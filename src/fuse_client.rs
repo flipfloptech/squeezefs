@@ -5228,6 +5228,11 @@ impl SqueezefsFilesystem {
             .await?;
         let (be_id, block_allocator, nvme_writer) =
             self.router.backend_router.get_active_backend()?;
+        crate::block_allocator::ensure_stored_block_image_fits(
+            processed.len(),
+            block_allocator.chunk_size(),
+            "write-through block upload",
+        )?;
         // Marks the key's incarnation unstable: racing validated cache fills
         // of a reused key fail their seqlock check instead of caching
         // pre-DMA bytes.
@@ -6623,6 +6628,20 @@ impl Filesystem for SqueezefsFilesystem {
                         config.encrypt_algo.clone(),
                         config.encrypt_key.as_deref(),
                     );
+                    // FIND-RW4-A geometry gate (forward-only): a transformed
+                    // volume whose block_size leaves no chunk headroom for
+                    // the worst-case stored image — every pre-fix
+                    // compressed/encrypted format — cannot hold
+                    // incompressible blocks. Refuse the mount LOUD; reformat
+                    // is the remedy (new formats clamp block_size).
+                    if let Err(msg) = crypto_state.transform_geometry_check(
+                        config.block_size,
+                        self.router.backend_router.default_allocator.chunk_size(),
+                    ) {
+                        error!("{msg}");
+                        eprintln!("squeezefs: {msg}");
+                        return Err(libc::EINVAL.into());
+                    }
                     self.router.set_crypto(crypto_state);
                     let _ = self.inodes_limit.set(config.inodes);
                     let _ = self.capacity_limit.set(config.capacity);
@@ -10534,6 +10553,11 @@ async fn upload_active_block_bytes(
         .process_write_async(block_bytes.clone())
         .await?;
     let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
+    crate::block_allocator::ensure_stored_block_image_fits(
+        processed_block.len(),
+        block_allocator.chunk_size(),
+        "staging-refusal durable escalation",
+    )?;
     let offset = block_allocator.allocate_block().await?;
     if let Err(e) = nvme_writer.write_block(offset, processed_block).await {
         let _ = block_allocator.free_block(offset).await;
@@ -10584,6 +10608,11 @@ async fn fold_upload_block(
 ) -> Result<(), SqueezefsError> {
     let processed_block = router.get_crypto().process_write_async(block_bytes).await?;
     let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
+    crate::block_allocator::ensure_stored_block_image_fits(
+        processed_block.len(),
+        block_allocator.chunk_size(),
+        "fold block upload",
+    )?;
     let offset = block_allocator.allocate_block().await?;
     if let Err(e) = nvme_writer.write_block(offset, processed_block).await {
         let _ = block_allocator.free_block(offset).await;
@@ -10767,6 +10796,7 @@ async fn flush_one_active_block(
             router.get_crypto(),
             &nvme_writer,
             offset,
+            block_allocator.chunk_size(),
             block_data_source,
         )
         .await

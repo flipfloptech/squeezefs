@@ -199,6 +199,10 @@ async fn create_file(h: &H, name: &str) -> u64 {
 }
 
 async fn write_all(h: &H, ino: u64, data: &[u8], bs: u64) {
+    try_write_all(h, ino, data, bs).await.unwrap();
+}
+
+async fn try_write_all(h: &H, ino: u64, data: &[u8], bs: u64) -> Result<(), fuse3::Errno> {
     let mut off = 0usize;
     while off < data.len() {
         let chunk = std::cmp::min(bs as usize, data.len() - off);
@@ -212,11 +216,11 @@ async fn write_all(h: &H, ino: u64, data: &[u8], bs: u64) {
                 0,
                 0,
             )
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(w.written as usize, chunk);
         off += chunk;
     }
+    Ok(())
 }
 
 async fn read_all(h: &H, ino: u64, len: usize, bs: u64) -> Result<Vec<u8>, fuse3::Errno> {
@@ -556,10 +560,11 @@ fn read_frame_word(dev: &std::path::Path, offset: u64) -> u32 {
 // ---------------------------------------------------------------------
 // 4. Chunk-overflow refusal: on out-of-contract geometry (block_size ==
 //    CHUNK_SIZE, transformed) an incompressible full block CANNOT be
-//    stored. The write/fsync must refuse LOUD — landing it would trample
-//    the neighboring chunk (the silent-corruption half of FIND-RW4-A).
-//    Dev behavior (RED): the write lands overflowing, fsync succeeds,
-//    and the cold read fails — silent corruption + unavailability.
+//    stored. The write path must refuse LOUD — at the write or its
+//    durability barrier — landing it would trample the neighboring chunk
+//    (the silent-corruption half of FIND-RW4-A). Dev behavior (RED): the
+//    write lands overflowing, everything claims success, and the cold
+//    read fails — silent corruption + unavailability.
 // ---------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -577,19 +582,23 @@ async fn oversized_stored_image_refused_never_silent() {
     .await;
     let ino = create_file(&h, "oversize").await;
     let data = lcg_bytes(CHUNK_SIZE as usize, 0x0BAD_F00D);
-    write_all(&h, ino, &data, CHUNK_SIZE).await;
-    let fsync_res = h.fs.fsync(h.req, ino, 0, false).await;
-    match fsync_res {
+    let stored = async {
+        try_write_all(&h, ino, &data, CHUNK_SIZE).await?;
+        h.fs.fsync(h.req, ino, 0, false).await
+    }
+    .await;
+    match stored {
         Err(_) => {
             // Post-fix contract: the oversized stored image is refused loud
-            // at the write path — nothing landed, nothing overflowed.
+            // somewhere on the write/durability path — nothing landed by
+            // overflowing the chunk.
         }
         Ok(_) => {
             // If the store CLAIMS success, the data must actually be
             // readable back cold — an unreadable "success" is the defect.
             purge_cold(&h, ino).await;
             let cold = read_all(&h, ino, data.len(), CHUNK_SIZE).await.expect(
-                "fsync claimed success for an incompressible full-chunk block, so the \
+                "store claimed success for an incompressible full-chunk block, so the \
                      cold read MUST decode — instead it failed loud (FIND-RW4-A: the \
                      oversized frame landed by overflowing the allocator chunk)",
             );
@@ -755,8 +764,11 @@ async fn frame_marker_superset_of_pre_fix_encoding() {
 }
 
 // ---------------------------------------------------------------------
-// 7. Crash pin: a failed durable upload of an incompressible block leaves
-//    the OLD durable data intact (mapping unchanged, old block decodes).
+// 7. Crash pin: a durable upload of an incompressible block that DIES
+//    between the transformed device write and the meta commit leaves the
+//    OLD durable data fully intact (mapping unchanged, old block
+//    decodes), and the acked new data still lands once the fault clears
+//    (never-lossy).
 // ---------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -765,7 +777,7 @@ async fn failed_incompressible_upload_keeps_old_data() {
     let h = make(
         *b"rw4a-crs-0000001",
         "rw4a_crash",
-        false,
+        true,
         "lz4",
         "none",
         None,
@@ -773,27 +785,28 @@ async fn failed_incompressible_upload_keeps_old_data() {
     )
     .await;
     let ino = create_file(&h, "crash_pin").await;
-    // v1: compressible baseline, durably stored + cold-verified.
-    let v1 = compressible(BS_SMALL as usize);
+    // v1: compressible 2-block striped baseline, durably stored.
+    let v1 = compressible(2 * BS_SMALL as usize);
     write_all(&h, ino, &v1, BS_SMALL).await;
     h.fs.fsync(h.req, ino, 0, false).await.unwrap();
     let path = squeezefs::keys::inode_path(ino);
     let meta1 = h.fs.router.fetch_metadata(&path).await.unwrap();
+    assert_eq!(meta1.file_type, "striped");
     let key1 = meta1.block_map.clone().unwrap().get(&0).unwrap().clone();
 
-    // v2: incompressible overwrite whose durable upload is FAILED between
-    // the transform and the meta commit (write_block injection).
-    let v2 = lcg_bytes(BS_SMALL as usize, 0xC4A5_11ED);
-    write_all(&h, ino, &v2, BS_SMALL).await;
-    squeezefs::nvme_dev::set_fail_next_writes(1);
-    let fs_res = h.fs.fsync(h.req, ino, 0, false).await;
-    squeezefs::nvme_dev::clear_fail_next_writes();
-    assert!(
-        fs_res.is_err(),
-        "fsync must surface the injected upload failure"
-    );
+    // v2: incompressible full overwrite of block 0 whose durable upload
+    // DMA is failed by injection (armed with margin so any retry inside
+    // the window keeps failing — the mapping provably cannot move while
+    // the old-data assertions run). The write itself must still ack:
+    // never-lossy custody degrades to staging.
+    let v2b0 = lcg_bytes(BS_SMALL as usize, 0xC4A5_11ED);
+    squeezefs::nvme_dev::set_fail_next_writes(8);
+    try_write_all(&h, ino, &v2b0, BS_SMALL)
+        .await
+        .expect("write must ack via the never-lossy staging degrade");
 
-    // Old durable data intact: mapping unchanged, old block decodes.
+    // Old durable data intact inside the failure window: mapping
+    // unchanged, old transformed block still decodes.
     let meta2 = h.fs.router.fetch_metadata(&path).await.unwrap();
     let key2 = meta2.block_map.clone().unwrap().get(&0).unwrap().clone();
     assert_eq!(key1, key2, "failed upload must not move the block mapping");
@@ -802,20 +815,23 @@ async fn failed_incompressible_upload_keeps_old_data() {
         h.fs.router
             .get_crypto()
             .process_read(&raw)
-            .expect("old durable block must still decode after the failed upload");
+            .expect("old durable block must still decode inside the failure window");
     assert_eq!(
-        &plain[..v1.len()],
-        v1.as_slice(),
+        &plain[..BS_SMALL as usize],
+        &v1[..BS_SMALL as usize],
         "old durable bytes must be intact"
     );
 
-    // Never-lossy: the acked v2 still flushes once the fault clears.
+    // Never-lossy: the acked v2 lands once the fault clears.
+    squeezefs::nvme_dev::clear_fail_next_writes();
     h.fs.fsync(h.req, ino, 0, false)
         .await
-        .expect("retried fsync must land v2 durably");
+        .expect("post-fault fsync must land v2 durably");
     purge_cold(&h, ino).await;
-    let cold = read_all(&h, ino, v2.len(), BS_SMALL).await.unwrap();
-    assert_eq!(cold, v2, "v2 must be durable + cold-readable after retry");
+    let mut expected = v1.clone();
+    expected[..BS_SMALL as usize].copy_from_slice(&v2b0);
+    let cold = read_all(&h, ino, expected.len(), BS_SMALL).await.unwrap();
+    assert_eq!(cold, expected, "v2 must be durable + cold-readable");
 }
 
 fn test_pem() -> String {

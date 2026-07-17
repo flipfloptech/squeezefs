@@ -549,9 +549,15 @@ async fn test_staged_dma_source_is_guard_backed_and_flush_then_remove_sequences(
     // Passthrough DMA straight off the mmap: must take the aligned branch.
     let crypto = CryptoCompressState::new("none".to_string(), "none".to_string(), None);
     let before = unaligned_fallbacks();
-    squeezefs::cache::nvme::write_block_from_staging(&crypto, &sb.dev, 0, source)
-        .await
-        .expect("guard-backed DMA failed");
+    squeezefs::cache::nvme::write_block_from_staging(
+        &crypto,
+        &sb.dev,
+        0,
+        squeezefs::block_allocator::CHUNK_SIZE,
+        source,
+    )
+    .await
+    .expect("guard-backed DMA failed");
     assert_eq!(
         unaligned_fallbacks() - before,
         0,
@@ -616,9 +622,15 @@ async fn test_write_block_from_staging_transform_leg_drops_guard_before_dma() {
         .expect("reference transform failed");
     assert!(expected.len() < payload.len(), "payload must compress");
 
-    squeezefs::cache::nvme::write_block_from_staging(&crypto, &sb.dev, 0, source)
-        .await
-        .expect("transform-leg staged flush failed");
+    squeezefs::cache::nvme::write_block_from_staging(
+        &crypto,
+        &sb.dev,
+        0,
+        squeezefs::block_allocator::CHUNK_SIZE,
+        source,
+    )
+    .await
+    .expect("transform-leg staged flush failed");
 
     // Guard died inside process_write (fresh output buffer) — same-shard
     // mutation must proceed.

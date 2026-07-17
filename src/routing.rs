@@ -2067,8 +2067,29 @@ impl DataRouter {
             let end = (off as usize + sz).min(raw.len());
             return Ok(raw.slice(start..end));
         }
-        let size = self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
-        self.backend_router.read_block(block_key, size).await
+        self.backend_router
+            .read_block(block_key, self.device_block_window())
+            .await
+    }
+
+    /// Device window for an UNDECORATED (whole-block) read. Passthrough
+    /// volumes read exactly `block_size` (byte-identity — §5.6 ranged
+    /// reads and the zero-copy raw-DMA leg depend on it). Transformed
+    /// volumes read the FIND-RW4-A worst-case stored image — frame +
+    /// AEAD envelope + a full raw-escape payload — rounded up to the
+    /// 4 KiB LBA and clamped to the allocator chunk (the write-path
+    /// guard bounds every stored image by the chunk, and the mount
+    /// geometry gate guarantees the worst case fits it). Pre-fix the
+    /// window was `block_size` exactly, which is what made every
+    /// incompressible block unreadable ("malformed transform frame").
+    pub(crate) fn device_block_window(&self) -> usize {
+        let bs = self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        let crypto = self.get_crypto();
+        if crypto.is_passthrough() {
+            return bs;
+        }
+        (crypto.max_stored_image_len(bs).div_ceil(4096) * 4096)
+            .min(crate::block_allocator::CHUNK_SIZE as usize)
     }
 
     pub fn set_block_size(&self, block_size: u64) {
@@ -3384,7 +3405,19 @@ impl DataRouter {
             .await?;
         let (be_id, allocator, writer) = self.backend_router.get_active_backend()?;
         if processed.len() as u64 > allocator.chunk_size() {
-            // Incompressible expansion past the block size: stays resident.
+            // FIND-RW4-A: unreachable post-fix (the store-raw escape bounds
+            // every stored image by `max_stored_image_len`, and the mount
+            // geometry gate guarantees that fits the chunk). Staying
+            // resident is the never-wrong degrade for this opportunistic
+            // path — but it must be LOUD, because a permanently
+            // unpromotable file means the geometry invariant broke.
+            log::error!(
+                "staged promotion of {file_path}: stored image ({} B) exceeds the {} B \
+                 allocator chunk — FIND-RW4-A geometry invariant violated; file stays \
+                 ring-resident (readable, never promoted)",
+                processed.len(),
+                allocator.chunk_size()
+            );
             return Ok(false);
         }
         let offset = allocator.allocate_block().await?;
@@ -4499,6 +4532,11 @@ impl DataRouter {
 
                     let (be_id, block_allocator, nvme_writer) =
                         self.backend_router.get_active_backend()?;
+                    crate::block_allocator::ensure_stored_block_image_fits(
+                        processed_data.len(),
+                        block_allocator.chunk_size(),
+                        "staged spill",
+                    )?;
                     let be_offset = block_allocator.allocate_block().await?;
                     // Size-carrying mapping (`bk:0:packed_len` — see
                     // `parse_block_mapping`).
@@ -4609,6 +4647,16 @@ impl DataRouter {
                     return Err(e);
                 }
             };
+            if let Err(e) = crate::block_allocator::ensure_stored_block_image_fits(
+                processed.len(),
+                block_allocator.chunk_size(),
+                "sparse stripe write",
+            ) {
+                for k in &allocated_keys {
+                    let _ = self.backend_router.free_block(k).await;
+                }
+                return Err(e);
+            }
 
             if let Err(e) = nvme_writer.write_block(offset, processed).await {
                 for k in &allocated_keys {
@@ -4792,6 +4840,14 @@ impl DataRouter {
                     .persist_block_key(&be_id, offset);
 
                 let processed_block = crypto.process_write_async(block_bytes.clone()).await?;
+                if let Err(e) = crate::block_allocator::ensure_stored_block_image_fits(
+                    processed_block.len(),
+                    block_allocator.chunk_size(),
+                    "striped RMW block write",
+                ) {
+                    let _ = block_allocator.free_block(offset).await;
+                    return Err(e);
+                }
                 nvme_writer.write_block(offset, processed_block).await?;
 
                 // Cache + publish only after the device write: a racing
@@ -6525,6 +6581,11 @@ impl DataRouter {
                         let processed = self.get_crypto().process_write_async(clipped).await?;
                         let (be_id, allocator, writer) =
                             self.backend_router.get_active_backend()?;
+                        crate::block_allocator::ensure_stored_block_image_fits(
+                            processed.len(),
+                            allocator.chunk_size(),
+                            "staged truncate durable clip",
+                        )?;
                         let offset = allocator.allocate_block().await?;
                         // Size-carrying mapping (`bk:0:packed_len` — see
                         // `parse_block_mapping`).

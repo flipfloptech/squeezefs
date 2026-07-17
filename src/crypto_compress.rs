@@ -7,16 +7,31 @@ use rsa::RsaPrivateKey;
 use std::sync::Arc;
 
 /// Self-delimiting transform frame: every non-passthrough `process_write`
-/// image is prefixed `[u32 LE image_len]`. Block reads return the full
-/// `block_size` window — stored image + trailing device bytes — and
-/// neither decoder tolerates the padding (lz4's
-/// `decompress_size_prepended` rejects trailing bytes with `OffsetZero`;
-/// AEAD opens `data[header..]`, so padding lands inside the tag check).
-/// Passthrough images carry NO frame (byte-identity is the passthrough
-/// contract — §5.6 ranged reads depend on it). Forward-only: unframed
-/// legacy blobs refuse loud in `process_read` (their cold device reads
-/// never worked, so there is no behavior to preserve).
+/// image is prefixed `[u32 LE word]` where `word = image_len |
+/// FRAME_RAW_FLAG?`. Block reads return the full device window — stored
+/// image + trailing device bytes — and neither decoder tolerates the
+/// padding (lz4's `decompress_size_prepended` rejects trailing bytes with
+/// `OffsetZero`; AEAD opens `data[header..]`, so padding lands inside the
+/// tag check). Passthrough images carry NO frame (byte-identity is the
+/// passthrough contract — §5.6 ranged reads depend on it). Forward-only:
+/// unframed legacy blobs refuse loud in `process_read` (their cold device
+/// reads never worked, so there is no behavior to preserve).
 const FRAME_LEN_BYTES: usize = 4;
+
+/// FIND-RW4-A store-raw escape marker (bit 31 of the frame word): the
+/// image payload was stored RAW — compression was attempted and did not
+/// shrink the block (incompressible data expands under lz4/zstd), so the
+/// raw payload was stored instead, bounding every stored image by
+/// `max_stored_image_len`. Encryption, when configured, still applies
+/// over the raw payload (the escape sits below the AEAD layer);
+/// `process_read` dispatches on the marker, never guesses. Image lengths
+/// are bounded by the block size (≤ 4 MiB class), so bit 31 was always 0
+/// in pre-fix frames — the flagged decoder is a STRICT SUPERSET of the
+/// pre-fix encoding.
+const FRAME_RAW_FLAG: u32 = 1 << 31;
+
+/// Length bits of the frame word (see [`FRAME_RAW_FLAG`]).
+const FRAME_LEN_MASK: u32 = FRAME_RAW_FLAG - 1;
 
 /// On-disk AEAD header prefix: `[2B wrapped_key_len][1B nonce_len]`.
 const ENCRYPT_HEADER_PREFIX_LEN: usize = 3;
@@ -233,9 +248,63 @@ impl CryptoCompressState {
 
     /// Worst-case transform output for `input_len` bytes (§5.7) — the
     /// pooled path's fit check against the pool's buffer size. Includes
-    /// the self-delimiting frame prefix.
+    /// the self-delimiting frame prefix. Deliberately sized for the
+    /// compressors' EXPANDED intermediate output: the store-raw escape
+    /// decides only after compression ran into the scratch.
     fn worst_case_scratch_len(&self, input_len: usize) -> usize {
         FRAME_LEN_BYTES + Self::scratch_compress_term(input_len) + self.scratch_encrypt_overhead()
+    }
+
+    /// FIND-RW4-A: the normative upper bound on a STORED image for a
+    /// `payload_len`-byte payload. With the store-raw escape the
+    /// compression term never exceeds the raw payload, so the bound is
+    /// `frame + worst-case AEAD envelope + payload`. Deliberately
+    /// CONSERVATIVE on the wrapped-key term (RSA-4096 fallback, never the
+    /// session blob actually present in THIS process): readers size their
+    /// device windows with it, and a window must cover any writer's
+    /// output regardless of which process wrote the block. Passthrough
+    /// states store byte-identical payloads (no frame).
+    pub fn max_stored_image_len(&self, payload_len: usize) -> usize {
+        if self.is_passthrough() {
+            return payload_len;
+        }
+        let encrypt_overhead = if self.encrypt_mode == EncryptMode::None {
+            0
+        } else {
+            ENCRYPT_HEADER_PREFIX_LEN + WRAPPED_KEY_LEN_FALLBACK + NONCE_LEN + AEAD_TAG_LEN_MAX
+        };
+        FRAME_LEN_BYTES + encrypt_overhead + payload_len
+    }
+
+    /// FIND-RW4-A mount/format geometry gate: a TRANSFORMED volume must be
+    /// able to store the worst-case image of a full `block_size` payload
+    /// inside one `chunk_size` allocator chunk — otherwise incompressible
+    /// blocks either overflow the chunk (silent neighbor corruption) or
+    /// cannot be stored at all. Every pre-fix compressed/encrypted format
+    /// (`block_size == chunk_size`) fails this check; post-fix formats
+    /// reserve [`TRANSFORM_BLOCK_HEADROOM`]. `Err` carries the operator
+    /// message (forward-only: reformat is the remedy — no shim).
+    pub fn transform_geometry_check(
+        &self,
+        block_size: u64,
+        chunk_size: u64,
+    ) -> std::result::Result<(), String> {
+        if self.is_passthrough() {
+            return Ok(());
+        }
+        let worst = self.max_stored_image_len(block_size as usize) as u64;
+        if worst > chunk_size {
+            return Err(format!(
+                "compressed/encrypted volume geometry cannot hold incompressible blocks \
+                 (FIND-RW4-A): worst-case stored image for a {block_size} B block is \
+                 {worst} B > the {chunk_size} B allocator chunk. This volume was \
+                 formatted before the incompressible-block fix; its full-size \
+                 incompressible blocks were never readable. Reformat with a current \
+                 binary (format now reserves {TRANSFORM_BLOCK_HEADROOM} B of per-chunk \
+                 headroom on transformed volumes) — refusing to mount."
+            ));
+        }
+        Ok(())
     }
 
     /// Initialize the §5.7 CRYPTO_SCRATCH_POOL for `block_size`-byte writes:
@@ -519,6 +588,30 @@ impl CryptoCompressState {
         }
     }
 
+    /// FIND-RW4-A store-raw escape, scratch leg: compress into `out`, and
+    /// when the compressed form would not SHRINK the payload (equal counts
+    /// — an equal-size image is pure decompress cost for zero gain),
+    /// overwrite it with the raw payload instead. Returns
+    /// `(bytes_written, raw_flag)`. The scratch is sized for the
+    /// compressors' worst case, so the intermediate expanded output always
+    /// fits; the extra memcpy is paid only by incompressible blocks (whose
+    /// pre-fix alternative was an unreadable frame).
+    fn compress_or_raw_into_scratch(
+        &self,
+        data: &[u8],
+        out: &mut [u8],
+    ) -> Result<(usize, bool), SqueezefsError> {
+        let n = self.compress_into_scratch(data, out)?;
+        if self.compression_mode != CompressionMode::None && n >= data.len() {
+            crate::fuse_client::METRICS
+                .compress_stored_raw
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            out[..data.len()].copy_from_slice(data);
+            return Ok((data.len(), true));
+        }
+        Ok((n, false))
+    }
+
     /// §5.7 pooled transform: compress into the scratch at the sealed-payload
     /// offset, then encrypt **in place within the scratch** — header first,
     /// `seal_in_place_separate_tag` at the offset (a raw fixed scratch has no
@@ -529,8 +622,9 @@ impl CryptoCompressState {
     /// ciphertext lands on a 4 KiB multiple). The input is never mutated.
     ///
     /// The image is emitted INSIDE the self-delimiting frame (see
-    /// `FRAME_LEN_BYTES`): everything transform-related lands at
-    /// `out[FRAME_LEN_BYTES..]`, and the length prefix is written last.
+    /// `FRAME_LEN_BYTES` / `FRAME_RAW_FLAG`): everything transform-related
+    /// lands at `out[FRAME_LEN_BYTES..]`, and the frame word is written
+    /// last.
     fn process_write_pooled(
         &self,
         pool: &Arc<BufferPool>,
@@ -538,13 +632,14 @@ impl CryptoCompressState {
     ) -> Result<bytes::Bytes, SqueezefsError> {
         const F: usize = FRAME_LEN_BYTES;
         let mut scratch = pool.alloc();
-        let image_len = if self.encrypt_mode != EncryptMode::None {
+        let (image_len, raw_flag) = if self.encrypt_mode != EncryptMode::None {
             let (wrapped_key, less_safe_key) = self.resolve_encrypt_key()?;
             let wrapped_len = wrapped_key.len();
             let header_len = ENCRYPT_HEADER_PREFIX_LEN + wrapped_len + NONCE_LEN;
             let out = scratch.backing_mut();
 
-            let plain_len = self.compress_into_scratch(data, &mut out[F + header_len..])?;
+            let (plain_len, raw_flag) =
+                self.compress_or_raw_into_scratch(data, &mut out[F + header_len..])?;
 
             // The exact on-disk header `encrypt` emits:
             // [2B wrapped_key_len][1B nonce_len][wrapped_key][nonce].
@@ -570,13 +665,18 @@ impl CryptoCompressState {
             let tag_bytes = tag.as_ref();
             out[F + header_len + plain_len..F + header_len + plain_len + tag_bytes.len()]
                 .copy_from_slice(tag_bytes);
-            header_len + plain_len + tag_bytes.len()
+            (header_len + plain_len + tag_bytes.len(), raw_flag)
         } else {
             let out = scratch.backing_mut();
-            self.compress_into_scratch(data, &mut out[F..])?
+            self.compress_or_raw_into_scratch(data, &mut out[F..])?
         };
-        scratch.backing_mut()[..F].copy_from_slice(&(image_len as u32).to_le_bytes());
+        let word = image_len as u32 | if raw_flag { FRAME_RAW_FLAG } else { 0 };
+        scratch.backing_mut()[..F].copy_from_slice(&word.to_le_bytes());
         scratch.set_written_len(F + image_len);
+        debug_assert!(
+            F + image_len <= self.max_stored_image_len(data.len()),
+            "stored image exceeded its FIND-RW4-A bound"
+        );
         Ok(scratch.into_bytes())
     }
 
@@ -596,15 +696,33 @@ impl CryptoCompressState {
             }
         }
         let compressed = self.compress(&data)?;
-        let image: Vec<u8> = if self.encrypt_mode != EncryptMode::None {
-            self.encrypt(&compressed)?
+        // FIND-RW4-A store-raw escape (heap leg): a compressed image that
+        // did not shrink is replaced by the raw payload + frame marker.
+        let raw_flag =
+            self.compression_mode != CompressionMode::None && compressed.len() >= data.len();
+        let plain: &[u8] = if raw_flag {
+            crate::fuse_client::METRICS
+                .compress_stored_raw
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            &data
         } else {
-            compressed.into_owned()
+            &compressed
         };
-        // Self-delimiting frame (heap leg — see `FRAME_LEN_BYTES`).
+        let image: std::borrow::Cow<[u8]> = if self.encrypt_mode != EncryptMode::None {
+            std::borrow::Cow::Owned(self.encrypt(plain)?)
+        } else {
+            std::borrow::Cow::Borrowed(plain)
+        };
+        // Self-delimiting frame (heap leg — see `FRAME_LEN_BYTES` /
+        // `FRAME_RAW_FLAG`).
+        let word = image.len() as u32 | if raw_flag { FRAME_RAW_FLAG } else { 0 };
         let mut framed = Vec::with_capacity(FRAME_LEN_BYTES + image.len());
-        framed.extend_from_slice(&(image.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&word.to_le_bytes());
         framed.extend_from_slice(&image);
+        debug_assert!(
+            framed.len() <= self.max_stored_image_len(data.len()),
+            "stored image exceeded its FIND-RW4-A bound"
+        );
         Ok(bytes::Bytes::from(framed))
     }
 
@@ -615,8 +733,8 @@ impl CryptoCompressState {
         if self.is_passthrough() {
             return Ok(std::borrow::Cow::Borrowed(data));
         }
-        // Frame parse: block reads return the full block_size WINDOW —
-        // the stored image plus whatever trailing bytes the device holds.
+        // Frame parse: block reads return the full device WINDOW — the
+        // stored image plus whatever trailing bytes the device holds.
         // Neither decoder tolerates the padding (lz4's
         // `decompress_size_prepended` rejects trailing bytes; AEAD opens
         // `data[header..]`, so padding lands inside the tag check), which
@@ -629,7 +747,12 @@ impl CryptoCompressState {
                 "transform image shorter than its frame header".to_string(),
             ));
         }
-        let image_len = u32::from_le_bytes(data[..FRAME_LEN_BYTES].try_into().unwrap()) as usize;
+        let word = u32::from_le_bytes(data[..FRAME_LEN_BYTES].try_into().unwrap());
+        // FIND-RW4-A dispatch: bit 31 = store-raw escape (image payload
+        // was not compressed). Pre-fix frames always carried 0 there —
+        // strict-superset decoding.
+        let raw_image = word & FRAME_RAW_FLAG != 0;
+        let image_len = (word & FRAME_LEN_MASK) as usize;
         let image = data
             .get(FRAME_LEN_BYTES..FRAME_LEN_BYTES + image_len)
             .ok_or_else(|| {
@@ -645,12 +768,15 @@ impl CryptoCompressState {
             None
         };
 
-        match decrypted {
-            Some(v) => {
+        match (decrypted, raw_image) {
+            // Store-raw escape: the (decrypted) payload IS the plaintext.
+            (Some(v), true) => Ok(std::borrow::Cow::Owned(v)),
+            (None, true) => Ok(std::borrow::Cow::Borrowed(image)),
+            (Some(v), false) => {
                 let decompressed = self.decompress(&v)?;
                 Ok(std::borrow::Cow::Owned(decompressed.into_owned()))
             }
-            None => Ok(std::borrow::Cow::Owned(
+            (None, false) => Ok(std::borrow::Cow::Owned(
                 self.decompress(image)?.into_owned(),
             )),
         }
@@ -703,6 +829,14 @@ mod tests {
         let mut v = Vec::with_capacity(4 + image.len());
         v.extend_from_slice(&(image.len() as u32).to_le_bytes());
         v.extend_from_slice(image);
+        v
+    }
+
+    /// RAW-flagged frame (the FIND-RW4-A store-raw escape form).
+    fn framed_raw(payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(4 + payload.len());
+        v.extend_from_slice(&(payload.len() as u32 | FRAME_RAW_FLAG).to_le_bytes());
+        v.extend_from_slice(payload);
         v
     }
 
@@ -977,14 +1111,17 @@ mod tests {
         assert!(cap0 > 0, "pool must preallocate");
 
         // Deep write first: leaves long stale content in a recycled buffer.
+        // Entropy payload — the FIND-RW4-A store-raw escape emits the
+        // RAW-flagged frame (compression would expand it).
         let deep = lcg_bytes(bs, 0xD1CE);
         let deep_out = state
             .process_write(bytes::Bytes::from(deep.clone()))
             .unwrap();
         assert_eq!(pool_len(&state), cap0 - 1, "deep write must be pooled");
+        assert_eq!(deep_out.as_ref(), framed_raw(&deep).as_slice());
         assert_eq!(
-            deep_out.as_ref(),
-            framed(&lz4_flex::compress_prepend_size(&deep)).as_slice()
+            state.process_read(&deep_out).unwrap().as_ref(),
+            deep.as_slice()
         );
         drop(deep_out);
         assert_eq!(pool_len(&state), cap0);
@@ -1006,12 +1143,11 @@ mod tests {
             assert_eq!(state.process_read(&out).unwrap().as_ref(), short.as_slice());
         }
 
-        // Empty payload keeps the framing too ([0,0,0,0] prefix).
+        // Empty payload: lz4's 4-byte size prefix cannot shrink 0 bytes,
+        // so the escape stores it raw — a lone RAW-flagged zero-length
+        // frame word.
         let empty_out = state.process_write(bytes::Bytes::new()).unwrap();
-        assert_eq!(
-            empty_out.as_ref(),
-            framed(&lz4_flex::compress_prepend_size(&[])).as_slice()
-        );
+        assert_eq!(empty_out.as_ref(), framed_raw(&[]).as_slice());
         assert!(state.process_read(&empty_out).unwrap().is_empty());
     }
 
@@ -1117,9 +1253,11 @@ mod tests {
     }
 
     #[test]
-    fn test_incompressible_input_within_bound_stays_pooled() {
-        // Incompressible data expands (prefix + literal framing) but stays
-        // within the worst-case bound — it must NOT bounce to the heap.
+    fn test_incompressible_input_stays_pooled_and_stores_raw() {
+        // Incompressible data would expand under lz4; the FIND-RW4-A
+        // escape stores it RAW instead — bounded by frame + payload — and
+        // the transform stays pooled (the scratch holds the compressor's
+        // intermediate expansion before the escape decision).
         let bs = 128 * 1024;
         let state = CryptoCompressState::new("lz4".to_string(), "none".to_string(), None);
         state.init_scratch_pool(bs);
@@ -1129,15 +1267,17 @@ mod tests {
         let out = state
             .process_write(bytes::Bytes::from(payload.clone()))
             .unwrap();
-        assert!(
-            out.len() > payload.len(),
-            "entropy payload must expand under lz4"
+        assert_eq!(
+            out.len(),
+            FRAME_LEN_BYTES + payload.len(),
+            "raw escape bounds the stored image at frame + raw payload"
         );
         assert_eq!(
-            pool_len(&state),
-            cap0 - 1,
-            "expansion within bound stays pooled"
+            out.len(),
+            state.max_stored_image_len(payload.len()),
+            "compression-only worst case is exactly the raw-escape image"
         );
+        assert_eq!(pool_len(&state), cap0 - 1, "raw escape stays pooled");
         assert_eq!(
             state.process_read(&out).unwrap().as_ref(),
             payload.as_slice()

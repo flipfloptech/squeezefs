@@ -535,7 +535,7 @@ impl ExtentRecord {
 /// #     dev: &squeezefs::nvme_dev::NvmeBlockDev,
 /// #     source: squeezefs::cache::nvme::StagedDmaSource,
 /// # ) {
-/// squeezefs::cache::nvme::write_block_from_staging(crypto, dev, 0, source)
+/// squeezefs::cache::nvme::write_block_from_staging(crypto, dev, 0, 4 << 20, source)
 ///     .await
 ///     .unwrap();
 /// // §5.5: retention past the DMA is a compile error (moved value).
@@ -607,13 +607,23 @@ impl AsRef<[u8]> for StagedDmaSource {
 /// `Bytes` can leak into a cache. The shard read lock is therefore held
 /// across exactly one transform-or-DMA (plus the sampled read-back verify
 /// on `--write-verification` mounts) — the §5.5 hold bound.
+///
+/// `chunk_size` is the destination allocator's chunk: the transformed
+/// image is guarded against it before the DMA (FIND-RW4-A — an oversized
+/// image must fail loud here, never overflow into the neighboring chunk).
 pub async fn write_block_from_staging(
     crypto: &crate::crypto_compress::CryptoCompressState,
     writer: &crate::nvme_dev::NvmeBlockDev,
     offset: u64,
+    chunk_size: u64,
     source: StagedDmaSource,
 ) -> Result<()> {
     let processed = crypto.process_write_async(source.into_bytes()).await?;
+    crate::block_allocator::ensure_stored_block_image_fits(
+        processed.len(),
+        chunk_size,
+        "staged writeback flush",
+    )?;
     writer.write_block(offset, processed).await
 }
 

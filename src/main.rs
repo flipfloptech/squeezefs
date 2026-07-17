@@ -1485,6 +1485,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mount_bootstrap_fail(&msg);
         }
 
+        // FIND-RW4-A geometry pre-flight (the authoritative gate re-runs at
+        // FUSE init): refuse pre-fix transformed geometry before any
+        // runtime/FUSE machinery spins up. Key material is irrelevant to
+        // the arithmetic (the check uses the conservative envelope bound).
+        {
+            let probe = squeezefs::crypto_compress::CryptoCompressState::new(
+                format_config.compression.clone(),
+                format_config.encrypt_algo.clone(),
+                None,
+            );
+            if let Err(msg) = probe.transform_geometry_check(
+                format_config.block_size,
+                squeezefs::block_allocator::CHUNK_SIZE,
+            ) {
+                mount_bootstrap_fail(&msg);
+            }
+        }
+
         let data_lvs = format_config.data_lv.clone().unwrap_or_default();
         let writeback = !no_writeback;
 
@@ -1926,7 +1944,43 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             let meta_journal_override = meta_journal_mb.map(|mb| mb * 1024 * 1024);
 
-            let parsed_block_size = parse_human_readable_size(&block_size)?;
+            let requested_block_size = parse_human_readable_size(&block_size)?;
+            // Every logical block lives in one fixed allocator chunk: a
+            // larger block would span chunks and corrupt its neighbor.
+            let chunk = squeezefs::block_allocator::CHUNK_SIZE;
+            if requested_block_size > chunk {
+                return Err(format!(
+                    "--block-size {} exceeds the {} B allocator chunk — blocks must fit \
+                     one chunk",
+                    block_size, chunk
+                )
+                .into());
+            }
+            // FIND-RW4-A: transformed (compressed/encrypted) volumes must
+            // reserve per-chunk headroom so a full block stored RAW (the
+            // incompressible-block escape) plus its frame/AEAD envelope
+            // still fits the chunk. Clamp loudly; mounts REFUSE transformed
+            // volumes that violate this geometry.
+            let transform_active = squeezefs::crypto_compress::CompressionMode::parse(&compression)
+                .map_err(|e| e.to_string())?
+                != squeezefs::crypto_compress::CompressionMode::None
+                || squeezefs::crypto_compress::EncryptMode::parse(&encrypt_algo)
+                    .map_err(|e| e.to_string())?
+                    != squeezefs::crypto_compress::EncryptMode::None;
+            let transform_cap = chunk - squeezefs::crypto_compress::TRANSFORM_BLOCK_HEADROOM;
+            let parsed_block_size = if transform_active && requested_block_size > transform_cap {
+                println!(
+                    "Block size clamped to {} B (requested {}): compressed/encrypted \
+                     volumes reserve {} B of per-chunk headroom so incompressible \
+                     blocks always fit their allocator chunk (FIND-RW4-A).",
+                    transform_cap,
+                    block_size,
+                    squeezefs::crypto_compress::TRANSFORM_BLOCK_HEADROOM
+                );
+                transform_cap
+            } else {
+                requested_block_size
+            };
             let config = FormatConfig {
                 name: "squeezefs".to_string(),
                 block_size: parsed_block_size,

@@ -241,7 +241,11 @@ GREEN**:
 
 ## 7. Findings (recorded, out of this PR's scope)
 
-- **FIND-RW2-A (pre-existing, latent)**: materializing a deferred RMW seed
+- **FIND-RW2-A (pre-existing, latent)** — **FIXED in RW4** (`76ee762`,
+  `.benchmarks/2026-07-17-rw4-extent-overlay.md`: the device-fetch funnel
+  decodes decorated mappings; incarnation tracking keys on the cleaned
+  base offset; pinned by `fold_seeds_decorated_promoted_mapping`):
+  materializing a deferred RMW seed
   for a striped block whose mapping is DECORATED (`bk:off:len`) fails
   `Io(InvalidData "Invalid block offset")` — `fetch_seed_image →
   get_block_for_index → BackendRouter::read_block` parses the decorated

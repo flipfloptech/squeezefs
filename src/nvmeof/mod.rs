@@ -1,27 +1,49 @@
-/*
- * JuiceFS, Copyright 2026 Juicedata, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-#![allow(clippy::all)]
+//! NVMe-oF target + initiator management (`squeezefs storage nvmeof …`).
+//!
+//! N1 state of the dual-stack target-management program
+//! (`docs/design-nvmeof-target-management.md`, PR 1): the module is split
+//! (`ledger` / `stack` / `initiator` / `nocow`), the **share ledger**
+//! (§6.4) is live as the record store for the existing verbs — `share`
+//! and `unshare` record/consult it through the write-ahead intent API,
+//! `restore-shares` replays it for nvmet, the ledger owns the
+//! loop-device association (the configfs fake-file *read* is gone; the
+//! never-fires loop-detach bug dies here) — and the dead code is purged
+//! (`extract_nvmeof_connection_details`, `SqueezefsError::NvmeOfBackend`,
+//! the `#![allow(clippy::all)]` exemption, the self-truncating
+//! `/etc/squeezefs/nvmeof_shares.json` registry).
+//!
+//! **Transitional (dies at N2/N3/N4):** the kernel-nvmet configfs share
+//! path, its collision-prone small-int port allocator, the configfs
+//! fake-file *write* (silently no-ops on real kernels; nothing reads it
+//! from N1 on), the silent sparse auto-create, the `SQUEEZEFS_MOCK_*`
+//! env forks, and the raw `spdk-*` lifecycle verbs below are the
+//! pre-rebuild paths, kept only until their rebuild PRs land. They are
+//! JuiceFS-derived (Apache-2.0) — the retained keeper files
+//! (`initiator.rs`, `nocow.rs`) carry the license header per the §6.1
+//! provenance note. Ownership is **ledger membership**, never NQN
+//! prefix: N1-era records keep the old-style default NQNs and remain
+//! fully managed at N2+.
+//!
+//! io_uring note: everything here is one-shot mount-time/admin control
+//! plane (configfs writes, JSON-RPC over a unix socket, nvme-cli
+//! shell-outs) — the sanctioned `reservation.rs` precedent; no data path
+//! is touched.
 
+pub mod initiator;
 pub mod ledger;
+pub mod nocow;
 pub mod stack;
 
+pub use initiator::{connect_target, disconnect_target};
+
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
+
+use ledger::Ledger;
+use stack::{Listener, ShareRecord, ShareState};
 
 /// Which target stack owns a share for its lifetime
 /// (`docs/design-nvmeof-target-management.md` §6.1/§6.4 — the ledger's
@@ -43,19 +65,19 @@ impl StackKind {
     }
 }
 
-fn is_mock() -> bool {
+pub(crate) fn is_mock() -> bool {
     std::env::var("SQUEEZEFS_MOCK_NVMEOF").is_ok()
 }
 
-fn check_root() -> std::io::Result<()> {
+pub(crate) fn check_root() -> io::Result<()> {
     if is_mock() {
         return Ok(());
     }
     #[cfg(unix)]
     {
         if unsafe { libc::getuid() } != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
                 "This command requires root privileges. Please run with sudo.",
             ));
         }
@@ -73,33 +95,13 @@ fn configfs_path() -> PathBuf {
     }
 }
 
-fn sysfs_fabrics_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("SQUEEZEFS_MOCK_NVMEOF_FABRICS_DIR") {
-        PathBuf::from(dir)
-    } else if is_mock() {
-        PathBuf::from("/tmp/squeezefs_nvme_fabrics")
-    } else {
-        PathBuf::from("/sys/class/nvme-fabrics")
-    }
-}
-
-fn sysfs_nvme_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("SQUEEZEFS_MOCK_NVMEOF_NVME_DIR") {
-        PathBuf::from(dir)
-    } else if is_mock() {
-        PathBuf::from("/tmp/squeezefs_nvme")
-    } else {
-        PathBuf::from("/sys/class/nvme")
-    }
-}
-
-fn execute_cmd(cmd_name: &str, args: &[&str]) -> std::io::Result<String> {
+pub(crate) fn execute_cmd(cmd_name: &str, args: &[&str]) -> io::Result<String> {
     if is_mock() {
         return Ok(String::new());
     }
     let output = Command::new(cmd_name).args(args).output()?;
     if !output.status.success() {
-        return Err(std::io::Error::other(format!(
+        return Err(io::Error::other(format!(
             "Command {} failed: {}",
             cmd_name,
             String::from_utf8_lossy(&output.stderr)
@@ -108,33 +110,119 @@ fn execute_cmd(cmd_name: &str, args: &[&str]) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// First-mutating-verb hook of the §6.4 old-registry migration; skipped
+/// in mock mode so tests never touch host `/etc` state (the whole mock
+/// fork dies at N2).
+fn retire_old_registry_once() {
+    if !is_mock() {
+        ledger::retire_old_registry(Path::new(ledger::OLD_REGISTRY_PATH));
+    }
+}
+
+fn canonical_or_raw(path: &str) -> String {
+    fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// Pre-side-effect duplicate refusal (before the transitional sparse
+/// auto-create can fire). `Ledger::begin_share` re-checks the same laws
+/// atomically under the ledger flock — this is the polite early exit,
+/// that is the authority.
+fn ledger_duplicate_precheck(
+    ledger: &Ledger,
+    subnqn_opt: Option<&str>,
+    backing_path: &str,
+    canonical: &str,
+) -> io::Result<()> {
+    for share in ledger.load()? {
+        if share.backing_canonical == canonical || share.backing_path == backing_path {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "Backing path '{}' is already shared under subsystem '{}' (stack {}, state \
+                     {}); unshare it first: squeezefs storage nvmeof unshare {}",
+                    backing_path,
+                    share.subnqn,
+                    share.stack.as_str(),
+                    share.state.as_str(),
+                    share.subnqn
+                ),
+            ));
+        }
+        if subnqn_opt == Some(share.subnqn.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "Subsystem '{}' is already in the share ledger (stack {}, state {})",
+                    share.subnqn,
+                    share.stack.as_str(),
+                    share.state.as_str()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn pending_record(
+    subnqn: &str,
+    stack: StackKind,
+    backing_path: &str,
+    canonical: &str,
+    port: u16,
+    ips: &[String],
+) -> ShareRecord {
+    // N1 transitional presence (§6.4 / PR-plan PR 1): required fields +
+    // `loop_device` (recorded once losetup ran); `nvmet_port_id`,
+    // `ns_uuid`, `nsid`, `ptpl_file`, `bdev_name` stay null — the
+    // pre-rebuild paths stamp/pin nothing.
+    ShareRecord {
+        subnqn: subnqn.to_string(),
+        stack,
+        state: ShareState::Pending,
+        backing_path: backing_path.to_string(),
+        backing_canonical: canonical.to_string(),
+        nsid: None,
+        ns_uuid: None,
+        listeners: ips
+            .iter()
+            .map(|ip| Listener {
+                ip: ip.clone(),
+                port,
+                nvmet_port_id: None,
+            })
+            .collect(),
+        bdev_name: None,
+        ptpl_file: None,
+        loop_device: None,
+        created_utc: ledger::utc_now_rfc3339(),
+        adopted_from: None,
+    }
+}
+
 pub fn share_target(
     backing_path: &str,
     subnqn_opt: Option<&str>,
     port: u16,
     ips: &[String],
-) -> std::io::Result<String> {
+) -> io::Result<String> {
     check_root()?;
+    retire_old_registry_once();
+    let ledger = Ledger::open_default();
 
-    // Prevent duplicate sharing of the same backing path
-    let canonical_target =
-        fs::canonicalize(backing_path).unwrap_or_else(|_| PathBuf::from(backing_path));
+    // Duplicate refusal before any side effect (ledger membership is the
+    // ownership law; live-state walks join the guard with the N2 rebuild).
+    ledger_duplicate_precheck(
+        &ledger,
+        subnqn_opt,
+        backing_path,
+        &canonical_or_raw(backing_path),
+    )?;
 
-    let shares = load_shares();
-    for share in &shares {
-        let share_canonical = fs::canonicalize(&share.backing_path)
-            .unwrap_or_else(|_| PathBuf::from(&share.backing_path));
-        if canonical_target == share_canonical {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!(
-                    "Backing path '{}' is already shared under subsystem '{}'",
-                    backing_path, share.subnqn
-                ),
-            ));
-        }
-    }
-    // 1. Check/create backing path if it's a regular file path
+    // 1. Check/create backing path if it's a regular file path.
+    //    (Transitional: the silent 1 GiB sparse auto-create dies at N2 —
+    //    replaced by refuse-loud + the explicit `--create-size` opt-in.)
     let backing_path_buf = PathBuf::from(backing_path);
     if !backing_path_buf.exists() {
         println!(
@@ -147,14 +235,72 @@ pub fn share_target(
     if backing_path_buf.is_file() {
         // CoW guard: a btrfs-CoW backing file silently downgrades O_DIRECT
         // to buffered I/O and wedges the whole fabric under write load.
-        ensure_nocow_backing(&backing_path_buf)?;
+        nocow::ensure_nocow_backing(&backing_path_buf)?;
     }
 
-    let is_dir = backing_path_buf.is_dir();
-    if is_dir {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
+    if backing_path_buf.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
             "Backing path cannot be a directory.",
+        ));
+    }
+
+    let subnqn = match subnqn_opt {
+        Some(s) => s.to_string(),
+        None => format!("nqn.2026-06.io.squeezefs:subsystem-{}", Uuid::new_v4()),
+    };
+
+    // §6.4 law 6: record the pending intent BEFORE the first stack
+    // mutation — a crash in any later window leaves a record that still
+    // claims the objects (never stranded as "foreign").
+    let record = pending_record(
+        &subnqn,
+        StackKind::Nvmet,
+        backing_path,
+        &canonical_or_raw(backing_path),
+        port,
+        ips,
+    );
+    ledger.begin_share(&record)?;
+
+    match share_nvmet_via_configfs(&subnqn, backing_path, &record.listeners) {
+        Ok(loop_device) => {
+            if loop_device.is_some() {
+                // Law 5: the loop association is ledger bookkeeping.
+                ledger.set_loop_device(&subnqn, loop_device)?;
+            }
+            ledger.finalize_share(&subnqn)?;
+            Ok(subnqn)
+        }
+        Err(e) => {
+            log::warn!(
+                "share of '{}' failed mid-flight ({e}); its pending intent record remains in \
+                 the ledger and still claims any created objects — reconcile with \
+                 'squeezefs storage nvmeof restore-shares' or tear down with 'squeezefs \
+                 storage nvmeof unshare {}'",
+                subnqn,
+                subnqn
+            );
+            Err(e)
+        }
+    }
+}
+
+/// The pre-rebuild kernel-nvmet configfs share path (transitional; N2
+/// replaces it wholesale — including the collision-prone small-int port
+/// allocator, accepted for this one-PR window). Shared by the `share`
+/// verb and the ledger replay in `restore_shares`. Never auto-creates
+/// backings. Returns the loop device attached for file backings.
+fn share_nvmet_via_configfs(
+    subnqn: &str,
+    backing_path: &str,
+    listeners: &[Listener],
+) -> io::Result<Option<String>> {
+    let backing_path_buf = PathBuf::from(backing_path);
+    if !backing_path_buf.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Backing path '{}' does not exist.", backing_path),
         ));
     }
 
@@ -210,12 +356,7 @@ pub fn share_target(
     }
 
     // 5. Setup subsystem
-    let subnqn = match subnqn_opt {
-        Some(s) => s.to_string(),
-        None => format!("nqn.2026-06.io.squeezefs:subsystem-{}", Uuid::new_v4()),
-    };
-
-    let sub_dir = config_dir.join("subsystems").join(&subnqn);
+    let sub_dir = config_dir.join("subsystems").join(subnqn);
     fs::create_dir_all(&sub_dir)?;
 
     // Enable any host access
@@ -227,13 +368,18 @@ pub fn share_target(
     fs::write(ns_dir.join("device_path"), &resolved_device)?;
     fs::write(ns_dir.join("enable"), "1")?;
 
-    // Save loop association info in subsystem dir if present
-    if let Some(loop_dev) = associated_loop {
+    // Transitional (N1 contract): this configfs fake-file *write* is
+    // impossible on a real kernel (fails silently) and survives only
+    // until N2 deletes this whole path — NOTHING reads it from N1 on;
+    // the ledger's `loop_device` field is the association of record.
+    if let Some(loop_dev) = &associated_loop {
         let _ = fs::write(sub_dir.join("associated_loop_device"), loop_dev);
     }
 
     // 6. Setup Ports
-    for ip in ips {
+    for listener in listeners {
+        let ip = &listener.ip;
+        let port = listener.port;
         let mut port_exists = false;
         let mut port_id = 1;
         let mut port_dir = config_dir.join("ports").join(port_id.to_string());
@@ -260,7 +406,7 @@ pub fn share_target(
         }
 
         // Link subsystem to port
-        let link_dest = port_dir.join("subsystems").join(&subnqn);
+        let link_dest = port_dir.join("subsystems").join(subnqn);
         fs::create_dir_all(port_dir.join("subsystems"))?;
 
         #[cfg(unix)]
@@ -269,16 +415,10 @@ pub fn share_target(
         }
     }
 
-    let _ = register_share(backing_path, &subnqn, port, ips);
-
-    // Return connect instruction string
-    Ok(subnqn)
+    Ok(associated_loop)
 }
 
-pub fn call_spdk_rpc(
-    method: &str,
-    params: serde_json::Value,
-) -> std::io::Result<serde_json::Value> {
+fn call_spdk_rpc(method: &str, params: serde_json::Value) -> io::Result<serde_json::Value> {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
@@ -321,7 +461,7 @@ pub fn call_spdk_rpc(
     }
 
     let val: serde_json::Value = serde_json::from_slice(&response_bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(val)
 }
 
@@ -330,56 +470,95 @@ pub fn share_target_spdk(
     subnqn_opt: Option<&str>,
     port: u16,
     ips: &[String],
-) -> std::io::Result<String> {
-    // Prevent duplicate sharing of the same backing path via local configuration
-    let canonical_target =
-        fs::canonicalize(backing_path).unwrap_or_else(|_| PathBuf::from(backing_path));
+) -> io::Result<String> {
+    retire_old_registry_once();
+    let ledger = Ledger::open_default();
+    let canonical = canonical_or_raw(backing_path);
 
-    let shares = load_shares();
-    for share in &shares {
-        let share_canonical = fs::canonicalize(&share.backing_path)
-            .unwrap_or_else(|_| PathBuf::from(&share.backing_path));
-        if canonical_target == share_canonical {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!(
-                    "Backing path '{}' is already shared under subsystem '{}'",
-                    backing_path, share.subnqn
-                ),
-            ));
-        }
-    }
+    // Ledger membership guard (cross-stack by construction) …
+    ledger_duplicate_precheck(&ledger, subnqn_opt, backing_path, &canonical)?;
 
-    // Double check active SPDK bdevs directly
+    // … plus the live-state check the old module got right: scan active
+    // SPDK bdevs directly (a crash-window or foreign share of the same
+    // backing still refuses).
+    let canonical_target = PathBuf::from(&canonical);
     if let Ok(res) = call_spdk_rpc("bdev_get_bdevs", serde_json::json!({})) {
         if let Some(bdevs) = res.get("result").and_then(|r| r.as_array()) {
             for bdev in bdevs {
-                if let Some(driver_specific) = bdev.get("driver_specific") {
-                    if let Some(aio) = driver_specific.get("aio") {
-                        if let Some(filename) = aio.get("filename").and_then(|f| f.as_str()) {
-                            let canonical_existing = fs::canonicalize(filename)
-                                .unwrap_or_else(|_| PathBuf::from(filename));
-                            if canonical_target == canonical_existing {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::AlreadyExists,
-                                    format!(
-                                        "Backing path '{}' is already shared by active SPDK bdev '{}'",
-                                        backing_path,
-                                        bdev.get("name").and_then(|n| n.as_str()).unwrap_or("unknown")
-                                    ),
-                                ));
-                            }
-                        }
+                let filename = bdev
+                    .get("driver_specific")
+                    .and_then(|d| d.get("aio"))
+                    .and_then(|aio| aio.get("filename"))
+                    .and_then(|f| f.as_str());
+                if let Some(filename) = filename {
+                    let canonical_existing =
+                        fs::canonicalize(filename).unwrap_or_else(|_| PathBuf::from(filename));
+                    if canonical_target == canonical_existing {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!(
+                                "Backing path '{}' is already shared by active SPDK bdev '{}'",
+                                backing_path,
+                                bdev.get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("unknown")
+                            ),
+                        ));
                     }
                 }
             }
         }
     }
+
+    // CoW guard (see nocow::ensure_nocow_backing): SPDK's AIO bdev opens
+    // the file O_DIRECT, which btrfs silently downgrades to buffered on
+    // CoW files — the single-threaded reactor then wedges in the
+    // dirty-page throttle under write load and takes the whole fabric
+    // down with it.
+    let backing_path_buf = PathBuf::from(backing_path);
+    if backing_path_buf.is_file() {
+        nocow::ensure_nocow_backing(&backing_path_buf)?;
+    }
+
     let subnqn = match subnqn_opt {
         Some(s) => s.to_string(),
         None => format!("nqn.2026-06.io.squeezefs:spdk-subsystem-{}", Uuid::new_v4()),
     };
 
+    // §6.4 law 6: pending intent before the first RPC mutation.
+    let record = pending_record(
+        &subnqn,
+        StackKind::Spdk,
+        backing_path,
+        &canonical,
+        port,
+        ips,
+    );
+    ledger.begin_share(&record)?;
+
+    match share_spdk_via_rpc(&subnqn, backing_path, &record.listeners) {
+        Ok(()) => {
+            ledger.finalize_share(&subnqn)?;
+            Ok(subnqn)
+        }
+        Err(e) => {
+            log::warn!(
+                "SPDK share of '{}' failed mid-flight ({e}); its pending intent record remains \
+                 in the ledger and still claims any created objects — tear down with \
+                 'squeezefs storage nvmeof unshare {}'",
+                subnqn,
+                subnqn
+            );
+            Err(e)
+        }
+    }
+}
+
+/// The pre-rebuild SPDK RPC share path (transitional; N4 replaces it
+/// with pinned nsid + ns UUID + `ptpl_file` and the `save_config` law —
+/// this path deliberately stamps/pins nothing, which is why the N1-era
+/// record's SPDK-only fields stay null).
+fn share_spdk_via_rpc(subnqn: &str, backing_path: &str, listeners: &[Listener]) -> io::Result<()> {
     // 1. Create transport (ignore if already exists)
     let _ = call_spdk_rpc(
         "nvmf_create_transport",
@@ -387,15 +566,6 @@ pub fn share_target_spdk(
             "trtype": "TCP"
         }),
     );
-
-    // CoW guard (see ensure_nocow_backing): SPDK's AIO bdev opens the file
-    // O_DIRECT, which btrfs silently downgrades to buffered on CoW files —
-    // the single-threaded reactor then wedges in the dirty-page throttle
-    // under write load and takes the whole fabric down with it.
-    let backing_path_buf = PathBuf::from(backing_path);
-    if backing_path_buf.is_file() {
-        ensure_nocow_backing(&backing_path_buf)?;
-    }
 
     // 2. Create bdev from backing path
     let bdev_name = format!("bdev_{}", Uuid::new_v4().simple());
@@ -410,10 +580,10 @@ pub fn share_target_spdk(
     )?;
 
     if let Some(err) = res.get("error") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to create SPDK AIO bdev: {}", err),
-        ));
+        return Err(io::Error::other(format!(
+            "Failed to create SPDK AIO bdev: {}",
+            err
+        )));
     }
 
     // 3. Create subsystem
@@ -427,10 +597,10 @@ pub fn share_target_spdk(
     )?;
 
     if let Some(err) = res.get("error") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to create SPDK NVMe-oF subsystem: {}", err),
-        ));
+        return Err(io::Error::other(format!(
+            "Failed to create SPDK NVMe-oF subsystem: {}",
+            err
+        )));
     }
 
     // 4. Add namespace using our bdev
@@ -445,14 +615,14 @@ pub fn share_target_spdk(
     )?;
 
     if let Some(err) = res.get("error") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to add bdev to SPDK subsystem namespace: {}", err),
-        ));
+        return Err(io::Error::other(format!(
+            "Failed to add bdev to SPDK subsystem namespace: {}",
+            err
+        )));
     }
 
     // 5. Add listener to expose the port/IP for each address
-    for ip in ips {
+    for listener in listeners {
         let res = call_spdk_rpc(
             "nvmf_subsystem_add_listener",
             serde_json::json!({
@@ -460,44 +630,62 @@ pub fn share_target_spdk(
                 "listen_address": {
                     "trtype": "TCP",
                     "adrfam": "IPv4",
-                    "traddr": ip,
-                    "trsvcid": port.to_string()
+                    "traddr": listener.ip,
+                    "trsvcid": listener.port.to_string()
                 }
             }),
         )?;
 
         if let Some(err) = res.get("error") {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "Failed to expose SPDK subsystem listener on {}:{}: {}",
-                    ip, port, err
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "Failed to expose SPDK subsystem listener on {}:{}: {}",
+                listener.ip, listener.port, err
+            )));
         }
     }
 
-    let _ = register_share_ext(backing_path, &subnqn, port, ips, true);
-
-    Ok(subnqn)
+    Ok(())
 }
 
-pub fn unshare_target_spdk(subnqn: &str) -> std::io::Result<()> {
-    // 1. Get subsystems to identify associated bdev name
+/// SPDK teardown (transitional pre-rebuild RPC shapes). With
+/// `tolerate_missing` (ledgered records — §6.4 law 4) a subsystem that
+/// vanished from the live listing is a verified no-op that still cleans
+/// the ledger; without it (pre-N1 unledgered shares) it is NotFound.
+fn unshare_spdk_via_rpc(subnqn: &str, tolerate_missing: bool) -> io::Result<()> {
+    // 1. Get subsystems to identify liveness + the associated bdev name.
     let res = call_spdk_rpc("nvmf_get_subsystems", serde_json::json!({}))?;
+    let mut live = false;
     let mut bdev_to_delete = None;
     if let Some(result_arr) = res.get("result").and_then(|r| r.as_array()) {
         for sub in result_arr {
             if sub.get("nqn").and_then(|n| n.as_str()) == Some(subnqn) {
-                if let Some(namespaces) = sub.get("namespaces").and_then(|ns| ns.as_array()) {
-                    if let Some(ns1) = namespaces.first() {
-                        if let Some(name) = ns1.get("name").and_then(|n| n.as_str()) {
-                            bdev_to_delete = Some(name.to_string());
-                        }
+                live = true;
+                if let Some(ns1) = sub
+                    .get("namespaces")
+                    .and_then(|ns| ns.as_array())
+                    .and_then(|ns| ns.first())
+                {
+                    if let Some(name) = ns1.get("name").and_then(|n| n.as_str()) {
+                        bdev_to_delete = Some(name.to_string());
                     }
                 }
             }
         }
+    }
+
+    if !live {
+        if tolerate_missing {
+            println!(
+                "SPDK subsystem '{}' is no longer live on the target — nothing to tear down \
+                 (cleaning the ledger record).",
+                subnqn
+            );
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("SPDK subsystem NQN '{}' not found.", subnqn),
+        ));
     }
 
     // 2. Delete the subsystem
@@ -508,51 +696,48 @@ pub fn unshare_target_spdk(subnqn: &str) -> std::io::Result<()> {
         }),
     )?;
     if let Some(err) = res.get("error") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to delete SPDK subsystem: {}", err),
-        ));
+        return Err(io::Error::other(format!(
+            "Failed to delete SPDK subsystem: {}",
+            err
+        )));
     }
 
     // 3. Delete the associated bdev if we found it
     if let Some(bdev_name) = bdev_to_delete {
-        let _ = call_spdk_rpc(
+        if let Err(e) = call_spdk_rpc(
             "bdev_aio_delete",
             serde_json::json!({
                 "name": bdev_name
             }),
-        );
+        ) {
+            log::warn!("bdev_aio_delete of '{bdev_name}' failed after subsystem delete: {e}");
+        }
     }
-
-    let _ = deregister_share(subnqn);
 
     Ok(())
 }
 
-pub fn unshare_target(subnqn: &str) -> std::io::Result<()> {
-    check_root()?;
-
-    // Check if shared via SPDK
-    let shares = load_shares();
-    if let Some(share) = shares.iter().find(|s| s.subnqn == subnqn) {
-        if share.is_spdk.unwrap_or(false) {
-            return unshare_target_spdk(subnqn);
-        }
-    }
-
+/// Kernel-nvmet configfs teardown (transitional pre-rebuild path; the
+/// all-ports symlink walk is deliberate at N1 — the old allocator's
+/// small-int port ids are untracked, §6.4 N1 contract). Loop detach does
+/// NOT live here: the association is ledger bookkeeping (law 5).
+fn unshare_nvmet_via_configfs(subnqn: &str, tolerate_missing: bool) -> io::Result<()> {
     let config_dir = configfs_path();
     let sub_dir = config_dir.join("subsystems").join(subnqn);
     if !sub_dir.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
+        if tolerate_missing {
+            println!(
+                "Subsystem '{}' is no longer present in configfs — nothing to tear down \
+                 (cleaning the ledger record).",
+                subnqn
+            );
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
             format!("Subsystem NQN '{}' not found.", subnqn),
         ));
     }
-
-    // Read loop device association if any
-    let associated_loop = fs::read_to_string(sub_dir.join("associated_loop_device"))
-        .ok()
-        .map(|s| s.trim().to_string());
 
     // 1. Remove all symlinks from ports
     let ports_dir = config_dir.join("ports");
@@ -586,264 +771,91 @@ pub fn unshare_target(subnqn: &str) -> std::io::Result<()> {
         let _ = fs::remove_dir(&sub_dir);
     }
 
-    // 3. Detach loop device if associated
-    if let Some(loop_dev) = associated_loop {
-        if !is_mock() {
-            let _ = execute_cmd("losetup", &["-d", &loop_dev]);
-        }
-        println!("Detached associated loop device '{}'.", loop_dev);
-    }
-
-    let _ = deregister_share(subnqn);
-
     Ok(())
 }
 
-fn get_host_id() -> String {
-    if let Ok(content) = fs::read_to_string("/etc/nvme/hostid") {
-        let trimmed = content.trim().to_string();
-        if !trimmed.is_empty() {
-            return trimmed;
-        }
-    }
-    let new_id = Uuid::new_v4().to_string();
-    let _ = fs::create_dir_all("/etc/nvme");
-    let _ = fs::write("/etc/nvme/hostid", &new_id);
-    new_id
-}
-
-fn get_host_nqn() -> String {
-    if let Ok(content) = fs::read_to_string("/etc/nvme/hostnqn") {
-        let trimmed = content.trim().to_string();
-        if !trimmed.is_empty() {
-            return trimmed;
-        }
-    }
-    let new_nqn = format!("nqn.2014-08.org.nvmexpress:uuid:{}", get_host_id());
-    let _ = fs::create_dir_all("/etc/nvme");
-    let _ = fs::write("/etc/nvme/hostnqn", &new_nqn);
-    new_nqn
-}
-
-fn find_device_for_nqn(subnqn: &str) -> std::io::Result<Option<String>> {
-    let nvme_path = sysfs_nvme_path();
-    if !nvme_path.exists() {
-        return Ok(None);
-    }
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(nvme_path)? {
-        entries.push(entry?);
-    }
-    entries.sort_by_key(|e| e.file_name());
-
-    for entry in entries {
-        let path = entry.path();
-        let dev_name = entry.file_name().to_string_lossy().to_string();
-        if dev_name.starts_with("nvme") {
-            let nqn_file = path.join("subsysnqn");
-            if nqn_file.exists() {
-                let current_nqn = fs::read_to_string(nqn_file)?.trim().to_string();
-                if current_nqn == subnqn {
-                    // Check if namespace block device dir exists (e.g. nvme0n1)
-                    let mut sub_entries = Vec::new();
-                    for sub_entry in fs::read_dir(&path)? {
-                        sub_entries.push(sub_entry?);
-                    }
-                    sub_entries.sort_by_key(|e| e.file_name());
-
-                    for sub_entry in sub_entries {
-                        let sub_name = sub_entry.file_name().to_string_lossy().to_string();
-                        if sub_name.starts_with(&dev_name) && sub_name.contains('n') {
-                            return Ok(Some(format!("/dev/{}", sub_name)));
-                        }
-                    }
-                    return Ok(Some(format!("/dev/{}n1", dev_name)));
-                }
-            }
-        }
-    }
-    Ok(None)
-}
-
-static MOCK_WRITE_MUTEX: once_cell::sync::Lazy<std::sync::Mutex<()>> =
-    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(()));
-
-fn connect_target_single(
-    ip: &str,
-    port: u16,
-    subnqn: &str,
-    local_ip: Option<std::net::IpAddr>,
-) -> std::io::Result<()> {
-    check_root()?;
+/// Detach a ledger-recorded loop device (law 5: the ledger, never
+/// configfs, is where `unshare` learns the association — the pre-split
+/// configfs read could never see anything on a real kernel, so the
+/// detach never fired outside the mock).
+fn detach_recorded_loop(loop_dev: &str) {
     if !is_mock() {
-        let _ = execute_cmd("modprobe", &["nvme-tcp"]);
-    }
-
-    // Use nvme-cli connect if available
-    let has_nvme_cli = !is_mock() && Command::new("nvme").arg("--version").status().is_ok();
-
-    if has_nvme_cli {
-        let port_str = port.to_string();
-        let mut args = vec![
-            "connect".to_string(),
-            "-t".to_string(),
-            "tcp".to_string(),
-            "-a".to_string(),
-            ip.to_string(),
-            "-s".to_string(),
-            port_str,
-            "-n".to_string(),
-            subnqn.to_string(),
-        ];
-        if let Some(host_ip) = local_ip {
-            args.push("-p".to_string());
-            args.push(host_ip.to_string());
-        }
-        let output = Command::new("nvme").args(&args).output()?;
-        if !output.status.success() {
-            let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("nvme connect failed: {}", err_msg),
-            ));
-        }
-    } else {
-        // Fallback to direct fabrics write
-        let target_file = if is_mock() {
-            let fabrics_path = sysfs_fabrics_path();
-            fs::create_dir_all(&fabrics_path)?;
-            fabrics_path.join("ctl")
-        } else {
-            let dev_fabrics = PathBuf::from("/dev/nvme-fabrics");
-            if !dev_fabrics.exists() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "NVMe Fabrics interface (/dev/nvme-fabrics) not found. Please ensure 'nvme-tcp' module is loaded.",
-                ));
-            }
-            dev_fabrics
-        };
-
-        let hostnqn = get_host_nqn();
-        let hostid = get_host_id();
-        let mut ctrl_conn_str = format!(
-            "transport=tcp,traddr={},trsvcid={},nqn={},hostnqn={},hostid={}",
-            ip, port, subnqn, hostnqn, hostid
-        );
-        if let Some(host_ip) = local_ip {
-            ctrl_conn_str = format!("{},host_traddr={}", ctrl_conn_str, host_ip);
-        }
-
-        if is_mock() {
-            let _lock = MOCK_WRITE_MUTEX.lock().unwrap();
-            let mut ctl_content = String::new();
-            if target_file.exists() {
-                ctl_content = fs::read_to_string(&target_file)?;
-            }
-            if !ctl_content.is_empty() {
-                ctl_content.push('\n');
-            }
-            ctl_content.push_str(&ctrl_conn_str);
-            fs::write(&target_file, &ctl_content)?;
-
-            // Find next available controller name (e.g. nvme0, nvme1, ...)
-            let mut ctrl_index = 0;
-            let nvme_path = sysfs_nvme_path();
-            while nvme_path.join(format!("nvme{}", ctrl_index)).exists() {
-                ctrl_index += 1;
-            }
-            let ctrl_dir = nvme_path.join(format!("nvme{}", ctrl_index));
-            fs::create_dir_all(&ctrl_dir)?;
-            fs::write(ctrl_dir.join("subsysnqn"), subnqn)?;
-            fs::write(
-                ctrl_dir.join("address"),
-                format!("traddr={},trsvcid={}", ip, port),
-            )?;
-            fs::write(ctrl_dir.join("delete_controller"), "")?;
-
-            // Create mock namespace
-            let ns_dev_dir = ctrl_dir.join(format!("nvme{}n1", ctrl_index));
-            fs::create_dir_all(&ns_dev_dir)?;
-        } else {
-            fs::write(&target_file, &ctrl_conn_str)?;
+        if let Err(e) = execute_cmd("losetup", &["-d", loop_dev]) {
+            log::warn!("losetup -d {loop_dev} failed (detach it manually): {e}");
+            return;
         }
     }
-    Ok(())
+    println!("Detached associated loop device '{}'.", loop_dev);
 }
 
-pub fn connect_target(ip: &str, port: u16, subnqn: &str) -> std::io::Result<String> {
-    connect_target_single(ip, port, subnqn, None)?;
-
-    // Wait up to 2 seconds for the block device node to appear in sysfs
-    let start_time = std::time::Instant::now();
-    while start_time.elapsed() < std::time::Duration::from_secs(2) {
-        if let Ok(Some(dev)) = find_device_for_nqn(subnqn) {
-            return Ok(dev);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    Ok(
-        "Connection requested. Check 'squeezefs storage nvmeof list' for device mapping."
-            .to_string(),
-    )
-}
-
-pub fn disconnect_target(subnqn: &str) -> std::io::Result<()> {
+/// Unshare a target subsystem. Stack dispatch is resolved from the
+/// **ledger** — including `pending`/`removing` intent records (§6.4
+/// law 6: a crash-window share is still ours to remove); the `--spdk`
+/// flag only matters for pre-N1 unledgered shares (transitional legacy
+/// fallback, one-PR window — the rebuilt N2 verb refuses unledgered
+/// NQNs by ownership law).
+pub fn unshare_target(subnqn: &str, spdk_flag: bool) -> io::Result<()> {
     check_root()?;
-    let nvme_path = sysfs_nvme_path();
-    if !nvme_path.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "No active NVMe devices found.",
-        ));
-    }
+    retire_old_registry_once();
+    let ledger = Ledger::open_default();
 
-    let mut found = false;
-    for entry in fs::read_dir(nvme_path)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .starts_with("nvme")
-        {
-            let nqn_file = path.join("subsysnqn");
-            if nqn_file.exists() {
-                let current_nqn = fs::read_to_string(nqn_file)?.trim().to_string();
-                if current_nqn == subnqn {
-                    // Trigger disconnect by writing to delete_controller
-                    let del_file = path.join("delete_controller");
-                    if del_file.exists() {
-                        fs::write(del_file, "1")?;
-                        found = true;
-                        println!(
-                            "Sent delete request to controller '{}'.",
-                            path.file_name().unwrap().to_string_lossy()
-                        );
+    match ledger.find(subnqn)? {
+        Some(record) => {
+            if spdk_flag && record.stack != StackKind::Spdk {
+                println!(
+                    "Note: '--spdk' ignored — the ledger records '{}' on the {} stack \
+                     (dispatch is resolved from the ledger, never guessed).",
+                    subnqn,
+                    record.stack.as_str()
+                );
+            }
+            // §6.4 law 6: flip to `removing` BEFORE the first teardown
+            // write; delete the record only after teardown completes.
+            ledger.mark_removing(subnqn)?;
+            match record.stack {
+                StackKind::Spdk => unshare_spdk_via_rpc(subnqn, true)?,
+                StackKind::Nvmet => {
+                    unshare_nvmet_via_configfs(subnqn, true)?;
+                    if let Some(loop_dev) = &record.loop_device {
+                        detach_recorded_loop(loop_dev);
                     }
                 }
             }
+            ledger.delete(subnqn)?;
+            Ok(())
+        }
+        None => {
+            // Pre-N1 share (never ledgered): legacy teardown for this
+            // one-PR window. No loop detach — the configfs association
+            // read is gone (it never worked on a real kernel), and there
+            // is no ledger record to consult.
+            if spdk_flag {
+                unshare_spdk_via_rpc(subnqn, false)
+            } else {
+                unshare_nvmet_via_configfs(subnqn, false)
+            }
         }
     }
-
-    if !found {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("No connected controller found for NQN '{}'.", subnqn),
-        ));
-    }
-
-    Ok(())
 }
 
-pub fn list_nvmeof() -> std::io::Result<()> {
+pub fn list_nvmeof() -> io::Result<()> {
     check_root()?;
     let config_dir = configfs_path();
     let subs_dir = config_dir.join("subsystems");
 
-    // Colored is imported in main.rs but not necessarily here. We can just print standard strings or implement simple coloring.
+    // Loop associations come from the ledger (law 5) — the configfs
+    // fake file was unreadable on real kernels and nothing reads it now.
+    let ledger_records = Ledger::open_default().load().unwrap_or_else(|e| {
+        log::warn!("share ledger unreadable during list: {e}");
+        Vec::new()
+    });
+    let loop_of = |nqn: &str| {
+        ledger_records
+            .iter()
+            .find(|r| r.subnqn == nqn)
+            .and_then(|r| r.loop_device.clone())
+    };
+
     println!("=== Shared NVMe-oF Targets ===");
     let mut targets_found = false;
     if subs_dir.exists() {
@@ -860,9 +872,8 @@ pub fn list_nvmeof() -> std::io::Result<()> {
                 "unknown".to_string()
             };
 
-            let assoc_loop = fs::read_to_string(sub_path.join("associated_loop_device"))
-                .ok()
-                .map(|s| format!(" (loop: {})", s.trim()))
+            let assoc_loop = loop_of(&sub_name)
+                .map(|l| format!(" (loop: {})", l))
                 .unwrap_or_default();
 
             // Find bound IP and Port
@@ -901,11 +912,13 @@ pub fn list_nvmeof() -> std::io::Result<()> {
 
                 // Backing bdev
                 let mut backing = "unknown".to_string();
-                if let Some(namespaces) = sub.get("namespaces").and_then(|n| n.as_array()) {
-                    if let Some(ns) = namespaces.first() {
-                        if let Some(bdev_name) = ns.get("bdev_name").and_then(|b| b.as_str()) {
-                            backing = bdev_name.to_string();
-                        }
+                if let Some(ns) = sub
+                    .get("namespaces")
+                    .and_then(|n| n.as_array())
+                    .and_then(|n| n.first())
+                {
+                    if let Some(bdev_name) = ns.get("bdev_name").and_then(|b| b.as_str()) {
+                        backing = bdev_name.to_string();
                     }
                 }
 
@@ -946,34 +959,7 @@ pub fn list_nvmeof() -> std::io::Result<()> {
     }
 
     println!("=== Connected Fabric Disks ===");
-    let nvme_path = sysfs_nvme_path();
-    let mut initiator_found = false;
-    if nvme_path.exists() {
-        for entry in fs::read_dir(nvme_path)? {
-            let entry = entry?;
-            let path = entry.path();
-            let dev_name = entry.file_name().to_string_lossy().to_string();
-            if dev_name.starts_with("nvme") {
-                let subs_nqn_file = path.join("subsysnqn");
-                let address_file = path.join("address");
-                if subs_nqn_file.exists() {
-                    let nqn = fs::read_to_string(subs_nqn_file)?.trim().to_string();
-                    let addr = if address_file.exists() {
-                        fs::read_to_string(address_file)?.trim().to_string()
-                    } else {
-                        "unknown".to_string()
-                    };
-
-                    println!("  Device:  /dev/{}n1", dev_name);
-                    println!("  NQN:     {}", nqn);
-                    println!("  Target:  {}", addr);
-                    println!();
-                    initiator_found = true;
-                }
-            }
-        }
-    }
-
+    let initiator_found = initiator::print_connected_fabric_disks()?;
     if !initiator_found {
         println!("  No connected remote NVMe-oF fabric disks.");
     }
@@ -981,166 +967,128 @@ pub fn list_nvmeof() -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn extract_nvmeof_connection_details(backing_dev: &str) -> Option<(String, u16, String)> {
-    use std::fs;
-    use std::path::Path;
-
-    let path = Path::new(backing_dev);
-    let real_path = fs::canonicalize(path).ok()?;
-    let real_path_str = real_path.to_string_lossy();
-
-    // Check if it starts with /dev/nvme
-    if real_path_str.starts_with("/dev/nvme") {
-        let parts: Vec<&str> = real_path_str.split('/').collect();
-        if let Some(dev_name) = parts.last() {
-            if dev_name.starts_with("nvme") {
-                // Find index before 'n' (e.g. nvme0n1 -> nvme0)
-                if let Some(end_idx) = dev_name.rfind('n') {
-                    let ctrl = &dev_name[..end_idx];
-                    let subsysnqn_path = format!("/sys/class/nvme/{}/subsysnqn", ctrl);
-                    let address_path = format!("/sys/class/nvme/{}/address", ctrl);
-
-                    if let (Ok(nqn_raw), Ok(addr_raw)) = (
-                        fs::read_to_string(subsysnqn_path),
-                        fs::read_to_string(address_path),
-                    ) {
-                        let subnqn = nqn_raw.trim().to_string();
-
-                        // Parse address properties: e.g. "traddr=192.168.1.100,trsvcid=4420"
-                        let mut ip = None;
-                        let mut port = None;
-                        for part in addr_raw.split(',') {
-                            let kv: Vec<&str> = part.split('=').collect();
-                            if kv.len() == 2 {
-                                match kv[0].trim() {
-                                    "traddr" => ip = Some(kv[1].trim().to_string()),
-                                    "trsvcid" => port = kv[1].trim().parse::<u16>().ok(),
-                                    _ => {}
-                                }
-                            }
-                        }
-                        if let (Some(ip_val), Some(port_val)) = (ip, port) {
-                            return Some((ip_val, port_val, subnqn));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-pub struct NvmeofShareConfig {
-    pub backing_path: String,
-    pub subnqn: String,
-    pub port: u16,
-    pub ip: String,
-    pub is_spdk: Option<bool>,
-}
-
-fn get_shares_config_path() -> PathBuf {
-    if std::env::var("SQUEEZEFS_TEST_ENV").is_ok() {
-        return PathBuf::from("/tmp/squeezefs_nvmeof_shares_test.json");
-    }
-    // If running as root, save under /etc/squeezefs/
-    let path = PathBuf::from("/etc/squeezefs/nvmeof_shares.json");
-    if let Some(parent) = path.parent() {
-        if fs::create_dir_all(parent).is_ok() && fs::write(&path, "[]").is_ok() {
-            return path;
-        }
-    }
-    // Fallback for non-root / user local path
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(format!("{}/.squeeze/nvmeof_shares.json", home))
-}
-
-fn load_shares() -> Vec<NvmeofShareConfig> {
-    let path = get_shares_config_path();
-    if let Ok(content) = fs::read_to_string(&path) {
-        serde_json::from_str(&content).unwrap_or_default()
-    } else {
-        Vec::new()
-    }
-}
-
-fn save_shares(shares: &[NvmeofShareConfig]) -> std::io::Result<()> {
-    let path = get_shares_config_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let content = serde_json::to_string_pretty(shares)?;
-    fs::write(path, content)?;
-    Ok(())
-}
-
-pub fn register_share(
-    backing_path: &str,
-    subnqn: &str,
-    port: u16,
-    ips: &[String],
-) -> std::io::Result<()> {
-    register_share_ext(backing_path, subnqn, port, ips, false)
-}
-
-pub fn register_share_ext(
-    backing_path: &str,
-    subnqn: &str,
-    port: u16,
-    ips: &[String],
-    is_spdk: bool,
-) -> std::io::Result<()> {
-    let mut shares = load_shares();
-    shares.retain(|s| s.subnqn != subnqn);
-    shares.push(NvmeofShareConfig {
-        backing_path: backing_path.to_string(),
-        subnqn: subnqn.to_string(),
-        port,
-        ip: ips.join(","),
-        is_spdk: Some(is_spdk),
-    });
-    save_shares(&shares)
-}
-
-pub fn deregister_share(subnqn: &str) -> std::io::Result<()> {
-    let mut shares = load_shares();
-    shares.retain(|s| s.subnqn != subnqn);
-    save_shares(&shares)
-}
-
-pub fn restore_shares() -> std::io::Result<()> {
-    let shares = load_shares();
-    if shares.is_empty() {
+/// Replay the share ledger (`restore-shares`). N1 semantics (PR-plan
+/// PR 1 transitional contract + §6.4 laws 4/6):
+///
+/// * **nvmet records** replay through the pre-rebuild configfs path
+///   (including its collision-prone port allocator — accepted for this
+///   one-PR window; N2 replaces the path): `active` + already-live ⇒
+///   verified no-op; `active` + gone ⇒ re-shared; `pending` + live ⇒
+///   finalized with a loud line; `pending` + no live objects ⇒
+///   garbage-collected loud; `removing` ⇒ teardown resumed, record
+///   deleted.
+/// * **spdk records are not replayed at this milestone** — SPDK restore
+///   rides the SPDK-native `save_config`/`load_config` truth from the
+///   SPDK rebuild (N3/N4) on; records are kept for ownership/dispatch
+///   and each skip says so loudly.
+///
+/// Per-record failures are collected (a report, not a first-failure
+/// bail); any failure makes the verb exit nonzero.
+pub fn restore_shares() -> io::Result<()> {
+    check_root()?;
+    retire_old_registry_once();
+    let ledger = Ledger::open_default();
+    let records = ledger.load()?;
+    if records.is_empty() {
         log::info!("No NVMe-oF target shares to restore.");
         return Ok(());
     }
-    log::info!("Restoring {} NVMe-oF target shares...", shares.len());
-    for share in shares {
-        log::info!(
-            "Restoring shared target {} on port {} (IPs: {})...",
-            share.backing_path,
-            share.port,
-            share.ip
-        );
-        let ips: Vec<String> = share.ip.split(',').map(|s| s.trim().to_string()).collect();
-        let res = if share.is_spdk.unwrap_or(false) {
-            share_target_spdk(&share.backing_path, Some(&share.subnqn), share.port, &ips)
-        } else {
-            share_target(&share.backing_path, Some(&share.subnqn), share.port, &ips)
-                .map(|_| share.subnqn.clone())
-        };
-        if let Err(e) = res {
+    log::info!("Restoring {} NVMe-oF target share(s)...", records.len());
+
+    let mut failures = 0usize;
+    for record in &records {
+        if record.stack == StackKind::Spdk {
+            log::warn!(
+                "restore-shares: not replaying SPDK share '{}' at this milestone — SPDK \
+                 restore rides SPDK-native save_config/load_config from the SPDK rebuild \
+                 (design PR N3/N4); the ledger record is kept for ownership and unshare \
+                 dispatch",
+                record.subnqn
+            );
+            continue;
+        }
+        if let Err(e) = restore_nvmet_record(&ledger, record) {
+            failures += 1;
             log::error!(
                 "Failed to restore target share for {}: {:?}",
-                share.subnqn,
+                record.subnqn,
                 e
             );
         }
     }
+
+    if failures > 0 {
+        return Err(io::Error::other(format!(
+            "{failures} of {} ledger share(s) failed to restore — see the log for the \
+             per-share report",
+            records.len()
+        )));
+    }
     Ok(())
 }
 
-pub fn spdk_install() -> std::io::Result<()> {
+fn restore_nvmet_record(ledger: &Ledger, record: &ShareRecord) -> io::Result<()> {
+    let sub_dir = configfs_path().join("subsystems").join(&record.subnqn);
+    match record.state {
+        ShareState::Removing => {
+            // §6.4 law 6: an interrupted unshare is resumed, not revived.
+            log::warn!(
+                "restore-shares: resuming interrupted teardown of '{}' (removing intent)",
+                record.subnqn
+            );
+            unshare_nvmet_via_configfs(&record.subnqn, true)?;
+            if let Some(loop_dev) = &record.loop_device {
+                detach_recorded_loop(loop_dev);
+            }
+            ledger.delete(&record.subnqn)
+        }
+        ShareState::Pending => {
+            if sub_dir.exists() {
+                // Live objects exist and match ⇒ the crash happened after
+                // the mutations completed: finalize the intent.
+                log::warn!(
+                    "restore-shares: finalizing crash-window pending intent '{}' — its live \
+                     objects exist",
+                    record.subnqn
+                );
+                ledger.finalize_share(&record.subnqn)
+            } else {
+                // No live objects ⇒ the share verb never completed and
+                // never returned success: garbage-collect the intent.
+                log::warn!(
+                    "restore-shares: garbage-collecting pending intent '{}' — no live objects \
+                     (the interrupted share never completed)",
+                    record.subnqn
+                );
+                ledger.delete(&record.subnqn)
+            }
+        }
+        ShareState::Active => {
+            if sub_dir.exists() {
+                // §6.4 law 4: an already-live share is a verified no-op.
+                log::info!(
+                    "restore-shares: '{}' is already live — verified no-op",
+                    record.subnqn
+                );
+                return Ok(());
+            }
+            if PathBuf::from(&record.backing_path).is_file() {
+                nocow::ensure_nocow_backing(Path::new(&record.backing_path))?;
+            }
+            let loop_device =
+                share_nvmet_via_configfs(&record.subnqn, &record.backing_path, &record.listeners)?;
+            // The loop device may differ across boots — refresh law-5
+            // bookkeeping.
+            if loop_device != record.loop_device {
+                ledger.set_loop_device(&record.subnqn, loop_device)?;
+            }
+            log::info!("restore-shares: re-shared '{}'", record.subnqn);
+            Ok(())
+        }
+    }
+}
+
+pub fn spdk_install() -> io::Result<()> {
     check_root()?;
     println!("Installing SPDK dependencies and compiling from source...");
     if is_mock() {
@@ -1150,8 +1098,8 @@ pub fn spdk_install() -> std::io::Result<()> {
 
     // 1. Clone
     println!("Cloning SPDK repo to /opt/spdk...");
-    let status = std::process::Command::new("git")
-        .args(&["clone", "https://github.com/spdk/spdk.git", "/opt/spdk"])
+    let status = Command::new("git")
+        .args(["clone", "https://github.com/spdk/spdk.git", "/opt/spdk"])
         .status()?;
     if !status.success() {
         println!(
@@ -1159,40 +1107,32 @@ pub fn spdk_install() -> std::io::Result<()> {
         );
     }
 
-    let status = std::process::Command::new("git")
+    let status = Command::new("git")
         .current_dir("/opt/spdk")
-        .args(&["submodule", "update", "--init"])
+        .args(["submodule", "update", "--init"])
         .status()?;
     if !status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Failed to update SPDK submodules",
-        ));
+        return Err(io::Error::other("Failed to update SPDK submodules"));
     }
 
     println!("Running pkgdep.sh to install system dependencies...");
-    let status = std::process::Command::new("./scripts/pkgdep.sh")
+    let status = Command::new("./scripts/pkgdep.sh")
         .current_dir("/opt/spdk")
         .status()?;
     if !status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Failed to install SPDK dependencies",
-        ));
+        return Err(io::Error::other("Failed to install SPDK dependencies"));
     }
 
     // Install Python dependencies (tabulate)
     println!("Installing required Python modules (tabulate)...");
-    let pip_status = std::process::Command::new("pip3")
-        .args(&["install", "tabulate", "--break-system-packages"])
+    let pip_status = Command::new("pip3")
+        .args(["install", "tabulate", "--break-system-packages"])
         .status();
     if pip_status.is_err() || !pip_status.unwrap().success() {
-        let pip_status2 = std::process::Command::new("pip")
-            .args(&["install", "tabulate"])
-            .status();
+        let pip_status2 = Command::new("pip").args(["install", "tabulate"]).status();
         if pip_status2.is_err() || !pip_status2.unwrap().success() {
-            let apt_status = std::process::Command::new("apt-get")
-                .args(&["install", "-y", "python3-tabulate"])
+            let apt_status = Command::new("apt-get")
+                .args(["install", "-y", "python3-tabulate"])
                 .status();
             if apt_status.is_err() || !apt_status.unwrap().success() {
                 println!(
@@ -1203,36 +1143,30 @@ pub fn spdk_install() -> std::io::Result<()> {
     }
 
     println!("Configuring SPDK...");
-    let status = std::process::Command::new("./configure")
+    let status = Command::new("./configure")
         .current_dir("/opt/spdk")
         .status()?;
     if !status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Failed to configure SPDK",
-        ));
+        return Err(io::Error::other("Failed to configure SPDK"));
     }
 
     println!("Building SPDK (this may take a few minutes)...");
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let status = std::process::Command::new("make")
+    let status = Command::new("make")
         .arg(format!("-j{}", cores))
         .current_dir("/opt/spdk")
         .status()?;
     if !status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Failed to compile SPDK",
-        ));
+        return Err(io::Error::other("Failed to compile SPDK"));
     }
 
     println!("Successfully installed and compiled SPDK at /opt/spdk.");
     Ok(())
 }
 
-pub fn spdk_setup(hugepages_mb: usize) -> std::io::Result<()> {
+pub fn spdk_setup(hugepages_mb: usize) -> io::Result<()> {
     check_root()?;
     println!("Configuring hugepages ({}MB)...", hugepages_mb);
     if is_mock() {
@@ -1243,26 +1177,23 @@ pub fn spdk_setup(hugepages_mb: usize) -> std::io::Result<()> {
     // 1. Allocate hugepages via sysfs
     let pages = hugepages_mb / 2; // 2MB pages
     let nr_hugepages_path = "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages";
-    if std::path::Path::new(nr_hugepages_path).exists() {
+    if Path::new(nr_hugepages_path).exists() {
         fs::write(nr_hugepages_path, pages.to_string())?;
         println!("Successfully allocated {} x 2MB hugepages.", pages);
     } else {
         // Fallback to setup.sh config_huge
         let setup_script = "/opt/spdk/scripts/setup.sh";
-        if std::path::Path::new(setup_script).exists() {
-            let status = std::process::Command::new(setup_script)
+        if Path::new(setup_script).exists() {
+            let status = Command::new(setup_script)
                 .arg("config_huge")
                 .env("HUGEMEM", hugepages_mb.to_string())
                 .status()?;
             if !status.success() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "SPDK setup.sh config_huge failed.",
-                ));
+                return Err(io::Error::other("SPDK setup.sh config_huge failed."));
             }
         } else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
                 "SPDK setup.sh not found at /opt/spdk/scripts/setup.sh.",
             ));
         }
@@ -1272,7 +1203,7 @@ pub fn spdk_setup(hugepages_mb: usize) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn spdk_bind(pci_addr: &str) -> std::io::Result<()> {
+pub fn spdk_bind(pci_addr: &str) -> io::Result<()> {
     check_root()?;
     println!(
         "Binding device at PCI address {} to SPDK user-space driver...",
@@ -1284,20 +1215,20 @@ pub fn spdk_bind(pci_addr: &str) -> std::io::Result<()> {
     }
 
     let setup_script = "/opt/spdk/scripts/setup.sh";
-    if std::path::Path::new(setup_script).exists() {
-        let status = std::process::Command::new(setup_script)
+    if Path::new(setup_script).exists() {
+        let status = Command::new(setup_script)
             .arg("bind")
             .arg(pci_addr)
             .status()?;
         if !status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to bind device {} using SPDK setup.sh", pci_addr),
-            ));
+            return Err(io::Error::other(format!(
+                "Failed to bind device {} using SPDK setup.sh",
+                pci_addr
+            )));
         }
     } else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
             "SPDK setup.sh not found. Run 'squeezefs storage nvmeof spdk-install' first.",
         ));
     }
@@ -1306,7 +1237,7 @@ pub fn spdk_bind(pci_addr: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn spdk_unbind(pci_addr: &str) -> std::io::Result<()> {
+pub fn spdk_unbind(pci_addr: &str) -> io::Result<()> {
     check_root()?;
     println!("Unbinding device at PCI address {} from SPDK...", pci_addr);
     if is_mock() {
@@ -1316,13 +1247,13 @@ pub fn spdk_unbind(pci_addr: &str) -> std::io::Result<()> {
 
     // Unbind from SPDK driver (vfio-pci or uio_pci_generic) via sysfs
     let unbind_path = format!("/sys/bus/pci/devices/{}/driver/unbind", pci_addr);
-    if std::path::Path::new(&unbind_path).exists() {
+    if Path::new(&unbind_path).exists() {
         let _ = fs::write(&unbind_path, pci_addr);
     }
 
     // Trigger driver probe to return it to the kernel NVMe driver
     let probe_path = "/sys/bus/pci/drivers_probe";
-    if std::path::Path::new(probe_path).exists() {
+    if Path::new(probe_path).exists() {
         let _ = fs::write(probe_path, pci_addr);
     }
 
@@ -1330,7 +1261,7 @@ pub fn spdk_unbind(pci_addr: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn spdk_start() -> std::io::Result<()> {
+pub fn spdk_start() -> io::Result<()> {
     check_root()?;
     println!("Starting SPDK NVMe-oF target daemon (nvmf_tgt)...");
     if is_mock() {
@@ -1339,15 +1270,15 @@ pub fn spdk_start() -> std::io::Result<()> {
     }
 
     let bin_path = "/opt/spdk/build/bin/nvmf_tgt";
-    if !std::path::Path::new(bin_path).exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
+    if !Path::new(bin_path).exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
             "SPDK target binary not found. Run 'squeezefs storage nvmeof spdk-install' first.",
         ));
     }
 
     // Check if nvmf_tgt is already running
-    let check = std::process::Command::new("pgrep").arg("nvmf_tgt").status();
+    let check = Command::new("pgrep").arg("nvmf_tgt").status();
     if let Ok(status) = check {
         if status.success() {
             println!("SPDK target daemon (nvmf_tgt) is already running.");
@@ -1356,7 +1287,7 @@ pub fn spdk_start() -> std::io::Result<()> {
     }
 
     // Spawn daemon in background
-    let child = std::process::Command::new(bin_path)
+    let child = Command::new(bin_path)
         .arg("-i")
         .arg("0")
         .arg("-m")
@@ -1368,205 +1299,4 @@ pub fn spdk_start() -> std::io::Result<()> {
     println!("Spawned SPDK nvmf_tgt in background (PID: {}).", child.id());
     println!("JSON-RPC socket listening at /var/tmp/spdk.sock");
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// CoW-filesystem guard for file-backed targets.
-// ---------------------------------------------------------------------------
-
-const BTRFS_SUPER_MAGIC: i64 = 0x9123_683E;
-const FS_NOCOW_FL: libc::c_long = 0x0080_0000;
-// ioctl codes for FS_IOC_GETFLAGS / FS_IOC_SETFLAGS (_IOR/_IOW('f', 1/2, long)).
-const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
-const FS_IOC_SETFLAGS: libc::c_ulong = 0x4008_6602;
-
-/// Ensure a regular-file backing path is safe to serve as an NVMe-oF target.
-///
-/// On btrfs, `O_DIRECT` (SPDK's AIO bdev) **silently degrades to buffered
-/// I/O on copy-on-write files**. The single-threaded `nvmf_tgt` reactor then
-/// parks in the kernel dirty-page throttle (`balance_dirty_pages`) under
-/// write load, stops polling the fabric sockets, keepalives blow past their
-/// budget, controllers flap between `live`/`connecting`, and every consumer
-/// of the target wedges in D-state — observed live as "format hangs".
-///
-/// Policy:
-/// - non-btrfs filesystem: nothing to do.
-/// - btrfs + flag already set, or file still EMPTY: set `FS_NOCOW_FL`
-///   (the flag only takes effect on empty files).
-/// - btrfs + data already written + no flag: **fail loud** with the exact
-///   remediation — silently proceeding is how the fabric wedged.
-fn ensure_nocow_backing(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-
-    let meta = fs::metadata(path)?;
-    if !meta.is_file() {
-        return Ok(()); // block devices etc. — not our concern here
-    }
-
-    // Filesystem probe.
-    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(c_path.as_ptr(), &mut sfs) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if sfs.f_type as i64 != BTRFS_SUPER_MAGIC {
-        return Ok(());
-    }
-
-    let f = fs::OpenOptions::new().read(true).open(path)?;
-    let mut flags: libc::c_long = 0;
-    if unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_GETFLAGS, &mut flags) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if flags & FS_NOCOW_FL != 0 {
-        return Ok(());
-    }
-    if meta.len() > 0 && !file_is_all_hole(path, &meta) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "Backing file '{}' lives on btrfs WITHOUT the NoCOW attribute and already \
-                 carries data. SPDK's O_DIRECT silently degrades to buffered I/O on CoW \
-                 files, which wedges the whole fabric under write load. Recreate it: \
-                 `rm {p} && touch {p} && chattr +C {p} && truncate -s <size> {p}` \
-                 (or place it on a non-CoW filesystem).",
-                path.display(),
-                p = path.display()
-            ),
-        ));
-    }
-    // Empty (or hole-only) file: btrfs only honors +C at i_size == 0 (it
-    // silently masks the bit otherwise), so shrink → flag → re-extend —
-    // safe for hole-only files, which have no data blocks to lose — and
-    // VERIFY the flag stuck.
-    drop(f);
-    let f = fs::OpenOptions::new().read(true).write(true).open(path)?;
-    let original_len = meta.len();
-    f.set_len(0)?;
-    flags |= FS_NOCOW_FL;
-    let set_res = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_SETFLAGS, &flags) };
-    let set_err = std::io::Error::last_os_error();
-    f.set_len(original_len)?;
-    if set_res != 0 {
-        return Err(set_err);
-    }
-    let mut verify: libc::c_long = 0;
-    if unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_GETFLAGS, &mut verify) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if verify & FS_NOCOW_FL == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            format!(
-                "btrfs did not accept the NoCOW attribute on '{}' — recreate it with \
-                 `touch`+`chattr +C` before sizing, or use a non-CoW filesystem",
-                path.display()
-            ),
-        ));
-    }
-    log::info!(
-        "Applied btrfs NoCOW (+C) to NVMe-oF backing file {}",
-        path.display()
-    );
-    Ok(())
-}
-
-/// Whether a file allocates no data blocks (truncate-only sparse file):
-/// btrfs accepts `FS_NOCOW_FL` on these exactly like on empty files.
-fn file_is_all_hole(path: &Path, meta: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let _ = path;
-    meta.blocks() == 0
-}
-
-#[cfg(test)]
-mod nocow_tests {
-    use super::*;
-    use std::io::Write;
-
-    fn fs_is_btrfs(dir: &Path) -> bool {
-        let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
-        let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
-        unsafe { libc::statfs(c.as_ptr(), &mut sfs) == 0 && sfs.f_type as i64 == BTRFS_SUPER_MAGIC }
-    }
-
-    fn get_flags(path: &Path) -> libc::c_long {
-        use std::os::unix::io::AsRawFd;
-        let f = fs::File::open(path).unwrap();
-        let mut flags: libc::c_long = 0;
-        unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_GETFLAGS, &mut flags) };
-        flags
-    }
-
-    /// Fresh (empty or truncate-sparse) backing files on btrfs get +C; the
-    /// repo checkout typically lives on btrfs — skip gracefully elsewhere.
-    #[test]
-    fn test_nocow_applied_to_fresh_backing_file() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
-        if !fs_is_btrfs(&dir) {
-            eprintln!("skip: target/ not on btrfs");
-            return;
-        }
-        let path = dir.join("nocow_fresh_test.nvme");
-        let _ = fs::remove_file(&path);
-        let f = fs::File::create(&path).unwrap();
-        f.set_len(4 * 1024 * 1024).unwrap(); // sparse: no data blocks
-        drop(f);
-
-        ensure_nocow_backing(&path).expect("fresh sparse file must accept +C");
-        assert_ne!(
-            get_flags(&path) & FS_NOCOW_FL,
-            0,
-            "NoCOW flag must be set on the fresh backing file"
-        );
-        let _ = fs::remove_file(&path);
-    }
-
-    /// Data-carrying CoW files must FAIL LOUD with the remediation — never
-    /// silently serve a fabric-wedging backing file.
-    #[test]
-    fn test_nocow_rejects_data_carrying_cow_file() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
-        if !fs_is_btrfs(&dir) {
-            eprintln!("skip: target/ not on btrfs");
-            return;
-        }
-        let path = dir.join("nocow_dirty_test.nvme");
-        let _ = fs::remove_file(&path);
-        let mut f = fs::File::create(&path).unwrap();
-        f.write_all(&[0xAA; 8192]).unwrap();
-        f.sync_all().unwrap();
-        drop(f);
-
-        let err = ensure_nocow_backing(&path)
-            .expect_err("data-carrying CoW backing file must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("NoCOW"),
-            "error must explain the CoW hazard: {msg}"
-        );
-        assert!(
-            msg.contains("chattr +C"),
-            "error must carry the remediation: {msg}"
-        );
-        let _ = fs::remove_file(&path);
-    }
-
-    /// Non-btrfs filesystems (tmpfs /tmp) are a no-op.
-    #[test]
-    fn test_nocow_noop_on_non_btrfs() {
-        let path = std::path::PathBuf::from("/tmp/nocow_noop_test.nvme");
-        let _ = fs::remove_file(&path);
-        let mut f = fs::File::create(&path).unwrap();
-        f.write_all(&[0xBB; 4096]).unwrap();
-        drop(f);
-        if fs_is_btrfs(std::path::Path::new("/tmp")) {
-            eprintln!("skip: /tmp unexpectedly btrfs");
-            let _ = fs::remove_file(&path);
-            return;
-        }
-        ensure_nocow_backing(&path).expect("non-CoW filesystems need no flag");
-        let _ = fs::remove_file(&path);
-    }
 }

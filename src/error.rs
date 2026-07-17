@@ -13,9 +13,6 @@ pub enum SqueezefsError {
     #[error("Metadata Backend error: {0}")]
     Redis(#[from] MockRedisError),
 
-    #[error("NVMe-oF error: {0}")]
-    NvmeOfBackend(String),
-
     #[error("Lock acquisition failed: {reason}")]
     LockFailed { reason: String },
 
@@ -61,7 +58,6 @@ impl SqueezefsError {
                 }
             }
             SqueezefsError::Redis(_) => libc::ECOMM,
-            SqueezefsError::NvmeOfBackend(_) => libc::EIO,
             SqueezefsError::LockFailed { .. } => libc::EAGAIN,
             SqueezefsError::FencingTokenExpired { .. } => libc::EIO,
             SqueezefsError::InvalidOperation(msg) => {

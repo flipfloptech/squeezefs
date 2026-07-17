@@ -2899,11 +2899,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 NvmeofActions::Unshare { subnqn, spdk } => {
-                    if spdk {
-                        squeezefs::nvmeof::unshare_target_spdk(&subnqn)?;
-                    } else {
-                        squeezefs::nvmeof::unshare_target(&subnqn)?;
-                    }
+                    // Stack dispatch is resolved from the share ledger
+                    // (docs/design-nvmeof-target-management.md §6.4); the
+                    // --spdk flag only matters for pre-N1 unledgered shares.
+                    squeezefs::nvmeof::unshare_target(&subnqn, spdk)?;
                     println!("Successfully stopped sharing target NQN '{}'.", subnqn);
                 }
                 NvmeofActions::Connect { ip, port, subnqn } => {

@@ -292,6 +292,73 @@ pub fn set_patch_max_bytes(v: u64) {
     patch_max_bytes_cell().store(v, Ordering::Relaxed);
 }
 
+/// W2 fold trigger — extent COUNT threshold (`SQUEEZEFS_FOLD_MAX_EXTENTS`,
+/// design §6): an extent overlay reaching this many parked runs enqueues a
+/// background fold. Env read once; runtime-settable for tests/acceptance.
+fn fold_max_extents_cell() -> &'static AtomicU64 {
+    static CELL: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let v = std::env::var("SQUEEZEFS_FOLD_MAX_EXTENTS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(64);
+        AtomicU64::new(v)
+    })
+}
+
+/// Current W2 fold extent-count trigger (0 = threshold folds disabled).
+pub fn fold_max_extents() -> u64 {
+    fold_max_extents_cell().load(Ordering::Relaxed)
+}
+
+/// Set the W2 fold extent-count trigger (tests/acceptance).
+pub fn set_fold_max_extents(v: u64) {
+    fold_max_extents_cell().store(v, Ordering::Relaxed);
+}
+
+/// W2 fold trigger — parked payload BYTE threshold per block
+/// (`SQUEEZEFS_FOLD_MAX_BYTES`, design §6). Default 1 MiB.
+fn fold_max_bytes_cell() -> &'static AtomicU64 {
+    static CELL: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let v = std::env::var("SQUEEZEFS_FOLD_MAX_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(1024 * 1024);
+        AtomicU64::new(v)
+    })
+}
+
+/// Current W2 fold byte trigger (0 = threshold folds disabled).
+pub fn fold_max_bytes() -> u64 {
+    fold_max_bytes_cell().load(Ordering::Relaxed)
+}
+
+/// Set the W2 fold byte trigger (tests/acceptance).
+pub fn set_fold_max_bytes(v: u64) {
+    fold_max_bytes_cell().store(v, Ordering::Relaxed);
+}
+
+/// W2 parked-write budget, in BUFFERS' WORTH of bytes (× block size): the
+/// retired 256-COUNT cap's byte form (§5.2 — an extent overlay charges its
+/// payload bytes, not a whole buffer). Runtime-settable test/acceptance
+/// seam; production default = the historical 256.
+fn parked_cap_buffers_cell() -> &'static AtomicU64 {
+    static CELL: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| AtomicU64::new(MAX_ACTIVE_BLOCK_BUFFERS as u64))
+}
+
+/// Current parked-write budget in buffers' worth (see
+/// [`set_parked_cap_buffers`]).
+pub fn parked_cap_buffers() -> u64 {
+    parked_cap_buffers_cell().load(Ordering::Relaxed)
+}
+
+/// Set the parked-write budget in buffers' worth (tests/acceptance).
+pub fn set_parked_cap_buffers(v: u64) {
+    parked_cap_buffers_cell().store(v, Ordering::Relaxed);
+}
+
 /// Op types the registry attributes — the mdstorm-visible request mix
 /// plus every op class that lost its per-op `timeout()` wrapper to the
 /// D1.b watchdog (read/write/readdir/link-family/fsync can all park on
@@ -1856,6 +1923,79 @@ pub struct Metrics {
     /// Patch DMA failures (EIO surfaced to exactly this write; tiers
     /// purged + incarnation re-stabilized — nothing acked, nothing lost).
     pub patch_dma_errors: Align64<AtomicU64>,
+
+    // -----------------------------------------------------------------
+    // W2 — extent-granular overlay / spill records / batched fold
+    // (design-random-small-writes §5.2 / §5.4, PR RW4). The
+    // patch-INELIGIBLE small-write shapes (compressed/encrypted volumes,
+    // shared/decorated/hole/unaligned blocks) park compactly, spill as
+    // 4 KiB-class staged extent records, and RMW exactly once per fold.
+    // -----------------------------------------------------------------
+    /// RAM bytes parked in extent-overlay payload slabs (RAII-gauged by
+    /// [`crate::cache::active_block::ActiveBlockBuf`]) — the R5 authority
+    /// component of the same name, sheddable via the parked drain (fold).
+    pub parked_extent_bytes: Align64<AtomicU64>,
+    /// RAM bytes parked in full-repr `ActiveBlockBuf` block backings
+    /// (block-size class; RAII-gauged). Together with
+    /// `parked_extent_bytes` this is the parked-write BYTE budget the old
+    /// 256-COUNT cap became (§5.2 — the inline-spill convoy for the small
+    /// shape dies with the count cap).
+    pub parked_full_buffer_bytes: Align64<AtomicU64>,
+    /// Small non-adjacent writes parked as extent-overlay runs (a 4 KiB
+    /// write parks ~4 KiB, not a 4 MiB-class deferred buffer).
+    pub extent_parks: Align64<AtomicU64>,
+    /// Extent overlays escalated to full buffers (coverage ≥ 25 % of the
+    /// block or a large merge).
+    pub extent_escalations: Align64<AtomicU64>,
+    /// Escalations taken IMPLICITLY by a legacy full-image call site
+    /// reaching an extent-repr buffer (defensive correctness arm). The
+    /// designed park/spill/fold routes never take it — growth here means
+    /// a route regression, not corruption.
+    pub extent_implicit_escalations: Align64<AtomicU64>,
+    /// Extent overlays spilled as staged `active_block_ext:` records
+    /// (**zero seed reads at spill, ever** — pinned by `get_obj` +
+    /// `spill_seed_reads` deltas staying 0 across extent spills).
+    pub extent_spills: Align64<AtomicU64>,
+    /// Payload bytes carried by extent-record spills (4 KiB-class puts vs
+    /// the retired seed-materialize + 4 MiB image put).
+    pub extent_spill_bytes: Align64<AtomicU64>,
+    /// Staged extent records absorbed back into a RAM overlay/buffer at
+    /// checkout (custody moves staging → RAM, the one-authority law).
+    pub extent_record_absorbs: Align64<AtomicU64>,
+    /// Per-block folds completed: seed ONCE (item B's binding-validated
+    /// `fetch_seed_image`), apply all k parked+staged extents, one durable
+    /// upload — amp ≈ 2048/k + spill legs (§4).
+    pub fold_passes: Align64<AtomicU64>,
+    /// Old-block seed reads paid by folds (≈ `fold_passes` for
+    /// data-backed blocks; 0 for hole-backed folds — never per extent).
+    pub fold_seed_reads: Align64<AtomicU64>,
+    /// Σ extents applied across folds (`fold_fill` mean = this ÷
+    /// `fold_passes`; the G-RW6 amortization gauge — median ≥ 16 gates).
+    pub fold_extents_folded: Align64<AtomicU64>,
+    /// `fold_fill` histogram: extents applied per fold (k).
+    pub fold_fill: Align64<QueueDepthHistogram>,
+    /// Staged-layout rider (§5.2): sub-image staged-file overwrites
+    /// captured as extent records instead of whole-image RMW re-stages.
+    pub staged_rider_extent_writes: Align64<AtomicU64>,
+    /// Rider records folded back into their staged image (fsync /
+    /// extending write / promotion / teardown).
+    pub staged_rider_folds: Align64<AtomicU64>,
+    /// Extent records found at mount (orphans — a clean shutdown drains
+    /// every record to fold, so ANY record here is kill-9-class residue;
+    /// loud stderr line per sweep, the `bind_staging_generation` loudness
+    /// class) that were RECOVERED (generation-bound, fencing-current).
+    pub extent_records_recovered: Align64<AtomicU64>,
+    /// Recovered-at-mount records DISCARDED for a stale fencing token
+    /// (the remount law: "stale fencing tokens discard staged work").
+    pub extent_records_stale_discarded: Align64<AtomicU64>,
+    /// Extent-record blobs that failed structural validation (torn write /
+    /// foreign bytes / checksum mismatch): detected-and-ignored loudly.
+    pub extent_records_torn_discarded: Align64<AtomicU64>,
+    /// Extent records naming a FUTURE record version: refused as units,
+    /// loudly, and LEFT IN PLACE (acked custody of a newer binary — the
+    /// §5.2 forward-only fence; the dir-level marker normally refuses the
+    /// whole mount first, so growth here means a mixed-version dir).
+    pub extent_records_future_refused: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -2868,6 +3008,26 @@ impl SqueezefsFilesystem {
                 "patch_ineligible_adjacent": METRICS.patch_ineligible_adjacent.load(Ordering::Relaxed),
                 "patch_ineligible_oversize": METRICS.patch_ineligible_oversize.load(Ordering::Relaxed),
                 "patch_dma_errors": METRICS.patch_dma_errors.load(Ordering::Relaxed),
+                // RW4 W2 extent overlay / spill records / batched fold
+                // families (design-random-small-writes §5.2 / §5.4).
+                "parked_extent_bytes": METRICS.parked_extent_bytes.load(Ordering::Relaxed),
+                "parked_full_buffer_bytes": METRICS.parked_full_buffer_bytes.load(Ordering::Relaxed),
+                "extent_parks": METRICS.extent_parks.load(Ordering::Relaxed),
+                "extent_escalations": METRICS.extent_escalations.load(Ordering::Relaxed),
+                "extent_implicit_escalations": METRICS.extent_implicit_escalations.load(Ordering::Relaxed),
+                "extent_spills": METRICS.extent_spills.load(Ordering::Relaxed),
+                "extent_spill_bytes": METRICS.extent_spill_bytes.load(Ordering::Relaxed),
+                "extent_record_absorbs": METRICS.extent_record_absorbs.load(Ordering::Relaxed),
+                "fold_passes": METRICS.fold_passes.load(Ordering::Relaxed),
+                "fold_seed_reads": METRICS.fold_seed_reads.load(Ordering::Relaxed),
+                "fold_extents_folded": METRICS.fold_extents_folded.load(Ordering::Relaxed),
+                "fold_fill": METRICS.fold_fill.to_json(),
+                "staged_rider_extent_writes": METRICS.staged_rider_extent_writes.load(Ordering::Relaxed),
+                "staged_rider_folds": METRICS.staged_rider_folds.load(Ordering::Relaxed),
+                "extent_records_recovered": METRICS.extent_records_recovered.load(Ordering::Relaxed),
+                "extent_records_stale_discarded": METRICS.extent_records_stale_discarded.load(Ordering::Relaxed),
+                "extent_records_torn_discarded": METRICS.extent_records_torn_discarded.load(Ordering::Relaxed),
+                "extent_records_future_refused": METRICS.extent_records_future_refused.load(Ordering::Relaxed),
                 "active_block_memset_elided_bytes": METRICS.active_block_memset_elided_bytes.load(Ordering::Relaxed),
                 "active_block_ooo_runs": METRICS.active_block_ooo_runs.load(Ordering::Relaxed),
                 "meta_device_syncs": METRICS.meta_device_syncs.load(Ordering::Relaxed),
@@ -3502,6 +3662,35 @@ impl SqueezefsFilesystem {
     ) -> Result<(), SqueezefsError> {
         self.flush_memory_buffers_driven(ino, fencing_token, FlushDriver::FsyncClose)
             .await
+    }
+
+    /// W2 per-block fold (design-random-small-writes §5.2): seed ONCE via
+    /// item B's binding-validated [`Self::fetch_seed_image`], apply all k
+    /// parked (RAM overlay) + staged (`active_block_ext:` record) extents,
+    /// and upload the composed block durably — one 4 MiB-class read + one
+    /// 4 MiB-class write per k user writes (`fold_fill`). Returns
+    /// `Ok(true)` when a fold ran (the block's extent state is drained),
+    /// `Ok(false)` when the block holds no foldable extent state (full-repr
+    /// buffers belong to the ordinary flush machinery). Never-lossy:
+    /// nothing is removed until the durable upload + merge committed; a
+    /// failed fold re-parks by construction.
+    pub async fn fold_extent_block(&self, _ino: u64, _b: u32) -> Result<bool, SqueezefsError> {
+        // RW4 RED scaffolding: inert — no fold machinery yet.
+        Ok(false)
+    }
+
+    /// W2 mount-time extent-record sweep (design §5.2 crash/recovery/
+    /// downgrade): validates every staged `active_block_ext:` record —
+    /// torn ⇒ discarded loudly; FUTURE record version ⇒ refused loudly
+    /// (left in place); stale fencing token ⇒ discarded (the remount law);
+    /// else recovered (composable + foldable). ANY record found here is
+    /// kill-9-class residue (clean shutdowns drain every record to fold),
+    /// so the sweep logs one loud stderr line — the §5.2 forward-detection
+    /// arm of the below-RW4 downgrade residual. Returns the recovered
+    /// count.
+    pub async fn recover_extent_records(&self) -> usize {
+        // RW4 RED scaffolding: inert — no recovery sweep yet.
+        0
     }
 
     /// [`Self::flush_memory_buffers_for_inode`] with the RW1 §1.2 driver

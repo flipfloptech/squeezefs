@@ -18,6 +18,30 @@ pub const STAGING_GENERATION_MARKER: &str = ".squeezefs_generation";
 /// identity-scheme change can re-stamp instead of misparsing.
 const STAGING_GENERATION_HEADER: &str = "squeezefs-staging-generation-v1";
 
+/// Marker file naming the highest staging CONTENT-FORMAT version this dir
+/// may contain (design-random-small-writes §5.2 review Issue 17 — the
+/// forward-only downgrade fence). Lives beside the generation marker at
+/// the root of every staging dir.
+pub const STAGING_FORMAT_MARKER: &str = ".squeezefs_staging_format";
+
+/// Staging content-format version THIS binary reads and writes.
+///
+/// * **1** — implicit pre-RW4 content (plain staged `file_id` blobs +
+///   `active_block:` whole-image records; no marker file existed).
+/// * **2** — RW4: adds `active_block_ext:` extent records
+///   ([`ExtentRecord`]).
+///
+/// The RW4 binary is the FIRST that validates this marker: a dir whose
+/// marker names a version **greater** than this constant belongs to a
+/// newer binary's dirty staging and is refused **as a unit, loudly**
+/// (mount fails; never wiped — the content is acked custody of a format
+/// this binary cannot parse). Downgrade below RW4 is declared unsupported
+/// (the house forward-only law): pre-RW4 binaries validate nothing and
+/// silently skip unknown keys — the §5.2 kill-9-then-downgrade residual,
+/// forward-detected by the next RW4+ mount's orphan-record sweep
+/// (`SqueezefsFilesystem::recover_extent_records`).
+pub const STAGING_FORMAT_VERSION: u32 = 2;
+
 /// Full marker file image for `fs_generation`.
 fn generation_marker_content(fs_generation: &str) -> Vec<u8> {
     format!("{STAGING_GENERATION_HEADER}\n{fs_generation}\n").into_bytes()
@@ -273,6 +297,144 @@ pub fn parse_staged_blob(bytes: &[u8], is_active_block: bool) -> Option<(StagedM
         return None;
     }
     Some((meta, bytes[data_start..data_end].to_vec()))
+}
+
+/// `true` ⇔ `key` belongs to the staged block-record family — the
+/// whole-image `active_block:` form or the W2 `active_block_ext:` extent
+/// record — whose ring blobs pad their header to 4 KiB (payloads stay
+/// 4 KiB-aligned for the §5.5 zero-copy DMA source) and which never enter
+/// the staged-file budget ledger.
+pub fn key_is_block_family(key: &str) -> bool {
+    key.starts_with("active_block:") || key.starts_with("active_block_ext:")
+}
+
+/// Magic prefix of a serialized [`ExtentRecord`].
+pub const EXTENT_RECORD_MAGIC: [u8; 8] = *b"SQZEXT01";
+
+/// Record-level format version of [`ExtentRecord`] (belt-and-braces under
+/// the dir-level [`STAGING_FORMAT_VERSION`] fence: a record naming a newer
+/// version than this binary understands is refused loudly, never parsed).
+pub const EXTENT_RECORD_VERSION: u32 = 1;
+
+/// Why an extent-record parse refused (both are LOUD at the consumer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtentRecordError {
+    /// Structurally invalid — bad magic, short buffer, inconsistent table,
+    /// or checksum mismatch (a torn/foreign blob): detected-and-ignored
+    /// loudly per the D0 staging contract.
+    Torn(String),
+    /// The record names a FUTURE format version: refuse it as a unit —
+    /// never guess, never wipe (it is acked custody of a newer binary).
+    FutureVersion(u32),
+}
+
+/// W2 staged **extent record** (design-random-small-writes §5.2): the
+/// 4 KiB-class spill form of a parked extent overlay — header
+/// {version, fencing token, block idx, extent table} + concatenated
+/// payloads, checksummed as a unit so a torn write is detected-and-ignored
+/// loudly at parse time (the ring's header-level recovery scan cannot see
+/// payload tears).
+///
+/// Layout (LE): magic 8B · version u32 · fencing_token u64 · block_idx u32
+/// · flags u32 (bit0 = `base_deferred`) · extent_count u32 · checksum u64
+/// (xxh3 over table+payloads) · table extent_count×(start u32, len u32) ·
+/// payloads.
+#[derive(Debug, Clone)]
+pub struct ExtentRecord {
+    pub version: u32,
+    /// Fencing token at STAGING time — the FIND-M11-A supersession stamp
+    /// (the remount law's discard test), never the fold's merge credential.
+    pub fencing_token: u64,
+    pub block_idx: u32,
+    /// The unwritten complement owes the block's OLD DEVICE BYTES (item B
+    /// deferral) — a fold must seed before applying. `false` = the block
+    /// had no existing data (hole/fresh): the complement is zeros and the
+    /// fold performs **no seed read**.
+    pub base_deferred: bool,
+    /// `(start, payload)` runs, ascending, pairwise disjoint and
+    /// non-abutting — mirror of the overlay's coverage-union invariant.
+    pub extents: Vec<(u32, Vec<u8>)>,
+}
+
+impl ExtentRecord {
+    /// Total payload bytes across the extent runs.
+    pub fn payload_bytes(&self) -> u64 {
+        self.extents.iter().map(|(_, d)| d.len() as u64).sum()
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let table_len = self.extents.len() * 8;
+        let payload_len: usize = self.extents.iter().map(|(_, d)| d.len()).sum();
+        let mut body = Vec::with_capacity(table_len + payload_len);
+        for (start, data) in &self.extents {
+            body.extend_from_slice(&start.to_le_bytes());
+            body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        }
+        for (_, data) in &self.extents {
+            body.extend_from_slice(data);
+        }
+        let checksum = xxh3_64(&body);
+        let mut out = Vec::with_capacity(40 + body.len());
+        out.extend_from_slice(&EXTENT_RECORD_MAGIC);
+        out.extend_from_slice(&self.version.to_le_bytes());
+        out.extend_from_slice(&self.fencing_token.to_le_bytes());
+        out.extend_from_slice(&self.block_idx.to_le_bytes());
+        out.extend_from_slice(&u32::from(self.base_deferred).to_le_bytes());
+        out.extend_from_slice(&(self.extents.len() as u32).to_le_bytes());
+        out.extend_from_slice(&checksum.to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    pub fn deserialize(bytes: &[u8]) -> std::result::Result<Self, ExtentRecordError> {
+        let torn = |what: &str| ExtentRecordError::Torn(what.to_string());
+        if bytes.len() < 40 {
+            return Err(torn("short header"));
+        }
+        if bytes[0..8] != EXTENT_RECORD_MAGIC {
+            return Err(torn("bad magic"));
+        }
+        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        if version > EXTENT_RECORD_VERSION {
+            return Err(ExtentRecordError::FutureVersion(version));
+        }
+        let fencing_token = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+        let block_idx = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        let flags = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+        let count = u32::from_le_bytes(bytes[28..32].try_into().unwrap()) as usize;
+        let checksum = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+        let table_end = 40usize
+            .checked_add(count.checked_mul(8).ok_or_else(|| torn("count overflow"))?)
+            .ok_or_else(|| torn("table overflow"))?;
+        if bytes.len() < table_end {
+            return Err(torn("short table"));
+        }
+        if xxh3_64(&bytes[40..]) != checksum {
+            return Err(torn("checksum mismatch"));
+        }
+        let mut extents = Vec::with_capacity(count);
+        let mut cursor = table_end;
+        for i in 0..count {
+            let off = 40 + i * 8;
+            let start = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            let len = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
+            let end = cursor
+                .checked_add(len)
+                .ok_or_else(|| torn("len overflow"))?;
+            if bytes.len() < end {
+                return Err(torn("short payload"));
+            }
+            extents.push((start, bytes[cursor..end].to_vec()));
+            cursor = end;
+        }
+        Ok(Self {
+            version,
+            fencing_token,
+            block_idx,
+            base_deferred: flags & 1 != 0,
+            extents,
+        })
+    }
 }
 
 /// §5.5 write-only, guard-backed DMA source over one staged payload
@@ -644,7 +806,10 @@ impl NvmeStaging {
             std::sync::Arc::new(scc::HashMap::new());
         let mut initial_write_bytes = 0u64;
         for key in staging_nvme_cache.list_keys() {
-            if key.starts_with(b"active_block:") {
+            if std::str::from_utf8(&key).is_ok_and(key_is_block_family) {
+                // Whole-image `active_block:` records AND `active_block_ext:`
+                // extent records: occupancy-indexed (the lock-free probes),
+                // never budget-counted (custody overlays, not staged files).
                 if let Ok(k) = std::str::from_utf8(&key) {
                     let _ = active_block_index.insert_sync(k.to_string(), ());
                 }
@@ -1100,6 +1265,57 @@ impl NvmeStaging {
         admitted
     }
 
+    /// Stage a W2 extent record (design-random-small-writes §5.2) under an
+    /// `active_block_ext:` key — the 4 KiB-class spill of a parked extent
+    /// overlay. **No seed read at spill, ever** (the record carries only
+    /// the app-written runs); same never-lossy admission contract as
+    /// [`Self::put_active_block`]: `false` = the ring refused, the caller
+    /// keeps the RAM overlay. Same-key re-spills replace crash-safely
+    /// (`reserve_and_write` keeps the old copy live until the replacement
+    /// is fully written — the FIND-VS-B never-shrink/replace-headroom
+    /// invariants apply to this record kind verbatim). Sync (staging shard
+    /// WRITE lock): call on the blocking pool per invariant rule 2.
+    #[must_use]
+    pub fn put_extent_record(&self, key: &str, record: &ExtentRecord) -> bool {
+        debug_assert!(key.starts_with("active_block_ext:"));
+        self.put_active_block(key, &record.serialize(), record.fencing_token)
+    }
+
+    /// Read + parse the staged extent record under `key`. `None` = no
+    /// record; `Some(Err(_))` = a record blob exists but refuses to parse
+    /// (torn/foreign ⇒ [`ExtentRecordError::Torn`], newer-binary content ⇒
+    /// [`ExtentRecordError::FutureVersion`]) — consumers dispose LOUDLY per
+    /// the §5.2 contract, never silently.
+    pub fn read_extent_record(
+        &self,
+        key: &str,
+    ) -> Option<std::result::Result<ExtentRecord, ExtentRecordError>> {
+        let raw = self.read_staged(key)?;
+        Some(ExtentRecord::deserialize(&raw))
+    }
+
+    /// Lock-free staged extent-record existence probe (the read/write hot
+    /// paths' zero-cost gate: one latch-free occupancy-index read; when the
+    /// map is empty the cost is exactly today's miss — R6).
+    pub fn has_staged_extent_record(&self, key: &str) -> bool {
+        debug_assert!(key.starts_with("active_block_ext:"));
+        self.active_block_index.read_sync(key, |_, _| ()).is_some()
+    }
+
+    /// Keys of every staged extent record whose key starts with `prefix`
+    /// (`""` = all). Served from the occupancy index — recovery sweeps and
+    /// fsync drains, never a hot path.
+    pub fn extent_record_keys(&self, prefix: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        self.active_block_index.iter_sync(|k, _| {
+            if k.starts_with("active_block_ext:") && k.starts_with(prefix) {
+                out.push(k.clone());
+            }
+            true
+        });
+        out
+    }
+
     /// **Lock-free staged-existence probe** (design-random-small-writes
     /// §5.1 predicate 2 / review Issue 10): does a staged `active_block:`
     /// entry exist for `key`? Served from a latch-free occupancy index —
@@ -1232,7 +1448,7 @@ impl NvmeStaging {
         let Some(meta) = StagedMetadata::deserialize(&bytes[8..8 + meta_len]) else {
             return false;
         };
-        let data_start = if file_id.starts_with("active_block:") {
+        let data_start = if key_is_block_family(file_id) {
             4096
         } else {
             8 + meta_len
@@ -1255,7 +1471,7 @@ impl NvmeStaging {
             let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
             if bytes.len() >= 8 + meta_len {
                 if let Some(meta) = StagedMetadata::deserialize(&bytes[8..8 + meta_len]) {
-                    let data_start = if file_id.starts_with("active_block:") {
+                    let data_start = if key_is_block_family(file_id) {
                         4096
                     } else {
                         8 + meta_len
@@ -1307,7 +1523,7 @@ impl NvmeStaging {
             let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
             if bytes.len() >= 8 + meta_len {
                 if let Some(meta) = StagedMetadata::deserialize(&bytes[8..8 + meta_len]) {
-                    let data_start = if file_id.starts_with("active_block:") {
+                    let data_start = if key_is_block_family(file_id) {
                         4096
                     } else {
                         8 + meta_len

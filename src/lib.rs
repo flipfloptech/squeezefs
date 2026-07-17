@@ -1,7 +1,7 @@
 #![allow(clippy::all)]
 // The stats-inode `serde_json::json!` literal exceeds the default macro
 // recursion limit (128) — compile-time only, no runtime effect.
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 pub mod mem_budget;
 pub mod nvme_dev;
 pub mod tiering;
@@ -254,6 +254,38 @@ pub mod keys {
         s.push_str("active_block:");
         s.push_str(file_path);
         s.push(':');
+        s
+    }
+
+    /// W2 staged extent-record key (design-random-small-writes §5.2):
+    /// `active_block_ext:inode_{ino}:block_{block}` — the 4 KiB-class spill
+    /// form of a parked [`crate::cache::active_block::ActiveBlockBuf`]
+    /// extent overlay (and the staged-layout rider's sub-image record,
+    /// keyed at block 0). Deliberately NOT a prefix of `active_block:` so
+    /// existing key-family scans never misparse it; classification points
+    /// use [`crate::cache::nvme::key_is_block_family`].
+    #[inline]
+    pub fn active_block_ext(ino: u64, block: u64) -> FsKey {
+        let mut s = CompactString::with_capacity(44);
+        let _ = write!(s, "active_block_ext:inode_{ino}:block_{block}");
+        FsKey(s)
+    }
+
+    /// Extent-record key when `file_path` is already `inode_N`:
+    /// `active_block_ext:{file_path}:block_{block}`.
+    #[inline]
+    pub fn active_block_ext_for_path(file_path: &str, block: u32) -> FsKey {
+        let mut s = CompactString::with_capacity(28 + file_path.len());
+        let _ = write!(s, "active_block_ext:{file_path}:block_{block}");
+        FsKey(s)
+    }
+
+    /// Scan prefix for an inode's staged extent records:
+    /// `active_block_ext:inode_{ino}:`.
+    #[inline]
+    pub fn active_block_ext_ino_prefix(ino: u64) -> CompactString {
+        let mut s = CompactString::with_capacity(32);
+        let _ = write!(s, "active_block_ext:inode_{ino}:");
         s
     }
 

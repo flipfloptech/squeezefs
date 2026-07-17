@@ -110,8 +110,32 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
   ```bash
   squeezefs status [sqmeta://<meta_dev> | <mountpoint>]   # config + volume summary (JSON)
   ```
-  Space usage comes from the OS: `df -h <mountpoint>` (see [`df` / statfs semantics](#df--statfs-semantics)).
+  The report's `"Clients"` array carries the volume's real mount registrations (same records and classification as `squeezefs clients` below).
   A mounted filesystem also exposes live daemon metrics as JSON on the virtual **`.stats`** inode at the mount root (`cat <mountpoint>/.stats`) — the preferred live regression signal (layout mix, cache/tier counters, `meta_kv_*`, `writer_guard_*`, transport geometry, patch/fold ledgers, memory-budget level).
+
+* **List client mount registrations:**
+  Serves the `client:{id}` heartbeat records and the single-writer `writer_claim` recorded on the volume set's root inos — the same records the format preflight and the mount guard consume, under the same staleness law. Read-only probe: works beside a live mount and never perturbs it. States: `live` (fresh heartbeat), `stale` (heartbeat older than the 45 s TTL — crashed or partitioned holder), `dead` (writer claim whose same-host pid is provably gone — reclaimable immediately, no TTL wait).
+  ```bash
+  squeezefs clients sqmeta://<meta_dev> [--json]
+  ```
+  ```text
+  KIND    ID                                     PID      STATE  AGE   VOLUME
+  client  0d3179c8-6a02-4f45-9c11-0c8ad6a0a1b2   731022   live   4s    /dev/xai-meta/mds01
+  writer  9c41c2e6-6a4e-4bfb-b41c-2fb1b1f2b7aa   731022   live   4s    /dev/xai-meta/mds01
+  2 registration(s): 2 live, 0 stale, 0 dead (reclaimable).
+  ```
+
+* **Show space/inode usage (offline/URI query):**
+  Answers from the same authoritative sources as the mounted daemon's statfs — formatted capacity/quotas from the format config, allocator-tracked striped-block usage (rebuilt by the same live-inode-tree walk a mount runs), and the v3 monotonic inode watermark — via read-only probes: **no live mount required**, and beside one it reports the durable point-in-time state. Aggregate plus per-volume rows (data volumes: size/allocated; meta volumes: KV heap size/free, next-ino).
+  ```bash
+  squeezefs df -g sqmeta://<meta_dev> [--json]
+  ```
+  ```text
+  SqueezeFS 'squeezefs' — offline query over 1 meta / 1 data volume(s), durable state
+  Data:   capacity 8.00 GiB   used 64.00 MiB (0.8%)   free 7.94 GiB
+  Inodes: quota 1000000   used 2   free 999998
+  ```
+  A **mounted** filesystem also answers plain `df -h <mountpoint>` from the OS (see [`df` / statfs semantics](#df--statfs-semantics)).
 
 * **Clear a stale writer claim (recovery verb):**
   Operator-attested removal of a stale single-writer claim after a cross-host crash on a volume without NVMe Persistent Reservations — see the [recovery runbook](#single-writer-mount-guard-guarantee-classes). Refuses fresh claims and live-mounted volumes.
@@ -123,11 +147,6 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
   Safely unmounts SqueezeFS by waiting for staging caches to flush before tearing down FUSE.
   ```bash
   squeezefs umount <mountpoint> [--force]
-  ```
-
-* **Defragment Squeezefs Volume** *(placeholder — the CLI verb exists but the defrag engine is currently a no-op stub)*:
-  ```bash
-  squeezefs defrag --nvme-path <path>
   ```
 
 * **Benchmark Mountpoint:**
@@ -228,6 +247,8 @@ SQUEEZEFS_VS_SMOKE=1 tests/run_vs_juicefs.sh # 30s-class micro-grid plumbing pro
 
 A mounted SqueezeFS reports honest, cheap numbers to `statfs(2)` (`df`): **total** is the formatted capacity — the summed data-backend size, or the lower explicit `--capacity` quota chosen at format (the effective limit you experience); **used/free** track the bytes currently allocated on the striped block backends, maintained by the block allocators at alloc/free time (no metadata transactions or device I/O on the statfs path). Tiny inline payloads live in the metadata volume and staged-but-unpromoted small writes in the local NVMe staging dirs, so those transient bytes appear in `df` as their blocks promote via writeback rather than instantaneously; deletes return space after background reclaim completes. Inode columns (`df -i`) report the format inode quota against the v3 monotonic, no-reuse inode watermark — `IFree` is remaining create headroom, and deleting files does not raise it.
 
+The **`squeezefs df`** verb answers the same accounting **offline** — read-only probes over the volume set, no mount required (`squeezefs df -g sqmeta://<meta_dev> [--json]`; see the command list above). It reports the durable point-in-time state: beside a live mount, bytes still in flight through staging/journal deferral appear once durable.
+
 ## Breaking changes & migration notes
 
 SqueezeFS moves **always forward** — no backwards compatibility. Refusals are loud, name their cause, and state the remedy. Current refusal classes an operator can hit:
@@ -242,7 +263,7 @@ SqueezeFS moves **always forward** — no backwards compatibility. Refusals are 
 
 > **⚠️ Cache/staging paths are format-declared.** `mount --disk-cache-paths` is refused loudly (never silently ignored). Change paths with the admin op `squeezefs config set-cache-paths <sqmeta-uri> <paths...>` (guarded like `format`: refused while any client has the volume mounted; the new dirs are wiped so the next mount stamps a fresh staging generation). Read them back with `config get-cache-paths`. A filesystem formatted without `--disk-cache-paths` is **permanently cache-less**.
 
-> **Removed flags/verbs** (kept here so stale scripts fail comprehensibly): `--strict-meta-atomicity` (only ever gated v2 volumes; deleted with them), `squeezefs migrate` (deleted with v2), `mount --local-ips` (the socket-level multi-rail bonding was removed in the 2026-07-04 connection simplification — fabric multipath is the kernel NVMe initiator's domain), `mount --disk-cache-paths` (see above).
+> **Removed flags/verbs** (kept here so stale scripts fail comprehensibly): `--strict-meta-atomicity` (only ever gated v2 volumes; deleted with them), `squeezefs migrate` (deleted with v2), `mount --local-ips` (the socket-level multi-rail bonding was removed in the 2026-07-04 connection simplification — fabric multipath is the kernel NVMe initiator's domain), `mount --disk-cache-paths` (see above), `squeezefs defrag` (removed 2026-07-17: the verb's engine was an unimplemented no-op that reported fake success — no fake surfaces; the jobs-layer `BlockMove` merge machinery it would drive remains, test-pinned, awaiting a real defrag program).
 
 ## Metadata Durability (crash contract)
 

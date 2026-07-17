@@ -70,9 +70,22 @@ echo hello > ~/squeezefs-sandbox/mnt/hello.txt && cat ~/squeezefs-sandbox/mnt/he
 # Live daemon metrics (JSON): transport geometry, cache tiers, layout mix, …
 head -40 ~/squeezefs-sandbox/mnt/.stats
 
-# Volume config / health summary (JSON), and honest statfs numbers
+# Volume config / health summary (JSON; "Clients" lists the mount registrations),
+# and honest statfs numbers
 ./target/release/squeezefs status sqmeta://$HOME/squeezefs-sandbox/meta.bin
 df -h ~/squeezefs-sandbox/mnt
+
+# Who has this filesystem mounted? (heartbeat records; safe beside the live mount)
+./target/release/squeezefs clients sqmeta://$HOME/squeezefs-sandbox/meta.bin
+#   KIND    ID                                     PID      STATE  AGE   VOLUME
+#   client  <uuid>                                 <pid>    live   3s    …/meta.bin
+#   writer  <uuid>                                 <pid>    live   3s    …/meta.bin
+
+# Space/inode accounting straight from the volumes (offline verb — also works
+# with no mount running; reports the durable state)
+./target/release/squeezefs df -g sqmeta://$HOME/squeezefs-sandbox/meta.bin
+#   Data:   capacity 8.00 GiB   used 0 B (0.0%)   free 8.00 GiB
+#   Inodes: quota 1000000   used 2   free 999998
 ```
 
 ### Step 6: Run the Benchmark

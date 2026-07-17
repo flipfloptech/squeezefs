@@ -973,9 +973,14 @@ async fn advisory_integration_phases() {
     for b in 0..6u64 {
         write_at(&h2, ino_d, b * BS, &vec![b as u8 + 50; 4096]).await;
     }
+    // W2 (RW4): sub-block non-adjacent overwrites park COMPACTLY as
+    // extent overlays (~payload bytes each), no longer as six
+    // block-size deferred buffers — the R5 gauge charges real bytes.
+    // The drain contract under test is unchanged: gauge -> 0, bytes
+    // exact (the drain FOLDS extent overlays through the durable path).
     assert!(
-        h2.fs.parked_buffer_bytes() >= 6 * BS,
-        "fixture: six parked partial blocks"
+        h2.fs.parked_buffer_bytes() >= 6 * 4096,
+        "fixture: six parked extent overlays"
     );
     h2.fs.drain_parked_toward(0).await;
     assert_eq!(
@@ -1089,8 +1094,14 @@ async fn advisory_integration_phases() {
     let gate_waits0 = METRICS.parked_gate_waits.load(Ordering::Relaxed);
     let red_cap_bytes = mem_budget::effective_parked_cap(256, Level::Red) as u64 * BS;
     let mut peak_parked = 0u64;
+    // W2 (RW4): the Red gate is a BYTE budget now — sub-25% writes park
+    // as ~4 KiB extent overlays and legitimately never trip it (the
+    // convoy fix). This phase pins the FULL-buffer OOM engine, so the
+    // storm writes >= 25% of each block (large merges route to the
+    // block-size deferred buffers the gate exists for).
+    let half = vec![0x21u8; (BS / 2) as usize];
     for b in 0..STORM_BLOCKS {
-        write_at(&h4, ino_f, b * BS, &[b as u8; 4096]).await;
+        write_at(&h4, ino_f, b * BS, &half).await;
         peak_parked = peak_parked.max(h4.fs.parked_buffer_bytes());
     }
     assert!(
@@ -1120,10 +1131,10 @@ async fn advisory_integration_phases() {
     for b in 0..STORM_BLOCKS {
         let d = read_at(&h4, ino_f, b * BS, 4096).await;
         assert!(
-            d.iter().all(|&x| x == b as u8),
+            d.iter().all(|&x| x == 0x21),
             "block {b}: gated writes must stay byte-exact (never-lossy)"
         );
-        let tail = read_at(&h4, ino_f, b * BS + 8192, 4096).await;
+        let tail = read_at(&h4, ino_f, b * BS + BS / 2 + 8192, 4096).await;
         assert!(
             tail.iter().all(|&x| x == 0x20),
             "block {b}: RMW remainder must survive the gated drain"

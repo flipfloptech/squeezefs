@@ -109,7 +109,7 @@ async fn session(
     )
     .await
     .unwrap();
-    let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
+    let router = DataRouter::new(dlm.clone(), cache, ba.clone(), nvme);
     router.set_crypto(squeezefs::crypto_compress::CryptoCompressState::new(
         "lz4".to_string(),
         "none".to_string(),
@@ -119,7 +119,15 @@ async fn session(
     let be = KvMetaBackend::open(meta_path).await.unwrap();
     let routed = Arc::new(RoutedMetaBackend::new(vec![be]));
     fs.router.set_meta_backend(routed.clone());
-    fs.meta_backend = Some(routed);
+    fs.meta_backend = Some(routed.clone());
+    // v3 refcount recovery, exactly like a real remount (main.rs mount
+    // path): session B's allocator must never re-hand offsets that hold
+    // live mapped blocks.
+    for kv in &routed.volumes {
+        ba.recover_active_blocks_v3(kv, &fs.router.backend_router)
+            .await
+            .expect("v3 refcount recovery");
+    }
     let req = Request {
         unique: 1,
         uid: unsafe { libc::getuid() },
@@ -223,10 +231,12 @@ async fn durable_striped(h: &H, name: &str, blocks: u64, tag: u8) -> (u64, Vec<u
     (ino, base)
 }
 
-/// Park extents on `blocks` and force them to SPILL as staged records (the
-/// crash-survivable custody form); returns the expected file image.
+/// Park extents on `blocks` and force them ALL to SPILL as staged records
+/// (the crash-survivable custody form): a zero byte budget makes every
+/// unlocked overlay a spill victim, and a driver write on a sacrificial
+/// SEPARATE ino runs the spill loop without holding any of the target
+/// blocks' locks. Returns the expected file image.
 async fn park_and_spill(h: &H, ino: u64, base: &[u8], tag: u8) -> Vec<u8> {
-    squeezefs::fuse_client::set_parked_cap_buffers(1);
     let p = pattern(4096, tag);
     let mut want = base.to_vec();
     for blk in 0..3u64 {
@@ -236,17 +246,25 @@ async fn park_and_spill(h: &H, ino: u64, base: &[u8], tag: u8) -> Vec<u8> {
             want[off as usize..off as usize + 4096].copy_from_slice(&p);
         }
     }
+    // Driver: a separate STRIPED file whose small write runs the spill
+    // loop while holding only ITS OWN block lock — every target overlay
+    // is an unlocked victim under the zero byte budget.
+    let driver = create(h, &format!("spill-driver-{tag}")).await;
+    write_at(h, driver, 0, &pattern(BS as usize + 1, tag ^ 0xFF)).await;
+    squeezefs::fuse_client::set_parked_cap_buffers(0);
+    write_at(h, driver, 4096, &pattern(512, tag ^ 0xAA)).await;
+    squeezefs::fuse_client::set_parked_cap_buffers(256);
     let prefix = squeezefs::keys::active_block_ext_ino_prefix(ino);
-    assert!(
-        !h.fs
-            .router
+    assert_eq!(
+        h.fs.router
             .cache
             .nvme
             .extent_record_keys(prefix.as_str())
-            .is_empty(),
-        "premise: extent records spilled to staging (crash-survivable)"
+            .len(),
+        3,
+        "premise: every target overlay spilled to a staged record \
+         (crash-survivable custody)"
     );
-    squeezefs::fuse_client::set_parked_cap_buffers(256);
     want
 }
 

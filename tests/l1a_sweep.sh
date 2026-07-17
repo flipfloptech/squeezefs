@@ -76,6 +76,9 @@ CAGE_MB="${SQUEEZEFS_L1A_CAGE_MB:-16384}"
 QUIET_POLLS="${SQUEEZEFS_L1A_QUIET_POLLS:-3}"
 QUIET_SECS="${SQUEEZEFS_L1A_QUIET_SECS:-5}"
 ROW_TIMEOUT="${SQUEEZEFS_L1A_ROW_TIMEOUT:-600}"
+# RW4 / G-RW6: format-time compression ("none" | "lz4" | "zstd") — the
+# compressed-volume rand-write row (every write patch-ineligible).
+COMPRESSION="${SQUEEZEFS_L1A_COMPRESSION:-none}"
 
 if [ "$SMOKE" = "1" ]; then
     TVALUES="${SQUEEZEFS_L1A_TVALUES:-2}"
@@ -246,6 +249,7 @@ sqz_format() { # <tag>
         "$(sqz_meta_uri)" \
         "sqdata://$SQZ_DIR/data1.img,$SQZ_DIR/data2.img,$SQZ_DIR/data3.img,$SQZ_DIR/data4.img" \
         --disk-cache-paths "$SQZ_STAGING" \
+        --compression "$COMPRESSION" \
         --force >"$ART/logs/format_$1.log" 2>&1 ||
         die "squeezefs format failed (see $ART/logs/format_$1.log)"
 }

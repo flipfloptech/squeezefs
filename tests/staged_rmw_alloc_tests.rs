@@ -151,16 +151,21 @@ async fn staged_rmw_storm_is_pool_backed_recycling_and_byte_exact() {
     let pooled0 = METRICS.staged_rmw_pooled_seeds.load(Ordering::Relaxed);
     let idle0 = BUFFER_POOL.len();
 
+    // W2 (RW4): sub-image overwrites >= 25 % of the image stay on the
+    // whole-image RMW path this suite pins (smaller ones ride the staged
+    // extent-record RIDER now — its economy is pinned in
+    // tests/extent_overlay_tests.rs).
+    const SUB: usize = 768 * 1024;
     let mut x = 0x9E37_79B9u64;
     for i in 0..OPS {
         x = x
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let off = (x % (IMG as u64 - 4096)) & !7;
+        let off = (x % (IMG as u64 - SUB as u64)) & !7;
         let val = (i % 251) as u8;
-        let buf = vec![val; 4096];
+        let buf = vec![val; SUB];
         write_at(&h, ino, off, &buf).await;
-        model[off as usize..off as usize + 4096].copy_from_slice(&buf);
+        model[off as usize..off as usize + SUB].copy_from_slice(&buf);
     }
 
     // 1) The seed path is POOLED — counted once per RMW op.

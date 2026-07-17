@@ -162,6 +162,72 @@ async fn bind_staging_generation(dir: &std::path::Path, fs_generation: &str) -> 
     Ok(())
 }
 
+/// Marker header line for [`STAGING_FORMAT_MARKER`] (versions the marker
+/// format itself, independent of the content version it carries).
+const STAGING_FORMAT_HEADER: &str = "squeezefs-staging-format-v1";
+
+/// Full marker file image for staging format `version`.
+fn staging_format_marker_content(version: u32) -> Vec<u8> {
+    format!("{STAGING_FORMAT_HEADER}\n{version}\n").into_bytes()
+}
+
+/// Parse a [`STAGING_FORMAT_MARKER`] image → the content version.
+fn parse_staging_format_marker(bytes: &[u8]) -> Option<u32> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != STAGING_FORMAT_HEADER {
+        return None;
+    }
+    lines.next()?.trim().parse().ok()
+}
+
+/// W2 §5.2 forward-only downgrade fence (review Issue 17), dir level —
+/// runs AFTER the generation gate (same-generation content only):
+///
+/// - marker names a version ≤ [`STAGING_FORMAT_VERSION`] ⇒ pass (re-stamp
+///   the current version when older);
+/// - marker missing/garbled ⇒ pre-RW4 content (or a fresh dir): adopt and
+///   STAMP the current version — the below-RW4 downgrade direction stays
+///   declared-unsupported with forward detection (the orphan-record sweep);
+/// - marker names a FUTURE version ⇒ **refuse the segment as a unit,
+///   loudly** (mount construction fails; the content is acked custody of
+///   a newer binary and is never wiped or guessed at).
+async fn validate_staging_format(dir: &std::path::Path) -> Result<()> {
+    let marker_path = dir.join(STAGING_FORMAT_MARKER);
+    let found = crate::uring_fs::read_all(&marker_path)
+        .await
+        .ok()
+        .as_deref()
+        .and_then(parse_staging_format_marker);
+    match found {
+        Some(v) if v > STAGING_FORMAT_VERSION => {
+            let msg = format!(
+                "STAGING FORMAT VERSION FENCE at {}: dir carries staging format v{v} but \
+                 this binary reads ≤ v{STAGING_FORMAT_VERSION} — refusing the staging \
+                 segment as a unit (dirty staging of a NEWER binary; mount the newer \
+                 binary to drain it, or wipe the dir explicitly — forward-only law)",
+                dir.display(),
+            );
+            eprintln!("{msg}");
+            log::error!("{msg}");
+            Err(SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                msg,
+            )))
+        }
+        Some(v) if v == STAGING_FORMAT_VERSION => Ok(()),
+        _ => {
+            crate::uring_fs::write_all(
+                &marker_path,
+                staging_format_marker_content(STAGING_FORMAT_VERSION),
+            )
+            .await?;
+            crate::uring_fs::fdatasync(&marker_path).await?;
+            Ok(())
+        }
+    }
+}
+
 pub fn dir_has_segment_data(path: &std::path::Path) -> bool {
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
@@ -691,6 +757,9 @@ impl NvmeStaging {
             for dir in &staging_dirs {
                 fs::create_dir_all(dir)?;
                 bind_staging_generation(dir, fs_generation).await?;
+                // W2 §5.2: the staging content-format fence (future
+                // versions refuse the segment as a unit — mount fails).
+                validate_staging_format(dir).await?;
             }
         }
 
@@ -1195,6 +1264,24 @@ impl NvmeStaging {
         .unwrap_or(false)
     }
 
+    /// Bump `file_id`'s stage generation under its ledger entry lock (the
+    /// W2 rider-write fence): an IN-FLIGHT promotion that read the image
+    /// before this rider write's record merge fails its commit-time
+    /// generation check (`remove_staged_if_generation`) instead of
+    /// publishing an image that lost the record's extents. Blocking-pool
+    /// hop for async callers.
+    pub async fn bump_staged_generation(&self, file_id: &str) {
+        let ledger = self.staged_ledger.clone();
+        let fid = file_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let scc::hash_map::Entry::Occupied(mut entry) = ledger.entry_sync(fid) {
+                let (cost, _) = *entry.get();
+                *entry.get_mut() = (cost, next_stage_generation());
+            }
+        })
+        .await;
+    }
+
     /// Ask the background merge worker to promote a staged file_id (best-effort).
     pub fn try_enqueue_staged_merge(
         &self,
@@ -1292,6 +1379,18 @@ impl NvmeStaging {
     ) -> Option<std::result::Result<ExtentRecord, ExtentRecordError>> {
         let raw = self.read_staged(key)?;
         Some(ExtentRecord::deserialize(&raw))
+    }
+
+    /// In-place REWRITE of a staged extent record with a shorter one (the
+    /// truncate-clip form): an in-extent patch that ring pressure can
+    /// never refuse (see `NvmeShard::patch_block_family_value`). Sync
+    /// (shard WRITE lock) — call on the blocking pool.
+    #[must_use]
+    pub fn rewrite_extent_record_in_place(&self, key: &str, record: &ExtentRecord) -> bool {
+        debug_assert!(key.starts_with("active_block_ext:"));
+        let key_bytes = Bytes::copy_from_slice(key.as_bytes());
+        self.staging_nvme_cache
+            .patch_block_family_value(&key_bytes, &record.serialize())
     }
 
     /// Lock-free staged extent-record existence probe (the read/write hot

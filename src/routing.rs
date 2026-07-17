@@ -55,6 +55,32 @@ pub fn layout_prune_epoch(ino: u64) -> u64 {
         .load(Ordering::Acquire)
 }
 
+/// W2 rider-record interval merge: fold `[start, start+data)` into the
+/// ascending, pairwise-disjoint `extents` list, NEWEST WINS on overlap —
+/// the record twin of `ExtentOverlay::merge`.
+pub(crate) fn merge_extent_run(extents: &mut Vec<(u32, Vec<u8>)>, start: u32, data: &[u8]) {
+    let end = start + data.len() as u32;
+    let lo = extents.partition_point(|&(s, ref d)| (s + d.len() as u32) < start);
+    let mut hi = lo;
+    while hi < extents.len() && extents[hi].0 <= end {
+        hi += 1;
+    }
+    if lo == hi {
+        extents.insert(lo, (start, data.to_vec()));
+        return;
+    }
+    let new_start = extents[lo].0.min(start);
+    let new_end = (extents[hi - 1].0 + extents[hi - 1].1.len() as u32).max(end);
+    let mut merged = vec![0u8; (new_end - new_start) as usize];
+    for (s, d) in extents.drain(lo..hi) {
+        let off = (s - new_start) as usize;
+        merged[off..off + d.len()].copy_from_slice(&d);
+    }
+    let off = (start - new_start) as usize;
+    merged[off..off + data.len()].copy_from_slice(data);
+    extents.insert(lo, (new_start, merged));
+}
+
 pub fn parse_inode_from_path(path: &str) -> u64 {
     if path.starts_with("inode_") {
         path.strip_prefix("inode_")
@@ -719,7 +745,12 @@ impl BackendRouter {
         &self,
         block_key: &str,
     ) -> Option<(std::sync::Arc<crate::block_allocator::BlockAllocator>, u64)> {
-        let (be_id, offset) = self.parse_block_key(block_key).ok()?;
+        // Decoration-tolerant (FIND-RW2-A, fixed in RW4): size-carrying
+        // `bk:off:len` mappings track their BASE offset's incarnation —
+        // the decorated window's content dies exactly when the base block
+        // is freed/reallocated. (Same rule `free_block` already applies.)
+        let cleaned = clean_block_key(block_key);
+        let (be_id, offset) = self.parse_block_key(&cleaned).ok()?;
         if be_id == "backend_0" {
             Some((self.default_allocator.clone(), offset))
         } else {
@@ -2016,6 +2047,26 @@ impl DataRouter {
     }
 
     pub async fn read_nvme_block(&self, block_key: &str) -> Result<bytes::Bytes> {
+        // FIND-RW2-A (fixed in RW4): decorated `bk:off:len` mappings —
+        // the promoted-staged form a striped block map can legitimately
+        // carry — used to reach `parse_block_key` verbatim and fail
+        // `Invalid block offset`, breaking every deferred-seed
+        // materialize (and fold seed) over such blocks. Decode the
+        // decoration here, at the single device-fetch funnel: read the
+        // LBA-aligned window covering the EXACT stored image and slice it
+        // (`read_promoted_staged_block`'s discipline), so passthrough
+        // tails of recycled tenants are never served as payload.
+        let (_base, off, sz, exact) = self.parse_block_mapping(block_key)?;
+        if exact {
+            // Window covering [off, off+sz), LBA-rounded (device reads are
+            // O_DIRECT-aligned); every real publish uses off == 0.
+            let read_len = (off as usize + sz).div_ceil(4096) * 4096;
+            let cleaned = clean_block_key(block_key);
+            let raw = self.backend_router.read_block(&cleaned, read_len).await?;
+            let start = (off as usize).min(raw.len());
+            let end = (off as usize + sz).min(raw.len());
+            return Ok(raw.slice(start..end));
+        }
         let size = self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
         self.backend_router.read_block(block_key, size).await
     }
@@ -3312,6 +3363,20 @@ impl DataRouter {
             return Ok(false);
         };
 
+        // W2 rider fence: a file with a LIVE extent record never promotes —
+        // the record's extents are NEWER than the ring image, and composing
+        // them here would put the promotion's commit in a multi-writer race
+        // with every rider mutation site. The record-bearing state is
+        // transient by construction (whole-image writes fold-first; fsync/
+        // teardown/threshold folds drain records), so deferral converges;
+        // under hard ring pressure the write path's spill leg still drains
+        // (records fold into the spilled image — never wedged custody).
+        let promote_ino = parse_inode_from_path(file_path);
+        let rider_key = crate::keys::active_block_ext(promote_ino, 0).to_string();
+        if self.cache.nvme.has_staged_extent_record(&rider_key) {
+            return Ok(false);
+        }
+
         let raw_len = raw.len();
         let processed = self
             .get_crypto()
@@ -3823,6 +3888,106 @@ impl DataRouter {
             None
         };
 
+        // Re-resolve the layout identity UNDER the guard (RW4): the
+        // snapshot above was taken before the lock, so a write/spill/
+        // promotion that committed while we waited leaves it naming a DEAD
+        // identity — the RMW seed below would then resolve through the
+        // "identity flipped" degrade arm and codify a short/zeros base
+        // over live acked bytes (surfaced by the W2 rider's fsync-driven
+        // fold writes racing a same-ino writer; the window predates W2).
+        let meta = if _staged_block_guard.is_some() {
+            let fresh = self.fetch_metadata(file_path).await?;
+            if fresh.file_type == "striped" {
+                // The layout flipped striped while we waited: this write
+                // belongs to the striped path now.
+                drop(_staged_block_guard);
+                self.write_striped(file_path, &meta_key, offset, data, fencing_token)
+                    .await?;
+                crate::fuse_client::METRICS
+                    .layout_striped_writes
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            fresh
+        } else {
+            meta
+        };
+
+        // W2 staged-layout rider (design-random-small-writes §5.2): a
+        // SUB-IMAGE overwrite of a ring-resident staged file rides a
+        // 4 KiB-class extent record instead of the whole-image RMW
+        // (seed + same-key re-stage — the FIND-VS-B storm shape). Bounded
+        // win: ≤ 25 % of the image, non-extending, under the fold
+        // thresholds; everything else (and a refused record put) takes
+        // today's whole-image path, which FOLDS any existing record first.
+        if meta.file_type == "staged" && !data.is_empty() {
+            if let Some(fid) = meta.file_id.as_deref() {
+                if let Some(img_len) = self.cache.nvme.staged_len(fid) {
+                    let small = (data.len() as u64) * 4 <= img_len.max(1);
+                    let non_extending = offset + data.len() as u64 <= meta.size;
+                    if small && non_extending {
+                        // Record mutations serialize under the HELD block-0
+                        // guard (every rider site holds it; truncate holds
+                        // the inode write guard); promotions never touch
+                        // records (they DEFER on record-bearing files), so
+                        // no meta-lock section is needed here.
+                        let ext_key = crate::keys::active_block_ext(ino, 0).to_string();
+                        let mut extents: Vec<(u32, Vec<u8>)> =
+                            match self.cache.nvme.read_extent_record(&ext_key) {
+                                Some(Ok(rec)) => rec.extents,
+                                Some(Err(_)) => Vec::new(), // recovery disposes loudly
+                                None => Vec::new(),
+                            };
+                        let payload: u64 = extents.iter().map(|(_, d)| d.len() as u64).sum();
+                        let fm = crate::fuse_client::fold_max_extents();
+                        let fb = crate::fuse_client::fold_max_bytes();
+                        let under_thresholds = (fm == 0 || (extents.len() as u64) < fm)
+                            && (fb == 0 || payload + data.len() as u64 <= fb);
+                        if under_thresholds {
+                            merge_extent_run(&mut extents, offset as u32, &data);
+                            let record = crate::cache::nvme::ExtentRecord {
+                                version: crate::cache::nvme::EXTENT_RECORD_VERSION,
+                                fencing_token,
+                                block_idx: 0,
+                                // The complement owes the staged image /
+                                // promoted block — a fold must seed (safe
+                                // direction even across a layout flip).
+                                base_deferred: true,
+                                extents,
+                            };
+                            // Fence racing promotions FIRST: a commit that
+                            // validates its generation after this put must
+                            // observe the bump and abort (never retire a
+                            // record it did not compose).
+                            self.cache.nvme.bump_staged_generation(fid).await;
+                            let nvme = self.cache.nvme.clone();
+                            let ek = ext_key.clone();
+                            let admitted = tokio::task::spawn_blocking(move || {
+                                nvme.put_extent_record(&ek, &record)
+                            })
+                            .await
+                            .map_err(|e| {
+                                SqueezefsError::Io(std::io::Error::other(e.to_string()))
+                            })?;
+                            if admitted {
+                                self.cache.write_lru.remove(file_path);
+                                self.cache.read_lru.remove(file_path);
+                                crate::fuse_client::METRICS
+                                    .staged_rider_extent_writes
+                                    .fetch_add(1, Ordering::Relaxed);
+                                crate::fuse_client::METRICS
+                                    .extent_spill_bytes
+                                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+                                return Ok(());
+                            }
+                            // Ring refused (never-lossy backpressure): the
+                            // whole-image path below owns the write.
+                        }
+                    }
+                }
+            }
+        }
+
         let stripe_threshold = if self.cache.nvme.staging_dirs().is_empty() {
             MAX_INLINE_SIZE
         } else {
@@ -4001,6 +4166,34 @@ impl DataRouter {
             }
         };
 
+        // W2 rider FOLD-FIRST (§5.2): any whole-image path (staged RMW,
+        // extending write, layout transition, inline shrink-rewrite) folds
+        // the staged extent record into its RMW base before proceeding —
+        // the commit arms below retire the record after publishing. The
+        // record's runs are NEWER than the base image; the incoming write
+        // (newest of all) overlays afterwards in the payload assembly.
+        let rider_ext_key = crate::keys::active_block_ext(ino, 0).to_string();
+        let mut fold_rider = false;
+        if self.cache.nvme.has_staged_extent_record(&rider_ext_key) {
+            if let Some(Ok(rec)) = self.cache.nvme.read_extent_record(&rider_ext_key) {
+                let max_end = rec
+                    .extents
+                    .iter()
+                    .map(|(s0, d)| *s0 as usize + d.len())
+                    .max()
+                    .unwrap_or(0);
+                if existing_data.len() < max_end {
+                    existing_data.resize(max_end, 0);
+                }
+                for (s0, d) in &rec.extents {
+                    existing_data[*s0 as usize..*s0 as usize + d.len()].copy_from_slice(d);
+                }
+                fold_rider = true;
+            }
+            // Torn/future records never compose here; the recovery sweep
+            // owns their loud disposition.
+        }
+
         // NOTE deliberately NO `meta.size` clamp on the seed: the physical
         // blob/durable image is authoritative when the cached logical size
         // lags LOW (hot-entry eviction + deferred layout persist — the
@@ -4107,6 +4300,9 @@ impl DataRouter {
                 )
                 .await;
             }
+            if fold_rider {
+                self.retire_rider_record(ino).await;
+            }
             crate::fuse_client::METRICS
                 .layout_striped_writes
                 .fetch_add(1, Ordering::Relaxed);
@@ -4174,6 +4370,9 @@ impl DataRouter {
                 None,
             )
             .await;
+            if fold_rider {
+                self.retire_rider_record(ino).await;
+            }
         } else if !self.cache.nvme.staging_dirs().is_empty()
             && (new_size as u64) <= self.block_size.load(Ordering::Acquire)
         {
@@ -4260,6 +4459,9 @@ impl DataRouter {
                         )
                         .await;
                     }
+                    if fold_rider {
+                        self.retire_rider_record(ino).await;
+                    }
                 }
                 Err(SqueezefsError::Io(ref e)) if e.kind() == std::io::ErrorKind::StorageFull => {
                     // Spill is the designed degraded mode under sustained
@@ -4340,6 +4542,9 @@ impl DataRouter {
                         Some(&stored_block_key),
                     )
                     .await;
+                    if fold_rider {
+                        self.retire_rider_record(ino).await;
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -4754,6 +4959,43 @@ impl DataRouter {
                         let start = std::cmp::min(offset as usize, guard.len);
                         let end = std::cmp::min(offset as usize + want, guard.len);
                         let phys = end - start;
+                        // W2 staged-layout rider (§5.2): overlay the
+                        // record's runs (NEWER than the ring image) — one
+                        // latch-free probe when absent.
+                        let rider_runs = self.staged_extent_runs_in(
+                            file_path,
+                            0,
+                            offset as usize,
+                            offset as usize + want,
+                        );
+                        if !rider_runs.is_empty() {
+                            let mut out = vec![0u8; want];
+                            out[..phys].copy_from_slice(&guard[start..end]);
+                            for (abs, d) in rider_runs {
+                                let lo = abs - offset as usize;
+                                out[lo..lo + d.len()].copy_from_slice(&d);
+                            }
+                            let (data, backing) = if let Some(dest) = dest_addr {
+                                let dest_ptr = dest as *mut u8;
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        out.as_ptr(),
+                                        dest_ptr,
+                                        out.len(),
+                                    );
+                                    let d = bytes::Bytes::from_owner(
+                                        crate::cache::pool::UringBufOwner {
+                                            ptr: dest_ptr,
+                                            len: out.len(),
+                                        },
+                                    );
+                                    (d, None)
+                                }
+                            } else {
+                                (bytes::Bytes::from(out), None)
+                            };
+                            return Ok((data, backing));
+                        }
                         let (data, backing) = if let Some(dest) = dest_addr {
                             let dest_ptr = dest as *mut u8;
                             unsafe {
@@ -4831,6 +5073,19 @@ impl DataRouter {
                                 let mut out = vec![0u8; want];
                                 if start < end {
                                     out[..end - start].copy_from_slice(&decompressed[start..end]);
+                                }
+                                // W2 rider: the record's runs are newer
+                                // than the promoted image (the crash
+                                // window between a promotion's publish
+                                // and its record retire).
+                                for (abs, d) in self.staged_extent_runs_in(
+                                    file_path,
+                                    0,
+                                    offset as usize,
+                                    offset as usize + want,
+                                ) {
+                                    let lo = abs - offset as usize;
+                                    out[lo..lo + d.len()].copy_from_slice(&d);
                                 }
                                 return Ok((bytes::Bytes::from(out), None));
                             }
@@ -4912,6 +5167,82 @@ impl DataRouter {
                         let slice_len = (end_offset - offset) as u32;
                         let cache_key =
                             crate::keys::active_block_for_path(file_path, b_idx).to_string();
+
+                        // W2 (§5.2 "overlay never invisible"): a staged
+                        // extent record's runs are NEWER than every base
+                        // (staged image / tiers / device / hole). When one
+                        // exists (one latch-free probe otherwise — R6),
+                        // take the compose path: base bytes + runs overlay.
+                        {
+                            let rel_s = slice_start as usize;
+                            let rel_e = (slice_start + slice_len as u64) as usize;
+                            let ext_runs =
+                                self.staged_extent_runs_in(file_path, b_idx, rel_s, rel_e);
+                            if !ext_runs.is_empty() {
+                                // Fully-covered requests never touch the
+                                // base (the item-B "ACKed bytes serve from
+                                // the overlay" law, record form).
+                                let mut cursor = rel_s;
+                                for (abs, d) in &ext_runs {
+                                    if *abs > cursor {
+                                        break;
+                                    }
+                                    cursor = cursor.max(abs + d.len());
+                                }
+                                let fully_covered = cursor >= rel_e;
+                                let mut out = vec![0u8; rel_e - rel_s];
+                                if fully_covered {
+                                    // runs overlay below fills everything
+                                } else if let Some(img) = self.cache.nvme.read_staged(&cache_key) {
+                                    let start = rel_s.min(img.len());
+                                    let end = rel_e.min(img.len());
+                                    out[..end - start].copy_from_slice(&img[start..end]);
+                                } else {
+                                    let block_keys = self
+                                        .load_striped_block_keys(
+                                            file_path,
+                                            &meta,
+                                            start_block,
+                                            end_block,
+                                        )
+                                        .await?;
+                                    let bk = block_keys.first().and_then(|(_, k)| k.as_deref());
+                                    if bk.is_some() {
+                                        if let Some(base) = self
+                                            .get_block_for_index(file_path, b_idx, bk, false)
+                                            .await?
+                                        {
+                                            let start = rel_s.min(base.len());
+                                            let end = rel_e.min(base.len());
+                                            out[..end - start].copy_from_slice(&base[start..end]);
+                                        }
+                                    }
+                                }
+                                for (abs, d) in ext_runs {
+                                    out[abs - rel_s..abs - rel_s + d.len()].copy_from_slice(&d);
+                                }
+                                let (data, backing) = if let Some(dest) = dest_addr {
+                                    let dest_ptr = dest as *mut u8;
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            out.as_ptr(),
+                                            dest_ptr,
+                                            out.len(),
+                                        );
+                                        let d = bytes::Bytes::from_owner(
+                                            crate::cache::pool::UringBufOwner {
+                                                ptr: dest_ptr,
+                                                len: out.len(),
+                                            },
+                                        );
+                                        (d, None)
+                                    }
+                                } else {
+                                    (bytes::Bytes::from(out), None)
+                                };
+                                return Ok((data, backing));
+                            }
+                        }
 
                         // Check active block staging first
                         if let Some(guard) = self.cache.nvme.read_staged_zero_copy(&cache_key) {
@@ -5593,6 +5924,20 @@ impl DataRouter {
                                     );
                                 }
                             }
+                            // W2 (§5.2): overlay the block's staged extent
+                            // record — its runs are NEWER than any base
+                            // (device / tier / staged image / hole zeros).
+                            for (s, d) in router.staged_extent_runs_in(
+                                &file_path_clone,
+                                b_idx,
+                                rel_start,
+                                rel_start + copy_len,
+                            ) {
+                                unsafe {
+                                    let dst = (raw_ptr + dest_start + (s - rel_start)) as *mut u8;
+                                    std::ptr::copy_nonoverlapping(d.as_ptr(), dst, d.len());
+                                }
+                            }
                             Ok::<(), SqueezefsError>(())
                         }));
                     }
@@ -5626,6 +5971,199 @@ impl DataRouter {
                     )))
                 }
             }
+        }
+    }
+
+    /// W2 rider FOLD (fsync / teardown / recovery drains): compose the
+    /// record's extents into the staged image DIRECTLY under the block-0
+    /// guard — seed from the ring blob (or the validated promoted copy),
+    /// apply the extents, same-key re-stage, retire the record. One
+    /// whole-image RMW per k rider writes — the rider's amortization form.
+    /// Never-lossy: a refused/failed re-stage leaves image + record
+    /// untouched and propagates (fsync is the error surface). Ok(true) =
+    /// a record existed and was drained.
+    pub(crate) async fn fold_rider_record(&self, ino: u64, fencing_token: u64) -> Result<bool> {
+        let key = crate::keys::active_block_ext(ino, 0).to_string();
+        if !self.cache.nvme.has_staged_extent_record(&key) {
+            return Ok(false);
+        }
+        let file_path = crate::keys::inode_path(ino);
+        let _guard = crate::fuse_client::block_lock_acquire(
+            ino,
+            0,
+            crate::fuse_client::BlockLockSite::StagedWrite,
+        )
+        .await;
+        // Re-probe + resolve the identity UNDER the guard.
+        let rec = match self.cache.nvme.read_extent_record(&key) {
+            Some(Ok(rec)) => rec,
+            Some(Err(_)) => return Ok(false), // recovery owns the disposition
+            None => return Ok(false),         // drained by a racing write's fold-first
+        };
+        let meta = self.fetch_metadata(&file_path).await?;
+        if meta.file_type == "striped" {
+            // The striped fold owns block-0 records of striped layouts.
+            return Ok(false);
+        }
+        if rec.extents.is_empty() || meta.file_type != "staged" {
+            // Degenerate record, or a non-staged layout (inline flip):
+            // every layout commit retires its record AFTER publishing an
+            // image that already contains the extents (fold-first), so a
+            // surviving record here is a crash-residue stale duplicate —
+            // retire it.
+            self.retire_rider_record(ino).await;
+            return Ok(true);
+        }
+        let Some(fid) = meta.file_id.clone() else {
+            return Ok(false);
+        };
+        // Base image: the ring blob, else the validated promoted copy.
+        let mut img: Vec<u8> = {
+            let mut buf = BUFFER_POOL.alloc();
+            if self.cache.nvme.read_staged_into(&fid, &mut buf) {
+                buf.to_vec()
+            } else if let Some(bk) = self.staged_block_mapping(&file_path, &meta).await {
+                let fetched = self.read_promoted_staged_block(&bk).await?;
+                let fresh = self.freshest_layout_identity(&file_path).await;
+                let still_bound = fresh.as_ref().is_some_and(|f| {
+                    f.file_type == "staged"
+                        && f.file_id == meta.file_id
+                        && f.block_map
+                            .as_ref()
+                            .and_then(|bm| bm.get(&0))
+                            .is_some_and(|cur| *cur == bk)
+                });
+                if !still_bound {
+                    // Identity moving under the fold: leave everything in
+                    // place — the next drain re-resolves.
+                    return Ok(false);
+                }
+                let mut v = fetched.to_vec();
+                if v.len() as u64 > meta.size {
+                    v.truncate(meta.size as usize);
+                }
+                v
+            } else {
+                // Payload lost (D0 crash degrade): the record extents are
+                // the only surviving custody — fold them over zeros.
+                vec![0u8; meta.size.min(u32::MAX as u64) as usize]
+            }
+        };
+        let max_end = rec
+            .extents
+            .iter()
+            .map(|(s0, d)| *s0 as usize + d.len())
+            .max()
+            .unwrap_or(0);
+        if img.len() < max_end {
+            img.resize(max_end, 0);
+        }
+        for (s0, d) in &rec.extents {
+            img[*s0 as usize..*s0 as usize + d.len()].copy_from_slice(d);
+        }
+        // Same-key crash-safe replace (bumps the stage generation — a
+        // racing promotion's commit aborts). StorageFull propagates:
+        // never-lossy custody stays exactly where it was.
+        self.cache
+            .nvme
+            .stage_write(&file_path, &fid, bytes::Bytes::from(img), fencing_token)
+            .await?;
+        self.retire_rider_record(ino).await;
+        Ok(true)
+    }
+
+    /// Clip the ino's rider record to `[0, new_size)`: drop extents fully
+    /// beyond, truncate the straddler, re-put (same-key crash-safe
+    /// replace) or remove when empty. Blocking-pool hop (shard WRITE
+    /// lock).
+    async fn clip_rider_record(&self, ino: u64, new_size: u64) {
+        let key = crate::keys::active_block_ext(ino, 0).to_string();
+        if !self.cache.nvme.has_staged_extent_record(&key) {
+            return;
+        }
+        // Record mutations serialize behind the truncate's held inode
+        // WRITE guard (rider writers hold the inode read guard);
+        // promotions defer on record-bearing files.
+        let Some(Ok(rec)) = self.cache.nvme.read_extent_record(&key) else {
+            return; // torn/future: recovery owns the disposition
+        };
+        let mut clipped: Vec<(u32, Vec<u8>)> = Vec::with_capacity(rec.extents.len());
+        for (s0, mut d) in rec.extents {
+            if (s0 as u64) >= new_size {
+                continue;
+            }
+            let keep = (new_size - s0 as u64).min(d.len() as u64) as usize;
+            d.truncate(keep);
+            if !d.is_empty() {
+                clipped.push((s0, d));
+            }
+        }
+        let nvme = self.cache.nvme.clone();
+        let record = crate::cache::nvme::ExtentRecord {
+            version: crate::cache::nvme::EXTENT_RECORD_VERSION,
+            fencing_token: rec.fencing_token,
+            block_idx: 0,
+            base_deferred: rec.base_deferred,
+            extents: clipped,
+        };
+        let _ = tokio::task::spawn_blocking(move || {
+            if record.extents.is_empty() {
+                nvme.remove_active_block(&key);
+            } else if !nvme.rewrite_extent_record_in_place(&key, &record) {
+                // The in-place patch failed (entry vanished / foreign
+                // shape): the record must NOT survive the truncate with
+                // beyond-EOF extents — resurrection bait (the
+                // staged-truncate-stale family). Discard: the sub-size
+                // extents it carried are un-fsynced custody the truncate
+                // barrier legally supersedes, and the base image (already
+                // clipped in place) stays authoritative.
+                nvme.remove_active_block(&key);
+            }
+        })
+        .await;
+    }
+
+    /// Retire the ino's rider record after a whole-image commit that
+    /// folded it (`fold_rider` in `write_file_opts`): blocking-pool hop
+    /// (shard WRITE lock), counted `staged_rider_folds`.
+    async fn retire_rider_record(&self, ino: u64) {
+        let key = crate::keys::active_block_ext(ino, 0).to_string();
+        let nvme = self.cache.nvme.clone();
+        let _ = tokio::task::spawn_blocking(move || nvme.remove_active_block(&key)).await;
+        crate::fuse_client::METRICS
+            .staged_rider_folds
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// W2 (§5.2) read-side record probe: the extents of block `b`'s staged
+    /// `active_block_ext:` record intersected with `[start, end)` (offsets
+    /// within the block), as `(block_offset, payload_copy)`. One latch-free
+    /// occupancy probe when no record exists (R6: the empty-map cost is
+    /// today's miss); bad records never compose (the recovery sweep and
+    /// the checkout absorb dispose of them loudly).
+    pub(crate) fn staged_extent_runs_in(
+        &self,
+        file_path: &str,
+        b: u32,
+        start: usize,
+        end: usize,
+    ) -> Vec<(usize, Vec<u8>)> {
+        let key = crate::keys::active_block_ext_for_path(file_path, b);
+        if !self.cache.nvme.has_staged_extent_record(&key) {
+            return Vec::new();
+        }
+        match self.cache.nvme.read_extent_record(&key) {
+            Some(Ok(rec)) => rec
+                .extents
+                .iter()
+                .filter(|&&(s, ref d)| (s as usize) < end && s as usize + d.len() > start)
+                .map(|&(s, ref d)| {
+                    let lo = start.max(s as usize);
+                    let hi = end.min(s as usize + d.len());
+                    (lo, d[lo - s as usize..hi - s as usize].to_vec())
+                })
+                .collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -5682,7 +6220,18 @@ impl DataRouter {
                 SqueezefsError::InvalidOperation("Missing file_id for staged file".to_string())
             })?;
             let new_file_id = Uuid::new_v4().to_string();
-            if let Some(data) = self.cache.nvme.read_staged(file_id) {
+            if let Some(mut data) = self.cache.nvme.read_staged(file_id) {
+                // W2: the clone's image must carry the source's rider
+                // record extents (newer than the ring image).
+                let src_ino = parse_inode_from_path(src);
+                for (s0, d) in
+                    self.staged_extent_runs_in(&crate::keys::inode_path(src_ino), 0, 0, usize::MAX)
+                {
+                    if data.len() < s0 + d.len() {
+                        data.resize(s0 + d.len(), 0);
+                    }
+                    data[s0..s0 + d.len()].copy_from_slice(&d);
+                }
                 self.cache
                     .nvme
                     .stage_write(
@@ -5905,6 +6454,13 @@ impl DataRouter {
                 // after committing its mapping) — the durable leg below
                 // resolves that mapping through all sources and clips it.
             }
+        }
+        // W2 rider record: clip extents past the truncate point or they
+        // resurface through the next fold / re-extend (the
+        // staged-truncate-stale family applied to the record kind). The
+        // caller holds the inode WRITE guard, excluding rider writers.
+        if new_size < pre_size {
+            self.clip_rider_record(ino, new_size).await;
         }
 
         // Phase 2 (unlocked, data I/O before the meta flip — P0 layout
@@ -6191,7 +6747,12 @@ impl DataRouter {
         // staging shard WRITE lock (shard-lock invariant rule 2).
         let keys: Vec<String> = block_indices
             .into_iter()
-            .map(|b| crate::keys::active_block_for_path(file_path, b as u32).to_string())
+            .flat_map(|b| {
+                [
+                    crate::keys::active_block_for_path(file_path, b as u32).to_string(),
+                    crate::keys::active_block_ext_for_path(file_path, b as u32).to_string(),
+                ]
+            })
             .collect();
         let _ = self.cache.nvme.remove_active_blocks_async(keys).await;
 

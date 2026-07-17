@@ -192,7 +192,9 @@ async fn write_rig_disabled_records_nothing_and_path_is_byte_identical() {
 
     let probes0 = METRICS.staging_sibling_probes.load(Ordering::Relaxed);
     let mut expect = base.clone();
-    let payload = pattern(4096, 77);
+    // W2 (RW4): >= 25 % of the block keeps the full-buffer checkout (and
+    // its always-on sibling-probe ledger) the measured path.
+    let payload = pattern((BS / 4) as usize, 77);
     for b in 0..blocks {
         let off = b * BS + 8192;
         write_at(&h, ino, off, &payload).await;

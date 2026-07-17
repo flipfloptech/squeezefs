@@ -719,6 +719,64 @@ impl NvmeShard {
     /// Returns `false` when the key is absent, the frame is malformed, or
     /// `new_original_size` is not a strict shrink (equal = benign no-op,
     /// returns `true`).
+    /// In-place payload REWRITE of a block-family staged entry (header
+    /// padded to 4 KiB — `active_block:` / `active_block_ext:` frames)
+    /// with a payload no longer than the current one. Like
+    /// [`NvmeShard::shrink_staged_value`] this is an in-extent patch that
+    /// needs NO segment placement, so ring pressure can never refuse it —
+    /// the W2 truncate-clip of an extent record depends on that (a
+    /// refusable clip is resurrection bait, the FIND-VS-B class). Crash
+    /// ordering: payload bytes are flushed before the size header, so a
+    /// torn patch yields a checksum-mismatching record that the consumer
+    /// discards LOUDLY (un-fsynced custody, POSIX-legal) — never a
+    /// silently mixed image.
+    pub fn patch_block_family_value(&self, key: &Bytes, new_payload: &[u8]) -> bool {
+        let mut inner = self.inner.write();
+        let Some(&meta) = inner.map.get(key) else {
+            return false;
+        };
+        let magic =
+            u32::from_le_bytes(inner.mmap[meta.offset..meta.offset + 4].try_into().unwrap());
+        if magic != BLOCK_MAGIC {
+            return false;
+        }
+        let key_len = u32::from_le_bytes(
+            inner.mmap[meta.offset + 4..meta.offset + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let val_len = u32::from_le_bytes(
+            inner.mmap[meta.offset + 8..meta.offset + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let alignment = if inner.capacity >= 4096 { 4096 } else { 1 };
+        let val_start = (meta.offset + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
+        if val_len < 24 || val_start + val_len > inner.mmap.len() {
+            return false;
+        }
+        let meta_len = u64::from_be_bytes(
+            inner.mmap[val_start..val_start + 8]
+                .try_into()
+                .unwrap_or([0; 8]),
+        ) as usize;
+        if meta_len < 20 || 8 + meta_len > val_len {
+            return false;
+        }
+        let os_off = val_start + 16;
+        let old = u64::from_be_bytes(inner.mmap[os_off..os_off + 8].try_into().unwrap());
+        // Block-family frames pad the header to 4 KiB.
+        let data_start = val_start + 4096;
+        if new_payload.len() as u64 > old || data_start + new_payload.len() > val_start + val_len {
+            return false;
+        }
+        inner.mmap[data_start..data_start + new_payload.len()].copy_from_slice(new_payload);
+        let _ = inner.mmap.flush_range(data_start, new_payload.len().max(1));
+        inner.mmap[os_off..os_off + 8].copy_from_slice(&(new_payload.len() as u64).to_be_bytes());
+        let _ = inner.mmap.flush_range(os_off, 8);
+        true
+    }
+
     pub fn shrink_staged_value(&self, key: &Bytes, new_original_size: u64) -> bool {
         let mut inner = self.inner.write();
         let Some(&meta) = inner.map.get(key) else {
@@ -1197,6 +1255,19 @@ impl NvmeCache {
         for dev in devices.iter() {
             let shard_idx = (xxh3_64(key) as usize) % dev.shards.len();
             if dev.shards[shard_idx].shrink_staged_value(key, new_original_size) {
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// See [`NvmeShard::patch_block_family_value`].
+    pub fn patch_block_family_value(&self, key: &Bytes, new_payload: &[u8]) -> bool {
+        let devices = self.devices.read();
+        let mut any = false;
+        for dev in devices.iter() {
+            let shard_idx = (xxh3_64(key) as usize) % dev.shards.len();
+            if dev.shards[shard_idx].patch_block_family_value(key, new_payload) {
                 any = true;
             }
         }

@@ -774,7 +774,11 @@ async fn test_striped_flush_dma_zero_copy_aligned_no_lru_retention() {
     // degrades into the staging put (+ writeback enqueue); block 1 stays
     // partial in RAM. (FAIL_NEXT_WRITES fires before any aligned-branch
     // accounting, so the counter window below stays clean.)
-    let p1: Vec<u8> = (0..4097u32).map(|i| ((i % 97) + 60) as u8).collect();
+    // W2 (RW4): the tail slice into block 1 must be >= 25 % of the block
+    // (1 KiB of 4 KiB) so it parks as a FULL deferred buffer — sub-25 %
+    // slices park as extent overlays now, which FOLD durably at teardown
+    // instead of staging (this suite pins the whole-image staged flush).
+    let p1: Vec<u8> = (0..5120u32).map(|i| ((i % 97) + 60) as u8).collect();
     squeezefs::nvme_dev::set_fail_next_writes(1);
     harness_write(&h, ino, 0, &p1).await;
     squeezefs::nvme_dev::clear_fail_next_writes();
@@ -830,9 +834,9 @@ async fn test_striped_flush_dma_zero_copy_aligned_no_lru_retention() {
         );
     }
 
-    // Content: p1 over [0..4097), p0's tail beyond.
+    // Content: p1 over [0..5120), p0's tail beyond.
     let mut expected = p1.clone();
-    expected.extend_from_slice(&p0[4097..]);
+    expected.extend_from_slice(&p0[5120..]);
     assert_eq!(
         harness_read(&h, ino, 0, 8193).await,
         expected,
@@ -979,7 +983,9 @@ async fn test_flush_write_verification_readback_runs_within_guard_hold() {
     // striped-flush test).
     let p0: Vec<u8> = (0..8193u32).map(|i| (i % 223) as u8).collect();
     harness_write(&h, ino, 0, &p0).await;
-    let p1: Vec<u8> = (0..4097u32).map(|i| ((i % 113) + 5) as u8).collect();
+    // W2 (RW4): >= 25 % tail slice keeps the FULL-buffer staged shape
+    // under test (sub-25 % would extent-park + fold instead).
+    let p1: Vec<u8> = (0..5120u32).map(|i| ((i % 113) + 5) as u8).collect();
     squeezefs::nvme_dev::set_fail_next_writes(1);
     harness_write(&h, ino, 0, &p1).await;
     squeezefs::nvme_dev::clear_fail_next_writes();
@@ -1010,7 +1016,7 @@ async fn test_flush_write_verification_readback_runs_within_guard_hold() {
     );
 
     let mut expected = p1.clone();
-    expected.extend_from_slice(&p0[4097..]);
+    expected.extend_from_slice(&p0[5120..]);
     assert_eq!(
         harness_read(&h, ino, 0, 8193).await,
         expected,

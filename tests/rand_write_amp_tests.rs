@@ -424,7 +424,11 @@ impl Ledger {
 /// overwrites at mid-block offsets (never block-complete, never adjacent)
 /// over `blocks` distinct striped blocks, `passes` shuffled passes.
 async fn rand_write_storm(h: &H, ino: u64, blocks: u64, passes: u64) -> u64 {
-    let payload = pattern(4096, 99);
+    // W2 (RW4): >= 25 % of the block so the storm keeps riding the
+    // FULL-buffer accumulation pipeline these pins document — sub-25 %
+    // non-adjacent writes park as extent overlays now (their pins live in
+    // tests/extent_overlay_tests.rs).
+    let payload = pattern((BS / 4) as usize, 99);
     let mut user_bytes = 0u64;
     for pass in 0..passes {
         for i in 0..blocks {
@@ -511,7 +515,9 @@ async fn staged_sibling_probe_fires_once_per_block_write() {
     make_striped(&h, ino, 8, 3).await;
 
     let before = ledger();
-    let payload = pattern(4096, 5);
+    // W2 (RW4): >= 25 % of the block — the sibling hop belongs to the
+    // full-buffer checkout; extent parks (sub-25 %) deliberately skip it.
+    let payload = pattern((BS / 4) as usize, 5);
     for b in 0..8u64 {
         write_at(&h, ino, b * BS + 4096, &payload).await;
     }
@@ -650,7 +656,9 @@ async fn ledger_buckets_reconcile_and_attribute_drivers() {
     // not in `drain`, and requests its own durable-upload chain.
     let ino2 = create(&h, "buckets2.dat").await;
     make_striped(&h, ino2, 4, 13).await;
-    let p = pattern(4096, 17);
+    // W2 (RW4): >= 25 % of the block parks a FULL partial buffer — the
+    // fsync-family STAGING leg under test (an extent overlay would FOLD).
+    let p = pattern((BS / 4) as usize, 17);
     write_at(&h, ino2, BS + 8192, &p).await; // parks one partial block
     let before_flush = ledger();
     let token = h.dlm.get_fencing_token_ino(ino2);
@@ -711,7 +719,18 @@ async fn g_rw2_device_byte_ledger_on_rand_write_shape() {
     assert_eq!(block_mapping_form(&m0), "undecorated-2part");
 
     let before = ledger();
-    let user_bytes = rand_write_storm(&h, ino, blocks, 2).await;
+    // The GATE shape is the scoreboard's: aligned 4 KiB isolated
+    // overwrites (patch-eligible with the knob ON) — deliberately NOT
+    // rand_write_storm's >= 25 % accumulation shape.
+    let payload = pattern(4096, 99);
+    let mut user_bytes = 0u64;
+    for pass in 0..2u64 {
+        for i in 0..blocks {
+            let b = (i * 173 + pass * 61) % blocks;
+            write_at(&h, ino, b * BS + 8192, &payload).await;
+            user_bytes += payload.len() as u64;
+        }
+    }
     // The R5-pressure machinery's drain — on the live daemon the budget
     // sampler drives this; the sandbox invokes the same entry point.
     h.fs.drain_parked_toward(0).await;
@@ -799,7 +818,7 @@ async fn write_rig_phases_and_sites_record() {
 
     let n = blocks; // one partial write per block (one pass)
     let user = rand_write_storm(&h, ino, blocks, 1).await;
-    assert_eq!(user, n * 4096);
+    assert_eq!(user, n * (BS / 4));
 
     // One complete block write => write-through (upload DMA + map merge).
     let full = pattern(BS as usize, 31);

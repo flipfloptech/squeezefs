@@ -133,14 +133,74 @@ impl AsRef<[u8]> for SnapshotOwner {
     }
 }
 
-/// A block-sized, 4096-aligned active-block accumulation buffer.
+/// W2 compact representation (design-random-small-writes §5.2): payload
+/// slabs for the SMALL-write shapes, mirroring the buffer's
+/// written-coverage union EXACTLY — `slabs[i]` carries the bytes of the
+/// i-th run of [`ActiveBlockBuf::runs_sorted`] (ascending, pairwise
+/// disjoint, non-abutting). The coverage union stays the single source of
+/// truth (RW3b); the overlay is payload storage only, kept in lockstep by
+/// [`ActiveBlockBuf::merge_extent`] and asserted in debug builds. A 4 KiB
+/// write parks ~4 KiB (`parked_extent_bytes`), not a block-size backing.
+struct ExtentOverlay {
+    /// `(start, payload)` slabs — invariant: ranges == the coverage runs.
+    slabs: Vec<(u32, Vec<u8>)>,
+}
+
+impl ExtentOverlay {
+    fn payload_bytes(&self) -> u64 {
+        self.slabs.iter().map(|(_, d)| d.len() as u64).sum()
+    }
+
+    /// Merge `[start, start+data)` newest-wins, coalescing with
+    /// overlapping/abutting slabs — the payload twin of the coverage
+    /// union's interval merge.
+    fn merge(&mut self, start: u32, data: &[u8]) {
+        let end = start + data.len() as u32;
+        let lo = self
+            .slabs
+            .partition_point(|&(s, ref d)| (s + d.len() as u32) < start);
+        let mut hi = lo;
+        while hi < self.slabs.len() && self.slabs[hi].0 <= end {
+            hi += 1;
+        }
+        if lo == hi {
+            self.slabs.insert(lo, (start, data.to_vec()));
+            return;
+        }
+        let new_start = self.slabs[lo].0.min(start);
+        let new_end = (self.slabs[hi - 1].0 + self.slabs[hi - 1].1.len() as u32).max(end);
+        let mut merged = vec![0u8; (new_end - new_start) as usize];
+        for (s, d) in self.slabs.drain(lo..hi) {
+            let off = (s - new_start) as usize;
+            merged[off..off + d.len()].copy_from_slice(&d);
+        }
+        // The incoming write is NEWEST: it wins every overlap.
+        let off = (start - new_start) as usize;
+        merged[off..off + data.len()].copy_from_slice(data);
+        self.slabs.insert(lo, (new_start, merged));
+    }
+}
+
+/// The buffer's physical representation: a full block-sized aligned
+/// backing (the historical form — every staging/upload/RMW path) or the
+/// W2 compact extent overlay (small-write parking; escalates to `Full`
+/// before any whole-image consumer needs it).
+enum Repr {
+    Full(CowCell<AlignedBlock>),
+    Extent(ExtentOverlay),
+}
+
+/// A block-sized active-block accumulation buffer.
 ///
 /// Mutation requires provable uniqueness (`Arc::get_mut`); shared
 /// snapshots force copy-on-write. Deliberately not `Clone`: the map entry
 /// is the exclusive owner, and [`ActiveBlockBuf::snapshot`] is the only
 /// sharing primitive.
 pub struct ActiveBlockBuf {
-    cell: CowCell<AlignedBlock>,
+    repr: Repr,
+    /// Logical block size — representation-independent (the extent form
+    /// has no backing to measure).
+    block_size: u32,
     /// Primary written run `[written.0, written.1)` — the union of ranges
     /// merged via [`ActiveBlockBuf::record_write`], as long as they arrive
     /// overlapping/abutting (the in-order common case: this pair is the
@@ -178,7 +238,44 @@ pub struct ActiveBlockBuf {
     deferred_seed: bool,
 }
 
+/// RAII gauge charge: `parked_full_buffer_bytes` for `Full`,
+/// `parked_extent_bytes` for `Extent` slab bytes — adjusted at
+/// construction, drop, escalation, and slab growth. Together these are the
+/// W2 parked-write BYTE budget (the retired 256-count cap's byte form).
+fn gauge_full() -> &'static std::sync::atomic::AtomicU64 {
+    &crate::fuse_client::METRICS.parked_full_buffer_bytes
+}
+
+fn gauge_extent() -> &'static std::sync::atomic::AtomicU64 {
+    &crate::fuse_client::METRICS.parked_extent_bytes
+}
+
+impl Drop for ActiveBlockBuf {
+    fn drop(&mut self) {
+        match &self.repr {
+            Repr::Full(_) => {
+                crate::gauge_core::sub_saturating(gauge_full(), self.block_size as u64);
+            }
+            Repr::Extent(ov) => {
+                crate::gauge_core::sub_saturating(gauge_extent(), ov.payload_bytes());
+            }
+        }
+    }
+}
+
 impl ActiveBlockBuf {
+    fn new_full(block_size: usize, deferred_seed: bool) -> Self {
+        gauge_full().fetch_add(block_size as u64, Ordering::Relaxed);
+        Self {
+            repr: Repr::Full(CowCell::new(AlignedBlock::alloc_raw(block_size))),
+            block_size: block_size as u32,
+            written: (0, 0),
+            written_extra: Vec::new(),
+            content_valid: false,
+            deferred_seed,
+        }
+    }
+
     /// A fresh accumulation buffer for a block with **no existing data**:
     /// born unwritten, with the seed-time zero-fill elided (§5.3). The
     /// complement's correct content is zeros by definition — established
@@ -186,13 +283,7 @@ impl ActiveBlockBuf {
     /// served as zeros by the coverage-aware read
     /// ([`ActiveBlockBuf::covered_runs_in`]) meanwhile.
     pub fn fresh(block_size: usize) -> Self {
-        Self {
-            cell: CowCell::new(AlignedBlock::alloc_raw(block_size)),
-            written: (0, 0),
-            written_extra: Vec::new(),
-            content_valid: false,
-            deferred_seed: false,
-        }
+        Self::new_full(block_size, false)
     }
 
     /// A deferred-RMW accumulation buffer for a block WITH existing device
@@ -204,18 +295,197 @@ impl ActiveBlockBuf {
     /// [`ActiveBlockBuf::fill_complement_from`] before the bytes can
     /// escape.
     pub fn deferred(block_size: usize) -> Self {
+        Self::new_full(block_size, true)
+    }
+
+    /// W2 (§5.2): a COMPACT extent-overlay buffer for the small-write
+    /// shapes — no block-size backing is allocated; payload slabs charge
+    /// `parked_extent_bytes`. `deferred` carries the item-B law verbatim:
+    /// `true` = the block has existing device data and the unwritten
+    /// complement owes its OLD bytes (a fold seeds once; reads compose the
+    /// complement from the base tiers); `false` = hole/no-existing-data —
+    /// the complement is zeros and a fold performs NO seed read.
+    pub fn extent(block_size: usize, deferred: bool) -> Self {
         Self {
-            cell: CowCell::new(AlignedBlock::alloc_raw(block_size)),
+            repr: Repr::Extent(ExtentOverlay { slabs: Vec::new() }),
+            block_size: block_size as u32,
             written: (0, 0),
             written_extra: Vec::new(),
             content_valid: false,
-            deferred_seed: true,
+            deferred_seed: deferred,
         }
+    }
+
+    /// Whether this buffer is the W2 compact extent-overlay form.
+    pub fn is_extent_repr(&self) -> bool {
+        matches!(self.repr, Repr::Extent(_))
     }
 
     /// Whether the unwritten complement still owes the old-block seed.
     pub fn seed_deferred(&self) -> bool {
         self.deferred_seed
+    }
+
+    /// Extent-repr accessors (0/empty on the full repr).
+    pub fn extent_count(&self) -> usize {
+        self.written_extra.len() + usize::from(self.written.0 != self.written.1)
+    }
+
+    /// Parked extent payload bytes (0 for the full repr).
+    pub fn extent_payload_bytes(&self) -> u64 {
+        match &self.repr {
+            Repr::Extent(ov) => ov.payload_bytes(),
+            Repr::Full(_) => 0,
+        }
+    }
+
+    /// Merge a small write into the extent overlay: coverage first (the
+    /// RW3b union — the single trigger source), then the payload slab
+    /// merge (newest wins). Returns the coverage-completion transition
+    /// exactly as [`ActiveBlockBuf::record_write`] does. Callers hold this
+    /// block's `BLOCK_FLUSH_LOCKS`.
+    pub fn merge_extent(&mut self, start: usize, data: &[u8]) -> bool {
+        debug_assert!(self.is_extent_repr(), "merge_extent on a full buffer");
+        if data.is_empty() {
+            return false;
+        }
+        let completed = self.record_write(start, start + data.len());
+        let Repr::Extent(ov) = &mut self.repr else {
+            unreachable!("checked extent repr above");
+        };
+        let before = ov.payload_bytes();
+        ov.merge(start as u32, data);
+        let after = ov.payload_bytes();
+        if after >= before {
+            gauge_extent().fetch_add(after - before, Ordering::Relaxed);
+        } else {
+            crate::gauge_core::sub_saturating(gauge_extent(), before - after);
+        }
+        #[cfg(debug_assertions)]
+        self.assert_slabs_mirror_runs();
+        completed
+    }
+
+    /// Apply an OLDER extent (a staged record being absorbed) — only into
+    /// the coverage GAPS, so newer parked bytes are never overwritten.
+    /// Works on both representations; callers hold the block lock.
+    pub fn absorb_older_extent(&mut self, start: usize, data: &[u8]) {
+        let end = start + data.len();
+        let subs: Vec<(u32, u32)> = self
+            .gaps(self.block_size)
+            .into_iter()
+            .filter_map(|(gs, ge)| {
+                let s = gs.max(start as u32);
+                let e = ge.min(end as u32);
+                (s < e).then_some((s, e))
+            })
+            .collect();
+        for (s, e) in subs {
+            let slice = &data[(s as usize - start)..(e as usize - start)];
+            match &mut self.repr {
+                Repr::Extent(_) => {
+                    let _ = self.merge_extent(s as usize, slice);
+                }
+                Repr::Full(_) => {
+                    let _ = self.record_write(s as usize, e as usize);
+                    self.make_mut()[s as usize..e as usize].copy_from_slice(slice);
+                }
+            }
+        }
+    }
+
+    /// The extent runs intersected with `[start, end)` as `(abs_start,
+    /// payload_copy)` — the read-compose input (bounded copies; extents
+    /// are small by construction). Content beyond the runs is the
+    /// caller's complement (zeros for a fresh overlay, the base
+    /// tiers/device for a deferred one).
+    pub fn extent_runs_in(&self, start: usize, end: usize) -> Vec<(usize, Vec<u8>)> {
+        match &self.repr {
+            Repr::Extent(ov) => ov
+                .slabs
+                .iter()
+                .filter(|&&(s, ref d)| (s as usize) < end && s as usize + d.len() > start)
+                .map(|&(s, ref d)| {
+                    let lo = start.max(s as usize);
+                    let hi = end.min(s as usize + d.len());
+                    (lo, d[lo - s as usize..hi - s as usize].to_vec())
+                })
+                .collect(),
+            Repr::Full(_) => Vec::new(),
+        }
+    }
+
+    /// Every extent run as `(start, payload_copy)` — the spill serializer
+    /// input (mirrors the coverage runs exactly).
+    pub fn extent_table(&self) -> Vec<(u32, Vec<u8>)> {
+        match &self.repr {
+            Repr::Extent(ov) => ov.slabs.clone(),
+            Repr::Full(_) => Vec::new(),
+        }
+    }
+
+    /// Escalate the extent overlay to a full buffer (coverage ≥ 25 % of
+    /// the block or a large merge, §5.2): allocate the block-size backing,
+    /// lay the slabs at their offsets, keep the coverage union and the
+    /// item-B deferral verbatim. Pure RAM conversion — no I/O, no
+    /// coverage change. Idempotent on a full buffer.
+    pub fn escalate_to_full(&mut self) {
+        let Repr::Extent(ov) = &mut self.repr else {
+            return;
+        };
+        let slabs = std::mem::take(&mut ov.slabs);
+        let freed: u64 = slabs.iter().map(|(_, d)| d.len() as u64).sum();
+        gauge_full().fetch_add(self.block_size as u64, Ordering::Relaxed);
+        crate::gauge_core::sub_saturating(gauge_extent(), freed);
+        let block = AlignedBlock::alloc_raw(self.block_size as usize);
+        self.repr = Repr::Full(CowCell::new(block));
+        let slice = self.make_mut();
+        for (s, d) in slabs {
+            slice[s as usize..s as usize + d.len()].copy_from_slice(&d);
+        }
+        crate::fuse_client::METRICS
+            .extent_escalations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Defensive escalation for legacy full-image call sites reaching an
+    /// extent buffer through a route the W2 wiring did not special-case:
+    /// stays CORRECT (the full form serves everything) and observable
+    /// (`extent_implicit_escalations` — designed routes keep it at 0).
+    fn implicit_escalate(&mut self) {
+        if self.is_extent_repr() {
+            self.escalate_to_full();
+            crate::fuse_client::METRICS
+                .extent_implicit_escalations
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn assert_slabs_mirror_runs(&self) {
+        let Repr::Extent(ov) = &self.repr else {
+            return;
+        };
+        let runs: Vec<(u32, u32)> = self.runs_sorted().collect();
+        let slabs: Vec<(u32, u32)> = ov
+            .slabs
+            .iter()
+            .map(|&(s, ref d)| (s, s + d.len() as u32))
+            .collect();
+        assert_eq!(
+            runs, slabs,
+            "extent slabs must mirror the coverage union exactly"
+        );
+    }
+
+    fn full_cell(&self) -> &CowCell<AlignedBlock> {
+        match &self.repr {
+            Repr::Full(cell) => cell,
+            Repr::Extent(_) => panic!(
+                "whole-image access to an extent-overlay buffer: the caller \
+                 must fold or escalate first (W2 route bug)"
+            ),
+        }
     }
 
     /// Materialize the deferred seed: fill every unwritten gap from `old`
@@ -233,11 +503,15 @@ impl ActiveBlockBuf {
         if !self.deferred_seed {
             return;
         }
+        // A seed application is a whole-image operation: an extent overlay
+        // reaching here (a route the W2 wiring should fold instead)
+        // escalates first — correct, observable.
+        self.implicit_escalate();
         self.deferred_seed = false;
         if self.content_valid {
             return;
         }
-        let len = self.cell.peek().len;
+        let len = self.block_size as usize;
         let gaps = self.gaps(len as u32);
         let slice = self.make_mut();
         for &(gs, ge) in &gaps {
@@ -276,8 +550,10 @@ impl ActiveBlockBuf {
                 std::ptr::write_bytes(block.ptr.add(copy_len), 0, block_size - copy_len);
             }
         }
+        gauge_full().fetch_add(block_size as u64, Ordering::Relaxed);
         Self {
-            cell: CowCell::new(block),
+            repr: Repr::Full(CowCell::new(block)),
+            block_size: block_size as u32,
             written: (0, 0),
             written_extra: Vec::new(),
             content_valid: true,
@@ -291,7 +567,7 @@ impl ActiveBlockBuf {
     /// [`ActiveBlockBuf::covered_runs_in`].
     pub fn covered(&self) -> (u32, u32) {
         if self.content_valid {
-            (0, self.cell.peek().len as u32)
+            (0, self.block_size)
         } else {
             self.written
         }
@@ -371,7 +647,7 @@ impl ActiveBlockBuf {
     /// (`active_block_ooo_runs`) that later writes coalesce with. Callers
     /// hold this block's `BLOCK_FLUSH_LOCKS` (as all mutations do).
     pub fn record_write(&mut self, start: usize, end: usize) -> bool {
-        let len = self.cell.peek().len;
+        let len = self.block_size as usize;
         debug_assert!(
             start <= end && end <= len,
             "write range out of block bounds"
@@ -412,7 +688,7 @@ impl ActiveBlockBuf {
     fn union_is_full(&self) -> bool {
         // Extras are disjoint from the primary, so a full primary implies
         // no extras.
-        self.written == (0, self.cell.peek().len as u32)
+        self.written == (0, self.block_size)
     }
 
     fn coalesce_extras_into_primary(&mut self) {
@@ -454,10 +730,13 @@ impl ActiveBlockBuf {
             "zero_complete on a deferred-seed buffer: the owner must \
              materialize the old-block seed first (item B exit contract)"
         );
+        // Whole-image exit reached with an extent overlay: escalate first
+        // (correct + counted; designed routes fold instead).
+        self.implicit_escalate();
         if self.content_valid {
             return;
         }
-        let len = self.cell.peek().len;
+        let len = self.block_size as usize;
         let gaps = self.gaps(len as u32);
         let zeroed: usize = gaps.iter().map(|&(s, e)| (e - s) as usize).sum();
         if zeroed > 0 {
@@ -481,7 +760,7 @@ impl ActiveBlockBuf {
     /// every byte is app-written, so the buffer is content-valid with zero
     /// memset; a deferred seed is skipped forever (the row-4 win).
     fn complete_written_union(&mut self) {
-        let len = self.cell.peek().len;
+        let len = self.block_size as usize;
         debug_assert!(self.written_extra.is_empty());
         if self.deferred_seed {
             self.deferred_seed = false;
@@ -507,14 +786,18 @@ impl ActiveBlockBuf {
     /// so snapshot and coverage are mutually consistent — a reader must
     /// serve zeros, never buffer bytes, in the gaps of a Fresh buffer.
     pub fn snapshot(&self) -> bytes::Bytes {
-        bytes::Bytes::from_owner(SnapshotOwner(self.cell.share()))
+        bytes::Bytes::from_owner(SnapshotOwner(self.full_cell().share()))
     }
 
     /// Exclusive mutable view for the write merge. O(1) when unique;
     /// O(block_size) copy into a fresh block when a snapshot is still alive
     /// (copy-on-write, counted in `active_block_cow_copies`).
     pub fn make_mut(&mut self) -> &mut [u8] {
-        let (copied, block) = self.cell.owned_mut(|shared| {
+        self.implicit_escalate();
+        let Repr::Full(cell) = &mut self.repr else {
+            unreachable!("implicit_escalate leaves a full repr");
+        };
+        let (copied, block) = cell.owned_mut(|shared| {
             let fresh = AlignedBlock::alloc_raw(shared.len);
             // SAFETY: `fresh.ptr` is a new `shared.len`-byte allocation;
             // `shared` is fully initialized and cannot overlap it.
@@ -534,7 +817,7 @@ impl ActiveBlockBuf {
     /// cannot coexist with this borrow. Staging callers must
     /// [`ActiveBlockBuf::zero_complete`] first (§5.3).
     pub fn as_slice(&self) -> &[u8] {
-        self.cell.peek().as_slice()
+        self.full_cell().peek().as_slice()
     }
 }
 

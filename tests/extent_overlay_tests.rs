@@ -728,40 +728,46 @@ async fn never_lossy_staging_refusal_and_fold_failure_repark() {
             want[s..s + 4096].copy_from_slice(&p);
         }
     }
-    let got = read_at(&h, ino, 0, want.len()).await;
-    assert_bytes(&got, &want, "reads with refused spills (RAM custody)");
-
-    // Fold failure: exhaust the allocator, fsync must FAIL (fold cannot
-    // upload), custody must survive; heal, fsync again, byte-exact.
-    let mut hoarded = Vec::new();
-    while let Ok(off) =
-        h.fs.router
-            .cache
-            .nvme
-            .block_allocator
-            .allocate_block()
-            .await
-    {
-        h.fs.router.cache.nvme.block_allocator.publish_block(off);
-        hoarded.push(off);
-        if hoarded.len() > 1_000_000 {
-            panic!("allocator refused to exhaust");
-        }
+    // Block-by-block reads: single-block probes compose the RAM overlay
+    // WITHOUT triggering the multi-block read's flush (which would fold —
+    // custody must still be RAM here).
+    for blk in 0..4u64 {
+        let got = read_at(&h, ino, blk * BS, BS as usize).await;
+        assert_bytes(
+            &got,
+            &want[(blk * BS) as usize..((blk + 1) * BS) as usize],
+            "reads with refused spills (RAM custody)",
+        );
     }
+    assert!(
+        h.fs.parked_buffer_bytes() > 0,
+        "premise: the refused-spill extents are still RAM custody"
+    );
+
+    // Fold failure: mark the block backend unhealthy — the fold's durable
+    // upload fails deterministically; fsync must FAIL, custody must
+    // survive; heal, fsync again, byte-exact.
+    h.fs.router
+        .backend_router
+        .unhealthy_backends
+        .insert("backend_0".to_string(), true);
     let r = h.fs.fsync(h.req, ino, 0, false).await;
     assert!(
         r.is_err(),
-        "fsync must surface the fold's upload failure (allocator exhausted)"
+        "fsync must surface the fold's upload failure (backend down)"
     );
-    let got = read_at(&h, ino, 0, want.len()).await;
-    assert_bytes(
-        &got,
-        &want,
-        "fold failure re-parks — the ACKed bytes stay served from custody",
-    );
-    for off in hoarded {
-        let _ = h.fs.router.cache.nvme.block_allocator.free_block(off).await;
+    for blk in 0..4u64 {
+        let got = read_at(&h, ino, blk * BS, BS as usize).await;
+        assert_bytes(
+            &got,
+            &want[(blk * BS) as usize..((blk + 1) * BS) as usize],
+            "fold failure re-parks — the ACKed bytes stay served from custody",
+        );
     }
+    h.fs.router
+        .backend_router
+        .unhealthy_backends
+        .remove("backend_0");
     fsync(&h, ino).await;
     purge_tiers(&h, ino).await;
     let got = read_at(&h, ino, 0, want.len()).await;
@@ -853,7 +859,9 @@ async fn reads_mid_fold_serve_exact_bytes() {
 
     let p = pattern(2048, 0x91);
     let mut want_block = base[BS as usize..2 * BS as usize].to_vec();
-    for i in 0..8u64 {
+    // 7 x 2 KiB = 14 KiB < the 16 KiB (25 %) escalation edge: the overlay
+    // must still be extent-repr when the fold runs.
+    for i in 0..7u64 {
         write_at(&h, ino, BS + i * 6144, &p).await;
         let s = (i * 6144) as usize;
         want_block[s..s + 2048].copy_from_slice(&p);

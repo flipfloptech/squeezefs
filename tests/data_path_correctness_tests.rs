@@ -594,18 +594,23 @@ async fn test_active_block_read_snapshot_stable_across_overwrite() {
 
     // Partial overwrite inside block 3 [196608, 262144): routes through
     // write_file_staged, RMW-seeds an in-RAM active-block buffer, and — being
-    // partial — leaves it dirty in active_block_buffers.
-    let patch1 = vec![0xABu8; 1024];
-    write_at(&h, ino, 196_608 + 512, &patch1).await;
-    content[196_608 + 512..196_608 + 512 + 1024].copy_from_slice(&patch1);
+    // partial — leaves it dirty in active_block_buffers. 32 KiB (>= 25 % of
+    // the block) so the FULL-buffer CoW machinery this test pins stays the
+    // route (RW4: sub-25 % non-adjacent writes park as extent overlays,
+    // whose held-read stability twin lives in tests/extent_overlay_tests.rs).
+    // Block 2 [131072, 196608) — the tail block is too short for a
+    // >= 25 % patch of a 64 KiB block within the 200 000-byte file.
+    let patch1 = vec![0xABu8; 32 * 1024];
+    write_at(&h, ino, 131_072 + 512, &patch1).await;
+    content[131_072 + 512..131_072 + 512 + 32 * 1024].copy_from_slice(&patch1);
 
     // Hold the zero-copy reply for a range of the dirty block.
     let held =
-        h.fs.read(h.req, ino, 0, 196_608, 2048, 0)
+        h.fs.read(h.req, ino, 0, 131_072, 2048, 0)
             .await
             .expect("read of dirty active block")
             .data;
-    let expected = &content[196_608..196_608 + 2048];
+    let expected = &content[131_072..131_072 + 2048];
     assert_eq!(
         &held[..],
         expected,
@@ -614,7 +619,7 @@ async fn test_active_block_read_snapshot_stable_across_overwrite() {
 
     // Overwrite an overlapping range of the same (still-dirty) block.
     let patch2 = vec![0xCDu8; 512];
-    write_at(&h, ino, 196_608 + 256, &patch2).await;
+    write_at(&h, ino, 131_072 + 256, &patch2).await;
 
     // The held reply must not have been mutated underneath us.
     assert_eq!(
@@ -627,7 +632,7 @@ async fn test_active_block_read_snapshot_stable_across_overwrite() {
     // Read-your-own-writes: a fresh read observes the merged content.
     let mut merged = expected.to_vec();
     merged[256..256 + 512].copy_from_slice(&patch2);
-    let after = read_at(&h, ino, 196_608, 2048).await;
+    let after = read_at(&h, ino, 131_072, 2048).await;
     assert_eq!(after, merged, "post-overwrite read must see the merge");
 
     // The write above collided with our live snapshot, so exactly this path

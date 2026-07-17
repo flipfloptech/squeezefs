@@ -143,7 +143,19 @@ All knobs are env vars documented in the script header (`tests/dev_substrate.sh 
 
 ### Migrating off `~/tmp/nvme/*.nvme` file-backed volumes
 
-There is nothing to convert: format **fresh** volumes on the substrate namespaces (the `create` output hands you the lines) and stop pointing mounts at the old `.nvme` files. SqueezeFS treats the namespaces as ordinary block devices; the old file volumes keep working if you ever need to mount them for archaeology, but don't benchmark against them — the substrate-bracket numbers above are the reason this substrate exists.
+There is nothing to convert: format **fresh** volumes on the substrate namespaces (the `create` output hands you the lines) and stop pointing mounts at the old `.nvme` files. SqueezeFS treats the namespaces as ordinary block devices; the old file volumes keep working if you ever need to mount them for archaeology, but don't benchmark against them.
+
+What migrating changes, measured end-to-end (same binary/box/shapes/default mount knobs, only the substrate differs — full method, all ten rows, and the honest anomalies in [`.benchmarks/2026-07-17-substrate-migration-ab.md`](.benchmarks/2026-07-17-substrate-migration-ab.md); medians of 3, `squeezefs bench`):
+
+| headline row | file-backed btrfs (before) | virtual NVMe substrate (after) | after/before |
+|---|---|---|---|
+| create 25 k × 4 KiB files (fsync/file), **strict** cadence | 677 files/s | 7,058 files/s | **10.4×** |
+| delete 25 k, **strict** cadence | 3,303 ops/s | 24,606 ops/s | **7.5×** |
+| create 25 k × 4 KiB files (fsync/file), default cadence | 2,550 files/s | 8,295 files/s | **3.3×** |
+| rand write 4 KiB O_DIRECT (30 s) | 7,155 IOPS (spread **4.8 k–24.4 k** — btrfs CoW churn) | 35,971 IOPS (±3 %) | **5.0×** |
+| seq read 1 MiB O_DIRECT, cold mount | 3,284 MiB/s | 7,718 MiB/s | **2.4×** |
+
+Two rows go the other way and are reported honestly in the note: seq write 1 MiB is 0.86× (host page cache over btrfs draining to a physical SSD beats zram-zstd on incompressible fill), and default-cadence delete is a wash (0.99×, ranges overlap). Stat is substrate-independent (~1× — the control row). The same session also reproduces the strict-cadence bracket the earlier microbenchmarks predicted: on btrfs files strict create collapses to 27 % of default (inside the md-baseline 3.8–8.9× band), on the substrate it holds ≥ 85 % (the OQ-5 constant) — and the substrate runs the guard enforcement-grade (`flock+pr`, `atomic4k`) where files run `flock+claim`, `file-backed`.
 
 > **⚠️ Durability: dev/test only.** Every byte lives in RAM. The volumes (and the devices themselves) vanish on reboot — by design. Never put production data on this substrate. Reformat after every reboot, or have the substrate recreated at boot and reformat on top of it:
 >

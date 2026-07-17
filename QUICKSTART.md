@@ -45,7 +45,7 @@ mkdir -p /tmp/squeezefs_staging
   sqdata:///tmp/squeezefs_data.bin \
   --disk-cache-paths /tmp/squeezefs_staging
 ```
-> Metadata volumes format as **v3** (CoW KV metadata) — the only supported metadata format (legacy v2 volumes refuse to mount: reformat required). Optional format knobs (`--meta-node-kib`, `--meta-journal-mb`) and the v3 durability contract are covered in section 5.
+> Metadata volumes format as **v3** (CoW KV metadata) — the only supported metadata format (legacy v2 volumes refuse to mount: reformat required). Optional format knobs (`--meta-node-kib`, `--meta-journal-mb`) and the v3 durability contract are covered in section 6.
 
 ### Step 4: Mount Squeezefs
 Create the mount point; the mount reads its cache/staging paths from the format config (passing `--disk-cache-paths` at mount is refused — change paths with `squeezefs config set-cache-paths`):
@@ -90,7 +90,54 @@ sudo ./target/release/squeezefs umount /mnt/squeezefs
 
 ---
 
-## 2. Bare-Metal Execution (Real Hardware Setup)
+## 2. Dev Box: Virtual NVMe Substrate (RAM-backed NVMe-oF Loop)
+
+If your dev box has no spare raw NVMe, do **not** settle for file-backed volumes on a CoW filesystem — build the virtual substrate instead. One command creates real `/dev/nvmeXnY` namespaces out of RAM block devices, driven through the kernel's NVMe-oF **loop** target (the same class of device the SqueezeFS harnesses use, and the closest local analog to the NVMe-oF production path):
+
+```
+metadata (mds):  memory-backed null_blk ──┐
+                                          ├── nvmet loop subsystem ── nvme connect -t loop ── /dev/nvmeXnY
+data     (oss):  zram (compressed RAM) ───┘
+```
+
+```bash
+sudo tests/dev_substrate.sh create     # 4 mds (null_blk) + 4 oss (zram) namespaces
+sudo tests/dev_substrate.sh status     # device table + a ready-to-paste format/mount hint
+sudo tests/dev_substrate.sh teardown   # removes ONLY what it created (nothing foreign)
+```
+
+`create` prints the exact `squeezefs format` / `mount` lines against the namespaces it just made. `status` shows which controller/namespace backs which role and what is in use. `teardown` refuses (loudly, with a list) if filesystems are still mounted from the namespaces — `SQZ_DEVSUB_FORCE=1` unmounts *its own* devices' mountpoints and proceeds. Everything is namespaced (`nqn.2026-07.io.squeezefs:devsub-*`, `sqzdevsub_*` null_blk items, a state manifest under `/run/squeezefs-devsub/`), so foreign nvmet subsystems, zram devices (e.g. zram swap), and null_blk instances are never touched; kernel modules are loaded on demand and deliberately never unloaded on teardown.
+
+### Why not file-backed volumes on btrfs/CoW?
+
+Measured on this repo's reference dev box (`.benchmarks/2026-07-14-metadata-throughput-baseline.md`): the metadata journal's barrier primitive (4 KiB write + fdatasync) costs **~495 µs p50 on a btrfs CoW file vs ~3 µs on memory-backed null_blk — 165×** (`chattr +C` does not fix it: ~465 µs), and under strict commit cadence file-backed-on-btrfs collapses metadata throughput **3.8–8.9×** (rename 6.3 k → 0.7 k ops/s). The nvmet-loop stack adds only ~6 µs over raw null_blk while exercising the **full kernel NVMe target/host stack**. The virtual substrate also gives you what a file never can:
+
+- real FLUSH/FUA semantics on the metadata path (`fua=1`, `write_cache=write back`),
+- **NVMe Persistent Reservations** — the single-writer mount guard runs **enforcement-grade** (`writer_guard_mode` reads `flock+pr` on the `.stats` inode, vs `flock`-only on files),
+- `meta_volume_atomicity_physical` classifying as a real block device (`atomic4k`) instead of `file-backed`.
+
+### Sizing knobs & RAM math
+
+All knobs are env vars documented in the script header (`tests/dev_substrate.sh --help`). Defaults: `SQZ_DEVSUB_MDS_COUNT=4` × `SQZ_DEVSUB_MDS_GB=1` GiB memory-backed null_blk (+ `SQZ_DEVSUB_MDS_CACHE_MB=256` write-back cache each) and `SQZ_DEVSUB_OSS_COUNT=4` × `SQZ_DEVSUB_OSS_GB=8` GiB zram (`SQZ_DEVSUB_OSS_ALGO=zstd`). RAM cost: mds ≤ ~5 GiB worst case (allocated on write); oss disksize is **virtual** — resident RAM ≈ the *compressed* working set (ceiling 32 GiB only if you fill every byte with incompressible data; typical dev/bench sets are a few GiB). `SQZ_DEVSUB_OSS_MEM_LIMIT_GB` hard-caps zram RAM if you need a guarantee (writes past the cap fail with EIO). Comfortable on a ≥ 64 GiB box at defaults.
+
+### Migrating off `~/tmp/nvme/*.nvme` file-backed volumes
+
+There is nothing to convert: format **fresh** volumes on the substrate namespaces (the `create` output hands you the lines) and stop pointing mounts at the old `.nvme` files. SqueezeFS treats the namespaces as ordinary block devices; the old file volumes keep working if you ever need to mount them for archaeology, but don't benchmark against them — the substrate-bracket numbers above are the reason this substrate exists.
+
+> **⚠️ Durability: dev/test only.** Every byte lives in RAM. The volumes (and the devices themselves) vanish on reboot — by design. Never put production data on this substrate. Reformat after every reboot, or have the substrate recreated at boot and reformat on top of it:
+>
+> ```bash
+> tests/dev_substrate.sh systemd-unit | sudo tee /etc/systemd/system/squeezefs-devsub.service
+> sudo systemctl daemon-reload && sudo systemctl enable --now squeezefs-devsub.service
+> ```
+>
+> (The script only *emits* the unit — installing it is your choice.)
+
+> **Scripted format→mount flows:** after `squeezefs format` closes a block device, udevd's change-event probe briefly holds an exclusive `flock` on the node, which the single-writer mount guard correctly refuses ("another squeezefs process holds the writer lock" names the wrong holder — the lock is udev's). Interactive use never notices; back-to-back scripts should run `udevadm settle` between format and mount.
+
+---
+
+## 3. Bare-Metal Execution (Real Hardware Setup)
 
 To avoid containerization network bridges or WSL virtualization overheads and measure true hardware capacity, run Squeezefs directly on the host using physical block devices.
 
@@ -127,7 +174,7 @@ sudo ./target/release/squeezefs mount \
 
 ---
 
-## 3. High-Performance Multi-Rail Configuration (NVMe-oF Mellanox Setup)
+## 4. High-Performance Multi-Rail Configuration (NVMe-oF Mellanox Setup)
 
 When deploying on a multi-node cluster where hosts are equipped with multiple physical NICs (e.g. 2 Mellanox NICs per host), configure Multi-Rail bonding to balance network packets over NVMe-oF at the application socket layer.
 
@@ -172,7 +219,7 @@ sudo ./target/release/squeezefs mount sqmeta:///dev/main-pool/meta-vol /mnt/sque
 
 ---
 
-## 4. Kernel Tuning for Bare Metal (Auto-Tune)
+## 5. Kernel Tuning for Bare Metal (Auto-Tune)
 
 For maximum HPC file throughput, Squeezefs includes an auto-tuning command. This script adjusts FUSE congestion thresholds, virtual memory dirty page ratios, and network socket maximum buffer sizes.
 
@@ -190,7 +237,7 @@ sudo ./target/release/squeezefs tune
 
 ---
 
-## 5. Metadata Durability Knobs
+## 6. Metadata Durability Knobs
 
 The metadata crash contract is documented in `README.md` → *Metadata Durability*: v3 (CoW KV metadata) holds it **by construction** — every on-disk unit is checksummed, torn writes are detected-and-ignored (never applied), and each transaction commits atomically as one checksummed journal entry (`docs/design-cow-kv-metadata.md` §4.10). Operationally:
 

@@ -492,6 +492,8 @@ sudo tests/run_elbencho_mount.sh
 
 Prerequisites: Volume formatted/mounted per `QUICKSTART.md`. Failures here can pass pure unit tests and still indicate mount regressions.
 
+Dev boxes without spare raw NVMe: `sudo tests/dev_substrate.sh create` builds the preferred pseudo-everything substrate — memory-backed null_blk (mds) + zram (oss) exposed as real `/dev/nvmeXnY` namespaces via nvmet-loop (QUICKSTART → *Dev Box: Virtual NVMe Substrate*). Do not measure barrier-bound work on file-backed-on-btrfs volumes: the substrate bracket is 165× on the journal barrier (`.benchmarks/2026-07-14-metadata-throughput-baseline.md`).
+
 ### Test tiering (do not run acceptance suites at per-commit cadence)
 
 fstests/LTP are **wall-clock-bound** (fixed-duration fsx/fsstress soaks, mount-cycle overhead) — a full `-g auto` is ~5 h regardless of CPU speed. Running them per fix wastes hours re-failing tests already known to fail. Use three tiers:

@@ -3,21 +3,28 @@
 //!
 //! Contract under test:
 //!
-//! - **Trigger parity**: write-through fires exactly at today's
-//!   `is_block_complete` point (`write_end == b_end_offset`) for every entry
-//!   kind (Fresh / Seeded / one-shot) and every fill order (sequential,
-//!   tail-first, gap, middle-last) — only the *destination* changes: a
-//!   content-complete block goes crypto → allocate → DMA → block-map merge
-//!   instead of staging-mmap + writeback. Observable as: no staging entry
-//!   for the completed block, the mapping present in the authoritative
-//!   backend meta immediately after the write acks, and the
-//!   `write_through_blocks` / `write_through_bytes` stats moving.
+//! - **Coverage-based trigger (RW3b)**: write-through fires exactly when the
+//!   accumulation's WRITTEN coverage (union of merged ranges, overlap-safe,
+//!   order-blind) reaches the whole block — for every entry kind (Fresh /
+//!   Seeded / one-shot) and every fill order (sequential, tail-first, gap,
+//!   middle-last, out-of-order) — never because one write's end coincides
+//!   with the block end (the retired `write_end == b_end_offset` proxy,
+//!   FIND-L1-A's convicted line; see tests/write_through_coverage_tests.rs
+//!   for the out-of-order segment pins). A content-complete block goes
+//!   crypto → allocate → DMA → block-map merge instead of staging-mmap +
+//!   writeback. Observable as: no staging entry for the completed block,
+//!   the mapping present in the authoritative backend meta immediately
+//!   after the completing write acks, and the `write_through_blocks` /
+//!   `write_through_bytes` stats moving. Partial coverage — including
+//!   segments that merely END at the block end — parks in RAM (staging's
+//!   design role at the fsync exits is preserved).
 //! - **Uncovered-range semantics under memset elision**: a Fresh
-//!   accumulation buffer no longer zero-fills at seed time; its `covered`
-//!   interval is pure memset-elision bookkeeping (never trigger input), and
-//!   recycled pool bytes never leave the covered range — not to the kernel
-//!   (coverage-aware read hit), not to staging / the device (zero-complete
-//!   under the block lock at the trigger and at every stage/upload exit).
+//!   accumulation buffer no longer zero-fills at seed time; its covered
+//!   run set (a primary run + rare disjoint out-of-order runs) keeps
+//!   recycled pool bytes from ever leaving the written ranges — not to the
+//!   kernel (coverage-aware read hit serves zeros in every gap), not to
+//!   staging / the device (zero-complete zeroes every gap under the block
+//!   lock at every stage/upload exit).
 //! - **One merge discipline**: every striped block-map RMW goes through
 //!   `DataRouter::merge_block_mappings` under `INODE_META_LOCKS` —
 //!   write-through, the fallback/fsync flush paths, the staging-refusal
@@ -312,10 +319,16 @@ async fn test_covered_interval_tracking_and_zero_complete() {
     assert_eq!(seeded.covered(), (0, 4096));
 }
 
-/// Gap write → zero the complement and degrade to fully-initialized
-/// (Accumulating_Fresh → Accumulating_Seeded in the §5.3 state machine).
+/// Gap write → a DISJOINT covered run (RW3b multi-extent coverage): the
+/// buffer stays not-content-valid (the union has a real hole — out-of-order
+/// segments must be able to fill it later without a false-complete), and
+/// `zero_complete` zeroes EVERY gap — head, interior hole, tail — never
+/// letting recycled bytes escape. Replaces the retired eager gap-degrade
+/// (which zeroed the whole complement at merge time and thereby lied
+/// "content-valid" to the trigger while the write that completed the union
+/// could no longer fire it).
 #[tokio::test]
-async fn test_gap_write_degrades_to_fully_initialized() {
+async fn test_gap_write_records_disjoint_run_and_zero_complete_fills_gaps() {
     let mut buf = ActiveBlockBuf::fresh(4096);
     buf.make_mut().fill(0xEE); // recycled garbage
 
@@ -323,25 +336,65 @@ async fn test_gap_write_degrades_to_fully_initialized() {
     buf.make_mut()[0..100].fill(1);
     assert_eq!(buf.covered(), (0, 100));
 
-    // Gap write [200, 300): the buffer must become content-valid, with the
-    // gap [100, 200) and the tail [300, 4096) zeroed — never 0xEE.
+    // Gap write [200, 300): recorded as a disjoint covered run — the union
+    // [0,100) ∪ [200,300) has a real hole, so the buffer must NOT report
+    // content-valid (a later [100,200) write must be able to complete it).
     buf.record_write(200, 300);
     buf.make_mut()[200..300].fill(2);
     assert!(
-        buf.is_content_valid(),
-        "gap write must degrade the buffer to fully-initialized"
+        !buf.is_content_valid(),
+        "a gap write must record a disjoint run, not degrade the union to \
+         fully-covered (the trigger would misfire / never fire)"
     );
+
+    // zero_complete at an exit zeroes every gap: [100,200) and [300,4096).
+    buf.zero_complete();
+    assert!(buf.is_content_valid());
     let s = buf.snapshot();
     assert!(s[0..100].iter().all(|&x| x == 1));
     assert!(
         s[100..200].iter().all(|&x| x == 0),
-        "gap must read zeros, not recycled bytes"
+        "interior gap must read zeros, not recycled bytes"
     );
     assert!(s[200..300].iter().all(|&x| x == 2));
     assert!(
         s[300..].iter().all(|&x| x == 0),
         "tail must read zeros, not recycled bytes"
     );
+}
+
+/// Out-of-order coverage union (RW3b): disjoint runs recorded in any order
+/// coalesce exactly; the union reaching the whole block is the ONE
+/// content-valid / trigger condition, order-blind and overlap-safe.
+#[tokio::test]
+async fn test_out_of_order_coverage_union_completes_exactly() {
+    // (end, head, mid): the completing write is the MIDDLE one.
+    let mut buf = ActiveBlockBuf::fresh(4096);
+    buf.record_write(3072, 4096);
+    assert!(!buf.is_content_valid());
+    buf.record_write(0, 1024);
+    assert!(
+        !buf.is_content_valid(),
+        "two disjoint runs must not read as complete"
+    );
+    buf.record_write(1024, 3072); // bridges both runs
+    assert!(
+        buf.is_content_valid(),
+        "the bridging write completes the union — the trigger point"
+    );
+
+    // Overlap-safe: overlapping ranges never double-count or false-complete.
+    let mut buf2 = ActiveBlockBuf::fresh(4096);
+    buf2.record_write(1024, 2048);
+    buf2.record_write(1536, 2560); // overlaps
+    buf2.record_write(2048, 4096); // overlaps + reaches the end
+    assert!(
+        !buf2.is_content_valid(),
+        "[1024,4096) is not the whole block — end-reaching writes must not \
+         complete a partial union"
+    );
+    buf2.record_write(0, 1600); // overlaps into the covered range
+    assert!(buf2.is_content_valid());
 }
 
 // ---------------------------------------------------------------------------
@@ -403,32 +456,58 @@ async fn test_sequential_complete_block_writes_through_without_staging() {
     assert_eq!(read_at(&h, ino, 0, p0.len() as u32).await, expected);
 }
 
-/// RMW-seeded complete block: partial overwrite reaching the block end fires
-/// the same trigger; the seeded prefix (old bytes) survives byte-exact.
+/// RMW overwrite reaching the block end but covering only [100, BS): the
+/// RW3b coverage trigger must NOT fire (write coverage is partial — the old
+/// `write_end == b_end` proxy fired here and paid an inline seed fetch);
+/// the deferred buffer parks, and the write that completes the union fires
+/// exactly one write-through with ZERO seed reads (the whole block is app
+/// bytes). The old-prefix-preserving partial flush is pinned by
+/// `striped_overwrite_lazy_seed_tests::partial_coverage_seeds_old_bytes_at_flush`.
 #[tokio::test]
-async fn test_rmw_seeded_complete_block_write_through_preserves_prefix() {
+async fn test_rmw_partial_end_write_parks_then_completion_writes_through() {
     let _g = serial().await;
     let h = make("wt_rmw").await;
     let ino = create(&h, "rmw.bin").await;
     let p0 = make_striped(&h, ino, 2 * BS as usize, 11).await;
 
     let before = wt_blocks();
-    // [100, BS): Seeded entry (existing data), write_end == b_end → trigger.
+    let seeds_before = METRICS.write_path_seed_read_bytes.load(Ordering::Relaxed);
+    // [100, BS): deferred entry (existing data), coverage partial → parks.
     let p1 = pattern(BS as usize - 100, 77);
     write_at(&h, ino, 100, &p1).await;
+    assert_eq!(
+        wt_blocks(),
+        before,
+        "a partial end-reaching overwrite must park, not write through"
+    );
+    assert_eq!(
+        METRICS.write_path_seed_read_bytes.load(Ordering::Relaxed),
+        seeds_before,
+        "the deferral holds — no write-time seed fetch"
+    );
 
+    // RYW during the window (single-block read — multi-block reads flush
+    // dirty overlays first by design): new bytes + preserved old head
+    // (reader-side materialize pays the deferred seed, item-B).
+    let mut expected = p0.clone();
+    expected[100..BS as usize].copy_from_slice(&p1);
+    assert_eq!(
+        read_at(&h, ino, 0, BS as u32).await,
+        expected[..BS as usize],
+        "window read: old head + new bytes"
+    );
+
+    // Completing the union fires exactly one write-through.
+    write_at(&h, ino, 0, &expected[..100]).await;
+    assert_eq!(wt_blocks() - before, 1, "union completion writes through");
     assert!(
         h.fs.router
             .cache
             .nvme
             .read_staged(&staged_key(ino, 0))
             .is_none(),
-        "seeded complete block must write through, not stage"
+        "the completed block must bypass staging"
     );
-    assert_eq!(wt_blocks() - before, 1);
-
-    let mut expected = p0.clone();
-    expected[100..BS as usize].copy_from_slice(&p1);
     assert_eq!(read_at(&h, ino, 0, p0.len() as u32).await, expected);
 }
 
@@ -509,10 +588,14 @@ async fn test_partial_tail_stays_in_ram_until_fsync() {
 // Out-of-order fills: the completion point must match today's byte-for-byte
 // ---------------------------------------------------------------------------
 
-/// Tail-first fill: [BS/2, BS) of a fresh block ends at the block end — the
-/// trigger fires immediately (as today), zeroing the uncovered head first.
+/// Tail-first fill: [BS/2, BS) of a fresh block ends at the block end but
+/// covers only half of it — the RW3b coverage trigger must NOT fire (the
+/// retired `write_end == b_end` proxy did, which is exactly how out-of-order
+/// segments got half-uploaded); the buffer parks, the uncovered head reads
+/// zeros from RAM, the head write completes the union and fires exactly one
+/// write-through.
 #[tokio::test]
-async fn test_tail_first_fill_zeroes_head_and_uploads_at_trigger() {
+async fn test_tail_first_fill_parks_then_head_completes_coverage() {
     let _g = serial().await;
     let h = make("wt_tailfirst").await;
     let ino = create(&h, "tailfirst.bin").await;
@@ -520,22 +603,25 @@ async fn test_tail_first_fill_zeroes_head_and_uploads_at_trigger() {
 
     let before = wt_blocks();
     let p = pattern((BS / 2) as usize, 8);
-    // Fresh block 3, write [3.5*BS, 4*BS): write_end == b_end → trigger.
+    // Fresh block 3, write [3.5*BS, 4*BS): partial coverage → no trigger.
     write_at(&h, ino, 3 * BS + BS / 2, &p).await;
     assert_eq!(
         wt_blocks() - before,
-        1,
-        "tail-first block-end write must upload immediately, exactly as today's staging point"
+        0,
+        "a partial tail-first fill must NOT write through — coverage, not \
+         write_end == b_end, is the trigger (FIND-L1-A's convicted proxy)"
     );
-    assert!(h
-        .fs
-        .router
-        .cache
-        .nvme
-        .read_staged(&staged_key(ino, 3))
-        .is_none());
+    assert!(
+        h.fs.router
+            .cache
+            .nvme
+            .read_staged(&staged_key(ino, 3))
+            .is_none(),
+        "the partial fill parks in RAM, not staging"
+    );
 
-    // The uncovered head is zeros — on the DEVICE (durable), not just in RAM.
+    // The uncovered head reads zeros from the RAM buffer (coverage-aware
+    // read — recycled pool bytes never escape).
     assert!(
         read_at(&h, ino, 3 * BS, (BS / 2) as u32)
             .await
@@ -544,11 +630,32 @@ async fn test_tail_first_fill_zeroes_head_and_uploads_at_trigger() {
         "uncovered head of a tail-first fill must read zeros"
     );
     assert_eq!(read_at(&h, ino, 3 * BS + BS / 2, (BS / 2) as u32).await, p);
+
+    // Head write completes the union → exactly one write-through.
+    let head = pattern((BS / 2) as usize, 9);
+    write_at(&h, ino, 3 * BS, &head).await;
+    assert_eq!(
+        wt_blocks() - before,
+        1,
+        "the coverage-completing head write must fire exactly one write-through"
+    );
+    assert!(h
+        .fs
+        .router
+        .cache
+        .nvme
+        .read_staged(&staged_key(ino, 3))
+        .is_none());
+    assert_eq!(read_at(&h, ino, 3 * BS, (BS / 2) as u32).await, head);
+    assert_eq!(read_at(&h, ino, 3 * BS + BS / 2, (BS / 2) as u32).await, p);
 }
 
-/// Gap fill: [0,100) then [200,300) (gap zeroed, buffer stays in RAM — no
-/// trigger), then [300, BS) completes the block and uploads. Hole bytes are
-/// zeros at every stage.
+/// Gap fill: [0,100) then [200,300) leave a REAL hole in the coverage union
+/// — no trigger even when a later [300, BS) write reaches the block end
+/// (RW3b: the union still has the [100,200) hole; the retired proxy fired
+/// here and codified the gap early). The hole reads zeros from RAM at every
+/// stage; filling it completes the union and uploads exactly once, with the
+/// gap-era zeros durable.
 #[tokio::test]
 async fn test_gap_then_completion_matches_todays_bytes() {
     let _g = serial().await;
@@ -559,7 +666,7 @@ async fn test_gap_then_completion_matches_todays_bytes() {
     let before = wt_blocks();
     write_at(&h, ino, 2 * BS, &[1u8; 100]).await;
     write_at(&h, ino, 2 * BS + 200, &[2u8; 100]).await; // gap write
-    assert_eq!(wt_blocks(), before, "no trigger before the block end");
+    assert_eq!(wt_blocks(), before, "no trigger while the union is partial");
 
     // RYW: the gap [100,200) must read zeros from the RAM buffer.
     let ram = read_at(&h, ino, 2 * BS, 300).await;
@@ -570,55 +677,105 @@ async fn test_gap_then_completion_matches_todays_bytes() {
     );
     assert!(ram[200..300].iter().all(|&b| b == 2));
 
-    // Complete the block → trigger → upload.
+    // Reaching the block end does NOT complete the union — the [100,200)
+    // hole is still uncovered (the retired write_end == b_end proxy fired
+    // here; the coverage trigger must not).
     let tail = pattern(BS as usize - 300, 13);
     write_at(&h, ino, 2 * BS + 300, &tail).await;
-    assert_eq!(wt_blocks() - before, 1);
+    assert_eq!(
+        wt_blocks(),
+        before,
+        "an end-reaching write must not fire while the union has a hole"
+    );
+
+    // Filling the hole completes the union → exactly one upload; the hole
+    // was written explicitly so every byte is app bytes now except nothing.
+    write_at(&h, ino, 2 * BS + 100, &[3u8; 100]).await;
+    assert_eq!(
+        wt_blocks() - before,
+        1,
+        "one write-through at union completion"
+    );
 
     let durable = read_at(&h, ino, 2 * BS, BS as u32).await;
     assert!(durable[0..100].iter().all(|&b| b == 1));
-    assert!(
-        durable[100..200].iter().all(|&b| b == 0),
-        "gap zeros must be durable"
-    );
+    assert!(durable[100..200].iter().all(|&b| b == 3));
     assert!(durable[200..300].iter().all(|&b| b == 2));
     assert_eq!(&durable[300..], &tail[..]);
+
+    // The sparse variant: a hole left unfilled goes durable as zeros via the
+    // fsync exit (zero_complete zeroes every gap under the block lock).
+    let before2 = wt_blocks();
+    write_at(&h, ino, 5 * BS, &[4u8; 100]).await;
+    write_at(&h, ino, 5 * BS + 200, &[5u8; 100]).await;
+    write_at(&h, ino, 5 * BS + 300, &pattern(BS as usize - 300, 21)).await;
+    assert_eq!(wt_blocks(), before2, "sparse union never fires");
+    h.fs.fsync(h.req, ino, 0, false).await.unwrap();
+    h.fs.force_flush_all_staged_data().await.unwrap();
+    let durable = read_at(&h, ino, 5 * BS, 300).await;
+    assert!(durable[0..100].iter().all(|&b| b == 4));
+    assert!(
+        durable[100..200].iter().all(|&b| b == 0),
+        "unfilled gap zeros must be durable after the fsync exit"
+    );
+    assert!(durable[200..300].iter().all(|&b| b == 5));
 }
 
-/// Middle-last: a tail-first block publishes; the later [0, BS/2) write
-/// re-seeds a Seeded entry from the published block via RMW (as today) and
-/// completes with old tail + new head.
+/// Middle-last / out-of-order halves of one accumulation: the tail-first
+/// half PARKS (RW3b — no early publish), the head half completes the union
+/// and fires exactly one write-through carrying both halves. A later
+/// partial overwrite of the published block parks again (deferred RMW — no
+/// trigger, no write-time seed read) and merges durably at fsync with the
+/// published half preserved (the item-B flush seed).
 #[tokio::test]
-async fn test_middle_last_after_published_tail_rmw_seeds() {
+async fn test_middle_last_completes_coverage_single_write_through() {
     let _g = serial().await;
     let h = make("wt_midlast").await;
     let ino = create(&h, "midlast.bin").await;
     make_striped(&h, ino, BS as usize + 1, 50).await;
 
-    // Publish block 2 tail-first.
+    // Tail half of fresh block 2: parks (partial union — no early publish).
+    let before = wt_blocks();
     let tail = pattern((BS / 2) as usize, 71);
     write_at(&h, ino, 2 * BS + BS / 2, &tail).await;
+    assert_eq!(wt_blocks(), before, "tail half must park, not publish");
 
-    // Middle-last head write: [2*BS, 2*BS + BS/2) — partial (no trigger),
-    // seeded via RMW from the just-published block.
+    // Head half completes the union → ONE write-through with both halves.
     let head = pattern((BS / 2) as usize, 99);
     write_at(&h, ino, 2 * BS, &head).await;
+    assert_eq!(
+        wt_blocks() - before,
+        1,
+        "the union-completing half fires exactly one write-through"
+    );
 
     let got = read_at(&h, ino, 2 * BS, BS as u32).await;
     assert_eq!(&got[..(BS / 2) as usize], &head[..], "new head");
-    assert_eq!(
-        &got[(BS / 2) as usize..],
-        &tail[..],
-        "published tail must survive the RMW re-seed"
-    );
+    assert_eq!(&got[(BS / 2) as usize..], &tail[..], "parked tail carried");
 
-    // Completing the block again writes through the seeded entry.
-    let before = wt_blocks();
+    // Partial overwrite of the now-published block: parks deferred (no
+    // trigger, no write-time seed), merges durably at fsync (flush seed).
+    let before2 = wt_blocks();
+    let seeds_before = METRICS.write_path_seed_read_bytes.load(Ordering::Relaxed);
     let p2 = pattern((BS / 2) as usize, 111);
     write_at(&h, ino, 2 * BS + BS / 2, &p2).await;
-    assert_eq!(wt_blocks() - before, 1);
+    assert_eq!(
+        wt_blocks(),
+        before2,
+        "a partial overwrite ending at b_end must not fire (coverage trigger)"
+    );
+    assert_eq!(
+        METRICS.write_path_seed_read_bytes.load(Ordering::Relaxed),
+        seeds_before,
+        "no write-time seed fetch — the deferral holds (item-B law)"
+    );
     let got = read_at(&h, ino, 2 * BS, BS as u32).await;
     assert_eq!(&got[..(BS / 2) as usize], &head[..]);
+    assert_eq!(&got[(BS / 2) as usize..], &p2[..]);
+    h.fs.fsync(h.req, ino, 0, false).await.unwrap();
+    h.fs.force_flush_all_staged_data().await.unwrap();
+    let got = read_at(&h, ino, 2 * BS, BS as u32).await;
+    assert_eq!(&got[..(BS / 2) as usize], &head[..], "flush seed kept head");
     assert_eq!(&got[(BS / 2) as usize..], &p2[..]);
 }
 

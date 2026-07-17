@@ -405,6 +405,21 @@ EOF
 #           213 legs pass; exactly that one missing line is the expected
 #           diff (re-verified 2026-07-12 on the honest-statfs branch:
 #           identical diff shape, 2x rolls).
+#     464 = staged-write-storm ring-pressure EIO (FIND-RW5-A, PRE-EXISTING
+#           — A/B-verified on pre-program 04889b6, which fails the same
+#           EIO class and additionally WEDGES; the current tip fails
+#           bounded-loud and never wedges): 464's 16-proc
+#           delalloc/append/sync_range storm over 200 files structurally
+#           oversubscribes this harness's 500MB staging ring; some
+#           whole-image staged replaces propagate StorageFull to the user
+#           write as EIO ("echo: write error" on line 46) instead of
+#           degrading to the durable-spill escalation. Never-lossy custody
+#           holds (dismount folds re-park loudly; recovery clean). Charter:
+#           rand-write program closing report §10 residual 8
+#           (.benchmarks/2026-07-17-rand-write-program-closing.md). Flips
+#           to expected-PASS when that charter lands. May occasionally
+#           pass by-run (it passed the 2026-07-15 M11 sweep); a pass is
+#           NOT a regression — a DIFFERENT failure signature is.
 #   127/616 (+074 fstest.2, 075) transient-ZEROS family = FIXED
 #           (fix/staged-identity-transient-zeros; ring atomic same-key
 #           replace f924085 + staged-identity read revalidation 0a184f3).
@@ -460,7 +475,7 @@ SQUEEZEFS_FSTESTS_QUICK=(
     generic/001 generic/003 generic/008 generic/009 generic/013
     generic/069 generic/074 generic/075 generic/091 generic/112
     generic/127 generic/213 generic/263 generic/285 generic/316
-    generic/469 generic/616 generic/617 generic/618
+    generic/464 generic/469 generic/616 generic/617 generic/618
 )
 
 if [ $# -gt 0 ]; then

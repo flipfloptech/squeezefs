@@ -1,6 +1,6 @@
 # Squeezefs Quick Start Guide
 
-This guide describes how to get Squeezefs up and running, execute its built-in micro-benchmarks, and configure it on bare-metal systems—including multi-rail setups using physical Mellanox NICs over NVMe-oF.
+This guide describes how to get Squeezefs up and running, verify a mount, execute its built-in benchmarks, and configure it on bare-metal systems and over NVMe-oF fabrics. It is the operator runbook; concepts, guarantee classes, and tuning-knob reference live in [README.md](README.md).
 
 ---
 
@@ -27,66 +27,74 @@ cargo build --release
 ```
 
 ### Step 2: Prepare Sandbox Backing Files
-Create blank files to serve as your metadata and data block devices:
-```bash
-# Allocate 64MB for Metadata Volume
-truncate -s 64M /tmp/squeezefs_meta.bin
+The whole sandbox runs **unprivileged** — FUSE mounts need no root, and keeping everything under your own `$HOME` avoids the modern-kernel `fs.protected_regular` trap (root cannot open another user's files in sticky `/tmp`, so a `sudo mount` over user-created `/tmp` volumes fails with `Permission denied`).
 
-# Allocate 1GB for Data Volume
-truncate -s 1G /tmp/squeezefs_data.bin
+Create sparse files to serve as your metadata and data block devices (sparse — they only consume disk as blocks are written):
+```bash
+mkdir -p ~/squeezefs-sandbox/staging ~/squeezefs-sandbox/mnt
+
+# Allocate 256MB for Metadata Volume
+truncate -s 256M ~/squeezefs-sandbox/meta.bin
+
+# Allocate 8GB for Data Volume
+truncate -s 8G ~/squeezefs-sandbox/data.bin
 ```
+> File-backed volumes are fine for a functional sandbox, but **do not benchmark barrier-bound metadata work on them** (especially on btrfs/CoW hosts — the measured distortion is 165× on the journal barrier). For anything measured, build the virtual NVMe substrate in [section 2](#2-dev-box-virtual-nvme-substrate-ram-backed-nvme-of-loop) instead.
 
 ### Step 3: Format the Filesystem
-Create the staging cache directory and format the backing files using SqueezeFS URIs (cache/staging paths are **declared at format** and recorded in the format config — omit `--disk-cache-paths` for a permanently cache-less filesystem):
+Format the backing files using SqueezeFS URIs (cache/staging paths are **declared at format** and recorded in the format config — omit `--disk-cache-paths` for a permanently cache-less filesystem):
 ```bash
-mkdir -p /tmp/squeezefs_staging
 ./target/release/squeezefs format \
-  sqmeta:///tmp/squeezefs_meta.bin \
-  sqdata:///tmp/squeezefs_data.bin \
-  --disk-cache-paths /tmp/squeezefs_staging
+  sqmeta://$HOME/squeezefs-sandbox/meta.bin \
+  sqdata://$HOME/squeezefs-sandbox/data.bin \
+  --disk-cache-paths ~/squeezefs-sandbox/staging
 ```
 > Metadata volumes format as **v3** (CoW KV metadata) — the only supported metadata format (legacy v2 volumes refuse to mount: reformat required). Optional format knobs (`--meta-node-kib`, `--meta-journal-mb`) and the v3 durability contract are covered in section 6.
 
 ### Step 4: Mount Squeezefs
-Create the mount point; the mount reads its cache/staging paths from the format config (passing `--disk-cache-paths` at mount is refused — change paths with `squeezefs config set-cache-paths`):
+The mount reads its cache/staging paths from the format config (passing `--disk-cache-paths` at mount is refused — change paths with `squeezefs config set-cache-paths`):
 ```bash
-sudo mkdir -p /mnt/squeezefs
-
-# Mount Squeezefs in the background
-sudo ./target/release/squeezefs mount \
-  sqmeta:///tmp/squeezefs_meta.bin \
-  /mnt/squeezefs \
+./target/release/squeezefs mount \
+  sqmeta://$HOME/squeezefs-sandbox/meta.bin \
+  ~/squeezefs-sandbox/mnt \
   --daemon \
-  --log-file /tmp/squeezefs.log \
-  --allow-others \
-  --uid $(id -u) \
-  --gid $(id -g)
+  --log-file ~/squeezefs-sandbox/mount.log
+```
+The mount log must contain `FUSE-over-io_uring transport armed for this session` — the high-performance transport is required, not optional (the mount fails loudly if the kernel cannot arm it; the mount auto-enables the kernel's `fuse.enable_uring` when it can). Add `--allow-other` (root or `user_allow_other` in `/etc/fuse.conf`) if other users — including root — must access the mount, and `--uid`/`--gid` to change the presented file ownership.
+
+### Step 5: Verify the Mount
+Exercise the filesystem, then read the live daemon metrics from the virtual `.stats` inode and the volume summary:
+```bash
+echo hello > ~/squeezefs-sandbox/mnt/hello.txt && cat ~/squeezefs-sandbox/mnt/hello.txt
+
+# Live daemon metrics (JSON): transport geometry, cache tiers, layout mix, …
+head -40 ~/squeezefs-sandbox/mnt/.stats
+
+# Volume config / health summary (JSON), and honest statfs numbers
+./target/release/squeezefs status sqmeta://$HOME/squeezefs-sandbox/meta.bin
+df -h ~/squeezefs-sandbox/mnt
 ```
 
-### Step 5: Run the Benchmark
-A bare invocation runs the **full saturation suite** over one auto-sized dataset (threads = `min(CPUs, 16)`; total = `max(16 GiB, 2 GiB × threads)` capped at 25% of free space): write seq 1m → read seq 1m → read rand 4k (30 s) → write rand 4k (30 s) → stat → del, all I/O passes O_DIRECT, mount left clean:
+### Step 6: Run the Benchmark
+A bare `squeezefs bench <mountpoint>` invocation runs the **full saturation suite** over one auto-sized dataset (threads = `min(CPUs, 16)`; total = `max(16 GiB, 2 GiB × threads)` capped at 25% of free space): write seq 1m → read seq 1m → read rand 4k (30 s) → write rand 4k (30 s) → stat → del, all I/O passes O_DIRECT, mount left clean. **Auto-sizing refuses loudly when even its 4 GiB minimum dataset does not fit under the 25%-of-free cap** — so the bare suite wants ≥ 16 GiB free (run it against the [section 2 substrate](#2-dev-box-virtual-nvme-substrate-ram-backed-nvme-of-loop) or real hardware). On this small sandbox, pass an explicit shape instead:
 ```bash
-./target/release/squeezefs bench /mnt/squeezefs
-```
-
-Explicit phases inherit the same auto defaults (comparable numbers) and reuse the persistent dataset:
-```bash
-# Write then read back 1 GiB per thread at 1 MiB ops across 4 threads
-./target/release/squeezefs bench /mnt/squeezefs -t 4 -w -r -s 1g -b 1m
+# Sandbox-sized: write then read back 256 MiB per thread at 1 MiB ops across 4 threads
+./target/release/squeezefs bench ~/squeezefs-sandbox/mnt -t 4 -w -r -s 256m -b 1m
 
 # Re-read the SAME dataset at a different block size (no rewrite), then clean up
-./target/release/squeezefs bench /mnt/squeezefs -t 4 -r -s 1g -b 128k
-./target/release/squeezefs bench /mnt/squeezefs -t 4 --del -s 1g
+./target/release/squeezefs bench ~/squeezefs-sandbox/mnt -t 4 -r -s 256m -b 128k
+./target/release/squeezefs bench ~/squeezefs-sandbox/mnt -t 4 --del -s 256m
 ```
+Explicit phases inherit the same auto defaults (comparable numbers) and reuse the persistent dataset at `<mountpoint>/squeezefs-bench/`; every run prints its computed shape with `(auto)`/`(explicit)` provenance in the header.
 
-Committed reference numbers (large-seq writes ~1.8 GB/s on the reference box via the zero-copy write path) live in `.benchmarks/2026-07-08-zero-copy-write-path-closing.md`; that table's large-seq row maps to `squeezefs bench /mnt/squeezefs -w -s 128m -b 1m`, or just compare the suite's `Write seq 1m` row. Compare your rows against it when validating a setup.
+Committed reference numbers live in `.benchmarks/` (each note states its box/substrate/method) — e.g. large-seq ~1.8 GB/s via the zero-copy write path (`.benchmarks/2026-07-08-zero-copy-write-path-closing.md`) and the default-mount 300–320 k device-true rand-4k IOPS class (`.benchmarks/2026-07-15-l1-transport-concurrency.md`). Compare your rows against those when validating a setup — file-backed sandbox rows will be substantially lower than substrate/hardware rows by design.
 
-### Step 6: Unmount Safely
+### Step 7: Unmount Safely
 Use SqueezeFS unmount to drain staging writes and cleanly shut down:
 ```bash
-sudo ./target/release/squeezefs umount /mnt/squeezefs
+./target/release/squeezefs umount ~/squeezefs-sandbox/mnt
 ```
-*(Or use standard `/bin/umount /mnt/squeezefs`, enabled by `--allow-others` and daemon CWD setsid root isolation).*
+*(Or `fusermount3 -u ~/squeezefs-sandbox/mnt`; standard root `/bin/umount` works on `--allow-other` mounts.)*
 
 ---
 
@@ -139,6 +147,8 @@ There is nothing to convert: format **fresh** volumes on the substrate namespace
 
 ## 3. Bare-Metal Execution (Real Hardware Setup)
 
+*(Requires dedicated physical NVMe drives — nothing in this section runs on the sandbox/substrate above.)*
+
 To avoid containerization network bridges or WSL virtualization overheads and measure true hardware capacity, run Squeezefs directly on the host using physical block devices.
 
 ### Step 1: Create Storage Pool and Volume
@@ -153,12 +163,13 @@ Assume `/dev/nvme0n1` and `/dev/nvme1n1` are dedicated fast NVMe drives:
 ```
 
 ### Step 2: Format Volumes Concurrently
-Format the logical volumes. Pass `--full` if you want a complete block-aligned zero-wipe of the devices:
+Format the logical volumes. Declare staging/cache directories on a **fast local NVMe filesystem** (they are recorded at format — the single source of truth; omit for a cache-less filesystem). Pass `--full` if you want a complete block-aligned zero-wipe of the devices:
 ```bash
+sudo mkdir -p /srv/squeezefs_staging   # on local NVMe, not tmpfs
 ./target/release/squeezefs format \
   sqmeta:///dev/main-pool/meta-vol \
   sqdata:///dev/main-pool/data-vol \
-  --disk-cache-paths /tmp/squeezefs_staging \
+  --disk-cache-paths /srv/squeezefs_staging \
   --full
 ```
 
@@ -169,14 +180,15 @@ sudo ./target/release/squeezefs mount \
   sqmeta:///dev/main-pool/meta-vol \
   /mnt/squeezefs \
   --daemon \
-  --allow-others
+  --allow-other
 ```
+For unattended hosts add `--supervise`: the parent stays alive as an external watchdog that probes `<mountpoint>/.stats` and (as root) aborts a wedged FUSE connection to release blocked callers — see README → *External mount supervisor*.
 
 ---
 
-## 4. High-Performance Multi-Rail Configuration (NVMe-oF Mellanox Setup)
+## 4. NVMe-oF Fabric Setup (Remote Block Storage)
 
-When deploying on a multi-node cluster where hosts are equipped with multiple physical NICs (e.g. 2 Mellanox NICs per host), configure Multi-Rail bonding to balance network packets over NVMe-oF at the application socket layer.
+*(Requires dedicated hardware: spare PCIe NVMe controllers for SPDK user-space binding and a real fabric. Fabric multipath/failover across multiple NICs is the kernel NVMe initiator's native multipath domain — configure it with `nvme connect` policies at the host level.)*
 
 ### Automatic SPDK Compilation, Setup, and Execution
 To compile SPDK from source, set up local hugepages, selectively bind target NVMe SSDs to user-space, and launch the user-space target daemon (`nvmf_tgt` listener) in the background:
@@ -212,10 +224,10 @@ sudo ./target/release/squeezefs storage volume create fabric-pool my-fabric-vol 
 
 # Format and mount the fabric-attached volume
 sudo ./target/release/squeezefs format sqmeta:///dev/main-pool/meta-vol sqdata:///dev/fabric-pool/my-fabric-vol
-sudo ./target/release/squeezefs mount sqmeta:///dev/main-pool/meta-vol /mnt/squeezefs --local-ips 10.10.10.1,10.10.20.1
+sudo ./target/release/squeezefs mount sqmeta:///dev/main-pool/meta-vol /mnt/squeezefs --daemon --allow-other
 ```
-- **Load Balancing:** All IO operations will cycle and balance round-robin between the two local IPs traversing the fabric.
-- **Failover HA:** If a Mellanox NIC link drops, Squeezefs catches the error and instantly retries the operation on the remaining healthy NIC.
+- **Single-writer guard on fabric namespaces:** where the namespace advertises NVMe Persistent Reservation support, the mount guard runs **enforcement-grade** (the device itself fences stale writers) — check `writer_guard_mode` on `.stats`. Guarantee classes per substrate: README → *Single-writer mount guard*.
+- **Multipath/HA:** path redundancy across NICs/ports is native NVMe multipath, configured at `nvme connect` time (kernel initiator), transparent to SqueezeFS.
 
 ---
 
@@ -243,26 +255,28 @@ The metadata crash contract is documented in `README.md` → *Metadata Durabilit
 
 ```bash
 # Strict sync-on-commit metadata durability (default is a 50 ms deferred window):
-SQUEEZEFS_META_FLUSH_INTERVAL_MS=0 sudo -E ./target/release/squeezefs mount …
+SQUEEZEFS_META_FLUSH_INTERVAL_MS=0 ./target/release/squeezefs mount …
 
 # v3 node-cache RAM budget (default 512 MiB) and dirty-node checkpoint cap
 # (default 4096; bounds the mount-replay working set):
 SQUEEZEFS_META_NODE_CACHE_MB=1024 \
 SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES=8192 \
-  sudo -E ./target/release/squeezefs mount …
+  ./target/release/squeezefs mount …
 
 # Inode-reclaim group-commit batch size (default 64):
-SQUEEZEFS_RECLAIM_BATCH=128 sudo -E ./target/release/squeezefs mount …
+SQUEEZEFS_RECLAIM_BATCH=128 ./target/release/squeezefs mount …
 
 # Read-path knobs (defaults are the measured sweet spot — see README →
 # "Read-path tuning" and docs/design-read-path.md). Examples:
 #   pin a memory budget instead of the cgroup-derived default:
-sudo -E ./target/release/squeezefs mount … --mem-budget 6G
+./target/release/squeezefs mount … --mem-budget 6G
 #   disable the sequential prefetch pipeline / sub-block ranged reads (A/B):
 SQUEEZEFS_READ_PREFETCH_WINDOW=0 SQUEEZEFS_READ_RANGED_THRESHOLD=0 \
-  sudo -E ./target/release/squeezefs mount …
+  ./target/release/squeezefs mount …
 #   restore unconditional first-touch tier publishes (pre-program behavior):
-SQUEEZEFS_READ_TIER_ADMISSION=always sudo -E ./target/release/squeezefs mount …
+SQUEEZEFS_READ_TIER_ADMISSION=always ./target/release/squeezefs mount …
+
+# (Root mounts inherit env through sudo -E.)
 ```
 
 v3 **format-time** knobs (`README.md` → *Format Squeezefs Volume*): `--meta-node-kib <64|128|256|512|1024>` (node size, default `256`; below 256 the per-volume record-value cap drops to `node_size/4`) and `--meta-journal-mb <MiB>` (journal ring, default `clamp(volume/64, 8 MiB, 32 MiB)`).
@@ -271,12 +285,14 @@ File-backed sandbox volumes (section 1) classify **physically** as `file-backed`
 
 ### Single-writer mount guard
 
-Every write mount exclusively claims its metadata volume(s): a dedicated `flock` (same-host), an NVMe Persistent Reservation where the namespace supports it (cross-host enforcement), and a `writer_claim` heartbeat record. A second concurrent mount is **refused loudly, naming the holder** — there is no bypass flag. Same-host crashes reclaim instantly and automatically; after a cross-host crash on a volume **without** reservation support, clear the stale claim by operator attestation once you have verified the named holder is dead:
+Every write mount exclusively claims its metadata volume(s): a dedicated `flock` (same-host), an NVMe Persistent Reservation where the namespace supports it (cross-host enforcement), and a `writer_claim` heartbeat record. A second concurrent mount is **refused loudly, naming the holder** (`claim: id=…, pid=…, boot=…, age=…`) — there is no bypass flag. Same-host crashes (even `kill -9`) reclaim instantly and automatically at the next mount; after a cross-host crash on a volume **without** reservation support, clear the stale claim by operator attestation once you have verified the named holder is dead:
 
 ```bash
-./target/release/squeezefs claim clear sqmeta:///tmp/squeezefs_meta.bin
+./target/release/squeezefs claim clear sqmeta://$HOME/squeezefs-sandbox/meta.bin
 ```
 
-Guarantee classes per substrate (and the full recovery runbook): `README.md` → *Single-writer mount guard*.
+The verb re-verifies staleness under its own probe: on a healthy volume it answers `no writer claim present — nothing to clear`, and it refuses fresh claims and live-mounted volumes. Guarantee classes per substrate (and the full recovery runbook): `README.md` → *Single-writer mount guard*.
 
 > **Legacy format v2**: support was removed entirely. A v2 superblock refuses to mount ("no longer supported; reformat required"); reformat it to v3 with `squeezefs format --force` (destroys the old contents). The offline `squeezefs migrate` converter was deleted along with v2 support.
+>
+> The full catalog of loud refusal classes (pre-watermark v3 volumes, pre-FIND-RW4-A compressed/encrypted volumes, staging generation binding, cache-path policy) lives in `README.md` → *Breaking changes & migration notes* — every message names its cause and remedy.

@@ -4,7 +4,7 @@
 
 Squeezefs is a slimmed-down, high-performance distributed POSIX FUSE filesystem (Rust + tokio + io_uring) featuring a decoupled, block-based logical volume metadata store backend (**MetaLV**) and a local or NVMe-oF block device client. Linux-only.
 
-Designed to operate at scale (15,000+ concurrent nodes), it delivers bare-metal file throughput by leveraging asynchronous network and file architectures, client-side caching, and multi-rail network load balancing over NVMe-oF fabrics, with zero external database dependencies.
+Designed to operate at scale (15,000+ concurrent nodes), it delivers bare-metal file throughput by leveraging asynchronous file architectures over FUSE-over-io_uring, tiered client-side caching, and direct NVMe / NVMe-oF block I/O, with zero external database dependencies.
 
 ---
 
@@ -27,7 +27,7 @@ Designed to operate at scale (15,000+ concurrent nodes), it delivers bare-metal 
 ```
 
 ### 1. Asynchronous POSIX FUSE Daemon
-Built in **Rust** using the asynchronous `tokio` runtime and `io_uring` polling over `/dev/fuse` to process OS requests efficiently. Standard mounts automatically switch to high-performance FUSE-over-io_uring after the INIT handshake.
+Built in **Rust** using the asynchronous `tokio` runtime and `io_uring` polling over `/dev/fuse` to process OS requests efficiently. Every mount switches to high-performance **FUSE-over-io_uring** after the INIT handshake (required — the mount fails loudly if the kernel cannot arm it). Default transport geometry is the measured IOPS-parity policy: a default mount sustains the **300–320 k device-true rand-4k IOPS class with zero knobs** on the reference substrate (`.benchmarks/2026-07-15-l1-transport-concurrency.md`).
 
 ### 2. Progressive Data Layout & I/O Routing
 Writes are dynamically routed based on file sizes to optimize storage overhead and network latency:
@@ -36,19 +36,20 @@ Writes are dynamically routed based on file sizes to optimize storage overhead a
 - **Striped Files (> 4MB):** Sliced into 4MB blocks and written directly to the target NVMe block devices.
 
 ### 3. Distributed Lock Manager (DLM) & Consistency
-Translates POSIX FUSE locks to cluster-wide leases on the metadata backend, protected by heartbeat limits and monotonic fencing tokens to prevent split-brain write conflicts.
+Translates POSIX FUSE locks to cluster-wide leases on the metadata backend, protected by heartbeat limits and monotonic fencing tokens to prevent split-brain write conflicts. Every write mount additionally claims its metadata volumes under the [single-writer mount guard](#single-writer-mount-guard-guarantee-classes) (flock + NVMe Persistent Reservations where supported).
 
 ### 4. Tiered Caching & Zero-Copy Paths
 - **Tier 1 (GPU Direct Storage - GDS):** Routes RDMA transfers directly from NVMe to VRAM, bypassing the host CPU/RAM.
 - **Tier 2 (Unified System RAM):** Clock/LRU caches dynamically sizing to system memory limits.
 - **Tier 3 (Local NVMe Staging):** Staging directory (`.staging`) for async writes and local caching of read blocks to avoid RTT latency.
-- **Zero-copy write path:** large sequential writes travel kernel → transport payload lease → one merge copy → io_uring DMA. Content-complete blocks upload directly (**write-through**), skipping the staging round-trip entirely; FUSE_WRITE payloads ride zero-copy leases over the registered FUSE-over-io_uring buffers. Measured on the committed reference profile: large-seq writes went from 430–512 MiB/s to ~1.8 GB/s (**≥ 3.5×**) with small-write, read, and metadata rows at-or-better — see `docs/design-zero-copy-write-path.md` and `.benchmarks/2026-07-08-zero-copy-write-path-closing.md`.
+- **Zero-copy write path:** large sequential writes travel kernel → transport payload lease → one merge copy → io_uring DMA. Blocks whose accumulated written coverage is complete upload directly (**write-through**), skipping the staging round-trip entirely — the trigger is the coverage *union*, so kernel-split out-of-order parallel O_DIRECT writes stay on the fast path; FUSE_WRITE payloads ride zero-copy leases over the registered FUSE-over-io_uring buffers. Measured on the committed reference profile: large-seq writes went from 430–512 MiB/s to ~1.8 GB/s (**≥ 3.5×**) with small-write, read, and metadata rows at-or-better — see `docs/design-zero-copy-write-path.md` and `.benchmarks/2026-07-08-zero-copy-write-path-closing.md`.
+- **Random-small-write path:** aligned small overwrites of exclusively-owned striped blocks are **one in-place sub-block DMA** (no read-modify-write, no metadata commit); everything else rides a byte-budgeted extent overlay with batched folds — see [Random-small-write path](#random-small-write-path-sole-owner-patch--extent-overlay-design-docsdesign-random-small-writesmd).
 
-### 5. Multi-NIC (Multi-Rail) Network Load Balancing & HA
-Binds outbound client connections to multiple configured physical interfaces (source IPs). Distributes traffic round-robin across NICs and automatically fails over on interface drops. Fully compatible with user-space storage engines like SPDK (Storage Performance Development Kit).
+### 5. Transparent Compression & Encryption
+Optional per-volume transforms declared at format: `--compression lz4|zstd` and `--encrypt-algo aes256gcm-rsa|chacha20-rsa` (RSA-wrapped symmetric keys via `--encrypt-key`), applied across all three write layouts. Compression is **best-effort per block**: an incompressible block is stored raw (frame-flagged, counted as `compress_stored_raw` in `.stats`) instead of expanding — and transformed volumes reserve per-chunk headroom at format so worst-case images always fit (see [Breaking changes](#breaking-changes--migration-notes)).
 
 ### 6. Built-in HPC Auto-Tuning
-Includes built-in host auto-tuning (`squeezefs tune`) to optimize virtual memory dirty page ratios, TCP socket buffers, and FUSE connection thresholds.
+Includes built-in host auto-tuning (`squeezefs tune`) to optimize virtual memory dirty page ratios (40/10), network socket buffer maxima (64 MiB), and live FUSE connection limits (`max_background`/`congestion_threshold` to the 256/192 policy ceiling, `read_ahead_kb` to 0). See [Kernel Tuning](QUICKSTART.md#5-kernel-tuning-for-bare-metal-auto-tune).
 
 ---
 
@@ -69,10 +70,13 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
   squeezefs format sqmeta://<meta_dev> [sqmeta://...] sqdata://<data_dev> [sqdata://...] [options]
   ```
   *Options:*
-  - `--block-size <bytes>`: Block size in bytes (e.g. `4M`, `1M`, default: `4M`).
-  - `--capacity <bytes>`: Maximum capacity of the volume (default: auto-detected or 1PB).
+  - `--block-size <bytes>`: Block size in bytes (e.g. `4M`, `1M`, default: `4M`). On compressed/encrypted volumes the effective block size is clamped so a worst-case (incompressible) stored image plus headroom fits its allocator chunk — the clamp prints loudly.
+  - `--capacity <bytes>`: Formatted capacity (default: the summed physical size of the data volumes). May be **lower** than physical (useful for testing); values above physical are refused — thin-provision underneath via LVM/fabric instead.
   - `--inodes <count>`: Hard quota limit for number of inodes (default: `1000000`).
   - `--disk-cache-paths <paths>`: Comma-separated paths to NVMe cache staging directories. **Declared here, at format** — recorded in the format config as the single source of truth. Omit it and the filesystem is **permanently cache-less**: mounts run with RAM tiers + direct block I/O only (no NVMe staging/read-cache tier). Change later with `squeezefs config set-cache-paths`.
+  - `--compression <lz4|zstd|none>` / `--encrypt-algo <aes256gcm-rsa|chacha20-rsa|none>` / `--encrypt-key <pem>`: transparent per-volume compression / client-side encryption (see [Key Features §5](#5-transparent-compression--encryption)).
+  - `--mem-cache-size` / `--disk-cache-size` / `--{read,write}-cache-size` / `--{read,write}-mem-cache-size`: cache budget defaults recorded in the format config (overridable per mount).
+  - `-f, --force`: Force formatting even if a squeezefs volume is already detected (this is also the reformat path for refused legacy volumes — destroys old contents).
   - `--full`: Performs full block-aligned zero-wiping of the backing device capacity with a progress bar (default is quick-format).
   - `--meta-node-kib <64|128|256|512|1024>`: v3 metadata btree node size in KiB (default `256`). Below `256` prints a warning — the per-volume record-value cap drops to `node_size/4`, so large xattrs / layout maps spill to the indirect mechanism sooner.
   - `--meta-journal-mb <MiB>`: v3 metadata journal ring size, overriding the default `clamp(volume/64, 8 MiB, 32 MiB)`.
@@ -82,12 +86,18 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
   squeezefs mount sqmeta://<meta_dev> [sqmeta://...] <mountpoint> [options]
   ```
   Cache/staging paths come from the format config; passing `--disk-cache-paths` at mount is a loud error (use `squeezefs config set-cache-paths` to change them).
-  *Options:*
-  - `--local-ips <ips>`: Comma-separated list of local source IP interfaces for multi-rail load balancing.
-  - `--mem-cache-size <size>`: System RAM cache size (e.g. `16GB` or `20%`).
+  *Options (operator-relevant subset; `squeezefs mount --help` is authoritative):*
   - `--daemon`: Run FUSE daemon in the background (changes its working directory to `/` to avoid locking paths).
-  - `--allow-others` (or `--allow-other`): Allow other users/root to access the mount (required for `sudo umount`).
+  - `--supervise` (requires `--daemon`): keep the parent alive as an external mount watchdog — see [External mount supervisor](#external-mount-supervisor-mount---daemon---supervise).
+  - `--allow-other` (alias `--allow-others`): Allow other users/root to access the mount (required for `sudo umount`).
   - `--log-file <path>`: Path to write daemon logs to when running in background.
+  - `--mem-budget <size>`: the daemon's joint memory budget (shed-don't-OOM authority) — see [Hybrid I/O](#hybrid-io-for-o_direct-reads-default-and-the-device-true-escape).
+  - `--mem-cache-size <size>`: System RAM cache size (e.g. `16GB` or `20%`); the other cache-size family flags override the format-config defaults the same way.
+  - `--uid <uid>` / `--gid <gid>`: presented owner of files in the mount (presentation-only; staging I/O runs as the mounting user).
+  - `-o <opts>`: FUSE options, including the per-class kernel TTLs (`attr_timeout`, `entry_timeout`, `dir_entry_timeout`, `negative_timeout`), `max_background` / `congestion_threshold` INIT overrides, and `direct_device_true` — each documented in its section below.
+  - `--no-writeback`: disable the FUSE writeback cache (enabled by default).
+  - `--write-verification` (+ `--write-verification-sample <N>`): opt-in read-after-write checksum verification.
+  - `--dismount-wait <secs>` / `--upload-delay <dur>`: staging drain window on dismount / background upload cadence.
 
 * **Change cache/staging directories (admin op):**
   Guarded like `format` (refused while any client has the volume mounted); rewrites the format config and wipes the new directories so the next mount stamps a fresh staging generation.
@@ -97,9 +107,16 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
   ```
 
 * **Show filesystem Status:**
-  Prints a detailed formatted configuration and volume health status summary:
   ```bash
-  squeezefs status sqmeta://<meta_dev>
+  squeezefs status [sqmeta://<meta_dev> | <mountpoint>]   # config + volume summary (JSON)
+  ```
+  Space usage comes from the OS: `df -h <mountpoint>` (see [`df` / statfs semantics](#df--statfs-semantics)).
+  A mounted filesystem also exposes live daemon metrics as JSON on the virtual **`.stats`** inode at the mount root (`cat <mountpoint>/.stats`) — the preferred live regression signal (layout mix, cache/tier counters, `meta_kv_*`, `writer_guard_*`, transport geometry, patch/fold ledgers, memory-budget level).
+
+* **Clear a stale writer claim (recovery verb):**
+  Operator-attested removal of a stale single-writer claim after a cross-host crash on a volume without NVMe Persistent Reservations — see the [recovery runbook](#single-writer-mount-guard-guarantee-classes). Refuses fresh claims and live-mounted volumes.
+  ```bash
+  squeezefs claim clear sqmeta://<meta_dev>
   ```
 
 * **Unmount Squeezefs:**
@@ -108,7 +125,7 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
   squeezefs umount <mountpoint> [--force]
   ```
 
-* **Defragment Squeezefs Volume:**
+* **Defragment Squeezefs Volume** *(placeholder — the CLI verb exists but the defrag engine is currently a no-op stub)*:
   ```bash
   squeezefs defrag --nvme-path <path>
   ```
@@ -158,20 +175,41 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
   ```
 
 * **NVMe-oF Utilities:**
-  Share and dismantle NVMe-oF targets, and install/configure user-space SPDK via `squeezefs storage nvmeof`.
+  Share and dismantle NVMe-oF targets, and install/configure user-space SPDK via `squeezefs storage nvmeof` (SPDK verbs: `spdk-install`, `spdk-setup`, `spdk-bind`, `spdk-unbind`, `spdk-start` — see [QUICKSTART §4](QUICKSTART.md#4-nvme-of-fabric-setup-remote-block-storage)).
   ```bash
   squeezefs storage nvmeof share <path> [--spdk] [--port <port>] [--ip <ip>]
   squeezefs storage nvmeof connect --ip <ip> --subnqn <nqn> [--port <port>]
   squeezefs storage nvmeof disconnect <nqn>
   squeezefs storage nvmeof unshare <nqn> [--spdk]
   squeezefs storage nvmeof list
+  squeezefs storage nvmeof restore-shares   # re-register persistent target shares
+  ```
+
+* **Storage pools & volumes (LVM):**
+  ```bash
+  squeezefs storage pool create <name> <disks...>     # + add/remove/delete/list
+  squeezefs storage volume create <pool> <name> --size <sz>   # + extend/delete/list
   ```
 
 ---
 
 ## Quick Start & Verification
 
-To get up and running quickly or deploy directly onto physical bare-metal hardware over NVMe-oF, see the [QUICKSTART.md](QUICKSTART.md) guide.
+To get up and running quickly or deploy directly onto physical bare-metal hardware over NVMe-oF, see the [QUICKSTART.md](QUICKSTART.md) guide. Dev boxes without spare raw NVMe should use the one-command virtual NVMe substrate (`sudo tests/dev_substrate.sh create` — QUICKSTART §2).
+
+## Performance snapshot (measured, citations)
+
+Every number traces to a committed `.benchmarks/` note (box/substrate/method inside each). Headline classes on the reference box:
+
+| Axis | Measured class | Evidence |
+|---|---|---|
+| rand-4k O_DIRECT read IOPS, **default mount, device-true** | **300–320 k** (zero knobs; 11.4× the pre-L1 stock posture) | `.benchmarks/2026-07-15-iops-parity-decomposition.md` (44 k → 316 k), `.benchmarks/2026-07-15-l1-transport-concurrency.md` |
+| rand-4k O_DIRECT read IOPS, tier-resident (hybrid warm) | **~536–558 k** steady-state, zero device traffic | `.benchmarks/2026-07-15-hybrid-io.md`, reconfirmed `.benchmarks/2026-07-17-rand-write-program-closing.md` §3b |
+| rand-4k write IOPS (sole-owner patch shape) | **59–67 k** (was 354–397 pre-program; device cost 4 KiB-class/op vs ~12 MiB/op) | `.benchmarks/2026-07-17-rand-write-program-closing.md` |
+| Large sequential write | ~1.8 GB/s zero-copy write-through (≥ 3.5× pre-program); **4.4–4.6 GiB/s device-true** during scoreboard seq rows | `.benchmarks/2026-07-08-zero-copy-write-path-closing.md`, `2026-07-17-rand-write-program-closing.md` §2 |
+| Metadata: create / entries-per-op | one-dir creates +44–62 % (110 µs/op serial wall), many-dirs 32.7 k/s; rename/unlink ≈ **1.0 journal entries/op** | `.benchmarks/2026-07-15-metadata-throughput-closing.md` |
+| Mount time at scale | 100 M-inode volume cold-mounts in ~22 ms | `.benchmarks/2026-07-09-kv-v3-gates.md` |
+| Crash contract soaks | kill-9 acked-loss **0** across 10/10 SMO soak rounds + 100/100 journal kill soaks; torn-write drops 0 | `.benchmarks/2026-07-17-rand-write-program-closing.md` §7, `2026-07-15-metadata-throughput-closing.md` G6 |
 
 ### The vs-JuiceFS scoreboard (release gate)
 
@@ -182,11 +220,29 @@ tests/run_vs_juicefs.sh                      # full scoreboard (~30–60 min, qu
 SQUEEZEFS_VS_SMOKE=1 tests/run_vs_juicefs.sh # 30s-class micro-grid plumbing proof (per-commit tier)
 ```
 
-**The gate:** the run emits a win/loss table (+ machine TSV + per-row raw logs, counter snapshots, and diskstats evidence) and **exits nonzero if SqueezeFS loses any row** (loss = < 0.95× JuiceFS; INVALID/unverified rows count as losses). `SQUEEZEFS_VS_ALLOW_LOSS="R1.foo,..."` exempts named rows for known-loss tracking — every allowed loss must have an attribution + follow-up in the current `.benchmarks` scoreboard report. Cadence: **per-release** (with the acceptance suites) and after any perf-relevant landing; the inaugural baseline is `.benchmarks/2026-07-15-vs-juicefs-scoreboard.md`.
+**The gate:** the run emits a win/loss table (+ machine TSV + per-row raw logs, counter snapshots, and diskstats evidence) and **exits nonzero if SqueezeFS loses any row** (loss = < 0.95× JuiceFS; INVALID/unverified rows count as losses). `SQUEEZEFS_VS_ALLOW_LOSS="R1.foo,..."` exempts named rows for known-loss tracking — every allowed loss must have an attribution + follow-up in the current `.benchmarks` scoreboard report. Cadence: **per-release** (with the acceptance suites) and after any perf-relevant landing.
+
+**Current standing (closing run, 2026-07-17, `.benchmarks/2026-07-17-rand-write-program-closing.md` §2): 13 W / 3 TIE across the 18 rows, gate GREEN** with the allowlist shrunk to exactly two rows (`R1.seq_write_1m,R3.seq_write_1m`). Highlights: rand-write 12.6–15.9× JuiceFS (the scoreboard's former only genuine loss, closed by the random-small-write program), rand-read 1.9–3.5×, stat 2.8×, del 9.2–11.2×, seq-read TIE. The two allowed rows are an **ACK-semantics measurement artifact, not a product loss**: on those page-cache-drain seq-write rows JuiceFS acks from RAM (its device drains 2.1–3.2 GiB/s) while SqueezeFS puts 4.4–4.6 GiB/s on the device during the row — the honest device-true comparison is regime R2's seq-write, which SqueezeFS **wins 2.11×**. Inaugural baseline (8 W / 3 TIE / 5 L / 2 INVALID): `.benchmarks/2026-07-15-vs-juicefs-scoreboard.md`.
 
 ### `df` / statfs semantics
 
 A mounted SqueezeFS reports honest, cheap numbers to `statfs(2)` (`df`): **total** is the formatted capacity — the summed data-backend size, or the lower explicit `--capacity` quota chosen at format (the effective limit you experience); **used/free** track the bytes currently allocated on the striped block backends, maintained by the block allocators at alloc/free time (no metadata transactions or device I/O on the statfs path). Tiny inline payloads live in the metadata volume and staged-but-unpromoted small writes in the local NVMe staging dirs, so those transient bytes appear in `df` as their blocks promote via writeback rather than instantaneously; deletes return space after background reclaim completes. Inode columns (`df -i`) report the format inode quota against the v3 monotonic, no-reuse inode watermark — `IFree` is remaining create headroom, and deleting files does not raise it.
+
+## Breaking changes & migration notes
+
+SqueezeFS moves **always forward** — no backwards compatibility. Refusals are loud, name their cause, and state the remedy. Current refusal classes an operator can hit:
+
+> **⚠️ Legacy metadata format v2 — removed.** A v2 superblock refuses to mount with *"no longer supported; reformat required"*. Reformat to v3 with `squeezefs format --force` (destroys the old contents). The offline `squeezefs migrate` v2→v3 converter was deleted along with v2 support.
+
+> **⚠️ Pre-watermark v3 volumes — refused (REFORMAT REQUIRED).** v3 volumes formatted before the node-seq mint watermark (the Finding-A KV-corruption fix era) fail the superblock feature gate: *"pre-watermark v3 volume: formatted before the node-seq mint watermark (Finding A) and no longer supported; reformat required"*. Volumes carrying **unknown** incompat bits (formatted by a newer binary) also refuse, naming the bits — upgrade squeezefs instead.
+
+> **⚠️ Pre-fix compressed/encrypted volumes — refused (REFORMAT REQUIRED).** Volumes formatted with `--compression`/`--encrypt-algo` before the FIND-RW4-A incompressible-block fix cannot hold worst-case stored images; mounts refuse with *"compressed/encrypted volume geometry cannot hold incompressible blocks (FIND-RW4-A) … refusing to mount"* (full-size incompressible blocks on such volumes were never readable — the refusal names the fix). Reformat with a current binary: `format` now reserves per-chunk headroom on transformed volumes (clamping the block size loudly when needed), and compression became **best-effort per block** — incompressible blocks are stored raw (`compress_stored_raw` counts them in `.stats`).
+
+> **⚠️ Staging directories are generation-bound.** Staging/cache dirs are stamped with the filesystem generation (the v3 superblock uuid set). A mount that finds staged content from a **dead generation** (e.g. after a reformat over live staging dirs) wipes it with one loud `STAGING GENERATION MISMATCH` line and counts `staging_generation_discards` in `.stats` — staged writes stamped by the old generation are gone **by design** (reformat discards data).
+
+> **⚠️ Cache/staging paths are format-declared.** `mount --disk-cache-paths` is refused loudly (never silently ignored). Change paths with the admin op `squeezefs config set-cache-paths <sqmeta-uri> <paths...>` (guarded like `format`: refused while any client has the volume mounted; the new dirs are wiped so the next mount stamps a fresh staging generation). Read them back with `config get-cache-paths`. A filesystem formatted without `--disk-cache-paths` is **permanently cache-less**.
+
+> **Removed flags/verbs** (kept here so stale scripts fail comprehensibly): `--strict-meta-atomicity` (only ever gated v2 volumes; deleted with them), `squeezefs migrate` (deleted with v2), `mount --local-ips` (the socket-level multi-rail bonding was removed in the 2026-07-04 connection simplification — fabric multipath is the kernel NVMe initiator's domain), `mount --disk-cache-paths` (see above).
 
 ## Metadata Durability (crash contract)
 
@@ -243,7 +299,7 @@ Defaults are the measured sweet spot — override only with a live-counter reaso
 
 ### Hybrid I/O for O_DIRECT reads (default) and the device-true escape
 
-**Hybrid I/O (default, user directive 2026-07-15):** O_DIRECT reads get the best of both worlds — they keep bypassing the *kernel page cache* (the kernel's side of O_DIRECT, unchanged) while serving from and admitting into *SqueezeFS's own read tiers* exactly like buffered reads. Tier hits serve from RAM (binding-validated, the 416–492k IOPS class on tier-resident data); misses use **evidence-based admission** — first touch of a block reads the device (device-true, nothing admitted: streaming/scan pollution protection), a **second touch within the ghost window** admits the block (one whole-block fetch → RAM hot tier + NVMe read tier), so re-read-heavy O_DIRECT workloads (rand-4k databases, repeated scans) converge to RAM speed after one warm-up pass. Admission pauses under memory-budget Red. Watch `read_odirect_tier_serves` / `ranged_read_ghost_escalations` in `.stats`.
+**Hybrid I/O (default, user directive 2026-07-15):** O_DIRECT reads get the best of both worlds — they keep bypassing the *kernel page cache* (the kernel's side of O_DIRECT, unchanged) while serving from and admitting into *SqueezeFS's own read tiers* exactly like buffered reads. Tier hits serve from RAM (binding-validated — the ~536–558 k IOPS class on tier-resident data, `.benchmarks/2026-07-15-hybrid-io.md` + the RW5 close §3b); misses use **evidence-based admission** — first touch of a block reads the device (device-true, nothing admitted: streaming/scan pollution protection), a **second touch within the ghost window** admits the block (one whole-block fetch → RAM hot tier + NVMe read tier), so re-read-heavy O_DIRECT workloads (rand-4k databases, repeated scans) converge to RAM speed after one warm-up pass. Admission pauses under memory-budget Red. Watch `read_odirect_tier_serves` / `ranged_read_ghost_escalations` in `.stats`.
 
 - **`-o direct_device_true`** (mount option) / **`SQUEEZEFS_DIRECT_DEVICE_TRUE=1`** (daemon env): the **measurement/diagnostic escape** — O_DIRECT reads become strictly device-true (no tier serve, no admission, no ghost recording, no prefetch classification; every O_DIRECT read is a validated device read of exactly its aligned window). This is the posture for device-path benchmarking and the `.benchmarks` amplification methodology (`squeezefs bench --direct` prints which posture the mount carries by sniffing `.stats`). Buffered traffic on the same mount keeps full hybrid behavior. Mode visible as `"direct_device_true"` in `.stats`; adoption counted by `read_device_true_reads`.
 - `--mem-budget <size>` (mount flag) / `SQUEEZEFS_MEM_BUDGET_MB`: the daemon's joint memory budget. Unset, the budget follows cgroup v2 `memory.max` × 0.8 (re-read every second — a runtime-lowered cage tightens the budget live), else 70 % of RAM. Under pressure the daemon sheds (early flushes, cache clamps, prefetch pause) instead of OOMing; watch `mem_budget_level`/`mem_budget_red_events` in `.stats`.

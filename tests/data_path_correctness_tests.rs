@@ -1072,10 +1072,13 @@ async fn test_write_through_reused_key_purges_stale_read_tiers() {
             .nvme
             .cache_read_block(&k1_old, bytes::Bytes::copy_from_slice(&poison));
 
-    // A block-end-reaching partial write RMW-seeds block 2 and fires the
-    // complete-block write-through, whose allocation takes the freed offset
-    // — the poisoned key string — as block 2's new key.
+    // A two-write covering fill of block 2 (head parks, tail completes the
+    // RW3b coverage union) fires the complete-block write-through, whose
+    // allocation takes the freed offset — the poisoned key string — as
+    // block 2's new key.
+    let head2: Vec<u8> = (0..block / 2).map(|i| ((i % 229) as u8) ^ 0x17).collect();
     let tail2: Vec<u8> = (0..block / 2).map(|i| ((i % 233) as u8) ^ 0x42).collect();
+    write_at(&h, ino, (2 * block) as u64, &head2).await;
     write_at(&h, ino, (2 * block + block / 2) as u64, &tail2).await;
     let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
     let k2_new = meta
@@ -1093,6 +1096,7 @@ async fn test_write_through_reused_key_purges_stale_read_tiers() {
     // incarnation's poison shadowing the reused key.
     let mut expected = base.clone();
     expected[block..2 * block].copy_from_slice(&over1);
+    expected[2 * block..2 * block + head2.len()].copy_from_slice(&head2);
     let s2 = 2 * block + block / 2;
     expected[s2..s2 + tail2.len()].copy_from_slice(&tail2);
     let got = read_at(&h, ino, (2 * block) as u64, block as u32).await;

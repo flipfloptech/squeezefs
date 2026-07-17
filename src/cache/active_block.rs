@@ -12,15 +12,25 @@
 //! `active_block_cow_copies` stat. Sequential streams never collide with a
 //! snapshot of a still-accumulating block, so they never pay the copy.
 //!
-//! PR 4 makes the `covered` interval load-bearing (memset elision, §5.3):
+//! PR 4 introduced the covered-range bookkeeping (memset elision, §5.3):
 //! [`ActiveBlockBuf::fresh`] buffers are born **uncovered** — no seed-time
-//! zero-fill — and `covered` tracks the contiguous initialized range
-//! `[covered.0, covered.1)`. It is pure elision bookkeeping, **never**
-//! write-through trigger input. The §5.3 contract: recycled pool bytes
-//! never leave the covered range — not to the kernel (the read path serves
-//! sparse holes via [`ActiveBlockBuf::covered_snapshot`]), not to staging
-//! or the device ([`ActiveBlockBuf::zero_complete`] under the block lock at
-//! the trigger and at every stage/upload exit). All `covered` mutations run
+//! zero-fill. RW3b (the FIND-L1-A fix,
+//! `.benchmarks/2026-07-17-rw3-find-l1a-forensics.md`) upgraded it to an
+//! **overlap-safe multi-run written-coverage union** and made it the
+//! **write-through trigger input**: [`ActiveBlockBuf::record_write`]
+//! returns `true` exactly when the union of written ranges reaches the
+//! whole block — order-blind, so kernel-split FUSE WRITE segments
+//! dispatched concurrently (`FOPEN_PARALLEL_DIRECT_WRITES`) trigger at
+//! true completion regardless of arrival order. The representation is a
+//! primary run `written` (the only thing an in-order stream ever touches —
+//! no allocation) plus a rare `written_extra` overflow of disjoint runs
+//! created only by out-of-order arrival (`active_block_ooo_runs`).
+//!
+//! The §5.3 contract is unchanged: recycled pool bytes never leave the
+//! written runs — not to the kernel (the read path serves gap bytes as
+//! zeros via [`ActiveBlockBuf::covered_runs_in`]), not to staging or the
+//! device ([`ActiveBlockBuf::zero_complete`] zeroes **every** gap under the
+//! block lock at every stage/upload exit). All coverage mutations run
 //! under `BLOCK_FLUSH_LOCKS` (the write merge, spill, fsync/teardown exits
 //! all hold the entry's block lock); readers stay lock-free.
 //!
@@ -131,87 +141,115 @@ impl AsRef<[u8]> for SnapshotOwner {
 /// sharing primitive.
 pub struct ActiveBlockBuf {
     cell: CowCell<AlignedBlock>,
-    /// Contiguous initialized range `[covered.0, covered.1)` — §5.3
-    /// memset-elision bookkeeping. Seeded buffers are born fully covered;
-    /// [`ActiveBlockBuf::fresh`] buffers grow it via
-    /// [`ActiveBlockBuf::record_write`]. Never write-through trigger input.
-    covered: (u32, u32),
-    /// Item B (the overwrite lazy-RMW seed): the uncovered complement's
+    /// Primary written run `[written.0, written.1)` — the union of ranges
+    /// merged via [`ActiveBlockBuf::record_write`], as long as they arrive
+    /// overlapping/abutting (the in-order common case: this pair is the
+    /// ONLY coverage state ever touched, no allocation). RW3b: written
+    /// coverage IS the write-through trigger input — `record_write`
+    /// returns `true` when the union reaches the whole block.
+    written: (u32, u32),
+    /// Out-of-order overflow: additional written runs, sorted by start,
+    /// pairwise disjoint and non-abutting, each disjoint and non-abutting
+    /// from `written`. Empty — never allocated — on in-order streams;
+    /// populated only when a write lands disjoint from every existing run
+    /// (kernel-split segment reorder; counted `active_block_ooo_runs`).
+    written_extra: Vec<(u32, u32)>,
+    /// Every byte of the buffer is the block's correct current content:
+    /// born-`seeded`, written union spans the block, complement zeroed
+    /// ([`ActiveBlockBuf::zero_complete`]) or seed-filled
+    /// ([`ActiveBlockBuf::fill_complement_from`]). Distinct from written
+    /// coverage: a Seeded buffer is content-valid with an empty written
+    /// union (a lone partial overwrite of it parks — it must never
+    /// re-trigger per merged range).
+    content_valid: bool,
+    /// Item B (the overwrite lazy-RMW seed): the unwritten complement's
     /// correct content is the block's OLD DEVICE BYTES, not zeros — the
-    /// seed read was deferred at checkout. Cleared when coverage reaches
-    /// full (the old bytes are wholly overwritten — the row-4 win: no read
-    /// at all) or when [`ActiveBlockBuf::fill_complement_from`]
-    /// materializes the seed (gap write / partial trigger / stage exit /
-    /// sparse read). While set, [`ActiveBlockBuf::zero_complete`] and the
-    /// gap-write zero-degrade are FORBIDDEN — zeroing would codify zeros
-    /// over acked old bytes.
+    /// seed read was deferred at checkout. Cleared when written coverage
+    /// reaches full (the old bytes are wholly overwritten — the row-4 win:
+    /// no read at all) or when
+    /// [`ActiveBlockBuf::fill_complement_from`] materializes the seed
+    /// (stage/upload exits / sparse read). While set,
+    /// [`ActiveBlockBuf::zero_complete`] is FORBIDDEN — zeroing would
+    /// codify zeros over acked old bytes. Invariant: `deferred_seed ⇒
+    /// !content_valid` (every full-coverage / fill transition clears it),
+    /// which is exactly the RW3b covered flush-seed elision — flush/spill
+    /// exits gate their seed fetch on `seed_deferred()`, so a fully
+    /// covered buffer can never pay one.
     deferred_seed: bool,
 }
 
 impl ActiveBlockBuf {
     /// A fresh accumulation buffer for a block with **no existing data**:
-    /// born uncovered, with the seed-time zero-fill elided (§5.3). The
+    /// born unwritten, with the seed-time zero-fill elided (§5.3). The
     /// complement's correct content is zeros by definition — established
-    /// lazily by [`ActiveBlockBuf::record_write`] (gap degrade) or
-    /// [`ActiveBlockBuf::zero_complete`] (trigger / stage / upload exits).
+    /// lazily by [`ActiveBlockBuf::zero_complete`] (stage/upload exits) and
+    /// served as zeros by the coverage-aware read
+    /// ([`ActiveBlockBuf::covered_runs_in`]) meanwhile.
     pub fn fresh(block_size: usize) -> Self {
         Self {
             cell: CowCell::new(AlignedBlock::alloc_raw(block_size)),
-            covered: (0, 0),
+            written: (0, 0),
+            written_extra: Vec::new(),
+            content_valid: false,
             deferred_seed: false,
         }
     }
 
     /// A deferred-RMW accumulation buffer for a block WITH existing device
-    /// data whose seed read is postponed (item B): born uncovered, the
+    /// data whose seed read is postponed (item B): born unwritten, the
     /// complement's correct content is the old block. If accumulation
-    /// fully covers the block before any exit, the seed read never happens
-    /// (the sequential-overwrite fast path); otherwise the owner
-    /// materializes via [`ActiveBlockBuf::fill_complement_from`] before
-    /// the bytes can escape.
+    /// fully covers the block before any exit — in ANY segment order
+    /// (RW3b) — the seed read never happens (the sequential-overwrite fast
+    /// path); otherwise the owner materializes via
+    /// [`ActiveBlockBuf::fill_complement_from`] before the bytes can
+    /// escape.
     pub fn deferred(block_size: usize) -> Self {
         Self {
             cell: CowCell::new(AlignedBlock::alloc_raw(block_size)),
-            covered: (0, 0),
+            written: (0, 0),
+            written_extra: Vec::new(),
+            content_valid: false,
             deferred_seed: true,
         }
     }
 
-    /// Whether the uncovered complement still owes the old-block seed.
+    /// Whether the unwritten complement still owes the old-block seed.
     pub fn seed_deferred(&self) -> bool {
         self.deferred_seed
     }
 
-    /// Materialize the deferred seed: fill the uncovered complement from
-    /// `old` (the block's current device/durable content; shorter-than-
-    /// block seeds zero-fill their own tail, matching
+    /// Materialize the deferred seed: fill every unwritten gap from `old`
+    /// (the block's current device/durable content; shorter-than-block
+    /// seeds zero-fill their own tail, matching
     /// [`ActiveBlockBuf::seeded`] semantics) and become content-valid.
     /// Callers hold this block's `BLOCK_FLUSH_LOCKS`. Idempotent-safe: a
     /// no-op when the seed is no longer deferred.
+    ///
+    /// Deliberately does NOT claim written coverage: a fill can happen
+    /// mid-accumulation (a sparse read materializing a parked buffer), and
+    /// the stream must still be able to complete the written union and
+    /// fire the write-through trigger afterwards.
     pub fn fill_complement_from(&mut self, old: &[u8]) {
         if !self.deferred_seed {
             return;
         }
         self.deferred_seed = false;
-        if self.is_content_valid() {
+        if self.content_valid {
             return;
         }
         let len = self.cell.peek().len;
-        let (c0, c1) = (self.covered.0 as usize, self.covered.1 as usize);
+        let gaps = self.gaps(len as u32);
         let slice = self.make_mut();
-        // Head [0, c0): old bytes, zero-filled past the seed's length.
-        let head_src = old.len().min(c0);
-        slice[..head_src].copy_from_slice(&old[..head_src]);
-        slice[head_src..c0].fill(0);
-        // Tail [c1, len): old bytes, zero-filled past the seed's length.
-        let tail_src_end = old.len().min(len);
-        if tail_src_end > c1 {
-            slice[c1..tail_src_end].copy_from_slice(&old[c1..tail_src_end]);
-            slice[tail_src_end..].fill(0);
-        } else {
-            slice[c1..].fill(0);
+        for &(gs, ge) in &gaps {
+            let (gs, ge) = (gs as usize, ge as usize);
+            // Old bytes where the seed reaches, zero-fill past its length.
+            let src_end = old.len().clamp(gs, ge);
+            if src_end > gs {
+                slice[gs..src_end].copy_from_slice(&old[gs..src_end]);
+            }
+            slice[src_end..ge].fill(0);
         }
-        self.covered = (0, len as u32);
+        self.content_valid = true;
         crate::fuse_client::METRICS
             .overwrite_seed_materialized
             .fetch_add(1, Ordering::Relaxed);
@@ -220,7 +258,9 @@ impl ActiveBlockBuf {
     /// A block seeded from existing content (RMW / staged / promotion
     /// seeds): copies `min(existing.len(), block_size)` bytes and
     /// zero-fills the remainder, so the buffer is born content-valid at
-    /// full block size regardless of the seed's length.
+    /// full block size regardless of the seed's length. Its WRITTEN
+    /// coverage starts empty — the write-through trigger still requires a
+    /// covering stream (a lone partial overwrite parks).
     pub fn seeded(existing: &[u8], block_size: usize) -> Self {
         // (deferred_seed: false — a seeded buffer is content-valid at birth.)
         let block = AlignedBlock::alloc_raw(block_size);
@@ -238,126 +278,236 @@ impl ActiveBlockBuf {
         }
         Self {
             cell: CowCell::new(block),
-            covered: (0, block_size as u32),
+            written: (0, 0),
+            written_extra: Vec::new(),
+            content_valid: true,
             deferred_seed: false,
         }
     }
 
-    /// The covered (initialized) interval `[start, end)`.
+    /// The primary covered run `[start, end)` — `(0, block_size)` once
+    /// content-valid. Multi-run queries go through
+    /// [`ActiveBlockBuf::covered_contains`] /
+    /// [`ActiveBlockBuf::covered_runs_in`].
     pub fn covered(&self) -> (u32, u32) {
-        self.covered
+        if self.content_valid {
+            (0, self.cell.peek().len as u32)
+        } else {
+            self.written
+        }
     }
 
     /// Content-valid: every byte is the block's correct current content
-    /// (Seeded buffers always; Fresh buffers once fully covered).
+    /// (Seeded buffers always; Fresh/deferred buffers once the written
+    /// union spans the block or the complement was zeroed / seed-filled).
     pub fn is_content_valid(&self) -> bool {
-        self.covered.0 == 0 && self.covered.1 as usize == self.cell.peek().len
+        self.content_valid
+    }
+
+    /// Whether `[start, end)` lies entirely within correct-content bytes:
+    /// the whole buffer once content-valid, else a single written run.
+    /// Reads inside it may serve buffer bytes verbatim.
+    pub fn covered_contains(&self, start: usize, end: usize) -> bool {
+        if self.content_valid {
+            return true;
+        }
+        let (s, e) = (start as u32, end as u32);
+        let inside = |run: (u32, u32)| run.0 <= s && e <= run.1;
+        inside(self.written) || self.written_extra.iter().any(|&run| inside(run))
+    }
+
+    /// The written runs intersected with `[start, end)`, ascending — the
+    /// sparse-read compose input (buffer bytes inside the runs, zeros in
+    /// the gaps of a Fresh buffer). Callers on the deferred path
+    /// materialize instead (gaps owe OLD bytes, item B). Content-valid
+    /// buffers report the whole range.
+    pub fn covered_runs_in(&self, start: usize, end: usize) -> Vec<(usize, usize)> {
+        if self.content_valid {
+            return vec![(start, end)];
+        }
+        let (s, e) = (start as u32, end as u32);
+        self.runs_sorted()
+            .filter(|&(rs, re)| rs < e && re > s)
+            .map(|(rs, re)| (rs.max(s) as usize, re.min(e) as usize))
+            .collect()
+    }
+
+    /// All written runs in ascending offset order (primary merged into the
+    /// sorted extras view). Runs are pairwise disjoint and non-abutting.
+    fn runs_sorted(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        let p = self.written;
+        let idx = self.written_extra.partition_point(|&(s, _)| s < p.0);
+        let (before, after) = self.written_extra.split_at(idx);
+        before
+            .iter()
+            .copied()
+            .chain((p.0 != p.1).then_some(p))
+            .chain(after.iter().copied())
+    }
+
+    /// The unwritten gaps of `[0, len)` in ascending order.
+    fn gaps(&self, len: u32) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        let mut cursor = 0u32;
+        for (s, e) in self.runs_sorted() {
+            if s > cursor {
+                out.push((cursor, s));
+            }
+            cursor = e;
+        }
+        if cursor < len {
+            out.push((cursor, len));
+        }
+        out
     }
 
     /// Record a write of `[start, end)` **before** merging it via
-    /// [`ActiveBlockBuf::make_mut`]. Overlapping/abutting writes extend the
-    /// covered interval; a gap write zeroes the uncovered complement and
-    /// degrades the buffer to fully-initialized (§5.3 state machine:
-    /// `Accumulating_Fresh → Accumulating_Seeded`). Callers hold this
-    /// block's `BLOCK_FLUSH_LOCKS` (as all mutations do).
-    pub fn record_write(&mut self, start: usize, end: usize) {
+    /// [`ActiveBlockBuf::make_mut`], and return `true` exactly when this
+    /// write completed the written union to the whole block — **the RW3b
+    /// write-through trigger** (overlap-safe, order-blind; fires once per
+    /// covering stream, never because a segment's end coincides with the
+    /// block end). Overlapping/abutting writes extend the primary run (the
+    /// in-order fast path); a disjoint write records an out-of-order run
+    /// (`active_block_ooo_runs`) that later writes coalesce with. Callers
+    /// hold this block's `BLOCK_FLUSH_LOCKS` (as all mutations do).
+    pub fn record_write(&mut self, start: usize, end: usize) -> bool {
         let len = self.cell.peek().len;
         debug_assert!(
             start <= end && end <= len,
             "write range out of block bounds"
         );
-        if self.is_content_valid() {
-            return;
+        if start == end || self.union_is_full() {
+            // Degenerate / already-complete: no transition to report (a
+            // re-write of a completed union must not double-fire).
+            return false;
         }
-        let (c0, c1) = (self.covered.0 as usize, self.covered.1 as usize);
-        if c0 == c1 {
+        let (s, e) = (start as u32, end as u32);
+        let (p0, p1) = self.written;
+        if p0 == p1 {
             // First touch.
-            if start == 0 && end == len {
-                self.complete_coverage(0);
-            } else {
-                self.covered = (start as u32, end as u32);
-            }
-        } else if start <= c1 && end >= c0 {
-            // Overlaps or abuts: extend the interval.
-            let new = (c0.min(start), c1.max(end));
-            if new == (0, len) {
-                self.complete_coverage(0);
-            } else {
-                self.covered = (new.0 as u32, new.1 as u32);
-            }
+            self.written = (s, e);
+        } else if s <= p1 && e >= p0 {
+            // Overlaps or abuts the primary run: extend it, then absorb any
+            // extras the grown primary now reaches (a bridging write can
+            // connect runs on both sides).
+            self.written = (p0.min(s), p1.max(e));
+            self.coalesce_extras_into_primary();
         } else {
-            // Gap write: zero the whole uncovered complement (the correct
-            // content of a Fresh block's complement *is* zeros) and degrade
-            // to fully-initialized — recycled bytes can now never escape.
-            debug_assert!(
-                !self.deferred_seed,
-                "gap write into a deferred-seed buffer: the owner must \
-                 materialize the old-block seed BEFORE merging (zeroing \
-                 would codify zeros over acked old bytes)"
-            );
-            self.zero_complement();
+            // Disjoint from the primary: an out-of-order run. Insert into
+            // the sorted extras, coalescing with overlapping/abutting
+            // neighbours (extras stay disjoint from the primary by
+            // construction: a run reaching the primary is caught above).
+            self.insert_extra_run(s, e);
+            crate::fuse_client::METRICS
+                .active_block_ooo_runs
+                .fetch_add(1, Ordering::Relaxed);
         }
+        if self.union_is_full() {
+            self.complete_written_union();
+            return true;
+        }
+        false
     }
 
-    /// Establish content-validity at a trigger / stage / upload exit: zero
-    /// the uncovered complement (elided when the buffer is fully covered or
-    /// was born Seeded). Idempotent. Callers hold this block's
-    /// `BLOCK_FLUSH_LOCKS`.
+    fn union_is_full(&self) -> bool {
+        // Extras are disjoint from the primary, so a full primary implies
+        // no extras.
+        self.written == (0, self.cell.peek().len as u32)
+    }
+
+    fn coalesce_extras_into_primary(&mut self) {
+        let (mut p0, mut p1) = self.written;
+        self.written_extra.retain(|&(s, e)| {
+            if s <= p1 && e >= p0 {
+                p0 = p0.min(s);
+                p1 = p1.max(e);
+                false
+            } else {
+                true
+            }
+        });
+        // One retain pass suffices: extras are pairwise non-abutting, so a
+        // grown primary can absorb each at most once, and absorbing one
+        // cannot make a previously-disjoint one reachable (any run between
+        // them would have been coalesced with it already).
+        self.written = (p0, p1);
+    }
+
+    fn insert_extra_run(&mut self, s: u32, e: u32) {
+        let idx = self.written_extra.partition_point(|&(_, re)| re < s);
+        let mut end_idx = idx;
+        let (mut ns, mut ne) = (s, e);
+        while end_idx < self.written_extra.len() && self.written_extra[end_idx].0 <= ne {
+            ns = ns.min(self.written_extra[end_idx].0);
+            ne = ne.max(self.written_extra[end_idx].1);
+            end_idx += 1;
+        }
+        self.written_extra.splice(idx..end_idx, [(ns, ne)]);
+    }
+
+    /// Establish content-validity at a stage/upload exit: zero **every**
+    /// unwritten gap (elided when the buffer is already content-valid).
+    /// Idempotent. Callers hold this block's `BLOCK_FLUSH_LOCKS`.
     pub fn zero_complete(&mut self) {
         debug_assert!(
             !self.deferred_seed,
             "zero_complete on a deferred-seed buffer: the owner must \
              materialize the old-block seed first (item B exit contract)"
         );
-        if self.is_content_valid() {
+        if self.content_valid {
             return;
         }
-        self.zero_complement();
+        let len = self.cell.peek().len;
+        let gaps = self.gaps(len as u32);
+        let zeroed: usize = gaps.iter().map(|&(s, e)| (e - s) as usize).sum();
+        if zeroed > 0 {
+            let slice = self.make_mut();
+            for &(gs, ge) in &gaps {
+                slice[gs as usize..ge as usize].fill(0);
+            }
+        }
+        // The gaps are zeros now — the exit owns the buffer's remaining
+        // life, so claiming the full union keeps `covered()` reporting
+        // `(0, len)` exactly as the pre-RW3b degrade did.
+        self.written = (0, len as u32);
+        self.written_extra.clear();
+        self.content_valid = true;
+        crate::fuse_client::METRICS
+            .active_block_memset_elided_bytes
+            .fetch_add((len - zeroed) as u64, Ordering::Relaxed);
     }
 
-    fn zero_complement(&mut self) {
+    /// The written union reached the whole block (the trigger transition):
+    /// every byte is app-written, so the buffer is content-valid with zero
+    /// memset; a deferred seed is skipped forever (the row-4 win).
+    fn complete_written_union(&mut self) {
         let len = self.cell.peek().len;
-        let (c0, c1) = (self.covered.0 as usize, self.covered.1 as usize);
-        let zeroed = c0 + (len - c1);
-        let slice = self.make_mut();
-        slice[..c0].fill(0);
-        slice[c1..].fill(0);
-        self.complete_coverage(zeroed);
-    }
-
-    /// Single Fresh → content-valid transition: record how many memset
-    /// bytes the elision actually saved vs today's unconditional
-    /// block-sized seed zero-fill.
-    fn complete_coverage(&mut self, zeroed_bytes: usize) {
-        let len = self.cell.peek().len;
-        self.covered = (0, len as u32);
+        debug_assert!(self.written_extra.is_empty());
         if self.deferred_seed {
-            // Fully covered: every old byte was overwritten — the deferred
-            // seed read is skipped forever (the row-4 win).
             self.deferred_seed = false;
             crate::fuse_client::METRICS
                 .overwrite_seed_skipped
                 .fetch_add(1, Ordering::Relaxed);
         }
-        crate::fuse_client::METRICS
-            .active_block_memset_elided_bytes
-            .fetch_add((len - zeroed_bytes) as u64, Ordering::Relaxed);
+        if !self.content_valid {
+            self.content_valid = true;
+            crate::fuse_client::METRICS
+                .active_block_memset_elided_bytes
+                .fetch_add(len as u64, Ordering::Relaxed);
+        }
     }
 
     /// Zero-copy immutable snapshot for readers (read-your-own-writes) and
     /// for staging/upload. The snapshot is immutable forever: any later
     /// writer that finds it alive copies first (CoW). Staging/upload
     /// callers must [`ActiveBlockBuf::zero_complete`] first (§5.3);
-    /// coverage-aware readers use [`ActiveBlockBuf::covered_snapshot`].
+    /// coverage-aware readers pair it with
+    /// [`ActiveBlockBuf::covered_contains`] /
+    /// [`ActiveBlockBuf::covered_runs_in`] read under the same entry guard
+    /// so snapshot and coverage are mutually consistent — a reader must
+    /// serve zeros, never buffer bytes, in the gaps of a Fresh buffer.
     pub fn snapshot(&self) -> bytes::Bytes {
         bytes::Bytes::from_owner(SnapshotOwner(self.cell.share()))
-    }
-
-    /// Snapshot **paired with** the covered interval, read together from
-    /// the same entry so the pair is mutually consistent (§5.3 read hit):
-    /// a reader must serve zeros — never buffer bytes — outside `covered`.
-    pub fn covered_snapshot(&self) -> (bytes::Bytes, (u32, u32)) {
-        (self.snapshot(), self.covered)
     }
 
     /// Exclusive mutable view for the write merge. O(1) when unique;
@@ -524,7 +674,137 @@ mod tests {
     #[test]
     fn one_shot_full_write_covers_without_zeroing() {
         let mut buf = ActiveBlockBuf::fresh(4096);
-        buf.record_write(0, 4096);
+        assert!(
+            buf.record_write(0, 4096),
+            "a one-shot full write completes the union (the trigger)"
+        );
         assert!(buf.is_content_valid());
+    }
+
+    /// RW3b: out-of-order disjoint runs coalesce exactly; the trigger fires
+    /// once, at the write that completes the union — including a bridge
+    /// that connects extras on BOTH sides of the primary run.
+    #[test]
+    fn ooo_runs_coalesce_and_trigger_fires_once_at_completion() {
+        let ooo_before = crate::fuse_client::METRICS
+            .active_block_ooo_runs
+            .load(Ordering::Relaxed);
+        let mut buf = ActiveBlockBuf::fresh(4096);
+        assert!(!buf.record_write(1024, 2048)); // primary [1024,2048)
+        assert!(!buf.record_write(3072, 4096)); // extra after
+        assert!(!buf.record_write(0, 512)); // extra before
+        assert!(
+            crate::fuse_client::METRICS
+                .active_block_ooo_runs
+                .load(Ordering::Relaxed)
+                >= ooo_before + 2,
+            "disjoint out-of-order runs must be observable"
+        );
+        assert!(buf.covered_contains(3072, 4096));
+        assert!(buf.covered_contains(0, 512));
+        assert!(!buf.covered_contains(0, 1024), "gap [512,1024) uncovered");
+        assert!(!buf.is_content_valid());
+        // Bridge [512,1024) + primary + [2048,3072): connects all runs but
+        // the union still spans [0,4096) only after this one write.
+        assert!(
+            buf.record_write(512, 3072),
+            "the bridging write completes the union exactly once"
+        );
+        assert!(buf.is_content_valid());
+        assert!(!buf.record_write(0, 4096), "no double-fire after complete");
+    }
+
+    /// Seeded buffers are content-valid but their WRITTEN union starts
+    /// empty: partial writes never report completion; a covering stream
+    /// completes exactly once.
+    #[test]
+    fn seeded_written_union_tracks_independently_of_content_validity() {
+        let mut buf = ActiveBlockBuf::seeded(&[7u8; 4096], 4096);
+        assert!(buf.is_content_valid());
+        assert!(
+            !buf.record_write(2048, 4096),
+            "a partial overwrite of a seeded buffer must not report complete"
+        );
+        assert!(buf.is_content_valid(), "still content-valid meanwhile");
+        assert!(
+            buf.record_write(0, 2048),
+            "the covering stream completes the union once"
+        );
+    }
+
+    /// Multi-gap zero_complete: every gap — head, interior, tail — zeroes;
+    /// written runs stay byte-exact.
+    #[test]
+    fn zero_complete_zeroes_every_gap() {
+        let mut buf = ActiveBlockBuf::fresh(4096);
+        buf.make_mut().fill(0xEE); // recycled garbage
+        buf.record_write(512, 1024);
+        buf.make_mut()[512..1024].fill(1);
+        buf.record_write(2048, 2560);
+        buf.make_mut()[2048..2560].fill(2);
+        buf.zero_complete();
+        assert!(buf.is_content_valid());
+        let s = buf.as_slice();
+        assert!(s[..512].iter().all(|&x| x == 0), "head gap");
+        assert!(s[512..1024].iter().all(|&x| x == 1));
+        assert!(s[1024..2048].iter().all(|&x| x == 0), "interior gap");
+        assert!(s[2048..2560].iter().all(|&x| x == 2));
+        assert!(s[2560..].iter().all(|&x| x == 0), "tail gap");
+        assert_eq!(buf.covered(), (0, 4096));
+    }
+
+    /// Multi-gap fill_complement_from: gaps take OLD bytes (zero-filled
+    /// past the seed's length); written runs stay byte-exact; written
+    /// coverage is NOT claimed (a later covering stream must still be able
+    /// to fire the trigger).
+    #[test]
+    fn fill_complement_fills_every_gap_with_old_bytes() {
+        let mut buf = ActiveBlockBuf::deferred(4096);
+        buf.record_write(512, 1024);
+        buf.make_mut()[512..1024].fill(1);
+        buf.record_write(2048, 2560);
+        buf.make_mut()[2048..2560].fill(2);
+        assert!(buf.seed_deferred());
+        let old = vec![9u8; 2304]; // shorter than the block
+        buf.fill_complement_from(&old);
+        assert!(!buf.seed_deferred());
+        assert!(buf.is_content_valid());
+        let s = buf.as_slice();
+        assert!(s[..512].iter().all(|&x| x == 9), "head gap = old bytes");
+        assert!(s[512..1024].iter().all(|&x| x == 1));
+        assert!(s[1024..2048].iter().all(|&x| x == 9), "interior gap = old");
+        assert!(s[2048..2560].iter().all(|&x| x == 2));
+        assert!(
+            s[2560..].iter().all(|&x| x == 0),
+            "past the old block's length = zeros"
+        );
+        // Written union untouched by the fill: completing it still fires.
+        assert!(
+            !buf.record_write(0, 512),
+            "union [0,1024)∪[2048,2560) partial"
+        );
+        assert!(
+            buf.record_write(1024, 4096),
+            "the covering stream still fires the trigger after a mid-window fill"
+        );
+    }
+
+    /// Runs intersected with a read range (the sparse-read compose input).
+    #[test]
+    fn covered_runs_in_intersects_exactly() {
+        let mut buf = ActiveBlockBuf::fresh(4096);
+        buf.record_write(512, 1024);
+        buf.record_write(2048, 2560);
+        assert_eq!(
+            buf.covered_runs_in(0, 4096),
+            vec![(512, 1024), (2048, 2560)]
+        );
+        assert_eq!(
+            buf.covered_runs_in(600, 2100),
+            vec![(600, 1024), (2048, 2100)]
+        );
+        assert_eq!(buf.covered_runs_in(1024, 2048), vec![]);
+        buf.zero_complete();
+        assert_eq!(buf.covered_runs_in(100, 200), vec![(100, 200)]);
     }
 }

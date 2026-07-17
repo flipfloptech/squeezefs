@@ -1552,9 +1552,9 @@ pub struct Metrics {
     /// covered the block before any exit (the row-4 win: one elided device
     /// block read each).
     pub overwrite_seed_skipped: Align64<AtomicU64>,
-    /// Deferred seeds materialized at an escape point (gap write, partial
-    /// trigger, stage/upload exit, sparse read) — same cost as the old
-    /// eager seed, paid only when actually needed.
+    /// Deferred seeds materialized at an escape point (stage/upload exits,
+    /// sparse read; RW3b deleted the write-path gap/partial-trigger sites)
+    /// — same cost as the old eager seed, paid only when actually needed.
     pub overwrite_seed_materialized: Align64<AtomicU64>,
     /// Truncate-shrinks of a staged blob applied as an IN-PLACE ring header
     /// patch (never a re-stage that ring pressure can refuse) — the fix for
@@ -1664,6 +1664,13 @@ pub struct Metrics {
     /// minus the complement bytes actually zeroed. Sequential fills elide
     /// the whole block.
     pub active_block_memset_elided_bytes: Align64<AtomicU64>,
+    /// Out-of-order written-coverage runs recorded (RW3b): a write landed
+    /// disjoint from every existing run of its accumulation buffer — the
+    /// kernel-split / `FOPEN_PARALLEL_DIRECT_WRITES` reorder signature
+    /// (unaligned-buffer O_DIRECT writers) and legitimately-sparse fills.
+    /// In-order streams keep it at 0; the coverage-based write-through
+    /// trigger makes it perf-neutral (FIND-L1-A fix).
+    pub active_block_ooo_runs: Align64<AtomicU64>,
     /// Meta-volume durability barriers actually issued (real `fdatasync` calls).
     /// A single FUSE fsync should raise this by exactly one (no redundant barrier).
     pub meta_device_syncs: Align64<AtomicU64>,
@@ -1745,9 +1752,12 @@ pub struct Metrics {
     /// fsync/close flush, teardown, Red parked-gate self-flush) — the
     /// non-spill share of the read leg.
     pub flush_seed_read_bytes: Align64<AtomicU64>,
-    /// Seed materializations inside `write_file_staged` itself (gap write /
-    /// partial-coverage trigger) — ~0 on the isolated-4k loss shape; growth
-    /// means the shape reaching the write path is not the modeled one.
+    /// Seed materializations inside `write_file_staged` itself. **Must
+    /// stay 0 since RW3b** (the `patch_edge_rmw_reads` tripwire pattern):
+    /// the coverage-based write-through trigger removed both in-path seed
+    /// sites (the gap-materialize and the partial-coverage trigger misfire
+    /// — FIND-L1-A's two write-path faces); any growth means an inline
+    /// seed fetch crept back into the merge path.
     pub write_path_seed_read_bytes: Align64<AtomicU64>,
     /// Bucket 2 write leg: staging puts by driver. `drain` = the
     /// R5-pressure parked drain (`drain_parked_toward`); `flush` = the
@@ -2859,6 +2869,7 @@ impl SqueezefsFilesystem {
                 "patch_ineligible_oversize": METRICS.patch_ineligible_oversize.load(Ordering::Relaxed),
                 "patch_dma_errors": METRICS.patch_dma_errors.load(Ordering::Relaxed),
                 "active_block_memset_elided_bytes": METRICS.active_block_memset_elided_bytes.load(Ordering::Relaxed),
+                "active_block_ooo_runs": METRICS.active_block_ooo_runs.load(Ordering::Relaxed),
                 "meta_device_syncs": METRICS.meta_device_syncs.load(Ordering::Relaxed),
                 "meta_sync_requests": METRICS.meta_sync_requests.load(Ordering::Relaxed),
                 "bg_admit_available_permits": crate::bg_admit::available_permits(),
@@ -3540,11 +3551,17 @@ impl SqueezefsFilesystem {
                 }
             };
             if deferred {
-                // Item B stage exit: the uncovered complement owes old
+                // Item B stage exit: the unwritten complement owes old
                 // bytes — never zeros. A failed fetch propagates with the
                 // buffer still parked (never-lossy: the ACKed bytes stay
                 // in RAM custody, readers keep serving them, and a healed
                 // retry flushes the SAME preserved bytes).
+                //
+                // RW3b covered flush-seed elision: this fetch is reachable
+                // only for genuinely-partial coverage — `seed_deferred() ⇒
+                // union partial` (every full-coverage transition clears the
+                // deferral), so a fully covered buffer can never pay a
+                // flush seed read (the measured ~1 GiB/row waste class).
                 let file_path = crate::keys::inode_path(ino);
                 let image = match self.fetch_seed_image(&file_path, b).await {
                     Ok(img) => img,
@@ -3953,21 +3970,21 @@ impl SqueezefsFilesystem {
                         crate::cache::active_block::ActiveBlockBuf::seeded(&d, block_size as usize)
                     } else if !needs_existing_data {
                         // Fresh entry: no existing data for this block, so the
-                        // seed-time zero-fill is elided (§5.3) — the `covered`
-                        // interval below keeps recycled pool bytes private, and
-                        // the complement is zeroed lazily at the trigger or at
-                        // any stage/upload exit.
+                        // seed-time zero-fill is elided (§5.3) — the written
+                        // coverage runs keep recycled pool bytes private, and
+                        // the gaps are zeroed lazily at any stage/upload exit
+                        // (a coverage-complete block has none).
                         crate::cache::active_block::ActiveBlockBuf::fresh(block_size as usize)
                     } else {
                         // Item B (the overwrite lazy-RMW seed): DEFER the
-                        // old-block read. A sequential overwrite fully
-                        // covers the block before its write-through, so the
-                        // seed read — one device block read per block, the
-                        // row-4 4x gap (17.8 GiB of reads in a pure
-                        // overwrite pass) — is skipped entirely when
-                        // coverage completes. Every escape path (gap write,
-                        // partial-coverage trigger, stage/upload exits,
-                        // sparse reads) materializes the seed first via
+                        // old-block read. A covering overwrite — in ANY
+                        // segment order (RW3b) — completes the block before
+                        // its write-through, so the seed read — one device
+                        // block read per block, the row-4 4x gap (17.8 GiB
+                        // of reads in a pure overwrite pass) — is skipped
+                        // entirely when coverage completes. Every escape
+                        // path (stage/upload exits, sparse reads)
+                        // materializes the seed first via
                         // `fetch_seed_image` — the SAME binding-
                         // validated fetch the eager seed used, just moved
                         // to the last responsible moment.
@@ -4031,105 +4048,42 @@ impl SqueezefsFilesystem {
                 // provably-unique memory: a live reader snapshot forces a
                 // copy-on-write instead of mutating aliased bytes (P0 fix,
                 // zero-copy write-path design §5.2). Coverage bookkeeping
-                // first (§5.3): a gap write zeroes the complement before
-                // the merge lands.
-                //
-                // Item B: a GAP write into a deferred-seed buffer would
-                // zero-degrade over old bytes — materialize the seed first
-                // (rare on sequential streams; identical cost to the old
-                // eager seed when it happens).
+                // first (§5.3 + RW3b): `record_write` merges this range
+                // into the buffer's written-coverage union — overlap-safe,
+                // order-blind, a disjoint (out-of-order / gap) range simply
+                // records another run — and returns `true` exactly when the
+                // union reaches the whole block. Gap writes into a
+                // deferred-seed buffer no longer materialize inline: the
+                // deferral holds (item B — the complement owes old bytes at
+                // whatever exit needs them), which is also what keeps a
+                // reordered kernel-split segment from paying a device read
+                // inside a sequential stream (FIND-L1-A).
                 let rel_start = (write_start - b_start_offset) as usize;
-                if block_data.seed_deferred() {
-                    let (c0, c1) = block_data.covered();
-                    let (c0, c1) = (c0 as usize, c1 as usize);
-                    let gap = c0 != c1 && (rel_start > c1 || rel_start + slice_len < c0);
-                    if gap {
-                        // OVERLAY NEVER INVISIBLE: re-park the checked-out
-                        // buffer for the fetch await (readers keep serving
-                        // the ACKed covered bytes), then re-check it out —
-                        // guaranteed: the held block lock excludes every
-                        // mutator — and fill synchronously. A failed fetch
-                        // leaves the old bytes parked (never-lossy); only
-                        // THIS write — never merged, never ACKed — fails
-                        // loud.
-                        self.active_block_buffers
-                            .insert(cache_key.clone(), block_data);
-                        let image = match self.fetch_seed_image(&file_path, b as u32).await {
-                            Ok(img) => img,
-                            Err(e) => return Err(e),
-                        };
-                        METRICS.write_path_seed_read_bytes.fetch_add(
-                            image.as_deref().map(|d| d.len()).unwrap_or(0) as u64,
-                            Ordering::Relaxed,
-                        );
-                        let Some((_, reowned)) = self.active_block_buffers.remove(&cache_key)
-                        else {
-                            unreachable!(
-                                "parked buffer vanished under a held BLOCK_FLUSH_LOCKS guard"
-                            );
-                        };
-                        block_data = reowned;
-                        block_data.fill_complement_from(image.as_deref().unwrap_or(&[]));
-                    }
-                }
                 let wp_merge = write_phase_start();
-                block_data.record_write(rel_start, rel_start + slice_len);
+                let coverage_completed = block_data.record_write(rel_start, rel_start + slice_len);
                 block_data.make_mut()[rel_start..rel_start + slice_len]
                     .copy_from_slice(file_data_slice);
                 write_phase_record(WritePhase::MergeCopy, wp_merge);
 
-                // 3. Write-through when the block is content-complete
-                // (normative trigger — byte-identical to the old staging
-                // point: write_end == b_end_offset for every entry kind and
-                // fill order), else keep in memory. §5.3: content-validity
-                // is established AT the trigger (zero the uncovered
-                // complement of a Fresh entry), never required before it.
-                let is_block_complete = write_end == b_end_offset;
+                // 3. Write-through when the block is content-complete —
+                // RW3b normative trigger: the ACCUMULATED written coverage
+                // spans the whole block (never `write_end == b_end_offset`,
+                // the retired proxy that misfired on partial coverage and
+                // missed out-of-order completion — the FIND-L1-A convict,
+                // .benchmarks/2026-07-17-rw3-find-l1a-forensics.md §3).
+                // Else keep in memory: partial coverage — including
+                // segments that merely END at the block boundary — parks,
+                // and the item-B deferral keeps holding (no seed fetch
+                // here, ever: a completed union has nothing to seed and a
+                // partial one defers to the flush/read/spill exits).
+                let is_block_complete = coverage_completed;
                 if is_block_complete {
-                    if block_data.seed_deferred() {
-                        // Trigger with partial coverage (stream started
-                        // mid-block): the uncovered head owes old bytes.
-                        // OVERLAY NEVER INVISIBLE: park the merged buffer
-                        // for the fetch await (previously-ACKed bytes stay
-                        // readable; the in-flight slice becoming readable
-                        // early is POSIX-legal for a racing read), re-check
-                        // it out under the held block lock, fill sync.
-                        // A failed fetch leaves it PARKED instead of
-                        // writing through (the staging-refusal precedent):
-                        // the write ACKs, the error surfaces at fsync's
-                        // materialize, nothing is lost and no zeros are
-                        // codified.
-                        self.active_block_buffers
-                            .insert(cache_key.clone(), block_data);
-                        match self.fetch_seed_image(&file_path, b as u32).await {
-                            Ok(image) => {
-                                METRICS.write_path_seed_read_bytes.fetch_add(
-                                    image.as_deref().map(|d| d.len()).unwrap_or(0) as u64,
-                                    Ordering::Relaxed,
-                                );
-                                let Some((_, reowned)) =
-                                    self.active_block_buffers.remove(&cache_key)
-                                else {
-                                    unreachable!(
-                                        "parked buffer vanished under a held \
-                                         BLOCK_FLUSH_LOCKS guard"
-                                    );
-                                };
-                                block_data = reowned;
-                                block_data.fill_complement_from(image.as_deref().unwrap_or(&[]));
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "deferred RMW seed for ino {} block {} unreadable at \
-                                     write-through ({:?}); parking — fsync surfaces the error",
-                                    ino, b, e
-                                );
-                                std::mem::drop(block_guard);
-                                return Ok::<(), SqueezefsError>(());
-                            }
-                        }
-                    }
-                    block_data.zero_complete();
+                    debug_assert!(
+                        block_data.is_content_valid() && !block_data.seed_deferred(),
+                        "a coverage-complete buffer must be content-valid with \
+                         its deferral cleared (record_write's completion \
+                         transition owns both)"
+                    );
                     match self
                         .upload_full_block(ino, b as u32, block_data.snapshot(), fencing_token)
                         .await
@@ -6582,16 +6536,47 @@ impl Filesystem for SqueezefsFilesystem {
                     // Zero-copy CoW-stable snapshot: immutable for the
                     // reply's whole lifetime — a later write to this block
                     // copies instead of mutating these bytes (P0 fix).
-                    // Coverage-aware (§5.3): snapshot + covered interval are
-                    // read from the same entry, so the pair is consistent;
-                    // memset elision means the uncovered range of a Fresh
-                    // buffer holds recycled pool bytes that must NEVER be
-                    // served through the kernel.
-                    let (snapshot, covered) = buf.value().covered_snapshot();
+                    // Coverage-aware (§5.3 + RW3b multi-run): snapshot +
+                    // coverage queries are read under the same entry guard,
+                    // so they are mutually consistent; memset elision means
+                    // the gaps of a Fresh buffer hold recycled pool bytes
+                    // that must NEVER be served through the kernel — a read
+                    // inside the covered runs serves the zero-copy slice, a
+                    // Fresh read overlapping a gap composes zeros + runs,
+                    // and a deferred read overlapping a gap materializes
+                    // (the gap owes OLD bytes, item B).
+                    let contained = buf.value().covered_contains(rel_offset, rel_end);
                     let deferred = buf.value().seed_deferred();
+                    if !contained && !deferred {
+                        // Rare sparse read overlapping the gaps of a Fresh
+                        // buffer: build the reply in a fresh buffer — zeros
+                        // plus written runs ∩ range — WITHOUT mutating the
+                        // shared buffer (zeroing in place here would be a
+                        // mutation outside BLOCK_FLUSH_LOCKS). Runs +
+                        // snapshot captured under the same guard.
+                        let snapshot = buf.value().snapshot();
+                        let runs = buf.value().covered_runs_in(rel_offset, rel_end);
+                        drop(buf);
+                        let mut out = vec![0u8; read_len];
+                        for (s, e) in runs {
+                            out[s - rel_offset..e - rel_offset].copy_from_slice(&snapshot[s..e]);
+                        }
+                        return Ok(ReplyData {
+                            data: bytes::Bytes::from(out),
+                            backing: None,
+                        });
+                    }
+                    if contained {
+                        // Common case (every content-valid entry and every
+                        // sequential read): zero-copy slice.
+                        let snapshot = buf.value().snapshot();
+                        drop(buf);
+                        return Ok(ReplyData {
+                            data: snapshot.slice(rel_offset..rel_end),
+                            backing: None,
+                        });
+                    }
                     drop(buf);
-                    if deferred
-                        && !(covered.0 as usize <= rel_offset && rel_end <= covered.1 as usize)
                     {
                         // Item B: the uncovered complement owes the OLD
                         // block's bytes (not zeros). Materialize under the
@@ -6655,31 +6640,6 @@ impl Filesystem for SqueezefsFilesystem {
                         }
                         // Buffer vanished (flushed meanwhile): fall through
                         // to the normal backend read below.
-                    } else {
-                        let data =
-                            if covered.0 as usize <= rel_offset && rel_end <= covered.1 as usize {
-                                // Common case (every Seeded/content-valid entry and
-                                // every sequential read): zero-copy slice.
-                                snapshot.slice(rel_offset..rel_end)
-                            } else {
-                                // Rare sparse read overlapping uncovered bytes:
-                                // build the reply in a fresh buffer — zeros plus
-                                // covered ∩ range — WITHOUT mutating the shared
-                                // buffer (zeroing in place here would be a mutation
-                                // outside BLOCK_FLUSH_LOCKS).
-                                let mut out = vec![0u8; read_len];
-                                let is = (covered.0 as usize).max(rel_offset);
-                                let ie = (covered.1 as usize).min(rel_end);
-                                if is < ie {
-                                    out[is - rel_offset..ie - rel_offset]
-                                        .copy_from_slice(&snapshot[is..ie]);
-                                }
-                                bytes::Bytes::from(out)
-                            };
-                        return Ok(ReplyData {
-                            data,
-                            backing: None,
-                        });
                     }
                 }
                 (file_size, false)

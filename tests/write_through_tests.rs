@@ -263,9 +263,10 @@ async fn test_covered_interval_tracking_and_zero_complete() {
     assert_eq!(buf.covered(), (1024, 2048));
     assert!(!buf.is_content_valid());
 
-    let (snap, covered) = buf.covered_snapshot();
-    assert_eq!(covered, (1024, 2048));
-    assert_eq!(&snap[1024..2048], &pattern(1024, 3)[..]);
+    assert_eq!(buf.covered(), (1024, 2048));
+    assert!(buf.covered_contains(1024, 2048));
+    assert!(!buf.covered_contains(0, 1024));
+    assert_eq!(&buf.snapshot()[1024..2048], &pattern(1024, 3)[..]);
 
     // Overlapping extension: [1536, 3072) merges into [1024, 3072).
     buf.record_write(1536, 3072);
@@ -1240,13 +1241,13 @@ async fn test_interleave_write_through_vs_fallback_writeback() {
         // Force block 2's write-through to fail → staging fallback.
         squeezefs::nvme_dev::set_fail_next_writes(1);
         let pa = pattern(BS as usize, (iter + 1) as u8);
-        write_at(&h, ino, 2 * BS + 1, &pa[1..]).await; // completes block 2 via [1..BS)
+        write_at(&h, ino, 2 * BS, &pa).await; // covering write completes block 2
         squeezefs::nvme_dev::clear_fail_next_writes();
 
         // Race: write-through of block 4 vs the fallback's flush of block 2.
         let pb = pattern(BS as usize, (iter + 2) as u8);
         let write_b = async {
-            write_at(&h, ino, 4 * BS + 1, &pb[1..]).await;
+            write_at(&h, ino, 4 * BS, &pb).await;
         };
         let flush_a = h.fs.flush_all_staged_blocks_to_backend();
         let (_, summary) = tokio::join!(write_b, flush_a);
@@ -1266,14 +1267,8 @@ async fn test_interleave_write_through_vs_fallback_writeback() {
             bm.contains_key(&4),
             "iter {iter}: write-through block 4 mapping lost (torn merge): {bm:?}"
         );
-        assert_eq!(
-            &read_at(&h, ino, 2 * BS + 1, (BS - 1) as u32).await[..],
-            &pa[1..]
-        );
-        assert_eq!(
-            &read_at(&h, ino, 4 * BS + 1, (BS - 1) as u32).await[..],
-            &pb[1..]
-        );
+        assert_eq!(&read_at(&h, ino, 2 * BS, BS as u32).await[..], &pa[..]);
+        assert_eq!(&read_at(&h, ino, 4 * BS, BS as u32).await[..], &pb[..]);
     }
 }
 
@@ -1315,7 +1310,7 @@ async fn test_interleave_write_through_vs_staging_refusal_escalation() {
         let token = h.fs.dlm().get_fencing_token_ino(ino);
         let pb = pattern(BS as usize, (iter + 4) as u8);
         let write_b = async {
-            write_at(&h, ino, 4 * BS + 1, &pb[1..]).await;
+            write_at(&h, ino, 4 * BS, &pb).await;
         };
         let escalate_a = h.fs.flush_memory_buffers_for_inode(ino, token);
         let (_, esc) = tokio::join!(write_b, escalate_a);
@@ -1332,10 +1327,7 @@ async fn test_interleave_write_through_vs_staging_refusal_escalation() {
             "iter {iter}: write-through block 4 mapping lost: {bm:?}"
         );
         assert_eq!(read_at(&h, ino, 2 * BS, 1000).await, pa);
-        assert_eq!(
-            &read_at(&h, ino, 4 * BS + 1, (BS - 1) as u32).await[..],
-            &pb[1..]
-        );
+        assert_eq!(&read_at(&h, ino, 4 * BS, BS as u32).await[..], &pb[..]);
     }
 }
 
@@ -1352,7 +1344,7 @@ async fn test_interleave_write_through_vs_truncate_shrink() {
 
         let pb = pattern(BS as usize, (iter + 5) as u8);
         let write_b = async {
-            write_at(&h, ino, 3 * BS + 1, &pb[1..]).await; // completes block 3
+            write_at(&h, ino, 3 * BS, &pb).await; // covering write completes block 3
         };
         let shrink = async {
             h.fs.setattr(
@@ -1389,10 +1381,7 @@ async fn test_interleave_write_through_vs_truncate_shrink() {
                 "iter {iter}: write won (size {}) but block 3 mapping lost: {bm:?}",
                 meta.size
             );
-            assert_eq!(
-                &read_at(&h, ino, 3 * BS + 1, (BS - 1) as u32).await[..],
-                &pb[1..]
-            );
+            assert_eq!(&read_at(&h, ino, 3 * BS, BS as u32).await[..], &pb[..]);
         }
         // Blocks 0/1 are below every cut and must survive in all orders.
         assert!(
@@ -1416,7 +1405,7 @@ async fn test_interleave_write_through_vs_truncate_grow() {
 
         let pb = pattern(BS as usize, (iter + 6) as u8);
         let write_b = async {
-            write_at(&h, ino, 3 * BS + 1, &pb[1..]).await; // completes block 3
+            write_at(&h, ino, 3 * BS, &pb).await; // covering write completes block 3
         };
         let grow = async {
             h.fs.setattr(
@@ -1444,10 +1433,7 @@ async fn test_interleave_write_through_vs_truncate_grow() {
             bm.contains_key(&3),
             "iter {iter}: write-through mapping dropped by the grow save: {bm:?}"
         );
-        assert_eq!(
-            &read_at(&h, ino, 3 * BS + 1, (BS - 1) as u32).await[..],
-            &pb[1..]
-        );
+        assert_eq!(&read_at(&h, ino, 3 * BS, BS as u32).await[..], &pb[..]);
     }
 }
 
@@ -1464,7 +1450,7 @@ async fn test_interleave_write_through_vs_fallocate_extend() {
 
         let pb = pattern(BS as usize, (iter + 7) as u8);
         let write_b = async {
-            write_at(&h, ino, 3 * BS + 1, &pb[1..]).await; // completes block 3
+            write_at(&h, ino, 3 * BS, &pb).await; // covering write completes block 3
         };
         let extend = async {
             h.fs.fallocate(h.req, ino, 0, 0, 12 * BS, 0).await.unwrap();
@@ -1482,10 +1468,7 @@ async fn test_interleave_write_through_vs_fallocate_extend() {
             bm.contains_key(&3),
             "iter {iter}: write-through mapping dropped by the fallocate save: {bm:?}"
         );
-        assert_eq!(
-            &read_at(&h, ino, 3 * BS + 1, (BS - 1) as u32).await[..],
-            &pb[1..]
-        );
+        assert_eq!(&read_at(&h, ino, 3 * BS, BS as u32).await[..], &pb[..]);
     }
 }
 

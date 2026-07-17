@@ -26,6 +26,7 @@ NVMET_PORT_ID_LOOP=52471
 NQN_SPDK="nqn.2026-07.io.spdkscope:bench-spdk"
 NQN_SPDK_GUARD="nqn.2026-07.io.spdkscope:guard-spdk"
 NQN_NVMET="nqn.2026-07.io.spdkscope:bench-nvmet"
+NQN_NVMET_GUARD="nqn.2026-07.io.spdkscope:guard-nvmet"
 NQN_LOOP="nqn.2026-07.io.spdkscope:bench-loop"
 NVMET_CFS=/sys/kernel/config/nvmet
 
@@ -70,6 +71,8 @@ ZR_NVMET=$(mkzram $((4*1024*1024*1024)) bench-nvmet)
 ZR_LOOP=$(mkzram $((4*1024*1024*1024)) bench-loop)
 ZR_GMETA=$(mkzram $((2*1024*1024*1024)) guard-meta)
 ZR_GDATA=$(mkzram $((8*1024*1024*1024)) guard-data)
+ZR_NGMETA=$(mkzram $((2*1024*1024*1024)) guard-nvmet-meta)
+ZR_NGDATA=$(mkzram $((8*1024*1024*1024)) guard-nvmet-data)
 
 # --- pre-fill bench devices (identical incompressible fill, all arms) ------
 for d in "$ZR_SPDK" "$ZR_NVMET" "$ZR_LOOP"; do
@@ -127,7 +130,26 @@ mknvmet_sub() { # nqn device
     echo 1 > "$sd/namespaces/1/enable"
     manifest "nvmet_subsystem=$nqn"
 }
+mknvmet_ns() { # nqn nsid device (with PR/reservations enabled — guard arm)
+    local nqn=$1 nsid=$2 dev=$3
+    local nd="$NVMET_CFS/subsystems/$nqn/namespaces/$nsid"
+    mkdir -p "$nd"
+    echo "$dev" > "$nd/device_path"
+    # kernel nvmet PR support is opt-in per namespace (resv_enable, set
+    # before enable) — the dev_substrate.sh convention.
+    [ -f "$nd/resv_enable" ] && echo 1 > "$nd/resv_enable"
+    echo 1 > "$nd/enable"
+}
 mknvmet_sub "$NQN_NVMET" "$ZR_NVMET"
+# guard-nvmet: the kernel-nvmet regression arm for the writer guard —
+# 2 PR-enabled namespaces (meta+data), same shape as the SPDK guard sub.
+SD="$NVMET_CFS/subsystems/$NQN_NVMET_GUARD"
+[ ! -d "$SD" ] || die "nvmet subsystem $NQN_NVMET_GUARD already exists (foreign?)"
+mkdir -p "$SD"
+echo 1 > "$SD/attr_allow_any_host"
+mknvmet_ns "$NQN_NVMET_GUARD" 1 "$ZR_NGMETA"
+mknvmet_ns "$NQN_NVMET_GUARD" 2 "$ZR_NGDATA"
+manifest "nvmet_subsystem=$NQN_NVMET_GUARD"
 PD="$NVMET_CFS/ports/$NVMET_PORT_ID_TCP"
 [ ! -d "$PD" ] || die "nvmet port $NVMET_PORT_ID_TCP exists (foreign?)"
 mkdir -p "$PD"
@@ -136,6 +158,7 @@ echo tcp       > "$PD/addr_trtype"
 echo $PORT_NVMET > "$PD/addr_trsvcid"
 echo ipv4      > "$PD/addr_adrfam"
 ln -s "$NVMET_CFS/subsystems/$NQN_NVMET" "$PD/subsystems/$NQN_NVMET"
+ln -s "$NVMET_CFS/subsystems/$NQN_NVMET_GUARD" "$PD/subsystems/$NQN_NVMET_GUARD"
 manifest "nvmet_port=$NVMET_PORT_ID_TCP"
 log "kernel nvmet-tcp target up (port $PORT_NVMET)"
 
@@ -176,19 +199,25 @@ nvme connect -t loop -n "$NQN_LOOP"
 manifest "connected=$NQN_LOOP"
 nvme connect -t tcp -a 127.0.0.1 -s $PORT_SPDK -n "$NQN_SPDK_GUARD"
 manifest "connected=$NQN_SPDK_GUARD"
+nvme connect -t tcp -a 127.0.0.1 -s $PORT_NVMET -n "$NQN_NVMET_GUARD"
+manifest "connected=$NQN_NVMET_GUARD"
 
 DEV_SPDK=$(finddev "$NQN_SPDK" 1)   || die "no dev for $NQN_SPDK"
 DEV_NVMET=$(finddev "$NQN_NVMET" 1) || die "no dev for $NQN_NVMET"
 DEV_LOOP=$(finddev "$NQN_LOOP" 1)   || die "no dev for $NQN_LOOP"
 DEV_GMETA=$(finddev "$NQN_SPDK_GUARD" 1) || die "no dev for $NQN_SPDK_GUARD (ns1)"
 DEV_GDATA=$(finddev "$NQN_SPDK_GUARD" 2) || die "no dev for $NQN_SPDK_GUARD (ns2)"
+DEV_NGMETA=$(finddev "$NQN_NVMET_GUARD" 1) || die "no dev for $NQN_NVMET_GUARD (ns1)"
+DEV_NGDATA=$(finddev "$NQN_NVMET_GUARD" 2) || die "no dev for $NQN_NVMET_GUARD (ns2)"
 {
     echo "DEV_SPDK=$DEV_SPDK"
     echo "DEV_NVMET=$DEV_NVMET"
     echo "DEV_LOOP=$DEV_LOOP"
     echo "DEV_GMETA=$DEV_GMETA"
     echo "DEV_GDATA=$DEV_GDATA"
+    echo "DEV_NGMETA=$DEV_NGMETA"
+    echo "DEV_NGDATA=$DEV_NGDATA"
     echo "SPDK_PID=$SPDK_PID"
 } > "$STATE/devices"
-log "devices: spdk=$DEV_SPDK nvmet=$DEV_NVMET loop=$DEV_LOOP guard=$DEV_GMETA,$DEV_GDATA"
+log "devices: spdk=$DEV_SPDK nvmet=$DEV_NVMET loop=$DEV_LOOP guard=$DEV_GMETA,$DEV_GDATA nvmet-guard=$DEV_NGMETA,$DEV_NGDATA"
 log "rig up OK"

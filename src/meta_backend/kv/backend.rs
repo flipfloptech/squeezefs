@@ -1942,9 +1942,30 @@ impl KvMetaBackend {
                 }
             }
             let key = self.pr_key;
-            rsv_call(&rsv, move |c| c.register(key))
-                .await
-                .map_err(|e| self.pr_error("reservation register", e))?;
+            // The register ladder (spec-strict targets, SPDK P0 finding):
+            // plain register is the fast path; a conflict with OUR OWN
+            // stale registration (kill-9'd incarnation, same host) is
+            // recovered report→unregister-own→register; foreign
+            // registrations are never touched (fail-closed into the
+            // acquire-conflict arbitration below).
+            let registered = rsv_call(&rsv, move |c| {
+                crate::meta_backend::reservation::register_ladder(c, key)
+            })
+            .await
+            .map_err(|e| self.pr_error("reservation register", e))?;
+            if let crate::meta_backend::reservation::RegisterOutcome::RecoveredOwnStale {
+                unregistered,
+            } = &registered
+            {
+                log::warn!(
+                    "meta volume {}: reservation register conflicted with our own stale \
+                     registration(s) {unregistered:#018x?} — a crashed incarnation's \
+                     residue on a spec-strict target (SPDK-class Register semantics); \
+                     unregistered them and registered fresh (single-writer guard \
+                     register ladder)",
+                    self.path.display()
+                );
+            }
             let acquire = rsv_call(&rsv, move |c| c.acquire_write_exclusive(key)).await;
             match acquire {
                 Ok(()) => {}
@@ -2202,10 +2223,30 @@ impl KvMetaBackend {
                     None => {
                         // PTPL lapse: the target dropped the reservation
                         // (power cycle) and nothing took it — re-prove
-                        // holdership.
+                        // holdership. The register rides the same ladder
+                        // as the mount gate: a lapse that somehow left a
+                        // stale same-host registration behind (exotic
+                        // target restart states) recovers identically,
+                        // and every fail-closed rung degrades to exactly
+                        // the plain-register error this arm already
+                        // escalates on.
                         let key = self.pr_key;
                         let re = async {
-                            rsv_call(&rsv, move |c| c.register(key)).await?;
+                            let out = rsv_call(&rsv, move |c| {
+                                crate::meta_backend::reservation::register_ladder(c, key)
+                            })
+                            .await?;
+                            if let crate::meta_backend::reservation::RegisterOutcome::RecoveredOwnStale {
+                                unregistered,
+                            } = &out
+                            {
+                                log::warn!(
+                                    "meta volume {}: lapse re-register recovered our own \
+                                     stale registration(s) {unregistered:#018x?} \
+                                     (single-writer guard register ladder)",
+                                    self.path.display()
+                                );
+                            }
                             rsv_call(&rsv, move |c| c.acquire_write_exclusive(key)).await
                         }
                         .await;

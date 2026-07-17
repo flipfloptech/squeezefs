@@ -20,6 +20,17 @@
 //! ioctl for this: io_uring-first governs *data* paths, not mount-time
 //! admin plumbing — the `nvmeof.rs` nvme-cli precedent).
 //!
+//! Register rides the [`register_ladder`]: targets disagree on Register
+//! semantics for a host that already holds a (stale, different-key)
+//! registration — kernel nvmet replaces it in place (IEKEY), while
+//! spec-strict targets (SPDK v26.05, measured in the 2026-07-17 scoping
+//! pass) return Reservation Conflict, which used to brick kill-9 →
+//! remount recovery there. The ladder proves from the device (Report +
+//! the association's Get-Features host identifier) that the conflicting
+//! registration is OUR OWN before unregistering it; foreign
+//! registrations are never touched (they stay preempt/TTL/claim
+//! territory).
+//!
 //! [`ReservationClient`] keeps the protocol cargo-testable: the mount
 //! guard drives the trait, production resolves the real passthru client
 //! by probing `RESCAP`, and tests install [`FakeReservationClient`]s
@@ -182,10 +193,81 @@ pub enum RegisterOutcome {
 /// error (foreign arbitration stays the acquire-conflict / claim /
 /// preempt path, which this ladder must not widen).
 pub fn register_ladder(client: &dyn ReservationClient, key: u64) -> io::Result<RegisterOutcome> {
-    // RED scaffolding: today's behavior verbatim (plain register, no
-    // recovery rungs) — the ladder lands in the fix commit.
-    client.register(key)?;
-    Ok(RegisterOutcome::Registered)
+    let Err(conflict) = client.register(key) else {
+        return Ok(RegisterOutcome::Registered);
+    };
+    if !is_reservation_conflict(&conflict) {
+        return Err(conflict);
+    }
+    // Spec-strict Register (SPDK v26.05 measured, scoping §4 pt 2): the
+    // expected cause is OUR OWN stale registration — a kill-9'd
+    // incarnation's residue under the same host identity, which a
+    // lenient target (kernel nvmet) would have silently replaced. Prove
+    // ownership from the device before touching anything; every
+    // unprovable shape falls through with the ORIGINAL conflict error
+    // (classification preserved) and loud diagnostics.
+    let ours = match client.wire_host_id() {
+        Ok(id) if !id.is_empty() => id,
+        Ok(_) => {
+            log::warn!(
+                "register ladder: register conflicted and the device reports no host \
+                 identifier for this association — failing closed (nothing unregistered)"
+            );
+            return Err(conflict);
+        }
+        Err(e) => {
+            log::warn!(
+                "register ladder: register conflicted and the association host id is \
+                 unreadable ({e}) — failing closed with the conflict (nothing unregistered)"
+            );
+            return Err(conflict);
+        }
+    };
+    let report = match client.report() {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!(
+                "register ladder: register conflicted and the reservation report failed \
+                 ({e}) — failing closed with the conflict (nothing unregistered)"
+            );
+            return Err(conflict);
+        }
+    };
+    let own_stale: Vec<u64> = report
+        .registrants
+        .iter()
+        .filter(|r| r.host_id == ours && r.rkey != key)
+        .map(|r| r.rkey)
+        .collect();
+    if own_stale.is_empty() {
+        log::warn!(
+            "register ladder: register conflicted but the report shows no registration \
+             under our host id {ours:02x?} (registrants: {:?}) — a foreign registration \
+             is not ours to remove; failing closed (arbitration stays the \
+             acquire-conflict / claim / preempt path)",
+            report.registrants
+        );
+        return Err(conflict);
+    }
+    for stale in &own_stale {
+        // Device-validated crkey: even here, the target itself refuses
+        // to remove anything not registered to THIS host.
+        client.unregister(*stale).map_err(|e| {
+            io::Error::other(format!(
+                "unregistering our own stale registration {stale:#018x} failed: {e} \
+                 (register ladder; original conflict: {conflict})"
+            ))
+        })?;
+    }
+    client.register(key).map_err(|e| {
+        io::Error::other(format!(
+            "fresh register after recovering own stale registration(s) {own_stale:#018x?} \
+             failed: {e} (register ladder)"
+        ))
+    })?;
+    Ok(RegisterOutcome::RecoveredOwnStale {
+        unregistered: own_stale,
+    })
 }
 
 // ---------------------------------------------------------------------------

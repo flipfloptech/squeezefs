@@ -15,10 +15,33 @@
  */
 #![allow(clippy::all)]
 
+pub mod ledger;
+pub mod stack;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
+
+/// Which target stack owns a share for its lifetime
+/// (`docs/design-nvmeof-target-management.md` §6.1/§6.4 — the ledger's
+/// `"stack"` field; a share is owned by exactly one stack, dispatch is
+/// resolved from the ledger, never guessed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StackKind {
+    Spdk,
+    Nvmet,
+}
+
+impl StackKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StackKind::Spdk => "spdk",
+            StackKind::Nvmet => "nvmet",
+        }
+    }
+}
 
 fn is_mock() -> bool {
     std::env::var("SQUEEZEFS_MOCK_NVMEOF").is_ok()

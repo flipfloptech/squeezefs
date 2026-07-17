@@ -767,6 +767,314 @@ async fn test_ptpl_lapse_foreign_holder_fail_stops() {
 }
 
 // ===========================================================================
+// The register ladder — spec-strict targets (SPDK v26.05 measured,
+// `.agents/spdk-scoping/scoping-report.md` §4/§7 Q1): after kill -9, the
+// dead incarnation's registration persists under the SAME host identity;
+// kernel nvmet lets the guard's IEKEY register replace it silently, but a
+// spec-strict target returns Reservation Conflict — bricking remount.
+// The ladder: Report → identify OWN stale registration (association wire
+// host id) → unregister exactly those keys → register fresh. NEVER
+// touches a foreign registration (that stays preempt/claim territory).
+// ===========================================================================
+
+use squeezefs::meta_backend::reservation::{
+    register_ladder, RegisterOutcome, ReservationClient, ReservationReport,
+};
+
+/// A client wrapper forcing a specific `register` outcome while
+/// delegating everything else to the fake — models strict-target corners
+/// the fake cannot reach organically (a Register conflict whose report
+/// shows no registration of ours; a non-conflict register error).
+#[derive(Debug)]
+struct RegisterFailingClient {
+    inner: std::sync::Arc<FakeReservationClient>,
+    errno: i32,
+}
+
+impl ReservationClient for RegisterFailingClient {
+    fn rescap(&self) -> std::io::Result<u8> {
+        self.inner.rescap()
+    }
+    fn host_identity(&self) -> std::io::Result<squeezefs::meta_backend::reservation::HostIdentity> {
+        self.inner.host_identity()
+    }
+    fn wire_host_id(&self) -> std::io::Result<Vec<u8>> {
+        self.inner.wire_host_id()
+    }
+    fn register(&self, _key: u64) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(self.errno))
+    }
+    fn unregister(&self, key: u64) -> std::io::Result<()> {
+        self.inner.unregister(key)
+    }
+    fn acquire_write_exclusive(&self, key: u64) -> std::io::Result<()> {
+        self.inner.acquire_write_exclusive(key)
+    }
+    fn preempt(&self, key: u64, victim_key: u64) -> std::io::Result<()> {
+        self.inner.preempt(key, victim_key)
+    }
+    fn release(&self, key: u64) -> std::io::Result<()> {
+        self.inner.release(key)
+    }
+    fn report(&self) -> std::io::Result<ReservationReport> {
+        self.inner.report()
+    }
+}
+
+/// Fast path pin: no stale state ⇒ plain register, no report/unregister
+/// detour — today's behavior byte-identical.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_register_ladder_fast_path_clean_namespace() {
+    let ns = FakeNvmeNamespace::new(); // spec-strict
+    let c = FakeReservationClient::new(ns.clone(), "nqn.2026-07.io.squeezefs:host-a", "hostid-a");
+    let out = register_ladder(c.as_ref(), 0x1111).expect("clean register");
+    assert_eq!(out, RegisterOutcome::Registered, "fast path outcome");
+    assert!(ns.is_registered(0x1111));
+    assert_eq!(
+        ns.unregister_count(),
+        0,
+        "the fast path must issue no unregister"
+    );
+}
+
+/// THE finding (scoping §4): our own stale registration (same host,
+/// crashed incarnation's key) conflicts on a spec-strict target — the
+/// ladder must recover it: report → unregister OUR stale key (dropping
+/// the WE reservation held under it) → register fresh; the new key can
+/// then acquire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_register_ladder_recovers_own_stale_registration_after_kill9() {
+    let ns = FakeNvmeNamespace::new(); // spec-strict
+    let host = "36ba36ac-5c0e-4ee1-8000-000000000001"; // uuid form (fabrics)
+    let dead = FakeReservationClient::new(ns.clone(), "nqn.2026-07.io.squeezefs:host-a", host);
+    dead.register(0xDEAD_0001).expect("incarnation 1 registers");
+    dead.acquire_write_exclusive(0xDEAD_0001)
+        .expect("incarnation 1 holds WE");
+    drop(dead); // kill -9: device state persists
+
+    let fresh = FakeReservationClient::new(ns.clone(), "nqn.2026-07.io.squeezefs:host-a", host);
+    let out = register_ladder(fresh.as_ref(), 0xF00D_0002).expect(
+        "the register ladder must recover from our own stale registration \
+         on a spec-strict target (kill-9 remount — the SPDK P0 finding)",
+    );
+    assert_eq!(
+        out,
+        RegisterOutcome::RecoveredOwnStale {
+            unregistered: vec![0xDEAD_0001]
+        },
+        "ladder names the recovered stale key"
+    );
+    assert!(
+        !ns.is_registered(0xDEAD_0001),
+        "the stale own key is unregistered"
+    );
+    assert!(ns.is_registered(0xF00D_0002), "the fresh key is registered");
+    assert_eq!(
+        ns.holder(),
+        None,
+        "unregistering the stale holder key released the WE reservation"
+    );
+    fresh
+        .acquire_write_exclusive(0xF00D_0002)
+        .expect("the fresh key can acquire after recovery");
+    assert_eq!(ns.holder(), Some(0xF00D_0002));
+}
+
+/// Recovery is registration-scoped: with a FOREIGN holder on the
+/// namespace, the ladder still recovers our own stale registration but
+/// never touches the foreign holder's state — acquire arbitration stays
+/// the existing conflict/claim/preempt path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_register_ladder_own_stale_with_foreign_holder_leaves_holder_alone() {
+    let ns = FakeNvmeNamespace::new(); // spec-strict
+    let foreign_key = 0xF0F0_F0F0u64;
+    ns.seed_holder(foreign_key);
+    let host = "hostid-a";
+    let dead = FakeReservationClient::new(ns.clone(), "nqn.2026-07.io.squeezefs:host-a", host);
+    dead.register(0xDEAD_0003)
+        .expect("incarnation 1 registers (non-holder)");
+    drop(dead);
+
+    let fresh = FakeReservationClient::new(ns.clone(), "nqn.2026-07.io.squeezefs:host-a", host);
+    let out = register_ladder(fresh.as_ref(), 0xF00D_0004)
+        .expect("own-stale recovery works beside a foreign holder");
+    assert_eq!(
+        out,
+        RegisterOutcome::RecoveredOwnStale {
+            unregistered: vec![0xDEAD_0003]
+        }
+    );
+    assert_eq!(
+        ns.holder(),
+        Some(foreign_key),
+        "the foreign holder's reservation is untouched"
+    );
+    assert!(
+        ns.is_registered(foreign_key),
+        "the foreign registration is untouched"
+    );
+    assert!(ns.is_registered(0xF00D_0004));
+}
+
+/// The foreign-registration law: a Register conflict whose report shows
+/// NO registration of ours falls through fail-closed with the conflict
+/// error — the ladder must not unregister anything (foreign keys are
+/// preempt/TTL territory, never the ladder's).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_register_ladder_never_unregisters_foreign_registration() {
+    let ns = FakeNvmeNamespace::new();
+    let foreign_key = 0xBEEF_0001u64;
+    ns.seed_holder(foreign_key); // the only registration: a foreign host's
+    let inner =
+        FakeReservationClient::new(ns.clone(), "nqn.2026-07.io.squeezefs:host-b", "hostid-b");
+    let paranoid = RegisterFailingClient {
+        inner,
+        errno: libc::EBADE, // a strict target conflicting for its own reasons
+    };
+    let err = register_ladder(&paranoid, 0xF00D_0005)
+        .expect_err("a conflict with no own registration must fail closed");
+    assert!(
+        squeezefs::meta_backend::reservation::is_reservation_conflict(&err),
+        "the original conflict class is preserved: {err:?}"
+    );
+    assert!(
+        ns.is_registered(foreign_key),
+        "the foreign registration is NEVER unregistered by the ladder"
+    );
+    assert_eq!(ns.holder(), Some(foreign_key), "foreign holder untouched");
+    assert_eq!(ns.unregister_count(), 0, "no unregister was issued");
+}
+
+/// Error classification: a NON-conflict register error (EIO-class device
+/// trouble) propagates untouched — no report, no unregister, no retry
+/// masquerade.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_register_ladder_non_conflict_register_error_propagates() {
+    let ns = FakeNvmeNamespace::new();
+    let inner =
+        FakeReservationClient::new(ns.clone(), "nqn.2026-07.io.squeezefs:host-a", "hostid-a");
+    let broken = RegisterFailingClient {
+        inner,
+        errno: libc::EIO,
+    };
+    let err = register_ladder(&broken, 0xF00D_0006)
+        .expect_err("a non-conflict register error must propagate");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EIO),
+        "the error class is preserved verbatim: {err:?}"
+    );
+    assert_eq!(ns.unregister_count(), 0, "no recovery rung fired");
+}
+
+/// Fail-closed identity corner: when our own association host id is
+/// unreadable/empty, the ladder must NOT match anything (an empty-to-
+/// empty match would unregister a registration it cannot prove is ours)
+/// — the conflict falls through loud.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_register_ladder_unreadable_own_identity_fails_closed() {
+    let ns = FakeNvmeNamespace::new(); // spec-strict
+    let dead = FakeReservationClient::new(ns.clone(), "nqn.2026-07.io.squeezefs:host-a", "");
+    dead.register(0xDEAD_0007)
+        .expect("an empty-hostid incarnation registered");
+    drop(dead);
+
+    let fresh = FakeReservationClient::new(ns.clone(), "nqn.2026-07.io.squeezefs:host-a", "");
+    let err = register_ladder(fresh.as_ref(), 0xF00D_0008)
+        .expect_err("an empty own host id must fail closed, never match");
+    assert!(
+        squeezefs::meta_backend::reservation::is_reservation_conflict(&err),
+        "conflict class preserved: {err:?}"
+    );
+    assert!(
+        ns.is_registered(0xDEAD_0007),
+        "nothing was unregistered under an unprovable identity"
+    );
+    assert_eq!(ns.unregister_count(), 0);
+}
+
+/// The P0 finding end to end at the mount gate: kill -9 (drop without
+/// shutdown — flock releases, claim + PR registration + WE reservation
+/// persist), then remount against a SPEC-STRICT namespace. Today this
+/// fails with "reservation register failed"; the ladder must recover:
+/// dead-pid claim reclaim + own-stale unregister + fresh register +
+/// acquire — `flock+pr` again, old key gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_kill9_remount_recovers_on_spec_strict_target() {
+    let vol = fresh_volume().await;
+    let ns = FakeNvmeNamespace::new(); // spec-strict
+    reservation::install_override(
+        vol.path(),
+        FakeReservationClient::new(
+            ns.clone(),
+            "nqn.2026-07.io.squeezefs:host-a",
+            "36ba36ac-5c0e-4ee1-8000-00000000000a",
+        ),
+    );
+
+    let be1 = KvMetaBackend::open(vol.path()).await.expect("first mount");
+    assert_eq!(be1.writer_guard_mode(), "flock+pr");
+    let stale_key = ns.holder().expect("incarnation 1 holds the WE");
+    drop(be1); // kill -9: no shutdown, no release — PR state persists
+
+    let be2 = KvMetaBackend::open(vol.path()).await.expect(
+        "remount after kill -9 must succeed on a spec-strict target \
+         (the SPDK P0 finding: register ladder recovers our own stale \
+         registration)",
+    );
+    assert_eq!(be2.writer_guard_mode(), "flock+pr", "enforcement regained");
+    let new_key = ns
+        .holder()
+        .expect("the remount re-acquired the WE reservation");
+    assert_ne!(new_key, stale_key, "a fresh key holds now");
+    assert!(
+        !ns.is_registered(stale_key),
+        "the crashed incarnation's registration was recovered (unregistered)"
+    );
+    let claim = be2.read_writer_claim().await.expect("re-claimed");
+    assert_eq!(claim.pid, std::process::id());
+    be2.shutdown().await.unwrap();
+    assert_eq!(ns.holder(), None, "clean unmount releases");
+    reservation::clear_override(vol.path());
+}
+
+/// The lenient regression pin: on a kernel-nvmet-class target the
+/// IEKEY register replaces our stale key in place — the ladder's fast
+/// path — so the kill-9 remount keeps working EXACTLY as today, with
+/// zero unregister commands (no double-behavior divergence).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_kill9_remount_on_lenient_target_stays_fast_path() {
+    let vol = fresh_volume().await;
+    let ns = FakeNvmeNamespace::lenient_register(); // kernel-nvmet model
+    reservation::install_override(
+        vol.path(),
+        FakeReservationClient::new(
+            ns.clone(),
+            "nqn.2026-07.io.squeezefs:host-a",
+            "36ba36ac-5c0e-4ee1-8000-00000000000b",
+        ),
+    );
+
+    let be1 = KvMetaBackend::open(vol.path()).await.expect("first mount");
+    let stale_key = ns.holder().expect("incarnation 1 holds the WE");
+    drop(be1); // kill -9
+
+    let be2 = KvMetaBackend::open(vol.path())
+        .await
+        .expect("kill-9 remount on a lenient target keeps working (M1 behavior)");
+    let new_key = ns.holder().expect("re-acquired");
+    assert_ne!(new_key, stale_key);
+    assert_eq!(
+        ns.unregister_count(),
+        0,
+        "lenient targets take the plain-register fast path — the ladder \
+         rungs must not fire there"
+    );
+    be2.shutdown().await.unwrap();
+    reservation::clear_override(vol.path());
+}
+
+// ===========================================================================
 // The fence signal at the BARRIER layer (Issue 14): reservation-conflict
 // errno at fdatasync ⇒ immediate failed latch + writer_guard_fenced, on
 // BOTH barrier paths. Generic barrier errors take the consecutive rung.
@@ -1063,7 +1371,7 @@ fn root_session_real_nvme_reservations() {
         println!("[m1-root] post-preempt report: {rep:?}");
         assert_eq!(rep.holder_key, Some(key), "preempt transferred the WE");
         assert!(
-            !rep.registered_keys.contains(&victim),
+            !rep.registered(victim),
             "preempt unregistered the victim key"
         );
         println!("[m1-root] conflict/report/preempt validated against {dev}");
@@ -1078,7 +1386,11 @@ fn root_session_real_nvme_reservations() {
     let rep = client.report().expect("reservation report");
     println!("[m1-root] post-acquire report: {rep:?}");
     assert_eq!(rep.holder_key, Some(key), "we hold the WE reservation");
-    assert!(rep.registered_keys.contains(&key));
+    assert!(rep.registered(key));
+    println!(
+        "[m1-root] wire host id: {:02x?}",
+        client.wire_host_id().expect("Get Features Host Identifier")
+    );
     client.release(key).expect("reservation release");
     let rep = client.report().expect("post-release report");
     println!("[m1-root] post-release report: {rep:?}");

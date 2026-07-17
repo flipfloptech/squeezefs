@@ -205,8 +205,12 @@ should be invisible).
 
 ## 6. Findings
 
-- **FIND-RW4-A (pre-existing, NOT an RW4 regression — A/B-proven on base
-  `a070836`)**: compressed (lz4) volumes CANNOT hold incompressible
+- **FIND-RW4-A — FIXED 2026-07-17** (`fix/compress-incompressible-blocks`,
+  evidence `.benchmarks/2026-07-17-find-rw4a-incompressible-fix.md`:
+  store-raw frame escape + transformed-volume chunk headroom + widened
+  read window + mount geometry gate). Original finding (pre-existing, NOT
+  an RW4 regression — A/B-proven on base
+  `a070836`): compressed (lz4) volumes CANNOT hold incompressible
   4 MiB blocks — the lz4 frame of incompressible data expands past the
   4 MiB allocator chunk (measured claim 4,210,758 B vs lz4 worst-case
   4,210,789 B for 4 MiB), the write lands anyway, and every read of such

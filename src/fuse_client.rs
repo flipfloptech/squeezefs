@@ -1677,6 +1677,13 @@ pub struct Metrics {
     pub layout_inline_writes: Align64<AtomicU64>,
     pub layout_staged_writes: Align64<AtomicU64>,
     pub layout_striped_writes: Align64<AtomicU64>,
+    /// FIND-RW4-A store-raw escape: block images whose compressed form
+    /// would not shrink (incompressible payloads) stored RAW behind the
+    /// frame's raw marker — compression is best-effort per block, never a
+    /// frame that cannot fit its allocator chunk. Growth ≈ the
+    /// incompressible share of the write mix; a compressible workload
+    /// must keep this ~0 (the escape must not disable compression).
+    pub compress_stored_raw: Align64<AtomicU64>,
     /// Best-effort background admission (see `bg_admit`).
     pub bg_spawn_admitted: Align64<AtomicU64>,
     pub bg_spawn_rejected: Align64<AtomicU64>,
@@ -2972,6 +2979,7 @@ impl SqueezefsFilesystem {
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
                 "layout_striped_writes": METRICS.layout_striped_writes.load(Ordering::Relaxed),
+                "compress_stored_raw": METRICS.compress_stored_raw.load(Ordering::Relaxed),
                 "bg_spawn_admitted": METRICS.bg_spawn_admitted.load(Ordering::Relaxed),
                 "bg_spawn_rejected": METRICS.bg_spawn_rejected.load(Ordering::Relaxed),
                 "uring_queue_full": METRICS.uring_queue_full.load(Ordering::Relaxed),

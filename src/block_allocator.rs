@@ -3,6 +3,43 @@ use crate::error::Result;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Physical allocation stride of every data-volume allocator: block
+/// offsets are minted as `block_idx * CHUNK_SIZE`, so a stored block
+/// image longer than this tramples the NEXT chunk's bytes on the device
+/// (the FIND-RW4-A neighbor-corruption mechanism). Every producer of a
+/// stored block image must satisfy `image_len <= CHUNK_SIZE` — see
+/// [`ensure_stored_block_image_fits`].
+pub const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+
+/// FIND-RW4-A defense in depth: refuse — loudly, never by silent
+/// truncation or a silent overflow write — any stored block image that
+/// would exceed its allocator chunk. Post-fix geometry (the store-raw
+/// escape + the format-time block-size headroom clamp + the mount
+/// geometry gate) makes this unreachable on in-contract volumes; if it
+/// fires, a write path produced an image the volume geometry cannot hold
+/// and the write MUST fail rather than corrupt the neighboring chunk.
+/// Deliberately an error, not an assert: a mis-geometried volume must
+/// degrade to a loud EIO, never abort the daemon.
+pub fn ensure_stored_block_image_fits(
+    stored_len: usize,
+    chunk_size: u64,
+    context: &str,
+) -> crate::error::Result<()> {
+    if stored_len as u64 > chunk_size {
+        let msg = format!(
+            "stored block image ({stored_len} B) exceeds the {chunk_size} B allocator \
+             chunk at {context}: refusing the write — landing it would corrupt the \
+             neighboring chunk (FIND-RW4-A guard)"
+        );
+        log::error!("{msg}");
+        return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            msg,
+        )));
+    }
+    Ok(())
+}
+
 /// Outcome of [`BlockAllocator::pin_block_validated`] (§5.1 clone
 /// validate-after-pin).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +92,7 @@ impl BlockAllocator {
         Ok(Self {
             _client: client,
             _volume_id: volume_id.to_string().into_boxed_str(),
-            chunk_size: 4 * 1024 * 1024, // 4MB
+            chunk_size: CHUNK_SIZE,
             free_blocks: dashmap::DashSet::new(),
             highest_block: AtomicU64::new(0),
             capacity_blocks: AtomicU64::new(0),

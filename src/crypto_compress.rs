@@ -30,6 +30,34 @@ const NONCE_LEN: usize = 12;
 /// configs onto the overflow bounce the pool exists to avoid).
 const WRAPPED_KEY_LEN_FALLBACK: usize = 512;
 
+/// Largest AEAD tag either supported algorithm emits (AES-256-GCM and
+/// ChaCha20-Poly1305 are both 16 B) — the conservative term in
+/// [`CryptoCompressState::max_stored_image_len`].
+const AEAD_TAG_LEN_MAX: usize = 16;
+
+/// FIND-RW4-A: per-block on-disk headroom a TRANSFORMED
+/// (compressed/encrypted) volume must reserve inside each allocator chunk
+/// so that a full `block_size` payload stored RAW (the incompressible-
+/// block escape) still fits: frame word + worst-case AEAD envelope
+/// (`[2B wrapped_key_len][1B nonce_len]` + RSA-4096 wrap + nonce + tag =
+/// 547 B), rounded up to one 4 KiB LBA so chunk-interior windows stay
+/// O_DIRECT-aligned. `format` clamps `block_size` to
+/// `CHUNK_SIZE - TRANSFORM_BLOCK_HEADROOM` on transformed volumes; mounts
+/// refuse transformed volumes whose geometry cannot satisfy it (pre-fix
+/// formats — reformat required).
+pub const TRANSFORM_BLOCK_HEADROOM: u64 = 4096;
+
+// The headroom must cover the worst-case non-payload bytes of a stored
+// raw-escape image (frame + AEAD header + RSA-4096 wrap + nonce + tag).
+const _: () = assert!(
+    TRANSFORM_BLOCK_HEADROOM as usize
+        >= FRAME_LEN_BYTES
+            + ENCRYPT_HEADER_PREFIX_LEN
+            + WRAPPED_KEY_LEN_FALLBACK
+            + NONCE_LEN
+            + AEAD_TAG_LEN_MAX
+);
+
 /// Resolved compression mode (P2-3) — avoids string matching on every block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionMode {

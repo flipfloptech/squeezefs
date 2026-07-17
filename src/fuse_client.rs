@@ -10305,6 +10305,17 @@ pub async fn get_volume_status(meta_lv_path: &str) -> Result<serde_json::Value, 
         }
     }
 
+    // The real mount registrations on this volume's root ino (client
+    // heartbeats + the writer claim), classified under the ONE staleness
+    // law — the same records the format preflight refuses on and
+    // `squeezefs clients` lists.
+    let clients: Vec<serde_json::Value> = backend
+        .mount_registrations()
+        .await
+        .iter()
+        .map(|r| r.to_json())
+        .collect();
+
     Ok(serde_json::json!({
         "Setting": {
             "Name": config.name,
@@ -10319,7 +10330,7 @@ pub async fn get_volume_status(meta_lv_path: &str) -> Result<serde_json::Value, 
             "StorageBackends": storage_backends,
             "ActiveWriteBackend": "",
         },
-        "Clients": []
+        "Clients": clients
     }))
 }
 

@@ -493,9 +493,13 @@ impl BlockAllocator {
                 }
             }
         }
-        println!(
+        // log, not stdout: this walk also runs under `squeezefs df`, whose
+        // `--json` output must stay machine-parseable.
+        log::info!(
             "Recovery scan summary (v3): checked={}, valid_inodes={}, layouts_found={}",
-            checked, valid_inodes, layouts_found
+            checked,
+            valid_inodes,
+            layouts_found
         );
         Ok(())
     }

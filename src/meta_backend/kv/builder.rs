@@ -718,14 +718,6 @@ pub struct FormatV3Options {
     pub format_config_xattr: Option<Vec<u8>>,
 }
 
-/// Parse the unix-seconds heartbeat timestamp from a `client:{id}`
-/// registration value (`{"ts":<secs>,"pid":<pid>}`). Returns `None` for
-/// legacy/unparseable values, which callers treat as stale.
-fn parse_client_registration_ts(val: &[u8]) -> Option<u64> {
-    let v: serde_json::Value = serde_json::from_slice(val).ok()?;
-    v.get("ts")?.as_u64()
-}
-
 /// No-side-effect format gate (run standalone by the CLI across ALL
 /// volumes before ANY volume is wiped, so a refused multi-volume format
 /// leaves everything intact; also the first step of [`format_v3`]).
@@ -779,33 +771,22 @@ pub async fn format_preflight(
         Ok(VolumeFormat::V2Legacy) => {}
         Ok(VolumeFormat::V3(_)) => {
             if let Ok(be) = KvMetaBackend::open_probe(path).await {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let ttl = crate::fuse_client::CLIENT_STALE_TTL_SECS;
-                let mut live = Vec::new();
-                if let Ok(attrs) = be.listxattr(ROOT_INO).await {
-                    // PR M1 (design-metadata-throughput §5.0): the live
-                    // sweep covers `client:* ∪ writer_claim` — the mount
-                    // guard's claim record marks a live writer exactly
-                    // like a registration marks a live client, under the
-                    // ONE staleness law (its JSON carries the same
-                    // `{"ts":…}` heartbeat this parser reads).
-                    for k in attrs.iter().filter(|k| {
-                        k.starts_with("client:") || k.as_str() == super::backend::WRITER_CLAIM_XATTR
-                    }) {
-                        let fresh = match be.getxattr(ROOT_INO, k).await {
-                            Ok(Some(val)) => parse_client_registration_ts(&val)
-                                .map(|ts| now.saturating_sub(ts) <= ttl)
-                                .unwrap_or(false),
-                            _ => false,
-                        };
-                        if fresh {
-                            live.push(k.clone());
-                        }
-                    }
-                }
+                // PR M1 (design-metadata-throughput §5.0): the live sweep
+                // covers `client:* ∪ writer_claim` — the mount guard's
+                // claim record marks a live writer exactly like a
+                // registration marks a live client, under the ONE
+                // staleness law. `mount_registrations` is the shared
+                // reader (also the `squeezefs clients`/`status` surface);
+                // the preflight's predicate is heartbeat freshness alone
+                // (a kill -9'd holder's records block format until the
+                // TTL, unchanged — reformat-under-crash stays TTL-gated).
+                let live: Vec<String> = be
+                    .mount_registrations()
+                    .await
+                    .into_iter()
+                    .filter(|r| r.heartbeat_fresh)
+                    .map(|r| r.key)
+                    .collect();
                 if !live.is_empty() {
                     return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                         "Cannot format: metadata volume is actively mounted by clients: {:?}",

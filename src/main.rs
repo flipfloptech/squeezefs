@@ -124,10 +124,15 @@ enum Commands {
         /// Optional Metadata URI (sqmeta://...) or mount point path
         meta_uri: Option<String>,
     },
-    /// List all active clients that have the filesystem mounted
+    /// List client mount registrations on a metadata volume set (live /
+    /// stale / dead, from the on-volume heartbeat records; read-only
+    /// probe — safe beside a live mount)
     Clients {
-        /// Metadata URI (sqmeta://...)
+        /// Metadata URI (sqmeta://...) or a metadata volume path
         meta_uri: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Single-writer mount-guard claim administration
     /// (docs/design-metadata-throughput.md §5.0)
@@ -379,24 +384,6 @@ enum Commands {
         /// Destination file path
         dest: String,
     },
-    /// Defragment a formatted SqueezeFS volume
-    Defrag {
-        /// Optional Metadata URI (sqmeta://...)
-        #[arg(
-            long,
-            short = 'g',
-            env = "SQUEEZEFS_META_URI",
-            alias = "meta-uri",
-            alias = "meta_uri"
-        )]
-        meta_uri: Option<String>,
-        /// NVMe device path
-        #[arg(long)]
-        nvme_path: String,
-        /// Optional target inode to defragment (only defragment this file)
-        #[arg(long, short = 'i')]
-        inode: Option<u64>,
-    },
     /// Automatically tune client node configurations (requires root/sudo to apply changes)
     Tune,
     /// Configuration management utility
@@ -413,9 +400,11 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigActions,
     },
-    /// Show filesystem disk space usage across all caches and NVMe-oF backend
+    /// Show filesystem space/inode usage for a volume set (offline/URI
+    /// query over the durable state; a mounted filesystem also answers
+    /// plain `df -h <mountpoint>` via statfs)
     Df {
-        /// Optional Metadata URI (sqmeta://...)
+        /// Metadata URI (sqmeta://...) or a metadata volume path
         #[arg(
             long,
             short = 'g',
@@ -424,8 +413,12 @@ enum Commands {
             alias = "meta_uri"
         )]
         meta_uri: Option<String>,
-        /// Optional path to a file or directory
+        /// Metadata URI (sqmeta://...) or metadata volume path
+        /// (positional alternative to --meta-uri)
         path: Option<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Manage underlying LVM storage pools and volumes
     Storage {
@@ -2205,9 +2198,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let status = squeezefs::fuse_client::get_volume_status(&path).await?;
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
-        Commands::Clients { meta_uri: _ } => {
+        Commands::Clients { meta_uri, json } => {
             squeezefs::set_fs_prefix("squeezefs");
-            println!("No active clients connected.");
+            let meta_lvs = if meta_uri.starts_with("sqmeta://") {
+                parse_block_uri(&meta_uri, "sqmeta://")?
+            } else {
+                vec![meta_uri]
+            };
+            run_clients_report(&meta_lvs, json).await?;
         }
         Commands::Claim { action } => {
             let ClaimActions::Clear { meta_uri } = action;
@@ -2678,31 +2676,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         }
-        Commands::Defrag {
-            meta_uri: _,
-            nvme_path,
-            inode,
-        } => {
-            let redis_url = "dummy".to_string();
-            let name = "squeezefs".to_string();
-            squeezefs::set_fs_prefix(&name);
-            if let Some(ino) = inode {
-                println!(
-                    "Starting defragmentation for volume '{}' targeting inode {}",
-                    name, ino
-                );
-            } else {
-                println!("Starting defragmentation for volume '{}'", name);
-            }
-            let opts = squeezefs::defrag::DefragOptions {
-                target_inode: inode,
-                ..Default::default()
-            };
-            squeezefs::defrag::run_defragmentation_with_options(
-                &redis_url, &name, &nvme_path, opts,
-            )
-            .await?;
-        }
         Commands::Bench {
             mountpoint,
             write,
@@ -2811,9 +2784,24 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             router.clone_path(&src, &dest).await?;
             println!("File cloned successfully.");
         }
-        Commands::Df { meta_uri: _, path } => {
+        Commands::Df {
+            meta_uri,
+            path,
+            json,
+        } => {
             squeezefs::set_fs_prefix("squeezefs");
-            run_df_command("dummy", path).await?;
+            let target = meta_uri.or(path).ok_or_else(|| {
+                "Error: no metadata volume specified — pass sqmeta://<meta_dev> (or a \
+                 metadata volume path). A mounted filesystem also answers plain \
+                 `df -h <mountpoint>`."
+                    .to_string()
+            })?;
+            let meta_lvs = if target.starts_with("sqmeta://") {
+                parse_block_uri(&target, "sqmeta://")?
+            } else {
+                vec![target]
+            };
+            run_df_report(&meta_lvs, json).await?;
         }
         Commands::Storage { action } => match action {
             StorageActions::Pool(pool_action) => match pool_action {
@@ -3907,11 +3895,310 @@ fn find_squeezefs_mounts() -> Vec<PathBuf> {
     mounts
 }
 
-async fn run_df_command(
-    _redis_url: &str,
-    _path_opt: Option<String>,
+/// `squeezefs clients` — list the mount registrations (client heartbeats +
+/// the single-writer claim) recorded on the volume set's root inos,
+/// classified under the existing staleness law (live / stale / dead-pid).
+/// Read-only probes (the `status` access pattern): never blocked by, and
+/// never perturbing, a live mount.
+async fn run_clients_report(
+    meta_lvs: &[String],
+    json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("SqueezeFS space usage command (df) is offline. Metadata and data are managed directly on block devices.");
+    let mut rows: Vec<(
+        String,
+        squeezefs::meta_backend::kv::backend::MountRegistration,
+    )> = Vec::new();
+    for path in meta_lvs {
+        let be = squeezefs::meta_backend::kv::backend::KvMetaBackend::open_probe(
+            std::path::Path::new(path),
+        )
+        .await
+        .map_err(|e| format!("cannot probe metadata volume '{path}': {e}"))?;
+        for reg in be.mount_registrations().await {
+            rows.push((path.clone(), reg));
+        }
+    }
+
+    let count_state = |s: &str| rows.iter().filter(|(_, r)| r.state() == s).count();
+    let (live, stale, dead) = (
+        count_state("live"),
+        count_state("stale"),
+        count_state("dead"),
+    );
+
+    if json {
+        let clients: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(path, r)| {
+                let mut v = r.to_json();
+                v["volume"] = serde_json::Value::String(path.clone());
+                v
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "volumes": meta_lvs,
+                "clients": clients,
+                "live": live,
+                "stale": stale,
+                "dead": dead,
+            }))?
+        );
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!(
+            "No client registrations on {} metadata volume(s) — no mount (live or crashed) \
+             holds this filesystem.",
+            meta_lvs.len()
+        );
+        return Ok(());
+    }
+    println!(
+        "{:<7} {:<38} {:<8} {:<6} {:<5} VOLUME",
+        "KIND", "ID", "PID", "STATE", "AGE"
+    );
+    for (path, r) in &rows {
+        println!(
+            "{:<7} {:<38} {:<8} {:<6} {:<5} {}",
+            r.kind,
+            r.id,
+            r.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+            r.state(),
+            r.age_secs
+                .map(|a| format!("{a}s"))
+                .unwrap_or_else(|| "-".into()),
+            path,
+        );
+    }
+    println!(
+        "{} registration(s): {live} live, {stale} stale, {dead} dead (reclaimable).",
+        rows.len()
+    );
+    Ok(())
+}
+
+/// `squeezefs df` — offline space/inode accounting for a volume set, from
+/// the same authoritative sources the mounted daemon's honest statfs
+/// serves: the formatted capacity/quotas (format config on the meta
+/// volume), the striped-block allocator accounting (rebuilt by the same
+/// inode-tree walk the mount runs), and the v3 monotonic ino watermark.
+/// Meta volumes are opened with read-only probes (the `status` access
+/// pattern) — works without a live mount and answers the durable
+/// point-in-time state beside one.
+async fn run_df_report(meta_lvs: &[String], json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let mut probes = Vec::new();
+    for path in meta_lvs {
+        let be = squeezefs::meta_backend::kv::backend::KvMetaBackend::open_probe(
+            std::path::Path::new(path),
+        )
+        .await
+        .map_err(|e| format!("cannot probe metadata volume '{path}': {e}"))?;
+        probes.push((path.clone(), be));
+    }
+
+    // The format config lives on the root ino of the first volume (the
+    // mount-time bootstrap contract).
+    let raw = probes[0]
+        .1
+        .getxattr(1, squeezefs::meta_backend::kv::builder::FORMAT_CONFIG_XATTR)
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "metadata volume '{}' carries no format config — volume not formatted by \
+                 `squeezefs format`",
+                probes[0].0
+            )
+        })?;
+    let config: FormatConfig = serde_json::from_slice(&raw)
+        .map_err(|e| format!("invalid format config on '{}': {e}", probes[0].0))?;
+
+    let data_lvs = config.data_lv.clone().unwrap_or_default();
+    if data_lvs.is_empty() {
+        return Err("format config names no data volumes".into());
+    }
+
+    // Rebuild the striped-block allocator accounting exactly the way a
+    // mount does (one allocator per data volume, refcounts recovered by
+    // the live-inode-tree walk) — the authoritative usage source behind
+    // statfs. Reads only; nothing is written.
+    let dlm = DlmClient::new("local")?;
+    let first_data_path = &data_lvs[0];
+    let first_name = std::path::Path::new(first_data_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(first_data_path)
+        .to_string();
+    let default_alloc = std::sync::Arc::new(
+        squeezefs::block_allocator::BlockAllocator::new(dlm.meta_client().clone(), &first_name)
+            .await?,
+    );
+    let default_dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(first_data_path));
+    let block_size = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(config.block_size));
+    let backend_router = squeezefs::routing::BackendRouter::new(
+        default_alloc.clone(),
+        default_dev.clone(),
+        block_size,
+    );
+    let mut volume_rows: Vec<(String, String, u64)> = Vec::new(); // (name, path, size)
+    for path in &data_lvs {
+        let name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path)
+            .to_string();
+        let (dev, alloc) = if path == first_data_path {
+            (default_dev.clone(), default_alloc.clone())
+        } else {
+            let d = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(path));
+            let a = std::sync::Arc::new(
+                squeezefs::block_allocator::BlockAllocator::new(dlm.meta_client().clone(), &name)
+                    .await?,
+            );
+            (d, a)
+        };
+        let size = squeezefs::nvme_dev::device_capacity_bytes(path)
+            .map_err(|e| format!("cannot size data volume '{path}': {e}"))?;
+        alloc.set_capacity_bytes(size);
+        backend_router.backends.insert(
+            name.clone(),
+            std::sync::Arc::new(squeezefs::routing::StorageBackend {
+                device: dev,
+                block_allocator: alloc,
+            }),
+        );
+        volume_rows.push((name, path.clone(), size));
+    }
+    for (path, kv) in &probes {
+        for entry in backend_router.backends.iter() {
+            entry
+                .value()
+                .block_allocator
+                .recover_active_blocks_v3(kv, &backend_router)
+                .await
+                .map_err(|e| {
+                    format!("allocator accounting walk failed on meta volume '{path}': {e}")
+                })?;
+        }
+    }
+
+    // Aggregate numbers — the statfs semantics verbatim: total = the
+    // formatted capacity (quota-aware), used = allocated striped-block
+    // bytes, files = the inode quota vs the monotonic watermark.
+    let capacity = config.capacity;
+    let used = backend_router.allocated_bytes();
+    let free = capacity.saturating_sub(used);
+    let inodes_total = config.inodes;
+    let inodes_used: u64 = probes
+        .iter()
+        .map(|(_, v)| v.next_ino().saturating_sub(2))
+        .sum::<u64>()
+        .saturating_add(1); // the root inode itself
+    let inodes_free = inodes_total.saturating_sub(inodes_used);
+
+    let data_volumes: Vec<serde_json::Value> = volume_rows
+        .iter()
+        .map(|(name, path, size)| {
+            let allocated = backend_router
+                .backends
+                .get(name)
+                .map(|be| {
+                    be.block_allocator
+                        .get_used_blocks()
+                        .saturating_mul(be.block_allocator.chunk_size())
+                })
+                .unwrap_or(0);
+            serde_json::json!({
+                "path": path,
+                "size_bytes": size,
+                "allocated_bytes": allocated,
+            })
+        })
+        .collect();
+
+    let mut meta_volumes = Vec::new();
+    for (path, be) in &probes {
+        let size = squeezefs::nvme_dev::device_capacity_bytes(path).unwrap_or(0);
+        let sb = be.superblock();
+        let node_size = sb.node_size as u64;
+        let heap = sb.heap.len;
+        let heap_free = be.free_extents().saturating_mul(node_size);
+        meta_volumes.push(serde_json::json!({
+            "path": path,
+            "size_bytes": size,
+            "kv_heap_bytes": heap,
+            "kv_heap_free_bytes": heap_free,
+            "kv_heap_used_bytes": heap.saturating_sub(heap_free),
+            "next_ino": be.next_ino(),
+        }));
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": config.name,
+                "block_size": config.block_size,
+                "capacity_bytes": capacity,
+                "used_bytes": used,
+                "free_bytes": free,
+                "inodes": {
+                    "total": inodes_total,
+                    "used": inodes_used,
+                    "free": inodes_free,
+                },
+                "data_volumes": data_volumes,
+                "meta_volumes": meta_volumes,
+            }))?
+        );
+        return Ok(());
+    }
+
+    let pct = if capacity > 0 {
+        (used as f64 / capacity as f64) * 100.0
+    } else {
+        0.0
+    };
+    println!(
+        "SqueezeFS '{}' — offline query over {} meta / {} data volume(s), durable state",
+        config.name,
+        meta_lvs.len(),
+        data_lvs.len()
+    );
+    println!(
+        "Data:   capacity {}   used {} ({pct:.1}%)   free {}",
+        format_size_human(capacity),
+        format_size_human(used),
+        format_size_human(free),
+    );
+    println!("Inodes: quota {inodes_total}   used {inodes_used}   free {inodes_free}");
+    println!();
+    println!("{:<52} {:>12} {:>12}", "DATA VOLUME", "SIZE", "ALLOCATED");
+    for dv in &data_volumes {
+        println!(
+            "{:<52} {:>12} {:>12}",
+            dv["path"].as_str().unwrap_or("?"),
+            format_size_human(dv["size_bytes"].as_u64().unwrap_or(0)),
+            format_size_human(dv["allocated_bytes"].as_u64().unwrap_or(0)),
+        );
+    }
+    println!();
+    println!(
+        "{:<52} {:>12} {:>12} {:>12} {:>9}",
+        "META VOLUME", "SIZE", "KV HEAP", "HEAP FREE", "NEXT-INO"
+    );
+    for mv in &meta_volumes {
+        println!(
+            "{:<52} {:>12} {:>12} {:>12} {:>9}",
+            mv["path"].as_str().unwrap_or("?"),
+            format_size_human(mv["size_bytes"].as_u64().unwrap_or(0)),
+            format_size_human(mv["kv_heap_bytes"].as_u64().unwrap_or(0)),
+            format_size_human(mv["kv_heap_free_bytes"].as_u64().unwrap_or(0)),
+            mv["next_ino"].as_u64().unwrap_or(0),
+        );
+    }
     Ok(())
 }
 

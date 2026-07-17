@@ -254,6 +254,85 @@ impl WriterClaim {
     }
 }
 
+/// The root-ino xattr key prefix of a mount registration
+/// (`client:{uuid}`), written/refreshed by the mount heartbeat
+/// ([`crate::fuse_client::SqueezefsFilesystem::refresh_client_registration`]).
+pub const CLIENT_REGISTRATION_PREFIX: &str = "client:";
+
+/// One mount registration read from a volume's root-ino xattrs — a
+/// `client:{id}` heartbeat record or the single-writer guard's
+/// [`WRITER_CLAIM_XATTR`] — classified under the ONE staleness law
+/// ([`crate::fuse_client::CLIENT_STALE_TTL_SECS`]) that the format
+/// preflight and the mount gate already share. This is a *read* of the
+/// records the mount heartbeat maintains, surfaced by `squeezefs
+/// clients` / `squeezefs status`; it introduces no new liveness protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountRegistration {
+    /// The root-ino xattr key (`client:{uuid}` or `writer_claim`).
+    pub key: String,
+    /// `"client"` (mount registration) or `"writer"` (guard claim).
+    pub kind: &'static str,
+    /// The registration uuid (`client:` suffix) or the claim's writer id.
+    pub id: String,
+    /// Holder pid from the record (same-host diagnosis; the claim scopes
+    /// it with `boot`). `None` when the value is unparseable.
+    pub pid: Option<u32>,
+    /// Holder boot id (`writer_claim` records only).
+    pub boot: Option<String>,
+    /// Heartbeat timestamp (unix seconds); `None` = unparseable value,
+    /// which every consumer treats as stale.
+    pub heartbeat_ts: Option<u64>,
+    /// Heartbeat age against the read instant.
+    pub age_secs: Option<u64>,
+    /// The format preflight's live predicate: parseable timestamp with
+    /// `age <= CLIENT_STALE_TTL_SECS`.
+    pub heartbeat_fresh: bool,
+    /// The mount gate's same-host dead-pid proof (`writer_claim` only —
+    /// `boot` scopes the pid to this boot): `kill(pid, 0) == ESRCH`. A
+    /// kill -9'd holder classifies reclaimable *before* its heartbeat
+    /// expires, exactly like the guard's instant-reclaim decision.
+    pub holder_provably_dead: bool,
+}
+
+impl MountRegistration {
+    /// Operator-facing state under the existing classification ladder:
+    /// dead-pid proof ⇒ `"dead"` (reclaimable), fresh heartbeat ⇒
+    /// `"live"`, otherwise `"stale"`.
+    pub fn state(&self) -> &'static str {
+        if self.holder_provably_dead {
+            "dead"
+        } else if self.heartbeat_fresh {
+            "live"
+        } else {
+            "stale"
+        }
+    }
+
+    /// The one JSON shape both CLI surfaces (`clients --json`, `status`
+    /// `"Clients"`) emit for a registration record.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kind": self.kind,
+            "key": self.key,
+            "id": self.id,
+            "pid": self.pid,
+            "boot": self.boot,
+            "heartbeat_ts": self.heartbeat_ts,
+            "age_secs": self.age_secs,
+            "state": self.state(),
+        })
+    }
+}
+
+/// Parse the unix-seconds heartbeat timestamp from a registration value
+/// (`{"ts":<secs>,…}` — both `client:{id}` records and the
+/// `writer_claim` carry it). `None` for legacy/unparseable values, which
+/// every consumer treats as stale.
+fn parse_registration_ts(val: &[u8]) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(val).ok()?;
+    v.get("ts")?.as_u64()
+}
+
 /// Outcome of [`KvMetaBackend::claim_clear`] — the operator-attested
 /// `squeezefs claim clear` admin verb (design-metadata-throughput §5.0:
 /// the recovery rung for a stale cross-host claim on a non-PR volume).
@@ -516,11 +595,10 @@ impl KvMetaBackend {
             }
         };
 
-        // (2) Bootstrap replay.
+        // (2) Bootstrap replay (sets `boot_id` — shared with probes).
         let mut inner = Self::open_inner(path).await?;
         *inner.guard_fd.get_mut().unwrap() = Some(guard_fd);
         inner.writer_id = uuid::Uuid::new_v4().to_string();
-        inner.boot_id = read_boot_id();
         // Layer B1 resolution: test override first, then the real RESCAP
         // probe (control-plane ioctl — off the async runtime).
         let probe_path = path.to_path_buf();
@@ -881,7 +959,10 @@ impl KvMetaBackend {
             atomicity_physical: std::sync::OnceLock::new(),
             guard_fd: std::sync::Mutex::new(None),
             writer_id: String::new(),
-            boot_id: String::new(),
+            // This boot's id — needed by write mounts (the claim gate's
+            // same-host dead-pid proof) AND probes (`mount_registrations`
+            // classifies claim records with the same proof).
+            boot_id: read_boot_id(),
             claimed: AtomicBool::new(false),
             reservations: None,
             pr_key: 0,
@@ -1993,6 +2074,72 @@ impl KvMetaBackend {
             Ok(Some(val)) => WriterClaim::decode(&val),
             _ => None,
         }
+    }
+
+    /// Read every mount registration on this volume's root ino — the
+    /// `client:{id}` heartbeat records plus the guard's `writer_claim` —
+    /// classified under the ONE staleness law
+    /// ([`crate::fuse_client::CLIENT_STALE_TTL_SECS`]). The format
+    /// preflight refuses on [`MountRegistration::heartbeat_fresh`]; the
+    /// `squeezefs clients` / `status` surfaces additionally report the
+    /// guard's same-host dead-pid proof for claim records (a kill -9'd
+    /// holder shows reclaimable instantly, matching the mount gate's own
+    /// classification). Read-only; safe on probe backends against a
+    /// live-mounted volume.
+    pub async fn mount_registrations(&self) -> Vec<MountRegistration> {
+        let now = unix_now_secs();
+        let ttl = crate::fuse_client::CLIENT_STALE_TTL_SECS;
+        let mut out = Vec::new();
+        let Ok(keys) = self.listxattr(1).await else {
+            return out;
+        };
+        for key in keys {
+            let (kind, is_writer) = if key.starts_with(CLIENT_REGISTRATION_PREFIX) {
+                ("client", false)
+            } else if key == WRITER_CLAIM_XATTR {
+                ("writer", true)
+            } else {
+                continue;
+            };
+            let Ok(Some(val)) = self.getxattr(1, &key).await else {
+                continue;
+            };
+            let heartbeat_ts = parse_registration_ts(&val);
+            let age_secs = heartbeat_ts.map(|ts| now.saturating_sub(ts));
+            let heartbeat_fresh = age_secs.map(|age| age <= ttl).unwrap_or(false);
+            let (id, pid, boot, holder_provably_dead) = if is_writer {
+                match WriterClaim::decode(&val) {
+                    Some(c) => {
+                        let same_host = !self.boot_id.is_empty() && c.boot == self.boot_id;
+                        let dead = same_host && pid_provably_dead(c.pid);
+                        (c.id.clone(), Some(c.pid), Some(c.boot), dead)
+                    }
+                    None => (String::new(), None, None, false),
+                }
+            } else {
+                let id = key
+                    .strip_prefix(CLIENT_REGISTRATION_PREFIX)
+                    .unwrap_or(&key)
+                    .to_string();
+                let pid = serde_json::from_slice::<serde_json::Value>(&val)
+                    .ok()
+                    .and_then(|v| v.get("pid")?.as_u64())
+                    .map(|p| p as u32);
+                (id, pid, None, false)
+            };
+            out.push(MountRegistration {
+                key,
+                kind,
+                id,
+                pid,
+                boot,
+                heartbeat_ts,
+                age_secs,
+                heartbeat_fresh,
+                holder_provably_dead,
+            });
+        }
+        out
     }
 
     /// Usurpation-class fail-stop: latch `failed` loud and count it in

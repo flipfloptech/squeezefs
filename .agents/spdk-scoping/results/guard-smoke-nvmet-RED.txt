@@ -1,0 +1,109 @@
+[guard-nvmet] arm=nvmet meta=/dev/nvme5n1 data=/dev/nvme5n2 loops=1 ptpl=0 2026-07-17T15:54:19-04:00
+[guard-nvmet] binary: /tmp/sqz-red/target/release/squeezefs (924162c93311a14a0bcc83a3bc73f71e)
+[guard-nvmet] 0. scrub: kill stale daemons, unmount, wipe superblocks
+$ dd if=/dev/zero of=/dev/nvme5n1 bs=1M count=16 oflag=direct
+16+0 records in
+16+0 records out
+16777216 bytes (17 MB, 16 MiB) copied, 0.0181262 s, 926 MB/s
+(rc=0)
+$ dd if=/dev/zero of=/dev/nvme5n2 bs=1M count=16 oflag=direct
+16+0 records in
+16+0 records out
+16777216 bytes (17 MB, 16 MiB) copied, 0.0107213 s, 1.6 GB/s
+(rc=0)
+[guard-nvmet] 1. format + mount (cache-less)
+$ /tmp/sqz-red/target/release/squeezefs format sqmeta:///dev/nvme5n1 sqdata:///dev/nvme5n2 --force
+Total physical data volume capacity: 2.00 GiB
+SqueezeFS version 0.1.0
+======================================================================
+  Format Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            2.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme5n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme5n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+======================================================================
+Format complete.
+(rc=0)
+$ /tmp/sqz-red/target/release/squeezefs --log-file /tmp/spdkscope/daemon-nvmet.log mount sqmeta:///dev/nvme5n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-nvmet] PASS: writer_guard_mode=flock+pr (enforcement grade)
+$ dd if=/dev/urandom of=/tmp/spdkscope/mnt/smoke.bin bs=1M count=8
+8+0 records in
+8+0 records out
+8388608 bytes (8.4 MB, 8.0 MiB) copied, 0.0257499 s, 326 MB/s
+(rc=0)
+$ sync
+(rc=0)
+[guard-nvmet] smoke.bin md5=a2c4c7e0720acc60418a86dcf09294d2
+[guard-nvmet] 2. double-mount refusal while first daemon serves
+$ /tmp/sqz-red/target/release/squeezefs mount sqmeta:///dev/nvme5n1 /tmp/spdkscope/mnt2 --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt2"...
+Failed to start squeezefs daemon:
+Error: Invalid operation: kv metadata: /dev/nvme5n1: another squeezefs process holds the writer lock (claim: id=1571c6b1-fcbb-4a0d-b3cb-8609654a3ef2, pid=217132, boot=44c91f20-6ee4-48c3-ac23-7bf8cdbe16b4, age=2s) — concurrent mounts of one metadata volume are refused (single-writer guard)
+(rc=1)
+[guard-nvmet] PASS: double-mount refused naming the guard
+[guard-nvmet] 3. claim clear refused while live-mounted
+$ /tmp/sqz-red/target/release/squeezefs claim clear sqmeta:///dev/nvme5n1
+[91mERROR[0m /dev/nvme5n1: /dev/nvme5n1: refusing to clear the writer claim — the volume is live-mounted on this host (the writer lock is held). Unmount it first
+Error: "claim clear refused/failed on 1 of 1 volume(s)"
+(rc=1)
+[guard-nvmet] PASS: claim clear refused while live
+[guard-nvmet] 4.1 kill -9 -> remount (cycle 1/1)
+$ /tmp/sqz-red/target/release/squeezefs --log-file /tmp/spdkscope/daemon-nvmet.log mount sqmeta:///dev/nvme5n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+Failed to start squeezefs daemon:
+Error: Invalid operation: kv metadata: /dev/nvme5n1: reservation register failed on the PR-capable namespace: Invalid exchange (os error 52) (single-writer guard)
+--- daemon log tail (/tmp/spdkscope/daemon-nvmet.log) ---
+Metadata Volumes:
+  - [enabled] /dev/nvme5n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme5n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/tmp/spdkscope/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-07-17T19:54:27Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-07-17T19:54:27Z INFO  squeezefs] Registering data volume 'nvme5n2' at path /dev/nvme5n2
+[2026-07-17T19:54:27Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reclaiming writer_claim from dead same-host holder (id=1571c6b1-fcbb-4a0d-b3cb-8609654a3ef2, pid=217132 ESRCH, age=6s)
+[91mERROR[0m mount refused: Invalid operation: kv metadata: /dev/nvme5n1: reservation register failed on the PR-capable namespace: Invalid exchange (os error 52) (single-writer guard)
+Error: InvalidOperation("kv metadata: /dev/nvme5n1: reservation register failed on the PR-capable namespace: Invalid exchange (os error 52) (single-writer guard)")
+(rc=1)
+[guard-nvmet] FAIL: cycle 1: REMOUNT did not appear after kill -9
+$ timeout 30 /tmp/sqz-red/target/release/squeezefs mount sqmeta:///dev/nvme5n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+Failed to start squeezefs daemon:
+Error: Invalid operation: kv metadata: /dev/nvme5n1: reservation register failed on the PR-capable namespace: Invalid exchange (os error 52) (single-writer guard)
+(rc=1)
+[guard-nvmet] PASS: register ladder did NOT fire on nvmet (lenient fast path, hits=0)
+[guard-nvmet] 6. clean unmount + claim clear no-op + zero PR residue
+$ umount /tmp/spdkscope/mnt
+umount: /tmp/spdkscope/mnt: not mounted.
+(rc=32)
+$ /tmp/sqz-red/target/release/squeezefs claim clear sqmeta:///dev/nvme5n1
+[91mERROR[0m /dev/nvme5n1: /dev/nvme5n1: refusing to clear the writer claim — the volume has live client registrations: ["client:597a74f2-1c08-4b06-9802-23f439ec9511"]
+Error: "claim clear refused/failed on 1 of 1 volume(s)"
+(rc=1)
+[guard-nvmet] FAIL: claim clear errored after clean unmount
+[guard-nvmet] FAIL: PR residue after clean unmount (regctl=1)
+[guard-nvmet] verdict: 3 failure(s)

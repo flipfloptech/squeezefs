@@ -1,0 +1,578 @@
+SqueezeFS version 0.1.0
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            2.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme5n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme5n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/tmp/spdkscope/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-07-17T20:01:54Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-07-17T20:01:54Z INFO  squeezefs] Registering data volume 'nvme5n2' at path /dev/nvme5n2
+[2026-07-17T20:01:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: writer claim taken (id=65f878b4-3814-4212-a637-2735d2f6c42b, mode=flock+pr)
+[2026-07-17T20:01:54Z INFO  squeezefs] meta volume /dev/nvme5n1: format=3 ledger_seq=1 replay_entries=0 replay_dropped_torn=0 replay_ms=3 free_extents=32636 next_ino=2 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=atomic4k writer_guard_mode=flock+pr
+[2026-07-17T20:01:54Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 32
+[2026-07-17T20:01:54Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-07-17T20:01:54Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:01:54Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 2048 MiB (memory budget 78709 MiB)
+[2026-07-17T20:01:54Z INFO  squeezefs::fuse_client] SqueezeFS version 0.1.0 initializing mount
+[2026-07-17T20:01:54Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:01:54Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+[SIG] Registering signal handlers inside shutdown block...
+[SIG] Signal handlers registered successfully.
+[2026-07-17T20:01:54Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 0.1.0).
+squeezefs: mount ready (version 0.1.0, exe hint: rebuild target/release and reinstall)
+[2026-07-17T20:01:54Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x7ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 fd=36 sqpoll=off
+FUSE-over-io_uring session path armed (ready=true, queues=32)
+FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+SqueezeFS version 0.1.0
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            2.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme5n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme5n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/tmp/spdkscope/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-07-17T20:01:59Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-07-17T20:01:59Z INFO  squeezefs] Registering data volume 'nvme5n2' at path /dev/nvme5n2
+[2026-07-17T20:01:59Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reclaiming writer_claim from dead same-host holder (id=65f878b4-3814-4212-a637-2735d2f6c42b, pid=229042 ESRCH, age=5s)
+[2026-07-17T20:01:59Z WARN  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reservation register conflicted with our own stale registration(s) [
+        0x4fd4c5ec277da479,
+    ] — a crashed incarnation's residue on a spec-strict target (SPDK-class Register semantics); unregistered them and registered fresh (single-writer guard register ladder)
+[2026-07-17T20:01:59Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: writer claim taken (id=a36676cb-93c6-4d94-8835-add99d2ae65d, mode=flock+pr)
+[2026-07-17T20:01:59Z INFO  squeezefs] meta volume /dev/nvme5n1: format=3 ledger_seq=3 replay_entries=10 replay_dropped_torn=0 replay_ms=3 free_extents=32636 next_ino=3 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=atomic4k writer_guard_mode=flock+pr
+[2026-07-17T20:01:59Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 32
+[2026-07-17T20:01:59Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-07-17T20:01:59Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=2, valid_inodes=2, layouts_found=1
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:01:59Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 2048 MiB (memory budget 78709 MiB)
+[2026-07-17T20:01:59Z INFO  squeezefs::fuse_client] SqueezeFS version 0.1.0 initializing mount
+[2026-07-17T20:01:59Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:01:59Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+[SIG] Registering signal handlers inside shutdown block...
+[SIG] Signal handlers registered successfully.
+[2026-07-17T20:01:59Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 0.1.0).
+squeezefs: mount ready (version 0.1.0, exe hint: rebuild target/release and reinstall)
+[2026-07-17T20:01:59Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x7ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 fd=36 sqpoll=off
+FUSE-over-io_uring session path armed (ready=true, queues=32)
+FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+SqueezeFS version 0.1.0
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            2.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme5n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme5n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/tmp/spdkscope/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-07-17T20:02:04Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-07-17T20:02:04Z INFO  squeezefs] Registering data volume 'nvme5n2' at path /dev/nvme5n2
+[2026-07-17T20:02:04Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reclaiming writer_claim from dead same-host holder (id=a36676cb-93c6-4d94-8835-add99d2ae65d, pid=229303 ESRCH, age=5s)
+[2026-07-17T20:02:04Z WARN  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reservation register conflicted with our own stale registration(s) [
+        0xff3bb73ec5409d6e,
+    ] — a crashed incarnation's residue on a spec-strict target (SPDK-class Register semantics); unregistered them and registered fresh (single-writer guard register ladder)
+[2026-07-17T20:02:04Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: writer claim taken (id=73ef1dd0-c928-4ce9-a95b-caec0b144ff3, mode=flock+pr)
+[2026-07-17T20:02:04Z INFO  squeezefs] meta volume /dev/nvme5n1: format=3 ledger_seq=5 replay_entries=0 replay_dropped_torn=0 replay_ms=3 free_extents=32636 next_ino=3 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=atomic4k writer_guard_mode=flock+pr
+[2026-07-17T20:02:04Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 32
+[2026-07-17T20:02:04Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-07-17T20:02:04Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=2, valid_inodes=2, layouts_found=1
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:04Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 2048 MiB (memory budget 78709 MiB)
+[2026-07-17T20:02:04Z INFO  squeezefs::fuse_client] SqueezeFS version 0.1.0 initializing mount
+[2026-07-17T20:02:04Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:04Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+[SIG] Registering signal handlers inside shutdown block...
+[SIG] Signal handlers registered successfully.
+[2026-07-17T20:02:04Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 0.1.0).
+squeezefs: mount ready (version 0.1.0, exe hint: rebuild target/release and reinstall)
+[2026-07-17T20:02:04Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x7ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 fd=36 sqpoll=off
+FUSE-over-io_uring session path armed (ready=true, queues=32)
+FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+SqueezeFS version 0.1.0
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            2.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme5n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme5n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/tmp/spdkscope/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-07-17T20:02:09Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-07-17T20:02:09Z INFO  squeezefs] Registering data volume 'nvme5n2' at path /dev/nvme5n2
+[2026-07-17T20:02:09Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reclaiming writer_claim from dead same-host holder (id=73ef1dd0-c928-4ce9-a95b-caec0b144ff3, pid=229447 ESRCH, age=5s)
+[2026-07-17T20:02:09Z WARN  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reservation register conflicted with our own stale registration(s) [
+        0xfc1d27831a7175c2,
+    ] — a crashed incarnation's residue on a spec-strict target (SPDK-class Register semantics); unregistered them and registered fresh (single-writer guard register ladder)
+[2026-07-17T20:02:09Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: writer claim taken (id=d5f7646f-ce61-4c48-a734-04a98100d1b9, mode=flock+pr)
+[2026-07-17T20:02:09Z INFO  squeezefs] meta volume /dev/nvme5n1: format=3 ledger_seq=7 replay_entries=0 replay_dropped_torn=0 replay_ms=3 free_extents=32636 next_ino=3 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=atomic4k writer_guard_mode=flock+pr
+[2026-07-17T20:02:09Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 32
+[2026-07-17T20:02:09Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-07-17T20:02:09Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=2, valid_inodes=2, layouts_found=1
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:09Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 2048 MiB (memory budget 78709 MiB)
+[2026-07-17T20:02:09Z INFO  squeezefs::fuse_client] SqueezeFS version 0.1.0 initializing mount
+[2026-07-17T20:02:09Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:09Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+[SIG] Registering signal handlers inside shutdown block...
+[SIG] Signal handlers registered successfully.
+[2026-07-17T20:02:09Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 0.1.0).
+squeezefs: mount ready (version 0.1.0, exe hint: rebuild target/release and reinstall)
+[2026-07-17T20:02:09Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x7ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 fd=36 sqpoll=off
+FUSE-over-io_uring session path armed (ready=true, queues=32)
+FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+SqueezeFS version 0.1.0
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            2.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme5n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme5n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/tmp/spdkscope/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-07-17T20:02:14Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-07-17T20:02:14Z INFO  squeezefs] Registering data volume 'nvme5n2' at path /dev/nvme5n2
+[2026-07-17T20:02:14Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reclaiming writer_claim from dead same-host holder (id=d5f7646f-ce61-4c48-a734-04a98100d1b9, pid=229596 ESRCH, age=5s)
+[2026-07-17T20:02:14Z WARN  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reservation register conflicted with our own stale registration(s) [
+        0x4b621c7d2e79c174,
+    ] — a crashed incarnation's residue on a spec-strict target (SPDK-class Register semantics); unregistered them and registered fresh (single-writer guard register ladder)
+[2026-07-17T20:02:14Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: writer claim taken (id=c23e3604-7732-467d-ba81-69c3d4a3c712, mode=flock+pr)
+[2026-07-17T20:02:14Z INFO  squeezefs] meta volume /dev/nvme5n1: format=3 ledger_seq=9 replay_entries=0 replay_dropped_torn=0 replay_ms=3 free_extents=32636 next_ino=3 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=atomic4k writer_guard_mode=flock+pr
+[2026-07-17T20:02:14Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 32
+[2026-07-17T20:02:14Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-07-17T20:02:14Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=2, valid_inodes=2, layouts_found=1
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:14Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 2048 MiB (memory budget 78709 MiB)
+[2026-07-17T20:02:14Z INFO  squeezefs::fuse_client] SqueezeFS version 0.1.0 initializing mount
+[2026-07-17T20:02:14Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:14Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+[SIG] Registering signal handlers inside shutdown block...
+[SIG] Signal handlers registered successfully.
+[2026-07-17T20:02:14Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 0.1.0).
+squeezefs: mount ready (version 0.1.0, exe hint: rebuild target/release and reinstall)
+[2026-07-17T20:02:14Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x7ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 fd=36 sqpoll=off
+FUSE-over-io_uring session path armed (ready=true, queues=32)
+FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+SqueezeFS version 0.1.0
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            2.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme5n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme5n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/tmp/spdkscope/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-07-17T20:02:20Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-07-17T20:02:20Z INFO  squeezefs] Registering data volume 'nvme5n2' at path /dev/nvme5n2
+[2026-07-17T20:02:20Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reclaiming writer_claim from dead same-host holder (id=c23e3604-7732-467d-ba81-69c3d4a3c712, pid=229742 ESRCH, age=6s)
+[2026-07-17T20:02:20Z WARN  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reservation register conflicted with our own stale registration(s) [
+        0xd50005d3045de2a5,
+    ] — a crashed incarnation's residue on a spec-strict target (SPDK-class Register semantics); unregistered them and registered fresh (single-writer guard register ladder)
+[2026-07-17T20:02:20Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: writer claim taken (id=d6ef2374-dedf-4b7e-8238-09486776027b, mode=flock+pr)
+[2026-07-17T20:02:20Z INFO  squeezefs] meta volume /dev/nvme5n1: format=3 ledger_seq=11 replay_entries=0 replay_dropped_torn=0 replay_ms=3 free_extents=32636 next_ino=3 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=atomic4k writer_guard_mode=flock+pr
+[2026-07-17T20:02:20Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 32
+[2026-07-17T20:02:20Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-07-17T20:02:20Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=2, valid_inodes=2, layouts_found=1
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:20Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 2048 MiB (memory budget 78709 MiB)
+[2026-07-17T20:02:20Z INFO  squeezefs::fuse_client] SqueezeFS version 0.1.0 initializing mount
+[2026-07-17T20:02:20Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:20Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+[SIG] Registering signal handlers inside shutdown block...
+[SIG] Signal handlers registered successfully.
+[2026-07-17T20:02:20Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 0.1.0).
+squeezefs: mount ready (version 0.1.0, exe hint: rebuild target/release and reinstall)
+[2026-07-17T20:02:20Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x7ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 fd=36 sqpoll=off
+FUSE-over-io_uring session path armed (ready=true, queues=32)
+FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+SqueezeFS version 0.1.0
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            2.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme5n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme5n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/tmp/spdkscope/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-07-17T20:02:25Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-07-17T20:02:25Z INFO  squeezefs] Registering data volume 'nvme5n2' at path /dev/nvme5n2
+[2026-07-17T20:02:25Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reclaiming writer_claim from dead same-host holder (id=d6ef2374-dedf-4b7e-8238-09486776027b, pid=229884 ESRCH, age=5s)
+[2026-07-17T20:02:25Z WARN  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reservation register conflicted with our own stale registration(s) [
+        0x438e50f0c2dfc781,
+    ] — a crashed incarnation's residue on a spec-strict target (SPDK-class Register semantics); unregistered them and registered fresh (single-writer guard register ladder)
+[2026-07-17T20:02:25Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: writer claim taken (id=76e81bea-b51a-4f3a-b85f-4f0d3c479529, mode=flock+pr)
+[2026-07-17T20:02:25Z INFO  squeezefs] meta volume /dev/nvme5n1: format=3 ledger_seq=13 replay_entries=0 replay_dropped_torn=0 replay_ms=3 free_extents=32636 next_ino=3 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=atomic4k writer_guard_mode=flock+pr
+[2026-07-17T20:02:25Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 32
+[2026-07-17T20:02:25Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-07-17T20:02:25Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=2, valid_inodes=2, layouts_found=1
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:25Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 2048 MiB (memory budget 78709 MiB)
+[2026-07-17T20:02:25Z INFO  squeezefs::fuse_client] SqueezeFS version 0.1.0 initializing mount
+[2026-07-17T20:02:25Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:25Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+[SIG] Registering signal handlers inside shutdown block...
+[SIG] Signal handlers registered successfully.
+[2026-07-17T20:02:25Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 0.1.0).
+squeezefs: mount ready (version 0.1.0, exe hint: rebuild target/release and reinstall)
+[2026-07-17T20:02:25Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x7ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 fd=36 sqpoll=off
+FUSE-over-io_uring session path armed (ready=true, queues=32)
+FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+SqueezeFS version 0.1.0
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            2.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme5n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme5n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/tmp/spdkscope/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-07-17T20:02:30Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-07-17T20:02:30Z INFO  squeezefs] Registering data volume 'nvme5n2' at path /dev/nvme5n2
+[2026-07-17T20:02:30Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reclaiming writer_claim from dead same-host holder (id=76e81bea-b51a-4f3a-b85f-4f0d3c479529, pid=230027 ESRCH, age=5s)
+[2026-07-17T20:02:30Z WARN  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reservation register conflicted with our own stale registration(s) [
+        0x31373dff09a92340,
+    ] — a crashed incarnation's residue on a spec-strict target (SPDK-class Register semantics); unregistered them and registered fresh (single-writer guard register ladder)
+[2026-07-17T20:02:30Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: writer claim taken (id=91430750-86db-46fb-928d-aaa18b5745a2, mode=flock+pr)
+[2026-07-17T20:02:30Z INFO  squeezefs] meta volume /dev/nvme5n1: format=3 ledger_seq=15 replay_entries=0 replay_dropped_torn=0 replay_ms=3 free_extents=32636 next_ino=3 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=atomic4k writer_guard_mode=flock+pr
+[2026-07-17T20:02:30Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 32
+[2026-07-17T20:02:30Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-07-17T20:02:30Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=2, valid_inodes=2, layouts_found=1
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:30Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 2048 MiB (memory budget 78709 MiB)
+[2026-07-17T20:02:30Z INFO  squeezefs::fuse_client] SqueezeFS version 0.1.0 initializing mount
+[2026-07-17T20:02:30Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:30Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+[SIG] Registering signal handlers inside shutdown block...
+[SIG] Signal handlers registered successfully.
+[2026-07-17T20:02:30Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 0.1.0).
+squeezefs: mount ready (version 0.1.0, exe hint: rebuild target/release and reinstall)
+[2026-07-17T20:02:30Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x7ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 fd=36 sqpoll=off
+FUSE-over-io_uring session path armed (ready=true, queues=32)
+FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+SqueezeFS version 0.1.0
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            2.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme5n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme5n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/tmp/spdkscope/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-07-17T20:02:35Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-07-17T20:02:35Z INFO  squeezefs] Registering data volume 'nvme5n2' at path /dev/nvme5n2
+[2026-07-17T20:02:35Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reclaiming writer_claim from dead same-host holder (id=91430750-86db-46fb-928d-aaa18b5745a2, pid=230172 ESRCH, age=5s)
+[2026-07-17T20:02:35Z WARN  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reservation register conflicted with our own stale registration(s) [
+        0x9e7c34a5c3c1be4f,
+    ] — a crashed incarnation's residue on a spec-strict target (SPDK-class Register semantics); unregistered them and registered fresh (single-writer guard register ladder)
+[2026-07-17T20:02:35Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: writer claim taken (id=bce028f7-35e0-4356-9117-328e71ebe36f, mode=flock+pr)
+[2026-07-17T20:02:35Z INFO  squeezefs] meta volume /dev/nvme5n1: format=3 ledger_seq=17 replay_entries=0 replay_dropped_torn=0 replay_ms=4 free_extents=32636 next_ino=3 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=atomic4k writer_guard_mode=flock+pr
+[2026-07-17T20:02:35Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 32
+[2026-07-17T20:02:35Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-07-17T20:02:35Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=2, valid_inodes=2, layouts_found=1
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:35Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 2048 MiB (memory budget 78709 MiB)
+[2026-07-17T20:02:35Z INFO  squeezefs::fuse_client] SqueezeFS version 0.1.0 initializing mount
+[2026-07-17T20:02:35Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:35Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+[SIG] Registering signal handlers inside shutdown block...
+[SIG] Signal handlers registered successfully.
+[2026-07-17T20:02:35Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 0.1.0).
+squeezefs: mount ready (version 0.1.0, exe hint: rebuild target/release and reinstall)
+[2026-07-17T20:02:35Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x7ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 fd=36 sqpoll=off
+FUSE-over-io_uring session path armed (ready=true, queues=32)
+FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+SqueezeFS version 0.1.0
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            2.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme5n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme5n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/tmp/spdkscope/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-07-17T20:02:40Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-07-17T20:02:40Z INFO  squeezefs] Registering data volume 'nvme5n2' at path /dev/nvme5n2
+[2026-07-17T20:02:40Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reclaiming writer_claim from dead same-host holder (id=bce028f7-35e0-4356-9117-328e71ebe36f, pid=230316 ESRCH, age=5s)
+[2026-07-17T20:02:40Z WARN  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reservation register conflicted with our own stale registration(s) [
+        0x26fb65c905ccbff1,
+    ] — a crashed incarnation's residue on a spec-strict target (SPDK-class Register semantics); unregistered them and registered fresh (single-writer guard register ladder)
+[2026-07-17T20:02:40Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: writer claim taken (id=4234179f-86ed-48de-8c2e-c108cfced416, mode=flock+pr)
+[2026-07-17T20:02:40Z INFO  squeezefs] meta volume /dev/nvme5n1: format=3 ledger_seq=19 replay_entries=0 replay_dropped_torn=0 replay_ms=4 free_extents=32636 next_ino=3 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=atomic4k writer_guard_mode=flock+pr
+[2026-07-17T20:02:40Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 32
+[2026-07-17T20:02:40Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-07-17T20:02:40Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=2, valid_inodes=2, layouts_found=1
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:40Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 2048 MiB (memory budget 78709 MiB)
+[2026-07-17T20:02:40Z INFO  squeezefs::fuse_client] SqueezeFS version 0.1.0 initializing mount
+[2026-07-17T20:02:40Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:40Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+[SIG] Registering signal handlers inside shutdown block...
+[SIG] Signal handlers registered successfully.
+[2026-07-17T20:02:40Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 0.1.0).
+squeezefs: mount ready (version 0.1.0, exe hint: rebuild target/release and reinstall)
+[2026-07-17T20:02:40Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x7ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 fd=36 sqpoll=off
+FUSE-over-io_uring session path armed (ready=true, queues=32)
+FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+SqueezeFS version 0.1.0
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            2.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme5n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme5n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/tmp/spdkscope/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-07-17T20:02:45Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-07-17T20:02:45Z INFO  squeezefs] Registering data volume 'nvme5n2' at path /dev/nvme5n2
+[2026-07-17T20:02:45Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reclaiming writer_claim from dead same-host holder (id=4234179f-86ed-48de-8c2e-c108cfced416, pid=230498 ESRCH, age=5s)
+[2026-07-17T20:02:45Z WARN  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: reservation register conflicted with our own stale registration(s) [
+        0x144ad9a83e8ea47c,
+    ] — a crashed incarnation's residue on a spec-strict target (SPDK-class Register semantics); unregistered them and registered fresh (single-writer guard register ladder)
+[2026-07-17T20:02:45Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme5n1: writer claim taken (id=1f321eac-34b8-4aa2-8dc2-3855fd73454a, mode=flock+pr)
+[2026-07-17T20:02:45Z INFO  squeezefs] meta volume /dev/nvme5n1: format=3 ledger_seq=21 replay_entries=0 replay_dropped_torn=0 replay_ms=3 free_extents=32636 next_ino=3 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=atomic4k writer_guard_mode=flock+pr
+[2026-07-17T20:02:45Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 32
+[2026-07-17T20:02:45Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-07-17T20:02:45Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=2, valid_inodes=2, layouts_found=1
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:45Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 2048 MiB (memory budget 78709 MiB)
+[2026-07-17T20:02:45Z INFO  squeezefs::fuse_client] SqueezeFS version 0.1.0 initializing mount
+[2026-07-17T20:02:45Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/tmp/spdkscope/mnt"...
+[2026-07-17T20:02:45Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+[SIG] Registering signal handlers inside shutdown block...
+[SIG] Signal handlers registered successfully.
+[2026-07-17T20:02:45Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 0.1.0).
+squeezefs: mount ready (version 0.1.0, exe hint: rebuild target/release and reinstall)
+[2026-07-17T20:02:45Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x7ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 fd=36 sqpoll=off
+FUSE-over-io_uring session path armed (ready=true, queues=32)
+FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+[2026-07-17T20:02:47Z INFO  squeezefs::fuse_client] FUSE Daemon: Destroying mount. Force flushing all staged and memory data...
+[2026-07-17T20:02:47Z INFO  squeezefs::fuse_client] FUSE Daemon: Force flushing all in-memory write buffers to local NVMe staging...
+[2026-07-17T20:02:47Z INFO  squeezefs::fuse_client] FUSE Daemon: All in-memory write buffers flushed to local NVMe staging.
+[2026-07-17T20:02:47Z INFO  squeezefs::fuse_client] FUSE Daemon: Force flushing all staged active blocks to NVMe-oF backend...
+[2026-07-17T20:02:47Z INFO  squeezefs::fuse_client] FUSE Daemon: No staged active blocks to flush.
+[2026-07-17T20:02:47Z INFO  squeezefs::fuse_client] FUSE Daemon: Dismount clean. All write staged blocks successfully flushed to backend.
+[2026-07-17T20:02:47Z INFO  squeezefs::fuse_client] FUSE session loop ended successfully.
+
+[!] The FUSE filesystem was unmounted externally (e.g. via umount). Squeezefs is now shutting down safely.
+

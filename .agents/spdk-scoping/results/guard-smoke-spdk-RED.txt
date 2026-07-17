@@ -1,0 +1,109 @@
+[guard-spdk] arm=spdk meta=/dev/nvme4n1 data=/dev/nvme4n2 loops=1 ptpl=0 2026-07-17T15:53:14-04:00
+[guard-spdk] binary: /tmp/sqz-red/target/release/squeezefs (924162c93311a14a0bcc83a3bc73f71e)
+[guard-spdk] 0. scrub: kill stale daemons, unmount, wipe superblocks
+$ dd if=/dev/zero of=/dev/nvme4n1 bs=1M count=16 oflag=direct
+16+0 records in
+16+0 records out
+16777216 bytes (17 MB, 16 MiB) copied, 0.00450125 s, 3.7 GB/s
+(rc=0)
+$ dd if=/dev/zero of=/dev/nvme4n2 bs=1M count=16 oflag=direct
+16+0 records in
+16+0 records out
+16777216 bytes (17 MB, 16 MiB) copied, 0.00794726 s, 2.1 GB/s
+(rc=0)
+[guard-spdk] 1. format + mount (cache-less)
+$ /tmp/sqz-red/target/release/squeezefs format sqmeta:///dev/nvme4n1 sqdata:///dev/nvme4n2 --force
+Total physical data volume capacity: 2.00 GiB
+SqueezeFS version 0.1.0
+======================================================================
+  Format Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            2.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme4n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme4n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+======================================================================
+Format complete.
+(rc=0)
+$ /tmp/sqz-red/target/release/squeezefs --log-file /tmp/spdkscope/daemon-spdk.log mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-spdk] PASS: writer_guard_mode=flock+pr (enforcement grade)
+$ dd if=/dev/urandom of=/tmp/spdkscope/mnt/smoke.bin bs=1M count=8
+8+0 records in
+8+0 records out
+8388608 bytes (8.4 MB, 8.0 MiB) copied, 0.0253895 s, 330 MB/s
+(rc=0)
+$ sync
+(rc=0)
+[guard-spdk] smoke.bin md5=0c274b26a0b1f569ecd95562a089e615
+[guard-spdk] 2. double-mount refusal while first daemon serves
+$ /tmp/sqz-red/target/release/squeezefs mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt2 --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt2"...
+Failed to start squeezefs daemon:
+Error: Invalid operation: kv metadata: /dev/nvme4n1: another squeezefs process holds the writer lock (claim: id=097d3464-54a9-4a98-bfdf-03763db6a93a, pid=216335, boot=44c91f20-6ee4-48c3-ac23-7bf8cdbe16b4, age=3s) — concurrent mounts of one metadata volume are refused (single-writer guard)
+(rc=1)
+[guard-spdk] PASS: double-mount refused naming the guard
+[guard-spdk] 3. claim clear refused while live-mounted
+$ /tmp/sqz-red/target/release/squeezefs claim clear sqmeta:///dev/nvme4n1
+[91mERROR[0m /dev/nvme4n1: /dev/nvme4n1: refusing to clear the writer claim — the volume is live-mounted on this host (the writer lock is held). Unmount it first
+Error: "claim clear refused/failed on 1 of 1 volume(s)"
+(rc=1)
+[guard-spdk] PASS: claim clear refused while live
+[guard-spdk] 4.1 kill -9 -> remount (cycle 1/1)
+$ /tmp/sqz-red/target/release/squeezefs --log-file /tmp/spdkscope/daemon-spdk.log mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+Failed to start squeezefs daemon:
+Error: Invalid operation: kv metadata: /dev/nvme4n1: reservation register failed on the PR-capable namespace: Invalid exchange (os error 52) (single-writer guard)
+--- daemon log tail (/tmp/spdkscope/daemon-spdk.log) ---
+Metadata Volumes:
+  - [enabled] /dev/nvme4n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme4n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/tmp/spdkscope/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-07-17T19:53:21Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-07-17T19:53:21Z INFO  squeezefs] Registering data volume 'nvme4n2' at path /dev/nvme4n2
+[2026-07-17T19:53:21Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme4n1: reclaiming writer_claim from dead same-host holder (id=097d3464-54a9-4a98-bfdf-03763db6a93a, pid=216335 ESRCH, age=6s)
+[91mERROR[0m mount refused: Invalid operation: kv metadata: /dev/nvme4n1: reservation register failed on the PR-capable namespace: Invalid exchange (os error 52) (single-writer guard)
+Error: InvalidOperation("kv metadata: /dev/nvme4n1: reservation register failed on the PR-capable namespace: Invalid exchange (os error 52) (single-writer guard)")
+(rc=1)
+[guard-spdk] FAIL: cycle 1: REMOUNT did not appear after kill -9
+$ timeout 30 /tmp/sqz-red/target/release/squeezefs mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+Failed to start squeezefs daemon:
+Error: Invalid operation: kv metadata: /dev/nvme4n1: reservation register failed on the PR-capable namespace: Invalid exchange (os error 52) (single-writer guard)
+(rc=1)
+[guard-spdk] FAIL: register ladder never fired on spdk (expected on strict Register)
+[guard-spdk] 6. clean unmount + claim clear no-op + zero PR residue
+$ umount /tmp/spdkscope/mnt
+umount: /tmp/spdkscope/mnt: not mounted.
+(rc=32)
+$ /tmp/sqz-red/target/release/squeezefs claim clear sqmeta:///dev/nvme4n1
+[91mERROR[0m /dev/nvme4n1: /dev/nvme4n1: refusing to clear the writer claim — the volume has live client registrations: ["client:b791f34b-7253-4399-9e0e-59589c00b233"]
+Error: "claim clear refused/failed on 1 of 1 volume(s)"
+(rc=1)
+[guard-spdk] FAIL: claim clear errored after clean unmount
+[guard-spdk] FAIL: PR residue after clean unmount (regctl=1)
+[guard-spdk] verdict: 4 failure(s)

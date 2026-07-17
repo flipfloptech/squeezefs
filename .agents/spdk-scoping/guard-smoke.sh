@@ -2,18 +2,25 @@
 # spdkscope writer-guard smoke — productized both-stack matrix for the
 # single-writer guard on fabric-served namespaces:
 #
-#   GUARD_ARM=spdk  (default)  SPDK v26.05 TCP target — SPEC-STRICT Register
-#   GUARD_ARM=nvmet            kernel nvmet TCP target — lenient IEKEY replace
+#   GUARD_ARM=spdk  (default)  SPDK v26.05 TCP target
+#   GUARD_ARM=nvmet            kernel nvmet TCP target
+#
+# The target's Register semantics (spec-strict conflict on a stale
+# different-key registration vs lenient in-place replace) are PROBED, not
+# assumed per arm: the 2026-07-17 ladder session measured BOTH SPDK
+# v26.05 AND kernel nvmet (7.1.3, nvmet pr.c) spec-strict — the M1-era
+# "nvmet replaces" note only ever covered same-key idempotency.
 #
 # Legs (each asserted; the script exits nonzero on any FAIL):
+#   0b. Register-semantics probe (nvme-cli, the daemon's register shape)
 #   1. format + mount, writer_guard_mode == flock+pr (enforcement grade)
 #   2. double-mount refusal while the first daemon serves
 #   3. claim clear refused while live-mounted
 #   4. kill -9 -> remount recovery, GUARD_KILL9_LOOPS times (default 1;
-#      data integrity md5-checked each cycle). On the spdk arm the remount
-#      exercises the PR register ladder (own-stale unregister); on nvmet
-#      the plain IEKEY fast path — the daemon log is checked for the
-#      expected divergence.
+#      data integrity md5-checked each cycle). On strict targets the
+#      remount must ride the PR register ladder (own-stale unregister,
+#      daemon-log hits >= 1); on lenient targets the plain fast path
+#      (0 hits) — asserted against the probed semantics.
 #   5. (GUARD_PTPL=1, spdk arm only) target power cycle while the holder
 #      is alive: save_config -> SIGKILL spdk_tgt -> relaunch -> load_config
 #      => holder keeps serving (no fail-stop; reservation restored from
@@ -47,27 +54,48 @@ pass() { log "PASS: $*"; }
 fail() { log "FAIL: $*"; FAILS=$((FAILS+1)); }
 run()  { echo "\$ $*" >> "$OUT"; "$@" >> "$OUT" 2>&1; local rc=$?; echo "(rc=$rc)" >> "$OUT"; return $rc; }
 is_mounted() { awk -v m="$MNT" '$2==m{f=1} END{exit !f}' /proc/mounts; }
-daemon_pid() { pgrep -f "squeezefs mount sqmeta://$META" | head -1; }
+daemon_pid() { pgrep -f "squeezefs.*mount sqmeta://$META" | head -1; }
 mount_it()   { RUST_LOG=info run "$SQZ" --log-file "$DLOG" mount "sqmeta://$META" "$MNT" --daemon --allow-other; }
 wait_mounted() { local i; for i in $(seq 1 60); do is_mounted && return 0; sleep 0.5; done; return 1; }
+stat_field() { # field -> first scalar (fields live under .metrics.*, arrays per volume)
+    jq -r ".metrics.$1[0] // .metrics.$1 // .$1[0] // .$1 // empty" "$MNT/.stats" 2>/dev/null
+}
 
 : > "$OUT"; : > "$DLOG"
 mkdir -p "$MNT" "$MNT2"
 log "arm=$ARM meta=$META data=$DATA loops=$LOOPS ptpl=$PTPL $(date -Is)"
 log "binary: $SQZ ($(md5sum "$SQZ" | cut -d' ' -f1))"
 
-log "0. scrub: kill stale daemons, unmount, wipe superblocks"
-pkill -f "squeezefs mount sqmeta://$META" && sleep 2
+log "0. scrub: kill stale daemons, unmount, wipe superblocks + PR residue"
+pkill -f "squeezefs.*mount sqmeta://$META" && sleep 2
 umount "$MNT" 2>/dev/null; umount -l "$MNT" 2>/dev/null; sleep 1
+# PR scrub: unregister every key this HOST holds (the crkey check makes
+# foreign attempts harmless conflicts; rig namespaces only ever see this
+# host, so this drains prior-session residue to regctl=0).
+for k in $(nvme resv-report "$META" --eds -o json 2>/dev/null | jq -r '.regctlext[]?.rkey'); do
+    run nvme resv-register "$META" --crkey="$k" --rrega=1
+done
 run dd if=/dev/zero of="$META" bs=1M count=16 oflag=direct
 run dd if=/dev/zero of="$DATA" bs=1M count=16 oflag=direct
+
+log "0b. Register-semantics probe (stale different-key register, the guard's shape)"
+run nvme resv-register "$META" --nrkey=0xA11CE --rrega=0 --iekey --cptpl=3
+if run nvme resv-register "$META" --nrkey=0xB0B --rrega=0 --iekey --cptpl=3; then
+    SEMANTICS=lenient   # different-key re-register replaced in place
+    run nvme resv-register "$META" --crkey=0xB0B --rrega=1
+else
+    SEMANTICS=strict    # spec-strict: Reservation Conflict
+    run nvme resv-register "$META" --crkey=0xA11CE --rrega=1
+fi
+run nvme resv-register "$META" --crkey=0xA11CE --rrega=1
+log "register semantics: $SEMANTICS"
 
 log "1. format + mount (cache-less)"
 run "$SQZ" format "sqmeta://$META" "sqdata://$DATA" --force || { fail "format"; exit 1; }
 mount_it
 wait_mounted || { fail "initial mount did not appear"; exit 1; }
 sleep 2
-MODE=$(jq -r '.writer_guard_mode[0] // .writer_guard_mode // empty' "$MNT/.stats" 2>/dev/null)
+MODE=$(stat_field writer_guard_mode)
 [ "$MODE" = "flock+pr" ] && pass "writer_guard_mode=flock+pr (enforcement grade)" \
                          || fail "writer_guard_mode=$MODE (want flock+pr)"
 run dd if=/dev/urandom of="$MNT/smoke.bin" bs=1M count=8
@@ -101,7 +129,7 @@ for i in $(seq 1 "$LOOPS"); do
     mount_it
     if wait_mounted; then
         sleep 2
-        MODE2=$(jq -r '.writer_guard_mode[0] // .writer_guard_mode // empty' "$MNT/.stats" 2>/dev/null)
+        MODE2=$(stat_field writer_guard_mode)
         MD5B=$(md5sum "$MNT/smoke.bin" 2>/dev/null | cut -d' ' -f1)
         [ "$MODE2" = "flock+pr" ] || fail "cycle $i: remount mode=$MODE2 (want flock+pr)"
         [ "$MD5B" = "$MD5" ] || fail "cycle $i: data integrity ($MD5B != $MD5)"
@@ -116,12 +144,12 @@ for i in $(seq 1 "$LOOPS"); do
 done
 
 LADDER_HITS=$(grep -c "register conflicted with our own stale" "$DLOG" 2>/dev/null || true)
-if [ "$ARM" = "spdk" ]; then
-    [ "${LADDER_HITS:-0}" -ge 1 ] && pass "register ladder fired on spdk remounts (log hits=$LADDER_HITS)" \
-                                  || fail "register ladder never fired on spdk (expected on strict Register)"
+if [ "$SEMANTICS" = "strict" ]; then
+    [ "${LADDER_HITS:-0}" -ge 1 ] && pass "register ladder fired on the strict target (log hits=$LADDER_HITS)" \
+                                  || fail "register ladder never fired on a strict target (expected per probe)"
 else
-    [ "${LADDER_HITS:-0}" -eq 0 ] && pass "register ladder did NOT fire on nvmet (lenient fast path, hits=0)" \
-                                  || fail "register ladder fired on nvmet (hits=$LADDER_HITS) — behavior divergence"
+    [ "${LADDER_HITS:-0}" -eq 0 ] && pass "register ladder did NOT fire on the lenient target (fast path, hits=0)" \
+                                  || fail "register ladder fired on a lenient target (hits=$LADDER_HITS) — divergence"
 fi
 
 if [ "$PTPL" = "1" ] && [ "$ARM" = "spdk" ]; then
@@ -144,8 +172,8 @@ if [ "$PTPL" = "1" ] && [ "$ARM" = "spdk" ]; then
         sleep 2
     done
     sleep 12   # one heartbeat re-check past reattach
-    FENCED=$(jq -r '.writer_guard_fenced[0] // .writer_guard_fenced // 0' "$MNT/.stats" 2>/dev/null)
-    REACQ=$(jq -r '.writer_guard_pr_reacquires[0] // .writer_guard_pr_reacquires // 0' "$MNT/.stats" 2>/dev/null)
+    FENCED=$(stat_field writer_guard_fenced)
+    REACQ=$(stat_field writer_guard_pr_reacquires)
     MD5C=$(md5sum "$MNT/smoke.bin" 2>/dev/null | cut -d' ' -f1)
     if [ -n "$OK" ] && [ "$MD5C" = "$MD5" ] && [ "${FENCED:-1}" = "0" ]; then
         pass "holder survived the target power cycle (PTPL; fenced=0, pr_reacquires=$REACQ, data intact)"
@@ -168,12 +196,20 @@ fi
 
 log "6. clean unmount + claim clear no-op + zero PR residue"
 run umount "$MNT"; sleep 1
-if run "$SQZ" claim clear "sqmeta://$META"; then
-    grep -q "no writer claim present" "$OUT" && pass "claim clear after clean unmount: no-op" \
-                                             || pass "claim clear rc=0 after clean unmount"
-else
-    fail "claim clear errored after clean unmount"
+# kill-9'd daemons orphan client:{uuid} heartbeat records; claim clear
+# REFUSES while any looks live (one staleness law, TTL 45 s) — first
+# prove the refusal against fresh orphans, then wait out the TTL and
+# prove the no-op.
+if ! run "$SQZ" claim clear "sqmeta://$META"; then
+    grep -q "live client registrations" "$OUT" \
+        && pass "claim clear refused under TTL-fresh crash-orphaned client records (staleness law)" \
+        || fail "claim clear errored for an unexpected reason"
+    log "waiting out the 45 s client TTL before the no-op check"
+    sleep 50
+    run "$SQZ" claim clear "sqmeta://$META" || fail "claim clear still refused after TTL"
 fi
+grep -q "no writer claim present" "$OUT" && pass "claim clear after clean unmount: no-op (claim was deleted at unmount)" \
+                                         || fail "claim clear did not report the no-op"
 REG=$(nvme resv-report "$META" --eds -o json 2>/dev/null | jq -r .regctl)
 [ "${REG:-x}" = "0" ] && pass "zero PR residue after clean unmount (regctl=0)" \
                       || fail "PR residue after clean unmount (regctl=$REG)"

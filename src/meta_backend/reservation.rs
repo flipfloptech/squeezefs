@@ -614,9 +614,13 @@ impl ReservationClient for NvmeReservationClient {
     }
 
     fn register(&self, key: u64) -> io::Result<()> {
-        // RREGA 0 (register) + IEKEY (bit 3: ignore existing key — makes
-        // re-registration after a crash idempotent) + CPTPL 11b (bits
-        // 31:30: persist through power loss where supported).
+        // RREGA 0 (register) + IEKEY (bit 3: ignore existing key) +
+        // CPTPL 11b (bits 31:30: persist through power loss where
+        // supported). NOTE (2026-07-17, guard-pr-register-ladder): IEKEY
+        // replace-on-register is NOT portable — spec-strict targets
+        // (SPDK v26.05 AND kernel nvmet ≥ its pr.c implementation, both
+        // measured) conflict on a different-key re-register; crash
+        // recovery is [`register_ladder`]'s job, never this shape's.
         let cptpl_set = 0b11u32 << 30;
         match self.resv_register(cptpl_set | 0x8, 0, key) {
             Ok(()) => Ok(()),

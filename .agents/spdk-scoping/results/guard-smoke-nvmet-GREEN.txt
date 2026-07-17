@@ -1,0 +1,157 @@
+[guard-nvmet] arm=nvmet meta=/dev/nvme5n1 data=/dev/nvme5n2 loops=10 ptpl=0 2026-07-17T16:01:52-04:00
+[guard-nvmet] binary: /home/justin/Source/squeezefs/target/release/squeezefs (0bdf8d25e31df69c39f27bddf5312313)
+[guard-nvmet] 0. scrub: kill stale daemons, unmount, wipe superblocks + PR residue
+$ nvme resv-register /dev/nvme5n1 --crkey=2831346481374941985 --rrega=1
+NVME Reservation  success
+(rc=0)
+$ dd if=/dev/zero of=/dev/nvme5n1 bs=1M count=16 oflag=direct
+16+0 records in
+16+0 records out
+16777216 bytes (17 MB, 16 MiB) copied, 0.0218287 s, 769 MB/s
+(rc=0)
+$ dd if=/dev/zero of=/dev/nvme5n2 bs=1M count=16 oflag=direct
+16+0 records in
+16+0 records out
+16777216 bytes (17 MB, 16 MiB) copied, 0.0169661 s, 989 MB/s
+(rc=0)
+[guard-nvmet] 0b. Register-semantics probe (stale different-key register, the guard's shape)
+$ nvme resv-register /dev/nvme5n1 --nrkey=0xA11CE --rrega=0 --iekey --cptpl=3
+NVME Reservation  success
+(rc=0)
+$ nvme resv-register /dev/nvme5n1 --nrkey=0xB0B --rrega=0 --iekey --cptpl=3
+NVMe status: Reservation Conflict: The command was aborted due to a conflict with a reservation held on the accessed namespace(0x4083)
+(rc=1)
+$ nvme resv-register /dev/nvme5n1 --crkey=0xA11CE --rrega=1
+NVME Reservation  success
+(rc=0)
+$ nvme resv-register /dev/nvme5n1 --crkey=0xA11CE --rrega=1
+NVMe status: Reservation Conflict: The command was aborted due to a conflict with a reservation held on the accessed namespace(0x4083)
+(rc=1)
+[guard-nvmet] register semantics: strict
+[guard-nvmet] 1. format + mount (cache-less)
+$ /home/justin/Source/squeezefs/target/release/squeezefs format sqmeta:///dev/nvme5n1 sqdata:///dev/nvme5n2 --force
+Total physical data volume capacity: 2.00 GiB
+SqueezeFS version 0.1.0
+======================================================================
+  Format Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            2.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme5n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme5n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+======================================================================
+Format complete.
+(rc=0)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-nvmet.log mount sqmeta:///dev/nvme5n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-nvmet] PASS: writer_guard_mode=flock+pr (enforcement grade)
+$ dd if=/dev/urandom of=/tmp/spdkscope/mnt/smoke.bin bs=1M count=8
+8+0 records in
+8+0 records out
+8388608 bytes (8.4 MB, 8.0 MiB) copied, 0.0266918 s, 314 MB/s
+(rc=0)
+$ sync
+(rc=0)
+[guard-nvmet] smoke.bin md5=df582b31302f069b086506211f5c151d
+[guard-nvmet] 2. double-mount refusal while first daemon serves
+$ /home/justin/Source/squeezefs/target/release/squeezefs mount sqmeta:///dev/nvme5n1 /tmp/spdkscope/mnt2 --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt2"...
+Failed to start squeezefs daemon:
+Error: Invalid operation: kv metadata: /dev/nvme5n1: another squeezefs process holds the writer lock (claim: id=65f878b4-3814-4212-a637-2735d2f6c42b, pid=229042, boot=44c91f20-6ee4-48c3-ac23-7bf8cdbe16b4, age=2s) — concurrent mounts of one metadata volume are refused (single-writer guard)
+(rc=1)
+[guard-nvmet] PASS: double-mount refused naming the guard
+[guard-nvmet] 3. claim clear refused while live-mounted
+$ /home/justin/Source/squeezefs/target/release/squeezefs claim clear sqmeta:///dev/nvme5n1
+[91mERROR[0m /dev/nvme5n1: /dev/nvme5n1: refusing to clear the writer claim — the volume is live-mounted on this host (the writer lock is held). Unmount it first
+Error: "claim clear refused/failed on 1 of 1 volume(s)"
+(rc=1)
+[guard-nvmet] PASS: claim clear refused while live
+[guard-nvmet] 4.1 kill -9 -> remount (cycle 1/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-nvmet.log mount sqmeta:///dev/nvme5n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-nvmet] PASS: cycle 1: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-nvmet] 4.2 kill -9 -> remount (cycle 2/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-nvmet.log mount sqmeta:///dev/nvme5n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-nvmet] PASS: cycle 2: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-nvmet] 4.3 kill -9 -> remount (cycle 3/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-nvmet.log mount sqmeta:///dev/nvme5n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-nvmet] PASS: cycle 3: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-nvmet] 4.4 kill -9 -> remount (cycle 4/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-nvmet.log mount sqmeta:///dev/nvme5n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-nvmet] PASS: cycle 4: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-nvmet] 4.5 kill -9 -> remount (cycle 5/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-nvmet.log mount sqmeta:///dev/nvme5n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-nvmet] PASS: cycle 5: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-nvmet] 4.6 kill -9 -> remount (cycle 6/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-nvmet.log mount sqmeta:///dev/nvme5n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-nvmet] PASS: cycle 6: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-nvmet] 4.7 kill -9 -> remount (cycle 7/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-nvmet.log mount sqmeta:///dev/nvme5n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-nvmet] PASS: cycle 7: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-nvmet] 4.8 kill -9 -> remount (cycle 8/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-nvmet.log mount sqmeta:///dev/nvme5n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-nvmet] PASS: cycle 8: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-nvmet] 4.9 kill -9 -> remount (cycle 9/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-nvmet.log mount sqmeta:///dev/nvme5n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-nvmet] PASS: cycle 9: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-nvmet] 4.10 kill -9 -> remount (cycle 10/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-nvmet.log mount sqmeta:///dev/nvme5n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-nvmet] PASS: cycle 10: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-nvmet] PASS: register ladder fired on the strict target (log hits=10)
+[guard-nvmet] 6. clean unmount + claim clear no-op + zero PR residue
+$ umount /tmp/spdkscope/mnt
+(rc=0)
+$ /home/justin/Source/squeezefs/target/release/squeezefs claim clear sqmeta:///dev/nvme5n1
+[91mERROR[0m /dev/nvme5n1: /dev/nvme5n1: refusing to clear the writer claim — the volume has live client registrations: ["client:7d7f51b4-626d-4fec-ad35-8c741f66d052", "client:2d5a8601-45ae-456a-84e8-9643f9526e1b", "client:93c552a9-38e6-4fc8-b98f-83181d845938", "client:9848e99d-d0c6-464e-bff8-134282a8a6a2", "client:c11ccec5-40bd-47ee-a334-f898294606b3", "client:e8f2426d-a64e-47cf-8c13-121da83c7d64", "client:e060c5a0-1fce-4b9c-8903-2a95957a947d", "client:c73315ef-c0b9-4b3b-ad64-4b7f37396164"]
+Error: "claim clear refused/failed on 1 of 1 volume(s)"
+(rc=1)
+[guard-nvmet] PASS: claim clear refused under TTL-fresh crash-orphaned client records (staleness law)
+[guard-nvmet] waiting out the 45 s client TTL before the no-op check
+$ /home/justin/Source/squeezefs/target/release/squeezefs claim clear sqmeta:///dev/nvme5n1
+/dev/nvme5n1: no writer claim present — nothing to clear
+(rc=0)
+[guard-nvmet] PASS: claim clear after clean unmount: no-op (claim was deleted at unmount)
+[guard-nvmet] PASS: zero PR residue after clean unmount (regctl=0)
+[guard-nvmet] verdict: 0 failure(s)

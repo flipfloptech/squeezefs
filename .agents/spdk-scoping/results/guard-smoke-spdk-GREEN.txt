@@ -1,0 +1,168 @@
+[guard-spdk] arm=spdk meta=/dev/nvme4n1 data=/dev/nvme4n2 loops=10 ptpl=1 2026-07-17T15:59:37-04:00
+[guard-spdk] binary: /home/justin/Source/squeezefs/target/release/squeezefs (0bdf8d25e31df69c39f27bddf5312313)
+[guard-spdk] 0. scrub: kill stale daemons, unmount, wipe superblocks + PR residue
+$ dd if=/dev/zero of=/dev/nvme4n1 bs=1M count=16 oflag=direct
+16+0 records in
+16+0 records out
+16777216 bytes (17 MB, 16 MiB) copied, 0.00710039 s, 2.4 GB/s
+(rc=0)
+$ dd if=/dev/zero of=/dev/nvme4n2 bs=1M count=16 oflag=direct
+16+0 records in
+16+0 records out
+16777216 bytes (17 MB, 16 MiB) copied, 0.00830516 s, 2.0 GB/s
+(rc=0)
+[guard-spdk] 0b. Register-semantics probe (stale different-key register, the guard's shape)
+$ nvme resv-register /dev/nvme4n1 --nrkey=0xA11CE --rrega=0 --iekey --cptpl=3
+NVME Reservation  success
+(rc=0)
+$ nvme resv-register /dev/nvme4n1 --nrkey=0xB0B --rrega=0 --iekey --cptpl=3
+NVMe status: Reservation Conflict: The command was aborted due to a conflict with a reservation held on the accessed namespace(0x83)
+(rc=1)
+$ nvme resv-register /dev/nvme4n1 --crkey=0xA11CE --rrega=1
+NVME Reservation  success
+(rc=0)
+$ nvme resv-register /dev/nvme4n1 --crkey=0xA11CE --rrega=1
+NVMe status: Reservation Conflict: The command was aborted due to a conflict with a reservation held on the accessed namespace(0x83)
+(rc=1)
+[guard-spdk] register semantics: strict
+[guard-spdk] 1. format + mount (cache-less)
+$ /home/justin/Source/squeezefs/target/release/squeezefs format sqmeta:///dev/nvme4n1 sqdata:///dev/nvme4n2 --force
+Total physical data volume capacity: 2.00 GiB
+SqueezeFS version 0.1.0
+======================================================================
+  Format Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            2.00 GiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme4n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme4n2 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+======================================================================
+Format complete.
+(rc=0)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-spdk.log mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-spdk] PASS: writer_guard_mode=flock+pr (enforcement grade)
+$ dd if=/dev/urandom of=/tmp/spdkscope/mnt/smoke.bin bs=1M count=8
+8+0 records in
+8+0 records out
+8388608 bytes (8.4 MB, 8.0 MiB) copied, 0.0262317 s, 320 MB/s
+(rc=0)
+$ sync
+(rc=0)
+[guard-spdk] smoke.bin md5=95ac6c8dcda277b6704dc0251565f70e
+[guard-spdk] 2. double-mount refusal while first daemon serves
+$ /home/justin/Source/squeezefs/target/release/squeezefs mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt2 --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt2"...
+Failed to start squeezefs daemon:
+Error: Invalid operation: kv metadata: /dev/nvme4n1: another squeezefs process holds the writer lock (claim: id=699d9e55-08c5-488a-ba62-b22ce4ce4baa, pid=226432, boot=44c91f20-6ee4-48c3-ac23-7bf8cdbe16b4, age=2s) — concurrent mounts of one metadata volume are refused (single-writer guard)
+(rc=1)
+[guard-spdk] PASS: double-mount refused naming the guard
+[guard-spdk] 3. claim clear refused while live-mounted
+$ /home/justin/Source/squeezefs/target/release/squeezefs claim clear sqmeta:///dev/nvme4n1
+[91mERROR[0m /dev/nvme4n1: /dev/nvme4n1: refusing to clear the writer claim — the volume is live-mounted on this host (the writer lock is held). Unmount it first
+Error: "claim clear refused/failed on 1 of 1 volume(s)"
+(rc=1)
+[guard-spdk] PASS: claim clear refused while live
+[guard-spdk] 4.1 kill -9 -> remount (cycle 1/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-spdk.log mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-spdk] PASS: cycle 1: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-spdk] 4.2 kill -9 -> remount (cycle 2/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-spdk.log mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-spdk] PASS: cycle 2: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-spdk] 4.3 kill -9 -> remount (cycle 3/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-spdk.log mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-spdk] PASS: cycle 3: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-spdk] 4.4 kill -9 -> remount (cycle 4/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-spdk.log mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-spdk] PASS: cycle 4: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-spdk] 4.5 kill -9 -> remount (cycle 5/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-spdk.log mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-spdk] PASS: cycle 5: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-spdk] 4.6 kill -9 -> remount (cycle 6/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-spdk.log mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-spdk] PASS: cycle 6: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-spdk] 4.7 kill -9 -> remount (cycle 7/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-spdk.log mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-spdk] PASS: cycle 7: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-spdk] 4.8 kill -9 -> remount (cycle 8/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-spdk.log mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-spdk] PASS: cycle 8: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-spdk] 4.9 kill -9 -> remount (cycle 9/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-spdk.log mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-spdk] PASS: cycle 9: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-spdk] 4.10 kill -9 -> remount (cycle 10/10)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-spdk.log mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-spdk] PASS: cycle 10: kill-9 -> remount recovered (flock+pr, data intact)
+[guard-spdk] PASS: register ladder fired on the strict target (log hits=10)
+[guard-spdk] 5. PTPL: target power cycle while holder ALIVE (save_config -> SIGKILL -> relaunch -> load_config)
+[guard-spdk] config saved (12457 B)
+[guard-spdk] spdk_tgt killed (pid 219781)
+$ /var/tmp/spdk-scoping/spdk/scripts/rpc.py -s /tmp/spdkscope/spdk.sock load_config -j /tmp/spdkscope/tgt-config.json
+Some configs were skipped because the RPC state that can call them passed over.
+(rc=0)
+[guard-spdk] spdk_tgt relaunched pid=228316 + config reloaded; waiting for initiator reattach
+[guard-spdk] PASS: holder survived the target power cycle (PTPL; fenced=0, pr_reacquires=0, data intact)
+[guard-spdk] 5b. kill -9 AFTER the power cycle -> remount (ladder against ptpl-restored state)
+$ /home/justin/Source/squeezefs/target/release/squeezefs --log-file /tmp/spdkscope/daemon-spdk.log mount sqmeta:///dev/nvme4n1 /tmp/spdkscope/mnt --daemon --allow-other
+Mounting Squeezefs at "/tmp/spdkscope/mnt"...
+[92mOK[0m Squeezefs is ready at "/tmp/spdkscope/mnt"
+(rc=0)
+[guard-spdk] PASS: post-power-cycle kill-9 remount recovered (data intact)
+[guard-spdk] 6. clean unmount + claim clear no-op + zero PR residue
+$ umount /tmp/spdkscope/mnt
+(rc=0)
+$ /home/justin/Source/squeezefs/target/release/squeezefs claim clear sqmeta:///dev/nvme4n1
+[91mERROR[0m /dev/nvme4n1: /dev/nvme4n1: refusing to clear the writer claim — the volume has live client registrations: ["client:1dcd5359-d7d5-4d7e-811b-f713e9eba095", "client:ce58a858-9a45-48b2-9ecc-5edaf1c315e0", "client:1f76024d-32e8-4165-8690-af066b78eac5", "client:71e22850-cbfa-458e-89f8-1799057af334", "client:2a3a22c0-96ed-43d1-bcb3-602ed4424d5d"]
+Error: "claim clear refused/failed on 1 of 1 volume(s)"
+(rc=1)
+[guard-spdk] PASS: claim clear refused under TTL-fresh crash-orphaned client records (staleness law)
+[guard-spdk] waiting out the 45 s client TTL before the no-op check
+$ /home/justin/Source/squeezefs/target/release/squeezefs claim clear sqmeta:///dev/nvme4n1
+/dev/nvme4n1: no writer claim present — nothing to clear
+(rc=0)
+[guard-spdk] PASS: claim clear after clean unmount: no-op (claim was deleted at unmount)
+[guard-spdk] PASS: zero PR residue after clean unmount (regctl=0)
+[guard-spdk] verdict: 0 failure(s)

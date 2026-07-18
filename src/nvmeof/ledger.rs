@@ -214,7 +214,7 @@ impl Ledger {
                     io::ErrorKind::AlreadyExists,
                     format!(
                         "subsystem '{}' is already in the share ledger (stack {}, state {}); \
-                         unshare it first: squeezefs storage nvmeof unshare {}",
+                         unshare it first: squeezefs nvmeof unshare {}",
                         holder.subnqn,
                         holder.stack.as_str(),
                         holder.state.as_str(),
@@ -231,7 +231,7 @@ impl Ledger {
                     format!(
                         "backing path '{}' is already shared under subsystem '{}' (stack {}, \
                          state {}) — the same backing must never be double-served, across \
-                         stacks included; unshare the holder first: squeezefs storage nvmeof \
+                         stacks included; unshare the holder first: squeezefs nvmeof \
                          unshare {}",
                         record.backing_canonical,
                         holder.subnqn,
@@ -313,6 +313,32 @@ impl Ledger {
                 .ok_or_else(|| not_found(subnqn, "set_loop_device"))?;
             record.loop_device = loop_device;
             Ok(())
+        })
+    }
+
+    /// General bookkeeping refresh under the same law-2 atomicity:
+    /// restore uses it to stamp an identity onto a pre-rebuild (N1-era)
+    /// record exactly once and to record freshly-allocated port ids for
+    /// records that predate the reserved-range allocator. The mutator
+    /// must never change `subnqn` (the record key) — validated after.
+    pub fn update_record(
+        &self,
+        subnqn: &str,
+        mutator: impl FnOnce(&mut ShareRecord),
+    ) -> io::Result<()> {
+        self.mutate(|shares| {
+            let record = shares
+                .iter_mut()
+                .find(|r| r.subnqn == subnqn)
+                .ok_or_else(|| not_found(subnqn, "update_record"))?;
+            mutator(record);
+            if record.subnqn != subnqn {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "update_record must not change the record key (subnqn)",
+                ));
+            }
+            record.validate()
         })
     }
 }

@@ -425,6 +425,13 @@ enum Commands {
         #[command(subcommand)]
         action: StorageActions,
     },
+    /// Configure and manage NVMe over Fabrics target shares and client
+    /// connections (dual-stack: SPDK default, kernel nvmet via
+    /// --target-stack nvmet)
+    Nvmeof {
+        #[command(subcommand)]
+        action: NvmeofActions,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -452,10 +459,6 @@ enum StorageActions {
     /// Manage storage volumes (LVM Logical Volumes)
     #[command(subcommand)]
     Volume(StorageVolumeActions),
-
-    /// Configure and manage NVMe over Fabrics targets and connections
-    #[command(subcommand)]
-    Nvmeof(NvmeofActions),
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -538,32 +541,83 @@ enum StorageVolumeActions {
     List,
 }
 
+/// `--target-stack` argument (§6.2 of the NVMe-oF target-management
+/// design): explicit selection, default `spdk`, loud failure — never a
+/// silent cross-stack fallback.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetStackArg {
+    Spdk,
+    Nvmet,
+}
+
+impl From<TargetStackArg> for squeezefs::nvmeof::StackKind {
+    fn from(v: TargetStackArg) -> Self {
+        match v {
+            TargetStackArg::Spdk => squeezefs::nvmeof::StackKind::Spdk,
+            TargetStackArg::Nvmet => squeezefs::nvmeof::StackKind::Nvmet,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug, Clone)]
 enum NvmeofActions {
-    /// Share a local disk or regular file as an NVMe-oF target subsystem
+    /// Share a local block device or regular file as an NVMe-oF target
+    /// subsystem (default target stack: spdk — kernel nvmet via
+    /// --target-stack nvmet)
     Share {
-        /// Local backing path (e.g. /dev/nvme1n1 or /tmp/testfile.img)
+        /// Local backing path (e.g. /dev/nvme1n1 or /srv/backing.img)
         backing_path: String,
-        /// Optional custom Subsystem NQN
+        /// Optional custom Subsystem NQN (default:
+        /// nqn.2026-07.io.squeezefs:share-<uuid>)
         #[arg(long)]
         subnqn: Option<String>,
-        /// Port to bind target listener to (default: 4420)
+        /// Port to bind target listeners to (default: 4420)
         #[arg(long, default_value_t = 4420)]
         port: u16,
-        /// IP address(es) to bind target to (comma-separated or multiple flags)
+        /// IP address(es) to bind listeners to (comma-separated or repeated)
         #[arg(long, required = true, value_delimiter = ',')]
         ip: Vec<String>,
-        /// Share target via user-space SPDK instead of kernel configfs
+        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default spdk)
+        #[arg(long, value_enum)]
+        target_stack: Option<TargetStackArg>,
+        /// Namespace id — SPDK-only; the kernel-nvmet namespace index is
+        /// structurally fixed at 1 (values != 1 with nvmet refuse loud)
         #[arg(long)]
-        spdk: bool,
+        nsid: Option<u32>,
+        /// Namespace identity UUID, recorded and re-presented by restore
+        /// on both stacks (generated once at share time when absent)
+        #[arg(long)]
+        ns_uuid: Option<String>,
+        /// Explicitly create a missing file backing as a sparse file of
+        /// this size (e.g. "10G") — missing backings otherwise refuse loud
+        #[arg(long)]
+        create_size: Option<String>,
+        /// Allow only these host NQNs to connect (repeatable; default:
+        /// allow-any — the trusted-fabric posture)
+        #[arg(long)]
+        allow_host: Vec<String>,
     },
-    /// Stop sharing an NVMe-oF target subsystem
+    /// Stop sharing a target subsystem (stack resolved from the share
+    /// ledger — never guessed; unledgered NQNs refuse loud)
     Unshare {
         /// Subsystem NQN to unshare
         subnqn: String,
-        /// Unshare target from user-space SPDK instead of kernel configfs
+    },
+    /// List ledgered shares reconciled against live target state
+    /// (managed / down / pending / removing / foreign) plus connected
+    /// remote fabric disks
+    List {
+        /// Emit machine-readable JSON
         #[arg(long)]
-        spdk: bool,
+        json: bool,
+    },
+    /// Re-establish ledgered shares on their recorded stacks (idempotent;
+    /// reconciles interrupted share/unshare intents; per-share report)
+    Restore {
+        /// Replay only records recorded for this stack (a filter, never a
+        /// retarget)
+        #[arg(long, value_enum)]
+        target_stack: Option<TargetStackArg>,
     },
     /// Connect local client to a remote NVMe-oF target
     Connect {
@@ -582,30 +636,6 @@ enum NvmeofActions {
         /// Subsystem NQN to disconnect
         subnqn: String,
     },
-    /// List locally shared targets and connected remote fabric disks
-    List,
-    /// Restore all locally registered persistent target shares
-    RestoreShares,
-    /// Install SPDK from source and set up dependencies
-    SpdkInstall,
-    /// Configure hugepages (e.g. 2GB or 4GB)
-    SpdkSetup {
-        /// Memory to allocate for hugepages (e.g. "2GB" or "4GB")
-        #[arg(long, default_value = "2GB")]
-        hugepages: String,
-    },
-    /// Bind a specific PCIe NVMe device to SPDK user-space driver
-    SpdkBind {
-        /// PCIe address of the device to bind (e.g. 0000:01:00.0)
-        pci: String,
-    },
-    /// Unbind a specific PCIe NVMe device from SPDK and return it to kernel control
-    SpdkUnbind {
-        /// PCIe address of the device to unbind (e.g. 0000:01:00.0)
-        pci: String,
-    },
-    /// Start the SPDK NVMe-oF target daemon (nvmf_tgt) in the background
-    SpdkStart,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1825,6 +1855,91 @@ fn parse_human_readable_size(s: &str) -> Result<u64, String> {
     Ok(base_val * multiplier)
 }
 
+/// The top-level `squeezefs nvmeof` dispatch (design §6.2 grammar). Kept
+/// out of the giant command match so the NvmeofError Display text — the
+/// designed loud-fail/runbook UX — can be rendered verbatim by the caller.
+fn dispatch_nvmeof(action: NvmeofActions) -> Result<(), squeezefs::nvmeof::stack::NvmeofError> {
+    use squeezefs::nvmeof::stack::NvmeofError;
+    match action {
+        NvmeofActions::Share {
+            backing_path,
+            subnqn,
+            port,
+            ip,
+            target_stack,
+            nsid,
+            ns_uuid,
+            create_size,
+            allow_host,
+        } => {
+            let create_size = match create_size {
+                Some(raw) => {
+                    // Accept both "10G" and "10GB" spellings.
+                    let normalized = raw.trim().trim_end_matches(['b', 'B']).to_string();
+                    Some(parse_human_readable_size(&normalized).map_err(|e| {
+                        NvmeofError::Refused(format!("--create-size '{raw}' is invalid: {e}"))
+                    })?)
+                }
+                None => None,
+            };
+            let record = squeezefs::nvmeof::share(&squeezefs::nvmeof::ShareOptions {
+                backing_path: backing_path.clone(),
+                subnqn,
+                port,
+                ips: ip.clone(),
+                stack: target_stack.map(Into::into),
+                nsid,
+                ns_uuid,
+                create_size,
+                allow_hosts: allow_host,
+            })?;
+            println!(
+                "Successfully shared '{}' as an NVMe-oF target ({} stack).",
+                backing_path,
+                record.stack.as_str()
+            );
+            println!("Subsystem NQN: {}", record.subnqn);
+            if let Some(u) = &record.ns_uuid {
+                println!("Namespace UUID: {u}");
+            }
+            println!("Connection string for client nodes:");
+            println!(
+                "  squeezefs nvmeof connect --ip {} --port {} --subnqn {}",
+                ip.first()
+                    .cloned()
+                    .unwrap_or_else(|| "<your-target-ip>".to_string()),
+                port,
+                record.subnqn
+            );
+        }
+        NvmeofActions::Unshare { subnqn } => {
+            squeezefs::nvmeof::unshare(&subnqn)?;
+            println!("Successfully stopped sharing target NQN '{}'.", subnqn);
+        }
+        NvmeofActions::List { json } => {
+            squeezefs::nvmeof::list(json)?;
+        }
+        NvmeofActions::Restore { target_stack } => {
+            squeezefs::nvmeof::restore(target_stack.map(Into::into))?;
+        }
+        NvmeofActions::Connect { ip, port, subnqn } => {
+            println!("Connecting to NVMe-oF target at {}:{}...", ip, port);
+            let dev = squeezefs::nvmeof::connect_target(&ip, port, &subnqn)?;
+            if dev.starts_with("/dev/") {
+                println!("{}", "Connection successful!".green().bold());
+                println!("Attached Remote Disk: {}", dev.cyan().bold());
+            } else {
+                println!("{}", dev.yellow());
+            }
+        }
+        NvmeofActions::Disconnect { subnqn } => {
+            squeezefs::nvmeof::disconnect_target(&subnqn)?;
+            println!("Successfully disconnected from target NQN '{}'.", subnqn);
+        }
+    }
+    Ok(())
+}
+
 async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Format {
@@ -2859,101 +2974,16 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     squeezefs::storage::volume_list()?;
                 }
             },
-            StorageActions::Nvmeof(nvmeof_action) => match nvmeof_action {
-                NvmeofActions::Share {
-                    backing_path,
-                    subnqn,
-                    port,
-                    ip,
-                    spdk,
-                } => {
-                    let resolved_nqn = if spdk {
-                        squeezefs::nvmeof::share_target_spdk(
-                            &backing_path,
-                            subnqn.as_deref(),
-                            port,
-                            &ip,
-                        )?
-                    } else {
-                        squeezefs::nvmeof::share_target(
-                            &backing_path,
-                            subnqn.as_deref(),
-                            port,
-                            &ip,
-                        )?
-                    };
-                    println!(
-                        "Successfully shared '{}' as {}NVMe-oF target.",
-                        backing_path,
-                        if spdk { "SPDK " } else { "" }
-                    );
-                    println!("Subsystem NQN: {}", resolved_nqn);
-                    println!("Connection string for client nodes:");
-                    println!(
-                        "  squeezefs storage nvmeof connect --ip {} --port {} --subnqn {}",
-                        ip.first()
-                            .cloned()
-                            .unwrap_or_else(|| "<your-target-ip>".to_string()),
-                        port,
-                        resolved_nqn
-                    );
-                }
-                NvmeofActions::Unshare { subnqn, spdk } => {
-                    // Stack dispatch is resolved from the share ledger
-                    // (docs/design-nvmeof-target-management.md §6.4); the
-                    // --spdk flag only matters for pre-N1 unledgered shares.
-                    squeezefs::nvmeof::unshare_target(&subnqn, spdk)?;
-                    println!("Successfully stopped sharing target NQN '{}'.", subnqn);
-                }
-                NvmeofActions::Connect { ip, port, subnqn } => {
-                    println!("Connecting to NVMe-oF target at {}:{}...", ip, port);
-                    let dev = squeezefs::nvmeof::connect_target(&ip, port, &subnqn)?;
-                    if dev.starts_with("/dev/") {
-                        println!("{}", "Connection successful!".green().bold());
-                        println!("Attached Remote Disk: {}", dev.cyan().bold());
-                    } else {
-                        println!("{}", dev.yellow());
-                    }
-                }
-                NvmeofActions::Disconnect { subnqn } => {
-                    squeezefs::nvmeof::disconnect_target(&subnqn)?;
-                    println!("Successfully disconnected from target NQN '{}'.", subnqn);
-                }
-                NvmeofActions::List => {
-                    squeezefs::nvmeof::list_nvmeof()?;
-                }
-                NvmeofActions::RestoreShares => {
-                    squeezefs::nvmeof::restore_shares()?;
-                    println!("All registered persistent target shares restored successfully.");
-                }
-                NvmeofActions::SpdkInstall => {
-                    squeezefs::nvmeof::spdk_install()?;
-                }
-                NvmeofActions::SpdkSetup { hugepages } => {
-                    let mb = match hugepages.as_str() {
-                        "2GB" | "2gb" => 2048,
-                        "4GB" | "4gb" => 4096,
-                        other => {
-                            return Err(format!(
-                                "Invalid hugepages value '{}'. Must be '2GB' or '4GB'.",
-                                other
-                            )
-                            .into());
-                        }
-                    };
-                    squeezefs::nvmeof::spdk_setup(mb)?;
-                }
-                NvmeofActions::SpdkBind { pci } => {
-                    squeezefs::nvmeof::spdk_bind(&pci)?;
-                }
-                NvmeofActions::SpdkUnbind { pci } => {
-                    squeezefs::nvmeof::spdk_unbind(&pci)?;
-                }
-                NvmeofActions::SpdkStart => {
-                    squeezefs::nvmeof::spdk_start()?;
-                }
-            },
         },
+        Commands::Nvmeof { action } => {
+            // The NvmeofError Display strings ARE the designed loud-fail /
+            // runbook UX (design §6.2/§6.3/§6.4) — render them verbatim,
+            // never through Debug.
+            if let Err(e) = dispatch_nvmeof(action) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
         Commands::Tune => {
             tune_system()?;
         }

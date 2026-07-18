@@ -25,33 +25,18 @@
 //! `reservation.rs::host_identity()` reads the same files — the files
 //! are the connect-time identity inputs, while `wire_host_id()` stays
 //! the registrant match authority, §6.7).
+//!
+//! N2 note: the `SQUEEZEFS_MOCK_NVMEOF*` env forks died with the §6.8
+//! zero-mock policy — these are the real paths only.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
 
-use super::{check_root, execute_cmd, is_mock};
+use super::{check_root, execute_cmd};
 
-pub(crate) fn sysfs_fabrics_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("SQUEEZEFS_MOCK_NVMEOF_FABRICS_DIR") {
-        PathBuf::from(dir)
-    } else if is_mock() {
-        PathBuf::from("/tmp/squeezefs_nvme_fabrics")
-    } else {
-        PathBuf::from("/sys/class/nvme-fabrics")
-    }
-}
-
-pub(crate) fn sysfs_nvme_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("SQUEEZEFS_MOCK_NVMEOF_NVME_DIR") {
-        PathBuf::from(dir)
-    } else if is_mock() {
-        PathBuf::from("/tmp/squeezefs_nvme")
-    } else {
-        PathBuf::from("/sys/class/nvme")
-    }
-}
+const SYSFS_NVME: &str = "/sys/class/nvme";
 
 fn get_host_id() -> String {
     if let Ok(content) = fs::read_to_string("/etc/nvme/hostid") {
@@ -80,7 +65,7 @@ fn get_host_nqn() -> String {
 }
 
 fn find_device_for_nqn(subnqn: &str) -> std::io::Result<Option<String>> {
-    let nvme_path = sysfs_nvme_path();
+    let nvme_path = PathBuf::from(SYSFS_NVME);
     if !nvme_path.exists() {
         return Ok(None);
     }
@@ -119,9 +104,6 @@ fn find_device_for_nqn(subnqn: &str) -> std::io::Result<Option<String>> {
     Ok(None)
 }
 
-static MOCK_WRITE_MUTEX: once_cell::sync::Lazy<std::sync::Mutex<()>> =
-    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(()));
-
 fn connect_target_single(
     ip: &str,
     port: u16,
@@ -129,12 +111,10 @@ fn connect_target_single(
     local_ip: Option<std::net::IpAddr>,
 ) -> std::io::Result<()> {
     check_root()?;
-    if !is_mock() {
-        let _ = execute_cmd("modprobe", &["nvme-tcp"]);
-    }
+    let _ = execute_cmd("modprobe", &["nvme-tcp"]);
 
     // Use nvme-cli connect if available
-    let has_nvme_cli = !is_mock() && Command::new("nvme").arg("--version").status().is_ok();
+    let has_nvme_cli = Command::new("nvme").arg("--version").status().is_ok();
 
     if has_nvme_cli {
         let port_str = port.to_string();
@@ -163,20 +143,14 @@ fn connect_target_single(
         }
     } else {
         // Fallback to direct fabrics write
-        let target_file = if is_mock() {
-            let fabrics_path = sysfs_fabrics_path();
-            fs::create_dir_all(&fabrics_path)?;
-            fabrics_path.join("ctl")
-        } else {
-            let dev_fabrics = PathBuf::from("/dev/nvme-fabrics");
-            if !dev_fabrics.exists() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "NVMe Fabrics interface (/dev/nvme-fabrics) not found. Please ensure 'nvme-tcp' module is loaded.",
-                ));
-            }
-            dev_fabrics
-        };
+        let dev_fabrics = PathBuf::from("/dev/nvme-fabrics");
+        if !dev_fabrics.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "NVMe Fabrics interface (/dev/nvme-fabrics) not found. Please ensure 'nvme-tcp' \
+                 module is loaded.",
+            ));
+        }
 
         let hostnqn = get_host_nqn();
         let hostid = get_host_id();
@@ -188,39 +162,7 @@ fn connect_target_single(
             ctrl_conn_str = format!("{},host_traddr={}", ctrl_conn_str, host_ip);
         }
 
-        if is_mock() {
-            let _lock = MOCK_WRITE_MUTEX.lock().unwrap();
-            let mut ctl_content = String::new();
-            if target_file.exists() {
-                ctl_content = fs::read_to_string(&target_file)?;
-            }
-            if !ctl_content.is_empty() {
-                ctl_content.push('\n');
-            }
-            ctl_content.push_str(&ctrl_conn_str);
-            fs::write(&target_file, &ctl_content)?;
-
-            // Find next available controller name (e.g. nvme0, nvme1, ...)
-            let mut ctrl_index = 0;
-            let nvme_path = sysfs_nvme_path();
-            while nvme_path.join(format!("nvme{}", ctrl_index)).exists() {
-                ctrl_index += 1;
-            }
-            let ctrl_dir = nvme_path.join(format!("nvme{}", ctrl_index));
-            fs::create_dir_all(&ctrl_dir)?;
-            fs::write(ctrl_dir.join("subsysnqn"), subnqn)?;
-            fs::write(
-                ctrl_dir.join("address"),
-                format!("traddr={},trsvcid={}", ip, port),
-            )?;
-            fs::write(ctrl_dir.join("delete_controller"), "")?;
-
-            // Create mock namespace
-            let ns_dev_dir = ctrl_dir.join(format!("nvme{}n1", ctrl_index));
-            fs::create_dir_all(&ns_dev_dir)?;
-        } else {
-            fs::write(&target_file, &ctrl_conn_str)?;
-        }
+        fs::write(&dev_fabrics, &ctrl_conn_str)?;
     }
     Ok(())
 }
@@ -237,15 +179,12 @@ pub fn connect_target(ip: &str, port: u16, subnqn: &str) -> std::io::Result<Stri
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    Ok(
-        "Connection requested. Check 'squeezefs storage nvmeof list' for device mapping."
-            .to_string(),
-    )
+    Ok("Connection requested. Check 'squeezefs nvmeof list' for device mapping.".to_string())
 }
 
 pub fn disconnect_target(subnqn: &str) -> std::io::Result<()> {
     check_root()?;
-    let nvme_path = sysfs_nvme_path();
+    let nvme_path = Path::new(SYSFS_NVME);
     if !nvme_path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -292,11 +231,18 @@ pub fn disconnect_target(subnqn: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The connected-fabric-disks half of `list` (kept initiator listing):
-/// prints each connected remote controller; returns whether any exist.
-pub(crate) fn print_connected_fabric_disks() -> std::io::Result<bool> {
-    let nvme_path = sysfs_nvme_path();
-    let mut initiator_found = false;
+/// One connected remote fabric controller, as `list` reports it.
+#[derive(Debug, Clone)]
+pub struct FabricDisk {
+    pub device: String,
+    pub subnqn: String,
+    pub address: String,
+}
+
+/// The connected-fabric-disks half of `list` (kept initiator listing).
+pub(crate) fn connected_fabric_disks() -> std::io::Result<Vec<FabricDisk>> {
+    let nvme_path = Path::new(SYSFS_NVME);
+    let mut out = Vec::new();
     if nvme_path.exists() {
         for entry in fs::read_dir(nvme_path)? {
             let entry = entry?;
@@ -312,15 +258,14 @@ pub(crate) fn print_connected_fabric_disks() -> std::io::Result<bool> {
                     } else {
                         "unknown".to_string()
                     };
-
-                    println!("  Device:  /dev/{}n1", dev_name);
-                    println!("  NQN:     {}", nqn);
-                    println!("  Target:  {}", addr);
-                    println!();
-                    initiator_found = true;
+                    out.push(FabricDisk {
+                        device: format!("/dev/{}n1", dev_name),
+                        subnqn: nqn,
+                        address: addr,
+                    });
                 }
             }
         }
     }
-    Ok(initiator_found)
+    Ok(out)
 }

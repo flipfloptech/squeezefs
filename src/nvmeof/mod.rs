@@ -1,33 +1,31 @@
-//! NVMe-oF target + initiator management (`squeezefs storage nvmeof …`).
+//! NVMe-oF target + initiator management (`squeezefs nvmeof …`).
 //!
-//! N1 state of the dual-stack target-management program
-//! (`docs/design-nvmeof-target-management.md`, PR 1): the module is split
-//! (`ledger` / `stack` / `initiator` / `nocow`), the **share ledger**
-//! (§6.4) is live as the record store for the existing verbs — `share`
-//! and `unshare` record/consult it through the write-ahead intent API,
-//! `restore-shares` replays it for nvmet, the ledger owns the
-//! loop-device association (the configfs fake-file *read* is gone; the
-//! never-fires loop-detach bug dies here) — and the dead code is purged
-//! (`extract_nvmeof_connection_details`, `SqueezefsError::NvmeOfBackend`,
-//! the `#![allow(clippy::all)]` exemption, the self-truncating
-//! `/etc/squeezefs/nvmeof_shares.json` registry).
+//! N2 state of the dual-stack target-management program
+//! (`docs/design-nvmeof-target-management.md`, PR 2): the kernel-nvmet
+//! target path is **rebuilt** (`nvmet::NvmetStack` — no fake configfs
+//! files, checked errors, `resv_enable` + `device_uuid` before enable,
+//! reserved-range port allocator, loop handling via the ledger) behind
+//! the finalized `TargetStack` trait (`stack.rs`), and the CLI moved to
+//! the top-level `squeezefs nvmeof` grammar (§6.2: `--target-stack`
+//! default **spdk**, which **fails loud** here with the milestone
+//! message until N3/N4 land SPDK lifecycle + sharing — the loud-fail UX
+//! is itself a deliverable). The pre-rebuild transitional paths (the
+//! collision-prone configfs share path, the raw SPDK RPC paths, the
+//! `spdk-*` lifecycle verbs, the silent sparse auto-create, and every
+//! `SQUEEZEFS_MOCK_NVMEOF*` fork) are **deleted** — the §6.8 zero-mock
+//! policy: unit tests ride injection seams (explicit configfs roots,
+//! relocated state dirs), never env behavior forks; correctness claims
+//! for target serving come from the real-kernel tiers.
 //!
-//! **Transitional (dies at N2/N3/N4):** the kernel-nvmet configfs share
-//! path, its collision-prone small-int port allocator, the configfs
-//! fake-file *write* (silently no-ops on real kernels; nothing reads it
-//! from N1 on), the silent sparse auto-create, the `SQUEEZEFS_MOCK_*`
-//! env forks, and the raw `spdk-*` lifecycle verbs below are the
-//! pre-rebuild paths, kept only until their rebuild PRs land. They are
-//! JuiceFS-derived (Apache-2.0) — the retained keeper files
-//! (`initiator.rs`, `nocow.rs`) carry the license header per the §6.1
-//! provenance note. Ownership is **ledger membership**, never NQN
-//! prefix: N1-era records keep the old-style default NQNs and remain
-//! fully managed at N2+.
+//! Kept: the client/initiator half (`initiator.rs` — binding decision 3)
+//! and the NoCOW guard (`nocow.rs`). Ownership is **ledger membership**,
+//! never NQN prefix: N1-era records keep old-style NQNs and remain fully
+//! managed; the `share-` prefix is only the classification heuristic for
+//! unledgered live objects.
 //!
 //! io_uring note: everything here is one-shot mount-time/admin control
-//! plane (configfs writes, JSON-RPC over a unix socket, nvme-cli
-//! shell-outs) — the sanctioned `reservation.rs` precedent; no data path
-//! is touched.
+//! plane (configfs writes, nvme-cli/losetup shell-outs) — the sanctioned
+//! `reservation.rs` precedent; no data path is touched.
 
 pub mod initiator;
 pub mod ledger;
@@ -37,6 +35,7 @@ pub mod stack;
 
 pub use initiator::{connect_target, disconnect_target};
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -44,7 +43,10 @@ use std::process::Command;
 use uuid::Uuid;
 
 use ledger::Ledger;
-use stack::{Listener, NvmeofError, ShareRecord, ShareState};
+use stack::{
+    Listener, LiveShare, NvmeofError, PreflightError, PreflightOp, RestoreOutcome, ShareRecord,
+    ShareRequest, ShareState, TargetStack,
+};
 
 /// Which target stack owns a share for its lifetime
 /// (`docs/design-nvmeof-target-management.md` §6.1/§6.4 — the ledger's
@@ -87,8 +89,92 @@ pub const TARGET_STACK_ENV: &str = "SQUEEZEFS_NVMEOF_TARGET_STACK";
 /// > default `spdk`. An unparseable env value refuses loud — never a
 /// silent default.
 pub fn resolve_stack(flag: Option<StackKind>) -> Result<StackKind, NvmeofError> {
-    let _ = flag;
-    unimplemented!("PR 2 (N2) RED: resolve_stack")
+    if let Some(kind) = flag {
+        return Ok(kind);
+    }
+    match std::env::var(TARGET_STACK_ENV) {
+        Ok(v) if !v.is_empty() => v.parse::<StackKind>().map_err(|e| {
+            NvmeofError::Refused(format!(
+                "{TARGET_STACK_ENV}='{v}' is invalid: {e} — SqueezeFS never falls back to a \
+                 default on a malformed selection"
+            ))
+        }),
+        _ => Ok(StackKind::Spdk),
+    }
+}
+
+/// The N2 SPDK loud-fail (§6.2/§6.3 + PR-plan PR 2): the default stack is
+/// spdk, whose target management lands with the N3 (lifecycle) / N4
+/// (share path) milestones — until then every SPDK-selected verb fails
+/// LOUD with this designed preflight message. Only the remediation text
+/// changes when N3/N4 land.
+fn spdk_unavailable() -> PreflightError {
+    PreflightError {
+        message: "error: SPDK target stack unavailable: SPDK target management lands with the \
+                  next milestone of this program (design milestones N3/N4 — \
+                  docs/design-nvmeof-target-management.md)\n  select the kernel target stack \
+                  explicitly:\n    sudo squeezefs nvmeof <verb> … --target-stack nvmet\n    \
+                  (or export SQUEEZEFS_NVMEOF_TARGET_STACK=nvmet)\n  or install/start the SPDK \
+                  target once available:\n    sudo squeezefs nvmeof target install    (lands \
+                  with N3)\n    sudo squeezefs nvmeof target start      (lands with N3)\nnote: \
+                  SqueezeFS never falls back between target stacks automatically —\n      they \
+                  differ in reservation persistence (PTPL) and latency envelope."
+            .to_string(),
+    }
+}
+
+/// Constructs the selected stack. The SPDK arm is the N2 loud-fail; it
+/// becomes a real `SpdkStack` at N3/N4 (§Migration pt 3: between N2 and
+/// N4, SPDK target serving is deliberately unavailable on `dev`).
+fn stack_for(kind: StackKind) -> Result<Box<dyn TargetStack>, NvmeofError> {
+    match kind {
+        StackKind::Nvmet => Ok(Box::new(nvmet::NvmetStack::open_default()?)),
+        StackKind::Spdk => Err(NvmeofError::Preflight(spdk_unavailable())),
+    }
+}
+
+pub(crate) fn check_root() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if unsafe { libc::getuid() } != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "This command requires root privileges. Please run with sudo.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn execute_cmd(cmd_name: &str, args: &[&str]) -> io::Result<String> {
+    let output = Command::new(cmd_name).args(args).output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "Command {} failed: {}",
+            cmd_name,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// First-mutating-verb hook of the §6.4 old-registry migration. Rides
+/// the state-dir relocation seam (§6.8): a relocated
+/// `SQUEEZEFS_NVMEOF_STATE_DIR` means "not this host's production state",
+/// so the production-migration rename of the host's
+/// `/etc/squeezefs/nvmeof_shares.json` is skipped — a test run must
+/// never mutate live host files outside its relocated state surface.
+fn retire_old_registry_once() {
+    if std::env::var(ledger::STATE_DIR_ENV).is_ok_and(|v| !v.is_empty()) {
+        return;
+    }
+    ledger::retire_old_registry(Path::new(ledger::OLD_REGISTRY_PATH));
+}
+
+fn canonical_or_raw(path: &str) -> String {
+    fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
 }
 
 /// §6.2 per-stack flag semantics (rev-3 issue 23): `--ns-uuid` seeds the
@@ -101,17 +187,75 @@ pub fn validate_share_flags(
     nsid: Option<u32>,
     ns_uuid: Option<&str>,
 ) -> Result<(), NvmeofError> {
-    let _ = (stack, nsid, ns_uuid);
-    unimplemented!("PR 2 (N2) RED: validate_share_flags")
+    if stack == StackKind::Nvmet {
+        if let Some(n) = nsid {
+            if n != 1 {
+                return Err(NvmeofError::Refused(format!(
+                    "--nsid is SPDK-only: the kernel-nvmet namespace index is structurally \
+                     fixed at 1 (one namespace per subsystem — \
+                     docs/design-nvmeof-target-management.md §6.6), got --nsid {n} with \
+                     --target-stack nvmet.\n  drop the flag (or pass --nsid 1, the structural \
+                     index); multi-namespace nvmet subsystems would be a schema-visible format \
+                     change, never a silent flag reinterpretation"
+                )));
+            }
+        }
+    }
+    if let Some(raw) = ns_uuid {
+        Uuid::parse_str(raw).map_err(|e| {
+            NvmeofError::Refused(format!(
+                "--ns-uuid '{raw}' is not a valid UUID ({e}) — it seeds the recorded namespace \
+                 identity on both stacks and must be well-formed"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// §6.2 backing preparation (both stacks): a missing path refuses loud
 /// (the silent 1 GiB sparse auto-create is dead — `--create-size` is the
 /// explicit opt-in), directories refuse, and regular-file backings get
-/// the NoCOW guard.
+/// the NoCOW guard (a btrfs-CoW backing silently downgrades O_DIRECT to
+/// buffered and wedges the fabric under write load).
 pub fn prepare_backing(backing_path: &str, create_size: Option<u64>) -> io::Result<()> {
-    let _ = (backing_path, create_size);
-    unimplemented!("PR 2 (N2) RED: prepare_backing")
+    let path = PathBuf::from(backing_path);
+    if !path.exists() {
+        match create_size {
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "backing path '{backing_path}' does not exist — SqueezeFS never \
+                         auto-creates backings (a typo must not conjure a device); pass \
+                         --create-size <size> to create it as a sparse file explicitly"
+                    ),
+                ));
+            }
+            Some(size) => {
+                let f = fs::File::create(&path).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("cannot create backing file '{backing_path}': {e}"),
+                    )
+                })?;
+                f.set_len(size)?;
+                println!("Created sparse backing file '{backing_path}' ({size} bytes).");
+            }
+        }
+    }
+    if path.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "backing path '{backing_path}' is a directory — share a block device or a \
+                     regular file"
+            ),
+        ));
+    }
+    if path.is_file() {
+        nocow::ensure_nocow_backing(&path)?;
+    }
+    Ok(())
 }
 
 /// Everything the `nvmeof share` verb collects from the CLI (§6.2 share
@@ -135,1273 +279,368 @@ pub struct ShareOptions {
     pub allow_hosts: Vec<String>,
 }
 
+fn validate_nqn_component(what: &str, value: &str) -> Result<(), NvmeofError> {
+    if value.is_empty() || value.contains('/') || value.chars().any(char::is_whitespace) {
+        return Err(NvmeofError::Refused(format!(
+            "{what} '{value}' is not a valid NQN (must be non-empty, no '/' or whitespace — it \
+             names a configfs object)"
+        )));
+    }
+    Ok(())
+}
+
 /// The `nvmeof share` verb (§6.2): grammar validation → stack resolution
 /// (SPDK fails loud until N3/N4) → root → backing preparation → the
 /// selected stack's share flow (intent protocol + live-state duplicate
 /// guard inside).
 pub fn share(opts: &ShareOptions) -> Result<ShareRecord, NvmeofError> {
-    let _ = opts;
-    unimplemented!("PR 2 (N2) RED: share")
+    // Grammar rungs first (pure argument semantics — before root, before
+    // any side effect).
+    let kind = resolve_stack(opts.stack)?;
+    validate_share_flags(kind, opts.nsid, opts.ns_uuid.as_deref())?;
+    if opts.ips.is_empty() {
+        return Err(NvmeofError::Refused(
+            "at least one --ip listener address is required".to_string(),
+        ));
+    }
+    let mut listeners = Vec::new();
+    for ip in &opts.ips {
+        nvmet::adrfam_of(ip)?; // loud on malformed addresses, both stacks
+        let listener = Listener {
+            ip: ip.clone(),
+            port: opts.port,
+            nvmet_port_id: None,
+        };
+        if listeners.contains(&listener) {
+            return Err(NvmeofError::Refused(format!(
+                "duplicate listener {ip}:{} — each (ip, port) pair may appear once",
+                opts.port
+            )));
+        }
+        listeners.push(listener);
+    }
+    for host in &opts.allow_hosts {
+        validate_nqn_component("--allow-host", host)?;
+    }
+    if let Some(subnqn) = &opts.subnqn {
+        validate_nqn_component("--subnqn", subnqn)?;
+    }
+
+    let stack = stack_for(kind)?;
+    check_root()?;
+    stack.preflight(PreflightOp::Share)?;
+    retire_old_registry_once();
+
+    prepare_backing(&opts.backing_path, opts.create_size)?;
+
+    let subnqn = match &opts.subnqn {
+        Some(s) => s.clone(),
+        // The N2+ ownership-prefix default (§6.2) — distinguishable from
+        // devsub/foreign objects; classification of unledgered live
+        // objects only, never an ownership test.
+        None => format!("nqn.2026-07.io.squeezefs:share-{}", Uuid::new_v4()),
+    };
+    let ns_uuid = match &opts.ns_uuid {
+        Some(raw) => Uuid::parse_str(raw)
+            .map_err(|e| NvmeofError::Refused(format!("--ns-uuid '{raw}': {e}")))?
+            .to_string(),
+        None => Uuid::new_v4().to_string(),
+    };
+
+    let request = ShareRequest {
+        subnqn,
+        backing_canonical: canonical_or_raw(&opts.backing_path),
+        backing_path: opts.backing_path.clone(),
+        ns_uuid,
+        listeners,
+        allow_hosts: opts.allow_hosts.clone(),
+    };
+    let record = stack.share(&request)?;
+    log::info!(
+        "nvmeof share: stack={} nqn={} backing={} ns_uuid={} listeners={} allow_hosts={}",
+        record.stack.as_str(),
+        record.subnqn,
+        record.backing_path,
+        record.ns_uuid.as_deref().unwrap_or("-"),
+        record
+            .listeners
+            .iter()
+            .map(|l| format!("{}:{}#{}", l.ip, l.port, l.nvmet_port_id.unwrap_or(0)))
+            .collect::<Vec<_>>()
+            .join(","),
+        record.allow_hosts.len(),
+    );
+    Ok(record)
 }
 
 /// The `nvmeof unshare` verb (§6.2): stack resolved from the ledger —
-/// including `pending`/`removing` intent records; an NQN absent from the
+/// including `pending`/`removing` intent records (§6.4 law 6: a
+/// crash-window share is still ours to remove); an NQN absent from the
 /// ledger refuses loud with `list` guidance (we never tear down objects
-/// we did not record).
+/// we did not record — the dev_substrate ownership law).
 pub fn unshare(subnqn: &str) -> Result<(), NvmeofError> {
-    let _ = subnqn;
-    unimplemented!("PR 2 (N2) RED: unshare")
+    check_root()?;
+    retire_old_registry_once();
+    let ledger = Ledger::open_default();
+    match ledger.find(subnqn).map_err(NvmeofError::Io)? {
+        Some(record) => {
+            let stack = stack_for(record.stack)?;
+            stack.preflight(PreflightOp::Unshare)?;
+            stack.unshare(&record)?;
+            Ok(())
+        }
+        None => Err(NvmeofError::Refused(format!(
+            "subsystem '{subnqn}' is not in the share ledger — SqueezeFS never tears down \
+             target objects it did not record (ownership = ledger membership).\n  inspect \
+             managed + live state:  sudo squeezefs nvmeof list\n  pre-rebuild or foreign \
+             kernel-nvmet objects are removed manually via configfs:\n    rm  \
+             {root}/ports/<id>/subsystems/{subnqn}    (for each port linking it)\n    echo 0 > \
+             {root}/subsystems/{subnqn}/namespaces/1/enable\n    rmdir \
+             {root}/subsystems/{subnqn}/namespaces/1\n    rmdir {root}/subsystems/{subnqn}",
+            root = nvmet::NVMET_CONFIGFS_ROOT
+        ))),
+    }
+}
+
+/// The `nvmeof restore` verb (§6.2): bare replays EVERY ledger record
+/// into its recorded stack; `--target-stack X` filters, never retargets.
+/// Reconciles §6.4 law-6 intents; per-share report; idempotent. Exits
+/// nonzero when any record failed.
+pub fn restore(filter: Option<StackKind>) -> Result<(), NvmeofError> {
+    // An explicit SPDK filter selects a stack that cannot restore yet:
+    // loud milestone failure (§Migration pt 3), not a silent no-op.
+    // (When N4 lands, this gate is replaced by the real SPDK restore
+    // dispatch — stack_for's SPDK arm stops failing.)
+    if filter == Some(StackKind::Spdk) {
+        stack_for(StackKind::Spdk)?;
+    }
+    check_root()?;
+    retire_old_registry_once();
+    let ledger = Ledger::open_default();
+    let records = ledger.load().map_err(NvmeofError::Io)?;
+    if records.is_empty() {
+        println!("No NVMe-oF target shares to restore.");
+        return Ok(());
+    }
+
+    // Bare `restore` replays every record into its RECORDED stack; a
+    // filter selects records recorded for that stack, never retargets.
+    let selected = |kind: StackKind| filter.is_none() || filter == Some(kind);
+
+    let mut failures = 0usize;
+    let mut replayed = 0usize;
+    let nvmet_records: Vec<ShareRecord> = records
+        .iter()
+        .filter(|r| r.stack == StackKind::Nvmet)
+        .cloned()
+        .collect();
+    if selected(StackKind::Nvmet) && !nvmet_records.is_empty() {
+        let stack = stack_for(StackKind::Nvmet)?;
+        stack.preflight(PreflightOp::Restore)?;
+        let report = stack.restore(&nvmet_records)?;
+        for entry in &report.entries {
+            replayed += 1;
+            let line = match &entry.outcome {
+                RestoreOutcome::Restored => "restored".to_string(),
+                RestoreOutcome::VerifiedNoop => "already live — verified no-op".to_string(),
+                RestoreOutcome::FinalizedPending => {
+                    "pending intent finalized (live objects exist)".to_string()
+                }
+                RestoreOutcome::GarbageCollectedPending => {
+                    "pending intent garbage-collected (no live objects)".to_string()
+                }
+                RestoreOutcome::TeardownResumed => {
+                    "interrupted teardown resumed; record removed".to_string()
+                }
+                RestoreOutcome::Skipped(why) => format!("skipped: {why}"),
+                RestoreOutcome::Failed(why) => {
+                    failures += 1;
+                    format!("FAILED: {why}")
+                }
+            };
+            println!("restore {}: {line}", entry.subnqn);
+        }
+    }
+
+    if selected(StackKind::Spdk) {
+        for rec in records.iter().filter(|r| r.stack == StackKind::Spdk) {
+            println!(
+                "restore {}: skipped — SPDK restore rides SPDK-native save_config/load_config \
+                 from the SPDK milestones of this program (N3/N4); the ledger record is kept \
+                 for ownership and unshare dispatch",
+                rec.subnqn
+            );
+        }
+    }
+
+    if failures > 0 {
+        return Err(NvmeofError::Refused(format!(
+            "{failures} of {replayed} replayed ledger share(s) failed to restore — see the \
+             per-share report above"
+        )));
+    }
+    Ok(())
+}
+
+/// Reconciliation classification of one ledger record for `list` (§6.2).
+fn classification_of(record: &ShareRecord, live: bool) -> &'static str {
+    match (record.stack, record.state, live) {
+        (StackKind::Spdk, _, _) => "unverified (SPDK stack management lands at N3/N4)",
+        (_, ShareState::Pending, _) => {
+            "pending — interrupted share; `nvmeof restore` finalizes or garbage-collects it"
+        }
+        (_, ShareState::Removing, _) => {
+            "removing — interrupted unshare; `nvmeof restore` resumes the teardown"
+        }
+        (_, ShareState::Active, true) => "managed",
+        (_, ShareState::Active, false) => "down — restore candidate (`nvmeof restore`)",
+    }
 }
 
 /// The `nvmeof list` verb (§6.2): ledger ∪ live-state reconciliation —
 /// managed / down / pending / removing / foreign — plus the kept
 /// connected-fabric-disks section.
 pub fn list(json: bool) -> Result<(), NvmeofError> {
-    let _ = json;
-    unimplemented!("PR 2 (N2) RED: list")
-}
+    check_root()?;
+    let ledger = Ledger::open_default();
+    let records = ledger.load().map_err(NvmeofError::Io)?;
 
-/// The `nvmeof restore` verb (§6.2): bare replays EVERY ledger record
-/// into its recorded stack; `--target-stack X` filters, never retargets.
-/// Reconciles §6.4 law-6 intents; per-share report; idempotent.
-pub fn restore(filter: Option<StackKind>) -> Result<(), NvmeofError> {
-    let _ = filter;
-    unimplemented!("PR 2 (N2) RED: restore")
-}
+    let stack = nvmet::NvmetStack::open_default()?;
+    stack.preflight(PreflightOp::List)?;
+    let live = stack.live_shares()?;
+    let live_by_nqn: HashMap<&str, &LiveShare> =
+        live.iter().map(|l| (l.subnqn.as_str(), l)).collect();
 
-pub(crate) fn is_mock() -> bool {
-    std::env::var("SQUEEZEFS_MOCK_NVMEOF").is_ok()
-}
+    let connected = initiator::connected_fabric_disks().map_err(NvmeofError::Io)?;
 
-pub(crate) fn check_root() -> io::Result<()> {
-    if is_mock() {
+    if json {
+        let shares: Vec<serde_json::Value> = records
+            .iter()
+            .map(|r| {
+                let is_live = live_by_nqn.contains_key(r.subnqn.as_str());
+                let mut v = serde_json::to_value(r).unwrap_or_else(|_| serde_json::json!({}));
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert(
+                        "classification".to_string(),
+                        serde_json::Value::String(classification_of(r, is_live).to_string()),
+                    );
+                    obj.insert("live".to_string(), serde_json::Value::Bool(is_live));
+                }
+                v
+            })
+            .collect();
+        let foreign: Vec<serde_json::Value> = live
+            .iter()
+            .filter(|l| !records.iter().any(|r| r.subnqn == l.subnqn))
+            .map(|l| {
+                serde_json::json!({
+                    "subnqn": l.subnqn,
+                    "device_path": l.device_path,
+                    "backing_canonical": l.backing_canonical,
+                    "ns_uuid": l.ns_uuid,
+                    "enabled": l.enabled,
+                    "listeners": l.listeners.iter().map(|x| serde_json::json!({
+                        "ip": x.ip, "port": x.port, "nvmet_port_id": x.nvmet_port_id,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let connected_json: Vec<serde_json::Value> = connected
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "device": d.device, "subnqn": d.subnqn, "address": d.address,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "shares": shares,
+                "foreign_live": foreign,
+                "connected_fabric_disks": connected_json,
+            }))
+            .map_err(|e| NvmeofError::Io(io::Error::other(e)))?
+        );
         return Ok(());
     }
-    #[cfg(unix)]
-    {
-        if unsafe { libc::getuid() } != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "This command requires root privileges. Please run with sudo.",
-            ));
-        }
+
+    println!("=== Managed NVMe-oF Target Shares (ledger ∪ live state) ===");
+    if records.is_empty() {
+        println!("  (no ledgered shares)");
     }
-    Ok(())
-}
-
-fn configfs_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("SQUEEZEFS_MOCK_NVMEOF_DIR") {
-        PathBuf::from(dir)
-    } else if is_mock() {
-        PathBuf::from("/tmp/squeezefs_nvmet")
-    } else {
-        PathBuf::from("/sys/kernel/config/nvmet")
-    }
-}
-
-pub(crate) fn execute_cmd(cmd_name: &str, args: &[&str]) -> io::Result<String> {
-    if is_mock() {
-        return Ok(String::new());
-    }
-    let output = Command::new(cmd_name).args(args).output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "Command {} failed: {}",
-            cmd_name,
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// First-mutating-verb hook of the §6.4 old-registry migration; skipped
-/// in mock mode so tests never touch host `/etc` state (the whole mock
-/// fork dies at N2).
-fn retire_old_registry_once() {
-    if !is_mock() {
-        ledger::retire_old_registry(Path::new(ledger::OLD_REGISTRY_PATH));
-    }
-}
-
-fn canonical_or_raw(path: &str) -> String {
-    fs::canonicalize(path)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| path.to_string())
-}
-
-/// Pre-side-effect duplicate refusal (before the transitional sparse
-/// auto-create can fire). `Ledger::begin_share` re-checks the same laws
-/// atomically under the ledger flock — this is the polite early exit,
-/// that is the authority.
-fn ledger_duplicate_precheck(
-    ledger: &Ledger,
-    subnqn_opt: Option<&str>,
-    backing_path: &str,
-    canonical: &str,
-) -> io::Result<()> {
-    for share in ledger.load()? {
-        if share.backing_canonical == canonical || share.backing_path == backing_path {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "Backing path '{}' is already shared under subsystem '{}' (stack {}, state \
-                     {}); unshare it first: squeezefs storage nvmeof unshare {}",
-                    backing_path,
-                    share.subnqn,
-                    share.stack.as_str(),
-                    share.state.as_str(),
-                    share.subnqn
-                ),
-            ));
-        }
-        if subnqn_opt == Some(share.subnqn.as_str()) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "Subsystem '{}' is already in the share ledger (stack {}, state {})",
-                    share.subnqn,
-                    share.stack.as_str(),
-                    share.state.as_str()
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn pending_record(
-    subnqn: &str,
-    stack: StackKind,
-    backing_path: &str,
-    canonical: &str,
-    port: u16,
-    ips: &[String],
-) -> ShareRecord {
-    // N1 transitional presence (§6.4 / PR-plan PR 1): required fields +
-    // `loop_device` (recorded once losetup ran); `nvmet_port_id`,
-    // `ns_uuid`, `nsid`, `ptpl_file`, `bdev_name` stay null — the
-    // pre-rebuild paths stamp/pin nothing.
-    ShareRecord {
-        subnqn: subnqn.to_string(),
-        stack,
-        state: ShareState::Pending,
-        backing_path: backing_path.to_string(),
-        backing_canonical: canonical.to_string(),
-        nsid: None,
-        ns_uuid: None,
-        listeners: ips
-            .iter()
-            .map(|ip| Listener {
-                ip: ip.clone(),
-                port,
-                nvmet_port_id: None,
-            })
-            .collect(),
-        bdev_name: None,
-        ptpl_file: None,
-        loop_device: None,
-        created_utc: ledger::utc_now_rfc3339(),
-        allow_hosts: Vec::new(),
-        adopted_from: None,
-    }
-}
-
-pub fn share_target(
-    backing_path: &str,
-    subnqn_opt: Option<&str>,
-    port: u16,
-    ips: &[String],
-) -> io::Result<String> {
-    check_root()?;
-    retire_old_registry_once();
-    let ledger = Ledger::open_default();
-
-    // Duplicate refusal before any side effect (ledger membership is the
-    // ownership law; live-state walks join the guard with the N2 rebuild).
-    ledger_duplicate_precheck(
-        &ledger,
-        subnqn_opt,
-        backing_path,
-        &canonical_or_raw(backing_path),
-    )?;
-
-    // 1. Check/create backing path if it's a regular file path.
-    //    (Transitional: the silent 1 GiB sparse auto-create dies at N2 —
-    //    replaced by refuse-loud + the explicit `--create-size` opt-in.)
-    let backing_path_buf = PathBuf::from(backing_path);
-    if !backing_path_buf.exists() {
+    for record in &records {
+        let live_entry = live_by_nqn.get(record.subnqn.as_str());
+        println!("  NQN:            {}", record.subnqn);
+        println!("  Stack:          {}", record.stack.as_str());
         println!(
-            "Backing file '{}' does not exist. Auto-creating a 1GB sparse file...",
-            backing_path
+            "  Backing:        {}{}",
+            record.backing_path,
+            record
+                .loop_device
+                .as_deref()
+                .map(|l| format!(" (loop: {l})"))
+                .unwrap_or_default()
         );
-        let f = fs::File::create(&backing_path_buf)?;
-        f.set_len(1024 * 1024 * 1024)?; // 1GB default
-    }
-    if backing_path_buf.is_file() {
-        // CoW guard: a btrfs-CoW backing file silently downgrades O_DIRECT
-        // to buffered I/O and wedges the whole fabric under write load.
-        nocow::ensure_nocow_backing(&backing_path_buf)?;
-    }
-
-    if backing_path_buf.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Backing path cannot be a directory.",
-        ));
-    }
-
-    let subnqn = match subnqn_opt {
-        Some(s) => s.to_string(),
-        None => format!("nqn.2026-06.io.squeezefs:subsystem-{}", Uuid::new_v4()),
-    };
-
-    // §6.4 law 6: record the pending intent BEFORE the first stack
-    // mutation — a crash in any later window leaves a record that still
-    // claims the objects (never stranded as "foreign").
-    let record = pending_record(
-        &subnqn,
-        StackKind::Nvmet,
-        backing_path,
-        &canonical_or_raw(backing_path),
-        port,
-        ips,
-    );
-    ledger.begin_share(&record)?;
-
-    match share_nvmet_via_configfs(&subnqn, backing_path, &record.listeners) {
-        Ok(loop_device) => {
-            if loop_device.is_some() {
-                // Law 5: the loop association is ledger bookkeeping.
-                ledger.set_loop_device(&subnqn, loop_device)?;
-            }
-            ledger.finalize_share(&subnqn)?;
-            Ok(subnqn)
+        if let Some(u) = &record.ns_uuid {
+            println!("  NS UUID:        {u}");
         }
-        Err(e) => {
-            log::warn!(
-                "share of '{}' failed mid-flight ({e}); its pending intent record remains in \
-                 the ledger and still claims any created objects — reconcile with \
-                 'squeezefs storage nvmeof restore-shares' or tear down with 'squeezefs \
-                 storage nvmeof unshare {}'",
-                subnqn,
-                subnqn
-            );
-            Err(e)
+        println!(
+            "  Listeners:      {}",
+            record
+                .listeners
+                .iter()
+                .map(|l| match l.nvmet_port_id {
+                    Some(id) => format!("{}:{} (port id {id})", l.ip, l.port),
+                    None => format!("{}:{}", l.ip, l.port),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if !record.allow_hosts.is_empty() {
+            println!("  Allowed hosts:  {}", record.allow_hosts.join(", "));
         }
-    }
-}
-
-/// The pre-rebuild kernel-nvmet configfs share path (transitional; N2
-/// replaces it wholesale — including the collision-prone small-int port
-/// allocator, accepted for this one-PR window). Shared by the `share`
-/// verb and the ledger replay in `restore_shares`. Never auto-creates
-/// backings. Returns the loop device attached for file backings.
-fn share_nvmet_via_configfs(
-    subnqn: &str,
-    backing_path: &str,
-    listeners: &[Listener],
-) -> io::Result<Option<String>> {
-    let backing_path_buf = PathBuf::from(backing_path);
-    if !backing_path_buf.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Backing path '{}' does not exist.", backing_path),
-        ));
+        println!(
+            "  State:          {}",
+            classification_of(record, live_entry.is_some())
+        );
+        println!();
     }
 
-    // 2. Load modules
-    if !is_mock() {
-        let _ = execute_cmd("modprobe", &["nvmet"]);
-        let _ = execute_cmd("modprobe", &["nvmet-tcp"]);
+    let foreign: Vec<&LiveShare> = live
+        .iter()
+        .filter(|l| !records.iter().any(|r| r.subnqn == l.subnqn))
+        .collect();
+    println!("=== Foreign / Unmanaged Live nvmet Subsystems (displayed, never touched) ===");
+    if foreign.is_empty() {
+        println!("  (none)");
     }
-
-    // 3. Mount configfs if not mounted
-    let config_dir = configfs_path();
-    if !is_mock() && !config_dir.exists() {
-        let _ = execute_cmd("mount", &["-t", "configfs", "none", "/sys/kernel/config"]);
-    }
-
-    // 4. Handle regular files via loop devices
-    let mut resolved_device = backing_path.to_string();
-    let is_reg_file = !is_mock() && {
-        let metadata = fs::metadata(&backing_path_buf)?;
-        metadata.is_file()
-    };
-
-    let mut associated_loop = None;
-    if is_reg_file || (is_mock() && backing_path.ends_with(".img")) {
-        // Try to find if already associated
-        let loop_list = if is_mock() {
-            String::new()
-        } else {
-            execute_cmd("losetup", &["-j", backing_path]).unwrap_or_default()
-        };
-
-        if !loop_list.is_empty() {
-            // Already associated, parse loop device
-            if let Some(first_line) = loop_list.lines().next() {
-                if let Some(pos) = first_line.find(':') {
-                    resolved_device = first_line[..pos].to_string();
-                    associated_loop = Some(resolved_device.clone());
-                }
-            }
-        } else {
-            // Find free loop device and associate
-            let free_loop = if is_mock() {
-                "/dev/loop99".to_string()
-            } else {
-                execute_cmd("losetup", &["-f"])?
-            };
-            if !is_mock() {
-                execute_cmd("losetup", &[&free_loop, backing_path])?;
-            }
-            resolved_device = free_loop.clone();
-            associated_loop = Some(free_loop);
-        }
-    }
-
-    // 5. Setup subsystem
-    let sub_dir = config_dir.join("subsystems").join(subnqn);
-    fs::create_dir_all(&sub_dir)?;
-
-    // Enable any host access
-    fs::write(sub_dir.join("attr_allow_any_host"), "1")?;
-
-    // Create namespace
-    let ns_dir = sub_dir.join("namespaces").join("1");
-    fs::create_dir_all(&ns_dir)?;
-    fs::write(ns_dir.join("device_path"), &resolved_device)?;
-    fs::write(ns_dir.join("enable"), "1")?;
-
-    // Transitional (N1 contract): this configfs fake-file *write* is
-    // impossible on a real kernel (fails silently) and survives only
-    // until N2 deletes this whole path — NOTHING reads it from N1 on;
-    // the ledger's `loop_device` field is the association of record.
-    if let Some(loop_dev) = &associated_loop {
-        let _ = fs::write(sub_dir.join("associated_loop_device"), loop_dev);
-    }
-
-    // 6. Setup Ports
-    for listener in listeners {
-        let ip = &listener.ip;
-        let port = listener.port;
-        let mut port_exists = false;
-        let mut port_id = 1;
-        let mut port_dir = config_dir.join("ports").join(port_id.to_string());
-        while port_dir.exists() {
-            // Read active address and port svc ID to see if it is our IP and port
-            if let Ok(addr) = fs::read_to_string(port_dir.join("addr_traddr")) {
-                if let Ok(svc) = fs::read_to_string(port_dir.join("addr_trsvcid")) {
-                    if addr.trim() == ip && svc.trim() == port.to_string() {
-                        port_exists = true;
-                        break; // Port already exists and matches!
-                    }
-                }
-            }
-            port_id += 1;
-            port_dir = config_dir.join("ports").join(port_id.to_string());
-        }
-
-        if !port_exists {
-            fs::create_dir_all(&port_dir)?;
-            fs::write(port_dir.join("addr_traddr"), ip)?;
-            fs::write(port_dir.join("addr_trtype"), "tcp")?;
-            fs::write(port_dir.join("addr_trsvcid"), port.to_string())?;
-            fs::write(port_dir.join("addr_adrfam"), "ipv4")?;
-        }
-
-        // Link subsystem to port
-        let link_dest = port_dir.join("subsystems").join(subnqn);
-        fs::create_dir_all(port_dir.join("subsystems"))?;
-
-        #[cfg(unix)]
-        if !link_dest.exists() {
-            std::os::unix::fs::symlink(&sub_dir, &link_dest)?;
-        }
-    }
-
-    Ok(associated_loop)
-}
-
-fn call_spdk_rpc(method: &str, params: serde_json::Value) -> io::Result<serde_json::Value> {
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
-
-    let socket_path =
-        std::env::var("SQUEEZEFS_SPDK_SOCK").unwrap_or_else(|_| "/var/tmp/spdk.sock".to_string());
-
-    if is_mock() {
-        return Ok(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": true
-        }));
-    }
-
-    let mut stream = UnixStream::connect(&socket_path)?;
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params
-    });
-
-    let req_str = request.to_string();
-    stream.write_all(req_str.as_bytes())?;
-    stream.flush()?;
-
-    let mut response_bytes = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = stream.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        response_bytes.extend_from_slice(&buf[..n]);
-        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&response_bytes) {
-            if val.get("result").is_some() || val.get("error").is_some() {
-                return Ok(val);
-            }
-        }
-    }
-
-    let val: serde_json::Value = serde_json::from_slice(&response_bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(val)
-}
-
-pub fn share_target_spdk(
-    backing_path: &str,
-    subnqn_opt: Option<&str>,
-    port: u16,
-    ips: &[String],
-) -> io::Result<String> {
-    retire_old_registry_once();
-    let ledger = Ledger::open_default();
-    let canonical = canonical_or_raw(backing_path);
-
-    // Ledger membership guard (cross-stack by construction) …
-    ledger_duplicate_precheck(&ledger, subnqn_opt, backing_path, &canonical)?;
-
-    // … plus the live-state check the old module got right: scan active
-    // SPDK bdevs directly (a crash-window or foreign share of the same
-    // backing still refuses).
-    let canonical_target = PathBuf::from(&canonical);
-    if let Ok(res) = call_spdk_rpc("bdev_get_bdevs", serde_json::json!({})) {
-        if let Some(bdevs) = res.get("result").and_then(|r| r.as_array()) {
-            for bdev in bdevs {
-                let filename = bdev
-                    .get("driver_specific")
-                    .and_then(|d| d.get("aio"))
-                    .and_then(|aio| aio.get("filename"))
-                    .and_then(|f| f.as_str());
-                if let Some(filename) = filename {
-                    let canonical_existing =
-                        fs::canonicalize(filename).unwrap_or_else(|_| PathBuf::from(filename));
-                    if canonical_target == canonical_existing {
-                        return Err(io::Error::new(
-                            io::ErrorKind::AlreadyExists,
-                            format!(
-                                "Backing path '{}' is already shared by active SPDK bdev '{}'",
-                                backing_path,
-                                bdev.get("name")
-                                    .and_then(|n| n.as_str())
-                                    .unwrap_or("unknown")
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    // CoW guard (see nocow::ensure_nocow_backing): SPDK's AIO bdev opens
-    // the file O_DIRECT, which btrfs silently downgrades to buffered on
-    // CoW files — the single-threaded reactor then wedges in the
-    // dirty-page throttle under write load and takes the whole fabric
-    // down with it.
-    let backing_path_buf = PathBuf::from(backing_path);
-    if backing_path_buf.is_file() {
-        nocow::ensure_nocow_backing(&backing_path_buf)?;
-    }
-
-    let subnqn = match subnqn_opt {
-        Some(s) => s.to_string(),
-        None => format!("nqn.2026-06.io.squeezefs:spdk-subsystem-{}", Uuid::new_v4()),
-    };
-
-    // §6.4 law 6: pending intent before the first RPC mutation.
-    let record = pending_record(
-        &subnqn,
-        StackKind::Spdk,
-        backing_path,
-        &canonical,
-        port,
-        ips,
-    );
-    ledger.begin_share(&record)?;
-
-    match share_spdk_via_rpc(&subnqn, backing_path, &record.listeners) {
-        Ok(()) => {
-            ledger.finalize_share(&subnqn)?;
-            Ok(subnqn)
-        }
-        Err(e) => {
-            log::warn!(
-                "SPDK share of '{}' failed mid-flight ({e}); its pending intent record remains \
-                 in the ledger and still claims any created objects — tear down with \
-                 'squeezefs storage nvmeof unshare {}'",
-                subnqn,
-                subnqn
-            );
-            Err(e)
-        }
-    }
-}
-
-/// The pre-rebuild SPDK RPC share path (transitional; N4 replaces it
-/// with pinned nsid + ns UUID + `ptpl_file` and the `save_config` law —
-/// this path deliberately stamps/pins nothing, which is why the N1-era
-/// record's SPDK-only fields stay null).
-fn share_spdk_via_rpc(subnqn: &str, backing_path: &str, listeners: &[Listener]) -> io::Result<()> {
-    // 1. Create transport (ignore if already exists)
-    let _ = call_spdk_rpc(
-        "nvmf_create_transport",
-        serde_json::json!({
-            "trtype": "TCP"
-        }),
-    );
-
-    // 2. Create bdev from backing path
-    let bdev_name = format!("bdev_{}", Uuid::new_v4().simple());
-
-    let res = call_spdk_rpc(
-        "bdev_aio_create",
-        serde_json::json!({
-            "name": bdev_name,
-            "filename": backing_path,
-            "block_size": 4096
-        }),
-    )?;
-
-    if let Some(err) = res.get("error") {
-        return Err(io::Error::other(format!(
-            "Failed to create SPDK AIO bdev: {}",
-            err
-        )));
-    }
-
-    // 3. Create subsystem
-    let res = call_spdk_rpc(
-        "nvmf_create_subsystem",
-        serde_json::json!({
-            "nqn": subnqn,
-            "allow_any_host": true,
-            "serial_number": format!("SQ{}", &Uuid::new_v4().to_string()[..10])
-        }),
-    )?;
-
-    if let Some(err) = res.get("error") {
-        return Err(io::Error::other(format!(
-            "Failed to create SPDK NVMe-oF subsystem: {}",
-            err
-        )));
-    }
-
-    // 4. Add namespace using our bdev
-    let res = call_spdk_rpc(
-        "nvmf_subsystem_add_ns",
-        serde_json::json!({
-            "nqn": subnqn,
-            "namespace": {
-                "bdev_name": bdev_name
-            }
-        }),
-    )?;
-
-    if let Some(err) = res.get("error") {
-        return Err(io::Error::other(format!(
-            "Failed to add bdev to SPDK subsystem namespace: {}",
-            err
-        )));
-    }
-
-    // 5. Add listener to expose the port/IP for each address
-    for listener in listeners {
-        let res = call_spdk_rpc(
-            "nvmf_subsystem_add_listener",
-            serde_json::json!({
-                "nqn": subnqn,
-                "listen_address": {
-                    "trtype": "TCP",
-                    "adrfam": "IPv4",
-                    "traddr": listener.ip,
-                    "trsvcid": listener.port.to_string()
-                }
-            }),
-        )?;
-
-        if let Some(err) = res.get("error") {
-            return Err(io::Error::other(format!(
-                "Failed to expose SPDK subsystem listener on {}:{}: {}",
-                listener.ip, listener.port, err
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-/// SPDK teardown (transitional pre-rebuild RPC shapes). With
-/// `tolerate_missing` (ledgered records — §6.4 law 4) a subsystem that
-/// vanished from the live listing is a verified no-op that still cleans
-/// the ledger; without it (pre-N1 unledgered shares) it is NotFound.
-fn unshare_spdk_via_rpc(subnqn: &str, tolerate_missing: bool) -> io::Result<()> {
-    // 1. Get subsystems to identify liveness + the associated bdev name.
-    let res = call_spdk_rpc("nvmf_get_subsystems", serde_json::json!({}))?;
-    let mut live = false;
-    let mut bdev_to_delete = None;
-    if let Some(result_arr) = res.get("result").and_then(|r| r.as_array()) {
-        for sub in result_arr {
-            if sub.get("nqn").and_then(|n| n.as_str()) == Some(subnqn) {
-                live = true;
-                if let Some(ns1) = sub
-                    .get("namespaces")
-                    .and_then(|ns| ns.as_array())
-                    .and_then(|ns| ns.first())
-                {
-                    if let Some(name) = ns1.get("name").and_then(|n| n.as_str()) {
-                        bdev_to_delete = Some(name.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    if !live {
-        if tolerate_missing {
-            println!(
-                "SPDK subsystem '{}' is no longer live on the target — nothing to tear down \
-                 (cleaning the ledger record).",
-                subnqn
-            );
-            return Ok(());
-        }
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("SPDK subsystem NQN '{}' not found.", subnqn),
-        ));
-    }
-
-    // 2. Delete the subsystem
-    let res = call_spdk_rpc(
-        "nvmf_delete_subsystem",
-        serde_json::json!({
-            "nqn": subnqn
-        }),
-    )?;
-    if let Some(err) = res.get("error") {
-        return Err(io::Error::other(format!(
-            "Failed to delete SPDK subsystem: {}",
-            err
-        )));
-    }
-
-    // 3. Delete the associated bdev if we found it
-    if let Some(bdev_name) = bdev_to_delete {
-        if let Err(e) = call_spdk_rpc(
-            "bdev_aio_delete",
-            serde_json::json!({
-                "name": bdev_name
-            }),
-        ) {
-            log::warn!("bdev_aio_delete of '{bdev_name}' failed after subsystem delete: {e}");
-        }
-    }
-
-    Ok(())
-}
-
-/// Kernel-nvmet configfs teardown (transitional pre-rebuild path; the
-/// all-ports symlink walk is deliberate at N1 — the old allocator's
-/// small-int port ids are untracked, §6.4 N1 contract). Loop detach does
-/// NOT live here: the association is ledger bookkeeping (law 5).
-fn unshare_nvmet_via_configfs(subnqn: &str, tolerate_missing: bool) -> io::Result<()> {
-    let config_dir = configfs_path();
-    let sub_dir = config_dir.join("subsystems").join(subnqn);
-    if !sub_dir.exists() {
-        if tolerate_missing {
-            println!(
-                "Subsystem '{}' is no longer present in configfs — nothing to tear down \
-                 (cleaning the ledger record).",
-                subnqn
-            );
-            return Ok(());
-        }
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Subsystem NQN '{}' not found.", subnqn),
-        ));
-    }
-
-    // 1. Remove all symlinks from ports
-    let ports_dir = config_dir.join("ports");
-    if ports_dir.exists() {
-        for entry in fs::read_dir(ports_dir)? {
-            let entry = entry?;
-            let port_subsystems = entry.path().join("subsystems");
-            if port_subsystems.exists() {
-                let link_path = port_subsystems.join(subnqn);
-                if link_path.exists() {
-                    let _ = fs::remove_file(link_path);
-                }
-            }
-        }
-    }
-
-    // 2. Disable namespace and delete directories
-    if is_mock() {
-        let _ = fs::remove_dir_all(&sub_dir);
-    } else {
-        let ns_dir = sub_dir.join("namespaces").join("1");
-        if ns_dir.exists() {
-            let _ = fs::write(ns_dir.join("enable"), "0");
-            let _ = fs::remove_file(ns_dir.join("device_path"));
-            let _ = fs::remove_file(ns_dir.join("enable"));
-            let _ = fs::remove_dir(ns_dir);
-        }
-        let _ = fs::remove_dir(sub_dir.join("namespaces"));
-        let _ = fs::remove_file(sub_dir.join("associated_loop_device"));
-        let _ = fs::remove_file(sub_dir.join("attr_allow_any_host"));
-        let _ = fs::remove_dir(&sub_dir);
-    }
-
-    Ok(())
-}
-
-/// Detach a ledger-recorded loop device (law 5: the ledger, never
-/// configfs, is where `unshare` learns the association — the pre-split
-/// configfs read could never see anything on a real kernel, so the
-/// detach never fired outside the mock).
-fn detach_recorded_loop(loop_dev: &str) {
-    if !is_mock() {
-        if let Err(e) = execute_cmd("losetup", &["-d", loop_dev]) {
-            log::warn!("losetup -d {loop_dev} failed (detach it manually): {e}");
-            return;
-        }
-    }
-    println!("Detached associated loop device '{}'.", loop_dev);
-}
-
-/// Unshare a target subsystem. Stack dispatch is resolved from the
-/// **ledger** — including `pending`/`removing` intent records (§6.4
-/// law 6: a crash-window share is still ours to remove); the `--spdk`
-/// flag only matters for pre-N1 unledgered shares (transitional legacy
-/// fallback, one-PR window — the rebuilt N2 verb refuses unledgered
-/// NQNs by ownership law).
-pub fn unshare_target(subnqn: &str, spdk_flag: bool) -> io::Result<()> {
-    check_root()?;
-    retire_old_registry_once();
-    let ledger = Ledger::open_default();
-
-    match ledger.find(subnqn)? {
-        Some(record) => {
-            if spdk_flag && record.stack != StackKind::Spdk {
-                println!(
-                    "Note: '--spdk' ignored — the ledger records '{}' on the {} stack \
-                     (dispatch is resolved from the ledger, never guessed).",
-                    subnqn,
-                    record.stack.as_str()
-                );
-            }
-            // §6.4 law 6: flip to `removing` BEFORE the first teardown
-            // write; delete the record only after teardown completes.
-            ledger.mark_removing(subnqn)?;
-            match record.stack {
-                StackKind::Spdk => unshare_spdk_via_rpc(subnqn, true)?,
-                StackKind::Nvmet => {
-                    unshare_nvmet_via_configfs(subnqn, true)?;
-                    if let Some(loop_dev) = &record.loop_device {
-                        detach_recorded_loop(loop_dev);
-                    }
-                }
-            }
-            ledger.delete(subnqn)?;
-            Ok(())
-        }
-        None => {
-            // Pre-N1 share (never ledgered): legacy teardown for this
-            // one-PR window. No loop detach — the configfs association
-            // read is gone (it never worked on a real kernel), and there
-            // is no ledger record to consult.
-            if spdk_flag {
-                unshare_spdk_via_rpc(subnqn, false)
-            } else {
-                unshare_nvmet_via_configfs(subnqn, false)
-            }
-        }
-    }
-}
-
-pub fn list_nvmeof() -> io::Result<()> {
-    check_root()?;
-    let config_dir = configfs_path();
-    let subs_dir = config_dir.join("subsystems");
-
-    // Loop associations come from the ledger (law 5) — the configfs
-    // fake file was unreadable on real kernels and nothing reads it now.
-    let ledger_records = Ledger::open_default().load().unwrap_or_else(|e| {
-        log::warn!("share ledger unreadable during list: {e}");
-        Vec::new()
-    });
-    let loop_of = |nqn: &str| {
-        ledger_records
-            .iter()
-            .find(|r| r.subnqn == nqn)
-            .and_then(|r| r.loop_device.clone())
-    };
-
-    println!("=== Shared NVMe-oF Targets ===");
-    let mut targets_found = false;
-    if subs_dir.exists() {
-        for entry in fs::read_dir(subs_dir)? {
-            let entry = entry?;
-            let sub_name = entry.file_name().to_string_lossy().to_string();
-            let sub_path = entry.path();
-
-            let backing = if let Ok(dev) =
-                fs::read_to_string(sub_path.join("namespaces").join("1").join("device_path"))
-            {
-                dev.trim().to_string()
-            } else {
-                "unknown".to_string()
-            };
-
-            let assoc_loop = loop_of(&sub_name)
-                .map(|l| format!(" (loop: {})", l))
-                .unwrap_or_default();
-
-            // Find bound IP and Port
-            let mut bound_addr = "0.0.0.0:4420".to_string();
-            let ports_dir = config_dir.join("ports");
-            if ports_dir.exists() {
-                for p_entry in fs::read_dir(ports_dir)? {
-                    let p_entry = p_entry?;
-                    if p_entry.path().join("subsystems").join(&sub_name).exists() {
-                        let ip = fs::read_to_string(p_entry.path().join("addr_traddr"))
-                            .unwrap_or_default();
-                        let port = fs::read_to_string(p_entry.path().join("addr_trsvcid"))
-                            .unwrap_or_default();
-                        bound_addr = format!("{}:{}", ip.trim(), port.trim());
-                        break;
-                    }
-                }
-            }
-
-            println!("  NQN:    {}", sub_name);
-            println!("  Backing: {}{}", backing, assoc_loop);
-            println!("  Listen:  {}", bound_addr);
-            println!();
-            targets_found = true;
-        }
-    }
-
-    // SPDK Target Subsystems
-    if let Ok(res) = call_spdk_rpc("nvmf_get_subsystems", serde_json::json!({})) {
-        if let Some(result_arr) = res.get("result").and_then(|r| r.as_array()) {
-            for sub in result_arr {
-                let nqn = sub.get("nqn").and_then(|n| n.as_str()).unwrap_or_default();
-                if nqn == "nqn.2014-08.org.nvmexpress.discovery" {
-                    continue; // Skip discovery subsystem
-                }
-
-                // Backing bdev
-                let mut backing = "unknown".to_string();
-                if let Some(ns) = sub
-                    .get("namespaces")
-                    .and_then(|n| n.as_array())
-                    .and_then(|n| n.first())
-                {
-                    if let Some(bdev_name) = ns.get("bdev_name").and_then(|b| b.as_str()) {
-                        backing = bdev_name.to_string();
-                    }
-                }
-
-                // Listen addresses
-                let mut listen_str = Vec::new();
-                if let Some(listeners) = sub.get("listen_addresses").and_then(|l| l.as_array()) {
-                    for listener in listeners {
-                        let ip = listener
-                            .get("traddr")
-                            .and_then(|i| i.as_str())
-                            .unwrap_or("");
-                        let port = listener
-                            .get("trsvcid")
-                            .and_then(|p| p.as_str())
-                            .unwrap_or("");
-                        if !ip.is_empty() && !port.is_empty() {
-                            listen_str.push(format!("{}:{}", ip, port));
-                        }
-                    }
-                }
-                let bound_addr = if listen_str.is_empty() {
-                    "none".to_string()
-                } else {
-                    listen_str.join(", ")
-                };
-
-                println!("  NQN:    {}", nqn);
-                println!("  Backing: {} (SPDK)", backing);
-                println!("  Listen:  {}", bound_addr);
-                println!();
-                targets_found = true;
-            }
-        }
-    }
-
-    if !targets_found {
-        println!("  No shared NVMe-oF targets configured.");
+    for l in foreign {
+        println!("  NQN:     {}", l.subnqn);
+        println!(
+            "  Serving: {} (backing {})",
+            l.device_path, l.backing_canonical
+        );
+        println!(
+            "  Listen:  {}",
+            l.listeners
+                .iter()
+                .map(|x| format!("{}:{}", x.ip, x.port))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!();
     }
 
     println!("=== Connected Fabric Disks ===");
-    let initiator_found = initiator::print_connected_fabric_disks()?;
-    if !initiator_found {
+    if connected.is_empty() {
         println!("  No connected remote NVMe-oF fabric disks.");
     }
-
-    Ok(())
-}
-
-/// Replay the share ledger (`restore-shares`). N1 semantics (PR-plan
-/// PR 1 transitional contract + §6.4 laws 4/6):
-///
-/// * **nvmet records** replay through the pre-rebuild configfs path
-///   (including its collision-prone port allocator — accepted for this
-///   one-PR window; N2 replaces the path): `active` + already-live ⇒
-///   verified no-op; `active` + gone ⇒ re-shared; `pending` + live ⇒
-///   finalized with a loud line; `pending` + no live objects ⇒
-///   garbage-collected loud; `removing` ⇒ teardown resumed, record
-///   deleted.
-/// * **spdk records are not replayed at this milestone** — SPDK restore
-///   rides the SPDK-native `save_config`/`load_config` truth from the
-///   SPDK rebuild (N3/N4) on; records are kept for ownership/dispatch
-///   and each skip says so loudly.
-///
-/// Per-record failures are collected (a report, not a first-failure
-/// bail); any failure makes the verb exit nonzero.
-pub fn restore_shares() -> io::Result<()> {
-    check_root()?;
-    retire_old_registry_once();
-    let ledger = Ledger::open_default();
-    let records = ledger.load()?;
-    if records.is_empty() {
-        log::info!("No NVMe-oF target shares to restore.");
-        return Ok(());
+    for d in &connected {
+        println!("  Device:  {}", d.device);
+        println!("  NQN:     {}", d.subnqn);
+        println!("  Target:  {}", d.address);
+        println!();
     }
-    log::info!("Restoring {} NVMe-oF target share(s)...", records.len());
-
-    let mut failures = 0usize;
-    for record in &records {
-        if record.stack == StackKind::Spdk {
-            log::warn!(
-                "restore-shares: not replaying SPDK share '{}' at this milestone — SPDK \
-                 restore rides SPDK-native save_config/load_config from the SPDK rebuild \
-                 (design PR N3/N4); the ledger record is kept for ownership and unshare \
-                 dispatch",
-                record.subnqn
-            );
-            continue;
-        }
-        if let Err(e) = restore_nvmet_record(&ledger, record) {
-            failures += 1;
-            log::error!(
-                "Failed to restore target share for {}: {:?}",
-                record.subnqn,
-                e
-            );
-        }
-    }
-
-    if failures > 0 {
-        return Err(io::Error::other(format!(
-            "{failures} of {} ledger share(s) failed to restore — see the log for the \
-             per-share report",
-            records.len()
-        )));
-    }
-    Ok(())
-}
-
-fn restore_nvmet_record(ledger: &Ledger, record: &ShareRecord) -> io::Result<()> {
-    let sub_dir = configfs_path().join("subsystems").join(&record.subnqn);
-    match record.state {
-        ShareState::Removing => {
-            // §6.4 law 6: an interrupted unshare is resumed, not revived.
-            log::warn!(
-                "restore-shares: resuming interrupted teardown of '{}' (removing intent)",
-                record.subnqn
-            );
-            unshare_nvmet_via_configfs(&record.subnqn, true)?;
-            if let Some(loop_dev) = &record.loop_device {
-                detach_recorded_loop(loop_dev);
-            }
-            ledger.delete(&record.subnqn)
-        }
-        ShareState::Pending => {
-            if sub_dir.exists() {
-                // Live objects exist and match ⇒ the crash happened after
-                // the mutations completed: finalize the intent.
-                log::warn!(
-                    "restore-shares: finalizing crash-window pending intent '{}' — its live \
-                     objects exist",
-                    record.subnqn
-                );
-                ledger.finalize_share(&record.subnqn)
-            } else {
-                // No live objects ⇒ the share verb never completed and
-                // never returned success: garbage-collect the intent.
-                log::warn!(
-                    "restore-shares: garbage-collecting pending intent '{}' — no live objects \
-                     (the interrupted share never completed)",
-                    record.subnqn
-                );
-                ledger.delete(&record.subnqn)
-            }
-        }
-        ShareState::Active => {
-            if sub_dir.exists() {
-                // §6.4 law 4: an already-live share is a verified no-op.
-                log::info!(
-                    "restore-shares: '{}' is already live — verified no-op",
-                    record.subnqn
-                );
-                return Ok(());
-            }
-            if PathBuf::from(&record.backing_path).is_file() {
-                nocow::ensure_nocow_backing(Path::new(&record.backing_path))?;
-            }
-            let loop_device =
-                share_nvmet_via_configfs(&record.subnqn, &record.backing_path, &record.listeners)?;
-            // The loop device may differ across boots — refresh law-5
-            // bookkeeping.
-            if loop_device != record.loop_device {
-                ledger.set_loop_device(&record.subnqn, loop_device)?;
-            }
-            log::info!("restore-shares: re-shared '{}'", record.subnqn);
-            Ok(())
-        }
-    }
-}
-
-pub fn spdk_install() -> io::Result<()> {
-    check_root()?;
-    println!("Installing SPDK dependencies and compiling from source...");
-    if is_mock() {
-        println!("MOCK: Cloning spdk, running pkgdep.sh, configuring, and building via make.");
-        return Ok(());
-    }
-
-    // 1. Clone
-    println!("Cloning SPDK repo to /opt/spdk...");
-    let status = Command::new("git")
-        .args(["clone", "https://github.com/spdk/spdk.git", "/opt/spdk"])
-        .status()?;
-    if !status.success() {
-        println!(
-            "SPDK repo already exists at /opt/spdk or git clone failed. Proceeding with update..."
-        );
-    }
-
-    let status = Command::new("git")
-        .current_dir("/opt/spdk")
-        .args(["submodule", "update", "--init"])
-        .status()?;
-    if !status.success() {
-        return Err(io::Error::other("Failed to update SPDK submodules"));
-    }
-
-    println!("Running pkgdep.sh to install system dependencies...");
-    let status = Command::new("./scripts/pkgdep.sh")
-        .current_dir("/opt/spdk")
-        .status()?;
-    if !status.success() {
-        return Err(io::Error::other("Failed to install SPDK dependencies"));
-    }
-
-    // Install Python dependencies (tabulate)
-    println!("Installing required Python modules (tabulate)...");
-    let pip_status = Command::new("pip3")
-        .args(["install", "tabulate", "--break-system-packages"])
-        .status();
-    if pip_status.is_err() || !pip_status.unwrap().success() {
-        let pip_status2 = Command::new("pip").args(["install", "tabulate"]).status();
-        if pip_status2.is_err() || !pip_status2.unwrap().success() {
-            let apt_status = Command::new("apt-get")
-                .args(["install", "-y", "python3-tabulate"])
-                .status();
-            if apt_status.is_err() || !apt_status.unwrap().success() {
-                println!(
-                    "Warning: Could not install python 'tabulate' library. Compilation might fail."
-                );
-            }
-        }
-    }
-
-    println!("Configuring SPDK...");
-    let status = Command::new("./configure")
-        .current_dir("/opt/spdk")
-        .status()?;
-    if !status.success() {
-        return Err(io::Error::other("Failed to configure SPDK"));
-    }
-
-    println!("Building SPDK (this may take a few minutes)...");
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let status = Command::new("make")
-        .arg(format!("-j{}", cores))
-        .current_dir("/opt/spdk")
-        .status()?;
-    if !status.success() {
-        return Err(io::Error::other("Failed to compile SPDK"));
-    }
-
-    println!("Successfully installed and compiled SPDK at /opt/spdk.");
-    Ok(())
-}
-
-pub fn spdk_setup(hugepages_mb: usize) -> io::Result<()> {
-    check_root()?;
-    println!("Configuring hugepages ({}MB)...", hugepages_mb);
-    if is_mock() {
-        println!("MOCK: Configuring hugepages.");
-        return Ok(());
-    }
-
-    // 1. Allocate hugepages via sysfs
-    let pages = hugepages_mb / 2; // 2MB pages
-    let nr_hugepages_path = "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages";
-    if Path::new(nr_hugepages_path).exists() {
-        fs::write(nr_hugepages_path, pages.to_string())?;
-        println!("Successfully allocated {} x 2MB hugepages.", pages);
-    } else {
-        // Fallback to setup.sh config_huge
-        let setup_script = "/opt/spdk/scripts/setup.sh";
-        if Path::new(setup_script).exists() {
-            let status = Command::new(setup_script)
-                .arg("config_huge")
-                .env("HUGEMEM", hugepages_mb.to_string())
-                .status()?;
-            if !status.success() {
-                return Err(io::Error::other("SPDK setup.sh config_huge failed."));
-            }
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "SPDK setup.sh not found at /opt/spdk/scripts/setup.sh.",
-            ));
-        }
-    }
-
-    println!("Successfully configured hugepages.");
-    Ok(())
-}
-
-pub fn spdk_bind(pci_addr: &str) -> io::Result<()> {
-    check_root()?;
-    println!(
-        "Binding device at PCI address {} to SPDK user-space driver...",
-        pci_addr
-    );
-    if is_mock() {
-        println!("MOCK: Binding device {} to SPDK.", pci_addr);
-        return Ok(());
-    }
-
-    let setup_script = "/opt/spdk/scripts/setup.sh";
-    if Path::new(setup_script).exists() {
-        let status = Command::new(setup_script)
-            .arg("bind")
-            .arg(pci_addr)
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::other(format!(
-                "Failed to bind device {} using SPDK setup.sh",
-                pci_addr
-            )));
-        }
-    } else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "SPDK setup.sh not found. Run 'squeezefs storage nvmeof spdk-install' first.",
-        ));
-    }
-
-    println!("Successfully bound device {} to SPDK.", pci_addr);
-    Ok(())
-}
-
-pub fn spdk_unbind(pci_addr: &str) -> io::Result<()> {
-    check_root()?;
-    println!("Unbinding device at PCI address {} from SPDK...", pci_addr);
-    if is_mock() {
-        println!("MOCK: Unbinding device {} from SPDK.", pci_addr);
-        return Ok(());
-    }
-
-    // Unbind from SPDK driver (vfio-pci or uio_pci_generic) via sysfs
-    let unbind_path = format!("/sys/bus/pci/devices/{}/driver/unbind", pci_addr);
-    if Path::new(&unbind_path).exists() {
-        let _ = fs::write(&unbind_path, pci_addr);
-    }
-
-    // Trigger driver probe to return it to the kernel NVMe driver
-    let probe_path = "/sys/bus/pci/drivers_probe";
-    if Path::new(probe_path).exists() {
-        let _ = fs::write(probe_path, pci_addr);
-    }
-
-    println!("Successfully unbound device {} from SPDK.", pci_addr);
-    Ok(())
-}
-
-pub fn spdk_start() -> io::Result<()> {
-    check_root()?;
-    println!("Starting SPDK NVMe-oF target daemon (nvmf_tgt)...");
-    if is_mock() {
-        println!("MOCK: Spawning /opt/spdk/build/bin/nvmf_tgt in background.");
-        return Ok(());
-    }
-
-    let bin_path = "/opt/spdk/build/bin/nvmf_tgt";
-    if !Path::new(bin_path).exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "SPDK target binary not found. Run 'squeezefs storage nvmeof spdk-install' first.",
-        ));
-    }
-
-    // Check if nvmf_tgt is already running
-    let check = Command::new("pgrep").arg("nvmf_tgt").status();
-    if let Ok(status) = check {
-        if status.success() {
-            println!("SPDK target daemon (nvmf_tgt) is already running.");
-            return Ok(());
-        }
-    }
-
-    // Spawn daemon in background
-    let child = Command::new(bin_path)
-        .arg("-i")
-        .arg("0")
-        .arg("-m")
-        .arg("0x1")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-
-    println!("Spawned SPDK nvmf_tgt in background (PID: {}).", child.id());
-    println!("JSON-RPC socket listening at /var/tmp/spdk.sock");
     Ok(())
 }

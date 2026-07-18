@@ -31,6 +31,7 @@
 //! plane (configfs writes, nvme-cli/losetup shell-outs) — the sanctioned
 //! `reservation.rs` precedent; no data path is touched.
 
+pub mod fabric;
 pub mod initiator;
 pub mod ledger;
 pub mod nocow;

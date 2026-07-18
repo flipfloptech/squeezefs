@@ -295,3 +295,70 @@ async fn transport_commit_batch_stats_surface() {
         "commit total exports (mean batch size = commits / flushes)"
     );
 }
+
+/// PR 6 / N6 (design-nvmeof-target-management §6.9): the daemon
+/// `fabric_*` family — `fabric_controllers`, `fabric_ctrl_not_live`
+/// (both gauges) and `fabric_ctrl_reconnects` (the sampled-transition
+/// counter, undercount caveat pinned in
+/// `test_fabric_reconnects_is_sampled_transition_counter_undercounts_bursts`)
+/// — must ALWAYS export as u64s, zero-valued on boxes with no fabric
+/// controllers (the missing-sysfs zero-case): operators and the
+/// fidelity tier's G2 leg key on the field names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fabric_family_stats_surface_exports_zero_valued_without_fabric() {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::cache::TieredCache;
+    use squeezefs::dlm::DlmClient;
+    use squeezefs::fuse_client::SqueezefsFilesystem;
+    use squeezefs::nvme_dev::NvmeBlockDev;
+    use squeezefs::routing::DataRouter;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    let dlm = DlmClient::new("local").unwrap();
+    let b = NamedTempFile::new().unwrap();
+    std::fs::File::create(b.path())
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
+    let ba = Arc::new(
+        BlockAllocator::new(dlm.meta_client().clone(), "fabric_family_stats_test")
+            .await
+            .unwrap(),
+    );
+    let s = tempfile::tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![s.path().to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("16MB"),
+        Some("32MB"),
+        dlm.meta_client().clone(),
+        ba.clone(),
+        nvme.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
+    let fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
+
+    let json: serde_json::Value =
+        serde_json::from_str(&fs.generate_stats_json().await).expect("stats JSON parses");
+    let metrics = json
+        .get("metrics")
+        .and_then(|m| m.as_object())
+        .expect("stats carries a metrics object");
+
+    for field in [
+        "fabric_controllers",
+        "fabric_ctrl_not_live",
+        "fabric_ctrl_reconnects",
+    ] {
+        assert!(
+            metrics.get(field).is_some_and(|v| v.is_u64()),
+            "metrics.{field} must always export as u64 (design §6.9 fabric_* family)"
+        );
+    }
+}

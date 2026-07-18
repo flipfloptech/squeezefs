@@ -213,35 +213,40 @@ For unattended hosts add `--supervise`: the parent stays alive as an external wa
 
 ## 4. NVMe-oF Fabric Setup (Remote Block Storage)
 
-*(Requires dedicated hardware: spare PCIe NVMe controllers for SPDK user-space binding and a real fabric. Fabric multipath/failover across multiple NICs is the kernel NVMe initiator's native multipath domain — configure it with `nvme connect` policies at the host level.)*
+Target sharing and client connections live under the top-level **`squeezefs nvmeof`** verb (dual-stack: SPDK and kernel nvmet; stack selection is explicit — `--target-stack`, env `SQUEEZEFS_NVMEOF_TARGET_STACK`, default `spdk` — and failure is loud, never a silent cross-stack fallback).
 
-### Automatic SPDK Compilation, Setup, and Execution
-To compile SPDK from source, set up local hugepages, selectively bind target NVMe SSDs to user-space, and launch the user-space target daemon (`nvmf_tgt` listener) in the background:
+> ⚠️ **Interim — SPDK target management lands later in this program.** The NVMe-oF target-management program (`docs/design-nvmeof-target-management.md`) ships in milestones: the kernel-nvmet target path below is fully managed **today**; the SPDK stack's lifecycle verbs (`nvmeof target install/setup/start/stop/status/systemd-unit`) and SPDK sharing land with milestones **N3/N4**. Until then, `--target-stack spdk` — including the **default** — fails loud with a message naming those milestones. Select `--target-stack nvmet` explicitly for everything on this page. (The old `storage nvmeof spdk-*` verbs are removed — README → *Removed flags/verbs*.)
+
+### Share a Target via the Kernel nvmet Stack
 ```bash
-# 1. Compile SPDK from source and install system dependencies to /opt/spdk
-sudo ./target/release/squeezefs storage nvmeof spdk-install
+# Share a backing disk as an NVMe-oF subsystem target (kernel nvmet)
+sudo ./target/release/squeezefs nvmeof share /dev/nvme1n1 --ip 10.10.10.50 --target-stack nvmet
 
-# 2. Configure hugepages safely (defaults to 2GB, supports 4GB) without unbinding system disks
-sudo ./target/release/squeezefs storage nvmeof spdk-setup --hugepages 2GB
+# Regular-file backings work too (served via a loop device — the writer guard is
+# detection-grade there; missing paths refuse loud, --create-size opts into creation):
+sudo ./target/release/squeezefs nvmeof share /srv/backing.img --create-size 100G \
+    --ip 10.10.10.50 --target-stack nvmet
 
-# 3. Selectively bind only a specific secondary NVMe SSD PCIe controller to SPDK
-sudo ./target/release/squeezefs storage nvmeof spdk-bind --pci 0000:02:00.0
-
-# 4. Start the background SPDK target daemon (nvmf_tgt)
-sudo ./target/release/squeezefs storage nvmeof spdk-start
+# Restrict who may connect (default is allow-any — the trusted-fabric posture):
+sudo ./target/release/squeezefs nvmeof share /dev/nvme1n1 --ip 10.10.10.50 \
+    --target-stack nvmet --allow-host nqn.2014-08.org.nvmexpress:uuid:<client-host-id>
 ```
+Each share records a write-ahead intent in the share ledger (`/var/lib/squeezefs/nvmeof/shares.json`), stamps a stable namespace identity (`device_uuid`, seedable with `--ns-uuid`), enables NVMe Persistent Reservations (`resv_enable`) where the kernel offers the knob, and allocates listener port ids from the reserved range **53000–53999** (relocatable via `SQUEEZEFS_NVMET_PORT_ID_BASE`; foreign configfs ports are never touched).
 
-### Share a Target via user-space SPDK
+### Inspect, Restore, Unshare
 ```bash
-# Share a backing disk as SPDK NVMe-oF subsystem target
-sudo ./target/release/squeezefs storage nvmeof share /dev/nvme0n1 --spdk --port 4420 --ip 10.10.10.50
+sudo ./target/release/squeezefs nvmeof list            # managed / down / pending / removing / foreign
+sudo ./target/release/squeezefs nvmeof restore --target-stack nvmet   # replay the ledger after reboot
+                                                       # (configfs is empty at boot by nature)
+sudo ./target/release/squeezefs nvmeof unshare <subnqn>  # stack resolved from the ledger
 ```
+`restore` is idempotent: already-live shares verify as no-ops, interrupted shares/unshares (crash-window intents) are finalized, garbage-collected, or resumed, and the recorded namespace identity is re-presented so initiators reattach without operator action. `unshare` refuses NQNs the ledger does not own — pre-rebuild or foreign shares surface in `list` as foreign/unmanaged with the manual removal steps.
 
 ### Connect to Remote NVMe-oF Storage
 To connect to an NVMe over Fabrics target device before mounting:
 ```bash
 # Connect to the remote storage cluster
-sudo ./target/release/squeezefs storage nvmeof connect --ip 10.10.10.50 --subnqn nqn.2026-06.org.squeezefs:data
+sudo ./target/release/squeezefs nvmeof connect --ip 10.10.10.50 --subnqn nqn.2026-07.io.squeezefs:share-<uuid>
 
 # Create pool and volume spanning the fabric-attached block device
 sudo ./target/release/squeezefs storage pool create fabric-pool /dev/nvme1n1
@@ -250,9 +255,13 @@ sudo ./target/release/squeezefs storage volume create fabric-pool my-fabric-vol 
 # Format and mount the fabric-attached volume
 sudo ./target/release/squeezefs format sqmeta:///dev/main-pool/meta-vol sqdata:///dev/fabric-pool/my-fabric-vol
 sudo ./target/release/squeezefs mount sqmeta:///dev/main-pool/meta-vol /mnt/squeezefs --daemon --allow-other
+
+# Done with a share on the client side:
+sudo ./target/release/squeezefs nvmeof disconnect <subnqn>
 ```
 - **Single-writer guard on fabric namespaces:** where the namespace advertises NVMe Persistent Reservation support, the mount guard runs **enforcement-grade** (the device itself fences stale writers) — check `writer_guard_mode` on `.stats`. Guarantee classes per substrate: README → *Single-writer mount guard*.
 - **Multipath/HA:** path redundancy across NICs/ports is native NVMe multipath, configured at `nvme connect` time (kernel initiator), transparent to SqueezeFS.
+- Fabric multipath/failover across multiple NICs is the kernel NVMe initiator's native multipath domain — configure it with `nvme connect` policies at the host level.
 
 ---
 

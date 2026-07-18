@@ -193,16 +193,19 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
   squeezefs tune
   ```
 
-* **NVMe-oF Utilities:**
-  Share and dismantle NVMe-oF targets, and install/configure user-space SPDK via `squeezefs storage nvmeof` (SPDK verbs: `spdk-install`, `spdk-setup`, `spdk-bind`, `spdk-unbind`, `spdk-start` — see [QUICKSTART §4](QUICKSTART.md#4-nvme-of-fabric-setup-remote-block-storage)).
+* **NVMe-oF Utilities (top-level `squeezefs nvmeof`, dual-stack):**
+  Share and dismantle NVMe-oF target subsystems and connect clients (see [QUICKSTART §4](QUICKSTART.md#4-nvme-of-fabric-setup-remote-block-storage)). Target-stack selection is explicit — `--target-stack {spdk|nvmet}` (or `SQUEEZEFS_NVMEOF_TARGET_STACK`), default **spdk** — and failure is loud: there is **no silent cross-stack fallback**. ⚠️ **Interim (target-management program in flight):** the SPDK stack's management verbs land with the program's N3/N4 milestones — until then the **default (spdk) fails loud** with a message naming those milestones; select `--target-stack nvmet` explicitly for the kernel target, which is fully managed today (rebuilt configfs path: reserved port-id range 53000–53999 with ownership checks, `resv_enable`+`device_uuid` stamped before enable, write-ahead intent ledger, working `restore`).
   ```bash
-  squeezefs storage nvmeof share <path> [--spdk] [--port <port>] [--ip <ip>]
-  squeezefs storage nvmeof connect --ip <ip> --subnqn <nqn> [--port <port>]
-  squeezefs storage nvmeof disconnect <nqn>
-  squeezefs storage nvmeof unshare <nqn> [--spdk]
-  squeezefs storage nvmeof list
-  squeezefs storage nvmeof restore-shares   # re-register persistent target shares
+  squeezefs nvmeof share <backing> --ip <ip>[,...] [--port 4420] [--subnqn <nqn>] \
+      [--target-stack spdk|nvmet] [--nsid <n>] [--ns-uuid <uuid>] \
+      [--create-size <sz>] [--allow-host <hostnqn>]...
+  squeezefs nvmeof unshare <subnqn>          # stack resolved from the share ledger
+  squeezefs nvmeof list [--json]             # managed/down/pending/removing/foreign
+  squeezefs nvmeof restore [--target-stack spdk|nvmet]   # replay ledger; reconcile intents
+  squeezefs nvmeof connect --ip <ip> --subnqn <nqn> [--port <port>]
+  squeezefs nvmeof disconnect <nqn>
   ```
+  Flag semantics: `--ns-uuid` seeds the recorded namespace identity on **both** stacks (generated once when absent; re-presented by `restore` so initiators reattach); `--nsid` is **SPDK-only** — the kernel-nvmet namespace index is structurally fixed at 1, so `--nsid` ≠ 1 with nvmet refuses loud. Missing backing paths refuse loud (`--create-size` is the explicit sparse-create opt-in; NoCOW-guarded on btrfs). `--allow-host` (repeatable) restricts a share to named host NQNs; the default is allow-any — the trusted-fabric posture.
 
 * **Storage pools & volumes (LVM):**
   ```bash
@@ -264,6 +267,8 @@ SqueezeFS moves **always forward** — no backwards compatibility. Refusals are 
 > **⚠️ Cache/staging paths are format-declared.** `mount --disk-cache-paths` is refused loudly (never silently ignored). Change paths with the admin op `squeezefs config set-cache-paths <sqmeta-uri> <paths...>` (guarded like `format`: refused while any client has the volume mounted; the new dirs are wiped so the next mount stamps a fresh staging generation). Read them back with `config get-cache-paths`. A filesystem formatted without `--disk-cache-paths` is **permanently cache-less**.
 
 > **Removed flags/verbs** (kept here so stale scripts fail comprehensibly): `--strict-meta-atomicity` (only ever gated v2 volumes; deleted with them), `squeezefs migrate` (deleted with v2), `mount --local-ips` (the socket-level multi-rail bonding was removed in the 2026-07-04 connection simplification — fabric multipath is the kernel NVMe initiator's domain), `mount --disk-cache-paths` (see above), `squeezefs defrag` (removed 2026-07-17: the verb's engine was an unimplemented no-op that reported fake success — no fake surfaces; the jobs-layer `BlockMove` merge machinery it would drive remains, test-pinned, awaiting a real defrag program).
+>
+> **NVMe-oF verb migration (2026-07-17, target-management program PR 2/N2** — `docs/design-nvmeof-target-management.md` §API): the whole `squeezefs storage nvmeof <verb>` surface **moved to the top-level `squeezefs nvmeof <verb>`**, and within it: `share --spdk`/`unshare --spdk` → `--target-stack {spdk|nvmet}` (default spdk; `unshare` now resolves the stack from the share ledger, never a flag); `restore-shares` → `restore` (and it works — the old registry truncated itself to `[]` on every root invocation, so share persistence had **never** worked; a pre-existing `/etc/squeezefs/nvmeof_shares.json` is retired to `.retired-by-rebuild` on the first mutating verb, and pre-rebuild live shares surface in `list` as foreign/unmanaged with documented removal-first exits); `spdk-install`/`spdk-setup`/`spdk-start` → `nvmeof target install/setup/start` (**land with milestone N3** — until then SPDK-stack verbs fail loud naming the milestone); `spdk-bind`/`spdk-unbind` **deleted** (PCIe vfio passthrough backing is a future program — v1 serves kernel block nodes and files via the kernel target today, `bdev_aio` at N4); share's silent 1 GiB sparse auto-create on a missing path **deleted** (refuse loud; `--create-size <sz>` is the explicit opt-in).
 
 ## Metadata Durability (crash contract)
 
@@ -289,7 +294,7 @@ The v3 metadata engine is single-writer by construction, and the mount enforces 
 |---|---|
 | Same host, any volume | **Refusal-grade** (flock on a dedicated fd; kernel-enforced; instant crash reclaim; SIGSTOP-safe) |
 | NVMe / NVMe-oF namespace with `RESCAP` PR support | **Enforcement-grade** (Write-Exclusive reservation: the device rejects a fenced/stale holder's writes; acquire arbitrates simultaneous mounts; automatic TTL-stale preemption is safe). **Fencing detection latency ≤ one flush cadence + one barrier** (50 ms default; immediate in strict/fsync — Issue 14); PTPL-lapse residual ≤ 10 s (heartbeat report re-check, §5.0 B1 pt 6). Crash (kill -9) remount recovery is portable across Register semantics: on **spec-strict** targets (SPDK v26.05 and current kernel nvmet, both measured 2026-07-17) the guard's **register ladder** proves the conflicting registration is its own dead incarnation's — via the association's device-reported host identifier — and unregisters exactly that key before re-registering; foreign registrations are never touched (preempt/TTL/`claim clear` territory) |
-| — SPDK-served namespace (`storage nvmeof share --spdk`) | **Enforcement-grade, measured** (2026-07-17 rig: mount `flock+pr`, fencing EBADE class, preempt, ladder crash-remount ×10) — and with a `ptpl_file`-served namespace, reservations **persist through target restarts** (PTPL; a live holder rides out `spdk_tgt` kill + `load_config` with `writer_guard_fenced=0`). Note today's `share --spdk` does not yet pin ns UUID / `ptpl_file` — that lands with the SPDK-target program (scoping §5) |
+| — SPDK-served namespace (`nvmeof share --target-stack spdk` — SPDK target management lands with milestones N3/N4 of the target program; measured on the scoping rig) | **Enforcement-grade, measured** (2026-07-17 rig: mount `flock+pr`, fencing EBADE class, preempt, ladder crash-remount ×10) — and with a `ptpl_file`-served namespace, reservations **persist through target restarts** (PTPL; a live holder rides out `spdk_tgt` kill + `load_config` with `writer_guard_fenced=0`). Note product SPDK sharing does not yet pin ns UUID / `ptpl_file` — that lands with N4 of the SPDK-target program (scoping §5) |
 | — loop-device-backed nvmet namespace (the repo's own file-backed share path, `losetup` wrap) | loop devices expose no PR ⇒ lands in the **"block without PR"** row below — named explicitly because the repo's own tooling creates this shape |
 | Block volume **without** PR support | **Detection-grade**: mounts separated by > ~1 heartbeat are refused; near-simultaneous mounts can both arm; a paused holder cannot detect usurpation — therefore automatic cross-host takeover is disabled (operator-attested `claim clear` only) |
 | File-backed volume shared cross-host (NFS et al.), or containers with private `/dev` nodes | **Unsupported for concurrent-mount protection** — single-host operation of such volumes remains fully guarded by flock (former) / PR-if-available (latter) |

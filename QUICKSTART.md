@@ -270,7 +270,7 @@ sudo ./target/release/squeezefs nvmeof share /srv/backing.img --create-size 100G
 sudo ./target/release/squeezefs nvmeof share /dev/nvme1n1 --ip 10.10.10.50 \
     --allow-host nqn.2014-08.org.nvmexpress:uuid:<client-host-id>
 ```
-Every share records a write-ahead intent in the share ledger (`/var/lib/squeezefs/nvmeof/shares.json`) **before** the first RPC mutation and ends with `save_config` to `tgt-config.json` — the SPDK source of truth that `target start`/the systemd unit replay via `load_config`, so shares (and their reservations, via PTPL) reappear under the same NQN/nsid/UUID across target restarts without operator action. A backing already served by **either** stack refuses loud, naming the live holder and the exact removal steps (the cross-stack duplicate-backing guard). `unshare <subnqn>` resolves the stack from the ledger and refuses while initiators are connected (`--force` overrides; unmount → `disconnect` → unshare is the sequence).
+Every share records a write-ahead intent in the share ledger (`/var/lib/squeezefs/nvmeof/shares.json`) **before** the first RPC mutation and ends with `save_config` to `tgt-config.json` — the SPDK source of truth that `target start`/the systemd unit replay via `load_config`, so shares (and their reservations, via PTPL) reappear under the same NQN/nsid/UUID across target restarts without operator action. A backing already served by **either** stack refuses loud, naming the live holder, the exact removal steps, and — for foreign holders — the `nvmeof adopt` alternative (the cross-stack duplicate-backing guard). `unshare <subnqn>` resolves the stack from the ledger and refuses while initiators are connected (`--force` overrides; unmount → `disconnect` → unshare is the sequence).
 
 ### Share a Target via the Kernel nvmet Stack
 ```bash
@@ -288,7 +288,7 @@ sudo ./target/release/squeezefs nvmeof share /dev/nvme1n1 --ip 10.10.10.50 \
 ```
 Each share records a write-ahead intent in the share ledger (`/var/lib/squeezefs/nvmeof/shares.json`), stamps a stable namespace identity (`device_uuid`, seedable with `--ns-uuid`), enables NVMe Persistent Reservations (`resv_enable`) where the kernel offers the knob, and allocates listener port ids from the reserved range **53000–53999** (relocatable via `SQUEEZEFS_NVMET_PORT_ID_BASE`; foreign configfs ports are never touched).
 
-### Inspect, Restore, Unshare
+### Inspect, Restore, Unshare, Adopt
 ```bash
 sudo ./target/release/squeezefs nvmeof list            # managed / down / pending / removing / foreign (both stacks)
 sudo ./target/release/squeezefs nvmeof restore         # replay the whole ledger, each record to its recorded stack
@@ -297,7 +297,24 @@ sudo ./target/release/squeezefs nvmeof restore --target-stack spdk    # filter (
 sudo ./target/release/squeezefs nvmeof restore --target-stack nvmet   # filter (configfs is empty at boot by nature)
 sudo ./target/release/squeezefs nvmeof unshare <subnqn>  # stack resolved from the ledger
 ```
-`restore` is idempotent: already-live shares verify as no-ops, interrupted shares/unshares (crash-window intents) are finalized, garbage-collected, or resumed, and the recorded namespace identity is re-presented so initiators reattach without operator action; on the SPDK stack it ends with `save_config` whenever reconciliation changed anything (a no-op pass never rewrites the config). `unshare` refuses NQNs the ledger does not own — pre-rebuild or foreign shares surface in `list` as foreign/unmanaged with the manual removal steps.
+`restore` is idempotent: already-live shares verify as no-ops, interrupted shares/unshares (crash-window intents) are finalized, garbage-collected, or resumed, and the recorded namespace identity is re-presented so initiators reattach without operator action; on the SPDK stack it ends with `save_config` whenever reconciliation changed anything (a no-op pass never rewrites the config). `unshare` refuses NQNs the ledger does not own — pre-rebuild or foreign shares surface in `list` as foreign/unmanaged, and the managed way to take one over is **`adopt`**:
+```bash
+# Absorb a live foreign/unledgered share into management. Writes ONLY the
+# share ledger — the live target object is untouched and keeps serving
+# (zero interruption). Stack auto-detected from where the subsystem lives;
+# --target-stack disambiguates an NQN live on both stacks:
+sudo ./target/release/squeezefs nvmeof adopt <subnqn>
+
+# The two scenarios adopt exists for (design §6.10):
+#   * pre-rebuild shares: configfs subsystems built by the old binary
+#     (adopted_from class "pre-rebuild"; small-int port ids are recorded
+#     as-is and removed at unshare only when link-free);
+#   * ledger loss: /var/lib/squeezefs/nvmeof/shares.json destroyed while
+#     the target keeps serving — adopt rebuilds each record in place from
+#     live state (class "ledger-loss"; a surviving spdk/ptpl/<uuid>.json
+#     is re-bound), with zero data-path bounce.
+```
+Adopt is an explicit operator action, never automatic. It refuses loud on six named classes — `adopt_not_live`, `adopt_ambiguous` (live on both stacks; `--target-stack` disambiguates), `adopt_already_ledgered` (NQN or backing already recorded, any intent state — `restore`/`unshare` territory), `adopt_backing_duplicated` (another live object serves the same backing — the duplicate-backing guard applies verbatim), `adopt_harness_owned` (test-fabric objects are never absorbed), `adopt_shape_unsupported` (multi-namespace / non-`bdev_aio` shapes) — and every refusal message is the runbook. Absorption rides the write-ahead intent protocol with a TOCTOU re-verify (live drift aborts loud, leaving nothing behind); identity the live object does not expose is recorded as a **loud null** (re-share under management to upgrade, e.g. to PTPL reservation persistence). After adoption the share is fully managed: `list` shows its `adopted_from` provenance, `restore` and `unshare` treat it like any product-created share. Manual removal-first + re-share remains the fallback for shapes adopt refuses.
 
 ### Connect to Remote NVMe-oF Storage
 To connect to an NVMe over Fabrics target device before mounting:

@@ -95,7 +95,11 @@ snapshot_sections() { # label -> writes $STATE/snap-<label>.txt
         done
         echo "--- n4bgate nvmet configfs objects ---"
         ls -1 "$NVMET_ROOT/subsystems" 2>/dev/null | grep n4bgate || echo "(none)"
-        ls -1d "$NVMET_ROOT/ports/$PORT_ID_PRE" 2>/dev/null || echo "(port gone)"
+        if [ -n "$PORT_ID_PRE" ] && [ -d "$NVMET_ROOT/ports/$PORT_ID_PRE" ]; then
+            echo "n4bgate port $PORT_ID_PRE present"
+        else
+            echo "(no n4bgate port)"
+        fi
         echo "--- devsub substrate presence (observed, never touched) ---"
         ls -1 "$NVMET_ROOT/subsystems" 2>/dev/null | grep devsub || echo "(none)"
         echo "--- listeners 4460-4699 ---"
@@ -104,13 +108,22 @@ snapshot_sections() { # label -> writes $STATE/snap-<label>.txt
     echo "$out"
 }
 
-# Shape+mtime snapshot of one configfs subtree (the zero-target-mutation
-# witness: adopt must leave every path, type, content and mtime as-is).
+# Shape+content snapshot of one configfs subtree (the
+# zero-target-mutation witness): every path + type, every attr file's
+# CONTENT, every symlink's target. Mtimes are deliberately EXCLUDED —
+# measured on this kernel (runs 1–2 of this gate): configfs
+# re-instantiates attribute inodes lazily on lookup and bumps parent
+# dir mtimes on READ walks (adopt's own probe moved namespaces/1 and
+# passthru dir mtimes without writing anything), so mtime is
+# read-noise, not a mutation signal on configfs. Every real mutation
+# still shows: object create/remove = path add/remove, attr write =
+# content change, link change = target change.
 configfs_snapshot() { # dir out-file
     local dir=$1 out=$2
     if [ -d "$dir" ]; then
-        (cd "$dir" && find . -printf '%P|%y|%T@' -exec sh -c \
-            '[ -f "$1" ] && printf "|%s" "$(cat "$1" 2>/dev/null | tr -d "\n")"; echo' _ {} \; \
+        (cd "$dir" && find . \( -type d -printf '%P|d\n' \) -o \
+            \( -type l -printf '%P|l|%l\n' \) -o \
+            \( -type f -exec sh -c 'printf "%s|f|%s\n" "${1#./}" "$(cat "$1" 2>/dev/null | tr -d "\n")"' _ {} \; \) \
             | sort) > "$out" 2>/dev/null
     else
         echo "(absent)" > "$out"
@@ -255,7 +268,7 @@ if [ $RC -eq 0 ] && echo "$OUT" | grep -q "pre-rebuild" && echo "$OUT" | grep -q
 else bad "adopt: rc=$RC $OUT"; fi
 configfs_snapshot "$NVMET_ROOT" "$STATE/configfs-after-adopt.txt"
 if diff -u "$STATE/configfs-before-adopt.txt" "$STATE/configfs-after-adopt.txt" > "$STATE/configfs-adopt.diff"; then
-    ok "ZERO target mutation: configfs shape+content+mtime snapshot identical across adopt"
+    ok "ZERO target mutation: configfs shape+content+symlink snapshot identical across adopt"
 else bad "configfs mutated across adopt:"; cat "$STATE/configfs-adopt.diff"; fi
 
 REC=$(jq -c ".shares[] | select(.subnqn==\"$NQN_PRE\")" "$LEDGER_DIR/shares.json")

@@ -34,9 +34,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
 
+use super::fabric::SYSFS_NVME;
 use super::{check_root, execute_cmd};
-
-const SYSFS_NVME: &str = "/sys/class/nvme";
 
 fn get_host_id() -> String {
     if let Ok(content) = fs::read_to_string("/etc/nvme/hostid") {

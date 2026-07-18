@@ -2007,6 +2007,27 @@ pub struct Metrics {
     /// §5.2 forward-only fence; the dir-level marker normally refuses the
     /// whole mount first, so growth here means a mixed-version dir).
     pub extent_records_future_refused: Align64<AtomicU64>,
+    /// PR 6 / N6 (design-nvmeof-target-management §6.9): gauge —
+    /// fabric-attached (`transport != pcie`) NVMe controllers under
+    /// `/sys/class/nvme` at the last sampler beat. Zero on boxes with no
+    /// fabric (including no sysfs root at all) — never an error.
+    pub fabric_controllers: Align64<AtomicU64>,
+    /// §6.9 gauge — sampled fabric controllers in any non-`live` state
+    /// (`connecting`/`resetting`/…): the reconnect-storm detector.
+    pub fabric_ctrl_not_live: Align64<AtomicU64>,
+    /// §6.9 — a **sampled-transition counter, not a kernel counter**:
+    /// sysfs exposes only instantaneous controller state (there is NO
+    /// native cumulative reconnect count), so this counts *observed*
+    /// not-live→live transitions per controller identity — the
+    /// renumbering-stable `(transport, subsysnqn, address)` tuple — at
+    /// the 10 s stats cadence and **undercounts flaps faster than the
+    /// cadence** (a bounce that fits entirely between two beats counts
+    /// zero). Acceptable for the storm detector it exists to be
+    /// (measured storms run at 10 s cadence for ~10 min); do NOT try to
+    /// "fix" it against a kernel counter that does not exist. Caveat
+    /// pinned by
+    /// `test_fabric_reconnects_is_sampled_transition_counter_undercounts_bursts`.
+    pub fabric_ctrl_reconnects: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -3080,6 +3101,16 @@ impl SqueezefsFilesystem {
                 "transport_commit_batch": serde_json::Value::Object(t_cb_hist),
                 "transport_commit_batch_flushes": t_cb_flushes,
                 "transport_commit_batch_commits": t_cb_commits,
+                // PR 6 / N6 (design-nvmeof-target-management §6.9): the
+                // fabric_* family — box-wide sysfs controller-state
+                // sample published by the 10 s sampler task
+                // (`start_mount`). Always exported; zero-valued on
+                // fabric-less boxes. `fabric_ctrl_reconnects` is the
+                // SAMPLED-transition counter (undercount caveat on the
+                // Metrics field doc).
+                "fabric_controllers": METRICS.fabric_controllers.load(Ordering::Relaxed),
+                "fabric_ctrl_not_live": METRICS.fabric_ctrl_not_live.load(Ordering::Relaxed),
+                "fabric_ctrl_reconnects": METRICS.fabric_ctrl_reconnects.load(Ordering::Relaxed),
                 "write_lock_wait": METRICS.write_lock_wait.to_json(),
                 "block_lock_wait": METRICS.block_lock_wait.to_json(),
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),
@@ -10065,6 +10096,49 @@ pub async fn start_mount<P: AsRef<Path>>(
         })
     };
 
+    // PR 6 / N6 (design-nvmeof-target-management §6.9): the fabric_*
+    // controller-state sampler. Rides the SAME cadence constant as the
+    // heartbeat (one staleness law; the §6.9 "10 s cadence") but its OWN
+    // task, deliberately: a fabric outage stalls the heartbeat loop's
+    // guard writes on the dead device, and the storm detector must keep
+    // sampling exactly then — sharing that loop would blind it to the
+    // outage it exists to observe. Sysfs reads are tiny control-plane
+    // file I/O (the sanctioned nvmeof-module precedent), pushed through
+    // spawn_blocking to keep the runtime clean.
+    let fabric_stats_handle = tokio::spawn(async move {
+        let mut sampler = crate::nvmeof::fabric::FabricStatsSampler::default();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            CLIENT_HEARTBEAT_INTERVAL_SECS,
+        ));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let controllers = tokio::task::spawn_blocking(|| {
+                crate::nvmeof::fabric::enumerate_fabric_controllers(std::path::Path::new(
+                    crate::nvmeof::fabric::SYSFS_NVME,
+                ))
+            })
+            .await
+            .unwrap_or_default();
+            let sample = sampler.observe(&controllers);
+            METRICS
+                .fabric_controllers
+                .store(sample.controllers, Ordering::Relaxed);
+            METRICS
+                .fabric_ctrl_not_live
+                .store(sample.not_live, Ordering::Relaxed);
+            if sample.reconnects_observed > 0 {
+                METRICS
+                    .fabric_ctrl_reconnects
+                    .fetch_add(sample.reconnects_observed, Ordering::Relaxed);
+                info!(
+                    "fabric sampler: {} controller reconnect(s) observed (not_live={} of {})",
+                    sample.reconnects_observed, sample.not_live, sample.controllers
+                );
+            }
+        }
+    });
+
     // Spawns the mount loop using fuse3 Session
     let session = fuse3::raw::Session::new(options);
 
@@ -10256,8 +10330,9 @@ pub async fn start_mount<P: AsRef<Path>>(
         }
     }
 
-    // Stop heartbeat task
+    // Stop heartbeat + fabric sampler tasks
     heartbeat_handle.abort();
+    fabric_stats_handle.abort();
 
     // Clean up the mount by unmounting the session if it hasn't been done already.
     if let Err(e) = handle.unmount().await {
@@ -10316,7 +10391,25 @@ pub async fn get_volume_status(meta_lv_path: &str) -> Result<serde_json::Value, 
         .map(|r| r.to_json())
         .collect();
 
-    Ok(serde_json::json!({
+    // PR 6 / N6 (design-nvmeof-target-management §6.9): the per-volume
+    // "Fabric" section — present only when a backing device (this meta
+    // volume or a data LV) is fabric-attached, rendered from the same
+    // sysfs source as the daemon `.stats` fabric_* family. One-shot
+    // sample: `fabric_ctrl_reconnects` is 0 by construction here (no
+    // history to observe a transition in — the live counter is the
+    // consuming daemon's `.stats` field).
+    let mut backing_devices: Vec<String> = vec![meta_lv_path.to_string()];
+    if let Some(ref datalvs) = config.data_lv {
+        backing_devices.extend(datalvs.iter().cloned());
+    }
+    let fabric_section = crate::nvmeof::fabric::fabric_status_section(
+        &crate::nvmeof::fabric::device_base_names(&backing_devices),
+        &crate::nvmeof::fabric::enumerate_fabric_controllers(std::path::Path::new(
+            crate::nvmeof::fabric::SYSFS_NVME,
+        )),
+    );
+
+    let mut status = serde_json::json!({
         "Setting": {
             "Name": config.name,
             "BlockSize": config.block_size,
@@ -10331,7 +10424,11 @@ pub async fn get_volume_status(meta_lv_path: &str) -> Result<serde_json::Value, 
             "ActiveWriteBackend": "",
         },
         "Clients": clients
-    }))
+    });
+    if let Some(fabric) = fabric_section {
+        status["Fabric"] = fabric;
+    }
+    Ok(status)
 }
 
 async fn run_constant_writeback_worker(

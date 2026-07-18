@@ -183,6 +183,11 @@ straight to the device, where this accounting class cannot arise; see
 btrfs measurement generally). Allowlisted as `R2.seq_write_1m.jfs` with this
 attribution; delete the entry when either component lands.
 
+**Follow-up landed same day — entry DELETED. See the 2026-07-18 addendum
+below: component (a) root-caused as an attribution error (the flag is
+write-path inert, pinned by `escape_never_touches_the_write_path`), and the
+row re-measured W at matched durability.**
+
 ### Loss 2+3 — `R1/R2.del_storm.gee` (0.47×/0.43×): geesefs async-ACK deletes — the del-family twin of the artifact RW6 just retired for writes
 
 geesefs "deletes" 131,072 files at 79,738/86,037 files/s — 1.7 s wall for
@@ -203,25 +208,36 @@ attribution; the chartered follow-up is a durable-del harness mode
 (fsync/syncfs-inclusive delete timing, the RW6 pattern applied to the del
 family).
 
+**Follow-up landed same day — entries DELETED. See the 2026-07-18 addendum
+below: RW6-del shipped, and both rows flip to W (2.44×/2.38×) at matched
+durability with geesefs's 79–86 k relaxed collapsing to ~13.6 k durable,
+exactly as predicted.**
+
 ## Gate posture for releases
 
+**Standing posture (since the 2026-07-18 addendum below): allowlist ∅.**
+
 ```bash
-SQUEEZEFS_SB_ALLOW_LOSS="R1.del_storm.gee,R2.del_storm.gee,R2.seq_write_1m.jfs" \
-  tests/run_scoreboard.sh
+tests/run_scoreboard.sh    # bare — no SQUEEZEFS_SB_ALLOW_LOSS
 ```
 
-Verified on this run's rows (re-score of `rawrows.tsv` with the allowlist):
-**GATE GREEN — no unattributed loss rows**. Every W/TIE row and the N/S
-ledger are hard gate; each allowlisted row must be deleted the day its
-follow-up lands. The historical `R1.seq_write_1m,R3.seq_write_1m` allowlist
-is retired (rows now W at matched durability).
+*Historical record of this run's adjudicated posture (superseded same day —
+all three entries deleted per the follow-up law):* the raw run exited 1 on
+the three loss rows above, and the adjudicated posture at publication was
+`SQUEEZEFS_SB_ALLOW_LOSS="R1.del_storm.gee,R2.del_storm.gee,R2.seq_write_1m.jfs"`,
+verified GATE GREEN on a re-score of `rawrows.tsv`. Every W/TIE row and the
+N/S ledger are hard gate; each allowlisted row must be deleted the day its
+follow-up lands — which happened the same day (addendum). The historical
+`R1.seq_write_1m,R3.seq_write_1m` allowlist is retired (rows now W at
+matched durability).
 
 ## Honest anomalies & residuals
 
 1. **The gate did its job on first contact**: the raw run exits 1 on the
    three rows above; the allowlist above is the *adjudicated* posture, not a
    default. Anyone re-running bare `tests/run_scoreboard.sh` will see the
-   same three rows until the follow-ups land.
+   same three rows until the follow-ups land. *(They landed the same day —
+   addendum below; the standing posture is a bare run, allowlist ∅.)*
 2. **R3 `gee` stat/del = ref-n/a** (geesefs lost ~0.4 % of acked creates
    across its own remount — evidence under Loss 2+3). Not a SqueezeFS gate
    event; recorded as the reference's own behavior with rc=1 rows kept.
@@ -263,9 +279,7 @@ is retired (rows now W at matched durability).
 tests/run_scoreboard.sh                       # full grid (~85 min on this box)
 tests/run_scoreboard.sh teardown              # owned daemons + stores to zero
 SQUEEZEFS_SB_SMOKE=1 tests/run_scoreboard.sh  # ~11 min micro-grid plumbing proof
-# release-gate posture (adjudicated allowlist above):
-SQUEEZEFS_SB_ALLOW_LOSS="R1.del_storm.gee,R2.del_storm.gee,R2.seq_write_1m.jfs" \
-  tests/run_scoreboard.sh
+# release-gate posture: bare (allowlist ∅ since the 2026-07-18 addendum)
 ```
 
 Artifacts for this run: `/var/tmp/squeezefs_scoreboard/artifacts/20260718T190017Z/`
@@ -296,3 +310,134 @@ tarball on unaffected kernels. Residual: **4 wedged juicefs processes**
 reaped without a reboot — PIDs 1428555/1428575/2050894/2050918, zero mounts
 held, zero CPU. Everything else this session spawned was torn down to zero
 residue.
+
+---
+
+## Addendum (2026-07-18, same day): all three allowlist entries retired — standing posture allowlist ∅
+
+Both chartered follow-ups landed on `fix/scoreboard-loss-followups`
+(branch off dev `cefe311`); per the follow-up law, all three entries are
+**deleted** and the standing release-gate posture is a **bare run —
+`SQUEEZEFS_SB_ALLOW_LOSS` empty**. The original tables and adjudications
+above are the historical record of the inaugural run and are unchanged.
+
+### Loss 1 (`R2.seq_write_1m.jfs@durable`) — component (a) resolved: the flag was never causal; attribution error
+
+Root-cause verdict: **`-o direct_device_true` is write-path inert; the
+original R2 depression was ambient substrate state, not the flag.** Three
+independent lines of evidence:
+
+1. **Code**: the escape's only consumers are the three read-side sites in
+   `src/routing.rs` (single-block serve, multi-block arm, ranged fetch —
+   all `direct_device_true() && hint.odirect`); nothing on the
+   write/flush/writeback path consults the flag or `hint.odirect`.
+2. **The original run's own artifacts** (re-mined): the R1 (flag off) and
+   R2 (flag on) `seq_write_1m.sqz` rows are bit-identical above the
+   kernel — same `write_through_blocks` Δ4,064, same
+   `write_through_bytes`, same 16.3 GiB `/proc/pid/io` `write_bytes`,
+   same total daemon CPU (14.4 vs 15.5 core-s). Device `io_ticks` shows
+   the R2 window at **27 % device utilization** (2.3 s busy in the 8.6 s
+   window vs R1's 2.7 s in 3.9 s): the device idled on unsubmitted work —
+   an ambient submission stall, not a throttle. The row launched at
+   `load=13.49` straight after the R1 five-system grid, and **every**
+   reference's R2 write row was equally depressed ~0.5× vs its R1 row
+   (swfs 2,401→1,276; gee 1,363→644; mps3 1,236→446 — none of which
+   mount with the flag).
+3. **Targeted A/B reproduction** (this box, file-backed R2-shape volumes
+   on the same btrfs substrate class, R2 sqz mount posture — 16 G cage,
+   `taskset 0-15`, `--mem-budget 4096M --disk-cache-size 4096MB`;
+   instrument: elbencho 3.1-9 `-w -t16 -s1024m -b1m --direct` + the RW6
+   harness-style timed fdatasync/syncfs pass; standalone rig, n=3/arm,
+   one pair deliberately preceded by ~49 GiB write+delete churn as a
+   noise probe):
+
+   | arm | relaxed MiB/s (median) | durable MiB/s (median) | pass s (median) | phase device drain MiB/s (median) |
+   |---|---:|---:|---:|---:|
+   | flag ON  | 5,135 | 4,855 | 0.149 | 5,073 |
+   | flag OFF | 4,453 | 4,267 | 0.191 | 4,413 |
+
+   Quiet paired runs match at 1.001×/0.998× (drain, on/off); the medians'
+   +15 % skew toward *flag-on* is the churn-probe pair landing on the OFF
+   arm — i.e. ambient churn dominates any flag effect, in either
+   direction. Dirty pages at phase end: ~40 MiB both arms (nothing left
+   for the pass to drain). Harness-native isolated R1+R2 sqz rows agree
+   (artifacts `20260718T221441Z`): R1@durable 4,907 vs R2@durable 4,574,
+   passes 0.151/0.225 s.
+
+**Row re-measured, fresh same-session harness pair** (bare harness,
+`SQUEEZEFS_SB_SYSTEMS="sqz jfs" SQUEEZEFS_SB_REGIMES=R2
+SQUEEZEFS_SB_WORKLOADS=seq_write_1m`, jfs meta=sqlite3, artifacts
+`20260718T225448Z` — same substrate/method/instrument as the inaugural
+run):
+
+| Row | SQZ | JFS | SQZ/jfs | v |
+|---|---:|---:|---:|:--:|
+| R2.seq_write_1m@durable | 4,330 | 2,673 | **1.62×** | **W** |
+| R2.seq_write_1m@relaxed | 4,510 | 2,731 | 1.65× | W |
+
+sqz durability pass 0.152 s (R1/R3-class, was 5.04 s in the inaugural
+row); device drain 4,292 MiB/s at 3.6 daemon cores WITH the flag on,
+`VERIFY` line carries `mode=True`. Acceptance criteria (drain parity
+±10 % on quiet pairs, pass ≤ 0.3 s, beats jfs 2,322 reference at matched
+durability) all met.
+
+**Product outcome**: no code change — the write path was never coupled to
+the flag. The innocence is now a pinned contract:
+`tests/hybrid_io_tests.rs::escape_never_touches_the_write_path` runs one
+identical write script (write-through drain, W1 patch shape,
+staging-spill leg) with the escape off vs armed and requires
+byte-identical write-side counter deltas, zero
+`get_obj`/`write_path_seed_read_bytes`/`read_device_true_reads` motion in
+the write window, and identical durable content — RED-verified against a
+deliberate coupling mutation (write-through gated on the flag ⇒ fails
+loud, 6 vs 0 blocks), green on the real code. Component (b) of the
+original attribution (file-backed `.img` page-cache buffering) did not
+reproduce either — O_DIRECT block writes drain inline on this substrate
+(≈40 MiB dirty at phase end) — and remains covered by the standing
+substrate-honesty note (`tests/dev_substrate.sh` 165× bracket warning);
+raw-namespace production mounts are unaffected by construction.
+
+### Losses 2+3 (`R1/R2.del_storm.gee`) — RW6-del landed: durable-mode delete rows
+
+`tests/run_scoreboard.sh` now carries **RW6-del**: del_storm rows get the
+same two modes as writes — relaxed (native unlink ACK semantics, labeled,
+non-gating) and **durable** (governs del-family verdicts): RMFILES
+elapsed + a timed pass identical for every system — fsync on the tree dir
+and mount root (the client flush lever; geesefs documents dir-fsync
+flushes ALL pending changes inside it, deletes included, while its syncfs
+is not wired up in FUSE), then syncfs on the mount, then syncfs on the
+substrate (store settle). durable value = entries / (RMFILES ms + pass
+s); the follow-up RMDIRS phase stays excluded from both modes, matching
+the relaxed row's historical scope.
+
+**Targeted verification rows** (sqz + gee, R1 + R2, same
+substrate/method/instrument as the inaugural run; RustFS store per the
+harness; artifacts `20260718T224645Z`):
+
+| Row | mode | SQZ | GEE | SQZ/gee | v | gee pass split |
+|---|---|---:|---:|---:|:--:|---|
+| R1.del_storm | relaxed | 37,188 | 81,005 | 0.46× | labeled | — |
+| R1.del_storm | **durable** | **33,591** | **13,785** | **2.44×** | **W** | `dirfsync_s=7.706 syncfs_s=0.185` |
+| R2.del_storm | relaxed | 37,183 | 81,822 | 0.45× | labeled | — |
+| R2.del_storm | **durable** | **32,292** | **13,581** | **2.38×** | **W** | `dirfsync_s=7.769 syncfs_s=0.281` |
+
+Exactly the adjudication's prediction: geesefs's acked 81 k files/s
+collapses to ~13.6 k once its DeleteObjects queue actually drains (7.7 s
+of dir-fsync — the flush lever its own docs prescribe), while SqueezeFS's
+journal-durable destroys barely move (37.2 k → 33.6/32.3 k; sqz pass
+0.378/0.534 s, dir-fsync ≤ 45 ms). Both rows are Ws with an empty
+allowlist; gate GREEN on the targeted runs.
+
+### Standing posture
+
+```bash
+tests/run_scoreboard.sh    # release gate: bare run, allowlist ∅
+```
+
+Follow-up branch evidence: contract test + RW6-del harness commits on
+`fix/scoreboard-loss-followups`; targeted-row artifacts
+`20260718T221441Z` (isolated R1/R2 sqz pair), `20260718T224645Z`
+(durable-del sqz+gee R1/R2), `20260718T225448Z` (fresh R2 sqz/jfs pair).
+Every measurement above states its instrument (elbencho 3.1-9 phases;
+harness python durability passes; standalone-rig A/B for the n=3
+medians). n=1 per harness row per the standing scoreboard discipline.

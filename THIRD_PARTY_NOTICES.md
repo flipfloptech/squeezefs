@@ -6,15 +6,17 @@ recorded below; each remains governed by its own original license, which is
 unaffected by the repository's BUSL 1.1. This file satisfies the attribution
 and notice-retention obligations of those licenses.
 
-## Vendored: `third_party/fuse3/` — MIT License
+## Fork: `crates/fuse3/` — derived from `fuse3` (MIT License)
 
-[`third_party/fuse3/`](third_party/fuse3/) is a locally patched vendored fork
-of the [`fuse3`](https://crates.io/crates/fuse3) crate v0.7.3 ("FUSE
+[`crates/fuse3/`](crates/fuse3/) is a first-party maintained fork, derived
+from upstream [`fuse3`](https://crates.io/crates/fuse3) crate v0.7.3 ("FUSE
 user-space library async version implementation") by Sherlock Holo,
 upstream repository <https://github.com/Sherlock-Holo/fuse3>, wired in via
-`[patch.crates-io]` in [Cargo.toml](Cargo.toml). The directory remains under
-its original upstream **MIT License**; the upstream license file is retained
-in-tree at [`third_party/fuse3/LICENSE`](third_party/fuse3/LICENSE) and is
+`[patch.crates-io]` in [Cargo.toml](Cargo.toml). The fork has substantially
+diverged from upstream and is maintained as first-party code, but it
+inherits its provenance obligations: the derived portions remain under the
+original upstream **MIT License**, the upstream license file is retained
+in-tree at [`crates/fuse3/LICENSE`](crates/fuse3/LICENSE), and it is
 reproduced here as its terms require:
 
 ```text

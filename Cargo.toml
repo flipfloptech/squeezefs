@@ -72,7 +72,7 @@ nix = { version = "0.29.0", features = ["ioctl"] }
 
 
 [patch.crates-io]
-fuse3 = { path = "third_party/fuse3" }
+fuse3 = { path = "crates/fuse3" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "0.5"

@@ -109,7 +109,7 @@ POSIX FUSE locks map to cluster leases on Metadata Volumes:
 * Work-stealing / multi-thread tokio; core pinning where configured.
 * **Block path io_uring:** `NvmeBlockDev` worker (bounded request queue, backpressure, fixed-file register when available).
 * **Path file I/O io_uring:** `crate::uring_fs` for ad-hoc local files (e.g. GDS cache materialize). Staging **mmap** segments stay mmap for zero-syscall get/put.
-* **FUSE transport:** vendored **fuse3** — classical `/dev/fuse` only for `FUSE_INIT` (kernel requires initialized connection before REGISTER); **FUSE-over-io_uring is required** for the request hot path after arm (`flags2` `FUSE_OVER_IO_URING`, `REGISTER` / `COMMIT_AND_FETCH`). No userspace opt-out; mount fails if setup fails. Auto-enables `fuse.enable_uring=Y` when possible. One queue per possible CPU; session arms only after all queues REGISTERed.
+* **FUSE transport:** the first-party **fuse3** fork (`crates/fuse3`) — classical `/dev/fuse` only for `FUSE_INIT` (kernel requires initialized connection before REGISTER); **FUSE-over-io_uring is required** for the request hot path after arm (`flags2` `FUSE_OVER_IO_URING`, `REGISTER` / `COMMIT_AND_FETCH`). No userspace opt-out; mount fails if setup fails. Auto-enables `fuse.enable_uring=Y` when possible. One queue per possible CPU; session arms only after all queues REGISTERed.
 * Always use io_uring when we can (non-negotiable) — see Non-Negotiables section.
 * No dead code (non-negotiable) — see Non-Negotiables section.
 * Not uring: TLS peer paths (network). Staging mmap segments stay mmap by design.
@@ -438,9 +438,9 @@ cargo build --release
 
 `[profile.release]` keeps `debug = true` so release binaries carry symbols for profiling. `tikv-jemallocator` is the global allocator on Linux.
 
-### Patched `fuse3` dependency
+### First-party `fuse3` fork (`crates/fuse3`)
 
-`Cargo.toml` has `[patch.crates-io] fuse3 = { path = "third_party/fuse3" }`. The vendored copy in `third_party/fuse3/` is patched locally — do not replace it with the crates.io version or "restore" `Cargo.toml.orig`. If FUSE behavior changes, edit the vendored source.
+`crates/fuse3` is a maintained **fork** of the upstream crates.io `fuse3` crate (v0.7.3, Sherlock Holo, MIT — upstream attribution retained in `THIRD_PARTY_NOTICES.md` and `crates/fuse3/LICENSE`). It has substantially diverged from upstream: the FUSE-over-io_uring transport, payload leases, and flag sweeps live here. Treat it as first-party code — edit it directly when FUSE behavior changes; **never** replace it with the crates.io version or "restore" `Cargo.toml.orig`. `Cargo.toml` has `[patch.crates-io] fuse3 = { path = "crates/fuse3" }`, which redirects every `fuse3` dependency edge in the build graph to this in-tree fork.
 
 ### Build features for profiling
 

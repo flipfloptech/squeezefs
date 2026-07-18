@@ -77,7 +77,7 @@ The staged roadmap agreed with the owner: (1) per-record checksums, (2) durable 
 - **Data-block backpointers / refcount durability** (`block_allocator.rs:281-411` mount rebuild scan): unchanged in this design; the KV layer reserves a tree id for a future backpointers tree (§4.2).
 - **Snapshots/reflink of metadata**: designed-for only.
 - **A networked/replicated DLM**: the in-process DLM (`src/dlm.rs`, `meta_backend/dlm.rs`) and its fencing-token semantics are composed with, not changed (§4.9).
-- **FUSE transport** (vendored `third_party/fuse3`), `fsck`-style offline repair tooling beyond what mount-time validation provides, and dropping v2 mount support (a later, separate decision).
+- **FUSE transport** (the first-party `crates/fuse3` fork), `fsck`-style offline repair tooling beyond what mount-time validation provides, and dropping v2 mount support (a later, separate decision).
 
 ---
 

@@ -35,7 +35,7 @@ for both sides (dev control rebuilt in a clean worktree @ `3c9eda4`).
    timer per inbound request pull) plus the tokio **time-driver park path**
    (`process_at_time` 0.68 %/0.72 %, driver total 1.31 %/1.30 % — equal on both
    sides) survive M4 untouched, because the transport is **M3/M10 scope** and
-   M4's Files row never touches `third_party/fuse3`. The design's own word was
+   M4's Files row never touches `crates/fuse3`. The design's own word was
    "2.75 % … is the measured **ceiling** of the win", and the measured handler
    share of it is ~0.2 pp. D1.b's direct proof therefore rests on (a) the
    deleted wrappers + zero-clock-read registry path (code + pinned contract

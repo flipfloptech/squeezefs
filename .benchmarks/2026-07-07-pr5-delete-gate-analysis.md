@@ -90,7 +90,7 @@ Decomposition of the ~205 µs above the transport floor:
   unlink syscall. The daemon cannot pre-drop those pages: the
   FUSE-over-io_uring transport currently REJECTS outbound notify
   (`fuse_notify_inval_*` unsupported in the vendored fuse3 over-uring write
-  path, `third_party/fuse3/src/raw/connection/tokio.rs:552-560`), so
+  path, `crates/fuse3/src/raw/connection/tokio.rs:552-560`), so
   notify-based pre-eviction (or kernel ≥ 6.16 `FUSE_NOTIFY_INC_EPOCH`-style
   approaches) requires a transport feature first.
 

@@ -74,7 +74,7 @@ this traffic. Ours did not. Daemon-side defect; no kernel workaround needed.
 
 ## Fix (io_uring-first compliant)
 
-`third_party/fuse3` (vendored, edited in place):
+`crates/fuse3` (vendored, edited in place):
 
 - **Classical sideband servicer**: after arm, the primary session keeps
   reading `/dev/fuse` — via the existing io_uring `Readv` path

@@ -92,7 +92,7 @@ pub mod gauge_core;
 pub mod incarnation_core;
 #[path = "../../src/meta_backend/kv/journal_core.rs"]
 pub mod journal_core;
-#[path = "../../third_party/fuse3/src/raw/connection/lease_core.rs"]
+#[path = "../../crates/fuse3/src/raw/connection/lease_core.rs"]
 pub mod lease_core;
 #[path = "../../src/meta_backend/kv/node_state_core.rs"]
 pub mod node_state_core;

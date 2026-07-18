@@ -10,7 +10,7 @@
 //! small-RAM boxes degrade gracefully instead of pinning RAM.
 //!
 //! Normative default policy (encoded here, implemented in
-//! `third_party/fuse3/src/raw/connection/fuse_over_uring.rs` +
+//! `crates/fuse3/src/raw/connection/fuse_over_uring.rs` +
 //! `src/mem_budget.rs::transport_buffer_cap`):
 //!
 //! - queues = kernel possible CPUs (unchanged; kernel readiness requires

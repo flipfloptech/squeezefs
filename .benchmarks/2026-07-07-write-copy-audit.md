@@ -2,7 +2,7 @@
 
 Read-only audit of `/home/justin/Source/squeezefs` @ 2026-07-07.
 Scenario: large sequential write to a striped file. Defaults: FUSE `max_write` = 1 MiB
-(`KERNEL_MAX_PAGES_LIMIT * 4096`, `third_party/fuse3/src/raw/connection/fuse_over_uring.rs:268-273`),
+(`KERNEL_MAX_PAGES_LIMIT * 4096`, `crates/fuse3/src/raw/connection/fuse_over_uring.rs:268-273`),
 FS `block_size` = 4 MiB. Crypto/compression **passthrough** unless noted.
 
 ## Path actually taken by a large sequential write
@@ -40,9 +40,9 @@ Sizes are per unit that flows through that point (R = one FUSE request ≤1 MiB;
 | # | Location | From → To | Size | Avoidable? How |
 |---|----------|-----------|------|----------------|
 | K | kernel `fuse_uring_commit_fetch` (not in repo) | page cache → registered `ent.payload` (`fuse_over_uring.rs:680,704-707`) | 1 MiB /R | **No** (required kernel→user copy; the one physically necessary CPU copy) |
-| 1 | `third_party/fuse3/src/raw/connection/fuse_over_uring.rs:896-898` | `ent.payload: Vec<u8>` → `Bytes::copy_from_slice` → fresh heap `Bytes` | 1 MiB /R **+ 1 MiB alloc per request** | **Yes.** `Bytes::from_owner` over a leased ent-payload buffer; double-buffer per ent or defer COMMIT re-arm until the lease drops |
-| 2 | `third_party/fuse3/src/raw/connection/tokio.rs:470,475` (also 483,494 fallback) | `InboundUringReq.payload: Bytes` → session `data_buf: Vec<u8>` (reused) | 1 MiB /R | **Yes.** Only `op_in` (= `fuse_write_in`, 40 B) is needed by `handle_write`; skip body copy when opcode == FUSE_WRITE (opcode is at `header_and_op[4..8]`) |
-| 3 | `third_party/fuse3/src/raw/session.rs:2471` | `Bytes::copy_from_slice(data)` — **classical path only**; uring path (`:2469-2470`) reuses `payload` refcounted | 1 MiB /R (classical only) | Already zero-copy over-uring; classical is INIT-only, ignore |
+| 1 | `crates/fuse3/src/raw/connection/fuse_over_uring.rs:896-898` | `ent.payload: Vec<u8>` → `Bytes::copy_from_slice` → fresh heap `Bytes` | 1 MiB /R **+ 1 MiB alloc per request** | **Yes.** `Bytes::from_owner` over a leased ent-payload buffer; double-buffer per ent or defer COMMIT re-arm until the lease drops |
+| 2 | `crates/fuse3/src/raw/connection/tokio.rs:470,475` (also 483,494 fallback) | `InboundUringReq.payload: Bytes` → session `data_buf: Vec<u8>` (reused) | 1 MiB /R | **Yes.** Only `op_in` (= `fuse_write_in`, 40 B) is needed by `handle_write`; skip body copy when opcode == FUSE_WRITE (opcode is at `header_and_op[4..8]`) |
+| 3 | `crates/fuse3/src/raw/session.rs:2471` | `Bytes::copy_from_slice(data)` — **classical path only**; uring path (`:2469-2470`) reuses `payload` refcounted | 1 MiB /R (classical only) | Already zero-copy over-uring; classical is INIT-only, ignore |
 | 4 | `src/fuse_client.rs:1262-1270` | first touch of a block: `ALIGNED_BUF_POOL.alloc_raw()` + `write_bytes(ptr,0,4MiB)` zero-fill | 4 MiB /B (memset) | **Yes** for full-coverage blocks: no buffer needed at all (see refactor 1) |
 | 5 | `src/fuse_client.rs:1358-1371` | RMW seed: existing block `Bytes` → `copy_nonoverlapping` into `AlignedBufOwner` | ≤4 MiB /B | Only on partial overwrite of existing data; unavoidable for true RMW, avoidable when coverage is complete |
 | 6 | `src/fuse_client.rs:1384-1390` | request payload slice → `copy_nonoverlapping` into block buffer (`block_data.as_ptr() as *mut u8` — **mutates a shared `Bytes` via raw ptr; latent UB**) | 1 MiB /R (4 MiB cumulative /B) | **Yes** for full-coverage blocks (refactor 1). For genuine partial-block RMW this is the legitimate merge copy |
@@ -82,8 +82,8 @@ Signature impact: none externally; new private helper e.g. `async fn upload_full
 ### 2. Transport zero-copy: kill copies #1 and #2 (est. +150-300 MiB/s)
 2 MiB of memcpy + a 1 MiB heap alloc per 1 MiB request, on the fuse-over-uring thread — this is the transport half of the glibc-memcpy profile.
 Changes:
-- `third_party/fuse3/src/raw/connection/fuse_over_uring.rs`: replace `Bytes::copy_from_slice(&ents[ent_idx].payload[..])` (`:896-898`) with `Bytes::from_owner(EntPayloadLease { pool, qid, ent_idx })`. Requires the ent's payload buffer not to be re-armed while the lease lives: either (a) per-ent double buffering (swap a spare `Vec<u8>` in before COMMIT_AND_FETCH — moves the copy to only-when-contended), or (b) defer the ent's re-arm until lease drop (depth=4 gives slack; add a "parked ent" state). Note `UringBufOwner` (`tokio.rs:576-579`) already proves the from_owner pattern on the reply side.
-- `third_party/fuse3/src/raw/connection/tokio.rs:462-499`: after `header_buf` is filled, read opcode from `inbound.header_and_op[4..8]`; for `FUSE_WRITE`, copy only `op_in` (40 B of `fuse_write_in`) into `data_buf` and skip the payload body copy — `handle_write` (`session.rs:2436-2472`) only parses `fuse_write_in` from `data_ref` and then uses `uring_payload` anyway. (Requires relaxing the `write_in.size == data.len()` check at `session.rs:2461` to validate against `payload.len()` on the uring path.)
+- `crates/fuse3/src/raw/connection/fuse_over_uring.rs`: replace `Bytes::copy_from_slice(&ents[ent_idx].payload[..])` (`:896-898`) with `Bytes::from_owner(EntPayloadLease { pool, qid, ent_idx })`. Requires the ent's payload buffer not to be re-armed while the lease lives: either (a) per-ent double buffering (swap a spare `Vec<u8>` in before COMMIT_AND_FETCH — moves the copy to only-when-contended), or (b) defer the ent's re-arm until lease drop (depth=4 gives slack; add a "parked ent" state). Note `UringBufOwner` (`tokio.rs:576-579`) already proves the from_owner pattern on the reply side.
+- `crates/fuse3/src/raw/connection/tokio.rs:462-499`: after `header_buf` is filled, read opcode from `inbound.header_and_op[4..8]`; for `FUSE_WRITE`, copy only `op_in` (40 B of `fuse_write_in`) into `data_buf` and skip the payload body copy — `handle_write` (`session.rs:2436-2472`) only parses `fuse_write_in` from `data_ref` and then uses `uring_payload` anyway. (Requires relaxing the `write_in.size == data.len()` check at `session.rs:2461` to validate against `payload.len()` on the uring path.)
 
 ### 3. Writeback flush zero-copy: kill copy #8 (est. +100-200 MiB/s, and the fsync path)
 Partially subsumed by refactor 1 for sequential streams, but still hit by partial blocks, backpressure spills, and every fsync-driven flush; also removes a 4 MiB alloc per block.

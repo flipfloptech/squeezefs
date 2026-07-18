@@ -401,13 +401,19 @@ impl BackendRouter {
         sum
     }
 
+    /// Per-op backend health gate: the explicit `unhealthy_backends` mark
+    /// (the real health state machine) is authoritative and instant; the
+    /// device-node liveness probe behind it is TTL-cached on the device
+    /// (L3 statx residual — a bare `Path::exists()` here was 0.76
+    /// statx/op on the rand-4k charter workload; the I/O path fails loud
+    /// on a vanished node inside the TTL window).
     pub fn is_backend_healthy(&self, be_id: &str) -> bool {
         if self.unhealthy_backends.contains_key(be_id) {
             false
         } else if be_id == "backend_0" {
-            std::path::Path::new(&self.default_device.device_path).exists()
+            self.default_device.node_exists_cached()
         } else if let Some(be) = self.backends.get(be_id) {
-            std::path::Path::new(&be.device.device_path).exists()
+            be.device.node_exists_cached()
         } else {
             false
         }

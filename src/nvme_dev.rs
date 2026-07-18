@@ -537,10 +537,20 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
 /// transport-economy regression.
 pub const NODE_PROBE_TTL_MS: u64 = 1000;
 
+/// TTL-cached device-node liveness state, shared across [`NvmeBlockDev`]
+/// clones (they describe the same node, so they share one probe).
+struct NodeProbe {
+    /// Coarse monotonic ms of the last probe (0 = never probed).
+    at_ms: std::sync::atomic::AtomicU64,
+    /// Last probe outcome (valid while fresh).
+    seen: std::sync::atomic::AtomicBool,
+}
+
 #[derive(Clone)]
 pub struct NvmeBlockDev {
     pub device_path: String,
     worker: Arc<UringWorker>,
+    node_probe: Arc<NodeProbe>,
 }
 
 /// Capacity in bytes of a backing file OR block device (seek-to-end works
@@ -551,12 +561,46 @@ pub fn device_capacity_bytes(path: &str) -> std::io::Result<u64> {
     f.seek(std::io::SeekFrom::End(0))
 }
 
+/// Coarse monotonic milliseconds since process start (probe-TTL clock).
+fn coarse_monotonic_ms() -> u64 {
+    static START: once_cell::sync::Lazy<std::time::Instant> =
+        once_cell::sync::Lazy::new(std::time::Instant::now);
+    START.elapsed().as_millis() as u64
+}
+
 impl NvmeBlockDev {
     pub fn new(device_path: &str) -> Self {
         Self {
             device_path: device_path.to_string(),
             worker: Arc::new(UringWorker::new(device_path.to_string())),
+            node_probe: Arc::new(NodeProbe {
+                at_ms: std::sync::atomic::AtomicU64::new(0),
+                seen: std::sync::atomic::AtomicBool::new(false),
+            }),
         }
+    }
+
+    /// TTL-cached device-node liveness (L3 statx residual: the per-ranged-
+    /// read `Path::exists()` in `is_backend_healthy` was 0.76 statx/op on
+    /// the charter workload). The probe is a liveness *hint* — the I/O
+    /// path itself fails loud on a vanished device inside the TTL window —
+    /// so a ≤ [`NODE_PROBE_TTL_MS`] detection delay trades nothing real.
+    /// Racing expirers may both re-probe (idempotent statx on the same
+    /// path); a torn seen/at pairing pairs two probes of the same node
+    /// microseconds apart and self-heals within one TTL.
+    pub fn node_exists_cached(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let now = coarse_monotonic_ms();
+        let at = self.node_probe.at_ms.load(Ordering::Relaxed);
+        if at != 0 && now.saturating_sub(at) < NODE_PROBE_TTL_MS {
+            return self.node_probe.seen.load(Ordering::Relaxed);
+        }
+        let seen = std::path::Path::new(&self.device_path).exists();
+        self.node_probe.seen.store(seen, Ordering::Relaxed);
+        // `max(1)`: 0 is the never-probed sentinel; a probe inside the
+        // process's first millisecond must still record as probed.
+        self.node_probe.at_ms.store(now.max(1), Ordering::Relaxed);
+        seen
     }
 
     pub async fn write_block(&self, offset: u64, data: bytes::Bytes) -> Result<()> {

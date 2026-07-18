@@ -217,6 +217,11 @@ pub struct ShareRequest {
     pub subnqn: String,
     pub backing_path: String,
     pub backing_canonical: String,
+    /// `--nsid` (§6.2: SPDK-only — the SPDK stack pins
+    /// `unwrap_or(1)` via `add_ns -n` and records it; the nvmet stack's
+    /// namespace index is structurally fixed at 1, so grammar validation
+    /// guarantees `None`/`Some(1)` there and nothing is recorded).
+    pub nsid: Option<u32>,
     /// The both-stack namespace identity (§6.4): seeded by `--ns-uuid`
     /// or generated once at share time — recorded, stamped
     /// (nvmet `device_uuid` / SPDK `add_ns -u`), re-presented by restore.

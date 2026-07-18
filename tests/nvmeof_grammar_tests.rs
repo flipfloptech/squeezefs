@@ -7,17 +7,21 @@
 //!   lifecycle verbs fail with clap's unknown-verb error (the README
 //!   removed-verbs ledger explains them);
 //! * `--target-stack` resolution (flag > `SQUEEZEFS_NVMEOF_TARGET_STACK`
-//!   env > default `spdk`) and the **loud-fail UX for the SPDK default
-//!   share path** — as of N3 the target lifecycle verbs are live, so the
-//!   designed preflight message points at the REAL `target
-//!   install/start` verbs while stating that SPDK **sharing** lands with
-//!   N4 (the PR-plan's remediation-text-only update);
+//!   env > default `spdk`) — **as of N4 the default stack reaches a real
+//!   `SpdkStack`**: the N3 interim milestone refusal is dead, so an
+//!   unprivileged SPDK-selected share/restore dies on the ROOT rung
+//!   (proving stack construction succeeded), never on a milestone
+//!   message; resolution is observed via the `--nsid` per-stack
+//!   discriminator (nvmet refuses ≠ 1 at the grammar rung, spdk allows);
 //! * the `target …` verb surface exists (N3): install/setup/start/stop/
 //!   status demand root; systemd-unit emits unprivileged;
 //!   `install --version` must equal the pin;
 //! * per-stack flag semantics (§6.2): `--nsid` is SPDK-only (nvmet index
 //!   structurally fixed at 1 ⇒ `--nsid` ≠ 1 with nvmet refuses loud);
-//!   `--ns-uuid` seeds both stacks and must parse.
+//!   `--ns-uuid` seeds both stacks and must parse; N4 adds
+//!   `--accept-version-drift` to the mutating share verbs (share /
+//!   unshare / restore — SPDK rung 4) and `--force` to unshare (the R7
+//!   live-consumer override), both refusing loud where meaningless.
 //!
 //! Every invocation uses a missing backing path and a tempdir state dir,
 //! so even a root run mutates nothing.
@@ -147,41 +151,26 @@ fn test_target_grammar_help_lists_lifecycle_verbs() {
 }
 
 // ---------------------------------------------------------------------------
-// the SPDK-default loud-fail UX for the SHARE path (remediation text
-// updated at N3: target lifecycle verbs are live, sharing lands with N4)
+// the SPDK default reaches a REAL SpdkStack from N4 on (the interim
+// milestone refusal is dead — unprivileged runs die on the root rung)
 // ---------------------------------------------------------------------------
 
-fn assert_spdk_unavailable_message(context: &str, text: &str) {
+fn assert_reaches_real_spdk_path(context: &str, text: &str) {
     assert!(
-        text.contains("SPDK target stack unavailable"),
-        "{context}: must name the unavailable stack: {text}"
+        !text.contains("lands with milestone N4") && !text.contains("SPDK share management lands"),
+        "{context}: the N3 interim milestone refusal must be DEAD at N4: {text}"
     );
     assert!(
-        text.contains("SPDK share management lands with milestone N4"),
-        "{context}: must carry the designed milestone message: {text}"
-    );
-    assert!(
-        text.contains("target lifecycle verbs are live"),
-        "{context}: must state that the N3 target verbs exist: {text}"
-    );
-    assert!(
-        text.contains("nvmeof target install") && text.contains("nvmeof target start"),
-        "{context}: remediation points at the REAL lifecycle verbs: {text}"
-    );
-    assert!(
-        text.contains("--target-stack nvmet"),
-        "{context}: must name the explicit kernel-stack selection: {text}"
-    );
-    assert!(
-        text.contains("never falls back between target stacks"),
-        "{context}: must state the no-silent-fallback law: {text}"
+        text.contains("root"),
+        "{context}: unprivileged SPDK-selected verbs die on the root rung (stack construction \
+         succeeded): {text}"
     );
 }
 
-/// `share` with the default stack (spdk) fails LOUD with the designed
-/// preflight message — before any root check or backing side effect.
+/// `share` with the default stack (spdk) reaches the real SPDK path:
+/// unprivileged it dies demanding root — never on a milestone message.
 #[test]
-fn test_share_default_stack_spdk_fails_loud_with_milestone_message() {
+fn test_share_default_stack_reaches_real_spdk_path() {
     let out = run(
         &[
             "nvmeof",
@@ -192,16 +181,13 @@ fn test_share_default_stack_spdk_fails_loud_with_milestone_message() {
         ],
         &[],
     );
-    assert!(
-        !out.status.success(),
-        "default (spdk) share must fail at N2"
-    );
-    assert_spdk_unavailable_message("default stack", &combined(&out));
+    assert!(!out.status.success(), "unprivileged share must fail");
+    assert_reaches_real_spdk_path("default stack", &combined(&out));
 }
 
-/// Explicit `--target-stack spdk` fails with the same message.
+/// Explicit `--target-stack spdk` reaches the same real path.
 #[test]
-fn test_share_explicit_spdk_fails_loud() {
+fn test_share_explicit_spdk_reaches_real_path() {
     let out = run(
         &[
             "nvmeof",
@@ -215,14 +201,16 @@ fn test_share_explicit_spdk_fails_loud() {
         &[],
     );
     assert!(!out.status.success());
-    assert_spdk_unavailable_message("explicit spdk", &combined(&out));
+    assert_reaches_real_spdk_path("explicit spdk", &combined(&out));
 }
 
 /// Stack resolution order: the flag wins over the env; the env wins over
-/// the default.
+/// the default — observed via the `--nsid` per-stack discriminator
+/// (nvmet refuses `--nsid` ≠ 1 at the grammar rung, spdk allows it).
 #[test]
 fn test_stack_resolution_flag_over_env_over_default() {
-    // env=spdk (same as default): loud-fail.
+    // Default (spdk): --nsid 2 is legal — the run proceeds to the root
+    // rung, never the structural-index refusal.
     let out = run(
         &[
             "nvmeof",
@@ -230,14 +218,21 @@ fn test_stack_resolution_flag_over_env_over_default() {
             "/nonexistent/backing.img",
             "--ip",
             "127.0.0.1",
+            "--nsid",
+            "2",
         ],
-        &[("SQUEEZEFS_NVMEOF_TARGET_STACK", "spdk")],
+        &[],
     );
     assert!(!out.status.success());
-    assert_spdk_unavailable_message("env spdk", &combined(&out));
+    let text = combined(&out);
+    assert!(
+        !text.contains("structurally fixed"),
+        "default spdk allows --nsid 2: {text}"
+    );
+    assert_reaches_real_spdk_path("default stack nsid", &text);
 
-    // env=nvmet: passes stack resolution — fails later (root or missing
-    // backing), NOT with the spdk message.
+    // env=nvmet: the env is honored — --nsid 2 dies on the structural
+    // refusal BEFORE root.
     let out = run(
         &[
             "nvmeof",
@@ -245,21 +240,19 @@ fn test_stack_resolution_flag_over_env_over_default() {
             "/nonexistent/backing.img",
             "--ip",
             "127.0.0.1",
+            "--nsid",
+            "2",
         ],
         &[("SQUEEZEFS_NVMEOF_TARGET_STACK", "nvmet")],
     );
     assert!(!out.status.success());
     let text = combined(&out);
     assert!(
-        !text.contains("SPDK target stack unavailable"),
+        text.contains("structurally fixed at 1"),
         "env nvmet must select the kernel stack: {text}"
     );
-    assert!(
-        text.contains("root") || text.contains("does not exist"),
-        "nvmet share must proceed to the root/backing checks: {text}"
-    );
 
-    // flag=spdk beats env=nvmet.
+    // flag=spdk beats env=nvmet: --nsid 2 is legal again.
     let out = run(
         &[
             "nvmeof",
@@ -267,13 +260,20 @@ fn test_stack_resolution_flag_over_env_over_default() {
             "/nonexistent/backing.img",
             "--ip",
             "127.0.0.1",
+            "--nsid",
+            "2",
             "--target-stack",
             "spdk",
         ],
         &[("SQUEEZEFS_NVMEOF_TARGET_STACK", "nvmet")],
     );
     assert!(!out.status.success());
-    assert_spdk_unavailable_message("flag over env", &combined(&out));
+    let text = combined(&out);
+    assert!(
+        !text.contains("structurally fixed"),
+        "the flag must beat the env: {text}"
+    );
+    assert_reaches_real_spdk_path("flag over env", &text);
 }
 
 /// An unparseable env value refuses loud (never a silent default).
@@ -297,13 +297,114 @@ fn test_invalid_env_stack_value_refuses_loud() {
     );
 }
 
-/// `restore --target-stack spdk` (an explicit SPDK filter) fails loud
-/// with the milestone message at N2.
+/// `restore --target-stack spdk` reaches the real SPDK restore path at
+/// N4: unprivileged it dies on the root rung, never on a milestone
+/// message.
 #[test]
-fn test_restore_spdk_filter_fails_loud() {
+fn test_restore_spdk_filter_reaches_real_path() {
     let out = run(&["nvmeof", "restore", "--target-stack", "spdk"], &[]);
     assert!(!out.status.success());
-    assert_spdk_unavailable_message("restore spdk", &combined(&out));
+    assert_reaches_real_spdk_path("restore spdk", &combined(&out));
+}
+
+// ---------------------------------------------------------------------------
+// N4 mutating-verb flags (§6.2 flag placement + R7)
+// ---------------------------------------------------------------------------
+
+/// `--accept-version-drift` exists on the mutating share verbs (share /
+/// unshare / restore — it gates SPDK preflight rung 4 wherever that rung
+/// runs); unshare additionally carries `--force` (the live-consumer
+/// override). Unprivileged runs die on the root rung, never on clap.
+#[test]
+fn test_mutating_share_verbs_carry_drift_and_force_flags() {
+    for args in [
+        vec![
+            "nvmeof",
+            "share",
+            "/nonexistent/backing.img",
+            "--ip",
+            "127.0.0.1",
+            "--accept-version-drift",
+        ],
+        vec![
+            "nvmeof",
+            "unshare",
+            "nqn.2026-07.io.squeezefs:share-x",
+            "--accept-version-drift",
+        ],
+        vec![
+            "nvmeof",
+            "unshare",
+            "nqn.2026-07.io.squeezefs:share-x",
+            "--force",
+        ],
+        vec!["nvmeof", "restore", "--accept-version-drift"],
+        vec![
+            "nvmeof",
+            "restore",
+            "--target-stack",
+            "spdk",
+            "--accept-version-drift",
+        ],
+    ] {
+        let out = run(&args, &[]);
+        assert!(!out.status.success(), "{args:?} unprivileged must fail");
+        let text = combined(&out);
+        assert!(
+            !text.contains("unexpected argument") && !text.contains("unrecognized subcommand"),
+            "{args:?} must exist in the N4 grammar: {text}"
+        );
+        assert!(text.contains("root"), "{args:?} demands root: {text}");
+    }
+}
+
+/// `--accept-version-drift` with an explicit nvmet selection refuses
+/// loud at the grammar rung (SPDK-only — the kernel target has no
+/// version to drift; the `--disk-cache-paths` never-silently-ignore
+/// precedent), before the root check.
+#[test]
+fn test_share_accept_version_drift_with_nvmet_refuses_loud() {
+    let out = run(
+        &[
+            "nvmeof",
+            "share",
+            "/nonexistent/backing.img",
+            "--ip",
+            "127.0.0.1",
+            "--target-stack",
+            "nvmet",
+            "--accept-version-drift",
+        ],
+        &[],
+    );
+    assert!(!out.status.success());
+    let text = combined(&out);
+    assert!(
+        text.contains("--accept-version-drift") && text.contains("SPDK-only"),
+        "must name the flag as SPDK-only: {text}"
+    );
+    assert!(
+        !text.contains("root privileges"),
+        "the flag refusal fires before the root check: {text}"
+    );
+
+    // Same law on the restore filter.
+    let out = run(
+        &[
+            "nvmeof",
+            "restore",
+            "--target-stack",
+            "nvmet",
+            "--accept-version-drift",
+        ],
+        &[],
+    );
+    assert!(!out.status.success());
+    let text = combined(&out);
+    assert!(
+        text.contains("--accept-version-drift") && text.contains("SPDK-only"),
+        "restore --target-stack nvmet --accept-version-drift refuses: {text}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -50,6 +50,7 @@ fn req(subnqn: &str, backing: &str, ns_uuid: &str, listeners: &[(&str, u16)]) ->
         subnqn: subnqn.to_string(),
         backing_path: backing.to_string(),
         backing_canonical: backing.to_string(),
+        nsid: None,
         ns_uuid: ns_uuid.to_string(),
         listeners: listeners
             .iter()

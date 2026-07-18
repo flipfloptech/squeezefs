@@ -357,6 +357,7 @@ pub fn share(opts: &ShareOptions) -> Result<ShareRecord, NvmeofError> {
         subnqn,
         backing_canonical: canonical_or_raw(&opts.backing_path),
         backing_path: opts.backing_path.clone(),
+        nsid: opts.nsid,
         ns_uuid,
         listeners,
         allow_hosts: opts.allow_hosts.clone(),
@@ -767,6 +768,26 @@ pub fn target_systemd_unit(
             Ok(())
         }
     }
+}
+
+/// The cross-stack half of the §6.4 live-state duplicate-backing guard
+/// (fully live at N4): before a share on stack X mutates anything, the
+/// verb layer walks the OTHER stack's live state (`other_kind` +
+/// `other_live`) and refuses when the requested backing (or NQN) is
+/// already served there — a path shared via nvmet must refuse an SPDK
+/// share of the same canonical path and vice versa. The refusal message
+/// IS the runbook: it names the live holder, its ledger classification,
+/// and the exit (`unshare` for anything ledgered; the exact manual
+/// configfs / rpc.py removal steps for foreign objects). Lives HERE —
+/// never inside a stack subtree — per the G3 module-graph rule.
+pub fn cross_stack_duplicate_guard(
+    req: &ShareRequest,
+    other_kind: StackKind,
+    other_live: &[LiveShare],
+    ledger: &Ledger,
+) -> Result<(), NvmeofError> {
+    let _ = (req, other_kind, other_live, ledger);
+    unimplemented!("N4 skeleton — implemented by the feat commit")
 }
 
 /// Reconciliation classification of one ledger record for `list` (§6.2).

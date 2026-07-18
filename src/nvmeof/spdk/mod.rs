@@ -22,6 +22,13 @@ pub mod rpc;
 
 use std::path::PathBuf;
 
+use super::ledger::Ledger;
+use super::stack::{
+    LiveShare, NvmeofError, PreflightError, PreflightOp, RestoreReport, ShareRecord, ShareRequest,
+    TargetStack, TargetStatus,
+};
+use super::StackKind;
+
 /// Env override substituting the pinned `spdk_tgt` binary for the six
 /// target verbs' preflights and `target start` (rig/dev seam — always
 /// with the loud unpinned warning; `target install` ignores it: install
@@ -152,5 +159,104 @@ impl SpdkPaths {
     /// Reservation-persistence files (`ptpl_file`s), populated from N4.
     pub fn ptpl_dir(&self) -> PathBuf {
         self.spdk_state_dir().join("ptpl")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SpdkStack — the SPDK share path behind the TargetStack trait (§6.5, N4)
+// ---------------------------------------------------------------------------
+
+/// The SPDK target stack (§6.1/§6.5, PR 4/N4): `save_config`-backed
+/// share/unshare/restore over the RPC client v2, every share pinning
+/// `nsid` + ns UUID + `ptpl_file` (the scoping §4 pt 1 fix), riding the
+/// shared ledger intent protocol (§6.4 law 6) and the live-state
+/// duplicate guard (`bdev_get_bdevs` filename scan — the one duplicate
+/// check the old module got right, kept).
+pub struct SpdkStack {
+    paths: SpdkPaths,
+    ledger: Ledger,
+    /// §6.2 flag placement: gates preflight rung 4 on the mutating verbs.
+    accept_version_drift: bool,
+    /// `unshare --force`: overrides the live-consumer refusal (design R7
+    /// posture, mirrors `target stop`).
+    unshare_force: bool,
+}
+
+impl SpdkStack {
+    /// Stack rooted at explicit paths + ledger (the sanctioned unit-tier
+    /// injection seam: every code path executed is the production path
+    /// pointed at a different location — §6.8).
+    pub fn new(
+        paths: SpdkPaths,
+        ledger: Ledger,
+        accept_version_drift: bool,
+        unshare_force: bool,
+    ) -> Self {
+        SpdkStack {
+            paths,
+            ledger,
+            accept_version_drift,
+            unshare_force,
+        }
+    }
+
+    /// Production constructor (env-aware paths, default ledger).
+    pub fn open_default(accept_version_drift: bool, unshare_force: bool) -> Self {
+        SpdkStack::new(
+            SpdkPaths::resolve(),
+            Ledger::open_default(),
+            accept_version_drift,
+            unshare_force,
+        )
+    }
+
+    /// Tolerant live-state gather for `list` and the cross-stack
+    /// duplicate guard's nvmet-share direction: a dead/unreachable
+    /// target serves nothing (SPDK state is process-resident), so the
+    /// walk degrades to empty **with the loud note returned** — never a
+    /// silent hole, never a hard failure on a box that simply does not
+    /// run SPDK.
+    pub fn live_shares_tolerant(&self) -> (Vec<LiveShare>, Option<String>) {
+        let _ = (
+            &self.paths,
+            &self.ledger,
+            self.accept_version_drift,
+            self.unshare_force,
+        );
+        unimplemented!("N4 skeleton — implemented by the feat commit")
+    }
+}
+
+impl TargetStack for SpdkStack {
+    fn kind(&self) -> StackKind {
+        StackKind::Spdk
+    }
+
+    fn preflight(&self, op: PreflightOp) -> Result<(), PreflightError> {
+        let _ = op;
+        unimplemented!("N4 skeleton — implemented by the feat commit")
+    }
+
+    fn share(&self, req: &ShareRequest) -> Result<ShareRecord, NvmeofError> {
+        let _ = req;
+        unimplemented!("N4 skeleton — implemented by the feat commit")
+    }
+
+    fn unshare(&self, rec: &ShareRecord) -> Result<(), NvmeofError> {
+        let _ = rec;
+        unimplemented!("N4 skeleton — implemented by the feat commit")
+    }
+
+    fn live_shares(&self) -> Result<Vec<LiveShare>, NvmeofError> {
+        unimplemented!("N4 skeleton — implemented by the feat commit")
+    }
+
+    fn restore(&self, recs: &[ShareRecord]) -> Result<RestoreReport, NvmeofError> {
+        let _ = recs;
+        unimplemented!("N4 skeleton — implemented by the feat commit")
+    }
+
+    fn target_status(&self) -> Result<TargetStatus, NvmeofError> {
+        unimplemented!("N4 skeleton — implemented by the feat commit")
     }
 }

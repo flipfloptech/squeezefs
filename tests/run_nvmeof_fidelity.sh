@@ -178,7 +178,10 @@ ledger_state_of() { # nqn -> state string or empty
 }
 
 mnt_stat() { # mnt field -> first scalar off the .stats inode
-    jq -r ".metrics.$2[0] // .metrics.$2 // .$2[0] // .$2 // empty" "$1/.stats" 2>/dev/null
+    # `?` suppresses the "cannot index scalar" error so the alternatives
+    # serve BOTH shapes: per-volume arrays (writer_guard_*) and daemon
+    # scalars (the PR 6 fabric_* family).
+    jq -r ".metrics.$2[0]? // .metrics.$2? // .$2[0]? // .$2? // empty" "$1/.stats" 2>/dev/null
 }
 
 io_roundtrip() { # dev mib -> 0 on md5 match (O_DIRECT both ways)
@@ -1306,6 +1309,7 @@ leg_pr_matrix() {
 leg_g2_spdk() {
     local out="$STATE/legs/g2-spdk.txt" nqn_m nqn_d zm zd dev_m dev_d mnt dlog md5 md5b uuid
     local fenced reacq io_ok mode spid dpid ladder mounted reg
+    local fab_base fab_nl fab_reconn_base fab_reconn fab_ctrls fab_ok
     nqn_m="nqn.2026-07.io.squeezefs:fideli-g2-meta"
     nqn_d="nqn.2026-07.io.squeezefs:fideli-g2-data"
     mnt="$STATE/mnt-g2"
@@ -1359,20 +1363,67 @@ leg_g2_spdk() {
         bad "G2S: ptpl file missing"
     fi
 
+    # [PR 6] fabric_* baseline (design §6.9): the daemon's sampler beats
+    # every 10 s — poll until it has published a settled view of this
+    # mount's two fabric controllers (meta + data, both live) before we
+    # yank the target. The settled baseline also makes the reconnect
+    # assertion below deterministic: with a live sample banked and a
+    # not-live sample observed in the down window, the post-reattach
+    # not-live->live transition MUST be counted.
+    fab_base=""
+    fab_nl=""
+    for _ in $(seq 1 20); do
+        fab_base=$(mnt_stat "$mnt" fabric_controllers)
+        fab_nl=$(mnt_stat "$mnt" fabric_ctrl_not_live)
+        [ "${fab_base:-0}" -ge 2 ] && [ "${fab_nl:-1}" = "0" ] && break
+        sleep 2
+    done
+    if [ "${fab_base:-0}" -ge 2 ] && [ "${fab_nl:-1}" = "0" ]; then
+        ok "G2S: fabric_* baseline settled (controllers=$fab_base, not_live=0)"
+    else
+        bad "G2S: fabric baseline (controllers=${fab_base:-?} not_live=${fab_nl:-?})"
+    fi
+    fab_reconn_base=$(mnt_stat "$mnt" fabric_ctrl_reconnects)
+    fab_reconn_base=${fab_reconn_base:-0}
+    # [PR 6] squeezefs status renders the per-volume Fabric section off
+    # the same sysfs source (both backing devices of this volume are
+    # fabric-attached -> exactly 2 controller identities, NQN/addr/state
+    # rows present).
+    if "$FIDELI_BIN" status "sqmeta://$dev_m" > "$STATE/legs/g2-status.json" 2>>"$out" &&
+        jq -e '.Fabric.fabric_controllers == 2 and .Fabric.fabric_ctrl_not_live == 0 and
+               ([.Fabric.Controllers[].SubsysNqn] | length >= 2)' \
+            "$STATE/legs/g2-status.json" >/dev/null; then
+        ok "G2S: squeezefs status Fabric section renders (2 live controllers, NQN rows)"
+    else
+        bad "G2S: status Fabric section: $(jq -c '.Fabric // "absent"' "$STATE/legs/g2-status.json" 2>/dev/null)"
+    fi
+
     # THE TARGET-RESTART PERSISTENCE WINDOW (G2). SIGKILL the target under
     # a live mount, restart through the product, and prove IO resumes with
-    # the reservation intact.
-    #
-    # [PR 6 HOOK] The fabric_* daemon stats family lands with PR 6
-    # (design §6.9 / PR-plan PR 6): once it ships, THIS is the leg that
-    # asserts `fabric_ctrl_not_live` rises while the target is down and
-    # settles back to 0 after reattach, and `fabric_ctrl_reconnects`
-    # increments across the bounce (sampled-transition counter). Attach
-    # the gauge reads right here, around the SIGKILL -> target start ->
-    # IO-resume window (harness edit owned by PR 6).
+    # the reservation intact. PR 6 gauge assertions ride this window
+    # (design §6.9 / PR-plan PR 6 — the harness edit this PR owns).
     spid=$(cat "$SQUEEZEFS_NVMEOF_RUN_DIR/spdk_tgt.pid")
     kill -9 "$spid" || { bad "G2S: SIGKILL spdk_tgt"; return; }
     sleep 1
+    # [PR 6] fabric_ctrl_not_live must RISE while the target is dead:
+    # spdk_tgt's death resets the TCP connections, the kernel initiator
+    # flips both controllers to `connecting`, and the next sampler beat
+    # publishes it. Holding `target start` until the gauge moves keeps
+    # the down window >= one observed not-live sample — the precondition
+    # the settle assertion below builds on. (Sampled-transition law:
+    # without this hold, a bounce faster than the 10 s cadence may
+    # legitimately count zero.)
+    fab_nl=""
+    for _ in $(seq 1 30); do
+        fab_nl=$(mnt_stat "$mnt" fabric_ctrl_not_live)
+        [ "${fab_nl:-0}" -ge 1 ] && break
+        sleep 2
+    done
+    if [ "${fab_nl:-0}" -ge 1 ]; then
+        ok "G2S: fabric_ctrl_not_live rose while the target is dead (not_live=$fab_nl)"
+    else
+        bad "G2S: fabric_ctrl_not_live never rose in the down window"
+    fi
     if "$FIDELI_BIN" nvmeof target start >> "$out" 2>&1 &&
         grep -q "load_config applied" "$out"; then
         ok "G2S: target start after SIGKILL replayed the SPDK source of truth"
@@ -1413,6 +1464,34 @@ leg_g2_spdk() {
         ok "G2S: post-bounce writes land"
     else
         bad "G2S: post-bounce write"
+    fi
+
+    # [PR 6] fabric_* gauges settle across the bounce (design §6.9):
+    # not_live back to 0 and the sampled-transition reconnect counter
+    # incremented — the down window above banked a not-live sample per
+    # controller, so the first post-reattach beat must observe the
+    # not-live->live transition. fabric_controllers stays at its
+    # baseline (same endpoints, reattached — population stable).
+    fab_ok=""
+    fab_reconn=""
+    fab_ctrls=""
+    for _ in $(seq 1 30); do
+        fab_nl=$(mnt_stat "$mnt" fabric_ctrl_not_live)
+        fab_reconn=$(mnt_stat "$mnt" fabric_ctrl_reconnects)
+        fab_ctrls=$(mnt_stat "$mnt" fabric_controllers)
+        [ "${fab_nl:-1}" = "0" ] && [ "${fab_reconn:-0}" -gt "$fab_reconn_base" ] &&
+            { fab_ok=1; break; }
+        sleep 2
+    done
+    if [ -n "$fab_ok" ]; then
+        ok "G2S: fabric gauges settled (not_live=0, reconnects $fab_reconn_base -> $fab_reconn)"
+    else
+        bad "G2S: fabric settle (not_live=${fab_nl:-?} reconnects=${fab_reconn:-?} base=$fab_reconn_base)"
+    fi
+    if [ "${fab_ctrls:-0}" = "$fab_base" ]; then
+        ok "G2S: fabric_controllers stable across the bounce (n=$fab_ctrls)"
+    else
+        bad "G2S: fabric_controllers moved across the bounce ($fab_base -> ${fab_ctrls:-?})"
     fi
 
     dpid=$(pgrep -f "squeezefs.*mount sqmeta://$dev_m" | head -1)

@@ -4,6 +4,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
 
 ## Contents
 
+- [Versioning & releases](#versioning--releases)
 - [Durability & crash contract](#durability--crash-contract)
   - [Metadata Durability (crash contract)](#metadata-durability-crash-contract)
   - [Single-writer mount guard (guarantee classes)](#single-writer-mount-guard-guarantee-classes)
@@ -32,6 +33,29 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
 - [Performance records](#performance-records)
   - [The vs-JuiceFS scoreboard (release gate)](#the-vs-juicefs-scoreboard-release-gate)
   - [Built-in benchmark (`squeezefs bench`)](#built-in-benchmark-squeezefs-bench)
+
+---
+
+## Versioning & releases
+
+**The version of a SqueezeFS build is the git commit it was built from.** There is no semver and no calver — strictly git commits for versioning. Periodic releases are **annotated git tags on specific commits** — `stable-YYYY.MM[.N]` and `lts-YYYY.MM` — created manually as a release act (never by CI, never by a version-bump commit). The tag names the release; the commit stays the version. Tags are the **only** release names.
+
+**Verify what a node is running** (the two surfaces carry the same build-time capture):
+
+```bash
+squeezefs --version        # or -V
+# untagged build:  squeezefs f63455bcb824 (f63455bcb8249b064531d000624c40825a6e763e) built 2026-07-18T13:45:25Z
+# release build:   squeezefs stable-2026.07 (f63455bcb824 / f63455bcb8249b064531d000624c40825a6e763e) built 2026-07-18T13:45:25Z
+grep -E '"build_(commit|tag)"' <mountpoint>/.stats   # the fleet mixed-version detector
+```
+
+The `.stats` inode exports `build_commit` (the full hash) and `build_tag` (always present; empty string when the commit is not a release) on every mounted daemon — sweep it across the fleet to find mixed-version nodes. A `-dirty` suffix on the hash means the binary was built from a tree with uncommitted **tracked** changes (untracked scratch does not count; the flag is captured when the build script runs) — a dirty rebuild of a tagged commit deliberately does not masquerade as the release.
+
+Mechanics and edges:
+
+- The identity is captured at compile time by `build.rs` (`git rev-parse HEAD`, `--short=12`, `git status --porcelain --untracked-files=no`, `git describe --tags --exact-match`) and embedded via `SQUEEZEFS_BUILD_*` rustc envs; `src/version.rs` is the single formatting source of truth for `--version`, the mount/format summary, the mount-ready log lines, `.config`'s `client_version`, and `.stats`.
+- **`Cargo.toml`'s `version = "0.1.0"` is a cargo-internal placeholder only** — cargo requires one, SqueezeFS ignores it. Never bump it for a release; never read it as a version.
+- **Tarball / no-git builds**: packagers set `SQUEEZEFS_BUILD_COMMIT` (and optionally `SQUEEZEFS_BUILD_TAG`) in the build environment to stamp the identity; without git *and* without the envs, the build still succeeds and embeds `unknown`. `SOURCE_DATE_EPOCH` is honored for a reproducible build timestamp.
 
 ---
 

@@ -623,6 +623,7 @@ The integration branch is **`dev`** (not `main`; `main` is reserved for releases
 - Tests-first cycle: write failing tests → implement → refine → commit each logical step separately.
 - Merge with `--ff-only`; rebase feature branches if `dev` has diverged. Delete branches after merge.
 - Conventional commits: `type(scope): description`. Messages explain WHY.
+- **Versioning is git commits only** (`docs/operations.md` §Versioning & releases): release tags (`stable-*`/`lts-*`, created manually as a release act) are the only release names — never introduce semver bumps (`Cargo.toml`'s `version` is a cargo-internal placeholder).
 
 See the full TDD Development Workflow section above for the detailed phased process.
 

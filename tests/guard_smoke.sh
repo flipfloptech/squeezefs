@@ -6,7 +6,8 @@
 # management.md §6.8 / G4): runs the writer-guard matrix against namespaces
 # **shared by the product's own verbs** (the fidelity substrate,
 # tests/nvmeof_target_substrate.sh), on either target stack. Supersedes
-# `.agents/spdk-scoping/guard-smoke.sh` (kept there as evidence lineage).
+# the scoping rig's guard-smoke (removed from the tree — history:
+# `.agents/spdk-scoping/guard-smoke.sh` at c615e3a).
 #
 # Usage
 #   sudo tests/guard_smoke.sh [--stack spdk|nvmet] [--loops N] [--ptpl]

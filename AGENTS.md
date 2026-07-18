@@ -116,7 +116,7 @@ POSIX FUSE locks map to cluster leases on Metadata Volumes:
 
 ### Reference fast-FUSE clients (user directive, 2026-07-14)
 
-The **DAOS client** (`github.com/daos-stack/daos`, `src/client/` — dfuse / libdfs / libioil / libpil4dfs) and **JuiceFS** (`github.com/juicedata/juicefs`) are the designated reference fast-FUSE clients. **Consult them for perf/recovery patterns before designing new client-side machinery** — both independently converged on the levers the metadata-throughput program validated (negative-dentry TTLs, clean-handle FLUSH elision, submit batching, per-class kernel TTLs), and their recovery/ops machinery (external supervisor + FUSE-connection abort, fsck/dump/backup, cache-disk health FSM, seamless-upgrade fd handover) is the standing gap board. The full survey — findings classified HAVE / IN-PROGRAM / GAP / N/A with ranked P1/P2/P3 adoption boards and code anchors — lives at **`.agents/reference-clients-survey.md`**; extend it (same classification) when surveying them again.
+The **DAOS client** (`github.com/daos-stack/daos`, `src/client/` — dfuse / libdfs / libioil / libpil4dfs) and **JuiceFS** (`github.com/juicedata/juicefs`) are the designated reference fast-FUSE clients. **Consult them for perf/recovery patterns before designing new client-side machinery** — both independently converged on the levers the metadata-throughput program validated (negative-dentry TTLs, clean-handle FLUSH elision, submit batching, per-class kernel TTLs), and their recovery/ops machinery (external supervisor + FUSE-connection abort, fsck/dump/backup, cache-disk health FSM, seamless-upgrade fd handover) is the standing gap board. The full survey — findings classified HAVE / IN-PROGRAM / GAP / N/A with ranked P1/P2/P3 adoption boards and code anchors — lives at **`docs/reference-clients-survey.md`**; extend it (same classification) when surveying them again.
 
 ### Metadata Cluster Topology
 
@@ -245,7 +245,7 @@ Before touching any code:
 - Determine `Send`/`Sync` requirements for all shared state.
 - Identify async boundaries — which types must implement `Future`, which tasks cross `.await` points.
 - **I/O path:** does this touch FUSE, NVMe, or local files? If yes, plan the **io_uring** design — not a classical shortcut.
-- **New client-side machinery?** Check the reference fast-FUSE clients first (DAOS client, JuiceFS — `.agents/reference-clients-survey.md`) for a proven pattern before inventing one.
+- **New client-side machinery?** Check the reference fast-FUSE clients first (DAOS client, JuiceFS — `docs/reference-clients-survey.md`) for a proven pattern before inventing one.
 
 Produce a brief execution plan:
 
@@ -507,7 +507,7 @@ fstests/LTP are **wall-clock-bound** (fixed-duration fsx/fsstress soaks, mount-c
 | **Nightly (nvmeof fidelity)** | `sudo tests/run_nvmeof_fidelity.sh full` — guard kill-9 ×10 per stack (restart-from-zero) + SPDK PTPL power-cycle leg, PR/PTPL matrix, loud-fail matrix (G3), crash-window injection (§6.4 law 6), adopt legs (§6.10), target-restart persistence (G2, both stacks), soft-RoCE plumbing leg (rdma_rxe — plumbing only, no guard/perf claims), A/B smoke rows (recorded), teardown-to-zero-residue proof | nightly + nvmeof program/release gates | ≤70 min budget (5m46s measured, zram/localhost dev box) |
 | **Per-release (competitive)** | `tests/run_vs_juicefs.sh` — the standing **vs-JuiceFS scoreboard** (matched substrate/budgets, 3 regimes × 6 elbencho workloads, win/loss table; exits nonzero on any LOSS row; `SQUEEZEFS_VS_ALLOW_LOSS` tracks attributed known losses). `SQUEEZEFS_VS_SMOKE=1` micro-grid is the per-commit-tier plumbing check | every release + after perf-relevant landings; baseline `.benchmarks/2026-07-15-vs-juicefs-scoreboard.md` | ~30–60 min |
 
-**NVMe-oF fidelity tier scripts** (design-nvmeof-target-management §6.8, PR 5/N5): `tests/nvmeof_target_substrate.sh` (create/teardown/status/mkzram/snapshot — product-verb-driven dual-stack fabric, `:fideli-` ownership marker, test port slice 54000–54099, hugepage record/restore, built-in zero-residue snapshot diff), `tests/run_nvmeof_fidelity.sh` (the quick/full orchestrator above), `tests/guard_smoke.sh` (writer-guard matrix on product-shared namespaces, `--stack spdk|nvmet --loops N [--ptpl]`). They supersede the ad-hoc root gates under `.agents/spdk-scoping/` (kept there as evidence lineage). The multi-run discipline below applies verbatim to the ×10 guard matrices.
+**NVMe-oF fidelity tier scripts** (design-nvmeof-target-management §6.8, PR 5/N5): `tests/nvmeof_target_substrate.sh` (create/teardown/status/mkzram/snapshot — product-verb-driven dual-stack fabric, `:fideli-` ownership marker, test port slice 54000–54099, hugepage record/restore, built-in zero-residue snapshot diff), `tests/run_nvmeof_fidelity.sh` (the quick/full orchestrator above), `tests/guard_smoke.sh` (writer-guard matrix on product-shared namespaces, `--stack spdk|nvmet --loops N [--ptpl]`). They supersede the ad-hoc root gates that lived under `.agents/spdk-scoping/` (rig scripts removed from the tree 2026-07-18 — git history at `c615e3a`; the scoping record itself lives on as `.benchmarks/2026-07-17-spdk-target-scoping.md`). The multi-run discipline below applies verbatim to the ×10 guard matrices.
 
 **`SQUEEZEFS_FSTESTS_QUICK`** (defined in `tests/run_fstests.sh`) is the **standing regression set**: every fstests case that has ever caught a real SqueezeFS bug, plus core fsx/fsstress soak, hole/punch/seek coverage, and mount basics. **Grow it whenever a new test surfaces a bug** — that is the point of the tier. When an external suite catches a bug, also **port the scenario into a fast `cargo` test** (the `tests/*_tests.rs` layer) so the per-commit tier gains the coverage permanently.
 
@@ -615,8 +615,7 @@ See the full TDD Development Workflow section above for the detailed phased proc
 While this file is the combined one source of truth for agents and contributors:
 
 - `README.md` / `QUICKSTART.md` — user-facing CLI, NVMe-oF, and bare-metal setup.
-- `.agents/walkthrough.md` — notes on the transparent compression / encryption implementation.
-- `.agents/reference-clients-survey.md` — the DAOS-client + JuiceFS reference fast-FUSE client survey (see **Reference fast-FUSE clients** above).
+- `docs/reference-clients-survey.md` — the DAOS-client + JuiceFS reference fast-FUSE client survey (see **Reference fast-FUSE clients** above).
 - `docs/PROFILING_AND_GATES.md` (historical) — content now consolidated here.
 
 ---

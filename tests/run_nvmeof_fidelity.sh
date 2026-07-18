@@ -6,8 +6,9 @@
 # target-management program (docs/design-nvmeof-target-management.md §6.8):
 # every leg drives the PRODUCT's own verbs against BOTH real target stacks
 # (SPDK spdk_tgt + kernel nvmet) on the fidelity substrate
-# (tests/nvmeof_target_substrate.sh). Supersedes the ad-hoc root gates under
-# `.agents/spdk-scoping/` (kept there as evidence lineage).
+# (tests/nvmeof_target_substrate.sh). Supersedes the ad-hoc root gates that
+# lived under `.agents/spdk-scoping/` (removed from the tree — git history
+# at c615e3a).
 #
 # Usage
 #   sudo tests/run_nvmeof_fidelity.sh quick     # per-PR tier (~10 min)

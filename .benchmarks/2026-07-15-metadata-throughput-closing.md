@@ -432,7 +432,7 @@ conveyor pass panics **0**; barriers/op 0.0006–0.0033 (default cadence).
   (transport pop_timeout residual), row 5 (**iops-parity investigation**),
   row 6 (KV-core allocation flood), row 7/7b (aio-dio + DIO families +
   074 environmental), row 8 (**survey P2 board** — now committed at
-  `.agents/reference-clients-survey.md`), row 9 (**SPDK-targets
+  `docs/reference-clients-survey.md`), row 9 (**SPDK-targets
   program**), row 10 (scratch drain-timeout class).
 - **Documentation closure (PR M12)**: `docs/design-metadata-throughput.md`
   → Status **Implemented** (revision 3: landed-SHA table, actual landing

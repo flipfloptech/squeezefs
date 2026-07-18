@@ -9,7 +9,8 @@
 # product's own lifecycle verbs** (target setup/start, share, connect).
 # The harness supplies only backings and assertions.
 #
-# This productizes `.agents/spdk-scoping/{rig-up,teardown,snapshot}.sh`
+# This productizes the scoping rig's rig-up/teardown/snapshot scripts
+# (history: `.agents/spdk-scoping/{rig-up,teardown,snapshot}.sh` at c615e3a)
 # under the tests/dev_substrate.sh ownership conventions.
 #
 # Verbs

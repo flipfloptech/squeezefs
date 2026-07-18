@@ -1,4 +1,4 @@
-# SPDK-Mandatory Program — Target-Side Scoping Report
+# SPDK Target Scoping — Measurement & Scoping Record (SPDK-Mandatory Program, Target Side)
 
 Date: 2026-07-17 · Dev at `ad68be1` (clean) · Box: AMD RYZEN AI MAX+ PRO 395 (32 threads, capped 3.5 GHz, governor `performance`), 109 GiB RAM, kernel 7.1.3-2-cachyos, btrfs root.
 Scope charter: SPDK becomes **mandatory for NVMe-oF target serving**; **client/initiator side is explicitly out of scope** (daemon stays kernel io_uring `NvmeBlockDev`, kernel initiator, PR ioctls on kernel block nodes). `tests/dev_substrate.sh` stays kernel nvmet-loop as the default dev substrate; this pass seeds a later target-fidelity test tier. This is a scoping report — **no product code changed, no design decisions locked.**

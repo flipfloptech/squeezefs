@@ -40,7 +40,7 @@ use super::{SpdkPaths, SPDK_TGT_BIN_ENV};
 /// The pinned SPDK release tag (§6.5).
 pub const SPDK_PINNED_TAG: &str = "v26.05";
 /// The pinned commit sha `v26.05` must resolve to (verified after clone —
-/// tag-spoof defense; `.agents/spdk-scoping/scoping-report.md` §3.1).
+/// tag-spoof defense; `.benchmarks/2026-07-17-spdk-target-scoping.md` §3.1).
 pub const SPDK_PINNED_COMMIT: &str = "d519b163cbc0e2f28c35d9bc86d610da368b032c";
 /// Upstream repository.
 pub const SPDK_GIT_URL: &str = "https://github.com/spdk/spdk.git";

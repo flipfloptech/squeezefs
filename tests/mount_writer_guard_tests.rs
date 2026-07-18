@@ -768,7 +768,7 @@ async fn test_ptpl_lapse_foreign_holder_fail_stops() {
 
 // ===========================================================================
 // The register ladder — spec-strict targets (SPDK v26.05 measured,
-// `.agents/spdk-scoping/scoping-report.md` §4/§7 Q1): after kill -9, the
+// `.benchmarks/2026-07-17-spdk-target-scoping.md` §4/§7 Q1): after kill -9, the
 // dead incarnation's registration persists under the SAME host identity;
 // kernel nvmet lets the guard's IEKEY register replace it silently, but a
 // spec-strict target returns Reservation Conflict — bricking remount.

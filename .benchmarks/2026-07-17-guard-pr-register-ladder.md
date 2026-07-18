@@ -2,7 +2,7 @@
 
 Date: 2026-07-17 · Branch `fix/guard-pr-register-ladder` off dev `fd3eed8` · Box: AMD RYZEN AI MAX+ PRO 395 (32 threads), kernel 7.1.3-2-cachyos · Rig: the committed `.agents/spdk-scoping/` scripts (SPDK v26.05 `d519b16` local build at `/var/tmp/spdk-scoping`, zram-backed NVMe/TCP; **new** kernel-nvmet guard arm added to `rig-up.sh` — 2 `resv_enable=1` namespaces, same shape as the SPDK guard subsystem).
 
-Closes the SPDK scoping pass's **P0** (`.agents/spdk-scoping/scoping-report.md` §4 / §7 Q1 / §8 S1): the single-writer guard's PR layer assumed lenient Register semantics — after kill -9, the dead incarnation's stale registration (same host identity, old key) persists, and a **spec-strict target refuses the fresh Register with Reservation Conflict**, bricking remount (fail-closed; no data risk; a remount blocker).
+Closes the SPDK scoping pass's **P0** (`.benchmarks/2026-07-17-spdk-target-scoping.md` §4 / §7 Q1 / §8 S1): the single-writer guard's PR layer assumed lenient Register semantics — after kill -9, the dead incarnation's stale registration (same host identity, old key) persists, and a **spec-strict target refuses the fresh Register with Reservation Conflict**, bricking remount (fail-closed; no data risk; a remount blocker).
 
 **Instrument statement:** `guard-smoke.sh` (real `squeezefs format/mount --daemon/claim clear` CLI + nvme-cli probes) against rig-served namespaces; unit tier is `tests/mount_writer_guard_tests.rs` against the in-memory `FakeReservationClient`.
 

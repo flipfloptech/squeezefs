@@ -1121,7 +1121,9 @@ async fn pending_free_wedged_tail_fails_volume_loud_never_livelocks() {
 /// 2026-07-16 — C′ closed the walks that *detected* the reuse), so the
 /// committed fixture (`.agents/findvsa/extract_pending_free_fixture.py`
 /// over `recapture.sh` round 8, kvparse.py-derived; full dump in
-/// `.agents/findvsa/capture-2026-07-16-pendingfree-expectations.txt`)
+/// `.agents/findvsa/capture-2026-07-16-pendingfree-expectations.txt` —
+/// the FIND-VS-A harness was removed from the tree, git history at
+/// `c615e3a`)
 /// pins the mechanism's PRECONDITION from real bytes instead — every
 /// in-window `Freed` final across the four post-kill meta volumes, with
 /// the mounted record's seq + tail:

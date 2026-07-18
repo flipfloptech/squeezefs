@@ -6,3 +6,12 @@ tests/ltp_repro.sh
 ltp_syscalls.results
 loom-models/target/
 dhat-heap.json
+
+# agent scratch space — only .agents/skills/ stays committed
+.agents/*
+!.agents/skills/
+!.agents/skills/**
+
+# editor / assistant litter
+.gemini/
+.vscode/

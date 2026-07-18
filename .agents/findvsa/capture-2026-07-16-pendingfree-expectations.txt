@@ -1,5 +1,0 @@
-  chain from tail=78368840: entries=7085 dropped_confirmed=0 trailing_pending=1487 head=88996513 first_fails=[(88996716, 8680820740569200760, 2021161080)]
-  chain from tail=58026609: entries=1586 dropped_confirmed=0 trailing_pending=3513 head=60401846 first_fails=[(60406117, 7789189728167831916, 170809)]
-  chain from tail=81737742: entries=5271 dropped_confirmed=0 trailing_pending=2150 head=89667190 first_fails=[(89667393, 8680820740569200760, 2021161080)]
-  chain from tail=55630873: entries=4988 dropped_confirmed=0 trailing_pending=2257 head=63121796 first_fails=[(63121897, 8680820740569200760, 2021161080)]
-{"row": "header", "images": 4, "in_window_frees": 231, "generation_gate_released": 71, "coverage_gate_parked": 231, "fallback_root_refs": 0, "mounted_root_refs": 0}

@@ -81,7 +81,8 @@ fn hex_decode(s: &str) -> Vec<u8> {
 }
 
 /// The 2026-07-16 re-captured loss round (docs/design-smo-replay-currency.md
-/// §6 PR 1 first act; regeneration: `.agents/findvsa/recapture.sh`, raw
+/// §6 PR 1 first act; regeneration: the FIND-VS-A harness — removed from
+/// the tree, git history at `c615e3a`: `.agents/findvsa/recapture.sh`, raw
 /// images out-of-repo, expectations in
 /// `.agents/findvsa/capture-2026-07-16-expectations.txt`): 311 acked
 /// creates lost across a CLEAN replay (`dropped_torn == [0,0,0,0]`). The

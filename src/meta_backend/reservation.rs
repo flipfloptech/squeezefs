@@ -175,7 +175,7 @@ pub enum RegisterOutcome {
 }
 
 /// The register ladder (design-metadata-throughput §5.0 B1; SPDK-strict
-/// Register recovery, `.agents/spdk-scoping/scoping-report.md` §4/§7 Q1):
+/// Register recovery, `.benchmarks/2026-07-17-spdk-target-scoping.md` §4/§7 Q1):
 ///
 /// 1. Plain `register(key)` — success is today's fast path, untouched.
 /// 2. On the reservation-conflict class ONLY: Reservation Report →

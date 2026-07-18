@@ -2,7 +2,7 @@
 
 Date: 2026-07-18 · Dev at `45a4eda` (docs branch `docs/nvmeof-program-close`; **zero runtime-code change** since PR 6) · Box: AMD RYZEN AI MAX+ PRO 395 (32 threads, capped 3.5 GHz, governor `performance`), 109 GiB RAM, kernel 7.1.3-2-cachyos.
 
-**What this is**: the closing A/B rerun the design doc's PR 7 row orders (`docs/design-nvmeof-target-management.md` — gate **G5** named rows, plus the two user-resolved recorded-class additions: **2-/4-reactor spdk_tgt scaling** and **`bdev_uring` vs `bdev_aio`**). Unlike the 2026-07-17 scoping A/B (`.agents/spdk-scoping/scoping-report.md` §3, rig-plumbed), every target here is stood up **through the product's own verbs** on the fidelity substrate (`tests/nvmeof_target_substrate.sh`): `target setup` → `target start [--cores N]` → `share --target-stack {spdk,nvmet}` → `connect`. The harness supplied only backings, fio, and assertions.
+**What this is**: the closing A/B rerun the design doc's PR 7 row orders (`docs/design-nvmeof-target-management.md` — gate **G5** named rows, plus the two user-resolved recorded-class additions: **2-/4-reactor spdk_tgt scaling** and **`bdev_uring` vs `bdev_aio`**). Unlike the 2026-07-17 scoping A/B (`.benchmarks/2026-07-17-spdk-target-scoping.md` §3, rig-plumbed), every target here is stood up **through the product's own verbs** on the fidelity substrate (`tests/nvmeof_target_substrate.sh`): `target setup` → `target start [--cores N]` → `share --target-stack {spdk,nvmet}` → `connect`. The harness supplied only backings, fio, and assertions.
 
 ## Provenance
 

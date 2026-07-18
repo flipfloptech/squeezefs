@@ -11,7 +11,8 @@
 //! Everything runs unprivileged over injected roots (§6.8 relocation
 //! seams: the production code pointed at tempdirs). The real
 //! install→setup→start→status→stop cycle is the root tier
-//! (`.agents/spdk-scoping/n3-spdk-gate.sh` until PR 5's harness).
+//! (`tests/run_nvmeof_fidelity.sh`; its pre-PR-5 seed was
+//! `.agents/spdk-scoping/n3-spdk-gate.sh` — git history at `c615e3a`).
 
 use std::fs;
 use std::path::Path;

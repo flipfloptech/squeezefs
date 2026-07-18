@@ -215,9 +215,9 @@ For unattended hosts add `--supervise`: the parent stays alive as an external wa
 
 Target sharing and client connections live under the top-level **`squeezefs nvmeof`** verb (dual-stack: SPDK and kernel nvmet; stack selection is explicit — `--target-stack`, env `SQUEEZEFS_NVMEOF_TARGET_STACK`, default `spdk` — and failure is loud, never a silent cross-stack fallback).
 
-> ⚠️ **Interim — SPDK sharing lands at N4.** The NVMe-oF target-management program (`docs/design-nvmeof-target-management.md`) ships in milestones: the kernel-nvmet target path below is fully managed **today**, and as of milestone **N3** the SPDK **target lifecycle verbs** (`nvmeof target install/setup/start/stop/status/systemd-unit`) are live. SPDK **sharing** lands with milestone **N4** — until then `share`/`unshare`/`restore` with `--target-stack spdk` (including the **default**) fail loud pointing at the live target verbs; select `--target-stack nvmet` explicitly for the sharing runbook below. (The old `storage nvmeof spdk-*` verbs are removed — README → *Removed flags/verbs*.)
+Both stacks are fully managed (target-management program milestone N4): the SPDK runbook below is the **default path** (`share`/`unshare`/`restore` ride `save_config`/`load_config` with pinned namespace identity + PTPL), and the kernel-nvmet runbook remains the first-class explicit alternative. (The old `storage nvmeof spdk-*` verbs are removed — README → *Removed flags/verbs*.)
 
-### Manage the SPDK Target Runtime (lifecycle — live as of N3)
+### Manage the SPDK Target Runtime (lifecycle)
 ```bash
 # One-time: build the pinned SPDK release (v26.05, commit-sha verified after
 # clone) into /opt/squeezefs/spdk/v26.05/. Never mutates system packages
@@ -250,7 +250,27 @@ sudo ./target/release/squeezefs nvmeof target systemd-unit > squeezefs-spdk-tgt.
 # Undo the hugepage reservation when done:
 sudo ./target/release/squeezefs nvmeof target setup --restore-prior
 ```
-Mutating verbs refuse a target whose version drifts from the pin unless `--accept-version-drift`; `target status` always *reports* drift; `target stop` warns-and-proceeds (refusing shutdown on version grounds would invert the risk). Dev/rig boxes can point `SQUEEZEFS_SPDK_TGT_BIN` at an existing build — loud, unpinned. SPDK **share** commands ride these verbs from N4 on.
+Mutating verbs (`share`/`unshare`/`restore`/`target start`) refuse a target whose version drifts from the pin unless `--accept-version-drift`; `target status` always *reports* drift; `target stop` warns-and-proceeds (refusing shutdown on version grounds would invert the risk). Dev/rig boxes can point `SQUEEZEFS_SPDK_TGT_BIN` at an existing build — loud, unpinned.
+
+### Share a Target via SPDK (the default stack)
+```bash
+# Share a backing disk as an NVMe-oF subsystem on the running SPDK target
+# (the default stack — no --target-stack needed). Every share pins the
+# namespace id (--nsid, default 1), a stable namespace UUID (--ns-uuid to
+# seed; generated once and recorded), and a PTPL reservation-persistence
+# file (<state>/spdk/ptpl/<uuid>.json) — NVMe Persistent Reservations
+# survive target restarts on this stack:
+sudo ./target/release/squeezefs nvmeof share /dev/nvme1n1 --ip 10.10.10.50
+
+# Regular-file backings are served directly by bdev_aio (no loop device;
+# NoCOW-guarded on btrfs; missing paths refuse loud — --create-size opts in):
+sudo ./target/release/squeezefs nvmeof share /srv/backing.img --create-size 100G --ip 10.10.10.50
+
+# Restrict who may connect (default is allow-any — the trusted-fabric posture):
+sudo ./target/release/squeezefs nvmeof share /dev/nvme1n1 --ip 10.10.10.50 \
+    --allow-host nqn.2014-08.org.nvmexpress:uuid:<client-host-id>
+```
+Every share records a write-ahead intent in the share ledger (`/var/lib/squeezefs/nvmeof/shares.json`) **before** the first RPC mutation and ends with `save_config` to `tgt-config.json` — the SPDK source of truth that `target start`/the systemd unit replay via `load_config`, so shares (and their reservations, via PTPL) reappear under the same NQN/nsid/UUID across target restarts without operator action. A backing already served by **either** stack refuses loud, naming the live holder and the exact removal steps (the cross-stack duplicate-backing guard). `unshare <subnqn>` resolves the stack from the ledger and refuses while initiators are connected (`--force` overrides; unmount → `disconnect` → unshare is the sequence).
 
 ### Share a Target via the Kernel nvmet Stack
 ```bash
@@ -270,12 +290,14 @@ Each share records a write-ahead intent in the share ledger (`/var/lib/squeezefs
 
 ### Inspect, Restore, Unshare
 ```bash
-sudo ./target/release/squeezefs nvmeof list            # managed / down / pending / removing / foreign
-sudo ./target/release/squeezefs nvmeof restore --target-stack nvmet   # replay the ledger after reboot
-                                                       # (configfs is empty at boot by nature)
+sudo ./target/release/squeezefs nvmeof list            # managed / down / pending / removing / foreign (both stacks)
+sudo ./target/release/squeezefs nvmeof restore         # replay the whole ledger, each record to its recorded stack
+sudo ./target/release/squeezefs nvmeof restore --target-stack spdk    # filter (the systemd ExecStartPost path:
+                                                       # RPC-live wait -> load_config -> reconcile)
+sudo ./target/release/squeezefs nvmeof restore --target-stack nvmet   # filter (configfs is empty at boot by nature)
 sudo ./target/release/squeezefs nvmeof unshare <subnqn>  # stack resolved from the ledger
 ```
-`restore` is idempotent: already-live shares verify as no-ops, interrupted shares/unshares (crash-window intents) are finalized, garbage-collected, or resumed, and the recorded namespace identity is re-presented so initiators reattach without operator action. `unshare` refuses NQNs the ledger does not own — pre-rebuild or foreign shares surface in `list` as foreign/unmanaged with the manual removal steps.
+`restore` is idempotent: already-live shares verify as no-ops, interrupted shares/unshares (crash-window intents) are finalized, garbage-collected, or resumed, and the recorded namespace identity is re-presented so initiators reattach without operator action; on the SPDK stack it ends with `save_config` whenever reconciliation changed anything (a no-op pass never rewrites the config). `unshare` refuses NQNs the ledger does not own — pre-rebuild or foreign shares surface in `list` as foreign/unmanaged with the manual removal steps.
 
 ### Connect to Remote NVMe-oF Storage
 To connect to an NVMe over Fabrics target device before mounting:

@@ -54,6 +54,13 @@ enum Script {
     WrongId(Value),
     /// Accept, read the request, never answer.
     Silence,
+    /// `rpc_get_methods` with real `current` semantics (FIND-N3-A): the
+    /// runtime-callable set only when `params.current == true`, the full
+    /// method list (incl. STARTUP-only entries) otherwise.
+    CurrentAwareMethods {
+        current: Vec<String>,
+        all: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +189,18 @@ fn serve_one(
                     break;
                 }
             }
+        }
+        Script::CurrentAwareMethods { current, all } => {
+            let wants_current = request
+                .get("params")
+                .and_then(|p| p.get("current"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let list = if wants_current { current } else { all };
+            respond(
+                &mut stream,
+                json!({"jsonrpc": "2.0", "id": id, "result": list}),
+            );
         }
     }
 }
@@ -554,18 +573,38 @@ fn test_save_config_composes_subsystem_configs_and_writes_atomically() {
     );
 }
 
+/// The FIND-N3-A regression pin (caught by the root-tier gate, run 1):
+/// a RUNTIME target's `rpc_get_methods` lists ALL methods unless
+/// `{"current": true}` is passed — without it, load_config replayed the
+/// STARTUP-only `sock_set_default_impl` a real save_config captures and
+/// the target refused ("Method may only be called before framework is
+/// initialized"). The fake mirrors the real semantics: the full method
+/// list without `current: true`, the runtime-callable set with it — so a
+/// client that drops the param sends the startup-only method and panics
+/// the fake.
 #[test]
 fn test_load_config_replays_runtime_methods_and_reports_skipped() {
     let server = FakeRpcServer::start(move |method| match method {
-        "rpc_get_methods" => Script::Result(json!([
-            "bdev_aio_create",
-            "nvmf_create_transport",
-            "nvmf_create_subsystem"
-        ])),
+        "rpc_get_methods" => Script::CurrentAwareMethods {
+            current: vec![
+                "bdev_aio_create".into(),
+                "nvmf_create_transport".into(),
+                "nvmf_create_subsystem".into(),
+            ],
+            all: vec![
+                "framework_set_scheduler".into(),
+                "bdev_aio_create".into(),
+                "nvmf_create_transport".into(),
+                "nvmf_create_subsystem".into(),
+            ],
+        },
         "bdev_aio_create" | "nvmf_create_transport" | "nvmf_create_subsystem" => {
             Script::Result(json!(true))
         }
-        other => panic!("startup-only method must never be sent: {other}"),
+        other => panic!(
+            "startup-only method must never be sent to a runtime target: {other} (the client \
+             must gate on rpc_get_methods current:true — FIND-N3-A)"
+        ),
     });
     let client = SpdkRpcClient::with_timeouts(
         server.socket(),

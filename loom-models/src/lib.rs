@@ -22,6 +22,15 @@
 //!   executes exactly once and never while a payload lease is live
 //!   (including the shutdown header-only drain), and a parked commit is
 //!   never lost to a missed eventfd wake.
+//! - [`wake_core`]: the queue-worker eventfd wake-coalescing flag (L3
+//!   transport-economy lever B) — invariants: N producer publications
+//!   between two worker passes cost ≤ N (ideally 1) eventfd writes and a
+//!   publication is NEVER stranded — after any interleaving of
+//!   publish→arm→(write) producers with drain→disarm→scan worker passes,
+//!   either a pass observed the publication or the eventfd counter is
+//!   nonzero (the level-triggered PollAdd re-wakes the worker); also
+//!   composed with [`lease_core`]: a parked commit whose lease drops
+//!   through the coalescer is never stranded.
 //! - [`journal_core`]: the KV journal ring's lock-free admission +
 //!   reservation core (CoW KV metadata design §4.4 pts 2/5, §4.6 pt 3,
 //!   PR K3) — invariants: reservations never overlap and are contiguous
@@ -94,6 +103,8 @@ pub mod incarnation_core;
 pub mod journal_core;
 #[path = "../../crates/fuse3/src/raw/connection/lease_core.rs"]
 pub mod lease_core;
+#[path = "../../crates/fuse3/src/raw/connection/wake_core.rs"]
+pub mod wake_core;
 #[path = "../../src/meta_backend/kv/node_state_core.rs"]
 pub mod node_state_core;
 #[path = "../../src/patch_clone_core.rs"]
@@ -105,7 +116,7 @@ pub mod refcount_core;
 mod models {
     use crate::{
         alloc_ext_core, conveyor_core, gauge_core, incarnation_core, journal_core, lease_core,
-        node_state_core, patch_clone_core, refcount_core,
+        node_state_core, patch_clone_core, refcount_core, wake_core,
     };
     use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use loom::sync::Arc;
@@ -606,6 +617,178 @@ mod models {
 
             dropper.join().unwrap();
             assert!(!st.leased(), "lease outlived its drop");
+        });
+    }
+
+    /// Wake-coalescer invariant #1 (L3 transport-economy lever B): a
+    /// producer publication is NEVER stranded. Producers publish state
+    /// (Release store — the mpsc-send stand-in) then `arm()`, writing the
+    /// eventfd only on `true`; the worker's pass is drain-eventfd →
+    /// `disarm()` → scan. After ANY interleaving, when the worker would
+    /// park (eventfd counter 0 after a pass), every publication has been
+    /// observed — a missed one with a zero counter is the lost-wake
+    /// deadlock (stranded reply ⇒ kernel `waiting ≥ 1` ⇒ umount EBUSY).
+    /// An unconsumed counter is fine: the level-triggered PollAdd re-wakes
+    /// the worker the moment `submit_and_wait` arms it, modeled as the
+    /// post-join extra pass.
+    ///
+    /// Development weakening evidence (both verified failing): permuting
+    /// the worker pass to scan-before-disarm strands a publication
+    /// ("consumed 1 of 2" park), and `disarm` as a plain SeqCst *store*
+    /// (no RMW read of the flag's predecessor — the happens-before
+    /// carrier) strands both models. The shipped RMW + drain→disarm→scan
+    /// order passes.
+    #[test]
+    fn wake_coalescer_publication_never_stranded() {
+        loom::model(|| {
+            let flag = Arc::new(wake_core::WakeCoalescer::new());
+            let efd = Arc::new(AtomicU64::new(0)); // eventfd counter
+            let produced = Arc::new(AtomicU64::new(0)); // channel stand-in
+
+            let producers: Vec<_> = (0..2)
+                .map(|_| {
+                    let flag = Arc::clone(&flag);
+                    let efd = Arc::clone(&efd);
+                    let produced = Arc::clone(&produced);
+                    thread::spawn(move || {
+                        // submit_reply ships exactly this order: channel
+                        // send (publish), then arm, then conditional write.
+                        produced.fetch_add(1, Ordering::Release);
+                        if flag.arm() {
+                            efd.fetch_add(1, Ordering::Release);
+                        }
+                    })
+                })
+                .collect();
+
+            // Queue worker: bounded passes (each producer writes the
+            // eventfd at most once ⇒ ≤ 2 wake-driven continuations).
+            let worker = {
+                let flag = Arc::clone(&flag);
+                let efd = Arc::clone(&efd);
+                let produced = Arc::clone(&produced);
+                thread::spawn(move || {
+                    let mut consumed = 0;
+                    for _pass in 0..3 {
+                        efd.swap(0, Ordering::AcqRel); // drain to EAGAIN
+                        flag.disarm();
+                        consumed = produced.load(Ordering::Acquire); // scan
+                        if efd.load(Ordering::SeqCst) == 0 {
+                            break; // park: PollAdd armed, counter zero
+                        }
+                    }
+                    consumed
+                })
+            };
+
+            for p in producers {
+                p.join().unwrap();
+            }
+            let consumed = worker.join().unwrap();
+
+            if efd.load(Ordering::SeqCst) == 0 {
+                // Worker parked with nothing armed: NOTHING may be stranded.
+                assert_eq!(
+                    consumed, 2,
+                    "lost wake: publication(s) stranded while the worker \
+                     parks on a zero eventfd (consumed {consumed} of 2)"
+                );
+            } else {
+                // Level-triggered PollAdd: the nonzero counter re-wakes the
+                // worker; that pass observes everything.
+                efd.swap(0, Ordering::AcqRel);
+                flag.disarm();
+                assert_eq!(
+                    produced.load(Ordering::Acquire),
+                    2,
+                    "the wake-driven pass must observe every publication"
+                );
+            }
+        });
+    }
+
+    /// Wake-coalescer invariant #2 — composed with [`lease_core`] exactly
+    /// as shipped (`EntPayloadLease::drop` + a concurrent `submit_reply`
+    /// producer sharing one queue coalescer): a parked commit whose lease
+    /// drops through the coalescer is never stranded, and the concurrent
+    /// reply publication is never lost, whatever a racing worker pass
+    /// consumed. The worker runs one CONCURRENT pass (the race window),
+    /// then the wake-driven passes the nonzero counter would produce.
+    #[test]
+    fn wake_coalescer_lease_drop_parked_commit_never_stranded() {
+        loom::model(|| {
+            let st = Arc::new(lease_core::EntLeaseState::new());
+            assert_eq!(st.acquire(), 0, "fresh ent must be lease-free");
+            // The commit parked before the drop (worker owns the message).
+            assert!(matches!(st.try_commit(), lease_core::CommitGate::Parked));
+
+            let flag = Arc::new(wake_core::WakeCoalescer::new());
+            let efd = Arc::new(AtomicU64::new(0));
+            let sent = Arc::new(AtomicU64::new(0));
+
+            // Thread A: EntPayloadLease::drop as shipped — release, then
+            // the coalesced wake.
+            let dropper = {
+                let st = Arc::clone(&st);
+                let flag = Arc::clone(&flag);
+                let efd = Arc::clone(&efd);
+                thread::spawn(move || {
+                    if st.release() && flag.arm() {
+                        efd.fetch_add(1, Ordering::Release);
+                    }
+                })
+            };
+            // Thread B: submit_reply for another ent on the same queue —
+            // publish, then the coalesced wake.
+            let submitter = {
+                let flag = Arc::clone(&flag);
+                let efd = Arc::clone(&efd);
+                let sent = Arc::clone(&sent);
+                thread::spawn(move || {
+                    sent.store(1, Ordering::Release);
+                    if flag.arm() {
+                        efd.fetch_add(1, Ordering::Release);
+                    }
+                })
+            };
+
+            // One concurrent worker pass (the race window).
+            let mut commits = 0u32;
+            let mut sent_seen;
+            efd.swap(0, Ordering::AcqRel);
+            flag.disarm();
+            sent_seen = sent.load(Ordering::Acquire) != 0;
+            if st.try_unpark() {
+                assert!(!st.leased(), "unparked commit with a live lease");
+                commits += 1;
+            }
+
+            dropper.join().unwrap();
+            submitter.join().unwrap();
+
+            // Wake-driven passes: each producer wrote ≤ 1, so ≤ 2 rounds.
+            for _ in 0..2 {
+                if efd.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+                efd.swap(0, Ordering::AcqRel);
+                flag.disarm();
+                sent_seen |= sent.load(Ordering::Acquire) != 0;
+                if commits == 0 && st.try_unpark() {
+                    assert!(!st.leased(), "unparked commit with a live lease");
+                    commits += 1;
+                }
+            }
+
+            assert_eq!(
+                commits, 1,
+                "parked commit stranded (or double-committed) across the \
+                 coalesced lease-drop wake"
+            );
+            assert!(
+                sent_seen,
+                "reply publication stranded across the coalesced wake"
+            );
         });
     }
 

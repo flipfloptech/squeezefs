@@ -215,7 +215,42 @@ For unattended hosts add `--supervise`: the parent stays alive as an external wa
 
 Target sharing and client connections live under the top-level **`squeezefs nvmeof`** verb (dual-stack: SPDK and kernel nvmet; stack selection is explicit — `--target-stack`, env `SQUEEZEFS_NVMEOF_TARGET_STACK`, default `spdk` — and failure is loud, never a silent cross-stack fallback).
 
-> ⚠️ **Interim — SPDK target management lands later in this program.** The NVMe-oF target-management program (`docs/design-nvmeof-target-management.md`) ships in milestones: the kernel-nvmet target path below is fully managed **today**; the SPDK stack's lifecycle verbs (`nvmeof target install/setup/start/stop/status/systemd-unit`) and SPDK sharing land with milestones **N3/N4**. Until then, `--target-stack spdk` — including the **default** — fails loud with a message naming those milestones. Select `--target-stack nvmet` explicitly for everything on this page. (The old `storage nvmeof spdk-*` verbs are removed — README → *Removed flags/verbs*.)
+> ⚠️ **Interim — SPDK sharing lands at N4.** The NVMe-oF target-management program (`docs/design-nvmeof-target-management.md`) ships in milestones: the kernel-nvmet target path below is fully managed **today**, and as of milestone **N3** the SPDK **target lifecycle verbs** (`nvmeof target install/setup/start/stop/status/systemd-unit`) are live. SPDK **sharing** lands with milestone **N4** — until then `share`/`unshare`/`restore` with `--target-stack spdk` (including the **default**) fail loud pointing at the live target verbs; select `--target-stack nvmet` explicitly for the sharing runbook below. (The old `storage nvmeof spdk-*` verbs are removed — README → *Removed flags/verbs*.)
+
+### Manage the SPDK Target Runtime (lifecycle — live as of N3)
+```bash
+# One-time: build the pinned SPDK release (v26.05, commit-sha verified after
+# clone) into /opt/squeezefs/spdk/v26.05/. Never mutates system packages
+# without consent: a missing toolchain refuses loud with the package list;
+# --with-pkgdep is the explicit opt-in that runs SPDK's pkgdep.sh.
+sudo ./target/release/squeezefs nvmeof target install
+
+# Reserve 2 MiB hugepages (default 2048 MiB = 1024 pages). The prior value is
+# recorded in the state dir and restored by --restore-prior:
+sudo ./target/release/squeezefs nvmeof target setup --hugemem-mb 2048
+
+# Start the target (pidfile direct mode): preflighted spawn -> RPC-liveness
+# wait -> load_config (tgt-config.json, the SPDK source of truth) -> pidfile.
+# One reactor on the highest online CPU by default (--core-mask / --cores
+# override); the reactor busy-polls ~100 % of its core by design:
+sudo ./target/release/squeezefs nvmeof target start
+
+# Health: RPC liveness + latency, version + drift vs the v26.05 pin, reactor
+# busy %, hugepages, ledger reconciliation. The diagnostic verb never refuses:
+sudo ./target/release/squeezefs nvmeof target status --json
+
+# Stop: save_config -> SIGTERM -> 10 s grace -> SIGKILL. Refuses while
+# ledgered shares have live initiator connections (--force overrides):
+sudo ./target/release/squeezefs nvmeof target stop
+
+# Production: emit a systemd unit with every value baked at emission time
+# (squeezefs never installs units — the operator does):
+sudo ./target/release/squeezefs nvmeof target systemd-unit > squeezefs-spdk-tgt.service
+
+# Undo the hugepage reservation when done:
+sudo ./target/release/squeezefs nvmeof target setup --restore-prior
+```
+Mutating verbs refuse a target whose version drifts from the pin unless `--accept-version-drift`; `target status` always *reports* drift; `target stop` warns-and-proceeds (refusing shutdown on version grounds would invert the risk). Dev/rig boxes can point `SQUEEZEFS_SPDK_TGT_BIN` at an existing build — loud, unpinned. SPDK **share** commands ride these verbs from N4 on.
 
 ### Share a Target via the Kernel nvmet Stack
 ```bash

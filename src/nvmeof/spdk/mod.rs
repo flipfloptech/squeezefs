@@ -405,6 +405,31 @@ impl SpdkStack {
                 .and_then(|b| filename_of.get(b))
                 .cloned()
                 .unwrap_or_default();
+            // Live namespace ids — the §6.10 shape classification input
+            // (adopt supports exactly one namespace) and the adopted
+            // record's recorded nsid.
+            let mut nsids: Vec<u32> = namespaces
+                .iter()
+                .filter_map(|n| n.get("nsid").and_then(serde_json::Value::as_u64))
+                .map(|v| v as u32)
+                .collect();
+            nsids.sort_unstable();
+            // The live host allowlist — captured so an adopted share's
+            // restore never silently widens to allow-any.
+            let mut allow_hosts: Vec<String> = sub
+                .get("hosts")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|h| {
+                            h.get("nqn")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            allow_hosts.sort();
             let backing_canonical = if device_path.is_empty() {
                 String::new()
             } else {
@@ -440,9 +465,9 @@ impl SpdkStack {
                     .map(str::to_string),
                 listeners,
                 enabled: !namespaces.is_empty(),
-                nsids: Vec::new(),
-                bdev_name: None,
-                allow_hosts: Vec::new(),
+                nsids,
+                bdev_name: bdev_name.map(str::to_string),
+                allow_hosts,
             });
         }
         Ok(out)
@@ -532,9 +557,12 @@ impl SpdkStack {
                 )
             } else {
                 format!(
-                    "  removal-first is the only re-share path while the old object serves \
-                     (docs/design-nvmeof-target-management.md §6.4):\n{}",
-                    manual_removal_steps(&self.paths.rpc_sock(), &live.subnqn, None)
+                    "  while the old object serves, either remove it first \
+                     (docs/design-nvmeof-target-management.md §6.4):\n{}\n  or absorb it into \
+                     management instead — writes only the ledger, the live object keeps \
+                     serving (§6.10):\n    sudo squeezefs nvmeof adopt {}",
+                    manual_removal_steps(&self.paths.rpc_sock(), &live.subnqn, None),
+                    live.subnqn
                 )
             };
             if live.subnqn == req.subnqn {
@@ -618,8 +646,10 @@ impl SpdkStack {
         })?;
         let ptpl = self.ptpl_abs(rec).ok_or_else(|| {
             NvmeofError::Refused(format!(
-                "record '{}' carries no ptpl_file — N4+ SPDK records always do (reservation \
-                 persistence is not optional on this stack)",
+                "record '{}' carries no ptpl_file — N4+ SPDK-shared records always do \
+                 (reservation persistence is not optional on this stack), and an ADOPTED \
+                 record without one cannot be re-established by restore (the §6.10 loud-null \
+                 contract): unshare it and re-share under management to upgrade",
                 rec.subnqn
             ))
         })?;

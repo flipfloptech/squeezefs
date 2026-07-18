@@ -707,8 +707,18 @@ fn test_adopt_not_live_refusal_names_class_and_list_guidance() {
 fn test_adopt_ambiguous_refusal_names_both_holders_and_disambiguator() {
     let (_dir, ledger) = tmp_ledger();
     let ps = probes(
-        vec![live(NQN_FOREIGN, "/dev/zram11", Some(UUID_A), &[])],
-        vec![live(NQN_FOREIGN, "/dev/zram12", Some(UUID_B), &[])],
+        vec![live(
+            NQN_FOREIGN,
+            "/dev/zram11",
+            Some(UUID_A),
+            &[("127.0.0.1", 4420, Some(4))],
+        )],
+        vec![live(
+            NQN_FOREIGN,
+            "/dev/zram12",
+            Some(UUID_B),
+            &[("127.0.0.1", 4421, None)],
+        )],
     );
     let err = adopt_candidate(NQN_FOREIGN, None, &ps, &ledger)
         .expect_err("both stacks live must fail closed");
@@ -1048,15 +1058,42 @@ fn test_adopt_candidate_nvmet_shape_records_identity_listeners_loop() {
     // canonical resolves to the file — backing_path records the file and
     // loop_device the node (§6.4 law 5: teardown learns it from the
     // ledger).
-    let mut loop_holder = live(NQN_FOREIGN, "/dev/loop7", Some(UUID_A), &[]);
+    let mut loop_holder = live(
+        NQN_FOREIGN,
+        "/dev/loop7",
+        Some(UUID_A),
+        &[("127.0.0.1", 4421, Some(53002))],
+    );
     loop_holder.backing_canonical = "/srv/backing.img".to_string();
     let ps = probes(vec![loop_holder], vec![]);
     let (candidate, _) = adopt_candidate(NQN_FOREIGN, None, &ps, &ledger).expect("loop candidate");
     assert_eq!(candidate.backing_path, "/srv/backing.img");
     assert_eq!(candidate.loop_device.as_deref(), Some("/dev/loop7"));
 
+    // A live object with NO listener is not representable (the §6.4
+    // schema requires >= 1) — shape-unsupported, never a validate panic.
+    let bare_no_listener = live(
+        "nqn.2026-06.io.foreign:no-listener",
+        "/dev/zram23",
+        None,
+        &[],
+    );
+    let ps = probes(vec![bare_no_listener], vec![]);
+    let err = adopt_candidate("nqn.2026-06.io.foreign:no-listener", None, &ps, &ledger)
+        .expect_err("no listener = unsupported shape");
+    let text = err.to_string();
+    assert!(
+        text.contains("adopt_shape_unsupported") && text.contains("listener"),
+        "no-listener objects refuse as shape-unsupported: {text}"
+    );
+
     // Missing device_uuid: recorded null with the loud re-share note.
-    let bare = live("nqn.2026-06.io.foreign:no-uuid", "/dev/zram23", None, &[]);
+    let bare = live(
+        "nqn.2026-06.io.foreign:no-uuid",
+        "/dev/zram23",
+        None,
+        &[("127.0.0.1", 4422, Some(53003))],
+    );
     let ps = probes(vec![bare], vec![]);
     let (candidate, notes) = adopt_candidate("nqn.2026-06.io.foreign:no-uuid", None, &ps, &ledger)
         .expect("null identity is recordable");

@@ -423,10 +423,12 @@ impl NvmetStack {
                      (classification: {class}); SqueezeFS never adopts or clobbers a live \
                      object implicitly.\n  if it is managed, unshare it first:\n    sudo \
                      squeezefs nvmeof unshare {}\n  if it is foreign/pre-rebuild, remove it \
-                     manually:\n{}",
+                     manually:\n{}\n  or absorb it into management explicitly (writes only \
+                     the ledger — §6.10):\n    sudo squeezefs nvmeof adopt {}",
                     live.subnqn,
                     live.subnqn,
-                    self.manual_removal_steps(&live.subnqn)
+                    self.manual_removal_steps(&live.subnqn),
+                    live.subnqn
                 )));
             }
             let same_backing = live.backing_canonical == req.backing_canonical
@@ -441,9 +443,12 @@ impl NvmetStack {
                     )
                 } else {
                     format!(
-                        "  removal-first is the only re-share path while the old object \
-                         serves (docs/design-nvmeof-target-management.md §6.4):\n{}",
-                        self.manual_removal_steps(&live.subnqn)
+                        "  while the old object serves, either remove it first \
+                         (docs/design-nvmeof-target-management.md §6.4):\n{}\n  or absorb it \
+                         into management instead — writes only the ledger, the live object \
+                         keeps serving (§6.10):\n    sudo squeezefs nvmeof adopt {}",
+                        self.manual_removal_steps(&live.subnqn),
+                        live.subnqn
                     )
                 };
                 return Err(NvmeofError::Refused(format!(
@@ -480,6 +485,32 @@ impl NvmetStack {
         for entry in fs::read_dir(&subs_dir).map_err(NvmeofError::Io)? {
             let entry = entry.map_err(NvmeofError::Io)?;
             let nqn = entry.file_name().to_string_lossy().into_owned();
+            // Namespace indexes — the §6.10 shape classification input
+            // (this stack's supported shape is exactly [1], the §6.6
+            // structural convention; the identity attrs below still read
+            // from index 1).
+            let mut nsids: Vec<u32> = Vec::new();
+            let ns_root = entry.path().join("namespaces");
+            if ns_root.is_dir() {
+                for ns in fs::read_dir(&ns_root).map_err(NvmeofError::Io)? {
+                    let ns = ns.map_err(NvmeofError::Io)?;
+                    if let Ok(idx) = ns.file_name().to_string_lossy().parse::<u32>() {
+                        nsids.push(idx);
+                    }
+                }
+            }
+            nsids.sort_unstable();
+            // The live allowlist (`allowed_hosts` links) — captured so an
+            // adopted share's restore never silently widens to allow-any.
+            let mut allow_hosts: Vec<String> = Vec::new();
+            let ah_dir = entry.path().join("allowed_hosts");
+            if ah_dir.is_dir() {
+                for link in fs::read_dir(&ah_dir).map_err(NvmeofError::Io)? {
+                    let link = link.map_err(NvmeofError::Io)?;
+                    allow_hosts.push(link.file_name().to_string_lossy().into_owned());
+                }
+            }
+            allow_hosts.sort();
             let ns = entry.path().join("namespaces").join("1");
             let device_path = read_attr_opt(&ns.join("device_path")).unwrap_or_default();
             let ns_uuid = read_attr_opt(&ns.join("device_uuid")).filter(|s| !s.is_empty());
@@ -490,9 +521,9 @@ impl NvmetStack {
                 ns_uuid,
                 listeners: listeners_of.remove(&nqn).unwrap_or_default(),
                 enabled,
-                nsids: Vec::new(),
-                bdev_name: None,
-                allow_hosts: Vec::new(),
+                nsids,
+                bdev_name: None, // SPDK-only
+                allow_hosts,
                 subnqn: nqn,
             });
         }

@@ -684,3 +684,194 @@ async fn mixed_direct_buffered_coherence_091_shape() {
     let d = read_flags(&h, ino, BS + 4096, 4096, OD).await;
     assert!(d.iter().all(|&x| x == 0xA2), "sibling block unperturbed");
 }
+
+/// Scoreboard loss-1 follow-up (2026-07-18,
+/// `.benchmarks/2026-07-18-multi-reference-scoreboard.md` §Loss 1): the
+/// inaugural R2 `seq_write_1m` row correlated `-o direct_device_true` with
+/// a halved write-phase device drain. Root-caused as NOT causal — the
+/// escape's only consumers are the three read-side sites
+/// (`src/routing.rs`), the original row's own `.stats` deltas show the
+/// write path executed identical work flag-on vs flag-off, and targeted
+/// A/B measurement shows drain parity (report addendum, 2026-07-18).
+///
+/// This test PINS that innocence as the standing contract: **the escape
+/// must never gate, serialize, or reroute the write/flush path.** It runs
+/// one identical write script twice — escape off, then escape armed via
+/// the mount-option path — and requires byte-identical write-side
+/// routing:
+///
+/// - identical write-through / patch / layout / flush-spill counter
+///   deltas (a flag-coupled route change diverges here — 6 write-through
+///   blocks vs 0 is the loudest failure shape);
+/// - ZERO device reads and ZERO `write_path_seed_read_bytes` inside the
+///   write window in both modes (pins the chartered hypothesis "the flag
+///   makes drains serial-read-bound via RMW seed serving" to dead);
+/// - ZERO `read_device_true_reads` movement during pure writes in both
+///   modes (the escape's consumers are read-only — a write-side consumer
+///   regression trips this), while a post-window O_DIRECT read proves the
+///   armed fixture's escape was genuinely live;
+/// - identical durable content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn escape_never_touches_the_write_path() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct WriteSideDeltas {
+        write_through_blocks: u64,
+        write_through_bytes: u64,
+        patch_writes: u64,
+        patch_write_bytes: u64,
+        layout_striped_writes: u64,
+        get_obj: u64,
+        write_path_seed_read_bytes: u64,
+        staging_put_bytes_flush: u64,
+        writeback_enqueued_flush: u64,
+        read_device_true_reads: u64,
+    }
+
+    fn counters() -> [u64; 10] {
+        [
+            METRICS.write_through_blocks.load(Ordering::Relaxed),
+            METRICS.write_through_bytes.load(Ordering::Relaxed),
+            METRICS.patch_writes.load(Ordering::Relaxed),
+            METRICS.patch_write_bytes.load(Ordering::Relaxed),
+            METRICS.layout_striped_writes.load(Ordering::Relaxed),
+            METRICS.get_obj.load(Ordering::Relaxed),
+            METRICS.write_path_seed_read_bytes.load(Ordering::Relaxed),
+            METRICS.staging_put_bytes_flush.load(Ordering::Relaxed),
+            METRICS.writeback_enqueued_flush.load(Ordering::Relaxed),
+            METRICS.read_device_true_reads.load(Ordering::Relaxed),
+        ]
+    }
+
+    /// One write script = the loss row's shapes at fixture scale: striped
+    /// base, full-block O_DIRECT overwrites (the write-through drain), an
+    /// aligned interior O_DIRECT small overwrite (the W1 patch shape), a
+    /// partial tail + fsync (the staging-spill/flush leg).
+    async fn run_script(h: &H, name: &str) -> WriteSideDeltas {
+        let ino = create(h, name).await;
+        for b in 0..6u64 {
+            write_at(h, ino, b * BS, &vec![b as u8 + 1; BS as usize]).await;
+        }
+        make_cold(h, ino).await;
+
+        let c0 = counters();
+        // Patch lever OFF for the overwrite leg so every full-block
+        // O_DIRECT overwrite deterministically takes the accumulation →
+        // coverage-complete → write-through route (the R2 row's 4,064-
+        // block drain path), not the in-place patch.
+        squeezefs::fuse_client::set_patch_max_bytes(0);
+        for b in 0..6u64 {
+            write_odirect_at(h, ino, b * BS, &vec![b as u8 + 0x21; BS as usize]).await;
+        }
+        // Patch posture back to default for the small-overwrite shape.
+        squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
+        write_odirect_at(h, ino, 2 * BS + 8192, &vec![0x77u8; 4096]).await;
+        h.fs.fsync(h.req, ino, 0, false).await.unwrap();
+        // Partial tail: parks, then spills/flushes at fsync.
+        write_at(h, ino, 6 * BS, &vec![0x55u8; (BS / 4) as usize]).await;
+        h.fs.fsync(h.req, ino, 0, false).await.unwrap();
+        let c1 = counters();
+
+        // Durable content (identical route ⇒ identical bytes) — read
+        // AFTER the measured window (buffered, so no device-true motion).
+        let d = read_at(h, ino, 5 * BS, 4096).await;
+        assert!(
+            d.iter().all(|&x| x == 5 + 0x21),
+            "{name}: overwritten block bytes"
+        );
+        let d = read_at(h, ino, 2 * BS + 8192, 4096).await;
+        assert!(d.iter().all(|&x| x == 0x77), "{name}: patched bytes");
+        let d = read_at(h, ino, 2 * BS, 4096).await;
+        assert!(
+            d.iter().all(|&x| x == 0x23),
+            "{name}: unpatched bytes of the patched block"
+        );
+        let d = read_at(h, ino, 6 * BS, 4096).await;
+        assert!(d.iter().all(|&x| x == 0x55), "{name}: tail bytes");
+
+        WriteSideDeltas {
+            write_through_blocks: c1[0] - c0[0],
+            write_through_bytes: c1[1] - c0[1],
+            patch_writes: c1[2] - c0[2],
+            patch_write_bytes: c1[3] - c0[3],
+            layout_striped_writes: c1[4] - c0[4],
+            get_obj: c1[5] - c0[5],
+            write_path_seed_read_bytes: c1[6] - c0[6],
+            staging_put_bytes_flush: c1[7] - c0[7],
+            writeback_enqueued_flush: c1[8] - c0[8],
+            read_device_true_reads: c1[9] - c0[9],
+        }
+    }
+
+    // Phase A — escape OFF (default posture). The baseline arm-proof
+    // probe (an O_DIRECT read staying hybrid) runs before the fixture is
+    // dropped; fixtures must not overlap (fresh volumes mint the same ino
+    // sequence, and per-ino process globals — DLM object locks, stripe
+    // shards — are keyed by ino).
+    let base;
+    let dtr_probe0 = METRICS.read_device_true_reads.load(Ordering::Relaxed);
+    {
+        let h_off = make_with(*b"hybrid-io-w-v001", "hyb_ns_w_off").await;
+        assert!(!h_off.fs.router.direct_device_true());
+        base = run_script(&h_off, "wa_off").await;
+
+        let ino_off = create(&h_off, "wa_off_probe").await;
+        for b in 0..3u64 {
+            write_at(&h_off, ino_off, b * BS, &vec![0xEEu8; BS as usize]).await;
+        }
+        make_cold(&h_off, ino_off).await;
+        let d = read_flags(&h_off, ino_off, 0, 4096, OD).await;
+        assert!(d.iter().all(|&x| x == 0xEE));
+        assert_eq!(
+            METRICS.read_device_true_reads.load(Ordering::Relaxed),
+            dtr_probe0,
+            "baseline fixture: O_DIRECT reads stay hybrid"
+        );
+    }
+
+    // Phase B — escape ARMED via the mount-option path (`start_mount`'s
+    // `-o direct_device_true` setter).
+    let h_on = make_with(*b"hybrid-io-w-v002", "hyb_ns_w_on").await;
+    h_on.fs.router.set_direct_device_true(true);
+    assert!(h_on.fs.router.direct_device_true());
+    let armed = run_script(&h_on, "wa_on").await;
+
+    // THE contract: byte-identical write-side routing.
+    assert_eq!(
+        base, armed,
+        "the direct_device_true escape must be write-path inert: identical \
+         script ⇒ identical write-side counter deltas"
+    );
+
+    // The write-through drain leg genuinely ran (10 full blocks), with no
+    // device reads, no seed reads, and no device-true motion — in BOTH
+    // modes (equality above makes one set of absolutes cover both).
+    assert_eq!(base.write_through_blocks, 6, "write-through drain leg");
+    assert_eq!(base.write_through_bytes, 6 * BS, "write-through bytes");
+    assert_eq!(base.get_obj, 0, "pure writes never read the device");
+    assert_eq!(
+        base.write_path_seed_read_bytes, 0,
+        "write-path seed-read tripwire (must stay 0 — AGENTS.md)"
+    );
+    assert_eq!(
+        base.read_device_true_reads, 0,
+        "the escape's consumers are read-side only; a write-side consumer \
+         would move this during a pure-write window"
+    );
+
+    // Arm proof: the SAME O_DIRECT-read probe was hybrid on the baseline
+    // fixture (asserted above) and is device-true here — the phases' one
+    // difference is demonstrably live, so the equality above is a real
+    // A/B.
+    let dtr1 = METRICS.read_device_true_reads.load(Ordering::Relaxed);
+    let ino_on = create(&h_on, "wa_on_probe").await;
+    for b in 0..3u64 {
+        write_at(&h_on, ino_on, b * BS, &vec![0xEDu8; BS as usize]).await;
+    }
+    make_cold(&h_on, ino_on).await;
+    let d = read_flags(&h_on, ino_on, 0, 4096, OD).await;
+    assert!(d.iter().all(|&x| x == 0xED));
+    assert!(
+        METRICS.read_device_true_reads.load(Ordering::Relaxed) > dtr1,
+        "armed fixture: the escape is live (device-true read counted)"
+    );
+}

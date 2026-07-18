@@ -623,7 +623,7 @@ impl NvmetStack {
             println!(
                 "note: '{}' is served via loop device {dev}; loop devices expose no NVMe \
                  Persistent Reservations, so the single-writer mount guard is DETECTION-grade \
-                 on this share (README → Single-writer mount guard).",
+                 on this share (docs/operations.md → Single-writer mount guard).",
                 record.backing_path
             );
             loop_device = Some(dev.clone());

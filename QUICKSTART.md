@@ -1,6 +1,6 @@
 # Squeezefs Quick Start Guide
 
-This guide describes how to get Squeezefs up and running, verify a mount, execute its built-in benchmarks, and configure it on bare-metal systems and over NVMe-oF fabrics. It is the operator runbook; concepts, guarantee classes, and tuning-knob reference live in [README.md](README.md).
+This guide describes how to get Squeezefs up and running, verify a mount, execute its built-in benchmarks, and configure it on bare-metal systems and over NVMe-oF fabrics. It is the operator runbook; the project overview lives in [README.md](README.md), and the guarantee classes and tuning-knob reference live in [docs/operations.md](docs/operations.md).
 
 ---
 
@@ -207,7 +207,7 @@ sudo ./target/release/squeezefs mount \
   --daemon \
   --allow-other
 ```
-For unattended hosts add `--supervise`: the parent stays alive as an external watchdog that probes `<mountpoint>/.stats` and (as root) aborts a wedged FUSE connection to release blocked callers — see README → *External mount supervisor*.
+For unattended hosts add `--supervise`: the parent stays alive as an external watchdog that probes `<mountpoint>/.stats` and (as root) aborts a wedged FUSE connection to release blocked callers — see [docs/operations.md → External mount supervisor](docs/operations.md#external-mount-supervisor-mount---daemon---supervise).
 
 ---
 
@@ -215,7 +215,7 @@ For unattended hosts add `--supervise`: the parent stays alive as an external wa
 
 Target sharing and client connections live under the top-level **`squeezefs nvmeof`** verb (dual-stack: SPDK and kernel nvmet; stack selection is explicit — `--target-stack`, env `SQUEEZEFS_NVMEOF_TARGET_STACK`, default `spdk` — and failure is loud, never a silent cross-stack fallback).
 
-Both stacks are fully managed (NVMe-oF target-management program, 2026-07 — `docs/design-nvmeof-target-management.md`): the SPDK runbook below is the **default path** (`share`/`unshare`/`restore` ride `save_config`/`load_config` with pinned namespace identity + PTPL), and the kernel-nvmet runbook remains the first-class explicit alternative. **Choose per deployment class with the measured table** in README → *NVMe-oF Utilities* (queued-I/O storage nodes: spdk; core-constrained converged nodes and QD1-latency consumers: consider nvmet; per-core honesty stated per row — evidence `.benchmarks/2026-07-18-nvmeof-dual-stack-ab.md`). (The old `storage nvmeof spdk-*` verbs are removed — README → *Removed flags/verbs*.)
+Both stacks are fully managed (NVMe-oF target-management program, 2026-07 — `docs/design-nvmeof-target-management.md`): the SPDK runbook below is the **default path** (`share`/`unshare`/`restore` ride `save_config`/`load_config` with pinned namespace identity + PTPL), and the kernel-nvmet runbook remains the first-class explicit alternative. **Choose per deployment class with the measured table** in [docs/operations.md → NVMe-oF operations](docs/operations.md#nvme-of-operations) (queued-I/O storage nodes: spdk; core-constrained converged nodes and QD1-latency consumers: consider nvmet; per-core honesty stated per row — evidence `.benchmarks/2026-07-18-nvmeof-dual-stack-ab.md`). (The old `storage nvmeof spdk-*` verbs are removed — [docs/operations.md → Removed verbs & flags](docs/operations.md#removed-verbs--flags).)
 
 ### Manage the SPDK Target Runtime (lifecycle)
 ```bash
@@ -242,7 +242,7 @@ sudo ./target/release/squeezefs nvmeof target start
 # busy % (useful-work fraction: ~0 idle even while the poller burns its core),
 # hugepages, ptpl_files present/missing, ledger reconciliation. The diagnostic
 # verb never refuses. Initiator-side fabric signals (fabric_* on .stats,
-# squeezefs status "Fabric" section): README -> NVMe-oF Utilities:
+# squeezefs status "Fabric" section): docs/operations.md -> Fabric observability:
 sudo ./target/release/squeezefs nvmeof target status --json
 
 # Stop: save_config -> SIGTERM -> 10 s grace -> SIGKILL. Refuses while
@@ -339,7 +339,7 @@ sudo ./target/release/squeezefs mount sqmeta:///dev/main-pool/meta-vol /mnt/sque
 # Done with a share on the client side:
 sudo ./target/release/squeezefs nvmeof disconnect <subnqn>
 ```
-- **Single-writer guard on fabric namespaces:** where the namespace advertises NVMe Persistent Reservation support, the mount guard runs **enforcement-grade** (the device itself fences stale writers) — check `writer_guard_mode` on `.stats`. Guarantee classes per substrate: README → *Single-writer mount guard*.
+- **Single-writer guard on fabric namespaces:** where the namespace advertises NVMe Persistent Reservation support, the mount guard runs **enforcement-grade** (the device itself fences stale writers) — check `writer_guard_mode` on `.stats`. Guarantee classes per substrate: [docs/operations.md → Single-writer mount guard](docs/operations.md#single-writer-mount-guard-guarantee-classes).
 - **Multipath/HA:** path redundancy across NICs/ports is native NVMe multipath, configured at `nvme connect` time (kernel initiator), transparent to SqueezeFS.
 - Fabric multipath/failover across multiple NICs is the kernel NVMe initiator's native multipath domain — configure it with `nvme connect` policies at the host level.
 
@@ -365,7 +365,7 @@ sudo ./target/release/squeezefs tune
 
 ## 6. Metadata Durability Knobs
 
-The metadata crash contract is documented in `README.md` → *Metadata Durability*: v3 (CoW KV metadata) holds it **by construction** — every on-disk unit is checksummed, torn writes are detected-and-ignored (never applied), and each transaction commits atomically as one checksummed journal entry (`docs/design-cow-kv-metadata.md` §4.10). Operationally:
+The metadata crash contract is documented in [docs/operations.md → Metadata Durability](docs/operations.md#metadata-durability-crash-contract): v3 (CoW KV metadata) holds it **by construction** — every on-disk unit is checksummed, torn writes are detected-and-ignored (never applied), and each transaction commits atomically as one checksummed journal entry (`docs/design-cow-kv-metadata.md` §4.10). Operationally:
 
 ```bash
 # Strict sync-on-commit metadata durability (default is a 50 ms deferred window):
@@ -380,8 +380,8 @@ SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES=8192 \
 # Inode-reclaim group-commit batch size (default 64):
 SQUEEZEFS_RECLAIM_BATCH=128 ./target/release/squeezefs mount …
 
-# Read-path knobs (defaults are the measured sweet spot — see README →
-# "Read-path tuning" and docs/design-read-path.md). Examples:
+# Read-path knobs (defaults are the measured sweet spot — see docs/operations.md
+# -> "Read-path tuning" and docs/design-read-path.md). Examples:
 #   pin a memory budget instead of the cgroup-derived default:
 ./target/release/squeezefs mount … --mem-budget 6G
 #   disable the sequential prefetch pipeline / sub-block ranged reads (A/B):
@@ -393,7 +393,7 @@ SQUEEZEFS_READ_TIER_ADMISSION=always ./target/release/squeezefs mount …
 # (Root mounts inherit env through sudo -E.)
 ```
 
-v3 **format-time** knobs (`README.md` → *Format Squeezefs Volume*): `--meta-node-kib <64|128|256|512|1024>` (node size, default `256`; below 256 the per-volume record-value cap drops to `node_size/4`) and `--meta-journal-mb <MiB>` (journal ring, default `clamp(volume/64, 8 MiB, 32 MiB)`).
+v3 **format-time** knobs ([docs/operations.md → Format](docs/operations.md#format-squeezefs-format)): `--meta-node-kib <64|128|256|512|1024>` (node size, default `256`; below 256 the per-volume record-value cap drops to `node_size/4`) and `--meta-journal-mb <MiB>` (journal ring, default `clamp(volume/64, 8 MiB, 32 MiB)`).
 
 File-backed sandbox volumes (section 1) classify **physically** as `file-backed` (reported as `meta_volume_atomicity_physical` on the `.stats` inode) — purely informational: metadata integrity does not depend on it; the contract field `meta_volume_atomicity` reads `cow-checksummed`.
 
@@ -405,8 +405,8 @@ Every write mount exclusively claims its metadata volume(s): a dedicated `flock`
 ./target/release/squeezefs claim clear sqmeta://$HOME/squeezefs-sandbox/meta.bin
 ```
 
-The verb re-verifies staleness under its own probe: on a healthy volume it answers `no writer claim present — nothing to clear`, and it refuses fresh claims and live-mounted volumes. Guarantee classes per substrate (and the full recovery runbook): `README.md` → *Single-writer mount guard*.
+The verb re-verifies staleness under its own probe: on a healthy volume it answers `no writer claim present — nothing to clear`, and it refuses fresh claims and live-mounted volumes. Guarantee classes per substrate (and the full recovery runbook): [docs/operations.md → Single-writer mount guard](docs/operations.md#single-writer-mount-guard-guarantee-classes).
 
 > **Legacy format v2**: support was removed entirely. A v2 superblock refuses to mount ("no longer supported; reformat required"); reformat it to v3 with `squeezefs format --force` (destroys the old contents). The offline `squeezefs migrate` converter was deleted along with v2 support.
 >
-> The full catalog of loud refusal classes (pre-watermark v3 volumes, pre-FIND-RW4-A compressed/encrypted volumes, staging generation binding, cache-path policy) lives in `README.md` → *Breaking changes & migration notes* — every message names its cause and remedy.
+> The full catalog of loud refusal classes (pre-watermark v3 volumes, pre-FIND-RW4-A compressed/encrypted volumes, staging generation binding, cache-path policy) lives in [docs/operations.md → Breaking changes & migration notes](docs/operations.md#breaking-changes--migration-notes) — every message names its cause and remedy.

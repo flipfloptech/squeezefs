@@ -4,8 +4,8 @@
 //! unprivileged. Pinned here:
 //!
 //! * the old `storage nvmeof …` spellings and the deleted `spdk-*`
-//!   lifecycle verbs fail with clap's unknown-verb error (the README
-//!   removed-verbs ledger explains them);
+//!   lifecycle verbs fail with clap's unknown-verb error (the
+//!   docs/operations.md removed-verbs ledger explains them);
 //! * `--target-stack` resolution (flag > `SQUEEZEFS_NVMEOF_TARGET_STACK`
 //!   env > default `spdk`) — **as of N4 the default stack reaches a real
 //!   `SpdkStack`**: the N3 interim milestone refusal is dead, so an
@@ -57,7 +57,7 @@ fn combined(out: &Output) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// removed verbs (README ledger entries explain these)
+// removed verbs (docs/operations.md ledger entries explain these)
 // ---------------------------------------------------------------------------
 
 /// The `storage nvmeof …` surface is gone: stale scripts fail with clap's

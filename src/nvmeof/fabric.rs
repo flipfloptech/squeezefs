@@ -27,13 +27,43 @@ pub const SYSFS_NVME: &str = "/sys/class/nvme";
 /// Identity of a fabric controller that is STABLE across kernel
 /// controller renumbering: `nvme3` can give up (`ctrl_loss_tmo`), get
 /// deleted, and reappear as `nvme7` on reconnect — but it still serves
-/// the same `(transport, subsysnqn, address)` endpoint. The sampled
+/// the same `(transport, subsysnqn, target endpoint)`. The sampled
 /// reconnect counter tracks THIS, never the `nvmeN` name.
+///
+/// FIND-N6-A: `endpoint` is the [`stable_endpoint`] reduction of the
+/// `address` attribute, NEVER the raw string — nvme-tcp appends
+/// `src_addr=…` only while queue 0 is live (`nvme_tcp_get_address`,
+/// drivers/nvme/host/tcp.c), so the raw string CHANGES between
+/// `connecting` and `live` and keying on it mints a fresh
+/// first-seen-live identity at every reattach (the reconnect counter
+/// then never fires — caught live by the G2 fidelity leg).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FabricIdentity {
     pub transport: String,
     pub subsysnqn: String,
-    pub address: String,
+    pub endpoint: String,
+}
+
+/// Reduce a kernel `address` attribute to its STABLE target-endpoint
+/// components (`traddr` + `trsvcid`). Dropped on purpose: `src_addr=`
+/// (present only while the controller is live — FIND-N6-A) and
+/// host-side path keys (`host_traddr=`/`host_iface=` are connect-time
+/// path config, not target identity).
+fn stable_endpoint(address: &str) -> String {
+    let reduced = address
+        .split(',')
+        .map(str::trim)
+        .filter(|kv| kv.starts_with("traddr=") || kv.starts_with("trsvcid="))
+        .collect::<Vec<_>>()
+        .join(",");
+    if reduced.is_empty() {
+        // No traddr at all (loop transport's empty address, exotic
+        // formats): nothing volatile to strip either — the raw string
+        // is already stable, keep whatever distinction it carries.
+        address.trim().to_string()
+    } else {
+        reduced
+    }
 }
 
 /// One fabric-attached (`transport != "pcie"`) controller as read from
@@ -61,12 +91,14 @@ pub struct FabricController {
 }
 
 impl FabricController {
-    /// The renumbering-stable identity tuple (see [`FabricIdentity`]).
+    /// The renumbering-stable identity tuple (see [`FabricIdentity`] —
+    /// FIND-N6-A: the address component is the [`stable_endpoint`]
+    /// reduction, never the raw state-volatile attribute).
     pub fn identity(&self) -> FabricIdentity {
         FabricIdentity {
             transport: self.transport.clone(),
             subsysnqn: self.subsysnqn.clone(),
-            address: self.address.clone(),
+            endpoint: stable_endpoint(&self.address),
         }
     }
 

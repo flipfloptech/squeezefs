@@ -325,6 +325,78 @@ fn test_vanished_while_live_then_reappearing_live_is_not_a_reconnect() {
     assert_eq!(s.reconnects_observed, 0);
 }
 
+/// FIND-N6-A (caught live by the G2 fidelity leg, 2026-07-18 run 1):
+/// nvme-tcp appends `src_addr=…` to the sysfs `address` attribute ONLY
+/// while queue 0 is live (`nvme_tcp_get_address`,
+/// drivers/nvme/host/tcp.c) — a controller's address string CHANGES
+/// between `connecting` and `live`. Identity keyed on the raw string
+/// minted a fresh first-seen-live identity at every reattach and the
+/// reconnect counter could never fire. Identity must be the STABLE
+/// target endpoint (`traddr`/`trsvcid`) only.
+#[test]
+fn test_reconnect_counted_across_volatile_src_addr_identity_churn() {
+    let mut sampler = FabricStatsSampler::default();
+    // Live: kernel reports the connection's source address too.
+    sampler.observe(&[ctrl(
+        "nvme5",
+        "live",
+        NQN_A,
+        "traddr=127.0.0.1,trsvcid=4621,src_addr=127.0.0.1",
+    )]);
+    // Target dead: connecting — src_addr is GONE from the attribute.
+    let s = sampler.observe(&[ctrl(
+        "nvme5",
+        "connecting",
+        NQN_A,
+        "traddr=127.0.0.1,trsvcid=4621",
+    )]);
+    assert_eq!(
+        s.not_live, 1,
+        "the down-window controller is the SAME identity, now not-live"
+    );
+    // Reattached: live again, src_addr back.
+    let s = sampler.observe(&[ctrl(
+        "nvme5",
+        "live",
+        NQN_A,
+        "traddr=127.0.0.1,trsvcid=4621,src_addr=127.0.0.1",
+    )]);
+    assert_eq!(
+        s.reconnects_observed, 1,
+        "the observed not-live->live transition must count across the \
+         volatile src_addr churn (FIND-N6-A)"
+    );
+    assert_eq!(
+        s.controllers, 1,
+        "one endpoint, one controller — no phantom identity split"
+    );
+}
+
+#[test]
+fn test_identity_is_stable_target_endpoint_only() {
+    let live = ctrl(
+        "nvme5",
+        "live",
+        NQN_A,
+        "traddr=127.0.0.1,trsvcid=4621,src_addr=127.0.0.1",
+    );
+    let connecting = ctrl(
+        "nvme9",
+        "connecting",
+        NQN_A,
+        "traddr=127.0.0.1,trsvcid=4621",
+    );
+    assert_eq!(
+        live.identity(),
+        connecting.identity(),
+        "identity survives BOTH the volatile src_addr component and \
+         controller renumbering"
+    );
+    // But distinct target endpoints stay distinct.
+    let other_port = ctrl("nvme5", "live", NQN_A, "traddr=127.0.0.1,trsvcid=4622");
+    assert_ne!(live.identity(), other_port.identity());
+}
+
 #[test]
 fn test_same_nqn_on_two_addresses_are_distinct_identities() {
     // Two portals to one subsystem (or two test ports reusing an NQN)

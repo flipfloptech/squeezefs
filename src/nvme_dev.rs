@@ -531,6 +531,12 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
     }
 }
 
+/// TTL of the cached device-node liveness probe (see
+/// [`NvmeBlockDev::node_exists_cached`]): a vanished node is detected
+/// within this window; a per-call probe is the 0.76 statx/op L3
+/// transport-economy regression.
+pub const NODE_PROBE_TTL_MS: u64 = 1000;
+
 #[derive(Clone)]
 pub struct NvmeBlockDev {
     pub device_path: String,

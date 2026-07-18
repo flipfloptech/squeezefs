@@ -368,7 +368,15 @@ Before considering work complete:
 
 If a `task check` or `cargo xtask check` target exists, run it — it is the authoritative quality gate.
 
-**Required verification gate (must pass before commit):**
+**Required verification gate (must pass before commit — tiered by change class; user directive 2026-07-18: stop running full test suites on doc-only changes):**
+
+| Change class | Required gate |
+|---|---|
+| **Docs/markdown only** (no `.rs` / `.toml` / tests / scripts touched) | markdown link/anchor check only — **no cargo gate** |
+| **Manifest metadata only** (`Cargo.toml` non-dependency keys) | `cargo check` + `cargo clippy --all-targets --all-features -- -D warnings` + `cargo fmt --check` |
+| **Code, dependencies, tests, or harness scripts touched** | the **full gate** below (plus loom when a lock-free core changes) |
+
+The **full gate**:
 
 ```bash
 cargo clippy --all-targets --all-features -- -D warnings
@@ -465,7 +473,17 @@ Release profile keeps `debug = true` for symbolicated profiles.
 
 Most integration tests execute against local file-backed MetaLV sandboxes.
 
-### Required verification gate (every commit)
+### Required verification gate (tiered by change class)
+
+Match the gate to what the commit touches (user directive 2026-07-18: stop running full test suites on doc-only changes). Same table as the TDD Phase 5 gate — keep the two in sync:
+
+| Change class | Required gate |
+|---|---|
+| **Docs/markdown only** (no `.rs` / `.toml` / tests / scripts touched) | markdown link/anchor check only — **no cargo gate** |
+| **Manifest metadata only** (`Cargo.toml` non-dependency keys) | `cargo check` + `cargo clippy --all-targets --all-features -- -D warnings` + `cargo fmt --check` |
+| **Code, dependencies, tests, or harness scripts touched** | the **full gate** below (plus loom when a lock-free core changes) |
+
+The **full gate**:
 
 ```bash
 cargo clippy --all-targets --all-features -- -D warnings
@@ -500,7 +518,7 @@ fstests/LTP are **wall-clock-bound** (fixed-duration fsx/fsstress soaks, mount-c
 
 | Tier | What | When | Cost |
 |------|------|------|------|
-| **Per-commit** | the cargo gate (clippy/fmt/`test --test-threads=1`/doc/bench-smoke; loom when a lock-free core changes) | every commit | ~5 min |
+| **Per-commit** | the change-class gate above (docs-only: markdown link/anchor check, no cargo; manifest-metadata: check+clippy+fmt; code-class: the full cargo gate — clippy/fmt/`test --test-threads=1`/doc/bench-smoke; loom when a lock-free core changes) | every commit, sized to its class | seconds–~5 min by class |
 | **Per-PR (data-path)** | `FSTESTS_QUICK=1 sudo tests/run_fstests.sh` — the curated `SQUEEZEFS_FSTESTS_QUICK` regression set + `sudo tests/run_ltp_syscalls.sh` | PRs touching the write/read/layout/FUSE paths | ~15–20 min |
 | **Per-PR (nvmeof/guard fidelity)** | `sudo tests/run_nvmeof_fidelity.sh quick` — both-stack (SPDK + kernel nvmet) product-verb round-trips + 1 guard kill-9 cycle per stack, zero-residue snapshot assert; real kernels, zero mocks (design-nvmeof-target-management §6.8) | PRs touching `src/nvmeof/`, `src/meta_backend/reservation.rs`, or the writer-guard gate | ≤10 min (2m20s measured, zram/localhost dev box) |
 | **Nightly / release-gate** | full `sudo tests/run_fstests.sh` (`-g auto`), full LTP, `sudo tests/run_elbencho_mount.sh`, `long_validation.py` scale mounts | nightly + closing gates (e.g. the K7 §8 gate) | hours, unattended |

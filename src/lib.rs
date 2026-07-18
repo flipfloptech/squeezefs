@@ -44,6 +44,7 @@ pub mod storage;
 pub mod stripe_locks;
 pub mod supervisor;
 pub mod uring_fs;
+pub mod version;
 
 use parking_lot::RwLock;
 

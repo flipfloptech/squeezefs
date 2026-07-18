@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# [SUPERSEDED 2026-07-18, PR 5/N5] standing coverage now tests/run_nvmeof_fidelity.sh (adopt legs A1/A1b/A2/A3) — kept as evidence lineage; do not extend.
 # PR 4b (N4b) root-tier gate — `nvmeof adopt` foreign-share absorption
 # (docs/design-nvmeof-target-management.md §6.10, PR-plan PR 4b gate row),
 # the two §6.10 pt-5 fidelity legs + the harness-owned refusal live:

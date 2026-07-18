@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# [SUPERSEDED 2026-07-18, PR 5/N5] productized as tests/nvmeof_target_substrate.sh teardown (manifest-scoped + built-in zero-residue diff) — kept as evidence lineage; do not extend.
 # spdkscope teardown — removes ONLY manifest-recorded objects, restores
 # hugepages to the recorded prior value. Safe to re-run.
 set -uo pipefail

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# [SUPERSEDED 2026-07-18, PR 5/N5] productized as tests/run_nvmeof_fidelity.sh full (leg_pr_matrix, product-verb target power cycle) — kept as evidence lineage; do not extend.
 # spdkscope PR/PTPL matrix v2 vs the SPDK target guard namespace — probes with
 # kernel nvme CLI exactly what the M1 writer guard checks (reservation.rs):
 # RESCAP (Identify NS byte 31), Register(+IEKEY,+CPTPL), Acquire WE,

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# [SUPERSEDED 2026-07-18, PR 5/N5] productized as tests/nvmeof_target_substrate.sh snapshot (stable-sections residue witness) — kept as evidence lineage; do not extend.
 # spdkscope box-state snapshot — run before AND after the A/B rig to prove
 # zero residue. Read-only. Usage: sudo ./snapshot.sh <label> (writes
 # /tmp/spdkscope/snapshot-<label>.txt)

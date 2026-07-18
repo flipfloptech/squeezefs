@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# [SUPERSEDED 2026-07-18, PR 5/N5] productized as tests/guard_smoke.sh (product-verb substrate, --stack/--loops/--ptpl) — kept as evidence lineage; do not extend.
 # spdkscope writer-guard smoke — productized both-stack matrix for the
 # single-writer guard on fabric-served namespaces:
 #

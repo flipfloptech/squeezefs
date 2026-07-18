@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# [SUPERSEDED 2026-07-18, PR 5/N5] standing coverage now tests/run_nvmeof_fidelity.sh (round-trip + loud-fail + crash-window nvmet legs) — kept as evidence lineage; do not extend.
 # PR 2 (N2) root-tier gate — rebuilt kernel-nvmet path via PRODUCT VERBS
 # (docs/design-nvmeof-target-management.md, PR-plan PR 2 gate row):
 #   share (file + block backing) -> connect -> IO -> unshare -> ZERO residue

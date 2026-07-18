@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# [SUPERSEDED 2026-07-18, PR 5/N5] standing coverage now tests/run_nvmeof_fidelity.sh (roundtrip-spdk + G2 persistence + guard legs) — kept as evidence lineage; do not extend.
 # PR 4 (N4) root-tier gate — SPDK share/unshare/restore via PRODUCT VERBS
 # (docs/design-nvmeof-target-management.md, PR-plan PR 4 gate row): the
 # FULL G2 acceptance plus the guard clause of G4 that activates at N4:

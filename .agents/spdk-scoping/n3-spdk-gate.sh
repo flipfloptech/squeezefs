@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# [SUPERSEDED 2026-07-18, PR 5/N5] standing coverage now tests/run_nvmeof_fidelity.sh (lifecycle rides substrate create; loud-fail matrix leg) — kept as evidence lineage; do not extend.
 # PR 3 (N3) root-tier gate — SPDK target lifecycle via PRODUCT VERBS
 # (docs/design-nvmeof-target-management.md, PR-plan PR 3 gate row):
 #   install (pinned clone+build, provenance, idempotency, dirty refusal)

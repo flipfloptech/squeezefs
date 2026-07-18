@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# [SUPERSEDED 2026-07-18, PR 5/N5] productized as tests/nvmeof_target_substrate.sh (the fidelity substrate) — kept as evidence lineage; do not extend.
 # spdkscope A/B rig — SPDK NVMe/TCP target vs kernel nvmet-tcp vs nvmet-loop
 # (reference), all zram-backed, everything namespaced "spdkscope".
 #

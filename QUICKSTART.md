@@ -215,7 +215,7 @@ For unattended hosts add `--supervise`: the parent stays alive as an external wa
 
 Target sharing and client connections live under the top-level **`squeezefs nvmeof`** verb (dual-stack: SPDK and kernel nvmet; stack selection is explicit — `--target-stack`, env `SQUEEZEFS_NVMEOF_TARGET_STACK`, default `spdk` — and failure is loud, never a silent cross-stack fallback).
 
-Both stacks are fully managed (target-management program milestone N4): the SPDK runbook below is the **default path** (`share`/`unshare`/`restore` ride `save_config`/`load_config` with pinned namespace identity + PTPL), and the kernel-nvmet runbook remains the first-class explicit alternative. (The old `storage nvmeof spdk-*` verbs are removed — README → *Removed flags/verbs*.)
+Both stacks are fully managed (NVMe-oF target-management program, 2026-07 — `docs/design-nvmeof-target-management.md`): the SPDK runbook below is the **default path** (`share`/`unshare`/`restore` ride `save_config`/`load_config` with pinned namespace identity + PTPL), and the kernel-nvmet runbook remains the first-class explicit alternative. **Choose per deployment class with the measured table** in README → *NVMe-oF Utilities* (queued-I/O storage nodes: spdk; core-constrained converged nodes and QD1-latency consumers: consider nvmet; per-core honesty stated per row — evidence `.benchmarks/2026-07-18-nvmeof-dual-stack-ab.md`). (The old `storage nvmeof spdk-*` verbs are removed — README → *Removed flags/verbs*.)
 
 ### Manage the SPDK Target Runtime (lifecycle)
 ```bash
@@ -232,11 +232,17 @@ sudo ./target/release/squeezefs nvmeof target setup --hugemem-mb 2048
 # Start the target (pidfile direct mode): preflighted spawn -> RPC-liveness
 # wait -> load_config (tgt-config.json, the SPDK source of truth) -> pidfile.
 # One reactor on the highest online CPU by default (--core-mask / --cores
-# override); the reactor busy-polls ~100 % of its core by design:
+# override); the reactor busy-polls ~100 % of its core by design. Leave the
+# one-reactor default unless a multi-connection workload measures otherwise:
+# the 2-/4-reactor A/B rows (single-stream, TCP-localhost-bound) gained
+# nothing and burned a full core per added reactor:
 sudo ./target/release/squeezefs nvmeof target start
 
 # Health: RPC liveness + latency, version + drift vs the v26.05 pin, reactor
-# busy %, hugepages, ledger reconciliation. The diagnostic verb never refuses:
+# busy % (useful-work fraction: ~0 idle even while the poller burns its core),
+# hugepages, ptpl_files present/missing, ledger reconciliation. The diagnostic
+# verb never refuses. Initiator-side fabric signals (fabric_* on .stats,
+# squeezefs status "Fabric" section): README -> NVMe-oF Utilities:
 sudo ./target/release/squeezefs nvmeof target status --json
 
 # Stop: save_config -> SIGTERM -> 10 s grace -> SIGKILL. Refuses while

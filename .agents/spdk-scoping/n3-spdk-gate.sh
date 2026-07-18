@@ -49,6 +49,12 @@ tctl() { sensors 2>/dev/null | awk '/Tctl/ {gsub(/[+°C]/,"",$2); print $2}'; }
 command -v nvme >/dev/null || die "nvme-cli required"
 command -v jq >/dev/null || die "jq required"
 [ -x "$SCOPING_TGT" ] || die "sanctioned scoping build missing at $SCOPING_TGT"
+# Fresh gate state EVERY run: a prior run's tgt-config.json/ledger/prior
+# record is stale rig state, not a product precondition (run-1 lesson: a
+# leftover config referencing a torn-down zram made the NEXT run's start
+# refuse — correctly — on load_config). Artifacts survive until the next
+# invocation for post-mortem.
+[ -d "$STATE" ] && find "$STATE" -mindepth 1 -delete
 mkdir -p "$STATE" "$LEDGER_DIR" "$RUN_DIR"
 : > "$STATE/manifest"
 

@@ -2,6 +2,7 @@
 name = "squeezefs"
 version = "0.1.0"
 edition = "2021"
+license-file = "LICENSE"
 
 [dependencies]
 parking_lot = "0.12"

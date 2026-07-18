@@ -101,3 +101,7 @@ The CLI surface: `format`, `mount`, `umount`, `status`, `clients`, `df`, `bench`
 | `docs/design-*.md` | Normative design records for each subsystem — metadata format, write/read paths, metadata throughput, NVMe-oF target management |
 | [`.benchmarks/`](.benchmarks/) | Committed measurement records: baselines, attributions, fix verifications, and program-closing adjudications |
 | [AGENTS.md](AGENTS.md) | Contributor and agent rules: architecture invariants, TDD workflow, verification gates |
+
+## License
+
+SqueezeFS is source-available under the [Business Source License 1.1](LICENSE): use it, modify it, run it in production — including commercially — for anything except offering SqueezeFS itself (or a derivative) to third parties as a competing commercial storage product or managed/hosted storage service. Each released version automatically converts to Apache 2.0 four years after its publication. Third-party components and the dependency license audit are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

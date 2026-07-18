@@ -635,6 +635,18 @@ enum NvmeofActions {
         #[arg(long)]
         accept_version_drift: bool,
     },
+    /// Absorb a live foreign (unledgered) share into management by
+    /// writing only the share ledger — the live target object is never
+    /// touched (explicit operator action; stack auto-detected from
+    /// where the subsystem lives)
+    Adopt {
+        /// Subsystem NQN to adopt (must be live on exactly one stack)
+        subnqn: String,
+        /// Disambiguate an NQN that is live on BOTH stacks (adopt
+        /// otherwise fails closed naming both holders); never a retarget
+        #[arg(long, value_enum)]
+        target_stack: Option<TargetStackArg>,
+    },
     /// Connect local client to a remote NVMe-oF target
     Connect {
         /// Remote target IP address
@@ -2041,6 +2053,28 @@ fn dispatch_nvmeof(action: NvmeofActions) -> Result<(), squeezefs::nvmeof::stack
             accept_version_drift,
         } => {
             squeezefs::nvmeof::restore(target_stack.map(Into::into), accept_version_drift)?;
+        }
+        NvmeofActions::Adopt {
+            subnqn,
+            target_stack,
+        } => {
+            let record = squeezefs::nvmeof::adopt(&subnqn, target_stack.map(Into::into))?;
+            println!(
+                "Adopted '{}' into management on the {} stack (provenance class: {}) — target \
+                 state untouched, only the share ledger was written.",
+                record.subnqn,
+                record.stack.as_str(),
+                record
+                    .adopted_from
+                    .as_ref()
+                    .map(|a| a.class.as_str())
+                    .unwrap_or("-"),
+            );
+            println!(
+                "The share is now fully managed: 'nvmeof list' shows it with its provenance, \
+                 and 'nvmeof restore' / 'nvmeof unshare {}' apply.",
+                record.subnqn
+            );
         }
         NvmeofActions::Connect { ip, port, subnqn } => {
             println!("Connecting to NVMe-oF target at {}:{}...", ip, port);

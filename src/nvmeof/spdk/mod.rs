@@ -440,9 +440,35 @@ impl SpdkStack {
                     .map(str::to_string),
                 listeners,
                 enabled: !namespaces.is_empty(),
+                nsids: Vec::new(),
+                bdev_name: None,
+                allow_hosts: Vec::new(),
             });
         }
         Ok(out)
+    }
+
+    /// Tolerant bare-bdev inventory (`name -> aio filename`) for the
+    /// adopt probe (§6.10: the §6.4 duplicate-guard laws apply to adopt
+    /// verbatim, including the `bdev_get_bdevs` filename scan). A
+    /// dead/unreachable target serves nothing — empty, like
+    /// `live_shares_tolerant`.
+    pub fn aio_bdevs_tolerant(&self) -> Vec<(String, String)> {
+        let client = self.client();
+        if client.version().is_err() {
+            return Vec::new();
+        }
+        self.aio_bdevs(&client).unwrap_or_default()
+    }
+
+    /// §6.10 pt 4 truth capture: adopt on this stack ends with
+    /// `save_config` — not because target state changed (it did not),
+    /// but because `tgt-config.json` must describe what the target now
+    /// serves *under management*; without it a foreign rpc.py-built
+    /// subsystem survives only until the next `load_config` and is then
+    /// re-healed by ledger `restore` — a bounce adopt exists to avoid.
+    pub fn save_config(&self) -> Result<(), NvmeofError> {
+        lifecycle::save_config(&self.client(), &self.paths.tgt_config())
     }
 
     /// Tolerant live-state gather for `list` and the cross-stack

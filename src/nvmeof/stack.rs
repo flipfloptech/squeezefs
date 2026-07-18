@@ -87,6 +87,17 @@ pub enum AdoptClass {
     LedgerLoss,
 }
 
+impl AdoptClass {
+    /// The on-disk kebab spelling (`list` display + verb output).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AdoptClass::PreRebuild => "pre-rebuild",
+            AdoptClass::Foreign => "foreign",
+            AdoptClass::LedgerLoss => "ledger-loss",
+        }
+    }
+}
+
 /// Adoption provenance (§6.4 field-presence rules / §6.10): present only
 /// on records written by `nvmeof adopt`, surfaced by `list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,12 +246,15 @@ pub struct ShareRequest {
 }
 
 /// One live share as the stack reports it (configfs walk / RPC
-/// `nvmf_get_subsystems`) — reconciled against the ledger by `list`.
+/// `nvmf_get_subsystems`) — reconciled against the ledger by `list` and
+/// classified by `nvmeof adopt` (§6.10: the walkers ARE the adopt
+/// classification probes; adopt reads the live object into a candidate
+/// record from exactly this shape).
 #[derive(Debug, Clone)]
 pub struct LiveShare {
     pub subnqn: String,
-    /// The device the target serves (nvmet `device_path`; may be a loop
-    /// node for file backings).
+    /// The device the target serves (nvmet `device_path` / the SPDK aio
+    /// bdev filename; may be a loop node for nvmet file backings).
     pub device_path: String,
     /// `device_path` resolved toward the operator's backing: loop nodes
     /// resolve to their backing file when the kernel exposes it.
@@ -248,6 +262,18 @@ pub struct LiveShare {
     pub ns_uuid: Option<String>,
     pub listeners: Vec<Listener>,
     pub enabled: bool,
+    /// Every namespace index the live object carries (§6.10 shape
+    /// classification: nvmet supports exactly `[1]` — the structural
+    /// convention — and SPDK exactly one namespace; anything else is
+    /// `adopt_shape_unsupported`).
+    pub nsids: Vec<u32>,
+    /// SPDK only: the serving bdev's name (recorded by adopt so
+    /// unshare/restore drive the same object); `None` on nvmet.
+    pub bdev_name: Option<String>,
+    /// The live host-NQN allowlist (nvmet `allowed_hosts` links / SPDK
+    /// subsystem hosts); empty = allow-any. Recorded by adopt so a
+    /// restored adopted share never silently widens to allow-any.
+    pub allow_hosts: Vec<String>,
 }
 
 /// Per-record outcome of a `restore` replay (§6.4 laws 4 + 6).

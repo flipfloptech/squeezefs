@@ -1053,6 +1053,9 @@ fn test_cross_stack_duplicate_guard_names_holder_and_steps() {
         ns_uuid: Some(UUID_B.to_string()),
         listeners: vec![],
         enabled: true,
+        nsids: vec![1],
+        bdev_name: None,
+        allow_hosts: vec![],
     };
 
     // SPDK share (other stack = nvmet) of the nvmet-served backing.
@@ -1087,6 +1090,9 @@ fn test_cross_stack_duplicate_guard_names_holder_and_steps() {
         ns_uuid: Some(UUID_B.to_string()),
         listeners: vec![],
         enabled: true,
+        nsids: vec![1],
+        bdev_name: Some("foreign_aio8".to_string()),
+        allow_hosts: vec![],
     };
     let request = req(NQN_A, "/dev/zram8", UUID_A, &[("127.0.0.1", 4420)]);
     let err = cross_stack_duplicate_guard(&request, StackKind::Spdk, &[spdk_holder], &ledger)
@@ -1130,6 +1136,9 @@ fn test_cross_stack_duplicate_guard_names_holder_and_steps() {
         ns_uuid: Some(UUID_B.to_string()),
         listeners: vec![],
         enabled: true,
+        nsids: vec![1],
+        bdev_name: None,
+        allow_hosts: vec![],
     };
     let request = req(NQN_A, "/dev/zram7", UUID_A, &[("127.0.0.1", 4420)]);
     let err = cross_stack_duplicate_guard(&request, StackKind::Nvmet, &[managed_live], &ledger)

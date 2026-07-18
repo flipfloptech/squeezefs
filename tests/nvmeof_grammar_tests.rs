@@ -110,7 +110,8 @@ fn test_deleted_verbs_absent_from_new_grammar() {
     }
 }
 
-/// The new verb surface parses: `nvmeof --help` lists the §6.2 verbs.
+/// The new verb surface parses: `nvmeof --help` lists the §6.2 verbs
+/// (incl. `adopt`, PR 4b).
 #[test]
 fn test_new_grammar_help_lists_verbs() {
     let out = run(&["nvmeof", "--help"], &[]);
@@ -121,12 +122,74 @@ fn test_new_grammar_help_lists_verbs() {
         "unshare",
         "list",
         "restore",
+        "adopt",
         "connect",
         "disconnect",
         "target",
     ] {
         assert!(help.contains(verb), "help must list '{verb}': {help}");
     }
+}
+
+/// The `adopt` verb grammar (§6.10, PR 4b): root demanded before any
+/// probing (an unprivileged run dies on the root rung — adopt writes
+/// the ledger and probes both stacks); `--target-stack` is the
+/// both-stacks-live disambiguator and parses the stack values; a bogus
+/// value dies on clap's invalid-value error before anything runs.
+#[test]
+fn test_adopt_grammar_root_rung_and_stack_disambiguator() {
+    let out = run(&["nvmeof", "adopt", "nqn.2026-06.io.foreign:x"], &[]);
+    assert!(!out.status.success(), "unprivileged adopt must fail");
+    let text = combined(&out);
+    assert!(
+        text.contains("root"),
+        "unprivileged adopt dies on the root rung: {text}"
+    );
+
+    for stack in ["spdk", "nvmet"] {
+        let out = run(
+            &[
+                "nvmeof",
+                "adopt",
+                "nqn.2026-06.io.foreign:x",
+                "--target-stack",
+                stack,
+            ],
+            &[],
+        );
+        assert!(!out.status.success());
+        let text = combined(&out);
+        assert!(
+            text.contains("root"),
+            "--target-stack {stack} parses and adopt still dies on the root rung: {text}"
+        );
+    }
+
+    let out = run(
+        &[
+            "nvmeof",
+            "adopt",
+            "nqn.2026-06.io.foreign:x",
+            "--target-stack",
+            "banana",
+        ],
+        &[],
+    );
+    assert!(!out.status.success());
+    let err = stderr_of(&out);
+    assert!(
+        err.contains("invalid value") || err.contains("possible values"),
+        "a bogus stack dies on clap: {err}"
+    );
+
+    // adopt takes exactly one positional (the subnqn).
+    let out = run(&["nvmeof", "adopt"], &[]);
+    assert!(!out.status.success());
+    let err = stderr_of(&out);
+    assert!(
+        err.contains("required") || err.contains("SUBNQN") || err.contains("subnqn"),
+        "missing subnqn dies on clap: {err}"
+    );
 }
 
 /// The N3 `target …` verb surface exists (§6.2).

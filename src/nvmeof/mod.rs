@@ -49,8 +49,8 @@ use uuid::Uuid;
 
 use ledger::Ledger;
 use stack::{
-    Listener, LiveShare, NvmeofError, PreflightOp, RestoreOutcome, ShareRecord, ShareRequest,
-    ShareState, TargetStack,
+    AdoptClass, Listener, LiveShare, NvmeofError, PreflightOp, RestoreOutcome, ShareRecord,
+    ShareRequest, ShareState, TargetStack,
 };
 
 /// Which target stack owns a share for its lifetime
@@ -923,6 +923,121 @@ pub fn cross_stack_duplicate_guard(
         )));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `nvmeof adopt <subnqn>` — foreign-share absorption (§6.10, PR 4b/N4b).
+// Adopt probes BOTH stacks (stack auto-detected from where the subnqn
+// lives), so the whole flow lives HERE per the G3 module-graph rule —
+// never inside a stack subtree.
+// ---------------------------------------------------------------------------
+
+/// Known test-harness NQN markers (§6.10 `adopt_harness_owned`): the
+/// dev-substrate prefix (`tests/dev_substrate.sh`), the PR 5 fidelity
+/// tier's prefix, and the scoping rig's domain
+/// (`nqn.2026-07.io.spdkscope:*`). Harness objects belong to their
+/// harness's teardown — never absorb the test fabric.
+pub const HARNESS_NQN_MARKERS: [&str; 3] = [":devsub-", ":fideli-", "spdkscope"];
+
+/// Known test-harness nvmet port ids (§6.10 `adopt_harness_owned`):
+/// dev_substrate's 52026 and the scoping rig's 52470/52471 — refused by
+/// name; a share serving through the test fabric's port objects is the
+/// test fabric's.
+pub const HARNESS_NVMET_PORT_IDS: [u32; 3] = [52026, 52470, 52471];
+
+/// One stack's live probe for the adopt flow (§6.10 pt 1). Production
+/// (`adopt`) fills it from the real walkers (`NvmetStack::live_shares`,
+/// `SpdkStack::live_shares_tolerant` + `aio_bdevs_tolerant`); the unit
+/// tier injects snapshots — the same classification code runs over both
+/// (§6.8: seams relocate inputs, never fork behavior).
+pub struct AdoptProbe {
+    pub kind: StackKind,
+    pub live: Vec<LiveShare>,
+    /// SPDK bare-bdev inventory (`name -> aio filename`) for the §6.4
+    /// filename-scan half of `adopt_backing_duplicated`; empty on nvmet
+    /// (configfs subsystems ARE the whole walk there).
+    pub aio_bdevs: Vec<(String, String)>,
+    /// The tolerant gather's loud note (e.g. "SPDK target not
+    /// answering — a stopped target serves nothing"), woven into the
+    /// `adopt_not_live` refusal so a dead-target probe is never a
+    /// silent hole.
+    pub note: Option<String>,
+}
+
+/// Provenance-class heuristic for an unledgered live NQN (§6.10 pt 3 /
+/// §6.4 `adopted_from.class`). The product's own N2+ ownership prefix on
+/// an unledgered object means the ledger was lost; the pre-rebuild
+/// binary's default prefixes mean a pre-rebuild share; anything else is
+/// foreign. Classification is informational provenance — never an
+/// ownership test (ownership = ledger membership).
+pub fn adopt_class_of(subnqn: &str) -> AdoptClass {
+    let _ = subnqn;
+    unimplemented!("nvmeof adopt lands with the PR 4b feat commit (design §6.10)")
+}
+
+/// §6.10 pts 1–2: locate the live foreign object (exactly one stack;
+/// `flag` disambiguates a both-stacks-live NQN), refuse loud on the six
+/// named classes (`adopt_not_live` / `adopt_ambiguous` /
+/// `adopt_already_ledgered` / `adopt_backing_duplicated` /
+/// `adopt_harness_owned` / `adopt_shape_unsupported`), and read the live
+/// object into a candidate `pending` record with `adopted_from`
+/// provenance. Returns the candidate plus the loud notes (recorded
+/// nulls, out-of-range port ids) for the caller to print — pure over the
+/// injected probes; mutates nothing.
+pub fn adopt_candidate(
+    subnqn: &str,
+    flag: Option<StackKind>,
+    probes: &[AdoptProbe],
+    ledger: &Ledger,
+) -> Result<(ShareRecord, Vec<String>), NvmeofError> {
+    let _ = (subnqn, flag, probes, ledger);
+    unimplemented!("nvmeof adopt lands with the PR 4b feat commit (design §6.10)")
+}
+
+/// §6.10 pt 3 TOCTOU re-verify: the freshly re-probed live state must
+/// still match the candidate record on every live-observable field
+/// (backing, identity, listeners incl. nvmet port ids, namespace shape,
+/// allow-hosts). Drift = `Err(reason)` — the caller aborts loud and
+/// garbage-collects the pending intent.
+pub fn adopt_verify_unchanged(
+    candidate: &ShareRecord,
+    live_now: &[LiveShare],
+) -> Result<(), String> {
+    let _ = (candidate, live_now);
+    unimplemented!("nvmeof adopt lands with the PR 4b feat commit (design §6.10)")
+}
+
+/// The adopt flow over explicit stacks + ledger (the §6.8 injection
+/// seam: the unit tier drives injected stacks/fake targets through
+/// exactly this production path). Probes both stacks → classify
+/// (`adopt_candidate`) → absorb via the intent protocol (§6.4 law 6:
+/// `begin_share(pending)` → TOCTOU re-verify → SPDK truth-capture
+/// `save_config` → `finalize_share(active)`). **Mutates no target
+/// state** on any path — drift aborts delete only the pending ledger
+/// record.
+pub fn adopt_over(
+    subnqn: &str,
+    flag: Option<StackKind>,
+    ledger: &Ledger,
+    nvmet_stack: &nvmet::NvmetStack,
+    spdk_stack: &spdk::SpdkStack,
+) -> Result<ShareRecord, NvmeofError> {
+    let _ = (subnqn, flag, ledger, nvmet_stack, spdk_stack);
+    unimplemented!("nvmeof adopt lands with the PR 4b feat commit (design §6.10)")
+}
+
+/// The `nvmeof adopt <subnqn>` verb (§6.2/§6.10): explicit operator
+/// action absorbing a live foreign (unledgered) share into management by
+/// writing ONLY the ledger — the live target object is untouched (the
+/// two funneling scenarios, pre-rebuild shares and ledger loss, have
+/// data serving that must not bounce). Stack auto-detected from where
+/// the subnqn lives; `--target-stack` only disambiguates a
+/// both-stacks-live NQN (never a retarget, and the env knob is
+/// deliberately not consulted — detection is live-state truth).
+pub fn adopt(subnqn: &str, flag: Option<StackKind>) -> Result<ShareRecord, NvmeofError> {
+    check_root()?;
+    let _ = (subnqn, flag);
+    unimplemented!("nvmeof adopt lands with the PR 4b feat commit (design §6.10)")
 }
 
 /// Reconciliation classification of one ledger record for `list` (§6.2)

@@ -490,6 +490,9 @@ impl NvmetStack {
                 ns_uuid,
                 listeners: listeners_of.remove(&nqn).unwrap_or_default(),
                 enabled,
+                nsids: Vec::new(),
+                bdev_name: None,
+                allow_hosts: Vec::new(),
                 subnqn: nqn,
             });
         }

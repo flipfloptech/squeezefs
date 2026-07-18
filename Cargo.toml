@@ -1,5 +1,7 @@
 [package]
 name = "squeezefs"
+# cargo-internal placeholder only — SqueezeFS versions are git commits
+# (see docs/operations.md §Versioning & releases); never bump for releases.
 version = "0.1.0"
 edition = "2021"
 license-file = "LICENSE"

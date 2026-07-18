@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 #[derive(Parser)]
 #[command(name = "squeezefs")]
+// Git-commit versioning (docs/operations.md §Versioning & releases): the
+// version IS the build commit — never CARGO_PKG_VERSION (a cargo-internal
+// placeholder). `-V`/`--version` print `squeezefs <commit-first line>`.
+#[command(version = squeezefs::version::version_line())]
 #[command(about = "Squeezefs: slimmed down high-performance distributed filesystem", long_about = None)]
 struct Cli {
     #[arg(long, global = true)]
@@ -1779,7 +1783,7 @@ fn print_squeezefs_summary(
     };
     println!(
         "SqueezeFS version {}",
-        env!("CARGO_PKG_VERSION").bold().cyan()
+        squeezefs::version::version_line().bold().cyan()
     );
     println!(
         "{}",

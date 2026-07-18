@@ -2770,7 +2770,7 @@ impl SqueezefsFilesystem {
         }
 
         let config_obj = serde_json::json!({
-            "client_version": env!("CARGO_PKG_VERSION"),
+            "client_version": crate::version::version_line(),
             "format": format_fields,
             "data_volumes": data_volumes,
             "metadata_volumes": metadata_volumes,
@@ -2907,6 +2907,13 @@ impl SqueezefsFilesystem {
             .is_some_and(|mb| !mb.volumes.is_empty());
 
         let mut stats_obj = serde_json::json!({
+            // Build identity (docs/operations.md §Versioning & releases):
+            // the fleet mixed-version detector. `build_commit` is the full
+            // git commit (with `-dirty` when built from a modified tree);
+            // `build_tag` always exports, empty string when the commit is
+            // not a `stable-*`/`lts-*` release.
+            "build_commit": crate::version::build_commit(),
+            "build_tag": crate::version::build_tag(),
             "read_lru_keys": read_lru_keys,
             "write_lru_keys": write_lru_keys,
             "nvme_staged_write_file_ids": nvme_staged_write_file_ids,
@@ -6579,7 +6586,7 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         info!(
             "FUSE Daemon: Initialized Squeezefs Filesystem mount (version {}).",
-            env!("CARGO_PKG_VERSION")
+            crate::version::version_line()
         );
         // D1.b: the per-daemon deadline watchdog replaces the retired
         // per-op `timeout()` wrappers (see the await-disposition audit at
@@ -6589,7 +6596,7 @@ impl Filesystem for SqueezefsFilesystem {
         // without enabling full logging (PATH often pointed at a stale install).
         eprintln!(
             "squeezefs: mount ready (version {}, exe hint: rebuild target/release and reinstall)",
-            env!("CARGO_PKG_VERSION")
+            crate::version::version_line()
         );
 
         // D2.a probe + D2.d atomic-open probe (measurement only — design
@@ -10024,7 +10031,7 @@ pub async fn start_mount<P: AsRef<Path>>(
 
     info!(
         "SqueezeFS version {} initializing mount",
-        env!("CARGO_PKG_VERSION")
+        crate::version::version_line()
     );
     info!(
         "FUSE Daemon: Mounting squeezefs at {:?}...",

@@ -296,20 +296,34 @@ impl InboundQueue {
         let _ = self.tx.send(req);
     }
 
-    /// Pop with timeout (async)
-    async fn pop_timeout(&self, active: &AtomicBool, timeout: Duration) -> Option<InboundUringReq> {
+    /// Pure event-driven pop (L3 lever C): parks on the channel wake and the
+    /// pool's shutdown notify — no poll cadence, no per-pull timer
+    /// registration (the retired 200 ms `pop_timeout` cost a time-driver
+    /// park + `epoll_wait` per request). Returns `None` exactly when the
+    /// pool is shut down.
+    async fn pop(
+        &self,
+        active: &AtomicBool,
+        shutdown: &tokio::sync::Notify,
+    ) -> Option<InboundUringReq> {
         let mut rx_guard = self.rx.lock().await;
-        if !active.load(Ordering::Relaxed) {
-            return None;
+        loop {
+            // Register interest BEFORE the active check: `notify_waiters`
+            // wakes only already-registered waiters, so enable-then-check
+            // closes the store(false)/notify vs check/park race (the
+            // documented tokio pattern). Either the check sees the store,
+            // or the registration precedes the notify and the select wakes.
+            let notified = shutdown.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !active.load(Ordering::Acquire) {
+                return None;
+            }
+            tokio::select! {
+                r = rx_guard.recv() => return r,
+                _ = notified.as_mut() => continue, // re-check active
+            }
         }
-        match tokio::time::timeout(timeout, rx_guard.recv()).await {
-            Ok(Some(r)) => Some(r),
-            _ => None,
-        }
-    }
-
-    fn notify_all(&self) {
-        // Async queues don't need condvar notify
     }
 }
 
@@ -319,6 +333,9 @@ pub struct FuseOverUring {
     ready: AtomicBool,
     /// False after shutdown; workers exit and session falls through to errors.
     active: AtomicBool,
+    /// Wakes every parked session pull on shutdown (L3 lever C — the pull
+    /// path is pure event-driven; this is its only non-channel wake).
+    shutdown_notify: tokio::sync::Notify,
     /// Number of queue workers that have submitted their initial REGISTERs.
     queues_registered: AtomicU64,
     pub(crate) nqueues: u16, // used for diagnostics
@@ -886,6 +903,7 @@ impl FuseOverUring {
             // still delivers on the classical path → permanent hang.
             ready: AtomicBool::new(false),
             active: AtomicBool::new(true),
+            shutdown_notify: tokio::sync::Notify::new(),
             queues_registered: AtomicU64::new(0),
             nqueues: nqueues as u16,
             inbound,
@@ -1028,10 +1046,15 @@ impl FuseOverUring {
         self.ready.load(Ordering::Acquire) && self.active.load(Ordering::Acquire)
     }
 
-    /// Async pop for session read path.
-    pub async fn recv_inbound_timeout(&self, qid: u16, timeout: Duration) -> Option<InboundUringReq> {
+    /// Event-driven pop for the session read path: parks until a request
+    /// arrives or the pool shuts down (`None`). A qid beyond the queue set
+    /// is structurally unreachable (workers are spawned for 0..nqueues) and
+    /// returns `None` — the caller fails loud, never poll-parks.
+    pub async fn recv_inbound(&self, qid: u16) -> Option<InboundUringReq> {
         if (qid as usize) < self.inbound.len() {
-            self.inbound[qid as usize].pop_timeout(&self.active, timeout).await
+            self.inbound[qid as usize]
+                .pop(&self.active, &self.shutdown_notify)
+                .await
         } else {
             None
         }
@@ -1130,9 +1153,9 @@ impl FuseOverUring {
             }
             pending.clear();
         }
-        for iq in &self.inbound {
-            iq.notify_all();
-        }
+        // Wake every parked session pull (after the active=false store above
+        // — pop's enable-then-check ordering makes this race-free).
+        self.shutdown_notify.notify_waiters();
         let one: u64 = 1;
         for q in &self.queues {
             let _ = unsafe { libc::write(q.wake_fd, &one as *const u64 as *const _, 8) };
@@ -2644,14 +2667,15 @@ mod inbound_queue_tests {
     async fn pop_delivers_pushed_requests_in_order() {
         let q = InboundQueue::new();
         let active = AtomicBool::new(true);
+        let shutdown = tokio::sync::Notify::new();
         q.push(req(7));
         q.push(req(8));
         let a = q
-            .pop_timeout(&active, Duration::from_millis(200))
+            .pop(&active, &shutdown)
             .await
             .expect("first pushed request");
         let b = q
-            .pop_timeout(&active, Duration::from_millis(200))
+            .pop(&active, &shutdown)
             .await
             .expect("second pushed request");
         assert_eq!((a.unique, b.unique), (7, 8), "FIFO delivery");
@@ -2663,12 +2687,14 @@ mod inbound_queue_tests {
     async fn pop_wakes_promptly_for_late_push() {
         let q = Arc::new(InboundQueue::new());
         let active = Arc::new(AtomicBool::new(true));
+        let shutdown = Arc::new(tokio::sync::Notify::new());
         let popper = tokio::spawn({
             let q = Arc::clone(&q);
             let active = Arc::clone(&active);
+            let shutdown = Arc::clone(&shutdown);
             async move {
                 let t0 = Instant::now();
-                let r = q.pop_timeout(&active, Duration::from_millis(200)).await;
+                let r = q.pop(&active, &shutdown).await;
                 (r, t0.elapsed())
             }
         });
@@ -2687,19 +2713,21 @@ mod inbound_queue_tests {
     }
 
     /// THE lever-C contract: shutdown wakes a parked popper immediately —
-    /// `active = false` + the shutdown wake must produce `None` in
+    /// `active = false` + `notify_waiters` must produce `None` in
     /// event-time, never after sleeping out a poll interval. (The retired
-    /// 200 ms `pop_timeout` fails this by construction: its shutdown
-    /// "wake" was a no-op `notify_all`, so a parked popper always slept
-    /// the full timeout.)
+    /// 200 ms `pop_timeout` failed this by construction: its shutdown
+    /// "wake" was a no-op, so a parked popper always slept the full
+    /// timeout — 180 ms measured RED on this exact test.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pop_returns_none_promptly_on_shutdown() {
         let q = Arc::new(InboundQueue::new());
         let active = Arc::new(AtomicBool::new(true));
+        let shutdown = Arc::new(tokio::sync::Notify::new());
         let popper = tokio::spawn({
             let q = Arc::clone(&q);
             let active = Arc::clone(&active);
-            async move { q.pop_timeout(&active, Duration::from_millis(200)).await }
+            let shutdown = Arc::clone(&shutdown);
+            async move { q.pop(&active, &shutdown).await }
         });
         // Wait until the popper holds the rx lock (= it is inside pop)…
         while q.rx.try_lock().is_ok() {
@@ -2713,7 +2741,7 @@ mod inbound_queue_tests {
         let t0 = Instant::now();
         // Exactly what FuseOverUring::shutdown does for the session path.
         active.store(false, Ordering::Release);
-        q.notify_all();
+        shutdown.notify_waiters();
         let r = popper.await.expect("popper task");
         let elapsed = t0.elapsed();
         assert!(r.is_none(), "shutdown pop must drain to None");

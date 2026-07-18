@@ -454,9 +454,14 @@ impl FuseConnection {
             if let Some(pool) = pool.filter(|p| p.is_ready() || !p.is_active()) {
                 let pool2 = pool.clone();
                 let qid = self.assigned_qid.unwrap_or(0);
-                let inbound;
-                loop {
-                    if !pool2.is_active() {
+                // Pure event-driven pull (L3 lever C): parks on the queue
+                // channel / shutdown notify — no 200 ms poll cadence, no
+                // per-pull timer registration. `None` means the pool shut
+                // down (or a structurally-unreachable qid): fail loud so the
+                // session worker exits, never poll-park.
+                let inbound = match pool2.recv_inbound(qid).await {
+                    Some(r) => r,
+                    None => {
                         return (
                             (header_buf, data_buf, None),
                             Err(io::Error::new(
@@ -465,19 +470,7 @@ impl FuseConnection {
                             )),
                         );
                     }
-                    match pool2.recv_inbound_timeout(qid, std::time::Duration::from_millis(200)).await {
-                        Some(r) => {
-                            inbound = r;
-                            break;
-                        }
-                        None => {
-                            if qid as usize >= pool2.nqueues as usize {
-                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                            }
-                            continue;
-                        }
-                    }
-                }
+                };
 
                 // Reconstruct classical fuse framing for the session dispatcher:
                 //   [fuse_in_header 40][arg0 in op_in][arg1+ in payload]

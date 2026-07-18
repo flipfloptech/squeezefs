@@ -88,17 +88,9 @@ pub const FUSE_BIG_WRITES: u32 = 1 << 5;
 /// don't apply umask to file mode on create operations
 pub const FUSE_DONT_MASK: u32 = 1 << 6;
 
-#[cfg(not(target_os = "macos"))]
-/// kernel supports splice write on the device
-pub const FUSE_SPLICE_WRITE: u32 = 1 << 7;
-
-#[cfg(not(target_os = "macos"))]
-/// kernel supports splice move on the device
-pub const FUSE_SPLICE_MOVE: u32 = 1 << 8;
-
-#[cfg(not(target_os = "macos"))]
-/// kernel supports splice read on the device
-pub const FUSE_SPLICE_READ: u32 = 1 << 9;
+// FUSE_SPLICE_WRITE (1<<7) / FUSE_SPLICE_MOVE (1<<8) / FUSE_SPLICE_READ
+// (1<<9) were deleted with the reply-path splice machinery (L3 lever A):
+// the daemon implements no splice path and must not advertise one.
 
 #[allow(dead_code)]
 /// locking for BSD style file locks

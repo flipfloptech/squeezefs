@@ -152,8 +152,6 @@ use crate::MountOptions;
 pub struct FuseConnection {
     unmount_notify: Arc<Notify>,
     mode: ConnectionMode,
-    pub(crate) splice_read: std::sync::atomic::AtomicBool,
-    pub(crate) splice_write: std::sync::atomic::AtomicBool,
     /// Optional kernel FUSE-over-io_uring pool (Linux 6.14+). Shared across multi-queue clones.
     #[cfg(target_os = "linux")]
     pub(crate) over_uring: std::sync::Arc<
@@ -196,8 +194,6 @@ impl FuseConnection {
             Ok(Self {
                 unmount_notify,
                 mode: ConnectionMode::NonBlock(connection),
-                splice_read: std::sync::atomic::AtomicBool::new(false),
-                splice_write: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -208,8 +204,6 @@ impl FuseConnection {
             Ok(Self {
                 unmount_notify,
                 mode: ConnectionMode::Block(connection),
-                splice_read: std::sync::atomic::AtomicBool::new(false),
-                splice_write: std::sync::atomic::AtomicBool::new(false),
                 over_uring: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 classical_inflight: std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::HashSet::new(),
@@ -274,8 +268,6 @@ impl FuseConnection {
         Ok(Self {
             unmount_notify,
             mode: ConnectionMode::NonBlock(connection),
-            splice_read: std::sync::atomic::AtomicBool::new(false),
-            splice_write: std::sync::atomic::AtomicBool::new(false),
             over_uring: std::sync::Arc::new(std::sync::Mutex::new(None)),
             classical_inflight: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
@@ -309,8 +301,6 @@ impl FuseConnection {
                 Ok(Self {
                     unmount_notify: self.unmount_notify.clone(),
                     mode: ConnectionMode::Block(connection),
-                    splice_read: std::sync::atomic::AtomicBool::new(self.splice_read.load(std::sync::atomic::Ordering::Relaxed)),
-                    splice_write: std::sync::atomic::AtomicBool::new(self.splice_write.load(std::sync::atomic::Ordering::Relaxed)),
                     // Share over-uring pool so multi-queue session workers pull the same inbound queue.
                     over_uring: self.over_uring.clone(),
                     classical_inflight: self.classical_inflight.clone(),
@@ -392,8 +382,6 @@ impl FuseConnection {
                 Ok(Self {
                     unmount_notify: self.unmount_notify.clone(),
                     mode: ConnectionMode::NonBlock(connection),
-                    splice_read: std::sync::atomic::AtomicBool::new(self.splice_read.load(std::sync::atomic::Ordering::Relaxed)),
-                    splice_write: std::sync::atomic::AtomicBool::new(self.splice_write.load(std::sync::atomic::Ordering::Relaxed)),
                     // Share over-uring pool so multi-queue session workers pull the same inbound queue.
                     over_uring: self.over_uring.clone(),
                     classical_inflight: self.classical_inflight.clone(),

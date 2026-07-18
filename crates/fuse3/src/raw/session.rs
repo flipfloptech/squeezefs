@@ -664,37 +664,28 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 Either::Right((data, extend_data, backing)) => (data, Some(extend_data), backing),
             };
 
-            let mut write_done = false;
-            if fuse_connection.splice_read.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Some(ref payload) = extend_data {
-                    use std::os::fd::AsRawFd;
-                    let fd = fuse_connection.as_fd().as_raw_fd();
-                    match splice_reply(fd, &data, payload) {
-                        Ok(_) => {
-                            write_done = true;
-                        }
-                        Err(err) => {
-                            warn!("splice_reply failed: {:?}, falling back to write_vectored", err);
-                        }
-                    }
+            // L3 lever A: replies route through `write_vectored` ONLY —
+            // over-uring COMMIT_AND_FETCH for ring uniques (the hot path
+            // after arm), classical vectored write for INIT / sideband /
+            // handoff stragglers. The historical splice_reply fast path was
+            // deleted: on an armed session every ring reply bounced off
+            // `/dev/fuse` with ENOENT (the kernel holds ring uniques in the
+            // uring ent, not fpq->processing) and paid a pipe2 + write +
+            // vmsplice + splice + 2×close + fcntl block per READ reply
+            // before falling back here anyway.
+            if let Err(err) = fuse_connection.write_vectored(data, extend_data).await.1 {
+                if err.kind() == ErrorKind::NotFound {
+                    warn!(
+                        "may reply interrupted fuse request, ignore this error {}",
+                        err
+                    );
+
+                    continue;
                 }
-            }
 
-            if !write_done {
-                if let Err(err) = fuse_connection.write_vectored(data, extend_data).await.1 {
-                    if err.kind() == ErrorKind::NotFound {
-                        warn!(
-                            "may reply interrupted fuse request, ignore this error {}",
-                            err
-                        );
+                error!("reply fuse failed {}", err);
 
-                        continue;
-                    }
-
-                    error!("reply fuse failed {}", err);
-
-                    return Err(err);
-                }
+                return Err(err);
             }
 
             drop(backing);
@@ -1325,11 +1316,6 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             request_timeout: 0,
             unused: [0; 11],
         };
-
-        let has_splice_read = (reply_flags & FUSE_SPLICE_READ) > 0;
-        let has_splice_write = (reply_flags & FUSE_SPLICE_WRITE) > 0;
-        fuse_connection.splice_read.store(has_splice_read, std::sync::atomic::Ordering::Relaxed);
-        fuse_connection.splice_write.store(has_splice_write, std::sync::atomic::Ordering::Relaxed);
 
         debug!("fuse init out {:?}", init_out);
 
@@ -4660,40 +4646,6 @@ pub fn tpc_thread_count() -> usize {
     TPC_SCHEDULER.senders.len()
 }
 
-struct ThreadPipe {
-    rx: std::os::fd::RawFd,
-    tx: std::os::fd::RawFd,
-}
-
-impl ThreadPipe {
-    fn new() -> Option<Self> {
-        let mut fds = [0; 2];
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == 0 {
-            let rx = fds[0];
-            let tx = fds[1];
-            unsafe {
-                libc::fcntl(tx, libc::F_SETPIPE_SZ, 4 * 1024 * 1024);
-            }
-            Some(ThreadPipe { rx, tx })
-        } else {
-            None
-        }
-    }
-}
-
-impl Drop for ThreadPipe {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.rx);
-            libc::close(self.tx);
-        }
-    }
-}
-
-thread_local! {
-    static PIPE: std::cell::RefCell<Option<ThreadPipe>> = std::cell::RefCell::new(ThreadPipe::new());
-}
-
 /// INIT reply-flags negotiation: the subset of the kernel's offered
 /// `init_in.flags` capabilities this daemon actually implements (mount
 /// options gate the optional ones). Pure — pinned by
@@ -4746,26 +4698,11 @@ fn negotiate_reply_flags(init_in_flags: u32, mount_options: &MountOptions) -> u3
         reply_flags |= FUSE_DONT_MASK;
     }
 
-    #[cfg(not(target_os = "macos"))]
-    if init_in_flags & FUSE_SPLICE_WRITE > 0 {
-        debug!("enable FUSE_SPLICE_WRITE");
-
-        reply_flags |= FUSE_SPLICE_WRITE;
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    if init_in_flags & FUSE_SPLICE_MOVE > 0 {
-        debug!("enable FUSE_SPLICE_MOVE");
-
-        reply_flags |= FUSE_SPLICE_MOVE;
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    if init_in_flags & FUSE_SPLICE_READ > 0 {
-        debug!("enable FUSE_SPLICE_READ");
-
-        reply_flags |= FUSE_SPLICE_READ;
-    }
+    // FUSE_SPLICE_{WRITE,MOVE,READ} are deliberately NOT echoed: the daemon
+    // has no splice implementation (L3 lever A — reply routing is over-uring
+    // COMMIT_AND_FETCH + classical vectored write only), and advertising a
+    // capability nothing implements is how the ENOENT-bouncing splice reply
+    // path shipped in the first place.
 
     // posix lock used, maybe we don't need bsd lock
     if init_in_flags & FUSE_FLOCK_LOCKS > 0 {
@@ -4853,106 +4790,6 @@ fn negotiate_reply_flags(init_in_flags: u32, mount_options: &MountOptions) -> u3
     reply_flags
 }
 
-fn splice_reply(
-    fd: std::os::fd::RawFd,
-    header: &[u8],
-    payload: &[u8],
-) -> std::io::Result<usize> {
-    PIPE.with(|pipe_cell| {
-        let mut pipe_opt = pipe_cell.borrow_mut();
-        if pipe_opt.is_none() {
-            *pipe_opt = ThreadPipe::new();
-        }
-        let pipe = pipe_opt.as_mut().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Pipe not initialized")
-        })?;
-
-        fn run_splice(tx: std::os::fd::RawFd, rx: std::os::fd::RawFd, target_fd: std::os::fd::RawFd, header: &[u8], payload: &[u8]) -> std::io::Result<usize> {
-            let mut written_header = 0;
-            while written_header < header.len() {
-                let res = unsafe {
-                    libc::write(
-                        tx,
-                        header[written_header..].as_ptr() as *const libc::c_void,
-                        header.len() - written_header,
-                    )
-                };
-                if res < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(err);
-                }
-                written_header += res as usize;
-            }
-
-            let mut written_payload = 0;
-            while written_payload < payload.len() {
-                let iov = libc::iovec {
-                    iov_base: payload[written_payload..].as_ptr() as *mut libc::c_void,
-                    iov_len: payload.len() - written_payload,
-                };
-                let res = unsafe {
-                    libc::vmsplice(
-                        tx,
-                        &iov as *const libc::iovec,
-                        1,
-                        libc::SPLICE_F_GIFT | libc::SPLICE_F_NONBLOCK,
-                    )
-                };
-                if res < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(err);
-                }
-                if res == 0 {
-                    break;
-                }
-                written_payload += res as usize;
-            }
-
-            let total_len = header.len() + payload.len();
-            let mut spliced = 0;
-            while spliced < total_len {
-                let res = unsafe {
-                    libc::splice(
-                        rx,
-                        std::ptr::null_mut(),
-                        target_fd,
-                        std::ptr::null_mut(),
-                        total_len - spliced,
-                        libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
-                    )
-                };
-                if res < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(err);
-                }
-                if res == 0 {
-                    break;
-                }
-                spliced += res as usize;
-            }
-
-            Ok(spliced)
-        }
-
-        match run_splice(pipe.tx, pipe.rx, fd, header, payload) {
-            Ok(spliced) => Ok(spliced),
-            Err(err) => {
-                *pipe_opt = ThreadPipe::new();
-                Err(err)
-            }
-        }
-    })
-}
-
 #[cfg(test)]
 mod init_negotiation_tests {
     use super::*;
@@ -4969,10 +4806,14 @@ mod init_negotiation_tests {
     /// family never echoes, whatever the kernel offers.
     #[test]
     fn init_reply_never_advertises_splice() {
+        // linux/fuse.h uapi bits (constants deleted with the splice code):
+        // FUSE_SPLICE_WRITE = 1<<7, FUSE_SPLICE_MOVE = 1<<8,
+        // FUSE_SPLICE_READ = 1<<9.
+        const FUSE_SPLICE_FAMILY: u32 = (1 << 7) | (1 << 8) | (1 << 9);
         let opts = MountOptions::default();
         let flags = negotiate_reply_flags(u32::MAX, &opts);
         assert_eq!(
-            flags & (FUSE_SPLICE_READ | FUSE_SPLICE_WRITE | FUSE_SPLICE_MOVE),
+            flags & FUSE_SPLICE_FAMILY,
             0,
             "INIT reply advertised FUSE_SPLICE_* but the daemon has no splice \
              implementation (reply routing is over-uring COMMIT_AND_FETCH + \

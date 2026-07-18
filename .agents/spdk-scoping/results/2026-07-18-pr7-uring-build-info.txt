@@ -1,0 +1,4 @@
+tag: v26.05 (throwaway PR7 uring-comparison build)
+commit: d519b163cbc0e2f28c35d9bc86d610da368b032c
+configure: --disable-tests --disable-unit-tests --disable-examples --with-uring
+built: 2026-07-18T05:48:11-04:00

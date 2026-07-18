@@ -78,6 +78,8 @@
 #
 # RW6 — durability-leveled timing (write-family rows; harness honesty fix):
 #   Write rows carry TWO modes:
+#   (The delete family carries the same two modes since the durable-del
+#    revision — see "RW6-del" below.)
 #     relaxed  — the row as elbencho reports it: each system's native ACK
 #                semantics (page-cache/async-flush ACKs included), published
 #                LABELED, never gating.
@@ -109,6 +111,29 @@
 #   ACKs ride the kernel page cache; mount-s3 close() blocks on upload
 #   completion (relaxed ≈ durable by construction).
 #
+# RW6-del — durability-leveled DELETE timing (the RW6 pattern applied to
+#   the del family; chartered by the 2026-07-18 baseline's Loss 2+3
+#   adjudication — geesefs acks unlinks from RAM, so its relaxed del rows
+#   measure queueing, not deletion):
+#     relaxed  — the RMFILES phase as elbencho reports it (native unlink
+#                ACK semantics), published LABELED, never gating.
+#     durable  — RMFILES elapsed + a timed delete-durability pass run
+#                immediately after the phase, identical for every system:
+#     (a) fsync() on the tree directory and the mount root through the
+#         FUSE mount — the client-side flush lever: geesefs documents that
+#         fsync on a DIRECTORY flushes ALL pending changes inside it
+#         (deletes included; its syncfs is not wired up in FUSE), and
+#         dir-fsync is harmless where deletes are already synchronous
+#         (refusals recorded as skips, never fatal); then
+#     (b) syncfs() on the mount (FUSE_SYNCFS where honored), then
+#     (c) syncfs() on the SUBSTRATE directory — settles every system's
+#         local store state (object tombstones/metadata) to the device.
+#   durable value = RMFILES entries [csv `entries [last]`] /
+#   (RMFILES elapsed [csv `time ms [last]`] + pass elapsed). The follow-up
+#   `-D` RMDIRS phase stays excluded from both modes (matches the relaxed
+#   row's historical scope). Durable governs the del-family verdicts; the
+#   stat family keeps relaxed-only (reads carry no durability semantics).
+#
 # Capability matrix (N/S cells — user-locked semantics):
 #   Where a reference does not support a workload BY DESIGN the cell reads
 #   "N/S (not supported by design)" — NEVER "0 IOPS", never a LOSS; N/S cells
@@ -121,7 +146,7 @@
 #   random/out-of-order writes by design (verified EBADF on this box).
 #
 # Verdicts & gate:
-#   Per primary row (read/stat/del rows in relaxed mode; write rows in
+#   Per primary row (read/stat rows in relaxed mode; write + del rows in
 #   durable mode), per reference: W if SQZ > 1.05x ref, L if < 0.95x, TIE
 #   inside ±5%. Rank = SqueezeFS's position among the numeric cells of the
 #   row (1 = fastest). Exit nonzero on ANY unattributed LOSS or INVALID
@@ -1180,6 +1205,50 @@ EOF
     awk 'NR==1{print $1; exit}' "$pfx.durable" 2>/dev/null | grep -E '^[0-9.]+$' || echo "NA"
 }
 
+# RW6-del durability pass — see header. Runs IMMEDIATELY after the delete
+# phase; prints total seconds + component split. Dir-fsync first (geesefs:
+# fsync on a directory flushes ALL pending changes inside it — its syncfs
+# is not wired up in FUSE; refusals are skips, never fatal), then the same
+# mount + substrate syncfs boundary as the write pass.
+durability_pass_del() { # <mnt> <pfx> -> echoes elapsed seconds ("NA" on failure)
+    local mnt="$1" pfx="$2"
+    timeout -k 10 "$ROW_TIMEOUT" python3 - "$mnt" "$SUBSTRATE" "$mnt/sbtree" <<'EOF' >"$pfx.durable" 2>&1
+import ctypes, os, sys, time
+mnt, substrate, tree = sys.argv[1], sys.argv[2], sys.argv[3]
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+t0 = time.monotonic()
+dirs_fsynced = dirs_skipped = 0
+for d in (tree, mnt):  # client flush lever: dir-fsync (tree, then mount root)
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        dirs_skipped += 1
+        continue
+    try:
+        os.fsync(fd)
+        dirs_fsynced += 1
+    except OSError:
+        dirs_skipped += 1
+    finally:
+        os.close(fd)
+t1 = time.monotonic()
+for d in (mnt, substrate):  # FUSE_SYNCFS where honored, then store settle
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        continue
+    try:
+        if libc.syncfs(fd) != 0:
+            raise OSError(ctypes.get_errno(), "syncfs")
+    finally:
+        os.close(fd)
+t2 = time.monotonic()
+print(f"{t2 - t0:.3f} dirfsync_s={t1 - t0:.3f} syncfs_s={t2 - t1:.3f} "
+      f"dirs_fsynced={dirs_fsynced} dirs_skipped={dirs_skipped}")
+EOF
+    awk 'NR==1{print $1; exit}' "$pfx.durable" 2>/dev/null | grep -E '^[0-9.]+$' || echo "NA"
+}
+
 csv_field() { # <csvfile> <op> <column-name> -> value or NA
     python3 - "$1" "$2" "$3" <<'EOF' 2>/dev/null || echo "NA"
 import csv, sys
@@ -1194,8 +1263,10 @@ EOF
 }
 
 # run_row <regime> <workload> <system> <mnt> <pid> <op> <key> <unit> <block_kib> -- <elbencho args...>
-# block_kib: block size for durable-ops math on IOPS rows (0 = seq MiB/s row;
-# -1 = non-write row, no durable mode).
+# block_kib: durable-mode selector + ops math: 0 = seq MiB/s row; >0 = IOPS
+# row (ops = MiB x 1024 / block_kib); "del" = delete row (ops = csv
+# `entries [last]`, RW6-del dir-fsync/syncfs pass); -1 = row without a
+# durable mode.
 run_row() {
     local regime="$1" wl="$2" sys="$3" mnt="$4" pid="$5" op="$6" key="$7" unit="$8" block_kib="$9"
     shift 9
@@ -1216,12 +1287,18 @@ run_row() {
         >"$pfx.elbencho" 2>&1
     local rc=$?
 
-    # RW6: durability pass rides IMMEDIATELY after the write phase.
-    local t_dur="" t_write_ms="NA" tot_mib="NA"
+    # RW6 / RW6-del: durability pass rides IMMEDIATELY after the timed
+    # phase (write rows: fdatasync+syncfs; del rows: dir-fsync+syncfs).
+    local t_dur="" t_write_ms="NA" durable_base="NA"
     if [ "$block_kib" != "-1" ]; then
-        t_dur="$(durability_pass "$mnt" "$pfx")"
+        if [ "$block_kib" = "del" ]; then
+            t_dur="$(durability_pass_del "$mnt" "$pfx")"
+            durable_base="$(csv_field "$pfx.csv" "$op" "entries [last]")"
+        else
+            t_dur="$(durability_pass "$mnt" "$pfx")"
+            durable_base="$(csv_field "$pfx.csv" "$op" "MiB [last]")"
+        fi
         t_write_ms="$(csv_field "$pfx.csv" "$op" "time ms [last]")"
-        tot_mib="$(csv_field "$pfx.csv" "$op" "MiB [last]")"
     fi
     snap "$pfx" after "$mnt" "$pid"
 
@@ -1241,29 +1318,34 @@ run_row() {
 t0=open('$pfx.t.before').read().strip(); t1=open('$pfx.t.after').read().strip()
 print(f'{float(t1)-float(t0):.1f}')" 2>/dev/null)"
 
-    # Durable value: bytes (or ops) over write-elapsed + durability-pass.
+    # Durable value: bytes (or ops/entries) over phase-elapsed + pass.
     local durable_value="NA" durable_note=""
     if [ "$block_kib" != "-1" ]; then
-        durable_value="$(python3 - "$t_write_ms" "$tot_mib" "$t_dur" "$block_kib" "$rc" <<'EOF'
+        durable_value="$(python3 - "$t_write_ms" "$durable_base" "$t_dur" "$block_kib" "$rc" <<'EOF'
 import sys
-t_ms, mib, t_dur, blk_kib, rc = sys.argv[1:6]
+t_ms, base, t_dur, blk_kib, rc = sys.argv[1:6]
 try:
     if rc != "0":
         raise ValueError
     total_s = float(t_ms) / 1000.0 + float(t_dur)
-    mibf = float(mib)
-    blk = int(blk_kib)
+    basef = float(base)
     if total_s <= 0:
         raise ValueError
-    if blk > 0:  # IOPS row: ops = MiB * 1024 / block_kib
-        print(f"{mibf * 1024.0 / blk / total_s:.0f}")
+    if blk_kib == "del":  # del row: entries -> files/s
+        print(f"{basef / total_s:.0f}")
+    elif int(blk_kib) > 0:  # IOPS row: ops = MiB * 1024 / block_kib
+        print(f"{basef * 1024.0 / int(blk_kib) / total_s:.0f}")
     else:  # seq row: MiB/s
-        print(f"{mibf / total_s:.1f}")
+        print(f"{basef / total_s:.1f}")
 except (ValueError, ZeroDivisionError):
     print("NA")
 EOF
 )"
-        durable_note="t_write_ms=$t_write_ms;t_dur_s=$t_dur;mib=$tot_mib"
+        if [ "$block_kib" = "del" ]; then
+            durable_note="t_del_ms=$t_write_ms;t_dur_s=$t_dur;ents=$durable_base"
+        else
+            durable_note="t_write_ms=$t_write_ms;t_dur_s=$t_dur;mib=$durable_base"
+        fi
     fi
 
     # Device evidence (diskstats delta over the row) + daemon CPU.
@@ -1424,7 +1506,7 @@ ensure_tree() { # <mnt> <sys> — untimed prep for stat/del storms
 
 prep_failed_row() { # <regime> <wl> <sys> — NA rows for a failed untimed prep
     emit_na_row "$1" "$2" "$3" "relaxed" "untimed prep failed (see $ART/logs)"
-    case "$2" in seq_write_1m | rand_write_4k)
+    case "$2" in seq_write_1m | rand_write_4k | del_storm)
         emit_na_row "$1" "$2" "$3" "durable" "untimed prep failed (see $ART/logs)"
         ;;
     esac
@@ -1480,7 +1562,7 @@ run_workload() {
             prep_failed_row "$regime" "$wl" "$sys"
             return 0
         }
-        run_row "$regime" "$wl" "$sys" "$mnt" "$pid" RMFILES "Files/s" "files/s" -1 -- \
+        run_row "$regime" "$wl" "$sys" "$mnt" "$pid" RMFILES "Files/s" "files/s" del -- \
             -F -D -t "$THREADS" -n "$TREE_DIRS" -N "$TREE_FILES" "$mnt/sbtree"
         ;;
     *) die "unknown workload '$wl'" ;;
@@ -1674,7 +1756,7 @@ run_regime_system() { # <regime> <system>
         log "skipping $sys (earlier setup failure: ${SYS_FAIL[$sys]})"
         for wl in $WORKLOADS; do
             emit_na_row "$regime" "$wl" "$sys" "relaxed" "${SYS_FAIL[$sys]}"
-            case "$wl" in seq_write_1m | rand_write_4k)
+            case "$wl" in seq_write_1m | rand_write_4k | del_storm)
                 emit_na_row "$regime" "$wl" "$sys" "durable" "${SYS_FAIL[$sys]}"
                 ;;
             esac
@@ -1702,7 +1784,7 @@ run_regime_system() { # <regime> <system>
         sys_backend_stop "$sys"
         for wl in $WORKLOADS; do
             emit_na_row "$regime" "$wl" "$sys" "relaxed" "${SYS_FAIL[$sys]}"
-            case "$wl" in seq_write_1m | rand_write_4k)
+            case "$wl" in seq_write_1m | rand_write_4k | del_storm)
                 emit_na_row "$regime" "$wl" "$sys" "durable" "${SYS_FAIL[$sys]}"
                 ;;
             esac
@@ -1717,7 +1799,7 @@ run_regime_system() { # <regime> <system>
         if is_ns "$sys" "$wl"; then
             log "$regime.$wl.$sys: N/S — $(ns_reason "$sys" "$wl")"
             emit_ns_row "$regime" "$wl" "$sys" "relaxed"
-            case "$wl" in seq_write_1m | rand_write_4k)
+            case "$wl" in seq_write_1m | rand_write_4k | del_storm)
                 emit_ns_row "$regime" "$wl" "$sys" "durable"
                 ;;
             esac
@@ -1913,6 +1995,8 @@ meta = os.environ.get("SCORE_META", "")
 systems = os.environ.get("SYSTEMS", "sqz jfs swfs gee mps3").split()
 refs = [s for s in systems if s != "sqz"]
 WRITE_FAMILY = {"seq_write_1m", "rand_write_4k"}
+DEL_FAMILY = {"del_storm"}  # RW6-del: durable governs, relaxed labeled
+GOVERNED = WRITE_FAMILY | DEL_FAMILY
 
 cells = {}   # (regime, wl, mode) -> {sys: {...}}
 order = []
@@ -1935,7 +2019,7 @@ for line in open(rows_tsv):
                            "note": note, "dev": dev}
 
 def is_primary(wl, mode):
-    return (mode == "durable") if wl in WRITE_FAMILY else (mode == "relaxed")
+    return (mode == "durable") if wl in GOVERNED else (mode == "relaxed")
 
 def fmt(v, unit, raw):
     if raw == "NS":
@@ -1945,11 +2029,11 @@ def fmt(v, unit, raw):
     return f"{v:,.0f}" if (unit != "MiB/s" or v >= 100) else f"{v:,.1f}"
 
 losses, invalid = [], []
-prim_md = ["", "## Primary kernel-FUSE table (gating; write rows = durable mode)", "",
+prim_md = ["", "## Primary kernel-FUSE table (gating; write + delete rows = durable mode)", "",
            "| Row | Workload (unit) | SQZ | " +
            " | ".join(f"{r.upper()} | SQZ/{r} | v" for r in refs) + " | Rank |",
            "|---|---|---:|" + "---:|---:|:--:|" * len(refs) + ":--:|"]
-lab_md = ["", "## Relaxed write rows (native ACK semantics — labeled, non-gating)", "",
+lab_md = ["", "## Relaxed write/delete rows (native ACK semantics — labeled, non-gating)", "",
           "| Row | Workload (unit) | SQZ | " +
           " | ".join(f"{r.upper()} | SQZ/{r}" for r in refs) + " |",
           "|---|---|---:|" + "---:|---:|" * len(refs) + ""]
@@ -2037,7 +2121,7 @@ for key in order:
         prim_md.append(f"| {label} | {wl} ({unit}) | {sqz_txt} | " +
                        " | ".join(f"{c[0]} | {c[1]} | {c[2]}" for c in ref_cols) +
                        f" | {rank_txt} |")
-    elif mode == "relaxed" and wl in WRITE_FAMILY:
+    elif mode == "relaxed" and wl in GOVERNED:
         lab_md.append(f"| {rowid}@relaxed | {wl} ({unit}) | {sqz_txt} | " +
                       " | ".join(f"{c[0]} | {c[1]}" for c in ref_cols) + " |")
     tsv.append("\t".join([rowid, regime, wl, mode, unit] +
@@ -2063,8 +2147,9 @@ if family:
 header = ["# SqueezeFS multi-reference scoreboard", "",
           f"Provenance: {meta}", "",
           "Verdict rule (per reference): W if SQZ > 1.05x ref, L if < 0.95x, TIE inside ±5%. "
-          "Write-family verdicts are governed by the durable rows (fsync-inclusive, RW6); "
-          "relaxed write rows are published labeled below. N/S = not supported by design "
+          "Write- and delete-family verdicts are governed by the durable rows "
+          "(fsync/syncfs-inclusive — RW6 for writes, RW6-del for deletes); "
+          "relaxed write/delete rows are published labeled below. N/S = not supported by design "
           "(neutral; excluded from ranks). Rank = SqueezeFS position among numeric cells "
           "(1 = fastest). INVALID = missing/unverified/failed SqueezeFS cell (gates).", ""]
 doc = header + prim_md + lab_md + top3_md

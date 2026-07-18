@@ -7,9 +7,14 @@
 //!   lifecycle verbs fail with clap's unknown-verb error (the README
 //!   removed-verbs ledger explains them);
 //! * `--target-stack` resolution (flag > `SQUEEZEFS_NVMEOF_TARGET_STACK`
-//!   env > default `spdk`) and the N2 **loud-fail UX for the SPDK
-//!   default** — the designed preflight message pointing at the N3/N4
-//!   milestones is itself a deliverable;
+//!   env > default `spdk`) and the **loud-fail UX for the SPDK default
+//!   share path** — as of N3 the target lifecycle verbs are live, so the
+//!   designed preflight message points at the REAL `target
+//!   install/start` verbs while stating that SPDK **sharing** lands with
+//!   N4 (the PR-plan's remediation-text-only update);
+//! * the `target …` verb surface exists (N3): install/setup/start/stop/
+//!   status demand root; systemd-unit emits unprivileged;
+//!   `install --version` must equal the pin;
 //! * per-stack flag semantics (§6.2): `--nsid` is SPDK-only (nvmet index
 //!   structurally fixed at 1 ⇒ `--nsid` ≠ 1 with nvmet refuses loud);
 //!   `--ns-uuid` seeds both stacks and must parse.
@@ -114,13 +119,36 @@ fn test_new_grammar_help_lists_verbs() {
         "restore",
         "connect",
         "disconnect",
+        "target",
     ] {
         assert!(help.contains(verb), "help must list '{verb}': {help}");
     }
 }
 
+/// The N3 `target …` verb surface exists (§6.2).
+#[test]
+fn test_target_grammar_help_lists_lifecycle_verbs() {
+    let out = run(&["nvmeof", "target", "--help"], &[]);
+    assert!(out.status.success(), "nvmeof target --help must succeed");
+    let help = combined(&out);
+    for verb in [
+        "install",
+        "setup",
+        "start",
+        "stop",
+        "status",
+        "systemd-unit",
+    ] {
+        assert!(
+            help.contains(verb),
+            "target help must list '{verb}': {help}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
-// the N2 SPDK-default loud-fail UX (the deliverable)
+// the SPDK-default loud-fail UX for the SHARE path (remediation text
+// updated at N3: target lifecycle verbs are live, sharing lands with N4)
 // ---------------------------------------------------------------------------
 
 fn assert_spdk_unavailable_message(context: &str, text: &str) {
@@ -129,12 +157,16 @@ fn assert_spdk_unavailable_message(context: &str, text: &str) {
         "{context}: must name the unavailable stack: {text}"
     );
     assert!(
-        text.contains("SPDK target management lands with the next milestone of this program"),
+        text.contains("SPDK share management lands with milestone N4"),
         "{context}: must carry the designed milestone message: {text}"
     );
     assert!(
-        text.contains("N3") && text.contains("N4"),
-        "{context}: must point at the N3/N4 milestones: {text}"
+        text.contains("target lifecycle verbs are live"),
+        "{context}: must state that the N3 target verbs exist: {text}"
+    );
+    assert!(
+        text.contains("nvmeof target install") && text.contains("nvmeof target start"),
+        "{context}: remediation points at the REAL lifecycle verbs: {text}"
     );
     assert!(
         text.contains("--target-stack nvmet"),
@@ -410,5 +442,129 @@ fn test_unshare_verb_exists_and_demands_root() {
     assert!(
         text.contains("root"),
         "unprivileged unshare demands root: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the N3 target lifecycle verb surface (§6.2/§6.5)
+// ---------------------------------------------------------------------------
+
+/// The mutating target verbs exist and demand root (unprivileged runs
+/// die on the root rung, never on clap).
+#[test]
+fn test_target_mutating_verbs_exist_and_demand_root() {
+    for args in [
+        vec!["nvmeof", "target", "install"],
+        vec!["nvmeof", "target", "setup"],
+        vec!["nvmeof", "target", "start"],
+        vec!["nvmeof", "target", "stop"],
+        vec!["nvmeof", "target", "status"],
+    ] {
+        let out = run(&args, &[]);
+        assert!(!out.status.success(), "{args:?} unprivileged must fail");
+        let text = combined(&out);
+        assert!(
+            !text.contains("unrecognized subcommand"),
+            "{args:?} must exist in the grammar: {text}"
+        );
+        assert!(text.contains("root"), "{args:?} demands root: {text}");
+    }
+}
+
+/// `target install --version` must equal the pin — pin bumps are
+/// deliberate PRs, never a CLI flag (§6.5/R1). Grammar-rung refusal:
+/// fires before the root check.
+#[test]
+fn test_target_install_version_pin_refusal() {
+    let out = run(&["nvmeof", "target", "install", "--version", "v27.01"], &[]);
+    assert!(!out.status.success(), "--version v27.01 must refuse");
+    let text = combined(&out);
+    assert!(
+        text.contains("v26.05") && text.contains("v27.01"),
+        "names the pin and the request: {text}"
+    );
+    assert!(
+        !text.contains("root privileges"),
+        "the pin refusal fires before the root check: {text}"
+    );
+}
+
+/// `target setup --hugemem-mb … --restore-prior` is a contradiction —
+/// clap refuses the combination.
+#[test]
+fn test_target_setup_restore_prior_conflicts_with_hugemem() {
+    let out = run(
+        &[
+            "nvmeof",
+            "target",
+            "setup",
+            "--hugemem-mb",
+            "512",
+            "--restore-prior",
+        ],
+        &[],
+    );
+    assert!(!out.status.success());
+    let text = combined(&out);
+    assert!(
+        text.contains("cannot be used with"),
+        "clap conflict expected: {text}"
+    );
+}
+
+/// `target start --core-mask … --cores …` is a contradiction.
+#[test]
+fn test_target_start_core_mask_conflicts_with_cores() {
+    let out = run(
+        &[
+            "nvmeof",
+            "target",
+            "start",
+            "--core-mask",
+            "0x1",
+            "--cores",
+            "2",
+        ],
+        &[],
+    );
+    assert!(!out.status.success());
+    assert!(
+        combined(&out).contains("cannot be used with"),
+        "clap conflict expected: {}",
+        combined(&out)
+    );
+}
+
+/// `target stop --target-stack nvmet` refuses loud: the kernel target is
+/// not a process (there is nothing to stop) — never a silent no-op.
+#[test]
+fn test_target_stop_nvmet_refuses_loud() {
+    let out = run(
+        &["nvmeof", "target", "stop", "--target-stack", "nvmet"],
+        &[],
+    );
+    assert!(!out.status.success());
+    let text = combined(&out);
+    assert!(
+        text.contains("not a process"),
+        "must explain the nvmet stop refusal: {text}"
+    );
+}
+
+/// `target install` with the nvmet stack selected via env still installs
+/// SPDK — the verb is SPDK-only by definition (§6.2 table); no silent
+/// reinterpretation, the help says so. Here: the env must NOT change the
+/// version-pin refusal path (proving install ignores stack selection).
+#[test]
+fn test_target_install_is_spdk_only_regardless_of_env() {
+    let out = run(
+        &["nvmeof", "target", "install", "--version", "v27.01"],
+        &[("SQUEEZEFS_NVMEOF_TARGET_STACK", "nvmet")],
+    );
+    assert!(!out.status.success());
+    assert!(
+        combined(&out).contains("v26.05"),
+        "install stays the SPDK pin path under env=nvmet: {}",
+        combined(&out)
     );
 }

@@ -31,6 +31,7 @@ pub mod initiator;
 pub mod ledger;
 pub mod nocow;
 pub mod nvmet;
+pub mod spdk;
 pub mod stack;
 
 pub use initiator::{connect_target, disconnect_target};
@@ -480,6 +481,81 @@ pub fn restore(filter: Option<StackKind>) -> Result<(), NvmeofError> {
         )));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `nvmeof target …` verbs (§6.2/§6.5, PR 3/N3) — stack dispatch lives HERE,
+// never inside a stack subtree (the G3 module-graph rule: src/nvmeof/spdk/
+// carries no reference to nvmet items and vice versa).
+// ---------------------------------------------------------------------------
+
+/// `target start` options carried from the CLI (§6.2 grammar).
+#[derive(Debug, Clone, Default)]
+pub struct TargetStartOptions {
+    pub core_mask: Option<String>,
+    pub cores: Option<u32>,
+    pub dpdk_mem_mb: u64,
+    pub accept_version_drift: bool,
+}
+
+/// `nvmeof target install` (§6.5): SPDK-only by definition — pinned tag +
+/// sha verified build into `/opt/squeezefs/spdk/<tag>/`; `--with-pkgdep`
+/// is the explicit consent for system package mutation.
+pub fn target_install(version: Option<&str>, with_pkgdep: bool) -> Result<(), NvmeofError> {
+    let _ = (version, with_pkgdep);
+    unimplemented!("N3 skeleton — implemented by the feat commit")
+}
+
+/// `nvmeof target setup` (§6.5): SPDK — hugepage reservation with the
+/// recorded-prior file (+ `--restore-prior` restore path); nvmet —
+/// modprobe + configfs mount checks.
+pub fn target_setup(
+    stack_flag: Option<StackKind>,
+    hugemem_mb: u64,
+    restore_prior: bool,
+) -> Result<(), NvmeofError> {
+    let _ = (stack_flag, hugemem_mb, restore_prior);
+    unimplemented!("N3 skeleton — implemented by the feat commit")
+}
+
+/// `nvmeof target start` (§6.5): SPDK — preflighted spawn with pidfile +
+/// RPC-liveness wait + `load_config`; nvmet — modprobe + ledger `restore`
+/// (configfs is the "running target").
+pub fn target_start(
+    stack_flag: Option<StackKind>,
+    opts: &TargetStartOptions,
+) -> Result<(), NvmeofError> {
+    let _ = (stack_flag, opts);
+    unimplemented!("N3 skeleton — implemented by the feat commit")
+}
+
+/// `nvmeof target stop` (§6.5): SPDK — `save_config` → SIGTERM by pidfile
+/// → grace → SIGKILL; refuses while ledger shares are live-connected
+/// unless `--force`. nvmet — refuses loud (the kernel target is not a
+/// process).
+pub fn target_stop(stack_flag: Option<StackKind>, force: bool) -> Result<(), NvmeofError> {
+    let _ = (stack_flag, force);
+    unimplemented!("N3 skeleton — implemented by the feat commit")
+}
+
+/// `nvmeof target status` (§6.9): the diagnostic verb — never refuses on
+/// drift; reports.
+pub fn target_status(stack_flag: Option<StackKind>, json: bool) -> Result<(), NvmeofError> {
+    let _ = (stack_flag, json);
+    unimplemented!("N3 skeleton — implemented by the feat commit")
+}
+
+/// `nvmeof target systemd-unit` (§6.5): emits a unit to stdout with
+/// values baked at emission — never installs (the dev_substrate
+/// precedent).
+pub fn target_systemd_unit(
+    stack_flag: Option<StackKind>,
+    core_mask: Option<String>,
+    cores: Option<u32>,
+    dpdk_mem_mb: u64,
+) -> Result<(), NvmeofError> {
+    let _ = (stack_flag, core_mask, cores, dpdk_mem_mb);
+    unimplemented!("N3 skeleton — implemented by the feat commit")
 }
 
 /// Reconciliation classification of one ledger record for `list` (§6.2).

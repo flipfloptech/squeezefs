@@ -168,8 +168,10 @@ if [ $? -ne 0 ] && echo "$OUT" | grep -q "structurally fixed at 1"; then
     ok "--nsid 2 with nvmet refuses loud"
 else bad "--nsid refusal: $OUT"; fi
 
+# N3 updated the remediation text: sharing lands with N4, the target
+# lifecycle verbs are live (docs/design-nvmeof-target-management.md PR 3).
 OUT=$("$BIN" nvmeof share /dev/null --ip 127.0.0.1 2>&1)
-if [ $? -ne 0 ] && echo "$OUT" | grep -q "SPDK target management lands with the next milestone"; then
+if [ $? -ne 0 ] && echo "$OUT" | grep -q "SPDK share management lands with milestone N4"; then
     ok "default (spdk) stack fails loud with the milestone message"
 else bad "spdk loud-fail: $OUT"; fi
 

@@ -70,7 +70,24 @@ pub struct SpdkPaths {
 impl SpdkPaths {
     /// Production constructor (env-aware).
     pub fn resolve() -> Self {
-        unimplemented!("N3 skeleton — implemented by the feat commit")
+        let env_dir = |key: &str, default: &str| -> PathBuf {
+            match std::env::var(key) {
+                Ok(v) if !v.is_empty() => PathBuf::from(v),
+                _ => PathBuf::from(default),
+            }
+        };
+        SpdkPaths {
+            install_prefix: PathBuf::from(DEFAULT_INSTALL_ROOT).join(lifecycle::SPDK_PINNED_TAG),
+            run_dir: env_dir(RUN_DIR_ENV, DEFAULT_RUN_DIR),
+            state_dir: env_dir(
+                super::ledger::STATE_DIR_ENV,
+                super::ledger::DEFAULT_STATE_DIR,
+            ),
+            bin_override: match std::env::var(SPDK_TGT_BIN_ENV) {
+                Ok(v) if !v.is_empty() => Some(PathBuf::from(v)),
+                _ => None,
+            },
+        }
     }
 
     /// Injection seam for the unit tier.

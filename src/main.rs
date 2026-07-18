@@ -636,6 +636,101 @@ enum NvmeofActions {
         /// Subsystem NQN to disconnect
         subnqn: String,
     },
+    /// Manage the NVMe-oF target runtime (SPDK lifecycle: pinned
+    /// install, hugepage setup, start/stop/status, systemd-unit
+    /// emission; nvmet arms where meaningful)
+    Target {
+        #[command(subcommand)]
+        action: TargetActions,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum TargetActions {
+    /// Build the pinned SPDK release (tag + commit sha verified) into
+    /// /opt/squeezefs/spdk/<tag>/ — SPDK-only by definition
+    Install {
+        /// Release to install — must equal the pinned tag (pin bumps are
+        /// deliberate PRs, never a CLI flag)
+        #[arg(long)]
+        version: Option<String>,
+        /// Explicit consent to system package mutation (runs the pinned
+        /// tree's scripts/pkgdep.sh); default: probe the toolchain and
+        /// refuse loud listing the missing packages
+        #[arg(long)]
+        with_pkgdep: bool,
+    },
+    /// SPDK: reserve 2 MiB hugepages (records the prior value; restore
+    /// with --restore-prior). nvmet: modprobe + configfs mount checks
+    Setup {
+        /// Hugepage reservation in MiB (default 2048 = 1024 × 2 MiB pages)
+        #[arg(long, conflicts_with = "restore_prior")]
+        hugemem_mb: Option<u64>,
+        /// Restore nr_hugepages to the recorded prior value and clear the
+        /// record
+        #[arg(long)]
+        restore_prior: bool,
+        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default spdk)
+        #[arg(long, value_enum)]
+        target_stack: Option<TargetStackArg>,
+    },
+    /// Start the target (SPDK: pidfile mode — preflighted spawn,
+    /// RPC-liveness wait, load_config; nvmet: modprobe + ledger restore)
+    Start {
+        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default spdk)
+        #[arg(long, value_enum)]
+        target_stack: Option<TargetStackArg>,
+        /// Explicit reactor core mask (hex, e.g. 0x80000000); default:
+        /// one reactor on the highest online CPU
+        #[arg(long, conflicts_with = "cores")]
+        core_mask: Option<String>,
+        /// Reactor core count, allocated from the highest online CPUs down
+        #[arg(long)]
+        cores: Option<u32>,
+        /// DPDK hugepage memory for spdk_tgt -s, in MiB (default 1024)
+        #[arg(long)]
+        dpdk_mem_mb: Option<u64>,
+        /// Proceed despite a target version that drifts from the pin
+        /// (mutating-verb gate; status always reports, stop warns)
+        #[arg(long)]
+        accept_version_drift: bool,
+    },
+    /// Stop the SPDK target: save_config -> SIGTERM -> grace -> SIGKILL
+    /// (refuses while ledgered shares have live consumers unless --force)
+    Stop {
+        /// Stop even with live initiator connections on ledgered shares
+        #[arg(long)]
+        force: bool,
+        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default spdk)
+        #[arg(long, value_enum)]
+        target_stack: Option<TargetStackArg>,
+    },
+    /// Report target health: RPC liveness, version + drift, reactor
+    /// busy, hugepages, ledger reconciliation (never refuses on drift)
+    Status {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default spdk)
+        #[arg(long, value_enum)]
+        target_stack: Option<TargetStackArg>,
+    },
+    /// Emit a systemd unit to stdout with values baked at emission time
+    /// (never installed — the operator installs it)
+    SystemdUnit {
+        /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default spdk)
+        #[arg(long, value_enum)]
+        target_stack: Option<TargetStackArg>,
+        /// Explicit reactor core mask (hex) to bake into ExecStart
+        #[arg(long, conflicts_with = "cores")]
+        core_mask: Option<String>,
+        /// Reactor core count from the highest online CPUs down
+        #[arg(long)]
+        cores: Option<u32>,
+        /// DPDK hugepage memory (spdk_tgt -s) to bake, in MiB (default 1024)
+        #[arg(long)]
+        dpdk_mem_mb: Option<u64>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1936,6 +2031,64 @@ fn dispatch_nvmeof(action: NvmeofActions) -> Result<(), squeezefs::nvmeof::stack
             squeezefs::nvmeof::disconnect_target(&subnqn)?;
             println!("Successfully disconnected from target NQN '{}'.", subnqn);
         }
+        NvmeofActions::Target { action } => match action {
+            TargetActions::Install {
+                version,
+                with_pkgdep,
+            } => {
+                squeezefs::nvmeof::target_install(version.as_deref(), with_pkgdep)?;
+            }
+            TargetActions::Setup {
+                hugemem_mb,
+                restore_prior,
+                target_stack,
+            } => {
+                squeezefs::nvmeof::target_setup(
+                    target_stack.map(Into::into),
+                    hugemem_mb,
+                    restore_prior,
+                )?;
+            }
+            TargetActions::Start {
+                target_stack,
+                core_mask,
+                cores,
+                dpdk_mem_mb,
+                accept_version_drift,
+            } => {
+                squeezefs::nvmeof::target_start(
+                    target_stack.map(Into::into),
+                    &squeezefs::nvmeof::TargetStartOptions {
+                        core_mask,
+                        cores,
+                        dpdk_mem_mb,
+                        accept_version_drift,
+                    },
+                )?;
+            }
+            TargetActions::Stop {
+                force,
+                target_stack,
+            } => {
+                squeezefs::nvmeof::target_stop(target_stack.map(Into::into), force)?;
+            }
+            TargetActions::Status { json, target_stack } => {
+                squeezefs::nvmeof::target_status(target_stack.map(Into::into), json)?;
+            }
+            TargetActions::SystemdUnit {
+                target_stack,
+                core_mask,
+                cores,
+                dpdk_mem_mb,
+            } => {
+                squeezefs::nvmeof::target_systemd_unit(
+                    target_stack.map(Into::into),
+                    core_mask,
+                    cores,
+                    dpdk_mem_mb,
+                )?;
+            }
+        },
     }
     Ok(())
 }

@@ -104,29 +104,34 @@ pub fn resolve_stack(flag: Option<StackKind>) -> Result<StackKind, NvmeofError> 
     }
 }
 
-/// The N2 SPDK loud-fail (§6.2/§6.3 + PR-plan PR 2): the default stack is
-/// spdk, whose target management lands with the N3 (lifecycle) / N4
-/// (share path) milestones — until then every SPDK-selected verb fails
-/// LOUD with this designed preflight message. Only the remediation text
-/// changes when N3/N4 land.
+/// The N3 SPDK share-path loud-fail (§6.2/§6.3 + PR-plan PR 2/PR 3): the
+/// default stack is spdk, whose **share management** lands with the N4
+/// milestone — until then every SPDK-selected share verb fails LOUD with
+/// this designed preflight message. As of N3 the target lifecycle verbs
+/// are live, so the remediation text names the REAL verbs (the PR-plan's
+/// remediation-text-only update); the message itself retires at N4.
 fn spdk_unavailable() -> PreflightError {
     PreflightError {
-        message: "error: SPDK target stack unavailable: SPDK target management lands with the \
-                  next milestone of this program (design milestones N3/N4 — \
-                  docs/design-nvmeof-target-management.md)\n  select the kernel target stack \
-                  explicitly:\n    sudo squeezefs nvmeof <verb> … --target-stack nvmet\n    \
-                  (or export SQUEEZEFS_NVMEOF_TARGET_STACK=nvmet)\n  or install/start the SPDK \
-                  target once available:\n    sudo squeezefs nvmeof target install    (lands \
-                  with N3)\n    sudo squeezefs nvmeof target start      (lands with N3)\nnote: \
-                  SqueezeFS never falls back between target stacks automatically —\n      they \
-                  differ in reservation persistence (PTPL) and latency envelope."
+        message: "error: SPDK target stack unavailable: SPDK share management lands with \
+                  milestone N4 of this program (docs/design-nvmeof-target-management.md) — \
+                  the target lifecycle verbs are live as of N3\n  manage the SPDK target \
+                  process today:\n    sudo squeezefs nvmeof target install     (pinned-release \
+                  build)\n    sudo squeezefs nvmeof target setup       (hugepage reservation)\n    \
+                  sudo squeezefs nvmeof target start\n    sudo squeezefs nvmeof target status\n  \
+                  select the kernel target stack for sharing explicitly:\n    sudo squeezefs \
+                  nvmeof <verb> … --target-stack nvmet\n    (or export \
+                  SQUEEZEFS_NVMEOF_TARGET_STACK=nvmet)\nnote: SqueezeFS never falls back \
+                  between target stacks automatically —\n      they differ in reservation \
+                  persistence (PTPL) and latency envelope."
             .to_string(),
     }
 }
 
-/// Constructs the selected stack. The SPDK arm is the N2 loud-fail; it
-/// becomes a real `SpdkStack` at N3/N4 (§Migration pt 3: between N2 and
-/// N4, SPDK target serving is deliberately unavailable on `dev`).
+/// Constructs the selected stack for the SHARE verbs. The SPDK arm is
+/// the N3 loud-fail; it becomes a real `SpdkStack` at N4 (§Migration
+/// pt 3: between N2 and N4, SPDK target *serving* is deliberately
+/// unavailable on `dev` — the N3 lifecycle verbs dispatch separately
+/// below, never through this constructor).
 fn stack_for(kind: StackKind) -> Result<Box<dyn TargetStack>, NvmeofError> {
     match kind {
         StackKind::Nvmet => Ok(Box::new(nvmet::NvmetStack::open_default()?)),
@@ -467,8 +472,9 @@ pub fn restore(filter: Option<StackKind>) -> Result<(), NvmeofError> {
         for rec in records.iter().filter(|r| r.stack == StackKind::Spdk) {
             println!(
                 "restore {}: skipped — SPDK restore rides SPDK-native save_config/load_config \
-                 from the SPDK milestones of this program (N3/N4); the ledger record is kept \
-                 for ownership and unshare dispatch",
+                 from milestone N4 of this program (the N3 target lifecycle verbs already run \
+                 load_config at 'target start'); the ledger record is kept for ownership and \
+                 unshare dispatch",
                 rec.subnqn
             );
         }
@@ -489,21 +495,49 @@ pub fn restore(filter: Option<StackKind>) -> Result<(), NvmeofError> {
 // carries no reference to nvmet items and vice versa).
 // ---------------------------------------------------------------------------
 
-/// `target start` options carried from the CLI (§6.2 grammar).
+/// `target start` options carried from the CLI (§6.2 grammar). The
+/// `Option` fields distinguish explicitly-passed values from defaults —
+/// SPDK-only flags with `--target-stack nvmet` refuse loud, never a
+/// silent flag-ignore (the `--disk-cache-paths` precedent).
 #[derive(Debug, Clone, Default)]
 pub struct TargetStartOptions {
     pub core_mask: Option<String>,
     pub cores: Option<u32>,
-    pub dpdk_mem_mb: u64,
+    pub dpdk_mem_mb: Option<u64>,
     pub accept_version_drift: bool,
+}
+
+/// Refuse SPDK-only flags on the nvmet arm loud (never silently ignore).
+fn refuse_spdk_only_flags(kind: StackKind, set_flags: &[(&str, bool)]) -> Result<(), NvmeofError> {
+    if kind != StackKind::Nvmet {
+        return Ok(());
+    }
+    let offending: Vec<&str> = set_flags
+        .iter()
+        .filter(|(_, set)| *set)
+        .map(|(name, _)| *name)
+        .collect();
+    if offending.is_empty() {
+        return Ok(());
+    }
+    Err(NvmeofError::Refused(format!(
+        "{} {} SPDK-only: the kernel nvmet target has no spdk_tgt process, hugepages, or \
+         reactor cores — drop the flag(s) with --target-stack nvmet (SqueezeFS never \
+         silently ignores an explicit flag)",
+        offending.join(", "),
+        if offending.len() == 1 { "is" } else { "are" },
+    )))
 }
 
 /// `nvmeof target install` (§6.5): SPDK-only by definition — pinned tag +
 /// sha verified build into `/opt/squeezefs/spdk/<tag>/`; `--with-pkgdep`
 /// is the explicit consent for system package mutation.
 pub fn target_install(version: Option<&str>, with_pkgdep: bool) -> Result<(), NvmeofError> {
-    let _ = (version, with_pkgdep);
-    unimplemented!("N3 skeleton — implemented by the feat commit")
+    // Grammar rung first (fires before root — the validate_share_flags
+    // precedent), then root, then the build.
+    spdk::lifecycle::validate_install_version(version)?;
+    check_root()?;
+    spdk::lifecycle::install(&spdk::SpdkPaths::resolve(), version, with_pkgdep)
 }
 
 /// `nvmeof target setup` (§6.5): SPDK — hugepage reservation with the
@@ -511,11 +545,75 @@ pub fn target_install(version: Option<&str>, with_pkgdep: bool) -> Result<(), Nv
 /// modprobe + configfs mount checks.
 pub fn target_setup(
     stack_flag: Option<StackKind>,
-    hugemem_mb: u64,
+    hugemem_mb: Option<u64>,
     restore_prior: bool,
 ) -> Result<(), NvmeofError> {
-    let _ = (stack_flag, hugemem_mb, restore_prior);
-    unimplemented!("N3 skeleton — implemented by the feat commit")
+    let kind = resolve_stack(stack_flag)?;
+    refuse_spdk_only_flags(
+        kind,
+        &[
+            ("--hugemem-mb", hugemem_mb.is_some()),
+            ("--restore-prior", restore_prior),
+        ],
+    )?;
+    check_root()?;
+    match kind {
+        StackKind::Spdk => {
+            let paths = spdk::SpdkPaths::resolve();
+            let sysfs = Path::new(spdk::hugepages::HUGEPAGES_2M_SYSFS_DIR);
+            if restore_prior {
+                let out = spdk::hugepages::restore_prior(sysfs, &paths.spdk_state_dir())
+                    .map_err(NvmeofError::Io)?;
+                println!(
+                    "hugepages restored to the recorded prior: nr_hugepages = {} (record \
+                     cleared).",
+                    out.achieved
+                );
+                return Ok(());
+            }
+            let mb = hugemem_mb.unwrap_or(spdk::hugepages::DEFAULT_HUGEMEM_MB);
+            let out = spdk::hugepages::setup(
+                sysfs,
+                &paths.spdk_state_dir(),
+                mb,
+                spdk::hugepages::mem_available_kb(),
+            )
+            .map_err(NvmeofError::Io)?;
+            for w in &out.warnings {
+                eprintln!("warning: {w}");
+            }
+            if let Some(prior) = out.prior_recorded {
+                println!(
+                    "recorded prior nr_hugepages = {prior} (restore with 'squeezefs nvmeof \
+                     target setup --restore-prior')"
+                );
+            }
+            if out.verified_noop {
+                println!(
+                    "hugepage pool already holds {} × 2 MiB pages — verified no-op.",
+                    out.achieved_pages
+                );
+            } else {
+                println!(
+                    "reserved {} × 2 MiB hugepages ({} MiB requested{}).",
+                    out.achieved_pages,
+                    mb,
+                    if out.clamped_to_in_use {
+                        ", clamped to in-use pages"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Ok(())
+        }
+        StackKind::Nvmet => {
+            let stack = nvmet::NvmetStack::open_default()?;
+            stack.ensure_ready()?;
+            println!("kernel nvmet target ready: modules loaded, configfs mounted.");
+            Ok(())
+        }
+    }
 }
 
 /// `nvmeof target start` (§6.5): SPDK — preflighted spawn with pidfile +
@@ -525,43 +623,156 @@ pub fn target_start(
     stack_flag: Option<StackKind>,
     opts: &TargetStartOptions,
 ) -> Result<(), NvmeofError> {
-    let _ = (stack_flag, opts);
-    unimplemented!("N3 skeleton — implemented by the feat commit")
+    let kind = resolve_stack(stack_flag)?;
+    refuse_spdk_only_flags(
+        kind,
+        &[
+            ("--core-mask", opts.core_mask.is_some()),
+            ("--cores", opts.cores.is_some()),
+            ("--dpdk-mem-mb", opts.dpdk_mem_mb.is_some()),
+            ("--accept-version-drift", opts.accept_version_drift),
+        ],
+    )?;
+    check_root()?;
+    match kind {
+        StackKind::Spdk => spdk::lifecycle::start(
+            &spdk::SpdkPaths::resolve(),
+            &spdk::lifecycle::StartOptions {
+                core_mask: opts.core_mask.clone(),
+                cores: opts.cores,
+                dpdk_mem_mb: opts
+                    .dpdk_mem_mb
+                    .unwrap_or(spdk::lifecycle::DEFAULT_DPDK_MEM_MB),
+                accept_version_drift: opts.accept_version_drift,
+            },
+        ),
+        StackKind::Nvmet => {
+            let stack = nvmet::NvmetStack::open_default()?;
+            stack.ensure_ready()?;
+            println!(
+                "kernel nvmet target ready (configfs is the running target) — replaying the \
+                 share ledger:"
+            );
+            restore(Some(StackKind::Nvmet))
+        }
+    }
 }
 
 /// `nvmeof target stop` (§6.5): SPDK — `save_config` → SIGTERM by pidfile
 /// → grace → SIGKILL; refuses while ledger shares are live-connected
 /// unless `--force`. nvmet — refuses loud (the kernel target is not a
-/// process).
+/// process; grammar-class refusal, before root).
 pub fn target_stop(stack_flag: Option<StackKind>, force: bool) -> Result<(), NvmeofError> {
-    let _ = (stack_flag, force);
-    unimplemented!("N3 skeleton — implemented by the feat commit")
+    let kind = resolve_stack(stack_flag)?;
+    if kind == StackKind::Nvmet {
+        return Err(NvmeofError::Refused(
+            "the kernel nvmet target is not a process — there is nothing to stop.\n  configfs \
+             objects are the 'running target': tear shares down instead:\n    sudo squeezefs \
+             nvmeof unshare <subnqn>\n  (modules stay loaded by policy)"
+                .to_string(),
+        ));
+    }
+    check_root()?;
+    spdk::lifecycle::stop(&spdk::SpdkPaths::resolve(), force)
 }
 
 /// `nvmeof target status` (§6.9): the diagnostic verb — never refuses on
 /// drift; reports.
 pub fn target_status(stack_flag: Option<StackKind>, json: bool) -> Result<(), NvmeofError> {
-    let _ = (stack_flag, json);
-    unimplemented!("N3 skeleton — implemented by the feat commit")
+    let kind = resolve_stack(stack_flag)?;
+    check_root()?;
+    match kind {
+        StackKind::Spdk => spdk::lifecycle::status(&spdk::SpdkPaths::resolve(), json),
+        StackKind::Nvmet => {
+            let stack = nvmet::NvmetStack::open_default()?;
+            let status = stack.target_status()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "stack": "nvmet",
+                        "modules_present": status.modules_present,
+                        "configfs_mounted": status.configfs_mounted,
+                        "subsystems": status.subsystems,
+                        "namespaces": status.namespaces,
+                        "ports": status.ports,
+                        "resv_enabled_namespaces": status.resv_enabled_namespaces,
+                    }))
+                    .map_err(|e| NvmeofError::Io(io::Error::other(e)))?
+                );
+            } else {
+                println!("=== Kernel nvmet NVMe-oF Target Status ===");
+                println!(
+                    "  modules:   {}",
+                    if status.modules_present {
+                        "loaded"
+                    } else {
+                        "absent"
+                    }
+                );
+                println!(
+                    "  configfs:  {}",
+                    if status.configfs_mounted {
+                        "mounted"
+                    } else {
+                        "absent"
+                    }
+                );
+                println!(
+                    "  serving:   {} subsystem(s), {} namespace(s) ({} with PR/resv_enable), \
+                     {} port(s)",
+                    status.subsystems,
+                    status.namespaces,
+                    status.resv_enabled_namespaces,
+                    status.ports
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 /// `nvmeof target systemd-unit` (§6.5): emits a unit to stdout with
-/// values baked at emission — never installs (the dev_substrate
-/// precedent).
+/// values baked at emission — never installs, mutates nothing, needs no
+/// root (the dev_substrate precedent).
 pub fn target_systemd_unit(
     stack_flag: Option<StackKind>,
     core_mask: Option<String>,
     cores: Option<u32>,
-    dpdk_mem_mb: u64,
+    dpdk_mem_mb: Option<u64>,
 ) -> Result<(), NvmeofError> {
-    let _ = (stack_flag, core_mask, cores, dpdk_mem_mb);
-    unimplemented!("N3 skeleton — implemented by the feat commit")
+    let kind = resolve_stack(stack_flag)?;
+    refuse_spdk_only_flags(
+        kind,
+        &[
+            ("--core-mask", core_mask.is_some()),
+            ("--cores", cores.is_some()),
+            ("--dpdk-mem-mb", dpdk_mem_mb.is_some()),
+        ],
+    )?;
+    match kind {
+        StackKind::Spdk => {
+            let unit = spdk::lifecycle::systemd_unit(
+                &spdk::SpdkPaths::resolve(),
+                core_mask,
+                cores,
+                dpdk_mem_mb.unwrap_or(spdk::lifecycle::DEFAULT_DPDK_MEM_MB),
+            )?;
+            print!("{unit}");
+            Ok(())
+        }
+        StackKind::Nvmet => {
+            let exe = std::env::current_exe().map_err(NvmeofError::Io)?;
+            print!("{}", spdk::lifecycle::render_nvmet_unit(&exe));
+            Ok(())
+        }
+    }
 }
 
 /// Reconciliation classification of one ledger record for `list` (§6.2).
 fn classification_of(record: &ShareRecord, live: bool) -> &'static str {
     match (record.stack, record.state, live) {
-        (StackKind::Spdk, _, _) => "unverified (SPDK stack management lands at N3/N4)",
+        (StackKind::Spdk, _, _) => "unverified (SPDK share management lands at N4)",
         (_, ShareState::Pending, _) => {
             "pending — interrupted share; `nvmeof restore` finalizes or garbage-collects it"
         }

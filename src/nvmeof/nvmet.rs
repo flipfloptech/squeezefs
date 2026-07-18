@@ -272,6 +272,13 @@ impl NvmetStack {
         ))
     }
 
+    /// The nvmet arm of `target setup`/`target start` (§6.2: "modprobe +
+    /// configfs mount checks" / "configfs is the running target") —
+    /// public face of the preflight tree check for the verb layer.
+    pub fn ensure_ready(&self) -> Result<(), PreflightError> {
+        self.ensure_tree()
+    }
+
     fn subsystems_dir(&self) -> PathBuf {
         self.configfs_root.join("subsystems")
     }

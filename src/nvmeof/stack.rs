@@ -24,9 +24,11 @@
 //! populate: required fields plus `loop_device`; everything else stays
 //! null because the pre-rebuild share paths stamp/pin nothing.
 //!
-//! (`TargetStack`/`ShareRequest`/`TargetStatus` — the trait surface this
-//! file is named for — land with the stack rebuilds at N2+; defining
-//! them now would be dead code.)
+//! From N2 on this file also carries the finalized **`TargetStack`
+//! trait** (§6.1) and its request/report vocabulary: small, synchronous
+//! one-shot control-plane verbs (the `ReservationClient` precedent) with
+//! injectable seams instead of env-var mocks. `NvmetStack`
+//! (`super::nvmet`) implements it; `SpdkStack` follows at N3/N4.
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -115,6 +117,13 @@ pub struct ShareRecord {
     #[serde(default)]
     pub loop_device: Option<String>,
     pub created_utc: String,
+    /// `--allow-host` allowlist (§Security), recorded so `restore`
+    /// re-presents it — a restored share must never silently widen to
+    /// allow-any. Absent (not `[]`) on allow-any shares, so records
+    /// without an allowlist stay byte-compatible with N1 readers
+    /// (schema-visible v1 addition at N2, the `adopted_from` pattern).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted_from: Option<AdoptedFrom>,
 }
@@ -152,6 +161,177 @@ impl ShareRecord {
         if self.listeners.iter().any(|l| l.ip.is_empty()) {
             return fail("listener with empty ip");
         }
+        if self.allow_hosts.iter().any(|h| h.is_empty()) {
+            return fail("allow_hosts entry with empty host NQN");
+        }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// The TargetStack trait + verb vocabulary (§6.1, finalized at N2)
+// ---------------------------------------------------------------------------
+
+/// The verb a preflight ladder is gating (§6.2: every verb runs the
+/// selected stack's preflight first; failures are structured, ordered,
+/// and name the remediation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreflightOp {
+    Share,
+    Unshare,
+    List,
+    Restore,
+}
+
+/// A loud, actionable preflight failure. `Display` renders the full
+/// designed message — the error text IS the runbook (§6.2/§6.3), and it
+/// never suggests falling back to the other stack as an automatic action.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct PreflightError {
+    pub message: String,
+}
+
+/// Module-local CLI-facing error (design §API: thiserror, never
+/// FUSE-errno-mapped — nothing on the FUSE path constructs it).
+#[derive(Debug, thiserror::Error)]
+pub enum NvmeofError {
+    #[error("{0}")]
+    Preflight(#[from] PreflightError),
+    /// A loud refusal whose message is the runbook: it names the holder /
+    /// classification / remediation steps (§6.4 duplicate guard, §6.6
+    /// port-range exhaustion, ownership refusals, per-stack flag
+    /// semantics).
+    #[error("{0}")]
+    Refused(String),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
+
+/// What a stack needs to establish one share. Built by the verb layer
+/// (`super::share`) after grammar validation, backing preparation, and
+/// identity resolution — the stack performs target mutations and rides
+/// the ledger intent protocol.
+#[derive(Debug, Clone)]
+pub struct ShareRequest {
+    pub subnqn: String,
+    pub backing_path: String,
+    pub backing_canonical: String,
+    /// The both-stack namespace identity (§6.4): seeded by `--ns-uuid`
+    /// or generated once at share time — recorded, stamped
+    /// (nvmet `device_uuid` / SPDK `add_ns -u`), re-presented by restore.
+    pub ns_uuid: String,
+    /// One (ip, port) per listener; `nvmet_port_id` is allocated by the
+    /// nvmet stack and recorded (`None` on entry).
+    pub listeners: Vec<Listener>,
+    /// `--allow-host` allowlist; empty = allow-any (the trusted-fabric
+    /// default, stated loudly in docs).
+    pub allow_hosts: Vec<String>,
+}
+
+/// One live share as the stack reports it (configfs walk / RPC
+/// `nvmf_get_subsystems`) — reconciled against the ledger by `list`.
+#[derive(Debug, Clone)]
+pub struct LiveShare {
+    pub subnqn: String,
+    /// The device the target serves (nvmet `device_path`; may be a loop
+    /// node for file backings).
+    pub device_path: String,
+    /// `device_path` resolved toward the operator's backing: loop nodes
+    /// resolve to their backing file when the kernel exposes it.
+    pub backing_canonical: String,
+    pub ns_uuid: Option<String>,
+    pub listeners: Vec<Listener>,
+    pub enabled: bool,
+}
+
+/// Per-record outcome of a `restore` replay (§6.4 laws 4 + 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// Ledger record's live objects were gone — re-established,
+    /// re-presenting the recorded identity.
+    Restored,
+    /// Already live and matching (`device_path` **and** `device_uuid`) —
+    /// verified no-op.
+    VerifiedNoop,
+    /// Crash-window `pending` intent whose live objects exist — finalized
+    /// `active`.
+    FinalizedPending,
+    /// Crash-window `pending` intent with no live objects — the
+    /// interrupted share never completed; record garbage-collected loud.
+    GarbageCollectedPending,
+    /// `removing` intent — the interrupted teardown was resumed and the
+    /// record deleted.
+    TeardownResumed,
+    /// Not replayed, with the loud reason (e.g. an SPDK-stack record at a
+    /// milestone where SPDK restore is not yet live).
+    Skipped(String),
+    /// Loud per-record failure (collected, never short-circuiting the
+    /// report) — e.g. existing-but-mismatched live state, never clobbered.
+    Failed(String),
+}
+
+/// One `restore` report line.
+#[derive(Debug, Clone)]
+pub struct RestoreEntry {
+    pub subnqn: String,
+    pub outcome: RestoreOutcome,
+}
+
+/// The `restore` verb's per-share result report (a report, not a
+/// first-failure bail — §6.1).
+#[derive(Debug, Clone, Default)]
+pub struct RestoreReport {
+    pub entries: Vec<RestoreEntry>,
+}
+
+impl RestoreReport {
+    pub fn failures(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| matches!(e.outcome, RestoreOutcome::Failed(_)))
+            .count()
+    }
+}
+
+/// Stack health/inventory snapshot (§6.9). N2 carries the nvmet variant's
+/// fields (module presence, configfs, object counts, per-ns PR
+/// enablement); the SPDK lifecycle PR (N3) extends the payload.
+#[derive(Debug, Clone)]
+pub struct TargetStatus {
+    pub stack: StackKind,
+    pub modules_present: bool,
+    pub configfs_mounted: bool,
+    pub subsystems: usize,
+    pub namespaces: usize,
+    pub ports: usize,
+    pub resv_enabled_namespaces: usize,
+}
+
+/// One NVMe-oF target stack the product can manage (§6.1). Implementations:
+/// `NvmetStack` (kernel configfs, N2) and `SpdkStack` (JSON-RPC to
+/// spdk_tgt, N3/N4). Methods are synchronous one-shot control-plane
+/// operations (CLI-driven).
+pub trait TargetStack: Send + Sync {
+    fn kind(&self) -> StackKind;
+
+    /// Loud, actionable, ordered checks. Every error names its remediation
+    /// verb. NEVER returns a suggestion to fall back to the other stack as
+    /// an automatic action — only as an explicit operator choice in text.
+    fn preflight(&self, op: PreflightOp) -> Result<(), PreflightError>;
+
+    fn share(&self, req: &ShareRequest) -> Result<ShareRecord, NvmeofError>;
+    fn unshare(&self, rec: &ShareRecord) -> Result<(), NvmeofError>;
+
+    /// Live state as the stack reports it (RPC get_subsystems / configfs
+    /// walk) — reconciled against the ledger by `list`
+    /// (managed / down / foreign).
+    fn live_shares(&self) -> Result<Vec<LiveShare>, NvmeofError>;
+
+    /// Re-establish every ledger share (idempotent; per-share errors are
+    /// collected, not short-circuited — a report, not a first-failure
+    /// bail).
+    fn restore(&self, recs: &[ShareRecord]) -> Result<RestoreReport, NvmeofError>;
+
+    fn target_status(&self) -> Result<TargetStatus, NvmeofError>;
 }

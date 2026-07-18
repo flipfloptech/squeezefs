@@ -39,6 +39,7 @@ fn rec(subnqn: &str, stack: StackKind, backing: &str) -> ShareRecord {
         ptpl_file: None,
         loop_device: None,
         created_utc: "2026-07-17T00:00:00Z".to_string(),
+        allow_hosts: Vec::new(),
         adopted_from: None,
     }
 }
@@ -367,6 +368,7 @@ fn test_ledger_field_presence_rules() {
         ptpl_file: Some("spdk/ptpl/e2b1c9a4-52d1-4a08-9f31-7c2b8d1e0aa1.json".to_string()),
         loop_device: Some("/dev/loop7".to_string()),
         created_utc: "2026-07-17T14:02:11Z".to_string(),
+        allow_hosts: vec!["nqn.2014-08.org.nvmexpress:uuid:allowed-1".to_string()],
         adopted_from: Some(AdoptedFrom {
             utc: "2026-07-18T09:00:00Z".to_string(),
             class: AdoptClass::LedgerLoss,
@@ -397,6 +399,11 @@ fn test_ledger_field_presence_rules() {
     assert!(
         !obj.contains_key("adopted_from"),
         "adopted_from must be absent (not null) on shares created by share"
+    );
+    assert!(
+        !obj.contains_key("allow_hosts"),
+        "allow_hosts must be absent (not []) on allow-any shares — records \
+         without an allowlist stay byte-compatible with N1 readers"
     );
 }
 
@@ -691,6 +698,7 @@ fn arb_record(idx: usize) -> impl Strategy<Value = ShareRecord> {
         proptest::option::of("bdev_[a-z0-9]{6}"),
         proptest::option::of("spdk/ptpl/[a-f0-9]{8}\\.json"),
         proptest::option::of("/dev/loop[0-9]{1,2}"),
+        proptest::collection::vec("nqn\\.host:[a-z0-9]{4}", 0..3),
         proptest::option::of((
             Just("2026-07-18T00:00:00Z".to_string()),
             prop_oneof![
@@ -710,6 +718,7 @@ fn arb_record(idx: usize) -> impl Strategy<Value = ShareRecord> {
                 bdev_name,
                 ptpl_file,
                 loop_device,
+                allow_hosts,
                 adopted,
             )| {
                 ShareRecord {
@@ -732,6 +741,7 @@ fn arb_record(idx: usize) -> impl Strategy<Value = ShareRecord> {
                     ptpl_file,
                     loop_device,
                     created_utc: "2026-07-17T00:00:00Z".to_string(),
+                    allow_hosts,
                     adopted_from: adopted.map(|(utc, class)| AdoptedFrom { utc, class }),
                 }
             },

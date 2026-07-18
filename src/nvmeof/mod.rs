@@ -32,6 +32,7 @@
 pub mod initiator;
 pub mod ledger;
 pub mod nocow;
+pub mod nvmet;
 pub mod stack;
 
 pub use initiator::{connect_target, disconnect_target};
@@ -43,7 +44,7 @@ use std::process::Command;
 use uuid::Uuid;
 
 use ledger::Ledger;
-use stack::{Listener, ShareRecord, ShareState};
+use stack::{Listener, NvmeofError, ShareRecord, ShareState};
 
 /// Which target stack owns a share for its lifetime
 /// (`docs/design-nvmeof-target-management.md` §6.1/§6.4 — the ledger's
@@ -63,6 +64,109 @@ impl StackKind {
             StackKind::Nvmet => "nvmet",
         }
     }
+}
+
+impl std::str::FromStr for StackKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "spdk" => Ok(StackKind::Spdk),
+            "nvmet" => Ok(StackKind::Nvmet),
+            other => Err(format!(
+                "unknown target stack '{other}' (expected 'spdk' or 'nvmet')"
+            )),
+        }
+    }
+}
+
+/// Env half of the §6.2 stack-selection resolution order
+/// (`--target-stack` flag > this env > default `spdk`).
+pub const TARGET_STACK_ENV: &str = "SQUEEZEFS_NVMEOF_TARGET_STACK";
+
+/// §6.2 stack-selection resolution: flag > `SQUEEZEFS_NVMEOF_TARGET_STACK`
+/// > default `spdk`. An unparseable env value refuses loud — never a
+/// silent default.
+pub fn resolve_stack(flag: Option<StackKind>) -> Result<StackKind, NvmeofError> {
+    let _ = flag;
+    unimplemented!("PR 2 (N2) RED: resolve_stack")
+}
+
+/// §6.2 per-stack flag semantics (rev-3 issue 23): `--ns-uuid` seeds the
+/// recorded namespace identity on BOTH stacks and must parse as a UUID;
+/// `--nsid` is SPDK-only — the nvmet namespace index is structurally
+/// fixed at 1, so `--nsid` ≠ 1 with nvmet refuses loud (the
+/// `--disk-cache-paths` precedent: never a silent flag-ignore).
+pub fn validate_share_flags(
+    stack: StackKind,
+    nsid: Option<u32>,
+    ns_uuid: Option<&str>,
+) -> Result<(), NvmeofError> {
+    let _ = (stack, nsid, ns_uuid);
+    unimplemented!("PR 2 (N2) RED: validate_share_flags")
+}
+
+/// §6.2 backing preparation (both stacks): a missing path refuses loud
+/// (the silent 1 GiB sparse auto-create is dead — `--create-size` is the
+/// explicit opt-in), directories refuse, and regular-file backings get
+/// the NoCOW guard.
+pub fn prepare_backing(backing_path: &str, create_size: Option<u64>) -> io::Result<()> {
+    let _ = (backing_path, create_size);
+    unimplemented!("PR 2 (N2) RED: prepare_backing")
+}
+
+/// Everything the `nvmeof share` verb collects from the CLI (§6.2 share
+/// row).
+#[derive(Debug, Clone)]
+pub struct ShareOptions {
+    pub backing_path: String,
+    pub subnqn: Option<String>,
+    pub port: u16,
+    pub ips: Vec<String>,
+    /// `--target-stack` (resolution: flag > env > default `spdk`).
+    pub stack: Option<StackKind>,
+    /// SPDK-only (§6.2); `Some(n)` with `n != 1` on nvmet refuses loud.
+    pub nsid: Option<u32>,
+    /// Seeds the recorded both-stack namespace identity; generated when
+    /// absent.
+    pub ns_uuid: Option<String>,
+    /// Explicit opt-in size (bytes) for creating a missing file backing.
+    pub create_size: Option<u64>,
+    /// Host-NQN allowlist; empty = allow-any (trusted-fabric default).
+    pub allow_hosts: Vec<String>,
+}
+
+/// The `nvmeof share` verb (§6.2): grammar validation → stack resolution
+/// (SPDK fails loud until N3/N4) → root → backing preparation → the
+/// selected stack's share flow (intent protocol + live-state duplicate
+/// guard inside).
+pub fn share(opts: &ShareOptions) -> Result<ShareRecord, NvmeofError> {
+    let _ = opts;
+    unimplemented!("PR 2 (N2) RED: share")
+}
+
+/// The `nvmeof unshare` verb (§6.2): stack resolved from the ledger —
+/// including `pending`/`removing` intent records; an NQN absent from the
+/// ledger refuses loud with `list` guidance (we never tear down objects
+/// we did not record).
+pub fn unshare(subnqn: &str) -> Result<(), NvmeofError> {
+    let _ = subnqn;
+    unimplemented!("PR 2 (N2) RED: unshare")
+}
+
+/// The `nvmeof list` verb (§6.2): ledger ∪ live-state reconciliation —
+/// managed / down / pending / removing / foreign — plus the kept
+/// connected-fabric-disks section.
+pub fn list(json: bool) -> Result<(), NvmeofError> {
+    let _ = json;
+    unimplemented!("PR 2 (N2) RED: list")
+}
+
+/// The `nvmeof restore` verb (§6.2): bare replays EVERY ledger record
+/// into its recorded stack; `--target-stack X` filters, never retargets.
+/// Reconciles §6.4 law-6 intents; per-share report; idempotent.
+pub fn restore(filter: Option<StackKind>) -> Result<(), NvmeofError> {
+    let _ = filter;
+    unimplemented!("PR 2 (N2) RED: restore")
 }
 
 pub(crate) fn is_mock() -> bool {
@@ -197,6 +301,7 @@ fn pending_record(
         ptpl_file: None,
         loop_device: None,
         created_utc: ledger::utc_now_rfc3339(),
+        allow_hosts: Vec::new(),
         adopted_from: None,
     }
 }

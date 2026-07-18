@@ -285,6 +285,7 @@ fn test_nvmeof_ledger_restore_reconciles_intents() {
         ptpl_file: None,
         loop_device: None,
         created_utc: "2026-07-17T00:00:00Z".to_string(),
+        allow_hosts: Vec::new(),
         adopted_from: None,
     };
     ledger.begin_share(&pending_gc).expect("begin pending-gc");

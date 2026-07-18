@@ -620,8 +620,16 @@ pub struct LoadConfigReport {
     pub skipped: Vec<String>,
 }
 
-fn rpc_methods(client: &SpdkRpcClient) -> Result<HashSet<String>, NvmeofError> {
-    let methods = client.call("rpc_get_methods", None).map_err(rpc_err)?;
+/// The methods callable in the target's CURRENT RPC state. The
+/// `current: true` parameter is load-bearing (FIND-N3-A, caught by the
+/// N3 root-tier gate): without it a RUNTIME target lists ALL methods —
+/// including STARTUP-only entries a real `save_config` captures (e.g.
+/// `sock_set_default_impl`) — and replaying one errors with "Method may
+/// only be called before framework is initialized".
+fn rpc_methods_current(client: &SpdkRpcClient) -> Result<HashSet<String>, NvmeofError> {
+    let methods = client
+        .call("rpc_get_methods", Some(json!({ "current": true })))
+        .map_err(rpc_err)?;
     Ok(methods
         .as_array()
         .map(|arr| {
@@ -633,9 +641,12 @@ fn rpc_methods(client: &SpdkRpcClient) -> Result<HashSet<String>, NvmeofError> {
         .unwrap_or_default())
 }
 
-/// Replay a saved config into the running target (the rpc.py
-/// `load_config` algorithm: `rpc_get_methods` gate, pass loop,
-/// `framework_start_init` handling), collecting a loud report. A replayed
+/// Replay a saved config into the running target — the rpc.py
+/// `load_config` algorithm verbatim: re-query `rpc_get_methods
+/// {current: true}` at the top of every pass, replay the entries that
+/// state allows, kick `framework_start_init` when it is callable (a
+/// `--wait-for-rpc` STARTUP target), stop when a pass makes no progress;
+/// leftovers are reported loud, never silently dropped. A replayed
 /// method failing is a hard error — the caller owns the blast radius.
 pub fn load_config(
     client: &SpdkRpcClient,
@@ -664,9 +675,9 @@ pub fn load_config(
         })
         .unwrap_or_default();
 
-    let mut allowed = rpc_methods(client)?;
     let mut report = LoadConfigReport::default();
-    loop {
+    while !subsystems.is_empty() {
+        let allowed = rpc_methods_current(client)?;
         let mut progressed = false;
         for (_, entries) in subsystems.iter_mut() {
             let mut remaining = Vec::with_capacity(entries.len());
@@ -693,14 +704,11 @@ pub fn load_config(
             *entries = remaining;
         }
         subsystems.retain(|(_, cfg)| !cfg.is_empty());
-        if subsystems.is_empty() {
-            break;
-        }
         // A target started --wait-for-rpc parks in STARTUP state; kicking
-        // framework_start_init unlocks the runtime methods (rpc.py parity).
+        // framework_start_init unlocks the runtime methods (rpc.py
+        // parity); the next pass re-queries the current-state methods.
         if allowed.contains("framework_start_init") {
             client.call("framework_start_init", None).map_err(rpc_err)?;
-            allowed = rpc_methods(client)?;
             progressed = true;
         }
         if !progressed {
@@ -805,7 +813,12 @@ fn verify_checkout(src: &Path) -> Result<(), NvmeofError> {
             src.parent().unwrap_or(src).display()
         )));
     }
-    let dirt = git_output(src, &["status", "--porcelain"])?;
+    // `--ignore-submodules=dirty` is deliberate (FIND-N3-B, caught by the
+    // N3 root-tier gate): building SPDK leaves byproducts INSIDE its
+    // submodule trees (isa-l et al. report "M <submodule>" forever after
+    // one make) — those are build dirt, not source changes. A submodule
+    // whose recorded COMMIT moved still reports, and still refuses.
+    let dirt = git_output(src, &["status", "--porcelain", "--ignore-submodules=dirty"])?;
     if !dirt.is_empty() {
         return Err(NvmeofError::Refused(format!(
             "target install: existing checkout {} is DIRTY — refusing to build unverifiable \

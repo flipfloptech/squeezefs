@@ -2619,3 +2619,108 @@ mod tests {
         );
     }
 }
+
+/// L3 lever C (transport economy): the session's inbound pull must be pure
+/// event-driven — no poll cadence, no timer registration per pull. The
+/// M4→M10 hand-off measured the 200 ms `pop_timeout` churn at ~2.2 % clock
+/// (per-pull timer registration + time-driver park, one `epoll_wait`/op).
+#[cfg(test)]
+mod inbound_queue_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn req(unique: u64) -> InboundUringReq {
+        InboundUringReq {
+            header_and_op: vec![0; 40],
+            payload: Bytes::new(),
+            unique,
+        }
+    }
+
+    /// Push→pop delivery order and payload identity (pin: the pull-path
+    /// rework must not reorder or drop).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pop_delivers_pushed_requests_in_order() {
+        let q = InboundQueue::new();
+        let active = AtomicBool::new(true);
+        q.push(req(7));
+        q.push(req(8));
+        let a = q
+            .pop_timeout(&active, Duration::from_millis(200))
+            .await
+            .expect("first pushed request");
+        let b = q
+            .pop_timeout(&active, Duration::from_millis(200))
+            .await
+            .expect("second pushed request");
+        assert_eq!((a.unique, b.unique), (7, 8), "FIFO delivery");
+    }
+
+    /// A parked popper is woken by a push promptly (event-driven, not on a
+    /// poll boundary).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pop_wakes_promptly_for_late_push() {
+        let q = Arc::new(InboundQueue::new());
+        let active = Arc::new(AtomicBool::new(true));
+        let popper = tokio::spawn({
+            let q = Arc::clone(&q);
+            let active = Arc::clone(&active);
+            async move {
+                let t0 = Instant::now();
+                let r = q.pop_timeout(&active, Duration::from_millis(200)).await;
+                (r, t0.elapsed())
+            }
+        });
+        // Wait until the popper holds the rx lock (= it is inside pop).
+        while q.rx.try_lock().is_ok() {
+            tokio::task::yield_now().await;
+        }
+        q.push(req(42));
+        let (r, elapsed) = popper.await.expect("popper task");
+        assert_eq!(r.expect("pushed request").unique, 42);
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "push-to-delivery took {elapsed:?} — the pull path is parked on a \
+             poll cadence instead of the channel wake"
+        );
+    }
+
+    /// THE lever-C contract: shutdown wakes a parked popper immediately —
+    /// `active = false` + the shutdown wake must produce `None` in
+    /// event-time, never after sleeping out a poll interval. (The retired
+    /// 200 ms `pop_timeout` fails this by construction: its shutdown
+    /// "wake" was a no-op `notify_all`, so a parked popper always slept
+    /// the full timeout.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pop_returns_none_promptly_on_shutdown() {
+        let q = Arc::new(InboundQueue::new());
+        let active = Arc::new(AtomicBool::new(true));
+        let popper = tokio::spawn({
+            let q = Arc::clone(&q);
+            let active = Arc::clone(&active);
+            async move { q.pop_timeout(&active, Duration::from_millis(200)).await }
+        });
+        // Wait until the popper holds the rx lock (= it is inside pop)…
+        while q.rx.try_lock().is_ok() {
+            tokio::task::yield_now().await;
+        }
+        // …then a scheduling grace so it is PARKED (past its active check)
+        // before the shutdown fires. Not synchronization — the assertion
+        // clock starts after it, and it only makes the test stricter: a
+        // poll-based pull now provably sleeps out its interval.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let t0 = Instant::now();
+        // Exactly what FuseOverUring::shutdown does for the session path.
+        active.store(false, Ordering::Release);
+        q.notify_all();
+        let r = popper.await.expect("popper task");
+        let elapsed = t0.elapsed();
+        assert!(r.is_none(), "shutdown pop must drain to None");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "shutdown-to-None took {elapsed:?} — the session pull path is \
+             poll-based (timer park), not event-driven"
+        );
+    }
+}

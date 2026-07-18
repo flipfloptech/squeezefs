@@ -117,13 +117,19 @@ version = "1.36"
 features = [
     "fs",
     "rt",
+    # The multi-thread runtime the crate's own async tests run on (house
+    # rule: async tests use the multi_thread flavor to expose data races).
+    # The consuming daemon enables it anyway; this keeps the standalone
+    # `cargo test` of the fork honest instead of riding downstream feature
+    # unification.
+    "rt-multi-thread",
     "sync",
     "net",
     "macros",
     "process",
-    # The crate itself uses tokio::time (over-uring inbound timeout, session
-    # retry sleeps); without this the standalone `cargo test` of the vendored
-    # crate only compiled via downstream feature unification.
+    # The crate itself uses tokio::time (session retry sleeps); without this
+    # the standalone `cargo test` of the vendored crate only compiled via
+    # downstream feature unification.
     "time",
 ]
 optional = true

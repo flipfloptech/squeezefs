@@ -1245,155 +1245,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             init_flags2,
         ));
 
-        let mut reply_flags = 0;
-
-        // TODO: most of these FUSE_* flags should be controllable by the consuming crate.
-        if init_in.flags & FUSE_ASYNC_READ > 0 {
-            debug!("enable FUSE_ASYNC_READ");
-
-            reply_flags |= FUSE_ASYNC_READ;
-        }
-
-        #[cfg(feature = "file-lock")]
-        if init_in.flags & FUSE_POSIX_LOCKS > 0 {
-            debug!("enable FUSE_POSIX_LOCKS");
-
-            reply_flags |= FUSE_POSIX_LOCKS;
-        }
-
-        if init_in.flags & FUSE_FILE_OPS > 0 {
-            debug!("enable FUSE_FILE_OPS");
-
-            reply_flags |= FUSE_FILE_OPS;
-        }
-
-        if init_in.flags & FUSE_ATOMIC_O_TRUNC > 0 {
-            debug!("enable FUSE_ATOMIC_O_TRUNC");
-
-            reply_flags |= FUSE_ATOMIC_O_TRUNC;
-        }
-
-        if init_in.flags & FUSE_EXPORT_SUPPORT > 0 {
-            debug!("enable FUSE_EXPORT_SUPPORT");
-
-            reply_flags |= FUSE_EXPORT_SUPPORT;
-        }
-
-        if init_in.flags & FUSE_BIG_WRITES > 0 {
-            debug!("enable FUSE_BIG_WRITES");
-
-            reply_flags |= FUSE_BIG_WRITES;
-        }
-
-        if init_in.flags & FUSE_DONT_MASK > 0 && self.mount_options.dont_mask {
-            debug!("enable FUSE_DONT_MASK");
-
-            reply_flags |= FUSE_DONT_MASK;
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        if init_in.flags & FUSE_SPLICE_WRITE > 0 {
-            debug!("enable FUSE_SPLICE_WRITE");
-
-            reply_flags |= FUSE_SPLICE_WRITE;
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        if init_in.flags & FUSE_SPLICE_MOVE > 0 {
-            debug!("enable FUSE_SPLICE_MOVE");
-
-            reply_flags |= FUSE_SPLICE_MOVE;
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        if init_in.flags & FUSE_SPLICE_READ > 0 {
-            debug!("enable FUSE_SPLICE_READ");
-
-            reply_flags |= FUSE_SPLICE_READ;
-        }
-
-        // posix lock used, maybe we don't need bsd lock
-        if init_in.flags & FUSE_FLOCK_LOCKS > 0 {
-            reply_flags |= FUSE_FLOCK_LOCKS;
-        }
-
-        if init_in.flags & FUSE_HAS_IOCTL_DIR > 0 {
-            debug!("enable FUSE_HAS_IOCTL_DIR");
-
-            reply_flags |= FUSE_HAS_IOCTL_DIR;
-        }
-
-        if init_in.flags & FUSE_AUTO_INVAL_DATA > 0 {
-            debug!("enable FUSE_AUTO_INVAL_DATA");
-
-            reply_flags |= FUSE_AUTO_INVAL_DATA;
-        }
-
-        if init_in.flags & FUSE_DO_READDIRPLUS > 0 || self.mount_options.force_readdir_plus {
-            debug!("enable FUSE_DO_READDIRPLUS");
-
-            reply_flags |= FUSE_DO_READDIRPLUS;
-        }
-
-        if init_in.flags & FUSE_READDIRPLUS_AUTO > 0 && !self.mount_options.force_readdir_plus {
-            debug!("enable FUSE_READDIRPLUS_AUTO");
-
-            reply_flags |= FUSE_READDIRPLUS_AUTO;
-        }
-
-        if init_in.flags & FUSE_ASYNC_DIO > 0 {
-            debug!("enable FUSE_ASYNC_DIO");
-
-            reply_flags |= FUSE_ASYNC_DIO;
-        }
-
-        if init_in.flags & FUSE_WRITEBACK_CACHE > 0 && self.mount_options.write_back {
-            debug!("enable FUSE_WRITEBACK_CACHE");
-
-            reply_flags |= FUSE_WRITEBACK_CACHE;
-        }
-
-        if init_in.flags & FUSE_NO_OPEN_SUPPORT > 0 && self.mount_options.no_open_support {
-            debug!("enable FUSE_NO_OPEN_SUPPORT");
-
-            reply_flags |= FUSE_NO_OPEN_SUPPORT;
-        }
-
-        if init_in.flags & FUSE_PARALLEL_DIROPS > 0 {
-            debug!("enable FUSE_PARALLEL_DIROPS");
-
-            reply_flags |= FUSE_PARALLEL_DIROPS;
-        }
-
-        if init_in.flags & FUSE_HANDLE_KILLPRIV > 0 && self.mount_options.handle_killpriv {
-            debug!("enable FUSE_HANDLE_KILLPRIV");
-
-            reply_flags |= FUSE_HANDLE_KILLPRIV;
-        }
-
-        if init_in.flags & FUSE_POSIX_ACL > 0 && self.mount_options.default_permissions {
-            debug!("enable FUSE_POSIX_ACL");
-
-            reply_flags |= FUSE_POSIX_ACL;
-        }
-
-        if init_in.flags & FUSE_MAX_PAGES > 0 {
-            debug!("enable FUSE_MAX_PAGES");
-
-            reply_flags |= FUSE_MAX_PAGES;
-        }
-
-        if init_in.flags & FUSE_CACHE_SYMLINKS > 0 {
-            debug!("enable FUSE_CACHE_SYMLINKS");
-
-            reply_flags |= FUSE_CACHE_SYMLINKS;
-        }
-
-        if init_in.flags & FUSE_NO_OPENDIR_SUPPORT > 0 && self.mount_options.no_open_dir_support {
-            debug!("enable FUSE_NO_OPENDIR_SUPPORT");
-
-            reply_flags |= FUSE_NO_OPENDIR_SUPPORT;
-        }
+        let reply_flags = negotiate_reply_flags(init_in.flags, &self.mount_options);
 
         // TODO: pass init_in to init, so the file system will know which flags are in use.
         let reply = match fs.init(request).await {
@@ -4842,6 +4694,165 @@ thread_local! {
     static PIPE: std::cell::RefCell<Option<ThreadPipe>> = std::cell::RefCell::new(ThreadPipe::new());
 }
 
+/// INIT reply-flags negotiation: the subset of the kernel's offered
+/// `init_in.flags` capabilities this daemon actually implements (mount
+/// options gate the optional ones). Pure — pinned by
+/// `init_negotiation_tests`: a capability the daemon does not implement
+/// must never be advertised back to the kernel.
+fn negotiate_reply_flags(init_in_flags: u32, mount_options: &MountOptions) -> u32 {
+    let mut reply_flags = 0;
+
+    // TODO: most of these FUSE_* flags should be controllable by the consuming crate.
+    if init_in_flags & FUSE_ASYNC_READ > 0 {
+        debug!("enable FUSE_ASYNC_READ");
+
+        reply_flags |= FUSE_ASYNC_READ;
+    }
+
+    #[cfg(feature = "file-lock")]
+    if init_in_flags & FUSE_POSIX_LOCKS > 0 {
+        debug!("enable FUSE_POSIX_LOCKS");
+
+        reply_flags |= FUSE_POSIX_LOCKS;
+    }
+
+    if init_in_flags & FUSE_FILE_OPS > 0 {
+        debug!("enable FUSE_FILE_OPS");
+
+        reply_flags |= FUSE_FILE_OPS;
+    }
+
+    if init_in_flags & FUSE_ATOMIC_O_TRUNC > 0 {
+        debug!("enable FUSE_ATOMIC_O_TRUNC");
+
+        reply_flags |= FUSE_ATOMIC_O_TRUNC;
+    }
+
+    if init_in_flags & FUSE_EXPORT_SUPPORT > 0 {
+        debug!("enable FUSE_EXPORT_SUPPORT");
+
+        reply_flags |= FUSE_EXPORT_SUPPORT;
+    }
+
+    if init_in_flags & FUSE_BIG_WRITES > 0 {
+        debug!("enable FUSE_BIG_WRITES");
+
+        reply_flags |= FUSE_BIG_WRITES;
+    }
+
+    if init_in_flags & FUSE_DONT_MASK > 0 && mount_options.dont_mask {
+        debug!("enable FUSE_DONT_MASK");
+
+        reply_flags |= FUSE_DONT_MASK;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    if init_in_flags & FUSE_SPLICE_WRITE > 0 {
+        debug!("enable FUSE_SPLICE_WRITE");
+
+        reply_flags |= FUSE_SPLICE_WRITE;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    if init_in_flags & FUSE_SPLICE_MOVE > 0 {
+        debug!("enable FUSE_SPLICE_MOVE");
+
+        reply_flags |= FUSE_SPLICE_MOVE;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    if init_in_flags & FUSE_SPLICE_READ > 0 {
+        debug!("enable FUSE_SPLICE_READ");
+
+        reply_flags |= FUSE_SPLICE_READ;
+    }
+
+    // posix lock used, maybe we don't need bsd lock
+    if init_in_flags & FUSE_FLOCK_LOCKS > 0 {
+        reply_flags |= FUSE_FLOCK_LOCKS;
+    }
+
+    if init_in_flags & FUSE_HAS_IOCTL_DIR > 0 {
+        debug!("enable FUSE_HAS_IOCTL_DIR");
+
+        reply_flags |= FUSE_HAS_IOCTL_DIR;
+    }
+
+    if init_in_flags & FUSE_AUTO_INVAL_DATA > 0 {
+        debug!("enable FUSE_AUTO_INVAL_DATA");
+
+        reply_flags |= FUSE_AUTO_INVAL_DATA;
+    }
+
+    if init_in_flags & FUSE_DO_READDIRPLUS > 0 || mount_options.force_readdir_plus {
+        debug!("enable FUSE_DO_READDIRPLUS");
+
+        reply_flags |= FUSE_DO_READDIRPLUS;
+    }
+
+    if init_in_flags & FUSE_READDIRPLUS_AUTO > 0 && !mount_options.force_readdir_plus {
+        debug!("enable FUSE_READDIRPLUS_AUTO");
+
+        reply_flags |= FUSE_READDIRPLUS_AUTO;
+    }
+
+    if init_in_flags & FUSE_ASYNC_DIO > 0 {
+        debug!("enable FUSE_ASYNC_DIO");
+
+        reply_flags |= FUSE_ASYNC_DIO;
+    }
+
+    if init_in_flags & FUSE_WRITEBACK_CACHE > 0 && mount_options.write_back {
+        debug!("enable FUSE_WRITEBACK_CACHE");
+
+        reply_flags |= FUSE_WRITEBACK_CACHE;
+    }
+
+    if init_in_flags & FUSE_NO_OPEN_SUPPORT > 0 && mount_options.no_open_support {
+        debug!("enable FUSE_NO_OPEN_SUPPORT");
+
+        reply_flags |= FUSE_NO_OPEN_SUPPORT;
+    }
+
+    if init_in_flags & FUSE_PARALLEL_DIROPS > 0 {
+        debug!("enable FUSE_PARALLEL_DIROPS");
+
+        reply_flags |= FUSE_PARALLEL_DIROPS;
+    }
+
+    if init_in_flags & FUSE_HANDLE_KILLPRIV > 0 && mount_options.handle_killpriv {
+        debug!("enable FUSE_HANDLE_KILLPRIV");
+
+        reply_flags |= FUSE_HANDLE_KILLPRIV;
+    }
+
+    if init_in_flags & FUSE_POSIX_ACL > 0 && mount_options.default_permissions {
+        debug!("enable FUSE_POSIX_ACL");
+
+        reply_flags |= FUSE_POSIX_ACL;
+    }
+
+    if init_in_flags & FUSE_MAX_PAGES > 0 {
+        debug!("enable FUSE_MAX_PAGES");
+
+        reply_flags |= FUSE_MAX_PAGES;
+    }
+
+    if init_in_flags & FUSE_CACHE_SYMLINKS > 0 {
+        debug!("enable FUSE_CACHE_SYMLINKS");
+
+        reply_flags |= FUSE_CACHE_SYMLINKS;
+    }
+
+    if init_in_flags & FUSE_NO_OPENDIR_SUPPORT > 0 && mount_options.no_open_dir_support {
+        debug!("enable FUSE_NO_OPENDIR_SUPPORT");
+
+        reply_flags |= FUSE_NO_OPENDIR_SUPPORT;
+    }
+
+    reply_flags
+}
+
 fn splice_reply(
     fd: std::os::fd::RawFd,
     header: &[u8],
@@ -4940,6 +4951,70 @@ fn splice_reply(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod init_negotiation_tests {
+    use super::*;
+
+    /// L3 transport-economy lever A: the daemon implements NO splice reply
+    /// path — on an armed FUSE-over-io_uring session every classical splice
+    /// reply for a ring unique bounces off `/dev/fuse` with ENOENT (the
+    /// kernel holds ring uniques in the uring ent, not `fpq->processing`),
+    /// costing a `pipe2+write+vmsplice+splice+2×close+fcntl` block per READ
+    /// reply before the vectored fallback delivers it anyway (measured
+    /// 0.75 blocks/op, 100 % splice error rate —
+    /// `.benchmarks/2026-07-18-l3-transport-economy.md`). A capability the
+    /// daemon does not implement must never be advertised: the splice
+    /// family never echoes, whatever the kernel offers.
+    #[test]
+    fn init_reply_never_advertises_splice() {
+        let opts = MountOptions::default();
+        let flags = negotiate_reply_flags(u32::MAX, &opts);
+        assert_eq!(
+            flags & (FUSE_SPLICE_READ | FUSE_SPLICE_WRITE | FUSE_SPLICE_MOVE),
+            0,
+            "INIT reply advertised FUSE_SPLICE_* but the daemon has no splice \
+             implementation (reply routing is over-uring COMMIT_AND_FETCH + \
+             classical vectored write only)"
+        );
+    }
+
+    /// The negotiation still echoes the capabilities the daemon DOES
+    /// implement (extraction sanity: the splice fix must not eat the rest
+    /// of the capability word).
+    #[test]
+    fn init_reply_echoes_implemented_caps() {
+        let opts = MountOptions::default();
+        let flags = negotiate_reply_flags(u32::MAX, &opts);
+        for (cap, name) in [
+            (FUSE_ASYNC_READ, "FUSE_ASYNC_READ"),
+            (FUSE_PARALLEL_DIROPS, "FUSE_PARALLEL_DIROPS"),
+            (FUSE_MAX_PAGES, "FUSE_MAX_PAGES"),
+            (FUSE_ASYNC_DIO, "FUSE_ASYNC_DIO"),
+            (FUSE_AUTO_INVAL_DATA, "FUSE_AUTO_INVAL_DATA"),
+        ] {
+            assert!(
+                flags & cap > 0,
+                "{name} must echo when the kernel offers it"
+            );
+        }
+        // Option-gated capabilities follow their mount option.
+        assert_eq!(
+            flags & FUSE_WRITEBACK_CACHE,
+            0,
+            "FUSE_WRITEBACK_CACHE requires MountOptions::write_back"
+        );
+        let mut wb = MountOptions::default();
+        wb.write_back(true);
+        assert!(negotiate_reply_flags(u32::MAX, &wb) & FUSE_WRITEBACK_CACHE > 0);
+        // Nothing offered ⇒ nothing echoed (an unforced flag can never appear).
+        assert_eq!(
+            negotiate_reply_flags(0, &MountOptions::default()),
+            0,
+            "no kernel-offered capability may be invented by the daemon"
+        );
+    }
 }
 
 #[cfg(test)]

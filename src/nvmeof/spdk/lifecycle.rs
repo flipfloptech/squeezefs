@@ -220,7 +220,7 @@ fn resolve_core_mask(core_mask: Option<String>, cores: Option<u32>) -> Result<St
 // preflight ladder rungs (§6.2/§6.3 — the G3 loud-fail matrix)
 // ---------------------------------------------------------------------------
 
-const NO_FALLBACK_NOTE: &str = "note: SqueezeFS never falls back between target stacks \
+pub(crate) const NO_FALLBACK_NOTE: &str = "note: SqueezeFS never falls back between target stacks \
                                 automatically —\n      they differ in reservation persistence \
                                 (PTPL) and latency envelope.";
 

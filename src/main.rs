@@ -596,12 +596,24 @@ enum NvmeofActions {
         /// allow-any — the trusted-fabric posture)
         #[arg(long)]
         allow_host: Vec<String>,
+        /// Proceed against an SPDK target whose version drifts from the
+        /// pin (SPDK-only; refuses loud with --target-stack nvmet)
+        #[arg(long)]
+        accept_version_drift: bool,
     },
     /// Stop sharing a target subsystem (stack resolved from the share
     /// ledger — never guessed; unledgered NQNs refuse loud)
     Unshare {
         /// Subsystem NQN to unshare
         subnqn: String,
+        /// Tear down even with live initiator connections (the SPDK
+        /// stack detects and refuses them without this flag)
+        #[arg(long)]
+        force: bool,
+        /// Proceed against an SPDK target whose version drifts from the
+        /// pin (SPDK-only; refuses loud on nvmet-recorded NQNs)
+        #[arg(long)]
+        accept_version_drift: bool,
     },
     /// List ledgered shares reconciled against live target state
     /// (managed / down / pending / removing / foreign) plus connected
@@ -618,6 +630,10 @@ enum NvmeofActions {
         /// retarget)
         #[arg(long, value_enum)]
         target_stack: Option<TargetStackArg>,
+        /// Proceed against an SPDK target whose version drifts from the
+        /// pin (SPDK-only; refuses loud with --target-stack nvmet)
+        #[arg(long)]
+        accept_version_drift: bool,
     },
     /// Connect local client to a remote NVMe-oF target
     Connect {
@@ -1966,6 +1982,7 @@ fn dispatch_nvmeof(action: NvmeofActions) -> Result<(), squeezefs::nvmeof::stack
             ns_uuid,
             create_size,
             allow_host,
+            accept_version_drift,
         } => {
             let create_size = match create_size {
                 Some(raw) => {
@@ -1987,6 +2004,7 @@ fn dispatch_nvmeof(action: NvmeofActions) -> Result<(), squeezefs::nvmeof::stack
                 ns_uuid,
                 create_size,
                 allow_hosts: allow_host,
+                accept_version_drift,
             })?;
             println!(
                 "Successfully shared '{}' as an NVMe-oF target ({} stack).",
@@ -2007,15 +2025,22 @@ fn dispatch_nvmeof(action: NvmeofActions) -> Result<(), squeezefs::nvmeof::stack
                 record.subnqn
             );
         }
-        NvmeofActions::Unshare { subnqn } => {
-            squeezefs::nvmeof::unshare(&subnqn)?;
+        NvmeofActions::Unshare {
+            subnqn,
+            force,
+            accept_version_drift,
+        } => {
+            squeezefs::nvmeof::unshare(&subnqn, force, accept_version_drift)?;
             println!("Successfully stopped sharing target NQN '{}'.", subnqn);
         }
         NvmeofActions::List { json } => {
             squeezefs::nvmeof::list(json)?;
         }
-        NvmeofActions::Restore { target_stack } => {
-            squeezefs::nvmeof::restore(target_stack.map(Into::into))?;
+        NvmeofActions::Restore {
+            target_stack,
+            accept_version_drift,
+        } => {
+            squeezefs::nvmeof::restore(target_stack.map(Into::into), accept_version_drift)?;
         }
         NvmeofActions::Connect { ip, port, subnqn } => {
             println!("Connecting to NVMe-oF target at {}:{}...", ip, port);

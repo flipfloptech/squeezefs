@@ -501,13 +501,18 @@ probe_cages() {
     [ "$CAGES_OK" = "1" ] || log "WARN: systemd-run cages unavailable — daemons run UNCAGED (memcg budgets unenforced)"
 }
 
-cage_cmd() { # <memmax_mb> <unit_suffix> -> fills CAGE_ARGV array
-    local memmax_mb="$1" suffix="$2"
+cage_cmd() { # <memmax_mb> <unit_suffix> [memhigh_mb] -> fills CAGE_ARGV array
+    # memhigh (MemoryHigh) reclaim-throttles instead of OOM-killing — the
+    # page-cache-defeat mechanism for R2 STORE processes (full-run finding:
+    # a 2G MemoryMax on RustFS OOM-killed it mid write flood; the goal is
+    # forcing device serve, not killing the store).
+    local memmax_mb="$1" suffix="$2" memhigh_mb="${3:-}"
     CAGE_ARGV=()
     if [ "$CAGES_OK" = "1" ]; then
         CAGE_ARGV=(systemd-run --quiet --collect --scope
             --unit "sqzsb-${suffix}-$$-$(date +%s%N)"
             -p "MemoryMax=${memmax_mb}M" -p MemorySwapMax=0)
+        [ -n "$memhigh_mb" ] && CAGE_ARGV+=(-p "MemoryHigh=${memhigh_mb}M")
         [ "$(id -u)" -ne 0 ] && CAGE_ARGV+=(--user)
     fi
 }
@@ -827,12 +832,12 @@ SWFS_CACHE="$SWFS_DIR/mount_cache"
 SWFS_SRV_PID=""
 SWFS_MNT_PID=""
 
-swfs_server_start() { # <tag> <cage_mb>
-    local tag="$1" memmax="$2" i
+swfs_server_start() { # <tag> <cage_mb> [memhigh_mb]
+    local tag="$1" memmax="$2" memhigh="${3:-}" i
     local logf="$ART/logs/swfs_server_${tag}.log"
     rm -rf "$SWFS_DIR"
     mkdir -p "$SWFS_DIR/data" "$SWFS_CACHE" "$SWFS_MNT"
-    cage_cmd "$memmax" "swfs-srv-$tag"
+    cage_cmd "$memmax" "swfs-srv-$tag" "$memhigh"
     pin_cmd
     (cd "$SWFS_DIR" && "${CAGE_ARGV[@]}" "${PIN_ARGV[@]}" nohup "$WEED_BIN" server \
         -dir="$SWFS_DIR/data" -ip=127.0.0.1 -master.peers=none \
@@ -900,12 +905,12 @@ swfs_umount() {
 RUSTFS_DIR="$SUBSTRATE/rustfs"
 RUSTFS_PID=""
 
-rustfs_start() { # <tag> <cage_mb>
-    local tag="$1" memmax="$2" i
+rustfs_start() { # <tag> <cage_mb> [memhigh_mb]
+    local tag="$1" memmax="$2" memhigh="${3:-}" i
     local logf="$ART/logs/rustfs_${tag}.log"
     rm -rf "$RUSTFS_DIR"
     mkdir -p "$RUSTFS_DIR/data"
-    cage_cmd "$memmax" "rustfs-$tag"
+    cage_cmd "$memmax" "rustfs-$tag" "$memhigh"
     pin_cmd
     RUSTFS_ACCESS_KEY="$S3_AK" RUSTFS_SECRET_KEY="$S3_SK" \
         "${CAGE_ARGV[@]}" "${PIN_ARGV[@]}" nohup "$RUSTFS_BIN" server \
@@ -1134,7 +1139,7 @@ parse_elbencho() { # <file> <OP> <KEY> -> value (LAST DONE column) or "NA"
 # (no quiet gate in between); prints total seconds + component split.
 durability_pass() { # <mnt> <pfx> -> echoes elapsed seconds ("NA" on failure)
     local mnt="$1" pfx="$2"
-    python3 - "$mnt" "$SUBSTRATE" "${DATA_FILES[@]}" <<'EOF' >"$pfx.durable" 2>&1
+    timeout -k 10 "$ROW_TIMEOUT" python3 - "$mnt" "$SUBSTRATE" "${DATA_FILES[@]}" <<'EOF' >"$pfx.durable" 2>&1
 import ctypes, os, sys, time
 mnt, substrate, files = sys.argv[1], sys.argv[2], sys.argv[3:]
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -1492,8 +1497,10 @@ sys_format() { # <regime> <system> <tag> -> nonzero on failure (refs only)
     jfs) jfs_format "$tag" ;;
     swfs)
         swfs_server_stop
+        # R2: MemoryHigh reclaim-cage on the store (page-cache defeat without
+        # OOM-killing a process that legitimately buffers a 16 GiB flood).
         if [ "$regime" = "R2" ]; then
-            swfs_server_start "$tag" "$R2_REF_CAGE_MB"
+            swfs_server_start "$tag" "$CAGE_MB" "$R2_REF_CAGE_MB"
         else
             swfs_server_start "$tag" "$CAGE_MB"
         fi
@@ -1501,7 +1508,7 @@ sys_format() { # <regime> <system> <tag> -> nonzero on failure (refs only)
     gee | mps3)
         rustfs_stop
         if [ "$regime" = "R2" ]; then
-            rustfs_start "$tag" "$R2_REF_CAGE_MB" || return 1
+            rustfs_start "$tag" "$CAGE_MB" "$R2_REF_CAGE_MB" || return 1
         else
             rustfs_start "$tag" "$CAGE_MB" || return 1
         fi

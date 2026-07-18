@@ -149,7 +149,16 @@ run() {
 }
 is_mounted() { awk -v m="$MNT" '$2==m{f=1} END{exit !f}' /proc/mounts; }
 daemon_pid() { pgrep -f "squeezefs.*mount sqmeta://$META" | head -1; }
-mount_it()   { RUST_LOG=info run "$SQZ" --log-file "$DLOG" mount "sqmeta://$META" "$MNT" --daemon --allow-other; }
+mount_it() {
+    # Drain the udev queue first: our own wipe/format write-then-close fires
+    # a `change` uevent, and systemd-udevd holds a BSD flock on the block
+    # node while re-probing it (systemd BLOCK_DEVICE_LOCKING) — colliding
+    # with the guard's Layer-A LOCK_EX|LOCK_NB and refusing the mount as
+    # "another squeezefs process holds the writer lock". Settling is causal
+    # (never a retry that could mask a REAL double-mount refusal).
+    udevadm settle --timeout=10 2>/dev/null || true
+    RUST_LOG=info run "$SQZ" --log-file "$DLOG" mount "sqmeta://$META" "$MNT" --daemon --allow-other
+}
 wait_mounted() {
     local i
     for i in $(seq 1 60); do

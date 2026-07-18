@@ -2868,6 +2868,15 @@ impl SqueezefsFilesystem {
         let t_classical_sideband = fuse3::over_uring_classical_sideband();
         #[cfg(not(target_os = "linux"))]
         let t_classical_sideband = 0u64;
+        // L3 lever B wake economy: queue-eventfd writes performed vs elided
+        // by the per-queue coalescer (submit_reply + lease-drop sites).
+        // writes/(writes+elided) ≈ 1 under saturated load means the
+        // coalescer stopped eliding — the pre-L3 1.67 eventfd writes/op
+        // posture.
+        #[cfg(target_os = "linux")]
+        let (t_wake_writes, t_wakes_elided) = fuse3::transport_wake_stats();
+        #[cfg(not(target_os = "linux"))]
+        let (t_wake_writes, t_wakes_elided) = (0u64, 0u64);
         // D3.a (design-metadata-throughput §5.3/§9): COMMIT_AND_FETCH SQEs
         // per queue-worker ring flush. Mean batch (commits / flushes) ≈ 1
         // under storm load means the S2 submit batching regressed to
@@ -3108,6 +3117,8 @@ impl SqueezefsFilesystem {
                 "transport_commit_batch": serde_json::Value::Object(t_cb_hist),
                 "transport_commit_batch_flushes": t_cb_flushes,
                 "transport_commit_batch_commits": t_cb_commits,
+                "transport_wake_writes": t_wake_writes,
+                "transport_wakes_elided": t_wakes_elided,
                 // PR 6 / N6 (design-nvmeof-target-management §6.9): the
                 // fabric_* family — box-wide sysfs controller-state
                 // sample published by the 10 s sampler task

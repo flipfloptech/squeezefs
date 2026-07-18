@@ -34,7 +34,8 @@ pub use raw::{tpc_spawn, tpc_thread_count};
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use raw::{
     over_uring_classical_sideband, over_uring_commit_batch_stats, over_uring_geometry,
-    over_uring_sessions_active, over_uring_stats, transport_lease_stats, COMMIT_BATCH_LABELS,
+    over_uring_sessions_active, over_uring_stats, transport_lease_stats, transport_wake_stats,
+    COMMIT_BATCH_LABELS,
 };
 use nix::sys::stat::mode_t;
 use raw::abi::{

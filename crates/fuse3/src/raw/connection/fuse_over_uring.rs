@@ -73,6 +73,12 @@ use tracing::{debug, error, info, warn};
 mod lease_core;
 use lease_core::{CommitGate, EntLeaseState};
 
+/// Queue-worker eventfd wake-coalescing core (L3 transport-economy lever
+/// B) — same `#[path]`-included-by-`loom-models` convention.
+#[path = "wake_core.rs"]
+mod wake_core;
+use wake_core::WakeCoalescer;
+
 /// `FUSE_OVER_IO_URING` (1ULL<<41) → `flags2` bit 9.
 pub const FUSE_OVER_IO_URING_FLAGS2: u32 = 1u32 << 9;
 
@@ -148,6 +154,10 @@ struct QueueHandle {
     wake_fd: RawFd,
     /// Keep OwnedFd alive.
     _wake: OwnedFd,
+    /// L3 lever B: elides redundant `wake_fd` writes — N reply submissions
+    /// between two worker passes cost one eventfd write. Shared with the
+    /// queue's [`PayloadArena`] so lease drops elide through the same flag.
+    wake_coalescer: Arc<WakeCoalescer>,
     /// The queue's payload arena, set once by the worker at startup. Held
     /// here so payload pointers handed out via `get_payload_buffer` stay
     /// valid for the pool's whole life, even after the worker exited.
@@ -169,10 +179,18 @@ struct PayloadArena {
     /// dup(2) of the queue eventfd: lease drops wake the worker through the
     /// arena so the fd is alive exactly as long as any lease can write it.
     wake: OwnedFd,
+    /// The queue's wake-elision flag (shared with [`QueueHandle`]): lease
+    /// drops arm it before writing `wake` (L3 lever B).
+    wake_coalescer: Arc<WakeCoalescer>,
 }
 
 impl PayloadArena {
-    fn new(depth: usize, payload_sz: usize, wake_fd: RawFd) -> io::Result<Arc<Self>> {
+    fn new(
+        depth: usize,
+        payload_sz: usize,
+        wake_fd: RawFd,
+        wake_coalescer: Arc<WakeCoalescer>,
+    ) -> io::Result<Arc<Self>> {
         let dup = unsafe { libc::dup(wake_fd) };
         if dup < 0 {
             return Err(io::Error::last_os_error());
@@ -197,7 +215,12 @@ impl PayloadArena {
             }
             bufs.push(ptr as usize);
         }
-        Ok(Arc::new(Self { bufs, layout, wake }))
+        Ok(Arc::new(Self {
+            bufs,
+            layout,
+            wake,
+            wake_coalescer,
+        }))
     }
 
     fn buf(&self, idx: usize) -> Option<*mut u8> {
@@ -257,16 +280,25 @@ impl Drop for EntPayloadLease {
         );
         if self.state.release() {
             // Last lease gone with a commit parked: wake the queue worker.
-            let one: u64 = 1;
-            // SAFETY: writing 8 bytes to an eventfd we keep alive via
-            // `self.arena.wake`.
-            unsafe {
-                libc::write(
-                    self.arena.wake.as_raw_fd(),
-                    &one as *const u64 as *const _,
-                    8,
-                )
-            };
+            // L3 lever B — publish (the release above) happened first, so
+            // the coalescer may elide the write when a wake is already
+            // armed (wake_core protocol; loom-verified with this site's
+            // exact release→arm→write order).
+            if self.arena.wake_coalescer.arm() {
+                let one: u64 = 1;
+                // SAFETY: writing 8 bytes to an eventfd we keep alive via
+                // `self.arena.wake`.
+                unsafe {
+                    libc::write(
+                        self.arena.wake.as_raw_fd(),
+                        &one as *const u64 as *const _,
+                        8,
+                    )
+                };
+                TRANSPORT_WAKE_WRITES.fetch_add(1, Ordering::Relaxed);
+            } else {
+                TRANSPORT_WAKES_ELIDED.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -542,6 +574,21 @@ static TRANSPORT_PAYLOAD_LEASES: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_PARKED_COMMITS: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_LEASES_OUTSTANDING: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_LEASE_MAX_AGE_MS: AtomicU64 = AtomicU64::new(0);
+// L3 lever B wake economy: eventfd writes performed vs elided by the
+// per-queue WakeCoalescer (submit_reply + lease-drop sites). Regression
+// signal: writes/(writes+elided) ≈ 1 under saturated load means the
+// coalescer stopped eliding (the pre-L3 1.67 eventfd writes/op posture).
+static TRANSPORT_WAKE_WRITES: AtomicU64 = AtomicU64::new(0);
+static TRANSPORT_WAKES_ELIDED: AtomicU64 = AtomicU64::new(0);
+
+/// L3 lever B wake-economy counters: `(wake_writes, wakes_elided)` —
+/// queue-eventfd writes performed vs elided by the per-queue coalescer.
+pub fn transport_wake_stats() -> (u64, u64) {
+    (
+        TRANSPORT_WAKE_WRITES.load(Ordering::Relaxed),
+        TRANSPORT_WAKES_ELIDED.load(Ordering::Relaxed),
+    )
+}
 // Post-arm classical sideband deliveries (kernel-mandated: FORGET/INTERRUPT/
 // resends + `fiq->ops` switchover stragglers ride the classical device even
 // with the ring armed). Zero here after an unlink storm means sideband
@@ -877,6 +924,7 @@ impl FuseOverUring {
                 commit_tx,
                 wake_fd,
                 _wake: wake,
+                wake_coalescer: Arc::new(WakeCoalescer::new()),
                 arena: std::sync::Mutex::new(None),
             });
             commit_rxs.push(commit_rx);
@@ -1089,9 +1137,17 @@ impl FuseOverUring {
                 reply_body,
             })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "uring commit closed"))?;
-        // Wake queue thread
-        let one: u64 = 1;
-        let _ = unsafe { libc::write(q.wake_fd, &one as *const u64 as *const _, 8) };
+        // Wake the queue thread. L3 lever B: the channel send above is the
+        // publication; the coalescer elides the eventfd write when a wake
+        // is already armed — N replies between two worker passes cost one
+        // write (wake_core protocol, loom-verified send→arm→write order).
+        if q.wake_coalescer.arm() {
+            let one: u64 = 1;
+            let _ = unsafe { libc::write(q.wake_fd, &one as *const u64 as *const _, 8) };
+            TRANSPORT_WAKE_WRITES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            TRANSPORT_WAKES_ELIDED.fetch_add(1, Ordering::Relaxed);
+        }
         self.stats_replies.fetch_add(1, Ordering::Relaxed);
         STATS_REPLIES.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1156,6 +1212,9 @@ impl FuseOverUring {
         // Wake every parked session pull (after the active=false store above
         // — pop's enable-then-check ordering makes this race-free).
         self.shutdown_notify.notify_waiters();
+        // Teardown wakes stay UNCONDITIONAL (no coalescer): the worker must
+        // wake to see active == false whatever the elision flag says, and a
+        // one-shot extra write costs nothing.
         let one: u64 = 1;
         for q in &self.queues {
             let _ = unsafe { libc::write(q.wake_fd, &one as *const u64 as *const _, 8) };
@@ -1448,8 +1507,10 @@ fn queue_worker(
 
     // Payload memory lives in an Arc'd arena (not the worker-local Ent) so
     // FUSE_WRITE leases and `get_payload_buffer` pointers stay valid past
-    // worker exit (§5.4).
-    let arena = PayloadArena::new(depth, payload_sz, wake_fd)?;
+    // worker exit (§5.4). The arena shares the queue's wake coalescer so
+    // lease-drop wakes elide through the same flag as reply submissions.
+    let wake_coalescer = Arc::clone(&pool.queues[qid as usize].wake_coalescer);
+    let arena = PayloadArena::new(depth, payload_sz, wake_fd, Arc::clone(&wake_coalescer))?;
     // One lease state per ring ent + the worker-local parked commit slots.
     let lease_states: Vec<Arc<EntLeaseState>> =
         (0..depth).map(|_| Arc::new(EntLeaseState::new())).collect();
@@ -1532,11 +1593,11 @@ fn queue_worker(
         // producer would strand that producer until an unrelated event (a
         // stuck FUSE reply). Order closes it: every wake producer publishes
         // its state BEFORE writing the eventfd (submit_reply: channel send →
-        // write; lease drop: refs release → write; shutdown: active store →
-        // write), so a wake consumed here means the state is already visible
-        // to the drains below — and any wake arriving AFTER this drain
-        // leaves the counter nonzero, which completes the (level-triggered)
-        // PollAdd the moment submit_and_wait arms it.
+        // arm → write; lease drop: refs release → arm → write; shutdown:
+        // active store → write), so a wake consumed here means the state is
+        // already visible to the drains below — and any wake arriving AFTER
+        // this drain leaves the counter nonzero, which completes the
+        // (level-triggered) PollAdd the moment submit_and_wait arms it.
         let mut buf = [0u8; 8];
         loop {
             let n = unsafe { libc::read(wake_fd, buf.as_mut_ptr().cast(), 8) };
@@ -1554,6 +1615,16 @@ fn queue_worker(
                 break;
             }
         }
+        // L3 lever B — disarm the wake coalescer AT THIS POINT: after the
+        // eventfd drain, before any producer-state scan below. Disarming
+        // before the drain leaves the flag armed after the pass while the
+        // covering write was just consumed — the next producer elides
+        // against it and strands on a zero counter. Disarming after the
+        // scans loses the happens-before edge that makes a covered
+        // publication visible to THIS pass's scans. The drain→disarm→scan
+        // order is loom-verified (`wake_coalescer_*` models; weakening
+        // evidence in the model docs).
+        wake_coalescer.disarm();
 
         // Drain commits for this queue only (no demux). §5.4 re-arm gate: a
         // COMMIT_AND_FETCH both writes the reply into the ent payload and
@@ -2162,7 +2233,8 @@ mod tests {
         let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         assert!(efd >= 0);
         let efd_owned = unsafe { OwnedFd::from_raw_fd(efd) };
-        let arena = PayloadArena::new(4, 8192, efd_owned.as_raw_fd()).unwrap();
+        let arena = PayloadArena::new(4, 8192, efd_owned.as_raw_fd(), Arc::new(WakeCoalescer::new()))
+            .unwrap();
 
         let mut seen = std::collections::HashSet::new();
         for idx in 0..4 {
@@ -2349,7 +2421,8 @@ mod tests {
         let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         assert!(efd >= 0);
         let efd_owned = unsafe { OwnedFd::from_raw_fd(efd) };
-        let arena = PayloadArena::new(1, 8192, efd_owned.as_raw_fd()).unwrap();
+        let arena = PayloadArena::new(1, 8192, efd_owned.as_raw_fd(), Arc::new(WakeCoalescer::new()))
+            .unwrap();
         let state = Arc::new(EntLeaseState::new());
 
         assert_eq!(state.acquire(), 0);

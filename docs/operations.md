@@ -31,7 +31,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
   - [Fabric observability](#fabric-observability)
 - [NVMe-oF operations](#nvme-of-operations)
 - [Performance records](#performance-records)
-  - [The vs-JuiceFS scoreboard (release gate)](#the-vs-juicefs-scoreboard-release-gate)
+  - [The multi-reference scoreboard (release gate)](#the-multi-reference-scoreboard-release-gate)
   - [Built-in benchmark (`squeezefs bench`)](#built-in-benchmark-squeezefs-bench)
 
 ---
@@ -388,18 +388,23 @@ Every number traces to a committed `.benchmarks/` note (box/substrate/method ins
 
 The rest of `.benchmarks/` is the per-program measurement lineage — baselines, attribution rigs, fix verifications, and closing adjudications; each program's closing record is indexed from its design doc (`docs/design-*.md`).
 
-### The vs-JuiceFS scoreboard (release gate)
+### The multi-reference scoreboard (release gate)
 
-`tests/run_vs_juicefs.sh` is the standing **"beat-JuiceFS" scoreboard**: a re-runnable, matched-conditions A/B harness that measures SqueezeFS against JuiceFS on the same substrate (both durable stores in one non-tmpfs directory), matched cache budgets (one `SQUEEZEFS_VS_CACHE_MB` knob drives our `--mem-budget` and their `--cache-size`/`--buffer-size`), identical elbencho drivers, across **three regimes** — R1 as-deployed (all cache layers live, dataset 2–4× cache), R2 device-true (their `--cache-size 0` + tight cage, our `-o direct_device_true`, both **verified by counters per row**), R3 cold-cache (full drops, first pass) — × the 6-shape workload grid (seq write/read 1 MiB, rand read/write 4k at `t16 iodepth16 --direct`, stat storm, del storm).
+`tests/run_scoreboard.sh` is the standing **multi-reference scoreboard** — the proof surface for the top-3-fastest-FUSE-filesystems directive (PERFORMANCE IS PRIMARY, 2026-07-18). It measures SqueezeFS against the reference fast-FUSE field on one substrate with matched budgets and identical elbencho drivers: **JuiceFS** (meta engine + `file://` objstore), **SeaweedFS native** (`weed server` master+volume+filer, `weed mount`), and **geesefs** + **mountpoint-s3** over one shared local **RustFS** S3 store (object store held constant so those two rows differ only by client) — all pinned releases with recorded checksums, fetched into a non-repo tools dir. The grid is unchanged from the vs-JuiceFS lineage it absorbed: **three regimes** — R1 as-deployed (all cache layers live, dataset 2–4× cache), R2 device-true (sqz `-o direct_device_true` verified by counters; refs by cache-off knobs + tight cages on the page-cache-serving process, verified by device-byte evidence per row), R3 cold-cache (full drops + client cache wipes, first pass) — × the 6-shape workload grid (seq write/read 1 MiB, rand read/write 4k at `t16 iodepth16 --direct`, stat storm, del storm).
+
+**RW6 durability-leveled timing:** write-family rows carry two modes. *Relaxed* is each system's native ACK semantics (published, labeled, never gating). *Durable* — which **governs the write-family verdicts** — is fsync-inclusive at matched depth: the harness times fdatasync on every dataset file through the mount, then syncfs on the mount, then syncfs on the substrate (every system's backing store flushed to the device before the clock stops). elbencho's `--sync` cannot deliver this (verified from v3.1-9 source: it is a separate post-phase syncfs step, excluded from the WRITE row, and several FUSE clients no-op `FUSE_SYNCFS`), so the pass is the harness's own, identical for every system. The historical `R1/R3.seq_write_1m` allowlist (JuiceFS's page-cache-ACK artifact) is retired — **the expected allowlist is empty**.
+
+**Capability matrix:** where a reference does not support a workload *by design*, the cell reads **N/S (not supported by design)** — neutral, never "0 IOPS", never a LOSS, excluded from rank denominators. The matrix is declarative in the harness (one-line reason per cell) and verified empirically at mount time (the refusal errno is recorded in `capabilities.tsv`; a probe that succeeds un-declares the cell loudly). Current matrix: `mps3.rand_write_4k` (sequential-upload semantics; EBADF verified).
 
 ```bash
-tests/run_vs_juicefs.sh                      # full scoreboard (~30–60 min, quiet-gated)
-SQUEEZEFS_VS_SMOKE=1 tests/run_vs_juicefs.sh # 30s-class micro-grid plumbing proof (per-commit tier)
+tests/run_scoreboard.sh                      # full scoreboard (~2–4 h, quiet-gated)
+tests/run_scoreboard.sh teardown             # kill owned daemons + wipe stores
+SQUEEZEFS_SB_SMOKE=1 tests/run_scoreboard.sh # ~10 min micro-grid plumbing proof (per-commit tier)
 ```
 
-**The gate:** the run emits a win/loss table (+ machine TSV + per-row raw logs, counter snapshots, and diskstats evidence) and **exits nonzero if SqueezeFS loses any row** (loss = < 0.95× JuiceFS; INVALID/unverified rows count as losses). `SQUEEZEFS_VS_ALLOW_LOSS="R1.foo,..."` exempts named rows for known-loss tracking — every allowed loss must have an attribution + follow-up in the current `.benchmarks` scoreboard report. Cadence: **per-release** (with the acceptance suites) and after any perf-relevant landing.
+**The gate:** the run emits the primary kernel-FUSE table (per-reference W/L/TIE at ±5%, SqueezeFS rank per row, per-row-family **top-3 adjudication**) plus a labeled relaxed-write table, machine TSV, and per-row raw evidence (elbencho output + CSV, `.stats`/metrics counter snapshots, diskstats deltas, durability-pass splits, honesty lines), and **exits nonzero on any unattributed LOSS or any INVALID SqueezeFS cell** in the primary table. `SQUEEZEFS_SB_ALLOW_LOSS="R1.foo,R1.foo.jfs,..."` names attributed losses (row-wide or per-reference); a reference whose own setup fails 3× becomes an n/a-with-reason column (named residual), never a run abort — the SqueezeFS side always gates hard. Legacy `SQUEEZEFS_VS_*` env spellings are honored. Cadence: **per-release** and after any perf-relevant landing.
 
-**Current standing (closing run, 2026-07-17, `.benchmarks/2026-07-17-rand-write-program-closing.md` §2): 13 W / 3 TIE across the 18 rows, gate GREEN** with the allowlist shrunk to exactly two rows (`R1.seq_write_1m,R3.seq_write_1m`). Highlights: rand-write 12.6–15.9× JuiceFS (the scoreboard's former only genuine loss, closed by the random-small-write program), rand-read 1.9–3.5×, stat 2.8×, del 9.2–11.2×, seq-read TIE. The two allowed rows are an **ACK-semantics measurement artifact, not a product loss**: on those page-cache-drain seq-write rows JuiceFS acks from RAM (its device drains 2.1–3.2 GiB/s) while SqueezeFS puts 4.4–4.6 GiB/s on the device during the row — the honest device-true comparison is regime R2's seq-write, which SqueezeFS **wins 2.11×**. Inaugural baseline (8 W / 3 TIE / 5 L / 2 INVALID): `.benchmarks/2026-07-15-vs-juicefs-scoreboard.md`.
+**Current standing (inaugural multi-reference run, 2026-07-18): see `.benchmarks/2026-07-18-multi-reference-scoreboard.md`** — provenance, the full grid, per-family top-3 adjudication, and the honest-anomalies ledger. JuiceFS-only lineage: 13 W / 3 TIE closing standing `.benchmarks/2026-07-17-rand-write-program-closing.md` §2, inaugural baseline `.benchmarks/2026-07-15-vs-juicefs-scoreboard.md` (both measured with the retired `tests/run_vs_juicefs.sh` protocol this harness absorbed).
 
 ### Built-in benchmark (`squeezefs bench`)
 

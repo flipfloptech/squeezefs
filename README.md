@@ -53,9 +53,9 @@ Measured with the built-in benchmark and elbencho on the reference substrate; ev
 | Random 4 KiB write (in-place patch shape) | **59–67 k IOPS**, device cost 4 KiB-class per op | [random-write closing](.benchmarks/2026-07-17-rand-write-program-closing.md) |
 | Large sequential write | **~1.8 GB/s** write-through; **4.4–4.6 GiB/s** device-true during sequential scoreboard rows | [zero-copy closing](.benchmarks/2026-07-08-zero-copy-write-path-closing.md), [random-write closing](.benchmarks/2026-07-17-rand-write-program-closing.md) |
 | Metadata | many-dirs creates 32.7 k/s; rename/unlink ≈ 1.0 journal entries/op; 100 M-inode volume cold-mounts in ~22 ms | [metadata closing](.benchmarks/2026-07-15-metadata-throughput-closing.md), [v3 gates](.benchmarks/2026-07-09-kv-v3-gates.md) |
-| vs. JuiceFS, matched-conditions A/B (3 regimes × 6 workloads) | **13 wins / 3 ties** across 18 rows; 2 rows allowlisted as attributed measurement artifacts | [scoreboard standing](.benchmarks/2026-07-17-rand-write-program-closing.md), [baseline](.benchmarks/2026-07-15-vs-juicefs-scoreboard.md) |
+| vs. the reference FUSE field — JuiceFS, SeaweedFS, geesefs, mountpoint-s3 (matched conditions, 3 regimes × 6 workloads, fsync-inclusive **durable** write timing) | **top-3 or better on every row-family; fastest of the field on 13 of 18 rows** (59 W / 2 TIE across 66 comparable cells; 3 attributed-loss cells tracked) | [multi-reference scoreboard](.benchmarks/2026-07-18-multi-reference-scoreboard.md), [JuiceFS-only lineage](.benchmarks/2026-07-15-vs-juicefs-scoreboard.md) |
 
-The full record set, the vs-JuiceFS scoreboard harness, and the built-in benchmark reference live in [docs/operations.md → Performance records](docs/operations.md#performance-records).
+The full record set, the multi-reference scoreboard harness (`tests/run_scoreboard.sh`), and the built-in benchmark reference live in [docs/operations.md → Performance records](docs/operations.md#performance-records).
 
 ## Building
 

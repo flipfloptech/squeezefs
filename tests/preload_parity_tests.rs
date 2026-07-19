@@ -231,7 +231,11 @@ impl Fixture {
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         // SAFETY: plain open(2); ownership taken immediately.
         let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
-        assert!(fd >= 0, "open stand-in: {}", std::io::Error::last_os_error());
+        assert!(
+            fd >= 0,
+            "open stand-in: {}",
+            std::io::Error::last_os_error()
+        );
         // SAFETY: fresh owned fd.
         (fs_ino, unsafe { OwnedFd::from_raw_fd(fd) })
     }
@@ -252,7 +256,15 @@ impl Fixture {
     async fn fuse_write(&self, ino: u64, offset: u64, data: &[u8]) -> u32 {
         let reply = self
             .fs
-            .write(req(), ino, 0, offset, bytes::Bytes::copy_from_slice(data), 0, 0)
+            .write(
+                req(),
+                ino,
+                0,
+                offset,
+                bytes::Bytes::copy_from_slice(data),
+                0,
+                0,
+            )
             .await
             .expect("fuse write");
         reply.written
@@ -483,7 +495,10 @@ impl Drop for ClientSession {
     fn drop(&mut self) {
         // SAFETY: unmapping the mapping created in `establish`.
         unsafe {
-            libc::munmap(self.base as *mut libc::c_void, self.layout.total_bytes as usize);
+            libc::munmap(
+                self.base as *mut libc::c_void,
+                self.layout.total_bytes as usize,
+            );
         }
     }
 }
@@ -538,9 +553,8 @@ async fn ring_read_matches_fuse_read_byte_parity() {
         (1000, 2000),
         (0, 128 * 1024),
     ] {
-        let ring = tokio::task::block_in_place(|| {
-            session.ring_read(binding, offset, len, "parity read")
-        });
+        let ring =
+            tokio::task::block_in_place(|| session.ring_read(binding, offset, len, "parity read"));
         let fuse = fx.fuse_read(ino, offset, len as u32).await;
         assert_eq!(
             ring, fuse,
@@ -665,9 +679,15 @@ async fn arena_severance_client_scribble_never_reaches_acked_bytes() {
         tokio::task::block_in_place(|| session.ring_read(binding, 0, w.len(), "sever ring read"));
     // ring_read reuses arena_off 0 — it just overwrote the scribble; the
     // CONTENT must be the acked bytes, not 0xAA.
-    assert_eq!(ring, w, "ring read must return acked bytes, never scribbles");
+    assert_eq!(
+        ring, w,
+        "ring read must return acked bytes, never scribbles"
+    );
     let fuse = fx.fuse_read(ino, 0, w.len() as u32).await;
-    assert_eq!(fuse, w, "FUSE read must return acked bytes, never scribbles");
+    assert_eq!(
+        fuse, w,
+        "FUSE read must return acked bytes, never scribbles"
+    );
     fx.shutdown();
 }
 
@@ -682,7 +702,7 @@ async fn interleaved_transports_match_oracle() {
     let (session, binding) = ClientSession::establish(&fx, &fd);
 
     let mut oracle: Vec<u8> = Vec::new();
-    let mut apply = |oracle: &mut Vec<u8>, offset: usize, data: &[u8]| {
+    let apply = |oracle: &mut Vec<u8>, offset: usize, data: &[u8]| {
         if oracle.len() < offset + data.len() {
             oracle.resize(offset + data.len(), 0);
         }
@@ -755,16 +775,19 @@ async fn adversarial_mid_serve_mutation_serves_the_snapshot() {
         handoffs_before + 1,
         "write handoff",
     );
-    assert!(!session.is_done(1, gen), "op must be parked behind the writer");
+    assert!(
+        !session.is_done(1, gen),
+        "op must be parked behind the writer"
+    );
 
     // Mid-serve hostile mutation: descriptor fields AND payload bytes.
     session.slot(1).publish_descriptor(&SlotDescriptor {
         op: OP_WRITE,
         flags: 0,
         binding,
-        offset: 999_999,           // must NOT be served
-        len: 16,                    // must NOT be served
-        arena_off: 512 * 1024,      // must NOT be served
+        offset: 999_999,       // must NOT be served
+        len: 16,               // must NOT be served
+        arena_off: 512 * 1024, // must NOT be served
     });
     session.arena_fill(4096, original.len(), 0x5A); // post-sever scribble
 
@@ -809,7 +832,10 @@ async fn adversarial_mid_serve_mutation_serves_the_snapshot() {
         lock_demotes_before + 1,
         "read lock demotion",
     );
-    assert!(!session.is_done(2, gen), "read must be parked behind the writer");
+    assert!(
+        !session.is_done(2, gen),
+        "read must be parked behind the writer"
+    );
     // Mutate the descriptor mid-serve: the served op must be the snapshot.
     session.slot(2).publish_descriptor(&SlotDescriptor {
         op: OP_READ,
@@ -823,9 +849,12 @@ async fn adversarial_mid_serve_mutation_serves_the_snapshot() {
     let r = session.wait_done(2, gen, "adversarial read");
     assert_eq!(r, 8 * 1024, "read served the SNAPSHOT length");
     let got = session.arena_read(64 * 1024, 8 * 1024);
+    // The file at [0, 8 KiB) is the seed EXCEPT [1024, 8 KiB): the write
+    // variant above committed `original` at offset 1024.
+    let mut expected = seed[0..8 * 1024].to_vec();
+    expected[1024..].copy_from_slice(&original[..7 * 1024]);
     assert_eq!(
-        got,
-        &seed[0..8 * 1024],
+        got, expected,
         "read payload landed at the SNAPSHOT arena_off with the SNAPSHOT range"
     );
     fx.shutdown();
@@ -888,7 +917,11 @@ async fn queued_writer_lock_demotion_completes_after_release_no_deadlock() {
         let r = session.wait_done(i as u32, *gen, "post-release read");
         assert_eq!(r, 4096, "parked read {i} completes after release");
         let got = session.arena_read(i as u64 * 8192, 4096);
-        assert_eq!(got, &w[i * 4096..(i + 1) * 4096], "parity for parked read {i}");
+        assert_eq!(
+            got,
+            &w[i * 4096..(i + 1) * 4096],
+            "parity for parked read {i}"
+        );
     }
 
     // No-deadlock soak: interleaved FUSE writes + ring reads on one inode.
@@ -919,8 +952,7 @@ async fn cold_attr_miss_demotes_and_eof_fast_path_serves() {
     // and the async handoff still serves parity.
     fx.fs.attr_cache.invalidate(&ino);
     let miss_before = METRICS.ipc_fast_path_miss_demotions.load(Ordering::Relaxed);
-    let ring =
-        tokio::task::block_in_place(|| session.ring_read(binding, 0, w.len(), "cold read"));
+    let ring = tokio::task::block_in_place(|| session.ring_read(binding, 0, w.len(), "cold read"));
     assert_eq!(ring, w, "cold-cache ring read still serves parity");
     assert!(
         METRICS.ipc_fast_path_miss_demotions.load(Ordering::Relaxed) > miss_before,
@@ -960,7 +992,9 @@ async fn data_plane_stats_fields_export() {
     let fx = Fixture::new("stats").await;
     let stats = fx.fs.generate_stats_json().await;
     let v: serde_json::Value = serde_json::from_str(&stats).expect("stats json parses");
-    let m = v.get("metrics").expect("stats JSON carries a metrics object");
+    let m = v
+        .get("metrics")
+        .expect("stats JSON carries a metrics object");
     for key in [
         "ipc_ops_read",
         "ipc_ops_write",

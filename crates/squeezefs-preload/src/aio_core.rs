@@ -121,6 +121,11 @@ impl AioCtxState {
         self.pending.len()
     }
 
+    /// Kernel-lane ops submitted and not yet delivered.
+    pub fn kernel_pending(&self) -> usize {
+        self.kernel_pending
+    }
+
     /// The lane-split `io_submit` walk. `classes[i]` classifies
     /// `iocb_ids[i]`; `data_of` supplies each iocb's completion cookie
     /// (captured AT SUBMIT — the client may recycle the iocb after the

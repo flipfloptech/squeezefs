@@ -20,6 +20,7 @@ compile_error!(
 );
 
 pub mod aio_core;
+pub mod aio_glue;
 pub mod bailout;
 pub mod dev_cache;
 pub mod fd_table;

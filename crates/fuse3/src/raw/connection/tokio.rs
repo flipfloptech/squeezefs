@@ -612,22 +612,22 @@ impl FuseConnection {
                 } else {
                     0
                 };
-                // Notifications (unique==0) are not supported on over-uring yet.
-                if unique == 0 {
-                    return (
-                        (data, body_extend_data),
-                        Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "fuse notify not supported on FUSE-over-io_uring path",
-                        )),
-                    );
-                }
-                // Classical-delivered handoff requests must not use COMMIT.
-                let is_classical = self
-                    .classical_inflight
-                    .lock()
-                    .unwrap()
-                    .remove(&unique);
+                // Notifications (unique == 0, e.g. FUSE_NOTIFY_INVAL_INODE
+                // for the L4 W1 handoff) have NO over-uring mechanism: the
+                // kernel's COMMIT protocol keys on a request unique, and
+                // notifies are daemon-initiated. They ride the classical
+                // device write below — the same kernel-mandated classical
+                // sideband the post-arm FORGET/INTERRUPT traffic uses,
+                // never a hot-path fallback. (Pre-L4-6 this arm errored
+                // Unsupported, which the session loop treated as FATAL —
+                // the first live notify on an armed session killed the
+                // mount; the gate's notify-delivery row pins the fix.)
+                let is_classical = unique == 0
+                    || self
+                        .classical_inflight
+                        .lock()
+                        .unwrap()
+                        .remove(&unique);
                 if is_classical {
                     if super::fuse_over_uring::transport_debug() {
                         eprintln!("[XPORT] classical-reply unique={unique}");

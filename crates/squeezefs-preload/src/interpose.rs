@@ -472,22 +472,28 @@ fn ring_iovec(
 // interposer plumbing macro: guard + catch_unwind + real-call fallback
 // ---------------------------------------------------------------------------
 
+/// Interposer plumbing: resolve the real POINTER eagerly, but the real
+/// CALL stays lazy — it executes only on the passthrough paths (no
+/// guard, body says `None`, body panicked). The first sudo gate run
+/// caught the eager-call form double-applying every bound-fd write
+/// (real write + ring write = 2× file content); this laziness is the
+/// load-bearing fix, pinned by the gate's cp/dd parity rows.
 macro_rules! interposed {
-    ($real:expr, $fallback:expr, $body:expr) => {{
-        let Some(real) = $real else {
+    ($resolve:expr, $fallback:expr, |$f:ident| $call:expr, $body:expr) => {{
+        let Some($f) = $resolve else {
             // No RTLD_NEXT symbol: nothing to chain to. $fallback must
             // synthesize the kernel answer (raw syscall or errno).
             return $fallback;
         };
         let Some(_g) = Guard::enter() else {
-            return real;
+            return $call;
         };
         match catch_unwind(AssertUnwindSafe(|| $body)) {
             Ok(Some(r)) => r,
-            Ok(None) => real,
+            Ok(None) => $call,
             Err(_) => {
                 panic_poison();
-                real
+                $call
             }
         }
     }};
@@ -517,11 +523,12 @@ macro_rules! pread_like {
             offset: off_t,
         ) -> ssize_t {
             interposed!(
-                real!($sym, PreadFn).map(|f| unsafe { f(fd, buf, count, offset) }),
+                real!($sym, PreadFn),
                 {
                     set_errno(libc::ENOSYS);
                     -1
                 },
+                |f| unsafe { f(fd, buf, count, offset) },
                 ring_positional(fd, buf as *mut u8, count, offset, $write)
             )
         }
@@ -540,11 +547,12 @@ pread_like!(pwrite64, "pwrite64", true);
 #[no_mangle]
 pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t {
     interposed!(
-        real!("read", RwFn).map(|f| unsafe { f(fd, buf, count) }),
+        real!("read", RwFn),
         {
             set_errno(libc::ENOSYS);
             -1
         },
+        |f| unsafe { f(fd, buf, count) },
         ring_offsetful(fd, buf as *mut u8, count, false)
     )
 }
@@ -556,11 +564,12 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssi
 #[no_mangle]
 pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
     interposed!(
-        real!("write", RwFn).map(|f| unsafe { f(fd, buf as *mut c_void, count) }),
+        real!("write", RwFn),
         {
             set_errno(libc::ENOSYS);
             -1
         },
+        |f| unsafe { f(fd, buf as *mut c_void, count) },
         ring_offsetful(fd, buf as *mut u8, count, true)
     )
 }
@@ -572,11 +581,12 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: size_t) -> 
 #[no_mangle]
 pub unsafe extern "C" fn readv(fd: c_int, iov: *const libc::iovec, iovcnt: c_int) -> ssize_t {
     interposed!(
-        real!("readv", VecFn).map(|f| unsafe { f(fd, iov, iovcnt) }),
+        real!("readv", VecFn),
         {
             set_errno(libc::ENOSYS);
             -1
         },
+        |f| unsafe { f(fd, iov, iovcnt) },
         ring_iovec(fd, iov, iovcnt, -1, false)
     )
 }
@@ -586,105 +596,82 @@ pub unsafe extern "C" fn readv(fd: c_int, iov: *const libc::iovec, iovcnt: c_int
 #[no_mangle]
 pub unsafe extern "C" fn writev(fd: c_int, iov: *const libc::iovec, iovcnt: c_int) -> ssize_t {
     interposed!(
-        real!("writev", VecFn).map(|f| unsafe { f(fd, iov, iovcnt) }),
+        real!("writev", VecFn),
         {
             set_errno(libc::ENOSYS);
             -1
         },
+        |f| unsafe { f(fd, iov, iovcnt) },
         ring_iovec(fd, iov, iovcnt, -1, true)
     )
 }
 
-/// §5.1 positional vector rows.
-///
-/// # Safety
-/// C ABI interposer; argument contracts are libc's own.
-#[no_mangle]
-pub unsafe extern "C" fn preadv(
-    fd: c_int,
-    iov: *const libc::iovec,
-    iovcnt: c_int,
-    offset: off_t,
-) -> ssize_t {
-    interposed!(
-        real!("preadv", PVecFn).map(|f| unsafe { f(fd, iov, iovcnt, offset) }),
-        {
-            set_errno(libc::ENOSYS);
-            -1
-        },
-        ring_iovec(fd, iov, iovcnt, offset, false)
-    )
+/// §5.1 positional vector rows (both LFS spellings — see the LFS-64
+/// discipline note below).
+macro_rules! pvec_like {
+    ($name:ident, $sym:literal, $write:expr) => {
+        /// # Safety
+        /// C ABI interposer; argument contracts are libc's own.
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(
+            fd: c_int,
+            iov: *const libc::iovec,
+            iovcnt: c_int,
+            offset: off_t,
+        ) -> ssize_t {
+            interposed!(
+                real!($sym, PVecFn),
+                {
+                    set_errno(libc::ENOSYS);
+                    -1
+                },
+                |f| unsafe { f(fd, iov, iovcnt, offset) },
+                ring_iovec(fd, iov, iovcnt, offset, $write)
+            )
+        }
+    };
 }
 
-/// # Safety
-/// C ABI interposer; argument contracts are libc's own.
-#[no_mangle]
-pub unsafe extern "C" fn pwritev(
-    fd: c_int,
-    iov: *const libc::iovec,
-    iovcnt: c_int,
-    offset: off_t,
-) -> ssize_t {
-    interposed!(
-        real!("pwritev", PVecFn).map(|f| unsafe { f(fd, iov, iovcnt, offset) }),
-        {
-            set_errno(libc::ENOSYS);
-            -1
-        },
-        ring_iovec(fd, iov, iovcnt, offset, true)
-    )
-}
+pvec_like!(preadv, "preadv", false);
+pvec_like!(preadv64, "preadv64", false);
+pvec_like!(pwritev, "pwritev", true);
+pvec_like!(pwritev64, "pwritev64", true);
 
 /// §5.1 RWF-flagged vector rows: the flag screen (`rwf_passthrough`)
 /// gates ring eligibility; `offset == -1` is the offsetful shape.
-///
-/// # Safety
-/// C ABI interposer; argument contracts are libc's own.
-#[no_mangle]
-pub unsafe extern "C" fn preadv2(
-    fd: c_int,
-    iov: *const libc::iovec,
-    iovcnt: c_int,
-    offset: off_t,
-    flags: c_int,
-) -> ssize_t {
-    interposed!(
-        real!("preadv2", PVec2Fn).map(|f| unsafe { f(fd, iov, iovcnt, offset, flags) }),
-        {
-            set_errno(libc::ENOSYS);
-            -1
-        },
-        if rwf_passthrough(flags) {
-            None
-        } else {
-            ring_iovec(fd, iov, iovcnt, offset, false)
+macro_rules! pvec2_like {
+    ($name:ident, $sym:literal, $write:expr) => {
+        /// # Safety
+        /// C ABI interposer; argument contracts are libc's own.
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(
+            fd: c_int,
+            iov: *const libc::iovec,
+            iovcnt: c_int,
+            offset: off_t,
+            flags: c_int,
+        ) -> ssize_t {
+            interposed!(
+                real!($sym, PVec2Fn),
+                {
+                    set_errno(libc::ENOSYS);
+                    -1
+                },
+                |f| unsafe { f(fd, iov, iovcnt, offset, flags) },
+                if rwf_passthrough(flags) {
+                    None
+                } else {
+                    ring_iovec(fd, iov, iovcnt, offset, $write)
+                }
+            )
         }
-    )
+    };
 }
 
-/// # Safety
-/// C ABI interposer; argument contracts are libc's own.
-#[no_mangle]
-pub unsafe extern "C" fn pwritev2(
-    fd: c_int,
-    iov: *const libc::iovec,
-    iovcnt: c_int,
-    offset: off_t,
-    flags: c_int,
-) -> ssize_t {
-    interposed!(
-        real!("pwritev2", PVec2Fn).map(|f| unsafe { f(fd, iov, iovcnt, offset, flags) }),
-        {
-            set_errno(libc::ENOSYS);
-            -1
-        },
-        if rwf_passthrough(flags) {
-            None
-        } else {
-            ring_iovec(fd, iov, iovcnt, offset, true)
-        }
-    )
-}
+pvec2_like!(preadv2, "preadv2", false);
+pvec2_like!(preadv64v2, "preadv64v2", false);
+pvec2_like!(pwritev2, "pwritev2", true);
+pvec2_like!(pwritev64v2, "pwritev64v2", true);
 
 // ---------------------------------------------------------------------------
 // detection / lifecycle symbols
@@ -751,50 +738,72 @@ macro_rules! open_like {
 open_like!(open, "open");
 open_like!(open64, "open64");
 
-/// # Safety
-/// C ABI interposer; argument contracts are libc's own.
-#[no_mangle]
-pub unsafe extern "C" fn openat(
-    dirfd: c_int,
-    path: *const c_char,
-    oflag: c_int,
-    mode: mode_t,
-) -> c_int {
-    let Some(f) = real!("openat", OpenatFn) else {
-        set_errno(libc::ENOSYS);
-        return -1;
-    };
-    // SAFETY: chaining the real openat.
-    let fd = unsafe { f(dirfd, path, oflag, mode) };
-    let Some(_g) = Guard::enter() else { return fd };
-    match catch_unwind(AssertUnwindSafe(|| after_open(fd))) {
-        Ok(_) => fd,
-        Err(_) => {
-            panic_poison();
-            fd
+// LFS-64 discipline (found by the first sudo gate run): glibc ≥ 2.28
+// compiles `_FILE_OFFSET_BITS=64` callers against the 64-suffixed
+// symbols (`openat64`, `creat64`, `fcntl64`, `preadv64`, …) — an
+// interposer table missing them silently loses those events (CPython's
+// `os.dup` was the tell: its `fcntl64(F_DUPFD_CLOEXEC)` made a dup
+// invisible, so closing the original unbound the survivor). Every
+// interposed family therefore covers both spellings.
+
+macro_rules! openat_like {
+    ($name:ident, $sym:literal) => {
+        /// # Safety
+        /// C ABI interposer; argument contracts are libc's own.
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(
+            dirfd: c_int,
+            path: *const c_char,
+            oflag: c_int,
+            mode: mode_t,
+        ) -> c_int {
+            let Some(f) = real!($sym, OpenatFn) else {
+                set_errno(libc::ENOSYS);
+                return -1;
+            };
+            // SAFETY: chaining the real openat.
+            let fd = unsafe { f(dirfd, path, oflag, mode) };
+            let Some(_g) = Guard::enter() else { return fd };
+            match catch_unwind(AssertUnwindSafe(|| after_open(fd))) {
+                Ok(_) => fd,
+                Err(_) => {
+                    panic_poison();
+                    fd
+                }
+            }
         }
-    }
+    };
 }
 
-/// # Safety
-/// C ABI interposer; argument contracts are libc's own.
-#[no_mangle]
-pub unsafe extern "C" fn creat(path: *const c_char, mode: mode_t) -> c_int {
-    let Some(f) = real!("creat", CreatFn) else {
-        set_errno(libc::ENOSYS);
-        return -1;
-    };
-    // SAFETY: chaining the real creat.
-    let fd = unsafe { f(path, mode) };
-    let Some(_g) = Guard::enter() else { return fd };
-    match catch_unwind(AssertUnwindSafe(|| after_open(fd))) {
-        Ok(_) => fd,
-        Err(_) => {
-            panic_poison();
-            fd
+openat_like!(openat, "openat");
+openat_like!(openat64, "openat64");
+
+macro_rules! creat_like {
+    ($name:ident, $sym:literal) => {
+        /// # Safety
+        /// C ABI interposer; argument contracts are libc's own.
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(path: *const c_char, mode: mode_t) -> c_int {
+            let Some(f) = real!($sym, CreatFn) else {
+                set_errno(libc::ENOSYS);
+                return -1;
+            };
+            // SAFETY: chaining the real creat.
+            let fd = unsafe { f(path, mode) };
+            let Some(_g) = Guard::enter() else { return fd };
+            match catch_unwind(AssertUnwindSafe(|| after_open(fd))) {
+                Ok(_) => fd,
+                Err(_) => {
+                    panic_poison();
+                    fd
+                }
+            }
         }
-    }
+    };
 }
+
+creat_like!(creat, "creat");
+creat_like!(creat64, "creat64");
 
 type CloseFn = unsafe extern "C" fn(c_int) -> c_int;
 type CloseRangeFn = unsafe extern "C" fn(c_uint, c_uint, c_int) -> c_int;
@@ -929,11 +938,33 @@ type FcntlFn = unsafe extern "C" fn(c_int, c_int, *mut c_void) -> c_int;
 /// shape — DAOS-parity conservatism). Declared with a pointer third
 /// argument (the variadic slot), forwarded verbatim.
 ///
+/// Interposed under BOTH names, `fcntl` and `fcntl64`: glibc ≥ 2.28
+/// compiles `_FILE_OFFSET_BITS=64` callers (CPython's `os.dup` among
+/// them — the first sudo gate caught its `F_DUPFD_CLOEXEC` slipping
+/// past an fcntl-only shim as an invisible dup) against the 64 symbol.
+///
 /// # Safety
 /// C ABI interposer; argument contracts are libc's own.
 #[no_mangle]
 pub unsafe extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: *mut c_void) -> c_int {
-    let Some(f) = real!("fcntl", FcntlFn) else {
+    let real = real!("fcntl", FcntlFn);
+    // SAFETY: same contract, shared body.
+    unsafe { fcntl_body(real, fd, cmd, arg) }
+}
+
+/// # Safety
+/// C ABI interposer; argument contracts are libc's own.
+#[no_mangle]
+pub unsafe extern "C" fn fcntl64(fd: c_int, cmd: c_int, arg: *mut c_void) -> c_int {
+    let real = real!("fcntl64", FcntlFn);
+    // SAFETY: same contract, shared body.
+    unsafe { fcntl_body(real, fd, cmd, arg) }
+}
+
+/// # Safety
+/// Caller is one of the fcntl interposers; contracts are libc's own.
+unsafe fn fcntl_body(real: Option<FcntlFn>, fd: c_int, cmd: c_int, arg: *mut c_void) -> c_int {
+    let Some(f) = real else {
         set_errno(libc::ENOSYS);
         return -1;
     };

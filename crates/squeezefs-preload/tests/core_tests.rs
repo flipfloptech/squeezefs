@@ -67,7 +67,11 @@ fn dup_propagates_and_close_original_keeps_dup_bound() {
     // LAST close of the sharing set.
     let t = FdTable::new();
     t.bind(10, binding(1));
-    assert_eq!(t.on_dup(10, 20), None, "dup onto a free fd releases nothing");
+    assert_eq!(
+        t.on_dup(10, 20),
+        None,
+        "dup onto a free fd releases nothing"
+    );
 
     assert_eq!(
         t.on_close(10),
@@ -75,7 +79,9 @@ fn dup_propagates_and_close_original_keeps_dup_bound() {
         "closing the original must NOT unbind — the dup still shares it"
     );
     assert!(t.lookup(10).is_none(), "closed original must lookup None");
-    let b = t.lookup(20).expect("dup must stay bound after original close");
+    let b = t
+        .lookup(20)
+        .expect("dup must stay bound after original close");
     assert_eq!(b.binding_id, 1);
 
     assert_eq!(t.on_close(20), Some(1), "last close unbinds exactly once");
@@ -133,7 +139,9 @@ fn close_range_sweeps_inclusive_range() {
     );
     assert!(t.lookup(3).is_none() && t.lookup(5).is_none() && t.lookup(9).is_none());
     assert_eq!(
-        t.lookup(100).expect("out-of-range sharer stays bound").binding_id,
+        t.lookup(100)
+            .expect("out-of-range sharer stays bound")
+            .binding_id,
         2
     );
     assert_eq!(t.on_close(100), Some(2));
@@ -179,8 +187,14 @@ fn table_grows_to_large_fds_and_negative_fd_is_none() {
     t.bind(10_000, binding(1));
     assert_eq!(t.lookup(10_000).expect("large fd binds").binding_id, 1);
     assert!(t.lookup(9_999).is_none());
-    assert!(t.lookup(-1).is_none(), "negative fd must lookup None, never index");
-    assert!(t.lookup(i32::MAX).is_none(), "huge unbound fd is a cheap None");
+    assert!(
+        t.lookup(-1).is_none(),
+        "negative fd must lookup None, never index"
+    );
+    assert!(
+        t.lookup(i32::MAX).is_none(),
+        "huge unbound fd is a cheap None"
+    );
     assert_eq!(t.on_close(10_000), Some(1));
 }
 
@@ -245,16 +259,34 @@ fn classify_mirrors_the_daemon_screen_rows() {
         Err(BindRefusal::Flags),
         "O_PATH is the load-bearing refusal (search-only permission)"
     );
-    assert_eq!(classify_fd(libc::O_RDWR | libc::O_APPEND, reg, 1), Err(BindRefusal::Flags));
-    assert_eq!(classify_fd(libc::O_RDWR | libc::O_SYNC, reg, 1), Err(BindRefusal::Flags));
-    assert_eq!(classify_fd(libc::O_RDWR | libc::O_DSYNC, reg, 1), Err(BindRefusal::Flags));
-    assert_eq!(classify_fd(libc::O_RDWR | libc::O_TMPFILE, reg, 1), Err(BindRefusal::Flags));
+    assert_eq!(
+        classify_fd(libc::O_RDWR | libc::O_APPEND, reg, 1),
+        Err(BindRefusal::Flags)
+    );
+    assert_eq!(
+        classify_fd(libc::O_RDWR | libc::O_SYNC, reg, 1),
+        Err(BindRefusal::Flags)
+    );
+    assert_eq!(
+        classify_fd(libc::O_RDWR | libc::O_DSYNC, reg, 1),
+        Err(BindRefusal::Flags)
+    );
+    assert_eq!(
+        classify_fd(libc::O_RDWR | libc::O_TMPFILE, reg, 1),
+        Err(BindRefusal::Flags)
+    );
     assert_eq!(
         classify_fd(libc::O_RDWR, reg, 0),
         Err(BindRefusal::Flags),
         "st_nlink == 0 (unnamed/unlinked) refuses — passthrough serves it"
     );
-    for mode in [libc::S_IFDIR, libc::S_IFIFO, libc::S_IFSOCK, libc::S_IFBLK, libc::S_IFCHR] {
+    for mode in [
+        libc::S_IFDIR,
+        libc::S_IFIFO,
+        libc::S_IFSOCK,
+        libc::S_IFBLK,
+        libc::S_IFCHR,
+    ] {
         assert_eq!(
             classify_fd(libc::O_RDONLY, mode, 1),
             Err(BindRefusal::NotRegular),
@@ -266,10 +298,26 @@ fn classify_mirrors_the_daemon_screen_rows() {
 #[test]
 fn rwf_screen_passes_known_safe_and_refuses_the_rest() {
     assert!(!rwf_passthrough(0), "no flags ⇒ ring-eligible");
-    assert!(!rwf_passthrough(libc::RWF_HIPRI), "RWF_HIPRI is served (hint only)");
-    assert!(!rwf_passthrough(libc::RWF_SYNC | libc::RWF_DSYNC), "durability RWF flags ride the op");
-    assert!(rwf_passthrough(libc::RWF_APPEND), "RWF_APPEND ⇒ passthrough (atomic size authority)");
-    assert!(rwf_passthrough(libc::RWF_NOWAIT), "RWF_NOWAIT ⇒ passthrough (known-but-unservable)");
+    assert!(
+        !rwf_passthrough(libc::RWF_HIPRI),
+        "RWF_HIPRI is served (hint only)"
+    );
+    assert!(
+        rwf_passthrough(libc::RWF_SYNC),
+        "RWF_SYNC ⇒ passthrough (per-op durable barrier — the O_SYNC bind-refusal analogy)"
+    );
+    assert!(
+        rwf_passthrough(libc::RWF_DSYNC),
+        "RWF_DSYNC ⇒ passthrough (per-op durable barrier)"
+    );
+    assert!(
+        rwf_passthrough(libc::RWF_APPEND),
+        "RWF_APPEND ⇒ passthrough (atomic size authority)"
+    );
+    assert!(
+        rwf_passthrough(libc::RWF_NOWAIT),
+        "RWF_NOWAIT ⇒ passthrough (known-but-unservable)"
+    );
     assert!(
         rwf_passthrough(1 << 30),
         "UNKNOWN future flags must passthrough, never be silently dropped"

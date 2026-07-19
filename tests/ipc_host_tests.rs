@@ -1226,3 +1226,141 @@ async fn bootstrap_xattr_synthesis_filter_and_stats_fields() {
     }
     host.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// OQ-6 (v1.1): path-based ctl socket for container netns
+// ---------------------------------------------------------------------------
+//
+// Abstract AF_UNIX names are per network namespace (§5.2 known
+// limitation): a containerized app with the mount bind-mounted in but
+// its own netns can read the bootstrap xattr yet never connect. The
+// host therefore ALSO binds a filesystem-path SOCK_SEQPACKET socket
+// under a runtime dir and advertises it in the blob's reserved
+// `socket_path` field (carried since v1 — no ABI bump). The path
+// socket grants nothing the abstract one does not: SO_PEERCRED + the
+// §5.2 daemon fd screen remain the security boundary; the socket file
+// is 0666 BECAUSE connecting is not a credential.
+
+fn test_config_with_dir(name: &str, dir: &std::path::Path) -> IpcHostConfig {
+    let mut cfg = test_config(name);
+    cfg.socket_dir = Some(dir.to_path_buf());
+    cfg
+}
+
+#[test]
+fn path_socket_binds_advertises_and_serves_a_full_establish() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = test_config_with_dir("path-rt", dir.path());
+    let host = IpcHost::spawn(cfg.clone(), Arc::new(EchoSessionSink)).expect("host must spawn");
+
+    // Advertised in the blob's reserved field, and live on disk 0666
+    // (any uid that can read the mount may connect; connecting is not
+    // a credential — the fd screen is).
+    let blob = squeezefs_ipc::wire::BootstrapBlob::decode(&host.bootstrap_blob()).expect("blob");
+    let expected = dir
+        .path()
+        .join(format!("{}.sock", cfg.socket_name))
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(blob.socket_path, expected, "blob advertises the path socket");
+    assert_eq!(blob.socket, cfg.socket_name, "abstract stays primary");
+    let meta = std::fs::metadata(&blob.socket_path).expect("socket file exists");
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    assert!(meta.file_type().is_socket(), "must be a unix socket");
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o666,
+        "socket file mode is 0666"
+    );
+
+    // A full HELLO → SessionOk → BIND round trip over the PATH socket
+    // (identical protocol; only the rendezvous differs).
+    let mf = mount_file();
+    host.set_expected_st_dev(mf.st_dev);
+    let fd = open_flags(&mf.path, libc::O_RDWR);
+    let sock = path_connect(&blob.socket_path).expect("connect via path");
+    set_recv_timeout(&sock, Duration::from_secs(10));
+    send_ctl(
+        &sock,
+        &CtlMsg::Hello {
+            abi: squeezefs_ipc::layout::IPC_ABI,
+            pid: std::process::id(),
+            // SAFETY: getuid is trivially safe.
+            uid: unsafe { libc::getuid() },
+            build_commit: cfg.build_commit.clone(),
+            nonce: host.current_nonce(),
+        },
+        Some(fd.as_raw_fd()),
+    )
+    .expect("send HELLO over path socket");
+    let (reply, memfd) = recv_ctl(&sock).expect("recv HELLO reply");
+    match reply {
+        CtlMsg::SessionOk { .. } => {}
+        other => panic!("expected SessionOk over the path socket, got {other:?}"),
+    }
+    assert!(memfd.is_some(), "SessionOk must carry the memfd");
+    match bind(&sock, fd.as_raw_fd()) {
+        CtlMsg::BindOk { .. } => {}
+        other => panic!("expected BindOk over the path socket, got {other:?}"),
+    }
+
+    drop(sock);
+    host.shutdown();
+    assert!(
+        !std::path::Path::new(&blob.socket_path).exists(),
+        "shutdown must unlink the path socket (zero residue restored)"
+    );
+}
+
+#[test]
+fn unbindable_socket_dir_degrades_to_abstract_only_never_fails_spawn() {
+    // The path socket is optional plumbing: a dir that cannot be
+    // created/bound degrades LOUDLY to abstract-only — the mount (and
+    // same-netns interception) must never be held hostage by it.
+    let cfg = test_config_with_dir(
+        "path-degrade",
+        std::path::Path::new("/proc/does-not-exist/never"),
+    );
+    let host = IpcHost::spawn(cfg.clone(), Arc::new(EchoSessionSink))
+        .expect("spawn must survive a failed path bind");
+    let blob = squeezefs_ipc::wire::BootstrapBlob::decode(&host.bootstrap_blob()).expect("blob");
+    assert!(
+        blob.socket_path.is_empty(),
+        "no path advertised when the bind failed"
+    );
+    assert_eq!(blob.socket, cfg.socket_name, "abstract still serves");
+    // Abstract establish still works end to end.
+    let mf = mount_file();
+    host.set_expected_st_dev(mf.st_dev);
+    let fd = open_flags(&mf.path, libc::O_RDWR);
+    let (_sock, _sess) = establish(&cfg, &host, fd.as_raw_fd());
+    host.shutdown();
+}
+
+#[test]
+fn no_socket_dir_means_no_path_socket_and_empty_blob_field() {
+    let (host, cfg) = spawn_host("path-none");
+    let blob = squeezefs_ipc::wire::BootstrapBlob::decode(&host.bootstrap_blob()).expect("blob");
+    assert!(blob.socket_path.is_empty(), "v1-shaped blob when disabled");
+    assert_eq!(blob.socket, cfg.socket_name);
+    host.shutdown();
+}
+
+#[test]
+fn stale_socket_file_is_replaced_on_spawn() {
+    // Daemon names embed pid+random so a same-name file is OUR stale
+    // corpse (crash residue), never a live foreign daemon: bind must
+    // unlink-then-bind rather than fail EADDRINUSE.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = test_config_with_dir("path-stale", dir.path());
+    let stale = dir.path().join(format!("{}.sock", cfg.socket_name));
+    // A dead socket file with the same name (simulated crash residue).
+    let l = std::os::unix::net::UnixListener::bind(&stale).expect("stale bind");
+    drop(l);
+    assert!(stale.exists(), "stale socket file present before spawn");
+    let host = IpcHost::spawn(cfg, Arc::new(EchoSessionSink))
+        .expect("spawn must replace the stale socket file");
+    let blob = squeezefs_ipc::wire::BootstrapBlob::decode(&host.bootstrap_blob()).expect("blob");
+    assert!(!blob.socket_path.is_empty(), "path socket live after replace");
+    host.shutdown();
+}

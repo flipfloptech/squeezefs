@@ -17,7 +17,7 @@
 use squeezefs::fuse_client::METRICS;
 use squeezefs::ipc_host::{DataOp, IpcHost, IpcHostConfig, SessionSink, SlotCompletion};
 use squeezefs::ipc_service::DataPlaneSink;
-use squeezefs_il::session::{RingOutcome, Session};
+use squeezefs_il::session::{RingOutcome, Session, SessionError};
 use squeezefs_ipc::layout::Geometry;
 use squeezefs_ipc::wire::BootstrapBlob;
 
@@ -160,6 +160,7 @@ struct Fixture {
     _backing: tempfile::NamedTempFile,
     _meta: tempfile::NamedTempFile,
     _staging: tempfile::TempDir,
+    _sockdir: tempfile::TempDir,
 }
 
 impl Fixture {
@@ -169,8 +170,12 @@ impl Fixture {
             inner: DataPlaneSink::new(fs.clone(), tokio::runtime::Handle::current()),
             map: std::sync::Mutex::new(HashMap::new()),
         });
+        // OQ-6: fixtures advertise a path socket too (abstract stays the
+        // first rung — these suites prove both rungs of the ladder).
+        let sockdir = tempfile::tempdir().expect("socket tempdir");
         let cfg = IpcHostConfig {
             socket_name: format!("sqz-il0-session-{}-{}", std::process::id(), name),
+            socket_dir: Some(sockdir.path().to_path_buf()),
             build_commit: TEST_COMMIT.to_string(),
             allow_dev: false,
             geometry: test_geometry(),
@@ -193,6 +198,7 @@ impl Fixture {
             _backing: backing,
             _meta: meta,
             _staging: staging,
+            _sockdir: sockdir,
         }
     }
 
@@ -482,5 +488,49 @@ async fn explicit_poison_falls_through_and_stops_ctl_traffic() {
     );
     let _ = unbinds_before; // (bind-count is host-side; the real assert
                             // is that nothing panicked and nothing hung)
+    fx.host.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// OQ-6 (v1.1): connect ladder — abstract first, path-socket fallback
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn establish_falls_back_to_the_path_socket_when_abstract_is_unreachable() {
+    let fx = Fixture::new("path-ladder").await;
+    let mut blob = fx.blob();
+    assert!(
+        !blob.socket_path.is_empty(),
+        "fixture hosts advertise a path socket"
+    );
+    // A foreign-netns stand-in: the abstract name resolves nowhere in
+    // OUR namespace (ECONNREFUSED) while the path socket — reachable
+    // through any shared mount surface — still rendezvouses.
+    blob.socket = format!("sqz-il0-nowhere-{}", std::process::id());
+
+    let path = fx.dir.path().join(".hello-cred-ladder");
+    std::fs::write(&path, b"x").expect("cred file");
+    let f = std::fs::File::open(&path).expect("open cred");
+    let session = tokio::task::block_in_place(|| {
+        Session::establish(&blob, f.as_raw_fd(), TEST_COMMIT)
+            .expect("path-socket fallback must establish")
+    });
+    assert!(!session.poisoned(), "fallback session is live");
+    drop(session);
+
+    // Both rungs dead ⇒ Socket error (the bind_refused{socket} path).
+    let mut dead = fx.blob();
+    dead.socket = format!("sqz-il0-nowhere2-{}", std::process::id());
+    dead.socket_path = "/tmp/sqz-il0-does-not-exist.sock".to_string();
+    let err = tokio::task::block_in_place(
+        || match Session::establish(&dead, f.as_raw_fd(), TEST_COMMIT) {
+            Ok(_) => panic!("no rendezvous must refuse"),
+            Err(e) => e,
+        },
+    );
+    assert!(
+        matches!(err, SessionError::Socket(_)),
+        "both-rungs-dead is a socket refusal, got {err:?}"
+    );
     fx.host.shutdown();
 }

@@ -16,8 +16,12 @@ license-file = "LICENSE"
 #   - loom-models — must stay its own workspace so `--cfg loom` RUSTFLAGS
 #     never poison the main dependency graph (see loom-models/Cargo.toml).
 [workspace]
-members = [".", "crates/squeezefs-ipc"]
+members = [".", "crates/squeezefs-ipc", "crates/squeezefs-preload"]
 exclude = ["crates/fuse3", "loom-models"]
+# squeezefs-preload is deliberately NOT a default member (§5.4 Issue-4):
+# plain root `--release` builds carry panic="abort", which its
+# compile_error! guard refuses — it builds only under
+# `--profile preload-release` via tests/run_preload_gate.sh.
 default-members = [".", "crates/squeezefs-ipc"]
 
 [dependencies]

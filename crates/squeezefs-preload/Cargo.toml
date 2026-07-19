@@ -1,0 +1,39 @@
+# squeezefs-preload — the L4 LD_PRELOAD interception shim
+# (docs/design-preload-interception.md §5.4, PR L4-5).
+#
+# Output: `libsqueezefs_il.so`. Dependencies: `libc` + `squeezefs-ipc`
+# ONLY — no tokio, no allocator replacement (§5.4: we never interpose
+# allocation for the host app; the daemon's jemalloc is a Rust
+# #[global_allocator], a property this crate keeps).
+#
+# BUILD DISCIPLINE (§5.4 Issue-4): the ONLY sanctioned build of the
+# shipped .so is
+#
+#     cargo build -p squeezefs-preload --profile preload-release
+#
+# (root profile `release` carries panic="abort", which would void the
+# interposers' catch_unwind and turn any shim panic into a host-app
+# abort; src/lib.rs carries the #[cfg(panic = "abort")] compile_error!
+# guard making a wrong-profile build unrepresentable). The crate is
+# deliberately OUTSIDE the workspace default-members so plain root
+# `--release` invocations never build it; `tests/run_preload_gate.sh`
+# is its gate.
+
+[package]
+name = "squeezefs-preload"
+# cargo-internal placeholder only — SqueezeFS versions are git commits
+# (see docs/operations.md §Versioning & releases); never bump for releases.
+version = "0.1.0"
+edition = "2021"
+license-file = "../../LICENSE"
+publish = false
+
+[lib]
+name = "squeezefs_il"
+# cdylib = the shipped interposer .so; rlib = what the crate's own test
+# suite (and only it) links — never shipped into host apps.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libc = "0.2"
+squeezefs-ipc = { path = "../squeezefs-ipc" }

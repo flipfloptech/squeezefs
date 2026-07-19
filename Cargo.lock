@@ -2264,6 +2264,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "squeezefs-preload"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "squeezefs-ipc",
+]
+
+[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

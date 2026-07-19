@@ -78,6 +78,7 @@ coz-on = ["dep:coz"]
 
 [dev-dependencies]
 regex = "1.10"
+squeezefs-ipc = { path = "crates/squeezefs-ipc" }
 tempfile = "3.10"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1.5"
@@ -122,6 +123,10 @@ harness = false
 
 [[bench]]
 name = "squeezefs_bench"
+harness = false
+
+[[bench]]
+name = "ipc_hop_bench"
 harness = false
 
 

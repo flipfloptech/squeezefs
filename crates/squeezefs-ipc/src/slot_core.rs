@@ -260,6 +260,14 @@ impl SlotCore {
     pub fn raw_state(&self) -> u32 {
         self.state.load(Ordering::Acquire)
     }
+
+    /// The state word itself — the futex address a parked client sleeps
+    /// on ([`ParkOutcome::Park`]'s `expected` is compared against exactly
+    /// this word) and [`Self::complete`]'s wake target. Cross-process
+    /// futexes on shm must NOT use `FUTEX_PRIVATE_FLAG`.
+    pub fn state_futex_word(&self) -> &AtomicU32 {
+        &self.state
+    }
 }
 
 #[cfg(all(test, not(loom)))]

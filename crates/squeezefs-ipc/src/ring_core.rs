@@ -148,9 +148,15 @@ impl<'a> MpscRingView<'a> {
     /// PRECONDITION: single owner, before the mapping is shared — the
     /// session creator calls this exactly once, before any producer or
     /// the consumer can observe the ring (the same write-once discipline
-    /// as the session header).
+    /// as the session header). Relaxed stores are exact under that
+    /// precondition: the act of sharing the mapping (fd passing) is the
+    /// synchronization point.
     pub fn seed_for_sharing(&self) {
-        todo!("PR L4-2 red phase")
+        self.tail.store(0, Ordering::Relaxed);
+        for (index, cell) in self.cells.iter().enumerate() {
+            cell.value.store(0, Ordering::Relaxed);
+            cell.seq.store(index as u32, Ordering::Relaxed);
+        }
     }
 
     /// Producer side (any thread, any number of racing producers): publish

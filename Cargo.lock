@@ -2239,6 +2239,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "socket2 0.5.10",
+ "squeezefs-ipc",
  "sysinfo",
  "tempfile",
  "thiserror 1.0.69",
@@ -2256,7 +2257,10 @@ dependencies = [
 name = "squeezefs-ipc"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "proptest",
+ "scc",
+ "tokio",
 ]
 
 [[package]]

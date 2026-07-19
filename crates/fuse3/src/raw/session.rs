@@ -361,8 +361,16 @@ impl<FS> Session<FS> {
 
     /// get a [`notify`].
     ///
+    /// `pub` since PR L4-6 (the design's amended Non-Goal sanctions this
+    /// additive exposure): the daemon captures a handle **before**
+    /// `mount()` consumes the session and drives
+    /// `FUSE_NOTIFY_INVAL_INODE` for ring-write invalidations (§5.6.2
+    /// W1). The handle clones the session's reply channel, so it stays
+    /// valid for the mount's lifetime and rides the classical
+    /// connection's reply path even after FUSE-over-io_uring arms.
+    ///
     /// [`notify`]: Notify
-    fn get_notify(&self) -> Notify {
+    pub fn get_notify(&self) -> Notify {
         Notify::new(self.response_sender.clone())
     }
 

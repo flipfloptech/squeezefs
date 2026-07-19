@@ -9,6 +9,14 @@
 # will likely look very different (and much more reasonable).
 # See Cargo.toml.orig for the original contents.
 
+# Excluded from the root workspace (root Cargo.toml `workspace.exclude`);
+# this empty table makes the crate its own workspace root so `cargo test`
+# runs here standalone — the loom-models precedent (own workspace, own
+# lock). Without it, cargo refuses with "believes it's in a workspace
+# when it's not" (broken since the L4-1 root-workspace introduction;
+# surfaced by the L4-6 gate, the first to run this suite since).
+[workspace]
+
 [package]
 edition = "2021"
 rust-version = "1.77"

@@ -1535,6 +1535,19 @@ prep_failed_row() { # <regime> <wl> <sys> — NA rows for a failed untimed prep
 # ---------------------------------------------------------------------------
 
 il_preflight() {
+    # KD-7: sessions bind only between IDENTICAL build commits, and the
+    # dev override forgives degeneracy (-dirty), never INEQUALITY. The
+    # first full closing run failed exactly here: the daemon binary was
+    # built pre-commit (X-dirty) and the shim post-commit (Y) — every
+    # establish refused client-side, every row ran kernel FUSE, and the
+    # engagement gate INVALIDed all 12 (working as chartered). Build
+    # BOTH ends now, from the same tree state.
+    log "il: rebuilding daemon + shim from the current tree (KD-7 identity)"
+    if [ "$(id -u)" -eq 0 ] && [ -n "$RUNUSER" ] && [ "$RUNUSER" != "root" ]; then
+        su -s /bin/bash "$RUNUSER" -c "cd '$REPO_DIR' && cargo build --release" || die "il: daemon build failed"
+    else
+        (cd "$REPO_DIR" && cargo build --release) || die "il: daemon build failed"
+    fi
     # The shipped cdylib (sanctioned build only — Issue-4 profile law).
     local build_cmd="cargo build -p squeezefs-preload --profile preload-release --features interposers"
     if [ "$(id -u)" -eq 0 ] && [ -n "$RUNUSER" ] && [ "$RUNUSER" != "root" ]; then

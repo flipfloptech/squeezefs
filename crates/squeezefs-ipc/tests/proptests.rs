@@ -13,9 +13,9 @@ use squeezefs_ipc::slot_core::{ParkOutcome, SlotCore};
 use std::collections::VecDeque;
 
 fn valid_geometry() -> impl Strategy<Value = Geometry> {
-    // ring_entries: power of two 1..=65536; slots 1..=ring_entries;
-    // arena: 1..=1024 pages; max_op 1..=arena.
-    (0u32..=16, 1u64..=1024)
+    // ring_entries: power of two 2..=65536 (MIN_RING_ENTRIES floor);
+    // slots 1..=ring_entries; arena: 1..=1024 pages; max_op 1..=arena.
+    (1u32..=16, 1u64..=1024)
         .prop_flat_map(|(ring_pow, arena_pages)| {
             let ring_entries = 1u32 << ring_pow;
             let arena_bytes = arena_pages * PAGE_BYTES;
@@ -26,13 +26,15 @@ fn valid_geometry() -> impl Strategy<Value = Geometry> {
                 1..=u32::try_from(arena_bytes.min(u64::from(u32::MAX))).unwrap(),
             )
         })
-        .prop_map(|(ring_entries, slots, arena_bytes, max_op_bytes)| Geometry {
-            ring_entries,
-            slots,
-            arena_bytes,
-            max_op_bytes,
-            _pad: 0,
-        })
+        .prop_map(
+            |(ring_entries, slots, arena_bytes, max_op_bytes)| Geometry {
+                ring_entries,
+                slots,
+                arena_bytes,
+                max_op_bytes,
+                _pad: 0,
+            },
+        )
 }
 
 proptest! {
@@ -76,7 +78,7 @@ proptest! {
     /// VecDeque bounded to the same capacity, across many laps.
     #[test]
     fn ring_matches_reference_model(
-        cap_pow in 0u32..=4,
+        cap_pow in 1u32..=4,
         ops in proptest::collection::vec(any::<bool>(), 1..200),
     ) {
         let capacity = 1u32 << cap_pow;

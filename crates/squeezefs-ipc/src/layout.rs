@@ -103,7 +103,37 @@ impl Geometry {
     /// Validate every geometry rule (each refusal is a distinct variant —
     /// the daemon's bind refusal ledger wants attribution).
     pub fn validate(&self) -> Result<(), GeometryError> {
-        todo!("PR L4-1 red phase")
+        if self.ring_entries < crate::ring_core::MIN_RING_ENTRIES {
+            return Err(GeometryError::RingEntriesTooSmall);
+        }
+        if !self.ring_entries.is_power_of_two() {
+            return Err(GeometryError::RingEntriesNotPowerOfTwo);
+        }
+        if self.ring_entries > crate::ring_core::MAX_RING_ENTRIES {
+            return Err(GeometryError::RingEntriesTooLarge);
+        }
+        if self.slots == 0 {
+            return Err(GeometryError::SlotsZero);
+        }
+        if self.slots > self.ring_entries {
+            return Err(GeometryError::SlotsExceedRingEntries);
+        }
+        if self.arena_bytes == 0 {
+            return Err(GeometryError::ArenaZero);
+        }
+        if !self.arena_bytes.is_multiple_of(PAGE_BYTES) {
+            return Err(GeometryError::ArenaNotPageMultiple);
+        }
+        if self.arena_bytes > MAX_ARENA_BYTES {
+            return Err(GeometryError::ArenaTooLarge);
+        }
+        if self.max_op_bytes == 0 {
+            return Err(GeometryError::MaxOpZero);
+        }
+        if u64::from(self.max_op_bytes) > self.arena_bytes {
+            return Err(GeometryError::MaxOpExceedsArena);
+        }
+        Ok(())
     }
 }
 
@@ -111,7 +141,7 @@ impl Geometry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeometryError {
     RingEntriesNotPowerOfTwo,
-    RingEntriesZero,
+    RingEntriesTooSmall,
     RingEntriesTooLarge,
     SlotsZero,
     SlotsExceedRingEntries,
@@ -127,7 +157,7 @@ impl core::fmt::Display for GeometryError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let s = match self {
             Self::RingEntriesNotPowerOfTwo => "ring_entries must be a power of two",
-            Self::RingEntriesZero => "ring_entries must be nonzero",
+            Self::RingEntriesTooSmall => "ring_entries below MIN_RING_ENTRIES",
             Self::RingEntriesTooLarge => "ring_entries exceeds MAX_RING_ENTRIES",
             Self::SlotsZero => "slots must be nonzero",
             Self::SlotsExceedRingEntries => "slots must not exceed ring_entries",
@@ -169,8 +199,48 @@ pub struct SessionLayout {
 impl SessionLayout {
     /// Compute the layout for a geometry (validates it first).
     pub fn compute(geometry: &Geometry) -> Result<Self, GeometryError> {
-        let _ = geometry;
-        todo!("PR L4-1 red phase")
+        geometry.validate()?;
+
+        fn page_round(bytes: u64) -> Result<u64, GeometryError> {
+            bytes
+                .checked_add(PAGE_BYTES - 1)
+                .map(|v| v / PAGE_BYTES * PAGE_BYTES)
+                .ok_or(GeometryError::Overflow)
+        }
+        fn add(a: u64, b: u64) -> Result<u64, GeometryError> {
+            a.checked_add(b).ok_or(GeometryError::Overflow)
+        }
+
+        let header_off = 0;
+        let header_bytes = PAGE_BYTES;
+        let ring_off = add(header_off, header_bytes)?;
+        let ring_bytes = add(
+            RING_TAIL_LINE_BYTES,
+            u64::from(geometry.ring_entries) * RING_CELL_BYTES,
+        )?;
+        let ring_cells_off = add(ring_off, RING_TAIL_LINE_BYTES)?;
+        let slots_off = page_round(add(ring_off, ring_bytes)?)?;
+        let slots_bytes = u64::from(geometry.slots) * SLOT_BYTES;
+        let stats_off = page_round(add(slots_off, slots_bytes)?)?;
+        let stats_bytes = PAGE_BYTES;
+        let arena_off = page_round(add(stats_off, stats_bytes)?)?;
+        let arena_bytes = geometry.arena_bytes;
+        let total_bytes = add(arena_off, arena_bytes)?;
+
+        Ok(Self {
+            header_off,
+            header_bytes,
+            ring_off,
+            ring_bytes,
+            ring_cells_off,
+            slots_off,
+            slots_bytes,
+            stats_off,
+            stats_bytes,
+            arena_off,
+            arena_bytes,
+            total_bytes,
+        })
     }
 }
 
@@ -233,7 +303,16 @@ impl SessionHeader {
     /// Client-side map-time check: magic + ABI + geometry validity. (The
     /// daemon never calls this on a live mapping — §5.3.1 rule 1.)
     pub fn validate(&self) -> Result<(), HeaderError> {
-        todo!("PR L4-1 red phase")
+        if self.magic != IPC_MAGIC {
+            return Err(HeaderError::BadMagic);
+        }
+        if self.abi != IPC_ABI {
+            return Err(HeaderError::AbiMismatch {
+                theirs: self.abi,
+                ours: IPC_ABI,
+            });
+        }
+        self.geometry.validate().map_err(HeaderError::Geometry)
     }
 }
 
@@ -405,7 +484,15 @@ mod tests {
                     ring_entries: 0,
                     ..ok
                 },
-                GeometryError::RingEntriesZero,
+                GeometryError::RingEntriesTooSmall,
+            ),
+            (
+                Geometry {
+                    ring_entries: 1,
+                    slots: 1,
+                    ..ok
+                },
+                GeometryError::RingEntriesTooSmall,
             ),
             (
                 Geometry {

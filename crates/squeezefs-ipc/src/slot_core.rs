@@ -121,14 +121,37 @@ impl SlotCore {
     /// not FREE (caller scans on — bounded scan + free-list hint live in
     /// the client library, not here).
     pub fn try_claim(&self) -> Option<u64> {
-        todo!("PR L4-1 red phase")
+        // Acquire pairs with `release`'s Release store: the new claimant's
+        // descriptor writes are ordered after the previous consumer's
+        // result read (slot reuse never tears across lives).
+        self.state
+            .compare_exchange(
+                STATE_FREE,
+                STATE_CLAIMED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .ok()?;
+        // Exclusive claimant bumps the generation. Relaxed is sound: the
+        // bump is sequenced before `publish_submitted`'s Release store,
+        // and every DONE observation Acquire-loads a state word in that
+        // store's release sequence — so anyone who sees this life's DONE
+        // sees this generation (the `ipc_slot_core` loom model checks it).
+        Some(self.generation.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
     /// Client: publish the filled descriptor — CLAIMED → SUBMITTED
     /// (Release; pairs with [`Self::try_begin_serve`]'s Acquire so the
     /// daemon's snapshot sees every descriptor write).
     pub fn publish_submitted(&self) {
-        todo!("PR L4-1 red phase")
+        debug_assert_eq!(
+            state_bits(self.state.load(Ordering::Relaxed)),
+            STATE_CLAIMED,
+            "publish_submitted outside CLAIMED"
+        );
+        // WAITER cannot be set here in the honest protocol (a client only
+        // waits on an op it has submitted), so a plain store is exact.
+        self.state.store(STATE_SUBMITTED, Ordering::Release);
     }
 
     /// Daemon: SUBMITTED → SERVING (WAITER bit preserved — a client may
@@ -138,7 +161,25 @@ impl SlotCore {
     /// Success is the Acquire edge licensing the ONE descriptor snapshot
     /// read (§5.3.1 rule 1).
     pub fn try_begin_serve(&self) -> bool {
-        todo!("PR L4-1 red phase")
+        let mut cur = self.state.load(Ordering::Relaxed);
+        loop {
+            if state_bits(cur) != STATE_SUBMITTED {
+                return false;
+            }
+            // Preserve WAITER: a client may already be parked (or parking)
+            // on this word. Acquire on success pairs with
+            // `publish_submitted`'s Release — the descriptor snapshot that
+            // follows sees every client write.
+            match self.state.compare_exchange_weak(
+                cur,
+                STATE_SERVING | (cur & WAITER),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 
     /// Daemon: SERVING → DONE after the result is written into the slot.
@@ -147,7 +188,16 @@ impl SlotCore {
     /// (The swap also clears the WAITER bit: a woken client re-checks via
     /// [`Self::is_done_for`], never via the bit.)
     pub fn complete(&self) -> bool {
-        todo!("PR L4-1 red phase")
+        // AcqRel: the Release half publishes the result write (and, via
+        // the release sequence headed at `publish_submitted`, the claim's
+        // generation bump); the Acquire half orders the WAITER decision.
+        let prior = self.state.swap(STATE_DONE, Ordering::AcqRel);
+        debug_assert_eq!(
+            state_bits(prior),
+            STATE_SERVING,
+            "complete() outside SERVING"
+        );
+        prior & WAITER != 0
     }
 
     /// Anyone: is this slot DONE for generation `gen`? The legit waiter's
@@ -155,22 +205,50 @@ impl SlotCore {
     /// in one: orders the state load (Acquire) before the generation load,
     /// so a recycled slot's DONE is never attributed to an old generation.
     pub fn is_done_for(&self, gen: u64) -> bool {
-        let _ = gen;
-        todo!("PR L4-1 red phase")
+        // State FIRST (Acquire — synchronizes with `complete`'s Release
+        // half), generation second: once this life's DONE is visible, so
+        // is this life's generation bump (it happens-before the DONE
+        // publication), so a stale generation can never match. Relaxed on
+        // the generation load is sound under that happens-before — the
+        // overwritten old generation is unreadable here.
+        if state_bits(self.state.load(Ordering::Acquire)) != STATE_DONE {
+            return false;
+        }
+        self.generation.load(Ordering::Relaxed) == gen
     }
 
     /// Client: two-phase park entry — set WAITER and re-check DONE in one
     /// RMW (publish-then-recheck; §5.3 protocol rule 2). [`ParkOutcome::
     /// Ready`] means DONE already published: consume, do not park.
     pub fn park_prepare(&self) -> ParkOutcome {
-        todo!("PR L4-1 red phase")
+        // One RMW does both phases: publish the WAITER bit AND re-check
+        // DONE. Either this lands before `complete`'s swap (which then
+        // reads the bit and wakes) or after it (prior reads DONE ⇒ Ready).
+        // There is no third interleaving — that is the whole protocol.
+        // AcqRel: the Acquire half makes a Ready outcome license the
+        // result read immediately.
+        let prior = self.state.fetch_or(WAITER, Ordering::AcqRel);
+        if state_bits(prior) == STATE_DONE {
+            ParkOutcome::Ready
+        } else {
+            ParkOutcome::Park {
+                expected: prior | WAITER,
+            }
+        }
     }
 
     /// Client: DONE → FREE after consuming the result (Release; pairs with
     /// the next [`Self::try_claim`]'s Acquire so slot reuse never observes
     /// the previous op's stores out of order).
     pub fn release(&self) {
-        todo!("PR L4-1 red phase")
+        debug_assert_eq!(
+            state_bits(self.state.load(Ordering::Relaxed)),
+            STATE_DONE,
+            "release() outside DONE"
+        );
+        // Release pairs with the next `try_claim`'s Acquire (see there).
+        // Clears a late parker's WAITER bit with the rest of the word.
+        self.state.store(STATE_FREE, Ordering::Release);
     }
 
     /// Current generation (diagnostics / model assertions).

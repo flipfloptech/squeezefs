@@ -45,6 +45,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// under wrapping `u32` arithmetic.
 pub const MAX_RING_ENTRIES: u32 = 1 << 16;
 
+/// Hard capacity floor. A 1-cell ring is structurally broken in the
+/// cell-sequence scheme: position 1's claim check (`seq == 1`) is
+/// indistinguishable from position 0's publication (`seq == 0 + 1`), so a
+/// second producer would overwrite an unconsumed entry (found by the
+/// ring-vs-reference property suite; Vyukov's original asserts the same
+/// floor).
+pub const MIN_RING_ENTRIES: u32 = 2;
+
 /// One ring cell: a publication sequence plus the published op-slot index.
 ///
 /// `seq` encodes the cell's lap state (Vyukov): `index` = empty and
@@ -72,8 +80,9 @@ impl RingCell {
 pub enum RingGeometryError {
     /// Capacity must be a power of two (mask indexing).
     NotPowerOfTwo,
-    /// Zero cells.
-    Empty,
+    /// Capacity below [`MIN_RING_ENTRIES`] (see there — a 1-cell ring is
+    /// structurally broken).
+    TooSmall,
     /// Capacity above [`MAX_RING_ENTRIES`].
     TooLarge,
 }
@@ -82,7 +91,7 @@ impl core::fmt::Display for RingGeometryError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NotPowerOfTwo => write!(f, "ring capacity must be a power of two"),
-            Self::Empty => write!(f, "ring capacity must be nonzero"),
+            Self::TooSmall => write!(f, "ring capacity must be at least MIN_RING_ENTRIES"),
             Self::TooLarge => write!(f, "ring capacity exceeds MAX_RING_ENTRIES"),
         }
     }
@@ -102,15 +111,15 @@ pub struct MpscRingView<'a> {
 }
 
 impl<'a> MpscRingView<'a> {
-    /// Build a view over `tail` + `cells`. `cells.len()` must be a nonzero
-    /// power of two ≤ [`MAX_RING_ENTRIES`].
+    /// Build a view over `tail` + `cells`. `cells.len()` must be a power of
+    /// two in [`MIN_RING_ENTRIES`]..=[`MAX_RING_ENTRIES`].
     pub fn from_parts(
         tail: &'a AtomicU32,
         cells: &'a [RingCell],
     ) -> Result<Self, RingGeometryError> {
         let len = cells.len();
-        if len == 0 {
-            return Err(RingGeometryError::Empty);
+        if len < MIN_RING_ENTRIES as usize {
+            return Err(RingGeometryError::TooSmall);
         }
         if !len.is_power_of_two() {
             return Err(RingGeometryError::NotPowerOfTwo);
@@ -135,8 +144,48 @@ impl<'a> MpscRingView<'a> {
     /// visible backpressure — the caller spins/parks/falls through per the
     /// design §5.4.1 ladder; the daemon is never blocked by a full ring).
     pub fn push(&self, value: u32) -> bool {
-        let _ = value;
-        todo!("PR L4-1 red phase")
+        let mut tail = self.tail.load(Ordering::Relaxed);
+        loop {
+            let cell = &self.cells[(tail & self.mask) as usize];
+            // Acquire pairs with the consumer's cell-freeing Release store:
+            // a producer reusing the cell on lap N+1 must see it freed.
+            let seq = cell.seq.load(Ordering::Acquire);
+            let dif = seq.wrapping_sub(tail) as i32;
+            match dif.cmp(&0) {
+                core::cmp::Ordering::Equal => {
+                    // Cell is empty at exactly our position: reserve it.
+                    // Relaxed CAS on the tail is the classic bounded-MPSC
+                    // shape — publication rides the cell seq below, never
+                    // the tail word.
+                    match self.tail.compare_exchange_weak(
+                        tail,
+                        tail.wrapping_add(1),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            cell.value.store(value, Ordering::Relaxed);
+                            // Publish: seq = position + 1. Release pairs
+                            // with the consumer's Acquire so the value
+                            // store above is visible with it.
+                            cell.seq.store(tail.wrapping_add(1), Ordering::Release);
+                            return true;
+                        }
+                        Err(observed) => tail = observed,
+                    }
+                }
+                core::cmp::Ordering::Less => {
+                    // Previous-lap occupant not yet freed: the ring is
+                    // full. (A hostile client corrupting seqs can force
+                    // this observation — bounded backpressure, never UB.)
+                    return false;
+                }
+                core::cmp::Ordering::Greater => {
+                    // Another producer already published past us; reload.
+                    tail = self.tail.load(Ordering::Relaxed);
+                }
+            }
+        }
     }
 }
 
@@ -157,8 +206,24 @@ impl RingConsumer {
     /// Consume the next published index, if any. Must only ever be called
     /// by the one consumer (module-level precondition).
     pub fn pop(&mut self, ring: &MpscRingView<'_>) -> Option<u32> {
-        let _ = ring;
-        todo!("PR L4-1 red phase")
+        let head = self.head;
+        let cell = &ring.cells[(head & ring.mask) as usize];
+        // Acquire pairs with the producer's publishing Release store.
+        let seq = cell.seq.load(Ordering::Acquire);
+        if seq.wrapping_sub(head.wrapping_add(1)) as i32 == 0 {
+            let value = cell.value.load(Ordering::Relaxed);
+            // Free the cell for lap N+1: seq = position + capacity.
+            // Release pairs with a reusing producer's Acquire (our value
+            // read above must not be reordered past the hand-back).
+            cell.seq
+                .store(head.wrapping_add(ring.capacity()), Ordering::Release);
+            self.head = head.wrapping_add(1);
+            Some(value)
+        } else {
+            // Not yet published (or a hostile client scribbled the seq —
+            // observed as empty; bounded behavior, never out-of-bounds).
+            None
+        }
     }
 }
 
@@ -175,8 +240,8 @@ impl RingStorage {
     /// Allocate + seed a ring. `capacity` must satisfy
     /// [`MpscRingView::from_parts`]'s geometry rules.
     pub fn with_capacity(capacity: u32) -> Result<Self, RingGeometryError> {
-        if capacity == 0 {
-            return Err(RingGeometryError::Empty);
+        if capacity < MIN_RING_ENTRIES {
+            return Err(RingGeometryError::TooSmall);
         }
         if !capacity.is_power_of_two() {
             return Err(RingGeometryError::NotPowerOfTwo);
@@ -205,7 +270,12 @@ mod tests {
     fn geometry_refusals_exact() {
         assert_eq!(
             RingStorage::with_capacity(0).unwrap_err(),
-            RingGeometryError::Empty
+            RingGeometryError::TooSmall
+        );
+        assert_eq!(
+            RingStorage::with_capacity(1).unwrap_err(),
+            RingGeometryError::TooSmall,
+            "a 1-cell ring is structurally broken (see MIN_RING_ENTRIES)"
         );
         assert_eq!(
             RingStorage::with_capacity(3).unwrap_err(),
@@ -218,7 +288,7 @@ mod tests {
         let tail = AtomicU32::new(0);
         assert_eq!(
             MpscRingView::from_parts(&tail, &[]).unwrap_err(),
-            RingGeometryError::Empty
+            RingGeometryError::TooSmall
         );
         let cells: Vec<RingCell> = (0..3).map(RingCell::seeded).collect();
         assert_eq!(
@@ -335,7 +405,10 @@ mod tests {
         done.store(true, Ordering::Release);
         let seen = consumer.join().unwrap();
         for (v, n) in seen.iter().enumerate() {
-            assert_eq!(*n, 1, "value {v} delivered {n} times (must be exactly once)");
+            assert_eq!(
+                *n, 1,
+                "value {v} delivered {n} times (must be exactly once)"
+            );
         }
     }
 }

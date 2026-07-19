@@ -85,6 +85,15 @@ fi
 
 echo "=== Leg 2: interception mount battery ==="
 
+# Dev-box identity posture: a dirty tree stamps a `-dirty` build commit,
+# which is a DEGENERATE KD-7 identity — both ends refuse to establish
+# unless the counted dev override is set (the first sudo run of this
+# gate proved that refusal fires for real). The override still requires
+# commit-string EQUALITY: a shim and daemon built from different tree
+# states refuse regardless, which is exactly what a gate wants.
+export SQUEEZEFS_IPC_ALLOW_DEV=1
+echo "note: SQUEEZEFS_IPC_ALLOW_DEV=1 (dev-tree identities; counted in ipc_binds_dev_override)"
+
 # 2a. Build the daemon and mount with --interception.
 run_as_user "cargo build --release"
 SQUEEZEFS_BIN="$REPO_DIR/target/release/squeezefs"
@@ -131,16 +140,28 @@ stats() { # stats <key>
 # fine: --allow-other admits any uid, and root's opens pass the screen.
 ILP() { LD_PRELOAD="$SO" "$@"; }
 
+# Ring writes grow files invisibly to the KERNEL's attr cache (size TTL
+# 1 s): an unbound reader (cmp here) inside that window sees the stale
+# size — the documented §5.6.2 W1-class bound. PR L4-6's
+# notify_inval_inode mitigation shrinks it; until then the parity rows
+# wait out the TTL. Reads THROUGH the shim (ring reads) never see the
+# window — daemon state is the authority — which the dd read-back row
+# proves by running with no settle at all.
+ATTR_TTL_SETTLE=1.2
+settle() { sleep "$ATTR_TTL_SETTLE"; }
+
 # 2b. cp/dd parity ON the mount + the §3 rule-4 engagement proof.
 OPS_R0=$(stats ipc_ops_read); OPS_W0=$(stats ipc_ops_write); SESS0=$(stats ipc_sessions_total)
 
 ILP cp "$T/src.bin" "$MOUNT_DIR/cp.bin"
-cmp "$T/src.bin" "$MOUNT_DIR/cp.bin" || fail "cp parity onto the mount"
 ILP dd if="$MOUNT_DIR/cp.bin" of="$T/back.bin" bs=64k status=none
-cmp "$T/src.bin" "$T/back.bin" || fail "dd read-back parity from the mount"
+cmp "$T/src.bin" "$T/back.bin" || fail "ring read-back parity (no settle: daemon state is the authority)"
+settle
+cmp "$T/src.bin" "$MOUNT_DIR/cp.bin" || fail "cp parity onto the mount (kernel reader, post-TTL)"
 ILP dd if="$T/src.bin" of="$MOUNT_DIR/dd.bin" bs=1M oflag=direct status=none 2>/dev/null \
     || ILP dd if="$T/src.bin" of="$MOUNT_DIR/dd.bin" bs=1M status=none
-cmp "$T/src.bin" "$MOUNT_DIR/dd.bin" || fail "dd write parity onto the mount"
+settle
+cmp "$T/src.bin" "$MOUNT_DIR/dd.bin" || fail "dd write parity onto the mount (kernel reader, post-TTL)"
 
 OPS_R1=$(stats ipc_ops_read); OPS_W1=$(stats ipc_ops_write); SESS1=$(stats ipc_sessions_total)
 [ "$SESS1" -gt "$SESS0" ] || fail "no IPC session was ever established (engagement, §3 rule 4)"

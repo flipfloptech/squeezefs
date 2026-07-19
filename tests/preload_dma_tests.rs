@@ -314,10 +314,16 @@ async fn dma_lever_off_keeps_parity_with_zero_dmas() {
     fx.host.shutdown();
 }
 
-/// Warm reads (active-buffer hits) never DMA — the fast path serves
-/// them; the DMA plumb is exclusively the cold handoff's business.
+/// Two premises this test DISPROVED while red, now pinned as facts:
+/// a 64 KiB file takes the STAGED layout (no active-block buffer, so
+/// warm reads handoff — no fast-path serve), and the staging serve
+/// HONORS the dest plumb (bytes land directly in the arena: one
+/// staging→arena copy, the pool bounce deleted — counted, parity
+/// unconditional). What must never move the counter is the sync fast
+/// path, which completes structurally before the plumb exists — the
+/// EOF row pins that half.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn warm_reads_do_not_dma() {
+async fn staged_serves_land_in_arena_and_fast_path_never_dmas() {
     let fx = Fixture::new("warm").await;
     let session = fx.establish();
     let (_ino, fd) = fx.create_file("warm.bin").await;
@@ -332,14 +338,24 @@ async fn warm_reads_do_not_dma() {
     let mut buf = vec![0u8; w.len()];
     let _ = tokio::task::block_in_place(|| session.ring_pread(grant.binding_id, &mut buf, 0));
 
-    let dma_before = METRICS.ipc_arena_dma_reads.load(Ordering::Relaxed);
-    let fast_before = METRICS.ipc_fast_path_serves.load(Ordering::Relaxed);
     let out = tokio::task::block_in_place(|| session.ring_pread(grant.binding_id, &mut buf, 0));
     assert!(matches!(out, RingOutcome::Served(n) if n == w.len()));
-    assert_eq!(buf, w);
+    assert_eq!(
+        buf, w,
+        "staged-layout warm read parity (in-arena landing or copied — either way exact)"
+    );
+    let dma_before = METRICS.ipc_arena_dma_reads.load(Ordering::Relaxed);
+
+    // EOF short-circuit = a sync fast-path serve, structurally pre-DMA.
+    let fast_before = METRICS.ipc_fast_path_serves.load(Ordering::Relaxed);
+    let out = tokio::task::block_in_place(|| {
+        let mut b = vec![0u8; 4096];
+        session.ring_pread(grant.binding_id, &mut b, 1 << 40)
+    });
+    assert!(matches!(out, RingOutcome::Served(0)));
     assert!(
         METRICS.ipc_fast_path_serves.load(Ordering::Relaxed) > fast_before,
-        "warm read serves on the fast path"
+        "EOF row still fast-paths"
     );
     assert_eq!(
         METRICS.ipc_arena_dma_reads.load(Ordering::Relaxed),

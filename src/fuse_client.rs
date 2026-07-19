@@ -2101,6 +2101,14 @@ pub struct Metrics {
     /// write-storm economy gauge (notifies ≫ suppressed on rand-write
     /// workloads = window regression).
     pub ipc_inval_suppressed: Align64<AtomicU64>,
+    /// L4-7 (§5.5.3): ring reads whose bytes LANDED directly in the
+    /// session arena via the router dest plumb — device DMA on the
+    /// device path, or a single tier/staging→arena copy where a tier
+    /// honors the dest; either way the intermediate pooled-buffer copy
+    /// is deleted (§5.5.2 ledger) — the A/B instrument. 0 on fast-path
+    /// workloads is CORRECT (active-buffer memcpys complete pre-plumb);
+    /// 0 on device-true cold reads means the plumb rotted.
+    pub ipc_arena_dma_reads: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -2467,7 +2475,19 @@ pub struct SqueezefsFilesystem {
     /// bootstrap synthesis reads it per request.
     pub ipc_host:
         std::sync::Arc<arc_swap::ArcSwap<Option<std::sync::Arc<crate::ipc_host::IpcHost>>>>,
+    /// L4-7 (§5.5.3): per-request DMA destination override for ring-read
+    /// handoffs — keyed by the IPC-tagged `Request::unique`
+    /// ([`IPC_DEST_TAG`]), consumed exactly once at the read handler's
+    /// dest-resolution site (the same slot kernel requests fill from
+    /// `get_payload_buffer`). Latch-free (`scc`); entries live for one
+    /// handler invocation.
+    pub ipc_read_dest: std::sync::Arc<scc::HashMap<u64, u64>>,
 }
+
+/// High-bit tag marking a `Request::unique` as IPC-originated (the
+/// `ipc_read_dest` key space). Kernel uniques are small increasing
+/// integers — the tag bit is unreachable from that sequence.
+pub const IPC_DEST_TAG: u64 = 1 << 63;
 
 impl Clone for SqueezefsFilesystem {
     fn clone(&self) -> Self {
@@ -2525,6 +2545,7 @@ impl Clone for SqueezefsFilesystem {
             // Share the one cell (session_connection precedent): the
             // handler clone must see the host start_mount arms.
             ipc_host: self.ipc_host.clone(),
+            ipc_read_dest: self.ipc_read_dest.clone(),
         }
     }
 }
@@ -2629,6 +2650,7 @@ impl SqueezefsFilesystem {
                 0x2000_0000_0000_0000,
             )),
             ipc_host: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+            ipc_read_dest: std::sync::Arc::new(scc::HashMap::new()),
         }
     }
 
@@ -3263,6 +3285,7 @@ impl SqueezefsFilesystem {
                 "ipc_sessions_reaped": METRICS.ipc_sessions_reaped.load(Ordering::Relaxed),
                 "ipc_inval_notifies": METRICS.ipc_inval_notifies.load(Ordering::Relaxed),
                 "ipc_inval_suppressed": METRICS.ipc_inval_suppressed.load(Ordering::Relaxed),
+                "ipc_arena_dma_reads": METRICS.ipc_arena_dma_reads.load(Ordering::Relaxed),
                 "write_lock_wait": METRICS.write_lock_wait.to_json(),
                 "block_lock_wait": METRICS.block_lock_wait.to_json(),
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),
@@ -7882,11 +7905,17 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let conn_guard = self.session_connection.load();
-        let dest_addr = conn_guard
-            .as_ref()
-            .as_ref()
-            .and_then(|conn| conn.get_payload_buffer(_req.unique))
-            .map(|(ptr, _sz)| ptr);
+        let dest_addr = if _req.unique & IPC_DEST_TAG != 0 {
+            // L4-7: an IPC ring-read handoff planted its arena window as
+            // the DMA destination (consumed exactly once — §5.5.3).
+            self.ipc_read_dest.remove_sync(&_req.unique).map(|(_, v)| v)
+        } else {
+            conn_guard
+                .as_ref()
+                .as_ref()
+                .and_then(|conn| conn.get_payload_buffer(_req.unique))
+                .map(|(ptr, _sz)| ptr)
+        };
 
         // Backend / cache read without holding the inode lock (readers scale).
         let read_future = self.router.read_file_range_zero_copy(

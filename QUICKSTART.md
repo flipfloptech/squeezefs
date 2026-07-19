@@ -345,7 +345,94 @@ sudo ./target/release/squeezefs nvmeof disconnect <subnqn>
 
 ---
 
-## 5. Kernel Tuning for Bare Metal (Auto-Tune)
+## 5. Benchmarking the LD_PRELOAD Interception Path (Manual)
+
+The interception data plane (`docs/design-preload-interception.md`) lets
+unmodified apps bypass kernel FUSE for data ops. Benchmarking it by hand
+takes four steps; measured reference numbers live in
+`.benchmarks/2026-07-19-l4-interception-closing.md`.
+
+### Step 1 — build both ends from the SAME commit
+
+Sessions refuse on any build-commit mismatch (KD-7), so always build the
+daemon and the shim together:
+
+```bash
+cargo build --release
+cargo build -p squeezefs-preload --profile preload-release --features interposers
+# the shim: target/preload-release/libsqueezefs_il.so
+```
+
+A plain `--release` build of the shim refuses at compile time (the root
+profile's `panic="abort"` would abort host apps) — `--profile
+preload-release` is the only sanctioned build. On a dirty tree (any
+uncommitted change) the identity is degenerate and BOTH ends need
+`SQUEEZEFS_IPC_ALLOW_DEV=1`.
+
+### Step 2 — mount with interception armed
+
+```bash
+export SQUEEZEFS_IPC_ALLOW_DEV=1        # dev/dirty trees only
+./target/release/squeezefs mount sqmeta:///dev/nvme1n1 /mnt/squeezefs \
+    --daemon --interception --allow-other --log-file /tmp/sqz.log
+# device-true (tier serves disabled — amplification measurement):
+#   add -o direct_device_true
+```
+
+`--interception` also forces kernel write-through (KD-11): buffered
+kernel-path small writes get slower on this mount by design — the ring
+is where intercepted writes go instead.
+
+### Step 3 — run your tool under the shim
+
+The benchmark binary **must be dynamically linked** (`ldd $(command -v
+fio)` — a static binary silently ignores `LD_PRELOAD` and measures
+kernel FUSE). Then it is one env var:
+
+```bash
+export SQUEEZEFS_IPC_ALLOW_DEV=1        # match the mount
+SO=$PWD/target/preload-release/libsqueezefs_il.so
+
+# fio (psync = positional read/write, the ring's native shape)
+LD_PRELOAD=$SO fio --name=il --filename=/mnt/squeezefs/f.bin \
+    --rw=randread --bs=4k --size=2g --ioengine=psync --direct=1 \
+    --thread --numjobs=16 --group_reporting --runtime=30 --time_based
+
+# elbencho (sync positional; do NOT use --iodepth — it drives libaio,
+# which v1 does not intercept, so the run would measure kernel FUSE)
+LD_PRELOAD=$SO elbencho -w -t 16 -s 128m -b 1m --direct /mnt/squeezefs/f{1..16}
+LD_PRELOAD=$SO elbencho -r --rand -t 8 -b 4k --timelimit 30 --direct /mnt/squeezefs/f{1..16}
+
+# anything else works the same way:
+LD_PRELOAD=$SO cp big.bin /mnt/squeezefs/
+```
+
+### Step 4 — VERIFY the shim actually served the run
+
+Bail-outs are silent by design, so never publish a number without the
+engagement proof. Snapshot the stats inode before and after:
+
+```bash
+grep -o '"ipc_ops_read": *[0-9]*'  /mnt/squeezefs/.stats
+grep -o '"ipc_ops_write": *[0-9]*' /mnt/squeezefs/.stats
+```
+
+The delta across your run must account for its op count (ops chunk at
+64 KiB, so large-block runs show MORE ring ops than app ops). Also
+useful: `ipc_fast_path_serves` vs `ipc_async_handoffs` (warm serves vs
+device/lock work) and `ipc_sessions_total`/`ipc_binds` (did anything
+bind at all). If the deltas are ~0: check the binary is dynamic, both
+builds match, and the mount has `--interception`.
+
+Tuning knobs (defaults are the measured posture): daemon
+`SQUEEZEFS_IPC_SERVICE_THREADS` (default `clamp(cpus/4,2,8)` — warm
+serves execute on these threads), client `SQUEEZEFS_IL_SESSIONS`
+(fd-sharded sessions per mount, default 4) and `SQUEEZEFS_IL_SPINS`
+(pins the adaptive spin window for A/B runs). The scoreboard automates
+all of this as `SQUEEZEFS_SB_MODES=il tests/run_scoreboard.sh run`
+(unprivileged — not sudo).
+
+## 6. Kernel Tuning for Bare Metal (Auto-Tune)
 
 For maximum HPC file throughput, Squeezefs includes an auto-tuning command. This script adjusts FUSE congestion thresholds, virtual memory dirty page ratios, and network socket maximum buffer sizes.
 
@@ -363,7 +450,7 @@ sudo ./target/release/squeezefs tune
 
 ---
 
-## 6. Metadata Durability Knobs
+## 7. Metadata Durability Knobs
 
 The metadata crash contract is documented in [docs/operations.md → Metadata Durability](docs/operations.md#metadata-durability-crash-contract): v3 (CoW KV metadata) holds it **by construction** — every on-disk unit is checksummed, torn writes are detected-and-ignored (never applied), and each transaction commits atomically as one checksummed journal entry (`docs/design-cow-kv-metadata.md` §4.10). Operationally:
 

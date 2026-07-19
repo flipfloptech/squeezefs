@@ -22,3 +22,4 @@ compile_error!(
 pub mod bailout;
 pub mod dev_cache;
 pub mod fd_table;
+pub mod session;

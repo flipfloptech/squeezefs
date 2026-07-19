@@ -1,0 +1,796 @@
+//! The shim's **session client** (§5.2 client side, §5.3 wake protocol,
+//! §5.4.1 ring-op error ladder): ctl-socket handshake, shm mapping, and
+//! the ring submit/wait machinery the interposers call.
+//!
+//! ## Locking posture
+//!
+//! The **data path** (`ring_pread`/`ring_pwrite`) takes no locks: slot
+//! claim is a bounded CAS scan, the ring push is lock-free, the wait is
+//! spin-then-futex on the slot's own state word. The **ctl path**
+//! (`bind`/`unbind`) serializes request/response on one mutex — it is
+//! control-plane (an `open(2)` cadence), and same-thread reentry (the
+//! only self-deadlock shape) is impossible because the interposers'
+//! TLS guard routes reentrant calls straight to the real libc function.
+//!
+//! ## Bounded waits (§5.4.1)
+//!
+//! Every wait on daemon-owned progress is deadline-bounded. A timeout
+//! **poisons the session** (a daemon that stopped completing ops is
+//! sick; every later op falls through immediately) — the timed-out
+//! slot is never reused (the daemon may still complete it arbitrarily
+//! late; recycling it would hand a stale completion to a new op).
+//! Poisoning is AS-safe (one flag store + `shutdown(2)` on the ctl
+//! socket — never `close`, so the fd number cannot be reused under a
+//! racing ctl call), because the atfork child handler runs it.
+
+use crate::fd_table::Binding;
+use squeezefs_ipc::layout::{
+    Geometry, IpcSlot, SessionHeader, SessionLayout, SlotDescriptor, OP_READ, OP_WRITE,
+};
+use squeezefs_ipc::ring_core::{MpscRingView, RingCell};
+use squeezefs_ipc::slot_core::ParkOutcome;
+use squeezefs_ipc::wire::{build_commit_degenerate, BootstrapBlob, CtlMsg, CTL_MSG_MAX};
+
+use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// Default per-op completion deadline (overridable via
+/// `SQUEEZEFS_IL_OP_TIMEOUT_MS` or [`Session::establish_with_op_timeout_ms`]).
+const OP_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
+
+/// Spin iterations on the slot state word before parking (the RTT is
+/// single-digit µs on the measured rig — G-L4-1 — so the hot path
+/// normally never parks).
+const WAIT_SPINS: u32 = 4096;
+
+/// Ctl-socket receive deadline (a dead daemon must not hang a bind).
+const CTL_RECV_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One ring op's outcome, as the interposer ladder consumes it
+/// (§5.4.1): served (possibly short — POSIX-legal), a daemon errno
+/// (kernel-identical for that op), or "take the real call".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RingOutcome {
+    Served(usize),
+    Errno(i32),
+    Fallthrough,
+}
+
+/// A successful bind's grant (mirrors the daemon's `BindOk`).
+#[derive(Debug, Clone, Copy)]
+pub struct BindGrant {
+    pub binding_id: u64,
+    pub ino: u64,
+    pub read_ok: bool,
+    pub write_ok: bool,
+}
+
+impl BindGrant {
+    pub fn to_binding(self) -> Binding {
+        Binding {
+            binding_id: self.binding_id,
+            ino: self.ino,
+            read_ok: self.read_ok,
+            write_ok: self.write_ok,
+        }
+    }
+}
+
+/// Why a session could not establish / a bind failed. The interposers
+/// only branch on "did it work" (everything else is a counter + stderr
+/// line); the variants exist for attribution.
+#[derive(Debug)]
+pub enum SessionError {
+    /// Client-side KD-7 pre-check: blob identity does not match ours
+    /// (skew or degenerate identity without the dev override).
+    VersionSkew,
+    /// Socket/sendmsg/recvmsg failure (errno).
+    Socket(i32),
+    /// The daemon refused (class code as sent).
+    Refused(u32),
+    /// Malformed reply / missing fd / header validation failure.
+    Protocol,
+    /// mmap failure.
+    Map(i32),
+    /// Session is poisoned (bind on a poisoned session).
+    Poisoned,
+}
+
+pub struct Session {
+    base: *mut u8,
+    layout: SessionLayout,
+    geometry: Geometry,
+    /// Per-op payload ceiling: `min(max_op_bytes, arena_bytes / slots)` —
+    /// the slab-per-slot discipline (each claimed slot owns the arena
+    /// window `[slot × slab, slot × slab + slab)`; no cross-thread arena
+    /// coordination exists or is needed).
+    slab: u64,
+    ctl: Mutex<CtlSocket>,
+    /// Raw ctl fd for the AS-safe poison `shutdown(2)` (the mutex-held
+    /// owner is not lockable from an atfork handler).
+    ctl_fd: RawFd,
+    op_timeout: Duration,
+    slot_hint: AtomicU32,
+    poisoned: AtomicBool,
+    /// Header generation observed at map time; a daemon bump = poison.
+    my_generation: u64,
+}
+
+// SAFETY: `base` is a shared mapping accessed only through atomics
+// (header/ring/slots) and bounded raw copies (arena slabs, each owned by
+// the thread holding that slot's claim); the pointer itself is immutable
+// after establish. Ctl I/O is mutex-serialized.
+unsafe impl Send for Session {}
+unsafe impl Sync for Session {}
+
+struct CtlSocket {
+    fd: RawFd,
+}
+
+impl Session {
+    /// Establish a session from a decoded bootstrap blob + a screened
+    /// credential fd (any bound-eligible fd on the mount). `my_commit`
+    /// is this shim's build identity (KD-7 equality with the daemon).
+    pub fn establish(
+        blob: &BootstrapBlob,
+        cred_fd: RawFd,
+        my_commit: &str,
+    ) -> Result<Session, SessionError> {
+        let ms = std::env::var("SQUEEZEFS_IL_OP_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0);
+        Self::establish_inner(
+            blob,
+            cred_fd,
+            my_commit,
+            ms.map(Duration::from_millis).unwrap_or(OP_TIMEOUT_DEFAULT),
+        )
+    }
+
+    /// Test seam: explicit per-op deadline (the §5.4.1 bounded-wait pin
+    /// drives it to a small value against a stalled daemon).
+    pub fn establish_with_op_timeout_ms(
+        blob: &BootstrapBlob,
+        cred_fd: RawFd,
+        my_commit: &str,
+        timeout_ms: u64,
+    ) -> Result<Session, SessionError> {
+        Self::establish_inner(blob, cred_fd, my_commit, Duration::from_millis(timeout_ms))
+    }
+
+    fn establish_inner(
+        blob: &BootstrapBlob,
+        cred_fd: RawFd,
+        my_commit: &str,
+        op_timeout: Duration,
+    ) -> Result<Session, SessionError> {
+        // Client-side KD-7 pre-check: skip the doomed round trip (the
+        // daemon enforces the same law authoritatively).
+        let allow_dev = std::env::var("SQUEEZEFS_IPC_ALLOW_DEV").is_ok_and(|v| v == "1");
+        if blob.abi != squeezefs_ipc::layout::IPC_ABI
+            || blob.build_commit != my_commit
+            || ((build_commit_degenerate(&blob.build_commit) || build_commit_degenerate(my_commit))
+                && !allow_dev)
+        {
+            return Err(SessionError::VersionSkew);
+        }
+
+        let sock = connect_abstract(&blob.socket)?;
+        let sock_guard = FdGuard(sock);
+        set_recv_timeout(sock, CTL_RECV_TIMEOUT);
+
+        // SAFETY: plain getpid/getuid.
+        let (pid, uid) = unsafe { (libc::getpid() as u32, libc::getuid()) };
+        send_ctl(
+            sock,
+            &CtlMsg::Hello {
+                abi: squeezefs_ipc::layout::IPC_ABI,
+                pid,
+                uid,
+                build_commit: my_commit.to_string(),
+                nonce: blob.nonce,
+            },
+            Some(cred_fd),
+        )?;
+        let (reply, memfd) = recv_ctl(sock)?;
+        let geometry = match reply {
+            CtlMsg::SessionOk { geometry } => geometry,
+            CtlMsg::Refuse { class } => return Err(SessionError::Refused(class as u32)),
+            _ => return Err(SessionError::Protocol),
+        };
+        let memfd = memfd.ok_or(SessionError::Protocol)?;
+        let memfd_guard = FdGuard(memfd);
+        let layout = SessionLayout::compute(&geometry).map_err(|_| SessionError::Protocol)?;
+
+        // SAFETY: shared mapping of the sealed memfd, full layout length.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                layout.total_bytes as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                memfd,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            // SAFETY: errno read directly after the failing call.
+            return Err(SessionError::Map(unsafe { *libc::__errno_location() }));
+        }
+        // The mapping holds the memory; the fd is no longer needed.
+        drop(memfd_guard);
+
+        // SAFETY: header page at offset 0 of a mapping sized by layout.
+        let header = unsafe { &*(base as *const SessionHeader) };
+        if header.validate().is_err() || header.geometry != geometry {
+            // SAFETY: unmapping the mapping created above.
+            unsafe { libc::munmap(base, layout.total_bytes as usize) };
+            return Err(SessionError::Protocol);
+        }
+        let my_generation = header.generation.load(Ordering::Acquire);
+
+        let slab = geometry.arena_bytes / u64::from(geometry.slots);
+        let slab = slab.min(u64::from(geometry.max_op_bytes));
+        if slab == 0 {
+            // SAFETY: unmapping the mapping created above.
+            unsafe { libc::munmap(base, layout.total_bytes as usize) };
+            return Err(SessionError::Protocol);
+        }
+
+        let sock = sock_guard.release();
+        Ok(Session {
+            base: base as *mut u8,
+            layout,
+            geometry,
+            slab,
+            ctl: Mutex::new(CtlSocket { fd: sock }),
+            ctl_fd: sock,
+            op_timeout,
+            slot_hint: AtomicU32::new(0),
+            poisoned: AtomicBool::new(false),
+            my_generation,
+        })
+    }
+
+    /// Bind `fd` for the data plane. Ctl round trip (control-plane
+    /// mutex; see the module locking posture).
+    pub fn bind(&self, fd: RawFd) -> Result<BindGrant, SessionError> {
+        if self.poisoned() {
+            return Err(SessionError::Poisoned);
+        }
+        let ctl = self.ctl.lock().expect("ctl mutex never poisons");
+        send_ctl(ctl.fd, &CtlMsg::Bind, Some(fd))?;
+        let (reply, none) = recv_ctl(ctl.fd)?;
+        drop(ctl);
+        if none.is_some() {
+            // SAFETY: closing an fd we own (unexpected attachment).
+            unsafe { libc::close(none.unwrap_or(-1)) };
+            return Err(SessionError::Protocol);
+        }
+        match reply {
+            CtlMsg::BindOk {
+                binding_id,
+                ino,
+                read_ok,
+                write_ok,
+            } => Ok(BindGrant {
+                binding_id,
+                ino,
+                read_ok,
+                write_ok,
+            }),
+            CtlMsg::BindRefused { class } => Err(SessionError::Refused(class as u32)),
+            _ => Err(SessionError::Protocol),
+        }
+    }
+
+    /// Release a binding (last-close path). Best-effort and silent: a
+    /// poisoned session never emits ctl traffic (§5.4.1 normative — the
+    /// atfork child must not unbind bindings the parent still uses).
+    pub fn unbind(&self, binding_id: u64) {
+        if self.poisoned() {
+            return;
+        }
+        if let Ok(ctl) = self.ctl.lock() {
+            let _ = send_ctl(ctl.fd, &CtlMsg::Unbind { binding_id }, None);
+        }
+    }
+
+    /// AS-safe poison: one flag store + `shutdown(2)` on the ctl socket
+    /// (kills traffic without freeing the fd number). The atfork child
+    /// handler calls this; so does the op-timeout path.
+    pub fn poison(&self) {
+        self.poisoned.store(true, Ordering::SeqCst);
+        // SAFETY: shutdown(2) on our own ctl fd; AS-safe, idempotent.
+        unsafe { libc::shutdown(self.ctl_fd, libc::SHUT_RDWR) };
+    }
+
+    pub fn poisoned(&self) -> bool {
+        if self.poisoned.load(Ordering::SeqCst) {
+            return true;
+        }
+        // A daemon-side generation bump is the poison broadcast (§5.7).
+        if self.header().generation.load(Ordering::Acquire) != self.my_generation {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return true;
+        }
+        false
+    }
+
+    /// Positional ring read into `buf` (chunked to the slab ceiling).
+    pub fn ring_pread(&self, binding_id: u64, buf: &mut [u8], offset: u64) -> RingOutcome {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let chunk = (buf.len() - done).min(self.slab as usize);
+            match self.one_op(OP_READ, binding_id, offset + done as u64, chunk, None) {
+                OpResult::Done { slot, n } => {
+                    let n = n.min(chunk);
+                    self.slab_read(slot, &mut buf[done..done + n]);
+                    self.release_slot(slot);
+                    done += n;
+                    if n < chunk {
+                        break; // EOF short read
+                    }
+                }
+                OpResult::Errno(e) => {
+                    return if done > 0 {
+                        RingOutcome::Served(done) // POSIX short read
+                    } else {
+                        RingOutcome::Errno(e)
+                    };
+                }
+                OpResult::Fallthrough => {
+                    return if done > 0 {
+                        RingOutcome::Served(done)
+                    } else {
+                        RingOutcome::Fallthrough
+                    };
+                }
+            }
+        }
+        RingOutcome::Served(done)
+    }
+
+    /// Positional ring write from `buf` (chunked to the slab ceiling).
+    pub fn ring_pwrite(&self, binding_id: u64, buf: &[u8], offset: u64) -> RingOutcome {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let chunk = (buf.len() - done).min(self.slab as usize);
+            match self.one_op(
+                OP_WRITE,
+                binding_id,
+                offset + done as u64,
+                chunk,
+                Some(&buf[done..done + chunk]),
+            ) {
+                OpResult::Done { slot, n } => {
+                    self.release_slot(slot);
+                    done += n.min(chunk);
+                    if n < chunk {
+                        break; // short write (POSIX-legal; caller retries)
+                    }
+                }
+                OpResult::Errno(e) => {
+                    return if done > 0 {
+                        RingOutcome::Served(done)
+                    } else {
+                        RingOutcome::Errno(e)
+                    };
+                }
+                OpResult::Fallthrough => {
+                    return if done > 0 {
+                        RingOutcome::Served(done)
+                    } else {
+                        RingOutcome::Fallthrough
+                    };
+                }
+            }
+        }
+        RingOutcome::Served(done)
+    }
+
+    // -----------------------------------------------------------------
+    // one op: claim → publish → push → doorbell → spin/park → result
+    // -----------------------------------------------------------------
+
+    fn one_op(
+        &self,
+        op: u32,
+        binding_id: u64,
+        offset: u64,
+        len: usize,
+        payload: Option<&[u8]>,
+    ) -> OpResult {
+        if self.poisoned() {
+            return OpResult::Fallthrough;
+        }
+        let Some((slot_idx, gen)) = self.claim_slot() else {
+            // Full ring = client-visible backpressure (§5.5.1): this op
+            // takes the real call; the binding stays.
+            return OpResult::Fallthrough;
+        };
+        let slot = self.slot(slot_idx);
+        let arena_off = u64::from(slot_idx) * self.slab;
+        if let Some(data) = payload {
+            self.slab_write(slot_idx, data);
+        }
+        slot.publish_descriptor(&SlotDescriptor {
+            op,
+            flags: 0,
+            binding: binding_id,
+            offset,
+            len: len as u32,
+            arena_off,
+        });
+        slot.core.publish_submitted();
+        if !self.ring().push(slot_idx) {
+            // Unreachable for an honest client (slots ≤ ring_entries);
+            // observing it means OUR state is corrupt — poison loudly.
+            self.poison();
+            return OpResult::Fallthrough;
+        }
+        // Doorbell (§5.3 protocol rule 1): publish first, then wake only
+        // a parked daemon. If the daemon is mid-scan (parked flag clear),
+        // its disarm→scan ordering finds our push without a wake; the
+        // daemon's bounded park (≤ 5 ms) absorbs the residual race.
+        let header = self.header();
+        header.doorbell.fetch_add(1, Ordering::Release);
+        if header.daemon_parked.load(Ordering::SeqCst) != 0 {
+            futex_wake(&header.doorbell);
+        }
+
+        // Wait: bounded spin, then futex park with a hard deadline.
+        let deadline = Instant::now() + self.op_timeout;
+        for _ in 0..WAIT_SPINS {
+            if slot.core.is_done_for(gen) {
+                return self.consume(slot_idx, gen);
+            }
+            std::hint::spin_loop();
+        }
+        loop {
+            match slot.core.park_prepare() {
+                ParkOutcome::Ready => return self.consume(slot_idx, gen),
+                ParkOutcome::Park { expected } => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        // §5.4.1 timeout: poison, never reuse the slot
+                        // (the daemon may complete it arbitrarily late —
+                        // recycling would hand that stale completion to
+                        // a future op).
+                        self.poison();
+                        return OpResult::Fallthrough;
+                    }
+                    let wait = (deadline - now).min(Duration::from_millis(50));
+                    futex_wait(slot.core.state_futex_word(), expected, wait);
+                    if slot.core.is_done_for(gen) {
+                        return self.consume(slot_idx, gen);
+                    }
+                    if self.poisoned() {
+                        return OpResult::Fallthrough;
+                    }
+                }
+            }
+        }
+    }
+
+    fn consume(&self, slot_idx: u32, gen: u64) -> OpResult {
+        let slot = self.slot(slot_idx);
+        debug_assert!(slot.core.is_done_for(gen));
+        let r = slot.result();
+        if r < 0 {
+            self.release_slot(slot_idx);
+            let e = (-r) as i32;
+            // Protocol-class rejects mean OUR bookkeeping diverged from
+            // the daemon (dead binding, bad descriptor) — kernel-identical
+            // errno for EBADF (wrong direction is a real fd property);
+            // EINVAL descriptor rejects fall through (the real call is
+            // the correct answer for a shim-side bug).
+            if e == libc::EINVAL {
+                return OpResult::Fallthrough;
+            }
+            return OpResult::Errno(e);
+        }
+        OpResult::Done {
+            slot: slot_idx,
+            n: r as usize,
+        }
+    }
+
+    fn claim_slot(&self) -> Option<(u32, u64)> {
+        let slots = self.geometry.slots;
+        let start = self.slot_hint.fetch_add(1, Ordering::Relaxed) % slots;
+        for i in 0..slots {
+            let idx = (start + i) % slots;
+            if let Some(gen) = self.slot(idx).core.try_claim() {
+                return Some((idx, gen));
+            }
+        }
+        None
+    }
+
+    fn release_slot(&self, idx: u32) {
+        self.slot(idx).core.release();
+    }
+
+    // -----------------------------------------------------------------
+    // mapping accessors (mirrors of the daemon side, client trust rules)
+    // -----------------------------------------------------------------
+
+    fn header(&self) -> &SessionHeader {
+        // SAFETY: header page at offset 0, written by the daemon before
+        // the memfd was shared; validated at establish.
+        unsafe { &*(self.base as *const SessionHeader) }
+    }
+
+    fn ring(&self) -> MpscRingView<'_> {
+        // SAFETY: offsets from the layout that sized the mapping;
+        // repr(C) protocol types; geometry validated at establish.
+        unsafe {
+            let tail = &*(self.base.add(self.layout.ring_off as usize) as *const AtomicU32);
+            let cells = std::slice::from_raw_parts(
+                self.base.add(self.layout.ring_cells_off as usize) as *const RingCell,
+                self.geometry.ring_entries as usize,
+            );
+            MpscRingView::from_parts(tail, cells).expect("geometry validated at establish")
+        }
+    }
+
+    fn slot(&self, i: u32) -> &IpcSlot {
+        debug_assert!(i < self.geometry.slots);
+        // SAFETY: bounds by claim_slot/geometry; slots at slots_off.
+        unsafe {
+            &*((self.base.add(self.layout.slots_off as usize) as *const IpcSlot).add(i as usize))
+        }
+    }
+
+    fn slab_write(&self, slot_idx: u32, data: &[u8]) {
+        debug_assert!(data.len() as u64 <= self.slab);
+        let off = self.layout.arena_off + u64::from(slot_idx) * self.slab;
+        // SAFETY: slab windows are disjoint per slot and inside the
+        // arena by construction (slab = arena/slots ≥ this slab's end).
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.base.add(off as usize), data.len());
+        }
+    }
+
+    fn slab_read(&self, slot_idx: u32, out: &mut [u8]) {
+        debug_assert!(out.len() as u64 <= self.slab);
+        let off = self.layout.arena_off + u64::from(slot_idx) * self.slab;
+        // SAFETY: as slab_write; the daemon may race writes here only
+        // for THIS op's completion, which is ordered by is_done_for's
+        // Acquire before this copy.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.base.add(off as usize), out.as_mut_ptr(), out.len());
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // SAFETY: unmapping the establish-time mapping; closing our fd.
+        unsafe {
+            libc::munmap(
+                self.base as *mut libc::c_void,
+                self.layout.total_bytes as usize,
+            );
+            libc::close(self.ctl_fd);
+        }
+    }
+}
+
+enum OpResult {
+    Done { slot: u32, n: usize },
+    Errno(i32),
+    Fallthrough,
+}
+
+// ---------------------------------------------------------------------------
+// raw socket plumbing (client twins of the daemon host's helpers — this
+// crate cannot depend on the daemon crate, and needs raw-libc control
+// anyway for AS-safety discipline)
+// ---------------------------------------------------------------------------
+
+/// RAII guard for a raw fd on error paths.
+struct FdGuard(RawFd);
+
+impl FdGuard {
+    fn release(self) -> RawFd {
+        let fd = self.0;
+        std::mem::forget(self);
+        fd
+    }
+}
+
+impl Drop for FdGuard {
+    fn drop(&mut self) {
+        // SAFETY: closing an fd this guard owns.
+        unsafe { libc::close(self.0) };
+    }
+}
+
+fn errno() -> i32 {
+    // SAFETY: thread-local errno read.
+    unsafe { *libc::__errno_location() }
+}
+
+fn connect_abstract(name: &str) -> Result<RawFd, SessionError> {
+    // SAFETY: socket(2); ownership handled by the caller's guard.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(SessionError::Socket(errno()));
+    }
+    let guard = FdGuard(fd);
+    // SAFETY: zeroed sockaddr_un is a valid all-default value.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = name.as_bytes();
+    if bytes.len() + 1 > addr.sun_path.len() {
+        return Err(SessionError::Protocol);
+    }
+    for (i, b) in bytes.iter().enumerate() {
+        addr.sun_path[i + 1] = *b as libc::c_char; // abstract: leading NUL
+    }
+    let len = std::mem::size_of::<libc::sa_family_t>() + 1 + bytes.len();
+    // SAFETY: connect with a correctly-sized sockaddr_un.
+    if unsafe {
+        libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            len as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(SessionError::Socket(errno()));
+    }
+    Ok(guard.release())
+}
+
+fn set_recv_timeout(fd: RawFd, timeout: Duration) {
+    let tv = libc::timeval {
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_usec: i64::from(timeout.subsec_micros()) as libc::suseconds_t,
+    };
+    // SAFETY: setsockopt with a valid timeval; best-effort.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const libc::timeval as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+    }
+}
+
+const CMSG_FD_SPACE: usize = 64;
+
+fn send_ctl(sock: RawFd, msg: &CtlMsg, fd: Option<RawFd>) -> Result<(), SessionError> {
+    let bytes = msg.encode();
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_ptr() as *mut libc::c_void,
+        iov_len: bytes.len(),
+    };
+    let mut cmsg_buf = [0u8; CMSG_FD_SPACE];
+    // SAFETY: zeroed msghdr is a valid all-default value.
+    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    hdr.msg_iov = &mut iov;
+    hdr.msg_iovlen = 1;
+    if let Some(fd) = fd {
+        hdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        // SAFETY: CMSG_SPACE for one int fits the buffer by construction.
+        hdr.msg_controllen =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as libc::size_t;
+        // SAFETY: standard CMSG_FIRSTHDR/CMSG_DATA over the buffer above.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&hdr);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as libc::size_t;
+            std::ptr::copy_nonoverlapping(
+                &fd as *const RawFd as *const u8,
+                libc::CMSG_DATA(cmsg),
+                std::mem::size_of::<RawFd>(),
+            );
+        }
+    }
+    // SAFETY: sendmsg with the msghdr assembled above.
+    let n = unsafe { libc::sendmsg(sock, &hdr, libc::MSG_NOSIGNAL) };
+    if n < 0 {
+        return Err(SessionError::Socket(errno()));
+    }
+    Ok(())
+}
+
+fn recv_ctl(sock: RawFd) -> Result<(CtlMsg, Option<RawFd>), SessionError> {
+    let mut buf = [0u8; CTL_MSG_MAX];
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    let mut cmsg_buf = [0u8; CMSG_FD_SPACE];
+    // SAFETY: zeroed msghdr is a valid all-default value.
+    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    hdr.msg_iov = &mut iov;
+    hdr.msg_iovlen = 1;
+    hdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    hdr.msg_controllen = cmsg_buf.len() as libc::size_t;
+    // SAFETY: recvmsg into the buffers above; CLOEXEC on received fds.
+    let n = unsafe { libc::recvmsg(sock, &mut hdr, libc::MSG_CMSG_CLOEXEC) };
+    if n < 0 {
+        return Err(SessionError::Socket(errno()));
+    }
+    let mut rx_fd = None;
+    // SAFETY: CMSG walk over the kernel-filled control buffer.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&hdr);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let mut fd: RawFd = -1;
+                std::ptr::copy_nonoverlapping(
+                    libc::CMSG_DATA(cmsg),
+                    &mut fd as *mut RawFd as *mut u8,
+                    std::mem::size_of::<RawFd>(),
+                );
+                if fd >= 0 {
+                    rx_fd = Some(fd);
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&hdr, cmsg);
+        }
+    }
+    if n == 0 {
+        return Err(SessionError::Socket(0)); // EOF: daemon gone
+    }
+    match CtlMsg::decode(&buf[..n as usize]) {
+        Ok(m) => Ok((m, rx_fd)),
+        Err(_) => {
+            if let Some(fd) = rx_fd {
+                // SAFETY: closing an fd we own.
+                unsafe { libc::close(fd) };
+            }
+            Err(SessionError::Protocol)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// futex plumbing (cross-process shm words — never FUTEX_PRIVATE)
+// ---------------------------------------------------------------------------
+
+fn futex_wake(word: &AtomicU32) {
+    // SAFETY: FUTEX_WAKE on a live atomic's address; no memory is read.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word.as_ptr(),
+            libc::FUTEX_WAKE,
+            i32::MAX,
+            0usize,
+            0usize,
+            0u32,
+        );
+    }
+}
+
+fn futex_wait(word: &AtomicU32, expected: u32, timeout: Duration) {
+    let ts = libc::timespec {
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_nsec: i64::from(timeout.subsec_nanos()) as libc::c_long,
+    };
+    // SAFETY: FUTEX_WAIT with a valid timespec; EINTR/EAGAIN both fine —
+    // the caller re-checks and re-parks under its own deadline.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word.as_ptr(),
+            libc::FUTEX_WAIT,
+            expected,
+            &ts as *const libc::timespec,
+            0usize,
+            0u32,
+        );
+    }
+}

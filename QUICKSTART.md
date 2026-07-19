@@ -398,10 +398,16 @@ LD_PRELOAD=$SO fio --name=il --filename=/mnt/squeezefs/f.bin \
     --rw=randread --bs=4k --size=2g --ioengine=psync --direct=1 \
     --thread --numjobs=16 --group_reporting --runtime=30 --time_based
 
-# elbencho (sync positional; do NOT use --iodepth — it drives libaio,
-# which v1 does not intercept, so the run would measure kernel FUSE)
+# elbencho (sync positional)
 LD_PRELOAD=$SO elbencho -w -t 16 -s 128m -b 1m --direct /mnt/squeezefs/f{1..16}
 LD_PRELOAD=$SO elbencho -r --rand -t 8 -b 4k --timelimit 30 --direct /mnt/squeezefs/f{1..16}
+
+# libaio (v1.1+: io_setup/io_submit/io_getevents are interposed — iodepth
+# concurrency rides the ring; the device-true sweet spot needs far fewer
+# threads than sync drivers). elbencho --iodepth works the same way.
+LD_PRELOAD=$SO fio --name=il --directory=/mnt/squeezefs --filesize=2g \
+    --rw=randread --bs=4k --ioengine=libaio --iodepth=32 --direct=1 \
+    --thread --numjobs=16 --group_reporting --runtime=30 --time_based
 
 # anything else works the same way:
 LD_PRELOAD=$SO cp big.bin /mnt/squeezefs/

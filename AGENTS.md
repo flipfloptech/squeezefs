@@ -640,7 +640,7 @@ While this file is the combined one source of truth for agents and contributors:
 
 - `README.md` / `QUICKSTART.md` — user-facing CLI, NVMe-oF, and bare-metal setup.
 - `docs/reference-clients-survey.md` — the DAOS-client + JuiceFS reference fast-FUSE client survey (see **Reference fast-FUSE clients** above).
-- `docs/design-preload-interception.md` — the L4 LD_PRELOAD POSIX-interception data path (`libsqueezefs-il`): charter labeling discipline, IPC protocol/gates, the survey's P3-A adoption item.
+- `docs/design-preload-interception.md` — the L4 LD_PRELOAD POSIX-interception data path (`libsqueezefs-il`): charter labeling discipline, IPC protocol/gates, the survey's P3-A adoption item; since v1.1 also the **libaio interposers** (`io_setup`/`io_submit`/`io_getevents` lane-split — libaio drivers are valid, engagement-verified il instruments; Rev 4 + `.benchmarks/2026-07-19-v1.1-libaio-interposers.md`).
 - `docs/PROFILING_AND_GATES.md` (historical) — content now consolidated here.
 
 ---

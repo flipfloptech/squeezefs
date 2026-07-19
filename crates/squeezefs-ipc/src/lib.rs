@@ -27,6 +27,7 @@
 pub mod layout;
 pub mod ring_core;
 pub mod slot_core;
+pub mod wire;
 
 // Production source-sharing of the shipped L3 wake-coalescing protocol
 // core (design-preload-interception §5.3.2, Issue-18 direction pinned):

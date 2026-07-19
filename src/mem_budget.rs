@@ -596,6 +596,32 @@ pub fn transport_buffer_cap(budget_bytes: u64) -> u64 {
     (budget_bytes / 8).min(TRANSPORT_BUFFER_CAP_CEILING)
 }
 
+/// L4 interception session-shm cap ceiling (design-preload-interception
+/// §5.7): even on huge budgets, never admit more than this in live
+/// session arenas.
+pub const IPC_ARENA_CAP_CEILING: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The L4 `ipc_session_arenas` admission cap: an eighth of the resolved
+/// memory budget, ceilinged at [`IPC_ARENA_CAP_CEILING`] — deliberately
+/// the same shape as [`transport_buffer_cap`] (the session arenas are the
+/// interception transport's payload buffers).
+pub fn ipc_arena_cap(budget_bytes: u64) -> u64 {
+    (budget_bytes / 8).min(IPC_ARENA_CAP_CEILING)
+}
+
+/// Register the L4 `ipc_session_arenas` component (design-preload-
+/// interception §5.7): floor 0, non-reclaimable (anon shm), shed =
+/// refuse-new-sessions until the gauge is back under target + reap-idle
+/// (PR L4-6) — never tearing live sessions (the R5 never-lossy
+/// discipline; live arenas are bounded by admission).
+pub fn register_ipc_session_arena_component(
+    mb: &MemBudget,
+    current: Arc<dyn Fn() -> u64 + Send + Sync>,
+    shed: Arc<dyn Fn(u64) + Send + Sync>,
+) {
+    mb.register(Component::new("ipc_session_arenas", 0, 1, current, shed));
+}
+
 /// One-atomic-load disk-tier publish gate (the finding-#2 escalation) —
 /// read by [`crate::cache::NvmeStaging::cache_read_block`], the single
 /// funnel every tier producer (fill path, dehydration, p2p store) routes

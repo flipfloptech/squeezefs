@@ -2028,6 +2028,44 @@ pub struct Metrics {
     /// pinned by
     /// `test_fabric_reconnects_is_sampled_transition_counter_undercounts_bursts`.
     pub fabric_ctrl_reconnects: Align64<AtomicU64>,
+    /// L4 interception session host (design-preload-interception §8, PR
+    /// L4-3 families). Gauge: live sessions — leaks show as
+    /// active ≫ expected.
+    pub ipc_sessions_active: Align64<AtomicU64>,
+    /// Sessions ever established.
+    pub ipc_sessions_total: Align64<AtomicU64>,
+    /// Successful per-fd binds.
+    pub ipc_binds: Align64<AtomicU64>,
+    /// The §5.2 daemon-side refusal ledger, by class. `version` growth =
+    /// mixed fleet (join with `build_commit`); `nonce` = stale/replayed
+    /// HELLO; `flags` = fd type/status screen (O_PATH, non-regular,
+    /// O_APPEND/O_SYNC/O_DSYNC/O_TMPFILE-class); `mode` = wrong-`st_dev`
+    /// (not a capability on this mount / mount unresolved); `budget` =
+    /// admission (arena cap, per-uid cap, shed); `peercred` = claimed
+    /// identity contradicted SO_PEERCRED (defense-in-depth tripwire).
+    pub ipc_bind_refused_version: Align64<AtomicU64>,
+    pub ipc_bind_refused_nonce: Align64<AtomicU64>,
+    pub ipc_bind_refused_flags: Align64<AtomicU64>,
+    pub ipc_bind_refused_mode: Align64<AtomicU64>,
+    pub ipc_bind_refused_budget: Align64<AtomicU64>,
+    pub ipc_bind_refused_peercred: Align64<AtomicU64>,
+    /// Degenerate (`unknown`/`-dirty`) identity pairs admitted via
+    /// `SQUEEZEFS_IPC_ALLOW_DEV` — nonzero outside dev boxes is a
+    /// fleet-hygiene alarm (KD-7).
+    pub ipc_binds_dev_override: Align64<AtomicU64>,
+    /// R5 admission refusals (arena budget / per-uid caps / shed target)
+    /// — the budget-class refusals, counted on the R5 surface too.
+    pub ipc_admission_refusals: Align64<AtomicU64>,
+    /// Live session-shm bytes (the `ipc_session_arenas` mem-budget
+    /// component gauge).
+    pub ipc_arena_bytes: Align64<AtomicU64>,
+    /// Malformed/forged ring descriptors completed `-EINVAL` and
+    /// wrong-direction ops completed `-EBADF` — **must stay 0 in
+    /// production**: nonzero = client bug or attack (loud log per site).
+    pub ipc_descriptor_rejects: Align64<AtomicU64>,
+    /// Sessions poisoned for protocol violations (§5.3 rule 4 / §5.7) —
+    /// **must stay 0 in production**; one loud log line per poison.
+    pub ipc_sessions_poisoned: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -2370,6 +2408,13 @@ pub struct SqueezefsFilesystem {
     reclaim_tx: tokio::sync::mpsc::Sender<u64>,
     reclaim_rx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<u64>>>>,
     pub next_dir_fh: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// L4 interception session host (design-preload-interception §5.2, PR
+    /// L4-3): `None` on non-interception mounts. Shared across handler
+    /// clones (the `session_connection` precedent — `start_mount` arms it
+    /// and the mounted handler clone must observe it); the getxattr
+    /// bootstrap synthesis reads it per request.
+    pub ipc_host:
+        std::sync::Arc<arc_swap::ArcSwap<Option<std::sync::Arc<crate::ipc_host::IpcHost>>>>,
 }
 
 impl Clone for SqueezefsFilesystem {
@@ -2425,6 +2470,9 @@ impl Clone for SqueezefsFilesystem {
             reclaim_tx: self.reclaim_tx.clone(),
             reclaim_rx: self.reclaim_rx.clone(),
             next_dir_fh: self.next_dir_fh.clone(),
+            // Share the one cell (session_connection precedent): the
+            // handler clone must see the host start_mount arms.
+            ipc_host: self.ipc_host.clone(),
         }
     }
 }
@@ -2528,6 +2576,7 @@ impl SqueezefsFilesystem {
             next_dir_fh: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 0x2000_0000_0000_0000,
             )),
+            ipc_host: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
         }
     }
 
@@ -3129,6 +3178,24 @@ impl SqueezefsFilesystem {
                 "fabric_controllers": METRICS.fabric_controllers.load(Ordering::Relaxed),
                 "fabric_ctrl_not_live": METRICS.fabric_ctrl_not_live.load(Ordering::Relaxed),
                 "fabric_ctrl_reconnects": METRICS.fabric_ctrl_reconnects.load(Ordering::Relaxed),
+                // L4 interception session-host families (design-preload-
+                // interception §8, PR L4-3): lifecycle, the §5.2 refusal
+                // ledger, R5 admission, and the two must-stay-0 tripwires
+                // (`ipc_descriptor_rejects`, `ipc_sessions_poisoned`).
+                "ipc_sessions_active": METRICS.ipc_sessions_active.load(Ordering::Relaxed),
+                "ipc_sessions_total": METRICS.ipc_sessions_total.load(Ordering::Relaxed),
+                "ipc_binds": METRICS.ipc_binds.load(Ordering::Relaxed),
+                "ipc_bind_refused_version": METRICS.ipc_bind_refused_version.load(Ordering::Relaxed),
+                "ipc_bind_refused_nonce": METRICS.ipc_bind_refused_nonce.load(Ordering::Relaxed),
+                "ipc_bind_refused_flags": METRICS.ipc_bind_refused_flags.load(Ordering::Relaxed),
+                "ipc_bind_refused_mode": METRICS.ipc_bind_refused_mode.load(Ordering::Relaxed),
+                "ipc_bind_refused_budget": METRICS.ipc_bind_refused_budget.load(Ordering::Relaxed),
+                "ipc_bind_refused_peercred": METRICS.ipc_bind_refused_peercred.load(Ordering::Relaxed),
+                "ipc_binds_dev_override": METRICS.ipc_binds_dev_override.load(Ordering::Relaxed),
+                "ipc_admission_refusals": METRICS.ipc_admission_refusals.load(Ordering::Relaxed),
+                "ipc_arena_bytes": METRICS.ipc_arena_bytes.load(Ordering::Relaxed),
+                "ipc_descriptor_rejects": METRICS.ipc_descriptor_rejects.load(Ordering::Relaxed),
+                "ipc_sessions_poisoned": METRICS.ipc_sessions_poisoned.load(Ordering::Relaxed),
                 "write_lock_wait": METRICS.write_lock_wait.to_json(),
                 "block_lock_wait": METRICS.block_lock_wait.to_json(),
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),
@@ -9732,6 +9799,11 @@ impl Filesystem for SqueezefsFilesystem {
             Some(s) => s,
             None => return Err(Errno::from(libc::EINVAL)),
         };
+        // The L4 bootstrap name is reserved UNCONDITIONALLY (design-
+        // preload-interception §5.2): never writable, armed or not.
+        if name_str == squeezefs_ipc::wire::BOOTSTRAP_XATTR {
+            return Err(Errno::from(libc::EPERM));
+        }
         let backend = self
             .meta_backend
             .as_ref()
@@ -9755,6 +9827,26 @@ impl Filesystem for SqueezefsFilesystem {
             Some(s) => s,
             None => return Err(Errno::from(libc::EINVAL)),
         };
+
+        // L4 bootstrap virtual xattr (design-preload-interception §5.2):
+        // synthesized ONLY when this mount's session host is armed —
+        // rides the already-authorized kernel path (read access to the
+        // file ⇒ may read it). Disabled mounts answer ENODATA (the cheap
+        // negative probe); the reserved name never serves on-disk bytes.
+        if name_str == squeezefs_ipc::wire::BOOTSTRAP_XATTR {
+            let host = self.ipc_host.load();
+            let Some(host) = host.as_ref() else {
+                return Err(Errno::from(libc::ENODATA));
+            };
+            let blob = host.bootstrap_blob();
+            if size == 0 {
+                return Ok(fuse3::raw::reply::ReplyXAttr::Size(blob.len() as u32));
+            }
+            if size < blob.len() as u32 {
+                return Err(Errno::from(libc::ERANGE));
+            }
+            return Ok(fuse3::raw::reply::ReplyXAttr::Data(blob.into()));
+        }
 
         let backend = self
             .meta_backend
@@ -9794,6 +9886,12 @@ impl Filesystem for SqueezefsFilesystem {
         let keys = backend.listxattr(inode).await.map_err(map_squeezefs_err)?;
         let mut data = Vec::new();
         for key in keys {
+            // The L4 bootstrap name is reserved: filtered from listxattr
+            // unconditionally (a historical/foreign on-disk key under it
+            // is never advertised — design-preload-interception §5.2).
+            if key == squeezefs_ipc::wire::BOOTSTRAP_XATTR {
+                continue;
+            }
             data.extend_from_slice(key.as_bytes());
             data.push(0);
         }
@@ -9885,6 +9983,11 @@ pub fn parse_custom_options(opts: &str) -> std::ffi::OsString {
                 || key == "negative_timeout"
                 || key == "dir_entry_timeout"
                 || key == "direct_device_true"
+                // L4 daemon-level tokens (KD-11 posture keys): consumed by
+                // `resolve_interception_posture`, never kernel options.
+                || key == "interception"
+                || key == "writeback"
+                || key == "writeback_cache"
             {
                 continue;
             }
@@ -9895,6 +9998,31 @@ pub fn parse_custom_options(opts: &str) -> std::ffi::OsString {
         }
     }
     custom_opts
+}
+
+/// The live mount's `st_dev` from `/proc/self/mountinfo` (field 3
+/// `major:minor` of the entry whose mount point matches) — the §5.2 fd
+/// screen's device authority, resolved WITHOUT stat'ing our own mount
+/// (zero self-FUSE traffic). `None` until the mount is visible.
+fn mount_st_dev(mount_path: &Path) -> Option<u64> {
+    let want = mount_path.canonicalize().ok()?;
+    let data = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    for line in data.lines() {
+        let mut fields = line.split_whitespace();
+        let _mount_id = fields.next()?;
+        let _parent_id = fields.next()?;
+        let devs = fields.next()?;
+        let _root = fields.next()?;
+        let mount_point = fields.next()?;
+        // mountinfo octal-escapes spaces/tabs in paths.
+        let unescaped = mount_point.replace("\\040", " ").replace("\\011", "\t");
+        if std::path::Path::new(&unescaped) == want {
+            let (maj, min) = devs.split_once(':')?;
+            let (maj, min): (u32, u32) = (maj.parse().ok()?, min.parse().ok()?);
+            return Some(libc::makedev(maj, min));
+        }
+    }
+    None
 }
 
 pub fn filter_kernel_mount_options(opts: &str) -> String {
@@ -9913,6 +10041,67 @@ pub fn filter_kernel_mount_options(opts: &str) -> String {
         }
     }
     kernel_opts.join(",")
+}
+
+/// Resolved interception/writeback posture for one mount (KD-11,
+/// design-preload-interception §5.6.2).
+#[derive(Debug, Clone, Copy)]
+pub struct InterceptionPosture {
+    /// The session host arms for this mount.
+    pub interception: bool,
+    /// The kernel writeback-cache flag actually sent in the INIT reply.
+    pub write_back: bool,
+}
+
+/// KD-11 (normative): `-o interception` (or the CLI flag / SQUEEZEFS_IPC=1)
+/// **forces kernel write-through** on that mount — the default-on kernel
+/// writeback cache acks buffered writes the daemon has not seen, and a
+/// ring read (direct-to-daemon by construction) would miss them. An
+/// explicit writeback request combined with interception is a
+/// contradiction and refuses LOUD; explicit writeback without
+/// interception is honored over the mount default. Pure function — the
+/// mount path feeds it (options, flag, env) and applies the result at the
+/// `options.write_back` site.
+pub fn resolve_interception_posture(
+    custom_opts: Option<&str>,
+    cli_flag: bool,
+    env_flag: bool,
+    writeback_default: bool,
+) -> Result<InterceptionPosture, String> {
+    let mut opt_interception = false;
+    let mut explicit_writeback = false;
+    if let Some(opts) = custom_opts {
+        for opt in opts.split(',') {
+            match opt.trim() {
+                "interception" => opt_interception = true,
+                // Both historical spellings of an explicit kernel
+                // writeback-cache request.
+                "writeback" | "writeback_cache" => explicit_writeback = true,
+                _ => {}
+            }
+        }
+    }
+    let interception = opt_interception || cli_flag || env_flag;
+    if interception && explicit_writeback {
+        return Err(
+            "mount option conflict: `-o interception` forces kernel write-through \
+             (writeback cache off — KD-11, docs/design-preload-interception.md §5.6.2); \
+             an explicit writeback/writeback_cache request cannot be combined with \
+             interception. Drop one of the two options."
+                .to_string(),
+        );
+    }
+    let write_back = if interception {
+        false
+    } else if explicit_writeback {
+        true
+    } else {
+        writeback_default
+    };
+    Ok(InterceptionPosture {
+        interception,
+        write_back,
+    })
 }
 
 /// Start FUSE mount daemon using fuse3.
@@ -9941,6 +10130,24 @@ pub async fn start_mount<P: AsRef<Path>>(
         );
     }
 
+    // KD-11: resolve the interception/writeback posture BEFORE any option
+    // is applied — `-o interception` / SQUEEZEFS_IPC=1 forces kernel
+    // write-through; explicit writeback + interception refuses loud.
+    // (The CLI `--interception` flag arrives merged into the option
+    // string by `main.rs`.)
+    let env_ipc = std::env::var("SQUEEZEFS_IPC").is_ok_and(|v| v == "1");
+    let posture = resolve_interception_posture(custom_opts.as_deref(), false, env_ipc, writeback)
+        .map_err(|e| -> Box<dyn std::error::Error> {
+        error!("{e}");
+        e.into()
+    })?;
+    if posture.interception && writeback && !posture.write_back {
+        info!(
+            "Interception mount: kernel writeback cache forced OFF (write-through — \
+             KD-11, docs/design-preload-interception.md §5.6.2)"
+        );
+    }
+
     let mut options = MountOptions::default();
     let is_root = unsafe { libc::getuid() } == 0;
     if is_root {
@@ -9948,7 +10155,7 @@ pub async fn start_mount<P: AsRef<Path>>(
         options.gid(gid);
     }
     options.allow_other(allow_other);
-    options.write_back(writeback);
+    options.write_back(posture.write_back);
     options.default_permissions(true);
 
     if let Some(ref opts) = custom_opts {
@@ -10017,6 +10224,71 @@ pub async fn start_mount<P: AsRef<Path>>(
         transport_cap / (1024 * 1024),
         mem_budget / (1024 * 1024)
     );
+
+    // L4 interception session host (PR L4-3): armed pre-mount so the
+    // bootstrap xattr synthesizes from the first request. Data-plane
+    // serves land in PR L4-4; this host is the §5.2 control plane.
+    if posture.interception {
+        let arena_mb = std::env::var("SQUEEZEFS_IPC_ARENA_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(64);
+        let max_op_bytes = std::env::var("SQUEEZEFS_IPC_MAX_OP_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(squeezefs_ipc::layout::DEFAULT_MAX_OP_BYTES);
+        let geometry = squeezefs_ipc::layout::Geometry {
+            arena_bytes: arena_mb * 1024 * 1024,
+            max_op_bytes,
+            ..squeezefs_ipc::layout::Geometry::default_v1()
+        };
+        // Session-shm admission cap: min(budget/8, 2 GiB), env-overridable
+        // (SQUEEZEFS_IPC_MEM_MAX, MiB) — the R5 `ipc_session_arenas`
+        // component bound (design §5.7).
+        let arena_cap_bytes = std::env::var("SQUEEZEFS_IPC_MEM_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or_else(|| crate::mem_budget::ipc_arena_cap(mem_budget));
+        let cfg = crate::ipc_host::IpcHostConfig {
+            socket_name: format!("sqz-il0-{}-{:08x}", std::process::id(), fastrand::u32(..)),
+            build_commit: crate::version::build_commit(),
+            allow_dev: std::env::var("SQUEEZEFS_IPC_ALLOW_DEV").is_ok_and(|v| v == "1"),
+            geometry,
+            arena_cap_bytes,
+            per_uid_session_cap: 64,
+        };
+        match crate::ipc_host::IpcHost::spawn(
+            cfg,
+            std::sync::Arc::new(crate::ipc_host::EchoSessionSink),
+        ) {
+            Ok(host) => {
+                crate::mem_budget::register_ipc_session_arena_component(
+                    &crate::mem_budget::MEM_BUDGET,
+                    std::sync::Arc::new(|| METRICS.ipc_arena_bytes.load(Ordering::Relaxed)),
+                    std::sync::Arc::new({
+                        let host = host.clone();
+                        move |target| host.shed_to(target)
+                    }),
+                );
+                info!(
+                    "IPC session host armed (socket {}, session shm cap {} MiB)",
+                    host.socket_name(),
+                    arena_cap_bytes / (1024 * 1024)
+                );
+                fs.ipc_host.store(std::sync::Arc::new(Some(host)));
+            }
+            Err(e) => {
+                // Fail the mount loud: `-o interception` was an explicit
+                // request — silently mounting without the host would fake
+                // the posture (charter rule 4's silent-passthrough class).
+                error!("interception session host failed to start: {e}");
+                return Err(format!("interception session host failed to start: {e}").into());
+            }
+        }
+    }
 
     if is_root {
         let filtered_opts = if let Some(ref opts) = custom_opts {
@@ -10174,6 +10446,34 @@ pub async fn start_mount<P: AsRef<Path>>(
 
     if let Some(conn) = handle.connection() {
         fs.session_connection.store(std::sync::Arc::new(Some(conn)));
+    }
+
+    // L4 interception: resolve the live mount's `st_dev` for the §5.2 fd
+    // screen (screen rule: `st_dev` must equal the mount device; binds
+    // refuse class `mode` until this lands — fail-safe). Read from
+    // /proc/self/mountinfo, never by stat'ing our own mount (zero
+    // self-FUSE traffic).
+    if let Some(host) = fs.ipc_host.load().as_ref().as_ref().cloned() {
+        let mp = mount_path.clone();
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let mp_probe = mp.clone();
+                let dev = tokio::task::spawn_blocking(move || mount_st_dev(&mp_probe))
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(dev) = dev {
+                    host.set_expected_st_dev(dev);
+                    info!("IPC session host: mount st_dev resolved ({dev})");
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            error!(
+                "IPC session host: mount st_dev NEVER resolved — every bind will \
+                 refuse (class mode) until remount; interception is inert on this mount"
+            );
+        });
     }
 
     println!("\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}", mount_path);
@@ -10351,6 +10651,12 @@ pub async fn start_mount<P: AsRef<Path>>(
     // Stop heartbeat + fabric sampler tasks
     heartbeat_handle.abort();
     fabric_stats_handle.abort();
+
+    // Tear down the interception session host (poisons nothing — live
+    // clients observe socket EOF and degrade to passthrough, §5.7).
+    if let Some(host) = fs.ipc_host.load().as_ref().as_ref().cloned() {
+        let _ = tokio::task::spawn_blocking(move || host.shutdown()).await;
+    }
 
     // Clean up the mount by unmounting the session if it hasn't been done already.
     if let Err(e) = handle.unmount().await {

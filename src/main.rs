@@ -248,6 +248,15 @@ enum Commands {
         #[arg(long)]
         no_writeback: bool,
 
+        /// Enable the L4 LD_PRELOAD interception session host for this
+        /// mount (equivalent to `-o interception` / SQUEEZEFS_IPC=1).
+        /// Forces kernel write-through on the mount (KD-11,
+        /// docs/design-preload-interception.md §5.6.2); combining it with
+        /// an explicit writeback request refuses loudly. v1 data plane
+        /// lands per the L4 PR ladder — this arms the §5.2 control plane.
+        #[arg(long)]
+        interception: bool,
+
         /// Allow other users to access the mount
         #[arg(long, alias = "allow-others")]
         allow_other: bool,
@@ -2593,6 +2602,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             gid,
             p2p_addr,
             no_writeback,
+            interception,
             allow_other,
             check_storage: _check_storage,
             options,
@@ -2995,6 +3005,19 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("Mounting Squeezefs at {:?}...", mountpoint);
 
             let writeback_val = !no_writeback;
+
+            // The CLI `--interception` flag rides the option string into
+            // `start_mount` (where `resolve_interception_posture` folds
+            // it with `-o interception` / SQUEEZEFS_IPC=1 and applies the
+            // KD-11 write-through flip).
+            let options = if interception {
+                Some(match options {
+                    Some(o) => format!("{o},interception"),
+                    None => "interception".to_string(),
+                })
+            } else {
+                options
+            };
 
             start_mount(
                 mountpoint,

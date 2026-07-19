@@ -15,6 +15,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
   - [SqueezeFS URI scheme](#squeezefs-uri-scheme)
   - [Format (`squeezefs format`)](#format-squeezefs-format)
   - [Mount (`squeezefs mount`)](#mount-squeezefs-mount)
+  - [LD_PRELOAD interception (`-o interception`)](#ld_preload-interception--o-interception--security-posture--unsupported-mixes)
   - [Cache/staging paths (`squeezefs config`)](#cachestaging-paths-squeezefs-config)
   - [Transparent compression & encryption](#transparent-compression--encryption)
   - [Read-path tuning](#read-path-tuning-mount-env-design-docsdesign-read-pathmd)
@@ -191,8 +192,29 @@ Cache/staging paths come from the format config; passing `--disk-cache-paths` at
 - `--uid <uid>` / `--gid <gid>`: presented owner of files in the mount (presentation-only; staging I/O runs as the mounting user).
 - `-o <opts>`: FUSE options, including the per-class kernel TTLs (`attr_timeout`, `entry_timeout`, `dir_entry_timeout`, `negative_timeout`), `max_background` / `congestion_threshold` INIT overrides, and `direct_device_true` — each documented in its section below.
 - `--no-writeback`: disable the FUSE writeback cache (enabled by default).
+- `--interception` (= `-o interception` = `SQUEEZEFS_IPC=1`): arm the L4 LD_PRELOAD interception session host for this mount — see [LD_PRELOAD interception](#ld_preload-interception--o-interception--security-posture--unsupported-mixes).
 - `--write-verification` (+ `--write-verification-sample <N>`): opt-in read-after-write checksum verification.
 - `--dismount-wait <secs>` / `--upload-delay <dur>`: staging drain window on dismount / background upload cadence.
+
+### LD_PRELOAD interception (`-o interception`) — security posture & unsupported mixes
+
+Opt-in at **both** ends (`docs/design-preload-interception.md`, v1 posture): the mount arms the session host (`--interception` / `-o interception` / `SQUEEZEFS_IPC=1`), and each app opts in with `LD_PRELOAD=libsqueezefs_il.so` (the shim ships in a later L4 PR; until then the armed host is the control plane only). Everything the shim cannot serve identically falls through to the real fd via kernel FUSE — **correctness never depends on interception**.
+
+**KD-11 — interception forces kernel write-through.** `-o interception` flips the mount to `write_back = false` (the same knob `--no-writeback` drives): the default-on kernel writeback cache acks buffered writes before the daemon sees them, and a ring read (direct-to-daemon by construction) would miss them. Combining `-o interception` with an explicit `writeback`/`writeback_cache` request is a contradiction and **refuses the mount loudly**. Cost: buffered kernel-path small writes on interception mounts lose the kernel's dirty-page batching (interception mounts exist to take the ring path for exactly those writes).
+
+**Security posture (the §5.2 daemon fd screen is the boundary):**
+- The bind credential is a **real open fd** passed over an abstract AF_UNIX socket (`SCM_RIGHTS`). The daemon re-derives everything from the received fd itself: `O_PATH` descriptions are refused outright (obtainable with search-only permission — accepting one would grant reads without read permission), non-regular files refuse, `st_dev` must match the mount, and per-op rights come strictly from the description's access mode **in both directions** (an `O_WRONLY` binding cannot ring-read; an `O_RDONLY` binding cannot ring-write — both surface as `EBADF`). `O_APPEND`, `O_SYNC`/`O_DSYNC`, and `O_TMPFILE`-class (unnamed regular file, `st_nlink == 0` — which also conservatively refuses open-then-unlinked fds; passthrough serves them) refuse at bind.
+- **Version lock (forward-only):** sessions bind only between identical builds (`build_commit` equality + `IPC_ABI`). Degenerate identities — `unknown` (no-git tarball) or `-dirty` — refuse on *either* side; `SQUEEZEFS_IPC_ALLOW_DEV=1` is the dev-box override, **counted** in `.stats` `ipc_binds_dev_override` (nonzero outside dev boxes is a fleet-hygiene alarm).
+- **Multi-user (`--allow-other`) posture:** any uid that can open files on the mount can establish sessions. Sessions are per-process, arenas are private mappings (no cross-process payload visibility), per-uid session caps and the R5 `ipc_session_arenas` budget component bound resource use (shed = refuse-new-sessions, never tearing live ones). The trust model is exactly POSIX-fd trust plus resource caps. `SO_PEERCRED` labels accounting and is defense-in-depth, not the authorizer.
+- **Observability:** `.stats` carries the refusal ledger (`ipc_bind_refused_{version,nonce,flags,mode,budget,peercred}`), lifecycle gauges (`ipc_sessions_{active,total}`, `ipc_arena_bytes`, `ipc_binds`, `ipc_admission_refusals`) and two **must-stay-0 tripwires**: `ipc_descriptor_rejects` and `ipc_sessions_poisoned` — nonzero means a client bug or an attack (one loud log line per event).
+
+**Unsupported mixes (documented contract, not detected):**
+- **Concurrent cross-process `MAP_SHARED` mmap-writers + ring writers on the same file** — page-granularity writeback can clobber ring-written bytes (lost updates). Same-process mmap is handled: the shim unbinds *all* in-process bindings on the mapped inode. Cross-process is declared unsupported; run such workloads without the shim.
+- **Cross-process buffered/mmap readers** can observe a bounded staleness window on ring-written data (same class as attr-TTL staleness); the daemon's `notify_inval_inode` handoff (later L4 PR) bounds it.
+- **Mixed-ABI fd lifecycles**: apps that close *and* recreate fds exclusively through raw `syscall(2)`/io_uring (invisible to the shim) and then issue libc data calls on the reused number are unsupported under the shim (`SQUEEZEFS_IL_PARANOID_FSTAT=1` is the triage knob).
+- **Containers with their own network namespace**: the abstract-socket rendezvous is per-netns — such apps silently stay on kernel FUSE (client-side `preload_bind_refused{socket}` is the tell); the path-based socket is the planned v1.1 answer.
+
+*Env knobs:* `SQUEEZEFS_IPC=1` (arm), `SQUEEZEFS_IPC_ARENA_MB` (per-session payload arena, default 64), `SQUEEZEFS_IPC_MAX_OP_BYTES` (default 1 MiB), `SQUEEZEFS_IPC_MEM_MAX` (MiB; session-shm admission cap, default `min(mem_budget/8, 2 GiB)`), `SQUEEZEFS_IPC_ALLOW_DEV=1` (counted dev-build skew override).
 
 ### Cache/staging paths (`squeezefs config`)
 

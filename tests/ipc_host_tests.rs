@@ -58,8 +58,7 @@ fn test_config(name: &str) -> IpcHostConfig {
 
 fn spawn_host(name: &str) -> (Arc<IpcHost>, IpcHostConfig) {
     let cfg = test_config(name);
-    let host = IpcHost::spawn(cfg.clone(), Arc::new(EchoSessionSink::default()))
-        .expect("host must spawn");
+    let host = IpcHost::spawn(cfg.clone(), Arc::new(EchoSessionSink)).expect("host must spawn");
     (host, cfg)
 }
 
@@ -209,12 +208,10 @@ impl ClientSession {
     fn slot(&self, i: usize) -> &IpcSlot {
         assert!(i < self.geometry.slots as usize);
         // SAFETY: slot i is inside the slot region by the assert + layout.
-        unsafe {
-            &*((self.base.add(self.layout.slots_off as usize) as *const IpcSlot).add(i))
-        }
+        unsafe { &*((self.base.add(self.layout.slots_off as usize) as *const IpcSlot).add(i)) }
     }
 
-    fn arena(&self, off: u64, len: usize) -> &mut [u8] {
+    fn arena(&mut self, off: u64, len: usize) -> &mut [u8] {
         assert!(off + len as u64 <= self.geometry.arena_bytes);
         // SAFETY: bounds asserted against the arena region.
         unsafe {
@@ -254,7 +251,10 @@ impl Drop for ClientSession {
     fn drop(&mut self) {
         // SAFETY: unmapping the mapping created in `map`.
         unsafe {
-            libc::munmap(self.base as *mut libc::c_void, self.layout.total_bytes as usize);
+            libc::munmap(
+                self.base as *mut libc::c_void,
+                self.layout.total_bytes as usize,
+            );
         }
     }
 }
@@ -355,11 +355,8 @@ fn hello_version_skew_refuses_including_unknown_and_dirty() {
         build_commit: "unknown".to_string(),
         ..cfg.clone()
     };
-    let unknown_host = IpcHost::spawn(
-        unknown_host_cfg.clone(),
-        Arc::new(EchoSessionSink::default()),
-    )
-    .expect("spawn");
+    let unknown_host =
+        IpcHost::spawn(unknown_host_cfg.clone(), Arc::new(EchoSessionSink)).expect("spawn");
     unknown_host.set_expected_st_dev(mf.st_dev);
     let (_s3, reply, _) = hello(
         &unknown_host_cfg,
@@ -378,8 +375,8 @@ fn hello_version_skew_refuses_including_unknown_and_dirty() {
         build_commit: dirty_commit.clone(),
         ..cfg.clone()
     };
-    let dirty_host = IpcHost::spawn(dirty_host_cfg.clone(), Arc::new(EchoSessionSink::default()))
-        .expect("spawn");
+    let dirty_host =
+        IpcHost::spawn(dirty_host_cfg.clone(), Arc::new(EchoSessionSink)).expect("spawn");
     dirty_host.set_expected_st_dev(mf.st_dev);
     let (_s4, reply, _) = hello(
         &dirty_host_cfg,
@@ -406,8 +403,7 @@ fn hello_version_skew_refuses_including_unknown_and_dirty() {
         allow_dev: true,
         ..cfg.clone()
     };
-    let allow_host =
-        IpcHost::spawn(allow_cfg.clone(), Arc::new(EchoSessionSink::default())).expect("spawn");
+    let allow_host = IpcHost::spawn(allow_cfg.clone(), Arc::new(EchoSessionSink)).expect("spawn");
     allow_host.set_expected_st_dev(mf.st_dev);
     let (_s5, reply, memfd) = hello(
         &allow_cfg,
@@ -533,7 +529,10 @@ fn fd_screen_refuses_adversarial_fds_at_hello_and_bind() {
     expect_refuse(&reply, RefuseClass::Flags, "O_PATH at HELLO");
 
     // Directory fd (non-S_ISREG → flags class, §5.2 rule 1).
-    let dirfd = open_flags(mf.path.parent().unwrap(), libc::O_RDONLY | libc::O_DIRECTORY);
+    let dirfd = open_flags(
+        mf.path.parent().unwrap(),
+        libc::O_RDONLY | libc::O_DIRECTORY,
+    );
     let (_s, reply, _) = hello_ok(&cfg, &host, dirfd.as_raw_fd());
     expect_refuse(&reply, RefuseClass::Flags, "directory fd at HELLO");
 
@@ -573,10 +572,7 @@ fn fd_screen_refuses_adversarial_fds_at_hello_and_bind() {
     expect_bind_refused(&reply, RefuseClass::Flags, "O_DSYNC at BIND");
 
     // O_TMPFILE-class: an unnamed regular file on the RIGHT device.
-    let tmpfile = open_flags(
-        mf.path.parent().unwrap(),
-        libc::O_TMPFILE | libc::O_RDWR,
-    );
+    let tmpfile = open_flags(mf.path.parent().unwrap(), libc::O_TMPFILE | libc::O_RDWR);
     let reply = bind(&sock, tmpfile.as_raw_fd());
     expect_bind_refused(&reply, RefuseClass::Flags, "O_TMPFILE at BIND");
 
@@ -599,7 +595,11 @@ fn memfd_regular_file() -> OwnedFd {
         let fd = OwnedFd::from_raw_fd(fd);
         let buf = [1u8; 4096];
         assert_eq!(
-            libc::write(fd.as_raw_fd(), buf.as_ptr() as *const libc::c_void, buf.len()),
+            libc::write(
+                fd.as_raw_fd(),
+                buf.as_ptr() as *const libc::c_void,
+                buf.len()
+            ),
             4096
         );
         fd
@@ -668,7 +668,7 @@ fn happy_path_bind_serves_echo_and_only_echo() {
     let good = open_flags(&mf.path, libc::O_RDWR);
 
     let binds_before = METRICS.ipc_binds.load(Ordering::Relaxed);
-    let (sock, session) = establish(&cfg, &host, good.as_raw_fd());
+    let (sock, mut session) = establish(&cfg, &host, good.as_raw_fd());
 
     let binding = match bind(&sock, good.as_raw_fd()) {
         CtlMsg::BindOk {
@@ -784,7 +784,14 @@ fn happy_path_bind_serves_echo_and_only_echo() {
     );
 
     // UNBIND releases the binding: the id goes dead.
-    send_ctl(&sock, &CtlMsg::Unbind { binding_id: binding }, None).expect("send UNBIND");
+    send_ctl(
+        &sock,
+        &CtlMsg::Unbind {
+            binding_id: binding,
+        },
+        None,
+    )
+    .expect("send UNBIND");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let r = session.submit_wait(&SlotDescriptor {
@@ -818,8 +825,7 @@ fn arena_budget_and_uid_caps_refuse_admission() {
     // Arena cap below one arena: every session refused, class budget.
     let mut cfg = test_config("budget");
     cfg.arena_cap_bytes = cfg.geometry.arena_bytes - 1;
-    let host =
-        IpcHost::spawn(cfg.clone(), Arc::new(EchoSessionSink::default())).expect("spawn");
+    let host = IpcHost::spawn(cfg.clone(), Arc::new(EchoSessionSink)).expect("spawn");
     host.set_expected_st_dev(mf.st_dev);
     let fd = open_flags(&mf.path, libc::O_RDWR);
     let budget_before = METRICS.ipc_bind_refused_budget.load(Ordering::Relaxed);
@@ -836,8 +842,7 @@ fn arena_budget_and_uid_caps_refuse_admission() {
     // Per-uid session cap 1: second concurrent session refused.
     let mut cfg = test_config("uidcap");
     cfg.per_uid_session_cap = 1;
-    let host =
-        IpcHost::spawn(cfg.clone(), Arc::new(EchoSessionSink::default())).expect("spawn");
+    let host = IpcHost::spawn(cfg.clone(), Arc::new(EchoSessionSink)).expect("spawn");
     host.set_expected_st_dev(mf.st_dev);
     let (_live_sock, _live_session) = establish(&cfg, &host, fd.as_raw_fd());
     let (_s2, reply, _) = hello_ok(&cfg, &host, fd.as_raw_fd());
@@ -852,9 +857,12 @@ fn shed_refuses_new_sessions_never_tears_live_ones() {
     host.set_expected_st_dev(mf.st_dev);
     let fd = open_flags(&mf.path, libc::O_RDWR);
 
-    let (sock, session) = establish(&cfg, &host, fd.as_raw_fd());
+    let (sock, mut session) = establish(&cfg, &host, fd.as_raw_fd());
     let live_arena = host.arena_bytes();
-    assert!(live_arena >= cfg.geometry.arena_bytes, "gauge counts the arena");
+    assert!(
+        live_arena >= cfg.geometry.arena_bytes,
+        "gauge counts the arena"
+    );
 
     // Shed to 0: new sessions refuse (class budget)…
     host.shed_to(0);
@@ -1107,7 +1115,7 @@ async fn bootstrap_xattr_synthesis_filter_and_stats_fields() {
         .getxattr(req, ino, OsStr::new(BOOTSTRAP_XATTR), 4096)
         .await
         .expect_err("disabled mount must not synthesize the blob");
-    assert_eq!(err.into(), libc::ENODATA);
+    assert_eq!(libc::c_int::from(err), -libc::ENODATA);
 
     // setxattr on the reserved name: EPERM even while disabled (the name
     // is reserved unconditionally).
@@ -1115,12 +1123,11 @@ async fn bootstrap_xattr_synthesis_filter_and_stats_fields() {
         .setxattr(req, ino, OsStr::new(BOOTSTRAP_XATTR), b"forged", 0, 0)
         .await
         .expect_err("reserved name is never writable");
-    assert_eq!(err.into(), libc::EPERM);
+    assert_eq!(libc::c_int::from(err), -libc::EPERM);
 
     // Arm the host (what `start_mount -o interception` does).
     let cfg = test_config("xattr");
-    let host = IpcHost::spawn(cfg.clone(), Arc::new(EchoSessionSink::default()))
-        .expect("host must spawn");
+    let host = IpcHost::spawn(cfg.clone(), Arc::new(EchoSessionSink)).expect("host must spawn");
     host.set_expected_st_dev(4242);
     fs.ipc_host.store(Arc::new(Some(host.clone())));
 
@@ -1164,10 +1171,7 @@ async fn bootstrap_xattr_synthesis_filter_and_stats_fields() {
         .setxattr(ino, "user.other", b"visible")
         .await
         .expect("plant sibling key");
-    let reply = fs
-        .listxattr(req, ino, 4096)
-        .await
-        .expect("listxattr");
+    let reply = fs.listxattr(req, ino, 4096).await.expect("listxattr");
     let names = match reply {
         fuse3::raw::reply::ReplyXAttr::Data(d) => d,
         other => panic!("expected data, got {other:?}"),
@@ -1187,11 +1191,16 @@ async fn bootstrap_xattr_synthesis_filter_and_stats_fields() {
         .setxattr(req, ino, OsStr::new(BOOTSTRAP_XATTR), b"forged", 0, 0)
         .await
         .expect_err("reserved name is never writable");
-    assert_eq!(err.into(), libc::EPERM);
+    assert_eq!(libc::c_int::from(err), -libc::EPERM);
 
-    // §8 stats surface: the ipc_* family exports on the stats inode.
+    // §8 stats surface: the ipc_* family exports on the stats inode —
+    // under the "metrics" object like every counter family
+    // (tests/metrics_tests.rs house style).
     let stats = fs.generate_stats_json().await;
     let v: serde_json::Value = serde_json::from_str(&stats).expect("stats json parses");
+    let v = v
+        .get("metrics")
+        .expect("stats JSON carries a metrics object");
     for key in [
         "ipc_sessions_active",
         "ipc_sessions_total",

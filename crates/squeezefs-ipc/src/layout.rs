@@ -66,9 +66,13 @@ pub const DEFAULT_MAX_OP_BYTES: u32 = 1024 * 1024;
 /// budget component, design §5.7 — this only bounds the arithmetic).
 pub const MAX_ARENA_BYTES: u64 = 1 << 40;
 
-/// v1 op codes (§5.3 op slot: READ | WRITE).
+/// v1 op codes (§5.3 op slot: READ | WRITE). ECHO is the L4-3 session-host
+/// liveness/round-trip op (payload in, byte-sum result + inverted payload
+/// out) — the one op served before the PR L4-4 data plane, kept after it
+/// as the ping op.
 pub const OP_READ: u32 = 1;
 pub const OP_WRITE: u32 = 2;
+pub const OP_ECHO: u32 = 3;
 
 /// Session geometry, fixed at session creation and embedded in the header.
 #[repr(C)]

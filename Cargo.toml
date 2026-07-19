@@ -69,6 +69,7 @@ crossbeam = "0.8"
 scc = "3.8.3"
 arc-swap = "1.7"
 compact_str = "0.8"
+squeezefs-ipc = { path = "crates/squeezefs-ipc" }
 
 [features]
 default = []
@@ -78,7 +79,6 @@ coz-on = ["dep:coz"]
 
 [dev-dependencies]
 regex = "1.10"
-squeezefs-ipc = { path = "crates/squeezefs-ipc" }
 tempfile = "3.10"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1.5"

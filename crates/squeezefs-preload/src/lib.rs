@@ -19,6 +19,7 @@ compile_error!(
      the root release profile's panic=\"abort\" would void catch_unwind and abort host apps"
 );
 
+pub mod aio_core;
 pub mod bailout;
 pub mod dev_cache;
 pub mod fd_table;

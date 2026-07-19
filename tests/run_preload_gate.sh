@@ -140,15 +140,21 @@ stats() { # stats <key>
 # fine: --allow-other admits any uid, and root's opens pass the screen.
 ILP() { LD_PRELOAD="$SO" "$@"; }
 
-# Ring writes grow files invisibly to the KERNEL's attr cache (size TTL
-# 1 s): an unbound reader (cmp here) inside that window sees the stale
-# size — the documented §5.6.2 W1-class bound. PR L4-6's
-# notify_inval_inode mitigation shrinks it; until then the parity rows
-# wait out the TTL. Reads THROUGH the shim (ring reads) never see the
-# window — daemon state is the authority — which the dd read-back row
-# proves by running with no settle at all.
-ATTR_TTL_SETTLE=1.2
-settle() { sleep "$ATTR_TTL_SETTLE"; }
+# §5.6.2 W1 + the L4-6 mitigation: ring writes grow files invisibly to
+# the KERNEL's attr cache (size TTL 1 s) — the daemon now pushes
+# FUSE_NOTIFY_INVAL_INODE on bind + rate-limited first write, so an
+# unbound kernel reader converges WITHIN the TTL. settle_notify polls
+# with a deadline strictly BELOW the 1 s TTL: passing proves the notify
+# was DELIVERED on the armed over-uring session (the L4-6 card's
+# delivery pin), not merely that the TTL expired. Reads THROUGH the
+# shim never see the window at all — the no-settle dd read-back row.
+settle_notify() { # settle_notify <a> <b> <what>
+    for _ in $(seq 1 8); do
+        cmp -s "$1" "$2" && return 0
+        sleep 0.1
+    done
+    fail "$3 (kernel reader did not converge < 1 s TTL — notify NOT delivered)"
+}
 
 # 2b. cp/dd parity ON the mount + the §3 rule-4 engagement proof.
 OPS_R0=$(stats ipc_ops_read); OPS_W0=$(stats ipc_ops_write); SESS0=$(stats ipc_sessions_total)
@@ -156,12 +162,13 @@ OPS_R0=$(stats ipc_ops_read); OPS_W0=$(stats ipc_ops_write); SESS0=$(stats ipc_s
 ILP cp "$T/src.bin" "$MOUNT_DIR/cp.bin"
 ILP dd if="$MOUNT_DIR/cp.bin" of="$T/back.bin" bs=64k status=none
 cmp "$T/src.bin" "$T/back.bin" || fail "ring read-back parity (no settle: daemon state is the authority)"
-settle
-cmp "$T/src.bin" "$MOUNT_DIR/cp.bin" || fail "cp parity onto the mount (kernel reader, post-TTL)"
+settle_notify "$T/src.bin" "$MOUNT_DIR/cp.bin" "cp parity via notify delivery"
 ILP dd if="$T/src.bin" of="$MOUNT_DIR/dd.bin" bs=1M oflag=direct status=none 2>/dev/null \
     || ILP dd if="$T/src.bin" of="$MOUNT_DIR/dd.bin" bs=1M status=none
-settle
-cmp "$T/src.bin" "$MOUNT_DIR/dd.bin" || fail "dd write parity onto the mount (kernel reader, post-TTL)"
+settle_notify "$T/src.bin" "$MOUNT_DIR/dd.bin" "dd write parity via notify delivery"
+INVAL=$(stats ipc_inval_notifies)
+[ "$INVAL" -gt 0 ] || fail "ipc_inval_notifies never moved — the W1 handoff is not firing"
+echo "OK: notify delivery on the armed session (ipc_inval_notifies=$INVAL)"
 
 OPS_R1=$(stats ipc_ops_read); OPS_W1=$(stats ipc_ops_write); SESS1=$(stats ipc_sessions_total)
 [ "$SESS1" -gt "$SESS0" ] || fail "no IPC session was ever established (engagement, §3 rule 4)"
@@ -241,5 +248,63 @@ if command -v elbencho &>/dev/null; then
 else
     echo "SKIP: elbencho not installed"
 fi
+
+# 2h. kill-9 soak (L4-6, G-L4-4 zero-residue): SIGKILL a preload'd
+# writer mid-stream ×5; every cycle must drain sessions AND session-shm
+# bytes to the pre-cycle baseline (multi-run discipline: any failure
+# aborts the count).
+SESS_BASE=$(stats ipc_sessions_active)
+ARENA_BASE=$(stats ipc_arena_bytes)
+for i in 1 2 3 4 5; do
+    # Env-prefixed SIMPLE command: bash backgrounds the real process, so
+    # $! is dd itself. (`ILP dd ... &` backgrounds a SUBSHELL running the
+    # function — the first run of this soak killed the wrapper while dd
+    # survived to finish normally, testing nothing.)
+    LD_PRELOAD="$SO" SQUEEZEFS_IPC_ALLOW_DEV=1 \
+        dd if=/dev/zero of="$MOUNT_DIR/kill$i.bin" bs=64k count=100000 status=none &
+    KPID=$!
+    sleep 0.3
+    kill -9 "$KPID" 2>/dev/null || true
+    wait "$KPID" 2>/dev/null || true
+    deadline=$((SECONDS + 10))
+    while :; do
+        [ "$(stats ipc_sessions_active)" -le "$SESS_BASE" ] \
+            && [ "$(stats ipc_arena_bytes)" -le "$ARENA_BASE" ] && break
+        [ "$SECONDS" -lt "$deadline" ] || fail "kill-9 cycle $i: session/arena residue"
+        sleep 0.2
+    done
+done
+mountpoint -q "$MOUNT_DIR" || fail "daemon died during the kill-9 soak"
+echo "OK: kill-9 soak (5 cycles, zero session/arena residue)"
+
+# 2i. fork-then-kill-parent (§5.7 row 1): the atfork child CLOSED its
+# inherited socket copy, so SIGKILL'ing the parent drops the last ref —
+# EOF fires and the session tears down even though a forked child
+# still runs (the child's inherited arena mapping is the bounded
+# straggler, reclaimed at its exit).
+LD_PRELOAD="$SO" SQUEEZEFS_IPC_ALLOW_DEV=1 python3 - "$MOUNT_DIR/forkp.bin" <<'EOF' &
+import os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+os.pwrite(fd, b"x" * 65536, 0)          # bind + session established
+pid = os.fork()
+if pid == 0:
+    time.sleep(20)                        # child outlives the parent
+    os._exit(0)
+print(os.getpid(), flush=True)
+time.sleep(30)                            # parent waits to be killed
+EOF
+FPID=$!
+sleep 1.5                                  # session + fork established
+kill -9 "$FPID" 2>/dev/null || true
+wait "$FPID" 2>/dev/null || true
+deadline=$((SECONDS + 10))
+while :; do
+    [ "$(stats ipc_sessions_active)" -le "$SESS_BASE" ] && break
+    [ "$SECONDS" -lt "$deadline" ] \
+        || fail "fork-kill-parent: session never tore down — the surviving child masked parent-death EOF"
+    sleep 0.2
+done
+pkill -9 -f "$MOUNT_DIR/forkp.bin" 2>/dev/null || true
+echo "OK: fork-then-kill-parent (EOF fired despite the surviving child)"
 
 echo "PRELOAD GATE (both legs) PASSED"

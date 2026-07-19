@@ -34,6 +34,7 @@ fn binding(id: u64) -> Binding {
         ino: 100 + id,
         read_ok: true,
         write_ok: true,
+        session: 0,
     }
 }
 
@@ -52,12 +53,12 @@ fn bind_lookup_close_roundtrip() {
     assert!(b.read_ok && b.write_ok);
 
     assert_eq!(
-        t.on_close(3),
+        t.on_close(3).map(|b| b.binding_id),
         Some(7),
         "sole-entry close must report the released binding for the async unbind"
     );
     assert!(t.lookup(3).is_none(), "closed fd must lookup None");
-    assert_eq!(t.on_close(3), None, "double close releases nothing");
+    assert!(t.on_close(3).is_none(), "double close releases nothing");
 }
 
 #[test]
@@ -68,7 +69,7 @@ fn dup_propagates_and_close_original_keeps_dup_bound() {
     let t = FdTable::new();
     t.bind(10, binding(1));
     assert_eq!(
-        t.on_dup(10, 20),
+        t.on_dup(10, 20).map(|b| b.binding_id),
         None,
         "dup onto a free fd releases nothing"
     );
@@ -84,7 +85,11 @@ fn dup_propagates_and_close_original_keeps_dup_bound() {
         .expect("dup must stay bound after original close");
     assert_eq!(b.binding_id, 1);
 
-    assert_eq!(t.on_close(20), Some(1), "last close unbinds exactly once");
+    assert_eq!(
+        t.on_close(20).map(|b| b.binding_id),
+        Some(1),
+        "last close unbinds exactly once"
+    );
     assert!(t.lookup(20).is_none());
 }
 
@@ -96,13 +101,13 @@ fn dup2_over_live_binding_releases_the_clobbered_one() {
     t.bind(5, binding(1));
     t.bind(6, binding(2));
     assert_eq!(
-        t.on_dup(5, 6),
+        t.on_dup(5, 6).map(|b| b.binding_id),
         Some(2),
         "dup2 over a bound fd must release the clobbered sole-ref binding"
     );
     assert_eq!(t.lookup(6).expect("6 now shares 5's binding").binding_id, 1);
-    assert_eq!(t.on_close(5), None);
-    assert_eq!(t.on_close(6), Some(1));
+    assert!(t.on_close(5).is_none());
+    assert_eq!(t.on_close(6).map(|b| b.binding_id), Some(1));
 }
 
 #[test]
@@ -113,12 +118,12 @@ fn bind_over_stale_entry_releases_it_first() {
     let t = FdTable::new();
     t.bind(4, binding(1));
     assert_eq!(
-        t.bind(4, binding(2)),
+        t.bind(4, binding(2)).map(|b| b.binding_id),
         Some(1),
         "rebinding a stale entry must release the old sole-ref binding"
     );
     assert_eq!(t.lookup(4).expect("new binding live").binding_id, 2);
-    assert_eq!(t.on_close(4), Some(2));
+    assert_eq!(t.on_close(4).map(|b| b.binding_id), Some(2));
 }
 
 #[test]
@@ -131,6 +136,7 @@ fn close_range_sweeps_inclusive_range() {
 
     let mut released = Vec::new();
     t.on_close_range(3, 9, &mut released);
+    let mut released: Vec<u64> = released.iter().map(|b| b.binding_id).collect();
     released.sort_unstable();
     assert_eq!(
         released,
@@ -144,7 +150,7 @@ fn close_range_sweeps_inclusive_range() {
             .binding_id,
         2
     );
-    assert_eq!(t.on_close(100), Some(2));
+    assert_eq!(t.on_close(100).map(|b| b.binding_id), Some(2));
 }
 
 #[test]
@@ -160,7 +166,7 @@ fn hygiene_sweep_is_refcount_aware_composition() {
     // fd 7 closed via raw syscall — the shim saw nothing. socket()
     // returns 7; the creator hygiene sweep runs on it:
     assert_eq!(
-        t.sweep_stale(7),
+        t.sweep_stale(7).map(|b| b.binding_id),
         None,
         "sweep releases the stale REF (not the binding — the dup still holds one)"
     );
@@ -171,14 +177,14 @@ fn hygiene_sweep_is_refcount_aware_composition() {
     );
 
     assert_eq!(
-        t.on_close(8),
+        t.on_close(8).map(|b| b.binding_id),
         Some(9),
         "the dup's close is the LAST ref — unbind exactly once"
     );
 
     // Empty-entry sweep (the overwhelmingly common case) is a no-op.
-    assert_eq!(t.sweep_stale(7), None);
-    assert_eq!(t.sweep_stale(1234), None);
+    assert!(t.sweep_stale(7).is_none());
+    assert!(t.sweep_stale(1234).is_none());
 }
 
 #[test]
@@ -195,7 +201,7 @@ fn table_grows_to_large_fds_and_negative_fd_is_none() {
         t.lookup(i32::MAX).is_none(),
         "huge unbound fd is a cheap None"
     );
-    assert_eq!(t.on_close(10_000), Some(1));
+    assert_eq!(t.on_close(10_000).map(|b| b.binding_id), Some(1));
 }
 
 #[test]
@@ -237,8 +243,54 @@ fn concurrent_dup_close_stress_unbinds_exactly_once() {
         0,
         "binding must never release while the anchor fd holds a ref"
     );
-    assert_eq!(t.on_close(3), Some(42), "the anchor close is the last ref");
-    assert_eq!(t.on_close(3), None);
+    assert_eq!(
+        t.on_close(3).map(|b| b.binding_id),
+        Some(42),
+        "the anchor close is the last ref"
+    );
+    assert!(t.on_close(3).is_none());
+}
+
+#[test]
+fn unbind_ino_walk_releases_every_sibling_in_process() {
+    // The §5.6.2 W3(a) mmap rule (Issue-22): mmap on a bound fd unbinds
+    // ALL in-process bindings on the SAME inode — fd_b must stop ring-
+    // writing when fd_a maps the file. Distinct inodes are untouched.
+    let t = FdTable::new();
+    t.bind(3, binding(1)); // ino 101
+    t.bind(4, binding(2)); // ino 102 (different file)
+                           // A second open of ino 101 (its own binding id):
+    t.bind(
+        5,
+        Binding {
+            binding_id: 9,
+            ino: 101,
+            read_ok: true,
+            write_ok: true,
+            session: 0,
+        },
+    );
+    t.on_dup(3, 30); // sharer of binding 1
+
+    let mut released = Vec::new();
+    t.unbind_ino(101, &mut released);
+    let mut released: Vec<u64> = released.iter().map(|b| b.binding_id).collect();
+    released.sort_unstable();
+    assert_eq!(
+        released,
+        vec![1, 9],
+        "every ino-101 binding releases exactly once (the dup ref and the entry ref collapse)"
+    );
+    assert!(
+        t.lookup(3).is_none() && t.lookup(5).is_none() && t.lookup(30).is_none(),
+        "all ino-101 entries (incl. dup sharers) must be gone"
+    );
+    assert_eq!(
+        t.lookup(4).expect("other inode untouched").binding_id,
+        2,
+        "unbind_ino must never touch other inodes"
+    );
+    assert_eq!(t.on_close(4).map(|b| b.binding_id), Some(2));
 }
 
 // ---------------------------------------------------------------------------

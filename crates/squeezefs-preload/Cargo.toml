@@ -37,3 +37,17 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 libc = "0.2"
 squeezefs-ipc = { path = "../squeezefs-ipc" }
+
+[features]
+# The #[no_mangle] libc interposer symbols. ONLY the shipped cdylib
+# enables this: an rlib carrying strong `open`/`read`/`write`/`close`
+# symbols would interpose INSIDE any test binary that links it (the
+# binary's own symbols beat libc's dynamic ones). The sanctioned .so
+# build is therefore:
+#
+#     cargo build -p squeezefs-preload --profile preload-release \
+#         --features interposers
+#
+# (tests/run_preload_gate.sh); the root dev-dependency stays
+# feature-less and links only the cores + session client.
+interposers = []

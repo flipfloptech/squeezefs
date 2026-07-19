@@ -68,12 +68,15 @@ pub struct BindGrant {
 }
 
 impl BindGrant {
-    pub fn to_binding(self) -> Binding {
+    /// The fd-table entry for this grant, tagged with the session's
+    /// registry token (how the closer routes the last-ref unbind).
+    pub fn to_binding(self, session: usize) -> Binding {
         Binding {
             binding_id: self.binding_id,
             ino: self.ino,
             read_ok: self.read_ok,
             write_ok: self.write_ok,
+            session,
         }
     }
 }

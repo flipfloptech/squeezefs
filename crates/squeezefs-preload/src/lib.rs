@@ -22,4 +22,11 @@ compile_error!(
 pub mod bailout;
 pub mod dev_cache;
 pub mod fd_table;
+#[cfg(feature = "interposers")]
+pub mod interpose;
 pub mod session;
+
+/// This shim's build identity (`<full-hash>[-dirty]`, `src/version.rs`
+/// form) — the KD-7 skew-gate key, compared against the daemon's
+/// bootstrap blob at establish.
+pub const BUILD_COMMIT: &str = env!("SQUEEZEFS_IL_BUILD_COMMIT");

@@ -34,6 +34,10 @@ pub struct Binding {
     pub ino: u64,
     pub read_ok: bool,
     pub write_ok: bool,
+    /// Opaque session token (the interposer registry slot this binding's
+    /// session lives in) — the closer routes the last-ref unbind ctl
+    /// message through it.
+    pub session: usize,
 }
 
 /// The shared, refcounted cell behind every fd entry that holds one
@@ -60,11 +64,12 @@ impl BindingCell {
             .is_ok()
     }
 
-    /// Drop one ref; `Some(binding_id)` on the last one — the caller's
-    /// cue to send the async unbind ctl message, exactly once.
-    fn release(&self) -> Option<u64> {
+    /// Drop one ref; `Some(binding)` on the last one — the caller's
+    /// cue to send the async unbind ctl message, exactly once (the
+    /// returned copy carries the session token to route it).
+    fn release(&self) -> Option<Binding> {
         if self.refs.fetch_sub(1, Ordering::AcqRel) == 1 {
-            Some(self.binding.binding_id)
+            Some(self.binding)
         } else {
             None
         }
@@ -178,10 +183,10 @@ impl FdTable {
         Some(unsafe { (*cell).binding })
     }
 
-    /// Install a fresh binding (refs = 1) on `fd`. Returns the binding id
+    /// Install a fresh binding (refs = 1) on `fd`. Returns the binding
     /// of a displaced **stale** entry whose last ref this released
     /// (raw-syscall-closed fd whose number was reused — §5.4.1).
-    pub fn bind(&self, fd: i32, binding: Binding) -> Option<u64> {
+    pub fn bind(&self, fd: i32, binding: Binding) -> Option<Binding> {
         let slot = self.slot_or_grow(fd)?;
         let cell = Box::into_raw(Box::new(BindingCell {
             binding,
@@ -193,9 +198,9 @@ impl FdTable {
 
     /// `dup`/`dup2`/`dup3`/`F_DUPFD*`: propagate `oldfd`'s binding to
     /// `newfd` (or clear `newfd` if `oldfd` is unbound — dup2 implicitly
-    /// closes newfd either way). Returns the binding id released by the
+    /// closes newfd either way). Returns the binding released by the
     /// displaced entry's last ref, if any.
-    pub fn on_dup(&self, oldfd: i32, newfd: i32) -> Option<u64> {
+    pub fn on_dup(&self, oldfd: i32, newfd: i32) -> Option<Binding> {
         let propagated: *mut BindingCell = match self.slot(oldfd) {
             Some(slot) => {
                 let cell = slot.load(Ordering::Acquire);
@@ -227,20 +232,20 @@ impl FdTable {
         Self::release_cell(old)
     }
 
-    /// `close(fd)`: drop the entry's ref. `Some(binding_id)` = last ref —
+    /// `close(fd)`: drop the entry's ref. `Some(binding)` = last ref —
     /// send the async unbind ctl message.
-    pub fn on_close(&self, fd: i32) -> Option<u64> {
+    pub fn on_close(&self, fd: i32) -> Option<Binding> {
         let slot = self.slot(fd)?;
         let old = slot.swap(std::ptr::null_mut(), Ordering::AcqRel);
         Self::release_cell(old)
     }
 
     /// `close_range(first, last)`: sweep the inclusive range, appending
-    /// every last-ref binding id to `released` (one unbind each). Whole
+    /// every last-ref binding to `released` (one unbind each). Whole
     /// unallocated segments are skipped in O(1) — `close_range(3, ~0)`
     /// is the systemd/container idiom and must not walk millions of
     /// nulls.
-    pub fn on_close_range(&self, first: i32, last: i32, released: &mut Vec<u64>) {
+    pub fn on_close_range(&self, first: i32, last: i32, released: &mut Vec<Binding>) {
         if first < 0 || last < first {
             return;
         }
@@ -262,17 +267,59 @@ impl FdTable {
         }
     }
 
+    /// The §5.6.2 W3(a) mmap rule (Issue-22): release **every** entry
+    /// whose binding names `ino` — the mapping's authority is per-file,
+    /// not per-fd (a same-inode sibling fd left bound would recreate the
+    /// lost-update hazard through ring writes racing page writeback).
+    /// Matches by ino only: two bound mounts sharing an st_ino would
+    /// over-unbind, which is passthrough — correct by §5.4.2.
+    pub fn unbind_ino(&self, ino: u64, released: &mut Vec<Binding>) {
+        for d in 0..DIR_SLOTS {
+            let seg = self.dir[d].load(Ordering::Acquire);
+            if seg.is_null() {
+                continue;
+            }
+            for s in 0..SEG_SLOTS {
+                // SAFETY: non-null segments are leaked allocations.
+                let slot = unsafe { &(*seg)[s] };
+                let cell = slot.load(Ordering::Acquire);
+                if cell.is_null() {
+                    continue;
+                }
+                // SAFETY: leaked cell — valid forever.
+                if unsafe { (*cell).binding.ino } != ino {
+                    continue;
+                }
+                // CAS, not swap: never clobber a racing rebind of this
+                // fd to some other file.
+                if slot
+                    .compare_exchange(
+                        cell,
+                        std::ptr::null_mut(),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    if let Some(b) = Self::release_cell(cell) {
+                        released.push(b);
+                    }
+                }
+            }
+        }
+    }
+
     /// The fd-creator hygiene sweep (§5.1, Issue-21): a creator returned
     /// `fd`; a stale entry there means its close was invisible (raw
     /// syscall / IORING_OP_CLOSE). Release it **exactly as `close`
     /// would** — refcount decrement, unbind id on last ref — never a
     /// bare clear. The common empty case is one segment load + one slot
     /// load + branch.
-    pub fn sweep_stale(&self, fd: i32) -> Option<u64> {
+    pub fn sweep_stale(&self, fd: i32) -> Option<Binding> {
         self.on_close(fd)
     }
 
-    fn release_cell(cell: *mut BindingCell) -> Option<u64> {
+    fn release_cell(cell: *mut BindingCell) -> Option<Binding> {
         if cell.is_null() {
             return None;
         }

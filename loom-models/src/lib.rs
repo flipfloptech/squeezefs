@@ -72,6 +72,29 @@
 //!   both interpose `fence(SeqCst)`. Modeled as ONE composition of
 //!   incarnation_core × refcount_core (per-protocol models structurally
 //!   cannot see SB across protocols).
+//! - [`ipc_ring_core`] (`squeezefs-ipc`, design-preload-interception
+//!   §5.3/§5.3.2, PR L4-1): the interception session's bounded MPSC
+//!   submission ring — invariants: no entry lost, none double-consumed,
+//!   no reservation past capacity, and per-cell publication sequences
+//!   monotonic across laps (ABA-safe reuse). **Model precondition, stated
+//!   because the model cannot see its violation** (the `patch_clone_core`
+//!   lesson): exactly ONE consumer per ring — guaranteed structurally by
+//!   the §5.5.1 session-pinning invariant, not by anything inside the
+//!   ring; the models own a single consumer cursor and only transfer it
+//!   across a `join`.
+//! - [`ipc_slot_core`] (`squeezefs-ipc`, §5.3, PR L4-1): the completion-
+//!   in-place op-slot state machine — invariants: exactly-once
+//!   completion; a client that sets WAITER after DONE-publication is
+//!   never stranded (publish-then-recheck, one RMW); FREE reuse never
+//!   observes a stale DONE (generation guard); and the daemon's dequeue
+//!   snapshot is the single linearization read of the descriptor
+//!   (§5.3.1 rule 1 — post-snapshot client mutation never changes the
+//!   served op, and the snapshot never reads pre-submit values).
+//! - `ipc_wake_core` (composition, §5.3 protocol rule 3): the shipped
+//!   [`wake_core::WakeCoalescer`] composed with [`ipc_ring_core`]
+//!   publication exactly as the session doorbell ships — N submissions
+//!   between two drains cost ≤ 1 wake and none is stranded (the L3
+//!   never-stranded law re-verified in the new composition).
 //! - [`conveyor_core`]: the per-volume commit conveyor's leader-election
 //!   / queue / drain core (metadata-throughput design §5.5 D5, PR M7) —
 //!   invariants: leader uniqueness (two racing electors never both win);
@@ -99,6 +122,10 @@ pub mod cow_core;
 pub mod gauge_core;
 #[path = "../../src/incarnation_core.rs"]
 pub mod incarnation_core;
+#[path = "../../crates/squeezefs-ipc/src/ring_core.rs"]
+pub mod ipc_ring_core;
+#[path = "../../crates/squeezefs-ipc/src/slot_core.rs"]
+pub mod ipc_slot_core;
 #[path = "../../src/meta_backend/kv/journal_core.rs"]
 pub mod journal_core;
 #[path = "../../crates/fuse3/src/raw/connection/lease_core.rs"]
@@ -115,8 +142,8 @@ pub mod refcount_core;
 #[cfg(all(test, loom))]
 mod models {
     use crate::{
-        alloc_ext_core, conveyor_core, gauge_core, incarnation_core, journal_core, lease_core,
-        node_state_core, patch_clone_core, refcount_core, wake_core,
+        alloc_ext_core, conveyor_core, gauge_core, incarnation_core, ipc_ring_core, ipc_slot_core,
+        journal_core, lease_core, node_state_core, patch_clone_core, refcount_core, wake_core,
     };
     use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use loom::sync::Arc;
@@ -1703,6 +1730,480 @@ mod models {
                 "guard must be released at the terminal outcome (no leak)"
             );
             assert!(!c.unlead_and_recheck());
+        });
+    }
+
+    /// IPC submission-ring invariant #1 (design-preload-interception
+    /// §5.3.2, PR L4-1): two racing producers' entries are never lost and
+    /// never double-consumed. The single consumer (module precondition —
+    /// enforced structurally by session pinning, §5.5.1) drains bounded
+    /// passes concurrently, then finishes deterministically post-join
+    /// (cursor ownership transfers through the join, the only legal
+    /// transfer).
+    ///
+    /// Weakening evidence (verified during development, then restored):
+    /// the producer's publishing seq store demoted Release→Relaxed fails
+    /// this model — the consumer pops the seeded phantom value 0 ("saw 0
+    /// of 2") in interleavings where the value store has not propagated.
+    #[test]
+    fn ipc_ring_racing_producers_never_lost_nor_duplicated() {
+        loom::model(|| {
+            let storage = Arc::new(
+                ipc_ring_core::RingStorage::with_capacity(2).expect("capacity 2 is valid"),
+            );
+
+            let producers: Vec<_> = [1u32, 2u32]
+                .into_iter()
+                .map(|v| {
+                    let storage = Arc::clone(&storage);
+                    thread::spawn(move || storage.view().push(v))
+                })
+                .collect();
+
+            // The one consumer: bounded concurrent passes (racing the
+            // producers), remainder drained post-join.
+            let consumer_storage = Arc::clone(&storage);
+            let consumer = thread::spawn(move || {
+                let ring = consumer_storage.view();
+                let mut cursor = ipc_ring_core::RingConsumer::new();
+                let mut popped = Vec::new();
+                for _ in 0..2 {
+                    if let Some(v) = cursor.pop(&ring) {
+                        popped.push(v);
+                    }
+                }
+                (cursor, popped)
+            });
+
+            for p in producers {
+                assert!(
+                    p.join().unwrap(),
+                    "capacity 2 must accept both racing pushes"
+                );
+            }
+            let (mut cursor, mut popped) = consumer.join().unwrap();
+            // Post-join drain with the transferred cursor.
+            let ring = storage.view();
+            while let Some(v) = cursor.pop(&ring) {
+                popped.push(v);
+            }
+
+            popped.sort_unstable();
+            assert_eq!(
+                popped,
+                vec![1, 2],
+                "every accepted entry is consumed exactly once (lost or \
+                 duplicated ring entry = lost or double-served op)"
+            );
+        });
+    }
+
+    /// IPC submission-ring invariant #2: reservation never passes capacity
+    /// — three pushes racing into a capacity-2 ring accept exactly two
+    /// (the third sees full = client-visible backpressure), and both
+    /// accepted entries drain intact.
+    #[test]
+    fn ipc_ring_never_reserves_past_capacity() {
+        loom::model(|| {
+            let storage = Arc::new(
+                ipc_ring_core::RingStorage::with_capacity(2).expect("capacity 2 is valid"),
+            );
+
+            let t = {
+                let storage = Arc::clone(&storage);
+                thread::spawn(move || {
+                    let ring = storage.view();
+                    u32::from(ring.push(10)) + u32::from(ring.push(11))
+                })
+            };
+            let accepted_main = u32::from(storage.view().push(12));
+            let accepted = t.join().unwrap() + accepted_main;
+            assert_eq!(
+                accepted, 2,
+                "capacity 2 must accept exactly 2 of 3 racing pushes"
+            );
+
+            let ring = storage.view();
+            let mut cursor = ipc_ring_core::RingConsumer::new();
+            let mut popped = Vec::new();
+            while let Some(v) = cursor.pop(&ring) {
+                popped.push(v);
+            }
+            popped.sort_unstable();
+            assert_eq!(popped.len(), 2, "exactly the accepted entries drain");
+            for v in popped {
+                assert!((10..=12).contains(&v), "phantom value {v} popped");
+            }
+        });
+    }
+
+    /// IPC submission-ring invariant #3 (per-cell seq monotonicity = ABA-
+    /// safe lap reuse): one producer streams three values through a
+    /// capacity-2 ring while the consumer drains concurrently — whatever
+    /// interleaves, consumption is exactly the accepted prefix, in FIFO
+    /// order, across the cell-0 lap boundary.
+    #[test]
+    fn ipc_ring_lap_reuse_keeps_fifo_exact() {
+        loom::model(|| {
+            let storage = Arc::new(
+                ipc_ring_core::RingStorage::with_capacity(2).expect("capacity 2 is valid"),
+            );
+
+            let producer = {
+                let storage = Arc::clone(&storage);
+                thread::spawn(move || {
+                    let ring = storage.view();
+                    assert!(ring.push(1), "empty ring must accept");
+                    assert!(ring.push(2), "second cell must accept");
+                    // Third push reuses cell 0 on lap 1 — legal only after
+                    // the consumer freed it; otherwise full (backpressure).
+                    ring.push(3)
+                })
+            };
+
+            let consumer_storage = Arc::clone(&storage);
+            let consumer = thread::spawn(move || {
+                let ring = consumer_storage.view();
+                let mut cursor = ipc_ring_core::RingConsumer::new();
+                let mut popped = Vec::new();
+                for _ in 0..3 {
+                    if let Some(v) = cursor.pop(&ring) {
+                        popped.push(v);
+                    }
+                }
+                (cursor, popped)
+            });
+
+            let third_accepted = producer.join().unwrap();
+            let (mut cursor, mut popped) = consumer.join().unwrap();
+            let ring = storage.view();
+            while let Some(v) = cursor.pop(&ring) {
+                popped.push(v);
+            }
+
+            let expect: Vec<u32> = if third_accepted {
+                vec![1, 2, 3]
+            } else {
+                vec![1, 2]
+            };
+            assert_eq!(
+                popped, expect,
+                "FIFO across the lap boundary: exactly the accepted \
+                 prefix, in order (a permutation or phantom here is the \
+                 cell-reuse ABA corruption)"
+            );
+        });
+    }
+
+    /// IPC op-slot invariant #1 (design-preload-interception §5.3
+    /// protocol rule 2, PR L4-1): completion is exactly-once and a client
+    /// that parks is never stranded — `park_prepare`'s single RMW either
+    /// lands before `complete`'s swap (daemon sees WAITER ⇒ wakes) or
+    /// after it (client sees DONE ⇒ Ready, no park). The descriptor/
+    /// result field is an atomic beside the state word, exactly like the
+    /// production `IpcSlot` fields.
+    ///
+    /// Weakening evidence (verified during development, then restored):
+    /// `complete`'s swap demoted AcqRel→Relaxed fails this model — a
+    /// Ready/woken consumer reads result 0 (the completion's result write
+    /// not published with its DONE).
+    #[test]
+    fn ipc_slot_completion_exactly_once_parked_waiter_never_stranded() {
+        loom::model(|| {
+            let slot = Arc::new(ipc_slot_core::SlotCore::new());
+            let result = Arc::new(AtomicU64::new(0));
+            let wake = Arc::new(AtomicBool::new(false));
+
+            // Client half 1 (main, sequential): claim + submit.
+            let gen = slot.try_claim().expect("fresh slot must claim");
+            slot.publish_submitted();
+
+            // Daemon: serve + complete + conditional wake.
+            let server = {
+                let slot = Arc::clone(&slot);
+                let result = Arc::clone(&result);
+                let wake = Arc::clone(&wake);
+                thread::spawn(move || {
+                    assert!(
+                        slot.try_begin_serve(),
+                        "submitted slot must begin serve (WAITER bit or not)"
+                    );
+                    result.store(7, Ordering::Relaxed);
+                    if slot.complete() {
+                        wake.store(true, Ordering::SeqCst);
+                    }
+                })
+            };
+
+            // Client half 2 (main): one bounded spin probe, then the
+            // two-phase park protocol.
+            let mut consumed = 0u32;
+            if slot.is_done_for(gen) {
+                assert_eq!(result.load(Ordering::Relaxed), 7, "spin consume");
+                consumed += 1;
+            } else {
+                match slot.park_prepare() {
+                    ipc_slot_core::ParkOutcome::Ready => {
+                        assert!(slot.is_done_for(gen));
+                        assert_eq!(result.load(Ordering::Relaxed), 7, "ready consume");
+                        consumed += 1;
+                    }
+                    ipc_slot_core::ParkOutcome::Park { expected } => {
+                        assert_eq!(
+                            ipc_slot_core::state_bits(expected) & ipc_slot_core::WAITER,
+                            0,
+                            "state_bits strips WAITER"
+                        );
+                        // Parked: the wake MUST arrive (assert post-join),
+                        // otherwise the client sleeps on a futex nobody
+                        // will ever wake — the stranded-op deadlock.
+                        server.join().unwrap();
+                        assert!(
+                            wake.load(Ordering::SeqCst),
+                            "missed wake: client parked but complete() saw no WAITER"
+                        );
+                        assert!(slot.is_done_for(gen), "woken client must consume");
+                        assert_eq!(result.load(Ordering::Relaxed), 7, "parked consume");
+                        consumed += 1;
+                        slot.release();
+                        assert_eq!(consumed, 1, "exactly-once completion");
+                        return; // server already joined
+                    }
+                }
+            }
+            server.join().unwrap();
+            assert_eq!(consumed, 1, "exactly-once completion");
+            slot.release();
+        });
+    }
+
+    /// IPC op-slot invariant #2 (the generation ABA guard): a waiter from
+    /// a previous life of the slot can never mistake a recycled slot's
+    /// DONE for its own — whatever the stale probe interleaves with, the
+    /// gen-1 check reads false forever once gen 1 was consumed.
+    #[test]
+    fn ipc_slot_free_reuse_never_observes_stale_done() {
+        loom::model(|| {
+            let slot = Arc::new(ipc_slot_core::SlotCore::new());
+
+            // Life 1, completed and consumed (sequential prologue).
+            let gen1 = slot.try_claim().expect("fresh slot must claim");
+            slot.publish_submitted();
+            assert!(slot.try_begin_serve());
+            slot.complete();
+            assert!(slot.is_done_for(gen1));
+            slot.release();
+
+            // Life 2 races the stale gen-1 probe.
+            let second_life = {
+                let slot = Arc::clone(&slot);
+                thread::spawn(move || {
+                    let gen2 = slot.try_claim().expect("released slot must re-claim");
+                    slot.publish_submitted();
+                    assert!(slot.try_begin_serve());
+                    slot.complete();
+                    gen2
+                })
+            };
+
+            // Stale probes (the delayed-futex-artifact shape): must never
+            // attribute life 2's DONE to gen 1.
+            for _ in 0..2 {
+                assert!(
+                    !slot.is_done_for(gen1),
+                    "stale generation consumed a recycled slot's DONE \
+                     (the ABA corruption: a dead waiter steals a live op)"
+                );
+            }
+
+            let gen2 = second_life.join().unwrap();
+            assert!(gen2 > gen1, "generations strictly monotonic");
+            assert!(!slot.is_done_for(gen1), "stale gen false even at rest");
+            assert!(slot.is_done_for(gen2), "the live generation consumes");
+        });
+    }
+
+    /// IPC op-slot invariant #3 (§5.3.1 rule 1 — the dequeue snapshot is
+    /// the single linearization read): with a hostile sibling mutating the
+    /// descriptor word mid-flight, the daemon's one post-`begin_serve`
+    /// snapshot read observes the submitted value or the hostile value —
+    /// NEVER the pre-submit seed (the submit Release / begin_serve Acquire
+    /// edge) — and the served op equals the snapshot even when the hostile
+    /// store lands after the snapshot (serve-from-copy, structural).
+    /// Descriptor modeled as an atomic beside the state word, exactly the
+    /// production `IpcSlot` shape (client-writable during serve is
+    /// bounded-behavior by design, never a data race).
+    ///
+    /// Weakening evidence (verified during development, then restored):
+    /// `publish_submitted` demoted Release→Relaxed fails this model — the
+    /// daemon's snapshot reads the pre-submit seed 0.
+    #[test]
+    fn ipc_slot_snapshot_single_read_never_pre_submit_hostile_bounded() {
+        loom::model(|| {
+            let slot = Arc::new(ipc_slot_core::SlotCore::new());
+            let descriptor = Arc::new(AtomicU64::new(0)); // pre-submit seed
+            let served = Arc::new(AtomicU64::new(0));
+
+            // The server is spawned BEFORE claim/submit — a post-submit
+            // spawn would smuggle a happens-before edge past the submit
+            // Release / begin_serve Acquire pairing this model exists to
+            // check (verified: with a post-submit spawn, weakening the
+            // submit store to Relaxed passes; with this shape it fails).
+            let server = {
+                let slot = Arc::clone(&slot);
+                let descriptor = Arc::clone(&descriptor);
+                let served = Arc::clone(&served);
+                thread::spawn(move || {
+                    // Bounded dequeue attempts (the ring-pop stand-in).
+                    for _ in 0..3 {
+                        if slot.try_begin_serve() {
+                            // THE single linearization read (§5.3.1 rule
+                            // 1): one load into a private copy; validated
+                            // + served from the copy; never re-read.
+                            let snapshot = descriptor.load(Ordering::Relaxed);
+                            assert_ne!(
+                                snapshot, 0,
+                                "snapshot read the pre-submit seed — the \
+                                 submit Release / begin_serve Acquire edge \
+                                 is broken"
+                            );
+                            served.store(snapshot, Ordering::Relaxed);
+                            slot.complete();
+                            return Some(snapshot);
+                        }
+                    }
+                    None
+                })
+            };
+
+            let _gen = slot.try_claim().expect("fresh slot must claim");
+            descriptor.store(1, Ordering::Relaxed); // the honest op
+            slot.publish_submitted();
+
+            // Hostile sibling thread scribbles the descriptor at an
+            // arbitrary point (before or after the daemon's snapshot).
+            let hostile = {
+                let descriptor = Arc::clone(&descriptor);
+                thread::spawn(move || descriptor.store(2, Ordering::Relaxed))
+            };
+
+            let served_by_thread = server.join().unwrap();
+            hostile.join().unwrap();
+            let snapshot = match served_by_thread {
+                Some(s) => s,
+                None => {
+                    // Every bounded attempt ran pre-submit: main serves
+                    // deterministically post-join (uninteresting branch;
+                    // the concurrent branches above are the model).
+                    assert!(slot.try_begin_serve());
+                    let snapshot = descriptor.load(Ordering::Relaxed);
+                    served.store(snapshot, Ordering::Relaxed);
+                    slot.complete();
+                    snapshot
+                }
+            };
+            assert!(
+                snapshot == 1 || snapshot == 2,
+                "snapshot must be the honest or hostile value, never torn"
+            );
+            assert_eq!(
+                served.load(Ordering::Relaxed),
+                snapshot,
+                "post-snapshot mutation never changes the served op \
+                 (serve-from-copy)"
+            );
+        });
+    }
+
+    /// IPC wake composition (`ipc_wake_core`, §5.3 protocol rule 3):
+    /// the SHIPPED `wake_core::WakeCoalescer` composed with the SHIPPED
+    /// `ipc_ring_core` publication, exactly as the session doorbell wires
+    /// them — producers push then arm (writing the doorbell eventfd/futex
+    /// stand-in only on `arm() == true`); the worker's pass is drain →
+    /// `disarm()` → ring scan. After ANY interleaving: if the worker
+    /// parks on a zero counter, every publication has been consumed —
+    /// N submissions between two drains cost ≤ 1 wake and none is
+    /// stranded (the L3 law re-verified in this composition).
+    ///
+    /// Weakening evidence (verified during development, then restored):
+    /// permuting the worker pass to scan-before-disarm strands a
+    /// publication (consumed 1 of 2 on a zero counter) — the same
+    /// failure signature the L3 `wake_coalescer_*` models recorded.
+    #[test]
+    fn ipc_wake_ring_publication_never_stranded() {
+        loom::model(|| {
+            let storage = Arc::new(
+                ipc_ring_core::RingStorage::with_capacity(4).expect("capacity 4 is valid"),
+            );
+            let flag = Arc::new(wake_core::WakeCoalescer::new());
+            let doorbell = Arc::new(AtomicU64::new(0));
+
+            let producers: Vec<_> = [1u32, 2u32]
+                .into_iter()
+                .map(|v| {
+                    let storage = Arc::clone(&storage);
+                    let flag = Arc::clone(&flag);
+                    let doorbell = Arc::clone(&doorbell);
+                    thread::spawn(move || {
+                        // §5.3 rule 1 order: publish (ring push), then arm,
+                        // then conditional doorbell write.
+                        assert!(storage.view().push(v), "capacity 4 never fills here");
+                        if flag.arm() {
+                            doorbell.fetch_add(1, Ordering::Release);
+                        }
+                    })
+                })
+                .collect();
+
+            // The one service thread: bounded passes of the shipped law
+            // (drain doorbell → disarm → scan/drain the ring).
+            let worker = {
+                let storage = Arc::clone(&storage);
+                let flag = Arc::clone(&flag);
+                let doorbell = Arc::clone(&doorbell);
+                thread::spawn(move || {
+                    let ring = storage.view();
+                    let mut cursor = ipc_ring_core::RingConsumer::new();
+                    let mut consumed = 0u32;
+                    for _pass in 0..3 {
+                        doorbell.swap(0, Ordering::AcqRel); // drain to EAGAIN
+                        flag.disarm();
+                        while cursor.pop(&ring).is_some() {
+                            consumed += 1;
+                        }
+                        if doorbell.load(Ordering::SeqCst) == 0 {
+                            break; // park: futex armed, counter zero
+                        }
+                    }
+                    (cursor, consumed)
+                })
+            };
+
+            for p in producers {
+                p.join().unwrap();
+            }
+            let (mut cursor, consumed) = worker.join().unwrap();
+
+            if doorbell.load(Ordering::SeqCst) == 0 {
+                // Worker parked with nothing armed: NOTHING may be stranded.
+                assert_eq!(
+                    consumed, 2,
+                    "lost wake: ring publication(s) stranded while the \
+                     service thread parks on a zero doorbell (consumed \
+                     {consumed} of 2)"
+                );
+            } else {
+                // Level-triggered doorbell: the nonzero counter re-wakes
+                // the worker; that pass observes everything.
+                doorbell.swap(0, Ordering::AcqRel);
+                flag.disarm();
+                let ring = storage.view();
+                let mut rest = consumed;
+                while cursor.pop(&ring).is_some() {
+                    rest += 1;
+                }
+                assert_eq!(rest, 2, "the wake-driven pass must observe both");
+            }
         });
     }
 }

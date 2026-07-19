@@ -233,8 +233,9 @@ else
     echo "SKIP: fio not installed"
 fi
 if command -v elbencho &>/dev/null; then
-    ILP elbencho -w -r -t 4 -b 64k -s 16m --verify 1 --nodelerr \
-        "$MOUNT_DIR/elb" >/dev/null 2>&1 \
+    # Run from the scratch dir: elbencho drops verify-state files in CWD.
+    (cd "$T" && ILP elbencho -w -r -t 4 -b 64k -s 16m --verify 1 --nodelerr \
+        "$MOUNT_DIR/elb" >/dev/null 2>&1) \
         || fail "elbencho write+read+verify under LD_PRELOAD"
     echo "OK: elbencho verify"
 else

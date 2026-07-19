@@ -2240,6 +2240,7 @@ dependencies = [
  "sha2",
  "socket2 0.5.10",
  "squeezefs-ipc",
+ "squeezefs-preload",
  "sysinfo",
  "tempfile",
  "thiserror 1.0.69",

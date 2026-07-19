@@ -30,7 +30,7 @@ use fuse3::raw::Request;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -322,8 +322,7 @@ async fn fork_child_poison_never_severs_the_parent_session() {
         "parent session must not be poisoned by the child's poison"
     );
     let mut buf = vec![0u8; 8192];
-    let out =
-        tokio::task::block_in_place(|| session.ring_pread(grant.binding_id, &mut buf, 0));
+    let out = tokio::task::block_in_place(|| session.ring_pread(grant.binding_id, &mut buf, 0));
     assert!(
         matches!(out, RingOutcome::Served(8192)),
         "parent ring ops must keep serving after the child poisoned, got {out:?}"
@@ -380,8 +379,7 @@ async fn idle_sessions_reap_and_active_sessions_survive() {
         "the reaped client must observe the generation bump and degrade"
     );
     let mut buf = vec![0u8; 64];
-    let out =
-        tokio::task::block_in_place(|| session.ring_pread(grant.binding_id, &mut buf, 0));
+    let out = tokio::task::block_in_place(|| session.ring_pread(grant.binding_id, &mut buf, 0));
     assert!(
         matches!(out, RingOutcome::Fallthrough),
         "ops on a reaped session must fall through, got {out:?}"
@@ -434,8 +432,7 @@ async fn invalidation_fires_on_bind_and_rate_limited_writes_never_reads() {
     let count_before_reads = fx.inval.count_for(ino);
     let mut buf = vec![0u8; 4096];
     for _ in 0..5 {
-        let out =
-            tokio::task::block_in_place(|| session.ring_pread(grant.binding_id, &mut buf, 0));
+        let out = tokio::task::block_in_place(|| session.ring_pread(grant.binding_id, &mut buf, 0));
         assert!(matches!(out, RingOutcome::Served(_)));
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -470,9 +467,8 @@ async fn teardown_with_parked_handoff_completes_without_poison() {
     let lock = fx.fs.get_inode_lock_ref(ino);
     let guard = lock.write().await;
     let handoffs_before = METRICS.ipc_async_handoffs.load(Ordering::Relaxed);
-    let submitted = tokio::task::block_in_place(|| {
-        session.submit_write_nowait(grant.binding_id, &w, 4096)
-    });
+    let submitted =
+        tokio::task::block_in_place(|| session.submit_write_nowait(grant.binding_id, &w, 4096));
     assert!(submitted, "op must submit");
     wait_until("handoff parked", Duration::from_secs(5), || {
         METRICS.ipc_async_handoffs.load(Ordering::Relaxed) > handoffs_before

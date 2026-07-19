@@ -119,6 +119,12 @@ pub struct IpcHostConfig {
     pub arena_cap_bytes: u64,
     /// Per-uid concurrent session cap (DoS posture §11).
     pub per_uid_session_cap: usize,
+    /// Idle-session reap bound in seconds (§5.7 row 2): a session with
+    /// no ring/ctl activity for this long is torn down with a
+    /// generation bump (the client observes poison and lazily
+    /// re-establishes). `0` disables the reaper (tests; production
+    /// wires `SQUEEZEFS_IPC_IDLE_SECS`, default 300).
+    pub idle_secs: u64,
 }
 
 /// Per-op rights derived from the screened fd's access mode (§5.2 rule 3).
@@ -180,6 +186,11 @@ pub trait SessionSink: Send + Sync + 'static {
     /// Serve one op; `completion` must be completed exactly once (`bytes`
     /// or `-errno`), from any thread.
     fn serve_data(&self, op: DataOp, completion: SlotCompletion);
+
+    /// A BIND was granted on `ino` (§5.6.2 W1: the data plane fires the
+    /// bind-time inode invalidation from here). Default: nothing — the
+    /// host-isolation sink has no kernel cache to shoot down.
+    fn on_bind(&self, _ino: u64) {}
 }
 
 /// The no-data-plane sink: every correctly-directed READ/WRITE completes
@@ -348,6 +359,9 @@ struct IpcSession {
     /// Ctl socket (service side keeps it only to shut it down at
     /// teardown/poison; the ctl thread owns the I/O).
     sock: Arc<UnixStream>,
+    /// Milliseconds-since-host-start of the last ring/ctl activity —
+    /// the §5.7 idle-reap clock. Served ops and BINDs refresh it.
+    last_active_ms: AtomicU64,
     torn_down: AtomicBool,
 }
 
@@ -538,6 +552,8 @@ pub struct IpcHost {
     /// Pinned service-thread count (§5.5.1) — sessions are assigned an
     /// owner index in `0..service_threads` at admission, forever.
     service_threads: usize,
+    /// Host epoch for the sessions' `last_active_ms` clocks.
+    started: Instant,
     shutting_down: AtomicBool,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
@@ -567,6 +583,7 @@ impl IpcHost {
             next_session_id: AtomicU64::new(1),
             next_binding_id: AtomicU64::new(1),
             service_threads,
+            started: Instant::now(),
             shutting_down: AtomicBool::new(false),
             threads: Mutex::new(Vec::new()),
         });
@@ -587,6 +604,14 @@ impl IpcHost {
                     .spawn(move || service_host.service_loop(idx))?,
             );
         }
+        if host.cfg.idle_secs > 0 {
+            let reap_host = Arc::clone(&host);
+            spawned.push(
+                std::thread::Builder::new()
+                    .name("sqz-ipc-reap".into())
+                    .spawn(move || reap_host.reap_loop())?,
+            );
+        }
         host.threads
             .lock()
             .expect("thread registry mutex never poisons")
@@ -598,6 +623,42 @@ impl IpcHost {
     /// the mount is live; tests inject).
     pub fn set_expected_st_dev(&self, st_dev: u64) {
         self.expected_st_dev.store(st_dev, Ordering::Relaxed);
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// §5.7 idle reaper: tear down sessions whose activity clock is
+    /// older than `idle_secs`. Reap = generation bump (the client
+    /// observes poison and degrades lazily) + ordinary teardown —
+    /// counted in `ipc_sessions_reaped`, never in the poison tripwire
+    /// (idleness is not a protocol violation).
+    fn reap_loop(self: Arc<Self>) {
+        let idle_ms = self.cfg.idle_secs.saturating_mul(1000);
+        let tick = Duration::from_millis((idle_ms / 4).clamp(100, 5000));
+        while !self.shutting_down.load(Ordering::SeqCst) {
+            std::thread::park_timeout(tick);
+            let now = self.now_ms();
+            let idle: Vec<Arc<IpcSession>> = self
+                .sessions
+                .lock()
+                .expect("session registry mutex never poisons")
+                .values()
+                .filter(|s| now.saturating_sub(s.last_active_ms.load(Ordering::Relaxed)) >= idle_ms)
+                .cloned()
+                .collect();
+            for s in idle {
+                METRICS.ipc_sessions_reaped.fetch_add(1, Ordering::Relaxed);
+                log::info!(
+                    "ipc session {}: idle past {} s — reaping (client degrades to passthrough)",
+                    s.id,
+                    self.cfg.idle_secs
+                );
+                s.map.header().generation.fetch_add(1, Ordering::Release);
+                self.teardown_session(&s, "idle reap");
+            }
+        }
     }
 
     /// Current anti-replay nonce (bootstrap-blob synthesis + tests).
@@ -754,6 +815,13 @@ impl IpcHost {
                             };
                             let _ = session.bindings.insert_sync(binding_id, rights);
                             METRICS.ipc_binds.fetch_add(1, Ordering::Relaxed);
+                            // §5.7 idle clock: ctl activity refreshes.
+                            session
+                                .last_active_ms
+                                .store(self.now_ms(), Ordering::Relaxed);
+                            // §5.6.2 W1: the bind-time inode invalidation
+                            // (the data plane decides what that means).
+                            self.sink.on_bind(rights_ino);
                             CtlMsg::BindOk {
                                 binding_id,
                                 ino: rights_ino,
@@ -947,8 +1015,12 @@ impl IpcHost {
             bindings: scc::HashMap::new(),
             consumer: Mutex::new(RingConsumer::new()),
             sock: Arc::clone(sock),
+            last_active_ms: AtomicU64::new(0),
             torn_down: AtomicBool::new(false),
         });
+        session
+            .last_active_ms
+            .store(self.now_ms(), Ordering::Relaxed);
         self.arena_bytes.fetch_add(footprint, Ordering::Relaxed);
         METRICS
             .ipc_arena_bytes
@@ -1112,9 +1184,15 @@ impl IpcHost {
                 .cloned()
                 .collect();
             let mut served = 0u32;
+            let now = self.now_ms();
             for s in &sessions {
                 match s.drain(&self.sink) {
-                    Some(n) => served += n,
+                    Some(0) => {}
+                    Some(n) => {
+                        served += n;
+                        // §5.7 idle clock: served ring ops are activity.
+                        s.last_active_ms.store(now, Ordering::Relaxed);
+                    }
                     None => self.poison_session(s, "ring/slot protocol violation"),
                 }
             }
@@ -1138,9 +1216,14 @@ impl IpcHost {
                 s.map.header().daemon_parked.store(1, Ordering::SeqCst);
             }
             let mut rescan_served = 0u32;
+            let now = self.now_ms();
             for s in &sessions {
                 match s.drain(&self.sink) {
-                    Some(n) => rescan_served += n,
+                    Some(0) => {}
+                    Some(n) => {
+                        rescan_served += n;
+                        s.last_active_ms.store(now, Ordering::Relaxed);
+                    }
                     None => self.poison_session(s, "ring/slot protocol violation"),
                 }
             }

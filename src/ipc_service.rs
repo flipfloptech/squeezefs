@@ -46,6 +46,57 @@ use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
 use squeezefs_ipc::layout::{OP_READ, OP_WRITE};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+/// The §5.6.2 W1 invalidation policy: fire on BIND, fire on the FIRST
+/// ring write per (ino, window), suppress in-window repeats, never on
+/// reads. The hook is injectable (tests record; production pushes
+/// `FUSE_NOTIFY_INVAL_INODE` through the fuse3 [`Notify`] handle) — the
+/// policy is identical either way and pinned by the lifecycle suite.
+///
+/// [`Notify`]: fuse3::raw::Notify
+struct Invalidator {
+    hook: Arc<dyn Fn(u64) + Send + Sync>,
+    window: std::time::Duration,
+    /// ino → last write-fired instant (latch-free; bounded by the set of
+    /// ring-written inos — entries are two words, never reclaimed within
+    /// a mount, same leak class as the shim's fd-table cells).
+    last_write: scc::HashMap<u64, std::time::Instant>,
+}
+
+impl Invalidator {
+    /// Bind-time invalidation: unconditional (the kernel may hold pages
+    /// from before this process bound), does NOT consume the write
+    /// window (the first write after bind still fires — pinned).
+    fn on_bind(&self, ino: u64) {
+        METRICS.ipc_inval_notifies.fetch_add(1, Ordering::Relaxed);
+        (self.hook)(ino);
+    }
+
+    /// Write-path invalidation, rate-limited per (ino, window).
+    fn on_write(&self, ino: u64) {
+        let now = std::time::Instant::now();
+        let mut fire = false;
+        match self.last_write.entry_sync(ino) {
+            scc::hash_map::Entry::Occupied(mut o) => {
+                if now.duration_since(*o.get()) >= self.window {
+                    *o.get_mut() = now;
+                    fire = true;
+                }
+            }
+            scc::hash_map::Entry::Vacant(v) => {
+                v.insert_entry(now);
+                fire = true;
+            }
+        }
+        if fire {
+            METRICS.ipc_inval_notifies.fetch_add(1, Ordering::Relaxed);
+            (self.hook)(ino);
+        } else {
+            METRICS.ipc_inval_suppressed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 /// The production [`SessionSink`]: fast path + async handoff over one
 /// filesystem instance (the same instance the FUSE session serves).
@@ -54,11 +105,46 @@ pub struct DataPlaneSink {
     /// The daemon's existing runtime — handoffs ride it as ordinary
     /// tasks (G-L4-1 leg (iii) priced the wake at ~1–3 µs).
     runtime: tokio::runtime::Handle,
+    /// The W1 invalidator; `None` = no kernel to invalidate (pre-L4-6
+    /// callers and pure host-isolation tests).
+    inval: Option<Arc<Invalidator>>,
 }
 
 impl DataPlaneSink {
     pub fn new(fs: SqueezefsFilesystem, runtime: tokio::runtime::Handle) -> Self {
-        Self { fs, runtime }
+        Self {
+            fs,
+            runtime,
+            inval: None,
+        }
+    }
+
+    /// Wire the §5.6.2 W1 invalidator: `hook(ino)` fires per the
+    /// bind/first-write policy above; `window_ms` is the per-ino write
+    /// rate window (production default 1000, `SQUEEZEFS_IPC_INVAL_WINDOW_MS`).
+    pub fn with_invalidator(
+        fs: SqueezefsFilesystem,
+        runtime: tokio::runtime::Handle,
+        hook: Arc<dyn Fn(u64) + Send + Sync>,
+        window_ms: u64,
+    ) -> Self {
+        Self {
+            fs,
+            runtime,
+            inval: Some(Arc::new(Invalidator {
+                hook,
+                window: std::time::Duration::from_millis(window_ms),
+                last_write: scc::HashMap::new(),
+            })),
+        }
+    }
+
+    /// The host's bind hook (translated inos in tests ride the sink
+    /// wrapper's override).
+    pub fn on_bind(&self, ino: u64) {
+        if let Some(iv) = &self.inval {
+            iv.on_bind(ino);
+        }
     }
 
     /// Synthetic request identity for ring-origin ops: the daemon serves
@@ -170,6 +256,7 @@ impl DataPlaneSink {
         let severed = bytes::Bytes::from(op.payload.read_severed());
         METRICS.ipc_async_handoffs.fetch_add(1, Ordering::Relaxed);
         let fs = self.fs.clone();
+        let inval = self.inval.clone();
         let ino = op.binding.ino;
         let offset = op.desc.offset;
         self.runtime.spawn(async move {
@@ -183,6 +270,12 @@ impl DataPlaneSink {
                         .ipc_bytes_in
                         .fetch_add(u64::from(reply.written), Ordering::Relaxed);
                     completion.complete(i64::from(reply.written));
+                    // §5.6.2 W1: invalidate AFTER the write landed (the
+                    // kernel's refetch must observe the new state);
+                    // rate-limited per (ino, window); reads never fire.
+                    if let Some(iv) = inval {
+                        iv.on_write(ino);
+                    }
                 }
                 Err(errno) => {
                     completion.complete(i64::from(libc::c_int::from(errno)));
@@ -204,5 +297,9 @@ impl SessionSink for DataPlaneSink {
                 completion.complete(-libc::EINVAL as i64);
             }
         }
+    }
+
+    fn on_bind(&self, ino: u64) {
+        DataPlaneSink::on_bind(self, ino);
     }
 }

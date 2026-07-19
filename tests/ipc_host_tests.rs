@@ -53,6 +53,7 @@ fn test_config(name: &str) -> IpcHostConfig {
         geometry: test_geometry(),
         arena_cap_bytes: 16 * 1024 * 1024,
         per_uid_session_cap: 8,
+        idle_secs: 0,
     }
 }
 

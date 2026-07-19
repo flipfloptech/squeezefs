@@ -130,22 +130,33 @@ impl Registry {
         None
     }
 
-    /// Atfork child / panic poison: AS-safe (flag store + `shutdown(2)`
-    /// per session; the child also clears the slots so its next
-    /// intercepted op lazily establishes its OWN session).
-    fn poison_all(&self, clear: bool) {
+    /// Same-process poison (panic path): AS-safe flag + `shutdown(2)`
+    /// per session.
+    fn poison_all(&self) {
         for i in 0..MAX_SESSIONS {
-            let p = if clear {
-                self.ptrs[i].swap(std::ptr::null_mut(), Ordering::AcqRel)
-            } else {
-                self.ptrs[i].load(Ordering::Acquire)
-            };
-            if clear {
-                self.devs[i].store(0, Ordering::Release);
-            }
+            let p = self.ptrs[i].load(Ordering::Acquire);
             if !p.is_null() {
                 // SAFETY: leaked session; poison is AS-safe by contract.
                 unsafe { (*p).poison() };
+            }
+        }
+    }
+
+    /// Atfork **child** poison (§5.4.1 fork row): flag + `close(2)` of
+    /// the child's inherited socket COPY — never `shutdown(2)`, which
+    /// acts on the file description fork SHARES with the parent and
+    /// would sever the parent's live session (the lifecycle suite's
+    /// fork-law test is the pin). Slots also clear so the child's next
+    /// intercepted op lazily establishes its OWN session; stale fd-table
+    /// entries then route to empty registry slots ⇒ passthrough.
+    fn poison_all_in_child(&self) {
+        for i in 0..MAX_SESSIONS {
+            let p = self.ptrs[i].swap(std::ptr::null_mut(), Ordering::AcqRel);
+            self.devs[i].store(0, Ordering::Release);
+            if !p.is_null() {
+                // SAFETY: leaked session; poison_child is AS-safe by
+                // contract and the child is single-threaded here.
+                unsafe { (*p).poison_child() };
             }
         }
     }
@@ -203,7 +214,7 @@ fn set_errno(e: c_int) {
 }
 
 fn panic_poison() {
-    registry().poison_all(false);
+    registry().poison_all();
     stderr_line("squeezefs-il: PANIC in interposer — all sessions poisoned, passthrough\n");
 }
 
@@ -685,12 +696,10 @@ fn atfork_init() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         extern "C" fn child() {
-            // AS-safe by contract (§5.4.1 fork row): flag-poison every
-            // session + close traffic; slots clear so the child's next
-            // intercepted op lazily establishes its OWN session. Stale
-            // fd-table entries route to empty registry slots ⇒
-            // passthrough (fallback-is-correctness).
-            registry().poison_all(true);
+            // AS-safe by contract (§5.4.1 fork row) — the CHILD variant:
+            // close(2) of the inherited copies, never shutdown (see
+            // poison_all_in_child).
+            registry().poison_all_in_child();
         }
         // SAFETY: registering an AS-safe child handler.
         unsafe { libc::pthread_atfork(None, None, Some(child)) };

@@ -2090,6 +2090,17 @@ pub struct Metrics {
     pub ipc_fast_path_miss_demotions: Align64<AtomicU64>,
     /// Gauge: pinned IPC service threads (`SQUEEZEFS_IPC_SERVICE_THREADS`).
     pub ipc_service_threads: Align64<AtomicU64>,
+    /// L4-6 lifecycle families (§5.7 / §5.6.2 W1). Idle sessions torn
+    /// down past `SQUEEZEFS_IPC_IDLE_SECS` — growth on busy clients =
+    /// idle-clock regression.
+    pub ipc_sessions_reaped: Align64<AtomicU64>,
+    /// W1 inode invalidations pushed to the kernel (bind + rate-limited
+    /// first ring write per (ino, window)).
+    pub ipc_inval_notifies: Align64<AtomicU64>,
+    /// W1 invalidations suppressed by the per-ino rate window — the
+    /// write-storm economy gauge (notifies ≫ suppressed on rand-write
+    /// workloads = window regression).
+    pub ipc_inval_suppressed: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -3249,6 +3260,9 @@ impl SqueezefsFilesystem {
                 "ipc_fast_path_lock_demotions": METRICS.ipc_fast_path_lock_demotions.load(Ordering::Relaxed),
                 "ipc_fast_path_miss_demotions": METRICS.ipc_fast_path_miss_demotions.load(Ordering::Relaxed),
                 "ipc_service_threads": METRICS.ipc_service_threads.load(Ordering::Relaxed),
+                "ipc_sessions_reaped": METRICS.ipc_sessions_reaped.load(Ordering::Relaxed),
+                "ipc_inval_notifies": METRICS.ipc_inval_notifies.load(Ordering::Relaxed),
+                "ipc_inval_suppressed": METRICS.ipc_inval_suppressed.load(Ordering::Relaxed),
                 "write_lock_wait": METRICS.write_lock_wait.to_json(),
                 "block_lock_wait": METRICS.block_lock_wait.to_json(),
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),
@@ -10348,6 +10362,11 @@ pub async fn start_mount<P: AsRef<Path>>(
     // L4 interception session host (PR L4-3): armed pre-mount so the
     // bootstrap xattr synthesizes from the first request. Data-plane
     // serves land in PR L4-4; this host is the §5.2 control plane.
+    // The W1 notify handle (PR L4-6) exists only post-mount — this cell
+    // bridges the gap (fires before it fills are skipped by the hook).
+    let mut ipc_notify_cell: Option<
+        std::sync::Arc<arc_swap::ArcSwap<Option<fuse3::notify::Notify>>>,
+    > = None;
     if posture.interception {
         let arena_mb = std::env::var("SQUEEZEFS_IPC_ARENA_MB")
             .ok()
@@ -10379,13 +10398,42 @@ pub async fn start_mount<P: AsRef<Path>>(
             geometry,
             arena_cap_bytes,
             per_uid_session_cap: 64,
+            // §5.7 idle reap (PR L4-6), default 300 s; 0 disables.
+            idle_secs: std::env::var("SQUEEZEFS_IPC_IDLE_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(300),
         };
         // PR L4-4: the real data plane — fast path + async handoff over
         // THIS filesystem instance (the same daemon state kernel requests
-        // reach; coherence is structural, §5.6.2).
-        let sink = std::sync::Arc::new(crate::ipc_service::DataPlaneSink::new(
+        // reach; coherence is structural, §5.6.2). PR L4-6 adds the W1
+        // invalidator: the hook pushes FUSE_NOTIFY_INVAL_INODE through
+        // the fuse3 Notify handle, captured post-mount into this cell
+        // (pre-mount fires are skipped — no kernel cache exists yet).
+        let inval_window_ms = std::env::var("SQUEEZEFS_IPC_INVAL_WINDOW_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(1000);
+        let notify_cell: std::sync::Arc<arc_swap::ArcSwap<Option<fuse3::notify::Notify>>> =
+            std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None));
+        ipc_notify_cell = Some(notify_cell.clone());
+        let hook_runtime = tokio::runtime::Handle::current();
+        let hook: std::sync::Arc<dyn Fn(u64) + Send + Sync> = std::sync::Arc::new(move |ino| {
+            if let Some(notify) = notify_cell.load().as_ref() {
+                let notify = notify.clone();
+                // Whole-inode shootdown: attrs + the full page range
+                // (off 0, len -1) — the kernel refetches size and data.
+                hook_runtime.spawn(async move {
+                    notify.invalid_inode(ino, 0, -1).await;
+                });
+            }
+        });
+        let sink = std::sync::Arc::new(crate::ipc_service::DataPlaneSink::with_invalidator(
             fs.clone(),
             tokio::runtime::Handle::current(),
+            hook,
+            inval_window_ms,
         ));
         match crate::ipc_host::IpcHost::spawn(cfg, sink) {
             Ok(host) => {
@@ -10555,6 +10603,13 @@ pub async fn start_mount<P: AsRef<Path>>(
 
     // Spawns the mount loop using fuse3 Session
     let session = fuse3::raw::Session::new(options);
+
+    // PR L4-6: capture the notify handle BEFORE mount() consumes the
+    // session; it clones the reply channel, so it stays valid for the
+    // mount's lifetime (rides the classical reply path post-arm).
+    if let Some(cell) = &ipc_notify_cell {
+        cell.store(std::sync::Arc::new(Some(session.get_notify())));
+    }
 
     #[cfg(target_os = "linux")]
     let mut handle = if unsafe { libc::getuid() } == 0 {

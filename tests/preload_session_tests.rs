@@ -176,6 +176,7 @@ impl Fixture {
             geometry: test_geometry(),
             arena_cap_bytes: 64 * 1024 * 1024,
             per_uid_session_cap: 8,
+            idle_secs: 0,
         };
         let host = IpcHost::spawn(cfg, sink.clone()).expect("host must spawn");
         let dir = tempfile::tempdir().expect("tempdir");
@@ -406,6 +407,7 @@ async fn stalled_serve_times_out_poisons_and_falls_through() {
         geometry: test_geometry(),
         arena_cap_bytes: 64 * 1024 * 1024,
         per_uid_session_cap: 8,
+        idle_secs: 0,
     };
     let host = IpcHost::spawn(cfg, Arc::new(StallSink)).expect("host must spawn");
     let dir = tempfile::tempdir().unwrap();

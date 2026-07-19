@@ -302,13 +302,33 @@ impl Session {
         }
     }
 
-    /// AS-safe poison: one flag store + `shutdown(2)` on the ctl socket
-    /// (kills traffic without freeing the fd number). The atfork child
-    /// handler calls this; so does the op-timeout path.
+    /// AS-safe **same-process** poison: one flag store + `shutdown(2)`
+    /// on the ctl socket (kills traffic without freeing the fd number,
+    /// so a racing ctl call can never hit a reused fd). The op-timeout
+    /// and panic paths call this. **Never call from an atfork child** —
+    /// shutdown acts on the file description, which fork SHARES with
+    /// the parent: it would sever the parent's live session. The child
+    /// path is [`Session::poison_child`].
     pub fn poison(&self) {
         self.poisoned.store(true, Ordering::SeqCst);
         // SAFETY: shutdown(2) on our own ctl fd; AS-safe, idempotent.
         unsafe { libc::shutdown(self.ctl_fd, libc::SHUT_RDWR) };
+    }
+
+    /// AS-safe **atfork-child** poison (§5.4.1 fork row): one flag store
+    /// plus `close(2)` of the child's inherited fd-table COPY. Close is
+    /// per-process (the parent's description stays live), and dropping
+    /// the child's ref is exactly what restores parent-death EOF
+    /// semantics (§5.7: a surviving child must not hold the socket
+    /// open). The poisoned flag makes every later ctl/ring path in the
+    /// child a no-op, so the closed (and possibly reused) fd number is
+    /// never touched again through this session.
+    pub fn poison_child(&self) {
+        self.poisoned.store(true, Ordering::SeqCst);
+        // SAFETY: close(2) on the child's own fd-table entry; AS-safe.
+        // Called exactly once per fork (the atfork handler), before any
+        // other thread exists in the child (fork gives it one thread).
+        unsafe { libc::close(self.ctl_fd) };
     }
 
     pub fn poisoned(&self) -> bool {
@@ -399,22 +419,20 @@ impl Session {
     // one op: claim → publish → push → doorbell → spin/park → result
     // -----------------------------------------------------------------
 
-    fn one_op(
+    /// Claim + publish + push + doorbell — everything up to the wait.
+    /// `None` = no slot (client-visible backpressure) or poisoned.
+    fn submit_op(
         &self,
         op: u32,
         binding_id: u64,
         offset: u64,
         len: usize,
         payload: Option<&[u8]>,
-    ) -> OpResult {
+    ) -> Option<(u32, u64)> {
         if self.poisoned() {
-            return OpResult::Fallthrough;
+            return None;
         }
-        let Some((slot_idx, gen)) = self.claim_slot() else {
-            // Full ring = client-visible backpressure (§5.5.1): this op
-            // takes the real call; the binding stays.
-            return OpResult::Fallthrough;
-        };
+        let (slot_idx, gen) = self.claim_slot()?;
         let slot = self.slot(slot_idx);
         let arena_off = u64::from(slot_idx) * self.slab;
         if let Some(data) = payload {
@@ -433,7 +451,7 @@ impl Session {
             // Unreachable for an honest client (slots ≤ ring_entries);
             // observing it means OUR state is corrupt — poison loudly.
             self.poison();
-            return OpResult::Fallthrough;
+            return None;
         }
         // Doorbell (§5.3 protocol rule 1): publish first, then wake only
         // a parked daemon. If the daemon is mid-scan (parked flag clear),
@@ -444,6 +462,34 @@ impl Session {
         if header.daemon_parked.load(Ordering::SeqCst) != 0 {
             futex_wake(&header.doorbell);
         }
+        Some((slot_idx, gen))
+    }
+
+    /// Fire-and-forget write submit (lifecycle suites: park an op in
+    /// flight, then kill the session). The slot is deliberately never
+    /// consumed or released — it is GC'd with the session (§5.7
+    /// "abandoned slots ... are GC'd with the session"). `true` = the
+    /// op is on the ring.
+    pub fn submit_write_nowait(&self, binding_id: u64, data: &[u8], offset: u64) -> bool {
+        let len = data.len().min(self.slab as usize);
+        self.submit_op(OP_WRITE, binding_id, offset, len, Some(&data[..len]))
+            .is_some()
+    }
+
+    fn one_op(
+        &self,
+        op: u32,
+        binding_id: u64,
+        offset: u64,
+        len: usize,
+        payload: Option<&[u8]>,
+    ) -> OpResult {
+        let Some((slot_idx, gen)) = self.submit_op(op, binding_id, offset, len, payload) else {
+            // Poisoned or full ring = client-visible backpressure
+            // (§5.5.1): this op takes the real call; the binding stays.
+            return OpResult::Fallthrough;
+        };
+        let slot = self.slot(slot_idx);
 
         // Wait: bounded spin, then futex park with a hard deadline.
         let deadline = Instant::now() + self.op_timeout;

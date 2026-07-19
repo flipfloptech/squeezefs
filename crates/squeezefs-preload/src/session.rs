@@ -86,6 +86,17 @@ pub enum RingOutcome {
     Fallthrough,
 }
 
+/// One in-flight no-wait ring op (the libaio ring lane). Holds the
+/// claimed slot + its generation; consumed exactly once by
+/// [`Session::poll_ticket`], or abandoned (never released — the slot is
+/// GC'd with the session, §5.7 — recycling a possibly-still-completing
+/// slot would hand a stale completion to a future op).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpTicket {
+    slot: u32,
+    gen: u64,
+}
+
 /// A successful bind's grant (mirrors the daemon's `BindOk`).
 #[derive(Debug, Clone, Copy)]
 pub struct BindGrant {
@@ -497,15 +508,71 @@ impl Session {
         Some((slot_idx, gen))
     }
 
-    /// Fire-and-forget write submit (lifecycle suites: park an op in
-    /// flight, then kill the session). The slot is deliberately never
-    /// consumed or released — it is GC'd with the session (§5.7
-    /// "abandoned slots ... are GC'd with the session"). `true` = the
-    /// op is on the ring.
-    pub fn submit_write_nowait(&self, binding_id: u64, data: &[u8], offset: u64) -> bool {
-        let len = data.len().min(self.slab as usize);
-        self.submit_op(OP_WRITE, binding_id, offset, len, Some(&data[..len]))
-            .is_some()
+    // -----------------------------------------------------------------
+    // no-wait tickets (the libaio ring lane, v1.1 OQ-1; also the
+    // lifecycle suites' park-an-op-in-flight primitive)
+    // -----------------------------------------------------------------
+
+    /// Per-op payload ceiling (one ticket = one slot; the aio screen
+    /// sizes ops against this before classifying them ring-eligible).
+    pub fn slab_bytes(&self) -> u64 {
+        self.slab
+    }
+
+    /// Fire a positional read without waiting. `None` = no slot or
+    /// poisoned (client-visible backpressure — the batch prefix ends
+    /// there, §5.5.1). The claimed slot stays claimed until
+    /// [`poll_ticket`](Self::poll_ticket) consumes it or the ticket is
+    /// abandoned (slot GC'd with the session, §5.7).
+    pub fn submit_pread_nowait(
+        &self,
+        binding_id: u64,
+        len: usize,
+        offset: u64,
+    ) -> Option<OpTicket> {
+        debug_assert!(len as u64 <= self.slab, "screened against slab_bytes()");
+        let (slot, gen) = self.submit_op(OP_READ, binding_id, offset, len, None)?;
+        Some(OpTicket { slot, gen })
+    }
+
+    /// Fire a positional write without waiting (payload copied to the
+    /// slot's slab now — the caller's buffer is free the moment this
+    /// returns, exactly libaio's contract after `io_submit`).
+    pub fn submit_pwrite_nowait(
+        &self,
+        binding_id: u64,
+        data: &[u8],
+        offset: u64,
+    ) -> Option<OpTicket> {
+        debug_assert!(
+            data.len() as u64 <= self.slab,
+            "screened against slab_bytes()"
+        );
+        let (slot, gen) = self.submit_op(OP_WRITE, binding_id, offset, data.len(), Some(data))?;
+        Some(OpTicket { slot, gen })
+    }
+
+    /// Non-blocking completion probe. `Some(res)` CONSUMES the ticket
+    /// (slot released): a successful read's payload is copied into
+    /// `out` first (`res` bytes, capped by `out`), and `res` carries
+    /// bytes-or-negative-errno — libaio `io_event.res` semantics.
+    /// Post-acceptance there is no fallthrough: the op was already
+    /// acknowledged as submitted, so even protocol-class rejects
+    /// surface as their errno. `None` = still in flight.
+    pub fn poll_ticket(&self, t: OpTicket, out: Option<&mut [u8]>) -> Option<i64> {
+        let slot = self.slot(t.slot);
+        if !slot.core.is_done_for(t.gen) {
+            return None;
+        }
+        let r = slot.result();
+        if r > 0 {
+            if let Some(buf) = out {
+                let n = (r as usize).min(buf.len());
+                self.slab_read(t.slot, &mut buf[..n]);
+            }
+        }
+        self.release_slot(t.slot);
+        Some(r)
     }
 
     fn one_op(

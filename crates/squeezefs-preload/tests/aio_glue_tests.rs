@@ -242,7 +242,7 @@ fn slab_fit_cap_and_zero_length_classify_kernel() {
 
 #[test]
 fn register_lookup_remove_roundtrip() {
-    let reg = AioCtxRegistry::new();
+    let reg: AioCtxRegistry = AioCtxRegistry::new();
     assert!(reg.lookup(0x7000).is_none(), "unknown ctx must lookup None");
 
     assert!(reg.register(0x7000), "fresh register succeeds");
@@ -259,7 +259,7 @@ fn register_lookup_remove_roundtrip() {
 
 #[test]
 fn duplicate_register_is_refused() {
-    let reg = AioCtxRegistry::new();
+    let reg: AioCtxRegistry = AioCtxRegistry::new();
     assert!(reg.register(0xA));
     assert!(
         !reg.register(0xA),
@@ -272,7 +272,7 @@ fn duplicate_register_is_refused() {
 fn removed_ctx_value_is_re_registrable_with_fresh_state() {
     // io_destroy + io_setup may hand back the SAME ctx value — the new
     // registration must start from zero state, not inherit the corpse.
-    let reg = AioCtxRegistry::new();
+    let reg: AioCtxRegistry = AioCtxRegistry::new();
     assert!(reg.register(0xB00));
     seed_kernel_ops(&mut reg.lookup(0xB00).unwrap().lock().unwrap(), 5);
     assert!(reg.remove(0xB00));
@@ -288,7 +288,7 @@ fn removed_ctx_value_is_re_registrable_with_fresh_state() {
 
 #[test]
 fn full_registry_refuses_and_degrades_to_passthrough() {
-    let reg = AioCtxRegistry::new();
+    let reg: AioCtxRegistry = AioCtxRegistry::new();
     let mut registered = 0usize;
     // Fill to capacity, whatever it is (bounded by design).
     for i in 1..=4096u64 {
@@ -313,7 +313,7 @@ fn full_registry_refuses_and_degrades_to_passthrough() {
 fn lookups_race_free_across_threads() {
     // Register/lookup from concurrent threads: distinct contexts never
     // observe each other's state (libaio serializes only PER context).
-    let reg = std::sync::Arc::new(AioCtxRegistry::new());
+    let reg: std::sync::Arc<AioCtxRegistry> = std::sync::Arc::new(AioCtxRegistry::new());
     let mut handles = Vec::new();
     for t in 0..8u64 {
         let reg = reg.clone();

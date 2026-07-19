@@ -41,7 +41,7 @@ use std::rc::Rc;
 struct FakeRing {
     /// scripted per-submit outcomes (pop-front); default = accept
     refusals: VecDeque<bool>, // true = refuse (no slot)
-    submitted: Vec<u64>,      // iocb ids in dispatch order
+    submitted: Vec<u64>, // iocb ids in dispatch order
     /// completions ready to harvest: (token, result)
     ready: VecDeque<(RingToken, i64)>,
     next_tok: u64,
@@ -85,12 +85,10 @@ struct FakeKernel {
 
 impl KernelLane for FakeKernel {
     fn submit_run(&mut self, iocb_ids: &[u64]) -> isize {
-        let n = self
-            .accepts
-            .pop_front()
-            .unwrap_or(iocb_ids.len() as isize);
+        let n = self.accepts.pop_front().unwrap_or(iocb_ids.len() as isize);
         let taken = if n < 0 { 0 } else { n as usize };
-        self.submitted_runs.push(iocb_ids[..taken.min(iocb_ids.len())].to_vec());
+        self.submitted_runs
+            .push(iocb_ids[..taken.min(iocb_ids.len())].to_vec());
         n
     }
 
@@ -129,9 +127,18 @@ fn mixed_batch_full_acceptance_dispatches_in_order() {
     let mut st = AioCtxState::new();
     let (mut ring, mut kern) = (FakeRing::default(), FakeKernel::default());
     use IocbClass::*;
-    let out = submit(&mut st, &mut ring, &mut kern, &[Ring, Kernel, Kernel, Ring, Kernel]);
+    let out = submit(
+        &mut st,
+        &mut ring,
+        &mut kern,
+        &[Ring, Kernel, Kernel, Ring, Kernel],
+    );
     assert_eq!(out, SubmitOutcome::Submitted(5));
-    assert_eq!(ring.submitted, vec![0, 3], "ring lane got its iocbs in order");
+    assert_eq!(
+        ring.submitted,
+        vec![0, 3],
+        "ring lane got its iocbs in order"
+    );
     assert_eq!(
         kern.submitted_runs,
         vec![vec![1, 2], vec![4]],
@@ -146,7 +153,12 @@ fn kernel_partial_acceptance_truncates_the_prefix_before_later_ring_ops() {
     let (mut ring, mut kern) = (FakeRing::default(), FakeKernel::default());
     kern.accepts.push_back(1); // the [1,2] run accepts only iocb 1
     use IocbClass::*;
-    let out = submit(&mut st, &mut ring, &mut kern, &[Ring, Kernel, Kernel, Ring, Ring]);
+    let out = submit(
+        &mut st,
+        &mut ring,
+        &mut kern,
+        &[Ring, Kernel, Kernel, Ring, Ring],
+    );
     // Prefix = iocb0 (ring) + iocb1 (kernel) = 2; iocbs 2..5 NOT submitted.
     assert_eq!(out, SubmitOutcome::Submitted(2));
     assert_eq!(
@@ -189,7 +201,10 @@ fn kernel_first_op_errno_propagates_when_batch_starts_kernel() {
     use IocbClass::*;
     let out = submit(&mut st, &mut ring, &mut kern, &[Kernel, Ring]);
     assert_eq!(out, SubmitOutcome::Errno(libc::EINVAL));
-    assert!(ring.submitted.is_empty(), "nothing after the failed first run");
+    assert!(
+        ring.submitted.is_empty(),
+        "nothing after the failed first run"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +260,10 @@ fn min_zero_never_blocks_and_returns_whatever_is_ready() {
     // Kernel lane must have been asked with min 0 (non-blocking probe)
     // or not at all — never a blocking min.
     for (min, _) in kern.getevents_calls.borrow().iter() {
-        assert_eq!(*min, 0, "min_nr=0 must never translate into a blocking kernel wait");
+        assert_eq!(
+            *min, 0,
+            "min_nr=0 must never translate into a blocking kernel wait"
+        );
     }
 }
 
@@ -273,7 +291,12 @@ fn ring_only_pending_waits_by_poll_slices_not_kernel_blocking() {
 fn destroy_abandons_ring_pendings_without_delivering() {
     let mut st = AioCtxState::new();
     let (mut ring, mut kern) = (FakeRing::default(), FakeKernel::default());
-    submit(&mut st, &mut ring, &mut kern, &[IocbClass::Ring, IocbClass::Ring]);
+    submit(
+        &mut st,
+        &mut ring,
+        &mut kern,
+        &[IocbClass::Ring, IocbClass::Ring],
+    );
     assert_eq!(st.ring_pending(), 2);
     st.destroy(&mut ring);
     assert_eq!(st.ring_pending(), 0);
@@ -297,9 +320,21 @@ fn only_pread_pwrite_on_bound_fds_classify_ring() {
     // PREADV=7, PWRITEV=8.
     assert_eq!(classify_iocb(0, true, true, true), IocbClass::Ring);
     assert_eq!(classify_iocb(1, true, true, true), IocbClass::Ring);
-    assert_eq!(classify_iocb(0, false, true, true), IocbClass::Kernel, "unbound fd");
-    assert_eq!(classify_iocb(0, true, false, true), IocbClass::Kernel, "no read right");
-    assert_eq!(classify_iocb(1, true, true, false), IocbClass::Kernel, "no write right");
+    assert_eq!(
+        classify_iocb(0, false, true, true),
+        IocbClass::Kernel,
+        "unbound fd"
+    );
+    assert_eq!(
+        classify_iocb(0, true, false, true),
+        IocbClass::Kernel,
+        "no read right"
+    );
+    assert_eq!(
+        classify_iocb(1, true, true, false),
+        IocbClass::Kernel,
+        "no write right"
+    );
     for op in [2u16, 3, 5, 6, 7, 8, 99] {
         assert_eq!(
             classify_iocb(op, true, true, true),

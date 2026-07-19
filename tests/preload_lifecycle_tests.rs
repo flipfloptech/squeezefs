@@ -467,8 +467,11 @@ async fn teardown_with_parked_handoff_completes_without_poison() {
     let lock = fx.fs.get_inode_lock_ref(ino);
     let guard = lock.write().await;
     let handoffs_before = METRICS.ipc_async_handoffs.load(Ordering::Relaxed);
-    let submitted =
-        tokio::task::block_in_place(|| session.submit_write_nowait(grant.binding_id, &w, 4096));
+    let submitted = tokio::task::block_in_place(|| {
+        session
+            .submit_pwrite_nowait(grant.binding_id, &w, 4096)
+            .is_some()
+    });
     assert!(submitted, "op must submit");
     wait_until("handoff parked", Duration::from_secs(5), || {
         METRICS.ipc_async_handoffs.load(Ordering::Relaxed) > handoffs_before

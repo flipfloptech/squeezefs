@@ -34,7 +34,7 @@ use crate::fd_table::{Binding, FdTable};
 use crate::session::{RingOutcome, Session};
 use squeezefs_ipc::wire::{BootstrapBlob, BOOTSTRAP_XATTR};
 
-use libc::{c_char, c_int, c_uint, c_void, mode_t, off_t, size_t, ssize_t};
+use libc::{c_char, c_int, c_long, c_uint, c_void, mode_t, off_t, size_t, ssize_t};
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
@@ -1210,4 +1210,573 @@ pub unsafe extern "C" fn socketpair(
         sweep_pair(fds);
     }
     r
+}
+
+// ---------------------------------------------------------------------------
+// libaio (v1.1 OQ-1): io_setup / io_submit / io_getevents / io_destroy
+// ---------------------------------------------------------------------------
+//
+// These interpose `libaio.so.1`'s wrappers (userspace ABI — the
+// `aio_glue::RawIocb`/`RawIoEvent` mirrors), NOT raw syscalls. Return
+// convention is libaio's: 0-or-count on success, NEGATIVE errno on
+// failure (never -1/errno).
+//
+// Lane split per iocb (`aio_glue::screen_iocb` + the hermetic
+// `aio_core::AioCtxState` mixed-batch machine): ring-eligible PREAD/
+// PWRITE on bound fds ride session slots as no-wait tickets; everything
+// else — and every unregistered context — is literally the real call
+// (§5.4.2 fallback-is-correctness).
+//
+// Locking: ONE Mutex per registered ctx (state + ticket table
+// co-located). The lock is never held across a long kernel wait —
+// `io_getevents` drives bounded ~50 ms merge passes and re-acquires
+// between them, so a split submitter/reaper pair (a legal libaio shape)
+// degrades to 50 ms granularity instead of deadlocking on the lock.
+//
+// Poison law: a poisoned session resolves its in-flight tickets as
+// `-EIO` events (never silently stranded, never a hang — the app sees
+// the failed I/O exactly as if the device errored). Poisoned/full
+// paths never re-enter interception: fresh submits classify Kernel
+// because `Session::submit_op` refuses when poisoned.
+
+use crate::aio_core::{AioCtxState, AioEvent, IocbClass, KernelLane, RingLane, RingToken};
+use crate::aio_glue::{screen_iocb, AioCtxRegistry, RawIoEvent, RawIocb, IOCB_CMD_PREAD};
+use crate::session::OpTicket;
+
+type IoSetupFn = unsafe extern "C" fn(c_int, *mut u64) -> c_int;
+type IoDestroyFn = unsafe extern "C" fn(u64) -> c_int;
+type IoSubmitFn = unsafe extern "C" fn(u64, c_long, *mut *mut RawIocb) -> c_int;
+type IoGetEventsFn =
+    unsafe extern "C" fn(u64, c_long, c_long, *mut RawIoEvent, *mut libc::timespec) -> c_int;
+type IoCancelFn = unsafe extern "C" fn(u64, *mut RawIocb, *mut RawIoEvent) -> c_int;
+
+/// One in-flight ring-lane iocb: everything `poll` needs without
+/// re-touching the fd table (the fd may close while the op flies —
+/// libaio completes it anyway, and so do we).
+struct LiveTicket {
+    session: usize,
+    ticket: OpTicket,
+    is_read: bool,
+    buf: u64,
+    len: u32,
+}
+
+/// Per-ctx payload: merge state + the ticket table its RingTokens
+/// index. One lock covers both (the registry's `Mutex<AioCtx>`).
+#[derive(Default)]
+struct AioCtx {
+    state: AioCtxState,
+    tickets: Vec<Option<LiveTicket>>,
+}
+
+fn aio_registry() -> &'static AioCtxRegistry<AioCtx> {
+    static REG: OnceLock<AioCtxRegistry<AioCtx>> = OnceLock::new();
+    REG.get_or_init(AioCtxRegistry::new)
+}
+
+/// The ring lane over session no-wait tickets. `iocb_id` IS the iocb
+/// pointer (the app owns it until the completion event, per libaio).
+struct SessionRing<'a> {
+    tickets: &'a mut Vec<Option<LiveTicket>>,
+}
+
+impl RingLane for SessionRing<'_> {
+    fn try_submit(&mut self, iocb_id: u64) -> Option<RingToken> {
+        // SAFETY: iocb_id is the app's live iocb pointer for the
+        // duration of io_submit (libaio contract).
+        let io = unsafe { &*(iocb_id as *const RawIocb) };
+        let b = table().lookup(io.aio_fildes)?;
+        let session = registry().by_token(b.session)?;
+        let is_read = io.aio_lio_opcode == IOCB_CMD_PREAD;
+        let ticket = if is_read {
+            session.submit_pread_nowait(b.binding_id, io.nbytes as usize, io.offset as u64)?
+        } else {
+            // SAFETY: PWRITE buf/nbytes are the app's contract with
+            // io_submit; the payload is copied to the slab NOW, so the
+            // app's buffer is free the moment io_submit returns.
+            let data =
+                unsafe { std::slice::from_raw_parts(io.buf as *const u8, io.nbytes as usize) };
+            session.submit_pwrite_nowait(b.binding_id, data, io.offset as u64)?
+        };
+        let live = LiveTicket {
+            session: b.session,
+            ticket,
+            is_read,
+            buf: io.buf,
+            len: io.nbytes as u32,
+        };
+        let idx = match self.tickets.iter().position(Option::is_none) {
+            Some(i) => {
+                self.tickets[i] = Some(live);
+                i
+            }
+            None => {
+                self.tickets.push(Some(live));
+                self.tickets.len() - 1
+            }
+        };
+        Some(RingToken(idx as u64))
+    }
+
+    fn poll(&mut self, tok: RingToken) -> Option<i64> {
+        let slot = self.tickets.get_mut(tok.0 as usize)?;
+        let t = slot.as_ref()?;
+        let session = registry().by_token(t.session)?;
+        let res = if t.is_read {
+            // SAFETY: the app owns buf until the completion event is
+            // delivered (libaio contract); len was screened ≤ slab.
+            let out = unsafe { std::slice::from_raw_parts_mut(t.buf as *mut u8, t.len as usize) };
+            session.poll_ticket(t.ticket, Some(out))
+        } else {
+            session.poll_ticket(t.ticket, None)
+        };
+        let res = match res {
+            Some(r) => r,
+            None if session.poisoned() => {
+                // §5.4.1 poison law, async shape: the slot may complete
+                // arbitrarily late — never recycle it (GC'd with the
+                // session); the op resolves as a failed I/O.
+                -(libc::EIO as i64)
+            }
+            None => return None,
+        };
+        *slot = None;
+        Some(res)
+    }
+
+    fn abandon(&mut self, tok: RingToken) {
+        // Destroy path: drop the bookkeeping, never release the slot —
+        // it is GC'd with the session (§5.7).
+        if let Some(slot) = self.tickets.get_mut(tok.0 as usize) {
+            *slot = None;
+        }
+    }
+}
+
+/// The kernel lane: literally the real libaio on the real ctx.
+struct RealKernel {
+    ctx: u64,
+}
+
+impl KernelLane for RealKernel {
+    fn submit_run(&mut self, iocb_ids: &[u64]) -> isize {
+        let Some(f) = real!("io_submit", IoSubmitFn) else {
+            return -(libc::ENOSYS as isize);
+        };
+        // SAFETY: a &[u64] of iocb pointers is layout-identical to the
+        // `struct iocb *ios[]` array io_submit takes; the real call
+        // does not mutate the array itself.
+        let r = unsafe {
+            f(
+                self.ctx,
+                iocb_ids.len() as c_long,
+                iocb_ids.as_ptr() as *mut *mut RawIocb,
+            )
+        };
+        r as isize
+    }
+
+    fn getevents(&mut self, min: usize, max: usize, timeout_ms: Option<u64>) -> Vec<AioEvent> {
+        let Some(f) = real!("io_getevents", IoGetEventsFn) else {
+            return Vec::new();
+        };
+        let mut raw: Vec<RawIoEvent> = vec![
+            RawIoEvent {
+                data: 0,
+                obj: 0,
+                res: 0,
+                res2: 0,
+            };
+            max
+        ];
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let tsp: *mut libc::timespec = match timeout_ms {
+            Some(ms) => {
+                ts.tv_sec = (ms / 1000) as libc::time_t;
+                ts.tv_nsec = ((ms % 1000) * 1_000_000) as libc::c_long;
+                &mut ts
+            }
+            None => std::ptr::null_mut(),
+        };
+        // SAFETY: chaining the real io_getevents with our sized buffer.
+        let n = unsafe {
+            f(
+                self.ctx,
+                min as c_long,
+                max as c_long,
+                raw.as_mut_ptr(),
+                tsp,
+            )
+        };
+        if n <= 0 {
+            // Errors (EINTR included) surface as an empty harvest; the
+            // caller's pass loop re-drives or returns partial — libaio
+            // itself allows returning fewer than min_nr on interrupt.
+            return Vec::new();
+        }
+        raw[..n as usize]
+            .iter()
+            .map(|e| AioEvent {
+                iocb_id: e.obj,
+                data: e.data,
+                res: e.res,
+                res2: e.res2,
+            })
+            .collect()
+    }
+}
+
+/// # Safety
+/// C ABI interposer; argument contracts are libaio's own.
+#[no_mangle]
+pub unsafe extern "C" fn io_setup(maxevents: c_int, ctxp: *mut u64) -> c_int {
+    let Some(f) = real!("io_setup", IoSetupFn) else {
+        return -libc::ENOSYS;
+    };
+    // SAFETY: chaining the real io_setup.
+    let r = unsafe { f(maxevents, ctxp) };
+    if r != 0 || ctxp.is_null() {
+        return r;
+    }
+    let Some(_g) = Guard::enter() else {
+        return r;
+    };
+    if catch_unwind(AssertUnwindSafe(|| {
+        // Registration failure (capacity) is fine: the ctx simply
+        // passthroughs wholesale.
+        // SAFETY: the real call just wrote *ctxp.
+        aio_registry().register(unsafe { *ctxp });
+    }))
+    .is_err()
+    {
+        panic_poison();
+    }
+    r
+}
+
+/// # Safety
+/// C ABI interposer; argument contracts are libaio's own.
+#[no_mangle]
+pub unsafe extern "C" fn io_destroy(ctx: u64) -> c_int {
+    let Some(f) = real!("io_destroy", IoDestroyFn) else {
+        return -libc::ENOSYS;
+    };
+    if let Some(_g) = Guard::enter() {
+        if catch_unwind(AssertUnwindSafe(|| {
+            if let Some(m) = aio_registry().lookup(ctx) {
+                let mut c = m.lock().unwrap_or_else(|p| p.into_inner());
+                let AioCtx { state, tickets } = &mut *c;
+                let mut ring = SessionRing { tickets };
+                state.destroy(&mut ring);
+                drop(c);
+                aio_registry().remove(ctx);
+            }
+        }))
+        .is_err()
+        {
+            panic_poison();
+        }
+    }
+    // SAFETY: chaining the real io_destroy (kernel-lane ops die with
+    // the kernel ctx, exactly as un-interposed libaio).
+    unsafe { f(ctx) }
+}
+
+/// # Safety
+/// C ABI interposer; argument contracts are libaio's own.
+#[no_mangle]
+pub unsafe extern "C" fn io_submit(ctx: u64, nr: c_long, ios: *mut *mut RawIocb) -> c_int {
+    let real = real!("io_submit", IoSubmitFn);
+    let fallback = |f: Option<IoSubmitFn>| -> c_int {
+        match f {
+            // SAFETY: chaining the real io_submit verbatim.
+            Some(f) => unsafe { f(ctx, nr, ios) },
+            None => -libc::ENOSYS,
+        }
+    };
+    let Some(_g) = Guard::enter() else {
+        return fallback(real);
+    };
+    let served = catch_unwind(AssertUnwindSafe(|| {
+        if nr <= 0 || ios.is_null() {
+            return None; // real call answers the edge cases
+        }
+        let m = aio_registry().lookup(ctx)?;
+        // SAFETY: ios[0..nr] are the app's iocb pointers (libaio
+        // contract for io_submit).
+        let ids: Vec<u64> = unsafe { std::slice::from_raw_parts(ios, nr as usize) }
+            .iter()
+            .map(|p| *p as u64)
+            .collect();
+        let classes: Vec<IocbClass> = ids
+            .iter()
+            .map(|&id| {
+                if id == 0 {
+                    return IocbClass::Kernel; // real call faults it
+                }
+                // SAFETY: non-null app iocb pointer, live for the call.
+                let io = unsafe { &*(id as *const RawIocb) };
+                let (rights, slab) = match table().lookup(io.aio_fildes) {
+                    Some(b) => {
+                        let slab = registry()
+                            .by_token(b.session)
+                            .map(|s| s.slab_bytes())
+                            .unwrap_or(0);
+                        (Some((b.read_ok, b.write_ok)), slab)
+                    }
+                    None => (None, 0),
+                };
+                screen_iocb(io, rights, slab)
+            })
+            .collect();
+        if !classes.contains(&IocbClass::Ring) {
+            return None; // pure-kernel batch: the real call, verbatim
+        }
+        let mut c = m.lock().unwrap_or_else(|p| p.into_inner());
+        let AioCtx { state, tickets } = &mut *c;
+        let mut ring = SessionRing { tickets };
+        let mut kern = RealKernel { ctx };
+        // SAFETY: data_of derefs live iocb pointers from `ids`.
+        let out = state.submit_batch(&mut ring, &mut kern, &ids, &classes, &|id| unsafe {
+            (*(id as *const RawIocb)).data
+        });
+        Some(match out {
+            crate::aio_core::SubmitOutcome::Submitted(n) => n as c_int,
+            crate::aio_core::SubmitOutcome::Errno(e) => -e,
+        })
+    }));
+    match served {
+        Ok(Some(r)) => r,
+        Ok(None) => fallback(real),
+        Err(_) => {
+            panic_poison();
+            fallback(real)
+        }
+    }
+}
+
+/// The served-path reap: bounded merge passes over the ctx lock.
+/// `None` = not ours / nothing in flight — the caller's REAL function
+/// (io_getevents or io_pgetevents, each with its own exact semantics)
+/// answers verbatim.
+///
+/// # Safety
+/// `events` must point to `nr` writable `io_event`s and `timeout`, when
+/// non-null, to a live timespec — libaio's own contracts for both
+/// symbols.
+unsafe fn aio_reap_served(
+    ctx: u64,
+    min_nr: c_long,
+    nr: c_long,
+    events: *mut RawIoEvent,
+    timeout: *mut libc::timespec,
+) -> Option<c_int> {
+    {
+        if nr <= 0 || events.is_null() {
+            return None;
+        }
+        let m = aio_registry().lookup(ctx)?;
+        {
+            // Fast reject: nothing this shim tracks is in flight on the
+            // ctx ⇒ the real call is exact (most contexts in a mixed
+            // process never touch SqueezeFS fds).
+            let c = m.lock().unwrap_or_else(|p| p.into_inner());
+            if c.state.ring_pending() == 0 && c.state.kernel_pending() == 0 {
+                return None;
+            }
+        }
+        // SAFETY: the caller's timeout, read once (libaio contract).
+        let deadline: Option<std::time::Instant> = if timeout.is_null() {
+            None
+        } else {
+            let ts = unsafe { &*timeout };
+            let d = std::time::Duration::new(ts.tv_sec.max(0) as u64, ts.tv_nsec.max(0) as u32);
+            Some(std::time::Instant::now() + d)
+        };
+        let (min_nr, nr) = (min_nr.max(0) as usize, nr as usize);
+        let mut got = 0usize;
+        let mut empty_passes = 0u32;
+        loop {
+            // One bounded merge pass per lock hold (≤ ~50 ms): a split
+            // submitter/reaper pair shares the ctx at that granularity.
+            let pass_ms: u64 = match deadline {
+                None => 50,
+                Some(d) => {
+                    let left = d.saturating_duration_since(std::time::Instant::now());
+                    (left.as_millis() as u64).min(50)
+                }
+            };
+            let evs = {
+                let mut c = m.lock().unwrap_or_else(|p| p.into_inner());
+                let AioCtx { state, tickets } = &mut *c;
+                let mut ring = SessionRing { tickets };
+                let mut kern = RealKernel { ctx };
+                state.getevents(
+                    &mut ring,
+                    &mut kern,
+                    min_nr.saturating_sub(got).min(nr - got),
+                    nr - got,
+                    Some(pass_ms),
+                )
+            };
+            for (i, ev) in evs.iter().enumerate() {
+                // SAFETY: events[0..nr] is the caller's array (libaio
+                // contract); got+i < nr by the pass's max.
+                unsafe {
+                    *events.add(got + i) = RawIoEvent {
+                        data: ev.data,
+                        obj: ev.iocb_id,
+                        res: ev.res,
+                        res2: ev.res2,
+                    };
+                }
+            }
+            got += evs.len();
+            if got >= min_nr || got >= nr {
+                return Some(got as c_int);
+            }
+            if let Some(d) = deadline {
+                if std::time::Instant::now() >= d {
+                    return Some(got as c_int);
+                }
+            }
+            // Ring-pending passes return in ~5 ms slices with nothing
+            // to show; park briefly OUTSIDE the lock so a spinning
+            // reaper is not CPU theft from the daemon (the adaptive-
+            // spin lesson) and a split submitter can take the ctx.
+            if evs.is_empty() {
+                empty_passes += 1;
+                if empty_passes > 2 {
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                } else {
+                    std::thread::yield_now();
+                }
+            } else {
+                empty_passes = 0;
+            }
+        }
+    }
+}
+
+/// # Safety
+/// C ABI interposer; argument contracts are libaio's own.
+#[no_mangle]
+pub unsafe extern "C" fn io_getevents(
+    ctx: u64,
+    min_nr: c_long,
+    nr: c_long,
+    events: *mut RawIoEvent,
+    timeout: *mut libc::timespec,
+) -> c_int {
+    let real = real!("io_getevents", IoGetEventsFn);
+    let fallback = |f: Option<IoGetEventsFn>| -> c_int {
+        match f {
+            // SAFETY: chaining the real io_getevents verbatim.
+            Some(f) => unsafe { f(ctx, min_nr, nr, events, timeout) },
+            None => -libc::ENOSYS,
+        }
+    };
+    let Some(_g) = Guard::enter() else {
+        return fallback(real);
+    };
+    // SAFETY: forwarding the caller's own array/timespec contracts.
+    match catch_unwind(AssertUnwindSafe(|| unsafe {
+        aio_reap_served(ctx, min_nr, nr, events, timeout)
+    })) {
+        Ok(Some(r)) => r,
+        Ok(None) => fallback(real),
+        Err(_) => {
+            panic_poison();
+            fallback(real)
+        }
+    }
+}
+
+type IoPGetEventsFn = unsafe extern "C" fn(
+    u64,
+    c_long,
+    c_long,
+    *mut RawIoEvent,
+    *mut libc::timespec,
+    *const libc::sigset_t,
+) -> c_int;
+
+/// # Safety
+/// C ABI interposer; argument contracts are libaio's own.
+///
+/// Served reaps run the same bounded-pass merge as `io_getevents`; the
+/// caller's sigmask is NOT applied during our short waits (signals stay
+/// deliverable under the thread's own mask — strictly more wakeful,
+/// never less; a ctx with no tracked ops takes the real call with exact
+/// pgetevents semantics).
+#[no_mangle]
+pub unsafe extern "C" fn io_pgetevents(
+    ctx: u64,
+    min_nr: c_long,
+    nr: c_long,
+    events: *mut RawIoEvent,
+    timeout: *mut libc::timespec,
+    sigmask: *const libc::sigset_t,
+) -> c_int {
+    let real = real!("io_pgetevents", IoPGetEventsFn);
+    let fallback = |f: Option<IoPGetEventsFn>| -> c_int {
+        match f {
+            // SAFETY: chaining the real io_pgetevents verbatim.
+            Some(f) => unsafe { f(ctx, min_nr, nr, events, timeout, sigmask) },
+            None => -libc::ENOSYS,
+        }
+    };
+    let Some(_g) = Guard::enter() else {
+        return fallback(real);
+    };
+    // SAFETY: forwarding the caller's own array/timespec contracts.
+    match catch_unwind(AssertUnwindSafe(|| unsafe {
+        aio_reap_served(ctx, min_nr, nr, events, timeout)
+    })) {
+        Ok(Some(r)) => r,
+        Ok(None) => fallback(real),
+        Err(_) => {
+            panic_poison();
+            fallback(real)
+        }
+    }
+}
+
+/// # Safety
+/// C ABI interposer; argument contracts are libaio's own.
+#[no_mangle]
+pub unsafe extern "C" fn io_cancel(ctx: u64, iocb: *mut RawIocb, evt: *mut RawIoEvent) -> c_int {
+    let real = real!("io_cancel", IoCancelFn);
+    let fallback = |f: Option<IoCancelFn>| -> c_int {
+        match f {
+            // SAFETY: chaining the real io_cancel verbatim.
+            Some(f) => unsafe { f(ctx, iocb, evt) },
+            None => -libc::ENOSYS,
+        }
+    };
+    let Some(_g) = Guard::enter() else {
+        return fallback(real);
+    };
+    let served = catch_unwind(AssertUnwindSafe(|| {
+        let m = aio_registry().lookup(ctx)?;
+        let c = m.lock().unwrap_or_else(|p| p.into_inner());
+        if c.state.ring_pending_contains(iocb as u64) {
+            // A ring op cannot be recalled — the honest kernel answer
+            // for an uncancellable in-flight op.
+            Some(-libc::EINPROGRESS)
+        } else {
+            None // kernel-lane or unknown iocb: the real call decides
+        }
+    }));
+    match served {
+        Ok(Some(r)) => r,
+        Ok(None) => fallback(real),
+        Err(_) => {
+            panic_poison();
+            fallback(real)
+        }
+    }
 }

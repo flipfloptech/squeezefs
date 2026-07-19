@@ -122,21 +122,25 @@ const RESERVED: u64 = u64::MAX;
 /// reference can never dangle — using a ctx after `io_destroy` is app
 /// UB kernel-side too, and the corpse it would touch here stays valid
 /// memory. Re-registering a recycled ctx value allocates FRESH state.
-pub struct AioCtxRegistry {
+///
+/// Generic over the per-context payload so the interposer can co-locate
+/// its ticket table with the merge state under ONE per-ctx lock
+/// (default = the bare state, the hermetically-tested shape).
+pub struct AioCtxRegistry<T = AioCtxState> {
     /// The registered `io_context_t` value; 0 = empty slot (the kernel
     /// never hands out ctx 0 — it is the "uninitialized" sentinel
     /// `io_setup` demands on input).
     ids: [AtomicU64; CTX_CAP],
-    states: [AtomicPtr<Mutex<AioCtxState>>; CTX_CAP],
+    states: [AtomicPtr<Mutex<T>>; CTX_CAP],
 }
 
-impl Default for AioCtxRegistry {
+impl<T: Default> Default for AioCtxRegistry<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl AioCtxRegistry {
+impl<T: Default> AioCtxRegistry<T> {
     pub fn new() -> Self {
         Self {
             ids: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -162,7 +166,7 @@ impl AioCtxRegistry {
             {
                 continue;
             }
-            let fresh = Box::into_raw(Box::new(Mutex::new(AioCtxState::new())));
+            let fresh = Box::into_raw(Box::new(Mutex::new(T::default())));
             self.states[i].store(fresh, Ordering::Release);
             self.ids[i].store(ctx, Ordering::Release);
             return true;
@@ -172,7 +176,7 @@ impl AioCtxRegistry {
 
     /// Resolve a registered context's state. `None` = not ours
     /// (passthrough wholesale).
-    pub fn lookup(&self, ctx: u64) -> Option<&Mutex<AioCtxState>> {
+    pub fn lookup(&self, ctx: u64) -> Option<&Mutex<T>> {
         if ctx == 0 {
             return None;
         }

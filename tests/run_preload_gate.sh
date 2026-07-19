@@ -232,8 +232,9 @@ echo "OK: offsetful read() parity"
 
 # 2g. fio / elbencho when present (parity-checked workloads).
 if command -v fio &>/dev/null; then
-    ILP fio --name=il --directory="$MOUNT_DIR" --size=32M --bs=4k --rw=randwrite \
-        --ioengine=psync --verify=crc32c --do_verify=1 --output-format=terse >/dev/null \
+    # Run from the scratch dir: fio drops *-verify.state files in CWD.
+    (cd "$T" && ILP fio --name=il --directory="$MOUNT_DIR" --size=32M --bs=4k --rw=randwrite \
+        --ioengine=psync --verify=crc32c --do_verify=1 --output-format=terse >/dev/null) \
         || fail "fio randwrite+verify under LD_PRELOAD"
     echo "OK: fio verify"
 else
@@ -247,6 +248,31 @@ if command -v elbencho &>/dev/null; then
     echo "OK: elbencho verify"
 else
     echo "SKIP: elbencho not installed"
+fi
+
+# 2g-aio. libaio interposers (v1.1 OQ-1): mixed-batch async I/O with
+# data verify, plus RING engagement proof — the iodepth concurrency
+# must ride the session slots, not kernel FUSE (charter §3 rule 4: an
+# aio row without an ipc_ops delta is measurement fraud, exactly the
+# static-elbencho lesson).
+# (ldd, not `ldconfig | grep -q`: under pipefail grep -q's early exit
+# SIGPIPEs ldconfig's large listing and false-skips the row.)
+if command -v fio &>/dev/null && ldd "$(command -v fio)" 2>/dev/null | grep -q libaio.so.1; then
+    W0=$(stats ipc_ops_write)
+    R0=$(stats ipc_ops_read)
+    (cd "$T" && ILP fio --name=ilaio --directory="$MOUNT_DIR" --size=32M --bs=4k --rw=randwrite \
+        --ioengine=libaio --iodepth=16 --verify=crc32c --do_verify=1 \
+        --output-format=terse >/dev/null) \
+        || fail "fio libaio randwrite+verify under LD_PRELOAD"
+    W1=$(stats ipc_ops_write)
+    R1=$(stats ipc_ops_read)
+    WD=$((W1 - W0)); RD=$((R1 - R0))
+    # 32M / 4k = 8192 writes + 8192 verify reads; threshold est/2.
+    [ "$WD" -ge 4096 ] || fail "libaio writes bypassed the ring (ipc_ops_write Δ$WD < 4096)"
+    [ "$RD" -ge 4096 ] || fail "libaio verify reads bypassed the ring (ipc_ops_read Δ$RD < 4096)"
+    echo "OK: fio libaio verify (ring writes Δ$WD, reads Δ$RD)"
+else
+    echo "SKIP: fio or libaio.so.1 not present (libaio row)"
 fi
 
 # 2h. kill-9 soak (L4-6, G-L4-4 zero-residue): SIGKILL a preload'd

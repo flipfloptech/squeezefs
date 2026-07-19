@@ -126,6 +126,13 @@ impl AioCtxState {
         self.kernel_pending
     }
 
+    /// Is this iocb currently in flight on the ring lane? (`io_cancel`
+    /// answers `-EINPROGRESS` for these — a ring op cannot be recalled;
+    /// everything else takes the real call.)
+    pub fn ring_pending_contains(&self, iocb_id: u64) -> bool {
+        self.pending.iter().any(|p| p.iocb_id == iocb_id)
+    }
+
     /// The lane-split `io_submit` walk. `classes[i]` classifies
     /// `iocb_ids[i]`; `data_of` supplies each iocb's completion cookie
     /// (captured AT SUBMIT — the client may recycle the iocb after the

@@ -231,7 +231,11 @@ impl Fixture {
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         // SAFETY: plain open(2); ownership taken immediately.
         let fd = unsafe { libc::open(cpath.as_ptr(), open_flags) };
-        assert!(fd >= 0, "open stand-in: {}", std::io::Error::last_os_error());
+        assert!(
+            fd >= 0,
+            "open stand-in: {}",
+            std::io::Error::last_os_error()
+        );
         // SAFETY: fresh owned fd.
         (fs_ino, unsafe { OwnedFd::from_raw_fd(fd) })
     }
@@ -279,7 +283,10 @@ async fn session_establish_bind_and_rw_parity() {
     let (ino, fd) = fx.create_file("parity.bin", libc::O_RDWR).await;
 
     let bind = session.bind(fd.as_raw_fd()).expect("bind must succeed");
-    assert!(bind.read_ok && bind.write_ok, "O_RDWR grants both directions");
+    assert!(
+        bind.read_ok && bind.write_ok,
+        "O_RDWR grants both directions"
+    );
 
     // Write via the client library (spans multiple max_op_bytes chunks:
     // 200 KiB over a 64 KiB per-op ceiling), read back via BOTH
@@ -323,7 +330,10 @@ async fn session_establish_bind_and_rw_parity() {
         let mut buf = vec![0u8; 4096];
         session.ring_pread(bind.binding_id, &mut buf, 1 << 40)
     });
-    assert!(matches!(n, RingOutcome::Served(0)), "past-EOF pread serves 0");
+    assert!(
+        matches!(n, RingOutcome::Served(0)),
+        "past-EOF pread serves 0"
+    );
 
     session.unbind(bind.binding_id);
     fx.host.shutdown();
@@ -464,7 +474,10 @@ async fn explicit_poison_falls_through_and_stops_ctl_traffic() {
     // A poisoned session never emits ctl traffic (§5.4.1 normative):
     // unbind after poison must be a silent no-op, and further binds fail.
     session.unbind(bind.binding_id);
-    assert!(session.bind(fd.as_raw_fd()).is_err(), "bind after poison fails");
+    assert!(
+        session.bind(fd.as_raw_fd()).is_err(),
+        "bind after poison fails"
+    );
     let _ = unbinds_before; // (bind-count is host-side; the real assert
                             // is that nothing panicked and nothing hung)
     fx.host.shutdown();

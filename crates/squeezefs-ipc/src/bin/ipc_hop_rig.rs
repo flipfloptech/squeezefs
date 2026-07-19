@@ -376,6 +376,41 @@ fn futex_wake(word: &AtomicU32, n: i32) {
     }
 }
 
+/// Pin the calling thread to the i-th CPU of the CURRENT affinity mask
+/// (so taskset rails compose: pinning picks within the rail, never
+/// escapes it).
+fn pin_thread_to_cpu(index: u32) {
+    // SAFETY: standard affinity get/set on self.
+    unsafe {
+        let mut cur: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut cur) != 0 {
+            return;
+        }
+        let allowed: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
+            .filter(|&c| libc::CPU_ISSET(c, &cur))
+            .collect();
+        if allowed.is_empty() {
+            return;
+        }
+        let target = allowed[index as usize % allowed.len()];
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(target, &mut set);
+        let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
+/// Whole-process CPU ns (user+sys) via getrusage — the daemon side's
+/// dispatcher + runtime workers together, for the §5.8.4 CPU/op rows.
+fn process_cpu_ns() -> u64 {
+    // SAFETY: getrusage into a zeroed buffer.
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+        let tv = |t: libc::timeval| t.tv_sec as u64 * 1_000_000_000 + t.tv_usec as u64 * 1_000;
+        tv(ru.ru_utime) + tv(ru.ru_stime)
+    }
+}
+
 fn thread_cpu_ns() -> u64 {
     // SAFETY: clock_gettime into a zeroed timespec.
     unsafe {
@@ -713,7 +748,10 @@ fn serve_slot(
 enum ServiceKind {
     Echo,
     Serve(Arc<ServeShaped>),
-    Handoff(tokio::sync::mpsc::Sender<u32>),
+    /// The §5.5.1 demote-path shape: every op becomes its own task on the
+    /// embedded runtime (spawn = the task wake the leg prices); the task
+    /// does the payload work and posts the completion.
+    Handoff(tokio::runtime::Handle),
 }
 
 /// Daemon-private SPSC hand-off (producer = the one ring consumer,
@@ -842,7 +880,7 @@ fn service_thread(shared: Arc<ServiceShared>, kind: ServiceKind, index: u32) -> 
 
 fn dispatch(
     session: &'static Session,
-    counters: &DaemonCounters,
+    counters: &Arc<DaemonCounters>,
     kind: &ServiceKind,
     idx: u32,
     payload: usize,
@@ -850,11 +888,16 @@ fn dispatch(
     match kind {
         ServiceKind::Echo => serve_slot(session, counters, None, idx, payload),
         ServiceKind::Serve(s) => serve_slot(session, counters, Some(s), idx, payload),
-        ServiceKind::Handoff(tx) => {
-            // The demote path: hand the op to the runtime; a task does the
-            // payload work + completion post. The channel is slots-deep,
-            // so this send never blocks in practice.
-            let _ = tx.blocking_send(idx);
+        ServiceKind::Handoff(handle) => {
+            // The demote path: one task per op onto the runtime (§5.5.1
+            // "package the op as a future onto the existing runtime");
+            // the spawn's task wake + scheduling IS the adder this leg
+            // prices. Payload work + completion post run in the task,
+            // parallel across runtime workers.
+            let counters = Arc::clone(counters);
+            handle.spawn(async move {
+                serve_slot(session, &counters, None, idx, payload);
+            });
         }
     }
 }
@@ -1115,6 +1158,7 @@ fn orchestrate(args: &Args) -> Result<(), String> {
         return Err(format!("expected HELLO, got {:?}", &buf[..n]));
     }
 
+    let daemon_cpu0 = process_cpu_ns();
     // The real sealed-memfd session.
     let geometry = rig_geometry(args);
     let layout = SessionLayout::compute(&geometry).map_err(|e| e.to_string())?;
@@ -1138,24 +1182,28 @@ fn orchestrate(args: &Args) -> Result<(), String> {
         service_threads: args.service_threads,
     });
 
-    // Handoff leg: the embedded minimal runtime + completion tasks.
+    // Handoff leg: the embedded minimal runtime (workers = --runtime-
+    // workers); ops become per-op tasks (see dispatch).
     let mut runtime = None;
-    let handoff_tx = if args.leg == "handoff" {
+    let handoff_handle = if args.leg == "handoff" {
+        // global_queue_interval(1): remote spawns land on the inject
+        // queue; hot workers must check it every poll or a busy runtime
+        // adds queue-check latency to every handoff (the §5.8.4 handoff
+        // row's runtime is also PINNED — dedicated CPUs, no migration).
+        let workers = args.runtime_workers as usize;
+        let pin_base = AtomicU32::new(0);
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(args.runtime_workers as usize)
+            .worker_threads(workers)
+            .global_queue_interval(1)
+            .on_thread_start(move || {
+                let i = pin_base.fetch_add(1, Ordering::Relaxed);
+                pin_thread_to_cpu(i);
+            })
             .build()
             .map_err(|e| e.to_string())?;
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<u32>(session.slots.len());
-        let task_counters = Arc::clone(&counters);
-        rt.spawn(async move {
-            while let Some(idx) = rx.recv().await {
-                // Completion posted from a runtime task — the §5.5.1
-                // demote-path shape whose adder this leg prices.
-                serve_slot(session, &task_counters, None, idx, payload);
-            }
-        });
+        let handle = rt.handle().clone();
         runtime = Some(rt);
-        Some(tx)
+        Some(handle)
     } else {
         None
     };
@@ -1169,11 +1217,15 @@ fn orchestrate(args: &Args) -> Result<(), String> {
             "serve" => ServiceKind::Serve(Arc::clone(
                 serve_shaped.as_ref().expect("serve leg builds the maps"),
             )),
-            _ => ServiceKind::Handoff(handoff_tx.clone().expect("handoff leg builds the channel")),
+            _ => ServiceKind::Handoff(
+                handoff_handle
+                    .clone()
+                    .expect("handoff leg builds the runtime"),
+            ),
         };
         service_handles.push(std::thread::spawn(move || service_thread(shared, kind, i)));
     }
-    drop(handoff_tx);
+    drop(handoff_handle);
 
     // Hand the session over.
     send_msg(sock, b"SESSION", Some(memfd.as_raw_fd()))?;
@@ -1224,6 +1276,8 @@ fn orchestrate(args: &Args) -> Result<(), String> {
 
     let measured_ops = get("measured_ops").max(1);
     let wall_ns = get("measured_wall_ns").max(1);
+    let daemon_cpu_ns = process_cpu_ns() - daemon_cpu0;
+    let served_total = counters.served.load(Ordering::Relaxed).max(1);
     let daemon_syscalls = counters.slot_wakes.load(Ordering::Relaxed)
         + counters.doorbell_waits.load(Ordering::Relaxed);
     let service_cpu_total: u64 = service_cpu.iter().map(|(c, _)| *c).sum();
@@ -1244,6 +1298,7 @@ fn orchestrate(args: &Args) -> Result<(), String> {
          daemon_slot_wakes={} daemon_doorbell_waits={} daemon_wait_timeouts={} \
          daemon_pops={} daemon_served={} serve_rejects={} tier_hits={} ring_full={} \
          verify_failures={} service_cpu_ns_total={service_cpu_total} \
+         daemon_process_cpu_ns={daemon_cpu_ns} daemon_cpu_ns_per_op={:.0} \
          client_threads_cpu_ns={} payload={} spin_ns={}",
         args.leg,
         args.threads,
@@ -1272,6 +1327,7 @@ fn orchestrate(args: &Args) -> Result<(), String> {
         counters.stat_tier_hits.load(Ordering::Relaxed),
         get("ring_full"),
         get("verify_failures"),
+        daemon_cpu_ns as f64 / served_total as f64,
         get("client_threads_cpu_ns"),
         args.payload,
         args.spin_ns,

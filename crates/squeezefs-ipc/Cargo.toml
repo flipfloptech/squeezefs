@@ -25,7 +25,6 @@ libc = { version = "0.2", optional = true }
 scc = { version = "3.8.3", optional = true }
 tokio = { version = "1.36", default-features = false, features = [
     "rt-multi-thread",
-    "sync",
 ], optional = true }
 
 [features]

@@ -139,6 +139,20 @@ impl<'a> MpscRingView<'a> {
         self.mask + 1
     }
 
+    /// Seed the cell sequences for a ring whose backing memory was NOT
+    /// constructed through [`RingStorage`] — i.e. a zero-initialized
+    /// shared mapping (fresh memfd pages read as zero, which is a broken
+    /// seeding: every cell except index 0 would read "previous lap still
+    /// occupied" = permanently full).
+    ///
+    /// PRECONDITION: single owner, before the mapping is shared — the
+    /// session creator calls this exactly once, before any producer or
+    /// the consumer can observe the ring (the same write-once discipline
+    /// as the session header).
+    pub fn seed_for_sharing(&self) {
+        todo!("PR L4-2 red phase")
+    }
+
     /// Producer side (any thread, any number of racing producers): publish
     /// one op-slot index. Returns `false` when the ring is full (client-
     /// visible backpressure — the caller spins/parks/falls through per the
@@ -295,6 +309,37 @@ mod tests {
             MpscRingView::from_parts(&tail, &cells).unwrap_err(),
             RingGeometryError::NotPowerOfTwo
         );
+    }
+
+    /// A zero-initialized cell array (the fresh-memfd shape) is broken
+    /// until seeded; `seed_for_sharing` must make it exactly equivalent to
+    /// a `RingStorage`-constructed ring.
+    #[test]
+    fn seed_for_sharing_revives_zeroed_cells() {
+        let tail = AtomicU32::new(0);
+        // Zero everything — including cell seqs (NOT the seeded values).
+        let cells: Vec<RingCell> = (0..4).map(|_| RingCell::seeded(0)).collect();
+        let ring = MpscRingView::from_parts(&tail, &cells).unwrap();
+        assert!(ring.push(1), "index 0 happens to accept even zeroed");
+        assert!(
+            !ring.push(2),
+            "zeroed cell 1 reads 'previous lap occupied' — the broken shape"
+        );
+
+        // Re-zero, then seed properly.
+        let tail = AtomicU32::new(0);
+        let cells: Vec<RingCell> = (0..4).map(|_| RingCell::seeded(0)).collect();
+        let ring = MpscRingView::from_parts(&tail, &cells).unwrap();
+        ring.seed_for_sharing();
+        let mut consumer = RingConsumer::new();
+        for v in 10..14u32 {
+            assert!(ring.push(v), "seeded ring accepts to capacity");
+        }
+        assert!(!ring.push(99), "and refuses past it");
+        for v in 10..14u32 {
+            assert_eq!(consumer.pop(&ring), Some(v), "seeded ring is FIFO");
+        }
+        assert_eq!(consumer.pop(&ring), None);
     }
 
     #[test]

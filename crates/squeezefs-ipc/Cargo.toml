@@ -17,7 +17,23 @@ license-file = "../../LICENSE"
 publish = false
 
 [dependencies]
-# none — see the crate-level rationale above.
+# The LIBRARY is dependency-free — see the crate-level rationale above.
+# Everything below is `rig`-feature-only plumbing for the PR L4-2 two-
+# process IPC-hop rig binary (the G-L4-1 go/no-go spike); the library
+# surface and the loom-included cores never see these.
+libc = { version = "0.2", optional = true }
+scc = { version = "3.8.3", optional = true }
+tokio = { version = "1.36", default-features = false, features = [
+    "rt-multi-thread",
+    "sync",
+], optional = true }
+
+[features]
+rig = ["dep:libc", "dep:scc", "dep:tokio"]
+
+[[bin]]
+name = "ipc_hop_rig"
+required-features = ["rig"]
 
 [dev-dependencies]
 proptest = "1.5"

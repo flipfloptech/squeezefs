@@ -195,6 +195,7 @@ impl Fixture {
         });
         let cfg = IpcHostConfig {
             socket_name: format!("sqz-il0-life-{}-{}", std::process::id(), name),
+            socket_dir: None,
             build_commit: TEST_COMMIT.to_string(),
             allow_dev: false,
             geometry: squeezefs_ipc::layout::Geometry {

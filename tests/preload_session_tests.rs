@@ -408,6 +408,7 @@ async fn stalled_serve_times_out_poisons_and_falls_through() {
     // Dedicated host wired to a sink that never completes.
     let cfg = IpcHostConfig {
         socket_name: format!("sqz-il0-session-stall-{}", std::process::id()),
+        socket_dir: None,
         build_commit: TEST_COMMIT.to_string(),
         allow_dev: false,
         geometry: test_geometry(),
@@ -522,12 +523,12 @@ async fn establish_falls_back_to_the_path_socket_when_abstract_is_unreachable() 
     let mut dead = fx.blob();
     dead.socket = format!("sqz-il0-nowhere2-{}", std::process::id());
     dead.socket_path = "/tmp/sqz-il0-does-not-exist.sock".to_string();
-    let err = tokio::task::block_in_place(
-        || match Session::establish(&dead, f.as_raw_fd(), TEST_COMMIT) {
+    let err = tokio::task::block_in_place(|| {
+        match Session::establish(&dead, f.as_raw_fd(), TEST_COMMIT) {
             Ok(_) => panic!("no rendezvous must refuse"),
             Err(e) => e,
-        },
-    );
+        }
+    });
     assert!(
         matches!(err, SessionError::Socket(_)),
         "both-rungs-dead is a socket refusal, got {err:?}"

@@ -181,6 +181,7 @@ impl Fixture {
         });
         let cfg = IpcHostConfig {
             socket_name: format!("sqz-il0-parity-{}-{}", std::process::id(), name),
+            socket_dir: None,
             build_commit: "a".repeat(40),
             allow_dev: false,
             geometry: test_geometry(),

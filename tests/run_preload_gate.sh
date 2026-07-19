@@ -275,6 +275,26 @@ else
     echo "SKIP: fio or libaio.so.1 not present (libaio row)"
 fi
 
+# 2g-netns. OQ-6 path-socket rendezvous: a client in a FOREIGN network
+# namespace (abstract AF_UNIX names are per-netns — the pre-v1.1 shape
+# silently degraded to kernel FUSE fleet-wide in containers). unshare -n
+# shares our mount namespace (FUSE mount + runtime dir visible) but not
+# the netns, so the abstract rung ECONNREFUSEDs and ONLY the path
+# socket can rendezvous. Engagement-checked like every il surface.
+if command -v unshare &>/dev/null; then
+    NS_R0=$(stats ipc_ops_read)
+    NS_S0=$(stats ipc_sessions_total)
+    unshare -n bash -c "LD_PRELOAD='$SO' dd if='$MOUNT_DIR/cp.bin' of=/dev/null bs=64k status=none" \
+        || fail "preload'd read inside unshare -n"
+    NS_R1=$(stats ipc_ops_read)
+    NS_S1=$(stats ipc_sessions_total)
+    [ "$((NS_S1 - NS_S0))" -ge 1 ] || fail "foreign-netns client established no session (path socket dead?)"
+    [ "$((NS_R1 - NS_R0))" -ge 32 ] || fail "foreign-netns reads bypassed the ring (Δ$((NS_R1 - NS_R0)))"
+    echo "OK: foreign-netns path-socket rendezvous (sessions +$((NS_S1 - NS_S0)), ring reads +$((NS_R1 - NS_R0)))"
+else
+    echo "SKIP: unshare not installed (netns row)"
+fi
+
 # 2h. kill-9 soak (L4-6, G-L4-4 zero-residue): SIGKILL a preload'd
 # writer mid-stream ×5; every cycle must drain sessions AND session-shm
 # bytes to the pre-cycle baseline (multi-run discipline: any failure

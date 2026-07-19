@@ -113,6 +113,16 @@ fn service_thread_count() -> usize {
 pub struct IpcHostConfig {
     /// Abstract AF_UNIX socket name (no leading NUL — added on the wire).
     pub socket_name: String,
+    /// OQ-6 (v1.1): when set, ALSO bind a filesystem-path
+    /// `SOCK_SEQPACKET` socket at `<dir>/<socket_name>.sock` and
+    /// advertise it in the blob's reserved `socket_path` field —
+    /// abstract names are per network namespace, so containerized apps
+    /// with the mount bind-mounted in need a path rendezvous. The path
+    /// socket grants nothing the abstract one does not (SO_PEERCRED +
+    /// the §5.2 fd screen remain the boundary; the file is 0666
+    /// BECAUSE connecting is not a credential). Bind failure degrades
+    /// loudly to abstract-only — never fails the spawn.
+    pub socket_dir: Option<std::path::PathBuf>,
     /// This daemon's build-commit identity (`src/version.rs` form) — the
     /// KD-7 skew gate key.
     pub build_commit: String,
@@ -539,6 +549,9 @@ pub struct IpcHost {
     cfg: IpcHostConfig,
     sink: Arc<dyn SessionSink>,
     listener_fd: OwnedFd,
+    /// OQ-6 path-socket listener + its on-disk path (unlinked at
+    /// shutdown). `None` = disabled or degraded to abstract-only.
+    path_listener: Option<(OwnedFd, std::path::PathBuf)>,
     nonce: Mutex<NonceState>,
     /// The mount's `st_dev` (screen rule: `st_dev` must match). `u64::MAX`
     /// = not resolved yet — every bind refuses class `mode` until the
@@ -576,11 +589,32 @@ impl IpcHost {
         SessionLayout::compute(&cfg.geometry)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         let listener_fd = abstract_listen(&cfg.socket_name)?;
+        // OQ-6: the optional path rendezvous. Failure is loud but never
+        // fatal — the mount (and same-netns interception) must not be
+        // held hostage by optional plumbing.
+        let path_listener = cfg.socket_dir.as_ref().and_then(|dir| {
+            let path = dir.join(format!("{}.sock", cfg.socket_name));
+            match path_listen(dir, &path) {
+                Ok(fd) => {
+                    log::info!("ipc host: path ctl socket at {}", path.display());
+                    Some((fd, path))
+                }
+                Err(e) => {
+                    log::warn!(
+                        "ipc host: path ctl socket bind failed at {} ({e}) — \
+                         abstract-only (foreign-netns clients will passthrough)",
+                        path.display()
+                    );
+                    None
+                }
+            }
+        });
         let service_threads = service_thread_count();
         let host = Arc::new(Self {
             cfg,
             sink,
             listener_fd,
+            path_listener,
             nonce: Mutex::new(NonceState::fresh()),
             expected_st_dev: AtomicU64::new(u64::MAX),
             arena_bytes: AtomicU64::new(0),
@@ -601,8 +635,16 @@ impl IpcHost {
         let accept_host = Arc::clone(&host);
         let accept = std::thread::Builder::new()
             .name("sqz-ipc-accept".into())
-            .spawn(move || accept_host.accept_loop())?;
+            .spawn(move || accept_host.accept_loop(AcceptOn::Abstract))?;
         let mut spawned = vec![accept];
+        if host.path_listener.is_some() {
+            let path_host = Arc::clone(&host);
+            spawned.push(
+                std::thread::Builder::new()
+                    .name("sqz-ipc-accept-p".into())
+                    .spawn(move || path_host.accept_loop(AcceptOn::Path))?,
+            );
+        }
         for idx in 0..service_threads {
             let service_host = Arc::clone(&host);
             spawned.push(
@@ -715,11 +757,19 @@ impl IpcHost {
         if self.shutting_down.swap(true, Ordering::SeqCst) {
             return;
         }
-        // Unblock the accept loop (shutdown(2) — closing an fd does NOT
+        // Unblock the accept loops (shutdown(2) — closing an fd does NOT
         // reliably unblock a blocking accept on Linux).
-        // SAFETY: plain shutdown(2) on our own listener fd.
+        // SAFETY: plain shutdown(2) on our own listener fds.
         unsafe {
             libc::shutdown(self.listener_fd.as_raw_fd(), libc::SHUT_RDWR);
+        }
+        if let Some((fd, path)) = &self.path_listener {
+            // SAFETY: plain shutdown(2) on our own path listener fd.
+            unsafe {
+                libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR);
+            }
+            // Zero residue restored: the socket file dies with the host.
+            let _ = std::fs::remove_file(path);
         }
         let sessions: Vec<Arc<IpcSession>> = self
             .sessions
@@ -749,9 +799,13 @@ impl IpcHost {
             flags: 0,
             build_commit: self.cfg.build_commit.clone(),
             socket: self.cfg.socket_name.clone(),
-            // RESERVED (OQ-6): the filesystem-path socket for container
-            // fleets — carried now so no ABI bump is needed later.
-            socket_path: String::new(),
+            // OQ-6 (v1.1): the filesystem-path rendezvous for container
+            // netns — empty when disabled or degraded to abstract-only.
+            socket_path: self
+                .path_listener
+                .as_ref()
+                .map(|(_, p)| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             nonce: self.current_nonce(),
         }
         .encode()
@@ -761,13 +815,20 @@ impl IpcHost {
     // accept + ctl plane
     // ---------------------------------------------------------------
 
-    fn accept_loop(self: Arc<Self>) {
+    fn accept_loop(self: Arc<Self>, on: AcceptOn) {
+        let listener = match on {
+            AcceptOn::Abstract => self.listener_fd.as_raw_fd(),
+            AcceptOn::Path => match &self.path_listener {
+                Some((fd, _)) => fd.as_raw_fd(),
+                None => return,
+            },
+        };
         loop {
             // SAFETY: accept4 on our listening socket; the fd is owned
             // immediately below.
             let fd = unsafe {
                 libc::accept4(
-                    self.listener_fd.as_raw_fd(),
+                    listener,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     libc::SOCK_CLOEXEC,
@@ -1343,6 +1404,14 @@ fn create_session_shm(
 // socket plumbing (abstract AF_UNIX SOCK_SEQPACKET + SCM_RIGHTS)
 // -------------------------------------------------------------------
 
+/// Which listener an accept thread drains (identical connection
+/// handling — the rendezvous is the only difference).
+#[derive(Clone, Copy)]
+enum AcceptOn {
+    Abstract,
+    Path,
+}
+
 fn abstract_sockaddr(name: &str) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
     // SAFETY: zeroed sockaddr_un is a valid all-default value.
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -1388,6 +1457,93 @@ fn abstract_listen(name: &str) -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     Ok(fd)
+}
+
+fn path_sockaddr(path: &std::path::Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: zeroed sockaddr_un is a valid all-default value.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() + 1 > addr.sun_path.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path too long for sun_path",
+        ));
+    }
+    for (i, b) in bytes.iter().enumerate() {
+        addr.sun_path[i] = *b as libc::c_char;
+    }
+    // NUL-terminated filesystem path.
+    let len = std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1;
+    Ok((addr, len as libc::socklen_t))
+}
+
+/// OQ-6: bind + listen a filesystem-path `SOCK_SEQPACKET` socket.
+/// The dir is created 0755 if missing; a same-name stale file is OUR
+/// crash residue (names embed pid+random — never a live foreign
+/// daemon) and is replaced; the socket file goes 0666 (connecting is
+/// not a credential — SO_PEERCRED + the fd screen are the boundary).
+fn path_listen(dir: &std::path::Path, path: &std::path::Path) -> io::Result<OwnedFd> {
+    std::fs::create_dir_all(dir)?;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    // SAFETY: socket(2); ownership taken immediately.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fresh owned fd.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let (addr, len) = path_sockaddr(path)?;
+    // SAFETY: bind with a correctly-sized sockaddr_un.
+    if unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            len,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
+    }
+    // SAFETY: listen(2).
+    if unsafe { libc::listen(fd.as_raw_fd(), 64) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// Client-side connect to a filesystem-path `SOCK_SEQPACKET` socket
+/// (OQ-6 rendezvous; tests use it as the raw-protocol harness).
+pub fn path_connect(path: &str) -> io::Result<UnixStream> {
+    // SAFETY: socket(2); ownership taken immediately.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fresh owned fd.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let (addr, len) = path_sockaddr(std::path::Path::new(path))?;
+    // SAFETY: connect with a correctly-sized sockaddr_un.
+    if unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            len,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(UnixStream::from(fd))
 }
 
 /// Client-side connect to an abstract-namespace `SOCK_SEQPACKET` socket

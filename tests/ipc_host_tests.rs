@@ -14,7 +14,8 @@
 //! complete `-ENOSYS` until PR L4-4 lands the data plane.
 
 use squeezefs::ipc_host::{
-    abstract_connect, futex_wake, recv_ctl, send_ctl, EchoSessionSink, IpcHost, IpcHostConfig,
+    abstract_connect, futex_wake, path_connect, recv_ctl, send_ctl, EchoSessionSink, IpcHost,
+    IpcHostConfig,
 };
 use squeezefs_ipc::layout::{
     Geometry, IpcSlot, SessionHeader, SessionLayout, SlotDescriptor, OP_ECHO, OP_READ, OP_WRITE,
@@ -48,6 +49,7 @@ fn test_geometry() -> Geometry {
 fn test_config(name: &str) -> IpcHostConfig {
     IpcHostConfig {
         socket_name: format!("sqz-il0-test-{}-{}", std::process::id(), name),
+        socket_dir: None,
         build_commit: "a".repeat(40),
         allow_dev: false,
         geometry: test_geometry(),
@@ -353,6 +355,7 @@ fn hello_version_skew_refuses_including_unknown_and_dirty() {
     // on BOTH sides refuses; `-dirty` on both sides refuses.
     let unknown_host_cfg = IpcHostConfig {
         socket_name: format!("sqz-il0-test-{}-unknown", std::process::id()),
+        socket_dir: None,
         build_commit: "unknown".to_string(),
         ..cfg.clone()
     };
@@ -373,6 +376,7 @@ fn hello_version_skew_refuses_including_unknown_and_dirty() {
     let dirty_commit = format!("{}-dirty", "c".repeat(40));
     let dirty_host_cfg = IpcHostConfig {
         socket_name: format!("sqz-il0-test-{}-dirty", std::process::id()),
+        socket_dir: None,
         build_commit: dirty_commit.clone(),
         ..cfg.clone()
     };
@@ -400,6 +404,7 @@ fn hello_version_skew_refuses_including_unknown_and_dirty() {
     let dev_before = METRICS.ipc_binds_dev_override.load(Ordering::Relaxed);
     let allow_cfg = IpcHostConfig {
         socket_name: format!("sqz-il0-test-{}-allowdev", std::process::id()),
+        socket_dir: None,
         build_commit: dirty_commit.clone(),
         allow_dev: true,
         ..cfg.clone()
@@ -1262,7 +1267,10 @@ fn path_socket_binds_advertises_and_serves_a_full_establish() {
         .join(format!("{}.sock", cfg.socket_name))
         .to_string_lossy()
         .into_owned();
-    assert_eq!(blob.socket_path, expected, "blob advertises the path socket");
+    assert_eq!(
+        blob.socket_path, expected,
+        "blob advertises the path socket"
+    );
     assert_eq!(blob.socket, cfg.socket_name, "abstract stays primary");
     let meta = std::fs::metadata(&blob.socket_path).expect("socket file exists");
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -1361,6 +1369,9 @@ fn stale_socket_file_is_replaced_on_spawn() {
     let host = IpcHost::spawn(cfg, Arc::new(EchoSessionSink))
         .expect("spawn must replace the stale socket file");
     let blob = squeezefs_ipc::wire::BootstrapBlob::decode(&host.bootstrap_blob()).expect("blob");
-    assert!(!blob.socket_path.is_empty(), "path socket live after replace");
+    assert!(
+        !blob.socket_path.is_empty(),
+        "path socket live after replace"
+    );
     host.shutdown();
 }

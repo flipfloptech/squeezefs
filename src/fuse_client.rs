@@ -10400,8 +10400,35 @@ pub async fn start_mount<P: AsRef<Path>>(
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(|mb| mb * 1024 * 1024)
             .unwrap_or_else(|| crate::mem_budget::ipc_arena_cap(mem_budget));
+        // OQ-6 (v1.1): the path-socket runtime dir for container-netns
+        // clients. `SQUEEZEFS_IPC_SOCKET_DIR` overrides (the literal
+        // `none` disables); default = /run/squeezefs for root mounts,
+        // $XDG_RUNTIME_DIR/squeezefs else /tmp/squeezefs-il-<uid> for
+        // user mounts. Container fleets bind-mount this dir alongside
+        // the filesystem (documented in operations.md); bind failure
+        // degrades loudly to abstract-only inside the host.
+        let socket_dir = match std::env::var("SQUEEZEFS_IPC_SOCKET_DIR") {
+            Ok(v) if v.trim() == "none" => None,
+            Ok(v) if !v.trim().is_empty() => Some(std::path::PathBuf::from(v.trim())),
+            _ => {
+                // SAFETY: geteuid is trivially safe.
+                let euid = unsafe { libc::geteuid() };
+                Some(if euid == 0 {
+                    std::path::PathBuf::from("/run/squeezefs")
+                } else {
+                    std::env::var("XDG_RUNTIME_DIR")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                        .map(|v| std::path::PathBuf::from(v).join("squeezefs"))
+                        .unwrap_or_else(|| {
+                            std::path::PathBuf::from(format!("/tmp/squeezefs-il-{euid}"))
+                        })
+                })
+            }
+        };
         let cfg = crate::ipc_host::IpcHostConfig {
             socket_name: format!("sqz-il0-{}-{:08x}", std::process::id(), fastrand::u32(..)),
+            socket_dir,
             build_commit: crate::version::build_commit(),
             allow_dev: std::env::var("SQUEEZEFS_IPC_ALLOW_DEV").is_ok_and(|v| v == "1"),
             geometry,

@@ -223,7 +223,18 @@ impl Session {
             return Err(SessionError::VersionSkew);
         }
 
-        let sock = connect_abstract(&blob.socket)?;
+        // OQ-6 connect ladder: abstract first (same-netns fast path,
+        // zero residue), then the advertised filesystem-path socket —
+        // the container-netns rendezvous (abstract names are per netns;
+        // the path rides any shared mount surface). Both rungs speak
+        // the identical protocol; failure of both is the
+        // bind_refused{socket} outcome.
+        // (Last-attempt error semantics, like a connect retry chain.)
+        let sock = match connect_abstract(&blob.socket) {
+            Ok(fd) => fd,
+            Err(_) if !blob.socket_path.is_empty() => connect_path(&blob.socket_path)?,
+            Err(e) => return Err(e),
+        };
         let sock_guard = FdGuard(sock);
         set_recv_timeout(sock, CTL_RECV_TIMEOUT);
 
@@ -793,6 +804,40 @@ fn connect_abstract(name: &str) -> Result<RawFd, SessionError> {
         addr.sun_path[i + 1] = *b as libc::c_char; // abstract: leading NUL
     }
     let len = std::mem::size_of::<libc::sa_family_t>() + 1 + bytes.len();
+    // SAFETY: connect with a correctly-sized sockaddr_un.
+    if unsafe {
+        libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            len as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(SessionError::Socket(errno()));
+    }
+    Ok(guard.release())
+}
+
+/// OQ-6: connect to the advertised filesystem-path socket (the
+/// container-netns rendezvous rung of the establish ladder).
+fn connect_path(path: &str) -> Result<RawFd, SessionError> {
+    // SAFETY: socket(2); ownership handled by the caller's guard.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(SessionError::Socket(errno()));
+    }
+    let guard = FdGuard(fd);
+    // SAFETY: zeroed sockaddr_un is a valid all-default value.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_bytes();
+    if bytes.len() + 1 > addr.sun_path.len() {
+        return Err(SessionError::Protocol);
+    }
+    for (i, b) in bytes.iter().enumerate() {
+        addr.sun_path[i] = *b as libc::c_char; // filesystem path: NUL-terminated
+    }
+    let len = std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1;
     // SAFETY: connect with a correctly-sized sockaddr_un.
     if unsafe {
         libc::connect(

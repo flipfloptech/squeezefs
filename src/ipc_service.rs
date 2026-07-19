@@ -45,12 +45,8 @@ use crate::ipc_host::{DataOp, SessionSink, SlotCompletion};
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
 use squeezefs_ipc::layout::{OP_READ, OP_WRITE};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-
-/// Monotonic low bits for IPC-tagged `Request::unique` values (the
-/// `ipc_read_dest` key space; see [`crate::fuse_client::IPC_DEST_TAG`]).
-static IPC_UNIQUE: AtomicU64 = AtomicU64::new(1);
 
 /// The §5.6.2 W1 invalidation policy: fire on BIND, fire on the FIRST
 /// ring write per (ino, window), suppress in-window repeats, never on
@@ -215,47 +211,15 @@ impl DataPlaneSink {
         }
     }
 
-    /// L4-7 (§5.5.3): is this read op eligible for a direct-to-arena DMA
-    /// destination? Gates, each load-bearing:
-    /// - lever (`SQUEEZEFS_IL_ARENA_DMA=0` = the acceptance A/B switch);
-    /// - **transform volumes never get an arena dest** (§5.3.1 rule 3:
-    ///   a decode reading its input from client-writable memory would
-    ///   let a racing scribble feed the daemon's interpreter — transform
-    ///   reads keep the private-buffer path);
-    /// - the window base must satisfy the device path's 4 KiB alignment
-    ///   contract (slab bases are page-multiples for sane geometries;
-    ///   odd slot counts can misalign — gate, don't assume).
-    fn arena_dest(&self, op: &DataOp) -> Option<u64> {
-        if std::env::var("SQUEEZEFS_IL_ARENA_DMA").is_ok_and(|v| v == "0") {
-            return None;
-        }
-        if !self.fs.router.get_crypto().is_passthrough() {
-            return None;
-        }
-        let dest = op.payload.dma_dest_addr();
-        if dest % 4096 != 0 {
-            return None;
-        }
-        Some(dest)
-    }
-
     /// The read handoff: re-runs the FULL read handler (including its
-    /// in-guard async attr fallback) under its own guard. Where eligible
-    /// (`arena_dest`), the op's arena window rides the handler's
-    /// existing `dest_addr` plumb (the kernel transport's registered-
-    /// payload slot) so device reads DMA straight into the completion
-    /// payload region; the sink detects where the bytes actually LANDED
-    /// by pointer equality (the fuse3 reply-path precedent) and copies
-    /// only when they landed elsewhere — parity is unconditional, the
-    /// router remains free to decline (tier hits, unaligned shapes,
-    /// multi-block composition).
+    /// in-guard async attr fallback) under its own guard, then posts the
+    /// bytes into the op's validated arena window.
     fn enqueue_read(&self, op: DataOp, completion: SlotCompletion) {
         METRICS.ipc_async_handoffs.fetch_add(1, Ordering::Relaxed);
         let fs = self.fs.clone();
         let ino = op.binding.ino;
         let offset = op.desc.offset;
         let len = op.desc.len;
-        let dest = self.arena_dest(&op);
         self.runtime.spawn(async move {
             // Re-seed a cold attr cache so warm workloads return to the
             // sync fast path after ONE miss demotion (the handler's own
@@ -263,35 +227,11 @@ impl DataPlaneSink {
             if fs.attr_cache.get(&ino).is_none() {
                 fs.refresh_attr_cache(ino).await;
             }
-            let mut request = Self::ring_request();
-            if let Some(d) = dest {
-                // One-shot dest channel entry, keyed by an IPC-tagged
-                // unique (kernel uniques never carry the tag bit).
-                request.unique =
-                    crate::fuse_client::IPC_DEST_TAG | IPC_UNIQUE.fetch_add(1, Ordering::Relaxed);
-                let _ = fs.ipc_read_dest.insert_sync(request.unique, d);
-            }
-            let ipc_unique = request.unique;
-            let result = fs.read(request, ino, 0, offset, len, 0).await;
-            if dest.is_some() {
-                // Idempotent cleanup: the handler consumes the entry on
-                // its dest-resolution path; error/virtual-inode paths
-                // may return before reaching it.
-                let _ = fs.ipc_read_dest.remove_sync(&ipc_unique);
-            }
-            match result {
+            match fs.read(Self::ring_request(), ino, 0, offset, len, 0).await {
                 Ok(reply) => {
-                    let landed = dest == Some(reply.data.as_ptr() as u64);
-                    if landed {
-                        // The device DMA'd straight into the arena window
-                        // (§5.5.2 ledger: the pool→arena copy deleted).
-                        METRICS.ipc_arena_dma_reads.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        // Into the SNAPSHOT window (§5.3.1: bounds
-                        // validated at dequeue; mid-serve descriptor
-                        // mutation is inert).
-                        op.payload.write(&reply.data);
-                    }
+                    // Into the SNAPSHOT window (§5.3.1: bounds validated at
+                    // dequeue; mid-serve descriptor mutation is inert).
+                    op.payload.write(&reply.data);
                     METRICS.ipc_ops_read.fetch_add(1, Ordering::Relaxed);
                     METRICS
                         .ipc_bytes_out

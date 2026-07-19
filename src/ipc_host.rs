@@ -249,14 +249,6 @@ impl ArenaWindow {
         }
     }
 
-    /// The window's base address — the L4-7 direct-to-arena DMA target
-    /// (§5.5.3). The §5.3.1 discipline for handing this to device I/O:
-    /// the DMA may only WRITE through it (read completions); nothing
-    /// derived is ever computed from a re-read of this memory.
-    pub fn dma_dest_addr(&self) -> u64 {
-        self.base as u64
-    }
-
     pub fn len(&self) -> usize {
         self.len
     }

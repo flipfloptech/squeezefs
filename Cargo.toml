@@ -6,6 +6,20 @@ version = "0.1.0"
 edition = "2021"
 license-file = "LICENSE"
 
+# L4 workspace (design-preload-interception §5.4 / KD-8, OQ-2 primary path):
+# root + the IPC protocol crate. `crates/squeezefs-preload` joins `members`
+# (but NOT `default-members` — the §5.4 panic-profile posture) when PR L4-5
+# creates it. Excluded on purpose:
+#   - crates/fuse3 — stays a [patch.crates-io] path dep with its own
+#     standalone suite (first-party fork precedent); NOT a member, or the
+#     root gate would absorb its test surface.
+#   - loom-models — must stay its own workspace so `--cfg loom` RUSTFLAGS
+#     never poison the main dependency graph (see loom-models/Cargo.toml).
+[workspace]
+members = [".", "crates/squeezefs-ipc"]
+exclude = ["crates/fuse3", "loom-models"]
+default-members = [".", "crates/squeezefs-ipc"]
+
 [dependencies]
 parking_lot = "0.12"
 memmap2 = "0.9"
@@ -87,6 +101,16 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+# The ONLY sanctioned build profile for the future `squeezefs-preload`
+# cdylib (design-preload-interception §5.4, Issue-4 resolution): the root
+# `panic = "abort"` would silently void the shim's `catch_unwind` and turn
+# any shim panic into a host-application abort. Verified accepted by the
+# pinned toolchain at PR L4-1 (built `squeezefs-ipc` under it as the
+# acceptance probe); the §5.4 standalone-workspace fallback was NOT needed.
+[profile.preload-release]
+inherits = "release"
+panic = "unwind"
 
 [[bench]]
 name = "meta_lv_bench"

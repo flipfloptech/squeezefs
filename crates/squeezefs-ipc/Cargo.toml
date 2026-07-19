@@ -1,0 +1,26 @@
+# squeezefs-ipc — the L4 interception IPC protocol crate
+# (docs/design-preload-interception.md §5.3, PR L4-1).
+#
+# Dependency-free ON PURPOSE: the protocol cores (`ring_core`, `slot_core`,
+# plus the `#[path]`-shared fuse3 `wake_core`) are `#[path]`-included by
+# `loom-models` (the house convention — models check the shipped code, not
+# a copy), and the future `squeezefs-preload` cdylib links this crate into
+# arbitrary host applications (no tokio, no allocator replacement — §5.4).
+
+[package]
+name = "squeezefs-ipc"
+# cargo-internal placeholder only — SqueezeFS versions are git commits
+# (see docs/operations.md §Versioning & releases); never bump for releases.
+version = "0.1.0"
+edition = "2021"
+license-file = "../../LICENSE"
+publish = false
+
+[dependencies]
+# none — see the crate-level rationale above.
+
+[dev-dependencies]
+proptest = "1.5"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

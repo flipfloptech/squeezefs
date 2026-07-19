@@ -3836,6 +3836,127 @@ impl DataRouter {
         }
     }
 
+    /// L4-8 (§5.5.1 "the 1 M+ engine"): the SYNC serve mirror for the IPC
+    /// read fast path — exactly the sync-servable striped legs of
+    /// [`Self::read_file_range_zero_copy`] (the staging mmap ring, then
+    /// the R4 hot-block tier), no awaits, no blocking locks. `None` = any
+    /// shape needing async work (W2 extent overlays, multi-block, cold
+    /// blocks, non-striped layouts) — the caller demotes to the handoff,
+    /// which runs the full handler; parity is by construction because
+    /// these legs are pointwise copies of the handler's own (same keys,
+    /// same clamps, same currency rules).
+    ///
+    /// Caller contract: `offset + read_len` already clamped to the
+    /// authoritative size (the fast path's guarded size check), and the
+    /// per-inode read guard held (mutators excluded — the same currency
+    /// the handler's serve legs rely on).
+    pub fn try_read_range_sync(
+        &self,
+        file_path: &str,
+        meta: &CachedMetadata,
+        offset: u64,
+        read_len: usize,
+    ) -> Option<bytes::Bytes> {
+        if read_len == 0 {
+            return None;
+        }
+        // The STAGED layout (whole-file ring blob keyed by file_id) —
+        // mirror of the handler's staged serve: entry hit needs no
+        // further validation (same-key re-stages replace atomically),
+        // short blobs zero-pad (truncate-up hole tails), a W2 rider
+        // overlay demotes to the handler's compose leg.
+        if meta.file_type == "staged" {
+            let file_id = meta.file_id.as_ref()?;
+            let guard = self.cache.nvme.read_staged_zero_copy(file_id)?;
+            if !self
+                .staged_extent_runs_in(file_path, 0, offset as usize, offset as usize + read_len)
+                .is_empty()
+            {
+                return None;
+            }
+            let start = (offset as usize).min(guard.len);
+            let end = (offset as usize + read_len).min(guard.len);
+            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+            if end - start == read_len {
+                return Some(bytes::Bytes::copy_from_slice(&guard[start..end]));
+            }
+            let mut out = vec![0u8; read_len];
+            out[..end - start].copy_from_slice(&guard[start..end]);
+            return Some(bytes::Bytes::from(out));
+        }
+        if meta.file_type != "striped" {
+            return None;
+        }
+        let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
+        let end_offset = offset + read_len as u64;
+        let start_block = (offset / block_size) as u32;
+        let end_block = ((end_offset - 1) / block_size) as u32;
+        if start_block != end_block {
+            return None;
+        }
+        let b_start = start_block as u64 * block_size;
+        let rel_s = (offset - b_start) as usize;
+        let rel_e = rel_s + read_len;
+
+        // W2 overlay present ⇒ the compose leg (async) owns this read
+        // ("overlay never invisible" — one latch-free probe otherwise).
+        if !self
+            .staged_extent_runs_in(file_path, start_block, rel_s, rel_e)
+            .is_empty()
+        {
+            return None;
+        }
+
+        // Leg 1: the staging mmap ring — same key, same clamps as the
+        // handler's "check active block staging first" leg (short serves
+        // included: a shorter staged image returns short, exactly as the
+        // handler would).
+        let cache_key = crate::keys::active_block_for_path(file_path, start_block).to_string();
+        if let Some(guard) = self.cache.nvme.read_staged_zero_copy(&cache_key) {
+            let start = rel_s.min(guard.len);
+            let end = rel_e.min(guard.len);
+            return Some(bytes::Bytes::copy_from_slice(&guard[start..end]));
+        }
+
+        // Leg 2: the R4 hot tier. Skipped wholesale under the
+        // device-true diagnostic posture: per-op O_DIRECT-ness is not
+        // visible on the ring, and quietly tier-serving there would turn
+        // the device-true il row into a warm row (measurement fraud).
+        if self.direct_device_true() {
+            return None;
+        }
+        let b_key = if let Some(map) = &meta.block_map {
+            map.get(&start_block).cloned()?
+        } else if let Some(id) = &meta.block_map_id {
+            self.block_map_cache
+                .get(&(id.clone(), start_block))
+                .and_then(|(k, _)| k)?
+        } else {
+            format!("{}/part_{}", meta.block_prefix.as_ref()?, start_block)
+        };
+        if let Some(hot) = self.cache.hot_block.get_no_promote(&b_key) {
+            let start = rel_s.min(hot.len());
+            let end = rel_e.min(hot.len());
+            METRICS.hot_block_hits.fetch_add(1, Ordering::Relaxed);
+            return Some(hot.slice(start..end));
+        }
+
+        // Leg 3: the NVMe read-cache shard (sync mmap — the handler's
+        // "tier fast path with binding recheck" leg). Binding currency:
+        // the handler rechecks via `current_block_binding().await`, whose
+        // source under a warm metadata cache is exactly the CURRENT map
+        // `b_key` was just derived from — and this daemon's writers
+        // update that map synchronously under the inode lock the caller
+        // holds. Same currency class, no await.
+        let guard = self.cache.nvme.get_cached_read_block_range_zero_copy(
+            &b_key,
+            rel_s as u64,
+            read_len as u32,
+        )?;
+        METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+        Some(bytes::Bytes::copy_from_slice(&guard))
+    }
+
     pub async fn load_striped_block_keys(
         &self,
         _file_path: &str,

@@ -985,6 +985,153 @@ async fn cold_attr_miss_demotes_and_eof_fast_path_serves() {
 }
 
 // ---------------------------------------------------------------------------
+// the §5.5.1 sync tier serve (L4-8 prerequisite): warm reads serve on the
+// fast path — no tokio, no handoff — from the sync-servable tiers.
+// Fixture fact (established while these were red): this sandbox's device
+// fills are never tier-published (untracked fill incarnations on the
+// temp-file backend), so the hot/disk read tiers CANNOT fill through
+// natural reads here — leg 1 (staging ring) is pinned with a genuinely
+// staged-layout file, leg 2 (R4 hot tier) hermetically by seeding the
+// tier under the block map's own key. Full-stack tier filling is the
+// scoreboard warm row's job (real mount, tracked incarnations).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn warm_staged_reads_serve_on_the_sync_fast_path() {
+    let fx = Fixture::new("sync-staged").await;
+    let (ino, fd) = fx.create_file("staged.bin").await;
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    // 2 MiB single write with staging dirs present ⇒ the STAGED layout:
+    // the staging mmap ring is the file's authoritative warm tier.
+    let w = deterministic_bytes(2 * 1024 * 1024, 71);
+    fx.fuse_write(ino, 0, &w).await;
+    fx.fs.fsync(req(), ino, 0, false).await.expect("fsync");
+
+    // Warm the guarded inputs (one read may demote-miss re-seeding the
+    // attr cache), then measure.
+    let _ = tokio::task::block_in_place(|| session.ring_read(binding, 0, 4096, "warm attrs"));
+
+    let fast_before = METRICS.ipc_fast_path_serves.load(Ordering::Relaxed);
+    let handoffs_before = METRICS.ipc_async_handoffs.load(Ordering::Relaxed);
+    let mut served = 0u64;
+    for (off, len) in [
+        (0u64, 4096usize),
+        (64 * 1024, 16 * 1024),
+        (1024 * 1024 + 511, 8192), // unaligned interior
+        (2 * 1024 * 1024 - 4096, 4096),
+    ] {
+        let ring =
+            tokio::task::block_in_place(|| session.ring_read(binding, off, len, "staged read"));
+        assert_eq!(
+            ring,
+            &w[off as usize..off as usize + len],
+            "staged sync-serve parity at offset {off} len {len}"
+        );
+        served += 1;
+    }
+    let fast_delta = METRICS.ipc_fast_path_serves.load(Ordering::Relaxed) - fast_before;
+    let handoff_delta = METRICS.ipc_async_handoffs.load(Ordering::Relaxed) - handoffs_before;
+    assert!(
+        fast_delta >= served,
+        "warm staged reads must serve on the SYNC fast path ({fast_delta} fast serves for \
+         {served} reads; {handoff_delta} handoffs) — the §5.5.1 tier→arena engine, leg 1"
+    );
+    assert_eq!(
+        handoff_delta, 0,
+        "no warm staged read may pay the tokio handoff (got {handoff_delta})"
+    );
+
+    // Coherence: a ring overwrite must never let the sync path serve
+    // stale staged bytes (the active buffer outranks every tier).
+    let patch = deterministic_bytes(8192, 72);
+    tokio::task::block_in_place(|| session.ring_write(binding, 64 * 1024, &patch, "overwrite"));
+    let ring = tokio::task::block_in_place(|| {
+        session.ring_read(binding, 64 * 1024, patch.len(), "post-overwrite read")
+    });
+    assert_eq!(
+        ring, patch,
+        "sync path must never serve stale staged bytes over a newer write"
+    );
+    fx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hot_tier_leg_serves_on_the_sync_fast_path_when_seeded() {
+    let fx = Fixture::new("sync-hot").await;
+    let (ino, fd) = fx.create_file("hot.bin").await;
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    // Striped file (8 MiB spans two blocks); flush so no active buffers
+    // or staged images remain.
+    let w = deterministic_bytes(8 * 1024 * 1024, 73);
+    fx.fuse_write(ino, 0, &w).await;
+    fx.fs.fsync(req(), ino, 0, false).await.expect("fsync");
+    let _ = tokio::task::block_in_place(|| session.ring_read(binding, 0, 4096, "warm attrs"));
+
+    // Seed the R4 hot tier under the CURRENT block map's key for block 0
+    // — exactly what a tracked-incarnation fill publish would have done.
+    let meta = fx
+        .fs
+        .router
+        .metadata_cache
+        .get(&ino)
+        .expect("metadata cached");
+    let b_key = meta
+        .block_map
+        .as_ref()
+        .expect("striped block map")
+        .get(&0)
+        .expect("block 0 bound")
+        .clone();
+    fx.fs
+        .router
+        .cache
+        .hot_block
+        .put(&b_key, bytes::Bytes::copy_from_slice(&w[..4 * 1024 * 1024]));
+
+    let fast_before = METRICS.ipc_fast_path_serves.load(Ordering::Relaxed);
+    let handoffs_before = METRICS.ipc_async_handoffs.load(Ordering::Relaxed);
+    let hot_before = METRICS.hot_block_hits.load(Ordering::Relaxed);
+    for (off, len) in [
+        (0u64, 4096usize),
+        (64 * 1024, 16 * 1024),
+        (1024 * 1024 + 511, 8192),
+    ] {
+        let ring = tokio::task::block_in_place(|| session.ring_read(binding, off, len, "hot read"));
+        assert_eq!(
+            ring,
+            &w[off as usize..off as usize + len],
+            "hot-tier sync-serve parity at offset {off} len {len}"
+        );
+    }
+    assert!(
+        METRICS.ipc_fast_path_serves.load(Ordering::Relaxed) - fast_before >= 3,
+        "seeded hot-tier reads must serve on the SYNC fast path — leg 2"
+    );
+    assert_eq!(
+        METRICS.ipc_async_handoffs.load(Ordering::Relaxed) - handoffs_before,
+        0,
+        "no hot-tier read may pay the tokio handoff"
+    );
+    assert!(
+        METRICS.hot_block_hits.load(Ordering::Relaxed) > hot_before,
+        "the R4 gauge must count the sync serves (parity with the handler leg)"
+    );
+
+    // Block 1 is NOT seeded: reads there must demote to the handoff and
+    // still serve parity (never a wrong answer, only a slower one).
+    let off = 4 * 1024 * 1024 + 8192;
+    let ring = tokio::task::block_in_place(|| session.ring_read(binding, off as u64, 4096, "cold"));
+    assert_eq!(
+        ring,
+        &w[off..off + 4096],
+        "unseeded block parity via handoff"
+    );
+    fx.shutdown();
+}
+
+// ---------------------------------------------------------------------------
 // §8 stats surface for the data-plane families
 // ---------------------------------------------------------------------------
 

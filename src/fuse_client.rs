@@ -3723,9 +3723,18 @@ impl SqueezefsFilesystem {
         }
         let cache_key = crate::keys::active_block(ino, start_block).to_string();
         let Some(buf) = self.active_block_buffers.get(&cache_key) else {
-            // No active buffer: the serve would be a tier/backend read
-            // (async). v1 keeps the fast path to active-buffer hits; the
-            // hot-tier sync serve is staged behind PR L4-7 evidence.
+            // No active buffer: try the SYNC tier serves (staging mmap
+            // ring, R4 hot tier — L4-8, the §5.5.1 tier→arena engine);
+            // anything they decline demotes to the handoff.
+            if let Some(m) = self.router.metadata_cache.get(&ino) {
+                let file_path = crate::keys::inode_path(ino);
+                if let Some(bytes) = self
+                    .router
+                    .try_read_range_sync(&file_path, &m, offset, read_len)
+                {
+                    return IpcReadProbe::Hit(bytes);
+                }
+            }
             return IpcReadProbe::Miss;
         };
         let block_start = start_block * block_size;

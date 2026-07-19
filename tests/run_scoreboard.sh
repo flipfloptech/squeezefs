@@ -248,6 +248,11 @@ REGIMES="$(env2 REGIMES "R1 R2 R3")"
 WORKLOADS="$(env2 WORKLOADS "seq_write_1m seq_read_1m rand_read_4k rand_write_4k stat_storm del_storm")"
 SYSTEMS="$(env2 SYSTEMS "sqz jfs swfs gee mps3")"
 ALLOW_LOSS="$(env2 ALLOW_LOSS "")"
+# L4-8: "il" in MODES runs the LD_PRELOAD interception pass after the main
+# grid — sqz-only, separately-labeled rows (the header charter's rule),
+# never W/L-gating, but every il row carries the charter-rule-4 ENGAGEMENT
+# check: ring ops must account for the row's ops or the run exits nonzero.
+MODES="$(env2 MODES "")"
 QUIET_LOAD="$(env2 QUIET_LOAD 2.0)"
 PORT_BASE="$(env2 PORT_BASE 53300)"
 KEEP="$(env2 KEEP 0)"
@@ -321,6 +326,16 @@ fi
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 ART="$(env2 OUT_DIR "$SUBSTRATE/artifacts/$TS")"
 ROWS_TSV="$ART/rawrows.tsv"
+IL_TSV="$ART/ilrows.tsv"
+# run_row's TSV target (the il pass redirects it; everything else in
+# run_row — snaps, durability passes, verification — is reused verbatim).
+ROWS_TSV_CUR="$ROWS_TSV"
+# Env-prefix argv for benchmark clients ("env" "LD_PRELOAD=..." when the
+# il pass is live, empty otherwise) — the PIN_ARGV pattern.
+IL_ENV=()
+IL_SO=""
+IL_ELBENCHO=""
+IL_INVALID=0
 CAPS_TSV="$ART/capabilities.tsv"
 
 # Globals initialized for set -u.
@@ -1282,7 +1297,7 @@ run_row() {
     snap "$pfx" before "$mnt" "$pid"
     pin_cmd
     rm -f "$pfx.csv"
-    timeout -k 10 "$ROW_TIMEOUT" "${PIN_ARGV[@]}" "$ELBENCHO_BIN" \
+    timeout -k 10 "$ROW_TIMEOUT" "${PIN_ARGV[@]}" "${IL_ENV[@]}" "$ELBENCHO_BIN" \
         --csvfile "$pfx.csv" --label "$rowid.$sys" "$@" \
         >"$pfx.elbencho" 2>&1
     local rc=$?
@@ -1450,13 +1465,13 @@ EOF
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$rowid" "$regime" "$wl" "relaxed" "$sys" "$unit" "$value" "$rc" "$dirty" \
         "$(echo "$devline" | tr ' ' ';')" "$(echo "$verify" | tr ' \t' ';;')" \
-        >>"$ROWS_TSV"
+        >>"$ROWS_TSV_CUR"
     # Durable row (fsync-inclusive; governs write-family verdicts).
     if [ "$block_kib" != "-1" ]; then
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$rowid" "$regime" "$wl" "durable" "$sys" "$unit" "$durable_value" "$rc" "$dirty" \
             "$(echo "$devline" | tr ' ' ';')" "$(echo "$durable_note" | tr ' \t' ';;')" \
-            >>"$ROWS_TSV"
+            >>"$ROWS_TSV_CUR"
     fi
 
     [ "$rc" -ne 0 ] && log "WARN: elbencho rc=$rc on $rowid.$sys (row recorded as-is)"
@@ -1480,7 +1495,7 @@ ensure_dataset() { # <mnt> <sys> — untimed prep when seq_write_1m isn't in the
     log "prep: creating dataset (untimed)"
     pin_cmd
     if ! timeout -k 10 $((ROW_TIMEOUT * 2)) \
-        "${PIN_ARGV[@]}" "$ELBENCHO_BIN" -w -t "$THREADS" -s "${FILE_MB}m" -b 1m \
+        "${PIN_ARGV[@]}" "${IL_ENV[@]}" "$ELBENCHO_BIN" -w -t "$THREADS" -s "${FILE_MB}m" -b 1m \
         --direct "${DATA_FILES[@]}" >"$ART/logs/prep_dataset.$RANDOM.log" 2>&1; then
         # A reference's prep failure is that reference's row, never the run's.
         [ "$sys" = "sqz" ] && die "sqz dataset prep failed"
@@ -1496,7 +1511,7 @@ ensure_tree() { # <mnt> <sys> — untimed prep for stat/del storms
     log "prep: creating tree ($((THREADS * TREE_DIRS * TREE_FILES)) files, untimed)"
     pin_cmd
     if ! timeout -k 10 $((ROW_TIMEOUT * 2)) \
-        "${PIN_ARGV[@]}" "$ELBENCHO_BIN" -w -d -t "$THREADS" -n "$TREE_DIRS" \
+        "${PIN_ARGV[@]}" "${IL_ENV[@]}" "$ELBENCHO_BIN" -w -d -t "$THREADS" -n "$TREE_DIRS" \
         -N "$TREE_FILES" -s 4k "$mnt/sbtree" >"$ART/logs/prep_tree.$RANDOM.log" 2>&1; then
         [ "$sys" = "sqz" ] && die "sqz tree prep failed"
         log "ERROR: $sys tree prep failed (row becomes n/a)"
@@ -1513,6 +1528,188 @@ prep_failed_row() { # <regime> <wl> <sys> — NA rows for a failed untimed prep
 }
 
 # run_workload <regime> <workload> <system> <mnt> <pid>
+# ---------------------------------------------------------------------------
+# L4-8 interception (il) pass — sqz-only, separately-labeled, never
+# W/L-gating; charter-rule-4 engagement enforced per row
+# (docs/design-preload-interception.md §3 rule 4, §5.8.3/§5.8.4).
+# ---------------------------------------------------------------------------
+
+il_preflight() {
+    # The shipped cdylib (sanctioned build only — Issue-4 profile law).
+    local build_cmd="cargo build -p squeezefs-preload --profile preload-release --features interposers"
+    if [ "$(id -u)" -eq 0 ] && [ -n "$RUNUSER" ] && [ "$RUNUSER" != "root" ]; then
+        su -s /bin/bash "$RUNUSER" -c "cd '$REPO_DIR' && $build_cmd" || die "il: shim build failed"
+    else
+        (cd "$REPO_DIR" && $build_cmd) || die "il: shim build failed"
+    fi
+    IL_SO="$REPO_DIR/target/preload-release/libsqueezefs_il.so"
+    [ -f "$IL_SO" ] || die "il: $IL_SO missing after build"
+    # Instrument law (the 2026-07-19 lesson): a STATICALLY linked elbencho
+    # never loads LD_PRELOAD — every il row would silently measure kernel
+    # FUSE. The pinned tools-dir binary is static; prefer it if dynamic,
+    # else fall back to a system elbencho, else refuse the pass. The
+    # substitution is STATED on the il table's instrument line.
+    IL_ELBENCHO=""
+    if ldd "$ELBENCHO_BIN" >/dev/null 2>&1; then
+        IL_ELBENCHO="$ELBENCHO_BIN"
+    elif command -v elbencho >/dev/null 2>&1 && ldd "$(command -v elbencho)" >/dev/null 2>&1; then
+        IL_ELBENCHO="$(command -v elbencho)"
+        log "il: pinned elbencho is static — il rows use $IL_ELBENCHO ($("$IL_ELBENCHO" --version 2>/dev/null | awk '/Version/{print $3; exit}')), stated per row"
+    else
+        die "il: no dynamically linked elbencho available — LD_PRELOAD cannot engage (install one)"
+    fi
+    # Dev-tree builds carry -dirty identities; the counted override is the
+    # sanctioned dev-box posture (ipc_binds_dev_override records it).
+    export SQUEEZEFS_IPC_ALLOW_DEV=1
+}
+
+il_stat() { # il_stat <snapfile> <key>
+    python3 -c "import json,sys
+try: print(json.load(open('$1'))['metrics'].get('$2',0))
+except Exception: print(0)"
+}
+
+# Engagement + counter sidecar for the il row just run by run_row.
+# INVALID (exit-nonzero class) unless ring ops cover >= half the row's
+# estimated ops — half, not exact: byte-count units and chunking make the
+# estimate a floor, and a genuinely engaged row lands far above it.
+il_engagement() { # <regime> <wl> <opkind READ|WRITE> <est_ops>
+    local regime="$1" wl="$2" opkind="$3" est="$4"
+    local pfx="$ART/rows/${regime}.${wl}.sqz"
+    local key="ipc_ops_read"
+    [ "$opkind" = "WRITE" ] && key="ipc_ops_write"
+    local d0 d1 f0 f1 h0 h1
+    d0=$(il_stat "$pfx.stats.before" "$key"); d1=$(il_stat "$pfx.stats.after" "$key")
+    f0=$(il_stat "$pfx.stats.before" ipc_fast_path_serves); f1=$(il_stat "$pfx.stats.after" ipc_fast_path_serves)
+    h0=$(il_stat "$pfx.stats.before" ipc_async_handoffs); h1=$(il_stat "$pfx.stats.after" ipc_async_handoffs)
+    local ring=$((d1 - d0)) fast=$((f1 - f0)) handoff=$((h1 - h0))
+    local refused
+    refused=$(il_stat "$pfx.stats.after" ipc_bind_refused_version)
+    {
+        echo "il-engagement: ring_${opkind}=$ring est_ops=$est fast=$fast handoff=$handoff"
+        echo "il-counters: binds=$(il_stat "$pfx.stats.after" ipc_binds) sessions=$(il_stat "$pfx.stats.after" ipc_sessions_total) refused_version=$refused rejects=$(il_stat "$pfx.stats.after" ipc_descriptor_rejects)"
+    } >>"$pfx.env"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$regime.$wl" "$opkind" "$ring" "$est" "$fast" "$handoff" >>"$ART/il_engagement.tsv"
+    if [ "$est" -gt 0 ] && [ "$ring" -lt $((est / 2)) ]; then
+        log "IL INVALID: $regime.$wl ring $key delta $ring < half of ~$est ops — shim not engaged (charter rule 4)"
+        IL_INVALID=$((IL_INVALID + 1))
+        return 1
+    fi
+    return 0
+}
+
+# One il workload row. Driver lines are §5.8.3-fixed and STATED (rail +
+# instrument) in the row sidecar: NO --iodepth anywhere (libaio is not
+# intercepted in v1 — an iodepth row measures kernel FUSE and is exactly
+# what the engagement check unmasks).
+run_il_workload() { # <ilregime IL-R1|IL-R2> <wl>
+    local regime="$1" wl="$2"
+    local mnt="$SQZ_MNT" pid="$SQZ_PID"
+    dataset_files "$mnt"
+    local rand_t=8
+    case "$regime" in IL-R2*) rand_t=256 ;; esac
+    local est=0 elapsed="$TIMELIMIT"
+    case "$wl" in
+    seq_write_1m)
+        mkdir -p "$mnt/sbdata"
+        rm -f "${DATA_FILES[@]}"
+        run_row "$regime" "$wl" "sqz" "$mnt" "$pid" WRITE "Throughput MiB/s" "MiB/s" 0 -- \
+            -w -t "$THREADS" -s "${FILE_MB}m" -b 1m --direct "${DATA_FILES[@]}"
+        # 1 MiB app writes chunk into >= 16 ring ops each (64 KiB slabs):
+        # estimate at 1 op/MiB — a hard floor.
+        est=$((DATASET_GB * 1024))
+        il_engagement "$regime" "$wl" WRITE "$est" || true
+        ;;
+    seq_read_1m)
+        ensure_dataset "$mnt" sqz || return 0
+        run_row "$regime" "$wl" "sqz" "$mnt" "$pid" READ "Throughput MiB/s" "MiB/s" -1 -- \
+            -r -t "$THREADS" -s "${FILE_MB}m" -b 1m --direct "${DATA_FILES[@]}"
+        est=$((DATASET_GB * 1024))
+        il_engagement "$regime" "$wl" READ "$est" || true
+        ;;
+    rand_read_4k)
+        ensure_dataset "$mnt" sqz || return 0
+        run_row "$regime" "$wl" "sqz" "$mnt" "$pid" READ "IOPS" "IOPS" -1 -- \
+            -r --rand -t "$rand_t" -b 4k --direct \
+            --timelimit "$TIMELIMIT" "${DATA_FILES[@]}"
+        est=$(il_row_est "$regime" "$wl")
+        il_engagement "$regime" "$wl" READ "$est" || true
+        ;;
+    rand_write_4k)
+        ensure_dataset "$mnt" sqz || return 0
+        run_row "$regime" "$wl" "sqz" "$mnt" "$pid" WRITE "IOPS" "IOPS" 4 -- \
+            -w --rand -t "$rand_t" -s "${FILE_MB}m" -b 4k --direct \
+            --timelimit "$TIMELIMIT" "${DATA_FILES[@]}"
+        est=$(il_row_est "$regime" "$wl")
+        il_engagement "$regime" "$wl" WRITE "$est" || true
+        ;;
+    stat_storm | del_storm)
+        # Metadata storms are kernel-FUSE by design (the shim intercepts
+        # DATA ops; stat/unlink are control-plane) — N/S in the il table,
+        # exactly like buffered-il semantics (unrepresentable, §5.6.1).
+        printf '%s\t%s\t%s\tNS\tsqz\tNS\tNS\t0\t-\t-\til-not-intercepted-metadata\n' \
+            "$regime.$wl" "$regime" "$wl" >>"$IL_TSV"
+        ;;
+    esac
+}
+
+# IOPS-row op estimate: value(IOPS) x the row's ACTUAL elapsed seconds
+# (both from the env sidecar run_row just wrote). Using TIMELIMIT here
+# was wrong: rows that finish dataset coverage early (rand reads on a
+# tier-resident dataset) made the estimate overshoot reality and
+# false-INVALIDed genuinely engaged rows.
+il_row_est() { # <regime> <wl>
+    awk '/rowid=/{
+        v=0; e=0
+        for (i=1;i<=NF;i++) {
+            if ($i ~ /^value=/)   { split($i,a,"="); v=a[2]+0 }
+            if ($i ~ /^elapsed=/) { split($i,a,"="); gsub(/s$/,"",a[2]); e=a[2]+0 }
+        }
+        printf "%d\n", v*e; exit
+    }' "$ART/rows/$1.$2.sqz.env" 2>/dev/null || echo 0
+}
+
+run_il_pass() {
+    log "=== interception (il) pass: sqz-only, separately-labeled, engagement-enforced ==="
+    il_preflight
+    ROWS_TSV_CUR="$IL_TSV"
+    local saved_elbencho="$ELBENCHO_BIN"
+    ELBENCHO_BIN="$IL_ELBENCHO"
+    IL_ENV=(env "LD_PRELOAD=$IL_SO" "SQUEEZEFS_IPC_ALLOW_DEV=1")
+    : >"$ART/il_engagement.tsv"
+    local ilregime wl
+    for ilregime in IL-R1 IL-R2; do
+        sqz_umount 2>/dev/null || true
+        sqz_format "il-$ilregime"
+        if [ "$ilregime" = "IL-R2" ]; then
+            sqz_mount "il-$ilregime" "$CAGE_MB" --interception -o direct_device_true
+        else
+            sqz_mount "il-$ilregime" "$CAGE_MB" --interception
+        fi
+        local il_rand_t=8
+        [ "$ilregime" = "IL-R2" ] && il_rand_t=256
+        log "il: mounted ($ilregime; rail: cpuset ${CPUSET:-none}; driver: elbencho sync positional, rand -t $il_rand_t, NO iodepth — libaio not intercepted in v1)"
+        for wl in $WORKLOADS; do
+            run_il_workload "$ilregime" "$wl"
+        done
+        # Off-rail companion (§5.8.4): the rand families once more on the
+        # full CPU set — labeled, recorded, never gating.
+        # (regime label gets an "o" suffix: IL-R1o / IL-R2o)
+        if [ -n "$CPUSET" ]; then
+            local saved_cpuset="$CPUSET"
+            CPUSET=""
+            for wl in rand_read_4k rand_write_4k; do
+                case " $WORKLOADS " in *" $wl "*) run_il_workload "${ilregime}o" "$wl" ;; esac
+            done
+            CPUSET="$saved_cpuset"
+        fi
+        sqz_umount 2>/dev/null || true
+    done
+    ROWS_TSV_CUR="$ROWS_TSV"
+    ELBENCHO_BIN="$saved_elbencho"
+    IL_ENV=()
+}
+
 run_workload() {
     local regime="$1" wl="$2" sys="$3" mnt="$4" pid="$5"
     dataset_files "$mnt"
@@ -1980,6 +2177,8 @@ main() {
         done
     done
 
+    case " $MODES " in *" il "*) run_il_pass ;; esac
+
     # -----------------------------------------------------------------------
     # Scoreboard: merge rows, compute verdicts + top-3 ranks, emit, gate.
     # -----------------------------------------------------------------------
@@ -2164,6 +2363,35 @@ if gate_fail and not smoke:
 print(f"\nGATE: {'SMOKE (not gating)' if smoke else 'GREEN — no unattributed loss rows'}")
 EOF
     local gate_rc=$?
+
+    # il table: appended to scoreboard.md from IL_TSV (separately labeled,
+    # never W/L-gating; the engagement INVALIDs gate independently below).
+    if [ -s "$IL_TSV" ]; then
+        {
+            echo ""
+            echo "## Interception (il) rows — LD_PRELOAD data plane (separately labeled, non-gating)"
+            echo ""
+            echo "Rail: cpuset ${CPUSET:-none} (rows with regime suffix 'o' = off-rail full-CPU companions, recorded never gating)."
+            echo "Drivers: elbencho sync positional; rand rows -t 8 (IL-R1 warm) / -t 256 (IL-R2 device-true); NO iodepth (libaio is not intercepted in v1 — §5.8.3)."
+            echo "Buffered-il semantics do not exist (unrepresentable — §5.6.1): N/S. Metadata storms are kernel-FUSE by design: N/S."
+            echo ""
+            echo "| row | mode | value | unit | engagement (ring/est) | fast/handoff |"
+            echo "|---|---|---|---|---|---|"
+            while IFS=$'\t' read -r rowid _ wl mode _ unit value _ _ _ note; do
+                local eng="-" fh="-"
+                if [ -f "$ART/il_engagement.tsv" ]; then
+                    eng=$(awk -F'\t' -v r="$rowid" '$1==r{print $3"/"$4; exit}' "$ART/il_engagement.tsv")
+                    fh=$(awk -F'\t' -v r="$rowid" '$1==r{print $5"/"$6; exit}' "$ART/il_engagement.tsv")
+                fi
+                echo "| $rowid | $mode | $value | $unit | ${eng:--} | ${fh:--} |"
+            done <"$IL_TSV"
+        } >>"$ART/scoreboard.md"
+        tail -n +2 "$ART/scoreboard.md" | grep -A100 "^## Interception" || true
+    fi
+    if [ "$IL_INVALID" -gt 0 ] && [ "$SMOKE" != "1" ]; then
+        log "IL GATE: FAIL — $IL_INVALID il row(s) not engaged (charter rule 4: a silent-passthrough row is unpublishable)"
+        exit 1
+    fi
 
     log "scoreboard: $ART/scoreboard.md (+ .tsv); capability ledger: $CAPS_TSV; raw rows + counter snapshots + device evidence: $ART/rows/"
     exit "$gate_rc"

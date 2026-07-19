@@ -89,16 +89,23 @@ const SERVICE_PARK_MAX: Duration = Duration::from_millis(5);
 /// Empty drain passes before the service thread starts parking.
 const SERVICE_SPIN_PASSES: u32 = 64;
 
-/// Default IPC service-thread count (§5.5.1; knob
-/// `SQUEEZEFS_IPC_SERVICE_THREADS`, clamp 1..=64).
-const SERVICE_THREADS_DEFAULT: usize = 2;
-
+/// IPC service-thread count (§5.5.1; knob
+/// `SQUEEZEFS_IPC_SERVICE_THREADS`, clamp 1..=64). Default scales with
+/// the box: `clamp(cpus/4, 2, 8)` — the 2026-07-19 sweep measured the
+/// warm il row's ceiling as exactly this count (2 threads = 643 k
+/// IOPS, 8 threads = 1.48 M on a 32-CPU box; fast-path serves execute
+/// ON these threads), and 8 saturated it.
 fn service_thread_count() -> usize {
     std::env::var("SQUEEZEFS_IPC_SERVICE_THREADS")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .map(|n| n.clamp(1, 64))
-        .unwrap_or(SERVICE_THREADS_DEFAULT)
+        .unwrap_or_else(|| {
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8);
+            (cpus / 4).clamp(2, 8)
+        })
 }
 
 /// Host configuration (mount-time; tests construct directly).

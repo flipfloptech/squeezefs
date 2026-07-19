@@ -101,21 +101,36 @@ impl Invalidator {
 /// The production [`SessionSink`]: fast path + async handoff over one
 /// filesystem instance (the same instance the FUSE session serves).
 pub struct DataPlaneSink {
-    fs: SqueezefsFilesystem,
+    /// `Arc`, not a value: `SqueezefsFilesystem::clone` deep-clones
+    /// dozens of `Arc`/moka/arc-swap fields, and the arc-swap Debt
+    /// machinery serializes globally — a per-op clone in the handoff
+    /// measured **48.9 % of daemon CPU** on the device-true row
+    /// (perf, 2026-07-19), flatlining it at ~125 k IOPS regardless of
+    /// concurrency. Handoffs clone this Arc: one refcount bump.
+    fs: Arc<SqueezefsFilesystem>,
     /// The daemon's existing runtime — handoffs ride it as ordinary
     /// tasks (G-L4-1 leg (iii) priced the wake at ~1–3 µs).
     runtime: tokio::runtime::Handle,
     /// The W1 invalidator; `None` = no kernel to invalidate (pre-L4-6
     /// callers and pure host-isolation tests).
     inval: Option<Arc<Invalidator>>,
+    /// Cached process identity for ring-op Requests (constant for the
+    /// daemon's lifetime — not two syscalls per op).
+    req_uid: u32,
+    req_gid: u32,
+    req_pid: u32,
 }
 
 impl DataPlaneSink {
     pub fn new(fs: SqueezefsFilesystem, runtime: tokio::runtime::Handle) -> Self {
         Self {
-            fs,
+            fs: Arc::new(fs),
             runtime,
             inval: None,
+            // SAFETY: plain getuid/getgid — always successful.
+            req_uid: unsafe { libc::getuid() },
+            req_gid: unsafe { libc::getgid() },
+            req_pid: std::process::id(),
         }
     }
 
@@ -129,13 +144,17 @@ impl DataPlaneSink {
         window_ms: u64,
     ) -> Self {
         Self {
-            fs,
+            fs: Arc::new(fs),
             runtime,
             inval: Some(Arc::new(Invalidator {
                 hook,
                 window: std::time::Duration::from_millis(window_ms),
                 last_write: scc::HashMap::new(),
             })),
+            // SAFETY: plain getuid/getgid — always successful.
+            req_uid: unsafe { libc::getuid() },
+            req_gid: unsafe { libc::getgid() },
+            req_pid: std::process::id(),
         }
     }
 
@@ -151,13 +170,12 @@ impl DataPlaneSink {
     /// with its own credentials — authorization already happened at the
     /// §5.2 fd screen (the kernel-granted fd is the capability), exactly
     /// like the kernel path where permission checks precede the WRITE.
-    fn ring_request() -> Request {
+    fn ring_request(&self) -> Request {
         Request {
             unique: 0,
-            // SAFETY: plain getuid/getgid — always successful.
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            pid: std::process::id(),
+            uid: self.req_uid,
+            gid: self.req_gid,
+            pid: self.req_pid,
         }
     }
 
@@ -216,7 +234,8 @@ impl DataPlaneSink {
     /// bytes into the op's validated arena window.
     fn enqueue_read(&self, op: DataOp, completion: SlotCompletion) {
         METRICS.ipc_async_handoffs.fetch_add(1, Ordering::Relaxed);
-        let fs = self.fs.clone();
+        let fs = Arc::clone(&self.fs);
+        let request = self.ring_request();
         let ino = op.binding.ino;
         let offset = op.desc.offset;
         let len = op.desc.len;
@@ -227,7 +246,7 @@ impl DataPlaneSink {
             if fs.attr_cache.get(&ino).is_none() {
                 fs.refresh_attr_cache(ino).await;
             }
-            match fs.read(Self::ring_request(), ino, 0, offset, len, 0).await {
+            match fs.read(request, ino, 0, offset, len, 0).await {
                 Ok(reply) => {
                     // Into the SNAPSHOT window (§5.3.1: bounds validated at
                     // dequeue; mid-serve descriptor mutation is inert).
@@ -255,15 +274,13 @@ impl DataPlaneSink {
         // be inert).
         let severed = bytes::Bytes::from(op.payload.read_severed());
         METRICS.ipc_async_handoffs.fetch_add(1, Ordering::Relaxed);
-        let fs = self.fs.clone();
+        let fs = Arc::clone(&self.fs);
+        let request = self.ring_request();
         let inval = self.inval.clone();
         let ino = op.binding.ino;
         let offset = op.desc.offset;
         self.runtime.spawn(async move {
-            match fs
-                .write(Self::ring_request(), ino, 0, offset, severed, 0, 0)
-                .await
-            {
+            match fs.write(request, ino, 0, offset, severed, 0, 0).await {
                 Ok(reply) => {
                     METRICS.ipc_ops_write.fetch_add(1, Ordering::Relaxed);
                     METRICS

@@ -41,9 +41,37 @@ use std::time::{Duration, Instant};
 const OP_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
 
 /// Spin iterations on the slot state word before parking (the RTT is
-/// single-digit µs on the measured rig — G-L4-1 — so the hot path
-/// normally never parks).
-const WAIT_SPINS: u32 = 4096;
+/// single-digit µs on the measured rig — G-L4-1 — so warm ops normally
+/// never park). Tunable (`SQUEEZEFS_IL_SPINS`): on handoff-heavy
+/// device-true workloads with hundreds of client threads, the spin
+/// window is pure CPU theft from the daemon — the 2026-07-19 sweep
+/// showed inverse scaling from exactly this.
+const WAIT_SPINS_DEFAULT: u32 = 4096;
+
+/// The adaptive floor: a session whose LAST op parked spins only this
+/// long before parking again (a parked op means daemon-side async work
+/// — device reads, lock waits — where the full window is CPU theft
+/// from the daemon; the 2026-07-19 device-true sweep measured the
+/// difference as 336 k → 605 k IOPS at 64 threads, with 256 the best
+/// floor: shorter floors over-park just-completing ops into futex
+/// syscalls).
+const WAIT_SPINS_PARKY: u32 = 256;
+
+/// `(spin_window, parky_floor)`. An EXPLICIT `SQUEEZEFS_IL_SPINS`
+/// pins both (the A/B lever disables adaptivity); the default pair is
+/// adaptive.
+fn wait_spins() -> (u32, u32) {
+    static SPINS: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    *SPINS.get_or_init(|| {
+        match std::env::var("SQUEEZEFS_IL_SPINS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        {
+            Some(v) => (v, v),
+            None => (WAIT_SPINS_DEFAULT, WAIT_SPINS_PARKY),
+        }
+    })
+}
 
 /// Ctl-socket receive deadline (a dead daemon must not hang a bind).
 const CTL_RECV_TIMEOUT: Duration = Duration::from_secs(10);
@@ -116,6 +144,9 @@ pub struct Session {
     ctl_fd: RawFd,
     op_timeout: Duration,
     slot_hint: AtomicU32,
+    /// Adaptive-spin hint: did this session's last completed op PARK?
+    /// (One relaxed bit — a heuristic, never a correctness input.)
+    last_parked: AtomicBool,
     poisoned: AtomicBool,
     /// Header generation observed at map time; a daemon bump = poison.
     my_generation: u64,
@@ -253,6 +284,7 @@ impl Session {
             ctl_fd: sock,
             op_timeout,
             slot_hint: AtomicU32::new(0),
+            last_parked: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
             my_generation,
         })
@@ -491,14 +523,25 @@ impl Session {
         };
         let slot = self.slot(slot_idx);
 
-        // Wait: bounded spin, then futex park with a hard deadline.
+        // Wait: bounded ADAPTIVE spin, then futex park with a hard
+        // deadline. Sessions whose last op parked spin only the short
+        // floor — full-window spinning on handoff-heavy workloads is
+        // CPU theft from the daemon (see WAIT_SPINS_PARKY).
         let deadline = Instant::now() + self.op_timeout;
-        for _ in 0..WAIT_SPINS {
+        let (window, parky) = wait_spins();
+        let spins = if self.last_parked.load(Ordering::Relaxed) {
+            parky
+        } else {
+            window
+        };
+        for _ in 0..spins {
             if slot.core.is_done_for(gen) {
+                self.last_parked.store(false, Ordering::Relaxed);
                 return self.consume(slot_idx, gen);
             }
             std::hint::spin_loop();
         }
+        self.last_parked.store(true, Ordering::Relaxed);
         loop {
             match slot.core.park_prepare() {
                 ParkOutcome::Ready => return self.consume(slot_idx, gen),

@@ -57,14 +57,35 @@ fn dev_cache() -> &'static NegativeDevCache {
     CACHE.get_or_init(NegativeDevCache::new)
 }
 
-/// Session registry: st_dev → leaked Session, slot index = the binding's
-/// `session` token. Fixed-size lock-free probes (a process talks to a
-/// handful of mounts); the CAS-insert loser's session drops (its ctl
-/// socket EOF tears the daemon side — harmless).
-const MAX_SESSIONS: usize = 16;
+/// Session registry: (st_dev, shard) → leaked Session, slot index = the
+/// binding's `session` token. Fixed-size lock-free probes (a process
+/// talks to a handful of mounts); the CAS-insert loser's session drops
+/// (its ctl socket EOF tears the daemon side — harmless).
+///
+/// **Why shards**: a session is pinned to ONE daemon service thread for
+/// life (§5.5.1 single-consumer invariant), so one session bounds a
+/// whole process to one dequeue thread — measured as the device-true
+/// plateau (~285 k IOPS flat from 64 to 256 client threads, perf
+/// showing only svc0 hot). Sharding bindings across K sessions BY FD
+/// keeps every session single-consumer while letting the daemon's
+/// admission spread them over service threads. K =
+/// `SQUEEZEFS_IL_SESSIONS` (default 4, clamp 1..=8).
+const MAX_SESSIONS: usize = 32;
+
+fn sessions_per_mount() -> usize {
+    static K: OnceLock<usize> = OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("SQUEEZEFS_IL_SESSIONS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 8))
+            .unwrap_or(4)
+    })
+}
 
 struct Registry {
-    devs: [AtomicU64; MAX_SESSIONS], // dev + 1; 0 = empty
+    devs: [AtomicU64; MAX_SESSIONS],   // dev + 1; 0 = empty
+    shards: [AtomicU64; MAX_SESSIONS], // shard index within the mount
     ptrs: [AtomicPtr<Session>; MAX_SESSIONS],
 }
 
@@ -72,15 +93,18 @@ fn registry() -> &'static Registry {
     static REG: OnceLock<Registry> = OnceLock::new();
     REG.get_or_init(|| Registry {
         devs: std::array::from_fn(|_| AtomicU64::new(0)),
+        shards: std::array::from_fn(|_| AtomicU64::new(0)),
         ptrs: std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())),
     })
 }
 
 impl Registry {
-    fn by_dev(&self, dev: u64) -> Option<(usize, &Session)> {
+    fn by_dev_shard(&self, dev: u64, shard: u64) -> Option<(usize, &Session)> {
         let tagged = dev.wrapping_add(1);
         for i in 0..MAX_SESSIONS {
-            if self.devs[i].load(Ordering::Acquire) == tagged {
+            if self.devs[i].load(Ordering::Acquire) == tagged
+                && self.shards[i].load(Ordering::Acquire) == shard
+            {
                 let p = self.ptrs[i].load(Ordering::Acquire);
                 if !p.is_null() {
                     // SAFETY: registered sessions are leaked (never freed).
@@ -104,7 +128,7 @@ impl Registry {
         }
     }
 
-    fn insert(&self, dev: u64, session: Session) -> Option<(usize, &Session)> {
+    fn insert(&self, dev: u64, shard: u64, session: Session) -> Option<(usize, &Session)> {
         let tagged = dev.wrapping_add(1);
         let boxed = Box::into_raw(Box::new(session));
         for i in 0..MAX_SESSIONS {
@@ -112,15 +136,19 @@ impl Registry {
                 .compare_exchange(0, tagged, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                self.shards[i].store(shard, Ordering::Release);
                 self.ptrs[i].store(boxed, Ordering::Release);
                 // SAFETY: just leaked; lives forever.
                 return Some((i, unsafe { &*boxed }));
             }
-            if self.devs[i].load(Ordering::Acquire) == tagged {
-                // Racing establish for the same mount: keep the winner.
-                // SAFETY: reclaiming our unpublished box.
+            if self.devs[i].load(Ordering::Acquire) == tagged
+                && self.shards[i].load(Ordering::Acquire) == shard
+                && !self.ptrs[i].load(Ordering::Acquire).is_null()
+            {
+                // Racing establish for the same (mount, shard): keep the
+                // winner. SAFETY: reclaiming our unpublished box.
                 drop(unsafe { Box::from_raw(boxed) });
-                return self.by_dev(dev);
+                return self.by_dev_shard(dev, shard);
             }
         }
         // Registry full: this mount stays passthrough (bounded, loud).
@@ -278,7 +306,9 @@ fn classify_and_bind(fd: c_int) {
         return;
     }
 
-    let session = match registry().by_dev(st.st_dev) {
+    // Shard by fd (the §5.5.1 concurrency lever — see Registry docs).
+    let shard = (fd as u64) % sessions_per_mount() as u64;
+    let session = match registry().by_dev_shard(st.st_dev, shard) {
         Some(s) => Some(s),
         None => {
             // SAFETY: fstatfs into a zeroed buf.
@@ -323,7 +353,7 @@ fn classify_and_bind(fd: c_int) {
                 return;
             }
             match Session::establish(&blob, fd, crate::BUILD_COMMIT) {
-                Ok(s) => registry().insert(st.st_dev, s),
+                Ok(s) => registry().insert(st.st_dev, shard, s),
                 Err(e) => {
                     stderr_line("squeezefs-il: session establish failed — mount passthrough\n");
                     let _ = e;

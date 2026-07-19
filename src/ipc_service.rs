@@ -1,0 +1,208 @@
+//! L4 IPC **data plane** — the daemon service sink behind the session
+//! host (`docs/design-preload-interception.md` §5.5, PR L4-4).
+//!
+//! [`DataPlaneSink`] receives validated READ/WRITE ops from the host's
+//! pinned service threads ([`crate::ipc_host`]) and serves them against
+//! the SAME daemon state kernel-FUSE requests reach — the handlers
+//! themselves, so coherence is structural, never mirrored:
+//!
+//! - **Sync read fast path (§5.5.1)**: per-inode `try_read()` (sync-
+//!   callable on the shipped `tokio::sync::RwLock<()>`), then the read
+//!   handler's guarded hit-path probe
+//!   ([`SqueezefsFilesystem::ipc_read_probe_locked`]). On a hit the bytes
+//!   memcpy into the arena and the slot completes on the service thread —
+//!   no tokio, no future, no syscall. On **lock contention** or any
+//!   **in-guard miss** the op demotes: the guard is dropped FIRST, then
+//!   the async handoff enqueues (**drop-guard-before-enqueue is
+//!   load-bearing**: tokio's `RwLock` is write-preferring/FIFO, so a
+//!   handoff re-acquiring `lock.read()` behind a queued writer while the
+//!   service thread still held its read guard would self-deadlock). The
+//!   two demotion counters split regression semantics: `lock` growth on
+//!   read-only workloads = unexpected writers; `miss` growth on warm
+//!   workloads = fast-path rot.
+//! - **Async handoff (read demotions + ALL v1 writes)**: the op packages
+//!   onto the existing runtime and runs the REAL handler
+//!   ([`fuse3::raw::Filesystem::read`] / [`Filesystem::write`]) — same
+//!   inode locks, same lease/fencing acquisition, same coverage-union
+//!   write-through, same W1 patch eligibility. Completion posts back to
+//!   the slot from the tokio worker via the [`SlotCompletion`] handle.
+//!
+//! ## Severance at dequeue (§5.5.2 / §5.3.1 rules 1–2)
+//!
+//! WRITE payloads live in **client-writable** arena memory for the whole
+//! serve. The sink severs the payload into private memory exactly once,
+//! synchronously at dequeue — before `ipc_async_handoffs` increments,
+//! before the handoff can park — so a hostile mid-serve scribble (or a
+//! benign client reusing its buffer after ack) can never alter what the
+//! daemon writes. The severed copy IS the payload source handed to the
+//! write handler (`bytes::Bytes`), entering the same severance-boundary
+//! machinery FUSE leases use. Descriptor fields were snapshot by the host
+//! drain (§5.3.1 rule 1) — the `DataOp` carries the snapshot; slot-field
+//! mutation mid-serve is inert by construction.
+
+use crate::fuse_client::{IpcReadProbe, SqueezefsFilesystem, METRICS};
+use crate::ipc_host::{DataOp, SessionSink, SlotCompletion};
+use fuse3::raw::prelude::Filesystem;
+use fuse3::raw::Request;
+use squeezefs_ipc::layout::{OP_READ, OP_WRITE};
+use std::sync::atomic::Ordering;
+
+/// The production [`SessionSink`]: fast path + async handoff over one
+/// filesystem instance (the same instance the FUSE session serves).
+pub struct DataPlaneSink {
+    fs: SqueezefsFilesystem,
+    /// The daemon's existing runtime — handoffs ride it as ordinary
+    /// tasks (G-L4-1 leg (iii) priced the wake at ~1–3 µs).
+    runtime: tokio::runtime::Handle,
+}
+
+impl DataPlaneSink {
+    pub fn new(fs: SqueezefsFilesystem, runtime: tokio::runtime::Handle) -> Self {
+        Self { fs, runtime }
+    }
+
+    /// Synthetic request identity for ring-origin ops: the daemon serves
+    /// with its own credentials — authorization already happened at the
+    /// §5.2 fd screen (the kernel-granted fd is the capability), exactly
+    /// like the kernel path where permission checks precede the WRITE.
+    fn ring_request() -> Request {
+        Request {
+            unique: 0,
+            // SAFETY: plain getuid/getgid — always successful.
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            pid: std::process::id(),
+        }
+    }
+
+    /// READ: try the §5.5.1 sync fast path, demote to the handoff on
+    /// contention or in-guard miss.
+    fn serve_read(&self, op: DataOp, completion: SlotCompletion) {
+        let ino = op.binding.ino;
+        let lock = self.fs.get_inode_lock_ref(ino);
+        match lock.try_read() {
+            Ok(guard) => {
+                let probe = self
+                    .fs
+                    .ipc_read_probe_locked(ino, op.desc.offset, op.desc.len);
+                // Drop-guard-before-enqueue (§5.5.1, load-bearing): the
+                // guard must be gone before ANY continuation — the Miss
+                // handoff re-acquires this lock behind possibly-queued
+                // writers, and even the sync completions have no business
+                // extending the critical section past the probe.
+                drop(guard);
+                match probe {
+                    IpcReadProbe::Eof => {
+                        METRICS.ipc_fast_path_serves.fetch_add(1, Ordering::Relaxed);
+                        METRICS.ipc_ops_read.fetch_add(1, Ordering::Relaxed);
+                        completion.complete(0);
+                    }
+                    IpcReadProbe::Hit(bytes) => {
+                        op.payload.write(&bytes);
+                        METRICS.ipc_fast_path_serves.fetch_add(1, Ordering::Relaxed);
+                        METRICS.ipc_ops_read.fetch_add(1, Ordering::Relaxed);
+                        METRICS
+                            .ipc_bytes_out
+                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        completion.complete(bytes.len() as i64);
+                    }
+                    IpcReadProbe::Miss => {
+                        METRICS
+                            .ipc_fast_path_miss_demotions
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.enqueue_read(op, completion);
+                    }
+                }
+            }
+            Err(_) => {
+                // A writer holds (or queues on) the inode lock: the op
+                // was about to wait anyway — demote (§5.5.1).
+                METRICS
+                    .ipc_fast_path_lock_demotions
+                    .fetch_add(1, Ordering::Relaxed);
+                self.enqueue_read(op, completion);
+            }
+        }
+    }
+
+    /// The read handoff: re-runs the FULL read handler (including its
+    /// in-guard async attr fallback) under its own guard, then posts the
+    /// bytes into the op's validated arena window.
+    fn enqueue_read(&self, op: DataOp, completion: SlotCompletion) {
+        METRICS.ipc_async_handoffs.fetch_add(1, Ordering::Relaxed);
+        let fs = self.fs.clone();
+        let ino = op.binding.ino;
+        let offset = op.desc.offset;
+        let len = op.desc.len;
+        self.runtime.spawn(async move {
+            // Re-seed a cold attr cache so warm workloads return to the
+            // sync fast path after ONE miss demotion (the handler's own
+            // fallback reads the backend but does not populate the cache).
+            if fs.attr_cache.get(&ino).is_none() {
+                fs.refresh_attr_cache(ino).await;
+            }
+            match fs.read(Self::ring_request(), ino, 0, offset, len, 0).await {
+                Ok(reply) => {
+                    // Into the SNAPSHOT window (§5.3.1: bounds validated at
+                    // dequeue; mid-serve descriptor mutation is inert).
+                    op.payload.write(&reply.data);
+                    METRICS.ipc_ops_read.fetch_add(1, Ordering::Relaxed);
+                    METRICS
+                        .ipc_bytes_out
+                        .fetch_add(reply.data.len() as u64, Ordering::Relaxed);
+                    completion.complete(reply.data.len() as i64);
+                }
+                Err(errno) => {
+                    completion.complete(i64::from(libc::c_int::from(errno)));
+                }
+            }
+        });
+    }
+
+    /// WRITE (all writes are handoffs in v1 — OQ-3 decides a sync write
+    /// fast path by measurement): sever at dequeue, then run the real
+    /// write handler with the severed copy as its payload source.
+    fn serve_write(&self, op: DataOp, completion: SlotCompletion) {
+        // §5.5.2 severance — the ONE arena read, on the service thread,
+        // BEFORE the handoff counter increments (tests park the handoff
+        // behind a held writer and scribble the arena: the scribble must
+        // be inert).
+        let severed = bytes::Bytes::from(op.payload.read_severed());
+        METRICS.ipc_async_handoffs.fetch_add(1, Ordering::Relaxed);
+        let fs = self.fs.clone();
+        let ino = op.binding.ino;
+        let offset = op.desc.offset;
+        self.runtime.spawn(async move {
+            match fs
+                .write(Self::ring_request(), ino, 0, offset, severed, 0, 0)
+                .await
+            {
+                Ok(reply) => {
+                    METRICS.ipc_ops_write.fetch_add(1, Ordering::Relaxed);
+                    METRICS
+                        .ipc_bytes_in
+                        .fetch_add(u64::from(reply.written), Ordering::Relaxed);
+                    completion.complete(i64::from(reply.written));
+                }
+                Err(errno) => {
+                    completion.complete(i64::from(libc::c_int::from(errno)));
+                }
+            }
+        });
+    }
+}
+
+impl SessionSink for DataPlaneSink {
+    fn serve_data(&self, op: DataOp, completion: SlotCompletion) {
+        match op.desc.op {
+            OP_READ => self.serve_read(op, completion),
+            OP_WRITE => self.serve_write(op, completion),
+            // The host validated the op code; anything else here is a
+            // daemon bug — complete EINVAL loudly rather than strand.
+            other => {
+                log::error!("ipc data plane: unexpected op code {other} reached the sink");
+                completion.complete(-libc::EINVAL as i64);
+            }
+        }
+    }
+}

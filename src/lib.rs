@@ -20,6 +20,7 @@ pub(crate) mod gauge_core;
 pub mod health;
 pub(crate) mod incarnation_core;
 pub mod ipc_host;
+pub mod ipc_service;
 pub mod meta_backend;
 pub mod nvmeof;
 pub mod p2p;

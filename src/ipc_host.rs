@@ -89,6 +89,18 @@ const SERVICE_PARK_MAX: Duration = Duration::from_millis(5);
 /// Empty drain passes before the service thread starts parking.
 const SERVICE_SPIN_PASSES: u32 = 64;
 
+/// Default IPC service-thread count (§5.5.1; knob
+/// `SQUEEZEFS_IPC_SERVICE_THREADS`, clamp 1..=64).
+const SERVICE_THREADS_DEFAULT: usize = 2;
+
+fn service_thread_count() -> usize {
+    std::env::var("SQUEEZEFS_IPC_SERVICE_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(1, 64))
+        .unwrap_or(SERVICE_THREADS_DEFAULT)
+}
+
 /// Host configuration (mount-time; tests construct directly).
 #[derive(Debug, Clone)]
 pub struct IpcHostConfig {
@@ -128,24 +140,58 @@ pub struct DataOp {
     pub payload: ArenaWindow,
 }
 
-/// The data-plane sink: receives validated READ/WRITE ops from the drain.
-/// PR L4-3 ships only [`EchoSessionSink`] (no data plane — completes
-/// `-ENOSYS`); PR L4-4's service sink runs the tier-hit fast path + async
-/// handoff.
-pub trait SessionSink: Send + Sync + 'static {
-    /// Serve one op; the returned value completes the slot (`bytes` or
-    /// `-errno`).
-    fn serve_data(&self, op: DataOp) -> i64;
+/// The completion handle for one dequeued op (PR L4-4): owns everything
+/// needed to publish the result from **any** thread — the sync fast path
+/// completes it on the service thread, the async handoff from a tokio
+/// worker after the parked handler finishes. The embedded mapping `Arc`
+/// keeps the shm alive until the completion lands (§5.3.1 rule 4:
+/// teardown's `munmap` is ordered after the last accessor structurally),
+/// so a completion racing session teardown writes into live private
+/// memory, never a freed mapping.
+pub struct SlotCompletion {
+    map: Arc<SessionMapping>,
+    slot_index: u32,
 }
 
-/// The PR L4-3 sink: session host only, **no data plane** — every
-/// correctly-directed READ/WRITE completes `-ENOSYS` until PR L4-4.
+impl SlotCompletion {
+    /// Publish `result` (`bytes` or `-errno`) and wake a parked client.
+    /// Consumes the handle: exactly one completion per dequeued op.
+    pub fn complete(self, result: i64) {
+        let slot = self
+            .map
+            .slot(self.slot_index)
+            .expect("slot index validated at dequeue");
+        slot.set_result(result);
+        if slot.core.complete() {
+            // A client parked on this slot's state word: wake it
+            // (cross-process futex — never FUTEX_PRIVATE).
+            futex_wake(slot.core.state_futex_word(), 1);
+        }
+    }
+}
+
+/// The data-plane sink: receives validated READ/WRITE ops from the drain,
+/// each with its [`SlotCompletion`]. The sink decides *where* the op
+/// completes — synchronously on the service thread (the §5.5.1 fast path)
+/// or from an async handoff — which is why the handle model replaced the
+/// L4-3 return-value contract. [`EchoSessionSink`] completes `-ENOSYS`
+/// inline; [`crate::ipc_service::DataPlaneSink`] serves for real.
+pub trait SessionSink: Send + Sync + 'static {
+    /// Serve one op; `completion` must be completed exactly once (`bytes`
+    /// or `-errno`), from any thread.
+    fn serve_data(&self, op: DataOp, completion: SlotCompletion);
+}
+
+/// The no-data-plane sink: every correctly-directed READ/WRITE completes
+/// `-ENOSYS`. Kept as the host-isolation test sink (`tests/
+/// ipc_host_tests.rs` exercises the §5.2 control plane without a
+/// filesystem); production mounts wire `DataPlaneSink`.
 #[derive(Debug, Default)]
 pub struct EchoSessionSink;
 
 impl SessionSink for EchoSessionSink {
-    fn serve_data(&self, _op: DataOp) -> i64 {
-        -libc::ENOSYS as i64
+    fn serve_data(&self, _op: DataOp, completion: SlotCompletion) {
+        completion.complete(-libc::ENOSYS as i64);
     }
 }
 
@@ -283,6 +329,11 @@ impl Drop for SessionMapping {
 struct IpcSession {
     id: u64,
     uid: u32,
+    /// The §5.5.1 session-ownership invariant: pinned to exactly ONE
+    /// service thread at admission, for the session's whole lifetime (the
+    /// `ipc_ring_core` single-consumer precondition). No drain handoff, no
+    /// live rebalance — new sessions admit to the lightest thread.
+    owner: usize,
     map: Arc<SessionMapping>,
     /// Session shm footprint charged to the gauge (the full mapping —
     /// header + rings + slots + stats + arena).
@@ -291,8 +342,8 @@ struct IpcSession {
     /// read by the service thread — latch-free (`scc`).
     bindings: scc::HashMap<u64, BindingRights>,
     /// The single consumer cursor (daemon-private on purpose — §5.3.2
-    /// single-consumer precondition). Only the service thread locks it;
-    /// PR L4-4's pinned service threads own it directly.
+    /// single-consumer precondition). Only the owning service thread
+    /// locks it (the mutex documents exclusivity; it is never contended).
     consumer: Mutex<RingConsumer>,
     /// Ctl socket (service side keeps it only to shut it down at
     /// teardown/poison; the ctl thread owns the I/O).
@@ -331,21 +382,27 @@ impl IpcSession {
             // THE one linearization read of the descriptor (§5.3.1 rule 1):
             // validate the copy, serve from the copy, never re-read.
             let desc = slot.snapshot_descriptor();
-            let result = self.serve_validated(&desc, sink);
-            slot.set_result(result);
-            if slot.core.complete() {
-                // A client parked on this slot's state word: wake it
-                // (cross-process futex — never FUTEX_PRIVATE).
-                futex_wake(slot.core.state_futex_word(), 1);
-            }
+            let completion = SlotCompletion {
+                map: Arc::clone(&self.map),
+                slot_index: index,
+            };
+            self.serve_validated(&desc, sink, completion);
             served += 1;
         }
         Some(served)
     }
 
-    /// Validate a snapshot against daemon-owned state and serve it
-    /// (§5.3 protocol rule 4: nothing in shm is trusted).
-    fn serve_validated(&self, desc: &SlotDescriptor, sink: &Arc<dyn SessionSink>) -> i64 {
+    /// Validate a snapshot against daemon-owned state and dispatch it
+    /// (§5.3 protocol rule 4: nothing in shm is trusted). Every path —
+    /// reject, ECHO, sink — completes `completion` exactly once; rejects
+    /// and ECHO complete inline, valid READ/WRITE ops hand the completion
+    /// to the sink (which may complete synchronously or from a handoff).
+    fn serve_validated(
+        &self,
+        desc: &SlotDescriptor,
+        sink: &Arc<dyn SessionSink>,
+        completion: SlotCompletion,
+    ) {
         let reject = |why: &str| -> i64 {
             METRICS
                 .ipc_descriptor_rejects
@@ -363,16 +420,16 @@ impl IpcSession {
             -libc::EINVAL as i64
         };
         if !matches!(desc.op, OP_ECHO | OP_READ | OP_WRITE) {
-            return reject("unknown op");
+            return completion.complete(reject("unknown op"));
         }
         let Some(binding) = self.bindings.read_sync(&desc.binding, |_, b| *b) else {
-            return reject("dead binding id");
+            return completion.complete(reject("dead binding id"));
         };
         if desc.len > self.map.geometry.max_op_bytes {
-            return reject("len exceeds max_op_bytes");
+            return completion.complete(reject("len exceeds max_op_bytes"));
         }
         let Some(payload) = self.map.arena_window(desc.arena_off, desc.len) else {
-            return reject("arena bounds violation");
+            return completion.complete(reject("arena bounds violation"));
         };
         // Per-op rights, both directions (§5.2 screen rule 3): EBADF like
         // the kernel's wrong-direction op on that fd. Counted as
@@ -382,13 +439,13 @@ impl IpcSession {
                 METRICS
                     .ipc_descriptor_rejects
                     .fetch_add(1, Ordering::Relaxed);
-                return -libc::EBADF as i64;
+                return completion.complete(-libc::EBADF as i64);
             }
             OP_WRITE if !binding.write_ok => {
                 METRICS
                     .ipc_descriptor_rejects
                     .fetch_add(1, Ordering::Relaxed);
-                return -libc::EBADF as i64;
+                return completion.complete(-libc::EBADF as i64);
             }
             _ => {}
         }
@@ -401,13 +458,16 @@ impl IpcSession {
             let sum: i64 = severed.iter().map(|b| i64::from(*b)).sum();
             let inverted: Vec<u8> = severed.iter().map(|b| !*b).collect();
             payload.write(&inverted);
-            return sum;
+            return completion.complete(sum);
         }
-        sink.serve_data(DataOp {
-            desc: *desc,
-            binding,
-            payload,
-        })
+        sink.serve_data(
+            DataOp {
+                desc: *desc,
+                binding,
+                payload,
+            },
+            completion,
+        );
     }
 }
 
@@ -475,6 +535,9 @@ pub struct IpcHost {
     uid_sessions: Mutex<HashMap<u32, usize>>,
     next_session_id: AtomicU64,
     next_binding_id: AtomicU64,
+    /// Pinned service-thread count (§5.5.1) — sessions are assigned an
+    /// owner index in `0..service_threads` at admission, forever.
+    service_threads: usize,
     shutting_down: AtomicBool,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
@@ -490,6 +553,7 @@ impl IpcHost {
         SessionLayout::compute(&cfg.geometry)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         let listener_fd = abstract_listen(&cfg.socket_name)?;
+        let service_threads = service_thread_count();
         let host = Arc::new(Self {
             cfg,
             sink,
@@ -502,22 +566,31 @@ impl IpcHost {
             uid_sessions: Mutex::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
             next_binding_id: AtomicU64::new(1),
+            service_threads,
             shutting_down: AtomicBool::new(false),
             threads: Mutex::new(Vec::new()),
         });
+        METRICS
+            .ipc_service_threads
+            .store(service_threads as u64, Ordering::Relaxed);
 
         let accept_host = Arc::clone(&host);
         let accept = std::thread::Builder::new()
             .name("sqz-ipc-accept".into())
             .spawn(move || accept_host.accept_loop())?;
-        let drain_host = Arc::clone(&host);
-        let drain = std::thread::Builder::new()
-            .name("sqz-ipc-drain".into())
-            .spawn(move || drain_host.drain_loop())?;
+        let mut spawned = vec![accept];
+        for idx in 0..service_threads {
+            let service_host = Arc::clone(&host);
+            spawned.push(
+                std::thread::Builder::new()
+                    .name(format!("sqz-ipc-svc{idx}"))
+                    .spawn(move || service_host.service_loop(idx))?,
+            );
+        }
         host.threads
             .lock()
             .expect("thread registry mutex never poisons")
-            .extend([accept, drain]);
+            .extend(spawned);
         Ok(host)
     }
 
@@ -847,9 +920,28 @@ impl IpcHost {
                 return refuse(RefuseClass::Internal);
             }
         };
+        // §5.5.1 pinning: admit to the lightest service thread (live
+        // sessions never rebalance — natural churn is the only mover).
+        let owner = {
+            let sessions = self
+                .sessions
+                .lock()
+                .expect("session registry mutex never poisons");
+            let mut counts = vec![0usize; self.service_threads];
+            for s in sessions.values() {
+                counts[s.owner] += 1;
+            }
+            counts
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, n)| **n)
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        };
         let session = Arc::new(IpcSession {
             id: self.next_session_id.fetch_add(1, Ordering::Relaxed),
             uid: cred.uid,
+            owner,
             map: Arc::new(map),
             charged_bytes: footprint,
             bindings: scc::HashMap::new(),
@@ -1003,11 +1095,12 @@ impl IpcHost {
     }
 
     // ---------------------------------------------------------------
-    // drain (ECHO liveness + sink handoff; PR L4-4 replaces this loop
-    // with pinned per-session service threads)
+    // service threads (§5.5.1): each drains ITS pinned sessions —
+    // validation + ECHO inline, READ/WRITE through the sink (fast path
+    // or async handoff; PR L4-4)
     // ---------------------------------------------------------------
 
-    fn drain_loop(self: Arc<Self>) {
+    fn service_loop(self: Arc<Self>, idx: usize) {
         let mut empty_passes = 0u32;
         while !self.shutting_down.load(Ordering::SeqCst) {
             let sessions: Vec<Arc<IpcSession>> = self
@@ -1015,6 +1108,7 @@ impl IpcHost {
                 .lock()
                 .expect("session registry mutex never poisons")
                 .values()
+                .filter(|s| s.owner == idx)
                 .cloned()
                 .collect();
             let mut served = 0u32;
@@ -1033,14 +1127,13 @@ impl IpcHost {
                 std::hint::spin_loop();
                 continue;
             }
-            // Park (bounded — §5.3.1 rule 5). L4-3 posture: set every
-            // owned session's parked flag, re-scan (the disarm→scan law:
-            // a submission published before the flag was visible is found
-            // by this scan; one published after sees the flag and wakes),
-            // then FUTEX_WAIT on the FIRST session's doorbell with a hard
-            // timeout. Wakes on other sessions' doorbells are absorbed by
-            // the timeout — bounded latency, never stranding. PR L4-4's
-            // pinned per-session service threads replace this rotation.
+            // Park (bounded — §5.3.1 rule 5): set every owned session's
+            // parked flag, re-scan (the disarm→scan law: a submission
+            // published before the flag was visible is found by this
+            // scan; one published after sees the flag and wakes), then
+            // FUTEX_WAIT on the FIRST owned session's doorbell with a
+            // hard timeout. Wakes on other sessions' doorbells are
+            // absorbed by the timeout — bounded latency, never stranding.
             for s in &sessions {
                 s.map.header().daemon_parked.store(1, Ordering::SeqCst);
             }

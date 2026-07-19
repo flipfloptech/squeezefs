@@ -2066,6 +2066,30 @@ pub struct Metrics {
     /// Sessions poisoned for protocol violations (§5.3 rule 4 / §5.7) —
     /// **must stay 0 in production**; one loud log line per poison.
     pub ipc_sessions_poisoned: Align64<AtomicU64>,
+    /// L4 data plane (design-preload-interception §8, PR L4-4 families).
+    /// Ring reads/writes SERVED (fast path + handoff; rejects excluded) —
+    /// the §3 charter-rule-4 engagement instrument: an interception
+    /// scoreboard row is INVALID unless these ≈ the row's ops.
+    pub ipc_ops_read: Align64<AtomicU64>,
+    pub ipc_ops_write: Align64<AtomicU64>,
+    /// Payload bytes accepted from ring writes (severed at dequeue).
+    pub ipc_bytes_in: Align64<AtomicU64>,
+    /// Payload bytes returned to ring reads.
+    pub ipc_bytes_out: Align64<AtomicU64>,
+    /// Reads completed synchronously on the service thread (the §5.5.1
+    /// fast path incl. the EOF short-circuit) — the 1 M+ engine gauge.
+    pub ipc_fast_path_serves: Align64<AtomicU64>,
+    /// Ops packaged onto the tokio runtime (read demotions + all v1
+    /// writes). For writes this increments AFTER the §5.5.2 severance.
+    pub ipc_async_handoffs: Align64<AtomicU64>,
+    /// Fast-path `try_read()` contention demotions — growth on read-only
+    /// workloads = unexpected writers (§5.5.1 counter split).
+    pub ipc_fast_path_lock_demotions: Align64<AtomicU64>,
+    /// Fast-path in-guard cache-miss demotions (attr/metadata/buffer) —
+    /// growth on warm workloads = fast-path rot.
+    pub ipc_fast_path_miss_demotions: Align64<AtomicU64>,
+    /// Gauge: pinned IPC service threads (`SQUEEZEFS_IPC_SERVICE_THREADS`).
+    pub ipc_service_threads: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -2278,6 +2302,23 @@ pub struct TeardownFlushSummary {
     pub failed: usize,
     /// First few failure reasons (bounded) for the aggregated log line.
     pub error_samples: Vec<String>,
+}
+
+/// Outcome of the IPC read fast-path's guarded probe
+/// ([`SqueezefsFilesystem::ipc_read_probe_locked`], §5.5.1 of the L4
+/// design): the caller (the IPC service thread, holding the inode
+/// `try_read` guard) serves `Eof`/`Hit` synchronously and demotes `Miss`
+/// to the async handoff — guard dropped first (the
+/// drop-guard-before-enqueue rule).
+pub enum IpcReadProbe {
+    /// `offset ≥ size` under the guarded size authority: complete 0 bytes.
+    Eof,
+    /// Sync-servable bytes (active-buffer covered hit) — a CoW-stable
+    /// snapshot slice, immutable for the completion's lifetime.
+    Hit(bytes::Bytes),
+    /// Any shape needing async work: demote (release the guard, then
+    /// enqueue the handoff — never the reverse order).
+    Miss,
 }
 
 pub struct SqueezefsFilesystem {
@@ -3196,6 +3237,18 @@ impl SqueezefsFilesystem {
                 "ipc_arena_bytes": METRICS.ipc_arena_bytes.load(Ordering::Relaxed),
                 "ipc_descriptor_rejects": METRICS.ipc_descriptor_rejects.load(Ordering::Relaxed),
                 "ipc_sessions_poisoned": METRICS.ipc_sessions_poisoned.load(Ordering::Relaxed),
+                // L4 data plane (§8, PR L4-4): ops/bytes are the charter-
+                // rule-4 engagement instrument; the serve/demote split is
+                // the fast-path health signal.
+                "ipc_ops_read": METRICS.ipc_ops_read.load(Ordering::Relaxed),
+                "ipc_ops_write": METRICS.ipc_ops_write.load(Ordering::Relaxed),
+                "ipc_bytes_in": METRICS.ipc_bytes_in.load(Ordering::Relaxed),
+                "ipc_bytes_out": METRICS.ipc_bytes_out.load(Ordering::Relaxed),
+                "ipc_fast_path_serves": METRICS.ipc_fast_path_serves.load(Ordering::Relaxed),
+                "ipc_async_handoffs": METRICS.ipc_async_handoffs.load(Ordering::Relaxed),
+                "ipc_fast_path_lock_demotions": METRICS.ipc_fast_path_lock_demotions.load(Ordering::Relaxed),
+                "ipc_fast_path_miss_demotions": METRICS.ipc_fast_path_miss_demotions.load(Ordering::Relaxed),
+                "ipc_service_threads": METRICS.ipc_service_threads.load(Ordering::Relaxed),
                 "write_lock_wait": METRICS.write_lock_wait.to_json(),
                 "block_lock_wait": METRICS.block_lock_wait.to_json(),
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),
@@ -3614,6 +3667,69 @@ impl SqueezefsFilesystem {
 
     pub fn get_inode_lock_ref(&self, ino: u64) -> &tokio::sync::RwLock<()> {
         self.active_inode_locks.get_inode_lock(ino)
+    }
+
+    /// PR L4-4 (§5.5.1): the read handler's guarded **hit-path** probe
+    /// sequence, factored for the IPC sync fast path. MUST be called with
+    /// this inode's read guard held (the service thread's `try_read()`).
+    ///
+    /// Mirrors the short critical section at the top of [`Filesystem::
+    /// read`] — attr-cache size, `metadata_cache` size override (the
+    /// load-bearing stale-size guard), EOF bound, single-block
+    /// active-buffer probe — but **synchronously only**: every shape whose
+    /// serve needs an await (the in-guard attr fallback, multi-block,
+    /// extent overlays, deferred seeds, backend/tier reads) reports
+    /// [`IpcReadProbe::Miss`], and the caller demotes per the
+    /// drop-guard-before-enqueue rule. Behavior parity with the handler on
+    /// the shapes it does serve is pinned by `tests/preload_parity_tests.rs`.
+    pub fn ipc_read_probe_locked(&self, ino: u64, offset: u64, size: u32) -> IpcReadProbe {
+        // Attr-cache size — a miss would need the handler's async
+        // `backend.getattr` fallback, unreachable from a sync service
+        // thread: demote (§5.5.1 normative rule).
+        let mut file_size = match self.attr_cache.get(&ino) {
+            Some((attr, _)) => attr.size,
+            None => return IpcReadProbe::Miss,
+        };
+        // Size coherency override (same rationale as the handler): the
+        // router metadata cache is updated synchronously by the write
+        // path; the durable attr caches can lag a just-committed write.
+        if let Some(m) = self.router.metadata_cache.get(&ino) {
+            file_size = m.size;
+        }
+        if offset >= file_size {
+            return IpcReadProbe::Eof;
+        }
+        let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        let start_block = offset / block_size;
+        let end_block = (offset + read_len as u64 - 1) / block_size;
+        if start_block != end_block {
+            // Multi-block reads flush dirty active blocks first (async).
+            return IpcReadProbe::Miss;
+        }
+        let cache_key = crate::keys::active_block(ino, start_block).to_string();
+        let Some(buf) = self.active_block_buffers.get(&cache_key) else {
+            // No active buffer: the serve would be a tier/backend read
+            // (async). v1 keeps the fast path to active-buffer hits; the
+            // hot-tier sync serve is staged behind PR L4-7 evidence.
+            return IpcReadProbe::Miss;
+        };
+        let block_start = start_block * block_size;
+        let rel_offset = (offset - block_start) as usize;
+        let rel_end = rel_offset + read_len;
+        // Extent overlays may owe a base read; uncovered ranges owe
+        // zeros-composition or a materializing fetch — handler business,
+        // not sync-servable. A fully-covered range is servable from the
+        // snapshot regardless of seed deferral (exactly the handler's
+        // `contained` branch: covered runs never overlap the owed gaps).
+        if buf.value().is_extent_repr() || !buf.value().covered_contains(rel_offset, rel_end) {
+            return IpcReadProbe::Miss;
+        }
+        // The handler's common case: zero-copy CoW-stable snapshot slice
+        // (immutable for the reply's lifetime — a later write copies).
+        let snapshot = buf.value().snapshot();
+        drop(buf);
+        IpcReadProbe::Hit(snapshot.slice(rel_offset..rel_end))
     }
 
     /// Write/refresh this client's mount registration (`client:{id}` xattr on the
@@ -6327,7 +6443,11 @@ impl SqueezefsFilesystem {
     /// could regress on the next real fetch).
     ///
     /// Failure degrades to the pre-M5 invalidate (next getattr refetches).
-    async fn refresh_attr_cache(&self, ino: u64) {
+    ///
+    /// `pub(crate)`: the IPC read handoff (`crate::ipc_service`) re-seeds
+    /// a cold attr cache with it so warm workloads return to the §5.5.1
+    /// sync fast path after one miss demotion.
+    pub(crate) async fn refresh_attr_cache(&self, ino: u64) {
         let Some(backend) = self.meta_backend.as_ref() else {
             self.attr_cache.invalidate(&ino);
             return;
@@ -10260,10 +10380,14 @@ pub async fn start_mount<P: AsRef<Path>>(
             arena_cap_bytes,
             per_uid_session_cap: 64,
         };
-        match crate::ipc_host::IpcHost::spawn(
-            cfg,
-            std::sync::Arc::new(crate::ipc_host::EchoSessionSink),
-        ) {
+        // PR L4-4: the real data plane — fast path + async handoff over
+        // THIS filesystem instance (the same daemon state kernel requests
+        // reach; coherence is structural, §5.6.2).
+        let sink = std::sync::Arc::new(crate::ipc_service::DataPlaneSink::new(
+            fs.clone(),
+            tokio::runtime::Handle::current(),
+        ));
+        match crate::ipc_host::IpcHost::spawn(cfg, sink) {
             Ok(host) => {
                 crate::mem_budget::register_ipc_session_arena_component(
                     &crate::mem_budget::MEM_BUDGET,

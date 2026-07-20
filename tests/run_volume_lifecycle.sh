@@ -51,6 +51,28 @@ set -euo pipefail
 #     favor the emptier volume (`backend_placement_picks` deltas — the
 #     stats instrument, house pattern). No rebalance job anywhere.
 #
+#   Leg 9 (mount, VL5b): meta add — format 2 meta volumes W=8
+#     (--meta-slots), mount, dataset + checksum manifest + INO manifest,
+#     unmount, OFFLINE `volume add-meta` of a third member taking 2
+#     slots (KD-8 barrier + generation restamp inside), remount on the
+#     3-member URI: manifest byte-identical, every st_ino stable, the
+#     old 2-member URI refuses loud.
+#
+#   Leg 10 (mount, VL5b): meta remove — continue from leg 9's set,
+#     OFFLINE `volume remove-meta` of the added member (slots migrate
+#     back to survivors, victim tombstones), remount on the survivor
+#     URI: manifest byte-identical, inos stable, victim-listed URI
+#     refuses loud.
+#
+#   Leg 11 (mount, VL5b, LOOPS=${LOOPS:-3}): kill-9 during slot
+#     migration — start an offline add-meta coordinator, kill -9 at a
+#     randomized point (§5.5.2b crash windows sampled), re-run the SAME
+#     add-meta (idempotent convergence), remount, manifest
+#     byte-identical + inos stable. Plus the ONLINE cutover-window
+#     measurement: `volume migrate-meta-slot` on a live mount under
+#     concurrent load; `meta_slot_cutover_ms_max` is PRINTED (the
+#     G-VL-4 p99 < 250 ms gate number is recorded, not enforced here).
+#
 # Unprivileged posture (the preload-gate precedent): file-backed volumes
 # + a user-owned mountpoint; root is NOT required.
 #
@@ -581,6 +603,185 @@ python3 -c "import sys; sys.exit(0 if float('$SPREAD_AFTER') < float('$SPREAD_BE
 do_unmount
 echo "OK: leg 8 (placement: spread $SPREAD_BEFORE -> $SPREAD_AFTER, picks oss1 +$D1 / oss2 +$D2)"
 
+# ---------------------------------------------------------------------------
+# VL5b meta-set helpers (legs 9–11)
+# ---------------------------------------------------------------------------
+
+# Mount helper for an explicit sqmeta:// URI (the meta legs swap URIs).
+do_mount_uri() { # do_mount_uri <sqmeta-uri>
+    RUST_LOG=info "$BIN" mount "$1" "$MNT" >>"$LOG" 2>&1 &
+    MOUNT_PID=$!
+    local deadline=$((SECONDS + 90))
+    until cat "$MNT/.stats" &>/dev/null; do
+        [ $SECONDS -lt $deadline ] || { tail -50 "$LOG" >&2; fail "mount did not become ready in 90s"; }
+        kill -0 "$MOUNT_PID" 2>/dev/null || { tail -50 "$LOG" >&2; fail "mount daemon exited"; }
+        sleep 0.25
+    done
+}
+
+# Record `name -> st_ino` for every dataset file (the ino-stability
+# instrument: global inos are eternally stable across meta set changes).
+ino_manifest() { # ino_manifest <out-file>
+    (cd "$MNT" && find dataset -type f -exec stat -c '%n %i' {} + | sort) >"$1"
+}
+
+# Fresh 2-meta-volume W=8 rig with a dataset; sets RIG/MNT/LOG and the
+# manifests at $RIG/manifest.sha256 + $RIG/inos.before.
+fresh_meta_rig() { # fresh_meta_rig <name>
+    RIG="$BASE/$1"
+    MNT="$BASE/$1_mnt"
+    LOG="$RIG/mount.log"
+    mkdir -p "$RIG/staging" "$MNT"
+    truncate -s 256M "$RIG/meta1"
+    truncate -s 256M "$RIG/meta2"
+    truncate -s 2G   "$RIG/oss1"
+    "$BIN" format "sqmeta://$RIG/meta1,$RIG/meta2" "sqdata://$RIG/oss1" \
+        --disk-cache-paths "$RIG/staging" --meta-slots 8 --force >/dev/null
+    do_mount_uri "sqmeta://$RIG/meta1,$RIG/meta2"
+    mkdir -p "$MNT/dataset"
+    for d in 0 1 2 3; do
+        mkdir -p "$MNT/dataset/d$d"
+        for i in $(seq 1 6); do
+            dd if=/dev/urandom of="$MNT/dataset/d$d/f$i.bin" bs=256K count=1 status=none
+            setfattr -n user.tag -v "d${d}f${i}" "$MNT/dataset/d$d/f$i.bin" 2>/dev/null || true
+        done
+    done
+    sync -f "$MNT"
+    (cd "$MNT" && find dataset -type f -exec sha256sum {} + | sort) >"$RIG/manifest.sha256"
+    ino_manifest "$RIG/inos.before"
+}
+
+verify_meta_manifest() { # verify_meta_manifest <who>
+    (cd "$MNT" && sha256sum -c "$RIG/manifest.sha256" --quiet) \
+        || fail "$1: dataset manifest mismatch (ZERO-LOSS violated)"
+    ino_manifest "$RIG/inos.after"
+    diff -u "$RIG/inos.before" "$RIG/inos.after" >/dev/null \
+        || fail "$1: st_ino instability across the meta set change (KD-7 violated)"
+}
+
+# ---------------------------------------------------------------------------
+# Leg 9 (VL5b): offline add-meta — manifest + ino stability + URI refusals
+# ---------------------------------------------------------------------------
+note "Leg 9: meta add (offline add-meta, W=8, --take-slots 2)"
+
+fresh_meta_rig "metaadd"
+do_unmount
+
+truncate -s 256M "$RIG/meta3"
+ADD_OUT="$(retry_guarded 90 "$BIN" volume add-meta "sqmeta://$RIG/meta1,$RIG/meta2" \
+    "$RIG/meta3" --take-slots 2)" \
+    || fail "volume add-meta kept refusing after the staleness TTL"
+echo "$ADD_OUT" | grep -qi "hosting slot" || fail "add-meta must print the taken slots: $ADD_OUT"
+
+# The old 2-member URI now refuses loud (stamps declare 3 members).
+if "$BIN" volume list "sqmeta://$RIG/meta1,$RIG/meta2" --json 2>"$RIG/old_uri.err"; then
+    fail "the shrunken URI must refuse after add-meta"
+fi
+
+do_mount_uri "sqmeta://$RIG/meta1,$RIG/meta2,$RIG/meta3"
+verify_meta_manifest "leg 9"
+# New writes still work on the migrated map (mints ride the travelling
+# cursors — collisions would surface as EEXIST/corruption here).
+dd if=/dev/urandom of="$MNT/dataset/post_add.bin" bs=256K count=1 status=none
+sync -f "$MNT"
+do_unmount
+echo "OK: leg 9 (add-meta: manifest byte-identical, inos stable, old URI refused)"
+
+# ---------------------------------------------------------------------------
+# Leg 10 (VL5b): offline remove-meta — survivors serve, victim tombstones
+# ---------------------------------------------------------------------------
+note "Leg 10: meta remove (offline remove-meta of the added member)"
+
+# Refresh the manifests to include post_add.bin.
+do_mount_uri "sqmeta://$RIG/meta1,$RIG/meta2,$RIG/meta3"
+(cd "$MNT" && find dataset -type f -exec sha256sum {} + | sort) >"$RIG/manifest.sha256"
+ino_manifest "$RIG/inos.before"
+do_unmount
+
+retry_guarded 90 "$BIN" volume remove-meta \
+    "sqmeta://$RIG/meta1,$RIG/meta2,$RIG/meta3" "$RIG/meta3" >/dev/null \
+    || fail "volume remove-meta kept refusing after the staleness TTL"
+
+# Listing the tombstoned victim refuses loud.
+if "$BIN" volume list "sqmeta://$RIG/meta1,$RIG/meta2,$RIG/meta3" --json 2>"$RIG/victim.err"; then
+    fail "a victim-listed URI must refuse after remove-meta"
+fi
+grep -qiE "retired|tombstone|member" "$RIG/victim.err" \
+    || fail "the victim refusal must name the retirement: $(cat "$RIG/victim.err")"
+
+do_mount_uri "sqmeta://$RIG/meta1,$RIG/meta2"
+verify_meta_manifest "leg 10"
+do_unmount
+echo "OK: leg 10 (remove-meta: survivors serve, manifest + inos intact, victim refused)"
+
+# ---------------------------------------------------------------------------
+# Leg 11 (VL5b): kill-9 during the migration coordinator + online cutover
+# window measurement (printed, not enforced)
+# ---------------------------------------------------------------------------
+note "Leg 11: kill-9 during slot migration (LOOPS=$LOOPS) + cutover window"
+
+for loop in $(seq 1 "$LOOPS"); do
+    note "  kill-9 loop $loop/$LOOPS"
+    fresh_meta_rig "metakill_$loop"
+    do_unmount
+
+    truncate -s 256M "$RIG/meta3"
+    # Start the offline coordinator and kill -9 it at a randomized point
+    # (§5.5.2b windows sampled: format/copy/claim/re-stamp/teardown).
+    DELAY="0.$((RANDOM % 9))"
+    [ $((RANDOM % 3)) -eq 0 ] && DELAY="1.$((RANDOM % 5))"
+    ( retry_guarded 90 "$BIN" volume add-meta "sqmeta://$RIG/meta1,$RIG/meta2" \
+        "$RIG/meta3" --take-slots 2 >/dev/null 2>&1 ) &
+    COORD_PID=$!
+    sleep "$DELAY"
+    kill -9 "$COORD_PID" 2>/dev/null || true
+    wait "$COORD_PID" 2>/dev/null || true
+    pkill -9 -f "volume add-meta.*metakill_$loop" 2>/dev/null || true
+    echo "    killed coordinator after ${DELAY}s"
+
+    # Re-run converges (idempotent §5.5.2b re-run; counts-disagree
+    # mid-states refuse mounts until then, so convergence is REQUIRED).
+    retry_guarded 120 "$BIN" volume add-meta "sqmeta://$RIG/meta1,$RIG/meta2" \
+        "$RIG/meta3" --take-slots 2 >/dev/null \
+        || fail "kill-9 loop $loop: add-meta re-run did not converge"
+
+    do_mount_uri "sqmeta://$RIG/meta1,$RIG/meta2,$RIG/meta3"
+    verify_meta_manifest "kill-9 loop $loop"
+    do_unmount
+    rm -rf "$RIG" "$MNT"
+    echo "    OK: loop $loop converged, manifest + inos intact"
+done
+
+# The ONLINE cutover-window measurement: migrate a slot on a LIVE mount
+# under concurrent load; print the widest window (G-VL-4's p99 < 250 ms
+# gate number — recorded here, enforced by the closing-gate run).
+note "  online migrate-meta-slot cutover-window measurement"
+fresh_meta_rig "metaonline"
+( i=0; while [ $i -lt 400 ] && [ -e "$MNT/.stats" ]; do
+      echo "load" > "$MNT/dataset/churn_$((i % 50)).txt" 2>/dev/null || break
+      rm -f "$MNT/dataset/churn_$(((i + 25) % 50)).txt" 2>/dev/null || true
+      i=$((i + 1))
+  done ) &
+CHURN_PID=$!
+"$BIN" volume migrate-meta-slot "$MNT" 1 0 >/dev/null \
+    || fail "online migrate-meta-slot submission failed"
+MIG_DEADLINE=$((SECONDS + 120))
+until [ "$(stats_field meta_slot_migrations)" -ge 1 ]; do
+    [ $SECONDS -lt $MIG_DEADLINE ] || fail "online slot migration did not complete in 120s"
+    sleep 0.5
+done
+wait "$CHURN_PID" 2>/dev/null || true
+CUTOVER_MS="$(stats_field meta_slot_cutover_ms_max)"
+PARKED="$(stats_field meta_slot_gate_parked_commits)"
+DELTA_KEYS="$(stats_field meta_slot_delta_keys)"
+sync -f "$MNT"
+(cd "$MNT" && sha256sum -c "$RIG/manifest.sha256" --quiet) \
+    || fail "online migration: manifest mismatch"
+do_unmount
+echo "  MEASUREMENT (recorded, not enforced): meta_slot_cutover_ms_max=${CUTOVER_MS} ms" \
+     "(G-VL-4 target p99 < 250 ms), gate parks=${PARKED}, delta keys=${DELTA_KEYS}"
+echo "OK: leg 11 (kill-9 ×$LOOPS convergence + online cutover window ${CUTOVER_MS} ms)"
+
 echo "==============================================================="
-echo "VOLUME LIFECYCLE RIG (VL3 + VL4 + VL4b legs) PASSED (kill-9 LOOPS=$LOOPS)"
+echo "VOLUME LIFECYCLE RIG (VL3 + VL4 + VL4b + VL5b legs) PASSED (kill-9 LOOPS=$LOOPS)"
 echo "==============================================================="

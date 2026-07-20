@@ -882,6 +882,20 @@ enum VolumeActions {
         #[arg(long, default_value = "1")]
         take_slots: String,
     },
+    /// Migrate ONE routing slot to another metadata volume on a LIVE
+    /// mount (design-volume-lifecycle §5.5.2, PR VL5b): the online
+    /// engine — bulk copy + conveyor delta tee + §5.5.2a cutover gate
+    /// (p99 window < 250 ms target) + the §5.5.2b flip. Runs as a
+    /// fabric job (`squeezefs job list` shows progress); idempotent
+    /// re-run converges after any crash.
+    MigrateMetaSlot {
+        /// Live mountpoint
+        target: String,
+        /// The routing slot to move
+        slot: u16,
+        /// Target metadata volume index (canonical member order)
+        target_volume: usize,
+    },
     /// Remove a METADATA volume (§5.5.2): migrates every slot it hosts
     /// to the survivors (§5.2 meta-side capacity preflight), stamps the
     /// survivors first and the victim's retirement tombstone last, and
@@ -3093,6 +3107,31 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         "Added metadata volume '{device}' hosting slot(s) {taken:?}. Mount \
                          with the EXTENDED URI (all members listed); the old URI now \
                          refuses loud."
+                    );
+                }
+                VolumeActions::MigrateMetaSlot {
+                    target,
+                    slot,
+                    target_volume,
+                } => {
+                    if !live(&target) {
+                        return Err("volume migrate-meta-slot runs the ONLINE engine on a live \
+                             mount — pass the mountpoint (offline set changes are \
+                             add-meta/remove-meta)"
+                            .into());
+                    }
+                    let body = admin_roundtrip(
+                        &target,
+                        "migrate-meta-slot",
+                        &format!("{slot} {target_volume}"),
+                    )?;
+                    let v: serde_json::Value = serde_json::from_str(&body)
+                        .map_err(|e| format!("undecodable admin reply: {e}"))?;
+                    println!(
+                        "Slot {slot} migration to volume {target_volume} submitted (job {}). \
+                         Watch `squeezefs job list {target}`; the cutover window rides \
+                         `meta_slot_cutover_ms_max` on .stats.",
+                        v["job_id"].as_str().unwrap_or("?")
                     );
                 }
                 VolumeActions::RemoveMeta { target, victim } => {

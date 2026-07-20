@@ -494,6 +494,40 @@ impl crate::ipc_host::AdminSink for FabricAdminSink {
                     let fs = need_fs()?;
                     Ok(Self::volume_states_json(&fs).to_string())
                 }
+                // -----------------------------------------------------
+                // PR VL5b (§5.5.2): ONLINE slot migration — submits the
+                // migrate-meta-slot fabric job (bulk copy + conveyor
+                // delta tee + §5.5.2a cutover gate + §5.5.2b flip) on
+                // the live daemon.
+                // -----------------------------------------------------
+                "migrate-meta-slot" => {
+                    let mut parts = arg.split_whitespace();
+                    let usage = "usage: migrate-meta-slot <slot> <target-volume-index>";
+                    let slot: u16 = parts
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| usage.to_string())?;
+                    let target_volume: usize = parts
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| usage.to_string())?;
+                    let job_id = fabric
+                        .submit(crate::jobs::JobSpec {
+                            job_type: crate::jobs::JobType::MigrateMetaSlot {
+                                slot,
+                                target_volume,
+                            },
+                            throttle_pct: 100,
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!({
+                        "job_id": job_id,
+                        "slot": slot,
+                        "target_volume": target_volume,
+                    })
+                    .to_string())
+                }
                 "volume-disable" | "volume-enable" => {
                     let fs = need_fs()?;
                     let disabled = verb == "volume-disable";

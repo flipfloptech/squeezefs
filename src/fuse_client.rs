@@ -6092,6 +6092,9 @@ impl SqueezefsFilesystem {
         // of a reused key fail their seqlock check instead of caching
         // pre-DMA bytes.
         let offset = block_allocator.allocate_block().await?;
+        // PR VL6a: live-owner registration across the allocate→merge
+        // window (drops at function end, after the map merge below).
+        let _inflight = block_allocator.inflight_register(offset);
         if let Err(e) = nvme_writer.write_block(offset, processed).await {
             let _ = block_allocator.free_block(offset).await;
             return Err(e);
@@ -11885,6 +11888,8 @@ async fn upload_active_block_bytes(
         "staging-refusal durable escalation",
     )?;
     let offset = block_allocator.allocate_block().await?;
+    // PR VL6a: live-owner registration for the allocate→merge window.
+    let _inflight = block_allocator.inflight_register(offset);
     if let Err(e) = nvme_writer.write_block(offset, processed_block).await {
         let _ = block_allocator.free_block(offset).await;
         return Err(e);
@@ -11940,6 +11945,8 @@ async fn fold_upload_block(
         "fold block upload",
     )?;
     let offset = block_allocator.allocate_block().await?;
+    // PR VL6a: live-owner registration for the allocate→merge window.
+    let _inflight = block_allocator.inflight_register(offset);
     if let Err(e) = nvme_writer.write_block(offset, processed_block).await {
         let _ = block_allocator.free_block(offset).await;
         return Err(e);
@@ -12098,6 +12105,10 @@ async fn flush_one_active_block(
 
         let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
         let offset = block_allocator.allocate_block().await?;
+        // PR VL6a: the flush unit is THE canonical in-flight owner (the
+        // retry-forever FIND-M11-A adversary the fsck registry exists
+        // for) — registered per attempt across its allocate→merge window.
+        let _inflight = block_allocator.inflight_register(offset);
 
         let block_data_source = match router.cache.nvme.staged_dma_source(&cache_key) {
             Some(s) => s,

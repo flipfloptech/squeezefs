@@ -344,6 +344,12 @@ pub struct RouterShardDevice {
     backend_ids: Vec<String>,
     block_len: usize,
     rt: tokio::runtime::Handle,
+    /// PR VL6a: coordinator-pre-allocated shard destinations are
+    /// unpublished BY DESIGN for the whole shard (and quarantined
+    /// destinations until job end) — their live-owner registrations in
+    /// the fsck in-flight registry live with the seam (dropped when the
+    /// job's seam is torn down, alongside quarantine reclaim).
+    inflight: parking_lot::Mutex<Vec<crate::block_allocator::InflightAllocGuard>>,
 }
 
 impl RouterShardDevice {
@@ -358,6 +364,7 @@ impl RouterShardDevice {
             backend_ids,
             block_len,
             rt: tokio::runtime::Handle::current(),
+            inflight: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
@@ -409,6 +416,9 @@ impl ShardDeviceSeam for RouterShardDevice {
             let offset = self
                 .block_on(alloc.allocate_block())
                 .map_err(std::io::Error::other)?;
+            // VL6a: unpublished-by-design shard destination — registered
+            // in-flight for the seam's lifetime.
+            self.inflight.lock().push(alloc.inflight_register(offset));
             out.push(DestTuple {
                 backend_id: idx as u32,
                 offset,

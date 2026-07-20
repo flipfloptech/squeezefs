@@ -2390,6 +2390,10 @@ impl DataRouter {
                     .xattr_value_cap(ino)
                     .saturating_sub(LAYOUT_INLINE_HEADROOM);
 
+        // PR VL6a: a freshly allocated indirect blob is registered
+        // in-flight until this function's `set_layout_and_size` publishes
+        // the layout naming it (the guard drops at function end).
+        let mut _blob_inflight: Option<crate::block_allocator::InflightAllocGuard> = None;
         let bytes = if needs_indirect {
             let bm = m.block_map.as_ref().unwrap();
             // Backend-true spill (versioned v1 blob): the SAME key strings
@@ -2454,6 +2458,7 @@ impl DataRouter {
                 }
                 let (be, block_allocator, dev) = self.backend_router.get_active_backend()?;
                 let off = block_allocator.allocate_block().await?;
+                _blob_inflight = Some(block_allocator.inflight_register(off));
                 (be, off, dev)
             };
 
@@ -4080,6 +4085,9 @@ impl DataRouter {
             return Ok(false);
         }
         let offset = allocator.allocate_block().await?;
+        // PR VL6a: live owner registration for the allocate→commit window
+        // (drops at function end, after the layout commit below).
+        let _inflight = allocator.inflight_register(offset);
         // Size-carrying mapping (`bk:0:packed_len`): without the exact
         // stored-image length, a passthrough transform cannot strip the
         // whole-block read's recycled-tenant tail (see
@@ -5107,7 +5115,10 @@ impl DataRouter {
                 chunks.push((b, chunk));
             }
 
-            let block_mappings = self.durable_write_sparse_blocks(chunks).await?;
+            // The in-flight guards hold the fsck registry entries until
+            // the layout commit below published the mappings (VL6a).
+            let (block_mappings, _inflight_guards) =
+                self.durable_write_sparse_blocks(chunks).await?;
 
             let mut block_map = std::collections::HashMap::new();
             for (idx, key) in block_mappings {
@@ -5343,6 +5354,9 @@ impl DataRouter {
                         "staged spill",
                     )?;
                     let be_offset = block_allocator.allocate_block().await?;
+                    // PR VL6a: in-flight until `save_metadata_to_backend`
+                    // below publishes the spill layout (scope-held).
+                    let _inflight = block_allocator.inflight_register(be_offset);
                     // Size-carrying mapping (`bk:0:packed_len` — see
                     // `parse_block_mapping`).
                     let stored_block_key = format!(
@@ -5412,12 +5426,20 @@ impl DataRouter {
     /// Every block I/O is **awaited**. On any allocate/crypto/write failure, all
     /// blocks allocated in this call are freed and the error is returned so the
     /// caller can leave the prior layout (inline/staged) untouched.
+    /// PR VL6a: the returned [`InflightAllocGuard`]s register every
+    /// fresh block as live-owner in-flight — the caller MUST hold them
+    /// until its layout commit published the mappings (drop-on-error is
+    /// exactly right: the error paths free the blocks).
     async fn durable_write_sparse_blocks(
         &self,
         chunks: Vec<(u32, bytes::Bytes)>,
-    ) -> Result<Vec<(u32, String)>> {
+    ) -> Result<(
+        Vec<(u32, String)>,
+        Vec<crate::block_allocator::InflightAllocGuard>,
+    )> {
         let mut block_mappings: Vec<(u32, String)> = Vec::new();
         let mut allocated_keys: Vec<String> = Vec::new();
+        let mut inflight_guards: Vec<crate::block_allocator::InflightAllocGuard> = Vec::new();
 
         for (block_idx, chunk) in chunks {
             let (be_id, block_allocator, nvme_writer) =
@@ -5442,6 +5464,7 @@ impl DataRouter {
             };
             let stored_block_key = self.backend_router.persist_block_key(&be_id, offset);
             allocated_keys.push(stored_block_key.clone());
+            inflight_guards.push(block_allocator.inflight_register(offset));
 
             let processed = match self.get_crypto().process_write_async(chunk.clone()).await {
                 Ok(p) => p,
@@ -5482,7 +5505,7 @@ impl DataRouter {
             block_mappings.push((block_idx, stored_block_key));
         }
 
-        Ok(block_mappings)
+        Ok((block_mappings, inflight_guards))
     }
 
     /// Register a completed stripe layout in MetaLV after durable block writes.
@@ -5640,6 +5663,9 @@ impl DataRouter {
                 let (be_id, block_allocator, nvme_writer) =
                     router_clone.backend_router.get_active_backend()?;
                 let offset = block_allocator.allocate_block().await?;
+                // PR VL6a: live-owner registration rides the task result
+                // back to the caller, which holds it across the merge.
+                let inflight = block_allocator.inflight_register(offset);
                 let stored_new_block_key = router_clone
                     .backend_router
                     .persist_block_key(&be_id, offset);
@@ -5669,11 +5695,15 @@ impl DataRouter {
                 read_lru.put(&stored_new_block_key, block_bytes);
                 block_allocator.publish_block(offset);
 
-                Ok::<_, SqueezefsError>((b, stored_new_block_key))
+                Ok::<_, SqueezefsError>((b, stored_new_block_key, inflight))
             }));
         }
 
         let mut results = Vec::new();
+        // Held across the merge below (VL6a live-owner window); dropped
+        // with the function — after the publish — or on the error path
+        // where the blocks are freed.
+        let mut _inflight_guards: Vec<crate::block_allocator::InflightAllocGuard> = Vec::new();
         let mut first_err: Option<SqueezefsError> = None;
         let mut tasks_stream = tasks;
         while let Some(task_res) = tasks_stream.next().await {
@@ -5683,7 +5713,10 @@ impl DataRouter {
                     e
                 )))
             }) {
-                Ok(Ok(res)) => results.push(res),
+                Ok(Ok((b, key, guard))) => {
+                    results.push((b, key));
+                    _inflight_guards.push(guard);
+                }
                 Ok(Err(e)) | Err(e) => {
                     if first_err.is_none() {
                         first_err = Some(e);
@@ -7332,6 +7365,9 @@ impl DataRouter {
         // (`new_size == 0` needs no clip: the commit's prune drops
         // `block_map[0]` entirely — block start 0 >= 0.)
         let mut clipped_bk: Option<(String, String)> = None; // (old, new)
+                                                             // PR VL6a: live-owner guard for the clip block's
+                                                             // allocate→commit window (drops at function end).
+        let mut _clip_inflight: Option<crate::block_allocator::InflightAllocGuard> = None;
         if new_size < pre_size && new_size > 0 {
             if let Some(old_bk) = self.staged_block_mapping(&file_path, &meta).await {
                 // The mapping can be displaced under our feet by a racing
@@ -7392,6 +7428,7 @@ impl DataRouter {
                             "staged truncate durable clip",
                         )?;
                         let offset = allocator.allocate_block().await?;
+                        _clip_inflight = Some(allocator.inflight_register(offset));
                         // Size-carrying mapping (`bk:0:packed_len` — see
                         // `parse_block_mapping`).
                         let new_bk = format!(

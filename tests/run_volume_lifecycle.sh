@@ -73,6 +73,22 @@ set -euo pipefail
 #     concurrent load; `meta_slot_cutover_ms_max` is PRINTED (the
 #     G-VL-4 p99 < 250 ms gate number is recorded, not enforced here).
 #
+#   Leg 12 (mount, VL6a): online fsck under concurrent write/delete
+#     churn — `squeezefs fsck <mnt>` ×3, findings MUST be 0 each pass
+#     (G-VL-5 a at rig scale; `fsck_findings` tripwire asserted), plus
+#     offline fsck and the `--shards k/N` + `merge-reports` union on
+#     the same set.
+#
+#   Leg 13 (mount, VL6a): fsck DURING an active throttled drain over a
+#     clone-heavy dataset — zero findings while the mover's pre-publish
+#     refcount ledger and in-flight destinations are live (the
+#     G-VL-5(a) drain-concurrent row), clones byte-identical after
+#     convergence, post-drain fsck clean.
+#
+#   Leg 14 (mount, VL6a): the C7 scrub arm — `squeezefs scrub` on a
+#     plain volume: per-arm counters asserted (100 % readability-only —
+#     the KD-17 honesty gauge; zero failures/findings).
+#
 # Unprivileged posture (the preload-gate precedent): file-backed volumes
 # + a user-owned mountpoint; root is NOT required.
 #
@@ -791,6 +807,143 @@ echo "  MEASUREMENT (recorded, not enforced): meta_slot_cutover_ms_max=${CUTOVER
      "(G-VL-4 target p99 < 250 ms), gate parks=${PARKED}, delta keys=${DELTA_KEYS}"
 echo "OK: leg 11 (kill-9 ×$LOOPS convergence + online cutover window ${CUTOVER_MS} ms)"
 
+# ---------------------------------------------------------------------------
+# Leg 12 (VL6a): online fsck under concurrent write/delete churn —
+# FP = 0 ×3 (G-VL-5 a at rig scale), plus the offline + sharded modes
+# ---------------------------------------------------------------------------
+note "Leg 12: fsck under load (FP=0 x3) + offline/sharded fsck"
+
+fresh_drain_rig "fsck" 6 8
+
+# Concurrent churn: rewrite/delete cycles across the dataset while fsck
+# runs (the rig's dd/checksum churn — in-flight allocations, frees, and
+# staged custody continuously exercise the epoch filter + registry).
+( i=0; while [ $i -lt 2000 ] && [ -e "$MNT/.stats" ]; do
+      dd if=/dev/urandom of="$MNT/dataset/churn_$((i % 8)).bin" bs=256K count=1 \
+          conv=notrunc status=none 2>/dev/null || break
+      [ $((i % 5)) -eq 0 ] && rm -f "$MNT/dataset/churn_$(((i + 3) % 8)).bin" 2>/dev/null
+      i=$((i + 1))
+  done ) &
+FSCK_CHURN_PID=$!
+
+for pass in 1 2 3; do
+    FSCK_OUT="$("$BIN" fsck "$MNT")" \
+        || fail "fsck pass $pass under churn reported findings (FP!=0) or failed: $FSCK_OUT"
+    echo "$FSCK_OUT" | grep -q "findings: 0" \
+        || fail "fsck pass $pass: expected zero findings, got: $FSCK_OUT"
+    echo "    OK: fsck pass $pass under churn — findings: 0"
+done
+kill "$FSCK_CHURN_PID" 2>/dev/null || true
+wait "$FSCK_CHURN_PID" 2>/dev/null || true
+
+# Engagement: the scan actually ran (stats-inode instrument).
+FSCK_SCANNED="$(stats_field fsck_inodes_scanned)"
+[ "$FSCK_SCANNED" -gt 0 ] || fail "engagement: fsck_inodes_scanned stayed 0"
+FSCK_FOUND="$(stats_field fsck_findings)"
+[ "$FSCK_FOUND" -eq 0 ] || fail "tripwire: fsck_findings=$FSCK_FOUND on a healthy volume"
+sync -f "$MNT"
+do_unmount
+
+# Offline fsck (read-only probes; retried through the heartbeat TTL) +
+# the k/N shard union equivalence on the same set.
+OFF_OUT="$(retry_guarded 90 "$BIN" fsck "sqmeta://$RIG/meta1" --offline)" \
+    || fail "offline fsck kept refusing after the staleness TTL: $OFF_OUT"
+echo "$OFF_OUT" | grep -q "findings: 0" || fail "offline fsck must be clean: $OFF_OUT"
+"$BIN" fsck "sqmeta://$RIG/meta1" --offline --shards 0/2 --json >"$RIG/shard0.json" \
+    || fail "shard 0/2 fsck failed"
+"$BIN" fsck "sqmeta://$RIG/meta1" --offline --shards 1/2 --json >"$RIG/shard1.json" \
+    || fail "shard 1/2 fsck failed"
+MERGE_OUT="$("$BIN" fsck merge-reports "$RIG/shard0.json" "$RIG/shard1.json")" \
+    || fail "merge-reports reported findings on a healthy set: $MERGE_OUT"
+echo "$MERGE_OUT" | grep -q "findings: 0" || fail "merged shard report must be clean: $MERGE_OUT"
+echo "OK: leg 12 (fsck FP=0 x3 under churn; offline + 2-shard merge clean)"
+
+# ---------------------------------------------------------------------------
+# Leg 13 (VL6a): fsck DURING an active drain over a clone-heavy dataset —
+# FP = 0 (the G-VL-5(a) drain-concurrent row: the mover's pre-publish
+# refcount ledger + in-flight destinations are the adversary)
+# ---------------------------------------------------------------------------
+note "Leg 13: fsck during drain over a cloned dataset (FP=0)"
+
+fresh_drain_rig "fsckdrain" 4 16
+# Clone-heavy: whole-file clones via copy_file_range (refcount sharing).
+for f in f1 f2; do
+python3 - "$MNT/dataset/$f.bin" "$MNT/dataset/${f}_clone.bin" <<'EOF'
+import os, sys
+src = os.open(sys.argv[1], os.O_RDONLY)
+size = os.fstat(src).st_size
+dst = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+copied = 0
+while copied < size:
+    n = os.copy_file_range(src, dst, size - copied, copied, copied)
+    if n <= 0:
+        raise SystemExit(f"copy_file_range stalled at {copied}/{size}")
+    copied += n
+os.close(src); os.close(dst)
+EOF
+done
+sync -f "$MNT"
+(cd "$MNT/dataset" && sha256sum f*.bin) >"$RIG/clones.sha256"
+
+# Slow drain so fsck runs INSIDE the drain window.
+"$BIN" volume remove-data "$MNT" oss2 --throttle 10 \
+    || fail "leg 13: remove-data must admit"
+[ "$(vol_state_live oss2)" = "draining" ] || fail "leg 13: oss2 must be draining"
+
+FSCK_OUT="$("$BIN" fsck "$MNT")" \
+    || fail "fsck during an active drain reported findings (FP!=0) or failed: $FSCK_OUT"
+echo "$FSCK_OUT" | grep -q "findings: 0" \
+    || fail "drain-concurrent fsck must report zero findings: $FSCK_OUT"
+[ "$(vol_state_live oss2)" = "draining" ] || [ "$(vol_state_live oss2)" = "retired" ] \
+    || fail "leg 13: drain state lost during fsck"
+
+# Let the drain converge; everything stays byte-identical.
+EVAC_ID="$("$BIN" job list "$MNT" | python3 -c '
+import json, sys
+rows = json.loads(sys.stdin.read())
+live = [r for r in rows if r["state"] in ("queued", "running", "paused")]
+print(live[0]["job_id"] if live else "")
+')"
+[ -n "$EVAC_ID" ] && "$BIN" job throttle "$MNT" "$EVAC_ID" 100 >/dev/null || true
+wait_vol_state_live oss2 retired 240
+(cd "$MNT/dataset" && sha256sum -c "$RIG/clones.sha256" --quiet) \
+    || fail "leg 13: clones not byte-identical after drain + fsck"
+# And a post-drain fsck is still clean (no mover residue misreported).
+"$BIN" fsck "$MNT" | grep -q "findings: 0" || fail "leg 13: post-drain fsck not clean"
+do_unmount
+echo "OK: leg 13 (drain-concurrent fsck FP=0, clones intact, post-drain clean)"
+
+# ---------------------------------------------------------------------------
+# Leg 14 (VL6a): the C7 scrub arm — per-arm counters (KD-17 honesty:
+# plain volumes report readability-only, never fake verification)
+# ---------------------------------------------------------------------------
+note "Leg 14: scrub (C7) with per-arm counters"
+
+fresh_drain_rig "scrub" 4 8
+SCRUB_OUT="$("$BIN" scrub "$MNT" --json)" || fail "scrub reported failures: $SCRUB_OUT"
+python3 - <<EOF || fail "scrub counters wrong: $SCRUB_OUT"
+import json, sys
+r = json.loads('''$SCRUB_OUT''')
+c = r["counters"]
+assert r["findings"] == [], f"scrub findings on a healthy volume: {r['findings']}"
+assert c["scrub_blocks_scanned"] > 0, "scrub scanned nothing"
+assert c["scrub_failures"] == 0, "scrub failures on a healthy volume"
+# Plain (uncompressed, unencrypted) volume: the honesty gauge — every
+# block is readability-only, no fake AEAD/frame verification claims.
+assert c["scrub_readability_only"] == c["scrub_blocks_scanned"], (
+    "plain volume must be 100% readability-only",
+    c,
+)
+assert c["scrub_aead_verified"] == 0 and c["scrub_frame_verified"] == 0, c
+EOF
+echo "    scrub counters: $(echo "$SCRUB_OUT" | python3 -c '
+import json, sys
+c = json.load(sys.stdin)["counters"]
+print({k: v for k, v in c.items() if k.startswith("scrub_")})
+')"
+do_unmount
+echo "OK: leg 14 (scrub per-arm counters, readability-only honesty gauge)"
+
 echo "==============================================================="
-echo "VOLUME LIFECYCLE RIG (VL3 + VL4 + VL4b + VL5b legs) PASSED (kill-9 LOOPS=$LOOPS)"
+echo "VOLUME LIFECYCLE RIG (VL3 + VL4 + VL4b + VL5b + VL6a legs) PASSED (kill-9 LOOPS=$LOOPS)"
 echo "==============================================================="

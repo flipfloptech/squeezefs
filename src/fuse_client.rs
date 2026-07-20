@@ -1716,11 +1716,45 @@ pub struct Metrics {
     pub job_failed: Align64<AtomicU64>,
     pub job_tasks_done: Align64<AtomicU64>,
     pub job_checkpoint_writes: Align64<AtomicU64>,
-    /// Worker copy-buffer bytes (the R5 `job_copy_buffers` gauge; the
-    /// VL4 movers charge it — 0 until then).
+    /// Worker copy-buffer bytes (the R5 `job_copy_buffers` gauge,
+    /// charged by the VL4 movers' copy window).
     pub job_copy_buffer_bytes: Align64<AtomicU64>,
     /// Jobs paused by the R5 shed hook.
     pub job_paused_mem_pressure: Align64<AtomicU64>,
+    /// Drains self-paused by the §5.2 checkpoint-time capacity
+    /// re-verification (state `paused-capacity`) instead of running the
+    /// survivors to StorageFull.
+    pub job_paused_capacity: Align64<AtomicU64>,
+    /// VL4 evacuation family (design-volume-lifecycle §10). Distinct
+    /// victim blocks moved (a clone-shared block counts ONCE — the
+    /// move-once law).
+    pub evacuate_blocks_moved: Align64<AtomicU64>,
+    /// Stored bytes copied by the mover — THE drain-engagement
+    /// instrument (§3: a drain row is INVALID unless this accounts for
+    /// the victim's used bytes).
+    pub evacuate_bytes_moved: Align64<AtomicU64>,
+    /// Moved blocks whose refcount was > 1 (clone-shared; refcount
+    /// transferred to the destination pre-publish).
+    pub evacuate_shared_blocks_moved: Align64<AtomicU64>,
+    /// Copy-window bytes in flight (gauge; bounded by 64 blocks/worker —
+    /// the §5.2 `transient` term's live counterpart).
+    pub evacuate_inflight_bytes: Align64<AtomicU64>,
+    /// Mover publishes superseded by a concurrent foreground write
+    /// (FIND-M11-A applied to movers: contractual no-ops, re-plan
+    /// revisits).
+    pub evacuate_stale_token_noops: Align64<AtomicU64>,
+    /// Blocks deferred by the quiescent-first rule (§5.4 step 3: live
+    /// active buffers / parked extents / spilled records).
+    pub evacuate_deferred_staged_blocks: Align64<AtomicU64>,
+    /// Census re-plan passes (KD-6: convergence is by idempotent plan
+    /// regeneration).
+    pub evacuate_replans: Align64<AtomicU64>,
+    /// The §5.2 preflight terms of the ACTIVE drain (gauges; 0 when no
+    /// drain runs) — `volume list` mirrors them so the operator sees the
+    /// same math preflight ran.
+    pub evacuate_needed_bytes: Align64<AtomicU64>,
+    pub evacuate_avail_bytes: Align64<AtomicU64>,
+    pub evacuate_transient_bytes: Align64<AtomicU64>,
     /// Volume-lifecycle preflight refusals (design-volume-lifecycle §10,
     /// PR VL3): online `volume add-data` / state-change requests refused
     /// by validation (bad device, duplicate member, meta volume, probe
@@ -2827,6 +2861,7 @@ impl SqueezefsFilesystem {
     pub async fn admin_add_data_volume(
         &self,
         device: &str,
+        no_rebalance: bool,
     ) -> std::result::Result<crate::DataVolumeRecord, String> {
         let refused = |msg: String| {
             METRICS
@@ -2919,7 +2954,237 @@ impl SqueezefsFilesystem {
              placement enabled",
             device, record.id, capacity
         );
+
+        // 6. §5.3 step 6 (KD-12): the automatic rebalance pass is the
+        //    DEFAULT — a bounded fabric job at the conservative throttle,
+        //    visible/pausable/cancellable like any job. `--no-rebalance`
+        //    opts out (allocation participation only).
+        if !no_rebalance {
+            match self.job_fabric.load().as_ref() {
+                Some(fabric) => {
+                    match fabric
+                        .submit(crate::jobs::JobSpec {
+                            job_type: crate::jobs::JobType::Rebalance,
+                            throttle_pct: crate::jobs::REBALANCE_DEFAULT_THROTTLE_PCT,
+                        })
+                        .await
+                    {
+                        Ok(job_id) => info!(
+                            "volume add-data: auto-rebalance pass submitted as job {job_id} \
+                             (throttle {} % — KD-12 default; --no-rebalance opts out)",
+                            crate::jobs::REBALANCE_DEFAULT_THROTTLE_PCT
+                        ),
+                        Err(e) => log::error!(
+                            "volume add-data: auto-rebalance submission failed: {e} — the \
+                             volume participates in placement; run `squeezefs defrag \
+                             --rebalance` (VL7) or re-add capacity pressure manually"
+                        ),
+                    }
+                }
+                None => log::warn!(
+                    "volume add-data: no job fabric wired — the auto-rebalance pass was \
+                     not submitted"
+                ),
+            }
+        }
         Ok(record)
+    }
+
+    /// Durable volume-state commit through the LIVE meta backend (the
+    /// conveyor): rewrite the `FormatConfig` record set with `volume_id`
+    /// flipped to `new_state`, mirror `data_lv`, publish the runtime
+    /// snapshot. Shared by remove-data (→ draining) and undrain
+    /// (→ active).
+    async fn commit_volume_state(
+        &self,
+        volume_id: &str,
+        new_state: &str,
+    ) -> std::result::Result<(), String> {
+        let meta = self
+            .meta_backend
+            .as_ref()
+            .ok_or_else(|| "no metadata backend mounted".to_string())?;
+        let raw = meta
+            .getxattr(1, crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR)
+            .await
+            .map_err(|e| format!("format config read failed: {e}"))?
+            .ok_or_else(|| "format config not found on the volume set".to_string())?;
+        let mut cfg: crate::FormatConfig =
+            serde_json::from_slice(&raw).map_err(|e| format!("format config undecodable: {e}"))?;
+        let mut records = cfg.resolved_data_volumes();
+        let rec = records
+            .iter_mut()
+            .find(|r| r.id == volume_id)
+            .ok_or_else(|| format!("unknown data volume '{volume_id}'"))?;
+        rec.state = new_state.to_string();
+        cfg.data_lv = Some(
+            records
+                .iter()
+                .filter(|r| r.state != crate::VOL_STATE_RETIRED)
+                .map(|r| r.backing_dev.clone())
+                .collect(),
+        );
+        cfg.data_volumes = Some(records.clone());
+        let bytes =
+            serde_json::to_vec(&cfg).map_err(|e| format!("format config serialize: {e}"))?;
+        meta.setxattr(
+            1,
+            crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
+            &bytes,
+        )
+        .await
+        .map_err(|e| format!("durable volume-state commit failed: {e}"))?;
+        self.router.backend_router.set_volume_records(records);
+        Ok(())
+    }
+
+    /// The ONLINE `volume remove-data` (design-volume-lifecycle §5.4,
+    /// served by the admin-lane `volume-remove-data` verb): the §5.2
+    /// capacity preflight (honest refusal with the exact numbers —
+    /// `volume_preflight_refusals` counted), the durable
+    /// `Active → Draining` flip (bit 3 already stamped by any prior
+    /// lifecycle verb; stamped here for sets whose first lifecycle use
+    /// is a remove), and the `evacuate-data-volume` job submission.
+    /// Returns the job id.
+    pub async fn admin_remove_data_volume(
+        &self,
+        volume_id: &str,
+        throttle_pct: u32,
+    ) -> std::result::Result<String, String> {
+        let refused = |msg: String| {
+            METRICS
+                .volume_preflight_refusals
+                .fetch_add(1, Ordering::Relaxed);
+            msg
+        };
+        let meta = self
+            .meta_backend
+            .as_ref()
+            .ok_or_else(|| "no metadata backend mounted".to_string())?;
+        let fabric = self
+            .job_fabric
+            .load()
+            .as_ref()
+            .clone()
+            .ok_or_else(|| "no job fabric wired on this mount".to_string())?;
+        let ctx = fabric
+            .mover_ctx()
+            .ok_or_else(|| "the mover context is not wired on this fabric".to_string())?;
+
+        // State gate: only an Active member can start draining.
+        match self.router.backend_router.volume_state(volume_id) {
+            Some(state) if state == crate::VOL_STATE_ACTIVE => {}
+            Some(state) => {
+                return Err(refused(format!(
+                    "volume '{volume_id}' is '{state}' — only an active volume can be \
+                     removed (undrain first, or see `squeezefs volume list`)"
+                )))
+            }
+            None => {
+                return Err(refused(format!(
+                    "unknown data volume '{volume_id}' (see `squeezefs volume list`)"
+                )))
+            }
+        }
+
+        // §5.2 preflight: dedupe census, survivor availability, the
+        // worker-window transient, write-rate/ETA headroom.
+        let pf = crate::jobs::drain_preflight(meta, ctx, volume_id, fabric.worker_count())
+            .await
+            .map_err(|e| format!("capacity preflight census failed: {e}"))?;
+        if !pf.admits() {
+            return Err(refused(pf.refusal()));
+        }
+        METRICS
+            .evacuate_needed_bytes
+            .store(pf.needed_bytes, Ordering::Relaxed);
+        METRICS
+            .evacuate_avail_bytes
+            .store(pf.avail_bytes, Ordering::Relaxed);
+        METRICS
+            .evacuate_transient_bytes
+            .store(pf.transient_bytes, Ordering::Relaxed);
+
+        // Lifecycle bit before the durable state flip (§7 ordering law —
+        // idempotent for sets that already used a lifecycle verb).
+        for vol in &meta.volumes {
+            let path = vol.device_path().display().to_string();
+            crate::meta_backend::kv::superblock::set_volume_lifecycle_bit(std::path::Path::new(
+                &path,
+            ))
+            .await
+            .map_err(|e| format!("lifecycle-bit stamp failed on {path}: {e}"))?;
+        }
+
+        // Durable Active → Draining, then the evacuation job.
+        self.commit_volume_state(volume_id, crate::VOL_STATE_DRAINING)
+            .await?;
+        let job_id = fabric
+            .submit(crate::jobs::JobSpec {
+                job_type: crate::jobs::JobType::EvacuateVolume {
+                    volume_id: volume_id.to_string(),
+                },
+                throttle_pct,
+            })
+            .await
+            .map_err(|e| format!("evacuation job submission failed: {e}"))?;
+        info!(
+            "volume remove-data: '{volume_id}' draining (job {job_id}, throttle {throttle_pct} %) \
+             — preflight: needed {} B, avail {} B, transient {} B, headroom {} B",
+            pf.needed_bytes, pf.avail_bytes, pf.transient_bytes, pf.headroom_bytes
+        );
+        Ok(job_id)
+    }
+
+    /// The ONLINE `volume undrain` (§5.4): cancel the volume's
+    /// evacuation job(s) and flip the durable state back to `active`.
+    pub async fn admin_undrain_data_volume(
+        &self,
+        volume_id: &str,
+    ) -> std::result::Result<(), String> {
+        match self.router.backend_router.volume_state(volume_id) {
+            Some(state) if state == crate::VOL_STATE_DRAINING => {}
+            Some(state) => {
+                return Err(format!(
+                    "volume '{volume_id}' is '{state}', not draining — nothing to undrain \
+                     (retired volumes never come back: ids are permanent, KD-5)"
+                ))
+            }
+            None => return Err(format!("unknown data volume '{volume_id}'")),
+        }
+        // Durable flip FIRST: a mover pass observing the non-draining
+        // state self-cancels even if the explicit cancel below races it.
+        self.commit_volume_state(volume_id, crate::VOL_STATE_ACTIVE)
+            .await?;
+        if let Some(fabric) = self.job_fabric.load().as_ref() {
+            for (job_id, state) in fabric.jobs_matching(|jt| {
+                matches!(jt, crate::jobs::JobType::EvacuateVolume { volume_id: v } if v == volume_id)
+            }) {
+                if !state.is_terminal() {
+                    if let Err(e) = fabric.cancel(&job_id).await {
+                        log::warn!("undrain: cancelling evacuation job {job_id} failed: {e}");
+                    }
+                }
+            }
+        }
+        info!("volume undrain: '{volume_id}' back to active; evacuation cancelled");
+        Ok(())
+    }
+
+    /// The mover quiescence probe (§5.4 step 3) for THIS mount: a block
+    /// is quiescent when it has no live RAM `ActiveBlockBuf`, no staged
+    /// `active_block:` ring entry, and no spilled `active_block_ext:`
+    /// record.
+    pub fn mover_quiesce_probe(&self) -> crate::jobs::QuiesceProbe {
+        let bufs = self.active_block_buffers.clone();
+        let router = self.router.clone();
+        std::sync::Arc::new(move |ino, b| {
+            let key = crate::keys::active_block(ino, b).to_string();
+            let ext = crate::keys::active_block_ext(ino, b).to_string();
+            !bufs.contains_key(&key)
+                && !router.cache.nvme.has_staged_active_block(&key)
+                && !router.cache.nvme.has_staged_extent_record(&ext)
+        })
     }
 
     /// Live metadata-volume health override (`config metadata-volume
@@ -3315,6 +3580,17 @@ impl SqueezefsFilesystem {
                 "job_checkpoint_writes": METRICS.job_checkpoint_writes.load(Ordering::Relaxed),
                 "job_copy_buffer_bytes": METRICS.job_copy_buffer_bytes.load(Ordering::Relaxed),
                 "job_paused_mem_pressure": METRICS.job_paused_mem_pressure.load(Ordering::Relaxed),
+                "job_paused_capacity": METRICS.job_paused_capacity.load(Ordering::Relaxed),
+                "evacuate_blocks_moved": METRICS.evacuate_blocks_moved.load(Ordering::Relaxed),
+                "evacuate_bytes_moved": METRICS.evacuate_bytes_moved.load(Ordering::Relaxed),
+                "evacuate_shared_blocks_moved": METRICS.evacuate_shared_blocks_moved.load(Ordering::Relaxed),
+                "evacuate_inflight_bytes": METRICS.evacuate_inflight_bytes.load(Ordering::Relaxed),
+                "evacuate_stale_token_noops": METRICS.evacuate_stale_token_noops.load(Ordering::Relaxed),
+                "evacuate_deferred_staged_blocks": METRICS.evacuate_deferred_staged_blocks.load(Ordering::Relaxed),
+                "evacuate_replans": METRICS.evacuate_replans.load(Ordering::Relaxed),
+                "evacuate_needed_bytes": METRICS.evacuate_needed_bytes.load(Ordering::Relaxed),
+                "evacuate_avail_bytes": METRICS.evacuate_avail_bytes.load(Ordering::Relaxed),
+                "evacuate_transient_bytes": METRICS.evacuate_transient_bytes.load(Ordering::Relaxed),
                 "volume_preflight_refusals": METRICS.volume_preflight_refusals.load(Ordering::Relaxed),
                 "job_remote_workers": METRICS.job_remote_workers.load(Ordering::Relaxed),
                 "job_remote_enrollments": METRICS.job_remote_enrollments.load(Ordering::Relaxed),

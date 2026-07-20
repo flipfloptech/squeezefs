@@ -277,15 +277,21 @@ pub trait ShardDeviceSeam: Send + Sync {
     /// before within this job fabric's lifetime (the fresh-destination
     /// law's allocator half).
     fn allocate(&self, n: usize) -> std::io::Result<Vec<DestTuple>>;
+    /// Worker-side SOURCE read for copy shards (shared storage): the
+    /// mover copy step over the wire — a worker fills each destination
+    /// with the bytes behind the matching `source_keys` entry instead of
+    /// the Noop pattern (VL4; the coordinator-side mover publish is what
+    /// still keeps the mover job types off the wire in v1.1).
+    fn read_source(&self, key: &str) -> std::io::Result<Vec<u8>>;
     /// Worker-side block fill (shared storage — the data plane).
     fn write_block(&self, dest: &DestTuple, data: &[u8]) -> std::io::Result<()>;
     /// Coordinator-side verify-read before publish.
     fn read_block(&self, dest: &DestTuple) -> std::io::Result<Vec<u8>>;
 }
 
-/// Production seam until the VL4 movers land: Noop shards plan zero
-/// blocks, so allocation and device access are structurally
-/// unreachable — reaching them is a bug, refused loud.
+/// Device-less seam for fabric-only wiring (unit tests, bare hosts):
+/// Noop shards plan zero blocks, so allocation and device access are
+/// structurally unreachable — reaching them is a bug, refused loud.
 #[derive(Debug)]
 pub struct NoopDeviceSeam;
 
@@ -301,18 +307,138 @@ impl ShardDeviceSeam for NoopDeviceSeam {
             return Ok(Vec::new());
         }
         Err(std::io::Error::other(
-            "NoopDeviceSeam cannot allocate destinations — mutating shards land with the VL4 movers",
+            "NoopDeviceSeam cannot allocate destinations — use RouterShardDevice",
+        ))
+    }
+    fn read_source(&self, _key: &str) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::other(
+            "NoopDeviceSeam has no device — use RouterShardDevice",
         ))
     }
     fn write_block(&self, _dest: &DestTuple, _data: &[u8]) -> std::io::Result<()> {
         Err(std::io::Error::other(
-            "NoopDeviceSeam has no device — mutating shards land with the VL4 movers",
+            "NoopDeviceSeam has no device — use RouterShardDevice",
         ))
     }
     fn read_block(&self, _dest: &DestTuple) -> std::io::Result<Vec<u8>> {
         Err(std::io::Error::other(
-            "NoopDeviceSeam has no device — mutating shards land with the VL4 movers",
+            "NoopDeviceSeam has no device — use RouterShardDevice",
         ))
+    }
+}
+
+/// The PRODUCTION seam (PR VL4): `BackendRouter`-backed device access —
+/// allocation on placement-eligible volumes' allocators, block fill and
+/// verify-reads through the per-volume `NvmeBlockDev` io_uring workers,
+/// source reads through the router's key resolution. `DestTuple`'s
+/// numeric `backend_id` indexes the ordered volume-id table captured at
+/// construction (the wire frame stays schema-stable while volume ids
+/// are strings).
+///
+/// Bridging: the seam trait is sync (workers and the host's verify path
+/// call it inline); this implementation hops onto the captured runtime
+/// via `block_in_place` — it therefore requires the multi-thread
+/// runtime, which every mount and offline coordinator runs.
+pub struct RouterShardDevice {
+    router: Arc<crate::routing::BackendRouter>,
+    backend_ids: Vec<String>,
+    block_len: usize,
+    rt: tokio::runtime::Handle,
+}
+
+impl RouterShardDevice {
+    /// Capture the router and its CURRENT volume-id table (call from
+    /// async context — mount wiring is).
+    pub fn new(router: Arc<crate::routing::BackendRouter>, block_len: usize) -> Arc<Self> {
+        let mut backend_ids: Vec<String> =
+            router.backends.iter().map(|e| e.key().clone()).collect();
+        backend_ids.sort();
+        Arc::new(Self {
+            router,
+            backend_ids,
+            block_len,
+            rt: tokio::runtime::Handle::current(),
+        })
+    }
+
+    fn id_of(&self, dest: &DestTuple) -> std::io::Result<&str> {
+        self.backend_ids
+            .get(dest.backend_id as usize)
+            .map(|s| s.as_str())
+            .ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "destination backend index {} out of table range {}",
+                    dest.backend_id,
+                    self.backend_ids.len()
+                ))
+            })
+    }
+
+    fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
+        tokio::task::block_in_place(|| self.rt.block_on(fut))
+    }
+}
+
+impl ShardDeviceSeam for RouterShardDevice {
+    fn plan_blocks(&self, job: &JobType) -> usize {
+        // Noop plans no device work; the movers never reach the wire in
+        // v1.1 (`JobType::wire_executable`), so a mover job type here is
+        // a dispatcher bug — planning 0 keeps it inert.
+        let _ = job;
+        0
+    }
+    fn block_len(&self) -> usize {
+        self.block_len
+    }
+    fn allocate(&self, n: usize) -> std::io::Result<Vec<DestTuple>> {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (be_id, alloc, _dev) = self
+                .router
+                .get_active_backend()
+                .map_err(std::io::Error::other)?;
+            let idx = self
+                .backend_ids
+                .iter()
+                .position(|id| *id == be_id)
+                .ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "backend '{be_id}' joined after the seam table was captured"
+                    ))
+                })?;
+            let offset = self
+                .block_on(alloc.allocate_block())
+                .map_err(std::io::Error::other)?;
+            out.push(DestTuple {
+                backend_id: idx as u32,
+                offset,
+            });
+        }
+        Ok(out)
+    }
+    fn read_source(&self, key: &str) -> std::io::Result<Vec<u8>> {
+        self.block_on(self.router.read_block(key, self.block_len))
+            .map(|b| b.to_vec())
+            .map_err(std::io::Error::other)
+    }
+    fn write_block(&self, dest: &DestTuple, data: &[u8]) -> std::io::Result<()> {
+        let be_id = self.id_of(dest)?.to_string();
+        let (_alloc, dev) = self
+            .router
+            .get_backend(&be_id)
+            .map_err(std::io::Error::other)?;
+        self.block_on(dev.write_block(dest.offset, bytes::Bytes::copy_from_slice(data)))
+            .map_err(std::io::Error::other)
+    }
+    fn read_block(&self, dest: &DestTuple) -> std::io::Result<Vec<u8>> {
+        let be_id = self.id_of(dest)?.to_string();
+        let (_alloc, dev) = self
+            .router
+            .get_backend(&be_id)
+            .map_err(std::io::Error::other)?;
+        self.block_on(dev.read_block(dest.offset, self.block_len))
+            .map(|b| b.to_vec())
+            .map_err(std::io::Error::other)
     }
 }
 
@@ -326,6 +452,7 @@ pub struct FakeShardDevice {
     block_len: usize,
     next_offset: AtomicU64,
     store: parking_lot::Mutex<HashMap<DestTuple, Vec<u8>>>,
+    sources: parking_lot::Mutex<HashMap<String, Vec<u8>>>,
     allocs: parking_lot::Mutex<Vec<Vec<DestTuple>>>,
 }
 
@@ -338,6 +465,7 @@ impl FakeShardDevice {
             block_len,
             next_offset: AtomicU64::new(0),
             store: parking_lot::Mutex::new(HashMap::new()),
+            sources: parking_lot::Mutex::new(HashMap::new()),
             allocs: parking_lot::Mutex::new(Vec::new()),
         })
     }
@@ -346,6 +474,11 @@ impl FakeShardDevice {
     /// in call order.
     pub fn allocations(&self) -> Vec<Vec<DestTuple>> {
         self.allocs.lock().clone()
+    }
+
+    /// Seed one source key for the copy-step shape (`read_source`).
+    pub fn seed_source(&self, key: &str, data: Vec<u8>) {
+        self.sources.lock().insert(key.to_string(), data);
     }
 }
 
@@ -369,6 +502,13 @@ impl ShardDeviceSeam for FakeShardDevice {
             self.allocs.lock().push(out.clone());
         }
         Ok(out)
+    }
+    fn read_source(&self, key: &str) -> std::io::Result<Vec<u8>> {
+        self.sources
+            .lock()
+            .get(key)
+            .cloned()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "unseeded source key"))
     }
     fn write_block(&self, dest: &DestTuple, data: &[u8]) -> std::io::Result<()> {
         self.store.lock().insert(dest.clone(), data.to_vec());
@@ -981,7 +1121,10 @@ impl JobWireHost {
                 tokio::time::sleep(Duration::from_millis(25)).await;
                 continue;
             };
-            let Some((job_id, ctl)) = self.fabric.claim_next() else {
+            // `true`: the wire claims only wire-executable job types —
+            // the VL4 movers stay on the local pool (their per-ino meta
+            // publish is coordinator-local; see `JobType::wire_executable`).
+            let Some((job_id, ctl)) = self.fabric.claim_next(true) else {
                 let _ =
                     tokio::time::timeout(Duration::from_millis(250), self.fabric.work_notified())
                         .await;
@@ -1661,13 +1804,32 @@ impl JobWireWorker {
             // 1. Fill the pre-allocated destinations in re-validated
             //    batches (the DMA phase of the mover shape).
             let mut checksums = Vec::with_capacity(shard.destinations.len());
-            'fill: for chunk in shard.destinations.chunks(REVALIDATE_BATCH) {
+            'fill: for (chunk_no, chunk) in shard.destinations.chunks(REVALIDATE_BATCH).enumerate()
+            {
                 if !revalidate_lease(&mut lease_rx, assigned_deadline, &writer, &opts, ttl).await {
                     aborted = true;
                     break 'fill;
                 }
-                for dest in chunk {
-                    let data = block_pattern(shard.shard_fencing, dest, shard.block_len as usize);
+                for (i, dest) in chunk.iter().enumerate() {
+                    let dest_idx = chunk_no * REVALIDATE_BATCH + i;
+                    // The copy step (VL4): a shard carrying source keys
+                    // is a mover-shaped copy — fill each destination
+                    // with the matching source's bytes read off shared
+                    // storage. Keyless shards keep the Noop pattern.
+                    let data = match shard.source_keys.get(dest_idx) {
+                        Some(key) => match seam.read_source(key) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                log::warn!(
+                                    "job worker: source read of '{key}' failed: {e} — \
+                                     aborting shard"
+                                );
+                                aborted = true;
+                                break 'fill;
+                            }
+                        },
+                        None => block_pattern(shard.shard_fencing, dest, shard.block_len as usize),
+                    };
                     if let Err(e) = seam.write_block(dest, &data) {
                         log::warn!("job worker: destination write failed: {e} — aborting shard");
                         aborted = true;
@@ -1711,6 +1873,19 @@ impl JobWireWorker {
                             }
                             remaining -= batch;
                         }
+                    }
+                    // The movers never reach the wire in v1.1
+                    // (`JobType::wire_executable` gates the dispatcher);
+                    // an assigned mover shard is a coordinator bug —
+                    // abort loudly, never fake-complete it.
+                    JobType::EvacuateVolume { .. } | JobType::Rebalance => {
+                        log::error!(
+                            "job worker: mover shard {}:{} reached the wire — the \
+                             dispatcher must not assign mover job types (v1.1); aborting",
+                            shard.job_id,
+                            shard.shard
+                        );
+                        aborted = true;
                     }
                 }
             }

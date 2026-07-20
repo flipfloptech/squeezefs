@@ -386,9 +386,15 @@ pub async fn probe_data_volume_rw(device: &str) -> Result<()> {
 ///    ids), `data_lv` mirrored;
 /// 6. clean shutdown (claims released).
 ///
-/// The §5.3 step-6 auto-rebalance default arms with the VL4 mover —
-/// callers print that honestly.
-pub async fn add_data_volume(meta_lvs: &[String], device: &str) -> Result<crate::DataVolumeRecord> {
+/// §5.3 step 6 (KD-12): the auto-rebalance default in its OFFLINE
+/// posture — no live mount exists, so the verb commits a durable
+/// **Queued** `rebalance` job record beside the volume record; the next
+/// mount's fabric adopts and runs it. `no_rebalance` suppresses it.
+pub async fn add_data_volume(
+    meta_lvs: &[String],
+    device: &str,
+    no_rebalance: bool,
+) -> Result<crate::DataVolumeRecord> {
     // 1. Live-client gate on EVERY volume before anything is touched.
     for path in meta_lvs {
         crate::meta_backend::kv::builder::format_preflight(Path::new(path), true)
@@ -415,7 +421,15 @@ pub async fn add_data_volume(meta_lvs: &[String], device: &str) -> Result<crate:
     };
     records.push(record.clone());
 
-    commit_volume_records(meta_lvs, cfg, records).await?;
+    let extra = if no_rebalance {
+        Vec::new()
+    } else {
+        vec![crate::jobs::durable_queued_job_xattr(
+            &crate::jobs::JobType::Rebalance,
+            crate::jobs::REBALANCE_DEFAULT_THROTTLE_PCT,
+        )]
+    };
+    commit_volume_records(meta_lvs, cfg, records, extra).await?;
     Ok(record)
 }
 
@@ -456,18 +470,317 @@ pub async fn set_data_volume_state(
         return Ok(()); // idempotent — never materializes records for a no-op
     }
     rec.state = state.to_string();
-    commit_volume_records(meta_lvs, cfg, records).await
+    commit_volume_records(meta_lvs, cfg, records, Vec::new()).await
+}
+
+/// `squeezefs volume undrain` — the OFFLINE guarded path (§5.4): flip a
+/// `draining` record back to `active` and mark the volume's durable
+/// evacuation-job records cancelled so no future mount adopts them.
+/// Retired volumes refuse (terminal — ids are permanent, KD-5).
+pub async fn undrain_data_volume(meta_lvs: &[String], volume_id: &str) -> Result<()> {
+    for path in meta_lvs {
+        crate::meta_backend::kv::builder::format_preflight(Path::new(path), true)
+            .await
+            .map_err(|e| {
+                SqueezefsError::InvalidOperation(format!("volume undrain refused: {e}"))
+            })?;
+    }
+    let cfg = read_volume_format_config(meta_lvs).await?;
+    let mut records = cfg.resolved_data_volumes();
+    let rec = records
+        .iter_mut()
+        .find(|r| r.id == volume_id)
+        .ok_or_else(|| {
+            SqueezefsError::InvalidOperation(format!(
+                "unknown data volume '{volume_id}' (see `squeezefs volume list`)"
+            ))
+        })?;
+    if rec.state != crate::VOL_STATE_DRAINING {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "volume '{volume_id}' is '{}', not draining — nothing to undrain (retired \
+             volumes never come back: ids are permanent, KD-5)",
+            rec.state
+        )));
+    }
+    rec.state = crate::VOL_STATE_ACTIVE.to_string();
+
+    // Cancel the durable evacuation records for this volume in the same
+    // guarded open (an adopted Queued/Running record would restart the
+    // drain at the next mount).
+    let backends = crate::meta_backend::open_meta_volume_set(meta_lvs).await?;
+    let routed = std::sync::Arc::new(crate::meta_backend::RoutedMetaBackend::new(backends));
+    let result: Result<()> = async {
+        for mut job in crate::jobs::JobFabric::list_records(&routed).await? {
+            let matches = matches!(
+                &job.job_type,
+                crate::jobs::JobType::EvacuateVolume { volume_id: v } if v == volume_id
+            );
+            if matches && !job.state.is_terminal() {
+                job.state = crate::jobs::JobState::Cancelled;
+                let name = format!("{}{}", crate::jobs::JOB_XATTR_PREFIX, job.job_id);
+                let bytes = serde_json::to_vec(&job).map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!("job record encode: {e}"))
+                })?;
+                crate::meta_backend::Metadata::setxattr(routed.as_ref(), 1, &name, &bytes).await?;
+            }
+        }
+        // The state flip rides the same open (bit 3 is already set —
+        // draining implies a prior lifecycle commit).
+        let mut cfg = cfg;
+        cfg.data_lv = Some(
+            records
+                .iter()
+                .filter(|r| r.state != crate::VOL_STATE_RETIRED)
+                .map(|r| r.backing_dev.clone())
+                .collect(),
+        );
+        cfg.data_volumes = Some(records);
+        let bytes = serde_json::to_vec(&cfg).map_err(|e| {
+            SqueezefsError::InvalidOperation(format!("failed to serialize the format config: {e}"))
+        })?;
+        crate::meta_backend::Metadata::setxattr(
+            routed.as_ref(),
+            1,
+            crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
+            &bytes,
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    for vol in &routed.volumes {
+        if let Err(e) = vol.shutdown().await {
+            log::warn!("releasing guard after undrain: {e}");
+        }
+    }
+    result
+}
+
+/// `squeezefs volume remove-data` — the OFFLINE posture (§5.8): the
+/// short-lived **D0-guarded coordinator process**. Guarded open of the
+/// whole set, an in-process data router + job fabric (mover wired, no
+/// FUSE surface), the §5.2 preflight, the durable `Active → Draining`
+/// flip, and the evacuation run **to completion** with progress output
+/// — the volume retires before this returns. Staging note (honest):
+/// the offline coordinator opens NO staging dirs (they are per-mount
+/// isolated); a cleanly-unmounted set carries no staged records by
+/// invariant, and anything ring-resident belongs to the next mount's
+/// recovery, not to this drain.
+pub async fn remove_data_volume_offline(
+    meta_lvs: &[String],
+    volume_id: &str,
+    throttle_pct: u32,
+) -> Result<()> {
+    use crate::error::SqueezefsError as E;
+    for path in meta_lvs {
+        crate::meta_backend::kv::builder::format_preflight(Path::new(path), true)
+            .await
+            .map_err(|e| E::InvalidOperation(format!("volume remove-data refused: {e}")))?;
+    }
+    let cfg = read_volume_format_config(meta_lvs).await?;
+    let records = cfg.resolved_data_volumes();
+    let victim = records.iter().find(|r| r.id == volume_id).ok_or_else(|| {
+        E::InvalidOperation(format!(
+            "unknown data volume '{volume_id}' (see `squeezefs volume list`)"
+        ))
+    })?;
+    if victim.state != crate::VOL_STATE_ACTIVE && victim.state != crate::VOL_STATE_DRAINING {
+        return Err(E::InvalidOperation(format!(
+            "volume '{volume_id}' is '{}' — only an active (or already-draining) volume \
+             can be removed",
+            victim.state
+        )));
+    }
+
+    // Guarded open (the D0 claims) + the in-process engine.
+    let backends = crate::meta_backend::open_meta_volume_set(meta_lvs).await?;
+    let routed = std::sync::Arc::new(crate::meta_backend::RoutedMetaBackend::new(backends));
+    let result = offline_drain_body(&routed, meta_lvs, cfg, records, volume_id, throttle_pct).await;
+    for vol in &routed.volumes {
+        if let Err(e) = vol.shutdown().await {
+            log::warn!("releasing guard after offline remove-data: {e}");
+        }
+    }
+    result
+}
+
+/// The offline coordinator body (split so the guard release above runs
+/// on every path).
+async fn offline_drain_body(
+    routed: &std::sync::Arc<crate::meta_backend::RoutedMetaBackend>,
+    meta_lvs: &[String],
+    cfg: crate::FormatConfig,
+    records: Vec<crate::DataVolumeRecord>,
+    volume_id: &str,
+    throttle_pct: u32,
+) -> Result<()> {
+    use crate::error::SqueezefsError as E;
+
+    // The in-process data plane: the mount-shaped router over the
+    // record set (retired members skipped; the first live record's
+    // device/allocator are the default slot — the bare-key invariant).
+    let dlm = crate::dlm::DlmClient::new("local")?;
+    let live: Vec<&crate::DataVolumeRecord> = records
+        .iter()
+        .filter(|r| r.state != crate::VOL_STATE_RETIRED)
+        .collect();
+    let first = live
+        .first()
+        .ok_or_else(|| E::InvalidOperation("no live data volumes".to_string()))?;
+    let first_alloc = std::sync::Arc::new(
+        crate::block_allocator::BlockAllocator::new(dlm.meta_client().clone(), &first.id).await?,
+    );
+    if let Ok(cap) = crate::nvme_dev::device_capacity_bytes(&first.backing_dev) {
+        first_alloc.set_capacity_bytes(cap);
+    }
+    let first_dev = std::sync::Arc::new(crate::nvme_dev::NvmeBlockDev::new(&first.backing_dev));
+    if cfg.block_size > 0 {
+        std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", cfg.block_size.to_string());
+    }
+    let cache = crate::cache::TieredCache::new(
+        Vec::new(), // no staging dirs: per-mount isolated, not ours (see the verb doc)
+        Some("64MB"),
+        Some("64MB"),
+        None,
+        None,
+        dlm.meta_client().clone(),
+        first_alloc.clone(),
+        first_dev.clone(),
+        None,
+    )
+    .await?;
+    let router = crate::routing::DataRouter::new(dlm.clone(), cache, first_alloc, first_dev);
+    router.set_block_size(cfg.block_size);
+    for rec in &live {
+        router
+            .backend_router
+            .register_backend(rec, dlm.meta_client().clone())
+            .await?;
+    }
+    router.backend_router.set_volume_records(records.clone());
+    router.set_meta_backend(routed.clone());
+
+    // Allocator refcount recovery — the census ground truth (§5.2).
+    for kv in &routed.volumes {
+        for entry in router.backend_router.backends.iter() {
+            entry
+                .value()
+                .block_allocator
+                .recover_active_blocks_v3(kv, &router.backend_router)
+                .await?;
+        }
+    }
+
+    // The fabric with the mover wired (router-only quiescence probe —
+    // no FUSE layer exists in this process by construction).
+    let fabric = crate::jobs::JobFabric::start(
+        routed.clone(),
+        2,
+        100,
+        Some(crate::jobs::MoverCtx::router_only(router.clone())),
+    )
+    .await?;
+
+    // §5.2 preflight (honest refusal with the exact numbers).
+    let ctx = fabric.mover_ctx().expect("mover context was just wired");
+    let pf = crate::jobs::drain_preflight(routed, ctx, volume_id, fabric.worker_count()).await?;
+    if !pf.admits() {
+        fabric.shutdown_abrupt().await;
+        return Err(E::InvalidOperation(pf.refusal()));
+    }
+    println!(
+        "preflight OK: needed {} B, avail {} B, transient {} B, headroom {} B",
+        pf.needed_bytes, pf.avail_bytes, pf.transient_bytes, pf.headroom_bytes
+    );
+
+    // Durable Active → Draining (bit 3 first, §7 ordering), one tx.
+    for path in meta_lvs {
+        crate::meta_backend::kv::superblock::set_volume_lifecycle_bit(Path::new(path)).await?;
+    }
+    if records
+        .iter()
+        .find(|r| r.id == volume_id)
+        .is_some_and(|r| r.state == crate::VOL_STATE_ACTIVE)
+    {
+        let mut cfg = cfg;
+        let mut recs = records.clone();
+        recs.iter_mut()
+            .find(|r| r.id == volume_id)
+            .expect("victim exists")
+            .state = crate::VOL_STATE_DRAINING.to_string();
+        cfg.data_volumes = Some(recs.clone());
+        let bytes = serde_json::to_vec(&cfg).map_err(|e| {
+            E::InvalidOperation(format!("failed to serialize the format config: {e}"))
+        })?;
+        crate::meta_backend::Metadata::setxattr(
+            routed.as_ref(),
+            1,
+            crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
+            &bytes,
+        )
+        .await?;
+        router.backend_router.set_volume_records(recs);
+    }
+
+    // Run the drain to completion in-process (§5.8), with progress.
+    let job_id = fabric
+        .submit(crate::jobs::JobSpec {
+            job_type: crate::jobs::JobType::EvacuateVolume {
+                volume_id: volume_id.to_string(),
+            },
+            throttle_pct,
+        })
+        .await?;
+    println!("draining '{volume_id}' (job {job_id}, throttle {throttle_pct} %)...");
+    let end = loop {
+        match fabric
+            .wait_terminal(&job_id, std::time::Duration::from_secs(10))
+            .await
+        {
+            Ok(state) => break state,
+            Err(_) => {
+                if let Some(st) = fabric.status(&job_id).await? {
+                    println!(
+                        "  ...{}/{} tasks ({:?})",
+                        st.tasks_done, st.tasks_total, st.state
+                    );
+                    if st.state == crate::jobs::JobState::PausedCapacity {
+                        fabric.shutdown_abrupt().await;
+                        return Err(E::InvalidOperation(
+                            "drain self-paused (paused-capacity): survivors ran out of \
+                             slack — free space and re-run `volume remove-data` (the job \
+                             resumes by re-planning)"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    };
+    fabric.shutdown_abrupt().await;
+    match end {
+        crate::jobs::JobState::Completed => {
+            println!("volume '{volume_id}' evacuated and retired.");
+            Ok(())
+        }
+        other => Err(E::InvalidOperation(format!(
+            "offline drain of '{volume_id}' ended {other:?} — re-run to resume (the plan \
+             regenerates idempotently, KD-6)"
+        ))),
+    }
 }
 
 /// The shared durable tail of every offline lifecycle commit: guarded
 /// open of the whole set (D0 claims — excludes racing mounts for the
 /// commit's duration), **bit 3 on every member superblock first**, then
 /// one setxattr tx on volume 0 with the updated records + `data_lv`
-/// mirror, then clean shutdown.
+/// mirror (+ any `extra_xattrs` riders, e.g. the KD-12 durable Queued
+/// rebalance record), then clean shutdown.
 async fn commit_volume_records(
     meta_lvs: &[String],
     mut cfg: crate::FormatConfig,
     records: Vec<crate::DataVolumeRecord>,
+    extra_xattrs: Vec<(String, Vec<u8>)>,
 ) -> Result<()> {
     let backends = crate::meta_backend::open_meta_volume_set(meta_lvs).await?;
 
@@ -486,17 +799,30 @@ async fn commit_volume_records(
         }
     }
 
-    cfg.data_lv = Some(records.iter().map(|r| r.backing_dev.clone()).collect());
+    cfg.data_lv = Some(
+        records
+            .iter()
+            .filter(|r| r.state != crate::VOL_STATE_RETIRED)
+            .map(|r| r.backing_dev.clone())
+            .collect(),
+    );
     cfg.data_volumes = Some(records);
     let bytes = serde_json::to_vec(&cfg).map_err(|e| {
         SqueezefsError::InvalidOperation(format!("failed to serialize the format config: {e}"))
     })?;
-    let commit = crate::meta_backend::Metadata::setxattr(
-        backends[0].as_ref(),
-        1,
-        crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
-        &bytes,
-    )
+    let commit = async {
+        crate::meta_backend::Metadata::setxattr(
+            backends[0].as_ref(),
+            1,
+            crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
+            &bytes,
+        )
+        .await?;
+        for (name, value) in &extra_xattrs {
+            crate::meta_backend::Metadata::setxattr(backends[0].as_ref(), 1, name, value).await?;
+        }
+        Ok::<(), crate::error::SqueezefsError>(())
+    }
     .await;
     for be in &backends {
         if let Err(te) = be.shutdown().await {

@@ -1,4 +1,5 @@
-//! The **durable job fabric** (PR VL2, design-volume-lifecycle §5.1).
+//! The **durable job fabric** (PR VL2, design-volume-lifecycle §5.1) and
+//! the **VL4 movers** (§5.4 data-volume drain / §5.3-step-6 rebalance).
 //!
 //! Coordinator-side core: durable schema-versioned job records on
 //! ino 1 (`job:` xattrs — v3 whole-tx atomicity + torn-write immunity
@@ -10,11 +11,28 @@
 //! re-plans; the progress record is advisory, never correctness-
 //! bearing).
 //!
-//! v1.1 job types land incrementally: VL2 ships the fabric itself with
-//! [`JobType::Noop`] (the fabric's own test/soak vehicle); VL4+ add
-//! the movers (evacuate/rebalance), VL6 fsck shards, VL7 defrag. The
-//! §5.1.6 remote-worker wire is PR VL2b.
+//! PR VL4 adds the mover job types on the same fabric:
+//!
+//! * [`JobType::EvacuateVolume`] — the `evacuate-data-volume` job:
+//!   census-planned copy-then-republish CoW (KD-6), shared-block
+//!   move-once with pre-publish refcount transfer (§5.4 step 2),
+//!   quiescent-first deferral of live-buffered blocks (§5.4 step 3),
+//!   re-plan convergence, checkpoint-time capacity re-verification with
+//!   `paused-capacity` self-pause (§5.2), and the retire commit.
+//! * [`JobType::Rebalance`] — the same mover with the §5.3-step-6
+//!   bounded-pass objective (bring under-filled volumes to within 10
+//!   percentage points of the set-mean fill), auto-submitted by
+//!   `volume add-data` unless `--no-rebalance` (KD-12).
+//!
+//! Mover discipline is §5.1.5 verbatim: no inode write guard across the
+//! copy (P1-8 — the copy is lock-free data plane over `NvmeBlockDev`
+//! io_uring); publish via `merge_block_mappings` (`MergeExpected`) under
+//! the ino's CURRENT fencing token — tokens are READ, never incremented,
+//! by movers; the durable copy completes before any meta commit is
+//! touched (P1-10 by construction); displaced sources free through
+//! `free_block`'s clone-aware `begin_free → purge → punch → finish_free`.
 
+use crate::fuse_client::METRICS;
 use crate::meta_backend::{Metadata, RoutedMetaBackend};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -36,31 +54,92 @@ const ROOT_INO: u64 = 1;
 const CHECKPOINT_TASKS: u64 = 256;
 const CHECKPOINT_SECS: u64 = 5;
 
-/// Job kinds. `Noop` is the fabric's own test/soak vehicle (sanctioned
-/// by the design's G-VL-7 instrument: "crash-resume with a no-op test
-/// task type") — each task sleeps `task_ms`, making duty cycle and
-/// progress directly measurable with zero I/O.
+/// §5.2: the in-flight mover window per worker — an in-flight moved
+/// block occupies source AND destination until the post-publish free;
+/// the preflight `transient` term bounds the double-count by this
+/// window × the ACTUAL configured worker count.
+pub const EVACUATE_INFLIGHT_WINDOW_BLOCKS: u64 = 64;
+
+/// §5.2: the headroom floor — foreground growth slack the preflight
+/// always reserves even when the write-rate estimate is zero.
+pub const DRAIN_HEADROOM_FLOOR_BYTES: u64 = 1 << 30;
+
+/// The G-VL-3(b)-derived floor rate the preflight's INITIAL
+/// `drain_eta` uses (½ of a ~1 GiB/s devsub-class raw copy). The live
+/// checkpoint re-verification replaces it with the measured job rate —
+/// which is what actually protects the survivors (§5.2).
+pub const DRAIN_FLOOR_RATE_BYTES_PER_SEC: u64 = 512 << 20;
+
+/// KD-12: the conservative default throttle of the auto-submitted
+/// rebalance pass on `volume add-data`.
+pub const REBALANCE_DEFAULT_THROTTLE_PCT: u32 = 25;
+
+/// §5.3-step-6 / §5.7 rebalance objective: bring every under-filled
+/// volume to within this many percentage points of the set-mean fill.
+const REBALANCE_BAND: f64 = 0.10;
+
+/// Backoff between re-plan passes when a pass made no progress
+/// (deferred blocks waiting on quiescence, in-flight victim
+/// allocations waiting on publish).
+const REPLAN_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Job kinds. `Noop` is the fabric's own test/soak vehicle (each task
+/// sleeps `task_ms`, making duty cycle and progress directly
+/// measurable with zero I/O); the movers are PR VL4.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum JobType {
-    Noop { tasks: u64, task_ms: u64 },
+    Noop {
+        tasks: u64,
+        task_ms: u64,
+    },
+    /// §5.4 `evacuate-data-volume`: drain every referenced block off the
+    /// victim volume, then retire it.
+    EvacuateVolume {
+        volume_id: String,
+    },
+    /// §5.3-step-6 / §5.7 `rebalance`: one bounded pass of the same
+    /// mover moving blocks from above-mean volumes toward under-filled
+    /// ones (within the 10 pp band).
+    Rebalance,
 }
 
 impl JobType {
+    /// The a-priori task count. Movers plan by census — their totals
+    /// are discovered per pass and published live to the control block.
     fn tasks_total(&self) -> u64 {
         match self {
             JobType::Noop { tasks, .. } => *tasks,
+            JobType::EvacuateVolume { .. } | JobType::Rebalance => 0,
         }
+    }
+
+    /// Whether the §5.1.6 wire may execute this job on a remote worker.
+    /// The VL4 movers are LOCAL-POOL ONLY in v1.1: their publish step is
+    /// coordinator-side `merge_block_mappings` per referencing ino,
+    /// which the wire's single verify-then-publish shard shape does not
+    /// carry yet (the copy step is wire-capable — `ShardDeviceSeam`
+    /// grew `read_source` and the production `RouterShardDevice` exists
+    /// — but a remote worker completing a mover job without the meta
+    /// publish would be a lie, so the dispatcher must not claim them).
+    pub(crate) fn wire_executable(&self) -> bool {
+        matches!(self, JobType::Noop { .. })
     }
 }
 
 /// Job lifecycle states. Terminal = `Completed`/`Cancelled`/`Failed`.
+/// `PausedCapacity` is the §5.2 self-pause: the drain's checkpoint-time
+/// capacity re-verification found the survivors' slack consumed and
+/// parked the job loudly instead of running them to StorageFull —
+/// `job resume` is the operator's call once space is freed.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum JobState {
     Queued,
     Running,
     Paused,
+    #[serde(rename = "paused-capacity")]
+    PausedCapacity,
     Cancelled,
     Completed,
     Failed,
@@ -73,11 +152,15 @@ impl JobState {
             JobState::Cancelled | JobState::Completed | JobState::Failed
         )
     }
+
+    fn is_paused(self) -> bool {
+        matches!(self, JobState::Paused | JobState::PausedCapacity)
+    }
 }
 
 /// The durable `job:{id}` record (schema v1). One JSON value, well
 /// under the xattr cap; large plans shard into `job:{id}:shard:{k}`
-/// records (the movers' shape — VL4+).
+/// records (the wire's shape).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct JobRecord {
     pub schema: u32,
@@ -114,6 +197,489 @@ pub struct JobStatus {
     pub throttle_pct: u32,
 }
 
+/// Encode a durable **Queued** job record for an offline lifecycle verb
+/// to commit alongside its own transaction (§5.3: an offline
+/// `volume add-data` writes the rebalance record the next mount's
+/// fabric adopts). Returns `(xattr_name, json_bytes)`.
+pub fn durable_queued_job_xattr(job_type: &JobType, throttle_pct: u32) -> (String, Vec<u8>) {
+    let rec = JobRecord {
+        schema: 1,
+        job_id: uuid::Uuid::new_v4().to_string(),
+        job_type: job_type.clone(),
+        state: JobState::Queued,
+        throttle_pct,
+        created_by: format!("{}:{} (offline)", hostname_lossy(), std::process::id()),
+        created_ts: unix_ts(),
+        tasks_done: 0,
+        tasks_total: job_type.tasks_total(),
+        error: None,
+    };
+    let name = format!("{JOB_XATTR_PREFIX}{}", rec.job_id);
+    let bytes = serde_json::to_vec(&rec).expect("job record serializes");
+    (name, bytes)
+}
+
+// ---------------------------------------------------------------------------
+// §5.2 capacity preflight — the closed form (G-VL-3 e)
+// ---------------------------------------------------------------------------
+
+/// The §5.2 preflight terms for removing a data volume. The closed
+/// form is normative: **refuse iff
+/// `avail < needed + transient + headroom`** — and a refusal prints the
+/// exact numbers (honest refusal).
+#[derive(Clone, Copy, Debug)]
+pub struct DrainPreflight {
+    /// Deduped census of referenced bytes on the victim (a clone-shared
+    /// block counts ONCE — the §5.4 move-once design).
+    pub needed_bytes: u64,
+    /// Σ free over healthy, `active` survivors (the victim excluded).
+    pub avail_bytes: u64,
+    /// The in-flight double-count window: 64 blocks × ACTUAL workers.
+    pub transient_bytes: u64,
+    /// `max(write_rate_est × drain_eta, 1 GiB)` — foreground growth
+    /// slack, re-verified at every checkpoint.
+    pub headroom_bytes: u64,
+}
+
+impl DrainPreflight {
+    pub fn required_bytes(&self) -> u64 {
+        self.needed_bytes
+            .saturating_add(self.transient_bytes)
+            .saturating_add(self.headroom_bytes)
+    }
+
+    pub fn admits(&self) -> bool {
+        self.avail_bytes >= self.required_bytes()
+    }
+
+    /// The honest refusal: every §5.2 term with its exact number.
+    pub fn refusal(&self) -> String {
+        format!(
+            "capacity preflight refused: avail {} B < needed {} B + transient {} B + \
+             headroom {} B (= {} B required) — design-volume-lifecycle §5.2",
+            self.avail_bytes,
+            self.needed_bytes,
+            self.transient_bytes,
+            self.headroom_bytes,
+            self.required_bytes()
+        )
+    }
+}
+
+/// §5.2 `transient`: copies live on both sides until the post-publish
+/// free — 64 blocks × the ACTUAL configured worker count.
+pub fn drain_transient_bytes(workers: usize, block_size: u64) -> u64 {
+    EVACUATE_INFLIGHT_WINDOW_BLOCKS
+        .saturating_mul(workers as u64)
+        .saturating_mul(block_size)
+}
+
+/// §5.2 `headroom = max(write_rate_est × drain_eta, 1 GiB)`.
+pub fn drain_headroom_bytes(write_rate_bytes_per_sec: u64, drain_eta_secs: u64) -> u64 {
+    write_rate_bytes_per_sec
+        .saturating_mul(drain_eta_secs)
+        .max(DRAIN_HEADROOM_FLOOR_BYTES)
+}
+
+/// The §5.2 `write_rate_est` instrument: trailing mean of foreground
+/// block consumption from the stats counters —
+/// `Δ(write_through_blocks) + Δ(extent_spills)` blocks over the trailing
+/// window (≤ 60 s), sampled at the coordinator's checkpoint cadence.
+/// (The design also names staged-flush promotions; those land in
+/// `write_through_blocks`-adjacent accounting and are covered by the
+/// headroom floor — stated honestly in the PR record.)
+pub struct WriteRateEstimator {
+    samples: parking_lot::Mutex<std::collections::VecDeque<(std::time::Instant, u64)>>,
+}
+
+impl WriteRateEstimator {
+    pub fn new() -> Self {
+        Self {
+            samples: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    fn counter_now() -> u64 {
+        METRICS
+            .write_through_blocks
+            .load(Ordering::Relaxed)
+            .saturating_add(METRICS.extent_spills.load(Ordering::Relaxed))
+    }
+
+    /// Record one sample (checkpoint cadence).
+    pub fn observe(&self) {
+        let mut s = self.samples.lock();
+        let now = std::time::Instant::now();
+        s.push_back((now, Self::counter_now()));
+        while let Some((t, _)) = s.front() {
+            if now.duration_since(*t) > Duration::from_secs(60) && s.len() > 2 {
+                s.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Trailing-window mean, in bytes/s. Zero until two samples exist.
+    pub fn bytes_per_sec(&self, block_size: u64) -> u64 {
+        let s = self.samples.lock();
+        let (Some((t0, c0)), Some((t1, c1))) = (s.front(), s.back()) else {
+            return 0;
+        };
+        let secs = t1.duration_since(*t0).as_secs_f64();
+        if secs < 0.001 {
+            return 0;
+        }
+        let blocks = c1.saturating_sub(*c0) as f64;
+        (blocks * block_size as f64 / secs) as u64
+    }
+}
+
+impl Default for WriteRateEstimator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mover context + test hook
+// ---------------------------------------------------------------------------
+
+/// Quiescence probe (§5.4 step 3): `true` = block `(ino, block_idx)`
+/// carries NO live active buffer, parked extents, or spilled
+/// `active_block_ext:` record — safe to move now.
+pub type QuiesceProbe = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
+
+/// What the movers need beyond the meta backend: the data router (block
+/// I/O, merges, DLM token reads) and the quiescence probe. The mount
+/// wires the FUSE layer's probe (RAM active buffers included);
+/// [`MoverCtx::router_only`] is the offline-coordinator shape (staging
+/// records only — nothing else is live by construction).
+pub struct MoverCtx {
+    pub router: crate::routing::DataRouter,
+    pub quiesce: QuiesceProbe,
+    /// The §5.2 write-rate estimator, sampled at checkpoint cadence.
+    pub write_rate: WriteRateEstimator,
+}
+
+impl MoverCtx {
+    pub fn new(router: crate::routing::DataRouter, quiesce: QuiesceProbe) -> Self {
+        Self {
+            router,
+            quiesce,
+            write_rate: WriteRateEstimator::new(),
+        }
+    }
+
+    /// The offline-coordinator probe: staging-visible state only (a
+    /// D0-guarded coordinator process has no FUSE layer, so no RAM
+    /// active buffers exist by construction).
+    pub fn router_only(router: crate::routing::DataRouter) -> Self {
+        let probe_router = router.clone();
+        let quiesce: QuiesceProbe = Arc::new(move |ino, b| {
+            let key = crate::keys::active_block(ino, b).to_string();
+            let ext = crate::keys::active_block_ext(ino, b).to_string();
+            !probe_router.cache.nvme.has_staged_active_block(&key)
+                && !probe_router.cache.nvme.has_staged_extent_record(&ext)
+        });
+        Self::new(router, quiesce)
+    }
+}
+
+/// Test hook: invoked with `(ino, block_idx)` immediately before each
+/// mover publish attempt (after the copy, before the flush-lock/merge) —
+/// the deterministic window the supersession and crash-injection tests
+/// need. `None` in production; invoking a set hook may block the worker
+/// (tests park it deliberately).
+static EVAC_PRE_PUBLISH_HOOK: parking_lot::RwLock<Option<Arc<dyn Fn(u64, u32) + Send + Sync>>> =
+    parking_lot::RwLock::new(None);
+
+pub fn set_evacuate_pre_publish_hook(hook: Arc<dyn Fn(u64, u32) + Send + Sync>) {
+    *EVAC_PRE_PUBLISH_HOOK.write() = Some(hook);
+}
+
+pub fn clear_evacuate_pre_publish_hook() {
+    *EVAC_PRE_PUBLISH_HOOK.write() = None;
+}
+
+/// Hooks may PARK (the tests' crash/supersession windows), so a set hook
+/// runs on the blocking pool and is awaited — the worker future stays
+/// abortable at this await (a kill-9 analog can drop it mid-park).
+async fn fire_pre_publish_hook(ino: u64, block_idx: u32) {
+    let hook = EVAC_PRE_PUBLISH_HOOK.read().clone();
+    if let Some(h) = hook {
+        let _ = tokio::task::spawn_blocking(move || h(ino, block_idx)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Census planner (§5.4 step 1)
+// ---------------------------------------------------------------------------
+
+/// One referencer of a victim block.
+#[derive(Clone, Debug)]
+struct MoveRef {
+    ino: u64,
+    block_idx: u32,
+    /// The mapping string VERBATIM as persisted (decoration included).
+    mapping: String,
+}
+
+/// One move task: a distinct source base offset and every referencer —
+/// a shared block moves ONCE (§5.4 step 2).
+struct MoveTask {
+    /// Clean base key (`clean_block_key` form) on the source volume.
+    base_key: String,
+    /// The source volume the base key parses to (rebalance uses it to
+    /// exclude the source from destination picks).
+    src_id: String,
+    refs: Vec<MoveRef>,
+    /// Rebalance: the planned destination volume id (`None` = the
+    /// lowest-fill eligible pick).
+    dest_hint: Option<String>,
+}
+
+/// A census pass over the durable inode trees.
+struct Census {
+    tasks: Vec<MoveTask>,
+    /// Global inos whose INDIRECT block-map blob lives on a source
+    /// volume — relocated by an empty merge (the save path reallocates
+    /// blobs off non-active volumes).
+    blob_relocations: Vec<u64>,
+    /// Distinct source blocks (tasks + blobs) — the §5.2 `needed`
+    /// census.
+    distinct_blocks: u64,
+}
+
+/// Whether a parsed backend id denotes `victim`, honoring the
+/// `backend_0`/legacy default-slot aliases exactly like allocator
+/// recovery does.
+fn key_owned_by(be_id: &str, victim: &str, victim_is_default_slot: bool) -> bool {
+    be_id == victim || ((be_id == "backend_0" || be_id == "squeezefs") && victim_is_default_slot)
+}
+
+/// Walk every meta volume's live inode tree and collect the blocks
+/// whose keys parse to one of `sources` (the `df` census walk shape —
+/// tree-walk-derived ground truth, deduped by offset: the §5.2 dedupe
+/// census and the §5.4 move-once grouping in one pass).
+async fn census_for(
+    meta: &Arc<RoutedMetaBackend>,
+    router: &crate::routing::DataRouter,
+    sources: &[String],
+) -> crate::error::Result<Census> {
+    use crate::meta_backend::kv::record::{decode_inode_key, inode_key, InodeValue};
+
+    let br = &router.backend_router;
+    let default_slot_sources: std::collections::HashSet<&str> = sources
+        .iter()
+        .filter(|id| {
+            br.backends.get(id.as_str()).is_some_and(|be| {
+                Arc::ptr_eq(&be.device, &br.default_device)
+                    && Arc::ptr_eq(&be.block_allocator, &br.default_allocator)
+            })
+        })
+        .map(|s| s.as_str())
+        .collect();
+    let owner_of = |mapping: &str| -> Option<(String, String, u64)> {
+        let clean = crate::routing::clean_block_key(mapping);
+        let (be_id, offset) = br.parse_block_key(&clean).ok()?;
+        for src in sources {
+            if key_owned_by(&be_id, src, default_slot_sources.contains(src.as_str())) {
+                return Some((src.clone(), clean, offset));
+            }
+        }
+        None
+    };
+
+    let block_size = router.block_size.load(Ordering::Relaxed) as usize;
+    let mut by_offset: HashMap<String, MoveTask> = HashMap::new();
+    let mut blob_relocations = Vec::new();
+    let mut blob_blocks = 0u64;
+
+    for (vol_idx, kv) in meta.volumes.iter().enumerate() {
+        let inodes = kv.trees()[0];
+        let mut cursor: Vec<u8> = inode_key(1).to_vec();
+        let end = inode_key(u64::MAX - 1);
+        loop {
+            let page = inodes.range(&cursor, &end, 512).await.map_err(|e| {
+                crate::error::SqueezefsError::InvalidOperation(format!(
+                    "evacuation census inode walk failed: {e}"
+                ))
+            })?;
+            let Some((last_key, _)) = page.last() else {
+                break;
+            };
+            cursor = crate::meta_backend::kv::node::key_successor(last_key);
+            for (k, v) in &page {
+                let Ok(local_ino) = decode_inode_key(k) else {
+                    continue;
+                };
+                let Ok(val) = InodeValue::decode(v) else {
+                    continue;
+                };
+                if val.nlink == 0 {
+                    continue;
+                }
+                let Ok(Some(bytes)) = kv.getxattr(local_ino, "layout").await else {
+                    continue;
+                };
+                let layout: Option<crate::routing::LayoutMetadata> = if bytes.starts_with(b"{") {
+                    serde_json::from_slice(&bytes).ok()
+                } else {
+                    bincode::deserialize(&bytes).ok()
+                };
+                let Some(layout) = layout else { continue };
+                let global_ino = meta.make_global_ino(local_ino, vol_idx);
+
+                // The block-map entries: inline, or rehydrated from the
+                // indirect blob (whose own block may also need moving).
+                let mut entries: Vec<(u32, String)> = Vec::new();
+                let mut indirect_on_source = false;
+                if let Some(ref map_id) = layout.block_map_id {
+                    if let Some(blob_key) = map_id.strip_prefix("indirect:") {
+                        if owner_of(blob_key).is_some() {
+                            indirect_on_source = true;
+                        }
+                        match br.read_block(blob_key, block_size).await {
+                            Ok(raw) => {
+                                if let Ok(decoded) = crate::routing::decode_indirect_block_map(&raw)
+                                {
+                                    entries = decoded;
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "evacuation census: ino {global_ino} indirect map at \
+                                     '{blob_key}' unreadable: {e} — revisited next pass"
+                                );
+                            }
+                        }
+                    }
+                }
+                if entries.is_empty() {
+                    if let Some(ref bm) = layout.block_map {
+                        entries = bm.iter().map(|(&b, key)| (b, key.clone())).collect();
+                    }
+                }
+                if indirect_on_source {
+                    blob_relocations.push(global_ino);
+                    blob_blocks += 1;
+                }
+                for (b, mapping) in entries {
+                    let Some((src_id, clean, _offset)) = owner_of(&mapping) else {
+                        continue;
+                    };
+                    by_offset
+                        .entry(clean.clone())
+                        .or_insert_with(|| MoveTask {
+                            base_key: clean,
+                            src_id,
+                            refs: Vec::new(),
+                            dest_hint: None,
+                        })
+                        .refs
+                        .push(MoveRef {
+                            ino: global_ino,
+                            block_idx: b,
+                            mapping,
+                        });
+                }
+            }
+        }
+    }
+
+    let mut tasks: Vec<MoveTask> = by_offset.into_values().collect();
+    for t in &mut tasks {
+        // Ascending-ino publish order (§5.4 step 2).
+        t.refs.sort_by_key(|r| (r.ino, r.block_idx));
+    }
+    let distinct_blocks = tasks.len() as u64 + blob_blocks;
+    Ok(Census {
+        tasks,
+        blob_relocations,
+        distinct_blocks,
+    })
+}
+
+/// §5.2 `avail`: Σ free over placement-eligible survivors (durable
+/// state `active`, healthy), the sources excluded. Unbounded allocators
+/// (capacity 0 — offline tools) contribute nothing: conservative.
+fn avail_elsewhere(router: &crate::routing::DataRouter, exclude: &[String]) -> u64 {
+    let br = &router.backend_router;
+    let mut avail = 0u64;
+    for entry in br.backends.iter() {
+        let be_id = entry.key();
+        if exclude.iter().any(|e| e == be_id) || !br.placement_eligible(be_id) {
+            continue;
+        }
+        let alloc = &entry.value().block_allocator;
+        let cap = alloc.capacity_bytes();
+        if cap == 0 {
+            log::warn!(
+                "capacity preflight: volume '{be_id}' has no capacity bound — \
+                 contributing 0 B to avail (conservative)"
+            );
+            continue;
+        }
+        avail = avail.saturating_add(
+            cap.saturating_sub(alloc.get_used_blocks().saturating_mul(alloc.chunk_size())),
+        );
+    }
+    avail
+}
+
+/// The full §5.2 preflight for removing `volume_id`: dedupe census on
+/// the victim, survivor availability, the worker-window transient, and
+/// the write-rate/ETA headroom. `workers` is the ACTUAL configured
+/// worker count.
+pub async fn drain_preflight(
+    meta: &Arc<RoutedMetaBackend>,
+    ctx: &MoverCtx,
+    volume_id: &str,
+    workers: usize,
+) -> crate::error::Result<DrainPreflight> {
+    let block_size = ctx.router.block_size.load(Ordering::Relaxed);
+    let census = census_for(meta, &ctx.router, &[volume_id.to_string()]).await?;
+    let needed_bytes = census.distinct_blocks.saturating_mul(block_size);
+    ctx.write_rate.observe();
+    let rate = ctx.write_rate.bytes_per_sec(block_size);
+    let eta_secs = needed_bytes / DRAIN_FLOOR_RATE_BYTES_PER_SEC.max(1) + 1;
+    Ok(DrainPreflight {
+        needed_bytes,
+        avail_bytes: avail_elsewhere(&ctx.router, &[volume_id.to_string()]),
+        transient_bytes: drain_transient_bytes(workers, block_size),
+        headroom_bytes: drain_headroom_bytes(rate, eta_secs),
+    })
+}
+
+/// Charge scope for the copy window: `job_copy_buffer_bytes` (the R5
+/// component) + `evacuate_inflight_bytes`, released on drop so an
+/// aborted worker can never leak the gauges.
+struct CopyCharge(u64);
+
+impl CopyCharge {
+    fn new(bytes: u64) -> Self {
+        METRICS
+            .job_copy_buffer_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        METRICS
+            .evacuate_inflight_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        Self(bytes)
+    }
+}
+
+impl Drop for CopyCharge {
+    fn drop(&mut self) {
+        METRICS
+            .job_copy_buffer_bytes
+            .fetch_sub(self.0, Ordering::Relaxed);
+        METRICS
+            .evacuate_inflight_bytes
+            .fetch_sub(self.0, Ordering::Relaxed);
+    }
+}
+
 /// Live per-job control block: the workers' and control verbs' shared
 /// truth between checkpoints. `pub(crate)` since PR VL2b: the §5.1.6
 /// wire's coordinator is the second population driving the same claims
@@ -126,9 +692,11 @@ pub(crate) struct JobCtl {
     pub(crate) throttle: AtomicU32,
     /// Tasks completed (live; checkpointed on cadence).
     pub(crate) done: AtomicU64,
-    pub(crate) tasks_total: u64,
-    /// One worker owns a job at a time in VL2 (shard-level parallelism
-    /// arrives with the real movers' multi-shard plans).
+    /// Planned tasks. Static for `Noop`; the movers publish their
+    /// census-discovered totals here per pass (advisory progress).
+    pub(crate) tasks_total: AtomicU64,
+    /// One worker owns a job at a time (shard-level parallelism is the
+    /// wire's business).
     claimed: AtomicBool,
     state: parking_lot::Mutex<JobState>,
     terminal: Notify,
@@ -152,6 +720,10 @@ pub struct JobFabric {
     meta: Arc<RoutedMetaBackend>,
     jobs: parking_lot::Mutex<HashMap<String, Arc<JobCtl>>>,
     default_throttle: u32,
+    workers: usize,
+    /// The mover context (`None` = fabric-only wiring: unit tests, the
+    /// pre-VL4 remote-wire tests — mover jobs FAIL loud without it).
+    mover: Option<MoverCtx>,
     work: Notify,
     shutdown: AtomicBool,
     handles: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -160,19 +732,22 @@ pub struct JobFabric {
 impl JobFabric {
     /// Start the fabric: adopt durable non-terminal records (crash-
     /// resume by plan regeneration), then spawn `workers` local pool
-    /// tasks. `default_throttle` backs specs submitted with `0`… no —
-    /// spec percentages pass through verbatim; this is the mount's
-    /// `--job-cpu-limit` default applied when a job is submitted
-    /// without an explicit throttle by higher layers.
+    /// tasks. `default_throttle` is the mount's `--job-cpu-limit`
+    /// default applied when a job is submitted without an explicit
+    /// throttle. `mover` wires the VL4 movers (the mount and the
+    /// offline coordinator pass it; fabric-only tests pass `None`).
     pub async fn start(
         meta: Arc<RoutedMetaBackend>,
         workers: usize,
         default_throttle: u32,
+        mover: Option<MoverCtx>,
     ) -> crate::error::Result<Arc<Self>> {
         let fabric = Arc::new(Self {
             meta,
             jobs: parking_lot::Mutex::new(HashMap::new()),
             default_throttle,
+            workers: workers.max(1),
+            mover,
             work: Notify::new(),
             shutdown: AtomicBool::new(false),
             handles: parking_lot::Mutex::new(Vec::new()),
@@ -181,7 +756,7 @@ impl JobFabric {
         // Crash-resume (KD-6): every durable non-terminal record is
         // adopted. Running/Queued re-queue (the plan regenerates from
         // the record); Paused stays paused (operator intent survives
-        // the crash).
+        // the crash — capacity self-pauses included).
         for rec in Self::list_records(&fabric.meta).await? {
             if rec.state.is_terminal() {
                 continue;
@@ -193,21 +768,21 @@ impl JobFabric {
                 rec.tasks_done,
                 rec.tasks_total
             );
-            let adopted_state = match rec.state {
-                JobState::Paused => JobState::Paused,
-                _ => JobState::Queued,
+            let adopted_state = if rec.state.is_paused() {
+                rec.state
+            } else {
+                JobState::Queued
             };
             let ctl = Arc::new(JobCtl {
                 job_type: rec.job_type.clone(),
-                paused: AtomicBool::new(adopted_state == JobState::Paused),
+                paused: AtomicBool::new(adopted_state.is_paused()),
                 cancelled: AtomicBool::new(false),
                 throttle: AtomicU32::new(rec.throttle_pct),
                 // Plan regeneration, not trust: Noop's "current state"
-                // is the checkpointed cursor (advisory), and the plan
-                // is completed idempotently from there. Real movers
-                // re-census instead (VL4).
+                // is the checkpointed cursor (advisory); the movers
+                // re-census (KD-6).
                 done: AtomicU64::new(rec.tasks_done),
-                tasks_total: rec.tasks_total,
+                tasks_total: AtomicU64::new(rec.tasks_total),
                 claimed: AtomicBool::new(false),
                 state: parking_lot::Mutex::new(adopted_state),
                 terminal: Notify::new(),
@@ -254,15 +829,13 @@ impl JobFabric {
             cancelled: AtomicBool::new(false),
             throttle: AtomicU32::new(throttle),
             done: AtomicU64::new(0),
-            tasks_total: rec.tasks_total,
+            tasks_total: AtomicU64::new(rec.tasks_total),
             claimed: AtomicBool::new(false),
             state: parking_lot::Mutex::new(JobState::Queued),
             terminal: Notify::new(),
         });
         self.jobs.lock().insert(job_id.clone(), ctl);
-        crate::fuse_client::METRICS
-            .job_submitted
-            .fetch_add(1, Ordering::Relaxed);
+        METRICS.job_submitted.fetch_add(1, Ordering::Relaxed);
         self.work.notify_waiters();
         Ok(job_id)
     }
@@ -275,7 +848,7 @@ impl JobFabric {
                 job_id: job_id.to_string(),
                 state: ctl.state(),
                 tasks_done: ctl.done.load(Ordering::Relaxed),
-                tasks_total: ctl.tasks_total,
+                tasks_total: ctl.tasks_total.load(Ordering::Relaxed),
                 throttle_pct: ctl.throttle.load(Ordering::Relaxed),
             }));
         }
@@ -290,6 +863,17 @@ impl JobFabric {
             }))
     }
 
+    /// Every live control block of a given job type (the undrain path
+    /// cancels the victim's evacuation jobs through this).
+    pub fn jobs_matching(&self, pred: impl Fn(&JobType) -> bool) -> Vec<(String, JobState)> {
+        self.jobs
+            .lock()
+            .iter()
+            .filter(|(_, ctl)| pred(&ctl.job_type))
+            .map(|(id, ctl)| (id.clone(), ctl.state()))
+            .collect()
+    }
+
     /// Pause: workers stop pulling tasks after the in-flight one; the
     /// state change is durable.
     pub async fn pause(&self, job_id: &str) -> crate::error::Result<()> {
@@ -301,11 +885,12 @@ impl JobFabric {
         self.checkpoint(job_id, &ctl).await
     }
 
-    /// Resume a paused job.
+    /// Resume a paused job (operator pauses AND `paused-capacity`
+    /// self-pauses — freeing space and resuming is the §5.2 recovery).
     pub async fn resume(&self, job_id: &str) -> crate::error::Result<()> {
         let ctl = self.require(job_id)?;
         ctl.paused.store(false, Ordering::SeqCst);
-        if ctl.state() == JobState::Paused {
+        if ctl.state().is_paused() {
             ctl.set_state(JobState::Queued);
         }
         self.checkpoint(job_id, &ctl).await?;
@@ -321,9 +906,7 @@ impl JobFabric {
         if !ctl.state().is_terminal() {
             ctl.set_state(JobState::Cancelled);
         }
-        crate::fuse_client::METRICS
-            .job_cancelled
-            .fetch_add(1, Ordering::Relaxed);
+        METRICS.job_cancelled.fetch_add(1, Ordering::Relaxed);
         self.checkpoint(job_id, &ctl).await?;
         self.work.notify_waiters();
         Ok(())
@@ -420,23 +1003,33 @@ impl JobFabric {
         &self.meta
     }
 
+    /// The configured local worker count — the §5.2 `transient` term's
+    /// "ACTUAL configured workers".
+    pub fn worker_count(&self) -> usize {
+        self.workers
+    }
+
+    /// The mover context, when wired (the admin remove-data preflight
+    /// runs through it).
+    pub fn mover_ctx(&self) -> Option<&MoverCtx> {
+        self.mover.as_ref()
+    }
+
     /// R5 shed hook for the `job_copy_buffers` component (§5.1.5): under
     /// memory pressure, pause every running job — loud, durable via the
     /// workers' pause checkpoints, and deliberately NOT self-resuming
     /// (`job resume` is the operator's call once pressure clears). The
-    /// gauge is worker copy-buffer bytes (0 until the VL4 movers charge
-    /// it), so this fires only when real buffers exist.
+    /// gauge is worker copy-buffer bytes, so this fires only when real
+    /// buffers exist.
     pub fn shed_to(&self, target: u64) {
-        let gauge = crate::fuse_client::METRICS
-            .job_copy_buffer_bytes
-            .load(Ordering::Relaxed);
+        let gauge = METRICS.job_copy_buffer_bytes.load(Ordering::Relaxed);
         if gauge <= target {
             return;
         }
         for (id, ctl) in self.jobs.lock().iter() {
             if ctl.state() == JobState::Running {
                 ctl.paused.store(true, Ordering::SeqCst);
-                crate::fuse_client::METRICS
+                METRICS
                     .job_paused_mem_pressure
                     .fetch_add(1, Ordering::Relaxed);
                 log::warn!(
@@ -470,7 +1063,7 @@ impl JobFabric {
             crate::error::SqueezefsError::InvalidOperation(format!("job record encode: {e}"))
         })?;
         self.meta.setxattr(ROOT_INO, &name, &bytes).await?;
-        crate::fuse_client::METRICS
+        METRICS
             .job_checkpoint_writes
             .fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -495,17 +1088,21 @@ impl JobFabric {
         };
         rec.state = state;
         rec.tasks_done = ctl.done.load(Ordering::Relaxed);
+        rec.tasks_total = ctl.tasks_total.load(Ordering::Relaxed);
         rec.throttle_pct = ctl.throttle.load(Ordering::Relaxed);
         self.persist(&rec).await
     }
 
-    /// Claim the next runnable job (Queued, unclaimed). `pub(crate)`:
-    /// the §5.1.6 wire dispatcher claims through the same gate as the
-    /// local pool — one claim law for both populations (KD-1).
-    pub(crate) fn claim_next(&self) -> Option<(String, Arc<JobCtl>)> {
+    /// Claim the next runnable job (Queued, unclaimed). `for_wire`
+    /// restricts the pick to wire-executable job types — the §5.1.6
+    /// dispatcher must never claim a mover (its meta publish is
+    /// coordinator-local; a remote "completion" without it would be a
+    /// lie). The local pool claims everything.
+    pub(crate) fn claim_next(&self, for_wire: bool) -> Option<(String, Arc<JobCtl>)> {
         let jobs = self.jobs.lock();
         for (id, ctl) in jobs.iter() {
-            if ctl.state() == JobState::Queued
+            if (!for_wire || ctl.job_type.wire_executable())
+                && ctl.state() == JobState::Queued
                 && !ctl.paused.load(Ordering::SeqCst)
                 && ctl
                     .claimed
@@ -536,17 +1133,14 @@ impl JobFabric {
         if ctl.state().is_terminal() {
             return;
         }
-        let executed = ctl
-            .tasks_total
-            .saturating_sub(ctl.done.load(Ordering::Relaxed));
-        ctl.done.store(ctl.tasks_total, Ordering::Relaxed);
-        crate::fuse_client::METRICS
+        let total = ctl.tasks_total.load(Ordering::Relaxed);
+        let executed = total.saturating_sub(ctl.done.load(Ordering::Relaxed));
+        ctl.done.store(total, Ordering::Relaxed);
+        METRICS
             .job_tasks_done
             .fetch_add(executed, Ordering::Relaxed);
         let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
-        crate::fuse_client::METRICS
-            .job_completed
-            .fetch_add(1, Ordering::Relaxed);
+        METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
         ctl.set_state(JobState::Completed);
     }
 
@@ -575,7 +1169,7 @@ impl JobFabric {
             if self.shutdown.load(Ordering::SeqCst) {
                 return;
             }
-            let Some((job_id, ctl)) = self.claim_next() else {
+            let Some((job_id, ctl)) = self.claim_next(false) else {
                 // Park until submitted/resumed work (bounded so a lost
                 // notify cannot strand the pool).
                 let _ =
@@ -589,10 +1183,21 @@ impl JobFabric {
         }
     }
 
-    /// Execute one job until terminal/paused. Duty-cycle throttle after
-    /// every task (KD-3, live-re-read); checkpoint on the §5.1.2
-    /// cadence.
+    /// Execute one job until terminal/paused.
     async fn run_job(&self, job_id: &str, ctl: &JobCtl) {
+        match ctl.job_type.clone() {
+            JobType::Noop { .. } => self.run_noop(job_id, ctl).await,
+            JobType::EvacuateVolume { volume_id } => {
+                self.run_mover(job_id, ctl, MoverObjective::Drain { volume_id })
+                    .await
+            }
+            JobType::Rebalance => self.run_mover(job_id, ctl, MoverObjective::Rebalance).await,
+        }
+    }
+
+    /// The Noop vehicle: duty-cycle throttle after every task (KD-3,
+    /// live-re-read); checkpoint on the §5.1.2 cadence.
+    async fn run_noop(&self, job_id: &str, ctl: &JobCtl) {
         let mut since_checkpoint = 0u64;
         let mut last_checkpoint = tokio::time::Instant::now();
         loop {
@@ -607,13 +1212,11 @@ impl JobFabric {
                 return;
             }
             let done = ctl.done.load(Ordering::Relaxed);
-            if done >= ctl.tasks_total {
+            if done >= ctl.tasks_total.load(Ordering::Relaxed) {
                 // Durable-then-visible: the record flips terminal on
                 // disk before any waiter can observe it live.
                 let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
-                crate::fuse_client::METRICS
-                    .job_completed
-                    .fetch_add(1, Ordering::Relaxed);
+                METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
                 ctl.set_state(JobState::Completed);
                 return;
             }
@@ -623,11 +1226,10 @@ impl JobFabric {
                 JobType::Noop { task_ms, .. } => {
                     tokio::time::sleep(Duration::from_millis(*task_ms)).await;
                 }
+                _ => unreachable!("run_noop only executes Noop jobs"),
             }
             ctl.done.fetch_add(1, Ordering::Relaxed);
-            crate::fuse_client::METRICS
-                .job_tasks_done
-                .fetch_add(1, Ordering::Relaxed);
+            METRICS.job_tasks_done.fetch_add(1, Ordering::Relaxed);
             since_checkpoint += 1;
 
             if since_checkpoint >= CHECKPOINT_TASKS
@@ -645,6 +1247,756 @@ impl JobFabric {
             }
         }
     }
+
+    // -----------------------------------------------------------------
+    // The VL4 movers (§5.4 / §5.7-rebalance)
+    // -----------------------------------------------------------------
+
+    /// Run one mover job to a terminal/paused state, translating errors
+    /// into a loud durable `Failed`.
+    async fn run_mover(&self, job_id: &str, ctl: &JobCtl, objective: MoverObjective) {
+        match self.mover_body(job_id, ctl, &objective).await {
+            Ok(()) => {}
+            Err(e) => {
+                log::error!("job {job_id}: mover failed: {e}");
+                if !ctl.state().is_terminal() && !ctl.state().is_paused() {
+                    if let Ok(Some(mut rec)) = Self::read_record(&self.meta, job_id).await {
+                        rec.state = JobState::Failed;
+                        rec.error = Some(e.clone());
+                        rec.tasks_done = ctl.done.load(Ordering::Relaxed);
+                        let _ = self.persist(&rec).await;
+                    }
+                    METRICS.job_failed.fetch_add(1, Ordering::Relaxed);
+                    ctl.set_state(JobState::Failed);
+                }
+            }
+        }
+        // The drain gauges describe the ACTIVE drain only.
+        METRICS.evacuate_needed_bytes.store(0, Ordering::Relaxed);
+        METRICS.evacuate_avail_bytes.store(0, Ordering::Relaxed);
+        METRICS.evacuate_transient_bytes.store(0, Ordering::Relaxed);
+    }
+
+    async fn mover_body(
+        &self,
+        job_id: &str,
+        ctl: &JobCtl,
+        objective: &MoverObjective,
+    ) -> Result<(), String> {
+        let ctx = self.mover.as_ref().ok_or_else(|| {
+            "mover jobs need a mover context (not wired on this fabric)".to_string()
+        })?;
+        let block_size = ctx.router.block_size.load(Ordering::Relaxed);
+        let mut last_checkpoint = tokio::time::Instant::now();
+        let mut since_checkpoint = 0u64;
+        let started = tokio::time::Instant::now();
+        let moved_at_start = METRICS.evacuate_bytes_moved.load(Ordering::Relaxed);
+
+        loop {
+            if ctl.cancelled.load(Ordering::SeqCst) {
+                let _ = self.checkpoint_as(job_id, ctl, JobState::Cancelled).await;
+                ctl.set_state(JobState::Cancelled);
+                return Ok(());
+            }
+            if ctl.paused.load(Ordering::SeqCst) {
+                let st = if ctl.state() == JobState::PausedCapacity {
+                    JobState::PausedCapacity
+                } else {
+                    JobState::Paused
+                };
+                let _ = self.checkpoint_as(job_id, ctl, st).await;
+                ctl.set_state(st);
+                return Ok(());
+            }
+
+            // Plan regeneration per pass (KD-6): census from CURRENT
+            // durable state — idempotent by construction.
+            let (census, victim) = match objective {
+                MoverObjective::Drain { volume_id } => {
+                    // An externally-undrained volume ends the job as
+                    // cancelled (the undrain verb also cancels
+                    // explicitly; this covers offline/adopted races).
+                    match ctx.router.backend_router.volume_state(volume_id) {
+                        Some(state) if state == crate::VOL_STATE_DRAINING => {}
+                        other => {
+                            log::warn!(
+                                "job {job_id}: volume '{volume_id}' is {:?}, not draining — \
+                                 ending the evacuation as cancelled",
+                                other
+                            );
+                            ctl.cancelled.store(true, Ordering::SeqCst);
+                            continue;
+                        }
+                    }
+                    (
+                        census_for(&self.meta, &ctx.router, &[volume_id.clone()])
+                            .await
+                            .map_err(|e| format!("census failed: {e}"))?,
+                        Some(volume_id.clone()),
+                    )
+                }
+                MoverObjective::Rebalance => {
+                    let plan = plan_rebalance(&ctx.router);
+                    if plan.is_empty() {
+                        // Balanced (or nothing eligible): the bounded
+                        // pass has nothing to do.
+                        let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
+                        METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
+                        ctl.set_state(JobState::Completed);
+                        return Ok(());
+                    }
+                    let sources: Vec<String> = plan.iter().map(|p| p.source.clone()).collect();
+                    let mut census = census_for(&self.meta, &ctx.router, &sources)
+                        .await
+                        .map_err(|e| format!("census failed: {e}"))?;
+                    bound_rebalance_census(&mut census, &plan, block_size);
+                    (census, None)
+                }
+            };
+
+            // Publish the discovered totals (advisory progress).
+            let remaining = census.tasks.len() as u64 + census.blob_relocations.len() as u64;
+            ctl.tasks_total.store(
+                ctl.done.load(Ordering::Relaxed) + remaining,
+                Ordering::Relaxed,
+            );
+
+            // §5.2 capacity re-verification (drains): needed = the
+            // remaining census; avail from the survivors; headroom from
+            // the LIVE write-rate estimate and the measured job rate.
+            if let Some(victim_id) = victim.as_deref() {
+                ctx.write_rate.observe();
+                let needed_bytes = census.distinct_blocks.saturating_mul(block_size);
+                let rate = ctx.write_rate.bytes_per_sec(block_size);
+                // drain_eta = needed / measured_job_rate from the first
+                // checkpoint onward; the initial estimate uses the
+                // G-VL-3(b) floor rate (§5.2).
+                let moved = METRICS
+                    .evacuate_bytes_moved
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(moved_at_start);
+                let elapsed = started.elapsed().as_secs().max(1);
+                let job_rate = if moved > 0 {
+                    (moved / elapsed).max(1)
+                } else {
+                    DRAIN_FLOOR_RATE_BYTES_PER_SEC
+                };
+                let eta = needed_bytes / job_rate + 1;
+                let pf = DrainPreflight {
+                    needed_bytes,
+                    avail_bytes: avail_elsewhere(&ctx.router, &[victim_id.to_string()]),
+                    transient_bytes: drain_transient_bytes(self.workers, block_size),
+                    headroom_bytes: drain_headroom_bytes(rate, eta),
+                };
+                METRICS
+                    .evacuate_needed_bytes
+                    .store(pf.needed_bytes, Ordering::Relaxed);
+                METRICS
+                    .evacuate_avail_bytes
+                    .store(pf.avail_bytes, Ordering::Relaxed);
+                METRICS
+                    .evacuate_transient_bytes
+                    .store(pf.transient_bytes, Ordering::Relaxed);
+                if !pf.admits() {
+                    METRICS.job_paused_capacity.fetch_add(1, Ordering::Relaxed);
+                    log::error!(
+                        "job {job_id}: drain of '{victim_id}' self-paused (paused-capacity) — \
+                         foreground writes consumed the slack: {}",
+                        pf.refusal()
+                    );
+                    ctl.paused.store(true, Ordering::SeqCst);
+                    ctl.set_state(JobState::PausedCapacity);
+                    let _ = self
+                        .checkpoint_as(job_id, ctl, JobState::PausedCapacity)
+                        .await;
+                    return Ok(());
+                }
+            }
+
+            // Convergence check: census empty (and, for drains, the
+            // victim's allocator drained — an in-flight foreground write
+            // that pre-dates the draining flip still holds an allocated
+            // offset until its publish; retire must wait for it).
+            let mut deferred_this_pass = 0u64;
+            if census.tasks.is_empty() && census.blob_relocations.is_empty() {
+                match objective {
+                    MoverObjective::Rebalance => {
+                        let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
+                        METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
+                        ctl.set_state(JobState::Completed);
+                        return Ok(());
+                    }
+                    MoverObjective::Drain { volume_id } => {
+                        let victim_used = ctx
+                            .router
+                            .backend_router
+                            .backends
+                            .get(volume_id)
+                            .map(|be| be.block_allocator.get_used_blocks())
+                            .unwrap_or(0);
+                        if victim_used == 0 {
+                            self.retire_volume(volume_id, ctx).await?;
+                            let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
+                            METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
+                            ctl.set_state(JobState::Completed);
+                            log::info!("job {job_id}: volume '{volume_id}' evacuated and retired");
+                            return Ok(());
+                        }
+                        log::info!(
+                            "job {job_id}: census empty but '{volume_id}' still holds \
+                             {victim_used} allocated block(s) (in-flight writes or leaks \
+                             pending remount reclaim) — re-planning"
+                        );
+                        deferred_this_pass += victim_used;
+                    }
+                }
+            }
+
+            // Execute the pass.
+            for task in &census.tasks {
+                if ctl.cancelled.load(Ordering::SeqCst) || ctl.paused.load(Ordering::SeqCst) {
+                    break;
+                }
+                let start = tokio::time::Instant::now();
+                match self.move_one(ctx, task, victim.as_deref()).await {
+                    MoveOutcome::Moved => {
+                        ctl.done.fetch_add(1, Ordering::Relaxed);
+                        METRICS.job_tasks_done.fetch_add(1, Ordering::Relaxed);
+                    }
+                    MoveOutcome::Deferred => deferred_this_pass += 1,
+                    MoveOutcome::Superseded => {
+                        // Counted at the publish site; re-plan revisits.
+                    }
+                }
+                since_checkpoint += 1;
+                if since_checkpoint >= CHECKPOINT_TASKS
+                    || last_checkpoint.elapsed() >= Duration::from_secs(CHECKPOINT_SECS)
+                {
+                    let _ = self.checkpoint(job_id, ctl).await;
+                    ctx.write_rate.observe();
+                    since_checkpoint = 0;
+                    last_checkpoint = tokio::time::Instant::now();
+                }
+                // KD-3: duty-cycle throttle, live re-read per task.
+                let pct = ctl.throttle.load(Ordering::Relaxed);
+                if let Some(delay) = job_throttle_sleep(start.elapsed(), pct) {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+
+            // Indirect blob relocations: one empty merge under the ino's
+            // CURRENT token — the save path reallocates a blob living on
+            // a non-active volume and frees the old block.
+            for &ino in &census.blob_relocations {
+                if ctl.cancelled.load(Ordering::SeqCst) || ctl.paused.load(Ordering::SeqCst) {
+                    break;
+                }
+                let token = ctx.router.dlm.get_fencing_token_ino(ino);
+                match ctx
+                    .router
+                    .merge_block_mappings(
+                        ino,
+                        crate::routing::BlockMapOp::Merge(&[]),
+                        0,
+                        crate::routing::LayoutFlip::KeepLayout,
+                        token,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        ctl.done.fetch_add(1, Ordering::Relaxed);
+                        METRICS.job_tasks_done.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        log::warn!("mover: indirect-blob relocation for ino {ino} deferred: {e}");
+                        deferred_this_pass += 1;
+                    }
+                }
+            }
+
+            let _ = self.checkpoint(job_id, ctl).await;
+            METRICS.evacuate_replans.fetch_add(1, Ordering::Relaxed);
+
+            // The rebalance objective is a BOUNDED PASS (§5.3 step 6 /
+            // KD-12): one plan, one execution, then done — deferred or
+            // superseded tasks are simply not retried (the next add /
+            // operator invocation runs a fresh pass; convergence-by-
+            // re-plan is the DRAIN's law, not rebalance's).
+            if matches!(objective, MoverObjective::Rebalance)
+                && !ctl.cancelled.load(Ordering::SeqCst)
+                && !ctl.paused.load(Ordering::SeqCst)
+            {
+                let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
+                METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
+                ctl.set_state(JobState::Completed);
+                return Ok(());
+            }
+
+            if deferred_this_pass > 0 || census.tasks.is_empty() {
+                // No forward progress possible right now (quiescence
+                // waits / in-flight victim allocations): bounded backoff
+                // before the next idempotent re-plan.
+                tokio::time::sleep(REPLAN_BACKOFF).await;
+            }
+        }
+    }
+
+    /// §5.4 step 5 — the retire commit: durable record → `Retired` with
+    /// the path cleared (one tx through the live conveyor), then the
+    /// runtime deregistration (reads of a straggler key now fail loud).
+    async fn retire_volume(&self, volume_id: &str, ctx: &MoverCtx) -> Result<(), String> {
+        let raw = self
+            .meta
+            .getxattr(
+                ROOT_INO,
+                crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
+            )
+            .await
+            .map_err(|e| format!("format config read failed: {e}"))?
+            .ok_or_else(|| "format config not found".to_string())?;
+        let mut cfg: crate::FormatConfig =
+            serde_json::from_slice(&raw).map_err(|e| format!("format config undecodable: {e}"))?;
+        let mut records = cfg.resolved_data_volumes();
+        let rec = records
+            .iter_mut()
+            .find(|r| r.id == volume_id)
+            .ok_or_else(|| format!("volume '{volume_id}' vanished from the record set"))?;
+        rec.state = crate::VOL_STATE_RETIRED.to_string();
+        rec.backing_dev = String::new(); // path cleared; id kept forever (KD-5)
+        cfg.data_lv = Some(
+            records
+                .iter()
+                .filter(|r| r.state != crate::VOL_STATE_RETIRED)
+                .map(|r| r.backing_dev.clone())
+                .collect(),
+        );
+        cfg.data_volumes = Some(records.clone());
+        let bytes = serde_json::to_vec(&cfg).map_err(|e| format!("config serialize: {e}"))?;
+        self.meta
+            .setxattr(
+                ROOT_INO,
+                crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
+                &bytes,
+            )
+            .await
+            .map_err(|e| format!("retire commit failed: {e}"))?;
+
+        // Runtime AFTER the durable commit: snapshot + deregistration.
+        ctx.router.backend_router.set_volume_records(records);
+        ctx.router
+            .backend_router
+            .retire_backend(volume_id)
+            .map_err(|e| format!("retire deregistration failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Move ONE distinct source block (§5.1.5 discipline + §5.4 step 2
+    /// shared-block protocol). Copy is lock-free data plane; publish is
+    /// per-referencer `MergeExpected` under the ino's CURRENT token with
+    /// the block's flush lock held for the final quiescence
+    /// check-and-move; displaced sources free clone-aware.
+    async fn move_one(
+        &self,
+        ctx: &MoverCtx,
+        task: &MoveTask,
+        drain_victim: Option<&str>,
+    ) -> MoveOutcome {
+        let router = &ctx.router;
+        let br = &router.backend_router;
+        let block_size = router.block_size.load(Ordering::Relaxed);
+
+        // Quiescent-first (§5.4 step 3): every referencer must be free
+        // of live buffers / parked extents / spilled records.
+        for r in &task.refs {
+            if !(ctx.quiesce)(r.ino, r.block_idx as u64) {
+                METRICS
+                    .evacuate_deferred_staged_blocks
+                    .fetch_add(1, Ordering::Relaxed);
+                return MoveOutcome::Deferred;
+            }
+        }
+
+        // Pin the source (the clone/patch fence, §5.1 of
+        // design-random-small-writes): the pin makes the copy window
+        // patch-free (a sole-owner patch needs refcount 1) and validates
+        // no patch is mid-DMA. Refused splits two ways: a TRACKED offset
+        // refused was freed concurrently (census stale — the re-plan no
+        // longer sees it); an UNTRACKED offset (a mapping the allocator
+        // walk does not account — the staged-promoted class) has no
+        // patch/free exposure at all and moves pin-less, its frees
+        // no-oping naturally.
+        let mut pinned = true;
+        match br.pin_block_validated(&task.base_key) {
+            crate::block_allocator::PinOutcome::Pinned => {}
+            crate::block_allocator::PinOutcome::PinnedUnstable => {
+                let _ = br.free_block(&task.base_key).await; // undo the pin
+                METRICS
+                    .evacuate_deferred_staged_blocks
+                    .fetch_add(1, Ordering::Relaxed);
+                return MoveOutcome::Deferred;
+            }
+            crate::block_allocator::PinOutcome::Refused => {
+                if br.block_refcount(&task.base_key).is_some() {
+                    return MoveOutcome::Superseded;
+                }
+                log::info!(
+                    "mover: source {} is allocator-untracked (staged-promoted class) — \
+                     moving pin-less; the physical source block is not reclaimable here \
+                     (remount allocator rebuild owns it)",
+                    task.base_key
+                );
+                pinned = false;
+            }
+        }
+        // From here on a taken pin MUST be released on every path.
+        let unpin = |key: String| async move {
+            if pinned {
+                let _ = br.free_block(&key).await;
+            }
+        };
+
+        // 1. Copy: read the stored image (raw, transform-opaque —
+        //    movers copy stored bytes verbatim, §9), write to the
+        //    placement-chosen destination, verify by device read-back.
+        let _charge = CopyCharge::new(block_size);
+        let data = match br.read_block(&task.base_key, block_size as usize).await {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("mover: source read of {} failed: {e}", task.base_key);
+                unpin(task.base_key.clone()).await;
+                return MoveOutcome::Deferred;
+            }
+        };
+        let src_hash = xxhash_rust::xxh3::xxh3_64(&data);
+
+        let dest = match task.dest_hint.as_deref() {
+            Some(hint) if br.placement_eligible(hint) => br
+                .get_backend(hint)
+                .map(|(alloc, dev)| (hint.to_string(), alloc, dev)),
+            _ => br.pick_fill_destination(drain_victim.unwrap_or(&task.src_id)),
+        };
+        let (dst_id, dst_alloc, dst_dev) = match dest {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("mover: no destination for {}: {e}", task.base_key);
+                unpin(task.base_key.clone()).await;
+                return MoveOutcome::Deferred;
+            }
+        };
+        let dst_off = match dst_alloc.allocate_block().await {
+            Ok(o) => o,
+            Err(e) => {
+                log::warn!("mover: destination allocation on '{dst_id}' failed: {e}");
+                unpin(task.base_key.clone()).await;
+                return MoveOutcome::Deferred;
+            }
+        };
+        let fail_dst = |off: u64, alloc: Arc<crate::block_allocator::BlockAllocator>| async move {
+            let _ = alloc.free_block(off).await;
+        };
+        if let Err(e) = dst_dev.write_block(dst_off, data.clone()).await {
+            log::warn!("mover: destination write on '{dst_id}' failed: {e}");
+            fail_dst(dst_off, dst_alloc.clone()).await;
+            unpin(task.base_key.clone()).await;
+            return MoveOutcome::Deferred;
+        }
+        // Verify: device read-back against the source image hash.
+        match dst_dev.read_block(dst_off, block_size as usize).await {
+            Ok(back) if xxhash_rust::xxh3::xxh3_64(&back) == src_hash => {}
+            Ok(_) => {
+                log::error!(
+                    "mover: verify MISMATCH on '{dst_id}' offset {dst_off} — destination \
+                     freed, source untouched"
+                );
+                fail_dst(dst_off, dst_alloc.clone()).await;
+                unpin(task.base_key.clone()).await;
+                return MoveOutcome::Deferred;
+            }
+            Err(e) => {
+                log::warn!("mover: verify read on '{dst_id}' failed: {e}");
+                fail_dst(dst_off, dst_alloc.clone()).await;
+                unpin(task.base_key.clone()).await;
+                return MoveOutcome::Deferred;
+            }
+        }
+        dst_alloc.publish_block(dst_off);
+        let dst_base = br.persist_block_key(&dst_id, dst_off);
+
+        // 2. Pre-publish refcount transfer (§5.4 step 2): raise the
+        //    destination to the full reference count BEFORE any
+        //    referencer publishes — no window where dst refcount <
+        //    published references. The raised offsets are recorded in
+        //    the pre-publish refcount ledger (coordinator-visible; the
+        //    future fsck C3 consults it while a mover job is active).
+        let shared = task.refs.len() > 1;
+        for _ in 1..task.refs.len() {
+            if !br.increment_refcount(&dst_base) {
+                log::error!("mover: pre-publish refcount raise on {dst_base} refused");
+                let _ = br.free_block(&dst_base).await;
+                unpin(task.base_key.clone()).await;
+                return MoveOutcome::Deferred;
+            }
+        }
+        mover_ledger_insert(&dst_base);
+
+        // 3. Publish per referencer, ascending ino (§5.4 step 2), each
+        //    under the block's flush lock (lattice 3 — the final
+        //    check-and-move) and the ino's CURRENT fencing token (read,
+        //    never incremented — §5.1.5.5).
+        let mut published = 0usize;
+        for r in &task.refs {
+            fire_pre_publish_hook(r.ino, r.block_idx).await;
+            let flush_lock = crate::fuse_client::BLOCK_FLUSH_LOCKS.get_lock(r.ino, r.block_idx);
+            let _flush_guard = flush_lock.lock().await;
+            let superseded = if !(ctx.quiesce)(r.ino, r.block_idx as u64) {
+                // Went non-quiescent since the gate: leave it for the
+                // re-plan; the raised dst reference is released below.
+                METRICS
+                    .evacuate_deferred_staged_blocks
+                    .fetch_add(1, Ordering::Relaxed);
+                true
+            } else {
+                let suffix = decoration_suffix(&r.mapping, &task.base_key);
+                let new_mapping = format!("{dst_base}{suffix}");
+                let entries = [(r.block_idx, r.mapping.clone(), new_mapping)];
+                let token = router.dlm.get_fencing_token_ino(r.ino);
+                match router
+                    .merge_block_mappings(
+                        r.ino,
+                        crate::routing::BlockMapOp::MergeExpected(&entries),
+                        0,
+                        crate::routing::LayoutFlip::KeepLayout,
+                        token,
+                    )
+                    .await
+                {
+                    Ok(displaced) if displaced.iter().any(|d| d == &r.mapping) => {
+                        // Free the displaced source reference —
+                        // clone-aware decrement; the terminal decrement
+                        // punches (§5.1.5 step 4).
+                        let _ = br.free_block(&r.mapping).await;
+                        published += 1;
+                        false
+                    }
+                    Ok(_) => {
+                        // Expected-mismatch: a foreground write replaced
+                        // the mapping (or a truncate pruned it) — the
+                        // FIND-M11-A contractual no-op.
+                        METRICS
+                            .evacuate_stale_token_noops
+                            .fetch_add(1, Ordering::Relaxed);
+                        true
+                    }
+                    Err(crate::error::SqueezefsError::FencingTokenExpired { .. }) => {
+                        METRICS
+                            .evacuate_stale_token_noops
+                            .fetch_add(1, Ordering::Relaxed);
+                        true
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "mover: publish for ino {} block {} deferred: {e}",
+                            r.ino,
+                            r.block_idx
+                        );
+                        true
+                    }
+                }
+            };
+            if superseded {
+                // Release the reference raised for this referencer.
+                let _ = br.free_block(&dst_base).await;
+            }
+        }
+        mover_ledger_remove(&dst_base);
+
+        // 4. Undo the mover's own pin on the source. Every published
+        //    referencer already freed one source reference; once the
+        //    last reference (this pin) drops, the terminal free punches.
+        unpin(task.base_key.clone()).await;
+
+        if published > 0 {
+            METRICS
+                .evacuate_blocks_moved
+                .fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .evacuate_bytes_moved
+                .fetch_add(block_size, Ordering::Relaxed);
+            if shared {
+                METRICS
+                    .evacuate_shared_blocks_moved
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            MoveOutcome::Moved
+        } else {
+            // Nothing published: the destination's references have all
+            // been released (terminal free punched it) — the §5.4
+            // supersession outcome, or a deferral.
+            MoveOutcome::Superseded
+        }
+    }
+}
+
+enum MoverObjective {
+    Drain { volume_id: String },
+    Rebalance,
+}
+
+enum MoveOutcome {
+    Moved,
+    Deferred,
+    Superseded,
+}
+
+/// The suffix (decoration) a mapping string carries past its clean base
+/// key (`:rel_off:packed_len` size-carrying forms) — preserved verbatim
+/// on the destination mapping so the stored-image geometry survives the
+/// move (the §5.4 "same mapping shape" law: a whole-block mapping stays
+/// whole-block, a decorated one stays decorated).
+fn decoration_suffix<'a>(mapping: &'a str, base: &str) -> &'a str {
+    mapping.strip_prefix(base).unwrap_or("")
+}
+
+// The pre-publish refcount ledger (§5.4 step 2): destination base keys
+// whose refcounts were raised ahead of publication. Coordinator-visible
+// task state — the VL6 fsck C3 checker consults it while a mover job is
+// active (offsets here are exempt from refcount findings).
+static MOVER_PREPUBLISH_LEDGER: parking_lot::Mutex<Vec<String>> =
+    parking_lot::Mutex::new(Vec::new());
+
+fn mover_ledger_insert(key: &str) {
+    MOVER_PREPUBLISH_LEDGER.lock().push(key.to_string());
+}
+
+fn mover_ledger_remove(key: &str) {
+    let mut l = MOVER_PREPUBLISH_LEDGER.lock();
+    if let Some(pos) = l.iter().position(|k| k == key) {
+        l.swap_remove(pos);
+    }
+}
+
+/// Snapshot of the pre-publish refcount ledger (§5.4 step 2) — the
+/// mover-ledger surface fsck's C3 consultation (PR VL6a) reads.
+pub fn mover_prepublish_ledger() -> Vec<String> {
+    MOVER_PREPUBLISH_LEDGER.lock().clone()
+}
+
+// ---------------------------------------------------------------------------
+// Rebalance planning (§5.3 step 6 / §5.7 bounded pass)
+// ---------------------------------------------------------------------------
+
+struct RebalanceLeg {
+    source: String,
+    dest: String,
+    blocks: u64,
+}
+
+/// The bounded-pass plan: bring every volume below `mean − 10 pp` up to
+/// that band edge by moving blocks from above-mean volumes (fullest
+/// first), never pushing a source below the mean. Empty = balanced.
+fn plan_rebalance(router: &crate::routing::DataRouter) -> Vec<RebalanceLeg> {
+    let br = &router.backend_router;
+    let block_size = router.block_size.load(Ordering::Relaxed).max(1);
+    let mut rows: Vec<(String, u64, u64)> = Vec::new(); // (id, used, cap)
+    for entry in br.backends.iter() {
+        let be_id = entry.key();
+        if !br.placement_eligible(be_id) {
+            continue;
+        }
+        let alloc = &entry.value().block_allocator;
+        let cap = alloc.capacity_bytes();
+        if cap == 0 {
+            continue;
+        }
+        let used = alloc.get_used_blocks().saturating_mul(alloc.chunk_size());
+        rows.push((be_id.clone(), used, cap));
+    }
+    if rows.len() < 2 {
+        return Vec::new();
+    }
+    let total_used: u64 = rows.iter().map(|r| r.1).sum();
+    let total_cap: u64 = rows.iter().map(|r| r.2).sum();
+    if total_cap == 0 {
+        return Vec::new();
+    }
+    let mean = total_used as f64 / total_cap as f64;
+
+    let fill = |used: u64, cap: u64| used as f64 / cap as f64;
+    let mut under: Vec<(String, u64)> = rows
+        .iter()
+        .filter(|(_, u, c)| fill(*u, *c) < mean - REBALANCE_BAND)
+        .map(|(id, u, c)| {
+            let deficit = ((mean - REBALANCE_BAND) * *c as f64 - *u as f64).max(0.0) as u64;
+            (id.clone(), deficit / block_size)
+        })
+        .filter(|(_, blocks)| *blocks > 0)
+        .collect();
+    under.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+    let mut over: Vec<(String, u64)> = rows
+        .iter()
+        .filter(|(_, u, c)| fill(*u, *c) > mean)
+        .map(|(id, u, c)| {
+            let surplus = (*u as f64 - mean * *c as f64).max(0.0) as u64;
+            (id.clone(), surplus / block_size)
+        })
+        .filter(|(_, blocks)| *blocks > 0)
+        .collect();
+    over.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+
+    let mut legs = Vec::new();
+    let mut over_iter = over.into_iter();
+    let mut cur = over_iter.next();
+    for (dest, mut want) in under {
+        while want > 0 {
+            let Some((src, have)) = cur.as_mut() else {
+                break;
+            };
+            let take = want.min(*have);
+            if take > 0 {
+                legs.push(RebalanceLeg {
+                    source: src.clone(),
+                    dest: dest.clone(),
+                    blocks: take,
+                });
+                want -= take;
+                *have -= take;
+            }
+            if *have == 0 {
+                cur = over_iter.next();
+            }
+        }
+    }
+    legs
+}
+
+/// Clip a rebalance census to the plan's per-leg block budgets and tag
+/// each task with its planned destination — THE bounded-pass property:
+/// the pass moves at most the planned blocks, then completes.
+fn bound_rebalance_census(census: &mut Census, plan: &[RebalanceLeg], _block_size: u64) {
+    // Rebalance never relocates indirect blobs (they follow their maps
+    // on ordinary merges) — drains own that machinery.
+    census.blob_relocations.clear();
+    let mut budgets: HashMap<&str, Vec<(&str, u64)>> = HashMap::new();
+    for leg in plan {
+        budgets
+            .entry(leg.source.as_str())
+            .or_default()
+            .push((leg.dest.as_str(), leg.blocks));
+    }
+    let mut bounded = Vec::new();
+    for mut task in census.tasks.drain(..) {
+        let Some(legs) = budgets.get_mut(task.src_id.as_str()) else {
+            continue;
+        };
+        let Some(slot) = legs.iter_mut().find(|(_, left)| *left > 0) else {
+            continue;
+        };
+        task.dest_hint = Some(slot.0.to_string());
+        slot.1 -= 1;
+        bounded.push(task);
+    }
+    census.tasks = bounded;
+    census.distinct_blocks = census.tasks.len() as u64;
 }
 
 fn unix_ts() -> u64 {

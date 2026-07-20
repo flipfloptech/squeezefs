@@ -168,6 +168,17 @@ pub enum BlockMapOp<'a> {
     /// fallocate-extend) safe: they can no longer rewrite the block map
     /// "without mutating it".
     Merge(&'a [(u32, String)]),
+    /// The VL4 mover publish (design-volume-lifecycle §5.1.5/§5.4):
+    /// `(block_idx, expected_current, new_block_key)` — each entry merges
+    /// ONLY if the map's current value for `block_idx` equals
+    /// `expected_current`; anything else (a foreground write replaced the
+    /// mapping, a truncate pruned it) is SKIPPED under the same
+    /// `INODE_META_LOCKS` critical section — the FIND-M11-A supersession
+    /// law applied to movers: stale ⇒ contractual no-op, never a clobber.
+    /// Callers distinguish merged from skipped entries by the returned
+    /// displaced list (a merged entry displaces exactly its
+    /// `expected_current`).
+    MergeExpected(&'a [(u32, String, String)]),
     /// Remove every block whose start offset ≥ `new_size`
     /// (truncate-shrink): the old `retain`-and-save re-expressed as a
     /// removal set on the same primitive; removed keys come back as the
@@ -510,6 +521,92 @@ impl BackendRouter {
         Ok(())
     }
 
+    /// Durable-state lookup for a volume id from the record snapshot.
+    /// `None` = no record (bare routers / `--data-lv` overrides), which
+    /// callers treat as `active`.
+    pub fn volume_state(&self, id: &str) -> Option<String> {
+        self.volume_records
+            .load()
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.state.clone())
+    }
+
+    /// The state of the volume that OWNS a parsed block key's backend id,
+    /// resolving the reserved `backend_0` default-slot alias to the record
+    /// whose registered Arcs ARE the default slot (the first volume).
+    pub fn volume_state_for_key_backend(&self, be_id: &str) -> Option<String> {
+        if be_id != "backend_0" {
+            return self.volume_state(be_id);
+        }
+        for rec in self.volume_records.load().iter() {
+            if let Some(be) = self.backends.get(&rec.id) {
+                if std::sync::Arc::ptr_eq(&be.device, &self.default_device)
+                    && std::sync::Arc::ptr_eq(&be.block_allocator, &self.default_allocator)
+                {
+                    return Some(rec.state.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// §5.4: write-placement eligibility — healthy AND durable state
+    /// `active`. `Draining`/`Retired`/`disabled` volumes take no NEW
+    /// placements (draining still serves reads/refcounts normally; the
+    /// health gates stay the separate fail-stop override).
+    pub(crate) fn placement_eligible(&self, be_id: &str) -> bool {
+        if !self.is_backend_healthy(be_id) {
+            return false;
+        }
+        match self.volume_state(be_id) {
+            None => true, // recordless registration (bare routers/tests)
+            Some(state) => state == crate::VOL_STATE_ACTIVE,
+        }
+    }
+
+    /// Flip one volume record's durable-state SNAPSHOT (the runtime half
+    /// of the §5.4 state machine — callers commit the durable record
+    /// through the meta backend and then publish here). Refuses unknown
+    /// ids and states outside the lattice.
+    pub fn set_volume_state(&self, id: &str, state: &str) -> Result<()> {
+        if ![
+            crate::VOL_STATE_ACTIVE,
+            crate::VOL_STATE_DISABLED,
+            crate::VOL_STATE_DRAINING,
+            crate::VOL_STATE_RETIRED,
+        ]
+        .contains(&state)
+        {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "unknown volume state '{state}' (active|disabled|draining|retired)"
+            )));
+        }
+        let records = self.volume_records.load_full();
+        let mut updated = (*records).clone();
+        let rec = updated.iter_mut().find(|r| r.id == id).ok_or_else(|| {
+            SqueezefsError::InvalidOperation(format!(
+                "unknown data volume '{id}' (see `squeezefs volume list`)"
+            ))
+        })?;
+        rec.state = state.to_string();
+        self.volume_records.store(std::sync::Arc::new(updated));
+        Ok(())
+    }
+
+    /// §5.4 retire: deregister the runtime backend — reads of a straggler
+    /// key now fail loud (`err_backend_not_found`). The record itself is
+    /// kept forever (KD-5); callers flip it to `retired` first.
+    pub fn retire_backend(&self, id: &str) -> Result<()> {
+        if self.backends.remove(id).is_none() {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "unknown data volume '{id}' — nothing to retire"
+            )));
+        }
+        self.unhealthy_backends.remove(id);
+        Ok(())
+    }
+
     /// The `volume_states` gauge rows (design-volume-lifecycle §10):
     /// durable records joined with live allocator accounting. Volumes
     /// registered without records (bare routers, `--data-lv` overrides)
@@ -672,7 +769,10 @@ impl BackendRouter {
 
         for entry in self.backends.iter() {
             let be_id = entry.key();
-            if self.is_backend_healthy(be_id) {
+            // §5.4: placement eligibility = health AND durable state
+            // `active` — a Draining volume is dropped from the candidate
+            // set (weight 0) while it keeps serving reads.
+            if self.placement_eligible(be_id) {
                 let health = self.get_backend_health(be_id);
                 healthy_backends.push((
                     be_id.clone(),
@@ -705,6 +805,57 @@ impl BackendRouter {
         let selected = &candidates[idx];
 
         Ok((selected.0.clone(), selected.1.clone(), selected.2.clone()))
+    }
+
+    /// The VL4 mover's destination pick (design-volume-lifecycle
+    /// §5.4/§5.7): the LOWEST-fill placement-eligible backend, excluding
+    /// `exclude` (the move source). Choosing the emptiest survivor both
+    /// spreads a drain and drives the rebalance objective toward the set
+    /// mean.
+    pub fn pick_fill_destination(
+        &self,
+        exclude: &str,
+    ) -> Result<(
+        String,
+        std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+    )> {
+        let mut best: Option<(
+            String,
+            std::sync::Arc<crate::block_allocator::BlockAllocator>,
+            std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+            f64,
+        )> = None;
+        for entry in self.backends.iter() {
+            let be_id = entry.key();
+            if be_id == exclude || !self.placement_eligible(be_id) {
+                continue;
+            }
+            let alloc = &entry.value().block_allocator;
+            let capacity = alloc.capacity_bytes();
+            let used = alloc.get_used_blocks().saturating_mul(alloc.chunk_size());
+            let fill = if capacity > 0 {
+                used as f64 / capacity as f64
+            } else {
+                // Unbounded allocators (offline tools) sort by used bytes.
+                used as f64
+            };
+            if best.as_ref().is_none_or(|(_, _, _, f)| fill < *f) {
+                best = Some((
+                    be_id.clone(),
+                    alloc.clone(),
+                    entry.value().device.clone(),
+                    fill,
+                ));
+            }
+        }
+        match best {
+            Some((id, alloc, dev, _)) => Ok((id, alloc, dev)),
+            None => Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("no placement-eligible destination backend (excluding '{exclude}')"),
+            ))),
+        }
     }
 
     pub fn get_backend(
@@ -880,6 +1031,15 @@ impl BackendRouter {
         } else {
             false
         }
+    }
+
+    /// The allocator refcount behind a (possibly decorated) block key —
+    /// `None` = the offset is not allocator-tracked (freed, or a mapping
+    /// class the recovery walk does not account). The VL4 mover uses it
+    /// to split "freed concurrently" from "untracked" on a refused pin.
+    pub(crate) fn block_refcount(&self, block_key: &str) -> Option<u32> {
+        let (alloc, offset) = self.allocator_for_key(block_key)?;
+        alloc.refcount(offset)
     }
 
     /// [`Self::increment_refcount`] with the §5.1 **validate-after-pin**
@@ -1085,20 +1245,24 @@ impl BackendRouter {
                     }
                 }
 
-                // 3. Trigger failover if currently active write backend is unhealthy
+                // 3. Trigger failover if currently active write backend is
+                // unhealthy — or no longer placement-eligible (VL4: the
+                // sticky pointer is repointed off a Draining volume as a
+                // side effect, §5.4).
                 let active_be = (*router.active_write_backend.load_full()).clone();
-                if !router.is_backend_healthy(&active_be) {
+                if !router.placement_eligible(&active_be) {
                     log::warn!(
-                        "Active write backend '{}' is unhealthy! Initiating failover...",
+                        "Active write backend '{}' is unhealthy or not placement-eligible! \
+                         Initiating failover...",
                         active_be
                     );
-                    // Fail over to a healthy NAMED volume; the `backend_0`
+                    // Fail over to an eligible NAMED volume; the `backend_0`
                     // default slot is a candidate only on bare routers (same
                     // policy as `get_active_backend`).
                     let mut fallback_be = None;
                     for entry in router.backends.iter() {
                         let be_id = entry.key();
-                        if router.is_backend_healthy(be_id) {
+                        if router.placement_eligible(be_id) {
                             fallback_be = Some(be_id.clone());
                             break;
                         }
@@ -1975,10 +2139,27 @@ impl DataRouter {
                 }
             }
 
+            // VL4 (§5.4): an indirect blob may only be rewritten IN PLACE
+            // on a placement-eligible volume. A blob living on a
+            // Draining/Retired volume relocates to a fresh allocation (and
+            // the old blob block is freed after the layout commit) — this
+            // is how the mover's empty-merge "blob relocation" tasks and
+            // every ordinary merge on a draining set migrate the map block
+            // itself off the victim.
+            let reuse_info = reuse_info.filter(|(be, _)| {
+                self.backend_router
+                    .volume_state_for_key_backend(be)
+                    .is_none_or(|state| state == crate::VOL_STATE_ACTIVE)
+            });
             let (be_id, offset, nvme_writer) = if let Some((be, off)) = reuse_info {
                 let (_, dev) = self.backend_router.get_backend(&be)?;
                 (be, off, dev)
             } else {
+                if let Some(ref map_id) = m.block_map_id {
+                    if let Some(old_block_key) = map_id.strip_prefix("indirect:") {
+                        old_indirect_to_free = Some(old_block_key.to_string());
+                    }
+                }
                 let (be, block_allocator, dev) = self.backend_router.get_active_backend()?;
                 let off = block_allocator.allocate_block().await?;
                 (be, off, dev)
@@ -3924,6 +4105,31 @@ impl DataRouter {
                 // Size floor: never below the caller's bound nor the freshest
                 // RAM size (writes publish size to the RAM cache ahead of the
                 // deferred layout commit — a merge must not regress it).
+                current.size = std::cmp::max(current.size, min_size);
+                if let Some(cached) = self.metadata_cache.get(&ino) {
+                    if cached.size > current.size {
+                        current.size = cached.size;
+                    }
+                }
+            }
+            BlockMapOp::MergeExpected(entries) => {
+                for (b, expected, new_key) in entries {
+                    match block_map.get(b) {
+                        // Merge only where the mover's captured mapping is
+                        // still current — the supersession law: a mismatch
+                        // (foreground replace) or absence (truncate/punch
+                        // prune) skips silently; re-plan revisits.
+                        Some(cur) if cur == expected && cur != new_key => {
+                            let prev = block_map
+                                .insert(*b, new_key.clone())
+                                .expect("get() just observed the entry");
+                            purge(&prev);
+                            displaced.push(prev);
+                        }
+                        _ => {}
+                    }
+                }
+                // Same size discipline as Merge.
                 current.size = std::cmp::max(current.size, min_size);
                 if let Some(cached) = self.metadata_cache.get(&ino) {
                     if cached.size > current.size {

@@ -86,7 +86,7 @@ async fn meta_fixture() -> (Arc<RoutedMetaBackend>, NamedTempFile) {
 /// A fabric with `workers` local pool tasks (0 = no local pool — the
 /// remote-only test posture).
 async fn fabric(meta: &Arc<RoutedMetaBackend>, workers: usize) -> Arc<JobFabric> {
-    JobFabric::start(meta.clone(), workers, 100)
+    JobFabric::start(meta.clone(), workers, 100, None)
         .await
         .expect("fabric start")
 }

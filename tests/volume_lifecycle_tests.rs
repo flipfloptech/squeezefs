@@ -452,7 +452,7 @@ async fn test_offline_add_refuses_under_live_client_and_bad_devices() {
     // verb refuses (set-cache-paths template).
     let recs = base_format_config(&[&oss1]).resolved_data_volumes();
     let fx = open_fixture(&meta, &recs).await;
-    let err = squeezefs::config_ops::add_data_volume(&meta_lvs, oss2.to_str().unwrap())
+    let err = squeezefs::config_ops::add_data_volume(&meta_lvs, oss2.to_str().unwrap(), true)
         .await
         .expect_err("add under a live client must refuse");
     let msg = format!("{err}").to_lowercase();
@@ -463,20 +463,20 @@ async fn test_offline_add_refuses_under_live_client_and_bad_devices() {
     fx.close().await;
 
     // Nonexistent device refuses.
-    let err = squeezefs::config_ops::add_data_volume(&meta_lvs, "/nonexistent/nowhere")
+    let err = squeezefs::config_ops::add_data_volume(&meta_lvs, "/nonexistent/nowhere", true)
         .await
         .expect_err("missing device must refuse");
     assert!(!format!("{err}").is_empty());
 
     // Already-a-member device refuses (legacy member by path).
-    let err = squeezefs::config_ops::add_data_volume(&meta_lvs, oss1.to_str().unwrap())
+    let err = squeezefs::config_ops::add_data_volume(&meta_lvs, oss1.to_str().unwrap(), true)
         .await
         .expect_err("adding an existing member must refuse");
     let msg = format!("{err}").to_lowercase();
     assert!(msg.contains("member") || msg.contains("already"), "{msg}");
 
     // A meta volume can never be a data volume.
-    let err = squeezefs::config_ops::add_data_volume(&meta_lvs, meta.to_str().unwrap())
+    let err = squeezefs::config_ops::add_data_volume(&meta_lvs, meta.to_str().unwrap(), true)
         .await
         .expect_err("adding a meta volume as data must refuse");
     let msg = format!("{err}").to_lowercase();
@@ -518,7 +518,7 @@ async fn test_add_write_remount_read_and_new_backend_receives_allocations() {
     fx.close().await;
 
     // Offline add (guarded open; the set is unmounted now).
-    let rec = squeezefs::config_ops::add_data_volume(&meta_lvs, oss2.to_str().unwrap())
+    let rec = squeezefs::config_ops::add_data_volume(&meta_lvs, oss2.to_str().unwrap(), true)
         .await
         .expect("offline add-data");
     assert!(is_vol_id(&rec.id), "new volumes get vol- ids: {}", rec.id);
@@ -540,7 +540,7 @@ async fn test_add_write_remount_read_and_new_backend_receives_allocations() {
     );
 
     // Duplicate add refuses.
-    let err = squeezefs::config_ops::add_data_volume(&meta_lvs, oss2.to_str().unwrap())
+    let err = squeezefs::config_ops::add_data_volume(&meta_lvs, oss2.to_str().unwrap(), true)
         .await
         .expect_err("duplicate add must refuse");
     let msg = format!("{err}").to_lowercase();

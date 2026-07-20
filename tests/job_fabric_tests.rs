@@ -229,7 +229,7 @@ async fn format_config_removexattr_regression_hole_is_closed() {
 /// Fabric fixture: a JobFabric over the fixture's meta backend with a
 /// small local pool.
 async fn fabric(fx: &Fx, workers: usize) -> Arc<JobFabric> {
-    JobFabric::start(fx.meta.clone(), workers, 100)
+    JobFabric::start(fx.meta.clone(), workers, 100, None)
         .await
         .expect("fabric start")
 }

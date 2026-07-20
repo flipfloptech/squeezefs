@@ -817,6 +817,32 @@ enum VolumeActions {
         #[arg(long)]
         json: bool,
     },
+    /// Remove a data volume (design-volume-lifecycle §5.4): capacity
+    /// preflight (refused honestly when the survivors cannot fit the
+    /// census — §5.2 numbers printed), durable Active → Draining flip
+    /// (excluded from placement, still serves reads), CoW evacuation
+    /// (shared clone blocks move once), retire when the census is 0.
+    /// TARGET = a live mountpoint (the drain runs on the mounted
+    /// daemon's fabric) or a sqmeta:// URI (offline: a short-lived
+    /// D0-guarded coordinator drains in-process to completion, §5.8).
+    RemoveData {
+        /// Live mountpoint or sqmeta:// URI
+        target: String,
+        /// Durable volume id (see `squeezefs volume list`)
+        volume_id: String,
+        /// Duty-cycle throttle percentage for the evacuation job
+        #[arg(long, default_value_t = 100)]
+        throttle: u32,
+    },
+    /// Cancel an in-flight drain: the volume returns to `active` (and
+    /// write placement); the evacuation job is cancelled cleanly.
+    /// Retired volumes never come back (ids are permanent, KD-5).
+    Undrain {
+        /// Live mountpoint or sqmeta:// URI
+        target: String,
+        /// Durable volume id
+        volume_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2813,18 +2839,26 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     device,
                     no_rebalance,
                 } => {
-                    // §5.3 step-6 honesty (PR-plan self-consistency note):
-                    // the auto-rebalance DEFAULT arms with the VL4 mover.
+                    // §5.3 step 6 (KD-12): the auto-rebalance pass is the
+                    // DEFAULT — armed by this PR (VL4).
                     let rebalance_note = if no_rebalance {
                         "rebalance: opted out (--no-rebalance)".to_string()
+                    } else if live(&target) {
+                        "rebalance: automatic bounded pass submitted at 25 % throttle \
+                         (design-volume-lifecycle §5.3 step 6; see `squeezefs job list`)"
+                            .to_string()
                     } else {
-                        "rebalance: the automatic rebalance pass (design-volume-lifecycle \
-                         §5.3 step 6) activates with the VL4 mover PR; until then the new \
-                         volume participates in write placement only"
+                        "rebalance: durable queued rebalance job recorded — the pass runs \
+                         when the set is next mounted (design-volume-lifecycle §5.3 step 6)"
                             .to_string()
                     };
                     if live(&target) {
-                        let body = admin_roundtrip(&target, "volume-add-data", &device)?;
+                        let arg = if no_rebalance {
+                            format!("{device} no-rebalance")
+                        } else {
+                            device.clone()
+                        };
+                        let body = admin_roundtrip(&target, "volume-add-data", &arg)?;
                         let v: serde_json::Value = serde_json::from_str(&body)
                             .map_err(|e| format!("undecodable admin reply: {e}"))?;
                         println!(
@@ -2835,14 +2869,58 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         );
                     } else {
                         let meta_lvs = parse_block_uri(&target, "sqmeta://")?;
-                        let rec =
-                            squeezefs::config_ops::add_data_volume(&meta_lvs, &device).await?;
+                        let rec = squeezefs::config_ops::add_data_volume(
+                            &meta_lvs,
+                            &device,
+                            no_rebalance,
+                        )
+                        .await?;
                         println!(
                             "Added data volume '{}' as {} (state {}).",
                             device, rec.id, rec.state
                         );
                     }
                     println!("{rebalance_note}");
+                }
+                VolumeActions::RemoveData {
+                    target,
+                    volume_id,
+                    throttle,
+                } => {
+                    if live(&target) {
+                        let body = admin_roundtrip(
+                            &target,
+                            "volume-remove-data",
+                            &format!("{volume_id} {throttle}"),
+                        )?;
+                        let v: serde_json::Value = serde_json::from_str(&body)
+                            .map_err(|e| format!("undecodable admin reply: {e}"))?;
+                        println!(
+                            "Volume '{volume_id}' is draining (evacuation job {}, throttle \
+                             {throttle} %). It serves reads until retired; watch \
+                             `squeezefs volume list {target}` / `squeezefs job list {target}`.",
+                            v["job_id"].as_str().unwrap_or("?")
+                        );
+                    } else {
+                        let meta_lvs = parse_block_uri(&target, "sqmeta://")?;
+                        squeezefs::config_ops::remove_data_volume_offline(
+                            &meta_lvs, &volume_id, throttle,
+                        )
+                        .await?;
+                        println!("Volume '{volume_id}' evacuated and retired.");
+                    }
+                }
+                VolumeActions::Undrain { target, volume_id } => {
+                    if live(&target) {
+                        admin_roundtrip(&target, "volume-undrain", &volume_id)?;
+                    } else {
+                        let meta_lvs = parse_block_uri(&target, "sqmeta://")?;
+                        squeezefs::config_ops::undrain_data_volume(&meta_lvs, &volume_id).await?;
+                    }
+                    println!(
+                        "Volume '{volume_id}' is active again (drain cancelled; already-moved \
+                         blocks stay where the mover put them — CoW moves are never undone)."
+                    );
                 }
                 VolumeActions::List { target, json } => {
                     let rows: serde_json::Value = if live(&target) {
@@ -3228,10 +3306,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .collect(),
                 None => format_config.resolved_data_volumes(),
             };
-            if volume_records.is_empty() {
+            // VL4: retired records are id-tombstones (path cleared, kept
+            // forever — KD-5); the mount registers `Active|Draining|
+            // disabled` members only.
+            let mount_records: Vec<squeezefs::DataVolumeRecord> = volume_records
+                .iter()
+                .filter(|r| r.state != squeezefs::VOL_STATE_RETIRED)
+                .cloned()
+                .collect();
+            if mount_records.is_empty() {
                 return Err("Error: no data volumes specified or configured".into());
             }
-            let resolved_data_lvs: Vec<String> = volume_records
+            let resolved_data_lvs: Vec<String> = mount_records
                 .iter()
                 .map(|r| r.backing_dev.clone())
                 .collect();
@@ -3242,7 +3328,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             for path in &resolved_data_lvs {
                 squeezefs::storage::validate_backing_device(path)?;
             }
-            let first_record = &volume_records[0];
+            let first_record = &mount_records[0];
             let first_data_path = &first_record.backing_dev;
 
             let dlm = DlmClient::new("local")?;
@@ -3295,7 +3381,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // backing dev IS the router's default slot, so its build
             // reuses the default Arcs (bare-key invariant preserved);
             // durable `disabled` states land as health overrides.
-            for rec in &volume_records {
+            for rec in &mount_records {
                 log::info!(
                     "Registering data volume '{}' at path {} (state {})",
                     rec.id,
@@ -3307,6 +3393,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .register_backend(rec, dlm.meta_client().clone())
                     .await?;
             }
+            // The record SNAPSHOT keeps the retired tombstones (KD-5:
+            // `volume list` shows them; their ids can never be reused).
             router
                 .backend_router
                 .set_volume_records(volume_records.clone());
@@ -3414,10 +3502,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(8)
                 .div_euclid(4)
                 .clamp(2, 8);
+            // VL4: the mover context — the data router + this mount's
+            // quiescence probe (RAM active buffers + staging records) —
+            // arms the evacuate/rebalance job types on the fabric.
+            let mover_ctx = squeezefs::jobs::MoverCtx::new(
+                fs_engine.router.clone(),
+                fs_engine.mover_quiesce_probe(),
+            );
             let fabric = squeezefs::jobs::JobFabric::start(
                 routed_meta_backend,
                 fabric_workers,
                 job_cpu_limit,
+                Some(mover_ctx),
             )
             .await
             .map_err(|e| format!("job fabric start failed: {e}"))?;
@@ -3431,7 +3527,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // plumbed at mount — the listener logs it loud), the WERO
             // fence over the data namespaces, and the endpoint published
             // through the mount-registration heartbeat for worker
-            // discovery. NoopDeviceSeam until the VL4 movers land.
+            // discovery. PR VL4: the PRODUCTION RouterShardDevice seam
+            // (allocation + block I/O over the registered backends'
+            // io_uring workers); mover job types themselves stay
+            // local-pool (`JobType::wire_executable`).
             let wire_cfg = squeezefs::job_wire::JobWireConfig {
                 bind_addr: "0.0.0.0:0".parse().expect("literal addr"),
                 data_device_paths: resolved_data_lvs
@@ -3440,13 +3539,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .collect(),
                 ..Default::default()
             };
-            let wire = squeezefs::job_wire::JobWireHost::start(
-                fabric,
-                wire_cfg,
-                std::sync::Arc::new(squeezefs::job_wire::NoopDeviceSeam),
-            )
-            .await
-            .map_err(|e| format!("job wire start failed: {e}"))?;
+            let wire_seam = squeezefs::job_wire::RouterShardDevice::new(
+                fs_engine.router.backend_router.clone(),
+                format_config.block_size as usize,
+            );
+            let wire = squeezefs::job_wire::JobWireHost::start(fabric, wire_cfg, wire_seam)
+                .await
+                .map_err(|e| format!("job wire start failed: {e}"))?;
             let advertised = format!(
                 "{}:{}",
                 squeezefs::job_wire::local_advertise_ip(),
@@ -4786,7 +4885,13 @@ async fn run_df_report(meta_lvs: &[String], json: bool) -> Result<(), Box<dyn st
     let config: FormatConfig = serde_json::from_slice(&raw)
         .map_err(|e| format!("invalid format config on '{}': {e}", probes[0].0))?;
 
-    let volume_records = config.resolved_data_volumes();
+    // Retired records are id-tombstones (path cleared) — reported but
+    // never registered/sized (VL4).
+    let volume_records: Vec<squeezefs::DataVolumeRecord> = config
+        .resolved_data_volumes()
+        .into_iter()
+        .filter(|r| r.state != squeezefs::VOL_STATE_RETIRED)
+        .collect();
     if volume_records.is_empty() {
         return Err("format config names no data volumes".into());
     }

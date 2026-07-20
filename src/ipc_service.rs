@@ -359,13 +359,14 @@ impl FabricAdminSink {
     }
 
     fn volume_states_json(fs: &SqueezefsFilesystem) -> serde_json::Value {
+        use std::sync::atomic::Ordering;
         let rows: Vec<serde_json::Value> = fs
             .router
             .backend_router
             .volume_states()
             .into_iter()
             .map(|row| {
-                serde_json::json!({
+                let mut v = serde_json::json!({
                     "id": row.id,
                     "backing_dev": row.backing_dev,
                     "state": row.state,
@@ -373,7 +374,21 @@ impl FabricAdminSink {
                     "capacity_bytes": row.capacity_bytes,
                     "used_bytes": row.used_bytes,
                     "free_bytes": row.free_bytes,
-                })
+                });
+                // §5.2 reporting: when a drain is active, the draining
+                // row carries the same math preflight ran (live-updated
+                // at every checkpoint).
+                if row.state == crate::VOL_STATE_DRAINING {
+                    v["evacuate"] = serde_json::json!({
+                        "needed_bytes": crate::fuse_client::METRICS
+                            .evacuate_needed_bytes.load(Ordering::Relaxed),
+                        "avail_bytes": crate::fuse_client::METRICS
+                            .evacuate_avail_bytes.load(Ordering::Relaxed),
+                        "transient_bytes": crate::fuse_client::METRICS
+                            .evacuate_transient_bytes.load(Ordering::Relaxed),
+                    });
+                }
+                v
             })
             .collect();
         serde_json::json!(rows)
@@ -407,21 +422,71 @@ impl crate::ipc_host::AdminSink for FabricAdminSink {
                 // -----------------------------------------------------
                 "volume-add-data" => {
                     let fs = need_fs()?;
-                    let device = arg.trim();
+                    let mut parts = arg.split_whitespace();
+                    let device = parts.next().unwrap_or("");
+                    let no_rebalance = match parts.next() {
+                        None => false,
+                        Some("no-rebalance") => true,
+                        Some(other) => {
+                            return Err(format!(
+                                "usage: volume-add-data <device> [no-rebalance] \
+                                 (unknown flag '{other}')"
+                            ))
+                        }
+                    };
                     if device.is_empty() {
-                        return Err("usage: volume-add-data <device>".to_string());
+                        return Err("usage: volume-add-data <device> [no-rebalance]".to_string());
                     }
-                    let rec = fs.admin_add_data_volume(device).await?;
+                    let rec = fs.admin_add_data_volume(device, no_rebalance).await?;
                     Ok(serde_json::json!({
                         "id": rec.id,
                         "backing_dev": rec.backing_dev,
                         "state": rec.state,
                         "added_ts": rec.added_ts,
-                        // Honest §5.3 step-6 note: the auto-rebalance
-                        // default arms with the VL4 mover PR.
-                        "rebalance": "auto-rebalance pass activates with the VL4 mover PR; \
-                                      until then the volume participates in write placement \
-                                      only",
+                        // §5.3 step 6 (KD-12): the auto-rebalance DEFAULT
+                        // is armed — a bounded fabric pass at 25 % unless
+                        // opted out.
+                        "rebalance": if no_rebalance {
+                            "opted out (--no-rebalance)"
+                        } else {
+                            "auto-rebalance pass submitted (bounded, 25 % throttle — \
+                             see `squeezefs job list`)"
+                        },
+                    })
+                    .to_string())
+                }
+                "volume-remove-data" => {
+                    let fs = need_fs()?;
+                    let mut parts = arg.split_whitespace();
+                    let vol_id = parts.next().unwrap_or("");
+                    let throttle: u32 = match parts.next() {
+                        None => 100,
+                        Some(pct) => pct
+                            .parse()
+                            .map_err(|_| "usage: volume-remove-data <vol-id> [pct]".to_string())?,
+                    };
+                    if vol_id.is_empty() {
+                        return Err("usage: volume-remove-data <vol-id> [pct]".to_string());
+                    }
+                    let job_id = fs.admin_remove_data_volume(vol_id, throttle).await?;
+                    Ok(serde_json::json!({
+                        "volume_id": vol_id,
+                        "state": crate::VOL_STATE_DRAINING,
+                        "job_id": job_id,
+                        "throttle_pct": throttle,
+                    })
+                    .to_string())
+                }
+                "volume-undrain" => {
+                    let fs = need_fs()?;
+                    let vol_id = arg.trim();
+                    if vol_id.is_empty() {
+                        return Err("usage: volume-undrain <vol-id>".to_string());
+                    }
+                    fs.admin_undrain_data_volume(vol_id).await?;
+                    Ok(serde_json::json!({
+                        "volume_id": vol_id,
+                        "state": crate::VOL_STATE_ACTIVE,
                     })
                     .to_string())
                 }

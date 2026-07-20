@@ -312,10 +312,18 @@ pub mod keys {
 }
 
 /// Durable data-volume state values (design-volume-lifecycle §5.3/§5.4).
-/// VL3 uses `active`/`disabled`; the drain machinery (PR VL4) adds
-/// `draining`/`retired` to the same string lattice.
+/// `active`/`disabled` since VL3; the drain machinery (PR VL4) adds the
+/// §5.4 state machine: `Active → Draining → Retired` (with
+/// `Draining → Active` on `volume undrain`). `Retired` is terminal and
+/// the record is kept FOREVER — the id is never reused (KD-5).
 pub const VOL_STATE_ACTIVE: &str = "active";
 pub const VOL_STATE_DISABLED: &str = "disabled";
+/// §5.4: excluded from write placement and new allocations, but SERVES
+/// READS and refcount ops normally until retired.
+pub const VOL_STATE_DRAINING: &str = "draining";
+/// §5.4 terminal state: evacuation census reached 0; the runtime backend
+/// is deregistered and the record's path cleared, id retained forever.
+pub const VOL_STATE_RETIRED: &str = "retired";
 
 /// One member of the durable data-volume set (KD-5,
 /// design-volume-lifecycle §5.3): a never-reused volume id, its current

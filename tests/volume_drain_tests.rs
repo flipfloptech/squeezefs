@@ -339,15 +339,6 @@ async fn victim_blocks_of(fx: &Fx, ino: u64, victim: &str) -> Vec<(u32, String)>
     out
 }
 
-fn record(id: &str, dev: &Path, state: &str) -> DataVolumeRecord {
-    DataVolumeRecord {
-        id: id.to_string(),
-        backing_dev: dev.display().to_string(),
-        state: state.to_string(),
-        added_ts: 0,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // §5.2: the capacity-preflight closed form (G-VL-3 e)
 // ---------------------------------------------------------------------------
@@ -588,24 +579,30 @@ async fn test_clone_shared_blocks_move_once_both_clones_intact() {
     let src_ino = create_file(&fx, "orig.bin").await;
     let expected = striped_burst(&fx, src_ino, NBLOCKS).await;
     let dst_ino = create_file(&fx, "clone.bin").await;
+    // Present the CURRENT tokens (the FUSE layer still holds the create
+    // leases in this fixture; the whole-file copy_file_range handler
+    // passes tokens the same way).
+    let src_token = fx.fs.dlm().get_fencing_token_ino(src_ino);
+    let dst_token = fx.fs.dlm().get_fencing_token_ino(dst_ino);
     fx.fs
         .router
         .clone_file(
             &squeezefs::keys::inode_path(src_ino),
             &squeezefs::keys::inode_path(dst_ino),
-            None,
-            None,
+            Some(src_token),
+            Some(dst_token),
         )
         .await
         .expect("clone");
 
     let shared_on_victim = victim_blocks_of(&fx, src_ino, "oss2").await;
-    assert!(!shared_on_victim.is_empty(), "victim must hold shared blocks");
+    assert!(
+        !shared_on_victim.is_empty(),
+        "victim must hold shared blocks"
+    );
 
     let moved_before = METRICS.evacuate_blocks_moved.load(Ordering::Relaxed);
-    let shared_before = METRICS
-        .evacuate_shared_blocks_moved
-        .load(Ordering::Relaxed);
+    let shared_before = METRICS.evacuate_shared_blocks_moved.load(Ordering::Relaxed);
 
     let job_id = fx
         .fs
@@ -627,10 +624,7 @@ async fn test_clone_shared_blocks_move_once_both_clones_intact() {
         shared_on_victim.len() as u64,
         "a clone-shared block must move exactly once"
     );
-    let shared_moved = METRICS
-        .evacuate_shared_blocks_moved
-        .load(Ordering::Relaxed)
-        - shared_before;
+    let shared_moved = METRICS.evacuate_shared_blocks_moved.load(Ordering::Relaxed) - shared_before;
     assert_eq!(
         shared_moved,
         shared_on_victim.len() as u64,
@@ -646,9 +640,16 @@ async fn test_clone_shared_blocks_move_once_both_clones_intact() {
     // Both referencers now share the SAME new key per block (refcount
     // transferred, not duplicated): freeing one clone must not disturb
     // the other.
+    let mut con = fx
+        .fs
+        .router
+        .dlm
+        .get_connection()
+        .await
+        .expect("meta connection");
     fx.fs
         .router
-        .delete_file(&squeezefs::keys::inode_path(dst_ino))
+        .delete_file(&squeezefs::keys::inode_path(dst_ino), &mut con)
         .await
         .expect("delete the clone");
     assert_eq!(
@@ -690,9 +691,7 @@ async fn test_stale_mapping_supersession_is_contractual_noop() {
     let fired = std::sync::atomic::AtomicBool::new(false);
     let target = (ino, race_block);
     squeezefs::jobs::set_evacuate_pre_publish_hook(Arc::new(move |h_ino, h_block| {
-        if (h_ino, h_block) == target
-            && !fired.swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
+        if (h_ino, h_block) == target && !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
             let _ = hit_tx.send(());
             let _ = go_rx.lock().unwrap().recv();
         }
@@ -733,7 +732,11 @@ async fn test_stale_mapping_supersession_is_contractual_noop() {
         .wait_terminal(&job_id, std::time::Duration::from_secs(120))
         .await
         .expect("terminal");
-    assert_eq!(end, JobState::Completed, "supersession must not wedge the drain");
+    assert_eq!(
+        end,
+        JobState::Completed,
+        "supersession must not wedge the drain"
+    );
     squeezefs::jobs::clear_evacuate_pre_publish_hook();
 
     // The superseded publish was a contractual no-op, and re-planning
@@ -775,6 +778,7 @@ async fn test_stale_mapping_supersession_is_contractual_noop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_quiescent_first_defers_live_buffers_then_converges() {
+    let _ = env_logger::builder().is_test(true).try_init();
     let _serial = serial().await;
     let dir = tempfile::tempdir().unwrap();
     let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
@@ -783,7 +787,10 @@ async fn test_quiescent_first_defers_live_buffers_then_converges() {
     format_meta(&meta, &[&oss1, &oss2]).await;
     let recs = base_format_config(&[&oss1, &oss2]).resolved_data_volumes();
     let fx = open_fixture(&meta, &recs).await;
-    fx.fs.disable_background_writeback();
+    // Arm the FUSE-init workers (writeback flusher included): fsync of a
+    // parked partial buffer rides the writeback channel — the flush leg
+    // this test's convergence needs.
+    fx.fs.init(req()).await.expect("fuse init");
 
     const NBLOCKS: usize = 8;
     let ino = create_file(&fx, "hot.bin").await;
@@ -792,9 +799,11 @@ async fn test_quiescent_first_defers_live_buffers_then_converges() {
     assert!(!on_victim.is_empty());
     let (hot_block, _) = on_victim[0];
 
-    // Re-dirty ONE victim block without fsync: a live active buffer the
-    // quiescent-first rule must defer.
-    let hot = vec![0x77u8; BLOCK];
+    // Re-dirty ONE victim block without fsync — PARTIAL coverage, so
+    // the write parks as a live `ActiveBlockBuf` (a full-block write
+    // would write-through immediately and leave nothing to defer): the
+    // quiescent-first rule must defer this block.
+    let hot = vec![0x77u8; BLOCK / 4];
     fx.fs
         .write(
             req(),
@@ -855,7 +864,17 @@ async fn test_quiescent_first_defers_live_buffers_then_converges() {
         )
         .await
         .unwrap();
-    assert_eq!(&reply.data[..], &hot[..], "the flushed write must survive");
+    assert_eq!(
+        &reply.data[..hot.len()],
+        &hot[..],
+        "the flushed partial write must survive the drain"
+    );
+    let original = vec![(hot_block as u8) ^ 0x5C; BLOCK];
+    assert_eq!(
+        &reply.data[hot.len()..],
+        &original[hot.len()..],
+        "the unwritten remainder of the hot block must keep its bytes"
+    );
     fx.close().await;
 }
 
@@ -942,7 +961,10 @@ async fn test_undrain_restores_active_and_cancels_the_job() {
     let go_rx = std::sync::Mutex::new(go_rx);
     squeezefs::jobs::set_evacuate_pre_publish_hook(Arc::new(move |_ino, _b| {
         let _ = hit_tx.send(());
-        let _ = go_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(30));
+        let _ = go_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(30));
     }));
 
     let job_id = fx
@@ -1008,8 +1030,11 @@ async fn test_auto_rebalance_submitted_on_add_and_suppressed_by_opt_out() {
     let expected = striped_burst(&fx, ino, 32).await;
 
     // Default: add-data auto-submits the bounded rebalance pass at the
-    // conservative 25 % throttle (KD-12).
-    let rec = fx
+    // conservative 25 % throttle (KD-12). On this nearly-empty set the
+    // pass is a bounded no-op (every volume is already within 10 pp of
+    // the mean — the §5.3 step-6 objective); the MOVEMENT semantics are
+    // pinned by test_rebalance_moves_toward_the_set_mean below.
+    let _rec = fx
         .fs
         .admin_add_data_volume(oss2.to_str().unwrap(), false)
         .await
@@ -1036,21 +1061,6 @@ async fn test_auto_rebalance_submitted_on_add_and_suppressed_by_opt_out() {
         .await
         .expect("rebalance terminal");
     assert_eq!(end, JobState::Completed);
-
-    // The objective moved real bytes toward the empty volume.
-    let new_used = fx
-        .fs
-        .router
-        .backend_router
-        .volume_states()
-        .into_iter()
-        .find(|s| s.id == rec.id)
-        .unwrap()
-        .used_bytes;
-    assert!(
-        new_used > 0,
-        "the auto-rebalance pass must move blocks onto the added volume"
-    );
     assert_eq!(read_back(&fx, ino, 32).await, expected, "bytes survive");
 
     // Opt-out: --no-rebalance adds capacity without a pass.
@@ -1061,6 +1071,77 @@ async fn test_auto_rebalance_submitted_on_add_and_suppressed_by_opt_out() {
         .expect("online add with --no-rebalance");
     let after = JobFabric::list_records(&fx.meta).await.unwrap().len();
     assert_eq!(after, before, "--no-rebalance must submit no job");
+    fx.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_rebalance_moves_toward_the_set_mean() {
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    let oss2 = make_file(dir.path(), "oss2", 4 << 30);
+    format_meta(&meta, &[&oss1, &oss2]).await;
+    let recs = base_format_config(&[&oss1, &oss2]).resolved_data_volumes();
+    let fx = open_fixture(&meta, &recs).await;
+
+    // Seed data, then construct a > 10 pp imbalance by CLAMPING the
+    // capacity bounds (the fill ratio is used/capacity — the same §5.2
+    // numbers): oss1 ≈ 50 % full, oss2 ≈ 0 %.
+    let ino = create_file(&fx, "seed.bin").await;
+    let expected = striped_burst(&fx, ino, 64).await;
+    let br = &fx.fs.router.backend_router;
+    let (used1, used2) = {
+        let a1 = br.backends.get("oss1").unwrap().block_allocator.clone();
+        let a2 = br.backends.get("oss2").unwrap().block_allocator.clone();
+        (
+            a1.get_used_blocks() * a1.chunk_size(),
+            a2.get_used_blocks() * a2.chunk_size(),
+        )
+    };
+    // Clamp CAPACITIES so oss1 is overfull (fill 1.0) and oss2 sits
+    // below `mean − 10 pp` regardless of the round-robin split:
+    // cap1 = used1 ⇒ fill1 = 1.0; cap2 = 2 × total ⇒ fill2 ≈ 0.25 with
+    // mean ≈ 0.4 — squarely inside the §5.3-step-6 objective band.
+    let total_used = used1 + used2;
+    assert!(used1 > 0 && used2 > 0, "seed must spread over both volumes");
+    br.backends
+        .get("oss1")
+        .unwrap()
+        .block_allocator
+        .set_capacity_bytes(used1);
+    br.backends
+        .get("oss2")
+        .unwrap()
+        .block_allocator
+        .set_capacity_bytes(total_used * 2);
+
+    let job_id = fx
+        .fabric
+        .submit(squeezefs::jobs::JobSpec {
+            job_type: JobType::Rebalance,
+            throttle_pct: 100,
+        })
+        .await
+        .expect("submit rebalance");
+    let end = fx
+        .fabric
+        .wait_terminal(&job_id, std::time::Duration::from_secs(120))
+        .await
+        .expect("rebalance terminal");
+    assert_eq!(end, JobState::Completed, "the bounded pass completes");
+
+    // Blocks moved toward the under-filled volume; bytes intact.
+    let used2_after = {
+        let a2 = br.backends.get("oss2").unwrap().block_allocator.clone();
+        a2.get_used_blocks() * a2.chunk_size()
+    };
+    assert!(
+        used2_after > used2,
+        "the rebalance pass must move blocks onto the under-filled volume \
+         (oss2 used {used2} -> {used2_after})"
+    );
+    assert_eq!(read_back(&fx, ino, 64).await, expected, "bytes survive");
     fx.close().await;
 }
 
@@ -1159,11 +1240,9 @@ async fn test_crash_mid_drain_resumes_by_replan_and_preserves_bytes() {
 
     // "Remount": reopen the set; the fabric adopts the durable job and
     // re-plans from current state (KD-6 — idempotent).
-    let listed = squeezefs::config_ops::resolved_volume_records(&vec![meta
-        .display()
-        .to_string()])
-    .await
-    .expect("volume records probe");
+    let listed = squeezefs::config_ops::resolved_volume_records(&[meta.display().to_string()])
+        .await
+        .expect("volume records probe");
     assert_eq!(
         listed.iter().find(|r| r.id == "oss2").unwrap().state,
         VOL_STATE_DRAINING,

@@ -596,14 +596,14 @@ Use coz/dhat **after** a known-good cargo test gate, against a representative mo
 
 ## Module Map (non-obvious wiring)
 
-- `src/main.rs` (~5.3k lines) is the entire CLI: `format`, `status`, `clients`, `claim`, `mount`, `umount`, `bench`, `clone`, `tune`, `config`, `df`, `storage`, `nvmeof`. `src/lib.rs` is the library surface. (No `defrag`/`fsck` verbs yet — they land with the **volume-lifecycle program**, `docs/design-volume-lifecycle.md`; the former `config` fake admin verbs were deleted in its PR VL1 and refuse loudly naming their successors.)
+- `src/main.rs` is the entire CLI: `format`, `status`, `clients`, `claim`, `mount`, `umount`, `bench`, `clone`, `tune`, `config`, `volume` (PR VL3: `add-data`/`list` — durable `vol-` identity, KD-5), `job`, `df`, `storage`, `nvmeof`. `src/lib.rs` is the library surface (incl. `DataVolumeRecord` + `FormatConfig::resolved_data_volumes` legacy grandfathering). (No `defrag`/`fsck` verbs yet — they land with the **volume-lifecycle program**, `docs/design-volume-lifecycle.md`; the former `config` fake admin verbs were deleted in its PR VL1 and refuse loudly naming their successors. `volume remove-data`/drain is PR VL4.)
 - `src/fuse_client.rs` — FUSE daemon + `format_volume_ext` / `SqueezefsFilesystem`.
 - `src/routing.rs` — `DataRouter` (progressive layout: inline / staged / striped) plus the `OnceCell`-held `CryptoCompressState`.
 - `src/dlm.rs` — distributed lock manager (`DlmClient`, `acquire_lock`, fencing tokens, heartbeat renewal).
 - `src/block_allocator.rs`, `src/nvme_dev.rs`, `src/storage.rs` — block allocation + NVMe/LVM pool plumbing.
 - `src/cache/`, `src/tiering/` — tiered cache (GDS / RAM LRU / NVMe staging) and tier selection.
 - `src/crypto_compress.rs` — compression (lz4/zstd) + RSA-wrapped symmetric encryption, applied across all three write paths via `process_write` / `process_read`.
-- `src/jobs.rs`, `src/recovery.rs`, `src/nvmeof.rs`, `src/p2p.rs`, `src/config_ops.rs` — maintenance-job worker skeleton (throttle law + queue; the volume-lifecycle fabric extends it), crash recovery, NVMe-oF control, peer-to-peer, host-local runtime health overrides (`enable`/`disable` only — everything else that file once claimed was fake and is deleted).
+- `src/jobs.rs`, `src/recovery.rs`, `src/nvmeof.rs`, `src/p2p.rs`, `src/config_ops.rs` — maintenance-job worker skeleton (throttle law + queue; the volume-lifecycle fabric extends it), crash recovery, NVMe-oF control, peer-to-peer, and the offline **guarded** admin verbs over durable on-volume state (cache-path policy, `volume add-data`/state — PR VL3). The historical `/dev/shm` runtime-config file is DELETED (VL3): live `enable`/`disable` health overrides ride the admin lane (`BackendRouter::set_health_override`); offline enable/disable is durable `DataVolumeRecord.state`.
 
 ## Repo-specific conventions
 

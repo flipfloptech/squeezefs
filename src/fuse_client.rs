@@ -1761,6 +1761,12 @@ pub struct Metrics {
     /// failure). Offline verbs refuse in the CLI process and do not
     /// count here.
     pub volume_preflight_refusals: Align64<AtomicU64>,
+    /// §5.9 placement-table rebuilds (design-volume-lifecycle §10, PR
+    /// VL4b): the health-worker cadence + registration/state-change/
+    /// override/retire hooks + the empty-band degenerate rebuild. Never
+    /// a per-write cost — steady-state picks leave this flat (pinned in
+    /// tests/placement_tests.rs).
+    pub placement_table_refreshes: Align64<AtomicU64>,
     /// §5.1.6 remote-wire family (design-volume-lifecycle §10, PR VL2b).
     /// Currently-enrolled remote workers (gauge).
     pub job_remote_workers: Align64<AtomicU64>,
@@ -3458,6 +3464,28 @@ impl SqueezefsFilesystem {
             })
             .collect();
 
+        // §5.9 placement gauges (design-volume-lifecycle §10, PR VL4b):
+        // the live PlacementTable snapshot — per-backend picks/weight/
+        // fill plus the set-level fill spread (the G-VL-8 instrument).
+        let placement_table = self.router.backend_router.placement_snapshot();
+        let placement_backends: Vec<serde_json::Value> = placement_table
+            .rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.id,
+                    "backend_placement_picks": row.picks.load(Ordering::Relaxed),
+                    "backend_placement_weight": row.weight,
+                    "backend_fill_ratio": row.fill_ratio,
+                    "eligible": row.eligible,
+                })
+            })
+            .collect();
+        let placement_obj = serde_json::json!({
+            "backend_fill_spread": placement_table.fill_spread,
+            "backends": placement_backends,
+        });
+
         let mut stats_obj = serde_json::json!({
             // Build identity (docs/operations.md §Versioning & releases):
             // the fleet mixed-version detector. `build_commit` is the full
@@ -3474,6 +3502,7 @@ impl SqueezefsFilesystem {
             "active_leases_count": self.active_leases.len(),
             "active_posix_locks_count": self.active_posix_locks.len(),
             "volume_states": volume_states,
+            "placement": placement_obj,
             "metrics": {
                 "fuse_ops": METRICS.fuse_ops.load(Ordering::Relaxed),
                 "fuse_op_watchdog_overdue": METRICS.fuse_op_watchdog_overdue.load(Ordering::Relaxed),
@@ -3592,6 +3621,7 @@ impl SqueezefsFilesystem {
                 "evacuate_avail_bytes": METRICS.evacuate_avail_bytes.load(Ordering::Relaxed),
                 "evacuate_transient_bytes": METRICS.evacuate_transient_bytes.load(Ordering::Relaxed),
                 "volume_preflight_refusals": METRICS.volume_preflight_refusals.load(Ordering::Relaxed),
+                "placement_table_refreshes": METRICS.placement_table_refreshes.load(Ordering::Relaxed),
                 "job_remote_workers": METRICS.job_remote_workers.load(Ordering::Relaxed),
                 "job_remote_enrollments": METRICS.job_remote_enrollments.load(Ordering::Relaxed),
                 "job_remote_enroll_refused": METRICS.job_remote_enroll_refused.load(Ordering::Relaxed),

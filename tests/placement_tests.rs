@@ -126,8 +126,16 @@ proptest! {
 /// 100 points), cap 300.
 #[test]
 fn penalty_slope_and_cap_exact() {
-    assert_eq!(balance_penalty(0.5, 0.4), 100, "10 pp above mean = 100 points");
-    assert_eq!(balance_penalty(0.6, 0.4), 200, "20 pp above mean = 200 points");
+    assert_eq!(
+        balance_penalty(0.5, 0.4),
+        100,
+        "10 pp above mean = 100 points"
+    );
+    assert_eq!(
+        balance_penalty(0.6, 0.4),
+        200,
+        "20 pp above mean = 200 points"
+    );
     assert_eq!(balance_penalty(0.9, 0.4), 300, "capped at 300");
     assert_eq!(balance_penalty(1.0, 0.0), 300, "worst case still capped");
     assert_eq!(balance_penalty(0.25, 0.25), 0, "at the mean costs nothing");
@@ -159,9 +167,10 @@ fn make_dev_file(dir: &Path, name: &str, len: u64) -> PathBuf {
 }
 
 /// A bare router with `vols` named backends: per-volume allocator +
-/// device, capacity bounded to `cap_blocks`, `seed_used` blocks
-/// pre-allocated (the census imbalance seed). The default slot is a
-/// dummy that never joins placement (named registrations exist).
+/// device, capacity bounded to `cap_blocks` ALLOCATOR CHUNKS (the fill
+/// census quantum), `seed_used` chunks pre-allocated (the imbalance
+/// seed). The default slot is a dummy that never joins placement (named
+/// registrations exist).
 async fn router_with(vols: &[(&str, u64, u64)]) -> RouterFx {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BS.to_string());
     let dir = tempfile::tempdir().unwrap();
@@ -181,14 +190,14 @@ async fn router_with(vols: &[(&str, u64, u64)]) -> RouterFx {
     ));
 
     for &(id, cap_blocks, seed_used) in vols {
-        let dev_path = make_dev_file(dir.path(), &format!("{id}.img"), cap_blocks * BS);
+        let dev_path = make_dev_file(dir.path(), &format!("{id}.img"), 16 * 1024 * 1024);
         let dev = Arc::new(NvmeBlockDev::new(dev_path.to_str().unwrap()));
         let alloc = Arc::new(
             BlockAllocator::new(dlm.meta_client().clone(), id)
                 .await
                 .unwrap(),
         );
-        alloc.set_capacity_bytes(cap_blocks * BS);
+        alloc.set_capacity_bytes(cap_blocks * alloc.chunk_size());
         for _ in 0..seed_used {
             alloc.allocate_block().await.unwrap();
         }
@@ -243,12 +252,18 @@ async fn band_and_round_robin_over_imbalanced_table() {
             .find(|r| r.id == id)
             .unwrap_or_else(|| panic!("row {id} missing from the table"))
     };
-    assert!(row("oss1").eligible, "near-full is still ELIGIBLE (state active, healthy)");
+    assert!(
+        row("oss1").eligible,
+        "near-full is still ELIGIBLE (state active, healthy)"
+    );
     assert!(
         row("oss1").weight < row("oss3").weight,
         "the fill penalty must depress the full volume's weight"
     );
-    assert!((row("oss1").fill_ratio - 0.7).abs() < 0.01, "fill gauge exact-ish");
+    assert!(
+        (row("oss1").fill_ratio - 0.7).abs() < 0.01,
+        "fill gauge exact-ish"
+    );
     assert!(row("oss3").fill_ratio < 0.01);
     // Set-level spread gauge: max − min over eligible rows = ~70 pp.
     assert!(
@@ -312,7 +327,9 @@ async fn eligibility_and_refresh_on_state_change() {
 
     // Draining: excluded from the band the moment the state flips — no
     // worker tick required (the state-change refresh hook).
-    fx.router.set_volume_state("oss2", VOL_STATE_DRAINING).unwrap();
+    fx.router
+        .set_volume_state("oss2", VOL_STATE_DRAINING)
+        .unwrap();
     // Disabled (fail-stop health override): excluded instantly too.
     fx.router.set_health_override("oss3", true).unwrap();
     // Retired: deregistered — gone from the table entirely.
@@ -321,7 +338,11 @@ async fn eligibility_and_refresh_on_state_change() {
     let table = fx.router.placement_snapshot();
     let mut band = table.band_ids();
     band.sort();
-    assert_eq!(band, vec!["oss1".to_string()], "only the active healthy volume places");
+    assert_eq!(
+        band,
+        vec!["oss1".to_string()],
+        "only the active healthy volume places"
+    );
     let row = |id: &str| table.rows.iter().find(|r| r.id == id);
     assert!(!row("oss2").expect("draining stays a row").eligible);
     assert!(!row("oss3").expect("disabled stays a row").eligible);
@@ -329,11 +350,16 @@ async fn eligibility_and_refresh_on_state_change() {
 
     for i in 0..50 {
         let (id, _, _) = fx.router.get_active_backend().unwrap();
-        assert_eq!(id, "oss1", "pick #{i} must exclude draining/disabled/retired");
+        assert_eq!(
+            id, "oss1",
+            "pick #{i} must exclude draining/disabled/retired"
+        );
     }
 
     // Undrain / re-enable: rejoins the band immediately (refresh hooks).
-    fx.router.set_volume_state("oss2", VOL_STATE_ACTIVE).unwrap();
+    fx.router
+        .set_volume_state("oss2", VOL_STATE_ACTIVE)
+        .unwrap();
     fx.router.set_health_override("oss3", false).unwrap();
     let mut band = fx.router.placement_snapshot().band_ids();
     band.sort();
@@ -359,7 +385,10 @@ async fn unhealthy_mark_is_instant_against_a_stale_table() {
         .insert("oss2".to_string(), true);
     for i in 0..50 {
         let (id, _, _) = fx.router.get_active_backend().unwrap();
-        assert_eq!(id, "oss1", "pick #{i}: the stale table must not serve the marked volume");
+        assert_eq!(
+            id, "oss1",
+            "pick #{i}: the stale table must not serve the marked volume"
+        );
     }
     fx.router.unhealthy_backends.remove("oss2");
 
@@ -408,7 +437,10 @@ async fn picks_are_table_only_no_refresh_no_syscall() {
     // Structural pin: the pick works on the snapshot ALONE.
     let table = fx.router.placement_snapshot();
     let sel = table.pick(|_| true);
-    assert!(sel.is_some(), "a snapshot pick needs nothing but the snapshot");
+    assert!(
+        sel.is_some(),
+        "a snapshot pick needs nothing but the snapshot"
+    );
 
     // The picks land on the per-backend gauges.
     let table = fx.router.placement_snapshot();
@@ -471,7 +503,12 @@ async fn refresh_counter_and_fill_gauge_track_rebuilds() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fill_spread_converges_on_imbalanced_set() {
     let _g = serial().await;
-    let fx = router_with(&[("full1", 1024, 717), ("empty1", 1024, 0), ("empty2", 1024, 0)]).await;
+    let fx = router_with(&[
+        ("full1", 1024, 717),
+        ("empty1", 1024, 0),
+        ("empty2", 1024, 0),
+    ])
+    .await;
 
     let mut prev_spread = f64::MAX;
     let mut converged = false;
@@ -779,7 +816,8 @@ async fn w1_patch_unaffected_while_placement_prefers_other_backend() {
     // re-enable oss2: the table now prefers oss2 for NEW allocations.
     let oss1_id = recs[0].id.clone();
     let be1 = br.backends.get(&oss1_id).unwrap().value().clone();
-    be1.block_allocator.set_capacity_bytes(16 * BS);
+    let chunk = be1.block_allocator.chunk_size();
+    be1.block_allocator.set_capacity_bytes(16 * chunk);
     for _ in 0..4 {
         be1.block_allocator.allocate_block().await.unwrap();
     }
@@ -788,7 +826,7 @@ async fn w1_patch_unaffected_while_placement_prefers_other_backend() {
         .unwrap()
         .value()
         .block_allocator
-        .set_capacity_bytes(16 * BS);
+        .set_capacity_bytes(16 * chunk);
     br.set_health_override("oss2", false).unwrap();
     for i in 0..8 {
         let (id, _, _) = br.get_active_backend().unwrap();
@@ -825,14 +863,42 @@ async fn w1_patch_unaffected_while_placement_prefers_other_backend() {
         "every aligned overwrite must ride the in-place patch"
     );
     for (name, b, a) in [
-        ("unmapped", before.ineligible_unmapped, after.ineligible_unmapped),
-        ("decorated", before.ineligible_decorated, after.ineligible_decorated),
-        ("unaligned", before.ineligible_unaligned, after.ineligible_unaligned),
-        ("overlay", before.ineligible_overlay, after.ineligible_overlay),
+        (
+            "unmapped",
+            before.ineligible_unmapped,
+            after.ineligible_unmapped,
+        ),
+        (
+            "decorated",
+            before.ineligible_decorated,
+            after.ineligible_decorated,
+        ),
+        (
+            "unaligned",
+            before.ineligible_unaligned,
+            after.ineligible_unaligned,
+        ),
+        (
+            "overlay",
+            before.ineligible_overlay,
+            after.ineligible_overlay,
+        ),
         ("shared", before.ineligible_shared, after.ineligible_shared),
-        ("transform", before.ineligible_transform, after.ineligible_transform),
-        ("adjacent", before.ineligible_adjacent, after.ineligible_adjacent),
-        ("oversize", before.ineligible_oversize, after.ineligible_oversize),
+        (
+            "transform",
+            before.ineligible_transform,
+            after.ineligible_transform,
+        ),
+        (
+            "adjacent",
+            before.ineligible_adjacent,
+            after.ineligible_adjacent,
+        ),
+        (
+            "oversize",
+            before.ineligible_oversize,
+            after.ineligible_oversize,
+        ),
     ] {
         assert_eq!(
             a - b,
@@ -841,7 +907,10 @@ async fn w1_patch_unaffected_while_placement_prefers_other_backend() {
              overwrite workload — placement rotted the W1 predicate"
         );
     }
-    assert_eq!(after.edge_rmw_reads, before.edge_rmw_reads, "v1: no edge RMW ever");
+    assert_eq!(
+        after.edge_rmw_reads, before.edge_rmw_reads,
+        "v1: no edge RMW ever"
+    );
     assert_eq!(
         after.seed_read_bytes, before.seed_read_bytes,
         "write_path_seed_read_bytes is a must-stay-0 tripwire"
@@ -902,14 +971,20 @@ async fn stats_inode_carries_the_placement_family() {
         .get("placement")
         .expect(".stats must carry the placement object");
     assert!(
-        placement.get("backend_fill_spread").is_some_and(|v| v.is_number()),
+        placement
+            .get("backend_fill_spread")
+            .is_some_and(|v| v.is_number()),
         "backend_fill_spread gauge missing: {placement}"
     );
     let backends = placement
         .get("backends")
         .and_then(|v| v.as_array())
         .expect("placement.backends rows");
-    assert_eq!(backends.len(), 2, "one row per registered backend: {backends:?}");
+    assert_eq!(
+        backends.len(),
+        2,
+        "one row per registered backend: {backends:?}"
+    );
     let mut picks_total = 0u64;
     for row in backends {
         for key in [
@@ -923,7 +998,10 @@ async fn stats_inode_carries_the_placement_family() {
         }
         picks_total += row["backend_placement_picks"].as_u64().unwrap();
     }
-    assert!(picks_total >= 8, "picks gauge must account for the placements");
+    assert!(
+        picks_total >= 8,
+        "picks gauge must account for the placements"
+    );
     assert!(
         stats["metrics"]
             .get("placement_table_refreshes")

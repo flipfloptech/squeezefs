@@ -237,6 +237,117 @@ pub struct VolumeStateRow {
     pub free_bytes: u64,
 }
 
+/// §5.9 balance-penalty slope (design-volume-lifecycle, KD-16): `k =
+/// 1000` — 10 pp of fill above the set mean costs 100 health points.
+pub const BALANCE_PENALTY_K: f64 = 1000.0;
+/// §5.9 penalty cap: 300 of 1000, so balance NEVER outvotes health — a
+/// genuinely degraded backend still loses to a merely-full one, and
+/// failover semantics stay untouched (the health gates are absolute and
+/// precede scoring).
+pub const BALANCE_PENALTY_CAP: u32 = 300;
+
+/// The §5.9 balance penalty: `clamp(k × (fill_ratio − set_mean_fill),
+/// 0, 300)`. At or below the set mean the penalty is zero.
+pub fn balance_penalty(fill_ratio: f64, set_mean_fill: f64) -> u32 {
+    let raw = BALANCE_PENALTY_K * (fill_ratio - set_mean_fill);
+    if raw.is_nan() || raw <= 0.0 {
+        0
+    } else {
+        raw.min(f64::from(BALANCE_PENALTY_CAP)).round() as u32
+    }
+}
+
+/// §5.9: `health_effective = device/health score − balance_penalty`,
+/// saturating at zero. The KD-16 invariant is structural: the result
+/// never drops more than [`BALANCE_PENALTY_CAP`] below `device_health`.
+pub fn health_effective(device_health: u32, fill_ratio: f64, set_mean_fill: f64) -> u32 {
+    device_health.saturating_sub(balance_penalty(fill_ratio, set_mean_fill))
+}
+
+/// One backend row of the [`PlacementTable`] snapshot (design-
+/// volume-lifecycle §5.9/§10): the per-backend placement gauges plus the
+/// Arcs a pick hands to the write path.
+pub struct PlacementRow {
+    pub id: String,
+    /// `health_effective` at refresh time (`backend_placement_weight`).
+    pub weight: u32,
+    /// `used/capacity` from the allocator census (`backend_fill_ratio`).
+    pub fill_ratio: f64,
+    /// §5.4 placement eligibility at refresh time: healthy AND durable
+    /// state `active`. Ineligible rows carry weight 0 and never join the
+    /// band; they stay in the snapshot so the stats surface shows them.
+    pub eligible: bool,
+    /// Cumulative `backend_placement_picks` — Arc-shared with the router
+    /// so the gauge survives table swaps.
+    pub picks: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
+    device: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+}
+
+/// The §5.9 ArcSwap'd placement snapshot: an immutable per-backend row
+/// vec plus the 90 %-of-max `health_effective` band and an atomic
+/// round-robin cursor. Refreshed by the health worker on its cadence and
+/// immediately on registration / volume-state / health-override /
+/// retire transitions (plus the mover's retire path through those same
+/// hooks) — NEVER on the per-write path: a pick is one ArcSwap load +
+/// O(#backends) scan, zero locks, zero syscalls (the P1-11 pattern).
+pub struct PlacementTable {
+    pub rows: Vec<PlacementRow>,
+    /// Indices into `rows`: eligible backends within 90 % of the max
+    /// `health_effective`.
+    band: Vec<usize>,
+    /// Round-robin cursor within the band (reset on refresh — spread,
+    /// not fairness bookkeeping).
+    rr: std::sync::atomic::AtomicUsize,
+    /// Set-level max−min fill ratio over eligible rows — the
+    /// `backend_fill_spread` gauge, THE G-VL-8 instrument.
+    pub fill_spread: f64,
+}
+
+impl PlacementTable {
+    fn empty() -> Self {
+        Self {
+            rows: Vec::new(),
+            band: Vec::new(),
+            rr: std::sync::atomic::AtomicUsize::new(0),
+            fill_spread: 0.0,
+        }
+    }
+
+    /// The in-band backend ids (test/diagnostic surface).
+    pub fn band_ids(&self) -> Vec<String> {
+        self.band.iter().map(|&i| self.rows[i].id.clone()).collect()
+    }
+
+    /// The §5.9 hot-path pick: atomic round-robin within the band,
+    /// skipping candidates the `healthy` gate refuses (the
+    /// `unhealthy_backends` fail-stop mark stays authoritative and
+    /// INSTANT even against a stale snapshot). Takes ONLY the snapshot —
+    /// structurally no router, no filesystem, no syscalls.
+    pub fn pick<F: Fn(&str) -> bool>(
+        &self,
+        healthy: F,
+    ) -> Option<(
+        String,
+        std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+    )> {
+        let n = self.band.len();
+        if n == 0 {
+            return None;
+        }
+        let start = self.rr.fetch_add(1, Ordering::Relaxed);
+        for i in 0..n {
+            let row = &self.rows[self.band[start.wrapping_add(i) % n]];
+            if healthy(&row.id) {
+                row.picks.fetch_add(1, Ordering::Relaxed);
+                return Some((row.id.clone(), row.allocator.clone(), row.device.clone()));
+            }
+        }
+        None
+    }
+}
+
 #[derive(Clone)]
 pub struct BackendRouter {
     pub default_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
@@ -265,6 +376,14 @@ pub struct BackendRouter {
     /// (stats, admin verbs) load; the mount wiring and the online
     /// `volume add-data` path store.
     volume_records: std::sync::Arc<arc_swap::ArcSwap<Vec<crate::DataVolumeRecord>>>,
+    /// §5.9: the balance-aware write-placement snapshot (see
+    /// [`PlacementTable`]). Hot-path reads are one ArcSwap load.
+    placement_table: std::sync::Arc<arc_swap::ArcSwap<PlacementTable>>,
+    /// Per-backend cumulative pick counters (`backend_placement_picks`)
+    /// — kept outside the table so the gauges survive table swaps.
+    placement_picks: std::sync::Arc<
+        dashmap::DashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>,
+    >,
 }
 
 #[cold]
@@ -283,6 +402,28 @@ fn err_backend_not_found(be_id: &str) -> crate::error::SqueezefsError {
         "Storage backend '{}' not found/offline",
         be_id
     ))
+}
+
+/// Best-effort device size probe (`fs::metadata`, then a seek-to-end for
+/// device nodes, then a 100 GiB default). Refresh-cadence / `.config`
+/// surface only — the per-write path never calls this (§5.9: the
+/// per-write metadata/seek pair is retired).
+fn probe_device_size_bytes(device_path: &str) -> u64 {
+    let mut dev_size = 100 * 1024 * 1024 * 1024;
+    if let Ok(metadata) = std::fs::metadata(device_path) {
+        let len = metadata.len();
+        if len > 0 {
+            dev_size = len;
+        } else if let Ok(mut file) = std::fs::File::open(device_path) {
+            use std::io::Seek;
+            if let Ok(len) = file.seek(std::io::SeekFrom::End(0)) {
+                if len > 0 {
+                    dev_size = len;
+                }
+            }
+        }
+    }
+    dev_size
 }
 
 /// Strip a stored block-map value (`proto://offset:extra` or `offset:extra`)
@@ -386,7 +527,7 @@ impl BackendRouter {
         default_device: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
         block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
-        Self {
+        let router = Self {
             default_allocator,
             default_device,
             backends: std::sync::Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::new())),
@@ -399,7 +540,17 @@ impl BackendRouter {
             block_size,
             read_tier_purge: once_cell::sync::OnceCell::new(),
             volume_records: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
-        }
+            placement_table: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                PlacementTable::empty(),
+            )),
+            placement_picks: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
+        };
+        // Seed the table so bare routers place without waiting for a
+        // worker tick (construction-time probe, never per-write).
+        router.refresh_placement_table();
+        router
     }
 
     /// Wire the terminal-free read-tier purge (see the field doc). Called
@@ -412,11 +563,166 @@ impl BackendRouter {
     /// online add path swaps in the post-commit set).
     pub fn set_volume_records(&self, records: Vec<crate::DataVolumeRecord>) {
         self.volume_records.store(std::sync::Arc::new(records));
+        self.refresh_placement_table();
     }
 
     /// The durable volume-record snapshot (empty on bare routers).
     pub fn volume_records(&self) -> std::sync::Arc<Vec<crate::DataVolumeRecord>> {
         self.volume_records.load_full()
+    }
+
+    /// The current [`PlacementTable`] snapshot (stats surface + tests).
+    pub fn placement_snapshot(&self) -> std::sync::Arc<PlacementTable> {
+        self.placement_table.load_full()
+    }
+
+    /// Rebuild and publish the §5.9 placement snapshot from the live
+    /// census. Runs on the health-worker cadence and immediately on
+    /// registration / volume-state / health-override / retire
+    /// transitions — never on the per-write path (this is the ONLY
+    /// syscall site of placement, and only for allocators without a
+    /// capacity bound).
+    pub fn refresh_placement_table(&self) {
+        // Candidate policy unchanged: the `backend_0` default slot is a
+        // candidate ONLY on bare routers (no named registrations).
+        let mut cands: Vec<(
+            String,
+            std::sync::Arc<crate::block_allocator::BlockAllocator>,
+            std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+        )> = Vec::new();
+        if self.backends.is_empty() {
+            cands.push((
+                "backend_0".to_string(),
+                self.default_allocator.clone(),
+                self.default_device.clone(),
+            ));
+        }
+        for entry in self.backends.iter() {
+            cands.push((
+                entry.key().clone(),
+                entry.value().block_allocator.clone(),
+                entry.value().device.clone(),
+            ));
+        }
+
+        // Census: fill = used/capacity (the same allocator numbers §5.2
+        // uses); unbounded allocators fall back to a device-size probe —
+        // at refresh cadence, not per write.
+        struct Census {
+            id: String,
+            allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
+            device: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+            eligible: bool,
+            capacity: u64,
+            used: u64,
+        }
+        let census: Vec<Census> = cands
+            .into_iter()
+            .map(|(id, allocator, device)| {
+                let eligible = self.placement_eligible(&id);
+                let mut capacity = allocator.capacity_bytes();
+                if capacity == 0 {
+                    capacity = probe_device_size_bytes(&device.device_path);
+                }
+                let used = allocator
+                    .get_used_blocks()
+                    .saturating_mul(allocator.chunk_size());
+                Census {
+                    id,
+                    allocator,
+                    device,
+                    eligible,
+                    capacity,
+                    used,
+                }
+            })
+            .collect();
+
+        // set_mean = Σused/Σcapacity over the placing (eligible) set.
+        let (sum_used, sum_cap) = census
+            .iter()
+            .filter(|c| c.eligible && c.capacity > 0)
+            .fold((0u64, 0u64), |(u, c), m| {
+                (u.saturating_add(m.used), c.saturating_add(m.capacity))
+            });
+        let set_mean = if sum_cap > 0 {
+            sum_used as f64 / sum_cap as f64
+        } else {
+            0.0
+        };
+
+        let rows: Vec<PlacementRow> = census
+            .into_iter()
+            .map(|c| {
+                let fill_ratio = if c.capacity > 0 {
+                    (c.used as f64 / c.capacity as f64).min(1.0)
+                } else {
+                    0.0
+                };
+                // The device/health score: the free-fraction × 1000 the
+                // write path has always ranked on, census-sourced.
+                let device_health = ((1.0 - fill_ratio).max(0.0) * 1000.0) as u32;
+                let weight = if c.eligible {
+                    health_effective(device_health, fill_ratio, set_mean)
+                } else {
+                    0
+                };
+                let picks = self
+                    .placement_picks
+                    .entry(c.id.clone())
+                    .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)))
+                    .clone();
+                PlacementRow {
+                    id: c.id,
+                    weight,
+                    fill_ratio,
+                    eligible: c.eligible,
+                    picks,
+                    allocator: c.allocator,
+                    device: c.device,
+                }
+            })
+            .collect();
+
+        // The 90 %-of-max band over eligible rows (a zero max keeps every
+        // eligible row in the band — a full-but-healthy set still places,
+        // exactly like the retired per-write sort did).
+        let max_weight = rows
+            .iter()
+            .filter(|r| r.eligible)
+            .map(|r| r.weight)
+            .max()
+            .unwrap_or(0);
+        let cutoff = (max_weight * 9) / 10;
+        let band: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.eligible && r.weight >= cutoff)
+            .map(|(i, _)| i)
+            .collect();
+
+        let (min_fill, max_fill) = rows
+            .iter()
+            .filter(|r| r.eligible)
+            .fold((f64::MAX, f64::MIN), |(lo, hi), r| {
+                (lo.min(r.fill_ratio), hi.max(r.fill_ratio))
+            });
+        let fill_spread = if max_fill > min_fill {
+            max_fill - min_fill
+        } else {
+            0.0
+        };
+
+        self.placement_table
+            .store(std::sync::Arc::new(PlacementTable {
+                rows,
+                band,
+                rr: std::sync::atomic::AtomicUsize::new(0),
+                fill_spread,
+            }));
+        METRICS
+            .placement_table_refreshes
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Build a [`StorageBackend`] for one durable volume record — THE
@@ -475,6 +781,7 @@ impl BackendRouter {
             )),
             dashmap::mapref::entry::Entry::Vacant(v) => {
                 v.insert(backend);
+                self.refresh_placement_table();
                 Ok(())
             }
         }
@@ -495,6 +802,7 @@ impl BackendRouter {
         self.publish_backend(&record.id, backend.clone())?;
         if record.state == crate::VOL_STATE_DISABLED {
             self.unhealthy_backends.insert(record.id.clone(), true);
+            self.refresh_placement_table();
         }
         Ok(backend)
     }
@@ -518,6 +826,7 @@ impl BackendRouter {
         } else {
             self.unhealthy_backends.remove(id);
         }
+        self.refresh_placement_table();
         Ok(())
     }
 
@@ -591,6 +900,7 @@ impl BackendRouter {
         })?;
         rec.state = state.to_string();
         self.volume_records.store(std::sync::Arc::new(updated));
+        self.refresh_placement_table();
         Ok(())
     }
 
@@ -604,6 +914,7 @@ impl BackendRouter {
             )));
         }
         self.unhealthy_backends.remove(id);
+        self.refresh_placement_table();
         Ok(())
     }
 
@@ -696,6 +1007,10 @@ impl BackendRouter {
         }
     }
 
+    /// The `.config` data-volume health score (free-fraction × 1000 with
+    /// a device-size probe). Diagnostic surface ONLY — write placement
+    /// reads the §5.9 [`PlacementTable`] weights; this fn is never on the
+    /// per-write path.
     pub fn get_backend_health(&self, be_id: &str) -> u32 {
         if !self.is_backend_healthy(be_id) {
             return 0;
@@ -712,22 +1027,7 @@ impl BackendRouter {
             return 0;
         };
 
-        // Query real device capacity
-        let mut dev_size = 100 * 1024 * 1024 * 1024;
-        if let Ok(metadata) = std::fs::metadata(&device_path) {
-            let len = metadata.len();
-            if len > 0 {
-                dev_size = len;
-            } else if let Ok(mut file) = std::fs::File::open(&device_path) {
-                use std::io::Seek;
-                if let Ok(len) = file.seek(std::io::SeekFrom::End(0)) {
-                    if len > 0 {
-                        dev_size = len;
-                    }
-                }
-            }
-        }
-
+        let dev_size = probe_device_size_bytes(&device_path);
         let total_blocks = (dev_size / (4 * 1024 * 1024)).max(1);
         let used_blocks = allocator.get_used_blocks();
         let free_blocks = total_blocks.saturating_sub(used_blocks);
@@ -739,6 +1039,30 @@ impl BackendRouter {
         score.min(1000)
     }
 
+    /// §5.9 write placement: one ArcSwap load + an atomic round-robin
+    /// pick inside the 90 %-of-max `health_effective` band — zero locks,
+    /// zero syscalls (the retired implementation paid a per-write DashMap
+    /// scan + sort + `fs::metadata`+seek pair). The candidate policy is
+    /// unchanged (the `backend_0` default slot only on bare routers —
+    /// see [`Self::refresh_placement_table`]); the `unhealthy_backends`
+    /// fail-stop mark stays an absolute, instant gate via the pick's
+    /// health closure. An empty/expired band rebuilds ONCE (recoveries
+    /// don't wait a worker tick) and then fails with the same loud "no
+    /// healthy backends" error as ever.
+    /// The snapshot-currency check the pick path runs (RAM-only, no
+    /// syscalls): a table built for a different candidate population —
+    /// direct registrations without the publish hook (test fixtures),
+    /// or the bare-router → named-volume transition where the phantom
+    /// `backend_0` row must vanish — forces a rebuild before serving.
+    fn placement_table_current(&self, table: &PlacementTable) -> bool {
+        let named = self.backends.len();
+        if named == 0 {
+            table.rows.len() == 1 && table.rows[0].id == "backend_0"
+        } else {
+            table.rows.len() == named && !table.rows.iter().any(|r| r.id == "backend_0")
+        }
+    }
+
     pub fn get_active_backend(
         &self,
     ) -> Result<(
@@ -746,65 +1070,28 @@ impl BackendRouter {
         std::sync::Arc<crate::block_allocator::BlockAllocator>,
         std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
     )> {
-        let mut healthy_backends = Vec::new();
-
-        // The `backend_0` default slot is a placement candidate ONLY when no
-        // named volume is registered (bare routers: offline tools, tests).
-        // On real mounts every volume — including the first, whose
-        // device/allocator ARE the default slot — is registered under its
-        // real name, and the phantom must not appear in write placement,
-        // health scoring, or the data-volume table. `backend_0` remains a
-        // pure key-resolution ALIAS of the default slot for legacy
-        // unprefixed / `backend_0://` block keys (see `parse_block_key`,
-        // `get_backend`, `free_block`).
-        if self.backends.is_empty() && self.is_backend_healthy("backend_0") {
-            let health = self.get_backend_health("backend_0");
-            healthy_backends.push((
-                "backend_0".to_string(),
-                self.default_allocator.clone(),
-                self.default_device.clone(),
-                health,
-            ));
-        }
-
-        for entry in self.backends.iter() {
-            let be_id = entry.key();
-            // §5.4: placement eligibility = health AND durable state
-            // `active` — a Draining volume is dropped from the candidate
-            // set (weight 0) while it keeps serving reads.
-            if self.placement_eligible(be_id) {
-                let health = self.get_backend_health(be_id);
-                healthy_backends.push((
-                    be_id.clone(),
-                    entry.value().block_allocator.clone(),
-                    entry.value().device.clone(),
-                    health,
-                ));
+        let table = self.placement_table.load();
+        if self.placement_table_current(&table) {
+            if let Some(sel) = table.pick(|id| self.is_backend_healthy(id)) {
+                return Ok(sel);
             }
         }
-
-        if healthy_backends.is_empty() {
-            return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "No healthy storage backends available for write",
-            )));
+        // Degenerate path (never taken by healthy steady state): the
+        // candidate set changed under the table, the band is empty, or
+        // every banded candidate is gated unhealthy — rebuild once so
+        // registrations/recoveries serve immediately.
+        self.refresh_placement_table();
+        if let Some(sel) = self
+            .placement_table
+            .load()
+            .pick(|id| self.is_backend_healthy(id))
+        {
+            return Ok(sel);
         }
-
-        // Sort by health descending
-        healthy_backends.sort_by(|a, b| b.3.cmp(&a.3));
-
-        let max_health = healthy_backends[0].3;
-        // Filter candidates within 90% of max health
-        let candidates: Vec<_> = healthy_backends
-            .into_iter()
-            .filter(|b| b.3 >= (max_health * 9) / 10)
-            .collect();
-
-        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let idx = COUNTER.fetch_add(1, Ordering::Relaxed) % candidates.len();
-        let selected = &candidates[idx];
-
-        Ok((selected.0.clone(), selected.1.clone(), selected.2.clone()))
+        Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "No healthy storage backends available for write",
+        )))
     }
 
     /// The VL4 mover's destination pick (design-volume-lifecycle
@@ -1244,6 +1531,11 @@ impl BackendRouter {
                         crate::health::Transition::None => {}
                     }
                 }
+
+                // §5.9: republish the placement snapshot every tick — the
+                // refresh cadence for fill drift, and the pickup point
+                // for probe-driven health transitions.
+                router.refresh_placement_table();
 
                 // 3. Trigger failover if currently active write backend is
                 // unhealthy — or no longer placement-eligible (VL4: the

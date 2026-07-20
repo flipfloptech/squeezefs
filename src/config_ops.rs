@@ -1112,45 +1112,32 @@ pub enum TakeSlots {
     List(Vec<u16>),
 }
 
-/// The KD-8 staging drain barrier: verify every staging dir carries NO
-/// live staged write custody (per-unit diagnostics on refusal — R7:
-/// loud, abortable, never a drop), then RESTAMP the surviving dirs with
-/// the new generation so the discard-on-mismatch law is a provable
-/// no-op. A dir bound to a FOREIGN generation (neither old nor new) is
-/// wiped-and-stamped — its content was already condemned and adopting
-/// it would poison the cache.
+/// The KD-8 staging drain barrier over ISOLATED staging roots (the
+/// per-mount dirs carrying a generation marker + `staging_segment/`):
+/// verify every root carries NO live staged write custody (per-unit
+/// diagnostics on refusal — R7: loud, abortable, never a drop), then
+/// RESTAMP the old-generation roots with the new generation so the
+/// discard-on-mismatch law is a provable no-op. Roots bound to a
+/// FOREIGN generation are left untouched — their content was condemned
+/// before this barrier and the next mount's discard loses nothing.
 pub async fn staging_drain_barrier(
     dirs: &[PathBuf],
     old_generation: &str,
     new_generation: &str,
 ) -> Result<()> {
-    // Phase 1: verify EVERYTHING before flipping ANYTHING.
-    let mut custody: Vec<String> = Vec::new();
-    for dir in dirs {
-        for key in crate::cache::scan_live_staged_custody(dir, 16).await? {
-            custody.push(format!("{}: {key}", dir.display()));
-        }
-    }
-    if !custody.is_empty() {
-        return Err(SqueezefsError::InvalidOperation(format!(
-            "staging drain barrier refused (KD-8): {} live staged write-custody unit(s) \
-             remain — mount the filesystem, let writeback drain (sync + clean unmount), \
-             then re-run; nothing was changed. Units: {:?}",
-            custody.len(),
-            custody
-        )));
-    }
-    // Phase 2: restamp.
+    staging_rebind_prepare(dirs, old_generation, new_generation).await?;
+    // Phase 2: restamp the roots bound to the OLD generation.
     for dir in dirs {
         match crate::cache::read_staging_generation_marker(dir).await? {
             Some(g) if g == old_generation || g == new_generation => {
                 crate::cache::write_staging_generation_marker(dir, new_generation).await?;
             }
             _ => {
-                // Foreign/missing binding: wipe + stamp fresh (the
-                // content was condemned either way).
-                stamp_staging_dir(dir).await?;
-                crate::cache::write_staging_generation_marker(dir, new_generation).await?;
+                log::info!(
+                    "staging drain barrier: {} carries a foreign/missing generation \
+                     binding — left untouched (the next mount's discard law owns it)",
+                    dir.display()
+                );
             }
         }
     }
@@ -1158,6 +1145,103 @@ pub async fn staging_drain_barrier(
         .staging_drain_barriers
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+/// KD-8 phase 1 (run BEFORE any membership stamp flips): refuse loud on
+/// PENDING write custody (`active_block:` / `active_block_ext:` records
+/// — acked writes a crash left un-uploaded; their recovery semantics
+/// must not straddle a set change: mount + sync + clean unmount drains
+/// them), then write the TWO-PHASE dual marker on every old-generation
+/// root so durable staged-layout payloads REBIND instead of being
+/// discarded — every crash prefix leaves the root adoptable by
+/// whichever set is mountable.
+pub async fn staging_rebind_prepare(
+    dirs: &[PathBuf],
+    old_generation: &str,
+    new_generation: &str,
+) -> Result<()> {
+    let mut custody: Vec<String> = Vec::new();
+    for dir in dirs {
+        for key in crate::cache::scan_live_staged_custody(dir, 64).await? {
+            // Durable staged-layout payloads (uuid file ids) rebind;
+            // pending block custody refuses.
+            if key.starts_with("active_block:") || key.starts_with("active_block_ext:") {
+                custody.push(format!("{}: {key}", dir.display()));
+            }
+        }
+    }
+    if !custody.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "staging drain barrier refused (KD-8): {} pending write-custody unit(s) \
+             remain — mount the filesystem, let writeback drain (sync + clean unmount), \
+             then re-run; nothing was changed. Units: {:?}",
+            custody.len(),
+            custody
+        )));
+    }
+    for dir in dirs {
+        match crate::cache::read_staging_generation_marker(dir).await? {
+            Some(g) if g == old_generation || g == new_generation => {
+                crate::cache::write_staging_generation_prepare_marker(
+                    dir,
+                    old_generation,
+                    new_generation,
+                )
+                .await?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// KD-8 phase 2 (run AFTER the membership flip completed): finalize
+/// every dual-marked root to the single new-generation marker.
+pub async fn staging_rebind_finalize(dirs: &[PathBuf], new_generation: &str) -> Result<()> {
+    for dir in dirs {
+        // read_staging_generation_marker reports the FIRST bound
+        // generation; the dual marker's membership check is inside the
+        // writer path — finalize unconditionally on dual/old bindings.
+        if crate::cache::read_staging_generation_marker(dir)
+            .await?
+            .is_some()
+        {
+            crate::cache::write_staging_generation_marker(dir, new_generation).await?;
+        }
+    }
+    crate::fuse_client::METRICS
+        .staging_drain_barriers
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// Expand the format-config staging paths into the ISOLATED per-mount
+/// staging roots the daemon actually populates
+/// (`<config-dir>/<fs-name>/<sanitized-mountpoint>/` — the mount wiring
+/// in `src/main.rs`; the shared `cache_segment/` sibling is read cache,
+/// not custody, and is skipped).
+fn staging_isolated_roots(cfg: Option<&crate::FormatConfig>) -> Vec<PathBuf> {
+    let Some(cfg) = cfg else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for dir in cfg.disk_cache_paths.clone().unwrap_or_default() {
+        let base = dir.join(&cfg.name);
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_dir() {
+                continue;
+            }
+            if entry.file_name() == "cache_segment" {
+                continue; // shared read cache — discardable by design
+            }
+            out.push(entry.path());
+        }
+    }
+    out
 }
 
 /// One member's observation for the membership verbs: path + stamp.
@@ -1250,25 +1334,11 @@ pub async fn add_meta_volume(
     // the bootstrap xattr) simply have no staging dirs to barrier.
     let cfg = read_volume_format_config(meta_lvs).await.ok();
 
-    // KD-8 phase 1: custody must be empty BEFORE anything flips.
-    let staging_dirs = cfg
-        .as_ref()
-        .and_then(|c| c.disk_cache_paths.clone())
-        .unwrap_or_default();
+    // KD-8 phase 1 BEFORE anything flips: refuse pending write custody,
+    // dual-mark the isolated staging roots so durable staged payloads
+    // REBIND across the membership change (never a discard window).
+    let staging_dirs = staging_isolated_roots(cfg.as_ref());
     let old_gen = crate::meta_backend::volume_set_generation(meta_lvs).await?;
-    let mut custody = Vec::new();
-    for dir in &staging_dirs {
-        for key in crate::cache::scan_live_staged_custody(dir, 16).await? {
-            custody.push(format!("{}: {key}", dir.display()));
-        }
-    }
-    if !custody.is_empty() {
-        return Err(SqueezefsError::InvalidOperation(format!(
-            "volume add-meta refused (KD-8 staging drain barrier): live staged \
-             write-custody remains — mount, sync, unmount cleanly, then re-run. \
-             Units: {custody:?}"
-        )));
-    }
 
     // Resume detection: is the device already a stamped member of THIS
     // set (a crashed prior attempt)?
@@ -1408,6 +1478,18 @@ pub async fn add_meta_volume(
         .await?;
     }
 
+    // KD-8 phase 1 (the §5.5.2b write-0 class: durable, flips nothing):
+    // the new set's generation is derivable now that the member is
+    // formatted — dual-mark the staging roots.
+    let new_gen = {
+        let mut uris: Vec<String> = meta_lvs.to_vec();
+        uris.push(device.to_string());
+        crate::meta_backend::volume_set_generation(&uris)
+            .await
+            .unwrap_or_else(|_| old_gen.clone())
+    };
+    staging_rebind_prepare(&staging_dirs, &old_gen, &new_gen).await?;
+
     // Bit 4 on every participant BEFORE any extended stamp/guest record.
     for path in meta_lvs.iter().map(String::as_str).chain([device]) {
         crate::meta_backend::kv::superblock::set_slot_migration_bit(Path::new(path)).await?;
@@ -1518,12 +1600,12 @@ pub async fn add_meta_volume(
     }
     body?;
 
-    // KD-8 phase 2 + mirror: the NEW set's generation restamps staging;
-    // the FormatConfig mirror records the new membership.
+    // KD-8 phase 2 + mirror: finalize the staging rebind to the new
+    // generation; the FormatConfig mirror records the new membership.
     let mut new_uris: Vec<String> = meta_lvs.to_vec();
     new_uris.push(device.to_string());
     let new_gen = crate::meta_backend::volume_set_generation(&new_uris).await?;
-    staging_drain_barrier(&staging_dirs, &old_gen, &new_gen).await?;
+    staging_rebind_finalize(&staging_dirs, &new_gen).await?;
     update_meta_config_mirror(&new_uris).await?;
     Ok(taken)
 }
@@ -1561,10 +1643,7 @@ pub async fn remove_meta_volume(meta_lvs: &[String], victim: &str) -> Result<()>
             ))
         })?;
     let cfg = read_volume_format_config(meta_lvs).await.ok();
-    let staging_dirs = cfg
-        .as_ref()
-        .and_then(|c| c.disk_cache_paths.clone())
-        .unwrap_or_default();
+    let staging_dirs = staging_isolated_roots(cfg.as_ref());
     let old_gen = crate::meta_backend::volume_set_generation(meta_lvs).await?;
     let survivors_paths: Vec<String> = members
         .iter()
@@ -1611,20 +1690,12 @@ pub async fn remove_meta_volume(meta_lvs: &[String], victim: &str) -> Result<()>
         }
     }
 
-    // KD-8 phase 1.
-    let mut custody = Vec::new();
-    for dir in &staging_dirs {
-        for key in crate::cache::scan_live_staged_custody(dir, 16).await? {
-            custody.push(format!("{}: {key}", dir.display()));
-        }
-    }
-    if !custody.is_empty() {
-        return Err(SqueezefsError::InvalidOperation(format!(
-            "volume remove-meta refused (KD-8 staging drain barrier): live staged \
-             write-custody remains — mount, sync, unmount cleanly, then re-run. \
-             Units: {custody:?}"
-        )));
-    }
+    // KD-8 phase 1: refuse pending write custody + dual-mark the roots
+    // (durable staged payloads rebind across the change).
+    let new_gen_planned = crate::meta_backend::volume_set_generation(&survivors_paths)
+        .await
+        .unwrap_or_else(|_| old_gen.clone());
+    staging_rebind_prepare(&staging_dirs, &old_gen, &new_gen_planned).await?;
 
     // Bit 4 everywhere (extended stamps + guest records ahead).
     for m in &members {
@@ -1727,7 +1798,7 @@ pub async fn remove_meta_volume(meta_lvs: &[String], victim: &str) -> Result<()>
 
     // KD-8 phase 2 + mirror on the survivor set.
     let new_gen = crate::meta_backend::volume_set_generation(&survivors_paths).await?;
-    staging_drain_barrier(&staging_dirs, &old_gen, &new_gen).await?;
+    staging_rebind_finalize(&staging_dirs, &new_gen).await?;
     update_meta_config_mirror(&survivors_paths).await?;
     Ok(())
 }

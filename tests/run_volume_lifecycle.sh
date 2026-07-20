@@ -757,9 +757,13 @@ done
 # gate number — recorded here, enforced by the closing-gate run).
 note "  online migrate-meta-slot cutover-window measurement"
 fresh_meta_rig "metaonline"
-( i=0; while [ $i -lt 400 ] && [ -e "$MNT/.stats" ]; do
-      echo "load" > "$MNT/dataset/churn_$((i % 50)).txt" 2>/dev/null || break
-      rm -f "$MNT/dataset/churn_$(((i + 25) % 50)).txt" 2>/dev/null || true
+# Churn across EVERY dataset dir (the striped dirs live on both
+# volumes, so the migrating slot's keyspace sees concurrent commits —
+# the tee + gate get real contention).
+( i=0; while [ $i -lt 800 ] && [ -e "$MNT/.stats" ]; do
+      d=$((i % 4))
+      echo "load" > "$MNT/dataset/d$d/churn_$((i % 20)).txt" 2>/dev/null || break
+      rm -f "$MNT/dataset/d$d/churn_$(((i + 10) % 20)).txt" 2>/dev/null || true
       i=$((i + 1))
   done ) &
 CHURN_PID=$!

@@ -47,11 +47,36 @@ fn generation_marker_content(fs_generation: &str) -> Vec<u8> {
     format!("{STAGING_GENERATION_HEADER}\n{fs_generation}\n").into_bytes()
 }
 
+/// PR VL5b (KD-8): the TWO-PHASE rebind marker — a membership change
+/// writes `old\nnew` BEFORE any stamp flips and finalizes to the single
+/// new-generation marker after, so EVERY crash prefix leaves the dir
+/// adoptable by whichever set is mountable (old set pre-flip, new set
+/// post-flip) and durable staged custody is never discarded.
+fn generation_marker_content_dual(old_gen: &str, new_gen: &str) -> Vec<u8> {
+    format!("{STAGING_GENERATION_HEADER}\n{old_gen}\n{new_gen}\n").into_bytes()
+}
+
+/// The generations a marker image binds (one line each after the
+/// header). Empty = unreadable/foreign.
+fn marker_generations(bytes: &[u8]) -> Vec<String> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    let mut lines = text.lines();
+    if lines.next() != Some(STAGING_GENERATION_HEADER) {
+        return Vec::new();
+    }
+    lines
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Write (or rewrite) `dir`'s generation marker — the KD-8 restamp
 /// primitive (PR VL5b): binds the dir to `fs_generation` WITHOUT wiping
-/// content. Callers must have proven the dir carries no staged write
-/// custody first ([`scan_live_staged_custody`]); marker I/O is io_uring
-/// + fdatasync (never adopted volatile).
+/// content. Callers must have run the KD-8 barrier first (pending
+/// `active_block:` custody refused; durable staged payloads rebind);
+/// marker I/O is io_uring + fdatasync (never adopted volatile).
 pub async fn write_staging_generation_marker(
     dir: &std::path::Path,
     fs_generation: &str,
@@ -68,8 +93,26 @@ pub async fn write_staging_generation_marker(
     Ok(())
 }
 
+/// Write the TWO-PHASE rebind marker binding BOTH generations (KD-8
+/// phase 1 — see `generation_marker_content_dual`).
+pub async fn write_staging_generation_prepare_marker(
+    dir: &std::path::Path,
+    old_generation: &str,
+    new_generation: &str,
+) -> Result<()> {
+    let marker_path = dir.join(STAGING_GENERATION_MARKER);
+    crate::uring_fs::write_all(
+        &marker_path,
+        generation_marker_content_dual(old_generation, new_generation),
+    )
+    .await?;
+    crate::uring_fs::fdatasync(marker_path).await?;
+    Ok(())
+}
+
 /// Read `dir`'s generation-marker binding: `Ok(Some(generation))` for a
-/// well-formed marker, `Ok(None)` when absent/unreadable/foreign.
+/// well-formed marker (a dual rebind marker reports its FIRST bound
+/// generation), `Ok(None)` when absent/unreadable/foreign.
 pub async fn read_staging_generation_marker(dir: &std::path::Path) -> Result<Option<String>> {
     let marker_path = dir.join(STAGING_GENERATION_MARKER);
     let Ok(bytes) = crate::uring_fs::read_all(&marker_path).await else {
@@ -190,6 +233,17 @@ async fn bind_staging_generation(dir: &std::path::Path, fs_generation: &str) -> 
     let found = crate::uring_fs::read_all(&marker_path).await.ok();
     if found.as_deref() == Some(expected.as_slice()) {
         return Ok(());
+    }
+    // PR VL5b (KD-8): a mid-rebind dual marker (`old\nnew`) binds BOTH
+    // generations — adopt when ours is listed and canonicalize to the
+    // single marker (the crash-window adoption rule; module docs on
+    // `generation_marker_content_dual`).
+    if let Some(bytes) = &found {
+        if marker_generations(bytes).iter().any(|g| g == fs_generation) {
+            crate::uring_fs::write_all(&marker_path, expected).await?;
+            crate::uring_fs::fdatasync(&marker_path).await?;
+            return Ok(());
+        }
     }
 
     let cache_dir = dir.join("cache_segment");

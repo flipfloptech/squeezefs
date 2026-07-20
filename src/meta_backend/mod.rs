@@ -340,7 +340,7 @@ impl RoutedMetaBackend {
 
     /// Construct over an explicit frozen width + slot map (the §5.5.1a
     /// stamps' reconstruction, in canonical `member_position` order).
-    /// Refuses malformed maps loud ([`validate_slot_map`]).
+    /// Refuses malformed maps loud (`validate_slot_map`).
     pub fn with_slot_map(
         volumes: Vec<std::sync::Arc<kv::backend::KvMetaBackend>>,
         routing_width: u64,

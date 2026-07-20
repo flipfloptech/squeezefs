@@ -1721,6 +1721,42 @@ pub struct Metrics {
     pub job_copy_buffer_bytes: Align64<AtomicU64>,
     /// Jobs paused by the R5 shed hook.
     pub job_paused_mem_pressure: Align64<AtomicU64>,
+    /// §5.1.6 remote-wire family (design-volume-lifecycle §10, PR VL2b).
+    /// Currently-enrolled remote workers (gauge).
+    pub job_remote_workers: Align64<AtomicU64>,
+    /// Successful worker enrollments (HMAC-verified).
+    pub job_remote_enrollments: Align64<AtomicU64>,
+    /// Refused enrollments (bad HMAC / wire_schema / undecodable hello)
+    /// — a security tripwire.
+    pub job_remote_enroll_refused: Align64<AtomicU64>,
+    /// Shards assigned to remote workers — the remote-engagement
+    /// instrument (§10: a "distributed" run's row is INVALID unless
+    /// this accounts for the remote share).
+    pub job_remote_shards: Align64<AtomicU64>,
+    /// Verified-and-published remote result submissions.
+    pub job_remote_submissions: Align64<AtomicU64>,
+    /// Result submissions refused for stale/unknown shard_fencing — the
+    /// fencing tripwire (an expired holder's late submit).
+    pub job_remote_refused_stale: Align64<AtomicU64>,
+    /// Shard leases expired past the TTL (missed heartbeats).
+    pub job_remote_lease_expiries: Align64<AtomicU64>,
+    /// Expired shards returned to the queue (reassignment — any
+    /// population may pick them up, always with fresh destinations).
+    pub job_remote_reassignments: Align64<AtomicU64>,
+    /// Destination bytes verified-and-published from remote submissions.
+    pub job_remote_bytes_moved: Align64<AtomicU64>,
+    /// Bytes the coordinator verify-read before publishing (Issue-30:
+    /// == bytes_moved on plaintext transports, sampled under TLS).
+    pub job_remote_verify_read_bytes: Align64<AtomicU64>,
+    /// Do-not-publish quarantined destination tuples (gauge) — an
+    /// expired lease's destinations, never reused within the job.
+    pub job_remote_quarantined_destinations: Align64<AtomicU64>,
+    /// NVMe PR preemptions of expired worker-host registrations under
+    /// the coordinator's WERO hold (per namespace preempted).
+    pub job_remote_pr_preempts: Align64<AtomicU64>,
+    /// Guarantee-class gauge: 1 = `pr` (coordinator holds WERO on every
+    /// data namespace), 0 = `deferred-reclaim` (exported as the string).
+    pub job_remote_fence_mode: Align64<AtomicU64>,
     pub writeback_superseded_noops: Align64<AtomicU64>,
     /// `FencingTokenExpired` failures that reached the retry ladder — a
     /// TRANSIENT generation-bump race post-FIND-M11-A (the merge
@@ -2486,6 +2522,11 @@ pub struct SqueezefsFilesystem {
     /// exists; admin verbs and the stats surface reach it here).
     pub job_fabric:
         std::sync::Arc<arc_swap::ArcSwap<Option<std::sync::Arc<crate::jobs::JobFabric>>>>,
+    /// The §5.1.6 job-wire endpoint (`ip:port`) this coordinator
+    /// listens on (PR VL2b) — set once at mount; the registration
+    /// heartbeat publishes it as the ADDITIVE `job_endpoint` field
+    /// remote workers discover the coordinator through.
+    pub job_wire_endpoint: std::sync::Arc<std::sync::OnceLock<String>>,
 }
 
 impl Clone for SqueezefsFilesystem {
@@ -2545,6 +2586,7 @@ impl Clone for SqueezefsFilesystem {
             // handler clone must see the host start_mount arms.
             ipc_host: self.ipc_host.clone(),
             job_fabric: self.job_fabric.clone(),
+            job_wire_endpoint: self.job_wire_endpoint.clone(),
         }
     }
 }
@@ -2650,6 +2692,7 @@ impl SqueezefsFilesystem {
             )),
             ipc_host: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             job_fabric: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+            job_wire_endpoint: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -3152,6 +3195,21 @@ impl SqueezefsFilesystem {
                 "job_checkpoint_writes": METRICS.job_checkpoint_writes.load(Ordering::Relaxed),
                 "job_copy_buffer_bytes": METRICS.job_copy_buffer_bytes.load(Ordering::Relaxed),
                 "job_paused_mem_pressure": METRICS.job_paused_mem_pressure.load(Ordering::Relaxed),
+                "job_remote_workers": METRICS.job_remote_workers.load(Ordering::Relaxed),
+                "job_remote_enrollments": METRICS.job_remote_enrollments.load(Ordering::Relaxed),
+                "job_remote_enroll_refused": METRICS.job_remote_enroll_refused.load(Ordering::Relaxed),
+                "job_remote_shards": METRICS.job_remote_shards.load(Ordering::Relaxed),
+                "job_remote_submissions": METRICS.job_remote_submissions.load(Ordering::Relaxed),
+                "job_remote_refused_stale": METRICS.job_remote_refused_stale.load(Ordering::Relaxed),
+                "job_remote_lease_expiries": METRICS.job_remote_lease_expiries.load(Ordering::Relaxed),
+                "job_remote_reassignments": METRICS.job_remote_reassignments.load(Ordering::Relaxed),
+                "job_remote_bytes_moved": METRICS.job_remote_bytes_moved.load(Ordering::Relaxed),
+                "job_remote_verify_read_bytes": METRICS.job_remote_verify_read_bytes.load(Ordering::Relaxed),
+                "job_remote_quarantined_destinations": METRICS.job_remote_quarantined_destinations.load(Ordering::Relaxed),
+                "job_remote_pr_preempts": METRICS.job_remote_pr_preempts.load(Ordering::Relaxed),
+                // The §5.1.6 guarantee-class gauge, exported as its class
+                // name (the writer_guard_mode precedent).
+                "job_remote_fence_mode": if METRICS.job_remote_fence_mode.load(Ordering::Relaxed) == 1 { "pr" } else { "deferred-reclaim" },
                 "writeback_superseded_noops": METRICS.writeback_superseded_noops.load(Ordering::Relaxed),
                 "writeback_stale_token_retries": METRICS.writeback_stale_token_retries.load(Ordering::Relaxed),
                 "writeback_orphan_discards": METRICS.writeback_orphan_discards.load(Ordering::Relaxed),
@@ -3796,9 +3854,19 @@ impl SqueezefsFilesystem {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_secs();
-        // Compact JSON: {"ts":<unix_secs>,"pid":<pid>}. pid aids same-host diagnosis;
-        // the timestamp is the authoritative cross-node liveness signal.
-        let val = format!("{{\"ts\":{},\"pid\":{}}}", ts, std::process::id());
+        // Compact JSON: {"ts":<unix_secs>,"pid":<pid>[,"job_endpoint":"ip:port"]}.
+        // pid aids same-host diagnosis; the timestamp is the authoritative
+        // cross-node liveness signal; job_endpoint is the ADDITIVE §5.1.6
+        // discovery field (PR VL2b) remote workers dial the coordinator by.
+        let val = match self.job_wire_endpoint.get() {
+            Some(ep) => format!(
+                "{{\"ts\":{},\"pid\":{},\"job_endpoint\":\"{}\"}}",
+                ts,
+                std::process::id(),
+                ep
+            ),
+            None => format!("{{\"ts\":{},\"pid\":{}}}", ts, std::process::id()),
+        };
         let attr_name = format!("client:{}", client_id_str);
         let _ = backend.setxattr(1, &attr_name, val.as_bytes()).await;
     }

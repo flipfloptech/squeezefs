@@ -292,6 +292,12 @@ pub struct MountRegistration {
     /// kill -9'd holder classifies reclaimable *before* its heartbeat
     /// expires, exactly like the guard's instant-reclaim decision.
     pub holder_provably_dead: bool,
+    /// The coordinator's §5.1.6 job-wire endpoint (`ip:port`) — an
+    /// ADDITIVE field on `client:{id}` records (PR VL2b): only the
+    /// wire-hosting mount writes it; remote workers discover the live
+    /// coordinator through it. `None` on writer claims, legacy records,
+    /// and non-coordinator mounts.
+    pub job_endpoint: Option<String>,
 }
 
 impl MountRegistration {
@@ -320,6 +326,7 @@ impl MountRegistration {
             "heartbeat_ts": self.heartbeat_ts,
             "age_secs": self.age_secs,
             "state": self.state(),
+            "job_endpoint": self.job_endpoint,
         })
     }
 }
@@ -2128,25 +2135,32 @@ impl KvMetaBackend {
             let heartbeat_ts = parse_registration_ts(&val);
             let age_secs = heartbeat_ts.map(|ts| now.saturating_sub(ts));
             let heartbeat_fresh = age_secs.map(|age| age <= ttl).unwrap_or(false);
-            let (id, pid, boot, holder_provably_dead) = if is_writer {
+            let (id, pid, boot, holder_provably_dead, job_endpoint) = if is_writer {
                 match WriterClaim::decode(&val) {
                     Some(c) => {
                         let same_host = !self.boot_id.is_empty() && c.boot == self.boot_id;
                         let dead = same_host && pid_provably_dead(c.pid);
-                        (c.id.clone(), Some(c.pid), Some(c.boot), dead)
+                        (c.id.clone(), Some(c.pid), Some(c.boot), dead, None)
                     }
-                    None => (String::new(), None, None, false),
+                    None => (String::new(), None, None, false, None),
                 }
             } else {
                 let id = key
                     .strip_prefix(CLIENT_REGISTRATION_PREFIX)
                     .unwrap_or(&key)
                     .to_string();
-                let pid = serde_json::from_slice::<serde_json::Value>(&val)
-                    .ok()
+                let v = serde_json::from_slice::<serde_json::Value>(&val).ok();
+                let pid = v
+                    .as_ref()
                     .and_then(|v| v.get("pid")?.as_u64())
                     .map(|p| p as u32);
-                (id, pid, None, false)
+                // Additive §5.1.6 discovery field (PR VL2b) — absent on
+                // legacy and non-coordinator records.
+                let job_endpoint = v
+                    .as_ref()
+                    .and_then(|v| v.get("job_endpoint")?.as_str())
+                    .map(str::to_string);
+                (id, pid, None, false, job_endpoint)
             };
             out.push(MountRegistration {
                 key,
@@ -2158,6 +2172,7 @@ impl KvMetaBackend {
                 age_secs,
                 heartbeat_fresh,
                 holder_provably_dead,
+                job_endpoint,
             });
         }
         out

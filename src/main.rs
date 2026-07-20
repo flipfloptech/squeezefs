@@ -800,6 +800,15 @@ enum JobActions {
         job_id: String,
         pct: u32,
     },
+    /// Enroll this client as a remote data-plane worker on the volume
+    /// set's live coordinator (design-volume-lifecycle §5.1.6): probes
+    /// the mount registrations for the coordinator's job endpoint,
+    /// proves storage membership via the job:enroll secret, serves
+    /// shards until the coordinator goes away
+    Worker {
+        /// Metadata URI (sqmeta://...) of the volume set
+        meta_uri: String,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1257,6 +1266,60 @@ fn admin_roundtrip(mountpoint: &str, verb: &str, arg: &str) -> Result<String, St
         CtlMsg::AdminReply { ok: false, body } => Err(body),
         other => Err(format!("unexpected reply {other:?}")),
     }
+}
+
+/// PR VL2b: `squeezefs job worker <sqmeta-uri>` — enroll this client as
+/// a remote data-plane worker over the §5.1.6 wire. Discovery and the
+/// enrollment secret both ride read-only probe opens (the clients/df
+/// access pattern — no D0 claim); the coordinator is dialed over
+/// TCP (the sanctioned non-uring network path).
+async fn run_job_worker(meta_uri: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let meta_lvs = parse_block_uri(meta_uri, "sqmeta://")?;
+    let mut vols = Vec::new();
+    for path in &meta_lvs {
+        vols.push(squeezefs::meta_backend::open_volume_probe(path).await?);
+    }
+    let routed = std::sync::Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vols));
+    let secret = squeezefs::job_wire::read_enroll_secret(&routed)
+        .await
+        .map_err(|e| format!("storage-membership credential unavailable: {e}"))?;
+    let endpoint = squeezefs::job_wire::discover_endpoint(&routed)
+        .await
+        .ok_or(
+            "no live coordinator publishes a job_endpoint in the mount registrations — \
+             is a (post-VL2b) writer mounted on this volume set?",
+        )?;
+    println!("job worker: coordinator endpoint {endpoint} (discovered from mount registrations)");
+    // Guarantee-class detection (§5.1.6 startup-log requirement): this
+    // verb registers no per-host PR key on the data namespaces yet, so
+    // THIS worker host's zombie fence is the deferred-reclaim class
+    // (rung 3 documented residual); coordinators still PR-preempt hosts
+    // that do report a pr_key where RESCAP supports it.
+    println!(
+        "job worker: guarantee class deferred-reclaim for this host (no per-host \
+         data-namespace PR registration in this verb; design-volume-lifecycle §5.1.6 rung 3)"
+    );
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown-host".to_string());
+    let worker_id = format!("{hostname}:{}", std::process::id());
+    let worker = squeezefs::job_wire::JobWireWorker::connect(
+        &endpoint,
+        &secret,
+        squeezefs::job_wire::WorkerOptions::new(&worker_id),
+    )
+    .await
+    .map_err(|e| format!("enrollment failed: {e}"))?;
+    println!("job worker: enrolled as {worker_id}; serving shards (stop with SIGINT)");
+    let report = worker
+        .run(std::sync::Arc::new(squeezefs::job_wire::NoopDeviceSeam))
+        .await?;
+    println!(
+        "job worker: coordinator connection closed — shards completed {}, submissions \
+         refused {}, aborted by lease re-validation {}",
+        report.shards_completed, report.submissions_refused, report.shards_aborted
+    );
+    Ok(())
 }
 
 /// Offline probe: read the durable job records straight off the meta
@@ -2721,6 +2784,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         admin_roundtrip(&target, "job-throttle", &format!("{job_id} {pct}"))?
                     );
                 }
+                JobActions::Worker { meta_uri } => {
+                    run_job_worker(&meta_uri).await?;
+                }
             }
         }
         Commands::Claim { action } => {
@@ -3183,7 +3249,37 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("job fabric start failed: {e}"))?;
             fs_engine
                 .job_fabric
-                .store(std::sync::Arc::new(Some(fabric)));
+                .store(std::sync::Arc::new(Some(fabric.clone())));
+
+            // PR VL2b: the §5.1.6 job-shard execution wire — the
+            // coordinator's TCP listener (plaintext OQ-A default-
+            // permissive posture until a cluster security config is
+            // plumbed at mount — the listener logs it loud), the WERO
+            // fence over the data namespaces, and the endpoint published
+            // through the mount-registration heartbeat for worker
+            // discovery. NoopDeviceSeam until the VL4 movers land.
+            let wire_cfg = squeezefs::job_wire::JobWireConfig {
+                bind_addr: "0.0.0.0:0".parse().expect("literal addr"),
+                data_device_paths: resolved_data_lvs
+                    .iter()
+                    .map(std::path::PathBuf::from)
+                    .collect(),
+                ..Default::default()
+            };
+            let wire = squeezefs::job_wire::JobWireHost::start(
+                fabric,
+                wire_cfg,
+                std::sync::Arc::new(squeezefs::job_wire::NoopDeviceSeam),
+            )
+            .await
+            .map_err(|e| format!("job wire start failed: {e}"))?;
+            let advertised = format!(
+                "{}:{}",
+                squeezefs::job_wire::local_advertise_ip(),
+                wire.endpoint().port()
+            );
+            let _ = fs_engine.job_wire_endpoint.set(advertised.clone());
+            log::info!("job wire: endpoint {advertised} (published via the mount registration)");
 
             let opt_idle = if resolved_fuse_io_uring_sqpoll_idle_ms > 0 {
                 Some(resolved_fuse_io_uring_sqpoll_idle_ms)

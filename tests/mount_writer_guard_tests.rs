@@ -810,11 +810,20 @@ impl ReservationClient for RegisterFailingClient {
     fn acquire_write_exclusive(&self, key: u64) -> std::io::Result<()> {
         self.inner.acquire_write_exclusive(key)
     }
+    fn acquire_write_exclusive_registrants_only(&self, key: u64) -> std::io::Result<()> {
+        self.inner.acquire_write_exclusive_registrants_only(key)
+    }
     fn preempt(&self, key: u64, victim_key: u64) -> std::io::Result<()> {
         self.inner.preempt(key, victim_key)
     }
+    fn preempt_registrants_only(&self, key: u64, victim_key: u64) -> std::io::Result<()> {
+        self.inner.preempt_registrants_only(key, victim_key)
+    }
     fn release(&self, key: u64) -> std::io::Result<()> {
         self.inner.release(key)
+    }
+    fn release_registrants_only(&self, key: u64) -> std::io::Result<()> {
+        self.inner.release_registrants_only(key)
     }
     fn report(&self) -> std::io::Result<ReservationReport> {
         self.inner.report()

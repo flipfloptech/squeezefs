@@ -106,7 +106,15 @@ fn generate_node_cert_signed_by_ca(
     Ok((certs, key))
 }
 
-fn make_server_config(security: &ClusterSecurityConfig) -> std::io::Result<quinn::ServerConfig> {
+/// The transport-agnostic rustls **server** construction over
+/// [`ClusterSecurityConfig`] — CA-pinned mTLS (client-cert verifier +
+/// CA-signed node cert) when a CA is configured, self-signed otherwise.
+/// Shared by the quinn DHT wrap below and the §5.1.6 job wire's
+/// tokio-rustls acceptor (design-volume-lifecycle KD-15: the reuse
+/// boundary is this cert/CA/verifier machinery, never the quinn wrap).
+pub(crate) fn rustls_server_config(
+    security: &ClusterSecurityConfig,
+) -> std::io::Result<rustls::ServerConfig> {
     init_rustls();
 
     let server_config = if let Some(ref ca_cert_der) = security.ca_cert {
@@ -139,6 +147,11 @@ fn make_server_config(security: &ClusterSecurityConfig) -> std::io::Result<quinn
             .with_single_cert(certs, key)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
     };
+    Ok(server_config)
+}
+
+fn make_server_config(security: &ClusterSecurityConfig) -> std::io::Result<quinn::ServerConfig> {
+    let server_config = rustls_server_config(security)?;
 
     let quinn_server_config = quinn::crypto::rustls::QuicServerConfig::try_from(server_config)
         .map_err(std::io::Error::other)?;
@@ -158,7 +171,14 @@ fn make_server_config(security: &ClusterSecurityConfig) -> std::io::Result<quinn
     Ok(server_config)
 }
 
-fn make_client_config(security: &ClusterSecurityConfig) -> std::io::Result<quinn::ClientConfig> {
+/// The transport-agnostic rustls **client** construction over
+/// [`ClusterSecurityConfig`] — CA-rooted validation + client-auth cert
+/// when a CA is configured, verification-less otherwise (matching the
+/// DHT's self-signed posture). Shared by the quinn wrap and the §5.1.6
+/// job wire's tokio-rustls connector.
+pub(crate) fn rustls_client_config(
+    security: &ClusterSecurityConfig,
+) -> std::io::Result<rustls::ClientConfig> {
     init_rustls();
 
     let client_config = if let Some(ref ca_cert_der) = security.ca_cert {
@@ -181,6 +201,11 @@ fn make_client_config(security: &ClusterSecurityConfig) -> std::io::Result<quinn
             .with_no_client_auth();
         client_config
     };
+    Ok(client_config)
+}
+
+fn make_client_config(security: &ClusterSecurityConfig) -> std::io::Result<quinn::ClientConfig> {
+    let client_config = rustls_client_config(security)?;
 
     let quinn_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_config)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;

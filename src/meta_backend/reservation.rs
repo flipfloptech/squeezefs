@@ -143,14 +143,35 @@ pub trait ReservationClient: Send + Sync + std::fmt::Debug {
     /// [`reservation_conflict_error`] class.
     fn acquire_write_exclusive(&self, key: u64) -> io::Result<()>;
 
+    /// Reservation Acquire, **Write Exclusive – Registrants Only**
+    /// (WERO, rtype 2 — design-volume-lifecycle §5.1.6 / KD-15): every
+    /// *registered* host keeps writing; only unregistered hosts are
+    /// write-blocked. The job-wire coordinator's fence on shared **data**
+    /// namespaces while remote workers are enrolled — disjoint from D0's
+    /// rtype-1 Write Exclusive on meta volumes (different namespaces,
+    /// different rtypes, no interaction).
+    fn acquire_write_exclusive_registrants_only(&self, key: u64) -> io::Result<()>;
+
     /// Reservation Acquire with the PREEMPT action: unregister
     /// `victim_key` and take the Write Exclusive reservation for `key`.
     /// Only safe against a TTL-stale holder — the device fences the
     /// victim (design §5.0 B1 pt 3).
     fn preempt(&self, key: u64, victim_key: u64) -> io::Result<()>;
 
+    /// PREEMPT under a standing WERO reservation (rtype 2): remove the
+    /// expired worker host's registration — its resumed DMA is
+    /// device-rejected — while the reservation (and every other
+    /// registrant's write access) stands (design-volume-lifecycle
+    /// §5.1.6 rung 2).
+    fn preempt_registrants_only(&self, key: u64, victim_key: u64) -> io::Result<()>;
+
     /// Reservation Release (clean unmount).
     fn release(&self, key: u64) -> io::Result<()>;
+
+    /// Release a WERO (rtype 2) reservation — the job-wire coordinator's
+    /// last-remote-departure teardown; like [`Self::release`] it leaves
+    /// zero residue (the registration is dropped with it).
+    fn release_registrants_only(&self, key: u64) -> io::Result<()>;
 
     /// Reservation Report: current holder + registrants (the heartbeat
     /// PTPL-lapse re-check, §5.0 B1 pt 6).
@@ -380,6 +401,9 @@ const NVME_CMD_RESV_RELEASE: u8 = 0x15;
 /// Reservation type: Write Exclusive (reads from all hosts, writes from
 /// the holder only — probes keep working, §5.0 B1 pt 2).
 const RTYPE_WRITE_EXCLUSIVE: u32 = 1;
+/// Reservation type: Write Exclusive – Registrants Only (registrants
+/// write, unregistered hosts blocked — the §5.1.6 job-wire fence).
+const RTYPE_WRITE_EXCLUSIVE_REGISTRANTS_ONLY: u32 = 2;
 /// NVMe generic status: Reservation Conflict.
 const NVME_SC_RESERVATION_CONFLICT: i32 = 0x83;
 
@@ -530,8 +554,10 @@ impl NvmeReservationClient {
         })
     }
 
-    /// Reservation Acquire / Preempt: 16 B payload `[crkey, prkey]`.
-    fn resv_acquire(&self, racqa: u32, crkey: u64, prkey: u64) -> io::Result<()> {
+    /// Reservation Acquire / Preempt: 16 B payload `[crkey, prkey]`,
+    /// reservation type in CDW10 bits 15:8 (rtype 1 = D0's Write
+    /// Exclusive, rtype 2 = the §5.1.6 WERO fence).
+    fn resv_acquire(&self, racqa: u32, rtype: u32, crkey: u64, prkey: u64) -> io::Result<()> {
         let mut data = [0u8; 16];
         data[..8].copy_from_slice(&crkey.to_le_bytes());
         data[8..].copy_from_slice(&prkey.to_le_bytes());
@@ -540,10 +566,32 @@ impl NvmeReservationClient {
             nsid: self.nsid,
             addr: data.as_mut_ptr() as u64,
             data_len: data.len() as u32,
-            cdw10: (RTYPE_WRITE_EXCLUSIVE << 8) | racqa,
+            cdw10: (rtype << 8) | racqa,
             ..Default::default()
         };
         self.passthru(NVME_IOCTL_IO_CMD, &mut cmd)
+    }
+
+    /// Reservation Release for `rtype` (the release must name the held
+    /// reservation type), followed by unregister for zero residue.
+    fn resv_release(&self, rtype: u32, key: u64) -> io::Result<()> {
+        let mut data = [0u8; 8];
+        data.copy_from_slice(&key.to_le_bytes());
+        let mut cmd = NvmePassthruCmd {
+            opcode: NVME_CMD_RESV_RELEASE,
+            nsid: self.nsid,
+            addr: data.as_mut_ptr() as u64,
+            data_len: data.len() as u32,
+            cdw10: rtype << 8, // RRELA 0: release
+            ..Default::default()
+        };
+        self.passthru(NVME_IOCTL_IO_CMD, &mut cmd)?;
+        // NVMe release does NOT unregister; drop the registration too so
+        // a clean teardown leaves zero residue on the namespace (a stale
+        // registration would make this host's next fresh-key register
+        // conflict — observed against kernel nvmet in the M1 session,
+        // and refused outright by spec-strict targets like SPDK).
+        self.unregister(key)
     }
 }
 
@@ -643,31 +691,27 @@ impl ReservationClient for NvmeReservationClient {
     }
 
     fn acquire_write_exclusive(&self, key: u64) -> io::Result<()> {
-        self.resv_acquire(0, key, 0)
+        self.resv_acquire(0, RTYPE_WRITE_EXCLUSIVE, key, 0)
+    }
+
+    fn acquire_write_exclusive_registrants_only(&self, key: u64) -> io::Result<()> {
+        self.resv_acquire(0, RTYPE_WRITE_EXCLUSIVE_REGISTRANTS_ONLY, key, 0)
     }
 
     fn preempt(&self, key: u64, victim_key: u64) -> io::Result<()> {
-        self.resv_acquire(1, key, victim_key)
+        self.resv_acquire(1, RTYPE_WRITE_EXCLUSIVE, key, victim_key)
+    }
+
+    fn preempt_registrants_only(&self, key: u64, victim_key: u64) -> io::Result<()> {
+        self.resv_acquire(1, RTYPE_WRITE_EXCLUSIVE_REGISTRANTS_ONLY, key, victim_key)
     }
 
     fn release(&self, key: u64) -> io::Result<()> {
-        let mut data = [0u8; 8];
-        data.copy_from_slice(&key.to_le_bytes());
-        let mut cmd = NvmePassthruCmd {
-            opcode: NVME_CMD_RESV_RELEASE,
-            nsid: self.nsid,
-            addr: data.as_mut_ptr() as u64,
-            data_len: data.len() as u32,
-            cdw10: RTYPE_WRITE_EXCLUSIVE << 8, // RRELA 0: release
-            ..Default::default()
-        };
-        self.passthru(NVME_IOCTL_IO_CMD, &mut cmd)?;
-        // NVMe release does NOT unregister; drop the registration too so
-        // a clean unmount leaves zero residue on the namespace (a stale
-        // registration would make this host's next fresh-key register
-        // conflict — observed against kernel nvmet in the M1 session,
-        // and refused outright by spec-strict targets like SPDK).
-        self.unregister(key)
+        self.resv_release(RTYPE_WRITE_EXCLUSIVE, key)
+    }
+
+    fn release_registrants_only(&self, key: u64) -> io::Result<()> {
+        self.resv_release(RTYPE_WRITE_EXCLUSIVE_REGISTRANTS_ONLY, key)
     }
 
     fn report(&self) -> io::Result<ReservationReport> {
@@ -730,6 +774,9 @@ struct FakeRegistrant {
 #[derive(Debug, Default)]
 struct FakeNsState {
     holder: Option<u64>,
+    /// The held reservation's type — meaningful only while `holder` is
+    /// `Some` (rtype 1 = Write Exclusive, rtype 2 = WERO).
+    rtype: u32,
     registered: Vec<FakeRegistrant>,
 }
 
@@ -787,6 +834,7 @@ impl FakeNvmeNamespace {
             });
         }
         st.holder = Some(key);
+        st.rtype = RTYPE_WRITE_EXCLUSIVE;
     }
 
     /// Test priming: a target power cycle on a PTPL-less target —
@@ -795,7 +843,33 @@ impl FakeNvmeNamespace {
     pub fn power_cycle(&self) {
         let mut st = self.state.lock().unwrap();
         st.holder = None;
+        st.rtype = 0;
         st.registered.clear();
+    }
+
+    /// Whether the device would admit a WRITE from the host registered
+    /// under `wire_host_id` — the reservation-gating law the real target
+    /// enforces per command (the §5.1.6 fence-observation hook): no
+    /// reservation ⇒ open; Write Exclusive (rtype 1) ⇒ only the holder's
+    /// host; Write Exclusive – Registrants Only (rtype 2) ⇒ any
+    /// registered host, unregistered hosts rejected.
+    pub fn write_allowed(&self, wire_host_id: &[u8]) -> bool {
+        let st = self.state.lock().unwrap();
+        let Some(holder) = st.holder else {
+            return true;
+        };
+        match st.rtype {
+            RTYPE_WRITE_EXCLUSIVE => st
+                .registered
+                .iter()
+                .any(|r| r.key == holder && r.host_id == wire_host_id),
+            RTYPE_WRITE_EXCLUSIVE_REGISTRANTS_ONLY => {
+                st.registered.iter().any(|r| r.host_id == wire_host_id)
+            }
+            // Unmodeled rtypes fail closed: the fake never grants what
+            // it cannot attribute.
+            _ => false,
+        }
     }
 
     /// Current Write Exclusive holder key.
@@ -872,6 +946,74 @@ impl FakeReservationClient {
             Err(_) => id.into_bytes(),
         }
     }
+
+    /// Shared Acquire model for both reservation types: the acquiring
+    /// host must be registered under `key`; a free namespace takes the
+    /// reservation with `rtype`; re-acquiring the held key with the same
+    /// rtype is idempotent; everything else conflicts (including an
+    /// rtype change on a standing reservation — the real device refuses
+    /// that shape too).
+    fn fake_acquire(&self, key: u64, rtype: u32) -> io::Result<()> {
+        let me = self.my_wire_id();
+        let mut st = self.ns.state.lock().unwrap();
+        if !st
+            .registered
+            .iter()
+            .any(|r| r.host_id == me && r.key == key)
+        {
+            // An unregistered host's acquire is a reservation conflict.
+            return Err(reservation_conflict_error());
+        }
+        match st.holder {
+            None => {
+                st.holder = Some(key);
+                st.rtype = rtype;
+                Ok(())
+            }
+            Some(h) if h == key && st.rtype == rtype => Ok(()),
+            Some(_) => Err(reservation_conflict_error()),
+        }
+    }
+
+    /// Shared PREEMPT model: the device-sanctioned foreign-registration
+    /// removal — every registrant under the victim key goes; the
+    /// preemptor takes/keeps the reservation under `rtype`.
+    fn fake_preempt(&self, key: u64, victim_key: u64, rtype: u32) -> io::Result<()> {
+        let me = self.my_wire_id();
+        let mut st = self.ns.state.lock().unwrap();
+        if !st
+            .registered
+            .iter()
+            .any(|r| r.host_id == me && r.key == key)
+        {
+            return Err(reservation_conflict_error());
+        }
+        st.registered.retain(|r| r.key != victim_key);
+        st.holder = Some(key);
+        st.rtype = rtype;
+        self.ns.preempts.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Shared Release model: releasing the held key under the named
+    /// rtype drops the reservation; this host's registration under `key`
+    /// goes with it (zero residue, matching the real client's
+    /// release-then-unregister). Releasing the held key under the WRONG
+    /// rtype fails loud (the real device refuses a mismatched-type
+    /// release) — nothing changes.
+    fn fake_release(&self, key: u64, rtype: u32) -> io::Result<()> {
+        let me = self.my_wire_id();
+        let mut st = self.ns.state.lock().unwrap();
+        if st.holder == Some(key) {
+            if st.rtype != rtype {
+                return Err(reservation_conflict_error());
+            }
+            st.holder = None;
+            st.rtype = 0;
+        }
+        st.registered.retain(|r| !(r.host_id == me && r.key == key));
+        Ok(())
+    }
 }
 
 impl ReservationClient for FakeReservationClient {
@@ -933,58 +1075,34 @@ impl ReservationClient for FakeReservationClient {
             // Unregistering the holder's key releases the reservation
             // (Write Exclusive is holder-keyed).
             st.holder = None;
+            st.rtype = 0;
         }
         self.ns.unregisters.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     fn acquire_write_exclusive(&self, key: u64) -> io::Result<()> {
-        let me = self.my_wire_id();
-        let mut st = self.ns.state.lock().unwrap();
-        if !st
-            .registered
-            .iter()
-            .any(|r| r.host_id == me && r.key == key)
-        {
-            // An unregistered host's acquire is a reservation conflict.
-            return Err(reservation_conflict_error());
-        }
-        match st.holder {
-            None => {
-                st.holder = Some(key);
-                Ok(())
-            }
-            Some(h) if h == key => Ok(()),
-            Some(_) => Err(reservation_conflict_error()),
-        }
+        self.fake_acquire(key, RTYPE_WRITE_EXCLUSIVE)
+    }
+
+    fn acquire_write_exclusive_registrants_only(&self, key: u64) -> io::Result<()> {
+        self.fake_acquire(key, RTYPE_WRITE_EXCLUSIVE_REGISTRANTS_ONLY)
     }
 
     fn preempt(&self, key: u64, victim_key: u64) -> io::Result<()> {
-        let me = self.my_wire_id();
-        let mut st = self.ns.state.lock().unwrap();
-        if !st
-            .registered
-            .iter()
-            .any(|r| r.host_id == me && r.key == key)
-        {
-            return Err(reservation_conflict_error());
-        }
-        // PREEMPT is the one device-sanctioned foreign-registration
-        // removal: every registrant under the victim key goes.
-        st.registered.retain(|r| r.key != victim_key);
-        st.holder = Some(key);
-        self.ns.preempts.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        self.fake_preempt(key, victim_key, RTYPE_WRITE_EXCLUSIVE)
+    }
+
+    fn preempt_registrants_only(&self, key: u64, victim_key: u64) -> io::Result<()> {
+        self.fake_preempt(key, victim_key, RTYPE_WRITE_EXCLUSIVE_REGISTRANTS_ONLY)
     }
 
     fn release(&self, key: u64) -> io::Result<()> {
-        let me = self.my_wire_id();
-        let mut st = self.ns.state.lock().unwrap();
-        if st.holder == Some(key) {
-            st.holder = None;
-        }
-        st.registered.retain(|r| !(r.host_id == me && r.key == key));
-        Ok(())
+        self.fake_release(key, RTYPE_WRITE_EXCLUSIVE)
+    }
+
+    fn release_registrants_only(&self, key: u64) -> io::Result<()> {
+        self.fake_release(key, RTYPE_WRITE_EXCLUSIVE_REGISTRANTS_ONLY)
     }
 
     fn report(&self) -> io::Result<ReservationReport> {

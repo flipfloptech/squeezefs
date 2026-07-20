@@ -65,6 +65,11 @@ rsa = { version = "0.9", features = ["pem"] }
 ring = "0.17"
 rand = "0.8"
 sha2 = "0.10"
+hmac = "0.12"
+# The §5.1.6 job-shard execution wire's TLS (design-volume-lifecycle
+# KD-15): framed TCP/TLS, reusing ClusterSecurityConfig's cert/CA/
+# verifier machinery — NOT the quinn wrap.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 ahash = "0.8"
 twox-hash = "1.6"
 bytes = { version = "1.5", features = ["serde"] }

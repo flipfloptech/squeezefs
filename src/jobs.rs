@@ -115,16 +115,18 @@ pub struct JobStatus {
 }
 
 /// Live per-job control block: the workers' and control verbs' shared
-/// truth between checkpoints.
-struct JobCtl {
-    job_type: JobType,
+/// truth between checkpoints. `pub(crate)` since PR VL2b: the §5.1.6
+/// wire's coordinator is the second population driving the same claims
+/// and completions (KD-1: one protocol, two transports).
+pub(crate) struct JobCtl {
+    pub(crate) job_type: JobType,
     paused: AtomicBool,
     cancelled: AtomicBool,
     /// Live-retunable duty cycle (workers re-read per task).
-    throttle: AtomicU32,
+    pub(crate) throttle: AtomicU32,
     /// Tasks completed (live; checkpointed on cadence).
-    done: AtomicU64,
-    tasks_total: u64,
+    pub(crate) done: AtomicU64,
+    pub(crate) tasks_total: u64,
     /// One worker owns a job at a time in VL2 (shard-level parallelism
     /// arrives with the real movers' multi-shard plans).
     claimed: AtomicBool,
@@ -133,7 +135,7 @@ struct JobCtl {
 }
 
 impl JobCtl {
-    fn state(&self) -> JobState {
+    pub(crate) fn state(&self) -> JobState {
         *self.state.lock()
     }
     fn set_state(&self, s: JobState) {
@@ -213,7 +215,10 @@ impl JobFabric {
             fabric.jobs.lock().insert(rec.job_id.clone(), ctl);
         }
 
-        for idx in 0..workers.max(1) {
+        // `workers == 0` is the remote-only posture (no local pool —
+        // every shard rides the §5.1.6 wire; test/soak shape). Mounts
+        // always pass the clamped L4-style pool size.
+        for idx in 0..workers {
             let f = Arc::clone(&fabric);
             let h = tokio::spawn(async move { f.worker_loop(idx).await });
             fabric.handles.lock().push(h);
@@ -494,8 +499,10 @@ impl JobFabric {
         self.persist(&rec).await
     }
 
-    /// Claim the next runnable job (Queued, unclaimed).
-    fn claim_next(&self) -> Option<(String, Arc<JobCtl>)> {
+    /// Claim the next runnable job (Queued, unclaimed). `pub(crate)`:
+    /// the §5.1.6 wire dispatcher claims through the same gate as the
+    /// local pool — one claim law for both populations (KD-1).
+    pub(crate) fn claim_next(&self) -> Option<(String, Arc<JobCtl>)> {
         let jobs = self.jobs.lock();
         for (id, ctl) in jobs.iter() {
             if ctl.state() == JobState::Queued
@@ -509,6 +516,57 @@ impl JobFabric {
             }
         }
         None
+    }
+
+    /// Mark a remotely-executed job Running (durable-then-visible, the
+    /// same order the local pool uses) — called by the wire dispatcher
+    /// right after a shard is assigned.
+    pub(crate) async fn remote_running(&self, job_id: &str, ctl: &Arc<JobCtl>) {
+        ctl.set_state(JobState::Running);
+        let _ = self.checkpoint(job_id, ctl).await;
+    }
+
+    /// A verified remote submission completes the job: tasks are
+    /// accounted, the durable record flips terminal BEFORE the live
+    /// state (the run_job durable-then-visible law), and the terminal
+    /// notify fires. A job that went terminal meanwhile (cancel) is
+    /// left alone — the submission's effects were already refused or
+    /// are contractually moot for Noop shards.
+    pub(crate) async fn remote_complete(&self, job_id: &str, ctl: &Arc<JobCtl>) {
+        if ctl.state().is_terminal() {
+            return;
+        }
+        let executed = ctl
+            .tasks_total
+            .saturating_sub(ctl.done.load(Ordering::Relaxed));
+        ctl.done.store(ctl.tasks_total, Ordering::Relaxed);
+        crate::fuse_client::METRICS
+            .job_tasks_done
+            .fetch_add(executed, Ordering::Relaxed);
+        let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
+        crate::fuse_client::METRICS
+            .job_completed
+            .fetch_add(1, Ordering::Relaxed);
+        ctl.set_state(JobState::Completed);
+    }
+
+    /// Return an expired remote shard's job to the queue (lease-expiry
+    /// reassignment, §5.1.6): any population — local pool or another
+    /// remote worker — may claim it again; the wire's bumped
+    /// shard_fencing is what keeps the old holder's late submission out.
+    pub(crate) async fn requeue_remote(&self, job_id: &str, ctl: &Arc<JobCtl>) {
+        if !ctl.state().is_terminal() {
+            ctl.set_state(JobState::Queued);
+            let _ = self.checkpoint(job_id, ctl).await;
+        }
+        ctl.claimed.store(false, Ordering::SeqCst);
+        self.work.notify_waiters();
+    }
+
+    /// One pending-work wake for the wire dispatcher (the same notify
+    /// the local pool parks on).
+    pub(crate) fn work_notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.work.notified()
     }
 
     async fn worker_loop(self: Arc<Self>, idx: usize) {

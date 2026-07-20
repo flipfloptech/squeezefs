@@ -80,10 +80,7 @@ async fn open_v3_meta(
 async fn meta_fixture() -> (Arc<RoutedMetaBackend>, NamedTempFile) {
     let meta_file = NamedTempFile::new().unwrap();
     let kv = open_v3_meta(meta_file.path(), 256 * 1024 * 1024).await;
-    (
-        Arc::new(RoutedMetaBackend::new(vec![kv])),
-        meta_file,
-    )
+    (Arc::new(RoutedMetaBackend::new(vec![kv])), meta_file)
 }
 
 /// A fabric with `workers` local pool tasks (0 = no local pool — the
@@ -154,8 +151,14 @@ fn wero_registrants_only_fake_semantics() {
     // write-blocked while the reservation stands — the documented
     // operational side effect (design §5.1.6 consequence (a)).
     assert!(ns.write_allowed(b"host-coord"), "holder writes");
-    assert!(ns.write_allowed(b"host-a"), "registrant A writes under WERO");
-    assert!(ns.write_allowed(b"host-b"), "registrant B writes under WERO");
+    assert!(
+        ns.write_allowed(b"host-a"),
+        "registrant A writes under WERO"
+    );
+    assert!(
+        ns.write_allowed(b"host-b"),
+        "registrant B writes under WERO"
+    );
     assert!(
         !ns.write_allowed(b"host-stranger"),
         "unregistered host is write-blocked under WERO"
@@ -347,7 +350,11 @@ async fn tls_transport_round_trip_keeps_sampling() {
         .await
         .expect("host start");
     assert_eq!(host.transport_mode(), "tls");
-    assert_eq!(host.verify_permille(), 250, "TLS keeps the configured sample");
+    assert_eq!(
+        host.verify_permille(),
+        250,
+        "TLS keeps the configured sample"
+    );
 
     let secret = read_enroll_secret(&meta).await.expect("secret");
     let mut opts = WorkerOptions::new("w-tls");
@@ -427,7 +434,10 @@ async fn remote_worker_executes_noop_shard_end_to_end() {
     let rec: serde_json::Value = serde_json::from_slice(&raw).expect("shard record is JSON");
     assert_eq!(rec["schema"], 1);
     assert_eq!(rec["state"], "completed", "shard record terminal: {rec}");
-    assert_eq!(rec["shard_fencing"], 0, "no expiry ⇒ no fencing bump: {rec}");
+    assert_eq!(
+        rec["shard_fencing"], 0,
+        "no expiry ⇒ no fencing bump: {rec}"
+    );
 
     host.shutdown().await;
     let report = run.await.expect("worker task").expect("worker run");
@@ -487,9 +497,11 @@ async fn lease_expiry_reassigns_to_local_pool_and_refuses_late_submit() {
 
     // Tiny shard: executed well within the TTL, then parked pre-submit.
     let job_id = fab.submit(noop_spec(4, 1)).await.expect("submit");
-    poll_until("shard assigned to the remote", Duration::from_secs(10), || {
-        METRICS.job_remote_shards.load(Ordering::Relaxed) == shards0 + 1
-    })
+    poll_until(
+        "shard assigned to the remote",
+        Duration::from_secs(10),
+        || METRICS.job_remote_shards.load(Ordering::Relaxed) == shards0 + 1,
+    )
     .await;
 
     // TTL 1 s, no heartbeats ⇒ the lease expires: fencing bumps and the
@@ -722,11 +734,16 @@ async fn wero_fence_acquires_preempts_and_releases_over_the_wire() {
         METRICS.job_remote_lease_expiries.load(Ordering::Relaxed) == expiries0 + 1
     })
     .await;
-    poll_until("PR preempt of the expired host", Duration::from_secs(10), || {
-        METRICS.job_remote_pr_preempts.load(Ordering::Relaxed) == preempts0 + 1
-    })
+    poll_until(
+        "PR preempt of the expired host",
+        Duration::from_secs(10),
+        || METRICS.job_remote_pr_preempts.load(Ordering::Relaxed) == preempts0 + 1,
+    )
     .await;
-    assert!(!ns.is_registered(0xA0), "expired host's registration preempted");
+    assert!(
+        !ns.is_registered(0xA0),
+        "expired host's registration preempted"
+    );
     assert!(
         !ns.write_allowed(b"host-w1"),
         "the preempted host's DMA is device-rejected"
@@ -740,9 +757,11 @@ async fn wero_fence_acquires_preempts_and_releases_over_the_wire() {
     // zero residue.
     run.abort();
     let _ = run.await;
-    poll_until("WERO released at last departure", Duration::from_secs(10), || {
-        ns.holder().is_none()
-    })
+    poll_until(
+        "WERO released at last departure",
+        Duration::from_secs(10),
+        || ns.holder().is_none(),
+    )
     .await;
 
     host.shutdown().await;

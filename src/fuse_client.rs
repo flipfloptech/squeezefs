@@ -1706,6 +1706,16 @@ pub struct Metrics {
     /// longer matches the unit's token: a newer write re-staged the block
     /// and owns its custody chain). The healthy churn outcome — the
     /// FIND-M11-A contract that stale units resolve instead of livelock.
+    /// §5.1.2 reserved-xattr screen refusals (get/set/remove on a
+    /// reserved internal name through FUSE) — tamper-attempt tripwire.
+    pub fuse_reserved_xattr_refusals: Align64<AtomicU64>,
+    /// Job-fabric counters (design-volume-lifecycle §10, PR VL2).
+    pub job_submitted: Align64<AtomicU64>,
+    pub job_completed: Align64<AtomicU64>,
+    pub job_cancelled: Align64<AtomicU64>,
+    pub job_failed: Align64<AtomicU64>,
+    pub job_tasks_done: Align64<AtomicU64>,
+    pub job_checkpoint_writes: Align64<AtomicU64>,
     pub writeback_superseded_noops: Align64<AtomicU64>,
     /// `FencingTokenExpired` failures that reached the retry ladder — a
     /// TRANSIENT generation-bump race post-FIND-M11-A (the merge
@@ -2467,6 +2477,10 @@ pub struct SqueezefsFilesystem {
     /// bootstrap synthesis reads it per request.
     pub ipc_host:
         std::sync::Arc<arc_swap::ArcSwap<Option<std::sync::Arc<crate::ipc_host::IpcHost>>>>,
+    /// The VL2 job fabric (populated at mount after the meta backend
+    /// exists; admin verbs and the stats surface reach it here).
+    pub job_fabric:
+        std::sync::Arc<arc_swap::ArcSwap<Option<std::sync::Arc<crate::jobs::JobFabric>>>>,
 }
 
 impl Clone for SqueezefsFilesystem {
@@ -2525,6 +2539,7 @@ impl Clone for SqueezefsFilesystem {
             // Share the one cell (session_connection precedent): the
             // handler clone must see the host start_mount arms.
             ipc_host: self.ipc_host.clone(),
+            job_fabric: self.job_fabric.clone(),
         }
     }
 }
@@ -2629,6 +2644,7 @@ impl SqueezefsFilesystem {
                 0x2000_0000_0000_0000,
             )),
             ipc_host: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+            job_fabric: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
         }
     }
 
@@ -3122,6 +3138,13 @@ impl SqueezefsFilesystem {
                 "lease_acquire_ok": METRICS.lease_acquire_ok.load(Ordering::Relaxed),
                 "lease_acquire_fail": METRICS.lease_acquire_fail.load(Ordering::Relaxed),
                 "writeback_retry_exhaustions": METRICS.writeback_retry_exhaustions.load(Ordering::Relaxed),
+                "fuse_reserved_xattr_refusals": METRICS.fuse_reserved_xattr_refusals.load(Ordering::Relaxed),
+                "job_submitted": METRICS.job_submitted.load(Ordering::Relaxed),
+                "job_completed": METRICS.job_completed.load(Ordering::Relaxed),
+                "job_cancelled": METRICS.job_cancelled.load(Ordering::Relaxed),
+                "job_failed": METRICS.job_failed.load(Ordering::Relaxed),
+                "job_tasks_done": METRICS.job_tasks_done.load(Ordering::Relaxed),
+                "job_checkpoint_writes": METRICS.job_checkpoint_writes.load(Ordering::Relaxed),
                 "writeback_superseded_noops": METRICS.writeback_superseded_noops.load(Ordering::Relaxed),
                 "writeback_stale_token_retries": METRICS.writeback_stale_token_retries.load(Ordering::Relaxed),
                 "writeback_orphan_discards": METRICS.writeback_orphan_discards.load(Ordering::Relaxed),
@@ -9936,9 +9959,18 @@ impl Filesystem for SqueezefsFilesystem {
             Some(s) => s,
             None => return Err(Errno::from(libc::EINVAL)),
         };
-        // The L4 bootstrap name is reserved UNCONDITIONALLY (design-
-        // preload-interception §5.2): never writable, armed or not.
-        if name_str == squeezefs_ipc::wire::BOOTSTRAP_XATTR {
+        // Reserved-namespace screen (design-volume-lifecycle §5.1.2,
+        // generalizing the L4 BOOTSTRAP_XATTR rule): internal records —
+        // job fabric bookkeeping, the format config, anything under
+        // `user.squeezefs.` — never cross the FUSE boundary. Without
+        // this, any user could FORGE or DELETE the durable lease/
+        // fencing bookkeeping of an in-flight drain from an
+        // unprivileged shell (the format config was already exposed
+        // pre-VL2 — a real hole, pinned closed by tests).
+        if reserved_xattr_name(name_str) {
+            METRICS
+                .fuse_reserved_xattr_refusals
+                .fetch_add(1, Ordering::Relaxed);
             return Err(Errno::from(libc::EPERM));
         }
         let backend = self
@@ -9984,6 +10016,16 @@ impl Filesystem for SqueezefsFilesystem {
             }
             return Ok(fuse3::raw::reply::ReplyXAttr::Data(blob.into()));
         }
+        // Reserved-namespace screen (§5.1.2): internal record bytes
+        // never serve through FUSE (daemon/probe paths read the meta
+        // backend directly). The bootstrap name above is the one
+        // deliberate exception — synthesized, never on-disk bytes.
+        if reserved_xattr_name(name_str) {
+            METRICS
+                .fuse_reserved_xattr_refusals
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(Errno::from(libc::EPERM));
+        }
 
         let backend = self
             .meta_backend
@@ -10023,10 +10065,10 @@ impl Filesystem for SqueezefsFilesystem {
         let keys = backend.listxattr(inode).await.map_err(map_squeezefs_err)?;
         let mut data = Vec::new();
         for key in keys {
-            // The L4 bootstrap name is reserved: filtered from listxattr
-            // unconditionally (a historical/foreign on-disk key under it
-            // is never advertised — design-preload-interception §5.2).
-            if key == squeezefs_ipc::wire::BOOTSTRAP_XATTR {
+            // Reserved names are filtered unconditionally (§5.1.2 screen,
+            // subsuming the L4 bootstrap rule): internal records are
+            // invisible through FUSE.
+            if reserved_xattr_name(&key) {
                 continue;
             }
             data.extend_from_slice(key.as_bytes());
@@ -10047,6 +10089,15 @@ impl Filesystem for SqueezefsFilesystem {
             Some(s) => s,
             None => return Err(Errno::from(libc::EINVAL)),
         };
+        // Reserved-namespace screen (§5.1.2). Pre-VL2 this handler had
+        // NO screen at all — `removexattr("user.squeezefs.format_config")`
+        // deleted the durable format config from any unprivileged shell.
+        if reserved_xattr_name(name_str) {
+            METRICS
+                .fuse_reserved_xattr_refusals
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(Errno::from(libc::EPERM));
+        }
         let backend = self
             .meta_backend
             .as_ref()
@@ -10057,6 +10108,16 @@ impl Filesystem for SqueezefsFilesystem {
             .map_err(map_squeezefs_err)?;
         Ok(())
     }
+}
+
+/// §5.1.2 reserved-namespace predicate (design-volume-lifecycle): names
+/// that carry SqueezeFS-internal durable records — the job fabric's
+/// `job:` family, everything under `user.squeezefs.` (format config,
+/// the L4 bootstrap name, future internal records) — never cross the
+/// FUSE boundary in either direction. The daemon, offline probes, and
+/// admin verbs read them through the meta backend directly.
+fn reserved_xattr_name(name: &str) -> bool {
+    name.starts_with(crate::jobs::JOB_XATTR_PREFIX) || name.starts_with("user.squeezefs.")
 }
 
 /// Initialize the multi-threaded work-stealing tokio runtime

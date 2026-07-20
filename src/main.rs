@@ -2997,10 +2997,28 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            fs_engine.meta_backend = Some(routed_meta_backend);
+            fs_engine.meta_backend = Some(routed_meta_backend.clone());
             fs_engine.dismount_wait = resolved_dismount_wait;
 
-            squeezefs::jobs::start_job_worker(job_cpu_limit);
+            // VL2: the coordinator-side job fabric (durable records,
+            // duty-cycle throttle, crash-resume adoption). Local pool
+            // sized like the L4 service posture; `--job-cpu-limit` is
+            // the default throttle for jobs submitted without one.
+            let fabric_workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8)
+                .div_euclid(4)
+                .clamp(2, 8);
+            let fabric = squeezefs::jobs::JobFabric::start(
+                routed_meta_backend,
+                fabric_workers,
+                job_cpu_limit,
+            )
+            .await
+            .map_err(|e| format!("job fabric start failed: {e}"))?;
+            fs_engine
+                .job_fabric
+                .store(std::sync::Arc::new(Some(fabric)));
 
             let opt_idle = if resolved_fuse_io_uring_sqpoll_idle_ms > 0 {
                 Some(resolved_fuse_io_uring_sqpoll_idle_ms)

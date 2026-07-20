@@ -15,7 +15,7 @@ const HEADER_SIZE: usize = 12; // magic (4B) + key_len (4B) + val_len (4B)
 /// `seg_dir` (PR VL5b, the KD-8 staging drain barrier's custody probe —
 /// no store instance, io_uring chunked reads). Sound because every
 /// remove/flush zeroes its record's on-disk `BLOCK_MAGIC` (see
-/// [`NvmeShardInner::remove`]): only never-flushed write custody still
+/// `NvmeShardInner::remove` — a private impl): only never-flushed write custody still
 /// scans live. Returns at most `max_units` keys (diagnostics bound).
 pub async fn scan_live_segment_keys(
     seg_dir: &std::path::Path,

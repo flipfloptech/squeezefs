@@ -3363,13 +3363,21 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             // Version-gated bootstrap (PR K6a): root-inode presence and
-            // the format config are read off the first volume's KV trees
-            // via a read-only probe mount.
-            let first_meta_path = &meta_lvs[0];
-            let boot_vol = squeezefs::meta_backend::open_volume_probe(first_meta_path).await?;
-            let _root_inode = boot_vol.getattr(1).await?;
+            // the format config are read off the SLOT-0 HOST's KV trees
+            // via a read-only probe mount (§5.5.1a discovery — PR VL5b:
+            // after a slot-0 migration the root records live in a guest
+            // keyspace on another member; legacy sets keep reading the
+            // first volume's ino 1 verbatim).
+            let disc = squeezefs::meta_backend::discover_meta_set(&meta_lvs).await?;
+            let slot0_home = disc.ordered_paths[disc.slot_to_volume[0]].clone();
+            let boot_vol = squeezefs::meta_backend::open_volume_probe(&slot0_home).await?;
+            let boot_root = boot_vol.slot0_root_ino();
+            let _root_inode = boot_vol.getattr(boot_root).await?;
             let val_opt = boot_vol
-                .getxattr(1, squeezefs::meta_backend::kv::builder::FORMAT_CONFIG_XATTR)
+                .getxattr(
+                    boot_root,
+                    squeezefs::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
+                )
                 .await?;
             let val = val_opt.ok_or(
                 "Format configuration xattr not found on root inode. Is this volume formatted?",

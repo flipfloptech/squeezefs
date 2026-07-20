@@ -44,6 +44,13 @@ set -euo pipefail
 #     drain converges, manifest byte-identical (G-VL-3 a; the ×10 run is
 #     the closing gate, LOOPS=10).
 #
+#   Leg 8 (mount, VL4b): balance-aware placement (§5.9, G-VL-8 at rig
+#     scale) — 2 volumes, oss2 live-disabled while oss1 fills to ~70 %,
+#     re-enable, sustained mixed write/delete workload: assert
+#     `placement.backend_fill_spread` decreases and new allocations
+#     favor the emptier volume (`backend_placement_picks` deltas — the
+#     stats instrument, house pattern). No rebalance job anywhere.
+#
 # Unprivileged posture (the preload-gate precedent): file-backed volumes
 # + a user-owned mountpoint; root is NOT required.
 #
@@ -495,6 +502,85 @@ for loop in $(seq 1 "$LOOPS"); do
 done
 echo "OK: leg 7 (kill-9 soak ×$LOOPS)"
 
+# ---------------------------------------------------------------------------
+# Leg 8 (VL4b): balance-aware placement — fill spread converges, picks
+# favor the emptier volume (§5.9, G-VL-8 at rig scale)
+# ---------------------------------------------------------------------------
+note "Leg 8: balance-aware placement (fill-penalty PlacementTable)"
+
+RIG="$BASE/placement"
+MNT="$BASE/placement_mnt"
+LOG="$RIG/mount.log"
+mkdir -p "$RIG/staging" "$MNT"
+truncate -s 256M "$RIG/meta1"
+truncate -s 512M "$RIG/oss1"
+truncate -s 512M "$RIG/oss2"
+"$BIN" format "sqmeta://$RIG/meta1" "sqdata://$RIG/oss1,$RIG/oss2" \
+    --disk-cache-paths "$RIG/staging" --force >/dev/null
+do_mount
+
+placement_field() { # placement_field <python-expr over data["placement"]>
+    python3 -c '
+import json, sys
+data = json.load(open(sys.argv[1]))
+p = data.get("placement") or {}
+print(eval(sys.argv[2]))
+' "$MNT/.stats" "$1"
+}
+
+spread_now() { placement_field 'p["backend_fill_spread"]'; }
+picks_of() { # picks_of <volume-id>
+    placement_field "next(r['backend_placement_picks'] for r in p['backends'] if r['id'] == '$1')"
+}
+
+# Fill oss1 to ~70 % with oss2 live-disabled (the fail-stop health
+# override rides the admin lane; the override hook refreshes the table).
+"$BIN" config -g "$MNT" data-volume disable oss2 >/dev/null \
+    || fail "live data-volume disable must succeed"
+for i in $(seq 1 22); do
+    dd if=/dev/urandom of="$MNT/fill_$i.bin" bs=1M count=16 status=none
+done
+sync -f "$MNT"
+
+# Re-enable: both volumes eligible, the census imbalance is now visible.
+"$BIN" config -g "$MNT" data-volume enable oss2 >/dev/null \
+    || fail "live data-volume enable must succeed"
+SPREAD_BEFORE="$(spread_now)"
+PICKS1_BEFORE="$(picks_of oss1)"
+PICKS2_BEFORE="$(picks_of oss2)"
+python3 -c "import sys; sys.exit(0 if float('$SPREAD_BEFORE') > 0.4 else 1)" \
+    || fail "premise: the seeded imbalance must read as spread > 40 pp (got $SPREAD_BEFORE)"
+note "  seeded spread: $SPREAD_BEFORE (picks oss1=$PICKS1_BEFORE oss2=$PICKS2_BEFORE)"
+
+# The sustained mixed write/delete workload — no rebalance job anywhere.
+for i in $(seq 1 16); do
+    dd if=/dev/urandom of="$MNT/spread_$i.bin" bs=1M count=12 status=none
+    if [ $((i % 4)) -eq 0 ]; then
+        rm -f "$MNT/fill_$i.bin"
+    fi
+done
+sync -f "$MNT"
+sleep 6 # one health-worker cadence: the fill gauges republish
+
+SPREAD_AFTER="$(spread_now)"
+PICKS1_AFTER="$(picks_of oss1)"
+PICKS2_AFTER="$(picks_of oss2)"
+D1=$((PICKS1_AFTER - PICKS1_BEFORE))
+D2=$((PICKS2_AFTER - PICKS2_BEFORE))
+note "  post-workload spread: $SPREAD_AFTER (pick deltas oss1=$D1 oss2=$D2)"
+
+# (a) The spread instrument moved DOWN by a real margin.
+python3 -c "import sys; sys.exit(0 if float('$SPREAD_AFTER') < float('$SPREAD_BEFORE') - 0.05 else 1)" \
+    || fail "backend_fill_spread must decrease under the workload ($SPREAD_BEFORE -> $SPREAD_AFTER)"
+# (b) New allocations favor the emptier volume: >= 60 % of the pick
+#     delta lands on oss2 (G-VL-8 a, at rig scale).
+[ "$D2" -gt 0 ] || fail "the emptier volume received no placements"
+[ $((D2 * 10)) -ge $(((D1 + D2) * 6)) ] \
+    || fail "placement must favor the emptier volume (oss1 +$D1 vs oss2 +$D2)"
+
+do_unmount
+echo "OK: leg 8 (placement: spread $SPREAD_BEFORE -> $SPREAD_AFTER, picks oss1 +$D1 / oss2 +$D2)"
+
 echo "==============================================================="
-echo "VOLUME LIFECYCLE RIG (VL3 + VL4 legs) PASSED (kill-9 LOOPS=$LOOPS)"
+echo "VOLUME LIFECYCLE RIG (VL3 + VL4 + VL4b legs) PASSED (kill-9 LOOPS=$LOOPS)"
 echo "==============================================================="

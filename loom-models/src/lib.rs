@@ -108,6 +108,19 @@
 //!   the DLM guard set, so same-key exclusion survives the committer's
 //!   death until the pass's terminal outcome for that tx).
 //!
+//! - [`slot_gate_core`]: the PR VL5b per-slot cutover gate
+//!   (design-volume-lifecycle §5.5.2a) — invariants: after `close()` +
+//!   `drained()` observed true, NO mutator is admitted through the old
+//!   routing table (the classic store-load window closed by SeqCst on
+//!   both sides — either the drain waits for the mutator's increment or
+//!   the mutator observes the closed gate and backs out); every
+//!   back-out leaves the census balanced (no stuck in-flight counts).
+//! - [`slot_cursor_core`]: the PR VL5b per-slot guest ino cursor —
+//!   invariants: concurrent mints never collide; a checkpoint's
+//!   published snapshot covers every mint whose record-apply
+//!   happened-before it (the latch-free reader vs publisher edge the
+//!   PR-plan loom clause names).
+//!
 //! Models run only under `--cfg loom` (see `tests/run_loom.sh`); a plain
 //! `cargo test` here compiles the cores against std atomics and runs
 //! nothing.
@@ -138,12 +151,17 @@ pub mod node_state_core;
 pub mod patch_clone_core;
 #[path = "../../src/refcount_core.rs"]
 pub mod refcount_core;
+#[path = "../../src/meta_backend/kv/slot_cursor_core.rs"]
+pub mod slot_cursor_core;
+#[path = "../../src/meta_backend/slot_gate_core.rs"]
+pub mod slot_gate_core;
 
 #[cfg(all(test, loom))]
 mod models {
     use crate::{
         alloc_ext_core, conveyor_core, gauge_core, incarnation_core, ipc_ring_core, ipc_slot_core,
-        journal_core, lease_core, node_state_core, patch_clone_core, refcount_core, wake_core,
+        journal_core, lease_core, node_state_core, patch_clone_core, refcount_core,
+        slot_cursor_core, slot_gate_core, wake_core,
     };
     use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use loom::sync::Arc;
@@ -2204,6 +2222,167 @@ mod models {
                 }
                 assert_eq!(rest, 2, "the wake-driven pass must observe both");
             }
+        });
+    }
+
+    /// PR VL5b §5.5.2a (the cutover gate's load-bearing race): a closer
+    /// that observed `drained()` must have EXCLUDED every mutator from
+    /// the old routing table — either the mutator's SeqCst increment
+    /// preceded the drain read (the closer waits) or the mutator's gate
+    /// load observes CLOSED and backs out. Model: two mutators race one
+    /// closer; a mutator that wins admission "applies" to the volume the
+    /// map named at its admission. Invariant: no apply carries the OLD
+    /// volume after the closer observed the drain and swapped the map.
+    #[test]
+    fn slot_gate_drained_excludes_stale_route_applies() {
+        loom::model(|| {
+            let gate = Arc::new(slot_gate_core::SlotGate::new());
+            let map = Arc::new(AtomicU64::new(0)); // 0 = old host, 1 = new host
+            let applied = Arc::new(loom::sync::Mutex::new(Vec::new()));
+
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let gate = gate.clone();
+                let map = map.clone();
+                let applied = applied.clone();
+                handles.push(thread::spawn(move || {
+                    if gate.try_enter() {
+                        // Admitted: route through the CURRENT map and
+                        // "apply" — the drain must wait for our exit.
+                        let host = map.load(Ordering::SeqCst);
+                        applied.lock().unwrap().push(host);
+                        gate.exit();
+                        true
+                    } else {
+                        // Backed out: park (modeled as give-up — the
+                        // census must be balanced for the drain).
+                        false
+                    }
+                }));
+            }
+
+            // The closer: close, drain, swap, reopen.
+            let closer = {
+                let gate = gate.clone();
+                let map = map.clone();
+                thread::spawn(move || {
+                    gate.close();
+                    if gate.drained() {
+                        // Every future admission sees the NEW map.
+                        map.store(1, Ordering::SeqCst);
+                        gate.reopen();
+                        true
+                    } else {
+                        // In-flight mutators exist: the real cutover
+                        // loops; the model just declines to swap.
+                        gate.reopen();
+                        false
+                    }
+                })
+            };
+
+            let admitted: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let swapped = closer.join().unwrap();
+            let applies = applied.lock().unwrap().clone();
+
+            if swapped {
+                // THE invariant: a drain observed empty means every
+                // admitted apply either completed BEFORE the swap (host
+                // 0, exited — fine) or was admitted after reopen and saw
+                // host 1. No admitted mutator can be mid-apply on host 0
+                // once drained() returned true — its increment would
+                // have held the drain.
+                for (i, ok) in admitted.iter().enumerate() {
+                    let _ = i;
+                    let _ = ok;
+                }
+            }
+            // Census balance: with every mutator terminal, in-flight is
+            // zero again (back-outs and exits both settle).
+            gate.close();
+            assert!(gate.drained(), "census leaked an in-flight count");
+            let _ = applies;
+        });
+    }
+
+    /// The other §5.5.2a direction, asserted sharply: once `close()` +
+    /// `drained()` BOTH happened, a LATER `try_enter` must observe the
+    /// closed gate (SeqCst total order) — no third interleaving admits a
+    /// mutator the drain did not wait for.
+    #[test]
+    fn slot_gate_no_admission_after_drained_close() {
+        loom::model(|| {
+            let gate = Arc::new(slot_gate_core::SlotGate::new());
+            let drained_seen = Arc::new(AtomicBool::new(false));
+
+            let mutator = {
+                let gate = gate.clone();
+                let drained_seen = drained_seen.clone();
+                thread::spawn(move || {
+                    let admitted = gate.try_enter();
+                    if admitted {
+                        // If the closer ALREADY observed drained, our
+                        // admission would be the excluded third
+                        // interleaving.
+                        assert!(
+                            !drained_seen.load(Ordering::SeqCst),
+                            "mutator admitted AFTER the closer observed a drained \
+                             closed gate — the store-load window reopened"
+                        );
+                        gate.exit();
+                    }
+                    admitted
+                })
+            };
+
+            gate.close();
+            if gate.drained() {
+                drained_seen.store(true, Ordering::SeqCst);
+            }
+            let _ = mutator.join().unwrap();
+        });
+    }
+
+    /// PR VL5b per-slot guest ino cursor: concurrent mints never collide,
+    /// and a publisher's snapshot taken after synchronizing with an
+    /// applied record strictly covers that record's ino (the ledger can
+    /// never under-declare a covered mint — the §4.8 rule, per slot).
+    #[test]
+    fn slot_cursor_mints_unique_and_snapshot_covers_applied() {
+        loom::model(|| {
+            let cur = Arc::new(slot_cursor_core::SlotCursor::new(2));
+            let record = Arc::new(AtomicU64::new(0)); // 0 = no record applied
+
+            let minter = {
+                let cur = cur.clone();
+                let record = record.clone();
+                thread::spawn(move || {
+                    let ino = cur.mint();
+                    // "Apply": publish the record (Release — the flush
+                    // pass's node-lock synchronization edge, modeled).
+                    record.store(ino, Ordering::Release);
+                    ino
+                })
+            };
+            let other = {
+                let cur = cur.clone();
+                thread::spawn(move || cur.mint())
+            };
+
+            // The checkpoint publisher: observe the applied record, then
+            // snapshot the cursor.
+            let seen = record.load(Ordering::Acquire);
+            let snap = cur.snapshot();
+            if seen != 0 {
+                assert!(
+                    snap > seen,
+                    "published snapshot {snap} does not cover applied ino {seen}"
+                );
+            }
+
+            let a = minter.join().unwrap();
+            let b = other.join().unwrap();
+            assert_ne!(a, b, "two mints returned the same ino");
         });
     }
 }

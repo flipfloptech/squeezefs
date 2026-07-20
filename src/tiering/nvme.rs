@@ -11,6 +11,86 @@ use xxhash_rust::xxh3::xxh3_64;
 const BLOCK_MAGIC: u32 = 0xCAFEBABE;
 const HEADER_SIZE: usize = 12; // magic (4B) + key_len (4B) + val_len (4B)
 
+/// Standalone LIVE-record key scan over the segment shard files in
+/// `seg_dir` (PR VL5b, the KD-8 staging drain barrier's custody probe —
+/// no store instance, io_uring chunked reads). Sound because every
+/// remove/flush zeroes its record's on-disk `BLOCK_MAGIC` (see
+/// [`NvmeShardInner::remove`]): only never-flushed write custody still
+/// scans live. Returns at most `max_units` keys (diagnostics bound).
+pub async fn scan_live_segment_keys(
+    seg_dir: &std::path::Path,
+    max_units: usize,
+) -> crate::error::Result<Vec<String>> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(seg_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => {
+            return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                e.kind(),
+                format!("scanning {}: {e}", seg_dir.display()),
+            )))
+        }
+    };
+    const CHUNK: usize = 4 * 1024 * 1024;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() || meta.len() == 0 {
+            continue;
+        }
+        let path = entry.path();
+        let capacity = meta.len() as usize;
+        let alignment = if capacity >= 4096 { 4096 } else { 1 };
+        let mut offset = 0usize;
+        while offset + HEADER_SIZE <= capacity && out.len() < max_units {
+            let want = CHUNK.min(capacity - offset);
+            let chunk = crate::uring_fs::read_at(&path, offset as u64, want).await?;
+            let mut pos = 0usize;
+            while pos + HEADER_SIZE <= chunk.len() {
+                let magic = u32::from_le_bytes(chunk[pos..pos + 4].try_into().unwrap());
+                if magic != BLOCK_MAGIC {
+                    pos += alignment;
+                    continue;
+                }
+                let key_len =
+                    u32::from_le_bytes(chunk[pos + 4..pos + 8].try_into().unwrap()) as usize;
+                let sane = key_len > 0 && key_len <= capacity - (offset + pos + HEADER_SIZE);
+                if sane {
+                    let key_off = offset + pos + HEADER_SIZE;
+                    let key_bytes = if pos + HEADER_SIZE + key_len <= chunk.len() {
+                        chunk[pos + HEADER_SIZE..pos + HEADER_SIZE + key_len].to_vec()
+                    } else {
+                        crate::uring_fs::read_at(&path, key_off as u64, key_len)
+                            .await?
+                            .to_vec()
+                    };
+                    out.push(String::from_utf8_lossy(&key_bytes).into_owned());
+                    if out.len() >= max_units {
+                        break;
+                    }
+                }
+                pos += alignment;
+            }
+            offset += want;
+        }
+    }
+    Ok(out)
+}
+
+/// Test seam for [`scan_live_segment_keys`]: one live record's minimal
+/// shard image (header + key + 1-byte value at the writer geometry).
+pub fn encode_segment_record_for_test(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let alignment = 1usize; // capacity < 4096 ⇒ byte alignment (see scan)
+    let val_start = (HEADER_SIZE + key.len() + alignment - 1) & !(alignment - 1);
+    let mut img = vec![0u8; val_start + value.len()];
+    img[0..4].copy_from_slice(&BLOCK_MAGIC.to_le_bytes());
+    img[4..8].copy_from_slice(&(key.len() as u32).to_le_bytes());
+    img[8..12].copy_from_slice(&(value.len() as u32).to_le_bytes());
+    img[HEADER_SIZE..HEADER_SIZE + key.len()].copy_from_slice(key);
+    img[val_start..].copy_from_slice(value);
+    img
+}
+
 #[derive(Clone, Copy, Debug)]
 struct BlockMeta {
     offset: usize,

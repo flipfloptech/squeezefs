@@ -46,10 +46,11 @@ use super::node_cache::{
     CachedNode, LiveLookup, NodeCache, NodeCacheConfig, OwnedRec, DEFAULT_WRITEBACK_DELTA_BYTES,
 };
 use super::record::{
-    decode_dentry_key, decode_inode_key, decode_readdir_cookie, dentry_key, dentry_name_hash54,
-    encode_readdir_cookie, first_free_coll_seq, inode_key, xattr_key, xattr_name_hash56,
-    DentryValue, InodeDelta, InodeValue, ReaddirPos, Record, RecordKind, XattrValue, HASH54_MAX,
-    HASH56_MAX, TREE_ALLOC_RESERVED, TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
+    decode_dentry_key, decode_inode_key, decode_readdir_cookie, decode_xattr_key, dentry_key,
+    dentry_name_hash54, encode_readdir_cookie, first_free_coll_seq, inode_key, xattr_key,
+    xattr_name_hash56, DentryValue, InodeDelta, InodeValue, ReaddirPos, Record, RecordKind,
+    XattrValue, HASH54_MAX, HASH56_MAX, TREE_ALLOC_RESERVED, TREE_DENTRIES, TREE_INODES,
+    TREE_XATTRS,
 };
 use super::superblock::{classify_volume, SuperblockV3, VolumeFormat};
 use super::tree::{decode_interior_value, KvTree, RootPtr, SmoContext, SmoJournal};
@@ -352,6 +353,119 @@ pub enum ClaimClearOutcome {
     Cleared(WriterClaim),
 }
 
+/// PR VL5b (design-volume-lifecycle §5.5.2 step 3): the conveyor
+/// pass-task key tee. Records do not carry journal sequence numbers and
+/// the ring wraps many times during a large-slot copy, so "replay since
+/// seq X" is unavailable — instead the per-volume pass task (the sole
+/// leaf-lock taker for user commits) tees the KEYS of records routed to
+/// the migrating keyspace into this bounded in-RAM side log. Keys only —
+/// values are re-read from the authoritative tree at delta-apply time.
+///
+/// **Overflow rule** (§5.5.2): a full side log latches `overflowed` and
+/// drops its contents (bounding memory); the engine's next round flips
+/// to a fresh full snapshot pass — correct by construction (the snapshot
+/// supersedes the lost keys). Three consecutive overflows abort the
+/// migration loudly.
+pub struct MigrationTee {
+    /// The migrating keyspace on THIS volume: owning inos in `[lo, hi)`.
+    lo: u64,
+    hi: u64,
+    /// Key-count cap (≈ 40 B/key; the design default 1 M keys ≈ 40 MiB).
+    cap: usize,
+    /// The side log: `(tree_id, key)` — deduped (per-key LWW means one
+    /// re-read covers any number of commits).
+    log: parking_lot::Mutex<std::collections::HashSet<(u8, Vec<u8>)>>,
+    overflowed: AtomicBool,
+    /// PER-VOLUME control-record exclusion: the source's own
+    /// `writer_claim` xattr `(root ino, name hash56)` — its heartbeat
+    /// rewrites ride the conveyor and must neither travel with the slot
+    /// nor keep the cutover's tee-empty recheck from settling.
+    exclude_xattr: std::sync::OnceLock<(u64, u64)>,
+}
+
+impl MigrationTee {
+    pub(super) fn new(lo: u64, hi: u64, cap: usize) -> Self {
+        Self {
+            lo,
+            hi,
+            cap,
+            log: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            overflowed: AtomicBool::new(false),
+            exclude_xattr: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Install the writer-claim exclusion (see `exclude_xattr`).
+    pub fn exclude_writer_claim(&self, root_ino: u64, name_hash56: u64) {
+        let _ = self.exclude_xattr.set((root_ino, name_hash56));
+    }
+
+    /// The owning ino of a record key: the first 8 big-endian bytes in
+    /// all three §4.2 trees (ino / parent ino / ino).
+    fn key_owner(key: &[u8]) -> Option<u64> {
+        key.get(..8)
+            .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+    }
+
+    /// Pass-task hook: tee the keys of one committed tx's records.
+    fn note_committed(&self, recs: &[(u8, Record)]) {
+        for (tree_id, r) in recs {
+            if *tree_id == TREE_ALLOC_RESERVED {
+                continue;
+            }
+            let Some(ino) = Self::key_owner(&r.key) else {
+                continue;
+            };
+            if ino < self.lo || ino >= self.hi {
+                continue;
+            }
+            if *tree_id == TREE_XATTRS {
+                if let (Some(&(ex_ino, ex_hash)), Ok((k_ino, k_hash, _))) =
+                    (self.exclude_xattr.get(), decode_xattr_key(&r.key))
+                {
+                    if k_ino == ex_ino && k_hash == ex_hash {
+                        continue; // the volume's own writer_claim heartbeat
+                    }
+                }
+            }
+            let mut log = self.log.lock();
+            if log.len() >= self.cap {
+                // Latch the overflow and drop the log — the engine's
+                // fresh-snapshot fallback supersedes the lost keys, and
+                // an unbounded log would defeat the 40 MiB budget.
+                self.overflowed.store(true, Ordering::Release);
+                log.clear();
+                crate::fuse_client::METRICS
+                    .meta_slot_delta_overflows
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            log.insert((*tree_id, r.key.clone()));
+        }
+    }
+
+    /// Engine round drain: `(keys, overflowed)` — resets both for the
+    /// next round.
+    pub(crate) fn drain_round(&self) -> (Vec<(u8, Vec<u8>)>, bool) {
+        let keys: Vec<(u8, Vec<u8>)> = {
+            let mut log = self.log.lock();
+            log.drain().collect()
+        };
+        let overflowed = self.overflowed.swap(false, Ordering::AcqRel);
+        (keys, overflowed)
+    }
+
+    /// Non-draining size probe (the engine's cutover-threshold check).
+    pub(crate) fn pending_len(&self) -> usize {
+        self.log.lock().len()
+    }
+
+    /// Whether the current round already overflowed.
+    pub(crate) fn has_overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::Acquire)
+    }
+}
+
 /// One mounted v3 metadata volume.
 pub struct KvMetaBackend {
     path: PathBuf,
@@ -363,6 +477,20 @@ pub struct KvMetaBackend {
     /// per checkpoint cycle (background task) and written only by
     /// format-grade admin verbs (`repair-set`), never on the hot path.
     membership_stamp: std::sync::Mutex<Option<super::checkpoint::MembershipStamp>>,
+    /// PR VL5b (§5.5.2 / KD-7): per-slot GUEST ino cursors — one
+    /// [`SlotCursor`] per hosted guest slot, seeded from the mounted
+    /// stamp's `slot_cursors` (+ the replayed per-slot maxima) and
+    /// published into every checkpoint's ledger record. Latch-free (scc)
+    /// — minting is a hot-path `fetch_add`; the map itself mutates only
+    /// on migration flips (control plane).
+    guest_cursors: scc::HashMap<u16, Arc<super::slot_cursor_core::SlotCursor>>,
+    /// PR VL5b (§5.5.2): the conveyor pass-task key tee — armed by the
+    /// slot-migration engine for the duration of a bulk-copy/delta
+    /// round, `None` (one arc-swap load per batch) otherwise. The pass
+    /// task tees the KEYS of successfully committed records whose owning
+    /// ino falls in the migrating keyspace; values are re-read at delta
+    /// apply.
+    migration_tee: arc_swap::ArcSwapOption<MigrationTee>,
     /// Shared node cache behind the three trees (§4.5). Held for tree
     /// lifetime; the trees clone the `Arc`.
     inodes: KvTree,
@@ -866,6 +994,10 @@ impl KvMetaBackend {
             .await?;
         }
         let mut max_replayed_ino: u64 = 0;
+        // PR VL5b: per-guest-slot replayed ino maxima — the same §4.8
+        // recovery fold, one cursor per guest namespace.
+        let mut max_replayed_guest: std::collections::HashMap<u16, u64> =
+            std::collections::HashMap::new();
         for entry in &recovery.entries {
             for (tag, rec) in &entry.records {
                 let (tree_id, level) = untag(*tag);
@@ -881,7 +1013,13 @@ impl KvMetaBackend {
                 };
                 if tree_id == TREE_INODES {
                     if let Ok(ino) = decode_inode_key(&rec.key) {
-                        max_replayed_ino = max_replayed_ino.max(ino);
+                        match crate::meta_backend::split_guest_local(ino) {
+                            Some((slot, raw)) => {
+                                let e = max_replayed_guest.entry(slot).or_insert(0);
+                                *e = (*e).max(raw);
+                            }
+                            None => max_replayed_ino = max_replayed_ino.max(ino),
+                        }
                     }
                 }
                 tree.apply_replayed(
@@ -931,7 +1069,7 @@ impl KvMetaBackend {
                 path: path.to_path_buf(),
             },
         ));
-        Ok(Self {
+        let be = Self {
             path: path.to_path_buf(),
             sb,
             checkpoint_seq: AtomicU64::new(ledger.seq),
@@ -940,6 +1078,8 @@ impl KvMetaBackend {
             // record — every checkpoint re-writes it, so a slot-mapped
             // volume's newest ledger slot always carries its membership.
             membership_stamp: std::sync::Mutex::new(ledger.membership_stamp.clone()),
+            guest_cursors: scc::HashMap::new(),
+            migration_tee: arc_swap::ArcSwapOption::empty(),
             ledger,
             inodes,
             dentries,
@@ -990,7 +1130,35 @@ impl KvMetaBackend {
             barrier_failures: AtomicU64::new(0),
             pending_free_stalled_cycles: AtomicU64::new(0),
             guard_trace: std::sync::Mutex::new(Vec::new()),
-        })
+        };
+
+        // PR VL5b: seed the per-slot guest cursors — the mounted stamp's
+        // travelling cursors folded with the replayed per-slot maxima
+        // (§4.8's `max(ledger watermark, replayed + 1)` rule, per slot).
+        if let Some(stamp) = be.membership_stamp.lock().unwrap().as_ref() {
+            for (slot, next) in &stamp.slot_cursors {
+                let floor = (*next).max(max_replayed_guest.get(slot).map(|m| m + 1).unwrap_or(2));
+                let _ = be.guest_cursors.insert_sync(
+                    *slot,
+                    Arc::new(super::slot_cursor_core::SlotCursor::new(floor)),
+                );
+            }
+        }
+        // Replayed guest records for a slot the stamp carries no cursor
+        // for (crash between the guest commit and the next checkpoint's
+        // extended stamp): the replay fold is authoritative.
+        for (slot, max_raw) in &max_replayed_guest {
+            match be.guest_cursors.read_sync(slot, |_, v| v.clone()) {
+                Some(c) => c.install_floor(max_raw + 1),
+                None => {
+                    let _ = be.guest_cursors.insert_sync(
+                        *slot,
+                        Arc::new(super::slot_cursor_core::SlotCursor::new(max_raw + 1)),
+                    );
+                }
+            }
+        }
+        Ok(be)
     }
 
     /// The mounted superblock.
@@ -1016,7 +1184,156 @@ impl KvMetaBackend {
     /// lands durably with the next checkpoint's ledger write (shutdown's
     /// final cycle at the latest).
     pub fn set_membership_stamp(&self, stamp: super::checkpoint::MembershipStamp) {
+        // Cursors named by the stamp become live cells (idempotent —
+        // install_floor never regresses a fresher mint).
+        for (slot, next) in &stamp.slot_cursors {
+            match self.guest_cursors.read_sync(slot, |_, v| v.clone()) {
+                Some(c) => c.install_floor(*next),
+                None => {
+                    let _ = self.guest_cursors.insert_sync(
+                        *slot,
+                        Arc::new(super::slot_cursor_core::SlotCursor::new(*next)),
+                    );
+                }
+            }
+        }
         *self.membership_stamp.lock().unwrap() = Some(stamp);
+    }
+
+    /// PR VL5b: the stamp image a checkpoint's ledger record carries —
+    /// the stored stamp with the LIVE per-slot guest cursors folded in
+    /// (the loom-modeled `slot_cursor_core` publication edge: every mint
+    /// whose record the flush pass covered is strictly below its
+    /// published cursor).
+    pub(super) fn membership_stamp_for_ledger(&self) -> Option<super::checkpoint::MembershipStamp> {
+        let mut stamp = self.membership_stamp.lock().unwrap().clone()?;
+        let mut cursors: Vec<(u16, u64)> = Vec::new();
+        self.guest_cursors.iter_sync(|slot, cursor| {
+            cursors.push((*slot, cursor.snapshot()));
+            true
+        });
+        cursors.sort_unstable_by_key(|(s, _)| *s);
+        if !cursors.is_empty() {
+            stamp.slot_cursors = cursors;
+        }
+        Some(stamp)
+    }
+
+    /// PR VL5b: mint one GUEST local ino for hosted slot `slot` (raw —
+    /// the caller namespaces it with `guest_local_ino`). Fails loud on a
+    /// slot this volume carries no cursor for (routing bug, never UB).
+    pub fn allocate_guest_ino(&self, slot: u16) -> Result<Ino> {
+        if let Some(c) = self.guest_cursors.read_sync(&slot, |_, v| v.clone()) {
+            return Ok(c.mint());
+        }
+        // VIRGIN guest slot (hosted since format, never migrated, never
+        // minted — the identity distribution's over-provisioned slots):
+        // its keyspace is empty by construction (only travelling cursors
+        // or replay maxima make records; both install cursors), so a
+        // fresh cursor at 2 is exact. Lazy-created here; the next
+        // checkpoint's extended stamp publishes it.
+        let fresh = Arc::new(super::slot_cursor_core::SlotCursor::new(2));
+        let c = match self.guest_cursors.insert_sync(slot, fresh.clone()) {
+            Ok(()) => fresh,
+            Err(_) => self
+                .guest_cursors
+                .read_sync(&slot, |_, v| v.clone())
+                .ok_or_else(|| self.eio("guest cursor raced out (impossible)"))?,
+        };
+        Ok(c.mint())
+    }
+
+    /// PR VL5b: the current cursor snapshot for `slot` (the migration
+    /// engine reads the SOURCE's travelling cursor at cutover). `None` =
+    /// no guest cursor — the slot's keyspace is this volume's legacy one
+    /// and the volume `next_ino` watermark is its cursor.
+    pub fn guest_cursor_snapshot(&self, slot: u16) -> Option<u64> {
+        self.guest_cursors
+            .read_sync(&slot, |_, v| v.clone())
+            .map(|c| c.snapshot())
+    }
+
+    /// PR VL5b: install (or raise) the travelling cursor for `slot` —
+    /// the migration flip's target-side step. Idempotent and monotonic.
+    pub fn install_guest_cursor(&self, slot: u16, next: u64) {
+        match self.guest_cursors.read_sync(&slot, |_, v| v.clone()) {
+            Some(c) => c.install_floor(next),
+            None => {
+                let _ = self.guest_cursors.insert_sync(
+                    slot,
+                    Arc::new(super::slot_cursor_core::SlotCursor::new(next)),
+                );
+            }
+        }
+    }
+
+    /// PR VL5b: drop a migrated-away slot's cursor (source side, after
+    /// the flip — the cursor travelled to the target).
+    pub fn remove_guest_cursor(&self, slot: u16) {
+        let _ = self.guest_cursors.remove_sync(&slot);
+    }
+
+    /// PR VL5b (§5.5.2 step 3): arm the conveyor pass-task key tee for
+    /// the keyspace `[lo, hi)`. One tee per volume at a time (one flip
+    /// per slot at a time is the coordinator's law); returns the handle
+    /// the engine drains rounds from.
+    pub fn arm_migration_tee(&self, lo: u64, hi: u64, cap: usize) -> Arc<MigrationTee> {
+        let tee = Arc::new(MigrationTee::new(lo, hi, cap));
+        self.migration_tee.store(Some(tee.clone()));
+        tee
+    }
+
+    /// Disarm the tee (cutover complete or migration aborted).
+    pub fn disarm_migration_tee(&self) {
+        self.migration_tee.store(None);
+    }
+
+    /// PR VL5b: one migration batch on this volume — bulk-copy puts and
+    /// teardown deletes staged as ONE ordinary conveyor transaction.
+    /// Guard-set EMPTY by design (the KvTx doc's architectural-exclusion
+    /// class): the migrating keyspace has no other writer — bulk-copy
+    /// targets an unpublished guest keyspace, and teardown runs strictly
+    /// after the flip re-routed every op away from the source.
+    pub async fn migration_apply(
+        &self,
+        puts: Vec<(u8, Vec<u8>, Vec<u8>)>,
+        deletes: Vec<(u8, Vec<u8>)>,
+    ) -> Result<()> {
+        self.write_gate()?;
+        let mut tx = KvTx::new();
+        for (tree_id, key, value) in puts {
+            tx.stage_put(tree_id, key, Bytes::from(value));
+        }
+        for (tree_id, key) in deletes {
+            tx.stage_delete(tree_id, key);
+        }
+        self.commit_tx(tx).await?;
+        Ok(())
+    }
+
+    /// PR VL5b: latch-free point read of one raw record (`tree_id`,
+    /// `key`) — the delta-apply value re-read. `None` = deleted/absent.
+    pub async fn migration_read_record(&self, tree_id: u8, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .tree_by_id(tree_id)
+            .lookup(key)
+            .await?
+            .map(|b| b.to_vec()))
+    }
+
+    /// PR VL5b: the EFFECTIVE local ino of the filesystem root (global
+    /// ino 1) on THIS volume — local 1 when slot 0 is the volume's
+    /// legacy keyspace (every pre-migration set), the guest-namespaced
+    /// root when the volume hosts slot 0 as a guest. Callers that probe
+    /// root-ino records off a single volume (format config, mount
+    /// registrations) resolve through this.
+    pub fn slot0_root_ino(&self) -> Ino {
+        match self.membership_stamp() {
+            Some(st) if st.slots_hosted.contains(&0) && st.resolved_native_slot() != Some(0) => {
+                crate::meta_backend::guest_local_ino(0, 1)
+            }
+            _ => 1,
+        }
     }
 
     /// Mount replay statistics.
@@ -2144,10 +2461,24 @@ impl KvMetaBackend {
         let now = unix_now_secs();
         let ttl = crate::fuse_client::CLIENT_STALE_TTL_SECS;
         let mut out = Vec::new();
-        let Ok(keys) = self.listxattr(1).await else {
-            return out;
-        };
-        for key in keys {
+        // PR VL5b: `client:` heartbeats are ROUTED records on global
+        // ino 1 — after a slot-0 migration they live in this volume's
+        // GUEST slot-0 keyspace (`guest_local_ino(0, 1)`), not at local
+        // ino 1 (which keeps only the per-volume `writer_claim`). Scan
+        // both roots.
+        let mut roots: Vec<Ino> = vec![1];
+        if let Some(stamp) = self.membership_stamp() {
+            if stamp.slots_hosted.contains(&0) && stamp.resolved_native_slot() != Some(0) {
+                roots.push(crate::meta_backend::guest_local_ino(0, 1));
+            }
+        }
+        let mut keys: Vec<(Ino, String)> = Vec::new();
+        for root in roots {
+            if let Ok(names) = self.listxattr(root).await {
+                keys.extend(names.into_iter().map(|n| (root, n)));
+            }
+        }
+        for (root, key) in keys {
             let (kind, is_writer) = if key.starts_with(CLIENT_REGISTRATION_PREFIX) {
                 ("client", false)
             } else if key == WRITER_CLAIM_XATTR {
@@ -2155,7 +2486,13 @@ impl KvMetaBackend {
             } else {
                 continue;
             };
-            let Ok(Some(val)) = self.getxattr(1, &key).await else {
+            if is_writer && root != 1 {
+                // A `writer_claim` is PER-VOLUME state at local ino 1 —
+                // one in a migrated guest keyspace is a foreign volume's
+                // stale residue, never this volume's claim.
+                continue;
+            }
+            let Ok(Some(val)) = self.getxattr(root, &key).await else {
                 continue;
             };
             let heartbeat_ts = parse_registration_ts(&val);
@@ -3320,6 +3657,11 @@ impl KvMetaBackend {
                 // Terminal outcomes, in queue order (the pass task fans
                 // them out after releasing the backend ref).
                 let mut failed = failed;
+                // PR VL5b (§5.5.2 step 3): the pass task IS the key tee —
+                // every user commit on the volume passes through here, so
+                // one armed-tee load per batch captures every migrating-
+                // keyspace key with zero cost when no migration runs.
+                let tee = self.migration_tee.load_full();
                 for (qi, q) in std::mem::take(&mut s.entries).into_iter().enumerate() {
                     if let Some(pos) = failed.iter().position(|(fi, _)| *fi == qi) {
                         let (_, e) = failed.swap_remove(pos);
@@ -3333,6 +3675,9 @@ impl KvMetaBackend {
                             // D4.a: one successful commit_tx = one journal
                             // entry against the tx's construction site.
                             super::note_commit_site(q.site);
+                            if let Some(tee) = tee.as_deref() {
+                                tee.note_committed(&q.recs);
+                            }
                             Ok(())
                         }
                     };
@@ -3964,7 +4309,12 @@ impl KvMetaBackend {
         mode: u32,
         uid: u32,
         gid: u32,
-        global_of: impl FnOnce(Ino) -> Ino,
+        // PR VL5b: the routed layer pre-allocates BOTH — the effective
+        // local key ino (native watermark or guest-namespaced cursor
+        // mint) and its global encoding (which rides the mint slot, not
+        // this volume's index) — so this backend stays keyspace-agnostic.
+        local_ino: Ino,
+        global_ino: Ino,
         guards: Arc<[DlmGuard]>,
     ) -> Result<Inode> {
         self.write_gate()?;
@@ -3986,8 +4336,6 @@ impl KvMetaBackend {
             }
         }
         let is_dir = (mode & libc::S_IFMT) == libc::S_IFDIR;
-        let local_ino = self.allocate_ino();
-        let global_ino = global_of(local_ino);
         let now = Self::now_ns();
         let child = InodeValue {
             mode: final_mode,

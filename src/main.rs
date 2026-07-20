@@ -854,16 +854,44 @@ enum VolumeActions {
         volume_id: String,
     },
     /// Inspect and reconcile the metadata set-membership stamps
-    /// (design-volume-lifecycle §5.5.1a, PR VL5a): prints the observed
+    /// (design-volume-lifecycle §5.5.1a/§5.5.2b): prints the observed
     /// per-volume stamp state, idempotently re-stamps a COHERENT
     /// observed state (including the single inferable missing member a
-    /// crashed repair can leave), and refuses everything else loud —
-    /// the §5.5.2b epoch resolution lands with the migration engine
-    /// (VL5b). Offline verb: takes the D0 claims like format-grade
+    /// crashed repair can leave), resolves slot-flip epoch spreads by
+    /// per-slot highest-epoch-wins (PR VL5b), and refuses everything
+    /// else loud. Offline verb: takes the D0 claims like format-grade
     /// verbs; live mounts refuse.
     RepairSet {
         /// sqmeta:// URI of the metadata volume set
         target: String,
+    },
+    /// Add a METADATA volume (design-volume-lifecycle §5.5.2, PR VL5b):
+    /// formats the device as a new member and migrates the taken slots
+    /// onto it (an added meta volume is only useful WITH slot
+    /// migration). OFFLINE D0-guarded coordinator verb — pass the
+    /// sqmeta:// URI of the CURRENT set; unmount first. Runs the KD-8
+    /// staging drain barrier and restamps the generation. Idempotent:
+    /// re-run an interrupted add with the same arguments.
+    AddMeta {
+        /// sqmeta:// URI of the CURRENT metadata set
+        target: String,
+        /// Blank backing device for the new member
+        device: String,
+        /// Slots to take: a count ("2" = the 2 most-loaded takeable
+        /// slots) or an explicit list ("1,3,5")
+        #[arg(long, default_value = "1")]
+        take_slots: String,
+    },
+    /// Remove a METADATA volume (§5.5.2): migrates every slot it hosts
+    /// to the survivors (§5.2 meta-side capacity preflight), stamps the
+    /// survivors first and the victim's retirement tombstone last, and
+    /// restamps the generation (KD-8 barrier). OFFLINE D0-guarded
+    /// coordinator verb; idempotent re-run converges.
+    RemoveMeta {
+        /// sqmeta:// URI of the CURRENT set (victim included)
+        target: String,
+        /// The victim member's device path (as listed in the URI)
+        victim: String,
     },
 }
 
@@ -1885,14 +1913,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build()
             .unwrap();
         // Version-gated bootstrap (PR K6a): the format config is read off
-        // the first volume's KV xattr tree via a read-only probe mount.
+        // the SLOT-0 HOST's KV xattr tree via a read-only probe mount
+        // (§5.5.1a discovery resolves the host — PR VL5b: after a slot-0
+        // migration the config lives in a guest keyspace on another
+        // member; legacy sets keep reading volume 0's ino 1 verbatim).
         // Blank, legacy-v2, foreign, torn, future-version, and
         // unknown-feature superblocks all fail loud here, before any
         // daemonization.
         let val_opt = temp_rt.block_on(async {
-            let vol = squeezefs::meta_backend::open_volume_probe(first_meta_path).await?;
-            vol.getxattr(1, squeezefs::meta_backend::kv::builder::FORMAT_CONFIG_XATTR)
-                .await
+            let disc = squeezefs::meta_backend::discover_meta_set(&meta_lvs).await?;
+            let home = &disc.ordered_paths[disc.slot_to_volume[0]];
+            let vol = squeezefs::meta_backend::open_volume_probe(home).await?;
+            let root = vol.slot0_root_ino();
+            vol.getxattr(
+                root,
+                squeezefs::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
+            )
+            .await
         });
         let val_opt = match val_opt {
             Ok(v) => v,
@@ -3020,6 +3057,59 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             restamped.len()
                         );
                     }
+                }
+                VolumeActions::AddMeta {
+                    target,
+                    device,
+                    take_slots,
+                } => {
+                    if live(&target) {
+                        return Err(
+                            "volume add-meta is an OFFLINE verb (design-volume-lifecycle \
+                             §5.5.2: the membership change runs a D0-guarded coordinator \
+                             with the KD-8 staging drain barrier): unmount first and pass \
+                             the sqmeta:// URI"
+                                .into(),
+                        );
+                    }
+                    let meta_lvs = parse_block_uri(&target, "sqmeta://")?;
+                    let take =
+                        if take_slots.contains(',') || take_slots.parse::<u32>().is_err() {
+                            let mut slots = Vec::new();
+                            for part in take_slots.split(',') {
+                                slots.push(part.trim().parse::<u16>().map_err(|_| {
+                                    format!("--take-slots: '{part}' is not a slot id")
+                                })?);
+                            }
+                            squeezefs::config_ops::TakeSlots::List(slots)
+                        } else {
+                            squeezefs::config_ops::TakeSlots::Count(
+                                take_slots.parse::<u32>().expect("checked above"),
+                            )
+                        };
+                    let taken =
+                        squeezefs::config_ops::add_meta_volume(&meta_lvs, &device, &take).await?;
+                    println!(
+                        "Added metadata volume '{device}' hosting slot(s) {taken:?}. Mount \
+                         with the EXTENDED URI (all members listed); the old URI now \
+                         refuses loud."
+                    );
+                }
+                VolumeActions::RemoveMeta { target, victim } => {
+                    if live(&target) {
+                        return Err(
+                            "volume remove-meta is an OFFLINE verb (design-volume-lifecycle \
+                             §5.5.2): unmount first and pass the sqmeta:// URI"
+                                .into(),
+                        );
+                    }
+                    let meta_lvs = parse_block_uri(&target, "sqmeta://")?;
+                    squeezefs::config_ops::remove_meta_volume(&meta_lvs, &victim).await?;
+                    println!(
+                        "Removed metadata volume '{victim}' (slots migrated to the \
+                         survivors; the victim carries a retirement tombstone). Mount with \
+                         the SURVIVOR URI — listing the victim refuses loud."
+                    );
                 }
                 VolumeActions::List { target, json } => {
                     let rows: serde_json::Value = if live(&target) {

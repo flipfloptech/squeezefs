@@ -1878,7 +1878,9 @@ impl JobWireWorker {
                     // (`JobType::wire_executable` gates the dispatcher);
                     // an assigned mover shard is a coordinator bug —
                     // abort loudly, never fake-complete it.
-                    JobType::EvacuateVolume { .. } | JobType::Rebalance => {
+                    JobType::EvacuateVolume { .. }
+                    | JobType::Rebalance
+                    | JobType::MigrateMetaSlot { .. } => {
                         log::error!(
                             "job worker: mover shard {}:{} reached the wire — the \
                              dispatcher must not assign mover job types (v1.1); aborting",

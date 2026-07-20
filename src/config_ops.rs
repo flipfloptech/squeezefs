@@ -20,8 +20,11 @@ use std::path::{Path, PathBuf};
 /// legacy-v2 / unformatted volumes.
 async fn read_format_config(first_meta: &str) -> Result<crate::FormatConfig> {
     let vol = crate::meta_backend::open_volume_probe(first_meta).await?;
+    // PR VL5b: after a slot-0 migration the config record lives in the
+    // host's GUEST slot-0 keyspace, not at local ino 1.
+    let root = vol.slot0_root_ino();
     let val = vol
-        .getxattr(1, crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR)
+        .getxattr(root, crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR)
         .await?
         .ok_or_else(|| {
             SqueezefsError::InvalidOperation(format!(
@@ -865,9 +868,16 @@ async fn commit_volume_records(
 ///   stamps leave exactly one position and one slot-complement free (the
 ///   kill-9 window repair-set itself can leave): the missing stamp is
 ///   inferable — write it (bit 2 barriered first, §5.5.1a ordering);
-/// - anything else (mixed epochs, foreign uuids, duplicate positions,
-///   multiple stampless members…): REFUSE loud with the observed state —
-///   the §5.5.2b highest-complete-epoch resolution lands with VL5b.
+/// - **PR VL5b**: an EPOCH SPREAD over otherwise-coherent stamps (same
+///   uuid/width/count, unique positions — the §5.5.2b slot-flip crash
+///   windows) RESOLVES: per-slot highest-epoch-wins decides every dual
+///   claim, and all members re-stamp at the max epoch with their
+///   resolved hosted sets (converging writes 1/2 of an interrupted
+///   flip; keyspace residue is cleaned by re-running the migration);
+/// - anything else (foreign uuids, duplicate positions, count
+///   disagreements — interrupted membership changes re-run their own
+///   verb — multiple stampless members…): REFUSE loud with the
+///   observed state.
 ///
 /// Returns the paths whose ledger was re-stamped. Guarded like the other
 /// offline lifecycle verbs: live clients refuse; each stamp write rides a
@@ -920,21 +930,27 @@ pub async fn repair_meta_set(meta_lvs: &[String]) -> Result<Vec<String>> {
         )))
     };
 
-    // Coherence of the stamped subset.
+    // Coherence of the stamped subset (PR VL5b: EPOCHS may spread — the
+    // §5.5.2b per-slot resolution below converges them; uuid, geometry
+    // and membership count must agree).
     let first = stamped[0].stamp.as_ref().expect("filtered Some");
     for o in &stamped[1..] {
         let st = o.stamp.as_ref().expect("filtered Some");
         if st.set_uuid != first.set_uuid
-            || st.set_epoch != first.set_epoch
             || st.member_count != first.member_count
             || st.routing_width != first.routing_width
         {
             return refuse(format!(
-                "stamps on {} and {} disagree (uuid/epoch/geometry)",
+                "stamps on {} and {} disagree (uuid/count/geometry)",
                 stamped[0].path, o.path
             ));
         }
     }
+    let max_epoch = stamped
+        .iter()
+        .map(|o| o.stamp.as_ref().expect("filtered Some").set_epoch)
+        .max()
+        .unwrap_or(1);
     let member_count = usize::from(first.member_count);
     let width = first.routing_width as usize;
     if member_count != meta_lvs.len() {
@@ -944,10 +960,12 @@ pub async fn repair_meta_set(meta_lvs: &[String]) -> Result<Vec<String>> {
         ));
     }
 
-    // Positions and hosted slots of the stamped members.
+    // Positions and hosted slots of the stamped members (PR VL5b: a
+    // dual claim across epochs resolves highest-epoch-wins; a SAME-epoch
+    // dual claim stays a refusal — corruption by construction).
     let mut pos_holder: Vec<Option<&str>> = vec![None; member_count];
-    let mut slot_hosted: Vec<bool> = vec![false; width];
-    for o in &stamped {
+    let mut slot_claim: Vec<Option<(usize, u64)>> = vec![None; width];
+    for (oi, o) in stamped.iter().enumerate() {
         let st = o.stamp.as_ref().expect("filtered Some");
         let pos = usize::from(st.member_position);
         if pos >= member_count {
@@ -962,30 +980,49 @@ pub async fn repair_meta_set(meta_lvs: &[String]) -> Result<Vec<String>> {
         pos_holder[pos] = Some(&o.path);
         for &s in &st.slots_hosted {
             let s = usize::from(s);
-            if s >= width || slot_hosted[s] {
-                return refuse(format!(
-                    "{} hosts slot {s} out of range or already hosted",
-                    o.path
-                ));
+            if s >= width {
+                return refuse(format!("{} hosts slot {s} out of range", o.path));
             }
-            slot_hosted[s] = true;
+            match slot_claim[s] {
+                None => slot_claim[s] = Some((oi, st.set_epoch)),
+                Some((pi, pe)) if pe == st.set_epoch => {
+                    return refuse(format!(
+                        "{} and {} both host slot {s} at the SAME epoch {pe} — corruption",
+                        stamped[pi].path, o.path
+                    ));
+                }
+                Some((_, pe)) if st.set_epoch > pe => {
+                    slot_claim[s] = Some((oi, st.set_epoch));
+                }
+                Some(_) => {}
+            }
         }
     }
+    let slot_hosted: Vec<bool> = slot_claim.iter().map(|c| c.is_some()).collect();
 
     let unstamped: Vec<&crate::meta_backend::MetaVolumeObservation> =
         obs.iter().filter(|o| o.stamp.is_none()).collect();
     let mut to_write: Vec<(String, MembershipStamp)> = Vec::new();
     match unstamped.len() {
         0 => {
-            // Fully coherent: every slot must already be hosted; re-stamp
-            // exactly what stands (idempotent).
+            // Fully coherent (or an epoch-spread slot-flip state): every
+            // slot must be hosted after resolution; re-stamp the
+            // RESOLVED state at the max epoch (idempotent for coherent
+            // sets; converges §5.5.2b writes 1/2 for interrupted flips —
+            // keyspace residue is cleaned by re-running the migration).
             if let Some(missing) = slot_hosted.iter().position(|&h| !h) {
                 return refuse(format!(
                     "slot {missing} of width {width} is hosted by no member"
                 ));
             }
-            for o in &obs {
-                to_write.push((o.path.clone(), o.stamp.clone().expect("all stamped")));
+            for (oi, o) in stamped.iter().enumerate() {
+                let mut st = o.stamp.clone().expect("filtered Some");
+                st.native_slot = st.resolved_native_slot();
+                st.set_epoch = max_epoch;
+                st.slots_hosted
+                    .retain(|&s| matches!(slot_claim[usize::from(s)], Some((ci, _)) if ci == oi));
+                st.slot_cursors.retain(|(s, _)| st.slots_hosted.contains(s));
+                to_write.push((o.path.clone(), st));
             }
         }
         1 => {
@@ -1023,6 +1060,9 @@ pub async fn repair_meta_set(meta_lvs: &[String]) -> Result<Vec<String>> {
                 member_count: first.member_count,
                 routing_width: first.routing_width,
                 slots_hosted: missing_slots,
+                // VL5a-shaped inference (native = position; no guests).
+                native_slot: None,
+                slot_cursors: Vec::new(),
             };
             println!(
                 "inferring the missing stamp for {}: position {pos}, slots {:?}",
@@ -1056,4 +1096,700 @@ pub async fn repair_meta_set(meta_lvs: &[String]) -> Result<Vec<String>> {
     }
     println!("re-stamped {} member volume(s).", restamped.len());
     Ok(restamped)
+}
+
+// ---------------------------------------------------------------------------
+// PR VL5b — the KD-8 staging drain barrier + offline meta membership verbs
+// (design-volume-lifecycle §5.5.2 add/remove flows, §5.5.3, §5.2 meta side).
+// ---------------------------------------------------------------------------
+
+/// How `volume add-meta` picks the slots the new member takes.
+#[derive(Debug, Clone)]
+pub enum TakeSlots {
+    /// The k most-loaded eligible slots (record-count census).
+    Count(u32),
+    /// An explicit slot list.
+    List(Vec<u16>),
+}
+
+/// The KD-8 staging drain barrier: verify every staging dir carries NO
+/// live staged write custody (per-unit diagnostics on refusal — R7:
+/// loud, abortable, never a drop), then RESTAMP the surviving dirs with
+/// the new generation so the discard-on-mismatch law is a provable
+/// no-op. A dir bound to a FOREIGN generation (neither old nor new) is
+/// wiped-and-stamped — its content was already condemned and adopting
+/// it would poison the cache.
+pub async fn staging_drain_barrier(
+    dirs: &[PathBuf],
+    old_generation: &str,
+    new_generation: &str,
+) -> Result<()> {
+    // Phase 1: verify EVERYTHING before flipping ANYTHING.
+    let mut custody: Vec<String> = Vec::new();
+    for dir in dirs {
+        for key in crate::cache::scan_live_staged_custody(dir, 16).await? {
+            custody.push(format!("{}: {key}", dir.display()));
+        }
+    }
+    if !custody.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "staging drain barrier refused (KD-8): {} live staged write-custody unit(s) \
+             remain — mount the filesystem, let writeback drain (sync + clean unmount), \
+             then re-run; nothing was changed. Units: {:?}",
+            custody.len(),
+            custody
+        )));
+    }
+    // Phase 2: restamp.
+    for dir in dirs {
+        match crate::cache::read_staging_generation_marker(dir).await? {
+            Some(g) if g == old_generation || g == new_generation => {
+                crate::cache::write_staging_generation_marker(dir, new_generation).await?;
+            }
+            _ => {
+                // Foreign/missing binding: wipe + stamp fresh (the
+                // content was condemned either way).
+                stamp_staging_dir(dir).await?;
+                crate::cache::write_staging_generation_marker(dir, new_generation).await?;
+            }
+        }
+    }
+    crate::fuse_client::METRICS
+        .staging_drain_barriers
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// One member's observation for the membership verbs: path + stamp.
+struct MemberObs {
+    path: String,
+    stamp: crate::meta_backend::kv::checkpoint::MembershipStamp,
+}
+
+/// Observe an all-stamped coherent-uuid set (membership verbs tolerate
+/// epoch/count spread — THEY are the §5.5.2b re-run that converges it).
+async fn observe_stamped_members(meta_lvs: &[String]) -> Result<Vec<MemberObs>> {
+    let obs = crate::meta_backend::observe_meta_set(meta_lvs).await?;
+    let mut out = Vec::with_capacity(obs.len());
+    for o in obs {
+        let Some(stamp) = o.stamp else {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "metadata volume {} carries no §5.5.1a membership stamp — meta membership \
+                 changes need a `format --meta-slots` set (a legacy set's routing width \
+                 equals its volume count: every slot is its host's only slot, so there is \
+                 nothing a new member could take — the W-granularity law, \
+                 design-volume-lifecycle §5.5.1/operations.md)",
+                o.path
+            )));
+        };
+        out.push(MemberObs {
+            path: o.path,
+            stamp,
+        });
+    }
+    let first_uuid = out[0].stamp.set_uuid;
+    let first_width = out[0].stamp.routing_width;
+    for m in &out[1..] {
+        if m.stamp.set_uuid != first_uuid || m.stamp.routing_width != first_width {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "metadata volumes {} and {} disagree on set identity/width — not one set",
+                out[0].path, m.path
+            )));
+        }
+    }
+    Ok(out)
+}
+
+/// Record-count census of one slot's keyspace on its host (the
+/// "most-loaded" ranking for `--take-slots k`).
+async fn slot_record_count(path: &str, slot: u16, native: Option<u16>) -> Result<u64> {
+    let be = crate::meta_backend::kv::backend::KvMetaBackend::open_probe(Path::new(path)).await?;
+    let ks = crate::meta_backend::slot_migration::SlotKeyspace::of(slot, native);
+    let mut n = 0u64;
+    crate::meta_backend::slot_migration::scan_slot_keyspace(&be, &ks, |_, _, _| {
+        n += 1;
+        Ok(())
+    })
+    .await?;
+    Ok(n)
+}
+
+/// `squeezefs volume add-meta` — the OFFLINE D0-guarded coordinator
+/// (design-volume-lifecycle §5.5.2 Add, the VL4 `remove_data_volume_
+/// offline` posture): KD-8 staging barrier → format the new member →
+/// bulk-copy the taken slots into its guest keyspaces (write 0) → the
+/// new member's claim stamp @E (target-first) → every old member's
+/// stamp @E → source-keyspace teardown → generation restamp + config
+/// mirror. Idempotent: a crash anywhere re-runs to convergence (counts
+/// disagree ⇒ mounts refuse loud until then). Returns the taken slots.
+pub async fn add_meta_volume(
+    meta_lvs: &[String],
+    device: &str,
+    take: &TakeSlots,
+) -> Result<Vec<u16>> {
+    use crate::meta_backend::kv::backend::KvMetaBackend;
+    use crate::meta_backend::slot_migration::{
+        bulk_copy_slot, teardown_slot_keyspace, SlotKeyspace,
+    };
+    for path in meta_lvs {
+        crate::meta_backend::kv::builder::format_preflight(Path::new(path), true)
+            .await
+            .map_err(|e| {
+                SqueezefsError::InvalidOperation(format!("volume add-meta refused: {e}"))
+            })?;
+    }
+    if meta_lvs.iter().any(|p| canon(p) == canon(device)) {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "device {device} is already a member of the metadata set"
+        )));
+    }
+    let members = observe_stamped_members(meta_lvs).await?;
+    let width = members[0].stamp.routing_width;
+    let old_count = members.len() as u16;
+    // Config-less sets (library/test harnesses format volumes without
+    // the bootstrap xattr) simply have no staging dirs to barrier.
+    let cfg = read_volume_format_config(meta_lvs).await.ok();
+
+    // KD-8 phase 1: custody must be empty BEFORE anything flips.
+    let staging_dirs = cfg
+        .as_ref()
+        .and_then(|c| c.disk_cache_paths.clone())
+        .unwrap_or_default();
+    let old_gen = crate::meta_backend::volume_set_generation(meta_lvs).await?;
+    let mut custody = Vec::new();
+    for dir in &staging_dirs {
+        for key in crate::cache::scan_live_staged_custody(dir, 16).await? {
+            custody.push(format!("{}: {key}", dir.display()));
+        }
+    }
+    if !custody.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "volume add-meta refused (KD-8 staging drain barrier): live staged \
+             write-custody remains — mount, sync, unmount cleanly, then re-run. \
+             Units: {custody:?}"
+        )));
+    }
+
+    // Resume detection: is the device already a stamped member of THIS
+    // set (a crashed prior attempt)?
+    let dev_stamp =
+        match crate::meta_backend::kv::superblock::classify_volume(Path::new(device)).await {
+            Ok(crate::meta_backend::kv::superblock::VolumeFormat::V3(sb)) => {
+                crate::meta_backend::kv::checkpoint::read_newest_ledger(
+                    Path::new(device),
+                    sb.root_ledger.start,
+                )
+                .await?
+                .and_then(|r| r.membership_stamp)
+                .filter(|st| st.set_uuid == members[0].stamp.set_uuid)
+            }
+            _ => None,
+        };
+    let (epoch, new_position, resume) = match &dev_stamp {
+        Some(st) => (st.set_epoch, st.member_position, true),
+        None => (
+            members.iter().map(|m| m.stamp.set_epoch).max().unwrap_or(1) + 1,
+            members
+                .iter()
+                .map(|m| m.stamp.member_position)
+                .max()
+                .unwrap_or(0)
+                + 1,
+            false,
+        ),
+    };
+
+    // Slot selection: explicit list, resumed claim, or the k-most-loaded
+    // census — a source may never lose its LAST slot.
+    let hosted_by = |m: &MemberObs| m.stamp.slots_hosted.clone();
+    let taken: Vec<u16> = match (&dev_stamp, take) {
+        (Some(st), _) if !st.slots_hosted.is_empty() => st.slots_hosted.clone(),
+        (_, TakeSlots::List(slots)) => {
+            let mut slots = slots.clone();
+            slots.sort_unstable();
+            slots.dedup();
+            for &s in &slots {
+                if u32::from(s) >= width {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "slot {s} outside the frozen routing width {width}"
+                    )));
+                }
+            }
+            for m in &members {
+                let keeps = hosted_by(m).iter().filter(|s| !slots.contains(s)).count();
+                if keeps == 0 && !hosted_by(m).is_empty() {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "taking {slots:?} would leave {} hosting nothing — every member \
+                         keeps at least one slot (use `volume remove-meta` to retire a \
+                         member)",
+                        m.path
+                    )));
+                }
+            }
+            slots
+        }
+        (_, TakeSlots::Count(k)) => {
+            if *k == 0 {
+                return Err(SqueezefsError::InvalidOperation(
+                    "--take-slots 0 takes nothing — an added meta volume is only useful \
+                     WITH slot migration (design-volume-lifecycle §5.5.2)"
+                        .to_string(),
+                ));
+            }
+            // Candidates: every slot whose host keeps another one.
+            let mut cands: Vec<(u64, u16)> = Vec::new();
+            for m in &members {
+                let hosted = hosted_by(m);
+                if hosted.len() < 2 {
+                    continue;
+                }
+                // A member may lose all but one slot.
+                let native = m.stamp.resolved_native_slot();
+                let mut loads = Vec::new();
+                for &s in &hosted {
+                    loads.push((slot_record_count(&m.path, s, native).await?, s));
+                }
+                loads.sort_by(|a, b| b.0.cmp(&a.0));
+                loads.pop(); // the host keeps its least-loaded slot
+                cands.extend(loads);
+            }
+            cands.sort_by(|a, b| b.0.cmp(&a.0));
+            if (cands.len() as u32) < *k {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "--take-slots {k}: only {} slot(s) are takeable (every member keeps \
+                     at least one) — the W-granularity limit (operations.md)",
+                    cands.len()
+                )));
+            }
+            cands.truncate(*k as usize);
+            cands.into_iter().map(|(_, s)| s).collect()
+        }
+    };
+
+    // Format the new member (fresh runs only): a HOSTLESS transient
+    // stamp at epoch E — the claim (slots + cursors) lands after the
+    // copy, per the §5.5.2b write-0-before-claim order.
+    let node_size = {
+        match crate::meta_backend::kv::superblock::classify_volume(Path::new(&members[0].path))
+            .await?
+        {
+            crate::meta_backend::kv::superblock::VolumeFormat::V3(sb) => sb.node_size as usize,
+            _ => unreachable!("observed members are v3"),
+        }
+    };
+    if !resume {
+        let volume_len = crate::nvme_dev::device_capacity_bytes(device)
+            .or_else(|_| std::fs::metadata(device).map(|m| m.len()))
+            .map_err(|e| {
+                SqueezefsError::InvalidOperation(format!("cannot size device {device}: {e}"))
+            })?;
+        let opts = crate::meta_backend::kv::builder::FormatV3Options {
+            node_size,
+            journal_len_override: None,
+            force: false, // a formatted device refuses — never silently destroy
+            full_wipe: false,
+            format_config_xattr: None,
+        };
+        crate::meta_backend::kv::builder::format_v3_stamped(
+            Path::new(device),
+            volume_len,
+            &opts,
+            crate::meta_backend::kv::checkpoint::MembershipStamp {
+                set_uuid: members[0].stamp.set_uuid,
+                set_epoch: epoch,
+                member_position: new_position,
+                member_count: old_count + 1,
+                routing_width: width,
+                slots_hosted: Vec::new(),
+                native_slot: None,
+                slot_cursors: Vec::new(),
+            },
+        )
+        .await?;
+    }
+
+    // Bit 4 on every participant BEFORE any extended stamp/guest record.
+    for path in meta_lvs.iter().map(String::as_str).chain([device]) {
+        crate::meta_backend::kv::superblock::set_slot_migration_bit(Path::new(path)).await?;
+    }
+
+    // Open the whole working set with D0 claims: sources + the target.
+    let target = KvMetaBackend::open(Path::new(device)).await?;
+    let mut sources: Vec<(String, std::sync::Arc<KvMetaBackend>)> = Vec::new();
+    for m in &members {
+        let be = KvMetaBackend::open(Path::new(&m.path)).await?;
+        sources.push((m.path.clone(), be));
+    }
+    let body = async {
+        // Record keys embed the seeded hashes: the whole working set
+        // must share one seed (VL5b set-wide-seed formats).
+        for (_, be) in &sources {
+            crate::meta_backend::slot_migration::check_hash_seed_uniform(be, &target)?;
+        }
+        // Copy each taken slot (source = the member whose stamp claims
+        // it at the highest epoch; a released source skips the copy).
+        let mut cursors: Vec<(u16, u64)> = Vec::new();
+        for &slot in &taken {
+            let src = sources
+                .iter()
+                .filter_map(|(p, be)| {
+                    be.membership_stamp()
+                        .filter(|st| st.slots_hosted.contains(&slot))
+                        .map(|st| (p.clone(), be.clone(), st))
+                })
+                .max_by_key(|(_, _, st)| st.set_epoch);
+            let Some((_, src_be, src_stamp)) = src else {
+                // Resume path: the source already released — the copy +
+                // claim landed durably before the crash.
+                let cur = target.guest_cursor_snapshot(slot).unwrap_or(2);
+                cursors.push((slot, cur));
+                continue;
+            };
+            let src_ks = SlotKeyspace::of(slot, src_stamp.resolved_native_slot());
+            let dst_ks = SlotKeyspace::of(slot, None);
+            teardown_slot_keyspace(&target, &dst_ks).await?; // re-run wipe
+            bulk_copy_slot(&src_be, &src_ks, &target, &dst_ks).await?;
+            let cur = if src_ks.legacy {
+                src_be.next_ino()
+            } else {
+                src_be.guest_cursor_snapshot(slot).unwrap_or(2)
+            };
+            target.install_guest_cursor(slot, cur);
+            cursors.push((slot, cur));
+        }
+
+        // Write 1 (target-first): the new member's claim @E, durable.
+        let mut claim = target.membership_stamp().ok_or_else(|| {
+            SqueezefsError::InvalidOperation("new member lost its stamp".to_string())
+        })?;
+        claim.set_epoch = epoch;
+        claim.member_count = old_count + 1;
+        claim.member_position = new_position;
+        claim.slots_hosted = taken.clone();
+        claim.native_slot = None;
+        claim.slot_cursors = cursors;
+        target.set_membership_stamp(claim);
+        target
+            .checkpoint_now()
+            .await
+            .map_err(|e| SqueezefsError::InvalidOperation(format!("claim write failed: {e}")))?;
+
+        // Write 2..n: every OLD member's stamp @E (count n+1, minus the
+        // slots it lost).
+        for (_, be) in &sources {
+            let Some(mut st) = be.membership_stamp() else {
+                continue;
+            };
+            st.native_slot = st.resolved_native_slot();
+            st.set_epoch = epoch;
+            st.member_count = old_count + 1;
+            st.slots_hosted.retain(|s| !taken.contains(s));
+            st.slot_cursors.retain(|(s, _)| !taken.contains(s));
+            for s in &taken {
+                be.remove_guest_cursor(*s);
+            }
+            be.set_membership_stamp(st);
+            be.checkpoint_now().await.map_err(|e| {
+                SqueezefsError::InvalidOperation(format!("member re-stamp failed: {e}"))
+            })?;
+        }
+
+        // Teardown: the sources' now-guest-hosted keyspaces.
+        for &slot in &taken {
+            for (_, be) in &sources {
+                let Some(st) = be.membership_stamp() else {
+                    continue;
+                };
+                let ks = SlotKeyspace::of(slot, st.resolved_native_slot());
+                teardown_slot_keyspace(be, &ks).await?;
+            }
+        }
+        Ok::<(), SqueezefsError>(())
+    }
+    .await;
+    // Release every claim on all paths.
+    for (_, be) in &sources {
+        if let Err(e) = be.shutdown().await {
+            log::warn!("releasing guard after add-meta: {e}");
+        }
+    }
+    if let Err(e) = target.shutdown().await {
+        log::warn!("releasing target guard after add-meta: {e}");
+    }
+    body?;
+
+    // KD-8 phase 2 + mirror: the NEW set's generation restamps staging;
+    // the FormatConfig mirror records the new membership.
+    let mut new_uris: Vec<String> = meta_lvs.to_vec();
+    new_uris.push(device.to_string());
+    let new_gen = crate::meta_backend::volume_set_generation(&new_uris).await?;
+    staging_drain_barrier(&staging_dirs, &old_gen, &new_gen).await?;
+    update_meta_config_mirror(&new_uris).await?;
+    Ok(taken)
+}
+
+/// `squeezefs volume remove-meta` — the OFFLINE D0-guarded coordinator:
+/// §5.2 meta-side capacity preflight → KD-8 barrier → migrate every
+/// victim-hosted slot to survivors → SURVIVORS-FIRST stamps @E →
+/// the victim's retirement TOMBSTONE last (§5.5.2b epoch completeness)
+/// → generation restamp + config mirror. `victim` is the member's
+/// device path as listed in the URI.
+pub async fn remove_meta_volume(meta_lvs: &[String], victim: &str) -> Result<()> {
+    use crate::meta_backend::kv::backend::KvMetaBackend;
+    use crate::meta_backend::slot_migration::{
+        bulk_copy_slot, teardown_slot_keyspace, SlotKeyspace,
+    };
+    for path in meta_lvs {
+        crate::meta_backend::kv::builder::format_preflight(Path::new(path), true)
+            .await
+            .map_err(|e| {
+                SqueezefsError::InvalidOperation(format!("volume remove-meta refused: {e}"))
+            })?;
+    }
+    let members = observe_stamped_members(meta_lvs).await?;
+    if members.len() < 2 {
+        return Err(SqueezefsError::InvalidOperation(
+            "cannot remove the last metadata volume".to_string(),
+        ));
+    }
+    let victim_idx = members
+        .iter()
+        .position(|m| canon(&m.path) == canon(victim))
+        .ok_or_else(|| {
+            SqueezefsError::InvalidOperation(format!(
+                "{victim} is not a member of the metadata set"
+            ))
+        })?;
+    let cfg = read_volume_format_config(meta_lvs).await.ok();
+    let staging_dirs = cfg
+        .as_ref()
+        .and_then(|c| c.disk_cache_paths.clone())
+        .unwrap_or_default();
+    let old_gen = crate::meta_backend::volume_set_generation(meta_lvs).await?;
+    let survivors_paths: Vec<String> = members
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != victim_idx)
+        .map(|(_, m)| m.path.clone())
+        .collect();
+    let old_count = members.len() as u16;
+    let epoch = members.iter().map(|m| m.stamp.set_epoch).max().unwrap_or(1) + 1;
+    let victim_slots = members[victim_idx].stamp.slots_hosted.clone();
+    let victim_native = members[victim_idx].stamp.resolved_native_slot();
+
+    // §5.2 meta-side capacity preflight (honest refusal with numbers):
+    // victim used extents must fit the survivors' free extents minus the
+    // checkpoint headroom (clamped to a quarter of the smallest
+    // survivor's heap — the working set can never exceed the volume).
+    {
+        let victim_be =
+            crate::meta_backend::kv::backend::KvMetaBackend::open_probe(Path::new(victim)).await?;
+        let victim_used = victim_be
+            .superblock()
+            .total_extents()
+            .saturating_sub(victim_be.free_extents());
+        let node_size = u64::from(victim_be.superblock().node_size);
+        drop(victim_be);
+        let mut avail = 0u64;
+        let mut headroom = 0u64;
+        for p in &survivors_paths {
+            let be = KvMetaBackend::open_probe(Path::new(p)).await?;
+            avail = avail.saturating_add(be.free_extents());
+            let max_dirty = std::env::var("SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(4096);
+            headroom = headroom.max((2 * max_dirty).min(be.superblock().total_extents() / 4));
+        }
+        if avail < victim_used.saturating_add(headroom) {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "volume remove-meta preflight refused (§5.2 meta side): survivors' free \
+                 extents {avail} < victim used {victim_used} + checkpoint headroom \
+                 {headroom} (extents of {node_size} B) — grow the survivors first; \
+                 nothing was changed"
+            )));
+        }
+    }
+
+    // KD-8 phase 1.
+    let mut custody = Vec::new();
+    for dir in &staging_dirs {
+        for key in crate::cache::scan_live_staged_custody(dir, 16).await? {
+            custody.push(format!("{}: {key}", dir.display()));
+        }
+    }
+    if !custody.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "volume remove-meta refused (KD-8 staging drain barrier): live staged \
+             write-custody remains — mount, sync, unmount cleanly, then re-run. \
+             Units: {custody:?}"
+        )));
+    }
+
+    // Bit 4 everywhere (extended stamps + guest records ahead).
+    for m in &members {
+        crate::meta_backend::kv::superblock::set_slot_migration_bit(Path::new(&m.path)).await?;
+    }
+
+    // Open the working set (D0 claims).
+    let victim_be = KvMetaBackend::open(Path::new(victim)).await?;
+    let mut survivors: Vec<(String, std::sync::Arc<KvMetaBackend>)> = Vec::new();
+    for p in &survivors_paths {
+        survivors.push((p.clone(), KvMetaBackend::open(Path::new(p)).await?));
+    }
+    let body = async {
+        // Migrate every victim-hosted slot to the emptiest survivor.
+        let mut placed: Vec<(u16, usize, u64)> = Vec::new(); // (slot, survivor idx, cursor)
+        for &slot in &victim_slots {
+            let (ti, target) = survivors
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, be))| {
+                    // v1: never migrate a slot back onto its origin's
+                    // legacy keyspace.
+                    be.membership_stamp()
+                        .and_then(|st| st.resolved_native_slot())
+                        != Some(slot)
+                })
+                .max_by_key(|(_, (_, be))| be.free_extents())
+                .map(|(i, (_, be))| (i, be.clone()))
+                .ok_or_else(|| {
+                    SqueezefsError::InvalidOperation(format!(
+                        "no survivor can host slot {slot} (v1 refuses migrating a slot \
+                         back onto its origin volume)"
+                    ))
+                })?;
+            crate::meta_backend::slot_migration::check_hash_seed_uniform(&victim_be, &target)?;
+            let src_ks = SlotKeyspace::of(slot, victim_native);
+            let dst_ks = SlotKeyspace::of(slot, None);
+            teardown_slot_keyspace(&target, &dst_ks).await?; // re-run wipe
+            bulk_copy_slot(&victim_be, &src_ks, &target, &dst_ks).await?;
+            let cur = if src_ks.legacy {
+                victim_be.next_ino()
+            } else {
+                victim_be.guest_cursor_snapshot(slot).unwrap_or(2)
+            };
+            target.install_guest_cursor(slot, cur);
+            placed.push((slot, ti, cur));
+        }
+
+        // SURVIVORS-FIRST stamps @E (count n−1, positions kept, plus the
+        // slots they gained) — the victim's disappearance is only ever
+        // expressed after the surviving set is fully self-describing.
+        for (i, (_, be)) in survivors.iter().enumerate() {
+            let Some(mut st) = be.membership_stamp() else {
+                continue;
+            };
+            st.native_slot = st.resolved_native_slot();
+            st.set_epoch = epoch;
+            st.member_count = old_count - 1;
+            for (slot, ti, cur) in &placed {
+                if *ti == i {
+                    if !st.slots_hosted.contains(slot) {
+                        st.slots_hosted.push(*slot);
+                        st.slots_hosted.sort_unstable();
+                    }
+                    st.slot_cursors.retain(|(s, _)| s != slot);
+                    st.slot_cursors.push((*slot, *cur));
+                }
+            }
+            st.slot_cursors.sort_unstable_by_key(|(s, _)| *s);
+            be.set_membership_stamp(st);
+            be.checkpoint_now().await.map_err(|e| {
+                SqueezefsError::InvalidOperation(format!("survivor re-stamp failed: {e}"))
+            })?;
+        }
+
+        // VICTIM-LAST: the retirement tombstone (member_count = 0 —
+        // discovery refuses it loud by name if ever listed again).
+        let mut tomb = members[victim_idx].stamp.clone();
+        tomb.set_epoch = epoch;
+        tomb.member_count = 0;
+        tomb.slots_hosted = Vec::new();
+        tomb.slot_cursors = Vec::new();
+        tomb.native_slot = victim_native;
+        victim_be.set_membership_stamp(tomb);
+        victim_be.checkpoint_now().await.map_err(|e| {
+            SqueezefsError::InvalidOperation(format!("victim tombstone failed: {e}"))
+        })?;
+        Ok::<(), SqueezefsError>(())
+    }
+    .await;
+    for (_, be) in &survivors {
+        if let Err(e) = be.shutdown().await {
+            log::warn!("releasing survivor guard after remove-meta: {e}");
+        }
+    }
+    if let Err(e) = victim_be.shutdown().await {
+        log::warn!("releasing victim guard after remove-meta: {e}");
+    }
+    body?;
+
+    // KD-8 phase 2 + mirror on the survivor set.
+    let new_gen = crate::meta_backend::volume_set_generation(&survivors_paths).await?;
+    staging_drain_barrier(&staging_dirs, &old_gen, &new_gen).await?;
+    update_meta_config_mirror(&survivors_paths).await?;
+    Ok(())
+}
+
+/// Rewrite the informational FormatConfig meta mirror (width / slot map
+/// / member records) from the authoritative stamps — shared tail of the
+/// membership verbs. Best-effort mirror content, but committed through
+/// the guarded routed open (the config xattr is real state).
+async fn update_meta_config_mirror(meta_lvs: &[String]) -> Result<()> {
+    use crate::meta_backend::Metadata;
+    let disc = crate::meta_backend::discover_meta_set(meta_lvs).await?;
+    let routed = crate::meta_backend::open_routed_meta_set(meta_lvs).await?;
+    let out = async {
+        let Some(bytes) = routed
+            .getxattr(1, crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR)
+            .await?
+        else {
+            return Ok(());
+        };
+        let Ok(mut cfg) = serde_json::from_slice::<crate::FormatConfig>(&bytes) else {
+            return Ok(());
+        };
+        cfg.meta_routing_width = Some(disc.routing_width as u32);
+        let positions: Vec<u16> = {
+            let obs = crate::meta_backend::observe_meta_set(&disc.ordered_paths).await?;
+            obs.iter()
+                .map(|o| o.stamp.as_ref().map(|s| s.member_position).unwrap_or(0))
+                .collect()
+        };
+        cfg.meta_slot_map = Some(disc.slot_to_volume.iter().map(|&v| positions[v]).collect());
+        cfg.meta_volumes = Some(
+            disc.ordered_paths
+                .iter()
+                .zip(&positions)
+                .map(|(p, &pos)| crate::MetaVolumeRecord {
+                    id: format!("meta-pos-{pos}"),
+                    backing_dev: p.clone(),
+                    member_position: pos,
+                    added_ts: std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                })
+                .collect(),
+        );
+        let bytes = serde_json::to_vec(&cfg).map_err(|e| {
+            SqueezefsError::InvalidOperation(format!("config mirror serialize: {e}"))
+        })?;
+        routed
+            .setxattr(
+                1,
+                crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
+                &bytes,
+            )
+            .await?;
+        Ok::<(), SqueezefsError>(())
+    }
+    .await;
+    for be in &routed.volumes {
+        if let Err(e) = be.shutdown().await {
+            log::warn!("releasing guard after the meta config mirror update: {e}");
+        }
+    }
+    out
 }

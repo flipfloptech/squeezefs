@@ -118,12 +118,26 @@ pub const FEATURE_INCOMPAT_KV_GUEST_SLOTS: u64 = 1 << 2;
 /// the [`FEATURES_INCOMPAT_KNOWN`] gate.
 pub const FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE: u64 = 1 << 3;
 
+/// `features_incompat` bit 4: the volume carries **VL5b-extended
+/// membership stamps** (explicit `native_slot` + per-slot ino cursors —
+/// design-volume-lifecycle §5.5.2, PR VL5b) and possibly guest-keyspace
+/// records. An extended stamp fails the VL5a decoder's
+/// length-consistency equation and would **decode as absent** (silent
+/// fallback to an older ledger slot — stale roots), so the §5.5.1a
+/// ordering invariant recurs one generation later: **(1)** this bit is
+/// written and barriered durably **before (2)** the volume's first
+/// extended ledger slot (or first guest-keyspace record). VL5a-mask
+/// binaries (bits 0..=3) refuse loud at this gate. Never set on
+/// non-participating volumes — they stay byte-identical.
+pub const FEATURE_INCOMPAT_KV_SLOT_MIGRATION: u64 = 1 << 4;
+
 /// Incompat feature bits this binary understands. Any other set bit
 /// refuses the mount naming the bit (§6.1).
 pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
     | FEATURE_INCOMPAT_NODE_SEQ_WATERMARK
     | FEATURE_INCOMPAT_KV_GUEST_SLOTS
-    | FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE;
+    | FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE
+    | FEATURE_INCOMPAT_KV_SLOT_MIGRATION;
 
 /// The §5.5.1a ledger-slot space cap: at most 64 hosted slots per volume,
 /// so a worst-case root-ledger record (24 B header + 34 B fixed prefix +
@@ -744,4 +758,13 @@ pub async fn set_volume_lifecycle_bit(path: &Path) -> Result<bool, KvError> {
 /// zeroed first, so no crash prefix is mountable by any binary at all.
 pub async fn set_guest_slots_bit(path: &Path) -> Result<bool, KvError> {
     set_incompat_bit(path, FEATURE_INCOMPAT_KV_GUEST_SLOTS, "guest-slots").await
+}
+
+/// Stamp [`FEATURE_INCOMPAT_KV_SLOT_MIGRATION`] on `path`'s superblock —
+/// step **(1)** of the VL5b bit-before-first-extended-record ordering
+/// invariant (see the constant's doc). Callers must invoke this (and let
+/// the write land durably) **before** the volume's first VL5b-extended
+/// ledger slot or guest-keyspace record is written.
+pub async fn set_slot_migration_bit(path: &Path) -> Result<bool, KvError> {
+    set_incompat_bit(path, FEATURE_INCOMPAT_KV_SLOT_MIGRATION, "slot-migration").await
 }

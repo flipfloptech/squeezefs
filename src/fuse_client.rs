@@ -1890,6 +1890,28 @@ pub struct Metrics {
     /// bind_staging_generation`). One increment per discarded dir; exactly
     /// once per dir after a reformat, 0 on every warm restart.
     pub staging_generation_discards: Align64<AtomicU64>,
+    /// PR VL5b (§5.5.2a): mutating routed-meta ops parked at a CLOSED
+    /// per-slot cutover gate (before any 4a lock — planned, bounded
+    /// parks; NEVER escalated to `disabled_volumes`). One increment per
+    /// park event.
+    pub meta_slot_gate_parked_commits: Align64<AtomicU64>,
+    /// PR VL5b (§5.5.2): slot migrations completed (flip + teardown).
+    pub meta_slot_migrations: Align64<AtomicU64>,
+    /// PR VL5b: records bulk-copied by slot migrations (engagement
+    /// instrument for migration rows).
+    pub meta_slot_records_copied: Align64<AtomicU64>,
+    /// PR VL5b: delta keys captured by the conveyor pass-task tee and
+    /// re-read at apply.
+    pub meta_slot_delta_keys: Align64<AtomicU64>,
+    /// PR VL5b: side-log overflows (each flips the round to a fresh full
+    /// snapshot; three consecutive abort the migration loud).
+    pub meta_slot_delta_overflows: Align64<AtomicU64>,
+    /// PR VL5b: the widest cutover window (gate close → reopen) in
+    /// milliseconds — the G-VL-4 p99-window instrument (max gauge).
+    pub meta_slot_cutover_ms_max: Align64<AtomicU64>,
+    /// KD-8: staging drain barriers run before meta set changes (each =
+    /// verify-custody-empty + generation restamp).
+    pub staging_drain_barriers: Align64<AtomicU64>,
     /// Reads of a `staged` file whose payload is GONE — no staging-ring
     /// entry (crash-torn → discarded by segment index recovery, or lost
     /// before a kill) and no promoted mapping. Served as size-consistent
@@ -3594,6 +3616,13 @@ impl SqueezefsFilesystem {
                 "bg_spawn_rejected": METRICS.bg_spawn_rejected.load(Ordering::Relaxed),
                 "uring_queue_full": METRICS.uring_queue_full.load(Ordering::Relaxed),
                 "staging_generation_discards": METRICS.staging_generation_discards.load(Ordering::Relaxed),
+                "meta_slot_gate_parked_commits": METRICS.meta_slot_gate_parked_commits.load(Ordering::Relaxed),
+                "meta_slot_migrations": METRICS.meta_slot_migrations.load(Ordering::Relaxed),
+                "meta_slot_records_copied": METRICS.meta_slot_records_copied.load(Ordering::Relaxed),
+                "meta_slot_delta_keys": METRICS.meta_slot_delta_keys.load(Ordering::Relaxed),
+                "meta_slot_delta_overflows": METRICS.meta_slot_delta_overflows.load(Ordering::Relaxed),
+                "meta_slot_cutover_ms_max": METRICS.meta_slot_cutover_ms_max.load(Ordering::Relaxed),
+                "staging_drain_barriers": METRICS.staging_drain_barriers.load(Ordering::Relaxed),
                 "staged_payload_lost_reads": METRICS.staged_payload_lost_reads.load(Ordering::Relaxed),
                 "staged_identity_retries": METRICS.staged_identity_retries.load(Ordering::Relaxed),
                 "nvme_unaligned_write_fallbacks": METRICS.nvme_unaligned_write_fallbacks.load(Ordering::Relaxed),
@@ -11483,8 +11512,13 @@ pub async fn get_volume_status(meta_lv_path: &str) -> Result<serde_json::Value, 
         std::path::Path::new(meta_lv_path),
     )
     .await?;
+    // PR VL5b: the config record rides the slot-0 keyspace (guest-
+    // namespaced after a slot-0 migration).
     let val_opt = backend
-        .getxattr(1, crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR)
+        .getxattr(
+            backend.slot0_root_ino(),
+            crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
+        )
         .await?;
     let val = val_opt.ok_or_else(|| {
         SqueezefsError::Io(std::io::Error::new(

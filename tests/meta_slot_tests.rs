@@ -106,6 +106,9 @@ fn stamp(pos: u16, count: u16, width: u32, epoch: u64, uuid: [u8; 16]) -> Member
         member_count: count,
         routing_width: width,
         slots_hosted: (0..width as u16).filter(|s| s % count == pos).collect(),
+        // VL5a-shaped (unextended) stamps — byte-identity preserved.
+        native_slot: None,
+        slot_cursors: Vec::new(),
     }
 }
 
@@ -351,6 +354,8 @@ proptest! {
             member_count,
             routing_width,
             slots_hosted: (0..n_slots as u16).collect(),
+            native_slot: None,
+            slot_cursors: Vec::new(),
         });
         let r = rec(seq, n_roots, st);
         let img = r.encode_slot().expect("encodes");
@@ -376,6 +381,8 @@ fn test_encode_slot_boundary_at_64_hosted_slots() {
             member_count: 64,
             routing_width: 4096,
             slots_hosted: (0..MEMBERSHIP_MAX_HOSTED_SLOTS as u16).collect(),
+            native_slot: None,
+            slot_cursors: Vec::new(),
         }),
         ..rec(1, 197, None)
     };
@@ -390,6 +397,8 @@ fn test_encode_slot_boundary_at_64_hosted_slots() {
             member_count: 1,
             routing_width: 4096,
             slots_hosted: (0..(MEMBERSHIP_MAX_HOSTED_SLOTS as u16 + 1)).collect(),
+            native_slot: None,
+            slot_cursors: Vec::new(),
         }),
         ..rec(1, 3, None)
     };
@@ -753,7 +762,10 @@ async fn test_discovery_disagreements_refuse_loud_naming_volumes() {
         "refusal must state the expected vs listed member counts: {msg}"
     );
 
-    // Torn/mixed epochs (crash mid-protocol) — refuse with the repair verb.
+    // Epoch spread (PR VL5b amendment — the VL5a refusal was explicitly
+    // temporary: "the §5.5.2b epoch resolution lands with VL5b"): a
+    // slot flip bumps only its participants, so mixed epochs over
+    // uniquely-claimed slots now MOUNT via per-slot highest-epoch-wins.
     let e = make_file(dir.path(), "ep_e", VOL_LEN);
     let f = make_file(dir.path(), "ep_f", VOL_LEN);
     let uuid3 = [3u8; 16];
@@ -769,22 +781,38 @@ async fn test_discovery_disagreements_refuse_loud_naming_volumes() {
         &f,
         VOL_LEN,
         &opts(),
-        stamp(1, 2, 2, 2, uuid3), // epoch 2 vs 1
+        stamp(1, 2, 2, 2, uuid3), // epoch 2 vs 1 — a legitimate rest state
     )
     .await
     .unwrap();
     let paths = vec![e.display().to_string(), f.display().to_string()];
+    let disc = discover_meta_set(&paths)
+        .await
+        .expect("epoch spread with unique claims resolves (§5.5.2b)");
+    assert_eq!(disc.slot_to_volume, vec![0, 1]);
+    // A SAME-epoch dual claim stays a loud refusal (corruption by
+    // construction — one coordinator, one flip per slot at a time).
+    let e2 = make_file(dir.path(), "dc_e", VOL_LEN);
+    let f2 = make_file(dir.path(), "dc_f", VOL_LEN);
+    let uuid3b = [13u8; 16];
+    let mut st_a = stamp(0, 2, 2, 3, uuid3b);
+    st_a.slots_hosted = vec![0, 1];
+    let mut st_b = stamp(1, 2, 2, 3, uuid3b);
+    st_b.slots_hosted = vec![1];
+    squeezefs::meta_backend::kv::builder::format_v3_stamped(&e2, VOL_LEN, &opts(), st_a)
+        .await
+        .unwrap();
+    squeezefs::meta_backend::kv::builder::format_v3_stamped(&f2, VOL_LEN, &opts(), st_b)
+        .await
+        .unwrap();
+    let paths = vec![e2.display().to_string(), f2.display().to_string()];
     let err = discover_meta_set(&paths)
         .await
-        .expect_err("mixed epochs must refuse");
+        .expect_err("a same-epoch dual claim must refuse");
     let msg = format!("{err}");
     assert!(
-        msg.contains("repair-set"),
-        "torn-epoch refusal must name the recovery verb: {msg}"
-    );
-    assert!(
-        msg.contains(&e.display().to_string()) && msg.contains(&f.display().to_string()),
-        "torn-epoch refusal must name the volumes: {msg}"
+        msg.contains(&e2.display().to_string()) && msg.contains(&f2.display().to_string()),
+        "same-epoch dual-claim refusal must name the volumes: {msg}"
     );
 
     // Different set uuids (a volume from another set).
@@ -908,8 +936,10 @@ async fn test_repair_set_restamps_coherent_state_and_refuses_incoherent() {
     assert!(disc.stamped);
     assert_eq!(disc.routing_width, 4);
 
-    // Incoherent (mixed epochs): repair REFUSES — VL5a fixes nothing it
-    // cannot prove coherent (the §5.5.2b epoch protocol is VL5b's).
+    // Epoch spread (PR VL5b amendment): repair-set now RESOLVES a
+    // slot-flip epoch spread — per-slot highest-epoch-wins, every member
+    // re-stamped at the max epoch (the VL5a refusal was explicitly
+    // "lands with VL5b").
     let ea = make_file(dir.path(), "e_a", VOL_LEN);
     let eb = make_file(dir.path(), "e_b", VOL_LEN);
     let uuid = [10u8; 16];
@@ -930,13 +960,19 @@ async fn test_repair_set_restamps_coherent_state_and_refuses_incoherent() {
     .await
     .unwrap();
     let paths = vec![ea.display().to_string(), eb.display().to_string()];
-    let err = squeezefs::config_ops::repair_meta_set(&paths)
+    let restamped = squeezefs::config_ops::repair_meta_set(&paths)
         .await
-        .expect_err("mixed epochs must refuse repair in VL5a");
-    assert!(
-        !format!("{err}").is_empty(),
-        "refusal carries the observed state"
+        .expect("an epoch-spread slot-flip state resolves in VL5b");
+    assert_eq!(
+        restamped.len(),
+        2,
+        "both members re-stamped at the max epoch"
     );
+    let disc = discover_meta_set(&paths)
+        .await
+        .expect("resolved set discovers");
+    assert!(disc.stamped);
+    assert_eq!(disc.set_epoch, 2, "resolution converges on the max epoch");
 }
 
 // ---------------------------------------------------------------------------

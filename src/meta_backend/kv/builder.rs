@@ -427,7 +427,7 @@ impl ImageBuilder {
             self.cfg.uuid,
             self.cfg.hash_seed,
         )?;
-        if self.membership_stamp.is_some() {
+        if let Some(stamp) = &self.membership_stamp {
             // PR VL5a: a slot-mapped member carries KV_GUEST_SLOTS. The
             // §5.5.1a bit-before-first-stamp invariant is subsumed by
             // format's flip discipline: sector 0 was zeroed above the
@@ -435,6 +435,12 @@ impl ImageBuilder {
             // stamped LAST behind the barrier — no crash prefix leaves a
             // stamped volume mountable by ANY binary without the bit.
             sb.features_incompat |= super::superblock::FEATURE_INCOMPAT_KV_GUEST_SLOTS;
+            if stamp.is_extended() {
+                // PR VL5b: an extended stamp (fresh add-meta member)
+                // additionally carries KV_SLOT_MIGRATION — same flip
+                // discipline subsumes the bit-first ordering.
+                sb.features_incompat |= super::superblock::FEATURE_INCOMPAT_KV_SLOT_MIGRATION;
+            }
         }
 
         // §9 quick-format hygiene: zero SB + ledger + ring + bitmap.
@@ -907,6 +913,18 @@ async fn format_v3_inner(
     let mut builder = ImageBuilder::new(BuilderConfig {
         node_size: opts.node_size,
         journal_len_override: opts.journal_len_override,
+        // PR VL5b: slot-mapped members share ONE set-wide hash seed,
+        // derived from the (random, per-format) set uuid — record keys
+        // must stay byte-identical across hosts or a migrated slot's
+        // seeded dentry/xattr hashes could never resolve on its new
+        // volume. Same §9 secrecy class as the per-volume seed (both
+        // are minted from fresh format-time randomness and both live
+        // plaintext in sector 0). Legacy formats keep their random
+        // per-volume seed verbatim.
+        hash_seed: match &stamp {
+            Some(st) => xxhash_rust::xxh3::xxh3_64(&st.set_uuid),
+            None => rand::random::<u64>(),
+        },
         ..BuilderConfig::new(opts.node_size)
     })?;
     // Root stamping: the root directory belongs to the INVOKING user

@@ -102,6 +102,16 @@ pub enum JobType {
     /// mover moving blocks from above-mean volumes toward under-filled
     /// ones (within the 10 pp band).
     Rebalance,
+    /// PR VL5b (§5.5.2): the `migrate-meta-slot` job — one routing
+    /// slot's records move to another meta volume via the online
+    /// migration engine (bulk copy + conveyor delta tee + cutover gate
+    /// + §5.5.2b flip). Crash-resume: the adopted record re-runs the
+    /// engine, which is idempotent across every crash window.
+    MigrateMetaSlot {
+        slot: u16,
+        /// Target volume index in the CANONICAL member order.
+        target_volume: usize,
+    },
 }
 
 impl JobType {
@@ -110,7 +120,9 @@ impl JobType {
     fn tasks_total(&self) -> u64 {
         match self {
             JobType::Noop { tasks, .. } => *tasks,
-            JobType::EvacuateVolume { .. } | JobType::Rebalance => 0,
+            JobType::EvacuateVolume { .. }
+            | JobType::Rebalance
+            | JobType::MigrateMetaSlot { .. } => 0,
         }
     }
 
@@ -1192,6 +1204,66 @@ impl JobFabric {
                     .await
             }
             JobType::Rebalance => self.run_mover(job_id, ctl, MoverObjective::Rebalance).await,
+            JobType::MigrateMetaSlot {
+                slot,
+                target_volume,
+            } => {
+                self.run_meta_slot_migration(job_id, ctl, slot, target_volume)
+                    .await
+            }
+        }
+    }
+
+    /// PR VL5b: drive the online slot-migration engine as a fabric job
+    /// (LOCAL POOL ONLY — the engine holds the coordinator's routed
+    /// backend; the wire's shard shape does not carry it, exactly like
+    /// the VL4 movers). Terminal states ride the durable record like
+    /// every job; a kill-9 resume re-runs the idempotent engine.
+    async fn run_meta_slot_migration(
+        &self,
+        job_id: &str,
+        ctl: &JobCtl,
+        slot: u16,
+        target_volume: usize,
+    ) {
+        if ctl.cancelled.load(Ordering::SeqCst) {
+            let _ = self.checkpoint_as(job_id, ctl, JobState::Cancelled).await;
+            ctl.set_state(JobState::Cancelled);
+            return;
+        }
+        let out = crate::meta_backend::slot_migration::migrate_slot(
+            &self.meta,
+            slot,
+            target_volume,
+            &crate::meta_backend::slot_migration::MigrationOptions::default(),
+            &crate::meta_backend::slot_migration::MigrationTestHooks::default(),
+        )
+        .await;
+        match out {
+            Ok(report) => {
+                ctl.done.store(1, Ordering::Relaxed);
+                ctl.tasks_total.store(1, Ordering::Relaxed);
+                let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
+                METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
+                ctl.set_state(JobState::Completed);
+                log::info!(
+                    "migrate-meta-slot {job_id}: slot {slot} → volume {target_volume}                      ({} records, {} delta keys, {} overflows, cutover {} ms)",
+                    report.records_copied,
+                    report.delta_keys,
+                    report.overflows,
+                    report.cutover_ms
+                );
+            }
+            Err(e) => {
+                log::error!("migrate-meta-slot {job_id} failed: {e}");
+                if let Ok(Some(mut rec)) = Self::read_record(&self.meta, job_id).await {
+                    rec.state = JobState::Failed;
+                    rec.error = Some(format!("slot migration failed: {e}"));
+                    let _ = self.persist(&rec).await;
+                }
+                METRICS.job_failed.fetch_add(1, Ordering::Relaxed);
+                ctl.set_state(JobState::Failed);
+            }
         }
     }
 

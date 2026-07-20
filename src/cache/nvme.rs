@@ -47,6 +47,74 @@ fn generation_marker_content(fs_generation: &str) -> Vec<u8> {
     format!("{STAGING_GENERATION_HEADER}\n{fs_generation}\n").into_bytes()
 }
 
+/// Write (or rewrite) `dir`'s generation marker — the KD-8 restamp
+/// primitive (PR VL5b): binds the dir to `fs_generation` WITHOUT wiping
+/// content. Callers must have proven the dir carries no staged write
+/// custody first ([`scan_live_staged_custody`]); marker I/O is io_uring
+/// + fdatasync (never adopted volatile).
+pub async fn write_staging_generation_marker(
+    dir: &std::path::Path,
+    fs_generation: &str,
+) -> Result<()> {
+    tokio::fs::create_dir_all(dir).await.map_err(|e| {
+        SqueezefsError::Io(std::io::Error::new(
+            e.kind(),
+            format!("creating staging dir {}: {e}", dir.display()),
+        ))
+    })?;
+    let marker_path = dir.join(STAGING_GENERATION_MARKER);
+    crate::uring_fs::write_all(&marker_path, generation_marker_content(fs_generation)).await?;
+    crate::uring_fs::fdatasync(marker_path).await?;
+    Ok(())
+}
+
+/// Read `dir`'s generation-marker binding: `Ok(Some(generation))` for a
+/// well-formed marker, `Ok(None)` when absent/unreadable/foreign.
+pub async fn read_staging_generation_marker(dir: &std::path::Path) -> Result<Option<String>> {
+    let marker_path = dir.join(STAGING_GENERATION_MARKER);
+    let Ok(bytes) = crate::uring_fs::read_all(&marker_path).await else {
+        return Ok(None);
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(None);
+    };
+    let mut lines = text.lines();
+    if lines.next() != Some(STAGING_GENERATION_HEADER) {
+        return Ok(None);
+    }
+    Ok(lines.next().map(str::to_string))
+}
+
+/// Enumerate LIVE staged write-custody keys in `dir` (the KD-8 barrier's
+/// per-unit diagnostics): a standalone header scan of the
+/// `staging_segment/` shard files. Sound because removal/flush zeroes
+/// each record's on-disk `BLOCK_MAGIC` (`tiering::nvme::NvmeShardInner::
+/// remove`), so only never-flushed custody still carries a live header —
+/// a cleanly-unmounted dir scans EMPTY. Read cache (`cache_segment/`)
+/// is deliberately not scanned: discarding it is always lossless.
+pub async fn scan_live_staged_custody(
+    dir: &std::path::Path,
+    max_units: usize,
+) -> Result<Vec<String>> {
+    crate::tiering::nvme::scan_live_segment_keys(&dir.join("staging_segment"), max_units).await
+}
+
+/// Test seam (PR VL5b, KD-8 contracts): seed one live staged-custody
+/// record (a minimal shard image with a single live header) so the
+/// barrier's refusal path is exercisable without a mount.
+pub async fn seed_staged_custody_for_test(dir: &std::path::Path, key: &str) -> Result<()> {
+    let seg_dir = dir.join("staging_segment");
+    tokio::fs::create_dir_all(&seg_dir).await.map_err(|e| {
+        SqueezefsError::Io(std::io::Error::new(
+            e.kind(),
+            format!("creating {}: {e}", seg_dir.display()),
+        ))
+    })?;
+    let img = crate::tiering::nvme::encode_segment_record_for_test(key.as_bytes(), b"x");
+    crate::uring_fs::write_all(&seg_dir.join("seeded_shard"), img).await?;
+    Ok(())
+}
+
 /// Remove every regular file directly inside `dir` (segment files; the dir
 /// itself and any nested dirs/symlinks stay). Follows `dir` when it is the
 /// mount layout's `cache_segment -> ../cache_segment` symlink — stale

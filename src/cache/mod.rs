@@ -3,7 +3,10 @@ pub mod gds;
 pub mod lru;
 pub mod nvme;
 pub mod pool;
-pub use nvme::NvmeStaging;
+pub use nvme::{
+    read_staging_generation_marker, scan_live_staged_custody, seed_staged_custody_for_test,
+    write_staging_generation_marker, NvmeStaging,
+};
 pub use pool::{AlignedBufPool, PooledBuf, ALIGNED_BUF_POOL, BUFFER_POOL};
 
 use crate::error::{Result, SqueezefsError};

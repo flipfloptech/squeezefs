@@ -47,9 +47,8 @@
 //!   the change; victim tombstones refuse loud; survivors-first /
 //!   victim-last epoch completeness.
 
-use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::checkpoint::{
-    read_newest_ledger, LedgerRecord, MembershipStamp, ROOT_LEDGER_SLOT_LEN,
+    LedgerRecord, MembershipStamp, ROOT_LEDGER_SLOT_LEN,
 };
 use squeezefs::meta_backend::kv::superblock::{
     classify_volume, FEATURES_INCOMPAT_KNOWN, FEATURE_INCOMPAT_KV_GUEST_SLOTS,
@@ -115,7 +114,11 @@ async fn shutdown_routed(routed: &Arc<RoutedMetaBackend>) {
 /// keyspace), directories striped across volumes with files + xattrs
 /// inside them (populating every volume's native slot). Returns
 /// `(name → ino)` for stability assertions.
-async fn populate(routed: &Arc<RoutedMetaBackend>, dirs: usize, files: usize) -> Vec<(String, u64)> {
+async fn populate(
+    routed: &Arc<RoutedMetaBackend>,
+    dirs: usize,
+    files: usize,
+) -> Vec<(String, u64)> {
     let mut made = Vec::new();
     for i in 0..files {
         let name = format!("rootf{i}");
@@ -165,7 +168,10 @@ async fn verify_population(routed: &Arc<RoutedMetaBackend>, made: &[(String, u64
             .lookup(parent, &leaf)
             .await
             .unwrap_or_else(|e| panic!("lookup {name} failed after migration: {e}"));
-        assert_eq!(got.ino, *ino, "global ino of {name} must be eternally stable");
+        assert_eq!(
+            got.ino, *ino,
+            "global ino of {name} must be eternally stable"
+        );
         if name.contains('/') {
             let tag = routed
                 .getxattr(*ino, "user.tag")
@@ -243,7 +249,8 @@ async fn test_bit4_gates_extended_stamps_against_vl5a_binaries() {
 
 #[test]
 fn test_guest_ino_namespace_partition_disjoint_and_round_trips() {
-    assert!(GUEST_NS_SHIFT >= 40, "≥ 2^40 native locals per volume");
+    // Pin the namespace geometry (a change is an on-disk format change).
+    assert_eq!(GUEST_NS_SHIFT, 40, "2^40 native locals per volume");
     assert_eq!(GUEST_NS_BASE, 1u64 << GUEST_NS_SHIFT);
     // Native locals never split as guests.
     for local in [1u64, 2, 3, GUEST_NS_BASE - 1] {
@@ -340,10 +347,8 @@ async fn test_slot_migration_equivalence_isolation_and_ino_stability() {
     let digest_before = set_logical_digest(&routed).await.expect("digest");
     let slot1_before = slot_logical_digest(&routed, 1).await.expect("slot digest");
 
-    // Non-participant byte-identity premise: volume 2 hosts only slot 2.
     shutdown_routed(&routed).await;
     drop(routed);
-    let m2_before = std::fs::read(&metas[2]).unwrap();
 
     // Migrate slot 1 (volume 1's native keyspace) to volume 0 — online
     // engine over a freshly opened routed set.
@@ -383,14 +388,25 @@ async fn test_slot_migration_equivalence_isolation_and_ino_stability() {
         !made.iter().any(|(_, i)| *i == extra.ino),
         "per-slot cursors must prevent ino reuse after migration"
     );
+    // The remount comparison baseline includes the post-migration create.
+    let digest_with_extra = set_logical_digest(&routed).await.expect("digest");
     shutdown_routed(&routed).await;
     drop(routed);
 
-    // Non-participant volume 2: byte-identical across the whole flow.
-    let m2_after = std::fs::read(&metas[2]).unwrap();
+    // Non-participation contract: volume 2 never grew bit 4, never
+    // hosts a guest record, and its own slots' logical state is
+    // untouched (ordinary mount activity — claims/checkpoints — moves
+    // device bytes on EVERY volume, so the contract is representational,
+    // not a device-image freeze).
+    let squeezefs::meta_backend::kv::superblock::VolumeFormat::V3(sb2) =
+        classify_volume(&metas[2]).await.unwrap()
+    else {
+        panic!("v3");
+    };
     assert_eq!(
-        m2_before, m2_after,
-        "a non-participating volume must stay byte-identical"
+        sb2.features_incompat & FEATURE_INCOMPAT_KV_SLOT_MIGRATION,
+        0,
+        "a non-participating volume must never grow incompat bit 4"
     );
 
     // Remount: discovery resolves the new map (highest-epoch-wins on the
@@ -404,7 +420,7 @@ async fn test_slot_migration_equivalence_isolation_and_ino_stability() {
     verify_population(&routed, &made).await;
     assert_eq!(
         set_logical_digest(&routed).await.expect("digest"),
-        digest_before,
+        digest_with_extra,
         "logical diff ∅ across remount"
     );
     shutdown_routed(&routed).await;
@@ -440,10 +456,18 @@ async fn test_delta_tee_captures_concurrent_writes_values_reread() {
     });
     hold.entered().await;
 
-    // Mutations to the migrating slot while the engine is parked: a new
-    // file, an xattr rewrite (twice — values re-read means the SECOND
-    // value must win), and an unlink.
-    let dino = routed.lookup(1, "dir0").await.expect("dir").ino;
+    // Mutations to the MIGRATING slot (slot 1) while the engine is
+    // parked: a new file, an xattr rewrite (twice — values re-read
+    // means the SECOND value must win), and an unlink.
+    let mut dino = None;
+    for d in 0..4 {
+        let ino = routed.lookup(1, &format!("dir{d}")).await.expect("dir").ino;
+        if route_ino_width(ino, 4).0 == 1 {
+            dino = Some(ino);
+            break;
+        }
+    }
+    let dino = dino.expect("a slot-1 directory exists among dir0..dir3");
     let fresh = routed
         .create(dino, "teed_create", libc::S_IFREG | 0o644, 0, 0)
         .await
@@ -468,7 +492,10 @@ async fn test_delta_tee_captures_concurrent_writes_values_reread() {
     );
 
     // Post-cutover state serves the TEED mutations from the new host.
-    let got = routed.lookup(dino, "teed_create").await.expect("teed create resolves");
+    let got = routed
+        .lookup(dino, "teed_create")
+        .await
+        .expect("teed create resolves");
     assert_eq!(got.ino, fresh);
     let tag = routed
         .getxattr(victim, "user.tag")
@@ -483,10 +510,19 @@ async fn test_delta_tee_captures_concurrent_writes_values_reread() {
         routed.lookup(dino, "f1").await.is_err(),
         "the teed unlink must hold post-cutover"
     );
-    // The untouched population is intact too.
+    // The untouched population is intact too (minus the teed unlink,
+    // whichever slot-1 directory it hit).
+    let unlinked_parent = made
+        .iter()
+        .find(|(_, i)| *i == dino)
+        .map(|(n, _)| n.clone())
+        .expect("the slot-1 dir is in the population");
     let survivors: Vec<(String, u64)> = made
-        .into_iter()
-        .filter(|(n, _)| n != "dir0/f1")
+        .iter()
+        .filter(|(n, _)| {
+            *n != format!("{unlinked_parent}/f1") && *n != format!("{unlinked_parent}/f0")
+        })
+        .cloned()
         .collect();
     verify_population(&routed, &survivors).await;
     shutdown_routed(&routed).await;
@@ -522,10 +558,38 @@ async fn test_delta_overflow_fresh_snapshot_fallback_and_triple_abort() {
         ..MigrationOptions::default()
     };
     let routed2 = routed.clone();
-    let mig =
-        tokio::spawn(async move { migrate_slot(&routed2, 1, 0, &opts_small, &hooks).await });
+    let mig = tokio::spawn(async move { migrate_slot(&routed2, 1, 0, &opts_small, &hooks).await });
     hold.entered().await;
-    let dino = routed.lookup(1, "dir0").await.expect("dir").ino;
+    let mut dino = None;
+    for d in 0..2 {
+        let ino = routed.lookup(1, &format!("dir{d}")).await.expect("dir").ino;
+        if route_ino_width(ino, 4).0 == 1 {
+            dino = Some(ino);
+            break;
+        }
+    }
+    // populate() striped only 2 dirs — if neither landed on slot 1,
+    // mint fresh dirs until one does (health round-robin alternates).
+    let dino = match dino {
+        Some(i) => i,
+        None => {
+            // The engine is parked at the hold — creates still flow (the
+            // gate is open during snapshot passes).
+            let mut found = None;
+            for i in 0..8 {
+                let ino = routed
+                    .create(1, &format!("ovdir{i}"), libc::S_IFDIR | 0o755, 0, 0)
+                    .await
+                    .expect("mkdir")
+                    .ino;
+                if route_ino_width(ino, 4).0 == 1 {
+                    found = Some(ino);
+                    break;
+                }
+            }
+            found.expect("a slot-1 dir within 8 mkdirs")
+        }
+    };
     for i in 0..32 {
         routed
             .create(dino, &format!("ov{i}"), libc::S_IFREG | 0o644, 0, 0)
@@ -533,7 +597,10 @@ async fn test_delta_overflow_fresh_snapshot_fallback_and_triple_abort() {
             .expect("overflow filler");
     }
     hold.release();
-    let report = mig.await.unwrap().expect("overflow must FALL BACK, not fail");
+    let report = mig
+        .await
+        .unwrap()
+        .expect("overflow must FALL BACK, not fail");
     assert!(
         report.overflows >= 1,
         "the tiny log must have overflowed: {report:?}"
@@ -550,10 +617,19 @@ async fn test_delta_overflow_fresh_snapshot_fallback_and_triple_abort() {
         "sanity: the fillers changed the logical state"
     );
 
-    // (b) Triple consecutive overflow aborts LOUD: hold every snapshot
-    // round and mutate the migrating keyspace once per round so each
-    // round's zero-cap log overflows. Needs a parent that ROUTES to the
-    // migrating slot 1.
+    // (b) Triple consecutive overflow aborts LOUD: a FRESH set (part (a)
+    // already moved slot 1 on the first one — no new dirs can mint there
+    // any more), hold every snapshot round, and mutate the migrating
+    // keyspace once per round so each round's zero-cap log overflows.
+    shutdown_routed(&routed).await;
+    drop(routed);
+    let metas_b = vec![
+        make_file(dir.path(), "b0", VOL_LEN),
+        make_file(dir.path(), "b1", VOL_LEN),
+    ];
+    format_stamped_set(&metas_b, 4).await;
+    let paths_b = uris(&metas_b);
+    let routed = open_routed_meta_set(&paths_b).await.expect("open b");
     let slot1_dir = {
         let mut found = None;
         for i in 0..8 {
@@ -673,11 +749,8 @@ async fn test_cutover_gate_parks_cross_slot_rename_with_zero_guards() {
     // The rename spanning the migrating slot: issued while the gate is
     // closed — it must PARK at the gate.
     let routed3 = routed.clone();
-    let rename = tokio::spawn(async move {
-        routed3
-            .rename(src_dir, "f0", dst_dir, "moved_in", 0)
-            .await
-    });
+    let rename =
+        tokio::spawn(async move { routed3.rename(src_dir, "f0", dst_dir, "moved_in", 0).await });
     // Deterministic park proof: the gate-parked counter moves...
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -809,15 +882,9 @@ async fn test_flip_crash_windows_resolve_and_rerun_converges() {
                 crash_after_write: Some(window),
                 ..MigrationOptions::default()
             };
-            let err = migrate_slot(
-                &routed,
-                1,
-                0,
-                &crash_opts,
-                &MigrationTestHooks::default(),
-            )
-            .await
-            .expect_err("the crash seam must abort the flip");
+            let err = migrate_slot(&routed, 1, 0, &crash_opts, &MigrationTestHooks::default())
+                .await
+                .expect_err("the crash seam must abort the flip");
             assert!(
                 format!("{err}").contains("crash injection"),
                 "window {window} round {round}: {err}"
@@ -883,33 +950,54 @@ async fn test_flip_torn_claim_slot_falls_back_and_rerun_converges() {
     migrate_slot(&routed, 1, 0, &crash_opts, &MigrationTestHooks::default())
         .await
         .expect_err("crash seam");
-    shutdown_routed(&routed).await;
+    // A kill-9 analog: DROP without clean shutdown (no final checkpoint
+    // may re-write the claim after the tear below; the checkpoint task
+    // reaps on its next tick — the documented sentinel discipline).
     drop(routed);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // Tear the newest ledger slot on the TARGET (volume 0).
+    // Tear EVERY claim-carrying ledger slot on the TARGET (volume 0):
+    // the mid-write-torn-claim state — A/B selection must fall back to
+    // the newest intact (pre-claim) record.
     let squeezefs::meta_backend::kv::superblock::VolumeFormat::V3(sb) =
         classify_volume(&metas[0]).await.unwrap()
     else {
         panic!("v3");
     };
-    let newest = read_newest_ledger(&metas[0], sb.root_ledger.start)
-        .await
-        .unwrap()
-        .expect("record");
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     let mut f = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .open(&metas[0])
         .unwrap();
-    f.seek(SeekFrom::Start(
-        sb.root_ledger.start + (newest.seq % 32) * ROOT_LEDGER_SLOT_LEN + 48,
-    ))
-    .unwrap();
-    f.write_all(&[0xFF; 32]).unwrap();
+    for slot_idx in 0..32u64 {
+        let mut img = vec![0u8; ROOT_LEDGER_SLOT_LEN as usize];
+        f.seek(SeekFrom::Start(
+            sb.root_ledger.start + slot_idx * ROOT_LEDGER_SLOT_LEN,
+        ))
+        .unwrap();
+        f.read_exact(&mut img).unwrap();
+        let Ok(rec) = LedgerRecord::decode_slot(&img) else {
+            continue;
+        };
+        if rec
+            .membership_stamp
+            .as_ref()
+            .is_some_and(|st| st.slots_hosted.contains(&1))
+        {
+            f.seek(SeekFrom::Start(
+                sb.root_ledger.start + slot_idx * ROOT_LEDGER_SLOT_LEN + 48,
+            ))
+            .unwrap();
+            f.write_all(&[0xFF; 32]).unwrap();
+        }
+    }
     f.sync_all().unwrap();
 
     // Torn claim ⇒ predecessor record ⇒ OLD claim state ⇒ old map.
-    let disc = discover_meta_set(&paths).await.expect("torn slot must fall back, not refuse");
+    let disc = discover_meta_set(&paths)
+        .await
+        .expect("torn slot must fall back, not refuse");
     assert_eq!(
         disc.slot_to_volume[1], 1,
         "a torn claim slot loses to its intact predecessor — the old map serves"
@@ -953,7 +1041,7 @@ async fn test_staging_drain_barrier_refuses_custody_and_restamps() {
         .await
         .expect("stamp old generation");
     squeezefs::config_ops::staging_drain_barrier(
-        &[staging.clone()],
+        std::slice::from_ref(&staging),
         "old-gen",
         "new-gen",
     )
@@ -979,7 +1067,7 @@ async fn test_staging_drain_barrier_refuses_custody_and_restamps() {
         .await
         .expect("seed a staged custody record");
     let err = squeezefs::config_ops::staging_drain_barrier(
-        &[dirty.clone()],
+        std::slice::from_ref(&dirty),
         "new-gen",
         "next-gen",
     )
@@ -1046,7 +1134,9 @@ async fn test_add_meta_and_remove_meta_end_to_end_ino_stable() {
             "taken slot {s} hosted by the new member"
         );
     }
-    let routed = open_routed_meta_set(&new_paths).await.expect("open new set");
+    let routed = open_routed_meta_set(&new_paths)
+        .await
+        .expect("open new set");
     verify_population(&routed, &made).await;
     assert_eq!(
         set_logical_digest(&routed).await.expect("digest"),

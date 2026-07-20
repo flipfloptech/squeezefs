@@ -1374,6 +1374,38 @@ async fn job_probe_records(
     Ok(squeezefs::jobs::JobFabric::list_records(&routed).await?)
 }
 
+/// Where a `config` volume-family verb acts (PR VL3 — the `/dev/shm`
+/// runtime-config file is gone): `-g sqmeta://…` targets the DURABLE
+/// records offline (guarded); `-g <mountpoint>` or the single live mount
+/// targets the daemon's admin lane.
+enum ConfigTarget {
+    Offline(Vec<String>),
+    Live(String),
+}
+
+fn resolve_config_target(
+    meta_uri: &Option<String>,
+) -> Result<ConfigTarget, Box<dyn std::error::Error>> {
+    if let Some(uri) = meta_uri {
+        if uri.starts_with("sqmeta://") {
+            return Ok(ConfigTarget::Offline(parse_block_uri(uri, "sqmeta://")?));
+        }
+        return Ok(ConfigTarget::Live(uri.clone()));
+    }
+    let mounts = find_squeezefs_mounts();
+    match mounts.len() {
+        0 => Err(
+            "no live SqueezeFS mount found; pass -g sqmeta://<volumes> for the \
+                  offline durable path, or -g <mountpoint> for a live daemon"
+                .into(),
+        ),
+        1 => Ok(ConfigTarget::Live(mounts[0].display().to_string())),
+        n => Err(
+            format!("{n} live SqueezeFS mounts found — pass -g <mountpoint> to pick one").into(),
+        ),
+    }
+}
+
 /// VL1 (design-volume-lifecycle §5.0): the removed fake admin verbs
 /// refuse loudly — exit nonzero, naming what was fake and the successor
 /// verb — never stub success.
@@ -3654,13 +3686,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Tune => {
             tune_system()?;
         }
-        Commands::Config {
-            meta_uri: _,
-            action,
-        } => {
-            let garnet_url = "dummy".to_string();
-            let fs_name = "squeezefs".to_string();
-            squeezefs::set_fs_prefix(&fs_name);
+        Commands::Config { meta_uri, action } => {
+            squeezefs::set_fs_prefix("squeezefs");
             match action {
                 ConfigActions::Set { key, value } => {
                     let _ = (key, value);
@@ -3702,65 +3729,112 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         _ => println!("none (cache-less)"),
                     }
                 }
-                ConfigActions::DiskCache(action) => match action {
-                    DiskCacheActions::List => {
-                        let list =
-                            squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
-                        println!("{}", serde_json::to_string_pretty(&list.diskcaches)?);
-                    }
-                    // Silent no-ops, all five — staging/cache paths are a
-                    // format-time declaration with ONE real admin verb.
-                    other => {
-                        let verb = match other {
-                            DiskCacheActions::Add { .. } => "config disk-cache add",
-                            DiskCacheActions::Remove { .. } => "config disk-cache remove",
-                            DiskCacheActions::Enable { .. } => "config disk-cache enable",
-                            DiskCacheActions::Disable { .. } => "config disk-cache disable",
-                            DiskCacheActions::Flush { .. } => "config disk-cache flush",
-                            DiskCacheActions::List => unreachable!("handled above"),
-                        };
-                        return Err(removed_verb(
-                            verb,
+                ConfigActions::DiskCache(action) => {
+                    // Staging/cache paths are a format-time declaration
+                    // with ONE real admin verb pair; the old `list`
+                    // printed an always-empty ephemeral table off the
+                    // deleted /dev/shm runtime config.
+                    let (verb, why, successor) = match action {
+                        DiskCacheActions::List => (
+                            "config disk-cache list",
+                            "it listed an always-empty ephemeral table (the /dev/shm \
+                             runtime config is deleted; the durable truth is the format \
+                             config).",
+                            "squeezefs config get-cache-paths",
+                        ),
+                        DiskCacheActions::Add { .. } => (
+                            "config disk-cache add",
                             "it was a silent no-op that changed nothing.",
                             "squeezefs config set-cache-paths",
-                        ));
-                    }
-                },
+                        ),
+                        DiskCacheActions::Remove { .. } => (
+                            "config disk-cache remove",
+                            "it was a silent no-op that changed nothing.",
+                            "squeezefs config set-cache-paths",
+                        ),
+                        DiskCacheActions::Enable { .. } => (
+                            "config disk-cache enable",
+                            "it was a silent no-op that changed nothing.",
+                            "squeezefs config set-cache-paths",
+                        ),
+                        DiskCacheActions::Disable { .. } => (
+                            "config disk-cache disable",
+                            "it was a silent no-op that changed nothing.",
+                            "squeezefs config set-cache-paths",
+                        ),
+                        DiskCacheActions::Flush { .. } => (
+                            "config disk-cache flush",
+                            "it was a silent no-op that changed nothing.",
+                            "squeezefs config set-cache-paths",
+                        ),
+                    };
+                    return Err(removed_verb(verb, why, successor));
+                }
                 ConfigActions::DataVolume(action) => match action {
-                    // KEPT (real): the fail-stop health overrides + list.
-                    // `disable` routes NEW writes away; blocks already on
-                    // the volume read EIO until re-enable — it is NOT an
-                    // evacuation (that is `volume remove-data`, PR VL4).
-                    DataVolumeActions::List => {
-                        let list =
-                            squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
-                        println!("{}", serde_json::to_string_pretty(&list.data_volumes)?);
-                    }
+                    // KEPT (real): the fail-stop health overrides + list,
+                    // re-homed off the deleted /dev/shm runtime config
+                    // (PR VL3): live mounts take the admin lane; a
+                    // `-g sqmeta://` target flips DURABLE record state
+                    // through the guarded offline path. `disable` routes
+                    // NEW writes away; blocks already on the volume read
+                    // EIO until re-enable — it is NOT an evacuation (that
+                    // is `volume remove-data`, PR VL4).
+                    DataVolumeActions::List => match resolve_config_target(&meta_uri)? {
+                        ConfigTarget::Live(mnt) => {
+                            let body = admin_roundtrip(&mnt, "volume-list", "")?;
+                            let v: serde_json::Value = serde_json::from_str(&body)
+                                .map_err(|e| format!("undecodable admin reply: {e}"))?;
+                            println!("{}", serde_json::to_string_pretty(&v)?);
+                        }
+                        ConfigTarget::Offline(meta_lvs) => {
+                            let recs =
+                                squeezefs::config_ops::resolved_volume_records(&meta_lvs).await?;
+                            println!("{}", serde_json::to_string_pretty(&recs)?);
+                        }
+                    },
                     DataVolumeActions::Enable { volume_id } => {
-                        squeezefs::config_ops::enable_data_volume(
-                            &garnet_url,
-                            &fs_name,
-                            &volume_id,
-                        )
-                        .await?;
-                        println!(
-                            "Data volume '{}' enabled (health override cleared).",
-                            volume_id
-                        );
+                        match resolve_config_target(&meta_uri)? {
+                            ConfigTarget::Live(mnt) => {
+                                println!("{}", admin_roundtrip(&mnt, "volume-enable", &volume_id)?);
+                            }
+                            ConfigTarget::Offline(meta_lvs) => {
+                                squeezefs::config_ops::set_data_volume_state(
+                                    &meta_lvs,
+                                    &volume_id,
+                                    squeezefs::VOL_STATE_ACTIVE,
+                                )
+                                .await?;
+                                println!(
+                                    "Data volume '{}' enabled (durable state; health override \
+                                     cleared at next mount).",
+                                    volume_id
+                                );
+                            }
+                        }
                     }
                     DataVolumeActions::Disable { volume_id } => {
-                        squeezefs::config_ops::disable_data_volume(
-                            &garnet_url,
-                            &fs_name,
-                            &volume_id,
-                        )
-                        .await?;
-                        println!(
-                            "Data volume '{}' disabled (fail-stop health override: new writes \
-                             fail over; blocks already on it read EIO until re-enabled — this \
-                             is not an evacuation).",
-                            volume_id
-                        );
+                        match resolve_config_target(&meta_uri)? {
+                            ConfigTarget::Live(mnt) => {
+                                println!(
+                                    "{}",
+                                    admin_roundtrip(&mnt, "volume-disable", &volume_id)?
+                                );
+                            }
+                            ConfigTarget::Offline(meta_lvs) => {
+                                squeezefs::config_ops::set_data_volume_state(
+                                    &meta_lvs,
+                                    &volume_id,
+                                    squeezefs::VOL_STATE_DISABLED,
+                                )
+                                .await?;
+                                println!(
+                                    "Data volume '{}' disabled (durable fail-stop health \
+                                     override: new writes fail over; blocks already on it read \
+                                     EIO until re-enabled — this is not an evacuation).",
+                                    volume_id
+                                );
+                            }
+                        }
                     }
                     DataVolumeActions::Add { .. } => {
                         return Err(removed_verb(
@@ -3788,37 +3862,74 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 },
                 ConfigActions::MetadataVolume(action) => {
+                    // Meta-volume health overrides are RUNTIME-ONLY (the
+                    // admin lane on a live mount): no durable meta-volume
+                    // records exist until the slot-map machinery
+                    // (design-volume-lifecycle §5.5, PR VL5a) — offline
+                    // targets refuse loud instead of faking durability.
+                    let offline_refusal = |verb: &str| -> Box<dyn std::error::Error> {
+                        format!(
+                            "`squeezefs config metadata-volume {verb}` needs a live mount \
+                             (admin lane): metadata-volume health overrides are runtime-only \
+                             until durable meta-volume records land \
+                             (design-volume-lifecycle §5.5, PR VL5a)."
+                        )
+                        .into()
+                    };
                     match action {
                         // KEPT (real): fail-stop health overrides + list.
-                        MetadataVolumeActions::List => {
-                            let list =
-                                squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
-                            println!("{}", serde_json::to_string_pretty(&list.metadata_volumes)?);
-                        }
+                        MetadataVolumeActions::List => match resolve_config_target(&meta_uri)? {
+                            ConfigTarget::Live(mnt) => {
+                                // The `.config` virtual file already
+                                // publishes the live meta-volume table.
+                                let raw = std::fs::read_to_string(
+                                    std::path::Path::new(&mnt).join(".config"),
+                                )
+                                .map_err(|e| format!("cannot read {mnt}/.config: {e}"))?;
+                                let v: serde_json::Value = serde_json::from_str(&raw)?;
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&v["metadata_volumes"])?
+                                );
+                            }
+                            ConfigTarget::Offline(meta_lvs) => {
+                                // Offline honesty: the durable truth is
+                                // the volume set itself; no durable
+                                // enable/disable state exists yet (VL5a).
+                                let rows: Vec<serde_json::Value> = meta_lvs
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, path)| {
+                                        serde_json::json!({
+                                            "id": format!("meta_volume_{idx}"),
+                                            "backing_dev": path,
+                                        })
+                                    })
+                                    .collect();
+                                println!("{}", serde_json::to_string_pretty(&rows)?);
+                            }
+                        },
                         MetadataVolumeActions::Enable { volume_id } => {
-                            squeezefs::config_ops::enable_metadata_volume(
-                                &garnet_url,
-                                &fs_name,
-                                &volume_id,
-                            )
-                            .await?;
-                            println!(
-                                "Metadata volume '{}' enabled (health override cleared).",
-                                volume_id
-                            );
+                            match resolve_config_target(&meta_uri)? {
+                                ConfigTarget::Live(mnt) => {
+                                    println!(
+                                        "{}",
+                                        admin_roundtrip(&mnt, "meta-volume-enable", &volume_id)?
+                                    );
+                                }
+                                ConfigTarget::Offline(_) => return Err(offline_refusal("enable")),
+                            }
                         }
                         MetadataVolumeActions::Disable { volume_id } => {
-                            squeezefs::config_ops::disable_metadata_volume(
-                                &garnet_url,
-                                &fs_name,
-                                &volume_id,
-                            )
-                            .await?;
-                            println!(
-                                "Metadata volume '{}' disabled (fail-stop health override — \
-                                 not an evacuation).",
-                                volume_id
-                            );
+                            match resolve_config_target(&meta_uri)? {
+                                ConfigTarget::Live(mnt) => {
+                                    println!(
+                                        "{}",
+                                        admin_roundtrip(&mnt, "meta-volume-disable", &volume_id)?
+                                    );
+                                }
+                                ConfigTarget::Offline(_) => return Err(offline_refusal("disable")),
+                            }
                         }
                         MetadataVolumeActions::Add { .. } => {
                             return Err(removed_verb(
@@ -3846,8 +3957,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 ConfigActions::List => {
-                    let list = squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
-                    println!("{}", serde_json::to_string_pretty(&list)?);
+                    return Err(removed_verb(
+                        "config list",
+                        "it printed the ephemeral /dev/shm runtime config (deleted in the \
+                         volume-lifecycle re-home; the durable truth lives on the volumes and \
+                         the live truth in the daemon).",
+                        "squeezefs volume list / config data-volume list / config \
+                         get-cache-paths / .config on a live mount",
+                    ));
                 }
                 ConfigActions::Fsck => {
                     return Err(removed_verb(

@@ -10,33 +10,16 @@
 //!
 //! These tests spawn the built binary (`CARGO_BIN_EXE_squeezefs`) —
 //! the refusal contract is CLI-visible behavior, so it is pinned at
-//! the CLI. The suite runs under the gate's `--test-threads=1`; tests
-//! that touch the process-global `/dev/shm/squeezefs_runtime_config.json`
-//! save and restore it.
+//! the CLI.
+//!
+//! PR VL3 update: the `/dev/shm/squeezefs_runtime_config.json` mechanism
+//! was DELETED — the kept `enable`/`disable` health overrides now ride
+//! the admin lane on live mounts and the guarded DURABLE record path
+//! offline (`-g sqmeta://…`); the fail-stop EIO semantics are unchanged
+//! and pinned below. `config list` (which printed the ephemeral file)
+//! is now itself a loud refusal naming its successors.
 
 use std::process::Command;
-
-const RUNTIME_CONFIG: &str = "/dev/shm/squeezefs_runtime_config.json";
-
-/// Save/restore guard for the global runtime-config file.
-struct RestoreConfig(Option<Vec<u8>>);
-impl RestoreConfig {
-    fn capture() -> Self {
-        RestoreConfig(std::fs::read(RUNTIME_CONFIG).ok())
-    }
-}
-impl Drop for RestoreConfig {
-    fn drop(&mut self) {
-        match &self.0 {
-            Some(bytes) => {
-                let _ = std::fs::write(RUNTIME_CONFIG, bytes);
-            }
-            None => {
-                let _ = std::fs::remove_file(RUNTIME_CONFIG);
-            }
-        }
-    }
-}
 
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_squeezefs"))
@@ -138,6 +121,9 @@ fn disk_cache_stub_verbs_refuse() {
             "config set-cache-paths",
         );
     }
+    // VL3: `disk-cache list` printed the always-empty ephemeral table off
+    // the deleted /dev/shm runtime config — refusal now too.
+    assert_refusal(&["config", "disk-cache", "list"], "config get-cache-paths");
 }
 
 #[test]
@@ -174,48 +160,137 @@ fn config_fsck_stub_refuses() {
 // kept surfaces stay real
 // ---------------------------------------------------------------------------
 
-#[test]
-fn enable_disable_health_overrides_still_work() {
-    let _g = RestoreConfig::capture();
-    let out = run(&["config", "data-volume", "disable", "vX"]);
+/// Format a tiny file-backed set (1 meta, 2 data) for the offline
+/// durable-override tests; returns (tempdir, sqmeta URI).
+fn format_tiny_set() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let meta = dir.path().join("meta1");
+    let oss1 = dir.path().join("oss1");
+    let oss2 = dir.path().join("oss2");
+    for (p, len) in [
+        (&meta, 256u64 << 20),
+        (&oss1, 256 << 20),
+        (&oss2, 256 << 20),
+    ] {
+        std::fs::File::create(p).unwrap().set_len(len).unwrap();
+    }
+    let uri = format!("sqmeta://{}", meta.display());
+    let out = run(&[
+        "format",
+        &uri,
+        &format!("sqdata://{},{}", oss1.display(), oss2.display()),
+        "--force",
+    ]);
     assert!(
         out.status.success(),
-        "disable is the kept fail-stop health override: {}",
+        "format failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let out = run(&["config", "data-volume", "enable", "vX"]);
-    assert!(out.status.success());
-    let out = run(&["config", "metadata-volume", "disable", "meta_volume_1"]);
-    assert!(out.status.success());
-    let out = run(&["config", "metadata-volume", "enable", "meta_volume_1"]);
-    assert!(out.status.success());
+    (dir, uri)
 }
 
 #[test]
-fn phantom_meta_volume_seed_is_gone() {
-    let _g = RestoreConfig::capture();
-    std::fs::remove_file(RUNTIME_CONFIG).ok();
-    let out = run(&["config", "list"]);
-    assert!(out.status.success(), "config list stays");
-    let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("config list prints JSON");
-    assert_eq!(
-        v["metadata_volumes"]
-            .as_object()
-            .map(|o| o.len())
-            .unwrap_or(usize::MAX),
-        0,
-        "default config must not seed the phantom meta_volume_0: {v}"
+fn enable_disable_health_overrides_still_work() {
+    // The kept fail-stop overrides, re-homed (VL3): `-g sqmeta://…`
+    // flips DURABLE record state through the guarded offline path; the
+    // EIO fail-stop semantics text is unchanged.
+    let (_dir, uri) = format_tiny_set();
+
+    let out = run(&["config", "-g", &uri, "data-volume", "disable", "oss2"]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        !out.stdout
-            .windows(b"squeezefs_pjdfs_meta".len())
-            .any(|w| w == b"squeezefs_pjdfs_meta"),
+        out.status.success(),
+        "disable is the kept fail-stop health override: {combined}"
+    );
+    assert!(
+        combined.contains("EIO") && combined.contains("not an evacuation"),
+        "the fail-stop EIO semantics stay documented in the verb output: {combined}"
+    );
+
+    // The state is DURABLE: the list probe shows it.
+    let out = run(&["config", "-g", &uri, "data-volume", "list"]);
+    assert!(out.status.success());
+    let rows: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("data-volume list prints JSON");
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "oss2")
+        .expect("oss2 row");
+    assert_eq!(row["state"], "disabled", "durable state: {rows}");
+
+    let out = run(&["config", "-g", &uri, "data-volume", "enable", "oss2"]);
+    assert!(out.status.success());
+
+    // Unknown ids refuse (no ephemeral file to accumulate poison entries).
+    let out = run(&["config", "-g", &uri, "data-volume", "disable", "vX"]);
+    assert!(
+        !out.status.success(),
+        "unknown volume ids must refuse on the durable path"
+    );
+
+    // Metadata-volume overrides are runtime-only (live admin lane) until
+    // VL5a's durable records — the offline target refuses LOUD, naming
+    // the successor machinery, instead of faking durability.
+    let out = run(&[
+        "config",
+        "-g",
+        &uri,
+        "metadata-volume",
+        "disable",
+        "meta_volume_0",
+    ]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "offline metadata-volume disable must refuse (runtime-only): {combined}"
+    );
+    assert!(
+        combined.contains("live mount") && combined.contains("VL5a"),
+        "the refusal must name the live-mount lane and the VL5a successor: {combined}"
+    );
+}
+
+#[test]
+fn config_list_removed_and_phantom_seed_gone() {
+    // VL3: `config list` printed the ephemeral /dev/shm runtime config —
+    // the file mechanism is deleted, the verb refuses naming successors,
+    // and the phantom seeds are structurally gone.
+    let probe = std::path::Path::new("/dev/shm/squeezefs_runtime_config.json");
+    let existed_before = probe.exists(); // stale from an old binary — not ours to delete
+    let out = run(&["config", "list"]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "`config list` must refuse (the runtime-config file is deleted): {combined}"
+    );
+    assert!(
+        combined.contains("removed") && combined.contains("volume list"),
+        "the refusal must name the successor `squeezefs volume list`: {combined}"
+    );
+    assert!(
+        !combined.contains("squeezefs_pjdfs_meta"),
         "the phantom /dev/shm/squeezefs_pjdfs_meta path must be gone"
     );
-    // The removed redirections bookkeeping does not resurface.
-    assert!(
-        v.get("metadata_volume_redirections").is_none(),
-        "redirections field (sole writer was the fake migrate) must be gone: {v}"
-    );
+    // The deleted mechanism's file must not be recreated by the binary.
+    if !existed_before {
+        assert!(
+            !probe.exists(),
+            "no verb may recreate the deleted /dev/shm runtime-config file"
+        );
+    }
 }

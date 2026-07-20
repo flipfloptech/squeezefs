@@ -1,65 +1,18 @@
+//! Offline (guarded) admin verbs over the DURABLE on-volume state: the
+//! cache-path policy verbs, the volume-lifecycle add/state verbs
+//! (design-volume-lifecycle §5.3, PR VL3), and the format-grade
+//! ownership/preflight helpers they share.
+//!
+//! The historical `/dev/shm/squeezefs_runtime_config.json` mechanism —
+//! an ephemeral host-local file the daemon ingested for enable/disable
+//! health overrides — was DELETED in PR VL3: live overrides now ride the
+//! admin lane (`volume-disable`/`volume-enable` →
+//! `BackendRouter::set_health_override`), and offline enable/disable is
+//! durable volume state in the `FormatConfig.data_volumes` records
+//! ([`set_data_volume_state`]).
+
 use crate::error::{Result, SqueezefsError};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-
-/// Host-local RUNTIME overrides (`/dev/shm` — ephemeral by design, dies
-/// at reboot). This is NOT the durable volume set: that is
-/// `FormatConfig.data_lv` on the meta volumes (and, post
-/// design-volume-lifecycle, the `data_volumes`/`meta_slot_map` records).
-/// The only surviving semantics here are the **fail-stop health
-/// overrides** (`enable`/`disable` statuses a live daemon ingests at
-/// `.config` generation) — everything else this file once carried
-/// (add/remove/migrate bookkeeping, redirections) was fake and was
-/// deleted (design-volume-lifecycle §5.0). VL3 re-homes the overrides
-/// onto the daemon admin lane and deletes this file entirely.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ConfigList {
-    pub diskcaches: Vec<DiskCacheInfo>,
-    pub data_volumes: HashMap<String, String>,
-    pub data_volume_statuses: HashMap<String, String>,
-    pub metadata_volumes: HashMap<String, String>,
-    pub metadata_volume_statuses: HashMap<String, String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct DiskCacheInfo {
-    pub path: PathBuf,
-    pub status: String,
-}
-
-const CONFIG_FILE_PATH: &str = "/dev/shm/squeezefs_runtime_config.json";
-
-pub fn load_or_create_config() -> ConfigList {
-    if let Ok(content) = std::fs::read_to_string(CONFIG_FILE_PATH) {
-        if let Ok(cfg) = serde_json::from_str::<ConfigList>(&content) {
-            return cfg;
-        }
-    }
-    // Default fallback: EVERYTHING starts empty. Real volumes register at
-    // mount from the resolved format config; the only writers here are the
-    // enable/disable health-override verbs. (Two phantom seeds used to leak
-    // into every runtime config from this default — a `backend_0` alias
-    // entry and a `meta_volume_0 → /dev/shm/squeezefs_pjdfs_meta` test
-    // path. Both deleted; G-VL-1 pins their absence.)
-    ConfigList {
-        diskcaches: Vec::new(),
-        data_volumes: HashMap::new(),
-        data_volume_statuses: HashMap::new(),
-        metadata_volumes: HashMap::new(),
-        metadata_volume_statuses: HashMap::new(),
-    }
-}
-
-pub fn save_config(cfg: &ConfigList) {
-    if let Ok(content) = serde_json::to_string_pretty(cfg) {
-        let _ = std::fs::write(CONFIG_FILE_PATH, content);
-    }
-}
-
-pub async fn list_config(_redis_url: &str, _fs_name: &str) -> Result<ConfigList> {
-    Ok(load_or_create_config())
-}
 
 /// Read the format-recorded volume-set config off the FIRST metadata
 /// volume via a read-only probe mount (nothing written, safe against a
@@ -554,45 +507,5 @@ async fn commit_volume_records(
         }
     }
     commit?;
-    Ok(())
-}
-
-pub async fn enable_data_volume(_redis_url: &str, _fs_name: &str, volume_id: &str) -> Result<()> {
-    let mut cfg = load_or_create_config();
-    cfg.data_volume_statuses
-        .insert(volume_id.to_string(), "enabled".to_string());
-    save_config(&cfg);
-    Ok(())
-}
-
-pub async fn disable_data_volume(_redis_url: &str, _fs_name: &str, volume_id: &str) -> Result<()> {
-    let mut cfg = load_or_create_config();
-    cfg.data_volume_statuses
-        .insert(volume_id.to_string(), "disabled".to_string());
-    save_config(&cfg);
-    Ok(())
-}
-
-pub async fn enable_metadata_volume(
-    _redis_url: &str,
-    _fs_name: &str,
-    volume_id: &str,
-) -> Result<()> {
-    let mut cfg = load_or_create_config();
-    cfg.metadata_volume_statuses
-        .insert(volume_id.to_string(), "enabled".to_string());
-    save_config(&cfg);
-    Ok(())
-}
-
-pub async fn disable_metadata_volume(
-    _redis_url: &str,
-    _fs_name: &str,
-    volume_id: &str,
-) -> Result<()> {
-    let mut cfg = load_or_create_config();
-    cfg.metadata_volume_statuses
-        .insert(volume_id.to_string(), "disabled".to_string());
-    save_config(&cfg);
     Ok(())
 }

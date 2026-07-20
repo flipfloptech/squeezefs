@@ -2958,60 +2958,11 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
-    async fn sync_runtime_config_to_daemon(&self) {
-        let cfg = crate::config_ops::load_or_create_config();
-
-        let have_named_backends = !self.router.backend_router.backends.is_empty();
-        for (vol_name, status) in &cfg.data_volume_statuses {
-            // With named volumes registered, only statuses for REGISTERED
-            // names apply. A stale runtime config (the file outlives daemon
-            // generations) carrying a phantom `backend_0: disabled` entry
-            // would otherwise mark the default slot unhealthy and fail every
-            // legacy unprefixed/`backend_0://` key read through the alias.
-            if have_named_backends
-                && !self
-                    .router
-                    .backend_router
-                    .backends
-                    .contains_key(vol_name.as_str())
-            {
-                continue;
-            }
-            if status == "disabled" {
-                self.router
-                    .backend_router
-                    .unhealthy_backends
-                    .insert(vol_name.clone(), true);
-            } else {
-                self.router
-                    .backend_router
-                    .unhealthy_backends
-                    .remove(vol_name);
-            }
-        }
-
-        // VL1 (design-volume-lifecycle §5.0): this sync carries ONLY the
-        // fail-stop health overrides. The redirections ingest that lived
-        // here fed the fake metadata-volume migrate and was deleted with
-        // it; real meta routing changes are the VL5 slot map.
-        if let Some(ref meta) = self.meta_backend {
-            for (vol_name, status) in &cfg.metadata_volume_statuses {
-                if vol_name.starts_with("meta_volume_") {
-                    if let Ok(idx) = vol_name["meta_volume_".len()..].parse::<usize>() {
-                        if status == "disabled" {
-                            meta.disabled_volumes.insert(idx, true);
-                        } else {
-                            meta.disabled_volumes.remove(&idx);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     async fn generate_config_json(&self) -> String {
-        self.sync_runtime_config_to_daemon().await;
-
+        // The `/dev/shm` runtime-config ingest that used to run here was
+        // deleted in PR VL3: health overrides arrive over the admin lane
+        // (`volume-disable`/`volume-enable`) or as durable record state
+        // applied at registration — `.config` reads live router state.
         let mut format_fields = std::collections::HashMap::new();
         let active_dirs = self.router.cache.nvme.staging_dirs();
         let active_dirs_str = active_dirs

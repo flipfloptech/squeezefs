@@ -20,8 +20,11 @@
 //!    byte-identical and frees back to zero used blocks on EVERY volume.
 //! 4. Single-volume mounts keep today's on-disk behavior: persisted block-map
 //!    keys stay bare/unprefixed and keep resolving.
-//! 5. A stale runtime-config `backend_0: disabled` entry must not poison the
-//!    alias health used by legacy-key reads.
+//! 5. A phantom `backend_0: disabled` health override must not poison the
+//!    alias health used by legacy-key reads — since PR VL3 (the `/dev/shm`
+//!    runtime-config file is deleted) the override surface is
+//!    `BackendRouter::set_health_override`, which refuses the reserved
+//!    alias and unknown ids outright.
 
 use fuse3::raw::Filesystem;
 use fuse3::SetAttr;
@@ -527,40 +530,38 @@ async fn test_single_volume_persisted_keys_stay_unprefixed_and_read_back() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Stale runtime-config phantom statuses must not poison alias health.
+// 6. Phantom health overrides must not poison alias health. (The /dev/shm
+//    runtime-config file this contract originally guarded against was
+//    DELETED in PR VL3; the override surface is now
+//    `BackendRouter::set_health_override`, which must REFUSE the reserved
+//    alias outright — the same protection, expressed structurally.)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_stale_runtime_config_backend0_disable_does_not_poison_alias() {
+async fn test_phantom_backend0_health_override_refused_and_alias_unpoisoned() {
     let _serial = serial().await;
     let _ = env_logger::builder().is_test(true).try_init();
 
-    const RUNTIME_CONFIG: &str = "/dev/shm/squeezefs_runtime_config.json";
-
-    /// Restore the shared runtime-config file no matter how the assertions go.
-    struct RestoreConfig(Option<Vec<u8>>);
-    impl Drop for RestoreConfig {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(bytes) => {
-                    let _ = std::fs::write(RUNTIME_CONFIG, bytes);
-                }
-                None => {
-                    let _ = std::fs::remove_file(RUNTIME_CONFIG);
-                }
-            }
-        }
-    }
-    let _restore = RestoreConfig(std::fs::read(RUNTIME_CONFIG).ok());
-
     let h = harness(&["oss1", "oss2", "oss3", "oss4"]).await;
 
-    // A stale config from an old daemon generation: the phantom marked
-    // disabled. Reading .config makes the daemon ingest it.
-    let mut cfg = squeezefs::config_ops::load_or_create_config();
-    cfg.data_volume_statuses
-        .insert("backend_0".to_string(), "disabled".to_string());
-    squeezefs::config_ops::save_config(&cfg);
+    // A `backend_0: disabled` override (the stale-runtime-config shape of
+    // old) must REFUSE — the reserved alias is not a volume.
+    assert!(
+        h.fs.router
+            .backend_router
+            .set_health_override("backend_0", true)
+            .is_err(),
+        "the reserved backend_0 alias must refuse health overrides"
+    );
+    // Unknown ids refuse too (a stale name from an older generation can
+    // never linger as a poison entry — there is no file to linger in).
+    assert!(
+        h.fs.router
+            .backend_router
+            .set_health_override("oss_gone", true)
+            .is_err(),
+        "unknown volume ids must refuse health overrides"
+    );
 
     let cfg_json = read_config_json(&h).await;
     let table = cfg_json["data_volumes"].as_object().unwrap();
@@ -575,8 +576,8 @@ async fn test_stale_runtime_config_backend0_disable_does_not_poison_alias() {
         );
     }
 
-    // Legacy alias reads must still work: the phantom's status must not
-    // have marked the default slot unhealthy.
+    // Legacy alias reads must still work: nothing above may have marked
+    // the default slot unhealthy.
     assert_legacy_keys_resolve(&h).await;
 }
 

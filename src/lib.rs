@@ -15,6 +15,7 @@ pub mod cpu;
 pub mod crypto_compress;
 pub mod dlm;
 pub mod error;
+pub mod fsck;
 pub mod fuse_client;
 pub(crate) mod gauge_core;
 pub mod health;

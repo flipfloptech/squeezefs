@@ -1767,6 +1767,41 @@ pub struct Metrics {
     /// a per-write cost — steady-state picks leave this flat (pinned in
     /// tests/placement_tests.rs).
     pub placement_table_refreshes: Align64<AtomicU64>,
+    /// PR VL6a `fsck_*` family (design-volume-lifecycle §10, §5.6):
+    /// cumulative across runs on this daemon. **`fsck_findings` must be
+    /// 0 on a healthy volume — the tripwire.**
+    pub fsck_inodes_scanned: Align64<AtomicU64>,
+    /// Tree pages walked by the C1 integrity walk (one per leaf-range
+    /// fetch).
+    pub fsck_nodes_walked: Align64<AtomicU64>,
+    pub fsck_blocks_checked: Align64<AtomicU64>,
+    pub fsck_refcounts_checked: Align64<AtomicU64>,
+    /// Scan-phase violations queued for verification (a high count with
+    /// a matching `fsck_suspects_cleared` is expected and healthy
+    /// online).
+    pub fsck_suspects: Align64<AtomicU64>,
+    pub fsck_suspects_cleared: Align64<AtomicU64>,
+    /// C2/C3 suspects exempted by the allocation-epoch side map
+    /// (allocated younger than the scan epoch).
+    pub fsck_epoch_exempted: Align64<AtomicU64>,
+    /// C2/C3 suspects exempted by the in-flight allocation registry
+    /// (live writeback/flush/parked/mover owners).
+    pub fsck_inflight_exempted: Align64<AtomicU64>,
+    /// C3 suspects exempted by the §5.4-step-2 mover pre-publish ledger.
+    pub fsck_mover_ledger_exempted: Align64<AtomicU64>,
+    /// Verified findings (class-labeled C1–C7 in the report). MUST stay
+    /// 0 on healthy volumes.
+    pub fsck_findings: Align64<AtomicU64>,
+    /// Wall seconds of the most recent run (gauge).
+    pub fsck_scan_secs: Align64<AtomicU64>,
+    /// C7 scrub family (KD-17). `scrub_readability_only` is the honesty
+    /// gauge: plain blocks that could only be READ, not verified (OQ-B).
+    pub scrub_blocks_scanned: Align64<AtomicU64>,
+    pub scrub_bytes_scanned: Align64<AtomicU64>,
+    pub scrub_aead_verified: Align64<AtomicU64>,
+    pub scrub_frame_verified: Align64<AtomicU64>,
+    pub scrub_readability_only: Align64<AtomicU64>,
+    pub scrub_failures: Align64<AtomicU64>,
     /// §5.1.6 remote-wire family (design-volume-lifecycle §10, PR VL2b).
     /// Currently-enrolled remote workers (gauge).
     pub job_remote_workers: Align64<AtomicU64>,
@@ -3651,6 +3686,23 @@ impl SqueezefsFilesystem {
                 "evacuate_transient_bytes": METRICS.evacuate_transient_bytes.load(Ordering::Relaxed),
                 "volume_preflight_refusals": METRICS.volume_preflight_refusals.load(Ordering::Relaxed),
                 "placement_table_refreshes": METRICS.placement_table_refreshes.load(Ordering::Relaxed),
+                "fsck_inodes_scanned": METRICS.fsck_inodes_scanned.load(Ordering::Relaxed),
+                "fsck_nodes_walked": METRICS.fsck_nodes_walked.load(Ordering::Relaxed),
+                "fsck_blocks_checked": METRICS.fsck_blocks_checked.load(Ordering::Relaxed),
+                "fsck_refcounts_checked": METRICS.fsck_refcounts_checked.load(Ordering::Relaxed),
+                "fsck_suspects": METRICS.fsck_suspects.load(Ordering::Relaxed),
+                "fsck_suspects_cleared": METRICS.fsck_suspects_cleared.load(Ordering::Relaxed),
+                "fsck_epoch_exempted": METRICS.fsck_epoch_exempted.load(Ordering::Relaxed),
+                "fsck_inflight_exempted": METRICS.fsck_inflight_exempted.load(Ordering::Relaxed),
+                "fsck_mover_ledger_exempted": METRICS.fsck_mover_ledger_exempted.load(Ordering::Relaxed),
+                "fsck_findings": METRICS.fsck_findings.load(Ordering::Relaxed),
+                "fsck_scan_secs": METRICS.fsck_scan_secs.load(Ordering::Relaxed),
+                "scrub_blocks_scanned": METRICS.scrub_blocks_scanned.load(Ordering::Relaxed),
+                "scrub_bytes_scanned": METRICS.scrub_bytes_scanned.load(Ordering::Relaxed),
+                "scrub_aead_verified": METRICS.scrub_aead_verified.load(Ordering::Relaxed),
+                "scrub_frame_verified": METRICS.scrub_frame_verified.load(Ordering::Relaxed),
+                "scrub_readability_only": METRICS.scrub_readability_only.load(Ordering::Relaxed),
+                "scrub_failures": METRICS.scrub_failures.load(Ordering::Relaxed),
                 "job_remote_workers": METRICS.job_remote_workers.load(Ordering::Relaxed),
                 "job_remote_enrollments": METRICS.job_remote_enrollments.load(Ordering::Relaxed),
                 "job_remote_enroll_refused": METRICS.job_remote_enroll_refused.load(Ordering::Relaxed),

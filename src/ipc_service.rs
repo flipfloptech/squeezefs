@@ -42,6 +42,7 @@
 
 use crate::fuse_client::{IpcReadProbe, SqueezefsFilesystem, METRICS};
 use crate::ipc_host::{DataOp, SessionSink, SlotCompletion};
+use crate::meta_backend::Metadata as _;
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
 use squeezefs_ipc::layout::{OP_READ, OP_WRITE};
@@ -557,6 +558,72 @@ impl crate::ipc_host::AdminSink for FabricAdminSink {
                     } else {
                         format!("metadata volume '{arg}' enabled (health override cleared)")
                     })
+                }
+                // -----------------------------------------------------
+                // PR VL6a (§5.6): online fsck — submits the report-only
+                // detection job on the live daemon's fabric (RAM-
+                // authoritative C1–C6 scan + optional C7 scrub).
+                // arg: "[scrub|scrub-only] [throttle <pct>]"
+                // -----------------------------------------------------
+                "fsck" => {
+                    let mut scrub = false;
+                    let mut scrub_only = false;
+                    let mut throttle_pct: u32 = 100;
+                    let mut parts = arg.split_whitespace();
+                    while let Some(tok) = parts.next() {
+                        match tok {
+                            "scrub" => scrub = true,
+                            "scrub-only" => scrub_only = true,
+                            "throttle" => {
+                                throttle_pct =
+                                    parts.next().and_then(|p| p.parse().ok()).ok_or_else(|| {
+                                        "usage: fsck [scrub|scrub-only] \
+                                                    [throttle <pct>]"
+                                            .to_string()
+                                    })?;
+                            }
+                            other => {
+                                return Err(format!(
+                                    "usage: fsck [scrub|scrub-only] [throttle <pct>] \
+                                     (unknown token '{other}')"
+                                ))
+                            }
+                        }
+                    }
+                    let job_id = fabric
+                        .submit(crate::jobs::JobSpec {
+                            job_type: crate::jobs::JobType::Fsck { scrub, scrub_only },
+                            throttle_pct,
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!({
+                        "job_id": job_id,
+                        "scrub": scrub || scrub_only,
+                        "throttle_pct": throttle_pct,
+                    })
+                    .to_string())
+                }
+                // The persisted `job:{id}:report` payload of a completed
+                // fsck job (structured findings JSON).
+                "fsck-report" => {
+                    let job_id = arg.trim();
+                    if job_id.is_empty() {
+                        return Err("usage: fsck-report <job-id>".to_string());
+                    }
+                    let name = format!("{}{job_id}:report", crate::jobs::JOB_XATTR_PREFIX);
+                    match fabric
+                        .meta_handle()
+                        .getxattr(1, &name)
+                        .await
+                        .map_err(|e| e.to_string())?
+                    {
+                        Some(bytes) => String::from_utf8(bytes)
+                            .map_err(|_| "report payload not UTF-8".to_string()),
+                        None => Err(format!(
+                            "no report for job {job_id} (still running? see job-status)"
+                        )),
+                    }
                 }
                 "job-list" => {
                     let mut out = Vec::new();

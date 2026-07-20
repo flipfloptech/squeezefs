@@ -70,6 +70,31 @@ pub struct BlockAllocator {
     /// EIO investigation.
     capacity_blocks: AtomicU64,
     refcounts: scc::HashMap<u64, AtomicU32>,
+    /// PR VL6a (design-volume-lifecycle §5.6): the fsck **allocation
+    /// epoch** — one monotonic atomic, bumped by the fsck coordinator at
+    /// scan start and again at re-check. Explicitly a SEPARATE side map
+    /// (below), never packed into the loom-verified incarnation seqlock.
+    fsck_scan_epoch: AtomicU64,
+    /// The scan latch: while set, `allocate_block` records each minted
+    /// offset in the epoch side map (one relaxed load on the hot path;
+    /// when no scan runs — zero stores, zero cost).
+    fsck_scan_active: std::sync::atomic::AtomicBool,
+    /// The scan-latched allocation-epoch side map (`offset → epoch at
+    /// allocation`); exists only for the duration of a scan
+    /// (`fsck_end_scan` drains it). C2/C3 checkers exempt any offset
+    /// present here (allocation younger than the scan epoch).
+    fsck_epoch_map: scc::HashMap<u64, u64>,
+    /// PR VL6a (§5.6): the **in-flight allocation registry** — the
+    /// enumerable live owners of allocated-but-unpublished offsets
+    /// (writeback/flush units, active-block uploads, R5-parked writes,
+    /// mover destinations, wire shard destinations). Fed by
+    /// [`Self::inflight_register`] RAII guards at the owner paths; an
+    /// owner's guard drops only AFTER its publish is durable and visible
+    /// to the tree/refcount reads fsck performs (the natural scope: the
+    /// guard is a local of the allocate→DMA→merge function). A crashed /
+    /// aborted owner drops its guard on unwind, so a genuinely leaked
+    /// offset is never shielded — only LIVE owners are.
+    inflight: scc::HashMap<u64, u32>,
     /// Per-offset incarnation seqlock: `gen << 1 | stable`.
     ///
     /// Block keys are plain offset strings, so when an offset is freed and
@@ -97,8 +122,90 @@ impl BlockAllocator {
             highest_block: AtomicU64::new(0),
             capacity_blocks: AtomicU64::new(0),
             refcounts: scc::HashMap::new(),
+            fsck_scan_epoch: AtomicU64::new(0),
+            fsck_scan_active: std::sync::atomic::AtomicBool::new(false),
+            fsck_epoch_map: scc::HashMap::new(),
+            inflight: scc::HashMap::new(),
             incarnations: scc::HashMap::new(),
         })
+    }
+
+    // -----------------------------------------------------------------
+    // PR VL6a — fsck allocation-epoch side map + in-flight registry
+    // (design-volume-lifecycle §5.6; the incarnation seqlock above is
+    // deliberately untouched)
+    // -----------------------------------------------------------------
+
+    /// Arm the scan latch and bump the allocation epoch (fsck scan
+    /// start). Returns the scan epoch.
+    pub fn fsck_begin_scan(&self) -> u64 {
+        let epoch = self.fsck_scan_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        self.fsck_scan_active.store(true, Ordering::SeqCst);
+        epoch
+    }
+
+    /// Bump the epoch again at re-check (the two-epoch survival gate).
+    pub fn fsck_bump_epoch(&self) -> u64 {
+        self.fsck_scan_epoch.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Disarm the latch and drain the side map (scan end).
+    pub fn fsck_end_scan(&self) {
+        self.fsck_scan_active.store(false, Ordering::SeqCst);
+        self.fsck_epoch_map.clear_sync();
+    }
+
+    /// The epoch recorded for `offset` in the side map (`Some` ⇔ the
+    /// offset was allocated while a scan was active — younger than the
+    /// scan epoch, exempt from C2/C3 promotion).
+    pub fn allocation_epoch_of(&self, offset: u64) -> Option<u64> {
+        self.fsck_epoch_map.read_sync(&offset, |_, v| *v)
+    }
+
+    /// Register a live owner of an allocated-but-unpublished offset.
+    /// The returned guard MUST be held until the owner's publish is
+    /// durable and visible to the tree/refcount reads fsck performs
+    /// (deregister-after-publish-visible — §5.6 registry contract), or
+    /// until the owner's failure path frees the offset; dropping it on
+    /// unwind is exactly right (a dead owner shields nothing).
+    pub fn inflight_register(self: &Arc<Self>, offset: u64) -> InflightAllocGuard {
+        match self.inflight.entry_sync(offset) {
+            scc::hash_map::Entry::Occupied(mut occ) => *occ.get_mut() += 1,
+            scc::hash_map::Entry::Vacant(vac) => {
+                let _ = vac.insert_entry(1);
+            }
+        }
+        InflightAllocGuard {
+            alloc: Arc::clone(self),
+            offset,
+        }
+    }
+
+    /// `true` ⇔ a live owner currently holds `offset` in flight.
+    pub fn inflight_contains(&self, offset: u64) -> bool {
+        self.inflight.read_sync(&offset, |_, _| ()).is_some()
+    }
+
+    /// Snapshot of the tracked (refcounted) population — fsck's C2/C3
+    /// allocator-side ground truth.
+    pub fn tracked_offsets(&self) -> Vec<(u64, u32)> {
+        let mut out = Vec::new();
+        self.refcounts.iter_sync(|k, v| {
+            out.push((*k, crate::refcount_core::peek(v)));
+            true
+        });
+        out
+    }
+
+    /// The free-list population (fsck C6 accounting).
+    pub fn free_blocks_count(&self) -> u64 {
+        self.free_blocks.len() as u64
+    }
+
+    /// The fresh-block cursor (fsck C6 accounting: `used = highest −
+    /// free`, the same arithmetic [`Self::get_used_blocks`] runs).
+    pub fn highest_block_index(&self) -> u64 {
+        self.highest_block.load(Ordering::Relaxed)
     }
 
     /// gen+1, stable=0 — offset owned by a writer whose data is not yet on the
@@ -327,6 +434,17 @@ impl BlockAllocator {
         // New incarnation, not yet durable: cache fills must not publish until
         // the owner calls `publish_block` after its device write.
         self.mark_incarnation_unstable(offset);
+        // PR VL6a (§5.6): while an fsck scan is latched, record the
+        // minting epoch in the side map — one relaxed load when idle.
+        if self.fsck_scan_active.load(Ordering::Relaxed) {
+            let epoch = self.fsck_scan_epoch.load(Ordering::Relaxed);
+            match self.fsck_epoch_map.entry_sync(offset) {
+                scc::hash_map::Entry::Occupied(mut occ) => *occ.get_mut() = epoch,
+                scc::hash_map::Entry::Vacant(vac) => {
+                    let _ = vac.insert_entry(epoch);
+                }
+            }
+        }
         Ok(offset)
     }
 
@@ -648,6 +766,33 @@ impl BlockAllocator {
                     }
                 }
             }
+        }
+    }
+}
+
+/// RAII registration in the [`BlockAllocator::inflight_register`]
+/// in-flight allocation registry (PR VL6a, design-volume-lifecycle
+/// §5.6). Held by the live owner of an allocated-but-unpublished offset
+/// across its allocate → DMA → meta-publish window; dropping it is the
+/// deregistration (contract: only after the publish is durable and
+/// visible, or on the owner's failure path where the offset is freed).
+pub struct InflightAllocGuard {
+    alloc: Arc<BlockAllocator>,
+    offset: u64,
+}
+
+impl Drop for InflightAllocGuard {
+    fn drop(&mut self) {
+        let remove = self
+            .alloc
+            .inflight
+            .update_sync(&self.offset, |_, c| {
+                *c = c.saturating_sub(1);
+                *c == 0
+            })
+            .unwrap_or(false);
+        if remove {
+            self.alloc.inflight.remove_sync(&self.offset);
         }
     }
 }

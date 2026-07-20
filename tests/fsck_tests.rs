@@ -31,14 +31,19 @@
 //!
 //! `test_census_walk_baseline_measured` prints the measured census-walk
 //! and fsck-scan rates on this fixture. Measured on the dev box
-//! (2026-07-20, release build, file-backed tmpfs-class sandbox, 2,048
-//! inodes): census walk ≈ **295k inodes/s**, fsck C1–C6 scan ≈
-//! **73k inodes/s** — the scan is 4.05× the walk cost and ~4.9× the
-//! ½-of-baseline floor (147k/s). The floor is RECORDED here and asserted
-//! only as a loose sanity bound (scan ≥ baseline/20) rather than the
-//! exact ½ floor, because cargo-test timings on shared dev boxes and
-//! debug builds are not a stable instrument (the gate-grade number rides
-//! the lifecycle rig + closing report, per §3 of the design).
+//! (2026-07-20, **release** build, file-backed tmp sandbox, 2,049 live
+//! inodes, node cache warm): census walk = **1,142,885 inodes/s**
+//! (0.002 s), fsck C1–C6 scan = **117,518 inodes/s** (0.017 s). The
+//! instrument caveat is load-bearing (stated per §3, "every measurement
+//! must state its instrument"): this walk is entirely RAM-authoritative
+//! and cache-warm, so the scan's strictly-larger CPU work (THREE tree
+//! walks with per-record decode + allocator cross-checks vs the walk's
+//! one tree + one xattr read) shows at full magnitude — the ½-of-
+//! baseline floor is defined against the RIG's device-backed census
+//! (where the walk is I/O-bound and the scan's extra CPU hides behind
+//! I/O), so here it is RECORDED, not asserted; the cargo assertion is a
+//! loose collapse tripwire (scan ≥ census/20), and the gate-grade
+//! ½-floor number rides the lifecycle rig + closing report.
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -47,7 +52,7 @@ use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fsck::{
     clear_pre_registry_check_hook, merge_reports, run as run_fsck, set_pre_registry_check_hook,
-    volume_generation, FsckCtx, FsckMode, FsckOptions, FsckReport,
+    volume_generation, FsckCtx, FsckOptions, FsckReport,
 };
 use squeezefs::fuse_client::SqueezefsFilesystem;
 use squeezefs::nvme_dev::NvmeBlockDev;
@@ -118,13 +123,13 @@ fn base_format_config(data_lvs: &[&Path]) -> FormatConfig {
     }
 }
 
-async fn format_meta(meta: &Path, data_lvs: &[&Path]) {
+async fn format_meta_node(meta: &Path, data_lvs: &[&Path], node_size: usize) {
     let cfg = base_format_config(data_lvs);
     squeezefs::meta_backend::kv::builder::format_v3(
         meta,
         256 * 1024 * 1024,
         &squeezefs::meta_backend::kv::builder::FormatV3Options {
-            node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+            node_size,
             journal_len_override: None,
             force: true,
             full_wipe: false,
@@ -133,6 +138,15 @@ async fn format_meta(meta: &Path, data_lvs: &[&Path]) {
     )
     .await
     .expect("format v3 meta volume");
+}
+
+async fn format_meta(meta: &Path, data_lvs: &[&Path]) {
+    format_meta_node(
+        meta,
+        data_lvs,
+        squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+    )
+    .await
 }
 
 /// Mount-shaped fixture (the VL4 drain-test shape): resolved volume
@@ -322,13 +336,6 @@ async fn block_mappings_of(fx: &Fx, ino: u64) -> Vec<(u32, String)> {
     out
 }
 
-fn classes_of(report: &FsckReport) -> Vec<String> {
-    let mut cs: Vec<String> = report.findings.iter().map(|f| f.class.clone()).collect();
-    cs.sort();
-    cs.dedup();
-    cs
-}
-
 fn assert_zero_findings(report: &FsckReport, what: &str) {
     assert!(
         report.findings.is_empty(),
@@ -409,7 +416,7 @@ async fn test_census_walk_baseline_measured() {
         census_rate / 2.0
     );
 
-    assert!(walked as u64 >= INODES as u64, "walk visited the dataset");
+    assert!(walked >= INODES as u64, "walk visited the dataset");
     assert!(
         report.counters.inodes_scanned >= INODES as u64,
         "fsck scanned the dataset"
@@ -481,24 +488,39 @@ async fn test_c1_bitflip_node_detected() {
     let dir = tempfile::tempdir().unwrap();
     let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
     let oss1 = make_file(dir.path(), "oss1", 4 << 30);
-    format_meta(&meta, &[&oss1]).await;
+    // Small nodes so the inode tree SPLITS (the corruption must land on
+    // a non-root leaf: the root is validated at open, a corrupt root is
+    // a refused mount — fsck's business is the walkable-but-damaged
+    // interior).
+    format_meta_node(&meta, &[&oss1], 64 * 1024).await;
     let recs = base_format_config(&[&oss1]).resolved_data_volumes();
 
-    // Populate + clean shutdown (checkpointed durable tree).
+    // Populate enough inodes to split the tree + clean shutdown
+    // (checkpointed durable nodes).
     {
         let fx = open_fixture(&meta, &recs).await;
-        for i in 0..64 {
+        for i in 0..4000 {
             create_file(&fx, &format!("f{i}")).await;
         }
         fx.close().await;
     }
 
-    // Locate the durable inode-tree root node, then flip bytes in it.
-    let root_addr = {
+    // Locate a durable LEAF of the inode tree, then flip bytes in it.
+    let leaf_addr = {
         let kv = squeezefs::meta_backend::kv::backend::KvMetaBackend::open_probe(&meta)
             .await
             .expect("probe open");
-        let addr = kv.trees()[0].root().addr;
+        let tree = kv.trees()[0];
+        let root_addr = tree.root().addr;
+        let leaf = tree
+            .resolve_leaf(&squeezefs::meta_backend::kv::record::inode_key(500))
+            .await
+            .expect("leaf resolves");
+        let addr = leaf.addr();
+        assert_ne!(
+            addr, root_addr,
+            "the inode tree must have split (grow the dataset if this fires)"
+        );
         kv.shutdown().await.expect("probe shutdown");
         addr
     };
@@ -509,13 +531,13 @@ async fn test_c1_bitflip_node_detected() {
             .write(true)
             .open(&meta)
             .unwrap();
-        f.seek(SeekFrom::Start(root_addr + 32)).unwrap();
+        f.seek(SeekFrom::Start(leaf_addr + 32)).unwrap();
         let mut buf = [0u8; 64];
         f.read_exact(&mut buf).unwrap();
         for b in buf.iter_mut() {
             *b ^= 0xFF;
         }
-        f.seek(SeekFrom::Start(root_addr + 32)).unwrap();
+        f.seek(SeekFrom::Start(leaf_addr + 32)).unwrap();
         f.write_all(&buf).unwrap();
         f.sync_all().unwrap();
     }
@@ -1026,8 +1048,11 @@ async fn test_c7_frame_corruption_detected() {
 }
 
 /// C7 arm 3: device read error on a plain volume (`scrub_readability_only`
-/// is the honesty gauge) — the backing device truncated under an
-/// allocated block, the file-backed analog of dm-error.
+/// is the honesty gauge). The error is injected at the scrub's device
+/// read seam — the cargo-tier "dm-error or equivalent" (the file-backed
+/// substrate cannot produce a real EIO: the uring read path completes
+/// past-EOF reads at full size, so truncation is invisible here; the
+/// root-privileged rig owns real-error-target coverage).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_c7_read_error_detected() {
     let _serial = serial().await;
@@ -1049,29 +1074,31 @@ async fn test_c7_read_error_detected() {
         clean.counters
     );
 
-    // The seed: cut the device off under the highest allocated block.
+    // The seed: EIO on one allocated block's read offset.
     let mappings = block_mappings_of(&fx, ino).await;
-    let mut max_off = 0u64;
-    for (_, m) in &mappings {
-        let clean_key = m.split(':').next().unwrap_or(m).to_string();
-        if let Ok((_, off)) = fx.fs.router.backend_router.parse_block_key(&clean_key) {
-            max_off = max_off.max(off);
-        }
-    }
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&oss1)
-        .unwrap()
-        .set_len(max_off)
-        .unwrap();
+    let (_, m) = mappings.first().expect("striped block");
+    let clean_key = m.split(':').next().unwrap_or(m).to_string();
+    let (_, victim_off) = fx
+        .fs
+        .router
+        .backend_router
+        .parse_block_key(&clean_key)
+        .expect("parse");
+    squeezefs::fsck::set_scrub_read_fault_hook(Arc::new(move |off| off == victim_off));
 
     let report = run_fsck(&fx.ctx(), &scrub_opts()).await.expect("scrub");
+    squeezefs::fsck::clear_scrub_read_fault_hook();
     assert!(
-        report.findings.iter().any(|f| f.class == "C7"),
+        report
+            .findings
+            .iter()
+            .any(|f| f.class == "C7" && f.evidence.contains("device read error")),
         "device read failure must surface a C7 finding, got {:?}",
         report.findings
     );
     assert!(report.counters.scrub_failures >= 1);
+    // The healthy blocks still verified readable.
+    assert!(report.counters.scrub_readability_only >= 3);
     fx.close().await;
 }
 

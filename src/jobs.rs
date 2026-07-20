@@ -112,6 +112,14 @@ pub enum JobType {
         /// Target volume index in the CANONICAL member order.
         target_volume: usize,
     },
+    /// PR VL6a (§5.6): the online report-only fsck. `scrub` adds the C7
+    /// data scrub (KD-17); `scrub_only` is the `squeezefs scrub`
+    /// spelling. The verified report persists as `job:{id}:report`
+    /// (probe-readable offline). Report-only — never mutates.
+    Fsck {
+        scrub: bool,
+        scrub_only: bool,
+    },
 }
 
 impl JobType {
@@ -122,7 +130,8 @@ impl JobType {
             JobType::Noop { tasks, .. } => *tasks,
             JobType::EvacuateVolume { .. }
             | JobType::Rebalance
-            | JobType::MigrateMetaSlot { .. } => 0,
+            | JobType::MigrateMetaSlot { .. }
+            | JobType::Fsck { .. } => 0,
         }
     }
 
@@ -134,6 +143,12 @@ impl JobType {
     /// grew `read_source` and the production `RouterShardDevice` exists
     /// — but a remote worker completing a mover job without the meta
     /// publish would be a lie, so the dispatcher must not claim them).
+    /// `Fsck` is likewise coordinator-local: the C1–C6 scan reads the
+    /// live daemon's RAM-authoritative state by design (§5.1.6
+    /// division), and while C7 scrub reads are DESIGNED distributable,
+    /// the wire dispatches whole jobs only — shipping scrub sub-shards
+    /// over the read-shard seam is a stated follow-up, not silently
+    /// half-shipped.
     pub(crate) fn wire_executable(&self) -> bool {
         matches!(self, JobType::Noop { .. })
     }
@@ -1196,7 +1211,7 @@ impl JobFabric {
     }
 
     /// Execute one job until terminal/paused.
-    async fn run_job(&self, job_id: &str, ctl: &JobCtl) {
+    async fn run_job(&self, job_id: &str, ctl: &Arc<JobCtl>) {
         match ctl.job_type.clone() {
             JobType::Noop { .. } => self.run_noop(job_id, ctl).await,
             JobType::EvacuateVolume { volume_id } => {
@@ -1210,6 +1225,123 @@ impl JobFabric {
             } => {
                 self.run_meta_slot_migration(job_id, ctl, slot, target_volume)
                     .await
+            }
+            JobType::Fsck { scrub, scrub_only } => {
+                self.run_fsck_job(job_id, ctl, scrub, scrub_only).await
+            }
+        }
+    }
+
+    /// PR VL6a: drive the §5.6 detection engine as a fabric job (LOCAL
+    /// POOL ONLY — see `wire_executable`). The verified report persists
+    /// as `job:{id}:report` beside the job record; findings > 0 leave
+    /// the job **Completed** (detection succeeded; the findings are its
+    /// output — the CLI owns exit-code semantics) but log loudly.
+    async fn run_fsck_job(&self, job_id: &str, ctl: &Arc<JobCtl>, scrub: bool, scrub_only: bool) {
+        let Some(ctx) = self.mover.as_ref() else {
+            log::error!("job {job_id}: fsck needs a mover context (not wired on this fabric)");
+            if let Ok(Some(mut rec)) = Self::read_record(&self.meta, job_id).await {
+                rec.state = JobState::Failed;
+                rec.error = Some("fsck needs a mover context".to_string());
+                let _ = self.persist(&rec).await;
+            }
+            METRICS.job_failed.fetch_add(1, Ordering::Relaxed);
+            ctl.set_state(JobState::Failed);
+            return;
+        };
+        let mut opts = crate::fsck::FsckOptions::online();
+        opts.scrub = scrub;
+        opts.scrub_only = scrub_only;
+        opts.throttle_pct = ctl.throttle.load(Ordering::Relaxed);
+        let fsck_ctx = crate::fsck::FsckCtx {
+            meta: self.meta.clone(),
+            router: ctx.router.clone(),
+            staging_dirs: ctx.router.cache.nvme.staging_dirs().to_vec(),
+            expected_generation: Some(crate::fsck::volume_generation(&self.meta)),
+        };
+        // Cancellation bridge: mirror the ctl flags into the engine's
+        // cooperative flag (pause is treated as cancel — a detection run
+        // re-submits cheaply; there is no partial-resume state).
+        let cancel = opts.cancel.clone();
+        let watcher = {
+            let cancel = cancel.clone();
+            let ctl = Arc::clone(ctl);
+            tokio::spawn(async move {
+                loop {
+                    if ctl.cancelled.load(Ordering::SeqCst) || ctl.paused.load(Ordering::SeqCst) {
+                        cancel.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+        };
+        let outcome = crate::fsck::run(&fsck_ctx, &opts).await;
+        watcher.abort();
+        let _ = watcher.await;
+        if ctl.cancelled.load(Ordering::SeqCst) {
+            let _ = self.checkpoint_as(job_id, ctl, JobState::Cancelled).await;
+            ctl.set_state(JobState::Cancelled);
+            return;
+        }
+        if ctl.paused.load(Ordering::SeqCst) {
+            let _ = self.checkpoint_as(job_id, ctl, JobState::Paused).await;
+            ctl.set_state(JobState::Paused);
+            return;
+        }
+        match outcome {
+            Ok(report) => {
+                if report.has_findings() {
+                    log::error!(
+                        "job {job_id}: fsck VERIFIED {} finding(s) — {}",
+                        report.findings.len(),
+                        serde_json::to_string(&report.findings).unwrap_or_default()
+                    );
+                } else {
+                    log::info!(
+                        "job {job_id}: fsck clean ({} inodes, {} blocks, {} suspects cleared)",
+                        report.counters.inodes_scanned,
+                        report.counters.blocks_checked,
+                        report.counters.suspects_cleared
+                    );
+                }
+                // Persist the report beside the record (probe-readable).
+                // Oversize reports truncate the findings list LOUDLY
+                // (healthy reports are tiny — findings == 0).
+                let name = format!("{JOB_XATTR_PREFIX}{job_id}:report");
+                let cap = self.meta.xattr_value_cap(ROOT_INO).saturating_sub(1024);
+                let mut to_store = report.clone();
+                let mut truncated = 0usize;
+                let mut bytes = serde_json::to_vec(&to_store).unwrap_or_default();
+                while bytes.len() > cap && !to_store.findings.is_empty() {
+                    to_store.findings.pop();
+                    truncated += 1;
+                    bytes = serde_json::to_vec(&to_store).unwrap_or_default();
+                }
+                if truncated > 0 {
+                    log::error!(
+                        "job {job_id}: fsck report truncated {truncated} finding(s) to fit \
+                         the xattr cap — the full list is in the daemon log above"
+                    );
+                }
+                if let Err(e) = self.meta.setxattr(ROOT_INO, &name, &bytes).await {
+                    log::warn!("job {job_id}: fsck report persist failed: {e}");
+                }
+                ctl.done.store(1, Ordering::Relaxed);
+                ctl.tasks_total.store(1, Ordering::Relaxed);
+                let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
+                METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
+                ctl.set_state(JobState::Completed);
+            }
+            Err(e) => {
+                log::error!("job {job_id}: fsck failed: {e}");
+                if let Ok(Some(mut rec)) = Self::read_record(&self.meta, job_id).await {
+                    rec.state = JobState::Failed;
+                    rec.error = Some(format!("fsck failed: {e}"));
+                    let _ = self.persist(&rec).await;
+                }
+                METRICS.job_failed.fetch_add(1, Ordering::Relaxed);
+                ctl.set_state(JobState::Failed);
             }
         }
     }
@@ -1763,6 +1895,11 @@ impl JobFabric {
                 return MoveOutcome::Deferred;
             }
         };
+        // PR VL6a: register this task as the destination's live owner in
+        // the in-flight allocation registry (fsck C2 exemption) for the
+        // whole copy→publish window; the guard drops after every
+        // referencer published (or the failure path freed the block).
+        let _dst_inflight = dst_alloc.inflight_register(dst_off);
         let fail_dst = |off: u64, alloc: Arc<crate::block_allocator::BlockAllocator>| async move {
             let _ = alloc.free_block(off).await;
         };
@@ -1951,6 +2088,18 @@ fn mover_ledger_remove(key: &str) {
 /// mover-ledger surface fsck's C3 consultation (PR VL6a) reads.
 pub fn mover_prepublish_ledger() -> Vec<String> {
     MOVER_PREPUBLISH_LEDGER.lock().clone()
+}
+
+/// Test seam (PR VL6a contracts): park a key in the pre-publish ledger
+/// exactly as a live mover task does — the fsck exemption tests need
+/// the ledger populated without racing a real mover's timing.
+pub fn test_mover_ledger_insert(key: &str) {
+    mover_ledger_insert(key);
+}
+
+/// Test seam: the task-terminal ledger removal.
+pub fn test_mover_ledger_remove(key: &str) {
+    mover_ledger_remove(key);
 }
 
 // ---------------------------------------------------------------------------

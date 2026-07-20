@@ -1874,13 +1874,15 @@ impl JobWireWorker {
                             remaining -= batch;
                         }
                     }
-                    // The movers never reach the wire in v1.1
-                    // (`JobType::wire_executable` gates the dispatcher);
-                    // an assigned mover shard is a coordinator bug —
-                    // abort loudly, never fake-complete it.
+                    // The movers (and fsck, VL6a) never reach the wire in
+                    // v1.1 (`JobType::wire_executable` gates the
+                    // dispatcher); an assigned shard of these is a
+                    // coordinator bug — abort loudly, never
+                    // fake-complete it.
                     JobType::EvacuateVolume { .. }
                     | JobType::Rebalance
-                    | JobType::MigrateMetaSlot { .. } => {
+                    | JobType::MigrateMetaSlot { .. }
+                    | JobType::Fsck { .. } => {
                         log::error!(
                             "job worker: mover shard {}:{} reached the wire — the \
                              dispatcher must not assign mover job types (v1.1); aborting",

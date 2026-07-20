@@ -162,6 +162,54 @@ enum Commands {
         #[command(subcommand)]
         action: JobActions,
     },
+    /// Online report-only filesystem check (design-volume-lifecycle
+    /// §5.6, PR VL6a): seven check classes with verify-before-report
+    /// zero-FP machinery. TARGET = a live mountpoint (online: the scan
+    /// reads the daemon's RAM-authoritative state under the suspects
+    /// machinery) or a sqmeta:// URI (offline: read-only probes —
+    /// refuses under a live writer), or the literal `merge-reports`
+    /// followed by shard report files. Detection never mutates; exit
+    /// status is nonzero when findings exist (repair is PR VL6b).
+    Fsck {
+        /// Live mountpoint, sqmeta:// URI, or `merge-reports`
+        target: String,
+        /// Shard report files (with `merge-reports`)
+        #[arg(trailing_var_arg = true)]
+        reports: Vec<String>,
+        /// Force online (default when TARGET is a mountpoint)
+        #[arg(long)]
+        online: bool,
+        /// Force offline (default when TARGET is a sqmeta:// URI)
+        #[arg(long)]
+        offline: bool,
+        /// KD-3 duty-cycle throttle percentage
+        #[arg(long, default_value_t = 100)]
+        throttle: u32,
+        /// Emit the structured report as JSON
+        #[arg(long)]
+        json: bool,
+        /// Offline zero-coordination sharding: scan the k-th of N
+        /// ino-residue shards ("k/N", 0-based k); union the outputs
+        /// with `fsck merge-reports`
+        #[arg(long)]
+        shards: Option<String>,
+        /// Add the C7 data scrub (KD-17: AEAD on encrypted, frame
+        /// decode on compressed, readability-only on plain)
+        #[arg(long)]
+        scrub: bool,
+    },
+    /// C7-only data scrub (the standalone spelling of `fsck --scrub`;
+    /// same engine — design-volume-lifecycle §5.6 / KD-17)
+    Scrub {
+        /// Live mountpoint or sqmeta:// URI
+        target: String,
+        /// KD-3 duty-cycle throttle percentage
+        #[arg(long, default_value_t = 100)]
+        throttle: u32,
+        /// Emit the structured report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Single-writer mount-guard claim administration
     /// (docs/design-metadata-throughput.md §5.0)
     Claim {
@@ -1446,6 +1494,205 @@ async fn run_job_worker(meta_uri: &str) -> Result<(), Box<dyn std::error::Error>
         report.shards_completed, report.submissions_refused, report.shards_aborted
     );
     Ok(())
+}
+
+/// PR VL6a: the `squeezefs fsck` / `squeezefs scrub` verb bodies
+/// (design-volume-lifecycle §5.6/§6). Online = submit the report-only
+/// detection job over the admin lane and poll to completion; offline =
+/// read-only probes with optional `--shards k/N` zero-coordination
+/// sharding; `fsck merge-reports <files…>` unions shard outputs.
+/// Detection never mutates; the process exits nonzero when verified
+/// findings exist (the fsck convention).
+#[allow(clippy::too_many_arguments)] // a CLI verb surface, not an API
+async fn run_fsck_verb(
+    target: &str,
+    reports: &[String],
+    force_online: bool,
+    force_offline: bool,
+    throttle: u32,
+    json: bool,
+    shards: Option<String>,
+    scrub: bool,
+    scrub_only: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    squeezefs::set_fs_prefix("squeezefs");
+
+    // `fsck merge-reports <files…>` — the shard union.
+    if target == "merge-reports" {
+        if reports.is_empty() {
+            return Err("usage: squeezefs fsck merge-reports <report.json…>".into());
+        }
+        let mut parsed = Vec::with_capacity(reports.len());
+        for path in reports {
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("cannot read shard report '{path}': {e}"))?;
+            parsed.push(
+                serde_json::from_slice::<squeezefs::fsck::FsckReport>(&bytes)
+                    .map_err(|e| format!("'{path}' is not an fsck report: {e}"))?,
+            );
+        }
+        let merged = squeezefs::fsck::merge_reports(&parsed);
+        print_fsck_report(&merged, json);
+        if merged.has_findings() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if !reports.is_empty() {
+        return Err("trailing report files are only valid with `fsck merge-reports`".into());
+    }
+
+    let live = !target.starts_with("sqmeta://");
+    if force_offline && live {
+        return Err(
+            "--offline needs the sqmeta:// URI (offline mode is read-only probes with \
+             nothing in flight; a mountpoint target runs ONLINE against the live daemon)"
+                .into(),
+        );
+    }
+    if force_online && !live {
+        return Err(
+            "--online needs a live mountpoint target (the online scan reads the daemon's \
+             RAM-authoritative state over the admin lane)"
+                .into(),
+        );
+    }
+
+    if live {
+        if shards.is_some() {
+            return Err("--shards k/N is the OFFLINE zero-coordination mode \
+                        (design-volume-lifecycle §5.6); online fsck runs whole on the \
+                        coordinator"
+                .into());
+        }
+        let mut arg = String::new();
+        if scrub_only {
+            arg.push_str("scrub-only");
+        } else if scrub {
+            arg.push_str("scrub");
+        }
+        if !arg.is_empty() {
+            arg.push(' ');
+        }
+        arg.push_str(&format!("throttle {throttle}"));
+        let body = admin_roundtrip(target, "fsck", arg.trim())?;
+        let v: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("undecodable admin reply: {e}"))?;
+        let job_id = v["job_id"]
+            .as_str()
+            .ok_or("admin reply carried no job id")?
+            .to_string();
+        eprintln!("fsck job {job_id} running (report-only; watch `squeezefs job list`)…");
+        loop {
+            let st = admin_roundtrip(target, "job-status", &job_id)?;
+            let sv: serde_json::Value =
+                serde_json::from_str(&st).map_err(|e| format!("undecodable job status: {e}"))?;
+            match sv["state"].as_str().unwrap_or("?") {
+                "completed" => break,
+                "failed" => return Err(format!("fsck job {job_id} failed (see daemon log)").into()),
+                "cancelled" => return Err(format!("fsck job {job_id} was cancelled").into()),
+                "paused" | "paused-capacity" => {
+                    return Err(format!(
+                        "fsck job {job_id} was paused — `squeezefs job resume` re-queues it \
+                         (detection re-runs whole)"
+                    )
+                    .into())
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+            }
+        }
+        let body = admin_roundtrip(target, "fsck-report", &job_id)?;
+        let report: squeezefs::fsck::FsckReport =
+            serde_json::from_str(&body).map_err(|e| format!("undecodable fsck report: {e}"))?;
+        print_fsck_report(&report, json);
+        if report.has_findings() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // Offline: read-only probes (refused loud under a live writer).
+    let meta_lvs = parse_block_uri(target, "sqmeta://")?;
+    let shard = match &shards {
+        None => None,
+        Some(spec) => {
+            let (k, n) = spec
+                .split_once('/')
+                .and_then(|(k, n)| Some((k.parse::<u32>().ok()?, n.parse::<u32>().ok()?)))
+                .filter(|(k, n)| *n > 0 && k < n)
+                .ok_or("--shards expects k/N with 0 <= k < N (e.g. 0/4)")?;
+            Some((k, n))
+        }
+    };
+    let mut opts = squeezefs::fsck::FsckOptions::offline();
+    opts.throttle_pct = throttle;
+    opts.shard = shard;
+    opts.scrub = scrub;
+    opts.scrub_only = scrub_only;
+    let report = squeezefs::fsck::run_offline(&meta_lvs, &opts).await?;
+    print_fsck_report(&report, json);
+    if report.has_findings() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn print_fsck_report(report: &squeezefs::fsck::FsckReport, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(report).expect("report serializes")
+        );
+        return;
+    }
+    let c = &report.counters;
+    println!(
+        "fsck ({} mode{}): {} inode(s), {} tree page(s), {} block(s), {} refcount(s) checked \
+         in {} s",
+        report.mode,
+        report
+            .shard
+            .as_deref()
+            .map(|s| format!(", shard {s}"))
+            .unwrap_or_default(),
+        c.inodes_scanned,
+        c.nodes_walked,
+        c.blocks_checked,
+        c.refcounts_checked,
+        c.scan_secs,
+    );
+    println!(
+        "suspects: {} raised, {} cleared ({} epoch-exempt, {} in-flight-exempt, \
+         {} mover-ledger-exempt)",
+        c.suspects,
+        c.suspects_cleared,
+        c.epoch_exempted,
+        c.inflight_exempted,
+        c.mover_ledger_exempted,
+    );
+    if c.scrub_blocks_scanned > 0 {
+        println!(
+            "scrub: {} block(s) / {} B — {} AEAD-verified, {} frame-verified, \
+             {} readability-only (no stored checksum — OQ-B), {} failure(s)",
+            c.scrub_blocks_scanned,
+            c.scrub_bytes_scanned,
+            c.scrub_aead_verified,
+            c.scrub_frame_verified,
+            c.scrub_readability_only,
+            c.scrub_failures,
+        );
+    }
+    if report.findings.is_empty() {
+        println!("findings: 0 (clean)");
+    } else {
+        println!(
+            "findings: {} — REPORT-ONLY (repair is PR VL6b):",
+            report.findings.len()
+        );
+        for f in &report.findings {
+            println!("  [{}] {} — {}", f.class, f.object, f.evidence);
+        }
+    }
 }
 
 /// Offline probe: read the durable job records straight off the meta
@@ -3267,6 +3514,28 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     run_job_worker(&meta_uri).await?;
                 }
             }
+        }
+        Commands::Fsck {
+            target,
+            reports,
+            online,
+            offline,
+            throttle,
+            json,
+            shards,
+            scrub,
+        } => {
+            run_fsck_verb(
+                &target, &reports, online, offline, throttle, json, shards, scrub, false,
+            )
+            .await?;
+        }
+        Commands::Scrub {
+            target,
+            throttle,
+            json,
+        } => {
+            run_fsck_verb(&target, &[], false, false, throttle, json, None, true, true).await?;
         }
         Commands::Claim { action } => {
             let ClaimActions::Clear { meta_uri } = action;

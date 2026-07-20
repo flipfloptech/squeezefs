@@ -354,6 +354,26 @@ pub fn new_data_volume_id() -> String {
     format!("vol-{:016x}", fastrand::u64(..))
 }
 
+/// One member of the durable META-volume set (PR VL5a,
+/// design-volume-lifecycle §5.5.1, KD-7): the `DataVolumeRecord`-style
+/// identity meta volumes get on `--meta-slots` formats. This config
+/// record is the HUMAN-READABLE MIRROR — the per-volume root-ledger
+/// membership stamp ([`meta_backend::kv::checkpoint::MembershipStamp`])
+/// is authoritative (§5.5.1a: the stamp solves the slot-0 bootstrap
+/// chicken-and-egg the config, an xattr on ino 1, cannot).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MetaVolumeRecord {
+    /// `vol-{16 hex}` (random, allocated once, never reused — KD-5).
+    pub id: String,
+    /// Backing device path at format time (host-resolvable).
+    pub backing_dev: String,
+    /// Canonical position in the set order (assigned at format = format
+    /// order; the `volume_set_generation` ordering key, §5.5.1a).
+    pub member_position: u16,
+    /// Unix seconds when the record was created.
+    pub added_ts: u64,
+}
+
 /// The grandfathered id of a legacy (`data_lv`) member: the device-path
 /// basename, byte-identical to what mount has always registered.
 pub fn legacy_volume_id(path: &str) -> String {
@@ -404,6 +424,21 @@ pub struct FormatConfig {
     pub upload_delay: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fuse_io_uring_sqpoll_idle_ms: Option<u32>,
+    /// PR VL5a (KD-7): the frozen routing width W recorded at a
+    /// `--meta-slots` format. `None` = legacy set: W is implicitly the
+    /// meta volume count, nothing written, config byte-identical.
+    /// MIRROR ONLY — mounts read W from the §5.5.1a membership stamps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta_routing_width: Option<u32>,
+    /// PR VL5a: the durable slot map, `slot s → member_position`
+    /// (identity distribution at format: slot k → position k mod N).
+    /// MIRROR ONLY — the stamps' `slots_hosted` sets are authoritative.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta_slot_map: Option<Vec<u16>>,
+    /// PR VL5a: the durable meta-volume identity records
+    /// ([`MetaVolumeRecord`]), in `member_position` order. MIRROR ONLY.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta_volumes: Option<Vec<MetaVolumeRecord>>,
 }
 
 impl FormatConfig {

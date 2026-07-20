@@ -106,6 +106,9 @@ fn base_format_config(data_lvs: &[&Path]) -> FormatConfig {
         dismount_wait: None,
         upload_delay: None,
         fuse_io_uring_sqpoll_idle_ms: None,
+        meta_routing_width: None,
+        meta_slot_map: None,
+        meta_volumes: None,
     }
 }
 

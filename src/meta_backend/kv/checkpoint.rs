@@ -99,11 +99,30 @@
 //!   alloc_bitmap_generation: u64
 //!   n_roots: u16
 //!   n_roots × { tree_id: u8, node_addr: u64, node_seq: u64 }
+//!   [membership stamp — OPTIONAL suffix, PR VL5a, §5.5.1a]:
+//!     set_uuid: [u8; 16]
+//!     set_epoch: u64
+//!     member_position: u16
+//!     member_count: u16
+//!     routing_width: u32
+//!     n_slots: u16          (≤ 64 — the ledger-slot space cap)
+//!     n_slots × u16         hosted slot ids
 //! ```
 //!
 //! Every length is bounds-checked against its container before use (§9);
 //! slots are written as full zero-padded 4 KiB images so a shorter record
 //! can never leave stale bytes of a longer predecessor parseable.
+//!
+//! Format note (forward-only, design-volume-lifecycle §5.5.1a): the
+//! membership stamp widens the payload PAST the historical
+//! `fixed + n_roots × 17` equation, so a stamp-extended slot fails the
+//! pre-VL5a decoder's length-consistency check and **decodes as
+//! absent** — which is why the superblock incompat bit
+//! [`super::superblock::FEATURE_INCOMPAT_KV_GUEST_SLOTS`] must be
+//! barriered durably BEFORE a volume's first stamped slot (the numbered
+//! bit-before-first-stamp invariant): old binaries then refuse at the
+//! superblock gate before any slot is read, instead of silently falling
+//! back to a stale pre-stamp record.
 
 use super::backend::KvMetaBackend;
 use super::tree::SmoContext;
@@ -135,6 +154,54 @@ pub const ROOT_LEDGER_HDR_LEN: usize = 24;
 const PAYLOAD_FIXED_LEN: usize = 8 + 8 + 8 + 8 + 2;
 /// Encoded size of one tree root: `tree_id | node_addr | node_seq`.
 const ROOT_ENC_LEN: usize = 1 + 8 + 8;
+
+/// The §5.5.1a hosted-slot cap per volume: a documented operational
+/// limit (mirrored by `superblock::META_SLOTS_PER_VOLUME_CAP` at format
+/// and re-enforced at migration preflight in VL5b) that exists precisely
+/// so the worst-case ledger record can never overflow its 4096-B slot:
+/// 24 (header) + 34 (fixed prefix) + 197 roots × 17 + the 162-B 64-slot
+/// stamp = 3 569 < 4 096.
+pub const MEMBERSHIP_MAX_HOSTED_SLOTS: usize = 64;
+/// Fixed stamp prefix: `set_uuid | set_epoch | member_position |
+/// member_count | routing_width | n_slots`.
+const STAMP_FIXED_LEN: usize = 16 + 8 + 2 + 2 + 4 + 2;
+
+/// The per-volume set-membership stamp (PR VL5a, design-volume-lifecycle
+/// §5.5.1a): rides the root-ledger record payload — the one structure
+/// that is already A/B-rotating, checksummed, and rewritable without
+/// relocation on a densely-packed v3 volume. Solves the slot-0 bootstrap
+/// chicken-and-egg (mount reads stamps off raw superblock+ledger reads
+/// before any tree routing) and makes volume ORDER durable:
+/// `member_position` defines the canonical order for
+/// `volume_set_generation`, not the operator's URI ordering. The stamp
+/// is authoritative; the `FormatConfig` mirror (`meta_routing_width` /
+/// `meta_slot_map` / `meta_volumes`) is human-readable only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipStamp {
+    /// The SET identity (minted once per `format --meta-slots`
+    /// invocation; distinct from the per-volume superblock uuid).
+    pub set_uuid: [u8; 16],
+    /// Membership epoch (§5.5.2b protocol; format mints 1). VL5a refuses
+    /// mixed epochs loud — the highest-complete-epoch resolution is
+    /// VL5b's.
+    pub set_epoch: u64,
+    /// This volume's position in the canonical set order (assigned at
+    /// format = format order; preserved across add/remove).
+    pub member_position: u16,
+    /// Members in this epoch's set (mount cross-checks completeness).
+    pub member_count: u16,
+    /// The frozen routing width W (KD-7): `route_ino`/`make_global_ino`
+    /// modulo, eternally stable across set changes.
+    pub routing_width: u32,
+    /// The slots this volume hosts, ≤ [`MEMBERSHIP_MAX_HOSTED_SLOTS`].
+    pub slots_hosted: Vec<u16>,
+}
+
+impl MembershipStamp {
+    fn encoded_len(&self) -> usize {
+        STAMP_FIXED_LEN + self.slots_hosted.len() * 2
+    }
+}
 
 /// One tree root named by a ledger record: `(tree_id, node_addr, node_seq)`
 /// (§4.1).
@@ -171,6 +238,12 @@ pub struct LedgerRecord {
     /// previous incarnation's checksummed records into the new node
     /// (the 2026-07-13 release-gate Finding A).
     pub node_seq_watermark: u64,
+    /// The §5.5.1a set-membership stamp (PR VL5a): `Some` on every
+    /// ledger record of a slot-mapped volume (written under the
+    /// bit-before-first-stamp invariant), `None` forever on legacy
+    /// volumes — whose slots stay byte-identical to the pre-VL5a
+    /// encoding.
+    pub membership_stamp: Option<MembershipStamp>,
 }
 
 /// xxh3 over a slot image with the checksum field (bytes 16..24) zeroed —
@@ -190,10 +263,27 @@ impl LedgerRecord {
     }
 
     /// Encode into a full zero-padded 4 KiB slot image. Errors when the
-    /// record cannot fit a slot (structurally impossible for the ≤ 5 trees
-    /// of §4.2 — defense in depth for the record count).
+    /// record cannot fit a slot — the §5.5.1a space-cap check is
+    /// load-bearing here: a stamp with more than
+    /// [`MEMBERSHIP_MAX_HOSTED_SLOTS`] hosted slots refuses LOUD (the
+    /// cap exists precisely so the worst-case record fits), and the
+    /// total-size check stays as defense in depth for the root count.
     pub fn encode_slot(&self) -> Result<Vec<u8>, KvError> {
-        let payload_len = PAYLOAD_FIXED_LEN + self.tree_roots.len() * ROOT_ENC_LEN;
+        if let Some(stamp) = &self.membership_stamp {
+            if stamp.slots_hosted.len() > MEMBERSHIP_MAX_HOSTED_SLOTS {
+                return Err(KvError::Corrupt(format!(
+                    "membership stamp hosts {} slots — at most {MEMBERSHIP_MAX_HOSTED_SLOTS} \
+                     slots per volume (the §5.5.1a ledger-slot space cap; 64 is the \
+                     documented operational limit)",
+                    stamp.slots_hosted.len()
+                )));
+            }
+        }
+        let stamp_len = self
+            .membership_stamp
+            .as_ref()
+            .map_or(0, MembershipStamp::encoded_len);
+        let payload_len = PAYLOAD_FIXED_LEN + self.tree_roots.len() * ROOT_ENC_LEN + stamp_len;
         if ROOT_LEDGER_HDR_LEN + payload_len > ROOT_LEDGER_SLOT_LEN as usize
             || self.tree_roots.len() > usize::from(u16::MAX)
         {
@@ -224,6 +314,24 @@ impl LedgerRecord {
             image[pos + 1..pos + 9].copy_from_slice(&root.node_addr.to_le_bytes());
             image[pos + 9..pos + 17].copy_from_slice(&root.node_seq.to_le_bytes());
             pos += ROOT_ENC_LEN;
+        }
+        if let Some(stamp) = &self.membership_stamp {
+            image[pos..pos + 16].copy_from_slice(&stamp.set_uuid);
+            pos += 16;
+            image[pos..pos + 8].copy_from_slice(&stamp.set_epoch.to_le_bytes());
+            pos += 8;
+            image[pos..pos + 2].copy_from_slice(&stamp.member_position.to_le_bytes());
+            pos += 2;
+            image[pos..pos + 2].copy_from_slice(&stamp.member_count.to_le_bytes());
+            pos += 2;
+            image[pos..pos + 4].copy_from_slice(&stamp.routing_width.to_le_bytes());
+            pos += 4;
+            image[pos..pos + 2].copy_from_slice(&(stamp.slots_hosted.len() as u16).to_le_bytes());
+            pos += 2;
+            for slot in &stamp.slots_hosted {
+                image[pos..pos + 2].copy_from_slice(&slot.to_le_bytes());
+                pos += 2;
+            }
         }
         let sum = slot_checksum(&image, payload_len);
         image[16..24].copy_from_slice(&sum.to_le_bytes());
@@ -266,7 +374,14 @@ impl LedgerRecord {
         let alloc_bitmap_generation = u64::from_le_bytes(payload[16..24].try_into().unwrap());
         let node_seq_watermark = u64::from_le_bytes(payload[24..32].try_into().unwrap());
         let n_roots = usize::from(u16::from_le_bytes(payload[32..34].try_into().unwrap()));
-        if PAYLOAD_FIXED_LEN + n_roots * ROOT_ENC_LEN != payload_len {
+        // §9: the roots region must fit BEFORE it is walked; what follows
+        // it is either nothing (the historical pre-VL5a encoding) or one
+        // §5.5.1a membership stamp whose own length equation must close
+        // the payload exactly. (The pre-VL5a decoder required equality
+        // here — which is why stamped slots decode as absent to old
+        // binaries; see the module-docs format note.)
+        let roots_end = PAYLOAD_FIXED_LEN + n_roots * ROOT_ENC_LEN;
+        if roots_end > payload_len {
             return Err(KvError::Corrupt(format!(
                 "ledger n_roots {n_roots} inconsistent with payload length {payload_len}"
             )));
@@ -281,6 +396,58 @@ impl LedgerRecord {
             });
             pos += ROOT_ENC_LEN;
         }
+        let membership_stamp = if pos == payload_len {
+            None
+        } else {
+            if pos + STAMP_FIXED_LEN > payload_len {
+                return Err(KvError::Corrupt(format!(
+                    "ledger payload tail of {} bytes is neither empty nor a membership \
+                     stamp (fixed stamp prefix is {STAMP_FIXED_LEN} bytes)",
+                    payload_len - pos
+                )));
+            }
+            let set_uuid: [u8; 16] = payload[pos..pos + 16].try_into().unwrap();
+            pos += 16;
+            let set_epoch = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let member_position = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap());
+            pos += 2;
+            let member_count = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap());
+            pos += 2;
+            let routing_width = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let n_slots = usize::from(u16::from_le_bytes(
+                payload[pos..pos + 2].try_into().unwrap(),
+            ));
+            pos += 2;
+            if n_slots > MEMBERSHIP_MAX_HOSTED_SLOTS {
+                return Err(KvError::Corrupt(format!(
+                    "membership stamp claims {n_slots} hosted slots (cap \
+                     {MEMBERSHIP_MAX_HOSTED_SLOTS})"
+                )));
+            }
+            if pos + n_slots * 2 != payload_len {
+                return Err(KvError::Corrupt(format!(
+                    "membership stamp n_slots {n_slots} inconsistent with payload \
+                     length {payload_len}"
+                )));
+            }
+            let mut slots_hosted = Vec::with_capacity(n_slots);
+            for _ in 0..n_slots {
+                slots_hosted.push(u16::from_le_bytes(
+                    payload[pos..pos + 2].try_into().unwrap(),
+                ));
+                pos += 2;
+            }
+            Some(MembershipStamp {
+                set_uuid,
+                set_epoch,
+                member_position,
+                member_count,
+                routing_width,
+                slots_hosted,
+            })
+        };
         Ok(Self {
             seq,
             tree_roots,
@@ -288,6 +455,7 @@ impl LedgerRecord {
             next_ino,
             alloc_bitmap_generation,
             node_seq_watermark,
+            membership_stamp,
         })
     }
 }
@@ -825,6 +993,12 @@ impl KvMetaBackend {
             // record's watermark — see the extent-reuse chain argument
             // on [`LedgerRecord::node_seq_watermark`].
             node_seq_watermark: inodes.node_seq_snapshot(),
+            // PR VL5a (§5.5.1a): the membership stamp rides EVERY ledger
+            // record of a slot-mapped volume (seeded from the mounted
+            // record at open; installed by format/repair-set). Legacy
+            // volumes carry None forever — their slots stay byte-
+            // identical to the pre-VL5a encoding.
+            membership_stamp: self.membership_stamp(),
         };
         if let Err(e) = write_ledger_slot(
             self.device_path(),

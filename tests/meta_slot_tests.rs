@@ -420,8 +420,12 @@ async fn test_torn_newest_stamped_slot_falls_back_to_predecessor() {
 
     // Tear the newest slot (slot = seq % 32 = 8) mid-payload.
     use std::io::{Seek, SeekFrom, Write};
-    let mut f = std::fs::OpenOptions::new().write(true).open(&ledger).unwrap();
-    f.seek(SeekFrom::Start(8 * ROOT_LEDGER_SLOT_LEN + 40)).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&ledger)
+        .unwrap();
+    f.seek(SeekFrom::Start(8 * ROOT_LEDGER_SLOT_LEN + 40))
+        .unwrap();
     f.write_all(&[0xFF; 64]).unwrap();
     f.sync_all().unwrap();
 
@@ -445,8 +449,14 @@ fn test_meta_slots_bounds_enforced_at_format() {
         "W > 64 × volumes refuses"
     );
     assert!(validate_meta_slots(2, 2).is_ok(), "W = volumes admits");
-    assert!(validate_meta_slots(128, 2).is_ok(), "W = 64 × volumes admits");
-    assert!(validate_meta_slots(1, 1).is_ok(), "W = 1 single volume admits");
+    assert!(
+        validate_meta_slots(128, 2).is_ok(),
+        "W = 64 × volumes admits"
+    );
+    assert!(
+        validate_meta_slots(1, 1).is_ok(),
+        "W = 1 single volume admits"
+    );
     let msg = format!("{}", validate_meta_slots(129, 2).unwrap_err());
     assert!(
         msg.contains("64"),
@@ -458,7 +468,11 @@ fn test_meta_slots_bounds_enforced_at_format() {
 fn test_plan_meta_slot_set_identity_map_and_hosted_slots() {
     let plan = plan_meta_slot_set(3, 7).expect("bounds admit");
     assert_eq!(plan.routing_width, 7);
-    assert_eq!(plan.slot_map, vec![0, 1, 2, 0, 1, 2, 0], "slot k → volume k % N");
+    assert_eq!(
+        plan.slot_map,
+        vec![0, 1, 2, 0, 1, 2, 0],
+        "slot k → volume k % N"
+    );
     assert_eq!(plan.stamps.len(), 3);
     for (pos, st) in plan.stamps.iter().enumerate() {
         assert_eq!(st.member_position, pos as u16);
@@ -471,10 +485,17 @@ fn test_plan_meta_slot_set_identity_map_and_hosted_slots() {
         assert!(st.slots_hosted.len() <= MEMBERSHIP_MAX_HOSTED_SLOTS);
     }
     // Every slot hosted exactly once across the set.
-    let mut all: Vec<u16> = plan.stamps.iter().flat_map(|s| s.slots_hosted.clone()).collect();
+    let mut all: Vec<u16> = plan
+        .stamps
+        .iter()
+        .flat_map(|s| s.slots_hosted.clone())
+        .collect();
     all.sort_unstable();
     assert_eq!(all, (0..7u16).collect::<Vec<_>>());
-    assert!(plan_meta_slot_set(2, 129).is_err(), "plan enforces the bound");
+    assert!(
+        plan_meta_slot_set(2, 129).is_err(),
+        "plan enforces the bound"
+    );
 }
 
 /// Default formats stay legacy-shaped: no bit 2, no stamp, a ledger slot
@@ -881,7 +902,9 @@ async fn test_repair_set_restamps_coherent_state_and_refuses_incoherent() {
         restamped.contains(&kb.display().to_string()),
         "the stampless member must be re-stamped: {restamped:?}"
     );
-    let disc = discover_meta_set(&paths).await.expect("repaired set discovers");
+    let disc = discover_meta_set(&paths)
+        .await
+        .expect("repaired set discovers");
     assert!(disc.stamped);
     assert_eq!(disc.routing_width, 4);
 

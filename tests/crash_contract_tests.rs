@@ -853,6 +853,7 @@ fn kv_ledger_rec(seq: u64) -> LedgerRecord {
         next_ino: 2 + seq,
         alloc_bitmap_generation: seq,
         node_seq_watermark: seq,
+        membership_stamp: None,
     }
 }
 
@@ -1137,6 +1138,7 @@ async fn test_kv_alloc_torn_newest_root_after_churn_predecessor_extents_intact()
         next_ino: 2,
         alloc_bitmap_generation: generation,
         node_seq_watermark: seq,
+        membership_stamp: None,
     };
 
     let ring = JournalRing::new(f.path(), 0, RING_PAGES, 0);
@@ -1462,6 +1464,7 @@ async fn test_kv_v3_torn_newest_ledger_mount_serves_predecessor() {
         next_ino: 999_999,
         alloc_bitmap_generation: 999,
         node_seq_watermark: 999,
+        membership_stamp: None,
     };
     torn.tree_roots
         .push(squeezefs::meta_backend::kv::checkpoint::TreeRoot {

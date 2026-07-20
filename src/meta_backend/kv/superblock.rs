@@ -94,21 +94,77 @@ pub const FEATURE_INCOMPAT_KV_V3: u64 = 1 << 0;
 /// remedy it demands.
 pub const FEATURE_INCOMPAT_NODE_SEQ_WATERMARK: u64 = 1 << 1;
 
+/// `features_incompat` bit 2: the volume participates in the **frozen
+/// routing-width / slot-map machinery** (design-volume-lifecycle §5.5.1,
+/// KD-7/KD-14, PR VL5a): its root-ledger records carry the §5.5.1a
+/// membership stamp (and, from PR VL5b on, guest tree roots). Stamp-
+/// extended ledger slots fail the pre-VL5a decoder's length-consistency
+/// equation and **decode as absent** — an old binary would silently fall
+/// back to an older slot (stale roots, stale `journal_tail_seq`) — so
+/// the numbered §5.5.1a ordering invariant is normative: **(1)** this
+/// bit is written and barriered durably **before (2)** the volume's
+/// first stamp-extended ledger slot. A crash between (1) and (2) is
+/// harmless: old binaries are already refused at this gate; this binary
+/// proceeds (the stamp appears on the next stamped ledger write). Never
+/// set on default formats — legacy sets stay bit-identical.
+pub const FEATURE_INCOMPAT_KV_GUEST_SLOTS: u64 = 1 << 2;
+
 /// `features_incompat` bit 3: the volume set has a **lifecycle history**
 /// (design-volume-lifecycle KD-14, §7): a non-legacy volume record, a
 /// non-identity slot map, or an active drain exists. Set durably at the
 /// FIRST lifecycle commit — **before** the durable record it gates
 /// (bit-before-durable-record ordering) — and never on untouched sets,
 /// so legacy volumes stay bit-identical. Old binaries refuse loud via
-/// the [`FEATURES_INCOMPAT_KNOWN`] gate. Bit 2 is reserved for
-/// `KV_GUEST_SLOTS` (PR VL5a) and deliberately not defined here.
+/// the [`FEATURES_INCOMPAT_KNOWN`] gate.
 pub const FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE: u64 = 1 << 3;
 
 /// Incompat feature bits this binary understands. Any other set bit
 /// refuses the mount naming the bit (§6.1).
 pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
     | FEATURE_INCOMPAT_NODE_SEQ_WATERMARK
+    | FEATURE_INCOMPAT_KV_GUEST_SLOTS
     | FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE;
+
+/// The §5.5.1a ledger-slot space cap: at most 64 hosted slots per volume,
+/// so a worst-case root-ledger record (24 B header + 34 B fixed prefix +
+/// (64 × 3 guest + ≤ 5 native) roots × 17 B + the membership stamp)
+/// stays under the 4096-B slot. Enforced here at format
+/// ([`validate_meta_slots`]) and by the stamp encoder
+/// ([`super::checkpoint::MembershipStamp`]); migration preflight (VL5b)
+/// re-enforces it per assignment.
+pub const META_SLOTS_PER_VOLUME_CAP: u32 = 64;
+
+/// Validate `format --meta-slots` (design-volume-lifecycle §5.5.1, KD-7):
+/// the frozen routing width must satisfy
+/// `volumes ≤ W ≤ 64 × volumes` — the lower bound because every volume
+/// must host at least one slot (its native mint slot), the upper bound
+/// because the round-robin identity distribution must respect the
+/// [`META_SLOTS_PER_VOLUME_CAP`] ledger-slot space cap on every member.
+pub fn validate_meta_slots(width: u32, volume_count: usize) -> Result<(), KvError> {
+    let n = u32::try_from(volume_count)
+        .map_err(|_| KvError::Corrupt(format!("absurd meta volume count {volume_count}")))?;
+    if n == 0 {
+        return Err(KvError::Corrupt(
+            "--meta-slots requires at least one metadata volume".to_string(),
+        ));
+    }
+    if width < n {
+        return Err(KvError::Corrupt(format!(
+            "--meta-slots {width} is below the volume count {n}: every metadata volume \
+             must host at least one routing slot (volumes ≤ W ≤ 64 × volumes, \
+             design-volume-lifecycle §5.5.1)"
+        )));
+    }
+    let cap = n.saturating_mul(META_SLOTS_PER_VOLUME_CAP);
+    if width > cap {
+        return Err(KvError::Corrupt(format!(
+            "--meta-slots {width} exceeds 64 × {n} volumes = {cap}: at most 64 hosted \
+             slots per volume — the §5.5.1a ledger-slot space cap keeps the worst-case \
+             root-ledger record inside its 4096-byte slot"
+        )));
+    }
+    Ok(())
+}
 
 /// Read-only feature bits this binary understands (none yet — §4.11
 /// reserves the mechanism for snapshots). Unknown bits mount read-only.
@@ -632,30 +688,26 @@ pub async fn write_superblock_v3(path: &Path, sb: &SuperblockV3) -> Result<(), K
     Ok(())
 }
 
-/// Stamp [`FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE`] on `path`'s superblock
-/// — the "first non-trivial lifecycle commit" gate (KD-14). Returns
-/// whether the bit was NEWLY set (`false` = already stamped, no write).
-/// Refuses blank / legacy-v2 / corrupt volumes loud. Callers must invoke
-/// this **before** committing the durable record the bit gates
-/// (bit-before-durable-record ordering, design-volume-lifecycle §7): a
-/// crash between the bit write and the record commit leaves a set old
-/// binaries refuse and this binary mounts unchanged — the safe prefix.
+/// Stamp one incompat `bit` on `path`'s superblock (shared body of the
+/// two KD-14 bit setters). Returns whether the bit was NEWLY set
+/// (`false` = already stamped, no write). Refuses blank / legacy-v2 /
+/// corrupt volumes loud.
 ///
 /// Sector 0 is written only here and at format, never by the live
 /// backend (checkpoints flip the root ledger), so the whole-sector
 /// checksummed rewrite is race-free against an open volume.
-pub async fn set_volume_lifecycle_bit(path: &Path) -> Result<bool, KvError> {
+async fn set_incompat_bit(path: &Path, bit: u64, what: &str) -> Result<bool, KvError> {
     match classify_volume(path).await? {
         VolumeFormat::V3(mut sb) => {
-            if sb.features_incompat & FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE != 0 {
+            if sb.features_incompat & bit != 0 {
                 return Ok(false);
             }
-            sb.features_incompat |= FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE;
+            sb.features_incompat |= bit;
             write_superblock_v3(path, &sb).await?;
             Ok(true)
         }
         VolumeFormat::Blank => Err(KvError::Corrupt(format!(
-            "{}: cannot stamp the volume-lifecycle bit on an unformatted volume — run \
+            "{}: cannot stamp the {what} bit on an unformatted volume — run \
              `squeezefs format` first",
             path.display()
         ))),
@@ -664,4 +716,32 @@ pub async fn set_volume_lifecycle_bit(path: &Path) -> Result<bool, KvError> {
             path.display()
         ))),
     }
+}
+
+/// Stamp [`FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE`] on `path`'s superblock
+/// — the "first non-trivial lifecycle commit" gate (KD-14). Callers must
+/// invoke this **before** committing the durable record the bit gates
+/// (bit-before-durable-record ordering, design-volume-lifecycle §7): a
+/// crash between the bit write and the record commit leaves a set old
+/// binaries refuse and this binary mounts unchanged — the safe prefix.
+pub async fn set_volume_lifecycle_bit(path: &Path) -> Result<bool, KvError> {
+    set_incompat_bit(
+        path,
+        FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE,
+        "volume-lifecycle",
+    )
+    .await
+}
+
+/// Stamp [`FEATURE_INCOMPAT_KV_GUEST_SLOTS`] on `path`'s superblock —
+/// step **(1)** of the §5.5.1a bit-before-first-stamp ordering
+/// invariant. Callers must invoke this (and let the write land durably)
+/// **before** the volume's first stamp-extended ledger slot is written;
+/// see the constant's doc for why the order is load-bearing. Fresh
+/// `--meta-slots` formats take the other path: the bit rides the planned
+/// superblock, which format's flip discipline stamps LAST behind a
+/// barrier over the already-written (stamped) ledger — sector 0 is
+/// zeroed first, so no crash prefix is mountable by any binary at all.
+pub async fn set_guest_slots_bit(path: &Path) -> Result<bool, KvError> {
+    set_incompat_bit(path, FEATURE_INCOMPAT_KV_GUEST_SLOTS, "guest-slots").await
 }

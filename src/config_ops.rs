@@ -198,13 +198,26 @@ pub fn staging_write_preflight(dirs: &[PathBuf]) -> std::result::Result<(), Stri
     Ok(())
 }
 
+/// The volume the format config lives on: the host of routing slot 0 in
+/// CANONICAL set order (ino 1 routes to slot 0 — PR VL5a §5.5.1a; for
+/// legacy sets this is exactly the first URI-listed volume, today's
+/// behavior). Every config read/write below resolves through this, so a
+/// reordered stamped URI still finds the config.
+async fn config_home_volume(meta_lvs: &[String]) -> Result<String> {
+    if meta_lvs.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(
+            "at least one metadata volume is required".to_string(),
+        ));
+    }
+    let disc = crate::meta_backend::discover_meta_set(meta_lvs).await?;
+    Ok(disc.ordered_paths[disc.slot_to_volume[0]].clone())
+}
+
 /// `squeezefs config get-cache-paths`: the staging/cache directories the
 /// filesystem was formatted with (`None`/empty ⇒ permanently cache-less).
 pub async fn get_cache_paths(meta_lvs: &[String]) -> Result<Option<Vec<PathBuf>>> {
-    let first = meta_lvs.first().ok_or_else(|| {
-        SqueezefsError::InvalidOperation("at least one metadata volume is required".to_string())
-    })?;
-    Ok(read_format_config(first).await?.disk_cache_paths)
+    let home = config_home_volume(meta_lvs).await?;
+    Ok(read_format_config(&home).await?.disk_cache_paths)
 }
 
 /// `squeezefs config set-cache-paths`: the ONLY way to change a
@@ -232,9 +245,8 @@ pub async fn get_cache_paths(meta_lvs: &[String]) -> Result<Option<Vec<PathBuf>>
 ///
 /// [`format_preflight`]: crate::meta_backend::kv::builder::format_preflight
 pub async fn set_cache_paths(meta_lvs: &[String], paths: &[PathBuf]) -> Result<()> {
-    let first = meta_lvs.first().ok_or_else(|| {
-        SqueezefsError::InvalidOperation("at least one metadata volume is required".to_string())
-    })?;
+    let first = config_home_volume(meta_lvs).await?;
+    let first = &first;
     if paths.is_empty() {
         return Err(SqueezefsError::InvalidOperation(
             "at least one cache path is required".to_string(),
@@ -273,14 +285,13 @@ pub async fn set_cache_paths(meta_lvs: &[String], paths: &[PathBuf]) -> Result<(
     Ok(())
 }
 
-/// Read the format config off the FIRST metadata volume via a read-only
+/// Read the format config off the config-home metadata volume (the host
+/// of routing slot 0 — the first volume for legacy sets) via a read-only
 /// probe (the `volume list` / `df` access pattern — safe beside a live
 /// mount, nothing written).
 pub async fn read_volume_format_config(meta_lvs: &[String]) -> Result<crate::FormatConfig> {
-    let first = meta_lvs.first().ok_or_else(|| {
-        SqueezefsError::InvalidOperation("at least one metadata volume is required".to_string())
-    })?;
-    read_format_config(first).await
+    let home = config_home_volume(meta_lvs).await?;
+    read_format_config(&home).await
 }
 
 /// `squeezefs volume list` offline probe: the durable data-volume set in
@@ -506,9 +517,9 @@ pub async fn undrain_data_volume(meta_lvs: &[String], volume_id: &str) -> Result
 
     // Cancel the durable evacuation records for this volume in the same
     // guarded open (an adopted Queued/Running record would restart the
-    // drain at the next mount).
-    let backends = crate::meta_backend::open_meta_volume_set(meta_lvs).await?;
-    let routed = std::sync::Arc::new(crate::meta_backend::RoutedMetaBackend::new(backends));
+    // drain at the next mount). Routed open: stamped sets route with
+    // their frozen width/slot map (PR VL5a).
+    let routed = crate::meta_backend::open_routed_meta_set(meta_lvs).await?;
     let result: Result<()> = async {
         for mut job in crate::jobs::JobFabric::list_records(&routed).await? {
             let matches = matches!(
@@ -592,9 +603,9 @@ pub async fn remove_data_volume_offline(
         )));
     }
 
-    // Guarded open (the D0 claims) + the in-process engine.
-    let backends = crate::meta_backend::open_meta_volume_set(meta_lvs).await?;
-    let routed = std::sync::Arc::new(crate::meta_backend::RoutedMetaBackend::new(backends));
+    // Guarded open (the D0 claims) + the in-process engine. Routed:
+    // stamped sets route with their frozen width/slot map (PR VL5a).
+    let routed = crate::meta_backend::open_routed_meta_set(meta_lvs).await?;
     let result = offline_drain_body(&routed, meta_lvs, cfg, records, volume_id, throttle_pct).await;
     for vol in &routed.volumes {
         if let Err(e) = vol.shutdown().await {
@@ -782,7 +793,9 @@ async fn commit_volume_records(
     records: Vec<crate::DataVolumeRecord>,
     extra_xattrs: Vec<(String, Vec<u8>)>,
 ) -> Result<()> {
-    let backends = crate::meta_backend::open_meta_volume_set(meta_lvs).await?;
+    // Routed open (PR VL5a): the config xattr on ino 1 routes to the
+    // slot-0 host on stamped sets; legacy sets keep volume 0.
+    let routed = crate::meta_backend::open_routed_meta_set(meta_lvs).await?;
 
     // Bit-before-durable-record (design-volume-lifecycle §7): stamp every
     // member superblock before the record exists. Sector 0 is never
@@ -792,7 +805,7 @@ async fn commit_volume_records(
         if let Err(e) =
             crate::meta_backend::kv::superblock::set_volume_lifecycle_bit(Path::new(path)).await
         {
-            for be in &backends {
+            for be in &routed.volumes {
                 let _ = be.shutdown().await;
             }
             return Err(e.into());
@@ -812,19 +825,19 @@ async fn commit_volume_records(
     })?;
     let commit = async {
         crate::meta_backend::Metadata::setxattr(
-            backends[0].as_ref(),
+            routed.as_ref(),
             1,
             crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
             &bytes,
         )
         .await?;
         for (name, value) in &extra_xattrs {
-            crate::meta_backend::Metadata::setxattr(backends[0].as_ref(), 1, name, value).await?;
+            crate::meta_backend::Metadata::setxattr(routed.as_ref(), 1, name, value).await?;
         }
         Ok::<(), crate::error::SqueezefsError>(())
     }
     .await;
-    for be in &backends {
+    for be in &routed.volumes {
         if let Err(te) = be.shutdown().await {
             log::warn!(
                 "releasing guard on {:?} after a lifecycle commit failed: {te}",
@@ -834,4 +847,213 @@ async fn commit_volume_records(
     }
     commit?;
     Ok(())
+}
+
+/// `squeezefs volume repair-set` — the VL5a posture (design-volume-
+/// lifecycle §5.5.1a): print the observed per-volume membership-stamp
+/// state, then **refuse to auto-fix anything beyond re-stamping a
+/// COHERENT observed state**:
+///
+/// - legacy set (no stamps anywhere): a no-op — never stamps, never sets
+///   a bit (KD-14's untouched-sets law);
+/// - every member stamped and mutually coherent (one `set_uuid`, one
+///   `set_epoch`, one geometry, unique complete positions, every slot in
+///   `[0, W)` hosted exactly once): idempotent re-stamp of exactly that
+///   state — closes a torn-newest-ledger-slot fallback that surfaced an
+///   older (but identical) stamp;
+/// - exactly ONE stampless member beside an otherwise-coherent set whose
+///   stamps leave exactly one position and one slot-complement free (the
+///   kill-9 window repair-set itself can leave): the missing stamp is
+///   inferable — write it (bit 2 barriered first, §5.5.1a ordering);
+/// - anything else (mixed epochs, foreign uuids, duplicate positions,
+///   multiple stampless members…): REFUSE loud with the observed state —
+///   the §5.5.2b highest-complete-epoch resolution lands with VL5b.
+///
+/// Returns the paths whose ledger was re-stamped. Guarded like the other
+/// offline lifecycle verbs: live clients refuse; each stamp write rides a
+/// D0-guarded open + clean shutdown (the final checkpoint makes it
+/// durable).
+pub async fn repair_meta_set(meta_lvs: &[String]) -> Result<Vec<String>> {
+    use crate::meta_backend::kv::checkpoint::{MembershipStamp, MEMBERSHIP_MAX_HOSTED_SLOTS};
+    if meta_lvs.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(
+            "at least one metadata volume is required".to_string(),
+        ));
+    }
+    // Live-client gate on EVERY volume before anything is touched.
+    for path in meta_lvs {
+        crate::meta_backend::kv::builder::format_preflight(Path::new(path), true)
+            .await
+            .map_err(|e| {
+                SqueezefsError::InvalidOperation(format!("volume repair-set refused: {e}"))
+            })?;
+    }
+
+    let obs = crate::meta_backend::observe_meta_set(meta_lvs).await?;
+    println!("observed membership state ({} volume(s)):", obs.len());
+    for o in &obs {
+        match &o.stamp {
+            Some(st) => println!(
+                "  {}: set {:02x?}.. epoch {} position {}/{} width {} slots {:?}",
+                o.path,
+                &st.set_uuid[..4],
+                st.set_epoch,
+                st.member_position,
+                st.member_count,
+                st.routing_width,
+                st.slots_hosted
+            ),
+            None => println!("  {}: NO membership stamp", o.path),
+        }
+    }
+
+    let stamped: Vec<&crate::meta_backend::MetaVolumeObservation> =
+        obs.iter().filter(|o| o.stamp.is_some()).collect();
+    if stamped.is_empty() {
+        println!("legacy set (no stamps) — nothing to repair.");
+        return Ok(Vec::new());
+    }
+    let refuse = |msg: String| {
+        Err(SqueezefsError::InvalidOperation(format!(
+            "volume repair-set refused: {msg} — VL5a re-stamps only a coherent observed \
+             state (the §5.5.2b epoch resolution lands with the migration engine)"
+        )))
+    };
+
+    // Coherence of the stamped subset.
+    let first = stamped[0].stamp.as_ref().expect("filtered Some");
+    for o in &stamped[1..] {
+        let st = o.stamp.as_ref().expect("filtered Some");
+        if st.set_uuid != first.set_uuid
+            || st.set_epoch != first.set_epoch
+            || st.member_count != first.member_count
+            || st.routing_width != first.routing_width
+        {
+            return refuse(format!(
+                "stamps on {} and {} disagree (uuid/epoch/geometry)",
+                stamped[0].path, o.path
+            ));
+        }
+    }
+    let member_count = usize::from(first.member_count);
+    let width = first.routing_width as usize;
+    if member_count != meta_lvs.len() {
+        return refuse(format!(
+            "stamps declare {member_count} members but the URI lists {}",
+            meta_lvs.len()
+        ));
+    }
+
+    // Positions and hosted slots of the stamped members.
+    let mut pos_holder: Vec<Option<&str>> = vec![None; member_count];
+    let mut slot_hosted: Vec<bool> = vec![false; width];
+    for o in &stamped {
+        let st = o.stamp.as_ref().expect("filtered Some");
+        let pos = usize::from(st.member_position);
+        if pos >= member_count {
+            return refuse(format!(
+                "{} stamps out-of-range position {pos} of {member_count}",
+                o.path
+            ));
+        }
+        if let Some(prev) = pos_holder[pos] {
+            return refuse(format!("{prev} and {} both stamp position {pos}", o.path));
+        }
+        pos_holder[pos] = Some(&o.path);
+        for &s in &st.slots_hosted {
+            let s = usize::from(s);
+            if s >= width || slot_hosted[s] {
+                return refuse(format!(
+                    "{} hosts slot {s} out of range or already hosted",
+                    o.path
+                ));
+            }
+            slot_hosted[s] = true;
+        }
+    }
+
+    let unstamped: Vec<&crate::meta_backend::MetaVolumeObservation> =
+        obs.iter().filter(|o| o.stamp.is_none()).collect();
+    let mut to_write: Vec<(String, MembershipStamp)> = Vec::new();
+    match unstamped.len() {
+        0 => {
+            // Fully coherent: every slot must already be hosted; re-stamp
+            // exactly what stands (idempotent).
+            if let Some(missing) = slot_hosted.iter().position(|&h| !h) {
+                return refuse(format!(
+                    "slot {missing} of width {width} is hosted by no member"
+                ));
+            }
+            for o in &obs {
+                to_write.push((o.path.clone(), o.stamp.clone().expect("all stamped")));
+            }
+        }
+        1 => {
+            // The kill-9 window: exactly one free position + the slot
+            // complement makes the missing stamp inferable.
+            let free_positions: Vec<usize> = pos_holder
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| h.is_none())
+                .map(|(p, _)| p)
+                .collect();
+            let [pos] = free_positions[..] else {
+                return refuse(format!(
+                    "one stampless member ({}) but {} free positions — not inferable",
+                    unstamped[0].path,
+                    free_positions.len()
+                ));
+            };
+            let missing_slots: Vec<u16> = slot_hosted
+                .iter()
+                .enumerate()
+                .filter(|(_, &h)| !h)
+                .map(|(s, _)| s as u16)
+                .collect();
+            if missing_slots.is_empty() || missing_slots.len() > MEMBERSHIP_MAX_HOSTED_SLOTS {
+                return refuse(format!(
+                    "the unhosted slot complement ({} slots) cannot belong to one member",
+                    missing_slots.len()
+                ));
+            }
+            let inferred = MembershipStamp {
+                set_uuid: first.set_uuid,
+                set_epoch: first.set_epoch,
+                member_position: pos as u16,
+                member_count: first.member_count,
+                routing_width: first.routing_width,
+                slots_hosted: missing_slots,
+            };
+            println!(
+                "inferring the missing stamp for {}: position {pos}, slots {:?}",
+                unstamped[0].path, inferred.slots_hosted
+            );
+            for o in &stamped {
+                to_write.push((o.path.clone(), o.stamp.clone().expect("stamped")));
+            }
+            to_write.push((unstamped[0].path.clone(), inferred));
+        }
+        n => {
+            return refuse(format!(
+                "{n} stampless members beside a stamped set — positions are not inferable"
+            ));
+        }
+    }
+
+    // Execute: bit 2 barriered durably FIRST on every volume that will
+    // carry a stamp (§5.5.1a ordering invariant — a crash here leaves
+    // bit-set stampless volumes this very verb repairs on re-run), then
+    // each stamp rides a guarded open's shutdown checkpoint.
+    for (path, _) in &to_write {
+        crate::meta_backend::kv::superblock::set_guest_slots_bit(Path::new(path)).await?;
+    }
+    let mut restamped = Vec::with_capacity(to_write.len());
+    for (path, stamp) in to_write {
+        let be = crate::meta_backend::kv::backend::KvMetaBackend::open(Path::new(&path)).await?;
+        be.set_membership_stamp(stamp);
+        be.shutdown().await?;
+        restamped.push(path);
+    }
+    println!("re-stamped {} member volume(s).", restamped.len());
+    Ok(restamped)
 }

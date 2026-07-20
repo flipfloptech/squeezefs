@@ -145,6 +145,10 @@ async fn open_volume_gated(
 /// volume k releases the guards already taken on volumes `0..k` — flocks,
 /// `writer_claim` records, and NVMe reservations — via each backend's
 /// clean shutdown, then propagates the volume-k error loud.
+///
+/// Takes `paths` verbatim — set-order canonicalization (the §5.5.1a
+/// stamp discovery) is [`open_routed_meta_set`]'s job; production
+/// write-mount paths go through that wrapper.
 pub async fn open_meta_volume_set(
     paths: &[String],
 ) -> Result<Vec<std::sync::Arc<kv::backend::KvMetaBackend>>> {
@@ -168,23 +172,195 @@ pub async fn open_meta_volume_set(
     Ok(opened)
 }
 
+/// Open a whole metadata volume set as the routed backend (PR VL5a): the
+/// §5.5.1a stamp discovery first (canonical `member_position` ordering,
+/// loud disagreement refusals), then the guarded [`open_meta_volume_set`]
+/// over the CANONICAL order, then a [`RoutedMetaBackend`] carrying the
+/// frozen routing width + durable slot map (legacy sets: implicit
+/// `W = volume count`, identity map, nothing written).
+pub async fn open_routed_meta_set(paths: &[String]) -> Result<std::sync::Arc<RoutedMetaBackend>> {
+    let disc = discover_meta_set(paths).await?;
+    // Structural validation BEFORE any guard is taken, so a bad map can
+    // never leave claims behind (discovery already guarantees this shape;
+    // belt and suspenders).
+    validate_slot_map(
+        disc.ordered_paths.len(),
+        disc.routing_width,
+        &disc.slot_to_volume,
+    )?;
+    let backends = open_meta_volume_set(&disc.ordered_paths).await?;
+    Ok(std::sync::Arc::new(RoutedMetaBackend::with_slot_map(
+        backends,
+        disc.routing_width,
+        disc.slot_to_volume,
+    )?))
+}
+
+/// [`open_routed_meta_set`]'s **read-only probe** twin (the clients/df/
+/// job-record access pattern — no D0 claims, no checkpoint tasks,
+/// nothing written): same §5.5.1a discovery + canonical ordering, probe
+/// opens per volume.
+pub async fn open_probe_routed_meta_set(
+    paths: &[String],
+) -> Result<std::sync::Arc<RoutedMetaBackend>> {
+    let disc = discover_meta_set(paths).await?;
+    let mut vols = Vec::with_capacity(disc.ordered_paths.len());
+    for path in &disc.ordered_paths {
+        vols.push(open_volume_probe(path).await?);
+    }
+    Ok(std::sync::Arc::new(RoutedMetaBackend::with_slot_map(
+        vols,
+        disc.routing_width,
+        disc.slot_to_volume,
+    )?))
+}
+
+/// Pure frozen-width ino routing (PR VL5a, KD-7): global ino →
+/// `(slot, local ino)` over the durable `routing_width W` — never over a
+/// live volume count, so global inos are eternally stable across set
+/// changes. `W ≤ 1` short-circuits to the EXACT identity encoding
+/// (`(0, ino)`) the pre-VL5a single-volume code used — every existing
+/// single-meta-volume filesystem's st_ino stability rides on it; for
+/// W = 1 the general arithmetic coincides anyway
+/// (`(ino−2)/1 + 2 = ino`). Ino 1 (the root) pins to slot 0.
+pub fn route_ino_width(ino: Ino, width: u64) -> (u64, Ino) {
+    if width <= 1 {
+        return (0, ino);
+    }
+    if ino == 1 {
+        return (0, 1);
+    }
+    ((ino - 2) % width, (ino - 2) / width + 2)
+}
+
+/// [`route_ino_width`]'s exact inverse: `(local ino, slot)` → global ino
+/// over the frozen width. Identity for `W ≤ 1`; local 1 on slot 0 is
+/// the root pin.
+pub fn make_global_ino_width(local_ino: Ino, slot: u64, width: u64) -> Ino {
+    if width <= 1 {
+        return local_ino;
+    }
+    if local_ino == 1 && slot == 0 {
+        return 1;
+    }
+    (local_ino - 2) * width + slot + 2
+}
+
+/// Validate a slot map's shape against a volume count + frozen width and
+/// derive each volume's **native mint slot** (its smallest hosted slot —
+/// where `make_global_ino` places the volume's freshly-allocated locals;
+/// in VL5a's identity distribution that is exactly the volume's
+/// `member_position`). Shared by [`RoutedMetaBackend::with_slot_map`]
+/// and the pre-open check in [`open_routed_meta_set`].
+fn validate_slot_map(
+    volume_count: usize,
+    routing_width: u64,
+    slot_to_volume: &[usize],
+) -> Result<Vec<u64>> {
+    let refuse = |msg: String| {
+        Err(crate::error::SqueezefsError::InvalidOperation(format!(
+            "metadata slot map invalid: {msg}"
+        )))
+    };
+    if volume_count == 0 {
+        return refuse("no metadata volumes".to_string());
+    }
+    if routing_width < volume_count as u64 {
+        return refuse(format!(
+            "routing width {routing_width} below the volume count {volume_count}"
+        ));
+    }
+    if slot_to_volume.len() as u64 != routing_width {
+        return refuse(format!(
+            "map covers {} slots but the frozen routing width is {routing_width}",
+            slot_to_volume.len()
+        ));
+    }
+    let mut native: Vec<u64> = vec![u64::MAX; volume_count];
+    for (slot, &vol) in slot_to_volume.iter().enumerate() {
+        if vol >= volume_count {
+            return refuse(format!(
+                "slot {slot} maps to volume index {vol} of {volume_count}"
+            ));
+        }
+        if native[vol] == u64::MAX {
+            native[vol] = slot as u64;
+        }
+    }
+    if let Some(orphan) = native.iter().position(|&s| s == u64::MAX) {
+        return refuse(format!(
+            "volume index {orphan} hosts no slot — every member must host at least one \
+             (its native mint slot)"
+        ));
+    }
+    Ok(native)
+}
+
 /// The routed multi-volume metadata backend: `volumes` stripes inos over
 /// per-volume [`kv::backend::KvMetaBackend`]s (format v3 is the only
 /// metadata format). `Arc`-shared (not `Clone`): the volumes own live
 /// backends (checkpoint tasks, caches) that must not fork.
+///
+/// PR VL5a (KD-7): routing runs over the FROZEN `routing_width` + the
+/// runtime slot→volume lookup table (the durable §5.5.1a slot map's
+/// cache, refreshed at open) — never over `volumes.len()` directly.
+/// Legacy sets ([`RoutedMetaBackend::new`]) synthesize the implicit
+/// `W = volume count` identity map, byte-identical to the pre-VL5a
+/// behavior.
 pub struct RoutedMetaBackend {
     pub volumes: Vec<std::sync::Arc<kv::backend::KvMetaBackend>>,
     pub disabled_volumes: std::sync::Arc<dashmap::DashMap<usize, bool, ahash::RandomState>>,
+    /// The frozen routing width W (KD-7). Legacy: the volume count.
+    routing_width: u64,
+    /// Runtime cache of the durable slot map: `slot → volumes index`.
+    /// A plain lookup table refreshed at open — migration semantics are
+    /// PR VL5b's.
+    slot_to_volume: Vec<usize>,
+    /// Per volume: its native mint slot (see [`validate_slot_map`]).
+    native_slot: Vec<u64>,
 }
 
 impl RoutedMetaBackend {
+    /// The LEGACY constructor: implicit `W = volume count`, identity
+    /// slot map — routes exactly as every pre-VL5a set did (nothing
+    /// durable exists to read; stamped sets come through
+    /// [`Self::with_slot_map`] via [`open_routed_meta_set`]).
     pub fn new(volumes: Vec<std::sync::Arc<kv::backend::KvMetaBackend>>) -> Self {
+        let n = volumes.len();
         Self {
             volumes,
             disabled_volumes: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
+            routing_width: n as u64,
+            slot_to_volume: (0..n).collect(),
+            native_slot: (0..n as u64).collect(),
         }
+    }
+
+    /// Construct over an explicit frozen width + slot map (the §5.5.1a
+    /// stamps' reconstruction, in canonical `member_position` order).
+    /// Refuses malformed maps loud ([`validate_slot_map`]).
+    pub fn with_slot_map(
+        volumes: Vec<std::sync::Arc<kv::backend::KvMetaBackend>>,
+        routing_width: u64,
+        slot_to_volume: Vec<usize>,
+    ) -> Result<Self> {
+        let native_slot = validate_slot_map(volumes.len(), routing_width, &slot_to_volume)?;
+        Ok(Self {
+            volumes,
+            disabled_volumes: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
+            routing_width,
+            slot_to_volume,
+            native_slot,
+        })
+    }
+
+    /// The frozen routing width W this set routes over (KD-7).
+    pub fn routing_width(&self) -> u64 {
+        self.routing_width
     }
 
     /// Routed dentry read: `(stored child ino (global), S_IFMT bits)`.
@@ -393,31 +569,27 @@ impl RoutedMetaBackend {
         Ok(())
     }
 
+    /// Global ino → `(volumes index, local ino)`: [`route_ino_width`]
+    /// over the FROZEN W (never `volumes.len()` — PR VL5a, KD-7), then
+    /// the slot→volume table. `W ≤ 1` keeps the pre-VL5a identity
+    /// short-circuit verbatim.
     pub fn route_ino(&self, ino: Ino) -> (usize, Ino) {
-        let num_volumes = self.volumes.len();
-        if num_volumes <= 1 {
+        if self.routing_width <= 1 {
             return (0, ino);
         }
-        if ino == 1 {
-            return (0, 1);
-        }
-        // (A redirection-follow loop lived here; its sole feeder was the
-        // fake `metadata-volume migrate` — deleted in VL1. Real routing
-        // changes are the VL5 slot map, design-volume-lifecycle §5.5.)
-        let volume_idx = ((ino - 2) % num_volumes as u64) as usize;
-        let local_ino = ((ino - 2) / num_volumes as u64) + 2;
-        (volume_idx, local_ino)
+        let (slot, local_ino) = route_ino_width(ino, self.routing_width);
+        (self.slot_to_volume[slot as usize], local_ino)
     }
 
+    /// `(local ino, volumes index)` → global ino over the frozen W:
+    /// freshly-minted locals encode into the volume's NATIVE slot (its
+    /// smallest hosted slot — the volume's `member_position` under the
+    /// VL5a identity distribution), which [`Self::route_ino`] inverts.
     pub fn make_global_ino(&self, local_ino: Ino, volume_idx: usize) -> Ino {
-        let num_volumes = self.volumes.len();
-        if num_volumes <= 1 {
+        if self.routing_width <= 1 {
             return local_ino;
         }
-        if local_ino == 1 && volume_idx == 0 {
-            return 1;
-        }
-        (local_ino - 2) * num_volumes as u64 + volume_idx as u64 + 2
+        make_global_ino_width(local_ino, self.native_slot[volume_idx], self.routing_width)
     }
 
     /// The per-ino xattr value cap — the largest inline xattr value
@@ -1348,6 +1520,296 @@ impl RoutedMetaBackend {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PR VL5a: §5.5.1a mount-time bootstrap — stamp observation, canonical
+// ordering, disagreement refusals, and the format-time slot plan.
+// ---------------------------------------------------------------------------
+
+/// One volume's raw §5.5.1a bootstrap observation: superblock uuid +
+/// the newest ledger record's membership stamp (both read off the device
+/// WITHOUT mounting — no tree routing, the chicken-and-egg resolution).
+#[derive(Debug, Clone)]
+pub struct MetaVolumeObservation {
+    pub path: String,
+    pub uuid: [u8; 16],
+    pub stamp: Option<kv::checkpoint::MembershipStamp>,
+}
+
+/// Read every listed volume's §5.5.1a observation (sector 0 + the 128 KiB
+/// ledger extent — cheap probe reads). Blank volumes and legacy v2 refuse
+/// loud exactly like the mount gate; a volume whose ledger holds no valid
+/// record observes as stampless (the mount proper will refuse it later —
+/// this surface only classifies membership). Also the raw feed for
+/// `squeezefs volume repair-set`'s observed-state report.
+pub async fn observe_meta_set(paths: &[String]) -> Result<Vec<MetaVolumeObservation>> {
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        match kv::superblock::classify_volume(std::path::Path::new(path)).await? {
+            kv::superblock::VolumeFormat::Blank => {
+                return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                    "Metadata volume {path} is not formatted (zeroed superblock) — run \
+                     `squeezefs format` first"
+                )));
+            }
+            kv::superblock::VolumeFormat::V2Legacy => {
+                return Err(v2_unsupported_error(path));
+            }
+            kv::superblock::VolumeFormat::V3(sb) => {
+                let stamp = kv::checkpoint::read_newest_ledger(
+                    std::path::Path::new(path),
+                    sb.root_ledger.start,
+                )
+                .await?
+                .and_then(|rec| rec.membership_stamp);
+                out.push(MetaVolumeObservation {
+                    path: path.clone(),
+                    uuid: sb.uuid,
+                    stamp,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A discovered metadata set (§5.5.1a): the CANONICAL member order plus
+/// the frozen routing geometry the mount routes with.
+#[derive(Debug, Clone)]
+pub struct MetaSetDiscovery {
+    /// Member paths in canonical order — `member_position` for stamped
+    /// sets, the operator's URI order (exactly today's behavior) for
+    /// legacy sets.
+    pub ordered_paths: Vec<String>,
+    /// Superblock uuids in the same canonical order (the
+    /// [`volume_set_generation`] inputs).
+    pub uuids: Vec<[u8; 16]>,
+    /// The frozen routing width W (legacy: the volume count).
+    pub routing_width: u64,
+    /// `slot → canonical volume index` (legacy: identity).
+    pub slot_to_volume: Vec<usize>,
+    /// Whether §5.5.1a stamps drove the reconstruction.
+    pub stamped: bool,
+}
+
+/// §5.5.1a order-independent discovery: probe every URI-listed volume's
+/// stamp FIRST (before any tree routing), reconstruct the membership by
+/// `member_position`, cross-check `set_uuid`/`set_epoch`/completeness,
+/// and only then let callers route ino 1. Legacy sets (no stamps): URI
+/// order stays authoritative, byte-identical to pre-VL5a behavior.
+/// **Every disagreement is a loud refusal naming the volumes**: mixed
+/// stamped/unstamped members, foreign `set_uuid`s, torn/mixed epochs
+/// (crash mid-protocol — the refusal names `squeezefs volume
+/// repair-set`), duplicate or out-of-range positions, member counts that
+/// do not match the URI list, and slot maps that do not cover `[0, W)`
+/// exactly once.
+pub async fn discover_meta_set(paths: &[String]) -> Result<MetaSetDiscovery> {
+    let obs = observe_meta_set(paths).await?;
+    let refuse = |msg: String| Err(crate::error::SqueezefsError::InvalidOperation(msg));
+
+    let stamped_count = obs.iter().filter(|o| o.stamp.is_some()).count();
+    if stamped_count == 0 {
+        // Legacy set: nothing durable to consult — implicit W = count,
+        // identity map, URI order authoritative (today's behavior).
+        return Ok(MetaSetDiscovery {
+            ordered_paths: obs.iter().map(|o| o.path.clone()).collect(),
+            uuids: obs.iter().map(|o| o.uuid).collect(),
+            routing_width: obs.len().max(1) as u64,
+            slot_to_volume: (0..obs.len()).collect(),
+            stamped: false,
+        });
+    }
+    if stamped_count < obs.len() {
+        let stampless: Vec<&str> = obs
+            .iter()
+            .filter(|o| o.stamp.is_none())
+            .map(|o| o.path.as_str())
+            .collect();
+        return refuse(format!(
+            "metadata set mixes stamped and stampless members: {} of {} volumes carry a \
+             §5.5.1a membership stamp but {stampless:?} carry none — a slot-mapped set's \
+             members are all stamped; if a repair was interrupted, run \
+             `squeezefs volume repair-set <sqmeta-uri>`",
+            stamped_count,
+            obs.len()
+        ));
+    }
+
+    // All stamped: cross-check identity, epoch, geometry, completeness.
+    let name = |o: &MetaVolumeObservation| o.path.clone();
+    let first = obs[0].stamp.as_ref().expect("all stamped");
+    for o in &obs[1..] {
+        let st = o.stamp.as_ref().expect("all stamped");
+        if st.set_uuid != first.set_uuid {
+            return refuse(format!(
+                "metadata volumes belong to DIFFERENT sets: {} and {} carry different \
+                 set uuids ({:02x?} vs {:02x?}) — one of them is from another filesystem",
+                name(&obs[0]),
+                name(o),
+                &first.set_uuid[..4],
+                &st.set_uuid[..4],
+            ));
+        }
+        if st.set_epoch != first.set_epoch {
+            return refuse(format!(
+                "metadata set carries torn/mixed membership epochs (crash mid-protocol): \
+                 {} is at epoch {} while {} is at epoch {} — run \
+                 `squeezefs volume repair-set <sqmeta-uri>` to reconcile",
+                name(&obs[0]),
+                first.set_epoch,
+                name(o),
+                st.set_epoch,
+            ));
+        }
+        if st.member_count != first.member_count || st.routing_width != first.routing_width {
+            return refuse(format!(
+                "metadata set stamps disagree on geometry: {} declares {} members / width \
+                 {} while {} declares {} members / width {}",
+                name(&obs[0]),
+                first.member_count,
+                first.routing_width,
+                name(o),
+                st.member_count,
+                st.routing_width,
+            ));
+        }
+    }
+    let member_count = usize::from(first.member_count);
+    if member_count != obs.len() {
+        let listed: Vec<&str> = obs.iter().map(|o| o.path.as_str()).collect();
+        return refuse(format!(
+            "metadata set stamps declare {member_count} members but the URI lists {} \
+             ({listed:?}) — a member is {}; every member of the set must be listed",
+            obs.len(),
+            if member_count > obs.len() {
+                "missing from the URI"
+            } else {
+                "listed that the stamps do not name"
+            },
+        ));
+    }
+
+    // Canonical ordering by member_position; duplicates refuse naming
+    // BOTH volumes.
+    let mut by_position: Vec<Option<&MetaVolumeObservation>> = vec![None; member_count];
+    for o in &obs {
+        let st = o.stamp.as_ref().expect("all stamped");
+        let pos = usize::from(st.member_position);
+        if pos >= member_count {
+            return refuse(format!(
+                "metadata volume {} stamps member position {pos} of a {member_count}-member \
+                 set — out of range",
+                name(o)
+            ));
+        }
+        if let Some(prev) = by_position[pos] {
+            return refuse(format!(
+                "metadata volumes {} and {} BOTH stamp member position {pos} — duplicate \
+                 membership; one of them is stale or foreign",
+                name(prev),
+                name(o)
+            ));
+        }
+        by_position[pos] = Some(o);
+    }
+    let ordered: Vec<&MetaVolumeObservation> = by_position
+        .into_iter()
+        .map(|o| o.expect("count == len and positions unique ⇒ complete"))
+        .collect();
+
+    // Slot map: every slot in [0, W) hosted exactly once across the set.
+    let width = first.routing_width as u64;
+    let mut slot_to_volume: Vec<Option<usize>> = vec![None; first.routing_width as usize];
+    for (vol_idx, o) in ordered.iter().enumerate() {
+        let st = o.stamp.as_ref().expect("all stamped");
+        for &slot in &st.slots_hosted {
+            let s = usize::from(slot);
+            if s >= slot_to_volume.len() {
+                return refuse(format!(
+                    "metadata volume {} hosts slot {slot} outside the frozen routing \
+                     width {width}",
+                    name(o)
+                ));
+            }
+            if let Some(prev) = slot_to_volume[s] {
+                return refuse(format!(
+                    "metadata volumes {} and {} BOTH host routing slot {slot} — the \
+                     durable slot map is torn; run `squeezefs volume repair-set`",
+                    name(ordered[prev]),
+                    name(o)
+                ));
+            }
+            slot_to_volume[s] = Some(vol_idx);
+        }
+    }
+    let mut map = Vec::with_capacity(slot_to_volume.len());
+    for (slot, vol) in slot_to_volume.into_iter().enumerate() {
+        match vol {
+            Some(v) => map.push(v),
+            None => {
+                return refuse(format!(
+                    "routing slot {slot} of width {width} is hosted by NO listed volume — \
+                     the durable slot map is incomplete; run `squeezefs volume repair-set`"
+                ));
+            }
+        }
+    }
+
+    Ok(MetaSetDiscovery {
+        ordered_paths: ordered.iter().map(|o| o.path.clone()).collect(),
+        uuids: ordered.iter().map(|o| o.uuid).collect(),
+        routing_width: width,
+        slot_to_volume: map,
+        stamped: true,
+    })
+}
+
+/// The format-time §5.5.1 slot plan for `format --meta-slots W`: one
+/// fresh set uuid, epoch 1, the identity slot distribution
+/// (`slot k → member position k mod N` — every member's native mint slot
+/// is its own position), and one membership stamp per member. Bounds per
+/// [`kv::superblock::validate_meta_slots`] (`volumes ≤ W ≤ 64 ×
+/// volumes`), refused loud.
+#[derive(Debug, Clone)]
+pub struct MetaSlotPlan {
+    /// The set identity every member's stamp carries.
+    pub set_uuid: [u8; 16],
+    /// The frozen routing width W.
+    pub routing_width: u32,
+    /// `slot → member_position` (the `FormatConfig.meta_slot_map`
+    /// mirror).
+    pub slot_map: Vec<u16>,
+    /// Per-member stamps, indexed by `member_position`.
+    pub stamps: Vec<kv::checkpoint::MembershipStamp>,
+}
+
+/// Build the [`MetaSlotPlan`] for `volume_count` members at frozen width
+/// `width` (see the struct docs).
+pub fn plan_meta_slot_set(volume_count: usize, width: u32) -> Result<MetaSlotPlan> {
+    kv::superblock::validate_meta_slots(width, volume_count)?;
+    let n = volume_count as u32;
+    let set_uuid = *uuid::Uuid::new_v4().as_bytes();
+    let slot_map: Vec<u16> = (0..width).map(|s| (s % n) as u16).collect();
+    let stamps = (0..n)
+        .map(|pos| kv::checkpoint::MembershipStamp {
+            set_uuid,
+            set_epoch: 1,
+            member_position: pos as u16,
+            member_count: n as u16,
+            routing_width: width,
+            slots_hosted: (0..width)
+                .filter(|s| s % n == pos)
+                .map(|s| s as u16)
+                .collect(),
+        })
+        .collect();
+    Ok(MetaSlotPlan {
+        set_uuid,
+        routing_width: width,
+        slot_map,
+        stamps,
+    })
+}
+
 /// The mounted volume set's **filesystem generation identity** — what a
 /// `squeezefs format` invocation changes and nothing else does. Local NVMe
 /// staging is bound to this identity (`cache::nvme` stamps it into every
@@ -1360,33 +1822,23 @@ impl RoutedMetaBackend {
 /// ([`kv::builder::BuilderConfig::new`]), read straight off sector 0
 /// without mounting the volume.
 ///
-/// The set identity is the ORDERED join of per-volume identities:
-/// `route_ino` stripes by volume order, so a reordered volume set is a
-/// different metadata view and must not adopt the old set's staging.
+/// The set identity is the ORDERED join of per-volume identities in
+/// **canonical set order** ([`discover_meta_set`]): `route_ino` stripes
+/// by that order, so a genuinely reordered LEGACY set is a different
+/// metadata view and must not adopt the old set's staging — while a
+/// STAMPED set's canonical order rides `member_position`, making the
+/// generation identical under any operator URI ordering (§5.5.1a).
 pub async fn volume_set_generation(meta_lvs: &[String]) -> Result<String> {
     use std::fmt::Write as _;
-    let mut parts = Vec::with_capacity(meta_lvs.len());
-    for path in meta_lvs {
-        let part = match kv::superblock::classify_volume(std::path::Path::new(path)).await? {
-            kv::superblock::VolumeFormat::Blank => {
-                return Err(crate::error::SqueezefsError::InvalidOperation(format!(
-                    "Metadata volume {path} is not formatted (zeroed superblock) — cannot \
-                     derive a filesystem generation; run `squeezefs format` first"
-                )));
-            }
-            kv::superblock::VolumeFormat::V2Legacy => {
-                return Err(v2_unsupported_error(path));
-            }
-            kv::superblock::VolumeFormat::V3(sb) => {
-                let mut s = String::with_capacity(3 + 32);
-                s.push_str("v3:");
-                for b in sb.uuid {
-                    let _ = write!(s, "{b:02x}");
-                }
-                s
-            }
-        };
-        parts.push(part);
+    let disc = discover_meta_set(meta_lvs).await?;
+    let mut parts = Vec::with_capacity(disc.uuids.len());
+    for uuid in &disc.uuids {
+        let mut s = String::with_capacity(3 + 32);
+        s.push_str("v3:");
+        for b in uuid {
+            let _ = write!(s, "{b:02x}");
+        }
+        parts.push(s);
     }
     Ok(parts.join("|"))
 }

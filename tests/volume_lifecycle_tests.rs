@@ -97,6 +97,9 @@ fn base_format_config(data_lvs: &[&Path]) -> FormatConfig {
         dismount_wait: None,
         upload_delay: None,
         fuse_io_uring_sqpoll_idle_ms: None,
+        meta_routing_width: None,
+        meta_slot_map: None,
+        meta_volumes: None,
     }
 }
 
@@ -346,9 +349,11 @@ fn test_new_volume_ids_are_vol_hex16_and_unique() {
 #[test]
 fn test_lifecycle_bit_is_bit3_and_does_not_intersect_bits_0_1_2() {
     assert_eq!(FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE, 1 << 3, "KD-14: bit 3");
-    // Bits 0/1 are KV_V3 / NODE_SEQ_WATERMARK; bit 2 is reserved for
-    // KV_GUEST_SLOTS (PR VL5a) — the new constant must intersect none.
-    let taken = FEATURE_INCOMPAT_KV_V3 | FEATURE_INCOMPAT_NODE_SEQ_WATERMARK | (1u64 << 2);
+    // Bits 0/1 are KV_V3 / NODE_SEQ_WATERMARK; bit 2 is KV_GUEST_SLOTS
+    // (landed in PR VL5a) — the lifecycle bit must intersect none.
+    let taken = FEATURE_INCOMPAT_KV_V3
+        | FEATURE_INCOMPAT_NODE_SEQ_WATERMARK
+        | squeezefs::meta_backend::kv::superblock::FEATURE_INCOMPAT_KV_GUEST_SLOTS;
     assert_eq!(
         FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE & taken,
         0,

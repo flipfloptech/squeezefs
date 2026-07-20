@@ -698,6 +698,9 @@ async fn set_format_config(h: &H, block_size: u64, comp: &str, enc: &str) {
         dismount_wait: None,
         upload_delay: None,
         fuse_io_uring_sqpoll_idle_ms: None,
+        meta_routing_width: None,
+        meta_slot_map: None,
+        meta_volumes: None,
     };
     h.routed
         .setxattr(

@@ -357,6 +357,12 @@ pub struct KvMetaBackend {
     path: PathBuf,
     sb: SuperblockV3,
     ledger: LedgerRecord,
+    /// The live §5.5.1a membership stamp (PR VL5a): seeded from the
+    /// mounted ledger record; every checkpoint's ledger record carries
+    /// it. `None` forever on legacy volumes. A plain `Mutex` — read once
+    /// per checkpoint cycle (background task) and written only by
+    /// format-grade admin verbs (`repair-set`), never on the hot path.
+    membership_stamp: std::sync::Mutex<Option<super::checkpoint::MembershipStamp>>,
     /// Shared node cache behind the three trees (§4.5). Held for tree
     /// lifetime; the trees clone the `Arc`.
     inodes: KvTree,
@@ -930,6 +936,10 @@ impl KvMetaBackend {
             sb,
             checkpoint_seq: AtomicU64::new(ledger.seq),
             last_ledger_tail: AtomicU64::new(ledger.journal_tail_seq),
+            // PR VL5a (§5.5.1a): seed the live stamp from the mounted
+            // record — every checkpoint re-writes it, so a slot-mapped
+            // volume's newest ledger slot always carries its membership.
+            membership_stamp: std::sync::Mutex::new(ledger.membership_stamp.clone()),
             ledger,
             inodes,
             dentries,
@@ -991,6 +1001,22 @@ impl KvMetaBackend {
     /// The ledger record this mount selected (newest valid).
     pub fn mounted_ledger(&self) -> &LedgerRecord {
         &self.ledger
+    }
+
+    /// The live §5.5.1a membership stamp this volume's checkpoints carry
+    /// (PR VL5a); `None` on legacy volumes.
+    pub fn membership_stamp(&self) -> Option<super::checkpoint::MembershipStamp> {
+        self.membership_stamp.lock().unwrap().clone()
+    }
+
+    /// Install/replace the §5.5.1a membership stamp — the `repair-set`
+    /// re-stamp surface. Callers must have barriered
+    /// [`super::superblock::FEATURE_INCOMPAT_KV_GUEST_SLOTS`] onto this
+    /// volume FIRST (the bit-before-first-stamp invariant); the stamp
+    /// lands durably with the next checkpoint's ledger write (shutdown's
+    /// final cycle at the latest).
+    pub fn set_membership_stamp(&self, stamp: super::checkpoint::MembershipStamp) {
+        *self.membership_stamp.lock().unwrap() = Some(stamp);
     }
 
     /// Mount replay statistics.

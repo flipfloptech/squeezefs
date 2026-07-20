@@ -122,6 +122,16 @@ enum Commands {
         /// clamp(volume/64, 8 MiB, 32 MiB).
         #[arg(long)]
         meta_journal_mb: Option<u64>,
+        /// Frozen metadata routing width W ("meta slots",
+        /// design-volume-lifecycle §5.5.1/KD-7). Default: W = meta volume
+        /// count, recorded implicitly (legacy-shaped set, byte-identical
+        /// to pre-VL5a formats). Explicit values make the set slot-mapped
+        /// (membership stamps + the KV_GUEST_SLOTS incompat bit — pre-VL5a
+        /// binaries refuse it loud); bounds: volumes <= W <= 64 x volumes.
+        /// Recommended >= 4x volumes for growth-planned deployments;
+        /// migration granularity is 1/W of the ino space.
+        #[arg(long)]
+        meta_slots: Option<u32>,
     },
     /// Show filesystem status
     Status {
@@ -843,6 +853,18 @@ enum VolumeActions {
         /// Durable volume id
         volume_id: String,
     },
+    /// Inspect and reconcile the metadata set-membership stamps
+    /// (design-volume-lifecycle §5.5.1a, PR VL5a): prints the observed
+    /// per-volume stamp state, idempotently re-stamps a COHERENT
+    /// observed state (including the single inferable missing member a
+    /// crashed repair can leave), and refuses everything else loud —
+    /// the §5.5.2b epoch resolution lands with the migration engine
+    /// (VL5b). Offline verb: takes the D0 claims like format-grade
+    /// verbs; live mounts refuse.
+    RepairSet {
+        /// sqmeta:// URI of the metadata volume set
+        target: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1339,11 +1361,9 @@ fn admin_roundtrip(mountpoint: &str, verb: &str, arg: &str) -> Result<String, St
 /// TCP (the sanctioned non-uring network path).
 async fn run_job_worker(meta_uri: &str) -> Result<(), Box<dyn std::error::Error>> {
     let meta_lvs = parse_block_uri(meta_uri, "sqmeta://")?;
-    let mut vols = Vec::new();
-    for path in &meta_lvs {
-        vols.push(squeezefs::meta_backend::open_volume_probe(path).await?);
-    }
-    let routed = std::sync::Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vols));
+    // Routed probe (PR VL5a): stamped sets canonicalize + route with
+    // their frozen width/slot map; legacy sets keep URI order.
+    let routed = squeezefs::meta_backend::open_probe_routed_meta_set(&meta_lvs).await?;
     let secret = squeezefs::job_wire::read_enroll_secret(&routed)
         .await
         .map_err(|e| format!("storage-membership credential unavailable: {e}"))?;
@@ -1392,11 +1412,9 @@ async fn job_probe_records(
     uri: &str,
 ) -> Result<Vec<squeezefs::jobs::JobRecord>, Box<dyn std::error::Error>> {
     let meta_lvs = parse_block_uri(uri, "sqmeta://")?;
-    let mut vols = Vec::new();
-    for path in &meta_lvs {
-        vols.push(squeezefs::meta_backend::open_volume_probe(path).await?);
-    }
-    let routed = std::sync::Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vols));
+    // Routed probe (PR VL5a): canonical order + frozen width for
+    // stamped sets; byte-identical legacy behavior otherwise.
+    let routed = squeezefs::meta_backend::open_probe_routed_meta_set(&meta_lvs).await?;
     Ok(squeezefs::jobs::JobFabric::list_records(&routed).await?)
 }
 
@@ -2473,6 +2491,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             fuse_io_uring_sqpoll_idle_ms,
             meta_node_kib,
             meta_journal_mb,
+            meta_slots,
         } => {
             let mut meta_lvs = Vec::new();
             let mut data_lvs = Vec::new();
@@ -2556,6 +2575,31 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             let meta_journal_override = meta_journal_mb.map(|mb| mb * 1024 * 1024);
 
+            // PR VL5a (design-volume-lifecycle §5.5.1/KD-7): an explicit
+            // --meta-slots freezes the routing width and makes the set
+            // slot-mapped — identity slot plan, membership stamps in every
+            // bootstrap ledger record, KV_GUEST_SLOTS (bit 2) on every
+            // member superblock. Bounds refuse BEFORE any destructive
+            // step. Default formats stay legacy-shaped (implicit
+            // W = volume count, nothing written, byte-identical).
+            let meta_slot_plan = match meta_slots {
+                Some(w) => Some(
+                    squeezefs::meta_backend::plan_meta_slot_set(meta_lvs.len(), w)
+                        .map_err(|e| format!("--meta-slots {w}: {e}"))?,
+                ),
+                None => None,
+            };
+            if let Some(ref plan) = meta_slot_plan {
+                println!(
+                    "Meta routing width frozen at W = {} over {} volume(s) (slot-mapped set: \
+                     membership stamps + KV_GUEST_SLOTS; pre-VL5a binaries refuse this set). \
+                     Migration granularity is 1/{} of the ino space.",
+                    plan.routing_width,
+                    meta_lvs.len(),
+                    plan.routing_width
+                );
+            }
+
             let requested_block_size = parse_human_readable_size(&block_size)?;
             // Every logical block lives in one fixed allocator chunk: a
             // larger block would span chunks and corrupt its neighbor.
@@ -2616,6 +2660,26 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 dismount_wait: dismount_wait.clone(),
                 upload_delay: Some(upload_delay.clone()),
                 fuse_io_uring_sqpoll_idle_ms,
+                // PR VL5a mirrors (the §5.5.1a stamps are authoritative;
+                // None on default formats keeps the config byte-identical).
+                meta_routing_width: meta_slot_plan.as_ref().map(|p| p.routing_width),
+                meta_slot_map: meta_slot_plan.as_ref().map(|p| p.slot_map.clone()),
+                meta_volumes: meta_slot_plan.as_ref().map(|_| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    meta_lvs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, path)| squeezefs::MetaVolumeRecord {
+                            id: squeezefs::new_data_volume_id(),
+                            backing_dev: path.clone(),
+                            member_position: i as u16,
+                            added_ts: now,
+                        })
+                        .collect()
+                }),
             };
 
             // Pre-flight EVERY meta volume before ANY destructive step
@@ -2657,13 +2721,16 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // dual-format dispatch).
             let config_bytes = serde_json::to_vec(&config)?;
             let first_meta = meta_lvs[0].clone();
-            for path in meta_lvs.clone() {
+            for (position, path) in meta_lvs.clone().into_iter().enumerate() {
                 let sem = semaphore.clone();
                 let config_xattr = if path == first_meta {
                     Some(config_bytes.clone())
                 } else {
                     None
                 };
+                // PR VL5a: each member's §5.5.1a stamp, by format order
+                // (= member_position; the canonical set order).
+                let stamp = meta_slot_plan.as_ref().map(|p| p.stamps[position].clone());
                 let handle = tokio::task::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     // Volume length: block devices use their physical
@@ -2681,12 +2748,23 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         full_wipe: !quick,
                         format_config_xattr: config_xattr,
                     };
-                    squeezefs::meta_backend::kv::builder::format_v3(
-                        Path::new(&path),
-                        volume_len,
-                        &opts,
-                    )
-                    .await
+                    match stamp {
+                        Some(stamp) => squeezefs::meta_backend::kv::builder::format_v3_stamped(
+                            Path::new(&path),
+                            volume_len,
+                            &opts,
+                            stamp,
+                        )
+                        .await
+                        .map(|_| ()),
+                        None => squeezefs::meta_backend::kv::builder::format_v3(
+                            Path::new(&path),
+                            volume_len,
+                            &opts,
+                        )
+                        .await
+                        .map(|_| ()),
+                    }
                     .map_err(|e| format!("Failed to format metadata volume '{}': {}", path, e))?;
                     Ok::<(), String>(())
                 });
@@ -2921,6 +2999,27 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         "Volume '{volume_id}' is active again (drain cancelled; already-moved \
                          blocks stay where the mover put them — CoW moves are never undone)."
                     );
+                }
+                VolumeActions::RepairSet { target } => {
+                    if live(&target) {
+                        return Err(
+                            "volume repair-set is an OFFLINE verb: pass the sqmeta:// URI \
+                             (it takes the single-writer claims like format-grade verbs; \
+                             unmount first)"
+                                .into(),
+                        );
+                    }
+                    let meta_lvs = parse_block_uri(&target, "sqmeta://")?;
+                    let restamped = squeezefs::config_ops::repair_meta_set(&meta_lvs).await?;
+                    if restamped.is_empty() {
+                        println!("Nothing to repair.");
+                    } else {
+                        println!(
+                            "Re-stamped {} member volume(s); the set now mounts with \
+                             order-independent discovery.",
+                            restamped.len()
+                        );
+                    }
                 }
                 VolumeActions::List { target, json } => {
                     let rows: serde_json::Value = if live(&target) {
@@ -3414,24 +3513,29 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // mount LOUD — the refusal text names the holder and the
             // remedy (dead-pid auto-reclaim / wait for the claim TTL /
             // `squeezefs claim clear`).
-            let meta_backends = match squeezefs::meta_backend::open_meta_volume_set(&meta_lvs).await
-            {
-                Ok(backends) => backends,
-                Err(e) => {
-                    eprintln!("\x1b[91mERROR\x1b[0m mount refused: {e}");
-                    return Err(e.into());
-                }
-            };
-            for (path, be) in meta_lvs.iter().zip(&meta_backends) {
+            // PR VL5a: the routed open runs the §5.5.1a stamp discovery
+            // first — stamped sets mount in canonical member_position
+            // order with their frozen routing width + slot map regardless
+            // of URI order; legacy sets keep URI order verbatim.
+            // Disagreements (torn epochs, missing members, duplicate
+            // positions) refuse LOUD naming the volumes.
+            let routed_meta_backend =
+                match squeezefs::meta_backend::open_routed_meta_set(&meta_lvs).await {
+                    Ok(routed) => routed,
+                    Err(e) => {
+                        eprintln!("\x1b[91mERROR\x1b[0m mount refused: {e}");
+                        return Err(e.into());
+                    }
+                };
+            for be in &routed_meta_backend.volumes {
                 // §10 mount log: format version, ledger seq chosen,
                 // replay entries/dropped/ms, free extents — plus BOTH
                 // resolved-OQ-2 atomicity fields (the contract class and
                 // the physical probe; the probe is informational — the
                 // CoW contract holds by construction) — and the guard
                 // guarantee class this volume actually mounted with.
-                let physical = squeezefs::meta_backend::atomicity::probe_meta_volume(
-                    std::path::Path::new(path),
-                );
+                let physical =
+                    squeezefs::meta_backend::atomicity::probe_meta_volume(be.device_path());
                 be.set_atomicity_physical(physical);
                 let stats = be.replay_stats();
                 log::info!(
@@ -3439,7 +3543,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                      replay_dropped_torn={} replay_ms={} free_extents={} next_ino={} \
                      meta_volume_atomicity={} meta_volume_atomicity_physical={} \
                      writer_guard_mode={}",
-                    path,
+                    be.device_path().display(),
                     be.mounted_ledger().seq,
                     stats.entries,
                     stats.dropped_torn,
@@ -3451,10 +3555,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     be.writer_guard_mode(),
                 );
             }
-
-            let routed_meta_backend = std::sync::Arc::new(
-                squeezefs::meta_backend::RoutedMetaBackend::new(meta_backends),
-            );
 
             let resolved_uid = uid.unwrap_or_else(|| {
                 std::env::var("SUDO_UID")

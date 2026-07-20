@@ -113,6 +113,12 @@ pub struct ImageBuilder {
     /// `(ino, name) → value`, name-sorted per ino.
     xattrs: BTreeMap<(u64, Vec<u8>), Vec<u8>>,
     next_ino: u64,
+    /// PR VL5a: the §5.5.1a membership stamp for a `--meta-slots`
+    /// format. `Some` makes the built image slot-mapped: the bootstrap
+    /// ledger record carries the stamp and the superblock carries
+    /// `KV_GUEST_SLOTS` (bit 2). `None` (the default) builds the legacy
+    /// byte-identical image.
+    membership_stamp: Option<super::checkpoint::MembershipStamp>,
 }
 
 impl ImageBuilder {
@@ -140,7 +146,17 @@ impl ImageBuilder {
             dentries,
             xattrs: BTreeMap::new(),
             next_ino: ROOT_INO + 1,
+            membership_stamp: None,
         })
+    }
+
+    /// Make the built image a slot-mapped set member (PR VL5a): the
+    /// bootstrap ledger record carries `stamp` and the superblock
+    /// carries `KV_GUEST_SLOTS`. The stamp participates in the
+    /// determinism contract like every other input (fixed stamp ⇒ fixed
+    /// image).
+    pub fn set_membership_stamp(&mut self, stamp: super::checkpoint::MembershipStamp) {
+        self.membership_stamp = Some(stamp);
     }
 
     fn check_name(name: &str) -> Result<(), KvError> {
@@ -404,13 +420,22 @@ impl ImageBuilder {
     /// references a half-built image — the §6.2 flip discipline applied
     /// to format).
     pub async fn build(&self, path: &Path, volume_len: u64) -> Result<BuiltImage, KvError> {
-        let sb = SuperblockV3::plan(
+        let mut sb = SuperblockV3::plan(
             volume_len,
             self.cfg.node_size,
             self.cfg.journal_len_override,
             self.cfg.uuid,
             self.cfg.hash_seed,
         )?;
+        if self.membership_stamp.is_some() {
+            // PR VL5a: a slot-mapped member carries KV_GUEST_SLOTS. The
+            // §5.5.1a bit-before-first-stamp invariant is subsumed by
+            // format's flip discipline: sector 0 was zeroed above the
+            // stamped ledger write, and the bit-carrying superblock is
+            // stamped LAST behind the barrier — no crash prefix leaves a
+            // stamped volume mountable by ANY binary without the bit.
+            sb.features_incompat |= super::superblock::FEATURE_INCOMPAT_KV_GUEST_SLOTS;
+        }
 
         // §9 quick-format hygiene: zero SB + ledger + ring + bitmap.
         zero_range(path, 0, sb.heap.start).await?;
@@ -464,6 +489,7 @@ impl ImageBuilder {
             next_ino: self.next_ino,
             alloc_bitmap_generation: 1,
             node_seq_watermark,
+            membership_stamp: self.membership_stamp.clone(),
         };
         write_ledger_slot(path, sb.root_ledger.start, &ledger).await?;
 
@@ -837,6 +863,29 @@ pub async fn format_v3(
     volume_len: u64,
     opts: &FormatV3Options,
 ) -> Result<BuiltImage, crate::error::SqueezefsError> {
+    format_v3_inner(path, volume_len, opts, None).await
+}
+
+/// [`format_v3`] for one member of a `--meta-slots` set (PR VL5a,
+/// design-volume-lifecycle §5.5.1a): the built image carries `stamp` in
+/// its bootstrap ledger record and `KV_GUEST_SLOTS` (bit 2) on its
+/// superblock — the lifecycle-shaped format. Default formats go through
+/// [`format_v3`] and stay legacy byte-identical.
+pub async fn format_v3_stamped(
+    path: &Path,
+    volume_len: u64,
+    opts: &FormatV3Options,
+    stamp: super::checkpoint::MembershipStamp,
+) -> Result<BuiltImage, crate::error::SqueezefsError> {
+    format_v3_inner(path, volume_len, opts, Some(stamp)).await
+}
+
+async fn format_v3_inner(
+    path: &Path,
+    volume_len: u64,
+    opts: &FormatV3Options,
+    stamp: Option<super::checkpoint::MembershipStamp>,
+) -> Result<BuiltImage, crate::error::SqueezefsError> {
     format_preflight(path, opts.force).await?;
 
     // Regular files grow to the requested volume length (control-path
@@ -870,6 +919,9 @@ pub async fn format_v3(
     builder.set_owner(ROOT_INO, root_uid, root_gid)?;
     if let Some(cfg) = &opts.format_config_xattr {
         builder.set_xattr(ROOT_INO, FORMAT_CONFIG_XATTR, cfg)?;
+    }
+    if let Some(stamp) = stamp {
+        builder.set_membership_stamp(stamp);
     }
     Ok(builder.build(path, volume_len).await?)
 }

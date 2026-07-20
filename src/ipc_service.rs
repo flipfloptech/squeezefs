@@ -322,10 +322,15 @@ impl SessionSink for DataPlaneSink {
 }
 
 /// The ADMIN-lane verb handler over the VL2 job fabric
-/// (design-volume-lifecycle §5.1.4). Runs on host ctl threads (plain
-/// OS threads) and blocks on the captured runtime handle.
+/// (design-volume-lifecycle §5.1.4) — and, since PR VL3, the volume
+/// lifecycle verbs against the live filesystem (`volume-add-data`,
+/// `volume-list`, the re-homed health overrides). Runs on host ctl
+/// threads (plain OS threads) and blocks on the captured runtime handle.
 pub struct FabricAdminSink {
     fabric: std::sync::Arc<crate::jobs::JobFabric>,
+    /// The live filesystem the volume verbs act on. `None` = fabric-only
+    /// wiring (fabric unit tests); volume verbs refuse loudly then.
+    fs: Option<std::sync::Arc<SqueezefsFilesystem>>,
     rt: tokio::runtime::Handle,
 }
 
@@ -335,8 +340,43 @@ impl FabricAdminSink {
     pub fn new(fabric: std::sync::Arc<crate::jobs::JobFabric>) -> Self {
         Self {
             fabric,
+            fs: None,
             rt: tokio::runtime::Handle::current(),
         }
+    }
+
+    /// [`Self::new`] with the live filesystem wired — the mount posture
+    /// (volume verbs served).
+    pub fn with_fs(
+        fabric: std::sync::Arc<crate::jobs::JobFabric>,
+        fs: std::sync::Arc<SqueezefsFilesystem>,
+    ) -> Self {
+        Self {
+            fabric,
+            fs: Some(fs),
+            rt: tokio::runtime::Handle::current(),
+        }
+    }
+
+    fn volume_states_json(fs: &SqueezefsFilesystem) -> serde_json::Value {
+        let rows: Vec<serde_json::Value> = fs
+            .router
+            .backend_router
+            .volume_states()
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.id,
+                    "backing_dev": row.backing_dev,
+                    "state": row.state,
+                    "healthy": row.healthy,
+                    "capacity_bytes": row.capacity_bytes,
+                    "used_bytes": row.used_bytes,
+                    "free_bytes": row.free_bytes,
+                })
+            })
+            .collect();
+        serde_json::json!(rows)
     }
 
     fn status_json(st: &crate::jobs::JobStatus) -> serde_json::Value {
@@ -353,9 +393,72 @@ impl FabricAdminSink {
 impl crate::ipc_host::AdminSink for FabricAdminSink {
     fn handle(&self, verb: &str, arg: &str) -> (bool, String) {
         let fabric = self.fabric.clone();
+        let fs = self.fs.clone();
         let arg = arg.trim().to_string();
         let res: Result<String, String> = self.rt.block_on(async move {
+            // The VL3 volume verbs need the live filesystem.
+            let need_fs = || {
+                fs.clone()
+                    .ok_or_else(|| "volume verbs not wired on this host".to_string())
+            };
             match verb {
+                // -----------------------------------------------------
+                // VL3 volume lifecycle (design-volume-lifecycle §5.3/§6)
+                // -----------------------------------------------------
+                "volume-add-data" => {
+                    let fs = need_fs()?;
+                    let device = arg.trim();
+                    if device.is_empty() {
+                        return Err("usage: volume-add-data <device>".to_string());
+                    }
+                    let rec = fs.admin_add_data_volume(device).await?;
+                    Ok(serde_json::json!({
+                        "id": rec.id,
+                        "backing_dev": rec.backing_dev,
+                        "state": rec.state,
+                        "added_ts": rec.added_ts,
+                        // Honest §5.3 step-6 note: the auto-rebalance
+                        // default arms with the VL4 mover PR.
+                        "rebalance": "auto-rebalance pass activates with the VL4 mover PR; \
+                                      until then the volume participates in write placement \
+                                      only",
+                    })
+                    .to_string())
+                }
+                "volume-list" => {
+                    let fs = need_fs()?;
+                    Ok(Self::volume_states_json(&fs).to_string())
+                }
+                "volume-disable" | "volume-enable" => {
+                    let fs = need_fs()?;
+                    let disabled = verb == "volume-disable";
+                    fs.router
+                        .backend_router
+                        .set_health_override(&arg, disabled)
+                        .map_err(|e| e.to_string())?;
+                    Ok(if disabled {
+                        format!(
+                            "data volume '{arg}' disabled (fail-stop health override: new \
+                             writes fail over; blocks already on it read EIO until \
+                             re-enabled — this is not an evacuation)"
+                        )
+                    } else {
+                        format!("data volume '{arg}' enabled (health override cleared)")
+                    })
+                }
+                "meta-volume-disable" | "meta-volume-enable" => {
+                    let fs = need_fs()?;
+                    let disabled = verb == "meta-volume-disable";
+                    fs.admin_set_meta_volume_health(&arg, disabled)?;
+                    Ok(if disabled {
+                        format!(
+                            "metadata volume '{arg}' disabled (fail-stop health override — \
+                             not an evacuation)"
+                        )
+                    } else {
+                        format!("metadata volume '{arg}' enabled (health override cleared)")
+                    })
+                }
                 "job-list" => {
                     let mut out = Vec::new();
                     for rec in crate::jobs::JobFabric::list_records(fabric.meta_handle())

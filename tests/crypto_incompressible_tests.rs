@@ -689,6 +689,7 @@ async fn set_format_config(h: &H, block_size: u64, comp: &str, enc: &str) {
         mem_cache_size: None,
         disk_cache_size: None,
         disk_cache_paths: None,
+        data_volumes: None,
         data_lv: None,
         read_cache_size: None,
         write_cache_size: None,

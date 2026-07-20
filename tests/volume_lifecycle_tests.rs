@@ -33,8 +33,8 @@ use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::SqueezefsFilesystem;
 use squeezefs::meta_backend::kv::superblock::{
-    classify_volume, FEATURE_INCOMPAT_KV_V3, FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE,
-    FEATURE_INCOMPAT_NODE_SEQ_WATERMARK, FEATURES_INCOMPAT_KNOWN,
+    classify_volume, FEATURES_INCOMPAT_KNOWN, FEATURE_INCOMPAT_KV_V3,
+    FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE, FEATURE_INCOMPAT_NODE_SEQ_WATERMARK,
 };
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
@@ -166,9 +166,7 @@ async fn open_fixture(meta: &Path, records: &[DataVolumeRecord]) -> Fx {
             .await
             .unwrap_or_else(|e| panic!("register_backend({}) failed: {e:?}", rec.id));
     }
-    router
-        .backend_router
-        .set_volume_records(records.to_vec());
+    router.backend_router.set_volume_records(records.to_vec());
     router
         .backend_router
         .active_write_backend
@@ -214,7 +212,15 @@ async fn create_file(fx: &Fx, name: &str) -> u64 {
 async fn striped_burst(fx: &Fx, ino: u64, nblocks: usize) -> Vec<u8> {
     let dummy = vec![0u8; BLOCK + 1];
     fx.fs
-        .write(req(), ino, 0, 0, bytes::Bytes::copy_from_slice(&dummy), 0, 0)
+        .write(
+            req(),
+            ino,
+            0,
+            0,
+            bytes::Bytes::copy_from_slice(&dummy),
+            0,
+            0,
+        )
         .await
         .unwrap();
     let mut expected = Vec::with_capacity(nblocks * BLOCK);
@@ -262,7 +268,10 @@ fn test_format_config_data_volumes_round_trip_and_old_configs_decode() {
         "data_lv": ["/dev/nvme1n2"],
     });
     let cfg: FormatConfig = serde_json::from_value(old).expect("old config decodes");
-    assert!(cfg.data_volumes.is_none(), "additive field defaults to None");
+    assert!(
+        cfg.data_volumes.is_none(),
+        "additive field defaults to None"
+    );
 
     // And a None field must not serialize (byte-identity for untouched
     // sets: the config JSON of a set that never used lifecycle verbs
@@ -499,7 +508,10 @@ async fn test_add_write_remount_read_and_new_backend_receives_allocations() {
 
     // Mount the legacy single-volume set, write + fsync a striped burst.
     let recs = base_format_config(&[&oss1]).resolved_data_volumes();
-    assert_eq!(recs[0].id, "oss1", "legacy id grandfathered byte-identically");
+    assert_eq!(
+        recs[0].id, "oss1",
+        "legacy id grandfathered byte-identically"
+    );
     let fx = open_fixture(&meta, &recs).await;
     let ino = create_file(&fx, "burst.bin").await;
     let expected = striped_burst(&fx, ino, 16).await;

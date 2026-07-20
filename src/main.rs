@@ -138,6 +138,13 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Volume lifecycle: durable data-volume add + set listing
+    /// (design-volume-lifecycle §5.3/§6, PR VL3; drain/remove land with
+    /// PR VL4)
+    Volume {
+        #[command(subcommand)]
+        action: VolumeActions,
+    },
     /// Maintenance-job fabric control (design-volume-lifecycle §6):
     /// live via the mount's admin lane, offline via probe reads of the
     /// durable job records
@@ -778,6 +785,37 @@ enum TargetActions {
         /// DPDK hugepage memory (spdk_tgt -s) to bake, in MiB (default 1024)
         #[arg(long)]
         dpdk_mem_mb: Option<u64>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum VolumeActions {
+    /// Add a data volume to the set — durable never-reused `vol-` id,
+    /// preflight-checked (device exists, sized, not already a member,
+    /// write+readback probe). TARGET = a live mountpoint (online add via
+    /// the admin lane) or a sqmeta:// URI (offline, guarded like
+    /// `config set-cache-paths`). Stamps the `KV_VOLUME_LIFECYCLE`
+    /// incompat bit: pre-VL3 binaries refuse the set loud afterwards.
+    AddData {
+        /// Live mountpoint or sqmeta:// URI
+        target: String,
+        /// Backing device to add (block device or file)
+        device: String,
+        /// Opt out of the automatic rebalance pass (the §5.3 step-6
+        /// default; it arms with the VL4 mover PR)
+        #[arg(long)]
+        no_rebalance: bool,
+    },
+    /// List the durable volume set: ids, backing devices, states, and
+    /// the capacity math that is honestly derivable (live mounts report
+    /// used/free from the allocators; offline probes report device
+    /// capacity — the full census rides `squeezefs df`)
+    List {
+        /// Live mountpoint or sqmeta:// URI
+        target: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -2509,6 +2547,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 disk_cache_size: disk_cache_size.clone(),
                 disk_cache_paths: disk_cache_paths.clone(),
                 data_lv: Some(data_lvs.clone()),
+                // Fresh formats stay legacy-shaped (KD-14 zero-cost
+                // grandfathering): durable records materialize — and the
+                // lifecycle bit stamps — only at the first lifecycle verb.
+                data_volumes: None,
                 read_cache_size: read_cache_size.clone(),
                 write_cache_size: write_cache_size.clone(),
                 read_mem_cache_size: read_mem_cache_size.clone(),
@@ -2729,6 +2771,105 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 vec![meta_uri]
             };
             run_clients_report(&meta_lvs, json).await?;
+        }
+        Commands::Volume { action } => {
+            squeezefs::set_fs_prefix("squeezefs");
+            let live = |t: &str| !t.starts_with("sqmeta://");
+            match action {
+                VolumeActions::AddData {
+                    target,
+                    device,
+                    no_rebalance,
+                } => {
+                    // §5.3 step-6 honesty (PR-plan self-consistency note):
+                    // the auto-rebalance DEFAULT arms with the VL4 mover.
+                    let rebalance_note = if no_rebalance {
+                        "rebalance: opted out (--no-rebalance)".to_string()
+                    } else {
+                        "rebalance: the automatic rebalance pass (design-volume-lifecycle \
+                         §5.3 step 6) activates with the VL4 mover PR; until then the new \
+                         volume participates in write placement only"
+                            .to_string()
+                    };
+                    if live(&target) {
+                        let body = admin_roundtrip(&target, "volume-add-data", &device)?;
+                        let v: serde_json::Value = serde_json::from_str(&body)
+                            .map_err(|e| format!("undecodable admin reply: {e}"))?;
+                        println!(
+                            "Added data volume '{}' as {} (state {}).",
+                            device,
+                            v["id"].as_str().unwrap_or("?"),
+                            v["state"].as_str().unwrap_or("?")
+                        );
+                    } else {
+                        let meta_lvs = parse_block_uri(&target, "sqmeta://")?;
+                        let rec =
+                            squeezefs::config_ops::add_data_volume(&meta_lvs, &device).await?;
+                        println!(
+                            "Added data volume '{}' as {} (state {}).",
+                            device, rec.id, rec.state
+                        );
+                    }
+                    println!("{rebalance_note}");
+                }
+                VolumeActions::List { target, json } => {
+                    let rows: serde_json::Value = if live(&target) {
+                        serde_json::from_str(&admin_roundtrip(&target, "volume-list", "")?)
+                            .map_err(|e| format!("undecodable admin reply: {e}"))?
+                    } else {
+                        let meta_lvs = parse_block_uri(&target, "sqmeta://")?;
+                        let recs =
+                            squeezefs::config_ops::resolved_volume_records(&meta_lvs).await?;
+                        // Offline honesty: capacity comes from the device
+                        // size where the device is reachable; used/free
+                        // need the census walk (`squeezefs df`) — omitted
+                        // rather than guessed (§5.2 lands the full math
+                        // with VL4 preflight).
+                        serde_json::Value::Array(
+                            recs.iter()
+                                .map(|r| {
+                                    let capacity =
+                                        squeezefs::nvme_dev::device_capacity_bytes(&r.backing_dev)
+                                            .ok();
+                                    serde_json::json!({
+                                        "id": r.id,
+                                        "backing_dev": r.backing_dev,
+                                        "state": r.state,
+                                        "added_ts": r.added_ts,
+                                        "capacity_bytes": capacity,
+                                    })
+                                })
+                                .collect(),
+                        )
+                    };
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&rows)?);
+                    } else {
+                        println!(
+                            "{:<22} {:<10} {:<8} {:>14} {:>14} BACKING",
+                            "ID", "STATE", "HEALTHY", "CAPACITY", "USED"
+                        );
+                        let fmt_bytes = |v: &serde_json::Value| match v.as_u64() {
+                            Some(b) => b.to_string(),
+                            None => "-".to_string(),
+                        };
+                        for row in rows.as_array().cloned().unwrap_or_default() {
+                            println!(
+                                "{:<22} {:<10} {:<8} {:>14} {:>14} {}",
+                                row["id"].as_str().unwrap_or("?"),
+                                row["state"].as_str().unwrap_or("?"),
+                                row["healthy"]
+                                    .as_bool()
+                                    .map(|h| h.to_string())
+                                    .unwrap_or_else(|| "-".into()),
+                                fmt_bytes(&row["capacity_bytes"]),
+                                fmt_bytes(&row["used_bytes"]),
+                                row["backing_dev"].as_str().unwrap_or("?"),
+                            );
+                        }
+                    }
+                }
+            }
         }
         Commands::Job { action } => {
             let live = |t: &str| !t.starts_with("sqmeta://");
@@ -3037,11 +3178,31 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             active_staging_dirs = isolated_staging_dirs;
 
-            let resolved_data_lvs =
-                backing_dev.unwrap_or_else(|| format_config.data_lv.clone().unwrap_or_default());
-            if resolved_data_lvs.is_empty() {
+            // The durable volume set (KD-5): `data_volumes` records when
+            // present, else legacy `data_lv` paths grandfathered with
+            // basename ids (byte-identical registration names — every
+            // historical `name://offset` block key keeps resolving). A
+            // `--data-lv` mount override synthesizes legacy-shaped
+            // records the same way.
+            let volume_records: Vec<squeezefs::DataVolumeRecord> = match backing_dev {
+                Some(paths) => paths
+                    .iter()
+                    .map(|p| squeezefs::DataVolumeRecord {
+                        id: squeezefs::legacy_volume_id(p),
+                        backing_dev: p.clone(),
+                        state: squeezefs::VOL_STATE_ACTIVE.to_string(),
+                        added_ts: 0,
+                    })
+                    .collect(),
+                None => format_config.resolved_data_volumes(),
+            };
+            if volume_records.is_empty() {
                 return Err("Error: no data volumes specified or configured".into());
             }
+            let resolved_data_lvs: Vec<String> = volume_records
+                .iter()
+                .map(|r| r.backing_dev.clone())
+                .collect();
 
             // Every data volume must be a usable backing device, not just the
             // first one — a typo'd second volume should fail here, not at
@@ -3049,20 +3210,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             for path in &resolved_data_lvs {
                 squeezefs::storage::validate_backing_device(path)?;
             }
-            let first_data_path = &resolved_data_lvs[0];
+            let first_record = &volume_records[0];
+            let first_data_path = &first_record.backing_dev;
 
             let dlm = DlmClient::new("local")?;
-
-            let first_name = std::path::Path::new(first_data_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(first_data_path)
-                .to_string();
 
             let block_alloc = std::sync::Arc::new(
                 squeezefs::block_allocator::BlockAllocator::new(
                     dlm.meta_client().clone(),
-                    &first_name,
+                    &first_record.id,
                 )
                 .await?,
             );
@@ -3101,46 +3257,32 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             let router = DataRouter::new(dlm.clone(), cache, block_alloc.clone(), nvme_dev.clone());
 
-            for path in &resolved_data_lvs {
-                let name = std::path::Path::new(path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(path)
-                    .to_string();
-
-                log::info!("Registering data volume '{}' at path {}", name, path);
-                let (dev, alloc) = if path == first_data_path {
-                    (nvme_dev.clone(), block_alloc.clone())
-                } else {
-                    let d = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(path));
-                    let a = std::sync::Arc::new(
-                        squeezefs::block_allocator::BlockAllocator::new(
-                            dlm.meta_client().clone(),
-                            &name,
-                        )
-                        .await?,
-                    );
-                    match squeezefs::nvme_dev::device_capacity_bytes(path) {
-                        Ok(cap) => a.set_capacity_bytes(cap),
-                        Err(e) => log::warn!(
-                            "could not size data volume {path}: {e}; allocator unbounded"
-                        ),
-                    }
-                    (d, a)
-                };
-
-                let backend = std::sync::Arc::new(squeezefs::routing::StorageBackend {
-                    device: dev,
-                    block_allocator: alloc,
-                });
-
-                router.backend_router.backends.insert(name.clone(), backend);
+            // ONE registration path (design-volume-lifecycle §5.3 step 3):
+            // mount and the online `volume add-data` share
+            // `BackendRouter::register_backend`. The first record's
+            // backing dev IS the router's default slot, so its build
+            // reuses the default Arcs (bare-key invariant preserved);
+            // durable `disabled` states land as health overrides.
+            for rec in &volume_records {
+                log::info!(
+                    "Registering data volume '{}' at path {} (state {})",
+                    rec.id,
+                    rec.backing_dev,
+                    rec.state
+                );
+                router
+                    .backend_router
+                    .register_backend(rec, dlm.meta_client().clone())
+                    .await?;
             }
+            router
+                .backend_router
+                .set_volume_records(volume_records.clone());
 
             router
                 .backend_router
                 .active_write_backend
-                .store(std::sync::Arc::new(first_name));
+                .store(std::sync::Arc::new(first_record.id.clone()));
 
             // Mount every volume through the sector-0 version gate
             // (design-cow-kv-metadata §6.1): v3 mounts read-write (the
@@ -4527,27 +4669,29 @@ async fn run_df_report(meta_lvs: &[String], json: bool) -> Result<(), Box<dyn st
     let config: FormatConfig = serde_json::from_slice(&raw)
         .map_err(|e| format!("invalid format config on '{}': {e}", probes[0].0))?;
 
-    let data_lvs = config.data_lv.clone().unwrap_or_default();
-    if data_lvs.is_empty() {
+    let volume_records = config.resolved_data_volumes();
+    if volume_records.is_empty() {
         return Err("format config names no data volumes".into());
     }
 
     // Rebuild the striped-block allocator accounting exactly the way a
-    // mount does (one allocator per data volume, refcounts recovered by
-    // the live-inode-tree walk) — the authoritative usage source behind
-    // statfs. Reads only; nothing is written.
+    // mount does (one allocator per data volume record, refcounts
+    // recovered by the live-inode-tree walk) — the authoritative usage
+    // source behind statfs. Reads only; nothing is written. Registration
+    // rides the durable ids (KD-5): a set with `vol-` members resolves
+    // its `vol-…://offset` keys correctly here too.
     let dlm = DlmClient::new("local")?;
-    let first_data_path = &data_lvs[0];
-    let first_name = std::path::Path::new(first_data_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(first_data_path)
-        .to_string();
+    let first_record = &volume_records[0];
     let default_alloc = std::sync::Arc::new(
-        squeezefs::block_allocator::BlockAllocator::new(dlm.meta_client().clone(), &first_name)
-            .await?,
+        squeezefs::block_allocator::BlockAllocator::new(
+            dlm.meta_client().clone(),
+            &first_record.id,
+        )
+        .await?,
     );
-    let default_dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(first_data_path));
+    let default_dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
+        &first_record.backing_dev,
+    ));
     let block_size = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(config.block_size));
     let backend_router = squeezefs::routing::BackendRouter::new(
         default_alloc.clone(),
@@ -4555,34 +4699,16 @@ async fn run_df_report(meta_lvs: &[String], json: bool) -> Result<(), Box<dyn st
         block_size,
     );
     let mut volume_rows: Vec<(String, String, u64)> = Vec::new(); // (name, path, size)
-    for path in &data_lvs {
-        let name = std::path::Path::new(path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(path)
-            .to_string();
-        let (dev, alloc) = if path == first_data_path {
-            (default_dev.clone(), default_alloc.clone())
-        } else {
-            let d = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(path));
-            let a = std::sync::Arc::new(
-                squeezefs::block_allocator::BlockAllocator::new(dlm.meta_client().clone(), &name)
-                    .await?,
-            );
-            (d, a)
-        };
-        let size = squeezefs::nvme_dev::device_capacity_bytes(path)
-            .map_err(|e| format!("cannot size data volume '{path}': {e}"))?;
-        alloc.set_capacity_bytes(size);
-        backend_router.backends.insert(
-            name.clone(),
-            std::sync::Arc::new(squeezefs::routing::StorageBackend {
-                device: dev,
-                block_allocator: alloc,
-            }),
-        );
-        volume_rows.push((name, path.clone(), size));
+    for rec in &volume_records {
+        let size = squeezefs::nvme_dev::device_capacity_bytes(&rec.backing_dev)
+            .map_err(|e| format!("cannot size data volume '{}': {e}", rec.backing_dev))?;
+        let backend = backend_router
+            .register_backend(rec, dlm.meta_client().clone())
+            .await?;
+        backend.block_allocator.set_capacity_bytes(size);
+        volume_rows.push((rec.id.clone(), rec.backing_dev.clone(), size));
     }
+    backend_router.set_volume_records(volume_records.clone());
     for (path, kv) in &probes {
         for entry in backend_router.backends.iter() {
             entry
@@ -4677,7 +4803,7 @@ async fn run_df_report(meta_lvs: &[String], json: bool) -> Result<(), Box<dyn st
         "SqueezeFS '{}' — offline query over {} meta / {} data volume(s), durable state",
         config.name,
         meta_lvs.len(),
-        data_lvs.len()
+        volume_records.len()
     );
     println!(
         "Data:   capacity {}   used {} ({pct:.1}%)   free {}",

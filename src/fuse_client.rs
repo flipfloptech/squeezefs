@@ -1721,6 +1721,12 @@ pub struct Metrics {
     pub job_copy_buffer_bytes: Align64<AtomicU64>,
     /// Jobs paused by the R5 shed hook.
     pub job_paused_mem_pressure: Align64<AtomicU64>,
+    /// Volume-lifecycle preflight refusals (design-volume-lifecycle §10,
+    /// PR VL3): online `volume add-data` / state-change requests refused
+    /// by validation (bad device, duplicate member, meta volume, probe
+    /// failure). Offline verbs refuse in the CLI process and do not
+    /// count here.
+    pub volume_preflight_refusals: Align64<AtomicU64>,
     /// §5.1.6 remote-wire family (design-volume-lifecycle §10, PR VL2b).
     /// Currently-enrolled remote workers (gauge).
     pub job_remote_workers: Align64<AtomicU64>,
@@ -2810,6 +2816,148 @@ impl SqueezefsFilesystem {
         self.active_delegations.contains_key(&inode)
     }
 
+    /// The ONLINE `volume add-data` (design-volume-lifecycle §5.3, served
+    /// by the admin-lane `volume-add-data` verb): validate + probe the
+    /// device, build the runtime backend, stamp `KV_VOLUME_LIFECYCLE`
+    /// (bit 3) on every member superblock, commit the durable record
+    /// through the live meta backend (the conveyor), and only THEN enable
+    /// write-path selection (§5.3 step-4 durability order: "runtime
+    /// registration is completed only after the durable commit acks").
+    /// Preflight refusals count `volume_preflight_refusals`.
+    pub async fn admin_add_data_volume(
+        &self,
+        device: &str,
+    ) -> std::result::Result<crate::DataVolumeRecord, String> {
+        let refused = |msg: String| {
+            METRICS
+                .volume_preflight_refusals
+                .fetch_add(1, Ordering::Relaxed);
+            msg
+        };
+        let meta = self
+            .meta_backend
+            .as_ref()
+            .ok_or_else(|| "no metadata backend mounted".to_string())?;
+        let meta_paths: Vec<String> = meta
+            .volumes
+            .iter()
+            .map(|v| v.device_path().display().to_string())
+            .collect();
+
+        // 2. Preflight against the durable set + the device probe — all
+        //    refusals before any durable effect.
+        let raw = meta
+            .getxattr(1, crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR)
+            .await
+            .map_err(|e| format!("format config read failed: {e}"))?
+            .ok_or_else(|| "format config not found on the volume set".to_string())?;
+        let mut cfg: crate::FormatConfig =
+            serde_json::from_slice(&raw).map_err(|e| format!("format config undecodable: {e}"))?;
+        let mut records = cfg.resolved_data_volumes();
+        let capacity = crate::config_ops::validate_new_data_volume(device, &records, &meta_paths)
+            .map_err(|e| refused(e.to_string()))?;
+        crate::config_ops::probe_data_volume_rw(device)
+            .await
+            .map_err(|e| refused(e.to_string()))?;
+
+        // 3. Build the runtime backend — placement NOT enabled yet.
+        let record = crate::DataVolumeRecord {
+            id: crate::new_data_volume_id(),
+            backing_dev: device.to_string(),
+            state: crate::VOL_STATE_ACTIVE.to_string(),
+            added_ts: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        let backend = self
+            .router
+            .backend_router
+            .build_backend(
+                &record.id,
+                &record.backing_dev,
+                self.router.dlm.meta_client().clone(),
+            )
+            .await
+            .map_err(|e| format!("backend construction failed: {e}"))?;
+
+        // 4a. Bit-before-durable-record (§7): stamp every member
+        //     superblock before the record exists. Sector 0 is never
+        //     rewritten by the live backend (checkpoints flip the root
+        //     ledger), so this is race-free under the mount's claims.
+        for path in &meta_paths {
+            crate::meta_backend::kv::superblock::set_volume_lifecycle_bit(std::path::Path::new(
+                path,
+            ))
+            .await
+            .map_err(|e| format!("lifecycle-bit stamp failed on {path}: {e}"))?;
+        }
+
+        // 4b. Durable record commit through the live conveyor.
+        records.push(record.clone());
+        cfg.data_lv = Some(records.iter().map(|r| r.backing_dev.clone()).collect());
+        cfg.data_volumes = Some(records.clone());
+        let bytes =
+            serde_json::to_vec(&cfg).map_err(|e| format!("format config serialize failed: {e}"))?;
+        meta.setxattr(
+            1,
+            crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
+            &bytes,
+        )
+        .await
+        .map_err(|e| format!("durable volume-record commit failed: {e}"))?;
+
+        // 5. Placement enabled LAST — the new capacity participates only
+        //    after the next mount is guaranteed to know the id.
+        self.router
+            .backend_router
+            .publish_backend(&record.id, backend)
+            .map_err(|e| format!("backend publish failed after the durable commit: {e}"))?;
+        self.router.backend_router.set_volume_records(records);
+        info!(
+            "volume add-data: '{}' added as {} ({} bytes) — durable record committed, \
+             placement enabled",
+            device, record.id, capacity
+        );
+        Ok(record)
+    }
+
+    /// Live metadata-volume health override (`config metadata-volume
+    /// enable/disable`, re-homed from the retired `/dev/shm` runtime
+    /// config): fail-stop only — a disabled volume's inos error until
+    /// re-enabled; no data moves (slot migration is PR VL5b). Runtime
+    /// state, deliberately not durable (no durable meta-volume records
+    /// exist until VL5a).
+    pub fn admin_set_meta_volume_health(
+        &self,
+        volume_id: &str,
+        disabled: bool,
+    ) -> std::result::Result<(), String> {
+        let meta = self
+            .meta_backend
+            .as_ref()
+            .ok_or_else(|| "no metadata backend mounted".to_string())?;
+        let idx: usize = volume_id
+            .strip_prefix("meta_volume_")
+            .unwrap_or(volume_id)
+            .parse()
+            .map_err(|_| {
+                format!("unknown metadata volume '{volume_id}' (use meta_volume_<index>)")
+            })?;
+        if idx >= meta.volumes.len() {
+            return Err(format!(
+                "metadata volume index {idx} out of range ({} volumes mounted)",
+                meta.volumes.len()
+            ));
+        }
+        if disabled {
+            meta.disabled_volumes.insert(idx, true);
+        } else {
+            meta.disabled_volumes.remove(&idx);
+        }
+        Ok(())
+    }
+
     async fn sync_runtime_config_to_daemon(&self) {
         let cfg = crate::config_ops::load_or_create_config();
 
@@ -3074,6 +3222,26 @@ impl SqueezefsFilesystem {
             .as_ref()
             .is_some_and(|mb| !mb.volumes.is_empty());
 
+        // Volume-lifecycle gauge rows (design-volume-lifecycle §10, PR
+        // VL3): durable records joined with live allocator accounting.
+        let volume_states: Vec<serde_json::Value> = self
+            .router
+            .backend_router
+            .volume_states()
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.id,
+                    "backing_dev": row.backing_dev,
+                    "state": row.state,
+                    "healthy": row.healthy,
+                    "capacity_bytes": row.capacity_bytes,
+                    "used_bytes": row.used_bytes,
+                    "free_bytes": row.free_bytes,
+                })
+            })
+            .collect();
+
         let mut stats_obj = serde_json::json!({
             // Build identity (docs/operations.md §Versioning & releases):
             // the fleet mixed-version detector. `build_commit` is the full
@@ -3089,6 +3257,7 @@ impl SqueezefsFilesystem {
             "active_writes": active_writes,
             "active_leases_count": self.active_leases.len(),
             "active_posix_locks_count": self.active_posix_locks.len(),
+            "volume_states": volume_states,
             "metrics": {
                 "fuse_ops": METRICS.fuse_ops.load(Ordering::Relaxed),
                 "fuse_op_watchdog_overdue": METRICS.fuse_op_watchdog_overdue.load(Ordering::Relaxed),
@@ -3195,6 +3364,7 @@ impl SqueezefsFilesystem {
                 "job_checkpoint_writes": METRICS.job_checkpoint_writes.load(Ordering::Relaxed),
                 "job_copy_buffer_bytes": METRICS.job_copy_buffer_bytes.load(Ordering::Relaxed),
                 "job_paused_mem_pressure": METRICS.job_paused_mem_pressure.load(Ordering::Relaxed),
+                "volume_preflight_refusals": METRICS.volume_preflight_refusals.load(Ordering::Relaxed),
                 "job_remote_workers": METRICS.job_remote_workers.load(Ordering::Relaxed),
                 "job_remote_enrollments": METRICS.job_remote_enrollments.load(Ordering::Relaxed),
                 "job_remote_enroll_refused": METRICS.job_remote_enroll_refused.load(Ordering::Relaxed),
@@ -10631,7 +10801,13 @@ pub async fn start_mount<P: AsRef<Path>>(
                 // meta backend exists, before start_mount).
                 if let Some(fabric) = fs.job_fabric.load().as_ref() {
                     host.set_admin_sink(std::sync::Arc::new(
-                        crate::ipc_service::FabricAdminSink::new(fabric.clone()),
+                        // VL3: the fs handle serves the volume verbs
+                        // (add-data / list / health overrides) beside the
+                        // fabric's job verbs.
+                        crate::ipc_service::FabricAdminSink::with_fs(
+                            fabric.clone(),
+                            std::sync::Arc::new(fs.clone()),
+                        ),
                     ));
                     // R5: the `job_copy_buffers` component (§5.1.5) —
                     // sheddable; pauses jobs loudly under pressure.

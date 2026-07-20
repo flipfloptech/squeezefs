@@ -209,6 +209,23 @@ pub struct StorageBackend {
     pub block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
 }
 
+/// One `volume_states` row (design-volume-lifecycle §10): the per-volume
+/// gauge object the stats inode and the admin `volume-list` verb publish.
+#[derive(Clone, Debug)]
+pub struct VolumeStateRow {
+    pub id: String,
+    pub backing_dev: String,
+    /// Durable record state (`active`/`disabled`; VL4 adds
+    /// draining/retired).
+    pub state: String,
+    /// Live health (the fail-stop override + device probe), distinct
+    /// from the durable state lattice.
+    pub healthy: bool,
+    pub capacity_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+}
+
 #[derive(Clone)]
 pub struct BackendRouter {
     pub default_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
@@ -232,6 +249,11 @@ pub struct BackendRouter {
     /// (`OnceCell`: the tiers outlive the router; bare routers in tests
     /// simply have no tiers to purge).
     read_tier_purge: once_cell::sync::OnceCell<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    /// The durable data-volume records this router was registered from
+    /// (KD-5; empty on bare routers). Lock-free snapshot swap: readers
+    /// (stats, admin verbs) load; the mount wiring and the online
+    /// `volume add-data` path store.
+    volume_records: std::sync::Arc<arc_swap::ArcSwap<Vec<crate::DataVolumeRecord>>>,
 }
 
 #[cold]
@@ -365,6 +387,7 @@ impl BackendRouter {
             )),
             block_size,
             read_tier_purge: once_cell::sync::OnceCell::new(),
+            volume_records: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
         }
     }
 
@@ -372,6 +395,163 @@ impl BackendRouter {
     /// once by `DataRouter::new`; later calls are no-ops.
     pub fn set_read_tier_purge(&self, purge: std::sync::Arc<dyn Fn(&str) + Send + Sync>) {
         let _ = self.read_tier_purge.set(purge);
+    }
+
+    /// Publish the durable volume-record snapshot (mount wiring; the
+    /// online add path swaps in the post-commit set).
+    pub fn set_volume_records(&self, records: Vec<crate::DataVolumeRecord>) {
+        self.volume_records.store(std::sync::Arc::new(records));
+    }
+
+    /// The durable volume-record snapshot (empty on bare routers).
+    pub fn volume_records(&self) -> std::sync::Arc<Vec<crate::DataVolumeRecord>> {
+        self.volume_records.load_full()
+    }
+
+    /// Build a [`StorageBackend`] for one durable volume record — THE
+    /// shared construction path for mount-time registration and the
+    /// online `volume add-data` (design-volume-lifecycle §5.3 step 3):
+    /// device handle, per-volume allocator, capacity bound. When
+    /// `backing_dev` IS the router's default device the default-slot
+    /// Arcs are reused, which is what keeps `persist_block_key`'s
+    /// first-volume bare-key invariant true (unprefixed on-disk keys stay
+    /// byte-identical).
+    ///
+    /// Building does NOT enable placement: the backend joins routing only
+    /// at [`Self::publish_backend`] — the §5.3 step-4 durability order
+    /// ("write-path selection of the new backend is enabled last").
+    pub async fn build_backend(
+        &self,
+        id: &str,
+        backing_dev: &str,
+        meta_client: std::sync::Arc<crate::dlm::MetaClient>,
+    ) -> Result<std::sync::Arc<StorageBackend>> {
+        if backing_dev == self.default_device.device_path {
+            return Ok(std::sync::Arc::new(StorageBackend {
+                device: self.default_device.clone(),
+                block_allocator: self.default_allocator.clone(),
+            }));
+        }
+        let device = std::sync::Arc::new(crate::nvme_dev::NvmeBlockDev::new(backing_dev));
+        let allocator = std::sync::Arc::new(
+            crate::block_allocator::BlockAllocator::new(meta_client, id).await?,
+        );
+        match crate::nvme_dev::device_capacity_bytes(backing_dev) {
+            Ok(cap) => allocator.set_capacity_bytes(cap),
+            Err(e) => {
+                log::warn!("could not size data volume {backing_dev}: {e}; allocator unbounded")
+            }
+        }
+        Ok(std::sync::Arc::new(StorageBackend {
+            device,
+            block_allocator: allocator,
+        }))
+    }
+
+    /// Insert a built backend into the routing set under its durable id:
+    /// write placement, key resolution, and health-worker coverage start
+    /// here. Duplicate ids and the reserved `backend_0` alias refuse.
+    pub fn publish_backend(&self, id: &str, backend: std::sync::Arc<StorageBackend>) -> Result<()> {
+        if id == "backend_0" {
+            return Err(SqueezefsError::InvalidOperation(
+                "'backend_0' is the reserved legacy key-resolution alias, not a volume id"
+                    .to_string(),
+            ));
+        }
+        match self.backends.entry(id.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => Err(SqueezefsError::InvalidOperation(
+                format!("data volume '{id}' is already registered"),
+            )),
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(backend);
+                Ok(())
+            }
+        }
+    }
+
+    /// Register one durable volume record: [`Self::build_backend`] +
+    /// [`Self::publish_backend`] + the record's durable `disabled` state
+    /// applied as a health override. The mount loop and test fixtures
+    /// call this per record — one registration path (§5.3 step 3).
+    pub async fn register_backend(
+        &self,
+        record: &crate::DataVolumeRecord,
+        meta_client: std::sync::Arc<crate::dlm::MetaClient>,
+    ) -> Result<std::sync::Arc<StorageBackend>> {
+        let backend = self
+            .build_backend(&record.id, &record.backing_dev, meta_client)
+            .await?;
+        self.publish_backend(&record.id, backend.clone())?;
+        if record.state == crate::VOL_STATE_DISABLED {
+            self.unhealthy_backends.insert(record.id.clone(), true);
+        }
+        Ok(backend)
+    }
+
+    /// The fail-stop health override (`config data-volume
+    /// enable/disable`), re-homed from the retired `/dev/shm` runtime
+    /// config: `disabled` routes NEW placements away; blocks already on
+    /// the volume read `EIO` until re-enabled — it is NOT an evacuation
+    /// (that is `volume remove-data`, PR VL4). Unknown ids refuse — and
+    /// the reserved `backend_0` alias can never be poisoned (the phantom
+    /// stale-status foot-gun, retired for good).
+    pub fn set_health_override(&self, id: &str, disabled: bool) -> Result<()> {
+        if !self.backends.contains_key(id) {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "unknown data volume '{id}' (see `squeezefs volume list`; 'backend_0' is a \
+                 reserved key-resolution alias, not a volume)"
+            )));
+        }
+        if disabled {
+            self.unhealthy_backends.insert(id.to_string(), true);
+        } else {
+            self.unhealthy_backends.remove(id);
+        }
+        Ok(())
+    }
+
+    /// The `volume_states` gauge rows (design-volume-lifecycle §10):
+    /// durable records joined with live allocator accounting. Volumes
+    /// registered without records (bare routers, `--data-lv` overrides)
+    /// synthesize `active` rows so the table always covers the routing
+    /// set.
+    pub fn volume_states(&self) -> Vec<VolumeStateRow> {
+        let records = self.volume_records.load_full();
+        let mut rows = Vec::new();
+        let mut covered = std::collections::HashSet::new();
+        let row_for = |id: &str, backing_dev: &str, state: &str| -> VolumeStateRow {
+            let (capacity, used) = self
+                .backends
+                .get(id)
+                .map(|be| {
+                    let alloc = &be.value().block_allocator;
+                    (
+                        alloc.capacity_bytes(),
+                        alloc.get_used_blocks().saturating_mul(alloc.chunk_size()),
+                    )
+                })
+                .unwrap_or((0, 0));
+            VolumeStateRow {
+                id: id.to_string(),
+                backing_dev: backing_dev.to_string(),
+                state: state.to_string(),
+                healthy: self.is_backend_healthy(id),
+                capacity_bytes: capacity,
+                used_bytes: used,
+                free_bytes: capacity.saturating_sub(used),
+            }
+        };
+        for rec in records.iter() {
+            covered.insert(rec.id.clone());
+            rows.push(row_for(&rec.id, &rec.backing_dev, &rec.state));
+        }
+        for entry in self.backends.iter() {
+            if !covered.contains(entry.key()) {
+                let dev_path = entry.value().device.device_path.clone();
+                rows.push(row_for(entry.key(), &dev_path, crate::VOL_STATE_ACTIVE));
+            }
+        }
+        rows
     }
 
     /// Bytes currently allocated on the striped block backends, summed

@@ -320,6 +320,243 @@ pub async fn set_cache_paths(meta_lvs: &[String], paths: &[PathBuf]) -> Result<(
     Ok(())
 }
 
+/// Read the format config off the FIRST metadata volume via a read-only
+/// probe (the `volume list` / `df` access pattern — safe beside a live
+/// mount, nothing written).
+pub async fn read_volume_format_config(meta_lvs: &[String]) -> Result<crate::FormatConfig> {
+    let first = meta_lvs.first().ok_or_else(|| {
+        SqueezefsError::InvalidOperation("at least one metadata volume is required".to_string())
+    })?;
+    read_format_config(first).await
+}
+
+/// `squeezefs volume list` offline probe: the durable data-volume set in
+/// volume order (legacy sets synthesize basename-id records — KD-5
+/// grandfathering).
+pub async fn resolved_volume_records(meta_lvs: &[String]) -> Result<Vec<crate::DataVolumeRecord>> {
+    Ok(read_volume_format_config(meta_lvs)
+        .await?
+        .resolved_data_volumes())
+}
+
+/// Canonical form for membership comparison (symlinked device paths must
+/// not smuggle a duplicate member in); falls back to the raw string for
+/// paths that do not resolve.
+fn canon(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// §5.3 step-2 device preflight, shared by the offline and online add
+/// paths: exists and is a usable backing device, sized, not already a
+/// data member, not a meta volume. Pure checks — no writes.
+pub fn validate_new_data_volume(
+    device: &str,
+    existing: &[crate::DataVolumeRecord],
+    meta_lvs: &[String],
+) -> Result<u64> {
+    crate::storage::validate_backing_device(device).map_err(|e| {
+        SqueezefsError::InvalidOperation(format!("data volume '{device}' failed validation: {e}"))
+    })?;
+    let capacity = crate::nvme_dev::device_capacity_bytes(device).map_err(|e| {
+        SqueezefsError::InvalidOperation(format!("cannot size data volume '{device}': {e}"))
+    })?;
+    let dev_canon = canon(device);
+    for rec in existing {
+        if canon(&rec.backing_dev) == dev_canon {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "'{device}' is already a member of the data-volume set (id '{}', state '{}') — \
+                 volume ids are never reused (KD-5)",
+                rec.id, rec.state
+            )));
+        }
+    }
+    for meta in meta_lvs {
+        if canon(meta) == dev_canon {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "'{device}' is a metadata volume of this set — a meta volume can never be \
+                 added as a data volume"
+            )));
+        }
+    }
+    Ok(capacity)
+}
+
+/// §5.3 step-2 probe: write+readback of a scratch block at offset 0 (no
+/// allocator involvement — the device is not a member yet), restored to
+/// zeros afterwards so the volume stays blank. Proves the device path is
+/// writable through the same `NvmeBlockDev` io_uring worker the mount
+/// will use — a read-only or vanished device fails HERE, before any
+/// durable record names it.
+pub async fn probe_data_volume_rw(device: &str) -> Result<()> {
+    let dev = crate::nvme_dev::NvmeBlockDev::new(device);
+    let mut pattern = vec![0u8; 4096];
+    fastrand::fill(&mut pattern);
+    let ctx = |what: &str, e: &SqueezefsError| {
+        SqueezefsError::InvalidOperation(format!(
+            "scratch-block {what} probe failed on '{device}': {e}"
+        ))
+    };
+    dev.write_block(0, bytes::Bytes::copy_from_slice(&pattern))
+        .await
+        .map_err(|e| ctx("write", &e))?;
+    let back = dev.read_block(0, 4096).await.map_err(|e| ctx("read", &e))?;
+    if back[..] != pattern[..] {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "scratch-block readback mismatch on '{device}' — the device does not persist \
+             writes (wrong path? overlapping volume?)"
+        )));
+    }
+    dev.write_block(0, bytes::Bytes::from(vec![0u8; 4096]))
+        .await
+        .map_err(|e| ctx("blank-restore", &e))?;
+    Ok(())
+}
+
+/// `squeezefs volume add-data` — the OFFLINE guarded path
+/// (design-volume-lifecycle §5.3; the online path is the admin-lane
+/// `volume-add-data` verb against the live daemon). Guarded like
+/// `set-cache-paths`:
+///
+/// 1. live-client gate (`format_preflight`) on every meta volume;
+/// 2. device preflight ([`validate_new_data_volume`]) + write/readback
+///    probe ([`probe_data_volume_rw`]) — all refusals BEFORE any durable
+///    effect;
+/// 3. guarded open of the whole set (takes the D0 writer claims);
+/// 4. **`KV_VOLUME_LIFECYCLE` bit 3 stamped durably on every member
+///    superblock BEFORE the record commit** (bit-before-durable-record,
+///    §7 — a crash after the bit and before the record leaves a set old
+///    binaries refuse and this binary mounts unchanged);
+/// 5. one setxattr tx on volume 0: `data_volumes` += the new `vol-` record
+///    (legacy members materialized with their grandfathered basename
+///    ids), `data_lv` mirrored;
+/// 6. clean shutdown (claims released).
+///
+/// The §5.3 step-6 auto-rebalance default arms with the VL4 mover —
+/// callers print that honestly.
+pub async fn add_data_volume(meta_lvs: &[String], device: &str) -> Result<crate::DataVolumeRecord> {
+    // 1. Live-client gate on EVERY volume before anything is touched.
+    for path in meta_lvs {
+        crate::meta_backend::kv::builder::format_preflight(Path::new(path), true)
+            .await
+            .map_err(|e| {
+                SqueezefsError::InvalidOperation(format!("volume add-data refused: {e}"))
+            })?;
+    }
+
+    // 2. The set must be formatted; validate + probe the device.
+    let cfg = read_volume_format_config(meta_lvs).await?;
+    let mut records = cfg.resolved_data_volumes();
+    validate_new_data_volume(device, &records, meta_lvs)?;
+    probe_data_volume_rw(device).await?;
+
+    let record = crate::DataVolumeRecord {
+        id: crate::new_data_volume_id(),
+        backing_dev: device.to_string(),
+        state: crate::VOL_STATE_ACTIVE.to_string(),
+        added_ts: std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    };
+    records.push(record.clone());
+
+    commit_volume_records(meta_lvs, cfg, records).await?;
+    Ok(record)
+}
+
+/// Offline durable enable/disable — the health override's durable home
+/// after the `/dev/shm` runtime-config deletion: flips one record's
+/// `state` (`active`/`disabled`) through the same guarded
+/// bit-before-record path as `add_data_volume`. Idempotent no-ops never
+/// materialize legacy records (an untouched set stays bit-identical).
+pub async fn set_data_volume_state(
+    meta_lvs: &[String],
+    volume_id: &str,
+    state: &str,
+) -> Result<()> {
+    if state != crate::VOL_STATE_ACTIVE && state != crate::VOL_STATE_DISABLED {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "unsupported volume state '{state}' (VL3 states: active|disabled; drain states \
+             land with `volume remove-data`, PR VL4)"
+        )));
+    }
+    for path in meta_lvs {
+        crate::meta_backend::kv::builder::format_preflight(Path::new(path), true)
+            .await
+            .map_err(|e| {
+                SqueezefsError::InvalidOperation(format!("volume state change refused: {e}"))
+            })?;
+    }
+    let cfg = read_volume_format_config(meta_lvs).await?;
+    let mut records = cfg.resolved_data_volumes();
+    let rec = records
+        .iter_mut()
+        .find(|r| r.id == volume_id)
+        .ok_or_else(|| {
+            SqueezefsError::InvalidOperation(format!(
+                "unknown data volume '{volume_id}' (see `squeezefs volume list`)"
+            ))
+        })?;
+    if rec.state == state {
+        return Ok(()); // idempotent — never materializes records for a no-op
+    }
+    rec.state = state.to_string();
+    commit_volume_records(meta_lvs, cfg, records).await
+}
+
+/// The shared durable tail of every offline lifecycle commit: guarded
+/// open of the whole set (D0 claims — excludes racing mounts for the
+/// commit's duration), **bit 3 on every member superblock first**, then
+/// one setxattr tx on volume 0 with the updated records + `data_lv`
+/// mirror, then clean shutdown.
+async fn commit_volume_records(
+    meta_lvs: &[String],
+    mut cfg: crate::FormatConfig,
+    records: Vec<crate::DataVolumeRecord>,
+) -> Result<()> {
+    let backends = crate::meta_backend::open_meta_volume_set(meta_lvs).await?;
+
+    // Bit-before-durable-record (design-volume-lifecycle §7): stamp every
+    // member superblock before the record exists. Sector 0 is never
+    // rewritten by the open backends (checkpoints flip the root ledger),
+    // so this is race-free under the held claims.
+    for path in meta_lvs {
+        if let Err(e) =
+            crate::meta_backend::kv::superblock::set_volume_lifecycle_bit(Path::new(path)).await
+        {
+            for be in &backends {
+                let _ = be.shutdown().await;
+            }
+            return Err(e.into());
+        }
+    }
+
+    cfg.data_lv = Some(records.iter().map(|r| r.backing_dev.clone()).collect());
+    cfg.data_volumes = Some(records);
+    let bytes = serde_json::to_vec(&cfg).map_err(|e| {
+        SqueezefsError::InvalidOperation(format!("failed to serialize the format config: {e}"))
+    })?;
+    let commit = crate::meta_backend::Metadata::setxattr(
+        backends[0].as_ref(),
+        1,
+        crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
+        &bytes,
+    )
+    .await;
+    for be in &backends {
+        if let Err(te) = be.shutdown().await {
+            log::warn!(
+                "releasing guard on {:?} after a lifecycle commit failed: {te}",
+                be.device_path()
+            );
+        }
+    }
+    commit?;
+    Ok(())
+}
+
 pub async fn enable_data_volume(_redis_url: &str, _fs_name: &str, volume_id: &str) -> Result<()> {
     let mut cfg = load_or_create_config();
     cfg.data_volume_statuses

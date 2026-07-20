@@ -273,6 +273,14 @@ impl BlockAllocator {
             .store(bytes / self.chunk_size, Ordering::Relaxed);
     }
 
+    /// The bound capacity in bytes (`0` = unbounded) — the
+    /// `volume_states` capacity gauge source.
+    pub fn capacity_bytes(&self) -> u64 {
+        self.capacity_blocks
+            .load(Ordering::Relaxed)
+            .saturating_mul(self.chunk_size)
+    }
+
     /// Advance the fresh-block cursor by one, refusing to mint an offset at
     /// or past the device capacity (when bounded). CAS loop: a refused
     /// racer must not bump the cursor.

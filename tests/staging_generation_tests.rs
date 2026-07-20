@@ -86,6 +86,7 @@ fn format_config_json() -> Vec<u8> {
         mem_cache_size: None,
         disk_cache_size: None,
         disk_cache_paths: None,
+        data_volumes: None,
         data_lv: None,
         read_cache_size: None,
         write_cache_size: None,

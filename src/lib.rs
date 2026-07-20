@@ -311,6 +311,51 @@ pub mod keys {
     }
 }
 
+/// Durable data-volume state values (design-volume-lifecycle §5.3/§5.4).
+/// VL3 uses `active`/`disabled`; the drain machinery (PR VL4) adds
+/// `draining`/`retired` to the same string lattice.
+pub const VOL_STATE_ACTIVE: &str = "active";
+pub const VOL_STATE_DISABLED: &str = "disabled";
+
+/// One member of the durable data-volume set (KD-5,
+/// design-volume-lifecycle §5.3): a never-reused volume id, its current
+/// backing device path, and its lifecycle state. Legacy sets (pre-VL3
+/// `data_lv`-only configs) synthesize records whose ids are EXACTLY the
+/// device-path basenames — the grandfathering that keeps every existing
+/// `name://offset` block key resolving to the same backend.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DataVolumeRecord {
+    /// `vol-{16 hex}` (random, allocated once, never reused) for volumes
+    /// added by `squeezefs volume add-data`; the historical basename for
+    /// grandfathered legacy members.
+    pub id: String,
+    /// Current backing device path (host-resolvable).
+    pub backing_dev: String,
+    /// [`VOL_STATE_ACTIVE`] / [`VOL_STATE_DISABLED`] (VL4 adds
+    /// draining/retired).
+    pub state: String,
+    /// Unix seconds when the record was created (`0` for synthesized
+    /// legacy records).
+    pub added_ts: u64,
+}
+
+/// Mint a fresh durable volume id: `vol-{16 hex}`, random, never reused
+/// (KD-5 — retired ids are recorded forever so a stale key can never
+/// resolve to the wrong device).
+pub fn new_data_volume_id() -> String {
+    format!("vol-{:016x}", fastrand::u64(..))
+}
+
+/// The grandfathered id of a legacy (`data_lv`) member: the device-path
+/// basename, byte-identical to what mount has always registered.
+pub fn legacy_volume_id(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct FormatConfig {
     pub name: String,
@@ -329,6 +374,14 @@ pub struct FormatConfig {
     pub disk_cache_paths: Option<Vec<std::path::PathBuf>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_lv: Option<Vec<String>>,
+    /// The durable data-volume set (design-volume-lifecycle §5.3, KD-5).
+    /// `None` = legacy set: records are synthesized from `data_lv`
+    /// basenames ([`FormatConfig::resolved_data_volumes`]) and the config
+    /// stays byte-identical until the first lifecycle verb materializes
+    /// them (which also stamps the `KV_VOLUME_LIFECYCLE` incompat bit —
+    /// bit-before-durable-record ordering, §7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_volumes: Option<Vec<DataVolumeRecord>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_cache_size: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -343,6 +396,30 @@ pub struct FormatConfig {
     pub upload_delay: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fuse_io_uring_sqpoll_idle_ms: Option<u32>,
+}
+
+impl FormatConfig {
+    /// The durable data-volume set this config names, in volume order:
+    /// `data_volumes` verbatim when present, else records synthesized
+    /// from the legacy `data_lv` paths with basename ids (grandfathering,
+    /// KD-5 — mount must register backends under EXACTLY the same names
+    /// as before VL3).
+    pub fn resolved_data_volumes(&self) -> Vec<DataVolumeRecord> {
+        if let Some(ref recs) = self.data_volumes {
+            return recs.clone();
+        }
+        self.data_lv
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|path| DataVolumeRecord {
+                id: legacy_volume_id(path),
+                backing_dev: path.clone(),
+                state: VOL_STATE_ACTIVE.to_string(),
+                added_ts: 0,
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

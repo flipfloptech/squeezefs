@@ -94,10 +94,21 @@ pub const FEATURE_INCOMPAT_KV_V3: u64 = 1 << 0;
 /// remedy it demands.
 pub const FEATURE_INCOMPAT_NODE_SEQ_WATERMARK: u64 = 1 << 1;
 
+/// `features_incompat` bit 3: the volume set has a **lifecycle history**
+/// (design-volume-lifecycle KD-14, §7): a non-legacy volume record, a
+/// non-identity slot map, or an active drain exists. Set durably at the
+/// FIRST lifecycle commit — **before** the durable record it gates
+/// (bit-before-durable-record ordering) — and never on untouched sets,
+/// so legacy volumes stay bit-identical. Old binaries refuse loud via
+/// the [`FEATURES_INCOMPAT_KNOWN`] gate. Bit 2 is reserved for
+/// `KV_GUEST_SLOTS` (PR VL5a) and deliberately not defined here.
+pub const FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE: u64 = 1 << 3;
+
 /// Incompat feature bits this binary understands. Any other set bit
 /// refuses the mount naming the bit (§6.1).
-pub const FEATURES_INCOMPAT_KNOWN: u64 =
-    FEATURE_INCOMPAT_KV_V3 | FEATURE_INCOMPAT_NODE_SEQ_WATERMARK;
+pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
+    | FEATURE_INCOMPAT_NODE_SEQ_WATERMARK
+    | FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE;
 
 /// Read-only feature bits this binary understands (none yet — §4.11
 /// reserves the mechanism for snapshots). Unknown bits mount read-only.
@@ -292,6 +303,15 @@ impl SuperblockV3 {
     /// (unknown incompat bits refuse loud, naming the bits). Torn or
     /// tampered superblocks fail loud — the §4.10 torn-SB crash case.
     pub fn decode_sector(buf: &[u8]) -> Result<Self, KvError> {
+        Self::decode_sector_with_known(buf, FEATURES_INCOMPAT_KNOWN)
+    }
+
+    /// [`Self::decode_sector`] against an explicit known-incompat mask.
+    /// The production gate passes [`FEATURES_INCOMPAT_KNOWN`]; tests pass
+    /// historical masks to prove the forward-only refusal an OLD binary
+    /// would issue for newer bits (KD-14's pinned old-mask check — the
+    /// real gate code path, not a synthetic "some bit set" assertion).
+    pub fn decode_sector_with_known(buf: &[u8], known_incompat: u64) -> Result<Self, KvError> {
         if buf.len() != SUPERBLOCK_V3_LEN {
             return Err(KvError::Corrupt(format!(
                 "v3 superblock sector must be {SUPERBLOCK_V3_LEN} bytes, got {}",
@@ -358,7 +378,7 @@ impl SuperblockV3 {
                     .to_string(),
             ));
         }
-        let unknown = sb.unknown_incompat();
+        let unknown = sb.features_incompat & !known_incompat;
         if unknown != 0 {
             let bits: Vec<String> = (0..64)
                 .filter(|b| unknown & (1u64 << b) != 0)
@@ -610,4 +630,38 @@ pub async fn write_superblock_v3(path: &Path, sb: &SuperblockV3) -> Result<(), K
     let img = sb.encode_sector()?;
     crate::uring_fs::write_at(path, 0, img).await?;
     Ok(())
+}
+
+/// Stamp [`FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE`] on `path`'s superblock
+/// — the "first non-trivial lifecycle commit" gate (KD-14). Returns
+/// whether the bit was NEWLY set (`false` = already stamped, no write).
+/// Refuses blank / legacy-v2 / corrupt volumes loud. Callers must invoke
+/// this **before** committing the durable record the bit gates
+/// (bit-before-durable-record ordering, design-volume-lifecycle §7): a
+/// crash between the bit write and the record commit leaves a set old
+/// binaries refuse and this binary mounts unchanged — the safe prefix.
+///
+/// Sector 0 is written only here and at format, never by the live
+/// backend (checkpoints flip the root ledger), so the whole-sector
+/// checksummed rewrite is race-free against an open volume.
+pub async fn set_volume_lifecycle_bit(path: &Path) -> Result<bool, KvError> {
+    match classify_volume(path).await? {
+        VolumeFormat::V3(mut sb) => {
+            if sb.features_incompat & FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE != 0 {
+                return Ok(false);
+            }
+            sb.features_incompat |= FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE;
+            write_superblock_v3(path, &sb).await?;
+            Ok(true)
+        }
+        VolumeFormat::Blank => Err(KvError::Corrupt(format!(
+            "{}: cannot stamp the volume-lifecycle bit on an unformatted volume — run \
+             `squeezefs format` first",
+            path.display()
+        ))),
+        VolumeFormat::V2Legacy => Err(KvError::Corrupt(format!(
+            "{}: format v2 is no longer supported; reformat required",
+            path.display()
+        ))),
+    }
 }

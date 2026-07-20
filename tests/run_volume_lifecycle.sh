@@ -313,11 +313,11 @@ do_unmount
 # ---------------------------------------------------------------------------
 LOOPS="${LOOPS:-3}"
 
-stats_field() { # stats_field <json-number-field>
+stats_field() { # stats_field <metrics-counter-name> — from the .stats "metrics" object
     python3 -c '
 import json, sys
 data = json.load(open(sys.argv[1]))
-print(int(data.get(sys.argv[2]) or 0))
+print(int((data.get("metrics") or {}).get(sys.argv[2]) or 0))
 ' "$MNT/.stats" "$1"
 }
 

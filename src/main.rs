@@ -138,6 +138,13 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Maintenance-job fabric control (design-volume-lifecycle §6):
+    /// live via the mount's admin lane, offline via probe reads of the
+    /// durable job records
+    Job {
+        #[command(subcommand)]
+        action: JobActions,
+    },
     /// Single-writer mount-guard claim administration
     /// (docs/design-metadata-throughput.md §5.0)
     Claim {
@@ -774,6 +781,27 @@ enum TargetActions {
     },
 }
 
+#[derive(Subcommand)]
+enum JobActions {
+    /// List jobs (TARGET = a live mountpoint, or a sqmeta:// URI for
+    /// the offline probe)
+    List { target: String },
+    /// One job's status
+    Status { target: String, job_id: String },
+    /// Pause a running job (live mount only)
+    Pause { target: String, job_id: String },
+    /// Resume a paused job (live mount only)
+    Resume { target: String, job_id: String },
+    /// Cancel a job (terminal; live mount only)
+    Cancel { target: String, job_id: String },
+    /// Retune a job's duty-cycle percentage live (live mount only)
+    Throttle {
+        target: String,
+        job_id: String,
+        pct: u32,
+    },
+}
+
 #[derive(Subcommand, Debug, Clone)]
 enum ConfigActions {
     /// Manage staging disk caches
@@ -1162,6 +1190,87 @@ fn parse_block_uri(uri: &str, scheme: &str) -> Result<Vec<String>, String> {
         })
         .collect();
     Ok(paths)
+}
+
+/// VL2 admin-lane client: discover the mount's ctl socket from the
+/// bootstrap xattr on the mountpoint root (armed on every mount since
+/// VL2), open an ADMIN session (peercred-gated daemon-side), run one
+/// verb.
+fn admin_roundtrip(mountpoint: &str, verb: &str, arg: &str) -> Result<String, String> {
+    // Read the bootstrap blob via plain getxattr on the mountpoint.
+    let cpath = std::ffi::CString::new(mountpoint).map_err(|_| "bad path".to_string())?;
+    let name = std::ffi::CString::new(squeezefs_ipc::wire::BOOTSTRAP_XATTR).unwrap();
+    let mut buf = vec![0u8; 4096];
+    // SAFETY: getxattr(2) into our sized buffer.
+    let n = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        return Err(format!(
+            "{mountpoint} does not answer the SqueezeFS bootstrap probe — not a live \
+             SqueezeFS mount? ({})",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let blob = squeezefs_ipc::wire::BootstrapBlob::decode(&buf[..n as usize])
+        .map_err(|e| format!("bootstrap blob undecodable: {e:?}"))?;
+    // Connect ladder (OQ-6): abstract first, path fallback.
+    let sock = squeezefs::ipc_host::abstract_connect(&blob.socket)
+        .or_else(|e| {
+            if blob.socket_path.is_empty() {
+                Err(e)
+            } else {
+                squeezefs::ipc_host::path_connect(&blob.socket_path)
+            }
+        })
+        .map_err(|e| format!("cannot reach the mount's ctl socket: {e}"))?;
+    use squeezefs::ipc_host::{recv_ctl, send_ctl};
+    use squeezefs_ipc::wire::CtlMsg;
+    // SAFETY: getpid/getuid are trivially safe.
+    let (pid, uid) = unsafe { (libc::getpid() as u32, libc::getuid()) };
+    send_ctl(&sock, &CtlMsg::AdminHello { pid, uid }, None).map_err(|e| e.to_string())?;
+    match recv_ctl(&sock).map_err(|e| e.to_string())?.0 {
+        CtlMsg::AdminOk => {}
+        CtlMsg::Refuse { class } => {
+            return Err(format!(
+                "admin session refused ({class:?}) — the lane admits root or the mount-owning uid"
+            ))
+        }
+        other => return Err(format!("unexpected reply {other:?}")),
+    }
+    send_ctl(
+        &sock,
+        &CtlMsg::AdminReq {
+            verb: verb.to_string(),
+            arg: arg.to_string(),
+        },
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    match recv_ctl(&sock).map_err(|e| e.to_string())?.0 {
+        CtlMsg::AdminReply { ok: true, body } => Ok(body),
+        CtlMsg::AdminReply { ok: false, body } => Err(body),
+        other => Err(format!("unexpected reply {other:?}")),
+    }
+}
+
+/// Offline probe: read the durable job records straight off the meta
+/// volumes (the clients/df access pattern — read-only, no D0 claim).
+async fn job_probe_records(
+    uri: &str,
+) -> Result<Vec<squeezefs::jobs::JobRecord>, Box<dyn std::error::Error>> {
+    let meta_lvs = parse_block_uri(uri, "sqmeta://")?;
+    let mut vols = Vec::new();
+    for path in &meta_lvs {
+        vols.push(squeezefs::meta_backend::open_volume_probe(path).await?);
+    }
+    let routed = std::sync::Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vols));
+    Ok(squeezefs::jobs::JobFabric::list_records(&routed).await?)
 }
 
 /// VL1 (design-volume-lifecycle §5.0): the removed fake admin verbs
@@ -2557,6 +2666,62 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 vec![meta_uri]
             };
             run_clients_report(&meta_lvs, json).await?;
+        }
+        Commands::Job { action } => {
+            let live = |t: &str| !t.starts_with("sqmeta://");
+            match action {
+                JobActions::List { target } => {
+                    if live(&target) {
+                        println!("{}", admin_roundtrip(&target, "job-list", "")?);
+                    } else {
+                        let recs = job_probe_records(&target).await?;
+                        println!("{}", serde_json::to_string_pretty(&recs)?);
+                    }
+                }
+                JobActions::Status { target, job_id } => {
+                    if live(&target) {
+                        println!("{}", admin_roundtrip(&target, "job-status", &job_id)?);
+                    } else {
+                        let recs = job_probe_records(&target).await?;
+                        match recs.iter().find(|r| r.job_id == job_id) {
+                            Some(r) => println!("{}", serde_json::to_string_pretty(r)?),
+                            None => return Err(format!("unknown job {job_id}").into()),
+                        }
+                    }
+                }
+                JobActions::Pause { target, job_id }
+                | JobActions::Resume { target, job_id }
+                | JobActions::Cancel { target, job_id }
+                    if !live(&target) =>
+                {
+                    let _ = job_id;
+                    return Err("mutating job verbs need a live mount (offline probes are \
+                                read-only — design-volume-lifecycle §6)"
+                        .into());
+                }
+                JobActions::Pause { target, job_id } => {
+                    println!("{}", admin_roundtrip(&target, "job-pause", &job_id)?);
+                }
+                JobActions::Resume { target, job_id } => {
+                    println!("{}", admin_roundtrip(&target, "job-resume", &job_id)?);
+                }
+                JobActions::Cancel { target, job_id } => {
+                    println!("{}", admin_roundtrip(&target, "job-cancel", &job_id)?);
+                }
+                JobActions::Throttle {
+                    target,
+                    job_id,
+                    pct,
+                } => {
+                    if !live(&target) {
+                        return Err("job throttle needs a live mount".into());
+                    }
+                    println!(
+                        "{}",
+                        admin_roundtrip(&target, "job-throttle", &format!("{job_id} {pct}"))?
+                    );
+                }
+            }
         }
         Commands::Claim { action } => {
             let ClaimActions::Clear { meta_uri } = action;

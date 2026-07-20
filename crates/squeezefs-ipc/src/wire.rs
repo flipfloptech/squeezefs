@@ -118,6 +118,14 @@ fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
+/// Length-prefixed variable string (admin frames). Truncation is a
+/// caller bug: callers cap before encoding; encode clamps defensively.
+fn put_var_str(out: &mut Vec<u8>, s: &str, cap: usize) {
+    let bytes = &s.as_bytes()[..s.len().min(cap)];
+    put_u32(out, bytes.len() as u32);
+    out.extend_from_slice(bytes);
+}
+
 fn put_str<const N: usize>(out: &mut Vec<u8>, s: &str) {
     let mut buf = [0u8; N];
     let bytes = s.as_bytes();
@@ -167,6 +175,17 @@ impl<'a> Reader<'a> {
 
     fn nonce(&mut self) -> Result<[u8; NONCE_LEN], WireError> {
         Ok(self.take(NONCE_LEN)?.try_into().unwrap())
+    }
+
+    /// Length-prefixed variable string (admin frames), bounded by `cap`.
+    fn str_var(&mut self, cap: usize) -> Result<String, WireError> {
+        let n = self.u32()? as usize;
+        if n > cap {
+            return Err(WireError::BadString);
+        }
+        core::str::from_utf8(self.take(n)?)
+            .map(str::to_owned)
+            .map_err(|_| WireError::BadString)
     }
 }
 
@@ -239,9 +258,20 @@ const TAG_BIND: u32 = 4;
 const TAG_BIND_OK: u32 = 5;
 const TAG_BIND_REFUSED: u32 = 6;
 const TAG_UNBIND: u32 = 7;
+const TAG_ADMIN_HELLO: u32 = 8;
+const TAG_ADMIN_OK: u32 = 9;
+const TAG_ADMIN_REQ: u32 = 10;
+const TAG_ADMIN_REPLY: u32 = 11;
 
 /// Upper bound on any encoded ctl message (receive-buffer sizing).
-pub const CTL_MSG_MAX: usize = 512;
+/// Admin frames (VL2 §5.1.4) carry variable JSON bodies and use the
+/// larger bound; data-plane frames stay tiny.
+pub const CTL_MSG_MAX: usize = 64 * 1024;
+
+/// Per-field caps inside admin frames (frames stay under CTL_MSG_MAX
+/// with headroom; oversize replies refuse instead of truncating).
+pub const ADMIN_VERB_MAX: usize = 64;
+pub const ADMIN_BODY_MAX: usize = 60 * 1024;
 
 /// One ctl datagram (§5.2 bind protocol). fd attachments ride `SCM_RIGHTS`
 /// beside the datagram, never inside it: `Hello` and `Bind` each carry
@@ -278,6 +308,18 @@ pub enum CtlMsg {
     /// Client → daemon: release a binding (shim close-path, refcounted
     /// client-side — last close sends this).
     Unbind { binding_id: u64 },
+    /// Client → daemon: open an ADMIN control session (VL2 §5.1.4).
+    /// No fd credential — `SO_PEERCRED` is the check (uid 0 or the
+    /// mount-owning uid; claimed pid/uid must match the kernel's).
+    AdminHello { pid: u32, uid: u32 },
+    /// Daemon → client: admin session admitted.
+    AdminOk,
+    /// Client → daemon: one admin verb (`job-list`, `job-pause`, …)
+    /// with a verb-specific argument string.
+    AdminReq { verb: String, arg: String },
+    /// Daemon → client: verb outcome; `body` is verb-specific JSON or
+    /// an error message when `ok` is false.
+    AdminReply { ok: bool, body: String },
 }
 
 impl CtlMsg {
@@ -330,6 +372,22 @@ impl CtlMsg {
                 put_u32(&mut out, TAG_UNBIND);
                 put_u64(&mut out, *binding_id);
             }
+            Self::AdminHello { pid, uid } => {
+                put_u32(&mut out, TAG_ADMIN_HELLO);
+                put_u32(&mut out, *pid);
+                put_u32(&mut out, *uid);
+            }
+            Self::AdminOk => put_u32(&mut out, TAG_ADMIN_OK),
+            Self::AdminReq { verb, arg } => {
+                put_u32(&mut out, TAG_ADMIN_REQ);
+                put_var_str(&mut out, verb, ADMIN_VERB_MAX);
+                put_var_str(&mut out, arg, ADMIN_BODY_MAX);
+            }
+            Self::AdminReply { ok, body } => {
+                put_u32(&mut out, TAG_ADMIN_REPLY);
+                put_u32(&mut out, u32::from(*ok));
+                put_var_str(&mut out, body, ADMIN_BODY_MAX);
+            }
         }
         debug_assert!(out.len() <= CTL_MSG_MAX);
         out
@@ -369,6 +427,19 @@ impl CtlMsg {
             },
             TAG_UNBIND => Self::Unbind {
                 binding_id: r.u64()?,
+            },
+            TAG_ADMIN_HELLO => Self::AdminHello {
+                pid: r.u32()?,
+                uid: r.u32()?,
+            },
+            TAG_ADMIN_OK => Self::AdminOk,
+            TAG_ADMIN_REQ => Self::AdminReq {
+                verb: r.str_var(ADMIN_VERB_MAX)?,
+                arg: r.str_var(ADMIN_BODY_MAX)?,
+            },
+            TAG_ADMIN_REPLY => Self::AdminReply {
+                ok: r.u32()? != 0,
+                body: r.str_var(ADMIN_BODY_MAX)?,
             },
             other => return Err(WireError::UnknownTag(other)),
         })

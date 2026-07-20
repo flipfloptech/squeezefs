@@ -142,6 +142,25 @@ pub struct IpcHostConfig {
     /// re-establishes). `0` disables the reaper (tests; production
     /// wires `SQUEEZEFS_IPC_IDLE_SECS`, default 300).
     pub idle_secs: u64,
+    /// VL2 (design-volume-lifecycle §5.1.4): whether data-plane
+    /// sessions are admitted. `false` = control-plane-only (the
+    /// every-mount posture without `-o interception`): the listener +
+    /// ctl threads run, ADMIN sessions work, but data-plane HELLOs
+    /// refuse before any fd screen — no shm sessions, no arenas.
+    pub data_plane: bool,
+    /// The mount-owning uid: the ADMIN lane admits peercred uid 0 or
+    /// this uid, nothing else.
+    pub owner_uid: u32,
+}
+
+/// The admin-verb handler behind the ADMIN lane (VL2 §5.1.4). Wired
+/// post-spawn (`set_admin_sink`); admin requests refuse until it is.
+/// Implementations run on host ctl threads (plain OS threads) and may
+/// block on their own runtime handle.
+pub trait AdminSink: Send + Sync + 'static {
+    /// Execute one verb; returns `(ok, body)` — body is verb-specific
+    /// JSON, or the error text when `!ok`.
+    fn handle(&self, verb: &str, arg: &str) -> (bool, String);
 }
 
 /// Per-op rights derived from the screened fd's access mode (§5.2 rule 3).
@@ -548,6 +567,11 @@ fn rand_nonce() -> [u8; NONCE_LEN] {
 pub struct IpcHost {
     cfg: IpcHostConfig,
     sink: Arc<dyn SessionSink>,
+    admin: arc_swap::ArcSwap<Option<Arc<dyn AdminSink>>>,
+    /// Live ADMIN connections (raw fds): severed at shutdown so their
+    /// ctl threads unblock and join — a lingering admin client must
+    /// never wedge daemon teardown (caught by the VL2 red suite).
+    admin_conns: Mutex<Vec<Arc<UnixStream>>>,
     listener_fd: OwnedFd,
     /// OQ-6 path-socket listener + its on-disk path (unlinked at
     /// shutdown). `None` = disabled or degraded to abstract-only.
@@ -613,6 +637,8 @@ impl IpcHost {
         let host = Arc::new(Self {
             cfg,
             sink,
+            admin: arc_swap::ArcSwap::from_pointee(None),
+            admin_conns: Mutex::new(Vec::new()),
             listener_fd,
             path_listener,
             nonce: Mutex::new(NonceState::fresh()),
@@ -771,6 +797,20 @@ impl IpcHost {
             // Zero residue restored: the socket file dies with the host.
             let _ = std::fs::remove_file(path);
         }
+        // Sever live ADMIN connections: their ctl threads park in recv
+        // between verbs and must unblock for the join below (a
+        // lingering admin client must never wedge teardown).
+        for conn in std::mem::take(
+            &mut *self
+                .admin_conns
+                .lock()
+                .expect("admin conn registry mutex never poisons"),
+        ) {
+            // SAFETY: plain shutdown(2) on a connection we own an Arc of.
+            unsafe {
+                libc::shutdown(conn.as_raw_fd(), libc::SHUT_RDWR);
+            }
+        }
         let sessions: Vec<Arc<IpcSession>> = self
             .sessions
             .lock()
@@ -866,7 +906,31 @@ impl IpcHost {
     /// Refuse; then BIND/UNBIND until EOF (client death — §5.7).
     fn connection_loop(self: Arc<Self>, sock: UnixStream) {
         let sock = Arc::new(sock);
-        let session = match self.handle_hello(&sock) {
+        // First datagram routes the connection: AdminHello opens the
+        // control-plane lane (VL2 §5.1.4), Hello the data plane.
+        let first = match recv_ctl(&sock) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if let (CtlMsg::AdminHello { pid, uid }, _) = &first {
+            self.admin_loop(&sock, *pid, *uid);
+            return;
+        }
+        if let (CtlMsg::AdminReq { .. } | CtlMsg::AdminReply { .. } | CtlMsg::AdminOk, _) = &first {
+            // Admin traffic from an unestablished peer: refuse loudly
+            // (a silent drop reads as a hang to a buggy client).
+            count_refusal(RefuseClass::Flags);
+            log::warn!("ipc host: admin frame before AdminHello — refusing");
+            let _ = send_ctl(
+                &sock,
+                &CtlMsg::Refuse {
+                    class: RefuseClass::Flags,
+                },
+                None,
+            );
+            return;
+        }
+        let session = match self.handle_hello_msg(&sock, first) {
             Some(s) => s,
             None => return, // refused (counted) or transport error
         };
@@ -937,11 +1001,76 @@ impl IpcHost {
     /// peercred → fd screen → budget admission. Any refusal is counted +
     /// replied; success establishes the session and replies `SessionOk`
     /// with the sealed memfd.
-    fn handle_hello(self: &Arc<Self>, sock: &Arc<UnixStream>) -> Option<Arc<IpcSession>> {
-        let (msg, rx_fd) = match recv_ctl(sock) {
-            Ok(v) => v,
-            Err(_) => return None,
+    /// The ADMIN lane (VL2 §5.1.4): peercred-gated (uid 0 or the mount
+    /// owner; claimed pid/uid must match the kernel's), then a
+    /// request/reply verb loop against the wired [`AdminSink`]. No fd
+    /// screen, no session, no shm — strictly more restrictive than the
+    /// data plane.
+    fn admin_loop(self: &Arc<Self>, sock: &Arc<UnixStream>, pid: u32, uid: u32) {
+        let refuse = |class: RefuseClass| {
+            count_refusal(class);
+            log::warn!("ipc host: AdminHello refused ({class:?}) from pid {pid} uid {uid}");
+            let _ = send_ctl(sock, &CtlMsg::Refuse { class }, None);
         };
+        let Some(cred) = peer_cred(sock) else {
+            return refuse(RefuseClass::Peercred);
+        };
+        if cred.pid as u32 != pid || cred.uid != uid {
+            return refuse(RefuseClass::Peercred);
+        }
+        if cred.uid != 0 && cred.uid != self.cfg.owner_uid {
+            return refuse(RefuseClass::Peercred);
+        }
+        if send_ctl(sock, &CtlMsg::AdminOk, None).is_err() {
+            return;
+        }
+        log::info!("ipc host: ADMIN session opened by pid {pid} uid {uid}");
+        self.admin_conns
+            .lock()
+            .expect("admin conn registry mutex never poisons")
+            .push(Arc::clone(sock));
+        loop {
+            match recv_ctl(sock) {
+                Ok((CtlMsg::AdminReq { verb, arg }, _)) => {
+                    let reply = match self.admin.load().as_ref() {
+                        Some(sink) => {
+                            let (ok, body) = sink.handle(&verb, &arg);
+                            CtlMsg::AdminReply { ok, body }
+                        }
+                        None => CtlMsg::AdminReply {
+                            ok: false,
+                            body: "admin sink not wired".to_string(),
+                        },
+                    };
+                    if send_ctl(sock, &reply, None).is_err() {
+                        break;
+                    }
+                }
+                Ok((other, _)) => {
+                    log::warn!("ipc host: unexpected ctl message on ADMIN lane: {other:?}");
+                    break;
+                }
+                Err(_) => break, // EOF / transport torn / shutdown sever
+            }
+        }
+        self.admin_conns
+            .lock()
+            .expect("admin conn registry mutex never poisons")
+            .retain(|c| !Arc::ptr_eq(c, sock));
+    }
+
+    /// Wire the admin-verb handler (post-spawn; requests refuse until
+    /// then).
+    pub fn set_admin_sink(&self, sink: Arc<dyn AdminSink>) {
+        self.admin.store(Arc::new(Some(sink)));
+    }
+
+    fn handle_hello_msg(
+        self: &Arc<Self>,
+        sock: &Arc<UnixStream>,
+        first: (CtlMsg, Option<OwnedFd>),
+    ) -> Option<Arc<IpcSession>> {
+        let (msg, rx_fd) = first;
         let CtlMsg::Hello {
             abi,
             pid,
@@ -962,6 +1091,14 @@ impl IpcHost {
             let _ = send_ctl(sock, &CtlMsg::Refuse { class }, None);
             None
         };
+
+        // VL2 control-plane-only posture (§5.1.4): on a mount without
+        // `-o interception`, data-plane sessions refuse BEFORE any fd
+        // screen — no shm, no arenas, no service dispatch. The ADMIN
+        // lane above is the only admitted traffic.
+        if !self.cfg.data_plane {
+            return refuse(RefuseClass::Flags);
+        }
 
         // KD-7 version lock: coarse ABI + build-commit equality; degenerate
         // identities (`unknown`/`-dirty`/empty) prove nothing by equality —

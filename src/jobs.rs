@@ -410,6 +410,38 @@ impl JobFabric {
     // internals
     // -----------------------------------------------------------------
 
+    /// The fabric's meta handle (admin sink / offline probes reuse it).
+    pub fn meta_handle(&self) -> &Arc<RoutedMetaBackend> {
+        &self.meta
+    }
+
+    /// R5 shed hook for the `job_copy_buffers` component (§5.1.5): under
+    /// memory pressure, pause every running job — loud, durable via the
+    /// workers' pause checkpoints, and deliberately NOT self-resuming
+    /// (`job resume` is the operator's call once pressure clears). The
+    /// gauge is worker copy-buffer bytes (0 until the VL4 movers charge
+    /// it), so this fires only when real buffers exist.
+    pub fn shed_to(&self, target: u64) {
+        let gauge = crate::fuse_client::METRICS
+            .job_copy_buffer_bytes
+            .load(Ordering::Relaxed);
+        if gauge <= target {
+            return;
+        }
+        for (id, ctl) in self.jobs.lock().iter() {
+            if ctl.state() == JobState::Running {
+                ctl.paused.store(true, Ordering::SeqCst);
+                crate::fuse_client::METRICS
+                    .job_paused_mem_pressure
+                    .fetch_add(1, Ordering::Relaxed);
+                log::warn!(
+                    "job fabric: paused job {id} under memory pressure \
+                     (job_copy_buffers {gauge} > target {target})"
+                );
+            }
+        }
+    }
+
     fn require(&self, job_id: &str) -> crate::error::Result<Arc<JobCtl>> {
         self.jobs.lock().get(job_id).cloned().ok_or_else(|| {
             crate::error::SqueezefsError::InvalidOperation(format!("unknown job {job_id}"))

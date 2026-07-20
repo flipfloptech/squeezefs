@@ -320,3 +320,103 @@ impl SessionSink for DataPlaneSink {
         DataPlaneSink::on_bind(self, ino);
     }
 }
+
+/// The ADMIN-lane verb handler over the VL2 job fabric
+/// (design-volume-lifecycle §5.1.4). Runs on host ctl threads (plain
+/// OS threads) and blocks on the captured runtime handle.
+pub struct FabricAdminSink {
+    fabric: std::sync::Arc<crate::jobs::JobFabric>,
+    rt: tokio::runtime::Handle,
+}
+
+impl FabricAdminSink {
+    /// Capture the current runtime (call from async context — mount
+    /// wiring and tests both are).
+    pub fn new(fabric: std::sync::Arc<crate::jobs::JobFabric>) -> Self {
+        Self {
+            fabric,
+            rt: tokio::runtime::Handle::current(),
+        }
+    }
+
+    fn status_json(st: &crate::jobs::JobStatus) -> serde_json::Value {
+        serde_json::json!({
+            "job_id": st.job_id,
+            "state": format!("{:?}", st.state).to_lowercase(),
+            "tasks_done": st.tasks_done,
+            "tasks_total": st.tasks_total,
+            "throttle_pct": st.throttle_pct,
+        })
+    }
+}
+
+impl crate::ipc_host::AdminSink for FabricAdminSink {
+    fn handle(&self, verb: &str, arg: &str) -> (bool, String) {
+        let fabric = self.fabric.clone();
+        let arg = arg.trim().to_string();
+        let res: Result<String, String> = self.rt.block_on(async move {
+            match verb {
+                "job-list" => {
+                    let mut out = Vec::new();
+                    for rec in crate::jobs::JobFabric::list_records(fabric.meta_handle())
+                        .await
+                        .map_err(|e| e.to_string())?
+                    {
+                        // Live state (the record lags by a checkpoint).
+                        let st = fabric
+                            .status(&rec.job_id)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        if let Some(st) = st {
+                            out.push(Self::status_json(&st));
+                        }
+                    }
+                    Ok(serde_json::json!(out).to_string())
+                }
+                "job-status" => match fabric.status(&arg).await.map_err(|e| e.to_string())? {
+                    Some(st) => Ok(Self::status_json(&st).to_string()),
+                    None => Err(format!("unknown job {arg}")),
+                },
+                "job-pause" => fabric
+                    .pause(&arg)
+                    .await
+                    .map(|_| "paused".into())
+                    .map_err(|e| e.to_string()),
+                "job-resume" => fabric
+                    .resume(&arg)
+                    .await
+                    .map(|_| "resumed".into())
+                    .map_err(|e| e.to_string()),
+                "job-cancel" => fabric
+                    .cancel(&arg)
+                    .await
+                    .map(|_| "cancelled".into())
+                    .map_err(|e| e.to_string()),
+                "job-throttle" => {
+                    let (id, pct) = arg
+                        .split_once(' ')
+                        .ok_or_else(|| "usage: job-throttle <id> <pct>".to_string())?;
+                    let pct: u32 = pct.trim().parse().map_err(|_| "bad pct".to_string())?;
+                    fabric
+                        .throttle(id.trim(), pct)
+                        .await
+                        .map(|_| "throttled".into())
+                        .map_err(|e| e.to_string())
+                }
+                other => Err(format!(
+                    "unknown admin verb `{other}` (see docs/design-volume-lifecycle.md §6)"
+                )),
+            }
+        });
+        // Oversize replies refuse instead of truncating (wire cap).
+        match res {
+            Ok(body) if body.len() > squeezefs_ipc::wire::ADMIN_BODY_MAX => (
+                false,
+                "reply too large; use the offline probe (`squeezefs job list <sqmeta-uri>`)"
+                    .to_string(),
+            ),
+            Ok(body) => (true, body),
+            Err(e) => (false, e),
+        }
+    }
+}

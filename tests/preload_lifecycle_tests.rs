@@ -208,6 +208,9 @@ impl Fixture {
             arena_cap_bytes: 64 * 1024 * 1024,
             per_uid_session_cap: 8,
             idle_secs,
+            data_plane: true,
+            // SAFETY: getuid is trivially safe.
+            owner_uid: unsafe { libc::getuid() },
         };
         let host = IpcHost::spawn(cfg, sink.clone()).expect("host must spawn");
         let dir = tempfile::tempdir().expect("tempdir");

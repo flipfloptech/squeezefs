@@ -56,6 +56,9 @@ fn test_config(name: &str) -> IpcHostConfig {
         arena_cap_bytes: 16 * 1024 * 1024,
         per_uid_session_cap: 8,
         idle_secs: 0,
+        data_plane: true,
+        // SAFETY: getuid is trivially safe.
+        owner_uid: unsafe { libc::getuid() },
     }
 }
 

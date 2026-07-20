@@ -1716,6 +1716,11 @@ pub struct Metrics {
     pub job_failed: Align64<AtomicU64>,
     pub job_tasks_done: Align64<AtomicU64>,
     pub job_checkpoint_writes: Align64<AtomicU64>,
+    /// Worker copy-buffer bytes (the R5 `job_copy_buffers` gauge; the
+    /// VL4 movers charge it — 0 until then).
+    pub job_copy_buffer_bytes: Align64<AtomicU64>,
+    /// Jobs paused by the R5 shed hook.
+    pub job_paused_mem_pressure: Align64<AtomicU64>,
     pub writeback_superseded_noops: Align64<AtomicU64>,
     /// `FencingTokenExpired` failures that reached the retry ladder — a
     /// TRANSIENT generation-bump race post-FIND-M11-A (the merge
@@ -3145,6 +3150,8 @@ impl SqueezefsFilesystem {
                 "job_failed": METRICS.job_failed.load(Ordering::Relaxed),
                 "job_tasks_done": METRICS.job_tasks_done.load(Ordering::Relaxed),
                 "job_checkpoint_writes": METRICS.job_checkpoint_writes.load(Ordering::Relaxed),
+                "job_copy_buffer_bytes": METRICS.job_copy_buffer_bytes.load(Ordering::Relaxed),
+                "job_paused_mem_pressure": METRICS.job_paused_mem_pressure.load(Ordering::Relaxed),
                 "writeback_superseded_noops": METRICS.writeback_superseded_noops.load(Ordering::Relaxed),
                 "writeback_stale_token_retries": METRICS.writeback_stale_token_retries.load(Ordering::Relaxed),
                 "writeback_orphan_discards": METRICS.writeback_orphan_discards.load(Ordering::Relaxed),
@@ -10428,10 +10435,13 @@ pub async fn start_mount<P: AsRef<Path>>(
     // serves land in PR L4-4; this host is the §5.2 control plane.
     // The W1 notify handle (PR L4-6) exists only post-mount — this cell
     // bridges the gap (fires before it fills are skipped by the hook).
-    let mut ipc_notify_cell: Option<
-        std::sync::Arc<arc_swap::ArcSwap<Option<fuse3::notify::Notify>>>,
-    > = None;
-    if posture.interception {
+    let ipc_notify_cell: Option<std::sync::Arc<arc_swap::ArcSwap<Option<fuse3::notify::Notify>>>>;
+    // VL2 (design-volume-lifecycle §5.1.4): the host arms on EVERY
+    // mount. Without `-o interception` it is control-plane-only —
+    // listener + ctl threads + the ADMIN lane; data-plane HELLOs
+    // refuse before any fd screen, so no shm sessions, no arenas, no
+    // service dispatch exist on a default mount.
+    {
         let arena_mb = std::env::var("SQUEEZEFS_IPC_ARENA_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -10494,6 +10504,13 @@ pub async fn start_mount<P: AsRef<Path>>(
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .unwrap_or(300),
+            // VL2: data plane only with `-o interception` (KD-11 posture
+            // unchanged); the ADMIN lane serves either way.
+            data_plane: posture.interception,
+            owner_uid: {
+                let (uid, _gid) = crate::config_ops::invoking_owner();
+                uid
+            },
         };
         // PR L4-4: the real data plane — fast path + async handoff over
         // THIS filesystem instance (the same daemon state kernel requests
@@ -10541,6 +10558,26 @@ pub async fn start_mount<P: AsRef<Path>>(
                     host.socket_name(),
                     arena_cap_bytes / (1024 * 1024)
                 );
+                // VL2: the ADMIN lane serves the job fabric when the
+                // mount wired one (main.rs creates it right after the
+                // meta backend exists, before start_mount).
+                if let Some(fabric) = fs.job_fabric.load().as_ref() {
+                    host.set_admin_sink(std::sync::Arc::new(
+                        crate::ipc_service::FabricAdminSink::new(fabric.clone()),
+                    ));
+                    // R5: the `job_copy_buffers` component (§5.1.5) —
+                    // sheddable; pauses jobs loudly under pressure.
+                    let shed_fabric = fabric.clone();
+                    crate::mem_budget::MEM_BUDGET.register(crate::mem_budget::Component::new(
+                        "job_copy_buffers",
+                        0,
+                        1,
+                        std::sync::Arc::new(|| {
+                            METRICS.job_copy_buffer_bytes.load(Ordering::Relaxed)
+                        }),
+                        std::sync::Arc::new(move |target| shed_fabric.shed_to(target)),
+                    ));
+                }
                 fs.ipc_host.store(std::sync::Arc::new(Some(host)));
             }
             Err(e) => {

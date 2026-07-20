@@ -157,9 +157,9 @@ impl Default for CachedMetadata {
 /// so truncate/fallocate share the serialization domain instead of racing
 /// it.
 pub enum BlockMapOp<'a> {
-    /// Insert/overwrite entries: write-through, flush paths, defrag
-    /// `BlockMove`, routing striped merge. `(block_idx, new_block_key)`
-    /// pairs.
+    /// Insert/overwrite entries: write-through, flush paths, routing
+    /// striped merge (and the volume-lifecycle movers, PR VL4).
+    /// `(block_idx, new_block_key)` pairs.
     ///
     /// `Merge(&[])` is the DEGENERATE, size-only case: no entries change,
     /// but the primitive still re-reads the CURRENT meta under

@@ -18,8 +18,8 @@
 //! * **F3 `squeezefs defrag`** returned fake success from a no-op engine.
 //!   The verb is REMOVED (no dead code, no fake surface): a stale script
 //!   must fail loudly with an unknown-subcommand error, and `--help` must
-//!   not advertise it. (The `jobs.rs` BlockMove machinery is independent
-//!   and stays — it is pinned by `tests/write_through_tests.rs`.)
+//!   not advertise it. (The dead `jobs.rs` BlockMove machinery was
+//!   deleted in VL1 — design-volume-lifecycle §5.0.)
 //!
 //! All CLI tests drive the real binary (`CARGO_BIN_EXE_squeezefs`);
 //! mount-needing tests skip cleanly where FUSE-over-io_uring is

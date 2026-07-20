@@ -3,6 +3,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Host-local RUNTIME overrides (`/dev/shm` — ephemeral by design, dies
+/// at reboot). This is NOT the durable volume set: that is
+/// `FormatConfig.data_lv` on the meta volumes (and, post
+/// design-volume-lifecycle, the `data_volumes`/`meta_slot_map` records).
+/// The only surviving semantics here are the **fail-stop health
+/// overrides** (`enable`/`disable` statuses a live daemon ingests at
+/// `.config` generation) — everything else this file once carried
+/// (add/remove/migrate bookkeeping, redirections) was fake and was
+/// deleted (design-volume-lifecycle §5.0). VL3 re-homes the overrides
+/// onto the daemon admin lane and deletes this file entirely.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ConfigList {
     pub diskcaches: Vec<DiskCacheInfo>,
@@ -10,7 +20,6 @@ pub struct ConfigList {
     pub data_volume_statuses: HashMap<String, String>,
     pub metadata_volumes: HashMap<String, String>,
     pub metadata_volume_statuses: HashMap<String, String>,
-    pub metadata_volume_redirections: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -27,29 +36,18 @@ pub fn load_or_create_config() -> ConfigList {
             return cfg;
         }
     }
-    // Default fallback. Data volumes start EMPTY: real volumes register at
-    // mount from the resolved data paths, and `config data-volume add` fills
-    // this map explicitly. The old hardcoded `backend_0` seed (a legacy
-    // key-resolution alias, not a volume — its `backing_dev` was not even a
-    // real path) leaked a phantom entry into every runtime config.
-    let data_volumes = HashMap::new();
-    let data_volume_statuses = HashMap::new();
-
-    let mut metadata_volumes = HashMap::new();
-    let mut metadata_volume_statuses = HashMap::new();
-    metadata_volumes.insert(
-        "meta_volume_0".to_string(),
-        "/dev/shm/squeezefs_pjdfs_meta".to_string(),
-    );
-    metadata_volume_statuses.insert("meta_volume_0".to_string(), "enabled".to_string());
-
+    // Default fallback: EVERYTHING starts empty. Real volumes register at
+    // mount from the resolved format config; the only writers here are the
+    // enable/disable health-override verbs. (Two phantom seeds used to leak
+    // into every runtime config from this default — a `backend_0` alias
+    // entry and a `meta_volume_0 → /dev/shm/squeezefs_pjdfs_meta` test
+    // path. Both deleted; G-VL-1 pins their absence.)
     ConfigList {
         diskcaches: Vec::new(),
-        data_volumes,
-        data_volume_statuses,
-        metadata_volumes,
-        metadata_volume_statuses,
-        metadata_volume_redirections: HashMap::new(),
+        data_volumes: HashMap::new(),
+        data_volume_statuses: HashMap::new(),
+        metadata_volumes: HashMap::new(),
+        metadata_volume_statuses: HashMap::new(),
     }
 }
 
@@ -322,68 +320,6 @@ pub async fn set_cache_paths(meta_lvs: &[String], paths: &[PathBuf]) -> Result<(
     Ok(())
 }
 
-pub async fn set_config_quota(
-    _redis_url: &str,
-    _fs_name: &str,
-    _key: &str,
-    _value: &str,
-) -> Result<()> {
-    Ok(())
-}
-
-pub async fn add_disk_cache_path(
-    _redis_url: &str,
-    _fs_name: &str,
-    _path: &Path,
-    _force: bool,
-) -> Result<()> {
-    Ok(())
-}
-
-pub async fn remove_disk_cache_path(
-    _redis_url: &str,
-    _fs_name: &str,
-    _path: &Path,
-    _force: bool,
-) -> Result<()> {
-    Ok(())
-}
-
-pub async fn enable_disk_cache_path(_redis_url: &str, _fs_name: &str, _path: &Path) -> Result<()> {
-    Ok(())
-}
-
-pub async fn disable_disk_cache_path(_redis_url: &str, _fs_name: &str, _path: &Path) -> Result<()> {
-    Ok(())
-}
-
-pub async fn flush_disk_cache_path(_redis_url: &str, _fs_name: &str, _path: &Path) -> Result<()> {
-    Ok(())
-}
-
-pub async fn add_data_volume(
-    _redis_url: &str,
-    _fs_name: &str,
-    volume_id: &str,
-    backing_dev: Option<&str>,
-) -> Result<()> {
-    let mut cfg = load_or_create_config();
-    cfg.data_volumes
-        .insert(volume_id.to_string(), backing_dev.unwrap_or("").to_string());
-    cfg.data_volume_statuses
-        .insert(volume_id.to_string(), "enabled".to_string());
-    save_config(&cfg);
-    Ok(())
-}
-
-pub async fn remove_data_volume(_redis_url: &str, _fs_name: &str, volume_id: &str) -> Result<()> {
-    let mut cfg = load_or_create_config();
-    cfg.data_volumes.remove(volume_id);
-    cfg.data_volume_statuses.remove(volume_id);
-    save_config(&cfg);
-    Ok(())
-}
-
 pub async fn enable_data_volume(_redis_url: &str, _fs_name: &str, volume_id: &str) -> Result<()> {
     let mut cfg = load_or_create_config();
     cfg.data_volume_statuses
@@ -396,33 +332,6 @@ pub async fn disable_data_volume(_redis_url: &str, _fs_name: &str, volume_id: &s
     let mut cfg = load_or_create_config();
     cfg.data_volume_statuses
         .insert(volume_id.to_string(), "disabled".to_string());
-    save_config(&cfg);
-    Ok(())
-}
-
-pub async fn add_metadata_volume(
-    _redis_url: &str,
-    _fs_name: &str,
-    volume_id: &str,
-    backing_dev: Option<&str>,
-) -> Result<()> {
-    let mut cfg = load_or_create_config();
-    cfg.metadata_volumes
-        .insert(volume_id.to_string(), backing_dev.unwrap_or("").to_string());
-    cfg.metadata_volume_statuses
-        .insert(volume_id.to_string(), "enabled".to_string());
-    save_config(&cfg);
-    Ok(())
-}
-
-pub async fn remove_metadata_volume(
-    _redis_url: &str,
-    _fs_name: &str,
-    volume_id: &str,
-) -> Result<()> {
-    let mut cfg = load_or_create_config();
-    cfg.metadata_volumes.remove(volume_id);
-    cfg.metadata_volume_statuses.remove(volume_id);
     save_config(&cfg);
     Ok(())
 }
@@ -449,58 +358,4 @@ pub async fn disable_metadata_volume(
         .insert(volume_id.to_string(), "disabled".to_string());
     save_config(&cfg);
     Ok(())
-}
-
-pub async fn migrate_data_volume(
-    _redis_url: &str,
-    _fs_name: &str,
-    from_volume: &str,
-    to_volume: &str,
-) -> Result<()> {
-    println!(
-        "Migrating data volume from {} to {} via LVM pvmove...",
-        from_volume, to_volume
-    );
-    let _ = crate::storage::run_cmd("pvmove", &[from_volume, to_volume]);
-
-    let mut cfg = load_or_create_config();
-    if let Some(dev) = cfg.data_volumes.remove(from_volume) {
-        cfg.data_volumes.insert(to_volume.to_string(), dev);
-        cfg.data_volume_statuses
-            .insert(to_volume.to_string(), "enabled".to_string());
-        cfg.data_volume_statuses
-            .insert(from_volume.to_string(), "disabled".to_string());
-    }
-    save_config(&cfg);
-    Ok(())
-}
-
-pub async fn migrate_metadata_volume(
-    _redis_url: &str,
-    _fs_name: &str,
-    from_volume: &str,
-    to_volume: &str,
-) -> Result<()> {
-    // Route-config bookkeeping only: point the ino-routing redirection at
-    // the new volume and flip the statuses. (The retired v2 backend used
-    // to also best-effort copy fixed-geometry inode slots here — a
-    // half-measure that never carried dentries/xattrs; no data movement
-    // is performed.)
-    println!(
-        "Redirecting metadata volume {} to {} in the runtime config (no data is moved).",
-        from_volume, to_volume
-    );
-    let mut cfg = load_or_create_config();
-    cfg.metadata_volume_redirections
-        .insert(from_volume.to_string(), to_volume.to_string());
-    cfg.metadata_volume_statuses
-        .insert(from_volume.to_string(), "disabled".to_string());
-    cfg.metadata_volume_statuses
-        .insert(to_volume.to_string(), "enabled".to_string());
-    save_config(&cfg);
-    Ok(())
-}
-
-pub async fn run_metadata_fsck(_redis_url: &str, _fs_name: &str) -> Result<Vec<String>> {
-    Ok(Vec::new())
 }

@@ -2778,6 +2778,10 @@ impl SqueezefsFilesystem {
             }
         }
 
+        // VL1 (design-volume-lifecycle §5.0): this sync carries ONLY the
+        // fail-stop health overrides. The redirections ingest that lived
+        // here fed the fake metadata-volume migrate and was deleted with
+        // it; real meta routing changes are the VL5 slot map.
         if let Some(ref meta) = self.meta_backend {
             for (vol_name, status) in &cfg.metadata_volume_statuses {
                 if vol_name.starts_with("meta_volume_") {
@@ -2787,16 +2791,6 @@ impl SqueezefsFilesystem {
                         } else {
                             meta.disabled_volumes.remove(&idx);
                         }
-                    }
-                }
-            }
-
-            for (from_vol, to_vol) in &cfg.metadata_volume_redirections {
-                if from_vol.starts_with("meta_volume_") && to_vol.starts_with("meta_volume_") {
-                    let from_idx = from_vol["meta_volume_".len()..].parse::<usize>();
-                    let to_idx = to_vol["meta_volume_".len()..].parse::<usize>();
-                    if let (Ok(from_i), Ok(to_i)) = (from_idx, to_idx) {
-                        meta.redirections.insert(from_i, to_i);
                     }
                 }
             }

@@ -175,7 +175,6 @@ pub async fn open_meta_volume_set(
 pub struct RoutedMetaBackend {
     pub volumes: Vec<std::sync::Arc<kv::backend::KvMetaBackend>>,
     pub disabled_volumes: std::sync::Arc<dashmap::DashMap<usize, bool, ahash::RandomState>>,
-    pub redirections: std::sync::Arc<dashmap::DashMap<usize, usize, ahash::RandomState>>,
 }
 
 impl RoutedMetaBackend {
@@ -183,9 +182,6 @@ impl RoutedMetaBackend {
         Self {
             volumes,
             disabled_volumes: std::sync::Arc::new(dashmap::DashMap::with_hasher(
-                ahash::RandomState::new(),
-            )),
-            redirections: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
         }
@@ -405,13 +401,10 @@ impl RoutedMetaBackend {
         if ino == 1 {
             return (0, 1);
         }
-        let mut volume_idx = ((ino - 2) % num_volumes as u64) as usize;
-
-        // Follow redirections
-        while let Some(red) = self.redirections.get(&volume_idx) {
-            volume_idx = *red;
-        }
-
+        // (A redirection-follow loop lived here; its sole feeder was the
+        // fake `metadata-volume migrate` — deleted in VL1. Real routing
+        // changes are the VL5 slot map, design-volume-lifecycle §5.5.)
+        let volume_idx = ((ino - 2) % num_volumes as u64) as usize;
         let local_ino = ((ino - 2) / num_volumes as u64) + 2;
         (volume_idx, local_ino)
     }

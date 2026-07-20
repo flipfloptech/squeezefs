@@ -1,5 +1,14 @@
-use crate::error::{Result, SqueezefsError};
-use crate::routing::DataRouter;
+//! The maintenance-job worker skeleton (percentage duty-cycle throttle
+//! + pause-aware in-process queue).
+//!
+//! VL1 (design-volume-lifecycle §5.0) deleted the dead `BlockMove`
+//! task type and its never-called `submit_and_wait_for_job` front end
+//! (git history keeps the shape). What survives is exactly what PR VL2
+//! extends into the durable distributed job fabric: the throttle law
+//! (`job_throttle_sleep`) and the mount-spawned worker loop with its
+//! pause/notify queue discipline. Until VL2 lands, [`TaskType`] is
+//! uninhabited — no producer exists, and the worker parks.
+
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -7,17 +16,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Maintenance task kinds. Uninhabited in VL1 (the fake `BlockMove`
+/// was deleted); VL2's fabric populates it (evacuate / rebalance /
+/// fsck / defrag shards — design-volume-lifecycle §5.1).
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum TaskType {
-    BlockMove {
-        ino: u64,
-        map_id: String,
-        idx_str: String,
-        src_offset: u64,
-        dest_offset: u64,
-        len: usize,
-    },
-}
+pub enum TaskType {}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct JobTask {
@@ -42,53 +45,12 @@ static IN_MEMORY_JOBS: Lazy<Mutex<InMemoryJobs>> = Lazy::new(|| {
     })
 });
 
-static WORKER_NOTIFY: Lazy<tokio::sync::Notify> = Lazy::new(|| tokio::sync::Notify::new());
+static WORKER_NOTIFY: Lazy<tokio::sync::Notify> = Lazy::new(tokio::sync::Notify::new);
 
-pub async fn submit_and_wait_for_job(
-    _redis_url: &str,
-    _fs_name: &str,
-    tasks: Vec<TaskType>,
-) -> Result<()> {
-    let job_id = uuid::Uuid::new_v4().to_string();
-    let mut job_tasks = Vec::new();
-    for (idx, task) in tasks.into_iter().enumerate() {
-        job_tasks.push(JobTask {
-            task_id: format!("{}_{}", job_id, idx),
-            job_id: job_id.clone(),
-            task_type: task,
-        });
-    }
-
-    let notify = Arc::new(tokio::sync::Notify::new());
-    {
-        let mut state = IN_MEMORY_JOBS.lock();
-        state.active_jobs.insert(job_id.clone());
-        state.pending_tasks.insert(job_id.clone(), job_tasks);
-        state.job_notifiers.insert(job_id.clone(), notify.clone());
-    }
-    WORKER_NOTIFY.notify_waiters();
-
-    loop {
-        let n = {
-            let state = IN_MEMORY_JOBS.lock();
-            if state.paused_jobs.contains(&job_id) {
-                return Err(SqueezefsError::InvalidOperation("Job paused".to_string()));
-            }
-            if !state.pending_tasks.contains_key(&job_id) {
-                break;
-            }
-            state.job_notifiers.get(&job_id).cloned()
-        };
-        if let Some(notifier) = n {
-            notifier.notified().await;
-        } else {
-            break;
-        }
-    }
-    Ok(())
-}
-
-pub fn start_job_worker(router: Arc<DataRouter>, _fs_name: String, cpu_limit_pct: u32) {
+/// The mount-spawned maintenance worker (`--job-cpu-limit` wires
+/// `cpu_limit_pct`). Drains the pause-aware queue under the duty-cycle
+/// throttle; parks when idle.
+pub fn start_job_worker(cpu_limit_pct: u32) {
     tokio::spawn(async move {
         loop {
             let task_to_run = {
@@ -102,9 +64,8 @@ pub fn start_job_worker(router: Arc<DataRouter>, _fs_name: String, cpu_limit_pct
                 }
                 if let Some(job_id) = chosen_job {
                     let tasks = state.pending_tasks.get_mut(&job_id).unwrap();
-                    let task = tasks.remove(0);
+                    let _task = tasks.remove(0);
                     let is_empty = tasks.is_empty();
-                    let task_wrapper = task.clone();
                     if is_empty {
                         state.pending_tasks.remove(&job_id);
                         state.active_jobs.remove(&job_id);
@@ -112,7 +73,7 @@ pub fn start_job_worker(router: Arc<DataRouter>, _fs_name: String, cpu_limit_pct
                             n.notify_waiters();
                         }
                     }
-                    Some(task_wrapper)
+                    Some(_task)
                 } else {
                     None
                 }
@@ -120,92 +81,7 @@ pub fn start_job_worker(router: Arc<DataRouter>, _fs_name: String, cpu_limit_pct
 
             if let Some(task_wrapper) = task_to_run {
                 let start = std::time::Instant::now();
-                match task_wrapper.task_type {
-                    TaskType::BlockMove {
-                        ino,
-                        map_id,
-                        idx_str,
-                        src_offset,
-                        dest_offset,
-                        len,
-                    } => {
-                        if let Ok(data) = router.nvme_writer.read_block(src_offset, len).await {
-                            match router.nvme_writer.write_block(dest_offset, data).await {
-                                Ok(_) => {
-                                    // Layout RMW via the §5.3 merge primitive
-                                    // (INODE_META_LOCKS). The old raw-xattr
-                                    // read-modify-setxattr ran under NO lock,
-                                    // skipped fencing revalidation, and left
-                                    // every RAM/NVMe tier stale — conversion
-                                    // fixes all three.
-                                    let target_ino: u64 = map_id.parse().unwrap_or(ino);
-                                    let idx: u32 = idx_str.parse().unwrap_or(0);
-                                    let fencing_token =
-                                        router.dlm.get_fencing_token_ino(target_ino);
-                                    let entries = [(idx, dest_offset.to_string())];
-                                    match router
-                                        .merge_block_mappings(
-                                            target_ino,
-                                            crate::routing::BlockMapOp::Merge(&entries),
-                                            0,
-                                            crate::routing::LayoutFlip::KeepLayout,
-                                            fencing_token,
-                                        )
-                                        .await
-                                    {
-                                        Ok(displaced) => {
-                                            // Design OQ 6 resolved: the source
-                                            // slot the move vacates follows the
-                                            // same displaced-key free
-                                            // discipline as every other merge
-                                            // caller — freed only AFTER the
-                                            // new map is published (durable +
-                                            // RAM-coherent, read tiers purged
-                                            // by the primitive), so no reader
-                                            // can resolve a block to a key
-                                            // being freed. free_block's
-                                            // begin_free → punch-on-terminal →
-                                            // finish_free split (f0ca977)
-                                            // honors clone sharing: a source
-                                            // still referenced by a clone is
-                                            // released but never punched or
-                                            // free-listed; a terminal source
-                                            // is punched strictly before its
-                                            // offset becomes reallocatable.
-                                            for bk in displaced {
-                                                let _ = router.backend_router.free_block(&bk).await;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            log::error!(
-                                                "Job worker: BlockMove merge failed: {:?}. Pausing job.",
-                                                e
-                                            );
-                                            let mut state = IN_MEMORY_JOBS.lock();
-                                            state.paused_jobs.insert(task_wrapper.job_id.clone());
-                                            if let Some(n) =
-                                                state.job_notifiers.get(&task_wrapper.job_id)
-                                            {
-                                                n.notify_waiters();
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!(
-                                        "Job worker: BlockMove failed: {:?}. Pausing job.",
-                                        e
-                                    );
-                                    let mut state = IN_MEMORY_JOBS.lock();
-                                    state.paused_jobs.insert(task_wrapper.job_id.clone());
-                                    if let Some(n) = state.job_notifiers.get(&task_wrapper.job_id) {
-                                        n.notify_waiters();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                run_task(task_wrapper);
                 if let Some(delay) = job_throttle_sleep(start.elapsed(), cpu_limit_pct) {
                     tokio::time::sleep(delay).await;
                 }
@@ -216,6 +92,16 @@ pub fn start_job_worker(router: Arc<DataRouter>, _fs_name: String, cpu_limit_pct
     });
 }
 
+/// Execute one task. [`TaskType`] is uninhabited until VL2, so this is
+/// statically unreachable-by-construction (no task can be built) — the
+/// seam where VL2's shard execution lands.
+fn run_task(task: JobTask) {
+    match task.task_type {}
+}
+
+/// The percentage duty-cycle throttle law (KD-3): after a task that ran
+/// for `elapsed`, sleep `elapsed × (100 − pct) / pct` so task-active
+/// time ≈ `pct` of wall time. `0` and `≥ 100` mean unthrottled.
 pub fn job_throttle_sleep(elapsed: Duration, cpu_limit_pct: u32) -> Option<Duration> {
     if cpu_limit_pct >= 100 || cpu_limit_pct == 0 {
         None

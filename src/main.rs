@@ -884,7 +884,7 @@ enum MetadataVolumeActions {
     Add {
         /// Volume ID
         volume_id: String,
-        /// Backing device path (e.g. "/dev/shm/squeezefs_pjdfs_meta")
+        /// Backing device path
         #[arg(long, alias = "backing-dev")]
         volume: Option<String>,
         /// Optional capacity
@@ -1162,6 +1162,17 @@ fn parse_block_uri(uri: &str, scheme: &str) -> Result<Vec<String>, String> {
         })
         .collect();
     Ok(paths)
+}
+
+/// VL1 (design-volume-lifecycle §5.0): the removed fake admin verbs
+/// refuse loudly — exit nonzero, naming what was fake and the successor
+/// verb — never stub success.
+fn removed_verb(verb: &str, why: &str, successor: &str) -> Box<dyn std::error::Error> {
+    format!(
+        "`squeezefs {verb}` was removed: {why} \
+         Superseded by `{successor}` (docs/design-volume-lifecycle.md)."
+    )
+    .into()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -2989,11 +3000,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             fs_engine.meta_backend = Some(routed_meta_backend);
             fs_engine.dismount_wait = resolved_dismount_wait;
 
-            squeezefs::jobs::start_job_worker(
-                std::sync::Arc::new(fs_engine.router.clone()),
-                fs_name.clone(),
-                job_cpu_limit,
-            );
+            squeezefs::jobs::start_job_worker(job_cpu_limit);
 
             let opt_idle = if resolved_fuse_io_uring_sqpoll_idle_ms > 0 {
                 Some(resolved_fuse_io_uring_sqpoll_idle_ms)
@@ -3235,8 +3242,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             squeezefs::set_fs_prefix(&fs_name);
             match action {
                 ConfigActions::Set { key, value } => {
-                    squeezefs::config_ops::set_config_quota(&garnet_url, &fs_name, &key, &value)
-                        .await?;
+                    let _ = (key, value);
+                    return Err(removed_verb(
+                        "config set",
+                        "it silently ignored every key and changed nothing.",
+                        "squeezefs format (quotas are format-time until the \
+                         volume-lifecycle capacity verbs land)",
+                    ));
                 }
                 ConfigActions::SetCachePaths { uri, paths } => {
                     let meta_lvs = parse_block_uri(&uri, "sqmeta://")?;
@@ -3270,83 +3282,34 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 ConfigActions::DiskCache(action) => match action {
-                    DiskCacheActions::Add { path } => {
-                        squeezefs::config_ops::add_disk_cache_path(
-                            &garnet_url,
-                            &fs_name,
-                            Path::new(&path),
-                            false,
-                        )
-                        .await?;
-                        println!("Disk cache path '{}' added successfully.", path);
-                    }
-                    DiskCacheActions::Remove { path, force } => {
-                        squeezefs::config_ops::remove_disk_cache_path(
-                            &garnet_url,
-                            &fs_name,
-                            Path::new(&path),
-                            force,
-                        )
-                        .await?;
-                        println!("Disk cache path '{}' removed successfully.", path);
-                    }
-                    DiskCacheActions::Enable { path } => {
-                        squeezefs::config_ops::enable_disk_cache_path(
-                            &garnet_url,
-                            &fs_name,
-                            Path::new(&path),
-                        )
-                        .await?;
-                        println!("Disk cache path '{}' enabled successfully.", path);
-                    }
-                    DiskCacheActions::Disable { path } => {
-                        squeezefs::config_ops::disable_disk_cache_path(
-                            &garnet_url,
-                            &fs_name,
-                            Path::new(&path),
-                        )
-                        .await?;
-                        println!("Disk cache path '{}' disabled successfully.", path);
-                    }
-                    DiskCacheActions::Flush { path } => {
-                        squeezefs::config_ops::flush_disk_cache_path(
-                            &garnet_url,
-                            &fs_name,
-                            Path::new(&path),
-                        )
-                        .await?;
-                        println!("Disk cache path '{}' flushed successfully.", path);
-                    }
                     DiskCacheActions::List => {
                         let list =
                             squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
                         println!("{}", serde_json::to_string_pretty(&list.diskcaches)?);
                     }
+                    // Silent no-ops, all five — staging/cache paths are a
+                    // format-time declaration with ONE real admin verb.
+                    other => {
+                        let verb = match other {
+                            DiskCacheActions::Add { .. } => "config disk-cache add",
+                            DiskCacheActions::Remove { .. } => "config disk-cache remove",
+                            DiskCacheActions::Enable { .. } => "config disk-cache enable",
+                            DiskCacheActions::Disable { .. } => "config disk-cache disable",
+                            DiskCacheActions::Flush { .. } => "config disk-cache flush",
+                            DiskCacheActions::List => unreachable!("handled above"),
+                        };
+                        return Err(removed_verb(
+                            verb,
+                            "it was a silent no-op that changed nothing.",
+                            "squeezefs config set-cache-paths",
+                        ));
+                    }
                 },
                 ConfigActions::DataVolume(action) => match action {
-                    DataVolumeActions::Add {
-                        volume_id,
-                        volume: backing_dev,
-                        ..
-                    } => {
-                        squeezefs::config_ops::add_data_volume(
-                            &garnet_url,
-                            &fs_name,
-                            &volume_id,
-                            backing_dev.as_deref(),
-                        )
-                        .await?;
-                        println!("Data volume '{}' registered/added successfully.", volume_id);
-                    }
-                    DataVolumeActions::Remove { volume_id, .. } => {
-                        squeezefs::config_ops::remove_data_volume(
-                            &garnet_url,
-                            &fs_name,
-                            &volume_id,
-                        )
-                        .await?;
-                        println!("Data volume '{}' removed successfully.", volume_id);
-                    }
+                    // KEPT (real): the fail-stop health overrides + list.
+                    // `disable` routes NEW writes away; blocks already on
+                    // the volume read EIO until re-enable — it is NOT an
+                    // evacuation (that is `volume remove-data`, PR VL4).
                     DataVolumeActions::List => {
                         let list =
                             squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
@@ -3359,7 +3322,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             &volume_id,
                         )
                         .await?;
-                        println!("Data volume '{}' enabled successfully.", volume_id);
+                        println!(
+                            "Data volume '{}' enabled (health override cleared).",
+                            volume_id
+                        );
                     }
                     DataVolumeActions::Disable { volume_id } => {
                         squeezefs::config_ops::disable_data_volume(
@@ -3368,53 +3334,41 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             &volume_id,
                         )
                         .await?;
-                        println!("Data volume '{}' disabled successfully.", volume_id);
-                    }
-                    DataVolumeActions::Migrate {
-                        from_volume,
-                        to_volume,
-                    } => {
-                        squeezefs::config_ops::migrate_data_volume(
-                            &garnet_url,
-                            &fs_name,
-                            &from_volume,
-                            &to_volume,
-                        )
-                        .await?;
                         println!(
-                            "Migrated data off data volume '{}' onto '{}' successfully.",
-                            from_volume, to_volume
+                            "Data volume '{}' disabled (fail-stop health override: new writes \
+                             fail over; blocks already on it read EIO until re-enabled — this \
+                             is not an evacuation).",
+                            volume_id
                         );
+                    }
+                    DataVolumeActions::Add { .. } => {
+                        return Err(removed_verb(
+                            "config data-volume add",
+                            "it wrote only an ephemeral host-local file; the daemon never \
+                             registered the volume and the durable set was untouched.",
+                            "squeezefs volume add-data",
+                        ));
+                    }
+                    DataVolumeActions::Remove { .. } => {
+                        return Err(removed_verb(
+                            "config data-volume remove",
+                            "it removed nothing real (ephemeral bookkeeping only) and \
+                             evacuated no data.",
+                            "squeezefs volume remove-data",
+                        ));
+                    }
+                    DataVolumeActions::Migrate { .. } => {
+                        return Err(removed_verb(
+                            "config data-volume migrate",
+                            "it shelled out to LVM pvmove — not filesystem-block-aware, no \
+                             refcount/fencing awareness, durable set untouched.",
+                            "squeezefs volume remove-data (drain)",
+                        ));
                     }
                 },
                 ConfigActions::MetadataVolume(action) => {
                     match action {
-                        MetadataVolumeActions::Add {
-                            volume_id,
-                            volume: backing_dev,
-                            ..
-                        } => {
-                            squeezefs::config_ops::add_metadata_volume(
-                                &garnet_url,
-                                &fs_name,
-                                &volume_id,
-                                backing_dev.as_deref(),
-                            )
-                            .await?;
-                            println!(
-                                "Metadata volume '{}' registered/added successfully.",
-                                volume_id
-                            );
-                        }
-                        MetadataVolumeActions::Remove { volume_id, .. } => {
-                            squeezefs::config_ops::remove_metadata_volume(
-                                &garnet_url,
-                                &fs_name,
-                                &volume_id,
-                            )
-                            .await?;
-                            println!("Metadata volume '{}' removed successfully.", volume_id);
-                        }
+                        // KEPT (real): fail-stop health overrides + list.
                         MetadataVolumeActions::List => {
                             let list =
                                 squeezefs::config_ops::list_config(&garnet_url, &fs_name).await?;
@@ -3427,7 +3381,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 &volume_id,
                             )
                             .await?;
-                            println!("Metadata volume '{}' enabled successfully.", volume_id);
+                            println!(
+                                "Metadata volume '{}' enabled (health override cleared).",
+                                volume_id
+                            );
                         }
                         MetadataVolumeActions::Disable { volume_id } => {
                             squeezefs::config_ops::disable_metadata_volume(
@@ -3436,20 +3393,34 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 &volume_id,
                             )
                             .await?;
-                            println!("Metadata volume '{}' disabled successfully.", volume_id);
+                            println!(
+                                "Metadata volume '{}' disabled (fail-stop health override — \
+                                 not an evacuation).",
+                                volume_id
+                            );
                         }
-                        MetadataVolumeActions::Migrate {
-                            from_volume,
-                            to_volume,
-                        } => {
-                            squeezefs::config_ops::migrate_metadata_volume(
-                                &garnet_url,
-                                &fs_name,
-                                &from_volume,
-                                &to_volume,
-                            )
-                            .await?;
-                            println!("Migrated metadata off metadata volume '{}' onto '{}' successfully.", from_volume, to_volume);
+                        MetadataVolumeActions::Add { .. } => {
+                            return Err(removed_verb(
+                                "config metadata-volume add",
+                                "it wrote only an ephemeral host-local file; the meta volume \
+                                 set is fixed at format until the slot-map machinery lands.",
+                                "squeezefs volume add-meta",
+                            ));
+                        }
+                        MetadataVolumeActions::Remove { .. } => {
+                            return Err(removed_verb(
+                                "config metadata-volume remove",
+                                "it removed nothing real and migrated no metadata.",
+                                "squeezefs volume remove-meta",
+                            ));
+                        }
+                        MetadataVolumeActions::Migrate { .. } => {
+                            return Err(removed_verb(
+                                "config metadata-volume migrate",
+                                "it moved NO data — route bookkeeping only, by its own \
+                                 admission.",
+                                "squeezefs volume remove-meta (slot migration)",
+                            ));
                         }
                     }
                 }
@@ -3458,18 +3429,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     println!("{}", serde_json::to_string_pretty(&list)?);
                 }
                 ConfigActions::Fsck => {
-                    println!("Running Squeezefs Metadata Consistency Check (FSCK)...");
-                    let issues =
-                        squeezefs::config_ops::run_metadata_fsck(&garnet_url, &fs_name).await?;
-                    if issues.is_empty() {
-                        println!("FSCK Completed: No consistency issues found.");
-                    } else {
-                        println!("FSCK Completed: Found {} issue(s):", issues.len());
-                        for issue in issues {
-                            println!("  - {}", issue);
-                        }
-                        std::process::exit(1);
-                    }
+                    return Err(removed_verb(
+                        "config fsck",
+                        "it checked NOTHING (an empty stub that always reported clean — \
+                         worse than no fsck).",
+                        "squeezefs fsck",
+                    ));
                 }
             }
         }

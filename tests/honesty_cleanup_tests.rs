@@ -141,6 +141,14 @@ fn disk_cache_stub_verbs_refuse() {
 }
 
 #[test]
+fn config_set_quota_stub_refuses() {
+    // set_config_quota is a silent no-op today — a fake-success verb.
+    // Quotas are format-time until the lifecycle capacity machinery
+    // lands; the refusal names both.
+    assert_refusal(&["config", "set", "capacity", "100G"], "squeezefs format");
+}
+
+#[test]
 fn config_fsck_stub_refuses() {
     let out = run(&["config", "fsck"]);
     let combined = format!(

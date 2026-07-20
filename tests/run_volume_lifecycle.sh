@@ -148,12 +148,35 @@ do_unmount() {
     MOUNT_PID=""
 }
 
-stats_field() { # stats_field <jq-ish key> — crude extraction, no jq dependency
-    python3 - "$1" <"$MNT/.stats" <<'EOF'
+# The guarded offline verbs refuse while any mount-registration heartbeat
+# is fresh (the ONE staleness law, CLIENT_STALE_TTL_SECS = 45 s): an
+# externally-unmounted daemon's records linger to the TTL, exactly like a
+# kill -9'd one. Retry the guarded verb until the records go stale.
+retry_guarded() { # retry_guarded <deadline-secs> <cmd...>
+    local deadline=$((SECONDS + $1)); shift
+    local out
+    while true; do
+        if out="$("$@" 2>&1)"; then
+            echo "$out"
+            return 0
+        fi
+        if ! echo "$out" | grep -q "actively mounted by clients"; then
+            echo "$out" >&2
+            return 1
+        fi
+        [ $SECONDS -lt $deadline ] || { echo "$out" >&2; return 1; }
+        echo "    (waiting for the unmounted daemon's heartbeat records to go stale...)" >&2
+        sleep 5
+    done
+}
+
+vol_used_bytes() { # vol_used_bytes <volume-id> — from the .stats volume_states rows
+    python3 -c '
 import json, sys
-data = json.load(sys.stdin)
-print(json.dumps(data.get(sys.argv[1], None)))
-EOF
+data = json.load(open(sys.argv[1]))
+rows = data.get("volume_states") or []
+print(next((r["used_bytes"] for r in rows if r["id"] == sys.argv[2]), 0))
+' "$MNT/.stats" "$1"
 }
 
 do_mount
@@ -169,8 +192,10 @@ sync -f "$MNT"
 do_unmount
 
 # The durable add (offline verb between mounts — the VL3 shape; the
-# online admin-lane path is exercised by the cargo suite).
-ADD_OUT="$("$BIN" volume add-data "sqmeta://$RIG/meta1" "$RIG/oss2")"
+# online admin-lane path is exercised by the cargo suite). Retries
+# through the post-unmount heartbeat-staleness window (TTL law).
+ADD_OUT="$(retry_guarded 90 "$BIN" volume add-data "sqmeta://$RIG/meta1" "$RIG/oss2")" \
+    || fail "volume add-data kept refusing after the staleness TTL"
 NEW_ID="$(echo "$ADD_OUT" | grep -oE 'vol-[0-9a-f]{16}' | head -1)"
 [ -n "$NEW_ID" ] || fail "no vol- id in add output: $ADD_OUT"
 note "added volume id: $NEW_ID"
@@ -189,18 +214,12 @@ echo "$LIST_LIVE" | grep -q '"id": *"oss1"' || fail "live volume list must keep 
 
 # 3. Engagement: write more data; the new backend must receive
 #    allocations — volume_states used_bytes on the new id must move.
-USED_BEFORE="$(stats_field volume_states | python3 -c "
-import json,sys
-rows = json.load(sys.stdin) or []
-print(next((r['used_bytes'] for r in rows if r['id']=='$NEW_ID'), 0))")"
+USED_BEFORE="$(vol_used_bytes "$NEW_ID")"
 for i in $(seq 1 16); do
     dd if=/dev/urandom of="$MNT/spread_$i.bin" bs=1M count=8 status=none
 done
 sync -f "$MNT"
-USED_AFTER="$(stats_field volume_states | python3 -c "
-import json,sys
-rows = json.load(sys.stdin) or []
-print(next((r['used_bytes'] for r in rows if r['id']=='$NEW_ID'), 0))")"
+USED_AFTER="$(vol_used_bytes "$NEW_ID")"
 [ "$USED_AFTER" -gt "$USED_BEFORE" ] \
     || fail "the added backend received no allocations (used $USED_BEFORE -> $USED_AFTER)"
 echo "OK: new backend receives allocations (used $USED_BEFORE -> $USED_AFTER bytes)"

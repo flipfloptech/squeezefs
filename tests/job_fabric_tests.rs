@@ -451,3 +451,213 @@ async fn job_list_is_offline_probe_shaped() {
         "offline-shaped list must carry the completed job: {listed:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// §5.1.4 admin lane (KD-4): control-plane sessions on the IPC host
+// ---------------------------------------------------------------------------
+
+use squeezefs::ipc_host::{abstract_connect, recv_ctl, send_ctl, IpcHost, IpcHostConfig};
+use squeezefs::ipc_service::FabricAdminSink;
+use squeezefs_ipc::layout::Geometry;
+use squeezefs_ipc::wire::CtlMsg;
+
+fn admin_host_cfg(name: &str, data_plane: bool, owner_uid: u32) -> IpcHostConfig {
+    IpcHostConfig {
+        socket_name: format!("sqz-il0-jobadmin-{}-{}", std::process::id(), name),
+        socket_dir: None,
+        build_commit: "b".repeat(40),
+        allow_dev: false,
+        geometry: Geometry {
+            ring_entries: 16,
+            slots: 16,
+            arena_bytes: 1024 * 1024,
+            max_op_bytes: 64 * 1024,
+            _pad: 0,
+        },
+        arena_cap_bytes: 16 * 1024 * 1024,
+        per_uid_session_cap: 8,
+        idle_secs: 0,
+        data_plane,
+        owner_uid,
+    }
+}
+
+/// Refusing data-plane sink: control-plane-only hosts must never reach it.
+struct NoDataPlane;
+impl squeezefs::ipc_host::SessionSink for NoDataPlane {
+    fn serve_data(
+        &self,
+        _op: squeezefs::ipc_host::DataOp,
+        _completion: squeezefs::ipc_host::SlotCompletion,
+    ) {
+        panic!("control-plane-only host must never dispatch data ops");
+    }
+}
+
+fn admin_hello(sock: &std::os::unix::net::UnixStream) -> CtlMsg {
+    // SAFETY: getpid/getuid are trivially safe.
+    let (pid, uid) = unsafe { (libc::getpid() as u32, libc::getuid()) };
+    send_ctl(sock, &CtlMsg::AdminHello { pid, uid }, None).expect("send AdminHello");
+    let (reply, fd) = recv_ctl(sock).expect("recv AdminHello reply");
+    assert!(fd.is_none(), "admin replies carry no fd");
+    reply
+}
+
+fn admin_req(sock: &std::os::unix::net::UnixStream, verb: &str, arg: &str) -> (bool, String) {
+    send_ctl(
+        sock,
+        &CtlMsg::AdminReq {
+            verb: verb.to_string(),
+            arg: arg.to_string(),
+        },
+        None,
+    )
+    .expect("send AdminReq");
+    let (reply, _) = recv_ctl(sock).expect("recv AdminReply");
+    match reply {
+        CtlMsg::AdminReply { ok, body } => (ok, body),
+        other => panic!("expected AdminReply, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_lane_controls_the_fabric_over_the_ctl_socket() {
+    let fx = fixture("admin-lane").await;
+    let fab = fabric(&fx, 1).await;
+
+    // Control-plane-only host (the every-mount posture): data-plane
+    // HELLOs refuse; ADMIN sessions from the owning uid work.
+    // SAFETY: getuid is trivially safe.
+    let owner = unsafe { libc::getuid() };
+    let cfg = admin_host_cfg("ctl", false, owner);
+    let host = IpcHost::spawn(cfg.clone(), Arc::new(NoDataPlane)).expect("host");
+    host.set_admin_sink(Arc::new(FabricAdminSink::new(fab.clone())));
+
+    // A data-plane HELLO on a control-plane-only host refuses (Flags).
+    let sock = abstract_connect(&cfg.socket_name).expect("connect");
+    // SAFETY: getpid/getuid trivially safe.
+    let (pid, uid) = unsafe { (libc::getpid() as u32, libc::getuid()) };
+    send_ctl(
+        &sock,
+        &CtlMsg::Hello {
+            abi: squeezefs_ipc::layout::IPC_ABI,
+            pid,
+            uid,
+            build_commit: cfg.build_commit.clone(),
+            nonce: host.current_nonce(),
+        },
+        None,
+    )
+    .expect("send");
+    // (No fd credential attached — a control-plane host must refuse
+    // before ever screening one.)
+    let (reply, _) = recv_ctl(&sock).expect("recv");
+    assert!(
+        matches!(reply, CtlMsg::Refuse { .. }),
+        "data-plane HELLO must refuse on a control-plane-only mount, got {reply:?}"
+    );
+    drop(sock);
+
+    // ADMIN session: hello → ok → job verbs round-trip.
+    let sock = abstract_connect(&cfg.socket_name).expect("connect");
+    let reply = admin_hello(&sock);
+    assert!(
+        matches!(reply, CtlMsg::AdminOk),
+        "owner-uid AdminHello must be admitted, got {reply:?}"
+    );
+
+    let job_id = fab
+        .submit(JobSpec {
+            job_type: JobType::Noop {
+                tasks: 20_000,
+                task_ms: 2,
+            },
+            throttle_pct: 100,
+        })
+        .await
+        .expect("submit");
+
+    let (ok, body) = admin_req(&sock, "job-list", "");
+    assert!(ok, "job-list must succeed: {body}");
+    assert!(body.contains(&job_id), "list carries the live job: {body}");
+
+    let (ok, _) = admin_req(&sock, "job-pause", &job_id);
+    assert!(ok, "pause over the lane");
+    let (ok, body) = admin_req(&sock, "job-status", &job_id);
+    assert!(ok && body.contains("paused"), "status shows paused: {body}");
+
+    let (ok, _) = admin_req(&sock, "job-throttle", &format!("{job_id} 25"));
+    assert!(ok, "throttle over the lane");
+    let (ok, body) = admin_req(&sock, "job-status", &job_id);
+    assert!(
+        ok && body.contains("25"),
+        "status shows the new throttle: {body}"
+    );
+
+    let (ok, _) = admin_req(&sock, "job-resume", &job_id);
+    assert!(ok, "resume over the lane");
+    let (ok, _) = admin_req(&sock, "job-cancel", &job_id);
+    assert!(ok, "cancel over the lane");
+    fab.wait_terminal(&job_id, Duration::from_secs(10))
+        .await
+        .expect("terminal after cancel");
+
+    // Unknown verb: a refusal, not a hang or a lie.
+    let (ok, body) = admin_req(&sock, "job-frobnicate", "x");
+    assert!(!ok, "unknown verb refuses: {body}");
+    host.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_lane_refuses_foreign_uids() {
+    let fx = fixture("admin-uid").await;
+    let fab = fabric(&fx, 1).await;
+    // Owner uid deliberately NOT ours (and not root when running as a
+    // user): our peercred uid must be refused.
+    // SAFETY: getuid trivially safe.
+    let my_uid = unsafe { libc::getuid() };
+    if my_uid == 0 {
+        // Running as root: root is always admitted by design — the
+        // foreign-uid refusal cannot be observed from here.
+        return;
+    }
+    let cfg = admin_host_cfg("uidgate", false, my_uid.wrapping_add(12345));
+    let host = IpcHost::spawn(cfg.clone(), Arc::new(NoDataPlane)).expect("host");
+    host.set_admin_sink(Arc::new(FabricAdminSink::new(fab)));
+
+    let sock = abstract_connect(&cfg.socket_name).expect("connect");
+    let reply = admin_hello(&sock);
+    assert!(
+        matches!(reply, CtlMsg::Refuse { .. }),
+        "foreign-uid AdminHello must refuse, got {reply:?}"
+    );
+    host.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_req_without_admin_hello_refuses() {
+    let fx = fixture("admin-nohello").await;
+    let fab = fabric(&fx, 1).await;
+    // SAFETY: getuid trivially safe.
+    let owner = unsafe { libc::getuid() };
+    let cfg = admin_host_cfg("nohello", false, owner);
+    let host = IpcHost::spawn(cfg.clone(), Arc::new(NoDataPlane)).expect("host");
+    host.set_admin_sink(Arc::new(FabricAdminSink::new(fab)));
+
+    let sock = abstract_connect(&cfg.socket_name).expect("connect");
+    send_ctl(
+        &sock,
+        &CtlMsg::AdminReq {
+            verb: "job-list".into(),
+            arg: String::new(),
+        },
+        None,
+    )
+    .expect("send");
+    let (reply, _) = recv_ctl(&sock).expect("recv");
+    assert!(
+        matches!(reply, CtlMsg::Refuse { .. }),
+        "AdminReq before AdminHello must refuse, got {reply:?}"
+    );
+    host.shutdown();
+}

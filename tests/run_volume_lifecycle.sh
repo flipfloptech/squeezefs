@@ -183,9 +183,14 @@ echo "$LIST_SMALL" | grep -q '"state": *"active"' \
 echo "OK: leg 3a (honest preflight refusal)"
 
 # 3b. Offline drain of an empty member runs the §5.8 in-process
-# coordinator to completion: census 0 ⇒ retired.
-"$BIN" volume remove-data "sqmeta://$DR/meta1" oss2 \
+# coordinator to completion: census 0 ⇒ retired. The outcome line
+# prints EXACTLY once (the CLI arm owns it; a library-layer duplicate
+# announced completion twice — regression pin).
+DRAIN_OUT="$("$BIN" volume remove-data "sqmeta://$DR/meta1" oss2)" \
     || fail "offline remove-data of an empty member must drain to retired"
+N_DONE=$(printf '%s\n' "$DRAIN_OUT" | grep -ci "evacuated and retired")
+[ "$N_DONE" -eq 1 ] \
+    || fail "the drain outcome line must print exactly once, got $N_DONE: $DRAIN_OUT"
 LIST_DR="$("$BIN" volume list "sqmeta://$DR/meta1" --json)"
 echo "$LIST_DR" | grep -q '"state": *"retired"' \
     || fail "the drained volume must list as retired: $LIST_DR"

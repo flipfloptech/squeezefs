@@ -773,10 +773,10 @@ async fn offline_drain_body(
     };
     fabric.shutdown_abrupt().await;
     match end {
-        crate::jobs::JobState::Completed => {
-            println!("volume '{volume_id}' evacuated and retired.");
-            Ok(())
-        }
+        // The CLI arm owns the user-facing outcome line (this library
+        // path reports progress only — printing it here too made the
+        // offline drain announce completion twice).
+        crate::jobs::JobState::Completed => Ok(()),
         other => Err(E::InvalidOperation(format!(
             "offline drain of '{volume_id}' ended {other:?} — re-run to resume (the plan \
              regenerates idempotently, KD-6)"

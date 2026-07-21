@@ -412,18 +412,19 @@ async fn test_read_straddling_eof_errors_instead_of_garbage_tail() {
 
     let dev = NvmeBlockDev::new(path.to_str().unwrap());
 
-    // Fill the last 2 KiB of the file with a known pattern.
-    let valid = vec![0x5Au8; 2048];
-    dev.write_block(file_len - 2048, bytes::Bytes::from(valid))
-        .await
-        .expect("in-range write must succeed");
-
-    // Prime pool recycling with a distinct garbage pattern.
+    // Prime pool recycling with a distinct garbage pattern. (Note: writes
+    // must stay clear of the EOF window — the unaligned bounce path pads
+    // writes to 4 KiB, which would legitimately extend the backing file.)
     let garbage = vec![0xEEu8; 4096];
     dev.write_block(0, bytes::Bytes::from(garbage))
         .await
         .expect("in-range write must succeed");
     let _ = dev.read_block(0, 4096).await.expect("prime read");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        file_len,
+        "backing file must not have grown — the straddle premise"
+    );
 
     // 4 KiB read whose second half is past EOF ⇒ kernel returns 2048.
     let res = dev.read_block(file_len - 2048, 4096).await;

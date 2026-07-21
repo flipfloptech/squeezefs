@@ -117,11 +117,39 @@ enum UringResponse {
     Read {
         bytes: bytes::Bytes,
         size: usize,
+        offset: u64,
         tx: oneshot::Sender<Result<bytes::Bytes>>,
     },
     Write {
         tx: oneshot::Sender<Result<()>>,
     },
+}
+
+/// Map a read CQE to the caller-visible result under the exact-length
+/// contract (VL8 item 5): every `UringResponse::Read` consumer
+/// (`read_block` / `read_block_with_dest` / `verify_write_block` and the
+/// routing-layer `read_block`/`read_block_range`/`read_file_range_zero_copy`)
+/// assumes the returned buffer holds exactly `size` bytes of device data.
+/// A short or zero completion (past-EOF on file-backed substrates; real
+/// block devices are all-or-EIO) must therefore fail loud — success would
+/// surface recycled pool-buffer bytes as data (silent-garbage class).
+fn finish_read(
+    io_res: std::io::Result<usize>,
+    bytes: bytes::Bytes,
+    size: usize,
+    offset: u64,
+) -> Result<bytes::Bytes> {
+    let got = io_res.map_err(crate::error::SqueezefsError::Io)?;
+    if got != size {
+        return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "short read: kernel returned {got} of {size} bytes at offset {offset} \
+                 (past-EOF/short reads must not surface recycled buffer bytes)"
+            ),
+        )));
+    }
+    Ok(bytes.slice(0..size))
 }
 
 struct UringWorker {
@@ -284,7 +312,12 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                     tx,
                 } => {
                     active[slot_idx] = Some(ActiveReq {
-                        response: UringResponse::Read { bytes, size, tx },
+                        response: UringResponse::Read {
+                            bytes,
+                            size,
+                            offset,
+                            tx,
+                        },
                         free_ptr: None,
                         _keep_alive: None,
                     });
@@ -363,11 +396,13 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                         };
 
                         match act.response {
-                            UringResponse::Read { bytes, size, tx } => {
-                                let mapped = io_res
-                                    .map_err(crate::error::SqueezefsError::Io)
-                                    .map(|_| bytes.slice(0..size));
-                                let _ = tx.send(mapped);
+                            UringResponse::Read {
+                                bytes,
+                                size,
+                                offset,
+                                tx,
+                            } => {
+                                let _ = tx.send(finish_read(io_res, bytes, size, offset));
                             }
                             UringResponse::Write { tx } => {
                                 let mapped =
@@ -458,11 +493,13 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                     };
 
                     match act.response {
-                        UringResponse::Read { bytes, size, tx } => {
-                            let mapped = io_res
-                                .map_err(crate::error::SqueezefsError::Io)
-                                .map(|_| bytes.slice(0..size));
-                            let _ = tx.send(mapped);
+                        UringResponse::Read {
+                            bytes,
+                            size,
+                            offset,
+                            tx,
+                        } => {
+                            let _ = tx.send(finish_read(io_res, bytes, size, offset));
                         }
                         UringResponse::Write { tx } => {
                             let mapped =
@@ -790,6 +827,11 @@ impl NvmeBlockDev {
         self.read_block_with_dest(offset, size, None).await
     }
 
+    /// Read exactly `size` bytes at `offset` (exact-length contract, VL8
+    /// item 5): on success the returned buffer holds `size` bytes of device
+    /// data. Short/zero kernel completions (past-EOF on file-backed
+    /// substrates) fail loud with `UnexpectedEof` — never partial or
+    /// recycled-buffer data.
     pub async fn read_block_with_dest(
         &self,
         offset: u64,

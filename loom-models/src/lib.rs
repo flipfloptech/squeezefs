@@ -1478,6 +1478,83 @@ mod models {
             assert!(!st.is_dirty(), "the swap cleared the dirty bit");
         });
     }
+    /// Node-lifecycle invariant #5 (PR VL7 §5.7 D4 — the forced-compaction
+    /// nudge): `begin_forced_freeze` composes with lock-serialized applies
+    /// exactly like the ordinary freeze — a racing apply lands either in
+    /// the pre-freeze delta (captured by the ordinary freeze arm: the
+    /// composition `compact_node_forced` drives) or after the swap (where
+    /// it re-sets DIRTY and the SMO's supersede reports `was_dirty` for
+    /// the bounded second merge); at most one freeze is ever in flight
+    /// (shared exclusion with `begin_freeze`); and the SMO's supersede
+    /// always observes `was_freezing` — the `smo_replace` bookkeeping
+    /// assert that makes the forced transition sound.
+    #[test]
+    fn node_state_forced_freeze_conserves_and_reports_freezing() {
+        loom::model(|| {
+            let st = Arc::new(node_state_core::NodeState::new());
+            let open = Arc::new(loom::sync::Mutex::new(0u64)); // open-delta records
+
+            let committer = {
+                let st = Arc::clone(&st);
+                let open = Arc::clone(&open);
+                thread::spawn(move || {
+                    let mut g = open.lock().unwrap();
+                    if st.mark_dirty().is_ok() {
+                        *g += 1;
+                        true
+                    } else {
+                        false // post-supersede apply refused (revalidate-and-retry)
+                    }
+                })
+            };
+
+            // compact_node_forced's freeze arm, under the node lock: the
+            // ordinary freeze when a delta is open, the forced transition
+            // when the overlay is empty.
+            let frozen: u64 = {
+                let mut g = open.lock().unwrap();
+                if *g > 0 {
+                    st.begin_freeze().expect("dirty node freezes ordinarily");
+                    std::mem::take(&mut *g)
+                } else {
+                    st.begin_forced_freeze()
+                        .expect("clean node forced-freezes");
+                    0
+                }
+            };
+            assert!(st.is_freezing(), "the nudge holds a freeze in flight");
+            assert!(
+                st.begin_forced_freeze().is_err(),
+                "at most one freeze in flight (forced vs forced)"
+            );
+
+            // The SMO swap + tidy-up, exactly smo_replace's order.
+            let outcome = st.supersede().expect("SMO swap");
+            assert!(
+                outcome.was_freezing,
+                "supersede must see a freeze-borne source (the smo_replace assert)"
+            );
+            st.end_freeze();
+            assert!(!st.is_freezing(), "freeze window closed after the swap");
+
+            let applied = committer.join().unwrap();
+            let open_now = *open.lock().unwrap();
+            assert_eq!(
+                frozen + open_now,
+                u64::from(applied),
+                "records conserved across the forced freeze \
+                 (frozen {frozen}, open {open_now}, applied {applied})"
+            );
+            if applied && frozen == 0 {
+                assert!(
+                    outcome.was_dirty,
+                    "a post-swap apply must be visible to the SMO as \
+                     re-accumulated dirt (the bounded second merge)"
+                );
+            }
+        });
+    }
+
     /// Conveyor invariant #1 (metadata-throughput §5.5, PR M7): leader
     /// uniqueness — two committers racing enqueue+elect produce exactly
     /// one leader; the loser's entry is guaranteed drained by SOMEONE

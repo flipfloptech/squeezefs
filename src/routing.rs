@@ -3647,19 +3647,22 @@ impl DataRouter {
     /// keeping this exact binding proof. Default-path callers pass
     /// `false`.
     ///
-    /// `escalate_contended` (VL8 item 7): MOVEMENT (the binding changed —
-    /// a COW rewrite displaced the key) and CONTENTION (the binding is
-    /// unchanged but the key's incarnation word keeps moving — a W1
-    /// in-place patch storm on this very block) are different failures.
-    /// Movement keeps the bounded rebind ladder. Contention has no rebind
-    /// to make: with `escalate_contended`, after two contended attempts
-    /// ONE fetch is serialized under the block's `BLOCK_FLUSH_LOCKS`
-    /// stripe — the lock every patch holds across its DMA — so the
-    /// seqlock settles and the read makes guaranteed progress instead of
-    /// exhausting the bound into a spurious EIO (the bimodal
-    /// read-mid-patch failure). MUST be `false` at call sites that may
-    /// already hold this block's stripe (seed fetches under a held block
-    /// guard; write-side RMW seeds) — the stripe is not reentrant.
+    /// `escalate_contended` (VL8 item 7; FIND-RW5-A extension): after two
+    /// losses of EITHER face — MOVEMENT (the binding changed — a COW
+    /// rewrite displaced the key) or CONTENTION (the binding is unchanged
+    /// but the key's incarnation word keeps moving — a patch storm, or
+    /// allocator free-list reuse cycling the same offset through other
+    /// custody's alloc→DMA→publish) — the fetch serializes under the
+    /// block's `BLOCK_FLUSH_LOCKS` stripe AND goes DEVICE-DIRECT
+    /// (`fetch_block_device_true`): a cohort fill inherited from the
+    /// shared single-flight was produced outside the stripe and
+    /// re-imports the invalidity the stripe excludes (the generic/464
+    /// rebind-exhaustion EIO, .benchmarks/2026-07-21-wedge-and-074-
+    /// fixes.md). All faces additionally get a bounded exponential
+    /// backoff tail past the fast attempts. MUST be `false` at call
+    /// sites that may already hold this block's stripe (seed fetches
+    /// under a held block guard; write-side RMW seeds) — the stripe is
+    /// not reentrant.
     /// Lock-order: acquires (3) only, after any caller-held (1) — legal
     /// under the P1-9 order; nothing below takes (1)/(3)/(4).
     pub async fn get_block_for_index(
@@ -3670,24 +3673,45 @@ impl DataRouter {
         device_true: bool,
         escalate_contended: bool,
     ) -> Result<Option<crate::cache::pool::ReadBlockValue>> {
-        // Each retry re-resolves against the freshest map. MOVEMENT
-        // exhaustion (the binding itself kept changing) requires
-        // back-to-back whole COW-rewrite cycles of this one block landing
-        // inside single fetches — churn far past any real workload — and
-        // fails loud rather than serving unproven bytes. CONTENTION never
-        // reaches exhaustion on the escalating path (see above).
-        const MAX_REBINDS: usize = 8;
+        // Each retry re-resolves against the freshest map. Exhaustion
+        // fails loud rather than serving unproven bytes — but only after
+        // the FIND-RW5-A liveness ladder (the generic/464 dominant EIO
+        // face: `fill_valid=false` on an UNCHANGED binding, 8 fast losses
+        // → user EIO; diagnostic tape /tmp/rw5a_diag/):
+        //
+        //  1. fast attempts (unchanged), then a bounded exponential
+        //     backoff tail — allocator free-list offset reuse cycles one
+        //     device offset through alloc→DMA→publish under OTHER
+        //     writers' custody, so a loser needs the storm to pause, not
+        //     more instant retries;
+        //  2. escalated attempts (the VL8 item-7 stripe hold, extended to
+        //     BOTH loss faces) fetch DEVICE-DIRECT: the cohort fill of
+        //     the shared single-flight was produced OUTSIDE the stripe by
+        //     a non-escalated reader, so inheriting it re-imports exactly
+        //     the invalidity the stripe was taken to exclude. The direct
+        //     fetch (the `fetch_block_device_true` primitive) carries the
+        //     full incarnation discipline, publishes nothing, and runs
+        //     serialized — writers of this block that hold the stripe are
+        //     excluded for its whole window.
+        const MAX_REBINDS: usize = 24;
+        const BACKOFF_AFTER: usize = 4;
         const CONTENDED_BEFORE_ESCALATE: usize = 2;
         let mut key: Option<String> = resolved_key.map(str::to_string);
-        let mut contended = 0usize;
-        for _ in 0..MAX_REBINDS {
+        let mut losses = 0usize;
+        for attempt in 0..MAX_REBINDS {
             let Some(cur_key) = key else {
                 return Ok(None);
             };
-            // VL8 item 7 contention escalation: hold the block's stripe
-            // across this one fetch so no patch can overlap it.
-            let _contention_guard = if escalate_contended && contended >= CONTENDED_BEFORE_ESCALATE
-            {
+            if attempt >= BACKOFF_AFTER {
+                let shift = (attempt - BACKOFF_AFTER).min(3) as u32;
+                tokio::time::sleep(Duration::from_millis(1u64 << shift)).await;
+            }
+            // VL8 item 7 escalation (FIND-RW5-A extension: EITHER loss
+            // face): hold the block's stripe across one DIRECT fetch so no
+            // stripe-holding writer can overlap it and no cohort fill can
+            // stand in for it.
+            let escalated = escalate_contended && losses >= CONTENDED_BEFORE_ESCALATE;
+            let _contention_guard = if escalated {
                 let ino = parse_inode_from_path(file_path);
                 Some(
                     crate::fuse_client::block_lock_acquire(
@@ -3700,7 +3724,7 @@ impl DataRouter {
             } else {
                 None
             };
-            let (val, incarnation_valid) = if device_true {
+            let (val, incarnation_valid) = if device_true || escalated {
                 self.fetch_block_device_true(&cur_key).await?
             } else {
                 self.get_cached_or_fetch_block_traced(&cur_key, false)
@@ -3717,17 +3741,13 @@ impl DataRouter {
             if incarnation_valid && current.as_deref() == Some(cur_key.as_str()) {
                 return Ok(Some(val));
             }
-            if current.as_deref() == Some(cur_key.as_str()) {
-                contended += 1;
-            } else {
-                contended = 0;
-            }
+            losses += 1;
             METRICS
                 .stale_binding_rebinds
                 .fetch_add(1, Ordering::Relaxed);
             debug!(
-                "stale-binding rebind: file={} block={} resolved_key={} current={:?} fill_valid={}",
-                file_path, b, cur_key, current, incarnation_valid
+                "stale-binding rebind: file={} block={} resolved_key={} current={:?} fill_valid={} escalated={}",
+                file_path, b, cur_key, current, incarnation_valid, escalated
             );
             key = current;
         }
@@ -3871,10 +3891,18 @@ impl DataRouter {
         );
 
         let mut key: Option<String> = resolved_key.map(str::to_string);
-        for _ in 0..MAX_REBINDS {
+        for attempt in 0..MAX_REBINDS {
             let Some(cur_key) = key else {
                 return Ok(None);
             };
+            // FIND-RW5-A backoff tail (same rationale as the whole-block
+            // loop): the ranged fast phase keeps its exhaustion fallback
+            // to the escalating whole-block loop, but a short backoff
+            // absorbs the free-list-reuse incarnation storms first.
+            if attempt >= 4 {
+                let shift = (attempt - 4).min(3) as u32;
+                tokio::time::sleep(std::time::Duration::from_millis(1u64 << shift)).await;
+            }
             let tracked = self.backend_router.key_incarnation_tracked(&cur_key);
             let before = self.backend_router.fill_incarnation(&cur_key);
 
@@ -5421,6 +5449,10 @@ impl DataRouter {
                     }
                 }
                 Err(SqueezefsError::Io(ref e)) if e.kind() == std::io::ErrorKind::StorageFull => {
+                    // FIND-RW5-A: the never-lossy escalation, counted.
+                    crate::fuse_client::METRICS
+                        .staged_spill_escalations
+                        .fetch_add(1, Ordering::Relaxed);
                     // Spill is the designed degraded mode under sustained
                     // pressure and can fire thousands of times in a burst:
                     // one line per second + a suppressed count keeps the
@@ -7072,12 +7104,102 @@ impl DataRouter {
             img[*s0 as usize..*s0 as usize + d.len()].copy_from_slice(d);
         }
         // Same-key crash-safe replace (bumps the stage generation — a
-        // racing promotion's commit aborts). StorageFull propagates:
-        // never-lossy custody stays exactly where it was.
-        self.cache
+        // racing promotion's commit aborts). A refused replace (the ring
+        // cannot place the crash-safe second copy, or the budget is
+        // oversubscribed) takes the FIND-RW5-A durable-spill escalation:
+        // the composed image goes straight to a backend block and the
+        // layout commits, exactly like the staged-replace arm — the fold
+        // must NEVER surface StorageFull to its driver (fsync/writeback/
+        // recovery), and custody transfers only after the durable commit.
+        match self
+            .cache
             .nvme
-            .stage_write(&file_path, &fid, bytes::Bytes::from(img), fencing_token)
-            .await?;
+            .stage_write(
+                &file_path,
+                &fid,
+                bytes::Bytes::from(img.clone()),
+                fencing_token,
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(SqueezefsError::Io(ref e)) if e.kind() == std::io::ErrorKind::StorageFull => {
+                crate::fuse_client::METRICS
+                    .staged_spill_escalations
+                    .fetch_add(1, Ordering::Relaxed);
+                let img_len = img.len() as u64;
+                let processed = self
+                    .get_crypto()
+                    .process_write_async(bytes::Bytes::from(img))
+                    .await?;
+                let (be_id, block_allocator, nvme_writer) =
+                    self.backend_router.get_active_backend()?;
+                crate::block_allocator::ensure_stored_block_image_fits(
+                    processed.len(),
+                    block_allocator.chunk_size(),
+                    "rider-fold spill",
+                )?;
+                let be_offset = block_allocator.allocate_block().await?;
+                // PR VL6a: in-flight until the layout commit below.
+                let _inflight = block_allocator.inflight_register(be_offset);
+                let stored_block_key = format!(
+                    "{}:0:{}",
+                    self.backend_router.persist_block_key(&be_id, be_offset),
+                    processed.len()
+                );
+                if let Err(e) = nvme_writer.write_block(be_offset, processed).await {
+                    let _ = block_allocator.free_block(be_offset).await;
+                    return Err(e);
+                }
+                block_allocator.publish_block(be_offset);
+
+                // Spill takes a FRESH file_id (the spill identity
+                // discipline): the stale ring entry must never shadow this
+                // durable image, and an in-flight promotion of the old id
+                // must fail its generation check.
+                let spill_file_id = Uuid::new_v4().to_string();
+                let _meta_guard = meta_lock_acquire(ino).await;
+                let fresh = self.metadata_cache.get(&ino);
+                let still_ours = fresh
+                    .as_ref()
+                    .map(|f| f.file_type == "staged" && f.file_id.as_deref() == Some(&fid))
+                    .unwrap_or(false);
+                if !still_ours {
+                    // Identity moved under the fold (promotion/re-stage
+                    // committed meanwhile): that commit folded-first, so
+                    // the record is stale-duplicate custody — free our
+                    // orphan upload and let the next drain re-resolve.
+                    let _ = block_allocator.free_block(be_offset).await;
+                    return Ok(false);
+                }
+                let mut block_map = std::collections::HashMap::new();
+                block_map.insert(0, stored_block_key.clone());
+                let mut updated_meta = meta.clone();
+                updated_meta.file_type = "staged".to_string();
+                updated_meta.size = updated_meta.size.max(img_len);
+                updated_meta.file_id = Some(spill_file_id);
+                updated_meta.data_key = None;
+                updated_meta.block_map = Some(std::sync::Arc::new(block_map));
+                updated_meta.layout_dirty = false;
+                updated_meta.cached_at = std::time::Instant::now();
+                // FIND-M11-A: the merge presents the ino's CURRENT
+                // generation, read at the last responsible moment.
+                let merge_token = self.dlm.get_fencing_token_ino(ino);
+                self.save_metadata_to_backend(ino, &updated_meta, merge_token)
+                    .await?;
+                self.metadata_cache.insert(ino, updated_meta);
+                self.cache.write_lru.remove(&file_path);
+                self.cache.read_lru.remove(&file_path);
+                // Release the superseded ring entry + any older durable copy.
+                self.release_superseded_staged(
+                    Some(&fid),
+                    fresh.as_ref().and_then(|f| f.block_map.as_deref()),
+                    Some(&stored_block_key),
+                )
+                .await;
+            }
+            Err(e) => return Err(e),
+        }
         self.retire_rider_record(ino).await;
         Ok(true)
     }
@@ -7242,15 +7364,60 @@ impl DataRouter {
                     }
                     data[s0..s0 + d.len()].copy_from_slice(&d);
                 }
-                self.cache
+                // FIND-RW5-A: a refused destination stage takes the
+                // durable-spill escalation (backend block + `block_map[0]`
+                // mapping) — a clone must never surface StorageFull because
+                // the staging ring is full of OTHER files' live custody.
+                match self
+                    .cache
                     .nvme
                     .stage_write(
                         dest,
                         &new_file_id,
-                        bytes::Bytes::from(data),
+                        bytes::Bytes::from(data.clone()),
                         resolved_dest_token,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(SqueezefsError::Io(ref e))
+                        if e.kind() == std::io::ErrorKind::StorageFull =>
+                    {
+                        crate::fuse_client::METRICS
+                            .staged_spill_escalations
+                            .fetch_add(1, Ordering::Relaxed);
+                        let processed = self
+                            .get_crypto()
+                            .process_write_async(bytes::Bytes::from(data))
+                            .await?;
+                        let (be_id, block_allocator, nvme_writer) =
+                            self.backend_router.get_active_backend()?;
+                        crate::block_allocator::ensure_stored_block_image_fits(
+                            processed.len(),
+                            block_allocator.chunk_size(),
+                            "staged-clone spill",
+                        )?;
+                        let be_offset = block_allocator.allocate_block().await?;
+                        // PR VL6a: in-flight until the caller's dest-layout
+                        // commit below publishes the mapping (scope-held —
+                        // this fn commits `updated_meta` before returning).
+                        let _inflight = block_allocator.inflight_register(be_offset);
+                        let stored_block_key = format!(
+                            "{}:0:{}",
+                            self.backend_router.persist_block_key(&be_id, be_offset),
+                            processed.len()
+                        );
+                        if let Err(e) = nvme_writer.write_block(be_offset, processed).await {
+                            let _ = block_allocator.free_block(be_offset).await;
+                            return Err(e);
+                        }
+                        block_allocator.publish_block(be_offset);
+                        let mut block_map = std::collections::HashMap::new();
+                        block_map.insert(0, stored_block_key);
+                        updated_meta.block_map = Some(std::sync::Arc::new(block_map));
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             updated_meta.file_id = Some(new_file_id);
         } else if meta.file_type == "striped" {

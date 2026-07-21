@@ -9219,31 +9219,38 @@ impl Filesystem for SqueezefsFilesystem {
                 // Q_DEPTH=4). Materialize a private copy before anything
                 // reaches `DataRouter::write_file`.
                 let data_bytes = sever_payload(&data);
-                if lock_scope == InodeWriteLockScope::MetaPrepOnly {
+                // FIND-RW5-A face 3: one fresh-lease retry on a transient
+                // adjacent-bump fence (see the striped arm below).
+                let held_guard = if lock_scope == InodeWriteLockScope::MetaPrepOnly {
                     drop(guard);
-                    if let Err(e) = self
-                        .router
-                        .write_file(&file_path, offset, data_bytes, fencing_token)
-                        .await
-                    {
-                        if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
-                            self.invalidate_local_lease(ino);
-                        }
-                        return Err(map_squeezefs_err(e));
-                    }
+                    None
                 } else {
-                    if let Err(e) = self
+                    Some(guard)
+                };
+                let mut token = fencing_token;
+                let mut attempt = 0u32;
+                loop {
+                    match self
                         .router
-                        .write_file(&file_path, offset, data_bytes, fencing_token)
+                        .write_file(&file_path, offset, data_bytes.clone(), token)
                         .await
                     {
-                        if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
+                        Ok(()) => break,
+                        Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
                             self.invalidate_local_lease(ino);
+                            if attempt >= 1 {
+                                return Err(map_squeezefs_err(e));
+                            }
+                            attempt += 1;
+                            token = self
+                                .get_or_acquire_lease(ino)
+                                .await
+                                .map_err(map_squeezefs_err)?;
                         }
-                        return Err(map_squeezefs_err(e));
+                        Err(e) => return Err(map_squeezefs_err(e)),
                     }
-                    drop(guard);
                 }
+                drop(held_guard);
             } else {
                 // `use_router_write` is unconditionally true for
                 // `file_type == "inline" || "staged"` (the condition names
@@ -9267,14 +9274,31 @@ impl Filesystem for SqueezefsFilesystem {
                 // data path.
                 drop(guard);
                 write_phase_record(WritePhase::RouteClassify, wp_route);
-                if let Err(e) = self
-                    .write_file_staged(ino, offset, data.clone(), old_size, fencing_token)
-                    .await
-                {
-                    if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
-                        self.invalidate_local_lease(ino);
+                // FIND-RW5-A face 3: a transient adjacent-bump fence
+                // (our own lease churn — single-writer mount) retries once
+                // with a fresh lease instead of surfacing EIO; a second
+                // fence is genuine and stays loud.
+                let mut token = fencing_token;
+                let mut attempt = 0u32;
+                loop {
+                    match self
+                        .write_file_staged(ino, offset, data.clone(), old_size, token)
+                        .await
+                    {
+                        Ok(()) => break,
+                        Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
+                            self.invalidate_local_lease(ino);
+                            if attempt >= 1 {
+                                return Err(map_squeezefs_err(e));
+                            }
+                            attempt += 1;
+                            token = self
+                                .get_or_acquire_lease(ino)
+                                .await
+                                .map_err(map_squeezefs_err)?;
+                        }
+                        Err(e) => return Err(map_squeezefs_err(e)),
                     }
-                    return Err(map_squeezefs_err(e));
                 }
             }
 
@@ -10619,9 +10643,18 @@ impl Filesystem for SqueezefsFilesystem {
             }
         }
 
-        // If there's a cached lease, release it and remove it from our active_leases map
-        if let Some((_, lease)) = self.active_leases.remove(&ino) {
-            let _ = lease.release().await;
+        // Drop the shared op lease only at the LAST close (FIND-RW5-A face
+        // 3): releasing it while other handles were open let the next
+        // acquisition bump the fencing token and fence every in-flight op
+        // still holding the old snapshot into EIO — the generic/464
+        // FencingTokenExpired{N, N+1} storm (16 procs sharing 200 files,
+        // every close detonating its siblings' writes). The open count
+        // decrements FIRST so "last close" is exact for this release.
+        self.remove_open(ino);
+        if !self.is_open(ino) {
+            if let Some((_, lease)) = self.active_leases.remove(&ino) {
+                let _ = lease.release().await;
+            }
         }
 
         // Release POSIX locks held by this lock owner on this inode
@@ -10641,7 +10674,6 @@ impl Filesystem for SqueezefsFilesystem {
 
         // Static lock array does not need dynamic cleanup
 
-        self.remove_open(ino);
         self.queue_reclaim_inode(ino);
 
         Ok(())

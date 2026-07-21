@@ -670,3 +670,142 @@ async fn concurrent_readdir_during_create_is_coherent() {
         "the final readdir must list exactly the created set"
     );
 }
+
+// ===========================================================================
+// (6) VL8 item 2 — the 013/464 async-write wedge's two structural defects
+//     (live capture 2026-07-21: /tmp/vl8_fstests/wedge_* evidence pack).
+// ===========================================================================
+
+/// `copy_file_range` orders its two inode guards by RAW INO, but the
+/// guards live in a hash-STRIPED table: raw-ino order is NOT a total
+/// order on the lock instances, so two concurrent cfr ops can acquire
+/// the same two stripes in opposite sequence — ABBA, and every op whose
+/// ino hashes onto the held/waited stripes wedges behind it forever.
+/// The acquisition sequence must be monotone in SHARD INDEX.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cfr_pair_guard_order_is_shard_monotone() {
+    arm_short_timeout();
+    let sandbox = fs_sandbox().await;
+    let fs = &sandbox.fs;
+
+    // Search a small ino range for a pair whose raw-ino order INVERTS the
+    // shard order (guaranteed to exist: the shard map is a hash).
+    let mut checked = 0u32;
+    for a in 2u64..2000 {
+        for b in (a + 1)..(a + 64).min(2000) {
+            let (first, second) = fs.inode_pair_lock_order(a, b);
+            let s_first = fs.active_inode_locks.shard_index(first);
+            let s_second = fs.active_inode_locks.shard_index(second);
+            if s_first != s_second {
+                checked += 1;
+                assert!(
+                    s_first < s_second,
+                    "guard sequence for inos ({a},{b}) = ({first},{second}) acquires \
+                     shard {s_first} before shard {s_second} — raw-ino order over a \
+                     hash-striped lock table is ABBA-capable (VL8 item 2)"
+                );
+            }
+        }
+    }
+    assert!(checked > 1000, "the search must actually exercise pairs");
+}
+
+/// A `copy_file_range` blocked on its inode guards must be VISIBLE to the
+/// op watchdog (kind + ino). In the live wedge the two deadlocked cfr
+/// handlers were invisible — every diagnosis started from the victims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cfr_registers_with_watchdog_while_guard_blocked() {
+    arm_short_timeout();
+    let sandbox = fs_sandbox().await;
+    let fs = sandbox.fs.clone();
+
+    let src = fs
+        .create(req(), 1, OsStr::new("cfr_wd_src.txt"), 0o644, 0)
+        .await
+        .expect("create src")
+        .attr
+        .ino;
+    let dst = fs
+        .create(req(), 1, OsStr::new("cfr_wd_dst.txt"), 0o644, 0)
+        .await
+        .expect("create dst")
+        .attr
+        .ino;
+
+    // Hold the SOURCE's inode guard: the cfr blocks at guard acquisition.
+    let src_guard = fs.get_inode_lock(src).write().await;
+
+    let cfr_task = {
+        let fs = fs.clone();
+        tokio::spawn(async move { fs.copy_file_range(req(), src, 0, 0, dst, 0, 0, 16, 0).await })
+    };
+
+    let mut seen = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && !cfr_task.is_finished() {
+        if op_watchdog_tick(Duration::ZERO)
+            .iter()
+            .any(|o| o.op == "copy_file_range" && o.ino == src)
+        {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        seen,
+        "a guard-blocked copy_file_range must appear in the watchdog registry \
+         (kind copy_file_range, ino {src}) — the live wedge's holders were invisible"
+    );
+
+    drop(src_guard);
+    let _ = tokio::time::timeout(Duration::from_secs(10), cfr_task)
+        .await
+        .expect("cfr must complete once the guard is released")
+        .expect("cfr task join");
+}
+
+/// Same contract for `fallocate` (the other watchdog-blind op class the
+/// live wedge capture caught permanently in flight).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fallocate_registers_with_watchdog_while_guard_blocked() {
+    arm_short_timeout();
+    let sandbox = fs_sandbox().await;
+    let fs = sandbox.fs.clone();
+
+    let ino = fs
+        .create(req(), 1, OsStr::new("falloc_wd.txt"), 0o644, 0)
+        .await
+        .expect("create")
+        .attr
+        .ino;
+
+    let guard = fs.get_inode_lock(ino).write().await;
+    let task = {
+        let fs = fs.clone();
+        tokio::spawn(async move { fs.fallocate(req(), ino, 0, 0, 4096, 0).await })
+    };
+
+    let mut seen = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && !task.is_finished() {
+        if op_watchdog_tick(Duration::ZERO)
+            .iter()
+            .any(|o| o.op == "fallocate" && o.ino == ino)
+        {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        seen,
+        "a guard-blocked fallocate must appear in the watchdog registry (ino {ino})"
+    );
+
+    drop(guard);
+    let _ = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("fallocate must complete once the guard is released")
+        .expect("fallocate task join");
+}

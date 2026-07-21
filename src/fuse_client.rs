@@ -399,9 +399,16 @@ pub enum FuseOpKind {
     Symlink = 16,
     Link = 17,
     Fsync = 18,
+    // VL8 item 2 (the 013/464 wedge live capture, 2026-07-21): these op
+    // classes sat permanently in flight while the watchdog was BLIND to
+    // them — every diagnosis started from the visible victims instead of
+    // the holders. They register like every other op.
+    CopyFileRange = 19,
+    Fallocate = 20,
+    Open = 21,
 }
 
-const FUSE_OP_KINDS: usize = 19;
+const FUSE_OP_KINDS: usize = 22;
 
 impl FuseOpKind {
     const ALL: [FuseOpKind; FUSE_OP_KINDS] = [
@@ -424,6 +431,9 @@ impl FuseOpKind {
         FuseOpKind::Symlink,
         FuseOpKind::Link,
         FuseOpKind::Fsync,
+        FuseOpKind::CopyFileRange,
+        FuseOpKind::Fallocate,
+        FuseOpKind::Open,
     ];
 
     fn name(self) -> &'static str {
@@ -447,6 +457,9 @@ impl FuseOpKind {
             FuseOpKind::Symlink => "symlink",
             FuseOpKind::Link => "link",
             FuseOpKind::Fsync => "fsync",
+            FuseOpKind::CopyFileRange => "copy_file_range",
+            FuseOpKind::Fallocate => "fallocate",
+            FuseOpKind::Open => "open",
         }
     }
 }
@@ -4415,6 +4428,23 @@ impl SqueezefsFilesystem {
 
     pub fn get_inode_lock(&self, ino: u64) -> &tokio::sync::RwLock<()> {
         self.active_inode_locks.get_inode_lock(ino)
+    }
+
+    /// The two-inode guard acquisition SEQUENCE for `copy_file_range` (the
+    /// only two-ino guard site): returns `(first, second)` — the ino whose
+    /// guard is taken first, then the other. Deadlock freedom over the
+    /// hash-STRIPED `active_inode_locks` requires a total order on the
+    /// LOCK INSTANCES actually acquired (the shard indexes), because two
+    /// distinct ino pairs can map onto the same two stripes in opposite
+    /// raw-ino order (the ABBA the VL8 item-2 wedge capture implicated:
+    /// two copy_file_range handlers permanently in flight, watchdog-blind,
+    /// with every visible victim queued behind striped inode guards).
+    pub fn inode_pair_lock_order(&self, src: u64, dst: u64) -> (u64, u64) {
+        if src < dst {
+            (src, dst)
+        } else {
+            (dst, src)
+        }
     }
 
     pub fn get_inode_lock_ref(&self, ino: u64) -> &tokio::sync::RwLock<()> {
@@ -9784,7 +9814,7 @@ impl Filesystem for SqueezefsFilesystem {
             _src_write_guard = Some(src_lock_arc.write().await);
             _src_read_guard = None;
             _dest_write_guard = None;
-        } else if inode < inode_out {
+        } else if self.inode_pair_lock_order(inode, inode_out).0 == inode {
             _src_read_guard = Some(src_lock_arc.read().await);
             _dest_write_guard = Some(dest_lock_arc.as_ref().unwrap().write().await);
             _src_write_guard = None;

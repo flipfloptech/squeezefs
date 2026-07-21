@@ -1952,6 +1952,10 @@ pub struct Metrics {
     /// pressure is the DESIGNED degraded mode; a user-visible EIO of the
     /// StorageFull class is a regression.
     pub staged_spill_escalations: Align64<AtomicU64>,
+    /// FIND-RW5-A forensics: double-release of an already-free device
+    /// offset (the release_superseded double-free family). MUST STAY 0 —
+    /// growth means an offset can be minted to two live owners.
+    pub block_double_frees: Align64<AtomicU64>,
     /// FIND-RW4-A store-raw escape: block images whose compressed form
     /// would not shrink (incompressible payloads) stored RAW behind the
     /// frame's raw marker — compression is best-effort per block, never a
@@ -4035,6 +4039,7 @@ impl SqueezefsFilesystem {
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
                 "staged_spill_escalations": METRICS.staged_spill_escalations.load(Ordering::Relaxed),
+                "block_double_frees": METRICS.block_double_frees.load(Ordering::Relaxed),
                 "layout_striped_writes": METRICS.layout_striped_writes.load(Ordering::Relaxed),
                 "compress_stored_raw": METRICS.compress_stored_raw.load(Ordering::Relaxed),
                 "bg_spawn_admitted": METRICS.bg_spawn_admitted.load(Ordering::Relaxed),

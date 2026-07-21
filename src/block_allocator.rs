@@ -481,6 +481,7 @@ impl BlockAllocator {
         } else {
             self.next_fresh_block()?
         };
+        log::debug!("allocate_block: offset {}", block_idx * self.chunk_size);
         Ok(self.claim_block_idx(block_idx))
     }
 
@@ -589,7 +590,20 @@ impl BlockAllocator {
     /// this can `allocate_block` hand the offset to a new owner.
     pub fn finish_free(&self, offset: u64) {
         let block_idx = offset / self.chunk_size;
-        self.free_blocks.insert(block_idx);
+        if !self.free_blocks.insert(block_idx) {
+            // FIND-RW5-A forensics tripwire: a second release of an offset
+            // already on the free list is the double-free family the
+            // release_superseded_staged doc warns about — the lineage that
+            // mints TWO live owners for one device offset once the next
+            // two allocations both receive it.
+            log::error!(
+                "DOUBLE FREE: offset {offset} (block {block_idx}) was already free —                  double-release lineage; see block_double_frees"
+            );
+            crate::fuse_client::METRICS
+                .block_double_frees
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        log::debug!("finish_free: offset {offset}");
         crate::fuse_client::METRICS
             .del_obj
             .fetch_add(1, Ordering::Relaxed);

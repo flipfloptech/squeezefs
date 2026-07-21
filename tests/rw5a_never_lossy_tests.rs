@@ -424,6 +424,62 @@ async fn reader_cohort_survives_perpetual_patch_storm() {
     storm.await.unwrap();
 }
 
+/// Face 4 — the double-reclaim double-free (the residual behind the
+/// probe-run rebind-exhaustion EIOs and the mount-time `DOUBLE FREE`
+/// tripwires): `queue_reclaim_inode` enqueues from BOTH release and
+/// forget, and duplicate reclaim batches both pass admission (the inode
+/// slot persists until the destroy commits) and both run
+/// `router.delete_file` — every mapped block freed TWICE. Interleaved
+/// with a concurrent allocation, free #2 steals the offset from its new
+/// owner (begin_free of an untracked offset frees unconditionally): one
+/// device offset, two live layouts — permanent incarnation churn (every
+/// reader of either owner rebind-exhausts into EIO) and cross-file
+/// corruption.
+///
+/// Deterministic pin: destroy a striped file via TWO concurrent
+/// reclaim batches for the same ino; every double-freed block trips the
+/// finish_free tripwire (block_double_frees MUST STAY 0), and a
+/// subsequently-created file must never receive a block that a third
+/// party can free from under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_reclaim_never_double_frees_blocks() {
+    let _g = serial().await;
+    let h = make(*b"rw5a_reclaim_2x!", "rw5a_reclaim", "64MB").await;
+
+    let ino = create(&h, "victim").await;
+    let len = 3 * BS as usize;
+    write_at(&h, ino, 0, &pat(len, 0x5A)).await;
+    h.fs.fsync(h.req, ino, 0, false).await.unwrap();
+    let path = squeezefs::keys::inode_path(ino);
+    let meta = h.fs.router.fetch_metadata(&path).await.unwrap();
+    assert_eq!(meta.file_type, "striped");
+
+    // Unlink (nlink -> 0) then close every tracked handle so reclaim
+    // admission passes; the kernel would now send RELEASE + FORGET, each
+    // queueing a reclaim — model the duplicate drive directly with two
+    // concurrent batches.
+    h.fs.unlink(h.req, 1, OsStr::new("victim")).await.unwrap();
+    h.fs.release(h.req, ino, ino, 0, 0, false).await.unwrap();
+
+    let before = METRICS.block_double_frees.load(Ordering::Relaxed);
+    let fs1 = h.fs.clone();
+    let fs2 = h.fs.clone();
+    let (a, b) = tokio::join!(
+        tokio::spawn(async move { fs1.reclaim_orphaned_batch(vec![ino]).await }),
+        tokio::spawn(async move { fs2.reclaim_orphaned_batch(vec![ino]).await }),
+    );
+    a.unwrap();
+    b.unwrap();
+    let after = METRICS.block_double_frees.load(Ordering::Relaxed);
+    assert_eq!(
+        after, before,
+        "duplicate reclaim drives (release+forget both queue; concurrent \
+         batches both admit) must not double-free the victim's blocks — \
+         a double-free interleaved with an allocation mints ONE device \
+         offset to TWO live owners (the generic/464 residual EIO class)"
+    );
+}
+
 /// Face 3a — RELEASE keeps the shared op lease while other handles are
 /// open: the fencing token must NOT bump across close-while-open + write
 /// (the 464 FencingTokenExpired{N, N+1} storm generator).

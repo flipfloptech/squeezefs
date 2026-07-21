@@ -451,11 +451,7 @@ async fn intersecting_scope_movers_serialize_queued_loud_then_run() {
     }
 
     assert_eq!(
-        fx.fs
-            .router
-            .backend_router
-            .volume_state("oss2")
-            .as_deref(),
+        fx.fs.router.backend_router.volume_state("oss2").as_deref(),
         Some(VOL_STATE_RETIRED),
         "the drain retired its victim"
     );
@@ -722,13 +718,7 @@ async fn red_pressure_pauses_jobs_loudly_and_operator_resume_recovers() {
 
     // Operator resume works: the job advances again.
     fx.fabric.resume(&job_id).await.expect("resume");
-    let before = fx
-        .fabric
-        .status(&job_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .tasks_done;
+    let before = fx.fabric.status(&job_id).await.unwrap().unwrap().tasks_done;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let st = fx.fabric.status(&job_id).await.unwrap().unwrap();

@@ -172,6 +172,31 @@ impl JobType {
         }
     }
 
+    /// PR VL9 (pin a): the mover-class volume scope this job mutates
+    /// block placement over — `None` for non-movers (fsck, slot
+    /// migration, folds, meta compaction, Noop all interleave freely).
+    /// Intersecting scopes SERIALIZE at claim time: one mover-class job
+    /// per volume at a time, the later job queues loud (KD-6
+    /// idempotence is what makes queueing safe — a queued mover
+    /// re-plans from whatever state the earlier one left).
+    fn mover_scope(&self) -> Option<MoverScope> {
+        match self {
+            JobType::EvacuateVolume { volume_id } => Some(MoverScope::Volume(volume_id.clone())),
+            JobType::DefragData { volume_id: Some(v) } => Some(MoverScope::Volume(v.clone())),
+            // Whole-set movers: rebalance plans sources/destinations
+            // across the set; an unscoped defrag covers every
+            // placement-eligible volume.
+            JobType::Rebalance | JobType::DefragData { volume_id: None } => {
+                Some(MoverScope::WholeSet)
+            }
+            JobType::Noop { .. }
+            | JobType::MigrateMetaSlot { .. }
+            | JobType::Fsck { .. }
+            | JobType::DefragMeta
+            | JobType::DefragFold => None,
+        }
+    }
+
     /// Whether the §5.1.6 wire may execute this job on a remote worker.
     /// The VL4 movers are LOCAL-POOL ONLY in v1.1: their publish step is
     /// coordinator-side `merge_block_mappings` per referencing ino,
@@ -188,6 +213,24 @@ impl JobType {
     /// half-shipped.
     pub(crate) fn wire_executable(&self) -> bool {
         matches!(self, JobType::Noop { .. })
+    }
+}
+
+/// PR VL9 (pin a): a mover-class job's placement scope. Per-volume
+/// scopes conflict only on the same volume; a whole-set mover
+/// conflicts with every mover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MoverScope {
+    Volume(String),
+    WholeSet,
+}
+
+impl MoverScope {
+    fn conflicts(&self, other: &MoverScope) -> bool {
+        match (self, other) {
+            (MoverScope::Volume(a), MoverScope::Volume(b)) => a == b,
+            _ => true,
+        }
     }
 }
 
@@ -818,6 +861,10 @@ pub(crate) struct JobCtl {
     /// One worker owns a job at a time (shard-level parallelism is the
     /// wire's business).
     claimed: AtomicBool,
+    /// PR VL9 (pin a): whether this deferral episode was already
+    /// counted/logged — `job_serialized_waits` counts episodes, not the
+    /// worker pool's claim-poll cadence. Reset on claim.
+    serialize_noted: AtomicBool,
     state: parking_lot::Mutex<JobState>,
     terminal: Notify,
 }
@@ -904,6 +951,7 @@ impl JobFabric {
                 done: AtomicU64::new(rec.tasks_done),
                 tasks_total: AtomicU64::new(rec.tasks_total),
                 claimed: AtomicBool::new(false),
+                serialize_noted: AtomicBool::new(false),
                 state: parking_lot::Mutex::new(adopted_state),
                 terminal: Notify::new(),
             });
@@ -951,6 +999,7 @@ impl JobFabric {
             done: AtomicU64::new(0),
             tasks_total: AtomicU64::new(rec.tasks_total),
             claimed: AtomicBool::new(false),
+            serialize_noted: AtomicBool::new(false),
             state: parking_lot::Mutex::new(JobState::Queued),
             terminal: Notify::new(),
         });
@@ -1221,14 +1270,48 @@ impl JobFabric {
     pub(crate) fn claim_next(&self, for_wire: bool) -> Option<(String, Arc<JobCtl>)> {
         let jobs = self.jobs.lock();
         for (id, ctl) in jobs.iter() {
-            if (!for_wire || ctl.job_type.wire_executable())
-                && ctl.state() == JobState::Queued
-                && !ctl.paused.load(Ordering::SeqCst)
-                && ctl
-                    .claimed
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
+            if (for_wire && !ctl.job_type.wire_executable())
+                || ctl.state() != JobState::Queued
+                || ctl.paused.load(Ordering::SeqCst)
             {
+                continue;
+            }
+            // PR VL9 (pin a): mover-class serialization — one
+            // mover-class job per volume at a time. A candidate whose
+            // scope intersects a CLAIMED (in-execution) mover stays
+            // Queued: `claimed` covers the whole worker-held window
+            // (set at claim, cleared when the worker returns — a
+            // paused/terminal mover releases its scope), so the
+            // Queued→Running visibility gap cannot double-claim.
+            if let Some(scope) = ctl.job_type.mover_scope() {
+                let conflict = jobs.iter().any(|(other_id, other)| {
+                    other_id != id
+                        && other.claimed.load(Ordering::SeqCst)
+                        && other
+                            .job_type
+                            .mover_scope()
+                            .is_some_and(|o| o.conflicts(&scope))
+                });
+                if conflict {
+                    if !ctl.serialize_noted.swap(true, Ordering::SeqCst) {
+                        METRICS.job_serialized_waits.fetch_add(1, Ordering::Relaxed);
+                        log::info!(
+                            "job fabric: mover job {id} ({:?}) queued behind a running \
+                             mover with an intersecting volume scope — one mover-class \
+                             job per volume at a time (PR VL9 pin; KD-6 makes queueing \
+                             safe, it runs when the scope frees)",
+                            ctl.job_type
+                        );
+                    }
+                    continue;
+                }
+            }
+            if ctl
+                .claimed
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                ctl.serialize_noted.store(false, Ordering::SeqCst);
                 return Some((id.clone(), Arc::clone(ctl)));
             }
         }

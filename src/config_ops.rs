@@ -1244,9 +1244,11 @@ fn staging_isolated_roots(cfg: Option<&crate::FormatConfig>) -> Vec<PathBuf> {
     out
 }
 
-/// One member's observation for the membership verbs: path + stamp.
+/// One member's observation for the membership verbs: path + superblock
+/// uuid + stamp.
 struct MemberObs {
     path: String,
+    uuid: [u8; 16],
     stamp: crate::meta_backend::kv::checkpoint::MembershipStamp,
 }
 
@@ -1256,20 +1258,17 @@ async fn observe_stamped_members(meta_lvs: &[String]) -> Result<Vec<MemberObs>> 
     let obs = crate::meta_backend::observe_meta_set(meta_lvs).await?;
     let mut out = Vec::with_capacity(obs.len());
     for o in obs {
-        let Some(stamp) = o.stamp else {
+        let crate::meta_backend::MetaVolumeObservation { path, uuid, stamp } = o;
+        let Some(stamp) = stamp else {
             return Err(SqueezefsError::InvalidOperation(format!(
-                "metadata volume {} carries no §5.5.1a membership stamp — meta membership \
+                "metadata volume {path} carries no §5.5.1a membership stamp — meta membership \
                  changes need a `format --meta-slots` set (a legacy set's routing width \
                  equals its volume count: every slot is its host's only slot, so there is \
                  nothing a new member could take — the W-granularity law, \
-                 design-volume-lifecycle §5.5.1/operations.md)",
-                o.path
+                 design-volume-lifecycle §5.5.1/operations.md)"
             )));
         };
-        out.push(MemberObs {
-            path: o.path,
-            stamp,
-        });
+        out.push(MemberObs { path, uuid, stamp });
     }
     let first_uuid = out[0].stamp.set_uuid;
     let first_width = out[0].stamp.routing_width;
@@ -1361,18 +1360,12 @@ pub async fn add_meta_volume_with(
     let members = observe_stamped_members(meta_lvs).await?;
     let width = members[0].stamp.routing_width;
     let old_count = members.len() as u16;
-    // Config-less sets (library/test harnesses format volumes without
-    // the bootstrap xattr) simply have no staging dirs to barrier.
-    let cfg = read_volume_format_config(meta_lvs).await.ok();
-
-    // KD-8 phase 1 BEFORE anything flips: refuse pending write custody,
-    // dual-mark the isolated staging roots so durable staged payloads
-    // REBIND across the membership change (never a discard window).
-    let staging_dirs = staging_isolated_roots(cfg.as_ref());
-    let old_gen = crate::meta_backend::volume_set_generation(meta_lvs).await?;
 
     // Resume detection: is the device already a stamped member of THIS
-    // set (a crashed prior attempt)?
+    // set (a crashed prior attempt)? Read BEFORE the config/generation
+    // probes (VL8 item 8): a stamped-ahead crash leaves the old URI
+    // refusing discovery, and the device's claim is the evidence that
+    // licenses the resume fallbacks below.
     let dev_stamp =
         match crate::meta_backend::kv::superblock::classify_volume(Path::new(device)).await {
             Ok(crate::meta_backend::kv::superblock::VolumeFormat::V3(sb)) => {
@@ -1386,6 +1379,62 @@ pub async fn add_meta_volume_with(
             }
             _ => None,
         };
+    // The §5.5.2b resume evidence: the device claims membership of THIS
+    // set at exactly count n+1 (writes 1..n of the crashed run landed).
+    let resume_evidence = dev_stamp
+        .as_ref()
+        .is_some_and(|st| usize::from(st.member_count) == meta_lvs.len() + 1);
+
+    // Config-less sets (library/test harnesses format volumes without
+    // the bootstrap xattr) simply have no staging dirs to barrier.
+    // VL8 item 8: after a stamped-ahead crash the OLD URI refuses
+    // discovery — with resume evidence, retry on the extended URI.
+    let cfg = match read_volume_format_config(meta_lvs).await {
+        Ok(c) => Some(c),
+        Err(_) if resume_evidence => {
+            let mut extended: Vec<String> = meta_lvs.to_vec();
+            extended.push(device.to_string());
+            match read_volume_format_config(&extended).await {
+                Ok(c) => Some(c),
+                Err(_) => {
+                    log::warn!(
+                        "add-meta resume: format config unreadable on both the old and \
+                         extended URIs (mid-stamp crash state) — staging rebind marks \
+                         are finalized by the next coherent run"
+                    );
+                    None
+                }
+            }
+        }
+        Err(_) => None,
+    };
+
+    // KD-8 phase 1 BEFORE anything flips: refuse pending write custody,
+    // dual-mark the isolated staging roots so durable staged payloads
+    // REBIND across the membership change (never a discard window).
+    let staging_dirs = staging_isolated_roots(cfg.as_ref());
+    let old_gen = match crate::meta_backend::volume_set_generation(meta_lvs).await {
+        Ok(g) => g,
+        Err(e) => {
+            // VL8 item 8 — the stamped-ahead crash window the VL7 rig
+            // hit: every member (old + new) already declares n+1, so the
+            // old URI refuses discovery and the same-arguments re-run
+            // used to die HERE. With the device's claim as evidence,
+            // recompute the OLD set's generation from the old members'
+            // superblock uuids in member-position order (identical to
+            // the pre-add discovery order). Without that evidence the
+            // refusal stands — it is the §5.5.1a gate working.
+            if !resume_evidence {
+                return Err(e);
+            }
+            let mut ordered: Vec<&MemberObs> = members.iter().collect();
+            ordered.sort_by_key(|m| m.stamp.member_position);
+            crate::meta_backend::generation_from_uuids(
+                &ordered.iter().map(|m| m.uuid).collect::<Vec<_>>(),
+            )
+        }
+    };
+
     let (epoch, new_position, resume) = match &dev_stamp {
         Some(st) => (st.set_epoch, st.member_position, true),
         None => (

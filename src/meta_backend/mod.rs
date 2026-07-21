@@ -2331,10 +2331,19 @@ pub fn plan_meta_slot_set(volume_count: usize, width: u32) -> Result<MetaSlotPla
 /// STAMPED set's canonical order rides `member_position`, making the
 /// generation identical under any operator URI ordering (§5.5.1a).
 pub async fn volume_set_generation(meta_lvs: &[String]) -> Result<String> {
-    use std::fmt::Write as _;
     let disc = discover_meta_set(meta_lvs).await?;
-    let mut parts = Vec::with_capacity(disc.uuids.len());
-    for uuid in &disc.uuids {
+    Ok(generation_from_uuids(&disc.uuids))
+}
+
+/// The generation string for an ordered superblock-uuid list — the join
+/// [`volume_set_generation`] performs after discovery. Public so the
+/// §5.5.2b add-meta resume path (VL8 item 8) can recompute the OLD set's
+/// generation when a crashed coordinator left the old URI refusing
+/// discovery (stamped-ahead membership counts).
+pub fn generation_from_uuids(uuids: &[[u8; 16]]) -> String {
+    use std::fmt::Write as _;
+    let mut parts = Vec::with_capacity(uuids.len());
+    for uuid in uuids {
         let mut s = String::with_capacity(3 + 32);
         s.push_str("v3:");
         for b in uuid {
@@ -2342,7 +2351,7 @@ pub async fn volume_set_generation(meta_lvs: &[String]) -> Result<String> {
         }
         parts.push(s);
     }
-    Ok(parts.join("|"))
+    parts.join("|")
 }
 
 #[cfg(test)]

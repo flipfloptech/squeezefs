@@ -386,15 +386,17 @@ EOF
 # Anything deviating from this table is a REGRESSION:
 #   PASS (deterministic): 001 008 013 069 074 075 091 112 127 263 285 469
 #                     616 617 618
-#     ... with ONE known OPEN intermittent on 074 (VL8 catalog item 1,
-#           .benchmarks/2026-07-21-vl8-stabilization-catalog.md): the
-#           fstest.4 leg (-s 10M -b 512 -mS, mmap stores + O_SYNC) can
-#           corrupt ONE 512-B unit with the PREVIOUS loop's pattern
-#           (observed 2026-07-20 run_3 and 2026-07-21 final-loop run 9 of
-#           10 — daemon logs clean both times). Distinct from the two
-#           FIXED 074 families below (zeros / stale-fill signatures).
-#           A 512-B stale-by-one-loop diff on fstest.4 = the OPEN bug;
-#           any OTHER 074 signature = a NEW regression.
+#     ... 074's THIRD family (the fstest.4 -F/-mS stale-by-one-loop unit,
+#           VL8 catalog item 1) = FIXED 2026-07-21
+#           (fix/write-wedge-and-074: open() ignored O_TRUNC while fuse3
+#           negotiates FUSE_ATOMIC_O_TRUNC — the kernel never sends the
+#           SETATTR(0) fallback, so every fstest loop's truncate was a
+#           daemon-side no-op and the previous generation's state
+#           survived into the next; pins in
+#           tests/mmap_writeback_staleness_tests.rs, counted x20 in
+#           .benchmarks/2026-07-21-wedge-and-074-fixes.md). A recurrence
+#           of the stale-by-one-loop signature on fstest.4 IS a
+#           regression, as is any other 074 diff.
 #   NOTRUN (deterministic, platform): 009 316 — both _require xfs_io fiemap;
 #                     FUSE has no FIEMAP ioctl. Kept as canaries: they start
 #                     RUNNING (and their punch/prealloc coverage arms) the
@@ -429,14 +431,18 @@ EOF
 #           to expected-PASS when that charter lands. May occasionally
 #           pass by-run (it passed the 2026-07-15 M11 sweep); a pass is
 #           NOT a regression — a DIFFERENT failure signature is.
-#           2026-07-21 (VL8 item 2): 464 can additionally WEDGE (writes
-#           in flight > 30 s forever, all threads idle-parked) — OPEN;
-#           write-only stuck-op census, so NOT the fixed cfr guard-order
-#           ABBA. The watchdog now registers copy_file_range/fallocate/
-#           open too, so any wedge capture names its holders; evidence
-#           packs: /tmp/vl8_fstests/wedge_* (013-shape, cfr holders) and
-#           /tmp/vl8_fstests/wedge464/* (464-shape, writes only), summary
-#           in .benchmarks/2026-07-21-vl8-stabilization-catalog.md.
+#           The 464 WEDGE mode (VL8 item 2 capture 2, writes-only stuck
+#           census) = FIXED 2026-07-21 (fix/write-wedge-and-074: the
+#           staged-ledger scc bucket was a second Hang-1 lock population
+#           — executor threads blocked in ledger *_sync ops while the
+#           bucket holder waited the shard write lock behind a parked
+#           §5.5 guard; ledger access is now scc *_async on executor
+#           paths). Pin: tests/staging_shard_deadlock_tests.rs
+#           (ledger_read_never_blocks_executor...); counted x10 in
+#           .benchmarks/2026-07-21-wedge-and-074-fixes.md. The watchdog
+#           additionally logs a named-holder lock-wait census whenever
+#           overdue ops exist. ANY new wedge (op in flight > 30 s
+#           forever) IS a regression — capture the census lines first.
 #   127/616 (+074 fstest.2, 075) transient-ZEROS family = FIXED
 #           (fix/staged-identity-transient-zeros; ring atomic same-key
 #           replace f924085 + staged-identity read revalidation 0a184f3).

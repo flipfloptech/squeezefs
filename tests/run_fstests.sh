@@ -386,6 +386,15 @@ EOF
 # Anything deviating from this table is a REGRESSION:
 #   PASS (deterministic): 001 008 013 069 074 075 091 112 127 263 285 469
 #                     616 617 618
+#     ... with ONE known OPEN intermittent on 074 (VL8 catalog item 1,
+#           .benchmarks/2026-07-21-vl8-stabilization-catalog.md): the
+#           fstest.4 leg (-s 10M -b 512 -mS, mmap stores + O_SYNC) can
+#           corrupt ONE 512-B unit with the PREVIOUS loop's pattern
+#           (observed 2026-07-20 run_3 and 2026-07-21 final-loop run 9 of
+#           10 — daemon logs clean both times). Distinct from the two
+#           FIXED 074 families below (zeros / stale-fill signatures).
+#           A 512-B stale-by-one-loop diff on fstest.4 = the OPEN bug;
+#           any OTHER 074 signature = a NEW regression.
 #   NOTRUN (deterministic, platform): 009 316 — both _require xfs_io fiemap;
 #                     FUSE has no FIEMAP ioctl. Kept as canaries: they start
 #                     RUNNING (and their punch/prealloc coverage arms) the
@@ -420,6 +429,14 @@ EOF
 #           to expected-PASS when that charter lands. May occasionally
 #           pass by-run (it passed the 2026-07-15 M11 sweep); a pass is
 #           NOT a regression — a DIFFERENT failure signature is.
+#           2026-07-21 (VL8 item 2): 464 can additionally WEDGE (writes
+#           in flight > 30 s forever, all threads idle-parked) — OPEN;
+#           write-only stuck-op census, so NOT the fixed cfr guard-order
+#           ABBA. The watchdog now registers copy_file_range/fallocate/
+#           open too, so any wedge capture names its holders; evidence
+#           packs: /tmp/vl8_fstests/wedge_* (013-shape, cfr holders) and
+#           /tmp/vl8_fstests/wedge464/* (464-shape, writes only), summary
+#           in .benchmarks/2026-07-21-vl8-stabilization-catalog.md.
 #   127/616 (+074 fstest.2, 075) transient-ZEROS family = FIXED
 #           (fix/staged-identity-transient-zeros; ring atomic same-key
 #           replace f924085 + staged-identity read revalidation 0a184f3).

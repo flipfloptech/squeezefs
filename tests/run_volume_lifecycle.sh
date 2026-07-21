@@ -4,7 +4,9 @@ set -euo pipefail
 # Volume-lifecycle rig — PR VL3 skeleton + PR VL4 drain/remove legs
 # (docs/design-volume-lifecycle.md §3, gates G-VL-2 + G-VL-3).
 # VL5b/VL6a/VL6b/VL7 added meta migration, fsck, repair, and defrag legs;
-# VL8 adds the interaction matrix.
+# VL9 adds leg 17 (the cross-feature interaction matrix at rig scale;
+# the canonical lifecycle soak is tests/run_lifecycle_soak.sh and the
+# counted ×10 G-VL matrices are tests/run_vl9_matrices.sh).
 #
 # Legs:
 #
@@ -1175,6 +1177,129 @@ do_mount
 do_unmount
 echo "OK: leg 16 (defrag: report-only match, D1 improvement, manifest intact)"
 
+# ---------------------------------------------------------------------------
+# Leg 17 (VL9): cross-feature interaction matrix at rig scale —
+#  (a) mover-scope serialization: whole-set defrag + volume-named defrag
+#      both QUEUE behind a running drain (job_serialized_waits is the
+#      engagement instrument); the whole-set mover completes after the
+#      drain, the mover NAMING the (by then retired) victim fails loud
+#      with the placement-eligibility refusal (never a silent no-op);
+#  (b) meta-slot-migrate + data-drain concurrently: both converge on a
+#      live mount (the cutover gate parks meta ops, never fabric
+#      workers), manifest byte-identical, post fsck clean.
+#  (The R5-Red job-pause pin is DELIBERATELY cargo-only —
+#  tests/interaction_tests.rs charges the job_copy_buffers gauge
+#  deterministically; the rig has no honest way to conjure real memory
+#  pressure without faking the budget.)
+# ---------------------------------------------------------------------------
+note "Leg 17a: mover serialization behind a live drain + named-victim refusal"
+
+fresh_drain_rig "interact" 6 16
+
+WAITS_BEFORE="$(stats_field job_serialized_waits)"
+"$BIN" volume remove-data "$MNT" oss2 --throttle 10 \
+    || fail "leg 17a: remove-data must admit"
+[ "$(vol_state_live oss2)" = "draining" ] || fail "leg 17a: oss2 must be draining"
+
+# Both movers intersect the drain's scope: the whole-set defrag must
+# queue-then-complete; the oss2-named defrag must queue-then-fail-loud
+# (its victim retires under it — placement-ineligible at plan time).
+"$BIN" defrag "$MNT" --data --throttle 100 >"$RIG/defrag_all.out" 2>&1 &
+DEFRAG_ALL_PID=$!
+"$BIN" defrag "$MNT" --data --volume oss2 --throttle 100 >"$RIG/defrag_oss2.out" 2>&1 &
+DEFRAG_OSS2_PID=$!
+
+# Engagement: both deferred movers count a serialization episode while
+# the drain still runs.
+SER_DEADLINE=$((SECONDS + 60))
+while :; do
+    WAITS_NOW="$(stats_field job_serialized_waits)"
+    [ "$WAITS_NOW" -ge $((WAITS_BEFORE + 2)) ] && break
+    [ "$(vol_state_live oss2)" = "draining" ] \
+        || fail "leg 17a: drain finished before the serialization window was observed"
+    [ $SECONDS -lt $SER_DEADLINE ] \
+        || fail "leg 17a: job_serialized_waits never moved ($WAITS_BEFORE -> $WAITS_NOW) — the movers did not serialize"
+    sleep 0.5
+done
+echo "    serialization observed: job_serialized_waits $WAITS_BEFORE -> $WAITS_NOW (drain still draining)"
+
+# Unthrottle the drain; everything then resolves.
+EVAC_ID="$("$BIN" job list "$MNT" | python3 -c '
+import json, sys
+rows = json.loads(sys.stdin.read())
+live = [r for r in rows if r["state"] in ("queued", "running")
+        and "evacuate_volume" in json.dumps(r.get("job_type"))]
+print(live[0]["job_id"] if live else "")
+')"
+[ -n "$EVAC_ID" ] && "$BIN" job throttle "$MNT" "$EVAC_ID" 100 >/dev/null || true
+wait_vol_state_live oss2 retired 240
+
+if ! wait "$DEFRAG_ALL_PID"; then
+    cat "$RIG/defrag_all.out" >&2
+    fail "leg 17a: the whole-set defrag must COMPLETE once the drain releases its scope"
+fi
+if wait "$DEFRAG_OSS2_PID"; then
+    cat "$RIG/defrag_oss2.out" >&2
+    fail "leg 17a: defrag naming the drained volume must FAIL loud, not succeed"
+fi
+grep -qi "failed" "$RIG/defrag_oss2.out" \
+    || fail "leg 17a: the named-victim refusal must be loud: $(cat "$RIG/defrag_oss2.out")"
+(cd "$MNT/dataset" && sha256sum -c "$RIG/manifest.sha256" --quiet) \
+    || fail "leg 17a: manifest mismatch across the serialized mover pileup"
+do_unmount
+echo "OK: leg 17a (serialize behind drain: whole-set completed, named victim refused loud)"
+
+note "Leg 17b: meta-slot-migrate + data-drain concurrently (both converge)"
+
+RIG="$BASE/interactmeta"
+MNT="$BASE/interactmeta_mnt"
+LOG="$RIG/mount.log"
+mkdir -p "$RIG/staging" "$MNT"
+truncate -s 256M "$RIG/meta1"
+truncate -s 256M "$RIG/meta2"
+truncate -s 8G   "$RIG/oss1"
+truncate -s 8G   "$RIG/oss2"
+"$BIN" format "sqmeta://$RIG/meta1,$RIG/meta2" "sqdata://$RIG/oss1,$RIG/oss2" \
+    --disk-cache-paths "$RIG/staging" --meta-slots 8 --force >/dev/null
+do_mount_uri "sqmeta://$RIG/meta1,$RIG/meta2"
+mkdir -p "$MNT/dataset"
+for i in $(seq 1 6); do
+    dd if=/dev/urandom of="$MNT/dataset/f$i.bin" bs=1M count=16 status=none
+done
+sync -f "$MNT"
+(cd "$MNT/dataset" && sha256sum f*.bin) >"$RIG/manifest.sha256"
+
+"$BIN" volume remove-data "$MNT" oss2 --throttle 10 \
+    || fail "leg 17b: remove-data must admit"
+[ "$(vol_state_live oss2)" = "draining" ] || fail "leg 17b: oss2 must be draining"
+
+"$BIN" volume migrate-meta-slot "$MNT" 1 0 >/dev/null \
+    || fail "leg 17b: migrate-meta-slot must admit beside a live drain"
+MIG_DEADLINE=$((SECONDS + 120))
+until [ "$(stats_field meta_slot_migrations)" -ge 1 ]; do
+    [ $SECONDS -lt $MIG_DEADLINE ] \
+        || fail "leg 17b: slot migration did not converge beside the drain"
+    sleep 0.5
+done
+STATE="$(vol_state_live oss2)"
+[ "$STATE" = "draining" ] || [ "$STATE" = "retired" ] \
+    || fail "leg 17b: drain state lost during the slot migration (got $STATE)"
+echo "    slot migration converged while the drain ran (cutover $(stats_field meta_slot_cutover_ms_max) ms)"
+
+EVAC_ID="$("$BIN" job list "$MNT" | python3 -c '
+import json, sys
+rows = json.loads(sys.stdin.read())
+live = [r for r in rows if r["state"] in ("queued", "running", "paused")]
+print(live[0]["job_id"] if live else "")
+')"
+[ -n "$EVAC_ID" ] && "$BIN" job throttle "$MNT" "$EVAC_ID" 100 >/dev/null || true
+wait_vol_state_live oss2 retired 240
+(cd "$MNT/dataset" && sha256sum -c "$RIG/manifest.sha256" --quiet) \
+    || fail "leg 17b: manifest mismatch after migrate+drain"
+"$BIN" fsck "$MNT" | grep -q "findings: 0" || fail "leg 17b: post-pair fsck not clean"
+do_unmount
+echo "OK: leg 17b (slot migration + drain both converged, manifest intact, fsck clean)"
+
 echo "==============================================================="
-echo "VOLUME LIFECYCLE RIG (VL3 + VL4 + VL4b + VL5b + VL6a + VL6b + VL7 legs) PASSED (kill-9 LOOPS=$LOOPS)"
+echo "VOLUME LIFECYCLE RIG (VL3 + VL4 + VL4b + VL5b + VL6a + VL6b + VL7 + VL9 legs) PASSED (kill-9 LOOPS=$LOOPS)"
 echo "==============================================================="

@@ -89,6 +89,15 @@ set -euo pipefail
 #     plain volume: per-arm counters asserted (100 % readability-only —
 #     the KD-17 honesty gauge; zero failures/findings).
 #
+#   Leg 15 (VL6b, offline): seed-corrupt ⇒ repair ⇒ re-fsck clean ⇒
+#     manifest intact (G-VL-5(d) at rig scale). Offline-seedable
+#     classes: a crafted C4 orphan custody record + a C5 stale
+#     generation marker. `fsck --repair` (dry run, the default) plans
+#     and mutates NOTHING (re-fsck still finds); `fsck --repair
+#     --apply` (the guarded D0 open) quarantines-first + repairs;
+#     re-fsck reports findings: 0; the quarantine manifest lists the
+#     copies; remount reads the dataset back byte-identical.
+#
 # Unprivileged posture (the preload-gate precedent): file-backed volumes
 # + a user-owned mountpoint; root is NOT required.
 #
@@ -944,6 +953,110 @@ print({k: v for k, v in c.items() if k.startswith("scrub_")})
 do_unmount
 echo "OK: leg 14 (scrub per-arm counters, readability-only honesty gauge)"
 
+# ---------------------------------------------------------------------------
+# Leg 15 (VL6b): offline seed-corrupt ⇒ fsck reports ⇒ --repair (dry run,
+# nothing mutates) ⇒ --repair --apply (guarded open, quarantine-first) ⇒
+# re-fsck CLEAN ⇒ manifest byte-identical (G-VL-5(d) at rig scale)
+# ---------------------------------------------------------------------------
+note "Leg 15: fsck --repair --apply (offline seed => repair => clean => manifest)"
+
+fresh_drain_rig "repair" 4 8
+sync -f "$MNT"
+do_unmount
+
+# Like retry_guarded, but findings-tolerant: fsck exits 1 WITH a report
+# when findings exist — only the live-writer refusal is retried.
+fsck_when_free() { # fsck_when_free <deadline-secs> <cmd...> ; sets FSCK_OUT/FSCK_RC
+    local deadline=$((SECONDS + $1)); shift
+    while true; do
+        FSCK_RC=0
+        FSCK_OUT="$("$@" 2>&1)" || FSCK_RC=$?
+        if ! echo "$FSCK_OUT" | grep -q "actively mounted by clients"; then
+            return 0
+        fi
+        [ $SECONDS -lt $deadline ] \
+            || fail "leg 15: fsck kept refusing past the staleness TTL: $FSCK_OUT"
+        echo "    (waiting for the unmounted daemon's heartbeat records to go stale...)" >&2
+        sleep 5
+    done
+}
+
+# Seed C4: a crafted orphan custody record (the writer geometry — magic,
+# key_len, val_len, key, payload; byte alignment for a sub-4KiB shard).
+python3 - "$RIG/staging/staging_segment/seeded_leg15" <<'EOF'
+import struct, sys, os
+key = b"active_block_ext:inode_9999990:block_0"
+val = b"leg15-payload"
+img = struct.pack("<III", 0xCAFEBABE, len(key), len(val)) + key + val
+os.makedirs(os.path.dirname(sys.argv[1]), exist_ok=True)
+with open(sys.argv[1], "wb") as f:
+    f.write(img)
+    f.flush(); os.fsync(f.fileno())
+EOF
+# Seed C5: rebind the staging generation marker to a dead generation.
+python3 - "$RIG/staging/.squeezefs_generation" <<'EOF'
+import os, sys
+lines = open(sys.argv[1]).read().splitlines()
+assert lines and lines[0] == "squeezefs-staging-generation-v1", lines
+with open(sys.argv[1], "w") as f:
+    f.write(lines[0] + "\nv3:deadbeefdeadbeefdeadbeefdeadbeef\n")
+    f.flush(); os.fsync(f.fileno())
+EOF
+
+# 1. Detection: both seeds are findings (exit 1 by the fsck convention).
+fsck_when_free 90 "$BIN" fsck "sqmeta://$RIG/meta1" --offline
+[ "$FSCK_RC" -ne 0 ] || fail "leg 15: seeded corruption must exit nonzero: $FSCK_OUT"
+echo "$FSCK_OUT" | grep -q '\[C4\]' || fail "leg 15: C4 orphan not reported: $FSCK_OUT"
+echo "$FSCK_OUT" | grep -q '\[C5\]' || fail "leg 15: C5 stale generation not reported: $FSCK_OUT"
+
+# 2. Dry run (the --repair default): the plan prints, NOTHING mutates.
+fsck_when_free 90 "$BIN" fsck "sqmeta://$RIG/meta1" --offline --repair
+[ "$FSCK_RC" -ne 0 ] || fail "leg 15: dry run with findings must exit nonzero"
+echo "$FSCK_OUT" | grep -q "DRY RUN" || fail "leg 15: dry run must say so: $FSCK_OUT"
+[ -f "$RIG/staging/staging_segment/seeded_leg15" ] \
+    || fail "leg 15: dry run must not touch the seeded record"
+[ ! -d "$RIG/staging/quarantine" ] \
+    || fail "leg 15: dry run must not create a quarantine"
+fsck_when_free 90 "$BIN" fsck "sqmeta://$RIG/meta1" --offline
+[ "$FSCK_RC" -ne 0 ] || fail "leg 15: dry run must not have repaired anything"
+
+# 3. Apply (guarded D0 open): quarantine-first per-class repair.
+fsck_when_free 90 "$BIN" fsck "sqmeta://$RIG/meta1" --offline --repair --apply
+[ "$FSCK_RC" -ne 0 ] || fail "leg 15: apply run still reports its findings (exit 1)"
+echo "$FSCK_OUT" | grep -q "repair (applied)" || fail "leg 15: apply must apply: $FSCK_OUT"
+echo "$FSCK_OUT" | grep -q "done  \[C4\]" || fail "leg 15: C4 not applied: $FSCK_OUT"
+echo "$FSCK_OUT" | grep -q "done  \[C5\]" || fail "leg 15: C5 not applied: $FSCK_OUT"
+
+# 4. Re-fsck: CLEAN (exit 0, findings: 0).
+fsck_when_free 90 "$BIN" fsck "sqmeta://$RIG/meta1" --offline
+[ "$FSCK_RC" -eq 0 ] || fail "leg 15: re-fsck after apply must be clean: $FSCK_OUT"
+echo "$FSCK_OUT" | grep -q "findings: 0" || fail "leg 15: re-fsck not clean: $FSCK_OUT"
+
+# 5. Quarantine manifest: the copies are listed and present.
+QMANIFEST="$(ls "$RIG"/staging/quarantine/*/manifest.json 2>/dev/null | head -1)"
+[ -n "$QMANIFEST" ] || fail "leg 15: no quarantine manifest written"
+python3 - "$QMANIFEST" <<'EOF' || exit 1
+import json, os, sys
+m = json.load(open(sys.argv[1]))
+classes = {e["class"] for e in m["entries"]}
+assert "C4" in classes and "C5" in classes, f"manifest classes: {classes}"
+qdir = os.path.dirname(sys.argv[1])
+for e in m["entries"]:
+    for f in e["files"]:
+        p = os.path.join(qdir, f["name"])
+        assert os.path.getsize(p) == f["bytes"], f"quarantined file mismatch: {p}"
+EOF
+echo "    OK: quarantine manifest lists the C4 + C5 copies verbatim"
+
+# 6. The data manifest survives the repair byte-identically.
+do_mount
+(cd "$MNT/dataset" && sha256sum -c "$RIG/manifest.sha256" --quiet) \
+    || fail "leg 15: dataset manifest mismatch after repair"
+# ...and a mounted-side fsck agrees the volume is clean.
+"$BIN" fsck "$MNT" | grep -q "findings: 0" || fail "leg 15: online post-repair fsck not clean"
+do_unmount
+echo "OK: leg 15 (seed => detect => dry-run => apply => re-fsck clean => manifest intact)"
+
 echo "==============================================================="
-echo "VOLUME LIFECYCLE RIG (VL3 + VL4 + VL4b + VL5b + VL6a legs) PASSED (kill-9 LOOPS=$LOOPS)"
+echo "VOLUME LIFECYCLE RIG (VL3 + VL4 + VL4b + VL5b + VL6a + VL6b legs) PASSED (kill-9 LOOPS=$LOOPS)"
 echo "==============================================================="

@@ -590,6 +590,62 @@ async fn merge_bases_on_dirty_ram_authority_never_the_lagging_backend() {
     );
 }
 
+/// Face 6 — steady-state frees of UNTRACKED offsets are refused (the
+/// double-free containment). After mount recovery every legitimately
+/// freeable block carries a refcount entry (allocation seeds it; the
+/// recovery walk seeds every live reference), so a steady-state free of
+/// an offset with NO entry is the second half of a double-release — the
+/// lineage that, interleaved with an allocation, mints one offset to two
+/// live owners. Refusal is the leak-safe direction: loud, counted
+/// (block_untracked_free_refusals), and the offset never re-enters the
+/// free list on a stale release. The remaining deep unification of the
+/// staged-layout commit families stays chartered (see the evidence
+/// note); this pin makes the mint IMPOSSIBLE meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn untracked_free_is_refused_never_a_second_release() {
+    let _g = serial().await;
+    let h = make(*b"rw5a_untracked!!", "rw5a_untrack", "64MB").await;
+    let (be_id, alloc, writer) = h.fs.router.backend_router.get_active_backend().unwrap();
+    let off = alloc.allocate_block().await.unwrap();
+    let img = h
+        .fs
+        .router
+        .get_crypto()
+        .process_write_async(bytes::Bytes::from(pat(4096, 0x99)))
+        .await
+        .unwrap();
+    writer.write_block(off, img).await.unwrap();
+    alloc.publish_block(off);
+    let key = h.fs.router.backend_router.persist_block_key(&be_id, off);
+
+    // Free #1: legitimate terminal release.
+    h.fs.router.backend_router.free_block(&key).await.unwrap();
+    let dfs_before = METRICS.block_double_frees.load(Ordering::Relaxed);
+
+    // Free #2: the stale double-release. It must be REFUSED (no free-list
+    // re-insert, no double-free tripwire) and counted.
+    let refusals_before = METRICS.block_untracked_free_refusals.load(Ordering::Relaxed);
+    h.fs.router.backend_router.free_block(&key).await.unwrap();
+    let refusals_after = METRICS.block_untracked_free_refusals.load(Ordering::Relaxed);
+    assert!(
+        refusals_after > refusals_before,
+        "a second release of a freed offset must be refused-and-counted \
+         ({refusals_before} -> {refusals_after})"
+    );
+    assert_eq!(
+        METRICS.block_double_frees.load(Ordering::Relaxed),
+        dfs_before,
+        "the refused release must never reach the free list"
+    );
+
+    // The offset stays allocatable exactly once and the machinery stays
+    // sane: realloc it, free it, realloc again.
+    let off2 = alloc.allocate_block().await.unwrap();
+    assert_eq!(off, off2, "the single free-list entry is reusable");
+    alloc.publish_block(off2);
+    h.fs.router.backend_router.free_block(&key).await.unwrap();
+}
+
 /// Face 3a — RELEASE keeps the shared op lease while other handles are
 /// open: the fencing token must NOT bump across close-while-open + write
 /// (the 464 FencingTokenExpired{N, N+1} storm generator).

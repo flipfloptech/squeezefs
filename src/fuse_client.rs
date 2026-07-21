@@ -1956,6 +1956,15 @@ pub struct Metrics {
     /// offset (the release_superseded double-free family). MUST STAY 0 —
     /// growth means an offset can be minted to two live owners.
     pub block_double_frees: Align64<AtomicU64>,
+    /// FIND-RW5-A face 6 containment: a steady-state free of a refcount-
+    /// UNTRACKED offset was REFUSED instead of released. At steady state
+    /// every legitimately freeable offset is tracked (allocation seeds the
+    /// count; the mount recovery walk seeds every live reference), so an
+    /// untracked free is the second half of a double-release — refusing it
+    /// is what makes the two-live-owner mint impossible. Growth is loud
+    /// evidence of a double-release lineage upstream (leak-safe: the block
+    /// leaks until fsck C6, it is never handed to two owners).
+    pub block_untracked_free_refusals: Align64<AtomicU64>,
     /// FIND-RW4-A store-raw escape: block images whose compressed form
     /// would not shrink (incompressible payloads) stored RAW behind the
     /// frame's raw marker — compression is best-effort per block, never a
@@ -4054,6 +4063,7 @@ impl SqueezefsFilesystem {
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
                 "staged_spill_escalations": METRICS.staged_spill_escalations.load(Ordering::Relaxed),
                 "block_double_frees": METRICS.block_double_frees.load(Ordering::Relaxed),
+                "block_untracked_free_refusals": METRICS.block_untracked_free_refusals.load(Ordering::Relaxed),
                 "layout_striped_writes": METRICS.layout_striped_writes.load(Ordering::Relaxed),
                 "compress_stored_raw": METRICS.compress_stored_raw.load(Ordering::Relaxed),
                 "bg_spawn_admitted": METRICS.bg_spawn_admitted.load(Ordering::Relaxed),

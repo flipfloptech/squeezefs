@@ -1249,3 +1249,125 @@ async fn test_remove_meta_capacity_preflight_refuses_honestly() {
     // Nothing was touched: the original set still mounts coherently.
     discover_meta_set(&paths).await.expect("set untouched");
 }
+
+// ---------------------------------------------------------------------------
+// VL8 item 8 — §5.5.2b add-meta crash windows: the documented SAME-ARGUMENTS
+// re-run must CONVERGE, not refuse. Found by the VL7 rig (leg 11 loop 3,
+// kill at ~0.7 s): a coordinator killed after stamping the (n+1)-member set
+// left a re-run refusing with "stamps declare 3 members but the URI lists 2".
+// ---------------------------------------------------------------------------
+
+/// The stamped-ahead window (crash after writes 2..n, before teardown +
+/// staging finalize + config mirror): every stamp already declares 3
+/// members. The re-run with the SAME arguments (old 2-member URI + the new
+/// device) must detect the stamped-ahead state and converge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_add_meta_rerun_converges_after_survivor_stamps_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let metas = vec![
+        make_file(dir.path(), "m0", VOL_LEN),
+        make_file(dir.path(), "m1", VOL_LEN),
+    ];
+    format_stamped_set(&metas, 8).await;
+    let paths = uris(&metas);
+
+    let routed = open_routed_meta_set(&paths).await.expect("open");
+    let made = populate(&routed, 3, 5).await;
+    let digest_before = set_logical_digest(&routed).await.expect("digest");
+    shutdown_routed(&routed).await;
+    drop(routed);
+
+    // Crash the coordinator AFTER every member is stamped @count 3.
+    let m2 = make_file(dir.path(), "m2", VOL_LEN);
+    let err = squeezefs::config_ops::add_meta_volume_with(
+        &paths,
+        &m2.display().to_string(),
+        &squeezefs::config_ops::TakeSlots::Count(2),
+        &squeezefs::config_ops::AddMetaHooks {
+            crash_after: Some(squeezefs::config_ops::AddMetaCrash::SurvivorStamps),
+        },
+    )
+    .await
+    .expect_err("the crash seam must abort the coordinator");
+    assert!(
+        format!("{err}").contains("crash injection"),
+        "seam abort, not a real failure: {err}"
+    );
+
+    // The documented recovery: re-run with the SAME arguments.
+    let taken = squeezefs::config_ops::add_meta_volume(
+        &paths,
+        &m2.display().to_string(),
+        &squeezefs::config_ops::TakeSlots::Count(2),
+    )
+    .await
+    .expect("the same-arguments re-run must converge (§5.5.2b)");
+    assert_eq!(taken.len(), 2, "resumed claim slots: {taken:?}");
+
+    // The converged 3-member set mounts with every ino stable, diff ∅.
+    let mut new_paths = paths.clone();
+    new_paths.push(m2.display().to_string());
+    let routed = open_routed_meta_set(&new_paths).await.expect("open new set");
+    verify_population(&routed, &made).await;
+    assert_eq!(
+        set_logical_digest(&routed).await.expect("digest"),
+        digest_before,
+        "logical diff ∅ across the crashed-then-resumed add-meta"
+    );
+    shutdown_routed(&routed).await;
+    drop(routed);
+}
+
+/// The claim window (crash after write 1 — the new member's durable claim —
+/// before any survivor re-stamp): survivors still declare the old count.
+/// The same-arguments re-run resumes the claim and converges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_add_meta_rerun_converges_after_new_member_claim_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let metas = vec![
+        make_file(dir.path(), "m0", VOL_LEN),
+        make_file(dir.path(), "m1", VOL_LEN),
+    ];
+    format_stamped_set(&metas, 8).await;
+    let paths = uris(&metas);
+
+    let routed = open_routed_meta_set(&paths).await.expect("open");
+    let made = populate(&routed, 2, 4).await;
+    let digest_before = set_logical_digest(&routed).await.expect("digest");
+    shutdown_routed(&routed).await;
+    drop(routed);
+
+    let m2 = make_file(dir.path(), "m2", VOL_LEN);
+    let err = squeezefs::config_ops::add_meta_volume_with(
+        &paths,
+        &m2.display().to_string(),
+        &squeezefs::config_ops::TakeSlots::Count(2),
+        &squeezefs::config_ops::AddMetaHooks {
+            crash_after: Some(squeezefs::config_ops::AddMetaCrash::NewMemberClaim),
+        },
+    )
+    .await
+    .expect_err("the crash seam must abort the coordinator");
+    assert!(format!("{err}").contains("crash injection"), "{err}");
+
+    let taken = squeezefs::config_ops::add_meta_volume(
+        &paths,
+        &m2.display().to_string(),
+        &squeezefs::config_ops::TakeSlots::Count(2),
+    )
+    .await
+    .expect("the same-arguments re-run must converge (§5.5.2b)");
+    assert_eq!(taken.len(), 2, "resumed claim slots: {taken:?}");
+
+    let mut new_paths = paths.clone();
+    new_paths.push(m2.display().to_string());
+    let routed = open_routed_meta_set(&new_paths).await.expect("open new set");
+    verify_population(&routed, &made).await;
+    assert_eq!(
+        set_logical_digest(&routed).await.expect("digest"),
+        digest_before,
+        "logical diff ∅ across the crashed-then-resumed add-meta"
+    );
+    shutdown_routed(&routed).await;
+    drop(routed);
+}

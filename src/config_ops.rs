@@ -1298,6 +1298,27 @@ async fn slot_record_count(path: &str, slot: u16, native: Option<u16>) -> Result
     Ok(n)
 }
 
+/// §5.5.2b crash-injection seams for [`add_meta_volume`] (the
+/// `MigrationTestHooks` precedent): `None` everywhere in production; a
+/// test aborts the coordinator at a named window and proves the
+/// documented same-arguments re-run converges (VL8 item 8).
+#[derive(Default)]
+pub struct AddMetaHooks {
+    pub crash_after: Option<AddMetaCrash>,
+}
+
+/// The named §5.5.2b add-meta crash windows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AddMetaCrash {
+    /// After write 1 — the new member's durable claim @E — before any
+    /// survivor re-stamp (survivors still declare the old count).
+    NewMemberClaim,
+    /// After writes 2..n — every survivor stamped @E, count n+1 —
+    /// before source-keyspace teardown + staging finalize + config
+    /// mirror (the "stamped-ahead" window the VL7 rig hit).
+    SurvivorStamps,
+}
+
 /// `squeezefs volume add-meta` — the OFFLINE D0-guarded coordinator
 /// (design-volume-lifecycle §5.5.2 Add, the VL4 `remove_data_volume_
 /// offline` posture): KD-8 staging barrier → format the new member →
@@ -1310,6 +1331,16 @@ pub async fn add_meta_volume(
     meta_lvs: &[String],
     device: &str,
     take: &TakeSlots,
+) -> Result<Vec<u16>> {
+    add_meta_volume_with(meta_lvs, device, take, &AddMetaHooks::default()).await
+}
+
+/// [`add_meta_volume`] with the §5.5.2b crash seams exposed.
+pub async fn add_meta_volume_with(
+    meta_lvs: &[String],
+    device: &str,
+    take: &TakeSlots,
+    hooks: &AddMetaHooks,
 ) -> Result<Vec<u16>> {
     use crate::meta_backend::kv::backend::KvMetaBackend;
     use crate::meta_backend::slot_migration::{
@@ -1555,6 +1586,11 @@ pub async fn add_meta_volume(
             .checkpoint_now()
             .await
             .map_err(|e| SqueezefsError::InvalidOperation(format!("claim write failed: {e}")))?;
+        if hooks.crash_after == Some(AddMetaCrash::NewMemberClaim) {
+            return Err(SqueezefsError::InvalidOperation(
+                "crash injection (add-meta: after new member claim)".to_string(),
+            ));
+        }
 
         // Write 2..n: every OLD member's stamp @E (count n+1, minus the
         // slots it lost).
@@ -1574,6 +1610,11 @@ pub async fn add_meta_volume(
             be.checkpoint_now().await.map_err(|e| {
                 SqueezefsError::InvalidOperation(format!("member re-stamp failed: {e}"))
             })?;
+        }
+        if hooks.crash_after == Some(AddMetaCrash::SurvivorStamps) {
+            return Err(SqueezefsError::InvalidOperation(
+                "crash injection (add-meta: after survivor stamps)".to_string(),
+            ));
         }
 
         // Teardown: the sources' now-guest-hosted keyspaces.

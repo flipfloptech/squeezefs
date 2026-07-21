@@ -357,3 +357,82 @@ async fn test_read_block_exceeds_pool_size() {
     let err_str = result.err().unwrap().to_string();
     assert!(err_str.contains("exceeds pool buffer size"));
 }
+
+/// VL8 item 5 — a read entirely past EOF on a file-backed substrate returns
+/// 0 bytes from the kernel; the completion path must NOT report success with
+/// recycled pool-buffer bytes. Real block devices are all-or-EIO; the short
+/// read is the file-backed-substrate silent-garbage class.
+#[tokio::test]
+async fn test_read_past_eof_errors_instead_of_recycled_garbage() {
+    let _serial = serial().await;
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+    let file = File::create(&path).unwrap();
+    let file_len: u64 = 1024 * 1024; // 1 MiB backing file
+    file.set_len(file_len).unwrap();
+
+    let dev = NvmeBlockDev::new(path.to_str().unwrap());
+
+    // Prime a pool buffer with a recognizable pattern via a real
+    // write+read cycle so a recycled buffer would carry 0xEE garbage.
+    let pattern = vec![0xEEu8; 4096];
+    dev.write_block(0, bytes::Bytes::from(pattern.clone()))
+        .await
+        .expect("in-range write must succeed");
+    let read_back = dev
+        .read_block(0, 4096)
+        .await
+        .expect("in-range read must succeed");
+    assert_eq!(read_back.as_ref(), pattern.as_slice());
+
+    // Read entirely past EOF: kernel returns 0 bytes. This must be a loud
+    // error, never Ok(recycled bytes).
+    let res = dev.read_block(file_len, 4096).await;
+    match res {
+        Err(_) => {} // correct: loud failure
+        Ok(bytes) => panic!(
+            "past-EOF read reported success with {} bytes (first byte {:#x}) — silent garbage",
+            bytes.len(),
+            bytes.first().copied().unwrap_or(0)
+        ),
+    }
+}
+
+/// VL8 item 5 — a read straddling EOF returns a SHORT count from the kernel;
+/// success must not be reported for the full requested size (the tail would
+/// be recycled pool-buffer bytes).
+#[tokio::test]
+async fn test_read_straddling_eof_errors_instead_of_garbage_tail() {
+    let _serial = serial().await;
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+    let file = File::create(&path).unwrap();
+    let file_len: u64 = 1024 * 1024;
+    file.set_len(file_len).unwrap();
+
+    let dev = NvmeBlockDev::new(path.to_str().unwrap());
+
+    // Fill the last 2 KiB of the file with a known pattern.
+    let valid = vec![0x5Au8; 2048];
+    dev.write_block(file_len - 2048, bytes::Bytes::from(valid))
+        .await
+        .expect("in-range write must succeed");
+
+    // Prime pool recycling with a distinct garbage pattern.
+    let garbage = vec![0xEEu8; 4096];
+    dev.write_block(0, bytes::Bytes::from(garbage))
+        .await
+        .expect("in-range write must succeed");
+    let _ = dev.read_block(0, 4096).await.expect("prime read");
+
+    // 4 KiB read whose second half is past EOF ⇒ kernel returns 2048.
+    let res = dev.read_block(file_len - 2048, 4096).await;
+    match res {
+        Err(_) => {} // correct: exact-length contract, short ⇒ loud error
+        Ok(bytes) => panic!(
+            "straddling-EOF read reported success with {} bytes; tail byte {:#x} — garbage tail",
+            bytes.len(),
+            bytes.last().copied().unwrap_or(0)
+        ),
+    }
+}

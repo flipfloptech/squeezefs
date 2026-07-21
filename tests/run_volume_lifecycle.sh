@@ -1078,7 +1078,24 @@ echo "OK: leg 15 (seed => detect => dry-run => apply => re-fsck clean => manifes
 # ---------------------------------------------------------------------------
 note "Leg 16: defrag (fragment => report-only matches => --data => gauges improve => manifest)"
 
-fresh_drain_rig "defrag" 24 8
+# SINGLE data volume, deliberately: the G-VL-6 synthetic-fragmentation
+# fixture needs interleaved deletes to interleave ON THE DEVICE — a
+# 2-volume set's placement can cluster alternating files per volume and
+# leave each volume's free space nearly contiguous (observed: 0.909).
+RIG="$BASE/defrag"
+MNT="$BASE/defrag_mnt"
+LOG="$RIG/mount.log"
+mkdir -p "$RIG/staging" "$MNT"
+truncate -s 256M "$RIG/meta1"
+truncate -s 8G   "$RIG/oss1"
+"$BIN" format "sqmeta://$RIG/meta1" "sqdata://$RIG/oss1" \
+    --disk-cache-paths "$RIG/staging" --force >/dev/null
+do_mount
+mkdir -p "$MNT/dataset"
+for i in $(seq 1 24); do
+    dd if=/dev/urandom of="$MNT/dataset/f$i.bin" bs=1M count=8 status=none
+done
+sync -f "$MNT"
 
 # Fragment: delete every other file (interleaved alloc/free), keep a
 # survivor manifest.
@@ -1109,15 +1126,15 @@ echo "    fragmented: frag_d1_contiguity=$C"
 
 # 1. --report-only matches the live gauges (the G-VL-6 census-match
 #    clause at rig scale; the cargo suite pins the independent census).
-REPORT="$("$BIN" defrag "$MNT" --report-only --json)"
+"$BIN" defrag "$MNT" --report-only --json >"$RIG/report_before.json"
 STATS_C="$(frag_gauge frag_d1_contiguity)"
 STATS_T="$(frag_gauge frag_d1_reclaimable_tail)"
-echo "$REPORT" | python3 - "$STATS_C" "$STATS_T" <<'EOF' || fail "leg 16: report-only does not match the live gauges"
+python3 - "$RIG/report_before.json" "$STATS_C" "$STATS_T" <<'EOF' || fail "leg 16: report-only does not match the live gauges"
 import json, sys
-r = json.load(sys.stdin)
+r = json.load(open(sys.argv[1]))
 worst_c = min(v["contiguity"] for v in r["d1"])
 worst_t = min(v["reclaimable_tail"] for v in r["d1"])
-sc, st = float(sys.argv[1]), float(sys.argv[2])
+sc, st = float(sys.argv[2]), float(sys.argv[3])
 # The gauges are permille-coded and refresh on cadence around the report.
 assert abs(worst_c - sc) < 0.05, f"contiguity: report {worst_c} vs gauge {sc}"
 assert abs(worst_t - st) < 0.05, f"tail: report {worst_t} vs gauge {st}"
@@ -1132,10 +1149,10 @@ MOVED_AFTER="$(stats_field defrag_blocks_moved)"
 [ "$MOVED_AFTER" -gt "$MOVED_BEFORE" ] \
     || fail "leg 16: engagement — defrag_blocks_moved did not move ($MOVED_BEFORE -> $MOVED_AFTER)"
 
-REPORT="$("$BIN" defrag "$MNT" --report-only --json)"
-echo "$REPORT" | python3 - <<'EOF' || fail "leg 16: defrag --data must reach D1 >= 0.9 and tail >= 0.9"
+"$BIN" defrag "$MNT" --report-only --json >"$RIG/report_after.json"
+python3 - "$RIG/report_after.json" <<'EOF' || fail "leg 16: defrag --data must reach D1 >= 0.9 and tail >= 0.9"
 import json, sys
-r = json.load(sys.stdin)
+r = json.load(open(sys.argv[1]))
 worst_c = min(v["contiguity"] for v in r["d1"])
 worst_t = min(v["reclaimable_tail"] for v in r["d1"])
 assert worst_c >= 0.9, f"post-defrag contiguity {worst_c}"

@@ -92,6 +92,14 @@ pub trait Metadata: Send + Sync {
         flags: u32,
     ) -> Result<()>;
     async fn readdir(&self, dir: Ino, offset: u64, max: usize) -> Result<Vec<DirEntry>>;
+    /// Fetch the inode's attributes.
+    ///
+    /// **4a locking (VL8 item 6):** the [`RoutedMetaBackend`] implementation
+    /// takes a **shared** 4a DLM lease on `I{ino}` internally. Callers that
+    /// already hold the **exclusive** lease on the same stripe must NOT call
+    /// this — the internal shared acquisition self-deadlocks against the
+    /// caller's exclusive guard. Read the inode through the already-held
+    /// guard's path instead (e.g. `read_inode_routed`), as VL6a's fsck does.
     async fn getattr(&self, ino: Ino) -> Result<Inode>;
     async fn setattr(
         &self,
@@ -1810,6 +1818,8 @@ impl Metadata for RoutedMetaBackend {
         self.volumes[v_idx].readdir(local_dir, offset, max).await
     }
 
+    // Takes a SHARED 4a lease internally — see the trait-level doc note
+    // (VL8 item 6): exclusive-lease holders on the same stripe self-deadlock.
     async fn getattr(&self, ino: Ino) -> Result<Inode> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;

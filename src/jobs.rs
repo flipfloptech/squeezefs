@@ -690,7 +690,11 @@ async fn census_for(
                     bincode::deserialize(&bytes).ok()
                 };
                 let Some(layout) = layout else { continue };
-                let global_ino = meta.make_global_ino(local_ino, vol_idx);
+                // Guest-only members carry raw CONTROL records with no
+                // global encoding — skip them (VL9 soak-found panic).
+                let Some(global_ino) = meta.try_make_global_ino(local_ino, vol_idx) else {
+                    continue;
+                };
 
                 // The block-map entries: inline, or rehydrated from the
                 // indirect blob (whose own block may also need moving).

@@ -800,6 +800,37 @@ impl RoutedMetaBackend {
         }
     }
 
+    /// [`Self::make_global_ino`] for TREE WALKS (fsck / mover planners /
+    /// defrag census): a raw local on a volume with NO legacy keyspace
+    /// (a guest-only member added by `volume add-meta`) is a
+    /// format-bootstrap CONTROL record, not a user inode — it has no
+    /// global encoding and the walk must skip it, never panic (VL9
+    /// soak-found: `fsck --offline` after add-meta panicked on the new
+    /// member's local root record). The op-path invariant in
+    /// [`Self::make_global_ino`] stays a panic — routed ops can only
+    /// reach raw locals through the legacy keyspace.
+    pub fn try_make_global_ino(&self, local_ino: Ino, volume_idx: usize) -> Option<Ino> {
+        if self.routing_width <= 1 {
+            return Some(local_ino);
+        }
+        // Raw local 1 is the ROOT PIN only in slot 0's keyspace; every
+        // other keyspace's local 1 (native bootstrap or hosted-guest
+        // `guest_local_ino(slot, 1)`) is a per-volume/per-slot CONTROL
+        // record with no global encoding (its `(local - 2)` would
+        // underflow). Locals < 1 never encode.
+        let (slot, raw) = match split_guest_local(local_ino) {
+            Some((slot, raw)) => (u64::from(slot), raw),
+            None => (u64::from(self.legacy_slot[volume_idx]?), local_ino),
+        };
+        if raw == 1 {
+            return (slot == 0).then_some(1);
+        }
+        if raw < 2 {
+            return None;
+        }
+        Some(make_global_ino_width(raw, slot, self.routing_width))
+    }
+
     /// PR VL5b: mint one fresh ino on `volume_idx` — from the volume's
     /// native watermark when its mint slot is its legacy keyspace, from
     /// the slot's travelling guest cursor otherwise. Returns

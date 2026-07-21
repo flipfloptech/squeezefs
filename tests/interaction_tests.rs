@@ -1081,10 +1081,7 @@ async fn fsck_census_survives_a_guest_only_meta_member() {
     // it has NO legacy keyspace (its only raw records are bootstrap
     // control records).
     let m3 = make_file(dir.path(), "meta3", 256 * 1024 * 1024);
-    let uris: Vec<String> = [&m1, &m2]
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect();
+    let uris: Vec<String> = [&m1, &m2].iter().map(|p| p.display().to_string()).collect();
     let taken = squeezefs::config_ops::add_meta_volume(
         &uris,
         &m3.display().to_string(),

@@ -225,7 +225,11 @@ pub(crate) async fn walk_striped_files(
                 if layout.file_type != "striped" {
                     continue;
                 }
-                let global_ino = meta.make_global_ino(local_ino, vol_idx);
+                // Guest-only members carry raw CONTROL records with no
+                // global encoding — skip them (VL9 soak-found panic).
+                let Some(global_ino) = meta.try_make_global_ino(local_ino, vol_idx) else {
+                    continue;
+                };
 
                 let mut raw: Vec<(u32, String)> = Vec::new();
                 if let Some(ref map_id) = layout.block_map_id {

@@ -804,7 +804,11 @@ async fn walk_census(
                 if val.nlink == 0 {
                     continue;
                 }
-                let global_ino = ctx.meta.make_global_ino(local_ino, vol_idx);
+                // Guest-only members carry raw CONTROL records with no
+                // global encoding — skip them (VL9 soak-found panic).
+                let Some(global_ino) = ctx.meta.try_make_global_ino(local_ino, vol_idx) else {
+                    continue;
+                };
                 if let Some((shard_k, shard_n)) = opts.shard {
                     if global_ino % shard_n as u64 != shard_k as u64 {
                         continue;

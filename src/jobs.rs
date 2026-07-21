@@ -2291,9 +2291,18 @@ impl JobFabric {
                 pinned = false;
             }
         }
+        // The pinned source rides the mover ledger for the whole
+        // copy+publish window (PR VL9 pin b): the pin holds refcount =
+        // census-refs + 1, which an overlapping online fsck would
+        // otherwise report as a C3 refcount mismatch — a false positive
+        // on live mover state (G-VL-5(a) FP=0 with an active drain).
+        if pinned {
+            mover_ledger_insert(&task.base_key);
+        }
         // From here on a taken pin MUST be released on every path.
         let unpin = |key: String| async move {
             if pinned {
+                mover_ledger_remove(&key);
                 let _ = br.free_block(&key).await;
             }
         };

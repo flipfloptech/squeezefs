@@ -448,7 +448,9 @@ pub fn is_damaged_mapping(mapping_str: &str) -> bool {
 /// (packed length / crypto framing) after the offset; the allocator only keys
 /// on the offset. A `damaged:` quarantine marker strips to its BASE key so
 /// frees/purges/recovery resolve the physical block it preserves.
-pub(crate) fn clean_block_key(bk: &str) -> String {
+/// `pub` since PR VL7: the defrag census tooling and its tests'
+/// independent recomputation parse mappings through the ONE cleaner.
+pub fn clean_block_key(bk: &str) -> String {
     let bk = bk.strip_prefix(DAMAGED_MAPPING_PREFIX).unwrap_or(bk);
     if let Some(pos) = bk.find("://") {
         let proto = &bk[..pos];

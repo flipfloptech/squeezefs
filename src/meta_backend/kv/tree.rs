@@ -860,6 +860,60 @@ impl KvTree {
         out
     }
 
+    /// PR VL7 (design-volume-lifecycle §5.7 D4): the **compaction nudge**
+    /// — fold one node's serialized log through [`Self::smo_replace`]
+    /// regardless of log fullness. Never a new compactor: the successor
+    /// build, journaling, retire, and counters are `smo_replace` verbatim,
+    /// and the caller holds the per-volume SMO mutex (the same
+    /// serialization domain as the checkpoint task — lattice 4b respected
+    /// by delegation). Returns `false` when the node vanished / was
+    /// superseded since the census (idempotent no-op, exactly like a
+    /// spurious maintenance enqueue). Freeze + floor discipline mirrors
+    /// [`Self::checkpoint_flush_node`]'s compaction arm: the floor is
+    /// restored BEFORE the SMO so the retire's dying-floor fold keeps the
+    /// tail clamped (FIND-VS-A).
+    pub(crate) async fn compact_node_forced(
+        &self,
+        ctx: &mut SmoContext,
+        addr: u64,
+        out: &mut MaintenanceOutcome,
+    ) -> Result<bool, KvError> {
+        let Some(node) = self.cache.try_get(addr) else {
+            return Ok(false); // evicted/retired since the census
+        };
+        if node.state().is_superseded() || node.tree_id() != self.tree_id {
+            return Ok(false);
+        }
+        let (floor, forced_freeze) = {
+            let mut guard = node.lock().write().await;
+            let frozen = node.freeze_locked(&mut guard, &self.cache.config().layout)?;
+            // No delta to swap (the common nudge target — a clean node
+            // with a dead-heavy log): enter FREEZING through the forced
+            // transition so the SMO's supersede/end_freeze bookkeeping
+            // sees a freeze-borne source (empty frozen delta).
+            // (`freeze_locked` returns the EXISTING frozen delta when one
+            // is in flight, so `None` ⇔ truly nothing frozen.)
+            let forced = if frozen.is_none() {
+                if node.state().begin_forced_freeze().is_err() {
+                    return Ok(false); // superseded/racing — the census was stale
+                }
+                true
+            } else {
+                false
+            };
+            (node.take_dirty_floor(), forced)
+        };
+        node.restore_dirty_floor(floor);
+        let out = self.smo_replace(ctx, &node, out).await;
+        if out.is_err() && forced_freeze {
+            // Undo the empty forced freeze so the node stays writable —
+            // there was no frozen delta to restore.
+            node.state().end_freeze();
+        }
+        out?;
+        Ok(true)
+    }
+
     fn cache_map_dirty_addrs(&self, out: &mut Vec<u64>) {
         self.cache.for_each_node(|node| {
             if node.tree_id() == self.tree_id

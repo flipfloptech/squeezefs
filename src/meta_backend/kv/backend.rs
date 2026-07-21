@@ -2066,6 +2066,93 @@ impl KvMetaBackend {
     pub(super) fn allocator(&self) -> &Arc<ExtentAllocator> {
         &self.alloc
     }
+
+    /// PR VL7 (design-volume-lifecycle §5.7 D4): the **dead-bset census**
+    /// over this volume's RESIDENT leaf population — per leaf, total
+    /// serialized records vs distinct keys ([`crate::meta_backend::kv::
+    /// node_cache::NodeSnapshot::indexed_record_census`]); the difference
+    /// is the superseded-record population a compaction fold reclaims.
+    /// RAM-authoritative by design (the demand-paged node cache is the
+    /// read surface): callers that need whole-volume coverage — the
+    /// `--report-only` engine, the offline harness — page the trees in
+    /// with a full range walk first (`squeezefs::defrag::measure` does).
+    pub fn dead_bset_census(&self) -> DeadBsetCensus {
+        let mut out = DeadBsetCensus::default();
+        self.node_cache().for_each_node(|n| {
+            if n.level() != 0 || n.state().is_superseded() {
+                return;
+            }
+            let (total, distinct) = n.snapshot().indexed_record_census();
+            out.leaves += 1;
+            out.records_indexed += total;
+            out.records_live += distinct;
+            if total > distinct {
+                out.candidates.push((n.tree_id(), n.addr()));
+            }
+        });
+        out
+    }
+
+    /// PR VL7 (§5.7 D4): the **compaction nudge** — fold each candidate
+    /// leaf through the EXISTING SMO compactor
+    /// ([`KvTree::compact_node_forced`] → `smo_replace`), serialized with
+    /// the checkpoint task through the per-volume SMO mutex (the same
+    /// delegation `checkpoint_now` uses — lattice 4b). Journal-reserve /
+    /// pending-free refusals run a checkpoint cycle and retry, exactly
+    /// like the maintenance pass; a node that refuses past the bound
+    /// fails loud. Returns the number of nodes actually compacted
+    /// (vanished/superseded candidates no-op — the census is advisory,
+    /// the SMO revalidates).
+    pub async fn defrag_compact_nodes(
+        &self,
+        targets: &[(u8, u64)],
+    ) -> std::result::Result<u64, KvError> {
+        let mut smo = self.smo.lock().await;
+        let trees = self.trees();
+        let mut compacted = 0u64;
+        for &(tree_id, addr) in targets {
+            let Some(tree) = trees.iter().find(|t| t.tree_id() == tree_id) else {
+                continue; // unknown tree id: stale/foreign census entry
+            };
+            let mut out = crate::meta_backend::kv::tree::MaintenanceOutcome::default();
+            let mut attempts = 0;
+            loop {
+                match tree.compact_node_forced(&mut smo, addr, &mut out).await {
+                    Ok(did) => {
+                        if did {
+                            compacted += 1;
+                        }
+                        break;
+                    }
+                    Err(KvError::JournalReserveExhausted { .. })
+                    | Err(KvError::PendingFreeFull { .. })
+                        if attempts < 4 =>
+                    {
+                        attempts += 1;
+                        self.checkpoint_cycle(&mut smo, true).await?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(compacted)
+    }
+}
+
+/// PR VL7 (§5.7 D4): one volume's dead-bset census — the measurement half
+/// of the D4 axis. `records_indexed − records_live` is the reclaimable
+/// dead-record population; `candidates` are the leaves a
+/// [`KvMetaBackend::defrag_compact_nodes`] nudge folds.
+#[derive(Debug, Default, Clone)]
+pub struct DeadBsetCensus {
+    /// Resident (non-superseded) leaves censused.
+    pub leaves: u64,
+    /// Total serialized records across those leaves' bset logs.
+    pub records_indexed: u64,
+    /// Distinct keys (the post-fold live population).
+    pub records_live: u64,
+    /// `(tree_id, node_addr)` of every leaf carrying dead records.
+    pub candidates: Vec<(u8, u64)>,
 }
 
 // ---------------------------------------------------------------------------

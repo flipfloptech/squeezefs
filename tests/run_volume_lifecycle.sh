@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Volume-lifecycle rig — PR VL3 skeleton + PR VL4 drain/remove legs
 # (docs/design-volume-lifecycle.md §3, gates G-VL-2 + G-VL-3).
-# VL5+/VL6+/VL7 add meta migration, fsck, and defrag cycles.
+# VL5b/VL6a/VL6b/VL7 added meta migration, fsck, repair, and defrag legs;
+# VL8 adds the interaction matrix.
 #
 # Legs:
 #
@@ -97,6 +98,13 @@ set -euo pipefail
 #     --apply` (the guarded D0 open) quarantines-first + repairs;
 #     re-fsck reports findings: 0; the quarantine manifest lists the
 #     copies; remount reads the dataset back byte-identical.
+#
+#   Leg 16 (mount, VL7): online defrag (G-VL-6 at rig scale) — fragment
+#     via interleaved create/delete churn, `defrag --report-only`
+#     matches the live frag_* gauges, `defrag --data` drives worst-volume
+#     D1 contiguity + reclaimable tail to >= 0.9 with the survivor
+#     manifest byte-identical across a remount; `defrag_blocks_moved` is
+#     the engagement instrument.
 #
 # Unprivileged posture (the preload-gate precedent): file-backed volumes
 # + a user-owned mountpoint; root is NOT required.
@@ -1063,6 +1071,89 @@ do_mount
 do_unmount
 echo "OK: leg 15 (seed => detect => dry-run => apply => re-fsck clean => manifest intact)"
 
+# ---------------------------------------------------------------------------
+# Leg 16 (VL7): online defrag — fragment via churn, gauges captured,
+# --report-only matches the live gauges, defrag --data improves them,
+# manifest byte-identical (G-VL-6 at rig scale)
+# ---------------------------------------------------------------------------
+note "Leg 16: defrag (fragment => report-only matches => --data => gauges improve => manifest)"
+
+fresh_drain_rig "defrag" 24 8
+
+# Fragment: delete every other file (interleaved alloc/free), keep a
+# survivor manifest.
+for i in $(seq 1 2 24); do
+    rm "$MNT/dataset/f$i.bin"
+done
+sync -f "$MNT"
+(cd "$MNT/dataset" && sha256sum f*.bin) >"$RIG/manifest.survivors.sha256"
+
+# The frag_* gauges publish on the 5 s worker cadence; wait for the
+# fragmentation to show (worst-volume D1 contiguity below 0.9).
+frag_gauge() { # frag_gauge <name> — null-safe float read from .stats
+    python3 -c '
+import json, sys
+v = (json.load(open(sys.argv[1])).get("metrics") or {}).get(sys.argv[2])
+print(-1.0 if v is None else float(v))
+' "$MNT/.stats" "$1"
+}
+DEADLINE=$((SECONDS + 60))
+while :; do
+    C="$(frag_gauge frag_d1_contiguity)"
+    if python3 -c "import sys; sys.exit(0 if 0 <= $C < 0.9 else 1)"; then break; fi
+    [ $SECONDS -lt $DEADLINE ] \
+        || fail "leg 16: interleaved deletes did not fragment (frag_d1_contiguity=$C)"
+    sleep 2
+done
+echo "    fragmented: frag_d1_contiguity=$C"
+
+# 1. --report-only matches the live gauges (the G-VL-6 census-match
+#    clause at rig scale; the cargo suite pins the independent census).
+REPORT="$("$BIN" defrag "$MNT" --report-only --json)"
+STATS_C="$(frag_gauge frag_d1_contiguity)"
+STATS_T="$(frag_gauge frag_d1_reclaimable_tail)"
+echo "$REPORT" | python3 - "$STATS_C" "$STATS_T" <<'EOF' || fail "leg 16: report-only does not match the live gauges"
+import json, sys
+r = json.load(sys.stdin)
+worst_c = min(v["contiguity"] for v in r["d1"])
+worst_t = min(v["reclaimable_tail"] for v in r["d1"])
+sc, st = float(sys.argv[1]), float(sys.argv[2])
+# The gauges are permille-coded and refresh on cadence around the report.
+assert abs(worst_c - sc) < 0.05, f"contiguity: report {worst_c} vs gauge {sc}"
+assert abs(worst_t - st) < 0.05, f"tail: report {worst_t} vs gauge {st}"
+assert r["d2"]["pairs"] >= 0 and len(r["d4"]) >= 1
+EOF
+echo "    OK: --report-only matches the live frag_* gauges"
+
+# 2. defrag --data (the verb waits for the job) => gauges improve.
+MOVED_BEFORE="$(stats_field defrag_blocks_moved)"
+"$BIN" defrag "$MNT" --data --throttle 100 || fail "leg 16: defrag --data failed"
+MOVED_AFTER="$(stats_field defrag_blocks_moved)"
+[ "$MOVED_AFTER" -gt "$MOVED_BEFORE" ] \
+    || fail "leg 16: engagement — defrag_blocks_moved did not move ($MOVED_BEFORE -> $MOVED_AFTER)"
+
+REPORT="$("$BIN" defrag "$MNT" --report-only --json)"
+echo "$REPORT" | python3 - <<'EOF' || fail "leg 16: defrag --data must reach D1 >= 0.9 and tail >= 0.9"
+import json, sys
+r = json.load(sys.stdin)
+worst_c = min(v["contiguity"] for v in r["d1"])
+worst_t = min(v["reclaimable_tail"] for v in r["d1"])
+assert worst_c >= 0.9, f"post-defrag contiguity {worst_c}"
+assert worst_t >= 0.9, f"post-defrag reclaimable tail {worst_t}"
+EOF
+echo "    OK: D1 contiguity/tail >= 0.9 after defrag --data (moved +$((MOVED_AFTER - MOVED_BEFORE)) blocks)"
+
+# 3. Zero corruption: the survivor manifest is byte-identical, across a
+#    remount too.
+(cd "$MNT/dataset" && sha256sum -c "$RIG/manifest.survivors.sha256" --quiet) \
+    || fail "leg 16: survivor manifest mismatch after defrag"
+do_unmount
+do_mount
+(cd "$MNT/dataset" && sha256sum -c "$RIG/manifest.survivors.sha256" --quiet) \
+    || fail "leg 16: survivor manifest mismatch after defrag + remount"
+do_unmount
+echo "OK: leg 16 (defrag: report-only match, D1 improvement, manifest intact)"
+
 echo "==============================================================="
-echo "VOLUME LIFECYCLE RIG (VL3 + VL4 + VL4b + VL5b + VL6a + VL6b legs) PASSED (kill-9 LOOPS=$LOOPS)"
+echo "VOLUME LIFECYCLE RIG (VL3 + VL4 + VL4b + VL5b + VL6a + VL6b + VL7 legs) PASSED (kill-9 LOOPS=$LOOPS)"
 echo "==============================================================="

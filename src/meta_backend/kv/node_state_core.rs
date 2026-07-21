@@ -209,6 +209,35 @@ impl NodeState {
         }
     }
 
+    /// PR VL7 (§5.7 D4 — the forced-compaction nudge): enter `FREEZING`
+    /// from a node with **no open delta to swap** (clean, or dirty with
+    /// an already-empty overlay). The SMO's supersede/`end_freeze`
+    /// bookkeeping then sees exactly the state an ordinary freeze-borne
+    /// source carries — with an EMPTY frozen delta by construction.
+    /// Same serialization owner as [`Self::begin_freeze`] (the per-volume
+    /// SMO task, under the node write lock); refuses on `SUPERSEDED`
+    /// and on an in-flight freeze.
+    pub fn begin_forced_freeze(&self) -> Result<(), FreezeRefused> {
+        let mut w = self.word.load(Ordering::Acquire);
+        loop {
+            if w & SUPERSEDED != 0 {
+                return Err(FreezeRefused::Superseded);
+            }
+            if w & FREEZING != 0 {
+                return Err(FreezeRefused::AlreadyFreezing);
+            }
+            match self.word.compare_exchange_weak(
+                w,
+                (w & !DIRTY) | FREEZING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(cur) => w = cur,
+            }
+        }
+    }
+
     /// The frozen image reached its destination (append committed, or the
     /// SMO consumed it): clear `FREEZING`. Returns whether `DIRTY`
     /// re-accumulated during the write — the writeback task's re-enqueue

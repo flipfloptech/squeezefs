@@ -625,6 +625,76 @@ impl crate::ipc_host::AdminSink for FabricAdminSink {
                     })
                     .to_string())
                 }
+                // -----------------------------------------------------
+                // PR VL7 (§5.7): the online defragmenter. `report` runs
+                // the four-axis measurement inline (publishing the
+                // frag_* gauges) and returns the per-volume/per-axis
+                // JSON; the mover spellings submit fabric jobs —
+                // `data [vol <id>]` (D1/D2), `meta` (D4), `fold` (D3),
+                // `rebalance` (the KD-12 operator surface for the VL4
+                // job). arg: "report | data [vol <id>] [throttle <pct>]
+                // | meta [throttle <pct>] | fold [throttle <pct>]
+                // | rebalance [throttle <pct>]"
+                // -----------------------------------------------------
+                "defrag" => {
+                    const USAGE: &str = "usage: defrag report | defrag \
+                                         data|meta|fold|rebalance [vol <id>] [throttle <pct>]";
+                    let mut parts = arg.split_whitespace();
+                    let mode = parts.next().ok_or_else(|| USAGE.to_string())?;
+                    let mut volume: Option<String> = None;
+                    let mut throttle_pct: u32 = 100;
+                    while let Some(tok) = parts.next() {
+                        match tok {
+                            "vol" => {
+                                volume = Some(
+                                    parts.next().ok_or_else(|| USAGE.to_string())?.to_string(),
+                                );
+                            }
+                            "throttle" => {
+                                throttle_pct = parts
+                                    .next()
+                                    .and_then(|p| p.parse().ok())
+                                    .ok_or_else(|| USAGE.to_string())?;
+                            }
+                            other => return Err(format!("{USAGE} (unknown token '{other}')")),
+                        }
+                    }
+                    if volume.is_some() && mode != "data" {
+                        return Err("vol <id> is only valid with `defrag data`".to_string());
+                    }
+                    if mode == "report" {
+                        let fs = need_fs()?;
+                        let meta = fs
+                            .meta_backend
+                            .as_ref()
+                            .ok_or_else(|| "no metadata backend mounted".to_string())?;
+                        let report = crate::defrag::measure(meta, &fs.router)
+                            .await
+                            .map_err(|e| format!("defrag measurement failed: {e}"))?;
+                        return serde_json::to_string(&report)
+                            .map_err(|e| format!("report encode: {e}"));
+                    }
+                    let job_type = match mode {
+                        "data" => crate::jobs::JobType::DefragData { volume_id: volume },
+                        "meta" => crate::jobs::JobType::DefragMeta,
+                        "fold" => crate::jobs::JobType::DefragFold,
+                        "rebalance" => crate::jobs::JobType::Rebalance,
+                        other => return Err(format!("{USAGE} (unknown mode '{other}')")),
+                    };
+                    let job_id = fabric
+                        .submit(crate::jobs::JobSpec {
+                            job_type,
+                            throttle_pct,
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!({
+                        "job_id": job_id,
+                        "mode": mode,
+                        "throttle_pct": throttle_pct,
+                    })
+                    .to_string())
+                }
                 // The persisted `job:{id}:report` payload of a completed
                 // fsck job (structured findings JSON).
                 "fsck-report" => {

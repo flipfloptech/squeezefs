@@ -83,6 +83,12 @@ const REBALANCE_BAND: f64 = 0.10;
 /// allocations waiting on publish).
 const REPLAN_BACKOFF: Duration = Duration::from_millis(200);
 
+/// PR VL7 (§5.7): the defrag re-plan pass cap — the termination belt
+/// under sustained foreground churn (each pass converges toward the
+/// compacted/ordered fixpoint; churn can keep minting new work forever,
+/// and a maintenance job must complete best-effort, never wedge).
+const DEFRAG_MAX_PASSES: u32 = 16;
+
 /// Job kinds. `Noop` is the fabric's own test/soak vehicle (each task
 /// sleeps `task_ms`, making duty cycle and progress directly
 /// measurable with zero I/O); the movers are PR VL4.
@@ -130,6 +136,24 @@ pub enum JobType {
         #[serde(default)]
         quarantine_dir: Option<String>,
     },
+    /// PR VL7 (§5.7 D1/D2): the data defragmenter — the SAME `move_one`
+    /// engine as the drain/rebalance movers with the contiguity-aware
+    /// destination pick (D1: tail blocks into low-offset same-backend
+    /// gaps; D2: locality rewrites of refcount-1 quiescent blocks onto
+    /// one backend, ascending). `volume_id = None` covers every
+    /// placement-eligible volume. Converges by re-plan until a pass
+    /// moves nothing (best-effort under foreground churn — the next
+    /// invocation re-plans from current state, KD-6).
+    DefragData {
+        volume_id: Option<String>,
+    },
+    /// PR VL7 (§5.7 D4): nudge dead-bset-heavy KV leaves through the
+    /// EXISTING SMO compactor (`KvMetaBackend::defrag_compact_nodes` —
+    /// never a new compactor), per meta volume.
+    DefragMeta,
+    /// PR VL7 (§5.7 D3): kick every parked/spilled extent block through
+    /// the EXISTING W2 fold machinery (the mount-wired [`FoldHook`]).
+    DefragFold,
 }
 
 impl JobType {
@@ -141,7 +165,10 @@ impl JobType {
             JobType::EvacuateVolume { .. }
             | JobType::Rebalance
             | JobType::MigrateMetaSlot { .. }
-            | JobType::Fsck { .. } => 0,
+            | JobType::Fsck { .. }
+            | JobType::DefragData { .. }
+            | JobType::DefragMeta
+            | JobType::DefragFold => 0,
         }
     }
 
@@ -387,16 +414,32 @@ impl Default for WriteRateEstimator {
 /// `active_block_ext:` record — safe to move now.
 pub type QuiesceProbe = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 
+/// PR VL7 (§5.7 D3): the fold surface the mount wires into the fabric —
+/// defrag DRIVES the existing W2 fold machinery, never reimplements it.
+/// `targets` enumerates the current parked/spilled extent blocks;
+/// `kick` runs one block's fold to completion
+/// (`SqueezefsFilesystem::fold_extent_block` — `Ok(true)` = a fold ran).
+pub struct FoldHook {
+    pub targets: Arc<dyn Fn() -> Vec<(u64, u32)> + Send + Sync>,
+    pub kick: Arc<
+        dyn Fn(u64, u32) -> futures::future::BoxFuture<'static, Result<bool, String>> + Send + Sync,
+    >,
+}
+
 /// What the movers need beyond the meta backend: the data router (block
 /// I/O, merges, DLM token reads) and the quiescence probe. The mount
-/// wires the FUSE layer's probe (RAM active buffers included);
-/// [`MoverCtx::router_only`] is the offline-coordinator shape (staging
-/// records only — nothing else is live by construction).
+/// wires the FUSE layer's probe (RAM active buffers included) plus the
+/// VL7 [`FoldHook`]; [`MoverCtx::router_only`] is the offline-coordinator
+/// shape (staging records only — nothing else is live by construction,
+/// and fold custody is mount-owned so no hook exists there).
 pub struct MoverCtx {
     pub router: crate::routing::DataRouter,
     pub quiesce: QuiesceProbe,
     /// The §5.2 write-rate estimator, sampled at checkpoint cadence.
     pub write_rate: WriteRateEstimator,
+    /// The D3 fold surface (`None` = no mounted FUSE layer: offline
+    /// coordinators and fabric-only tests — `DefragFold` fails loud).
+    pub fold: Option<FoldHook>,
 }
 
 impl MoverCtx {
@@ -405,7 +448,14 @@ impl MoverCtx {
             router,
             quiesce,
             write_rate: WriteRateEstimator::new(),
+            fold: None,
         }
+    }
+
+    /// Wire the mount's D3 fold surface (the VL7 mount posture).
+    pub fn with_fold(mut self, fold: FoldHook) -> Self {
+        self.fold = Some(fold);
+        self
     }
 
     /// The offline-coordinator probe: staging-visible state only (a
@@ -470,10 +520,41 @@ struct MoveTask {
     /// The source volume the base key parses to (rebalance uses it to
     /// exclude the source from destination picks).
     src_id: String,
+    /// The source's parsed device byte offset (the VL7 compaction
+    /// objective bounds its destination pick by it).
+    src_offset: u64,
     refs: Vec<MoveRef>,
     /// Rebalance: the planned destination volume id (`None` = the
     /// lowest-fill eligible pick).
     dest_hint: Option<String>,
+    /// PR VL7 (§5.7): the destination objective — `Balance` is the
+    /// drain/rebalance behavior verbatim; the defrag objectives pick
+    /// contiguity-aware destinations.
+    dest_pick: DestPick,
+}
+
+/// PR VL7 (§5.7 D1/D2): the mover's destination objective.
+#[derive(Clone, Debug)]
+enum DestPick {
+    /// Fill-balance (drain/rebalance): `dest_hint` or the lowest-fill
+    /// eligible survivor.
+    Balance,
+    /// D1 compaction: the LOWEST free block on the SAME backend, strictly
+    /// below the source offset — never a fresh tail mint (that would grow
+    /// the tail being reclaimed). No such gap ⇒ the move is a no-op this
+    /// pass. Tasks execute in (ino, logical-idx) order, so the ascending
+    /// gap consumption preserves per-file physical order (no D2
+    /// re-trigger).
+    CompactLow,
+    /// D2 locality rewrite: the named backend, lowest free at-or-above
+    /// the file's shared ascending FLOOR (fresh tail fallback) — the
+    /// floor is what makes one pass leave the file same-backend
+    /// ascending, i.e. what makes the rewrite CONVERGE instead of
+    /// chasing free-list order forever.
+    BackendAscending {
+        be_id: String,
+        floor: Arc<AtomicU64>,
+    },
 }
 
 /// A census pass over the durable inode trees.
@@ -603,7 +684,7 @@ async fn census_for(
                     blob_blocks += 1;
                 }
                 for (b, mapping) in entries {
-                    let Some((src_id, clean, _offset)) = owner_of(&mapping) else {
+                    let Some((src_id, clean, offset)) = owner_of(&mapping) else {
                         continue;
                     };
                     by_offset
@@ -611,8 +692,10 @@ async fn census_for(
                         .or_insert_with(|| MoveTask {
                             base_key: clean,
                             src_id,
+                            src_offset: offset,
                             refs: Vec::new(),
                             dest_hint: None,
+                            dest_pick: DestPick::Balance,
                         })
                         .refs
                         .push(MoveRef {
@@ -1229,6 +1312,12 @@ impl JobFabric {
                     .await
             }
             JobType::Rebalance => self.run_mover(job_id, ctl, MoverObjective::Rebalance).await,
+            JobType::DefragData { volume_id } => {
+                self.run_mover(job_id, ctl, MoverObjective::Defrag { volume_id })
+                    .await
+            }
+            JobType::DefragMeta => self.run_defrag_meta(job_id, ctl).await,
+            JobType::DefragFold => self.run_defrag_fold(job_id, ctl).await,
             JobType::MigrateMetaSlot {
                 slot,
                 target_volume,
@@ -1452,6 +1541,168 @@ impl JobFabric {
         }
     }
 
+    /// Fail a job loudly: durable `Failed` record with the error, then
+    /// the live flip (the shared shape of every inline failure arm).
+    async fn fail_job(&self, job_id: &str, ctl: &JobCtl, err: &str) {
+        log::error!("job {job_id}: {err}");
+        if let Ok(Some(mut rec)) = Self::read_record(&self.meta, job_id).await {
+            rec.state = JobState::Failed;
+            rec.error = Some(err.to_string());
+            let _ = self.persist(&rec).await;
+        }
+        METRICS.job_failed.fetch_add(1, Ordering::Relaxed);
+        ctl.set_state(JobState::Failed);
+    }
+
+    /// PR VL7 (§5.7 D4): per meta volume, page the trees resident, take
+    /// the dead-bset census, and nudge every dead-carrying leaf through
+    /// the EXISTING SMO compactor (`defrag_compact_nodes` — serialized
+    /// with the checkpoint task on the SMO mutex; never a new
+    /// compactor). Duty-cycle throttled per nudge batch; crash-resume is
+    /// plan regeneration (a re-run re-censuses — compaction is
+    /// idempotent, an already-folded leaf is no longer a candidate).
+    async fn run_defrag_meta(&self, job_id: &str, ctl: &JobCtl) {
+        let mut last_checkpoint = tokio::time::Instant::now();
+        for kv in self.meta.volumes.iter() {
+            if ctl.cancelled.load(Ordering::SeqCst) {
+                let _ = self.checkpoint_as(job_id, ctl, JobState::Cancelled).await;
+                ctl.set_state(JobState::Cancelled);
+                return;
+            }
+            if ctl.paused.load(Ordering::SeqCst) {
+                let _ = self.checkpoint_as(job_id, ctl, JobState::Paused).await;
+                ctl.set_state(JobState::Paused);
+                return;
+            }
+            if let Err(e) = crate::defrag::page_in_leaves(kv).await {
+                self.fail_job(job_id, ctl, &format!("defrag-meta leaf paging failed: {e}"))
+                    .await;
+                return;
+            }
+            let census = kv.dead_bset_census();
+            log::info!(
+                "job {job_id}: defrag-meta on {:?} — {} leaves, {} indexed / {} live \
+                 records, {} candidate(s)",
+                kv.device_path(),
+                census.leaves,
+                census.records_indexed,
+                census.records_live,
+                census.candidates.len()
+            );
+            ctl.tasks_total
+                .fetch_add(census.candidates.len() as u64, Ordering::Relaxed);
+            for chunk in census.candidates.chunks(8) {
+                if ctl.cancelled.load(Ordering::SeqCst) || ctl.paused.load(Ordering::SeqCst) {
+                    break;
+                }
+                let start = tokio::time::Instant::now();
+                match kv.defrag_compact_nodes(chunk).await {
+                    Ok(kicked) => {
+                        METRICS
+                            .defrag_meta_compactions_kicked
+                            .fetch_add(kicked, Ordering::Relaxed);
+                        ctl.done.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        METRICS
+                            .job_tasks_done
+                            .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        self.fail_job(job_id, ctl, &format!("defrag-meta nudge failed: {e}"))
+                            .await;
+                        return;
+                    }
+                }
+                if last_checkpoint.elapsed() >= Duration::from_secs(CHECKPOINT_SECS) {
+                    let _ = self.checkpoint(job_id, ctl).await;
+                    last_checkpoint = tokio::time::Instant::now();
+                }
+                let pct = ctl.throttle.load(Ordering::Relaxed);
+                if let Some(delay) = job_throttle_sleep(start.elapsed(), pct) {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+        if ctl.cancelled.load(Ordering::SeqCst) {
+            let _ = self.checkpoint_as(job_id, ctl, JobState::Cancelled).await;
+            ctl.set_state(JobState::Cancelled);
+            return;
+        }
+        if ctl.paused.load(Ordering::SeqCst) {
+            let _ = self.checkpoint_as(job_id, ctl, JobState::Paused).await;
+            ctl.set_state(JobState::Paused);
+            return;
+        }
+        let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
+        METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
+        ctl.set_state(JobState::Completed);
+    }
+
+    /// PR VL7 (§5.7 D3): kick every parked/spilled extent block through
+    /// the mount's fold hook — the EXISTING W2 fold machinery run to
+    /// completion. Kick failures are logged and left parked (never-lossy:
+    /// the extents stay custody; the fsync/pressure drains own the error
+    /// surface — exactly the background fold worker's law).
+    async fn run_defrag_fold(&self, job_id: &str, ctl: &JobCtl) {
+        let Some(hook) = self.mover.as_ref().and_then(|m| m.fold.as_ref()) else {
+            self.fail_job(
+                job_id,
+                ctl,
+                "defrag-fold needs the mount's fold surface: fold custody is \
+                 mount-owned (offline coordinators cannot kick folds — run \
+                 `squeezefs defrag <mountpoint> --fold` against the live mount)",
+            )
+            .await;
+            return;
+        };
+        let targets = (hook.targets)();
+        ctl.tasks_total
+            .store(targets.len() as u64, Ordering::Relaxed);
+        let mut last_checkpoint = tokio::time::Instant::now();
+        for (ino, b) in targets {
+            if ctl.cancelled.load(Ordering::SeqCst) {
+                let _ = self.checkpoint_as(job_id, ctl, JobState::Cancelled).await;
+                ctl.set_state(JobState::Cancelled);
+                return;
+            }
+            if ctl.paused.load(Ordering::SeqCst) {
+                let _ = self.checkpoint_as(job_id, ctl, JobState::Paused).await;
+                ctl.set_state(JobState::Paused);
+                return;
+            }
+            let start = tokio::time::Instant::now();
+            match (hook.kick)(ino, b).await {
+                Ok(true) => {
+                    METRICS.defrag_folds_kicked.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(false) => {} // vanished / full-repr: the flush machinery owns it
+                Err(e) => log::warn!(
+                    "job {job_id}: defrag-fold kick failed ({e}) — the extents stay \
+                     parked custody (never-lossy); the fsync/pressure drains own the \
+                     error surface"
+                ),
+            }
+            ctl.done.fetch_add(1, Ordering::Relaxed);
+            METRICS.job_tasks_done.fetch_add(1, Ordering::Relaxed);
+            if last_checkpoint.elapsed() >= Duration::from_secs(CHECKPOINT_SECS) {
+                let _ = self.checkpoint(job_id, ctl).await;
+                last_checkpoint = tokio::time::Instant::now();
+            }
+            let pct = ctl.throttle.load(Ordering::Relaxed);
+            if let Some(delay) = job_throttle_sleep(start.elapsed(), pct) {
+                tokio::time::sleep(delay).await;
+            }
+        }
+        if let Some(ctx) = self.mover.as_ref() {
+            let router = ctx.router.clone();
+            let _ =
+                tokio::task::spawn_blocking(move || crate::defrag::refresh_d1_d3_gauges(&router))
+                    .await;
+        }
+        let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
+        METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
+        ctl.set_state(JobState::Completed);
+    }
+
     /// The Noop vehicle: duty-cycle throttle after every task (KD-3,
     /// live-re-read); checkpoint on the §5.1.2 cadence.
     async fn run_noop(&self, job_id: &str, ctl: &JobCtl) {
@@ -1548,6 +1799,7 @@ impl JobFabric {
         let mut since_checkpoint = 0u64;
         let started = tokio::time::Instant::now();
         let moved_at_start = METRICS.evacuate_bytes_moved.load(Ordering::Relaxed);
+        let mut defrag_passes = 0u32;
 
         loop {
             if ctl.cancelled.load(Ordering::SeqCst) {
@@ -1609,6 +1861,10 @@ impl JobFabric {
                     bound_rebalance_census(&mut census, &plan, block_size);
                     (census, None)
                 }
+                MoverObjective::Defrag { volume_id } => (
+                    plan_defrag(&self.meta, ctx, volume_id.as_deref()).await?,
+                    None,
+                ),
             };
 
             // Publish the discovered totals (advisory progress).
@@ -1675,9 +1931,10 @@ impl JobFabric {
             // that pre-dates the draining flip still holds an allocated
             // offset until its publish; retire must wait for it).
             let mut deferred_this_pass = 0u64;
+            let mut moved_this_pass = 0u64;
             if census.tasks.is_empty() && census.blob_relocations.is_empty() {
                 match objective {
-                    MoverObjective::Rebalance => {
+                    MoverObjective::Rebalance | MoverObjective::Defrag { .. } => {
                         let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
                         METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
                         ctl.set_state(JobState::Completed);
@@ -1719,6 +1976,16 @@ impl JobFabric {
                     MoveOutcome::Moved => {
                         ctl.done.fetch_add(1, Ordering::Relaxed);
                         METRICS.job_tasks_done.fetch_add(1, Ordering::Relaxed);
+                        moved_this_pass += 1;
+                        if matches!(objective, MoverObjective::Defrag { .. }) {
+                            // §10: the defrag-engagement pair (a defrag
+                            // move also counts the shared evacuate_*
+                            // family at the move_one site).
+                            METRICS.defrag_blocks_moved.fetch_add(1, Ordering::Relaxed);
+                            METRICS
+                                .defrag_bytes_moved
+                                .fetch_add(block_size, Ordering::Relaxed);
+                        }
                     }
                     MoveOutcome::Deferred => deferred_this_pass += 1,
                     MoveOutcome::Superseded => {
@@ -1787,6 +2054,42 @@ impl JobFabric {
                 METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
                 ctl.set_state(JobState::Completed);
                 return Ok(());
+            }
+
+            // The defrag objective converges by re-plan while passes make
+            // progress and completes best-effort at the first no-progress
+            // pass (§5.7: foreground churn keeps minting new work — the
+            // next invocation re-plans from current state, KD-6; an empty
+            // census completes through the convergence check above). The
+            // pass cap is the termination BELT under sustained churn: a
+            // defrag never wedges the fabric chasing a moving target.
+            // The freshly-moved state re-gauges before the verdict.
+            if let MoverObjective::Defrag { .. } = objective {
+                defrag_passes += 1;
+                let router = ctx.router.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::defrag::refresh_d1_d3_gauges(&router)
+                })
+                .await;
+                if !ctl.cancelled.load(Ordering::SeqCst) && !ctl.paused.load(Ordering::SeqCst) {
+                    if moved_this_pass == 0 {
+                        let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
+                        METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
+                        ctl.set_state(JobState::Completed);
+                        return Ok(());
+                    }
+                    if defrag_passes >= DEFRAG_MAX_PASSES {
+                        log::info!(
+                            "job {job_id}: defrag completed at the {DEFRAG_MAX_PASSES}-pass \
+                             cap with work remaining (foreground churn keeps minting it) — \
+                             re-invoke to continue (KD-6 re-plan)"
+                        );
+                        let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
+                        METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
+                        ctl.set_state(JobState::Completed);
+                        return Ok(());
+                    }
+                }
             }
 
             if deferred_this_pass > 0 || census.tasks.is_empty() {
@@ -1926,26 +2229,84 @@ impl JobFabric {
         };
         let src_hash = xxhash_rust::xxh3::xxh3_64(&data);
 
-        let dest = match task.dest_hint.as_deref() {
-            Some(hint) if br.placement_eligible(hint) => br
-                .get_backend(hint)
-                .map(|(alloc, dev)| (hint.to_string(), alloc, dev)),
-            _ => br.pick_fill_destination(drain_victim.unwrap_or(&task.src_id)),
-        };
-        let (dst_id, dst_alloc, dst_dev) = match dest {
-            Ok(d) => d,
-            Err(e) => {
-                log::warn!("mover: no destination for {}: {e}", task.base_key);
-                unpin(task.base_key.clone()).await;
-                return MoveOutcome::Deferred;
+        // Destination + allocation per the task's objective (§5.7): the
+        // drain/rebalance fill-balance pick verbatim, or the VL7
+        // contiguity-aware picks.
+        let (dst_id, dst_alloc, dst_dev, dst_off) = match &task.dest_pick {
+            DestPick::Balance => {
+                let dest = match task.dest_hint.as_deref() {
+                    Some(hint) if br.placement_eligible(hint) => br
+                        .get_backend(hint)
+                        .map(|(alloc, dev)| (hint.to_string(), alloc, dev)),
+                    _ => br.pick_fill_destination(drain_victim.unwrap_or(&task.src_id)),
+                };
+                let (dst_id, dst_alloc, dst_dev) = match dest {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::warn!("mover: no destination for {}: {e}", task.base_key);
+                        unpin(task.base_key.clone()).await;
+                        return MoveOutcome::Deferred;
+                    }
+                };
+                match dst_alloc.allocate_block().await {
+                    Ok(o) => (dst_id, dst_alloc, dst_dev, o),
+                    Err(e) => {
+                        log::warn!("mover: destination allocation on '{dst_id}' failed: {e}");
+                        unpin(task.base_key.clone()).await;
+                        return MoveOutcome::Deferred;
+                    }
+                }
             }
-        };
-        let dst_off = match dst_alloc.allocate_block().await {
-            Ok(o) => o,
-            Err(e) => {
-                log::warn!("mover: destination allocation on '{dst_id}' failed: {e}");
-                unpin(task.base_key.clone()).await;
-                return MoveOutcome::Deferred;
+            DestPick::CompactLow => {
+                // D1: the lowest same-backend gap strictly below the
+                // source — no gap means nothing to gain this pass (the
+                // re-plan revisits; never a fresh tail mint).
+                let (alloc, dev) = match br.get_backend(&task.src_id) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        log::warn!("mover: compaction backend '{}' gone: {e}", task.src_id);
+                        unpin(task.base_key.clone()).await;
+                        return MoveOutcome::Deferred;
+                    }
+                };
+                let below = task.src_offset / alloc.chunk_size().max(1);
+                match alloc.allocate_block_below(below) {
+                    Some(o) => (task.src_id.clone(), alloc, dev, o),
+                    None => {
+                        unpin(task.base_key.clone()).await;
+                        return MoveOutcome::Superseded;
+                    }
+                }
+            }
+            DestPick::BackendAscending { be_id, floor } => {
+                // D2: the named backend, lowest free at-or-above the
+                // file's ascending floor (fresh-tail fallback keeps the
+                // sequence strictly ascending — the convergence
+                // invariant: one pass leaves the file same-backend
+                // ascending, so the next plan finds nothing).
+                if !br.placement_eligible(be_id) {
+                    unpin(task.base_key.clone()).await;
+                    return MoveOutcome::Deferred;
+                }
+                let (alloc, dev) = match br.get_backend(be_id) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        log::warn!("mover: locality backend '{be_id}' gone: {e}");
+                        unpin(task.base_key.clone()).await;
+                        return MoveOutcome::Deferred;
+                    }
+                };
+                let min_idx = floor.load(Ordering::Relaxed);
+                let off = match alloc.allocate_block_at_or_above(min_idx) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        log::warn!("mover: locality allocation on '{be_id}' failed: {e}");
+                        unpin(task.base_key.clone()).await;
+                        return MoveOutcome::Deferred;
+                    }
+                };
+                floor.store(off / alloc.chunk_size().max(1) + 1, Ordering::Relaxed);
+                (be_id.clone(), alloc, dev, off)
             }
         };
         // PR VL6a: register this task as the destination's live owner in
@@ -2100,8 +2461,15 @@ impl JobFabric {
 }
 
 enum MoverObjective {
-    Drain { volume_id: String },
+    Drain {
+        volume_id: String,
+    },
     Rebalance,
+    /// PR VL7 (§5.7 D1/D2): compaction + locality rewrites; `None` =
+    /// every placement-eligible volume.
+    Defrag {
+        volume_id: Option<String>,
+    },
 }
 
 enum MoveOutcome {
@@ -2271,6 +2639,191 @@ fn bound_rebalance_census(census: &mut Census, plan: &[RebalanceLeg], _block_siz
     }
     census.tasks = bounded;
     census.distinct_blocks = census.tasks.len() as u64;
+}
+
+// ---------------------------------------------------------------------------
+// PR VL7 — defrag planning (§5.7 D1/D2)
+// ---------------------------------------------------------------------------
+
+/// Resolve a parsed backend id to its REGISTERED volume id, honoring the
+/// `backend_0`/legacy default-slot aliases (the census walk's matching
+/// law, inverted): the record whose registered Arcs ARE the default slot
+/// owns bare/aliased keys.
+fn canonical_backend_id(br: &crate::routing::BackendRouter, be_id: &str) -> String {
+    if be_id != "backend_0" && be_id != "squeezefs" {
+        return be_id.to_string();
+    }
+    for entry in br.backends.iter() {
+        if Arc::ptr_eq(&entry.value().device, &br.default_device)
+            && Arc::ptr_eq(&entry.value().block_allocator, &br.default_allocator)
+        {
+            return entry.key().clone();
+        }
+    }
+    be_id.to_string()
+}
+
+/// Plan one defrag pass (§5.7): D2 locality rewrites first (refcount-1,
+/// quiescent-gated at move time, whole-file logical order onto the
+/// plurality-eligible backend, ascending picks), then D1 tail compaction
+/// (referenced blocks past the volume's compaction frontier — `used`
+/// blocks fit `[0, used)` exactly — into low same-backend gaps). Shared
+/// blocks compact fine (the §5.4 move-once machinery); D2 skips them —
+/// clones are never de-shared. Indirect map blobs are left to the drain
+/// machinery (they relocate on ordinary merges; a defrag never forces
+/// them).
+async fn plan_defrag(
+    meta: &Arc<RoutedMetaBackend>,
+    ctx: &MoverCtx,
+    volume_id: Option<&str>,
+) -> Result<Census, String> {
+    let br = &ctx.router.backend_router;
+
+    // Scope: the named volume or every placement-eligible one.
+    let mut scope: Vec<String> = Vec::new();
+    match volume_id {
+        Some(v) => {
+            if br.backends.get(v).is_none() {
+                return Err(format!(
+                    "unknown data volume '{v}' (see `squeezefs volume list`)"
+                ));
+            }
+            if !br.placement_eligible(v) {
+                return Err(format!(
+                    "volume '{v}' is not placement-eligible \
+                     (draining/retired/unhealthy) — defrag needs a writable volume"
+                ));
+            }
+            scope.push(v.to_string());
+        }
+        None => {
+            for entry in br.backends.iter() {
+                if br.placement_eligible(entry.key()) {
+                    scope.push(entry.key().clone());
+                }
+            }
+            scope.sort();
+        }
+    }
+    let empty = || Census {
+        tasks: Vec::new(),
+        blob_relocations: Vec::new(),
+        distinct_blocks: 0,
+    };
+    if scope.is_empty() {
+        return Ok(empty());
+    }
+
+    let mut tasks: Vec<MoveTask> = Vec::new();
+    let mut planned: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // D2: locality rewrites (their low-gap picks feed D1's goal too).
+    let files = crate::defrag::walk_striped_files(meta, &ctx.router)
+        .await
+        .map_err(|e| format!("defrag D2 walk failed: {e}"))?;
+    for f in files {
+        let (pairs, local) = crate::defrag::locality_pairs(&f.entries);
+        if pairs == 0 || local == pairs {
+            continue;
+        }
+        // Scope: the file must touch an in-scope volume.
+        if !f
+            .entries
+            .iter()
+            .any(|(_, _, be, _)| scope.contains(&canonical_backend_id(br, be)))
+        {
+            continue;
+        }
+        // Target: the plurality backend among ELIGIBLE canonical owners.
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for (_, _, be, _) in &f.entries {
+            *counts.entry(canonical_backend_id(br, be)).or_default() += 1;
+        }
+        let mut cands: Vec<(String, u64)> = counts
+            .into_iter()
+            .filter(|(id, _)| br.placement_eligible(id))
+            .collect();
+        cands.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let Some((target, _)) = cands.into_iter().next() else {
+            continue; // nowhere eligible to gather the file
+        };
+        // One ascending floor per file: the rewrite's convergence
+        // invariant (each publish bumps it past its destination).
+        let floor = Arc::new(AtomicU64::new(0));
+        for (idx, mapping, be, off) in &f.entries {
+            let clean = crate::routing::clean_block_key(mapping);
+            // Refcount-1 only (§5.7: clones are never de-shared by D2).
+            if br.block_refcount(&clean) != Some(1) {
+                continue;
+            }
+            if !planned.insert(clean.clone()) {
+                continue;
+            }
+            tasks.push(MoveTask {
+                base_key: clean,
+                src_id: canonical_backend_id(br, be),
+                src_offset: *off,
+                refs: vec![MoveRef {
+                    ino: f.ino,
+                    block_idx: *idx,
+                    mapping: mapping.clone(),
+                }],
+                dest_hint: None,
+                dest_pick: DestPick::BackendAscending {
+                    be_id: target.clone(),
+                    floor: floor.clone(),
+                },
+            });
+        }
+    }
+
+    // D1: tail compaction over the scope's referenced census.
+    let census = census_for(meta, &ctx.router, &scope)
+        .await
+        .map_err(|e| format!("defrag D1 census failed: {e}"))?;
+    let mut frontier: HashMap<String, u64> = HashMap::new();
+    for v in &scope {
+        if let Some(be) = br.backends.get(v) {
+            frontier.insert(v.clone(), be.value().block_allocator.get_used_blocks());
+        }
+    }
+    let mut d1_tasks: Vec<MoveTask> = Vec::new();
+    for mut t in census.tasks {
+        if planned.contains(&t.base_key) {
+            continue;
+        }
+        let Some(be) = br.backends.get(&t.src_id) else {
+            continue;
+        };
+        let chunk = be.value().block_allocator.chunk_size().max(1);
+        drop(be);
+        let Some(&fr) = frontier.get(&t.src_id) else {
+            continue;
+        };
+        if t.src_offset / chunk < fr {
+            continue; // already below the compaction frontier
+        }
+        planned.insert(t.base_key.clone());
+        t.dest_pick = DestPick::CompactLow;
+        d1_tasks.push(t);
+    }
+    // (ino, logical idx) order: the ascending gap consumption then
+    // preserves per-file physical order — compaction must not mint D2
+    // work (refs are already ascending-sorted by the census).
+    d1_tasks.sort_by_key(|t| {
+        t.refs
+            .first()
+            .map(|r| (r.ino, r.block_idx))
+            .unwrap_or((u64::MAX, u32::MAX))
+    });
+    tasks.extend(d1_tasks);
+
+    let distinct_blocks = tasks.len() as u64;
+    Ok(Census {
+        tasks,
+        blob_relocations: Vec::new(),
+        distinct_blocks,
+    })
 }
 
 fn unix_ts() -> u64 {

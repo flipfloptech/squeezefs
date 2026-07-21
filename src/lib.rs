@@ -13,6 +13,7 @@ pub mod config_ops;
 pub(crate) mod cow_core;
 pub mod cpu;
 pub mod crypto_compress;
+pub mod defrag;
 pub mod dlm;
 pub mod error;
 pub mod fsck;

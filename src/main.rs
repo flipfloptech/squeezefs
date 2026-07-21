@@ -226,6 +226,45 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Online defragmenter (design-volume-lifecycle §5.7, KD-11/KD-12):
+    /// fragmentation is the four measured axes — D1 free-space
+    /// contiguity, D2 file locality, D3 staged-extent pressure, D4 meta
+    /// node occupancy — each with a gauge and an independently
+    /// invocable mover reusing existing machinery (the VL4 mover with a
+    /// contiguity-aware pick / the W2 fold / the SMO compactor). TARGET
+    /// = a live mountpoint (jobs on the daemon's fabric via the admin
+    /// lane) or a sqmeta:// URI (offline: a short-lived D0-guarded
+    /// coordinator runs the job in-process, §5.8; `--fold` is
+    /// live-only — fold custody is mount-owned)
+    Defrag {
+        /// Live mountpoint or sqmeta:// URI
+        target: String,
+        /// D1/D2: compact free space + rewrite poor-locality files
+        #[arg(long)]
+        data: bool,
+        /// Restrict --data to one volume id (see `squeezefs volume list`)
+        #[arg(long)]
+        volume: Option<String>,
+        /// D4: nudge dead-bset-heavy KV leaves through the SMO compactor
+        #[arg(long)]
+        meta: bool,
+        /// D3: kick parked/spilled extents through the fold machinery
+        #[arg(long)]
+        fold: bool,
+        /// The KD-12 operator surface: submit the VL4 rebalance pass
+        #[arg(long)]
+        rebalance: bool,
+        /// Measure the four axes and print the per-volume/per-axis
+        /// report; moves nothing
+        #[arg(long)]
+        report_only: bool,
+        /// KD-3 duty-cycle throttle percentage for the mover jobs
+        #[arg(long, default_value_t = 100)]
+        throttle: u32,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Single-writer mount-guard claim administration
     /// (docs/design-metadata-throughput.md §5.0)
     Claim {
@@ -1785,6 +1824,177 @@ fn print_fsck_report(report: &squeezefs::fsck::FsckReport, json: bool) {
             println!("  skip  [{}] {} — {}", a.class, a.object, a.detail);
         }
     }
+}
+
+/// The `squeezefs defrag` verb's flag lattice (PR VL7, §5.7).
+struct DefragVerbArgs {
+    data: bool,
+    volume: Option<String>,
+    meta: bool,
+    fold: bool,
+    rebalance: bool,
+    report_only: bool,
+    throttle: u32,
+    json: bool,
+}
+
+fn print_defrag_report(report: &squeezefs::defrag::DefragReport, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(report).expect("report serializes")
+        );
+        return;
+    }
+    println!("defrag report (four-axis model, design-volume-lifecycle §5.7 / KD-11):");
+    for r in &report.d1 {
+        println!(
+            "  D1 {}: contiguity {:.3}, reclaimable tail {:.3} ({} free / {} used of {} \
+             blocks, largest run {})",
+            r.id,
+            r.contiguity,
+            r.reclaimable_tail,
+            r.free_blocks,
+            r.used_blocks,
+            r.space_blocks,
+            r.largest_free_run,
+        );
+    }
+    println!(
+        "  D2 locality {:.3} ({} local of {} adjacent pairs over {} file(s))",
+        report.d2.locality, report.d2.local_pairs, report.d2.pairs, report.d2.files
+    );
+    println!(
+        "  D3 pressure {} B ({} parked + {} spilled across {} record(s))",
+        report.d3.pressure_bytes,
+        report.d3.parked_extent_bytes,
+        report.d3.spilled_record_bytes,
+        report.d3.spilled_records
+    );
+    for r in &report.d4 {
+        println!(
+            "  D4 {}: dead-bset ratio {:.3} ({} live of {} records over {} leaves)",
+            r.volume, r.dead_bset_ratio, r.records_live, r.records_indexed, r.leaves
+        );
+    }
+}
+
+/// Poll a submitted job to terminal over the admin lane (the fsck verb's
+/// wait shape).
+fn admin_wait_job_terminal(target: &str, job_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let st = admin_roundtrip(target, "job-status", job_id)?;
+        let sv: serde_json::Value =
+            serde_json::from_str(&st).map_err(|e| format!("undecodable job status: {e}"))?;
+        match sv["state"].as_str().unwrap_or("?") {
+            "completed" => return Ok(()),
+            "failed" => return Err(format!("defrag job {job_id} failed (see daemon log)").into()),
+            "cancelled" => return Err(format!("defrag job {job_id} was cancelled").into()),
+            "paused" | "paused-capacity" => {
+                return Err(format!(
+                    "defrag job {job_id} was paused — `squeezefs job resume` re-queues it"
+                )
+                .into())
+            }
+            _ => std::thread::sleep(std::time::Duration::from_millis(500)),
+        }
+    }
+}
+
+async fn run_defrag_verb(
+    target: &str,
+    args: DefragVerbArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    squeezefs::set_fs_prefix("squeezefs");
+    let modes = [
+        args.data,
+        args.meta,
+        args.fold,
+        args.rebalance,
+        args.report_only,
+    ]
+    .iter()
+    .filter(|m| **m)
+    .count();
+    if modes != 1 {
+        return Err(
+            "pick exactly one of --data / --meta / --fold / --rebalance / --report-only \
+             (each §5.7 axis is independently invocable)"
+                .into(),
+        );
+    }
+    if args.volume.is_some() && !args.data {
+        return Err("--volume only scopes --data (D1/D2 are the per-volume movers)".into());
+    }
+    let live = !target.starts_with("sqmeta://");
+
+    if live {
+        if args.report_only {
+            let body = admin_roundtrip(target, "defrag", "report")?;
+            let report: squeezefs::defrag::DefragReport =
+                serde_json::from_str(&body).map_err(|e| format!("undecodable report: {e}"))?;
+            print_defrag_report(&report, args.json);
+            return Ok(());
+        }
+        let mode = if args.data {
+            "data"
+        } else if args.meta {
+            "meta"
+        } else if args.fold {
+            "fold"
+        } else {
+            "rebalance"
+        };
+        let mut arg = mode.to_string();
+        if let Some(v) = &args.volume {
+            arg.push_str(&format!(" vol {v}"));
+        }
+        arg.push_str(&format!(" throttle {}", args.throttle));
+        let body = admin_roundtrip(target, "defrag", &arg)?;
+        let v: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("undecodable admin reply: {e}"))?;
+        let job_id = v["job_id"]
+            .as_str()
+            .ok_or("admin reply carried no job id")?
+            .to_string();
+        eprintln!(
+            "defrag --{mode} job {job_id} running at {} % throttle (watch \
+             `squeezefs job list {target}`)…",
+            args.throttle
+        );
+        admin_wait_job_terminal(target, &job_id)?;
+        println!("defrag --{mode} completed (job {job_id}).");
+        return Ok(());
+    }
+
+    // Offline (§5.8): report-only = read-only probes; movers = the
+    // short-lived D0-guarded coordinator running the job in-process.
+    let meta_lvs = parse_block_uri(target, "sqmeta://")?;
+    if args.report_only {
+        let report = squeezefs::defrag::run_offline_report(&meta_lvs).await?;
+        print_defrag_report(&report, args.json);
+        return Ok(());
+    }
+    if args.fold {
+        return Err(
+            "defrag --fold is LIVE-ONLY: fold custody (parked overlays + staged \
+             extent records) is mount-owned — run `squeezefs defrag <mountpoint> \
+             --fold`; an unmounted set's records drain at the next mount's recovery"
+                .into(),
+        );
+    }
+    let job_type = if args.data {
+        squeezefs::jobs::JobType::DefragData {
+            volume_id: args.volume.clone(),
+        }
+    } else if args.meta {
+        squeezefs::jobs::JobType::DefragMeta
+    } else {
+        squeezefs::jobs::JobType::Rebalance
+    };
+    squeezefs::defrag::run_offline_mover(&meta_lvs, job_type, args.throttle).await?;
+    println!("offline defrag completed.");
+    Ok(())
 }
 
 /// Offline probe: read the durable job records straight off the meta
@@ -3661,6 +3871,32 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         }
+        Commands::Defrag {
+            target,
+            data,
+            volume,
+            meta,
+            fold,
+            rebalance,
+            report_only,
+            throttle,
+            json,
+        } => {
+            run_defrag_verb(
+                &target,
+                DefragVerbArgs {
+                    data,
+                    volume,
+                    meta,
+                    fold,
+                    rebalance,
+                    report_only,
+                    throttle,
+                    json,
+                },
+            )
+            .await?;
+        }
         Commands::Claim { action } => {
             let ClaimActions::Clear { meta_uri } = action;
             squeezefs::set_fs_prefix("squeezefs");
@@ -4135,10 +4371,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // VL4: the mover context — the data router + this mount's
             // quiescence probe (RAM active buffers + staging records) —
             // arms the evacuate/rebalance job types on the fabric.
+            // VL7: plus the D3 fold hook (defrag drives the W2 fold
+            // machinery through it) and the continuous frag_* gauge
+            // worker (§5.7 — D1/D3 on cadence; D2/D4 on measure).
             let mover_ctx = squeezefs::jobs::MoverCtx::new(
                 fs_engine.router.clone(),
                 fs_engine.mover_quiesce_probe(),
-            );
+            )
+            .with_fold(fs_engine.defrag_fold_hook());
+            squeezefs::defrag::spawn_gauge_worker(fs_engine.router.clone());
             let fabric = squeezefs::jobs::JobFabric::start(
                 routed_meta_backend,
                 fabric_workers,

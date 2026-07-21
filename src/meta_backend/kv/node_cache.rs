@@ -577,6 +577,26 @@ impl NodeSnapshot {
         self.base.entries.len()
     }
 
+    /// PR VL7 (design-volume-lifecycle §5.7 D4): the dead-record census of
+    /// this snapshot's SERIALIZED sources — `(total indexed records,
+    /// distinct keys)`. A key's group keeps exactly one live head after a
+    /// compaction fold, so `total − distinct` is the superseded ("dead
+    /// bset") record population a nudge can reclaim. Entries are
+    /// key-ascending by the index invariant: one linear pass.
+    pub fn indexed_record_census(&self) -> (u64, u64) {
+        let total = self.base.entries.len() as u64;
+        let mut distinct = 0u64;
+        let mut prev: Option<&[u8]> = None;
+        for e in self.base.entries.iter() {
+            let k = self.base.key_at(e);
+            if prev != Some(k) {
+                distinct += 1;
+                prev = Some(k);
+            }
+        }
+        (total, distinct)
+    }
+
     fn run_group(run: &[OwnedRec], key: &[u8]) -> std::ops::Range<usize> {
         let lo = run.partition_point(|r| &r.key[..] < key);
         let hi = run.partition_point(|r| &r.key[..] <= key);

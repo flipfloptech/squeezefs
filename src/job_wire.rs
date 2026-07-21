@@ -1892,7 +1892,10 @@ impl JobWireWorker {
                     JobType::EvacuateVolume { .. }
                     | JobType::Rebalance
                     | JobType::MigrateMetaSlot { .. }
-                    | JobType::Fsck { .. } => {
+                    | JobType::Fsck { .. }
+                    | JobType::DefragData { .. }
+                    | JobType::DefragMeta
+                    | JobType::DefragFold => {
                         log::error!(
                             "job worker: mover shard {}:{} reached the wire — the \
                              dispatcher must not assign mover job types (v1.1); aborting",

@@ -359,6 +359,19 @@ pub fn set_parked_cap_buffers(v: u64) {
     parked_cap_buffers_cell().store(v, Ordering::Relaxed);
 }
 
+/// Parse an `active_block:`/`active_block_ext:` ino-form key into its
+/// `(ino, block)` identity (PR VL7 — the D3 fold-target enumeration).
+/// Path-form keys (`active_block:{file_path}:block_{b}` with a non-`inode_`
+/// path) return `None`: they never name striped fold custody.
+fn parse_block_family_key(key: &str) -> Option<(u64, u32)> {
+    let rest = key
+        .strip_prefix("active_block_ext:")
+        .or_else(|| key.strip_prefix("active_block:"))?;
+    let rest = rest.strip_prefix("inode_")?;
+    let (ino, block) = rest.split_once(":block_")?;
+    Some((ino.parse().ok()?, block.parse().ok()?))
+}
+
 /// Op types the registry attributes — the mdstorm-visible request mix
 /// plus every op class that lost its per-op `timeout()` wrapper to the
 /// D1.b watchdog (read/write/readdir/link-family/fsync can all park on
@@ -1821,6 +1834,30 @@ pub struct Metrics {
     /// Applied repairs per class — index 0..6 ⇔ C1..C7
     /// (`fsck_repair_classC{1..7}` on the stats inode).
     pub fsck_repair_class: Align64<[AtomicU64; 7]>,
+    /// PR VL7 defrag family (design-volume-lifecycle §5.7/§10, KD-11).
+    /// Distinct blocks moved by the D1/D2 defrag objective (the same
+    /// `move_one` engine as `evacuate_*` — a defrag move counts BOTH
+    /// families; this one is the defrag-engagement instrument).
+    pub defrag_blocks_moved: Align64<AtomicU64>,
+    pub defrag_bytes_moved: Align64<AtomicU64>,
+    /// D3 fold kicks that actually ran a fold pass (drives the EXISTING
+    /// `fold_*` machinery — `fold_passes` moves in lockstep).
+    pub defrag_folds_kicked: Align64<AtomicU64>,
+    /// D4 leaf compactions nudged through the SMO serialization
+    /// (`meta_kv_node_compactions` moves in lockstep).
+    pub defrag_meta_compactions_kicked: Align64<AtomicU64>,
+    /// The four KD-11 axis gauges. Ratios are permille+1 encoded
+    /// (`crate::defrag::{encode_ratio,decode_ratio}`; raw 0 = never
+    /// measured — the stats JSON emits `null` then). Worst-volume
+    /// semantics for the per-volume axes (the actionable tripwire);
+    /// per-volume rows ride the `--report-only` JSON.
+    pub frag_d1_contiguity: Align64<AtomicU64>,
+    pub frag_d1_reclaimable_tail: Align64<AtomicU64>,
+    pub frag_d2_locality: Align64<AtomicU64>,
+    /// Plain bytes (parked overlay bytes + spilled `active_block_ext:`
+    /// record bytes) — not ratio-encoded.
+    pub frag_d3_pressure_bytes: Align64<AtomicU64>,
+    pub frag_d4_dead_bset_ratio: Align64<AtomicU64>,
     /// §5.1.6 remote-wire family (design-volume-lifecycle §10, PR VL2b).
     /// Currently-enrolled remote workers (gauge).
     pub job_remote_workers: Align64<AtomicU64>,
@@ -3269,6 +3306,60 @@ impl SqueezefsFilesystem {
         })
     }
 
+    /// PR VL7 (design-volume-lifecycle §5.7 D3): the fold hook the defrag
+    /// fabric drives — targets are this mount's parked-extent custody
+    /// (RAM extent-repr overlays + spilled `active_block_ext:` records),
+    /// and the kick IS [`Self::fold_extent_block`]: the existing W2 fold
+    /// machinery run to completion, never a reimplementation.
+    pub fn defrag_fold_hook(&self) -> crate::jobs::FoldHook {
+        let bufs = self.active_block_buffers.clone();
+        let router = self.router.clone();
+        // Cycle hygiene (load-bearing): the hook lives INSIDE the fabric
+        // (fabric → MoverCtx → FoldHook), and a verbatim clone carries
+        // the SHARED `job_fabric` cell that points back at the fabric —
+        // an Arc cycle that would leak this filesystem (and its cached
+        // DLM leases in the process-global lock table) past teardown.
+        // The captured clone gets a fresh, empty fabric cell instead;
+        // folds never consult it.
+        let mut fs = self.clone();
+        fs.job_fabric = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None));
+        crate::jobs::FoldHook {
+            targets: std::sync::Arc::new(move || {
+                let mut seen = std::collections::HashSet::new();
+                let mut out = Vec::new();
+                for entry in bufs.iter() {
+                    if entry.value().is_extent_repr() {
+                        if let Some(t) = parse_block_family_key(entry.key()) {
+                            if seen.insert(t) {
+                                out.push(t);
+                            }
+                        }
+                    }
+                }
+                for key in router.cache.nvme.extent_record_keys("") {
+                    if let Some(t) = parse_block_family_key(&key) {
+                        if seen.insert(t) {
+                            out.push(t);
+                        }
+                    }
+                }
+                out.sort_unstable();
+                out
+            }),
+            kick: std::sync::Arc::new(move |ino, b| {
+                // One deep clone of the Arc'd handles per kick — folds are
+                // 4 MiB-class device ops; the clone is noise (contrast the
+                // per-op-clone lesson on `DataPlaneSink::fs`).
+                let fs = fs.clone();
+                Box::pin(async move {
+                    fs.fold_extent_block(ino, b)
+                        .await
+                        .map_err(|e| format!("fold of ino {ino} block {b} failed: {e}"))
+                })
+            }),
+        }
+    }
+
     /// Live metadata-volume health override (`config metadata-volume
     /// enable/disable`, re-homed from the retired `/dev/shm` runtime
     /// config): fail-stop only — a disabled volume's inos error until
@@ -3736,6 +3827,18 @@ impl SqueezefsFilesystem {
                 "fsck_repair_classC5": METRICS.fsck_repair_class[4].load(Ordering::Relaxed),
                 "fsck_repair_classC6": METRICS.fsck_repair_class[5].load(Ordering::Relaxed),
                 "fsck_repair_classC7": METRICS.fsck_repair_class[6].load(Ordering::Relaxed),
+                // PR VL7 defrag family (§5.7 / §10, KD-11). Ratio gauges
+                // decode permille+1 (null = never measured); worst-volume
+                // semantics — per-volume rows ride `defrag --report-only`.
+                "defrag_blocks_moved": METRICS.defrag_blocks_moved.load(Ordering::Relaxed),
+                "defrag_bytes_moved": METRICS.defrag_bytes_moved.load(Ordering::Relaxed),
+                "defrag_folds_kicked": METRICS.defrag_folds_kicked.load(Ordering::Relaxed),
+                "defrag_meta_compactions_kicked": METRICS.defrag_meta_compactions_kicked.load(Ordering::Relaxed),
+                "frag_d1_contiguity": crate::defrag::decode_ratio(METRICS.frag_d1_contiguity.load(Ordering::Relaxed)),
+                "frag_d1_reclaimable_tail": crate::defrag::decode_ratio(METRICS.frag_d1_reclaimable_tail.load(Ordering::Relaxed)),
+                "frag_d2_locality": crate::defrag::decode_ratio(METRICS.frag_d2_locality.load(Ordering::Relaxed)),
+                "frag_d3_pressure_bytes": METRICS.frag_d3_pressure_bytes.load(Ordering::Relaxed),
+                "frag_d4_dead_bset_ratio": crate::defrag::decode_ratio(METRICS.frag_d4_dead_bset_ratio.load(Ordering::Relaxed)),
                 "job_remote_workers": METRICS.job_remote_workers.load(Ordering::Relaxed),
                 "job_remote_enrollments": METRICS.job_remote_enrollments.load(Ordering::Relaxed),
                 "job_remote_enroll_refused": METRICS.job_remote_enroll_refused.load(Ordering::Relaxed),

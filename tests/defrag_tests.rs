@@ -205,8 +205,8 @@ async fn open_fixture_ext(meta: &Path, records: &[DataVolumeRecord], compressed:
 
     let fs = Arc::new(fs);
     // The VL7 mount shape: quiescence probe + the D3 fold hook.
-    let mover = MoverCtx::new(fs.router.clone(), fs.mover_quiesce_probe())
-        .with_fold(fs.defrag_fold_hook());
+    let mover =
+        MoverCtx::new(fs.router.clone(), fs.mover_quiesce_probe()).with_fold(fs.defrag_fold_hook());
     let fabric = JobFabric::start(routed.clone(), 2, 100, Some(mover))
         .await
         .expect("fabric start");
@@ -300,11 +300,19 @@ async fn read_back(fx: &Fx, ino: u64, nblocks: usize) -> Vec<u8> {
     out
 }
 
-async fn unlink(fx: &Fx, name: &str) {
+/// Unlink + reclaim: block frees are deferred to FORGET + the reclaim
+/// worker pool (armed at FUSE INIT, which this harness never runs) —
+/// drive the same batch entry point directly, exactly what the kernel's
+/// forget would reach.
+async fn unlink(fx: &Fx, name: &str, ino: u64) {
+    // The create's open handle must release first (an open ino is
+    // reclaim-exempt by design), like the kernel's close() before rm.
+    let _ = fx.fs.release(req(), ino, 0, 0, 0, true).await;
     fx.fs
         .unlink(req(), 1, OsStr::new(name))
         .await
         .unwrap_or_else(|e| panic!("unlink {name} failed: {e:?}"));
+    fx.fs.reclaim_orphaned_batch(vec![ino]).await;
 }
 
 /// Independent D1 recomputation (the G-VL-6 census-match instrument):
@@ -312,7 +320,11 @@ async fn unlink(fx: &Fx, name: &str) {
 /// OWN run-scan — never the engine's code path.
 async fn independent_d1(
     alloc: &Arc<BlockAllocator>,
-) -> (u64 /* free */, u64 /* largest run */, u64 /* tail free */) {
+) -> (
+    u64, /* free */
+    u64, /* largest run */
+    u64, /* tail free */
+) {
     let mut free = alloc.get_free_blocks().await.unwrap();
     free.sort_unstable();
     let highest = alloc.highest_block_index();
@@ -461,7 +473,7 @@ async fn test_report_only_gauges_match_independent_census() {
         inos.push(ino);
     }
     for i in (1..8).step_by(2) {
-        unlink(&fx, &format!("f{i}.bin")).await;
+        unlink(&fx, &format!("f{i}.bin"), inos[i]).await;
     }
 
     let report = squeezefs::defrag::measure(&fx.meta, &fx.fs.router)
@@ -506,12 +518,7 @@ async fn test_report_only_gauges_match_independent_census() {
         let mut entries: Vec<(u32, String, u64)> = Vec::new();
         for (&b, mapping) in bm {
             let clean = squeezefs::routing::clean_block_key(mapping);
-            let (be, off) = fx
-                .fs
-                .router
-                .backend_router
-                .parse_block_key(&clean)
-                .unwrap();
+            let (be, off) = fx.fs.router.backend_router.parse_block_key(&clean).unwrap();
             entries.push((b, be, off));
         }
         entries.sort_by_key(|e| e.0);
@@ -593,9 +600,9 @@ async fn test_defrag_data_g_vl6_contiguity_tail_churn_zero_corruption() {
         let bytes = striped_burst(&fx, ino, FBLOCKS, i as u8).await;
         inos.push((i, ino, bytes));
     }
-    for (i, _, _) in &inos {
+    for (i, ino, _) in &inos {
         if i % 2 == 1 {
-            unlink(&fx, &format!("frag{i}.bin")).await;
+            unlink(&fx, &format!("frag{i}.bin"), *ino).await;
         }
     }
     for (i, ino, bytes) in &inos {
@@ -656,7 +663,9 @@ async fn test_defrag_data_g_vl6_contiguity_tail_churn_zero_corruption() {
                     .write(req(), ino, 0, 0, bytes::Bytes::copy_from_slice(&data), 0, 0)
                     .await;
                 let _ = fs.fsync(req(), ino, 0, false).await;
+                let _ = fs.release(req(), ino, 0, 0, 0, true).await;
                 let _ = fs.unlink(req(), 1, OsStr::new(&name)).await;
+                fs.reclaim_orphaned_batch(vec![ino]).await;
                 n += 1;
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -940,8 +949,7 @@ async fn test_d4_meta_nudge_increments_compactions() {
         !census.candidates.is_empty(),
         "dead-heavy leaves must be nudge candidates"
     );
-    let ratio_before =
-        1.0 - census.records_live as f64 / census.records_indexed.max(1) as f64;
+    let ratio_before = 1.0 - census.records_live as f64 / census.records_indexed.max(1) as f64;
 
     // The nudge: compaction THROUGH the SMO serialization.
     let compactions_before =
@@ -959,8 +967,7 @@ async fn test_d4_meta_nudge_increments_compactions() {
 
     // The census improves and the data still reads.
     let census = routed.volumes[0].dead_bset_census();
-    let ratio_after =
-        1.0 - census.records_live as f64 / census.records_indexed.max(1) as f64;
+    let ratio_after = 1.0 - census.records_live as f64 / census.records_indexed.max(1) as f64;
     assert!(
         ratio_after < ratio_before,
         "dead-bset ratio must improve ({ratio_before} → {ratio_after})"
@@ -1057,12 +1064,14 @@ async fn test_defrag_throttle_live_retune_and_pause() {
     let recs = base_format_config(&[&oss1]).resolved_data_volumes();
     let fx = open_fixture(&meta, &recs).await;
 
+    let mut t_inos = Vec::new();
     for i in 0..12 {
         let ino = create_file(&fx, &format!("t{i}.bin")).await;
         striped_burst(&fx, ino, 4, i as u8).await;
+        t_inos.push(ino);
     }
     for i in (1..12).step_by(2) {
-        unlink(&fx, &format!("t{i}.bin")).await;
+        unlink(&fx, &format!("t{i}.bin"), t_inos[i]).await;
     }
     let alloc = fx
         .fs
@@ -1133,15 +1142,17 @@ async fn test_kill9_mid_defrag_resume_converges_manifest_intact() {
     const FILES: usize = 12;
     const FBLOCKS: usize = 4;
     let mut manifest: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut k_inos = Vec::new();
     for i in 0..FILES {
         let ino = create_file(&fx, &format!("k{i}.bin")).await;
         let bytes = striped_burst(&fx, ino, FBLOCKS, i as u8).await;
         if i % 2 == 0 {
             manifest.insert(ino, bytes);
         }
+        k_inos.push(ino);
     }
     for i in (1..FILES).step_by(2) {
-        unlink(&fx, &format!("k{i}.bin")).await;
+        unlink(&fx, &format!("k{i}.bin"), k_inos[i]).await;
     }
     let alloc = fx
         .fs

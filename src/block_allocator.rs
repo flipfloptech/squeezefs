@@ -481,6 +481,13 @@ impl BlockAllocator {
         } else {
             self.next_fresh_block()?
         };
+        Ok(self.claim_block_idx(block_idx))
+    }
+
+    /// The shared post-claim tail: refcount 1, incarnation unstable (cache
+    /// fills must not publish until the owner's `publish_block`), and the
+    /// PR VL6a fsck epoch-latch record. Returns the byte offset.
+    fn claim_block_idx(&self, block_idx: u64) -> u64 {
         let offset = block_idx * self.chunk_size;
         let _ = self.refcounts.insert_sync(offset, AtomicU32::new(1));
         // New incarnation, not yet durable: cache fills must not publish until
@@ -497,7 +504,54 @@ impl BlockAllocator {
                 }
             }
         }
-        Ok(offset)
+        offset
+    }
+
+    /// PR VL7 (design-volume-lifecycle §5.7 D1/D2): the **contiguity-aware
+    /// pick** — claim the LOWEST free block whose index is `< below_idx`,
+    /// with the full `allocate_block` discipline (refcount, incarnation,
+    /// fsck epoch latch). `None` = no free block below the bound (the
+    /// mover defers; it never mints fresh tail blocks for a compaction —
+    /// that would grow the very tail it is reclaiming). Lock-free: the
+    /// `DashSet::remove` is the atomic claim; a lost race falls through to
+    /// the next candidate.
+    pub fn allocate_block_below(&self, below_idx: u64) -> Option<u64> {
+        let mut cands: Vec<u64> = self
+            .free_blocks
+            .iter()
+            .map(|i| *i)
+            .filter(|i| *i < below_idx)
+            .collect();
+        cands.sort_unstable();
+        for idx in cands {
+            if self.free_blocks.remove(&idx).is_some() {
+                return Some(self.claim_block_idx(idx));
+            }
+        }
+        None
+    }
+
+    /// PR VL7 (§5.7 D2): the **ascending pick** — claim the lowest free
+    /// block whose index is `≥ min_idx`; none free ⇒ a fresh tail mint
+    /// (strictly above every existing index, so successive calls with a
+    /// caller-maintained floor are guaranteed ascending — the locality
+    /// rewrite's convergence invariant). Full `allocate_block`
+    /// discipline; `StorageFull` propagates from the fresh-mint path.
+    pub fn allocate_block_at_or_above(&self, min_idx: u64) -> Result<u64> {
+        let mut cands: Vec<u64> = self
+            .free_blocks
+            .iter()
+            .map(|i| *i)
+            .filter(|i| *i >= min_idx)
+            .collect();
+        cands.sort_unstable();
+        for idx in cands {
+            if self.free_blocks.remove(&idx).is_some() {
+                return Ok(self.claim_block_idx(idx));
+            }
+        }
+        let idx = self.next_fresh_block()?;
+        Ok(self.claim_block_idx(idx))
     }
 
     /// Release one reference. On the TERMINAL release (count hit zero, or
@@ -590,9 +644,16 @@ impl BlockAllocator {
     }
 
     pub async fn get_free_blocks(&self) -> Result<Vec<u64>> {
+        Ok(self.free_block_indices())
+    }
+
+    /// Sorted snapshot of the free-list indices — the sync twin of
+    /// [`Self::get_free_blocks`] (PR VL7: the D1 contiguity census reads
+    /// it latch-free from sync contexts).
+    pub fn free_block_indices(&self) -> Vec<u64> {
         let mut list: Vec<u64> = self.free_blocks.iter().map(|item| *item).collect();
         list.sort_unstable();
-        Ok(list)
+        list
     }
 
     pub async fn recover_block(&self, block_idx: u64) -> Result<()> {

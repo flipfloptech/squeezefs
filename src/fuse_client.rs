@@ -4750,8 +4750,14 @@ impl SqueezefsFilesystem {
     /// (`extent_records_future_refused` — custody of a newer binary, never
     /// wiped; the dir-level format gate normally refuses the whole mount
     /// first). Returns `None` in both cases so callers proceed without the
-    /// record. Sync ring removal: call off the async hot path or accept
-    /// the bounded blocking remove (recovery/checkout contexts).
+    /// record. The torn-record ring removal is DETACHED to the blocking
+    /// pool (shard-lock invariant rule 2): this helper is reachable from
+    /// live read/checkout paths on fuse3 TPC executor threads, and the
+    /// shard WRITE lock legitimately waits for §5.5 read guards with
+    /// await-side lifetimes — a synchronous remove here is the Hang-1
+    /// executor-block shape (the VL8 generic/464 wedge family). Disposal
+    /// is idempotent cleanup: callers proceed without the record either
+    /// way, and a racing reader that still sees it disposes it again.
     fn dispose_bad_extent_record(
         &self,
         key: &str,
@@ -4769,7 +4775,13 @@ impl SqueezefsFilesystem {
                 );
                 eprintln!("{msg}");
                 warn!("{msg}");
-                self.router.cache.nvme.remove_active_block(key);
+                let nvme = self.router.cache.nvme.clone();
+                let key_owned = key.to_string();
+                // Detached blocking-pool removal (see fn doc): never take
+                // the staging shard WRITE lock on an executor thread.
+                tokio::task::spawn_blocking(move || {
+                    nvme.remove_active_block(&key_owned);
+                });
                 None
             }
             crate::cache::nvme::ExtentRecordError::FutureVersion(v) => {

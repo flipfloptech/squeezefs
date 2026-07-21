@@ -2789,7 +2789,16 @@ pub async fn repair(
                 fire_repair_abort_hook(&what)?;
                 // Discard: live store first (zeroes its indexed record),
                 // then the raw on-disk residue (seeded / unindexed images).
-                let _ = ctx.router.cache.nvme.remove_active_block(key);
+                // Blocking-pool hop (shard-lock invariant rule 2): live-lane
+                // fsck runs on executor threads, and the shard WRITE lock
+                // legitimately waits for §5.5 read guards with await-side
+                // lifetimes (the VL8 generic/464 wedge family).
+                let _ = ctx
+                    .router
+                    .cache
+                    .nvme
+                    .remove_active_block_async(key.to_string())
+                    .await;
                 let _ = crate::cache::nvme::extract_and_kill_staged_custody(dir, key, true).await?;
                 apply_ok(
                     &mut out,

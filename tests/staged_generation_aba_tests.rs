@@ -79,7 +79,10 @@ async fn stale_generation_never_matches_a_new_incarnation() {
     )
     .await
     .unwrap();
-    let g1 = nvme.staged_generation(id).expect("staged after write");
+    let g1 = nvme
+        .staged_generation(id)
+        .await
+        .expect("staged after write");
 
     // P1: legitimate release of incarnation 1.
     assert!(
@@ -97,7 +100,10 @@ async fn stale_generation_never_matches_a_new_incarnation() {
     )
     .await
     .unwrap();
-    let g2 = nvme.staged_generation(id).expect("staged after re-write");
+    let g2 = nvme
+        .staged_generation(id)
+        .await
+        .expect("staged after re-write");
     assert_ne!(
         g2, g1,
         "a new incarnation must never recycle a prior incarnation's generation \
@@ -134,7 +140,7 @@ async fn generation_is_single_use_across_release_and_restage_cycles() {
         )
         .await
         .unwrap();
-        let g = nvme.staged_generation(id).expect("staged");
+        let g = nvme.staged_generation(id).await.expect("staged");
         assert!(
             seen.insert(g),
             "round {round}: generation {g} was already used by a prior \

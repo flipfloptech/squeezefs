@@ -1138,9 +1138,22 @@ impl NvmeStaging {
 
         // Re-staging the same file_id replaces its ring entry: the gate must
         // charge the *delta*, not the sum of every intermediate payload.
+        //
+        // LEDGER-LOCK INVARIANT (the VL8 generic/464 writes-only wedge —
+        // tests/staging_shard_deadlock_tests.rs): every executor-side
+        // ledger access must be an scc `*_async` op, never `*_sync`. A
+        // concurrent re-stage's blocking-pool closure holds this file_id's
+        // ledger ENTRY lock across `reserve_and_write`'s shard-WRITE-lock
+        // wait, and that wait is unbounded while a §5.5 read guard is
+        // parked on an await — a `read_sync` here then BLOCKS the very
+        // executor thread that must poll the guard holder (the captured
+        // four-edge cycle: executor → bucket → shard write → guard →
+        // executor). `read_async` parks the TASK instead; the guard holder
+        // stays pollable and the cycle cannot close.
         let prior_cost = self
             .staged_ledger
-            .read_sync(file_id, |_, (cost, _)| *cost)
+            .read_async(file_id, |_, (cost, _)| *cost)
+            .await
             .unwrap_or(0);
 
         let over_cap =
@@ -1154,7 +1167,7 @@ impl NvmeStaging {
             // Capacity pressure: promote resident staged entries to durable
             // backend blocks so the pool drains, then wait (bounded) for the
             // merge worker to credit freed space. Never a fixed futile stall.
-            self.kick_promotion(file_id, 64);
+            self.kick_promotion(file_id, 64).await;
             let deadline = tokio::time::Instant::now() + Duration::from_millis(2000);
             loop {
                 let notified = self.space_freed_notify.notified();
@@ -1168,7 +1181,7 @@ impl NvmeStaging {
                 if !over_cap(total_staged_bytes) {
                     break;
                 }
-                self.kick_promotion(file_id, 64);
+                self.kick_promotion(file_id, 64).await;
             }
             total_staged_bytes = self
                 .current_staged_write_bytes
@@ -1280,14 +1293,20 @@ impl NvmeStaging {
     /// entries (excluding `exclude_file_id`, whose newest payload is the one
     /// being staged right now). Best-effort: a full queue means promotion is
     /// already in flight.
-    fn kick_promotion(&self, exclude_file_id: &str, max_items: usize) {
+    /// Async by the ledger-lock invariant (see `stage_write`'s prior-cost
+    /// read): the walk visits every bucket, and a bucket whose entry lock
+    /// is held across a shard-write wait must park this TASK, never the
+    /// executor thread. Both callers are `stage_write` (async context).
+    async fn kick_promotion(&self, exclude_file_id: &str, max_items: usize) {
         let mut pending: Vec<(String, u64)> = Vec::new();
-        self.staged_ledger.iter_sync(|file_id, (cost, _)| {
-            if file_id != exclude_file_id {
-                pending.push((file_id.clone(), *cost));
-            }
-            pending.len() < max_items
-        });
+        self.staged_ledger
+            .iter_async(|file_id, (cost, _)| {
+                if file_id != exclude_file_id {
+                    pending.push((file_id.clone(), *cost));
+                }
+                pending.len() < max_items
+            })
+            .await;
         for (file_id, cost) in pending {
             let Some(meta) = self.staged_meta_of(&file_id) else {
                 continue;
@@ -1320,8 +1339,15 @@ impl NvmeStaging {
     }
 
     /// Current stage generation of `file_id`, if it is budget-counted.
-    pub fn staged_generation(&self, file_id: &str) -> Option<u64> {
-        self.staged_ledger.read_sync(file_id, |_, (_, gen)| *gen)
+    /// Async by the ledger-lock invariant (see `stage_write`'s prior-cost
+    /// read): every caller is async-context (promotion commit, the read
+    /// path's in-flight-identity retry), and the bucket's entry lock is
+    /// legitimately held across shard-write waits — park the task, never
+    /// the executor thread.
+    pub async fn staged_generation(&self, file_id: &str) -> Option<u64> {
+        self.staged_ledger
+            .read_async(file_id, |_, (_, gen)| *gen)
+            .await
     }
 
     /// Remove `file_id`'s ring entry and return its budget **iff** its stage

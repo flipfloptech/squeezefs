@@ -4119,7 +4119,7 @@ impl DataRouter {
         fencing_token: u64,
     ) -> Result<bool> {
         let nvme = &self.cache.nvme;
-        let Some(gen) = nvme.staged_generation(file_id) else {
+        let Some(gen) = nvme.staged_generation(file_id).await else {
             return Ok(false);
         };
         let Some(raw) = nvme.read_staged(file_id) else {
@@ -4201,7 +4201,7 @@ impl DataRouter {
             };
             if current.file_type != "staged"
                 || current.file_id.as_deref() != Some(file_id)
-                || nvme.staged_generation(file_id) != Some(gen)
+                || nvme.staged_generation(file_id).await != Some(gen)
             {
                 return Ok(false);
             }
@@ -6100,7 +6100,7 @@ impl DataRouter {
                             continue;
                         }
                     }
-                    if self.cache.nvme.staged_generation(&file_id).is_some() {
+                    if self.cache.nvme.staged_generation(&file_id).await.is_some() {
                         // Same identity, budget-counted but not ring-resident: a
                         // stage/promotion of this id is IN FLIGHT. Bounded
                         // backoff, then re-resolve — never zeros for live data.

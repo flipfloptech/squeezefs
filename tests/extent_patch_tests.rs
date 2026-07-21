@@ -1671,3 +1671,84 @@ async fn cli_clone_refuses_live_writer() {
     );
     drop(holder);
 }
+
+/// VL8 item 7 — the DETERMINISTIC form of the bimodal
+/// `read_mid_patch_coherence_no_torn_or_stale_serves` EIO: a W1 patch
+/// storm bumps the SAME key's incarnation word at high frequency without
+/// ever changing the block-index→key binding, so a reader whose device
+/// fetch overlaps every round exhausts `get_block_for_index`'s bounded
+/// rebinds ("did not settle after 8 binding rebinds" → EIO), even though
+/// the block's content is perfectly servable. The bound's comment assumed
+/// consecutive invalidations require back-to-back whole COW rewrites —
+/// W1 in-place patches broke that assumption.
+///
+/// The storm here drives the §5.1 protocol directly (block lock →
+/// `begin_patch_sole_owner` → DMA window → `publish_block`) back-to-back,
+/// modeling the sticky machine window where the patcher outruns every
+/// reader fetch. Reads must make progress and serve the (unchanged) base
+/// content — never EIO.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_survives_perpetual_patch_storm_no_rebind_eio() {
+    let _g = serial().await;
+    let h = Arc::new(make(*b"vl8-item7-000001", "vl8_ns_i7").await);
+    let (ino, base) = durable_striped(&h, "i7.dat", 4, 0x33).await;
+
+    // Resolve block 2's device offset + allocator (the §5.1 words).
+    let file_path = squeezefs::keys::inode_path(ino);
+    let meta = h.fs.router.fetch_metadata(&file_path).await.unwrap();
+    let mapping = meta
+        .block_map
+        .as_ref()
+        .and_then(|bm| bm.get(&2).cloned())
+        .expect("block 2 mapped");
+    let (be_id, off) = h
+        .fs
+        .router
+        .backend_router
+        .parse_block_key(&mapping)
+        .expect("parse block key");
+    let (alloc, _dev) = h
+        .fs
+        .router
+        .backend_router
+        .get_backend(&be_id)
+        .expect("backend");
+
+    // The storm: back-to-back §5.1 patch rounds (lock → unstable → DMA
+    // window → publish), duty cycle ≈ 100 % — every UNLOCKED reader fetch
+    // overlaps an unstable/moved word.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let storm = {
+        let stop = stop.clone();
+        let alloc = alloc.clone();
+        tokio::spawn(async move {
+            while !stop.load(Ordering::Acquire) {
+                let guard = squeezefs::fuse_client::BLOCK_FLUSH_LOCKS
+                    .get_lock(ino, 2)
+                    .lock()
+                    .await;
+                if alloc.begin_patch_sole_owner(off) {
+                    // The DMA window (content unchanged in this model).
+                    tokio::task::yield_now().await;
+                    alloc.publish_block(off);
+                }
+                drop(guard);
+            }
+        })
+    };
+
+    // Reads must make progress under the storm — today they EIO after 8
+    // rebinds. Purge tiers per round so each read is device-honest.
+    for round in 0..10 {
+        purge_read_tiers(&h, ino).await;
+        let got = read_at(&h, ino, 2 * BS + 16384, 8192).await;
+        assert_bytes(
+            &got,
+            &base[(2 * BS + 16384) as usize..(2 * BS + 16384) as usize + 8192],
+            &format!("round {round}: storm-raced read must serve the base content"),
+        );
+    }
+
+    stop.store(true, Ordering::Release);
+    storm.await.unwrap();
+}

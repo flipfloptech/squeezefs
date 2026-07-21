@@ -443,6 +443,64 @@ async fn open_o_trunc_truncates_daemon_state() {
     );
 }
 
+/// The O_TRUNC-fix follow-up (found by the first counted generic/074 ×20:
+/// run 2 aborted the count with `fstest.0 … Input/output error` +
+/// `FencingTokenExpired {1, 2}`): setattr's size path presented a BARE
+/// `get_fencing_token_ino` snapshot instead of holding the shared cached
+/// lease. Sequence: close drops the cached lease → a background flush
+/// re-acquires (token bump) → the O_TRUNC open's truncate presents the
+/// stale snapshot → `save_metadata_to_backend` fences it → EIO to
+/// `open(2)`. Truncate is a mutation: it must ride the SAME
+/// `get_or_acquire_lease` discipline as writes (shared cache ⇒ no bump,
+/// or a fresh acquisition serialized behind the transient holder).
+///
+/// Race-loop repro (the window is bump-between-snapshot-and-save; no
+/// deterministic seam exists, so the loop drives it statistically —
+/// red-verified firing well within the budget pre-fix; post-fix every
+/// iteration must succeed by construction).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_o_trunc_never_races_lease_churn_into_eio() {
+    let _g = serial().await;
+    default_knobs();
+    let h = make(*b"mmapwb074lease!!", "mmap_wb_lease_race").await;
+    let ino = create(&h, "victim").await;
+    let path = squeezefs::keys::inode_path(ino);
+
+    for i in 0..300u32 {
+        // A write caches the op lease…
+        write_task(h.fs.clone(), h.req, ino, 0, vec![i as u8; 8192]).await;
+        // …release drops it…
+        h.fs.invalidate_local_lease(ino);
+        // …and the O_TRUNC open races a transient background acquirer
+        // (drain/clone-class): pre-fix some iteration's truncate presents
+        // a stale token and open(2) gets EIO.
+        let dlm = h.fs.dlm().clone();
+        let p = path.clone();
+        let acquirer = tokio::spawn(async move {
+            // Best-effort with a short budget: post-fix the open's
+            // truncate legitimately holds the cached op lease, so this
+            // acquirer finding the lock held (LockFailed) is the CORRECT
+            // outcome — no bump can occur under a held lease.
+            if let Ok(lease) = dlm
+                .acquire_lock(&p, None, std::time::Duration::from_millis(50))
+                .await
+            {
+                drop(lease);
+            }
+        });
+        let opened =
+            h.fs.open(h.req, ino, (libc::O_RDWR | libc::O_TRUNC) as u32)
+                .await;
+        acquirer.await.expect("acquirer task");
+        assert!(
+            opened.is_ok(),
+            "iteration {i}: open(O_TRUNC) must never surface a transient \
+             lease-churn fencing race as an open(2) error: {:?}",
+            opened.err()
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mmap_writeback_generations_stay_current_default_knobs() {
     let _g = serial().await;

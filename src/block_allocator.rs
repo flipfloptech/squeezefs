@@ -566,7 +566,7 @@ impl BlockAllocator {
     /// FIND-RW5-A face 6: a free of an UNTRACKED offset is **refused**
     /// (`false`), loudly and counted. At steady state every legitimately
     /// freeable offset carries a refcount entry — allocation seeds it
-    /// ([`Self::claim_block_idx`], [`Self::allocate_specific_block`]) and
+    /// (`claim_block_idx`, [`Self::allocate_specific_block`]) and
     /// the mount recovery walk seeds every live reference
     /// ([`Self::recover_block`]) — so an untracked free is the second half
     /// of a double-release: the lineage that, interleaved with two

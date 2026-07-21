@@ -30,7 +30,7 @@ pub const SYSFS_NVME: &str = "/sys/class/nvme";
 /// the same `(transport, subsysnqn, target endpoint)`. The sampled
 /// reconnect counter tracks THIS, never the `nvmeN` name.
 ///
-/// FIND-N6-A: `endpoint` is the [`stable_endpoint`] reduction of the
+/// FIND-N6-A: `endpoint` is the `stable_endpoint` reduction of the
 /// `address` attribute, NEVER the raw string — nvme-tcp appends
 /// `src_addr=…` only while queue 0 is live (`nvme_tcp_get_address`,
 /// drivers/nvme/host/tcp.c), so the raw string CHANGES between
@@ -92,7 +92,7 @@ pub struct FabricController {
 
 impl FabricController {
     /// The renumbering-stable identity tuple (see [`FabricIdentity`] —
-    /// FIND-N6-A: the address component is the [`stable_endpoint`]
+    /// FIND-N6-A: the address component is the `stable_endpoint`
     /// reduction, never the raw state-volatile attribute).
     pub fn identity(&self) -> FabricIdentity {
         FabricIdentity {

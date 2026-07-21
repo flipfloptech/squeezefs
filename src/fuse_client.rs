@@ -868,7 +868,14 @@ pub fn spawn_op_watchdog() {
                 // Refresh the coarse clock FIRST so ops registering after
                 // this tick stamp a fresh epoch, then scan.
                 COARSE_NOW_NS.store(prof_now_ns(), Ordering::Relaxed);
-                let _ = op_watchdog_tick(threshold);
+                let overdue = op_watchdog_tick(threshold);
+                if !overdue.is_empty() {
+                    // Named-holder companion (VL10): the overdue-op lines
+                    // name parked OPS; this names the LOCKS they park on
+                    // and each blocked stripe's last acquirer, so a wedge
+                    // capture reads as a cycle without a gdb session.
+                    log_lock_wait_census(threshold);
+                }
             }
         });
     });
@@ -1010,9 +1017,13 @@ pub enum BlockLockSite {
     /// W2 per-block fold (`fold_extent_block`) — seed once, apply k
     /// extents, one durable upload (design-random-small-writes §5.2).
     Fold = 8,
+    /// The VL8-item-7 read-path contention escalation
+    /// (`DataRouter::get_block_for_index`, `escalate_contended`) — one
+    /// fetch serialized under the block's stripe.
+    ReadEscalate = 9,
 }
 
-const BLOCK_LOCK_SITES: usize = 9;
+const BLOCK_LOCK_SITES: usize = 10;
 const BLOCK_LOCK_SITE_NAMES: [&str; BLOCK_LOCK_SITES] = [
     "write_checkout",
     "spill_victim",
@@ -1023,6 +1034,7 @@ const BLOCK_LOCK_SITE_NAMES: [&str; BLOCK_LOCK_SITES] = [
     "read_seed",
     "staged_write",
     "fold",
+    "read_escalate",
 ];
 
 struct WriteProfState {
@@ -1122,6 +1134,7 @@ async fn block_lock_acquire_prof(
             let holder = WRITE_PROF.stripe_holders[stripe].load(Ordering::Relaxed);
             let depth = WRITE_PROF.stripe_wait_depth[stripe].fetch_add(1, Ordering::Relaxed) + 1;
             WRITE_PROF.stripe_waiters.record(depth as usize);
+            let _t = LockWaitToken::begin(LockClass::Block, site as u64, ino, b as u64);
             let g = lock.lock().await;
             WRITE_PROF.stripe_wait_depth[stripe].fetch_sub(1, Ordering::Relaxed);
             let waited = t0.elapsed();
@@ -1135,6 +1148,7 @@ async fn block_lock_acquire_prof(
     };
     let waited = t0.elapsed();
     WRITE_PROF.stripe_holders[stripe].store(key, Ordering::Relaxed);
+    STRIPE_LAST_HOLDER[stripe].store(pack_holder(site, ino, b), Ordering::Relaxed);
     WRITE_PROF.site_waits[site as usize].record(waited);
     (guard, waited)
 }
@@ -1154,10 +1168,32 @@ pub async fn block_lock_acquire_timed(
     let lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
     if !op_profile_enabled() {
         let t0 = std::time::Instant::now();
-        let g = lock.lock().await;
+        let g = block_lock_census_acquire(lock, site, ino, b).await;
         return (g, t0.elapsed());
     }
     block_lock_acquire_prof(lock, site, ino, b).await
+}
+
+/// Always-on census acquisition: `try_lock` fast path (one CAS, the same
+/// state transition `lock()` performs uncontended); the contended arm
+/// registers a [`LockWaitToken`] so the watchdog can name this wait, and
+/// every acquisition stamps the stripe's last-holder word.
+async fn block_lock_census_acquire(
+    lock: &tokio::sync::Mutex<()>,
+    site: BlockLockSite,
+    ino: u64,
+    b: u32,
+) -> tokio::sync::MutexGuard<'_, ()> {
+    let g = match lock.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            let _t = LockWaitToken::begin(LockClass::Block, site as u64, ino, b as u64);
+            lock.lock().await
+        }
+    };
+    let stripe = BLOCK_FLUSH_LOCKS.block_shard_index(ino, b);
+    STRIPE_LAST_HOLDER[stripe].store(pack_holder(site, ino, b), Ordering::Relaxed);
+    g
 }
 
 /// [`block_lock_acquire_timed`] for the sites that never timed their wait:
@@ -1170,7 +1206,7 @@ pub async fn block_lock_acquire(
 ) -> tokio::sync::MutexGuard<'static, ()> {
     let lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
     if !op_profile_enabled() {
-        return lock.lock().await;
+        return block_lock_census_acquire(lock, site, ino, b).await;
     }
     block_lock_acquire_prof(lock, site, ino, b).await.0
 }
@@ -1192,6 +1228,211 @@ pub fn block_lock_try_note(site: BlockLockSite, ino: u64, b: u32, acquired: bool
             .spill_victim_lock_skips
             .fetch_add(1, Ordering::Relaxed);
     }
+}
+
+// ===========================================================================
+// Lock-wait census — the D1.b watchdog's NAMED-HOLDER surface (VL10).
+//
+// The VL8 wedge captures proved the overdue-op list alone cannot draw a
+// deadlock cycle: it names parked OPS, not the LOCKS they park on or the
+// keys that hold those locks. This census tracks, always-on:
+//
+//  - **Live waiters** on the two lock populations every write-path cycle
+//    has run through (`BLOCK_FLUSH_LOCKS`, `INODE_META_LOCKS`): a fixed
+//    lock-free slab, claimed only on the CONTENDED path (the uncontended
+//    fast path pays one extra `try_lock` CAS, nothing else).
+//  - **Last holder per BLOCK stripe**: one relaxed store per acquisition
+//    packing (site, ino, block) — "last acquirer" semantics like the RW1
+//    audit word (release does not clear it), diagnostic-grade by design.
+//
+// The watchdog tick appends the census to its overdue report, so a wedge
+// capture reads as a cycle: op X (ino A) waits block stripe S whose last
+// holder was site=fold (ino B, block C), which waits meta ino B, …
+// ===========================================================================
+
+/// Census lock classes (the populations wired so far).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LockClass {
+    /// `BLOCK_FLUSH_LOCKS` (P1-9 level 3) — `key` = block index.
+    Block = 0,
+    /// `INODE_META_LOCKS` (P1-9 level 3.5) — `key` unused.
+    Meta = 1,
+}
+
+const LOCK_CLASS_NAMES: [&str; 2] = ["block", "meta"];
+const LOCK_WAIT_SLOTS: usize = 512;
+
+struct LockWaitSlot {
+    /// 0 = free, 1 = claimed/waiting.
+    state: AtomicU64,
+    class: AtomicU64,
+    site: AtomicU64,
+    ino: AtomicU64,
+    key: AtomicU64,
+    since_ns: AtomicU64,
+}
+
+static LOCK_WAIT_CENSUS: Lazy<Vec<LockWaitSlot>> = Lazy::new(|| {
+    (0..LOCK_WAIT_SLOTS)
+        .map(|_| LockWaitSlot {
+            state: AtomicU64::new(0),
+            class: AtomicU64::new(0),
+            site: AtomicU64::new(0),
+            ino: AtomicU64::new(0),
+            key: AtomicU64::new(0),
+            since_ns: AtomicU64::new(0),
+        })
+        .collect()
+});
+
+/// Always-on last-holder word per `BLOCK_FLUSH_LOCKS` stripe:
+/// `[63:60] site+1 (0 = never held)`, `[59:24] ino low 36`,
+/// `[23:0] block low 24`. Truncation/collision = one misattributed
+/// diagnostic line, never a correctness event.
+static STRIPE_LAST_HOLDER: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| (0..BLOCK_LOCK_STRIPES).map(|_| AtomicU64::new(0)).collect());
+
+#[inline]
+fn pack_holder(site: BlockLockSite, ino: u64, b: u32) -> u64 {
+    ((site as u64 + 1) << 60) | ((ino & ((1 << 36) - 1)) << 24) | (b as u64 & 0xFF_FFFF)
+}
+
+fn unpack_holder(word: u64) -> Option<(&'static str, u64, u64)> {
+    let site = (word >> 60) as usize;
+    if site == 0 {
+        return None;
+    }
+    let name = BLOCK_LOCK_SITE_NAMES
+        .get(site - 1)
+        .copied()
+        .unwrap_or("unknown");
+    Some((name, (word >> 24) & ((1 << 36) - 1), word & 0xFF_FFFF))
+}
+
+/// RAII census entry for one CONTENDED lock wait. Slab exhaustion (more
+/// than `LOCK_WAIT_SLOTS` concurrent contended waits) degrades to an
+/// uncounted wait — never blocks, never allocates.
+pub struct LockWaitToken(usize);
+
+impl LockWaitToken {
+    fn begin(class: LockClass, site: u64, ino: u64, key: u64) -> LockWaitToken {
+        for (i, slot) in LOCK_WAIT_CENSUS.iter().enumerate() {
+            if slot
+                .state
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                slot.class.store(class as u64, Ordering::Relaxed);
+                slot.site.store(site, Ordering::Relaxed);
+                slot.ino.store(ino, Ordering::Relaxed);
+                slot.key.store(key, Ordering::Relaxed);
+                slot.since_ns.store(prof_now_ns(), Ordering::Relaxed);
+                return LockWaitToken(i);
+            }
+        }
+        LockWaitToken(usize::MAX)
+    }
+}
+
+impl Drop for LockWaitToken {
+    fn drop(&mut self) {
+        if self.0 != usize::MAX {
+            LOCK_WAIT_CENSUS[self.0].state.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// One live contended lock wait as reported by [`lock_wait_census`].
+#[derive(Debug, Clone)]
+pub struct LockWaitEntry {
+    /// Lock class name (`block` / `meta`).
+    pub class: &'static str,
+    /// Acquiring call-site name (block class) or `-`.
+    pub site: &'static str,
+    /// Waiter's target inode.
+    pub ino: u64,
+    /// Waiter's target block (block class; 0 for meta).
+    pub key: u64,
+    /// Wait age at scan, ms.
+    pub waited_ms: u64,
+    /// The blocked stripe's LAST holder, when known (block class):
+    /// `(site, ino, block)` — last-acquirer semantics.
+    pub holder: Option<(&'static str, u64, u64)>,
+}
+
+/// Scan the census for waits older than `threshold` (the watchdog's
+/// named-holder report; tests call it directly). Same scan-vs-release
+/// race contract as [`op_watchdog_tick`]: diagnostic-grade, never wrong
+/// about a wait that is genuinely stuck.
+pub fn lock_wait_census(threshold: Duration) -> Vec<LockWaitEntry> {
+    let now = prof_now_ns();
+    let threshold_ns = threshold.as_nanos() as u64;
+    let mut out = Vec::new();
+    for slot in LOCK_WAIT_CENSUS.iter() {
+        if slot.state.load(Ordering::Acquire) != 1 {
+            continue;
+        }
+        let age = now.saturating_sub(slot.since_ns.load(Ordering::Relaxed));
+        if age < threshold_ns {
+            continue;
+        }
+        let class_idx = slot.class.load(Ordering::Relaxed) as usize;
+        let class = LOCK_CLASS_NAMES.get(class_idx).copied().unwrap_or("?");
+        let site_idx = slot.site.load(Ordering::Relaxed) as usize;
+        let ino = slot.ino.load(Ordering::Relaxed);
+        let key = slot.key.load(Ordering::Relaxed);
+        let (site, holder) = if class_idx == LockClass::Block as usize {
+            let stripe = BLOCK_FLUSH_LOCKS.block_shard_index(ino, key as u32);
+            (
+                BLOCK_LOCK_SITE_NAMES.get(site_idx).copied().unwrap_or("?"),
+                unpack_holder(STRIPE_LAST_HOLDER[stripe].load(Ordering::Relaxed)),
+            )
+        } else {
+            ("-", None)
+        };
+        out.push(LockWaitEntry {
+            class,
+            site,
+            ino,
+            key,
+            waited_ms: age / 1_000_000,
+            holder,
+        });
+    }
+    out
+}
+
+/// Log the named-holder census (the watchdog's cycle-drawing companion to
+/// the overdue-op lines). Bounded output; one line per stuck wait.
+pub fn log_lock_wait_census(threshold: Duration) {
+    for e in lock_wait_census(threshold).into_iter().take(64) {
+        match e.holder {
+            Some((hsite, hino, hb)) => error!(
+                "lock-wait census: {}/{} ino {} key {} waited {} ms — stripe last-holder \
+                 site={} ino {} block {}",
+                e.class, e.site, e.ino, e.key, e.waited_ms, hsite, hino, hb
+            ),
+            None => error!(
+                "lock-wait census: {}/{} ino {} key {} waited {} ms",
+                e.class, e.site, e.ino, e.key, e.waited_ms
+            ),
+        }
+    }
+}
+
+/// Census-wrapped acquisition of an `INODE_META_LOCKS`-class mutex (used
+/// by `routing::meta_lock_acquire` — the lock lives in `routing`, the
+/// census here). Fast path: one `try_lock`.
+pub async fn census_meta_lock_acquire(
+    lock: &tokio::sync::Mutex<()>,
+    ino: u64,
+) -> tokio::sync::MutexGuard<'_, ()> {
+    if let Ok(g) = lock.try_lock() {
+        return g;
+    }
+    let _t = LockWaitToken::begin(LockClass::Meta, 0, ino, 0);
+    lock.lock().await
 }
 
 /// RAII in-flight WRITE sample (`fuse_write_inflight`): entering samples the

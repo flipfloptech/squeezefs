@@ -32,6 +32,14 @@ use uuid::Uuid;
 static INODE_META_LOCKS: once_cell::sync::Lazy<StripeLocks<tokio::sync::Mutex<()>, 4096>> =
     once_cell::sync::Lazy::new(StripeLocks::new);
 
+/// Census-wrapped `INODE_META_LOCKS` acquisition (the D1.b named-holder
+/// surface, VL10): every acquisition site routes here so a contended wait
+/// on the block-map merge domain shows up in the watchdog's lock-wait
+/// census with its inode named. Fast path = one `try_lock`.
+async fn meta_lock_acquire(ino: u64) -> tokio::sync::MutexGuard<'static, ()> {
+    crate::fuse_client::census_meta_lock_acquire(INODE_META_LOCKS.get_inode_lock(ino), ino).await
+}
+
 /// Per-inode (striped, collision-tolerant) LAYOUT-PRUNE EPOCH — a latch-free
 /// monotonic counter bumped under `INODE_META_LOCKS` by every block-map
 /// PRUNING merge (`TruncateFrom`, `RemoveBlocks`). The delayed-merge flush
@@ -3672,10 +3680,12 @@ impl DataRouter {
             {
                 let ino = parse_inode_from_path(file_path);
                 Some(
-                    crate::fuse_client::BLOCK_FLUSH_LOCKS
-                        .get_lock(ino, b)
-                        .lock()
-                        .await,
+                    crate::fuse_client::block_lock_acquire(
+                        ino,
+                        b,
+                        crate::fuse_client::BlockLockSite::ReadEscalate,
+                    )
+                    .await,
                 )
             } else {
                 None
@@ -4005,7 +4015,7 @@ impl DataRouter {
         // can never clobber a concurrent writer's fresh cache entry (see
         // INODE_META_LOCKS). Double-check after acquiring: a writer or racing
         // filler may have refreshed (or dirtied) the entry while we waited.
-        let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+        let _meta_guard = meta_lock_acquire(ino).await;
         if let Some(entry) = self.metadata_cache.get(&ino) {
             if fresh_or_dirty(&entry) {
                 return Ok(entry);
@@ -4046,7 +4056,7 @@ impl DataRouter {
         target_size: u64,
         fencing_token: u64,
     ) -> Result<()> {
-        let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+        let _meta_guard = meta_lock_acquire(ino).await;
         // NOTE: `fetch_metadata` would retake this lock.
         let current = match self.metadata_cache.get(&ino) {
             Some(m) => Some(m),
@@ -4082,7 +4092,7 @@ impl DataRouter {
         fencing_token: u64,
     ) -> Result<()> {
         let ino = parse_inode_from_path(file_path);
-        let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+        let _meta_guard = meta_lock_acquire(ino).await;
         let Some(meta) = self.metadata_cache.get(&ino) else {
             return Ok(());
         };
@@ -4189,7 +4199,7 @@ impl DataRouter {
 
         let ino = parse_inode_from_path(file_path);
         let commit = async {
-            let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+            let _meta_guard = meta_lock_acquire(ino).await;
             // Authoritative meta: RAM cache first (post-write truth), then
             // backend. NOTE: `fetch_metadata` would retake this lock.
             let current = match self.metadata_cache.get(&ino) {
@@ -4439,7 +4449,7 @@ impl DataRouter {
         fencing_token: u64,
         expected_epoch: Option<u64>,
     ) -> Result<Option<Vec<String>>> {
-        let _map_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+        let _map_guard = meta_lock_acquire(ino).await;
 
         let epoch_word = LAYOUT_PRUNE_EPOCHS.get_inode_lock(ino);
         if let Some(expected) = expected_epoch {
@@ -4586,7 +4596,7 @@ impl DataRouter {
     /// locked body (that call would retake this lock).
     pub async fn update_metadata_cache_size(&self, file_path: &str, size: u64) {
         let ino = parse_inode_from_path(file_path);
-        let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+        let _meta_guard = meta_lock_acquire(ino).await;
         let entry = match self.metadata_cache.get(&ino) {
             Some(entry) => Some(entry),
             None => match self.fetch_metadata_from_backend(ino).await {
@@ -5210,7 +5220,7 @@ impl DataRouter {
             }
 
             {
-                let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+                let _meta_guard = meta_lock_acquire(ino).await;
                 let fresh = self.metadata_cache.get(&ino);
                 let mut updated_meta = meta.clone();
                 updated_meta.file_type = "striped".to_string();
@@ -5279,7 +5289,7 @@ impl DataRouter {
                 .fetch_add(1, Ordering::Relaxed);
             let shared_data = payload_bytes;
 
-            let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+            let _meta_guard = meta_lock_acquire(ino).await;
             let fresh = self.metadata_cache.get(&ino);
             let mut updated_meta = meta.clone();
             updated_meta.file_type = "inline".to_string();
@@ -5333,7 +5343,7 @@ impl DataRouter {
 
             match stage_res {
                 Ok(_) => {
-                    let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+                    let _meta_guard = meta_lock_acquire(ino).await;
                     let fresh = self.metadata_cache.get(&ino);
                     // Ring-residency check (leg 5 of the zeros-LOSS family).
                     // A promotion enqueued by THIS stage's high-water
@@ -5462,7 +5472,7 @@ impl DataRouter {
                     // layout with pre-spill content.
                     let spill_file_id = Uuid::new_v4().to_string();
 
-                    let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+                    let _meta_guard = meta_lock_acquire(ino).await;
                     let fresh = self.metadata_cache.get(&ino);
                     let mut updated_meta = meta.clone();
                     updated_meta.file_type = "staged".to_string();
@@ -7292,7 +7302,7 @@ impl DataRouter {
                                  to avoid an unpinned/unvalidated clone"
                             )));
                         }
-                        let _meta_guard = INODE_META_LOCKS.get_inode_lock(src_ino).lock().await;
+                        let _meta_guard = meta_lock_acquire(src_ino).await;
                         match self.fetch_metadata_from_backend(src_ino).await? {
                             Some(fresh) if fresh.file_type == "striped" => current = fresh,
                             _ => {
@@ -7547,7 +7557,7 @@ impl DataRouter {
         // that committed since our snapshot must not be clobbered with a
         // pre-commit block_map).
         let commit = async {
-            let _meta_guard = INODE_META_LOCKS.get_inode_lock(ino).lock().await;
+            let _meta_guard = meta_lock_acquire(ino).await;
             // NOTE: `fetch_metadata` would retake this lock.
             let current = match self.metadata_cache.get(&ino) {
                 Some(m) => Some(m),

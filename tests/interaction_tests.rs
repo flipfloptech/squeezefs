@@ -1045,3 +1045,78 @@ async fn slot_migration_and_data_drain_converge_concurrently() {
     }
     fx.close().await;
 }
+
+// ---------------------------------------------------------------------------
+// fsck × meta-add: the census walk over a GUEST-ONLY member (a volume
+// added by `volume add-meta` — no legacy keyspace) must not panic on the
+// member's raw bootstrap records, and must report zero findings.
+// (Caught by the canonical lifecycle soak, iteration 9: `fsck --offline`
+// after add-meta panicked "raw local ino on a volume with no legacy
+// keyspace (routing bug)" — the walk fed the guest-only member's local
+// control record into make_global_ino.)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fsck_census_survives_a_guest_only_meta_member() {
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let m1 = make_file(dir.path(), "meta1", 256 * 1024 * 1024);
+    let m2 = make_file(dir.path(), "meta2", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    format_stamped_metas(&[m1.clone(), m2.clone()], 8, &[&oss1]).await;
+    let recs = base_format_config(&[&oss1]).resolved_data_volumes();
+
+    // Seed a dataset on the 2-member set, then close it cleanly.
+    {
+        let fx = open_fixture_stamped(&[m1.clone(), m2.clone()], &recs).await;
+        let ino = create_file(&fx, "burst.bin").await;
+        striped_burst(&fx, ino, 8).await;
+        for i in 0..6 {
+            create_file(&fx, &format!("aux{i}.txt")).await;
+        }
+        fx.close().await;
+    }
+
+    // The offline add-meta: the third member takes 2 slots as a GUEST —
+    // it has NO legacy keyspace (its only raw records are bootstrap
+    // control records).
+    let m3 = make_file(dir.path(), "meta3", 256 * 1024 * 1024);
+    let uris: Vec<String> = [&m1, &m2]
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    let taken = squeezefs::config_ops::add_meta_volume(
+        &uris,
+        &m3.display().to_string(),
+        &squeezefs::config_ops::TakeSlots::Count(2),
+    )
+    .await
+    .expect("add-meta converges");
+    assert_eq!(taken.len(), 2, "the new member hosts 2 guest slots");
+
+    // Reopen the 3-member set and run the fsck census (the soak's
+    // step-9 posture): it must complete without panicking on the
+    // guest-only member and report zero findings.
+    let fx = open_fixture_stamped(&[m1, m2, m3], &recs).await;
+    let ctx = squeezefs::fsck::FsckCtx {
+        meta: fx.meta.clone(),
+        router: fx.fs.router.clone(),
+        staging_dirs: vec![fx.staging_path.clone()],
+        expected_generation: None,
+    };
+    let mut opts = squeezefs::fsck::FsckOptions::online();
+    opts.settle = Duration::from_millis(100);
+    let report = squeezefs::fsck::run(&ctx, &opts)
+        .await
+        .expect("fsck census must survive a guest-only member (no panic, no error)");
+    assert!(
+        report.findings.is_empty(),
+        "healthy 3-member set must report zero findings: {:?}",
+        report.findings
+    );
+    assert!(
+        report.counters.inodes_scanned > 0,
+        "engagement: the census walked the real inodes"
+    );
+    fx.close().await;
+}

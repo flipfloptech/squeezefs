@@ -1743,6 +1743,16 @@ pub(crate) struct FillResult {
 pub static TEST_TIER_PUBLISH_DELAY_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Test seam (same contract as [`TEST_TIER_PUBLISH_DELAY_MS`]): artificial
+/// delay, in milliseconds, injected between a binding-validated fetch's
+/// bytes-in-hand point and its binding recheck
+/// ([`DataRouter::get_block_for_index`]). Lets the FIND-RW5-A churn suite
+/// make every fetch provably straddle a concurrent write-through
+/// displacement — one relaxed load per fetch, zero-cost when unset; no
+/// `#[cfg(test)]` fork of the production path.
+pub static TEST_BINDING_RECHECK_DELAY_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// R1b disk-tier admission mode (docs/design-read-path.md §5.3), resolved
 /// once per router from `SQUEEZEFS_READ_TIER_ADMISSION`
 /// (`always|second-touch|never`, default `second-touch`; unrecognized
@@ -3699,6 +3709,10 @@ impl DataRouter {
             // Recheck the binding only AFTER the bytes are in hand: the
             // proof needs (movement between snapshot and serve) ⇒ (word
             // changed), which only holds when the recheck follows the read.
+            let recheck_delay = TEST_BINDING_RECHECK_DELAY_MS.load(Ordering::Relaxed);
+            if recheck_delay > 0 {
+                tokio::time::sleep(Duration::from_millis(recheck_delay)).await;
+            }
             let current = self.current_block_binding(file_path, b).await?;
             if incarnation_valid && current.as_deref() == Some(cur_key.as_str()) {
                 return Ok(Some(val));

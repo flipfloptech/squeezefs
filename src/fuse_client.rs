@@ -1944,6 +1944,14 @@ pub struct Metrics {
     pub layout_inline_writes: Align64<AtomicU64>,
     pub layout_staged_writes: Align64<AtomicU64>,
     pub layout_striped_writes: Align64<AtomicU64>,
+    /// FIND-RW5-A: never-lossy StorageFull escalations — a staged
+    /// whole-image/fold/clone arm found the staging ring unable to admit
+    /// its image and degraded to the durable direct-block spill instead of
+    /// surfacing StorageFull to the caller. One count per escalation, all
+    /// arms (staged replace, rider fold, clone). Growth under sustained
+    /// pressure is the DESIGNED degraded mode; a user-visible EIO of the
+    /// StorageFull class is a regression.
+    pub staged_spill_escalations: Align64<AtomicU64>,
     /// FIND-RW4-A store-raw escape: block images whose compressed form
     /// would not shrink (incompressible payloads) stored RAW behind the
     /// frame's raw marker — compression is best-effort per block, never a
@@ -4026,6 +4034,7 @@ impl SqueezefsFilesystem {
                 "prefetch_active_streams": METRICS.prefetch_active_streams.load(Ordering::Relaxed),
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
+                "staged_spill_escalations": METRICS.staged_spill_escalations.load(Ordering::Relaxed),
                 "layout_striped_writes": METRICS.layout_striped_writes.load(Ordering::Relaxed),
                 "compress_stored_raw": METRICS.compress_stored_raw.load(Ordering::Relaxed),
                 "bg_spawn_admitted": METRICS.bg_spawn_admitted.load(Ordering::Relaxed),

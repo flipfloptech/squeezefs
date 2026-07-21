@@ -250,31 +250,36 @@ fn poll_clients(
 }
 
 // ===========================================================================
-// F3 — the defrag verb is REMOVED (no fake Ok(()) surface, no dead code).
+// F3 — the defrag verb: the VL1 fake was REMOVED; PR VL7 shipped the REAL
+// one (§5.7). The stale-script pin survives: the fake verb's flag grammar
+// (`--nvme-path`) still refuses loud, never a fake success.
 // ===========================================================================
 
-/// A stale script running `squeezefs defrag …` must fail loudly with an
-/// unknown-subcommand error — never a fake "Starting defragmentation…" +
-/// exit 0 from a no-op engine.
+/// A stale script running the FAKE verb's grammar must still fail loudly
+/// — the real VL7 verb has a different surface (`--data`/`--meta`/
+/// `--fold`/`--rebalance`/`--report-only`), so `--nvme-path` is an
+/// unknown-argument refusal, never a fake "Starting defragmentation…" +
+/// exit 0.
 #[test]
-fn test_defrag_verb_removed_fails_loud() {
+fn test_defrag_fake_grammar_still_fails_loud() {
     let out = run(&["defrag", "--nvme-path", "/nonexistent"]);
     assert!(
         !out.status.success(),
-        "removed `defrag` verb must exit nonzero, got: {}",
+        "the fake defrag grammar must exit nonzero, got: {}",
         String::from_utf8_lossy(&out.stdout)
     );
     let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
     assert!(
-        stderr.contains("unrecognized subcommand") || stderr.contains("unexpected argument"),
-        "the refusal must be the CLI's unknown-subcommand error (stale scripts \
+        stderr.contains("unexpected argument"),
+        "the refusal must be the CLI's unknown-argument error (stale scripts \
          fail comprehensibly), got:\n{stderr}"
     );
 }
 
-/// `--help` must not advertise the removed verb.
+/// `--help` advertises the REAL verb (PR VL7 — the AGENTS module map is
+/// truthful again), and its own help names the five §5.7 modes.
 #[test]
-fn test_defrag_verb_absent_from_help() {
+fn test_defrag_verb_listed_in_help_with_axis_modes() {
     let out = run(&["--help"]);
     let help = format!(
         "{}{}",
@@ -282,9 +287,21 @@ fn test_defrag_verb_absent_from_help() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        !help.to_lowercase().contains("defrag"),
-        "--help must not list the removed defrag verb:\n{help}"
+        help.to_lowercase().contains("defrag"),
+        "--help must list the VL7 defrag verb:\n{help}"
     );
+    let out = run(&["defrag", "--help"]);
+    let help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for flag in ["--data", "--meta", "--fold", "--rebalance", "--report-only"] {
+        assert!(
+            help.contains(flag),
+            "defrag --help must name the {flag} mode:\n{help}"
+        );
+    }
 }
 
 // ===========================================================================

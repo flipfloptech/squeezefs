@@ -2095,7 +2095,7 @@ impl KvMetaBackend {
 
     /// PR VL7 (§5.7 D4): the **compaction nudge** — fold each candidate
     /// leaf through the EXISTING SMO compactor
-    /// ([`KvTree::compact_node_forced`] → `smo_replace`), serialized with
+    /// (`KvTree::compact_node_forced` → `smo_replace`), serialized with
     /// the checkpoint task through the per-volume SMO mutex (the same
     /// delegation `checkpoint_now` uses — lattice 4b). Journal-reserve /
     /// pending-free refusals run a checkpoint cycle and retry, exactly

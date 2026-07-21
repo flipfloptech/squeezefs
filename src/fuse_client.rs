@@ -4439,8 +4439,16 @@ impl SqueezefsFilesystem {
     /// raw-ino order (the ABBA the VL8 item-2 wedge capture implicated:
     /// two copy_file_range handlers permanently in flight, watchdog-blind,
     /// with every visible victim queued behind striped inode guards).
+    ///
+    /// Order: ascending SHARD INDEX (the total order on the lock
+    /// instances); raw ino only tie-breaks equal shards for determinism —
+    /// the caller's `same_lock`/`ptr_eq` collapse already handles the
+    /// equal-shard case with a single exclusive guard before consulting
+    /// this sequence.
     pub fn inode_pair_lock_order(&self, src: u64, dst: u64) -> (u64, u64) {
-        if src < dst {
+        let s_src = self.active_inode_locks.shard_index(src);
+        let s_dst = self.active_inode_locks.shard_index(dst);
+        if s_src < s_dst || (s_src == s_dst && src <= dst) {
             (src, dst)
         } else {
             (dst, src)
@@ -8341,6 +8349,8 @@ impl Filesystem for SqueezefsFilesystem {
 
     async fn open(&self, _req: Request, inode: Inode, _flags: u32) -> FuseResult<ReplyOpen> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        // VL8 item 2: register (the live wedge held 4 opens invisibly).
+        let _prof = OpProf::begin(FuseOpKind::Open, inode);
         debug!("FUSE Open: inode = {}", inode);
 
         if inode == STATS_INODE || inode == CONFIG_INODE {
@@ -9765,6 +9775,9 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyCopyFileRange> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
+        // VL8 item 2: register BEFORE the guards — the live wedge's stuck
+        // cfr handlers were watchdog-invisible exactly while guard-blocked.
+        let _prof = OpProf::begin(FuseOpKind::CopyFileRange, inode);
         debug!(
             "FUSE copy_file_range: src_ino = {}, off_in = {}, dest_ino = {}, off_out = {}, length = {}",
             inode, off_in, inode_out, off_out, length
@@ -10339,6 +10352,8 @@ impl Filesystem for SqueezefsFilesystem {
         mode: u32,
     ) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        // VL8 item 2: register BEFORE the inode guard (watchdog visibility).
+        let _prof = OpProf::begin(FuseOpKind::Fallocate, ino);
         debug!(
             "FUSE Fallocate: ino = {}, offset = {}, length = {}, mode = {}",
             ino, offset, length, mode

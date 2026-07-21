@@ -1701,18 +1701,16 @@ async fn read_survives_perpetual_patch_storm_no_rebind_eio() {
         .as_ref()
         .and_then(|bm| bm.get(&2).cloned())
         .expect("block 2 mapped");
-    let (be_id, off) = h
-        .fs
-        .router
-        .backend_router
-        .parse_block_key(&mapping)
-        .expect("parse block key");
-    let (alloc, _dev) = h
-        .fs
-        .router
-        .backend_router
-        .get_backend(&be_id)
-        .expect("backend");
+    let (be_id, off) =
+        h.fs.router
+            .backend_router
+            .parse_block_key(&mapping)
+            .expect("parse block key");
+    let (alloc, _dev) =
+        h.fs.router
+            .backend_router
+            .get_backend(&be_id)
+            .expect("backend");
 
     // The storm: back-to-back §5.1 patch rounds (lock → unstable → DMA
     // window → publish), duty cycle ≈ 100 % — every UNLOCKED reader fetch

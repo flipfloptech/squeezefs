@@ -1307,7 +1307,9 @@ async fn test_add_meta_rerun_converges_after_survivor_stamps_crash() {
     // The converged 3-member set mounts with every ino stable, diff ∅.
     let mut new_paths = paths.clone();
     new_paths.push(m2.display().to_string());
-    let routed = open_routed_meta_set(&new_paths).await.expect("open new set");
+    let routed = open_routed_meta_set(&new_paths)
+        .await
+        .expect("open new set");
     verify_population(&routed, &made).await;
     assert_eq!(
         set_logical_digest(&routed).await.expect("digest"),
@@ -1361,7 +1363,9 @@ async fn test_add_meta_rerun_converges_after_new_member_claim_crash() {
 
     let mut new_paths = paths.clone();
     new_paths.push(m2.display().to_string());
-    let routed = open_routed_meta_set(&new_paths).await.expect("open new set");
+    let routed = open_routed_meta_set(&new_paths)
+        .await
+        .expect("open new set");
     verify_population(&routed, &made).await;
     assert_eq!(
         set_logical_digest(&routed).await.expect("digest"),

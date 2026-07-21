@@ -2948,6 +2948,18 @@ pub struct SqueezefsFilesystem {
     dismount_done: std::sync::Arc<tokio::sync::Notify>,
     reclaim_tx: tokio::sync::mpsc::Sender<u64>,
     reclaim_rx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<u64>>>>,
+    /// FIND-RW5-A face 4: per-ino single-drive reclaim guard. RELEASE and
+    /// FORGET both enqueue reclaims and concurrent batches both passed
+    /// admission (the inode slot persists until the destroy commits), so
+    /// duplicate drives ran `delete_file` twice — every mapped block freed
+    /// TWICE, and a double-free interleaved with an allocation STEALS the
+    /// offset from its new owner (one offset, two live layouts: permanent
+    /// incarnation churn, rebind-exhaustion EIOs, cross-file corruption).
+    /// An ino inserts here at admission and is removed only after its
+    /// destroy + teardown completed; a failed destroy LEAVES the guard set
+    /// — the slot and its blocks leak until remount (the never-lossy
+    /// direction) instead of re-arming a second data teardown.
+    reclaim_inflight: std::sync::Arc<scc::HashSet<u64>>,
     pub next_dir_fh: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// L4 interception session host (design-preload-interception §5.2, PR
     /// L4-3): `None` on non-interception mounts. Shared across handler
@@ -3016,6 +3028,7 @@ impl Clone for SqueezefsFilesystem {
             open_inodes: self.open_inodes.clone(),
             kernel_ttls: self.kernel_ttls,
             reclaim_semaphore: self.reclaim_semaphore.clone(),
+            reclaim_inflight: self.reclaim_inflight.clone(),
             dismount_once: self.dismount_once.clone(),
             dismount_complete: self.dismount_complete.clone(),
             dismount_done: self.dismount_done.clone(),
@@ -3121,6 +3134,7 @@ impl SqueezefsFilesystem {
                 ahash::RandomState::new(),
             )),
             kernel_ttls: KernelCacheTtls::from_env(),
+            reclaim_inflight: std::sync::Arc::new(scc::HashSet::new()),
             reclaim_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 reclaim_concurrency,
             )),
@@ -7771,7 +7785,17 @@ impl SqueezefsFilesystem {
                         ino, inode.nlink
                     );
                 }
-                Ok(_) => admitted.push(ino),
+                Ok(_) => {
+                    // Single-drive guard (FIND-RW5-A face 4): only ONE
+                    // reclaim may ever run an ino's data teardown —
+                    // duplicate drives (release+forget enqueues, racing
+                    // batches) double-freed the mapped blocks.
+                    if self.reclaim_inflight.insert_sync(ino).is_ok() {
+                        admitted.push(ino);
+                    } else {
+                        debug!("RECLAIM: ino = {ino} already in flight, skipping");
+                    }
+                }
                 Err(e) => {
                     debug!("RECLAIM: getattr({}) failed: {:?}", ino, e);
                 }
@@ -7845,6 +7869,10 @@ impl SqueezefsFilesystem {
     /// POSIX-lock cleanup, metadata/attr cache invalidation (+ the W1
     /// stream-adjacency word, so the map's growth is bounded by live inos).
     async fn reclaim_teardown(&self, ino: u64) {
+        // The single-drive guard clears only here — after the destroy
+        // committed (a failed destroy leaves it set: leak-safe, see the
+        // field doc).
+        self.reclaim_inflight.remove_sync(&ino);
         if let Some((_, lease)) = self.active_leases.remove(&ino) {
             let _ = lease.release().await;
         }

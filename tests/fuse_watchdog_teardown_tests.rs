@@ -809,3 +809,96 @@ async fn fallocate_registers_with_watchdog_while_guard_blocked() {
         .expect("fallocate must complete once the guard is released")
         .expect("fallocate task join");
 }
+
+// ===========================================================================
+// (7) VL8 item 9 — the syncfs transient-ENOENT vector: a kernel-writeback
+//     WRITE against a destroyed (unlinked + reclaimed) ino.
+// ===========================================================================
+
+/// With the writeback cache + clean-handle FLUSH elision, the kernel can
+/// flush dirty pages AFTER close+unlink destroyed the ino. That WRITE
+/// used to fail ENOENT — which lands in the superblock errseq and makes
+/// the NEXT `syncfs` report ENOENT once on a perfectly healthy mount
+/// (the VL7-rig leg-12 transient; REPRODUCED live on this rig 2026-07-21).
+/// Unlink IS the discard authority for that data: a WRITE whose ino is
+/// verified-NotFound must be answered as a counted discard
+/// (`writeback_orphan_discards` — the FIND-M11-A remount-law analogue),
+/// never an errno that poisons the sb errseq.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_to_reclaimed_ino_is_a_counted_discard_not_enoent() {
+    arm_short_timeout();
+    let sandbox = fs_sandbox().await;
+    let fs = sandbox.fs.clone();
+    // The reclaim worker pool arms in init() (mount does this for real).
+    fs.init(req()).await.expect("init");
+
+    let ino = fs
+        .create(req(), 1, OsStr::new("wb_orphan.txt"), 0o644, 0)
+        .await
+        .expect("create")
+        .attr
+        .ino;
+    // Some real dirty-page-era content while the file lives.
+    fs.write(
+        req(),
+        ino,
+        0,
+        0,
+        bytes::Bytes::from(vec![0xAAu8; 4096]),
+        0,
+        0,
+    )
+    .await
+    .expect("write to a live file");
+
+    // Close the create-handle (create counted an open; an open ino is
+    // never reclaimed), then unlink + FORGET like the kernel would.
+    fs.release(req(), ino, ino, 0, 0, false)
+        .await
+        .expect("release");
+    fs.unlink(req(), 1, OsStr::new("wb_orphan.txt"))
+        .await
+        .expect("unlink");
+    // Destroy is deferred until the kernel's FORGET drops the nlookup —
+    // deliver it (the reclaim worker then destroys the inode).
+    fs.forget(req(), ino, u64::MAX).await;
+
+    // Wait until the reclaim actually destroyed the ino (verified
+    // NotFound — the discard license).
+    let backend = fs.meta_backend.clone().expect("backend");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match backend.getattr(ino).await {
+            Err(_) => break,
+            Ok(_) if std::time::Instant::now() > deadline => {
+                panic!("unlinked ino {ino} was never reclaimed — fixture assumption broke")
+            }
+            Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+
+    // The kernel's deferred writeback WRITE arrives after destruction.
+    let before = METRICS.writeback_orphan_discards.load(Ordering::Relaxed);
+    let reply = fs
+        .write(
+            req(),
+            ino,
+            0,
+            0,
+            bytes::Bytes::from(vec![0xBBu8; 4096]),
+            0,
+            0,
+        )
+        .await
+        .expect(
+            "a writeback WRITE against a verified-reclaimed ino must be a \
+             counted DISCARD (unlink is the discard authority), not an errno \
+             that poisons the superblock errseq into a spurious syncfs failure",
+        );
+    assert_eq!(reply.written, 4096, "the discard acks the full payload");
+    assert!(
+        METRICS.writeback_orphan_discards.load(Ordering::Relaxed) > before,
+        "the discard must be COUNTED (writeback_orphan_discards) — silent \
+         success would hide real custody loss"
+    );
+}

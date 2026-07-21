@@ -9436,7 +9436,22 @@ impl Filesystem for SqueezefsFilesystem {
             };
 
             if let Some(new_size) = size_to_set {
-                let fencing_token = self.dlm.get_fencing_token_ino(ino);
+                // Truncate is a MUTATION: hold the shared op lease exactly
+                // like the write path (get_or_acquire_lease — cached-lease
+                // reuse), never a bare token snapshot. The snapshot raced
+                // any transient background acquirer (drain/clone-class)
+                // re-acquiring after release dropped the cached lease: the
+                // token bumped between the snapshot and the layout save's
+                // fence, and the truncate — since the O_TRUNC fix, run on
+                // every open(O_TRUNC) — surfaced the transient as EIO to
+                // open(2) (the aborted first generic/074 ×20, run 2).
+                // With the shared cache, either both sides reuse one lease
+                // (no bump) or the acquisition serializes behind the
+                // transient holder — no stale-token window exists.
+                let fencing_token = self
+                    .get_or_acquire_lease(ino)
+                    .await
+                    .map_err(map_squeezefs_err)?;
                 // Classify grow-vs-shrink against the FRESHEST size, never the
                 // durable inode size alone: staged/inline writes defer their
                 // layout+size persist, so `current_inode.size` lags and a real
@@ -9495,10 +9510,19 @@ impl Filesystem for SqueezefsFilesystem {
                 // one that already merged is pruned by truncate_layout below.
                 self.drop_active_block_overlays_beyond(ino, new_size).await;
 
-                self.router
+                if let Err(e) = self
+                    .router
                     .truncate_layout(ino, new_size, fencing_token)
                     .await
-                    .map_err(map_squeezefs_err)?;
+                {
+                    // Same hygiene as the write path: a fenced lease is
+                    // stale — drop the local cache so the retry (kernel or
+                    // app) re-acquires fresh.
+                    if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
+                        self.invalidate_local_lease(ino);
+                    }
+                    return Err(map_squeezefs_err(e));
+                }
             }
 
             let backend_res = backend

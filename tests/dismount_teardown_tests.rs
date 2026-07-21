@@ -307,3 +307,87 @@ async fn test_v3_dropped_backend_reaps_checkpoint_task() {
         "the checkpoint task must exit once its backend is dropped (no leaked tasks)"
     );
 }
+
+/// VL8 item 4 — external unmount cancels the session task's `destroy` future
+/// mid-teardown (reply-task select / detached queue workers / daemon exit),
+/// so `client:{id}` and `writer_claim` heartbeat records lingered to the
+/// 45 s staleness TTL. The teardown must survive that cancellation: records
+/// must deregister promptly WITHOUT the TTL wait.
+///
+/// The repro models the cancellation exactly: poll `destroy` once (past the
+/// `dismount_once` claim, into the teardown's first await) and DROP it.
+/// The deregistration must still complete. Observation is a bounded poll of
+/// the backend records (the effect is external to the dropped future — there
+/// is nothing in-band to synchronize on by design).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cancelled_destroy_still_deregisters_heartbeat_records() {
+    use squeezefs::meta_backend::kv::backend::WRITER_CLAIM_XATTR;
+    use squeezefs::meta_backend::Metadata;
+
+    let (fs, req, _b, _m) = make().await;
+    let backend = fs.meta_backend.clone().expect("fixture backend");
+
+    // Register this "mount": client heartbeat record + the writer_claim the
+    // volume open committed.
+    *fs.client_id.lock().unwrap() = "vl8-item4-client".to_string();
+    fs.refresh_client_registration().await;
+    let client_attr = "client:vl8-item4-client".to_string();
+    assert!(
+        backend
+            .getxattr(1, &client_attr)
+            .await
+            .expect("getxattr client record")
+            .is_some(),
+        "fixture must have a live client registration"
+    );
+    assert!(
+        backend
+            .getxattr(1, WRITER_CLAIM_XATTR)
+            .await
+            .expect("getxattr writer_claim")
+            .is_some(),
+        "volume open must have committed a writer_claim"
+    );
+
+    // External unmount: the destroy future is polled into its first await
+    // and then dropped (the session task dies).
+    let mut destroy_fut = Box::pin(fs.destroy(req));
+    let first_poll = futures::poll!(destroy_fut.as_mut());
+    assert!(
+        first_poll.is_pending(),
+        "destroy must reach an await point — the cancellation window is the point of this repro"
+    );
+    drop(destroy_fut);
+    assert!(
+        fs.dismount_started(),
+        "the dropped destroy must have claimed the teardown"
+    );
+
+    // The records must deregister without the 45 s TTL: bounded observation
+    // window well under the TTL.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let client_gone = backend
+            .getxattr(1, &client_attr)
+            .await
+            .ok()
+            .flatten()
+            .is_none();
+        let claim_gone = backend
+            .getxattr(1, WRITER_CLAIM_XATTR)
+            .await
+            .ok()
+            .flatten()
+            .is_none();
+        if client_gone && claim_gone {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "heartbeat records lingered past the observation window after a \
+             cancelled destroy (client_gone={client_gone}, claim_gone={claim_gone}) — \
+             they would sit until the 45 s staleness TTL"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}

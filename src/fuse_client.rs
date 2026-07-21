@@ -2667,6 +2667,14 @@ pub struct SqueezefsFilesystem {
     /// FUSE-over-io_uring surfaces Destroy once per queue; teardown must
     /// run exactly once.
     dismount_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// VL8 item 4: external unmount cancels the session task's `destroy`
+    /// future mid-teardown (reply-task select / detached queue workers /
+    /// daemon exit) — the real teardown therefore runs on a spawned task
+    /// that survives the cancellation, and this pair signals its
+    /// completion (`wait_dismount_teardown`) so the daemon does not exit
+    /// (and tests do not proceed) before heartbeat records deregister.
+    dismount_complete: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    dismount_done: std::sync::Arc<tokio::sync::Notify>,
     reclaim_tx: tokio::sync::mpsc::Sender<u64>,
     reclaim_rx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<u64>>>>,
     pub next_dir_fh: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -2738,6 +2746,8 @@ impl Clone for SqueezefsFilesystem {
             kernel_ttls: self.kernel_ttls,
             reclaim_semaphore: self.reclaim_semaphore.clone(),
             dismount_once: self.dismount_once.clone(),
+            dismount_complete: self.dismount_complete.clone(),
+            dismount_done: self.dismount_done.clone(),
             reclaim_tx: self.reclaim_tx.clone(),
             reclaim_rx: self.reclaim_rx.clone(),
             next_dir_fh: self.next_dir_fh.clone(),
@@ -2844,6 +2854,8 @@ impl SqueezefsFilesystem {
                 reclaim_concurrency,
             )),
             dismount_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dismount_complete: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dismount_done: std::sync::Arc::new(tokio::sync::Notify::new()),
             reclaim_tx,
             reclaim_rx: std::sync::Arc::new(std::sync::Mutex::new(Some(reclaim_rx))),
             next_dir_fh: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
@@ -7538,6 +7550,102 @@ pub struct GdsReadArgs {
 pub const SQUEEZEFS_IOC_GDS_READ: u32 = 0x80186601;
 
 // Implement fuse3 Raw Filesystem interface
+impl SqueezefsFilesystem {
+    /// The single-run dismount teardown body (extracted from `destroy`,
+    /// VL8 item 4): flush staged/memory data, deregister the `client:{id}`
+    /// heartbeat record, and shut each meta volume down (which deletes its
+    /// `writer_claim` and releases the D0 guard). Runs exactly once per
+    /// unmount on a cancellation-immune spawned task.
+    async fn run_dismount_teardown(&self) {
+        info!("FUSE Daemon: Destroying mount. Force flushing all staged and memory data...");
+
+        // Phase 1 & 2: Force flush memory buffers to staging, then staged blocks to NVMe-oF backend
+        let _ = self.force_flush_all_staged_data().await;
+
+        // Gracefully wait up to self.dismount_wait seconds for background workers to drain staged writes and active writes to NVMe-oF backend
+        let start_wait = std::time::Instant::now();
+        let max_wait = std::time::Duration::from_secs(self.dismount_wait);
+        loop {
+            let n = self
+                .router
+                .cache
+                .nvme
+                .staged_writes_in_flight
+                .load(Ordering::Acquire);
+            if n == 0 || start_wait.elapsed() >= max_wait {
+                break;
+            }
+            let remaining = max_wait.saturating_sub(start_wait.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            let notify = self.router.cache.nvme.staged_drained_notify.clone();
+            let _ = tokio::time::timeout(remaining, notify.notified()).await;
+        }
+
+        // Gather final count for warnings/statistics
+        let keys = self.router.cache.nvme.list_staged_files();
+        let mut staged_count = 0;
+        let mut active_writes_count = 0;
+        for key in keys {
+            if key.starts_with("active_block:") {
+                active_writes_count += 1;
+            } else {
+                staged_count += 1;
+            }
+        }
+
+        if staged_count > 0 || active_writes_count > 0 {
+            warn!(
+                "WARNING: SqueezeFS dismounted with unflushed data! Remaining local staged files: {}, active write directories: {}. Other nodes may see inconsistent filesystem state until these are recovered or flushed.",
+                staged_count, active_writes_count
+            );
+        } else {
+            info!("FUSE Daemon: Dismount clean. All write staged blocks successfully flushed to backend.");
+        }
+
+        // Unregister this client on dismount
+        let client_id_str = self.client_id.lock().unwrap().clone();
+        if !client_id_str.is_empty() {
+            if let Some(ref backend) = self.meta_backend {
+                let attr_name = format!("client:{}", client_id_str);
+                let _ = backend.removexattr(1, &attr_name).await;
+            }
+        }
+
+        // Clean-unmount teardown (K6b): each volume runs a final
+        // checkpoint and JOINS its checkpoint task (tail == head ⇒ empty
+        // replay window; no leaked tasks — design §4.6 /
+        // tests/dismount_teardown_tests.rs).
+        if let Some(ref backend) = self.meta_backend {
+            for vol in &backend.volumes {
+                if let Err(e) = vol.shutdown().await {
+                    warn!("Meta volume unmount teardown failed: {:?}", e);
+                }
+            }
+        }
+    }
+
+    /// Wait until the dismount teardown (spawned by the winning `destroy`
+    /// invocation) has completed. Returns immediately when no teardown has
+    /// started. VL8 item 4: the daemon awaits this (bounded) before exit so
+    /// heartbeat records are deregistered, not left to the staleness TTL.
+    pub async fn wait_dismount_teardown(&self) {
+        if !self.dismount_started() {
+            return;
+        }
+        loop {
+            // Arm the notification BEFORE re-checking the flag (the
+            // standard Notify race-closure order).
+            let notified = self.dismount_done.notified();
+            if self.dismount_complete.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 impl Filesystem for SqueezefsFilesystem {
     type DirEntryStream<'a> = futures::stream::BoxStream<'a, FuseResult<DirectoryEntry>>;
     type DirEntryPlusStream<'a> = futures::stream::BoxStream<'a, FuseResult<DirectoryEntryPlus>>;
@@ -7902,75 +8010,25 @@ impl Filesystem for SqueezefsFilesystem {
             debug!("FUSE Daemon: duplicate destroy (per-queue) ignored");
             return;
         }
-        info!("FUSE Daemon: Destroying mount. Force flushing all staged and memory data...");
-
-        // Phase 1 & 2: Force flush memory buffers to staging, then staged blocks to NVMe-oF backend
-        let _ = self.force_flush_all_staged_data().await;
-
-        // Gracefully wait up to self.dismount_wait seconds for background workers to drain staged writes and active writes to NVMe-oF backend
-        let start_wait = std::time::Instant::now();
-        let max_wait = std::time::Duration::from_secs(self.dismount_wait);
-        loop {
-            let n = self
-                .router
-                .cache
-                .nvme
-                .staged_writes_in_flight
-                .load(Ordering::Acquire);
-            if n == 0 || start_wait.elapsed() >= max_wait {
-                break;
-            }
-            let remaining = max_wait.saturating_sub(start_wait.elapsed());
-            if remaining.is_zero() {
-                break;
-            }
-            let notify = self.router.cache.nvme.staged_drained_notify.clone();
-            let _ = tokio::time::timeout(remaining, notify.notified()).await;
-        }
-
-        // Gather final count for warnings/statistics
-        let keys = self.router.cache.nvme.list_staged_files();
-        let mut staged_count = 0;
-        let mut active_writes_count = 0;
-        for key in keys {
-            if key.starts_with("active_block:") {
-                active_writes_count += 1;
-            } else {
-                staged_count += 1;
-            }
-        }
-
-        if staged_count > 0 || active_writes_count > 0 {
-            warn!(
-                "WARNING: SqueezeFS dismounted with unflushed data! Remaining local staged files: {}, active write directories: {}. Other nodes may see inconsistent filesystem state until these are recovered or flushed.",
-                staged_count, active_writes_count
-            );
-        } else {
-            info!("FUSE Daemon: Dismount clean. All write staged blocks successfully flushed to backend.");
-        }
-
-        // Unregister this client on dismount
-        let client_id_str = self.client_id.lock().unwrap().clone();
-        if !client_id_str.is_empty() {
-            if let Some(ref backend) = self.meta_backend {
-                let attr_name = format!("client:{}", client_id_str);
-                let _ = backend.removexattr(1, &attr_name).await;
-            }
-        }
-
-        // Clean-unmount teardown (K6b): each volume runs a final
-        // checkpoint and JOINS its checkpoint task (tail == head ⇒ empty
-        // replay window; no leaked tasks — design §4.6 /
-        // tests/dismount_teardown_tests.rs).
-        if let Some(ref backend) = self.meta_backend {
-            for vol in &backend.volumes {
-                if let Err(e) = vol.shutdown().await {
-                    warn!("Meta volume unmount teardown failed: {:?}", e);
-                }
-            }
-        }
+        // VL8 item 4: the winning destroy invocation may live on a session
+        // task that dies mid-teardown on external unmount (its future is
+        // dropped by the reply-task select, a detached queue worker's
+        // shutdown, or daemon exit) — which stranded `client:`/`writer_claim`
+        // heartbeat records until the 45 s staleness TTL. Run the real
+        // teardown on a spawned task that survives that cancellation and
+        // signal completion for `wait_dismount_teardown`. NOTE: no await
+        // point between the `dismount_once` claim above and this spawn —
+        // the claim can never be taken without the teardown being scheduled.
+        let this = self.clone();
+        let teardown = tokio::spawn(async move {
+            this.run_dismount_teardown().await;
+            this.dismount_complete.store(true, Ordering::Release);
+            this.dismount_done.notify_waiters();
+        });
+        // Normal (non-cancelled) flow still completes the teardown before
+        // replying to DESTROY; if THIS await is dropped, the task runs on.
+        let _ = teardown.await;
     }
-
     async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<ReplyEntry> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         crate::coz_progress!("fuse_lookup");
@@ -11691,6 +11749,24 @@ pub async fn start_mount<P: AsRef<Path>>(
         debug!("Unmount on exit status (may already be unmounted): {:?}", e);
     } else {
         info!("Cleanly unmounted filesystem on exit.");
+    }
+
+    // VL8 item 4: the dismount teardown runs on a spawned task that survives
+    // the session task's cancellation (external unmount drops the destroy
+    // future mid-flight). Wait for it (bounded) before the process exits so
+    // `client:`/`writer_claim` heartbeat records deregister instead of
+    // lingering to the 45 s staleness TTL. Bound: the teardown's own graceful
+    // drain window plus flush margin — never an unbounded hang on exit.
+    let teardown_wait = std::time::Duration::from_secs(fs.dismount_wait.saturating_add(60));
+    if tokio::time::timeout(teardown_wait, fs.wait_dismount_teardown())
+        .await
+        .is_err()
+    {
+        warn!(
+            "Dismount teardown did not complete within {:?}; heartbeat records \
+             may linger to the staleness TTL",
+            teardown_wait
+        );
     }
 
     Ok(())

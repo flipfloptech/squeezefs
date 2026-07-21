@@ -298,9 +298,13 @@ do_unmount() {
 }
 
 # The guarded offline verbs refuse while any mount-registration heartbeat
-# is fresh (the ONE staleness law, CLIENT_STALE_TTL_SECS = 45 s): an
-# externally-unmounted daemon's records linger to the TTL, exactly like a
-# kill -9'd one. Retry the guarded verb until the records go stale.
+# is fresh (the ONE staleness law, CLIENT_STALE_TTL_SECS = 45 s). Since the
+# VL8 item-4 fix a CLEANLY (externally) unmounted daemon deregisters its
+# client:/writer_claim records BEFORE exiting — do_unmount's wait on the
+# daemon pid therefore returns with the records already gone, and the
+# clean-unmount call sites carry a SHORT slack deadline (settle margin,
+# NOT the TTL). Only kill -9'd holders still ride the TTL/dead-pid law
+# (leg 11 keeps its long deadlines).
 retry_guarded() { # retry_guarded <deadline-secs> <cmd...>
     local deadline=$((SECONDS + $1)); shift
     local out
@@ -343,8 +347,8 @@ do_unmount
 # The durable add (offline verb between mounts — the VL3 shape; the
 # online admin-lane path is exercised by the cargo suite). Retries
 # through the post-unmount heartbeat-staleness window (TTL law).
-ADD_OUT="$(retry_guarded 90 "$BIN" volume add-data "sqmeta://$RIG/meta1" "$RIG/oss2")" \
-    || fail "volume add-data kept refusing after the staleness TTL"
+ADD_OUT="$(retry_guarded 20 "$BIN" volume add-data "sqmeta://$RIG/meta1" "$RIG/oss2")" \
+    || fail "volume add-data kept refusing past the clean-unmount deregistration window (VL8 item-4 regression?)"
 NEW_ID="$(echo "$ADD_OUT" | grep -oE 'vol-[0-9a-f]{16}' | head -1)"
 [ -n "$NEW_ID" ] || fail "no vol- id in add output: $ADD_OUT"
 note "added volume id: $NEW_ID"
@@ -706,9 +710,9 @@ fresh_meta_rig "metaadd"
 do_unmount
 
 truncate -s 256M "$RIG/meta3"
-ADD_OUT="$(retry_guarded 90 "$BIN" volume add-meta "sqmeta://$RIG/meta1,$RIG/meta2" \
+ADD_OUT="$(retry_guarded 20 "$BIN" volume add-meta "sqmeta://$RIG/meta1,$RIG/meta2" \
     "$RIG/meta3" --take-slots 2)" \
-    || fail "volume add-meta kept refusing after the staleness TTL"
+    || fail "volume add-meta kept refusing past the clean-unmount deregistration window (VL8 item-4 regression?)"
 echo "$ADD_OUT" | grep -qi "hosting slot" || fail "add-meta must print the taken slots: $ADD_OUT"
 
 # The old 2-member URI now refuses loud (stamps declare 3 members).
@@ -736,9 +740,9 @@ do_mount_uri "sqmeta://$RIG/meta1,$RIG/meta2,$RIG/meta3"
 ino_manifest "$RIG/inos.before"
 do_unmount
 
-retry_guarded 90 "$BIN" volume remove-meta \
+retry_guarded 20 "$BIN" volume remove-meta \
     "sqmeta://$RIG/meta1,$RIG/meta2,$RIG/meta3" "$RIG/meta3" >/dev/null \
-    || fail "volume remove-meta kept refusing after the staleness TTL"
+    || fail "volume remove-meta kept refusing past the clean-unmount deregistration window (VL8 item-4 regression?)"
 
 # Listing the tombstoned victim refuses loud.
 if "$BIN" volume list "sqmeta://$RIG/meta1,$RIG/meta2,$RIG/meta3" --json 2>"$RIG/victim.err"; then
@@ -863,8 +867,8 @@ do_unmount
 
 # Offline fsck (read-only probes; retried through the heartbeat TTL) +
 # the k/N shard union equivalence on the same set.
-OFF_OUT="$(retry_guarded 90 "$BIN" fsck "sqmeta://$RIG/meta1" --offline)" \
-    || fail "offline fsck kept refusing after the staleness TTL: $OFF_OUT"
+OFF_OUT="$(retry_guarded 20 "$BIN" fsck "sqmeta://$RIG/meta1" --offline)" \
+    || fail "offline fsck kept refusing past the clean-unmount deregistration window: $OFF_OUT"
 echo "$OFF_OUT" | grep -q "findings: 0" || fail "offline fsck must be clean: $OFF_OUT"
 "$BIN" fsck "sqmeta://$RIG/meta1" --offline --shards 0/2 --json >"$RIG/shard0.json" \
     || fail "shard 0/2 fsck failed"
@@ -1018,31 +1022,31 @@ with open(sys.argv[1], "w") as f:
 EOF
 
 # 1. Detection: both seeds are findings (exit 1 by the fsck convention).
-fsck_when_free 90 "$BIN" fsck "sqmeta://$RIG/meta1" --offline
+fsck_when_free 20 "$BIN" fsck "sqmeta://$RIG/meta1" --offline
 [ "$FSCK_RC" -ne 0 ] || fail "leg 15: seeded corruption must exit nonzero: $FSCK_OUT"
 echo "$FSCK_OUT" | grep -q '\[C4\]' || fail "leg 15: C4 orphan not reported: $FSCK_OUT"
 echo "$FSCK_OUT" | grep -q '\[C5\]' || fail "leg 15: C5 stale generation not reported: $FSCK_OUT"
 
 # 2. Dry run (the --repair default): the plan prints, NOTHING mutates.
-fsck_when_free 90 "$BIN" fsck "sqmeta://$RIG/meta1" --offline --repair
+fsck_when_free 20 "$BIN" fsck "sqmeta://$RIG/meta1" --offline --repair
 [ "$FSCK_RC" -ne 0 ] || fail "leg 15: dry run with findings must exit nonzero"
 echo "$FSCK_OUT" | grep -q "DRY RUN" || fail "leg 15: dry run must say so: $FSCK_OUT"
 [ -f "$ISOL/staging_segment/seeded_leg15" ] \
     || fail "leg 15: dry run must not touch the seeded record"
 [ ! -d "$RIG/staging/quarantine" ] \
     || fail "leg 15: dry run must not create a quarantine"
-fsck_when_free 90 "$BIN" fsck "sqmeta://$RIG/meta1" --offline
+fsck_when_free 20 "$BIN" fsck "sqmeta://$RIG/meta1" --offline
 [ "$FSCK_RC" -ne 0 ] || fail "leg 15: dry run must not have repaired anything"
 
 # 3. Apply (guarded D0 open): quarantine-first per-class repair.
-fsck_when_free 90 "$BIN" fsck "sqmeta://$RIG/meta1" --offline --repair --apply
+fsck_when_free 20 "$BIN" fsck "sqmeta://$RIG/meta1" --offline --repair --apply
 [ "$FSCK_RC" -ne 0 ] || fail "leg 15: apply run still reports its findings (exit 1)"
 echo "$FSCK_OUT" | grep -q "repair (applied)" || fail "leg 15: apply must apply: $FSCK_OUT"
 echo "$FSCK_OUT" | grep -q "done  \[C4\]" || fail "leg 15: C4 not applied: $FSCK_OUT"
 echo "$FSCK_OUT" | grep -q "done  \[C5\]" || fail "leg 15: C5 not applied: $FSCK_OUT"
 
 # 4. Re-fsck: CLEAN (exit 0, findings: 0).
-fsck_when_free 90 "$BIN" fsck "sqmeta://$RIG/meta1" --offline
+fsck_when_free 20 "$BIN" fsck "sqmeta://$RIG/meta1" --offline
 [ "$FSCK_RC" -eq 0 ] || fail "leg 15: re-fsck after apply must be clean: $FSCK_OUT"
 echo "$FSCK_OUT" | grep -q "findings: 0" || fail "leg 15: re-fsck not clean: $FSCK_OUT"
 

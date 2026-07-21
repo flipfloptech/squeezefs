@@ -443,37 +443,6 @@ async fn open_o_trunc_truncates_daemon_state() {
     );
 }
 
-/// Knob-bisect probe (ignored; driven by /tmp scripts during the VL10
-/// investigation): knobs from env, one seed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn knob_bisect_probe() {
-    let _g = serial().await;
-    let getv = |k: &str, d: u64| {
-        std::env::var(k)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(d)
-    };
-    squeezefs::fuse_client::set_patch_max_bytes(getv("SQZ_TEST_PATCH", 0));
-    squeezefs::fuse_client::set_fold_max_extents(getv("SQZ_TEST_FOLDEXT", 3));
-    squeezefs::fuse_client::set_fold_max_bytes(getv("SQZ_TEST_FOLDBYTES", 12288));
-    squeezefs::fuse_client::set_parked_cap_buffers(getv("SQZ_TEST_CAP", 4));
-    let seed = u64::from_str_radix(
-        std::env::var("SQZ_TEST_SEED")
-            .unwrap_or_else(|_| "1074".into())
-            .as_str(),
-        16,
-    )
-    .unwrap_or(0x1074);
-    let count = getv("SQZ_TEST_SEED_COUNT", 1);
-    let h = make(*b"mmapwb074probe!!", "mmap_wb_stale_probe").await;
-    for i in 0..count {
-        soak(&h, seed.wrapping_add(i), 3, 6).await;
-    }
-    default_knobs();
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mmap_writeback_generations_stay_current_default_knobs() {
     let _g = serial().await;

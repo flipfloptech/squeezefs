@@ -434,7 +434,7 @@ fn probe_device_size_bytes(device_path: &str) -> u64 {
 /// quarantined (counted for refcount coherence, skipped by the scrub and
 /// the lost checks), and the physical block stays in place for forensics
 /// until the marker itself is removed (unlink / truncate / a displacing
-/// overwrite frees the BASE key via [`clean_block_key`]'s prefix strip).
+/// overwrite frees the BASE key via `clean_block_key`'s prefix strip).
 pub const DAMAGED_MAPPING_PREFIX: &str = "damaged:";
 
 /// `true` ⇔ `mapping_str` is a §5.6a quarantined mapping.

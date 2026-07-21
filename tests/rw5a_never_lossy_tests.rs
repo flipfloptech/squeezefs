@@ -607,13 +607,12 @@ async fn untracked_free_is_refused_never_a_second_release() {
     let h = make(*b"rw5a_untracked!!", "rw5a_untrack", "64MB").await;
     let (be_id, alloc, writer) = h.fs.router.backend_router.get_active_backend().unwrap();
     let off = alloc.allocate_block().await.unwrap();
-    let img = h
-        .fs
-        .router
-        .get_crypto()
-        .process_write_async(bytes::Bytes::from(pat(4096, 0x99)))
-        .await
-        .unwrap();
+    let img =
+        h.fs.router
+            .get_crypto()
+            .process_write_async(bytes::Bytes::from(pat(4096, 0x99)))
+            .await
+            .unwrap();
     writer.write_block(off, img).await.unwrap();
     alloc.publish_block(off);
     let key = h.fs.router.backend_router.persist_block_key(&be_id, off);
@@ -624,9 +623,13 @@ async fn untracked_free_is_refused_never_a_second_release() {
 
     // Free #2: the stale double-release. It must be REFUSED (no free-list
     // re-insert, no double-free tripwire) and counted.
-    let refusals_before = METRICS.block_untracked_free_refusals.load(Ordering::Relaxed);
+    let refusals_before = METRICS
+        .block_untracked_free_refusals
+        .load(Ordering::Relaxed);
     h.fs.router.backend_router.free_block(&key).await.unwrap();
-    let refusals_after = METRICS.block_untracked_free_refusals.load(Ordering::Relaxed);
+    let refusals_after = METRICS
+        .block_untracked_free_refusals
+        .load(Ordering::Relaxed);
     assert!(
         refusals_after > refusals_before,
         "a second release of a freed offset must be refused-and-counted \

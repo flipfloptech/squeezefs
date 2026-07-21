@@ -1747,6 +1747,11 @@ pub struct Metrics {
     pub job_copy_buffer_bytes: Align64<AtomicU64>,
     /// Jobs paused by the R5 shed hook.
     pub job_paused_mem_pressure: Align64<AtomicU64>,
+    /// PR VL9 mover-serialization pin: mover-class jobs held Queued
+    /// behind a running mover with an intersecting volume scope (one
+    /// mover-class job per volume at a time; counted once per deferral
+    /// episode — KD-6 idempotence makes queueing safe).
+    pub job_serialized_waits: Align64<AtomicU64>,
     /// Drains self-paused by the §5.2 checkpoint-time capacity
     /// re-verification (state `paused-capacity`) instead of running the
     /// survivors to StorageFull.
@@ -3808,6 +3813,7 @@ impl SqueezefsFilesystem {
                 "job_checkpoint_writes": METRICS.job_checkpoint_writes.load(Ordering::Relaxed),
                 "job_copy_buffer_bytes": METRICS.job_copy_buffer_bytes.load(Ordering::Relaxed),
                 "job_paused_mem_pressure": METRICS.job_paused_mem_pressure.load(Ordering::Relaxed),
+                "job_serialized_waits": METRICS.job_serialized_waits.load(Ordering::Relaxed),
                 "job_paused_capacity": METRICS.job_paused_capacity.load(Ordering::Relaxed),
                 "evacuate_blocks_moved": METRICS.evacuate_blocks_moved.load(Ordering::Relaxed),
                 "evacuate_bytes_moved": METRICS.evacuate_bytes_moved.load(Ordering::Relaxed),

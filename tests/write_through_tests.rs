@@ -991,11 +991,19 @@ async fn test_write_through_fallback_never_lossy_on_device_error() {
     assert_eq!(read_at(&h, ino, 0, p0.len() as u32).await, expected);
 }
 
-/// Fencing expiry mid-stream: a completing write under a stale lease fails
-/// loudly (EIO), invalidates the local lease, and the next write re-acquires
-/// and succeeds — no torn state.
+/// Fencing expiry mid-stream (FIND-RW5-A face 3 contract, 2026-07-21):
+/// ONE transient adjacent bump — our own lease churn on a single-writer
+/// mount — must CONVERGE, not error: the write handler invalidates the
+/// stale local lease, re-acquires fresh, retries once, and succeeds with
+/// no torn state. (Pre-face-3 this test asserted the bump surfaced EIO —
+/// that contract was the generic/464 FencingTokenExpired{N,N+1} storm's
+/// user-visible face and was retired deliberately.) The layer BELOW stays
+/// loud: the router rejects a genuinely stale token — that rejection is
+/// what drives the handler's one-retry ladder, and a second fence still
+/// propagates (`write_never_surfaces_transient_lease_churn_as_eio` +
+/// `test_merge_primitive_rejects_stale_fencing_token` pin the siblings).
 #[tokio::test]
-async fn test_fencing_expiry_fails_write_and_recovers() {
+async fn test_fencing_expiry_converges_transiently_and_stays_loud_below() {
     let _g = serial().await;
     let h = make("wt_fencing").await;
     let ino = create(&h, "fencing.bin").await;
@@ -1012,26 +1020,42 @@ async fn test_fencing_expiry_fails_write_and_recovers() {
             .unwrap();
     drop(lease);
 
+    // The handler-level write CONVERGES across the transient bump.
+    let p1 = pattern(BS as usize, 1);
     let res =
-        h.fs.write(
-            h.req,
-            ino,
-            0,
-            0,
-            bytes::Bytes::from(pattern(BS as usize, 1)),
-            0,
-            0,
-        )
-        .await;
+        h.fs.write(h.req, ino, 0, 0, bytes::Bytes::from(p1.clone()), 0, 0)
+            .await;
     assert!(
-        res.is_err(),
-        "a stale-token completing write must fail loudly"
+        res.is_ok(),
+        "one transient adjacent-bump fence must converge via the fresh-lease \
+         retry, never surface to the user: {res:?}"
+    );
+    assert_eq!(read_at(&h, ino, 0, p1.len() as u32).await, p1);
+
+    // The router layer stays loud on a genuinely stale token.
+    let lease2 =
+        h.fs.dlm()
+            .acquire_lock(&path, Some((0, 1)), Duration::from_secs(5))
+            .await
+            .unwrap();
+    let stale = lease2.fencing_token() - 1;
+    drop(lease2);
+    let res =
+        h.fs.router
+            .write_file(&path, 0, bytes::Bytes::from(pattern(BS as usize, 3)), stale)
+            .await;
+    assert!(
+        matches!(
+            res,
+            Err(squeezefs::error::SqueezefsError::FencingTokenExpired { .. })
+        ),
+        "the router must reject a stale fencing token loudly: {res:?}"
     );
 
-    // Recovery: the stale lease was invalidated; a retry re-acquires.
-    let p = pattern(BS as usize + 1, 2);
-    write_at(&h, ino, 0, &p).await;
-    assert_eq!(read_at(&h, ino, 0, p.len() as u32).await, p);
+    // And the next handler write re-acquires and succeeds — no torn state.
+    let p2 = pattern(BS as usize + 1, 2);
+    write_at(&h, ino, 0, &p2).await;
+    assert_eq!(read_at(&h, ino, 0, p2.len() as u32).await, p2);
 }
 
 /// The merge primitive re-validates fencing at commit.

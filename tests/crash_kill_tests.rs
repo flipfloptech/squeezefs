@@ -707,7 +707,23 @@ async fn test_kill9_after_arm_same_host_instant_reclaim() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     assert!(ready.exists(), "child never armed in 60 s");
-    let child_pid: u32 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+    // The ready-file create+write is not atomic: under load this reader
+    // can observe the file before its pid write landed (a full-suite
+    // ParseIntError flake, 2026-07-21). Poll until the pid parses.
+    let child_pid: u32 = loop {
+        if let Ok(pid) = std::fs::read_to_string(&ready)
+            .unwrap_or_default()
+            .trim()
+            .parse()
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child ready file never carried a pid"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    };
 
     // While the child holds: this process must be refused (two daemons,
     // one meta volume — incident 4's exact shape, cross-process).

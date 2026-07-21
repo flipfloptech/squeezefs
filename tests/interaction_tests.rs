@@ -20,6 +20,14 @@
 //!   loudly (`job_paused_mem_pressure`, durable `paused` record); the
 //!   pause is deliberately NOT self-resuming — `job resume` is the
 //!   operator's call once pressure clears, and it works.
+//! - **Drain-during-fsck (pin b)**: fsck is NOT a mover — it runs to
+//!   `Completed` with ZERO findings WHILE a drain is parked mid-move
+//!   (the G-VL-5(a) drain-concurrent adversary, deterministic at cargo
+//!   scale via the pre-publish park).
+//! - **Meta-slot-migrate + data-drain (pin d)**: `MigrateMetaSlot` has
+//!   no mover scope — it converges WHILE a drain is parked; both jobs
+//!   complete, byte identity and global-ino stability hold across the
+//!   pair (the cutover gate parks meta ops, never fabric workers).
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -116,6 +124,30 @@ async fn format_meta(meta: &Path, data_lvs: &[&Path]) {
     .expect("format v3 meta volume");
 }
 
+/// Format a stamped `--meta-slots` set the way `format` does (config
+/// xattr on member 0 only) — the pin (d) fixture shape.
+async fn format_stamped_metas(metas: &[PathBuf], width: u32, data_lvs: &[&Path]) {
+    let cfg = base_format_config(data_lvs);
+    let plan =
+        squeezefs::meta_backend::plan_meta_slot_set(metas.len(), width).expect("plan admits");
+    for (i, m) in metas.iter().enumerate() {
+        squeezefs::meta_backend::kv::builder::format_v3_stamped(
+            m,
+            256 * 1024 * 1024,
+            &squeezefs::meta_backend::kv::builder::FormatV3Options {
+                node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+                journal_len_override: None,
+                force: true,
+                full_wipe: false,
+                format_config_xattr: (i == 0).then(|| serde_json::to_vec(&cfg).unwrap()),
+            },
+            plan.stamps[i].clone(),
+        )
+        .await
+        .expect("format stamped meta volume");
+    }
+}
+
 /// Mount-shaped fixture (the VL4 drain-suite shape): resolved volume
 /// records drive `register_backend`, the first record's device/allocator
 /// are the router's default slot, and the job fabric runs with the mover
@@ -124,10 +156,32 @@ struct Fx {
     fs: Arc<SqueezefsFilesystem>,
     meta: Arc<squeezefs::meta_backend::RoutedMetaBackend>,
     fabric: Arc<JobFabric>,
+    staging_path: PathBuf,
     _staging: TempDir,
 }
 
 async fn open_fixture(meta: &Path, records: &[DataVolumeRecord]) -> Fx {
+    let kv = squeezefs::meta_backend::kv::backend::KvMetaBackend::open(meta)
+        .await
+        .expect("open v3 meta volume");
+    let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![kv]));
+    fixture_with_meta(routed, records).await
+}
+
+/// The stamped-set variant (pin d): opens the routed W-slot set the way
+/// a mount does.
+async fn open_fixture_stamped(metas: &[PathBuf], records: &[DataVolumeRecord]) -> Fx {
+    let uris: Vec<String> = metas.iter().map(|p| p.display().to_string()).collect();
+    let routed = squeezefs::meta_backend::open_routed_meta_set(&uris)
+        .await
+        .expect("open stamped meta set");
+    fixture_with_meta(routed, records).await
+}
+
+async fn fixture_with_meta(
+    routed: Arc<squeezefs::meta_backend::RoutedMetaBackend>,
+    records: &[DataVolumeRecord],
+) -> Fx {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BLOCK.to_string());
     let dlm = DlmClient::new("local").unwrap();
 
@@ -143,8 +197,9 @@ async fn open_fixture(meta: &Path, records: &[DataVolumeRecord]) -> Fx {
     }
 
     let staging = tempfile::tempdir().unwrap();
+    let staging_path = staging.path().to_path_buf();
     let cache = TieredCache::new(
-        vec![staging.path().to_path_buf()],
+        vec![staging_path.clone()],
         Some("64MB"),
         Some("64MB"),
         Some("128MB"),
@@ -174,10 +229,6 @@ async fn open_fixture(meta: &Path, records: &[DataVolumeRecord]) -> Fx {
         .active_write_backend
         .store(Arc::new(first.id.clone()));
 
-    let kv = squeezefs::meta_backend::kv::backend::KvMetaBackend::open(meta)
-        .await
-        .expect("open v3 meta volume");
-    let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![kv]));
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
     fs.router.set_meta_backend(routed.clone());
     fs.meta_backend = Some(routed.clone());
@@ -208,6 +259,7 @@ async fn open_fixture(meta: &Path, records: &[DataVolumeRecord]) -> Fx {
         fs,
         meta: routed,
         fabric,
+        staging_path,
         _staging: staging,
     }
 }
@@ -737,5 +789,259 @@ async fn red_pressure_pauses_jobs_loudly_and_operator_resume_recovers() {
         .wait_terminal(&job_id, Duration::from_secs(10))
         .await
         .expect("terminal after cancel");
+    fx.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Pin (b): drain-during-fsck — BOTH proceed (fsck is not a mover, no
+// serialization), fsck completes with ZERO findings while the mover's
+// pre-publish state is live (the G-VL-5(a) drain-concurrent adversary
+// at cargo scale, deterministic via the parked publish window)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fsck_completes_clean_while_a_drain_is_parked_mid_move() {
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    let oss2 = make_file(dir.path(), "oss2", 4 << 30);
+    format_meta(&meta, &[&oss1, &oss2]).await;
+    let recs = base_format_config(&[&oss1, &oss2]).resolved_data_volumes();
+    let fx = open_fixture(&meta, &recs).await;
+
+    const NBLOCKS: usize = 24;
+    let ino = create_file(&fx, "burst.bin").await;
+    let expected = striped_burst(&fx, ino, NBLOCKS).await;
+    assert!(
+        !victim_blocks_of(&fx, ino, "oss2").await.is_empty(),
+        "placement must have spread blocks onto oss2"
+    );
+
+    // The fabric-run fsck scans with expected_generation =
+    // volume_generation (the mount posture) — bind the fixture staging
+    // dir the way a mount does so C5 sees the mounted generation.
+    squeezefs::cache::nvme::write_staging_generation_marker(
+        &fx.staging_path,
+        &squeezefs::fsck::volume_generation(&fx.meta),
+    )
+    .await
+    .expect("stamp staging generation");
+
+    // Park the drain mid-move: fsck then runs against the live mover
+    // state (pre-publish copy done, publish pending — the in-flight
+    // destination is exactly what the C2/C3 machinery must not flag).
+    let (hit_tx, hit_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let go_rx = std::sync::Mutex::new(go_rx);
+    let fired = std::sync::atomic::AtomicBool::new(false);
+    squeezefs::jobs::set_evacuate_pre_publish_hook(Arc::new(move |_ino, _b| {
+        if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let _ = hit_tx.send(());
+            let _ = go_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(120));
+        }
+    }));
+
+    let evac_id = fx
+        .fs
+        .admin_remove_data_volume("oss2", 100)
+        .await
+        .expect("remove-data admits");
+    hit_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the drain must reach its parked publish window");
+    assert_eq!(job_state(&fx, &evac_id).await, JobState::Running);
+
+    // fsck is NOT a mover: it must be claimed and run to completion
+    // WHILE the drain holds oss2 — and report zero findings.
+    let fsck_id = fx
+        .fabric
+        .submit(JobSpec {
+            job_type: JobType::Fsck {
+                scrub: false,
+                scrub_only: false,
+                repair: false,
+                apply: false,
+                quarantine_dir: None,
+            },
+            throttle_pct: 100,
+        })
+        .await
+        .expect("submit fsck");
+    let end = fx
+        .fabric
+        .wait_terminal(&fsck_id, Duration::from_secs(120))
+        .await
+        .expect("fsck must run WHILE the drain is parked (no serialization)");
+    assert_eq!(end, JobState::Completed, "drain-concurrent fsck completes");
+    assert_eq!(
+        job_state(&fx, &evac_id).await,
+        JobState::Running,
+        "the drain must still be running (parked) — concurrency proven"
+    );
+
+    // FP = 0: the persisted report carries zero findings and a real scan.
+    let report_raw = fx
+        .meta
+        .getxattr(1, &format!("{JOB_XATTR_PREFIX}{fsck_id}:report"))
+        .await
+        .expect("backend read")
+        .expect("fsck report persisted");
+    let report: serde_json::Value = serde_json::from_slice(&report_raw).expect("report is JSON");
+    assert_eq!(
+        report["findings"].as_array().map(Vec::len),
+        Some(0),
+        "drain-concurrent fsck must report ZERO findings (G-VL-5(a)): {report}"
+    );
+    assert!(
+        report["counters"]["inodes_scanned"].as_u64().unwrap_or(0) > 0,
+        "engagement: the scan must have walked inodes: {report}"
+    );
+
+    // Release the drain: it converges; byte identity holds.
+    let _ = go_tx.send(());
+    squeezefs::jobs::clear_evacuate_pre_publish_hook();
+    let end = fx
+        .fabric
+        .wait_terminal(&evac_id, Duration::from_secs(180))
+        .await
+        .expect("drain terminal");
+    assert_eq!(end, JobState::Completed, "the drain must converge");
+    assert_eq!(
+        fx.fs.router.backend_router.volume_state("oss2").as_deref(),
+        Some(VOL_STATE_RETIRED),
+        "the drain retired its victim"
+    );
+    assert_eq!(
+        read_back(&fx, ino, NBLOCKS).await,
+        expected,
+        "byte identity across the drain-concurrent fsck"
+    );
+    fx.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Pin (d): meta-slot-migrate + data-drain concurrently — BOTH converge
+// (MigrateMetaSlot is not a mover-class job: no scope conflict; the
+// cutover gate parks meta ops, never fabric workers)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slot_migration_and_data_drain_converge_concurrently() {
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let m1 = make_file(dir.path(), "meta1", 256 * 1024 * 1024);
+    let m2 = make_file(dir.path(), "meta2", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    let oss2 = make_file(dir.path(), "oss2", 4 << 30);
+    format_stamped_metas(&[m1.clone(), m2.clone()], 4, &[&oss1, &oss2]).await;
+    let recs = base_format_config(&[&oss1, &oss2]).resolved_data_volumes();
+    let fx = open_fixture_stamped(&[m1, m2], &recs).await;
+
+    const NBLOCKS: usize = 24;
+    let ino = create_file(&fx, "burst.bin").await;
+    let expected = striped_burst(&fx, ino, NBLOCKS).await;
+    assert!(
+        !victim_blocks_of(&fx, ino, "oss2").await.is_empty(),
+        "placement must have spread blocks onto oss2"
+    );
+    // Populate slot-1 keyspace beyond the root records (ino 1 % 4 = 1 —
+    // the root dir itself rides the migrating slot).
+    let mut aux = Vec::new();
+    for i in 0..8 {
+        let name = format!("aux{i}.txt");
+        let a = create_file(&fx, &name).await;
+        aux.push((name, a));
+    }
+
+    // Park the drain mid-move, then run the slot migration to completion
+    // WHILE the drain provably holds its claim.
+    let (hit_tx, hit_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let go_rx = std::sync::Mutex::new(go_rx);
+    let fired = std::sync::atomic::AtomicBool::new(false);
+    squeezefs::jobs::set_evacuate_pre_publish_hook(Arc::new(move |_ino, _b| {
+        if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let _ = hit_tx.send(());
+            let _ = go_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(120));
+        }
+    }));
+
+    let evac_id = fx
+        .fs
+        .admin_remove_data_volume("oss2", 100)
+        .await
+        .expect("remove-data admits");
+    hit_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the drain must reach its parked publish window");
+    assert_eq!(job_state(&fx, &evac_id).await, JobState::Running);
+
+    // Slot 1 natively lives on volume 1 (slot_map = s % n): migrate it
+    // to volume 0 while the drain runs. Both jobs must converge.
+    let mig_id = fx
+        .fabric
+        .submit(JobSpec {
+            job_type: JobType::MigrateMetaSlot {
+                slot: 1,
+                target_volume: 0,
+            },
+            throttle_pct: 100,
+        })
+        .await
+        .expect("submit migrate-meta-slot");
+    let end = fx
+        .fabric
+        .wait_terminal(&mig_id, Duration::from_secs(180))
+        .await
+        .expect("slot migration must run WHILE the drain is parked");
+    assert_eq!(
+        end,
+        JobState::Completed,
+        "the slot migration must converge mid-drain"
+    );
+    assert_eq!(
+        job_state(&fx, &evac_id).await,
+        JobState::Running,
+        "the drain must still be running (parked) — concurrency proven"
+    );
+
+    // Release the drain: it converges too.
+    let _ = go_tx.send(());
+    squeezefs::jobs::clear_evacuate_pre_publish_hook();
+    let end = fx
+        .fabric
+        .wait_terminal(&evac_id, Duration::from_secs(180))
+        .await
+        .expect("drain terminal");
+    assert_eq!(end, JobState::Completed, "the drain must converge");
+    assert_eq!(
+        fx.fs.router.backend_router.volume_state("oss2").as_deref(),
+        Some(VOL_STATE_RETIRED),
+        "the drain retired its victim"
+    );
+
+    // Byte identity + name→ino stability across BOTH concurrent ops.
+    assert_eq!(
+        read_back(&fx, ino, NBLOCKS).await,
+        expected,
+        "byte identity across the migrate+drain pair"
+    );
+    for (name, a) in &aux {
+        let got = fx
+            .fs
+            .lookup(req(), 1, OsStr::new(name))
+            .await
+            .unwrap_or_else(|e| panic!("lookup {name} after migrate+drain: {e:?}"))
+            .attr
+            .ino;
+        assert_eq!(got, *a, "global ino of {name} must be eternally stable");
+    }
     fx.close().await;
 }

@@ -480,6 +480,116 @@ async fn duplicate_reclaim_never_double_frees_blocks() {
     );
 }
 
+/// Face 5 — the two-lineage double-displacement (the forensics-convicted
+/// planting behind faces 2/4's downstream EIOs: run17's DOUBLE FREE
+/// backtrace pairs are two merge-driven displaced-frees of ONE key).
+/// `merge_block_mappings` based its RMW on the BACKEND layout even when
+/// the RAM cache held a DIRTY entry — but dirty layouts are the LOCAL
+/// AUTHORITY (staged-family commits defer their persist), so the merge
+/// resurrected the PRE-DIRTY map: a key an earlier commit had already
+/// displaced-and-freed reappears as "displaced" and is freed AGAIN.
+/// Interleaved with an allocation, free #2 steals the offset from its
+/// new owner — one offset, two live layouts, permanent incarnation
+/// churn, cross-file corruption.
+///
+/// Deterministic pin: persist map {0:A}; model the dirty-authority
+/// commit (displace A→B in RAM, dirty, free A — exactly what the staged
+/// spill/promote family does); then drive a fold-style merge of block 0.
+/// The merge must displace B (the dirty truth), never resurrect-and-
+/// re-free A: block_double_frees stays 0 and the saved map carries the
+/// merge over the DIRTY lineage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_bases_on_dirty_ram_authority_never_the_lagging_backend() {
+    let _g = serial().await;
+    let h = make(*b"rw5a_dirty_auth!", "rw5a_dirty", "64MB").await;
+
+    // Persisted striped fixture: map {0:A, 1:_} on the backend, clean.
+    let ino = create(&h, "victim").await;
+    write_at(&h, ino, 0, &pat(2 * BS as usize, 0x66)).await;
+    h.fs.fsync(h.req, ino, 0, false).await.unwrap();
+    let path = squeezefs::keys::inode_path(ino);
+    let meta = h.fs.router.fetch_metadata(&path).await.unwrap();
+    assert_eq!(meta.file_type, "striped");
+    let key_a = meta
+        .block_map
+        .as_ref()
+        .and_then(|bm| bm.get(&0).cloned())
+        .expect("block 0 mapped");
+
+    // The dirty-authority commit: displace A -> B in RAM ONLY (dirty),
+    // free A — the staged spill/promote commit shape whose backend
+    // persist is deferred.
+    let (be_id, alloc, writer) = h.fs.router.backend_router.get_active_backend().unwrap();
+    let off_b = alloc.allocate_block().await.unwrap();
+    let img =
+        h.fs.router
+            .get_crypto()
+            .process_write_async(bytes::Bytes::from(pat(BS as usize, 0x77)))
+            .await
+            .unwrap();
+    writer.write_block(off_b, img).await.unwrap();
+    alloc.publish_block(off_b);
+    let key_b = h.fs.router.backend_router.persist_block_key(&be_id, off_b);
+    let mut dirty = meta.clone();
+    {
+        let bm = dirty.block_map.as_mut().expect("map");
+        std::sync::Arc::make_mut(bm).insert(0, key_b.clone());
+    }
+    dirty.layout_dirty = true;
+    dirty.cached_at = std::time::Instant::now();
+    h.fs.router.metadata_cache.insert(ino, dirty);
+    h.fs.router.backend_router.free_block(&key_a).await.unwrap();
+
+    // The fold-style merge: block 0 gets a fresh key C. Pre-fix the merge
+    // read the LAGGING BACKEND ({0:A}) and handed A back as displaced —
+    // the caller's displaced-free then double-freed A.
+    let off_c = alloc.allocate_block().await.unwrap();
+    let img_c =
+        h.fs.router
+            .get_crypto()
+            .process_write_async(bytes::Bytes::from(pat(BS as usize, 0x78)))
+            .await
+            .unwrap();
+    writer.write_block(off_c, img_c).await.unwrap();
+    alloc.publish_block(off_c);
+    let key_c = h.fs.router.backend_router.persist_block_key(&be_id, off_c);
+    let token = h.fs.dlm().get_fencing_token_ino(ino);
+    let entries = [(0u32, key_c.clone())];
+    let before = METRICS.block_double_frees.load(Ordering::Relaxed);
+    let displaced =
+        h.fs.router
+            .merge_block_mappings(
+                ino,
+                squeezefs::routing::BlockMapOp::Merge(&entries),
+                0,
+                squeezefs::routing::LayoutFlip::KeepLayout,
+                token,
+            )
+            .await
+            .unwrap();
+    assert_eq!(
+        displaced,
+        vec![key_b.clone()],
+        "the merge must displace the DIRTY lineage's key (B), never \
+         resurrect the lagging backend's already-freed key (A)"
+    );
+    for bk in &displaced {
+        let _ = h.fs.router.backend_router.free_block(bk).await;
+    }
+    let after = METRICS.block_double_frees.load(Ordering::Relaxed);
+    assert_eq!(
+        after, before,
+        "displaced-free of a backend-resurrected key is a DOUBLE free"
+    );
+    // And the committed map must carry C over the dirty lineage.
+    let now = h.fs.router.fetch_metadata(&path).await.unwrap();
+    assert_eq!(
+        now.block_map.as_ref().and_then(|bm| bm.get(&0).cloned()),
+        Some(key_c),
+        "post-merge binding"
+    );
+}
+
 /// Face 3a — RELEASE keeps the shared op lease while other handles are
 /// open: the fencing token must NOT bump across close-while-open + write
 /// (the 464 FencingTokenExpired{N, N+1} storm generator).

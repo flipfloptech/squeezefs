@@ -122,14 +122,18 @@ enum Commands {
         /// clamp(volume/64, 8 MiB, 32 MiB).
         #[arg(long)]
         meta_journal_mb: Option<u64>,
-        /// Frozen metadata routing width W ("meta slots",
-        /// design-volume-lifecycle §5.5.1/KD-7). Default: W = meta volume
-        /// count, recorded implicitly (legacy-shaped set, byte-identical
-        /// to pre-VL5a formats). Explicit values make the set slot-mapped
-        /// (membership stamps + the KV_GUEST_SLOTS incompat bit — pre-VL5a
-        /// binaries refuse it loud); bounds: volumes <= W <= 64 x volumes.
+        // Anchors: design-volume-lifecycle §5.5.1 / KD-7; an explicit W
+        // stamps membership + the KV_GUEST_SLOTS incompat bit (pre-VL5a
+        // binaries refuse it loud); the implicit default stays
+        // byte-identical to pre-VL5a formats.
+        /// Frozen metadata routing width W ("meta slots"). Default: W =
+        /// meta volume count, recorded implicitly — the volume set stays
+        /// readable by older squeezefs releases. Explicit values mark the
+        /// set as slot-mapped: older squeezefs releases refuse to open it
+        /// afterwards (loudly). Bounds: volumes <= W <= 64 x volumes.
         /// Recommended >= 4x volumes for growth-planned deployments;
-        /// migration granularity is 1/W of the ino space.
+        /// metadata-volume migration granularity is 1/W of the inode
+        /// space.
         #[arg(long)]
         meta_slots: Option<u32>,
     },
@@ -148,31 +152,33 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Volume lifecycle: durable data-volume add + set listing
-    /// (design-volume-lifecycle §5.3/§6, PR VL3; drain/remove land with
-    /// PR VL4)
+    // Anchors: design-volume-lifecycle §5.3–§5.5/§6 (PR VL3–VL5b).
+    /// Volume-set lifecycle: add/list/drain/remove data volumes,
+    /// add/migrate/remove metadata volumes, repair membership stamps
     Volume {
         #[command(subcommand)]
         action: VolumeActions,
     },
-    /// Maintenance-job fabric control (design-volume-lifecycle §6):
-    /// live via the mount's admin lane, offline via probe reads of the
-    /// durable job records
+    // Anchor: design-volume-lifecycle §6 (the maintenance-job fabric).
+    /// Maintenance-job control: live via the mount's admin lane, offline
+    /// via read-only probes of the durable job records
     Job {
         #[command(subcommand)]
         action: JobActions,
     },
-    /// Online filesystem check (design-volume-lifecycle §5.6, PR VL6a)
-    /// with per-class repair (§5.6a, PR VL6b): seven check classes with
-    /// verify-before-report zero-FP machinery. TARGET = a live
-    /// mountpoint (online: the scan reads the daemon's RAM-authoritative
-    /// state under the suspects machinery) or a sqmeta:// URI (offline:
-    /// read-only probes — refuses under a live writer; `--repair` takes
-    /// the guarded D0 open instead), or the literal `merge-reports`
-    /// followed by shard report files. Detection never mutates;
-    /// `--repair` plans (dry-run default), `--repair --apply` executes
-    /// quarantine-first per-class actions on verified findings only.
-    /// Exit status is nonzero when findings exist.
+    // Anchors: design-volume-lifecycle §5.6 (PR VL6a) detection under
+    // the suspects machinery, §5.6a (PR VL6b) per-class repair; offline
+    // `--repair` takes the guarded D0 open.
+    /// Online filesystem check with per-class repair: seven check
+    /// classes (C1–C7, as labeled in the report), every finding verified
+    /// before it is reported. TARGET = a live mountpoint (online: the
+    /// scan reads the running daemon's live state) or a sqmeta:// URI
+    /// (offline: read-only probes — refuses under a live writer;
+    /// `--repair` takes the exclusive writer guard instead), or the
+    /// literal `merge-reports` followed by shard report files. Detection
+    /// never mutates; `--repair` plans (dry-run default), `--repair
+    /// --apply` executes quarantine-first per-class actions on verified
+    /// findings only. Exit status is nonzero when findings exist.
     Fsck {
         /// Live mountpoint, sqmeta:// URI, or `merge-reports`
         target: String,
@@ -185,7 +191,8 @@ enum Commands {
         /// Force offline (default when TARGET is a sqmeta:// URI)
         #[arg(long)]
         offline: bool,
-        /// KD-3 duty-cycle throttle percentage
+        // Anchor: KD-3 (the duty-cycle throttle law).
+        /// Duty-cycle throttle percentage (1–100; 100 = unthrottled)
         #[arg(long, default_value_t = 100)]
         throttle: u32,
         /// Emit the structured report as JSON
@@ -196,13 +203,16 @@ enum Commands {
         /// with `fsck merge-reports`. Incompatible with --repair.
         #[arg(long)]
         shards: Option<String>,
-        /// Add the C7 data scrub (KD-17: AEAD on encrypted, frame
-        /// decode on compressed, readability-only on plain)
+        // Anchor: KD-17 (scrub verification depth per data class).
+        /// Add the data scrub (check class C7): AEAD verification on
+        /// encrypted data, frame decode on compressed data,
+        /// readability-only on plain data
         #[arg(long)]
         scrub: bool,
-        /// Plan per-class repairs of the verified findings (§5.6a
-        /// table). DRY RUN unless --apply is also given. Offline this
-        /// requires the exclusive guarded open (repair is a writer).
+        // Anchor: the §5.6a per-class repair table.
+        /// Plan per-class repairs of the verified findings. DRY RUN
+        /// unless --apply is also given. Offline this requires the
+        /// exclusive guarded open (repair is a writer).
         #[arg(long)]
         repair: bool,
         /// Execute the repair plan (with --repair): quarantine-first,
@@ -214,28 +224,33 @@ enum Commands {
         #[arg(long)]
         quarantine_dir: Option<String>,
     },
-    /// C7-only data scrub (the standalone spelling of `fsck --scrub`;
-    /// same engine — design-volume-lifecycle §5.6 / KD-17)
+    // Anchors: design-volume-lifecycle §5.6 / KD-17.
+    /// Data scrub only (check class C7) — the standalone spelling of
+    /// `fsck --scrub`, same engine
     Scrub {
         /// Live mountpoint or sqmeta:// URI
         target: String,
-        /// KD-3 duty-cycle throttle percentage
+        // Anchor: KD-3 (the duty-cycle throttle law).
+        /// Duty-cycle throttle percentage (1–100; 100 = unthrottled)
         #[arg(long, default_value_t = 100)]
         throttle: u32,
         /// Emit the structured report as JSON
         #[arg(long)]
         json: bool,
     },
-    /// Online defragmenter (design-volume-lifecycle §5.7, KD-11/KD-12):
-    /// fragmentation is the four measured axes — D1 free-space
-    /// contiguity, D2 file locality, D3 staged-extent pressure, D4 meta
-    /// node occupancy — each with a gauge and an independently
-    /// invocable mover reusing existing machinery (the VL4 mover with a
-    /// contiguity-aware pick / the W2 fold / the SMO compactor). TARGET
-    /// = a live mountpoint (jobs on the daemon's fabric via the admin
-    /// lane) or a sqmeta:// URI (offline: a short-lived D0-guarded
-    /// coordinator runs the job in-process, §5.8; `--fold` is
-    /// live-only — fold custody is mount-owned)
+    // Anchors: design-volume-lifecycle §5.7 (KD-11 four-axis model,
+    // KD-12 rebalance surface), §5.8 offline D0-guarded coordinator;
+    // the movers reuse the VL4 move engine (contiguity-aware pick), the
+    // W2 fold, and the KV SMO compactor.
+    /// Online defragmenter: fragmentation is four measured axes — D1
+    /// free-space contiguity, D2 file locality, D3 staged-extent
+    /// pressure, D4 metadata node occupancy — each with a gauge (the
+    /// stats inode's frag_d1..frag_d4 fields) and an independently
+    /// invocable mover. TARGET = a live mountpoint (movers run as jobs
+    /// on the mounted daemon via the admin lane) or a sqmeta:// URI
+    /// (offline: a short-lived exclusive writer-guarded coordinator runs
+    /// the job in-process; `--fold` is live-only — extent-fold custody
+    /// belongs to the mount)
     Defrag {
         /// Live mountpoint or sqmeta:// URI
         target: String,
@@ -245,28 +260,36 @@ enum Commands {
         /// Restrict --data to one volume id (see `squeezefs volume list`)
         #[arg(long)]
         volume: Option<String>,
-        /// D4: nudge dead-bset-heavy KV leaves through the SMO compactor
+        // Anchor: the KV SMO compactor (design-cow-kv-metadata).
+        /// D4: compact metadata btree nodes that are heavy with dead
+        /// entries
         #[arg(long)]
         meta: bool,
         /// D3: kick parked/spilled extents through the fold machinery
         #[arg(long)]
         fold: bool,
-        /// The KD-12 operator surface: submit the VL4 rebalance pass
+        // Anchor: KD-12 — the pass is the VL4 mover's rebalance mode
+        // (the same engine `volume add-data` schedules by default).
+        /// Rebalance block placement across the data volumes (the same
+        /// pass `volume add-data` schedules by default)
         #[arg(long)]
         rebalance: bool,
         /// Measure the four axes and print the per-volume/per-axis
         /// report; moves nothing
         #[arg(long)]
         report_only: bool,
-        /// KD-3 duty-cycle throttle percentage for the mover jobs
+        // Anchor: KD-3 (the duty-cycle throttle law).
+        /// Duty-cycle throttle percentage for the mover jobs (1–100;
+        /// 100 = unthrottled)
         #[arg(long, default_value_t = 100)]
         throttle: u32,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
     },
+    // Anchor: docs/design-metadata-throughput.md §5.0 (the D0
+    // single-writer mount guard).
     /// Single-writer mount-guard claim administration
-    /// (docs/design-metadata-throughput.md §5.0)
     Claim {
         #[command(subcommand)]
         action: ClaimActions,
@@ -300,9 +323,11 @@ enum Commands {
         /// Memory write cache size limit
         #[arg(long)]
         write_mem_cache_size: Option<String>,
-        /// R5 joint memory budget for the daemon (e.g. "6G"); overrides
-        /// SQUEEZEFS_MEM_BUDGET_MB and the cgroup-derived default
-        /// (docs/design-read-path.md §5.7)
+        // Anchor: docs/design-read-path.md §5.7 (the R5 joint memory
+        // budget authority).
+        /// Joint memory budget for the daemon's caches and buffers
+        /// (e.g. "6G"); overrides SQUEEZEFS_MEM_BUDGET_MB and the
+        /// cgroup-derived default
         #[arg(long)]
         mem_budget: Option<String>,
 
@@ -375,12 +400,15 @@ enum Commands {
         #[arg(long)]
         no_writeback: bool,
 
-        /// Enable the L4 LD_PRELOAD interception session host for this
-        /// mount (equivalent to `-o interception` / SQUEEZEFS_IPC=1).
-        /// Forces kernel write-through on the mount (KD-11,
-        /// docs/design-preload-interception.md §5.6.2); combining it with
-        /// an explicit writeback request refuses loudly. v1 data plane
-        /// lands per the L4 PR ladder — this arms the §5.2 control plane.
+        // Anchors: docs/design-preload-interception.md (the L4 program)
+        // — KD-11 forced write-through (§5.6.2), the §5.2 session-host
+        // control plane.
+        /// Enable the LD_PRELOAD interception session host for this
+        /// mount (equivalent to `-o interception` / SQUEEZEFS_IPC=1):
+        /// clients launched with LD_PRELOAD=libsqueezefs_il.so exchange
+        /// data with the daemon directly, bypassing the kernel. Forces
+        /// kernel write-through on the mount; combining it with an
+        /// explicit writeback request refuses loudly.
         #[arg(long)]
         interception: bool,
 
@@ -419,8 +447,10 @@ enum Commands {
         #[arg(long)]
         write_verification: bool,
 
-        /// When `--write-verification` is set, verify every N-th write (P2-9).
-        /// Default 1 = verify every write. Larger values reduce RAW cost under load.
+        // Anchor: P2-9 (sampled read-after-write verification).
+        /// When `--write-verification` is set, verify every N-th write.
+        /// Default 1 = verify every write. Larger values reduce the
+        /// read-after-write cost under load.
         #[arg(long, default_value_t = 1)]
         write_verification_sample: u64,
     },
@@ -580,9 +610,9 @@ enum ClaimActions {
     /// rung for a crashed cross-host writer on a volume without NVMe
     /// Persistent Reservations). Refuses fresh claims and live-mounted
     /// volumes; re-verifies staleness under its own probe. The automation
-    /// ladder ahead of this verb: same-host dead-pid auto-reclaim -> PR
-    /// preempt -> claim TTL. There is NO mount flag that bypasses the
-    /// guard.
+    /// ladder ahead of this verb: same-host dead-pid auto-reclaim ->
+    /// Persistent-Reservation preempt -> claim TTL. There is NO mount
+    /// flag that bypasses the guard.
     Clear {
         /// Metadata URI (sqmeta://...) — every volume in the set is
         /// cleared in order
@@ -903,19 +933,21 @@ enum TargetActions {
 
 #[derive(Subcommand, Debug, Clone)]
 enum VolumeActions {
+    // Anchors: design-volume-lifecycle §5.3 (PR VL3); the add stamps the
+    // KV_VOLUME_LIFECYCLE incompat bit (pre-VL3 binaries refuse it loud).
     /// Add a data volume to the set — durable never-reused `vol-` id,
     /// preflight-checked (device exists, sized, not already a member,
     /// write+readback probe). TARGET = a live mountpoint (online add via
     /// the admin lane) or a sqmeta:// URI (offline, guarded like
-    /// `config set-cache-paths`). Stamps the `KV_VOLUME_LIFECYCLE`
-    /// incompat bit: pre-VL3 binaries refuse the set loud afterwards.
+    /// `config set-cache-paths`). Marks the volume set: older squeezefs
+    /// releases refuse to open it afterwards (loudly).
     AddData {
         /// Live mountpoint or sqmeta:// URI
         target: String,
         /// Backing device to add (block device or file)
         device: String,
-        /// Opt out of the automatic rebalance pass (the §5.3 step-6
-        /// default; it arms with the VL4 mover PR)
+        // Anchor: the §5.3 step-6 default rebalance (the VL4 mover).
+        /// Opt out of the automatic rebalance pass after the add
         #[arg(long)]
         no_rebalance: bool,
     },
@@ -930,14 +962,16 @@ enum VolumeActions {
         #[arg(long)]
         json: bool,
     },
-    /// Remove a data volume (design-volume-lifecycle §5.4): capacity
-    /// preflight (refused honestly when the survivors cannot fit the
-    /// census — §5.2 numbers printed), durable Active → Draining flip
-    /// (excluded from placement, still serves reads), CoW evacuation
-    /// (shared clone blocks move once), retire when the census is 0.
-    /// TARGET = a live mountpoint (the drain runs on the mounted
-    /// daemon's fabric) or a sqmeta:// URI (offline: a short-lived
-    /// D0-guarded coordinator drains in-process to completion, §5.8).
+    // Anchors: design-volume-lifecycle §5.4 (drain/remove), §5.2
+    // capacity census, §5.8 offline D0-guarded coordinator.
+    /// Remove a data volume: capacity preflight (refused honestly — with
+    /// the numbers printed — when the surviving volumes cannot fit the
+    /// data census), durable Active → Draining flip (excluded from new
+    /// placement, still serves reads), copy-on-write evacuation (shared
+    /// clone blocks move once), retire when the volume's census reaches
+    /// 0. TARGET = a live mountpoint (the drain runs on the mounted
+    /// daemon) or a sqmeta:// URI (offline: a short-lived exclusive
+    /// writer-guarded coordinator drains in-process to completion).
     RemoveData {
         /// Live mountpoint or sqmeta:// URI
         target: String,
@@ -947,33 +981,37 @@ enum VolumeActions {
         #[arg(long, default_value_t = 100)]
         throttle: u32,
     },
+    // Anchor: KD-5 (volume ids are permanent, never reused).
     /// Cancel an in-flight drain: the volume returns to `active` (and
     /// write placement); the evacuation job is cancelled cleanly.
-    /// Retired volumes never come back (ids are permanent, KD-5).
+    /// Retired volumes never come back (their ids are permanent).
     Undrain {
         /// Live mountpoint or sqmeta:// URI
         target: String,
         /// Durable volume id
         volume_id: String,
     },
-    /// Inspect and reconcile the metadata set-membership stamps
-    /// (design-volume-lifecycle §5.5.1a/§5.5.2b): prints the observed
-    /// per-volume stamp state, idempotently re-stamps a COHERENT
-    /// observed state (including the single inferable missing member a
-    /// crashed repair can leave), resolves slot-flip epoch spreads by
-    /// per-slot highest-epoch-wins (PR VL5b), and refuses everything
-    /// else loud. Offline verb: takes the D0 claims like format-grade
-    /// verbs; live mounts refuse.
+    // Anchors: design-volume-lifecycle §5.5.1a/§5.5.2b (PR VL5b);
+    // offline it takes the D0 writer-guard claims.
+    /// Inspect and reconcile the metadata set-membership stamps: prints
+    /// the observed per-volume stamp state, idempotently re-stamps a
+    /// COHERENT observed state (including the single inferable missing
+    /// member a crashed repair can leave), resolves slot-flip epoch
+    /// spreads by per-slot highest-epoch-wins, and refuses everything
+    /// else loud. Offline verb: takes the exclusive writer-guard claims
+    /// like format-grade verbs; live mounts refuse.
     RepairSet {
         /// sqmeta:// URI of the metadata volume set
         target: String,
     },
-    /// Add a METADATA volume (design-volume-lifecycle §5.5.2, PR VL5b):
-    /// formats the device as a new member and migrates the taken slots
-    /// onto it (an added meta volume is only useful WITH slot
-    /// migration). OFFLINE D0-guarded coordinator verb — pass the
-    /// sqmeta:// URI of the CURRENT set; unmount first. Runs the KD-8
-    /// staging drain barrier and restamps the generation. Idempotent:
+    // Anchors: design-volume-lifecycle §5.5.2 (PR VL5b); the KD-8
+    // staging-drain barrier; offline D0-guarded coordinator.
+    /// Add a METADATA volume: formats the device as a new member and
+    /// migrates the taken routing slots onto it (an added metadata
+    /// volume is only useful WITH slot migration). OFFLINE verb — pass
+    /// the sqmeta:// URI of the CURRENT set and unmount first; the
+    /// coordinator takes the exclusive writer guard. Drains staged
+    /// writes first and restamps the filesystem generation. Idempotent:
     /// re-run an interrupted add with the same arguments.
     AddMeta {
         /// sqmeta:// URI of the CURRENT metadata set
@@ -985,12 +1023,13 @@ enum VolumeActions {
         #[arg(long, default_value = "1")]
         take_slots: String,
     },
+    // Anchors: design-volume-lifecycle §5.5.2 (PR VL5b) — bulk copy +
+    // conveyor delta tee + the §5.5.2a cutover gate + the §5.5.2b flip.
     /// Migrate ONE routing slot to another metadata volume on a LIVE
-    /// mount (design-volume-lifecycle §5.5.2, PR VL5b): the online
-    /// engine — bulk copy + conveyor delta tee + §5.5.2a cutover gate
-    /// (p99 window < 250 ms target) + the §5.5.2b flip. Runs as a
-    /// fabric job (`squeezefs job list` shows progress); idempotent
-    /// re-run converges after any crash.
+    /// mount: bulk copy, then live-delta catch-up, then a brief cutover
+    /// pause (p99 window < 250 ms target) and the durable flip. Runs as
+    /// a background job (`squeezefs job list` shows progress);
+    /// idempotent re-run converges after any crash.
     MigrateMetaSlot {
         /// Live mountpoint
         target: String,
@@ -999,11 +1038,14 @@ enum VolumeActions {
         /// Target metadata volume index (canonical member order)
         target_volume: usize,
     },
-    /// Remove a METADATA volume (§5.5.2): migrates every slot it hosts
-    /// to the survivors (§5.2 meta-side capacity preflight), stamps the
-    /// survivors first and the victim's retirement tombstone last, and
-    /// restamps the generation (KD-8 barrier). OFFLINE D0-guarded
-    /// coordinator verb; idempotent re-run converges.
+    // Anchors: design-volume-lifecycle §5.5.2, §5.2 meta-side capacity
+    // preflight, KD-8 generation barrier; offline D0-guarded coordinator.
+    /// Remove a METADATA volume: migrates every routing slot it hosts to
+    /// the surviving members (capacity-preflighted, refused honestly
+    /// when they cannot fit it), stamps the survivors first and the
+    /// victim's retirement tombstone last, and restamps the filesystem
+    /// generation. OFFLINE verb — unmount first; the coordinator takes
+    /// the exclusive writer guard. Idempotent re-run converges.
     RemoveMeta {
         /// sqmeta:// URI of the CURRENT set (victim included)
         target: String,
@@ -1031,11 +1073,11 @@ enum JobActions {
         job_id: String,
         pct: u32,
     },
+    // Anchor: design-volume-lifecycle §5.1.6 (the remote-worker wire).
     /// Enroll this client as a remote data-plane worker on the volume
-    /// set's live coordinator (design-volume-lifecycle §5.1.6): probes
-    /// the mount registrations for the coordinator's job endpoint,
-    /// proves storage membership via the job:enroll secret, serves
-    /// shards until the coordinator goes away
+    /// set's live coordinator: probes the mount registrations for the
+    /// coordinator's job endpoint, proves storage membership via the
+    /// job:enroll secret, serves shards until the coordinator goes away
     Worker {
         /// Metadata URI (sqmeta://...) of the volume set
         meta_uri: String,

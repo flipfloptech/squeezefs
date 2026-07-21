@@ -981,9 +981,15 @@ fsck_when_free() { # fsck_when_free <deadline-secs> <cmd...> ; sets FSCK_OUT/FSC
     done
 }
 
+# The mount isolates its real staging (marker + staging_segment) under
+# <root>/squeezefs/<sanitized-mountpoint>/ — seed THERE.
+ISOL="$(find "$RIG/staging/squeezefs" -mindepth 1 -maxdepth 1 -type d ! -name cache_segment | head -1)"
+[ -n "$ISOL" ] || fail "leg 15: no isolated staging dir under $RIG/staging/squeezefs"
+[ -f "$ISOL/.squeezefs_generation" ] || fail "leg 15: mount left no generation marker in $ISOL"
+
 # Seed C4: a crafted orphan custody record (the writer geometry — magic,
 # key_len, val_len, key, payload; byte alignment for a sub-4KiB shard).
-python3 - "$RIG/staging/staging_segment/seeded_leg15" <<'EOF'
+python3 - "$ISOL/staging_segment/seeded_leg15" <<'EOF'
 import struct, sys, os
 key = b"active_block_ext:inode_9999990:block_0"
 val = b"leg15-payload"
@@ -994,7 +1000,7 @@ with open(sys.argv[1], "wb") as f:
     f.flush(); os.fsync(f.fileno())
 EOF
 # Seed C5: rebind the staging generation marker to a dead generation.
-python3 - "$RIG/staging/.squeezefs_generation" <<'EOF'
+python3 - "$ISOL/.squeezefs_generation" <<'EOF'
 import os, sys
 lines = open(sys.argv[1]).read().splitlines()
 assert lines and lines[0] == "squeezefs-staging-generation-v1", lines
@@ -1013,7 +1019,7 @@ echo "$FSCK_OUT" | grep -q '\[C5\]' || fail "leg 15: C5 stale generation not rep
 fsck_when_free 90 "$BIN" fsck "sqmeta://$RIG/meta1" --offline --repair
 [ "$FSCK_RC" -ne 0 ] || fail "leg 15: dry run with findings must exit nonzero"
 echo "$FSCK_OUT" | grep -q "DRY RUN" || fail "leg 15: dry run must say so: $FSCK_OUT"
-[ -f "$RIG/staging/staging_segment/seeded_leg15" ] \
+[ -f "$ISOL/staging_segment/seeded_leg15" ] \
     || fail "leg 15: dry run must not touch the seeded record"
 [ ! -d "$RIG/staging/quarantine" ] \
     || fail "leg 15: dry run must not create a quarantine"

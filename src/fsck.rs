@@ -3170,11 +3170,32 @@ async fn run_offline_body(
         }
     }
 
-    let staging_dirs = crate::config_ops::get_cache_paths(meta_lvs)
+    // The config records the staging ROOTS; a mount isolates its actual
+    // staging under `<root>/squeezefs/<sanitized-mountpoint>/` (the
+    // per-mount isolation in `main`'s mount path — the generation marker
+    // and `staging_segment/` live THERE, not at the root). Offline
+    // C4/C5 must scan both shapes: the raw root (legacy/test fixtures,
+    // and the quarantine home stays rooted there) plus every isolated
+    // per-mount dir found under it (`cache_segment` is the shared read
+    // cache — no custody, no marker — and scans inert either way).
+    let staging_roots = crate::config_ops::get_cache_paths(meta_lvs)
         .await
         .ok()
         .flatten()
         .unwrap_or_default();
+    let mut staging_dirs = Vec::new();
+    for root in staging_roots {
+        staging_dirs.push(root.clone());
+        if let Ok(entries) = std::fs::read_dir(root.join("squeezefs")) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && entry.file_name() != "cache_segment"
+                {
+                    staging_dirs.push(entry.path());
+                }
+            }
+        }
+    }
     let ctx = FsckCtx {
         meta: routed.clone(),
         router,

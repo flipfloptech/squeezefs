@@ -8606,11 +8606,11 @@ impl Filesystem for SqueezefsFilesystem {
         res
     }
 
-    async fn open(&self, _req: Request, inode: Inode, _flags: u32) -> FuseResult<ReplyOpen> {
+    async fn open(&self, req: Request, inode: Inode, flags: u32) -> FuseResult<ReplyOpen> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         // VL8 item 2: register (the live wedge held 4 opens invisibly).
         let _prof = OpProf::begin(FuseOpKind::Open, inode);
-        debug!("FUSE Open: inode = {}", inode);
+        debug!("FUSE Open: inode = {}, flags = {:#o}", inode, flags);
 
         if inode == STATS_INODE || inode == CONFIG_INODE {
             let content = if inode == STATS_INODE {
@@ -8654,6 +8654,31 @@ impl Filesystem for SqueezefsFilesystem {
                 fh,
                 flags: FOPEN_DIRECT_IO,
             });
+        }
+
+        // O_TRUNC (VL8 catalog item 1 — the generic/074 fstest.4 stale-unit
+        // corruption): fuse3 negotiates FUSE_ATOMIC_O_TRUNC, so the kernel
+        // NEVER sends the SETATTR(size=0) fallback for open(O_TRUNC) — it
+        // truncates its own page cache/i_size and trusts THIS handler to
+        // truncate daemon state. Ignoring the flag left the previous
+        // generation's entire state alive (size authority, block map,
+        // staged ring images, parked overlays, staged extent records):
+        // mmap store faults and RMW seeds then read pre-truncate bytes,
+        // and the un-truncated durable size can even resurrect after the
+        // kernel attr TTL. Route through the setattr size path — same
+        // guard order, same overlay/record prune, same backend commit as
+        // an explicit truncate-to-zero.
+        if flags & (libc::O_TRUNC as u32) != 0 {
+            self.setattr(
+                req,
+                inode,
+                None,
+                SetAttr {
+                    size: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await?;
         }
 
         self.add_open(inode);

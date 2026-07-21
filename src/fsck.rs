@@ -362,6 +362,13 @@ struct MappingRef {
     block_idx: u32,
     /// The mapping string VERBATIM (decoration included).
     mapping: String,
+    /// The CANONICAL volume id + offset the clean base key resolves to
+    /// (`"?"`/0 for unresolvable mappings). Referencer matching must key
+    /// on BOTH — offsets alias across volumes (a bare default-slot
+    /// mapping carries the same offset number as an unrelated `oss2://`
+    /// block; the leg-13 drain-concurrent FP root cause).
+    vol: String,
+    offset: u64,
     /// §5.6a quarantined (`damaged:`) mapping: counted for refcount
     /// coherence (the physical block is intentionally preserved), but
     /// never scrubbed and never a lost finding — it IS the repair.
@@ -847,11 +854,17 @@ async fn census_layout(
         match ctx.router.backend_router.parse_block_key(&clean) {
             Ok((be_id, offset)) => match canonical_backend(ctx, &be_id) {
                 Some((vol, _)) => {
-                    *out.refs.entry(vol).or_default().entry(offset).or_insert(0) += 1;
+                    *out.refs
+                        .entry(vol.clone())
+                        .or_default()
+                        .entry(offset)
+                        .or_insert(0) += 1;
                     out.mappings.push(MappingRef {
                         ino,
                         block_idx: idx,
                         mapping: mapping.to_string(),
+                        vol,
+                        offset,
                         damaged,
                     });
                 }
@@ -860,6 +873,8 @@ async fn census_layout(
                     ino,
                     block_idx: idx,
                     mapping: mapping.to_string(),
+                    vol: "?".to_string(),
+                    offset: 0,
                     damaged,
                 }),
             },
@@ -868,6 +883,8 @@ async fn census_layout(
                 ino,
                 block_idx: idx,
                 mapping: mapping.to_string(),
+                vol: "?".to_string(),
+                offset: 0,
                 damaged,
             }),
         }
@@ -970,13 +987,7 @@ fn evaluate_allocator_classes(
             let referencers: Vec<&MappingRef> = census
                 .mappings
                 .iter()
-                .filter(|m| {
-                    clean_key(&m.mapping)
-                        .rsplit("://")
-                        .next()
-                        .and_then(|s| s.parse::<u64>().ok())
-                        == Some(off)
-                })
+                .filter(|m| m.vol == v.id && m.offset == off)
                 .collect();
             let Some(live) = referencers.iter().find(|m| !m.damaged) else {
                 // No referencer at all (cross-volume alias) or every
@@ -2519,6 +2530,8 @@ pub async fn repair(
                         ino: *ino,
                         block_idx: *block_idx,
                         mapping: mapping.clone(),
+                        vol: vol.clone(),
+                        offset: *offset,
                         damaged: false,
                     };
                     !matches!(
@@ -2604,13 +2617,7 @@ pub async fn repair(
                 let mut referencers: Vec<u64> = fresh
                     .mappings
                     .iter()
-                    .filter(|m| {
-                        clean_key(&m.mapping)
-                            .rsplit("://")
-                            .next()
-                            .and_then(|s| s.parse::<u64>().ok())
-                            == Some(*offset)
-                    })
+                    .filter(|m| &m.vol == vol && m.offset == *offset)
                     .map(|m| m.ino)
                     .collect();
                 referencers.sort_unstable();
@@ -2924,11 +2931,23 @@ pub async fn repair(
                     );
                     continue;
                 }
-                let probe = MappingRef {
-                    ino: *ino,
-                    block_idx: *block_idx,
-                    mapping: mapping.clone(),
-                    damaged: false,
+                let probe = {
+                    let clean = clean_key(mapping);
+                    let (pvol, poff) = ctx
+                        .router
+                        .backend_router
+                        .parse_block_key(&clean)
+                        .ok()
+                        .and_then(|(be, off)| canonical_backend(ctx, &be).map(|(v, _)| (v, off)))
+                        .unwrap_or_else(|| ("?".to_string(), 0));
+                    MappingRef {
+                        ino: *ino,
+                        block_idx: *block_idx,
+                        mapping: mapping.clone(),
+                        vol: pvol,
+                        offset: poff,
+                        damaged: false,
+                    }
                 };
                 let still_failing = if online {
                     reverify_scrub_failure(ctx, &crypto, &probe, block_size).await

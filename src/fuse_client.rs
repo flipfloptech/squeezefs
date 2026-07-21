@@ -4678,7 +4678,12 @@ impl SqueezefsFilesystem {
             if let Some(bk) = old_block_key {
                 existing = self
                     .router
-                    .get_block_for_index(file_path, b, Some(&bk), false)
+                    // VL8 item 7: NO contention escalation — several
+                    // fetch_seed_image callers hold this very block's
+                    // BLOCK_FLUSH_LOCKS stripe across the seed fetch
+                    // (OVERLAY NEVER INVISIBLE); the stripe is not
+                    // reentrant.
+                    .get_block_for_index(file_path, b, Some(&bk), false, false)
                     .await?;
             }
         }

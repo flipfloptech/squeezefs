@@ -3628,22 +3628,57 @@ impl DataRouter {
     /// tier and the single-flight (`fetch_block_device_true`) while
     /// keeping this exact binding proof. Default-path callers pass
     /// `false`.
+    ///
+    /// `escalate_contended` (VL8 item 7): MOVEMENT (the binding changed —
+    /// a COW rewrite displaced the key) and CONTENTION (the binding is
+    /// unchanged but the key's incarnation word keeps moving — a W1
+    /// in-place patch storm on this very block) are different failures.
+    /// Movement keeps the bounded rebind ladder. Contention has no rebind
+    /// to make: with `escalate_contended`, after two contended attempts
+    /// ONE fetch is serialized under the block's `BLOCK_FLUSH_LOCKS`
+    /// stripe — the lock every patch holds across its DMA — so the
+    /// seqlock settles and the read makes guaranteed progress instead of
+    /// exhausting the bound into a spurious EIO (the bimodal
+    /// read-mid-patch failure). MUST be `false` at call sites that may
+    /// already hold this block's stripe (seed fetches under a held block
+    /// guard; write-side RMW seeds) — the stripe is not reentrant.
+    /// Lock-order: acquires (3) only, after any caller-held (1) — legal
+    /// under the P1-9 order; nothing below takes (1)/(3)/(4).
     pub async fn get_block_for_index(
         &self,
         file_path: &str,
         b: u32,
         resolved_key: Option<&str>,
         device_true: bool,
+        escalate_contended: bool,
     ) -> Result<Option<crate::cache::pool::ReadBlockValue>> {
-        // Each retry re-resolves against the freshest map, so consecutive
-        // failures require back-to-back whole COW-rewrite cycles of this one
-        // block landing inside single fetches — churn far past any real
-        // workload. Exhaustion fails loud rather than serving unproven bytes.
+        // Each retry re-resolves against the freshest map. MOVEMENT
+        // exhaustion (the binding itself kept changing) requires
+        // back-to-back whole COW-rewrite cycles of this one block landing
+        // inside single fetches — churn far past any real workload — and
+        // fails loud rather than serving unproven bytes. CONTENTION never
+        // reaches exhaustion on the escalating path (see above).
         const MAX_REBINDS: usize = 8;
+        const CONTENDED_BEFORE_ESCALATE: usize = 2;
         let mut key: Option<String> = resolved_key.map(str::to_string);
+        let mut contended = 0usize;
         for _ in 0..MAX_REBINDS {
             let Some(cur_key) = key else {
                 return Ok(None);
+            };
+            // VL8 item 7 contention escalation: hold the block's stripe
+            // across this one fetch so no patch can overlap it.
+            let _contention_guard = if escalate_contended && contended >= CONTENDED_BEFORE_ESCALATE
+            {
+                let ino = parse_inode_from_path(file_path);
+                Some(
+                    crate::fuse_client::BLOCK_FLUSH_LOCKS
+                        .get_lock(ino, b)
+                        .lock()
+                        .await,
+                )
+            } else {
+                None
             };
             let (val, incarnation_valid) = if device_true {
                 self.fetch_block_device_true(&cur_key).await?
@@ -3657,6 +3692,11 @@ impl DataRouter {
             let current = self.current_block_binding(file_path, b).await?;
             if incarnation_valid && current.as_deref() == Some(cur_key.as_str()) {
                 return Ok(Some(val));
+            }
+            if current.as_deref() == Some(cur_key.as_str()) {
+                contended += 1;
+            } else {
+                contended = 0;
             }
             METRICS
                 .stale_binding_rebinds
@@ -3775,7 +3815,7 @@ impl DataRouter {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     let whole = self
-                        .get_block_for_index(file_path, b, resolved_key, false)
+                        .get_block_for_index(file_path, b, resolved_key, false, true)
                         .await?;
                     return Ok(whole
                         .map(|val| Self::slice_whole_for_ranged(val, &rel_range, dest.as_ref())));
@@ -3888,7 +3928,7 @@ impl DataRouter {
         // copied in and the tail zeroed (reused-payload replay rule at
         // the copy site).
         let whole = self
-            .get_block_for_index(file_path, b, key.as_deref(), device_true)
+            .get_block_for_index(file_path, b, key.as_deref(), device_true, true)
             .await?;
         Ok(whole.map(|val| Self::slice_whole_for_ranged(val, &rel_range, dest.as_ref())))
     }
@@ -5669,6 +5709,12 @@ impl DataRouter {
                                 b,
                                 old_block_key.as_deref(),
                                 false,
+                                // Write-side RMW seed: no contention
+                                // escalation (VL8 item 7) — write-vs-patch
+                                // of one block already serialize on its
+                                // stripe; escalating from a write task
+                                // risks a same-stripe self-wait.
+                                false,
                             )
                             .await?
                         {
@@ -6147,7 +6193,7 @@ impl DataRouter {
                                     let bk = block_keys.first().and_then(|(_, k)| k.as_deref());
                                     if bk.is_some() {
                                         if let Some(base) = self
-                                            .get_block_for_index(file_path, b_idx, bk, false)
+                                            .get_block_for_index(file_path, b_idx, bk, false, true)
                                             .await?
                                         {
                                             let start = rel_s.min(base.len());
@@ -6585,6 +6631,7 @@ impl DataRouter {
                                                         start_block,
                                                         Some(b_key),
                                                         device_true,
+                                                        true,
                                                     )
                                                     .await?;
                                                 match (val, dest_addr) {
@@ -6826,6 +6873,7 @@ impl DataRouter {
                                     b_idx,
                                     b_key_opt.as_deref(),
                                     device_true,
+                                    true,
                                 )
                                 .await?
                             {

@@ -1253,20 +1253,24 @@ async fn recheck_suspects(
                         }),
                     })
                 } else {
-                    let fresh = fresh.as_ref().expect("fresh walk ran");
-                    // Identity-precise re-check: the SAME live (non-
-                    // quarantined) mapping must still reference the offset.
-                    let still_referenced = fresh.mappings.iter().any(|m| {
-                        m.ino == *ino
-                            && m.block_idx == *block_idx
-                            && m.mapping == *mapping
-                            && !m.damaged
-                    });
+                    // §5.6 normative order for the mover's src-free
+                    // adversary: observe the ALLOCATOR state first, then
+                    // re-verify the REFERENCE with a fresh per-ino layout
+                    // read. A drain frees a source block only after every
+                    // referencing publish is durable and visible, so a
+                    // mapping still present AFTER the untracked
+                    // observation is a genuine loss — while the
+                    // moved-and-freed race always shows the NEW mapping
+                    // at this re-read and clears (the leg-13
+                    // drain-concurrent FP shape).
                     let now_tracked = alloc_of(vol)
                         .map(|a| a.refcount(*offset).is_some())
                         .unwrap_or(false);
                     let out_of_range = why.contains("capacity") || why.contains("aligned");
-                    (still_referenced && (out_of_range || !now_tracked)).then(|| FsckFinding {
+                    let violates = out_of_range || !now_tracked;
+                    let still_referenced =
+                        violates && current_mapping_present(ctx, *ino, *block_idx, mapping).await;
+                    (still_referenced && violates).then(|| FsckFinding {
                         class: "C2".to_string(),
                         object: format!("{vol}:{offset}"),
                         evidence: format!("lost block ({by}): {why}"),
@@ -2117,28 +2121,34 @@ async fn current_mapping_present(ctx: &FsckCtx, ino: u64, block_idx: u32, mappin
 
 /// Flip a mapping to its §5.6a `damaged:` quarantine marker — one
 /// tx-atomic layout commit under the merge discipline (the 4a lease is
-/// taken inside the meta transaction). The displaced original key is
-/// deliberately NOT freed: for C7 the physical block is preserved for
-/// forensics; for C2-lost there is nothing allocated to free.
+/// taken inside the meta transaction). **Supersession-safe**: the flip
+/// rides [`crate::routing::BlockMapOp::MergeExpected`] — it lands only
+/// where the captured mapping is STILL current, so a foreground rewrite
+/// or a mover publish racing the repair is never overwritten (`false` =
+/// superseded, the caller refuses the action). The displaced original
+/// key is deliberately NOT freed: for C7 the physical block is
+/// preserved for forensics; for C2-lost there is nothing allocated to
+/// free.
 async fn flip_mapping_damaged(
     ctx: &FsckCtx,
     ino: u64,
     block_idx: u32,
     mapping: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let token = ctx.router.dlm.get_fencing_token_ino(ino);
     let damaged = format!("{}{mapping}", crate::routing::DAMAGED_MAPPING_PREFIX);
-    let entries = [(block_idx, damaged)];
-    ctx.router
+    let entries = [(block_idx, mapping.to_string(), damaged)];
+    let displaced = ctx
+        .router
         .merge_block_mappings(
             ino,
-            crate::routing::BlockMapOp::Merge(&entries),
+            crate::routing::BlockMapOp::MergeExpected(&entries),
             0,
             crate::routing::LayoutFlip::KeepLayout,
             token,
         )
         .await?;
-    Ok(())
+    Ok(displaced.iter().any(|d| d == mapping))
 }
 
 /// Best-effort raw copy of a mapping's stored image for quarantine
@@ -2561,7 +2571,16 @@ pub async fn repair(
                     out.counters.quarantined_records += 1;
                     out.counters.quarantined_bytes += bytes;
                     fire_repair_abort_hook(&what)?;
-                    flip_mapping_damaged(ctx, *ino, *block_idx, mapping).await?;
+                    if !flip_mapping_damaged(ctx, *ino, *block_idx, mapping).await? {
+                        refuse(
+                            &mut out,
+                            f,
+                            "mapping superseded between verify and flip (foreground \
+                             rewrite / mover publish) — nothing to quarantine"
+                                .to_string(),
+                        );
+                        continue;
+                    }
                     apply_ok(
                         &mut out,
                         f,
@@ -2949,7 +2968,16 @@ pub async fn repair(
                 out.counters.quarantined_blocks += 1;
                 out.counters.quarantined_bytes += bytes;
                 fire_repair_abort_hook(&what)?;
-                flip_mapping_damaged(ctx, *ino, *block_idx, mapping).await?;
+                if !flip_mapping_damaged(ctx, *ino, *block_idx, mapping).await? {
+                    refuse(
+                        &mut out,
+                        f,
+                        "mapping superseded between verify and flip (foreground \
+                         rewrite / mover publish) — the block moved on"
+                            .to_string(),
+                    );
+                    continue;
+                }
                 apply_ok(
                     &mut out,
                     f,

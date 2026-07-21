@@ -8800,6 +8800,46 @@ impl Filesystem for SqueezefsFilesystem {
             let guard = lock.write().await;
             METRICS.write_lock_wait.record(start_wait.elapsed());
 
+            // VL8 item 9 — the syncfs transient-ENOENT vector: with the
+            // writeback cache + clean-handle FLUSH elision the kernel can
+            // flush dirty pages AFTER close+unlink+FORGET destroyed the
+            // ino. Downstream, `fetch_metadata` would FABRICATE a fresh
+            // inline layout (silently resurrecting the destroyed ino as a
+            // zombie record) and deeper commit paths can surface ENOENT —
+            // which lands in the superblock errseq and fails the NEXT
+            // `syncfs` on a healthy mount (the VL7-rig leg-12 transient,
+            // reproduced live 2026-07-21). Unlink IS the discard
+            // authority for this data: when nothing local knows the ino
+            // (no open handle — writes with a live handle never probe, so
+            // the hot path pays nothing — no cached meta/attr) verify
+            // against the backend; a verified-NotFound ino gets a COUNTED
+            // discard ack (`writeback_orphan_discards`, the FIND-M11-A
+            // remount-law analogue), never a resurrect, never an errno.
+            if !self.is_open(ino)
+                && self.router.metadata_cache.get(&ino).is_none()
+                && self.attr_cache.get(&ino).is_none()
+            {
+                if let Some(backend) = self.meta_backend.as_ref() {
+                    if matches!(
+                        backend.getattr(ino).await,
+                        Err(ref e) if e.to_errno() == libc::ENOENT
+                    ) {
+                        METRICS
+                            .writeback_orphan_discards
+                            .fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            "FUSE Write: ino {ino} is verified-reclaimed — \
+                             counted writeback-orphan discard ({} bytes)",
+                            data.len()
+                        );
+                        drop(guard);
+                        return Ok(ReplyWrite {
+                            written: data.len() as u32,
+                        });
+                    }
+                }
+            }
+
             // 1. Get or acquire lease (fencing token)
             let fencing_token = self
                 .get_or_acquire_lease(ino)

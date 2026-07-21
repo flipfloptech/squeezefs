@@ -472,10 +472,20 @@ async fn torn_record_detected_and_ignored_loudly() {
         "a torn record must be detected-and-ignored LOUDLY (counted), \
          never parsed"
     );
-    assert!(
-        h.fs.router.cache.nvme.read_extent_record(&key).is_none(),
-        "the torn blob is discarded from staging"
-    );
+    // The physical removal is a DETACHED blocking-pool task since the VL10
+    // ledger-lock/Hang-1 hardening (dispose_bad_extent_record must never
+    // take the staging shard WRITE lock on an executor thread): the torn
+    // record is unreadable IMMEDIATELY (parse refuses — readers ignore it
+    // regardless of physical presence) and the blob vanishes shortly after.
+    let mut discarded = false;
+    for _ in 0..200 {
+        if h.fs.router.cache.nvme.read_extent_record(&key).is_none() {
+            discarded = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(discarded, "the torn blob is discarded from staging");
     // Reads/folds proceed over the durable base — no wedge, no zeros.
     let got = read_at(&h, ino, 0, base.len()).await;
     assert_bytes(&got, &base, "reads after a torn-record discard");

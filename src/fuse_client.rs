@@ -1802,6 +1802,25 @@ pub struct Metrics {
     pub scrub_frame_verified: Align64<AtomicU64>,
     pub scrub_readability_only: Align64<AtomicU64>,
     pub scrub_failures: Align64<AtomicU64>,
+    /// PR VL6b repair family (design-volume-lifecycle §10, §5.6a):
+    /// planned = per-finding actions the planner emitted (dry runs
+    /// included); applied = actions executed under `--apply`; refused =
+    /// verify-before-repair refusals (a stale/healed finding is never
+    /// acted on — a growing count under repeated repairs of the same
+    /// report is the designed outcome, never an error).
+    pub fsck_repairs_planned: Align64<AtomicU64>,
+    pub fsck_repairs_applied: Align64<AtomicU64>,
+    pub fsck_repairs_refused: Align64<AtomicU64>,
+    /// Quarantine-first accounting: records (meta/custody images +
+    /// move-aside files), blocks (device-block byte copies), and total
+    /// bytes copied into the per-run quarantine before anything was
+    /// discarded.
+    pub fsck_quarantined_records: Align64<AtomicU64>,
+    pub fsck_quarantined_blocks: Align64<AtomicU64>,
+    pub fsck_quarantined_bytes: Align64<AtomicU64>,
+    /// Applied repairs per class — index 0..6 ⇔ C1..C7
+    /// (`fsck_repair_classC{1..7}` on the stats inode).
+    pub fsck_repair_class: Align64<[AtomicU64; 7]>,
     /// §5.1.6 remote-wire family (design-volume-lifecycle §10, PR VL2b).
     /// Currently-enrolled remote workers (gauge).
     pub job_remote_workers: Align64<AtomicU64>,
@@ -3703,6 +3722,20 @@ impl SqueezefsFilesystem {
                 "scrub_frame_verified": METRICS.scrub_frame_verified.load(Ordering::Relaxed),
                 "scrub_readability_only": METRICS.scrub_readability_only.load(Ordering::Relaxed),
                 "scrub_failures": METRICS.scrub_failures.load(Ordering::Relaxed),
+                // PR VL6b repair family (§5.6a / §10).
+                "fsck_repairs_planned": METRICS.fsck_repairs_planned.load(Ordering::Relaxed),
+                "fsck_repairs_applied": METRICS.fsck_repairs_applied.load(Ordering::Relaxed),
+                "fsck_repairs_refused": METRICS.fsck_repairs_refused.load(Ordering::Relaxed),
+                "fsck_quarantined_records": METRICS.fsck_quarantined_records.load(Ordering::Relaxed),
+                "fsck_quarantined_blocks": METRICS.fsck_quarantined_blocks.load(Ordering::Relaxed),
+                "fsck_quarantined_bytes": METRICS.fsck_quarantined_bytes.load(Ordering::Relaxed),
+                "fsck_repair_classC1": METRICS.fsck_repair_class[0].load(Ordering::Relaxed),
+                "fsck_repair_classC2": METRICS.fsck_repair_class[1].load(Ordering::Relaxed),
+                "fsck_repair_classC3": METRICS.fsck_repair_class[2].load(Ordering::Relaxed),
+                "fsck_repair_classC4": METRICS.fsck_repair_class[3].load(Ordering::Relaxed),
+                "fsck_repair_classC5": METRICS.fsck_repair_class[4].load(Ordering::Relaxed),
+                "fsck_repair_classC6": METRICS.fsck_repair_class[5].load(Ordering::Relaxed),
+                "fsck_repair_classC7": METRICS.fsck_repair_class[6].load(Ordering::Relaxed),
                 "job_remote_workers": METRICS.job_remote_workers.load(Ordering::Relaxed),
                 "job_remote_enrollments": METRICS.job_remote_enrollments.load(Ordering::Relaxed),
                 "job_remote_enroll_refused": METRICS.job_remote_enroll_refused.load(Ordering::Relaxed),

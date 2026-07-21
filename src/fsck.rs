@@ -166,6 +166,60 @@ pub struct FsckFinding {
     pub object: String,
     /// What was observed (human-readable, machine-greppable).
     pub evidence: String,
+    /// PR VL6b (§5.6a): the structured identity the repair engine acts
+    /// on. `None` on reports produced by older binaries — such findings
+    /// are refused by repair (re-run detection), never guessed at from
+    /// the display strings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<FindingId>,
+}
+
+/// PR VL6b (§5.6a): machine identity of a verified finding — everything
+/// the per-class repair action needs, carried IN the report (findings
+/// are the only repair input; repair re-verifies each is still current
+/// before acting).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FindingId {
+    /// C1: checksum-bad / torn node (walk could not advance).
+    C1Torn {
+        vol: usize,
+        tree: u8,
+        cursor_hex: String,
+    },
+    /// C1: checksum-valid semantic damage on one record.
+    C1Semantic {
+        vol: usize,
+        tree: u8,
+        key_hex: String,
+    },
+    /// C2: allocated (tracked) with zero referencers.
+    C2Leaked { vol: String, offset: u64 },
+    /// C2: referenced but unallocated / out-of-range / unresolvable.
+    /// `unrepairable_shape` = out-of-range / unaligned / unknown-backend
+    /// mappings whose allocator can never legally be repaired — the
+    /// content-verify arm is skipped and the action is quarantine.
+    C2Lost {
+        vol: String,
+        offset: u64,
+        ino: u64,
+        block_idx: u32,
+        mapping: String,
+        unrepairable_shape: bool,
+    },
+    /// C3: refcount ≠ counted references.
+    C3Refcount { vol: String, offset: u64 },
+    /// C4: orphan staged custody.
+    C4Orphan { dir: PathBuf, key: String, ino: u64 },
+    /// C5: stale/invalid staging generation.
+    C5Staging { dir: PathBuf },
+    /// C6: capacity-accounting drift.
+    C6Drift { vol: String },
+    /// C7: scrub-failed block.
+    C7Scrub {
+        ino: u64,
+        block_idx: u32,
+        mapping: String,
+    },
 }
 
 /// The §10 `fsck_*` / `scrub_*` counter families, per run (the process
@@ -215,6 +269,10 @@ pub struct FsckReport {
     /// Present on sharded runs (merge input).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partial: Option<PartialCensus>,
+    /// PR VL6b (§5.6a): the repair plan/outcome when the run was invoked
+    /// with `--repair` (dry run) or `--repair --apply`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<RepairReport>,
 }
 
 impl FsckReport {
@@ -304,6 +362,10 @@ struct MappingRef {
     block_idx: u32,
     /// The mapping string VERBATIM (decoration included).
     mapping: String,
+    /// §5.6a quarantined (`damaged:`) mapping: counted for refcount
+    /// coherence (the physical block is intentionally preserved), but
+    /// never scrubbed and never a lost finding — it IS the repair.
+    damaged: bool,
 }
 
 struct CensusOut {
@@ -342,11 +404,14 @@ enum SuspectKind {
     /// C2 leaked: allocated (tracked) with zero referencers.
     C2Leaked { vol: String, offset: u64 },
     /// C2 lost: referenced but unallocated / out-of-range / unknown
-    /// backend.
+    /// backend. Carries the referencing mapping's identity for the
+    /// finding (§5.6a repair input).
     C2Lost {
         vol: String,
         offset: u64,
-        by: String,
+        ino: u64,
+        block_idx: u32,
+        mapping: String,
         why: String,
     },
     /// C3: refcount ≠ counted references.
@@ -478,6 +543,7 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         findings,
         counters: counters.clone(),
         partial: shard_refs,
+        repair: None,
     })
 }
 
@@ -527,6 +593,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         findings,
         counters,
         partial: Some(PartialCensus { refs }),
+        repair: None,
     }
 }
 
@@ -581,16 +648,42 @@ fn canonical_backend(ctx: &FsckCtx, be_id: &str) -> Option<(String, Arc<BlockAll
 // C1: tree walk (checksum ride-along + semantic checks)
 // ---------------------------------------------------------------------------
 
+/// The C1 checksum-valid schema check for one record — shared by the
+/// detection walk and the repair engine's verify-before-repair re-check.
+fn record_schema_violation(tree_id: u8, k: &[u8], v: &[u8]) -> Option<String> {
+    use crate::meta_backend::kv::record::{
+        decode_dentry_key, decode_inode_key, decode_xattr_key, DentryValue, InodeValue, XattrValue,
+        TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
+    };
+    match tree_id {
+        t if t == TREE_INODES => match decode_inode_key(k) {
+            Err(e) => Some(format!("key does not decode as an inode key: {e}")),
+            Ok(_) => InodeValue::decode(v)
+                .err()
+                .map(|e| format!("inode value undecodable: {e}")),
+        },
+        t if t == TREE_DENTRIES => match decode_dentry_key(k) {
+            Err(e) => Some(format!("key does not decode as a dentry key: {e}")),
+            Ok(_) => DentryValue::decode(v)
+                .err()
+                .map(|e| format!("dentry value undecodable: {e}")),
+        },
+        t if t == TREE_XATTRS => match decode_xattr_key(k) {
+            Err(e) => Some(format!("key does not decode as an xattr key: {e}")),
+            Ok(_) => XattrValue::decode(v)
+                .err()
+                .map(|e| format!("xattr value undecodable: {e}")),
+        },
+        _ => None,
+    }
+}
+
 async fn walk_trees_c1(
     ctx: &FsckCtx,
     opts: &FsckOptions,
     counters: &mut FsckCounters,
     suspects: &mut Vec<Suspect>,
 ) {
-    use crate::meta_backend::kv::record::{
-        decode_dentry_key, decode_inode_key, decode_xattr_key, DentryValue, InodeValue, XattrValue,
-        TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
-    };
     let end = crate::meta_backend::kv::tree::KEY_SPACE_MAX;
     for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
         for tree in kv.trees() {
@@ -637,27 +730,7 @@ async fn walk_trees_c1(
                         }
                     }
                     prev_key = Some(k.to_vec());
-                    let why: Option<String> = match tree_id {
-                        t if t == TREE_INODES => match decode_inode_key(k) {
-                            Err(e) => Some(format!("key does not decode as an inode key: {e}")),
-                            Ok(_) => InodeValue::decode(v)
-                                .err()
-                                .map(|e| format!("inode value undecodable: {e}")),
-                        },
-                        t if t == TREE_DENTRIES => match decode_dentry_key(k) {
-                            Err(e) => Some(format!("key does not decode as a dentry key: {e}")),
-                            Ok(_) => DentryValue::decode(v)
-                                .err()
-                                .map(|e| format!("dentry value undecodable: {e}")),
-                        },
-                        t if t == TREE_XATTRS => match decode_xattr_key(k) {
-                            Err(e) => Some(format!("key does not decode as an xattr key: {e}")),
-                            Ok(_) => XattrValue::decode(v)
-                                .err()
-                                .map(|e| format!("xattr value undecodable: {e}")),
-                        },
-                        _ => None,
-                    };
+                    let why = record_schema_violation(tree_id, k, v);
                     if let Some(why) = why {
                         suspects.push(Suspect {
                             kind: SuspectKind::C1Record {
@@ -765,6 +838,11 @@ async fn census_layout(
     out: &mut CensusOut,
 ) {
     let count_ref = |mapping: &str, ino: u64, idx: u32, out: &mut CensusOut| {
+        // §5.6a quarantined mapping: the reference is COUNTED (the
+        // physical block is intentionally preserved and must stay
+        // refcount-coherent), but the mapping is flagged so the scrub
+        // and the lost checks skip it — it is the repair, not damage.
+        let damaged = crate::routing::is_damaged_mapping(mapping);
         let clean = clean_key(mapping);
         match ctx.router.backend_router.parse_block_key(&clean) {
             Ok((be_id, offset)) => match canonical_backend(ctx, &be_id) {
@@ -774,18 +852,23 @@ async fn census_layout(
                         ino,
                         block_idx: idx,
                         mapping: mapping.to_string(),
+                        damaged,
                     });
                 }
+                None if damaged => {} // quarantined AND unresolvable: already isolated
                 None => out.unresolvable.push(MappingRef {
                     ino,
                     block_idx: idx,
                     mapping: mapping.to_string(),
+                    damaged,
                 }),
             },
+            Err(_) if damaged => {}
             Err(_) => out.unresolvable.push(MappingRef {
                 ino,
                 block_idx: idx,
                 mapping: mapping.to_string(),
+                damaged,
             }),
         }
     };
@@ -818,7 +901,11 @@ async fn census_layout(
 }
 
 /// Strip decoration to the clean base key (`proto://offset` / `offset`).
+/// A §5.6a `damaged:` quarantine marker strips to its preserved BASE key.
 fn clean_key(mapping: &str) -> String {
+    let mapping = mapping
+        .strip_prefix(crate::routing::DAMAGED_MAPPING_PREFIX)
+        .unwrap_or(mapping);
     if let Some(pos) = mapping.find("://") {
         let proto = &mapping[..pos];
         let rest = &mapping[pos + 3..];
@@ -876,46 +963,46 @@ fn evaluate_allocator_classes(
         }
 
         // Lost: referenced but untracked, out-of-range, or unaligned.
+        // Referencers that are §5.6a `damaged:` quarantine markers are
+        // never lost findings — the mapping IS the repair (the marker
+        // preserves the reference for forensics and reads EIO).
         for (&off, _) in refs.iter() {
-            let by = census
+            let referencers: Vec<&MappingRef> = census
                 .mappings
                 .iter()
-                .find(|m| {
+                .filter(|m| {
                     clean_key(&m.mapping)
                         .rsplit("://")
                         .next()
                         .and_then(|s| s.parse::<u64>().ok())
                         == Some(off)
                 })
-                .map(|m| format!("ino {} block {}", m.ino, m.block_idx))
-                .unwrap_or_else(|| "unknown referencer".to_string());
+                .collect();
+            let Some(live) = referencers.iter().find(|m| !m.damaged) else {
+                // No referencer at all (cross-volume alias) or every
+                // referencer already quarantined: nothing to report.
+                continue;
+            };
+            let lost = |why: String| Suspect {
+                kind: SuspectKind::C2Lost {
+                    vol: v.id.clone(),
+                    offset: off,
+                    ino: live.ino,
+                    block_idx: live.block_idx,
+                    mapping: live.mapping.clone(),
+                    why,
+                },
+            };
             if capacity != 0 && off >= capacity {
-                suspects.push(Suspect {
-                    kind: SuspectKind::C2Lost {
-                        vol: v.id.clone(),
-                        offset: off,
-                        by,
-                        why: format!("offset past device capacity {capacity}"),
-                    },
-                });
+                suspects.push(lost(format!("offset past device capacity {capacity}")));
             } else if off % chunk != 0 {
-                suspects.push(Suspect {
-                    kind: SuspectKind::C2Lost {
-                        vol: v.id.clone(),
-                        offset: off,
-                        by,
-                        why: format!("offset not aligned to the {chunk} B allocator chunk"),
-                    },
-                });
+                suspects.push(lost(format!(
+                    "offset not aligned to the {chunk} B allocator chunk"
+                )));
             } else if !sharded && !tracked.contains_key(&off) {
-                suspects.push(Suspect {
-                    kind: SuspectKind::C2Lost {
-                        vol: v.id.clone(),
-                        offset: off,
-                        by,
-                        why: "referenced offset is not allocator-tracked".to_string(),
-                    },
-                });
+                suspects.push(lost(
+                    "referenced offset is not allocator-tracked".to_string(),
+                ));
             }
         }
 
@@ -945,7 +1032,9 @@ fn evaluate_allocator_classes(
             kind: SuspectKind::C2Lost {
                 vol: "?".to_string(),
                 offset: 0,
-                by: format!("ino {} block {}", m.ino, m.block_idx),
+                ino: m.ino,
+                block_idx: m.block_idx,
+                mapping: m.mapping.clone(),
                 why: format!("mapping '{}' resolves to no known backend", m.mapping),
             },
         });
@@ -1133,25 +1222,46 @@ async fn recheck_suspects(
                     evidence: "leaked block: allocated (tracked) with zero referencers, \
                                registry-cleared across two scan epochs"
                         .to_string(),
+                    identity: Some(FindingId::C2Leaked {
+                        vol: vol.clone(),
+                        offset: *offset,
+                    }),
                 })
             }
             SuspectKind::C2Lost {
                 vol,
                 offset,
-                by,
+                ino,
+                block_idx,
+                mapping,
                 why,
             } => {
+                let by = format!("ino {ino} block {block_idx}");
                 if vol == "?" {
                     // Unresolvable mapping: permanent by construction.
                     Some(FsckFinding {
                         class: "C2".to_string(),
                         object: by.clone(),
                         evidence: format!("lost block: {why}"),
+                        identity: Some(FindingId::C2Lost {
+                            vol: vol.clone(),
+                            offset: *offset,
+                            ino: *ino,
+                            block_idx: *block_idx,
+                            mapping: mapping.clone(),
+                            unrepairable_shape: true,
+                        }),
                     })
                 } else {
                     let fresh = fresh.as_ref().expect("fresh walk ran");
-                    let refs = fresh.refs.get(vol).unwrap_or(&EMPTY);
-                    let still_referenced = refs.contains_key(offset);
+                    // Identity-precise re-check: the SAME live (non-
+                    // quarantined) mapping must still reference the offset.
+                    let still_referenced = fresh.mappings.iter().any(|m| {
+                        m.ino == *ino
+                            && m.block_idx == *block_idx
+                            && m.mapping == *mapping
+                            && !m.damaged
+                    });
                     let now_tracked = alloc_of(vol)
                         .map(|a| a.refcount(*offset).is_some())
                         .unwrap_or(false);
@@ -1160,6 +1270,14 @@ async fn recheck_suspects(
                         class: "C2".to_string(),
                         object: format!("{vol}:{offset}"),
                         evidence: format!("lost block ({by}): {why}"),
+                        identity: Some(FindingId::C2Lost {
+                            vol: vol.clone(),
+                            offset: *offset,
+                            ino: *ino,
+                            block_idx: *block_idx,
+                            mapping: mapping.clone(),
+                            unrepairable_shape: out_of_range,
+                        }),
                     })
                 }
             }
@@ -1176,6 +1294,10 @@ async fn recheck_suspects(
                             "refcount {actual} != {expected} counted references \
                              (clone-aware walk; mover ledger cleared)"
                         ),
+                        identity: Some(FindingId::C3Refcount {
+                            vol: vol.clone(),
+                            offset: *offset,
+                        }),
                     }),
                     _ => None, // untracked/unreferenced shapes are C2's business
                 }
@@ -1196,6 +1318,7 @@ async fn recheck_suspects(
                          {tracked} tracked refcounted blocks, stable across both \
                          scan epochs"
                     ),
+                    identity: Some(FindingId::C6Drift { vol: vol.clone() }),
                 })
             }
             SuspectKind::C1Walk {
@@ -1223,6 +1346,11 @@ async fn recheck_suspects(
                         class: "C1".to_string(),
                         object: format!("vol{vol}/tree{tree}/cursor{}", hex(cursor)),
                         evidence: format!("tree walk failed (checksum/undecodable node): {e}"),
+                        identity: Some(FindingId::C1Torn {
+                            vol: *vol,
+                            tree: *tree,
+                            cursor_hex: hex(cursor),
+                        }),
                     }),
                     Ok(_) => None,
                 }
@@ -1251,12 +1379,22 @@ async fn recheck_suspects(
                         class: "C1".to_string(),
                         object: format!("vol{vol}/tree{tree}/key{}", hex(key)),
                         evidence: format!("checksum-valid semantic damage: {why}"),
+                        identity: Some(FindingId::C1Semantic {
+                            vol: *vol,
+                            tree: *tree,
+                            key_hex: hex(key),
+                        }),
                     }),
                     Ok(None) => None, // record vanished (live delete)
                     Err(e) => Some(FsckFinding {
                         class: "C1".to_string(),
                         object: format!("vol{vol}/tree{tree}/key{}", hex(key)),
                         evidence: format!("record unreadable at re-check: {e}"),
+                        identity: Some(FindingId::C1Semantic {
+                            vol: *vol,
+                            tree: *tree,
+                            key_hex: hex(key),
+                        }),
                     }),
                 }
             }
@@ -1294,6 +1432,11 @@ async fn recheck_suspects(
                         "orphan staged record in {}: ino {ino} has no live inode meta",
                         dir.display()
                     ),
+                    identity: Some(FindingId::C4Orphan {
+                        dir: dir.clone(),
+                        key: key.clone(),
+                        ino: *ino,
+                    }),
                 })
             }
             SuspectKind::C5Generation { dir, why } => {
@@ -1305,6 +1448,7 @@ async fn recheck_suspects(
                         class: "C5".to_string(),
                         object: dir.display().to_string(),
                         evidence: why.clone(),
+                        identity: Some(FindingId::C5Staging { dir: dir.clone() }),
                     }),
                 }
             }
@@ -1365,6 +1509,12 @@ async fn scrub_c7(
         if opts.cancel.load(Ordering::Relaxed) {
             break;
         }
+        if m.damaged {
+            // §5.6a quarantined mapping: already isolated (reads EIO,
+            // block preserved for forensics) — never re-scrubbed, never
+            // re-reported.
+            continue;
+        }
         match verify_stored_block(ctx, &crypto, m, block_size).await {
             ScrubOutcome::Aead(bytes) => {
                 counters.scrub_aead_verified += 1;
@@ -1397,6 +1547,11 @@ async fn scrub_c7(
                         class: "C7".to_string(),
                         object: format!("ino {} block {} ({})", m.ino, m.block_idx, m.mapping),
                         evidence,
+                        identity: Some(FindingId::C7Scrub {
+                            ino: m.ino,
+                            block_idx: m.block_idx,
+                            mapping: m.mapping.clone(),
+                        }),
                     });
                 } else {
                     counters.suspects_cleared += 1;
@@ -1632,6 +1787,1207 @@ fn publish_metrics(c: &FsckCounters) {
 }
 
 // ---------------------------------------------------------------------------
+// PR VL6b — §5.6a repair: per-class actions, dry-run default,
+// quarantine-first, verify-before-repair
+// ---------------------------------------------------------------------------
+
+/// Repair invocation options. **Dry-run is the default** (`apply =
+/// false`): the planner emits per-finding actions and mutates NOTHING.
+#[derive(Clone, Debug, Default)]
+pub struct RepairOptions {
+    /// Execute the plan (`--repair --apply`). Requires coordinator /
+    /// D0-guarded authority — the CLI enforces the posture; the engine
+    /// enforces per-object leases.
+    pub apply: bool,
+    /// Quarantine home override (`--quarantine-dir`). Default:
+    /// `<first staging dir>/quarantine/`; REQUIRED on cache-less
+    /// filesystems when any action needs quarantine.
+    pub quarantine_dir: Option<PathBuf>,
+}
+
+/// One planned / applied / refused action (§5.6a table verbs).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RepairAction {
+    pub class: String,
+    pub object: String,
+    /// The table verb: `rebuild-in-place`, `quarantine-report-only`,
+    /// `free-leaked-block`, `repair-allocator`, `quarantine-mapping`,
+    /// `recount-and-set-refcount`, `quarantine-then-discard-custody`,
+    /// `quarantine-staging-dir`, `recompute-accounting`.
+    pub action: String,
+    pub detail: String,
+}
+
+/// §10 repair counters, per run (the process gauges in
+/// [`crate::fuse_client::METRICS`] accumulate the same names).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct RepairCounters {
+    pub planned: u64,
+    pub applied: u64,
+    /// Verify-before-repair refusals (stale/healed findings, missing
+    /// identity, unreachable authority). Never an error: the state
+    /// moved on and the repair honestly declined.
+    pub refused: u64,
+    pub quarantined_records: u64,
+    pub quarantined_blocks: u64,
+    pub quarantined_bytes: u64,
+    /// Applied repairs per class (`"C1"`..`"C7"`).
+    pub per_class: std::collections::BTreeMap<String, u64>,
+}
+
+/// The structured repair report (embedded in [`FsckReport::repair`]).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RepairReport {
+    pub schema: u32,
+    pub dry_run: bool,
+    pub planned: Vec<RepairAction>,
+    pub applied: Vec<RepairAction>,
+    /// Refusals with their reasons in `detail`.
+    pub refused: Vec<RepairAction>,
+    /// The per-run quarantine directory, when anything was quarantined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_dir: Option<String>,
+    pub counters: RepairCounters,
+}
+
+/// Kill-9-window test hook: invoked with `"<class>:<object>"` AFTER the
+/// action's quarantine copies are durable and BEFORE its commit
+/// mutation. Returning `true` aborts the run right there (the injected
+/// crash) — quarantine exists, the mutation never happened, the finding
+/// is re-detected by the next run (the §5.6a convergence law under
+/// test). `None` in production.
+static REPAIR_ABORT_HOOK: parking_lot::RwLock<Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>> =
+    parking_lot::RwLock::new(None);
+
+pub fn set_repair_abort_hook(hook: Arc<dyn Fn(&str) -> bool + Send + Sync>) {
+    *REPAIR_ABORT_HOOK.write() = Some(hook);
+}
+
+pub fn clear_repair_abort_hook() {
+    *REPAIR_ABORT_HOOK.write() = None;
+}
+
+fn fire_repair_abort_hook(what: &str) -> Result<()> {
+    let hook = REPAIR_ABORT_HOOK.read().clone();
+    if let Some(h) = hook {
+        if h(what) {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "fsck repair aborted by test hook at {what} (injected kill-9 window: \
+                 quarantine durable, commit never ran — re-run converges)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The per-run quarantine directory + JSON manifest (§5.6a: "nothing is
+/// destroyed without a copy"). Lazily created on the first quarantined
+/// byte; every entry append rewrites + fdatasyncs `manifest.json`
+/// BEFORE the action's commit mutation runs, so a crash between
+/// quarantine and commit always leaves an auditable copy.
+struct Quarantine {
+    home: Option<PathBuf>,
+    run_dir: Option<PathBuf>,
+    entries: Vec<serde_json::Value>,
+    seq: u32,
+}
+
+impl Quarantine {
+    fn new(ctx: &FsckCtx, opts: &RepairOptions) -> Self {
+        let home = opts
+            .quarantine_dir
+            .clone()
+            .or_else(|| ctx.staging_dirs.first().map(|d| d.join("quarantine")));
+        Quarantine {
+            home,
+            run_dir: None,
+            entries: Vec::new(),
+            seq: 0,
+        }
+    }
+
+    async fn run_dir(&mut self) -> Result<PathBuf> {
+        if let Some(d) = &self.run_dir {
+            return Ok(d.clone());
+        }
+        let home = self.home.clone().ok_or_else(|| {
+            SqueezefsError::InvalidOperation(
+                "repair needs a quarantine home and this filesystem is cache-less: \
+                 pass --quarantine-dir (§5.6a — nothing is destroyed without a copy)"
+                    .to_string(),
+            )
+        })?;
+        let run_id = format!(
+            "{:x}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            std::process::id()
+        );
+        let dir = home.join(run_id);
+        tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+            SqueezefsError::Io(std::io::Error::new(
+                e.kind(),
+                format!("creating quarantine dir {}: {e}", dir.display()),
+            ))
+        })?;
+        self.run_dir = Some(dir.clone());
+        Ok(dir)
+    }
+
+    /// Copy `parts` (suffix → bytes) into the run dir, fsync each, append
+    /// the manifest entry, rewrite + fsync the manifest. Returns total
+    /// bytes copied.
+    async fn put(
+        &mut self,
+        class: &str,
+        object: &str,
+        action: &str,
+        note: &str,
+        parts: &[(&str, &[u8])],
+    ) -> Result<u64> {
+        let dir = self.run_dir().await?;
+        self.seq += 1;
+        let seq = self.seq;
+        let mut files = Vec::new();
+        let mut total = 0u64;
+        for (i, (suffix, bytes)) in parts.iter().enumerate() {
+            let name = format!("{seq:04}_{class}_{i}_{suffix}.bin");
+            let path = dir.join(&name);
+            crate::uring_fs::write_all(&path, bytes.to_vec()).await?;
+            crate::uring_fs::fdatasync(&path).await?;
+            total += bytes.len() as u64;
+            files.push(serde_json::json!({ "name": name, "bytes": bytes.len() }));
+        }
+        self.entries.push(serde_json::json!({
+            "class": class,
+            "object": object,
+            "action": action,
+            "note": note,
+            "files": files,
+        }));
+        self.write_manifest().await?;
+        Ok(total)
+    }
+
+    async fn write_manifest(&mut self) -> Result<()> {
+        let dir = self.run_dir().await?;
+        let manifest = serde_json::json!({
+            "schema": 1u32,
+            "created_unix": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            "entries": self.entries,
+        });
+        let path = dir.join("manifest.json");
+        crate::uring_fs::write_all(
+            &path,
+            serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
+        )
+        .await?;
+        crate::uring_fs::fdatasync(&path).await
+    }
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok())
+        .collect()
+}
+
+/// The §5.6a table verb a finding plans to (dry run and apply share the
+/// planner — the plan IS what apply executes).
+fn planned_action(id: &FindingId) -> (&'static str, String) {
+    match id {
+        FindingId::C1Torn { .. } => (
+            "quarantine-report-only",
+            "torn node: no replicas exist — quarantine identity + report, never \
+             fabrication (data loss made visible and bounded)"
+                .to_string(),
+        ),
+        FindingId::C1Semantic { .. } => (
+            "rebuild-in-place",
+            "checksum-valid structural damage: quarantine the record bytes, then drop \
+             the schema-violating record via an ordinary journaled CoW leaf re-emit"
+                .to_string(),
+        ),
+        FindingId::C2Leaked { vol, offset } => (
+            "free-leaked-block",
+            format!(
+                "free {vol}:{offset} via begin_free → purge → punch → finish_free \
+                 (bytes quarantined first)"
+            ),
+        ),
+        FindingId::C2Lost {
+            unrepairable_shape, ..
+        } => {
+            if *unrepairable_shape {
+                (
+                    "quarantine-mapping",
+                    "out-of-range/unresolvable mapping: replace with an explicit \
+                     `damaged:` marker (reads EIO) — a hole is never silently fabricated"
+                        .to_string(),
+                )
+            } else {
+                (
+                    "verify-content-then-repair-allocator-or-quarantine",
+                    "verify the block content first; verifiable ⇒ repair the allocator \
+                     (the data was fine, the accounting was wrong); unverifiable ⇒ \
+                     quarantine the mapping (`damaged:` marker, reads EIO)"
+                        .to_string(),
+                )
+            }
+        }
+        FindingId::C3Refcount { vol, offset } => (
+            "recount-and-set-refcount",
+            format!(
+                "recount {vol}:{offset}'s references under every referencing ino's \
+                 DLM lease (ascending) and set the refcount to the counted value"
+            ),
+        ),
+        FindingId::C4Orphan { key, .. } => (
+            "quarantine-then-discard-custody",
+            format!(
+                "quarantine a verbatim copy of the staged record + payload for '{key}', \
+                 then discard via the recovery discard law (magic retire)"
+            ),
+        ),
+        FindingId::C5Staging { dir } => (
+            "quarantine-staging-dir",
+            format!(
+                "move {}'s stale-generation marker + staged segment files aside into \
+                 quarantine (the discard-on-mismatch law with a copy retained)",
+                dir.display()
+            ),
+        ),
+        FindingId::C6Drift { vol } => (
+            "recompute-accounting",
+            format!("recompute {vol}'s derived used/free accounting from the tracked census"),
+        ),
+        FindingId::C7Scrub { mapping, .. } => (
+            "quarantine-mapping",
+            format!(
+                "replace '{mapping}' with an explicit `damaged:` marker (reads EIO); \
+                 the physical block stays in place for forensics"
+            ),
+        ),
+    }
+}
+
+/// Is the ino's CURRENT layout still carrying `mapping` (verbatim,
+/// non-quarantined) at `block_idx`? The identity-precise
+/// verify-before-repair re-check for the mapping classes.
+async fn current_mapping_present(ctx: &FsckCtx, ino: u64, block_idx: u32, mapping: &str) -> bool {
+    let (vol_idx, local) = ctx.meta.route_ino(ino);
+    let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
+        return false;
+    };
+    let Ok(Some(bytes)) = kv.getxattr(local, "layout").await else {
+        return false;
+    };
+    let layout: Option<crate::routing::LayoutMetadata> = if bytes.starts_with(b"{") {
+        serde_json::from_slice(&bytes).ok()
+    } else {
+        bincode::deserialize(&bytes).ok()
+    };
+    let Some(layout) = layout else { return false };
+    let block_size = ctx
+        .router
+        .block_size
+        .load(std::sync::atomic::Ordering::Relaxed) as usize;
+    let mut probe = CensusOut {
+        refs: HashMap::new(),
+        mappings: Vec::new(),
+        unresolvable: Vec::new(),
+        inodes_scanned: 0,
+    };
+    census_layout(ctx, ino, &layout, block_size, &mut probe).await;
+    probe
+        .mappings
+        .iter()
+        .chain(probe.unresolvable.iter())
+        .any(|m| m.ino == ino && m.block_idx == block_idx && m.mapping == mapping && !m.damaged)
+}
+
+/// Flip a mapping to its §5.6a `damaged:` quarantine marker — one
+/// tx-atomic layout commit under the merge discipline (the 4a lease is
+/// taken inside the meta transaction). The displaced original key is
+/// deliberately NOT freed: for C7 the physical block is preserved for
+/// forensics; for C2-lost there is nothing allocated to free.
+async fn flip_mapping_damaged(
+    ctx: &FsckCtx,
+    ino: u64,
+    block_idx: u32,
+    mapping: &str,
+) -> Result<()> {
+    let token = ctx.router.dlm.get_fencing_token_ino(ino);
+    let damaged = format!("{}{mapping}", crate::routing::DAMAGED_MAPPING_PREFIX);
+    let entries = [(block_idx, damaged)];
+    ctx.router
+        .merge_block_mappings(
+            ino,
+            crate::routing::BlockMapOp::Merge(&entries),
+            0,
+            crate::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Best-effort raw copy of a mapping's stored image for quarantine
+/// (`None` when the device window cannot be read — recorded honestly in
+/// the manifest instead of blocking the isolation).
+async fn read_stored_image_best_effort(ctx: &FsckCtx, mapping: &str) -> Option<bytes::Bytes> {
+    let block_size = ctx
+        .router
+        .block_size
+        .load(std::sync::atomic::Ordering::Relaxed) as usize;
+    let clean = clean_key(mapping);
+    let (be_id, offset) = ctx.router.backend_router.parse_block_key(&clean).ok()?;
+    let (_, alloc_dev) = canonical_backend(ctx, &be_id)?;
+    let _ = alloc_dev; // canonicalization proves the backend exists
+    let (_, dev) = ctx.router.backend_router.get_backend(&be_id).ok()?;
+    let crypto = ctx.router.get_crypto();
+    let window = if crypto.is_passthrough() {
+        block_size
+    } else {
+        crypto
+            .max_stored_image_len(block_size)
+            .div_ceil(4096)
+            .saturating_mul(4096)
+    };
+    dev.read_block(offset, window).await.ok()
+}
+
+/// Run the §5.6a repair over a VERIFIED report's findings. Dry-run by
+/// default (`opts.apply = false`): plans + returns, mutating nothing.
+/// Apply mode re-verifies every finding is STILL current before acting
+/// (verify-before-repair — a healed/stale finding is a refused repair,
+/// counted), quarantines before every discard, and executes each action
+/// as one tx-atomic commit / copy-then-retire step so kill-9 anywhere
+/// leaves a consistent filesystem and a re-run converges.
+pub async fn repair(
+    ctx: &FsckCtx,
+    report: &FsckReport,
+    opts: &RepairOptions,
+) -> Result<RepairReport> {
+    let mut out = RepairReport {
+        schema: FSCK_REPORT_SCHEMA,
+        dry_run: !opts.apply,
+        planned: Vec::new(),
+        applied: Vec::new(),
+        refused: Vec::new(),
+        quarantine_dir: None,
+        counters: RepairCounters::default(),
+    };
+
+    // ---- Plan (shared by dry run and apply) ----
+    let mut actionable: Vec<(&FsckFinding, &FindingId)> = Vec::new();
+    for f in &report.findings {
+        match &f.identity {
+            Some(id) => {
+                let (verb, detail) = planned_action(id);
+                out.planned.push(RepairAction {
+                    class: f.class.clone(),
+                    object: f.object.clone(),
+                    action: verb.to_string(),
+                    detail,
+                });
+                actionable.push((f, id));
+            }
+            None => {
+                out.refused.push(RepairAction {
+                    class: f.class.clone(),
+                    object: f.object.clone(),
+                    action: "refused".to_string(),
+                    detail: "finding carries no structured identity (older-binary report) \
+                             — re-run detection with this binary"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    out.counters.planned = out.planned.len() as u64;
+    out.counters.refused = out.refused.len() as u64;
+
+    if !opts.apply {
+        publish_repair_metrics(&out.counters);
+        return Ok(out);
+    }
+
+    // ---- Apply ----
+    let online = report.mode == "online";
+    let block_size = ctx
+        .router
+        .block_size
+        .load(std::sync::atomic::Ordering::Relaxed) as usize;
+    let crypto = ctx.router.get_crypto().clone();
+    let vols = volume_allocators(ctx);
+    let alloc_of = |vol: &str| vols.iter().find(|v| v.id == vol).map(|v| v.alloc.clone());
+    let mut quarantine = Quarantine::new(ctx, opts);
+
+    // One fresh census for the allocator-class verifications (C2/C3),
+    // walked ONCE — the repair-time ground truth.
+    let needs_census = actionable.iter().any(|(_, id)| {
+        matches!(
+            id,
+            FindingId::C2Leaked { .. } | FindingId::C2Lost { .. } | FindingId::C3Refcount { .. }
+        )
+    });
+    let fresh = if needs_census {
+        let mut scratch = FsckCounters::default();
+        Some(walk_census(ctx, &FsckOptions::offline(), &mut scratch).await?)
+    } else {
+        None
+    };
+
+    let refuse = |out: &mut RepairReport, f: &FsckFinding, why: String| {
+        out.refused.push(RepairAction {
+            class: f.class.clone(),
+            object: f.object.clone(),
+            action: "refused".to_string(),
+            detail: why,
+        });
+        out.counters.refused += 1;
+    };
+    let class_idx = |class: &str| -> Option<usize> {
+        class
+            .strip_prefix('C')
+            .and_then(|n| n.parse::<usize>().ok())
+            .filter(|n| (1..=7).contains(n))
+            .map(|n| n - 1)
+    };
+    let apply_ok = |out: &mut RepairReport, f: &FsckFinding, verb: &str, detail: String| {
+        out.applied.push(RepairAction {
+            class: f.class.clone(),
+            object: f.object.clone(),
+            action: verb.to_string(),
+            detail,
+        });
+        out.counters.applied += 1;
+        *out.counters.per_class.entry(f.class.clone()).or_insert(0) += 1;
+        if let Some(i) = class_idx(&f.class) {
+            crate::fuse_client::METRICS.fsck_repair_class[i]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    };
+
+    for (f, id) in actionable {
+        let what = format!("{}:{}", f.class, f.object);
+        match id {
+            // -------------------------------------------------- C1 torn
+            FindingId::C1Torn {
+                vol,
+                tree,
+                cursor_hex,
+            } => {
+                // Verify: the walk still fails from this cursor.
+                let Some(kv) = ctx.meta.volumes.get(*vol) else {
+                    refuse(&mut out, f, "volume index no longer exists".to_string());
+                    continue;
+                };
+                let Some(cursor) = unhex(cursor_hex) else {
+                    refuse(&mut out, f, "undecodable cursor identity".to_string());
+                    continue;
+                };
+                let Some(tree_ref) = kv.trees().into_iter().find(|t| t.tree_id() == *tree) else {
+                    refuse(&mut out, f, "tree no longer exists".to_string());
+                    continue;
+                };
+                // Same-shaped read as the scan (a max=1 probe can be
+                // satisfied by a healthy left sibling and never touch the
+                // damaged node — the recheck's own lesson).
+                match tree_ref
+                    .range(
+                        &cursor,
+                        &crate::meta_backend::kv::tree::KEY_SPACE_MAX,
+                        SCAN_PAGE,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        refuse(
+                            &mut out,
+                            f,
+                            "walk now succeeds from the recorded cursor (healed / \
+                             transient I/O at scan time)"
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        // The honest action: no replicas exist — record the
+                        // identity + error in the quarantine manifest and
+                        // REPORT. The finding persists by design (data loss
+                        // made visible, never fabricated away).
+                        let note = format!(
+                            "torn node on vol{vol}/tree{tree} at cursor {cursor_hex}: {e}; \
+                             node bytes are unreachable through the validated read path \
+                             (checksum-refused) — identity recorded, no mutation performed"
+                        );
+                        let bytes = quarantine
+                            .put(&f.class, &f.object, "quarantine-report-only", &note, &[])
+                            .await?;
+                        out.counters.quarantined_records += 1;
+                        out.counters.quarantined_bytes += bytes;
+                        fire_repair_abort_hook(&what)?;
+                        apply_ok(&mut out, f, "quarantine-report-only", note);
+                    }
+                }
+            }
+            // ---------------------------------------------- C1 semantic
+            FindingId::C1Semantic { vol, tree, key_hex } => {
+                let Some(kv) = ctx.meta.volumes.get(*vol) else {
+                    refuse(&mut out, f, "volume index no longer exists".to_string());
+                    continue;
+                };
+                let Some(key) = unhex(key_hex) else {
+                    refuse(&mut out, f, "undecodable key identity".to_string());
+                    continue;
+                };
+                let Some(tree_ref) = kv.trees().into_iter().find(|t| t.tree_id() == *tree) else {
+                    refuse(&mut out, f, "tree no longer exists".to_string());
+                    continue;
+                };
+                // Verify under the owning ino's lease where one exists.
+                let _lease = match (online, owning_ino(*tree, &key)) {
+                    (true, Some(local)) => Some(kv.dlm().lock_inode_exclusive(local).await),
+                    _ => None,
+                };
+                let value = match tree_ref.lookup(&key).await {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        refuse(&mut out, f, "record no longer exists (healed)".to_string());
+                        continue;
+                    }
+                    Err(e) => {
+                        refuse(&mut out, f, format!("record unreadable at verify: {e}"));
+                        continue;
+                    }
+                };
+                if record_schema_violation(*tree, &key, &value).is_none() {
+                    refuse(
+                        &mut out,
+                        f,
+                        "record now satisfies its tree schema (superseded in place)".to_string(),
+                    );
+                    continue;
+                }
+                // Quarantine the record bytes, then drop it via the
+                // ordinary journaled CoW mutation (the leaf re-emits
+                // without the record; the parent pointer swap rides the
+                // existing SMO-path machinery).
+                let bytes = quarantine
+                    .put(
+                        &f.class,
+                        &f.object,
+                        "rebuild-in-place",
+                        "record bytes (key, value) before the drop",
+                        &[("key", &key), ("value", &value)],
+                    )
+                    .await?;
+                out.counters.quarantined_records += 1;
+                out.counters.quarantined_bytes += bytes;
+                fire_repair_abort_hook(&what)?;
+                tree_ref.delete(&key).await.map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!(
+                        "rebuild-in-place drop of the schema-violating record failed: {e}"
+                    ))
+                })?;
+                apply_ok(
+                    &mut out,
+                    f,
+                    "rebuild-in-place",
+                    format!(
+                        "schema-violating record dropped from vol{vol}/tree{tree} \
+                         (journaled CoW re-emit); bytes quarantined"
+                    ),
+                );
+            }
+            // ------------------------------------------------ C2 leaked
+            FindingId::C2Leaked { vol, offset } => {
+                let Some(alloc) = alloc_of(vol) else {
+                    refuse(&mut out, f, format!("volume '{vol}' no longer registered"));
+                    continue;
+                };
+                let fresh = fresh.as_ref().expect("census walked");
+                static EMPTY: once_cell::sync::Lazy<HashMap<u64, u32>> =
+                    once_cell::sync::Lazy::new(HashMap::new);
+                let refs = fresh.refs.get(vol).unwrap_or(&EMPTY);
+                if alloc.refcount(*offset).is_none() {
+                    refuse(
+                        &mut out,
+                        f,
+                        "offset no longer tracked (already freed)".to_string(),
+                    );
+                    continue;
+                }
+                if refs.contains_key(offset) || alloc.inflight_contains(*offset) {
+                    refuse(
+                        &mut out,
+                        f,
+                        "offset is referenced or has a live in-flight owner now \
+                         (published since the scan)"
+                            .to_string(),
+                    );
+                    continue;
+                }
+                // Quarantine the block bytes before the free destroys them.
+                let key = ctx.router.backend_router.persist_block_key(vol, *offset);
+                let (note, parts): (String, Vec<(&str, &[u8])>);
+                let image = read_stored_image_best_effort(ctx, &key).await;
+                match &image {
+                    Some(img) => {
+                        note = "leaked block bytes before the free".to_string();
+                        parts = vec![("block", img.as_ref())];
+                    }
+                    None => {
+                        note = "block bytes unreadable at quarantine time — identity \
+                                recorded only"
+                            .to_string();
+                        parts = Vec::new();
+                    }
+                }
+                let bytes = quarantine
+                    .put(&f.class, &f.object, "free-leaked-block", &note, &parts)
+                    .await?;
+                out.counters.quarantined_blocks += 1;
+                out.counters.quarantined_bytes += bytes;
+                fire_repair_abort_hook(&what)?;
+                ctx.router.backend_router.free_block(&key).await?;
+                apply_ok(
+                    &mut out,
+                    f,
+                    "free-leaked-block",
+                    format!("{vol}:{offset} freed (begin → purge → punch → finish)"),
+                );
+            }
+            // -------------------------------------------------- C2 lost
+            FindingId::C2Lost {
+                vol,
+                offset,
+                ino,
+                block_idx,
+                mapping,
+                unrepairable_shape,
+            } => {
+                if !current_mapping_present(ctx, *ino, *block_idx, mapping).await {
+                    refuse(
+                        &mut out,
+                        f,
+                        "the lost mapping is no longer present (truncated / rewritten / \
+                         already quarantined)"
+                            .to_string(),
+                    );
+                    continue;
+                }
+                let repair_allocator = if *unrepairable_shape {
+                    false
+                } else {
+                    let Some(alloc) = alloc_of(vol) else {
+                        refuse(&mut out, f, format!("volume '{vol}' no longer registered"));
+                        continue;
+                    };
+                    if alloc.refcount(*offset).is_some() {
+                        refuse(
+                            &mut out,
+                            f,
+                            "offset is allocator-tracked now (healed)".to_string(),
+                        );
+                        continue;
+                    }
+                    // Verify the content first (the C7 check for this
+                    // block's stored form).
+                    let probe = MappingRef {
+                        ino: *ino,
+                        block_idx: *block_idx,
+                        mapping: mapping.clone(),
+                        damaged: false,
+                    };
+                    !matches!(
+                        verify_stored_block(ctx, &crypto, &probe, block_size).await,
+                        ScrubOutcome::Failed(_) | ScrubOutcome::Skipped
+                    )
+                };
+                if repair_allocator {
+                    let alloc = alloc_of(vol).expect("checked above");
+                    let counted = fresh
+                        .as_ref()
+                        .and_then(|c| c.refs.get(vol).and_then(|m| m.get(offset)).copied())
+                        .unwrap_or(1)
+                        .max(1);
+                    fire_repair_abort_hook(&what)?;
+                    alloc.recover_block(*offset / alloc.chunk_size()).await?;
+                    alloc.fsck_set_refcount(*offset, counted);
+                    // The content is durable on the device: restore fill
+                    // stability under a fresh incarnation generation.
+                    alloc.publish_block(*offset);
+                    apply_ok(
+                        &mut out,
+                        f,
+                        "repair-allocator",
+                        format!(
+                            "content verified ⇒ {vol}:{offset} re-marked allocated at \
+                             refcount {counted} (the data was fine, the accounting \
+                             was wrong)"
+                        ),
+                    );
+                } else {
+                    // Quarantine the mapping: copy what is readable,
+                    // then flip to the explicit damaged marker.
+                    let image = read_stored_image_best_effort(ctx, mapping).await;
+                    let (note, parts): (String, Vec<(&str, &[u8])>) = match &image {
+                        Some(img) => (
+                            "stored image window at quarantine time".to_string(),
+                            vec![("block", img.as_ref())],
+                        ),
+                        None => (
+                            "stored image unreadable (out-of-range / unresolvable) — \
+                             identity recorded only"
+                                .to_string(),
+                            Vec::new(),
+                        ),
+                    };
+                    let bytes = quarantine
+                        .put(&f.class, &f.object, "quarantine-mapping", &note, &parts)
+                        .await?;
+                    out.counters.quarantined_records += 1;
+                    out.counters.quarantined_bytes += bytes;
+                    fire_repair_abort_hook(&what)?;
+                    flip_mapping_damaged(ctx, *ino, *block_idx, mapping).await?;
+                    apply_ok(
+                        &mut out,
+                        f,
+                        "quarantine-mapping",
+                        format!(
+                            "ino {ino} block {block_idx}: mapping replaced with the \
+                             explicit damaged marker (reads EIO; loss made visible, \
+                             never a fabricated hole)"
+                        ),
+                    );
+                }
+            }
+            // ------------------------------------------------------- C3
+            FindingId::C3Refcount { vol, offset } => {
+                let Some(alloc) = alloc_of(vol) else {
+                    refuse(&mut out, f, format!("volume '{vol}' no longer registered"));
+                    continue;
+                };
+                let fresh = fresh.as_ref().expect("census walked");
+                // The referencing inos, ascending — the §5.6a lease order.
+                let mut referencers: Vec<u64> = fresh
+                    .mappings
+                    .iter()
+                    .filter(|m| {
+                        clean_key(&m.mapping)
+                            .rsplit("://")
+                            .next()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            == Some(*offset)
+                    })
+                    .map(|m| m.ino)
+                    .collect();
+                referencers.sort_unstable();
+                referencers.dedup();
+                if referencers.is_empty() {
+                    refuse(
+                        &mut out,
+                        f,
+                        "no referencers remain (the unreferenced shape is C2's business)"
+                            .to_string(),
+                    );
+                    continue;
+                }
+                // Take every referencing ino's exclusive lease (ascending)
+                // and recount UNDER them.
+                let mut guards = Vec::with_capacity(referencers.len());
+                if online {
+                    for &g_ino in &referencers {
+                        let (vol_idx, local) = ctx.meta.route_ino(g_ino);
+                        if let Some(kv) = ctx.meta.volumes.get(vol_idx) {
+                            guards.push(kv.dlm().lock_inode_exclusive(local).await);
+                        }
+                    }
+                }
+                let mut counted = 0u32;
+                for &r_ino in &referencers {
+                    let (vol_idx, local) = ctx.meta.route_ino(r_ino);
+                    let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
+                        continue;
+                    };
+                    let Ok(Some(bytes)) = kv.getxattr(local, "layout").await else {
+                        continue;
+                    };
+                    let layout: Option<crate::routing::LayoutMetadata> = if bytes.starts_with(b"{")
+                    {
+                        serde_json::from_slice(&bytes).ok()
+                    } else {
+                        bincode::deserialize(&bytes).ok()
+                    };
+                    let Some(layout) = layout else { continue };
+                    let mut probe = CensusOut {
+                        refs: HashMap::new(),
+                        mappings: Vec::new(),
+                        unresolvable: Vec::new(),
+                        inodes_scanned: 0,
+                    };
+                    census_layout(ctx, r_ino, &layout, block_size, &mut probe).await;
+                    counted += probe
+                        .refs
+                        .get(vol)
+                        .and_then(|m| m.get(offset))
+                        .copied()
+                        .unwrap_or(0);
+                }
+                let actual = alloc.refcount(*offset);
+                match actual {
+                    Some(actual) if counted > 0 && actual != counted => {
+                        fire_repair_abort_hook(&what)?;
+                        alloc.fsck_set_refcount(*offset, counted);
+                        drop(guards);
+                        apply_ok(
+                            &mut out,
+                            f,
+                            "recount-and-set-refcount",
+                            format!(
+                                "{vol}:{offset} refcount {actual} → {counted} (recounted \
+                                 under {} referencing lease(s))",
+                                referencers.len()
+                            ),
+                        );
+                    }
+                    Some(actual) if counted > 0 => {
+                        drop(guards);
+                        refuse(
+                            &mut out,
+                            f,
+                            format!("refcount {actual} already matches the recount (healed)"),
+                        );
+                    }
+                    _ => {
+                        drop(guards);
+                        refuse(
+                            &mut out,
+                            f,
+                            "offset untracked or unreferenced at recount (C2's business)"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            // ------------------------------------------------------- C4
+            FindingId::C4Orphan { dir, key, ino } => {
+                // Verify: custody still live AND the ino still has no
+                // meta (v3 inos are monotonic — never reused — so a
+                // missing ino can never come back; the lease is for the
+                // read's coherence online).
+                let still_present =
+                    match crate::cache::nvme::scan_live_staged_custody(dir, CUSTODY_SCAN_MAX).await
+                    {
+                        Ok(keys) => keys.iter().any(|k| k == key),
+                        Err(e) => {
+                            refuse(&mut out, f, format!("custody scan failed at verify: {e}"));
+                            continue;
+                        }
+                    };
+                if !still_present {
+                    refuse(
+                        &mut out,
+                        f,
+                        "custody record no longer present (flushed / already discarded)"
+                            .to_string(),
+                    );
+                    continue;
+                }
+                let (vol_idx, local) = ctx.meta.route_ino(*ino);
+                let still_missing = {
+                    let _lease = if online {
+                        Some(
+                            ctx.meta.volumes[vol_idx]
+                                .dlm()
+                                .lock_inode_exclusive(local)
+                                .await,
+                        )
+                    } else {
+                        None
+                    };
+                    match ctx.meta.volumes[vol_idx].getattr(local).await {
+                        Ok(inode) => inode.nlink == 0,
+                        Err(e) if is_not_found(&e) => true,
+                        Err(_) => false,
+                    }
+                };
+                if !still_missing {
+                    refuse(
+                        &mut out,
+                        f,
+                        "ino has live meta now (not an orphan)".to_string(),
+                    );
+                    continue;
+                }
+                // Quarantine the record image(s) — header + key + payload.
+                let images =
+                    crate::cache::nvme::extract_and_kill_staged_custody(dir, key, false).await?;
+                if images.is_empty() {
+                    refuse(
+                        &mut out,
+                        f,
+                        "custody record vanished between verify and quarantine".to_string(),
+                    );
+                    continue;
+                }
+                let parts: Vec<(&str, &[u8])> =
+                    images.iter().map(|img| ("record", img.as_ref())).collect();
+                let bytes = quarantine
+                    .put(
+                        &f.class,
+                        &f.object,
+                        "quarantine-then-discard-custody",
+                        "verbatim staged record image(s): header + custody key + payload",
+                        &parts,
+                    )
+                    .await?;
+                out.counters.quarantined_records += images.len() as u64;
+                out.counters.quarantined_bytes += bytes;
+                fire_repair_abort_hook(&what)?;
+                // Discard: live store first (zeroes its indexed record),
+                // then the raw on-disk residue (seeded / unindexed images).
+                let _ = ctx.router.cache.nvme.remove_active_block(key);
+                let _ = crate::cache::nvme::extract_and_kill_staged_custody(dir, key, true).await?;
+                apply_ok(
+                    &mut out,
+                    f,
+                    "quarantine-then-discard-custody",
+                    format!(
+                        "orphan custody '{key}' discarded from {} ({} record image(s) \
+                         quarantined first)",
+                        dir.display(),
+                        images.len()
+                    ),
+                );
+            }
+            // ------------------------------------------------------- C5
+            FindingId::C5Staging { dir } => {
+                let Some(expected) = ctx.expected_generation.as_deref() else {
+                    refuse(
+                        &mut out,
+                        f,
+                        "no expected volume-set generation in this context".to_string(),
+                    );
+                    continue;
+                };
+                let stale = match crate::cache::nvme::read_staging_generation_marker(dir).await {
+                    Ok(Some(found)) => found != expected,
+                    Ok(None) => {
+                        crate::cache::nvme::dir_has_segment_data(&dir.join("staging_segment"))
+                    }
+                    Err(_) => true,
+                };
+                if !stale {
+                    refuse(
+                        &mut out,
+                        f,
+                        "staging generation matches the mounted set now (restamped)".to_string(),
+                    );
+                    continue;
+                }
+                // Quarantine: copy the marker + every staging segment file
+                // aside (move = copy + fsync + remove; the copy is durable
+                // BEFORE anything is removed).
+                let mut parts_owned: Vec<(String, Vec<u8>)> = Vec::new();
+                let marker_path = dir.join(crate::cache::nvme::STAGING_GENERATION_MARKER);
+                if let Ok(bytes) = crate::uring_fs::read_all(&marker_path).await {
+                    parts_owned.push(("generation_marker".to_string(), bytes.to_vec()));
+                }
+                let seg_dir = dir.join("staging_segment");
+                let mut seg_files: Vec<PathBuf> = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(&seg_dir) {
+                    for entry in entries.flatten() {
+                        if entry.metadata().map(|m| m.is_file()).unwrap_or(false) {
+                            seg_files.push(entry.path());
+                        }
+                    }
+                }
+                for p in &seg_files {
+                    if let Ok(bytes) = crate::uring_fs::read_all(p).await {
+                        let name = p
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "segment".to_string());
+                        parts_owned.push((format!("segment_{name}"), bytes.to_vec()));
+                    }
+                }
+                let parts: Vec<(&str, &[u8])> = parts_owned
+                    .iter()
+                    .map(|(n, b)| (n.as_str(), b.as_slice()))
+                    .collect();
+                let bytes = quarantine
+                    .put(
+                        &f.class,
+                        &f.object,
+                        "quarantine-staging-dir",
+                        "stale-generation marker + staged segment files, moved aside \
+                         (copy retained — the discard-on-mismatch law made non-destructive)",
+                        &parts,
+                    )
+                    .await?;
+                out.counters.quarantined_records += parts_owned.len() as u64;
+                out.counters.quarantined_bytes += bytes;
+                fire_repair_abort_hook(&what)?;
+                // The move-aside completes: remove the originals (the
+                // copies above are durable).
+                let _ = std::fs::remove_file(&marker_path);
+                for p in &seg_files {
+                    let _ = std::fs::remove_file(p);
+                }
+                apply_ok(
+                    &mut out,
+                    f,
+                    "quarantine-staging-dir",
+                    format!(
+                        "{}: stale marker + {} segment file(s) moved aside",
+                        dir.display(),
+                        seg_files.len()
+                    ),
+                );
+            }
+            // ------------------------------------------------------- C6
+            FindingId::C6Drift { vol } => {
+                let Some(alloc) = alloc_of(vol) else {
+                    refuse(&mut out, f, format!("volume '{vol}' no longer registered"));
+                    continue;
+                };
+                let used = alloc
+                    .highest_block_index()
+                    .saturating_sub(alloc.free_blocks_count());
+                let tracked = alloc.tracked_offsets().len() as u64;
+                if used == tracked {
+                    refuse(
+                        &mut out,
+                        f,
+                        "accounting converged on its own (healed)".to_string(),
+                    );
+                    continue;
+                }
+                fire_repair_abort_hook(&what)?;
+                let (frees_completed, evictions) = alloc.fsck_reconcile_accounting();
+                apply_ok(
+                    &mut out,
+                    f,
+                    "recompute-accounting",
+                    format!(
+                        "{vol}: derived accounting recomputed from the tracked census \
+                         ({frees_completed} wedged free(s) completed, {evictions} \
+                         free-list eviction(s))"
+                    ),
+                );
+            }
+            // ------------------------------------------------------- C7
+            FindingId::C7Scrub {
+                ino,
+                block_idx,
+                mapping,
+            } => {
+                if !current_mapping_present(ctx, *ino, *block_idx, mapping).await {
+                    refuse(
+                        &mut out,
+                        f,
+                        "mapping no longer present (rewritten / truncated / already \
+                         quarantined)"
+                            .to_string(),
+                    );
+                    continue;
+                }
+                let probe = MappingRef {
+                    ino: *ino,
+                    block_idx: *block_idx,
+                    mapping: mapping.clone(),
+                    damaged: false,
+                };
+                let still_failing = if online {
+                    reverify_scrub_failure(ctx, &crypto, &probe, block_size).await
+                } else {
+                    matches!(
+                        verify_stored_block(ctx, &crypto, &probe, block_size).await,
+                        ScrubOutcome::Failed(_)
+                    )
+                };
+                if !still_failing {
+                    refuse(
+                        &mut out,
+                        f,
+                        "block verifies now (moved / rewritten since the scan)".to_string(),
+                    );
+                    continue;
+                }
+                // Quarantine what is readable, then isolate the mapping.
+                let image = read_stored_image_best_effort(ctx, mapping).await;
+                let (note, parts): (String, Vec<(&str, &[u8])>) = match &image {
+                    Some(img) => (
+                        "corrupt stored image (verbatim device window) — the physical \
+                         block also stays in place for forensics"
+                            .to_string(),
+                        vec![("block", img.as_ref())],
+                    ),
+                    None => (
+                        "stored image unreadable (device read error) — identity \
+                         recorded; the physical block stays in place"
+                            .to_string(),
+                        Vec::new(),
+                    ),
+                };
+                let bytes = quarantine
+                    .put(&f.class, &f.object, "quarantine-mapping", &note, &parts)
+                    .await?;
+                out.counters.quarantined_blocks += 1;
+                out.counters.quarantined_bytes += bytes;
+                fire_repair_abort_hook(&what)?;
+                flip_mapping_damaged(ctx, *ino, *block_idx, mapping).await?;
+                apply_ok(
+                    &mut out,
+                    f,
+                    "quarantine-mapping",
+                    format!(
+                        "ino {ino} block {block_idx}: mapping quarantined (reads EIO); \
+                         physical block preserved for forensics"
+                    ),
+                );
+            }
+        }
+    }
+
+    out.quarantine_dir = quarantine.run_dir.as_ref().map(|d| d.display().to_string());
+    publish_repair_metrics(&out.counters);
+    Ok(out)
+}
+
+fn publish_repair_metrics(c: &RepairCounters) {
+    use crate::fuse_client::METRICS;
+    let m = &*METRICS;
+    m.fsck_repairs_planned
+        .fetch_add(c.planned, Ordering::Relaxed);
+    m.fsck_repairs_applied
+        .fetch_add(c.applied, Ordering::Relaxed);
+    m.fsck_repairs_refused
+        .fetch_add(c.refused, Ordering::Relaxed);
+    m.fsck_quarantined_records
+        .fetch_add(c.quarantined_records, Ordering::Relaxed);
+    m.fsck_quarantined_blocks
+        .fetch_add(c.quarantined_blocks, Ordering::Relaxed);
+    m.fsck_quarantined_bytes
+        .fetch_add(c.quarantined_bytes, Ordering::Relaxed);
+    // per_class applied counts are published inline at apply time (the
+    // per-action `apply_ok` path) — not re-added here.
+}
+
+// ---------------------------------------------------------------------------
 // Offline harness (read-only probes; §5.8 duality)
 // ---------------------------------------------------------------------------
 
@@ -1652,10 +3008,52 @@ pub async fn run_offline(meta_lvs: &[String], opts: &FsckOptions) -> Result<Fsck
             })?;
     }
     let routed = crate::meta_backend::open_probe_routed_meta_set(meta_lvs).await?;
-    let result = run_offline_body(&routed, meta_lvs, opts).await;
+    let result = run_offline_body(&routed, meta_lvs, opts, None).await;
     for vol in &routed.volumes {
         if let Err(e) = vol.shutdown().await {
             log::warn!("releasing probe after offline fsck: {e}");
+        }
+    }
+    result
+}
+
+/// The offline `--repair` harness (§5.6a / §5.8): repair is a WRITER —
+/// it runs under the **D0-guarded open** (the same posture every offline
+/// mutating verb takes — `set-cache-paths` / `volume remove-data`),
+/// never the read-only probe. Refused on `--shards` probe shards (a
+/// shard sees a partial census; repair acts only on whole-scan
+/// findings). Detection runs first inside the guard; the repair
+/// (dry-run or apply per `ropts`) consumes its verified findings; the
+/// combined report is returned with [`FsckReport::repair`] populated.
+pub async fn run_offline_repair(
+    meta_lvs: &[String],
+    opts: &FsckOptions,
+    ropts: &RepairOptions,
+) -> Result<FsckReport> {
+    use std::path::Path;
+    if opts.shard.is_some() {
+        return Err(SqueezefsError::InvalidOperation(
+            "--repair is refused on --shards probe shards: repair requires the whole-scan \
+             findings under the guarded open (§5.6a); run the repair unsharded"
+                .to_string(),
+        ));
+    }
+    for path in meta_lvs {
+        crate::meta_backend::kv::builder::format_preflight(Path::new(path), true)
+            .await
+            .map_err(|e| {
+                SqueezefsError::InvalidOperation(format!(
+                    "offline fsck --repair refused: {e} — repair requires exclusive \
+                     guarded access (§5.6a)"
+                ))
+            })?;
+    }
+    // The D0-guarded open (writer claims) — NOT the read-only probe.
+    let routed = crate::meta_backend::open_routed_meta_set(meta_lvs).await?;
+    let result = run_offline_body(&routed, meta_lvs, opts, Some(ropts)).await;
+    for vol in &routed.volumes {
+        if let Err(e) = vol.shutdown().await {
+            log::warn!("releasing guard after offline fsck --repair: {e}");
         }
     }
     result
@@ -1665,6 +3063,7 @@ async fn run_offline_body(
     routed: &Arc<RoutedMetaBackend>,
     meta_lvs: &[String],
     opts: &FsckOptions,
+    repair_opts: Option<&RepairOptions>,
 ) -> Result<FsckReport> {
     let cfg = crate::config_ops::read_volume_format_config(meta_lvs).await?;
     let records = cfg.resolved_data_volumes();
@@ -1735,5 +3134,9 @@ async fn run_offline_body(
         staging_dirs,
         expected_generation: Some(volume_generation(routed)),
     };
-    run(&ctx, opts).await
+    let mut report = run(&ctx, opts).await?;
+    if let Some(ropts) = repair_opts {
+        report.repair = Some(repair(&ctx, &report, ropts).await?);
+    }
+    Ok(report)
 }

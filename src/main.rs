@@ -162,14 +162,17 @@ enum Commands {
         #[command(subcommand)]
         action: JobActions,
     },
-    /// Online report-only filesystem check (design-volume-lifecycle
-    /// §5.6, PR VL6a): seven check classes with verify-before-report
-    /// zero-FP machinery. TARGET = a live mountpoint (online: the scan
-    /// reads the daemon's RAM-authoritative state under the suspects
-    /// machinery) or a sqmeta:// URI (offline: read-only probes —
-    /// refuses under a live writer), or the literal `merge-reports`
-    /// followed by shard report files. Detection never mutates; exit
-    /// status is nonzero when findings exist (repair is PR VL6b).
+    /// Online filesystem check (design-volume-lifecycle §5.6, PR VL6a)
+    /// with per-class repair (§5.6a, PR VL6b): seven check classes with
+    /// verify-before-report zero-FP machinery. TARGET = a live
+    /// mountpoint (online: the scan reads the daemon's RAM-authoritative
+    /// state under the suspects machinery) or a sqmeta:// URI (offline:
+    /// read-only probes — refuses under a live writer; `--repair` takes
+    /// the guarded D0 open instead), or the literal `merge-reports`
+    /// followed by shard report files. Detection never mutates;
+    /// `--repair` plans (dry-run default), `--repair --apply` executes
+    /// quarantine-first per-class actions on verified findings only.
+    /// Exit status is nonzero when findings exist.
     Fsck {
         /// Live mountpoint, sqmeta:// URI, or `merge-reports`
         target: String,
@@ -190,13 +193,26 @@ enum Commands {
         json: bool,
         /// Offline zero-coordination sharding: scan the k-th of N
         /// ino-residue shards ("k/N", 0-based k); union the outputs
-        /// with `fsck merge-reports`
+        /// with `fsck merge-reports`. Incompatible with --repair.
         #[arg(long)]
         shards: Option<String>,
         /// Add the C7 data scrub (KD-17: AEAD on encrypted, frame
         /// decode on compressed, readability-only on plain)
         #[arg(long)]
         scrub: bool,
+        /// Plan per-class repairs of the verified findings (§5.6a
+        /// table). DRY RUN unless --apply is also given. Offline this
+        /// requires the exclusive guarded open (repair is a writer).
+        #[arg(long)]
+        repair: bool,
+        /// Execute the repair plan (with --repair): quarantine-first,
+        /// verify-before-repair, idempotent per-class actions
+        #[arg(long)]
+        apply: bool,
+        /// Quarantine home override (default: <first staging
+        /// dir>/quarantine/; REQUIRED on cache-less filesystems)
+        #[arg(long)]
+        quarantine_dir: Option<String>,
     },
     /// C7-only data scrub (the standalone spelling of `fsck --scrub`;
     /// same engine — design-volume-lifecycle §5.6 / KD-17)
@@ -1503,6 +1519,13 @@ async fn run_job_worker(meta_uri: &str) -> Result<(), Box<dyn std::error::Error>
 /// sharding; `fsck merge-reports <files…>` unions shard outputs.
 /// Detection never mutates; the process exits nonzero when verified
 /// findings exist (the fsck convention).
+/// PR VL6b: the `--repair [--apply] [--quarantine-dir]` CLI surface.
+struct FsckRepairArgs {
+    repair: bool,
+    apply: bool,
+    quarantine_dir: Option<String>,
+}
+
 #[allow(clippy::too_many_arguments)] // a CLI verb surface, not an API
 async fn run_fsck_verb(
     target: &str,
@@ -1514,8 +1537,28 @@ async fn run_fsck_verb(
     shards: Option<String>,
     scrub: bool,
     scrub_only: bool,
+    repair_args: FsckRepairArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     squeezefs::set_fs_prefix("squeezefs");
+
+    // §5.6a argument lattice: dry-run is the DEFAULT (--repair plans;
+    // --repair --apply executes); apply/quarantine-dir without --repair
+    // are refused loud; --repair on probe shards is refused (repair
+    // needs whole-scan findings under exclusive/coordinator authority).
+    if (repair_args.apply || repair_args.quarantine_dir.is_some()) && !repair_args.repair {
+        return Err(
+            "--apply/--quarantine-dir are only valid with --repair (§5.6a: repair is \
+             dry-run by default)"
+                .into(),
+        );
+    }
+    if repair_args.repair && shards.is_some() {
+        return Err(
+            "--repair is refused on --shards probe shards: repair requires the whole-scan \
+             findings under the guarded open (§5.6a); run the repair unsharded"
+                .into(),
+        );
+    }
 
     // `fsck merge-reports <files…>` — the shard union.
     if target == "merge-reports" {
@@ -1567,12 +1610,18 @@ async fn run_fsck_verb(
         }
         let mut arg = String::new();
         if scrub_only {
-            arg.push_str("scrub-only");
+            arg.push_str("scrub-only ");
         } else if scrub {
-            arg.push_str("scrub");
+            arg.push_str("scrub ");
         }
-        if !arg.is_empty() {
-            arg.push(' ');
+        if repair_args.repair {
+            arg.push_str("repair ");
+            if repair_args.apply {
+                arg.push_str("apply ");
+            }
+            if let Some(qdir) = &repair_args.quarantine_dir {
+                arg.push_str(&format!("qdir {qdir} "));
+            }
         }
         arg.push_str(&format!("throttle {throttle}"));
         let body = admin_roundtrip(target, "fsck", arg.trim())?;
@@ -1629,7 +1678,17 @@ async fn run_fsck_verb(
     opts.shard = shard;
     opts.scrub = scrub;
     opts.scrub_only = scrub_only;
-    let report = squeezefs::fsck::run_offline(&meta_lvs, &opts).await?;
+    let report = if repair_args.repair {
+        // §5.6a: offline repair is a WRITER — the guarded D0 open, never
+        // the read-only probe (run_offline_repair enforces it).
+        let ropts = squeezefs::fsck::RepairOptions {
+            apply: repair_args.apply,
+            quarantine_dir: repair_args.quarantine_dir.clone().map(Into::into),
+        };
+        squeezefs::fsck::run_offline_repair(&meta_lvs, &opts, &ropts).await?
+    } else {
+        squeezefs::fsck::run_offline(&meta_lvs, &opts).await?
+    };
     print_fsck_report(&report, json);
     if report.has_findings() {
         std::process::exit(1);
@@ -1685,12 +1744,45 @@ fn print_fsck_report(report: &squeezefs::fsck::FsckReport, json: bool) {
     if report.findings.is_empty() {
         println!("findings: 0 (clean)");
     } else {
-        println!(
-            "findings: {} — REPORT-ONLY (repair is PR VL6b):",
-            report.findings.len()
-        );
+        println!("findings: {}:", report.findings.len());
         for f in &report.findings {
             println!("  [{}] {} — {}", f.class, f.object, f.evidence);
+        }
+    }
+    if let Some(rep) = &report.repair {
+        println!(
+            "repair ({}): {} planned, {} applied, {} refused; quarantined {} record(s) \
+             + {} block(s) = {} B{}",
+            if rep.dry_run {
+                "DRY RUN — pass --apply to execute"
+            } else {
+                "applied"
+            },
+            rep.counters.planned,
+            rep.counters.applied,
+            rep.counters.refused,
+            rep.counters.quarantined_records,
+            rep.counters.quarantined_blocks,
+            rep.counters.quarantined_bytes,
+            rep.quarantine_dir
+                .as_deref()
+                .map(|d| format!(" (quarantine: {d})"))
+                .unwrap_or_default(),
+        );
+        for a in &rep.planned {
+            println!(
+                "  plan  [{}] {} — {}: {}",
+                a.class, a.object, a.action, a.detail
+            );
+        }
+        for a in &rep.applied {
+            println!(
+                "  done  [{}] {} — {}: {}",
+                a.class, a.object, a.action, a.detail
+            );
+        }
+        for a in &rep.refused {
+            println!("  skip  [{}] {} — {}", a.class, a.object, a.detail);
         }
     }
 }
@@ -3524,9 +3616,25 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             json,
             shards,
             scrub,
+            repair,
+            apply,
+            quarantine_dir,
         } => {
             run_fsck_verb(
-                &target, &reports, online, offline, throttle, json, shards, scrub, false,
+                &target,
+                &reports,
+                online,
+                offline,
+                throttle,
+                json,
+                shards,
+                scrub,
+                false,
+                FsckRepairArgs {
+                    repair,
+                    apply,
+                    quarantine_dir,
+                },
             )
             .await?;
         }
@@ -3535,7 +3643,23 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             throttle,
             json,
         } => {
-            run_fsck_verb(&target, &[], false, false, throttle, json, None, true, true).await?;
+            run_fsck_verb(
+                &target,
+                &[],
+                false,
+                false,
+                throttle,
+                json,
+                None,
+                true,
+                true,
+                FsckRepairArgs {
+                    repair: false,
+                    apply: false,
+                    quarantine_dir: None,
+                },
+            )
+            .await?;
         }
         Commands::Claim { action } => {
             let ClaimActions::Clear { meta_uri } = action;

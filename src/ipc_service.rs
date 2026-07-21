@@ -560,39 +560,58 @@ impl crate::ipc_host::AdminSink for FabricAdminSink {
                     })
                 }
                 // -----------------------------------------------------
-                // PR VL6a (§5.6): online fsck — submits the report-only
-                // detection job on the live daemon's fabric (RAM-
-                // authoritative C1–C6 scan + optional C7 scrub).
-                // arg: "[scrub|scrub-only] [throttle <pct>]"
+                // PR VL6a (§5.6): online fsck — submits the detection
+                // job on the live daemon's fabric (RAM-authoritative
+                // C1–C6 scan + optional C7 scrub). PR VL6b (§5.6a):
+                // `repair` plans (dry-run), `repair apply` executes on
+                // the coordinator under per-object leases.
+                // arg: "[scrub|scrub-only] [repair] [apply]
+                //       [qdir <path>] [throttle <pct>]"
                 // -----------------------------------------------------
                 "fsck" => {
+                    const USAGE: &str = "usage: fsck [scrub|scrub-only] [repair] [apply] \
+                                         [qdir <path>] [throttle <pct>]";
                     let mut scrub = false;
                     let mut scrub_only = false;
+                    let mut repair = false;
+                    let mut apply = false;
+                    let mut quarantine_dir: Option<String> = None;
                     let mut throttle_pct: u32 = 100;
                     let mut parts = arg.split_whitespace();
                     while let Some(tok) = parts.next() {
                         match tok {
                             "scrub" => scrub = true,
                             "scrub-only" => scrub_only = true,
+                            "repair" => repair = true,
+                            "apply" => apply = true,
+                            "qdir" => {
+                                quarantine_dir = Some(
+                                    parts.next().ok_or_else(|| USAGE.to_string())?.to_string(),
+                                );
+                            }
                             "throttle" => {
-                                throttle_pct =
-                                    parts.next().and_then(|p| p.parse().ok()).ok_or_else(|| {
-                                        "usage: fsck [scrub|scrub-only] \
-                                                    [throttle <pct>]"
-                                            .to_string()
-                                    })?;
+                                throttle_pct = parts
+                                    .next()
+                                    .and_then(|p| p.parse().ok())
+                                    .ok_or_else(|| USAGE.to_string())?;
                             }
-                            other => {
-                                return Err(format!(
-                                    "usage: fsck [scrub|scrub-only] [throttle <pct>] \
-                                     (unknown token '{other}')"
-                                ))
-                            }
+                            other => return Err(format!("{USAGE} (unknown token '{other}')")),
                         }
+                    }
+                    if (apply || quarantine_dir.is_some()) && !repair {
+                        return Err("apply/qdir are only valid with repair (§5.6a: \
+                                    dry-run default)"
+                            .to_string());
                     }
                     let job_id = fabric
                         .submit(crate::jobs::JobSpec {
-                            job_type: crate::jobs::JobType::Fsck { scrub, scrub_only },
+                            job_type: crate::jobs::JobType::Fsck {
+                                scrub,
+                                scrub_only,
+                                repair,
+                                apply,
+                                quarantine_dir,
+                            },
                             throttle_pct,
                         })
                         .await
@@ -600,6 +619,8 @@ impl crate::ipc_host::AdminSink for FabricAdminSink {
                     Ok(serde_json::json!({
                         "job_id": job_id,
                         "scrub": scrub || scrub_only,
+                        "repair": repair,
+                        "apply": apply,
                         "throttle_pct": throttle_pct,
                     })
                     .to_string())

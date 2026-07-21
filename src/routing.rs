@@ -426,12 +426,30 @@ fn probe_device_size_bytes(device_path: &str) -> u64 {
     dev_size
 }
 
+/// PR VL6b (design-volume-lifecycle §5.6a): the **quarantined-mapping
+/// marker**. `fsck --repair --apply` replaces a mapping whose block failed
+/// content verification (C7 scrub failure / unverifiable C2 lost) with
+/// `damaged:<original-mapping>` — the read path serves an explicit **EIO**
+/// (never fabricated zeros), the fsck census treats the reference as
+/// quarantined (counted for refcount coherence, skipped by the scrub and
+/// the lost checks), and the physical block stays in place for forensics
+/// until the marker itself is removed (unlink / truncate / a displacing
+/// overwrite frees the BASE key via [`clean_block_key`]'s prefix strip).
+pub const DAMAGED_MAPPING_PREFIX: &str = "damaged:";
+
+/// `true` ⇔ `mapping_str` is a §5.6a quarantined mapping.
+pub fn is_damaged_mapping(mapping_str: &str) -> bool {
+    mapping_str.starts_with(DAMAGED_MAPPING_PREFIX)
+}
+
 /// Strip a stored block-map value (`proto://offset:extra` or `offset:extra`)
 /// down to the free-able key (`proto://offset` / `offset`) that
 /// [`BackendRouter::free_blocks`] expects. The map stores per-block extra
 /// (packed length / crypto framing) after the offset; the allocator only keys
-/// on the offset.
+/// on the offset. A `damaged:` quarantine marker strips to its BASE key so
+/// frees/purges/recovery resolve the physical block it preserves.
 pub(crate) fn clean_block_key(bk: &str) -> String {
+    let bk = bk.strip_prefix(DAMAGED_MAPPING_PREFIX).unwrap_or(bk);
     if let Some(pos) = bk.find("://") {
         let proto = &bk[..pos];
         let rest = &bk[pos + 3..];
@@ -2257,6 +2275,16 @@ impl DataRouter {
     /// The base key may itself contain `://` (non-default backends), so the
     /// decoration is parsed strictly AFTER that prefix.
     fn parse_block_mapping(&self, mapping_str: &str) -> Result<(u64, u64, usize, bool)> {
+        // §5.6a quarantined mapping: fsck repair replaced this block with an
+        // explicit damaged marker — reads are EIO by contract (never
+        // fabricated zeros, never a stale-bytes serve). Every striped read
+        // resolves its mapping through here, so this is the single choke
+        // point.
+        if is_damaged_mapping(mapping_str) {
+            return Err(SqueezefsError::Io(std::io::Error::from_raw_os_error(
+                libc::EIO,
+            )));
+        }
         let default_size = self.block_size.load(Ordering::Acquire) as usize;
         let (prefix, rest) = match mapping_str.find("://") {
             Some(pos) => mapping_str.split_at(pos + 3),
@@ -2822,6 +2850,14 @@ impl DataRouter {
         block_key: &str,
         speculative: bool,
     ) -> Result<(crate::cache::pool::ReadBlockValue, bool)> {
+        // §5.6a quarantined mapping: EIO before any tier probe (the damaged
+        // key itself is never cache-published, but the contract is a loud
+        // refusal at the first resolution point, not a miss-then-fetch).
+        if is_damaged_mapping(block_key) {
+            return Err(SqueezefsError::Io(std::io::Error::from_raw_os_error(
+                libc::EIO,
+            )));
+        }
         // Single-flight block fetch. Waiters must not hang if they miss the
         // completion broadcast (subscribe-after-send race under multi-thread
         // large sequential reads + prefetch). Always re-check caches and use a
@@ -3543,6 +3579,12 @@ impl DataRouter {
         &self,
         block_key: &str,
     ) -> Result<(crate::cache::pool::ReadBlockValue, bool)> {
+        // §5.6a quarantined mapping: same EIO contract as the cached path.
+        if is_damaged_mapping(block_key) {
+            return Err(SqueezefsError::Io(std::io::Error::from_raw_os_error(
+                libc::EIO,
+            )));
+        }
         let tracked = self.backend_router.key_incarnation_tracked(block_key);
         let before = self.backend_router.fill_incarnation(block_key);
         let bytes = self.fetch_block_from_remote(block_key).await?;

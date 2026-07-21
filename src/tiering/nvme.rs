@@ -77,6 +77,83 @@ pub async fn scan_live_segment_keys(
     Ok(out)
 }
 
+/// PR VL6b (design-volume-lifecycle §5.6a, C4 **quarantine-then-discard**):
+/// extract every LIVE segment record for `key` in `seg_dir` — the full
+/// on-disk image (header + key + payload, the writer geometry verbatim) —
+/// and, when `kill` is set, retire each source record by zeroing its
+/// `BLOCK_MAGIC` **after** the image is in hand (the existing recovery
+/// discard law — `NvmeShardInner::remove` retires records the same way —
+/// made non-destructive by the caller's quarantine copy). Returns the
+/// extracted images. Kill-9 between the caller's quarantine write and the
+/// zero here leaves the record live: re-detected, re-quarantined, never
+/// compounding (the §5.6a idempotence law).
+pub async fn extract_and_kill_segment_records(
+    seg_dir: &std::path::Path,
+    key: &str,
+    kill: bool,
+) -> crate::error::Result<Vec<bytes::Bytes>> {
+    let mut images = Vec::new();
+    let entries = match std::fs::read_dir(seg_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(images),
+        Err(e) => {
+            return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                e.kind(),
+                format!("scanning {}: {e}", seg_dir.display()),
+            )))
+        }
+    };
+    let want_key = key.as_bytes();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() || meta.len() == 0 {
+            continue;
+        }
+        let path = entry.path();
+        let capacity = meta.len() as usize;
+        let alignment = if capacity >= 4096 { 4096 } else { 1 };
+        let mut pos = 0usize;
+        while pos + HEADER_SIZE <= capacity {
+            let header = crate::uring_fs::read_at(&path, pos as u64, HEADER_SIZE).await?;
+            if header.len() < HEADER_SIZE {
+                break;
+            }
+            let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
+            if magic != BLOCK_MAGIC {
+                pos += alignment;
+                continue;
+            }
+            let key_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+            let val_len = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+            let sane = key_len > 0 && key_len <= capacity - (pos + HEADER_SIZE);
+            if sane {
+                let rec_key =
+                    crate::uring_fs::read_at(&path, (pos + HEADER_SIZE) as u64, key_len).await?;
+                if rec_key.as_ref() == want_key {
+                    // The writer geometry: value starts at the alignment
+                    // boundary after header+key (see `reserve_and_write`).
+                    let val_start =
+                        (pos + HEADER_SIZE + key_len + alignment - 1) & !(alignment - 1);
+                    let rec_end = (val_start + val_len).min(capacity);
+                    let image = crate::uring_fs::read_at(&path, pos as u64, rec_end - pos).await?;
+                    images.push(image);
+                    if kill {
+                        crate::uring_fs::write_at(
+                            &path,
+                            pos as u64,
+                            bytes::Bytes::from_static(&[0u8; 4]),
+                        )
+                        .await?;
+                        crate::uring_fs::fdatasync(&path).await?;
+                    }
+                }
+            }
+            pos += alignment;
+        }
+    }
+    Ok(images)
+}
+
 /// Test seam for [`scan_live_segment_keys`]: one live record's minimal
 /// shard image (header + key + 1-byte value at the writer geometry).
 pub fn encode_segment_record_for_test(key: &[u8], value: &[u8]) -> Vec<u8> {

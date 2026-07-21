@@ -142,6 +142,20 @@ pub async fn scan_live_staged_custody(
     crate::tiering::nvme::scan_live_segment_keys(&dir.join("staging_segment"), max_units).await
 }
 
+/// PR VL6b (design-volume-lifecycle §5.6a, C4): extract the on-disk
+/// image(s) of `key`'s live staged-custody record(s) in `dir` and, when
+/// `kill` is set, retire them (magic zeroed AFTER extraction — the
+/// recovery discard law made non-destructive by the caller's quarantine
+/// copy). See [`crate::tiering::nvme::extract_and_kill_segment_records`].
+pub async fn extract_and_kill_staged_custody(
+    dir: &std::path::Path,
+    key: &str,
+    kill: bool,
+) -> Result<Vec<bytes::Bytes>> {
+    crate::tiering::nvme::extract_and_kill_segment_records(&dir.join("staging_segment"), key, kill)
+        .await
+}
+
 /// Test seam (PR VL5b, KD-8 contracts): seed one live staged-custody
 /// record (a minimal shard image with a single live header) so the
 /// barrier's refusal path is exercisable without a mount.

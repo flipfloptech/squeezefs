@@ -112,13 +112,23 @@ pub enum JobType {
         /// Target volume index in the CANONICAL member order.
         target_volume: usize,
     },
-    /// PR VL6a (§5.6): the online report-only fsck. `scrub` adds the C7
-    /// data scrub (KD-17); `scrub_only` is the `squeezefs scrub`
-    /// spelling. The verified report persists as `job:{id}:report`
-    /// (probe-readable offline). Report-only — never mutates.
+    /// PR VL6a (§5.6): the online fsck. `scrub` adds the C7 data scrub
+    /// (KD-17); `scrub_only` is the `squeezefs scrub` spelling. The
+    /// verified report persists as `job:{id}:report` (probe-readable
+    /// offline). Detection never mutates; PR VL6b adds `repair`
+    /// (§5.6a): dry-run planning by default, `apply` executes the
+    /// per-class actions on the coordinator under per-object leases
+    /// (quarantine home override via `quarantine_dir`). Serde defaults
+    /// keep pre-VL6b durable job records decodable.
     Fsck {
         scrub: bool,
         scrub_only: bool,
+        #[serde(default)]
+        repair: bool,
+        #[serde(default)]
+        apply: bool,
+        #[serde(default)]
+        quarantine_dir: Option<String>,
     },
 }
 
@@ -1226,8 +1236,19 @@ impl JobFabric {
                 self.run_meta_slot_migration(job_id, ctl, slot, target_volume)
                     .await
             }
-            JobType::Fsck { scrub, scrub_only } => {
-                self.run_fsck_job(job_id, ctl, scrub, scrub_only).await
+            JobType::Fsck {
+                scrub,
+                scrub_only,
+                repair,
+                apply,
+                quarantine_dir,
+            } => {
+                let ropts = repair.then(|| crate::fsck::RepairOptions {
+                    apply,
+                    quarantine_dir: quarantine_dir.map(std::path::PathBuf::from),
+                });
+                self.run_fsck_job(job_id, ctl, scrub, scrub_only, ropts)
+                    .await
             }
         }
     }
@@ -1237,7 +1258,14 @@ impl JobFabric {
     /// as `job:{id}:report` beside the job record; findings > 0 leave
     /// the job **Completed** (detection succeeded; the findings are its
     /// output — the CLI owns exit-code semantics) but log loudly.
-    async fn run_fsck_job(&self, job_id: &str, ctl: &Arc<JobCtl>, scrub: bool, scrub_only: bool) {
+    async fn run_fsck_job(
+        &self,
+        job_id: &str,
+        ctl: &Arc<JobCtl>,
+        scrub: bool,
+        scrub_only: bool,
+        repair_opts: Option<crate::fsck::RepairOptions>,
+    ) {
         let Some(ctx) = self.mover.as_ref() else {
             log::error!("job {job_id}: fsck needs a mover context (not wired on this fabric)");
             if let Ok(Some(mut rec)) = Self::read_record(&self.meta, job_id).await {
@@ -1277,6 +1305,31 @@ impl JobFabric {
             })
         };
         let outcome = crate::fsck::run(&fsck_ctx, &opts).await;
+        // PR VL6b (§5.6a): repair consumes the run's VERIFIED findings on
+        // the coordinator — dry-run plans only; apply executes each action
+        // under the object's lease. A repair error fails the job loudly
+        // (detection results are preserved in the log above).
+        let outcome = match outcome {
+            Ok(mut report) => match &repair_opts {
+                Some(ropts) => match crate::fsck::repair(&fsck_ctx, &report, ropts).await {
+                    Ok(rep) => {
+                        log::info!(
+                            "job {job_id}: fsck repair ({}) — {} planned, {} applied, \
+                             {} refused",
+                            if ropts.apply { "apply" } else { "dry-run" },
+                            rep.counters.planned,
+                            rep.counters.applied,
+                            rep.counters.refused
+                        );
+                        report.repair = Some(rep);
+                        Ok(report)
+                    }
+                    Err(e) => Err(e),
+                },
+                None => Ok(report),
+            },
+            Err(e) => Err(e),
+        };
         watcher.abort();
         let _ = watcher.await;
         if ctl.cancelled.load(Ordering::SeqCst) {

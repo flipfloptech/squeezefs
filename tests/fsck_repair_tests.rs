@@ -69,6 +69,22 @@ const BLOCK: usize = 4096;
 static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    // ~30 mount-shaped fixtures live in this binary (3 rounds per class);
+    // each retains worker fds (uring rings, device fds) for the process
+    // lifetime, which overflows the common 1–2 k soft NOFILE default.
+    // Raise the soft limit toward the hard limit once, capped generously.
+    static RLIMIT_RAISED: OnceLock<()> = OnceLock::new();
+    RLIMIT_RAISED.get_or_init(|| {
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: plain getrlimit/setrlimit on stack structs.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
+            rl.rlim_cur = rl.rlim_max.min(65_536);
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) };
+        }
+    });
     SERIAL
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
@@ -704,24 +720,22 @@ async fn test_c2_lost_verified_content_repairs_allocator_x3() {
         // free with no device punch), still referenced by the map.
         let alloc = r.fx.default_allocator(&r.recs[0].id);
         let off = alloc.allocate_block().await.expect("allocate");
-        let (_, dev) = r
-            .fx
-            .fs
-            .router
-            .backend_router
-            .get_backend(&r.recs[0].id)
-            .expect("backend");
+        let (_, dev) =
+            r.fx.fs
+                .router
+                .backend_router
+                .get_backend(&r.recs[0].id)
+                .expect("backend");
         dev.write_block(off, bytes::Bytes::from(vec![0x5Au8; BLOCK]))
             .await
             .expect("device write");
         alloc.publish_block(off);
         alloc.free_block(off).await.expect("allocator-level free");
-        let key = r
-            .fx
-            .fs
-            .router
-            .backend_router
-            .persist_block_key(&r.recs[0].id, off);
+        let key =
+            r.fx.fs
+                .router
+                .backend_router
+                .persist_block_key(&r.recs[0].id, off);
         let token = r.fx.fs.dlm().get_fencing_token_ino(ino);
         let entries = [(400u32, key.clone())];
         r.fx.fs
@@ -781,12 +795,11 @@ async fn test_c2_lost_out_of_range_quarantines_mapping_x3() {
 
         // VL6a's phantom seed: an offset far past the device capacity.
         let phantom_off = 1024u64 * BLOCK as u64 * 1024;
-        let phantom_key = r
-            .fx
-            .fs
-            .router
-            .backend_router
-            .persist_block_key(&r.recs[0].id, phantom_off);
+        let phantom_key =
+            r.fx.fs
+                .router
+                .backend_router
+                .persist_block_key(&r.recs[0].id, phantom_off);
         let token = r.fx.fs.dlm().get_fencing_token_ino(ino);
         let entries = [(400u32, phantom_key.clone())];
         r.fx.fs
@@ -875,13 +888,12 @@ async fn test_c3_recount_and_set_x3() {
             .router
             .backend_router
             .increment_refcount(victim_mapping));
-        let (_, victim_off) = r
-            .fx
-            .fs
-            .router
-            .backend_router
-            .parse_block_key(victim_mapping)
-            .expect("parse");
+        let (_, victim_off) =
+            r.fx.fs
+                .router
+                .backend_router
+                .parse_block_key(victim_mapping)
+                .expect("parse");
         let alloc = r.fx.default_allocator(&r.recs[0].id);
         assert_eq!(alloc.refcount(victim_off), Some(3), "seed landed");
 
@@ -898,7 +910,11 @@ async fn test_c3_recount_and_set_x3() {
             "round {round}: plan {:?}",
             plan.planned
         );
-        assert_eq!(alloc.refcount(victim_off), Some(3), "dry run mutates nothing");
+        assert_eq!(
+            alloc.refcount(victim_off),
+            Some(3),
+            "dry run mutates nothing"
+        );
 
         let rep = run_repair(&r.fx.ctx(), &report, &apply())
             .await
@@ -1126,13 +1142,12 @@ async fn test_c7_scrub_failure_quarantines_mapping_x3() {
             .next()
             .unwrap_or(&victim_mapping)
             .to_string();
-        let (_, victim_off) = r
-            .fx
-            .fs
-            .router
-            .backend_router
-            .parse_block_key(&clean_key)
-            .expect("parse");
+        let (_, victim_off) =
+            r.fx.fs
+                .router
+                .backend_router
+                .parse_block_key(&clean_key)
+                .expect("parse");
         {
             use std::io::{Read, Seek, SeekFrom, Write};
             let mut f = std::fs::OpenOptions::new()
@@ -1183,18 +1198,17 @@ async fn test_c7_scrub_failure_quarantines_mapping_x3() {
         );
 
         // The damaged block reads EIO; re-scrub is clean.
-        let eio = r
-            .fx
-            .fs
-            .read(
-                req(),
-                ino,
-                0,
-                (victim_idx as usize * BLOCK) as u64,
-                BLOCK as u32,
-                0,
-            )
-            .await;
+        let eio =
+            r.fx.fs
+                .read(
+                    req(),
+                    ino,
+                    0,
+                    (victim_idx as usize * BLOCK) as u64,
+                    BLOCK as u32,
+                    0,
+                )
+                .await;
         assert!(
             eio.is_err(),
             "round {round}: quarantined mapping must read EIO, got Ok"

@@ -1435,6 +1435,7 @@ fn test_report_json_roundtrip_and_merge_dedupe() {
         class: "C4".to_string(),
         object: "active_block_ext:inode_7:block_0".to_string(),
         evidence: "no live inode".to_string(),
+        identity: None,
     };
     let r1 = FsckReport {
         schema: 1,
@@ -1447,6 +1448,7 @@ fn test_report_json_roundtrip_and_merge_dedupe() {
             ..Default::default()
         },
         partial: None,
+        repair: None,
     };
     let r2 = FsckReport {
         schema: 1,
@@ -1459,6 +1461,7 @@ fn test_report_json_roundtrip_and_merge_dedupe() {
             ..Default::default()
         },
         partial: None,
+        repair: None,
     };
     let json = serde_json::to_string(&r1).unwrap();
     let back: FsckReport = serde_json::from_str(&json).unwrap();

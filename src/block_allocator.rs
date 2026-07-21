@@ -202,6 +202,58 @@ impl BlockAllocator {
         self.free_blocks.len() as u64
     }
 
+    /// PR VL6b (design-volume-lifecycle §5.6a, C3 **recount-and-set** /
+    /// the C2-lost allocator-repair tail): set `offset`'s refcount to the
+    /// verified counted-reference value. Repair-only seam — callers hold
+    /// every referencing ino's DLM lease (ascending order) across the
+    /// recount and this store; `count == 0` is refused (an unreferenced
+    /// tracked offset is C2-leaked's business, freed through the full
+    /// begin→purge→punch→finish law, never zeroed in place).
+    pub fn fsck_set_refcount(&self, offset: u64, count: u32) -> bool {
+        if count == 0 {
+            return false;
+        }
+        match self.refcounts.entry_sync(offset) {
+            scc::hash_map::Entry::Occupied(occ) => {
+                occ.get().store(count, Ordering::SeqCst);
+                true
+            }
+            scc::hash_map::Entry::Vacant(vac) => {
+                let _ = vac.insert_entry(AtomicU32::new(count));
+                true
+            }
+        }
+    }
+
+    /// PR VL6b (§5.6a, C6 **recompute-and-republish**): reconcile the
+    /// derived used/free accounting with the tracked refcount population
+    /// (both are mount-session RAM, rebuilt at mount — pure derived
+    /// state). Two drift shapes are healed: a begin_free-limbo offset
+    /// (untracked, not free-listed, no live in-flight owner — the wedged
+    /// freer whose `finish_free` never came, provably dead after the
+    /// finding survived two scan epochs + repair-time re-verification)
+    /// gets its free completed; a tracked offset sitting on the free list
+    /// (double-owned accounting) is pulled off it. Returns
+    /// `(frees_completed, free_list_evictions)`.
+    pub fn fsck_reconcile_accounting(&self) -> (u64, u64) {
+        let highest = self.highest_block.load(Ordering::Relaxed);
+        let mut frees_completed = 0u64;
+        let mut free_list_evictions = 0u64;
+        for idx in 0..highest {
+            let offset = idx * self.chunk_size;
+            let tracked = self.refcounts.read_sync(&offset, |_, _| ()).is_some();
+            let free_listed = self.free_blocks.contains(&idx);
+            if !tracked && !free_listed && !self.inflight_contains(offset) {
+                self.free_blocks.insert(idx);
+                frees_completed += 1;
+            } else if tracked && free_listed {
+                self.free_blocks.remove(&idx);
+                free_list_evictions += 1;
+            }
+        }
+        (frees_completed, free_list_evictions)
+    }
+
     /// The fresh-block cursor (fsck C6 accounting: `used = highest −
     /// free`, the same arithmetic [`Self::get_used_blocks`] runs).
     pub fn highest_block_index(&self) -> u64 {

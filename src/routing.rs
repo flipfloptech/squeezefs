@@ -4509,11 +4509,23 @@ impl DataRouter {
             epoch_word.fetch_add(1, Ordering::Release);
         }
 
-        let mut current = match self.fetch_metadata_from_backend(ino).await? {
-            Some(m) => m,
-            // Never-persisted layout: the freshest RAM entry (post-write
-            // truth for dirty layouts) beats an empty default.
-            None => self.metadata_cache.get(&ino).unwrap_or_default(),
+        // RMW base — the dirty-authority rule (FIND-RW5-A face 5): a DIRTY
+        // RAM entry is the LOCAL AUTHORITY (staged-family commits defer
+        // their backend persist), so basing this RMW on the backend
+        // resurrected the PRE-DIRTY map: keys an earlier commit had already
+        // displaced-and-freed reappeared as "displaced" here and were freed
+        // AGAIN (the double-free double-owner mint — run17 forensics), and
+        // the dirty lineage's own keys were silently clobbered from the
+        // saved layout (the zeros-LOSS face). Clean/absent entries keep the
+        // backend base (freshest authoritative).
+        let mut current = match self.metadata_cache.get(&ino) {
+            Some(m) if m.layout_dirty => m,
+            cached => match self.fetch_metadata_from_backend(ino).await? {
+                Some(m) => m,
+                // Never-persisted layout: the freshest RAM entry (post-write
+                // truth) beats an empty default.
+                None => cached.unwrap_or_default(),
+            },
         };
 
         // CoW publish (item A): take the Arc, mutate a uniquely-owned copy

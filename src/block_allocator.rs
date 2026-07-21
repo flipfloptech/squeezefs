@@ -590,6 +590,24 @@ impl BlockAllocator {
     /// this can `allocate_block` hand the offset to a new owner.
     pub fn finish_free(&self, offset: u64) {
         let block_idx = offset / self.chunk_size;
+        // FIND-RW5-A forensics (env-gated, diagnostic-only): record every
+        // free's capture so a DOUBLE FREE names BOTH call sites.
+        if std::env::var("SQUEEZEFS_FREE_FORENSICS").is_ok() {
+            static TAPE: std::sync::OnceLock<
+                std::sync::Mutex<std::collections::HashMap<u64, String>>,
+            > = std::sync::OnceLock::new();
+            let tape = TAPE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+            let bt = std::backtrace::Backtrace::force_capture().to_string();
+            let mut tape = tape.lock().unwrap();
+            if let Some(first) = tape.get(&offset) {
+                if self.free_blocks.contains(&block_idx) {
+                    log::error!(
+                        "DOUBLE FREE FORENSICS offset {offset}:\n--- free #1 ---\n{first}\n--- free #2 ---\n{bt}"
+                    );
+                }
+            }
+            tape.insert(offset, bt);
+        }
         if !self.free_blocks.insert(block_idx) {
             // FIND-RW5-A forensics tripwire: a second release of an offset
             // already on the free list is the double-free family the

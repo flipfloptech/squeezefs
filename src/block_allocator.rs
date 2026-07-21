@@ -555,13 +555,28 @@ impl BlockAllocator {
         Ok(self.claim_block_idx(idx))
     }
 
-    /// Release one reference. On the TERMINAL release (count hit zero, or
-    /// the offset was untracked) the offset's incarnation is retired and
-    /// `true` is returned — but the offset is **not yet reallocatable**:
-    /// the freer owns it until [`Self::finish_free`], which is what makes
-    /// destructive post-free device work (the router's hole punch) safe to
-    /// run in between — it strictly happens-before any new owner's DMA.
-    /// Non-terminal releases return `false` and release nothing else.
+    /// Release one reference. On the TERMINAL release (count hit zero) the
+    /// offset's incarnation is retired and `true` is returned — but the
+    /// offset is **not yet reallocatable**: the freer owns it until
+    /// [`Self::finish_free`], which is what makes destructive post-free
+    /// device work (the router's hole punch) safe to run in between — it
+    /// strictly happens-before any new owner's DMA. Non-terminal releases
+    /// return `false` and release nothing else.
+    ///
+    /// FIND-RW5-A face 6: a free of an UNTRACKED offset is **refused**
+    /// (`false`), loudly and counted. At steady state every legitimately
+    /// freeable offset carries a refcount entry — allocation seeds it
+    /// ([`Self::claim_block_idx`], [`Self::allocate_specific_block`]) and
+    /// the mount recovery walk seeds every live reference
+    /// ([`Self::recover_block`]) — so an untracked free is the second half
+    /// of a double-release: the lineage that, interleaved with two
+    /// allocations, mints ONE device offset to TWO live owners (the
+    /// generic/464 rebind-exhaustion EIO engine). Refusal is the leak-safe
+    /// direction: the offset never re-enters the free list on a stale
+    /// release (fsck C6 reconciles a genuine limbo). The historical
+    /// untracked-frees-anyway arm predates recovery seeding and had no
+    /// remaining legitimate caller (fsck's C2Leaked apply refuses untracked
+    /// offsets itself before freeing).
     pub fn begin_free(&self, offset: u64) -> bool {
         let should_free = if let Some(terminal) = self
             .refcounts
@@ -574,7 +589,14 @@ impl BlockAllocator {
                 false
             }
         } else {
-            true
+            log::error!(
+                "begin_free REFUSED untracked offset {offset}: no refcount entry — \
+                 double-release lineage (see block_untracked_free_refusals)"
+            );
+            crate::fuse_client::METRICS
+                .block_untracked_free_refusals
+                .fetch_add(1, Ordering::Relaxed);
+            false
         };
 
         if should_free {

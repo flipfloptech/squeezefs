@@ -282,3 +282,40 @@ fn test_daemon_child_exit_reason_is_surfaced() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// fstests generic/128 repro-port (VL10 release gate; kernel-interface
+/// half documented in the fix commit): `-o nosuid`/`nodev`/`noexec` were
+/// silently DROPPED — `filter_kernel_mount_options` passed neither the
+/// option strings nor the MS_* flags, so a `mount -o nosuid` produced a
+/// suid-honoring mount and generic/128's fsgqa `ls` of a 0700 root dir
+/// succeeded through the setuid binary. The daemon-side contract pinned
+/// here: the option tokens parse into the mount security flags exactly.
+#[test]
+fn mount_security_flags_parse_the_posix_mount_tokens() {
+    use squeezefs::fuse_client::mount_security_flags;
+
+    assert_eq!(mount_security_flags(""), (false, false, false));
+    assert_eq!(
+        mount_security_flags("fsname=/dev/x,rw"),
+        (false, false, false)
+    );
+    assert_eq!(
+        mount_security_flags("nosuid"),
+        (true, false, false),
+        "generic/128's exact shape"
+    );
+    assert_eq!(
+        mount_security_flags("rw, nosuid ,nodev"),
+        (true, true, false),
+        "whitespace + companions"
+    );
+    assert_eq!(
+        mount_security_flags("noexec,nosuid,nodev,max_read=1048576"),
+        (true, true, true)
+    );
+    // Never confused with value-carrying or prefixed keys.
+    assert_eq!(
+        mount_security_flags("nosuidX,nodev=1"),
+        (false, false, false)
+    );
+}

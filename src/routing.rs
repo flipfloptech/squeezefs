@@ -1479,6 +1479,7 @@ impl BackendRouter {
             return Ok(());
         };
 
+        log::debug!("router free_block: key={block_key} offset={offset}");
         if allocator.begin_free(offset) {
             // Terminal release: `begin_free` has retired the incarnation, so
             // sweep the read tiers HERE — after the retire, before the
@@ -4528,6 +4529,22 @@ impl DataRouter {
             },
         };
 
+        let forensics_base = if current.layout_dirty {
+            "dirty-ram"
+        } else {
+            "backend/cached"
+        };
+        let forensics_op: Option<String> = if std::env::var("SQUEEZEFS_FREE_FORENSICS").is_ok() {
+            Some(match &op {
+                BlockMapOp::Merge(e) => format!("Merge({e:?})"),
+                BlockMapOp::MergeExpected(e) => format!("MergeExpected({e:?})"),
+                BlockMapOp::TruncateFrom { new_size } => format!("TruncateFrom({new_size})"),
+                BlockMapOp::RemoveBlocks(idxs) => format!("RemoveBlocks({idxs:?})"),
+            })
+        } else {
+            None
+        };
+
         // CoW publish (item A): take the Arc, mutate a uniquely-owned copy
         // via `make_mut` — held reader snapshots keep the exact map they
         // were taken with (test_block_map_snapshot_independent_of_*).
@@ -4614,6 +4631,20 @@ impl DataRouter {
                     }
                 }
             }
+        }
+        // FIND-RW5-A merge forensics (env-gated, diagnostic-only): one line
+        // per merge naming the base authority, the op, what displaced, and
+        // the post-merge bindings — enough to reconstruct whether a later
+        // read's stale binding came from a lost map update or a wrongful
+        // free of a still-current key.
+        if let Some(op_name) = forensics_op {
+            let mut map_now: Vec<(u32, String)> =
+                block_map.iter().map(|(b, k)| (*b, k.clone())).collect();
+            map_now.sort_unstable_by_key(|(b, _)| *b);
+            log::warn!(
+                "MERGE FORENSICS ino={ino} base={forensics_base} op={op_name} \
+                 token={fencing_token} displaced={displaced:?} map_now={map_now:?}"
+            );
         }
         current.block_map = Some(block_map_arc);
 

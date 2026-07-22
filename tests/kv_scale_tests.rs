@@ -601,14 +601,35 @@ async fn fuse_readdir_v3_emits_key_cookies_and_streams() {
         assert!(*off > 0, "sign bit / negativity check");
     }
 
-    // Root virtuals ride ABOVE the real cookie space, in order, last.
-    let n = walked.len();
-    assert_eq!(walked[n - 2].0, ".config");
-    assert_eq!(walked[n - 2].1, CONFIG_INODE);
-    assert_eq!(walked[n - 2].2 as u64, READDIR_VIRTUAL_CONFIG_COOKIE);
-    assert_eq!(walked[n - 1].0, ".stats");
-    assert_eq!(walked[n - 1].1, STATS_INODE);
-    assert_eq!(walked[n - 1].2 as u64, READDIR_VIRTUAL_STATS_COOKIE);
+    // Root virtuals are LOOKUP-ONLY (the .zfs/.lustre hidden-control-file
+    // pattern — fstests generic/062, VL10 release gate): they never
+    // appear in listings (recursive walks, tar/rsync/getfattr -R must not
+    // see fabricated files), but path access keeps working.
+    assert!(
+        !walked
+            .iter()
+            .any(|(n, _, _)| n == ".config" || n == ".stats"),
+        "virtual control files must not be LISTED"
+    );
+    let stats_ino = h
+        .fs
+        .lookup(req(), 1, std::ffi::OsStr::new(".stats"))
+        .await
+        .expect(".stats stays lookup-able")
+        .attr
+        .ino;
+    assert_eq!(stats_ino, STATS_INODE);
+    let config_ino = h
+        .fs
+        .lookup(req(), 1, std::ffi::OsStr::new(".config"))
+        .await
+        .expect(".config stays lookup-able")
+        .attr
+        .ino;
+    assert_eq!(config_ino, CONFIG_INODE);
+    // The historical virtual cookies stay reserved above the real space
+    // (a kernel resuming from a stale pre-hide cookie must terminate,
+    // not re-list) — sign-bit-clear for the i64 FUSE surface.
     assert!(
         READDIR_VIRTUAL_CONFIG_COOKIE
             > READDIR_COOKIE_BIAS + dentry_key_suffix(HASH54_MAX, u8::MAX)

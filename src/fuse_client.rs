@@ -2652,8 +2652,31 @@ fn map_squeezefs_err(e: SqueezefsError) -> Errno {
 }
 
 #[inline]
+/// Inode times are **i64 nanoseconds carried in the u64 storage word**
+/// (two's complement): every positive (post-1970) value reads
+/// identically to the historical unsigned interpretation, and pre-epoch
+/// timestamps survive instead of wrapping (fstests generic/258, VL10
+/// release gate; pinned in
+/// `tests/attr_refresh_tests.rs::negative_timestamps_round_trip`).
+/// `div_euclid`/`rem_euclid` keep the nsec field non-negative for
+/// negative totals (`-0.5 s` = sec −1, nsec 500e6 — the kernel
+/// `timespec64` convention).
 fn as_timestamp(ns: u64) -> Timestamp {
-    Timestamp::new((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as u32)
+    let ns = ns as i64;
+    Timestamp::new(
+        ns.div_euclid(1_000_000_000),
+        ns.rem_euclid(1_000_000_000) as u32,
+    )
+}
+
+/// The inverse of [`as_timestamp`]: a FUSE `Timestamp` (possibly
+/// pre-epoch) into the i64-in-u64 nanosecond storage word, saturating at
+/// the i64 range (± year 2262/1677 — beyond it the kernel's own
+/// `timespec64` ns math saturates the same way).
+fn timestamp_to_ns_word(t: Timestamp) -> u64 {
+    t.sec
+        .saturating_mul(1_000_000_000)
+        .saturating_add(t.nsec as i64) as u64
 }
 
 /// D1.d (design-metadata-throughput §5.1, PR M5): per-inode open-handle
@@ -9577,13 +9600,13 @@ impl Filesystem for SqueezefsFilesystem {
                 gid_to_set = Some(gid);
             }
             if let Some(atime) = set_attr.atime {
-                atime_to_set = Some(atime.sec as u64 * 1_000_000_000 + atime.nsec as u64);
+                atime_to_set = Some(timestamp_to_ns_word(atime));
             }
             if let Some(mtime) = set_attr.mtime {
-                mtime_to_set = Some(mtime.sec as u64 * 1_000_000_000 + mtime.nsec as u64);
+                mtime_to_set = Some(timestamp_to_ns_word(mtime));
             }
             if let Some(ctime) = set_attr.ctime {
-                ctime_to_set = Some(ctime.sec as u64 * 1_000_000_000 + ctime.nsec as u64);
+                ctime_to_set = Some(timestamp_to_ns_word(ctime));
             }
             let _guard = if size_to_set.is_some() {
                 Some(self.active_inode_locks.get_inode_lock(ino).write().await)

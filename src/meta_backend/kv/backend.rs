@@ -1826,10 +1826,14 @@ impl KvMetaBackend {
             return;
         }
         if let Some((pm, pc)) = self.pending_times.read_sync(&ino, |_, p| *p) {
-            if pm > v.mtime {
+            // Times are i64 ns carried in the u64 word (pre-epoch values
+            // are representable — fstests generic/258); the newest-wins
+            // fold must compare SIGNED or a backdated pre-epoch stamp
+            // would out-rank every echo forever.
+            if (pm as i64) > (v.mtime as i64) {
                 v.mtime = pm;
             }
-            if pc > v.ctime {
+            if (pc as i64) > (v.ctime as i64) {
                 v.ctime = pc;
             }
         }

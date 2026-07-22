@@ -342,10 +342,7 @@ async fn negative_timestamps_round_trip() {
         "pre-epoch mtime must round-trip, not wrap (generic/258)"
     );
     assert_eq!(got.atime, want, "pre-epoch atime must round-trip");
-    assert!(
-        got.mtime.sec < 0,
-        "the sign must survive the storage word"
-    );
+    assert!(got.mtime.sec < 0, "the sign must survive the storage word");
 
     // Sub-second negative shape too (sec = -1, nsec 500e6 = -0.5 s).
     let frac = Timestamp::new(-1, 500_000_000);

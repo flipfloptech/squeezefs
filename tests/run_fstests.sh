@@ -94,8 +94,15 @@ if [ ! -f "src/open_by_handle" ]; then
     if ! getent group fsgqa >/dev/null; then
         groupadd fsgqa
     fi
+    # Repair a pre-existing home-less fsgqa (the pre-VL10 useradd shape).
+    if getent passwd fsgqa >/dev/null && [ ! -d "$(getent passwd fsgqa | cut -d: -f6)" ]; then
+        mkhomedir_helper fsgqa 2>/dev/null || mkdir -p "$(getent passwd fsgqa | cut -d: -f6)" && chown fsgqa:fsgqa "$(getent passwd fsgqa | cut -d: -f6)"
+    fi
     if ! getent passwd fsgqa >/dev/null; then
-        useradd -g fsgqa fsgqa
+        # -m: several tests `su - fsgqa`; a missing home dir leaks a
+        # "cannot change directory" warning into golden output
+        # (generic/128's residual diff, VL10 release gate).
+        useradd -m -g fsgqa fsgqa
     fi
     make
 fi
@@ -518,11 +525,28 @@ EOF
 #           self-limiting (3.06M ops, negative last-10-min drift), and
 #           618 standalone passes 3/3. An OOM on an EARLY test or under a
 #           bigger cap IS a regression.
+# VL10 release-gate additions (2026-07-22). Kernel-interface-only rows
+# (the repro-port mandate's documented exception class — their semantics
+# live in the kernel's own lock code once FUSE_POSIX_LOCKS/FLOCK_LOCKS
+# stopped being advertised, unreachable from cargo tests):
+#   131 = POSIX byte-range lock semantics (kernel-local; locktest)
+#   478 = OFD locks (kernel-local)
+#   504 = flock + /proc/locks visibility (kernel-local)
+# Cargo-pinned rows added for their fstests faces: 020 (xattr value cap),
+# 035 (rename dir-overwrite nlink), 062 (virtuals unlisted), 128
+# (-o nosuid honored), 258 (pre-epoch timestamps), 426/467/477
+# (EXPORT_SUPPORT '.'/'..' revival), 525 (EFBIG size cap), 533
+# (removexattr ENODATA), 294/306/452 (the O(size) delete linger family —
+# rides the sparse_write_bounded cargo pin).
 SQUEEZEFS_FSTESTS_QUICK=(
     generic/001 generic/003 generic/008 generic/009 generic/013
-    generic/069 generic/074 generic/075 generic/091 generic/112
-    generic/127 generic/213 generic/263 generic/285 generic/316
-    generic/464 generic/469 generic/616 generic/617 generic/618
+    generic/020 generic/035 generic/062 generic/069 generic/074
+    generic/075 generic/091 generic/112 generic/127 generic/128
+    generic/131 generic/213 generic/258 generic/263 generic/285
+    generic/294 generic/306 generic/316 generic/426 generic/452
+    generic/464 generic/467 generic/469 generic/477 generic/478
+    generic/504 generic/525 generic/533 generic/616 generic/617
+    generic/618
 )
 
 if [ $# -gt 0 ]; then

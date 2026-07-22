@@ -69,7 +69,10 @@ pub const FATTR_FLAGS: u32 = 1 << 31;
 /// asynchronous read requests
 pub const FUSE_ASYNC_READ: u32 = 1 << 0;
 
-#[cfg(feature = "file-lock")]
+// Referenced only by the INIT-negotiation pins (the capability is
+// deliberately never echoed — kernel-local POSIX locks) and the
+// feature-gated lock plumbing.
+#[cfg(any(test, feature = "file-lock"))]
 /// locking for POSIX file locks
 pub const FUSE_POSIX_LOCKS: u32 = 1 << 1;
 
@@ -124,7 +127,9 @@ pub const FUSE_PARALLEL_DIROPS: u32 = 1 << 18;
 /// fs handles killing suid/sgid/cap on write/chown/trunc
 pub const FUSE_HANDLE_KILLPRIV: u32 = 1 << 19;
 
-// if enable this, means use default_permissions
+// Referenced only by the INIT-negotiation pins (the capability is
+// deliberately never echoed — the no-ACL posture).
+#[cfg(test)]
 /// filesystem supports posix acls
 pub const FUSE_POSIX_ACL: u32 = 1 << 20;
 

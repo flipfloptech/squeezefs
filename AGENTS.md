@@ -92,11 +92,12 @@ Writes that grow past thresholds promote layouts **durably** (block I/O before m
 
 ### Distributed Lock Manager (DLM) & Consistency
 
-POSIX FUSE locks map to cluster leases on Metadata Volumes:
+Write custody maps to cluster leases on Metadata Volumes:
 * **Acquisition:** Lease locking + fencing token `INCR` (no external distributed database required).
-* **Granularity:** File-level or byte-range; never directory-wide for data.
+* **Granularity:** File-level write leases; never directory-wide for data.
 * **Leases & Heartbeats:** TTL + background renewal; local caches must re-validate after lock key loss.
 * **Fencing Tokens:** Monotonic per-file tokens; writers present tokens; stale tokens → `FencingTokenExpired` / reject.
+* **POSIX advisory locks (fcntl byte-range, OFD, flock) are KERNEL-LOCAL** (2026-07-22, VL10 release gate — fstests generic/131/478/504): the INIT reply never advertises `FUSE_POSIX_LOCKS`/`FUSE_FLOCK_LOCKS` (pinned in the fuse3 fork's negotiation tests), so the kernel's canonical `posix_lock_file` arbitrates per mount — full POSIX semantics (unlock-on-close, splits, OFD owners, `/proc/locks`) for free. Intra-mount arbitration is the whole requirement under the D0 single-writer mount guard; the former daemon lock table and the DLM per-inode delegation surface it rode were deleted (never construct a daemon lock path "for the cluster" — cross-mount write exclusion is D0's job).
 
 ### Tiered Caching & Paths
 

@@ -191,10 +191,6 @@ impl DlmClient {
         Ok(MockPubSub {})
     }
 
-    pub async fn publish_recall(&self, _client_id: &str, _ino: u64) -> Result<()> {
-        Ok(())
-    }
-
     /// Acquire an exclusive lease on `file_path` (optionally a byte range),
     /// waiting up to `ttl` for the current holder to release.
     ///
@@ -258,14 +254,6 @@ impl DlmClient {
             }
         }
     }
-
-    pub async fn acquire_delegation(&self, inode: u64, _ttl: Duration) -> Result<DelegationResult> {
-        Ok(DelegationResult::Acquired(DelegationLease {
-            inode,
-            client_id: self.client_id.clone(),
-            delegation_key: format!("delegation:{}", inode),
-        }))
-    }
 }
 
 struct LockLeaseInner {
@@ -324,29 +312,6 @@ impl LockLease {
         self.inner.unlock();
         Ok(())
     }
-}
-
-#[derive(Debug)]
-pub struct DelegationLease {
-    pub inode: u64,
-    pub client_id: String,
-    pub delegation_key: String,
-}
-
-impl DelegationLease {
-    pub async fn is_held(&self) -> bool {
-        true
-    }
-
-    pub async fn release(self) -> Result<()> {
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-pub enum DelegationResult {
-    Acquired(DelegationLease),
-    HeldBy(String),
 }
 
 #[derive(Clone)]

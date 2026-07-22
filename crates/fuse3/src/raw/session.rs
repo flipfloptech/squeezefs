@@ -4669,12 +4669,15 @@ fn negotiate_reply_flags(init_in_flags: u32, mount_options: &MountOptions) -> u3
         reply_flags |= FUSE_ASYNC_READ;
     }
 
-    #[cfg(feature = "file-lock")]
-    if init_in_flags & FUSE_POSIX_LOCKS > 0 {
-        debug!("enable FUSE_POSIX_LOCKS");
-
-        reply_flags |= FUSE_POSIX_LOCKS;
-    }
+    // FUSE_POSIX_LOCKS is deliberately NOT echoed: POSIX fcntl locks stay
+    // KERNEL-LOCAL (`posix_lock_file` — the canonical implementation).
+    // A daemon-arbitrated table cannot satisfy the full surface:
+    // unlock-on-close rides FLUSH's lock_owner, which the clean-handle
+    // ENOSYS latch elides connection-wide (fstests generic/131 subtest
+    // 27); OFD locks carry file-description owners the wire does not
+    // represent (generic/478); /proc/locks shows only kernel-tracked
+    // locks (generic/504's flock twin). Intra-mount arbitration is the
+    // whole requirement under the D0 single-writer mount guard.
 
     if init_in_flags & FUSE_FILE_OPS > 0 {
         debug!("enable FUSE_FILE_OPS");

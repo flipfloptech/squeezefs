@@ -5,7 +5,7 @@ use crate::meta_backend::Metadata;
 use crate::routing::DataRouter;
 use fuse3::raw::{
     prelude::*,
-    reply::{DirectoryEntry, FileAttr, ReplyCopyFileRange, ReplyIoctl, ReplyLock},
+    reply::{DirectoryEntry, FileAttr, ReplyCopyFileRange, ReplyIoctl},
     Request,
 };
 use fuse3::{Errno, Inode, MountOptions, Result as FuseResult, Timestamp};
@@ -218,13 +218,12 @@ impl KernelCacheTtls {
 //
 // Bounded waits that already exist and are KEPT (not per-op timeouts):
 // `destroy()`'s staged-drain wait (bounded by `dismount_wait`,
-// fuse_client.rs:4243-4261), `ensure_delegation_held`'s 40×50 ms retry
-// budget (:2102+), the 2 s device health probe (routing.rs:898), the
+// fuse_client.rs:4243-4261), the 2 s device health probe (routing.rs:898), the
 // DLM lease acquire's 5 s bound, and the reclaim gather window
 // (`drain_reclaim_batch`'s `timeout_at`, fuse_client.rs:8018+ — a batch
-// WINDOW, not an op wait). POSIX blocking locks (`setlk` F_SETLKW)
-// legitimately block indefinitely per contract and are exempt from
-// watchdog registration; they were never timeout-wrapped.
+// WINDOW, not an op wait). POSIX byte-range locks are KERNEL-LOCAL
+// (FUSE_POSIX_LOCKS is never advertised — fstests 131/478/504), so no
+// lock wait ever reaches this daemon.
 // ===========================================================================
 
 // ===========================================================================
@@ -2703,91 +2702,6 @@ pub struct OpenEntry {
     dirty: std::sync::atomic::AtomicBool,
 }
 
-/// One POSIX advisory byte-range lock (inclusive `start..=end`, the
-/// kernel `struct file_lock` shape). The daemon opts into
-/// `FUSE_POSIX_LOCKS`, so it is the SOLE arbiter of advisory-lock
-/// semantics: type-aware compatibility (RD/RD shares, anything/WR
-/// conflicts across owners), same-owner replace/split coverage, and
-/// truthful GETLK conflict reports (fstests generic/131 — the pre-fix
-/// typeless `(ino, owner, start, end)` table made overlapping READ locks
-/// from different processes conflict and fabricated F_WRLCK conflicts;
-/// pinned in `tests/posix_lock_tests.rs`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PosixLockEntry {
-    owner: u64,
-    pid: u32,
-    /// `libc::F_RDLCK` / `libc::F_WRLCK` as u32 (the FUSE wire encoding).
-    typ: u32,
-    start: u64,
-    /// Inclusive.
-    end: u64,
-}
-
-impl PosixLockEntry {
-    fn overlaps(&self, start: u64, end: u64) -> bool {
-        std::cmp::max(self.start, start) <= std::cmp::min(self.end, end)
-    }
-
-    /// POSIX compatibility: locks of the same owner never conflict
-    /// (re-locks REPLACE coverage); across owners only RD/RD shares.
-    fn conflicts_with(&self, owner: u64, start: u64, end: u64, typ: u32) -> bool {
-        self.owner != owner
-            && self.overlaps(start, end)
-            && (self.typ == libc::F_WRLCK as u32 || typ == libc::F_WRLCK as u32)
-    }
-}
-
-/// Carve `owner`'s coverage of `[start, end]` out of `list` — the POSIX
-/// split: a spanning lock leaves left/right remnants.
-fn posix_carve_owner_range(list: &mut Vec<PosixLockEntry>, owner: u64, start: u64, end: u64) {
-    let mut out = Vec::with_capacity(list.len() + 1);
-    for e in list.drain(..) {
-        if e.owner != owner || !e.overlaps(start, end) {
-            out.push(e);
-            continue;
-        }
-        if e.start < start {
-            out.push(PosixLockEntry {
-                end: start - 1,
-                ..e
-            });
-        }
-        if e.end > end {
-            out.push(PosixLockEntry {
-                start: end + 1,
-                ..e
-            });
-        }
-    }
-    *list = out;
-}
-
-/// Merge `owner`'s adjacent/contiguous same-type entries (bounded table
-/// growth under repeated re-locks; carving keeps own entries disjoint,
-/// so a sort + single pass suffices).
-fn posix_coalesce_owner(list: &mut Vec<PosixLockEntry>, owner: u64) {
-    let mut own: Vec<PosixLockEntry> = Vec::new();
-    list.retain(|e| {
-        if e.owner == owner {
-            own.push(*e);
-            false
-        } else {
-            true
-        }
-    });
-    own.sort_by_key(|e| e.start);
-    let mut merged: Vec<PosixLockEntry> = Vec::with_capacity(own.len());
-    for e in own {
-        match merged.last_mut() {
-            Some(last) if last.typ == e.typ && e.start <= last.end.saturating_add(1) => {
-                last.end = std::cmp::max(last.end, e.end);
-            }
-            _ => merged.push(e),
-        }
-    }
-    list.extend(merged);
-}
-
 /// Max automatic retries for a single background writeback unit (P0-3).
 const WRITEBACK_MAX_ATTEMPTS: u32 = 4;
 /// P1-3: max partial blocks held only in RAM (not yet staged).
@@ -2887,10 +2801,6 @@ pub struct SqueezefsFilesystem {
     gid: u32,
     active_leases: std::sync::Arc<dashmap::DashMap<u64, crate::dlm::LockLease, ahash::RandomState>>,
     lease_locks: std::sync::Arc<StripeLocks<tokio::sync::Mutex<()>, 4096>>,
-    active_posix_locks:
-        std::sync::Arc<dashmap::DashMap<Inode, Vec<PosixLockEntry>, ahash::RandomState>>,
-    active_delegations:
-        std::sync::Arc<dashmap::DashMap<Inode, crate::dlm::DelegationLease, ahash::RandomState>>,
     pub active_inode_locks: std::sync::Arc<StripeLocks<tokio::sync::RwLock<()>, 4096>>,
     /// P1-4: capacity-bounded attribute cache (moka TTL + max_capacity).
     pub attr_cache: moka::sync::Cache<u64, (FileAttr, std::time::Instant)>,
@@ -3055,8 +2965,6 @@ impl Clone for SqueezefsFilesystem {
             gid: self.gid,
             active_leases: self.active_leases.clone(),
             lease_locks: self.lease_locks.clone(),
-            active_posix_locks: self.active_posix_locks.clone(),
-            active_delegations: self.active_delegations.clone(),
             active_inode_locks: self.active_inode_locks.clone(),
             attr_cache: self.attr_cache.clone(),
             dir_entry_cache_v3: self.dir_entry_cache_v3.clone(),
@@ -3155,12 +3063,6 @@ impl SqueezefsFilesystem {
                 ahash::RandomState::new(),
             )),
             lease_locks: std::sync::Arc::new(StripeLocks::new()),
-            active_posix_locks: std::sync::Arc::new(dashmap::DashMap::with_hasher(
-                ahash::RandomState::new(),
-            )),
-            active_delegations: std::sync::Arc::new(dashmap::DashMap::with_hasher(
-                ahash::RandomState::new(),
-            )),
             active_inode_locks: std::sync::Arc::new(StripeLocks::new()),
             attr_cache,
             dir_entry_cache_v3,
@@ -3298,17 +3200,6 @@ impl SqueezefsFilesystem {
 
     pub fn dlm(&self) -> &DlmClient {
         &self.dlm
-    }
-
-    pub fn active_posix_locks_count(&self) -> usize {
-        self.active_posix_locks
-            .iter()
-            .map(|e| e.value().len())
-            .sum()
-    }
-
-    pub fn has_delegation(&self, inode: Inode) -> bool {
-        self.active_delegations.contains_key(&inode)
     }
 
     /// The ONLINE `volume add-data` (design-volume-lifecycle §5.3, served
@@ -4067,7 +3958,6 @@ impl SqueezefsFilesystem {
             "nvme_read_cache_block_keys": nvme_read_cache_block_keys,
             "active_writes": active_writes,
             "active_leases_count": self.active_leases.len(),
-            "active_posix_locks_count": self.active_posix_locks_count(),
             "volume_states": volume_states,
             "placement": placement_obj,
             "metrics": {
@@ -4975,50 +4865,6 @@ impl SqueezefsFilesystem {
         if let Some((_, lease)) = self.active_leases.remove(&ino) {
             // Best-effort async release if runtime present.
             drop(lease);
-        }
-    }
-
-    async fn ensure_delegation_held(&self, inode: Inode) -> Result<(), SqueezefsError> {
-        if self.active_delegations.contains_key(&inode) {
-            return Ok(());
-        }
-
-        let mut attempts = 0;
-        let max_attempts = 40; // 2 seconds total timeout (40 * 50ms)
-
-        loop {
-            match self
-                .dlm
-                .acquire_delegation(inode, Duration::from_secs(5))
-                .await?
-            {
-                crate::dlm::DelegationResult::Acquired(lease) => {
-                    info!(
-                        "ensure_delegation_held: Acquired delegation on inode {}",
-                        inode
-                    );
-                    // Local mock DLM: no locks to load from Redis
-                    self.active_delegations.insert(inode, lease);
-                    return Ok(());
-                }
-                crate::dlm::DelegationResult::HeldBy(holder) => {
-                    info!("ensure_delegation_held: Inode {} delegation held by {}. Publishing recall...", inode, holder);
-                    if let Err(e) = self.dlm.publish_recall(&holder, inode).await {
-                        warn!(
-                            "ensure_delegation_held: Failed to publish recall to {}: {:?}",
-                            holder, e
-                        );
-                    }
-                }
-            }
-
-            attempts += 1;
-            if attempts >= max_attempts {
-                return Err(SqueezefsError::LockFailed {
-                    reason: format!("Timed out waiting to acquire delegation on inode {}", inode),
-                });
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -7993,7 +7839,6 @@ impl SqueezefsFilesystem {
         if let Some((_, lease)) = self.active_leases.remove(&ino) {
             let _ = lease.release().await;
         }
-        self.active_posix_locks.remove(&ino);
         self.router.metadata_cache.remove(&ino);
         self.attr_cache.invalidate(&ino);
         self.last_write_end.remove_sync(&ino);
@@ -10796,13 +10641,8 @@ impl Filesystem for SqueezefsFilesystem {
             }
         }
 
-        // Release POSIX locks held by this lock owner on this inode
-        // (close drops the process's advisory locks).
-        if let Some(mut entry) = self.active_posix_locks.get_mut(&ino) {
-            entry.value_mut().retain(|l| l.owner != _lock_owner);
-        }
-        self.active_posix_locks
-            .remove_if(&ino, |_, list| list.is_empty());
+        // POSIX locks are kernel-local (no daemon table): close-time lock
+        // release is the kernel's posix_lock_file bookkeeping.
         prof.mark_backend_done();
 
         // Static lock array does not need dynamic cleanup
@@ -10976,146 +10816,16 @@ impl Filesystem for SqueezefsFilesystem {
         }
     }
 
-    async fn getlk(
-        &self,
-        _req: Request,
-        inode: Inode,
-        _fh: u64,
-        _lock_owner: u64,
-        _start: u64,
-        _end: u64,
-        _type: u32,
-        _pid: u32,
-    ) -> FuseResult<ReplyLock> {
-        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
-        debug!(
-            "FUSE getlk: inode = {}, owner = {}, start = {}, end = {}, type = {}",
-            inode, _lock_owner, _start, _end, _type
-        );
-
-        if let Err(e) = self.ensure_delegation_held(inode).await {
-            error!(
-                "FUSE getlk: Failed to ensure delegation held for inode {}: {:?}",
-                inode, e
-            );
-            return Err(map_squeezefs_err(e));
-        }
-
-        // Report the ACTUAL first conflicting lock — its real type, range,
-        // and pid (the pre-fix reply fabricated F_WRLCK; generic/131).
-        if let Some(list) = self.active_posix_locks.get(&inode) {
-            if let Some(c) = list
-                .iter()
-                .find(|e| e.conflicts_with(_lock_owner, _start, _end, _type))
-            {
-                debug!(
-                    "FUSE getlk: conflict with owner {} type {} on range {}-{}",
-                    c.owner, c.typ, c.start, c.end
-                );
-                return Ok(ReplyLock {
-                    start: c.start,
-                    end: c.end,
-                    r#type: c.typ,
-                    pid: c.pid,
-                });
-            }
-        }
-
-        debug!("FUSE getlk: no conflict found, range unlocked");
-        Ok(ReplyLock {
-            start: _start,
-            end: _end,
-            r#type: libc::F_UNLCK as u32,
-            pid: 0,
-        })
-    }
-
-    async fn setlk(
-        &self,
-        _req: Request,
-        inode: Inode,
-        _fh: u64,
-        _lock_owner: u64,
-        _start: u64,
-        _end: u64,
-        _type: u32,
-        _pid: u32,
-        _block: bool,
-    ) -> FuseResult<()> {
-        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
-
-        debug!(
-            "FUSE setlk: inode = {}, owner = {}, start = {}, end = {}, type = {}, block = {}",
-            inode, _lock_owner, _start, _end, _type, _block
-        );
-
-        if let Err(e) = self.ensure_delegation_held(inode).await {
-            error!(
-                "FUSE setlk: Failed to ensure delegation held for inode {}: {:?}",
-                inode, e
-            );
-            return Err(map_squeezefs_err(e));
-        }
-
-        if _type == libc::F_UNLCK as u32 {
-            // POSIX split: carve exactly [start, end] out of this owner's
-            // coverage — a spanning lock leaves left/right remnants.
-            if let Some(mut entry) = self.active_posix_locks.get_mut(&inode) {
-                posix_carve_owner_range(entry.value_mut(), _lock_owner, _start, _end);
-            }
-            self.active_posix_locks
-                .remove_if(&inode, |_, list| list.is_empty());
-            return Ok(());
-        }
-
-        let mut attempts = 0;
-        let max_attempts = if _block { 20 } else { 1 };
-
-        loop {
-            // The conflict check and the apply happen under ONE entry
-            // guard — the pre-fix scan-then-insert pair was a TOCTOU.
-            {
-                let mut entry = self.active_posix_locks.entry(inode).or_default();
-                let list = entry.value_mut();
-                let conflict = list
-                    .iter()
-                    .any(|e| e.conflicts_with(_lock_owner, _start, _end, _type));
-                if !conflict {
-                    debug!(
-                        "FUSE setlk: acquired {} lock {}-{} for owner {}",
-                        if _type == libc::F_WRLCK as u32 {
-                            "write"
-                        } else {
-                            "read"
-                        },
-                        _start,
-                        _end,
-                        _lock_owner
-                    );
-                    // Same-owner re-lock REPLACES coverage (upgrade/
-                    // downgrade splits the old entry), then adjacent
-                    // same-type ranges coalesce.
-                    posix_carve_owner_range(list, _lock_owner, _start, _end);
-                    list.push(PosixLockEntry {
-                        owner: _lock_owner,
-                        pid: _pid,
-                        typ: _type,
-                        start: _start,
-                        end: _end,
-                    });
-                    posix_coalesce_owner(list, _lock_owner);
-                    return Ok(());
-                }
-            }
-
-            attempts += 1;
-            if attempts >= max_attempts {
-                debug!("FUSE setlk: lock acquisition failed/timed out, returning EAGAIN");
-                return Err(Errno::from(libc::EAGAIN));
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
+    // POSIX byte-range locks are KERNEL-LOCAL: the INIT reply never
+    // advertises FUSE_POSIX_LOCKS (see the fuse3 negotiation note +
+    // pins), so the kernel's canonical posix_lock_file arbitrates and
+    // no GETLK/SETLK ever reaches this daemon. The former
+    // daemon-arbitrated table could not satisfy the full surface
+    // (unlock-on-close rode the FLUSH lock_owner that the clean-handle
+    // ENOSYS latch elides; OFD owners don't cross the wire; /proc/locks
+    // shows only kernel-tracked locks — fstests generic/131/478/504).
+    // Intra-mount arbitration is the whole requirement under the D0
+    // single-writer mount guard.
 
     async fn ioctl(
         &self,

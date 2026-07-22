@@ -5176,10 +5176,13 @@ impl KvMetaBackend {
         let tx0 = KvTx::new();
         let (existing, key) = self.xattr_slot(&tx0, ino, name).await?;
         if !existing {
-            return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Xattr not found",
-            )));
+            // ENODATA (Linux ENOATTR): the ATTRIBUTE is absent — never
+            // generic NotFound, which the errno map renders ENOENT and
+            // misnames the (existing) file (fstests generic/533; pinned
+            // in tests/job_fabric_tests.rs).
+            return Err(crate::error::SqueezefsError::Io(
+                std::io::Error::from_raw_os_error(libc::ENODATA),
+            ));
         }
         let mut tx = tx0;
         tx.stage_delete(TREE_XATTRS, key);

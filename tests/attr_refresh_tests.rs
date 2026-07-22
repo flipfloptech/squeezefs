@@ -392,3 +392,38 @@ async fn lookup_dot_revives_the_nodeid_itself() {
             .attr;
     assert_eq!(got.ino, 1);
 }
+
+/// The directory half of the EXPORT_SUPPORT contract (fstests
+/// generic/467's "on a linked dir!" row): reconnecting an evicted
+/// DIRECTORY handle walks `LOOKUP(nodeid, "..")` up to a connected
+/// ancestor. No parent pointer exists in the inode record (v3 keeps the
+/// linkage in the dentry tree only), so ".." resolves by a reverse
+/// dentry scan — the rare, cold handle-reconnect path, priced and
+/// documented at the resolver.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lookup_dotdot_resolves_the_real_parent() {
+    let h = make().await;
+    let outer = mkdir(&h, "outer").await;
+    let inner =
+        h.fs.mkdir(h.req, outer, OsStr::new("inner"), 0o755, 0)
+            .await
+            .unwrap()
+            .attr
+            .ino;
+
+    let got = h
+        .fs
+        .lookup(h.req, inner, OsStr::new(".."))
+        .await
+        .expect("LOOKUP(dir, \"..\") must resolve — directory handle reconnection")
+        .attr;
+    assert_eq!(got.ino, outer, "inner/.. is outer");
+
+    let got = h
+        .fs
+        .lookup(h.req, outer, OsStr::new(".."))
+        .await
+        .expect("LOOKUP(outer, \"..\")")
+        .attr;
+    assert_eq!(got.ino, 1, "outer/.. is the root");
+}

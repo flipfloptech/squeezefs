@@ -1573,6 +1573,22 @@ impl NvmeStaging {
         self.active_block_index.read_sync(key, |_, _| ()).is_some()
     }
 
+    /// Keys of every staged entry (`active_block:` AND
+    /// `active_block_ext:`) whose key starts with `prefix`. Served from
+    /// the latch-free occupancy index — the delete/reclaim sweep
+    /// (O(present), the fix for the O(logical-size) teardown linger —
+    /// fstests generic/294/306/452 family), never a hot path.
+    pub fn staged_keys_with_prefix(&self, prefix: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        self.active_block_index.iter_sync(|k, _| {
+            if k.starts_with(prefix) {
+                out.push(k.clone());
+            }
+            true
+        });
+        out
+    }
+
     /// Keys of every staged extent record whose key starts with `prefix`
     /// (`""` = all). Served from the occupancy index — recovery sweeps and
     /// fsync drains, never a hot path.

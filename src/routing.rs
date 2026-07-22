@@ -7909,36 +7909,37 @@ impl DataRouter {
         // instead of one per corpse — the extra commit's sector guards
         // collided with foreground unlinks under delete storms).
 
-        // Targeted O(1) active block removals without full staging listing
-        let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
-        let max_block = if block_size > 0 {
-            (meta.size + block_size - 1) / block_size
-        } else {
-            0
-        };
-        let mut block_indices = std::collections::HashSet::new();
-        for b in 0..=max_block {
-            block_indices.insert(b);
-        }
-        if let Some(ref block_map) = meta.block_map {
-            for &b in block_map.keys() {
-                block_indices.insert(b as u64);
-            }
-        }
-        // Canonical key form (`…:block_{b}`): the previous hand-rolled
-        // `active_block:{path}:{b}` never matched a real entry, leaking
-        // staged overlays past delete to shadow a reused inode's reads.
+        // Staged-overlay teardown is O(PRESENT + map), never O(logical
+        // size): the pre-fix sweep enumerated EVERY logical block
+        // (`0..=max_block`) to build the key list — a 16 TiB sparse
+        // corpse meant a 4M-entry HashSet + 8M key Strings on the
+        // reclaim worker, minutes of post-unmount daemon linger (the
+        // fstests generic/294/306/452/529/530 "previous daemon still
+        // running after 60s" family; pinned in
+        // tests/sparse_write_bounded_tests.rs::delete_of_huge_sparse_file_is_omap).
+        // The occupancy index lists exactly what is staged for this path
+        // (both `active_block:` and `active_block_ext:` families, the
+        // canonical `…:block_{b}` forms); the block map adds the mapped
+        // indices' canonical keys for defense in depth.
         // One blocking-pool hop for the whole sweep: each removal is a
         // staging shard WRITE lock (shard-lock invariant rule 2).
-        let keys: Vec<String> = block_indices
-            .into_iter()
-            .flat_map(|b| {
-                [
-                    crate::keys::active_block_for_path(file_path, b as u32).to_string(),
-                    crate::keys::active_block_ext_for_path(file_path, b as u32).to_string(),
-                ]
-            })
-            .collect();
+        let mut keys: Vec<String> = self
+            .cache
+            .nvme
+            .staged_keys_with_prefix(&format!("active_block:{file_path}:"));
+        keys.extend(
+            self.cache
+                .nvme
+                .staged_keys_with_prefix(&format!("active_block_ext:{file_path}:")),
+        );
+        if let Some(ref block_map) = meta.block_map {
+            for &b in block_map.keys() {
+                keys.push(crate::keys::active_block_for_path(file_path, b).to_string());
+                keys.push(crate::keys::active_block_ext_for_path(file_path, b).to_string());
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
         let _ = self.cache.nvme.remove_active_blocks_async(keys).await;
 
         self.cache.write_lru.remove(file_path);

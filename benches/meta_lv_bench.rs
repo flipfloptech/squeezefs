@@ -428,7 +428,7 @@ fn bench_kv_fold(c: &mut Criterion) {
         gid: 1000,
         nlink: 2,
         flags: 0,
-        flags2: 0,
+        rdev: 0,
         size: 4096,
         atime: 1,
         mtime: 2,

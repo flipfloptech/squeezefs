@@ -111,7 +111,7 @@ fn iv(seed: u64) -> InodeValue {
         gid: 2000,
         nlink: 1,
         flags: 0,
-        flags2: 0,
+        rdev: 0,
         size: seed.wrapping_mul(4096),
         atime: seed.wrapping_add(1),
         mtime: seed.wrapping_add(2),

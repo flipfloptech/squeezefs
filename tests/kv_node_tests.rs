@@ -47,7 +47,7 @@ fn inode_value(seed: u64) -> InodeValue {
         gid: 0,
         nlink: 1,
         flags: 0,
-        flags2: 0,
+        rdev: 0,
         size: seed * 3,
         atime: seed,
         mtime: seed,

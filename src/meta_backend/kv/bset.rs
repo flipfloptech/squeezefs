@@ -408,7 +408,7 @@ mod tests {
             gid: 0,
             nlink: 1,
             flags: 0,
-            flags2: 0,
+            rdev: 0,
             size: seed * 7,
             atime: seed,
             mtime: seed,

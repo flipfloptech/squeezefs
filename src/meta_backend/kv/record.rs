@@ -183,7 +183,15 @@ pub fn assign_dentry_coll_seq<I: IntoIterator<Item = u8>>(occupied: I) -> Result
 
 // ---------------------------------------------------------------------------
 // Inode record value (design §4.2 table): the DiskInode fields minus the pad,
-// plus flags2; leading varint version tag for future extension.
+// plus rdev; leading varint version tag for future extension.
+//
+// `rdev` occupies the wire word historically named `flags2` (same byte
+// position — zero on-disk format change). The word was reserved: its bit 0
+// carried the retired migrate-era quarantine meaning and was NEVER written
+// by any live binary, so every existing volume holds 0 there. Since the
+// generic/306 fix it persists the device number of mknod'd char/block
+// nodes (the kernel's 32-bit new_encode_dev encoding, verbatim from
+// `fuse_mknod_in.rdev`); 0 for every non-device inode.
 // ---------------------------------------------------------------------------
 
 /// Append a LEB128 varint (the inode value's leading version tag).
@@ -285,7 +293,7 @@ pub struct InodeValue {
     pub gid: u32,
     pub nlink: u32,
     pub flags: u32,
-    pub flags2: u32,
+    pub rdev: u32,
     pub size: u64,
     pub atime: u64,
     pub mtime: u64,
@@ -302,7 +310,7 @@ impl InodeValue {
         out.extend_from_slice(&self.gid.to_le_bytes());
         out.extend_from_slice(&self.nlink.to_le_bytes());
         out.extend_from_slice(&self.flags.to_le_bytes());
-        out.extend_from_slice(&self.flags2.to_le_bytes());
+        out.extend_from_slice(&self.rdev.to_le_bytes());
         out.extend_from_slice(&self.size.to_le_bytes());
         out.extend_from_slice(&self.atime.to_le_bytes());
         out.extend_from_slice(&self.mtime.to_le_bytes());
@@ -325,7 +333,7 @@ impl InodeValue {
             gid: r.u32("inode value gid")?,
             nlink: r.u32("inode value nlink")?,
             flags: r.u32("inode value flags")?,
-            flags2: r.u32("inode value flags2")?,
+            rdev: r.u32("inode value rdev")?,
             size: r.u64("inode value size")?,
             atime: r.u64("inode value atime")?,
             mtime: r.u64("inode value mtime")?,
@@ -440,7 +448,7 @@ pub const DELTA_UID: u16 = 1 << 1;
 pub const DELTA_GID: u16 = 1 << 2;
 pub const DELTA_NLINK: u16 = 1 << 3;
 pub const DELTA_FLAGS: u16 = 1 << 4;
-pub const DELTA_FLAGS2: u16 = 1 << 5;
+pub const DELTA_RDEV: u16 = 1 << 5;
 pub const DELTA_SIZE: u16 = 1 << 6;
 pub const DELTA_ATIME: u16 = 1 << 7;
 pub const DELTA_MTIME: u16 = 1 << 8;
@@ -505,8 +513,8 @@ impl InodeDelta {
         if self.mask & DELTA_FLAGS != 0 {
             out.extend_from_slice(&self.fields.flags.to_le_bytes());
         }
-        if self.mask & DELTA_FLAGS2 != 0 {
-            out.extend_from_slice(&self.fields.flags2.to_le_bytes());
+        if self.mask & DELTA_RDEV != 0 {
+            out.extend_from_slice(&self.fields.rdev.to_le_bytes());
         }
         if self.mask & DELTA_SIZE != 0 {
             out.extend_from_slice(&self.fields.size.to_le_bytes());
@@ -548,8 +556,8 @@ impl InodeDelta {
         if mask & DELTA_FLAGS != 0 {
             fields.flags = r.u32("inode delta flags")?;
         }
-        if mask & DELTA_FLAGS2 != 0 {
-            fields.flags2 = r.u32("inode delta flags2")?;
+        if mask & DELTA_RDEV != 0 {
+            fields.rdev = r.u32("inode delta rdev")?;
         }
         if mask & DELTA_SIZE != 0 {
             fields.size = r.u64("inode delta size")?;
@@ -585,8 +593,8 @@ impl InodeDelta {
         if self.mask & DELTA_FLAGS != 0 {
             base.flags = self.fields.flags;
         }
-        if self.mask & DELTA_FLAGS2 != 0 {
-            base.flags2 = self.fields.flags2;
+        if self.mask & DELTA_RDEV != 0 {
+            base.rdev = self.fields.rdev;
         }
         if self.mask & DELTA_SIZE != 0 {
             base.size = self.fields.size;
@@ -1088,7 +1096,7 @@ mod tests {
             gid: 2000 + (seed >> 8) as u32,
             nlink: 1 + (seed as u32 & 3),
             flags: (seed as u32).rotate_left(7),
-            flags2: 0,
+            rdev: 0,
             size: seed.wrapping_mul(4096),
             atime: seed.wrapping_add(1),
             mtime: seed.wrapping_add(2),
@@ -1317,9 +1325,10 @@ mod tests {
     #[test]
     fn inode_value_roundtrips_with_leading_version_varint() {
         let v = InodeValue {
-            // flags2 is a reserved wire field (bit 0 was the retired
-            // migrate-era quarantine flag); a nonzero value must round-trip.
-            flags2: 1,
+            // rdev rides the wire word historically named flags2 (bit 0
+            // was the retired migrate-era quarantine flag, never written
+            // by a live binary); a nonzero value must round-trip.
+            rdev: 1,
             ..iv(7)
         };
         let bytes = v.encode();
@@ -1458,23 +1467,11 @@ mod tests {
         assert_eq!(base.ctime, 222);
         assert_eq!(
             (
-                base.mode,
-                base.uid,
-                base.gid,
-                base.nlink,
-                base.flags,
-                base.flags2,
-                base.size,
+                base.mode, base.uid, base.gid, base.nlink, base.flags, base.rdev, base.size,
                 base.atime
             ),
             (
-                orig.mode,
-                orig.uid,
-                orig.gid,
-                orig.nlink,
-                orig.flags,
-                orig.flags2,
-                orig.size,
+                orig.mode, orig.uid, orig.gid, orig.nlink, orig.flags, orig.rdev, orig.size,
                 orig.atime
             ),
             "Δtime must never carry or clobber value fields (§4.4 pt 6)"

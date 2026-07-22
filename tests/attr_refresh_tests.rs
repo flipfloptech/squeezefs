@@ -441,9 +441,8 @@ async fn mknod_rdev_round_trips() {
     let h = make().await;
     let rdev: u32 = libc::makedev(1, 3) as u32; // /dev/null's numbers
 
-    let reply = h
-        .fs
-        .mknod(
+    let reply =
+        h.fs.mknod(
             h.req,
             1,
             OsStr::new("nullnode"),

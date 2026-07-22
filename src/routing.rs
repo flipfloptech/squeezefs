@@ -7981,12 +7981,13 @@ impl DataRouter {
         if let Some(backend) = self.inner.meta_backend.get() {
             let src_inode = backend.getattr(src_ino).await?;
             let dest_inode = backend
-                .create(
+                .create_with_rdev(
                     parent_ino,
                     file_name,
                     src_inode.mode,
                     src_inode.uid,
                     src_inode.gid,
+                    src_inode.rdev,
                 )
                 .await?;
             let _ = backend

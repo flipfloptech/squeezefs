@@ -677,7 +677,7 @@ async fn test_replay_seq_sorted_and_fold_contract() {
         gid: 2,
         nlink: 1,
         flags: 0,
-        flags2: 0,
+        rdev: 0,
         size: 100,
         atime: 1,
         mtime: 1,

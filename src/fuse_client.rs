@@ -7645,7 +7645,7 @@ impl SqueezefsFilesystem {
             nlink: inode.nlink,
             uid: inode.uid,
             gid: inode.gid,
-            rdev: 0,
+            rdev: inode.rdev,
             blksize: 4096,
         }
     }
@@ -8627,6 +8627,13 @@ impl Filesystem for SqueezefsFilesystem {
             parent, name_str, mode, rdev
         );
 
+        // Persist rdev only for the node kinds it means something on
+        // (char/block devices — the kernel's 32-bit new_encode_dev word);
+        // POSIX says mknod ignores dev for FIFOs/sockets/regular files.
+        let stored_rdev = match mode & libc::S_IFMT {
+            libc::S_IFCHR | libc::S_IFBLK => rdev,
+            _ => 0,
+        };
         let prof = OpProf::begin(FuseOpKind::Mknod, parent);
         let mknod_future = async {
             let backend = self
@@ -8635,12 +8642,11 @@ impl Filesystem for SqueezefsFilesystem {
                 .expect("meta_backend must be configured");
             prof.mark_backend_start();
             let backend_res = backend
-                .create(parent, &name_str, mode, req.uid, req.gid)
+                .create_with_rdev(parent, &name_str, mode, req.uid, req.gid, stored_rdev)
                 .await;
             prof.mark_backend_done();
             let inode = backend_res.map_err(map_squeezefs_err)?;
-            let mut attr = self.inode_to_file_attr(&inode);
-            attr.rdev = rdev;
+            let attr = self.inode_to_file_attr(&inode);
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
             self.bump_dir_generation(parent);

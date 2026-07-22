@@ -1517,6 +1517,7 @@ impl KvMetaBackend {
             mtime: v.mtime,
             ctime: v.ctime,
             flags: v.flags,
+            rdev: v.rdev,
         })
     }
 
@@ -4162,6 +4163,7 @@ impl KvMetaBackend {
             mtime: v.mtime,
             ctime: v.ctime,
             flags: v.flags,
+            rdev: v.rdev,
         }
     }
 
@@ -4435,6 +4437,7 @@ impl KvMetaBackend {
         mode: u32,
         uid: u32,
         gid: u32,
+        rdev: u32,
         // PR VL5b: the routed layer pre-allocates BOTH — the effective
         // local key ino (native watermark or guest-namespaced cursor
         // mint) and its global encoding (which rides the mint slot, not
@@ -4469,7 +4472,7 @@ impl KvMetaBackend {
             gid: final_gid,
             nlink: if is_dir { 2 } else { 1 },
             flags: 0,
-            flags2: 0,
+            rdev,
             size: 0,
             atime: now,
             mtime: now,
@@ -4500,6 +4503,7 @@ impl KvMetaBackend {
         mode: u32,
         uid: u32,
         gid: u32,
+        rdev: u32,
         guards: Arc<[DlmGuard]>,
     ) -> Result<InodeValue> {
         self.write_gate()?;
@@ -4511,7 +4515,7 @@ impl KvMetaBackend {
             gid,
             nlink: if is_dir { 2 } else { 1 },
             flags: 0,
-            flags2: 0,
+            rdev,
             size: 0,
             atime: now,
             mtime: now,
@@ -5210,13 +5214,14 @@ impl Metadata for KvMetaBackend {
     /// Mirrors the retired v2 `create`: exclusive parent, EEXIST check,
     /// setgid inheritance, full parent-time update — one whole-tx journal
     /// entry (inode + dentry + parent).
-    async fn create(
+    async fn create_with_rdev(
         &self,
         parent: Ino,
         name: &str,
         mode: u32,
         uid: u32,
         gid: u32,
+        rdev: u32,
     ) -> Result<Inode> {
         self.write_gate()?;
         let guards: Arc<[DlmGuard]> = Arc::from(vec![
@@ -5250,7 +5255,7 @@ impl Metadata for KvMetaBackend {
             gid: final_gid,
             nlink: 1,
             flags: 0,
-            flags2: 0,
+            rdev,
             size: 0,
             atime: now,
             mtime: now,

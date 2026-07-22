@@ -67,6 +67,11 @@ pub struct Inode {
     pub mtime: u64,
     pub ctime: u64,
     pub flags: u32,
+    /// Device number of char/block device nodes (the kernel's 32-bit
+    /// `new_encode_dev` encoding, verbatim from mknod); 0 for every
+    /// non-device inode. Persisted in the inode value's `rdev` wire word
+    /// (historically the reserved `flags2`).
+    pub rdev: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,8 +84,30 @@ pub struct DirEntry {
 #[async_trait::async_trait]
 pub trait Metadata: Send + Sync {
     async fn lookup(&self, parent: Ino, name: &str) -> Result<Inode>;
-    async fn create(&self, parent: Ino, name: &str, mode: u32, uid: u32, gid: u32)
-        -> Result<Inode>;
+    /// Create with `rdev = 0` — every non-device creation site. Provided:
+    /// delegates to [`Metadata::create_with_rdev`].
+    async fn create(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Inode> {
+        self.create_with_rdev(parent, name, mode, uid, gid, 0).await
+    }
+    /// `rdev` is the device number for char/block device nodes (mknod's
+    /// 32-bit `new_encode_dev` word, persisted in the inode value's
+    /// `rdev` wire word); 0 for everything else.
+    async fn create_with_rdev(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u32,
+    ) -> Result<Inode>;
     async fn unlink(&self, parent: Ino, name: &str) -> Result<Ino>;
     async fn link(&self, ino: Ino, new_parent: Ino, new_name: &str) -> Result<Inode>;
     async fn rename(
@@ -1070,13 +1097,14 @@ impl Metadata for RoutedMetaBackend {
         self.getattr(child_ino).await
     }
 
-    async fn create(
+    async fn create_with_rdev(
         &self,
         parent: Ino,
         name: &str,
         mode: u32,
         uid: u32,
         gid: u32,
+        rdev: u32,
     ) -> Result<Inode> {
         // §5.5.2a cutover gate: BEFORE any 4a acquisition — a parked
         // create holds nothing. Routes are derived AFTER admission: a
@@ -1176,6 +1204,7 @@ impl Metadata for RoutedMetaBackend {
                     mode,
                     uid,
                     gid,
+                    rdev,
                     new_local,
                     new_global,
                     guards,
@@ -1215,7 +1244,14 @@ impl Metadata for RoutedMetaBackend {
             let (new_local_ino, global_child_ino) = self.allocate_local_ino(target_v_idx)?;
             let target_be = &self.volumes[target_v_idx];
             let minted = target_be
-                .routed_mint_inode(new_local_ino, final_mode, uid, final_gid, guards.clone())
+                .routed_mint_inode(
+                    new_local_ino,
+                    final_mode,
+                    uid,
+                    final_gid,
+                    rdev,
+                    guards.clone(),
+                )
                 .await;
             if minted.is_err() {
                 self.mirror_volume_failure(target_v_idx);
@@ -1232,6 +1268,7 @@ impl Metadata for RoutedMetaBackend {
                 mtime: v.mtime,
                 ctime: v.ctime,
                 flags: v.flags,
+                rdev: v.rdev,
             };
 
             // Parent side: the dentry (global child ino) + parent update.
@@ -1564,6 +1601,7 @@ impl Metadata for RoutedMetaBackend {
                 mtime: v.mtime,
                 ctime: v.ctime,
                 flags: v.flags,
+                rdev: v.rdev,
             };
 
             // Parent side: dentry + best-effort parent times.

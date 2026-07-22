@@ -1023,6 +1023,28 @@ impl RoutedMetaBackend {
 #[async_trait::async_trait]
 impl Metadata for RoutedMetaBackend {
     async fn lookup(&self, parent: Ino, name: &str) -> Result<Inode> {
+        // ".." — the FUSE_EXPORT_SUPPORT directory-handle reconnect path
+        // (fstests generic/467): no parent pointer exists in the inode
+        // record, so the parent resolves by reverse dentry scan — cold
+        // and rare by construction (see
+        // `KvMetaBackend::find_parent_of_child` for the priced cost
+        // note). Loud NotFound when no dentry names the child (an
+        // orphaned/racing-unlinked dir) — never a fabricated parent.
+        if name == ".." {
+            if parent == 1 {
+                return self.getattr(1).await;
+            }
+            for (v_idx, vol) in self.volumes.iter().enumerate() {
+                self.check_volume_enabled(v_idx)?;
+                if let Some(local_p) = vol.find_parent_of_child(parent).await? {
+                    return self.getattr(self.make_global_ino(local_p, v_idx)).await;
+                }
+            }
+            return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no dentry names ino {parent} — cannot resolve \"..\""),
+            )));
+        }
         let (v_idx, local_parent) = self.route_ino(parent);
         self.check_volume_enabled(v_idx)?;
         // Drop the D-guard before getattr's I-lock (canonical class order —

@@ -1462,6 +1462,40 @@ impl KvMetaBackend {
         self.getattr(dentry.child_ino).await
     }
 
+    /// Reverse dentry resolution: the LOCAL parent ino of the dentry
+    /// naming `child` (dentry values carry GLOBAL child inos), or `None`
+    /// when no dentry on this volume names it.
+    ///
+    /// **Cost, stated honestly:** a full dentries-tree range scan —
+    /// O(entries) over the RAM-authoritative fold (the fsck census-walk
+    /// shape). Its ONLY caller is `LOOKUP(nodeid, "..")` on the
+    /// `FUSE_EXPORT_SUPPORT` directory-handle **reconnect** path
+    /// (fstests generic/467; `open_by_handle_at` of an evicted directory
+    /// after cache drop) — cold and rare by construction. The hot ".."
+    /// path never reaches here: the kernel resolves ".." from its own
+    /// dcache while the directory is connected. v3 stores no parent
+    /// pointer in the inode record; adding one is an inode-value
+    /// version bump (a forward-only format change) that this rare path
+    /// does not justify.
+    pub async fn find_parent_of_child(&self, child_global: Ino) -> Result<Option<Ino>> {
+        let end = super::tree::KEY_SPACE_MAX;
+        let mut cursor: Vec<u8> = vec![0u8];
+        loop {
+            let page = self.dentries.range(&cursor, &end, SCAN_PAGE).await?;
+            let Some((last_key, _)) = page.last() else {
+                return Ok(None);
+            };
+            cursor = key_successor(last_key);
+            for (k, v) in &page {
+                let d = DentryValue::decode(v)?;
+                if d.child_ino == child_global {
+                    let (parent, _hash54, _coll) = decode_dentry_key(k)?;
+                    return Ok(Some(parent));
+                }
+            }
+        }
+    }
+
     /// Attributes of `ino` from the inode tree (K1 fold; Δtime deltas
     /// folded into the base record; PR M6 pending-times refinements
     /// folded on top — absorbed echoes are read-visible before they

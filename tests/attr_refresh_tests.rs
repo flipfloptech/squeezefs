@@ -411,19 +411,17 @@ async fn lookup_dotdot_resolves_the_real_parent() {
             .attr
             .ino;
 
-    let got = h
-        .fs
-        .lookup(h.req, inner, OsStr::new(".."))
-        .await
-        .expect("LOOKUP(dir, \"..\") must resolve — directory handle reconnection")
-        .attr;
+    let got =
+        h.fs.lookup(h.req, inner, OsStr::new(".."))
+            .await
+            .expect("LOOKUP(dir, \"..\") must resolve — directory handle reconnection")
+            .attr;
     assert_eq!(got.ino, outer, "inner/.. is outer");
 
-    let got = h
-        .fs
-        .lookup(h.req, outer, OsStr::new(".."))
-        .await
-        .expect("LOOKUP(outer, \"..\")")
-        .attr;
+    let got =
+        h.fs.lookup(h.req, outer, OsStr::new(".."))
+            .await
+            .expect("LOOKUP(outer, \"..\")")
+            .attr;
     assert_eq!(got.ino, 1, "outer/.. is the root");
 }

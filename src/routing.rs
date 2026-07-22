@@ -3681,11 +3681,39 @@ impl DataRouter {
             } else {
                 None
             };
-            let (val, incarnation_valid) = if device_true || escalated {
-                self.fetch_block_device_true(&cur_key).await?
+            let fetched = if device_true || escalated {
+                self.fetch_block_device_true(&cur_key).await
             } else {
-                self.get_cached_or_fetch_block_traced(&cur_key, false)
-                    .await?
+                self.get_cached_or_fetch_block_traced(&cur_key, false).await
+            };
+            let (val, incarnation_valid) = match fetched {
+                Ok(x) => x,
+                Err(e) => {
+                    // A fetch/DECODE failure on a NON-current binding is a
+                    // stale-binding LOSS, not corruption: a displaced+freed
+                    // offset is legally reused mid-read, and on transformed
+                    // volumes the dead incarnation's bytes fail frame/AEAD
+                    // decode (the reads_mid_fold LZ4 EINVAL — the
+                    // never-invisible fold widened readers into the
+                    // displace/free/reuse window). Rebind exactly like a
+                    // wrong-bytes fill; propagate only when the CURRENT map
+                    // still binds this key (a real I/O/corruption error).
+                    let current = self.current_block_binding(file_path, b).await?;
+                    if current.as_deref() == Some(cur_key.as_str()) {
+                        return Err(e);
+                    }
+                    losses += 1;
+                    METRICS
+                        .stale_binding_rebinds
+                        .fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        "stale-binding rebind (fetch error): file={} block={} key={} \
+                         current={:?} err={e}",
+                        file_path, b, cur_key, current
+                    );
+                    key = current;
+                    continue;
+                }
             };
             // Recheck the binding only AFTER the bytes are in hand: the
             // proof needs (movement between snapshot and serve) ⇒ (word

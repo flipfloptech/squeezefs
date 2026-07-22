@@ -10052,11 +10052,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .await
                 .map_err(map_squeezefs_err)?;
             prof.mark_backend_done();
-            // A full page may have more real entries behind it; the
-            // root virtuals ride above the whole real-cookie space and
-            // are appended only once the real stream is exhausted.
-            let more_reals = page.len() == V3_READDIR_PAGE;
-            let mut entries = Vec::with_capacity(page.len() + 4);
+            let mut entries = Vec::with_capacity(page.len() + 2);
             if off_u < 1 {
                 entries.push(DirectoryEntry {
                     name: ".".into(),
@@ -10092,24 +10088,11 @@ impl Filesystem for SqueezefsFilesystem {
                     offset: cookie as i64,
                 });
             }
-            if parent == 1 && !more_reals {
-                if off_u < READDIR_VIRTUAL_CONFIG_COOKIE {
-                    entries.push(DirectoryEntry {
-                        name: ".config".into(),
-                        kind: FileType::RegularFile,
-                        inode: CONFIG_INODE,
-                        offset: READDIR_VIRTUAL_CONFIG_COOKIE as i64,
-                    });
-                }
-                if off_u < READDIR_VIRTUAL_STATS_COOKIE {
-                    entries.push(DirectoryEntry {
-                        name: ".stats".into(),
-                        kind: FileType::RegularFile,
-                        inode: STATS_INODE,
-                        offset: READDIR_VIRTUAL_STATS_COOKIE as i64,
-                    });
-                }
-            }
+            // The root virtuals (.config/.stats) are LOOKUP-ONLY — never
+            // listed (the .zfs/.lustre hidden control-file pattern;
+            // fstests generic/062: recursive walks must not see
+            // fabricated files). Their reserved cookies remain honored on
+            // resume (a stale pre-hide cookie terminates the stream).
             use futures::stream::{self, StreamExt};
             let stream = stream::iter(entries.into_iter().map(Ok)).boxed();
             Ok(ReplyDirectory { entries: stream })
@@ -10142,8 +10125,7 @@ impl Filesystem for SqueezefsFilesystem {
                     .await
                     .map_err(map_squeezefs_err)?;
                 prof.mark_backend_done();
-                let more_reals = page.len() == V3_READDIRPLUS_PAGE;
-                let mut entries = Vec::with_capacity(page.len() + 4);
+                let mut entries = Vec::with_capacity(page.len() + 2);
                 if offset < 1 {
                     let attr = self
                         .get_attr_internal(parent)
@@ -10209,63 +10191,7 @@ impl Filesystem for SqueezefsFilesystem {
                         offset: cookie as i64,
                     });
                 }
-                if parent == 1 && !more_reals {
-                    // Virtual entries carry the PUBLISHED generation's size
-                    // (never a freshly generated throwaway's — that size
-                    // referred to bytes no fh will ever serve; see the
-                    // GETATTR coherence contract). First touch generates
-                    // once, publishes, and stores the pending generation.
-                    if offset < READDIR_VIRTUAL_CONFIG_COOKIE {
-                        let published = self.latest_config_size.load(Ordering::Acquire);
-                        let size = if published > 0 {
-                            published
-                        } else {
-                            let bytes = self.generate_config_json().await.into_bytes();
-                            let size = bytes.len() as u64;
-                            self.latest_config_json
-                                .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
-                            self.latest_config_size.store(size, Ordering::Release);
-                            size
-                        };
-                        let attr = self.get_config_attr(size);
-                        entries.push(DirectoryEntryPlus {
-                            name: ".config".into(),
-                            kind: FileType::RegularFile,
-                            inode: CONFIG_INODE,
-                            generation: 1,
-                            attr,
-                            // Zero TTLs (like `.stats`): exact-size
-                            // payloads must never serve a cached size.
-                            entry_ttl: Duration::from_secs(0),
-                            attr_ttl: Duration::from_secs(0),
-                            offset: READDIR_VIRTUAL_CONFIG_COOKIE as i64,
-                        });
-                    }
-                    if offset < READDIR_VIRTUAL_STATS_COOKIE {
-                        let published = self.latest_stats_size.load(Ordering::Acquire);
-                        let size = if published > 0 {
-                            published
-                        } else {
-                            let bytes = self.generate_stats_json().await.into_bytes();
-                            let size = bytes.len() as u64;
-                            self.latest_stats_json
-                                .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
-                            self.latest_stats_size.store(size, Ordering::Release);
-                            size
-                        };
-                        let attr = self.get_stats_attr(size);
-                        entries.push(DirectoryEntryPlus {
-                            name: ".stats".into(),
-                            kind: FileType::RegularFile,
-                            inode: STATS_INODE,
-                            generation: 1,
-                            attr,
-                            entry_ttl: Duration::from_secs(0),
-                            attr_ttl: Duration::from_secs(0),
-                            offset: READDIR_VIRTUAL_STATS_COOKIE as i64,
-                        });
-                    }
-                }
+                // Root virtuals are LOOKUP-ONLY — see the readdir twin.
                 use futures::stream::{self, StreamExt};
                 let stream = stream::iter(entries.into_iter().map(Ok)).boxed();
                 Ok(ReplyDirectoryPlus { entries: stream })

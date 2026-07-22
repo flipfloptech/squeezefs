@@ -611,21 +611,19 @@ async fn fuse_readdir_v3_emits_key_cookies_and_streams() {
             .any(|(n, _, _)| n == ".config" || n == ".stats"),
         "virtual control files must not be LISTED"
     );
-    let stats_ino = h
-        .fs
-        .lookup(req(), 1, std::ffi::OsStr::new(".stats"))
-        .await
-        .expect(".stats stays lookup-able")
-        .attr
-        .ino;
+    let stats_ino =
+        h.fs.lookup(req(), 1, std::ffi::OsStr::new(".stats"))
+            .await
+            .expect(".stats stays lookup-able")
+            .attr
+            .ino;
     assert_eq!(stats_ino, STATS_INODE);
-    let config_ino = h
-        .fs
-        .lookup(req(), 1, std::ffi::OsStr::new(".config"))
-        .await
-        .expect(".config stays lookup-able")
-        .attr
-        .ino;
+    let config_ino =
+        h.fs.lookup(req(), 1, std::ffi::OsStr::new(".config"))
+            .await
+            .expect(".config stays lookup-able")
+            .attr
+            .ino;
     assert_eq!(config_ino, CONFIG_INODE);
     // The historical virtual cookies stay reserved above the real space
     // (a kernel resuming from a stale pre-hide cookie must terminate,

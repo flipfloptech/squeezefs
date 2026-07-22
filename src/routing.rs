@@ -364,8 +364,6 @@ pub struct BackendRouter {
         dashmap::DashMap<String, std::sync::Arc<StorageBackend>, ahash::RandomState>,
     >,
     pub unhealthy_backends: std::sync::Arc<dashmap::DashMap<String, bool, ahash::RandomState>>,
-    /// P1-11: lock-free active backend id (hot path read).
-    pub active_write_backend: std::sync::Arc<arc_swap::ArcSwap<String>>,
     pub block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Read-tier purge hook, run inside every TERMINAL `free_block`
     /// (`begin_free` → purge → punch → `finish_free`). Closes the
@@ -561,9 +559,6 @@ impl BackendRouter {
             backends: std::sync::Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::new())),
             unhealthy_backends: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
-            )),
-            active_write_backend: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
-                "backend_0".to_string(),
             )),
             block_size,
             read_tier_purge: once_cell::sync::OnceCell::new(),
@@ -1563,52 +1558,13 @@ impl BackendRouter {
 
                 // §5.9: republish the placement snapshot every tick — the
                 // refresh cadence for fill drift, and the pickup point
-                // for probe-driven health transitions.
+                // for probe-driven health transitions. Failover IS the
+                // republish: every write picks from this table
+                // (`get_active_backend`), so an unhealthy/Draining volume
+                // drops out of placement here — there is no sticky
+                // active-backend pointer to repoint (deleted with the
+                // KD-16 PlacementTable landing; it had no readers left).
                 router.refresh_placement_table();
-
-                // 3. Trigger failover if currently active write backend is
-                // unhealthy — or no longer placement-eligible (VL4: the
-                // sticky pointer is repointed off a Draining volume as a
-                // side effect, §5.4).
-                let active_be = (*router.active_write_backend.load_full()).clone();
-                if !router.placement_eligible(&active_be) {
-                    log::warn!(
-                        "Active write backend '{}' is unhealthy or not placement-eligible! \
-                         Initiating failover...",
-                        active_be
-                    );
-                    // Fail over to an eligible NAMED volume; the `backend_0`
-                    // default slot is a candidate only on bare routers (same
-                    // policy as `get_active_backend`).
-                    let mut fallback_be = None;
-                    for entry in router.backends.iter() {
-                        let be_id = entry.key();
-                        if router.placement_eligible(be_id) {
-                            fallback_be = Some(be_id.clone());
-                            break;
-                        }
-                    }
-                    if fallback_be.is_none()
-                        && router.backends.is_empty()
-                        && router.is_backend_healthy("backend_0")
-                    {
-                        fallback_be = Some("backend_0".to_string());
-                    }
-
-                    if let Some(healthy_be) = fallback_be {
-                        log::info!(
-                            "Failover: Switching active write backend from '{}' to '{}'",
-                            active_be,
-                            healthy_be
-                        );
-                        router
-                            .active_write_backend
-                            .store(std::sync::Arc::new(healthy_be.clone()));
-                        // Switch is completed in-memory.
-                    } else {
-                        log::error!("Failover failed: No healthy storage backends available!");
-                    }
-                }
             }
         });
     }

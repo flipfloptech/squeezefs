@@ -224,10 +224,6 @@ async fn fixture_with_meta(
             .unwrap_or_else(|e| panic!("register_backend({}) failed: {e:?}", rec.id));
     }
     router.backend_router.set_volume_records(records.to_vec());
-    router
-        .backend_router
-        .active_write_backend
-        .store(Arc::new(first.id.clone()));
 
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
     fs.router.set_meta_backend(routed.clone());

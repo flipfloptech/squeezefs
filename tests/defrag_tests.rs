@@ -179,10 +179,6 @@ async fn open_fixture_ext(meta: &Path, records: &[DataVolumeRecord], compressed:
             .unwrap_or_else(|e| panic!("register_backend({}) failed: {e:?}", rec.id));
     }
     router.backend_router.set_volume_records(records.to_vec());
-    router
-        .backend_router
-        .active_write_backend
-        .store(Arc::new(first.id.clone()));
 
     let kv = squeezefs::meta_backend::kv::backend::KvMetaBackend::open(meta)
         .await

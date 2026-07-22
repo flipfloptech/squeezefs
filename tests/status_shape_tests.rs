@@ -170,19 +170,16 @@ async fn test_status_shape_durable_multi_volume() {
     let backends = setting["StorageBackends"]
         .as_object()
         .expect("StorageBackends object");
-    assert_eq!(
-        backends.len(),
-        2,
-        "both volume records listed: {status:#}"
-    );
+    assert_eq!(backends.len(), 2, "both volume records listed: {status:#}");
     for rec in [&rec1, &rec2] {
-        let row = backends
-            .get(&rec.id)
-            .unwrap_or_else(|| panic!("StorageBackends keyed by durable id {}: {status:#}", rec.id));
+        let row = backends.get(&rec.id).unwrap_or_else(|| {
+            panic!("StorageBackends keyed by durable id {}: {status:#}", rec.id)
+        });
         assert_eq!(row["id"], rec.id.as_str());
         assert_eq!(row["backing_dev"], rec.backing_dev.as_str());
         assert_eq!(
-            row["status"], rec.state.as_str(),
+            row["status"],
+            rec.state.as_str(),
             "status must be the record's REAL lifecycle state, not a hardcoded 'enabled'"
         );
     }

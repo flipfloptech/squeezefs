@@ -4306,11 +4306,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .backend_router
                 .set_volume_records(volume_records.clone());
 
-            router
-                .backend_router
-                .active_write_backend
-                .store(std::sync::Arc::new(first_record.id.clone()));
-
             // Mount every volume through the sector-0 version gate
             // (design-cow-kv-metadata §6.1): v3 mounts read-write (the
             // §4.4 commit pipeline + §4.6 checkpoint task are live);
@@ -4600,12 +4595,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .await?;
             let router = DataRouter::new(dlm, cache, block_alloc.clone(), nvme_dev.clone());
 
-            // Run purely offline on default backend_0
-            router
-                .backend_router
-                .active_write_backend
-                .store(std::sync::Arc::new("backend_0".to_string()));
-
+            // Runs purely offline: the bare router's placement table
+            // serves the `backend_0` default slot.
             println!("Cloning file from {} to {}...", src, dest);
             router.clone_path(&src, &dest).await?;
             println!("File cloned successfully.");

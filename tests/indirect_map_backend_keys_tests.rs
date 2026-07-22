@@ -181,10 +181,6 @@ async fn mount_h(specs: &[VolSpec], meta_path: &std::path::Path, format: bool) -
             }),
         );
     }
-    router
-        .backend_router
-        .active_write_backend
-        .store(Arc::new(volumes[0].name.clone()));
 
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
     let meta_backend = open_v3_meta(meta_path, 256 * 1024 * 1024, format).await;
@@ -477,10 +473,6 @@ async fn test_spill_roundtrip_preserves_prefixed_keys_and_versioned_header() {
             }),
         );
     }
-    router
-        .backend_router
-        .active_write_backend
-        .store(Arc::new(devs[0].0.clone()));
 
     let metaf = NamedTempFile::new().unwrap();
     metaf.as_file().set_len(128 * 1024 * 1024).unwrap();

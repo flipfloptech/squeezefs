@@ -148,10 +148,6 @@ async fn harness(volume_names: &[&str]) -> H {
             }),
         );
     }
-    router
-        .backend_router
-        .active_write_backend
-        .store(Arc::new(volumes[0].name.clone()));
 
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
 

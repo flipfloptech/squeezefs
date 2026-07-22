@@ -360,3 +360,37 @@ async fn negative_timestamps_round_trip() {
     let got = h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr;
     assert_eq!(got.mtime, frac, "negative sec + positive nsec round-trip");
 }
+
+/// fstests generic/426 repro-port (VL10 release gate): the fuse3 INIT
+/// reply advertises `FUSE_EXPORT_SUPPORT`, whose kernel contract is that
+/// `LOOKUP(nodeid, ".")` revives an evicted nodeid (the
+/// `open_by_handle_at` decode path — `fuse_get_dentry`). The daemon
+/// forwarded "." to the backend dentry walk, which stores no "."
+/// records, so every handle whose inode had been evicted came back
+/// ESTALE ("returned 116 incorrectly on a linked file"). `LOOKUP(".")`
+/// must resolve to the nodeid ITSELF; `LOOKUP("..")` at the root must
+/// resolve to the root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lookup_dot_revives_the_nodeid_itself() {
+    let h = make().await;
+    let dir = mkdir(&h, "exp").await;
+    let file = create(&h, dir, "handle-me").await;
+
+    for ino in [dir, file, 1] {
+        let got = h
+            .fs
+            .lookup(h.req, ino, OsStr::new("."))
+            .await
+            .expect("LOOKUP(nodeid, \".\") must succeed — the EXPORT_SUPPORT contract")
+            .attr;
+        assert_eq!(got.ino, ino, "\".\" resolves to the nodeid itself");
+    }
+
+    let got = h
+        .fs
+        .lookup(h.req, 1, OsStr::new(".."))
+        .await
+        .expect("LOOKUP(root, \"..\") must succeed (root is its own parent)")
+        .attr;
+    assert_eq!(got.ino, 1);
+}

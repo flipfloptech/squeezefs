@@ -253,3 +253,58 @@ async fn same_dir_rename_refreshes_parent_once() {
     );
     assert!(cached_attr(&h, dir).is_some());
 }
+
+/// Post-create, the PARENT's cached attrs must be the backend's post-bump
+/// values — never the pre-create snapshot left over from an earlier
+/// getattr.
+///
+/// Found by the VL10 release gate: pjdfstest `open/00.t` subtests 33–34
+/// ("update parent directory ctime/mtime if file didn't exist") observed
+/// the parent's PRE-create mtime/ctime through a stat issued immediately
+/// after `open(O_CREAT)` — the create handler kept the parent's stale
+/// cache entry ("Keep parent attr in cache") while the backend had just
+/// bumped the parent's times, so every parent GETATTR inside the attr-TTL
+/// window served pre-bump times. unlink/rename already refresh (D2.c);
+/// create was the one dir-mutating handler that neither refreshed nor
+/// invalidated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_refreshes_parent_attr_cache() {
+    let h = make().await;
+    let dir = mkdir(&h, "pdir").await;
+
+    // Seed the daemon attr cache with the PRE-create parent attrs (the
+    // kernel's path-walk GETATTR does exactly this before an open(O_CREAT)).
+    let pre = h.fs.getattr(h.req, dir, None, 0).await.unwrap().attr;
+    assert!(cached_attr(&h, dir).is_some(), "seed must be cached");
+
+    // Advance the wall clock past the times' observable resolution so the
+    // backend's parent-times bump provably differs from the seeded snapshot
+    // (clock movement, not synchronization — no event is being awaited).
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let r0 = refreshes();
+    create(&h, dir, "newborn").await;
+
+    let cached = cached_attr(&h, dir)
+        .expect("post-create the PARENT attrs must be cached (refreshed, not left stale)");
+    let truth = backend_inode(&h, dir).await;
+    assert_eq!(
+        cached.mtime,
+        ts(truth.mtime),
+        "cached parent mtime must be the backend's post-create value"
+    );
+    assert_eq!(
+        cached.ctime,
+        ts(truth.ctime),
+        "cached parent ctime must be the backend's post-create value"
+    );
+    assert_ne!(
+        cached.mtime, pre.mtime,
+        "the backend bumped parent mtime on create — a cache still holding \
+         the pre-create snapshot is the pjdfstest open/00.t 33-34 bug"
+    );
+    assert!(
+        refreshes() - r0 >= 1,
+        "create must account a parent attr refresh"
+    );
+}

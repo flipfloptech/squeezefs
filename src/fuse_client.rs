@@ -11235,6 +11235,9 @@ impl Filesystem for SqueezefsFilesystem {
         // fencing bookkeeping of an in-flight drain from an
         // unprivileged shell (the format config was already exposed
         // pre-VL2 — a real hole, pinned closed by tests).
+        if posix_acl_xattr_name(name_str) {
+            return Err(Errno::from(libc::EOPNOTSUPP));
+        }
         if reserved_xattr_name(name_str) {
             METRICS
                 .fuse_reserved_xattr_refusals
@@ -11288,6 +11291,9 @@ impl Filesystem for SqueezefsFilesystem {
         // never serve through FUSE (daemon/probe paths read the meta
         // backend directly). The bootstrap name above is the one
         // deliberate exception — synthesized, never on-disk bytes.
+        if posix_acl_xattr_name(name_str) {
+            return Err(Errno::from(libc::EOPNOTSUPP));
+        }
         if reserved_xattr_name(name_str) {
             METRICS
                 .fuse_reserved_xattr_refusals
@@ -11360,6 +11366,9 @@ impl Filesystem for SqueezefsFilesystem {
         // Reserved-namespace screen (§5.1.2). Pre-VL2 this handler had
         // NO screen at all — `removexattr("user.squeezefs.format_config")`
         // deleted the durable format config from any unprivileged shell.
+        if posix_acl_xattr_name(name_str) {
+            return Err(Errno::from(libc::EOPNOTSUPP));
+        }
         if reserved_xattr_name(name_str) {
             METRICS
                 .fuse_reserved_xattr_refusals
@@ -11386,6 +11395,17 @@ impl Filesystem for SqueezefsFilesystem {
 /// admin verbs read them through the meta backend directly.
 fn reserved_xattr_name(name: &str) -> bool {
     name.starts_with(crate::jobs::JOB_XATTR_PREFIX) || name.starts_with("user.squeezefs.")
+}
+
+/// POSIX ACL xattrs refuse ENOTSUP (the no-ACL filesystem class —
+/// fstests generic/099/319, VL10 release gate): SqueezeFS implements no
+/// ACL semantics (no mode↔ACL_USER_OBJ/mask sync, no default-ACL
+/// inheritance, no enforcement beyond mode bits), and STORING the
+/// xattrs made every tool believe otherwise. setfacl fails loud;
+/// fstests' `_require_acls` notruns; `-o default_permissions` mode-bit
+/// enforcement is unaffected. Pinned in tests/job_fabric_tests.rs.
+fn posix_acl_xattr_name(name: &str) -> bool {
+    name == "system.posix_acl_access" || name == "system.posix_acl_default"
 }
 
 /// Initialize the multi-threaded work-stealing tokio runtime

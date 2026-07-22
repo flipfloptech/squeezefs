@@ -575,21 +575,115 @@ SQUEEZEFS_FSTESTS_QUICK=(
     generic/618
 )
 
-if [ $# -gt 0 ]; then
-    TEST_ARGS=("${@}")
-elif [ "${FSTESTS_QUICK:-0}" = "1" ]; then
-    TEST_ARGS=("${SQUEEZEFS_FSTESTS_QUICK[@]}")
-else
-    TEST_ARGS=("-g" "auto")
-fi
-echo "Running fstests with arguments: ${TEST_ARGS[*]}..."
-cd "$XFSTESTS_DIR"
+# ---------------------------------------------------------------------------
+# FAIL FAST (standing user rule, 2026-07-22): full and QUICK runs abort at
+# the FIRST unexpected failure — nonzero exit, artifacts preserved, the
+# failing test named loudly. The adjudicated by-design set (003/192 noatime,
+# 213 thin provisioning) continues ONLY when its failure diff matches the
+# pinned expected shape EXACTLY; any other diff on those tests aborts too.
+# Single-test invocations (explicit args) keep the classic one-shot check.
+# xfstests' check has no first-class fail-fast, so the full run expands
+# `-g auto` (`check -n`) and drives the list per test.
+# ---------------------------------------------------------------------------
 
-# We ignore non-zero exit code of check script for our cleanup
-set +e
-./check "${TEST_ARGS[@]}"
-EXIT_CODE=$?
-set -e
+# The pinned expected shapes, verbatim `diff tests/<t>.out results/<t>.out.bad`.
+expected_shape_diff() {
+    case "$1" in
+    generic/003) cat <<'EOF'
+1a2,7
+> ERROR: access time has not been updated after accessing file1 first time
+> ERROR: change time has changed for file1 after remount
+> ERROR: access time has not been updated after accessing file2
+> ERROR: access time has not been updated after accessing file3 second time
+> ERROR: change time has changed after accessing file3 second time
+> ERROR: access time has not been updated after accessing file3 third time
+EOF
+        ;;
+    generic/192) cat <<'EOF'
+4c4,5
+< delta1 is in range
+---
+> delta1 has value of 0
+> delta1 is NOT in range 5 .. 7
+EOF
+        ;;
+    generic/213) cat <<'EOF'
+4d3
+< fallocate: No space left on device
+EOF
+        ;;
+    *) return 1 ;;
+    esac
+}
+
+# A failed test continues only if its out.bad diff IS its pinned shape.
+failure_is_expected_shape() {
+    local t="$1"
+    local golden="tests/${t}.out" bad="results/${t}.out.bad"
+    local want got
+    want="$(expected_shape_diff "$t")" || return 1
+    [ -f "$golden" ] && [ -f "$bad" ] || return 1
+    got="$(diff "$golden" "$bad" 2>/dev/null || true)"
+    [ "$got" = "$want" ]
+}
+
+# Per-test driver: abort on the first unexpected failure.
+run_check_failfast() {
+    local ran=0 clean=0 shaped=0
+    local t rc
+    for t in "$@"; do
+        ran=$((ran + 1))
+        set +e
+        ./check "$t"
+        rc=$?
+        set -e
+        if [ $rc -eq 0 ]; then
+            clean=$((clean + 1))
+            continue
+        fi
+        if failure_is_expected_shape "$t"; then
+            shaped=$((shaped + 1))
+            echo "EXPECTED-SHAPE: $t failed with exactly its pinned by-design diff" \
+                 "(003/192 = noatime class, 213 = thin provisioning) — continuing"
+            continue
+        fi
+        echo "==================================================================" >&2
+        echo "FAIL FAST: $t FAILED UNEXPECTEDLY (test $ran of $#)" >&2
+        echo "Artifacts preserved under $XFSTESTS_DIR/results/${t}*" >&2
+        if [ -f "results/${t}.out.bad" ]; then
+            echo "--- diff tests/${t}.out results/${t}.out.bad (head) ---" >&2
+            diff "tests/${t}.out" "results/${t}.out.bad" 2>/dev/null | head -40 >&2 || true
+        fi
+        echo "Fix it (red cargo repro-port first), then RESTART the full run" >&2
+        echo "from the beginning (counted-restart discipline)." >&2
+        echo "==================================================================" >&2
+        return 1
+    done
+    echo "FAIL-FAST SUMMARY: $ran ran, $clean clean, $shaped expected-shape, 0 unexpected"
+}
+
+cd "$XFSTESTS_DIR"
+EXIT_CODE=0
+if [ $# -gt 0 ]; then
+    # Targeted fix-loop mode: classic one-shot check, verbatim args.
+    echo "Running fstests with arguments: ${*}..."
+    set +e
+    ./check "${@}"
+    EXIT_CODE=$?
+    set -e
+elif [ "${FSTESTS_QUICK:-0}" = "1" ]; then
+    echo "Running fstests QUICK set (${#SQUEEZEFS_FSTESTS_QUICK[@]} tests, fail-fast)..."
+    run_check_failfast "${SQUEEZEFS_FSTESTS_QUICK[@]}" || EXIT_CODE=1
+else
+    echo "Expanding -g auto and running the full suite fail-fast..."
+    mapfile -t FULL_LIST < <(./check -n -g auto 2>/dev/null | grep -oE '^[a-z]+/[0-9]+')
+    if [ "${#FULL_LIST[@]}" -lt 100 ]; then
+        echo "ERROR: -g auto expansion produced only ${#FULL_LIST[@]} tests — refusing" >&2
+        exit 1
+    fi
+    echo "Full list: ${#FULL_LIST[@]} tests."
+    run_check_failfast "${FULL_LIST[@]}" || EXIT_CODE=1
+fi
 
 # 7. Cleanup: unmount and wait for the daemons to finish draining so a
 #    back-to-back invocation starts from a quiet state.

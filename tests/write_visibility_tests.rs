@@ -842,3 +842,136 @@ async fn concurrent_clean_handle_of_dirty_inode_stays_on_full_path() {
     assert!(h.fs.is_open(ino), "one handle must remain open");
     release(&h, ino).await;
 }
+
+/// fstests generic/209 repro-port (VL10 release gate,
+/// `aio-dio-invalidate-readahead`): read-after-ACKED-write freshness
+/// under a sequential overwrite storm crossing the staged→striped
+/// promotion boundary. The writer overwrites the whole file page by
+/// page with the pass number; a concurrent reader may read ANY range
+/// whose writes already COMPLETED and must never see the previous
+/// pass's byte. The mount-level failure ("reader found old byte") sat
+/// deterministically just past the first block boundary — 3/3 with and
+/// without the kernel writeback cache, so the staleness is served by
+/// the daemon, not kernel readahead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completed_overwrites_never_serve_the_previous_pass() {
+    let h = Arc::new(make().await);
+    let ino = create(&h, "gen209").await;
+
+    const PAGE: u64 = 4096;
+    const FILE: u64 = 2 * BS; // two blocks — the promotion boundary lives inside
+    const PASSES: u8 = 12;
+
+    // Pass 0 lays the file down NON-ZERO (value 100): a served stale
+    // pass-0 byte reads 100, a zero-filled overlay complement reads 0 —
+    // the two failure classes disambiguate on sight.
+    for off in (0..FILE).step_by(PAGE as usize) {
+        write_at(&h, ino, off, &[100u8; PAGE as usize]).await;
+    }
+
+    // (pass, completed_end): every byte in [0, completed_end) carries
+    // `pass`; everything at/after carries `pass - 1`.
+    let (tx, rx) = tokio::sync::watch::channel((0u8, FILE));
+
+    let writer = {
+        let h = h.clone();
+        tokio::spawn(async move {
+            for pass in 1..=PASSES {
+                let _ = tx.send((pass, 0));
+                let buf = vec![pass; PAGE as usize];
+                for off in (0..FILE).step_by(PAGE as usize) {
+                    write_at(&h, ino, off, &buf).await;
+                    let _ = tx.send((pass, off + PAGE));
+                    if (off / PAGE) % 8 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+            drop(tx);
+        })
+    };
+
+    let reader = {
+        let h = h.clone();
+        let mut rx = rx.clone();
+        tokio::spawn(async move {
+            loop {
+                let (pass, end) = *rx.borrow_and_update();
+                if pass >= 1 && end >= PAGE {
+                    // Read a window straddling the block boundary when
+                    // covered, else the freshest completed page.
+                    let want = if end > BS + PAGE { BS - PAGE } else { 0 };
+                    let off = want.min(end - PAGE);
+                    let len = (end - off).min(4 * PAGE) as u32;
+                    let got = read_at(&h, ino, off, len).await;
+                    // Every byte in a COMPLETED range must be >= pass
+                    // (a racing next-pass byte is legal; pass-1 is not).
+                    let (cur_pass, cur_end) = *rx.borrow();
+                    if cur_pass == pass {
+                        for (i, &b) in got.iter().enumerate() {
+                            let pos = off + i as u64;
+                            if pos + 1 <= cur_end.min(end) && b < pass {
+                                // The generic/209 contract: a byte whose
+                                // write COMPLETED before this read began
+                                // must never read the previous pass. (The
+                                // convicted windows, forensically
+                                // attributed during VL10: the write path's
+                                // remove->mutate->reinsert overlay checkout,
+                                // and the multi-block/fallthrough reads
+                                // that never composed RAM overlays over the
+                                // base tiers — both transient, self-healing
+                                // serves of one-write-behind acked bytes.)
+                                panic!(
+                                    "READER FOUND OLD BYTE {b} at pos {pos} \
+                                     (pass {pass}, completed_end {end}) — \
+                                     generic/209",
+                                );
+                            }
+                        }
+                    }
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+    };
+
+    writer.await.unwrap();
+    reader.await.unwrap();
+
+    // Post-storm: the final pass is fully durable-visible everywhere.
+    let final_bytes = read_at(&h, ino, 0, FILE as u32).await;
+    for (i, &b) in final_bytes.iter().enumerate() {
+        assert_eq!(b, PASSES, "post-storm byte {i} must carry the last pass");
+    }
+}
+
+/// Deterministic discriminator for the generic/209 staleness: does a
+/// SERIALIZED sequential overwrite revert its neighbor (a write-path
+/// seed-source bug), or is the stale byte only served transiently
+/// (a read-path race)?
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serialized_overwrite_never_reverts_neighbors() {
+    let h = make().await;
+    let ino = create(&h, "gen209det").await;
+    const PAGE: usize = 4096;
+
+    // Pass 0: zeros across 6 pages (staged regime).
+    for p in 0..6u64 {
+        write_at(&h, ino, p * PAGE as u64, &[0u8; PAGE]).await;
+    }
+    // Pass 1: page-by-page value 1, verifying after EVERY write that all
+    // previously written pass-1 pages still read 1.
+    for p in 0..6u64 {
+        write_at(&h, ino, p * PAGE as u64, &[1u8; PAGE]).await;
+        let got = read_at(&h, ino, 0, ((p + 1) * PAGE as u64) as u32).await;
+        for (i, &b) in got.iter().enumerate() {
+            assert_eq!(
+                b, 1,
+                "byte at {i} reverted to the previous pass after the \
+                 SERIALIZED write of page {p} — write-path seed source bug"
+            );
+        }
+    }
+}

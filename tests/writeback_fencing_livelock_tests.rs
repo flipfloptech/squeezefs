@@ -439,39 +439,39 @@ async fn teardown_force_flush_drains_stale_token_entries_bounded() {
 /// discards orphan active blocks" — the recovery contract, applied live)
 /// instead of spinning forever.
 ///
-/// The leak shape that strands the entry past delete_file's own sweep is
-/// the incident's: the RAM meta entry is gone (evicted / invalidated), the
-/// backend layout was never persisted (deferred), so the sweep derives
-/// size 0 and misses the staged block's index.
+/// The incident's leak shape (RAM meta evicted ⇒ the size-derived sweep
+/// missed beyond-size blocks) was closed at the source by the VL10
+/// occupancy-index prefix sweep (`27c29d9` — delete now enumerates the
+/// staged overlay by key prefix, size-independent), so the harness
+/// rebuilds the orphan DIRECTLY after reclaim: the surviving crash-window
+/// analog (staged pre-crash, sweep raced / process died mid-delete). The
+/// worker-side discard ladder is the contract under test either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reclaimed_inode_unit_discards_orphan_staging_no_spin() {
     let _serial = serial().await;
     let h = make("m11a_reclaimed").await;
     let ino = create(&h, "reclaimed.bin").await;
 
+    // Blocks 0–1 persist; block 5 (beyond the persisted layout — the
+    // shape the extent fold refuses) STAGES at flush and its writeback
+    // UNIT enters the queue. The worker is not running yet, so the unit
+    // waits for init below.
     write_at(&h, ino, 0, &vec![0x11u8; 4097]).await;
-    // Stage a block PAST the persisted size (block 5; the persisted layout
-    // covers 4097 bytes = blocks 0..=1): its size extension lives only in
-    // the RAM dirty entry (deferred persist).
     write_at(&h, ino, 5 * BLOCK_SIZE, &vec![0xDDu8; 2048]).await;
     let token = h.dlm.get_fencing_token_ino(ino);
     h.fs.flush_memory_buffers_for_inode(ino, token)
         .await
-        .expect("stage block 5");
+        .expect("stage");
     let key = squeezefs::keys::active_block(ino, 5).to_string();
     assert!(
         h.nvme.get_staged_fencing_token(&key).is_some(),
-        "harness: block 5 must be staged"
+        "harness: block 5 must stage (the fold-refused shape) so its \
+         writeback unit is queued"
     );
-
-    // The incident's sweep-miss shape: the RAM meta entry (the only holder
-    // of the extended size) is evicted, so delete_file derives the block
-    // sweep from the persisted 4097-byte layout and misses block 5.
-    h.fs.router.metadata_cache.invalidate(&ino);
 
     // Close + unlink + reclaim (the fsstress open/write/close/unlink
     // grammar): the inode record is destroyed (monotonic inos — never
-    // reused); the staged entry for block 1 survives the sweep.
+    // reused) and delete's occupancy-index sweep clears the overlay.
     h.fs.release(h.req, ino, 0, 0, 0, false)
         .await
         .expect("release");
@@ -490,10 +490,24 @@ async fn reclaimed_inode_unit_discards_orphan_staging_no_spin() {
         "harness: reclaim must have destroyed the inode record: \
          {attr_post_reclaim:?}"
     );
+
+    // Delete's occupancy-index sweep (the VL10 linger fix) removed the
+    // staged entry — but block 5's flush-era UNIT is still queued.
+    // Rebuild the staged source under its flush-era token: the
+    // crash-window analog (an orphan entry for a destroyed inode). The
+    // queued unit must walk the full ladder — upload → merge → NotFound
+    // → authoritative absence probe → DISCARD — never spin.
+    assert!(
+        h.nvme.get_staged_fencing_token(&key).is_none(),
+        "harness: delete's sweep must have cleared the staged entry"
+    );
+    h.nvme
+        .put_active_block_async(key.clone(), bytes::Bytes::from(vec![0xDDu8; 2048]), token)
+        .await
+        .expect("stage the orphan entry");
     assert!(
         h.nvme.get_staged_fencing_token(&key).is_some(),
-        "harness: the leaked orphan staged entry is the repro precondition \
-         (delete_file's sweep must have missed block 5)"
+        "harness: the orphan staged entry is the repro precondition"
     );
 
     // Worker on: the unit must resolve by discarding the orphan — never

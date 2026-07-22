@@ -8481,6 +8481,27 @@ impl Filesystem for SqueezefsFilesystem {
         let name_str = osstr_to_cow(name);
         debug!("FUSE Lookup: parent = {}, name = {}", parent, name_str);
 
+        // FUSE_EXPORT_SUPPORT contract (fstests generic/426; pinned in
+        // tests/attr_refresh_tests.rs): the kernel revives an evicted
+        // nodeid — the open_by_handle_at decode path — with
+        // `LOOKUP(nodeid, ".")`, and reconnects directory handles with
+        // `LOOKUP(nodeid, "..")`. "." is the nodeid itself; ".." at the
+        // root is the root (elsewhere it falls through to the backend,
+        // which resolves stored parent links where they exist and stays
+        // loud where they do not — never a fabricated parent).
+        if name_str == "." || (parent == 1 && name_str == "..") {
+            let target = if name_str == "." { parent } else { 1 };
+            let attr = self
+                .get_attr_internal(target)
+                .await
+                .map_err(map_squeezefs_err)?;
+            return Ok(ReplyEntry {
+                ttl: self.entry_ttl_for(attr.kind),
+                attr,
+                generation: 1,
+            });
+        }
+
         if parent == 1 && name_str == ".config" {
             let config_data = self.generate_config_json().await;
             let bytes = config_data.into_bytes();

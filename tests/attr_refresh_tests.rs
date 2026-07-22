@@ -377,20 +377,18 @@ async fn lookup_dot_revives_the_nodeid_itself() {
     let file = create(&h, dir, "handle-me").await;
 
     for ino in [dir, file, 1] {
-        let got = h
-            .fs
-            .lookup(h.req, ino, OsStr::new("."))
-            .await
-            .expect("LOOKUP(nodeid, \".\") must succeed — the EXPORT_SUPPORT contract")
-            .attr;
+        let got =
+            h.fs.lookup(h.req, ino, OsStr::new("."))
+                .await
+                .expect("LOOKUP(nodeid, \".\") must succeed — the EXPORT_SUPPORT contract")
+                .attr;
         assert_eq!(got.ino, ino, "\".\" resolves to the nodeid itself");
     }
 
-    let got = h
-        .fs
-        .lookup(h.req, 1, OsStr::new(".."))
-        .await
-        .expect("LOOKUP(root, \"..\") must succeed (root is its own parent)")
-        .attr;
+    let got =
+        h.fs.lookup(h.req, 1, OsStr::new(".."))
+            .await
+            .expect("LOOKUP(root, \"..\") must succeed (root is its own parent)")
+            .attr;
     assert_eq!(got.ino, 1);
 }

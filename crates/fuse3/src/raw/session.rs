@@ -4772,11 +4772,13 @@ fn negotiate_reply_flags(init_in_flags: u32, mount_options: &MountOptions) -> u3
         reply_flags |= FUSE_HANDLE_KILLPRIV;
     }
 
-    if init_in_flags & FUSE_POSIX_ACL > 0 && mount_options.default_permissions {
-        debug!("enable FUSE_POSIX_ACL");
-
-        reply_flags |= FUSE_POSIX_ACL;
-    }
+    // FUSE_POSIX_ACL is deliberately NOT echoed: the daemon implements no
+    // ACL semantics (fstests generic/099/319 posture — system.posix_acl_*
+    // xattrs refuse), and negotiating it makes the kernel's
+    // posix_acl_create probe the parent's default ACL on EVERY create —
+    // any non-"absent" reply poisons file creation wholesale (the VL10
+    // targeted-rerun blanket-EOPNOTSUPP regression). Kernel-side
+    // default_permissions mode-bit checking is independent of this flag.
 
     if init_in_flags & FUSE_MAX_PAGES > 0 {
         debug!("enable FUSE_MAX_PAGES");
@@ -4847,6 +4849,25 @@ mod init_negotiation_tests {
             0,
             "INIT reply advertised FUSE_FLOCK_LOCKS but no flock handler exists \
              — BSD flock must stay kernel-local"
+        );
+    }
+
+    /// The no-ACL posture (fstests generic/099/319): negotiating
+    /// FUSE_POSIX_ACL makes the kernel's `posix_acl_create` probe the
+    /// parent's default ACL on EVERY create — with a daemon that refuses
+    /// ACL xattrs, that poisons file creation wholesale (every
+    /// open(O_CREAT)/mkdir returned EOPNOTSUPP — the VL10 targeted-rerun
+    /// regression). The daemon implements no ACL semantics, so the
+    /// capability must never be advertised, default_permissions or not.
+    #[test]
+    fn init_reply_never_advertises_posix_acl() {
+        let mut opts = MountOptions::default();
+        opts.default_permissions(true);
+        let flags = negotiate_reply_flags(u32::MAX, &opts);
+        assert_eq!(
+            flags & FUSE_POSIX_ACL,
+            0,
+            "INIT reply advertised FUSE_POSIX_ACL but the daemon refuses ACL xattrs"
         );
     }
 

@@ -882,7 +882,7 @@ async fn completed_overwrites_never_serve_the_previous_pass() {
                 for off in (0..FILE).step_by(PAGE as usize) {
                     write_at(&h, ino, off, &buf).await;
                     let _ = tx.send((pass, off + PAGE));
-                    if (off / PAGE) % 8 == 0 {
+                    if (off / PAGE).is_multiple_of(8) {
                         tokio::task::yield_now().await;
                     }
                 }
@@ -910,7 +910,7 @@ async fn completed_overwrites_never_serve_the_previous_pass() {
                     if cur_pass == pass {
                         for (i, &b) in got.iter().enumerate() {
                             let pos = off + i as u64;
-                            if pos + 1 <= cur_end.min(end) && b < pass {
+                            if pos < cur_end.min(end) && b < pass {
                                 // The generic/209 contract: a byte whose
                                 // write COMPLETED before this read began
                                 // must never read the previous pass. (The

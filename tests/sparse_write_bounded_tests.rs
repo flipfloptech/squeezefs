@@ -481,9 +481,8 @@ async fn file_size_cap_is_honest_efbig_and_the_last_byte_round_trips() {
     let cap: u64 = BS * (u32::MAX as u64); // block_size × (2^32 − 1)
 
     // (1) Beyond the cap: EFBIG, loud — truncate and write both.
-    let e = h
-        .fs
-        .setattr(
+    let e =
+        h.fs.setattr(
             h.req,
             ino,
             None,
@@ -498,9 +497,8 @@ async fn file_size_cap_is_honest_efbig_and_the_last_byte_round_trips() {
         let io: std::io::Error = e.into();
         assert_eq!(io.raw_os_error(), Some(libc::EFBIG), "truncate → EFBIG");
     }
-    let e = h
-        .fs
-        .write(
+    let e =
+        h.fs.write(
             h.req,
             ino,
             0,

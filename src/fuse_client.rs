@@ -7621,6 +7621,22 @@ impl SqueezefsFilesystem {
         self.dismount_once.load(Ordering::Acquire)
     }
 
+    /// The largest representable file size: block indices are **u32**
+    /// across the striped layout (`block_map` keys, patch/extent records,
+    /// prefetch lanes), so content past `block_size × (2^32 − 1)` cannot
+    /// be addressed. Every size-growing entry point (write, truncate,
+    /// fallocate, copy_file_range dest) refuses EFBIG at this boundary —
+    /// the pre-fix paths silently wrapped the index mod 2^32 and read
+    /// back zeros (fstests generic/525; pinned in
+    /// tests/sparse_write_bounded_tests.rs). Widening the index space is
+    /// an on-disk layout-key change; at the default 4 MiB block size the
+    /// cap is ~16 EiB−4 MiB, far past the i64 VFS ceiling — only small
+    /// custom block sizes ever observe it.
+    fn max_file_size(&self) -> u64 {
+        let bs = self.router.block_size.load(Ordering::Relaxed);
+        (i64::MAX as u64).min(bs.saturating_mul(u32::MAX as u64))
+    }
+
     fn mode_to_file_type(&self, mode: u32) -> FileType {
         match mode & libc::S_IFMT {
             libc::S_IFDIR => FileType::Directory,
@@ -9238,6 +9254,15 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(Errno::from(libc::EACCES));
         }
 
+        // The representable maximum: block indices are u32 across the
+        // striped layout, so files cap at block_size × (2^32 − 1). Beyond
+        // it the pre-fix path silently wrapped the block index mod 2^32
+        // and read back zeros (fstests generic/525) — refuse EFBIG loud
+        // (pinned in tests/sparse_write_bounded_tests.rs).
+        if offset.saturating_add(data.len() as u64) > self.max_file_size() {
+            return Err(Errno::from(libc::EFBIG));
+        }
+
         // D1.d: this open generation now has flushable state.
         self.mark_handle_dirty(ino);
 
@@ -9599,8 +9624,12 @@ impl Filesystem for SqueezefsFilesystem {
             let mut size_to_set = None;
             let mut mode_to_set = None;
             if let Some(size) = set_attr.size {
-                const MAX_FILE_SIZE: u64 = i64::MAX as u64;
-                if size > MAX_FILE_SIZE {
+                // The representable maximum is block_size × (2^32 − 1)
+                // (u32 block indices — see `max_file_size`); beyond it the
+                // pre-fix path wrapped indices mod 2^32 (fstests
+                // generic/525). The old i64::MAX guard was never the real
+                // boundary.
+                if size > self.max_file_size() {
                     return Err(Errno::from(libc::EFBIG));
                 }
                 size_to_set = Some(size);
@@ -10272,6 +10301,12 @@ impl Filesystem for SqueezefsFilesystem {
         // read-only here).
         self.mark_handle_dirty(inode_out);
 
+        // u32 block-index representability (see `max_file_size`) — EFBIG
+        // past the cap, like write/truncate (generic/525).
+        if off_out.saturating_add(length) > self.max_file_size() {
+            return Err(Errno::from(libc::EFBIG));
+        }
+
         let src_path = format!("inode_{}", inode);
         let dest_path = format!("inode_{}", inode_out);
 
@@ -10860,6 +10895,12 @@ impl Filesystem for SqueezefsFilesystem {
         // fall back instead of silently corrupting via the extend path below.
         if mode & (COLLAPSE_RANGE | INSERT_RANGE) != 0 {
             return Err(Errno::from(libc::EOPNOTSUPP));
+        }
+
+        // u32 block-index representability (see `max_file_size`) — EFBIG
+        // past the cap, like write/truncate (generic/525).
+        if offset.saturating_add(length) > self.max_file_size() {
+            return Err(Errno::from(libc::EFBIG));
         }
 
         // PUNCH_HOLE / ZERO_RANGE: the range must read back as zeros (a hole).

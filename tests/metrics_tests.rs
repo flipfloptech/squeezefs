@@ -145,7 +145,6 @@ async fn stats_snapshot_getattr_size_matches_served_bytes_under_churn() {
 
     // Two full "cat" cycles with counter churn in the middle of each —
     // the storm-session reality (phase snapshots bracket 100 k-op storms).
-    let mut prev_size: Option<u64> = None;
     for round in 0..2u64 {
         // cat: LOOKUP …
         let _entry = fs
@@ -185,29 +184,23 @@ async fn stats_snapshot_getattr_size_matches_served_bytes_under_churn() {
             .expect("a full-size read of .stats must parse as JSON");
         assert!(parsed.get("metrics").is_some(), "snapshot carries metrics");
 
-        // The splice-path reality (measured: `cat` reads via splice, whose
-        // read bound is a possibly ONE-GENERATION-STALE `i_size` no matter
-        // what the daemon replies — FOPEN_DIRECT_IO exempts only the
-        // plain-`read(2)` path, and 4 KiB quantization still tore whenever
-        // the storm grew the payload across a quantum): the size must be
-        // CONSTANT, not merely quantized. `.stats` pads to a fixed 256 KiB
-        // floor (trailing whitespace — legal JSON; 6× headroom over the
-        // rig-enabled ~41 KB payload), so `i_size` never moves between
-        // generations and every stale bound covers the whole payload.
+        // Exact-size contract (2026-07-22, padding retirement): the
+        // constant-size floor padding that used to blunt the splice-path
+        // stale-`i_size` bound was deleted — `cat .config`/`.stats`
+        // printed its whitespace tail as garbage. Coherence now rides the
+        // snapshot protocol alone: OPEN pins generation + size, GETATTR
+        // never regenerates once published, and BOTH virtual inodes reply
+        // zero attr/entry TTLs so every fstat reaches the daemon and the
+        // kernel's copy bound is always the pinned generation's exact
+        // size. The payload itself must carry no tail padding beyond one
+        // final newline.
+        let raw = std::str::from_utf8(&data.data).expect(".stats is UTF-8");
         assert_eq!(
-            attr.attr.size,
-            256 * 1024,
-            "round {round}: .stats payload size is CONSTANT (256 KiB floor) \
-             so a stale-i_size splice bound always covers the full payload"
+            raw,
+            format!("{}\n", raw.trim_end()),
+            "round {round}: .stats must carry NO tail padding beyond one \
+             final newline"
         );
-        if let Some(prev) = prev_size {
-            let clamped = &data.data[..std::cmp::min(prev as usize, data.data.len())];
-            let clamped_parsed: serde_json::Value = serde_json::from_slice(clamped).expect(
-                "a stale-i_size-clamped snapshot must still parse (padding-only truncation)",
-            );
-            assert!(clamped_parsed.get("metrics").is_some());
-        }
-        prev_size = Some(attr.attr.size);
         fs.release(req, STATS_INODE, opened.fh, 0, 0, false)
             .await
             .expect("release .stats");

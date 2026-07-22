@@ -2616,54 +2616,22 @@ pub struct ClientStats {
     pub cache_misses: u64,
 }
 
-/// `.stats` payload size floor: every generation is tail-padded (spaces +
-/// final newline — legal JSON) to this CONSTANT length, chosen with ~6×
-/// headroom over the rig-enabled ~41 KB payload. See
-/// [`pad_virtual_payload`] for why constancy (not mere quantization) is
-/// the contract.
-const STATS_PAYLOAD_FLOOR: usize = 256 * 1024;
-
-/// `.config` twin of [`STATS_PAYLOAD_FLOOR`] (config JSON is ~2–4 KB).
-const CONFIG_PAYLOAD_FLOOR: usize = 64 * 1024;
-
-/// Tail-pad a virtual-inode payload (`.stats` / `.config` JSON) with
-/// spaces + a final newline to the CONSTANT `floor` length. Trailing
-/// whitespace is legal JSON, so parsers are unaffected — and size
-/// CONSTANCY is what makes snapshot reads robust against the kernel's
-/// splice read path, whose copy bound is a possibly one-generation-stale
-/// `i_size` no matter what the daemon replies (`FOPEN_DIRECT_IO` exempts
-/// only the plain-`read(2)` path; `cat` uses splice — measured in the M2
-/// acceptance session, where 4 KiB quantization still tore whenever a
-/// storm grew the payload across a quantum). With a constant size,
-/// `i_size` never moves between generations, so every stale bound covers
-/// the whole payload and truncation can only ever remove padding.
-/// Overflow (payload > floor) falls back to 4 KiB quantization — reads
-/// stay correct through the plain-read path and the GETATTR published-
-/// size contract; only the stale-splice-bound immunity degrades (loud —
-/// warn once per process). Paired with the GETATTR published-size
-/// contract; pinned by
-/// `metrics_tests::stats_snapshot_getattr_size_matches_served_bytes_under_churn`.
-fn pad_virtual_payload(mut s: String, floor: usize) -> String {
-    let target = if s.len() < floor {
-        floor
-    } else {
-        static OVERFLOW_WARNED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !OVERFLOW_WARNED.swap(true, Ordering::Relaxed) {
-            warn!(
-                "virtual payload exceeds its constant-size floor ({} > {floor}): \
-                 falling back to 4 KiB quantization — raise the floor to restore \
-                 stale-splice-bound immunity",
-                s.len()
-            );
-        }
-        (s.len() + 1).div_ceil(4096) * 4096
-    };
-    let pad = target - s.len() - 1;
-    s.reserve(pad + 1);
-    for _ in 0..pad {
-        s.push(' ');
-    }
+/// Finish a virtual-inode payload (`.stats` / `.config` JSON): the exact
+/// pretty-printed JSON plus ONE final newline — no tail padding. The
+/// historical constant-size floor padding (`pad_virtual_payload`, retired
+/// 2026-07-22 on user report: `cat .config` printed a screenful of
+/// whitespace) papered over the kernel's stale-`i_size` copy bound with
+/// up-to-256-KiB whitespace tails. Exact sizes are kept coherent by the
+/// snapshot protocol instead: OPEN pins the generation per fh AND
+/// publishes its size, GETATTR never regenerates once published, and
+/// both virtual inodes reply with ZERO attr/entry TTLs so every fstat
+/// reaches the daemon and reports the pinned generation's exact size
+/// (`FOPEN_DIRECT_IO` already exempts plain reads). Single-reader `cat`
+/// is exact by construction; concurrent readers race last-open-wins
+/// (bounded, documented residual — see the OPEN pin point). Pinned by
+/// `metrics_tests::stats_snapshot_getattr_size_matches_served_bytes_under_churn`
+/// and `phantom_backend0_tests::test_config_payload_exact_size_no_tail_padding`.
+fn finish_virtual_payload(mut s: String) -> String {
     s.push('\n');
     s
 }
@@ -3721,19 +3689,36 @@ impl SqueezefsFilesystem {
         // not a volume: surfacing it here (pre-fix) made it a phantom entry
         // in `.config` on every multi-volume mount. Only a bare router (no
         // named registrations — offline tools, tests) still reports its
-        // default slot under the legacy name.
-        let mut data_volumes = serde_json::Map::new();
-        let mut data_vol_names: Vec<String> = self
+        // default slot under the legacy name. Entries carry the volume's
+        // REAL backing device path (the registered device — user report
+        // 2026-07-22: the name was recycled into `backing_dev`), its
+        // durable id, and its canonical `sqdata://` URI; the durable
+        // record snapshot fixes a deterministic (volume) order.
+        let records = self.router.backend_router.volume_records();
+        let mut data_vol_names: Vec<String> = Vec::new();
+        let mut covered = std::collections::HashSet::new();
+        for rec in records.iter() {
+            if self.router.backend_router.backends.contains_key(&rec.id) {
+                data_vol_names.push(rec.id.clone());
+                covered.insert(rec.id.clone());
+            }
+        }
+        let mut recordless: Vec<String> = self
             .router
             .backend_router
             .backends
             .iter()
             .map(|item| item.key().clone())
+            .filter(|name| !covered.contains(name))
             .collect();
+        recordless.sort();
+        data_vol_names.extend(recordless);
         if data_vol_names.is_empty() {
             data_vol_names.push("backend_0".to_string());
         }
 
+        let mut data_volumes = serde_json::Map::new();
+        let mut data_paths: Vec<String> = Vec::new();
         for name in data_vol_names {
             let is_unhealthy = self
                 .router
@@ -3742,17 +3727,43 @@ impl SqueezefsFilesystem {
                 .contains_key(&name);
             let status = if is_unhealthy { "disabled" } else { "enabled" };
             let health = self.router.backend_router.get_backend_health(&name);
+            // The registered device is authoritative for the live path;
+            // the durable record backs it up; the bare-router default
+            // slot falls through to the default device.
+            let backing_dev = self
+                .router
+                .backend_router
+                .backends
+                .get(&name)
+                .map(|be| be.device.device_path.clone())
+                .or_else(|| {
+                    records
+                        .iter()
+                        .find(|r| r.id == name)
+                        .map(|r| r.backing_dev.clone())
+                })
+                .unwrap_or_else(|| {
+                    self.router
+                        .backend_router
+                        .default_device
+                        .device_path
+                        .clone()
+                });
             data_volumes.insert(
                 name.clone(),
                 serde_json::json!({
-                    "backing_dev": name,
+                    "id": name,
+                    "backing_dev": backing_dev,
+                    "uri": format!("sqdata://{backing_dev}"),
                     "status": status,
                     "health": health,
                 }),
             );
+            data_paths.push(backing_dev);
         }
 
         let mut metadata_volumes = serde_json::Map::new();
+        let mut meta_paths: Vec<String> = Vec::new();
         if let Some(ref meta) = self.meta_backend {
             for (idx, vol) in meta.volumes.iter().enumerate() {
                 let name = format!("meta_volume_{}", idx);
@@ -3764,14 +3775,16 @@ impl SqueezefsFilesystem {
                     name,
                     serde_json::json!({
                         "backing_dev": path_str,
+                        "uri": format!("sqmeta://{path_str}"),
                         "status": status,
                         "health": health,
                     }),
                 );
+                meta_paths.push(path_str);
             }
         }
 
-        let config_obj = serde_json::json!({
+        let mut config_obj = serde_json::json!({
             "client_version": crate::version::version_line(),
             "format": format_fields,
             "data_volumes": data_volumes,
@@ -3780,11 +3793,24 @@ impl SqueezefsFilesystem {
             "gid": self.gid,
             "block_size": self.router.block_size.load(Ordering::Relaxed),
         });
+        // Canonical joined-member URI spellings (`parse_block_uri`
+        // grammar: `scheme://p1,p2` in volume order) — the exact strings
+        // the CLI verbs accept. Only mounts with a metadata backend can
+        // name their set.
+        if let Some(obj) = config_obj.as_object_mut() {
+            if !meta_paths.is_empty() {
+                obj.insert(
+                    "sqmeta_uri".to_string(),
+                    serde_json::json!(format!("sqmeta://{}", meta_paths.join(","))),
+                );
+            }
+            obj.insert(
+                "sqdata_uri".to_string(),
+                serde_json::json!(format!("sqdata://{}", data_paths.join(","))),
+            );
+        }
 
-        pad_virtual_payload(
-            serde_json::to_string_pretty(&config_obj).unwrap_or_default(),
-            CONFIG_PAYLOAD_FLOOR,
-        )
+        finish_virtual_payload(serde_json::to_string_pretty(&config_obj).unwrap_or_default())
     }
 
     fn get_stats_attr(&self, size: u64) -> FileAttr {
@@ -4644,10 +4670,7 @@ impl SqueezefsFilesystem {
             }
         }
 
-        pad_virtual_payload(
-            serde_json::to_string_pretty(&stats_obj).unwrap_or_default(),
-            STATS_PAYLOAD_FLOOR,
-        )
+        finish_virtual_payload(serde_json::to_string_pretty(&stats_obj).unwrap_or_default())
     }
 
     fn get_config_attr(&self, size: u64) -> FileAttr {
@@ -8399,7 +8422,10 @@ impl Filesystem for SqueezefsFilesystem {
             self.latest_config_size.store(size, Ordering::Release);
             let attr = self.get_config_attr(size);
             return Ok(ReplyEntry {
-                ttl: Duration::from_secs(1),
+                // Zero TTL (like `.stats`): with exact-size payloads
+                // (no floor padding) every fstat must reach the daemon
+                // so the kernel's copy bound is never a stale size.
+                ttl: Duration::from_secs(0),
                 attr,
                 generation: 1,
             });
@@ -8503,7 +8529,9 @@ impl Filesystem for SqueezefsFilesystem {
             };
             let attr = self.get_config_attr(size);
             return Ok(ReplyAttr {
-                ttl: Duration::from_secs(1),
+                // Zero TTL (like `.stats`): exact-size payloads need
+                // every fstat served fresh from the published pin.
+                ttl: Duration::from_secs(0),
                 attr,
             });
         }
@@ -10145,8 +10173,10 @@ impl Filesystem for SqueezefsFilesystem {
                             inode: CONFIG_INODE,
                             generation: 1,
                             attr,
-                            entry_ttl: Duration::from_secs(1),
-                            attr_ttl: Duration::from_secs(1),
+                            // Zero TTLs (like `.stats`): exact-size
+                            // payloads must never serve a cached size.
+                            entry_ttl: Duration::from_secs(0),
+                            attr_ttl: Duration::from_secs(0),
                             offset: READDIR_VIRTUAL_CONFIG_COOKIE as i64,
                         });
                     }

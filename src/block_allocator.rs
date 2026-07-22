@@ -3,6 +3,17 @@ use crate::error::Result;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// FIND-RW5-A double-release forensics tape (env-gated by
+/// `SQUEEZEFS_FREE_FORENSICS`, diagnostic-only): the last recorded free
+/// backtrace per offset, shared by `finish_free` (records + pairs a
+/// DOUBLE FREE) and `begin_free`'s refusal arm (pairs a REFUSED release
+/// with the first free that emptied the refcount).
+fn free_forensics_tape() -> &'static std::sync::Mutex<std::collections::HashMap<u64, String>> {
+    static TAPE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, String>>> =
+        std::sync::OnceLock::new();
+    TAPE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Physical allocation stride of every data-volume allocator: block
 /// offsets are minted as `block_idx * CHUNK_SIZE`, so a stored block
 /// image longer than this tramples the NEXT chunk's bytes on the device
@@ -472,16 +483,19 @@ impl BlockAllocator {
             found_idx = Some(*item);
             break;
         }
-        let block_idx = if let Some(idx) = found_idx {
+        let (block_idx, src) = if let Some(idx) = found_idx {
             if self.free_blocks.remove(&idx).is_some() {
-                idx
+                (idx, "freelist")
             } else {
-                self.next_fresh_block()?
+                (self.next_fresh_block()?, "fresh")
             }
         } else {
-            self.next_fresh_block()?
+            (self.next_fresh_block()?, "fresh")
         };
-        log::debug!("allocate_block: offset {}", block_idx * self.chunk_size);
+        log::debug!(
+            "allocate_block: offset {} ({src})",
+            block_idx * self.chunk_size
+        );
         Ok(self.claim_block_idx(block_idx))
     }
 
@@ -490,7 +504,20 @@ impl BlockAllocator {
     /// PR VL6a fsck epoch-latch record. Returns the byte offset.
     fn claim_block_idx(&self, block_idx: u64) -> u64 {
         let offset = block_idx * self.chunk_size;
-        let _ = self.refcounts.insert_sync(offset, AtomicU32::new(1));
+        if self
+            .refcounts
+            .insert_sync(offset, AtomicU32::new(1))
+            .is_err()
+        {
+            // A lingering refcount entry at claim time means the offset was
+            // free-listed while a tracked owner existed — the double-owner
+            // mint observed from the OTHER side. Loud: this is never legal.
+            log::error!(
+                "CLAIM ANOMALY: offset {offset} claimed from the free list while a \
+                 refcount entry lingers (count={:?})",
+                self.refcount(offset)
+            );
+        }
         // New incarnation, not yet durable: cache fills must not publish until
         // the owner calls `publish_block` after its device write.
         self.mark_incarnation_unstable(offset);
@@ -584,8 +611,10 @@ impl BlockAllocator {
         {
             if terminal {
                 self.refcounts.remove_sync(&offset);
+                log::debug!("begin_free terminal: offset {offset}");
                 true
             } else {
+                log::debug!("begin_free nonterminal: offset {offset}");
                 false
             }
         } else {
@@ -593,6 +622,22 @@ impl BlockAllocator {
                 "begin_free REFUSED untracked offset {offset}: no refcount entry — \
                  double-release lineage (see block_untracked_free_refusals)"
             );
+            // Forensics (env-gated): pair the refused release's backtrace with
+            // the recorded FIRST free of this offset — names both halves of
+            // the double-release lineage even though the refusal never
+            // reaches finish_free's tape.
+            if std::env::var("SQUEEZEFS_FREE_FORENSICS").is_ok() {
+                let bt = std::backtrace::Backtrace::force_capture().to_string();
+                let first = free_forensics_tape()
+                    .lock()
+                    .unwrap()
+                    .get(&offset)
+                    .cloned()
+                    .unwrap_or_else(|| "<no recorded first free>".to_string());
+                log::error!(
+                    "REFUSED FREE FORENSICS offset {offset}:\n--- first free ---\n{first}\n--- refused release ---\n{bt}"
+                );
+            }
             crate::fuse_client::METRICS
                 .block_untracked_free_refusals
                 .fetch_add(1, Ordering::Relaxed);
@@ -615,12 +660,8 @@ impl BlockAllocator {
         // FIND-RW5-A forensics (env-gated, diagnostic-only): record every
         // free's capture so a DOUBLE FREE names BOTH call sites.
         if std::env::var("SQUEEZEFS_FREE_FORENSICS").is_ok() {
-            static TAPE: std::sync::OnceLock<
-                std::sync::Mutex<std::collections::HashMap<u64, String>>,
-            > = std::sync::OnceLock::new();
-            let tape = TAPE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
             let bt = std::backtrace::Backtrace::force_capture().to_string();
-            let mut tape = tape.lock().unwrap();
+            let mut tape = free_forensics_tape().lock().unwrap();
             if let Some(first) = tape.get(&offset) {
                 if self.free_blocks.contains(&block_idx) {
                     log::error!(
@@ -809,7 +850,20 @@ impl BlockAllocator {
                 {
                     {
                         if let Some(layout) = layout_opt {
-                            if layout.file_type == "striped" {
+                            // FIND-RW5-A remount face: STAGED files carry
+                            // durable block_map entries too — the staged
+                            // truncate-clip (`bk:0:len`) and the StorageFull
+                            // durable spills. Gating this walk on "striped"
+                            // left those live offsets untracked AND
+                            // free-listed on a fresh allocator (the gap-fill
+                            // claims nothing for them), so `allocate_block`
+                            // minted the SAME offset to a second owner while
+                            // the staged file's map still bound it — the
+                            // generic/464 post-remount never-settles EIO +
+                            // refused-untracked-free storm. Seed refcounts
+                            // for EVERY layout that carries durable block
+                            // references, regardless of file_type.
+                            if layout.file_type == "striped" || layout.file_type == "staged" {
                                 // 1. Check for indirect block map
                                 if let Some(ref map_id) = layout.block_map_id {
                                     if map_id.starts_with("indirect:") {

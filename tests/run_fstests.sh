@@ -402,12 +402,25 @@ EOF
 #                     RUNNING (and their punch/prealloc coverage arms) the
 #                     day a FIEMAP-capable kernel/fuse lands.
 #   FAIL (deterministic, platform-class — expected-fail, kept as canaries):
-#     003 = atime semantics: FUSE attr caching + writeback-cache mount keep
-#           relatime/strictatime updates kernel-side and remount-unstable
-#           (atime not updated on read; ctime jitter across remount). Not a
-#           data-path bug; revisit only if we adopt FOPEN_KEEP/attr-timeout
-#           rework. A DIFFERENT diff than the 10 known atime/ctime ERROR
-#           lines = regression.
+#     003 = noatime by design (user ruling, VL8 item-3 adjudication: no
+#           read-path atime write exists — the JuiceFS reference-client
+#           posture; relatime/strictatime unsupported) + kernel-TTL attr
+#           observation. Expected shape re-pinned 2026-07-22 (VL10 release
+#           gate): exactly SIX ERROR lines — 4 × "access time has not been
+#           updated" (file1 first time / file2 / file3 second time / file3
+#           third time) + "change time has changed for file1 after
+#           remount" + "change time has changed after accessing file3
+#           second time". (Was 10 lines; the create-parent-attr-refresh
+#           fix 37f1c86 removed four ctime/mtime observation legs.) A
+#           DIFFERENT diff than those 6 lines = regression.
+#     192 = the SAME noatime-by-design class (adjudicated with 003,
+#           2026-07-22 — generic/192 measures the atime delta after a
+#           sleeping read; _require_atime notruns ceph/"atime not
+#           maintained" filesystems upstream but knows no generic-fuse
+#           spelling, so it runs here). Expected shape: exactly
+#           "delta1 has value of 0" + "delta1 is NOT in range 5 .. 7"
+#           replacing the golden "delta1 is in range" (delta2 = mtime
+#           stays in range). Any other diff = regression.
 #     213 = thin provisioning: fallocate(mode=0) never reserves physical
 #           blocks (sparse/dynamic backend by design — statfs now reports
 #           honest capacity/allocated numbers per fix/real-statfs, but

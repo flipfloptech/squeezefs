@@ -144,6 +144,22 @@ while [ $# -gt 0 ]; do
     fi
 done
 
+# REMOUNT (mount -o remount,...) reaches subtype helpers too. It is a
+# VFS-flag flip on the LIVE attachment (MS_REMOUNT — e.g. generic/294's
+# remount,ro; 306/452 carry the same shape), NOT a new daemon: treating
+# it as a fresh mount made the helper wait 60s for the (legitimately
+# alive, mounted) daemon and fail the test. Hand it to the kernel
+# directly (-i skips helper re-entry).
+case ",$OPTS," in
+*,remount,*)
+    # LIBMOUNT_FORCE_MOUNT2: util-linux's new fsconfig() API re-submits
+    # the existing fuse params on reconfigure, which kernel fuse refuses
+    # ("No changes allowed in reconfigure"); the classic mount(2)
+    # MS_REMOUNT path flips the VFS flags only.
+    LIBMOUNT_FORCE_MOUNT2=always exec /usr/bin/mount -i -o "$OPTS" "$MNT"
+    ;;
+esac
+
 ALL_OPTS="fsname=$DEV"
 if [ -n "$OPTS" ]; then
     ALL_OPTS="$ALL_OPTS,$OPTS"

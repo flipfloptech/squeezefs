@@ -384,8 +384,8 @@ EOF
 # DETERMINISTIC EXPECTED RESULT of this tier (2026-07-11, post 285/617 +
 # staged-identity transient-zeros + 074 striped stale-fill fixes).
 # Anything deviating from this table is a REGRESSION:
-#   PASS (deterministic): 001 008 013 069 074 075 091 112 127 263 285 469
-#                     616 617 618
+#   PASS (deterministic): 001 008 013 069 074 075 091 112 127 263 285 464
+#                     469 616 617 618
 #     ... 074's THIRD family (the fstest.4 -F/-mS stale-by-one-loop unit,
 #           VL8 catalog item 1) = FIXED 2026-07-21
 #           (fix/write-wedge-and-074: open() ignored O_TRUNC while fuse3
@@ -416,21 +416,32 @@ EOF
 #           213 legs pass; exactly that one missing line is the expected
 #           diff (re-verified 2026-07-12 on the honest-statfs branch:
 #           identical diff shape, 2x rolls).
-#     464 = staged-write-storm ring-pressure EIO (FIND-RW5-A, PRE-EXISTING
-#           — A/B-verified on pre-program 04889b6, which fails the same
-#           EIO class and additionally WEDGES; the current tip fails
-#           bounded-loud and never wedges): 464's 16-proc
+#   464 EIO class (FIND-RW5-A, the staged-write-storm ring-pressure EIO)
+#           = FIXED 2026-07-21 — the charter LANDED (fix/write-wedge-and-074;
+#           counted x10 fully green in
+#           .benchmarks/2026-07-21-wedge-and-074-fixes.md). 464 moved
+#           from expected-FAIL to expected-PASS above. Was: 464's 16-proc
 #           delalloc/append/sync_range storm over 200 files structurally
-#           oversubscribes this harness's 500MB staging ring; some
-#           whole-image staged replaces propagate StorageFull to the user
-#           write as EIO ("echo: write error" on line 46) instead of
-#           degrading to the durable-spill escalation. Never-lossy custody
-#           holds (dismount folds re-park loudly; recovery clean). Charter:
-#           rand-write program closing report §10 residual 8
-#           (.benchmarks/2026-07-17-rand-write-program-closing.md). Flips
-#           to expected-PASS when that charter lands. May occasionally
-#           pass by-run (it passed the 2026-07-15 M11 sweep); a pass is
-#           NOT a regression — a DIFFERENT failure signature is.
+#           oversubscribes this harness's 500MB staging ring and user
+#           writes surfaced EIO. Six convicted faces, all pinned in
+#           tests/rw5a_never_lossy_tests.rs: (1) StorageFull propagation
+#           from the fold-rider re-stage + clone staged arms (now durable
+#           spills, counted staged_spill_escalations); (2) rebind
+#           exhaustion — cohort fill inheritance defeated the stripe
+#           escalation (now device-true + stripe-locked escalated
+#           attempts, bound 24 w/ backoff); (3) RELEASE dropped the shared
+#           op lease with other handles open (now last-close only + one
+#           fresh-lease write retry); (4) duplicate reclaim (RELEASE+FORGET
+#           both enqueued -> delete_file twice -> block double-free; now
+#           reclaim_inflight single-drive guard); (5) merge RMW based on
+#           the lagging backend over a DIRTY RAM layout (now dirty-
+#           authority rule); (6) untracked frees freed unconditionally —
+#           the second half of any double-release minted one offset to two
+#           live owners (now refused-and-counted,
+#           block_untracked_free_refusals; block_double_frees is a
+#           must-stay-0 tripwire). ANY 464 diff (EIO line, wedge, or
+#           other) IS now a regression — capture the daemon logs and the
+#           DOUBLE FREE / REFUSED untracked / did-not-settle greps first.
 #           The 464 WEDGE mode (VL8 item 2 capture 2, writes-only stuck
 #           census) = FIXED 2026-07-21 (fix/write-wedge-and-074: the
 #           staged-ledger scc bucket was a second Hang-1 lock population

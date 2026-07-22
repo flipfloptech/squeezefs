@@ -8,6 +8,22 @@
 //! knowledge stays in the tree as `//` comments at the clap definition
 //! sites — it just must not be ON DISPLAY in `--help`.
 //!
+//! Style tripwires (user ruling 2026-07-22): removing the anchors was not
+//! enough — the register must be man-page prose (`man mount`), not
+//! design-doc prose. Mechanical checks so the register cannot bit-rot:
+//!
+//! 1. Every entry in every `Commands:` listing is a one-line summary —
+//!    the description column is at most 72 characters (essay `about`s
+//!    belong in `long_about`, shown on the subcommand's own page).
+//! 2. No house editorial voice anywhere in help output: banned phrases
+//!    `honestly`, `loudly`, ` loud`, `refuses everything`, `rides `,
+//!    `the numbers printed`. State the behavior instead ("fails with an
+//!    explanation", "exits nonzero").
+//! 3. No prose ALL-CAPS emphasis (METADATA, OFFLINE, WITH, ...). Genuine
+//!    acronyms and arg-name references are allowlisted explicitly;
+//!    `<PLACEHOLDER>`/`[bracketed]` spans are clap syntax, not prose, and
+//!    are stripped before the scan.
+//!
 //! Deliberately ALLOWED (operator-facing product vocabulary, not internal
 //! anchors): the defrag fragmentation axes D1–D4 (each is a stats-inode
 //! gauge `frag_d1_*`..`frag_d4_*` and the defrag help defines them
@@ -23,6 +39,7 @@
 
 use regex::Regex;
 use std::process::Command;
+use std::sync::OnceLock;
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_squeezefs")
@@ -49,12 +66,19 @@ fn help_for(path: &[String]) -> String {
     )
 }
 
-/// Parse the subcommand names out of a clap help page's `Commands:`
+/// One row of a clap `Commands:` listing: the subcommand name and the
+/// rendered description column (everything after the name, trimmed).
+struct CommandRow {
+    name: String,
+    description: String,
+}
+
+/// Parse the subcommand rows out of a clap help page's `Commands:`
 /// section. Subcommand rows are indented exactly two spaces; wrapped
 /// description continuations are indented deeper and skipped. The
 /// auto-generated `help` subcommand is skipped (its page is the parent's).
-fn subcommands_of(help: &str) -> Vec<String> {
-    let mut subs = Vec::new();
+fn command_rows(help: &str) -> Vec<CommandRow> {
+    let mut rows = Vec::new();
     let mut in_commands = false;
     for line in help.lines() {
         if line.trim_end() == "Commands:" {
@@ -72,13 +96,56 @@ fn subcommands_of(help: &str) -> Vec<String> {
             if !rest.starts_with(' ') {
                 if let Some(name) = rest.split_whitespace().next() {
                     if name != "help" {
-                        subs.push(name.to_string());
+                        let description = rest[name.len()..].trim_start().trim_end().to_string();
+                        rows.push(CommandRow {
+                            name: name.to_string(),
+                            description,
+                        });
                     }
                 }
             }
         }
     }
-    subs
+    rows
+}
+
+/// One walked node of the CLI tree: the command path (root = empty) and
+/// its full `--help` page.
+struct HelpPage {
+    path: String,
+    help: String,
+}
+
+/// Walk the full CLI tree once and cache every `--help` page — all the
+/// tripwires below scan the same collection.
+fn help_pages() -> &'static [HelpPage] {
+    static PAGES: OnceLock<Vec<HelpPage>> = OnceLock::new();
+    PAGES.get_or_init(|| {
+        fn walk(path: &mut Vec<String>, pages: &mut Vec<HelpPage>) {
+            let help = help_for(path);
+            let rows = command_rows(&help);
+            pages.push(HelpPage {
+                path: path.join(" "),
+                help,
+            });
+            for row in rows {
+                path.push(row.name);
+                walk(path, pages);
+                path.pop();
+            }
+        }
+        let mut pages = Vec::new();
+        walk(&mut Vec::new(), &mut pages);
+        // Parser self-check: the CLI tree has ~85 nodes today; walking far
+        // fewer means the `Commands:` parser rotted, not that the CLI shrank.
+        assert!(
+            pages.len() >= 60,
+            "help-tree walk visited only {} nodes — the subcommand \
+             parser is broken (expected the full CLI tree)",
+            pages.len()
+        );
+        pages
+    })
 }
 
 /// The forbidden internal-reference patterns. Each match is a leak.
@@ -126,34 +193,6 @@ fn forbidden_patterns() -> Vec<(Regex, &'static str)> {
     .collect()
 }
 
-/// Recursively walk the full CLI tree, collecting every forbidden-pattern
-/// hit with its command path and offending help line.
-fn walk(
-    path: &mut Vec<String>,
-    patterns: &[(Regex, &'static str)],
-    violations: &mut Vec<String>,
-    visited: &mut usize,
-) {
-    *visited += 1;
-    let help = help_for(path);
-    for line in help.lines() {
-        for (re, label) in patterns {
-            if re.is_match(line) {
-                violations.push(format!(
-                    "`squeezefs {} --help` leaks {label}:\n    {}",
-                    path.join(" "),
-                    line.trim()
-                ));
-            }
-        }
-    }
-    for sub in subcommands_of(&help) {
-        path.push(sub);
-        walk(path, patterns, violations, visited);
-        path.pop();
-    }
-}
-
 /// The tripwire: no `--help` page anywhere in the CLI tree may display an
 /// internal design anchor, key-decision number, PR-ladder name, or
 /// program codename.
@@ -161,15 +200,19 @@ fn walk(
 fn test_help_tree_contains_no_internal_design_anchors() {
     let patterns = forbidden_patterns();
     let mut violations = Vec::new();
-    let mut visited = 0usize;
-    walk(&mut Vec::new(), &patterns, &mut violations, &mut visited);
-    // Parser self-check: the CLI tree has ~85 nodes today; walking far
-    // fewer means the `Commands:` parser rotted, not that the CLI shrank.
-    assert!(
-        visited >= 60,
-        "help-tree walk visited only {visited} nodes — the subcommand \
-         parser is broken (expected the full CLI tree)"
-    );
+    for page in help_pages() {
+        for line in page.help.lines() {
+            for (re, label) in &patterns {
+                if re.is_match(line) {
+                    violations.push(format!(
+                        "`squeezefs {} --help` leaks {label}:\n    {}",
+                        page.path,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+    }
     assert!(
         violations.is_empty(),
         "internal engineering references on display in --help ({} leaks):\n\n{}",
@@ -184,8 +227,12 @@ fn test_help_tree_contains_no_internal_design_anchors() {
 /// the root list and are walked automatically).
 #[test]
 fn test_help_walker_sees_top_level_verbs() {
-    let help = help_for(&[]);
-    let subs = subcommands_of(&help);
+    let root = &help_pages()[0];
+    assert_eq!(root.path, "", "the first walked page is the root");
+    let subs: Vec<String> = command_rows(&root.help)
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
     for verb in [
         "format", "mount", "umount", "status", "clients", "volume", "job", "fsck", "scrub",
         "defrag", "claim", "bench", "clone", "tune", "config", "df", "storage", "nvmeof",
@@ -195,4 +242,168 @@ fn test_help_walker_sees_top_level_verbs() {
             "root help must list `{verb}` (walker saw: {subs:?})"
         );
     }
+}
+
+// ===========================================================================
+// Man-page register (user ruling 2026-07-22)
+// ===========================================================================
+
+/// Style tripwire 1: every `Commands:` entry is a one-line summary.
+///
+/// The build does not enable clap's `wrap_help`, so each row renders as
+/// one physical line whatever its length — "fits on one rendered line"
+/// is therefore enforced as the equivalent contract: the description
+/// column (the subcommand's short `about`) is at most 72 characters.
+/// Essays belong in `long_about`, shown on the subcommand's own page.
+#[test]
+fn test_commands_listings_are_one_line_summaries() {
+    const MAX_ABOUT_CHARS: usize = 72;
+    let mut violations = Vec::new();
+    for page in help_pages() {
+        for row in command_rows(&page.help) {
+            let len = row.description.chars().count();
+            if len > MAX_ABOUT_CHARS {
+                violations.push(format!(
+                    "`squeezefs {} --help` lists `{}` with a {len}-char description \
+                     (max {MAX_ABOUT_CHARS}):\n    {}",
+                    page.path, row.name, row.description
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "Commands-list entries must be one-line summaries ({} essays):\n\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
+}
+
+/// Style tripwire 2: no house editorial voice in any help output.
+/// Case-insensitive substrings; ` loud` (leading space) also nets
+/// "refuse loud"/"fails loud" without matching ordinary words.
+#[test]
+fn test_help_tree_contains_no_editorial_voice() {
+    let banned: [&str; 6] = [
+        "honestly",
+        "loudly",
+        " loud",
+        "refuses everything",
+        "rides ",
+        "the numbers printed",
+    ];
+    let mut violations = Vec::new();
+    for page in help_pages() {
+        for line in page.help.lines() {
+            let lower = line.to_lowercase();
+            for phrase in banned {
+                if lower.contains(phrase) {
+                    violations.push(format!(
+                        "`squeezefs {} --help` uses banned phrase `{phrase}`:\n    {}",
+                        page.path,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "editorial voice on display in --help ({} hits):\n\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
+}
+
+/// Acronyms and arg-name references that may legitimately render as
+/// all-caps words in help prose. Everything else that is an all-caps
+/// word of 3+ letters is prose emphasis and forbidden. Env-var names
+/// (`SQUEEZEFS_*`, `SUDO_*`) are allowed by prefix below.
+const CAPS_ALLOWLIST: &[&str] = &[
+    "ACL",
+    "AEAD",
+    "CLI",
+    "CPU",
+    "DPDK",
+    "FUSE",
+    "GID",
+    "JSON",
+    "LD_PRELOAD",
+    "LTP",
+    "LVM",
+    "NQN",
+    "NVME",
+    "O_DIRECT",
+    "O_SYNC",
+    "PEM",
+    "PID",
+    "POSIX",
+    "RAM",
+    "RPC",
+    "RSA",
+    "SIGKILL",
+    "SIGTERM",
+    "SPDK",
+    "SQPOLL",
+    "TARGET",
+    "TCP",
+    "TLS",
+    "TTL",
+    "UID",
+    "URI",
+    "UUID",
+];
+
+/// Strip clap syntax spans that are not prose: `<VALUE_NAME>` placeholders
+/// and `[bracketed]` annotations (`[OPTIONS]`, `[default: ...]`,
+/// `[env: ...]`, `[possible values: ...]`).
+fn strip_non_prose(line: &str) -> String {
+    static ANGLE: OnceLock<Regex> = OnceLock::new();
+    static SQUARE: OnceLock<Regex> = OnceLock::new();
+    let angle = ANGLE.get_or_init(|| Regex::new(r"<[^<>]*>").expect("valid pattern"));
+    let square = SQUARE.get_or_init(|| Regex::new(r"\[[^\[\]]*\]").expect("valid pattern"));
+    square
+        .replace_all(&angle.replace_all(line, " "), " ")
+        .into_owned()
+}
+
+/// Style tripwire 3: no ALL-CAPS emphasis words in help prose
+/// (METADATA, OFFLINE, WITH, COHERENT, ...). A word is a violation when
+/// it has 3+ letters, every letter is uppercase, and it is neither in
+/// the explicit allowlist nor an env-var name.
+#[test]
+fn test_help_tree_contains_no_all_caps_emphasis() {
+    static WORD: OnceLock<Regex> = OnceLock::new();
+    let word = WORD.get_or_init(|| Regex::new(r"[A-Za-z0-9_]+").expect("valid pattern"));
+    let mut violations = Vec::new();
+    for page in help_pages() {
+        for line in page.help.lines() {
+            let prose = strip_non_prose(line);
+            for m in word.find_iter(&prose) {
+                let token = m.as_str();
+                let letters = token.chars().filter(|c| c.is_ascii_alphabetic()).count();
+                let all_upper = token
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+                if letters >= 3
+                    && all_upper
+                    && !CAPS_ALLOWLIST.contains(&token)
+                    && !token.starts_with("SQUEEZEFS_")
+                    && !token.starts_with("SUDO_")
+                {
+                    violations.push(format!(
+                        "`squeezefs {} --help` shouts `{token}`:\n    {}",
+                        page.path,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "ALL-CAPS emphasis on display in --help ({} shouts):\n\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
 }

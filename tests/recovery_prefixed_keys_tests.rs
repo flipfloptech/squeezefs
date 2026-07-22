@@ -571,3 +571,107 @@ async fn test_multi_volume_inline_map_remount_recovery_smoke() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 5. STAGED-layout durable block-map recovery (FIND-RW5-A remount face).
+//    generic/464's shape: a dirty dismount leaves STAGED files whose
+//    layouts carry durable `block_map` entries — the staged truncate-clip
+//    (`bk:0:len`) and the RW5-A StorageFull durable spills. The recovery
+//    walk gated seeding on `file_type == "striped"`, so a remount left
+//    those live offsets refcount-UNTRACKED and — worse — free-listed by
+//    the gap-fill: `allocate_block` hands the SAME offset to a new writer
+//    while the staged file's map still binds it (the two-live-owner mint;
+//    reads then never settle → the 464 post-remount EIO storms, and every
+//    later free of the stale binding is the REFUSED-untracked signature).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_staged_layout_block_map_recovery_seeds_refcounts() {
+    let _serial = serial().await;
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let specs = make_vol_specs(&["rp_soss1", "rp_soss2"], 256 * 1024 * 1024);
+    let meta = NamedTempFile::new().unwrap();
+    meta.as_file().set_len(256 * 1024 * 1024).unwrap();
+
+    let h = mount_h(&specs, meta.path(), true).await;
+
+    // Two staged files, one durable base block each: a bare `off:len`
+    // decorated key on the default slot (the truncate-clip / spill shape)
+    // and a prefixed `name://off:len` on the second volume.
+    let mut owned_offsets: Vec<(usize, u64, u64)> = Vec::new(); // (vol idx, ino, offset)
+    for (i, vol_idx) in [(0usize, 0usize), (1, 1)] {
+        let vol = &h.volumes[vol_idx];
+        let off = vol.allocator.allocate_block().await.expect("allocate");
+        vol.device
+            .write_block(off, bytes::Bytes::from(pattern_block(9, i)))
+            .await
+            .expect("write staged base block");
+        vol.allocator.publish_block(off);
+        let key = h.fs.router.backend_router.persist_block_key(&vol.name, off);
+        let stored = format!("{key}:{}", BLOCK); // size-carrying `bk:0:len`
+
+        let ino = h
+            .routed
+            .create(
+                1,
+                &format!("staged_recover_{i}.bin"),
+                libc::S_IFREG | 0o644,
+                1000,
+                1000,
+            )
+            .await
+            .expect("create")
+            .ino;
+        let mut map = std::collections::HashMap::new();
+        map.insert(0u32, stored);
+        let layout = LayoutMetadata {
+            file_type: "staged".to_string(),
+            size: BLOCK as u64,
+            block_map_id: None,
+            block_prefix: None,
+            file_id: Some(format!("staged_file_{i}")),
+            data_key: None,
+            block_map: Some(map),
+        };
+        let bytes = bincode::serialize(&layout).expect("serialize layout");
+        h.routed
+            .set_layout_and_size(ino, &bytes, layout.size)
+            .await
+            .expect("plant staged layout");
+        owned_offsets.push((vol_idx, ino, off));
+    }
+
+    // Simulated dirty-remount: fresh allocators, recovery walk.
+    drop(h);
+    let h2 = mount_h(&specs, meta.path(), false).await;
+    run_recovery(&h2).await;
+
+    for (vol_idx, _ino, off) in &owned_offsets {
+        let vol = &h2.volumes[*vol_idx];
+        let idx = off / CHUNK;
+        // The staged file's durable base block is refcount-live...
+        assert!(
+            vol.allocator.increment_refcount(*off),
+            "volume {}: staged-layout block offset {off} must be refcount-seeded \
+             by recovery (untracked => its later free is refused and its offset \
+             was free-listed to a second owner)",
+            vol.name
+        );
+        vol.allocator.begin_free(*off); // undo the probe's reference
+                                        // ...and NOT free-listed / double-allocatable.
+        let free = vol.allocator.get_free_blocks().await.unwrap();
+        assert!(
+            !free.contains(&idx),
+            "volume {}: staged-layout block idx {idx} sits in the free list after \
+             recovery — one allocation away from a second live owner",
+            vol.name
+        );
+        let fresh = vol.allocator.allocate_block().await.expect("allocate");
+        assert_ne!(
+            fresh, *off,
+            "volume {}: allocate_block handed out the staged file's live offset",
+            vol.name
+        );
+    }
+}

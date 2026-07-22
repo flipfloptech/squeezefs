@@ -1326,3 +1326,96 @@ async fn test_offline_remove_data_drains_to_retired() {
         .expect_err("undrain of a retired volume must refuse");
     assert!(!format!("{err}").is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// VL10 (G-VL-3 b): independent block moves overlap when unthrottled
+// ---------------------------------------------------------------------------
+
+/// The drain-vs-raw-copy floor measurement sat AT the 0.5 line because
+/// `move_one` ran as a strict serial pipeline: each block paid its read →
+/// write → verify → publish round-trips alone (3× the block's bytes in
+/// device traffic, serialized). At 100 % throttle the pass must overlap
+/// independent block moves so device time hides behind device time.
+///
+/// Instrument: park the FIRST publish via the pre-publish hook (the
+/// hook rides the blocking pool — a parked move must not stop its
+/// chunk-mates), then watch the `evacuate_inflight_bytes` copy gauge: a
+/// second in-flight move charges it to ≥ 2 blocks while the first is
+/// parked. The serial mover holds it at exactly 1 block forever (red).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_unthrottled_drain_overlaps_block_moves() {
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    let oss2 = make_file(dir.path(), "oss2", 4 << 30);
+    format_meta(&meta, &[&oss1, &oss2]).await;
+    let recs = base_format_config(&[&oss1, &oss2]).resolved_data_volumes();
+    let fx = open_fixture(&meta, &recs).await;
+
+    const NBLOCKS: usize = 16;
+    let ino = create_file(&fx, "overlap.bin").await;
+    let expected = striped_burst(&fx, ino, NBLOCKS).await;
+    let on_victim = victim_blocks_of(&fx, ino, "oss2").await;
+    assert!(
+        on_victim.len() >= 2,
+        "need ≥ 2 victim blocks for an overlap ({} placed)",
+        on_victim.len()
+    );
+
+    // Park the FIRST publish; every later publish passes through.
+    let (hit_tx, hit_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let go_rx = std::sync::Mutex::new(go_rx);
+    let fired = std::sync::atomic::AtomicBool::new(false);
+    squeezefs::jobs::set_evacuate_pre_publish_hook(Arc::new(move |_ino, _b| {
+        if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let _ = hit_tx.send(());
+            let _ = go_rx.lock().unwrap().recv();
+        }
+    }));
+
+    let job_id = fx
+        .fs
+        .admin_remove_data_volume("oss2", 100)
+        .await
+        .expect("remove-data admits");
+    hit_rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the mover must reach the parked publish");
+
+    // The first move is parked HOLDING its copy charge. A pipelined
+    // pass has already (or immediately) charged a second move; a serial
+    // pass can never exceed one block here.
+    let block = fx.fs.router.block_size.load(Ordering::Relaxed);
+    let mut max_seen = 0u64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let g = METRICS.evacuate_inflight_bytes.load(Ordering::Relaxed);
+        max_seen = max_seen.max(g);
+        if max_seen >= 2 * block {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    go_tx.send(()).expect("release the parked publish");
+
+    let end = fx
+        .fabric
+        .wait_terminal(&job_id, std::time::Duration::from_secs(120))
+        .await
+        .expect("terminal");
+    squeezefs::jobs::clear_evacuate_pre_publish_hook();
+    assert_eq!(end, JobState::Completed, "the drain must complete");
+    assert!(
+        max_seen >= 2 * block,
+        "unthrottled drain never overlapped block moves: copy gauge peaked at \
+         {max_seen} B (< 2 × {block} B) while a publish was parked — the pass \
+         is still the serial per-block pipeline"
+    );
+
+    // Overlap must not cost correctness.
+    assert_eq!(read_back(&fx, ino, NBLOCKS).await, expected);
+    assert!(victim_blocks_of(&fx, ino, "oss2").await.is_empty());
+    fx.close().await;
+}

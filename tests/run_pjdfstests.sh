@@ -81,6 +81,10 @@ elif command -v pacman &>/dev/null; then
 else
     echo "Warning: package manager not supported, assuming prerequisites are installed."
 fi
+# Arch keeps perl's core utilities (incl. prove) out of the default PATH.
+if [ -d /usr/bin/core_perl ]; then
+    export PATH="$PATH:/usr/bin/core_perl"
+fi
 if ! command -v prove &>/dev/null; then
     echo "ERROR: 'prove' (perl Test::Harness) not found." >&2
     exit 1

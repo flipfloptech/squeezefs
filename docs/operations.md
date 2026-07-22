@@ -27,6 +27,12 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
   - [External mount supervisor](#external-mount-supervisor-mount---daemon---supervise)
   - [Host auto-tuning (`squeezefs tune`)](#host-auto-tuning-squeezefs-tune)
   - [Other verbs](#other-verbs)
+- [Volume lifecycle & online maintenance](#volume-lifecycle--online-maintenance)
+  - [Data volumes](#data-volumes)
+  - [Metadata volumes](#metadata-volumes)
+  - [fsck / scrub](#fsck--scrub)
+  - [Defragmentation](#defragmentation)
+  - [Jobs & distributed execution](#jobs--distributed-execution)
 - [Observability](#observability)
   - [`df` / statfs semantics](#df--statfs-semantics)
   - [Fabric observability](#fabric-observability)
@@ -141,7 +147,7 @@ SqueezeFS moves **always forward** — no backwards compatibility. Refusals are 
 
 Kept here so stale scripts fail comprehensibly:
 
-> **Removed flags/verbs**: `--strict-meta-atomicity` (only ever gated v2 volumes; deleted with them), `squeezefs migrate` (deleted with v2), `mount --local-ips` (the socket-level multi-rail bonding was removed in the 2026-07-04 connection simplification — fabric multipath is the kernel NVMe initiator's domain), `mount --disk-cache-paths` (see [Breaking changes](#breaking-changes--migration-notes)), `squeezefs defrag` (removed 2026-07-17: the verb's engine was an unimplemented no-op that reported fake success — no fake surfaces; the jobs-layer `BlockMove` merge machinery it would drive remains, test-pinned, awaiting a real defrag program).
+> **Removed flags/verbs**: `--strict-meta-atomicity` (only ever gated v2 volumes; deleted with them), `squeezefs migrate` (deleted with v2), `mount --local-ips` (the socket-level multi-rail bonding was removed in the 2026-07-04 connection simplification — fabric multipath is the kernel NVMe initiator's domain), `mount --disk-cache-paths` (see [Breaking changes](#breaking-changes--migration-notes)), the `config data-volume add/remove/migrate` / `config metadata-volume add/remove/migrate` / `config … fsck` fake admin verbs (deleted 2026-07-19 in the volume-lifecycle program's honesty cleanup — they reported success without doing the work; their real successors are `squeezefs volume …` and `squeezefs fsck`, below). `squeezefs defrag` was removed 2026-07-17 for the same honesty reason and **returned as a real implementation in the 2026-07 volume-lifecycle program** — see [Volume lifecycle & online maintenance](#volume-lifecycle--online-maintenance).
 >
 > **NVMe-oF verb migration (2026-07-17, target-management program PR 2/N2** — `docs/design-nvmeof-target-management.md` §API): the whole `squeezefs storage nvmeof <verb>` surface **moved to the top-level `squeezefs nvmeof <verb>`**, and within it: `share --spdk`/`unshare --spdk` → `--target-stack {spdk|nvmet}` (default spdk; `unshare` now resolves the stack from the share ledger, never a flag); `restore-shares` → `restore` (and it works — the old registry truncated itself to `[]` on every root invocation, so share persistence had **never** worked; a pre-existing `/etc/squeezefs/nvmeof_shares.json` is retired to `.retired-by-rebuild` on the first mutating verb, and pre-rebuild live shares surface in `list` as foreign/unmanaged — as of milestone **N4b** the managed exit is **`squeezefs nvmeof adopt <subnqn>`**, which absorbs the live share into the ledger with `adopted_from: pre-rebuild` provenance and zero serving interruption; manual removal-first + re-share remains the documented fallback for shapes adopt refuses); `spdk-install`/`spdk-setup`/`spdk-start` → `nvmeof target install/setup/start` (live as of milestone N3, joined by the new `target stop`/`status`/`systemd-unit`; SPDK *sharing* went live with milestone **N4** — the default stack shares for real, and the interim loud-fail message is gone); `spdk-bind`/`spdk-unbind` **deleted** (PCIe vfio passthrough backing is a future program — v1 serves kernel block nodes and files, `bdev_aio` on the SPDK stack); share's silent 1 GiB sparse auto-create on a missing path **deleted** (refuse loud; `--create-size <sz>` is the explicit opt-in).
 
@@ -311,6 +317,79 @@ squeezefs tune
   squeezefs storage pool create <name> <disks...>     # + add/remove/delete/list
   squeezefs storage volume create <pool> <name> --size <sz>   # + extend/delete/list
   ```
+
+## Volume lifecycle & online maintenance
+
+The 2026-07 volume-lifecycle program (`docs/design-volume-lifecycle.md`; closing record `.benchmarks/2026-07-22-volume-lifecycle-closing.md`) shipped dynamic volume membership, online fsck with repair, and a real defragmenter. Everything long-running executes as a **maintenance job**: durable (survives crashes and remounts; resumes by re-run or `job resume`), pausable, duty-cycle throttled (`--throttle 1–100`, retunable live), visible to `squeezefs job list` both on the live mount and offline from the volume records.
+
+Every verb takes a **TARGET** that is either a live mountpoint (online — the operation runs on the mounted daemon through its admin lane) or a `sqmeta://` URI (offline — a short-lived coordinator takes the same exclusive writer guard as `format`; refused while anyone has the volume mounted).
+
+### Data volumes
+
+```bash
+squeezefs volume list <target>                     # durable ids, states, honest capacity math
+squeezefs volume add-data <target> <device>        # online add; auto-schedules a rebalance pass (--no-rebalance opts out)
+squeezefs volume remove-data <target> <volume-id>  # preflight -> drain (CoW evacuation) -> retire
+squeezefs volume undrain <target> <volume-id>      # cancel an in-flight drain; volume returns to active
+```
+
+- **Preflight is honest**: a remove that cannot fit the victim's census on the survivors is refused **with the numbers printed** (needed / available / in-flight transient / headroom). A running drain re-verifies at every checkpoint and self-pauses (`paused-capacity`) instead of running the survivors out of space.
+- A **draining** volume is excluded from new placement but **serves reads to completion**. Shared clone blocks move exactly once. Retired volume ids are permanent — they never come back.
+- Fill balance is also maintained continuously in the write path (balance-aware placement: emptier healthy volumes attract proportionally more new blocks; health always outranks balance). `defrag --rebalance` runs the bulk pass on demand.
+
+### Metadata volumes
+
+```bash
+squeezefs volume add-meta <sqmeta-uri> <new-device> --take-slots <n|list>  # OFFLINE: unmount first
+squeezefs volume remove-meta <sqmeta-uri> <victim-device>                  # OFFLINE: unmount first
+squeezefs volume migrate-meta-slot <mountpoint> <slot> <volume-index>      # ONLINE background job
+squeezefs volume repair-set <sqmeta-uri>                # reconcile membership stamps after a crashed change
+```
+
+- Metadata routing granularity is the **routing width** frozen at format (default = the metadata volume count at format). **W-granularity honesty**: a filesystem formatted with one metadata volume has W = 1 — one slot — so adding metadata volumes later cannot spread existing metadata (the verb warns loudly). Plan growth at format time with `format --meta-slots <n>`.
+- Membership changes are crash-safe: interrupted `add-meta`/`remove-meta` **re-run with the same arguments and converge**; `repair-set` reconciles the stamps when a crash left them mid-flip. Old binaries refuse lifecycle-marked sets loudly (forward-only).
+- Set changes drain local staging first, then rebind the staging generation — durable staged payloads survive the membership change.
+
+### fsck / scrub
+
+```bash
+squeezefs fsck <target> [--json] [--throttle N]        # detect: 7 classes, verified findings only, exit != 0 on findings
+squeezefs fsck <target> --scrub                        # add the C7 data scrub (AEAD/frame/readability per stored form)
+squeezefs fsck <sqmeta-uri> --shards k/N ...           # offline zero-coordination sharding; union with `fsck merge-reports`
+squeezefs fsck <target> --repair                       # plan per-class repairs (DRY RUN)
+squeezefs fsck <target> --repair --apply               # execute: quarantine-first, idempotent, verified findings only
+```
+
+Online fsck runs against the live daemon with **zero false positives by design** (every suspect is verified before it is reported — concurrent writes, drains, and parked work are exempted through the live registries, never guessed at). Repair is dry-run by default, quarantines before every discard (per-run quarantine dir + JSON manifest), and is honest where no redundancy exists: torn nodes and scrub-failed blocks are quarantined and reported, never fabricated. On plain (uncompressed, unencrypted) data the scrub can only verify readability — the report says so (`scrub_readability_only`).
+
+### Defragmentation
+
+```bash
+squeezefs defrag <target> --report-only        # measure the four axes; move nothing
+squeezefs defrag <target> --data [--volume id] # D1/D2: free-space contiguity + file locality movers
+squeezefs defrag <target> --meta               # D4: compact metadata btree nodes
+squeezefs defrag <target> --fold               # D3: kick parked/spilled extents through the fold (live mounts only)
+squeezefs defrag <target> --rebalance          # bulk placement rebalance across data volumes
+```
+
+Fragmentation is four measured axes with live gauges on `.stats` (`frag_d1_contiguity`, `frag_d1_reclaimable_tail`, `frag_d2_locality`, `frag_d3_pressure_bytes`, `frag_d4_dead_bset_ratio`). Movers are safe under concurrent load and honor the same job throttle.
+
+### Jobs & distributed execution
+
+```bash
+squeezefs job list <target>          # live or offline probe of the durable job records
+squeezefs job status|pause|resume|cancel|throttle <mountpoint> <job-id> [pct]
+squeezefs job worker <sqmeta-uri>    # enroll this client as a remote data-plane worker
+```
+
+Any client with storage access can enroll as a **remote worker** (`job worker`): it proves storage membership (an enrollment secret readable only with metadata-volume access), leases shards from the coordinator, and executes device-bound work (evacuation copies, scrub reads) under the coordinator's throttle. Safety model: remote workers write **only to coordinator-pre-allocated, unpublished destinations**; publication happens coordinator-side after verification, behind per-shard fencing; an expired lease's destinations are quarantined and never reused. Guarantee ladder for a paused/partitioned ("zombie") worker, strongest first:
+
+| Substrate | Fence for an expired worker | Residual window |
+|---|---|---|
+| Data namespaces with NVMe PR support | the coordinator holds a Write Exclusive – Registrants Only reservation while remote workers are enrolled and **preempts the expired host's registration** — the device itself rejects that host's resumed DMA (`job_remote_fence_mode = "pr"`) | none — quarantine reclaim is unconditionally safe |
+| No PR support | per-batch lease re-validation (a woken zombie aborts before its next batch) + destination quarantine (`job_remote_fence_mode = "deferred-reclaim"`) | a zombie pausing across job end into post-reclaim reallocation — documented residual; keep jobs short on such substrates |
+
+Side effect to know about: while a WERO reservation stands (remote workers enrolled on a PR-capable data namespace), **hosts that are not registered participants are write-blocked by the device** until the job ends. On plaintext (non-TLS) wires the coordinator verify-reads 100 % of remote-written bytes before publishing (≈ 2× read cost on remote-moved data); TLS deployments sample instead.
 
 ## Observability
 

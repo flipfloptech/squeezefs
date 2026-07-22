@@ -17,6 +17,7 @@ SqueezeFS is a high-performance distributed POSIX filesystem for Linux, built in
 - **Transparent compression & encryption.** Per-volume `lz4`/`zstd` compression and RSA-wrapped AES-256-GCM/ChaCha20 encryption, declared at format; compression is best-effort per block, so incompressible data is stored raw instead of expanding.
 - **Instant copy-on-write clones.** `squeezefs clone` duplicates a file's metadata without copying block data; block reference counts track the sharing.
 - **Managed NVMe-oF targets, dual-stack.** `squeezefs nvmeof` shares, restores, and adopts target subsystems on SPDK (default) or kernel nvmet, backed by a write-ahead share ledger; refusals are loud and name the exact remedy.
+- **Online volume lifecycle & maintenance.** Add and remove metadata and data volumes with honest capacity preflight and automatic copy-on-write migration; online fsck with verified findings and per-class quarantine-first repair; a four-axis online defragmenter; all long-running maintenance runs as pausable, percentage-throttled background jobs that survive crashes and can be distributed across mounted clients.
 - **Real observability.** Live daemon metrics as JSON on the virtual `.stats` inode; `status`, `clients`, and `df` verbs answer from the volumes themselves — no live mount required.
 - **Host auto-tuning.** `squeezefs tune` applies the recommended kernel posture in one step: virtual-memory dirty ratios, socket buffer maxima, and live FUSE connection limits.
 - **Proven crash contract.** kill-9 soak suites measure zero acked-durability loss, and every performance or durability claim traces to a committed measurement record in `.benchmarks/`.
@@ -71,7 +72,7 @@ Optional Cargo features (off by default): `gds` (GPU Direct Storage path), `dhat
 
 Versions are git commits — no semver/calver; releases are `stable-*`/`lts-*` git tags on specific commits. Check a build with `squeezefs --version` (and the `.stats` `build_commit` field on a mounted daemon); policy details in [docs/operations.md §Versioning & releases](docs/operations.md#versioning--releases).
 
-To verify a build, run the standard gate — clippy (`-D warnings`), `cargo fmt --check`, `cargo test --all-features -- --test-threads=1`, `cargo doc --no-deps`, and the criterion bench smoke. Root-only external suites (LTP, fstests, elbencho, the NVMe-oF fidelity tier) live under `tests/` and are tiered in [AGENTS.md](AGENTS.md).
+To verify a build, run the standard gate — clippy (`-D warnings`), `cargo fmt --check`, `cargo test --all-features -- --test-threads=1`, `cargo doc --no-deps`, and the criterion bench smoke. Root-only external suites (pjdfstest, LTP, fstests, elbencho, the NVMe-oF fidelity tier) live under `tests/` and are tiered in [AGENTS.md](AGENTS.md).
 
 ## Quick example
 
@@ -93,7 +94,7 @@ squeezefs umount ~/sqfs/mnt                     # drains staging before teardown
 
 For measured work, skip file-backed volumes: `sudo tests/dev_substrate.sh create` builds a RAM-backed virtual NVMe substrate with real fabric namespaces ([QUICKSTART §2](QUICKSTART.md#2-dev-box-virtual-nvme-substrate-ram-backed-nvme-of-loop)).
 
-The CLI surface: `format`, `mount`, `umount`, `status`, `clients`, `df`, `bench`, `clone`, `tune`, `config`, `claim`, `nvmeof`, and `storage` — each documented in [docs/operations.md](docs/operations.md).
+The CLI surface: `format`, `mount`, `umount`, `status`, `clients`, `df`, `bench`, `clone`, `tune`, `config`, `claim`, `volume`, `fsck`/`scrub`, `defrag`, `job`, `nvmeof`, and `storage` — each documented in [docs/operations.md](docs/operations.md).
 
 ## Documentation
 

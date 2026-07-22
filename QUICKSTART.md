@@ -503,3 +503,31 @@ The verb re-verifies staleness under its own probe: on a healthy volume it answe
 > **Legacy format v2**: support was removed entirely. A v2 superblock refuses to mount ("no longer supported; reformat required"); reformat it to v3 with `squeezefs format --force` (destroys the old contents). The offline `squeezefs migrate` converter was deleted along with v2 support.
 >
 > The full catalog of loud refusal classes (pre-watermark v3 volumes, pre-FIND-RW4-A compressed/encrypted volumes, staging generation binding, cache-path policy) lives in [docs/operations.md → Breaking changes & migration notes](docs/operations.md#breaking-changes--migration-notes) — every message names its cause and remedy.
+
+---
+
+## 8. Volume Lifecycle & Online Maintenance (Taste)
+
+Volume membership, fsck, and defragmentation are first-class verbs — try them against the section-1 sandbox. Long-running work executes as durable, pausable, throttled background jobs (`squeezefs job list` shows them, live or offline):
+
+```bash
+# Grow the data side ONLINE: the new volume joins placement immediately and a
+# rebalance pass is scheduled automatically (--no-rebalance opts out)
+truncate -s 8G ~/squeezefs-sandbox/data2.bin
+./target/release/squeezefs volume add-data ~/squeezefs-sandbox/mnt ~/squeezefs-sandbox/data2.bin
+./target/release/squeezefs volume list ~/squeezefs-sandbox/mnt
+
+# Shrink it again: preflight-checked drain (refused with the numbers printed
+# if the survivors cannot fit the data), copy-on-write evacuation, retire
+./target/release/squeezefs volume remove-data ~/squeezefs-sandbox/mnt <vol-id-from-list>
+
+# Online filesystem check — verified findings only, exit != 0 when any exist;
+# add --scrub for the full data scrub, --repair [--apply] for quarantine-first repair
+./target/release/squeezefs fsck ~/squeezefs-sandbox/mnt
+
+# Measure fragmentation (moves nothing), then defragment what needs it
+./target/release/squeezefs defrag ~/squeezefs-sandbox/mnt --report-only
+./target/release/squeezefs defrag ~/squeezefs-sandbox/mnt --data --throttle 25
+```
+
+Metadata volumes grow/shrink too (`volume add-meta` / `remove-meta` are offline verbs; `volume migrate-meta-slot` moves a routing slot on the live mount). The full runbook — capacity-preflight math, the metadata routing-width honesty note, distributed remote workers, and the job fence guarantee table — is [docs/operations.md → Volume lifecycle & online maintenance](docs/operations.md#volume-lifecycle--online-maintenance).

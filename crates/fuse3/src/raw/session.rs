@@ -4829,6 +4829,26 @@ mod init_negotiation_tests {
         );
     }
 
+    /// fstests generic/504 (VL10 release gate): the daemon implements NO
+    /// FLOCK handler, yet the INIT reply echoed `FUSE_FLOCK_LOCKS` — so
+    /// the kernel skipped its own canonical BSD-flock bookkeeping
+    /// (`/proc/locks` showed nothing for a held flock: "lock info not
+    /// found"). A capability the daemon does not implement must never be
+    /// advertised: flock stays KERNEL-LOCAL (correct semantics,
+    /// /proc/locks visibility, and D0's single-writer mount guard is
+    /// what bounds cross-mount exposure).
+    #[test]
+    fn init_reply_never_advertises_flock_locks() {
+        let opts = MountOptions::default();
+        let flags = negotiate_reply_flags(u32::MAX, &opts);
+        assert_eq!(
+            flags & FUSE_FLOCK_LOCKS,
+            0,
+            "INIT reply advertised FUSE_FLOCK_LOCKS but no flock handler exists \
+             — BSD flock must stay kernel-local"
+        );
+    }
+
     /// The negotiation still echoes the capabilities the daemon DOES
     /// implement (extraction sanity: the splice fix must not eat the rest
     /// of the capability word).

@@ -661,3 +661,55 @@ async fn admin_req_without_admin_hello_refuses() {
     );
     host.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// POSIX ACL posture (fstests generic/099 + generic/319 repro-port, VL10
+// release gate): SqueezeFS does not IMPLEMENT POSIX ACL semantics (no
+// mode↔ACL_USER_OBJ/mask sync, no default-ACL inheritance, no
+// enforcement beyond mode bits) — so STORING the ACL xattrs was a lie
+// the kernel and every tool believed (`ls` showed '+', modes diverged
+// from the effective ACL, generic/099's Permission-denied legs executed
+// freely). The honest posture: `system.posix_acl_*` refuses ENOTSUP —
+// tools and fstests then classify the filesystem as no-ACL (setfacl
+// fails loud, `_require_acls` notruns) instead of trusting fabricated
+// semantics.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn posix_acl_xattrs_refuse_enotsup() {
+    let fx = fixture("acl-posture").await;
+
+    for name in ["system.posix_acl_access", "system.posix_acl_default"] {
+        let e = fx
+            .fs
+            .setxattr(req(), ROOT, OsStr::new(name), b"\x02\x00\x00\x00", 0, 0)
+            .await
+            .expect_err("ACL setxattr must refuse — ACL semantics are not implemented");
+        assert_eq!(
+            e,
+            libc::EOPNOTSUPP.into(),
+            "setxattr({name}) must be ENOTSUP (the no-ACL filesystem class)"
+        );
+
+        let e = fx
+            .fs
+            .getxattr(req(), ROOT, OsStr::new(name), 4096)
+            .await
+            .expect_err("ACL getxattr must refuse");
+        assert_eq!(e, libc::EOPNOTSUPP.into(), "getxattr({name})");
+
+        let e = fx
+            .fs
+            .removexattr(req(), ROOT, OsStr::new(name))
+            .await
+            .expect_err("ACL removexattr must refuse");
+        assert_eq!(e, libc::EOPNOTSUPP.into(), "removexattr({name})");
+    }
+
+    // Non-ACL system.* names are untouched by this posture (trusted.*/
+    // security.* etc. keep their existing behavior).
+    fx.fs
+        .setxattr(req(), ROOT, OsStr::new("user.beside"), b"ok", 0, 0)
+        .await
+        .expect("plain xattrs unaffected");
+}

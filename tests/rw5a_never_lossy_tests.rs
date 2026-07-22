@@ -720,3 +720,69 @@ async fn write_never_surfaces_transient_lease_churn_as_eio() {
         );
     }
 }
+
+/// FIND-RW4-B (the fstests generic/075.3 msync-EIO face, VL10 release
+/// gate): a staged file whose SIZE was truncated UP past the 4 MiB
+/// allocator chunk kept admitting sub-image rider extents bounded by
+/// `meta.size` — the truncate-inflated number — instead of the staged
+/// IMAGE they actually ride on. An admitted extent past the image end
+/// makes the fold compose an image of `max_extent_end` bytes; when the
+/// ring is full, the durable-spill escalation correctly refuses the
+/// > chunk store (the FIND-RW4-A guard — never overflow, never
+/// truncate) and fsync surfaces EIO forever (fsx: `domapwrite: msync:
+/// Input/output error`). The rider admission must bound by the staged
+/// image length: beyond-image writes belong to the whole-image path,
+/// which grows/promotes correctly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn truncate_up_rider_admission_bounds_by_the_image_not_the_size() {
+    let _g = serial().await;
+    let h = make(*b"rw4b_rider_2026!", "rw4b_rider", "4MB").await;
+
+    // A staged image (700 KiB < the 1 MiB staged window)…
+    let ino = create(&h, "grown").await;
+    let img_len: u64 = 700 * 1024;
+    write_at(&h, ino, 0, &pat(img_len as usize, 0xD4)).await;
+
+    // …whose size is truncated UP past the 4 MiB allocator chunk.
+    let new_size: u64 = squeezefs::block_allocator::CHUNK_SIZE + 512 * 1024;
+    let mut sa = fuse3::SetAttr::default();
+    sa.size = Some(new_size);
+    h.fs.setattr(h.req, ino, None, sa)
+        .await
+        .expect("truncate up");
+
+    // A small write past the chunk boundary but inside the new size:
+    // pre-fix this rides the block-0 record (small vs the 700 KiB
+    // image, "non-extending" vs the inflated size) — the poisoned
+    // extent whose fold can never be stored.
+    let tail_off = squeezefs::block_allocator::CHUNK_SIZE + 128 * 1024;
+    let tail = pat(4096, 0xE5);
+    write_at(&h, ino, tail_off, &tail).await;
+
+    // Oversubscribe the ring so the fold's same-key re-stage refuses
+    // and the durable-spill arm (where the chunk guard lives) engages.
+    fill_ring(&h, 8, 700 * 1024, 0xF6).await;
+
+    // fsync must SUCCEED (pre-fix: EIO via the FIND-RW4-A refusal of a
+    // 4.125 MiB composed image) and both the image and the tail bytes
+    // must read back.
+    h.fs.fsync(h.req, ino, 0, false)
+        .await
+        .expect("fsync of a truncate-up staged file must never wedge on an unstorable rider fold");
+    assert_eq!(
+        read_at(&h, ino, tail_off, tail.len()).await,
+        tail,
+        "tail bytes past the chunk boundary"
+    );
+    assert_eq!(
+        read_at(&h, ino, 0, 4096).await,
+        pat(img_len as usize, 0xD4)[..4096].to_vec(),
+        "staged image head"
+    );
+    // The hole between the image end and the tail reads zeros.
+    assert_eq!(
+        read_at(&h, ino, img_len + 4096, 4096).await,
+        vec![0u8; 4096],
+        "truncate-up hole"
+    );
+}

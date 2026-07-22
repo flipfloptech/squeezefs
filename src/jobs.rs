@@ -54,6 +54,14 @@ const ROOT_INO: u64 = 1;
 const CHECKPOINT_TASKS: u64 = 256;
 const CHECKPOINT_SECS: u64 = 5;
 
+/// VL10 (G-VL-3 b): how many independent block moves an UNTHROTTLED
+/// drain/rebalance pass keeps in flight (join_all window). Each move is
+/// device-I/O-bound (read + write + verify-read per block); 4 overlaps
+/// the round-trips without meaningfully raising the R5-gauged copy
+/// budget (4 × block_size on `job_copy_buffers`). Throttled passes and
+/// defrag (order-dependent D1/D2 placement floors) stay width-1.
+const MOVER_PIPELINE_WIDTH: usize = 4;
+
 /// §5.2: the in-flight mover window per worker — an in-flight moved
 /// block occupies source AND destination until the post-publish free;
 /// the preflight `transient` term bounds the double-count by this
@@ -2053,33 +2061,70 @@ impl JobFabric {
                 }
             }
 
-            // Execute the pass.
-            for task in &census.tasks {
+            // Execute the pass. VL10 (G-VL-3 b): independent block moves
+            // OVERLAP when unthrottled — each move pays 3× its bytes in
+            // serialized device round-trips (read → write → verify →
+            // publish), and the serial per-block loop measured exactly
+            // the ½-of-raw-copy floor. Drain/rebalance moves are
+            // independent (per-block flush locks; allocator picks are
+            // atomic; per-ino publish commits serialize on the 4a lease
+            // they already take), so a bounded window of them runs
+            // concurrently via join_all. Defrag stays serial: its D1/D2
+            // picks thread an ascending-floor invariant through the
+            // task sequence (`DestPick::BackendAscending`'s floor
+            // update is order-dependent). Throttled runs stay serial —
+            // KD-3's duty cycle is per WORKER, and a concurrent window
+            // would consume a multiple of the granted duty budget.
+            let mut task_i = 0usize;
+            while task_i < census.tasks.len() {
                 if ctl.cancelled.load(Ordering::SeqCst) || ctl.paused.load(Ordering::SeqCst) {
                     break;
                 }
+                // Live re-read per window: a mid-job rethrottle collapses
+                // the window back to serial on the next iteration.
+                let pct = ctl.throttle.load(Ordering::Relaxed);
+                let unthrottled = pct == 0 || pct >= 100;
+                let width = if unthrottled
+                    && matches!(
+                        objective,
+                        MoverObjective::Drain { .. } | MoverObjective::Rebalance
+                    ) {
+                    MOVER_PIPELINE_WIDTH
+                } else {
+                    1
+                };
+                let window = &census.tasks[task_i..(task_i + width).min(census.tasks.len())];
+                task_i += window.len();
                 let start = tokio::time::Instant::now();
-                match self.move_one(ctx, task, victim.as_deref()).await {
-                    MoveOutcome::Moved => {
-                        ctl.done.fetch_add(1, Ordering::Relaxed);
-                        METRICS.job_tasks_done.fetch_add(1, Ordering::Relaxed);
-                        moved_this_pass += 1;
-                        if matches!(objective, MoverObjective::Defrag { .. }) {
-                            // §10: the defrag-engagement pair (a defrag
-                            // move also counts the shared evacuate_*
-                            // family at the move_one site).
-                            METRICS.defrag_blocks_moved.fetch_add(1, Ordering::Relaxed);
-                            METRICS
-                                .defrag_bytes_moved
-                                .fetch_add(block_size, Ordering::Relaxed);
+                let outcomes = futures::future::join_all(
+                    window
+                        .iter()
+                        .map(|task| self.move_one(ctx, task, victim.as_deref())),
+                )
+                .await;
+                for outcome in outcomes {
+                    match outcome {
+                        MoveOutcome::Moved => {
+                            ctl.done.fetch_add(1, Ordering::Relaxed);
+                            METRICS.job_tasks_done.fetch_add(1, Ordering::Relaxed);
+                            moved_this_pass += 1;
+                            if matches!(objective, MoverObjective::Defrag { .. }) {
+                                // §10: the defrag-engagement pair (a defrag
+                                // move also counts the shared evacuate_*
+                                // family at the move_one site).
+                                METRICS.defrag_blocks_moved.fetch_add(1, Ordering::Relaxed);
+                                METRICS
+                                    .defrag_bytes_moved
+                                    .fetch_add(block_size, Ordering::Relaxed);
+                            }
+                        }
+                        MoveOutcome::Deferred => deferred_this_pass += 1,
+                        MoveOutcome::Superseded => {
+                            // Counted at the publish site; re-plan revisits.
                         }
                     }
-                    MoveOutcome::Deferred => deferred_this_pass += 1,
-                    MoveOutcome::Superseded => {
-                        // Counted at the publish site; re-plan revisits.
-                    }
                 }
-                since_checkpoint += 1;
+                since_checkpoint += window.len() as u64;
                 if since_checkpoint >= CHECKPOINT_TASKS
                     || last_checkpoint.elapsed() >= Duration::from_secs(CHECKPOINT_SECS)
                 {
@@ -2088,8 +2133,8 @@ impl JobFabric {
                     since_checkpoint = 0;
                     last_checkpoint = tokio::time::Instant::now();
                 }
-                // KD-3: duty-cycle throttle, live re-read per task.
-                let pct = ctl.throttle.load(Ordering::Relaxed);
+                // KD-3: duty-cycle throttle, live re-read per task
+                // (width is 1 whenever the throttle is active).
                 if let Some(delay) = job_throttle_sleep(start.elapsed(), pct) {
                     tokio::time::sleep(delay).await;
                 }

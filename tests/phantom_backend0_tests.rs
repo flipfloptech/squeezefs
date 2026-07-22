@@ -31,7 +31,7 @@ use fuse3::SetAttr;
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
-use squeezefs::fuse_client::{SqueezefsFilesystem, CONFIG_INODE};
+use squeezefs::fuse_client::{SqueezefsFilesystem, CONFIG_INODE, STATS_INODE};
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::{DataRouter, StorageBackend};
 use std::ffi::OsStr;
@@ -578,7 +578,211 @@ async fn test_phantom_backend0_health_override_refused_and_alias_unpoisoned() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Real-CLI multi-volume shape (the user's exact failure): format 4 sqmeta +
+// 7. `.config` virtual-file honesty (user report 2026-07-22): catting the
+//    file must yield EXACT-size JSON (no tail-padding whitespace spam), the
+//    data-volume table must carry each volume's REAL backing device path and
+//    durable id (never the name recycled into `backing_dev`), and the
+//    canonical `sqmeta://` / `sqdata://` URI spellings — the same strings
+//    the CLI verbs accept — must appear for the set and per volume.
+// ---------------------------------------------------------------------------
+
+/// One full single-reader "cat" cycle against a virtual inode: LOOKUP →
+/// OPEN (pins the generation) → fstat(GETATTR) → read-to-EOF → RELEASE.
+/// Returns (the fstat-reported size, the bytes the pinned fh served).
+async fn cat_virtual(h: &H, ino: u64) -> (u64, Vec<u8>) {
+    let name = if ino == CONFIG_INODE {
+        ".config"
+    } else {
+        ".stats"
+    };
+    let _entry =
+        h.fs.lookup(h.req, 1, OsStr::new(name))
+            .await
+            .expect("lookup virtual inode");
+    let opened =
+        h.fs.open(h.req, ino, libc::O_RDONLY as u32)
+            .await
+            .expect("open virtual inode");
+    let attr =
+        h.fs.getattr(h.req, ino, Some(opened.fh), 0)
+            .await
+            .expect("getattr virtual inode");
+    let data =
+        h.fs.read(h.req, ino, opened.fh, 0, 16 * 1024 * 1024, 0)
+            .await
+            .expect("read virtual inode");
+    h.fs.release(h.req, ino, opened.fh, 0, 0, false)
+        .await
+        .expect("release virtual inode");
+    (attr.attr.size, data.data.to_vec())
+}
+
+/// The catted `.config` bytes are exactly the JSON payload plus ONE final
+/// newline — no tail padding (the user's "lot of line returns") — and the
+/// fstat size the kernel copies to equals the served bytes exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_config_payload_exact_size_no_tail_padding() {
+    let _serial = serial().await;
+    let _ = env_logger::builder().is_test(true).try_init();
+    let h = harness(&["oss1", "oss2"]).await;
+
+    let (size, bytes) = cat_virtual(&h, CONFIG_INODE).await;
+    assert_eq!(
+        size,
+        bytes.len() as u64,
+        "fstat size must equal the bytes the pinned fh serves"
+    );
+    let raw = String::from_utf8(bytes).expect(".config is UTF-8");
+    assert_eq!(
+        raw,
+        format!("{}\n", raw.trim_end()),
+        ".config must carry NO tail padding beyond one final newline"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect(".config parses as JSON");
+    assert!(parsed.get("data_volumes").is_some());
+}
+
+/// `.stats` rides the same exact-size snapshot mechanism: regression guard
+/// for the padding removal (monitoring scripts read this inode).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_stats_payload_exact_size_no_tail_padding() {
+    let _serial = serial().await;
+    let _ = env_logger::builder().is_test(true).try_init();
+    let h = harness(&["oss1", "oss2"]).await;
+
+    let (size, bytes) = cat_virtual(&h, STATS_INODE).await;
+    assert_eq!(
+        size,
+        bytes.len() as u64,
+        "fstat size must equal the bytes the pinned fh serves"
+    );
+    let raw = String::from_utf8(bytes).expect(".stats is UTF-8");
+    assert_eq!(
+        raw,
+        format!("{}\n", raw.trim_end()),
+        ".stats must carry NO tail padding beyond one final newline"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect(".stats parses as JSON");
+    assert!(
+        parsed.get("metrics").is_some(),
+        ".stats still serves the complete metrics surface"
+    );
+}
+
+/// The data-volume table carries each volume's REAL backing device path
+/// (the registered device, like the metadata table always did), its durable
+/// id, and per-volume + volume-set URIs in the product's canonical grammar
+/// (`parse_block_uri`: `sqmeta://p1,p2` / `sqdata://p1,p2`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_config_lists_real_backing_devices_ids_and_uris() {
+    let _serial = serial().await;
+    let _ = env_logger::builder().is_test(true).try_init();
+    let h = harness(&["oss1", "oss2"]).await;
+
+    // Publish the durable record snapshot exactly as mount wiring does
+    // (KD-5: ids are the registered names; backing_dev the real path).
+    let records: Vec<squeezefs::DataVolumeRecord> = h
+        .volumes
+        .iter()
+        .map(|v| squeezefs::DataVolumeRecord {
+            id: v.name.clone(),
+            backing_dev: v.device.device_path.clone(),
+            state: squeezefs::VOL_STATE_ACTIVE.to_string(),
+            added_ts: 0,
+        })
+        .collect();
+    h.fs.router.backend_router.set_volume_records(records);
+
+    let (_size, bytes) = cat_virtual(&h, CONFIG_INODE).await;
+    let cfg: serde_json::Value = serde_json::from_slice(&bytes).expect(".config parses as JSON");
+
+    let table = cfg["data_volumes"]
+        .as_object()
+        .expect("data_volumes object");
+    let mut data_paths = Vec::new();
+    for v in &h.volumes {
+        let entry = table
+            .get(&v.name)
+            .unwrap_or_else(|| panic!("volume {} missing from .config", v.name));
+        let real = &v.device.device_path;
+        assert_eq!(
+            entry["backing_dev"].as_str(),
+            Some(real.as_str()),
+            "data volume {} must report its REAL backing device path, \
+             not its name recycled into the field",
+            v.name
+        );
+        assert_eq!(
+            entry["id"].as_str(),
+            Some(v.name.as_str()),
+            "data volume {} must carry its durable volume id",
+            v.name
+        );
+        assert_eq!(
+            entry["uri"].as_str(),
+            Some(format!("sqdata://{real}").as_str()),
+            "data volume {} must carry its canonical sqdata:// URI",
+            v.name
+        );
+        assert_eq!(entry["status"], "enabled");
+        assert!(entry["health"].is_number(), "health stays a numeric score");
+        data_paths.push(real.clone());
+    }
+    assert_eq!(
+        cfg["sqdata_uri"].as_str(),
+        Some(format!("sqdata://{}", data_paths.join(",")).as_str()),
+        "the joined data-volume-set sqdata:// URI must appear"
+    );
+
+    // Metadata table: real path (as today) + per-volume URI + the joined
+    // volume-set sqmeta:// URI — the exact string the CLI verbs accept.
+    let meta_path = h._meta.path().display().to_string();
+    let mtable = cfg["metadata_volumes"]
+        .as_object()
+        .expect("metadata_volumes object");
+    let m0 = mtable
+        .get("meta_volume_0")
+        .expect("meta_volume_0 entry present");
+    assert_eq!(m0["backing_dev"].as_str(), Some(meta_path.as_str()));
+    assert_eq!(
+        m0["uri"].as_str(),
+        Some(format!("sqmeta://{meta_path}").as_str()),
+        "per-meta-volume sqmeta:// URI"
+    );
+    assert_eq!(
+        cfg["sqmeta_uri"].as_str(),
+        Some(format!("sqmeta://{meta_path}").as_str()),
+        "the volume-set sqmeta:// URI (joined member form the CLI accepts) must appear"
+    );
+}
+
+/// Legacy bare-router fallback (offline tools, tests): a router with no
+/// named registrations keeps its `backend_0` default-slot entry — but even
+/// that entry must report the default device's real path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_config_bare_router_default_slot_reports_device_path() {
+    let _serial = serial().await;
+    let _ = env_logger::builder().is_test(true).try_init();
+    let h = harness(&["solo1"]).await;
+    h.fs.router.backend_router.backends.clear();
+
+    let (_size, bytes) = cat_virtual(&h, CONFIG_INODE).await;
+    let cfg: serde_json::Value = serde_json::from_slice(&bytes).expect(".config parses as JSON");
+    let table = cfg["data_volumes"]
+        .as_object()
+        .expect("data_volumes object");
+    let entry = table
+        .get("backend_0")
+        .expect("bare routers keep the legacy default-slot entry");
+    assert_eq!(
+        entry["backing_dev"].as_str(),
+        Some(h.volumes[0].device.device_path.as_str()),
+        "even the legacy default slot must report the real device path"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. Real-CLI multi-volume shape (the user's exact failure): format 4 sqmeta +
 //    4 sqdata, mount, bench-shaped burst, .config exactly oss1-4, no
 //    ENOENT/EIO in the daemon log.
 // ---------------------------------------------------------------------------
@@ -800,6 +1004,38 @@ mod cli {
             vec!["oss1", "oss2", "oss3", "oss4"],
             ".config data_volumes must list exactly the named volumes; got {keys:?}"
         );
+
+        // User report 2026-07-22: the catted bytes are exact-size JSON —
+        // no tail padding beyond one final newline — every data volume
+        // reports its REAL backing device path + sqdata:// URI, and the
+        // volume-set sqmeta:// URI (the CLI-accepted spelling) appears.
+        let raw = std::fs::read_to_string(mount.mnt.join(".config")).expect("read .config");
+        assert_eq!(
+            raw,
+            format!("{}\n", raw.trim_end()),
+            "catting .config must not print tail-padding whitespace"
+        );
+        assert!(
+            cfg["sqmeta_uri"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("sqmeta://"),
+            ".config must carry the volume-set sqmeta:// URI; got {:?}",
+            cfg["sqmeta_uri"]
+        );
+        for name in ["oss1", "oss2", "oss3", "oss4"] {
+            let real = mount.base.join(name).display().to_string();
+            assert_eq!(
+                table[name]["backing_dev"].as_str(),
+                Some(real.as_str()),
+                "data volume {name} must report its real backing device path"
+            );
+            assert_eq!(
+                table[name]["uri"].as_str(),
+                Some(format!("sqdata://{real}").as_str()),
+                "data volume {name} must carry its canonical sqdata:// URI"
+            );
+        }
 
         // Bench-shaped burst (the user's first-128MB-write failure shape).
         let file_path = mount.mnt.join("bench_large_seq_0.bin");

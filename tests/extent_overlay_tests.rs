@@ -1099,3 +1099,61 @@ async fn rider_truncate_clips_record_extents() {
          in the re-extended hole)"
     );
 }
+
+/// 12. Stale-binding decode failures REBIND, never propagate (the
+/// reads_mid_fold flake's root cause, VL10 release gate): on a
+/// transformed volume a reader that resolved block b → K loses the race
+/// with a fold/CoW-overwrite that displaces K, frees it, and lets the
+/// offset be REUSED — the device bytes under K then legally fail frame
+/// decode (LZ4 "ExpectedAnotherByte" mid-fold, EINVAL to the user). A
+/// decode failure on a dead incarnation is a stale-binding LOSS (the
+/// same class as wrong-bytes fills, which the incarnation seqlock
+/// already catches); only a CURRENT-binding decode failure is real
+/// corruption. Deterministic form: hand the validated loop a stale key
+/// naming an undecodable foreign image.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_binding_decode_failure_rebinds_not_errors() {
+    let _g = serial().await;
+    let h = make_ext(*b"rw4-decode-rb-01", "rw4_ns_m", true, true).await;
+    let (ino, base) = durable_striped(&h, "rebind.dat", 2, 0x2C).await;
+    let path = squeezefs::keys::inode_path(ino);
+
+    // A test-owned allocated offset holding bytes that CANNOT decode as
+    // a stored frame (truncated garbage) — the reused-offset image a
+    // dead incarnation's reader would fetch.
+    let (be_id, alloc, dev) = h
+        .fs
+        .router
+        .backend_router
+        .get_active_backend()
+        .expect("active backend");
+    let off = alloc.allocate_block().await.expect("alloc");
+    dev.write_block(off, bytes::Bytes::from(vec![0x5Au8; 4096]))
+        .await
+        .expect("plant undecodable bytes");
+    alloc.publish_block(off);
+    let stale_key = h.fs.router.backend_router.persist_block_key(&be_id, off);
+
+    // The reader resolved block 0 → stale_key (a mapping snapshot from
+    // before the displace); the CURRENT map still binds the real key.
+    purge_tiers(&h, ino).await;
+    let got = h
+        .fs
+        .router
+        .get_block_for_index(&path, 0, Some(stale_key.as_str()), false, true)
+        .await
+        .expect(
+            "a decode failure on a NON-current binding must rebind to the \
+             live mapping, not propagate",
+        )
+        .expect("block 0 is mapped");
+    let bytes: Vec<u8> = match got {
+        squeezefs::cache::pool::ReadBlockValue::Bytes(b) => b.to_vec(),
+        _ => panic!("unexpected value repr (not Bytes)"),
+    };
+    assert_eq!(
+        &bytes[..64],
+        &base[..64],
+        "the rebind must serve the CURRENT incarnation's bytes"
+    );
+}

@@ -8667,7 +8667,14 @@ impl Filesystem for SqueezefsFilesystem {
                 },
             );
             self.bump_dir_generation(parent);
-            // Keep parent attr in cache; only dir_entry listing is stale.
+            // D2.c: refresh (not invalidate, and never keep-stale) — the
+            // backend just bumped the parent's mtime/ctime, and the kernel
+            // re-GETATTRs the parent on its next path walk
+            // (fuse_dir_changed). Keeping the pre-create cache entry served
+            // pre-bump parent times for a full attr-TTL window (pjdfstest
+            // open/00.t 33-34, found by the VL10 release gate; pinned in
+            // tests/attr_refresh_tests.rs).
+            self.refresh_attr_cache(parent).await;
             self.add_open(inode.ino);
             Ok(ReplyCreated {
                 ttl: self.entry_ttl_for(attr.kind),

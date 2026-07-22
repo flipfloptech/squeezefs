@@ -138,8 +138,20 @@ PASS=0
 FAIL=0
 BROK=0
 CONF=0
+# FAIL FAST (standing user rule, 2026-07-22): the first unexpected
+# result (FAILED or BROKEN — TCONF skips are the suite's own expected
+# environment class) aborts the run immediately; fix red-first, then
+# restart the whole run (counted-restart discipline).
+ABORT=""
 
-echo "Running LTP filesystem tests on squeezefs mount..."
+fail_fast() {
+    echo "==================================================================" >&2
+    echo "FAIL FAST: $1 — aborting the LTP run (fix red-first, restart)" >&2
+    echo "==================================================================" >&2
+    ABORT=1
+}
+
+echo "Running LTP filesystem tests on squeezefs mount (fail-fast)..."
 for test in "${TESTS[@]}"; do
     binary="/tmp/ltp_install/testcases/bin/$test"
     if [ -x "$binary" ]; then
@@ -156,17 +168,21 @@ for test in "${TESTS[@]}"; do
             elif [ $ret -eq 2 ]; then
                 BROK=$((BROK+1))
                 echo "$test: BROKEN (TBROK)"
+                fail_fast "$test BROKEN (exit $ret)"
             else
                 FAIL=$((FAIL+1))
                 echo "$test: FAILED"
+                fail_fast "$test FAILED (exit $ret)"
             fi
         fi
     else
         echo "Warning: Test binary not found: $test"
     fi
+    if [ -n "$ABORT" ]; then break; fi
 done
 
 for name in "${!CUSTOM_TESTS[@]}"; do
+    if [ -n "$ABORT" ]; then break; fi
     cmd=${CUSTOM_TESTS[$name]}
     echo "--------------------------------------------------"
     echo "Running custom test: $name ($cmd)"
@@ -180,9 +196,11 @@ for name in "${!CUSTOM_TESTS[@]}"; do
         elif [ $ret -eq 2 ]; then
             BROK=$((BROK+1))
             echo "$name: BROKEN (TBROK)"
+            fail_fast "$name BROKEN (exit $ret)"
         else
             FAIL=$((FAIL+1))
             echo "$name: FAILED"
+            fail_fast "$name FAILED (exit $ret)"
         fi
     fi
 done

@@ -713,3 +713,31 @@ async fn posix_acl_xattrs_refuse_enotsup() {
         .await
         .expect("plain xattrs unaffected");
 }
+
+/// fstests generic/533 repro-port (VL10 release gate): removing an
+/// ABSENT xattr must fail ENODATA ("No such attribute" — Linux ENOATTR),
+/// never ENOENT ("No such file or directory" — that names the FILE,
+/// which exists). The backend's absent-xattr arm surfaced generic
+/// NotFound, which the errno map rendered ENOENT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removexattr_of_absent_attr_is_enodata() {
+    let fx = fixture("xattr-enodata").await;
+    let e = fx
+        .fs
+        .removexattr(req(), ROOT, OsStr::new("user.never_existed"))
+        .await
+        .expect_err("absent xattr removal must fail");
+    assert_eq!(
+        e,
+        libc::ENODATA.into(),
+        "absent xattr => ENODATA/ENOATTR, never ENOENT"
+    );
+
+    // A genuinely absent INODE keeps ENOENT-class loudness.
+    let e = fx
+        .fs
+        .removexattr(req(), 999_999_999, OsStr::new("user.x"))
+        .await
+        .expect_err("absent inode must fail");
+    assert_ne!(e, libc::ENODATA.into(), "missing-inode is not ENODATA");
+}

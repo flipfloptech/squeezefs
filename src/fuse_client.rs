@@ -5771,41 +5771,6 @@ impl SqueezefsFilesystem {
         Ok(true)
     }
 
-    /// Absorb (and retire) the block's staged extent record into a
-    /// just-checked-out FULL buffer — the one-authority law extended to
-    /// the record kind: a full-repr buffer for block `b` always contains
-    /// (supersedes) `b`'s record from birth, exactly as the checkout
-    /// consumes the staged full sibling. Runs under the held block lock;
-    /// record extents apply into coverage GAPS only (they are older than
-    /// anything already merged).
-    async fn absorb_extent_record_into(
-        &self,
-        block_data: &mut crate::cache::active_block::ActiveBlockBuf,
-        ino: u64,
-        b: u32,
-    ) -> Result<(), SqueezefsError> {
-        let ext_key = crate::keys::active_block_ext(ino, b as u64).to_string();
-        if !self.router.cache.nvme.has_staged_extent_record(&ext_key) {
-            return Ok(());
-        }
-        if let Some(rec) = self.read_valid_extent_record(&ext_key) {
-            let bs = self.router.block_size.load(Ordering::Relaxed) as usize;
-            for (s, d) in &rec.extents {
-                if (*s as usize) + d.len() <= bs {
-                    block_data.absorb_older_extent(*s as usize, d);
-                }
-            }
-            METRICS
-                .extent_record_absorbs
-                .fetch_add(1, Ordering::Relaxed);
-            let nvme = self.router.cache.nvme.clone();
-            tokio::task::spawn_blocking(move || nvme.remove_active_block(&ext_key))
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-        }
-        Ok(())
-    }
-
     /// Staged/striped active-block write path. Safe to call without holding the
     /// per-inode write lock: mutates each block under [`BLOCK_FLUSH_LOCKS`].
     ///
@@ -5970,15 +5935,30 @@ impl SqueezefsFilesystem {
                     }
                 }
 
-                // 1. Get existing block data (either from memory cache, NVMe staging cache, or read from backend/cache)
+                // 1. Ensure this block's overlay entry is PRESENT and
+                // seeded — never checked out. OVERLAY NEVER INVISIBLE,
+                // applied to the write path itself (fstests generic/209,
+                // VL10 release gate): the old remove→mutate→reinsert
+                // possession made every previously-ACKED byte living in
+                // this buffer invisible to concurrent reads for the whole
+                // absorb/sibling-remove/upload await window — readers fell
+                // through to the pre-merge ring/backend and served
+                // one-write-behind bytes (the aio-dio-invalidate-readahead
+                // "old byte" signature; pinned in
+                // tests/write_visibility_tests.rs::completed_overwrites_never_serve_the_previous_pass).
+                // The entry now stays in the map at every instant; all
+                // mutations happen under short-lived map guards (never
+                // across an await), and this block's BLOCK_FLUSH_LOCKS
+                // guard (held) excludes every other mutator.
                 let wp_checkout = write_phase_start();
-                let mut block_data =
-                    if let Some((_, buf)) = self.active_block_buffers.remove(&cache_key) {
-                        // RW1 ledger: an overlay already owned this block —
-                        // the §1.2 block-revisit discount, quantified.
-                        METRICS.write_block_revisits.fetch_add(1, Ordering::Relaxed);
-                        buf
-                    } else if let Some(d) = self.router.cache.nvme.read_staged(&cache_key) {
+                if self.active_block_buffers.contains_key(&cache_key) {
+                    // RW1 ledger: an overlay already owned this block —
+                    // the §1.2 block-revisit discount, quantified.
+                    METRICS.write_block_revisits.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // Build the seed OUTSIDE the map (no acked bytes live
+                    // here yet — awaits are legal), then publish it.
+                    let seed = if let Some(d) = self.router.cache.nvme.read_staged(&cache_key) {
                         METRICS.write_block_revisits.fetch_add(1, Ordering::Relaxed);
                         crate::cache::active_block::ActiveBlockBuf::seeded(&d, block_size as usize)
                     } else if !needs_existing_data {
@@ -5992,44 +5972,64 @@ impl SqueezefsFilesystem {
                         // Item B (the overwrite lazy-RMW seed): DEFER the
                         // old-block read. A covering overwrite — in ANY
                         // segment order (RW3b) — completes the block before
-                        // its write-through, so the seed read — one device
-                        // block read per block, the row-4 4x gap (17.8 GiB
-                        // of reads in a pure overwrite pass) — is skipped
+                        // its write-through, so the seed read is skipped
                         // entirely when coverage completes. Every escape
                         // path (stage/upload exits, sparse reads)
                         // materializes the seed first via
-                        // `fetch_seed_image` — the SAME binding-
-                        // validated fetch the eager seed used, just moved
-                        // to the last responsible moment.
+                        // `fetch_seed_image`. A concurrent read of a
+                        // deferred gap takes this block's lock (Item B
+                        // materialize) and therefore parks behind THIS
+                        // write — fresh serve after, never a stale one.
                         METRICS
                             .overwrite_seed_deferred
                             .fetch_add(1, Ordering::Relaxed);
                         crate::cache::active_block::ActiveBlockBuf::deferred(block_size as usize)
                     };
+                    self.active_block_buffers.insert(cache_key.clone(), seed);
+                }
                 write_phase_record(WritePhase::Checkout, wp_checkout);
 
                 // W2 one-authority extension: a full-repr buffer supersedes
                 // the block's staged extent record from birth — absorb its
-                // (older) extents into the coverage gaps and retire it,
-                // exactly as the checkout consumes the staged full sibling.
+                // (older) extents into the coverage gaps and retire it.
                 // Zero-cost when no record exists (one latch-free probe).
-                self.absorb_extent_record_into(&mut block_data, ino, b as u32)
-                    .await?;
+                // Split form of the old `absorb_extent_record_into`: sync
+                // record read → guarded apply (no await under the map
+                // guard) → awaited record retirement.
+                {
+                    let ext_key = crate::keys::active_block_ext(ino, b as u64).to_string();
+                    if self.router.cache.nvme.has_staged_extent_record(&ext_key) {
+                        if let Some(rec) = self.read_valid_extent_record(&ext_key) {
+                            let bs_usize = block_size as usize;
+                            if let Some(mut e) = self.active_block_buffers.get_mut(&cache_key) {
+                                for (s, d) in &rec.extents {
+                                    if (*s as usize) + d.len() <= bs_usize {
+                                        e.value_mut().absorb_older_extent(*s as usize, d);
+                                    }
+                                }
+                            }
+                            METRICS
+                                .extent_record_absorbs
+                                .fetch_add(1, Ordering::Relaxed);
+                            let nvme = self.router.cache.nvme.clone();
+                            tokio::task::spawn_blocking(move || nvme.remove_active_block(&ext_key))
+                                .await
+                                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        }
+                    }
+                }
 
-                // ONE-AUTHORITY INVARIANT (generic/075.2): per block, the
-                // newest content lives in exactly one overlay — the RAM
-                // parked buffer XOR the staged `active_block:` entry. We now
-                // own the RMW base (consumed the parked buffer, read the
-                // staged entry, or seeded device/fresh) and are about to
-                // mutate + re-park/upload it, so any staged sibling is
-                // superseded: remove it under this block's lock. Leaving it
-                // let flush_one_active_block upload the STALE staged copy
-                // over the newer merge, and let router reads serve pre-write
-                // bytes through the ACTIVE_STAGED tier once the RAM buffer
-                // moved on (both observed live in the fsx-075 soak). Any
-                // queued WritebackRequest for it becomes a clean no-op; the
-                // durability promise transfers to this write's own
-                // park/write-through path.
+                // ONE-AUTHORITY INVARIANT (generic/075.2), amended by the
+                // never-invisible law: per block, the NEWEST content lives
+                // in the RAM parked buffer, which now coexists with a
+                // (strictly older) staged `active_block:` sibling only for
+                // the guarded window below — readers prefer the RAM
+                // overlay, and this block's held lock excludes
+                // flush_one_active_block from uploading the stale staged
+                // copy meanwhile. The sibling is superseded and removed
+                // here; any queued WritebackRequest for it becomes a clean
+                // no-op; the durability promise transfers to this write's
+                // own park/write-through path.
                 //
                 // spawn_blocking (same rule as every put_active_block call):
                 // the staging-shard WRITE lock is a parking_lot lock, and
@@ -6065,51 +6065,62 @@ impl SqueezefsFilesystem {
                     write_phase_record(WritePhase::SiblingRemove, wp_sibling);
                 }
 
-                // 2. Merge the request slice. `make_mut` mutates only
-                // provably-unique memory: a live reader snapshot forces a
-                // copy-on-write instead of mutating aliased bytes (P0 fix,
-                // zero-copy write-path design §5.2). Coverage bookkeeping
-                // first (§5.3 + RW3b): `record_write` merges this range
-                // into the buffer's written-coverage union — overlap-safe,
-                // order-blind, a disjoint (out-of-order / gap) range simply
-                // records another run — and returns `true` exactly when the
-                // union reaches the whole block. Gap writes into a
-                // deferred-seed buffer no longer materialize inline: the
-                // deferral holds (item B — the complement owes old bytes at
-                // whatever exit needs them), which is also what keeps a
-                // reordered kernel-split segment from paying a device read
-                // inside a sequential stream (FIND-L1-A).
+                // 2. Merge the request slice under a SHORT map guard (no
+                // await). `make_mut` mutates only provably-unique memory: a
+                // live reader snapshot forces a copy-on-write instead of
+                // mutating aliased bytes (P0 fix, zero-copy write-path
+                // design §5.2). Coverage bookkeeping first (§5.3 + RW3b):
+                // `record_write` merges this range into the buffer's
+                // written-coverage union — overlap-safe, order-blind — and
+                // returns `true` exactly when the union reaches the whole
+                // block. Gap writes into a deferred-seed buffer do not
+                // materialize inline (item B holds; FIND-L1-A).
                 let rel_start = (write_start - b_start_offset) as usize;
                 let wp_merge = write_phase_start();
-                let coverage_completed = block_data.record_write(rel_start, rel_start + slice_len);
-                block_data.make_mut()[rel_start..rel_start + slice_len]
-                    .copy_from_slice(file_data_slice);
+                let coverage_completed = {
+                    let mut entry = self
+                        .active_block_buffers
+                        .get_mut(&cache_key)
+                        .expect("parked entry cannot vanish under the held block lock");
+                    let completed = entry
+                        .value_mut()
+                        .record_write(rel_start, rel_start + slice_len);
+                    entry.value_mut().make_mut()[rel_start..rel_start + slice_len]
+                        .copy_from_slice(file_data_slice);
+                    completed
+                };
                 write_phase_record(WritePhase::MergeCopy, wp_merge);
 
                 // 3. Write-through when the block is content-complete —
                 // RW3b normative trigger: the ACCUMULATED written coverage
-                // spans the whole block (never `write_end == b_end_offset`,
-                // the retired proxy that misfired on partial coverage and
-                // missed out-of-order completion — the FIND-L1-A convict,
-                // .benchmarks/2026-07-17-rw3-find-l1a-forensics.md §3).
-                // Else keep in memory: partial coverage — including
-                // segments that merely END at the block boundary — parks,
-                // and the item-B deferral keeps holding (no seed fetch
-                // here, ever: a completed union has nothing to seed and a
-                // partial one defers to the flush/read/spill exits).
+                // spans the whole block (FIND-L1-A). Else keep parked:
+                // partial coverage stays in the map (it never left), and
+                // the item-B deferral keeps holding. The upload runs from a
+                // CoW snapshot while the entry stays readable; the entry is
+                // removed only after the durable publish succeeds.
                 let is_block_complete = coverage_completed;
                 if is_block_complete {
-                    debug_assert!(
-                        block_data.is_content_valid() && !block_data.seed_deferred(),
-                        "a coverage-complete buffer must be content-valid with \
-                         its deferral cleared (record_write's completion \
-                         transition owns both)"
-                    );
+                    let block_snapshot = {
+                        let entry = self
+                            .active_block_buffers
+                            .get(&cache_key)
+                            .expect("parked entry cannot vanish under the held block lock");
+                        debug_assert!(
+                            entry.value().is_content_valid() && !entry.value().seed_deferred(),
+                            "a coverage-complete buffer must be content-valid with \
+                             its deferral cleared (record_write's completion \
+                             transition owns both)"
+                        );
+                        entry.value().snapshot()
+                    };
                     match self
-                        .upload_full_block(ino, b as u32, block_data.snapshot(), fencing_token)
+                        .upload_full_block(ino, b as u32, block_snapshot.clone(), fencing_token)
                         .await
                     {
                         Ok(()) => {
+                            // Durable + published: the RAM entry retires
+                            // (reads flow to the block map / read tiers).
+                            self.active_block_buffers.remove(&cache_key);
                             METRICS.write_through_blocks.fetch_add(1, Ordering::Relaxed);
                             METRICS
                                 .write_through_bytes
@@ -6118,8 +6129,10 @@ impl SqueezefsFilesystem {
                         }
                         Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
                             // A fenced-out writer must not publish anywhere —
-                            // not even to staging. Propagate; the caller
-                            // invalidates the local lease.
+                            // not even to staging. Drop custody (the old
+                            // checked-out buffer was dropped here too) and
+                            // propagate; the caller invalidates the lease.
+                            self.active_block_buffers.remove(&cache_key);
                             return Err(e);
                         }
                         Err(e) => {
@@ -6137,13 +6150,13 @@ impl SqueezefsFilesystem {
                             let nvme_clone = self.router.cache.nvme.clone();
                             let cache_key_clone = cache_key.clone();
                             let fencing_token_val = fencing_token;
-                            let block_snapshot = block_data.snapshot();
                             let put_len = block_snapshot.len() as u64;
+                            let staging_snapshot = block_snapshot;
                             let wp_put = write_phase_start();
                             let admitted = tokio::task::spawn_blocking(move || {
                                 nvme_clone.put_active_block(
                                     &cache_key_clone,
-                                    &block_snapshot,
+                                    &staging_snapshot,
                                     fencing_token_val,
                                 )
                             })
@@ -6151,6 +6164,11 @@ impl SqueezefsFilesystem {
                             .map_err(|e| std::io::Error::other(e.to_string()))?;
                             write_phase_record(WritePhase::StagingPut, wp_put);
 
+                            if admitted {
+                                // Staged custody landed: the RAM entry
+                                // retires (the ring copy is identical).
+                                self.active_block_buffers.remove(&cache_key);
+                            }
                             std::mem::drop(block_guard);
 
                             if admitted {
@@ -6169,23 +6187,23 @@ impl SqueezefsFilesystem {
                                     .fetch_add(1, Ordering::Relaxed);
                             } else {
                                 // Staging refused too (never-lossy
-                                // backpressure): keep the block in RAM like
-                                // a partial block; fsync's buffer flush
-                                // re-attempts staging or uploads it durably.
+                                // backpressure): the block stays PARKED —
+                                // it never left the map — and rides the R5
+                                // admission pass like a partial block;
+                                // fsync's buffer flush re-attempts staging
+                                // or uploads it durably.
                                 let wp_park = write_phase_start();
-                                self.insert_active_block_buffer(
-                                    cache_key.clone(),
-                                    block_data,
-                                    fencing_token,
-                                )
-                                .await;
+                                self.admit_parked_active_block(&cache_key, fencing_token)
+                                    .await;
                                 write_phase_record(WritePhase::ParkSpill, wp_park);
                             }
                         }
                     }
                 } else {
+                    // Partial coverage: already parked (never left the
+                    // map); run the R5 byte-budget admission pass.
                     let wp_park = write_phase_start();
-                    self.insert_active_block_buffer(cache_key.clone(), block_data, fencing_token)
+                    self.admit_parked_active_block(&cache_key, fencing_token)
                         .await;
                     write_phase_record(WritePhase::ParkSpill, wp_park);
                     std::mem::drop(block_guard);
@@ -6723,6 +6741,64 @@ impl SqueezefsFilesystem {
     }
 
     /// `(ino, block)` of an `active_block:inode_{ino}:block_{b}` key.
+    /// Compose the RAM active-block overlays' AUTHORITATIVE runs over a
+    /// base-tier read reply (the never-invisible law's read-side
+    /// composer — fstests generic/209): for every block the reply
+    /// covers, an extent-repr overlay contributes its parked slabs and a
+    /// full-repr overlay its written-coverage runs, both strictly newer
+    /// than any base tier by the one-authority invariant. Runs are
+    /// captured under short per-entry map guards (no await); the reply
+    /// is copied only when an overlay actually intersects it.
+    fn overlay_parked_runs(&self, ino: u64, offset: u64, data: bytes::Bytes) -> bytes::Bytes {
+        if data.is_empty() || self.active_block_buffers.is_empty() {
+            return data;
+        }
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        let end = offset + data.len() as u64;
+        let start_block = offset / block_size;
+        let end_block = (end - 1) / block_size;
+        let mut out: Option<Vec<u8>> = None;
+        for b in start_block..=end_block {
+            let key = crate::keys::active_block(ino, b).to_string();
+            let Some(entry) = self.active_block_buffers.get(&key) else {
+                continue;
+            };
+            let b_start = b * block_size;
+            let rel_lo = offset.max(b_start).saturating_sub(b_start) as usize;
+            let rel_hi = (end.min(b_start + block_size) - b_start) as usize;
+            // Capture the runs under the guard, then drop it before the
+            // (allocation-bearing) compose.
+            let runs: Vec<(usize, Vec<u8>)> = if entry.value().is_extent_repr() {
+                entry.value().extent_runs_in(rel_lo, rel_hi)
+            } else {
+                let snapshot = entry.value().snapshot();
+                entry
+                    .value()
+                    .covered_runs_in(rel_lo, rel_hi)
+                    .into_iter()
+                    .map(|(s, e)| (s, snapshot[s..e].to_vec()))
+                    .collect()
+            };
+            drop(entry);
+            if runs.is_empty() {
+                continue;
+            }
+            let out = out.get_or_insert_with(|| data.to_vec());
+            for (s, d) in runs {
+                let abs = b_start as usize + s;
+                let lo = abs - offset as usize;
+                let hi = (lo + d.len()).min(out.len());
+                if lo < out.len() {
+                    out[lo..hi].copy_from_slice(&d[..hi - lo]);
+                }
+            }
+        }
+        match out {
+            Some(v) => bytes::Bytes::from(v),
+            None => data,
+        }
+    }
+
     fn parse_active_block_key(key: &str) -> Option<(u64, u32)> {
         let rest = key.strip_prefix("active_block:inode_")?;
         let (ino_str, block_str) = rest.split_once(":block_")?;
@@ -6994,12 +7070,13 @@ impl SqueezefsFilesystem {
         }
     }
 
-    async fn insert_active_block_buffer(
-        &self,
-        cache_key: String,
-        block_data: crate::cache::active_block::ActiveBlockBuf,
-        fencing_token: u64,
-    ) {
+    /// The R5 byte-budget admission pass for an ALREADY-PARKED active
+    /// block (the never-invisible successor of the old
+    /// `insert_active_block_buffer`, whose by-value insert was half of
+    /// the generic/209 checkout window — entries now stay in the map at
+    /// every instant and this pass runs on them in place). Caller holds
+    /// this block's `BLOCK_FLUSH_LOCKS` guard.
+    async fn admit_parked_active_block(&self, cache_key: &str, fencing_token: u64) {
         // R5 Red (§5.7): the spill threshold halves — parked dirty bytes
         // reach the existing never-lossy staging path at half the byte
         // budget (the fast, guaranteed RSS reducer of the row-5 cage
@@ -7022,43 +7099,50 @@ impl SqueezefsFilesystem {
         //    through `upload_active_block_bytes` (the fsync
         //    staging-refusal escalation — upload + merge under the block
         //    guard the caller already holds, the established 3 → 3.5
-        //    extended order) and never parks; RAM frees when the buffer
-        //    drops here. Leg B measured why waiting longer is wrong: a
+        //    extended order) and retires the parked entry; RAM frees at
+        //    the removal. Leg B measured why waiting longer is wrong: a
         //    drain CONVOY (writers of the same hot inode queueing behind
         //    one flush pass) produced 36 ten-second deadline stalls —
         //    the writer paying for its own block's writeback is bounded
         //    by the device, not by the convoy.
         //
         // Never-lossy at every exit: assist parks nothing it does not
-        // own; self-flush makes the bytes durable BEFORE the buffer
-        // drops; self-flush FAILURE parks past the cap loud
-        // (parked_gate_timeouts) — RAM is the last-resort custody of
+        // own; self-flush makes the bytes durable BEFORE the entry
+        // retires; self-flush FAILURE keeps the entry parked past the cap
+        // loud (parked_gate_timeouts) — RAM is the last-resort custody of
         // dirty data, exactly like the staging-refusal soft-cap leg.
         if crate::mem_budget::level() == crate::mem_budget::Level::Red {
             // W2: the Red admission gate is the BYTE budget's halved form
             // (extent overlays charge payload bytes, full buffers a block).
             let gate_bytes = self.parked_cap_bytes();
-            let incoming = block_data
-                .extent_payload_bytes()
-                .max(if block_data.is_extent_repr() {
-                    0
-                } else {
-                    self.router.block_size.load(Ordering::Relaxed)
-                });
-            if Self::parked_gauge_bytes().saturating_add(incoming) > gate_bytes {
+            let incoming = match self.active_block_buffers.get(cache_key) {
+                Some(e) => e
+                    .value()
+                    .extent_payload_bytes()
+                    .max(if e.value().is_extent_repr() {
+                        0
+                    } else {
+                        self.router.block_size.load(Ordering::Relaxed)
+                    }),
+                // Entry gone (a concurrent spill of it under our own
+                // spill pass): nothing to admit.
+                None => return,
+            };
+            // NOTE: `incoming` is already charged in the parked gauge
+            // (RAII on the buffer) — the gate compares against the same
+            // total the old by-value path saw at its insert instant.
+            if Self::parked_gauge_bytes() > gate_bytes {
                 METRICS.parked_gate_waits.fetch_add(1, Ordering::Relaxed);
                 let assist_ms = std::env::var("SQUEEZEFS_PARKED_GATE_ASSIST_MS")
                     .ok()
                     .and_then(|v| v.trim().parse::<u64>().ok())
-                    .unwrap_or(250);
+                    .unwrap_or(200);
                 let deadline = std::time::Instant::now() + Duration::from_millis(assist_ms);
-                let bs = self.router.block_size.load(Ordering::Relaxed).max(1);
-                // Aim one block under the cap so this insert lands within it.
-                let cap_bytes = gate_bytes.saturating_sub(bs);
-                while Self::parked_gauge_bytes().saturating_add(incoming) > gate_bytes
+                while Self::parked_gauge_bytes() > gate_bytes
                     && crate::mem_budget::level() == crate::mem_budget::Level::Red
                     && std::time::Instant::now() < deadline
                 {
+                    let cap_bytes = gate_bytes.saturating_sub(incoming);
                     self.parked_drain_target
                         .fetch_min(cap_bytes, Ordering::Relaxed);
                     self.ensure_parked_drain_worker();
@@ -7069,28 +7153,29 @@ impl SqueezefsFilesystem {
                         _ = tokio::time::sleep(Duration::from_millis(25)) => {}
                     }
                 }
-                let still_over = Self::parked_gauge_bytes().saturating_add(incoming) > gate_bytes
+                let still_over = Self::parked_gauge_bytes() > gate_bytes
                     && crate::mem_budget::level() == crate::mem_budget::Level::Red;
                 if still_over {
-                    if let Some((ino, b)) = Self::parse_active_block_key(&cache_key) {
-                        let mut data = block_data;
+                    if let Some((ino, b)) = Self::parse_active_block_key(cache_key) {
                         // W2: an extent overlay reaching the Red self-flush
-                        // escalates in RAM first — the whole-image
-                        // choreography below (seed / zero-complete /
-                        // upload) then applies verbatim.
-                        data.escalate_to_full();
-                        // §5.3 exit 2: zero-complete Fresh buffers before
-                        // their bytes leave RAM (hole intervals materialize
-                        // as zeros — recycled pool bytes never escape).
-                        // Item B: deferred buffers owe old bytes first.
-                        // OVERLAY NEVER INVISIBLE: park for the fetch await
-                        // (the caller holds this block's lock, so the
-                        // re-checkout is guaranteed); a failed fetch leaves
-                        // the buffer parked (never-lossy; the gate stays
-                        // soft for it).
-                        if data.seed_deferred() {
+                        // escalates to full IN THE MAP first — the
+                        // whole-image choreography (seed / zero-complete /
+                        // upload) then applies to the parked entry.
+                        // OVERLAY NEVER INVISIBLE: the entry stays parked
+                        // across every await (the caller holds this
+                        // block's lock, so no other mutator can race);
+                        // a failed fetch/upload leaves it parked
+                        // (never-lossy; the gate stays soft for it).
+                        let deferred = match self.active_block_buffers.get_mut(cache_key) {
+                            Some(mut e) => {
+                                e.value_mut().escalate_to_full();
+                                e.value().seed_deferred()
+                            }
+                            None => return,
+                        };
+                        if deferred {
+                            // Item B: deferred buffers owe old bytes first.
                             let file_path = crate::keys::inode_path(ino);
-                            self.active_block_buffers.insert(cache_key.clone(), data);
                             let Ok(image) = self.fetch_seed_image(&file_path, b).await else {
                                 return;
                             };
@@ -7098,18 +7183,24 @@ impl SqueezefsFilesystem {
                                 image.as_deref().map(|d| d.len()).unwrap_or(0) as u64,
                                 Ordering::Relaxed,
                             );
-                            let Some((_, reowned)) = self.active_block_buffers.remove(&cache_key)
-                            else {
-                                unreachable!(
-                                    "parked buffer vanished under the caller's held \
-                                     BLOCK_FLUSH_LOCKS guard"
-                                );
-                            };
-                            data = reowned;
-                            data.fill_complement_from(image.as_deref().unwrap_or(&[]));
+                            if let Some(mut e) = self.active_block_buffers.get_mut(cache_key) {
+                                e.value_mut()
+                                    .fill_complement_from(image.as_deref().unwrap_or(&[]));
+                            } else {
+                                return;
+                            }
                         }
-                        data.zero_complete();
-                        let self_flush_snapshot = data.snapshot();
+                        // §5.3 exit 2: zero-complete Fresh buffers before
+                        // their bytes leave RAM (hole intervals materialize
+                        // as zeros — recycled pool bytes never escape).
+                        let self_flush_snapshot = match self.active_block_buffers.get_mut(cache_key)
+                        {
+                            Some(mut e) => {
+                                e.value_mut().zero_complete();
+                                e.value().snapshot()
+                            }
+                            None => return,
+                        };
                         let self_flush_len = self_flush_snapshot.len() as u64;
                         match upload_active_block_bytes(ino, b, self_flush_snapshot, &self.router)
                             .await
@@ -7123,13 +7214,15 @@ impl SqueezefsFilesystem {
                                 METRICS
                                     .durable_upload_bytes_self_flush
                                     .fetch_add(self_flush_len, Ordering::Relaxed);
+                                // Durable + published: the entry retires.
+                                self.active_block_buffers.remove(cache_key);
                                 // A staler STAGED image under this key (an
                                 // earlier spill) must not outlive the newer
                                 // durable merge — same fencing-checked
                                 // remove as flush_one_active_block, on the
                                 // blocking pool (shard write lock).
                                 let nvme = self.router.cache.nvme.clone();
-                                let key = cache_key.clone();
+                                let key = cache_key.to_string();
                                 let token = fencing_token;
                                 let _ = tokio::task::spawn_blocking(move || {
                                     match nvme.get_staged_fencing_token(&key) {
@@ -7140,28 +7233,24 @@ impl SqueezefsFilesystem {
                                     }
                                 })
                                 .await;
-                                return;
                             }
                             Err(e) => {
                                 METRICS.parked_gate_timeouts.fetch_add(1, Ordering::Relaxed);
                                 warn!(
                                     "Red parked-buffer gate: self-flush of ino {} block {} \
-                                     failed ({:?}) — parking past the cap ({} buffers) to \
-                                     preserve the dirty bytes",
+                                     failed ({:?}) — staying parked past the cap ({} buffers) \
+                                     to preserve the dirty bytes",
                                     ino,
                                     b,
                                     e,
                                     self.active_block_buffers.len()
                                 );
-                                self.active_block_buffers.insert(cache_key, data);
-                                return;
                             }
                         }
                     }
                 }
             }
         }
-        self.active_block_buffers.insert(cache_key, block_data);
     }
 
     pub async fn flush_all_memory_buffers_to_staging(&self) -> Result<(), SqueezefsError> {
@@ -9078,6 +9167,19 @@ impl Filesystem for SqueezefsFilesystem {
                 return Err(map_squeezefs_err(e));
             }
         };
+
+        // OVERLAY NEVER INVISIBLE — the multi-block/fallthrough face
+        // (fstests generic/209, VL10 release gate): the router serves the
+        // base tiers only, so any block whose NEWEST bytes still live in
+        // a RAM overlay (a park re-created between the flush above and
+        // the router read, a straddling read's second block, the
+        // single-block probe's vanished-buffer fallthrough) would serve
+        // pre-park bytes. Compose the parked runs over the reply — the
+        // same authority order as the single-block probe (extent runs /
+        // covered runs win over the base). Zero-cost when no overlay
+        // exists (one map probe per covered block); the compose allocates
+        // only when an overlay actually intersects the range.
+        let data = self.overlay_parked_runs(ino, offset, data);
 
         Ok(ReplyData { data, backing })
     }

@@ -88,24 +88,34 @@ if [ ! -d "$XFSTESTS_DIR" ]; then
 fi
 
 cd "$XFSTESTS_DIR"
+# xfstests requires the fsgqa user/group; keep this OUTSIDE the
+# compile-once guard so cached-suite runs repair it too. -m / the home
+# repair: several tests `su - fsgqa`, and a missing home dir leaks a
+# "cannot change directory" warning into golden output (generic/128's
+# residual diff, VL10 release gate).
+if ! getent group fsgqa >/dev/null; then
+    groupadd fsgqa
+fi
+if ! getent passwd fsgqa >/dev/null; then
+    useradd -m -g fsgqa fsgqa
+fi
+FSGQA_HOME="$(getent passwd fsgqa | cut -d: -f6)"
+if [ -n "$FSGQA_HOME" ] && [ ! -d "$FSGQA_HOME" ]; then
+    mkdir -p "$FSGQA_HOME"
+    chown fsgqa:fsgqa "$FSGQA_HOME"
+fi
 if [ ! -f "src/open_by_handle" ]; then
     echo "Compiling xfstests..."
-    # xfstests requires creating fsgqa user/group if they do not exist
-    if ! getent group fsgqa >/dev/null; then
-        groupadd fsgqa
-    fi
-    # Repair a pre-existing home-less fsgqa (the pre-VL10 useradd shape).
-    if getent passwd fsgqa >/dev/null && [ ! -d "$(getent passwd fsgqa | cut -d: -f6)" ]; then
-        mkhomedir_helper fsgqa 2>/dev/null || mkdir -p "$(getent passwd fsgqa | cut -d: -f6)" && chown fsgqa:fsgqa "$(getent passwd fsgqa | cut -d: -f6)"
-    fi
-    if ! getent passwd fsgqa >/dev/null; then
-        # -m: several tests `su - fsgqa`; a missing home dir leaks a
-        # "cannot change directory" warning into golden output
-        # (generic/128's residual diff, VL10 release gate).
-        useradd -m -g fsgqa fsgqa
-    fi
     make
 fi
+
+# attr >= 2.6 prints an UNCONDITIONAL warning on `setfattr --restore`
+# whenever the dump contains any multi-component path ("unsafe without
+# option -P") — reproduced on tmpfs with a plain nested dir, i.e. pure
+# instrument noise the pre-2.6 golden output predates (VL10 release
+# gate, generic/062's residual line). The dump paths are physical
+# (getfattr -h walk), so -P is semantics-identical; idempotent sed.
+sed -i 's/setfattr -h --restore=/setfattr -hP --restore=/' tests/generic/062
 
 # 4. Install mount and mkfs helpers
 echo "Installing FUSE helpers in /sbin..."

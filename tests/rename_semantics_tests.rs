@@ -118,20 +118,18 @@ async fn backend_nlink(h: &H, ino: u64) -> u32 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rename_over_directory_zeroes_dest_nlink() {
     let h = make().await;
-    let d1 = h
-        .fs
-        .mkdir(h.req, 1, OsStr::new("dir1"), 0o755, 0)
-        .await
-        .unwrap()
-        .attr
-        .ino;
-    let d2 = h
-        .fs
-        .mkdir(h.req, 1, OsStr::new("dir2"), 0o755, 0)
-        .await
-        .unwrap()
-        .attr
-        .ino;
+    let d1 =
+        h.fs.mkdir(h.req, 1, OsStr::new("dir1"), 0o755, 0)
+            .await
+            .unwrap()
+            .attr
+            .ino;
+    let d2 =
+        h.fs.mkdir(h.req, 1, OsStr::new("dir2"), 0o755, 0)
+            .await
+            .unwrap()
+            .attr
+            .ino;
 
     h.fs.rename(h.req, 1, OsStr::new("dir1"), 1, OsStr::new("dir2"))
         .await
@@ -143,13 +141,12 @@ async fn rename_over_directory_zeroes_dest_nlink() {
         "the overwritten directory's nlink must be 0 (generic/035)"
     );
     // The surviving name resolves to the source dir.
-    let got = h
-        .fs
-        .lookup(h.req, 1, OsStr::new("dir2"))
-        .await
-        .unwrap()
-        .attr
-        .ino;
+    let got =
+        h.fs.lookup(h.req, 1, OsStr::new("dir2"))
+            .await
+            .unwrap()
+            .attr
+            .ino;
     assert_eq!(got, d1);
 }
 
@@ -158,20 +155,18 @@ async fn rename_over_directory_zeroes_dest_nlink() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rename_over_file_zeroes_dest_nlink() {
     let h = make().await;
-    let _f1 = h
-        .fs
-        .create(h.req, 1, OsStr::new("f1"), libc::S_IFREG | 0o644, 0)
-        .await
-        .unwrap()
-        .attr
-        .ino;
-    let f2 = h
-        .fs
-        .create(h.req, 1, OsStr::new("f2"), libc::S_IFREG | 0o644, 0)
-        .await
-        .unwrap()
-        .attr
-        .ino;
+    let _f1 =
+        h.fs.create(h.req, 1, OsStr::new("f1"), libc::S_IFREG | 0o644, 0)
+            .await
+            .unwrap()
+            .attr
+            .ino;
+    let f2 =
+        h.fs.create(h.req, 1, OsStr::new("f2"), libc::S_IFREG | 0o644, 0)
+            .await
+            .unwrap()
+            .attr
+            .ino;
 
     h.fs.rename(h.req, 1, OsStr::new("f1"), 1, OsStr::new("f2"))
         .await
@@ -193,19 +188,25 @@ async fn rename2_refuses_unsupported_flags() {
         libc::RENAME_WHITEOUT | libc::RENAME_NOREPLACE,
         1 << 5, // any future/unknown bit
     ] {
-        let err = h
-            .fs
-            .rename2(h.req, 1, OsStr::new("src"), 1, OsStr::new("dst"), flags)
-            .await
-            .expect_err("unsupported rename2 flags must refuse");
+        let err =
+            h.fs.rename2(h.req, 1, OsStr::new("src"), 1, OsStr::new("dst"), flags)
+                .await
+                .expect_err("unsupported rename2 flags must refuse");
         let io: std::io::Error = err.into();
         assert_eq!(
             io.raw_os_error(),
             Some(libc::EINVAL),
             "flags {flags:#x} must be EINVAL, and the rename must not happen"
         );
+        // Lookup misses reply as NEGATIVE entries (ino 0, the D2 kernel
+        // negative-dentry caching) — absent means Err OR the negative
+        // reply, never a real ino.
+        let absent = match h.fs.lookup(h.req, 1, OsStr::new("dst")).await {
+            Err(_) => true,
+            Ok(reply) => reply.attr.ino == 0,
+        };
         assert!(
-            h.fs.lookup(h.req, 1, OsStr::new("dst")).await.is_err(),
+            absent,
             "no dentry may appear under the refused flags {flags:#x}"
         );
     }

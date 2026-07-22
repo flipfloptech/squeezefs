@@ -9969,6 +9969,15 @@ impl Filesystem for SqueezefsFilesystem {
             parent, name_str, new_parent, new_name_str, flags
         );
 
+        // Refuse flags this filesystem does not implement — LOUD, never a
+        // silent plain rename. The kernel forwards RENAME_WHITEOUT to any
+        // FUSE fs; ignoring it made the kernel believe whiteouts were
+        // created (fstests generic/078; pinned in
+        // tests/rename_semantics_tests.rs).
+        if flags & !(libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE) != 0 {
+            return Err(Errno::from(libc::EINVAL));
+        }
+
         if (parent == 1 && name_str == ".config") || (new_parent == 1 && new_name_str == ".config")
         {
             return Err(Errno::from(libc::EPERM));

@@ -4847,14 +4847,19 @@ impl KvMetaBackend {
         if let Some((new_key, _new_d)) = new_pos {
             if let Some(dest) = dest_local {
                 if let Some(mut dv) = self.read_inode_value(dest).await? {
-                    if (dv.mode & libc::S_IFMT) == libc::S_IFDIR
-                        && self.dir_has_entries(dest).await?
-                    {
-                        return Err(crate::error::SqueezefsError::Io(
-                            std::io::Error::from_raw_os_error(libc::ENOTEMPTY),
-                        ));
-                    }
-                    if dv.nlink > 0 {
+                    if (dv.mode & libc::S_IFMT) == libc::S_IFDIR {
+                        if self.dir_has_entries(dest).await? {
+                            return Err(crate::error::SqueezefsError::Io(
+                                std::io::Error::from_raw_os_error(libc::ENOTEMPTY),
+                            ));
+                        }
+                        // A replaced directory is REMOVED: both its "."
+                        // self-link and its parent entry vanish — nlink 0,
+                        // the routed_unlink_local rmdir rule (fstests
+                        // generic/035; pinned in
+                        // tests/rename_semantics_tests.rs).
+                        dv.nlink = 0;
+                    } else if dv.nlink > 0 {
                         dv.nlink -= 1;
                     }
                     dv.ctime = now;
@@ -4920,12 +4925,15 @@ impl KvMetaBackend {
         let Some(mut dv) = self.read_inode_value(local_dest).await? else {
             return Ok(());
         };
-        if (dv.mode & libc::S_IFMT) == libc::S_IFDIR && self.dir_has_entries(local_dest).await? {
-            return Err(crate::error::SqueezefsError::Io(
-                std::io::Error::from_raw_os_error(libc::ENOTEMPTY),
-            ));
-        }
-        if dv.nlink > 0 {
+        if (dv.mode & libc::S_IFMT) == libc::S_IFDIR {
+            if self.dir_has_entries(local_dest).await? {
+                return Err(crate::error::SqueezefsError::Io(
+                    std::io::Error::from_raw_os_error(libc::ENOTEMPTY),
+                ));
+            }
+            // Replaced directory ⇒ nlink 0 (the rmdir rule — generic/035).
+            dv.nlink = 0;
+        } else if dv.nlink > 0 {
             dv.nlink -= 1;
         }
         dv.ctime = Self::now_ns();

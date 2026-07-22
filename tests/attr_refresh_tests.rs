@@ -308,3 +308,58 @@ async fn create_refreshes_parent_attr_cache() {
         "create must account a parent attr refresh"
     );
 }
+
+/// fstests generic/258 repro-port (VL10 release gate): pre-epoch
+/// (negative) timestamps must round-trip. The daemon stored times as
+/// unsigned ns (`sec as u64 * 1e9`), so `utimensat` with a negative
+/// second wrapped into year-576 territory ("Timestamp wrapped:
+/// 18131146533"). Times are now i64 nanoseconds carried in the u64
+/// storage word (two's complement — every existing positive value reads
+/// identically), sign-restored at the FUSE boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn negative_timestamps_round_trip() {
+    let h = make().await;
+    let ino = create(&h, 1, "epoch-minus").await;
+
+    // The generic/258 shape: one day before the epoch.
+    let want = Timestamp::new(-86_400, 0);
+    h.fs.setattr(
+        h.req,
+        ino,
+        None,
+        fuse3::SetAttr {
+            atime: Some(want),
+            mtime: Some(want),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("setattr with a negative timestamp");
+
+    let got = h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr;
+    assert_eq!(
+        got.mtime, want,
+        "pre-epoch mtime must round-trip, not wrap (generic/258)"
+    );
+    assert_eq!(got.atime, want, "pre-epoch atime must round-trip");
+    assert!(
+        got.mtime.sec < 0,
+        "the sign must survive the storage word"
+    );
+
+    // Sub-second negative shape too (sec = -1, nsec 500e6 = -0.5 s).
+    let frac = Timestamp::new(-1, 500_000_000);
+    h.fs.setattr(
+        h.req,
+        ino,
+        None,
+        fuse3::SetAttr {
+            mtime: Some(frac),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let got = h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr;
+    assert_eq!(got.mtime, frac, "negative sec + positive nsec round-trip");
+}

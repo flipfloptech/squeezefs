@@ -2113,3 +2113,84 @@ async fn v3_ring_full_liveness_storm_drains() {
         "storm state must survive remount byte-for-byte (post-fold digest)"
     );
 }
+
+/// fstests generic/020 repro-port (VL10 release gate): a full
+/// `XATTR_SIZE_MAX` (65,536-byte) VALUE must round-trip on a
+/// default-node-size volume — the Linux cap governs the VALUE; the
+/// record envelope (name + length framing) must NOT eat into it. The
+/// pre-fix check charged `value + name + 8` against the 65,536 record
+/// cap, so the advertised "value ≤ min(65536, node_size/4)" contract
+/// (AGENTS + design-cow-kv-metadata §4.2) was never actually reachable.
+/// Over-cap values still refuse loud.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xattr_value_cap_is_the_full_xattr_size_max() {
+    // Default 256 KiB nodes: value cap = min(65536, 65536) = 65536.
+    let file = NamedTempFile::new().expect("temp volume");
+    file.as_file().set_len(V3_VOL_LEN).unwrap();
+    format_v3(
+        file.path(),
+        V3_VOL_LEN,
+        &FormatV3Options {
+            node_size: 256 * 1024,
+            journal_len_override: Some(8 * 1024 * 1024),
+            force: false,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .unwrap();
+    let b = open_volume_for_mount(file.path().to_str().unwrap())
+        .await
+        .expect("open_volume_for_mount");
+
+    let f = b
+        .create(ROOT_INO, "xmax", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+
+    // The generic/020 shape: name "user.long_attr", value 65,536 bytes.
+    let val = vec![0x00u8; 65_536];
+    b.setxattr(f.ino, "user.long_attr", &val)
+        .await
+        .expect("a full XATTR_SIZE_MAX value must fit (generic/020)");
+    assert_eq!(
+        b.getxattr(f.ino, "user.long_attr").await.unwrap(),
+        Some(val),
+        "the 64 KiB value must round-trip byte-exact"
+    );
+
+    // One byte over the value cap refuses loud.
+    let over = vec![0x00u8; 65_537];
+    assert!(
+        b.setxattr(f.ino, "user.long_attr", &over).await.is_err(),
+        "65,537-byte value must refuse (cap is the VALUE cap)"
+    );
+
+    // Small-node volumes keep the node_size/4 VALUE cap (the documented
+    // sub-256-KiB drop) — 16 KiB value cap at 64 KiB nodes.
+    let (small, _sf) = mutable_volume().await;
+    let g = small
+        .create(ROOT_INO, "xsmall", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    let exact = vec![0x11u8; 16 * 1024];
+    small
+        .setxattr(g.ino, "user.exactly_a_quarter_node", &exact)
+        .await
+        .expect("a full node_size/4 VALUE must fit regardless of name length");
+    assert_eq!(
+        small
+            .getxattr(g.ino, "user.exactly_a_quarter_node")
+            .await
+            .unwrap(),
+        Some(exact)
+    );
+    assert!(
+        small
+            .setxattr(g.ino, "user.over", &vec![0x22u8; 16 * 1024 + 1])
+            .await
+            .is_err(),
+        "one byte over node_size/4 must refuse on small-node volumes"
+    );
+}

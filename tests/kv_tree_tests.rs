@@ -194,10 +194,13 @@ async fn point_ops_insert_overwrite_delete_reinsert() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn value_cap_enforced_typed() {
-    let mut vol = Vol::small(); // 64 KiB nodes ⇒ cap = 16 KiB (§4.2)
+    // 64 KiB nodes ⇒ 16 KiB value cap + the xattr envelope allowance
+    // (§4.2; fstests generic/020 — the record budget carries the envelope
+    // so a full cap-sized user VALUE fits regardless of name length).
+    let mut vol = Vol::small();
     let tree = vol.tree(TREE_INODES).await;
     let cap = vol.cache.config().layout.record_value_cap();
-    assert_eq!(cap, 16 * 1024);
+    assert_eq!(cap, 16 * 1024 + 256);
 
     tree.insert(&ikey(1), vec![0u8; cap])
         .await

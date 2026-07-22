@@ -96,16 +96,28 @@ fn test_node_layout_validates_the_format_knob() {
     }
 }
 
-/// The per-volume record-value cap is `min(65,536, node_size/4)` (§4.2):
-/// exactly 64 KiB at the 256 KiB default (Linux `XATTR_SIZE_MAX`), scaling
-/// down with the knob, ceiling-clamped above it.
+/// The per-volume record-value budget is the user VALUE cap
+/// `min(65,536, node_size/4)` (§4.2 — exactly Linux `XATTR_SIZE_MAX` at
+/// the 256 KiB default, scaling down with the knob, ceiling-clamped
+/// above it) PLUS the xattr record envelope allowance (1-byte name_len +
+/// name ≤ 255), so a full cap-sized user value with a maximal name still
+/// encodes (fstests generic/020, VL10 release gate).
 #[test]
 fn test_record_value_cap_is_min_of_ceiling_and_quarter_node() {
-    assert_eq!(record_value_cap(DEFAULT_NODE_SIZE), 65_536);
-    assert_eq!(record_value_cap(MIN_NODE_SIZE), 16_384);
-    assert_eq!(record_value_cap(128 * 1024), 32_768);
-    assert_eq!(record_value_cap(512 * 1024), 65_536, "ceiling-clamped");
-    assert_eq!(record_value_cap(MAX_NODE_SIZE), 65_536, "ceiling-clamped");
+    use squeezefs::meta_backend::kv::node::{xattr_value_cap, XATTR_RECORD_ENVELOPE_MAX};
+    assert_eq!(XATTR_RECORD_ENVELOPE_MAX, 256, "1-byte name_len + 255 name");
+    assert_eq!(xattr_value_cap(DEFAULT_NODE_SIZE), 65_536);
+    assert_eq!(xattr_value_cap(MIN_NODE_SIZE), 16_384);
+    assert_eq!(xattr_value_cap(128 * 1024), 32_768);
+    assert_eq!(xattr_value_cap(512 * 1024), 65_536, "ceiling-clamped");
+    assert_eq!(xattr_value_cap(MAX_NODE_SIZE), 65_536, "ceiling-clamped");
+    for ns in [MIN_NODE_SIZE, 128 * 1024, DEFAULT_NODE_SIZE, MAX_NODE_SIZE] {
+        assert_eq!(
+            record_value_cap(ns),
+            xattr_value_cap(ns) + XATTR_RECORD_ENVELOPE_MAX,
+            "record budget = value cap + envelope at node_size {ns}"
+        );
+    }
     assert_eq!(
         layout().record_value_cap(),
         record_value_cap(DEFAULT_NODE_SIZE)
@@ -119,7 +131,11 @@ async fn test_record_value_cap_enforced_with_typed_error() {
     let vol = fresh_volume();
     let small = NodeLayout::new(MIN_NODE_SIZE).expect("64 KiB layout");
     let cap = small.record_value_cap();
-    assert_eq!(cap, 16_384, "64 KiB knob ⇒ node_size/4 governs");
+    assert_eq!(
+        cap,
+        16_384 + 256,
+        "64 KiB knob ⇒ node_size/4 value cap + the xattr envelope allowance"
+    );
 
     let over = Record::put(inode_key(7).to_vec(), 1, vec![0xAB; cap + 1]);
     let at_cap = Record::put(inode_key(7).to_vec(), 1, vec![0xAB; cap]);

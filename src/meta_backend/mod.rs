@@ -996,7 +996,7 @@ impl RoutedMetaBackend {
     /// size.
     pub fn xattr_value_cap(&self, ino: Ino) -> usize {
         let (v_idx, _) = self.route_ino(ino);
-        self.volumes[v_idx].record_value_cap()
+        self.volumes[v_idx].xattr_value_cap()
     }
 
     /// One cookie-paged readdir step against `dir`'s volume (design

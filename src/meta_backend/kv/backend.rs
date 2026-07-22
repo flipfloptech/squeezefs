@@ -1362,13 +1362,14 @@ impl KvMetaBackend {
         &self.path
     }
 
-    /// This volume's per-record value cap `min(65_536, node_size/4)` (§4.2) —
-    /// the largest inline xattr value it can store. PR K8 (§5.3): the data
-    /// path consults it (via [`crate::meta_backend::RoutedMetaBackend::xattr_value_cap`])
-    /// to decide the per-volume layout inline-spill boundary, so mixed v2/v3
-    /// (and mixed-`node_size` v3) sets spill per volume.
-    pub fn record_value_cap(&self) -> usize {
-        self.cache.config().layout.record_value_cap()
+    /// This volume's user-facing xattr VALUE cap `min(65_536, node_size/4)`
+    /// (§4.2) — the largest inline xattr value it can store. PR K8 (§5.3):
+    /// the data path consults it (via
+    /// [`crate::meta_backend::RoutedMetaBackend::xattr_value_cap`]) to
+    /// decide the per-volume layout inline-spill boundary, so mixed
+    /// mixed-`node_size` v3 sets spill per volume.
+    pub fn xattr_value_cap(&self) -> usize {
+        self.cache.config().layout.xattr_value_cap()
     }
 
     /// The three logical trees, tree-id order (inodes, dentries, xattrs)
@@ -5099,10 +5100,13 @@ impl KvMetaBackend {
         guards: Arc<[DlmGuard]>,
     ) -> Result<()> {
         self.write_gate()?;
-        let cap = self.cache.config().layout.record_value_cap();
-        // The value rides an XattrValue envelope (name + lengths); keep
-        // the whole record under the cap the node layer enforces.
-        if value.len() + name.len() + 8 > cap {
+        // The USER value cap (§4.2): the record envelope (1-byte name_len
+        // + name ≤ 255) rides in the node layer's separate envelope
+        // allowance, so a full `XATTR_SIZE_MAX` value fits regardless of
+        // name length (fstests generic/020; pinned in
+        // tests/kv_backend_tests.rs::xattr_value_cap_is_the_full_xattr_size_max).
+        let cap = self.cache.config().layout.xattr_value_cap();
+        if value.len() > cap {
             return Err(KvError::ValueTooLarge {
                 len: value.len(),
                 cap,

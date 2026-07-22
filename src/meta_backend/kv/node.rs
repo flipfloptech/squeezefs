@@ -134,10 +134,26 @@ pub const DEFAULT_NODE_SIZE: usize = 256 * 1024;
 /// The user-facing record-value ceiling: Linux `XATTR_SIZE_MAX` (§4.2).
 pub const RECORD_VALUE_CAP_CEILING: usize = 65_536;
 
-/// The per-volume record-value cap `min(65,536, node_size/4)` (§4.2) —
-/// enforced at this layer on every write path (PR K2).
-pub fn record_value_cap(node_size: usize) -> usize {
+/// Worst-case xattr record envelope OVER the user value: the
+/// `XattrValue` framing is a 1-byte `name_len` + the name (≤ 255,
+/// `XATTR_NAME_MAX`).
+pub const XATTR_RECORD_ENVELOPE_MAX: usize = 256;
+
+/// The user-facing xattr VALUE cap `min(65,536, node_size/4)` (§4.2):
+/// exactly Linux `XATTR_SIZE_MAX` at the 256 KiB default node size.
+pub fn xattr_value_cap(node_size: usize) -> usize {
     RECORD_VALUE_CAP_CEILING.min(node_size / 4)
+}
+
+/// The per-volume record-value cap — the node layer's budget for one
+/// ENCODED record value, enforced at this layer on every write path
+/// (PR K2). It is the user VALUE cap plus the xattr envelope allowance,
+/// so a full `XATTR_SIZE_MAX` user value with a maximal name still fits
+/// (fstests generic/020, VL10 release gate — the pre-fix formula charged
+/// the envelope against the value cap, making the advertised
+/// "value ≤ min(65536, node_size/4)" contract unreachable).
+pub fn record_value_cap(node_size: usize) -> usize {
+    xattr_value_cap(node_size) + XATTR_RECORD_ENVELOPE_MAX
 }
 
 /// A validated node-size knob (§5.1: 64 KiB–1 MiB, 4 KiB-page aligned).
@@ -170,6 +186,12 @@ impl NodeLayout {
     /// This layout's record-value cap: [`record_value_cap`]`(node_size)`.
     pub fn record_value_cap(&self) -> usize {
         record_value_cap(self.node_size)
+    }
+
+    /// This layout's user-facing xattr VALUE cap:
+    /// [`xattr_value_cap`]`(node_size)`.
+    pub fn xattr_value_cap(&self) -> usize {
+        xattr_value_cap(self.node_size)
     }
 }
 

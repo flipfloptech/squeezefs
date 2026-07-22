@@ -280,26 +280,34 @@ fn test_commands_listings_are_one_line_summaries() {
 }
 
 /// Style tripwire 2: no house editorial voice in any help output.
-/// Case-insensitive substrings; ` loud` (leading space) also nets
-/// "refuse loud"/"fails loud" without matching ordinary words.
+/// Case-insensitive; `loud`/`rides` are word-bounded so "refuse loud"
+/// and "rides `squeezefs df`" are caught while ordinary words such as
+/// "cloud" or "overrides" are not.
 #[test]
 fn test_help_tree_contains_no_editorial_voice() {
-    let banned: [&str; 6] = [
-        "honestly",
-        "loudly",
-        " loud",
-        "refuses everything",
-        "rides ",
-        "the numbers printed",
-    ];
+    let banned: Vec<(Regex, &'static str)> = [
+        ("honestly", "honestly"),
+        ("loudly", "loudly"),
+        (r"\bloud\b", "loud"),
+        ("refuses everything", "refuses everything"),
+        (r"\brides\b", "rides"),
+        ("the numbers printed", "the numbers printed"),
+    ]
+    .into_iter()
+    .map(|(pat, label)| {
+        (
+            Regex::new(&format!("(?i){pat}")).expect("valid pattern"),
+            label,
+        )
+    })
+    .collect();
     let mut violations = Vec::new();
     for page in help_pages() {
         for line in page.help.lines() {
-            let lower = line.to_lowercase();
-            for phrase in banned {
-                if lower.contains(phrase) {
+            for (re, label) in &banned {
+                if re.is_match(line) {
                     violations.push(format!(
-                        "`squeezefs {} --help` uses banned phrase `{phrase}`:\n    {}",
+                        "`squeezefs {} --help` uses banned phrase `{label}`:\n    {}",
                         page.path,
                         line.trim()
                     ));

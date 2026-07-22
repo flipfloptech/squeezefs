@@ -35,11 +35,12 @@ enum Commands {
         /// Block size (e.g. "4M", "1M", default: 4MB)
         #[arg(long, default_value = "4M")]
         block_size: String,
-        /// Formatted capacity (e.g. "100G"). Default: the summed physical
-        /// size of the data volumes. May be LOWER than physical (testing);
-        /// values above physical are refused — oversubscription is not
-        /// supported at the filesystem level (thin-provision underneath via
-        /// LVM/fabric instead).
+        /// Formatted capacity (e.g. "100G"; default: summed physical size)
+        ///
+        /// The value may be lower than the physical size of the data
+        /// volumes. Values above physical are rejected: oversubscription
+        /// is not supported at the filesystem level. Thin-provision
+        /// underneath, via LVM or the fabric, instead.
         #[arg(long)]
         capacity: Option<String>,
         /// Hard quota limiting the number of inodes (default: 1000000)
@@ -104,18 +105,28 @@ enum Commands {
         /// Path to RSA private key PEM file for client-side encryption
         #[arg(long)]
         encrypt_key: Option<String>,
-        /// Time in seconds to wait for staged writes to drain to NVMe-oF backend on dismount (default: 10)
+        /// Seconds to wait for staged writes to drain on dismount
+        ///
+        /// Staged writes drain to the block backend before the
+        /// filesystem detaches. Default: 10.
         #[arg(long)]
         dismount_wait: Option<String>,
-        /// Delay/interval for background staging write uploads (e.g. "500ms", "5s", default: "500ms")
+        /// Interval for background staging write uploads
+        ///
+        /// Accepts durations such as "500ms" or "5s".
         #[arg(long, default_value = "500ms")]
         upload_delay: String,
-        /// Shared default /dev/fuse io_uring SQPOLL idle timeout in milliseconds. Use 0 to disable the shared default.
+        /// Shared default io_uring SQPOLL idle timeout in milliseconds
+        ///
+        /// Applies to the /dev/fuse rings of every mount of this
+        /// volume. Use 0 to disable the shared default.
         #[arg(long, env = "SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS")]
         fuse_io_uring_sqpoll_idle_ms: Option<u32>,
-        /// Metadata (v3) btree node size in KiB: 64|128|256|512|1024.
-        /// Values below 256 warn: the per-volume record-value cap becomes
-        /// node_size/4 (xattr/layout headroom traded for cold-read latency).
+        /// Metadata btree node size in KiB: 64|128|256|512|1024
+        ///
+        /// Values below 256 print a warning: the per-volume record-value
+        /// cap becomes node_size/4, trading xattr and layout headroom for
+        /// cold-read latency.
         #[arg(long, default_value = "256")]
         meta_node_kib: u32,
         /// Metadata (v3) journal ring size in MiB, overriding the default
@@ -126,14 +137,15 @@ enum Commands {
         // stamps membership + the KV_GUEST_SLOTS incompat bit (pre-VL5a
         // binaries refuse it loud); the implicit default stays
         // byte-identical to pre-VL5a formats.
-        /// Frozen metadata routing width W ("meta slots"). Default: W =
-        /// meta volume count, recorded implicitly — the volume set stays
-        /// readable by older squeezefs releases. Explicit values mark the
-        /// set as slot-mapped: older squeezefs releases refuse to open it
-        /// afterwards (loudly). Bounds: volumes <= W <= 64 x volumes.
-        /// Recommended >= 4x volumes for growth-planned deployments;
-        /// metadata-volume migration granularity is 1/W of the inode
-        /// space.
+        /// Frozen metadata routing width W ("meta slots")
+        ///
+        /// Default: W = metadata volume count, recorded implicitly, so
+        /// the volume set stays readable by older squeezefs releases.
+        /// Explicit values mark the set as slot-mapped: older squeezefs
+        /// releases refuse to open it afterwards. Bounds: volumes <= W
+        /// <= 64 x volumes. Recommended >= 4x volumes for growth-planned
+        /// deployments; metadata-volume migration granularity is 1/W of
+        /// the inode space.
         #[arg(long)]
         meta_slots: Option<u32>,
     },
@@ -142,9 +154,11 @@ enum Commands {
         /// Optional Metadata URI (sqmeta://...) or mount point path
         meta_uri: Option<String>,
     },
-    /// List client mount registrations on a metadata volume set (live /
-    /// stale / dead, from the on-volume heartbeat records; read-only
-    /// probe — safe beside a live mount)
+    /// List client mount registrations on a metadata volume set
+    ///
+    /// Classifies each registration as live, stale, or dead from the
+    /// on-volume heartbeat records. Read-only probe, safe to run beside
+    /// a live mount.
     Clients {
         /// Metadata URI (sqmeta://...) or a metadata volume path
         meta_uri: String,
@@ -153,15 +167,21 @@ enum Commands {
         json: bool,
     },
     // Anchors: design-volume-lifecycle §5.3–§5.5/§6 (PR VL3–VL5b).
-    /// Volume-set lifecycle: add/list/drain/remove data volumes,
-    /// add/migrate/remove metadata volumes, repair membership stamps
+    /// Manage the volume set: add, list, drain, remove, repair
+    ///
+    /// Data volumes: add, list, drain and remove, cancel a drain.
+    /// Metadata volumes: add, remove, migrate routing slots, and repair
+    /// the set-membership stamps.
     Volume {
         #[command(subcommand)]
         action: VolumeActions,
     },
     // Anchor: design-volume-lifecycle §6 (the maintenance-job fabric).
-    /// Maintenance-job control: live via the mount's admin lane, offline
-    /// via read-only probes of the durable job records
+    /// Control maintenance jobs
+    ///
+    /// On a live mountpoint, commands act through the mount's admin
+    /// lane. On a sqmeta:// URI, list and status are read-only probes
+    /// of the durable job records.
     Job {
         #[command(subcommand)]
         action: JobActions,
@@ -169,16 +189,23 @@ enum Commands {
     // Anchors: design-volume-lifecycle §5.6 (PR VL6a) detection under
     // the suspects machinery, §5.6a (PR VL6b) per-class repair; offline
     // `--repair` takes the guarded D0 open.
-    /// Online filesystem check with per-class repair: seven check
-    /// classes (C1–C7, as labeled in the report), every finding verified
-    /// before it is reported. TARGET = a live mountpoint (online: the
-    /// scan reads the running daemon's live state) or a sqmeta:// URI
-    /// (offline: read-only probes — refuses under a live writer;
-    /// `--repair` takes the exclusive writer guard instead), or the
-    /// literal `merge-reports` followed by shard report files. Detection
-    /// never mutates; `--repair` plans (dry-run default), `--repair
-    /// --apply` executes quarantine-first per-class actions on verified
-    /// findings only. Exit status is nonzero when findings exist.
+    /// Check the filesystem, with optional per-class repair
+    ///
+    /// Runs seven check classes (C1-C7, as labeled in the report).
+    /// Every finding is verified before it is reported, and detection
+    /// never mutates the filesystem.
+    ///
+    /// TARGET is a live mountpoint or a sqmeta:// URI. On a mountpoint
+    /// the scan reads the running daemon's live state. On a URI it uses
+    /// offline read-only probes and fails while another writer holds
+    /// the volumes; with --repair it takes the exclusive writer guard
+    /// instead. TARGET may also be the literal `merge-reports`,
+    /// followed by shard report files to combine.
+    ///
+    /// --repair plans per-class repairs of the verified findings and is
+    /// a dry run unless --apply is also given. With --apply it executes
+    /// quarantine-first actions on verified findings only. Exit status
+    /// is nonzero when findings exist.
     Fsck {
         /// Live mountpoint, sqmeta:// URI, or `merge-reports`
         target: String,
@@ -198,35 +225,46 @@ enum Commands {
         /// Emit the structured report as JSON
         #[arg(long)]
         json: bool,
-        /// Offline zero-coordination sharding: scan the k-th of N
-        /// ino-residue shards ("k/N", 0-based k); union the outputs
-        /// with `fsck merge-reports`. Incompatible with --repair.
+        /// Offline sharding: scan the k-th of N shards ("k/N", 0-based)
+        ///
+        /// Zero-coordination ino-residue sharding. Union the shard
+        /// outputs with `fsck merge-reports`. Incompatible with
+        /// --repair.
         #[arg(long)]
         shards: Option<String>,
         // Anchor: KD-17 (scrub verification depth per data class).
-        /// Add the data scrub (check class C7): AEAD verification on
-        /// encrypted data, frame decode on compressed data,
-        /// readability-only on plain data
+        /// Add the data scrub (check class C7)
+        ///
+        /// AEAD verification on encrypted data, frame decode on
+        /// compressed data, readability checks on plain data.
         #[arg(long)]
         scrub: bool,
         // Anchor: the §5.6a per-class repair table.
-        /// Plan per-class repairs of the verified findings. DRY RUN
-        /// unless --apply is also given. Offline this requires the
-        /// exclusive guarded open (repair is a writer).
+        /// Plan per-class repairs (a dry run unless --apply is given)
+        ///
+        /// Repair is a writer: offline it requires the exclusive
+        /// guarded open.
         #[arg(long)]
         repair: bool,
-        /// Execute the repair plan (with --repair): quarantine-first,
-        /// verify-before-repair, idempotent per-class actions
+        /// Execute the repair plan (with --repair)
+        ///
+        /// Actions are quarantine-first, verify-before-repair, and
+        /// idempotent per class.
         #[arg(long)]
         apply: bool,
-        /// Quarantine home override (default: <first staging
-        /// dir>/quarantine/; REQUIRED on cache-less filesystems)
+        /// Quarantine directory (default: <first staging dir>/quarantine/)
+        ///
+        /// Cache-less filesystems have no staging directory, so this
+        /// option is required there.
         #[arg(long)]
         quarantine_dir: Option<String>,
     },
     // Anchors: design-volume-lifecycle §5.6 / KD-17.
-    /// Data scrub only (check class C7) — the standalone spelling of
-    /// `fsck --scrub`, same engine
+    /// Run the data scrub (check class C7)
+    ///
+    /// The standalone spelling of `fsck --scrub`, using the same
+    /// engine: AEAD verification on encrypted data, frame decode on
+    /// compressed data, readability checks on plain data.
     Scrub {
         /// Live mountpoint or sqmeta:// URI
         target: String,
@@ -242,15 +280,19 @@ enum Commands {
     // KD-12 rebalance surface), §5.8 offline D0-guarded coordinator;
     // the movers reuse the VL4 move engine (contiguity-aware pick), the
     // W2 fold, and the KV SMO compactor.
-    /// Online defragmenter: fragmentation is four measured axes — D1
-    /// free-space contiguity, D2 file locality, D3 staged-extent
-    /// pressure, D4 metadata node occupancy — each with a gauge (the
-    /// stats inode's frag_d1..frag_d4 fields) and an independently
-    /// invocable mover. TARGET = a live mountpoint (movers run as jobs
-    /// on the mounted daemon via the admin lane) or a sqmeta:// URI
-    /// (offline: a short-lived exclusive writer-guarded coordinator runs
-    /// the job in-process; `--fold` is live-only — extent-fold custody
-    /// belongs to the mount)
+    /// Defragment the filesystem along four measured axes
+    ///
+    /// Fragmentation is measured on four axes: D1 free-space
+    /// contiguity, D2 file locality, D3 staged-extent pressure, and D4
+    /// metadata node occupancy. Each axis has a gauge (the stats
+    /// inode's frag_d1..frag_d4 fields) and an independently invocable
+    /// mover.
+    ///
+    /// TARGET is a live mountpoint or a sqmeta:// URI. On a mountpoint
+    /// the movers run as jobs on the mounted daemon through the admin
+    /// lane. On a URI, a short-lived offline coordinator takes the
+    /// exclusive writer guard and runs the job in-process. --fold works
+    /// on live mounts only: extent-fold custody belongs to the mount.
     Defrag {
         /// Live mountpoint or sqmeta:// URI
         target: String,
@@ -326,8 +368,9 @@ enum Commands {
         // Anchor: docs/design-read-path.md §5.7 (the R5 joint memory
         // budget authority).
         /// Joint memory budget for the daemon's caches and buffers
-        /// (e.g. "6G"); overrides SQUEEZEFS_MEM_BUDGET_MB and the
-        /// cgroup-derived default
+        ///
+        /// Accepts sizes such as "6G". Overrides SQUEEZEFS_MEM_BUDGET_MB
+        /// and the cgroup-derived default.
         #[arg(long)]
         mem_budget: Option<String>,
 
@@ -335,10 +378,12 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         meta_lv: Option<Vec<String>>,
 
-        /// REFUSED: cache paths are fixed at format (recorded in the
-        /// format config); use `squeezefs config set-cache-paths` to
-        /// change them. Passing this flag is a loud error, never a
-        /// silent ignore.
+        /// Rejected at mount time: cache paths are fixed at format
+        ///
+        /// Cache paths are recorded in the format config and cannot be
+        /// overridden at mount. Passing this flag is an error, never a
+        /// silent ignore. Use `squeezefs config set-cache-paths` to
+        /// change them.
         #[arg(long, value_delimiter = ',', alias = "cache-dir")]
         disk_cache_paths: Option<Vec<PathBuf>>,
 
@@ -366,29 +411,34 @@ enum Commands {
         #[arg(long)]
         daemon: bool,
 
-        /// Keep the parent process alive as an EXTERNAL mount watchdog
-        /// (requires --daemon): probes <mountpoint>/.stats every 5s
-        /// (SQUEEZEFS_SUPERVISE_INTERVAL_SECS); after 30s of sustained
+        /// Keep the parent alive as a mount watchdog (requires --daemon)
+        ///
+        /// The parent probes <mountpoint>/.stats every 5s
+        /// (SQUEEZEFS_SUPERVISE_INTERVAL_SECS). After 30s of sustained
         /// unresponsiveness (SQUEEZEFS_SUPERVISE_UNRESPONSIVE_SECS) it
-        /// logs loudly, dumps daemon state, and — as root — writes
-        /// /sys/fs/fuse/connections/<id>/abort to release blocked
-        /// callers. Complements the in-daemon watchdog, which can log a
-        /// wedge but not clear one. Kill/restart stays manual (the
-        /// escalation prints the daemon PID and the exact commands).
+        /// logs an error, dumps daemon state, and, when run as root,
+        /// writes /sys/fs/fuse/connections/<id>/abort to release
+        /// blocked callers. This complements the in-daemon watchdog,
+        /// which can log a wedge but not clear one. Kill and restart
+        /// stay manual; the escalation prints the daemon PID and the
+        /// exact commands.
         #[arg(long, requires = "daemon")]
         supervise: bool,
 
-        /// Custom UID presented as the owner of files in the mount
-        /// (default: current user or SUDO_UID). Presentation-only: staging
-        /// /cache I/O still runs as the user executing `squeezefs mount`
-        /// (the staging preflight enforces that identity can write the
-        /// roots; format/set-cache-paths stamp their ownership).
+        /// UID presented as the owner of files in the mount
+        ///
+        /// Default: the current user, or SUDO_UID under sudo.
+        /// Presentation-only: staging and cache I/O still run as the
+        /// user executing `squeezefs mount`. The staging preflight
+        /// checks that identity can write the roots; format and
+        /// set-cache-paths stamp their ownership.
         #[arg(long)]
         uid: Option<u32>,
 
-        /// Custom GID presented as the group of files in the mount
-        /// (default: current group or SUDO_GID). Presentation-only, like
-        /// --uid.
+        /// GID presented as the group of files in the mount
+        ///
+        /// Default: the current group, or SUDO_GID under sudo.
+        /// Presentation-only, like --uid.
         #[arg(long)]
         gid: Option<u32>,
 
@@ -403,12 +453,13 @@ enum Commands {
         // Anchors: docs/design-preload-interception.md (the L4 program)
         // — KD-11 forced write-through (§5.6.2), the §5.2 session-host
         // control plane.
-        /// Enable the LD_PRELOAD interception session host for this
-        /// mount (equivalent to `-o interception` / SQUEEZEFS_IPC=1):
-        /// clients launched with LD_PRELOAD=libsqueezefs_il.so exchange
-        /// data with the daemon directly, bypassing the kernel. Forces
+        /// Enable the LD_PRELOAD interception session host for this mount
+        ///
+        /// Equivalent to `-o interception` / SQUEEZEFS_IPC=1. Clients
+        /// launched with LD_PRELOAD=libsqueezefs_il.so exchange data
+        /// with the daemon directly, bypassing the kernel. Forces
         /// kernel write-through on the mount; combining it with an
-        /// explicit writeback request refuses loudly.
+        /// explicit writeback request is an error.
         #[arg(long)]
         interception: bool,
 
@@ -420,18 +471,30 @@ enum Commands {
         #[arg(long)]
         check_storage: bool,
 
-        /// Time in seconds to wait for staged writes to drain to NVMe-oF backend on dismount (default: 10)
+        /// Seconds to wait for staged writes to drain on dismount
+        ///
+        /// Staged writes drain to the block backend before the
+        /// filesystem detaches. Default: 10.
         #[arg(long)]
         dismount_wait: Option<String>,
-        /// Delay/interval for background staging write uploads (e.g. "500ms", "5s")
+        /// Interval for background staging write uploads
+        ///
+        /// Accepts durations such as "500ms" or "5s".
         #[arg(long)]
         upload_delay: Option<String>,
 
-        /// Override the /dev/fuse io_uring SQPOLL idle timeout in milliseconds for this mount. Use 0 to disable even if the volume has a shared default.
+        /// io_uring SQPOLL idle timeout in milliseconds for this mount
+        ///
+        /// Overrides the volume's shared default for the /dev/fuse
+        /// rings. Use 0 to disable even when the volume has a shared
+        /// default.
         #[arg(long, env = "SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS")]
         fuse_io_uring_sqpoll_idle_ms: Option<u32>,
 
-        /// Pin the /dev/fuse io_uring SQPOLL kernel thread to a CPU for this mount only. Use 0 to disable CPU pinning.
+        /// Pin the io_uring SQPOLL kernel thread to a CPU (this mount)
+        ///
+        /// Applies to the /dev/fuse rings. Use 0 to disable CPU
+        /// pinning.
         #[arg(long, env = "SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU")]
         fuse_io_uring_sqpoll_cpu: Option<u32>,
 
@@ -439,7 +502,9 @@ enum Commands {
         #[arg(short = 'o', long)]
         options: Option<String>,
 
-        /// Limit the background job worker CPU utilization percentage (1 to 100, default: 50)
+        /// Background job worker CPU utilization limit, in percent
+        ///
+        /// Accepts 1 to 100. Default: 50.
         #[arg(long, default_value_t = 50)]
         job_cpu_limit: u32,
 
@@ -448,13 +513,18 @@ enum Commands {
         write_verification: bool,
 
         // Anchor: P2-9 (sampled read-after-write verification).
-        /// When `--write-verification` is set, verify every N-th write.
-        /// Default 1 = verify every write. Larger values reduce the
-        /// read-after-write cost under load.
+        /// With --write-verification, verify every N-th write
+        ///
+        /// The default of 1 verifies every write. Larger values reduce
+        /// the read-after-write cost under load.
         #[arg(long, default_value_t = 1)]
         write_verification_sample: u64,
     },
-    /// Cleanly unmount a squeezefs mountpoint (fusermount/umount/-f; kills zombie daemon if needed)
+    /// Unmount a squeezefs mountpoint
+    ///
+    /// Unmounts via fusermount or umount. With -f it kills holders and
+    /// any leftover daemon, falling back to a lazy umount as a last
+    /// resort.
     Umount {
         /// Optional Metadata URI (sqmeta://...)
         #[arg(
@@ -471,25 +541,34 @@ enum Commands {
         #[arg(long, short = 'f')]
         force: bool,
     },
-    /// Benchmark a mounted filesystem over a persistent, reusable dataset at
-    /// <MOUNTPOINT>/squeezefs-bench (simplified-elbencho model). A BARE
-    /// invocation (no phase flags) runs the full saturation suite over one
-    /// auto-sized dataset: write seq 1m --direct, read seq 1m --direct, read
-    /// rand 4k --direct (30s box), write rand 4k --direct (30s box), stat,
-    /// del (leaves the mount clean). Explicit phase flags run exactly those
-    /// phases in the fixed order write, read, stat, del, with the same auto
-    /// defaults for -t/-n/-s so single-phase numbers stay comparable to the
-    /// suite passes.
+    /// Benchmark a mounted filesystem
+    ///
+    /// Runs over a persistent, reusable dataset at
+    /// <MOUNTPOINT>/squeezefs-bench (simplified-elbencho model).
+    ///
+    /// A bare invocation (no phase flags) runs the full saturation
+    /// suite over one auto-sized dataset: write seq 1m --direct, read
+    /// seq 1m --direct, read rand 4k --direct (30s box), write rand 4k
+    /// --direct (30s box), stat, del. The del pass leaves the mount
+    /// clean.
+    ///
+    /// Explicit phase flags run exactly those phases in the fixed
+    /// order write, read, stat, del, with the same auto defaults for
+    /// -t/-n/-s, so single-phase numbers stay comparable to the suite
+    /// passes.
     Bench {
         /// Path to the mounted filesystem directory
         mountpoint: PathBuf,
-        /// Write phase: create/overwrite the dataset, timed. Timing includes
-        /// file create/open, and every file is fsync'd before the clock stops
-        /// (honest durable write numbers).
+        /// Write phase: create or overwrite the dataset, timed
+        ///
+        /// Timing includes file create/open, and every file is fsync'd
+        /// before the clock stops, so the rows report durable writes.
         #[arg(short = 'w', long)]
         write: bool,
-        /// Read phase: read the dataset back, timed (reuses the dataset from
-        /// an earlier -w; fails loudly if its shape does not match)
+        /// Read phase: read the dataset back, timed
+        ///
+        /// Reuses the dataset from an earlier -w; fails if its shape
+        /// does not match.
         #[arg(short = 'r', long)]
         read: bool,
         /// Stat phase: stat every dataset file, timed
@@ -498,43 +577,56 @@ enum Commands {
         /// Delete phase: delete the dataset, timed (doubles as cleanup)
         #[arg(long)]
         del: bool,
-        /// Number of worker threads (worker t owns squeezefs-bench/t{t}/)
-        /// [default: auto = min(CPUs, 16)]
+        /// Number of worker threads [default: auto = min(CPUs, 16)]
+        ///
+        /// Worker t owns squeezefs-bench/t{t}/.
         #[arg(short = 't', long)]
         threads: Option<usize>,
         /// Files per thread [default: auto = 1]
         #[arg(short = 'n', long)]
         files: Option<usize>,
-        /// File size — human units 4k / 128k / 4m / 10g, or plain bytes
-        /// [default: auto-sized — total max(16g, 2g x threads), capped at 25%
-        /// of the mountpoint's free space, rounded down to 1 MiB]
+        /// File size: human units 4k / 128k / 4m / 10g, or plain bytes
+        ///
+        /// Default: auto-sized. The total is max(16g, 2g x threads),
+        /// capped at 25% of the mountpoint's free space and rounded
+        /// down to 1 MiB.
         #[arg(short = 's', long, value_parser = squeezefs::bench::parse_size)]
         size: Option<u64>,
-        /// I/O block size per operation, same units — explicit phase runs
-        /// only; the suite fixes 1m seq / 4k rand [default: 1m]
+        /// I/O block size per operation, same units [default: 1m]
+        ///
+        /// Explicit phase runs only; the suite fixes 1m sequential and
+        /// 4k random.
         #[arg(short = 'b', long, value_parser = squeezefs::bench::parse_size)]
         block: Option<u64>,
-        /// Random offsets: shuffled full-coverage block list (every block
-        /// exactly once) — explicit phase runs only
+        /// Random offsets (explicit phase runs only)
+        ///
+        /// Uses a shuffled full-coverage block list: every block
+        /// exactly once.
         #[arg(long)]
         rand: bool,
-        /// O_DIRECT I/O — requires -b to be a multiple of 4096 and -s to be a
-        /// multiple of -b (loud errors otherwise). The suite's I/O passes are
-        /// always O_DIRECT. NOTE (hybrid I/O): on a default mount O_DIRECT
-        /// reads serve from the SqueezeFS read tiers once warm — for
-        /// device-path/amplification measurement mount with
-        /// `-o direct_device_true` (the bench header prints which posture
-        /// the rows carry).
+        /// O_DIRECT I/O
+        ///
+        /// Requires -b to be a multiple of 4096 and -s to be a multiple
+        /// of -b; anything else is an error. The suite's I/O passes are
+        /// always O_DIRECT.
+        ///
+        /// Hybrid I/O note: on a default mount, O_DIRECT reads serve
+        /// from the SqueezeFS read tiers once warm. For device-path or
+        /// amplification measurement, mount with `-o direct_device_true`.
+        /// The bench header prints which posture the rows carry.
         #[arg(long)]
         direct: bool,
         /// Wall-clock time box in seconds for rand read/write passes
-        /// [default: 30 for --rand, unlimited (full coverage) for
-        /// sequential; 0 = force full coverage]. Partial coverage is stated
-        /// in the results row.
+        ///
+        /// Default: 30 for --rand, unlimited (full coverage) for
+        /// sequential; 0 forces full coverage. Partial coverage is
+        /// stated in the results row.
         #[arg(long)]
         time: Option<u64>,
-        /// Repeat the selected pass set N times (fresh timing each
-        /// iteration; write iterations overwrite the dataset in place)
+        /// Repeat the selected pass set N times
+        ///
+        /// Each iteration is timed fresh; write iterations overwrite
+        /// the dataset in place.
         #[arg(short = 'i', long, default_value_t = 1)]
         iterations: usize,
     },
@@ -554,7 +646,9 @@ enum Commands {
         /// Destination file path
         dest: String,
     },
-    /// Automatically tune client node configurations (requires root/sudo to apply changes)
+    /// Automatically tune client node configuration
+    ///
+    /// Applying changes requires root (run under sudo).
     Tune,
     /// Configuration management utility
     Config {
@@ -570,9 +664,11 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigActions,
     },
-    /// Show filesystem space/inode usage for a volume set (offline/URI
-    /// query over the durable state; a mounted filesystem also answers
-    /// plain `df -h <mountpoint>` via statfs)
+    /// Show filesystem space and inode usage for a volume set
+    ///
+    /// An offline query over the durable state, addressed by URI. A
+    /// mounted filesystem also answers plain `df -h <mountpoint>` via
+    /// statfs.
     Df {
         /// Metadata URI (sqmeta://...) or a metadata volume path
         #[arg(
@@ -595,9 +691,10 @@ enum Commands {
         #[command(subcommand)]
         action: StorageActions,
     },
-    /// Configure and manage NVMe over Fabrics target shares and client
-    /// connections (dual-stack: SPDK default, kernel nvmet via
-    /// --target-stack nvmet)
+    /// Manage NVMe over Fabrics target shares and client connections
+    ///
+    /// Dual-stack: SPDK is the default target stack; select kernel
+    /// nvmet with --target-stack nvmet.
     Nvmeof {
         #[command(subcommand)]
         action: NvmeofActions,
@@ -606,16 +703,20 @@ enum Commands {
 
 #[derive(Subcommand, Debug, Clone)]
 enum ClaimActions {
-    /// Operator-attested removal of a STALE writer_claim (the recovery
-    /// rung for a crashed cross-host writer on a volume without NVMe
-    /// Persistent Reservations). Refuses fresh claims and live-mounted
-    /// volumes; re-verifies staleness under its own probe. The automation
-    /// ladder ahead of this verb: same-host dead-pid auto-reclaim ->
-    /// Persistent-Reservation preempt -> claim TTL. There is NO mount
-    /// flag that bypasses the guard.
+    /// Remove a stale writer claim (operator-attested)
+    ///
+    /// The recovery step for a crashed cross-host writer on a volume
+    /// without NVMe Persistent Reservations. Fresh claims and
+    /// live-mounted volumes are refused, and staleness is re-verified
+    /// under the command's own probe.
+    ///
+    /// The automation ladder ahead of this verb: same-host dead-pid
+    /// auto-reclaim, then Persistent-Reservation preempt, then claim
+    /// TTL expiry. No mount flag bypasses the guard.
     Clear {
-        /// Metadata URI (sqmeta://...) — every volume in the set is
-        /// cleared in order
+        /// Metadata URI (sqmeta://...)
+        ///
+        /// Every volume in the set is cleared in order.
         meta_uri: String,
     },
 }
@@ -680,7 +781,9 @@ enum StorageVolumeActions {
         /// Volume size (e.g. 1P, 100G)
         #[arg(long)]
         size: String,
-        /// Explicit number of disks/stripes to stripe across (defaults to auto-detecting all disks in the pool)
+        /// Number of disks/stripes to stripe across
+        ///
+        /// Default: auto-detect all disks in the pool.
         #[arg(long)]
         stripes: Option<usize>,
         /// Stripe size (e.g. 64K, 256K, 512K, default: 512K)
@@ -731,9 +834,10 @@ impl From<TargetStackArg> for squeezefs::nvmeof::StackKind {
 
 #[derive(Subcommand, Debug, Clone)]
 enum NvmeofActions {
-    /// Share a local block device or regular file as an NVMe-oF target
-    /// subsystem (default target stack: spdk — kernel nvmet via
-    /// --target-stack nvmet)
+    /// Share a local block device or file as an NVMe-oF subsystem
+    ///
+    /// The default target stack is spdk; select kernel nvmet with
+    /// --target-stack nvmet.
     Share {
         /// Local backing path (e.g. /dev/nvme1n1 or /srv/backing.img)
         backing_path: String,
@@ -750,70 +854,91 @@ enum NvmeofActions {
         /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default spdk)
         #[arg(long, value_enum)]
         target_stack: Option<TargetStackArg>,
-        /// Namespace id — SPDK-only; the kernel-nvmet namespace index is
-        /// structurally fixed at 1 (values != 1 with nvmet refuse loud)
+        /// Namespace id (SPDK only)
+        ///
+        /// The kernel-nvmet namespace index is structurally fixed at 1;
+        /// other values with nvmet are an error.
         #[arg(long)]
         nsid: Option<u32>,
-        /// Namespace identity UUID, recorded and re-presented by restore
-        /// on both stacks (generated once at share time when absent)
+        /// Namespace identity UUID
+        ///
+        /// Recorded and re-presented by restore on both stacks.
+        /// Generated once at share time when absent.
         #[arg(long)]
         ns_uuid: Option<String>,
-        /// Explicitly create a missing file backing as a sparse file of
-        /// this size (e.g. "10G") — missing backings otherwise refuse loud
+        /// Create a missing file backing as a sparse file of this size
+        ///
+        /// Accepts sizes such as "10G". Without this flag a missing
+        /// backing is an error.
         #[arg(long)]
         create_size: Option<String>,
-        /// Allow only these host NQNs to connect (repeatable; default:
-        /// allow-any — the trusted-fabric posture)
+        /// Allow only these host NQNs to connect (repeatable)
+        ///
+        /// Default: allow any host, the trusted-fabric posture.
         #[arg(long)]
         allow_host: Vec<String>,
-        /// Proceed against an SPDK target whose version drifts from the
-        /// pin (SPDK-only; refuses loud with --target-stack nvmet)
+        /// Proceed despite SPDK target version drift from the pin
+        ///
+        /// SPDK only; an error with --target-stack nvmet.
         #[arg(long)]
         accept_version_drift: bool,
     },
-    /// Stop sharing a target subsystem (stack resolved from the share
-    /// ledger — never guessed; unledgered NQNs refuse loud)
+    /// Stop sharing a target subsystem
+    ///
+    /// The stack is resolved from the share ledger, never guessed.
+    /// Unledgered NQNs are an error.
     Unshare {
         /// Subsystem NQN to unshare
         subnqn: String,
-        /// Tear down even with live initiator connections (the SPDK
-        /// stack detects and refuses them without this flag)
+        /// Tear down even with live initiator connections
+        ///
+        /// The SPDK stack detects live connections and refuses without
+        /// this flag.
         #[arg(long)]
         force: bool,
-        /// Proceed against an SPDK target whose version drifts from the
-        /// pin (SPDK-only; refuses loud on nvmet-recorded NQNs)
+        /// Proceed despite SPDK target version drift from the pin
+        ///
+        /// SPDK only; an error on nvmet-recorded NQNs.
         #[arg(long)]
         accept_version_drift: bool,
     },
-    /// List ledgered shares reconciled against live target state
-    /// (managed / down / pending / removing / foreign) plus connected
-    /// remote fabric disks
+    /// List ledgered shares and connected remote fabric disks
+    ///
+    /// Shares are reconciled against live target state and reported as
+    /// managed, down, pending, removing, or foreign.
     List {
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
     },
-    /// Re-establish ledgered shares on their recorded stacks (idempotent;
-    /// reconciles interrupted share/unshare intents; per-share report)
+    /// Re-establish ledgered shares on their recorded stacks
+    ///
+    /// Idempotent. Reconciles interrupted share/unshare intents and
+    /// prints a per-share report.
     Restore {
-        /// Replay only records recorded for this stack (a filter, never a
-        /// retarget)
+        /// Replay only records recorded for this stack
+        ///
+        /// A filter, never a retarget.
         #[arg(long, value_enum)]
         target_stack: Option<TargetStackArg>,
-        /// Proceed against an SPDK target whose version drifts from the
-        /// pin (SPDK-only; refuses loud with --target-stack nvmet)
+        /// Proceed despite SPDK target version drift from the pin
+        ///
+        /// SPDK only; an error with --target-stack nvmet.
         #[arg(long)]
         accept_version_drift: bool,
     },
-    /// Absorb a live foreign (unledgered) share into management by
-    /// writing only the share ledger — the live target object is never
-    /// touched (explicit operator action; stack auto-detected from
-    /// where the subsystem lives)
+    /// Absorb a live unledgered share into management
+    ///
+    /// An explicit operator action: writes only the share ledger and
+    /// never touches the live target object. The stack is auto-detected
+    /// from where the subsystem lives.
     Adopt {
         /// Subsystem NQN to adopt (must be live on exactly one stack)
         subnqn: String,
-        /// Disambiguate an NQN that is live on BOTH stacks (adopt
-        /// otherwise fails closed naming both holders); never a retarget
+        /// Disambiguate an NQN that is live on both stacks
+        ///
+        /// Without this flag such an adopt fails closed, naming both
+        /// holders. Never a retarget.
         #[arg(long, value_enum)]
         target_stack: Option<TargetStackArg>,
     },
@@ -834,9 +959,11 @@ enum NvmeofActions {
         /// Subsystem NQN to disconnect
         subnqn: String,
     },
-    /// Manage the NVMe-oF target runtime (SPDK lifecycle: pinned
-    /// install, hugepage setup, start/stop/status, systemd-unit
-    /// emission; nvmet arms where meaningful)
+    /// Manage the NVMe-oF target runtime
+    ///
+    /// SPDK lifecycle: pinned install, hugepage setup,
+    /// start/stop/status, systemd-unit emission. The nvmet stack
+    /// implements the verbs where they are meaningful.
     Target {
         #[command(subcommand)]
         action: TargetActions,
@@ -845,21 +972,28 @@ enum NvmeofActions {
 
 #[derive(Subcommand, Debug, Clone)]
 enum TargetActions {
-    /// Build the pinned SPDK release (tag + commit sha verified) into
-    /// /opt/squeezefs/spdk/<tag>/ — SPDK-only by definition
+    /// Build the pinned SPDK release from source
+    ///
+    /// Verifies the tag and commit sha, then builds into
+    /// /opt/squeezefs/spdk/<tag>/. SPDK only by definition.
     Install {
-        /// Release to install — must equal the pinned tag (pin bumps are
-        /// deliberate PRs, never a CLI flag)
+        /// Release to install; must equal the pinned tag
+        ///
+        /// Pin bumps are deliberate source changes, never a CLI flag.
         #[arg(long)]
         version: Option<String>,
-        /// Explicit consent to system package mutation (runs the pinned
-        /// tree's scripts/pkgdep.sh); default: probe the toolchain and
-        /// refuse loud listing the missing packages
+        /// Consent to system package mutation
+        ///
+        /// Runs the pinned tree's scripts/pkgdep.sh. Default: probe the
+        /// toolchain and fail, listing the missing packages.
         #[arg(long)]
         with_pkgdep: bool,
     },
-    /// SPDK: reserve 2 MiB hugepages (records the prior value; restore
-    /// with --restore-prior). nvmet: modprobe + configfs mount checks
+    /// Prepare the host for the selected target stack
+    ///
+    /// SPDK: reserves 2 MiB hugepages and records the prior value;
+    /// restore it with --restore-prior. nvmet: modprobe and configfs
+    /// mount checks.
     Setup {
         /// Hugepage reservation in MiB (default 2048 = 1024 × 2 MiB pages)
         #[arg(long, conflicts_with = "restore_prior")]
@@ -872,14 +1006,17 @@ enum TargetActions {
         #[arg(long, value_enum)]
         target_stack: Option<TargetStackArg>,
     },
-    /// Start the target (SPDK: pidfile mode — preflighted spawn,
-    /// RPC-liveness wait, load_config; nvmet: modprobe + ledger restore)
+    /// Start the target
+    ///
+    /// SPDK runs in pidfile mode: preflighted spawn, RPC-liveness
+    /// wait, then load_config. nvmet: modprobe and ledger restore.
     Start {
         /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default spdk)
         #[arg(long, value_enum)]
         target_stack: Option<TargetStackArg>,
-        /// Explicit reactor core mask (hex, e.g. 0x80000000); default:
-        /// one reactor on the highest online CPU
+        /// Explicit reactor core mask (hex, e.g. 0x80000000)
+        ///
+        /// Default: one reactor on the highest online CPU.
         #[arg(long, conflicts_with = "cores")]
         core_mask: Option<String>,
         /// Reactor core count, allocated from the highest online CPUs down
@@ -889,12 +1026,17 @@ enum TargetActions {
         #[arg(long)]
         dpdk_mem_mb: Option<u64>,
         /// Proceed despite a target version that drifts from the pin
-        /// (mutating-verb gate; status always reports, stop warns)
+        ///
+        /// A gate on mutating verbs only: status always reports, stop
+        /// warns.
         #[arg(long)]
         accept_version_drift: bool,
     },
-    /// Stop the SPDK target: save_config -> SIGTERM -> grace -> SIGKILL
-    /// (refuses while ledgered shares have live consumers unless --force)
+    /// Stop the target
+    ///
+    /// SPDK sequence: save_config, SIGTERM, a grace period, then
+    /// SIGKILL. Fails while ledgered shares have live consumers unless
+    /// --force is given.
     Stop {
         /// Stop even with live initiator connections on ledgered shares
         #[arg(long)]
@@ -903,8 +1045,11 @@ enum TargetActions {
         #[arg(long, value_enum)]
         target_stack: Option<TargetStackArg>,
     },
-    /// Report target health: RPC liveness, version + drift, reactor
-    /// busy, hugepages, ledger reconciliation (never refuses on drift)
+    /// Report target health
+    ///
+    /// Covers RPC liveness, version and drift from the pin, reactor
+    /// busy, hugepages, and ledger reconciliation. Never fails on
+    /// version drift.
     Status {
         /// Emit machine-readable JSON
         #[arg(long)]
@@ -913,8 +1058,10 @@ enum TargetActions {
         #[arg(long, value_enum)]
         target_stack: Option<TargetStackArg>,
     },
-    /// Emit a systemd unit to stdout with values baked at emission time
-    /// (never installed — the operator installs it)
+    /// Emit a systemd unit to stdout
+    ///
+    /// Values are baked at emission time. The unit is never installed;
+    /// the operator installs it.
     SystemdUnit {
         /// Target stack (flag > SQUEEZEFS_NVMEOF_TARGET_STACK env > default spdk)
         #[arg(long, value_enum)]
@@ -935,12 +1082,16 @@ enum TargetActions {
 enum VolumeActions {
     // Anchors: design-volume-lifecycle §5.3 (PR VL3); the add stamps the
     // KV_VOLUME_LIFECYCLE incompat bit (pre-VL3 binaries refuse it loud).
-    /// Add a data volume to the set — durable never-reused `vol-` id,
-    /// preflight-checked (device exists, sized, not already a member,
-    /// write+readback probe). TARGET = a live mountpoint (online add via
-    /// the admin lane) or a sqmeta:// URI (offline, guarded like
-    /// `config set-cache-paths`). Marks the volume set: older squeezefs
-    /// releases refuse to open it afterwards (loudly).
+    /// Add a data volume to the set
+    ///
+    /// The new member gets a durable, never-reused `vol-` id. The add
+    /// is preflight-checked: the device must exist, be sized, not
+    /// already be a member, and pass a write-and-readback probe.
+    ///
+    /// TARGET is a live mountpoint (online add through the admin lane)
+    /// or a sqmeta:// URI (offline; guarded like `config
+    /// set-cache-paths`). The add marks the volume set: older squeezefs
+    /// releases refuse to open it afterwards.
     AddData {
         /// Live mountpoint or sqmeta:// URI
         target: String,
@@ -951,10 +1102,12 @@ enum VolumeActions {
         #[arg(long)]
         no_rebalance: bool,
     },
-    /// List the durable volume set: ids, backing devices, states, and
-    /// the capacity math that is honestly derivable (live mounts report
-    /// used/free from the allocators; offline probes report device
-    /// capacity — the full census rides `squeezefs df`)
+    /// List the durable volume set
+    ///
+    /// Prints ids, backing devices, states, and the capacity figures
+    /// available from the query path used: live mounts report used and
+    /// free space from the allocators; offline probes report device
+    /// capacity. `squeezefs df` prints the full census.
     List {
         /// Live mountpoint or sqmeta:// URI
         target: String,
@@ -964,14 +1117,20 @@ enum VolumeActions {
     },
     // Anchors: design-volume-lifecycle §5.4 (drain/remove), §5.2
     // capacity census, §5.8 offline D0-guarded coordinator.
-    /// Remove a data volume: capacity preflight (refused honestly — with
-    /// the numbers printed — when the surviving volumes cannot fit the
-    /// data census), durable Active → Draining flip (excluded from new
-    /// placement, still serves reads), copy-on-write evacuation (shared
-    /// clone blocks move once), retire when the volume's census reaches
-    /// 0. TARGET = a live mountpoint (the drain runs on the mounted
-    /// daemon) or a sqmeta:// URI (offline: a short-lived exclusive
-    /// writer-guarded coordinator drains in-process to completion).
+    /// Drain and remove a data volume
+    ///
+    /// A capacity preflight runs first; when the surviving volumes
+    /// cannot hold the data census, the command fails and prints the
+    /// capacity figures. The volume then flips durably from active to
+    /// draining: it is excluded from new placement but still serves
+    /// reads. Copy-on-write evacuation moves the data (shared clone
+    /// blocks move once), and the volume retires when its census
+    /// reaches zero.
+    ///
+    /// TARGET is a live mountpoint (the drain runs on the mounted
+    /// daemon) or a sqmeta:// URI (offline: a short-lived coordinator
+    /// takes the exclusive writer guard and drains in-process to
+    /// completion).
     RemoveData {
         /// Live mountpoint or sqmeta:// URI
         target: String,
@@ -982,9 +1141,11 @@ enum VolumeActions {
         throttle: u32,
     },
     // Anchor: KD-5 (volume ids are permanent, never reused).
-    /// Cancel an in-flight drain: the volume returns to `active` (and
-    /// write placement); the evacuation job is cancelled cleanly.
-    /// Retired volumes never come back (their ids are permanent).
+    /// Cancel an in-flight drain
+    ///
+    /// The volume returns to `active` and to write placement, and the
+    /// evacuation job is cancelled cleanly. Retired volumes never come
+    /// back; their ids are permanent.
     Undrain {
         /// Live mountpoint or sqmeta:// URI
         target: String,
@@ -993,28 +1154,34 @@ enum VolumeActions {
     },
     // Anchors: design-volume-lifecycle §5.5.1a/§5.5.2b (PR VL5b);
     // offline it takes the D0 writer-guard claims.
-    /// Inspect and reconcile the metadata set-membership stamps: prints
-    /// the observed per-volume stamp state, idempotently re-stamps a
-    /// COHERENT observed state (including the single inferable missing
-    /// member a crashed repair can leave), resolves slot-flip epoch
-    /// spreads by per-slot highest-epoch-wins, and refuses everything
-    /// else loud. Offline verb: takes the exclusive writer-guard claims
-    /// like format-grade verbs; live mounts refuse.
+    /// Inspect and reconcile the metadata set-membership stamps
+    ///
+    /// Prints the observed per-volume stamp state. A coherent observed
+    /// state is re-stamped idempotently, including the single
+    /// inferable missing member a crashed repair can leave. Slot-flip
+    /// epoch spreads resolve by per-slot highest-epoch-wins. Any other
+    /// state fails with an explanation and no changes.
+    ///
+    /// Offline verb: takes the exclusive writer-guard claims like
+    /// format-grade verbs, and fails while the set is live-mounted.
     RepairSet {
         /// sqmeta:// URI of the metadata volume set
         target: String,
     },
     // Anchors: design-volume-lifecycle §5.5.2 (PR VL5b); the KD-8
     // staging-drain barrier; offline D0-guarded coordinator.
-    /// Add a METADATA volume: formats the device as a new member and
-    /// migrates the taken routing slots onto it (an added metadata
-    /// volume is only useful WITH slot migration). OFFLINE verb — pass
-    /// the sqmeta:// URI of the CURRENT set and unmount first; the
-    /// coordinator takes the exclusive writer guard. Drains staged
-    /// writes first and restamps the filesystem generation. Idempotent:
-    /// re-run an interrupted add with the same arguments.
+    /// Add a metadata volume and migrate routing slots onto it
+    ///
+    /// Formats the device as a new member and migrates the taken
+    /// routing slots onto it; an added metadata volume is only useful
+    /// together with slot migration. Staged writes are drained first,
+    /// and the filesystem generation is restamped.
+    ///
+    /// Offline verb: unmount first and pass the sqmeta:// URI of the
+    /// current set. The coordinator takes the exclusive writer guard.
+    /// Idempotent: re-run an interrupted add with the same arguments.
     AddMeta {
-        /// sqmeta:// URI of the CURRENT metadata set
+        /// sqmeta:// URI of the current metadata set
         target: String,
         /// Blank backing device for the new member
         device: String,
@@ -1025,11 +1192,12 @@ enum VolumeActions {
     },
     // Anchors: design-volume-lifecycle §5.5.2 (PR VL5b) — bulk copy +
     // conveyor delta tee + the §5.5.2a cutover gate + the §5.5.2b flip.
-    /// Migrate ONE routing slot to another metadata volume on a LIVE
-    /// mount: bulk copy, then live-delta catch-up, then a brief cutover
-    /// pause (p99 window < 250 ms target) and the durable flip. Runs as
-    /// a background job (`squeezefs job list` shows progress);
-    /// idempotent re-run converges after any crash.
+    /// Migrate one routing slot to another metadata volume
+    ///
+    /// Runs on a live mount: bulk copy, then live-delta catch-up, then
+    /// a brief cutover pause (p99 window under 250 ms target) and the
+    /// durable flip. Runs as a background job; `squeezefs job list`
+    /// shows progress. An idempotent re-run converges after any crash.
     MigrateMetaSlot {
         /// Live mountpoint
         target: String,
@@ -1040,14 +1208,18 @@ enum VolumeActions {
     },
     // Anchors: design-volume-lifecycle §5.5.2, §5.2 meta-side capacity
     // preflight, KD-8 generation barrier; offline D0-guarded coordinator.
-    /// Remove a METADATA volume: migrates every routing slot it hosts to
-    /// the surviving members (capacity-preflighted, refused honestly
-    /// when they cannot fit it), stamps the survivors first and the
-    /// victim's retirement tombstone last, and restamps the filesystem
-    /// generation. OFFLINE verb — unmount first; the coordinator takes
-    /// the exclusive writer guard. Idempotent re-run converges.
+    /// Remove a metadata volume from the set
+    ///
+    /// Migrates every routing slot the victim hosts to the surviving
+    /// members. A capacity preflight runs first and fails, with the
+    /// figures printed, when the survivors cannot fit the slots. The
+    /// survivors are stamped first, the victim's retirement tombstone
+    /// last, and the filesystem generation is restamped.
+    ///
+    /// Offline verb: unmount first. The coordinator takes the
+    /// exclusive writer guard. An idempotent re-run converges.
     RemoveMeta {
-        /// sqmeta:// URI of the CURRENT set (victim included)
+        /// sqmeta:// URI of the current set (victim included)
         target: String,
         /// The victim member's device path (as listed in the URI)
         victim: String,
@@ -1056,8 +1228,10 @@ enum VolumeActions {
 
 #[derive(Subcommand)]
 enum JobActions {
-    /// List jobs (TARGET = a live mountpoint, or a sqmeta:// URI for
-    /// the offline probe)
+    /// List jobs
+    ///
+    /// TARGET is a live mountpoint, or a sqmeta:// URI for the offline
+    /// read-only probe.
     List { target: String },
     /// One job's status
     Status { target: String, job_id: String },
@@ -1074,10 +1248,11 @@ enum JobActions {
         pct: u32,
     },
     // Anchor: design-volume-lifecycle §5.1.6 (the remote-worker wire).
-    /// Enroll this client as a remote data-plane worker on the volume
-    /// set's live coordinator: probes the mount registrations for the
-    /// coordinator's job endpoint, proves storage membership via the
-    /// job:enroll secret, serves shards until the coordinator goes away
+    /// Enroll this client as a remote data-plane job worker
+    ///
+    /// Probes the mount registrations for the live coordinator's job
+    /// endpoint, proves storage membership via the enrollment secret,
+    /// and serves job shards until the coordinator goes away.
     Worker {
         /// Metadata URI (sqmeta://...) of the volume set
         meta_uri: String,
@@ -1108,17 +1283,22 @@ enum ConfigActions {
         alias = "metadata_backend"
     )]
     MetadataVolume(MetadataVolumeActions),
-    /// Set runtime configuration quotas (capacity, inodes, or memory cache sizes)
+    /// Set runtime quotas (capacity, inodes, memory cache sizes)
     Set {
-        /// Quota/config key (e.g. "capacity", "inodes", "mem_cache_size", "read_mem_cache_size", "write_mem_cache_size", "fuse_io_uring_sqpoll_idle_ms")
+        /// Quota/config key
+        ///
+        /// One of "capacity", "inodes", "mem_cache_size",
+        /// "read_mem_cache_size", "write_mem_cache_size", or
+        /// "fuse_io_uring_sqpoll_idle_ms".
         key: String,
         /// New value (e.g. "100G", "2T" or numeric value/0)
         value: String,
     },
-    /// Replace the staging/cache directories recorded at format. Guarded
-    /// like format: refused while any client has the volume mounted. The
-    /// new directories are wiped so the next mount stamps a fresh staging
-    /// generation into them.
+    /// Replace the staging/cache directories recorded at format
+    ///
+    /// Guarded like format: fails while any client has the volume
+    /// mounted. The new directories are wiped so the next mount stamps
+    /// a fresh staging generation into them.
     SetCachePaths {
         /// Metadata URI (sqmeta://...) of the filesystem to change
         uri: String,
@@ -1155,7 +1335,7 @@ enum DataVolumeActions {
         /// Subsystem NQN of NVMe-oF target
         #[arg(long)]
         subnqn: Option<String>,
-        /// Optional capacity in bytes (or e.g. "100G", default matches formatted volume capacity)
+        /// Capacity (e.g. "100G"; default: the formatted volume capacity)
         #[arg(long)]
         capacity: Option<String>,
     },

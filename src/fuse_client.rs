@@ -12287,16 +12287,17 @@ pub async fn get_volume_status(meta_lv_path: &str) -> Result<serde_json::Value, 
     // REAL lifecycle state — active/disabled/draining/retired — mirroring
     // the `.config` display convention. Legacy (`data_lv`-only) configs
     // grandfather through `resolved_data_volumes()` (basename ids).
+    // Retired tombstones keep their permanent id + state but OMIT the
+    // cleared backing_dev (never rendered as an empty placeholder).
     let mut storage_backends = serde_json::Map::new();
     for rec in config.resolved_data_volumes() {
-        storage_backends.insert(
-            rec.id.clone(),
-            serde_json::json!({
-                "id": rec.id,
-                "backing_dev": rec.backing_dev,
-                "status": rec.state,
-            }),
-        );
+        let mut row = serde_json::Map::new();
+        row.insert("id".into(), serde_json::json!(rec.id));
+        if !rec.backing_dev.is_empty() {
+            row.insert("backing_dev".into(), serde_json::json!(rec.backing_dev));
+        }
+        row.insert("status".into(), serde_json::json!(rec.state));
+        storage_backends.insert(rec.id, serde_json::Value::Object(row));
     }
 
     // The real mount registrations on this volume's root ino (client
@@ -12318,9 +12319,13 @@ pub async fn get_volume_status(meta_lv_path: &str) -> Result<serde_json::Value, 
     // history to observe a transition in — the live counter is the
     // consuming daemon's `.stats` field).
     let mut backing_devices: Vec<String> = vec![meta_lv_path.to_string()];
-    if let Some(ref datalvs) = config.data_lv {
-        backing_devices.extend(datalvs.iter().cloned());
-    }
+    backing_devices.extend(
+        config
+            .resolved_data_volumes()
+            .into_iter()
+            .map(|r| r.backing_dev)
+            .filter(|p| !p.is_empty()),
+    );
     let fabric_section = crate::nvmeof::fabric::fabric_status_section(
         &crate::nvmeof::fabric::device_base_names(&backing_devices),
         &crate::nvmeof::fabric::enumerate_fabric_controllers(std::path::Path::new(

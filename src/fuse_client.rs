@@ -5958,10 +5958,26 @@ impl SqueezefsFilesystem {
                 } else {
                     // Build the seed OUTSIDE the map (no acked bytes live
                     // here yet — awaits are legal), then publish it.
+                    // The seed class keys on whether the BLOCK holds any
+                    // existing bytes — NOT on `needs_existing_data` (this
+                    // write's complement shape). The entry is published
+                    // BEFORE this write's coverage is recorded (never
+                    // invisible), so a fully-covering overwrite classified
+                    // "no complement owed" would sit in the map as a Fresh
+                    // (zeros-complement) buffer with an EMPTY union for the
+                    // absorb/sibling awaits — and a concurrent read's
+                    // Fresh-gap branch would compose ZEROS over real old
+                    // bytes (the ranged_read rebind_under_movement foreign-
+                    // zeros regression). Deferred costs nothing here: the
+                    // covering write completes the union at record_write,
+                    // which clears the deferral (`seed_deferred ⇒ union
+                    // partial` — structural), so no seed read is ever paid.
+                    let block_has_existing_bytes =
+                        std::cmp::min(existing_size, b_end_offset) > b_start_offset;
                     let seed = if let Some(d) = self.router.cache.nvme.read_staged(&cache_key) {
                         METRICS.write_block_revisits.fetch_add(1, Ordering::Relaxed);
                         crate::cache::active_block::ActiveBlockBuf::seeded(&d, block_size as usize)
-                    } else if !needs_existing_data {
+                    } else if !block_has_existing_bytes {
                         // Fresh entry: no existing data for this block, so the
                         // seed-time zero-fill is elided (§5.3) — the written
                         // coverage runs keep recycled pool bytes private, and

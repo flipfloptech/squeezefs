@@ -425,3 +425,44 @@ async fn lookup_dotdot_resolves_the_real_parent() {
             .attr;
     assert_eq!(got.ino, 1, "outer/.. is the root");
 }
+
+/// fstests generic/306 repro-port (VL10 release gate): device-node
+/// rdev must PERSIST. mknod stored the mode but dropped the device
+/// number (`rdev: 0` hardcoded in the attr conversion), so a mknod'd
+/// `c 1 3` read back as a char device pointing at device 0:0 —
+/// "No such device or address" on every open (306 writes to a
+/// mknod'd null device on a ro-remounted fs). The rdev rides the
+/// inode value's `rdev` wire word (32-bit new_encode_dev — historically
+/// the reserved `flags2`, whose bit 0's retired migrate-era quarantine
+/// meaning was never written by any live binary, so every existing
+/// volume holds 0 there; zero on-disk format change).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mknod_rdev_round_trips() {
+    let h = make().await;
+    let rdev: u32 = libc::makedev(1, 3) as u32; // /dev/null's numbers
+
+    let reply = h
+        .fs
+        .mknod(
+            h.req,
+            1,
+            OsStr::new("nullnode"),
+            libc::S_IFCHR | 0o666,
+            rdev,
+        )
+        .await
+        .expect("mknod");
+    assert_eq!(reply.attr.rdev, rdev, "mknod reply carries the rdev");
+    let ino = reply.attr.ino;
+
+    // Through a COLD attr cache (the durable read path, not the reply
+    // echo).
+    h.fs.attr_cache.invalidate(&ino);
+    let got = h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr;
+    assert_eq!(
+        got.rdev, rdev,
+        "getattr after cache invalidation must serve the persisted rdev \
+         (generic/306's devnull was 0:0)"
+    );
+    assert_eq!(got.kind, fuse3::FileType::CharDevice);
+}

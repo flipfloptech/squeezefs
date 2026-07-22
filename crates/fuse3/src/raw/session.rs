@@ -4712,10 +4712,11 @@ fn negotiate_reply_flags(init_in_flags: u32, mount_options: &MountOptions) -> u3
     // capability nothing implements is how the ENOENT-bouncing splice reply
     // path shipped in the first place.
 
-    // posix lock used, maybe we don't need bsd lock
-    if init_in_flags & FUSE_FLOCK_LOCKS > 0 {
-        reply_flags |= FUSE_FLOCK_LOCKS;
-    }
+    // FUSE_FLOCK_LOCKS is deliberately NOT echoed: no daemon flock
+    // handler exists, and advertising it made the kernel skip its own
+    // canonical BSD-flock bookkeeping (`/proc/locks` empty for held
+    // flocks — fstests generic/504). flock stays kernel-local; POSIX
+    // fcntl locks stay daemon-arbitrated above (the file-lock feature).
 
     if init_in_flags & FUSE_HAS_IOCTL_DIR > 0 {
         debug!("enable FUSE_HAS_IOCTL_DIR");

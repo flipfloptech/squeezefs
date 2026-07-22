@@ -418,12 +418,18 @@ async fn test_census_walk_baseline_measured() {
         "fsck scanned the dataset"
     );
     assert_zero_findings(&report, "baseline population");
-    // Loose sanity bound only — the gate-grade ½-floor number rides the
-    // lifecycle rig / closing report (see the file header for the
-    // recorded measurement and the reason this is not asserted exactly).
+    // The gate-grade ½-floor number rides the lifecycle rig / closing
+    // report (see the file header for the instrument caveat). This cargo
+    // bound pins the STRUCTURAL fix for it (VL10): pass 1's independent
+    // read-only walks (3 C1 tree walks + the census) run CONCURRENTLY at
+    // 100 % throttle, so the RAM-warm scan wall clock is bounded by the
+    // slowest single walk plus the cheap tails — ≥ census/4 here (it was
+    // ~census/10 when the four walks were a serial sum; the pre-fix
+    // tripwire was /20).
     assert!(
-        scan_rate >= census_rate / 20.0,
-        "fsck scan rate {scan_rate:.0}/s collapsed vs census baseline {census_rate:.0}/s"
+        scan_rate >= census_rate / 4.0,
+        "fsck scan rate {scan_rate:.0}/s collapsed vs census baseline {census_rate:.0}/s \
+         (< ¼ — the parallel pass-1 shape regressed toward the serial sum)"
     );
     fx.close().await;
 }

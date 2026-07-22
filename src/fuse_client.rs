@@ -11468,6 +11468,24 @@ fn mount_st_dev(mount_path: &Path) -> Option<u64> {
     None
 }
 
+/// The POSIX mount security tokens `(nosuid, nodev, noexec)` in a
+/// `-o` option string. These are MOUNT FLAGS (`MS_NOSUID`/`MS_NODEV`/
+/// `MS_NOEXEC`), not FUSE data options — the pre-fix plumbing dropped
+/// them entirely, so `mount -o nosuid` produced a suid-honoring mount
+/// (fstests generic/128; pinned in tests/mount_preflight_tests.rs).
+pub fn mount_security_flags(opts: &str) -> (bool, bool, bool) {
+    let (mut nosuid, mut nodev, mut noexec) = (false, false, false);
+    for opt in opts.split(',') {
+        match opt.trim() {
+            "nosuid" => nosuid = true,
+            "nodev" => nodev = true,
+            "noexec" => noexec = true,
+            _ => {}
+        }
+    }
+    (nosuid, nodev, noexec)
+}
+
 pub fn filter_kernel_mount_options(opts: &str) -> String {
     let mut kernel_opts = Vec::new();
     for opt in opts.split(',') {
@@ -11600,6 +11618,15 @@ pub async fn start_mount<P: AsRef<Path>>(
     options.allow_other(allow_other);
     options.write_back(posture.write_back);
     options.default_permissions(true);
+    if let Some(ref opts) = custom_opts {
+        // MS_NOSUID/MS_NODEV/MS_NOEXEC ride the mount(2) flags (root
+        // path) / the fusermount option string (unprivileged path) —
+        // fstests generic/128.
+        let (nosuid, nodev, noexec) = mount_security_flags(opts);
+        options.nosuid(nosuid);
+        options.nodev(nodev);
+        options.noexec(noexec);
+    }
 
     if let Some(ref opts) = custom_opts {
         for opt in opts.split(',') {

@@ -143,6 +143,29 @@ impl MountOptions {
         self
     }
 
+    /// mount with `MS_NOSUID` (suid/sgid bits ignored), default is disable.
+    /// Root mounts apply it as a mount(2) flag; unprivileged mounts pass
+    /// `nosuid` to fusermount.
+    pub fn nosuid(&mut self, nosuid: bool) -> &mut Self {
+        self.nosuid = nosuid;
+
+        self
+    }
+
+    /// mount with `MS_NODEV` (device nodes not interpreted), default is disable.
+    pub fn nodev(&mut self, nodev: bool) -> &mut Self {
+        self.nodev = nodev;
+
+        self
+    }
+
+    /// mount with `MS_NOEXEC` (execution refused), default is disable.
+    pub fn noexec(&mut self, noexec: bool) -> &mut Self {
+        self.noexec = noexec;
+
+        self
+    }
+
     /// make kernel support zero-message opens, default is disable
     pub fn no_open_support(&mut self, no_open_support: bool) -> &mut Self {
         self.no_open_support = no_open_support;
@@ -322,6 +345,18 @@ impl MountOptions {
 
         if self.default_permissions {
             opts.push("default_permissions".to_string());
+        }
+
+        if self.nosuid {
+            opts.push("nosuid".to_string());
+        }
+
+        if self.nodev {
+            opts.push("nodev".to_string());
+        }
+
+        if self.noexec {
+            opts.push("noexec".to_string());
         }
 
         let mut options = OsString::from(opts.join(","));

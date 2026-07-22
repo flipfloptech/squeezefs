@@ -23,7 +23,9 @@
 
 use std::path::{Path, PathBuf};
 
-use squeezefs::{DataVolumeRecord, FormatConfig, VOL_STATE_ACTIVE, VOL_STATE_DRAINING};
+use squeezefs::{
+    DataVolumeRecord, FormatConfig, VOL_STATE_ACTIVE, VOL_STATE_DRAINING, VOL_STATE_RETIRED,
+};
 
 const BLOCK: u64 = 4096;
 
@@ -122,11 +124,21 @@ async fn test_status_shape_durable_multi_volume() {
         state: VOL_STATE_DRAINING.to_string(),
         added_ts: 1_700_000_001,
     };
+    // A retired id-tombstone (VL4 §5.4: evacuation done, path CLEARED,
+    // id kept forever — KD-5). Its row must surface the permanent id +
+    // state with the backing_dev key OMITTED (the cleared path is "not
+    // a device anymore", never rendered as "").
+    let rec3 = DataVolumeRecord {
+        id: "vol-00000000000000c3".to_string(),
+        backing_dev: String::new(),
+        state: VOL_STATE_RETIRED.to_string(),
+        added_ts: 1_700_000_002,
+    };
 
     let mut cfg = base_format_config();
     cfg.mem_cache_size = Some("64MB".to_string());
     cfg.data_lv = Some(vec![rec1.backing_dev.clone(), rec2.backing_dev.clone()]);
-    cfg.data_volumes = Some(vec![rec1.clone(), rec2.clone()]);
+    cfg.data_volumes = Some(vec![rec1.clone(), rec2.clone(), rec3.clone()]);
     format_meta(&meta, &cfg).await;
 
     let status = squeezefs::fuse_client::get_volume_status(&meta.display().to_string())
@@ -170,7 +182,7 @@ async fn test_status_shape_durable_multi_volume() {
     let backends = setting["StorageBackends"]
         .as_object()
         .expect("StorageBackends object");
-    assert_eq!(backends.len(), 2, "both volume records listed: {status:#}");
+    assert_eq!(backends.len(), 3, "all volume records listed: {status:#}");
     for rec in [&rec1, &rec2] {
         let row = backends.get(&rec.id).unwrap_or_else(|| {
             panic!("StorageBackends keyed by durable id {}: {status:#}", rec.id)
@@ -183,6 +195,17 @@ async fn test_status_shape_durable_multi_volume() {
             "status must be the record's REAL lifecycle state, not a hardcoded 'enabled'"
         );
     }
+    // The retired tombstone: permanent id + state, backing_dev OMITTED
+    // (path cleared at retirement — never rendered as "").
+    let tomb = backends
+        .get(&rec3.id)
+        .unwrap_or_else(|| panic!("retired tombstone {} listed: {status:#}", rec3.id));
+    assert_eq!(tomb["id"], rec3.id.as_str());
+    assert_eq!(tomb["status"], VOL_STATE_RETIRED);
+    assert!(
+        tomb.as_object().unwrap().get("backing_dev").is_none(),
+        "retired tombstone's cleared path must be omitted: {status:#}"
+    );
 
     // 6. Clients rides along as a real (possibly empty) array.
     assert!(status["Clients"].is_array(), "Clients array: {status:#}");

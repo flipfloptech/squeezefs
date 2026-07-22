@@ -4852,6 +4852,31 @@ mod init_negotiation_tests {
         );
     }
 
+    /// Kernel-local POSIX byte-range locks (fstests generic/131 subtest
+    /// 27, generic/478, generic/504 — the VL10 release gate): a
+    /// daemon-arbitrated lock table cannot satisfy the full POSIX
+    /// surface — unlock-on-close rides FLUSH's `lock_owner`, which the
+    /// D2 clean-handle ENOSYS latch elides connection-wide (131's
+    /// "close without unlocking" leg), OFD locks carry
+    /// file-description owner semantics the wire does not represent
+    /// (478), and `/proc/locks` only shows kernel-tracked locks (504's
+    /// flock twin). The kernel's `posix_lock_file` is the canonical
+    /// implementation, and intra-mount arbitration is the whole
+    /// requirement under the D0 single-writer mount guard (cross-client
+    /// POSIX locks never existed — the daemon's Remote lock variant was
+    /// never constructed). The capability must never be echoed.
+    #[test]
+    fn init_reply_never_advertises_posix_locks() {
+        let opts = MountOptions::default();
+        let flags = negotiate_reply_flags(u32::MAX, &opts);
+        assert_eq!(
+            flags & FUSE_POSIX_LOCKS,
+            0,
+            "INIT reply advertised FUSE_POSIX_LOCKS — POSIX fcntl locks must \
+             stay kernel-local"
+        );
+    }
+
     /// The no-ACL posture (fstests generic/099/319): negotiating
     /// FUSE_POSIX_ACL makes the kernel's `posix_acl_create` probe the
     /// parent's default ACL on EVERY create — with a daemon that refuses

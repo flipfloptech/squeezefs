@@ -296,7 +296,7 @@ With `--supervise` the `mount --daemon` parent stays alive as an external watchd
 
 ### Host auto-tuning (`squeezefs tune`)
 
-Built-in host auto-tuning (`squeezefs tune`, requires root) optimizes virtual memory dirty page ratios (40/10), network socket buffer maxima (64 MiB), and live FUSE connection limits (`max_background`/`congestion_threshold` to the 256/192 policy ceiling, `read_ahead_kb` to 0). See [Kernel Tuning](../QUICKSTART.md#5-kernel-tuning-for-bare-metal-auto-tune).
+Built-in host auto-tuning (`squeezefs tune`, requires root) optimizes virtual memory dirty page ratios (40/10), network socket buffer maxima (64 MiB), and live FUSE connection limits (`max_background`/`congestion_threshold` to the 256/192 policy ceiling, `read_ahead_kb` to 0). See [Kernel Tuning](../QUICKSTART.md#6-kernel-tuning-for-bare-metal-auto-tune).
 
 ```bash
 squeezefs tune

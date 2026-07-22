@@ -114,12 +114,12 @@ async fn make() -> H {
         gid: unsafe { libc::getgid() },
         pid: 1,
     };
-    let ino =
-        fs.create(req, 1, OsStr::new("lockfile"), libc::S_IFREG | 0o644, 0)
-            .await
-            .unwrap()
-            .attr
-            .ino;
+    let ino = fs
+        .create(req, 1, OsStr::new("lockfile"), libc::S_IFREG | 0o644, 0)
+        .await
+        .unwrap()
+        .attr
+        .ino;
     H {
         fs,
         req,
@@ -252,22 +252,20 @@ async fn getlk_reports_the_real_conflict() {
 
     // WR probe by owner 2: conflicts with the RD lock — reply must carry
     // F_RDLCK + the real range + owner 1's pid.
-    let reply = h
-        .fs
-        .getlk(h.req, h.ino, h.ino, 2, 52, end(52, 4), WR, 2)
-        .await
-        .expect("getlk itself succeeds");
+    let reply =
+        h.fs.getlk(h.req, h.ino, h.ino, 2, 52, end(52, 4), WR, 2)
+            .await
+            .expect("getlk itself succeeds");
     assert_eq!(reply.r#type, RD, "the conflict is a READ lock, not WRLCK");
     assert_eq!(reply.start, 50);
     assert_eq!(reply.end, end(50, 10));
     assert_eq!(reply.pid, 1, "the real holder's pid");
 
     // RD probe by owner 2: RD/RD compatible — must reply F_UNLCK.
-    let reply = h
-        .fs
-        .getlk(h.req, h.ino, h.ino, 2, 52, end(52, 4), RD, 2)
-        .await
-        .expect("getlk succeeds");
+    let reply =
+        h.fs.getlk(h.req, h.ino, h.ino, 2, 52, end(52, 4), RD, 2)
+            .await
+            .expect("getlk succeeds");
     assert_eq!(reply.r#type, UN, "RD probe over RD lock: no conflict");
 }
 

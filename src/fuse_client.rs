@@ -2680,23 +2680,89 @@ pub struct OpenEntry {
     dirty: std::sync::atomic::AtomicBool,
 }
 
-pub enum PosixLock {
-    Local,
-    Global(Box<crate::dlm::LockLease>),
-    Remote { client_id: String },
+/// One POSIX advisory byte-range lock (inclusive `start..=end`, the
+/// kernel `struct file_lock` shape). The daemon opts into
+/// `FUSE_POSIX_LOCKS`, so it is the SOLE arbiter of advisory-lock
+/// semantics: type-aware compatibility (RD/RD shares, anything/WR
+/// conflicts across owners), same-owner replace/split coverage, and
+/// truthful GETLK conflict reports (fstests generic/131 — the pre-fix
+/// typeless `(ino, owner, start, end)` table made overlapping READ locks
+/// from different processes conflict and fabricated F_WRLCK conflicts;
+/// pinned in `tests/posix_lock_tests.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PosixLockEntry {
+    owner: u64,
+    pid: u32,
+    /// `libc::F_RDLCK` / `libc::F_WRLCK` as u32 (the FUSE wire encoding).
+    typ: u32,
+    start: u64,
+    /// Inclusive.
+    end: u64,
 }
 
-impl std::fmt::Debug for PosixLock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PosixLock::Local => write!(f, "Local"),
-            PosixLock::Global(_) => write!(f, "Global"),
-            PosixLock::Remote { client_id } => f
-                .debug_struct("Remote")
-                .field("client_id", client_id)
-                .finish(),
+impl PosixLockEntry {
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        std::cmp::max(self.start, start) <= std::cmp::min(self.end, end)
+    }
+
+    /// POSIX compatibility: locks of the same owner never conflict
+    /// (re-locks REPLACE coverage); across owners only RD/RD shares.
+    fn conflicts_with(&self, owner: u64, start: u64, end: u64, typ: u32) -> bool {
+        self.owner != owner
+            && self.overlaps(start, end)
+            && (self.typ == libc::F_WRLCK as u32 || typ == libc::F_WRLCK as u32)
+    }
+}
+
+/// Carve `owner`'s coverage of `[start, end]` out of `list` — the POSIX
+/// split: a spanning lock leaves left/right remnants.
+fn posix_carve_owner_range(list: &mut Vec<PosixLockEntry>, owner: u64, start: u64, end: u64) {
+    let mut out = Vec::with_capacity(list.len() + 1);
+    for e in list.drain(..) {
+        if e.owner != owner || !e.overlaps(start, end) {
+            out.push(e);
+            continue;
+        }
+        if e.start < start {
+            out.push(PosixLockEntry {
+                end: start - 1,
+                ..e
+            });
+        }
+        if e.end > end {
+            out.push(PosixLockEntry {
+                start: end + 1,
+                ..e
+            });
         }
     }
+    *list = out;
+}
+
+/// Merge `owner`'s adjacent/contiguous same-type entries (bounded table
+/// growth under repeated re-locks; carving keeps own entries disjoint,
+/// so a sort + single pass suffices).
+fn posix_coalesce_owner(list: &mut Vec<PosixLockEntry>, owner: u64) {
+    let mut own: Vec<PosixLockEntry> = Vec::new();
+    list.retain(|e| {
+        if e.owner == owner {
+            own.push(*e);
+            false
+        } else {
+            true
+        }
+    });
+    own.sort_by_key(|e| e.start);
+    let mut merged: Vec<PosixLockEntry> = Vec::with_capacity(own.len());
+    for e in own {
+        match merged.last_mut() {
+            Some(last) if last.typ == e.typ && e.start <= last.end.saturating_add(1) => {
+                last.end = std::cmp::max(last.end, e.end);
+            }
+            _ => merged.push(e),
+        }
+    }
+    list.extend(merged);
 }
 
 /// Max automatic retries for a single background writeback unit (P0-3).
@@ -2799,7 +2865,7 @@ pub struct SqueezefsFilesystem {
     active_leases: std::sync::Arc<dashmap::DashMap<u64, crate::dlm::LockLease, ahash::RandomState>>,
     lease_locks: std::sync::Arc<StripeLocks<tokio::sync::Mutex<()>, 4096>>,
     active_posix_locks:
-        std::sync::Arc<dashmap::DashMap<(Inode, u64, u64, u64), PosixLock, ahash::RandomState>>,
+        std::sync::Arc<dashmap::DashMap<Inode, Vec<PosixLockEntry>, ahash::RandomState>>,
     active_delegations:
         std::sync::Arc<dashmap::DashMap<Inode, crate::dlm::DelegationLease, ahash::RandomState>>,
     pub active_inode_locks: std::sync::Arc<StripeLocks<tokio::sync::RwLock<()>, 4096>>,
@@ -3212,31 +3278,10 @@ impl SqueezefsFilesystem {
     }
 
     pub fn active_posix_locks_count(&self) -> usize {
-        self.active_posix_locks.len()
-    }
-
-    pub fn has_local_posix_lock(&self, inode: Inode, owner: u64, start: u64, end: u64) -> bool {
-        if let Some(lock) = self.active_posix_locks.get(&(inode, owner, start, end)) {
-            matches!(*lock, PosixLock::Local)
-        } else {
-            false
-        }
-    }
-
-    pub fn has_global_posix_lock(&self, inode: Inode, owner: u64, start: u64, end: u64) -> bool {
-        if let Some(lock) = self.active_posix_locks.get(&(inode, owner, start, end)) {
-            matches!(*lock, PosixLock::Global(_))
-        } else {
-            false
-        }
-    }
-
-    pub fn has_remote_posix_lock(&self, inode: Inode, owner: u64, start: u64, end: u64) -> bool {
-        if let Some(lock) = self.active_posix_locks.get(&(inode, owner, start, end)) {
-            matches!(*lock, PosixLock::Remote { .. })
-        } else {
-            false
-        }
+        self.active_posix_locks
+            .iter()
+            .map(|e| e.value().len())
+            .sum()
     }
 
     pub fn has_delegation(&self, inode: Inode) -> bool {
@@ -3999,7 +4044,7 @@ impl SqueezefsFilesystem {
             "nvme_read_cache_block_keys": nvme_read_cache_block_keys,
             "active_writes": active_writes,
             "active_leases_count": self.active_leases.len(),
-            "active_posix_locks_count": self.active_posix_locks.len(),
+            "active_posix_locks_count": self.active_posix_locks_count(),
             "volume_states": volume_states,
             "placement": placement_obj,
             "metrics": {
@@ -7909,7 +7954,7 @@ impl SqueezefsFilesystem {
         if let Some((_, lease)) = self.active_leases.remove(&ino) {
             let _ = lease.release().await;
         }
-        self.active_posix_locks.retain(|key, _| key.0 != ino);
+        self.active_posix_locks.remove(&ino);
         self.router.metadata_cache.remove(&ino);
         self.attr_cache.invalidate(&ino);
         self.last_write_end.remove_sync(&ino);
@@ -10738,18 +10783,12 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         // Release POSIX locks held by this lock owner on this inode
-        let mut posix_to_remove = Vec::new();
-        for entry in self.active_posix_locks.iter() {
-            let &(lock_ino, lock_owner, lock_start, lock_end) = entry.key();
-            if lock_ino == ino && lock_owner == _lock_owner {
-                posix_to_remove.push((lock_ino, lock_owner, lock_start, lock_end));
-            }
+        // (close drops the process's advisory locks).
+        if let Some(mut entry) = self.active_posix_locks.get_mut(&ino) {
+            entry.value_mut().retain(|l| l.owner != _lock_owner);
         }
-        for key in posix_to_remove {
-            if let Some((_, PosixLock::Global(lease))) = self.active_posix_locks.remove(&key) {
-                let _ = lease.release().await;
-            }
-        }
+        self.active_posix_locks
+            .remove_if(&ino, |_, list| list.is_empty());
         prof.mark_backend_done();
 
         // Static lock array does not need dynamic cleanup
@@ -10942,37 +10981,23 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(map_squeezefs_err(e));
         }
 
-        // Check local conflicts
-        for entry in self.active_posix_locks.iter() {
-            let &(lock_ino, lock_owner, lock_start, lock_end) = entry.key();
-            if lock_ino == inode {
-                let is_conflict = match entry.value() {
-                    PosixLock::Local | PosixLock::Global(_) => {
-                        lock_owner != _lock_owner
-                            && std::cmp::max(lock_start, _start) <= std::cmp::min(lock_end, _end)
-                    }
-                    PosixLock::Remote { .. } => {
-                        std::cmp::max(lock_start, _start) <= std::cmp::min(lock_end, _end)
-                    }
-                };
-
-                if is_conflict {
-                    debug!(
-                        "FUSE getlk: conflict found locally with owner {} on range {}-{}",
-                        lock_owner, lock_start, lock_end
-                    );
-                    let conflict_pid = if lock_owner == u64::MAX {
-                        0
-                    } else {
-                        lock_owner as u32
-                    };
-                    return Ok(ReplyLock {
-                        start: lock_start,
-                        end: lock_end,
-                        r#type: libc::F_WRLCK as u32,
-                        pid: conflict_pid,
-                    });
-                }
+        // Report the ACTUAL first conflicting lock — its real type, range,
+        // and pid (the pre-fix reply fabricated F_WRLCK; generic/131).
+        if let Some(list) = self.active_posix_locks.get(&inode) {
+            if let Some(c) = list
+                .iter()
+                .find(|e| e.conflicts_with(_lock_owner, _start, _end, _type))
+            {
+                debug!(
+                    "FUSE getlk: conflict with owner {} type {} on range {}-{}",
+                    c.owner, c.typ, c.start, c.end
+                );
+                return Ok(ReplyLock {
+                    start: c.start,
+                    end: c.end,
+                    r#type: c.typ,
+                    pid: c.pid,
+                });
             }
         }
 
@@ -11013,68 +11038,54 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         if _type == libc::F_UNLCK as u32 {
-            let mut to_remove = Vec::new();
-            for entry in self.active_posix_locks.iter() {
-                let &(lock_ino, lock_owner, lock_start, lock_end) = entry.key();
-                if lock_ino == inode
-                    && lock_owner == _lock_owner
-                    && std::cmp::max(lock_start, _start) <= std::cmp::min(lock_end, _end)
-                {
-                    to_remove.push((lock_ino, lock_owner, lock_start, lock_end));
-                }
+            // POSIX split: carve exactly [start, end] out of this owner's
+            // coverage — a spanning lock leaves left/right remnants.
+            if let Some(mut entry) = self.active_posix_locks.get_mut(&inode) {
+                posix_carve_owner_range(entry.value_mut(), _lock_owner, _start, _end);
             }
-            for key in to_remove {
-                if let Some((_, PosixLock::Global(lease))) = self.active_posix_locks.remove(&key) {
-                    if let Err(e) = lease.release().await {
-                        error!("Failed to explicitly release lock lease: {:?}", e);
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        // If we already hold a lock on this exact range, release it first
-        if let Some((_, PosixLock::Global(old_lease))) =
             self.active_posix_locks
-                .remove(&(inode, _lock_owner, _start, _end))
-        {
-            let _ = old_lease.release().await;
+                .remove_if(&inode, |_, list| list.is_empty());
+            return Ok(());
         }
 
         let mut attempts = 0;
         let max_attempts = if _block { 20 } else { 1 };
 
         loop {
-            let mut conflict = false;
-            for entry in self.active_posix_locks.iter() {
-                let &(lock_ino, lock_owner, lock_start, lock_end) = entry.key();
-                if lock_ino == inode {
-                    let is_conflict = match entry.value() {
-                        PosixLock::Local | PosixLock::Global(_) => {
-                            lock_owner != _lock_owner
-                                && std::cmp::max(lock_start, _start)
-                                    <= std::cmp::min(lock_end, _end)
-                        }
-                        PosixLock::Remote { .. } => {
-                            std::cmp::max(lock_start, _start) <= std::cmp::min(lock_end, _end)
-                        }
-                    };
-
-                    if is_conflict {
-                        conflict = true;
-                        break;
-                    }
+            // The conflict check and the apply happen under ONE entry
+            // guard — the pre-fix scan-then-insert pair was a TOCTOU.
+            {
+                let mut entry = self.active_posix_locks.entry(inode).or_default();
+                let list = entry.value_mut();
+                let conflict = list
+                    .iter()
+                    .any(|e| e.conflicts_with(_lock_owner, _start, _end, _type));
+                if !conflict {
+                    debug!(
+                        "FUSE setlk: acquired {} lock {}-{} for owner {}",
+                        if _type == libc::F_WRLCK as u32 {
+                            "write"
+                        } else {
+                            "read"
+                        },
+                        _start,
+                        _end,
+                        _lock_owner
+                    );
+                    // Same-owner re-lock REPLACES coverage (upgrade/
+                    // downgrade splits the old entry), then adjacent
+                    // same-type ranges coalesce.
+                    posix_carve_owner_range(list, _lock_owner, _start, _end);
+                    list.push(PosixLockEntry {
+                        owner: _lock_owner,
+                        pid: _pid,
+                        typ: _type,
+                        start: _start,
+                        end: _end,
+                    });
+                    posix_coalesce_owner(list, _lock_owner);
+                    return Ok(());
                 }
-            }
-
-            if !conflict {
-                debug!(
-                    "FUSE setlk: successfully acquired lock range {}-{} for owner {} locally",
-                    _start, _end, _lock_owner
-                );
-                self.active_posix_locks
-                    .insert((inode, _lock_owner, _start, _end), PosixLock::Local);
-                return Ok(());
             }
 
             attempts += 1;

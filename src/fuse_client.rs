@@ -12282,17 +12282,21 @@ pub async fn get_volume_status(meta_lv_path: &str) -> Result<serde_json::Value, 
         ))
     })?;
 
+    // The durable data-volume set (KD-5, design-volume-lifecycle §5.3):
+    // keyed by the never-reused volume id, each row carrying the record's
+    // REAL lifecycle state — active/disabled/draining/retired — mirroring
+    // the `.config` display convention. Legacy (`data_lv`-only) configs
+    // grandfather through `resolved_data_volumes()` (basename ids).
     let mut storage_backends = serde_json::Map::new();
-    if let Some(ref datalvs) = config.data_lv {
-        for dl in datalvs {
-            storage_backends.insert(
-                dl.clone(),
-                serde_json::json!({
-                    "backing_dev": dl.clone(),
-                    "status": "enabled",
-                }),
-            );
-        }
+    for rec in config.resolved_data_volumes() {
+        storage_backends.insert(
+            rec.id.clone(),
+            serde_json::json!({
+                "id": rec.id,
+                "backing_dev": rec.backing_dev,
+                "status": rec.state,
+            }),
+        );
     }
 
     // The real mount registrations on this volume's root ino (client
@@ -12324,20 +12328,31 @@ pub async fn get_volume_status(meta_lv_path: &str) -> Result<serde_json::Value, 
         )),
     );
 
+    // Unset optional format fields are OMITTED — never rendered as ""/[]
+    // placeholders (a `None` here means "not configured", not "empty").
+    let mut setting = serde_json::Map::new();
+    setting.insert("Name".into(), serde_json::json!(config.name));
+    setting.insert("BlockSize".into(), serde_json::json!(config.block_size));
+    setting.insert("Capacity".into(), serde_json::json!(config.capacity));
+    setting.insert("Inodes".into(), serde_json::json!(config.inodes));
+    setting.insert("Compression".into(), serde_json::json!(config.compression));
+    setting.insert("EncryptAlgo".into(), serde_json::json!(config.encrypt_algo));
+    if let Some(ref v) = config.mem_cache_size {
+        setting.insert("MemCacheSize".into(), serde_json::json!(v));
+    }
+    if let Some(ref v) = config.disk_cache_size {
+        setting.insert("DiskCacheSize".into(), serde_json::json!(v));
+    }
+    if let Some(ref v) = config.disk_cache_paths {
+        setting.insert("DiskCachePaths".into(), serde_json::json!(v));
+    }
+    setting.insert(
+        "StorageBackends".into(),
+        serde_json::Value::Object(storage_backends),
+    );
+
     let mut status = serde_json::json!({
-        "Setting": {
-            "Name": config.name,
-            "BlockSize": config.block_size,
-            "Capacity": config.capacity,
-            "Inodes": config.inodes,
-            "Compression": config.compression,
-            "EncryptAlgo": config.encrypt_algo,
-            "MemCacheSize": config.mem_cache_size.unwrap_or_default(),
-            "DiskCacheSize": config.disk_cache_size.unwrap_or_default(),
-            "DiskCachePaths": config.disk_cache_paths.unwrap_or_default(),
-            "StorageBackends": storage_backends,
-            "ActiveWriteBackend": "",
-        },
+        "Setting": setting,
         "Clients": clients
     });
     if let Some(fabric) = fabric_section {

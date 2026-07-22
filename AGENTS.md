@@ -556,10 +556,10 @@ fstests/LTP are **wall-clock-bound** (fixed-duration fsx/fsstress soaks, mount-c
 
 **`SQUEEZEFS_FSTESTS_QUICK`** (defined in `tests/run_fstests.sh`) is the **standing regression set**: every fstests case that has ever caught a real SqueezeFS bug, plus core fsx/fsstress soak, hole/punch/seek coverage, and mount basics. **Grow it whenever a new test surfaces a bug.**
 
-**Fix-loop discipline (inventory once, then targeted):**
-1. **Inventory once** — one full `-g auto` produces the complete failure list. Do **not** re-run the full suite between fixes.
-2. **Targeted fix loop** — per failure *family* (cluster related failures; one root cause often spans several tests): tests-first fix → verify the single case with `sudo tests/run_fstests.sh generic/NNN` (minutes) → merge.
-3. **One final sweep** — a single full `-g auto` after the last fix (and nightly thereafter) to catch fix interactions.
+**Fix-loop discipline (FAIL FAST — user rule 2026-07-22; retires the former "inventory once" posture for full runs):**
+1. **Full runs fail fast** — `tests/run_fstests.sh` (full `-g auto` AND the QUICK set) aborts IMMEDIATELY at the first UNEXPECTED failure (nonzero exit, artifacts preserved, the failing test named loudly); `tests/run_ltp_syscalls.sh` aborts on the first FAILED/BROKEN (TCONF skips continue). The adjudicated by-design set (fstests 003/192 noatime, 213 thin provisioning) continues ONLY when a failure diff matches its pinned expected shape EXACTLY — any other diff on those tests aborts too (`expected_shape_diff` in the runner is the single source of the shapes).
+2. **Fix immediately, red-first** — the aborted run's failure gets its cargo repro-port (red) and fix per the repro-port mandate, verified with the single-test mode (`sudo tests/run_fstests.sh generic/NNN` — classic one-shot, unchanged).
+3. **Restart from the beginning** — after the fix, the FULL run restarts from zero (the counted-restart discipline below applies verbatim: pre-fix progress verified the old binary and is not creditable). The release gate's "all three suites pass" means each suite completed end-to-end fail-fast-clean on the final binary.
 
 **Multi-run discipline (counted runs: soaks, ×N repro suites, acceptance medians):**
 1. **A deterministic or attributable failure on any early run aborts the count** — stop, fix, then **restart the count from zero**. Runs completed before the fix verified the old binary; they are not creditable toward the fixed one's acceptance.

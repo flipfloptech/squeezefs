@@ -486,20 +486,82 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
 
     if !opts.scrub_only {
         // ---- Pass 1: C1 walk + census + staging + accounting ----
-        let mut c1 = Vec::new();
-        walk_trees_c1(ctx, opts, &mut counters, &mut c1).await;
-        suspects.extend(c1);
-
-        let census = walk_census(ctx, opts, &mut counters).await?;
-        counters.inodes_scanned = census.inodes_scanned;
-        if opts.shard.is_some() {
-            shard_refs = Some(PartialCensus {
-                refs: census.refs.clone(),
-            });
-        }
-
-        // C4/C5 staging scan.
-        scan_staging(ctx, opts, &mut suspects).await;
+        //
+        // The C1 tree walks, the census, and the C4/C5 staging scan are
+        // INDEPENDENT read-only scans; running them as a serial sum is
+        // what put the measured scan rate under the G-VL-5(c)
+        // ½-of-census floor (VL10). At 100 % throttle the per-(volume,
+        // tree) C1 walks and the staging scan run as spawned tasks
+        // concurrent with the census, so the pass wall clock is bounded
+        // by the slowest single walk. Throttled runs keep the serial
+        // shape: KD-3's duty cycle is per WORKER — concurrent walks
+        // would consume a multiple of the granted duty budget.
+        let unthrottled = opts.throttle_pct == 0 || opts.throttle_pct >= 100;
+        let census = if unthrottled {
+            let mut walks = tokio::task::JoinSet::new();
+            for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
+                for tree_idx in 0..kv.trees().len() {
+                    let kv = kv.clone();
+                    let cancel = opts.cancel.clone();
+                    let pct = opts.throttle_pct;
+                    walks.spawn(async move {
+                        walk_one_tree_c1(kv, vol_idx, tree_idx, pct, cancel).await
+                    });
+                }
+            }
+            // The C4/C5 staging scan overlaps too (its own dirs +
+            // per-custody-key getattr — disjoint from the walks).
+            let staging = tokio::spawn(scan_staging(
+                ctx.meta.clone(),
+                ctx.staging_dirs.clone(),
+                ctx.expected_generation.clone(),
+                opts.shard,
+            ));
+            let census = walk_census(ctx, opts, &mut counters).await?;
+            while let Some(joined) = walks.join_next().await {
+                let (nodes_walked, walk_suspects) = joined.map_err(|e| {
+                    crate::error::SqueezefsError::InvalidOperation(format!(
+                        "fsck C1 walk task failed: {e}"
+                    ))
+                })?;
+                counters.nodes_walked += nodes_walked;
+                suspects.extend(walk_suspects);
+            }
+            suspects.extend(staging.await.map_err(|e| {
+                crate::error::SqueezefsError::InvalidOperation(format!(
+                    "fsck staging scan task failed: {e}"
+                ))
+            })?);
+            counters.inodes_scanned = census.inodes_scanned;
+            if opts.shard.is_some() {
+                shard_refs = Some(PartialCensus {
+                    refs: census.refs.clone(),
+                });
+            }
+            census
+        } else {
+            let mut c1 = Vec::new();
+            walk_trees_c1(ctx, opts, &mut counters, &mut c1).await;
+            suspects.extend(c1);
+            let census = walk_census(ctx, opts, &mut counters).await?;
+            counters.inodes_scanned = census.inodes_scanned;
+            if opts.shard.is_some() {
+                shard_refs = Some(PartialCensus {
+                    refs: census.refs.clone(),
+                });
+            }
+            // C4/C5 staging scan (serial under throttle — KD-3's duty
+            // cycle is per worker).
+            let staging = scan_staging(
+                ctx.meta.clone(),
+                ctx.staging_dirs.clone(),
+                ctx.expected_generation.clone(),
+                opts.shard,
+            )
+            .await;
+            suspects.extend(staging);
+            census
+        };
 
         // C2/C3/C6 evaluation against the live allocator state.
         evaluate_allocator_classes(&vols, &census, opts, &mut counters, &mut suspects);
@@ -685,72 +747,103 @@ fn record_schema_violation(tree_id: u8, k: &[u8], v: &[u8]) -> Option<String> {
     }
 }
 
+/// One (volume, tree) C1 walk — the parallel unit (VL10, G-VL-5(c)):
+/// checksum ride-along via the range read, cross-page key ordering, and
+/// the schema check per record. Returns `(pages_walked, suspects)`.
+async fn walk_one_tree_c1(
+    kv: Arc<crate::meta_backend::kv::backend::KvMetaBackend>,
+    vol_idx: usize,
+    tree_idx: usize,
+    throttle_pct: u32,
+    cancel: Arc<AtomicBool>,
+) -> (u64, Vec<Suspect>) {
+    let end = crate::meta_backend::kv::tree::KEY_SPACE_MAX;
+    let tree = kv.trees()[tree_idx];
+    let tree_id = tree.tree_id();
+    let mut nodes_walked = 0u64;
+    let mut suspects = Vec::new();
+    let mut cursor: Vec<u8> = vec![0u8];
+    let mut prev_key: Option<Vec<u8>> = None;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let t0 = std::time::Instant::now();
+        let page = match tree.range(&cursor, &end, SCAN_PAGE).await {
+            Ok(p) => p,
+            Err(e) => {
+                suspects.push(Suspect {
+                    kind: SuspectKind::C1Walk {
+                        vol: vol_idx,
+                        tree: tree_id,
+                        cursor: cursor.clone(),
+                        error: e.to_string(),
+                    },
+                });
+                break; // the walk cannot advance past an unreadable node
+            }
+        };
+        nodes_walked += 1;
+        let Some((last_key, _)) = page.last() else {
+            break;
+        };
+        cursor = crate::meta_backend::kv::node::key_successor(last_key);
+        for (k, v) in &page {
+            // In-page + cross-page ordering (checksum-valid
+            // structural damage surfaces here).
+            if let Some(prev) = &prev_key {
+                if k.as_ref() <= prev.as_slice() {
+                    suspects.push(Suspect {
+                        kind: SuspectKind::C1Record {
+                            vol: vol_idx,
+                            tree: tree_id,
+                            key: k.to_vec(),
+                            why: "key ordering violated".to_string(),
+                        },
+                    });
+                }
+            }
+            prev_key = Some(k.to_vec());
+            let why = record_schema_violation(tree_id, k, v);
+            if let Some(why) = why {
+                suspects.push(Suspect {
+                    kind: SuspectKind::C1Record {
+                        vol: vol_idx,
+                        tree: tree_id,
+                        key: k.to_vec(),
+                        why,
+                    },
+                });
+            }
+        }
+        throttle_sleep(throttle_pct, t0.elapsed()).await;
+    }
+    (nodes_walked, suspects)
+}
+
+/// The serial C1 walk — the THROTTLED shape (KD-3's duty cycle is per
+/// worker; the unthrottled parallel shape lives in [`run`]'s pass 1).
 async fn walk_trees_c1(
     ctx: &FsckCtx,
     opts: &FsckOptions,
     counters: &mut FsckCounters,
     suspects: &mut Vec<Suspect>,
 ) {
-    let end = crate::meta_backend::kv::tree::KEY_SPACE_MAX;
     for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
-        for tree in kv.trees() {
+        for tree_idx in 0..kv.trees().len() {
             if opts.cancel.load(Ordering::Relaxed) {
                 return;
             }
-            let tree_id = tree.tree_id();
-            let mut cursor: Vec<u8> = vec![0u8];
-            let mut prev_key: Option<Vec<u8>> = None;
-            loop {
-                let t0 = std::time::Instant::now();
-                let page = match tree.range(&cursor, &end, SCAN_PAGE).await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        suspects.push(Suspect {
-                            kind: SuspectKind::C1Walk {
-                                vol: vol_idx,
-                                tree: tree_id,
-                                cursor: cursor.clone(),
-                                error: e.to_string(),
-                            },
-                        });
-                        break; // the walk cannot advance past an unreadable node
-                    }
-                };
-                counters.nodes_walked += 1;
-                let Some((last_key, _)) = page.last() else {
-                    break;
-                };
-                cursor = crate::meta_backend::kv::node::key_successor(last_key);
-                for (k, v) in &page {
-                    // In-page + cross-page ordering (checksum-valid
-                    // structural damage surfaces here).
-                    if let Some(prev) = &prev_key {
-                        if k.as_ref() <= prev.as_slice() {
-                            suspects.push(Suspect {
-                                kind: SuspectKind::C1Record {
-                                    vol: vol_idx,
-                                    tree: tree_id,
-                                    key: k.to_vec(),
-                                    why: "key ordering violated".to_string(),
-                                },
-                            });
-                        }
-                    }
-                    prev_key = Some(k.to_vec());
-                    let why = record_schema_violation(tree_id, k, v);
-                    if let Some(why) = why {
-                        suspects.push(Suspect {
-                            kind: SuspectKind::C1Record {
-                                vol: vol_idx,
-                                tree: tree_id,
-                                key: k.to_vec(),
-                                why,
-                            },
-                        });
-                    }
-                }
-                throttle(opts, t0.elapsed()).await;
-            }
+            let (nodes_walked, walk_suspects) = walk_one_tree_c1(
+                kv.clone(),
+                vol_idx,
+                tree_idx,
+                opts.throttle_pct,
+                opts.cancel.clone(),
+            )
+            .await;
+            counters.nodes_walked += nodes_walked;
+            suspects.extend(walk_suspects);
         }
     }
 }
@@ -1070,10 +1163,19 @@ fn custody_key_ino(key: &str) -> Option<u64> {
     ino_str.parse::<u64>().ok()
 }
 
-async fn scan_staging(ctx: &FsckCtx, opts: &FsckOptions, suspects: &mut Vec<Suspect>) {
-    for dir in &ctx.staging_dirs {
+/// The C4/C5 staging scan — spawnable (VL10, G-VL-5(c)): it touches only
+/// the staging dirs and per-key `getattr`, independent of the C1 walks
+/// and the census, so the unthrottled pass 1 overlaps it with them.
+async fn scan_staging(
+    meta: Arc<RoutedMetaBackend>,
+    staging_dirs: Vec<PathBuf>,
+    expected_generation: Option<String>,
+    shard: Option<(u32, u32)>,
+) -> Vec<Suspect> {
+    let mut suspects = Vec::new();
+    for dir in &staging_dirs {
         // C5: generation validity.
-        if let Some(expected) = &ctx.expected_generation {
+        if let Some(expected) = &expected_generation {
             match crate::cache::nvme::read_staging_generation_marker(dir).await {
                 Ok(Some(found)) if &found == expected => {}
                 Ok(Some(found)) => suspects.push(Suspect {
@@ -1118,12 +1220,12 @@ async fn scan_staging(ctx: &FsckCtx, opts: &FsckOptions, suspects: &mut Vec<Susp
             let Some(ino) = custody_key_ino(&key) else {
                 continue;
             };
-            if let Some((k, n)) = opts.shard {
+            if let Some((k, n)) = shard {
                 if ino % n as u64 != k as u64 {
                     continue;
                 }
             }
-            let missing = match ctx.meta.getattr(ino).await {
+            let missing = match meta.getattr(ino).await {
                 Ok(inode) => inode.nlink == 0,
                 Err(e) if is_not_found(&e) => true,
                 Err(_) => false, // infrastructure error: never a finding
@@ -1139,6 +1241,7 @@ async fn scan_staging(ctx: &FsckCtx, opts: &FsckOptions, suspects: &mut Vec<Susp
             }
         }
     }
+    suspects
 }
 
 // ---------------------------------------------------------------------------
@@ -1764,7 +1867,13 @@ async fn reverify_scrub_failure(
 // ---------------------------------------------------------------------------
 
 async fn throttle(opts: &FsckOptions, elapsed: Duration) {
-    if let Some(delay) = crate::jobs::job_throttle_sleep(elapsed, opts.throttle_pct) {
+    throttle_sleep(opts.throttle_pct, elapsed).await;
+}
+
+/// The KD-3 duty-cycle sleep by percentage — the `FsckOptions`-free form
+/// the spawned per-tree C1 walks use.
+async fn throttle_sleep(throttle_pct: u32, elapsed: Duration) {
+    if let Some(delay) = crate::jobs::job_throttle_sleep(elapsed, throttle_pct) {
         tokio::time::sleep(delay).await;
     }
 }

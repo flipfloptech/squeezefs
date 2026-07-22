@@ -355,10 +355,14 @@ async fn test_census_walk_baseline_measured() {
     let fx = open_fixture(&meta, &recs).await;
 
     // A metadata-heavy population: many inodes, a few carrying blocks.
-    const INODES: usize = 2048;
+    // Sized so the census walk takes tens of milliseconds — small enough
+    // to populate quickly, big enough that pass 1's RATES dominate its
+    // fixed costs (at 2 k inodes the ratio measured constant overhead:
+    // the staging scan's ~10 ms floor, not the walk shape).
+    const INODES: usize = 32768;
     for i in 0..INODES {
         let ino = create_file(&fx, &format!("f{i}")).await;
-        if i % 256 == 0 {
+        if i % 4096 == 0 {
             striped_burst(&fx, ino, 2).await;
         }
     }

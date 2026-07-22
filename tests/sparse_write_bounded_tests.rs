@@ -528,3 +528,47 @@ async fn file_size_cap_is_honest_efbig_and_the_last_byte_round_trips() {
         "one tail byte must map O(1) blocks, got {mapped}"
     );
 }
+
+/// The O(logical-size) family's DELETE face (found live by the VL10
+/// release-gate sweep: fstests generic/294/306/452/529/530 all failed on
+/// "previous daemon for … still running after 60s" — gdb of a lingering
+/// daemon caught the reclaim worker inside `delete_file`'s
+/// `for b in 0..=max_block` staging-key sweep). Deleting a sparse file
+/// enumerated EVERY LOGICAL BLOCK to build the staged-overlay key list —
+/// O(size) CPU + RAM (a 16 TiB sparse corpse = 4M-entry HashSet + 8M
+/// key Strings on the teardown path, minutes of linger after unmount).
+/// The pinned contract: delete cost follows the MAP + the staged
+/// occupancy index, never the logical size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_of_huge_sparse_file_is_omap() {
+    let h = make(true).await;
+    let ino = create(&h, "sparse-corpse").await;
+    warm_io_pools(&h).await;
+
+    // 1 TiB logical, one data-bearing block: with BS=64 KiB that is 2^24
+    // logical blocks — the pre-fix sweep builds a 16M-entry HashSet and
+    // ~33M key Strings (minutes + GBs); post-fix it walks the map + the
+    // occupancy index (O(1) here).
+    write_at(&h, ino, 0, &vec![0xCD; BS as usize]).await;
+    truncate_to(&h, ino, 1u64 << 40).await;
+
+    let hwm_before = vm_hwm_kb();
+    let t0 = std::time::Instant::now();
+    let mut con = h.fs.router.dlm.get_connection().await.unwrap();
+    h.fs.router
+        .delete_file(&format!("inode_{ino}"), &mut con)
+        .await
+        .expect("delete_file");
+    let took = t0.elapsed();
+    let hwm_delta_kb = vm_hwm_kb().saturating_sub(hwm_before);
+
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "delete of a 1 TiB sparse file must be O(map), took {took:?}"
+    );
+    assert!(
+        hwm_delta_kb < 256 * 1024,
+        "delete must not materialize O(logical-size) key sets \
+         (peak RSS delta {hwm_delta_kb} KiB)"
+    );
+}

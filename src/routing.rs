@@ -4905,7 +4905,17 @@ impl DataRouter {
             if let Some(fid) = meta.file_id.as_deref() {
                 if let Some(img_len) = self.cache.nvme.staged_len(fid) {
                     let small = (data.len() as u64) * 4 <= img_len.max(1);
-                    let non_extending = offset + data.len() as u64 <= meta.size;
+                    // Bound by the staged IMAGE the record rides on —
+                    // never by `meta.size` (fstests generic/075.3, VL10
+                    // release gate): a truncate-UP inflates the size past
+                    // the image (even past the 4 MiB allocator chunk), and
+                    // a size-bounded admission then parks extents the fold
+                    // composes into an image the FIND-RW4-A guard rightly
+                    // refuses to store — fsync wedges EIO forever
+                    // (`domapwrite: msync: EIO` under fsx). Beyond-image
+                    // writes take the whole-image path below, which grows
+                    // and promotes correctly.
+                    let non_extending = offset + data.len() as u64 <= img_len.min(meta.size);
                     if small && non_extending {
                         // Record mutations serialize under the HELD block-0
                         // guard (every rider site holds it; truncate holds

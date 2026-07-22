@@ -745,8 +745,10 @@ async fn truncate_up_rider_admission_bounds_by_the_image_not_the_size() {
 
     // …whose size is truncated UP past the 4 MiB allocator chunk.
     let new_size: u64 = squeezefs::block_allocator::CHUNK_SIZE + 512 * 1024;
-    let mut sa = fuse3::SetAttr::default();
-    sa.size = Some(new_size);
+    let sa = fuse3::SetAttr {
+        size: Some(new_size),
+        ..Default::default()
+    };
     h.fs.setattr(h.req, ino, None, sa)
         .await
         .expect("truncate up");

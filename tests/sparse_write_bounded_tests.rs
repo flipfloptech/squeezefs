@@ -458,3 +458,75 @@ async fn cacheless_far_write_is_bounded_and_omap() {
     );
     assert_zeros(&h, ino, HUGE / 2, 4096, "cache-less hole").await;
 }
+
+/// fstests generic/525 repro-port (VL10 release gate): high-offset
+/// honesty. Block indices are u32 across the striped layout
+/// (`block_map: HashMap<u32, _>`), so the REPRESENTABLE maximum file
+/// size is `block_size × (2^32 − 1)`. The sweep binary silently
+/// ACCEPTED a truncate to 2^63 − 1 and a pwrite at 2^63 − 2, wrapped
+/// the block index mod 2^32, and read back `00` where `61` was written
+/// — silent corruption of the offset space. The honest contract pinned
+/// here:
+/// 1. size/offsets beyond the cap refuse **EFBIG**, loud (generic/525's
+///    own `! -s` guard then notruns: "does not support huge file size");
+/// 2. the LAST representable byte round-trips exactly, O(map) sparse;
+/// 3. nothing near the cap wraps `u32` block-index arithmetic (the
+///    debug build's `end_block + 1` overflow panic in pipeline_touch).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_size_cap_is_honest_efbig_and_the_last_byte_round_trips() {
+    let h = make(true).await;
+    let ino = create(&h, "huge525").await;
+    warm_io_pools(&h).await;
+
+    let cap: u64 = BS * (u32::MAX as u64); // block_size × (2^32 − 1)
+
+    // (1) Beyond the cap: EFBIG, loud — truncate and write both.
+    let e = h
+        .fs
+        .setattr(
+            h.req,
+            ino,
+            None,
+            fuse3::SetAttr {
+                size: Some((1u64 << 63) - 1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("truncate beyond block_size×(2^32−1) must refuse");
+    {
+        let io: std::io::Error = e.into();
+        assert_eq!(io.raw_os_error(), Some(libc::EFBIG), "truncate → EFBIG");
+    }
+    let e = h
+        .fs
+        .write(
+            h.req,
+            ino,
+            0,
+            cap,
+            bytes::Bytes::copy_from_slice(b"x"),
+            0,
+            0,
+        )
+        .await
+        .expect_err("write past the representable maximum must refuse");
+    {
+        let io: std::io::Error = e.into();
+        assert_eq!(io.raw_os_error(), Some(libc::EFBIG), "write → EFBIG");
+    }
+
+    // (2) The LAST representable byte round-trips.
+    truncate_to(&h, ino, cap).await;
+    assert_eq!(size_of(&h, ino).await, cap, "cap-sized truncate succeeds");
+    write_at(&h, ino, cap - 1, b"a").await;
+    let got = read_at(&h, ino, cap - 1, 1).await;
+    assert_eq!(got, b"a".to_vec(), "the last representable byte reads back");
+
+    // (3) Sparse discipline at the top: O(map), no wrap, no panic.
+    let mapped = mapped_blocks(&h, ino).await;
+    assert!(
+        mapped <= 4,
+        "one tail byte must map O(1) blocks, got {mapped}"
+    );
+}

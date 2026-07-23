@@ -2902,6 +2902,12 @@ pub struct SqueezefsFilesystem {
     /// be shared (`Arc`): a per-clone `ArcSwap` would leave the handler's clone
     /// permanently seeing `None`, silently disabling the read zero-copy payload
     /// destination (`get_payload_buffer` in `read`).
+    /// The kernel notify handle (FUSE_NOTIFY_* over the classical reply
+    /// path), armed at mount like `session_connection`. Used by daemon-
+    /// initiated attribute changes the kernel cannot see — currently the
+    /// generic/683 setid strip (an attrs-only INVAL_INODE so the next
+    /// stat refetches instead of serving the pre-strip mode for a TTL).
+    pub kernel_notify: std::sync::Arc<arc_swap::ArcSwap<Option<fuse3::notify::Notify>>>,
     pub session_connection: std::sync::Arc<
         arc_swap::ArcSwap<Option<std::sync::Arc<fuse3::raw::connection::FuseConnection>>>,
     >,
@@ -2998,6 +3004,7 @@ impl Clone for SqueezefsFilesystem {
             // Share the one cell — never split it per clone, or the mounted
             // handler clone would not observe the connection start_mount
             // publishes after mount (re-enables the read zero-copy dest).
+            kernel_notify: self.kernel_notify.clone(),
             session_connection: self.session_connection.clone(),
             open_inodes: self.open_inodes.clone(),
             kernel_ttls: self.kernel_ttls,
@@ -3095,6 +3102,7 @@ impl SqueezefsFilesystem {
             latest_config_size: std::sync::Arc::new(AtomicU64::new(0)),
             inodes_limit: std::sync::Arc::new(std::sync::OnceLock::new()),
             capacity_limit: std::sync::Arc::new(std::sync::OnceLock::new()),
+            kernel_notify: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             session_connection: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
                 None,
             ))),
@@ -4763,6 +4771,15 @@ impl SqueezefsFilesystem {
             .await
             .map_err(map_squeezefs_err)?;
         self.refresh_attr_cache(ino).await;
+        // The kernel's incore mode still shows the pre-strip bits for an
+        // attr-TTL window (fallocate replies carry no attrs) — push an
+        // attrs-only INVAL_INODE so the very next stat refetches. Awaited
+        // inline: the reply to this FALLOCATE then strictly follows the
+        // invalidation. Absent handle (in-process tests) skips.
+        if let Some(notify) = self.kernel_notify.load().as_ref() {
+            let notify = notify.clone();
+            notify.invalid_inode(ino, 0, 0).await;
+        }
         Ok(())
     }
 
@@ -11999,6 +12016,9 @@ pub async fn start_mount<P: AsRef<Path>>(
     if let Some(cell) = &ipc_notify_cell {
         cell.store(std::sync::Arc::new(Some(session.get_notify())));
     }
+    // The general daemon-side notify (generic/683 setid strip et al).
+    fs.kernel_notify
+        .store(std::sync::Arc::new(Some(session.get_notify())));
 
     #[cfg(target_os = "linux")]
     let mut handle = if unsafe { libc::getuid() } == 0 {

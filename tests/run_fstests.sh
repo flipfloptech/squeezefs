@@ -168,6 +168,18 @@ fi
 TAG="$(basename "$MNT")"
 LOG="/tmp/squeezefs_fstests_${TAG}.log"
 
+# SECOND MOUNTPOINT of an ALREADY-MOUNTED device (fstests generic/732:
+# same export at two mountpoints, cross-mountpoint renames): local
+# filesystems share the superblock; the FUSE equivalent is a BIND of the
+# live attachment — one daemon, one D0 writer claim, full coherence by
+# construction. Only when the daemon is LIVE and its mountpoint is
+# attached; a draining/dying daemon falls through to the serialize-wait.
+LIVE_MNT="$(pgrep -af "squeezefs mount sqmeta://$DEV " 2>/dev/null | head -1 | \
+    sed -nE "s#.*squeezefs mount sqmeta://$DEV ([^ ]+) .*#\1#p")"
+if [ -n "$LIVE_MNT" ] && [ "$LIVE_MNT" != "$MNT" ] && mountpoint -q "$LIVE_MNT" 2>/dev/null; then
+    exec /usr/bin/mount --bind "$LIVE_MNT" "$MNT"
+fi
+
 # xfstests' `umount` returns while the previous daemon is still draining
 # staged writes to this same meta volume + staging dir. Mounting a second
 # daemon on top of that races fencing/recovery and corrupts the volume, and a

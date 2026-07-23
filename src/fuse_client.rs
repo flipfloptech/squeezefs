@@ -909,6 +909,35 @@ pub const BLOCK_LOCK_STRIPES: usize = 4096;
 pub static BLOCK_FLUSH_LOCKS: Lazy<StripeLocks<tokio::sync::Mutex<()>, BLOCK_LOCK_STRIPES>> =
     Lazy::new(|| StripeLocks::new());
 
+/// Per-(ino, block) CUSTODY-TRANSFER epoch — the moving-custody read
+/// protocol's seqlock word (fstests generic/795). A block's acked bytes
+/// migrate RAM overlay ⇄ staged sibling / extent record ⇄ durable binding;
+/// every transfer publishes its destination strictly BEFORE retiring its
+/// source (under the block's flush lock), so the RETIRE is the only event
+/// that can invert a lock-free reader's probe order (destination probed
+/// pre-publish, source probed post-retire — acked bytes invisible to both).
+/// Every retire bumps this word; the read handler fingerprints it across
+/// its whole probe window and re-runs the read on movement. Stripe
+/// collisions only ever cause a spurious retry, never a missed one.
+pub static BLOCK_CUSTODY_EPOCHS: Lazy<
+    StripeLocks<std::sync::atomic::AtomicU64, BLOCK_LOCK_STRIPES>,
+> = Lazy::new(StripeLocks::new);
+
+/// Bump `ino`/`b`'s custody epoch (Release) — call at every overlay /
+/// staged-sibling / extent-record retire, after the removal completed.
+pub fn bump_block_custody_epoch(ino: u64, b: u32) {
+    BLOCK_CUSTODY_EPOCHS
+        .get_lock(ino, b)
+        .fetch_add(1, Ordering::Release);
+}
+
+/// Current custody epoch for `ino`/`b` (Acquire).
+pub fn block_custody_epoch(ino: u64, b: u32) -> u64 {
+    BLOCK_CUSTODY_EPOCHS
+        .get_lock(ino, b)
+        .load(Ordering::Acquire)
+}
+
 // ===========================================================================
 // RW1 write-path attribution rig (docs/design-random-small-writes.md PR RW1;
 // §5.3 W3 rig extension; §5.4 observability)
@@ -5216,7 +5245,7 @@ impl SqueezefsFilesystem {
         // Authority transferred (the merge published): drain the extent
         // state. Reads between the publish and these removals compose the
         // same bytes over the already-folded base — idempotent.
-        self.active_block_buffers.remove(&cache_key);
+        self.retire_parked_overlay(&cache_key);
         if record.is_some() || had_staged_full {
             let nvme = self.router.cache.nvme.clone();
             let ek = ext_key.clone();
@@ -5455,7 +5484,7 @@ impl SqueezefsFilesystem {
                     .fetch_add(put_len, Ordering::Relaxed);
                 // Authority transferred: the staged copy is identical and
                 // router reads serve it — the RAM copy can go.
-                self.active_block_buffers.remove(&key);
+                self.retire_parked_overlay(&key);
                 drop(block_guard);
                 let req = WritebackRequest {
                     ino,
@@ -5479,7 +5508,7 @@ impl SqueezefsFilesystem {
                 METRICS
                     .durable_upload_bytes_escalation
                     .fetch_add(put_len, Ordering::Relaxed);
-                self.active_block_buffers.remove(&key);
+                self.retire_parked_overlay(&key);
                 drop(block_guard);
             }
         }
@@ -6194,7 +6223,7 @@ impl SqueezefsFilesystem {
                         Ok(()) => {
                             // Durable + published: the RAM entry retires
                             // (reads flow to the block map / read tiers).
-                            self.active_block_buffers.remove(&cache_key);
+                            self.retire_parked_overlay(&cache_key);
                             METRICS.write_through_blocks.fetch_add(1, Ordering::Relaxed);
                             METRICS
                                 .write_through_bytes
@@ -6206,7 +6235,7 @@ impl SqueezefsFilesystem {
                             // not even to staging. Drop custody (the old
                             // checked-out buffer was dropped here too) and
                             // propagate; the caller invalidates the lease.
-                            self.active_block_buffers.remove(&cache_key);
+                            self.retire_parked_overlay(&cache_key);
                             return Err(e);
                         }
                         Err(e) => {
@@ -6241,7 +6270,7 @@ impl SqueezefsFilesystem {
                             if admitted {
                                 // Staged custody landed: the RAM entry
                                 // retires (the ring copy is identical).
-                                self.active_block_buffers.remove(&cache_key);
+                                self.retire_parked_overlay(&cache_key);
                             }
                             std::mem::drop(block_guard);
 
@@ -6350,7 +6379,7 @@ impl SqueezefsFilesystem {
                     let block_guard = block_lock_acquire(ino, b as u32, BlockLockSite::Punch).await;
                     let key = crate::keys::active_block(ino, b).to_string();
                     let ext_key = crate::keys::active_block_ext(ino, b).to_string();
-                    self.active_block_buffers.remove(&key);
+                    self.retire_parked_overlay(&key);
                     // Blocking-pool hop: shard WRITE lock (invariant rule 2).
                     // W2: the staged extent record dies with the block too.
                     self.router
@@ -6445,7 +6474,7 @@ impl SqueezefsFilesystem {
             let _block_guard = block_lock_acquire(ino, b, BlockLockSite::OverlayPrune).await;
             let key = crate::keys::active_block(ino, b as u64).to_string();
             let ext_key = crate::keys::active_block_ext(ino, b as u64).to_string();
-            self.active_block_buffers.remove(&key);
+            self.retire_parked_overlay(&key);
             // spawn_blocking: the staging-shard WRITE lock must never park
             // an async worker (§5.5 read guards are held across DMA awaits;
             // see flush_one_active_block).
@@ -6679,7 +6708,7 @@ impl SqueezefsFilesystem {
         // is gone). A stale whole-file RAM snapshot would serve pre-write
         // bytes — drop it, as the routing striped merge does.
         let cache_key = crate::keys::active_block(ino, b as u64).to_string();
-        self.active_block_buffers.remove(&cache_key);
+        self.retire_parked_overlay(&cache_key);
         // Blocking-pool hop: shard WRITE lock (invariant rule 2).
         self.router
             .cache
@@ -6823,15 +6852,60 @@ impl SqueezefsFilesystem {
     /// than any base tier by the one-authority invariant. Runs are
     /// captured under short per-entry map guards (no await); the reply
     /// is copied only when an overlay actually intersects it.
-    fn overlay_parked_runs(&self, ino: u64, offset: u64, data: bytes::Bytes) -> bytes::Bytes {
-        if data.is_empty() || self.active_block_buffers.is_empty() {
-            return data;
+    /// The read window's custody fingerprint: per covered block, the
+    /// durable binding and the block's CUSTODY-TRANSFER EPOCH (see
+    /// `BLOCK_CUSTODY_EPOCHS` — bumped at every overlay / staged-sibling /
+    /// extent-record retire). A block's acked bytes move overlay ⇄ sibling
+    /// / record ⇄ binding; presence booleans cannot see an A→B→A cycle
+    /// completing inside the window (sibling retired into a re-seeded
+    /// overlay that write-through retired again — the observed 795 tape),
+    /// but every transfer's retire bumps the epoch, so an unchanged
+    /// fingerprint proves no transfer crossed the reader's probe gaps.
+    /// `None` = not a striped layout (no custody chain to fingerprint).
+    /// Bindings ride the freshest RAM metadata entry (every block-map
+    /// merge republishes it before retiring the superseded tier).
+    async fn read_custody_fingerprint(
+        &self,
+        file_path: &str,
+        ino: u64,
+        offset: u64,
+        len: usize,
+    ) -> Option<Vec<(u32, Option<String>, u64)>> {
+        if len == 0 {
+            return None;
+        }
+        let meta = self.router.metadata_cache.get(&ino)?;
+        if meta.file_type != "striped" {
+            return None;
         }
         let block_size = self.router.block_size.load(Ordering::Relaxed);
-        let end = offset + data.len() as u64;
+        let start_block = (offset / block_size) as u32;
+        let end_block = ((offset + len as u64 - 1) / block_size) as u32;
+        let bindings = self
+            .router
+            .load_striped_block_keys(file_path, &meta, start_block, end_block)
+            .await
+            .ok()?;
+        Some(
+            bindings
+                .into_iter()
+                .map(|(b, key)| (b, key, block_custody_epoch(ino, b)))
+                .collect(),
+        )
+    }
+
+    /// Capture the RAM-overlay byte runs intersecting `[offset, offset+len)`
+    /// as absolute-offset runs. Zero-cost when no overlay exists (one map
+    /// probe per covered block); runs are copied out under short map guards.
+    fn capture_parked_runs(&self, ino: u64, offset: u64, len: usize) -> Vec<(u64, Vec<u8>)> {
+        if len == 0 || self.active_block_buffers.is_empty() {
+            return Vec::new();
+        }
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        let end = offset + len as u64;
         let start_block = offset / block_size;
         let end_block = (end - 1) / block_size;
-        let mut out: Option<Vec<u8>> = None;
+        let mut out = Vec::new();
         for b in start_block..=end_block {
             let key = crate::keys::active_block(ino, b).to_string();
             let Some(entry) = self.active_block_buffers.get(&key) else {
@@ -6854,23 +6928,54 @@ impl SqueezefsFilesystem {
                     .collect()
             };
             drop(entry);
-            if runs.is_empty() {
+            for (s, d) in runs {
+                out.push((b_start + s as u64, d));
+            }
+        }
+        out
+    }
+
+    /// Overlay absolute-offset byte runs onto `data` (read reply base at
+    /// `offset`). Allocates only when a run actually intersects the range.
+    fn apply_parked_runs(offset: u64, data: bytes::Bytes, runs: &[(u64, Vec<u8>)]) -> bytes::Bytes {
+        if data.is_empty() || runs.is_empty() {
+            return data;
+        }
+        let mut out: Option<Vec<u8>> = None;
+        for (abs, d) in runs {
+            let Some(lo) = abs.checked_sub(offset).map(|v| v as usize) else {
+                continue;
+            };
+            if lo >= data.len() {
                 continue;
             }
             let out = out.get_or_insert_with(|| data.to_vec());
-            for (s, d) in runs {
-                let abs = b_start as usize + s;
-                let lo = abs - offset as usize;
-                let hi = (lo + d.len()).min(out.len());
-                if lo < out.len() {
-                    out[lo..hi].copy_from_slice(&d[..hi - lo]);
-                }
-            }
+            let hi = (lo + d.len()).min(out.len());
+            out[lo..hi].copy_from_slice(&d[..hi - lo]);
         }
         match out {
             Some(v) => bytes::Bytes::from(v),
             None => data,
         }
+    }
+
+    /// Retire a block's RAM overlay — the custody-transfer form of
+    /// `active_block_buffers.remove` (generic/795 moving-custody read
+    /// protocol): every overlay retire bumps the block's custody epoch so
+    /// lock-free readers whose probe window the transfer crossed re-run.
+    /// ALL overlay removals must route here (a raw `.remove()` is a
+    /// protocol violation — readers could serve zeros for acked bytes).
+    fn retire_parked_overlay(
+        &self,
+        key: &str,
+    ) -> Option<(String, crate::cache::active_block::ActiveBlockBuf)> {
+        let removed = self.active_block_buffers.remove(key);
+        if removed.is_some() {
+            if let Some((ino, b)) = Self::parse_active_block_key(key) {
+                bump_block_custody_epoch(ino, b);
+            }
+        }
+        removed
     }
 
     fn parse_active_block_key(key: &str) -> Option<(u64, u32)> {
@@ -7033,7 +7138,7 @@ impl SqueezefsFilesystem {
                     };
                     if extents.is_empty() {
                         // Nothing parked (degenerate): drop the empty shell.
-                        self.active_block_buffers.remove(&spill_key);
+                        self.retire_parked_overlay(&spill_key);
                         spilled = true;
                         break;
                     }
@@ -7065,7 +7170,7 @@ impl SqueezefsFilesystem {
                         .fetch_add(payload, Ordering::Relaxed);
                     // Authority transferred stage-then-remove (the record
                     // is a superset snapshot of the overlay).
-                    self.active_block_buffers.remove(&spill_key);
+                    self.retire_parked_overlay(&spill_key);
                     spilled = true;
                     break;
                 }
@@ -7133,7 +7238,7 @@ impl SqueezefsFilesystem {
                     break 'spill;
                 }
                 // Authority transferred stage-then-remove (identical copy).
-                self.active_block_buffers.remove(&spill_key);
+                self.retire_parked_overlay(&spill_key);
                 spilled = true;
                 break;
             }
@@ -7289,7 +7394,7 @@ impl SqueezefsFilesystem {
                                     .durable_upload_bytes_self_flush
                                     .fetch_add(self_flush_len, Ordering::Relaxed);
                                 // Durable + published: the entry retires.
-                                self.active_block_buffers.remove(cache_key);
+                                self.retire_parked_overlay(cache_key);
                                 // A staler STAGED image under this key (an
                                 // earlier spill) must not outlive the newer
                                 // durable merge — same fencing-checked
@@ -7448,7 +7553,7 @@ impl SqueezefsFilesystem {
                     METRICS
                         .durable_upload_bytes_escalation
                         .fetch_add(put_len, Ordering::Relaxed);
-                    self.active_block_buffers.remove(&key);
+                    self.retire_parked_overlay(&key);
                 }
                 continue;
             }
@@ -7456,7 +7561,7 @@ impl SqueezefsFilesystem {
                 .staging_put_bytes_teardown
                 .fetch_add(put_len, Ordering::Relaxed);
             // Authority transferred stage-then-remove (identical copy).
-            self.active_block_buffers.remove(&key);
+            self.retire_parked_overlay(&key);
             drop(block_guard);
 
             let req = WritebackRequest {
@@ -9229,38 +9334,70 @@ impl Filesystem for SqueezefsFilesystem {
             .and_then(|conn| conn.get_payload_buffer(_req.unique))
             .map(|(ptr, _sz)| ptr);
 
-        // Backend / cache read without holding the inode lock (readers scale).
-        let read_future = self.router.read_file_range_zero_copy(
-            &file_path,
-            offset,
-            read_len as u32,
-            dest_addr,
-            read_hint,
-        );
-        prof.mark_backend_start();
-        let read_res = read_future.await;
-        prof.mark_backend_done();
-        let (data, backing) = match read_res {
-            Ok(res) => res,
-            Err(e) => {
-                error!("FUSE Read error: {:?}", e);
-                return Err(map_squeezefs_err(e));
+        // OVERLAY NEVER INVISIBLE — the moving-custody read protocol
+        // (fstests generic/795, VL10 release gate). A block's acked bytes
+        // live in exactly one live authority at a time — RAM overlay →
+        // staged sibling → durable binding — and every transfer publishes
+        // its destination strictly BEFORE retiring its source (under the
+        // block's flush lock). This read is deliberately lock-free, so a
+        // transfer landing INSIDE the read window can invert the reader's
+        // probe order: the router resolved the block map before the
+        // publish, while the overlay/sibling probes ran after the retire —
+        // acked bytes invisible to every tier this pass touched (zeros
+        // served at the head of a just-completed block, the 795 cmp
+        // signature). Three layered defenses, all load-bearing:
+        //
+        //  1. pre-captured overlay runs (before the router read) close the
+        //     overlay-retired-during-read face;
+        //  2. the post-read capture (strictly newer where both exist)
+        //     closes the park-created-during-read face;
+        //  3. the binding fingerprint below detects a block-map publish
+        //     that landed mid-read — the one transfer the two captures
+        //     cannot see (sibling/overlay → durable binding) — and re-runs
+        //     the read; the fresh pass resolves the published map. Bounded:
+        //     each retry needs another publish inside the ever-smaller
+        //     window; exhaustion serves the last compose (a racing read may
+        //     legally serve any value current within its window).
+        let mut bindings_before = self
+            .read_custody_fingerprint(&file_path, ino, offset, read_len)
+            .await;
+        let mut attempts = 0u32;
+        let (data, backing) = loop {
+            let pre_runs = self.capture_parked_runs(ino, offset, read_len);
+
+            // Backend / cache read without holding the inode lock (readers
+            // scale).
+            let read_future = self.router.read_file_range_zero_copy(
+                &file_path,
+                offset,
+                read_len as u32,
+                dest_addr,
+                read_hint,
+            );
+            prof.mark_backend_start();
+            let read_res = read_future.await;
+            prof.mark_backend_done();
+            let (data, backing) = match read_res {
+                Ok(res) => res,
+                Err(e) => {
+                    error!("FUSE Read error: {:?}", e);
+                    return Err(map_squeezefs_err(e));
+                }
+            };
+
+            let post_runs = self.capture_parked_runs(ino, offset, data.len());
+            let data = Self::apply_parked_runs(offset, data, &pre_runs);
+            let data = Self::apply_parked_runs(offset, data, &post_runs);
+
+            let bindings_after = self
+                .read_custody_fingerprint(&file_path, ino, offset, read_len)
+                .await;
+            if bindings_after == bindings_before || attempts >= 4 {
+                break (data, backing);
             }
+            attempts += 1;
+            bindings_before = bindings_after;
         };
-
-        // OVERLAY NEVER INVISIBLE — the multi-block/fallthrough face
-        // (fstests generic/209, VL10 release gate): the router serves the
-        // base tiers only, so any block whose NEWEST bytes still live in
-        // a RAM overlay (a park re-created between the flush above and
-        // the router read, a straddling read's second block, the
-        // single-block probe's vanished-buffer fallthrough) would serve
-        // pre-park bytes. Compose the parked runs over the reply — the
-        // same authority order as the single-block probe (extent runs /
-        // covered runs win over the base). Zero-cost when no overlay
-        // exists (one map probe per covered block); the compose allocates
-        // only when an overlay actually intersects the range.
-        let data = self.overlay_parked_runs(ino, offset, data);
-
         Ok(ReplyData { data, backing })
     }
 
@@ -9416,15 +9553,14 @@ impl Filesystem for SqueezefsFilesystem {
             let sec = now.as_secs() as i64;
             let nsec = now.subsec_nanos();
 
-            // Publish size/mtime to attr_cache under the write lock
-            if let Some((mut attr, _)) = self.attr_cache.get(&ino) {
-                attr.size = expected_new_size;
-                attr.blocks = expected_new_size.div_ceil(512);
-                attr.mtime = Timestamp::new(sec, nsec);
-                attr.ctime = Timestamp::new(sec, nsec);
-                self.attr_cache
-                    .insert(ino, (attr, std::time::Instant::now()));
-            }
+            // (fstests generic/795: the attr size/mtime publish moved to
+            // AFTER the dispatch below — SIZE MUST NEVER LEAD DATA. The
+            // pre-dispatch publish let a concurrent reader observe
+            // size = expected_new_size while this write's bytes were not
+            // yet in any overlay: the read clamps to the published size
+            // and legitimately composes ZEROS for the not-yet-landed
+            // range — acked-looking zeros at stable offsets, the 795
+            // cmp-mismatch signature.)
 
             if use_router_write {
                 // §5.4 lease-severance boundary — the single sever route:
@@ -9483,11 +9619,7 @@ impl Filesystem for SqueezefsFilesystem {
                 // path. PR 6 deleted the in-handler promotion block (dead:
                 // its `file_type` guard could never hold here) and the
                 // subsumed `is_aligned` direct leg.
-                if expected_new_size > old_size {
-                    self.router
-                        .update_metadata_cache_size(&file_path, expected_new_size)
-                        .await;
-                }
+                //
                 // Striped: drop inode write lock before long active-block
                 // I/O (P1-8); per-block BLOCK_FLUSH_LOCKS serialize the
                 // data path.
@@ -9522,6 +9654,28 @@ impl Filesystem for SqueezefsFilesystem {
             }
 
             prof.mark_backend_done();
+            // Size/mtime publish — strictly AFTER the data landed (either
+            // router commit or the striped overlays; both are readable
+            // now), so size never leads data (generic/795). The striped
+            // path defers its durable size persist to the flush cadence:
+            // the RAM metadata_cache floor bump here is its ONLY size
+            // publish, and it must trail `write_file_staged` for the same
+            // reason the attr publish below does — the read path clamps
+            // `read_len` to this entry's size, and a size the overlays
+            // cannot back yet composes zeros for the gap.
+            if !use_router_write && expected_new_size > old_size {
+                self.router
+                    .update_metadata_cache_size(&file_path, expected_new_size)
+                    .await;
+            }
+            if let Some((mut attr, _)) = self.attr_cache.get(&ino) {
+                attr.size = attr.size.max(expected_new_size);
+                attr.blocks = attr.size.div_ceil(512);
+                attr.mtime = Timestamp::new(sec, nsec);
+                attr.ctime = Timestamp::new(sec, nsec);
+                self.attr_cache
+                    .insert(ino, (attr, std::time::Instant::now()));
+            }
             Ok(ReplyWrite {
                 written: bytes_written,
             })
@@ -10617,14 +10771,17 @@ impl Filesystem for SqueezefsFilesystem {
                 dest_size > self.router.block_size.load(Ordering::Relaxed)
             });
         if dest_is_striped {
+            self.write_file_staged(inode_out, off_out, chunk, dest_size, target_fencing_token)
+                .await
+                .map_err(map_squeezefs_err)?;
+            // Size publish strictly AFTER the data landed — size must
+            // never lead data (generic/795; same law as the WRITE
+            // handler's post-dispatch publish).
             if new_dest_size > dest_size {
                 self.router
                     .update_metadata_cache_size(&dest_path, new_dest_size)
                     .await;
             }
-            self.write_file_staged(inode_out, off_out, chunk, dest_size, target_fencing_token)
-                .await
-                .map_err(map_squeezefs_err)?;
         } else {
             self.router
                 .write_file(&dest_path, off_out, chunk, target_fencing_token)

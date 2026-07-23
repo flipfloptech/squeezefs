@@ -43,6 +43,17 @@ pub const STAGING_FORMAT_MARKER: &str = ".squeezefs_staging_format";
 pub const STAGING_FORMAT_VERSION: u32 = 2;
 
 /// Full marker file image for `fs_generation`.
+/// `(ino, block)` of an `active_block:inode_{i}:block_{b}` or
+/// `active_block_ext:inode_{i}:block_{b}` staging key; `None` for plain
+/// file_id keys (whole-file staged blobs have no per-block custody word).
+fn parse_block_custody_key(key: &str) -> Option<(u64, u32)> {
+    let rest = key
+        .strip_prefix("active_block:inode_")
+        .or_else(|| key.strip_prefix("active_block_ext:inode_"))?;
+    let (ino_str, block_str) = rest.split_once(":block_")?;
+    Some((ino_str.parse().ok()?, block_str.parse().ok()?))
+}
+
 fn generation_marker_content(fs_generation: &str) -> Vec<u8> {
     format!("{STAGING_GENERATION_HEADER}\n{fs_generation}\n").into_bytes()
 }
@@ -1642,6 +1653,13 @@ impl NvmeStaging {
         if let Some((_, (cost, _))) = self.staged_ledger.remove_sync(key) {
             Self::sub_saturating(&self.current_staged_write_bytes, cost);
             self.space_freed_notify.notify_waiters();
+        }
+        // Moving-custody read protocol (generic/795): a staged sibling /
+        // extent record retire is a custody transfer a lock-free reader can
+        // be inverted by — bump the block's custody epoch so in-window
+        // readers re-run (see `fuse_client::BLOCK_CUSTODY_EPOCHS`).
+        if let Some((ino, b)) = parse_block_custody_key(key) {
+            crate::fuse_client::bump_block_custody_epoch(ino, b);
         }
         val
     }

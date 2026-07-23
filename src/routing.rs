@@ -3653,7 +3653,20 @@ impl DataRouter {
         const MAX_REBINDS: usize = 24;
         const BACKOFF_AFTER: usize = 4;
         const CONTENDED_BEFORE_ESCALATE: usize = 2;
-        let mut key: Option<String> = resolved_key.map(str::to_string);
+        // Never-invisible hole revalidation (fstests generic/795): a None
+        // binding handed in from the caller's ENTRY-TIME map snapshot may
+        // be stale-absent — a concurrent write-through / writeback publish
+        // (which updates the RAM metadata_cache strictly BEFORE retiring
+        // the overlay / staged sibling the caller already probed) can land
+        // inside the caller's read window, leaving the acked bytes
+        // invisible to both the snapshot and the retired tiers. Re-resolve
+        // against the freshest map before any hole verdict; only a
+        // fresh-map absence serves zeros. (Rebind-loop absences below are
+        // fresh by construction — they come from current_block_binding.)
+        let mut key: Option<String> = match resolved_key {
+            Some(k) => Some(k.to_string()),
+            None => self.current_block_binding(file_path, b).await?,
+        };
         let mut losses = 0usize;
         for attempt in 0..MAX_REBINDS {
             let Some(cur_key) = key else {
@@ -6771,7 +6784,60 @@ impl DataRouter {
                                             }
                                         }
                                     }
-                                    None => None,
+                                    // Stale-absent binding (generic/795):
+                                    // the entry-time map snapshot may miss
+                                    // a binding a concurrent write-through/
+                                    // writeback published mid-read — after
+                                    // it retired the overlay/sibling this
+                                    // read already probed. The fetch loop
+                                    // re-resolves freshest-first; only a
+                                    // fresh-map absence is a hole.
+                                    None => {
+                                        let val = self
+                                            .get_block_for_index(
+                                                file_path,
+                                                start_block,
+                                                None,
+                                                device_true,
+                                                true,
+                                            )
+                                            .await?;
+                                        match (val, dest_addr) {
+                                            (Some(val), Some(dest)) => {
+                                                let start =
+                                                    std::cmp::min(slice_start as usize, val.len());
+                                                let end = std::cmp::min(
+                                                    (slice_start + slice_len as u64) as usize,
+                                                    val.len(),
+                                                );
+                                                let len = end - start;
+                                                let dest_ptr = dest as *mut u8;
+                                                unsafe {
+                                                    std::ptr::copy_nonoverlapping(
+                                                        val[start..end].as_ptr(),
+                                                        dest_ptr,
+                                                        len,
+                                                    );
+                                                    if len < slice_len as usize {
+                                                        std::ptr::write_bytes(
+                                                            dest_ptr.add(len),
+                                                            0,
+                                                            slice_len as usize - len,
+                                                        );
+                                                    }
+                                                }
+                                                let b = bytes::Bytes::from_owner(
+                                                    crate::cache::pool::UringBufOwner {
+                                                        ptr: dest_ptr,
+                                                        len,
+                                                    },
+                                                );
+                                                Some(crate::cache::pool::ReadBlockValue::Bytes(b))
+                                            }
+                                            (Some(val), None) => Some(val),
+                                            (None, _) => None,
+                                        }
+                                    }
                                 };
 
                             match downloaded {

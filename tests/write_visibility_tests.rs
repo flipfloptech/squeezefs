@@ -994,6 +994,9 @@ async fn sequential_recopy_readers_never_see_foreign_bytes() {
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ino_cell = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // The writer's ACK watermark for the CURRENT incarnation: bytes
+    // [0, watermark) have completed their write_at when read.
+    let acked = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Writer: rm + create + sequential 8 KiB rewrite, forever.
     let writer = {
@@ -1001,22 +1004,22 @@ async fn sequential_recopy_readers_never_see_foreign_bytes() {
         let pattern = pattern.clone();
         let stop = stop.clone();
         let ino_cell = ino_cell.clone();
+        let acked = acked.clone();
         tokio::spawn(async move {
-            let mut gen = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                gen += 1;
-                let name = format!("fsv");
-                let _ = h.fs.unlink(h.req, 1, OsStr::new(&name)).await;
-                let ino = create(&h, &name).await;
+                let name = "fsv";
+                let _ = h.fs.unlink(h.req, 1, OsStr::new(name)).await;
+                let ino = create(&h, name).await;
+                acked.store(0, std::sync::atomic::Ordering::Release);
                 ino_cell.store(ino, std::sync::atomic::Ordering::Release);
                 for off in (0..LEN).step_by(8192) {
                     let end = (off + 8192).min(LEN);
                     write_at(&h, ino, off as u64, &pattern[off..end]).await;
+                    acked.store(end as u64, std::sync::atomic::Ordering::Release);
                     if off % 65536 == 0 {
                         tokio::task::yield_now().await;
                     }
                 }
-                let _ = gen;
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
@@ -1030,6 +1033,7 @@ async fn sequential_recopy_readers_never_see_foreign_bytes() {
         let pattern = pattern.clone();
         let stop = stop.clone();
         let ino_cell = ino_cell.clone();
+        let acked = acked.clone();
         readers.push(tokio::spawn(async move {
             let mut i = 0u64;
             let mut served = 0u64;
@@ -1052,16 +1056,41 @@ async fn sequential_recopy_readers_never_see_foreign_bytes() {
                 if ino_cell.load(std::sync::atomic::Ordering::Acquire) != ino {
                     continue;
                 }
+                let mut first_bad = None;
+                let mut bad = 0usize;
                 for (j, &b) in got.iter().enumerate() {
                     let pos = off as usize + j;
                     if pos < LEN && b != pattern[pos] {
-                        panic!(
-                            "foreign byte served: incarnation {ino} off {pos} got {b:#04x} \
-                             want {:#04x} (generic/795 — size visible before data, or a \
-                             stale identity serve)",
-                            pattern[pos]
-                        );
+                        if first_bad.is_none() {
+                            first_bad = Some(pos);
+                        }
+                        bad += 1;
                     }
+                }
+                let watermark = acked.load(std::sync::atomic::Ordering::Acquire);
+                if let Some(pos) = first_bad {
+                    let j0 = pos - off as usize;
+                    let dump: Vec<String> = got[j0..(j0 + 32).min(got.len())]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    let wdump: Vec<String> = pattern[pos..(pos + 32).min(LEN)]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    panic!(
+                        "foreign bytes served: incarnation {ino} reply off {off} len {} — \
+                         {bad} wrong bytes starting at {pos} (ack watermark {watermark}: \
+                         {}); got[{j0}..]={} want={} (generic/795)",
+                        got.len(),
+                        if (pos as u64) < watermark {
+                            "ACKED bytes lost from visibility"
+                        } else {
+                            "SIZE LED DATA (unacked range readable)"
+                        },
+                        dump.join(""),
+                        wdump.join("")
+                    );
                 }
                 served += got.len() as u64;
                 if i.is_multiple_of(64) {

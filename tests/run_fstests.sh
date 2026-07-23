@@ -750,8 +750,10 @@ run_check_failfast() {
             echo "--- diff tests/${t}.out results/${t}.out.bad (head) ---" >&2
             diff "tests/${t}.out" "results/${t}.out.bad" 2>/dev/null | head -40 >&2 || true
         fi
-        echo "Fix it (red cargo repro-port first), then RESTART the full run" >&2
-        echo "from the beginning (counted-restart discipline)." >&2
+        echo "Fix it (red cargo repro-port first), re-run the single test, then" >&2
+        echo "RESUME with: sudo tests/run_fstests.sh --resume-from $t" >&2
+        echo "(debugging efficiency only — final acceptance is still ONE complete" >&2
+        echo "from-zero pass on the final binary)." >&2
         echo "==================================================================" >&2
         return 1
     done
@@ -759,8 +761,47 @@ run_check_failfast() {
 }
 
 cd "$XFSTESTS_DIR"
+# The persisted from-zero expansion order — what makes a resume
+# deterministic (the resume rule, user directive 2026-07-23).
+ORDER_FILE="$XFSTESTS_DIR/vl10_full_list.order"
+
+expand_full_list() {
+    mapfile -t FULL_LIST < <(./check -n -g auto 2>/dev/null | grep -oE '^[a-z]+/[0-9]+')
+    if [ "${#FULL_LIST[@]}" -lt 100 ]; then
+        echo "ERROR: -g auto expansion produced only ${#FULL_LIST[@]} tests — refusing" >&2
+        exit 1
+    fi
+}
+
 EXIT_CODE=0
-if [ $# -gt 0 ]; then
+if [ "${1:-}" = "--resume-from" ]; then
+    # RESUME rule (user directive 2026-07-23): after a fail-fast abort at
+    # test T is fixed, re-run T then RESUME from T's position to the END
+    # of the persisted from-zero order. Debugging efficiency ONLY — the
+    # release-gate acceptance is still one complete from-zero pass on the
+    # final binary; prior-position greens from the aborted pass are
+    # provisional and the closing report cites only the from-zero pass.
+    RESUME_AT="${2:?--resume-from needs a test name (e.g. generic/634)}"
+    if [ -f "$ORDER_FILE" ]; then
+        mapfile -t FULL_LIST < "$ORDER_FILE"
+        echo "Resume order: persisted from-zero expansion ($ORDER_FILE, ${#FULL_LIST[@]} tests)."
+    else
+        echo "WARNING: no persisted order file — expanding fresh (check -n order is stable)." >&2
+        expand_full_list
+    fi
+    SLICE=()
+    seen=""
+    for t in "${FULL_LIST[@]}"; do
+        [ "$t" = "$RESUME_AT" ] && seen=1
+        [ -n "$seen" ] && SLICE+=("$t")
+    done
+    if [ "${#SLICE[@]}" -eq 0 ]; then
+        echo "ERROR: $RESUME_AT is not in the expanded list — nothing to resume" >&2
+        exit 1
+    fi
+    echo "=== RESUME PASS (NOT acceptance): ${#SLICE[@]} tests from $RESUME_AT to end ==="
+    run_check_failfast "${SLICE[@]}" || EXIT_CODE=1
+elif [ $# -gt 0 ]; then
     # Targeted fix-loop mode: classic one-shot check, verbatim args.
     echo "Running fstests with arguments: ${*}..."
     set +e
@@ -772,12 +813,9 @@ elif [ "${FSTESTS_QUICK:-0}" = "1" ]; then
     run_check_failfast "${SQUEEZEFS_FSTESTS_QUICK[@]}" || EXIT_CODE=1
 else
     echo "Expanding -g auto and running the full suite fail-fast..."
-    mapfile -t FULL_LIST < <(./check -n -g auto 2>/dev/null | grep -oE '^[a-z]+/[0-9]+')
-    if [ "${#FULL_LIST[@]}" -lt 100 ]; then
-        echo "ERROR: -g auto expansion produced only ${#FULL_LIST[@]} tests — refusing" >&2
-        exit 1
-    fi
-    echo "Full list: ${#FULL_LIST[@]} tests."
+    expand_full_list
+    printf '%s\n' "${FULL_LIST[@]}" > "$ORDER_FILE"
+    echo "Full list: ${#FULL_LIST[@]} tests (order persisted to $ORDER_FILE)."
     run_check_failfast "${FULL_LIST[@]}" || EXIT_CODE=1
 fi
 

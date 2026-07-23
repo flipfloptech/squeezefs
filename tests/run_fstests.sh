@@ -616,6 +616,40 @@ EOF
     esac
 }
 
+# HOST-HARDWARE dmesg noise (documented instrument class, 2026-07-23):
+# xfstests' _check_dmesg fails a test on ANY "WARNING:"-class kernel line
+# since the test started — including this box's amdgpu display-driver
+# idle-power WARN (dc_dmub_srv_apply_idle_power_optimizations, fired by
+# desktop vblank activity, zero fs frames) and split-lock CPU traps from
+# unrelated desktop processes. Those are not filesystem findings and
+# recur randomly, so a DMESG-ONLY failure (golden output matched — no
+# out.bad) continues IFF every triggering line is a named host-hardware
+# frame. Anything naming fs/fuse/mm/block paths stays fatal; the flagged
+# lines are printed either way. No cargo repro possible (host GPU
+# driver) — the same instrument-noise class as the attr `--restore` sed.
+dmesg_failure_is_host_noise() {
+    local t="$1" f="results/${t}.dmesg"
+    [ -f "$f" ] || return 1
+    [ -f "results/${t}.out.bad" ] && return 1
+    local hits
+    hits=$(grep -E -e "kernel BUG at" -e "WARNING:" -e "\bBUG:" -e "Oops:" \
+        -e "possible recursive locking detected" \
+        -e "(INFO|ERR): suspicious RCU usage" \
+        -e "INFO: possible circular locking dependency detected" \
+        -e "general protection fault:" -e "BUG .* remaining" \
+        -e "oom-kill" -e "UBSAN:" "$f" || true)
+    [ -n "$hits" ] || return 1
+    echo "--- dmesg trigger lines for $t ---"
+    printf '%s\n' "$hits"
+    # EVERY triggering line must be a known host-hardware frame.
+    if printf '%s\n' "$hits" | grep -E -q -v \
+        -e "drivers/gpu/drm" -e "amdgpu" -e "dc_dmub_srv" \
+        -e "split lock" -e "bus_lock" -e "wireless extensions"; then
+        return 1
+    fi
+    return 0
+}
+
 # A failed test continues only if its out.bad diff IS its pinned shape.
 failure_is_expected_shape() {
     local t="$1"
@@ -645,6 +679,13 @@ run_check_failfast() {
             shaped=$((shaped + 1))
             echo "EXPECTED-SHAPE: $t failed with exactly its pinned by-design diff" \
                  "(003/192 = noatime class, 213 = thin provisioning) — continuing"
+            continue
+        fi
+        if dmesg_failure_is_host_noise "$t"; then
+            shaped=$((shaped + 1))
+            echo "HOST-NOISE DMESG: $t failed only _check_dmesg and every trigger" \
+                 "line is a named host-hardware frame (GPU/CPU-errata — lines" \
+                 "above; results/${t}.dmesg preserved) — continuing"
             continue
         fi
         echo "==================================================================" >&2

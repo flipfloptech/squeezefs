@@ -4782,6 +4782,11 @@ impl KvMetaBackend {
         flags: u32,
         src_local: Option<Ino>,
         dest_local: Option<Ino>,
+        // RENAME_WHITEOUT (fstests generic/631, the overlayfs-upper
+        // contract): `(local key ino, global dentry ino)` pre-allocated
+        // by the routed layer — the whiteout char-0:0 inode and its
+        // dentry at the OLD name ride this same whole-tx entry.
+        whiteout: Option<(Ino, Ino)>,
         guards: Arc<[DlmGuard]>,
     ) -> Result<()> {
         self.write_gate()?;
@@ -4929,6 +4934,38 @@ impl KvMetaBackend {
             if dest_replaced != Some(src) {
                 tx.stage_delta(TREE_INODES, inode_key(src), &InodeDelta::ctime(now));
             }
+        }
+        // RENAME_WHITEOUT: mint the char-0:0 whiteout at the OLD name in
+        // the SAME whole-tx entry (atomic with the move — overlayfs'
+        // rename-whiteout-over-victim depends on it). VFS contract:
+        // S_IFCHR, perm 0, rdev 0; owner 0:0 (whiteouts are mounter
+        // plumbing — overlayfs checks type + rdev only).
+        if let Some((w_local, w_global)) = whiteout {
+            let wv = InodeValue {
+                mode: libc::S_IFCHR,
+                uid: 0,
+                gid: 0,
+                nlink: 1,
+                flags: 0,
+                rdev: 0,
+                size: 0,
+                atime: now,
+                mtime: now,
+                ctime: now,
+            };
+            tx.stage_put(TREE_INODES, inode_key(w_local), wv.encode());
+            let wk = self
+                .dentry_insert_key(&tx, local_old_parent, old_name)
+                .await?;
+            tx.stage_put(
+                TREE_DENTRIES,
+                wk,
+                DentryValue::encode_parts(
+                    w_global,
+                    Self::ft_byte(libc::S_IFCHR),
+                    old_name.as_bytes(),
+                )?,
+            );
         }
         tx.hold_guards(guards);
         self.commit_tx(tx).await?;
@@ -5403,6 +5440,12 @@ impl Metadata for KvMetaBackend {
                 std::io::Error::from_raw_os_error(libc::EINVAL),
             ));
         }
+        // WHITEOUT|EXCHANGE is VFS-forbidden (see the routed impl).
+        if flags & libc::RENAME_WHITEOUT != 0 && flags & libc::RENAME_EXCHANGE != 0 {
+            return Err(crate::error::SqueezefsError::Io(
+                std::io::Error::from_raw_os_error(libc::EINVAL),
+            ));
+        }
         let guards: Arc<[DlmGuard]> = Arc::from(
             self.dlm
                 .lock_many(
@@ -5467,6 +5510,35 @@ impl Metadata for KvMetaBackend {
                 // D1.c single-copy staging (no intermediate name Vec).
                 DentryValue::encode_parts(old_d.child_ino, old_d.file_type, new_name.as_bytes())?,
             );
+            // RENAME_WHITEOUT: the char-0:0 whiteout at the OLD name in
+            // the same whole-tx entry (the routed impl's contract).
+            if flags & libc::RENAME_WHITEOUT != 0 {
+                let w_ino = self.allocate_ino();
+                let now = Self::now_ns();
+                let wv = InodeValue {
+                    mode: libc::S_IFCHR,
+                    uid: 0,
+                    gid: 0,
+                    nlink: 1,
+                    flags: 0,
+                    rdev: 0,
+                    size: 0,
+                    atime: now,
+                    mtime: now,
+                    ctime: now,
+                };
+                tx.stage_put(TREE_INODES, inode_key(w_ino), wv.encode());
+                let wk = self.dentry_insert_key(&tx, old_parent, old_name).await?;
+                tx.stage_put(
+                    TREE_DENTRIES,
+                    wk,
+                    DentryValue::encode_parts(
+                        w_ino,
+                        Self::ft_byte(libc::S_IFCHR),
+                        old_name.as_bytes(),
+                    )?,
+                );
+            }
         }
         tx.hold_guards(guards);
         self.commit_tx(tx).await?;

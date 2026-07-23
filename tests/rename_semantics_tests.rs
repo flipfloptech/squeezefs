@@ -255,11 +255,19 @@ async fn rename_whiteout_moves_and_leaves_a_char_00_node() {
     .expect("RENAME_WHITEOUT must succeed (overlayfs-upper requires it)");
 
     // The move happened.
-    let moved = h.fs.lookup(h.req, 1, OsStr::new("wdst")).await.unwrap().attr;
+    let moved =
+        h.fs.lookup(h.req, 1, OsStr::new("wdst"))
+            .await
+            .unwrap()
+            .attr;
     assert_eq!(moved.ino, src, "dst is the moved source inode");
 
     // The OLD name is a whiteout: char device 0:0.
-    let wh = h.fs.lookup(h.req, 1, OsStr::new("wsrc")).await.unwrap().attr;
+    let wh =
+        h.fs.lookup(h.req, 1, OsStr::new("wsrc"))
+            .await
+            .unwrap()
+            .attr;
     assert_ne!(wh.ino, 0, "the whiteout must exist at the old name");
     assert_ne!(wh.ino, src, "the whiteout is a FRESH inode");
     assert_eq!(

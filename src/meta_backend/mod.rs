@@ -1639,6 +1639,13 @@ impl Metadata for RoutedMetaBackend {
                 std::io::Error::from_raw_os_error(libc::EINVAL),
             ));
         }
+        // The VFS forbids WHITEOUT|EXCHANGE; a defensive refusal keeps
+        // the combination unrepresentable below (generic/631 family).
+        if flags & libc::RENAME_WHITEOUT != 0 && flags & libc::RENAME_EXCHANGE != 0 {
+            return Err(crate::error::SqueezefsError::Io(
+                std::io::Error::from_raw_os_error(libc::EINVAL),
+            ));
+        }
 
         // §5.5.2a cutover gate — the deterministic G-VL-4 cross-slot-
         // rename case: BOTH parents' slots checked before any 4a
@@ -1652,6 +1659,23 @@ impl Metadata for RoutedMetaBackend {
         let (new_parent_v_idx, local_new_parent) = self.route_ino(new_parent);
         self.check_volume_enabled(old_parent_v_idx)?;
         self.check_volume_enabled(new_parent_v_idx)?;
+
+        // RENAME_WHITEOUT (fstests generic/631, the overlayfs-upper
+        // contract) mints a fresh char-0:0 inode in the old parent's
+        // volume: its mint slot joins the gate BEFORE any 4a acquisition
+        // (the create-path discipline — a park here can span a flip, so
+        // both parents' routes are re-verified after).
+        if flags & libc::RENAME_WHITEOUT != 0 {
+            let mint = self.route.load().mint_slot[old_parent_v_idx];
+            if self.slot_gate_extend_slots(&mut _gate, &[mint]).await
+                && (self.route_ino(old_parent) != (old_parent_v_idx, local_old_parent)
+                    || self.route_ino(new_parent) != (new_parent_v_idx, local_new_parent))
+            {
+                return Err(crate::error::SqueezefsError::Io(
+                    std::io::Error::from_raw_os_error(libc::EAGAIN),
+                ));
+            }
+        }
 
         // Per-volume lock sets in ascending volume order, each internally
         // canonical (I before D, stripe-deduped by lock_many). Interleaving
@@ -1763,6 +1787,15 @@ impl Metadata for RoutedMetaBackend {
                         .await?;
                 }
             }
+            // RENAME_WHITEOUT: pre-allocate the whiteout's (local,
+            // global) pair — minted in the old parent's volume, rides
+            // the same whole-tx entry. (A failed rename burns the ino —
+            // the standing §4.8 monotonic-allocation law, as at create.)
+            let whiteout = if flags & libc::RENAME_WHITEOUT != 0 {
+                Some(self.allocate_local_ino(old_parent_v_idx)?)
+            } else {
+                None
+            };
             let out = be
                 .routed_rename_local(
                     local_old_parent,
@@ -1772,6 +1805,7 @@ impl Metadata for RoutedMetaBackend {
                     flags,
                     src_local,
                     dest_local,
+                    whiteout,
                     guards.clone(),
                 )
                 .await;
@@ -1890,6 +1924,32 @@ impl Metadata for RoutedMetaBackend {
                 // PR M6 D4.b: the moved inode's ctime fragment.
                 let (v, l) = self.route_ino(old_child);
                 self.touch_ctime_routed(v, l, guards.clone()).await?;
+                // RENAME_WHITEOUT, cross-volume shape: mint the char-0:0
+                // whiteout + its dentry at the OLD name as per-volume
+                // fragments AFTER the move (cross-volume renames were
+                // never transactional across volumes — the documented
+                // posture; the crash window leaves the rename done
+                // without its whiteout, exactly like the other
+                // cross-volume fragments).
+                if flags & libc::RENAME_WHITEOUT != 0 {
+                    let (w_local, w_global) = self.allocate_local_ino(old_parent_v_idx)?;
+                    let minted = self.volumes[old_parent_v_idx]
+                        .routed_mint_inode(w_local, libc::S_IFCHR, 0, 0, 0, guards.clone())
+                        .await;
+                    if minted.is_err() {
+                        self.mirror_volume_failure(old_parent_v_idx);
+                    }
+                    minted?;
+                    self.insert_dentry_routed(
+                        old_parent_v_idx,
+                        local_old_parent,
+                        w_global,
+                        old_name,
+                        libc::S_IFCHR,
+                        guards.clone(),
+                    )
+                    .await?;
+                }
                 Ok(())
             } else {
                 Err(crate::error::SqueezefsError::Io(std::io::Error::new(

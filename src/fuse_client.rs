@@ -10012,11 +10012,17 @@ impl Filesystem for SqueezefsFilesystem {
         );
 
         // Refuse flags this filesystem does not implement — LOUD, never a
-        // silent plain rename. The kernel forwards RENAME_WHITEOUT to any
-        // FUSE fs; ignoring it made the kernel believe whiteouts were
-        // created (fstests generic/078; pinned in
-        // tests/rename_semantics_tests.rs).
-        if flags & !(libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE) != 0 {
+        // silent plain rename (fstests generic/078; pinned in
+        // tests/rename_semantics_tests.rs). RENAME_WHITEOUT is
+        // IMPLEMENTED (fstests generic/631 — the overlayfs-upper
+        // contract: the backend mints the char-0:0 whiteout atomically
+        // inside the rename tx); WHITEOUT|EXCHANGE stays refused (the
+        // VFS forbids the combination — defensive here, load-bearing in
+        // the backend).
+        if flags & !(libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE | libc::RENAME_WHITEOUT) != 0 {
+            return Err(Errno::from(libc::EINVAL));
+        }
+        if flags & libc::RENAME_WHITEOUT != 0 && flags & libc::RENAME_EXCHANGE != 0 {
             return Err(Errno::from(libc::EINVAL));
         }
 

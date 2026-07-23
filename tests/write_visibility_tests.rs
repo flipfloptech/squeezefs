@@ -975,3 +975,109 @@ async fn serialized_overwrite_never_reverts_neighbors() {
         }
     }
 }
+
+/// fstests generic/795 repro-port (VL10 release gate, the cat-race
+/// face): one stable source pattern; a writer loop that unlinks,
+/// re-creates, and SEQUENTIALLY rewrites the copy (the `cat orig >
+/// fsv` shape — the file walks inline → staged → striped as it grows);
+/// concurrent readers compare the copy against the pattern. A reader
+/// may legally see a SHORT file (EOF — the copy is mid-flight), but
+/// every byte it DOES get inside the visible size must equal the
+/// pattern: 795's readers filter EOF and still caught wrong bytes
+/// (zeros / foreign) at stable offsets, self-healing on remount —
+/// a daemon-side transient wrong serve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sequential_recopy_readers_never_see_foreign_bytes() {
+    let h = Arc::new(make().await);
+    const LEN: usize = 10 * BS as usize; // 10 blocks: crosses all layouts
+    let pattern: Arc<Vec<u8>> = Arc::new((0..LEN).map(|i| (i % 251) as u8 ^ 0x5A).collect());
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ino_cell = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Writer: rm + create + sequential 8 KiB rewrite, forever.
+    let writer = {
+        let h = h.clone();
+        let pattern = pattern.clone();
+        let stop = stop.clone();
+        let ino_cell = ino_cell.clone();
+        tokio::spawn(async move {
+            let mut gen = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                gen += 1;
+                let name = format!("fsv");
+                let _ = h.fs.unlink(h.req, 1, OsStr::new(&name)).await;
+                let ino = create(&h, &name).await;
+                ino_cell.store(ino, std::sync::atomic::Ordering::Release);
+                for off in (0..LEN).step_by(8192) {
+                    let end = (off + 8192).min(LEN);
+                    write_at(&h, ino, off as u64, &pattern[off..end]).await;
+                    if off % 65536 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                let _ = gen;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+    };
+
+    // Readers: random windows of the CURRENT incarnation; short reads are
+    // legal, wrong bytes never.
+    let mut readers = Vec::new();
+    for r in 0..4u64 {
+        let h = h.clone();
+        let pattern = pattern.clone();
+        let stop = stop.clone();
+        let ino_cell = ino_cell.clone();
+        readers.push(tokio::spawn(async move {
+            let mut i = 0u64;
+            let mut served = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                i += 1;
+                let ino = ino_cell.load(std::sync::atomic::Ordering::Acquire);
+                if ino == 0 {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                let off = ((i * 7919 + r * 13007) % LEN as u64) & !4095;
+                let len = 16384u32;
+                let reply = match h.fs.read(h.req, ino, 0, off, len, 0).await {
+                    Ok(rep) => rep,
+                    Err(_) => continue, // unlinked under us — legal
+                };
+                let got = reply.data.as_ref();
+                // The incarnation may have moved (unlink+recreate): only
+                // judge bytes when the ino is STILL current after the read.
+                if ino_cell.load(std::sync::atomic::Ordering::Acquire) != ino {
+                    continue;
+                }
+                for (j, &b) in got.iter().enumerate() {
+                    let pos = off as usize + j;
+                    if pos < LEN && b != pattern[pos] {
+                        panic!(
+                            "foreign byte served: incarnation {ino} off {pos} got {b:#04x} \
+                             want {:#04x} (generic/795 — size visible before data, or a \
+                             stale identity serve)",
+                            pattern[pos]
+                        );
+                    }
+                }
+                served += got.len() as u64;
+                if i.is_multiple_of(64) {
+                    tokio::task::yield_now().await;
+                }
+            }
+            served
+        }));
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.await.unwrap();
+    let mut total = 0u64;
+    for t in readers {
+        total += t.await.unwrap();
+    }
+    assert!(total > 0, "readers must have served bytes");
+}

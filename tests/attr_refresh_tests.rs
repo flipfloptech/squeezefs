@@ -536,3 +536,75 @@ async fn out_of_range_timestamps_saturate_deterministically() {
     let got = h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr;
     assert_eq!(got.mtime, exact, "in-range times are exact (generic/634)");
 }
+
+/// fstests generic/683 (VL10 release gate): an unprivileged fallocate
+/// must DROP suid/sgid — the vfs killpriv machinery covers write and
+/// truncate in the kernel, but FUSE fallocate leaves the strip to the
+/// daemon (683's Tests 1–4 golden: 6666 → 666 after a qa_user falloc;
+/// the pre-fix daemon kept the non-group-exec sgid: 2666). Root keeps
+/// its bits (683 Tests 5–8). The strip matches setattr_prepare's law:
+/// suid always; sgid regardless of group-exec (the modern vfs shape
+/// the 683 golden encodes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unprivileged_fallocate_drops_suid_sgid() {
+    let h = make().await;
+    let ino = create(&h, 1, "setuid.bin").await;
+    // 6666: suid + sgid, non-exec (683 Test 1's shape).
+    h.fs.setattr(
+        h.req,
+        ino,
+        None,
+        fuse3::SetAttr {
+            mode: Some(0o6666),
+            size: Some(196_608),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("seed mode+size");
+
+    // An UNPRIVILEGED caller's fallocate (uid 1000 != root).
+    let user_req = Request {
+        unique: 2,
+        uid: 1000,
+        gid: 1000,
+        pid: 2,
+    };
+    h.fs.fallocate(user_req, ino, 0, 0, 65_536, 0)
+        .await
+        .expect("fallocate");
+    let got = backend_inode(&h, ino).await;
+    assert_eq!(
+        got.mode & 0o7777,
+        0o666,
+        "unprivileged fallocate must drop BOTH suid and sgid (generic/683)"
+    );
+
+    // Root keeps the bits (683 Test 5).
+    h.fs.setattr(
+        h.req,
+        ino,
+        None,
+        fuse3::SetAttr {
+            mode: Some(0o6666),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let root_req = Request {
+        unique: 3,
+        uid: 0,
+        gid: 0,
+        pid: 3,
+    };
+    h.fs.fallocate(root_req, ino, 0, 0, 65_536, 0)
+        .await
+        .expect("root fallocate");
+    let got = backend_inode(&h, ino).await;
+    assert_eq!(
+        got.mode & 0o7777,
+        0o6666,
+        "root fallocate keeps suid/sgid (generic/683 Test 5)"
+    );
+}

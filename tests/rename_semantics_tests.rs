@@ -174,8 +174,11 @@ async fn rename_over_file_zeroes_dest_nlink() {
     assert_eq!(backend_nlink(&h, f2).await, 0);
 }
 
-/// generic/078: RENAME_WHITEOUT (and any unknown rename2 flag) must
-/// refuse EINVAL — never a silent plain rename.
+/// Any unknown rename2 flag must refuse EINVAL — never a silent plain
+/// rename. (RENAME_WHITEOUT graduated from this list to a real
+/// implementation — fstests generic/631, the overlayfs-upper probe; its
+/// pins are below. WHITEOUT|EXCHANGE stays refused: the VFS forbids the
+/// combination and a defensive daemon refusal keeps it unrepresentable.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rename2_refuses_unsupported_flags() {
     let h = make().await;
@@ -184,8 +187,7 @@ async fn rename2_refuses_unsupported_flags() {
         .unwrap();
 
     for flags in [
-        libc::RENAME_WHITEOUT,
-        libc::RENAME_WHITEOUT | libc::RENAME_NOREPLACE,
+        libc::RENAME_WHITEOUT | libc::RENAME_EXCHANGE,
         1 << 5, // any future/unknown bit
     ] {
         let err =
@@ -221,4 +223,137 @@ async fn rename2_refuses_unsupported_flags() {
     )
     .await
     .expect("NOREPLACE into a free name");
+}
+
+/// fstests generic/631 (overlayfs-over-squeezefs, VL10 release gate):
+/// RENAME_WHITEOUT is IMPLEMENTED — the kernel forwards flag 4 to every
+/// FUSE fs (proven live: the daemon logs `flags = 4`; refusing it is a
+/// DAEMON gap, not a kernel-interface one), and overlayfs refuses any
+/// upper fs without it ("upper fs missing required features"). The
+/// rename moves src → dst and leaves a fresh whiteout at the OLD name:
+/// a char device 0:0 (the VFS whiteout contract — S_IFCHR, rdev 0),
+/// minted atomically inside the same-volume rename transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_whiteout_moves_and_leaves_a_char_00_node() {
+    let h = make().await;
+    let src =
+        h.fs.create(h.req, 1, OsStr::new("wsrc"), libc::S_IFREG | 0o644, 0)
+            .await
+            .unwrap()
+            .attr
+            .ino;
+
+    h.fs.rename2(
+        h.req,
+        1,
+        OsStr::new("wsrc"),
+        1,
+        OsStr::new("wdst"),
+        libc::RENAME_WHITEOUT,
+    )
+    .await
+    .expect("RENAME_WHITEOUT must succeed (overlayfs-upper requires it)");
+
+    // The move happened.
+    let moved = h.fs.lookup(h.req, 1, OsStr::new("wdst")).await.unwrap().attr;
+    assert_eq!(moved.ino, src, "dst is the moved source inode");
+
+    // The OLD name is a whiteout: char device 0:0.
+    let wh = h.fs.lookup(h.req, 1, OsStr::new("wsrc")).await.unwrap().attr;
+    assert_ne!(wh.ino, 0, "the whiteout must exist at the old name");
+    assert_ne!(wh.ino, src, "the whiteout is a FRESH inode");
+    assert_eq!(
+        wh.kind,
+        fuse3::FileType::CharDevice,
+        "whiteout = char device (VFS contract)"
+    );
+    assert_eq!(wh.rdev, 0, "whiteout rdev = 0:0 (VFS contract)");
+    assert_eq!(wh.nlink, 1);
+
+    // The whiteout is a real unlinkable node (overlayfs cleans them up).
+    h.fs.unlink(h.req, 1, OsStr::new("wsrc"))
+        .await
+        .expect("whiteout unlink");
+}
+
+/// WHITEOUT composes with NOREPLACE exactly like a plain rename:
+/// an existing destination refuses EEXIST (and no whiteout appears);
+/// an absent destination succeeds and leaves the whiteout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_whiteout_noreplace_composes() {
+    let h = make().await;
+    h.fs.create(h.req, 1, OsStr::new("a"), libc::S_IFREG | 0o644, 0)
+        .await
+        .unwrap();
+    h.fs.create(h.req, 1, OsStr::new("b"), libc::S_IFREG | 0o644, 0)
+        .await
+        .unwrap();
+
+    let err =
+        h.fs.rename2(
+            h.req,
+            1,
+            OsStr::new("a"),
+            1,
+            OsStr::new("b"),
+            libc::RENAME_WHITEOUT | libc::RENAME_NOREPLACE,
+        )
+        .await
+        .expect_err("existing destination must refuse under NOREPLACE");
+    let io: std::io::Error = err.into();
+    assert_eq!(io.raw_os_error(), Some(libc::EEXIST));
+    let a = h.fs.lookup(h.req, 1, OsStr::new("a")).await.unwrap().attr;
+    assert_eq!(
+        a.kind,
+        fuse3::FileType::RegularFile,
+        "the refused rename must not leave a whiteout"
+    );
+
+    h.fs.rename2(
+        h.req,
+        1,
+        OsStr::new("a"),
+        1,
+        OsStr::new("c"),
+        libc::RENAME_WHITEOUT | libc::RENAME_NOREPLACE,
+    )
+    .await
+    .expect("absent destination succeeds");
+    let wh = h.fs.lookup(h.req, 1, OsStr::new("a")).await.unwrap().attr;
+    assert_eq!(wh.kind, fuse3::FileType::CharDevice);
+    assert_eq!(wh.rdev, 0);
+}
+
+/// WHITEOUT over an EXISTING destination (no NOREPLACE): the replace
+/// happens AND the whiteout appears at the old name — the overlayfs
+/// unlink-through-whiteout shape (its workdir whiteout is renamed over
+/// the victim's upper entry).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_whiteout_over_existing_destination() {
+    let h = make().await;
+    let src =
+        h.fs.create(h.req, 1, OsStr::new("s2"), libc::S_IFREG | 0o644, 0)
+            .await
+            .unwrap()
+            .attr
+            .ino;
+    h.fs.create(h.req, 1, OsStr::new("d2"), libc::S_IFREG | 0o644, 0)
+        .await
+        .unwrap();
+
+    h.fs.rename2(
+        h.req,
+        1,
+        OsStr::new("s2"),
+        1,
+        OsStr::new("d2"),
+        libc::RENAME_WHITEOUT,
+    )
+    .await
+    .expect("whiteout rename over an existing destination");
+    let d = h.fs.lookup(h.req, 1, OsStr::new("d2")).await.unwrap().attr;
+    assert_eq!(d.ino, src);
+    let wh = h.fs.lookup(h.req, 1, OsStr::new("s2")).await.unwrap().attr;
+    assert_eq!(wh.kind, fuse3::FileType::CharDevice);
+    assert_eq!(wh.rdev, 0);
 }

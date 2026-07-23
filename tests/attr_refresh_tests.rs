@@ -465,3 +465,74 @@ async fn mknod_rdev_round_trips() {
     );
     assert_eq!(got.kind, fuse3::FileType::CharDevice);
 }
+
+/// fstests generic/634 adjudication companion (VL10 release gate): the
+/// on-disk timestamp word is i64 NANOSECONDS — a deliberate ±292-year
+/// range (1677-09-21 .. 2262-04-11), the same class of finite-range
+/// choice as ext4's u34 seconds or xfs bigtime. Out-of-range setattr
+/// times must SATURATE deterministically to the range edge (never wrap,
+/// never error) and the CLAMPED value must be what every subsequent
+/// getattr serves — the daemon's half of the clamp-and-persist
+/// contract. (The kernel half — incore clamping — needs sb->s_time_max,
+/// which the FUSE protocol cannot advertise; that is 634's documented
+/// expected shape in tests/run_fstests.sh.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn out_of_range_timestamps_saturate_deterministically() {
+    let h = make().await;
+    let ino = create(&h, 1, "y2514").await;
+
+    // generic/634's u34_max: May 30 01:53:03 UTC 2514 — beyond i64 ns.
+    let huge = Timestamp::new(17_179_869_183, 0);
+    h.fs.setattr(
+        h.req,
+        ino,
+        None,
+        fuse3::SetAttr {
+            mtime: Some(huge),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("out-of-range setattr must clamp, not error");
+    let got = h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr;
+    assert_eq!(
+        got.mtime.sec, 9_223_372_036,
+        "beyond-range mtime saturates to the i64-ns ceiling (2262-04-11)"
+    );
+    assert_eq!(got.mtime.nsec, 854_775_807);
+
+    // The floor: year 0 — before the i64-ns floor (1677-09-21).
+    let tiny = Timestamp::new(-62_167_219_200, 0);
+    h.fs.setattr(
+        h.req,
+        ino,
+        None,
+        fuse3::SetAttr {
+            mtime: Some(tiny),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("below-range setattr must clamp, not error");
+    let got = h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr;
+    assert_eq!(
+        got.mtime.sec, -9_223_372_037,
+        "below-range mtime saturates to the i64-ns floor (1677-09-21)"
+    );
+
+    // In-range values keep round-tripping exactly.
+    let exact = Timestamp::new(7_956_915_742, 0); // all-twos, year 2222
+    h.fs.setattr(
+        h.req,
+        ino,
+        None,
+        fuse3::SetAttr {
+            mtime: Some(exact),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let got = h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr;
+    assert_eq!(got.mtime, exact, "in-range times are exact (generic/634)");
+}

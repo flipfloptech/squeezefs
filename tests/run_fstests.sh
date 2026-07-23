@@ -587,6 +587,17 @@ SQUEEZEFS_FSTESTS_QUICK=(
 # ---------------------------------------------------------------------------
 
 # The pinned expected shapes, verbatim `diff tests/<t>.out results/<t>.out.bad`.
+# generic/634 (adjudicated 2026-07-23): the on-disk timestamp word is i64
+# NANOSECONDS — a deliberate ±292-year range (1677..2262), the same
+# finite-range class as ext4 u34/xfs bigtime. The daemon half of 634's
+# clamp-and-persist contract is exact (deterministic saturation, pinned in
+# tests/attr_refresh_tests.rs::out_of_range_timestamps_saturate_*); the
+# kernel half CANNOT be satisfied over FUSE — incore clamping needs
+# sb->s_time_max and the FUSE protocol has no field to advertise it, so
+# the kernel keeps huge dates incore while the daemon persists the clamp,
+# and 634's before/after-remount diff shows exactly the six saturated
+# rows below. Kernel-interface-only (the 131/478/504 exception class).
+# Any OTHER diff on 634 = regression.
 expected_shape_diff() {
     case "$1" in
     generic/003) cat <<'EOF'
@@ -610,6 +621,50 @@ EOF
     generic/213) cat <<'EOF'
 4d3
 < fallocate: No space left on device
+EOF
+        ;;
+    generic/634) cat <<'EOF'
+1a2,41
+> 2,4c2,4
+> < 2147483647-12-31 23:59:59.000000000 +0000 67767976233532799 /mnt/squeezefs_scratch/t_abs_max_time
+> < stat.mtime.tv_sec = 67767976233532799
+> < stat.mtime.tv_nsec = 0
+> ---
+> > 2262-04-11 23:47:16.854775807 +0000 9223372036 /mnt/squeezefs_scratch/t_abs_max_time
+> > stat.mtime.tv_sec = 9223372036
+> > stat.mtime.tv_nsec = 854775807
+> 6,8c6,8
+> < 0000-01-01 00:00:00.000000000 +0000 -62167219200 /mnt/squeezefs_scratch/t_abs_min_time
+> < stat.mtime.tv_sec = -62167219200
+> < stat.mtime.tv_nsec = 0
+> ---
+> > 1677-09-21 00:12:43.145224192 +0000 -9223372037 /mnt/squeezefs_scratch/t_abs_min_time
+> > stat.mtime.tv_sec = -9223372037
+> > stat.mtime.tv_nsec = 145224192
+> 22,24c22,24
+> < 2446-05-10 22:38:55.000000000 +0000 15032385535 /mnt/squeezefs_scratch/t_u34_from_s32_min
+> < stat.mtime.tv_sec = 15032385535
+> < stat.mtime.tv_nsec = 0
+> ---
+> > 2262-04-11 23:47:16.854775807 +0000 9223372036 /mnt/squeezefs_scratch/t_u34_from_s32_min
+> > stat.mtime.tv_sec = 9223372036
+> > stat.mtime.tv_nsec = 854775807
+> 26,28c26,28
+> < 2514-05-30 01:53:03.000000000 +0000 17179869183 /mnt/squeezefs_scratch/t_u34_max
+> < stat.mtime.tv_sec = 17179869183
+> < stat.mtime.tv_nsec = 0
+> ---
+> > 2262-04-11 23:47:16.854775807 +0000 9223372036 /mnt/squeezefs_scratch/t_u34_max
+> > stat.mtime.tv_sec = 9223372036
+> > stat.mtime.tv_nsec = 854775807
+> 30,32c30,32
+> < 2486-07-02 20:20:24.000000000 +0000 16299260424 /mnt/squeezefs_scratch/t_u64ns_from_s32_min
+> < stat.mtime.tv_sec = 16299260424
+> < stat.mtime.tv_nsec = 0
+> ---
+> > 2262-04-11 23:47:16.854775807 +0000 9223372036 /mnt/squeezefs_scratch/t_u64ns_from_s32_min
+> > stat.mtime.tv_sec = 9223372036
+> > stat.mtime.tv_nsec = 854775807
 EOF
         ;;
     *) return 1 ;;

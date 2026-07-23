@@ -4725,6 +4725,47 @@ impl SqueezefsFilesystem {
         self.active_inode_locks.get_inode_lock(ino)
     }
 
+    /// fstests generic/683 family (VL10 release gate): an UNPRIVILEGED
+    /// data-modifying fallocate (prealloc/punch/zero — every arm) drops
+    /// suid+sgid, both bits regardless of exec bits (the 5.19-era vfs
+    /// setgid-series law the 683 golden encodes). The kernel's killpriv
+    /// machinery covers write/truncate and chmods suid away itself, but
+    /// FUSE fallocate leaves the strip to the daemon — without this the
+    /// non-group-exec sgid survived (6666 → 2666, not 666). Idempotent
+    /// with any kernel-sent killpriv chmod; root (uid 0) keeps its bits.
+    async fn strip_setid_after_unprivileged_datamod(
+        &self,
+        req: &Request,
+        ino: u64,
+    ) -> FuseResult<()> {
+        if req.uid == 0 {
+            return Ok(());
+        }
+        let backend = self
+            .meta_backend
+            .as_ref()
+            .expect("meta_backend must be configured");
+        let inode = backend.getattr(ino).await.map_err(map_squeezefs_err)?;
+        if inode.mode & 0o6000 == 0 {
+            return Ok(());
+        }
+        backend
+            .setattr(
+                ino,
+                Some(inode.mode & !0o6000),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map_err(map_squeezefs_err)?;
+        self.refresh_attr_cache(ino).await;
+        Ok(())
+    }
+
     /// PR L4-4 (§5.5.1): the read handler's guarded **hit-path** probe
     /// sequence, factored for the IPC sync fast path. MUST be called with
     /// this inode's read guard held (the service thread's `try_read()`).
@@ -10836,7 +10877,7 @@ impl Filesystem for SqueezefsFilesystem {
 
     async fn fallocate(
         &self,
-        _req: Request,
+        req: Request,
         ino: u64,
         _fh: u64,
         offset: u64,
@@ -10900,6 +10941,8 @@ impl Filesystem for SqueezefsFilesystem {
                     .await
                     .map_err(map_squeezefs_err)?;
             }
+            self.strip_setid_after_unprivileged_datamod(&req, ino)
+                .await?;
             return Ok(());
         }
 
@@ -10917,6 +10960,8 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_squeezefs_err)?;
         }
 
+        self.strip_setid_after_unprivileged_datamod(&req, ino)
+            .await?;
         Ok(())
     }
 

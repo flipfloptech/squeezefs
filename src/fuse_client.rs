@@ -10634,87 +10634,49 @@ impl Filesystem for SqueezefsFilesystem {
             _src_write_guard = None;
         }
 
-        // Sort paths lexicographically to prevent deadlocks under concurrent operations.
-        let (src_lease, dest_lease) = if inode == inode_out {
-            if self.active_leases.contains_key(&inode) {
-                (None, None)
-            } else {
-                let lease = match self
-                    .dlm
-                    .acquire_lock(&src_path, None, Duration::from_secs(5))
-                    .await
-                {
-                    Ok(l) => l,
-                    Err(e) => {
-                        error!(
-                            "copy_file_range: failed to acquire lock on src_path {}: {:?}",
-                            src_path, e
-                        );
-                        return Err(Errno::from(libc::EAGAIN));
-                    }
-                };
-                (Some(lease), None)
+        // Per-ino CACHED leases — the write path's discipline
+        // (`get_or_acquire_lease`): once acquired, a lease persists in
+        // `active_leases` until release/reclaim, so cfr storms stop paying
+        // (and stop LOSING) a fresh 5s DLM wait per copy. Acquire in
+        // ascending-ino order (a stable total order; the old path-sorted
+        // TEMPORARY leases still returned EAGAIN to userspace whenever a
+        // conveyor tx co-owned the ino's 4a guard across a >5s batch stall
+        // — cp aborted the copy, fstests generic/795's
+        // "Resource temporarily unavailable"). One brief bounded retry
+        // absorbs the stall; a persistent holder still fails loud.
+        let mut lease_tokens: [(u64, u64); 2] = [(inode, 0), (inode_out, 0)];
+        {
+            let mut order = [inode.min(inode_out), inode.max(inode_out)];
+            if order[0] == order[1] {
+                order[1] = 0; // dedup sentinel (ino 0 never occurs)
             }
-        } else {
-            let src_already_held = self.active_leases.contains_key(&inode);
-            let dest_already_held = self.active_leases.contains_key(&inode_out);
-
-            let (first_path, second_path) = if src_path < dest_path {
-                (&src_path, &dest_path)
-            } else {
-                (&dest_path, &src_path)
-            };
-
-            let first_lease = if (src_path < dest_path && src_already_held)
-                || (src_path >= dest_path && dest_already_held)
-            {
-                None
-            } else {
-                let l = match self
-                    .dlm
-                    .acquire_lock(first_path, None, Duration::from_secs(5))
-                    .await
-                {
-                    Ok(l) => Some(l),
-                    Err(e) => {
-                        error!(
-                            "copy_file_range: failed to acquire lock on first path {}: {:?}",
-                            first_path, e
-                        );
-                        return Err(Errno::from(libc::EAGAIN));
+            for &i in order.iter().filter(|&&i| i != 0) {
+                let mut attempt = 0u32;
+                let tok = loop {
+                    match self.get_or_acquire_lease(i).await {
+                        Ok(t) => break t,
+                        Err(e) if attempt < 2 => {
+                            attempt += 1;
+                            debug!(
+                                "copy_file_range: lease wait on ino {i} lost (attempt {attempt}): {e:?}; retrying"
+                            );
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+                        Err(e) => {
+                            error!("copy_file_range: failed to acquire lease on ino {i}: {e:?}");
+                            return Err(Errno::from(libc::EAGAIN));
+                        }
                     }
                 };
-                l
-            };
-
-            let second_lease = if (src_path < dest_path && dest_already_held)
-                || (src_path >= dest_path && src_already_held)
-            {
-                None
-            } else {
-                let l = match self
-                    .dlm
-                    .acquire_lock(second_path, None, Duration::from_secs(5))
-                    .await
-                {
-                    Ok(l) => Some(l),
-                    Err(e) => {
-                        error!(
-                            "copy_file_range: failed to acquire lock on second path {}: {:?}",
-                            second_path, e
-                        );
-                        return Err(Errno::from(libc::EAGAIN));
+                for slot in lease_tokens.iter_mut() {
+                    if slot.0 == i {
+                        slot.1 = tok;
                     }
-                };
-                l
-            };
-
-            if src_path < dest_path {
-                (first_lease, second_lease)
-            } else {
-                (second_lease, first_lease)
+                }
             }
-        };
+        }
+        let src_token = lease_tokens[0].1;
+        let dest_token = lease_tokens[1].1;
 
         // 2. Read sizes to check if we can perform metadata clone
         let src_size = self
@@ -10723,22 +10685,6 @@ impl Filesystem for SqueezefsFilesystem {
             .await
             .map_err(map_squeezefs_err)?;
         let dest_size = self.router.get_file_size(&dest_path).await.unwrap_or(0);
-
-        let src_token = if let Some(ref sl) = src_lease {
-            sl.fencing_token()
-        } else if let Some(lease) = self.active_leases.get(&inode) {
-            lease.fencing_token()
-        } else {
-            0
-        };
-
-        let dest_token = if let Some(ref dl) = dest_lease {
-            dl.fencing_token()
-        } else if let Some(lease) = self.active_leases.get(&inode_out) {
-            lease.fencing_token()
-        } else {
-            0
-        };
 
         // Whole-file clone fast path — ONLY when the source's acked custody
         // is fully merged (freeze-clean): under the held guards, every
@@ -10883,17 +10829,7 @@ impl Filesystem for SqueezefsFilesystem {
             };
 
         // Perform write to destination
-        let target_fencing_token = if let Some(ref dl) = dest_lease {
-            dl.fencing_token()
-        } else if let Some(ref sl) = src_lease {
-            sl.fencing_token()
-        } else if let Some(lease) = self.active_leases.get(&inode_out) {
-            lease.fencing_token()
-        } else if let Some(lease) = self.active_leases.get(&inode) {
-            lease.fencing_token()
-        } else {
-            0
-        };
+        let target_fencing_token = dest_token;
 
         let copied_len = effective_len as u64;
         let new_dest_size = std::cmp::max(dest_size, off_out + copied_len);

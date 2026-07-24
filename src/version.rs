@@ -1,17 +1,27 @@
-//! Build identity — git-commit versioning (user policy, 2026-07-18).
+//! Build identity — release-train + git-commit versioning (user policy,
+//! 2026-07-24, superseding the commit-only 2026-07-18 policy).
 //!
-//! The version of a SqueezeFS build **is the git commit it was built from**:
-//! no semver, no calver. Periodic releases are annotated `stable-YYYY.MM[.N]`
-//! / `lts-YYYY.MM` git tags on specific commits — the tag names the release,
-//! the commit stays the version. `build.rs` captures the identity at compile
-//! time (`SQUEEZEFS_BUILD_{COMMIT,COMMIT_SHORT,DIRTY,TAG,TIMESTAMP}` rustc
-//! envs, with packager env fallbacks and `unknown` for no-git tarball
-//! builds); this module turns it into the one-line `--version` string, the
+//! A SqueezeFS build carries **two identities, both surfaced**: the
+//! **release-train version** ([`RELEASE_TRAIN`] = `CARGO_PKG_VERSION`,
+//! bumped in `Cargo.toml` as a release act — currently the 1.1 train; the
+//! first-party `fuse3` fork and the preload/ipc crates track the same
+//! train) and the **git commit the build was produced from** (the
+//! fine-grained identity). Periodic releases remain annotated
+//! `stable-YYYY.MM[.N]` / `lts-YYYY.MM` git tags on specific commits — the
+//! tag names the release, the commit pins the exact build. `build.rs`
+//! captures the commit identity at compile time
+//! (`SQUEEZEFS_BUILD_{COMMIT,COMMIT_SHORT,DIRTY,TAG,TIMESTAMP}` rustc envs,
+//! with packager env fallbacks and `unknown` for no-git tarball builds);
+//! this module turns both into the one-line `--version` string, the
 //! `.stats` `build_commit` / `build_tag` fields (the fleet mixed-version
 //! detector), and nothing else. Operator surface: docs/operations.md
 //! §Versioning & releases. Contract: tests/cli_version_tests.rs.
 
 use std::sync::LazyLock;
+
+/// The release-train version — `CARGO_PKG_VERSION`, bumped as a release
+/// act (docs/operations.md §Versioning & releases).
+pub const RELEASE_TRAIN: &str = env!("CARGO_PKG_VERSION");
 
 /// Full build commit hash (40-hex), `unknown` on no-git tarball builds
 /// without a packager override.
@@ -30,15 +40,17 @@ fn build_dirty() -> bool {
     env!("SQUEEZEFS_BUILD_DIRTY") == "1"
 }
 
-/// Format the one-line, grep-friendly, commit-first version string (without
+/// Format the one-line, grep-friendly, train-first version string (without
 /// the leading binary name — clap prepends `squeezefs `):
 ///
-/// * untagged: `<short>[-dirty] (<full>[-dirty]) built <built_utc>`
-/// * tagged:   `<tag> (<short>[-dirty] / <full>[-dirty]) built <built_utc>`
+/// * untagged: `<train> (<short>[-dirty] / <full>[-dirty]) built <built_utc>`
+/// * tagged:   `<train> (<short>[-dirty] / <full>[-dirty], tag <tag>) built <built_utc>`
 ///
+/// The release-train version leads; the commit identity survives verbatim.
 /// `-dirty` rides **both** hash forms — a dirty rebuild of a tagged commit
 /// must never masquerade as the release.
 pub fn format_version_line(
+    train: &str,
     short: &str,
     full: &str,
     dirty: bool,
@@ -47,9 +59,9 @@ pub fn format_version_line(
 ) -> String {
     let d = if dirty { "-dirty" } else { "" };
     if tag.is_empty() {
-        format!("{short}{d} ({full}{d}) built {built_utc}")
+        format!("{train} ({short}{d} / {full}{d}) built {built_utc}")
     } else {
-        format!("{tag} ({short}{d} / {full}{d}) built {built_utc}")
+        format!("{train} ({short}{d} / {full}{d}, tag {tag}) built {built_utc}")
     }
 }
 
@@ -62,6 +74,7 @@ pub fn format_build_commit(full: &str, dirty: bool) -> String {
 
 static VERSION_LINE: LazyLock<String> = LazyLock::new(|| {
     format_version_line(
+        RELEASE_TRAIN,
         BUILD_COMMIT_SHORT,
         BUILD_COMMIT,
         build_dirty(),

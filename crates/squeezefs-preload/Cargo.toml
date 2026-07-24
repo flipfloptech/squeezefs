@@ -21,9 +21,10 @@
 
 [package]
 name = "squeezefs-preload"
-# cargo-internal placeholder only — SqueezeFS versions are git commits
-# (see docs/operations.md §Versioning & releases); never bump for releases.
-version = "0.1.0"
+# First-party crate: tracks the SqueezeFS release-train version
+# (docs/operations.md §Versioning & releases), bumped as a release act.
+# Git commits remain the fine-grained identity.
+version = "1.1.0"
 edition = "2021"
 license-file = "../../LICENSE"
 publish = false

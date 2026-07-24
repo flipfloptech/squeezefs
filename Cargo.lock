@@ -685,7 +685,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "fuse3"
-version = "0.7.3"
+version = "1.1.0"
 dependencies = [
  "async-notify",
  "bincode",
@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "squeezefs"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2268,7 +2268,7 @@ dependencies = [
 
 [[package]]
 name = "squeezefs-ipc"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "libc",
  "proptest",
@@ -2278,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "squeezefs-preload"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "libc",
  "squeezefs-ipc",

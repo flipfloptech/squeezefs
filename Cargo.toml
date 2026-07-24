@@ -1,8 +1,11 @@
 [package]
 name = "squeezefs"
-# cargo-internal placeholder only — SqueezeFS versions are git commits
-# (see docs/operations.md §Versioning & releases); never bump for releases.
-version = "0.1.0"
+# The release-train version (docs/operations.md §Versioning & releases):
+# bumped as a release act (user directive 2026-07-24). Git commits remain
+# the fine-grained identity; stable-*/lts-* tags remain the release names.
+# The first-party crates (crates/fuse3, crates/squeezefs-{ipc,preload})
+# track the same train.
+version = "1.1.0"
 edition = "2021"
 license-file = "LICENSE"
 
@@ -12,7 +15,16 @@ license-file = "LICENSE"
 # creates it. Excluded on purpose:
 #   - crates/fuse3 — stays a [patch.crates-io] path dep with its own
 #     standalone suite (first-party fork precedent); NOT a member, or the
-#     root gate would absorb its test surface.
+#     root gate would absorb its test surface. The patch indirection is
+#     LOAD-BEARING for workspace topology, not crates-io identity: the
+#     fork is its own workspace root (the empty [workspace] table in its
+#     manifest), and cargo rejects a *direct* path dependency to a nested
+#     foreign workspace root ("multiple workspace roots found in the same
+#     workspace") even when excluded — patch entries bypass that check
+#     (the prepublish precedent). The fork carries the SqueezeFS
+#     release-train version (1.1.x, no longer upstream's 0.7.x), so the
+#     requirement below is the prepublish-style `version = "1.1"` that
+#     only the patched source can satisfy.
 #   - loom-models — must stay its own workspace so `--cfg loom` RUSTFLAGS
 #     never poison the main dependency graph (see loom-models/Cargo.toml).
 [workspace]
@@ -36,7 +48,10 @@ tokio = { version = "1.36", features = ["full"] }
 # (FUSE_POSIX_LOCKS is never advertised — fstests generic/131/478/504; see
 # the fuse3 negotiation pins). The feature would re-require daemon
 # getlk/setlk impls nothing can ever call.
-fuse3 = { version = "0.7", features = ["tokio-runtime", "unprivileged"] }
+# Resolves ONLY via the [patch.crates-io] path entry below (crates.io has
+# no fuse3 1.1 — the fully-diverged first-party fork carries the SqueezeFS
+# release train; see the workspace-topology note above).
+fuse3 = { version = "1.1", features = ["tokio-runtime", "unprivileged"] }
 io-uring = "0.6"
 dashmap = "5.5"
 zerocopy = { version = "0.8.52", features = ["derive"] }
@@ -107,7 +122,10 @@ nix = { version = "0.29.0", features = ["ioctl"] }
 # still builds only via --profile preload-release.
 squeezefs-preload = { path = "crates/squeezefs-preload" }
 
-
+# Load-bearing (see the crates/fuse3 workspace-topology note at the top):
+# redirects the prepublish-style `fuse3 = "1.1"` requirement to the
+# in-tree first-party fork — cargo rejects the equivalent direct path
+# dependency because the fork is its own (excluded) workspace root.
 [patch.crates-io]
 fuse3 = { path = "crates/fuse3" }
 

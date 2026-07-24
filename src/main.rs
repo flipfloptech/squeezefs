@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 #[derive(Parser)]
 #[command(name = "squeezefs")]
-// Git-commit versioning (docs/operations.md §Versioning & releases): the
-// version IS the build commit — never CARGO_PKG_VERSION (a cargo-internal
-// placeholder). `-V`/`--version` print `squeezefs <commit-first line>`.
+// Release-train + git-commit versioning (docs/operations.md §Versioning &
+// releases): the line leads with the release-train version (CARGO_PKG_VERSION,
+// bumped as a release act) AND carries the build-commit identity — both, not
+// either. `-V`/`--version` print `squeezefs <train> (<commit identity>) ...`.
 #[command(version = squeezefs::version::version_line())]
 #[command(about = "Squeezefs: slimmed down high-performance distributed filesystem", long_about = None)]
 struct Cli {

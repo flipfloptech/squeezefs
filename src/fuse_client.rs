@@ -8024,13 +8024,13 @@ impl SqueezefsFilesystem {
             // reclaim may ever run an ino's data teardown — duplicate
             // drives (release+forget enqueues, racing batches) double-freed
             // the mapped blocks.
-            if self.reclaim_inflight.insert_sync(ino).is_err() {
-                debug!("RECLAIM: ino = {ino} already in flight, skipping");
-                continue;
-            }
+            // Cheap gates FIRST, without claiming: a live (nlink > 0) or
+            // erroring ino must never even transiently enter the in-flight
+            // set — FORGET storms (drop_caches) enqueue live inos
+            // constantly, and a transient claim turned racing OPENs of
+            // healthy files into spurious ENOENT.
             if self.is_open(ino) {
                 debug!("RECLAIM: ino = {} is currently open, skipping reclaim", ino);
-                self.reclaim_inflight.remove_sync(&ino);
                 continue;
             }
             match backend.getattr(ino).await {
@@ -8039,16 +8039,39 @@ impl SqueezefsFilesystem {
                         "RECLAIM: ino = {} has nlink = {}, skipping reclaim",
                         ino, inode.nlink
                     );
-                    self.reclaim_inflight.remove_sync(&ino);
+                    continue;
                 }
-                Ok(_) => {
-                    admitted.push(ino);
-                }
+                Ok(_) => {}
                 Err(e) => {
                     debug!("RECLAIM: getattr({}) failed: {:?}", ino, e);
-                    self.reclaim_inflight.remove_sync(&ino);
+                    continue;
                 }
             }
+            // Claim, then RE-CHECK the open count (the handshake's load-
+            // bearing order): the open path counts itself first and then
+            // refuses on a visible claim, so an OPEN racing this admission
+            // either lands its count before our re-check (we back out) or
+            // sees the claim and fails ENOENT — correct either way, because
+            // nlink is already 0 here (the file IS unlinked; ENOENT is the
+            // honest outcome for an open that lost the race to rm).
+            //
+            // Single-drive guard (FIND-RW5-A face 4) unchanged: only ONE
+            // reclaim may ever run an ino's data teardown — duplicate
+            // drives (release+forget enqueues, racing batches) double-freed
+            // the mapped blocks.
+            if self.reclaim_inflight.insert_sync(ino).is_err() {
+                debug!("RECLAIM: ino = {ino} already in flight, skipping");
+                continue;
+            }
+            if self.is_open(ino) {
+                debug!(
+                    "RECLAIM: ino = {} opened during admission, backing out",
+                    ino
+                );
+                self.reclaim_inflight.remove_sync(&ino);
+                continue;
+            }
+            admitted.push(ino);
         }
         if admitted.is_empty() {
             return;
@@ -10745,6 +10768,17 @@ impl Filesystem for SqueezefsFilesystem {
         // read serves interior holes as zeros at their correct positions;
         // `_src_backing` keeps any zero-copy mmap segment alive until the
         // chunk has been consumed below.
+        //
+        // OVERLAY NEVER INVISIBLE, the cfr face (fstests generic/795): the
+        // router serves the BASE tiers only — a source block whose newest
+        // acked bytes still sit in a RAM overlay (a buffered `head -c` +
+        // `sync` leaves the last partial block parked; the writeback merge
+        // lands later) would copy as ZEROS/stale into the destination and
+        // every subsequent cmp of the copy differs at that block until the
+        // source's overlay flushes. Compose exactly like the READ handler:
+        // capture the parked runs before AND after the base read (the
+        // moving-custody protocol's two sandwich halves).
+        let src_pre_runs = self.capture_parked_runs(inode, off_in, effective_len);
         let (src_data, _src_backing) = self
             .router
             .read_file_range_zero_copy(
@@ -10756,20 +10790,27 @@ impl Filesystem for SqueezefsFilesystem {
             )
             .await
             .map_err(map_squeezefs_err)?;
+        let src_post_runs = self.capture_parked_runs(inode, off_in, effective_len);
         let phys = src_data.len();
         // `effective_len > 0` here (length > 0), so the chunk is always
         // non-empty regardless of the physical/logical gap.
-        let chunk: bytes::Bytes = if phys >= effective_len {
-            // Fully backed by physical data: zero-copy slice.
-            src_data.slice(0..effective_len)
-        } else {
-            // Short read = the range runs past the physical tail into the
-            // hole/EOF gap: assemble exactly effective_len bytes — real data
-            // first, then zeros.
-            let mut buf = vec![0u8; effective_len];
-            buf[..phys].copy_from_slice(&src_data);
-            bytes::Bytes::from(buf)
-        };
+        let chunk: bytes::Bytes =
+            if phys >= effective_len && src_pre_runs.is_empty() && src_post_runs.is_empty() {
+                // Fully backed by physical data, no overlays: zero-copy slice.
+                src_data.slice(0..effective_len)
+            } else {
+                // Short read = the range runs past the physical tail into the
+                // hole/EOF gap (a parked source overlay can also hold acked
+                // bytes PAST the base's physical tail): assemble exactly
+                // effective_len bytes — base data, zeros for the gap, then the
+                // overlay runs composed over the top (pre first, post wins).
+                let mut buf = vec![0u8; effective_len];
+                let n = phys.min(effective_len);
+                buf[..n].copy_from_slice(&src_data[..n]);
+                let composed =
+                    Self::apply_parked_runs(off_in, bytes::Bytes::from(buf), &src_pre_runs);
+                Self::apply_parked_runs(off_in, composed, &src_post_runs)
+            };
 
         // Perform write to destination
         let target_fencing_token = if let Some(ref dl) = dest_lease {

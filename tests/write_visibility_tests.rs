@@ -1110,3 +1110,103 @@ async fn sequential_recopy_readers_never_see_foreign_bytes() {
     }
     assert!(total > 0, "readers must have served bytes");
 }
+
+/// fstests generic/795 repro-port, the OPEN/RECLAIM race face (VL10
+/// release gate): `rm` of an unwatched file admits its reclaim; a racing
+/// OPEN that lands after the admission must NOT be granted a handle onto
+/// the inode being destroyed. Pre-fix, the admission checked the open
+/// count BEFORE claiming the in-flight slot, so an OPEN arriving in the
+/// gap succeeded and then read a destroyed inode: the daemon's size view
+/// collapsed to 0/NotFound, reads went empty, and the kernel
+/// zero-extended them to its cached i_size — full-length foreign ZEROS
+/// through a legally-open fd (the generic/795 `cmp` mismatch, sticky in
+/// the page cache until drop_caches). Contract pinned here: whenever the
+/// open HANDLER succeeds, every subsequent read through that handle
+/// serves the file's real bytes — never empty, never an error, never
+/// zeros; an ENOENT open (lost the race to rm) is the one legal refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn open_racing_reclaim_never_reads_a_destroyed_ino() {
+    let h = Arc::new(make().await);
+    // 10 blocks: the destroy walks a real block map, keeping the
+    // admission->destroy window wide enough to race deterministically.
+    let payload: Vec<u8> = (0..10 * BS as usize)
+        .map(|i| (i % 251) as u8 ^ 0xA7)
+        .collect();
+
+    for round in 0..150u32 {
+        let name = format!("hs{round}");
+        let ino = create(&h, &name).await;
+        write_at(&h, ino, 0, &payload).await;
+        // Unlink: nlink -> 0, destroy deferred to the reclaim machinery.
+        h.fs.unlink(h.req, 1, OsStr::new(&name)).await.unwrap();
+
+        // Race: the reclaim drive (the release/forget worker's unit of
+        // work) vs a LOOP of OPEN + read + release on the same ino for the
+        // reclaim's whole duration — every granted handle must serve the
+        // real bytes.
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reclaimer = {
+            let h = h.clone();
+            let done = done.clone();
+            tokio::spawn(async move {
+                // Let the opener loop get airborne so the admission's
+                // open-count re-check races live open/release churn.
+                tokio::task::yield_now().await;
+                h.fs.reclaim_orphaned_batch(vec![ino]).await;
+                done.store(true, std::sync::atomic::Ordering::Release);
+            })
+        };
+        let opener = {
+            let h = h.clone();
+            let payload = payload.clone();
+            let done = done.clone();
+            tokio::spawn(async move {
+                let mut granted = 0u32;
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    match h.fs.open(h.req, ino, libc::O_RDONLY as u32).await {
+                        Ok(reply) => {
+                            granted += 1;
+                            // Handle granted: the inode must stay fully
+                            // readable for the handle's lifetime — read a
+                            // window in each block.
+                            for b in 0..10u64 {
+                                let off = b * BS;
+                                let got =
+                                    h.fs.read(h.req, ino, reply.fh, off, 4096, 0)
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            panic!(
+                                                "round {round}: read at {off} through a GRANTED \
+                                             handle failed {e:?} (open won the race, the \
+                                             inode must be alive)"
+                                            )
+                                        });
+                                assert_eq!(
+                                    got.data.as_ref(),
+                                    &payload[off as usize..off as usize + 4096],
+                                    "round {round}: granted handle served wrong/empty bytes \
+                                     at {off} (destroyed-under-fd — generic/795)"
+                                );
+                            }
+                            let _ = h.fs.release(h.req, ino, reply.fh, 0, 0, false).await;
+                        }
+                        Err(e) => {
+                            // Lost the race to rm: ENOENT is the one legal refusal.
+                            assert_eq!(
+                                e,
+                                fuse3::Errno::from(libc::ENOENT),
+                                "round {round}: open refused with the wrong errno"
+                            );
+                            break;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                granted
+            })
+        };
+        let (r1, r2) = tokio::join!(reclaimer, opener);
+        r1.unwrap();
+        r2.unwrap();
+    }
+}

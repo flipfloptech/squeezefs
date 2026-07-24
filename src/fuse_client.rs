@@ -8005,8 +8005,32 @@ impl SqueezefsFilesystem {
             if ino <= 1 || ino == CONFIG_INODE || ino == STATS_INODE {
                 continue;
             }
+            // OPEN/RECLAIM HANDSHAKE (fstests generic/795 — the destroy-
+            // under-a-live-fd race): claim the in-flight slot FIRST, then
+            // re-check the open count. The open path takes the mirrored
+            // order (add_open, THEN refuse if the slot is claimed), so every
+            // interleaving resolves one way: either this admission sees the
+            // open and backs out, or the open sees the claim and fails
+            // ENOENT — a destroyed inode can never be readable through a
+            // just-granted handle. The old order admitted at count == 0 and
+            // a racing OPEN landed after the check; reads on that live fd
+            // then found the destroyed ino (size 0 / NotFound) and the
+            // KERNEL zero-extended the short replies to its cached i_size
+            // (fuse_short_read) — full-length foreign zeros, sticky in the
+            // page cache (the generic/795 cmp signature, tape-proven:
+            // OPEN → 5 good chunks → RECLAIM-ADMIT → EMPTY fsize 0).
+            //
+            // Single-drive guard (FIND-RW5-A face 4) unchanged: only ONE
+            // reclaim may ever run an ino's data teardown — duplicate
+            // drives (release+forget enqueues, racing batches) double-freed
+            // the mapped blocks.
+            if self.reclaim_inflight.insert_sync(ino).is_err() {
+                debug!("RECLAIM: ino = {ino} already in flight, skipping");
+                continue;
+            }
             if self.is_open(ino) {
                 debug!("RECLAIM: ino = {} is currently open, skipping reclaim", ino);
+                self.reclaim_inflight.remove_sync(&ino);
                 continue;
             }
             match backend.getattr(ino).await {
@@ -8015,20 +8039,14 @@ impl SqueezefsFilesystem {
                         "RECLAIM: ino = {} has nlink = {}, skipping reclaim",
                         ino, inode.nlink
                     );
+                    self.reclaim_inflight.remove_sync(&ino);
                 }
                 Ok(_) => {
-                    // Single-drive guard (FIND-RW5-A face 4): only ONE
-                    // reclaim may ever run an ino's data teardown —
-                    // duplicate drives (release+forget enqueues, racing
-                    // batches) double-freed the mapped blocks.
-                    if self.reclaim_inflight.insert_sync(ino).is_ok() {
-                        admitted.push(ino);
-                    } else {
-                        debug!("RECLAIM: ino = {ino} already in flight, skipping");
-                    }
+                    admitted.push(ino);
                 }
                 Err(e) => {
                     debug!("RECLAIM: getattr({}) failed: {:?}", ino, e);
+                    self.reclaim_inflight.remove_sync(&ino);
                 }
             }
         }
@@ -8992,7 +9010,19 @@ impl Filesystem for SqueezefsFilesystem {
             .await?;
         }
 
+        // OPEN/RECLAIM HANDSHAKE (fstests generic/795): count the open
+        // FIRST, then refuse if a reclaim already claimed the destroy slot.
+        // Mirrored order on the reclaim side (claim slot, then re-check the
+        // open count) makes every interleaving safe: either the reclaim
+        // backs out on our count, or we see its claim here and fail ENOENT
+        // (the open lost the race to rm — the file is unlinked with no
+        // surviving opens). Without this, an OPEN landing after admission
+        // was granted a handle onto the inode being destroyed.
         self.add_open(inode);
+        if self.reclaim_inflight.contains_sync(&inode) {
+            self.remove_open(inode);
+            return Err(Errno::from(libc::ENOENT));
+        }
         // File handle is just the inode number for simplicity in this design
         Ok(ReplyOpen {
             fh: inode,
@@ -9129,11 +9159,17 @@ impl Filesystem for SqueezefsFilesystem {
                         )
                     })
                     .map_err(map_squeezefs_err)?;
+                // Fail LOUD on a dead/erroring ino — the old `.unwrap_or(0)`
+                // fabricated size 0, and the kernel zero-extends a short
+                // read up to its cached i_size (fuse_short_read): a
+                // destroyed-under-fd or transiently-erroring inode read as
+                // silent full-length zeros instead of an error
+                // (generic/795).
                 backend
                     .getattr(ino)
                     .await
                     .map(|inode| inode.size)
-                    .unwrap_or(0)
+                    .map_err(map_squeezefs_err)?
             };
 
             // Size coherency: prefer the router metadata cache, which the write

@@ -584,7 +584,7 @@ SQUEEZEFS_FSTESTS_QUICK=(
     generic/294 generic/306 generic/316 generic/426 generic/452
     generic/464 generic/467 generic/469 generic/477 generic/478
     generic/504 generic/525 generic/533 generic/616 generic/617
-    generic/618
+    generic/618 generic/631 generic/683 generic/732 generic/795
 )
 
 # ---------------------------------------------------------------------------

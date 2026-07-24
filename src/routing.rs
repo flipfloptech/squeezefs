@@ -4686,6 +4686,20 @@ impl DataRouter {
         if let Some(mut entry) = entry {
             if size > entry.size {
                 entry.size = size;
+                // The grown size is ACKED-ONLY-HERE state: the striped
+                // write path defers its durable size persist to the
+                // flush/fsync cadence, so this RAM floor is the sole
+                // carrier of the write's true end until then. Mark the
+                // entry DIRTY — the local-authority rule (see
+                // `fetch_metadata`'s aged-fsx note): a clean entry's TTL
+                // refill (or any evict-and-refetch) would replace the
+                // floor with the lagging durable size and reads would
+                // clamp acked bytes away (the one-shot write-through
+                // tail-byte loss, tests/write_through_tests.rs::
+                // test_one_shot_full_block_write_through). Persisted and
+                // cleaned by `persist_dirty_layout_if_needed` on the
+                // fsync/release cadence like every dirty layout.
+                entry.layout_dirty = true;
                 entry.cached_at = std::time::Instant::now();
                 self.metadata_cache.insert(ino, entry);
             }

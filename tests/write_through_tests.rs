@@ -539,10 +539,38 @@ async fn test_one_shot_full_block_write_through() {
         "one-shot complete block must write through"
     );
     assert_eq!(wt_blocks() - before, 1);
+
+    // The write's true end (2·BS+1) is ACKED-ONLY-IN-RAM until the fsync
+    // cadence: the striped path defers its durable size persist, so the
+    // RAM floor entry must be the DIRTY local authority (a clean entry's
+    // TTL refill would regress size below acked bytes and the read would
+    // clamp the tail away — the post-2991ddb one-shot tail-byte loss).
+    let ram =
+        h.fs.router
+            .metadata_cache
+            .get(&ino)
+            .expect("RAM meta entry present after write");
+    assert_eq!(ram.size, 2 * BS + 1, "RAM size floor carries the write end");
+    assert!(
+        ram.layout_dirty,
+        "the RAM size floor must be DIRTY (local authority) while the \
+         durable persist is deferred"
+    );
+    assert_eq!(read_at(&h, ino, BS, p.len() as u32).await, p);
+
+    // fsync drives the dirty floor durable; the durable view (fetched
+    // from the backend after dropping the RAM entry) must carry both the
+    // block-1 mapping and the true size.
+    h.fs.fsync(h.req, ino, 0, false).await.unwrap();
     let meta = backend_meta(&h, ino).await;
     assert!(
         meta.block_map.as_ref().and_then(|m| m.get(&1)).is_some(),
         "block 1 mapping must be published"
+    );
+    assert_eq!(
+        meta.size,
+        2 * BS + 1,
+        "fsync persists the acked size floor durably"
     );
     assert_eq!(read_at(&h, ino, BS, p.len() as u32).await, p);
 }

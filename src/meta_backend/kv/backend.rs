@@ -4144,11 +4144,12 @@ impl KvMetaBackend {
     // Op building blocks (shared by the trait impl and the routed arms).
     // -----------------------------------------------------------------
 
+    /// Inode-timestamp stamps ride the kernel's coarse clock domain —
+    /// see `crate::coarse_realtime_ns` (fstests generic/423: a fine-clock
+    /// stamp here could LEAD the kernel's own locally-authored wb-cache
+    /// cmtime by up to a tick, inverting cross-inode ctime order).
     fn now_ns() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64
+        crate::coarse_realtime_ns()
     }
 
     fn to_inode(ino: Ino, v: &InodeValue) -> Inode {
@@ -4677,8 +4678,15 @@ impl KvMetaBackend {
             ));
         }
         child.nlink += 1;
+        // Monotone ctime bump over the FOLDED view: the reply is served
+        // from this value, so it must never regress below a previously
+        // served base+refinement (generic/423 inversion class; the
+        // setattr commit-arm discipline — fold, carry, retire).
+        self.fold_pending_times(local_child, &mut child);
         let now = Self::now_ns();
-        child.ctime = now;
+        if (now as i64) > (child.ctime as i64) {
+            child.ctime = now;
+        }
         let mut tx = KvTx::new();
         tx.stage_put(TREE_INODES, inode_key(local_child), child.encode());
         let dkey = self.dentry_insert_key(&tx, local_parent, name).await?;
@@ -4692,6 +4700,9 @@ impl KvMetaBackend {
             .await?;
         tx.hold_guards(guards);
         self.commit_tx(tx).await?;
+        // The committed Put carries the folded refinement (I-guard held
+        // by the routed caller: race-free).
+        self.retire_pending_times(local_child);
         Ok(Self::to_inode(global_child, &child))
     }
 
@@ -4723,11 +4734,21 @@ impl KvMetaBackend {
         } else if v.nlink > 0 {
             v.nlink = v.nlink.saturating_sub((-delta) as u32);
         }
-        v.ctime = Self::now_ns();
+        // Monotone ctime bump over the FOLDED view (the local `link`'s
+        // generic/423 discipline — the returned value is served, so it
+        // must never regress below a previously served base+refinement).
+        self.fold_pending_times(local_child, &mut v);
+        let now = Self::now_ns();
+        if (now as i64) > (v.ctime as i64) {
+            v.ctime = now;
+        }
         let mut tx = KvTx::new();
         tx.stage_put(TREE_INODES, inode_key(local_child), v.encode());
         tx.hold_guards(guards);
         self.commit_tx(tx).await?;
+        // The committed Put carries the folded refinement (I-guard held
+        // by the routed caller: race-free).
+        self.retire_pending_times(local_child);
         Ok(v)
     }
 
@@ -5156,7 +5177,16 @@ impl KvMetaBackend {
         if let Some(c) = ctime {
             v.ctime = c;
         } else if ctime_updated {
-            v.ctime = Self::now_ns();
+            // Auto-bump is MONOTONE over the folded view (signed — i64 ns
+            // in the u64 word): `now` is the coarse kernel-domain clock
+            // and a parked refinement can sit ahead of it inside a tick;
+            // an auto-stamp must never regress a ctime a reader already
+            // saw (generic/423 inversion class). Explicit sets above stay
+            // verbatim — exact-set semantics.
+            let now = Self::now_ns();
+            if (now as i64) > (v.ctime as i64) {
+                v.ctime = now;
+            }
         }
         let mut tx = KvTx::new();
         tx.stage_put(TREE_INODES, inode_key(ino), v.encode());
@@ -5401,9 +5431,20 @@ impl Metadata for KvMetaBackend {
             .read_inode_value(ino)
             .await?
             .ok_or_else(|| Self::not_found(format!("Inode {ino} not found")))?;
+        // Fold the parked times refinement into the base so the ctime
+        // bump below is MONOTONE against every already-served view (a
+        // getattr served base+refinement moments ago; stamping `now`
+        // over the unfolded base could regress below it — the
+        // generic/423 inversion class), and so the committed Put CARRIES
+        // the refinement (retired below, the setattr commit-arm
+        // discipline).
+        self.fold_pending_times(ino, &mut child);
         child.nlink += 1;
         let now = Self::now_ns();
-        child.ctime = now;
+        // Signed monotone bump (times are i64 ns in the u64 word).
+        if (now as i64) > (child.ctime as i64) {
+            child.ctime = now;
+        }
 
         let mut tx = KvTx::new();
         tx.stage_put(TREE_INODES, inode_key(ino), child.encode());
@@ -5418,6 +5459,9 @@ impl Metadata for KvMetaBackend {
             .await?;
         tx.hold_guards(guards);
         self.commit_tx(tx).await?;
+        // The committed Put carries the folded refinement (under the
+        // I-guard: race-free) — same discipline as the setattr commit arm.
+        self.retire_pending_times(ino);
         Ok(Self::to_inode(ino, &child))
     }
 

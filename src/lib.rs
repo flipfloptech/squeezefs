@@ -99,6 +99,33 @@ pub fn write_verification_should_check() -> bool {
     WRITE_VERIFICATION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n == 0
 }
 
+/// The inode-timestamp clock: `CLOCK_REALTIME_COARSE`, i64 ns carried in
+/// the u64 storage word (pre-epoch representable — fstests generic/258).
+///
+/// **Why coarse (fstests generic/423):** under the default writeback
+/// cache the kernel authors regular-file cmtime LOCALLY
+/// (`fuse_update_ctime` → `inode_set_ctime_current`) from the coarse
+/// clock, which lags fine `CLOCK_REALTIME` by up to one tick (measured
+/// 1.85 ms at HZ=1000). Daemon stamps taken from the fine clock ran
+/// AHEAD of every kernel stamp in the same tick, so a daemon-stamped
+/// inode (423's socket) created moments before an `ln` carried a ctime
+/// LATER than the kernel's link stamp — a cross-inode ctime inversion.
+/// Every daemon-authored inode timestamp must ride the kernel's clock
+/// domain: a stamp taken here can never exceed a kernel stamp authored
+/// later (same-tick stamps compare EQUAL, the kernel's own semantics).
+/// Pinned by `tests/attr_refresh_tests.rs::
+/// daemon_inode_stamps_never_lead_the_kernel_coarse_clock`.
+pub fn coarse_realtime_ns() -> u64 {
+    let mut t = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime with a valid clock id and a valid out
+    // pointer; CLOCK_REALTIME_COARSE cannot fail on Linux.
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut t) };
+    t.tv_sec.wrapping_mul(1_000_000_000).wrapping_add(t.tv_nsec) as u64
+}
+
 pub fn fs_prefix() -> &'static str {
     *FS_PREFIX.read()
 }

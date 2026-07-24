@@ -133,6 +133,23 @@ macro_rules! fsai2ts {
     };
 }
 
+/// Resolve a `FATTR_{A,M}TIME_NOW` request in the KERNEL'S inode-timestamp
+/// clock domain: `CLOCK_REALTIME_COARSE` (what `inode_set_ctime_current()`
+/// reads). The fine `CLOCK_REALTIME` runs AHEAD of it by up to a tick, so a
+/// fine-resolved "now" could out-rank kernel-authored writeback-cache
+/// stamps taken later — a cross-inode timestamp inversion (fstests
+/// generic/423 class; see the daemon's `coarse_realtime_ns`).
+fn coarse_now_timestamp() -> Timestamp {
+    let mut t = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime with a valid clock id and a valid out pointer;
+    // CLOCK_REALTIME_COARSE cannot fail on Linux.
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut t) };
+    Timestamp::new(t.tv_sec as i64, t.tv_nsec as u32)
+}
+
 impl From<&fuse_setattr_in> for SetAttr {
     fn from(setattr_in: &fuse_setattr_in) -> Self {
         let mut set_attr = Self::default();
@@ -158,7 +175,7 @@ impl From<&fuse_setattr_in> for SetAttr {
         }
 
         if setattr_in.valid & FATTR_ATIME_NOW > 0 {
-            set_attr.atime = Some(SystemTime::now().into());
+            set_attr.atime = Some(coarse_now_timestamp());
         }
 
         if setattr_in.valid & FATTR_MTIME > 0 {
@@ -166,7 +183,7 @@ impl From<&fuse_setattr_in> for SetAttr {
         }
 
         if setattr_in.valid & FATTR_MTIME_NOW > 0 {
-            set_attr.mtime = Some(SystemTime::now().into());
+            set_attr.mtime = Some(coarse_now_timestamp());
         }
 
         if setattr_in.valid & FATTR_LOCKOWNER > 0 {

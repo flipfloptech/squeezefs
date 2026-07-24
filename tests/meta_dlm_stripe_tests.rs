@@ -68,6 +68,18 @@ async fn mk_dir(b: &RoutedMetaBackend, parent: u64, name: &str) -> u64 {
         .ino
 }
 
+/// Cross a `CLOCK_REALTIME_COARSE` tick: daemon inode stamps ride the
+/// kernel's coarse clock domain (the generic/423 fix — see
+/// `squeezefs::coarse_realtime_ns`), so ops inside ONE tick legitimately
+/// carry EQUAL timestamps. A strict time-ADVANCE assertion needs its
+/// "before" capture and the mutating op in different ticks.
+async fn cross_coarse_tick() {
+    let base = squeezefs::coarse_realtime_ns();
+    while squeezefs::coarse_realtime_ns() <= base {
+        tokio::time::sleep(Duration::from_micros(100)).await;
+    }
+}
+
 /// Create files until two of them share an inode stripe; returns their inos.
 async fn colliding_ino_pair(b: &RoutedMetaBackend, dlm: &DlmLockManager, dir: u64) -> (u64, u64) {
     let mut seen: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
@@ -405,6 +417,7 @@ async fn test_rename_updates_parent_times_and_source_ctime() {
     let ino = mk_file(&b, dir, "src").await;
     let dir_before = b.getattr(dir).await.expect("parent before");
     let src_before = b.getattr(ino).await.expect("source before");
+    cross_coarse_tick().await;
     b.rename(dir, "src", dir, "dst", 0)
         .await
         .expect("same-parent rename");
@@ -437,6 +450,7 @@ async fn test_rename_updates_parent_times_and_source_ctime() {
     mk_file(&b, d1, "mv").await;
     let d1_before = b.getattr(d1).await.expect("old parent before");
     let d2_before = b.getattr(d2).await.expect("new parent before");
+    cross_coarse_tick().await;
     b.rename(d1, "mv", d2, "mv2", 0)
         .await
         .expect("cross-parent rename");
@@ -459,6 +473,7 @@ async fn test_rename_updates_parent_times_and_source_ctime() {
     let _ = sub;
     let d1_b2 = b.getattr(d1).await.expect("old parent before dirmove");
     let d2_b2 = b.getattr(d2).await.expect("new parent before dirmove");
+    cross_coarse_tick().await;
     b.rename(d1, "movedir", d2, "movedir", 0)
         .await
         .expect("directory move");
@@ -487,6 +502,7 @@ async fn test_rename_updates_parent_times_and_source_ctime() {
     let d2_b3 = b.getattr(d2).await.expect("before exchange");
     let ea_before = b.getattr(ea).await.expect("xa before");
     let eb_before = b.getattr(eb).await.expect("xb before");
+    cross_coarse_tick().await;
     b.rename(d1, "xa", d2, "xb", libc::RENAME_EXCHANGE)
         .await
         .expect("exchange");

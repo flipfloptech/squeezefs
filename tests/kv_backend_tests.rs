@@ -1376,11 +1376,12 @@ async fn mutable_volume() -> (Arc<KvMetaBackend>, NamedTempFile) {
     (backend, file)
 }
 
+/// The reference clock for "stamped at-or-after this" assertions — the
+/// SAME domain the daemon stamps inode times from (`CLOCK_REALTIME_COARSE`
+/// since the generic/423 fix; a fine-grained reference taken just before
+/// an op legitimately LEADS the op's coarse stamp within a tick).
 fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
+    squeezefs::coarse_realtime_ns()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

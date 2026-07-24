@@ -141,6 +141,18 @@ fn clock_ns() -> u64 {
         .as_nanos() as u64
 }
 
+/// Cross a `CLOCK_REALTIME_COARSE` tick: daemon inode stamps ride the
+/// kernel's coarse clock domain (the generic/423 fix — see
+/// `squeezefs::coarse_realtime_ns`), so ops inside ONE tick legitimately
+/// carry EQUAL timestamps. A strict time-ADVANCE assertion needs its
+/// "before" capture and the mutating op in different ticks.
+async fn cross_coarse_tick() {
+    let base = squeezefs::coarse_realtime_ns();
+    while squeezefs::coarse_realtime_ns() <= base {
+        tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+    }
+}
+
 /// The kernel's post-mutation ctime writeback echo, modeled faithfully:
 /// after rename/unlink/link/setxattr of a writeback-cache regular file the
 /// kernel authors the inode's ctime from ITS clock (`fuse_update_ctime` →
@@ -522,6 +534,7 @@ async fn times_echo_absorption_is_read_visible_and_drains_durable() {
         .expect("create");
     backend.link(f.ino, 1, "hl_b").await.expect("hardlink");
     let pre = backend.getattr(f.ino).await.expect("pre-unlink getattr");
+    cross_coarse_tick().await;
     backend.unlink(1, "hl_a").await.expect("unlink one link");
 
     let in_tx = backend.getattr(f.ino).await.expect("post-unlink getattr");

@@ -9596,11 +9596,12 @@ impl Filesystem for SqueezefsFilesystem {
                 inode_write_lock_scope(use_router_write, is_striped)
             };
 
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO);
-            let sec = now.as_secs() as i64;
-            let nsec = now.subsec_nanos();
+            // Kernel clock domain (fstests generic/423) — an attr-cache
+            // time publish is a daemon-authored inode stamp like any
+            // other; see `crate::coarse_realtime_ns`.
+            let now_ns = crate::coarse_realtime_ns() as i64;
+            let sec = now_ns.div_euclid(1_000_000_000);
+            let nsec = now_ns.rem_euclid(1_000_000_000) as u32;
 
             // (fstests generic/795: the attr size/mtime publish moved to
             // AFTER the dispatch below — SIZE MUST NEVER LEAD DATA. The

@@ -1210,3 +1210,57 @@ async fn open_racing_reclaim_never_reads_a_destroyed_ino() {
         r2.unwrap();
     }
 }
+
+/// fstests generic/795 — the WHOLE-FILE CLONE face (the last face of the
+/// gate's fix ladder, tape-proven): `copy_file_range`'s off 0→0,
+/// full-length, empty-dest fast path takes `DataRouter::clone_file`, which
+/// cloned the striped source's DURABLE-ONLY block map by refcount. A
+/// source whose tail (or any) block's acked bytes still sat in PARKED /
+/// STAGED custody (the normal state right after a buffered copy — the
+/// write-through merges complete blocks, the partial tail parks) handed
+/// the clone a full-size layout with a HOLE where the parked block
+/// belongs: every read of the clone served ZEROS there, durably, while
+/// the source read fine (its overlay serves) — `cmp orig fsv differ` at
+/// exactly the first parked-block boundary, persisting for the clone's
+/// whole life. The clone must carry the source's COMPLETE acked custody.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn whole_file_clone_carries_parked_source_custody() {
+    let tag = "clone-parked-src".to_string();
+    let h = make().await;
+    let src = create(&h, "clsrc").await;
+
+    // Striped source: blocks 0,1 complete (the promotion merges them
+    // durably), then a SEPARATE partial tail write — the striped write
+    // path parks block 2's acked bytes in the RAM overlay (partial
+    // coverage never write-throughs; the durable map stays {0,1}). This
+    // is the exact custody state a buffered `cp`-style copy leaves right
+    // after its tail write.
+    let len = 2 * BS + BS / 2;
+    write_at(&h, src, 0, &vec![0x5Cu8; (2 * BS) as usize]).await;
+    write_at(&h, src, 2 * BS, &vec![0x5Cu8; (BS / 2) as usize]).await;
+
+    // Move block 2's custody one station down the chain: RAM overlay →
+    // staged `active_block:` sibling (what any concurrent reader's
+    // multi-block flush does), with the durable merge still QUEUED — the
+    // state a busy mount is in almost all the time. The clone's
+    // source-freeze must drain THIS station too; pre-fix it scanned RAM
+    // overlays only and cloned a map with block 2 missing.
+    let tok = h.fs.router.dlm.get_fencing_token_ino(src);
+    h.fs.flush_memory_buffers_for_inode(src, tok).await.unwrap();
+
+    // Empty destination + the exact fast-path shape: off 0 -> 0, full
+    // length, dest_size 0.
+    let dst = create(&h, "cldst").await;
+    let copied = cfr(&h, src, 0, dst, 0, len).await;
+    assert_eq!(copied, len, "[{tag}] short clone");
+
+    // Every byte of the clone must be the source's acked bytes — the
+    // parked tail block included. Pre-fix: [2*BS, 2.5*BS) read ZEROS.
+    assert_fill(&h, dst, 0, len, 0x5C, &tag).await;
+
+    // And it stays true across the durable flush cycle on BOTH files.
+    fsync(&h, src).await;
+    fsync(&h, dst).await;
+    assert_fill(&h, dst, 0, len, 0x5C, &tag).await;
+    assert_fill(&h, src, 0, len, 0x5C, &tag).await;
+}

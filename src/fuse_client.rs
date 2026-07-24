@@ -4387,7 +4387,6 @@ impl SqueezefsFilesystem {
             },
             "internal_caches": {
                 "metadata_cache_size": self.router.metadata_cache.entry_count(),
-                "block_map_cache_size": self.router.block_map_cache.entry_count(),
             }
         });
 
@@ -8509,15 +8508,6 @@ impl Filesystem for SqueezefsFilesystem {
                     Arc::new(move || meta_cache.entry_count() * 1024),
                     Arc::new(move |_| meta_cache_shed.invalidate_all()),
                 ));
-                let bmap_cache = self.router.block_map_cache.clone();
-                let bmap_cache_shed = self.router.block_map_cache.clone();
-                MEM_BUDGET.register(Component::new(
-                    "block_map_cache",
-                    0,
-                    1,
-                    Arc::new(move || bmap_cache.entry_count() * 256),
-                    Arc::new(move |_| bmap_cache_shed.invalidate_all()),
-                ));
                 // KV metadata node cache (follow-up C defense-in-depth):
                 // gauge at the budget-accounting basis (nodes × node
                 // size); the shed is a checkpoint KICK — an early run of
@@ -10570,6 +10560,47 @@ impl Filesystem for SqueezefsFilesystem {
             let _ = self
                 .flush_active_blocks_with_retry(inode, src_flush_token)
                 .await;
+            // generic/795, the whole-file-clone face: the scan above finds
+            // RAM overlays only — custody parked one station DOWN the chain
+            // (the staged `active_block:` sibling a reader-triggered or
+            // memory-pressure flush leaves behind, durable merge still
+            // queued) is invisible to it, and the clone fast path below
+            // would snapshot a block map with those blocks MISSING: a
+            // full-size clone whose unmerged blocks read ZEROS, durably
+            // (the fstests cmp signature at the first parked-block
+            // boundary). Drain any below-size unbound block that has a
+            // staged sibling; bounded — each pass merges what it found.
+            let bs = self.router.block_size.load(Ordering::Relaxed);
+            for _ in 0..4 {
+                let Ok(meta) = self.router.fetch_metadata(&src_path).await else {
+                    break;
+                };
+                if meta.file_type != "striped" || meta.size == 0 {
+                    break;
+                }
+                let blocks = meta.size.div_ceil(bs) as u32;
+                let mut missing: Vec<u32> = Vec::new();
+                for b in 0..blocks {
+                    // Bound OR unbound: any staged sibling is undrained
+                    // acked custody (a sibling on a BOUND block supersedes
+                    // the bound image — the durable copy is stale).
+                    let key = crate::keys::active_block(inode, b as u64).to_string();
+                    if self.router.cache.nvme.has_staged_active_block(&key) {
+                        missing.push(b);
+                    }
+                }
+                if missing.is_empty() {
+                    break;
+                }
+                let _ = flush_due_active_blocks_for_inode(
+                    inode,
+                    missing,
+                    &self.router,
+                    &self.dlm,
+                    &self.active_inode_locks,
+                )
+                .await;
+            }
         }
 
         // 1. Acquire local locks on both inodes to ensure consistency and prevent deadlocks
@@ -10709,7 +10740,46 @@ impl Filesystem for SqueezefsFilesystem {
             0
         };
 
-        if off_in == 0 && off_out == 0 && length >= src_size && dest_size == 0 {
+        // Whole-file clone fast path — ONLY when the source's acked custody
+        // is fully merged (freeze-clean): under the held guards, every
+        // below-size block must be either map-bound or genuinely hole
+        // (no RAM overlay, no staged sibling). A write that re-parked
+        // custody between the pre-guard drain and the guard acquisition
+        // demotes this copy to the chunked path below, which composes
+        // parked runs correctly (generic/795).
+        let clone_freeze_clean =
+            if off_in == 0 && off_out == 0 && length >= src_size && dest_size == 0 {
+                match self.router.fetch_metadata(&src_path).await {
+                    Ok(meta) if meta.file_type == "striped" && meta.size > 0 => {
+                        let bs = self.router.block_size.load(Ordering::Relaxed);
+                        let blocks = meta.size.div_ceil(bs) as u32;
+                        (0..blocks).all(|b| {
+                            // BOUND blocks are not automatically clean: a
+                            // revisit overlay / staged sibling on a bound block
+                            // means the durable image is a GAP-BAKED stale copy
+                            // whose truth is parked (the clone would share the
+                            // stale key while the source serves the overlay).
+                            let key = crate::keys::active_block(inode, b as u64).to_string();
+                            let ext = crate::keys::active_block_ext(inode, b as u64).to_string();
+                            let unbound = !meta
+                                .block_map
+                                .as_ref()
+                                .map(|m| m.contains_key(&b))
+                                .unwrap_or(false);
+                            let parked = self.active_block_buffers.contains_key(&key)
+                                || self.router.cache.nvme.has_staged_active_block(&key)
+                                || self.router.cache.nvme.has_staged_extent_record(&ext);
+                            !(parked || (unbound && b as u64 * bs < meta.size))
+                        })
+                    }
+                    Ok(_) => true,
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+        if off_in == 0 && off_out == 0 && length >= src_size && dest_size == 0 && clone_freeze_clean
+        {
             self.router
                 .clone_file(&src_path, &dest_path, Some(src_token), Some(dest_token))
                 .await

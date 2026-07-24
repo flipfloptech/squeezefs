@@ -1613,7 +1613,6 @@ pub struct DataRouterInner {
     /// nothing; string forms remain only where backend keys genuinely need
     /// `fs_key!`-class shapes).
     pub metadata_cache: moka::sync::Cache<u64, CachedMetadata>,
-    pub block_map_cache: moka::sync::Cache<(String, u32), (Option<String>, std::time::Instant)>,
     /// Single-flight registry. `scc::HashMap`, NOT `HashIndex` (a measured
     /// deviation from the design doc's "container stays" note): HashIndex
     /// defers value drops through epoch reclamation, and since R1a the
@@ -2600,7 +2599,6 @@ impl DataRouter {
         sys.refresh_memory();
         let total_memory = sys.total_memory();
         let metadata_capacity = std::cmp::max(10_000, total_memory / 200_000);
-        let block_map_capacity = std::cmp::max(50_000, total_memory / 50_000);
 
         // Process parallelism, not the (possibly core-pinned) constructor
         // thread's mask — the Hang-1 sizing poison collapsed this to 4.
@@ -2628,10 +2626,6 @@ impl DataRouter {
                 metadata_cache: moka::sync::Cache::builder()
                     .max_capacity(metadata_capacity)
                     .time_to_idle(std::time::Duration::from_secs(300))
-                    .build(),
-                block_map_cache: moka::sync::Cache::builder()
-                    .max_capacity(block_map_capacity)
-                    .time_to_live(std::time::Duration::from_secs(300))
                     .build(),
                 inflight_block_reads: std::sync::Arc::new(scc::HashMap::new()),
                 stream_lanes: moka::sync::Cache::builder()
@@ -4789,10 +4783,12 @@ impl DataRouter {
         }
         let b_key = if let Some(map) = &meta.block_map {
             map.get(&start_block).cloned()?
-        } else if let Some(id) = &meta.block_map_id {
-            self.block_map_cache
-                .get(&(id.clone(), start_block))
-                .and_then(|(k, _)| k)?
+        } else if meta.block_map_id.is_some() {
+            // Map-id without an inline map (anomalous — see
+            // `load_striped_block_keys`): this sync leg cannot re-resolve
+            // from the backend, so DEMOTE to the async handler (which can),
+            // never fabricate a miss/hole.
+            return None;
         } else {
             format!("{}/part_{}", meta.block_prefix.as_ref()?, start_block)
         };
@@ -4821,7 +4817,7 @@ impl DataRouter {
 
     pub async fn load_striped_block_keys(
         &self,
-        _file_path: &str,
+        file_path: &str,
         meta: &CachedMetadata,
         start_block: u32,
         end_block: u32,
@@ -4833,14 +4829,34 @@ impl DataRouter {
                 let key_opt = block_map.get(&b).cloned();
                 block_keys.push((b, key_opt));
             }
-        } else if let Some(block_map_id) = &meta.block_map_id {
-            for b in start_block..=end_block {
-                let cache_key = (block_map_id.clone(), b);
-                if let Some(entry) = self.block_map_cache.get(&cache_key) {
-                    let (bk, _) = &entry;
-                    block_keys.push((b, bk.clone()));
-                } else {
-                    block_keys.push((b, None));
+        } else if meta.block_map_id.is_some() {
+            // A map-id WITHOUT an inline map: `fetch_metadata_from_backend`
+            // always inline-resolves (indirect maps rehydrate into
+            // `block_map`), so this shape only arises from an anomalous RAM
+            // entry. The old arm consulted a moka `block_map_cache` whose
+            // populate sites died with the Redis removal (23ed315) — every
+            // miss silently resolved the block as a HOLE, a fabricate-zeros
+            // engine (the generic/795 gate found it). Re-resolve
+            // AUTHORITATIVELY from the backend instead; if the backend
+            // cannot produce a map either, fail LOUD — never fabricate.
+            let ino = parse_inode_from_path(file_path);
+            log::warn!(
+                "load_striped_block_keys: ino {ino} carries block_map_id without an \
+                 inline map (anomalous entry) — re-resolving from the backend"
+            );
+            match self.fetch_metadata_from_backend(ino).await? {
+                Some(fresh) if fresh.block_map.is_some() => {
+                    let map = fresh.block_map.as_ref().expect("checked is_some");
+                    for b in start_block..=end_block {
+                        block_keys.push((b, map.get(&b).cloned()));
+                    }
+                }
+                _ => {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "striped ino {ino}: block map unresolvable (id present, no \
+                         inline map, backend re-fetch empty) — refusing to serve \
+                         fabricated holes"
+                    )));
                 }
             }
         } else if let Some(block_prefix) = &meta.block_prefix {
@@ -7547,6 +7563,32 @@ impl DataRouter {
             // a point-in-time clone of a hot-mutating file has no progress
             // guarantee worth a new lock-order edge.
             let src_ino = parse_inode_from_path(src);
+            // generic/795 (the whole-file-clone face): a below-size block
+            // that is unbound in the map but has a staged `active_block:`
+            // sibling is ACKED CUSTODY the clone cannot carry by refcount —
+            // cloning around it mints a full-size layout whose block reads
+            // zeros. The cfr handler drains this station before calling;
+            // any other caller must too. Refuse loud, never corrupt.
+            {
+                let bs = self.block_size.load(Ordering::Relaxed);
+                let blocks = meta.size.div_ceil(bs) as u32;
+                for b in 0..blocks {
+                    // Bound or unbound alike: a staged sibling / extent
+                    // record IS the block's newest acked custody — the
+                    // durable image (if any) is stale, and a refcount clone
+                    // of it would durably serve the pre-park bytes (zeros
+                    // for a gap-baked image).
+                    let key = crate::keys::active_block(src_ino, b as u64).to_string();
+                    let ext = crate::keys::active_block_ext(src_ino, b as u64).to_string();
+                    if self.cache.nvme.has_staged_active_block(&key)
+                        || self.cache.nvme.has_staged_extent_record(&ext)
+                    {
+                        return Err(SqueezefsError::InvalidOperation(format!(
+                            "clone source {src} block {b} holds undrained staged                              custody (acked bytes not yet merged into the map) —                              drain/flush the source before cloning"
+                        )));
+                    }
+                }
+            }
             let mut current = meta.clone();
             let mut attempt = 0usize;
             loop {

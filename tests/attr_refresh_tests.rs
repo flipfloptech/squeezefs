@@ -608,3 +608,173 @@ async fn unprivileged_fallocate_drops_suid_sgid() {
         "root fallocate keeps suid/sgid (generic/683 Test 5)"
     );
 }
+
+/// The kernel's inode-timestamp clock domain: `CLOCK_REALTIME_COARSE`
+/// (what `inode_set_ctime_current()` reads — the stamp `fuse_link` /
+/// write dirtying author LOCALLY for regular files under the writeback
+/// cache we mount with). i64 ns in the u64 storage word, same convention
+/// as the daemon's stamps.
+fn kernel_coarse_now_ns() -> u64 {
+    let mut t = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime with a valid clock id and a valid out pointer.
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut t) };
+    t.tv_sec.wrapping_mul(1_000_000_000).wrapping_add(t.tv_nsec) as u64
+}
+
+/// fstests generic/423 repro-port (statx `ts=C,c`, the hard-link leg) —
+/// THE mechanism: under the default writeback cache the kernel authors a
+/// regular file's link-ctime LOCALLY from `CLOCK_REALTIME_COARSE`
+/// (`fuse_update_ctime` → `inode_set_ctime_current`), while the daemon
+/// stamped every OTHER inode (423's socket) from the fine-grained
+/// `CLOCK_REALTIME`. The fine clock runs AHEAD of the coarse clock by up
+/// to one kernel tick (measured 1.85 ms on this host at HZ=1000), so a
+/// daemon-stamped sibling created moments BEFORE an `ln` can carry a
+/// ctime LATER than the kernel's link stamp — 423's observed 162 µs
+/// nsec regression. The pinned contract: **a daemon-authored inode
+/// timestamp must never exceed a coarse-clock reading taken AFTER the
+/// operation returned** (that reading IS the earliest stamp the kernel
+/// could author next). Every daemon stamp must ride the kernel's clock
+/// domain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_inode_stamps_never_lead_the_kernel_coarse_clock() {
+    let h = make().await;
+    for round in 0..100u32 {
+        let as_ns = |t: Timestamp| (t.sec as u64).wrapping_mul(1_000_000_000) + t.nsec as u64;
+        let check = |round: u32, tag: &str, stamp: u64, fence: u64| {
+            assert!(
+                (stamp as i64) <= (fence as i64),
+                "round {round}: {tag} {stamp} ns LEADS the kernel coarse clock \
+                 ({fence} ns read AFTER the op) by {} ns — the kernel's next \
+                 locally-authored wb-cache stamp (fuse_update_ctime at `ln`) \
+                 would land BEHIND it: fstests generic/423 ts=C,c inversion",
+                (stamp as i64) - (fence as i64),
+            );
+        };
+
+        // create (423's mknod-the-socket analog: a fresh daemon-stamped
+        // inode) …
+        let f = create(&h, 1, &format!("c423-{round}")).await;
+        let coarse = kernel_coarse_now_ns();
+        let t = backend_inode(&h, f).await;
+        check(round, "create ctime", t.ctime, coarse);
+        check(round, "create mtime", t.mtime, coarse);
+
+        // … a data write (the write path publishes its own attr times) …
+        let w =
+            h.fs.write(h.req, f, 0, 0, bytes::Bytes::from(vec![0xEEu8; 512]), 0, 0)
+                .await
+                .unwrap();
+        assert_eq!(w.written, 512);
+        let coarse = kernel_coarse_now_ns();
+        let served = h.fs.getattr(h.req, f, None, 0).await.unwrap().attr;
+        check(
+            round,
+            "post-write served mtime",
+            as_ns(served.mtime),
+            coarse,
+        );
+        check(
+            round,
+            "post-write served ctime",
+            as_ns(served.ctime),
+            coarse,
+        );
+
+        // … and link (the daemon-side ctime bump itself).
+        let link_attr =
+            h.fs.link(h.req, f, 1, OsStr::new(&format!("cl423-{round}")))
+                .await
+                .unwrap()
+                .attr;
+        let coarse = kernel_coarse_now_ns();
+        let t = backend_inode(&h, f).await;
+        check(round, "link-reply ctime", as_ns(link_attr.ctime), coarse);
+        check(round, "post-link backend ctime", t.ctime, coarse);
+    }
+}
+
+/// fstests generic/423 (statx `ts=C,c`, the hard-link leg): after
+/// `link()`, the linked file's ctime must be >= the ctime/btime of ANY
+/// object created before the link — and in particular >= its own
+/// just-observed pre-link ctime and >= a sibling created moments before.
+/// The failing shape on the gate: the post-link ctime landed ~160 µs
+/// BEHIND a socket created before the `ln` ran (nsec regression within
+/// the same second). Pin the whole ordering chain, tightly, many rounds
+/// (the regression is a sub-millisecond clock/serve-path skew).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn link_ctime_is_monotone_against_prior_observations() {
+    let h = make().await;
+    for round in 0..200u32 {
+        let fname = format!("f423-{round}");
+        let sname = format!("s423-{round}");
+        let lname = format!("l423-{round}");
+        let f = create(&h, 1, &fname).await;
+
+        // dd-analog data write (the write path publishes its own times).
+        let w =
+            h.fs.write(h.req, f, 0, 0, bytes::Bytes::from(vec![0xABu8; 4096]), 0, 0)
+                .await
+                .unwrap();
+        assert_eq!(w.written, 4096);
+
+        // Kernel writeback times-echo analog: a bare mtime/ctime SETATTR
+        // (the absorb arm parks it as a pending refinement).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let echo = Timestamp::new(now.as_secs() as i64, now.subsec_nanos());
+        h.fs.setattr(
+            h.req,
+            f,
+            None,
+            fuse3::SetAttr {
+                mtime: Some(echo),
+                ctime: Some(echo),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // The sibling created BEFORE the link (423's socket): its btime /
+        // ctime are the reference the linked file must not fall behind.
+        let s = create(&h, 1, &sname).await;
+        let ref_attr = h.fs.getattr(h.req, s, None, 0).await.unwrap().attr;
+
+        // Pre-link self-observation: the file's own ctime as a reference.
+        let pre = h.fs.getattr(h.req, f, None, 0).await.unwrap().attr;
+
+        // link() — must bump the file's ctime to now (>= both refs).
+        let link_attr =
+            h.fs.link(h.req, f, 1, OsStr::new(&lname))
+                .await
+                .unwrap()
+                .attr;
+        let post = h.fs.getattr(h.req, f, None, 0).await.unwrap().attr;
+
+        for (tag, got) in [("link-reply", link_attr.ctime), ("getattr", post.ctime)] {
+            let ge = |a: Timestamp, b: Timestamp| (a.sec, a.nsec) >= (b.sec, b.nsec);
+            assert!(
+                ge(got, ref_attr.ctime),
+                "round {round}: {tag} ctime {}.{:09} regressed below the PRIOR sibling's \
+                 ctime {}.{:09} (generic/423 ts=C,c)",
+                got.sec,
+                got.nsec,
+                ref_attr.ctime.sec,
+                ref_attr.ctime.nsec
+            );
+            assert!(
+                ge(got, pre.ctime),
+                "round {round}: {tag} ctime {}.{:09} regressed below the file's OWN \
+                 pre-link ctime {}.{:09} (generic/423)",
+                got.sec,
+                got.nsec,
+                pre.ctime.sec,
+                pre.ctime.nsec
+            );
+        }
+    }
+}

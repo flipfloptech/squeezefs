@@ -45,14 +45,17 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
 
 ## Versioning & releases
 
-**The version of a SqueezeFS build is the git commit it was built from.** There is no semver and no calver — strictly git commits for versioning. Periodic releases are **annotated git tags on specific commits** — `stable-YYYY.MM[.N]` and `lts-YYYY.MM` — created manually as a release act (never by CI, never by a version-bump commit). The tag names the release; the commit stays the version. Tags are the **only** release names.
+**A SqueezeFS build carries two identities, both surfaced** (user directive 2026-07-24, superseding the commit-only 2026-07-18 policy):
+
+1. **The release-train version** — `Cargo.toml`'s package `version` (currently the **1.1 train**), bumped **as a release act** (never by CI, never per commit). The first-party crates (`crates/fuse3` — the fully-diverged fork, `crates/squeezefs-ipc`, `crates/squeezefs-preload`) track the same train.
+2. **The git commit the build was produced from** — the fine-grained identity. Periodic releases remain **annotated git tags on specific commits** — `stable-YYYY.MM[.N]` and `lts-YYYY.MM` — created manually as a release act. The tag names the release; the commit pins the exact build. Tags are the **only** release names.
 
 **Verify what a node is running** (the two surfaces carry the same build-time capture):
 
 ```bash
 squeezefs --version        # or -V
-# untagged build:  squeezefs f63455bcb824 (f63455bcb8249b064531d000624c40825a6e763e) built 2026-07-18T13:45:25Z
-# release build:   squeezefs stable-2026.07 (f63455bcb824 / f63455bcb8249b064531d000624c40825a6e763e) built 2026-07-18T13:45:25Z
+# untagged build:  squeezefs 1.1.0 (f63455bcb824 / f63455bcb8249b064531d000624c40825a6e763e) built 2026-07-18T13:45:25Z
+# release build:   squeezefs 1.1.0 (f63455bcb824 / f63455bcb8249b064531d000624c40825a6e763e, tag stable-2026.07) built 2026-07-18T13:45:25Z
 grep -E '"build_(commit|tag)"' <mountpoint>/.stats   # the fleet mixed-version detector
 ```
 
@@ -60,8 +63,8 @@ The `.stats` inode exports `build_commit` (the full hash) and `build_tag` (alway
 
 Mechanics and edges:
 
-- The identity is captured at compile time by `build.rs` (`git rev-parse HEAD`, `--short=12`, `git status --porcelain --untracked-files=no`, `git describe --tags --exact-match`) and embedded via `SQUEEZEFS_BUILD_*` rustc envs; `src/version.rs` is the single formatting source of truth for `--version`, the mount/format summary, the mount-ready log lines, `.config`'s `client_version`, and `.stats`.
-- **`Cargo.toml`'s `version = "0.1.0"` is a cargo-internal placeholder only** — cargo requires one, SqueezeFS ignores it. Never bump it for a release; never read it as a version.
+- The commit identity is captured at compile time by `build.rs` (`git rev-parse HEAD`, `--short=12`, `git status --porcelain --untracked-files=no`, `git describe --tags --exact-match`) and embedded via `SQUEEZEFS_BUILD_*` rustc envs; the train version is `CARGO_PKG_VERSION`; `src/version.rs` is the single formatting source of truth for `--version`, the mount/format summary, the mount-ready log lines, `.config`'s `client_version`, and `.stats`.
+- **Bumping the train is a release act**: edit the package `version` in the root `Cargo.toml` and the first-party crate manifests (`crates/fuse3`, `crates/squeezefs-ipc`, `crates/squeezefs-preload`) together — they carry the same train. (The pre-2026-07-24 "`0.1.0` cargo-internal placeholder, never bump" posture is retired.) The `.stats` `build_commit`/`build_tag` fields stay raw commit/tag — fleet tooling never parses the version line.
 - **Tarball / no-git builds**: packagers set `SQUEEZEFS_BUILD_COMMIT` (and optionally `SQUEEZEFS_BUILD_TAG`) in the build environment to stamp the identity; without git *and* without the envs, the build still succeeds and embeds `unknown`. `SOURCE_DATE_EPOCH` is honored for a reproducible build timestamp.
 
 ---

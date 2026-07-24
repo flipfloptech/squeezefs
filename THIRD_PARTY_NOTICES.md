@@ -13,7 +13,9 @@ from upstream [`fuse3`](https://crates.io/crates/fuse3) crate v0.7.3 ("FUSE
 user-space library async version implementation") by Sherlock Holo,
 upstream repository <https://github.com/Sherlock-Holo/fuse3>, wired in via
 `[patch.crates-io]` in [Cargo.toml](Cargo.toml). The fork has substantially
-diverged from upstream and is maintained as first-party code, but it
+diverged from upstream and is maintained as first-party code — it now
+carries the SqueezeFS release-train version (1.1.x), no longer upstream's
+0.7.x; the fork-point fact above is historical and stays — but it
 inherits its provenance obligations: the derived portions remain under the
 original upstream **MIT License**, the upstream license file is retained
 in-tree at [`crates/fuse3/LICENSE`](crates/fuse3/LICENSE), and it is

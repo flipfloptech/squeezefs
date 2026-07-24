@@ -70,7 +70,7 @@ cargo build --release
 
 Optional Cargo features (off by default): `gds` (GPU Direct Storage path), `dhat-on` (heap profiling), `coz-on` (causal profiling). Release builds keep debug symbols for profiling.
 
-Versions are git commits — no semver/calver; releases are `stable-*`/`lts-*` git tags on specific commits. Check a build with `squeezefs --version` (and the `.stats` `build_commit` field on a mounted daemon); policy details in [docs/operations.md §Versioning & releases](docs/operations.md#versioning--releases).
+Builds carry two identities: the release-train version (currently the 1.1 train, bumped as a release act) and the git commit they were built from; releases are `stable-*`/`lts-*` git tags on specific commits. Check a build with `squeezefs --version` (both identities on one line; also the `.stats` `build_commit` field on a mounted daemon); policy details in [docs/operations.md §Versioning & releases](docs/operations.md#versioning--releases).
 
 To verify a build, run the standard gate — clippy (`-D warnings`), `cargo fmt --check`, `cargo test --all-features -- --test-threads=1`, `cargo doc --no-deps`, and the criterion bench smoke. Root-only external suites (pjdfstest, LTP, fstests, elbencho, the NVMe-oF fidelity tier) live under `tests/` and are tiered in [AGENTS.md](AGENTS.md).
 

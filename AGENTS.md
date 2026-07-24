@@ -469,7 +469,7 @@ cargo build --release
 
 ### First-party `fuse3` fork (`crates/fuse3`)
 
-`crates/fuse3` is a maintained **fork** of the upstream crates.io `fuse3` crate (v0.7.3, Sherlock Holo, MIT — upstream attribution retained in `THIRD_PARTY_NOTICES.md` and `crates/fuse3/LICENSE`). It has substantially diverged from upstream: the FUSE-over-io_uring transport, payload leases, and flag sweeps live here. Treat it as first-party code — edit it directly when FUSE behavior changes; **never** replace it with the crates.io version or "restore" `Cargo.toml.orig`. `Cargo.toml` has `[patch.crates-io] fuse3 = { path = "crates/fuse3" }`, which redirects every `fuse3` dependency edge in the build graph to this in-tree fork.
+`crates/fuse3` is a maintained **fork** of the upstream crates.io `fuse3` crate (forked from v0.7.3, Sherlock Holo, MIT — upstream attribution retained in `THIRD_PARTY_NOTICES.md` and `crates/fuse3/LICENSE`). It has substantially diverged from upstream: the FUSE-over-io_uring transport, payload leases, and flag sweeps live here — and it now carries the **SqueezeFS release-train version** (1.1.x), not upstream's 0.7.x. Treat it as first-party code — edit it directly when FUSE behavior changes; **never** replace it with the crates.io version or "restore" `Cargo.toml.orig`. `Cargo.toml` declares the prepublish-style requirement `fuse3 = { version = "1.1", … }` plus `[patch.crates-io] fuse3 = { path = "crates/fuse3" }`: only the in-tree fork can satisfy it (crates.io fuse3 never can), and the patch indirection is **load-bearing for workspace topology** — the fork is its own excluded workspace root (standalone suite, own lock), and cargo rejects a direct path dependency to a nested foreign workspace root ("multiple workspace roots found in the same workspace"); patch entries bypass that check.
 
 ### Build features for profiling
 
@@ -653,7 +653,7 @@ The integration branch is **`dev`** (not `main`; `main` is reserved for releases
 - Tests-first cycle: write failing tests → implement → refine → commit each logical step separately.
 - Merge with `--ff-only`; rebase feature branches if `dev` has diverged. Delete branches after merge.
 - Conventional commits: `type(scope): description`. Messages explain WHY.
-- **Versioning is git commits only** (`docs/operations.md` §Versioning & releases): release tags (`stable-*`/`lts-*`, created manually as a release act) are the only release names — never introduce semver bumps (`Cargo.toml`'s `version` is a cargo-internal placeholder).
+- **Versioning = release train + git commit** (`docs/operations.md` §Versioning & releases; user directive 2026-07-24 superseding the commit-only posture): package versions track the **release train** (currently 1.1.0) and are bumped **as a release act** across the root and the first-party crates (`crates/fuse3`, `crates/squeezefs-ipc`, `crates/squeezefs-preload`) together — never per commit, never by CI. Git commits remain the fine-grained identity (`--version` shows both); release tags (`stable-*`/`lts-*`, created manually as a release act) remain the only release names.
 
 See the full TDD Development Workflow section above for the detailed phased process.
 

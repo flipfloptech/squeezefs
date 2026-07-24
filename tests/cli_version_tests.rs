@@ -1,14 +1,18 @@
-//! Git-commit versioning contract (user policy, 2026-07-18): the version of
-//! a SqueezeFS build **is the git commit it was built from** — no semver, no
-//! calver. Periodic releases are `stable-*` / `lts-*` git tags on specific
-//! commits; the tag never replaces the commit in the version line, it only
-//! prefixes it. Policy + operator surface: docs/operations.md §Versioning &
+//! Versioning contract (user policy, 2026-07-24, superseding 2026-07-18):
+//! the version line carries BOTH identities — the **release-train version**
+//! (`CARGO_PKG_VERSION`, bumped as a release act; currently the 1.1 train)
+//! leads, and the **git commit the build was produced from** survives
+//! verbatim (short + full hash, `-dirty`, exact `stable-*`/`lts-*` tag).
+//! Git commits remain the fine-grained identity; tags remain the release
+//! names. Policy + operator surface: docs/operations.md §Versioning &
 //! releases.
 //!
 //! Pinned here:
-//! * `squeezefs --version` / `-V` print one grep-friendly, commit-first line:
-//!   - untagged: `squeezefs <short12>[-dirty] (<full40>[-dirty]) built <utc-rfc3339>`
-//!   - tagged:   `squeezefs <tag> (<short12>[-dirty] / <full40>[-dirty]) built <utc-rfc3339>`
+//! * `squeezefs --version` / `-V` print one grep-friendly, train-first line:
+//!   - untagged: `squeezefs <train> (<short12>[-dirty] / <full40>[-dirty]) built <utc-rfc3339>`
+//!   - tagged:   `squeezefs <train> (<short12>[-dirty] / <full40>[-dirty], tag <tag>) built <utc-rfc3339>`
+//! * The train version is `CARGO_PKG_VERSION` and is no longer the retired
+//!   `0.1.0` cargo placeholder.
 //! * A binary built from this repo embeds a REAL hash (never the `unknown`
 //!   tarball fallback) that matches `git rev-parse HEAD` at build time.
 //! * The dirty and tag branches are pinned at the formatting-function level
@@ -29,15 +33,16 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_squeezefs")
 }
 
-/// The one-line version-output shape, both branches:
-/// untagged commit-first, or tag-first with the commit pair in parens.
+/// The one-line version-output shape, both branches: the release-train
+/// version leads, the commit pair (short / full, `-dirty` on both when
+/// applicable) rides in the parens, the exact release tag (when present)
+/// trails inside the parens as `, tag <tag>`.
 fn version_line_regex() -> Regex {
     Regex::new(
-        r"(?x)^squeezefs\ (?:
-            [0-9a-f]{12}(?:-dirty)?\ \([0-9a-f]{40}(?:-dirty)?\)
-          |
-            \S+\ \([0-9a-f]{12}(?:-dirty)?\ /\ [0-9a-f]{40}(?:-dirty)?\)
-          )\ built\ \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
+        r"(?x)^squeezefs\ \d+\.\d+\.\d+\ \(
+            [0-9a-f]{12}(?:-dirty)?\ /\ [0-9a-f]{40}(?:-dirty)?
+            (?:,\ tag\ \S+)?
+          \)\ built\ \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
     )
     .expect("version-line regex compiles")
 }
@@ -56,11 +61,11 @@ fn run_version(flag: &str) -> String {
     String::from_utf8(out.stdout).expect("version output is UTF-8")
 }
 
-/// `--version` prints exactly one line in the commit-first shape, and the
+/// `--version` prints exactly one line in the train-first shape, and the
 /// embedded commit is real: 12-hex short + 40-hex full + UTC RFC3339
 /// build timestamp, never the `unknown` no-git fallback (this repo HAS git).
 #[test]
-fn version_flag_prints_one_commit_first_line() {
+fn version_flag_prints_one_train_first_line() {
     let stdout = run_version("--version");
     let line = stdout.trim_end_matches('\n');
     assert!(
@@ -69,14 +74,39 @@ fn version_flag_prints_one_commit_first_line() {
     );
     assert!(
         version_line_regex().is_match(line),
-        "--version line must match the commit-first format \
-         `squeezefs <short12> (<full40>[-dirty]) built <ts>` (or the tagged \
-         `squeezefs <tag> (<short12> / <full40>) built <ts>` branch), got: {line:?}"
+        "--version line must match the train-first format \
+         `squeezefs <train> (<short12>[-dirty] / <full40>[-dirty]\
+         [, tag <tag>]) built <ts>`, got: {line:?}"
     );
     assert!(
         !line.contains("unknown"),
         "a binary built from this git repo must embed a real commit, \
          not the tarball `unknown` fallback: {line:?}"
+    );
+}
+
+/// The line leads with the release-train version — `CARGO_PKG_VERSION`,
+/// which now tracks the release train (bumped as a release act) and is no
+/// longer the retired `0.1.0` cargo-internal placeholder.
+#[test]
+fn version_line_leads_with_the_release_train() {
+    let train = env!("CARGO_PKG_VERSION");
+    assert_ne!(
+        train, "0.1.0",
+        "the package version must track the release train (currently the \
+         1.1 train), not the retired 0.1.0 placeholder"
+    );
+    assert_eq!(
+        train,
+        squeezefs::version::RELEASE_TRAIN,
+        "RELEASE_TRAIN must be CARGO_PKG_VERSION verbatim"
+    );
+    let stdout = run_version("--version");
+    let prefix = format!("squeezefs {train} (");
+    assert!(
+        stdout.starts_with(&prefix),
+        "--version must lead with the release-train version \
+         (expected prefix {prefix:?}), got: {stdout:?}"
     );
 }
 
@@ -120,7 +150,7 @@ fn version_embeds_the_real_build_commit() {
     let short = &head[..12];
     assert!(
         stdout.contains(short),
-        "--version must lead with the 12-hex short form {short} of the build \
+        "--version must carry the 12-hex short form {short} of the build \
          commit, got: {stdout:?}"
     );
 }
@@ -142,43 +172,44 @@ fn binary_version_line_is_the_library_version_line() {
 // build-time; tests must NOT create tags or dirty the tree).
 // ---------------------------------------------------------------------------
 
+const TRAIN: &str = "1.1.0";
 const SHORT: &str = "f63455bcb824";
 const FULL: &str = "f63455bcb8249b064531d000624c40825a6e763e";
 const TS: &str = "2026-07-18T00:00:00Z";
 
 #[test]
-fn formatter_untagged_clean_is_commit_first() {
+fn formatter_untagged_clean_is_train_first_with_the_commit_pair() {
     assert_eq!(
-        squeezefs::version::format_version_line(SHORT, FULL, false, "", TS),
-        format!("{SHORT} ({FULL}) built {TS}"),
-        "untagged clean build: `<short> (<full>) built <ts>`"
+        squeezefs::version::format_version_line(TRAIN, SHORT, FULL, false, "", TS),
+        format!("{TRAIN} ({SHORT} / {FULL}) built {TS}"),
+        "untagged clean build: `<train> (<short> / <full>) built <ts>`"
     );
 }
 
 #[test]
 fn formatter_untagged_dirty_suffixes_both_hashes() {
     assert_eq!(
-        squeezefs::version::format_version_line(SHORT, FULL, true, "", TS),
-        format!("{SHORT}-dirty ({FULL}-dirty) built {TS}"),
+        squeezefs::version::format_version_line(TRAIN, SHORT, FULL, true, "", TS),
+        format!("{TRAIN} ({SHORT}-dirty / {FULL}-dirty) built {TS}"),
         "dirty build: -dirty rides both the short and full hash"
     );
 }
 
 #[test]
-fn formatter_tagged_release_leads_with_the_tag() {
+fn formatter_tagged_release_carries_the_tag_with_the_commit() {
     assert_eq!(
-        squeezefs::version::format_version_line(SHORT, FULL, false, "stable-2026.07", TS),
-        format!("stable-2026.07 ({SHORT} / {FULL}) built {TS}"),
-        "tagged release: `<tag> (<short> / <full>) built <ts>` — the tag \
-         names the release, the commit stays the version"
+        squeezefs::version::format_version_line(TRAIN, SHORT, FULL, false, "stable-2026.07", TS),
+        format!("{TRAIN} ({SHORT} / {FULL}, tag stable-2026.07) built {TS}"),
+        "tagged release: `<train> (<short> / <full>, tag <tag>) built <ts>` \
+         — the tag names the release, the commit identity survives verbatim"
     );
 }
 
 #[test]
 fn formatter_tagged_dirty_still_carries_dirty_hashes() {
     assert_eq!(
-        squeezefs::version::format_version_line(SHORT, FULL, true, "lts-2026.07", TS),
-        format!("lts-2026.07 ({SHORT}-dirty / {FULL}-dirty) built {TS}"),
+        squeezefs::version::format_version_line(TRAIN, SHORT, FULL, true, "lts-2026.07", TS),
+        format!("{TRAIN} ({SHORT}-dirty / {FULL}-dirty, tag lts-2026.07) built {TS}"),
         "a dirty rebuild of a tagged commit must not masquerade as the release"
     );
 }
@@ -195,7 +226,7 @@ fn formatter_output_shapes_match_the_cli_regex() {
     ] {
         let line = format!(
             "squeezefs {}",
-            squeezefs::version::format_version_line(SHORT, FULL, dirty, tag, TS)
+            squeezefs::version::format_version_line(TRAIN, SHORT, FULL, dirty, tag, TS)
         );
         assert!(
             re.is_match(&line),
@@ -220,12 +251,17 @@ fn build_commit_stats_form_suffixes_dirty_on_the_full_hash() {
 }
 
 /// The embedded (build-time) identity is internally consistent: the version
-/// line carries exactly the values `build_commit()` / `build_tag()` report.
+/// line leads with the release train and carries exactly the values
+/// `build_commit()` / `build_tag()` report.
 #[test]
 fn embedded_identity_is_internally_consistent() {
     let line = squeezefs::version::version_line();
     let commit = squeezefs::version::build_commit();
     let tag = squeezefs::version::build_tag();
+    assert!(
+        line.starts_with(&format!("{} (", squeezefs::version::RELEASE_TRAIN)),
+        "version_line() must lead with RELEASE_TRAIN (line: {line:?})"
+    );
     assert!(
         line.contains(&commit),
         "version_line() must embed build_commit() verbatim \
@@ -233,8 +269,8 @@ fn embedded_identity_is_internally_consistent() {
     );
     if !tag.is_empty() {
         assert!(
-            line.starts_with(tag),
-            "tagged builds lead with the tag (line: {line:?}, tag: {tag:?})"
+            line.contains(&format!(", tag {tag}")),
+            "tagged builds carry `, tag <tag>` (line: {line:?}, tag: {tag:?})"
         );
     }
 }

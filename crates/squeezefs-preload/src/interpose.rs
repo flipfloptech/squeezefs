@@ -1429,6 +1429,16 @@ impl KernelLane for RealKernel {
     }
 }
 
+/// Retro-neutralize one ctx (panic paths): vacate the registry entry so
+/// every later call on the value is the verbatim real call — a
+/// half-mutated merge state must never keep owning a live context.
+/// Registry ops are libc-free atomics, safe without the TLS guard.
+fn aio_retro_neutralize(ctx: u64) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        aio_registry().remove(ctx);
+    }));
+}
+
 /// # Safety
 /// C ABI interposer; argument contracts are libaio's own.
 #[no_mangle]
@@ -1446,13 +1456,19 @@ pub unsafe extern "C" fn io_setup(maxevents: c_int, ctxp: *mut u64) -> c_int {
     };
     if catch_unwind(AssertUnwindSafe(|| {
         // Registration failure (capacity) is fine: the ctx simply
-        // passthroughs wholesale.
+        // passthroughs wholesale. A colliding value retro-neutralizes
+        // inside register() — the kernel recycled a ring address whose
+        // destroy bookkeeping was missed; the corpse must not own it.
         // SAFETY: the real call just wrote *ctxp.
         aio_registry().register(unsafe { *ctxp });
     }))
     .is_err()
     {
         panic_poison();
+        // A panic mid-register must leave the value with a definite
+        // owner: the real kernel (passthrough wholesale).
+        // SAFETY: the real call wrote *ctxp above (r == 0 checked).
+        aio_retro_neutralize(unsafe { *ctxp });
     }
     r
 }
@@ -1461,25 +1477,30 @@ pub unsafe extern "C" fn io_setup(maxevents: c_int, ctxp: *mut u64) -> c_int {
 /// C ABI interposer; argument contracts are libaio's own.
 #[no_mangle]
 pub unsafe extern "C" fn io_destroy(ctx: u64) -> c_int {
+    // Bookkeeping FIRST and unconditionally: it is libc-free (registry
+    // atomics + one process-local mutex), so it runs even when the TLS
+    // guard is unavailable (reentrant entry — e.g. a signal handler
+    // destroying a context over an interposed frame) and even when the
+    // real symbol is missing. A skipped vacate leaves a stale entry
+    // that a recycled ctx value would adopt (the 2026-07-25 field
+    // crash class). Vacate BEFORE draining: even if the drain panics,
+    // the id no longer resolves.
+    if catch_unwind(AssertUnwindSafe(|| {
+        if let Some(m) = aio_registry().lookup(ctx) {
+            aio_registry().remove(ctx);
+            let mut c = m.lock().unwrap_or_else(|p| p.into_inner());
+            let AioCtx { state, tickets } = &mut *c;
+            let mut ring = SessionRing { tickets };
+            state.destroy(&mut ring);
+        }
+    }))
+    .is_err()
+    {
+        panic_poison();
+    }
     let Some(f) = real!("io_destroy", IoDestroyFn) else {
         return -libc::ENOSYS;
     };
-    if let Some(_g) = Guard::enter() {
-        if catch_unwind(AssertUnwindSafe(|| {
-            if let Some(m) = aio_registry().lookup(ctx) {
-                let mut c = m.lock().unwrap_or_else(|p| p.into_inner());
-                let AioCtx { state, tickets } = &mut *c;
-                let mut ring = SessionRing { tickets };
-                state.destroy(&mut ring);
-                drop(c);
-                aio_registry().remove(ctx);
-            }
-        }))
-        .is_err()
-        {
-            panic_poison();
-        }
-    }
     // SAFETY: chaining the real io_destroy (kernel-lane ops die with
     // the kernel ctx, exactly as un-interposed libaio).
     unsafe { f(ctx) }
@@ -1552,8 +1573,17 @@ pub unsafe extern "C" fn io_submit(ctx: u64, nr: c_long, ios: *mut *mut RawIocb)
         Ok(Some(r)) => r,
         Ok(None) => fallback(real),
         Err(_) => {
+            // A panicked body may have already dispatched part of the
+            // batch (kernel runs / ring tickets) — replaying the REAL
+            // call would double-submit: duplicate completions corrupt
+            // the host app's accounting (the sync interposers' lazy-
+            // real lesson, async shape). Retro-neutralize the ctx
+            // (every later call is the verbatim real call; tracked
+            // ring ops die with the poisoned session) and fail this
+            // submit loud with a kernel-legal errno.
             panic_poison();
-            fallback(real)
+            aio_retro_neutralize(ctx);
+            -libc::EIO
         }
     }
 }
@@ -1582,9 +1612,14 @@ unsafe fn aio_reap_served(
         {
             // Fast reject: nothing this shim tracks is in flight on the
             // ctx ⇒ the real call is exact (most contexts in a mixed
-            // process never touch SqueezeFS fds).
+            // process never touch SqueezeFS fds). A destroyed corpse
+            // (reachable only through registry staleness — belt-and-
+            // braces below the collision retro-neutralization) serves
+            // nothing and must forward to the real call too, never
+            // merge-loop on empty harvests (a host-app hang).
             let c = m.lock().unwrap_or_else(|p| p.into_inner());
-            if c.state.ring_pending() == 0 && c.state.kernel_pending() == 0 {
+            if c.state.destroyed() || (c.state.ring_pending() == 0 && c.state.kernel_pending() == 0)
+            {
                 return None;
             }
         }
@@ -1689,8 +1724,15 @@ pub unsafe extern "C" fn io_getevents(
         Ok(Some(r)) => r,
         Ok(None) => fallback(real),
         Err(_) => {
+            // A panicked merge may have already consumed ring tickets
+            // and written a prefix of the caller's event array —
+            // replaying the REAL call would overwrite that prefix and
+            // orphan those completions. Retro-neutralize the ctx and
+            // answer -EINTR (kernel-legal, app-retryable; every later
+            // call is the verbatim real call).
             panic_poison();
-            fallback(real)
+            aio_retro_neutralize(ctx);
+            -libc::EINTR
         }
     }
 }
@@ -1739,14 +1781,20 @@ pub unsafe extern "C" fn io_pgetevents(
         Ok(Some(r)) => r,
         Ok(None) => fallback(real),
         Err(_) => {
+            // Same law as io_getevents' panic arm (see there).
             panic_poison();
-            fallback(real)
+            aio_retro_neutralize(ctx);
+            -libc::EINTR
         }
     }
 }
 
 /// # Safety
 /// C ABI interposer; argument contracts are libaio's own.
+///
+/// The panic arm keeps the real-call fallback (unlike submit/getevents):
+/// the served body is read-only — it can neither dispatch nor consume,
+/// so the real call stays exact.
 #[no_mangle]
 pub unsafe extern "C" fn io_cancel(ctx: u64, iocb: *mut RawIocb, evt: *mut RawIoEvent) -> c_int {
     let real = real!("io_cancel", IoCancelFn);

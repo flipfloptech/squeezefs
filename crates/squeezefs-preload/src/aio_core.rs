@@ -126,6 +126,16 @@ impl AioCtxState {
         self.kernel_pending
     }
 
+    /// Has [`destroy`](Self::destroy) run? A destroyed state serves
+    /// nothing (`getevents` returns empty forever), so the reap path
+    /// must forward such a context to the REAL call instead of
+    /// merge-looping on empty harvests (a host-app hang). Reachable
+    /// only through registry staleness — belt-and-braces below the
+    /// collision retro-neutralization.
+    pub fn destroyed(&self) -> bool {
+        self.destroyed
+    }
+
     /// Is this iocb currently in flight on the ring lane? (`io_cancel`
     /// answers `-EINPROGRESS` for these — a ring op cannot be recalled;
     /// everything else takes the real call.)

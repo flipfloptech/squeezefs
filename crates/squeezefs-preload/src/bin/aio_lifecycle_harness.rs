@@ -60,10 +60,7 @@ fn resolve() -> Option<Aio> {
     // … → libaio), so a preloaded interposer wins exactly as in a host
     // app that links libaio.
     unsafe {
-        let h = libc::dlopen(
-            c"libaio.so.1".as_ptr(),
-            libc::RTLD_NOW | libc::RTLD_GLOBAL,
-        );
+        let h = libc::dlopen(c"libaio.so.1".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
         if h.is_null() {
             return None;
         }
@@ -144,7 +141,11 @@ fn run_phase(aio: &Aio, fd: c_int, tid: usize, phase: usize, qd: usize, write: b
             data: (0xC0FFEE00 + b) as u64,
             key: 0,
             aio_rw_flags: 0,
-            aio_lio_opcode: if write { IOCB_CMD_PWRITE } else { IOCB_CMD_PREAD },
+            aio_lio_opcode: if write {
+                IOCB_CMD_PWRITE
+            } else {
+                IOCB_CMD_PREAD
+            },
             aio_reqprio: 0,
             aio_fildes: fd,
             buf: buf.ptr as u64,
@@ -172,7 +173,10 @@ fn run_phase(aio: &Aio, fd: c_int, tid: usize, phase: usize, qd: usize, write: b
         };
         if rc == -libc::EAGAIN {
             eagain += 1;
-            assert!(eagain < 10_000, "io_submit EAGAIN-livelocked at {submitted}/{qd}");
+            assert!(
+                eagain < 10_000,
+                "io_submit EAGAIN-livelocked at {submitted}/{qd}"
+            );
             std::thread::yield_now();
             continue;
         }
@@ -205,7 +209,10 @@ fn run_phase(aio: &Aio, fd: c_int, tid: usize, phase: usize, qd: usize, write: b
         assert!(rc >= 0, "io_getevents failed: {rc}");
         if rc == 0 {
             spins += 1;
-            assert!(spins < 60, "io_getevents starved: {got}/{qd} after 60 waits");
+            assert!(
+                spins < 60,
+                "io_getevents starved: {got}/{qd} after 60 waits"
+            );
             continue;
         }
         for ev in &evs[..rc as usize] {
@@ -329,7 +336,6 @@ fn main() {
 
     let mut handles = Vec::new();
     for tid in 0..threads {
-        let aio = aio;
         let dir = dir.clone();
         let setup_first = match mode.as_str() {
             "setup-first" => true,

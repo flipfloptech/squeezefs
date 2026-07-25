@@ -148,17 +148,31 @@ impl<T: Default> AioCtxRegistry<T> {
         }
     }
 
-    /// Register a fresh context. `false` = already registered or at
-    /// capacity (the caller lets the context passthrough wholesale).
+    /// Register a fresh context. `false` = at capacity (the caller
+    /// lets the context passthrough wholesale).
+    ///
+    /// **Collision retro-neutralization (2026-07-25 field crash
+    /// class)**: a colliding register is BY CONSTRUCTION a recycled
+    /// REAL context — the kernel never hands out one live ctx value
+    /// twice, so an existing entry for this value is a corpse whose
+    /// `io_destroy` bookkeeping was missed (guard-refused interposer
+    /// entry, panicked destroy body, `real!`-miss early return, libaio
+    /// builds whose `io_queue_release` binds `io_destroy` internally).
+    /// The stale entry is VACATED and the value re-registered fresh:
+    /// adopting the corpse's state (stale pendings / ring tickets)
+    /// would divert the new real context off the verbatim-real
+    /// passthrough path — synthesized events with dangling iocb
+    /// pointers, host-app heap corruption.
     ///
     /// Slot protocol: claim the id `0 → RESERVED`, store the fresh
     /// state, then publish the real ctx value — a lookup can only ever
     /// match an id whose state is already the fresh box (no torn
     /// visibility, no cross-wiring under racing registers).
     pub fn register(&self, ctx: u64) -> bool {
-        if ctx == 0 || ctx == RESERVED || self.lookup(ctx).is_some() {
+        if ctx == 0 || ctx == RESERVED {
             return false;
         }
+        self.remove(ctx);
         for i in 0..CTX_CAP {
             if self.ids[i]
                 .compare_exchange(0, RESERVED, Ordering::AcqRel, Ordering::Acquire)

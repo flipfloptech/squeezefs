@@ -258,14 +258,18 @@ fn register_lookup_remove_roundtrip() {
 }
 
 #[test]
-fn duplicate_register_is_refused() {
+fn duplicate_register_retro_neutralizes_never_stacks() {
+    // Superseded contract (2026-07-25): a colliding register used to be
+    // REFUSED — which made the new REAL context adopt the corpse's
+    // state. Now it retro-neutralizes: vacate + fresh registration,
+    // and the value still resolves (exactly one owner).
     let reg: AioCtxRegistry = AioCtxRegistry::new();
     assert!(reg.register(0xA));
     assert!(
-        !reg.register(0xA),
-        "an io_context_t value is registered at most once"
+        reg.register(0xA),
+        "a colliding register is a recycled real context — re-register fresh"
     );
-    assert!(reg.lookup(0xA).is_some(), "the original registration stays");
+    assert!(reg.lookup(0xA).is_some(), "the value resolves to one owner");
 }
 
 #[test]

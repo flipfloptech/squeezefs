@@ -28,7 +28,8 @@ use std::path::Path;
 
 use squeezefs::nvmeof::fabric::subsysnqn_of_namespace;
 use squeezefs::nvmeof::initiator::{
-    connected_fabric_disks_at, disconnect_controllers_at, find_device_for_nqn_at,
+    connect_target, connected_fabric_disks_at, disconnect_controllers_at, fabrics_connect_string,
+    find_device_for_nqn_at, nvme_cli_connect_args, ConnectOptions,
 };
 
 const NQN_A: &str = "nqn.2026-07.io.squeezefs:share-aaaa";
@@ -307,6 +308,224 @@ fn test_disconnect_writes_delete_controller_on_every_matching_controller() {
     assert!(
         none.is_empty(),
         "no matching controller ⇒ empty, caller refuses loud"
+    );
+}
+
+// ===========================================================================
+// connect path/queue options (2026-07-25 live-cluster findings) — the
+// injectable connect-argument builders behind `nvmeof connect
+// --host-traddr/--host-iface/--nr-io-queues`: pass through EXACTLY when
+// supplied, change NOTHING when absent
+// ===========================================================================
+
+#[test]
+fn test_nvme_cli_args_base_shape_without_options() {
+    let args = nvme_cli_connect_args("10.0.0.1", 4420, NQN_A, &ConnectOptions::default());
+    assert_eq!(
+        args,
+        vec![
+            "connect".to_string(),
+            "-t".to_string(),
+            "tcp".to_string(),
+            "-a".to_string(),
+            "10.0.0.1".to_string(),
+            "-s".to_string(),
+            "4420".to_string(),
+            "-n".to_string(),
+            NQN_A.to_string(),
+        ],
+        "no options supplied ⇒ the pre-existing argv exactly (no behavior change)"
+    );
+}
+
+/// Each option passes through singly — and only itself.
+#[test]
+fn test_nvme_cli_args_pass_each_option_through_singly() {
+    let with_traddr = nvme_cli_connect_args(
+        "10.0.0.1",
+        4420,
+        NQN_A,
+        &ConnectOptions {
+            host_traddr: Some("10.0.0.2".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        with_traddr
+            .windows(2)
+            .any(|w| w == ["--host-traddr", "10.0.0.2"]),
+        "--host-traddr passes through as a flag/value pair: {with_traddr:?}"
+    );
+    assert!(
+        !with_traddr.iter().any(|a| a == "--host-iface")
+            && !with_traddr.iter().any(|a| a == "--nr-io-queues"),
+        "unsupplied options never appear: {with_traddr:?}"
+    );
+
+    let with_iface = nvme_cli_connect_args(
+        "10.0.0.1",
+        4420,
+        NQN_A,
+        &ConnectOptions {
+            host_iface: Some("eth1".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        with_iface.windows(2).any(|w| w == ["--host-iface", "eth1"]),
+        "--host-iface passes through: {with_iface:?}"
+    );
+    assert!(
+        !with_iface.iter().any(|a| a == "--host-traddr"),
+        "unsupplied options never appear: {with_iface:?}"
+    );
+
+    let with_queues = nvme_cli_connect_args(
+        "10.0.0.1",
+        4420,
+        NQN_A,
+        &ConnectOptions {
+            nr_io_queues: Some(8),
+            ..Default::default()
+        },
+    );
+    assert!(
+        with_queues.windows(2).any(|w| w == ["--nr-io-queues", "8"]),
+        "--nr-io-queues passes through: {with_queues:?}"
+    );
+}
+
+/// All three combined: base argv prefix unchanged, all three pairs present.
+#[test]
+fn test_nvme_cli_args_combined_options_extend_the_base() {
+    let opts = ConnectOptions {
+        host_traddr: Some("10.0.0.2".to_string()),
+        host_iface: Some("eth1".to_string()),
+        nr_io_queues: Some(4),
+    };
+    let args = nvme_cli_connect_args("10.0.0.1", 4420, NQN_A, &opts);
+    let base = nvme_cli_connect_args("10.0.0.1", 4420, NQN_A, &ConnectOptions::default());
+    assert_eq!(
+        &args[..base.len()],
+        &base[..],
+        "options only APPEND — the base argv is a stable prefix"
+    );
+    for pair in [
+        ["--host-traddr", "10.0.0.2"],
+        ["--host-iface", "eth1"],
+        ["--nr-io-queues", "4"],
+    ] {
+        assert!(
+            args.windows(2).any(|w| w == pair),
+            "combined options all pass through ({pair:?}): {args:?}"
+        );
+    }
+}
+
+#[test]
+fn test_fabrics_string_base_shape_without_options() {
+    let s = fabrics_connect_string(
+        "10.0.0.1",
+        4420,
+        NQN_A,
+        "nqn.2014-08.org.nvmexpress:uuid:host",
+        "hostid-1",
+        &ConnectOptions::default(),
+    );
+    assert_eq!(
+        s,
+        format!(
+            "transport=tcp,traddr=10.0.0.1,trsvcid=4420,nqn={},hostnqn=nqn.2014-08.org.\
+             nvmexpress:uuid:host,hostid=hostid-1",
+            NQN_A
+        ),
+        "no options supplied ⇒ the pre-existing fabrics option string exactly"
+    );
+}
+
+/// The raw `/dev/nvme-fabrics` write maps the flags to the kernel's
+/// fabrics option names — each appended only when supplied.
+#[test]
+fn test_fabrics_string_maps_options_to_kernel_option_names() {
+    let all = fabrics_connect_string(
+        "10.0.0.1",
+        4420,
+        NQN_A,
+        "hnqn",
+        "hid",
+        &ConnectOptions {
+            host_traddr: Some("10.0.0.2".to_string()),
+            host_iface: Some("eth1".to_string()),
+            nr_io_queues: Some(8),
+        },
+    );
+    for needle in ["host_traddr=10.0.0.2", "host_iface=eth1", "nr_io_queues=8"] {
+        assert!(all.contains(needle), "must carry {needle}: {all}");
+    }
+
+    let only_iface = fabrics_connect_string(
+        "10.0.0.1",
+        4420,
+        NQN_A,
+        "hnqn",
+        "hid",
+        &ConnectOptions {
+            host_iface: Some("eth1".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        only_iface.contains("host_iface=eth1")
+            && !only_iface.contains("host_traddr=")
+            && !only_iface.contains("nr_io_queues="),
+        "unsupplied options never reach the fabrics write: {only_iface}"
+    );
+}
+
+/// `nr_io_queues = 0` refuses at the library boundary BEFORE the root
+/// check (zero I/O queues is not a connection — the flag bounds the
+/// request, it never zeroes it). Unprivileged-safe by construction:
+/// the refusal precedes every side effect.
+#[test]
+fn test_connect_target_refuses_zero_io_queues_before_anything() {
+    let err = connect_target(
+        "127.0.0.1",
+        4420,
+        NQN_A,
+        &ConnectOptions {
+            nr_io_queues: Some(0),
+            ..Default::default()
+        },
+    )
+    .expect_err("zero I/O queues must refuse");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--nr-io-queues") && !msg.contains("root"),
+        "names the flag and fires before the root rung: {msg}"
+    );
+}
+
+/// Ledger/list coherence: the `list` walk surfaces the controller's
+/// sysfs `address` attribute VERBATIM — a traddr-pinned connection's
+/// `host_traddr=`/`src_addr=` fields show up untouched.
+#[test]
+fn test_list_passes_pinned_source_address_through_verbatim() {
+    let t = tempfile::tempdir().unwrap();
+    let (subsys, nvme) = roots(&t);
+    let pinned = "traddr=10.0.0.1,trsvcid=4420,host_traddr=10.0.0.2,src_addr=10.0.0.2";
+    mk_entry(
+        &nvme,
+        "nvme0",
+        &[("subsysnqn", NQN_A), ("address", pinned)],
+        &["nvme0n1"],
+    );
+
+    let disks = connected_fabric_disks_at(&subsys, &nvme).expect("walk must not error");
+    assert_eq!(disks.len(), 1);
+    assert_eq!(
+        disks[0].address, pinned,
+        "the pinned source address surfaces verbatim from sysfs"
     );
 }
 

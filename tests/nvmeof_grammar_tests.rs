@@ -610,6 +610,81 @@ fn test_unshare_verb_exists_and_demands_root() {
 }
 
 // ---------------------------------------------------------------------------
+// connect path/queue flags (2026-07-25 live-cluster findings: same-subnet
+// dual-NIC hosts need the source pinned; a target granting fewer I/O
+// queues than requested failed the connect with errno -18)
+// ---------------------------------------------------------------------------
+
+/// The three connect path/queue flags exist in the grammar, singly and
+/// combined — unprivileged runs die on the root rung, never on clap.
+#[test]
+fn test_connect_path_flags_exist_singly_and_combined() {
+    let base = [
+        "nvmeof",
+        "connect",
+        "--ip",
+        "127.0.0.1",
+        "--subnqn",
+        "nqn.2026-07.io.squeezefs:share-x",
+    ];
+    for extra in [
+        vec!["--host-traddr", "10.0.0.2"],
+        vec!["--host-iface", "eth1"],
+        vec!["--nr-io-queues", "8"],
+        vec!["--host-traddr", "10.0.0.2", "--host-iface", "eth1"],
+        vec![
+            "--host-traddr",
+            "10.0.0.2",
+            "--host-iface",
+            "eth1",
+            "--nr-io-queues",
+            "4",
+        ],
+    ] {
+        let mut args: Vec<&str> = base.to_vec();
+        args.extend(extra.iter());
+        let out = run(&args, &[]);
+        assert!(!out.status.success(), "{args:?} unprivileged must fail");
+        let text = combined(&out);
+        assert!(
+            !text.contains("unexpected argument") && !text.contains("unrecognized subcommand"),
+            "{args:?} must exist in the connect grammar: {text}"
+        );
+        assert!(text.contains("root"), "{args:?} demands root: {text}");
+    }
+}
+
+/// `--nr-io-queues 0` refuses at the grammar rung — zero I/O queues is
+/// not a connection; the flag exists to BOUND the request, not to zero
+/// it — before the root check.
+#[test]
+fn test_connect_nr_io_queues_zero_refuses_loud() {
+    let out = run(
+        &[
+            "nvmeof",
+            "connect",
+            "--ip",
+            "127.0.0.1",
+            "--subnqn",
+            "nqn.2026-07.io.squeezefs:share-x",
+            "--nr-io-queues",
+            "0",
+        ],
+        &[],
+    );
+    assert!(!out.status.success(), "--nr-io-queues 0 must refuse");
+    let text = combined(&out);
+    assert!(
+        text.contains("invalid value") && text.contains("--nr-io-queues"),
+        "must die on clap's range validation naming the flag: {text}"
+    );
+    assert!(
+        !text.contains("root privileges"),
+        "the range refusal fires before the root check: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // the N3 target lifecycle verb surface (§6.2/§6.5)
 // ---------------------------------------------------------------------------
 

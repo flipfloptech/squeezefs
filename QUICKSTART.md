@@ -340,8 +340,36 @@ sudo ./target/release/squeezefs mount sqmeta:///dev/main-pool/meta-vol /mnt/sque
 sudo ./target/release/squeezefs nvmeof disconnect <subnqn>
 ```
 - **Single-writer guard on fabric namespaces:** where the namespace advertises NVMe Persistent Reservation support, the mount guard runs **enforcement-grade** (the device itself fences stale writers) — check `writer_guard_mode` on `.stats`. Guarantee classes per substrate: [docs/operations.md → Single-writer mount guard](docs/operations.md#single-writer-mount-guard-guarantee-classes).
-- **Multipath/HA:** path redundancy across NICs/ports is native NVMe multipath, configured at `nvme connect` time (kernel initiator), transparent to SqueezeFS.
-- Fabric multipath/failover across multiple NICs is the kernel NVMe initiator's native multipath domain — configure it with `nvme connect` policies at the host level.
+- **Multipath/HA:** path redundancy across NICs/ports is native NVMe multipath, transparent to SqueezeFS — build the paths with repeated `connect` invocations (recipe below) and pick the spread policy via the kernel's `iopolicy` knob.
+- **Queue-constrained targets:** a target that offers fewer I/O queues than the initiator requests by default fails the connect (the kernel reports errno -18 mid-queue-setup). Bound the request instead of fighting the target: `connect ... --nr-io-queues 8`.
+
+#### Multi-NIC clients: a second fabric path
+
+A client with two data NICs gets one path per NIC: share on both target addresses, connect once per path, and let native NVMe multipath merge them into one head node.
+
+```bash
+# On the target host: one share, listeners on both fabric addresses
+sudo ./target/release/squeezefs nvmeof share /dev/nvme1n1 --ip 10.10.10.50,10.10.20.50
+
+# On the client: one connect per path. NICs on DISTINCT subnets route
+# themselves — the second connect leaves the second NIC without help:
+sudo ./target/release/squeezefs nvmeof connect --ip 10.10.10.50 --subnqn <subnqn>
+sudo ./target/release/squeezefs nvmeof connect --ip 10.10.20.50 --subnqn <subnqn>
+
+# NICs on the SAME subnet cannot be separated by routing — the kernel
+# would send both connections out the first NIC. Pin the source of the
+# second path explicitly:
+sudo ./target/release/squeezefs nvmeof connect --ip 10.10.10.51 --subnqn <subnqn> \
+    --host-traddr 10.10.10.22 --host-iface eth2
+```
+
+Both connections land under one subsystem: `nvmeof list` shows two controller rows whose `Target:` line carries the sysfs address verbatim — a pinned path shows its `host_traddr=`/`src_addr=` fields, so verify each path leaves the NIC you meant. The namespace stays a single block device (the multipath head node, e.g. `/dev/nvme0n1`); spread I/O across the paths with the kernel's iopolicy:
+
+```bash
+echo round-robin | sudo tee /sys/class/nvme-subsystem/nvme-subsys*/iopolicy
+```
+
+`--host-traddr` is **required** only for the same-subnet case (and for policy-routed hosts where the default route disagrees with the path you want); distinct-subnet dual-NIC setups work by routing alone. `disconnect <subnqn>` tears down every path controller of the subsystem at once.
 
 ---
 

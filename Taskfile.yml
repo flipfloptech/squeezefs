@@ -1,0 +1,135 @@
+# SqueezeFS build system — go-task v3 (https://taskfile.dev).
+#
+# `task build` (the default) is the host dev build; `task build:<distro>`
+# produces distro-targeted artifacts in throwaway containers. Artifacts land
+# in per-target subfolders under dist/ and KEEP THEIR DEFAULT NAMES — the
+# folder disambiguates, never a filename suffix: every dist/<target>/ holds
+# the daemon (`squeezefs`) and the interception shim (`libsqueezefs_il.so`)
+# side by side, built from the SAME commit (the KD-7 session skew gate
+# refuses mixed-commit daemon/shim pairs — deploy a dist folder as a unit).
+#
+# Container builds mount the checkout READ-ONLY at its host path (plus the
+# git common dir when the checkout is a linked worktree) so the git commit
+# identity embeds — docker/build-in-container.sh asserts it per artifact,
+# along with the per-distro glibc ceiling. Per-target named volumes carry
+# the cargo registry and target dir for incremental rebuilds.
+#
+# Bootstrap go-task without root: see README.md §Building (installs into
+# ./bin, never sudo system-wide). Some distros ship the binary as
+# `go-task`; both spellings run this file identically.
+version: '3'
+
+vars:
+  # Container runtime: CONTAINER_TOOL env overrides; else prefer docker,
+  # then podman. Empty means "no runtime" — distro builds refuse loudly.
+  CONTAINER_TOOL:
+    sh: |
+      if [ -n "${CONTAINER_TOOL:-}" ]; then
+        echo "$CONTAINER_TOOL"
+      elif command -v docker >/dev/null 2>&1; then
+        echo docker
+      elif command -v podman >/dev/null 2>&1; then
+        echo podman
+      fi
+
+tasks:
+  default:
+    desc: Host dev build (alias for build)
+    cmds:
+      - task: build
+
+  build:
+    desc: 'Host dev build → dist/host/{squeezefs, libsqueezefs_il.so}'
+    cmds:
+      - cargo build --release
+      # The only sanctioned shim build (§5.4 Issue-4: the root release
+      # profile's panic="abort" is refused by the shim's compile guard).
+      - cargo build -p squeezefs-preload --profile preload-release --features interposers
+      - mkdir -p dist/host
+      - install -m 0755 target/release/squeezefs dist/host/squeezefs
+      - install -m 0755 target/preload-release/libsqueezefs_il.so dist/host/libsqueezefs_il.so
+      # Identity check only — the host dev build has no foreign glibc ceiling.
+      - docker/check-artifacts.sh dist/host none
+
+  build:rocky8:
+    desc: 'Rocky Linux 8 (latest 8.x) build → dist/rocky8/ (glibc ≤ 2.28)'
+    cmds:
+      - task: build:distro
+        vars: { TARGET: rocky8, GLIBC_CEILING: '2.28' }
+
+  build:rocky9:
+    desc: 'Rocky Linux 9 (latest 9.x) build → dist/rocky9/ (glibc ≤ 2.34)'
+    cmds:
+      - task: build:distro
+        vars: { TARGET: rocky9, GLIBC_CEILING: '2.34' }
+
+  build:ubuntu2404:
+    desc: 'Ubuntu 24.04 build → dist/ubuntu2404/ (glibc ≤ 2.39)'
+    cmds:
+      - task: build:distro
+        vars: { TARGET: ubuntu2404, GLIBC_CEILING: '2.39' }
+
+  build:ubuntu2604:
+    desc: 'Ubuntu 26.04 build → dist/ubuntu2604/ (glibc ceiling probed in-container)'
+    cmds:
+      - task: build:distro
+        # "auto" = the image's own glibc, probed in-container — deliberate
+        # for a young release rather than hardcoding a guess.
+        vars: { TARGET: ubuntu2604, GLIBC_CEILING: 'auto' }
+
+  build:all:
+    desc: All four distro targets (serial — per-target caches, readable logs)
+    cmds:
+      - task: build:rocky8
+      - task: build:rocky9
+      - task: build:ubuntu2404
+      - task: build:ubuntu2604
+
+  build:distro:
+    internal: true
+    label: 'build:{{.TARGET}}'
+    requires:
+      vars: [TARGET, GLIBC_CEILING]
+    preconditions:
+      - sh: 'test -n "{{.CONTAINER_TOOL}}"'
+        msg: 'No container runtime found (docker or podman); install one or set CONTAINER_TOOL.'
+    cmds:
+      - '{{.CONTAINER_TOOL}} build -t squeezefs-build:{{.TARGET}} -f docker/Dockerfile.{{.TARGET}} docker'
+      - mkdir -p dist/{{.TARGET}}
+      # The checkout mounts READ-ONLY at its host absolute path so build.rs
+      # git identity capture works verbatim; a linked worktree additionally
+      # mounts its git common dir (the `.git` file's absolute target).
+      - |
+        set -eu
+        git_mount=""
+        common=$(git rev-parse --path-format=absolute --git-common-dir)
+        case "$common" in
+          "{{.ROOT_DIR}}"/*) ;;
+          *) git_mount="-v $common:$common:ro" ;;
+        esac
+        {{.CONTAINER_TOOL}} run --rm \
+          -v "{{.ROOT_DIR}}:{{.ROOT_DIR}}:ro" \
+          $git_mount \
+          -v "{{.ROOT_DIR}}/dist/{{.TARGET}}:/out" \
+          -v "squeezefs-cargo-registry-{{.TARGET}}:/usr/local/cargo/registry" \
+          -v "squeezefs-target-{{.TARGET}}:/build" \
+          -w "{{.ROOT_DIR}}" \
+          -e GLIBC_CEILING="{{.GLIBC_CEILING}}" \
+          -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+          squeezefs-build:{{.TARGET}} \
+          "{{.ROOT_DIR}}/docker/build-in-container.sh"
+
+  check:
+    desc: The authoritative full cargo gate (AGENTS.md — code-class changes)
+    cmds:
+      - cargo clippy --all-targets --all-features -- -D warnings
+      - cargo fmt --check
+      - cargo test --all-features -- --test-threads=1
+      - cargo doc --no-deps
+      # Criterion smoke — one iteration per bench, no measurement.
+      - cargo bench --benches -- --test
+
+  clean:
+    desc: Remove dist/ (container caches survive; prune the named volumes to drop them)
+    cmds:
+      - rm -rf dist

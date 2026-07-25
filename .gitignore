@@ -1,6 +1,10 @@
 /target/
 **/*.rs.bk
 
+# task build-system output (Taskfile.yml) + local go-task bootstrap
+/dist/
+/bin/
+
 # scratch repro harness (user-local, intentionally untracked)
 tests/ltp_repro.sh
 ltp_syscalls.results

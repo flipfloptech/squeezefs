@@ -1,0 +1,23 @@
+# Rocky Linux 9 (latest 9.x) build image for `task build:rocky9`.
+# glibc ceiling: 2.34 (asserted per artifact by docker/check-artifacts.sh).
+FROM docker.io/rockylinux/rockylinux:9
+
+# Distro build deps: toolchain + pkg-config + FUSE 3 + libclang (bindgen)
+# + binutils (objdump for the glibc-ceiling assertion). Devel packages
+# live in the CRB repo on 9.x (PowerTools' successor).
+RUN dnf -y install dnf-plugins-core \
+ && dnf config-manager --set-enabled crb \
+ && dnf -y install \
+      gcc gcc-c++ make git binutils file \
+      pkgconf-pkg-config fuse3 fuse3-devel \
+      clang clang-devel llvm-devel \
+ && dnf clean all
+
+# rustup: the repo carries no rust-toolchain.toml, so track stable. The
+# cargo registry (/usr/local/cargo/registry) is volume-mounted per target
+# by the Taskfile for incremental rebuilds.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:${PATH}
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain stable

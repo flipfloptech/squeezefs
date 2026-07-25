@@ -1,0 +1,26 @@
+# Rocky Linux 8 (latest 8.x) build image for `task build:rocky8`.
+# glibc ceiling: 2.28 (asserted per artifact by docker/check-artifacts.sh).
+#
+# The org repo docker.io/rockylinux/rockylinux:8 tracks the latest 8.x
+# point release (the legacy official-image `rockylinux:8` froze at 8.9).
+FROM docker.io/rockylinux/rockylinux:8
+
+# Distro build deps: toolchain + pkg-config + FUSE 3 + libclang (bindgen)
+# + binutils (objdump for the glibc-ceiling assertion). fuse3-devel and
+# clang-devel need the PowerTools repo on 8.x.
+RUN dnf -y install dnf-plugins-core \
+ && dnf config-manager --set-enabled powertools \
+ && dnf -y install \
+      gcc gcc-c++ make git binutils file \
+      pkgconf-pkg-config fuse3 fuse3-devel \
+      clang clang-devel llvm-devel \
+ && dnf clean all
+
+# rustup: the repo carries no rust-toolchain.toml, so track stable. The
+# cargo registry (/usr/local/cargo/registry) is volume-mounted per target
+# by the Taskfile for incremental rebuilds.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:${PATH}
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain stable

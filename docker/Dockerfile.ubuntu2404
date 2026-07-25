@@ -1,0 +1,21 @@
+# Ubuntu 24.04 LTS build image for `task build:ubuntu2404`.
+# glibc ceiling: 2.39 (asserted per artifact by docker/check-artifacts.sh).
+FROM docker.io/library/ubuntu:24.04
+
+# Distro build deps: toolchain + pkg-config + FUSE 3 + libclang (bindgen)
+# + binutils (objdump for the glibc-ceiling assertion) + curl/CA for rustup.
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential pkg-config git curl ca-certificates binutils file \
+      fuse3 libfuse3-dev clang libclang-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# rustup: the repo carries no rust-toolchain.toml, so track stable. The
+# cargo registry (/usr/local/cargo/registry) is volume-mounted per target
+# by the Taskfile for incremental rebuilds.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:${PATH}
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain stable

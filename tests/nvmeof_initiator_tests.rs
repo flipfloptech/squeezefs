@@ -88,7 +88,12 @@ fn test_multipath_layout_returns_head_node_never_controller_path_node() {
     // only the HIDDEN per-controller path node nvme0c0n1; the
     // user-visible head node nvme0n1 lives under the subsystem.
     mk_entry(&nvme, "nvme0", &[("subsysnqn", NQN_A)], &["nvme0c0n1"]);
-    mk_entry(&subsys, "nvme-subsys0", &[("subsysnqn", NQN_A)], &["nvme0n1"]);
+    mk_entry(
+        &subsys,
+        "nvme-subsys0",
+        &[("subsysnqn", NQN_A)],
+        &["nvme0n1"],
+    );
 
     let dev = find_device_for_nqn_at(&subsys, &nvme, NQN_A).expect("walk must not error");
     assert_eq!(
@@ -107,7 +112,12 @@ fn test_multipath_mismatched_instance_numbers_follow_the_subsystem() {
     // derives the name from the controller instance fabricates a
     // nonexistent /dev/nvme3n1.
     mk_entry(&nvme, "nvme3", &[("subsysnqn", NQN_A)], &["nvme3c3n1"]);
-    mk_entry(&subsys, "nvme-subsys1", &[("subsysnqn", NQN_A)], &["nvme1n1"]);
+    mk_entry(
+        &subsys,
+        "nvme-subsys1",
+        &[("subsysnqn", NQN_A)],
+        &["nvme1n1"],
+    );
 
     let dev = find_device_for_nqn_at(&subsys, &nvme, NQN_A).expect("walk must not error");
     assert_eq!(
@@ -123,8 +133,18 @@ fn test_multi_subsystem_tree_returns_namespace_of_the_matching_nqn_only() {
     let (subsys, nvme) = roots(&t);
     mk_entry(&nvme, "nvme0", &[("subsysnqn", NQN_A)], &["nvme0c0n1"]);
     mk_entry(&nvme, "nvme1", &[("subsysnqn", NQN_B)], &["nvme1c1n1"]);
-    mk_entry(&subsys, "nvme-subsys0", &[("subsysnqn", NQN_A)], &["nvme0n1"]);
-    mk_entry(&subsys, "nvme-subsys1", &[("subsysnqn", NQN_B)], &["nvme1n1"]);
+    mk_entry(
+        &subsys,
+        "nvme-subsys0",
+        &[("subsysnqn", NQN_A)],
+        &["nvme0n1"],
+    );
+    mk_entry(
+        &subsys,
+        "nvme-subsys1",
+        &[("subsysnqn", NQN_B)],
+        &["nvme1n1"],
+    );
 
     let dev_a = find_device_for_nqn_at(&subsys, &nvme, NQN_A).expect("walk must not error");
     let dev_b = find_device_for_nqn_at(&subsys, &nvme, NQN_B).expect("walk must not error");
@@ -189,15 +209,26 @@ fn test_list_reports_head_node_on_multipath_and_honest_none_when_unresolvable() 
     mk_entry(
         &nvme,
         "nvme0",
-        &[("subsysnqn", NQN_A), ("address", "traddr=10.0.0.1,trsvcid=4420")],
+        &[
+            ("subsysnqn", NQN_A),
+            ("address", "traddr=10.0.0.1,trsvcid=4420"),
+        ],
         &["nvme0c0n1"],
     );
-    mk_entry(&subsys, "nvme-subsys0", &[("subsysnqn", NQN_A)], &["nvme0n1"]);
+    mk_entry(
+        &subsys,
+        "nvme-subsys0",
+        &[("subsysnqn", NQN_A)],
+        &["nvme0n1"],
+    );
     // Controller whose namespace has not materialized anywhere yet.
     mk_entry(
         &nvme,
         "nvme1",
-        &[("subsysnqn", NQN_B), ("address", "traddr=10.0.0.2,trsvcid=4420")],
+        &[
+            ("subsysnqn", NQN_B),
+            ("address", "traddr=10.0.0.2,trsvcid=4420"),
+        ],
         &[],
     );
 
@@ -264,13 +295,19 @@ fn test_disconnect_writes_delete_controller_on_every_matching_controller() {
     );
     assert_eq!(
         std::fs::read_to_string(nvme.join("nvme2/delete_controller")).unwrap(),
-        "",
+        // The fixture seeds attribute files with a trailing newline
+        // (mk_entry) — anything else here means the walk wrote to a
+        // foreign NQN's controller.
+        "\n",
         "a foreign NQN's controller is never touched"
     );
 
     let none = disconnect_controllers_at(&nvme, "nqn.2026-07.io.squeezefs:share-missing")
         .expect("walk must not error");
-    assert!(none.is_empty(), "no matching controller ⇒ empty, caller refuses loud");
+    assert!(
+        none.is_empty(),
+        "no matching controller ⇒ empty, caller refuses loud"
+    );
 }
 
 // ===========================================================================
@@ -283,7 +320,12 @@ fn test_subsysnqn_of_namespace_follows_subsystem_on_mismatched_instances() {
     let t = tempfile::tempdir().unwrap();
     let (subsys, nvme) = roots(&t);
     mk_entry(&nvme, "nvme3", &[("subsysnqn", NQN_A)], &["nvme3c3n1"]);
-    mk_entry(&subsys, "nvme-subsys1", &[("subsysnqn", NQN_A)], &["nvme1n1"]);
+    mk_entry(
+        &subsys,
+        "nvme-subsys1",
+        &[("subsysnqn", NQN_A)],
+        &["nvme1n1"],
+    );
 
     assert_eq!(
         subsysnqn_of_namespace(&subsys, &nvme, "nvme1n1").as_deref(),

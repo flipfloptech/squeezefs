@@ -501,6 +501,36 @@ pub fn validate_backing_device(path: &str) -> Result<()> {
     )))
 }
 
+/// Is this LVM PV path one of ours — a loop device or a
+/// SqueezeFS-served NVMe namespace (its subsystem NQN under the
+/// product domain)?
+///
+/// The NQN lookup rides the strict-shape subsystem-first resolver
+/// (`nvmeof::fabric::subsysnqn_of_namespace`): the pre-fix code
+/// derived the controller name by string surgery on the namespace
+/// basename (`rfind('n')` + `/sys/class/nvme/{ctrl}/subsysnqn`), which
+/// is wrong on CONFIG_NVME_MULTIPATH kernels where the head node's
+/// instance number is the SUBSYSTEM's — `/dev/nvme1n1` may be served
+/// while no controller `nvme1` exists (the 2026-07-25 `nvme0c0n1` bug
+/// class).
+fn pv_is_squeezefs_backed(pv_trim: &str) -> bool {
+    if pv_trim.starts_with("/dev/loop") {
+        return true;
+    }
+    if !pv_trim.starts_with("/dev/nvme") {
+        return false;
+    }
+    let Some(dev_name) = pv_trim.rsplit('/').next() else {
+        return false;
+    };
+    crate::nvmeof::fabric::subsysnqn_of_namespace(
+        std::path::Path::new(crate::nvmeof::fabric::SYSFS_NVME_SUBSYSTEM),
+        std::path::Path::new(crate::nvmeof::fabric::SYSFS_NVME),
+        dev_name,
+    )
+    .is_some_and(|nqn| nqn.starts_with("nqn.2026-06.io.squeezefs:"))
+}
+
 pub fn pool_list() -> Result<()> {
     let output = Command::new("vgs")
         .args(["-o", "vg_name", "--noheadings"])
@@ -537,35 +567,7 @@ pub fn pool_list() -> Result<()> {
                         let pv_trim = pv.trim();
                         if !pv_trim.is_empty() {
                             count += 1;
-                            let ok = pv_trim.starts_with("/dev/loop") || {
-                                if pv_trim.starts_with("/dev/nvme") {
-                                    let parts: Vec<&str> = pv_trim.split('/').collect();
-                                    if let Some(dev_name) = parts.last() {
-                                        if dev_name.starts_with("nvme") {
-                                            if let Some(end_idx) = dev_name.rfind('n') {
-                                                let ctrl = &dev_name[..end_idx];
-                                                let nqn_path =
-                                                    format!("/sys/class/nvme/{}/subsysnqn", ctrl);
-                                                if let Ok(nqn) = std::fs::read_to_string(nqn_path) {
-                                                    nqn.trim()
-                                                        .starts_with("nqn.2026-06.io.squeezefs:")
-                                                } else {
-                                                    false
-                                                }
-                                            } else {
-                                                false
-                                            }
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                }
-                            };
-                            if !ok {
+                            if !pv_is_squeezefs_backed(pv_trim) {
                                 is_ours = false;
                                 break;
                             }
@@ -642,35 +644,7 @@ pub fn volume_list() -> Result<()> {
                         let pv_trim = pv.trim();
                         if !pv_trim.is_empty() {
                             count += 1;
-                            let ok = pv_trim.starts_with("/dev/loop") || {
-                                if pv_trim.starts_with("/dev/nvme") {
-                                    let parts: Vec<&str> = pv_trim.split('/').collect();
-                                    if let Some(dev_name) = parts.last() {
-                                        if dev_name.starts_with("nvme") {
-                                            if let Some(end_idx) = dev_name.rfind('n') {
-                                                let ctrl = &dev_name[..end_idx];
-                                                let nqn_path =
-                                                    format!("/sys/class/nvme/{}/subsysnqn", ctrl);
-                                                if let Ok(nqn) = std::fs::read_to_string(nqn_path) {
-                                                    nqn.trim()
-                                                        .starts_with("nqn.2026-06.io.squeezefs:")
-                                                } else {
-                                                    false
-                                                }
-                                            } else {
-                                                false
-                                            }
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                }
-                            };
-                            if !ok {
+                            if !pv_is_squeezefs_backed(pv_trim) {
                                 is_ours = false;
                                 break;
                             }

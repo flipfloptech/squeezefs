@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
 
-use super::fabric::SYSFS_NVME;
+use super::fabric::{split_nvme_namespace, SYSFS_NVME, SYSFS_NVME_SUBSYSTEM};
 use super::{check_root, execute_cmd};
 
 fn get_host_id() -> String {
@@ -63,44 +63,98 @@ fn get_host_nqn() -> String {
     new_nqn
 }
 
-fn find_device_for_nqn(subnqn: &str) -> std::io::Result<Option<String>> {
-    let nvme_path = PathBuf::from(SYSFS_NVME);
-    if !nvme_path.exists() {
-        return Ok(None);
+/// Sorted child directories of a sysfs class root. An absent root is an
+/// empty walk (sysfs classes appear with their first member — no
+/// `nvme-subsystem` class on non-multipath kernels, no `nvme` class
+/// before the first controller attaches).
+fn sorted_child_dirs(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
     }
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(nvme_path)? {
-        entries.push(entry?);
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            dirs.push(path);
+        }
     }
-    entries.sort_by_key(|e| e.file_name());
+    dirs.sort();
+    Ok(dirs)
+}
 
-    for entry in entries {
-        let path = entry.path();
-        let dev_name = entry.file_name().to_string_lossy().to_string();
-        if dev_name.starts_with("nvme") {
-            let nqn_file = path.join("subsysnqn");
-            if nqn_file.exists() {
-                let current_nqn = fs::read_to_string(nqn_file)?.trim().to_string();
-                if current_nqn == subnqn {
-                    // Check if namespace block device dir exists (e.g. nvme0n1)
-                    let mut sub_entries = Vec::new();
-                    for sub_entry in fs::read_dir(&path)? {
-                        sub_entries.push(sub_entry?);
-                    }
-                    sub_entries.sort_by_key(|e| e.file_name());
+/// Does `dir` carry attribute file `attr` with (trimmed) content
+/// `want`? A missing file is a mismatch, never an error (sysfs entries
+/// can vanish mid-walk while a controller tears down).
+fn attr_matches(dir: &Path, attr: &str, want: &str) -> std::io::Result<bool> {
+    let file = dir.join(attr);
+    if !file.exists() {
+        return Ok(false);
+    }
+    Ok(fs::read_to_string(file)?.trim() == want)
+}
 
-                    for sub_entry in sub_entries {
-                        let sub_name = sub_entry.file_name().to_string_lossy().to_string();
-                        if sub_name.starts_with(&dev_name) && sub_name.contains('n') {
-                            return Ok(Some(format!("/dev/{}", sub_name)));
-                        }
-                    }
-                    return Ok(Some(format!("/dev/{}n1", dev_name)));
-                }
+/// First child of `dir` whose name is a namespace BLOCK device —
+/// strictly `^nvme\d+n\d+$` (`split_nvme_namespace`), sorted. The
+/// strictness is load-bearing: on CONFIG_NVME_MULTIPATH kernels the
+/// controller dir carries hidden per-controller path nodes
+/// `nvme<X>c<C>n<Y>` which are NOT user-visible block devices — the
+/// pre-fix `starts_with(dev) && contains('n')` predicate matched them
+/// (the 2026-07-25 `/dev/nvme0c0n1` bring-up bug).
+fn first_namespace_block_child(dir: &Path) -> std::io::Result<Option<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if entry.path().is_dir() && split_nvme_namespace(&name).is_some() {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names.into_iter().next())
+}
+
+/// Resolve the user-visible namespace block device serving `subnqn`
+/// from explicit sysfs roots (§6.8 injection seam — production wraps
+/// this with the real `SYSFS_NVME_SUBSYSTEM` / `SYSFS_NVME` roots).
+///
+/// Discovery order: prefer the SUBSYSTEM class
+/// (`/sys/class/nvme-subsystem/*/subsysnqn` → its strict-shape
+/// `nvme<X>n<Y>` child — on multipath kernels the head node lives
+/// there and its instance number is the subsystem's, not necessarily
+/// any controller's), then fall back to the controller class
+/// (non-multipath kernels: the plain namespace is a controller child)
+/// under the same strict shape rule. Unresolvable is an honest `None`
+/// — device names are never fabricated by string concatenation (the
+/// pre-fix `format!("/dev/{}n1", ctrl)` fallback could mint a
+/// nonexistent node).
+pub fn find_device_for_nqn_at(
+    subsystem_root: &Path,
+    nvme_root: &Path,
+    subnqn: &str,
+) -> std::io::Result<Option<String>> {
+    for dir in sorted_child_dirs(subsystem_root)? {
+        if attr_matches(&dir, "subsysnqn", subnqn)? {
+            if let Some(name) = first_namespace_block_child(&dir)? {
+                return Ok(Some(format!("/dev/{}", name)));
+            }
+        }
+    }
+    for dir in sorted_child_dirs(nvme_root)? {
+        if attr_matches(&dir, "subsysnqn", subnqn)? {
+            if let Some(name) = first_namespace_block_child(&dir)? {
+                return Ok(Some(format!("/dev/{}", name)));
             }
         }
     }
     Ok(None)
+}
+
+fn find_device_for_nqn(subnqn: &str) -> std::io::Result<Option<String>> {
+    find_device_for_nqn_at(
+        Path::new(SYSFS_NVME_SUBSYSTEM),
+        Path::new(SYSFS_NVME),
+        subnqn,
+    )
 }
 
 fn connect_target_single(
@@ -181,6 +235,29 @@ pub fn connect_target(ip: &str, port: u16, subnqn: &str) -> std::io::Result<Stri
     Ok("Connection requested. Check 'squeezefs nvmeof list' for device mapping.".to_string())
 }
 
+/// Write the delete request to EVERY controller under `nvme_root`
+/// serving `subnqn` and return the controller names written, sorted
+/// (§6.8 injection seam). Multipath kernels attach several path
+/// controllers per subsystem — all of them are the connection, so all
+/// of them get the delete.
+pub fn disconnect_controllers_at(nvme_root: &Path, subnqn: &str) -> std::io::Result<Vec<String>> {
+    let mut deleted = Vec::new();
+    for dir in sorted_child_dirs(nvme_root)? {
+        if !attr_matches(&dir, "subsysnqn", subnqn)? {
+            continue;
+        }
+        // Trigger disconnect by writing to delete_controller.
+        let del_file = dir.join("delete_controller");
+        if del_file.exists() {
+            fs::write(del_file, "1")?;
+            if let Some(name) = dir.file_name() {
+                deleted.push(name.to_string_lossy().to_string());
+            }
+        }
+    }
+    Ok(deleted)
+}
+
 pub fn disconnect_target(subnqn: &str) -> std::io::Result<()> {
     check_root()?;
     let nvme_path = Path::new(SYSFS_NVME);
@@ -191,40 +268,15 @@ pub fn disconnect_target(subnqn: &str) -> std::io::Result<()> {
         ));
     }
 
-    let mut found = false;
-    for entry in fs::read_dir(nvme_path)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .starts_with("nvme")
-        {
-            let nqn_file = path.join("subsysnqn");
-            if nqn_file.exists() {
-                let current_nqn = fs::read_to_string(nqn_file)?.trim().to_string();
-                if current_nqn == subnqn {
-                    // Trigger disconnect by writing to delete_controller
-                    let del_file = path.join("delete_controller");
-                    if del_file.exists() {
-                        fs::write(del_file, "1")?;
-                        found = true;
-                        println!(
-                            "Sent delete request to controller '{}'.",
-                            path.file_name().unwrap().to_string_lossy()
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    if !found {
+    let deleted = disconnect_controllers_at(nvme_path, subnqn)?;
+    if deleted.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("No connected controller found for NQN '{}'.", subnqn),
         ));
+    }
+    for name in &deleted {
+        println!("Sent delete request to controller '{}'.", name);
     }
 
     Ok(())
@@ -233,38 +285,53 @@ pub fn disconnect_target(subnqn: &str) -> std::io::Result<()> {
 /// One connected remote fabric controller, as `list` reports it.
 #[derive(Debug, Clone)]
 pub struct FabricDisk {
-    pub device: String,
+    /// The resolved user-visible namespace block device
+    /// (`/dev/nvme<X>n<Y>` — the multipath head node where one
+    /// exists); `None` when no strict-shape namespace has materialized
+    /// yet (the pre-fix code fabricated `/dev/{ctrl}n1` here — a name
+    /// that need not exist).
+    pub device: Option<String>,
     pub subnqn: String,
     pub address: String,
 }
 
-/// The connected-fabric-disks half of `list` (kept initiator listing).
-pub(crate) fn connected_fabric_disks() -> std::io::Result<Vec<FabricDisk>> {
-    let nvme_path = Path::new(SYSFS_NVME);
+/// The connected-fabric-disks walk behind `list`, on explicit sysfs
+/// roots (§6.8 injection seam): one row per controller carrying a
+/// `subsysnqn`, sorted, with the device resolved through the same
+/// subsystem-first strict-shape discovery as connect.
+pub fn connected_fabric_disks_at(
+    subsystem_root: &Path,
+    nvme_root: &Path,
+) -> std::io::Result<Vec<FabricDisk>> {
     let mut out = Vec::new();
-    if nvme_path.exists() {
-        for entry in fs::read_dir(nvme_path)? {
-            let entry = entry?;
-            let path = entry.path();
-            let dev_name = entry.file_name().to_string_lossy().to_string();
-            if dev_name.starts_with("nvme") {
-                let subs_nqn_file = path.join("subsysnqn");
-                let address_file = path.join("address");
-                if subs_nqn_file.exists() {
-                    let nqn = fs::read_to_string(subs_nqn_file)?.trim().to_string();
-                    let addr = if address_file.exists() {
-                        fs::read_to_string(address_file)?.trim().to_string()
-                    } else {
-                        "unknown".to_string()
-                    };
-                    out.push(FabricDisk {
-                        device: format!("/dev/{}n1", dev_name),
-                        subnqn: nqn,
-                        address: addr,
-                    });
-                }
-            }
+    for dir in sorted_child_dirs(nvme_root)? {
+        let Some(dev_name) = dir.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if !dev_name.starts_with("nvme") {
+            continue;
         }
+        let subs_nqn_file = dir.join("subsysnqn");
+        if !subs_nqn_file.exists() {
+            continue;
+        }
+        let nqn = fs::read_to_string(subs_nqn_file)?.trim().to_string();
+        let address_file = dir.join("address");
+        let addr = if address_file.exists() {
+            fs::read_to_string(address_file)?.trim().to_string()
+        } else {
+            "unknown".to_string()
+        };
+        out.push(FabricDisk {
+            device: find_device_for_nqn_at(subsystem_root, nvme_root, &nqn)?,
+            subnqn: nqn,
+            address: addr,
+        });
     }
     Ok(out)
+}
+
+/// The connected-fabric-disks half of `list` (kept initiator listing).
+pub(crate) fn connected_fabric_disks() -> std::io::Result<Vec<FabricDisk>> {
+    connected_fabric_disks_at(Path::new(SYSFS_NVME_SUBSYSTEM), Path::new(SYSFS_NVME))
 }

@@ -1816,7 +1816,12 @@ pub fn list(json: bool) -> Result<(), NvmeofError> {
         println!("  No connected remote NVMe-oF fabric disks.");
     }
     for d in &connected {
-        println!("  Device:  {}", d.device);
+        println!(
+            "  Device:  {}",
+            d.device
+                .as_deref()
+                .unwrap_or("(no namespace block device visible yet)")
+        );
         println!("  NQN:     {}", d.subnqn);
         println!("  Target:  {}", d.address);
         println!();

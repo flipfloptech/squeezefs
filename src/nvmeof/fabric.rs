@@ -24,6 +24,15 @@ use std::path::Path;
 /// root).
 pub const SYSFS_NVME: &str = "/sys/class/nvme";
 
+/// The subsystem class root (`nvme-subsys<N>` children). On
+/// CONFIG_NVME_MULTIPATH kernels the user-visible namespace head nodes
+/// (`nvme<X>n<Y>`, where `X` is the SUBSYSTEM instance — not
+/// necessarily any controller's) live HERE, while the controller class
+/// carries only the hidden per-controller path nodes `nvme<X>c<C>n<Y>`.
+/// Device discovery prefers this root (the 2026-07-25 bring-up bug:
+/// a controller-class-only walk reported `/dev/nvme0c0n1`).
+pub const SYSFS_NVME_SUBSYSTEM: &str = "/sys/class/nvme-subsystem";
+
 /// Identity of a fabric controller that is STABLE across kernel
 /// controller renumbering: `nvme3` can give up (`ctrl_loss_tmo`), get
 /// deleted, and reappear as `nvme7` on reconnect — but it still serves
@@ -140,7 +149,12 @@ impl FabricController {
 }
 
 /// Parse `nvme<X>n<Y>` → `(X, Y)`; anything else → `None`.
-fn split_nvme_namespace(name: &str) -> Option<(u64, u64)> {
+///
+/// This IS the strict namespace-block-device shape rule
+/// (`^nvme\d+n\d+$` exactly): multipath path nodes (`nvme0c0n1`),
+/// partitions (`nvme0n1p2`), and controller names (`nvme0`) all parse
+/// to `None` — only user-visible namespace head/plain nodes pass.
+pub(crate) fn split_nvme_namespace(name: &str) -> Option<(u64, u64)> {
     let rest = name.strip_prefix("nvme")?;
     let n_pos = rest.find('n')?;
     let ctrl: u64 = rest[..n_pos].parse().ok()?;
@@ -325,6 +339,40 @@ impl FabricStatsSampler {
             reconnects_observed: reconnects,
         }
     }
+}
+
+/// Resolve the subsystem NQN serving the namespace block device
+/// `dev_base` (a `/dev` basename; partition suffixes normalize first —
+/// LVM PVs are often partitions). The strict `^nvme\d+n\d+$` shape rule
+/// applies: a `c`-infixed controller-path name is not a user-visible
+/// block device and yields `None`.
+///
+/// Resolution order mirrors device discovery (`initiator.rs`):
+/// subsystem class first (multipath — the head node's instance number
+/// is the SUBSYSTEM's, so `/sys/class/nvme/nvme<X>` may not exist at
+/// all), then the controller class for non-multipath kernels (there
+/// instance == controller number). Purely informational
+/// classification — absent/unreadable sysfs yields `None`, never an
+/// error.
+pub fn subsysnqn_of_namespace(
+    subsystem_root: &Path,
+    nvme_root: &Path,
+    dev_base: &str,
+) -> Option<String> {
+    let base = normalize_nvme_base(dev_base);
+    let (instance, _nsid) = split_nvme_namespace(&base)?;
+    if let Ok(entries) = fs::read_dir(subsystem_root) {
+        let mut dirs: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        dirs.sort();
+        for dir in dirs {
+            if dir.join(&base).is_dir() {
+                if let Some(nqn) = read_attr(&dir, "subsysnqn") {
+                    return Some(nqn);
+                }
+            }
+        }
+    }
+    read_attr(&nvme_root.join(format!("nvme{instance}")), "subsysnqn")
 }
 
 /// Resolve raw device paths (as recorded in the format config / passed

@@ -393,8 +393,20 @@ done
 # and the fd stays unbound. libaio through the shim must then be
 # PERFECTLY passthrough: full lifecycle green, zero ipc data ops.
 if [ "$AIO_SKIP" -eq 0 ]; then
-    umount "$MOUNT_DIR" 2>/dev/null || umount -l "$MOUNT_DIR" 2>/dev/null || true
+    # Free the kill-soak ballast (the 1G backend is near-full) and let
+    # the drained daemon release the D0 writer claim before remounting.
+    rm -f "$MOUNT_DIR"/kill*.bin "$MOUNT_DIR"/dd.bin "$MOUNT_DIR"/elb* 2>/dev/null || true
     sleep 1
+    umount "$MOUNT_DIR" 2>/dev/null || umount -l "$MOUNT_DIR" 2>/dev/null || true
+    deadline=$((SECONDS + 20))
+    while pgrep -x squeezefs >/dev/null 2>&1; do
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            killall -9 squeezefs 2>/dev/null || true # D0 flock reclaim is instant
+            sleep 1
+            break
+        fi
+        sleep 0.5
+    done
     RUST_LOG=info "$SQUEEZEFS_BIN" mount \
         sqmeta:///dev/shm/squeezefs_il_meta \
         "$MOUNT_DIR" \

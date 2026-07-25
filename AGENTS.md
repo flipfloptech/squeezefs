@@ -460,6 +460,8 @@ System deps (Ubuntu/Debian): `build-essential pkg-config libfuse3-dev fuse3 clan
 cargo build --release
 ```
 
+**go-task is the packaged build path** (user directive 2026-07-25; `Taskfile.yml` + `docker/` — README §Building has the full workflow): `task build` = host dev build, `task build:{rocky8,rocky9,ubuntu2404,ubuntu2604}` / `task build:all` = containerized distro builds, each landing `dist/<target>/{squeezefs, libsqueezefs_il.so}` under default names (the folder is the same-commit daemon+shim pairing unit — KD-7). In-container assertions: `--version` never `unknown`, per-distro glibc ceilings. `task check` runs the authoritative full cargo gate. Plain `cargo build` remains valid for dev work.
+
 ### Optional Cargo features (off by default)
 - `gds` — GPU Direct Storage RDMA path (pulls `libloading`).
 - `dhat-on` — heap profiling (`dhat`); a static `dhat::Alloc` replaces the global allocator in `src/main.rs`.

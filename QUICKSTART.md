@@ -26,6 +26,18 @@ Clone and compile the repository with release optimizations:
 cargo build --release
 ```
 
+The packaged path is [go-task](https://taskfile.dev) (`Taskfile.yml` — plain cargo stays valid for dev). Bootstrap it without root if absent (installs into `./bin`, never sudo system-wide; some distros name the binary `go-task`):
+```bash
+command -v task go-task >/dev/null || \
+  sh -c "$(curl -fsSL https://taskfile.dev/install.sh)" -- -d -b ./bin
+export PATH="$PWD/bin:$PATH"
+
+task build              # host dev build → dist/host/{squeezefs, libsqueezefs_il.so}
+task build:rocky8       # distro container builds (needs docker or podman):
+task build:all          #   rocky8 / rocky9 / ubuntu2404 / ubuntu2604 → dist/<target>/
+```
+Artifacts keep their default names — the `dist/<target>/` folder disambiguates. Each folder pairs the daemon and the interception shim **from the same commit**; deploy a folder as a unit (interception sessions refuse mixed-commit daemon/shim pairs — see [README §Building](README.md#building)).
+
 ### Step 2: Prepare Sandbox Backing Files
 The whole sandbox runs **unprivileged** — FUSE mounts need no root, and keeping everything under your own `$HOME` avoids the modern-kernel `fs.protected_regular` trap (root cannot open another user's files in sticky `/tmp`, so a `sudo mount` over user-created `/tmp` volumes fails with `Permission denied`).
 
@@ -390,6 +402,9 @@ cargo build --release
 cargo build -p squeezefs-preload --profile preload-release --features interposers
 # the shim: target/preload-release/libsqueezefs_il.so
 ```
+
+(`task build` does both and drops the same-commit pair side by side in
+`dist/host/` — the folder is the pairing unit.)
 
 A plain `--release` build of the shim refuses at compile time (the root
 profile's `panic="abort"` would abort host apps) — `--profile

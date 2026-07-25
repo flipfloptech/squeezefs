@@ -70,9 +70,31 @@ cargo build --release
 
 Optional Cargo features (off by default): `gds` (GPU Direct Storage path), `dhat-on` (heap profiling), `coz-on` (causal profiling). Release builds keep debug symbols for profiling.
 
+### Packaged builds with go-task
+
+The packaged build path is [go-task](https://taskfile.dev) (`Taskfile.yml`); plain `cargo build` remains valid for dev work. Bootstrap go-task without root — install into `./bin` locally if it is absent (never sudo system-wide; some distros ship the binary as `go-task`, both spellings work):
+
+```bash
+command -v task go-task >/dev/null || \
+  sh -c "$(curl -fsSL https://taskfile.dev/install.sh)" -- -d -b ./bin
+export PATH="$PWD/bin:$PATH"
+```
+
+| Task | Result |
+|---|---|
+| `task build` (default) | Host dev build → `dist/host/` (daemon + interception shim) |
+| `task build:rocky8` / `build:rocky9` / `build:ubuntu2404` / `build:ubuntu2604` | Distro-targeted container build → `dist/<target>/` |
+| `task build:all` | All four distro targets |
+| `task check` | The authoritative full cargo gate (clippy `-D warnings`, fmt, tests, doc, bench smoke) |
+| `task clean` | Remove `dist/` |
+
+Every `dist/<target>/` holds `squeezefs` and `libsqueezefs_il.so` **side by side under their default names** — the folder disambiguates, never a filename suffix. The pair in one folder is built from the **same commit**, and that pairing is load-bearing: interception sessions refuse a daemon/shim build-commit mismatch (KD-7), so deploy a dist folder as a unit and never mix artifacts across folders or builds.
+
+Distro builds need docker or podman (docker preferred; `CONTAINER_TOOL=podman task build:rocky8` overrides). They mount the checkout read-only so the git commit identity embeds, cache the cargo registry/target in per-target named volumes for incremental rebuilds, and assert per artifact — inside the container — that `--version` carries the real commit (never `unknown`) and that the maximum referenced `GLIBC_` symbol version stays within the distro's ceiling (Rocky 8 = 2.28, Rocky 9 = 2.34, Ubuntu 24.04 = 2.39, Ubuntu 26.04 probed in-image).
+
 Builds carry two identities: the release-train version (currently the 1.1 train, bumped as a release act) and the git commit they were built from; releases are `stable-*`/`lts-*` git tags on specific commits. Check a build with `squeezefs --version` (both identities on one line; also the `.stats` `build_commit` field on a mounted daemon); policy details in [docs/operations.md §Versioning & releases](docs/operations.md#versioning--releases).
 
-To verify a build, run the standard gate — clippy (`-D warnings`), `cargo fmt --check`, `cargo test --all-features -- --test-threads=1`, `cargo doc --no-deps`, and the criterion bench smoke. Root-only external suites (pjdfstest, LTP, fstests, elbencho, the NVMe-oF fidelity tier) live under `tests/` and are tiered in [AGENTS.md](AGENTS.md).
+To verify a build, run the standard gate — `task check`: clippy (`-D warnings`), `cargo fmt --check`, `cargo test --all-features -- --test-threads=1`, `cargo doc --no-deps`, and the criterion bench smoke. Root-only external suites (pjdfstest, LTP, fstests, elbencho, the NVMe-oF fidelity tier) live under `tests/` and are tiered in [AGENTS.md](AGENTS.md).
 
 ## Quick example
 

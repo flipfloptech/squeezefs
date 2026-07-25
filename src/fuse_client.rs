@@ -5833,8 +5833,7 @@ impl SqueezefsFilesystem {
             // the ESCALATED absorbed state and let the ordinary checkout
             // merge this write (write-through machinery included).
             overlay.escalate_to_full();
-            self.active_block_buffers
-                .insert(cache_key.to_string(), overlay);
+            self.park_overlay_entry(cache_key.to_string(), overlay);
             let nvme = self.router.cache.nvme.clone();
             let ek = ext_key.clone();
             tokio::task::spawn_blocking(move || nvme.remove_active_block(&ek))
@@ -5849,8 +5848,7 @@ impl SqueezefsFilesystem {
         let bytes = overlay.extent_payload_bytes();
         // Park FIRST (overlay visible), then retire the absorbed record —
         // at every instant at least one copy serves reads.
-        self.active_block_buffers
-            .insert(cache_key.to_string(), overlay);
+        self.park_overlay_entry(cache_key.to_string(), overlay);
         if absorbed_record {
             let nvme = self.router.cache.nvme.clone();
             let ek = ext_key.clone();
@@ -6098,7 +6096,7 @@ impl SqueezefsFilesystem {
                             .fetch_add(1, Ordering::Relaxed);
                         crate::cache::active_block::ActiveBlockBuf::deferred(block_size as usize)
                     };
-                    self.active_block_buffers.insert(cache_key.clone(), seed);
+                    self.park_overlay_entry(cache_key.clone(), seed);
                 }
                 write_phase_record(WritePhase::Checkout, wp_checkout);
 
@@ -6904,11 +6902,42 @@ impl SqueezefsFilesystem {
         )
     }
 
+    /// Publish a parked overlay into `active_block_buffers` — the mandated
+    /// single insert path (mirror of [`Self::retire_parked_overlay`]): the
+    /// O(1) gate increments BEFORE the map publish, so a reader observing
+    /// `0` holds a proof no overlay exists (a transient over-count is
+    /// conservative — the reader pays an ordinary probe). Replacements
+    /// re-balance the count. A raw `.insert()` on the map is a protocol
+    /// violation — readers gated on `0` would skip acked bytes.
+    fn park_overlay_entry(
+        &self,
+        key: String,
+        buf: crate::cache::active_block::ActiveBlockBuf,
+    ) -> Option<crate::cache::active_block::ActiveBlockBuf> {
+        self.parked_overlay_count
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        let replaced = self.active_block_buffers.insert(key, buf);
+        if replaced.is_some() {
+            self.parked_overlay_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
+        replaced
+    }
+
     /// Capture the RAM-overlay byte runs intersecting `[offset, offset+len)`
-    /// as absolute-offset runs. Zero-cost when no overlay exists (one map
-    /// probe per covered block); runs are copied out under short map guards.
+    /// as absolute-offset runs. Zero-cost when no overlay exists — one
+    /// lock-free O(1) gate load, NEVER `DashMap::is_empty()`/`len()` (an
+    /// every-shard rwlock scan: 45 % + 12 % of daemon CPU at 4k-randread
+    /// saturation, `.benchmarks/2026-07-25-odirect-randread-concurrency.md`);
+    /// with overlays live, one map probe per covered block, runs copied out
+    /// under short map guards.
     fn capture_parked_runs(&self, ino: u64, offset: u64, len: usize) -> Vec<(u64, Vec<u8>)> {
-        if len == 0 || self.active_block_buffers.is_empty() {
+        if len == 0
+            || self
+                .parked_overlay_count
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+        {
             return Vec::new();
         }
         let block_size = self.router.block_size.load(Ordering::Relaxed);
@@ -6981,6 +7010,10 @@ impl SqueezefsFilesystem {
     ) -> Option<(String, crate::cache::active_block::ActiveBlockBuf)> {
         let removed = self.active_block_buffers.remove(key);
         if removed.is_some() {
+            // Gate decrement strictly AFTER the map removal: `0` must
+            // always prove the map empty (see `park_overlay_entry`).
+            self.parked_overlay_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
             if let Some((ino, b)) = Self::parse_active_block_key(key) {
                 bump_block_custody_epoch(ino, b);
             }

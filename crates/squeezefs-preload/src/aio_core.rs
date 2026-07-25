@@ -49,9 +49,10 @@ pub enum SubmitOutcome {
 /// The ring side of one aio context, as the core sees it.
 pub trait RingLane {
     /// Fire-and-forget submit of one ring-eligible iocb. `None` = no
-    /// slot / not currently servable — the op (and the batch prefix)
-    /// ends here; the caller may pass the iocb through instead on the
-    /// NEXT submit (the binding stays).
+    /// slot / not currently servable — the core reroutes the iocb to the
+    /// kernel lane at its batch position (never -EAGAIN, never a
+    /// truncated prefix: the real call on the bound fd is always correct,
+    /// §5.4.2; the binding stays for the next submit).
     fn try_submit(&mut self, iocb_id: u64) -> Option<RingToken>;
     /// Non-blocking completion probe; `Some(res)` consumes the token.
     fn poll(&mut self, tok: RingToken) -> Option<i64>;
@@ -210,13 +211,18 @@ impl AioCtxState {
                             accepted += 1;
                         }
                         None => {
-                            // No slot: the prefix ends here (client-visible
-                            // backpressure, §5.5.1 — EAGAIN if first).
-                            return if accepted == 0 {
-                                SubmitOutcome::Errno(libc::EAGAIN)
-                            } else {
-                                SubmitOutcome::Submitted(accepted)
-                            };
+                            // No slot (or poisoned session): reroute to
+                            // the KERNEL lane at this batch position —
+                            // the iocb is a bound-fd pread/pwrite whose
+                            // real call is always correct (§5.4.2
+                            // fallback-is-correctness), so session slot
+                            // exhaustion must never surface as -EAGAIN
+                            // or a truncated prefix (2026-07-25
+                            // ipc-miss-path design-board item). Order is
+                            // preserved: the op joins the open kernel
+                            // run, which any later ring op flushes
+                            // before itself dispatching.
+                            run.push(*id);
                         }
                     }
                 }

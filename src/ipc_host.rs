@@ -163,12 +163,21 @@ pub trait AdminSink: Send + Sync + 'static {
     fn handle(&self, verb: &str, arg: &str) -> (bool, String);
 }
 
-/// Per-op rights derived from the screened fd's access mode (§5.2 rule 3).
+/// Per-op rights derived from the screened fd's access mode (§5.2 rule 3),
+/// plus the description's **read class** (2026-07-25 ipc-miss-path fix):
+/// the kernel path hands the routing layer the description's O_DIRECT bit
+/// on every READ (`fuse_read_in.flags` → `ReadClassHint`); ring ops must
+/// carry the same class or an O_DIRECT app under the shim silently
+/// reclassifies to buffered admission behavior.
 #[derive(Debug, Clone, Copy)]
 pub struct BindingRights {
     pub ino: u64,
     pub read_ok: bool,
     pub write_ok: bool,
+    /// The screened description carried O_DIRECT at bind time. (An
+    /// F_SETFL toggling O_DIRECT later unbinds shim-side — the class is
+    /// per-description and captured once, like the rights.)
+    pub odirect: bool,
 }
 
 /// A validated data-plane op (direction-checked, bounds-checked) handed to
@@ -938,12 +947,13 @@ impl IpcHost {
             match recv_ctl(&sock) {
                 Ok((CtlMsg::Bind, Some(fd))) => {
                     let reply = match self.screen_fd(fd.as_raw_fd()) {
-                        Ok((rights_ino, read_ok, write_ok)) => {
+                        Ok((rights_ino, read_ok, write_ok, odirect)) => {
                             let binding_id = self.next_binding_id.fetch_add(1, Ordering::Relaxed);
                             let rights = BindingRights {
                                 ino: rights_ino,
                                 read_ok,
                                 write_ok,
+                                odirect,
                             };
                             let _ = session.bindings.insert_sync(binding_id, rights);
                             METRICS.ipc_binds.fetch_add(1, Ordering::Relaxed);
@@ -1266,8 +1276,8 @@ impl IpcHost {
     }
 
     /// The normative §5.2 daemon fd screen (module docs). Returns
-    /// `(st_ino, read_ok, write_ok)` for accepted fds.
-    fn screen_fd(&self, fd: RawFd) -> Result<(u64, bool, bool), RefuseClass> {
+    /// `(st_ino, read_ok, write_ok, odirect)` for accepted fds.
+    fn screen_fd(&self, fd: RawFd) -> Result<(u64, bool, bool, bool), RefuseClass> {
         // SAFETY: F_GETFL on a received (owned) fd.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 {
@@ -1315,7 +1325,11 @@ impl IpcHost {
             libc::O_RDWR => (true, true),
             _ => return Err(RefuseClass::Flags),
         };
-        Ok((st.st_ino, read_ok, write_ok))
+        // Read class (BindingRights doc): the description's O_DIRECT bit,
+        // carried into every ring op exactly as the kernel path carries
+        // `fuse_read_in.flags`.
+        let odirect = flags & libc::O_DIRECT != 0;
+        Ok((st.st_ino, read_ok, write_ok, odirect))
     }
 
     // ---------------------------------------------------------------
@@ -1414,15 +1428,40 @@ impl IpcHost {
                 continue;
             }
             // Park (bounded — §5.3.1 rule 5): set every owned session's
-            // parked flag, re-scan (the disarm→scan law: a submission
-            // published before the flag was visible is found by this
-            // scan; one published after sees the flag and wakes), then
-            // FUTEX_WAIT on the FIRST owned session's doorbell with a
-            // hard timeout. Wakes on other sessions' doorbells are
-            // absorbed by the timeout — bounded latency, never stranding.
+            // parked flag, SNAPSHOT every doorbell, re-scan (the
+            // disarm→scan law: a submission published before the flag was
+            // visible is found by this scan; one published after sees the
+            // flag and wakes), then wait on ALL owned doorbells against
+            // the pre-rescan snapshots.
+            //
+            // Two lost-wake classes closed here (2026-07-25 ipc-miss-path
+            // fix; each was a measured 5 ms-bound latency term on the
+            // miss-dominated shape):
+            // 1. **Snapshot BEFORE rescan** (order is load-bearing —
+            //    `ipc_park_snapshot_before_rescan_never_strands` in
+            //    loom-models): snapshotting after the rescan folds a
+            //    submission that raced the rescan's tail INTO the wait's
+            //    expected value, so the wait admits and sleeps its full
+            //    bound with a servable op published (13 % of parks were
+            //    expiring by timeout under load). With the snapshot
+            //    first, any doorbell bump after it fails the wait's
+            //    admission (or the rescan already served it — one
+            //    spurious re-loop, never a strand).
+            // 2. **Wait on ALL owned doorbells** (`futex_waitv(2)`): the
+            //    former single-doorbell wait deafened the thread to every
+            //    other owned session's wake — with sessions > service
+            //    threads, non-first sessions ate the full 5 ms bound on
+            //    EVERY submission burst (the measured sessions=8 <
+            //    sessions=4 inversion). Kernels without futex_waitv fall
+            //    back to the first-session wait; the 5 ms bound still
+            //    caps the damage (§5.3.1 rule 5 semantics unchanged).
             for s in &sessions {
                 s.map.header().daemon_parked.store(1, Ordering::SeqCst);
             }
+            let observed: Vec<u32> = sessions
+                .iter()
+                .map(|s| s.map.header().doorbell.load(Ordering::SeqCst))
+                .collect();
             let mut rescan_served = 0u32;
             let now = self.now_ms();
             for s in &sessions {
@@ -1436,12 +1475,15 @@ impl IpcHost {
                 }
             }
             if rescan_served == 0 {
-                if let Some(first) = sessions.first() {
-                    let doorbell = &first.map.header().doorbell;
-                    let observed = doorbell.load(Ordering::SeqCst);
-                    futex_wait(doorbell, observed, SERVICE_PARK_MAX);
-                } else {
+                if sessions.is_empty() {
                     std::thread::park_timeout(SERVICE_PARK_MAX);
+                } else {
+                    let waiters: Vec<(&AtomicU32, u32)> = sessions
+                        .iter()
+                        .zip(&observed)
+                        .map(|(s, o)| (&s.map.header().doorbell, *o))
+                        .collect();
+                    futex_wait_many(&waiters, SERVICE_PARK_MAX);
                 }
             } else {
                 empty_passes = 0;
@@ -1866,5 +1908,85 @@ fn futex_wait(word: &AtomicU32, expected: u32, timeout: Duration) {
             0usize,
             0u32,
         );
+    }
+}
+
+/// `futex_waitv(2)` wait-multiple entry (Linux ≥ 5.16). Mirrors
+/// `include/uapi/linux/futex.h` — 32 bytes, `val`/`uaddr` as u64.
+#[repr(C)]
+struct FutexWaitv {
+    val: u64,
+    uaddr: u64,
+    flags: u32,
+    __reserved: u32,
+}
+
+/// `FUTEX2_SIZE_U32` — the only size the doorbell words use.
+const FUTEX2_SIZE_U32: u32 = 0x02;
+/// `futex_waitv(2)` hard cap (`FUTEX_WAITV_MAX`).
+const FUTEX_WAITV_MAX: usize = 128;
+
+/// Bounded wait on MANY futex words at once (the multi-session service
+/// park — one wake on ANY owned doorbell returns). Each `(word, expected)`
+/// pair admits like `FUTEX_WAIT`: if any word already differs, returns
+/// immediately (EAGAIN). Beyond `FUTEX_WAITV_MAX` words the excess is not
+/// waited on — the `timeout` bound still caps their latency (§5.3.1 rule
+/// 5). Kernels without `futex_waitv` (ENOSYS) fall back to the
+/// first-word single wait — the pre-fix posture, same bound.
+fn futex_wait_many(waiters: &[(&AtomicU32, u32)], timeout: Duration) {
+    debug_assert!(!waiters.is_empty());
+    if waiters.len() == 1 {
+        futex_wait(waiters[0].0, waiters[0].1, timeout);
+        return;
+    }
+    static WAITV_SUPPORTED: AtomicBool = AtomicBool::new(true);
+    if !WAITV_SUPPORTED.load(Ordering::Relaxed) {
+        futex_wait(waiters[0].0, waiters[0].1, timeout);
+        return;
+    }
+    let vec: Vec<FutexWaitv> = waiters
+        .iter()
+        .take(FUTEX_WAITV_MAX)
+        .map(|(word, expected)| FutexWaitv {
+            val: u64::from(*expected),
+            uaddr: word.as_ptr() as u64,
+            flags: FUTEX2_SIZE_U32,
+            __reserved: 0,
+        })
+        .collect();
+    // futex_waitv takes an ABSOLUTE timeout (CLOCK_MONOTONIC).
+    // SAFETY: clock_gettime into a zeroed timespec.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: plain clock_gettime(2).
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    let mut nsec = ts.tv_nsec as i128 + i128::from(timeout.subsec_nanos());
+    let mut sec = ts.tv_sec as i128 + timeout.as_secs() as i128;
+    if nsec >= 1_000_000_000 {
+        nsec -= 1_000_000_000;
+        sec += 1;
+    }
+    ts.tv_sec = sec as libc::time_t;
+    ts.tv_nsec = nsec as libc::c_long;
+    // SAFETY: SYS_futex_waitv with a valid waiter array + absolute
+    // timespec; every return class (wake index, EAGAIN value-changed,
+    // ETIMEDOUT, EINTR) resolves to "caller rescans".
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_futex_waitv,
+            vec.as_ptr(),
+            vec.len() as u32,
+            0u32,
+            &ts as *const libc::timespec,
+            libc::CLOCK_MONOTONIC,
+        )
+    };
+    if r < 0 {
+        // SAFETY: errno read directly after the failing call.
+        let errno = unsafe { *libc::__errno_location() };
+        if errno == libc::ENOSYS {
+            // Pre-5.16 kernel: remember, degrade to the single wait.
+            WAITV_SUPPORTED.store(false, Ordering::Relaxed);
+            futex_wait(waiters[0].0, waiters[0].1, timeout);
+        }
     }
 }

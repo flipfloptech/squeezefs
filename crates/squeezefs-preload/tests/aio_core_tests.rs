@@ -189,14 +189,22 @@ fn ring_refusal_reroutes_to_the_kernel_lane_never_eagain() {
         "a mid-batch ring refusal must reroute that iocb to the kernel \
          lane, not end the prefix"
     );
-    assert_eq!(ring.submitted, vec![0], "only the accepted ring op rode the ring");
+    assert_eq!(
+        ring.submitted,
+        vec![0],
+        "only the accepted ring op rode the ring"
+    );
     assert_eq!(
         kern.submitted_runs,
         vec![vec![1, 2]],
         "the refused ring op joins the kernel run at its batch position"
     );
     assert_eq!(st.ring_pending(), 1);
-    assert_eq!(st.kernel_pending(), 2, "rerouted op counts as kernel-pending");
+    assert_eq!(
+        st.kernel_pending(),
+        2,
+        "rerouted op counts as kernel-pending"
+    );
 
     // First-op refusal: the kernel lane takes it too — no EAGAIN.
     let mut st2 = AioCtxState::new();

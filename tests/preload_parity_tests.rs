@@ -1187,7 +1187,13 @@ async fn ring_read_carries_the_bindings_odirect_class() {
     let fx = Fixture::new("odirect-class").await;
     let create = fx
         .fs
-        .create(req(), 1, OsStr::new("odclass.bin"), libc::S_IFREG | 0o644, 0)
+        .create(
+            req(),
+            1,
+            OsStr::new("odclass.bin"),
+            libc::S_IFREG | 0o644,
+            0,
+        )
         .await
         .expect("create");
     let ino = create.attr.ino;
@@ -1198,6 +1204,10 @@ async fn ring_read_carries_the_bindings_odirect_class() {
     let fd = odirect_standin(&fx, &dir, "odclass.bin", ino);
     let (session, binding) = ClientSession::establish(&fx, &fd);
 
+    // Force the MISS shape (the class travels on the async handoff —
+    // under default hybrid policy a fast-path tier serve is legal for
+    // O_DIRECT and never reaches the read handler).
+    fx.fs.attr_cache.invalidate(&ino);
     let od_before = METRICS.read_odirect_requests.load(Ordering::Relaxed);
     let got = tokio::task::block_in_place(|| session.ring_read(binding, 0, 4096, "od read"));
     assert_eq!(got, &w[..4096], "byte parity on the O_DIRECT binding");
@@ -1262,7 +1272,9 @@ async fn ddt_mount_odirect_binding_skips_the_tier_fast_path() {
     // (Re-point the screen back at the fixture tempdir for the plain fd.)
     {
         use std::os::unix::fs::MetadataExt;
-        let dev = std::fs::metadata(fx.dir.path()).expect("fixture dir metadata").dev();
+        let dev = std::fs::metadata(fx.dir.path())
+            .expect("fixture dir metadata")
+            .dev();
         fx.host.set_expected_st_dev(dev);
     }
     let (ino2, fd2) = fx.create_file("odddt-buffered.bin").await;

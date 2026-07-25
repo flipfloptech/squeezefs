@@ -1108,6 +1108,20 @@ unsafe fn fcntl_body(real: Option<FcntlFn>, fd: c_int, cmd: c_int, arg: *mut c_v
                     let new_flags = arg as usize as c_int;
                     if new_flags & libc::O_APPEND != 0 {
                         route_release(table().on_close(fd));
+                    } else if table().lookup(fd).is_some() {
+                        // O_DIRECT toggle = read-CLASS change (the daemon
+                        // captured the description's class at bind —
+                        // BindingRights::odirect; the kernel path reads
+                        // the live description on every request). A
+                        // binding whose class diverged would serve the
+                        // wrong admission semantics: unbind, kernel
+                        // takes the fd with the correct live class.
+                        // (F_GETFL only for BOUND fds — control-plane,
+                        // one extra syscall.)
+                        let cur = unsafe { f(fd, libc::F_GETFL, std::ptr::null_mut()) };
+                        if cur >= 0 && (cur ^ new_flags) & libc::O_DIRECT != 0 {
+                            route_release(table().on_close(fd));
+                        }
                     }
                 }
                 _ => {}

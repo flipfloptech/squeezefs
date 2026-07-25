@@ -350,6 +350,11 @@ unsafe impl Sync for AlignedBufPool {}
 pub struct AlignedBufOwner {
     pub ptr: *mut u8,
     pub len: usize,
+    /// The HOME pool this backing recycles into (2026-07-25 ipc-miss-path
+    /// fix: two size-classed pools exist — [`ALIGNED_BUF_POOL`] whole-block
+    /// and [`RANGED_BUF_POOL`] sub-block; a cross-pool recycle would hand a
+    /// small backing out as a whole-block one, a heap overflow).
+    pool: Arc<AlignedBufPool>,
 }
 
 unsafe impl Send for AlignedBufOwner {}
@@ -383,8 +388,8 @@ impl Drop for AlignedBufOwner {
     fn drop(&mut self) {
         // Route through `recycle` so a full pool frees the buffer instead of
         // leaking it (the previous direct `queue.push` dropped over-capacity
-        // buffers on the floor).
-        ALIGNED_BUF_POOL.recycle(self.ptr);
+        // buffers on the floor). Always the HOME pool (struct doc).
+        self.pool.recycle(self.ptr);
     }
 }
 
@@ -417,6 +422,7 @@ impl AlignedBufPool {
         let owner = AlignedBufOwner {
             ptr,
             len: self.buf_size,
+            pool: Arc::clone(self),
         };
         let bytes = bytes::Bytes::from_owner(owner);
 
@@ -426,16 +432,27 @@ impl AlignedBufPool {
     /// Take a 4096-aligned buffer of [`Self::buf_size`] without wrapping in
     /// `Bytes` (P2-4: nvme unaligned write path recycles via [`Self::recycle`]).
     pub fn alloc_raw(self: &Arc<Self>) -> *mut u8 {
-        let ptr = self.queue.pop().unwrap_or_else(|| {
-            // RW1 H3 evidence (design-random-small-writes §5.3): a handout
-            // that missed the recycle queue pays the mmap/page-fault
-            // allocation path — the pool-exhaustion counter the ≥13-writer
-            // convoy forensics read.
-            crate::fuse_client::METRICS
-                .aligned_pool_misses
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            alloc_pooled(self.buf_size)
-        });
+        let ptr = match self.queue.pop() {
+            Some(p) => {
+                crate::fuse_client::METRICS
+                    .aligned_pool_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                p
+            }
+            None => {
+                // RW1 H3 evidence (design-random-small-writes §5.3): a handout
+                // that missed the recycle queue pays the mmap/page-fault
+                // allocation path — the pool-exhaustion counter the ≥13-writer
+                // convoy forensics read. (2026-07-25: on the ipc miss path a
+                // 4 MiB-class miss is ALSO a THP-zeroing fault + munmap TLB
+                // storm per op — the read-bounce traffic rides
+                // [`RANGED_BUF_POOL`] for exactly that reason.)
+                crate::fuse_client::METRICS
+                    .aligned_pool_misses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                alloc_pooled(self.buf_size)
+            }
+        };
         debug_assert_eq!(
             ptr as usize % POOLED_BUF_ALIGN,
             0,
@@ -484,3 +501,37 @@ pub static ALIGNED_BUF_POOL: Lazy<Arc<AlignedBufPool>> = Lazy::new(|| {
     let capacity = std::cmp::max(cores * 16, 64);
     Arc::new(AlignedBufPool::new(capacity, 4 * 1024 * 1024))
 });
+
+/// Sub-block read-bounce pool (2026-07-25 ipc-miss-path fix): R3 ranged
+/// reads bounce their LBA window through an aligned pooled buffer, and the
+/// only pool was the whole-block 4 MiB one — every concurrent 4 KiB ranged
+/// read checked out (or, past ~370 in flight, FRESH-ALLOCATED) a 4 MiB
+/// backing, whose first-touch THP zeroing under the io_uring gup
+/// (`kernel_init_pages`, measured 40 % of daemon CPU) and per-free TLB
+/// shootdowns were the ring-read miss path's 6 ms/op convoy. Windows up to
+/// [`RANGED_BUF_SIZE`] ride this pool; larger stay on the whole-block pool.
+/// (The kernel transport never sees this: its reads land in registered
+/// payload buffers via `dest_addr`.)
+pub const RANGED_BUF_SIZE: usize = 64 * 1024;
+
+pub static RANGED_BUF_POOL: Lazy<Arc<AlignedBufPool>> = Lazy::new(|| {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    // Sized for miss-path concurrency (hundreds of in-flight sub-block
+    // reads), not block count: 64 KiB backings are cheap (cores × 64 ≈
+    // 92 MiB on a 23-CPU box), and exhaustion degrades to ordinary
+    // allocation — counted by `aligned_pool_misses`.
+    let capacity = std::cmp::max(cores * 64, 512);
+    Arc::new(AlignedBufPool::new(capacity, RANGED_BUF_SIZE))
+});
+
+/// Pick the read-bounce pool for a device read of `size` bytes (routing
+/// contract pinned by `read_bounce_pool_routing_and_home_recycle`).
+pub fn read_bounce_pool(size: usize) -> &'static Arc<AlignedBufPool> {
+    if size <= RANGED_BUF_SIZE {
+        &RANGED_BUF_POOL
+    } else {
+        &ALIGNED_BUF_POOL
+    }
+}

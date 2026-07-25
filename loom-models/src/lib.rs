@@ -143,8 +143,6 @@ pub mod ipc_slot_core;
 pub mod journal_core;
 #[path = "../../crates/fuse3/src/raw/connection/lease_core.rs"]
 pub mod lease_core;
-#[path = "../../crates/fuse3/src/raw/connection/wake_core.rs"]
-pub mod wake_core;
 #[path = "../../src/meta_backend/kv/node_state_core.rs"]
 pub mod node_state_core;
 #[path = "../../src/patch_clone_core.rs"]
@@ -155,6 +153,8 @@ pub mod refcount_core;
 pub mod slot_cursor_core;
 #[path = "../../src/meta_backend/slot_gate_core.rs"]
 pub mod slot_gate_core;
+#[path = "../../crates/fuse3/src/raw/connection/wake_core.rs"]
+pub mod wake_core;
 
 #[cfg(all(test, loom))]
 mod models {
@@ -1517,8 +1517,7 @@ mod models {
                     st.begin_freeze().expect("dirty node freezes ordinarily");
                     std::mem::take(&mut *g)
                 } else {
-                    st.begin_forced_freeze()
-                        .expect("clean node forced-freezes");
+                    st.begin_forced_freeze().expect("clean node forced-freezes");
                     0
                 }
             };
@@ -2341,7 +2340,13 @@ mod models {
                 })
             };
 
-            // Consumer: one park attempt under the FIXED ordering.
+            // Consumer: one park attempt under the FIXED ordering. Returns
+            // (parked-with-observed, cursor) — strandedness is judged in
+            // the main thread AFTER the producer completes, because futex
+            // atomicity means a bump AFTER the wait admitted WAKES the
+            // sleeper (not a strand); only a bump folded INTO `observed`
+            // strands (wake fired before the wait began, wait admits
+            // against the post-bump value and sleeps the full bound).
             let consumer = {
                 let storage = Arc::clone(&storage);
                 let doorbell = Arc::clone(&doorbell);
@@ -2355,25 +2360,28 @@ mod models {
                     while cursor.pop(&ring).is_some() {
                         drained += 1;
                     }
-                    if drained == 0 {
-                        // FUTEX_WAIT admission: sleeps only if the word
-                        // still equals `observed`.
-                        let admitted = doorbell.load(Ordering::SeqCst) == observed;
-                        if admitted {
-                            // The wait would sleep its full bound: nothing
-                            // may be stranded on the ring.
-                            assert!(
-                                cursor.pop(&ring).is_none(),
-                                "park admitted with a published entry stranded \
-                                 (lost doorbell wake)"
-                            );
-                        }
-                    }
+                    let parked = if drained == 0 { Some(observed) } else { None };
+                    (parked, cursor)
                 })
             };
 
             producer.join().unwrap();
-            consumer.join().unwrap();
+            let (parked, mut cursor) = consumer.join().unwrap();
+            if let Some(observed) = parked {
+                // The producer has fully completed. If the doorbell still
+                // equals the wait's admission value, no wake is coming
+                // (the producer's wake, if any, fired before the wait) —
+                // the sleeper sleeps its full bound: nothing may be
+                // stranded on the ring.
+                if doorbell.load(Ordering::SeqCst) == observed {
+                    let ring = storage.view();
+                    assert!(
+                        cursor.pop(&ring).is_none(),
+                        "park admitted with a published entry stranded \
+                         (lost doorbell wake)"
+                    );
+                }
+            }
         });
     }
 

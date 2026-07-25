@@ -853,7 +853,12 @@ impl NvmeBlockDev {
             };
             (addr as *mut u8, b)
         } else {
-            crate::cache::pool::ALIGNED_BUF_POOL.alloc()
+            // Size-classed bounce (2026-07-25 ipc-miss-path fix): sub-block
+            // windows ride the 64 KiB RANGED_BUF_POOL — a 4 KiB ranged read
+            // checking out a 4 MiB whole-block backing exhausted that pool
+            // at miss-path concurrency and paid a THP-zeroing fault + TLB
+            // storm per excess op (see pool.rs::RANGED_BUF_POOL).
+            crate::cache::pool::read_bounce_pool(size).alloc()
         };
 
         let (tx, rx_oneshot) = oneshot::channel();

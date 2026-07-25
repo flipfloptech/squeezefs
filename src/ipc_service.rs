@@ -184,6 +184,15 @@ impl DataPlaneSink {
     /// contention or in-guard miss.
     fn serve_read(&self, op: DataOp, completion: SlotCompletion) {
         let ino = op.binding.ino;
+        // Device-true parity (2026-07-25 ipc-miss-path fix): on a
+        // `direct_device_true` mount, kernel O_DIRECT reads bypass every
+        // tier — an O_DIRECT binding's ring reads must do the same, so
+        // the tier fast path is skipped by POLICY (not counted as a miss
+        // demotion — that counter means fast-path rot, and a device-true
+        // mount handing off 100 % of O_DIRECT reads is its design).
+        if op.binding.odirect && self.fs.router.direct_device_true() {
+            return self.enqueue_read(op, completion);
+        }
         let lock = self.fs.get_inode_lock_ref(ino);
         match lock.try_read() {
             Ok(guard) => {
@@ -240,6 +249,18 @@ impl DataPlaneSink {
         let ino = op.binding.ino;
         let offset = op.desc.offset;
         let len = op.desc.len;
+        // Read-class parity (BindingRights::odirect): hand the handler
+        // exactly the flags the kernel path would (`fuse_read_in.flags`
+        // carries the description's O_DIRECT bit on every READ). Dropping
+        // it reclassified O_DIRECT ring reads as buffered — on cold
+        // working sets that re-enabled the whole-block ghost-admission
+        // machinery per miss (the measured 13× il-vs-kernel collapse on
+        // the 2026-07-25 fabric-latency rig).
+        let flags = if op.binding.odirect {
+            libc::O_DIRECT as u32
+        } else {
+            0
+        };
         self.runtime.spawn(async move {
             // Re-seed a cold attr cache so warm workloads return to the
             // sync fast path after ONE miss demotion (the handler's own
@@ -247,7 +268,7 @@ impl DataPlaneSink {
             if fs.attr_cache.get(&ino).is_none() {
                 fs.refresh_attr_cache(ino).await;
             }
-            match fs.read(request, ino, 0, offset, len, 0).await {
+            match fs.read(request, ino, 0, offset, len, flags).await {
                 Ok(reply) => {
                     // Into the SNAPSHOT window (§5.3.1: bounds validated at
                     // dequeue; mid-serve descriptor mutation is inert).

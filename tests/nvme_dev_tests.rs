@@ -437,3 +437,68 @@ async fn test_read_straddling_eof_errors_instead_of_garbage_tail() {
         ),
     }
 }
+
+// ---------------------------------------------------------------------------
+// 2026-07-25 ipc-miss-path fix: size-classed read-bounce pools. A sub-block
+// device read must never check out (or fresh-allocate) a whole-block
+// backing — that was the ring-read miss path's 6 ms/op convoy (4 MiB
+// THP-zeroing fault + munmap TLB storm per over-capacity op) — and every
+// pooled backing must recycle into its HOME pool (a cross-pool recycle
+// would later hand a 64 KiB backing out as a 4 MiB one: heap overflow).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn read_bounce_pool_routing_and_home_recycle() {
+    use squeezefs::cache::pool::{
+        read_bounce_pool, ALIGNED_BUF_POOL, RANGED_BUF_POOL, RANGED_BUF_SIZE,
+    };
+
+    // Routing: sub-block windows ride the small pool; whole-block stays big.
+    assert!(std::sync::Arc::ptr_eq(
+        read_bounce_pool(4096),
+        &RANGED_BUF_POOL
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        read_bounce_pool(RANGED_BUF_SIZE),
+        &RANGED_BUF_POOL
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        read_bounce_pool(RANGED_BUF_SIZE + 1),
+        &ALIGNED_BUF_POOL
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        read_bounce_pool(4 * 1024 * 1024),
+        &ALIGNED_BUF_POOL
+    ));
+    assert_eq!(RANGED_BUF_POOL.buf_size(), RANGED_BUF_SIZE);
+
+    // Home recycle: alloc from EACH pool, drop the Bytes owner, and the
+    // idle byte count of BOTH pools must return exactly to its prior value
+    // (small never leaks into big, big never leaks into small).
+    let small_before = RANGED_BUF_POOL.allocated_bytes();
+    let big_before = ALIGNED_BUF_POOL.allocated_bytes();
+    let (_p1, small_bytes) = RANGED_BUF_POOL.alloc();
+    let (_p2, big_bytes) = ALIGNED_BUF_POOL.alloc();
+    assert_eq!(
+        RANGED_BUF_POOL.allocated_bytes(),
+        small_before - RANGED_BUF_SIZE as u64,
+        "small alloc checks out of the small pool"
+    );
+    assert_eq!(
+        ALIGNED_BUF_POOL.allocated_bytes(),
+        big_before - ALIGNED_BUF_POOL.buf_size() as u64,
+        "big alloc checks out of the big pool"
+    );
+    drop(small_bytes);
+    drop(big_bytes);
+    assert_eq!(
+        RANGED_BUF_POOL.allocated_bytes(),
+        small_before,
+        "small backing must recycle into its HOME pool"
+    );
+    assert_eq!(
+        ALIGNED_BUF_POOL.allocated_bytes(),
+        big_before,
+        "big backing must recycle into its HOME pool"
+    );
+}

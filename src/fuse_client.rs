@@ -2395,9 +2395,15 @@ pub struct Metrics {
     /// asserts probes == striped block writes; RW3's lock-free probe flips
     /// that pin when it elides the hop.
     pub staging_sibling_probes: Align64<AtomicU64>,
-    /// H3 evidence: `ALIGNED_BUF_POOL` handouts that missed the recycle
-    /// queue and paid the mmap/page-fault allocation path.
+    /// H3 evidence: `ALIGNED_BUF_POOL`/`RANGED_BUF_POOL` handouts that
+    /// missed the recycle queue and paid the mmap/page-fault allocation
+    /// path.
     pub aligned_pool_misses: Align64<AtomicU64>,
+    /// Companion hit counter (2026-07-25 ipc-miss-path fix): pooled
+    /// handouts served from the recycle queue — the miss RATIO is the
+    /// convoy instrument (misses/(hits+misses) ≈ 0.4 was the 6 ms/op
+    /// ring-read collapse; ≈ 0 is the healthy posture).
+    pub aligned_pool_hits: Align64<AtomicU64>,
     // -----------------------------------------------------------------
     // RW2 W1 sole-owner extent patch (docs/design-random-small-writes.md
     // §5.1/§5.4). `patch_writes`/`patch_write_bytes` count in-place
@@ -4233,6 +4239,7 @@ impl SqueezefsFilesystem {
                 "write_block_revisits": METRICS.write_block_revisits.load(Ordering::Relaxed),
                 "staging_sibling_probes": METRICS.staging_sibling_probes.load(Ordering::Relaxed),
                 "aligned_pool_misses": METRICS.aligned_pool_misses.load(Ordering::Relaxed),
+                "aligned_pool_hits": METRICS.aligned_pool_hits.load(Ordering::Relaxed),
                 // RW2 W1 sole-owner extent patch families (design-random-
                 // small-writes §5.4 — the decision ledger + gate tripwires).
                 "patch_writes": METRICS.patch_writes.load(Ordering::Relaxed),
@@ -8615,6 +8622,13 @@ impl Filesystem for SqueezefsFilesystem {
                     2,
                     Arc::new(|| crate::cache::pool::ALIGNED_BUF_POOL.allocated_bytes()),
                     Arc::new(|target| crate::cache::pool::ALIGNED_BUF_POOL.trim_to(target)),
+                ));
+                MEM_BUDGET.register(Component::new(
+                    "ranged_buf_pool",
+                    4 * MIB,
+                    2,
+                    Arc::new(|| crate::cache::pool::RANGED_BUF_POOL.allocated_bytes()),
+                    Arc::new(|target| crate::cache::pool::RANGED_BUF_POOL.trim_to(target)),
                 ));
             }
             crate::mem_budget::spawn_sampler();

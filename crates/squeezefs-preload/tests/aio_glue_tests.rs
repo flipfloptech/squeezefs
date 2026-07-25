@@ -287,6 +287,89 @@ fn removed_ctx_value_is_re_registrable_with_fresh_state() {
 }
 
 #[test]
+fn recycled_ctx_value_with_missed_destroy_retro_neutralizes() {
+    // The 2026-07-25 field crash class (fake-vs-real io_context_t
+    // confusion): io_destroy bookkeeping can be MISSED — a guard-refused
+    // interposer entry (signal-handler reentrancy), a panicked destroy
+    // body, a libaio build whose io_queue_release binds io_destroy
+    // internally (-Bsymbolic class) — while the REAL kernel destroy
+    // still runs. The kernel then recycles the ring address for a brand
+    // new, never-shim-touched context. Registering that recycled value
+    // MUST hand out FRESH state: adopting the corpse (stale
+    // kernel_pending / ring tickets) diverts the new REAL context off
+    // the verbatim-real passthrough path into the merge machinery —
+    // synthesized events with dangling iocb pointers, host-app heap
+    // corruption. Membership must be infallible: a colliding register
+    // is BY CONSTRUCTION a new real context (the kernel never hands out
+    // the same live ctx value twice), so the stale entry is vacated and
+    // re-registered fresh.
+    let reg: AioCtxRegistry = AioCtxRegistry::new();
+    assert!(reg.register(0xDEAD_7000));
+    seed_kernel_ops(&mut reg.lookup(0xDEAD_7000).unwrap().lock().unwrap(), 7);
+    // io_destroy bookkeeping MISSED here (no remove()) — the kernel
+    // recycles the address for a new context:
+    assert!(
+        reg.register(0xDEAD_7000),
+        "a colliding register is a recycled REAL context — it must retro-neutralize \
+         the stale entry and register fresh, never refuse"
+    );
+    let st = reg.lookup(0xDEAD_7000).expect("recycled ctx resolves");
+    assert_eq!(
+        st.lock().unwrap().kernel_pending(),
+        0,
+        "fresh state — the corpse's tracked pendings must NOT be adopted \
+         (adoption diverts a real ctx off the verbatim-real path)"
+    );
+    // The retro-neutralized registration is a normal one: destroy works.
+    assert!(reg.remove(0xDEAD_7000));
+    assert!(reg.lookup(0xDEAD_7000).is_none());
+}
+
+#[test]
+fn collision_reregistration_consumes_one_slot() {
+    // Retro-neutralization must vacate the corpse, not stack a second
+    // slot for the same id: after one remove() the value is gone (a
+    // ghost duplicate would resurrect the corpse on the next lookup).
+    let reg: AioCtxRegistry = AioCtxRegistry::new();
+    assert!(reg.register(0xC0));
+    assert!(reg.register(0xC0), "collision re-registers fresh");
+    assert!(reg.remove(0xC0), "one remove vacates it");
+    assert!(
+        reg.lookup(0xC0).is_none(),
+        "no ghost duplicate slot may survive the remove"
+    );
+    assert!(!reg.remove(0xC0), "second remove finds nothing");
+}
+
+#[test]
+fn destroyed_state_is_observable_for_the_passthrough_fast_reject() {
+    // The interposer's reap fast-reject must be able to see a destroyed
+    // corpse (belt-and-braces below the registry fix): a destroyed
+    // state serves NOTHING (getevents returns empty forever), so the
+    // only correct owner for such a ctx is the REAL call — an
+    // interposer that keeps merge-looping on it hangs the host app.
+    let reg: AioCtxRegistry = AioCtxRegistry::new();
+    assert!(reg.register(0xD1));
+    {
+        let st = reg.lookup(0xD1).unwrap();
+        let mut st = st.lock().unwrap();
+        seed_kernel_ops(&mut st, 2);
+        st.destroy(&mut NoSlotRing);
+        assert!(
+            st.destroyed(),
+            "destroy must be observable — the reap path forwards destroyed \
+             corpses to the real call instead of merge-looping"
+        );
+        assert!(
+            st.getevents(&mut NoSlotRing, &mut AcceptAllKernel, 1, 4, Some(0))
+                .is_empty(),
+            "a destroyed state never serves events"
+        );
+    }
+    assert!(reg.remove(0xD1));
+}
+
+#[test]
 fn full_registry_refuses_and_degrades_to_passthrough() {
     let reg: AioCtxRegistry = AioCtxRegistry::new();
     let mut registered = 0usize;

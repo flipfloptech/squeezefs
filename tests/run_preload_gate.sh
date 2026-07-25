@@ -77,6 +77,24 @@ cmp "$T/src.bin" "$T/untar.bin" || fail "tar roundtrip under LD_PRELOAD (plain f
 LD_PRELOAD="$SO" bash -c 'set -e; echo x | grep -q x; ls / >/dev/null; true' || fail "shell battery under LD_PRELOAD"
 echo "OK: plain-file passthrough battery"
 
+# 1d. libaio lifecycle passthrough (2026-07-25 field crash class): the
+# full io_setup → io_submit → io_getevents → io_destroy lifecycle on a
+# PLAIN (non-SqueezeFS) directory under the shim, all orderings — a
+# context never created through a live shim session must be forwarded
+# UNTOUCHED to real libaio (fake-vs-real io_context_t confusion was the
+# elbencho t32 qd32 segfault). Multi-phase per thread so destroyed ring
+# addresses recycle (the confusion-class trigger surface). Exit 2 =
+# no libaio.so.1 on this box (skip loudly).
+AIO_HARNESS="$REPO_DIR/target/preload-release/aio_lifecycle_harness"
+[ -x "$AIO_HARNESS" ] || fail "aio_lifecycle_harness missing at $AIO_HARNESS"
+for mode in setup-first open-first mixed; do
+    rc=0
+    LD_PRELOAD="$SO" "$AIO_HARNESS" "$T" "$mode" 8 4 16 || rc=$?
+    if [ "$rc" -eq 2 ]; then echo "SKIP: libaio.so.1 not present (aio passthrough leg)"; break; fi
+    [ "$rc" -eq 0 ] || fail "aio lifecycle passthrough ($mode) rc=$rc"
+done
+echo "OK: libaio lifecycle passthrough (plain fs, 3 orderings)"
+
 if [ "$(id -u)" -ne 0 ]; then
     echo "=== Leg 2 skipped (not root) — run: sudo $0 ==="
     echo "PRELOAD GATE (leg 1) PASSED"
@@ -352,5 +370,61 @@ while :; do
 done
 pkill -9 -f "$MOUNT_DIR/forkp.bin" 2>/dev/null || true
 echo "OK: fork-then-kill-parent (EOF fired despite the surviving child)"
+
+# 2j. libaio lifecycle on the ARMED mount (served merge path): the same
+# harness with ring-lane engagement — mixed batches, per-phase ctx
+# destroy/recreate (ring-address recycling against LIVE sessions).
+AIO_HARNESS="$REPO_DIR/target/preload-release/aio_lifecycle_harness"
+[ -x "$AIO_HARNESS" ] || fail "aio_lifecycle_harness missing at $AIO_HARNESS"
+AIO_SKIP=0
+for mode in setup-first open-first mixed; do
+    rc=0
+    ILP "$AIO_HARNESS" "$MOUNT_DIR" "$mode" 8 4 16 || rc=$?
+    if [ "$rc" -eq 2 ]; then AIO_SKIP=1; echo "SKIP: libaio.so.1 not present (aio mount legs)"; break; fi
+    [ "$rc" -eq 0 ] || fail "aio lifecycle on the armed mount ($mode) rc=$rc"
+done
+[ "$AIO_SKIP" -eq 1 ] || echo "OK: libaio lifecycle on the armed mount (3 orderings)"
+
+# 2k. libaio lifecycle in the ESTABLISH-REFUSED shape — the 2026-07-25
+# field crash environment, exactly: a mount WITHOUT -o interception
+# still arms the VL2 control-plane host (bootstrap xattr serves, the
+# listener answers) but refuses every data-plane HELLO, so each
+# eligible open prints "session establish failed — mount passthrough"
+# and the fd stays unbound. libaio through the shim must then be
+# PERFECTLY passthrough: full lifecycle green, zero ipc data ops.
+if [ "$AIO_SKIP" -eq 0 ]; then
+    umount "$MOUNT_DIR" 2>/dev/null || umount -l "$MOUNT_DIR" 2>/dev/null || true
+    sleep 1
+    RUST_LOG=info "$SQUEEZEFS_BIN" mount \
+        sqmeta:///dev/shm/squeezefs_il_meta \
+        "$MOUNT_DIR" \
+        --daemon \
+        --disk-cache-size 500MB \
+        --log-file "$LOG" \
+        --allow-other
+    sleep 3
+    mountpoint -q "$MOUNT_DIR" || { cat "$LOG" || true; fail "no-interception remount failed"; }
+    chmod 1777 "$MOUNT_DIR"
+    PT_R0=$(stats ipc_ops_read); PT_W0=$(stats ipc_ops_write)
+    PT_ERR="$T/aio_pt_stderr.log"
+    for mode in setup-first open-first mixed; do
+        rc=0
+        ILP "$AIO_HARNESS" "$MOUNT_DIR" "$mode" 8 4 16 2>"$PT_ERR" || rc=$?
+        [ "$rc" -eq 0 ] || { cat "$PT_ERR"; fail "aio lifecycle in the establish-refused shape ($mode) rc=$rc"; }
+    done
+    grep -q "session establish failed" "$PT_ERR" \
+        || fail "establish-refused shape not exercised — the field crash environment needs the per-open refusal"
+    PT_R1=$(stats ipc_ops_read); PT_W1=$(stats ipc_ops_write)
+    [ "$PT_R1" -eq "$PT_R0" ] && [ "$PT_W1" -eq "$PT_W0" ] \
+        || fail "passthrough mount served ring ops (reads Δ$((PT_R1-PT_R0)), writes Δ$((PT_W1-PT_W0)))"
+    if command -v elbencho &>/dev/null; then
+        # The reporter's instrument shape (libaio engine, deep iodepth).
+        (cd "$T" && ILP elbencho -w -r -t 8 --iodepth 16 -b 4k -s 2m --direct --nolive \
+            "$MOUNT_DIR/aiopt"{1..8} >/dev/null 2>&1) \
+            || fail "elbencho libaio on the establish-refused mount"
+        echo "OK: elbencho libaio (establish-refused shape)"
+    fi
+    echo "OK: libaio lifecycle passthrough (establish-refused shape, engagement zero)"
+fi
 
 echo "PRELOAD GATE (both legs) PASSED"

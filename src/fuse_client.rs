@@ -2875,6 +2875,15 @@ pub struct SqueezefsFilesystem {
     active_block_buffers: std::sync::Arc<
         dashmap::DashMap<String, crate::cache::active_block::ActiveBlockBuf, ahash::RandomState>,
     >,
+    /// O(1) lock-free gate over `active_block_buffers` occupancy: the count
+    /// of live parked overlays, incremented BEFORE a park publishes and
+    /// decremented AFTER a retire completes (conservative: `0` proves the
+    /// map empty; a transient over-count only costs a per-block probe).
+    /// The read hot path consults THIS — never `DashMap::is_empty()`/
+    /// `len()`, which read-lock every shard (measured 45 % + 12 % of
+    /// daemon CPU at 4k-randread saturation,
+    /// .benchmarks/2026-07-25-odirect-randread-concurrency.md).
+    parked_overlay_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// W1 §5.1 predicate 6 — the per-ino stream-adjacency word: the END
     /// offset of the ino's most recent striped write (one relaxed `swap`
     /// per write; latch-free `scc` map, shared across handler clones). A
@@ -3012,6 +3021,7 @@ impl Clone for SqueezefsFilesystem {
             mountpoint: self.mountpoint.clone(),
             max_background_uploads: self.max_background_uploads,
             active_block_buffers: self.active_block_buffers.clone(),
+            parked_overlay_count: self.parked_overlay_count.clone(),
             last_write_end: self.last_write_end.clone(),
             parked_drain_target: self.parked_drain_target.clone(),
             parked_drain_kick: self.parked_drain_kick.clone(),
@@ -3113,6 +3123,7 @@ impl SqueezefsFilesystem {
             active_block_buffers: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
+            parked_overlay_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_write_end: std::sync::Arc::new(scc::HashMap::new()),
             parked_drain_target: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             parked_drain_kick: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -6988,6 +6999,15 @@ impl SqueezefsFilesystem {
     /// count × block-size approximation.
     pub fn parked_buffer_bytes(&self) -> u64 {
         Self::parked_gauge_bytes()
+    }
+
+    /// The O(1) parked-overlay gate value (see the field doc): `0` proves
+    /// `active_block_buffers` empty — the read hot path skips every
+    /// per-block overlay probe on that proof. Exposed for the gate's
+    /// contract tests (`tests/parked_overlay_gate_tests.rs`).
+    pub fn parked_overlay_gate_count(&self) -> usize {
+        self.parked_overlay_count
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// §5.7 Red drain — "early `flush_memory_buffers_*`, the existing

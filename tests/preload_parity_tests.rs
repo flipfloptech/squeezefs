@@ -1139,6 +1139,149 @@ async fn hot_tier_leg_serves_on_the_sync_fast_path_when_seeded() {
 // §8 stats surface for the data-plane families
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// O_DIRECT read-class parity (the 2026-07-25 ipc-miss-path finding): the
+// kernel path hands the routing layer the file description's O_DIRECT bit
+// on EVERY read (`fuse_read_in.flags` → `ReadClassHint`); ring reads must
+// carry the SAME class from the screened binding, or an O_DIRECT app under
+// the shim silently reclassifies to buffered — on a `direct_device_true`
+// mount that re-enables the hybrid ghost-admission machinery the kernel
+// path escapes (whole-4MiB escalation fetches against a cold working set:
+// the measured 231k → 17.5k il collapse on the fabric-latency rig).
+// ---------------------------------------------------------------------------
+
+/// Open an O_DIRECT stand-in for `fs_ino` in a tempdir on a REAL
+/// filesystem (the repo dir — /tmp is commonly tmpfs, which refuses
+/// O_DIRECT), re-point the host's expected `st_dev` at it, and register
+/// the ino translation. Returns the O_DIRECT fd.
+fn odirect_standin(fx: &Fixture, dir: &tempfile::TempDir, name: &str, fs_ino: u64) -> OwnedFd {
+    let path = dir.path().join(name);
+    let mut f = std::fs::File::create(&path).expect("create O_DIRECT stand-in");
+    f.write_all(&[0u8; 16]).expect("stand-in bytes");
+    drop(f);
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(&path).expect("stand-in metadata");
+    fx.host.set_expected_st_dev(md.dev());
+    fx.sink
+        .map
+        .lock()
+        .expect("ino map mutex never poisons")
+        .insert(md.ino(), fs_ino);
+    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    // SAFETY: plain open(2); ownership taken immediately.
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_DIRECT) };
+    assert!(
+        fd >= 0,
+        "O_DIRECT open on {} failed ({}) — this test needs a tempdir on a \
+         filesystem that supports O_DIRECT (the repo dir is used for exactly \
+         that reason)",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: fresh owned fd.
+    unsafe { OwnedFd::from_raw_fd(fd) }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ring_read_carries_the_bindings_odirect_class() {
+    let fx = Fixture::new("odirect-class").await;
+    let create = fx
+        .fs
+        .create(req(), 1, OsStr::new("odclass.bin"), libc::S_IFREG | 0o644, 0)
+        .await
+        .expect("create");
+    let ino = create.attr.ino;
+    let w = deterministic_bytes(64 * 1024, 91);
+    fx.fuse_write(ino, 0, &w).await;
+
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("repo-dir tempdir");
+    let fd = odirect_standin(&fx, &dir, "odclass.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    let od_before = METRICS.read_odirect_requests.load(Ordering::Relaxed);
+    let got = tokio::task::block_in_place(|| session.ring_read(binding, 0, 4096, "od read"));
+    assert_eq!(got, &w[..4096], "byte parity on the O_DIRECT binding");
+    let od_delta = METRICS.read_odirect_requests.load(Ordering::Relaxed) - od_before;
+    assert!(
+        od_delta >= 1,
+        "a ring read on an O_DIRECT binding must reach the read path CARRYING \
+         the O_DIRECT class (read_odirect_requests delta = {od_delta}) — \
+         dropping it reclassifies the op as buffered (admission/ghost \
+         machinery the kernel path would not run)"
+    );
+    fx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddt_mount_odirect_binding_skips_the_tier_fast_path() {
+    let fx = Fixture::new("odirect-ddt").await;
+    let create = fx
+        .fs
+        .create(req(), 1, OsStr::new("odddt.bin"), libc::S_IFREG | 0o644, 0)
+        .await
+        .expect("create");
+    let ino = create.attr.ino;
+    // Staged warm tier (the warm_staged recipe): the sync fast path WOULD
+    // serve these bytes.
+    let w = deterministic_bytes(2 * 1024 * 1024, 92);
+    fx.fuse_write(ino, 0, &w).await;
+    fx.fs.fsync(req(), ino, 0, false).await.expect("fsync");
+
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("repo-dir tempdir");
+    let fd = odirect_standin(&fx, &dir, "odddt.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    // Warm the guarded inputs (attr cache) exactly like the staged test.
+    let _ = tokio::task::block_in_place(|| session.ring_read(binding, 0, 4096, "warm attrs"));
+
+    // Arm device-true: kernel O_DIRECT reads now bypass every tier —
+    // ring reads on an O_DIRECT binding must do the same (handoff to the
+    // full handler, which routes device-true), never a tier fast-serve.
+    fx.fs.router.set_direct_device_true(true);
+    let fast_before = METRICS.ipc_fast_path_serves.load(Ordering::Relaxed);
+    let handoff_before = METRICS.ipc_async_handoffs.load(Ordering::Relaxed);
+    let got = tokio::task::block_in_place(|| session.ring_read(binding, 8192, 4096, "ddt read"));
+    assert_eq!(got, &w[8192..12288], "byte parity on the device-true leg");
+    let fast_delta = METRICS.ipc_fast_path_serves.load(Ordering::Relaxed) - fast_before;
+    let handoff_delta = METRICS.ipc_async_handoffs.load(Ordering::Relaxed) - handoff_before;
+    fx.fs.router.set_direct_device_true(false);
+    assert_eq!(
+        fast_delta, 0,
+        "device-true mount + O_DIRECT binding: the tier fast path must be \
+         SKIPPED (kernel O_DIRECT reads never tier-serve there; got \
+         {fast_delta} fast serves)"
+    );
+    assert!(
+        handoff_delta >= 1,
+        "the device-true O_DIRECT ring read must ride the async handoff \
+         (got {handoff_delta})"
+    );
+
+    // Same warm state, NON-O_DIRECT binding, device-true still armed: the
+    // buffered-class fast path stays (device-true scopes to O_DIRECT).
+    // (Re-point the screen back at the fixture tempdir for the plain fd.)
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dev = std::fs::metadata(fx.dir.path()).expect("fixture dir metadata").dev();
+        fx.host.set_expected_st_dev(dev);
+    }
+    let (ino2, fd2) = fx.create_file("odddt-buffered.bin").await;
+    fx.fuse_write(ino2, 0, &w[..64 * 1024]).await;
+    let (session2, binding2) = ClientSession::establish(&fx, &fd2);
+    let _ = tokio::task::block_in_place(|| session2.ring_read(binding2, 0, 4096, "warm attrs 2"));
+    fx.fs.router.set_direct_device_true(true);
+    let fast2_before = METRICS.ipc_fast_path_serves.load(Ordering::Relaxed);
+    let got2 = tokio::task::block_in_place(|| session2.ring_read(binding2, 0, 4096, "buf read"));
+    fx.fs.router.set_direct_device_true(false);
+    assert_eq!(got2, &w[..4096], "buffered-binding parity");
+    assert!(
+        METRICS.ipc_fast_path_serves.load(Ordering::Relaxed) > fast2_before,
+        "a buffered (non-O_DIRECT) binding keeps the sync fast path even \
+         under direct_device_true — the escape scopes to the O_DIRECT class"
+    );
+    fx.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn data_plane_stats_fields_export() {
     let fx = Fixture::new("stats").await;

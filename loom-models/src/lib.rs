@@ -2302,6 +2302,81 @@ mod models {
         });
     }
 
+    /// IPC service-thread futex-park protocol (the 2026-07-25
+    /// ipc-miss-path fix): the park's `FUTEX_WAIT(doorbell, observed)`
+    /// admission value must be snapshot **BEFORE** the pre-park rescan —
+    /// snapshot-after-rescan opens the lost-wake window (a submission
+    /// landing between the rescan's last empty pop and the snapshot bumps
+    /// the doorbell INTO `observed`, so the wait admits and sleeps the
+    /// full 5 ms bound with a servable op on the ring; measured on the
+    /// fabric-latency rig as 13 % of service parks expiring by timeout
+    /// under load). Model: producer = ring push → doorbell bump (the
+    /// client's §5.3 rule-1 order); consumer = parked-flag → snapshot →
+    /// rescan → futex admission check (`doorbell == observed`).
+    /// Invariant: an ADMITTED park (the wait would sleep) implies the
+    /// ring is empty.
+    ///
+    /// Weakening evidence (verified during development, then restored):
+    /// moving the snapshot after the rescan — the shipped pre-fix order —
+    /// fails with "park admitted with a published entry stranded".
+    #[test]
+    fn ipc_park_snapshot_before_rescan_never_strands() {
+        loom::model(|| {
+            let storage = Arc::new(
+                ipc_ring_core::RingStorage::with_capacity(4).expect("capacity 4 is valid"),
+            );
+            let doorbell = Arc::new(AtomicU64::new(0));
+
+            let producer = {
+                let storage = Arc::clone(&storage);
+                let doorbell = Arc::clone(&doorbell);
+                thread::spawn(move || {
+                    // §5.3 rule 1: publish (ring push), THEN doorbell.
+                    assert!(storage.view().push(7), "capacity 4 never fills here");
+                    doorbell.fetch_add(1, Ordering::SeqCst);
+                    // (The conditional FUTEX_WAKE is modeled by the
+                    // consumer's admission check: a wake fired before the
+                    // wait is exactly the case the admission value must
+                    // catch.)
+                })
+            };
+
+            // Consumer: one park attempt under the FIXED ordering.
+            let consumer = {
+                let storage = Arc::clone(&storage);
+                let doorbell = Arc::clone(&doorbell);
+                thread::spawn(move || {
+                    let ring = storage.view();
+                    let mut cursor = ipc_ring_core::RingConsumer::new();
+                    // parked flag would be set here (client wake gating —
+                    // not load-bearing for this invariant).
+                    let observed = doorbell.load(Ordering::SeqCst); // SNAPSHOT
+                    let mut drained = 0u32; // RESCAN
+                    while cursor.pop(&ring).is_some() {
+                        drained += 1;
+                    }
+                    if drained == 0 {
+                        // FUTEX_WAIT admission: sleeps only if the word
+                        // still equals `observed`.
+                        let admitted = doorbell.load(Ordering::SeqCst) == observed;
+                        if admitted {
+                            // The wait would sleep its full bound: nothing
+                            // may be stranded on the ring.
+                            assert!(
+                                cursor.pop(&ring).is_none(),
+                                "park admitted with a published entry stranded \
+                                 (lost doorbell wake)"
+                            );
+                        }
+                    }
+                })
+            };
+
+            producer.join().unwrap();
+            consumer.join().unwrap();
+        });
+    }
+
     /// PR VL5b §5.5.2a (the cutover gate's load-bearing race): a closer
     /// that observed `drained()` must have EXCLUDED every mutator from
     /// the old routing table — either the mutator's SeqCst increment

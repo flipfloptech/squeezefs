@@ -170,7 +170,13 @@ fn kernel_partial_acceptance_truncates_the_prefix_before_later_ring_ops() {
 }
 
 #[test]
-fn ring_refusal_truncates_and_first_op_failure_returns_errno() {
+fn ring_refusal_reroutes_to_the_kernel_lane_never_eagain() {
+    // The 2026-07-25 ipc-miss-path design-board item: session slot
+    // exhaustion (try_submit = None) is NOT an error — the iocb is a
+    // bound-fd pread/pwrite whose REAL kernel call is always correct
+    // (§5.4.2 fallback-is-correctness). It reclassifies to the kernel
+    // lane AT ITS BATCH POSITION (prefix order preserved: it joins the
+    // open kernel run, which any later ring op flushes first).
     let mut st = AioCtxState::new();
     let (mut ring, mut kern) = (FakeRing::default(), FakeKernel::default());
     ring.refusals.push_back(false);
@@ -179,18 +185,47 @@ fn ring_refusal_truncates_and_first_op_failure_returns_errno() {
     let out = submit(&mut st, &mut ring, &mut kern, &[Ring, Ring, Kernel]);
     assert_eq!(
         out,
-        SubmitOutcome::Submitted(1),
-        "a mid-batch ring refusal ends the prefix (later kernel op not submitted)"
+        SubmitOutcome::Submitted(3),
+        "a mid-batch ring refusal must reroute that iocb to the kernel \
+         lane, not end the prefix"
     );
-    assert!(kern.submitted_runs.is_empty());
+    assert_eq!(ring.submitted, vec![0], "only the accepted ring op rode the ring");
+    assert_eq!(
+        kern.submitted_runs,
+        vec![vec![1, 2]],
+        "the refused ring op joins the kernel run at its batch position"
+    );
+    assert_eq!(st.ring_pending(), 1);
+    assert_eq!(st.kernel_pending(), 2, "rerouted op counts as kernel-pending");
 
-    // First-op refusal ⇒ -EAGAIN, nothing submitted (libaio convention).
+    // First-op refusal: the kernel lane takes it too — no EAGAIN.
     let mut st2 = AioCtxState::new();
     let (mut ring2, mut kern2) = (FakeRing::default(), FakeKernel::default());
     ring2.refusals.push_back(true);
     let out2 = submit(&mut st2, &mut ring2, &mut kern2, &[Ring, Kernel]);
-    assert_eq!(out2, SubmitOutcome::Errno(libc::EAGAIN));
-    assert!(kern2.submitted_runs.is_empty() && ring2.submitted.is_empty());
+    assert_eq!(
+        out2,
+        SubmitOutcome::Submitted(2),
+        "first-op slot exhaustion must NOT surface -EAGAIN — the kernel \
+         lane serves the op"
+    );
+    assert!(ring2.submitted.is_empty());
+    assert_eq!(kern2.submitted_runs, vec![vec![0, 1]]);
+
+    // Ordering law under reroute: a LATER ring op still flushes the run
+    // (which now contains the rerouted op) before itself dispatching.
+    let mut st3 = AioCtxState::new();
+    let (mut ring3, mut kern3) = (FakeRing::default(), FakeKernel::default());
+    ring3.refusals.push_back(true); // first ring op refused
+    ring3.refusals.push_back(false); // second accepted
+    let out3 = submit(&mut st3, &mut ring3, &mut kern3, &[Ring, Ring]);
+    assert_eq!(out3, SubmitOutcome::Submitted(2));
+    assert_eq!(
+        kern3.submitted_runs,
+        vec![vec![0]],
+        "the rerouted op's run flushed BEFORE the later ring dispatch"
+    );
+    assert_eq!(ring3.submitted, vec![1]);
 }
 
 #[test]

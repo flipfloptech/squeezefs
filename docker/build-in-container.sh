@@ -29,8 +29,12 @@ install -m 0755 "$CARGO_TARGET_DIR/preload-release/libsqueezefs_il.so" "$out/lib
 "$src/docker/check-artifacts.sh" "$out" \
   "${GLIBC_CEILING:?GLIBC_CEILING must be set (a version, or auto)}"
 
-# Hand artifacts back to the invoking host user (real-docker case; rootless
-# podman already maps container root onto the host user).
-if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
+# Hand artifacts back to the invoking host user — real-docker case only.
+# Rootless podman already maps container root onto the host user (there a
+# chown to HOST_UID would REMAP files to a subuid); the mapping is
+# detectable from the source mount's apparent owner: uid 0 = rootless
+# podman (leave alone), HOST_UID = real docker (chown back).
+if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ] \
+  && [ "$(stat -c %u "$src")" = "$HOST_UID" ]; then
   chown "$HOST_UID:$HOST_GID" "$out/squeezefs" "$out/libsqueezefs_il.so" 2>/dev/null || true
 fi

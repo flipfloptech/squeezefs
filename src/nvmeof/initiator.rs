@@ -157,11 +157,95 @@ fn find_device_for_nqn(subnqn: &str) -> std::io::Result<Option<String>> {
     )
 }
 
+/// Optional connect-time path/queue controls (the 2026-07-25
+/// live-cluster findings): pin the fabric connection's source
+/// address/interface on multi-homed hosts (same-subnet dual-NIC setups
+/// cannot select the path by routing alone), and bound the I/O-queue
+/// request to what the target will grant (a target granting fewer
+/// queues than requested fails the connect with errno -18). Every
+/// field passes through ONLY when supplied — an all-`None` value is
+/// byte-identical to the pre-flag behavior.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectOptions {
+    /// Local source address for the fabric connection
+    /// (nvme-cli `--host-traddr` / fabrics `host_traddr=`).
+    pub host_traddr: Option<String>,
+    /// Local source interface
+    /// (nvme-cli `--host-iface` / fabrics `host_iface=`).
+    pub host_iface: Option<String>,
+    /// Upper bound on requested I/O queues, ≥ 1
+    /// (nvme-cli `--nr-io-queues` / fabrics `nr_io_queues=`).
+    pub nr_io_queues: Option<u32>,
+}
+
+/// The nvme-cli argv for one connect. Pure and injectable (tested
+/// directly): the option-less shape is a stable prefix; supplied
+/// options only append their flag/value pairs.
+pub fn nvme_cli_connect_args(
+    ip: &str,
+    port: u16,
+    subnqn: &str,
+    opts: &ConnectOptions,
+) -> Vec<String> {
+    let mut args = vec![
+        "connect".to_string(),
+        "-t".to_string(),
+        "tcp".to_string(),
+        "-a".to_string(),
+        ip.to_string(),
+        "-s".to_string(),
+        port.to_string(),
+        "-n".to_string(),
+        subnqn.to_string(),
+    ];
+    if let Some(traddr) = &opts.host_traddr {
+        args.push("--host-traddr".to_string());
+        args.push(traddr.clone());
+    }
+    if let Some(iface) = &opts.host_iface {
+        args.push("--host-iface".to_string());
+        args.push(iface.clone());
+    }
+    if let Some(n) = opts.nr_io_queues {
+        args.push("--nr-io-queues".to_string());
+        args.push(n.to_string());
+    }
+    args
+}
+
+/// The `/dev/nvme-fabrics` option string for one connect (the
+/// no-nvme-cli fallback). Host identity is injectable (tested
+/// directly); supplied options map to the kernel's fabrics option
+/// names and append only when present.
+pub fn fabrics_connect_string(
+    ip: &str,
+    port: u16,
+    subnqn: &str,
+    hostnqn: &str,
+    hostid: &str,
+    opts: &ConnectOptions,
+) -> String {
+    let mut s = format!(
+        "transport=tcp,traddr={},trsvcid={},nqn={},hostnqn={},hostid={}",
+        ip, port, subnqn, hostnqn, hostid
+    );
+    if let Some(traddr) = &opts.host_traddr {
+        s.push_str(&format!(",host_traddr={}", traddr));
+    }
+    if let Some(iface) = &opts.host_iface {
+        s.push_str(&format!(",host_iface={}", iface));
+    }
+    if let Some(n) = opts.nr_io_queues {
+        s.push_str(&format!(",nr_io_queues={}", n));
+    }
+    s
+}
+
 fn connect_target_single(
     ip: &str,
     port: u16,
     subnqn: &str,
-    local_ip: Option<std::net::IpAddr>,
+    opts: &ConnectOptions,
 ) -> std::io::Result<()> {
     check_root()?;
     let _ = execute_cmd("modprobe", &["nvme-tcp"]);
@@ -170,22 +254,7 @@ fn connect_target_single(
     let has_nvme_cli = Command::new("nvme").arg("--version").status().is_ok();
 
     if has_nvme_cli {
-        let port_str = port.to_string();
-        let mut args = vec![
-            "connect".to_string(),
-            "-t".to_string(),
-            "tcp".to_string(),
-            "-a".to_string(),
-            ip.to_string(),
-            "-s".to_string(),
-            port_str,
-            "-n".to_string(),
-            subnqn.to_string(),
-        ];
-        if let Some(host_ip) = local_ip {
-            args.push("-p".to_string());
-            args.push(host_ip.to_string());
-        }
+        let args = nvme_cli_connect_args(ip, port, subnqn, opts);
         let output = Command::new("nvme").args(&args).output()?;
         if !output.status.success() {
             let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
@@ -205,23 +274,30 @@ fn connect_target_single(
             ));
         }
 
-        let hostnqn = get_host_nqn();
-        let hostid = get_host_id();
-        let mut ctrl_conn_str = format!(
-            "transport=tcp,traddr={},trsvcid={},nqn={},hostnqn={},hostid={}",
-            ip, port, subnqn, hostnqn, hostid
-        );
-        if let Some(host_ip) = local_ip {
-            ctrl_conn_str = format!("{},host_traddr={}", ctrl_conn_str, host_ip);
-        }
-
+        let ctrl_conn_str =
+            fabrics_connect_string(ip, port, subnqn, &get_host_nqn(), &get_host_id(), opts);
         fs::write(&dev_fabrics, &ctrl_conn_str)?;
     }
     Ok(())
 }
 
-pub fn connect_target(ip: &str, port: u16, subnqn: &str) -> std::io::Result<String> {
-    connect_target_single(ip, port, subnqn, None)?;
+pub fn connect_target(
+    ip: &str,
+    port: u16,
+    subnqn: &str,
+    opts: &ConnectOptions,
+) -> std::io::Result<String> {
+    // Refuse the degenerate bound BEFORE any side effect (root check,
+    // modprobe, connect): zero I/O queues is not a connection — the
+    // flag exists to bound the request, never to zero it.
+    if opts.nr_io_queues == Some(0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--nr-io-queues must be at least 1: the flag bounds the I/O-queue request to what \
+             the target grants; zero requests no I/O queues at all",
+        ));
+    }
+    connect_target_single(ip, port, subnqn, opts)?;
 
     // Wait up to 2 seconds for the block device node to appear in sysfs
     let start_time = std::time::Instant::now();

@@ -954,6 +954,28 @@ enum NvmeofActions {
         /// Remote target Subsystem NQN
         #[arg(long)]
         subnqn: String,
+        /// Source address for the fabric connection
+        ///
+        /// Binds the connection to the given local address. Required
+        /// when several local interfaces share a subnet and routing
+        /// alone cannot select the outgoing path; on distinct subnets
+        /// routing usually suffices.
+        #[arg(long)]
+        host_traddr: Option<String>,
+        /// Source network interface for the fabric connection
+        ///
+        /// Binds the connection to the named local interface. Combine
+        /// with --host-traddr to pin both the address and the
+        /// interface.
+        #[arg(long)]
+        host_iface: Option<String>,
+        /// Upper bound on the number of I/O queues to request
+        ///
+        /// A target may offer fewer I/O queues than the initiator
+        /// requests by default, which fails the connection; this flag
+        /// caps the request at the target's limit. Minimum 1.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        nr_io_queues: Option<u32>,
     },
     /// Disconnect local client from a remote NVMe-oF target
     Disconnect {
@@ -3209,9 +3231,21 @@ fn dispatch_nvmeof(action: NvmeofActions) -> Result<(), squeezefs::nvmeof::stack
                 record.subnqn
             );
         }
-        NvmeofActions::Connect { ip, port, subnqn } => {
+        NvmeofActions::Connect {
+            ip,
+            port,
+            subnqn,
+            host_traddr,
+            host_iface,
+            nr_io_queues,
+        } => {
             println!("Connecting to NVMe-oF target at {}:{}...", ip, port);
-            let dev = squeezefs::nvmeof::connect_target(&ip, port, &subnqn)?;
+            let opts = squeezefs::nvmeof::ConnectOptions {
+                host_traddr,
+                host_iface,
+                nr_io_queues,
+            };
+            let dev = squeezefs::nvmeof::connect_target(&ip, port, &subnqn, &opts)?;
             if dev.starts_with("/dev/") {
                 println!("{}", "Connection successful!".green().bold());
                 println!("Attached Remote Disk: {}", dev.cyan().bold());

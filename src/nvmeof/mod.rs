@@ -39,7 +39,7 @@ pub mod nvmet;
 pub mod spdk;
 pub mod stack;
 
-pub use initiator::{connect_target, disconnect_target};
+pub use initiator::{connect_target, disconnect_target, ConnectOptions};
 
 use std::collections::HashMap;
 use std::fs;

@@ -1849,6 +1849,175 @@ impl EscalationCooldown {
     }
 }
 
+/// Scan-resistant admission governor (2026-07-26 finding: cold-dominated
+/// random 4k over a working set ≫ budget collapsed the DEFAULT hybrid
+/// posture ~20× — ghost escalations fetched whole 4 MiB blocks that
+/// evicted before reuse, so admission bandwidth was pure waste competing
+/// with foreground reads for device queue slots; the per-key escalation
+/// cooldown alone under-bounds it because 2¹⁶-slot collisions ping-pong
+/// records on large key populations — measured 7× over the per-key bound
+/// on the 24 GiB rig set).
+///
+/// Two coupled mechanisms, both windowed over TWO 2-second epochs (the
+/// house sliding-window pattern — ghost table / stream gauge):
+///
+/// 1. **Waste signal** (the `prefetch_evicted_unconsumed` sibling for
+///    admissions): every hot-tier eviction of a *protected* (i.e.
+///    ghost-admitted) entry reports its payback — `served_bytes` accrued
+///    by real reader serves since insert. Shortfall against the entry's
+///    own length is windowed **waste**: the admission did not pay back
+///    its whole-block fetch. A never-served victim additionally counts
+///    `read_admission_evicted_unhit` (the headline tripwire).
+/// 2. **Clamp**: when windowed waste ≥ half of windowed admitted bytes
+///    (noise floor: two blocks), escalations are admitted only while
+///    windowed admitted bytes stay ≤ `fill_pct` % (default 5,
+///    `SQUEEZEFS_READ_ADMISSION_FILL_PCT`) of windowed *foreground*
+///    ranged device bytes — admission waste is bounded to a few percent
+///    of the device bandwidth the workload is already paying. Denials
+///    count `read_admission_governor_denials`; the denied read proceeds
+///    as a device-true ranged window read (always correctness-safe), and
+///    deliberately records **no** escalation cooldown, so genuinely hot
+///    keys retry and win the trickle (skew convergence).
+///
+/// Fitting working sets produce no evictions ⇒ no waste ⇒ the governor
+/// never clamps and warm-up/steady state are byte-identical to the
+/// pre-governor hybrid policy. Uniform beyond-budget churn keeps the
+/// waste ratio ≈ 100 % ⇒ the clamp is stable at the trickle. Skewed
+/// workloads: hot admissions pay back (clock `referenced` re-arming keeps
+/// them resident), tail admissions keep the clamp engaged — the hot
+/// subset converges to RAM while the tail stays device-true.
+///
+/// Concurrency: single-word `Relaxed` atomics, racy-tolerant by the same
+/// argument as [`GhostTable`] (a lost update is one extra or one denied
+/// escalation, never a correctness event); no cross-word invariant ⇒ no
+/// loom model required.
+pub struct AdmissionGovernor {
+    fill_pct: u64,
+    epoch: std::sync::atomic::AtomicU64,
+    admitted_cur: std::sync::atomic::AtomicU64,
+    admitted_prev: std::sync::atomic::AtomicU64,
+    wasted_cur: std::sync::atomic::AtomicU64,
+    wasted_prev: std::sync::atomic::AtomicU64,
+    foreground_cur: std::sync::atomic::AtomicU64,
+    foreground_prev: std::sync::atomic::AtomicU64,
+    clamped: std::sync::atomic::AtomicBool,
+}
+
+impl AdmissionGovernor {
+    const EPOCH_MS: u64 = 2_000;
+
+    pub fn new(fill_pct: u64) -> Self {
+        Self {
+            fill_pct: fill_pct.min(100),
+            epoch: std::sync::atomic::AtomicU64::new(0),
+            admitted_cur: std::sync::atomic::AtomicU64::new(0),
+            admitted_prev: std::sync::atomic::AtomicU64::new(0),
+            wasted_cur: std::sync::atomic::AtomicU64::new(0),
+            wasted_prev: std::sync::atomic::AtomicU64::new(0),
+            foreground_cur: std::sync::atomic::AtomicU64::new(0),
+            foreground_prev: std::sync::atomic::AtomicU64::new(0),
+            clamped: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Slide the two-epoch window (op-driven; the CAS winner shifts).
+    fn roll(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = StreamLanes::now_ms() / Self::EPOCH_MS;
+        let seen = self.epoch.load(Relaxed);
+        if seen != now
+            && self
+                .epoch
+                .compare_exchange(seen, now, Relaxed, Relaxed)
+                .is_ok()
+        {
+            let adjacent = now == seen.wrapping_add(1);
+            for (cur, prev) in [
+                (&self.admitted_cur, &self.admitted_prev),
+                (&self.wasted_cur, &self.wasted_prev),
+                (&self.foreground_cur, &self.foreground_prev),
+            ] {
+                let c = cur.swap(0, Relaxed);
+                prev.store(if adjacent { c } else { 0 }, Relaxed);
+            }
+        }
+    }
+
+    fn window(
+        cur: &std::sync::atomic::AtomicU64,
+        prev: &std::sync::atomic::AtomicU64,
+    ) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        cur.load(Relaxed).saturating_add(prev.load(Relaxed))
+    }
+
+    /// Foreground ranged device bytes — the clamp's denominator. Fed at
+    /// the ranged device-read site (the workload's own device spend);
+    /// escalation fetches deliberately do NOT feed it (no self-funding).
+    pub fn note_foreground(&self, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.roll();
+        self.foreground_cur.fetch_add(bytes, Relaxed);
+    }
+
+    /// Eviction report from the governed (hot-block) tier: protected
+    /// victims carry their payback credit; the shortfall is windowed
+    /// waste. Probation victims (stream residue) are not admissions and
+    /// never count.
+    pub fn on_eviction(&self, len: u64, class: &crate::tiering::memory::EvictClass) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let crate::tiering::memory::EvictClass::Protected { served_bytes } = class else {
+            return;
+        };
+        let waste = len.saturating_sub(*served_bytes);
+        if waste == 0 {
+            return;
+        }
+        self.roll();
+        self.wasted_cur.fetch_add(waste, Relaxed);
+        METRICS
+            .read_admission_wasted_bytes
+            .fetch_add(waste, Relaxed);
+        if *served_bytes == 0 {
+            METRICS
+                .read_admission_evicted_unhit
+                .fetch_add(1, Relaxed);
+        }
+    }
+
+    /// The escalation-site decision: admit (accounting the block) or deny
+    /// (counted; the caller falls back to the device-true ranged window
+    /// read and records no cooldown).
+    pub fn allow_escalation(&self, block_bytes: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.roll();
+        let admitted = Self::window(&self.admitted_cur, &self.admitted_prev);
+        let wasted = Self::window(&self.wasted_cur, &self.wasted_prev);
+        let clamped =
+            wasted >= 2 * block_bytes.max(1) && wasted.saturating_mul(2) >= admitted;
+        self.clamped.store(clamped, Relaxed);
+        if clamped {
+            let foreground = Self::window(&self.foreground_cur, &self.foreground_prev);
+            let spend = admitted.saturating_add(block_bytes).saturating_mul(100);
+            if spend > foreground.saturating_mul(self.fill_pct) {
+                METRICS
+                    .read_admission_governor_denials
+                    .fetch_add(1, Relaxed);
+                return false;
+            }
+        }
+        self.admitted_cur.fetch_add(block_bytes, Relaxed);
+        true
+    }
+
+    /// Stats gauge: the clamp verdict of the most recent escalation
+    /// attempt (windowed state is op-driven; this is a snapshot, not a
+    /// recomputation).
+    pub fn clamped(&self) -> bool {
+        self.clamped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// One classifier offset lane (§5.3) grown into the R2 pipeline owner
 /// (§5.5): racy-tolerant atomics throughout — moka races and lost updates
 /// cost a later classification or a slightly mis-sized window, never

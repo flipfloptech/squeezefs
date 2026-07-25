@@ -1884,6 +1884,19 @@ pub struct Metrics {
     /// growing on a pure one-pass scan means the ghost window is
     /// misclassifying (collisions — check `read_tier_admission_ghost_hits`).
     pub ranged_read_ghost_escalations: Align64<AtomicU64>,
+    /// Scan-resistant admission governor (2026-07-26; the beyond-budget
+    /// random-read collapse): `evicted_unhit` — ghost-admitted hot-tier
+    /// victims evicted without EVER serving a reader (the
+    /// `prefetch_evicted_unconsumed` sibling for admissions; sustained
+    /// growth = the cache is not earning and the clamp should be engaged);
+    /// `wasted_bytes` — cumulative payback shortfall of admitted victims
+    /// (waste ÷ device read bytes is the bounded-waste verdict, target ≤
+    /// a few percent under churn); `governor_denials` — escalations
+    /// refused by the clamp (each one stayed a device-true ranged window
+    /// read; ≈ 0 on fitting working sets by construction).
+    pub read_admission_evicted_unhit: Align64<AtomicU64>,
+    pub read_admission_wasted_bytes: Align64<AtomicU64>,
+    pub read_admission_governor_denials: Align64<AtomicU64>,
     /// R5 (§5.7 Yellow row): dehydration-worker victims dropped because the
     /// memory authority paused dehydration entirely (protected included —
     /// disk-tier warmth is the cheapest sacrifice under memory pressure).
@@ -4045,6 +4058,9 @@ impl SqueezefsFilesystem {
                 "ranged_read_unaligned_bounces": METRICS.ranged_read_unaligned_bounces.load(Ordering::Relaxed),
                 "ranged_read_rebinds": METRICS.ranged_read_rebinds.load(Ordering::Relaxed),
                 "ranged_read_ghost_escalations": METRICS.ranged_read_ghost_escalations.load(Ordering::Relaxed),
+                "read_admission_evicted_unhit": METRICS.read_admission_evicted_unhit.load(Ordering::Relaxed),
+                "read_admission_wasted_bytes": METRICS.read_admission_wasted_bytes.load(Ordering::Relaxed),
+                "read_admission_governor_denials": METRICS.read_admission_governor_denials.load(Ordering::Relaxed),
                 "mem_budget_bytes": crate::mem_budget::MEM_BUDGET.budget_bytes(),
                 "mem_budget_pressure_bytes": crate::mem_budget::MEM_BUDGET.pressure_bytes(),
                 "mem_budget_gauge_sum_bytes": crate::mem_budget::MEM_BUDGET.gauge_sum_bytes(),

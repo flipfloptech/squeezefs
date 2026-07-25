@@ -348,7 +348,7 @@ fn probation_get_promotes_sticky_protected() {
         "promoted entry evicts after its second chance"
     );
     assert!(
-        matches!(ev3[0].2, EvictClass::Protected),
+        matches!(ev3[0].2, EvictClass::Protected { .. }),
         "sticky protected must survive the clock scan's referenced-bit \
          consumption"
     );

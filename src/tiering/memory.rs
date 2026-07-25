@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use xxhash_rust::xxh3::xxh3_64;
 
 /// The victim's sticky classification at eviction time, read from the
@@ -8,10 +8,17 @@ use xxhash_rust::xxh3::xxh3_64;
 /// dehydrate to the NVMe tier; `Probation` (inserted probationary, never
 /// read) ⇒ dropped. NOTE: PR 3 plumbs this behavior-neutral (all classes
 /// still dehydrate); the gate flip is PR 4 policy.
+///
+/// `served_bytes` (admission-governor waste basis, docs/design-read-path.md
+/// §5.3 scan-resistance addendum): the payback credit serve sites accrued
+/// on this entry since insert (`get_serving`). A protected — i.e.
+/// ghost-admitted — victim whose credit never reached its own length did
+/// not pay back its whole-block admission fetch; the governor counts the
+/// shortfall as windowed waste.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvictClass {
     Probation,
-    Protected,
+    Protected { served_bytes: u64 },
 }
 
 /// Entry state: the shard value grows ONE sticky class bit beside the
@@ -33,6 +40,11 @@ pub enum EvictClass {
 struct EntryState {
     referenced: AtomicBool,
     protected: AtomicBool,
+    /// Payback credit (bytes served to real readers since insert) — the
+    /// admission governor's waste basis, reported with the victim at
+    /// eviction. Relaxed accumulate; a racy lost add is a slightly
+    /// stiffer clamp, never a correctness event.
+    served_bytes: AtomicU64,
 }
 
 /// A single thread-safe shard of the Clock cache.
@@ -62,10 +74,16 @@ impl MemoryCacheShard {
         }
     }
 
-    fn get(&self, key: &[u8], promote: bool) -> Option<Bytes> {
+    fn get(&self, key: &[u8], promote: bool, served_bytes: u64) -> Option<Bytes> {
         let entry = self.map.get_sync(key)?;
         let (value, state) = entry.get();
         state.referenced.store(true, Ordering::Relaxed);
+        if served_bytes > 0 {
+            // Serve-site payback credit (admission governor): only real
+            // reader serves pass a length; probes and residency checks
+            // pass 0 and never inflate an entry's payback.
+            state.served_bytes.fetch_add(served_bytes, Ordering::Relaxed);
+        }
         if promote {
             // Sticky promotion (§5.4): a block-level re-access marks the
             // entry worth keeping — never cleared by the clock scan.
@@ -126,6 +144,7 @@ impl MemoryCacheShard {
                         // stickiness.
                         referenced: AtomicBool::new(referenced),
                         protected: AtomicBool::new(protected),
+                        served_bytes: AtomicU64::new(0),
                     },
                 )
             });
@@ -159,7 +178,9 @@ impl MemoryCacheShard {
                     let (value, state) = entry.remove();
                     self.current_bytes.fetch_sub(value.len(), Ordering::Relaxed);
                     let class = if state.protected.load(Ordering::Relaxed) {
-                        EvictClass::Protected
+                        EvictClass::Protected {
+                            served_bytes: state.served_bytes.load(Ordering::Relaxed),
+                        }
                     } else {
                         EvictClass::Probation
                     };
@@ -207,7 +228,11 @@ impl MemoryCacheShard {
                                 // is false for every victim by
                                 // construction and could never classify.
                                 class = if state.protected.load(Ordering::Relaxed) {
-                                    EvictClass::Protected
+                                    EvictClass::Protected {
+                                        served_bytes: state
+                                            .served_bytes
+                                            .load(Ordering::Relaxed),
+                                    }
                                 } else {
                                     EvictClass::Probation
                                 };
@@ -278,7 +303,7 @@ impl MemoryCache {
     /// Promotes probation entries to sticky-protected (block-level re-access).
     pub fn get(&self, key: &[u8]) -> Option<Bytes> {
         let idx = self.get_shard_idx(key);
-        self.shards[idx].get(key, true)
+        self.shards[idx].get(key, true, 0)
     }
 
     /// [`Self::get`] WITHOUT sticky promotion — stream sub-read
@@ -286,7 +311,16 @@ impl MemoryCache {
     /// consuming a fill's own sub-ranges never marks it keep-worthy.
     pub fn get_no_promote(&self, key: &[u8]) -> Option<Bytes> {
         let idx = self.get_shard_idx(key);
-        self.shards[idx].get(key, false)
+        self.shards[idx].get(key, false, 0)
+    }
+
+    /// [`Self::get_no_promote`] plus payback credit: a real reader serve
+    /// of `served_bytes` user bytes accrues on the entry (the admission
+    /// governor's waste basis, reported with the victim at eviction).
+    /// Probes/residency checks must use the non-crediting variants.
+    pub fn get_serving(&self, key: &[u8], served_bytes: u64) -> Option<Bytes> {
+        let idx = self.get_shard_idx(key);
+        self.shards[idx].get(key, false, served_bytes)
     }
 
     /// Inserts an item as PROTECTED (referenced=true, protected=true) —

@@ -46,6 +46,12 @@ pub struct LruCache {
     /// no channel traffic). Set for the hot-block tier; read_lru keeps
     /// full-channel behavior (its inserts are all protected anyway).
     drop_probation_evictions: bool,
+    /// Scan-resistance waste sink (hot-block tier only): every victim is
+    /// reported to the admission governor at the eviction SOURCE — clock
+    /// evictions, Yellow-freeze clamps and Red sheds alike — so
+    /// admitted-but-never-paid-back evictions feed the escalation clamp.
+    /// `purge`/`remove` (invalidations) deliberately do not report.
+    admission_governor: Option<Arc<crate::routing::AdmissionGovernor>>,
 }
 
 impl LruCache {
@@ -62,10 +68,26 @@ impl LruCache {
 
     /// Construct with a custom memory limit in bytes.
     pub fn with_capacity(max_bytes: u64) -> Self {
+        Self::with_capacity_min_shard(max_bytes, 0)
+    }
+
+    /// [`Self::with_capacity`] with a minimum per-shard capacity: caches
+    /// holding multi-MiB values (the hot-block tier) must keep several
+    /// NEIGHBORS per shard or hash-colliding keys can never coexist —
+    /// core-count sharding gave the default 128 MiB hot budget ONE 4 MiB
+    /// block per shard (perpetual churn on fitting working sets). The
+    /// shard count is reduced (never below 1) until each shard holds at
+    /// least `min_shard_bytes`.
+    pub fn with_capacity_min_shard(max_bytes: u64, min_shard_bytes: u64) -> Self {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(16);
-        let num_shards = std::cmp::max(cores.next_power_of_two(), 16);
+        let mut num_shards = std::cmp::max(cores.next_power_of_two(), 16);
+        if min_shard_bytes > 0 {
+            while num_shards > 1 && max_bytes / (num_shards as u64) < min_shard_bytes {
+                num_shards /= 2;
+            }
+        }
 
         let mut actual_shards = num_shards;
 
@@ -103,6 +125,7 @@ impl LruCache {
             evict_channel_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             evict_rx_taken: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drop_probation_evictions: false,
+            admission_governor: None,
         }
     }
 
@@ -138,6 +161,16 @@ impl LruCache {
         self
     }
 
+    /// Builder: attach the scan-resistance admission governor (hot-block
+    /// tier only — see `admission_governor`).
+    pub fn with_admission_governor(
+        mut self,
+        governor: Arc<crate::routing::AdmissionGovernor>,
+    ) -> Self {
+        self.admission_governor = Some(governor);
+        self
+    }
+
     /// Retrieve the eviction receiver. Can only be taken once; taking it
     /// is what ARMS the send side (victims of worker-less caches drop at
     /// the source instead of parking in an unconsumed channel).
@@ -161,6 +194,14 @@ impl LruCache {
     /// consuming its own sub-ranges.
     pub fn get_no_promote(&self, key: &str) -> Option<Bytes> {
         self.inner.get_no_promote(key.as_bytes())
+    }
+
+    /// Non-promoting get WITH payback credit — real reader serves pass
+    /// the user bytes they served so the entry's eventual eviction can be
+    /// classified earned-vs-waste by the admission governor. Probes and
+    /// residency checks must use [`Self::get_no_promote`] (credit 0).
+    pub fn get_serving(&self, key: &str, served_bytes: u64) -> Option<Bytes> {
+        self.inner.get_serving(key.as_bytes(), served_bytes)
     }
 
     /// Insert an entry as PROTECTED (the pre-R4 semantics — every put via
@@ -192,7 +233,10 @@ impl LruCache {
     /// dehydration pause is already active below Red, and a clamp that
     /// queued multi-MiB payloads would re-create the pressure it sheds.
     pub fn shed_to(&self, target: u64) {
-        for (_k, _v, class) in self.inner.shed_to(target as usize) {
+        for (_k, v, class) in self.inner.shed_to(target as usize) {
+            if let Some(gov) = &self.admission_governor {
+                gov.on_eviction(v.len() as u64, &class);
+            }
             crate::fuse_client::METRICS
                 .hot_block_evictions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -229,6 +273,13 @@ impl LruCache {
                 return;
             }
             for (ek, ev, class) in evicted {
+                // Scan resistance: report every victim's payback verdict
+                // to the governor at the SOURCE (before any channel/drop
+                // routing — victims dropped by the byte bound must still
+                // count their waste).
+                if let Some(gov) = &self.admission_governor {
+                    gov.on_eviction(ev.len() as u64, &class);
+                }
                 // R1b liveness (the PR 4 bench OOM): probation victims of a
                 // drop-probation cache are one-pass residue — dropping them
                 // AT THE SOURCE keeps multi-MiB `Bytes` from ever parking

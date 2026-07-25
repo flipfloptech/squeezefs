@@ -25,6 +25,11 @@ pub struct TieredCache {
     /// BESIDE `--read-mem-cache-size`, not from it
     /// (`SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB`; 0 short-circuits the tier).
     pub hot_block: lru::LruCache,
+    /// Scan-resistant admission governor (docs/design-read-path.md §5.3
+    /// addendum): owns the escalation clamp windows; fed waste by the
+    /// hot-block tier's evictions and foreground bytes by the ranged
+    /// device-read site.
+    pub admission_governor: std::sync::Arc<crate::routing::AdmissionGovernor>,
     pub nvme: nvme::NvmeStaging,
 }
 
@@ -91,7 +96,39 @@ impl TieredCache {
             }
             Err(_) => std::cmp::max(2 * 4 * 1024 * 1024, read_mem_limit / 4),
         };
-        let hot_block = lru::LruCache::with_capacity(hot_budget).with_drop_probation_evictions();
+        // Scan-resistance clamp budget: escalation fill bytes as a percent
+        // of foreground ranged device bytes while the waste signal holds
+        // (default 5 — admission waste bounded to a few percent of the
+        // device bandwidth the workload already pays; 0 = no escalations
+        // while clamped; fitting working sets never clamp).
+        let fill_pct = match std::env::var("SQUEEZEFS_READ_ADMISSION_FILL_PCT") {
+            Ok(v) => {
+                let p = v.trim().parse::<u64>().map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!(
+                        "SQUEEZEFS_READ_ADMISSION_FILL_PCT must be an integer percent 0..=100: {e}"
+                    ))
+                })?;
+                if p > 100 {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "SQUEEZEFS_READ_ADMISSION_FILL_PCT must be 0..=100 (got {p})"
+                    )));
+                }
+                p
+            }
+            Err(_) => 5,
+        };
+        let admission_governor =
+            std::sync::Arc::new(crate::routing::AdmissionGovernor::new(fill_pct));
+        // Shard geometry: 4 MiB hot values need shards that can hold a few
+        // NEIGHBORS — the generic core-count sharding gave the default
+        // 128 MiB budget 32 shards = ONE block per shard, so any two keys
+        // sharing a shard could never coexist (measured on the rig as
+        // perpetual protected churn at 50 % budget fill: 6.1k whole-block
+        // refetches / 20 s on a FITTING 64 MiB set). Keep per-shard
+        // capacity ≥ 4 default blocks (16 MiB).
+        let hot_block = lru::LruCache::with_capacity(hot_budget)
+            .with_drop_probation_evictions()
+            .with_admission_governor(admission_governor.clone());
 
         // 2. Get disk size limit
         let aggregate_capacity = get_aggregate_disk_capacity(&staging_dirs);
@@ -233,7 +270,7 @@ impl TieredCache {
                             // racing tier eviction after the probe just
                             // re-cools one block — the always-true device
                             // fallback, never wrongness.
-                            crate::tiering::memory::EvictClass::Protected => {
+                            crate::tiering::memory::EvictClass::Protected { .. } => {
                                 // R5 Yellow+ (§5.7): dehydration paused
                                 // entirely — protected victims INCLUDED
                                 // (an escalation over the steady-state
@@ -266,6 +303,7 @@ impl TieredCache {
             read_lru,
             write_lru,
             hot_block,
+            admission_governor,
             nvme,
         })
     }

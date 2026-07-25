@@ -241,6 +241,40 @@ fn slab_fit_cap_and_zero_length_classify_kernel() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn libaio_symbols_carry_explicit_default_versions() {
+    // The 2026-07-25 Rocky 8 field segfault (glibc 2.28, libaio
+    // 0.3.112): glibc < 2.36 `dlsym(RTLD_NEXT, …)` returns the BASE
+    // version of a multi-versioned symbol — `io_getevents@LIBAIO_0.1`,
+    // a 4-argument compat wrapper whose internal PLT call re-enters the
+    // interposer; called with the 5-argument LIBAIO_0.4 convention it
+    // register-shuffles until an integer lands in the timeout register
+    // (`movdqu (%rcx)` at EL8 offset 0xF00 — the field frame). Every
+    // interposed libaio symbol therefore resolves via `dlvsym` with its
+    // explicit default version, falling back to plain `dlsym` only when
+    // that version does not exist (unversioned/static builds).
+    use squeezefs_il::aio_glue::libaio_default_version;
+    assert_eq!(libaio_default_version("io_setup"), Some("LIBAIO_0.4"));
+    assert_eq!(libaio_default_version("io_destroy"), Some("LIBAIO_0.4"));
+    assert_eq!(libaio_default_version("io_submit"), Some("LIBAIO_0.1"));
+    assert_eq!(
+        libaio_default_version("io_getevents"),
+        Some("LIBAIO_0.4"),
+        "the field-crash symbol: 0.1 is the 4-arg compat trap"
+    );
+    assert_eq!(
+        libaio_default_version("io_cancel"),
+        Some("LIBAIO_0.4"),
+        "same multi-version class as io_getevents"
+    );
+    assert_eq!(libaio_default_version("io_pgetevents"), Some("LIBAIO_0.5"));
+    assert_eq!(
+        libaio_default_version("open"),
+        None,
+        "libc-family symbols stay on unversioned dlsym"
+    );
+}
+
+#[test]
 fn register_lookup_remove_roundtrip() {
     let reg: AioCtxRegistry = AioCtxRegistry::new();
     assert!(reg.lookup(0x7000).is_none(), "unknown ctx must lookup None");

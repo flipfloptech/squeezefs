@@ -1,0 +1,32 @@
+# Rocky Linux 8 (latest 8.x) RUNTIME-REPRO image — the 2026-07-25 field
+# segfault's userspace (glibc 2.28, libaio 0.3.112, dynamic elbencho with
+# the libaio engine), for `tests/run_rocky8_aio_repro.sh`.
+#
+# Derives the environment, not the build: artifacts come from
+# `task build:rocky8` (dist/rocky8/), bind-mounted at run time. The
+# container needs --device /dev/fuse and privileges to FUSE-mount
+# (local test container — acceptable per the repro charter).
+FROM docker.io/rockylinux/rockylinux:8
+
+RUN dnf -y install dnf-plugins-core \
+ && dnf config-manager --set-enabled powertools \
+ && dnf -y install \
+      gcc gcc-c++ make git file binutils findutils cmake \
+      libaio libaio-devel \
+      boost-devel numactl-devel openssl-devel ncurses-devel \
+      fuse3 fuse3-devel \
+      python3 procps-ng gdb \
+ && dnf clean all
+
+# The reporter's instrument: DYNAMIC elbencho built in-distro (the pinned
+# static release cannot load an LD_PRELOAD shim — AGENTS.md lesson).
+# BACKTRACE_SUPPORT=0: EL8 ships no libbacktrace; crash attribution here
+# rides core dumps + the image's gdb instead of boost stacktrace.
+RUN git clone --depth 1 https://github.com/breuner/elbencho.git /opt/elbencho \
+ && make -C /opt/elbencho -j"$(nproc)" BACKTRACE_SUPPORT=0 \
+ && install -m 0755 /opt/elbencho/bin/elbencho /usr/local/bin/elbencho \
+ && ldd /usr/local/bin/elbencho | grep -q libaio.so.1 \
+ && rm -rf /opt/elbencho
+
+# FUSE-in-container hygiene: allow_other needs user_allow_other.
+RUN sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf || true

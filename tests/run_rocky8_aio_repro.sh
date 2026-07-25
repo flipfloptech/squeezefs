@@ -50,7 +50,9 @@ if ! $CT image exists squeezefs-test:rocky8 2>/dev/null; then
     $CT build -t squeezefs-test:rocky8 -f docker/Dockerfile.rocky8-test docker
 fi
 
-$CT run --rm \
+# -i: the leg script rides stdin (`bash -s`); without it the container
+# shell sees EOF and exits 0 silently — a false green.
+$CT run --rm -i \
     --privileged --device /dev/fuse \
     -v "$REPO_DIR/dist/rocky8:/art:ro" \
     -v "squeezefs-target-rocky8:/build" \

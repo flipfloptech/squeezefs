@@ -65,6 +65,39 @@ pub struct RawIoEvent {
 }
 
 // ---------------------------------------------------------------------------
+// symbol-version table (the 2026-07-25 Rocky 8 field segfault)
+// ---------------------------------------------------------------------------
+
+/// The DEFAULT version of each interposed `libaio.so.1` symbol.
+///
+/// glibc < 2.36 `dlsym(RTLD_NEXT, …)` returns the **base** version of a
+/// multi-versioned symbol, not the default: on EL8's libaio 0.3.112
+/// that hands the interposer `io_getevents@LIBAIO_0.1` — a 4-argument
+/// compat wrapper whose internal PLT call re-enters the interposer —
+/// instead of the 5-argument `io_getevents@@LIBAIO_0.4`. Calling it
+/// with the 0.4 convention register-shuffles until an integer lands in
+/// its timeout register (`movdqu (%rcx)`, EL8 offset 0xF00 — the field
+/// crash frame). The interposers therefore resolve every libaio symbol
+/// via `dlvsym` with the version listed here, falling back to plain
+/// `dlsym` only when that version does not exist (unversioned/static
+/// libaio builds). libc-family symbols are NOT listed: they are
+/// single-version at their link names and stay on unversioned `dlsym`.
+///
+/// Version facts pinned against libaio 0.3.112 (EL8) and 0.3.113:
+/// `io_submit` only ever shipped as `LIBAIO_0.1`; `io_pgetevents` was
+/// added at `LIBAIO_0.5`; `io_getevents`/`io_cancel` carry 0.1 compat
+/// versions below their 0.4 defaults; `io_setup`/`io_destroy` are
+/// sole-version 0.4.
+pub fn libaio_default_version(sym: &str) -> Option<&'static str> {
+    match sym {
+        "io_setup" | "io_destroy" | "io_getevents" | "io_cancel" => Some("LIBAIO_0.4"),
+        "io_submit" => Some("LIBAIO_0.1"),
+        "io_pgetevents" => Some("LIBAIO_0.5"),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // eligibility screen
 // ---------------------------------------------------------------------------
 

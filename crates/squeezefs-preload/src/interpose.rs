@@ -288,6 +288,55 @@ macro_rules! real {
     }};
 }
 
+/// Real-function chaining for the **libaio** symbols — `dlvsym` with the
+/// symbol's explicit default version (`aio_glue::libaio_default_version`),
+/// plain `dlsym` only when that version is absent (unversioned/static
+/// libaio builds).
+///
+/// Why not `real!`: glibc < 2.36 `dlsym(RTLD_NEXT, …)` returns the BASE
+/// version of a multi-versioned symbol — on EL8 that is
+/// `io_getevents@LIBAIO_0.1`, a 4-argument compat wrapper whose internal
+/// PLT call re-enters this interposer; called with the 5-argument 0.4
+/// convention it register-shuffles until an integer lands in its
+/// timeout register and faults inside libaio (the 2026-07-25 Rocky 8
+/// field segfault, frames 0xF00/0xF1B). `dlvsym` is version-exact on
+/// every glibc.
+macro_rules! real_aio {
+    ($sym:literal, $sig:ty) => {{
+        static PTR: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+        let mut p = PTR.load(Ordering::Relaxed);
+        if p.is_null() {
+            let name = concat!($sym, "\0").as_ptr() as *const c_char;
+            if let Some(ver) = crate::aio_glue::libaio_default_version($sym) {
+                // One tiny NUL-terminated copy on the first resolve only.
+                let mut vbuf = [0u8; 16];
+                let vb = ver.as_bytes();
+                if vb.len() < vbuf.len() {
+                    vbuf[..vb.len()].copy_from_slice(vb);
+                    // SAFETY: dlvsym(RTLD_NEXT) with NUL-terminated
+                    // symbol + version strings.
+                    p = unsafe {
+                        libc::dlvsym(libc::RTLD_NEXT, name, vbuf.as_ptr() as *const c_char)
+                    };
+                }
+            }
+            if p.is_null() {
+                // SAFETY: dlsym(RTLD_NEXT) with a NUL-terminated literal
+                // (unversioned providers; the versioned trap cannot
+                // apply where the version does not exist).
+                p = unsafe { libc::dlsym(libc::RTLD_NEXT, name) };
+            }
+            PTR.store(p, Ordering::Relaxed);
+        }
+        if p.is_null() {
+            None
+        } else {
+            // SAFETY: the symbol's C signature is $sig by libaio contract.
+            Some(unsafe { std::mem::transmute::<*mut c_void, $sig>(p) })
+        }
+    }};
+}
+
 // ---------------------------------------------------------------------------
 // bind / release plumbing
 // ---------------------------------------------------------------------------
@@ -1400,7 +1449,7 @@ struct RealKernel {
 
 impl KernelLane for RealKernel {
     fn submit_run(&mut self, iocb_ids: &[u64]) -> isize {
-        let Some(f) = real!("io_submit", IoSubmitFn) else {
+        let Some(f) = real_aio!("io_submit", IoSubmitFn) else {
             return -(libc::ENOSYS as isize);
         };
         // SAFETY: a &[u64] of iocb pointers is layout-identical to the
@@ -1417,7 +1466,7 @@ impl KernelLane for RealKernel {
     }
 
     fn getevents(&mut self, min: usize, max: usize, timeout_ms: Option<u64>) -> Vec<AioEvent> {
-        let Some(f) = real!("io_getevents", IoGetEventsFn) else {
+        let Some(f) = real_aio!("io_getevents", IoGetEventsFn) else {
             return Vec::new();
         };
         let mut raw: Vec<RawIoEvent> = vec![
@@ -1483,7 +1532,7 @@ fn aio_retro_neutralize(ctx: u64) {
 /// C ABI interposer; argument contracts are libaio's own.
 #[no_mangle]
 pub unsafe extern "C" fn io_setup(maxevents: c_int, ctxp: *mut u64) -> c_int {
-    let Some(f) = real!("io_setup", IoSetupFn) else {
+    let Some(f) = real_aio!("io_setup", IoSetupFn) else {
         return -libc::ENOSYS;
     };
     // SAFETY: chaining the real io_setup.
@@ -1538,7 +1587,7 @@ pub unsafe extern "C" fn io_destroy(ctx: u64) -> c_int {
     {
         panic_poison();
     }
-    let Some(f) = real!("io_destroy", IoDestroyFn) else {
+    let Some(f) = real_aio!("io_destroy", IoDestroyFn) else {
         return -libc::ENOSYS;
     };
     // SAFETY: chaining the real io_destroy (kernel-lane ops die with
@@ -1550,7 +1599,7 @@ pub unsafe extern "C" fn io_destroy(ctx: u64) -> c_int {
 /// C ABI interposer; argument contracts are libaio's own.
 #[no_mangle]
 pub unsafe extern "C" fn io_submit(ctx: u64, nr: c_long, ios: *mut *mut RawIocb) -> c_int {
-    let real = real!("io_submit", IoSubmitFn);
+    let real = real_aio!("io_submit", IoSubmitFn);
     let fallback = |f: Option<IoSubmitFn>| -> c_int {
         match f {
             // SAFETY: chaining the real io_submit verbatim.
@@ -1746,7 +1795,7 @@ pub unsafe extern "C" fn io_getevents(
     events: *mut RawIoEvent,
     timeout: *mut libc::timespec,
 ) -> c_int {
-    let real = real!("io_getevents", IoGetEventsFn);
+    let real = real_aio!("io_getevents", IoGetEventsFn);
     let fallback = |f: Option<IoGetEventsFn>| -> c_int {
         match f {
             // SAFETY: chaining the real io_getevents verbatim.
@@ -1803,7 +1852,7 @@ pub unsafe extern "C" fn io_pgetevents(
     timeout: *mut libc::timespec,
     sigmask: *const libc::sigset_t,
 ) -> c_int {
-    let real = real!("io_pgetevents", IoPGetEventsFn);
+    let real = real_aio!("io_pgetevents", IoPGetEventsFn);
     let fallback = |f: Option<IoPGetEventsFn>| -> c_int {
         match f {
             // SAFETY: chaining the real io_pgetevents verbatim.
@@ -1837,7 +1886,7 @@ pub unsafe extern "C" fn io_pgetevents(
 /// so the real call stays exact.
 #[no_mangle]
 pub unsafe extern "C" fn io_cancel(ctx: u64, iocb: *mut RawIocb, evt: *mut RawIoEvent) -> c_int {
-    let real = real!("io_cancel", IoCancelFn);
+    let real = real_aio!("io_cancel", IoCancelFn);
     let fallback = |f: Option<IoCancelFn>| -> c_int {
         match f {
             // SAFETY: chaining the real io_cancel verbatim.

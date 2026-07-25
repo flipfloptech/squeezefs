@@ -316,6 +316,37 @@ fn wait_sessions_active(expect: u64, what: &str) {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn hello_on_control_plane_only_host_refuses_class_disabled() {
+    // User directive 2026-07-25 (reason-bearing shim refusal lines): a
+    // mount without `-o interception` arms the VL2 control-plane-only
+    // host, which refuses every data-plane HELLO — previously with the
+    // opaque `Flags` class (indistinguishable from a credential-fd
+    // screen refusal). The daemon KNOWS the reason; the wire must carry
+    // it so the shim can print "interception not armed on this mount".
+    let mut cfg = test_config("ctlonly");
+    cfg.data_plane = false;
+    let host = IpcHost::spawn(cfg.clone(), Arc::new(EchoSessionSink)).expect("host must spawn");
+    let mf = mount_file();
+    host.set_expected_st_dev(mf.st_dev);
+    let fd = open_flags(&mf.path, libc::O_RDWR);
+
+    let (_sock, reply, _) = hello(
+        &cfg,
+        &host,
+        fd.as_raw_fd(),
+        &cfg.build_commit,
+        host.current_nonce(),
+        std::process::id(),
+        unsafe { libc::getuid() },
+    );
+    expect_refuse(
+        &reply,
+        RefuseClass::Disabled,
+        "control-plane-only mount must name its refusal (not the Flags screen)",
+    );
+}
+
+#[test]
 fn hello_version_skew_refuses_including_unknown_and_dirty() {
     let (host, cfg) = spawn_host("skew");
     let mf = mount_file();

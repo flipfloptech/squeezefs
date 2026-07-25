@@ -39,6 +39,12 @@ crate-type = ["cdylib", "rlib"]
 libc = "0.2"
 squeezefs-ipc = { path = "../squeezefs-ipc" }
 
+[dev-dependencies]
+# The crate's own integration tests speak the wire types directly
+# (refusal-class reason formatting) and use libc errno constants.
+libc = "0.2"
+squeezefs-ipc = { path = "../squeezefs-ipc" }
+
 [features]
 # The #[no_mangle] libc interposer symbols. ONLY the shipped cdylib
 # enables this: an rlib carrying strong `open`/`read`/`write`/`close`

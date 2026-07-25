@@ -388,9 +388,10 @@ done
 # 2k. libaio lifecycle in the ESTABLISH-REFUSED shape — the 2026-07-25
 # field crash environment, exactly: a mount WITHOUT -o interception
 # still arms the VL2 control-plane host (bootstrap xattr serves, the
-# listener answers) but refuses every data-plane HELLO, so each
-# eligible open prints "session establish failed — mount passthrough"
-# and the fd stays unbound. libaio through the shim must then be
+# listener answers) but refuses every data-plane HELLO, so the shim
+# reports "session refused: interception not armed on this mount"
+# (once per mount+reason) and the fds stay unbound. libaio through the
+# shim must then be
 # PERFECTLY passthrough: full lifecycle green, zero ipc data ops.
 if [ "$AIO_SKIP" -eq 0 ]; then
     # Free the kill-soak ballast (the 1G backend is near-full) and let
@@ -424,8 +425,19 @@ if [ "$AIO_SKIP" -eq 0 ]; then
         ILP "$AIO_HARNESS" "$MOUNT_DIR" "$mode" 8 4 16 2>"$PT_ERR" || rc=$?
         [ "$rc" -eq 0 ] || { cat "$PT_ERR"; fail "aio lifecycle in the establish-refused shape ($mode) rc=$rc"; }
     done
-    grep -q "session establish failed" "$PT_ERR" \
-        || fail "establish-refused shape not exercised — the field crash environment needs the per-open refusal"
+    # Reason-bearing refusal line (user directive 2026-07-25): the shim
+    # must NAME the cause — this shape's cause is the unarmed data
+    # plane — and print it once per (mount, reason) per process, never
+    # per open/thread (the field report's 32-thread run printed a line
+    # per open). $PT_ERR holds the LAST harness run (one process,
+    # 8 threads x 3 phases of opens).
+    grep -q "session refused: interception not armed on this mount" "$PT_ERR" \
+        || { cat "$PT_ERR"; fail "refusal line must name the unarmed-interception cause"; }
+    grep -q -- "--interception" "$PT_ERR" \
+        || fail "refusal line must name the remedy (mount with --interception)"
+    REFUSE_LINES=$(grep -c "session refused" "$PT_ERR" || true)
+    [ "$REFUSE_LINES" -eq 1 ] \
+        || fail "refusal line must print once per (mount, reason) per process — got $REFUSE_LINES lines"
     PT_R1=$(stats ipc_ops_read); PT_W1=$(stats ipc_ops_write)
     [ "$PT_R1" -eq "$PT_R0" ] && [ "$PT_W1" -eq "$PT_W0" ] \
         || fail "passthrough mount served ring ops (reads Δ$((PT_R1-PT_R0)), writes Δ$((PT_W1-PT_W0)))"

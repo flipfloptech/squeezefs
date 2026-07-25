@@ -31,7 +31,7 @@
 use crate::bailout::{classify_fd, rwf_passthrough};
 use crate::dev_cache::NegativeDevCache;
 use crate::fd_table::{Binding, FdTable};
-use crate::session::{RingOutcome, Session};
+use crate::session::{refuse_reason, RefusalOnce, RingOutcome, Session, SessionError};
 use squeezefs_ipc::wire::{BootstrapBlob, BOOTSTRAP_XATTR};
 
 use libc::{c_char, c_int, c_long, c_uint, c_void, mode_t, off_t, size_t, ssize_t};
@@ -236,6 +236,21 @@ fn stderr_line(msg: &str) {
     }
 }
 
+/// Once-per-(mount, reason) gate for the refusal lines (user directive
+/// 2026-07-25): the establish ladder retries on every eligible open by
+/// design; the LOGGING must not (the field report's 32-thread run
+/// printed a line per open). Establish/bind context only — never a
+/// signal handler — so the tiny mutexed set is safe here (§5.4).
+fn refusal_once() -> &'static RefusalOnce {
+    static ONCE: RefusalOnce = RefusalOnce::new();
+    &ONCE
+}
+
+/// Bind-refusal keys live in their own code space: the same daemon
+/// class refusing a HELLO and a BIND on one mount are distinct events,
+/// each worth its one line.
+const BIND_REFUSAL_KEY_BASE: u32 = 0x8000;
+
 fn set_errno(e: c_int) {
     // SAFETY: thread-local errno write.
     unsafe { *libc::__errno_location() = e };
@@ -355,8 +370,17 @@ fn classify_and_bind(fd: c_int) {
             match Session::establish(&blob, fd, crate::BUILD_COMMIT) {
                 Ok(s) => registry().insert(st.st_dev, shard, s),
                 Err(e) => {
-                    stderr_line("squeezefs-il: session establish failed — mount passthrough\n");
-                    let _ = e;
+                    // Reason-bearing refusal line (user directive
+                    // 2026-07-25), once per (mount, reason) for the
+                    // process lifetime — the ladder itself retries on
+                    // every eligible open by design.
+                    if refusal_once().first(st.st_dev, e.reason_code()) {
+                        let line = format!(
+                            "squeezefs-il: session refused: {} — mount passthrough\n",
+                            e.describe(blob.abi, &blob.build_commit, crate::BUILD_COMMIT)
+                        );
+                        stderr_line(&line);
+                    }
                     return;
                 }
             }
@@ -371,8 +395,24 @@ fn classify_and_bind(fd: c_int) {
     if flags < 0 || classify_fd(flags, st.st_mode, st.st_nlink as u64).is_err() {
         return; // §5.4.1 bind-time passthrough rows
     }
-    if let Ok(grant) = session.bind(fd) {
-        route_release(table().bind(fd, grant.to_binding(token)));
+    match session.bind(fd) {
+        Ok(grant) => route_release(table().bind(fd, grant.to_binding(token))),
+        Err(SessionError::Refused(class)) => {
+            // Daemon BIND refusal: the fd stays kernel-served (KD-6
+            // silence for the OP; the REASON prints once per
+            // (mount, class) — its own key space, distinct from the
+            // same class refusing a HELLO).
+            if refusal_once().first(st.st_dev, BIND_REFUSAL_KEY_BASE | (class & 0xFFF)) {
+                let line = format!(
+                    "squeezefs-il: bind refused: {} — fd stays kernel-served\n",
+                    refuse_reason(class)
+                );
+                stderr_line(&line);
+            }
+        }
+        // Socket/poison-class failures on a live session: the poison
+        // machinery owns that loudness (§5.4.1) — no line here.
+        Err(_) => {}
     }
 }
 

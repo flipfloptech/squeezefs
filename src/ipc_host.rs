@@ -1095,9 +1095,12 @@ impl IpcHost {
         // VL2 control-plane-only posture (§5.1.4): on a mount without
         // `-o interception`, data-plane sessions refuse BEFORE any fd
         // screen — no shm, no arenas, no service dispatch. The ADMIN
-        // lane above is the only admitted traffic.
+        // lane above is the only admitted traffic. The class names the
+        // cause on the wire (user directive 2026-07-25): the shim's
+        // refusal line tells the operator to mount with --interception
+        // instead of hiding behind the Flags screen.
         if !self.cfg.data_plane {
-            return refuse(RefuseClass::Flags);
+            return refuse(RefuseClass::Disabled);
         }
 
         // KD-7 version lock: coarse ABI + build-commit equality; degenerate
@@ -1458,6 +1461,10 @@ fn count_refusal(class: RefuseClass) {
         RefuseClass::Mode => &METRICS.ipc_bind_refused_mode,
         RefuseClass::Budget => &METRICS.ipc_bind_refused_budget,
         RefuseClass::Peercred => &METRICS.ipc_bind_refused_peercred,
+        // Expected posture on non-interception mounts (every preloaded
+        // app's establish probe lands here) — counted separately so the
+        // security-signal classes above stay unpolluted.
+        RefuseClass::Disabled => &METRICS.ipc_bind_refused_disabled,
         // Internal failures are daemon faults, logged loud at the site;
         // ledger them with the budget/admission family is wrong — count
         // them as poisons? No: they refuse a NEW session, nothing lives

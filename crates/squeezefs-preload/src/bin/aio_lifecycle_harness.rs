@@ -33,7 +33,46 @@
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int, c_long};
 
-use squeezefs_il::aio_glue::{RawIoEvent, RawIocb, IOCB_CMD_PREAD, IOCB_CMD_PWRITE};
+// LOCAL mirrors of libaio's userspace ABI — deliberately NOT imported
+// from `squeezefs_il::aio_glue`: the gate builds this package with
+// `--features interposers`, so linking the rlib would compile the
+// strong `open`/`io_*` interposer symbols INTO THIS EXECUTABLE, whose
+// symbols beat the preloaded .so — the harness would silently test a
+// self-interposed double-shim topology instead of the shipped one (the
+// exact hazard the manifest's feature comment warns about; caught live
+// by the gate's once-per-(mount, reason) refusal-line count). The
+// layouts are pinned against libaio.h by the lib's aio_glue tests.
+
+/// Mirror of [`squeezefs_il::aio_glue::RawIocb`] (libaio.h `struct iocb`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct RawIocb {
+    data: u64,
+    key: u32,
+    aio_rw_flags: u32,
+    aio_lio_opcode: u16,
+    aio_reqprio: u16,
+    aio_fildes: i32,
+    buf: u64,
+    nbytes: u64,
+    offset: i64,
+    __pad3: i64,
+    flags: u32,
+    resfd: u32,
+}
+
+/// Mirror of [`squeezefs_il::aio_glue::RawIoEvent`] (libaio.h `struct io_event`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct RawIoEvent {
+    data: u64,
+    obj: u64,
+    res: i64,
+    res2: i64,
+}
+
+const IOCB_CMD_PREAD: u16 = 0;
+const IOCB_CMD_PWRITE: u16 = 1;
 
 type IoSetupFn = unsafe extern "C" fn(c_int, *mut u64) -> c_int;
 type IoDestroyFn = unsafe extern "C" fn(u64) -> c_int;

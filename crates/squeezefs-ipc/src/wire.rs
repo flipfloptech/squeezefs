@@ -89,6 +89,12 @@ pub enum RefuseClass {
     /// Daemon-internal failure (memfd/map) — never the client's fault,
     /// always log-loud daemon-side.
     Internal = 7,
+    /// Data plane not armed on this mount (no `-o interception`): the
+    /// VL2 control-plane-only posture refuses every data HELLO before
+    /// any fd screen. Carried on the wire so the shim's refusal line
+    /// can name the actual cause + remedy (user directive 2026-07-25)
+    /// instead of the formerly-opaque `Flags` class.
+    Disabled = 8,
 }
 
 impl RefuseClass {
@@ -101,6 +107,7 @@ impl RefuseClass {
             5 => Self::Budget,
             6 => Self::Peercred,
             7 => Self::Internal,
+            8 => Self::Disabled,
             other => return Err(WireError::BadClass(other)),
         })
     }
@@ -505,6 +512,9 @@ mod tests {
             CtlMsg::BindRefused {
                 class: RefuseClass::Flags,
             },
+            CtlMsg::Refuse {
+                class: RefuseClass::Disabled,
+            },
             CtlMsg::Unbind { binding_id: 7 },
         ];
         for m in msgs {
@@ -526,6 +536,8 @@ mod tests {
             Err(WireError::UnknownTag(999))
         );
         assert_eq!(RefuseClass::from_u32(0), Err(WireError::BadClass(0)));
+        assert_eq!(RefuseClass::from_u32(8), Ok(RefuseClass::Disabled));
+        assert_eq!(RefuseClass::from_u32(9), Err(WireError::BadClass(9)));
     }
 
     #[test]

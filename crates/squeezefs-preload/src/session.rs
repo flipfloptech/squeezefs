@@ -121,8 +121,9 @@ impl BindGrant {
 }
 
 /// Why a session could not establish / a bind failed. The interposers
-/// only branch on "did it work" (everything else is a counter + stderr
-/// line); the variants exist for attribution.
+/// branch on "did it work"; the variants carry the attribution the
+/// refusal stderr line surfaces ([`SessionError::describe`] — user
+/// directive 2026-07-25: the line must name the actual cause).
 #[derive(Debug)]
 pub enum SessionError {
     /// Client-side KD-7 pre-check: blob identity does not match ours
@@ -138,6 +139,128 @@ pub enum SessionError {
     Map(i32),
     /// Session is poisoned (bind on a poisoned session).
     Poisoned,
+}
+
+impl SessionError {
+    /// Stable per-cause code — the [`RefusalOnce`] dedup key half
+    /// (distinct causes on one mount must each print once). Socket/map
+    /// errnos and daemon refusal classes fold into disjoint ranges so
+    /// no two causes collide.
+    pub fn reason_code(&self) -> u32 {
+        match self {
+            Self::VersionSkew => 1,
+            Self::Protocol => 2,
+            Self::Poisoned => 3,
+            Self::Socket(e) => 0x1000 | (*e as u32 & 0xFFF),
+            Self::Map(e) => 0x2000 | (*e as u32 & 0xFFF),
+            Self::Refused(c) => 0x4000 | (*c & 0xFFF),
+        }
+    }
+
+    /// The reason text for the refusal stderr line (user directive
+    /// 2026-07-25): names the ACTUAL cause — and where one exists, the
+    /// remedy. `daemon_abi`/`daemon_commit` come from the bootstrap
+    /// blob; `my_commit` is this shim's build identity.
+    pub fn describe(&self, daemon_abi: u32, daemon_commit: &str, my_commit: &str) -> String {
+        match self {
+            Self::VersionSkew => {
+                // Recompute the establish pre-check's sub-cause in its
+                // check order (abi → commit → degenerate identity).
+                if daemon_abi != squeezefs_ipc::layout::IPC_ABI {
+                    format!(
+                        "ipc abi mismatch (shim {}, daemon {daemon_abi})",
+                        squeezefs_ipc::layout::IPC_ABI
+                    )
+                } else if daemon_commit != my_commit {
+                    format!("build mismatch (shim {my_commit}, daemon {daemon_commit})")
+                } else {
+                    format!(
+                        "dev build identity ({my_commit}) — set SQUEEZEFS_IPC_ALLOW_DEV=1 \
+                         on both ends"
+                    )
+                }
+            }
+            Self::Socket(0) => "daemon closed the ctl socket".into(),
+            Self::Socket(e) => format!("ctl socket unreachable (os error {e})"),
+            Self::Refused(c) => refuse_reason(*c),
+            Self::Protocol => "malformed ctl reply / session layout".into(),
+            Self::Map(e) => format!("session shm map failed (os error {e})"),
+            Self::Poisoned => "session poisoned".into(),
+        }
+    }
+}
+
+/// Reason text for one daemon refusal class (shared by the HELLO ladder
+/// via [`SessionError::describe`] and the BIND refusal line). Unknown
+/// classes surface their number — a newer daemon's refusal must never
+/// hide.
+pub fn refuse_reason(class: u32) -> String {
+    use squeezefs_ipc::wire::RefuseClass as C;
+    match C::from_u32(class) {
+        Ok(C::Disabled) => {
+            "interception not armed on this mount (mount with --interception)".into()
+        }
+        Ok(C::Version) => {
+            // Daemon-side skew with the client pre-check passed means a
+            // degenerate-identity refusal on the DAEMON side (its
+            // override is per-end).
+            "daemon refused: build/abi skew or dev identity \
+             (daemon needs SQUEEZEFS_IPC_ALLOW_DEV=1 too?)"
+                .into()
+        }
+        Ok(C::Nonce) => "daemon refused: stale bootstrap nonce".into(),
+        Ok(C::Flags) => "daemon refused: credential fd screen (flags/type)".into(),
+        Ok(C::Mode) => "daemon refused: credential fd is not on this mount".into(),
+        Ok(C::Budget) => "daemon refused: session budget / admission cap".into(),
+        Ok(C::Peercred) => "daemon refused: peer credential mismatch".into(),
+        Ok(C::Internal) => "daemon refused: internal daemon failure (see daemon log)".into(),
+        Err(_) => format!("daemon refused: unknown class {class}"),
+    }
+}
+
+/// Once-per-(mount, reason) print gate for the refusal lines: the
+/// establish ladder retries on every eligible open BY DESIGN (the mount
+/// stays ours — never negative-cached), so without this gate a
+/// 32-thread benchmark prints a line per open (the field report).
+///
+/// A tiny mutexed set, NOT lock-free: exactly-once matters (the gate
+/// asserts the count) and the refusal path is control-plane, runs only
+/// in establish/bind context (never a signal handler — the §5.4
+/// AS-safety constraint binds `close`/the fd table, not this path).
+pub struct RefusalOnce {
+    seen: Mutex<Vec<(u64, u32)>>,
+}
+
+/// Capacity bound: beyond it the set stops REMEMBERING, never stops
+/// PRINTING (a new reason past capacity stays loud — loud beats lossy;
+/// realistic processes see a handful of (mount, reason) pairs).
+const REFUSAL_ONCE_CAP: usize = 128;
+
+impl Default for RefusalOnce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RefusalOnce {
+    pub const fn new() -> Self {
+        Self {
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// `true` exactly once per distinct `(dev, code)` key (then the
+    /// caller prints); `false` on every repeat.
+    pub fn first(&self, dev: u64, code: u32) -> bool {
+        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        if seen.iter().any(|&(d, c)| d == dev && c == code) {
+            return false;
+        }
+        if seen.len() < REFUSAL_ONCE_CAP {
+            seen.push((dev, code));
+        }
+        true
+    }
 }
 
 pub struct Session {

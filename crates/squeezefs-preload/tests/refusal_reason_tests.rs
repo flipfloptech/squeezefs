@@ -5,7 +5,7 @@
 //! Contracts pinned here:
 //!
 //! - **The refusal line names the actual cause** ([`SessionError::describe`]
-//!   + [`refuse_reason`]): a version skew carries BOTH build commits, an
+//!   and [`refuse_reason`]): a version skew carries BOTH build commits, an
 //!   unarmed mount names the `--interception` remedy, a degenerate dev
 //!   identity names the `SQUEEZEFS_IPC_ALLOW_DEV` override, every daemon
 //!   refusal class has distinct text, and unknown classes surface their
@@ -95,7 +95,10 @@ fn every_daemon_refusal_class_has_distinct_text_and_unknown_carries_its_number()
         }
     }
     let unknown = refuse_reason(999);
-    assert!(unknown.contains("999"), "unknown class number surfaced: {unknown}");
+    assert!(
+        unknown.contains("999"),
+        "unknown class number surfaced: {unknown}"
+    );
 }
 
 // ---------------------------------------------------------------------------

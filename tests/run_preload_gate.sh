@@ -87,6 +87,13 @@ echo "OK: plain-file passthrough battery"
 # no libaio.so.1 on this box (skip loudly).
 AIO_HARNESS="$REPO_DIR/target/preload-release/aio_lifecycle_harness"
 [ -x "$AIO_HARNESS" ] || fail "aio_lifecycle_harness missing at $AIO_HARNESS"
+# Self-interposition tripwire: the harness must NOT carry the strong
+# interposer symbols itself (an exe's symbols beat the preloaded .so —
+# the harness would silently test a self-interposed double-shim
+# topology; caught live by the refusal-line once-count on 2026-07-25).
+if nm "$AIO_HARNESS" 2>/dev/null | grep -qE " T (open|read|write|io_setup|io_getevents)$"; then
+    fail "aio_lifecycle_harness carries interposer symbols — it must not link the featured rlib"
+fi
 for mode in setup-first open-first mixed; do
     rc=0
     LD_PRELOAD="$SO" "$AIO_HARNESS" "$T" "$mode" 8 4 16 || rc=$?

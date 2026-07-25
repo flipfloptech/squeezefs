@@ -2567,6 +2567,11 @@ pub struct Metrics {
     pub ipc_bind_refused_mode: Align64<AtomicU64>,
     pub ipc_bind_refused_budget: Align64<AtomicU64>,
     pub ipc_bind_refused_peercred: Align64<AtomicU64>,
+    /// Data-plane HELLOs refused because the mount is control-plane-only
+    /// (no `-o interception`) — the expected posture on default mounts
+    /// with preloaded apps probing; counted apart from the security
+    /// classes above so their signals stay clean.
+    pub ipc_bind_refused_disabled: Align64<AtomicU64>,
     /// Degenerate (`unknown`/`-dirty`) identity pairs admitted via
     /// `SQUEEZEFS_IPC_ALLOW_DEV` — nonzero outside dev boxes is a
     /// fleet-hygiene alarm (KD-7).
@@ -4311,6 +4316,7 @@ impl SqueezefsFilesystem {
                 "ipc_bind_refused_mode": METRICS.ipc_bind_refused_mode.load(Ordering::Relaxed),
                 "ipc_bind_refused_budget": METRICS.ipc_bind_refused_budget.load(Ordering::Relaxed),
                 "ipc_bind_refused_peercred": METRICS.ipc_bind_refused_peercred.load(Ordering::Relaxed),
+                "ipc_bind_refused_disabled": METRICS.ipc_bind_refused_disabled.load(Ordering::Relaxed),
                 "ipc_binds_dev_override": METRICS.ipc_binds_dev_override.load(Ordering::Relaxed),
                 "ipc_admission_refusals": METRICS.ipc_admission_refusals.load(Ordering::Relaxed),
                 "ipc_arena_bytes": METRICS.ipc_arena_bytes.load(Ordering::Relaxed),

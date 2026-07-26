@@ -1815,7 +1815,30 @@ unsafe fn aio_reap_served(
                 std::thread::sleep(std::time::Duration::from_micros(200));
                 continue;
             }
-            // Ring ops pending, nothing ready: EVENT-DRIVEN park outside
+            // Ring ops pending, nothing ready. Deep-pending sets batch on
+            // a SHORT bounded sleep instead of event-parking: at qd32
+            // saturation an event park costs a full waitv cycle client-
+            // side plus one daemon futex_wake syscall PER COMPLETION
+            // (the WAITER bit), where the old ladder amortized several
+            // completions per wake — measured −6 % on t32qd32 (sizing
+            // note §5). The quantum is 50 µs (¼ the old ladder's), only
+            // ever taken with ≥ REAP_EVENT_PARK_MAX ops in flight, so
+            // its latency contribution is bounded by depth; the SPARSE
+            // regime — where the 200 µs/5 ms quantum actually shaped
+            // completion latency and max-latency tails — stays fully
+            // event-driven below.
+            if parks.len() > REAP_EVENT_PARK_MAX {
+                let quantum = std::time::Duration::from_micros(50);
+                let bound = match deadline {
+                    None => quantum,
+                    Some(d) => d
+                        .saturating_duration_since(std::time::Instant::now())
+                        .min(quantum),
+                };
+                std::thread::sleep(bound);
+                continue;
+            }
+            // Sparse pending set: EVENT-DRIVEN park outside
             // the lock (2026-07-26 reap economy — replaces the 200 µs
             // sleep ladder whose quantum shaped every cold completion).
             // A short spin first covers the just-completing case without
@@ -1899,6 +1922,14 @@ const KERNEL_LANE_SLICE: std::time::Duration = std::time::Duration::from_millis(
 /// — cross-thread submits after the snapshot and > FUTEX_WAITV_MAX
 /// pending sets.
 const RING_PARK_RECHECK: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Above this many in-flight ring ops the reap batches on a 50 µs
+/// bounded sleep instead of event-parking (per-completion wake cost
+/// exceeds the deep-regime quantum's amortized latency share; the
+/// sparse regime — where quantums shaped tails — stays event-driven).
+/// 24 keeps qd ≤ 16 pipelines fully event-driven (measured best there)
+/// and batches qd32+ (measured −6 % event-parked, recovered batched).
+const REAP_EVENT_PARK_MAX: usize = 24;
 
 /// # Safety
 /// C ABI interposer; argument contracts are libaio's own.

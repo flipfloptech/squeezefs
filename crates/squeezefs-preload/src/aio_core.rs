@@ -327,9 +327,20 @@ impl AioCtxState {
             } else {
                 slice_ms.min(deadline_ms.saturating_sub(waited))
             };
-            let got = kern.getevents(kmin, room, Some(if kmin == 0 { 0 } else { kwait }));
-            self.kernel_pending = self.kernel_pending.saturating_sub(got.len());
-            out.extend(got);
+            if self.kernel_pending > 0 {
+                // Kernel-lane pendings exist: probe (non-blocking when the
+                // ring can still complete `min`) or wait. With ZERO
+                // kernel pendings the probe is skipped entirely — a
+                // pure-ring pass paid one wasted real io_getevents
+                // syscall per pass (the 2026-07-26 reap economy: at
+                // qd32 that was a syscall per wake cycle for nothing;
+                // tracked kernel_pending is the lane contract, exactly
+                // as the top-of-call opportunistic drain already
+                // assumes).
+                let got = kern.getevents(kmin, room, Some(if kmin == 0 { 0 } else { kwait }));
+                self.kernel_pending = self.kernel_pending.saturating_sub(got.len());
+                out.extend(got);
+            }
             if out.len() < max {
                 self.harvest_ring(ring, &mut out, max);
             }

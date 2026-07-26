@@ -1160,6 +1160,18 @@ pub fn wait_any(entries: &[WaitEntry<'_>], timeout: Duration) {
     let Some(first) = entries.first() else {
         return;
     };
+    // Userspace admission pre-check: any entry whose word already moved
+    // makes the kernel's own admission fail (EAGAIN) — the syscall is
+    // pure waste. At qd32 saturation 42 % of waits failed admission
+    // (2026-07-26 sizing); one relaxed-load scan deletes those
+    // syscalls. Semantics identical to the EAGAIN return: caller
+    // re-harvests.
+    if entries
+        .iter()
+        .any(|e| e.word.load(Ordering::Acquire) != e.expected)
+    {
+        return;
+    }
     if entries.len() == 1 {
         return futex_wait(first.word, first.expected, timeout);
     }

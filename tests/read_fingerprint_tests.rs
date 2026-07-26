@@ -38,14 +38,6 @@ fn fp(meta: &CachedMetadata, ino: u64, offset: u64, len: usize) -> Option<ReadCu
     ReadCustodyFp::build_sync(meta, ino, BS, offset, len)
 }
 
-fn matches(a: &Option<ReadCustodyFp>, b: &Option<ReadCustodyFp>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(x), Some(y)) => x.matches(y),
-        _ => false,
-    }
-}
-
 /// Distinct ino space per test: the custody-epoch words are process-global
 /// stripes; giving each test its own (ino, block) keys keeps the epoch
 /// assertions independent (stripe collisions only ever ADD mismatches,

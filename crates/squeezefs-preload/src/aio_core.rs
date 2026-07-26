@@ -144,6 +144,14 @@ impl AioCtxState {
         self.pending.iter().any(|p| p.iocb_id == iocb_id)
     }
 
+    /// Tokens of every in-flight ring op, submission (oldest-first)
+    /// order — the reap loop's outside-lock park snapshot (oldest first
+    /// is also the truncation order when the set exceeds the
+    /// `futex_waitv` word cap).
+    pub fn pending_tokens(&self) -> Vec<RingToken> {
+        self.pending.iter().map(|p| p.tok).collect()
+    }
+
     /// The lane-split `io_submit` walk. `classes[i]` classifies
     /// `iocb_ids[i]`; `data_of` supplies each iocb's completion cookie
     /// (captured AT SUBMIT — the client may recycle the iocb after the
@@ -307,12 +315,17 @@ impl AioCtxState {
             // non-blocking probe (a blocking wait on an empty lane is
             // a hang). The wait itself is a bounded slice whenever
             // ring ops are also in flight so the loop re-polls the
-            // ring instead of parking the full deadline kernel-side.
+            // ring instead of parking the full deadline kernel-side —
+            // and every slice is capped by the remaining budget, so a
+            // zero-timeout call is ONE non-blocking merge pass (the
+            // reap loop's waiting policy lives OUTSIDE the ctx lock;
+            // pre-2026-07-26 the slice ignored the budget and blocked
+            // 5 ms with both lanes live — the field's reap quantum).
             let kmin = need.min(self.kernel_pending).min(room);
             let kwait = if self.pending.is_empty() && kmin > 0 {
                 deadline_ms.saturating_sub(waited)
             } else {
-                slice_ms
+                slice_ms.min(deadline_ms.saturating_sub(waited))
             };
             let got = kern.getevents(kmin, room, Some(if kmin == 0 { 0 } else { kwait }));
             self.kernel_pending = self.kernel_pending.saturating_sub(got.len());

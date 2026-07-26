@@ -94,7 +94,9 @@ impl KernelLane for FakeKernel {
     }
 
     fn getevents(&mut self, min: usize, max: usize, timeout_ms: Option<u64>) -> Vec<AioEvent> {
-        self.getevents_calls.borrow_mut().push((min, max, timeout_ms));
+        self.getevents_calls
+            .borrow_mut()
+            .push((min, max, timeout_ms));
         self.events.pop_front().unwrap_or_default()
     }
 }

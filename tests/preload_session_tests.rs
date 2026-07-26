@@ -165,13 +165,7 @@ impl SessionSink for DelaySink {
 fn delay_host(
     name: &str,
     delay_ms: u64,
-) -> (
-    Arc<IpcHost>,
-    tempfile::TempDir,
-    std::fs::File,
-    Session,
-    u64,
-) {
+) -> (Arc<IpcHost>, tempfile::TempDir, std::fs::File, Session, u64) {
     let cfg = IpcHostConfig {
         socket_name: format!("sqz-il0-session-{name}-{}", std::process::id()),
         socket_dir: None,
@@ -582,7 +576,9 @@ async fn ticket_park_wait_is_event_driven_not_quantum_polled() {
         start.elapsed()
     );
     assert!(session.ticket_done(t));
-    let res = session.poll_ticket(t, Some(&mut [0u8; 4096])).expect("done");
+    let res = session
+        .poll_ticket(t, Some(&mut [0u8; 4096]))
+        .expect("done");
     assert_eq!(res, 4096);
 
     // Ready path: the op already completed — `ticket_wait_entry` must
@@ -600,7 +596,9 @@ async fn ticket_park_wait_is_event_driven_not_quantum_polled() {
         "a DONE ticket must never park (Ready ⇒ consume immediately)"
     );
     assert_eq!(
-        session.poll_ticket(t2, Some(&mut [0u8; 512])).expect("done"),
+        session
+            .poll_ticket(t2, Some(&mut [0u8; 512]))
+            .expect("done"),
         512
     );
     host.shutdown();
@@ -642,7 +640,9 @@ async fn slot_completion_wakes_every_parked_waiter() {
         );
     }
     assert_eq!(
-        session.poll_ticket(t, Some(&mut [0u8; 4096])).expect("done"),
+        session
+            .poll_ticket(t, Some(&mut [0u8; 4096]))
+            .expect("done"),
         4096
     );
     host.shutdown();

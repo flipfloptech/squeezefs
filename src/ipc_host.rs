@@ -214,9 +214,14 @@ impl SlotCompletion {
             .expect("slot index validated at dequeue");
         slot.set_result(result);
         if slot.core.complete() {
-            // A client parked on this slot's state word: wake it
-            // (cross-process futex — never FUTEX_PRIVATE).
-            futex_wake(slot.core.state_futex_word(), 1);
+            // Client(s) parked on this slot's state word: wake them ALL
+            // (cross-process futex — never FUTEX_PRIVATE). Breadth is
+            // load-bearing since the 2026-07-26 event-driven reap: a
+            // split submitter/reaper pair may BOTH park on one in-flight
+            // op's word (each re-snapshots the same pending set), and a
+            // single-waiter wake strands the loser for its full bound —
+            // pinned by `slot_completion_wakes_every_parked_waiter`.
+            futex_wake(slot.core.state_futex_word(), i32::MAX);
         }
     }
 }

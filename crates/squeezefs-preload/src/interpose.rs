@@ -1331,10 +1331,13 @@ pub unsafe extern "C" fn socketpair(
 // (§5.4.2 fallback-is-correctness).
 //
 // Locking: ONE Mutex per registered ctx (state + ticket table
-// co-located). The lock is never held across a long kernel wait —
-// `io_getevents` drives bounded ~50 ms merge passes and re-acquires
-// between them, so a split submitter/reaper pair (a legal libaio shape)
-// degrades to 50 ms granularity instead of deadlocking on the lock.
+// co-located). The lock is never held across a wait when ring ops are
+// pending — those passes are NON-BLOCKING (harvest + kernel probes) and
+// the reap parks OUTSIDE the lock on the pending slots' futex words
+// (event-driven; 2026-07-26 reap economy). Only the kernel-lane-only
+// shape waits inside a pass (bounded ~50 ms holds, as before), so a
+// split submitter/reaper pair (a legal libaio shape) degrades to 50 ms
+// granularity there and to the park bound elsewhere — never a deadlock.
 //
 // Poison law: a poisoned session resolves its in-flight tickets as
 // `-EIO` events (never silently stranded, never a hang — the app sees
@@ -1736,29 +1739,50 @@ unsafe fn aio_reap_served(
         };
         let (min_nr, nr) = (min_nr.max(0) as usize, nr as usize);
         let mut got = 0usize;
-        let mut empty_passes = 0u32;
         loop {
-            // One bounded merge pass per lock hold (≤ ~50 ms): a split
-            // submitter/reaper pair shares the ctx at that granularity.
-            let pass_ms: u64 = match deadline {
-                None => 50,
-                Some(d) => {
-                    let left = d.saturating_duration_since(std::time::Instant::now());
-                    (left.as_millis() as u64).min(50)
-                }
-            };
-            let evs = {
+            // One merge pass per lock hold. Ring-involved passes carry a
+            // ZERO budget (non-blocking: harvest + kernel probes only) —
+            // the waiting policy lives OUTSIDE the lock as an
+            // event-driven ticket park (below), so a split submitter is
+            // never blocked behind a sleeping reaper. Only the
+            // kernel-lane-only shape waits inside the pass (the real
+            // io_getevents wake is already event-driven there), bounded
+            // ≤ ~50 ms per hold as before.
+            let mut parks: Vec<(usize, OpTicket)> = Vec::new();
+            let (evs, ring_pending, kernel_pending) = {
                 let mut c = m.lock().unwrap_or_else(|p| p.into_inner());
                 let AioCtx { state, tickets } = &mut *c;
+                let pass_ms: u64 = if state.ring_pending() == 0 && state.kernel_pending() > 0 {
+                    match deadline {
+                        None => 50,
+                        Some(d) => {
+                            let left = d.saturating_duration_since(std::time::Instant::now());
+                            (left.as_millis() as u64).min(50)
+                        }
+                    }
+                } else {
+                    0
+                };
                 let mut ring = SessionRing { tickets };
                 let mut kern = RealKernel { ctx };
-                state.getevents(
+                let evs = state.getevents(
                     &mut ring,
                     &mut kern,
                     min_nr.saturating_sub(got).min(nr - got),
                     nr - got,
                     Some(pass_ms),
-                )
+                );
+                let ring_pending = state.ring_pending();
+                if evs.is_empty() && ring_pending > 0 {
+                    // Park snapshot: (session token, ticket) per pending
+                    // ring op — resolved to wait entries outside the lock.
+                    for tok in state.pending_tokens() {
+                        if let Some(Some(t)) = tickets.get(tok.0 as usize).map(Option::as_ref) {
+                            parks.push((t.session, t.ticket));
+                        }
+                    }
+                }
+                (evs, ring_pending, state.kernel_pending())
             };
             for (i, ev) in evs.iter().enumerate() {
                 // SAFETY: events[0..nr] is the caller's array (libaio
@@ -1781,23 +1805,96 @@ unsafe fn aio_reap_served(
                     return Some(got as c_int);
                 }
             }
-            // Ring-pending passes return in ~5 ms slices with nothing
-            // to show; park briefly OUTSIDE the lock so a spinning
-            // reaper is not CPU theft from the daemon (the adaptive-
-            // spin lesson) and a split submitter can take the ctx.
-            if evs.is_empty() {
-                empty_passes += 1;
-                if empty_passes > 2 {
-                    std::thread::sleep(std::time::Duration::from_micros(200));
-                } else {
-                    std::thread::yield_now();
-                }
-            } else {
-                empty_passes = 0;
+            if !evs.is_empty() || (ring_pending == 0 && kernel_pending > 0) {
+                continue; // progress, or the pass itself carried the wait
             }
+            if ring_pending == 0 && kernel_pending == 0 {
+                // Nothing tracked in flight with min unmet: only a racing
+                // submitter (another thread, legal libaio) can change
+                // that — idle-wait politely, nothing to park on.
+                std::thread::sleep(std::time::Duration::from_micros(200));
+                continue;
+            }
+            // Ring ops pending, nothing ready: EVENT-DRIVEN park outside
+            // the lock (2026-07-26 reap economy — replaces the 200 µs
+            // sleep ladder whose quantum shaped every cold completion).
+            // A short spin first covers the just-completing case without
+            // a futex round trip; it is deliberately tiny (the CPU-theft
+            // lesson: reaper spin starves the daemon at fleet scale).
+            let mut ready = false;
+            'spin: for _ in 0..64 {
+                for (token, t) in &parks {
+                    if registry()
+                        .by_token(*token)
+                        .is_some_and(|s| s.ticket_done(*t))
+                    {
+                        ready = true;
+                        break 'spin;
+                    }
+                }
+                std::hint::spin_loop();
+            }
+            if ready {
+                continue;
+            }
+            // Park admission per pending ticket (sets the WAITER bit the
+            // daemon's completion wakes; a Ready here means a completion
+            // raced the snapshot — re-harvest immediately). The wait is
+            // bounded: ring-only shapes re-check on a coarse cap (cross-
+            // thread submits add tickets this wait does not cover);
+            // both-lanes shapes cap at the kernel-probe slice (kernel
+            // completions cannot wake a futex).
+            let mut entries: Vec<crate::session::WaitEntry<'static>> =
+                Vec::with_capacity(parks.len().min(128));
+            for (token, t) in parks.iter().take(128) {
+                let Some(session) = registry().by_token(*token) else {
+                    continue; // session gone: its poll resolves next pass
+                };
+                match session.ticket_wait_entry(*t) {
+                    Some(e) => entries.push(e),
+                    None => {
+                        ready = true; // completed in the gap
+                        break;
+                    }
+                }
+            }
+            if ready || entries.is_empty() {
+                if entries.is_empty() && !ready {
+                    // No waitable session (all poisoned/gone): the next
+                    // pass resolves the tickets as -EIO; don't spin the
+                    // lock at full speed while it does.
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                continue;
+            }
+            let cap = if kernel_pending > 0 {
+                KERNEL_LANE_SLICE
+            } else {
+                RING_PARK_RECHECK
+            };
+            let bound = match deadline {
+                None => cap,
+                Some(d) => d
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(cap),
+            };
+            crate::session::wait_any(&entries, bound);
         }
     }
 }
+
+/// Both-lanes park cap: kernel-lane completions cannot wake a futex, so
+/// the ring park doubles as the kernel probe cadence. 1 ms replaces the
+/// pre-2026-07-26 hard-coded 5 ms in-lock kernel slice (the field's
+/// completion quantizer); the kernel lane only carries slot-exhaustion
+/// reroutes, so the probe rate stays trivial.
+const KERNEL_LANE_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Ring-only park cap: the wake is event-driven (the daemon FUTEX_WAKEs
+/// the slot word), so this bound only covers tickets the wait does not
+/// — cross-thread submits after the snapshot and > FUTEX_WAITV_MAX
+/// pending sets.
+const RING_PARK_RECHECK: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// # Safety
 /// C ABI interposer; argument contracts are libaio's own.

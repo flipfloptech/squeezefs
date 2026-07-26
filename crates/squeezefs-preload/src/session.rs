@@ -97,6 +97,17 @@ pub struct OpTicket {
     gen: u64,
 }
 
+/// One admitted park entry — the slot state word plus the expected
+/// value (`FUTEX_WAIT` admission semantics per word). Produced by
+/// [`Session::ticket_wait_entry`], consumed by [`wait_any`]; entries
+/// may span sessions (the aio pending set shards fds across them —
+/// futex words are just addresses in this process's mapping).
+#[derive(Clone, Copy)]
+pub struct WaitEntry<'a> {
+    word: &'a AtomicU32,
+    expected: u32,
+}
+
 /// A successful bind's grant (mirrors the daemon's `BindOk`).
 #[derive(Debug, Clone, Copy)]
 pub struct BindGrant {
@@ -686,6 +697,35 @@ impl Session {
         Some(OpTicket { slot, gen })
     }
 
+    /// Non-consuming completion probe (the reap loop's pre-park spin):
+    /// is this ticket's op DONE? Unlike [`poll_ticket`](Self::poll_ticket)
+    /// the slot stays claimed — the caller still consumes exactly once.
+    pub fn ticket_done(&self, t: OpTicket) -> bool {
+        self.slot(t.slot).core.is_done_for(t.gen)
+    }
+
+    /// Park admission for one in-flight ticket (the 2026-07-26
+    /// event-driven reap): sets the slot's WAITER bit and returns the
+    /// `(futex word, expected value)` pair a [`wait_any`] over the
+    /// pending set sleeps on. `None` = the slot is already DONE
+    /// (possibly for a LATER generation — a recycled slot; either way:
+    /// do not park, re-harvest). The admission is race-free by the slot
+    /// protocol: a completion racing this RMW either observes the
+    /// WAITER bit (the daemon wakes the word) or changes the word so
+    /// the wait's admission fails — `park_prepare`'s publish-then-
+    /// recheck shape, verified by the `ipc_slot_multi_park_admission_
+    /// never_strands` loom model.
+    pub fn ticket_wait_entry(&self, t: OpTicket) -> Option<WaitEntry<'_>> {
+        let slot = self.slot(t.slot);
+        match slot.core.park_prepare() {
+            ParkOutcome::Ready => None,
+            ParkOutcome::Park { expected } => Some(WaitEntry {
+                word: slot.core.state_futex_word(),
+                expected,
+            }),
+        }
+    }
+
     /// Non-blocking completion probe. `Some(res)` CONSUMES the ticket
     /// (slot released): a successful read's payload is copied into
     /// `out` first (`res` bytes, capped by `out`), and `res` carries
@@ -1086,6 +1126,105 @@ fn recv_ctl(sock: RawFd) -> Result<(CtlMsg, Option<RawFd>), SessionError> {
 // ---------------------------------------------------------------------------
 // futex plumbing (cross-process shm words — never FUTEX_PRIVATE)
 // ---------------------------------------------------------------------------
+
+/// `futex_waitv(2)` wait-multiple entry (Linux ≥ 5.16). Mirrors
+/// `include/uapi/linux/futex.h` — 32 bytes, `val`/`uaddr` as u64.
+#[repr(C)]
+struct FutexWaitv {
+    val: u64,
+    uaddr: u64,
+    flags: u32,
+    __reserved: u32,
+}
+
+/// `FUTEX2_SIZE_U32` — the only size the slot state words use.
+const FUTEX2_SIZE_U32: u32 = 0x02;
+/// `futex_waitv(2)` hard cap (`FUTEX_WAITV_MAX`).
+const FUTEX_WAITV_MAX: usize = 128;
+/// No-`futex_waitv` degradation quantum: a single-word wait cannot be
+/// woken by the OTHER entries' completions, so its bound caps their
+/// detection latency (pre-5.16 kernels — the el8/el9 fleet posture;
+/// strictly better than the pre-2026-07-26 sleep ladder, which no
+/// completion could cut short).
+const WAITV_FALLBACK_QUANTUM: Duration = Duration::from_micros(200);
+
+/// Bounded sleep until ANY entry's word is woken or its value moves
+/// (the event-driven reap park — the daemon's completion `FUTEX_WAKE`s
+/// the slot word whose WAITER bit [`Session::ticket_wait_entry`] set).
+/// Admission is per word: any entry already differing returns
+/// immediately (EAGAIN). Beyond [`FUTEX_WAITV_MAX`] entries the excess
+/// is not waited on — the timeout still bounds their latency. Kernels
+/// without `futex_waitv` (ENOSYS) degrade to a single wait on the
+/// FIRST (oldest) entry, capped at [`WAITV_FALLBACK_QUANTUM`].
+pub fn wait_any(entries: &[WaitEntry<'_>], timeout: Duration) {
+    let Some(first) = entries.first() else {
+        return;
+    };
+    if entries.len() == 1 {
+        return futex_wait(first.word, first.expected, timeout);
+    }
+    static WAITV_SUPPORTED: AtomicBool = AtomicBool::new(true);
+    if !WAITV_SUPPORTED.load(Ordering::Relaxed) {
+        return futex_wait(
+            first.word,
+            first.expected,
+            timeout.min(WAITV_FALLBACK_QUANTUM),
+        );
+    }
+    let mut vec = [const {
+        FutexWaitv {
+            val: 0,
+            uaddr: 0,
+            flags: 0,
+            __reserved: 0,
+        }
+    }; FUTEX_WAITV_MAX];
+    let n = entries.len().min(FUTEX_WAITV_MAX);
+    for (dst, e) in vec.iter_mut().zip(entries.iter().take(n)) {
+        dst.val = u64::from(e.expected);
+        dst.uaddr = e.word.as_ptr() as u64;
+        dst.flags = FUTEX2_SIZE_U32;
+    }
+    // futex_waitv takes an ABSOLUTE CLOCK_MONOTONIC timeout.
+    // SAFETY: clock_gettime into a zeroed timespec.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: plain clock_gettime(2).
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    let mut nsec = ts.tv_nsec as i128 + i128::from(timeout.subsec_nanos());
+    let mut sec = ts.tv_sec as i128 + timeout.as_secs() as i128;
+    if nsec >= 1_000_000_000 {
+        nsec -= 1_000_000_000;
+        sec += 1;
+    }
+    ts.tv_sec = sec as libc::time_t;
+    ts.tv_nsec = nsec as libc::c_long;
+    // SAFETY: SYS_futex_waitv with a valid waiter array + absolute
+    // timespec; every return class (wake index, EAGAIN value-changed,
+    // ETIMEDOUT, EINTR) resolves to "caller re-harvests".
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_futex_waitv,
+            vec.as_ptr(),
+            n as u32,
+            0u32,
+            &ts as *const libc::timespec,
+            libc::CLOCK_MONOTONIC,
+        )
+    };
+    if r < 0 {
+        // SAFETY: errno read directly after the failing call.
+        let errno = unsafe { *libc::__errno_location() };
+        if errno == libc::ENOSYS {
+            // Pre-5.16 kernel: remember, degrade to the quantum wait.
+            WAITV_SUPPORTED.store(false, Ordering::Relaxed);
+            futex_wait(
+                first.word,
+                first.expected,
+                timeout.min(WAITV_FALLBACK_QUANTUM),
+            );
+        }
+    }
+}
 
 fn futex_wake(word: &AtomicU32) {
     // SAFETY: FUTEX_WAKE on a live atomic's address; no memory is read.

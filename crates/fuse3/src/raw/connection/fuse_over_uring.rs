@@ -139,6 +139,69 @@ pub struct InboundUringReq {
     pub unique: u64,
 }
 
+/// Sharded unique → (qid, ent_idx, commit_id) map (see field doc).
+struct PendingMap {
+    shards: Vec<Mutex<HashMap<u64, (u16, u16, u64)>>>,
+}
+
+impl PendingMap {
+    const SHARDS: usize = 64;
+
+    fn new() -> Self {
+        Self {
+            shards: (0..Self::SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+        }
+    }
+
+    #[inline]
+    fn shard(&self, unique: u64) -> &Mutex<HashMap<u64, (u16, u16, u64)>> {
+        &self.shards[((unique >> 1) as usize) & (Self::SHARDS - 1)]
+    }
+
+    fn insert(&self, unique: u64, v: (u16, u16, u64)) {
+        self.shard(unique).lock().unwrap().insert(unique, v);
+    }
+
+    fn get(&self, unique: u64) -> Option<(u16, u16, u64)> {
+        self.shard(unique).lock().unwrap().get(&unique).copied()
+    }
+
+    fn remove(&self, unique: u64) -> Option<(u16, u16, u64)> {
+        self.shard(unique).lock().unwrap().remove(&unique)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.shards.iter().all(|s| s.lock().unwrap().is_empty())
+    }
+
+    fn snapshot(&self) -> Vec<(u64, (u16, u16, u64))> {
+        self.shards
+            .iter()
+            .flat_map(|s| {
+                s.lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (*k, *v))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn clear(&self) {
+        for s in &self.shards {
+            s.lock().unwrap().clear();
+        }
+    }
+
+    fn retain(&self, mut f: impl FnMut(&u64, &mut (u16, u16, u64)) -> bool) {
+        for s in &self.shards {
+            s.lock().unwrap().retain(&mut f);
+        }
+    }
+}
+
 struct CommitMsg {
     ent_idx: u16,
     commit_id: u64,
@@ -161,7 +224,7 @@ struct QueueHandle {
     /// The queue's payload arena, set once by the worker at startup. Held
     /// here so payload pointers handed out via `get_payload_buffer` stay
     /// valid for the pool's whole life, even after the worker exited.
-    arena: std::sync::Mutex<Option<Arc<PayloadArena>>>,
+    arena: arc_swap::ArcSwapOption<PayloadArena>,
 }
 
 /// Owns every registered payload buffer of one queue plus a dup of the
@@ -197,8 +260,8 @@ impl PayloadArena {
         }
         // SAFETY: `dup` just returned a fresh owned descriptor.
         let wake = unsafe { OwnedFd::from_raw_fd(dup) };
-        let layout = std::alloc::Layout::from_size_align(payload_sz, 4096)
-            .map_err(io::Error::other)?;
+        let layout =
+            std::alloc::Layout::from_size_align(payload_sz, 4096).map_err(io::Error::other)?;
         let mut bufs = Vec::with_capacity(depth);
         for _ in 0..depth {
             // SAFETY: `layout` has non-zero size (payload_sz ≥ 8192).
@@ -372,8 +435,13 @@ pub struct FuseOverUring {
     queues_registered: AtomicU64,
     pub(crate) nqueues: u16, // used for diagnostics
     inbound: Vec<Arc<InboundQueue>>,
-    /// unique → (qid, ent_idx, commit_id)
-    pending: Mutex<HashMap<u64, (u16, u16, u64)>>,
+    /// unique → (qid, ent_idx, commit_id) — sharded (P2 per-op economy):
+    /// every request pays insert-at-delivery + get-in-handler +
+    /// remove-at-reply; one global mutex across 32 queue workers plus the
+    /// handler/reply tasks was ~3 contended acquisitions per op at depth
+    /// (`Mutex::lock_contended` in the perf profile). Kernel uniques step
+    /// by 2 (bit 0 is FUSE_INT_REQ_BIT), so shard on `unique >> 1`.
+    pending: PendingMap,
     /// §5.3 D3.b: session SQPOLL posture for the queue rings (`None` =
     /// knob unset = plain rings). See [`SqpollGroup`] for the one-poller
     /// leader/attach topology.
@@ -925,7 +993,7 @@ impl FuseOverUring {
                 wake_fd,
                 _wake: wake,
                 wake_coalescer: Arc::new(WakeCoalescer::new()),
-                arena: std::sync::Mutex::new(None),
+                arena: arc_swap::ArcSwapOption::const_empty(),
             });
             commit_rxs.push(commit_rx);
         }
@@ -955,7 +1023,7 @@ impl FuseOverUring {
             queues_registered: AtomicU64::new(0),
             nqueues: nqueues as u16,
             inbound,
-            pending: Mutex::new(HashMap::new()),
+            pending: PendingMap::new(),
             sqpoll,
             queues: queue_handles,
             workers: Mutex::new(Vec::new()),
@@ -1109,18 +1177,13 @@ impl FuseOverUring {
     }
 
     pub fn submit_reply(&self, unique: u64, header: Vec<u8>, reply_body: Bytes) -> io::Result<()> {
-        let (qid, ent_idx, commit_id) = self
-            .pending
-            .lock()
-            .unwrap()
-            .remove(&unique)
-            .ok_or_else(|| {
-                xport_dbg!("[XPORT] reply-NOTFOUND unique={unique}");
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("uring: no pending unique={unique}"),
-                )
-            })?;
+        let (qid, ent_idx, commit_id) = self.pending.remove(unique).ok_or_else(|| {
+            xport_dbg!("[XPORT] reply-NOTFOUND unique={unique}");
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("uring: no pending unique={unique}"),
+            )
+        })?;
         xport_dbg!(
             "[XPORT] reply unique={unique} qid={qid} ent={ent_idx} cid={commit_id} body={}",
             reply_body.len()
@@ -1154,12 +1217,9 @@ impl FuseOverUring {
     }
 
     pub fn get_payload_buffer(&self, unique: u64) -> Option<(u64, usize)> {
-        let (qid, ent_idx, _) = {
-            let pending_guard = self.pending.lock().unwrap();
-            pending_guard.get(&unique).cloned()?
-        };
+        let (qid, ent_idx, _) = self.pending.get(unique)?;
         let q = self.queues.get(qid as usize)?;
-        let arena = q.arena.lock().unwrap().clone()?;
+        let arena = q.arena.load_full()?;
         let ptr = arena.buf(ent_idx as usize)?;
         Some((ptr as u64, self.payload_sz))
     }
@@ -1194,14 +1254,11 @@ impl FuseOverUring {
         if self.active.swap(false, Ordering::Release) {
             // Session was counted at spawn time (before ready).
             ACTIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
-            info!(
-                "FUSE-over-io_uring shutting down (fd={})",
-                self.fuse_fd
-            );
+            info!("FUSE-over-io_uring shutting down (fd={})", self.fuse_fd);
             // Drop any uncommitted request map entries; kernel already aborted them.
-            let mut pending = self.pending.lock().unwrap();
+            let pending = &self.pending;
             if transport_debug() && !pending.is_empty() {
-                for (unique, (qid, ent, cid)) in pending.iter() {
+                for (unique, (qid, ent, cid)) in pending.snapshot() {
                     eprintln!(
                         "[XPORT] shutdown with pending unique={unique} qid={qid} ent={ent} cid={cid}"
                     );
@@ -1220,7 +1277,6 @@ impl FuseOverUring {
             let _ = unsafe { libc::write(q.wake_fd, &one as *const u64 as *const _, 8) };
         }
     }
-
 }
 
 impl Drop for FuseOverUring {
@@ -1440,10 +1496,11 @@ fn connection_watch(pool: Arc<FuseOverUring>) {
     while pool.active.load(Ordering::Relaxed) {
         if transport_debug() && last_scan.elapsed() >= Duration::from_secs(5) {
             last_scan = Instant::now();
-            let pending = pool.pending.lock().unwrap();
-            let now_set: std::collections::HashSet<u64> = pending.keys().copied().collect();
+            let snapshot = pool.pending.snapshot();
+            let now_set: std::collections::HashSet<u64> =
+                snapshot.iter().map(|(k, _)| *k).collect();
             for unique in now_set.intersection(&last_seen) {
-                if let Some((qid, ent, cid)) = pending.get(unique) {
+                if let Some((qid, ent, cid)) = pool.pending.get(*unique) {
                     eprintln!(
                         "[XPORT] stale-pending unique={unique} qid={qid} ent={ent} cid={cid} (>5s, delivered but unreplied)"
                     );
@@ -1549,7 +1606,7 @@ fn queue_worker(
         };
     }
 
-    *pool.queues[qid as usize].arena.lock().unwrap() = Some(arena.clone());
+    pool.queues[qid as usize].arena.store(Some(arena.clone()));
 
     for (idx, ent) in ents.iter().enumerate() {
         push_cmd(
@@ -1652,7 +1709,10 @@ fn queue_worker(
                     )?;
                 }
                 CommitGate::Parked => {
-                    xport_dbg!("[XPORT] commit-parked qid={qid} ent={idx} cid={}", msg.commit_id);
+                    xport_dbg!(
+                        "[XPORT] commit-parked qid={qid} ent={idx} cid={}",
+                        msg.commit_id
+                    );
                     debug_assert!(
                         parked_msgs[idx].is_none(),
                         "two commits parked for one ring ent"
@@ -1671,7 +1731,10 @@ fn queue_worker(
         for idx in 0..ents.len() {
             if parked_msgs[idx].is_some() && lease_states[idx].try_unpark() {
                 let msg = parked_msgs[idx].take().expect("checked is_some");
-                xport_dbg!("[XPORT] commit-unparked qid={qid} ent={idx} cid={}", msg.commit_id);
+                xport_dbg!(
+                    "[XPORT] commit-unparked qid={qid} ent={idx} cid={}",
+                    msg.commit_id
+                );
                 apply_reply(&mut ents[idx], &msg.header, &msg.reply_body);
                 push_cmd_batched(
                     &mut ring,
@@ -1697,9 +1760,7 @@ fn queue_worker(
             Ok(_) => {}
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
             Err(e) if FuseOverUring::is_disconnect_errno(e.raw_os_error().unwrap_or(0)) => {
-                info!(
-                    "fuse-over-uring qid={qid}: submit_and_wait disconnect ({e}); shutting down"
-                );
+                info!("fuse-over-uring qid={qid}: submit_and_wait disconnect ({e}); shutting down");
                 pool.shutdown();
                 break;
             }
@@ -1754,9 +1815,8 @@ fn queue_worker(
                 // Drop any pending map entry for this ring slot and re-REGISTER so we
                 // do not permanently lose queue capacity after a failed COMMIT/REGISTER.
                 warn!("fuse-over-uring qid={qid} cqe err={err} ent={ent_idx}; reclaim entry");
-                pool.pending.lock().unwrap().retain(|_, (q, e, _)| {
-                    !(*q == qid && *e == ent_idx as u16)
-                });
+                pool.pending
+                    .retain(|_, (q, e, _)| !(*q == qid && *e == ent_idx as u16));
                 if ent_idx < ents.len() {
                     resubmit.push(ent_idx);
                 }
@@ -1780,9 +1840,7 @@ fn queue_worker(
                     warn!(
                         "fuse-over-uring qid={qid} ent={ent_idx}: unique=0 commit_id={cid}; force EIO COMMIT"
                     );
-                    xport_dbg!(
-                        "[XPORT] unique0-force-commit qid={qid} ent={ent_idx} cid={cid}"
-                    );
+                    xport_dbg!("[XPORT] unique0-force-commit qid={qid} ent={ent_idx} cid={cid}");
                     // Delivery on this ent implies its previous commit passed
                     // the refs == 0 gate; header-only reply, payload untouched.
                     debug_assert!(!lease_states[ent_idx].leased());
@@ -1809,8 +1867,7 @@ fn queue_worker(
                 }
                 continue;
             }
-            let opcode =
-                u32::from_le_bytes(ents[ent_idx].header.in_out[4..8].try_into().unwrap());
+            let opcode = u32::from_le_bytes(ents[ent_idx].header.in_out[4..8].try_into().unwrap());
             let payload_sz = ents[ent_idx].header.ring_ent_in_out.payload_sz as usize;
             let mut header_and_op =
                 Vec::with_capacity(FUSE_IN_HEADER_SIZE + FUSE_URING_OP_IN_OUT_SZ);
@@ -1896,8 +1953,6 @@ fn queue_worker(
             // keeps `waiting≥1` forever → plain `umount` EBUSY with no openers
             // (seen after full pjdfstest).
             pool.pending
-                .lock()
-                .unwrap()
                 .insert(unique, (qid, ent_idx as u16, commit_id));
             pool.inbound[qid as usize].push(InboundUringReq {
                 header_and_op,
@@ -2021,7 +2076,7 @@ fn queue_worker(
 /// relies on exactly that.
 fn apply_reply(ent: &mut Ent, header: &[u8], body: &Bytes) {
     const OUT_HDR: usize = 16; // sizeof(fuse_out_header)
-    // Clear header region so stale request bytes cannot leak into the reply.
+                               // Clear header region so stale request bytes cannot leak into the reply.
     ent.header.in_out = [0; FUSE_URING_IN_OUT_HEADER_SZ];
     if header.len() < OUT_HDR {
         // Degenerate — treat as IO error header.
@@ -2233,8 +2288,13 @@ mod tests {
         let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         assert!(efd >= 0);
         let efd_owned = unsafe { OwnedFd::from_raw_fd(efd) };
-        let arena = PayloadArena::new(4, 8192, efd_owned.as_raw_fd(), Arc::new(WakeCoalescer::new()))
-            .unwrap();
+        let arena = PayloadArena::new(
+            4,
+            8192,
+            efd_owned.as_raw_fd(),
+            Arc::new(WakeCoalescer::new()),
+        )
+        .unwrap();
 
         let mut seen = std::collections::HashSet::new();
         for idx in 0..4 {
@@ -2249,13 +2309,7 @@ mod tests {
 
         // The arena wake fd is a dup: writing it must signal the original.
         let one: u64 = 1;
-        let w = unsafe {
-            libc::write(
-                arena.wake.as_raw_fd(),
-                &one as *const u64 as *const _,
-                8,
-            )
-        };
+        let w = unsafe { libc::write(arena.wake.as_raw_fd(), &one as *const u64 as *const _, 8) };
         assert_eq!(w, 8);
         let mut buf = [0u8; 8];
         let r = unsafe { libc::read(efd_owned.as_raw_fd(), buf.as_mut_ptr().cast(), 8) };
@@ -2421,8 +2475,13 @@ mod tests {
         let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         assert!(efd >= 0);
         let efd_owned = unsafe { OwnedFd::from_raw_fd(efd) };
-        let arena = PayloadArena::new(1, 8192, efd_owned.as_raw_fd(), Arc::new(WakeCoalescer::new()))
-            .unwrap();
+        let arena = PayloadArena::new(
+            1,
+            8192,
+            efd_owned.as_raw_fd(),
+            Arc::new(WakeCoalescer::new()),
+        )
+        .unwrap();
         let state = Arc::new(EntLeaseState::new());
 
         assert_eq!(state.acquire(), 0);
@@ -2448,7 +2507,10 @@ mod tests {
         // The drop must have fired the wake (parked was set).
         let mut buf = [0u8; 8];
         let r = unsafe { libc::read(efd_owned.as_raw_fd(), buf.as_mut_ptr().cast(), 8) };
-        assert_eq!(r, 8, "lease drop with a parked commit must fire the eventfd");
+        assert_eq!(
+            r, 8,
+            "lease drop with a parked commit must fire the eventfd"
+        );
         assert!(state.try_unpark(), "commit releasable after the drop");
     }
 

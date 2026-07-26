@@ -1,13 +1,11 @@
+use bytes::Bytes;
 #[cfg(target_os = "linux")]
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
-use bytes::Bytes;
 
 #[cfg(target_os = "linux")]
 use io_uring::{opcode, types, IoUring};
-
-
 
 #[cfg(target_os = "linux")]
 #[repr(transparent)]
@@ -71,9 +69,7 @@ fn try_register_fuse_fd(ring: &IoUring, fd: RawFd) -> bool {
     match ring.submitter().register_files(&[fd]) {
         Ok(()) => true,
         Err(e) => {
-            tracing::debug!(
-                "fuse3: register_files(/dev/fuse) failed ({e:?}); using types::Fd"
-            );
+            tracing::debug!("fuse3: register_files(/dev/fuse) failed ({e:?}); using types::Fd");
             false
         }
     }
@@ -85,7 +81,6 @@ impl std::fmt::Debug for DebugUring {
         f.write_str("IoUring")
     }
 }
-
 
 #[cfg(any(
     all(target_os = "linux", feature = "unprivileged"),
@@ -103,10 +98,7 @@ use std::io::IoSlice;
 use std::io::IoSliceMut;
 
 use std::ops::{Deref, DerefMut};
-#[cfg(any(
-    target_os = "linux",
-    target_os = "freebsd"
-))]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::os::fd::OwnedFd;
 use std::os::fd::{AsFd, BorrowedFd};
 #[cfg(target_os = "freebsd")]
@@ -121,16 +113,13 @@ use std::{ffi::OsString, path::Path};
 use async_notify::Notify;
 use futures_util::lock::Mutex;
 use futures_util::{select, FutureExt};
-#[cfg(target_os = "freebsd")]
-use nix::sys::uio;
 #[cfg(target_os = "linux")]
 use nix::fcntl::{FcntlArg, OFlag};
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 use nix::sys::socket::{self, AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType};
-#[cfg(any(
-    target_os = "linux",
-    target_os = "freebsd"
-))]
+#[cfg(target_os = "freebsd")]
+use nix::sys::uio;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use tokio::io::{unix::AsyncFd, Interest};
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 use tokio::process::Command;
@@ -149,19 +138,65 @@ use crate::raw::abi::FUSE_WRITE_IN_SIZE;
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 use crate::MountOptions;
 
+/// Uniques delivered via classical `/dev/fuse` (INIT, the REGISTER
+/// handoff window, the post-arm classical sideband). Replies for these
+/// must use classical write even after the uring pool is armed.
+///
+/// Per-op economy (P2): on an armed steady-state session this set is
+/// (almost always) EMPTY — only sideband stragglers enter it — yet every
+/// reply paid the global mutex + hash probe. `len` (bumped AFTER a
+/// successful insert, decremented AFTER a successful remove) gates the
+/// probe: a reply observing `len == 0` may skip the lock because a
+/// unique's own classical insert is ordered strictly before its reply
+/// (delivery → session dispatch → handler → reply crosses synchronized
+/// channel/task edges, so the bump is visible by reply time); other
+/// uniques' racing entries are irrelevant to this unique's verdict — the
+/// set is keyed by unique and only the owner ever removes its entry.
+#[cfg(target_os = "linux")]
+struct ClassicalInflight {
+    len: std::sync::atomic::AtomicUsize,
+    set: std::sync::Mutex<std::collections::HashSet<u64>>,
+}
+
+#[cfg(target_os = "linux")]
+impl ClassicalInflight {
+    fn new() -> Self {
+        Self {
+            len: std::sync::atomic::AtomicUsize::new(0),
+            set: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    fn insert(&self, unique: u64) {
+        if self.set.lock().unwrap().insert(unique) {
+            self.len.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn remove(&self, unique: u64) -> bool {
+        if self.len.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return false;
+        }
+        let removed = self.set.lock().unwrap().remove(&unique);
+        if removed {
+            self.len.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
+        removed
+    }
+}
+
 pub struct FuseConnection {
     unmount_notify: Arc<Notify>,
     mode: ConnectionMode,
     /// Optional kernel FUSE-over-io_uring pool (Linux 6.14+). Shared across multi-queue clones.
     #[cfg(target_os = "linux")]
-    pub(crate) over_uring: std::sync::Arc<
-        std::sync::Mutex<Option<std::sync::Arc<super::fuse_over_uring::FuseOverUring>>>,
-    >,
+    pub(crate) over_uring:
+        std::sync::Arc<arc_swap::ArcSwapOption<super::fuse_over_uring::FuseOverUring>>,
     /// Uniques delivered via classical `/dev/fuse` (INIT, the REGISTER handoff,
     /// and the post-arm classical sideband). Replies for these must use
     /// classical write even after the uring pool is armed.
     #[cfg(target_os = "linux")]
-    classical_inflight: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
+    classical_inflight: std::sync::Arc<ClassicalInflight>,
     #[cfg(target_os = "linux")]
     pub(crate) assigned_qid: Option<u16>,
     /// Post-arm classical sideband servicer (primary session only). The kernel
@@ -204,10 +239,8 @@ impl FuseConnection {
             Ok(Self {
                 unmount_notify,
                 mode: ConnectionMode::Block(connection),
-                over_uring: std::sync::Arc::new(std::sync::Mutex::new(None)),
-                classical_inflight: std::sync::Arc::new(std::sync::Mutex::new(
-                    std::collections::HashSet::new(),
-                )),
+                over_uring: std::sync::Arc::new(arc_swap::ArcSwapOption::const_empty()),
+                classical_inflight: std::sync::Arc::new(ClassicalInflight::new()),
                 assigned_qid: None,
                 classical_sideband: std::sync::atomic::AtomicBool::new(false),
             })
@@ -216,7 +249,7 @@ impl FuseConnection {
 
     #[cfg(target_os = "linux")]
     pub fn num_uring_queues(&self) -> Option<usize> {
-        self.over_uring.lock().unwrap().as_ref().map(|p| p.nqueues as usize)
+        self.over_uring.load().as_ref().map(|p| p.nqueues as usize)
     }
 
     /// Start kernel FUSE-over-io_uring workers after FUSE_INIT. Required transport.
@@ -233,7 +266,7 @@ impl FuseConnection {
     ) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         // Already enabled (e.g. race with another enable call)
-        if self.over_uring.lock().unwrap().is_some() {
+        if self.over_uring.load().is_some() {
             return Ok(());
         }
         let fd = self.as_fd().as_raw_fd();
@@ -246,13 +279,13 @@ impl FuseConnection {
                 ),
             )
         })?;
-        *self.over_uring.lock().unwrap() = Some(pool);
+        self.over_uring.store(Some(pool));
         Ok(())
     }
 
     #[cfg(target_os = "linux")]
     pub fn get_payload_buffer(&self, unique: u64) -> Option<(u64, usize)> {
-        let pool = self.over_uring.lock().unwrap().clone()?;
+        let pool = self.over_uring.load_full()?;
         pool.get_payload_buffer(unique)
     }
 
@@ -268,10 +301,8 @@ impl FuseConnection {
         Ok(Self {
             unmount_notify,
             mode: ConnectionMode::NonBlock(connection),
-            over_uring: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            classical_inflight: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashSet::new(),
-            )),
+            over_uring: std::sync::Arc::new(arc_swap::ArcSwapOption::const_empty()),
+            classical_inflight: std::sync::Arc::new(ClassicalInflight::new()),
             assigned_qid: None,
             classical_sideband: std::sync::atomic::AtomicBool::new(false),
         })
@@ -310,8 +341,8 @@ impl FuseConnection {
             }
             #[cfg(feature = "unprivileged")]
             ConnectionMode::NonBlock(_) => {
-                use std::os::unix::fs::OpenOptionsExt;
                 use std::os::fd::{AsRawFd, FromRawFd};
+                use std::os::unix::fs::OpenOptionsExt;
                 let primary_fd = self.as_fd().as_raw_fd();
                 let file = std::fs::OpenOptions::new()
                     .write(true)
@@ -334,14 +365,18 @@ impl FuseConnection {
                 let read_use_fixed = try_register_fuse_fd(&read_ring, fd.as_raw_fd());
                 let write_use_fixed = try_register_fuse_fd(&write_ring, fd.as_raw_fd());
 
-                let read_event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+                let read_event_fd =
+                    unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
                 if read_event_fd < 0 {
                     return Err(io::Error::last_os_error());
                 }
 
-                let write_event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+                let write_event_fd =
+                    unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
                 if write_event_fd < 0 {
-                    unsafe { libc::close(read_event_fd); }
+                    unsafe {
+                        libc::close(read_event_fd);
+                    }
                     return Err(io::Error::last_os_error());
                 }
 
@@ -445,7 +480,7 @@ impl FuseConnection {
                 // Sideband servicer: never drain the uring inbound queues.
                 None
             } else {
-                self.over_uring.lock().unwrap().clone()
+                self.over_uring.load_full()
             };
             // After arm: uring-only. Before arm / when inactive: fall through.
             // - ready → drain uring inbound
@@ -487,8 +522,7 @@ impl FuseConnection {
                     );
                 }
                 header_buf[..40].copy_from_slice(&inbound.header_and_op[..40]);
-                let total_len =
-                    u32::from_le_bytes(header_buf[0..4].try_into().unwrap()) as usize;
+                let total_len = u32::from_le_bytes(header_buf[0..4].try_into().unwrap()) as usize;
                 let body_need = total_len.saturating_sub(40);
                 let op_in = &inbound.header_and_op[40..];
                 let payload = &inbound.payload;
@@ -500,8 +534,7 @@ impl FuseConnection {
                 // for bytes nothing reads. Copy only the fuse_write_in arg
                 // from op_in; every other opcode keeps the reconstruction
                 // below verbatim.
-                let opcode =
-                    u32::from_le_bytes(inbound.header_and_op[4..8].try_into().unwrap());
+                let opcode = u32::from_le_bytes(inbound.header_and_op[4..8].try_into().unwrap());
                 if opcode == crate::raw::abi::fuse_opcode::FUSE_WRITE as u32
                     && body_need >= FUSE_WRITE_IN_SIZE
                     && !payload.is_empty()
@@ -546,7 +579,10 @@ impl FuseConnection {
                         }
                     }
                 }
-                return ((header_buf, data_buf, Some(inbound.payload)), Ok(40 + filled));
+                return (
+                    (header_buf, data_buf, Some(inbound.payload)),
+                    Ok(40 + filled),
+                );
             }
         }
 
@@ -583,7 +619,7 @@ impl FuseConnection {
                 }
                 // FUSE_FORGET = 2, FUSE_BATCH_FORGET = 42: no reply exists.
                 if unique != 0 && !matches!(op, 2 | 42) {
-                    self.classical_inflight.lock().unwrap().insert(unique);
+                    self.classical_inflight.insert(unique);
                 }
             }
         }
@@ -604,7 +640,7 @@ impl FuseConnection {
         // plain `umount` returns EBUSY forever.
         #[cfg(target_os = "linux")]
         {
-            let pool = self.over_uring.lock().unwrap().clone();
+            let pool = self.over_uring.load_full();
             if let Some(pool) = pool.filter(|p| p.is_ready()) {
                 // unique is at offset 8 in fuse_out_header (len u32, error i32, unique u64)
                 let unique = if data.deref().len() >= 16 {
@@ -622,12 +658,7 @@ impl FuseConnection {
                 // Unsupported, which the session loop treated as FATAL —
                 // the first live notify on an armed session killed the
                 // mount; the gate's notify-delivery row pins the fix.)
-                let is_classical = unique == 0
-                    || self
-                        .classical_inflight
-                        .lock()
-                        .unwrap()
-                        .remove(&unique);
+                let is_classical = unique == 0 || self.classical_inflight.remove(unique);
                 if is_classical {
                     if super::fuse_over_uring::transport_debug() {
                         eprintln!("[XPORT] classical-reply unique={unique}");
@@ -636,7 +667,9 @@ impl FuseConnection {
                 } else {
                     let body_bytes = if let Some(ref ext) = body_extend_data {
                         let slice = ext.deref();
-                        let dest_addr = pool.get_payload_buffer(unique).map(|(ptr, _)| ptr as *const u8);
+                        let dest_addr = pool
+                            .get_payload_buffer(unique)
+                            .map(|(ptr, _)| ptr as *const u8);
                         if let Some(addr) = dest_addr {
                             if slice.as_ptr() == addr {
                                 bytes::Bytes::from_owner(UringBufOwner {
@@ -749,7 +782,9 @@ impl BlockFuseConnection {
 
         let write_event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if write_event_fd < 0 {
-            unsafe { libc::close(read_event_fd); }
+            unsafe {
+                libc::close(read_event_fd);
+            }
             return Err(io::Error::last_os_error());
         }
 
@@ -1041,7 +1076,6 @@ struct NonBlockFuseConnection {
     write: Mutex<()>,
 }
 
-
 #[cfg(any(
     all(target_os = "linux", feature = "unprivileged"),
     target_os = "freebsd"
@@ -1168,9 +1202,12 @@ impl NonBlockFuseConnection {
                 return Err(io::Error::last_os_error());
             }
 
-            let write_event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            let write_event_fd =
+                unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
             if write_event_fd < 0 {
-                unsafe { libc::close(read_event_fd); }
+                unsafe {
+                    libc::close(read_event_fd);
+                }
                 return Err(io::Error::last_os_error());
             }
 
@@ -1217,7 +1254,6 @@ impl NonBlockFuseConnection {
                 write: Mutex::new(()),
             })
         }
-
     }
 
     #[cfg(all(target_os = "linux", feature = "unprivileged"))]

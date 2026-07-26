@@ -216,7 +216,10 @@ impl std::hash::Hash for ReplyData {
 
 impl From<Bytes> for ReplyData {
     fn from(data: Bytes) -> Self {
-        Self { data, backing: None }
+        Self {
+            data,
+            backing: None,
+        }
     }
 }
 

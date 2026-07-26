@@ -1,12 +1,13 @@
+use bytes::Bytes;
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 use std::ffi::OsStr;
-use std::mem;
 use std::ffi::OsString;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::io::Error as IoError;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
+use std::mem;
 use std::num::NonZeroU32;
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
@@ -17,7 +18,6 @@ use std::pin::{pin, Pin};
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
-use bytes::Bytes;
 
 #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
 use async_fs::read_dir;
@@ -571,8 +571,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             .map(Result::unwrap)
             .fuse();
         #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
-        let reply_task = task::spawn(Self::reply_fuse(fuse_write_connection, receiver))
-            .fuse();
+        let reply_task = task::spawn(Self::reply_fuse(fuse_write_connection, receiver)).fuse();
 
         let mut reply_task = pin!(reply_task);
 
@@ -793,22 +792,28 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 // Classical path: ENODEV (pre-FUSE_ABORT_ERROR) or ECONNABORTED.
                 // Uring path: we surface ENOTCONN / NotConnected when the pool dies.
                 let disconnect = match err.raw_os_error() {
-                    Some(e) if matches!(
-                        e,
-                        libc::ENODEV
-                            | libc::ECONNABORTED
-                            | libc::ENOTCONN
-                            | libc::EPIPE
-                            | libc::EBADF
-                            | libc::ESHUTDOWN
-                    ) => true,
-                    _ => err.kind() == ErrorKind::NotConnected || err.kind() == ErrorKind::BrokenPipe,
+                    Some(e)
+                        if matches!(
+                            e,
+                            libc::ENODEV
+                                | libc::ECONNABORTED
+                                | libc::ENOTCONN
+                                | libc::EPIPE
+                                | libc::EBADF
+                                | libc::ESHUTDOWN
+                        ) =>
+                    {
+                        true
+                    }
+                    _ => {
+                        err.kind() == ErrorKind::NotConnected || err.kind() == ErrorKind::BrokenPipe
+                    }
                 };
                 if disconnect {
                     debug!("fuse connection dead ({err}); ending session");
                     #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
                     {
-                        if let Some(pool) = fuse_connection.over_uring.lock().unwrap().take() {
+                        if let Some(pool) = fuse_connection.over_uring.swap(None) {
                             pool.shutdown();
                         }
                     }
@@ -970,7 +975,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                             .write_vectored::<_, Vec<u8>>(hdr, None)
                             .await
                             .1;
-                        if let Some(pool) = fuse_connection.over_uring.lock().unwrap().take() {
+                        if let Some(pool) = fuse_connection.over_uring.swap(None) {
                             pool.shutdown();
                         }
                     }
@@ -1041,7 +1046,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 }
 
                 fuse_opcode::FUSE_WRITE => {
-                    self.handle_write(request, in_header, data_ref, uring_payload.clone(), &fs).await;
+                    self.handle_write(request, in_header, data_ref, uring_payload.clone(), &fs)
+                        .await;
                 }
 
                 fuse_opcode::FUSE_STATFS => {
@@ -1362,7 +1368,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
         {
             fuse_connection.enable_fuse_over_uring(transport_geom)?;
-            if let Some(pool) = fuse_connection.over_uring.lock().unwrap().clone() {
+            if let Some(pool) = fuse_connection.over_uring.load_full() {
                 pool.mark_ready();
             }
             eprintln!("FUSE-over-io_uring transport armed for this session");
@@ -2419,8 +2425,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         p.len()
                     );
 
-                    reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender)
-                        .await;
+                    reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                     return;
                 }
@@ -2433,8 +2438,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 if write_in.size as usize != data.len() {
                     error!("fuse_write_in body len is invalid");
 
-                    reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender)
-                        .await;
+                    reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                     return;
                 }
@@ -3813,7 +3817,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         error: err.into(),
                         unique: request.unique,
                     };
-                    get_bincode_config().serialize(&out_header).expect("won't happened")
+                    get_bincode_config()
+                        .serialize(&out_header)
+                        .expect("won't happened")
                 }
                 Ok(reply) => {
                     let out_header = fuse_out_header {
@@ -3827,9 +3833,14 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         in_iovs: reply.in_iovs,
                         out_iovs: reply.out_iovs,
                     };
-                    let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + mem::size_of::<fuse_ioctl_out>());
-                    get_bincode_config().serialize_into(&mut data, &out_header).expect("won't happened");
-                    get_bincode_config().serialize_into(&mut data, &ioctl_out).expect("won't happened");
+                    let mut data =
+                        Vec::with_capacity(FUSE_OUT_HEADER_SIZE + mem::size_of::<fuse_ioctl_out>());
+                    get_bincode_config()
+                        .serialize_into(&mut data, &out_header)
+                        .expect("won't happened");
+                    get_bincode_config()
+                        .serialize_into(&mut data, &ioctl_out)
+                        .expect("won't happened");
                     data
                 }
             };
@@ -4525,7 +4536,11 @@ where
 }
 
 struct TpcScheduler {
-    senders: Vec<tokio::sync::mpsc::UnboundedSender<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
+    senders: Vec<
+        tokio::sync::mpsc::UnboundedSender<
+            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        >,
+    >,
     next_idx: std::sync::atomic::AtomicUsize,
 }
 
@@ -4571,13 +4586,17 @@ impl TpcScheduler {
 
         let mut senders = Vec::new();
         let core_count = if core_ids.is_empty() {
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(16)
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(16)
         } else {
             core_ids.len()
         };
 
         for i in 0..core_count {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<
+                std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+            >();
             senders.push(tx);
 
             let core_id = if !core_ids.is_empty() {
@@ -4590,7 +4609,7 @@ impl TpcScheduler {
                 if let Some(cid) = core_id {
                     core_affinity::set_for_current(cid);
                 }
-                
+
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -4619,12 +4638,16 @@ impl TpcScheduler {
             tokio::task::spawn(fut);
             return;
         }
-        let idx = self.next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.senders.len();
+        let idx = self
+            .next_idx
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.senders.len();
         let _ = self.senders[idx].send(Box::pin(fut));
     }
 }
 
-static TPC_SCHEDULER: once_cell::sync::Lazy<TpcScheduler> = once_cell::sync::Lazy::new(TpcScheduler::new);
+static TPC_SCHEDULER: once_cell::sync::Lazy<TpcScheduler> =
+    once_cell::sync::Lazy::new(TpcScheduler::new);
 
 #[inline]
 fn spawn<F>(span: Span, fut: F)
@@ -4949,7 +4972,11 @@ mod kernel_init_tests {
         let ki = KernelInit::new(7, 45, 0x8000_0001, 1 << 9);
         assert_eq!(ki.major, 7);
         assert_eq!(ki.minor, 45);
-        assert_eq!(ki.flags & 0xFFFF_FFFF, 0x8000_0001, "classical flags in bits 0..31");
+        assert_eq!(
+            ki.flags & 0xFFFF_FFFF,
+            0x8000_0001,
+            "classical flags in bits 0..31"
+        );
         assert_eq!(
             ki.flags & (1u64 << 41),
             1u64 << 41,

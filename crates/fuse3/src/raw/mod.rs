@@ -7,19 +7,28 @@
 //! choose.
 
 use bytes::Bytes;
-pub use filesystem::Filesystem;
-use futures_util::future::Either;
-pub use request::Request;
-#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
-pub use session::{kernel_init_info, KernelInit, MountHandle, Session, tpc_spawn, tpc_thread_count};
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use connection::fuse_over_uring::{
     over_uring_classical_sideband, over_uring_commit_batch_stats, over_uring_geometry,
     over_uring_sessions_active, over_uring_stats, transport_lease_stats, transport_wake_stats,
     COMMIT_BATCH_LABELS,
 };
+pub use filesystem::Filesystem;
+use futures_util::future::Either;
+pub use request::Request;
+#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
+pub use session::{
+    kernel_init_info, tpc_spawn, tpc_thread_count, KernelInit, MountHandle, Session,
+};
 
-pub(crate) type FuseData = Either<Vec<u8>, (Vec<u8>, Bytes, Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>)>;
+pub(crate) type FuseData = Either<
+    Vec<u8>,
+    (
+        Vec<u8>,
+        Bytes,
+        Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    ),
+>;
 
 pub(crate) mod abi;
 pub mod connection;

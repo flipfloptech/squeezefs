@@ -2190,6 +2190,19 @@ impl StreamActivityGauge {
 /// never wrongness.
 pub struct StreamLanes {
     lanes: [StreamLane; 4],
+    /// Consecutive reads of this file that matched NO lane — the
+    /// random-dominated signature. A spurious classification (random
+    /// traffic occasionally lands 4 contiguous offsets) would otherwise
+    /// veto the ranged path file-wide for its whole 2 s freshness window,
+    /// steering thousands of random misses into ungoverned whole-block
+    /// fetches (the scan-resistance cold-row residual, measured 20–40 GiB
+    /// per 20 s on the rig). At [`Self::FOREIGN_DECLASSIFY_RUN`] the
+    /// classifications clear; any lane match resets the run. Honest cost:
+    /// a REAL small-request stream interleaved with a ≥ 16:1 random flood
+    /// on the same file declassifies too and rides ranged window reads
+    /// until the flood subsides — under such a flood its whole-block
+    /// locality was churning anyway, and re-classification is 4 requests.
+    foreign_since_match: std::sync::atomic::AtomicU32,
 }
 
 /// §5.6 zero-copy ranged destination, one definition: a 4 KiB-aligned
@@ -2254,8 +2267,13 @@ impl StreamLanes {
         };
         Self {
             lanes: [mk(), mk(), mk(), mk()],
+            foreign_since_match: std::sync::atomic::AtomicU32::new(0),
         }
     }
+
+    /// Foreign-run length that clears every lane's classification (see
+    /// `foreign_since_match`).
+    const FOREIGN_DECLASSIFY_RUN: u32 = 16;
 
     fn now_ms() -> u64 {
         std::time::SystemTime::now()
@@ -2288,6 +2306,7 @@ impl StreamLanes {
         // Lane match: continue the run.
         for lane in &self.lanes {
             if lane.next_expected_offset.load(Relaxed) == offset {
+                self.foreign_since_match.store(0, Relaxed);
                 lane.next_expected_offset.store(offset + len, Relaxed);
                 let run = lane.run_reads.fetch_add(1, Relaxed) + 1;
                 lane.last_seen_ms.store(now, Relaxed);
@@ -2306,6 +2325,20 @@ impl StreamLanes {
                     lane,
                     streaming: false,
                 });
+            }
+        }
+        // No lane matched: a foreign read. A long-enough foreign run
+        // means random traffic dominates this file — clear every lane's
+        // classification (and its run credit: fresh evidence required)
+        // so a spurious stream cannot hold the ranged-path veto for its
+        // whole freshness window. Racy-tolerant like the lanes
+        // themselves: a lost update delays the declassify by one read.
+        if self.foreign_since_match.fetch_add(1, Relaxed) + 1 >= Self::FOREIGN_DECLASSIFY_RUN {
+            self.foreign_since_match.store(0, Relaxed);
+            for lane in &self.lanes {
+                if lane.classified.swap(false, Relaxed) {
+                    lane.run_reads.store(0, Relaxed);
+                }
             }
         }
         // Claim the stalest lane (2 s staleness — the existing constant).

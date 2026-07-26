@@ -461,10 +461,11 @@ async fn governor_phases() {
         "fixture: the contiguous run must classify the lane"
     );
     // 100 scattered (never contiguous, never lane-matching) reads — the
-    // random-dominated signature.
+    // random-dominated signature. Blocks 2..=13 only: block 15 must stay
+    // COLD so the final assertion observes the dispatch, not a hot hit.
     for i in 0..100u64 {
-        let b = 2 + (i % 14);
-        read_flags(&h, ino, b * BS + 20480 + (i / 14) * 8192, 4096, OD).await;
+        let b = 2 + (i % 12);
+        read_flags(&h, ino, b * BS + 20480 + (i / 12) * 8192, 4096, OD).await;
     }
     // A fresh cold-block random read must now be RANGED again (the veto
     // cleared), not a whole-block fetch.

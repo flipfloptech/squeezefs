@@ -113,7 +113,7 @@ fn service_spin_window() -> Duration {
 fn service_spin_window_from(v: Option<&str>) -> Duration {
     let us = v
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(30)
+        .unwrap_or(0)
         .clamp(0, 10_000);
     Duration::from_micros(us)
 }

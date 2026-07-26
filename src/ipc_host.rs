@@ -88,18 +88,20 @@ const SERVICE_PARK_MAX: Duration = Duration::from_millis(5);
 
 /// Empty-pass spin window before a service thread parks (time-based —
 /// the §5.5.1 "spin → short wait" ladder's spin rung, restored; knob
-/// `SQUEEZEFS_IPC_SPIN_US`, default 20). The former 64 bare `spin_loop`
+/// `SQUEEZEFS_IPC_SPIN_US`, default 0 — see below). The former 64 bare `spin_loop`
 /// hints were sub-µs — smaller than ANY per-session inter-arrival gap
 /// once sessions spread across threads (13–55 µs on the 2026-07-26
 /// fabric-rig shapes), so every burst paid a full doorbell park/wake
 /// cycle: the measured sessions inversion (svc voluntary context
 /// switches 32k → 394k /s from sessions=1 → 8 at one offered load).
-/// The default is deliberately conservative: 20 µs covers dense
-/// per-session arrival without measurable CPU theft anywhere on the
-/// sizing grid, while 100 µs — which buys ~3 % more on 16-process
-/// libaio fleets — cost the sync lane 22 % (8 spinning service
-/// threads vs the tokio workers; evidence note §5). Fleets with no
-/// sync lanes can raise it.
+/// The default is 0 — the window ships as an explicit fleet lever,
+/// not an ambient tax: every nonzero setting measured on the sizing
+/// grid bought its libaio-fleet gain (+3–5 % at 20 µs, more at 100 µs)
+/// by stealing runnable-tokio CPU from the sync lane (−4 % at 20 µs,
+/// −22 % at 100 µs with 8 service threads; evidence note §5–6), and
+/// the sync lane is a protected row. The multi-session/fleet wins that
+/// ship by default come from the event-driven reap + the epoch-cached
+/// snapshot; libaio-only fleets raise this knob for the rest.
 fn service_spin_window() -> Duration {
     let us = std::env::var("SQUEEZEFS_IPC_SPIN_US")
         .ok()

@@ -190,8 +190,9 @@ pub struct FuseConnection {
     mode: ConnectionMode,
     /// Optional kernel FUSE-over-io_uring pool (Linux 6.14+). Shared across multi-queue clones.
     #[cfg(target_os = "linux")]
-    pub(crate) over_uring:
-        std::sync::Arc<arc_swap::ArcSwapOption<super::fuse_over_uring::FuseOverUring>>,
+    pub(crate) over_uring: std::sync::Arc<
+        std::sync::Mutex<Option<std::sync::Arc<super::fuse_over_uring::FuseOverUring>>>,
+    >,
     /// Uniques delivered via classical `/dev/fuse` (INIT, the REGISTER handoff,
     /// and the post-arm classical sideband). Replies for these must use
     /// classical write even after the uring pool is armed.
@@ -239,7 +240,7 @@ impl FuseConnection {
             Ok(Self {
                 unmount_notify,
                 mode: ConnectionMode::Block(connection),
-                over_uring: std::sync::Arc::new(arc_swap::ArcSwapOption::const_empty()),
+                over_uring: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 classical_inflight: std::sync::Arc::new(ClassicalInflight::new()),
                 assigned_qid: None,
                 classical_sideband: std::sync::atomic::AtomicBool::new(false),
@@ -249,7 +250,11 @@ impl FuseConnection {
 
     #[cfg(target_os = "linux")]
     pub fn num_uring_queues(&self) -> Option<usize> {
-        self.over_uring.load().as_ref().map(|p| p.nqueues as usize)
+        self.over_uring
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.nqueues as usize)
     }
 
     /// Start kernel FUSE-over-io_uring workers after FUSE_INIT. Required transport.
@@ -266,7 +271,7 @@ impl FuseConnection {
     ) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         // Already enabled (e.g. race with another enable call)
-        if self.over_uring.load().is_some() {
+        if self.over_uring.lock().unwrap().is_some() {
             return Ok(());
         }
         let fd = self.as_fd().as_raw_fd();
@@ -279,13 +284,20 @@ impl FuseConnection {
                 ),
             )
         })?;
-        self.over_uring.store(Some(pool));
+        *self.over_uring.lock().unwrap() = Some(pool);
         Ok(())
     }
 
     #[cfg(target_os = "linux")]
     pub fn get_payload_buffer(&self, unique: u64) -> Option<(u64, usize)> {
-        let pool = self.over_uring.load_full()?;
+        // Plain uncontended mutex, DELIBERATELY not arc-swap (P2 md-storm
+        // forensics): arc_swap loads/stores share one process-global debt
+        // registry, so high-rate guard traffic from the transport threads
+        // lengthened every kv node-snapshot `store()`'s pay_all walk on
+        // the serialized conveyor path (−10% create/del storms). The
+        // contended per-op lock was `pending` (now sharded); this one is
+        // uncontended.
+        let pool = self.over_uring.lock().unwrap().clone()?;
         pool.get_payload_buffer(unique)
     }
 
@@ -297,7 +309,8 @@ impl FuseConnection {
     #[cfg(target_os = "linux")]
     pub fn over_uring_ready(&self) -> bool {
         self.over_uring
-            .load()
+            .lock()
+            .unwrap()
             .as_ref()
             .is_some_and(|p| p.is_ready())
     }
@@ -319,7 +332,7 @@ impl FuseConnection {
         Ok(Self {
             unmount_notify,
             mode: ConnectionMode::NonBlock(connection),
-            over_uring: std::sync::Arc::new(arc_swap::ArcSwapOption::const_empty()),
+            over_uring: std::sync::Arc::new(std::sync::Mutex::new(None)),
             classical_inflight: std::sync::Arc::new(ClassicalInflight::new()),
             assigned_qid: None,
             classical_sideband: std::sync::atomic::AtomicBool::new(false),
@@ -498,7 +511,7 @@ impl FuseConnection {
                 // Sideband servicer: never drain the uring inbound queues.
                 None
             } else {
-                self.over_uring.load_full()
+                self.over_uring.lock().unwrap().clone()
             };
             // After arm: uring-only. Before arm / when inactive: fall through.
             // - ready → drain uring inbound
@@ -658,7 +671,7 @@ impl FuseConnection {
         // plain `umount` returns EBUSY forever.
         #[cfg(target_os = "linux")]
         {
-            let pool = self.over_uring.load_full();
+            let pool = self.over_uring.lock().unwrap().clone();
             if let Some(pool) = pool.filter(|p| p.is_ready()) {
                 // unique is at offset 8 in fuse_out_header (len u32, error i32, unique u64)
                 let unique = if data.deref().len() >= 16 {

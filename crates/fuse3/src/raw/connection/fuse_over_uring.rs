@@ -224,7 +224,7 @@ struct QueueHandle {
     /// The queue's payload arena, set once by the worker at startup. Held
     /// here so payload pointers handed out via `get_payload_buffer` stay
     /// valid for the pool's whole life, even after the worker exited.
-    arena: arc_swap::ArcSwapOption<PayloadArena>,
+    arena: std::sync::Mutex<Option<Arc<PayloadArena>>>,
 }
 
 /// Owns every registered payload buffer of one queue plus a dup of the
@@ -993,7 +993,7 @@ impl FuseOverUring {
                 wake_fd,
                 _wake: wake,
                 wake_coalescer: Arc::new(WakeCoalescer::new()),
-                arena: arc_swap::ArcSwapOption::const_empty(),
+                arena: std::sync::Mutex::new(None),
             });
             commit_rxs.push(commit_rx);
         }
@@ -1219,7 +1219,7 @@ impl FuseOverUring {
     pub fn get_payload_buffer(&self, unique: u64) -> Option<(u64, usize)> {
         let (qid, ent_idx, _) = self.pending.get(unique)?;
         let q = self.queues.get(qid as usize)?;
-        let arena = q.arena.load_full()?;
+        let arena = q.arena.lock().unwrap().clone()?;
         let ptr = arena.buf(ent_idx as usize)?;
         Some((ptr as u64, self.payload_sz))
     }
@@ -1606,7 +1606,7 @@ fn queue_worker(
         };
     }
 
-    pool.queues[qid as usize].arena.store(Some(arena.clone()));
+    *pool.queues[qid as usize].arena.lock().unwrap() = Some(arena.clone());
 
     for (idx, ent) in ents.iter().enumerate() {
         push_cmd(

@@ -423,6 +423,57 @@ async fn governor_phases() {
     drop(h);
 }
 
+/// Clamped-mode admission is an atomic RESERVATION, not check-then-add:
+/// under real mount concurrency (256-deep O_DIRECT), a thundering herd of
+/// simultaneous escalation attempts must not all pass the bandwidth check
+/// before any of their spends land (measured on the rig as ~6× the
+/// configured fill budget: 93 admits/s where 5 % of foreground allowed 15).
+#[test]
+fn clamped_admission_is_a_reservation_under_herd() {
+    let gov = std::sync::Arc::new(squeezefs::routing::AdmissionGovernor::new(5));
+    let block: u64 = 4 * 1024 * 1024;
+    // Engage the clamp: waste ≈ admitted (the churn steady state)...
+    for _ in 0..4 {
+        assert!(gov.allow_escalation(block), "pre-clamp admissions flow");
+        gov.on_eviction(
+            block,
+            &squeezefs::tiering::memory::EvictClass::Protected { served_bytes: 0 },
+        );
+    }
+    // ...and fund a known foreground window: budget = 5 % of 8 GiB =
+    // ~409 MiB ⇒ ~102 blocks MINUS the 16 MiB already admitted.
+    gov.note_foreground(8 * 1024 * 1024 * 1024);
+    let budget_blocks = (8u64 * 1024 * 1024 * 1024 * 5 / 100) / block; // 102
+
+    let admitted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..64 {
+        let gov = gov.clone();
+        let admitted = admitted.clone();
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..64 {
+                if gov.allow_escalation(block) {
+                    admitted.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let got = admitted.load(Ordering::Relaxed);
+    assert!(
+        got <= budget_blocks,
+        "herd of 4096 concurrent attempts must never overshoot the \
+         reserved fill budget (~{budget_blocks} blocks): admitted {got}"
+    );
+    assert!(
+        got >= budget_blocks / 2,
+        "the reservation must still fill most of the budget (got {got} of \
+         ~{budget_blocks})"
+    );
+}
+
 /// Pure-API shard-geometry pin (env-free — safe under parallel test fns):
 /// the min-shard constructor honors per-shard capacity floors.
 #[test]

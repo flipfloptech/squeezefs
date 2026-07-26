@@ -356,6 +356,14 @@ impl ArenaWindow {
         buf
     }
 
+    /// The window's base pointer — the direct-drive DMA destination
+    /// (`crate::ipc_direct`): raw on purpose, same non-exclusivity
+    /// contract as the copies above. Alignment is the CALLER's screen
+    /// (O_DIRECT-class DMA needs 4 KiB; unaligned windows bounce).
+    pub(crate) fn as_base_ptr(&self) -> *mut u8 {
+        self.base
+    }
+
     /// Write `bytes` into the window (completion payloads).
     pub fn write(&self, bytes: &[u8]) {
         let n = bytes.len().min(self.len);

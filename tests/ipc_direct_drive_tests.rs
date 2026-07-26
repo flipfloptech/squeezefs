@@ -533,18 +533,24 @@ async fn ddt_ranged_ring_read_direct_drives_with_exact_engagement() {
         (BS + 128 * 1024, 64 * 1024),
         (256 * 1024, 4096),
     ];
+    // Deltas bracket ONLY the ring reads (the parity fuse_read calls
+    // below drive the handler's own ranged accounting).
     let before = snap();
-    for (i, (offset, len)) in shapes.iter().enumerate() {
+    let mut got_all = Vec::new();
+    for (offset, len) in shapes {
         let got = tokio::task::block_in_place(|| {
             session.ring_pread(binding, *offset, *len, 0, "dd aligned read")
         });
+        got_all.push(got);
+    }
+    let d = delta(&before);
+    for (i, (offset, len)) in shapes.iter().enumerate() {
         let want = fx.fuse_read(ino, *offset, *len as u32).await;
         assert_eq!(
-            got, want,
+            got_all[i], want,
             "byte parity on direct-drive shape {i} (offset {offset} len {len})"
         );
     }
-    let d = delta(&before);
     fx.fs.router.set_direct_device_true(false);
 
     let n = shapes.len() as u64;

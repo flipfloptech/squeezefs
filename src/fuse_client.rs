@@ -4971,19 +4971,184 @@ impl SqueezefsFilesystem {
         offset: u64,
         len: u32,
     ) -> Result<IpcDirectSnapshot, IpcDirectIneligible> {
-        let _ = (ino, offset, len);
-        // Red scaffold: the engine does not exist yet — everything is
-        // ineligible (the tests define the contract).
-        Err(IpcDirectIneligible::Meta)
+        use IpcDirectIneligible as I;
+        // Device-class shape: 4–64 KiB (the R3 ranged window class the
+        // 64 KiB bounce pool sizes; sub-4 KiB and jumbo shapes are not
+        // the governed miss shape).
+        if !(4096..=64 * 1024).contains(&(len as u64)) {
+            return Err(I::Shape);
+        }
+        // Ranged window reads decode nothing — passthrough volumes only
+        // (the handler's own ranged-leg gate; transform volumes must
+        // fetch whole stored images).
+        if !self.router.get_crypto().is_passthrough() {
+            return Err(I::Meta);
+        }
+        // RAM-authoritative metadata only. The RAM entry is the binding
+        // authority on a live mount (the write path updates it
+        // synchronously; D0 excludes remote writers) — exactly the
+        // handler's `current_block_binding` source. Not resident ⇒
+        // fall back (the honest map-resident-majority split).
+        let Some(meta) = self.router.metadata_cache.get(&ino) else {
+            return Err(I::Meta);
+        };
+        if meta.file_type != "striped" {
+            return Err(I::Meta);
+        }
+        // Strict in-bounds: EOF-clipping shapes keep the handler's
+        // short-read/zero-fill semantics.
+        let Some(end) = offset.checked_add(u64::from(len)) else {
+            return Err(I::Shape);
+        };
+        if end > meta.size {
+            return Err(I::Shape);
+        }
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        if block_size == 0 || block_size % 4096 != 0 {
+            return Err(I::Shape);
+        }
+        let b = offset / block_size;
+        if (end - 1) / block_size != b {
+            return Err(I::Shape); // multi-block
+        }
+        let b32 = b as u32;
+        let Some(map) = meta.block_map.as_ref() else {
+            // Indirect / not-RAM-resident maps: sibling shapes stay on
+            // the handler (recorded split — never force a partial
+            // design to claim the whole shape).
+            return Err(I::Meta);
+        };
+        let Some(key) = map.get(&b32) else {
+            return Err(I::Layout); // hole block — handler serves zeros
+        };
+        if !crate::routing::is_whole_block_mapping(key) {
+            return Err(I::Layout); // decorated `bk:off:len` mapping
+        }
+        // Overlay screen — ANY overlay presence ⇒ handler (correctness
+        // owns ambiguity). The O(1) gate first (the capture_parked_runs
+        // discipline: never a map scan when no overlay exists).
+        if self
+            .parked_overlay_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            let cache_key = crate::keys::active_block(ino, b).to_string();
+            if self.active_block_buffers.contains_key(&cache_key) {
+                return Err(I::Overlay);
+            }
+        }
+        let file_path = crate::keys::inode_path(ino);
+        // Staged sibling (the striped block's staging-ring image) — the
+        // handler probes it before any device read; so must we.
+        let cache_key = crate::keys::active_block_for_path(&file_path, b32).to_string();
+        if self
+            .router
+            .cache
+            .nvme
+            .read_staged_zero_copy(&cache_key)
+            .is_some()
+        {
+            return Err(I::Overlay);
+        }
+        // W2 staged extent record (newer than every base tier).
+        let ext_key = crate::keys::active_block_ext_for_path(&file_path, b32);
+        if self.router.cache.nvme.has_staged_extent_record(&ext_key) {
+            return Err(I::Overlay);
+        }
+        // The 795 custody snapshot: epoch + binding + fill incarnation.
+        let epoch = block_custody_epoch(ino, b32);
+        let tracked = self.router.backend_router.key_incarnation_tracked(key);
+        let incarnation = if tracked {
+            match self.router.backend_router.fill_incarnation(key) {
+                Some(v) => Some(v),
+                // Unstable incarnation word = a patch/free is mid-flight
+                // on the block — movement, not a stable serve source.
+                None => return Err(I::Overlay),
+            }
+        } else {
+            None
+        };
+        Ok(IpcDirectSnapshot {
+            ino,
+            block: b32,
+            key: key.clone(),
+            epoch,
+            tracked,
+            incarnation,
+            offset,
+            len,
+        })
     }
 
     /// The CQE-side half of the 795 protocol for direct-drive: `true`
     /// only if the prelude snapshot still binds — same RAM authorities,
     /// same lock-free posture. `false` ⇒ the op must fall back to the
     /// handler (which re-runs the full moving-custody read protocol).
+    /// The epoch equality proves no custody TRANSFER (overlay/sibling/
+    /// record retire) crossed the DMA window; the overlay screens prove
+    /// no custody was CREATED inside it (creation does not bump the
+    /// epoch — the handler's post-read `capture_parked_runs` face); the
+    /// binding + incarnation checks prove the device bytes belong to
+    /// the block's live incarnation (the validated-ranged serve rule).
     pub fn ipc_direct_revalidate(&self, snap: &IpcDirectSnapshot) -> bool {
-        let _ = snap;
-        false
+        let Some(meta) = self.router.metadata_cache.get(&snap.ino) else {
+            return false;
+        };
+        if meta.file_type != "striped" {
+            return false;
+        }
+        if snap.offset + u64::from(snap.len) > meta.size {
+            return false;
+        }
+        let Some(map) = meta.block_map.as_ref() else {
+            return false;
+        };
+        if map.get(&snap.block).map(String::as_str) != Some(snap.key.as_str()) {
+            return false;
+        }
+        if block_custody_epoch(snap.ino, snap.block) != snap.epoch {
+            return false;
+        }
+        if self
+            .parked_overlay_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            let cache_key = crate::keys::active_block(snap.ino, u64::from(snap.block)).to_string();
+            if self.active_block_buffers.contains_key(&cache_key) {
+                return false;
+            }
+        }
+        let file_path = crate::keys::inode_path(snap.ino);
+        let cache_key = crate::keys::active_block_for_path(&file_path, snap.block).to_string();
+        if self
+            .router
+            .cache
+            .nvme
+            .read_staged_zero_copy(&cache_key)
+            .is_some()
+        {
+            return false;
+        }
+        let ext_key = crate::keys::active_block_ext_for_path(&file_path, snap.block);
+        if self.router.cache.nvme.has_staged_extent_record(&ext_key) {
+            return false;
+        }
+        if snap.tracked {
+            match snap.incarnation {
+                Some(before) => {
+                    if !self
+                        .router
+                        .backend_router
+                        .fill_incarnation_still(&snap.key, before)
+                    {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        true
     }
 
     pub fn ipc_read_probe_locked(&self, ino: u64, offset: u64, size: u32) -> IpcReadProbe {

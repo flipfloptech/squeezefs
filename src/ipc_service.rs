@@ -43,7 +43,7 @@
 //! drain (§5.3.1 rule 1) — the `DataOp` carries the snapshot; slot-field
 //! mutation mid-serve is inert by construction.
 
-use crate::fuse_client::{IpcReadProbe, SqueezefsFilesystem, METRICS};
+use crate::fuse_client::{IpcDirectIneligible, IpcReadProbe, SqueezefsFilesystem, METRICS};
 use crate::ipc_host::{DataOp, SessionSink, SlotCompletion};
 use crate::meta_backend::Metadata as _;
 use fuse3::raw::prelude::Filesystem;
@@ -72,6 +72,59 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     fuse3::raw::tpc_spawn(fut);
+}
+
+/// The read handoff body, factored free of the sink so the direct-drive
+/// engine's CQE fallback (`crate::ipc_direct`) rides the IDENTICAL path
+/// — same venue (`handoff_spawn` → per-core handler lanes), same
+/// handler, same counters. Re-runs the FULL read handler (including its
+/// in-guard async attr fallback) under its own guard, then posts the
+/// bytes into the op's validated arena window.
+pub(crate) fn spawn_read_handoff(
+    fs: Arc<SqueezefsFilesystem>,
+    request: Request,
+    op: DataOp,
+    completion: SlotCompletion,
+) {
+    METRICS.ipc_async_handoffs.fetch_add(1, Ordering::Relaxed);
+    let ino = op.binding.ino;
+    let offset = op.desc.offset;
+    let len = op.desc.len;
+    // Read-class parity (BindingRights::odirect): hand the handler
+    // exactly the flags the kernel path would (`fuse_read_in.flags`
+    // carries the description's O_DIRECT bit on every READ). Dropping
+    // it reclassified O_DIRECT ring reads as buffered — on cold
+    // working sets that re-enabled the whole-block ghost-admission
+    // machinery per miss (the measured 13× il-vs-kernel collapse on
+    // the 2026-07-25 fabric-latency rig).
+    let flags = if op.binding.odirect {
+        libc::O_DIRECT as u32
+    } else {
+        0
+    };
+    handoff_spawn(async move {
+        // Re-seed a cold attr cache so warm workloads return to the
+        // sync fast path after ONE miss demotion (the handler's own
+        // fallback reads the backend but does not populate the cache).
+        if fs.attr_cache.get(&ino).is_none() {
+            fs.refresh_attr_cache(ino).await;
+        }
+        match fs.read(request, ino, 0, offset, len, flags).await {
+            Ok(reply) => {
+                // Into the SNAPSHOT window (§5.3.1: bounds validated at
+                // dequeue; mid-serve descriptor mutation is inert).
+                op.payload.write(&reply.data);
+                METRICS.ipc_ops_read.fetch_add(1, Ordering::Relaxed);
+                METRICS
+                    .ipc_bytes_out
+                    .fetch_add(reply.data.len() as u64, Ordering::Relaxed);
+                completion.complete(reply.data.len() as i64);
+            }
+            Err(errno) => {
+                completion.complete(i64::from(libc::c_int::from(errno)));
+            }
+        }
+    });
 }
 
 /// The §5.6.2 W1 invalidation policy: fire on BIND, fire on the FIRST
@@ -142,6 +195,23 @@ pub struct DataPlaneSink {
     req_uid: u32,
     req_gid: u32,
     req_pid: u32,
+    /// DIALED P1 direct-drive engine (`crate::ipc_direct`), built
+    /// lazily on the FIRST governed (ddt + O_DIRECT) miss so mounts
+    /// that never see the shape pay nothing. `Some(None)` = spawn
+    /// failed once, loudly — every governed op falls back to the
+    /// handler path (fallback-is-correctness).
+    direct: std::sync::OnceLock<Option<Arc<crate::ipc_direct::DirectDriveEngine>>>,
+}
+
+impl Drop for DataPlaneSink {
+    fn drop(&mut self) {
+        // Engine teardown is the sink's job (the reaper thread holds an
+        // Arc of the engine, so Drop-on-Arc alone would never fire):
+        // flag + NOP wake + join, draining in-flight CQEs first.
+        if let Some(Some(engine)) = self.direct.get() {
+            engine.shutdown();
+        }
+    }
 }
 
 impl DataPlaneSink {
@@ -153,6 +223,7 @@ impl DataPlaneSink {
             req_uid: unsafe { libc::getuid() },
             req_gid: unsafe { libc::getgid() },
             req_pid: std::process::id(),
+            direct: std::sync::OnceLock::new(),
         }
     }
 
@@ -175,6 +246,7 @@ impl DataPlaneSink {
             req_uid: unsafe { libc::getuid() },
             req_gid: unsafe { libc::getgid() },
             req_pid: std::process::id(),
+            direct: std::sync::OnceLock::new(),
         }
     }
 
@@ -199,6 +271,42 @@ impl DataPlaneSink {
         }
     }
 
+    /// The lazily-spawned direct-drive engine (`None` = spawn failed
+    /// once, loudly — governed ops stay on the handler path forever).
+    fn direct_engine(&self) -> Option<&Arc<crate::ipc_direct::DirectDriveEngine>> {
+        self.direct
+            .get_or_init(|| {
+                match crate::ipc_direct::DirectDriveEngine::spawn(
+                    Arc::clone(&self.fs),
+                    self.req_uid,
+                    self.req_gid,
+                    self.req_pid,
+                ) {
+                    Ok(engine) => Some(engine),
+                    Err(e) => {
+                        log::warn!(
+                            "ipc direct-drive engine failed to spawn ({e}) — governed \
+                             ranged reads stay on the handler path"
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// The prelude decision ledger (the W1 `patch_ineligible_*` shape).
+    fn count_direct_ineligible(class: IpcDirectIneligible) {
+        let counter = match class {
+            IpcDirectIneligible::Shape => &METRICS.ipc_direct_ineligible_shape,
+            IpcDirectIneligible::Meta => &METRICS.ipc_direct_ineligible_meta,
+            IpcDirectIneligible::Layout => &METRICS.ipc_direct_ineligible_layout,
+            IpcDirectIneligible::Overlay => &METRICS.ipc_direct_ineligible_overlay,
+            IpcDirectIneligible::Backend => &METRICS.ipc_direct_ineligible_backend,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// READ: try the §5.5.1 sync fast path, demote to the handoff on
     /// contention or in-guard miss.
     fn serve_read(&self, op: DataOp, completion: SlotCompletion) {
@@ -209,7 +317,35 @@ impl DataPlaneSink {
         // the tier fast path is skipped by POLICY (not counted as a miss
         // demotion — that counter means fast-path rot, and a device-true
         // mount handing off 100 % of O_DIRECT reads is its design).
+        //
+        // DIALED P1 (2026-07-26): this governed shape is exactly the
+        // direct-drive charter — the prelude decides synchronously
+        // (RAM-authoritative, lock-free) and the service thread submits
+        // the device read on the ipc-host uring itself; ANY prelude
+        // miss falls back to the handler path (correctness owns
+        // ambiguity), recorded in the decision ledger.
         if op.binding.odirect && self.fs.router.direct_device_true() {
+            let (op, completion) =
+                match self
+                    .fs
+                    .ipc_direct_read_probe(ino, op.desc.offset, op.desc.len)
+                {
+                    Ok(snap) => match self.direct_engine() {
+                        Some(engine) => match engine.submit(op, completion, snap) {
+                            Ok(()) => return,
+                            // Backend refusal counted at the refusal site.
+                            Err(back) => back,
+                        },
+                        None => {
+                            Self::count_direct_ineligible(IpcDirectIneligible::Backend);
+                            (op, completion)
+                        }
+                    },
+                    Err(class) => {
+                        Self::count_direct_ineligible(class);
+                        (op, completion)
+                    }
+                };
             return self.enqueue_read(op, completion);
         }
         let lock = self.fs.get_inode_lock_ref(ino);
@@ -258,51 +394,10 @@ impl DataPlaneSink {
         }
     }
 
-    /// The read handoff: re-runs the FULL read handler (including its
-    /// in-guard async attr fallback) under its own guard, then posts the
-    /// bytes into the op's validated arena window.
+    /// The read handoff: [`spawn_read_handoff`] with this sink's ring
+    /// identity (the body is shared with the direct-drive CQE fallback).
     fn enqueue_read(&self, op: DataOp, completion: SlotCompletion) {
-        METRICS.ipc_async_handoffs.fetch_add(1, Ordering::Relaxed);
-        let fs = Arc::clone(&self.fs);
-        let request = self.ring_request();
-        let ino = op.binding.ino;
-        let offset = op.desc.offset;
-        let len = op.desc.len;
-        // Read-class parity (BindingRights::odirect): hand the handler
-        // exactly the flags the kernel path would (`fuse_read_in.flags`
-        // carries the description's O_DIRECT bit on every READ). Dropping
-        // it reclassified O_DIRECT ring reads as buffered — on cold
-        // working sets that re-enabled the whole-block ghost-admission
-        // machinery per miss (the measured 13× il-vs-kernel collapse on
-        // the 2026-07-25 fabric-latency rig).
-        let flags = if op.binding.odirect {
-            libc::O_DIRECT as u32
-        } else {
-            0
-        };
-        handoff_spawn(async move {
-            // Re-seed a cold attr cache so warm workloads return to the
-            // sync fast path after ONE miss demotion (the handler's own
-            // fallback reads the backend but does not populate the cache).
-            if fs.attr_cache.get(&ino).is_none() {
-                fs.refresh_attr_cache(ino).await;
-            }
-            match fs.read(request, ino, 0, offset, len, flags).await {
-                Ok(reply) => {
-                    // Into the SNAPSHOT window (§5.3.1: bounds validated at
-                    // dequeue; mid-serve descriptor mutation is inert).
-                    op.payload.write(&reply.data);
-                    METRICS.ipc_ops_read.fetch_add(1, Ordering::Relaxed);
-                    METRICS
-                        .ipc_bytes_out
-                        .fetch_add(reply.data.len() as u64, Ordering::Relaxed);
-                    completion.complete(reply.data.len() as i64);
-                }
-                Err(errno) => {
-                    completion.complete(i64::from(libc::c_int::from(errno)));
-                }
-            }
-        });
+        spawn_read_handoff(Arc::clone(&self.fs), self.ring_request(), op, completion);
     }
 
     /// WRITE (all writes are handoffs in v1 — OQ-3 decides a sync write

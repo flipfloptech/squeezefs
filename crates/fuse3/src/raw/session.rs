@@ -2336,6 +2336,11 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
+        // P2 per-op economy: on an armed over-uring session the READ reply
+        // is completed in place from the handler task (a synchronous
+        // COMMIT enqueue) instead of hopping through the unbounded reply
+        // channel + the per-queue reply task — one task wake per op saved.
+        let reply_conn = self.fuse_connection.clone();
 
         spawn(debug_span!("fuse_read"), async move {
             debug!(
@@ -2379,9 +2384,32 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 .serialize_into(&mut data_buf, &out_header)
                 .expect("won't happened");
 
-            let _ = resp_sender
-                .send(Either::Right((data_buf, reply_data, backing)))
-                .await;
+            // In-place reply on an armed session; the channel path stays
+            // for INIT-phase/classical sessions (pool not ready) and any
+            // clone without a connection handle. Error semantics mirror
+            // `reply_fuse`: NotFound = interrupted/double reply (benign);
+            // anything else is logged loud — the session's dispatch task
+            // observes a dead connection through its own read path.
+            match reply_conn.filter(|c| c.over_uring_ready()) {
+                Some(conn) => {
+                    if let Err(err) = conn.write_vectored(data_buf, Some(reply_data)).await.1 {
+                        if err.kind() == ErrorKind::NotFound {
+                            warn!(
+                                "may reply interrupted fuse request, ignore this error {}",
+                                err
+                            );
+                        } else {
+                            error!("in-place read reply failed {}", err);
+                        }
+                    }
+                    drop(backing);
+                }
+                None => {
+                    let _ = resp_sender
+                        .send(Either::Right((data_buf, reply_data, backing)))
+                        .await;
+                }
+            }
         });
     }
 

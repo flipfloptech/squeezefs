@@ -289,6 +289,24 @@ impl FuseConnection {
         pool.get_payload_buffer(unique)
     }
 
+    /// True once the FUSE-over-io_uring pool is armed and ready — the
+    /// gate for in-place replies (P2 per-op economy): an armed session's
+    /// reply is a synchronous COMMIT enqueue (`submit_reply`), safe to
+    /// run from the handler task itself instead of paying an unbounded-
+    /// channel hop + reply-task wake per op.
+    #[cfg(target_os = "linux")]
+    pub fn over_uring_ready(&self) -> bool {
+        self.over_uring
+            .load()
+            .as_ref()
+            .is_some_and(|p| p.is_ready())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn over_uring_ready(&self) -> bool {
+        false
+    }
+
     #[cfg(all(target_os = "linux", feature = "unprivileged"))]
     pub async fn new_with_unprivileged(
         mount_options: MountOptions,

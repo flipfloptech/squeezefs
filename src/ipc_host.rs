@@ -86,8 +86,17 @@ const NONCE_TTL: Duration = Duration::from_secs(60);
 /// daemon wait on a client-writable word ever exceeds this.
 const SERVICE_PARK_MAX: Duration = Duration::from_millis(5);
 
-/// Empty drain passes before the service thread starts parking.
-const SERVICE_SPIN_PASSES: u32 = 64;
+/// Empty-pass spin window before a service thread parks (time-based —
+/// the §5.5.1 "spin → short wait" ladder's spin rung, restored). The
+/// former 64 bare `spin_loop` hints were sub-µs — smaller than ANY
+/// per-session inter-arrival gap once sessions spread across threads
+/// (13–55 µs on the 2026-07-26 fabric-rig shapes), so every burst paid
+/// a full doorbell park/wake cycle: the measured sessions inversion
+/// (svc voluntary context switches 32k → 394k /s from sessions=1 → 8
+/// at one offered load). 100 µs covers fleet-spread inter-arrival; the
+/// worst-case idle tax is one 100 µs spin per thread per idle onset,
+/// then the 5 ms-bounded parks resume.
+const SERVICE_SPIN_WINDOW: Duration = Duration::from_micros(100);
 
 /// IPC service-thread count (§5.5.1; knob
 /// `SQUEEZEFS_IPC_SERVICE_THREADS`, clamp 1..=64). Default scales with
@@ -604,6 +613,12 @@ pub struct IpcHost {
     /// are never torn (never-lossy).
     shed_target: AtomicU64,
     sessions: Mutex<HashMap<u64, Arc<IpcSession>>>,
+    /// Bumped on every session admission/teardown — service threads
+    /// re-collect their owned set only when this moves, so the drain
+    /// hot pass never touches the registry mutex (the 2026-07-26
+    /// service economy; per-pass re-collect was measurable coherence
+    /// traffic across 8 spinning threads).
+    session_epoch: AtomicU64,
     uid_sessions: Mutex<HashMap<u32, usize>>,
     next_session_id: AtomicU64,
     next_binding_id: AtomicU64,
@@ -660,6 +675,7 @@ impl IpcHost {
             arena_bytes: AtomicU64::new(0),
             shed_target: AtomicU64::new(u64::MAX),
             sessions: Mutex::new(HashMap::new()),
+            session_epoch: AtomicU64::new(0),
             uid_sessions: Mutex::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
             next_binding_id: AtomicU64::new(1),
@@ -1254,6 +1270,9 @@ impl IpcHost {
             .lock()
             .expect("session registry mutex never poisons")
             .insert(session.id, Arc::clone(&session));
+        // AFTER the insert: a service thread seeing the new epoch always
+        // finds the session in the map.
+        self.session_epoch.fetch_add(1, Ordering::Release);
         *self
             .uid_sessions
             .lock()
@@ -1352,6 +1371,10 @@ impl IpcHost {
             .lock()
             .expect("session registry mutex never poisons")
             .remove(&session.id);
+        // A stale snapshot may drain this session for at most one more
+        // pass (safe: the mapping is Arc-held, bindings are cleared, the
+        // torn_down flag skips it at the next refresh).
+        self.session_epoch.fetch_add(1, Ordering::Release);
         {
             let mut uid_sessions = self
                 .uid_sessions
@@ -1400,16 +1423,28 @@ impl IpcHost {
     // ---------------------------------------------------------------
 
     fn service_loop(self: Arc<Self>, idx: usize) {
-        let mut empty_passes = 0u32;
+        // Owned-session snapshot, re-collected ONLY when the registry
+        // epoch moves (admission/teardown) — the drain hot pass is
+        // registry-mutex-free (2026-07-26 service economy). Staleness
+        // bound: one pass (a torn-down session drains at most once more,
+        // safely; a new session is picked up at the next pass top —
+        // pinned by `new_session_on_a_busy_thread_is_served_promptly`).
+        let mut sessions: Vec<Arc<IpcSession>> = Vec::new();
+        let mut seen_epoch = u64::MAX; // != any real epoch ⇒ first pass collects
+        let mut last_progress = Instant::now();
         while !self.shutting_down.load(Ordering::SeqCst) {
-            let sessions: Vec<Arc<IpcSession>> = self
-                .sessions
-                .lock()
-                .expect("session registry mutex never poisons")
-                .values()
-                .filter(|s| s.owner == idx)
-                .cloned()
-                .collect();
+            let epoch = self.session_epoch.load(Ordering::Acquire);
+            if epoch != seen_epoch {
+                sessions = self
+                    .sessions
+                    .lock()
+                    .expect("session registry mutex never poisons")
+                    .values()
+                    .filter(|s| s.owner == idx && !s.torn_down.load(Ordering::SeqCst))
+                    .cloned()
+                    .collect();
+                seen_epoch = epoch;
+            }
             let mut served = 0u32;
             let now = self.now_ms();
             for s in &sessions {
@@ -1424,11 +1459,10 @@ impl IpcHost {
                 }
             }
             if served > 0 {
-                empty_passes = 0;
+                last_progress = Instant::now();
                 continue;
             }
-            empty_passes = empty_passes.saturating_add(1);
-            if empty_passes < SERVICE_SPIN_PASSES {
+            if last_progress.elapsed() < SERVICE_SPIN_WINDOW {
                 std::hint::spin_loop();
                 continue;
             }
@@ -1492,7 +1526,7 @@ impl IpcHost {
                     futex_wait_many(&waiters, SERVICE_PARK_MAX);
                 }
             } else {
-                empty_passes = 0;
+                last_progress = Instant::now();
             }
             for s in &sessions {
                 s.map.header().daemon_parked.store(0, Ordering::SeqCst);

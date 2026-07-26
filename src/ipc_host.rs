@@ -103,12 +103,57 @@ const SERVICE_PARK_MAX: Duration = Duration::from_millis(5);
 /// ship by default come from the event-driven reap + the epoch-cached
 /// snapshot; libaio-only fleets raise this knob for the rest.
 fn service_spin_window() -> Duration {
-    let us = std::env::var("SQUEEZEFS_IPC_SPIN_US")
-        .ok()
+    service_spin_window_from(std::env::var("SQUEEZEFS_IPC_SPIN_US").ok().as_deref())
+}
+
+/// Pure sizing form (unit-pinned): the 2026-07-26 reap-economy A/B
+/// adjudicated the DEFAULT as 0 (`1508ea9` — every nonzero ambient
+/// window taxed the protected sync lane), but the landed code kept the
+/// sweep side's 30 µs — a doc-code divergence this pin closes.
+fn service_spin_window_from(v: Option<&str>) -> Duration {
+    let us = v
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(30)
         .clamp(0, 10_000);
     Duration::from_micros(us)
+}
+
+#[cfg(test)]
+mod spin_window_tests {
+    use super::*;
+
+    /// The adjudicated default (reap-economy note §5–6, commit
+    /// `1508ea9`): **0** — the spin window is an explicit fleet lever,
+    /// never an ambient tax on the sync lane.
+    #[test]
+    fn spin_window_default_is_zero() {
+        assert_eq!(
+            service_spin_window_from(None),
+            Duration::ZERO,
+            "the adjudicated SQUEEZEFS_IPC_SPIN_US default is 0 (an explicit \
+             fleet lever, not an ambient tax) — 1508ea9 landed the verdict in \
+             the doc comment but not the code"
+        );
+    }
+
+    /// Explicit settings are honored verbatim within the clamp.
+    #[test]
+    fn spin_window_explicit_and_clamped() {
+        assert_eq!(
+            service_spin_window_from(Some("20")),
+            Duration::from_micros(20)
+        );
+        assert_eq!(
+            service_spin_window_from(Some("999999")),
+            Duration::from_micros(10_000),
+            "clamp ceiling"
+        );
+        assert_eq!(
+            service_spin_window_from(Some("garbage")),
+            service_spin_window_from(None),
+            "unparseable falls back to the default"
+        );
+    }
 }
 
 /// IPC service-thread count (§5.5.1; knob

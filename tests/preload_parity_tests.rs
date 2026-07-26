@@ -176,7 +176,7 @@ impl Fixture {
     async fn new(name: &str) -> Fixture {
         let (fs, backing, meta, staging) = sandbox_fs().await;
         let sink = Arc::new(InoMapSink {
-            inner: DataPlaneSink::new(fs.clone(), tokio::runtime::Handle::current()),
+            inner: DataPlaneSink::new(fs.clone()),
             map: std::sync::Mutex::new(HashMap::new()),
         });
         let cfg = IpcHostConfig {

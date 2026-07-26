@@ -12149,7 +12149,6 @@ pub async fn start_mount<P: AsRef<Path>>(
         });
         let sink = std::sync::Arc::new(crate::ipc_service::DataPlaneSink::with_invalidator(
             fs.clone(),
-            tokio::runtime::Handle::current(),
             hook,
             inval_window_ms,
         ));

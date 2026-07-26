@@ -185,12 +185,7 @@ impl Fixture {
             })
         };
         let sink = Arc::new(InoMapSink {
-            inner: DataPlaneSink::with_invalidator(
-                fs.clone(),
-                tokio::runtime::Handle::current(),
-                hook,
-                inval_window_ms,
-            ),
+            inner: DataPlaneSink::with_invalidator(fs.clone(), hook, inval_window_ms),
             map: Mutex::new(HashMap::new()),
         });
         let cfg = IpcHostConfig {

@@ -21,11 +21,14 @@
 //!   read-only workloads = unexpected writers; `miss` growth on warm
 //!   workloads = fast-path rot.
 //! - **Async handoff (read demotions + ALL v1 writes)**: the op packages
-//!   onto the existing runtime and runs the REAL handler
-//!   ([`fuse3::raw::Filesystem::read`] / [`Filesystem::write`]) — same
-//!   inode locks, same lease/fencing acquisition, same coverage-union
-//!   write-through, same W1 patch eligibility. Completion posts back to
-//!   the slot from the tokio worker via the [`SlotCompletion`] handle.
+//!   onto the **fuse3 per-core handler lanes** ([`handoff_spawn`] →
+//!   `tpc_spawn` — the same venue kernel-lane handlers run on; the
+//!   2026-07-26 handoff-economy fix, see [`handoff_spawn`]'s docs) and
+//!   runs the REAL handler ([`fuse3::raw::Filesystem::read`] /
+//!   [`Filesystem::write`]) — same inode locks, same lease/fencing
+//!   acquisition, same coverage-union write-through, same W1 patch
+//!   eligibility. Completion posts back to the slot from the handler
+//!   lane via the [`SlotCompletion`] handle.
 //!
 //! ## Severance at dequeue (§5.5.2 / §5.3.1 rules 1–2)
 //!
@@ -48,6 +51,28 @@ use fuse3::raw::Request;
 use squeezefs_ipc::layout::{OP_READ, OP_WRITE};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+/// The handoff venue (§5.5.1 — the 2026-07-26 handoff-economy fix):
+/// ring handoffs run **where kernel-lane handlers run** — the fuse3
+/// per-core handler lanes ([`fuse3::raw::tpc_spawn`]), never the
+/// daemon's multi-thread runtime. A service thread is a foreign OS
+/// thread to tokio, so `Handle::spawn` from it lands every op on the
+/// **global inject queue**, which busy workers poll only between
+/// local-queue batches — the measured ~130 µs/op cold-firehose
+/// queueing term (reap-economy note §7) the kernel transport never
+/// pays: its dispatch task spawns handlers straight onto the TPC
+/// lanes. One venue for both transports also keeps the §5.5 "the
+/// handoff path IS the existing handler" argument exact — same
+/// handler body, same locks, same executor class. The lanes are
+/// per-core current-thread runtimes (unbounded FIFO submission, no
+/// inject-queue starvation from a foreign thread), which is what the
+/// venue pins below assert.
+fn handoff_spawn<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    fuse3::raw::tpc_spawn(fut);
+}
 
 /// The §5.6.2 W1 invalidation policy: fire on BIND, fire on the FIRST
 /// ring write per (ino, window), suppress in-window repeats, never on
@@ -109,9 +134,6 @@ pub struct DataPlaneSink {
     /// (perf, 2026-07-19), flatlining it at ~125 k IOPS regardless of
     /// concurrency. Handoffs clone this Arc: one refcount bump.
     fs: Arc<SqueezefsFilesystem>,
-    /// The daemon's existing runtime — handoffs ride it as ordinary
-    /// tasks (G-L4-1 leg (iii) priced the wake at ~1–3 µs).
-    runtime: tokio::runtime::Handle,
     /// The W1 invalidator; `None` = no kernel to invalidate (pre-L4-6
     /// callers and pure host-isolation tests).
     inval: Option<Arc<Invalidator>>,
@@ -123,10 +145,9 @@ pub struct DataPlaneSink {
 }
 
 impl DataPlaneSink {
-    pub fn new(fs: SqueezefsFilesystem, runtime: tokio::runtime::Handle) -> Self {
+    pub fn new(fs: SqueezefsFilesystem) -> Self {
         Self {
             fs: Arc::new(fs),
-            runtime,
             inval: None,
             // SAFETY: plain getuid/getgid — always successful.
             req_uid: unsafe { libc::getuid() },
@@ -140,13 +161,11 @@ impl DataPlaneSink {
     /// rate window (production default 1000, `SQUEEZEFS_IPC_INVAL_WINDOW_MS`).
     pub fn with_invalidator(
         fs: SqueezefsFilesystem,
-        runtime: tokio::runtime::Handle,
         hook: Arc<dyn Fn(u64) + Send + Sync>,
         window_ms: u64,
     ) -> Self {
         Self {
             fs: Arc::new(fs),
-            runtime,
             inval: Some(Arc::new(Invalidator {
                 hook,
                 window: std::time::Duration::from_millis(window_ms),
@@ -261,7 +280,7 @@ impl DataPlaneSink {
         } else {
             0
         };
-        self.runtime.spawn(async move {
+        handoff_spawn(async move {
             // Re-seed a cold attr cache so warm workloads return to the
             // sync fast path after ONE miss demotion (the handler's own
             // fallback reads the backend but does not populate the cache).
@@ -301,7 +320,7 @@ impl DataPlaneSink {
         let inval = self.inval.clone();
         let ino = op.binding.ino;
         let offset = op.desc.offset;
-        self.runtime.spawn(async move {
+        handoff_spawn(async move {
             match fs.write(request, ino, 0, offset, severed, 0, 0).await {
                 Ok(reply) => {
                     METRICS.ipc_ops_write.fetch_add(1, Ordering::Relaxed);
@@ -799,5 +818,57 @@ impl crate::ipc_host::AdminSink for FabricAdminSink {
             Ok(body) => (true, body),
             Err(e) => (false, e),
         }
+    }
+}
+
+#[cfg(test)]
+mod handoff_venue_tests {
+    use super::handoff_spawn;
+    use std::time::Duration;
+
+    /// The venue contract (§5.5.1 handoff economy): a handoff future
+    /// executes on a **per-core current-thread handler lane** — kernel
+    /// parity — never on the caller's multi-thread runtime. Weakening
+    /// evidence: routing `handoff_spawn` through a captured
+    /// multi-thread `Handle::spawn` (the pre-fix shape) fails this pin
+    /// with `MultiThread`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn handoff_runs_on_a_current_thread_handler_lane() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        handoff_spawn(async move {
+            let flavor = tokio::runtime::Handle::current().runtime_flavor();
+            let _ = tx.send(flavor);
+        });
+        let flavor = tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .expect("handoff future must run promptly")
+            .expect("handoff future must complete");
+        assert_eq!(
+            flavor,
+            tokio::runtime::RuntimeFlavor::CurrentThread,
+            "ring handoffs must ride the fuse3 per-core handler lanes \
+             (kernel parity), not the caller's multi-thread runtime"
+        );
+    }
+
+    /// Service threads are plain OS threads with NO ambient tokio
+    /// context — the handoff venue must accept a spawn from one
+    /// without panicking and still complete the future (the pre-fix
+    /// shape needed a captured `Handle`; this pin keeps the seam
+    /// callable from exactly where the drain runs).
+    #[test]
+    fn handoff_spawns_from_a_plain_os_thread_without_ambient_runtime() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            handoff_spawn(async move {
+                let _ = tx.send(42u32);
+            });
+        })
+        .join()
+        .expect("spawning thread must not panic");
+        let got = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("handoff future must complete without an ambient runtime");
+        assert_eq!(got, 42);
     }
 }

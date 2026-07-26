@@ -1638,7 +1638,7 @@ pub struct DataRouterInner {
     /// `u64` they already hold — the per-op key alloc + string hash bought
     /// nothing; string forms remain only where backend keys genuinely need
     /// `fs_key!`-class shapes).
-    pub metadata_cache: moka::sync::Cache<u64, CachedMetadata>,
+    pub metadata_cache: moka::sync::Cache<u64, CachedMetadata, ahash::RandomState>,
     /// Single-flight registry. `scc::HashMap`, NOT `HashIndex` (a measured
     /// deviation from the design doc's "container stays" note): HashIndex
     /// defers value drops through epoch reclamation, and since R1a the
@@ -2904,7 +2904,7 @@ impl DataRouter {
                 metadata_cache: moka::sync::Cache::builder()
                     .max_capacity(metadata_capacity)
                     .time_to_idle(std::time::Duration::from_secs(300))
-                    .build(),
+                    .build_with_hasher(ahash::RandomState::new()),
                 inflight_block_reads: std::sync::Arc::new(scc::HashMap::new()),
                 stream_lanes: moka::sync::Cache::builder()
                     .max_capacity(100000)

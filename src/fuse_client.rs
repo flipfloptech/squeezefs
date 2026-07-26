@@ -3113,7 +3113,7 @@ pub struct SqueezefsFilesystem {
     lease_locks: std::sync::Arc<StripeLocks<tokio::sync::Mutex<()>, 4096>>,
     pub active_inode_locks: std::sync::Arc<StripeLocks<tokio::sync::RwLock<()>, 4096>>,
     /// P1-4: capacity-bounded attribute cache (moka TTL + max_capacity).
-    pub attr_cache: moka::sync::Cache<u64, (FileAttr, std::time::Instant)>,
+    pub attr_cache: moka::sync::Cache<u64, (FileAttr, std::time::Instant), ahash::RandomState>,
     /// §4.5 (PR K7): snapshots of directories ≤
     /// [`DIR_ENTRY_CACHE_MAX_ENTRIES`], cookie-ascending
     /// `(name, ino, §5.1 cookie, file_type)` so cache-served pages keep
@@ -3379,7 +3379,7 @@ impl SqueezefsFilesystem {
         let attr_cache = moka::sync::Cache::builder()
             .max_capacity(attr_capacity)
             .time_to_live(Duration::from_secs(300))
-            .build();
+            .build_with_hasher(ahash::RandomState::new());
         Self {
             router,
             dlm,

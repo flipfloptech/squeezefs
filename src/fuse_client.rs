@@ -2649,6 +2649,39 @@ pub struct Metrics {
     /// write-storm economy gauge (notifies ≫ suppressed on rand-write
     /// workloads = window regression).
     pub ipc_inval_suppressed: Align64<AtomicU64>,
+    /// DIALED P1 direct-drive families (design-preload-interception
+    /// §5.5/§12 fallback shape; `perf/ipc-direct-drive`): governed ranged
+    /// ring reads the service thread submitted DIRECTLY on the ipc-host-
+    /// owned io_uring (no task, no tokio, no handler).
+    pub ipc_direct_drive_submits: Align64<AtomicU64>,
+    /// Direct-drive submits whose CQE revalidated (795 custody snapshot)
+    /// and completed the ring slot. `serves + fallbacks_post == submits`.
+    pub ipc_direct_drive_serves: Align64<AtomicU64>,
+    /// Direct-drive ops that DMA'd via the 64 KiB ranged bounce pool
+    /// (LBA-unaligned request window, or an arena destination that cannot
+    /// take O_DIRECT-class DMA) instead of straight into the arena.
+    pub ipc_direct_drive_bounces: Align64<AtomicU64>,
+    /// Direct-drive CQEs that failed post-DMA revalidation (custody
+    /// moved / binding changed / device error) and fell back to the
+    /// handler path — races, ≈ 0 on quiet read workloads.
+    pub ipc_direct_drive_fallbacks_post: Align64<AtomicU64>,
+    /// The prelude decision ledger (the W1 `patch_ineligible_*` pattern):
+    /// growth on a shape that should direct-drive = prelude rot.
+    /// `shape` = len outside 4–64 KiB / multi-block / EOF-crossing.
+    pub ipc_direct_ineligible_shape: Align64<AtomicU64>,
+    /// `meta` = no RAM-resident metadata / non-striped layout / block map
+    /// not RAM-resident (the honest map-resident-majority split).
+    pub ipc_direct_ineligible_meta: Align64<AtomicU64>,
+    /// `layout` = hole block (no binding) or decorated (`bk:off:len`)
+    /// mapping — not a whole-block window read.
+    pub ipc_direct_ineligible_layout: Align64<AtomicU64>,
+    /// `overlay` = live RAM overlay / staged sibling / staged extent
+    /// record on the block, or an unstable fill incarnation — correctness
+    /// owns ambiguity; the handler serves acked custody.
+    pub ipc_direct_ineligible_overlay: Align64<AtomicU64>,
+    /// `backend` = unhealthy/unknown volume, ring unavailable, or a
+    /// volume not registered with the direct-drive uring.
+    pub ipc_direct_ineligible_backend: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -2841,6 +2874,47 @@ pub struct TeardownFlushSummary {
 /// `try_read` guard) serves `Eof`/`Hit` synchronously and demotes `Miss`
 /// to the async handoff — guard dropped first (the
 /// drop-guard-before-enqueue rule).
+/// Why the direct-drive prelude refused an op (the decision ledger
+/// classes — see the `ipc_direct_ineligible_*` counters).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcDirectIneligible {
+    /// len outside the 4–64 KiB device class, multi-block, or
+    /// EOF-crossing (the in-bounds contract is strict).
+    Shape,
+    /// No RAM-resident metadata, non-striped layout, or block map not
+    /// RAM-resident (the honest map-resident-majority split).
+    Meta,
+    /// Hole block (no binding) or decorated (`bk:off:len`) mapping.
+    Layout,
+    /// Live RAM overlay / staged sibling / staged extent record on the
+    /// block, or an unstable fill incarnation — correctness owns
+    /// ambiguity.
+    Overlay,
+    /// Unhealthy/unknown backend volume, or one not registered with the
+    /// direct-drive uring.
+    Backend,
+}
+
+/// The direct-drive prelude's 795 custody snapshot: everything the CQE
+/// revalidation needs to prove no custody transfer crossed the DMA
+/// window. Captured before submit, checked at completion.
+#[derive(Debug, Clone)]
+pub struct IpcDirectSnapshot {
+    pub ino: u64,
+    pub block: u32,
+    /// The RAM-authoritative durable binding (whole-block, undecorated).
+    pub key: String,
+    /// `BLOCK_CUSTODY_EPOCHS` word at probe time (bumped by every
+    /// overlay/sibling/record retire — the 795 seqlock).
+    pub epoch: u64,
+    /// Whether the key is allocator-incarnation-tracked.
+    pub tracked: bool,
+    /// Pre-read fill-incarnation snapshot (tracked keys only).
+    pub incarnation: Option<u64>,
+    pub offset: u64,
+    pub len: u32,
+}
+
 pub enum IpcReadProbe {
     /// `offset ≥ size` under the guarded size authority: complete 0 bytes.
     Eof,
@@ -4368,6 +4442,18 @@ impl SqueezefsFilesystem {
                 "ipc_sessions_reaped": METRICS.ipc_sessions_reaped.load(Ordering::Relaxed),
                 "ipc_inval_notifies": METRICS.ipc_inval_notifies.load(Ordering::Relaxed),
                 "ipc_inval_suppressed": METRICS.ipc_inval_suppressed.load(Ordering::Relaxed),
+                // DIALED P1 direct-drive (perf/ipc-direct-drive): the
+                // governed miss shape served from the ipc-host uring +
+                // the prelude decision ledger.
+                "ipc_direct_drive_submits": METRICS.ipc_direct_drive_submits.load(Ordering::Relaxed),
+                "ipc_direct_drive_serves": METRICS.ipc_direct_drive_serves.load(Ordering::Relaxed),
+                "ipc_direct_drive_bounces": METRICS.ipc_direct_drive_bounces.load(Ordering::Relaxed),
+                "ipc_direct_drive_fallbacks_post": METRICS.ipc_direct_drive_fallbacks_post.load(Ordering::Relaxed),
+                "ipc_direct_ineligible_shape": METRICS.ipc_direct_ineligible_shape.load(Ordering::Relaxed),
+                "ipc_direct_ineligible_meta": METRICS.ipc_direct_ineligible_meta.load(Ordering::Relaxed),
+                "ipc_direct_ineligible_layout": METRICS.ipc_direct_ineligible_layout.load(Ordering::Relaxed),
+                "ipc_direct_ineligible_overlay": METRICS.ipc_direct_ineligible_overlay.load(Ordering::Relaxed),
+                "ipc_direct_ineligible_backend": METRICS.ipc_direct_ineligible_backend.load(Ordering::Relaxed),
                 "write_lock_wait": METRICS.write_lock_wait.to_json(),
                 "block_lock_wait": METRICS.block_lock_wait.to_json(),
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),
@@ -4872,6 +4958,34 @@ impl SqueezefsFilesystem {
     /// [`IpcReadProbe::Miss`], and the caller demotes per the
     /// drop-guard-before-enqueue rule. Behavior parity with the handler on
     /// the shapes it does serve is pinned by `tests/preload_parity_tests.rs`.
+    /// DIALED P1 direct-drive prelude (`docs/design-preload-interception.md`
+    /// §5.5/§12 fallback shape): decide — synchronously, from
+    /// RAM-authoritative state only, taking NO inode guards and NO node
+    /// locks — whether a governed ranged read may be submitted directly
+    /// on the ipc-host uring, and capture the 795 custody snapshot that
+    /// must revalidate at the CQE. Any miss ⇒ the caller falls back to
+    /// the existing handler path (fallback-is-correctness).
+    pub fn ipc_direct_read_probe(
+        &self,
+        ino: u64,
+        offset: u64,
+        len: u32,
+    ) -> Result<IpcDirectSnapshot, IpcDirectIneligible> {
+        let _ = (ino, offset, len);
+        // Red scaffold: the engine does not exist yet — everything is
+        // ineligible (the tests define the contract).
+        Err(IpcDirectIneligible::Meta)
+    }
+
+    /// The CQE-side half of the 795 protocol for direct-drive: `true`
+    /// only if the prelude snapshot still binds — same RAM authorities,
+    /// same lock-free posture. `false` ⇒ the op must fall back to the
+    /// handler (which re-runs the full moving-custody read protocol).
+    pub fn ipc_direct_revalidate(&self, snap: &IpcDirectSnapshot) -> bool {
+        let _ = snap;
+        false
+    }
+
     pub fn ipc_read_probe_locked(&self, ino: u64, offset: u64, size: u32) -> IpcReadProbe {
         // Attr-cache size — a miss would need the handler's async
         // `backend.getattr` fallback, unreachable from a sync service

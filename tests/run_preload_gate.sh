@@ -458,4 +458,65 @@ if [ "$AIO_SKIP" -eq 0 ]; then
     echo "OK: libaio lifecycle passthrough (establish-refused shape, engagement zero)"
 fi
 
+# 2l. direct-drive kill-9 soak (DIALED P1, perf/ipc-direct-drive): a
+# device-true remount arms the governed miss shape — the service
+# thread submits ranged device reads on the ipc-host uring with the
+# session ARENA as the DMA destination. SIGKILL a preload'd O_DIRECT
+# reader mid-stream x5: every cycle must drain sessions AND arena
+# bytes to baseline (the in-flight CQE pins the mapping Arc — §5.3.1
+# rule 4 — so teardown is safe but must still CONVERGE), the daemon
+# must survive, and the soak is INVALID unless direct-drive actually
+# engaged (ipc_direct_drive_serves delta > 0 — the engagement rule).
+umount "$MOUNT_DIR" 2>/dev/null || umount -l "$MOUNT_DIR" 2>/dev/null || true
+deadline=$((SECONDS + 20))
+while pgrep -x squeezefs >/dev/null 2>&1; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+        killall -9 squeezefs 2>/dev/null || true
+        sleep 1
+        break
+    fi
+    sleep 0.5
+done
+RUST_LOG=info "$SQUEEZEFS_BIN" mount \
+    sqmeta:///dev/shm/squeezefs_il_meta \
+    "$MOUNT_DIR" \
+    --daemon \
+    --interception \
+    --disk-cache-size 500MB \
+    --log-file "$LOG" \
+    --allow-other \
+    -o direct_device_true
+sleep 3
+mountpoint -q "$MOUNT_DIR" || { cat "$LOG" || true; fail "direct-drive remount failed"; }
+chmod 1777 "$MOUNT_DIR"
+# A striped file (> one 4 MiB block) written through the kernel path.
+dd if=/dev/urandom of="$MOUNT_DIR/ddsoak.bin" bs=1M count=12 status=none \
+    || fail "direct-drive soak: striped fixture write"
+sync "$MOUNT_DIR/ddsoak.bin" 2>/dev/null || true
+DD_SERVES0=$(stats ipc_direct_drive_serves)
+SESS_BASE=$(stats ipc_sessions_active)
+ARENA_BASE=$(stats ipc_arena_bytes)
+for i in 1 2 3 4 5; do
+    LD_PRELOAD="$SO" SQUEEZEFS_IPC_ALLOW_DEV=1 \
+        dd if="$MOUNT_DIR/ddsoak.bin" of=/dev/null iflag=direct bs=4k status=none &
+    KPID=$!
+    sleep 0.2
+    kill -9 "$KPID" 2>/dev/null || true
+    wait "$KPID" 2>/dev/null || true
+    deadline=$((SECONDS + 10))
+    while :; do
+        [ "$(stats ipc_sessions_active)" -le "$SESS_BASE" ] \
+            && [ "$(stats ipc_arena_bytes)" -le "$ARENA_BASE" ] && break
+        [ "$SECONDS" -lt "$deadline" ] || fail "direct-drive kill-9 cycle $i: session/arena residue"
+        sleep 0.2
+    done
+done
+mountpoint -q "$MOUNT_DIR" || fail "daemon died during the direct-drive kill-9 soak"
+DD_SERVES1=$(stats ipc_direct_drive_serves)
+[ "$DD_SERVES1" -gt "$DD_SERVES0" ] \
+    || fail "direct-drive kill-9 soak never engaged direct-drive (serves Δ0 — the leg tested nothing)"
+[ "$(stats ipc_descriptor_rejects)" -eq 0 ] || fail "descriptor rejects after the direct-drive soak"
+[ "$(stats ipc_sessions_poisoned)" -eq 0 ] || fail "poisoned sessions after the direct-drive soak"
+echo "OK: direct-drive kill-9 soak (5 cycles, engaged +$((DD_SERVES1-DD_SERVES0)) serves, zero residue)"
+
 echo "PRELOAD GATE (both legs) PASSED"

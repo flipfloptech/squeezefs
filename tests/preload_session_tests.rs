@@ -140,6 +140,78 @@ impl SessionSink for StallSink {
     }
 }
 
+/// A sink that completes each op from a detached thread after a fixed
+/// delay — the ticket-park pins' stand-in for a device-latency-bound
+/// daemon (the op is in flight long enough for the client to park, then
+/// completes while it sleeps).
+struct DelaySink {
+    delay: std::time::Duration,
+}
+
+impl SessionSink for DelaySink {
+    fn serve_data(&self, op: DataOp, completion: SlotCompletion) {
+        let d = self.delay;
+        let n = op.desc.len as i64;
+        std::thread::spawn(move || {
+            std::thread::sleep(d);
+            completion.complete(n);
+        });
+    }
+}
+
+/// Dedicated host over a [`DelaySink`] + one bound O_RDWR fd (the
+/// ticket-park pins' fixture shape — no filesystem needed, the sink
+/// fabricates results).
+fn delay_host(
+    name: &str,
+    delay_ms: u64,
+) -> (
+    Arc<IpcHost>,
+    tempfile::TempDir,
+    std::fs::File,
+    Session,
+    u64,
+) {
+    let cfg = IpcHostConfig {
+        socket_name: format!("sqz-il0-session-{name}-{}", std::process::id()),
+        socket_dir: None,
+        build_commit: TEST_COMMIT.to_string(),
+        allow_dev: false,
+        geometry: test_geometry(),
+        arena_cap_bytes: 64 * 1024 * 1024,
+        per_uid_session_cap: 8,
+        idle_secs: 0,
+        data_plane: true,
+        // SAFETY: getuid is trivially safe.
+        owner_uid: unsafe { libc::getuid() },
+    };
+    let host = IpcHost::spawn(
+        cfg,
+        Arc::new(DelaySink {
+            delay: std::time::Duration::from_millis(delay_ms),
+        }),
+    )
+    .expect("host must spawn");
+    let dir = tempfile::tempdir().unwrap();
+    let st_dev = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(dir.path()).unwrap().dev()
+    };
+    host.set_expected_st_dev(st_dev);
+    let path = dir.path().join("f.bin");
+    std::fs::write(&path, vec![7u8; 8192]).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let blob = BootstrapBlob::decode(&host.bootstrap_blob()).unwrap();
+    let session =
+        Session::establish(&blob, f.as_raw_fd(), TEST_COMMIT).expect("session establishes");
+    let bind = session.bind(f.as_raw_fd()).expect("bind succeeds");
+    (host, dir, f, session, bind.binding_id)
+}
+
 fn test_geometry() -> Geometry {
     Geometry {
         ring_entries: 16,
@@ -465,6 +537,113 @@ async fn stalled_serve_times_out_poisons_and_falls_through() {
     assert!(
         matches!(out, RingOutcome::Fallthrough),
         "every op on a poisoned session falls through immediately"
+    );
+    host.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// ticket parks (the 2026-07-26 reap economy): event-driven, never polled
+// ---------------------------------------------------------------------------
+
+/// The libaio reap's wait is EVENT-DRIVEN: a parked reaper is woken by
+/// the daemon's completion (the slot protocol's WAITER bit), not by a
+/// poll quantum. The wait admission is race-free: a completion landing
+/// between `ticket_wait_entry` and `wait_any` fails the futex admission
+/// (state word changed) — the wait returns immediately, never strands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ticket_park_wait_is_event_driven_not_quantum_polled() {
+    let (host, _dir, _f, session, binding) = delay_host("ticket-park", 100);
+
+    // Park path: op in flight (sink completes in ~100 ms), the reaper
+    // parks with a 10 s bound and must return on the completion WAKE —
+    // an expired bound here means the wake never arrived.
+    let t = session
+        .submit_pread_nowait(binding, 4096, 0)
+        .expect("slot claim");
+    assert!(!session.ticket_done(t), "op is in flight");
+    let start = std::time::Instant::now();
+    tokio::task::block_in_place(|| loop {
+        match session.ticket_wait_entry(t) {
+            None => break, // DONE — consume below
+            Some(entry) => {
+                squeezefs_il::session::wait_any(&[entry], std::time::Duration::from_secs(10));
+            }
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(9),
+            "parked reaper was not woken by the completion (slept toward \
+             the full bound — the wake is the contract)"
+        );
+    });
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "completion must WAKE the parked reaper (took {:?} against a \
+         ~100 ms serve — a poll quantum or a stranded park)",
+        start.elapsed()
+    );
+    assert!(session.ticket_done(t));
+    let res = session.poll_ticket(t, Some(&mut [0u8; 4096])).expect("done");
+    assert_eq!(res, 4096);
+
+    // Ready path: the op already completed — `ticket_wait_entry` must
+    // refuse to hand out a park (None), directing the caller to consume.
+    let t2 = session
+        .submit_pread_nowait(binding, 512, 0)
+        .expect("slot claim");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !session.ticket_done(t2) {
+        assert!(std::time::Instant::now() < deadline, "sink must complete");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(
+        session.ticket_wait_entry(t2).is_none(),
+        "a DONE ticket must never park (Ready ⇒ consume immediately)"
+    );
+    assert_eq!(
+        session.poll_ticket(t2, Some(&mut [0u8; 512])).expect("done"),
+        512
+    );
+    host.shutdown();
+}
+
+/// Wake breadth: EVERY waiter parked on a slot's state word is woken by
+/// its completion. Two reapers legally park on the same in-flight op
+/// (split submitter/reaper pairs re-snapshot the same pending set); a
+/// single-waiter wake would strand the loser for its full bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slot_completion_wakes_every_parked_waiter() {
+    let (host, _dir, _f, session, binding) = delay_host("wake-breadth", 300);
+    let session = Arc::new(session);
+
+    let t = session
+        .submit_pread_nowait(binding, 4096, 0)
+        .expect("slot claim");
+
+    let start = std::time::Instant::now();
+    let waiters: Vec<_> = (0..2)
+        .map(|_| {
+            let session = Arc::clone(&session);
+            std::thread::spawn(move || {
+                // A None here means the op already completed (the race is
+                // legal) — trivially "woken".
+                if let Some(entry) = session.ticket_wait_entry(t) {
+                    squeezefs_il::session::wait_any(&[entry], std::time::Duration::from_secs(6));
+                }
+                start.elapsed()
+            })
+        })
+        .collect();
+    for w in waiters {
+        let took = w.join().expect("waiter thread");
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "a parked waiter slept toward its full bound ({took:?}) — the \
+             completion must wake EVERY waiter on the word, not one"
+        );
+    }
+    assert_eq!(
+        session.poll_ticket(t, Some(&mut [0u8; 4096])).expect("done"),
+        4096
     );
     host.shutdown();
 }

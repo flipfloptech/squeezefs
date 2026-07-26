@@ -80,7 +80,8 @@ struct FakeKernel {
     submitted_runs: Vec<Vec<u64>>,
     /// scripted events for getevents calls (pop-front per call)
     events: VecDeque<Vec<AioEvent>>,
-    getevents_calls: RefCell<Vec<(usize, usize)>>, // (min, max) observed
+    /// (min, max, timeout_ms) observed per getevents call
+    getevents_calls: RefCell<Vec<(usize, usize, Option<u64>)>>,
 }
 
 impl KernelLane for FakeKernel {
@@ -92,8 +93,8 @@ impl KernelLane for FakeKernel {
         n
     }
 
-    fn getevents(&mut self, min: usize, max: usize, _timeout_ms: Option<u64>) -> Vec<AioEvent> {
-        self.getevents_calls.borrow_mut().push((min, max));
+    fn getevents(&mut self, min: usize, max: usize, timeout_ms: Option<u64>) -> Vec<AioEvent> {
+        self.getevents_calls.borrow_mut().push((min, max, timeout_ms));
         self.events.pop_front().unwrap_or_default()
     }
 }
@@ -277,7 +278,12 @@ fn getevents_merges_ring_first_then_kernel_with_min_across_lanes() {
     assert_eq!(st.ring_pending(), 1, "iocb 0 still in flight");
     // The kernel wait's min was reduced by the ring harvest (2 wanted,
     // 1 ring-served ⇒ kernel min 1).
-    assert_eq!(kern.getevents_calls.borrow().last(), Some(&(1, 7)));
+    let (min, max, _t) = *kern
+        .getevents_calls
+        .borrow()
+        .last()
+        .expect("a kernel wait happened");
+    assert_eq!((min, max), (1, 7));
 }
 
 #[test]
@@ -302,7 +308,7 @@ fn min_zero_never_blocks_and_returns_whatever_is_ready() {
     assert!(events.is_empty());
     // Kernel lane must have been asked with min 0 (non-blocking probe)
     // or not at all — never a blocking min.
-    for (min, _) in kern.getevents_calls.borrow().iter() {
+    for (min, _, _) in kern.getevents_calls.borrow().iter() {
         assert_eq!(
             *min, 0,
             "min_nr=0 must never translate into a blocking kernel wait"
@@ -322,12 +328,68 @@ fn ring_only_pending_waits_by_poll_slices_not_kernel_blocking() {
     ring.ready.push_back((tok, 4096));
     let events = st.getevents(&mut ring, &mut kern, 1, 4, Some(5000));
     assert_eq!(events.len(), 1);
-    for (min, _) in kern.getevents_calls.borrow().iter() {
+    for (min, _, _) in kern.getevents_calls.borrow().iter() {
         assert_eq!(
             *min, 0,
             "with zero kernel-pending ops, kernel waits must be non-blocking probes"
         );
     }
+}
+
+#[test]
+fn zero_timeout_pass_never_blocks_the_kernel_lane_with_ring_pending() {
+    // The 2026-07-26 reap-quantum charter: `getevents(timeout = Some(0))`
+    // is ONE non-blocking merge pass — the reap loop's waiting policy
+    // (event-driven ticket parks) lives OUTSIDE the ctx lock, so a pass
+    // must never smuggle a blocking kernel slice while ring ops are also
+    // pending. Pre-fix, both-lanes-live passes issued kernel waits with
+    // a hard-coded 5 ms slice even under a zero budget — the field's
+    // completion-latency quantizer (avg 5.13 ms vs kernel 4.37 ms at
+    // t32qd32 on 235 µs fabric).
+    let mut st = AioCtxState::new();
+    let (mut ring, mut kern) = (FakeRing::default(), FakeKernel::default());
+    use IocbClass::*;
+    submit(&mut st, &mut ring, &mut kern, &[Ring, Kernel]);
+    assert_eq!(st.ring_pending(), 1);
+    assert_eq!(st.kernel_pending(), 1);
+
+    // Nothing ready on either lane; min unmet: the pass returns empty
+    // instead of blocking.
+    let events = st.getevents(&mut ring, &mut kern, 2, 8, Some(0));
+    assert!(events.is_empty(), "nothing ready: the pass returns empty");
+    for (_, _, timeout) in kern.getevents_calls.borrow().iter() {
+        assert_eq!(
+            *timeout,
+            Some(0),
+            "a zero-budget pass must only issue NON-BLOCKING kernel probes \
+             (a hidden kernel slice under the ctx lock is the reap quantum)"
+        );
+    }
+}
+
+#[test]
+fn pending_tokens_snapshot_reports_inflight_ring_ops_oldest_first() {
+    // The reap loop's outside-lock park set: every in-flight ring op's
+    // token, submission order (oldest first — the truncation order when
+    // the set exceeds FUTEX_WAITV_MAX).
+    let mut st = AioCtxState::new();
+    let (mut ring, mut kern) = (FakeRing::default(), FakeKernel::default());
+    use IocbClass::*;
+    submit(&mut st, &mut ring, &mut kern, &[Ring, Kernel, Ring]);
+    let toks = st.pending_tokens();
+    assert_eq!(toks.len(), 2);
+    assert_eq!(
+        toks,
+        ring.inflight.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        "tokens in submission order"
+    );
+
+    // Consuming one drops it from the snapshot.
+    let tok2 = ring.inflight.iter().find(|(_, id)| *id == 2).unwrap().0;
+    ring.ready.push_back((tok2, 4096));
+    let events = st.getevents(&mut ring, &mut kern, 1, 4, Some(0));
+    assert_eq!(events.len(), 1);
+    assert_eq!(st.pending_tokens().len(), 1);
 }
 
 #[test]

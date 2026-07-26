@@ -2209,6 +2209,92 @@ mod models {
         });
     }
 
+    /// IPC op-slot invariant #4 (the 2026-07-26 reap-economy multi-park):
+    /// a reaper that `park_prepare`s SEVERAL in-flight slots and then
+    /// waits on all their words at once (`futex_waitv`) is never
+    /// stranded by a completion racing the gap between its RMW and the
+    /// wait. For the completed slot, exactly one of these holds after
+    /// any interleaving:
+    ///
+    ///   (a) `park_prepare` returned Ready (consume, no park), or
+    ///   (b) `complete()` reported a waiter (the daemon wakes the word), or
+    ///   (c) the word no longer equals the wait's expected value (the
+    ///       `futex_waitv` admission fails ⇒ immediate return).
+    ///
+    /// The strand shape — parked, no wake coming, admission value still
+    /// current — must be unrepresentable. The second slot stays in
+    /// flight throughout: its `park_prepare` (the snapshot loop's other
+    /// entry) must neither disturb the completed slot's outcome nor
+    /// fabricate a Ready.
+    #[test]
+    fn ipc_slot_multi_park_admission_never_strands() {
+        loom::model(|| {
+            let a = Arc::new(ipc_slot_core::SlotCore::new());
+            let b = Arc::new(ipc_slot_core::SlotCore::new());
+            let wake = Arc::new(AtomicBool::new(false));
+
+            // Sequential prologue: both ops claimed + submitted.
+            let gen_a = a.try_claim().expect("fresh slot must claim");
+            let _gen_b = b.try_claim().expect("fresh slot must claim");
+            a.publish_submitted();
+            b.publish_submitted();
+
+            // Daemon: serves + completes slot A only (B stays in flight).
+            let server = {
+                let a = Arc::clone(&a);
+                let wake = Arc::clone(&wake);
+                thread::spawn(move || {
+                    assert!(a.try_begin_serve(), "submitted slot must serve");
+                    if a.complete() {
+                        wake.store(true, Ordering::SeqCst);
+                    }
+                })
+            };
+
+            // Reaper: the snapshot loop — park_prepare on A then B (the
+            // waitv entry build), racing the completion.
+            let outcome_a = a.park_prepare();
+            let outcome_b = b.park_prepare();
+
+            server.join().unwrap();
+
+            match outcome_a {
+                ipc_slot_core::ParkOutcome::Ready => {
+                    // (a): consume immediately; never parks.
+                    assert!(a.is_done_for(gen_a), "Ready licenses the consume");
+                }
+                ipc_slot_core::ParkOutcome::Park { expected } => {
+                    // Parked: with the completion now fully applied,
+                    // either the wake was reported (b) or the admission
+                    // value is stale (c). Both end the wait promptly;
+                    // their conjunction failing is the strand.
+                    let woken = wake.load(Ordering::SeqCst);
+                    let admission_fails = a.raw_state() != expected;
+                    assert!(
+                        woken || admission_fails,
+                        "multi-park strand: parked on a completed slot with \
+                         no wake coming and a current admission value"
+                    );
+                    assert!(a.is_done_for(gen_a));
+                }
+            }
+            // B is untouched by A's completion: still in flight, its
+            // park admission stays current (the reaper's wait covers it).
+            match outcome_b {
+                ipc_slot_core::ParkOutcome::Ready => {
+                    panic!("slot B never completed — Ready is a fabrication")
+                }
+                ipc_slot_core::ParkOutcome::Park { expected } => {
+                    assert_eq!(
+                        b.raw_state(),
+                        expected,
+                        "an in-flight sibling's admission value must hold"
+                    );
+                }
+            }
+        });
+    }
+
     /// IPC wake composition (`ipc_wake_core`, §5.3 protocol rule 3):
     /// the SHIPPED `wake_core::WakeCoalescer` composed with the SHIPPED
     /// `ipc_ring_core` publication, exactly as the session doorbell wires

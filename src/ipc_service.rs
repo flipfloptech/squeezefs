@@ -455,6 +455,15 @@ impl SessionSink for DataPlaneSink {
     fn on_bind(&self, ino: u64) {
         DataPlaneSink::on_bind(self, ino);
     }
+
+    fn flush(&self) {
+        // Direct-drive submit-batch economy: one `io_uring_enter` per
+        // drain sweep (SessionSink::flush liveness rule — a published
+        // SQE must be kernel-visible before the service thread parks).
+        if let Some(Some(engine)) = self.direct.get() {
+            engine.flush();
+        }
+    }
 }
 
 /// The ADMIN-lane verb handler over the VL2 job fabric

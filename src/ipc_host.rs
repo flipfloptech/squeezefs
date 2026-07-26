@@ -308,6 +308,15 @@ pub trait SessionSink: Send + Sync + 'static {
     /// bind-time inode invalidation from here). Default: nothing — the
     /// host-isolation sink has no kernel cache to shoot down.
     fn on_bind(&self, _ino: u64) {}
+
+    /// End-of-sweep hook: the service loop calls this once after every
+    /// drain pass over its owned sessions. The direct-drive sink uses
+    /// it to flush pushed-but-unsubmitted SQEs in ONE `io_uring_enter`
+    /// per sweep (the submit-batch economy); the default is a no-op.
+    /// LIVENESS RULE for implementors: any work deferred during
+    /// `serve_data` MUST become kernel-visible here — the service
+    /// thread may park for up to its bounded window right after.
+    fn flush(&self) {}
 }
 
 /// The no-data-plane sink: every correctly-directed READ/WRITE completes
@@ -1532,6 +1541,10 @@ impl IpcHost {
                     None => self.poison_session(s, "ring/slot protocol violation"),
                 }
             }
+            // One flush per sweep (SessionSink::flush liveness rule):
+            // direct-drive SQEs published during the drain become
+            // kernel-visible before this thread can park.
+            self.sink.flush();
             if served > 0 {
                 last_progress = Instant::now();
                 continue;
@@ -1587,6 +1600,8 @@ impl IpcHost {
                     None => self.poison_session(s, "ring/slot protocol violation"),
                 }
             }
+            // Same liveness rule on the pre-park rescan sweep.
+            self.sink.flush();
             if rescan_served == 0 {
                 if sessions.is_empty() {
                     std::thread::park_timeout(SERVICE_PARK_MAX);

@@ -2913,6 +2913,12 @@ pub struct IpcDirectSnapshot {
     pub incarnation: Option<u64>,
     pub offset: u64,
     pub len: u32,
+    /// Probe-time overlay/staging keys, carried so the CQE-side
+    /// revalidation is allocation-free (the reaper thread is the
+    /// deep-qd throughput governor — 3 string builds/op measured as
+    /// part of its 100 %-CPU saturation at t32qd32).
+    pub cache_key: String,
+    pub ext_key: String,
 }
 
 pub enum IpcReadProbe {
@@ -5027,20 +5033,18 @@ impl SqueezefsFilesystem {
         // Overlay screen — ANY overlay presence ⇒ handler (correctness
         // owns ambiguity). The O(1) gate first (the capture_parked_runs
         // discipline: never a map scan when no overlay exists).
+        let file_path = crate::keys::inode_path(ino);
+        let cache_key = crate::keys::active_block_for_path(&file_path, b32).to_string();
         if self
             .parked_overlay_count
             .load(std::sync::atomic::Ordering::Acquire)
             != 0
+            && self.active_block_buffers.contains_key(&cache_key)
         {
-            let cache_key = crate::keys::active_block(ino, b).to_string();
-            if self.active_block_buffers.contains_key(&cache_key) {
-                return Err(I::Overlay);
-            }
+            return Err(I::Overlay);
         }
-        let file_path = crate::keys::inode_path(ino);
         // Staged sibling (the striped block's staging-ring image) — the
         // handler probes it before any device read; so must we.
-        let cache_key = crate::keys::active_block_for_path(&file_path, b32).to_string();
         if self
             .router
             .cache
@@ -5051,7 +5055,7 @@ impl SqueezefsFilesystem {
             return Err(I::Overlay);
         }
         // W2 staged extent record (newer than every base tier).
-        let ext_key = crate::keys::active_block_ext_for_path(&file_path, b32);
+        let ext_key = crate::keys::active_block_ext_for_path(&file_path, b32).to_string();
         if self.router.cache.nvme.has_staged_extent_record(&ext_key) {
             return Err(I::Overlay);
         }
@@ -5077,6 +5081,8 @@ impl SqueezefsFilesystem {
             incarnation,
             offset,
             len,
+            cache_key,
+            ext_key,
         })
     }
 
@@ -5113,25 +5119,25 @@ impl SqueezefsFilesystem {
             .parked_overlay_count
             .load(std::sync::atomic::Ordering::Acquire)
             != 0
+            && self.active_block_buffers.contains_key(&snap.cache_key)
         {
-            let cache_key = crate::keys::active_block(snap.ino, u64::from(snap.block)).to_string();
-            if self.active_block_buffers.contains_key(&cache_key) {
-                return false;
-            }
+            return false;
         }
-        let file_path = crate::keys::inode_path(snap.ino);
-        let cache_key = crate::keys::active_block_for_path(&file_path, snap.block).to_string();
         if self
             .router
             .cache
             .nvme
-            .read_staged_zero_copy(&cache_key)
+            .read_staged_zero_copy(&snap.cache_key)
             .is_some()
         {
             return false;
         }
-        let ext_key = crate::keys::active_block_ext_for_path(&file_path, snap.block);
-        if self.router.cache.nvme.has_staged_extent_record(&ext_key) {
+        if self
+            .router
+            .cache
+            .nvme
+            .has_staged_extent_record(&snap.ext_key)
+        {
             return false;
         }
         if snap.tracked {

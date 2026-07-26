@@ -151,6 +151,14 @@ pub(crate) struct DirectDriveEngine {
     req_pid: u32,
     shutting_down: AtomicBool,
     reaper: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// SQEs pushed since the last `io_uring_enter` — the submit-batch
+    /// economy (the M3/transport-commit-batch lesson, re-learned here:
+    /// a per-op enter from every service thread was the measured
+    /// kernel-cycle governor at t32qd32 — 4 saturated service threads,
+    /// dominant samples in the syscall path). The host's drain pass
+    /// calls [`Self::flush`] once per sweep; qd1 pays the same one
+    /// enter per op it always did.
+    pending_submits: std::sync::atomic::AtomicU32,
 }
 
 impl DirectDriveEngine {
@@ -245,6 +253,7 @@ impl DirectDriveEngine {
             req_pid,
             shutting_down: AtomicBool::new(false),
             reaper: Mutex::new(None),
+            pending_submits: std::sync::atomic::AtomicU32::new(0),
         });
         let reaper_engine = Arc::clone(&engine);
         let handle = std::thread::Builder::new()
@@ -411,11 +420,24 @@ impl DirectDriveEngine {
             st.inflight[idx] = Some(pending);
             st.inflight_count += 1;
         }
-        // Submit outside the lock (kernel handles concurrent enters; the
-        // published tail is what it consumes).
+        // No enter here: the SQE is published; the owning service
+        // thread's drain pass flushes ONCE per sweep (`flush`), so a
+        // deep-qd burst pays one syscall per batch instead of one per
+        // op. (The SQ-full path above already entered to make room.)
+        self.pending_submits.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// Flush pushed-but-unsubmitted SQEs — one `io_uring_enter` per
+    /// drain sweep. Cheap when idle (one atomic load); concurrent
+    /// flushes are harmless (the kernel consumes the published tail).
+    pub(crate) fn flush(&self) {
+        if self.pending_submits.swap(0, Ordering::AcqRel) == 0 {
+            return;
+        }
         for attempt in 0..3 {
             match self.ring.submit() {
-                Ok(_) => break,
+                Ok(_) => return,
                 Err(e)
                     if matches!(
                         e.raw_os_error(),
@@ -425,14 +447,13 @@ impl DirectDriveEngine {
                     std::hint::spin_loop();
                 }
                 Err(e) => {
-                    // The SQE is published; the reaper's own enter will
-                    // carry it. Loud because it should not happen.
+                    // The SQEs are published; the reaper's own enter
+                    // carries them. Loud because it should not happen.
                     log::error!("ipc direct-drive: io_uring submit failed: {e}");
-                    break;
+                    return;
                 }
             }
         }
-        Ok(())
     }
 
     /// The single CQ consumer: block in `io_uring_enter(GETEVENTS,

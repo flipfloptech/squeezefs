@@ -136,6 +136,13 @@ impl SessionSink for InoMapSink {
     fn on_bind(&self, ino: u64) {
         self.inner.on_bind(self.translate(ino));
     }
+
+    fn flush(&self) {
+        // Forward the end-of-sweep hook (SessionSink::flush liveness
+        // rule): direct-drive SQEs published during serve_data must
+        // reach the kernel before the service thread parks.
+        SessionSink::flush(&self.inner);
+    }
 }
 
 /// Recorded invalidations (the injected W1 hook).

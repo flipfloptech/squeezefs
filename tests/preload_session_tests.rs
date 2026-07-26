@@ -128,6 +128,13 @@ impl SessionSink for InoMapSink {
         op.binding.ino = fs_ino;
         SessionSink::serve_data(&self.inner, op, completion);
     }
+
+    fn flush(&self) {
+        // Forward the end-of-sweep hook (SessionSink::flush liveness
+        // rule): direct-drive SQEs published during serve_data must
+        // reach the kernel before the service thread parks.
+        SessionSink::flush(&self.inner);
+    }
 }
 
 /// A sink that NEVER completes: drops the completion handle. Pins the

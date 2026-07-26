@@ -310,7 +310,10 @@ async fn governor_phases() {
     // ---- Phase SKEW (bar c): hot subset + cold tail under an engaged
     // clamp — the hot pair must still get admitted (denied keys record no
     // cooldown; their own foreground traffic accrues the trickle) and
-    // then serve from RAM with the device flat.
+    // then serve from RAM with the device flat. The token grant is a
+    // wall-clock mechanism: shrink the epoch via the test seam so the
+    // trickle mints inside the loop instead of sleeping out 2 s windows.
+    squeezefs::routing::TEST_ADMISSION_EPOCH_MS.store(100, Ordering::Relaxed);
     std::env::set_var("SQUEEZEFS_READ_TIER_ADMISSION", "second-touch");
     std::env::set_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", "1"); // 2 slots
     std::env::set_var("SQUEEZEFS_READ_ADMISSION_FILL_PCT", "100");
@@ -348,6 +351,11 @@ async fn governor_phases() {
             warm = true;
             break;
         }
+        // Pace the loop across shimmed epoch boundaries (the mint is
+        // wall-clock; this is the mechanism under test, not a sync hack).
+        if i % 50 == 49 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
     assert!(
         warm,
@@ -368,6 +376,7 @@ async fn governor_phases() {
     );
     let _ = d_clamped;
     drop(h);
+    squeezefs::routing::TEST_ADMISSION_EPOCH_MS.store(0, Ordering::Relaxed);
     std::env::remove_var("SQUEEZEFS_READ_TIER_ADMISSION");
 
     // ---- Phase PAYBACK (plumbing, deterministic): the waste signal is
@@ -421,18 +430,44 @@ async fn governor_phases() {
     );
     assert!(shards >= 1);
     drop(h);
+
+    // ---- Phase HERD (reservation concurrency): pure-API, own epoch shim.
+    tokio::task::spawn_blocking(herd_phase).await.unwrap();
 }
 
-/// Clamped-mode admission is an atomic RESERVATION, not check-then-add:
-/// under real mount concurrency (256-deep O_DIRECT), a thundering herd of
-/// simultaneous escalation attempts must not all pass the bandwidth check
-/// before any of their spends land (measured on the rig as ~6× the
-/// configured fill budget: 93 admits/s where 5 % of foreground allowed 15).
-#[test]
-fn clamped_admission_is_a_reservation_under_herd() {
+/// Clamped-mode admission is an atomic token RESERVATION, not
+/// check-then-add: under real mount concurrency (256-deep O_DIRECT), a
+/// thundering herd of simultaneous escalation attempts must not all pass
+/// the bandwidth check before any of their spends land, and epoch-roll
+/// boundaries must not re-open budget already spent (both measured on the
+/// rig: ~6x the fill budget pre-reservation, 2x residual from the
+/// boundary race). Kept a helper of the serial phases fn: the epoch shim
+/// is process-global.
+fn herd_phase() {
+    use squeezefs::routing::TEST_ADMISSION_EPOCH_MS;
+    const EPOCH_MS: u64 = 200;
+    TEST_ADMISSION_EPOCH_MS.store(EPOCH_MS, Ordering::Relaxed);
     let gov = std::sync::Arc::new(squeezefs::routing::AdmissionGovernor::new(5));
     let block: u64 = 4 * 1024 * 1024;
-    // Engage the clamp: waste ≈ admitted (the churn steady state)...
+    // Fund the PREVIOUS epoch: the grant mints at the roll from the
+    // foreground the workload actually paid. 5 % of 8 GiB = ~409 MiB =>
+    // ~102 blocks for the epoch.
+    gov.note_foreground(8 * 1024 * 1024 * 1024);
+    let budget_blocks = (8u64 * 1024 * 1024 * 1024 * 5 / 100) / block; // 102
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    // Wait for the next epoch boundary, then run the whole phase well
+    // inside the fresh epoch (the herd itself is microseconds).
+    let e0 = now_ms() / EPOCH_MS;
+    while now_ms() / EPOCH_MS == e0 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // Engage the clamp: waste ~= admitted (the churn steady state). The
+    // first admissions ride unclamped (free) until the waste floor.
     for _ in 0..4 {
         assert!(gov.allow_escalation(block), "pre-clamp admissions flow");
         gov.on_eviction(
@@ -440,10 +475,6 @@ fn clamped_admission_is_a_reservation_under_herd() {
             &squeezefs::tiering::memory::EvictClass::Protected { served_bytes: 0 },
         );
     }
-    // ...and fund a known foreground window: budget = 5 % of 8 GiB =
-    // ~409 MiB ⇒ ~102 blocks MINUS the 16 MiB already admitted.
-    gov.note_foreground(8 * 1024 * 1024 * 1024);
-    let budget_blocks = (8u64 * 1024 * 1024 * 1024 * 5 / 100) / block; // 102
 
     let admitted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut handles = Vec::new();
@@ -465,13 +496,14 @@ fn clamped_admission_is_a_reservation_under_herd() {
     assert!(
         got <= budget_blocks,
         "herd of 4096 concurrent attempts must never overshoot the \
-         reserved fill budget (~{budget_blocks} blocks): admitted {got}"
+         epoch's token grant (~{budget_blocks} blocks): admitted {got}"
     );
     assert!(
         got >= budget_blocks / 2,
-        "the reservation must still fill most of the budget (got {got} of \
+        "the reservation must still spend most of the grant (got {got} of \
          ~{budget_blocks})"
     );
+    TEST_ADMISSION_EPOCH_MS.store(0, Ordering::Relaxed);
 }
 
 /// Pure-API shard-geometry pin (env-free — safe under parallel test fns):

@@ -1894,14 +1894,38 @@ impl EscalationCooldown {
 pub struct AdmissionGovernor {
     fill_pct: u64,
     epoch: std::sync::atomic::AtomicU64,
-    admitted_cur: std::sync::atomic::AtomicU64,
-    admitted_prev: std::sync::atomic::AtomicU64,
+    /// Clamped-mode fill budget for the CURRENT epoch, in bytes — granted
+    /// at each roll as `fill_pct` % of the PREVIOUS epoch's foreground
+    /// bytes (leftovers discarded). A single word so the reservation is
+    /// one `checked_sub` CAS: the earlier two-window spend arithmetic had
+    /// a roll-boundary race (a stale `prev` snapshot across the shift let
+    /// each boundary re-admit up to a herd of blocks — measured on the
+    /// rig as exactly 2× the configured budget) and an alternating
+    /// fill-to-cap/starve oscillation. Tokens have neither: budget is
+    /// minted once per epoch, spent by CAS, never re-derived.
+    tokens: std::sync::atomic::AtomicU64,
+    /// Windowed bytes of ADMITTED (protected) victims evicted — the waste
+    /// ratio's denominator. Deliberately eviction-side: an admission
+    /// burst must not be able to dilute the ratio and unclamp itself (the
+    /// check-then-add herd's second face — measured on the rig as the
+    /// clamp flapping open at ~6× the fill budget).
+    evicted_cur: std::sync::atomic::AtomicU64,
+    evicted_prev: std::sync::atomic::AtomicU64,
     wasted_cur: std::sync::atomic::AtomicU64,
     wasted_prev: std::sync::atomic::AtomicU64,
     foreground_cur: std::sync::atomic::AtomicU64,
     foreground_prev: std::sync::atomic::AtomicU64,
     clamped: std::sync::atomic::AtomicBool,
 }
+
+/// Test seam (the `TEST_TIER_PUBLISH_DELAY_MS` precedent): overrides the
+/// governor's wall-clock epoch length in milliseconds (0 = the production
+/// 2000 ms). The token grant and waste windows are wall-clock mechanisms;
+/// contract tests shrink the epoch so convergence is observable in-process
+/// instead of sleeping out multi-second windows. One relaxed load per
+/// roll, zero-cost when unset.
+pub static TEST_ADMISSION_EPOCH_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 impl AdmissionGovernor {
     const EPOCH_MS: u64 = 2_000;
@@ -1910,8 +1934,9 @@ impl AdmissionGovernor {
         Self {
             fill_pct: fill_pct.min(100),
             epoch: std::sync::atomic::AtomicU64::new(0),
-            admitted_cur: std::sync::atomic::AtomicU64::new(0),
-            admitted_prev: std::sync::atomic::AtomicU64::new(0),
+            tokens: std::sync::atomic::AtomicU64::new(0),
+            evicted_cur: std::sync::atomic::AtomicU64::new(0),
+            evicted_prev: std::sync::atomic::AtomicU64::new(0),
             wasted_cur: std::sync::atomic::AtomicU64::new(0),
             wasted_prev: std::sync::atomic::AtomicU64::new(0),
             foreground_cur: std::sync::atomic::AtomicU64::new(0),
@@ -1920,10 +1945,20 @@ impl AdmissionGovernor {
         }
     }
 
-    /// Slide the two-epoch window (op-driven; the CAS winner shifts).
+    fn epoch_ms() -> u64 {
+        let t = TEST_ADMISSION_EPOCH_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if t == 0 {
+            Self::EPOCH_MS
+        } else {
+            t
+        }
+    }
+
+    /// Slide the two-epoch window and mint the epoch's token grant
+    /// (op-driven; the CAS winner shifts).
     fn roll(&self) {
         use std::sync::atomic::Ordering::Relaxed;
-        let now = StreamLanes::now_ms() / Self::EPOCH_MS;
+        let now = StreamLanes::now_ms() / Self::epoch_ms();
         let seen = self.epoch.load(Relaxed);
         if seen != now
             && self
@@ -1933,13 +1968,21 @@ impl AdmissionGovernor {
         {
             let adjacent = now == seen.wrapping_add(1);
             for (cur, prev) in [
-                (&self.admitted_cur, &self.admitted_prev),
+                (&self.evicted_cur, &self.evicted_prev),
                 (&self.wasted_cur, &self.wasted_prev),
-                (&self.foreground_cur, &self.foreground_prev),
             ] {
                 let c = cur.swap(0, Relaxed);
                 prev.store(if adjacent { c } else { 0 }, Relaxed);
             }
+            // Mint this epoch's fill budget from the foreground the
+            // workload ACTUALLY paid last epoch; leftovers die with the
+            // epoch (no carryover bursts). Reservations racing this store
+            // cost at most one block of slack per roll — racy-tolerant.
+            let f = self.foreground_cur.swap(0, Relaxed);
+            self.foreground_prev
+                .store(if adjacent { f } else { 0 }, Relaxed);
+            self.tokens
+                .store(f.saturating_mul(self.fill_pct) / 100, Relaxed);
         }
     }
 
@@ -1966,11 +2009,12 @@ impl AdmissionGovernor {
         let crate::tiering::memory::EvictClass::Protected { served_bytes } = class else {
             return;
         };
+        self.roll();
+        self.evicted_cur.fetch_add(len, Relaxed);
         let waste = len.saturating_sub(*served_bytes);
         if waste == 0 {
             return;
         }
-        self.roll();
         self.wasted_cur.fetch_add(waste, Relaxed);
         METRICS
             .read_admission_wasted_bytes
@@ -1986,21 +2030,33 @@ impl AdmissionGovernor {
     pub fn allow_escalation(&self, block_bytes: u64) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         self.roll();
-        let admitted = Self::window(&self.admitted_cur, &self.admitted_prev);
+        let evicted = Self::window(&self.evicted_cur, &self.evicted_prev);
         let wasted = Self::window(&self.wasted_cur, &self.wasted_prev);
-        let clamped = wasted >= 2 * block_bytes.max(1) && wasted.saturating_mul(2) >= admitted;
+        // Eviction-side ratio: of the admitted bytes the tier gave BACK
+        // this window, did at least half pay for themselves? Admissions
+        // themselves are deliberately not in the denominator — a burst
+        // must not dilute the ratio and unclamp itself.
+        let clamped = wasted >= 2 * block_bytes.max(1) && wasted.saturating_mul(2) >= evicted;
         self.clamped.store(clamped, Relaxed);
         if clamped {
-            let foreground = Self::window(&self.foreground_cur, &self.foreground_prev);
-            let spend = admitted.saturating_add(block_bytes).saturating_mul(100);
-            if spend > foreground.saturating_mul(self.fill_pct) {
+            // RESERVATION, not check-then-add: under real mount
+            // concurrency (256-deep O_DIRECT) a herd of simultaneous
+            // attempts all passed a plain check before any spend landed —
+            // measured on the rig as ~6× the configured budget (93
+            // admits/s where 5 % of foreground allowed 15). The
+            // single-word token CAS makes the check and the spend one
+            // atomic step with no cross-word snapshot to race.
+            let reserved = self
+                .tokens
+                .fetch_update(Relaxed, Relaxed, |t| t.checked_sub(block_bytes))
+                .is_ok();
+            if !reserved {
                 METRICS
                     .read_admission_governor_denials
                     .fetch_add(1, Relaxed);
                 return false;
             }
         }
-        self.admitted_cur.fetch_add(block_bytes, Relaxed);
         true
     }
 

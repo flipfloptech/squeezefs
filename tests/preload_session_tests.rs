@@ -159,12 +159,24 @@ impl SessionSink for DelaySink {
     }
 }
 
-/// Dedicated host over a [`DelaySink`] + one bound O_RDWR fd (the
-/// ticket-park pins' fixture shape — no filesystem needed, the sink
-/// fabricates results).
-fn delay_host(
+/// A sink that completes inline on the daemon's drain pass — zero serve
+/// latency, so the only inter-op gap a service thread observes is the
+/// client's own submit round trip (a few µs). The service-economy pins'
+/// stand-in for a warm serve.
+struct InstantSink;
+
+impl SessionSink for InstantSink {
+    fn serve_data(&self, op: DataOp, completion: SlotCompletion) {
+        completion.complete(op.desc.len as i64);
+    }
+}
+
+/// Dedicated host over an arbitrary sink + one bound O_RDWR fd (the
+/// ticket-park / service-economy pins' fixture shape — no filesystem
+/// needed, the sink fabricates results).
+fn sink_host(
     name: &str,
-    delay_ms: u64,
+    sink: Arc<dyn SessionSink>,
 ) -> (Arc<IpcHost>, tempfile::TempDir, std::fs::File, Session, u64) {
     let cfg = IpcHostConfig {
         socket_name: format!("sqz-il0-session-{name}-{}", std::process::id()),
@@ -179,13 +191,7 @@ fn delay_host(
         // SAFETY: getuid is trivially safe.
         owner_uid: unsafe { libc::getuid() },
     };
-    let host = IpcHost::spawn(
-        cfg,
-        Arc::new(DelaySink {
-            delay: std::time::Duration::from_millis(delay_ms),
-        }),
-    )
-    .expect("host must spawn");
+    let host = IpcHost::spawn(cfg, sink).expect("host must spawn");
     let dir = tempfile::tempdir().unwrap();
     let st_dev = {
         use std::os::unix::fs::MetadataExt;
@@ -204,6 +210,19 @@ fn delay_host(
         Session::establish(&blob, f.as_raw_fd(), TEST_COMMIT).expect("session establishes");
     let bind = session.bind(f.as_raw_fd()).expect("bind succeeds");
     (host, dir, f, session, bind.binding_id)
+}
+
+/// [`sink_host`] over a [`DelaySink`] (the ticket-park pins' shape).
+fn delay_host(
+    name: &str,
+    delay_ms: u64,
+) -> (Arc<IpcHost>, tempfile::TempDir, std::fs::File, Session, u64) {
+    sink_host(
+        name,
+        Arc::new(DelaySink {
+            delay: std::time::Duration::from_millis(delay_ms),
+        }),
+    )
 }
 
 fn test_geometry() -> Geometry {
@@ -645,6 +664,136 @@ async fn slot_completion_wakes_every_parked_waiter() {
             .expect("done"),
         4096
     );
+    host.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// service-thread economy (the 2026-07-26 reap-economy residual 2): a hot
+// stream never pays a park/wake cycle per op, and the owned-session view
+// a service thread drains from always converges on the registry
+// ---------------------------------------------------------------------------
+
+/// A back-to-back op stream must NOT park the service thread per op:
+/// the empty-pass spin window covers the client's submit round trip
+/// (a few µs), so `ipc_service_parks` stays ~flat across the stream.
+/// Pre-fix, the spin window was 64 bare `spin_loop` hints (sub-µs —
+/// smaller than ANY client round trip), so every op paid a full
+/// park/wake cycle: the measured sessions inversion (svc voluntary
+/// context switches 32k→394k /s from sessions=1→8 at one offered load,
+/// > 1 park cycle per op at 8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_thread_stays_hot_between_back_to_back_ops() {
+    let (host, _dir, _f, session, binding) = sink_host("svc-hot", Arc::new(InstantSink));
+
+    // One op round trip, then a ~50 µs busy-wait gap — the fleet-spread
+    // per-session inter-arrival shape (a 235 µs device staggers bursts;
+    // the rig measured ~28 µs at sessions=8 and coarser on 16-process
+    // fleets). The gap sits far outside the old 64-pass spin (sub-µs to
+    // low-µs) and far inside the fixed time-based window.
+    let roundtrip = |n: usize| {
+        for _ in 0..n {
+            let t = session
+                .submit_pread_nowait(binding, 512, 0)
+                .expect("slot claim");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(res) = session.poll_ticket(t, Some(&mut [0u8; 512])) {
+                    assert_eq!(res, 512);
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "instant sink must complete"
+                );
+                std::hint::spin_loop();
+            }
+            let gap = std::time::Instant::now() + std::time::Duration::from_micros(50);
+            while std::time::Instant::now() < gap {
+                std::hint::spin_loop();
+            }
+        }
+    };
+
+    tokio::task::block_in_place(|| {
+        roundtrip(100); // warmup: session admitted, thread spun up
+        let parks0 = METRICS.ipc_service_parks.load(Ordering::Relaxed);
+        roundtrip(2000);
+        let parks = METRICS.ipc_service_parks.load(Ordering::Relaxed) - parks0;
+        assert!(
+            parks < 200,
+            "a hot back-to-back stream paid {parks} service parks over 2000 \
+             ops — the empty-pass spin window must cover the client's \
+             round-trip gap (a park/wake cycle per op is the sessions-\
+             inversion engine)"
+        );
+    });
+    host.shutdown();
+}
+
+/// The owned-session view converges: a session admitted to an ALREADY
+/// BUSY service thread (single-thread host, existing session mid-
+/// stream) is served promptly. Guards the snapshot-caching machinery —
+/// a stale owned-set that never refreshes would strand the new
+/// session's ops forever, not just for one park bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn new_session_on_a_busy_thread_is_served_promptly() {
+    // Force ONE service thread so both sessions share an owner. The env
+    // var is read once at host spawn (inside this test); the full suite
+    // runs single-threaded in the gate, so the window is benign.
+    std::env::set_var("SQUEEZEFS_IPC_SERVICE_THREADS", "1");
+    let (host, dir, _f, session_a, binding_a) = sink_host("svc-refresh", Arc::new(InstantSink));
+    std::env::remove_var("SQUEEZEFS_IPC_SERVICE_THREADS");
+
+    // Session A: continuous stream on a background thread — keeps the
+    // single service thread hot (and its owned snapshot warm).
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let streamer = {
+        let session_a = Arc::new(session_a);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let Some(t) = session_a.submit_pread_nowait(binding_a, 512, 0) else {
+                    continue;
+                };
+                while session_a.poll_ticket(t, Some(&mut [0u8; 512])).is_none() {
+                    std::hint::spin_loop();
+                }
+            }
+        })
+    };
+
+    // Session B admits mid-stream onto the same (only) service thread.
+    let path_b = dir.path().join("g.bin");
+    std::fs::write(&path_b, vec![9u8; 8192]).unwrap();
+    let f_b = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path_b)
+        .unwrap();
+    let blob = BootstrapBlob::decode(&host.bootstrap_blob()).unwrap();
+    let session_b =
+        Session::establish(&blob, f_b.as_raw_fd(), TEST_COMMIT).expect("session B establishes");
+    let bind_b = session_b.bind(f_b.as_raw_fd()).expect("bind B succeeds");
+
+    let start = std::time::Instant::now();
+    let t = session_b
+        .submit_pread_nowait(bind_b.binding_id, 512, 0)
+        .expect("slot claim on B");
+    tokio::task::block_in_place(|| loop {
+        if let Some(res) = session_b.poll_ticket(t, Some(&mut [0u8; 512])) {
+            assert_eq!(res, 512);
+            break;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "op on the newly admitted session was never served — the \
+             service thread's owned-session view must refresh on admission"
+        );
+        std::hint::spin_loop();
+    });
+
+    stop.store(true, Ordering::Relaxed);
+    streamer.join().expect("streamer thread");
     host.shutdown();
 }
 

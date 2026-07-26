@@ -2632,6 +2632,12 @@ pub struct Metrics {
     pub ipc_fast_path_miss_demotions: Align64<AtomicU64>,
     /// Gauge: pinned IPC service threads (`SQUEEZEFS_IPC_SERVICE_THREADS`).
     pub ipc_service_threads: Align64<AtomicU64>,
+    /// Owned-session doorbell parks taken by service threads (the
+    /// bounded `futex_waitv` waits — idle no-session parks are not
+    /// counted). Growth ≈ op rate on a busy stream = the spin window no
+    /// longer covers the per-session inter-arrival gap (the 2026-07-26
+    /// sessions-inversion engine: a park/wake cycle per burst).
+    pub ipc_service_parks: Align64<AtomicU64>,
     /// L4-6 lifecycle families (§5.7 / §5.6.2 W1). Idle sessions torn
     /// down past `SQUEEZEFS_IPC_IDLE_SECS` — growth on busy clients =
     /// idle-clock regression.
@@ -4358,6 +4364,7 @@ impl SqueezefsFilesystem {
                 "ipc_fast_path_lock_demotions": METRICS.ipc_fast_path_lock_demotions.load(Ordering::Relaxed),
                 "ipc_fast_path_miss_demotions": METRICS.ipc_fast_path_miss_demotions.load(Ordering::Relaxed),
                 "ipc_service_threads": METRICS.ipc_service_threads.load(Ordering::Relaxed),
+                "ipc_service_parks": METRICS.ipc_service_parks.load(Ordering::Relaxed),
                 "ipc_sessions_reaped": METRICS.ipc_sessions_reaped.load(Ordering::Relaxed),
                 "ipc_inval_notifies": METRICS.ipc_inval_notifies.load(Ordering::Relaxed),
                 "ipc_inval_suppressed": METRICS.ipc_inval_suppressed.load(Ordering::Relaxed),

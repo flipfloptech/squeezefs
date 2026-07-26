@@ -1483,6 +1483,7 @@ impl IpcHost {
                 if sessions.is_empty() {
                     std::thread::park_timeout(SERVICE_PARK_MAX);
                 } else {
+                    METRICS.ipc_service_parks.fetch_add(1, Ordering::Relaxed);
                     let waiters: Vec<(&AtomicU32, u32)> = sessions
                         .iter()
                         .zip(&observed)

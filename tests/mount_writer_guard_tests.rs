@@ -184,6 +184,63 @@ async fn test_second_open_refused_while_first_holds() {
     re.shutdown().await.unwrap();
 }
 
+/// Layer A teardown race (2026-07-26 flake class): `drop`-without-
+/// `shutdown` releases the guard flock only when the LAST `Arc` dies, and
+/// the detached checkpoint / times-drain / conveyor pass tasks each hold
+/// an upgraded `Arc` for the duration of a pass — so an INSTANT
+/// same-process reopen can find the flock still held by a backend that is
+/// provably in teardown and refuse `Busy … age=0s`. That was the
+/// `kv_backend_tests::v3_strict_mode_commits_barrier_per_commit` ~1/8
+/// standalone flake (reported 2026-07-25), and the
+/// `kv_smo_crash_completeness_tests` harness papers over the same window
+/// with a poll-retry loop.
+///
+/// The contract pinned here: when the flock holder's on-volume claim
+/// names THIS process (pid + boot) and the caller no longer holds a live
+/// handle, `open` waits out the teardown bounded instead of refusing —
+/// crash-equivalent drop→reopen is a sanctioned product shape (remount
+/// paths, the strict-mode replay check), not harness plumbing. A
+/// genuinely live same-process double mount still refuses (the wait
+/// expires — `test_second_open_refused_while_first_holds` above), and
+/// foreign holders never wait at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_reopen_waits_out_same_process_teardown_pin() {
+    let vol = fresh_volume().await;
+    let be = KvMetaBackend::open(vol.path()).await.expect("first mount");
+    Metadata::create(be.as_ref(), 1, "pinned", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("create under the first mount");
+
+    // Deterministic stand-in for the mid-pass background-task pin: a
+    // second Arc outlives the caller's drop by ~300 ms (exactly what a
+    // checkpoint tick's upgraded Weak does, without the timing luck).
+    let pin = be.clone();
+    drop(be);
+    let unpin = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(pin);
+    });
+
+    // The instant reopen must wait out the pin, not refuse: the claim on
+    // the volume names our own pid+boot and the flock frees the moment
+    // the pinned Arc dies.
+    let re = KvMetaBackend::open(vol.path()).await.expect(
+        "instant same-process reopen must wait out a teardown-pinned \
+         holder (bounded), never refuse Busy at age=0s",
+    );
+    assert_eq!(
+        Metadata::lookup(re.as_ref(), 1, "pinned")
+            .await
+            .expect("reopened volume serves the pre-drop create")
+            .mode
+            & libc::S_IFMT,
+        libc::S_IFREG,
+        "replayed create survives the drop→reopen"
+    );
+    unpin.join().unwrap();
+    re.shutdown().await.unwrap();
+}
+
 /// The dedicated-fd requirement (design §5.0 Layer A): `uring_fs`'s
 /// per-worker `FdCache` evicts by LRU, and a flock taken on a cache-owned
 /// fd would be **silently released at eviction**, reopening the

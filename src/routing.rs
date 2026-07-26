@@ -1570,7 +1570,12 @@ impl BackendRouter {
     }
 }
 
-async fn perform_device_health_check(dev: &crate::nvme_dev::NvmeBlockDev) -> crate::health::Probe {
+/// One liveness probe of a data device — the health worker's per-tick
+/// unit (public for the probe-attribution contract test: probe reads are
+/// control-plane diagnostics, never `get_obj` data-read counts).
+pub async fn perform_device_health_check(
+    dev: &crate::nvme_dev::NvmeBlockDev,
+) -> crate::health::Probe {
     use crate::health::Probe;
     if !std::path::Path::new(&dev.device_path).exists() {
         return Probe::Failed;

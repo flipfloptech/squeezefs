@@ -88,18 +88,18 @@ const SERVICE_PARK_MAX: Duration = Duration::from_millis(5);
 
 /// Empty-pass spin window before a service thread parks (time-based —
 /// the §5.5.1 "spin → short wait" ladder's spin rung, restored; knob
-/// `SQUEEZEFS_IPC_SPIN_US`, default 30). The former 64 bare `spin_loop`
+/// `SQUEEZEFS_IPC_SPIN_US`, default 20). The former 64 bare `spin_loop`
 /// hints were sub-µs — smaller than ANY per-session inter-arrival gap
 /// once sessions spread across threads (13–55 µs on the 2026-07-26
 /// fabric-rig shapes), so every burst paid a full doorbell park/wake
 /// cycle: the measured sessions inversion (svc voluntary context
 /// switches 32k → 394k /s from sessions=1 → 8 at one offered load).
-/// The default is deliberately conservative: 30 µs covers dense
-/// per-session arrival without measurable CPU theft, while 100 µs —
-/// which buys ~3 % more on 16-process libaio fleets — cost the sync
-/// lane 22 % on the sizing rig (8 spinning service threads vs the
-/// tokio workers; evidence note §5). Fleets with no sync lanes can
-/// raise it.
+/// The default is deliberately conservative: 20 µs covers dense
+/// per-session arrival without measurable CPU theft anywhere on the
+/// sizing grid, while 100 µs — which buys ~3 % more on 16-process
+/// libaio fleets — cost the sync lane 22 % (8 spinning service
+/// threads vs the tokio workers; evidence note §5). Fleets with no
+/// sync lanes can raise it.
 fn service_spin_window() -> Duration {
     let us = std::env::var("SQUEEZEFS_IPC_SPIN_US")
         .ok()

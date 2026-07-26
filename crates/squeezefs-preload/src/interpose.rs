@@ -1820,9 +1820,13 @@ unsafe fn aio_reap_served(
             // sleep ladder whose quantum shaped every cold completion).
             // A short spin first covers the just-completing case without
             // a futex round trip; it is deliberately tiny (the CPU-theft
-            // lesson: reaper spin starves the daemon at fleet scale).
+            // lesson: reaper spin starves the daemon at fleet scale) and
+            // SWEEP-bounded, not iteration-bounded — 64 sweeps over a
+            // qd32 pending set was 2048 cross-cacheline shm probes per
+            // empty pass, measurable client CPU theft on the t32qd32
+            // shape (2026-07-26 sizing).
             let mut ready = false;
-            'spin: for _ in 0..64 {
+            'spin: for _ in 0..4 {
                 for (token, t) in &parks {
                     if registry()
                         .by_token(*token)

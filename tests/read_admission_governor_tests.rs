@@ -433,6 +433,50 @@ async fn governor_phases() {
 
     // ---- Phase HERD (reservation concurrency): pure-API, own epoch shim.
     tokio::task::spawn_blocking(herd_phase).await.unwrap();
+
+    // ---- Phase DECLASSIFY (the cold-row residual): a spurious streaming
+    // classification (random traffic occasionally lands 4 contiguous
+    // offsets) vetoes the ranged path FILE-WIDE for its 2 s freshness
+    // window — every random miss in it becomes an ungoverned whole-block
+    // fetch (measured on the rig: 1–2 spurious classifications per 20 s
+    // steered 5–10k misses = 20–40 GiB of admission-class traffic the
+    // governor never saw). Random-dominated traffic must DECLASSIFY the
+    // file: a classified lane whose file then sees a run of non-matching
+    // (foreign) reads clears the veto and its run credit, and the next
+    // random cold miss rides the ranged path again — well inside the 2 s
+    // window.
+    std::env::set_var("SQUEEZEFS_READ_TIER_ADMISSION", "second-touch");
+    std::env::set_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", "8");
+    let h = make_with(*b"admission-gov-05", "gov_ns_e").await;
+    std::env::remove_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB");
+    std::env::remove_var("SQUEEZEFS_READ_TIER_ADMISSION");
+    let (ino, _map) = striped_file(&h, "declass", 16).await;
+
+    let sc0 = METRICS.read_streams_classified.load(Ordering::Relaxed);
+    for i in 0..4u64 {
+        read_flags(&h, ino, i * 4096, 4096, OD).await; // contiguous run
+    }
+    assert!(
+        METRICS.read_streams_classified.load(Ordering::Relaxed) > sc0,
+        "fixture: the contiguous run must classify the lane"
+    );
+    // 100 scattered (never contiguous, never lane-matching) reads — the
+    // random-dominated signature.
+    for i in 0..100u64 {
+        let b = 2 + (i % 14);
+        read_flags(&h, ino, b * BS + 20480 + (i / 14) * 8192, 4096, OD).await;
+    }
+    // A fresh cold-block random read must now be RANGED again (the veto
+    // cleared), not a whole-block fetch.
+    let rr0 = METRICS.ranged_reads.load(Ordering::Relaxed);
+    read_flags(&h, ino, 15 * BS + 4096, 4096, OD).await;
+    assert!(
+        METRICS.ranged_reads.load(Ordering::Relaxed) > rr0,
+        "random-dominated traffic must declassify the file well inside \
+         the 2 s freshness window (the veto steered this miss to an \
+         ungoverned whole-block fetch)"
+    );
+    drop(h);
 }
 
 /// Clamped-mode admission is an atomic token RESERVATION, not

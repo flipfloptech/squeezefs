@@ -144,6 +144,16 @@ pub struct CachedMetadata {
     pub layout_dirty: bool,
 }
 
+/// The `fetch_metadata` serve gate, extracted (P2 per-op economy): a
+/// DIRTY layout is the local authority (never re-validated — see the
+/// `fetch_metadata` doc comment for the aged-fsx loss class), a clean
+/// entry serves within its 1 s freshness horizon. Also gates the read
+/// handler's snapshot hint in
+/// [`DataRouter::read_file_range_zero_copy_with_meta`].
+pub fn metadata_entry_fresh_or_dirty(entry: &CachedMetadata) -> bool {
+    entry.layout_dirty || entry.cached_at.elapsed() < std::time::Duration::from_secs(1)
+}
+
 impl Default for CachedMetadata {
     fn default() -> Self {
         Self {
@@ -4297,7 +4307,6 @@ impl DataRouter {
     }
 
     pub async fn fetch_metadata(&self, file_path: &str) -> Result<CachedMetadata> {
-        use std::time::Duration;
         // A DIRTY layout is the LOCAL AUTHORITY, never re-validated from the
         // backend: a staged/inline write's layout+size live only in RAM (+
         // the staging ring) until the fsync/flush/promotion cadence persists
@@ -4314,9 +4323,7 @@ impl DataRouter {
         // lease means no remote writer can legitimately outrun a dirty
         // entry, and lease-loss staleness is governed by fencing at persist
         // time — not by serving a snapshot that predates acked writes.
-        let fresh_or_dirty = |entry: &CachedMetadata| {
-            entry.layout_dirty || entry.cached_at.elapsed() < Duration::from_secs(1)
-        };
+        let fresh_or_dirty = metadata_entry_fresh_or_dirty;
         let ino = parse_inode_from_path(file_path);
         if let Some(entry) = self.metadata_cache.get(&ino) {
             if fresh_or_dirty(&entry) {
@@ -6282,6 +6289,30 @@ impl DataRouter {
         bytes::Bytes,
         Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     )> {
+        self.read_file_range_zero_copy_with_meta(file_path, offset, size, dest_addr, hint, None)
+            .await
+    }
+
+    /// [`Self::read_file_range_zero_copy`] with an optional in-hand RAM
+    /// metadata snapshot (P2 per-op economy): the FUSE read handler just
+    /// probed the cache for size coherency — its snapshot serves the
+    /// first resolve attempt instead of a second moka get + clone. The
+    /// hint is trusted only under [`metadata_entry_fresh_or_dirty`] (the
+    /// exact `fetch_metadata` gate — a >1 s-stale clean entry still
+    /// re-validates from the backend), and every re-resolve inside the
+    /// loop goes through `fetch_metadata` as before.
+    pub async fn read_file_range_zero_copy_with_meta(
+        &self,
+        file_path: &str,
+        offset: u64,
+        size: u32,
+        dest_addr: Option<u64>,
+        hint: ReadClassHint,
+        meta_hint: Option<CachedMetadata>,
+    ) -> Result<(
+        bytes::Bytes,
+        Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    )> {
         // Fetch metadata first. The whole-file RAM snapshot (read_lru /
         // write_lru keyed by file_path) is deliberately NOT consulted on the
         // read data path: it is a whole-file copy that goes stale under
@@ -6291,7 +6322,10 @@ impl DataRouter {
         // serves from its authoritative, mutation-tracking tier instead: the
         // inline `data_key`, the staging ring (staged), or the per-block read
         // caches / hole map (striped).
-        let mut meta = self.fetch_metadata(file_path).await?;
+        let mut meta = match meta_hint {
+            Some(h) if metadata_entry_fresh_or_dirty(&h) => h,
+            _ => self.fetch_metadata(file_path).await?,
+        };
 
         // POSIX full-length below-EOF contract (the generic/617 short-read
         // family): every leg below returns EXACTLY

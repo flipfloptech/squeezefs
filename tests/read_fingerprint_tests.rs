@@ -98,7 +98,13 @@ fn binding_appearing_in_window_differs() {
     // caught this as (b, None, e) != (b, Some(k), e).
     let ino = fresh_ino();
     let a = fp(&striped_meta(&[(1, "elsewhere")]), ino, 0, 4096).unwrap();
-    let b = fp(&striped_meta(&[(0, "fresh"), (1, "elsewhere")]), ino, 0, 4096).unwrap();
+    let b = fp(
+        &striped_meta(&[(0, "fresh"), (1, "elsewhere")]),
+        ino,
+        0,
+        4096,
+    )
+    .unwrap();
     assert!(!a.matches(&b), "hole → bound inside the window must differ");
 }
 
@@ -118,7 +124,10 @@ fn rebind_outside_window_still_matches() {
     let ino = fresh_ino();
     let a = fp(&striped_meta(&[(0, "k0"), (7, "far")]), ino, 0, 4096).unwrap();
     let b = fp(&striped_meta(&[(0, "k0"), (7, "far-moved")]), ino, 0, 4096).unwrap();
-    assert!(a.matches(&b), "movement outside the window is not this read's business");
+    assert!(
+        a.matches(&b),
+        "movement outside the window is not this read's business"
+    );
 }
 
 #[test]
@@ -132,7 +141,10 @@ fn custody_epoch_bump_alone_differs() {
     let a = fp(&meta, ino, 0, 4096).unwrap();
     bump_block_custody_epoch(ino, 0);
     let b = fp(&meta, ino, 0, 4096).unwrap();
-    assert!(!a.matches(&b), "a custody retire inside the window must differ");
+    assert!(
+        !a.matches(&b),
+        "a custody retire inside the window must differ"
+    );
 }
 
 #[test]
@@ -153,7 +165,10 @@ fn multi_block_window_covers_every_block() {
     let a = fp(&meta, ino, BS - 4096, (2 * BS + 8192) as usize).unwrap();
     bump_block_custody_epoch(ino, 2);
     let b = fp(&meta, ino, BS - 4096, (2 * BS + 8192) as usize).unwrap();
-    assert!(!a.matches(&b), "the last covered block is part of the window");
+    assert!(
+        !a.matches(&b),
+        "the last covered block is part of the window"
+    );
 }
 
 #[test]
@@ -197,9 +212,15 @@ fn map_vs_prefix_shape_flip_differs_unless_keys_agree() {
 fn non_striped_and_empty_windows_do_not_fingerprint() {
     let ino = fresh_ino();
     let inline = CachedMetadata::default(); // file_type "inline"
-    assert!(fp(&inline, ino, 0, 4096).is_none(), "inline has no custody chain");
+    assert!(
+        fp(&inline, ino, 0, 4096).is_none(),
+        "inline has no custody chain"
+    );
     let striped = striped_meta(&[(0, "k0")]);
-    assert!(fp(&striped, ino, 0, 0).is_none(), "len 0 never fingerprints");
+    assert!(
+        fp(&striped, ino, 0, 0).is_none(),
+        "len 0 never fingerprints"
+    );
 }
 
 #[test]

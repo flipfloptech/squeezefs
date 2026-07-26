@@ -938,6 +938,177 @@ pub fn block_custody_epoch(ino: u64, b: u32) -> u64 {
         .load(Ordering::Acquire)
 }
 
+/// The read window's custody fingerprint — the moving-custody read
+/// protocol's defense #3 (generic/795), compact form (P2 per-op economy).
+///
+/// Semantics are the old tuple-vector's exactly: per covered block, the
+/// CURRENT binding key and the (ino, block) custody-epoch word; two
+/// fingerprints match iff every covered block agrees on both. The
+/// representation changed, not the verdict: the map shape holds the
+/// shared `block_map` **Arc** (clone = refcount bump — writers publish
+/// copy-on-write via `Arc::make_mut`, so a held snapshot's content is
+/// immutable) instead of cloning every covered key String per read per
+/// side, and `matches` compares pointer-equal maps by epochs alone.
+/// Epoch monotonicity kills binding-string ABA (a key can be retired and
+/// republished byte-identical only across a retire, which bumped the
+/// word), so the semantic compare is exactly as strong as the owned one.
+pub enum ReadCustodyFp {
+    /// Inline block map: the shared Arc + the covered window's epochs.
+    Map {
+        map: std::sync::Arc<std::collections::HashMap<u32, String>>,
+        start: u32,
+        epochs: Vec<u64>,
+    },
+    /// `block_prefix` files: keys are pure functions of the prefix.
+    Prefix {
+        prefix: String,
+        start: u32,
+        epochs: Vec<u64>,
+    },
+    /// Authoritative async fallback (the anomalous map-id-without-map
+    /// shape): owned resolved keys, the historical representation.
+    Owned(Vec<(u32, Option<String>, u64)>),
+}
+
+/// A covered block's binding key, borrowed from its fingerprint — the
+/// `Derived` arm avoids materializing `"{prefix}/part_{b}"` per compare.
+enum FpKeyRef<'a> {
+    Hole,
+    Str(&'a str),
+    Derived(&'a str, u32),
+}
+
+impl FpKeyRef<'_> {
+    fn eq(&self, other: &FpKeyRef<'_>) -> bool {
+        use FpKeyRef::*;
+        match (self, other) {
+            (Hole, Hole) => true,
+            (Str(a), Str(b)) => a == b,
+            (Derived(p, b), Derived(q, c)) => p == q && b == c,
+            (Derived(p, b), Str(s)) | (Str(s), Derived(p, b)) => {
+                // s == format!("{p}/part_{b}") without the alloc.
+                s.strip_prefix(p)
+                    .and_then(|r| r.strip_prefix("/part_"))
+                    .and_then(|r| r.parse::<u32>().ok())
+                    .is_some_and(|n| n == *b)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl ReadCustodyFp {
+    /// Build from an in-hand RAM metadata snapshot — zero cache probes,
+    /// zero key clones (one Arc bump / one prefix String). Returns `None`
+    /// for shapes with no custody chain (non-striped, empty window) AND
+    /// for the anomalous map-id-without-inline-map entry, which must ride
+    /// the authoritative async resolve instead (never fingerprint a shape
+    /// whose keys this builder cannot see).
+    pub fn build_sync(
+        meta: &crate::routing::CachedMetadata,
+        ino: u64,
+        block_size: u64,
+        offset: u64,
+        len: usize,
+    ) -> Option<ReadCustodyFp> {
+        if len == 0 || meta.file_type != "striped" || block_size == 0 {
+            return None;
+        }
+        let start = (offset / block_size) as u32;
+        let end = ((offset + len as u64 - 1) / block_size) as u32;
+        let epochs: Vec<u64> = (start..=end).map(|b| block_custody_epoch(ino, b)).collect();
+        if let Some(map) = &meta.block_map {
+            Some(ReadCustodyFp::Map {
+                map: map.clone(),
+                start,
+                epochs,
+            })
+        } else if meta.block_map_id.is_some() {
+            None
+        } else {
+            meta.block_prefix.as_ref().map(|p| ReadCustodyFp::Prefix {
+                prefix: p.clone(),
+                start,
+                epochs,
+            })
+        }
+    }
+
+    fn window(&self) -> (u32, usize) {
+        match self {
+            ReadCustodyFp::Map { start, epochs, .. }
+            | ReadCustodyFp::Prefix { start, epochs, .. } => (*start, epochs.len()),
+            ReadCustodyFp::Owned(v) => (v.first().map(|(b, _, _)| *b).unwrap_or(0), v.len()),
+        }
+    }
+
+    fn epoch(&self, i: usize) -> u64 {
+        match self {
+            ReadCustodyFp::Map { epochs, .. } | ReadCustodyFp::Prefix { epochs, .. } => epochs[i],
+            ReadCustodyFp::Owned(v) => v[i].2,
+        }
+    }
+
+    fn key(&self, i: usize) -> FpKeyRef<'_> {
+        match self {
+            ReadCustodyFp::Map { map, start, .. } => match map.get(&(start + i as u32)) {
+                Some(k) => FpKeyRef::Str(k),
+                None => FpKeyRef::Hole,
+            },
+            ReadCustodyFp::Prefix { prefix, start, .. } => {
+                FpKeyRef::Derived(prefix, start + i as u32)
+            }
+            ReadCustodyFp::Owned(v) => match &v[i].1 {
+                Some(k) => FpKeyRef::Str(k),
+                None => FpKeyRef::Hole,
+            },
+        }
+    }
+
+    /// Semantic equality over the covered window: per-block binding key
+    /// AND custody epoch. Pointer-equal map Arcs short-circuit the key
+    /// walk (the common no-movement case) — CoW publication makes pointer
+    /// equality a proof of content equality.
+    pub fn matches(&self, other: &ReadCustodyFp) -> bool {
+        let (sa, la) = self.window();
+        let (sb, lb) = other.window();
+        if sa != sb || la != lb {
+            return false;
+        }
+        let keys_known_equal = match (self, other) {
+            (ReadCustodyFp::Map { map: a, .. }, ReadCustodyFp::Map { map: b, .. }) => {
+                std::sync::Arc::ptr_eq(a, b)
+            }
+            (ReadCustodyFp::Prefix { prefix: a, .. }, ReadCustodyFp::Prefix { prefix: b, .. }) => {
+                a == b
+            }
+            _ => false,
+        };
+        for i in 0..la {
+            if self.epoch(i) != other.epoch(i) {
+                return false;
+            }
+            if !keys_known_equal && !self.key(i).eq(&other.key(i)) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// `Option` face of [`ReadCustodyFp::matches`] — `None` (no custody chain)
+/// only ever matches `None`, the old `Option<Vec<…>> ==` verdict.
+pub(crate) fn read_custody_fp_matches(
+    a: &Option<ReadCustodyFp>,
+    b: &Option<ReadCustodyFp>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.matches(y),
+        _ => false,
+    }
+}
+
 // ===========================================================================
 // RW1 write-path attribution rig (docs/design-random-small-writes.md PR RW1;
 // §5.3 W3 rig extension; §5.4 observability)
@@ -7194,34 +7365,58 @@ impl SqueezefsFilesystem {
     /// `None` = not a striped layout (no custody chain to fingerprint).
     /// Bindings ride the freshest RAM metadata entry (every block-map
     /// merge republishes it before retiring the superseded tier).
+    /// Build the read window's custody fingerprint (defense #3 of the
+    /// moving-custody protocol — see [`ReadCustodyFp`]). `meta`: an
+    /// in-hand RAM snapshot to build from (the handler's size-coherency
+    /// get — saves the second moka get + per-key clones the old builder
+    /// paid); `None` probes the cache fresh (the post-read side, which
+    /// must observe current authority). The anomalous map-id-without-map
+    /// shape falls back to the authoritative async resolve, exactly the
+    /// old builder's arm.
     async fn read_custody_fingerprint(
         &self,
+        meta: Option<&crate::routing::CachedMetadata>,
         file_path: &str,
         ino: u64,
         offset: u64,
         len: usize,
-    ) -> Option<Vec<(u32, Option<String>, u64)>> {
+    ) -> Option<ReadCustodyFp> {
         if len == 0 {
             return None;
         }
-        let meta = self.router.metadata_cache.get(&ino)?;
-        if meta.file_type != "striped" {
+        let fresh;
+        let m = match meta {
+            Some(m) => m,
+            None => {
+                fresh = self.router.metadata_cache.get(&ino)?;
+                &fresh
+            }
+        };
+        if m.file_type != "striped" {
             return None;
         }
         let block_size = self.router.block_size.load(Ordering::Relaxed);
+        if let Some(fp) = ReadCustodyFp::build_sync(m, ino, block_size, offset, len) {
+            return Some(fp);
+        }
+        if m.block_map_id.is_none() {
+            // No map, no map-id, no prefix: nothing to fingerprint (the
+            // old builder's load error → None arm).
+            return None;
+        }
         let start_block = (offset / block_size) as u32;
         let end_block = ((offset + len as u64 - 1) / block_size) as u32;
         let bindings = self
             .router
-            .load_striped_block_keys(file_path, &meta, start_block, end_block)
+            .load_striped_block_keys(file_path, m, start_block, end_block)
             .await
             .ok()?;
-        Some(
+        Some(ReadCustodyFp::Owned(
             bindings
                 .into_iter()
                 .map(|(b, key)| (b, key, block_custody_epoch(ino, b)))
                 .collect(),
-        )
+        ))
     }
 
     /// Publish a parked overlay into `active_block_buffers` — the mandated
@@ -9539,7 +9734,7 @@ impl Filesystem for SqueezefsFilesystem {
         // Must NOT hold the inode read lock across flush or backend I/O —
         // flush_single_active_block upgrades to write() and tokio RwLock is
         // not re-entrant (self-deadlock under multi-block / active-block reads).
-        let (file_size, active_hit) = {
+        let (file_size, active_hit, guard_meta) = {
             let _guard = lock.read().await;
 
             let mut file_size = if let Some((attr, _)) = self.attr_cache.get(&ino) {
@@ -9574,7 +9769,16 @@ impl Filesystem for SqueezefsFilesystem {
             // would observe a stale size (0 on a fresh file), return a short
             // read, and let the kernel cache zero pages — silent read-after-
             // write corruption.
-            if let Some(m) = self.router.metadata_cache.get(&ino) {
+            // Captured once and reused below (P2 per-op economy): the
+            // pre-read custody fingerprint and the router descent's first
+            // attempt both build from this snapshot instead of re-probing
+            // the cache — an older-than-instant snapshot is CONSERVATIVE
+            // for the fingerprint (movement since capture shows up as a
+            // post-side mismatch → one bounded retry; epoch monotonicity
+            // forbids ABA), and the router re-validates freshness before
+            // trusting the hint.
+            let guard_meta = self.router.metadata_cache.get(&ino);
+            if let Some(m) = &guard_meta {
                 file_size = m.size;
             }
 
@@ -9743,20 +9947,27 @@ impl Filesystem for SqueezefsFilesystem {
                         // to the normal backend read below.
                     }
                 }
-                (file_size, false)
+                (file_size, false, guard_meta)
             } else {
-                (file_size, true) // need flush of dirty active blocks first
+                (file_size, true, guard_meta) // need flush of dirty active blocks first
             }
         };
 
         let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
 
-        if active_hit {
+        let guard_meta = if active_hit {
             let fencing_token = self.dlm.get_fencing_token_ino(ino);
             let _ = self
                 .flush_active_blocks_with_retry(ino, fencing_token)
                 .await;
-        }
+            // The flush may have published bindings / retired overlays:
+            // re-snapshot so the pre-fingerprint and router hint see the
+            // post-flush layout (multi-block windows only — the hot
+            // single-block path never flushes here).
+            self.router.metadata_cache.get(&ino)
+        } else {
+            guard_meta
+        };
 
         let conn_guard = self.session_connection.load();
         let dest_addr = conn_guard
@@ -9790,20 +10001,25 @@ impl Filesystem for SqueezefsFilesystem {
         //     window; exhaustion serves the last compose (a racing read may
         //     legally serve any value current within its window).
         let mut bindings_before = self
-            .read_custody_fingerprint(&file_path, ino, offset, read_len)
+            .read_custody_fingerprint(guard_meta.as_ref(), &file_path, ino, offset, read_len)
             .await;
+        // The router's first attempt reuses the handler snapshot (one moka
+        // get + clone saved per read); retries re-resolve fresh — a retry
+        // IS the movement signal.
+        let mut meta_hint = guard_meta;
         let mut attempts = 0u32;
         let (data, backing) = loop {
             let pre_runs = self.capture_parked_runs(ino, offset, read_len);
 
             // Backend / cache read without holding the inode lock (readers
             // scale).
-            let read_future = self.router.read_file_range_zero_copy(
+            let read_future = self.router.read_file_range_zero_copy_with_meta(
                 &file_path,
                 offset,
                 read_len as u32,
                 dest_addr,
                 read_hint,
+                meta_hint.take(),
             );
             prof.mark_backend_start();
             let read_res = read_future.await;
@@ -9821,9 +10037,9 @@ impl Filesystem for SqueezefsFilesystem {
             let data = Self::apply_parked_runs(offset, data, &post_runs);
 
             let bindings_after = self
-                .read_custody_fingerprint(&file_path, ino, offset, read_len)
+                .read_custody_fingerprint(None, &file_path, ino, offset, read_len)
                 .await;
-            if bindings_after == bindings_before || attempts >= 4 {
+            if read_custody_fp_matches(&bindings_after, &bindings_before) || attempts >= 4 {
                 break (data, backing);
             }
             attempts += 1;

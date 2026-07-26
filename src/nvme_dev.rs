@@ -827,6 +827,18 @@ impl NvmeBlockDev {
         self.read_block_with_dest(offset, size, None).await
     }
 
+    /// Control-plane liveness read (the health worker's probe): same I/O
+    /// machinery as [`Self::read_block`] but **never counted in
+    /// `get_obj`** — that counter is the raw *data* device-read-op
+    /// counter (the churn detector, AGENTS.md), and a probe completing
+    /// behind queued data I/O at a nondeterministic point poisoned every
+    /// counter-window gate keyed on it (the 2026-07-26 one-extra-fetch
+    /// flake class, pinned in tests/backend_health_probe_tests.rs).
+    pub async fn probe_read_block(&self, offset: u64, size: usize) -> Result<bytes::Bytes> {
+        self.read_block_with_dest_inner(offset, size, None, false)
+            .await
+    }
+
     /// Read exactly `size` bytes at `offset` (exact-length contract, VL8
     /// item 5): on success the returned buffer holds `size` bytes of device
     /// data. Short/zero kernel completions (past-EOF on file-backed
@@ -837,6 +849,20 @@ impl NvmeBlockDev {
         offset: u64,
         size: usize,
         dest_addr: Option<u64>,
+    ) -> Result<bytes::Bytes> {
+        self.read_block_with_dest_inner(offset, size, dest_addr, true)
+            .await
+    }
+
+    /// The one read implementation behind [`Self::read_block_with_dest`]
+    /// (data reads — counted) and [`Self::probe_read_block`]
+    /// (control-plane probes — uncounted).
+    async fn read_block_with_dest_inner(
+        &self,
+        offset: u64,
+        size: usize,
+        dest_addr: Option<u64>,
+        count_in_get_obj: bool,
     ) -> Result<bytes::Bytes> {
         if dest_addr.is_none() && size > crate::cache::pool::ALIGNED_BUF_POOL.buf_size() {
             return Err(crate::error::SqueezefsError::InvalidOperation(format!(
@@ -902,9 +928,11 @@ impl NvmeBlockDev {
             }
         };
 
-        crate::fuse_client::METRICS
-            .get_obj
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count_in_get_obj {
+            crate::fuse_client::METRICS
+                .get_obj
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         Ok(res)
     }

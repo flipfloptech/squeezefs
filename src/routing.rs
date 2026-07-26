@@ -1507,7 +1507,13 @@ impl BackendRouter {
         _redis_url: String,
         _fs_name: String,
     ) {
-        let router = self.clone();
+        // `Weak`, deliberately (the checkpoint-task sentinel discipline —
+        // AGENTS "no leaked tasks"): a strong Arc here kept the router —
+        // and this 5 s probe loop — alive FOREVER after every caller
+        // dropped it. In-process that meant every dropped fixture/mount
+        // left an immortal worker probing its dead device each tick.
+        // Upgrading per tick lets the worker exit with its router.
+        let weak = std::sync::Arc::downgrade(self);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             // Per-backend probe hysteresis: only FAILURE_THRESHOLD consecutive
@@ -1517,6 +1523,9 @@ impl BackendRouter {
                 std::collections::HashMap::new();
             loop {
                 interval.tick().await;
+                let Some(router) = weak.upgrade() else {
+                    return; // router dropped: exit, leak nothing
+                };
 
                 // Probe the default slot under the legacy `backend_0` name
                 // only on bare routers: on real mounts the first volume's
@@ -1583,7 +1592,9 @@ pub async fn perform_device_health_check(
     // The probe shares the device's I/O lanes with real traffic: a timeout
     // means "busy", not "dead" — report it as inconclusive so saturation can
     // never flip a healthy backend offline (hysteresis in crate::health).
-    match tokio::time::timeout(Duration::from_secs(2), dev.read_block(0, 4096)).await {
+    // `probe_read_block`, deliberately: a liveness probe is control-plane
+    // and must never count in `get_obj` (the data churn detector).
+    match tokio::time::timeout(Duration::from_secs(2), dev.probe_read_block(0, 4096)).await {
         Ok(Ok(_)) => Probe::Ok,
         Ok(Err(e)) => {
             log::warn!(

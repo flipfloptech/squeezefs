@@ -724,12 +724,29 @@ impl KvMetaBackend {
             Ok(fd) => fd,
             Err(FlockOutcome::Held) => {
                 let holder = Self::probe_claim_best_effort(path).await;
-                return Err(KvError::Busy(format!(
-                    "{}: another squeezefs process holds the writer lock{} — concurrent \
-                     mounts of one metadata volume are refused (single-writer guard)",
-                    path.display(),
-                    holder_suffix(&holder),
-                )));
+                // Teardown-race absorption (2026-07-26): `drop`-without-
+                // `shutdown` releases the flock only when the LAST Arc
+                // dies, and the detached checkpoint / times-drain /
+                // conveyor pass tasks each pin an upgraded Arc for the
+                // duration of one pass — so an instant SAME-PROCESS
+                // reopen (remount paths, crash-equivalent drop→reopen)
+                // can find the flock held by a holder that is provably
+                // in teardown. When the on-volume claim names THIS
+                // process (pid + boot), wait the release out bounded; a
+                // genuinely live same-process double mount never
+                // releases and still refuses at the bound. Foreign
+                // holders (any other pid/boot) never wait.
+                match Self::await_same_process_teardown_flock(path, &holder).await {
+                    Some(fd) => fd,
+                    None => {
+                        return Err(KvError::Busy(format!(
+                            "{}: another squeezefs process holds the writer lock{} — concurrent \
+                             mounts of one metadata volume are refused (single-writer guard)",
+                            path.display(),
+                            holder_suffix(&holder),
+                        )));
+                    }
+                }
             }
             Err(FlockOutcome::Io(e)) => {
                 return Err(KvError::Io(crate::error::SqueezefsError::Io(e)));
@@ -2289,6 +2306,42 @@ impl KvMetaBackend {
             });
         }
         Ok(fd)
+    }
+
+    /// Layer A teardown-race absorption (2026-07-26; pinned by
+    /// `tests/mount_writer_guard_tests.rs::
+    /// test_reopen_waits_out_same_process_teardown_pin`): when the flock
+    /// holder's claim names THIS process (pid + boot) — a backend whose
+    /// last external `Arc` was dropped but whose struct is still pinned
+    /// by a mid-pass background task, OR a genuinely live same-process
+    /// double mount — poll the flock for a bounded window. A dying
+    /// holder frees it within one pass (ms-grade); a live one never does
+    /// and the caller falls back to the loud refusal. Returns the
+    /// acquired guard fd, or `None` (refuse) on any other holder, an
+    /// absent/unreadable claim, or bound expiry.
+    async fn await_same_process_teardown_flock(
+        path: &Path,
+        holder: &Option<(WriterClaim, u64)>,
+    ) -> Option<std::fs::File> {
+        /// Generous vs. the ms-grade pin (one checkpoint/conveyor pass);
+        /// a live same-process holder pays it once before the refusal.
+        const TEARDOWN_FLOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+        const POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+        let (claim, _) = holder.as_ref()?;
+        if claim.pid != std::process::id() || claim.boot != read_boot_id() {
+            return None; // foreign holder: refuse instantly (unchanged posture)
+        }
+        let deadline = std::time::Instant::now() + TEARDOWN_FLOCK_WAIT;
+        loop {
+            match Self::acquire_writer_flock(path) {
+                Ok(fd) => return Some(fd),
+                Err(FlockOutcome::Held) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(POLL).await;
+                }
+                Err(_) => return None,
+            }
+        }
     }
 
     /// Best-effort claim read for refusal messages only (a read-only probe

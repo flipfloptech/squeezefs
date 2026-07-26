@@ -683,7 +683,12 @@ async fn slot_completion_wakes_every_parked_waiter() {
 /// > 1 park cycle per op at 8).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn service_thread_stays_hot_between_back_to_back_ops() {
+    // Pin the window explicitly (the knob is read at service-thread
+    // start, inside this spawn): the mechanism under test is the
+    // time-based window, not the deployment default.
+    std::env::set_var("SQUEEZEFS_IPC_SPIN_US", "200");
     let (host, _dir, _f, session, binding) = sink_host("svc-hot", Arc::new(InstantSink));
+    std::env::remove_var("SQUEEZEFS_IPC_SPIN_US");
 
     // One op round trip, then a ~50 µs busy-wait gap — the fleet-spread
     // per-session inter-arrival shape (a 235 µs device staggers bursts;
@@ -795,6 +800,39 @@ async fn new_session_on_a_busy_thread_is_served_promptly() {
     stop.store(true, Ordering::Relaxed);
     streamer.join().expect("streamer thread");
     host.shutdown();
+}
+
+/// Host shutdown is prompt even with the §5.7 idle reaper armed: the
+/// reap thread parks on a `clamp(idle/4, 100ms, 5s)` tick and shutdown
+/// must cut that park short, not sleep it out under the join (the
+/// measured 2026-07-26 umount term: every interception mount paid a
+/// full 5 s reap-tick join on teardown).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_is_prompt_with_the_idle_reaper_armed() {
+    let cfg = IpcHostConfig {
+        socket_name: format!("sqz-il0-session-reapjoin-{}", std::process::id()),
+        socket_dir: None,
+        build_commit: TEST_COMMIT.to_string(),
+        allow_dev: false,
+        geometry: test_geometry(),
+        arena_cap_bytes: 64 * 1024 * 1024,
+        per_uid_session_cap: 8,
+        idle_secs: 3600, // reap tick clamps to its 5 s max
+        data_plane: true,
+        // SAFETY: getuid is trivially safe.
+        owner_uid: unsafe { libc::getuid() },
+    };
+    let host = IpcHost::spawn(cfg, Arc::new(InstantSink)).expect("host must spawn");
+    // Let the reap thread reach its park.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let start = std::time::Instant::now();
+    tokio::task::block_in_place(|| host.shutdown());
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "shutdown took {:?} — the reap thread's park must be cut short \
+         at join, not slept out",
+        start.elapsed()
+    );
 }
 
 // ---------------------------------------------------------------------------

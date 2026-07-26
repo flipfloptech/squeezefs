@@ -87,16 +87,27 @@ const NONCE_TTL: Duration = Duration::from_secs(60);
 const SERVICE_PARK_MAX: Duration = Duration::from_millis(5);
 
 /// Empty-pass spin window before a service thread parks (time-based —
-/// the §5.5.1 "spin → short wait" ladder's spin rung, restored). The
-/// former 64 bare `spin_loop` hints were sub-µs — smaller than ANY
-/// per-session inter-arrival gap once sessions spread across threads
-/// (13–55 µs on the 2026-07-26 fabric-rig shapes), so every burst paid
-/// a full doorbell park/wake cycle: the measured sessions inversion
-/// (svc voluntary context switches 32k → 394k /s from sessions=1 → 8
-/// at one offered load). 100 µs covers fleet-spread inter-arrival; the
-/// worst-case idle tax is one 100 µs spin per thread per idle onset,
-/// then the 5 ms-bounded parks resume.
-const SERVICE_SPIN_WINDOW: Duration = Duration::from_micros(100);
+/// the §5.5.1 "spin → short wait" ladder's spin rung, restored; knob
+/// `SQUEEZEFS_IPC_SPIN_US`, default 30). The former 64 bare `spin_loop`
+/// hints were sub-µs — smaller than ANY per-session inter-arrival gap
+/// once sessions spread across threads (13–55 µs on the 2026-07-26
+/// fabric-rig shapes), so every burst paid a full doorbell park/wake
+/// cycle: the measured sessions inversion (svc voluntary context
+/// switches 32k → 394k /s from sessions=1 → 8 at one offered load).
+/// The default is deliberately conservative: 30 µs covers dense
+/// per-session arrival without measurable CPU theft, while 100 µs —
+/// which buys ~3 % more on 16-process libaio fleets — cost the sync
+/// lane 22 % on the sizing rig (8 spinning service threads vs the
+/// tokio workers; evidence note §5). Fleets with no sync lanes can
+/// raise it.
+fn service_spin_window() -> Duration {
+    let us = std::env::var("SQUEEZEFS_IPC_SPIN_US")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30)
+        .clamp(0, 10_000);
+    Duration::from_micros(us)
+}
 
 /// IPC service-thread count (§5.5.1; knob
 /// `SQUEEZEFS_IPC_SERVICE_THREADS`, clamp 1..=64). Default scales with
@@ -857,6 +868,13 @@ impl IpcHost {
                 .lock()
                 .expect("thread registry mutex never poisons"),
         );
+        // Cut every `park_timeout` short (the reap thread's tick is up
+        // to 5 s — sleeping it out under the join added a flat 5 s to
+        // EVERY interception-mount umount). Doorbell futex parks are
+        // 5 ms-bounded and need no wake.
+        for t in &threads {
+            t.thread().unpark();
+        }
         for t in threads {
             let _ = t.join();
         }
@@ -1432,6 +1450,7 @@ impl IpcHost {
         let mut sessions: Vec<Arc<IpcSession>> = Vec::new();
         let mut seen_epoch = u64::MAX; // != any real epoch ⇒ first pass collects
         let mut last_progress = Instant::now();
+        let spin_window = service_spin_window();
         while !self.shutting_down.load(Ordering::SeqCst) {
             let epoch = self.session_epoch.load(Ordering::Acquire);
             if epoch != seen_epoch {
@@ -1462,7 +1481,7 @@ impl IpcHost {
                 last_progress = Instant::now();
                 continue;
             }
-            if last_progress.elapsed() < SERVICE_SPIN_WINDOW {
+            if last_progress.elapsed() < spin_window {
                 std::hint::spin_loop();
                 continue;
             }

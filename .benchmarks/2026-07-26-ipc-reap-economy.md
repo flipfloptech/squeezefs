@@ -3,9 +3,10 @@
 Branch `perf/ipc-reap-economy` (off dev lineage at `26fe3f9`). Commits:
 red `00914f7` (the event-driven reap contract), green `4fd1695`
 (aio_core / interpose / session / ipc_host), red `ec19290` (the
-service-thread spin-window contract), green `dac7d1a` + `3771a1c`
-(spin window + epoch-cached owned-session snapshot + SQUEEZEFS_IPC_SPIN_US
-+ prompt shutdown).
+service-thread spin-window contract), greens `dac7d1a` / `3771a1c` /
+`0e0488f` / `1508ea9` (spin window + epoch-cached owned-session
+snapshot + SQUEEZEFS_IPC_SPIN_US + prompt shutdown + deep-qd reap
+economy + the default-0 verdict).
 
 ## 0. Crash/resume record (honest)
 
@@ -130,7 +131,8 @@ had no time-based spin rung in the shipped code.
 
 - Time-based empty-pass spin window before parking, knob
   `SQUEEZEFS_IPC_SPIN_US` (clamp 0..=10000, read at service-thread
-  start), **default 30 µs — sized empirically, §5**.
+  start), **default 0 — an explicit fleet lever, not an ambient tax
+  (sizing verdict, §5–§6)**.
 - The drain hot pass is registry-mutex-free: service threads cache
   their owned set, re-collected only when `session_epoch` (bumped on
   admission/teardown, AFTER the map mutation) moves. Staleness bound
@@ -151,20 +153,112 @@ had no time-based spin rung in the shipped code.
 | 30 µs pure spin | 103k | 305k | 301k | 303k |
 | 20 µs pure spin | 105k | 305k | 297k | 301k |
 
-The conflict is structural: 8 service threads spinning 100 µs windows
-steal tokio-worker cores on daemon-CPU-heavy shapes (the sync lane);
+The conflict is structural: 8 service threads spinning wide windows
+steal runnable-tokio CPU on daemon-CPU-heavy shapes (the sync lane);
 yielding defers the doorbell pickup under queued load (the libaio
-fleet). **30 µs holds every shape at-or-above baseline** and takes the
-sessions-inversion churn out (s8: 295k → 303k, +2.7 %; parks no longer
-scale with sessions at dense arrival). Fleets with no sync lanes can
-raise the knob; the 100 µs row shows what it buys (+3 % on 16-process
-fleets) and what it costs.
+fleet); an adaptive density gate (spin only when serve-to-serve gaps
+fit the window) was tried and REVERTED — it flapped on the 28 µs
+fleet-arrival shapes (16-proc −4 %, s8 −5 %). **Verdict: default 0.**
+Every nonzero default bought its libaio-fleet gain by taxing the
+protected sync lane (−4 % at 20 µs, −22 % at 100 µs), while the
+counted §6 A/B shows the fleet wins that matter ship default-on from
+the event-driven reap + the epoch-cached snapshot alone. libaio-only
+fleets raise the knob (the 20–100 µs rows above price what it buys).
 
-## 6. A/B (final `3771a1c` pair vs baseline `26fe3f9` pair; medians of 3, 15 s rows, engagement exact on every il row)
+**Deep-qd reap sizing (client side, same discipline)**: fully
+event-parking the reap regressed t32qd32 −6 % — at qd32 saturation an
+event park costs a waitv cycle client-side plus one daemon
+`futex_wake` syscall PER COMPLETION (the WAITER bit), where the old
+ladder amortized several completions per wake, and 42 % of
+`futex_waitv` calls failed admission (EAGAIN). Fixes measured back:
+deep-pending sets (> `REAP_EVENT_PARK_MAX` = 24 in flight) batch on a
+50 µs bounded sleep (¼ the old ladder quantum, latency share bounded
+by depth) — t32qd32 recovered to baseline (342–358k); pure-ring merge
+passes skip the kernel `io_getevents` probe (was one wasted syscall
+per pass); `wait_any` pre-checks admission in userspace (deletes the
+EAGAIN syscalls); the pre-park done-scan is 4 sweeps, not 64 (2048
+cross-cacheline shm probes per empty pass at qd32). The sparse regime
+(qd ≤ 16 per ctx — the charter's tail territory) stays fully
+event-driven.
 
-<!-- FINAL TABLE INSERTED AFTER THE COUNTED RUN -->
+## 6. A/B (ship config `1508ea9` pair vs baseline `26fe3f9` pair; medians of 3, 15 s rows unless noted, engagement exact on every il row)
+
+The decisive pair ran **back-to-back in one session window** (baseline
+side 07:52, ship side 08:03 local) because the box drifts ~2 %
+downward within long sessions — the morning baseline side is also
+recorded where it differs. Kernel rows bracket the context (same
+binary class both sides).
+
+| Row | baseline `26fe3f9` | ship `1508ea9` | Δ |
+|---|---|---|---|
+| kernel t16 qd16 (context) | 349.0k | 357.5k | — |
+| il libaio t16 qd16, s4 | 292.7k (303.3/292.7/291.1) | **294.2k** (294.3/294.2/291.9) | ~flat |
+| il libaio t32 qd32, s4 (the field shape) | 334.2k (342.6/334.2/320.7) | **335.1k** (343.2/335.1/316.6) | ~flat IOPS; **completion avg 2.99→2.98 ms, max-lat class intact** |
+| 16-process fio libaio qd16 (one session/proc) | 284k (286/284/280), clat avg 893–912 µs | **289k** (295/289/276), clat avg 866–927 µs | +1.8 % |
+| il libaio t1 qd1 RTT | 3,696 IOPS / avg 269–273 µs | 3,634 IOPS / avg 273–277 µs | ~flat — **il per-op still beats kernel (307–327 µs) by ~35 µs** |
+| il sync t32 qd1 (protected psync-class row) | 100.6k (100.6/101.1/100.1) | 98.0k (98.4/96.8/98.0) | −2.6 %, inside the observed inter-session band for this row (96–108k across six mount sessions of identical sync-path code; the sync data path is untouched by this branch) |
+| **sessions sweep (10 s rows, t16 qd16)** s1 | 301.1k | **328.9k** | **+9.2 %** |
+| s2 | 296.2k | **304.8k** | +2.9 % |
+| s4 | 280.7k | **282.9k** | +0.8 % |
+| s8 | 267.4k | **274.9k** | **+2.8 %** |
+
+Intermediate counted sides (recorded for lineage, all 3-run medians):
+the reap-fix-only pair (`4fd1695`) cut il t32qd32 **max latency
+13.6 → 9.3 ms** and t16qd16 max 7.3 → 5.1 ms vs the morning baseline
+(the field's 783 ms max-latency class is exactly this park/wake-tail
+term); the w20-window side (`43a4668`+20 µs) traded sync −4 % for
+fleet +3 % and was rejected as a default.
+
+**What the charter asked vs what the boot delivered (honest)**: the
+84 % cold-firehose ratio did NOT close to ≥ 1.0 on this rig — il
+t16qd16 sits at 0.82–0.86× kernel on both sides; the two named
+residuals were real but their sum was worth single-digit percent plus
+the tail class, not the 16-point ratio. The remaining gap term is the
+per-op async-handoff/service path (kernel-lane clat 712–764 µs vs il
+854–927 µs at equal offered load ⇒ ~130 µs/op of daemon-side queueing
+the kernel transport does not pay); that is a different program item
+(per-op handoff cost), recorded in §7. Per-op (qd1) the shim beats the
+kernel path on every run of every side.
+
+**Warm fast-path unregressed** (constraint row, measured ×3 each):
+default interception mount (no ddt), 4 × 200 MiB warm set, elbencho
+sync t8 rand-4k 10 s — baseline 22.1k median (22.1/22.2/21.1) vs ship
+**23.0k** (23.0/24.7/21.6), serve mix comparable (~66k fast-path
+serves / ~138k handoffs per 204.8k ops both sides). The cold ddt rows
+above never touch the fast path by policy (`ipc_fast_path_serves`
+delta 0 on every ddt row).
+
+**Gates**: full cargo gate on the final commit — clippy `-D warnings`
++ fmt clean (both workspaces), `cargo doc --no-deps` clean, bench
+smoke green (all four bench binaries), loom 42/42 green
+(`tests/run_loom.sh`), `cargo test --all-features -- --test-threads=1`
+green across the suite EXCEPT two pre-existing failures that
+reproduce identically at the branch point `26fe3f9` (verified on the
+baseline worktree, untouched read-path surface):
+`hybrid_io_tests::escape_direct_device_true_is_device_true` and
+`read_tier_refetch_churn_tests::fetched_blocks_are_tier_visible_and_never_refetched`
+— both entered dev with the 2026-07-26 read-admission program and
+belong to it, recorded here so they are not silently inherited.
+Preload gate leg 1 (unprivileged) and leg 2 (root: mount parity +
+engagement, dup/close_range/lseek rows, notify delivery, foreign-netns
+rendezvous, fio/elbencho/libaio verify, **kill-9 soak ×5 and
+fork-kill-parent soak — zero residue**) both PASSED on the final
+binaries.
 
 ## 7. Found while sizing (recorded)
+
+- **OPEN: the residual cold-firehose term is per-op handoff cost, not
+  wake economy**: with the reap event-driven and the park churn gone,
+  il completion latency still runs ~130 µs/op above the kernel lane at
+  equal offered load (854–927 vs 712–764 µs clat). perf on the daemon
+  under the il row shows the cost spread across the async-handoff
+  path (`DataPlaneSink::enqueue_read` + tokio `schedule_task` +
+  `moka`/attr probes — §6 of the profile capture), i.e. one
+  spawned-task round trip per miss that the FUSE-over-uring path does
+  not pay per op. Next lever if the ratio matters: batched handoff
+  (drain N ring ops into one task) or sync-submit into the
+  `NvmeBlockDev` queue from the service thread — both pre-agreed
+  fallback shapes in design §5.5/§12.
 
 - **Umount promptness**: every interception-mount umount paid a flat
   ~5 s — `IpcHost::shutdown` joined the §5.7 reap thread without

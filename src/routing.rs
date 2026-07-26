@@ -1943,10 +1943,7 @@ impl AdmissionGovernor {
         }
     }
 
-    fn window(
-        cur: &std::sync::atomic::AtomicU64,
-        prev: &std::sync::atomic::AtomicU64,
-    ) -> u64 {
+    fn window(cur: &std::sync::atomic::AtomicU64, prev: &std::sync::atomic::AtomicU64) -> u64 {
         use std::sync::atomic::Ordering::Relaxed;
         cur.load(Relaxed).saturating_add(prev.load(Relaxed))
     }
@@ -1979,9 +1976,7 @@ impl AdmissionGovernor {
             .read_admission_wasted_bytes
             .fetch_add(waste, Relaxed);
         if *served_bytes == 0 {
-            METRICS
-                .read_admission_evicted_unhit
-                .fetch_add(1, Relaxed);
+            METRICS.read_admission_evicted_unhit.fetch_add(1, Relaxed);
         }
     }
 
@@ -1993,8 +1988,7 @@ impl AdmissionGovernor {
         self.roll();
         let admitted = Self::window(&self.admitted_cur, &self.admitted_prev);
         let wasted = Self::window(&self.wasted_cur, &self.wasted_prev);
-        let clamped =
-            wasted >= 2 * block_bytes.max(1) && wasted.saturating_mul(2) >= admitted;
+        let clamped = wasted >= 2 * block_bytes.max(1) && wasted.saturating_mul(2) >= admitted;
         self.clamped.store(clamped, Relaxed);
         if clamped {
             let foreground = Self::window(&self.foreground_cur, &self.foreground_prev);
@@ -4002,6 +3996,15 @@ impl DataRouter {
                 if ghost_hit
                     && crate::mem_budget::level() != crate::mem_budget::Level::Red
                     && !self.escalation_cooldown.recently_escalated(k)
+                    // Scan-resistance governor (2026-07-26): an escalation
+                    // is a whole-block admission FETCH — under the waste
+                    // clamp it must fit the fill budget or the read stays
+                    // a device-true ranged window read. Denials record NO
+                    // cooldown, so hot keys retry and win the trickle.
+                    && self
+                        .cache
+                        .admission_governor
+                        .allow_escalation(self.block_size.load(Ordering::Relaxed))
                 {
                     // Cooldown (churn bound, see EscalationCooldown): a
                     // key escalates at most once per ~32–64 s window —
@@ -4071,6 +4074,11 @@ impl DataRouter {
             METRICS
                 .ranged_read_bytes
                 .fetch_add(window as u64, Ordering::Relaxed);
+            // Scan-resistance governor: ranged window bytes are the
+            // workload's own device spend — the clamp's denominator.
+            // (Escalation fetches ride the whole-block path and never
+            // self-fund.)
+            self.cache.admission_governor.note_foreground(window as u64);
             if bounced {
                 METRICS
                     .ranged_read_unaligned_bounces
@@ -4975,7 +4983,9 @@ impl DataRouter {
         } else {
             format!("{}/part_{}", meta.block_prefix.as_ref()?, start_block)
         };
-        if let Some(hot) = self.cache.hot_block.get_no_promote(&b_key) {
+        // `get_serving`: real reader serve — credit the user bytes as
+        // admission payback (the governor's earned-vs-waste basis).
+        if let Some(hot) = self.cache.hot_block.get_serving(&b_key, read_len as u64) {
             let start = rel_s.min(hot.len());
             let end = rel_e.min(hot.len());
             METRICS.hot_block_hits.fetch_add(1, Ordering::Relaxed);
@@ -6612,7 +6622,12 @@ impl DataRouter {
                             // the serve. `Bytes` refcount hit; the reply
                             // slice is the only copy.
                             if let Some(b_key) = b_key_opt.as_ref().filter(|_| !device_true) {
-                                if let Some(hot) = self.cache.hot_block.get_no_promote(b_key) {
+                                // `get_serving`: real reader serve — credit
+                                // the user bytes as admission payback (the
+                                // governor's earned-vs-waste basis).
+                                if let Some(hot) =
+                                    self.cache.hot_block.get_serving(b_key, slice_len as u64)
+                                {
                                     let start = std::cmp::min(slice_start as usize, hot.len());
                                     let end = std::cmp::min(
                                         (slice_start + slice_len as u64) as usize,

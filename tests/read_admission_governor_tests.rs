@@ -436,6 +436,7 @@ fn min_shard_constructor_reduces_shards() {
         "128 MiB / 16 MiB min shard ⇒ ≤ 8 shards, got {}",
         c.num_shards()
     );
-    let tiny = squeezefs::cache::lru::LruCache::with_capacity_min_shard(1024 * 1024, 16 * 1024 * 1024);
+    let tiny =
+        squeezefs::cache::lru::LruCache::with_capacity_min_shard(1024 * 1024, 16 * 1024 * 1024);
     assert_eq!(tiny.num_shards(), 1, "min-shard floor never drops below 1");
 }

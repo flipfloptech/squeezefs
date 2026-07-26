@@ -126,7 +126,7 @@ impl TieredCache {
         // perpetual protected churn at 50 % budget fill: 6.1k whole-block
         // refetches / 20 s on a FITTING 64 MiB set). Keep per-shard
         // capacity ≥ 4 default blocks (16 MiB).
-        let hot_block = lru::LruCache::with_capacity(hot_budget)
+        let hot_block = lru::LruCache::with_capacity_min_shard(hot_budget, 16 * 1024 * 1024)
             .with_drop_probation_evictions()
             .with_admission_governor(admission_governor.clone());
 

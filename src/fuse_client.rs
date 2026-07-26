@@ -4061,6 +4061,7 @@ impl SqueezefsFilesystem {
                 "read_admission_evicted_unhit": METRICS.read_admission_evicted_unhit.load(Ordering::Relaxed),
                 "read_admission_wasted_bytes": METRICS.read_admission_wasted_bytes.load(Ordering::Relaxed),
                 "read_admission_governor_denials": METRICS.read_admission_governor_denials.load(Ordering::Relaxed),
+                "read_admission_governor_clamped": self.router.cache.admission_governor.clamped(),
                 "mem_budget_bytes": crate::mem_budget::MEM_BUDGET.budget_bytes(),
                 "mem_budget_pressure_bytes": crate::mem_budget::MEM_BUDGET.pressure_bytes(),
                 "mem_budget_gauge_sum_bytes": crate::mem_budget::MEM_BUDGET.gauge_sum_bytes(),

@@ -82,7 +82,9 @@ impl MemoryCacheShard {
             // Serve-site payback credit (admission governor): only real
             // reader serves pass a length; probes and residency checks
             // pass 0 and never inflate an entry's payback.
-            state.served_bytes.fetch_add(served_bytes, Ordering::Relaxed);
+            state
+                .served_bytes
+                .fetch_add(served_bytes, Ordering::Relaxed);
         }
         if promote {
             // Sticky promotion (§5.4): a block-level re-access marks the
@@ -229,9 +231,7 @@ impl MemoryCacheShard {
                                 // construction and could never classify.
                                 class = if state.protected.load(Ordering::Relaxed) {
                                     EvictClass::Protected {
-                                        served_bytes: state
-                                            .served_bytes
-                                            .load(Ordering::Relaxed),
+                                        served_bytes: state.served_bytes.load(Ordering::Relaxed),
                                     }
                                 } else {
                                     EvictClass::Probation

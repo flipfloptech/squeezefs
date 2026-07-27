@@ -2459,6 +2459,15 @@ pub struct Metrics {
     /// **0 except under real space pressure** — growth on a non-full
     /// volume means the background reclaimer is not keeping up.
     pub block_free_reclaim_sync_drains: Align64<AtomicU64>,
+    /// Reclaim entries dropped-without-finish_free because the writer
+    /// guard fenced / the volume fail-stopped (the D0 `failed` latch —
+    /// contract 6): a fenced zombie must never issue destructive device
+    /// commands, so the entries' space return passes to the successor
+    /// writer's recovery (un-returned thin space, re-covered on reuse —
+    /// the kill-9 posture). **0 on healthy mounts**; any growth means
+    /// this daemon was fenced — always investigate alongside
+    /// `writer_guard_fenced`.
+    pub block_free_reclaim_fence_halts: Align64<AtomicU64>,
     /// Seed-time memset bytes elided by §5.3 coverage tracking: for every
     /// Fresh accumulation buffer reaching content-validity, the block size
     /// minus the complement bytes actually zeroed. Sequential fills elide
@@ -4556,6 +4565,7 @@ impl SqueezefsFilesystem {
                 "block_free_reclaim_queue_bytes": METRICS.block_free_reclaim_queue_bytes.load(Ordering::Relaxed),
                 "block_free_reclaim_batches": METRICS.block_free_reclaim_batches.load(Ordering::Relaxed),
                 "block_free_reclaim_sync_drains": METRICS.block_free_reclaim_sync_drains.load(Ordering::Relaxed),
+                "block_free_reclaim_fence_halts": METRICS.block_free_reclaim_fence_halts.load(Ordering::Relaxed),
                 // RW1 rand-write device-byte ledger (design-random-small-
                 // writes §1.2 buckets; always-on — the G-RW2 gate's
                 // attribution source).

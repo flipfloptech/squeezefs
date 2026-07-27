@@ -73,6 +73,7 @@ use squeezefs::block_allocator::{BlockAllocator, CHUNK_SIZE};
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::{SqueezefsFilesystem, METRICS};
+use squeezefs::meta_backend::Metadata;
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::{BackendRouter, DataRouter};
 use std::process::{Command, Stdio};
@@ -483,26 +484,40 @@ async fn open_v3_meta(
         .expect("open v3 meta volume")
 }
 
-/// Drive the REAL D0 fail-stop: poison the meta backing (chmod 000 — the
-/// next `uring_fs::fdatasync` open fails) and run `JOURNAL_FAILURE_LATCH`
-/// (= 3) consecutive durability barriers. This latches the SAME `failed`
-/// state a fenced holder's reservation-conflict barrier latches
-/// immediately (`note_barrier_failure` — the signal `disabled_volumes`
-/// mirrors and `check_volume_enabled` consults). No test-only backdoor.
-async fn fence_meta_volume(
-    routed: &squeezefs::meta_backend::RoutedMetaBackend,
-    meta_path: &std::path::Path,
-) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(meta_path, std::fs::Permissions::from_mode(0o000))
-        .expect("poison meta backing");
-    for _ in 0..3 {
-        let _ = routed.volumes[0].sync_device().await;
+/// The journal-head physical offset (the crash_kill_tests helper, verbatim).
+fn journal_physical_offset(
+    be: &squeezefs::meta_backend::kv::backend::KvMetaBackend,
+    pos: u64,
+) -> u64 {
+    let geo = *be.journal_ring().core().geometry();
+    be.superblock().journal.start + geo.page_index(pos) * 4096 + 24 + geo.in_page_off(pos)
+}
+
+/// Drive the REAL D0 fail-stop through the sanctioned `uring_fs` fault
+/// harness (the exact recipe of crash_kill_tests::
+/// `test_repeated_journal_failures_escalate_to_disabled_volume`): a torn
+/// write at the journal head poisons the path — every subsequent request
+/// fails EIO ("device died") — and repeated journal failures latch the
+/// SAME `failed` state a fenced holder's reservation-conflict barrier
+/// latches immediately (the signal `disabled_volumes` mirrors and
+/// `check_volume_enabled` consults). No test-only backdoor.
+async fn fence_meta_volume(routed: &squeezefs::meta_backend::RoutedMetaBackend) {
+    let be = &routed.volumes[0];
+    let head = be.journal_ring().core().head();
+    squeezefs::uring_fs::arm_torn_write(journal_physical_offset(be, head), 0);
+    for i in 0..8 {
+        let _ = routed
+            .create(1, &format!("fence-{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await;
+        if be.is_failed() {
+            break;
+        }
     }
+    squeezefs::uring_fs::clear_faults();
     assert!(
-        routed.volumes[0].is_failed(),
-        "harness premise: three failed durability barriers must latch the \
-         volume failed (the journal-barrier fail-stop rung)"
+        be.is_failed(),
+        "harness premise: repeated journal write failures must latch the \
+         volume failed (the §4.4 pt 4 rung the fence probe consults)"
     );
 }
 
@@ -527,7 +542,7 @@ async fn fenced_guard_halts_worker_batch_reclaims() {
         offsets.push(o);
     }
 
-    fence_meta_volume(&routed, m.path()).await;
+    fence_meta_volume(&routed).await;
 
     let (p0, d0, s0, f0, qb0) = (
         punches(),
@@ -582,7 +597,7 @@ async fn fenced_guard_halts_sync_drain_and_enospc_valve() {
         offsets.push(o);
     }
 
-    fence_meta_volume(&routed, m.path()).await;
+    fence_meta_volume(&routed).await;
 
     let (p0, d0, s0, f0, sd0, qb0) = (
         punches(),

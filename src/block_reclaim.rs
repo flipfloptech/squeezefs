@@ -93,6 +93,18 @@ pub struct ReclaimQueue {
     processing: AtomicU64,
     notify: Arc<tokio::sync::Notify>,
     worker_armed: AtomicBool,
+    /// The writer-guard fence probe (`tests/async_block_reclaim_tests.rs`
+    /// contract 6): returns `true` when any volume of this mount's meta
+    /// set has latched the D0 fail-stop `failed` state — the SAME signal
+    /// the journal-barrier escalation sets (`KvMetaBackend::is_failed`,
+    /// what `disabled_volumes` mirrors). Wired by
+    /// `DataRouter::set_meta_backend`; bare routers (no meta set) have no
+    /// probe and never halt.
+    fence_signal: std::sync::OnceLock<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Sticky fence halt: once the probe fires, device reclaims cease
+    /// PERMANENTLY for this queue (a fenced holder is dead until remount
+    /// — `failed` never clears in-process).
+    halted: AtomicBool,
     batch_blocks: u64,
     batch_ms: u64,
     max_queued: u64,
@@ -106,10 +118,45 @@ impl ReclaimQueue {
             processing: AtomicU64::new(0),
             notify: Arc::new(tokio::sync::Notify::new()),
             worker_armed: AtomicBool::new(false),
+            fence_signal: std::sync::OnceLock::new(),
+            halted: AtomicBool::new(false),
             batch_blocks: env_u64("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", 64, 1, 1024),
             batch_ms: env_u64("SQUEEZEFS_RECLAIM_BATCH_MS", 2, 0, 600_000),
             max_queued: env_u64("SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS", 4096, 1, 1 << 20),
         })
+    }
+
+    /// Wire the writer-guard fence probe (see the field doc). Set once at
+    /// meta-backend wiring; later calls are no-ops.
+    pub fn set_fence_signal(&self, sig: Arc<dyn Fn() -> bool + Send + Sync>) {
+        let _ = self.fence_signal.set(sig);
+    }
+
+    /// `true` ⇔ device reclaims are (now) fence-halted. Evaluated once
+    /// per batch and by the ENOSPC valve — one atomic load when already
+    /// halted, one cheap probe (a few atomic loads over the meta set)
+    /// otherwise. Latches sticky and loud on the first observation.
+    pub(crate) fn fence_halted(&self) -> bool {
+        if self.halted.load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(sig) = self.fence_signal.get() else {
+            return false;
+        };
+        if sig() {
+            if !self.halted.swap(true, Ordering::AcqRel) {
+                log::error!(
+                    "block-reclaim: writer guard fenced / volume fail-stopped — ceasing \
+                     ALL device reclaims permanently (a fenced zombie's discard can land \
+                     on offsets the successor writer has reallocated); queued entries are \
+                     dropped WITHOUT finish_free — the successor's recovery owns the \
+                     accounting (un-returned thin space, re-covered on reuse; counted in \
+                     block_free_reclaim_fence_halts)"
+                );
+            }
+            return true;
+        }
+        false
     }
 
     /// Queue one terminal free's reclaim. Past the bounded-memory cap the
@@ -285,6 +332,23 @@ impl ReclaimQueue {
             remaining: entries.len(),
             bytes_remaining: entries.iter().map(|e| e.size).sum(),
         };
+
+        // Fence check ONCE per batch, before any device command (contract
+        // 6): a fenced holder must never issue destructive device I/O —
+        // on detection-grade (non-PR) substrates a zombie's discard can
+        // destroy the successor writer's reallocated blocks. Halted
+        // entries drop here WITHOUT finish_free (the successor's journal
+        // replay/recovery walk owns the accounting — the same posture as
+        // the kill-9 crash story: un-returned thin space, re-covered on
+        // reuse); the batch guard reconciles `processing` + the byte
+        // gauge, and the entries' in-flight registrations deregister on
+        // drop.
+        if self.fence_halted() {
+            METRICS
+                .block_free_reclaim_fence_halts
+                .fetch_add(entries.len() as u64, Ordering::Relaxed);
+            return;
+        }
 
         let mut by_dev: BTreeMap<String, Vec<ReclaimEntry>> = BTreeMap::new();
         for e in entries {

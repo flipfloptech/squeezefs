@@ -647,11 +647,27 @@ impl BackendRouter {
     ) {
         let rq = reclaim.clone();
         allocator.set_space_pressure_valve(std::sync::Arc::new(move || {
+            // Contract 6: a fenced daemon must not sync-drain — the
+            // queued entries' finish_free belongs to the successor
+            // writer's recovery now; allocation just fails StorageFull
+            // (this daemon is dead until remount anyway).
+            if rq.fence_halted() {
+                return;
+            }
             METRICS
                 .block_free_reclaim_sync_drains
                 .fetch_add(1, Ordering::Relaxed);
             rq.drain_sync();
         }));
+    }
+
+    /// Wire the writer-guard fence probe into the reclaim queue
+    /// (contract 6, `tests/async_block_reclaim_tests.rs`): called by
+    /// `DataRouter::set_meta_backend` with a probe over the mount's meta
+    /// set. Once any volume latches the D0 fail-stop `failed` state, the
+    /// queue ceases all device reclaims permanently.
+    pub fn set_reclaim_fence_signal(&self, sig: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {
+        self.reclaim.set_fence_signal(sig);
     }
 
     /// Drain the background reclaim queue to empty (blocking work runs on
@@ -2623,6 +2639,21 @@ impl DataRouter {
         &self,
         meta_backend: std::sync::Arc<crate::meta_backend::RoutedMetaBackend>,
     ) {
+        // Contract 6 (tests/async_block_reclaim_tests.rs): the reclaim
+        // queue observes the SAME per-volume `failed` latch the
+        // journal-barrier fail-stop escalation sets (what
+        // `disabled_volumes` mirrors) — a fenced holder must never keep
+        // issuing destructive discards from the blocking pool. Weak: the
+        // probe must not extend the meta set's lifetime through the
+        // router (a dropped backend reads as not-fenced, which is the
+        // process-teardown shape).
+        let weak = std::sync::Arc::downgrade(&meta_backend);
+        self.backend_router
+            .set_reclaim_fence_signal(std::sync::Arc::new(move || {
+                weak.upgrade()
+                    .map(|mb| mb.volumes.iter().any(|v| v.is_failed()))
+                    .unwrap_or(false)
+            }));
         let _ = self.inner.meta_backend.set(meta_backend);
     }
 

@@ -6048,13 +6048,69 @@ impl SqueezefsFilesystem {
             // applied synchronously, and authority transfers
             // STAGE-THEN-REMOVE so there is no window where neither copy
             // is readable.
-            let deferred = match self.active_block_buffers.get(&key) {
-                Some(entry) => entry.value().seed_deferred(),
+            let (deferred, complete) = match self.active_block_buffers.get(&key) {
+                Some(entry) => {
+                    let v = entry.value();
+                    (
+                        v.seed_deferred(),
+                        !v.is_extent_repr() && v.is_content_valid() && !v.seed_deferred(),
+                    )
+                }
                 None => {
                     drop(block_guard);
                     continue;
                 }
             };
+            if complete {
+                // Flush write-through leg (2026-07-27 write-pipeline-depth
+                // campaign, T5): coverage-complete parked custody — the
+                // pipe-blocked block this fsync just stole from a detached
+                // upload, or a never-lossy write-through-fallback park —
+                // rides ONE durable upload, never the staging + writeback
+                // detour (the parked-straggler RMW pipeline RW3b killed).
+                // Either racer (detached task / this flush) uploads it
+                // exactly once: retire-under-the-block-lock is the
+                // arbiter. Fence = custody dropped + propagate (a fenced
+                // writer must not publish anywhere); transient failure
+                // falls THROUGH to the staging leg below — fsync's
+                // durability bar owns the escalation ladder, unlike the
+                // write path's keep-parked posture.
+                let snapshot = self
+                    .active_block_buffers
+                    .get(&key)
+                    .expect("parked entry cannot vanish under the held block lock")
+                    .value()
+                    .snapshot();
+                match self
+                    .upload_full_block(ino, b, snapshot, fencing_token)
+                    .await
+                {
+                    Ok(()) => {
+                        self.retire_parked_overlay(&key);
+                        METRICS.write_through_blocks.fetch_add(1, Ordering::Relaxed);
+                        METRICS.write_through_bytes.fetch_add(
+                            self.router.block_size.load(Ordering::Relaxed),
+                            Ordering::Relaxed,
+                        );
+                        drop(block_guard);
+                        continue;
+                    }
+                    Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
+                        self.retire_parked_overlay(&key);
+                        drop(block_guard);
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        METRICS
+                            .write_through_fallbacks
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "flush write-through failed for ino {ino} block {b} ({e:?}); \
+                             degrading to the staging leg (fsync durability bar)"
+                        );
+                    }
+                }
+            }
             if deferred {
                 // Item B stage exit: the unwritten complement owes old
                 // bytes — never zeros. A failed fetch propagates with the
@@ -8462,13 +8518,71 @@ impl SqueezefsFilesystem {
             // await here too — teardown races the last reads/FORGETs, and
             // the same transparency rules apply (see
             // flush_memory_buffers_for_inode).
-            let deferred = match self.active_block_buffers.get(&key) {
-                Some(entry) => entry.value().seed_deferred(),
+            let (deferred, complete) = match self.active_block_buffers.get(&key) {
+                Some(entry) => {
+                    let v = entry.value();
+                    (
+                        v.seed_deferred(),
+                        !v.is_extent_repr() && v.is_content_valid() && !v.seed_deferred(),
+                    )
+                }
                 None => {
                     drop(block_guard);
                     continue;
                 }
             };
+            if complete {
+                // Teardown write-through leg (2026-07-27 campaign, same
+                // law as the fsync pass): coverage-complete parked custody
+                // uploads durably ONCE — no staging + writeback detour on
+                // the way out. A fencing expiry drops custody loudly (the
+                // remount law: a superseded era publishes nowhere;
+                // unfsynced loss is D0-legal at teardown); a transient
+                // failure falls through to the staging leg, whose durable
+                // escalation already owns the never-strand-dirty-RAM bar.
+                let fencing_token = self.dlm.get_fencing_token_ino(ino);
+                let snapshot = self
+                    .active_block_buffers
+                    .get(&key)
+                    .expect("parked entry cannot vanish under the held block lock")
+                    .value()
+                    .snapshot();
+                match self
+                    .upload_full_block(ino, b, snapshot, fencing_token)
+                    .await
+                {
+                    Ok(()) => {
+                        self.retire_parked_overlay(&key);
+                        METRICS.write_through_blocks.fetch_add(1, Ordering::Relaxed);
+                        METRICS.write_through_bytes.fetch_add(
+                            self.router.block_size.load(Ordering::Relaxed),
+                            Ordering::Relaxed,
+                        );
+                        drop(block_guard);
+                        continue;
+                    }
+                    Err(SqueezefsError::FencingTokenExpired { token, expected }) => {
+                        error!(
+                            "dismount: write-through for ino {ino} block {b} fenced \
+                             (token {token}, expected {expected}): custody dropped \
+                             (the remount law — a superseded writer era publishes \
+                             nowhere)"
+                        );
+                        self.retire_parked_overlay(&key);
+                        drop(block_guard);
+                        continue;
+                    }
+                    Err(e) => {
+                        METRICS
+                            .write_through_fallbacks
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "dismount write-through failed for ino {ino} block {b} \
+                             ({e:?}); degrading to the staging leg"
+                        );
+                    }
+                }
+            }
             if deferred {
                 // Item B teardown exit: on a failed fetch SKIP this buffer
                 // (unfsynced loss is D0-legal; staging a zeros-codified

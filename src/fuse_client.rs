@@ -1780,52 +1780,61 @@ fn sever_payload(data: &bytes::Bytes) -> bytes::Bytes {
     bytes::Bytes::copy_from_slice(data)
 }
 
-struct ThreadLocalState {
-    count: u64,
-    target: *const AtomicU64,
+/// Stripe count for [`ShardedAtomic`]: covers the possible-CPU-sized
+/// handler-lane population with mostly-private cache lines (collisions
+/// above 64 live threads stay exact, just occasionally shared).
+const SHARDED_ATOMIC_STRIPES: usize = 64;
+
+/// Exact, contention-striped counter for hot per-op metrics.
+///
+/// Replaces the retired `ProbabilisticAtomic` (per-thread 128-increment
+/// batches, flushed only at thread death): daemon handler lanes live
+/// forever, so up to `lanes × 127` counts sat invisible across every
+/// stats snapshot — a ±4k, 128-quantum band on row deltas that
+/// manufactured the OQ-1 "overwrite issues 2× the FUSE ops" ghost
+/// (kernel-side `fuse_request_send` hists were identical while
+/// `fuse_ops` read 31×128 vs 62×128;
+/// `.benchmarks/2026-07-27-oq1-overwrite-op-economy.md`). Stats rows
+/// need exact deltas: each thread owns a round-robin-assigned stripe
+/// (one uncontended relaxed RMW per op, no cross-lane cache-line
+/// bouncing), and `load` sums the stripes.
+pub struct ShardedAtomic {
+    stripes: [Align64<AtomicU64>; SHARDED_ATOMIC_STRIPES],
 }
 
-impl Drop for ThreadLocalState {
-    fn drop(&mut self) {
-        if self.count > 0 && !self.target.is_null() {
-            unsafe {
-                (*self.target).fetch_add(self.count, Ordering::Relaxed);
-            }
+impl Default for ShardedAtomic {
+    fn default() -> Self {
+        Self {
+            stripes: std::array::from_fn(|_| Align64(AtomicU64::new(0))),
         }
     }
 }
 
-#[derive(Default)]
-pub struct ProbabilisticAtomic {
-    inner: AtomicU64,
-}
-
-impl ProbabilisticAtomic {
-    pub fn fetch_add(&self, val: u64, order: Ordering) -> u64 {
+impl ShardedAtomic {
+    /// The calling thread's stripe index: assigned round-robin on first
+    /// use, cached in a thread-local (one relaxed global RMW per thread
+    /// lifetime, then a plain TLS read per op).
+    fn stripe_index() -> usize {
         thread_local! {
-            static STATE: std::cell::RefCell<ThreadLocalState> = std::cell::RefCell::new(ThreadLocalState {
-                count: 0,
-                target: std::ptr::null(),
-            });
+            static STRIPE: usize = {
+                static NEXT: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                NEXT.fetch_add(1, Ordering::Relaxed) % SHARDED_ATOMIC_STRIPES
+            };
         }
-        STATE.with(|s| {
-            let mut state = s.borrow_mut();
-            if state.target.is_null() {
-                state.target = &self.inner as *const AtomicU64;
-            }
-            state.count += val;
-            if state.count >= 128 {
-                let to_add = state.count;
-                state.count = 0;
-                self.inner.fetch_add(to_add, order)
-            } else {
-                self.inner.load(order)
-            }
-        })
+        STRIPE.with(|s| *s)
     }
 
+    pub fn fetch_add(&self, val: u64, order: Ordering) {
+        self.stripes[Self::stripe_index()].fetch_add(val, order);
+    }
+
+    /// Sum of all stripes. Relaxed per-stripe loads: exact for counts
+    /// that happened-before the read (the stats-snapshot contract);
+    /// concurrent increments may or may not be included, as with any
+    /// single atomic.
     pub fn load(&self, order: Ordering) -> u64 {
-        self.inner.load(order)
+        self.stripes.iter().map(|s| s.load(order)).sum()
     }
 }
 
@@ -1978,7 +1987,7 @@ impl QueueDepthHistogram {
 /// Process-wide counters (P3-1). All updates are `Relaxed` atomics — no locks on the hot path.
 #[derive(Default)]
 pub struct Metrics {
-    pub fuse_ops: Align64<ProbabilisticAtomic>,
+    pub fuse_ops: ShardedAtomic,
     /// D1.b watchdog (design-metadata-throughput §9): in-flight ops
     /// observed past `SQUEEZEFS_TIMEOUT` by the watchdog scan — one count
     /// per scan per overdue op (was: silent per-op ETIMEDOUT synthesis).

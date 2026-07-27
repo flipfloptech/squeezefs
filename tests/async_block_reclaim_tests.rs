@@ -66,9 +66,49 @@
 //! synchronously inside the free window and none of the
 //! `block_free_reclaim_{queued,queue_bytes,batches,sync_drains}` family
 //! exists.
+//!
+//! ## Field ledger inversion (2026-07-27, three-session matrix) — contracts 7–9
+//!
+//! The user's 4-node NVMe-oF/TCP cluster (zram-lz4 data targets, dev tip
+//! 78b9498) produced a three-session ledger the suite above never could:
+//! at fill 1.0 a full rewrite showed `queued=0, batches=0, discards=0`
+//! with `sync_drains=67,376` (≈ per allocation, climbing even idle-ish);
+//! at fill 0.62 the engine engaged (queued +49,278, discards +56,615) but
+//! `sync_drains` STILL ran ≈ 1 per allocation and the rewrite paid −33 %.
+//! Root causes pinned by contracts 7–9 (red against dev `78b9498`):
+//!
+//! 7. **Free-list claim must survive the lost race** (`sync_drains == 0`
+//!    at headroom): `try_allocate_block` read ONE free-list head and, on
+//!    losing the `DashSet::remove` race, fell to `next_fresh_block()` —
+//!    which refuses `StorageFull` on any cursor-at-cap store (any store
+//!    that has EVER been full; `highest_block` never shrinks). Every lost
+//!    race fired the ENOSPC valve: a counted `sync_drains` bump plus a
+//!    SYNCHRONOUS whole-queue discard drain on the write path (the −33 %
+//!    rewrite tax), at ANY fill. The claim loop must retry the next
+//!    candidate until the list is observed empty.
+//! 8. **The valve counts only genuine engagement**: a drain that found
+//!    the queue empty (nothing to reclaim — the fill-1.0 idle climb) must
+//!    NOT increment `block_free_reclaim_sync_drains`; the counter means
+//!    "queued space was force-reclaimed for an allocation", nothing else.
+//! 9. **Brim rewrites are space-neutral and must converge**: CoW
+//!    allocate-before-free can never succeed at fill 1.0, and the
+//!    never-lossy staging fallback silently turned a full store into an
+//!    unbounded writeback spiral (zero enqueues, zero device commands,
+//!    unbounded valve counts — the session-A ledger). A full-block
+//!    overwrite of a sole-owned, undecorated, passthrough striped mapping
+//!    must instead rewrite IN PLACE (the W1 incarnation fence, whole-block
+//!    face): no allocation, no free, no staging detour — counted in
+//!    `write_through_inplace_rewrites` — while genuine frees at the brim
+//!    (rm/truncate) still ride the queue with device commands.
+//!
+//! Contracts 7–9 go through the REAL striped write path (fs.create /
+//! fs.write / fs.setattr — the write-through + displacement machinery),
+//! never a hand-armed queue: the fidelity gap that let the original suite
+//! stay green while the field disengaged.
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
+use fuse3::SetAttr;
 use squeezefs::block_allocator::{BlockAllocator, CHUNK_SIZE};
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
@@ -885,4 +925,553 @@ async fn kill9_with_queued_discards_leaves_recoverable_volume() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Contracts 7–9 — the field ledger inversion (2026-07-27 three-session
+// matrix). REAL striped write path: fs.create / fs.write / fs.setattr.
+// ---------------------------------------------------------------------------
+
+/// Real-path harness (the write_through_tests fixture shape): file-backed
+/// data volume + v3 meta backend, so fs.create/fs.write drive the actual
+/// striped write-through / displacement machinery.
+struct FieldH {
+    fs: Arc<SqueezefsFilesystem>,
+    req: Request,
+    ba: Arc<BlockAllocator>,
+    backing: NamedTempFile,
+    _m: NamedTempFile,
+    _s: tempfile::TempDir,
+}
+
+/// Block size of the real-path harness (`SQUEEZEFS_DEFAULT_BLOCK_SIZE`).
+const FBS: u64 = 4096;
+
+/// RAII lever: force the W1 patch OFF (the sanctioned §6 A/B knob) so
+/// full-block overwrites exercise the CoW displacement path under test —
+/// the field's 4 MiB-block shape, where every write is patch-oversize.
+struct PatchOff(u64);
+impl PatchOff {
+    fn arm() -> Self {
+        let prev = squeezefs::fuse_client::patch_max_bytes();
+        squeezefs::fuse_client::set_patch_max_bytes(0);
+        Self(prev)
+    }
+}
+impl Drop for PatchOff {
+    fn drop(&mut self) {
+        squeezefs::fuse_client::set_patch_max_bytes(self.0);
+    }
+}
+
+async fn make_field_harness(test_id: &str) -> FieldH {
+    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", &FBS.to_string());
+    let dlm = DlmClient::new("local").unwrap();
+    let backing = NamedTempFile::new().unwrap();
+    std::fs::File::create(backing.path())
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
+    let ba = Arc::new(
+        BlockAllocator::new(dlm.meta_client().clone(), test_id)
+            .await
+            .unwrap(),
+    );
+    let s = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![s.path().to_path_buf()],
+        Some("32MB"),
+        Some("32MB"),
+        Some("64MB"),
+        Some("64MB"),
+        dlm.meta_client().clone(),
+        ba.clone(),
+        nvme.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = DataRouter::new(dlm.clone(), cache, ba.clone(), nvme);
+    let mut fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+
+    let m = NamedTempFile::new().unwrap();
+    let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
+        open_v3_meta(m.path(), 128 * 1024 * 1024).await,
+    ]));
+    fs.router.set_meta_backend(routed.clone());
+    fs.meta_backend = Some(routed);
+
+    let req = Request {
+        unique: 1,
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
+        pid: 1,
+    };
+    FieldH {
+        fs: Arc::new(fs),
+        req,
+        ba,
+        backing,
+        _m: m,
+        _s: s,
+    }
+}
+
+async fn field_create(h: &FieldH, name: &str) -> u64 {
+    h.fs
+        .create(
+            h.req,
+            1,
+            std::ffi::OsStr::new(name),
+            libc::S_IFREG | 0o644,
+            0,
+        )
+        .await
+        .unwrap()
+        .attr
+        .ino
+}
+
+async fn field_write(fs: &SqueezefsFilesystem, req: Request, ino: u64, off: u64, data: &[u8]) {
+    let w = fs
+        .write(req, ino, 0, off, bytes::Bytes::copy_from_slice(data), 0, 0)
+        .await
+        .unwrap_or_else(|e| panic!("write ino {ino} off {off} failed: {e:?}"));
+    assert_eq!(w.written as usize, data.len(), "short write at {off}");
+}
+
+async fn field_read(h: &FieldH, ino: u64, off: u64, size: u32) -> Vec<u8> {
+    h.fs
+        .read(h.req, ino, 0, off, size, 0)
+        .await
+        .unwrap_or_else(|e| panic!("read ino {ino} off {off} failed: {e:?}"))
+        .data
+        .to_vec()
+}
+
+fn field_pattern(len: usize, seed: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| ((i as u64 * 7 + seed as u64) % 251) as u8)
+        .collect()
+}
+
+/// Fresh striped file of `blocks` full blocks (one big first write — the
+/// fresh-file direct striped route; asserts the striped premise).
+async fn field_make_striped(h: &FieldH, name: &str, blocks: u64, seed: u8) -> u64 {
+    let ino = field_create(h, name).await;
+    let p = field_pattern((blocks * FBS) as usize, seed);
+    field_write(&h.fs, h.req, ino, 0, &p).await;
+    let path = squeezefs::keys::inode_path(ino);
+    h.fs.router.metadata_cache.remove(&ino);
+    let meta = h.fs.router.fetch_metadata(&path).await.unwrap();
+    assert_eq!(
+        meta.file_type, "striped",
+        "premise: fresh {blocks}-block file must be striped"
+    );
+    assert_eq!(
+        meta.block_map.as_ref().map(|m| m.len()).unwrap_or(0),
+        blocks as usize,
+        "premise: every block mapped"
+    );
+    ino
+}
+
+/// Truncate to zero through the real setattr path: every mapped block is
+/// a terminal free riding the displacement/free machinery.
+async fn field_truncate_zero(h: &FieldH, ino: u64) {
+    h.fs
+        .setattr(
+            h.req,
+            ino,
+            None,
+            SetAttr {
+                size: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("truncate to zero");
+}
+
+fn batches() -> u64 {
+    METRICS
+        .block_free_reclaim_batches
+        .load(Ordering::Relaxed)
+}
+fn wt_blocks() -> u64 {
+    METRICS.write_through_blocks.load(Ordering::Relaxed)
+}
+fn wt_fallbacks() -> u64 {
+    METRICS.write_through_fallbacks.load(Ordering::Relaxed)
+}
+fn inplace_rewrites() -> u64 {
+    METRICS
+        .write_through_inplace_rewrites
+        .load(Ordering::Relaxed)
+}
+fn untracked_refusals() -> u64 {
+    METRICS
+        .block_untracked_free_refusals
+        .load(Ordering::Relaxed)
+}
+
+/// Contract 7 (+ the conviction-3 tax mechanism): a striped rewrite in the
+/// FREE-LIST REGIME — cursor at cap, real headroom on the free list, the
+/// shape of ANY store that has ever been full (the field's post-rm fill
+/// 0.62) — must run entirely off the background reclaimer: `sync_drains`
+/// stays 0 (no valve on the write path), every displaced block enqueues,
+/// the worker batches them, and device commands account for every one.
+///
+/// RED against dev 78b9498: concurrent allocators all read the SAME
+/// free-list head; losers of the `DashSet::remove` race fall to
+/// `next_fresh_block()`, which is `StorageFull` at the cap — so the valve
+/// fires ≈ per allocation (counted + a synchronous whole-queue drain on
+/// the write path) despite 50 % headroom, and double-losers fail writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn field_rewrite_free_list_regime_runs_off_the_write_path() {
+    let _g = serial().await;
+    let _p = PatchOff::arm();
+    let h = make_field_harness("field_free_list_regime").await;
+
+    // 32-chunk volume, filled to the brim by 8 × 4-block fresh files —
+    // the cursor is now AT CAP forever (highest_block never shrinks).
+    h.ba.set_capacity_bytes(32 * CHUNK_SIZE);
+    let mut inos = Vec::new();
+    for i in 0..8 {
+        inos.push(field_make_striped(&h, &format!("g{i}"), 4, i as u8).await);
+    }
+
+    // Free half the store through the real truncate path (the field's
+    // session-B rm): 16 terminal frees ride the queue; settle the worker.
+    for &ino in &inos[4..] {
+        field_truncate_zero(&h, ino).await;
+    }
+    h.fs.router.backend_router.reclaim_drain().await;
+    assert_eq!(
+        h.ba.free_blocks_count(),
+        16,
+        "premise: free-list regime (fill 0.5, cursor at cap)"
+    );
+
+    let (sd0, q0, p0, d0, s0, b0, wt0, uf0, df0) = (
+        sync_drains(),
+        queued(),
+        punches(),
+        discards(),
+        skipped(),
+        batches(),
+        wt_blocks(),
+        untracked_refusals(),
+        double_frees(),
+    );
+
+    // 3 rounds × 8 CONCURRENT full-block rewrites (2 files × 4 blocks,
+    // one spawned task per block — true OS-thread parallelism on the
+    // allocator): 24 displaced blocks total, never more than 8 in flight
+    // against 16 free — allocation must never genuinely exhaust.
+    const ROUNDS: u64 = 3;
+    for round in 0..ROUNDS {
+        let mut tasks = Vec::new();
+        for (fi, &ino) in inos[..2].iter().enumerate() {
+            for b in 0..4u64 {
+                let fs = h.fs.clone();
+                let req = h.req;
+                let seed = (round * 16 + fi as u64 * 4 + b) as u8;
+                tasks.push(tokio::spawn(async move {
+                    let p = field_pattern(FBS as usize, seed);
+                    field_write(&fs, req, ino, b * FBS, &p).await;
+                }));
+            }
+        }
+        for t in tasks {
+            t.await.expect("rewrite task");
+        }
+        // The WORKER must complete the round's displaced reclaims (no
+        // explicit drain here — batches>0 is part of the contract).
+        eventually(
+            || queue_bytes() == 0,
+            "worker drains the round's displaced reclaims",
+        )
+        .await;
+    }
+
+    let displaced = ROUNDS * 8;
+    assert_eq!(
+        sync_drains() - sd0,
+        0,
+        "free-list-regime rewrites must NEVER fire the ENOSPC valve — a \
+         lost free-list claim race must retry the next candidate, not \
+         fresh-mint into StorageFull (the field's per-allocation \
+         sync_drains at 38 % headroom)"
+    );
+    assert_eq!(
+        queued() - q0,
+        displaced,
+        "every displaced block must enqueue to the background reclaimer"
+    );
+    assert_eq!(
+        (punches() - p0) + (discards() - d0) + (skipped() - s0),
+        displaced,
+        "device commands must account for every displaced block"
+    );
+    assert!(
+        batches() - b0 > 0,
+        "the background worker (not a write-path drain) must process the \
+         displaced reclaims"
+    );
+    assert_eq!(
+        wt_blocks() - wt0,
+        displaced,
+        "engagement: every rewrite must ride the real write-through path"
+    );
+    assert_eq!(untracked_refusals() - uf0, 0, "no untracked-free residue");
+    assert_eq!(double_frees() - df0, 0, "no double-free residue");
+
+    // Content survives the churn: final round's pattern reads back.
+    for (fi, &ino) in inos[..2].iter().enumerate() {
+        for b in 0..4u64 {
+            let seed = ((ROUNDS - 1) * 16 + fi as u64 * 4 + b) as u8;
+            assert_eq!(
+                field_read(&h, ino, b * FBS, FBS as u32).await,
+                field_pattern(FBS as usize, seed),
+                "file {fi} block {b} content after concurrent rewrite rounds"
+            );
+        }
+    }
+}
+
+/// Contract 8 — valve economy: `block_free_reclaim_sync_drains` counts
+/// ONLY genuine allocation-failure-driven drains that reclaimed queued
+/// space. (a) A genuinely-full store with an EMPTY queue refuses
+/// StorageFull without counting a drain (the field's fill-1.0 idle climb
+/// — one bump per failed allocation attempt, forever). (b) Racing
+/// allocators consuming a pre-reclaimed free list at cap never fire the
+/// valve at all and never fail.
+///
+/// RED against dev 78b9498: (a) counts +1 per attempt on an empty queue;
+/// (b) lost head-claim races fresh-mint into StorageFull → valve bumps
+/// and double-losers surface allocation errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn valve_counts_only_genuine_nonempty_drains() {
+    let _g = serial().await;
+    let (router, ba, _backing, _s) = make_router().await;
+    let _keepalive = &router;
+
+    // (a) Genuine full, empty queue: honest StorageFull, NO counted drain.
+    ba.set_capacity_bytes(CHUNK_SIZE);
+    let only = ba.allocate_block().await.expect("fill the 1-block volume");
+    ba.publish_block(only);
+    let sd0 = sync_drains();
+    for attempt in 0..3 {
+        match ba.allocate_block().await {
+            Err(squeezefs::error::SqueezefsError::Io(ref e))
+                if e.kind() == std::io::ErrorKind::StorageFull => {}
+            other => panic!("attempt {attempt}: expected StorageFull, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        sync_drains() - sd0,
+        0,
+        "an empty-queue valve pass is a no-op, not engagement — it must \
+         not be counted (the field's unbounded idle sync_drains climb)"
+    );
+
+    // (b) Free-list regime at cap: 64 entries pre-reclaimed, 16 racing
+    // tasks × 4 tight-loop allocations consume them exactly. No frees in
+    // flight, no queue involvement — the valve must never fire and every
+    // allocation must succeed with a distinct offset.
+    ba.set_capacity_bytes(64 * CHUNK_SIZE);
+    let mut offsets = Vec::new();
+    while let Ok(o) = ba.allocate_block().await {
+        ba.publish_block(o);
+        offsets.push(o);
+    }
+    assert_eq!(offsets.len(), 63, "premise: cursor driven to cap");
+    for o in &offsets {
+        router
+            .backend_router
+            .free_block(&o.to_string())
+            .await
+            .expect("terminal free");
+    }
+    router.backend_router.reclaim_drain().await;
+    assert_eq!(
+        ba.free_blocks_count(),
+        63,
+        "premise: everything reclaimed onto the free list"
+    );
+
+    let sd1 = sync_drains();
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let ba = ba.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut got = Vec::new();
+            for _ in 0..3 {
+                got.push(
+                    ba.allocate_block()
+                        .await
+                        .expect("free-list-regime allocation must not fail"),
+                );
+            }
+            got
+        }));
+    }
+    let mut claimed = std::collections::HashSet::new();
+    for t in tasks {
+        for o in t.await.expect("alloc task") {
+            assert!(claimed.insert(o), "offset {o} handed out twice");
+        }
+    }
+    assert_eq!(claimed.len(), 48, "48 racing allocations all served");
+    assert_eq!(
+        sync_drains() - sd1,
+        0,
+        "consuming a populated free list at cap must never fire the \
+         ENOSPC valve — the lost-race fresh-mint fallback is the field's \
+         per-allocation sync_drains + write-path drain tax"
+    );
+}
+
+/// Contract 9 — the brim (fill 1.0): a space-neutral full-block rewrite
+/// of a sole-owned striped file must CONVERGE — in place, on the device,
+/// with no staging spiral — and genuine frees at the brim must still ride
+/// the queue with device commands.
+///
+/// RED against dev 78b9498: every rewrite block fails allocation, counts
+/// an empty-queue sync drain, and degrades into the never-lossy staging
+/// fallback (`write_through_fallbacks` ≈ blocks) — acked bytes never
+/// reach the device (the session-A ledger: queued=0, zero device
+/// commands, sync_drains ≈ allocations), and
+/// `write_through_inplace_rewrites` does not exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn brim_rewrite_converges_in_place_with_honest_ledger() {
+    let _g = serial().await;
+    let _p = PatchOff::arm();
+    let h = make_field_harness("field_brim_rewrite").await;
+
+    // 8-chunk volume filled exactly by two 4-block files: fill 1.0,
+    // empty free list, empty queue.
+    h.ba.set_capacity_bytes(8 * CHUNK_SIZE);
+    let f1 = field_make_striped(&h, "f1", 4, 11).await;
+    let f2 = field_make_striped(&h, "f2", 4, 22).await;
+    assert_eq!(h.ba.free_blocks_count(), 0, "premise: brim");
+
+    // Capture f1's mapping (offset per block) BEFORE the rewrite.
+    let path = squeezefs::keys::inode_path(f1);
+    h.fs.router.metadata_cache.remove(&f1);
+    let before = h.fs.router.fetch_metadata(&path).await.unwrap();
+    let map_before = before.block_map.clone().expect("mapped");
+
+    let (sd0, q0, p0, d0, s0, fb0, ip0, wt0) = (
+        sync_drains(),
+        queued(),
+        punches(),
+        discards(),
+        skipped(),
+        wt_fallbacks(),
+        inplace_rewrites(),
+        wt_blocks(),
+    );
+
+    // Full rewrite of f1, block by block (the field's session-A shape).
+    for b in 0..4u64 {
+        let p = field_pattern(FBS as usize, 100 + b as u8);
+        field_write(&h.fs, h.req, f1, b * FBS, &p).await;
+    }
+
+    assert_eq!(
+        wt_fallbacks() - fb0,
+        0,
+        "a brim rewrite must CONVERGE, not spiral into the staging \
+         fallback (the session-A unbounded writeback backlog)"
+    );
+    assert_eq!(
+        sync_drains() - sd0,
+        0,
+        "empty-queue valve passes at the brim must not be counted"
+    );
+    assert_eq!(
+        inplace_rewrites() - ip0,
+        4,
+        "each sole-owner full-block rewrite at the brim lands IN PLACE \
+         (write_through_inplace_rewrites is the engagement counter)"
+    );
+    assert_eq!(
+        wt_blocks() - wt0,
+        4,
+        "in-place brim rewrites are still write-throughs"
+    );
+    assert_eq!(
+        queued() - q0,
+        0,
+        "an in-place rewrite displaces nothing — no free, no queue entry"
+    );
+
+    // The mapping is UNCHANGED (in place) and the bytes are ON THE DEVICE
+    // (not parked in staging): pread the backing file at each mapped
+    // offset — passthrough volume, plaintext on device.
+    h.fs.router.metadata_cache.remove(&f1);
+    let after = h.fs.router.fetch_metadata(&path).await.unwrap();
+    let map_after = after.block_map.clone().expect("still mapped");
+    assert_eq!(
+        *map_before, *map_after,
+        "in-place rewrite must not move the mapping"
+    );
+    use std::os::unix::fs::FileExt;
+    let dev = std::fs::File::open(h.backing.path()).expect("open backing");
+    let mut buf = vec![0u8; FBS as usize];
+    for b in 0..4u32 {
+        let key = map_after.get(&b).expect("mapped block");
+        let (_, off) = h.fs.router.backend_router.parse_block_key(key).unwrap();
+        dev.read_exact_at(&mut buf, off).expect("pread device");
+        assert_eq!(
+            buf,
+            field_pattern(FBS as usize, 100 + b as u8),
+            "block {b}: the rewrite must be ON THE DEVICE at the mapped \
+             offset, not acked into a staging spiral"
+        );
+        assert!(
+            h.fs.router
+                .cache
+                .nvme
+                .read_staged(&staged_field_key(f1, b as u64))
+                .is_none(),
+            "block {b}: no staged residue after an in-place brim rewrite"
+        );
+    }
+    for b in 0..4u64 {
+        assert_eq!(
+            field_read(&h, f1, b * FBS, FBS as u32).await,
+            field_pattern(FBS as usize, 100 + b as u8),
+            "read-back through the FUSE path"
+        );
+    }
+
+    // Genuine frees at the brim still ride the queue WITH device
+    // commands (accounting-only finish_free would leak thin space).
+    field_truncate_zero(&h, f2).await;
+    assert_eq!(
+        queued() - q0,
+        4,
+        "brim truncate frees must enqueue to the reclaimer"
+    );
+    eventually(
+        || (punches() - p0) + (discards() - d0) + (skipped() - s0) == 4 && queue_bytes() == 0,
+        "brim frees reclaimed with device commands",
+    )
+    .await;
+
+    // And the reclaimed space is allocatable: a fresh 4-block file lands.
+    let f3 = field_make_striped(&h, "f3", 4, 33).await;
+    assert_eq!(
+        field_read(&h, f3, 0, (4 * FBS) as u32).await,
+        field_pattern((4 * FBS) as usize, 33),
+        "fresh file over reclaimed brim space"
+    );
+}
+
+fn staged_field_key(ino: u64, b: u64) -> String {
+    squeezefs::keys::active_block(ino, b).to_string()
 }

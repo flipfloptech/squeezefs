@@ -2426,6 +2426,14 @@ pub struct Metrics {
     /// (device write failure / allocator failure / uring backpressure).
     /// ~0 on healthy mounts; sustained growth = device backpressure.
     pub write_through_fallbacks: Align64<AtomicU64>,
+    /// Brim in-place rewrites (field ledger inversion, 2026-07-27 —
+    /// `tests/async_block_reclaim_tests.rs` contract 9): a write-through
+    /// whose allocation genuinely failed for space landed IN PLACE over
+    /// the block's own sole-owned, undecorated, passthrough mapping (the
+    /// W1 incarnation fence, whole-block face) — no allocation, no free,
+    /// no staging detour. 0 except at genuine space pressure; growth here
+    /// with `write_through_fallbacks` quiet is the designed brim posture.
+    pub write_through_inplace_rewrites: Align64<AtomicU64>,
     // Terminal-free device reclaim economy (the shim-write-amplification
     // fix — `.benchmarks/2026-07-27-shim-write-amplification.md`;
     // classification `routing::free_reclaim_op`, contract
@@ -4563,6 +4571,7 @@ impl SqueezefsFilesystem {
                 "write_through_blocks": METRICS.write_through_blocks.load(Ordering::Relaxed),
                 "write_through_bytes": METRICS.write_through_bytes.load(Ordering::Relaxed),
                 "write_through_fallbacks": METRICS.write_through_fallbacks.load(Ordering::Relaxed),
+                "write_through_inplace_rewrites": METRICS.write_through_inplace_rewrites.load(Ordering::Relaxed),
                 // Terminal-free reclaim economy (shim-write-amplification
                 // fix): reclaims must never surface as device WRITE bytes.
                 "block_free_discards": METRICS.block_free_discards.load(Ordering::Relaxed),

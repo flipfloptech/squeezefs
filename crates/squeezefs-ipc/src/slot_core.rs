@@ -237,6 +237,24 @@ impl SlotCore {
         }
     }
 
+    /// Client: CLAIMED → FREE for a slot that was claimed but never
+    /// submitted — the **arena-extension hold** of a multi-slab op window
+    /// (large-op economy: the base slot's descriptor spans the run's
+    /// contiguous slabs; the extension slots exist only to reserve their
+    /// arena, and the daemon never observes them — only SUBMITTED slots
+    /// ride the ring). The claimant is exclusive while CLAIMED, so a plain
+    /// store is exact; Release pairs with the next [`Self::try_claim`]'s
+    /// Acquire exactly as [`Self::release`]. The claim's generation bump
+    /// stays (generations are monotonic per slot, not dense).
+    pub fn release_claimed(&self) {
+        debug_assert_eq!(
+            state_bits(self.state.load(Ordering::Relaxed)),
+            STATE_CLAIMED,
+            "release_claimed() outside CLAIMED"
+        );
+        self.state.store(STATE_FREE, Ordering::Release);
+    }
+
     /// Client: DONE → FREE after consuming the result (Release; pairs with
     /// the next [`Self::try_claim`]'s Acquire so slot reuse never observes
     /// the previous op's stores out of order).
@@ -303,6 +321,29 @@ mod tests {
 
         let gen2 = s.try_claim().expect("released slot must re-claim");
         assert_eq!(gen2, 2, "generations are monotonic per slot");
+    }
+
+    #[test]
+    fn release_claimed_returns_an_unsubmitted_hold_to_free() {
+        let s = SlotCore::new();
+        let gen = s.try_claim().expect("fresh slot must claim");
+        assert_eq!(state_bits(s.raw_state()), STATE_CLAIMED);
+        assert!(!s.try_begin_serve(), "a CLAIMED hold is daemon-invisible");
+        s.release_claimed();
+        assert_eq!(s.raw_state(), STATE_FREE);
+        assert!(
+            !s.is_done_for(gen),
+            "an abandoned hold's generation never reads DONE"
+        );
+        // Next life is a full clean cycle with a strictly later generation.
+        let gen2 = s.try_claim().expect("released hold must re-claim");
+        assert!(gen2 > gen, "generations stay monotonic across holds");
+        s.publish_submitted();
+        assert!(s.try_begin_serve());
+        s.complete();
+        assert!(s.is_done_for(gen2));
+        assert!(!s.is_done_for(gen), "hold gen never consumes a later DONE");
+        s.release();
     }
 
     #[test]

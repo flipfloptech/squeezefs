@@ -2151,6 +2151,47 @@ mod models {
         });
     }
 
+    /// IPC op-slot invariant #2b (DIALED P3 large-op economy — the
+    /// `release_claimed` arena-extension hold): a slot life that was
+    /// claimed but never submitted (a multi-slab run's extension hold)
+    /// returns to FREE, and the hold's generation can never consume a
+    /// LATER life's DONE — the same ABA guarantee as invariant #2, now
+    /// with the CLAIMED → FREE edge in the reuse chain. The hold's
+    /// release races the next life's full cycle.
+    #[test]
+    fn ipc_slot_claimed_hold_release_reuse_clean() {
+        loom::model(|| {
+            let slot = Arc::new(ipc_slot_core::SlotCore::new());
+
+            // Hold life: claimed as an arena extension, never submitted.
+            let hold_gen = slot.try_claim().expect("fresh slot must claim");
+            // While CLAIMED the daemon must never serve it.
+            assert!(!slot.try_begin_serve(), "holds are daemon-invisible");
+            slot.release_claimed();
+
+            // Next life races a stale hold-generation probe.
+            let second_life = {
+                let slot = Arc::clone(&slot);
+                thread::spawn(move || {
+                    let gen2 = slot.try_claim().expect("released hold must re-claim");
+                    slot.publish_submitted();
+                    assert!(slot.try_begin_serve(), "real life serves");
+                    slot.complete();
+                    gen2
+                })
+            };
+            for _ in 0..2 {
+                assert!(
+                    !slot.is_done_for(hold_gen),
+                    "a hold's generation must never consume a later life's DONE"
+                );
+            }
+            let gen2 = second_life.join().unwrap();
+            assert!(gen2 > hold_gen, "generations strictly monotonic across holds");
+            assert!(slot.is_done_for(gen2), "the live generation consumes");
+        });
+    }
+
     /// IPC op-slot invariant #2 (the generation ABA guard): a waiter from
     /// a previous life of the slot can never mistake a recycled slot's
     /// DONE for its own — whatever the stale probe interleaves with, the

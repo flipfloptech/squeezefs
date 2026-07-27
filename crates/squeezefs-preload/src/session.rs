@@ -565,33 +565,104 @@ impl Session {
         RingOutcome::Served(done)
     }
 
-    /// Positional ring write from `buf` (chunked to the slab ceiling).
+    /// Positional ring write from `buf` — the DIALED P3 **large-op ring
+    /// economy** (`.benchmarks/2026-07-27-write-side-economy.md`):
+    ///
+    /// - Chunks size to the full `max_op_bytes` window via **contiguous
+    ///   multi-slab slot runs** (`claim_run`) — a 1 MiB write is ONE ring
+    ///   op at default geometry, not 16 serial slab RTTs (the daemon has
+    ///   always validated `len ≤ max_op_bytes`; the collapse was purely
+    ///   this client's chunk sizing).
+    /// - Every chunk of the op is **submitted before any is waited on**
+    ///   (pipelined flights, reaped in offset order), so ops larger than
+    ///   `max_op_bytes` overlap their windows instead of serializing.
+    ///
+    /// POSIX prefix semantics: the reported count is the contiguous acked
+    /// prefix ending at the first short or failed chunk; later in-flight
+    /// chunks are drained and their results ignored (their bytes may have
+    /// landed — the same property as the kernel's split out-of-order
+    /// O_DIRECT WRITE pipeline, converged by the caller's retry).
     pub fn ring_pwrite(&self, binding_id: u64, buf: &[u8], offset: u64) -> RingOutcome {
-        let mut done = 0usize;
-        while done < buf.len() {
-            let chunk = (buf.len() - done).min(self.slab as usize);
-            match self.one_op(
-                OP_WRITE,
-                binding_id,
-                offset + done as u64,
-                chunk,
-                Some(&buf[done..done + chunk]),
-            ) {
-                OpResult::Done { slot, n } => {
-                    self.release_slot(slot);
-                    done += n.min(chunk);
-                    if n < chunk {
-                        break; // short write (POSIX-legal; caller retries)
+        let slab = self.slab as usize;
+        let max_chunk = (self.geometry.max_op_bytes as usize).max(1);
+        let mut flights: std::collections::VecDeque<WriteFlight> =
+            std::collections::VecDeque::new();
+        let mut submitted = 0usize; // bytes handed to flights
+        let mut done = 0usize; // contiguous acked prefix
+        let mut short = false; // a chunk completed short — stop extending
+        let mut failed: Option<i32> = None; // first failure's errno
+        loop {
+            // Submit phase: keep the pipeline full while no terminal
+            // condition holds. `claim_run` refusing (all slots busy) just
+            // ends this phase — reaping a flight below frees slots and the
+            // loop re-enters here.
+            while failed.is_none() && !short && submitted < buf.len() && !self.poisoned() {
+                let remaining = buf.len() - submitted;
+                let want_bytes = remaining.min(max_chunk);
+                let want_slots = want_bytes.div_ceil(slab).max(1) as u32;
+                let Some((base, gen, run)) = self.claim_run(want_slots) else {
+                    break;
+                };
+                let chunk = want_bytes.min(run as usize * slab);
+                self.slab_write_run(base, &buf[submitted..submitted + chunk]);
+                let slot = self.slot(base);
+                slot.publish_descriptor(&SlotDescriptor {
+                    op: OP_WRITE,
+                    flags: 0,
+                    binding: binding_id,
+                    offset: offset + submitted as u64,
+                    len: chunk as u32,
+                    arena_off: u64::from(base) * self.slab,
+                });
+                slot.core.publish_submitted();
+                if !self.ring().push(base) {
+                    // Unreachable for an honest client (slots ≤ ring
+                    // entries) — our state is corrupt; poison loudly. The
+                    // submitted-but-unpushed run is abandoned with the
+                    // session (never reused).
+                    self.poison();
+                    break;
+                }
+                // Doorbell (§5.3 protocol rule 1) per push; the coalescer
+                // elides the syscall unless the daemon is parked.
+                let header = self.header();
+                header.doorbell.fetch_add(1, Ordering::Release);
+                if header.daemon_parked.load(Ordering::SeqCst) != 0 {
+                    futex_wake(&header.doorbell);
+                }
+                flights.push_back(WriteFlight {
+                    base,
+                    gen,
+                    run,
+                    chunk,
+                });
+                submitted += chunk;
+            }
+            // Reap phase: consume the oldest (lowest-offset) flight.
+            let Some(fl) = flights.pop_front() else {
+                break; // nothing in flight and nothing submittable
+            };
+            match self.wait_consume(fl.base, fl.gen) {
+                WaitConsume::Done(r) => {
+                    self.release_run(fl.base, fl.run);
+                    if r < 0 {
+                        if failed.is_none() && !short {
+                            failed = Some((-r) as i32);
+                        }
+                    } else if failed.is_none() && !short {
+                        let n = (r as usize).min(fl.chunk);
+                        done += n;
+                        if n < fl.chunk {
+                            short = true;
+                        }
                     }
                 }
-                OpResult::Errno(e) => {
-                    return if done > 0 {
-                        RingOutcome::Served(done)
-                    } else {
-                        RingOutcome::Errno(e)
-                    };
-                }
-                OpResult::Fallthrough => {
+                WaitConsume::Abandoned => {
+                    // §5.4.1 deadline (session now poisoned) or a poison
+                    // broadcast: never reuse the run's slots — the daemon
+                    // may complete into (or DMA-serve from) the run's
+                    // arena arbitrarily late. Remaining flights are
+                    // abandoned with the session.
                     return if done > 0 {
                         RingOutcome::Served(done)
                     } else {
@@ -600,7 +671,25 @@ impl Session {
                 }
             }
         }
-        RingOutcome::Served(done)
+        if let Some(e) = failed {
+            return if done > 0 {
+                RingOutcome::Served(done)
+            } else if e == libc::EINVAL {
+                // Protocol-class reject on the first chunk: OUR
+                // bookkeeping diverged — the real call is the correct
+                // answer (mirrors `consume`).
+                RingOutcome::Fallthrough
+            } else {
+                RingOutcome::Errno(e)
+            };
+        }
+        if done > 0 || buf.is_empty() {
+            RingOutcome::Served(done)
+        } else {
+            // No slot was ever claimable (client-visible backpressure) or
+            // the session is poisoned: this op takes the real call.
+            RingOutcome::Fallthrough
+        }
     }
 
     // -----------------------------------------------------------------
@@ -762,12 +851,24 @@ impl Session {
             // (§5.5.1): this op takes the real call; the binding stays.
             return OpResult::Fallthrough;
         };
-        let slot = self.slot(slot_idx);
+        match self.wait_consume(slot_idx, gen) {
+            WaitConsume::Done(_) => self.consume(slot_idx, gen),
+            WaitConsume::Abandoned => OpResult::Fallthrough,
+        }
+    }
 
-        // Wait: bounded ADAPTIVE spin, then futex park with a hard
-        // deadline. Sessions whose last op parked spin only the short
-        // floor — full-window spinning on handoff-heavy workloads is
-        // CPU theft from the daemon (see WAIT_SPINS_PARKY).
+    /// Wait for one submitted slot's completion: bounded ADAPTIVE spin,
+    /// then futex park with a hard deadline (§5.4.1). Sessions whose
+    /// last op parked spin only the short floor — full-window spinning
+    /// on handoff-heavy workloads is CPU theft from the daemon (see
+    /// WAIT_SPINS_PARKY). `Done` returns the slot result WITHOUT
+    /// releasing it (the caller consumes/releases); `Abandoned` means
+    /// the deadline poisoned the session (or a poison broadcast landed)
+    /// — the slot is never reused (the daemon may complete it
+    /// arbitrarily late; recycling would hand that stale completion to
+    /// a future op).
+    fn wait_consume(&self, slot_idx: u32, gen: u64) -> WaitConsume {
+        let slot = self.slot(slot_idx);
         let deadline = Instant::now() + self.op_timeout;
         let (window, parky) = wait_spins();
         let spins = if self.last_parked.load(Ordering::Relaxed) {
@@ -778,31 +879,27 @@ impl Session {
         for _ in 0..spins {
             if slot.core.is_done_for(gen) {
                 self.last_parked.store(false, Ordering::Relaxed);
-                return self.consume(slot_idx, gen);
+                return WaitConsume::Done(slot.result());
             }
             std::hint::spin_loop();
         }
         self.last_parked.store(true, Ordering::Relaxed);
         loop {
             match slot.core.park_prepare() {
-                ParkOutcome::Ready => return self.consume(slot_idx, gen),
+                ParkOutcome::Ready => return WaitConsume::Done(slot.result()),
                 ParkOutcome::Park { expected } => {
                     let now = Instant::now();
                     if now >= deadline {
-                        // §5.4.1 timeout: poison, never reuse the slot
-                        // (the daemon may complete it arbitrarily late —
-                        // recycling would hand that stale completion to
-                        // a future op).
                         self.poison();
-                        return OpResult::Fallthrough;
+                        return WaitConsume::Abandoned;
                     }
                     let wait = (deadline - now).min(Duration::from_millis(50));
                     futex_wait(slot.core.state_futex_word(), expected, wait);
                     if slot.core.is_done_for(gen) {
-                        return self.consume(slot_idx, gen);
+                        return WaitConsume::Done(slot.result());
                     }
                     if self.poisoned() {
-                        return OpResult::Fallthrough;
+                        return WaitConsume::Abandoned;
                     }
                 }
             }
@@ -844,6 +941,45 @@ impl Session {
         None
     }
 
+    /// Claim a contiguous, non-wrapping run of up to `want` FREE slots —
+    /// one large-op arena window (slot slabs are adjacent in the arena,
+    /// so a run's window is `[base·slab, (base+run)·slab)`; runs never
+    /// wrap the slot array because the arena window must be contiguous).
+    /// Returns `(base, base_generation, run_len)` with `1 ≤ run_len ≤
+    /// want` — a shorter run under fragmentation is progress, never a
+    /// refusal. Only the BASE slot is ever submitted; the extension
+    /// slots are CLAIMED arena holds the daemon never observes, released
+    /// via [`release_run`](Self::release_run). `None` = not one slot
+    /// free (client-visible backpressure).
+    fn claim_run(&self, want: u32) -> Option<(u32, u64, u32)> {
+        let slots = self.geometry.slots;
+        let start = self.slot_hint.fetch_add(1, Ordering::Relaxed) % slots;
+        for i in 0..slots {
+            let base = (start + i) % slots;
+            if let Some(gen) = self.slot(base).core.try_claim() {
+                let mut run = 1u32;
+                while run < want && base + run < slots {
+                    if self.slot(base + run).core.try_claim().is_some() {
+                        run += 1;
+                    } else {
+                        break;
+                    }
+                }
+                return Some((base, gen, run));
+            }
+        }
+        None
+    }
+
+    /// Release a completed flight's run: the consumed base (DONE → FREE)
+    /// plus the never-submitted extension holds (CLAIMED → FREE).
+    fn release_run(&self, base: u32, run: u32) {
+        self.slot(base).core.release();
+        for i in 1..run {
+            self.slot(base + i).core.release_claimed();
+        }
+    }
+
     fn release_slot(&self, idx: u32) {
         self.slot(idx).core.release();
     }
@@ -881,9 +1017,21 @@ impl Session {
 
     fn slab_write(&self, slot_idx: u32, data: &[u8]) {
         debug_assert!(data.len() as u64 <= self.slab);
-        let off = self.layout.arena_off + u64::from(slot_idx) * self.slab;
-        // SAFETY: slab windows are disjoint per slot and inside the
-        // arena by construction (slab = arena/slots ≥ this slab's end).
+        self.slab_write_run(slot_idx, data);
+    }
+
+    /// Copy `data` into the contiguous arena window based at `base`'s
+    /// slab — the multi-slab run write (`data` may span the run's whole
+    /// window; the run's slots are all CLAIMED by this thread).
+    fn slab_write_run(&self, base: u32, data: &[u8]) {
+        let off = self.layout.arena_off + u64::from(base) * self.slab;
+        debug_assert!(
+            u64::from(base) * self.slab + data.len() as u64 <= self.geometry.arena_bytes,
+            "run window inside the arena by claim_run construction"
+        );
+        // SAFETY: the run's slot slabs are adjacent and disjoint from
+        // every other claimant's (all claimed by us), inside the arena
+        // by the assert above.
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), self.base.add(off as usize), data.len());
         }
@@ -918,6 +1066,22 @@ enum OpResult {
     Done { slot: u32, n: usize },
     Errno(i32),
     Fallthrough,
+}
+
+/// One in-flight chunk of a pipelined large write: the submitted base
+/// slot (+ its ABA generation) and the arena-extension run behind it.
+struct WriteFlight {
+    base: u32,
+    gen: u64,
+    run: u32,
+    chunk: usize,
+}
+
+/// [`Session::wait_consume`]'s outcome: the slot's raw result (slot NOT
+/// yet released), or the deadline/poison abandonment (slot never reused).
+enum WaitConsume {
+    Done(i64),
+    Abandoned,
 }
 
 // ---------------------------------------------------------------------------

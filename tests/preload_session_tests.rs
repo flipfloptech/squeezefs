@@ -1053,7 +1053,8 @@ fn large_write_is_one_ring_op_per_max_op_window() {
     let sink = Arc::new(RecordingSink {
         writes: std::sync::Mutex::new(Vec::new()),
     });
-    let (host, _dir, _f, session, bid) = sink_host_geo("wide-opcount", sink.clone(), wide_geometry());
+    let (host, _dir, _f, session, bid) =
+        sink_host_geo("wide-opcount", sink.clone(), wide_geometry());
 
     let buf = deterministic_bytes(1024 * 1024, 3);
     match session.ring_pwrite(bid, &buf, 0) {
@@ -1144,9 +1145,7 @@ fn large_write_error_semantics_prefix_or_errno() {
     // Error at the second window ⇒ Served(first window).
     let (host, _dir, _f, session, bid) = sink_host_geo(
         "wide-err1",
-        Arc::new(ErrAtSink {
-            err_at: 512 * 1024,
-        }),
+        Arc::new(ErrAtSink { err_at: 512 * 1024 }),
         wide_geometry(),
     );
     match session.ring_pwrite(bid, &buf, 0) {
@@ -1206,8 +1205,7 @@ fn fragmented_slots_still_serve_large_write_via_smaller_runs() {
     let sink = Arc::new(ParkReadsSink {
         parked: std::sync::Mutex::new(Vec::new()),
     });
-    let (host, _dir, _f, session, bid) =
-        sink_host_geo("wide-frag", sink.clone(), wide_geometry());
+    let (host, _dir, _f, session, bid) = sink_host_geo("wide-frag", sink.clone(), wide_geometry());
 
     // Park 13 of 16 slots behind never-completing reads.
     let mut held = Vec::new();

@@ -635,7 +635,7 @@ async fn kill9_with_queued_discards_leaves_recoverable_volume() {
         }
         // The freed offsets re-enter circulation (gap-filled free list) —
         // allocate a few, write, read back, free, drain.
-        for _ in 0..freed.len().min(4).max(1) {
+        for _ in 0..freed.len().clamp(1, 4) {
             let o = ba.allocate_block().await.expect("post-crash alloc");
             let pat = vec![0xA5u8; 4096];
             nvme.write_block(o, bytes::Bytes::from(pat.clone()))

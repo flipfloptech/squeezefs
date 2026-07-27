@@ -2439,6 +2439,26 @@ pub struct Metrics {
     /// retried as a zeroing write; sustained growth on a thin-provisioned
     /// substrate means space is not being returned to it.
     pub block_free_reclaim_skipped: Align64<AtomicU64>,
+    // Async block-reclaim (the overwrite-throughput fix —
+    // `.benchmarks/2026-07-27-async-block-reclaim.md`; queue in
+    // `crate::block_reclaim`, contract `tests/async_block_reclaim_tests.rs`):
+    // terminal frees QUEUE their device reclaim; the punch/discard
+    // counters above still account every displaced block exactly once,
+    // now from the background worker.
+    /// Terminal-free reclaims enqueued to the background reclaimer.
+    pub block_free_reclaim_queued: Align64<AtomicU64>,
+    /// GAUGE: bytes queued-or-in-flight in the background reclaimer.
+    /// Returns to baseline when the queue is drained (unmount, valve).
+    pub block_free_reclaim_queue_bytes: Align64<AtomicU64>,
+    /// Background reclaim batches processed (adjacent ranges coalesce
+    /// into fewer device commands inside a batch; counting stays
+    /// per-block on the punch/discard counters).
+    pub block_free_reclaim_batches: Align64<AtomicU64>,
+    /// ENOSPC pressure-valve drains: an allocation that would refuse for
+    /// space forced a synchronous drain of the queued reclaims first.
+    /// **0 except under real space pressure** — growth on a non-full
+    /// volume means the background reclaimer is not keeping up.
+    pub block_free_reclaim_sync_drains: Align64<AtomicU64>,
     /// Seed-time memset bytes elided by §5.3 coverage tracking: for every
     /// Fresh accumulation buffer reaching content-validity, the block size
     /// minus the complement bytes actually zeroed. Sequential fills elide
@@ -4532,6 +4552,10 @@ impl SqueezefsFilesystem {
                 "block_free_file_punches": METRICS.block_free_file_punches.load(Ordering::Relaxed),
                 "block_free_punch_bytes": METRICS.block_free_punch_bytes.load(Ordering::Relaxed),
                 "block_free_reclaim_skipped": METRICS.block_free_reclaim_skipped.load(Ordering::Relaxed),
+                "block_free_reclaim_queued": METRICS.block_free_reclaim_queued.load(Ordering::Relaxed),
+                "block_free_reclaim_queue_bytes": METRICS.block_free_reclaim_queue_bytes.load(Ordering::Relaxed),
+                "block_free_reclaim_batches": METRICS.block_free_reclaim_batches.load(Ordering::Relaxed),
+                "block_free_reclaim_sync_drains": METRICS.block_free_reclaim_sync_drains.load(Ordering::Relaxed),
                 // RW1 rand-write device-byte ledger (design-random-small-
                 // writes §1.2 buckets; always-on — the G-RW2 gate's
                 // attribution source).
@@ -8815,6 +8839,14 @@ impl SqueezefsFilesystem {
             let notify = self.router.cache.nvme.staged_drained_notify.clone();
             let _ = tokio::time::timeout(remaining, notify.notified()).await;
         }
+
+        // Async block-reclaim conservation (contract 3,
+        // tests/async_block_reclaim_tests.rs): a clean unmount returns
+        // every queued device range before declaring the dismount clean —
+        // nothing is lost on clean unmount. Runs AFTER the flush/drain
+        // waits above (they are what produce the final displaced-block
+        // frees).
+        self.router.backend_router.reclaim_drain().await;
 
         // Gather final count for warnings/statistics
         let keys = self.router.cache.nvme.list_staged_files();

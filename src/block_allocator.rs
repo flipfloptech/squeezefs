@@ -51,6 +51,12 @@ pub fn ensure_stored_block_image_fits(
     Ok(())
 }
 
+/// `true` ⇔ `e` is the allocator's StorageFull refusal (the ENOSPC
+/// pressure-valve trigger).
+fn is_storage_full(e: &crate::error::SqueezefsError) -> bool {
+    matches!(e, crate::error::SqueezefsError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull)
+}
+
 /// Outcome of [`BlockAllocator::pin_block_validated`] (§5.1 clone
 /// validate-after-pin).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +112,16 @@ pub struct BlockAllocator {
     /// aborted owner drops its guard on unwind, so a genuinely leaked
     /// offset is never shielded — only LIVE owners are.
     inflight: scc::HashMap<u64, u32>,
+    /// The ENOSPC **pressure valve** (async block-reclaim,
+    /// `tests/async_block_reclaim_tests.rs` contract 2): terminal frees
+    /// queue their device reclaim to `crate::block_reclaim`, and the
+    /// freed offsets are not reallocatable until the (background)
+    /// reclaim completes — so an allocation that would refuse for space
+    /// must first force a synchronous drain of the queued reclaims. A
+    /// full volume can never be wedged by lazily-queued space. Wired by
+    /// `BackendRouter` at construction/registration; allocators used
+    /// standalone (offline tools, unit fixtures) simply have no valve.
+    space_valve: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
     /// Per-offset incarnation seqlock: `gen << 1 | stable`.
     ///
     /// Block keys are plain offset strings, so when an offset is freed and
@@ -137,8 +153,15 @@ impl BlockAllocator {
             fsck_scan_active: std::sync::atomic::AtomicBool::new(false),
             fsck_epoch_map: scc::HashMap::new(),
             inflight: scc::HashMap::new(),
+            space_valve: std::sync::OnceLock::new(),
             incarnations: scc::HashMap::new(),
         })
+    }
+
+    /// Wire the ENOSPC pressure valve (see the field doc). Set once by
+    /// the owning `BackendRouter`; later calls are no-ops.
+    pub fn set_space_pressure_valve(&self, valve: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.space_valve.set(valve);
     }
 
     // -----------------------------------------------------------------
@@ -478,6 +501,29 @@ impl BlockAllocator {
     }
 
     pub async fn allocate_block(&self) -> Result<u64> {
+        match self.try_allocate_block() {
+            Err(e) if is_storage_full(&e) => {
+                // ENOSPC pressure valve: freed-but-queued reclaims own
+                // free space this allocation is entitled to — force a
+                // synchronous drain, then retry ONCE. The drain blocks
+                // this task on device reclaim work; ENOSPC is rarer and
+                // worse (the counter bump lives in the valve closure —
+                // `block_free_reclaim_sync_drains` must stay 0 except
+                // under real space pressure).
+                if let Some(valve) = self.space_valve.get() {
+                    valve();
+                    self.try_allocate_block()
+                } else {
+                    Err(e)
+                }
+            }
+            r => r,
+        }
+    }
+
+    /// One allocation attempt (free list, then fresh mint) — the body
+    /// [`Self::allocate_block`] wraps with the ENOSPC pressure valve.
+    fn try_allocate_block(&self) -> Result<u64> {
         let mut found_idx = None;
         for item in self.free_blocks.iter() {
             found_idx = Some(*item);

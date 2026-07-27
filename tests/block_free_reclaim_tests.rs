@@ -33,6 +33,12 @@
 //!
 //! RED against dev e314bec: `free_reclaim_op` does not exist; the free path
 //! punches unconditionally and counts nothing.
+//!
+//! Async block-reclaim amendment (perf/async-block-reclaim,
+//! `tests/async_block_reclaim_tests.rs`): the reclaim now runs on the
+//! background reclaimer, not inside `free_block` — the counting contracts
+//! here are unchanged but assert after `reclaim_drain()` (same ledger,
+//! background venue).
 
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
@@ -152,7 +158,9 @@ fn skipped() -> u64 {
 
 /// Contract 2: a terminal free on a file backing is ONE counted punch —
 /// and the backing range actually deallocates (the original ENOSPC
-/// motivation stays alive).
+/// motivation stays alive). Since the async block-reclaim fix the punch
+/// is QUEUED off the write path (`tests/async_block_reclaim_tests.rs`);
+/// the ledger asserts after a drain — same counts, background venue.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn terminal_free_on_file_backing_is_one_counted_punch() {
     let _g = serial().await;
@@ -174,6 +182,7 @@ async fn terminal_free_on_file_backing_is_one_counted_punch() {
         .free_block(&key)
         .await
         .expect("terminal free");
+    router.backend_router.reclaim_drain().await;
 
     assert_eq!(punches() - p0, 1, "terminal file-backed free = one punch");
     let bs = router.block_size.load(Ordering::Relaxed);
@@ -237,6 +246,7 @@ async fn batched_frees_count_one_reclaim_per_key() {
         .free_blocks(&key_refs)
         .await
         .expect("batched free");
+    router.backend_router.reclaim_drain().await;
     assert_eq!(
         punches() - p0,
         4,

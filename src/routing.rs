@@ -400,6 +400,12 @@ pub struct BackendRouter {
     placement_picks: std::sync::Arc<
         dashmap::DashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>,
     >,
+    /// The background block-reclaim queue (async block-reclaim — the
+    /// overwrite-throughput fix): terminal frees enqueue their device
+    /// reclaim here instead of issuing it on the write path; the queue
+    /// owns each entry's `finish_free`. Shared across router clones; the
+    /// allocators' ENOSPC pressure valves drain it synchronously.
+    reclaim: std::sync::Arc<crate::block_reclaim::ReclaimQueue>,
 }
 
 #[cold]
@@ -602,6 +608,8 @@ impl BackendRouter {
         default_device: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
         block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
+        let reclaim = crate::block_reclaim::ReclaimQueue::from_env();
+        Self::wire_space_pressure_valve(&default_allocator, &reclaim);
         let router = Self {
             default_allocator,
             default_device,
@@ -618,11 +626,46 @@ impl BackendRouter {
             placement_picks: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
+            reclaim,
         };
         // Seed the table so bare routers place without waiting for a
         // worker tick (construction-time probe, never per-write).
         router.refresh_placement_table();
         router
+    }
+
+    /// Wire an allocator's ENOSPC pressure valve to this router's reclaim
+    /// queue (tests/async_block_reclaim_tests.rs contract 2): an
+    /// allocation that would refuse for space force-drains the queued
+    /// reclaims first — a full volume can never be wedged by
+    /// lazily-queued space. The counter lives HERE so it means exactly
+    /// "valve drains" (0 except under real space pressure); explicit
+    /// drains (`reclaim_drain`, unmount) never bump it.
+    fn wire_space_pressure_valve(
+        allocator: &std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        reclaim: &std::sync::Arc<crate::block_reclaim::ReclaimQueue>,
+    ) {
+        let rq = reclaim.clone();
+        allocator.set_space_pressure_valve(std::sync::Arc::new(move || {
+            METRICS
+                .block_free_reclaim_sync_drains
+                .fetch_add(1, Ordering::Relaxed);
+            rq.drain_sync();
+        }));
+    }
+
+    /// Drain the background reclaim queue to empty (blocking work runs on
+    /// the blocking pool): unmount teardown and tests. Conservation face:
+    /// after this returns, every previously-enqueued range has been
+    /// reclaimed-or-consciously-skipped and `finish_free`d.
+    pub async fn reclaim_drain(&self) {
+        let q = self.reclaim.clone();
+        if tokio::task::spawn_blocking(move || q.drain_sync())
+            .await
+            .is_err()
+        {
+            log::error!("reclaim_drain blocking task panicked");
+        }
     }
 
     /// Wire the terminal-free read-tier purge (see the field doc). Called
@@ -825,6 +868,7 @@ impl BackendRouter {
         let allocator = std::sync::Arc::new(
             crate::block_allocator::BlockAllocator::new(meta_client, id).await?,
         );
+        Self::wire_space_pressure_valve(&allocator, &self.reclaim);
         match crate::nvme_dev::device_capacity_bytes(backing_dev) {
             Ok(cap) => allocator.set_capacity_bytes(cap),
             Err(e) => {
@@ -1426,87 +1470,6 @@ impl BackendRouter {
         }
     }
 
-    /// Reclaim a terminally-freed block's device range per
-    /// [`free_reclaim_op`] (the shim-write-amplification fix —
-    /// `.benchmarks/2026-07-27-shim-write-amplification.md`): PUNCH_HOLE
-    /// on regular-file backings (host-FS sparse reclaim, cheap metadata),
-    /// `BLKDISCARD` on block devices (NVMe Deallocate — no data payload,
-    /// no write bandwidth; the former unconditional PUNCH_HOLE was
-    /// `blkdev_issue_zeroout` there = a full block of Write-Zeroes per
-    /// freed block = the measured 1.85×-field / 2.000×-rig device write
-    /// amplification on every steady-state overwrite/delete stream).
-    /// Refused/unsupported reclaims are SKIPPED and counted — never
-    /// degraded into a zeroing write; freed ranges are never read (hole
-    /// semantics + write-before-publish + the incarnation seqlock).
-    fn reclaim_freed_range_sync(device_path: &str, offset: u64, size: u64) {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::fs::MetadataExt;
-            use std::os::unix::io::AsRawFd;
-            use std::sync::atomic::Ordering;
-            let Ok(file) = std::fs::OpenOptions::new().write(true).open(device_path) else {
-                crate::fuse_client::METRICS
-                    .block_free_reclaim_skipped
-                    .fetch_add(1, Ordering::Relaxed);
-                return;
-            };
-            let mode = file.metadata().map(|m| m.mode()).unwrap_or(0);
-            let fd = file.as_raw_fd();
-            match free_reclaim_op(mode) {
-                FreeReclaimOp::FilePunch => {
-                    let r = unsafe {
-                        libc::fallocate(
-                            fd,
-                            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                            offset as libc::off_t,
-                            size as libc::off_t,
-                        )
-                    };
-                    if r == 0 {
-                        crate::fuse_client::METRICS
-                            .block_free_file_punches
-                            .fetch_add(1, Ordering::Relaxed);
-                        crate::fuse_client::METRICS
-                            .block_free_punch_bytes
-                            .fetch_add(size, Ordering::Relaxed);
-                    } else {
-                        crate::fuse_client::METRICS
-                            .block_free_reclaim_skipped
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                FreeReclaimOp::BdevDiscard => {
-                    // BLKDISCARD = _IO(0x12, 119): REQ_OP_DISCARD (NVMe DSM
-                    // Deallocate). Not in the libc crate's const table.
-                    const BLKDISCARD: libc::c_ulong = 0x1277;
-                    let range: [u64; 2] = [offset, size];
-                    let r = unsafe { libc::ioctl(fd, BLKDISCARD as _, range.as_ptr()) };
-                    if r == 0 {
-                        crate::fuse_client::METRICS
-                            .block_free_discards
-                            .fetch_add(1, Ordering::Relaxed);
-                        crate::fuse_client::METRICS
-                            .block_free_discard_bytes
-                            .fetch_add(size, Ordering::Relaxed);
-                    } else {
-                        // Unsupported/refused deallocate: skip loud-once in
-                        // the counter, NEVER a zeroing-write fallback.
-                        crate::fuse_client::METRICS
-                            .block_free_reclaim_skipped
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                FreeReclaimOp::Skip => {
-                    crate::fuse_client::METRICS
-                        .block_free_reclaim_skipped
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = (device_path, offset, size);
-    }
-
     /// The allocator that owns a block key's offset (see incarnation seqlock in
     /// [`crate::block_allocator::BlockAllocator`]).
     fn allocator_for_key(
@@ -1570,6 +1533,14 @@ impl BackendRouter {
     /// until after the reclaim, so it can never race a new owner's DMA
     /// at the reused offset (the acked-write lost-update class surfaced
     /// by PR 6's pinned striped concurrency test).
+    ///
+    /// Since the async block-reclaim fix the reclaim + `finish_free` are
+    /// QUEUED to `crate::block_reclaim` (the whole window moves to the
+    /// background worker wholesale — on NVMe-oF the synchronous discard
+    /// was a ~235 µs fabric round-trip per displaced block, ~2 GB/s of
+    /// overwrite throughput). `begin_free` and the read-tier purge stay
+    /// on this path: free ACCOUNTING is synchronous; only space RETURN is
+    /// deferred.
     pub async fn free_block(&self, block_key: &str) -> Result<()> {
         // Decoration-tolerant: size-carrying mappings (`bk:off:len` — see
         // `parse_block_mapping`) free their BASE block; a raw parse of the
@@ -1603,8 +1574,17 @@ impl BackendRouter {
                 purge(block_key);
             }
             let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
-            Self::reclaim_freed_range_sync(&device_path, offset, block_size);
-            allocator.finish_free(offset);
+            // Queue the reclaim + finish_free; the in-flight registration
+            // shields the begin_free-limbo offset from fsck's C2/C3/C6
+            // adjudication while the queue owns it.
+            let inflight = allocator.inflight_register(offset);
+            self.reclaim.enqueue(crate::block_reclaim::ReclaimEntry {
+                allocator,
+                inflight,
+                device_path,
+                offset,
+                size: block_size,
+            });
         }
         Ok(())
     }

@@ -45,6 +45,7 @@ macro_rules! coz_progress {
     };
 }
 pub mod block_allocator;
+pub mod block_reclaim;
 pub mod jobs;
 pub mod storage;
 pub mod stripe_locks;

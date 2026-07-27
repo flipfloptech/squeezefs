@@ -557,6 +557,8 @@ async fn test_multi_volume_inline_map_remount_recovery_smoke() {
             .await
             .unwrap_or_else(|e| panic!("delete of {name} failed: {e:?}"));
     }
+    // Async block-reclaim: delete's frees finish on the background queue.
+    h2.fs.router.backend_router.reclaim_drain().await;
     for vol in &h2.volumes {
         assert_eq!(
             vol.allocator.get_used_blocks(),

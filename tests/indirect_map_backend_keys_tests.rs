@@ -624,6 +624,9 @@ async fn test_spill_roundtrip_preserves_prefixed_keys_and_versioned_header() {
         expect_shrunk,
         "re-inlined map must preserve the prefixed keys byte-identical"
     );
+    // Async block-reclaim: the displaced indirect block's finish_free
+    // rides the background queue — drain before observing used-blocks.
+    router.backend_router.reclaim_drain().await;
     let used_after: u64 = devs.iter().map(|(_, _, a)| a.get_used_blocks()).sum();
     assert_eq!(
         used_after + 1,
@@ -746,6 +749,8 @@ async fn test_single_volume_spilled_map_keys_stay_bare_and_roundtrip() {
         .delete_file(&path, &mut con)
         .await
         .expect("delete_file");
+    // Async block-reclaim: delete's frees finish on the background queue.
+    h.fs.router.backend_router.reclaim_drain().await;
     assert_eq!(
         h.volumes[0].allocator.get_used_blocks(),
         0,

@@ -398,6 +398,8 @@ async fn test_small_block_map_stays_inline() {
         .delete_file(&file_path, &mut meta_connection)
         .await
         .unwrap();
+    // Async block-reclaim: delete's frees finish on the background queue.
+    fs.router.backend_router.reclaim_drain().await;
 
     // Verify all data blocks are freed
     let end_blocks = block_alloc.get_used_blocks();

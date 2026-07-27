@@ -386,6 +386,9 @@ async fn test_multi_volume_striped_burst_reads_back_and_frees_cleanly() {
     )
     .await
     .unwrap();
+    // Async block-reclaim: truncate's displaced frees finish on the
+    // background queue.
+    h.fs.router.backend_router.reclaim_drain().await;
 
     for vol in &h.volumes {
         assert_eq!(
@@ -442,6 +445,8 @@ async fn assert_legacy_keys_resolve(h: &H) {
         .await
         .unwrap();
     h.fs.router.backend_router.free_block(&bare).await.unwrap();
+    // Async block-reclaim: frees finish on the background queue.
+    h.fs.router.backend_router.reclaim_drain().await;
     assert_eq!(
         alloc.get_used_blocks(),
         0,
@@ -522,6 +527,8 @@ async fn test_single_volume_persisted_keys_stay_unprefixed_and_read_back() {
     )
     .await
     .unwrap();
+    // Async block-reclaim: truncate's frees finish on the background queue.
+    h.fs.router.backend_router.reclaim_drain().await;
     assert_eq!(h.volumes[0].allocator.get_used_blocks(), 0);
 }
 

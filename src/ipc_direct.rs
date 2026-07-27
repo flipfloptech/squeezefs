@@ -2,9 +2,13 @@
 //! (`docs/design-preload-interception.md` §5.5/§12 pre-agreed fallback
 //! shape; charter `.benchmarks/2026-07-26-ipc-handoff-economy.md` §7).
 //!
-//! For the dominant governed miss shape — a `direct_device_true` mount,
-//! an O_DIRECT binding, and a single-block device-class (4–64 KiB)
-//! ranged read of a striped, whole-block-mapped, non-overlay block —
+//! For the governed miss shapes — an O_DIRECT binding's single-block
+//! device-class (4–64 KiB) ranged read of a striped, whole-block-mapped,
+//! non-overlay block, on either a `direct_device_true` mount (DIALED P1:
+//! every such miss) or a DEFAULT hybrid mount when the R1b admission
+//! decision DENIES the miss (DIALED P1.5: first touch / Red / cooldown /
+//! governor token denial — semantically identical to a device-true
+//! serve: ranged device read, no tier publish, nothing to invalidate) —
 //! the IPC service thread submits the device read DIRECTLY on this
 //! module's ipc-host-owned io_uring and the ring slot completes from
 //! the CQE: **no task, no tokio, no handler**. That deletes the per-op
@@ -22,6 +26,13 @@
 //! epoch + fill incarnation). Any prelude miss falls back to the
 //! existing handler path (fallback-is-correctness, the aio slot-reroute
 //! posture), recorded in the `ipc_direct_ineligible_*` decision ledger.
+//! On DEFAULT mounts the sink's prelude additionally runs the admission
+//! decision synchronously (`DataPlaneSink::try_direct_drive_default`):
+//! tier probes ride the sync fast path first (O_DIRECT tier hits still
+//! serve from tier — the 2026-07-15 hybrid directive), the ghost touch
+//! is RECORDED either way (skew evidence keeps accumulating through the
+//! ring), and GRANT-shaped escalation candidates route to the handler,
+//! where the admission fetch + publish machinery lives unchanged.
 //!
 //! ## Lock-order lattice
 //!
@@ -343,9 +354,15 @@ impl DirectDriveEngine {
                 .ranged_read_unaligned_bounces
                 .fetch_add(1, Ordering::Relaxed);
         }
-        METRICS
-            .read_device_true_reads
-            .fetch_add(1, Ordering::Relaxed);
+        // Posture parity (DIALED P1.5): `read_device_true_reads` is the
+        // ddt escape's family — the handler counts it only under
+        // `device_true`, so a default-mount governor-denied direct-drive
+        // must not inflate it (the amplification-methodology ruler).
+        if router.direct_device_true() {
+            METRICS
+                .read_device_true_reads
+                .fetch_add(1, Ordering::Relaxed);
+        }
         METRICS
             .read_odirect_requests
             .fetch_add(1, Ordering::Relaxed);

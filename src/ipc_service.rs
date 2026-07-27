@@ -195,11 +195,12 @@ pub struct DataPlaneSink {
     req_uid: u32,
     req_gid: u32,
     req_pid: u32,
-    /// DIALED P1 direct-drive engine (`crate::ipc_direct`), built
-    /// lazily on the FIRST governed (ddt + O_DIRECT) miss so mounts
-    /// that never see the shape pay nothing. `Some(None)` = spawn
-    /// failed once, loudly — every governed op falls back to the
-    /// handler path (fallback-is-correctness).
+    /// DIALED P1/P1.5 direct-drive engine (`crate::ipc_direct`), built
+    /// lazily on the FIRST governed O_DIRECT miss — the ddt posture's
+    /// every-miss slice (P1) or the default posture's governor-DENIED
+    /// slice (P1.5) — so mounts that never see the shape pay nothing.
+    /// `Some(None)` = spawn failed once, loudly — every governed op
+    /// falls back to the handler path (fallback-is-correctness).
     direct: std::sync::OnceLock<Option<Arc<crate::ipc_direct::DirectDriveEngine>>>,
 }
 
@@ -377,6 +378,29 @@ impl DataPlaneSink {
                         completion.complete(bytes.len() as i64);
                     }
                     IpcReadProbe::Miss => {
+                        // DIALED P1.5 (2026-07-27): a governed O_DIRECT
+                        // miss on the DEFAULT mount runs the R1b
+                        // admission decision synchronously in the
+                        // prelude — a DENIED miss (the majority on
+                        // working sets ≫ budget) is semantically a
+                        // device-true serve (ranged device read, no tier
+                        // publish, nothing to invalidate) and
+                        // direct-drives on the ipc-host uring. GRANTED
+                        // escalations and every prelude/policy refusal
+                        // demote to the handler exactly as before; a
+                        // direct-driven op is not a demotion (that
+                        // counter keeps meaning "went to the async
+                        // handoff" — the ddt branch's own posture).
+                        // Buffered bindings never enter (the 2026-07-15
+                        // hybrid-serve directive stays law).
+                        let (op, completion) = if op.binding.odirect {
+                            match self.try_direct_drive_default(op, completion) {
+                                Ok(()) => return,
+                                Err(pair) => pair,
+                            }
+                        } else {
+                            (op, completion)
+                        };
                         METRICS
                             .ipc_fast_path_miss_demotions
                             .fetch_add(1, Ordering::Relaxed);
@@ -391,6 +415,86 @@ impl DataPlaneSink {
                     .ipc_fast_path_lock_demotions
                     .fetch_add(1, Ordering::Relaxed);
                 self.enqueue_read(op, completion);
+            }
+        }
+    }
+
+    /// DIALED P1.5 (2026-07-27, `.benchmarks/2026-07-27-ipc-direct-drive-default.md`):
+    /// the DEFAULT-mount governed-miss reroute. Runs the R1b admission
+    /// decision synchronously — every step latch-free single-word
+    /// atomics/moka probes, callable from the foreign service thread
+    /// (no inode guard, no node lock, no blocking lock crosses the
+    /// prelude):
+    ///
+    /// 1. **Dispatch parity**: only the `second-touch` admission mode
+    ///    (the default) carries the governor decision this reroute
+    ///    mirrors; `always`/`never` diagnostic modes keep their verbatim
+    ///    handler semantics. The §5.6 `ranged_eligible` rule (threshold +
+    ///    stream-classification veto) must hold — a read the handler
+    ///    would not range must not direct-drive (whole-block + pipeline
+    ///    dispatch stays the handler's).
+    /// 2. **The P1 shape/custody prelude** (`ipc_direct_read_probe`):
+    ///    identical to the ddt leg — overlay screens both sides, 795
+    ///    snapshot, fallback-is-correctness for anything ambiguous.
+    /// 3. **The admission decision**: `ranged_escalation_candidate`
+    ///    records the ghost TOUCH (always — skewed hot subsets must keep
+    ///    accumulating re-hit evidence through the ring or they never
+    ///    earn admission) and gates Red/cooldown; a candidate then takes
+    ///    the governor's NON-RESERVING peek. **GRANT-shaped ⇒ handler**
+    ///    (the admission fetch + publish machinery stays where it is;
+    ///    `allow_escalation` there remains the ONLY token reservation
+    ///    site). **DENIED ⇒ direct-drive** with the denial accounted by
+    ///    the peek and NO cooldown recorded — hot keys retry and win the
+    ///    trickle (the governor's skew-convergence design).
+    ///
+    /// Racy-tolerance note (documented, bounded): a prelude-recorded
+    /// touch whose op then falls back to the handler (engine SQ-full /
+    /// backend refusal / post-CQE 795 failure) is re-recorded by the
+    /// handler's own candidacy check — at worst one EXTRA touch, i.e.
+    /// one earlier escalation, still governor-bounded (the GhostTable's
+    /// own racy-tolerance class); fallbacks are ≈ 0 in steady state.
+    fn try_direct_drive_default(
+        &self,
+        op: DataOp,
+        completion: SlotCompletion,
+    ) -> Result<(), (DataOp, SlotCompletion)> {
+        let router = &self.fs.router;
+        if router.tier_admission != crate::routing::TierAdmission::SecondTouch {
+            Self::count_direct_ineligible(IpcDirectIneligible::Policy);
+            return Err((op, completion));
+        }
+        let ino = op.binding.ino;
+        let file_path = crate::keys::inode_path(ino);
+        if !router.ranged_eligible(&file_path, u64::from(op.desc.len)) {
+            Self::count_direct_ineligible(IpcDirectIneligible::Policy);
+            return Err((op, completion));
+        }
+        let snap = match self
+            .fs
+            .ipc_direct_read_probe(ino, op.desc.offset, op.desc.len)
+        {
+            Ok(snap) => snap,
+            Err(class) => {
+                Self::count_direct_ineligible(class);
+                return Err((op, completion));
+            }
+        };
+        if router.ranged_escalation_candidate(&snap.key)
+            && router
+                .cache
+                .admission_governor
+                .escalation_would_admit(router.block_size.load(Ordering::Relaxed))
+        {
+            // GRANT: the escalation (whole-block ghost admission +
+            // validated publish) rides the unchanged handler path.
+            Self::count_direct_ineligible(IpcDirectIneligible::Policy);
+            return Err((op, completion));
+        }
+        match self.direct_engine() {
+            Some(engine) => engine.submit(op, completion, snap),
+            None => {
+                Self::count_direct_ineligible(IpcDirectIneligible::Backend);
+                Err((op, completion))
             }
         }
     }

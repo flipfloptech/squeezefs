@@ -556,9 +556,7 @@ fn snap() -> Deltas {
         inel_overlay: METRICS
             .ipc_direct_ineligible_overlay
             .load(Ordering::Relaxed),
-        inel_policy: METRICS
-            .ipc_direct_ineligible_policy
-            .load(Ordering::Relaxed),
+        inel_policy: METRICS.ipc_direct_ineligible_policy.load(Ordering::Relaxed),
         denials: METRICS
             .read_admission_governor_denials
             .load(Ordering::Relaxed),
@@ -1012,7 +1010,10 @@ async fn default_mount_governed_miss_ladder() {
         "default-posture direct-drive must NOT count read_device_true_reads \
          (that counter is the ddt escape's family)"
     );
-    assert_eq!(d.denials, 0, "an unclamped first touch is not a governor denial");
+    assert_eq!(
+        d.denials, 0,
+        "an unclamped first touch is not a governor denial"
+    );
 
     // (b) SECOND touch of the same block key: the prelude's ghost
     // recording in (a) is the evidence — the touch is now a GRANT-shaped

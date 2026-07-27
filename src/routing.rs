@@ -4077,6 +4077,24 @@ impl DataRouter {
                 .is_some_and(|lanes| lanes.any_streaming_fresh())
     }
 
+    /// The hybrid second-touch escalation CANDIDACY prefix — ONE
+    /// definition for the handler's ranged dispatch and the DIALED P1.5
+    /// IPC direct-drive prelude: records the ghost TOUCH (always — skew
+    /// evidence must accumulate regardless of the verdict), then gates on
+    /// the ghost hit, mem-budget Red (escalations pause, heat recording
+    /// continues — the §5.7 publish-pause mirror), and the per-key
+    /// escalation cooldown. `true` = the touch is escalation-shaped and
+    /// the caller consults the governor (`allow_escalation` on the
+    /// authoritative handler site, `escalation_would_admit` on the
+    /// prelude peek). Latch-free single-word atomics throughout —
+    /// prelude-callable from a foreign service thread.
+    pub(crate) fn ranged_escalation_candidate(&self, block_key: &str) -> bool {
+        let ghost_hit = self.ghost.check_and_record(block_key);
+        ghost_hit
+            && crate::mem_budget::level() != crate::mem_budget::Level::Red
+            && !self.escalation_cooldown.recently_escalated(block_key)
+    }
+
     /// BINDING-VALIDATED ranged striped serve (R3, §5.6). Identical proof
     /// obligation to [`Self::get_block_for_index`]: bytes for key K serve
     /// block `b` only if (a) the fill was incarnation-valid — snapshot
@@ -4137,10 +4155,7 @@ impl DataRouter {
         // so first touches keep exactly one ghost interaction per read.
         if !device_true && self.tier_admission == TierAdmission::SecondTouch {
             if let Some(k) = resolved_key {
-                let ghost_hit = self.ghost.check_and_record(k);
-                if ghost_hit
-                    && crate::mem_budget::level() != crate::mem_budget::Level::Red
-                    && !self.escalation_cooldown.recently_escalated(k)
+                if self.ranged_escalation_candidate(k)
                     // Scan-resistance governor (2026-07-26): an escalation
                     // is a whole-block admission FETCH — under the waste
                     // clamp it must fit the fill budget or the read stays

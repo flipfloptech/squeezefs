@@ -56,6 +56,13 @@
 #   SQZ_DEVSUB_TCP_SVC=54129      tcp mode: NVMe/TCP service port — keep it
 #                                 inside the devsub-tcp slice 54100–54199
 #                                 (54000–54099 belongs to the fidelity tier)
+#   SQZ_DEVSUB_INSTANCE=          optional [a-z0-9]{1,8} instance suffix: a
+#                                 SECOND substrate of the SAME transport on
+#                                 one box (two agents, one rig). Derives a
+#                                 fully-disjoint identifier family (state
+#                                 dir, port id, tcp service port, NQNs,
+#                                 null_blk names, loop traddr); empty keeps
+#                                 every historical name byte-identically
 #   SQZ_DEVSUB_MDS_COUNT=4        metadata namespaces (memory-backed null_blk)
 #   SQZ_DEVSUB_MDS_GB=1           GiB per metadata device (RAM, allocated on write)
 #   SQZ_DEVSUB_MDS_CACHE_MB=256   null_blk write-back cache MiB (>0 ⇒ real
@@ -126,25 +133,45 @@ loop | tcp) ;;
     ;;
 esac
 TCP_ADDR="${SQZ_DEVSUB_TCP_ADDR:-127.0.0.1}"
-TCP_SVC="${SQZ_DEVSUB_TCP_SVC:-54129}"
+# Optional instance suffix (2026-07-27 write-pipeline campaign): TWO agents
+# on one box each need their OWN substrate of the SAME transport (the
+# transport-scoped identifiers alone collide). `SQZ_DEVSUB_INSTANCE=b`
+# derives a fully-disjoint identifier family — state dir, nvmet port id,
+# tcp service port, NQN prefix, null_blk prefix, loop traddr — exactly the
+# existing disjointness law extended one level. Empty (default) preserves
+# every historical name byte-identically.
+INSTANCE="${SQZ_DEVSUB_INSTANCE:-}"
+if [ -n "$INSTANCE" ] && ! [[ "$INSTANCE" =~ ^[a-z0-9]{1,8}$ ]]; then
+    echo "[devsub] ERROR: SQZ_DEVSUB_INSTANCE must be 1-8 chars of [a-z0-9] (got '$INSTANCE')" >&2
+    exit 1
+fi
+# Instance port offsets: a stable small integer derived from the suffix so
+# two instances never share a nvmet port id / tcp service port by default
+# (explicit SQZ_DEVSUB_PORT_ID / SQZ_DEVSUB_TCP_SVC still win verbatim).
+INSTANCE_OFF=0
+if [ -n "$INSTANCE" ]; then
+    INSTANCE_OFF=$((($(printf '%s' "$INSTANCE" | cksum | cut -d' ' -f1) % 30) + 2))
+fi
+TCP_SVC="${SQZ_DEVSUB_TCP_SVC:-$((54129 + INSTANCE_OFF))}"
 # Loop-mode port address: nvmet loop ports accept a free-form traddr, and
 # `nvme connect -t loop -a` selects by it — the only way to name OUR port
 # on a box that also carries foreign loop rigs (see create_port).
-LOOP_TRADDR="sqzdevsub"
+LOOP_TRADDR="sqzdevsub${INSTANCE}"
 
 # Every ownership handle is transport-scoped and DISJOINT (prefix globs must
 # not overlap: a loop-mode stale-state sweep must never claim tcp-mode
-# objects, and vice versa), so both substrates can coexist on one box.
+# objects, and vice versa; an instance-suffixed substrate must never claim
+# the default instance's objects), so multiple substrates coexist on one box.
 if [ "$TRANSPORT" = "tcp" ]; then
-    STATE_DIR="${SQZ_DEVSUB_STATE_DIR:-/run/squeezefs-devsub-tcp}"
-    PORT_ID="${SQZ_DEVSUB_PORT_ID:-52027}"
-    NQN_PREFIX="nqn.2026-07.io.squeezefs:devsubtcp-"
-    NULLB_PREFIX="sqzdevsubtcp_"
+    STATE_DIR="${SQZ_DEVSUB_STATE_DIR:-/run/squeezefs-devsub-tcp${INSTANCE:+-$INSTANCE}}"
+    PORT_ID="${SQZ_DEVSUB_PORT_ID:-$((52027 + 2 * INSTANCE_OFF))}"
+    NQN_PREFIX="nqn.2026-07.io.squeezefs:devsubtcp${INSTANCE}-"
+    NULLB_PREFIX="sqzdevsubtcp${INSTANCE}_"
 else
-    STATE_DIR="${SQZ_DEVSUB_STATE_DIR:-/run/squeezefs-devsub}"
-    PORT_ID="${SQZ_DEVSUB_PORT_ID:-52026}"
-    NQN_PREFIX="nqn.2026-07.io.squeezefs:devsub-"
-    NULLB_PREFIX="sqzdevsub_"
+    STATE_DIR="${SQZ_DEVSUB_STATE_DIR:-/run/squeezefs-devsub${INSTANCE:+-$INSTANCE}}"
+    PORT_ID="${SQZ_DEVSUB_PORT_ID:-$((52026 + 2 * INSTANCE_OFF))}"
+    NQN_PREFIX="nqn.2026-07.io.squeezefs:devsub${INSTANCE}-"
+    NULLB_PREFIX="sqzdevsub${INSTANCE}_"
 fi
 MDS_COUNT="${SQZ_DEVSUB_MDS_COUNT:-4}"
 MDS_GB="${SQZ_DEVSUB_MDS_GB:-1}"

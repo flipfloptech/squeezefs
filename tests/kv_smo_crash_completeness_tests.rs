@@ -961,39 +961,26 @@ async fn pending_free_at_cap_forced_cycle_completes_and_conserves_extents() {
     );
 }
 
-/// The bounded-retry-then-loud terminal (PR 4 row, the `checkpoint_past`
-/// precedent): a GENUINELY wedged tail — a floor that no forced cycle can
-/// discharge pinned BELOW every parked retirement — must present as a
-/// loud volume failure after N forced cycles, never as an unbounded
-/// forced-cycle retry loop and never as the silent post-swap leak.
+/// The §4.7 pinned-floor at-cap shape — the closed dependency cycle the
+/// 2026-07 P2 campaign caught wedging both this suite (1/40 idle, 7/60
+/// under load) and a REAL metadata volume during its md storms
+/// (`.benchmarks/2026-07-26-fuse-per-op-economy.md` §9): the XATTRS root
+/// leaf is positioned **log-full-dirty with the oldest live floor**
+/// (one un-cycled burst after K−1 covered appends), then the pending
+/// FIFO is saturated with exactly `cap` YOUNGER retirements
+/// (threshold-driven INODES compactions, no cycles — their free gates
+/// all post-date the xattr floor). Every flush pass now needs the xattr
+/// leaf's compaction SMO to discharge the pinning floor; pre-fix the
+/// saturated FIFO refused it at admission headroom and the pass
+/// skip-deferred (clause c), restoring the ancient floor — tail pinned
+/// below every parked gate, `advance_durable` releases nothing, the FIFO
+/// stays full: a closed cycle no schedule could exit.
 ///
-/// Wedge construction (healthy I/O, no fault injection): the XATTRS root
-/// leaf is positioned log-full-dirty FIRST (its floor predates
-/// everything), so every forced cycle's flush pass needs its compaction
-/// SMO — which the saturated FIFO refuses at admission headroom
-/// (clause a) and the flush pass skips-and-defers (clause c), restoring
-/// the ancient floor: the tail can never reach the younger parked
-/// retirements, `pending_count` never decreases, and after N cycles the
-/// arm fails the volume loud (clause b's terminal).
-///
-/// RED on dev: the at-cap SMO leaks post-swap and the volume stays
-/// "healthy" (silent custody loss). GREEN under PR 4: `is_failed()`
-/// latches within the maintenance drive.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pending_free_wedged_tail_fails_volume_loud_never_livelocks() {
-    struct Cleanup;
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
-            TEST_PENDING_FREE_CAP.store(0, Ordering::SeqCst);
-        }
-    }
-    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
-    TEST_PENDING_FREE_CAP.store(2, Ordering::SeqCst);
-    let _cleanup = Cleanup;
-
-    let (_routed, kv, _file) = sandbox().await;
-
+/// Returns the INODES fill ino. On return: `pending == cap(2)`, the
+/// xattr leaf's next freeze-append must overflow into the compaction
+/// path, and its floor is the volume-wide minimum. The caller owns
+/// `TEST_PENDING_FREE_CAP = 2` and the parked cadence.
+async fn construct_pinned_floor_at_cap(kv: &Arc<KvMetaBackend>) -> u64 {
     let fill_ino = kv
         .create(1, "fillfile", libc::S_IFREG | 0o644, 0, 0)
         .await
@@ -1007,9 +994,8 @@ async fn pending_free_wedged_tail_fails_volume_loud_never_livelocks() {
     kv.checkpoint_now().await.expect("setup checkpoint");
 
     // Calibrate the XATTRS root leaf's lifecycle (bursts-to-compaction,
-    // measured on the second lifecycle like the fill calibration): xattr
-    // bursts touch ONLY the XATTRS tree, so its SMO cadence is
-    // independent of the INODES churn below.
+    // measured on the second lifecycle): xattr bursts touch ONLY the
+    // XATTRS tree, so its SMO cadence is independent of the INODES churn.
     let x_burst = |kv: Arc<KvMetaBackend>, flip: u32| async move {
         for j in 0..24u32 {
             let val = vec![u8::try_from((flip + j) % 251).unwrap(); 48];
@@ -1060,20 +1046,148 @@ async fn pending_free_wedged_tail_fails_volume_loud_never_livelocks() {
             placed = 0;
         }
     }
-    kv.checkpoint_now().await.expect("wedge quiesce");
-    assert_eq!(kv.pending_free_extents(), 0, "FIFO empty before the wedge");
+    kv.checkpoint_now().await.expect("shape quiesce");
+    assert_eq!(kv.pending_free_extents(), 0, "FIFO empty before the shape");
     x_burst(kv.clone(), x_flip).await; // the ancient floor, never cycled
 
-    // Saturate the FIFO with two YOUNGER retirements (threshold-driven
-    // INODES compactions, no cycles — their frees' seqs all post-date
-    // the xattr floor), then trigger the at-cap SMO. Every forced cycle
-    // must now skip the xattr leaf (headroom refused) and restore its
-    // ancient floor: tail pinned below the parked frees, no progress,
-    // loud terminal after N cycles.
-    // Each ~6 KiB burst wakes one maintenance pass; a mutation failing
-    // AFTER the loud latch is the expected fail-stop face (EIO), never a
-    // test error — a failure WITHOUT the latch is.
-    let big_burst = |kv: Arc<KvMetaBackend>, flip: u32| async move {
+    // Saturate the FIFO to exactly cap (= 2) YOUNGER retirements:
+    // threshold-driven INODES compactions (bursts > the 4 KiB writeback
+    // delta wake the parked-cadence task's maintenance pass — appends +
+    // SMOs, no checkpoint cycle), stopping the INSTANT pending hits cap
+    // so no third at-cap SMO fires during construction (each burst adds
+    // ~1.7 KiB of delta against a ~56 KiB log-fill spacing — stopping on
+    // the observed increment leaves a wide margin).
+    let mut flip = 0u32;
+    'saturate: for i in 0..400u32 {
+        assert!(
+            i < 399,
+            "FIFO saturation must converge within the burst budget"
+        );
+        for j in 0..64u32 {
+            let mode = libc::S_IFREG
+                | if (flip + j).is_multiple_of(2) {
+                    0o640
+                } else {
+                    0o600
+                };
+            kv.setattr(fill_ino, Some(mode), None, None, None, None, None, None)
+                .await
+                .expect("saturation setattr acked");
+        }
+        flip += 64;
+        for _ in 0..100 {
+            if kv.pending_free_extents() >= 2 {
+                break 'saturate;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+    assert_eq!(
+        kv.pending_free_extents(),
+        2,
+        "the construction saturates the FIFO to exactly cap"
+    );
+    assert!(!kv.is_failed(), "construction must leave the volume healthy");
+    fill_ino
+}
+
+/// THE WEDGE, driven through `checkpoint_now` — the audit-bypassing
+/// caller the P2 forensics named (`.benchmarks/2026-07-26-fuse-per-op-
+/// economy.md` §9): with the pinned-floor at-cap shape constructed,
+/// direct checkpoint cycles must CONVERGE — the flush pass compacts the
+/// log-full node even at cap (its retirement parks against the new
+/// cycle's tail instead of being refused at admission), the discharged
+/// floor lets the next cycle's tail pass every parked gate, and the FIFO
+/// drains. Two cycles suffice (one to discharge the pinning floor, one
+/// whose tail covers the parked gates); the budget is the audit bound.
+///
+/// RED on dev: every cycle skip-defers the log-full node (clause c),
+/// restores the ancient floor, and completes without progress —
+/// `pending` never leaves cap, silently, forever (the flake's 1-in-N
+/// face and the md-storm volume's persistent on-disk face).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_free_pinned_floor_at_cap_checkpoint_now_converges() {
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+            TEST_PENDING_FREE_CAP.store(0, Ordering::SeqCst);
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    TEST_PENDING_FREE_CAP.store(2, Ordering::SeqCst);
+    let _cleanup = Cleanup;
+
+    let (_routed, kv, _file) = sandbox().await;
+    let _fill_ino = construct_pinned_floor_at_cap(&kv).await;
+    // Conservation baseline: at-cap lifecycles are claim-1/free-1, so
+    // claimable + parked is invariant from here through full drain.
+    let free_a = kv.free_extents() + kv.pending_free_extents();
+
+    for i in 0..8u32 {
+        kv.checkpoint_now()
+            .await
+            .unwrap_or_else(|e| panic!("checkpoint cycle {i} must not fail: {e:?}"));
+        if kv.pending_free_extents() == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        kv.pending_free_extents(),
+        0,
+        "direct checkpoint_now cycles must break the §4.7 pinned-floor \
+         at-cap cycle within the audit bound — the flush pass compacts the \
+         log-full node with its retirement parked against the new tail \
+         (P2 §9 fix direction a), never skip-defers it into a closed cycle"
+    );
+    assert!(
+        !kv.is_failed(),
+        "a resolvable pinned-floor shape must never present as the loud \
+         wedged-tail terminal"
+    );
+    assert_eq!(
+        kv.free_extents(),
+        free_a,
+        "at-cap compaction lifecycles stay claim-1/free-1: extents must be \
+         conserved once the parked retirements drain"
+    );
+}
+
+/// THE WEDGE, driven through the maintenance arms (the shape's original
+/// loud-terminal contract, RETIRED by the structural fix): a pinned
+/// floor at cap is a RESOLVABLE shape — the at-cap SMO refusal forces a
+/// progress-audited checkpoint cycle whose flush pass now discharges the
+/// pinning floor itself, so the forced cycles CONVERGE. Failing the
+/// volume loud here was a wedge with a log line (USER LAW: we can't have
+/// wedges — and the same shape re-wedged the REMOUNT, so "loud" was not
+/// an exit; the terminal remains only for tails no cycle can discharge,
+/// e.g. a stuck in-flight reservation).
+///
+/// RED on dev: `is_failed()` latches after 8 no-progress forced cycles
+/// (the retired test pinned that as the contract) and mutations EIO.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_free_pinned_floor_at_cap_maintenance_converges_never_fails_loud() {
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+            TEST_PENDING_FREE_CAP.store(0, Ordering::SeqCst);
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    TEST_PENDING_FREE_CAP.store(2, Ordering::SeqCst);
+    let _cleanup = Cleanup;
+
+    let (_routed, kv, _file) = sandbox().await;
+    let fill_ino = construct_pinned_floor_at_cap(&kv).await;
+
+    // Keep driving threshold maintenance into the at-cap regime: the
+    // next INODES log-fill SMO meets the saturated FIFO and the
+    // maintenance arm forces checkpoint cycles. Post-fix those cycles
+    // make structural progress; the volume must stay healthy and every
+    // mutation must keep acking.
+    let mut flip = 1_000u32;
+    for round in 0..120u32 {
         for j in 0..64u32 {
             let mode = libc::S_IFREG
                 | if (flip + j).is_multiple_of(2) {
@@ -1085,32 +1199,245 @@ async fn pending_free_wedged_tail_fails_volume_loud_never_livelocks() {
                 .setattr(fill_ino, Some(mode), None, None, None, None, None, None)
                 .await
             {
-                assert!(
-                    kv.is_failed(),
-                    "wedge setattr failed while the volume was still healthy: {e:?}"
+                panic!(
+                    "mutation refused at round {round} (is_failed={}): {e:?} — the \
+                     pinned-floor at-cap shape must CONVERGE through the maintenance \
+                     arms, never latch the loud terminal (it is resolvable by \
+                     construction: the flush pass can always discharge the floor)",
+                    kv.is_failed()
                 );
-                return;
             }
         }
-    };
-    let mut failed_loud = false;
-    'wedge: for flip in 0..120u32 {
-        big_burst(kv.clone(), flip).await;
-        for _ in 0..30 {
-            if kv.is_failed() {
-                failed_loud = true;
-                break 'wedge;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        flip += 64;
+        assert!(
+            !kv.is_failed(),
+            "loud wedged-tail terminal latched on a RESOLVABLE pinned-floor \
+             shape at round {round} — the structural fix must have retired this"
+        );
+    }
+
+    // Quiesce: bounded direct cycles drain everything that ever parked.
+    for _ in 0..8u32 {
+        kv.checkpoint_now().await.expect("quiesce cycle");
+        if kv.pending_free_extents() == 0 {
+            break;
         }
     }
+    assert_eq!(
+        kv.pending_free_extents(),
+        0,
+        "every retirement that parked during the at-cap drive must drain"
+    );
+    assert!(!kv.is_failed(), "the volume ends healthy");
+}
+
+/// THE WEDGE, crashed and remounted — the field-recovery contract (the
+/// preserved md-storm image's shape at cargo scale): a volume killed
+/// inside the pinned-floor at-cap cycle re-parks its in-window frees at
+/// mount (the §2-A mount gate), replays the log-full node's dirt, and
+/// pre-fix re-enters the identical closed cycle — a PERSISTENT on-disk
+/// wedge no remount could clear. Post-fix the first post-mount cycles
+/// discharge the floor and drain the parked frees: remount IS recovery.
+///
+/// RED on dev: `pending` never drains after reopen (the remount face of
+/// the flake); GREEN with the structural fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_free_wedged_shape_reopen_recovers_and_drains() {
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+            TEST_PENDING_FREE_CAP.store(0, Ordering::SeqCst);
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    TEST_PENDING_FREE_CAP.store(2, Ordering::SeqCst);
+    let _cleanup = Cleanup;
+
+    let (routed, kv, file) = sandbox().await;
+    let fill_ino = construct_pinned_floor_at_cap(&kv).await;
+
+    // Acked custody the recovery must serve.
+    const MARKER: u32 = libc::S_IFREG | 0o751;
+    kv.setattr(fill_ino, Some(MARKER), None, None, None, None, None, None)
+        .await
+        .expect("marker acked");
+
+    // Crash-equivalent kill inside the wedge shape.
+    drop(routed);
+    drop(kv);
+    let kv2 = reopen(file.path()).await;
+
+    assert_eq!(
+        kv2.pending_free_extents(),
+        2,
+        "the in-window frees re-park at mount (§2-A mount gate)"
+    );
+    for i in 0..8u32 {
+        kv2.checkpoint_now()
+            .await
+            .unwrap_or_else(|e| panic!("post-mount cycle {i} must not fail: {e:?}"));
+        if kv2.pending_free_extents() == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        kv2.pending_free_extents(),
+        0,
+        "the first post-mount cycles must break the replayed pinned-floor \
+         at-cap cycle and drain the re-parked frees — pre-fix this shape was \
+         a PERSISTENT on-disk wedge (the preserved 2026-07-26 md-storm image)"
+    );
+    assert!(!kv2.is_failed(), "recovery leaves the volume healthy");
+    let got = kv2
+        .getattr(fill_ino)
+        .await
+        .expect("acked inode served")
+        .mode;
+    assert_eq!(got, MARKER, "acked custody whole across the recovery");
+}
+
+/// The RING face of the wedge — the preserved image's actual mount-
+/// refusal symptom ("conveyor pass parked 30001 ms waiting for
+/// journal-ring admission"): a crash with an un-reclaimed replay window
+/// that exhausts the user-admissible ring slice. At mount the
+/// writer-claim commit — the volume's FIRST post-replay mutation, issued
+/// BEFORE the checkpoint task exists — has no ring headroom and NO drain
+/// source: it parks against nobody, escalates through the
+/// journal-failure lattice, and the mount is REFUSED. The volume is
+/// perfectly healthy on disk; the refusal is pure ordering. (On the
+/// preserved image this face COMPOSES with the pinned-floor at-cap
+/// cycle — the reason the window grew unreclaimed in the first place —
+/// which the sibling tests above cover; the composition is proven on the
+/// real image in `.benchmarks/2026-07-27-kv-pending-free-cycle.md`.)
+///
+/// Post-fix, the claim gate preflights ring headroom and runs bounded
+/// barriered recovery checkpoint cycles inline before committing the
+/// claim (it holds the flock + PR + the B2 decision — it IS the writer):
+/// remount IS recovery.
+///
+/// Construction: a floor-size ring (reserve carve-out + one max entry ⇒
+/// the user slice is ~one max entry), the cadence parked, and an
+/// un-cycled commit run — threshold passes append but never write a
+/// ledger, so `reusable_upto` never advances and the window monotonically
+/// exhausts the slice. Per-entry ring consumption is MEASURED (identical
+/// setattrs have identical entry lengths) and the fill stops when the
+/// next entry would not fit, so no fill commit ever parks and the
+/// leftover headroom is smaller than the (strictly longer) writer-claim
+/// entry. RED on dev: reopen refuses (claim parked; SQUEEZEFS_TIMEOUT
+/// shortened so the lattice latches in seconds) — `reopen` panics loud.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ring_full_crash_mount_recovers_via_preclaim_drain() {
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+            std::env::remove_var("SQUEEZEFS_TIMEOUT");
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cleanup = Cleanup;
+
+    // The minimum legal ring: 256 KiB reserve carve-out + one 128 KiB
+    // max entry (superblock plan floor).
+    let file = NamedTempFile::new().expect("temp volume");
+    file.as_file().set_len(VOL_LEN).unwrap();
+    format_v3(
+        file.path(),
+        VOL_LEN,
+        &FormatV3Options {
+            node_size: NODE_SIZE,
+            journal_len_override: Some(384 * 1024),
+            force: false,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .expect("format v3");
+    let kv = KvMetaBackend::open(file.path()).await.expect("open");
+
+    const MARKER: u32 = libc::S_IFREG | 0o751;
+    let ino = kv
+        .create(1, "ringfill", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("create acked")
+        .ino;
+    kv.checkpoint_now().await.expect("setup checkpoint");
+
+    // Measured-entry fill of the user-admissible slice, no cycles.
+    let headroom = |kv: &Arc<KvMetaBackend>| {
+        let core = kv.journal_ring().core();
+        (core.reusable_upto() + core.geometry().logical_len())
+            .saturating_sub(core.geometry().reserve_bytes)
+            .saturating_sub(core.head())
+    };
+    let probe_a = headroom(&kv);
+    kv.setattr(ino, Some(MARKER), None, None, None, None, None, None)
+        .await
+        .expect("entry-size probe acked");
+    let entry_len = probe_a.saturating_sub(headroom(&kv)).max(64);
+    for _ in 0..40_000u32 {
+        if headroom(&kv) < 2 * entry_len {
+            break;
+        }
+        kv.setattr(ino, Some(MARKER), None, None, None, None, None, None)
+            .await
+            .expect("ring-fill setattr acked");
+    }
     assert!(
-        failed_loud,
-        "a genuinely wedged tail with the FIFO at cap must FAIL THE VOLUME \
-         LOUD after bounded forced cycles (design-smo-replay-currency PR 4, \
-         the checkpoint_past precedent) — neither a silent post-swap leak \
-         (dev: the extent falls out of the live FIFO and the volume keeps \
-         acking) nor an unbounded forced-cycle retry loop"
+        headroom(&kv) < 2 * entry_len,
+        "the fill must exhaust the user-admissible ring slice \
+         (headroom {} B, entry {} B)",
+        headroom(&kv),
+        entry_len
+    );
+
+    // Crash-equivalent kill: the window is un-reclaimed (no ledger record
+    // covers it), so the next mount replays ~the whole user slice.
+    drop(kv);
+
+    // Shorten the park-escalation threshold so the DEV refusal face is
+    // seconds, not minutes; the fixed gate never parks at all.
+    std::env::set_var("SQUEEZEFS_TIMEOUT", "2");
+    let ckpts_before =
+        squeezefs::meta_backend::kv::META_KV_CHECKPOINTS.load(Ordering::Relaxed);
+    let kv2 = reopen(file.path()).await; // a refusal panics here, loud
+    std::env::remove_var("SQUEEZEFS_TIMEOUT");
+
+    assert!(
+        squeezefs::meta_backend::kv::META_KV_CHECKPOINTS.load(Ordering::Relaxed) > ckpts_before,
+        "the claim gate must ENGAGE the pre-claim recovery cycles on an \
+         exhausted ring (a silently-admitted claim would mean the \
+         construction lost its lever)"
+    );
+    assert!(!kv2.is_failed(), "recovered mount is healthy");
+    let got = kv2.getattr(ino).await.expect("acked inode served").mode;
+    assert_eq!(got, MARKER, "acked custody whole across the recovery");
+    // The recovered ring admits normal traffic again, and cycles drain
+    // whatever the recovery parked.
+    kv2.setattr(
+        ino,
+        Some(libc::S_IFREG | 0o600),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("post-recovery mutation acked");
+    for _ in 0..8u32 {
+        kv2.checkpoint_now().await.expect("post-recovery cycle");
+        if kv2.pending_free_extents() == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        kv2.pending_free_extents(),
+        0,
+        "the recovered mount drains every replayed retirement"
     );
 }
 

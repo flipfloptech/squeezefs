@@ -323,16 +323,20 @@ fi
 # 2h. kill-9 soak (L4-6, G-L4-4 zero-residue): SIGKILL a preload'd
 # writer mid-stream ×5; every cycle must drain sessions AND session-shm
 # bytes to the pre-cycle baseline (multi-run discipline: any failure
-# aborts the count).
+# aborts the count). Odd cycles write bs=1M — multi-slab pipelined
+# flights (DIALED P3 large-op economy: contiguous slot runs + arena-
+# extension holds) are in flight at SIGKILL, so run teardown/GC is
+# soaked, not just single-slab ops; even cycles keep the 64k shape.
 SESS_BASE=$(stats ipc_sessions_active)
 ARENA_BASE=$(stats ipc_arena_bytes)
 for i in 1 2 3 4 5; do
+    if [ $((i % 2)) -eq 1 ]; then KBS=1M; KCNT=6000; else KBS=64k; KCNT=100000; fi
     # Env-prefixed SIMPLE command: bash backgrounds the real process, so
     # $! is dd itself. (`ILP dd ... &` backgrounds a SUBSHELL running the
     # function — the first run of this soak killed the wrapper while dd
     # survived to finish normally, testing nothing.)
     LD_PRELOAD="$SO" SQUEEZEFS_IPC_ALLOW_DEV=1 \
-        dd if=/dev/zero of="$MOUNT_DIR/kill$i.bin" bs=64k count=100000 status=none &
+        dd if=/dev/zero of="$MOUNT_DIR/kill$i.bin" bs="$KBS" count="$KCNT" status=none &
     KPID=$!
     sleep 0.3
     kill -9 "$KPID" 2>/dev/null || true

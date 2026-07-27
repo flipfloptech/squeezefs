@@ -584,6 +584,20 @@ impl Session {
     /// O_DIRECT WRITE pipeline, converged by the caller's retry).
     pub fn ring_pwrite(&self, binding_id: u64, buf: &[u8], offset: u64) -> RingOutcome {
         let slab = self.slab as usize;
+        // Single-slab ops (the ≤64 KiB hot rows — every W1 patch-path
+        // write) keep the allocation-free serial path: one claim, one
+        // wait, zero flight bookkeeping — byte-identical to the pre-P3
+        // shape.
+        if buf.len() <= slab {
+            return match self.one_op(OP_WRITE, binding_id, offset, buf.len(), Some(buf)) {
+                OpResult::Done { slot, n } => {
+                    self.release_slot(slot);
+                    RingOutcome::Served(n.min(buf.len()))
+                }
+                OpResult::Errno(e) => RingOutcome::Errno(e),
+                OpResult::Fallthrough => RingOutcome::Fallthrough,
+            };
+        }
         let max_chunk = (self.geometry.max_op_bytes as usize).max(1);
         let mut flights: std::collections::VecDeque<WriteFlight> =
             std::collections::VecDeque::new();

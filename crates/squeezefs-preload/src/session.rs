@@ -968,6 +968,34 @@ impl Session {
     fn claim_run(&self, want: u32) -> Option<(u32, u64, u32)> {
         let slots = self.geometry.slots;
         let start = self.slot_hint.fetch_add(1, Ordering::Relaxed) % slots;
+        // Pass 1 — aligned stride: try bases at multiples of `want` first,
+        // extending only from an aligned base. Concurrent large writers
+        // then PACK runs instead of interleaving them (a random-start
+        // greedy scan fragments the array: measured ring/op 1.86 instead
+        // of 1.00 on the 16-thread 1 MiB row), and an aligned claimant
+        // that loses one slot of its window loses to a whole run, not to
+        // a stray mid-window claim.
+        if want > 1 && slots >= want {
+            let bases = slots / want;
+            let first = (start / want) % bases;
+            for i in 0..bases {
+                let base = ((first + i) % bases) * want;
+                if let Some(gen) = self.slot(base).core.try_claim() {
+                    let mut run = 1u32;
+                    while run < want && base + run < slots {
+                        if self.slot(base + run).core.try_claim().is_some() {
+                            run += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    return Some((base, gen, run));
+                }
+            }
+        }
+        // Pass 2 — greedy: any FREE base, extend as far as possible
+        // (fragmentation degrades run length, never refuses — the
+        // fragmented-slots pin).
         for i in 0..slots {
             let base = (start + i) % slots;
             if let Some(gen) = self.slot(base).core.try_claim() {

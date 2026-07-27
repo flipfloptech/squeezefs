@@ -330,7 +330,12 @@ fi
 SESS_BASE=$(stats ipc_sessions_active)
 ARENA_BASE=$(stats ipc_arena_bytes)
 for i in 1 2 3 4 5; do
-    if [ $((i % 2)) -eq 1 ]; then KBS=1M; KCNT=6000; else KBS=64k; KCNT=100000; fi
+    # Each cycle's file is removed after the drain check: a bs=1M dd
+    # writes ~600 MB before the 0.3 s kill, and letting five cycles
+    # accumulate fills the 1G gate backend — later cycles would then
+    # kill an ENOSPC'd writer instead of a healthy in-flight one.
+    if [ $((i % 2)) -eq 1 ]; then KBS=1M; else KBS=64k; fi
+    KCNT=100000
     # Env-prefixed SIMPLE command: bash backgrounds the real process, so
     # $! is dd itself. (`ILP dd ... &` backgrounds a SUBSHELL running the
     # function — the first run of this soak killed the wrapper while dd
@@ -348,6 +353,7 @@ for i in 1 2 3 4 5; do
         [ "$SECONDS" -lt "$deadline" ] || fail "kill-9 cycle $i: session/arena residue"
         sleep 0.2
     done
+    rm -f "$MOUNT_DIR/kill$i.bin" 2>/dev/null || true
 done
 mountpoint -q "$MOUNT_DIR" || fail "daemon died during the kill-9 soak"
 echo "OK: kill-9 soak (5 cycles, zero session/arena residue)"

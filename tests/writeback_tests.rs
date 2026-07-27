@@ -743,6 +743,17 @@ async fn harness_write(h: &FlushHarness, ino: u64, off: u64, data: &[u8]) {
     assert_eq!(w.written as usize, data.len(), "short write at {off}");
 }
 
+/// Drain the detached write-pipeline uploads (2026-07-27 campaign):
+/// coverage-completing writes ACK with custody parked, so FAIL_NEXT_WRITES
+/// injections must rendezvous with the detached upload before the poison
+/// is cleared (and before the next covering write could consume it).
+async fn drain_pipeline(h: &FlushHarness) {
+    assert!(
+        h.fs.write_pipeline.quiesce(Duration::from_secs(30)).await,
+        "write pipeline must drain"
+    );
+}
+
 async fn harness_read(h: &FlushHarness, ino: u64, off: u64, len: u32) -> Vec<u8> {
     h.fs.read(h.req, ino, 0, off, len, 0)
         .await
@@ -781,6 +792,7 @@ async fn test_striped_flush_dma_zero_copy_aligned_no_lru_retention() {
     // routes through the router's direct striped path, not staging.
     let p0: Vec<u8> = (0..8193u32).map(|i| (i % 199) as u8).collect();
     harness_write(&h, ino, 0, &p0).await;
+    drain_pipeline(&h).await; // settle before the poison window
 
     // The staged shape post-PR 4: content-complete blocks write through and
     // bypass staging, so the staged flush leg is reached via the never-lossy
@@ -795,6 +807,7 @@ async fn test_striped_flush_dma_zero_copy_aligned_no_lru_retention() {
     let p1: Vec<u8> = (0..5120u32).map(|i| ((i % 97) + 60) as u8).collect();
     squeezefs::nvme_dev::set_fail_next_writes(1);
     harness_write(&h, ino, 0, &p1).await;
+    drain_pipeline(&h).await; // the detached upload consumes the poison
     squeezefs::nvme_dev::clear_fail_next_writes();
     let cache_key0 = squeezefs::keys::active_block(ino, 0).to_string();
     assert!(
@@ -997,11 +1010,13 @@ async fn test_flush_write_verification_readback_runs_within_guard_hold() {
     // striped-flush test).
     let p0: Vec<u8> = (0..8193u32).map(|i| (i % 223) as u8).collect();
     harness_write(&h, ino, 0, &p0).await;
-    // W2 (RW4): >= 25 % tail slice keeps the FULL-buffer staged shape
-    // under test (sub-25 % would extent-park + fold instead).
+    drain_pipeline(&h).await; // settle before the poison window
+                              // W2 (RW4): >= 25 % tail slice keeps the FULL-buffer staged shape
+                              // under test (sub-25 % would extent-park + fold instead).
     let p1: Vec<u8> = (0..5120u32).map(|i| ((i % 113) + 5) as u8).collect();
     squeezefs::nvme_dev::set_fail_next_writes(1);
     harness_write(&h, ino, 0, &p1).await;
+    drain_pipeline(&h).await; // the detached upload consumes the poison
     squeezefs::nvme_dev::clear_fail_next_writes();
 
     // Every flush write from here runs the sampled read-back verify against

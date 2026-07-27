@@ -716,7 +716,6 @@ async fn test_single_volume_spilled_map_keys_stay_bare_and_roundtrip() {
     let h = mount_h(&specs, meta.path(), true).await;
     let ino = create_file(&h, "solo_spill.bin").await;
     striped_spill_burst(&h, ino, SPILL_BLOCKS).await;
-
     let layout = persisted_layout(&h.routed, ino).await;
     assert!(
         is_indirect(&layout),

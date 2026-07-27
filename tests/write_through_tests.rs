@@ -196,6 +196,20 @@ async fn write_at(h: &H, ino: u64, off: u64, data: &[u8]) {
     assert_eq!(w.written as usize, data.len(), "short write at {off}");
 }
 
+/// Drain the detached write-pipeline uploads (2026-07-27 campaign): a
+/// coverage-completing write now ACKs with custody parked and its upload
+/// rides a detached task, so publish-state observations (staging absence,
+/// backend map, `write_through_*` deltas) are deterministic only at the
+/// pipeline's drain point. The pinned contracts are unchanged — exactly
+/// one write-through per covering stream, no staging detour, no seed
+/// reads — this is the observation rendezvous, not a semantics change.
+async fn drain_pipeline(h: &H) {
+    assert!(
+        h.fs.write_pipeline.quiesce(Duration::from_secs(30)).await,
+        "write pipeline must drain"
+    );
+}
+
 async fn read_at(h: &H, ino: u64, off: u64, size: u32) -> Vec<u8> {
     h.fs.read(h.req, ino, 0, off, size, 0)
         .await
@@ -222,6 +236,9 @@ async fn backend_meta(h: &H, ino: u64) -> squeezefs::routing::CachedMetadata {
 async fn make_striped(h: &H, ino: u64, len: usize, seed: u8) -> Vec<u8> {
     let p = pattern(len, seed);
     write_at(h, ino, 0, &p).await;
+    // Fixture hygiene: settle the fixture's own detached uploads so later
+    // counter windows and FAIL_NEXT_WRITES injections are exact.
+    drain_pipeline(h).await;
     let meta = backend_meta(h, ino).await;
     assert_eq!(meta.file_type, "striped", "premise: file must be striped");
     p
@@ -423,6 +440,7 @@ async fn test_sequential_complete_block_writes_through_without_staging() {
     // (write_end == b_end), block 1 becomes a partial RAM tail.
     let p1 = pattern(BS as usize + 1, 60);
     write_at(&h, ino, 0, &p1).await;
+    drain_pipeline(&h).await;
 
     assert!(
         h.fs.router
@@ -503,6 +521,7 @@ async fn test_rmw_partial_end_write_parks_then_completion_writes_through() {
 
     // Completing the union fires exactly one write-through.
     write_at(&h, ino, 0, &expected[..100]).await;
+    drain_pipeline(&h).await;
     assert_eq!(wt_blocks() - before, 1, "union completion writes through");
     assert!(
         h.fs.router
@@ -529,6 +548,7 @@ async fn test_one_shot_full_block_write_through() {
     // block 2 is a 1-byte partial tail.
     let p = pattern(BS as usize + 1, 42);
     write_at(&h, ino, BS, &p).await;
+    drain_pipeline(&h).await;
 
     assert!(
         h.fs.router
@@ -666,6 +686,7 @@ async fn test_tail_first_fill_parks_then_head_completes_coverage() {
     // Head write completes the union → exactly one write-through.
     let head = pattern((BS / 2) as usize, 9);
     write_at(&h, ino, 3 * BS, &head).await;
+    drain_pipeline(&h).await;
     assert_eq!(
         wt_blocks() - before,
         1,
@@ -723,6 +744,7 @@ async fn test_gap_then_completion_matches_todays_bytes() {
     // Filling the hole completes the union → exactly one upload; the hole
     // was written explicitly so every byte is app bytes now except nothing.
     write_at(&h, ino, 2 * BS + 100, &[3u8; 100]).await;
+    drain_pipeline(&h).await;
     assert_eq!(
         wt_blocks() - before,
         1,
@@ -775,6 +797,7 @@ async fn test_middle_last_completes_coverage_single_write_through() {
     // Head half completes the union → ONE write-through with both halves.
     let head = pattern((BS / 2) as usize, 99);
     write_at(&h, ino, 2 * BS, &head).await;
+    drain_pipeline(&h).await;
     assert_eq!(
         wt_blocks() - before,
         1,
@@ -995,6 +1018,9 @@ async fn test_write_through_fallback_never_lossy_on_device_error() {
     squeezefs::nvme_dev::set_fail_next_writes(1);
     let p1 = pattern(BS as usize + 1, 120);
     write_at(&h, ino, 0, &p1).await; // block 0 completes; its DMA fails once
+                                     // The detached upload must consume the injected failure before the
+                                     // poison is cleared (make_striped drained, so it is the only writer).
+    drain_pipeline(&h).await;
     squeezefs::nvme_dev::clear_fail_next_writes();
 
     assert!(
@@ -1297,6 +1323,7 @@ async fn test_interleave_write_through_vs_fallback_writeback() {
         squeezefs::nvme_dev::set_fail_next_writes(1);
         let pa = pattern(BS as usize, (iter + 1) as u8);
         write_at(&h, ino, 2 * BS, &pa).await; // covering write completes block 2
+        drain_pipeline(&h).await; // the detached upload consumes the poison
         squeezefs::nvme_dev::clear_fail_next_writes();
 
         // Race: write-through of block 4 vs the fallback's flush of block 2.
@@ -1306,6 +1333,7 @@ async fn test_interleave_write_through_vs_fallback_writeback() {
         };
         let flush_a = h.fs.flush_all_staged_blocks_to_backend();
         let (_, summary) = tokio::join!(write_b, flush_a);
+        drain_pipeline(&h).await;
         assert_eq!(
             summary.failed, 0,
             "iter {iter}: {:?}",
@@ -1370,6 +1398,7 @@ async fn test_interleave_write_through_vs_staging_refusal_escalation() {
         let escalate_a = h.fs.flush_memory_buffers_for_inode(ino, token);
         let (_, esc) = tokio::join!(write_b, escalate_a);
         esc.unwrap_or_else(|e| panic!("iter {iter}: escalation failed: {e:?}"));
+        drain_pipeline(&h).await;
 
         let meta = backend_meta(&h, ino).await;
         let bm = meta.block_map.clone().unwrap_or_default();
@@ -1415,6 +1444,7 @@ async fn test_interleave_write_through_vs_truncate_shrink() {
             .unwrap();
         };
         tokio::join!(write_b, shrink);
+        drain_pipeline(&h).await;
 
         let meta = backend_meta(&h, ino).await;
         let bm = meta.block_map.clone().unwrap_or_default();
@@ -1476,6 +1506,7 @@ async fn test_interleave_write_through_vs_truncate_grow() {
             .unwrap();
         };
         tokio::join!(write_b, grow);
+        drain_pipeline(&h).await;
 
         let meta = backend_meta(&h, ino).await;
         let bm = meta.block_map.clone().unwrap_or_default();
@@ -1511,6 +1542,7 @@ async fn test_interleave_write_through_vs_fallocate_extend() {
             h.fs.fallocate(h.req, ino, 0, 0, 12 * BS, 0).await.unwrap();
         };
         tokio::join!(write_b, extend);
+        drain_pipeline(&h).await;
 
         let meta = backend_meta(&h, ino).await;
         let bm = meta.block_map.clone().unwrap_or_default();

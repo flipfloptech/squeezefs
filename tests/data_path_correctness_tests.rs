@@ -131,6 +131,18 @@ async fn write_at(h: &H, ino: u64, off: u64, data: &[u8]) {
     assert_eq!(w.written as usize, data.len(), "short write at off {off}");
 }
 
+/// Drain the detached write-pipeline uploads (2026-07-27 campaign): a
+/// coverage-completing write ACKs with custody parked, so map/free-list
+/// observations are deterministic only at the pipeline's drain point.
+async fn drain_pipeline(h: &H) {
+    assert!(
+        h.fs.write_pipeline
+            .quiesce(std::time::Duration::from_secs(30))
+            .await,
+        "write pipeline must drain"
+    );
+}
+
 async fn read_at(h: &H, ino: u64, off: u64, size: u32) -> Vec<u8> {
     h.fs.read(h.req, ino, 0, off, size, 0)
         .await
@@ -1044,6 +1056,7 @@ async fn test_write_through_reused_key_purges_stale_read_tiers() {
     // Striped file, 4 blocks.
     let base = pattern(4 * block);
     write_at(&h, ino, 0, &base).await;
+    drain_pipeline(&h).await;
     let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
     let k1_old = meta
         .block_map
@@ -1056,6 +1069,7 @@ async fn test_write_through_reused_key_purges_stale_read_tiers() {
     // before the displaced free, so it never comes from the free list).
     let over1: Vec<u8> = (0..block).map(|i| ((i % 239) as u8) ^ 0x21).collect();
     write_at(&h, ino, block as u64, &over1).await;
+    drain_pipeline(&h).await; // the displaced free happens at durable publish
     let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
     let k1_new = meta
         .block_map
@@ -1090,6 +1104,7 @@ async fn test_write_through_reused_key_purges_stale_read_tiers() {
     let tail2: Vec<u8> = (0..block / 2).map(|i| ((i % 233) as u8) ^ 0x42).collect();
     write_at(&h, ino, (2 * block) as u64, &head2).await;
     write_at(&h, ino, (2 * block + block / 2) as u64, &tail2).await;
+    drain_pipeline(&h).await; // the write-through allocation publishes here
     let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
     let k2_new = meta
         .block_map

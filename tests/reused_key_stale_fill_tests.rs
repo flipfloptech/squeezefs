@@ -144,6 +144,18 @@ async fn write_at(h: &H, ino: u64, off: u64, data: &[u8]) {
     assert_eq!(w.written as usize, data.len(), "short write at off {off}");
 }
 
+/// Drain the detached write-pipeline uploads (2026-07-27 campaign): a
+/// coverage-completing write ACKs with custody parked; the ABA repro's
+/// displace/free/reuse premises are deterministic only at the drain point.
+async fn drain_pipeline(h: &H) {
+    assert!(
+        h.fs.write_pipeline
+            .quiesce(std::time::Duration::from_secs(30))
+            .await,
+        "write pipeline must drain"
+    );
+}
+
 async fn read_at(h: &H, ino: u64, off: u64, size: u32) -> Vec<u8> {
     h.fs.read(h.req, ino, 0, off, size, 0)
         .await
@@ -213,6 +225,7 @@ async fn parked_read_never_serves_reused_or_freed_key() {
     let mut initial = vec![0xA0u8; BS as usize];
     initial.extend_from_slice(&vec![0xB0u8; BS as usize]);
     write_at(&h, ino, 0, &initial).await;
+    drain_pipeline(&h).await;
 
     let m0 = block_map_of(&h, ino).await;
     let x = m0.get(&0).cloned().expect("b0 mapped after striped write");
@@ -244,14 +257,17 @@ async fn parked_read_never_serves_reused_or_freed_key() {
     );
 
     // COW-rewrite b0 (0xA1): displaces X from map[b0] and frees it — the
-    // free list now holds exactly X.
+    // free list now holds exactly X. (Drain the write pipeline first: the
+    // displace happens at the detached upload's durable publish.)
     write_at(&h, ino, 0, &vec![0xA1u8; BS as usize]).await;
+    drain_pipeline(&h).await;
     // Async block-reclaim: X's finish_free rides the background queue —
     // drain so the reuse premise below stays deterministic.
     h.fs.router.backend_router.reclaim_drain().await;
     // COW-rewrite b1 (0xB1): the allocator hands X to b1; b1's bytes are
     // DMA'd into X's device range and map[b1] = X is published.
     write_at(&h, ino, BS, &vec![0xB1u8; BS as usize]).await;
+    drain_pipeline(&h).await;
 
     // Premise of the repro (allocator reuse determinism): X now belongs to b1.
     let m1 = block_map_of(&h, ino).await;

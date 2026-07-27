@@ -120,6 +120,23 @@ pub const TEST_CONVEYOR_HOLD_PRE_DRAIN: u64 = 1;
 /// write/ack/barrier, before per-tx result fan-out.
 pub const TEST_CONVEYOR_HOLD_PRE_FANOUT: u64 = 2;
 
+/// [`TEST_CONVEYOR_HOLD_STAGE`] value: park the pass's EMPTY-drain tail
+/// **while its per-iteration backend `Arc` upgrade is still held** — the
+/// one place the pass pins a dropped-without-shutdown backend (and its
+/// Layer A writer flock) past the committer's wake. Models the OS
+/// descheduling the pass's worker thread between the upgrade and the
+/// `drop(be)`: the 2026-07-27 torn-claim remount flake window
+/// (`mount_writer_guard_tests::test_torn_claim_entry_recovers_and_
+/// reclaims` under full-suite load).
+pub const TEST_CONVEYOR_HOLD_EMPTY_DRAIN_TAIL: u64 = 3;
+
+/// Monotonic count of passes that PARKED on
+/// [`TEST_CONVEYOR_HOLD_EMPTY_DRAIN_TAIL`] while holding their backend
+/// upgrade — the test-side barrier proving the pin formed (the pass wins
+/// the upgrade-vs-Arc-drop race ~always, but the barrier makes the
+/// scenario honest instead of timing-lucky).
+pub static TEST_CONVEYOR_EMPTY_TAIL_PARKED: AtomicU64 = AtomicU64::new(0);
+
 /// The parked-pass wake for [`TEST_CONVEYOR_HOLD_STAGE`] (register-recheck
 /// discipline — a stale release can never strand a pass).
 static TEST_CONVEYOR_HOLD_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
@@ -3469,6 +3486,29 @@ impl KvMetaBackend {
             };
             let batch = conveyor.drain(be.batch_max_txs, be.batch_max_bytes);
             if batch.is_empty() {
+                // Test seam: park the empty-drain tail WHILE the
+                // per-iteration backend upgrade is held — the deliberate
+                // exception to the drop-before-park rule below (see
+                // [`TEST_CONVEYOR_HOLD_EMPTY_DRAIN_TAIL`]: it models the
+                // OS descheduling this worker thread between the upgrade
+                // and the drop, the 2026-07-27 torn-claim remount-flake
+                // window).
+                let mut park_noted = false;
+                while TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed)
+                    == TEST_CONVEYOR_HOLD_EMPTY_DRAIN_TAIL
+                {
+                    if !park_noted {
+                        TEST_CONVEYOR_EMPTY_TAIL_PARKED.fetch_add(1, Ordering::SeqCst);
+                        park_noted = true;
+                    }
+                    let notified = TEST_CONVEYOR_HOLD_NOTIFY.notified();
+                    if TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed)
+                        != TEST_CONVEYOR_HOLD_EMPTY_DRAIN_TAIL
+                    {
+                        break;
+                    }
+                    notified.await;
+                }
                 drop(be); // never park on leadership holding the backend
                 if !conveyor.unlead_and_recheck() {
                     return;

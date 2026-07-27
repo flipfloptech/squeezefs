@@ -36,11 +36,14 @@
 //! repo's serial-gate convention (`cargo test -- --test-threads=1`).
 
 use std::process::{Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use squeezefs::fuse_client::{CLIENT_HEARTBEAT_INTERVAL_SECS, CLIENT_STALE_TTL_SECS};
 use squeezefs::meta_backend::kv::backend::{
-    ClaimClearOutcome, KvMetaBackend, WriterClaim, WRITER_CLAIM_XATTR,
+    test_conveyor_hold_release, ClaimClearOutcome, KvMetaBackend, WriterClaim,
+    TEST_CONVEYOR_EMPTY_TAIL_PARKED, TEST_CONVEYOR_HOLD_EMPTY_DRAIN_TAIL,
+    TEST_CONVEYOR_HOLD_STAGE, WRITER_CLAIM_XATTR,
 };
 use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
 use squeezefs::meta_backend::reservation::{self, FakeNvmeNamespace, FakeReservationClient};
@@ -1372,6 +1375,103 @@ async fn test_torn_claim_entry_recovers_and_reclaims() {
     Metadata::create(be.as_ref(), 1, "post-tear", libc::S_IFREG | 0o644, 0, 0)
         .await
         .expect("volume serves after recovery");
+    be.shutdown().await.unwrap();
+}
+
+/// Panic-safe conveyor hold-seam arm/disarm (the FaultGuard precedent:
+/// the seam is process-global, so a failing assertion between arm and
+/// disarm must not leak a parked pass into the next test).
+struct ConveyorSeamGuard;
+
+impl ConveyorSeamGuard {
+    fn arm(stage: u64) -> Self {
+        TEST_CONVEYOR_HOLD_STAGE.store(stage, Ordering::SeqCst);
+        ConveyorSeamGuard
+    }
+}
+
+impl Drop for ConveyorSeamGuard {
+    fn drop(&mut self) {
+        TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
+        test_conveyor_hold_release();
+    }
+}
+
+/// The 2026-07-27 full-suite flake (P3 write-side-economy §7), pinned
+/// deterministically: a mount whose claim COMMIT fails (torn claim entry
+/// — the §4.1 device-error shape) has already spawned the conveyor pass
+/// task, and the pass's next-iteration backend upgrade races the failed
+/// `open`'s own `Arc` drop. When the pass wins and its worker thread is
+/// descheduled inside the empty-drain tail (an OS-quantum event — why the
+/// flake fired ~once per full-suite run and never isolated), it pins the
+/// backend struct and its Layer A writer flock past `open`'s error
+/// return. The volume carries NO readable claim (the torn entry never
+/// replays), so the same-process teardown absorption cannot attribute the
+/// holder and the instant remount refused Busy ("another squeezefs
+/// process holds the writer lock") — on a volume nobody held.
+///
+/// Contract: a gate-refused `open` releases Layer A **before** returning,
+/// so the remount can never race our own teardown. The
+/// `TEST_CONVEYOR_HOLD_EMPTY_DRAIN_TAIL` seam turns the scheduler quantum
+/// into a certainty by parking the pass tail while it holds the upgrade.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_failed_claim_commit_releases_flock_despite_pinned_pass_tail() {
+    let _faults = FaultGuard;
+    let seam = ConveyorSeamGuard::arm(TEST_CONVEYOR_HOLD_EMPTY_DRAIN_TAIL);
+    let vol = fresh_volume().await;
+
+    // The claim entry starts at the recovered ring head (the torn test's
+    // geometry math, verbatim).
+    let (journal_start, head_page, head_off) = {
+        let probe = KvMetaBackend::open_probe(vol.path()).await.unwrap();
+        let geo = *probe.journal_ring().core().geometry();
+        let head = probe.journal_ring().core().head();
+        (
+            probe.superblock().journal.start,
+            geo.page_index(head),
+            geo.in_page_off(head),
+        )
+    };
+    let claim_entry_phys = journal_start + head_page * 4096 + 24 + head_off;
+
+    let parked_before = TEST_CONVEYOR_EMPTY_TAIL_PARKED.load(Ordering::SeqCst);
+    uring_fs::arm_torn_write(claim_entry_phys + 8, 4);
+    let torn = KvMetaBackend::open(vol.path()).await;
+    assert!(
+        torn.is_err(),
+        "a torn claim write is a failed mount (device error), never a silent arm"
+    );
+    uring_fs::clear_faults();
+
+    // Barrier: the failed open's pass task parks its empty-drain tail
+    // HOLDING the backend upgrade — the teardown pin is now a fact, not
+    // a race. (Bounded: if the pass lost the upgrade race there is no
+    // pin and the remount below is trivially unpinned — the scenario
+    // degenerates to the plain torn-claim test, never to a false red.)
+    let pin_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while TEST_CONVEYOR_EMPTY_TAIL_PARKED.load(Ordering::SeqCst) == parked_before
+        && std::time::Instant::now() < pin_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    // The remount must succeed WHILE the pin is held: the failed open
+    // released Layer A before returning, so our own dying teardown can
+    // never masquerade as "another squeezefs process".
+    let be = KvMetaBackend::open(vol.path()).await.expect(
+        "remount after a failed claim commit must never be refused by our own \
+         teardown-pinned writer flock (the 2026-07-27 full-suite flake)",
+    );
+    let claim = be.read_writer_claim().await.expect("re-claimed");
+    assert_eq!(claim.pid, std::process::id());
+
+    // Disarm BEFORE shutdown: the remount's own pass parks on the seam
+    // after its claim batch, and a clean shutdown's claim-delete commit
+    // would otherwise queue behind a parked leader forever.
+    drop(seam);
+    Metadata::create(be.as_ref(), 1, "post-pin", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("volume serves after the pinned-teardown remount");
     be.shutdown().await.unwrap();
 }
 

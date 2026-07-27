@@ -1104,52 +1104,160 @@ impl KvTree {
         };
 
         // Claim fresh extents (internal class, §4.7) + write images.
-        let mut written: Vec<(u64, u64)> = Vec::new(); // (addr, node_seq)
+        // The whole fallible build — claims, image writes, load-backs, and
+        // the optional new root — runs inside one block so ANY error
+        // releases every claimed-but-unpublished extent (nothing routes
+        // to them yet). Pre-fix, a mid-build failure (e.g. the second
+        // claim of a split hitting NoSpace on a heap drained to zero
+        // during ENOSPC recovery — the preserved md-storm image's shape)
+        // leaked the earlier claims' bits until remount: poison exactly
+        // when extents are scarcest.
         let mut claimed_extents: Vec<u64> = Vec::new();
-        let mut claim = |ctx: &SmoContext, cache: &NodeCache| -> Result<u64, KvError> {
-            let extent = ctx.alloc.claim_internal()?;
-            claimed_extents.push(extent);
-            Ok(cache.extent_addr(extent))
-        };
-        if parts.len() == 1 {
-            let dst = claim(ctx, &self.cache)?;
-            let dst_seq = self.next_seq();
-            super::node::compact_node(&cfg.path, layout, &src, &extra, dst, dst_seq, durable_tail)
-                .await?;
-            written.push((dst, dst_seq));
-        } else if parts.len() == 2 {
-            let (l, r) = (claim(ctx, &self.cache)?, claim(ctx, &self.cache)?);
-            let (ls, rs) = (self.next_seq(), self.next_seq());
-            split_node(
-                &cfg.path,
-                layout,
-                &src,
-                &extra,
-                &SplitDest {
-                    node_addr: l,
-                    node_seq: ls,
-                },
-                &SplitDest {
-                    node_addr: r,
-                    node_seq: rs,
-                },
-                durable_tail,
-            )
-            .await?;
-            written.push((l, ls));
-            written.push((r, rs));
-        } else {
-            // Wider than two (a huge backlog folded at once): write each
-            // partition directly with the same gap-free bounds rule.
-            let mut min_key: Vec<u8> = node.min_key().to_vec();
-            for (i, part) in parts.iter().enumerate() {
+        let build_out: Result<
+            (
+                Vec<(u64, u64)>,
+                Vec<Arc<CachedNode>>,
+                Option<Arc<CachedNode>>,
+            ),
+            KvError,
+        > = async {
+            let mut written: Vec<(u64, u64)> = Vec::new(); // (addr, node_seq)
+            let mut claim = |ctx: &SmoContext, cache: &NodeCache| -> Result<u64, KvError> {
+                let extent = ctx.alloc.claim_internal()?;
+                claimed_extents.push(extent);
+                Ok(cache.extent_addr(extent))
+            };
+            if parts.len() == 1 {
                 let dst = claim(ctx, &self.cache)?;
                 let dst_seq = self.next_seq();
-                let max_key: Vec<u8> = if i + 1 == parts.len() {
-                    node.max_key().to_vec()
-                } else {
-                    part[part.len() - 1].key.clone()
-                };
+                super::node::compact_node(
+                    &cfg.path,
+                    layout,
+                    &src,
+                    &extra,
+                    dst,
+                    dst_seq,
+                    durable_tail,
+                )
+                .await?;
+                written.push((dst, dst_seq));
+            } else if parts.len() == 2 {
+                let (l, r) = (claim(ctx, &self.cache)?, claim(ctx, &self.cache)?);
+                let (ls, rs) = (self.next_seq(), self.next_seq());
+                split_node(
+                    &cfg.path,
+                    layout,
+                    &src,
+                    &extra,
+                    &SplitDest {
+                        node_addr: l,
+                        node_seq: ls,
+                    },
+                    &SplitDest {
+                        node_addr: r,
+                        node_seq: rs,
+                    },
+                    durable_tail,
+                )
+                .await?;
+                written.push((l, ls));
+                written.push((r, rs));
+            } else {
+                // Wider than two (a huge backlog folded at once): write each
+                // partition directly with the same gap-free bounds rule.
+                let mut min_key: Vec<u8> = node.min_key().to_vec();
+                for (i, part) in parts.iter().enumerate() {
+                    let dst = claim(ctx, &self.cache)?;
+                    let dst_seq = self.next_seq();
+                    let max_key: Vec<u8> = if i + 1 == parts.len() {
+                        node.max_key().to_vec()
+                    } else {
+                        part[part.len() - 1].key.clone()
+                    };
+                    write_node(
+                        &cfg.path,
+                        layout,
+                        &NodeWriteParams {
+                            node_addr: dst,
+                            node_seq: dst_seq,
+                            tree_id: node.tree_id(),
+                            level: node.level(),
+                            min_key: &min_key,
+                            max_key: &max_key,
+                        },
+                        part,
+                        horizon,
+                    )
+                    .await?;
+                    written.push((dst, dst_seq));
+                    min_key = key_successor(&max_key);
+                }
+            }
+            // Load-back the written successors (verifies the images; builds
+            // the snapshots zero-copy from the fresh extents).
+            let mut successors: Vec<Arc<CachedNode>> = Vec::with_capacity(written.len());
+            for (dst, _) in &written {
+                let loaded = load_node(&cfg.path, layout, *dst, durable_tail).await?;
+                let pinned = node.level() > 0 || (self.is_root(node) && written.len() == 1);
+                successors.push(CachedNode::from_loaded(
+                    loaded,
+                    pinned,
+                    self.cache.charge_gauge(),
+                )?);
+            }
+
+            // Test seam (docs/design-smo-replay-currency.md §6 PR 1): park an
+            // armed build HERE — successor images are fixed on disk, no locks
+            // are held, and the flip's reservation is not yet taken — so user
+            // commits injected while parked reserve BELOW the flip's seq and
+            // reach the successors only as `take_overlay()` leftovers: the
+            // sub-mechanism (i) stranding window, held open deterministically.
+            // Unarmed cost: one relaxed load per SMO.
+            if TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) == u64::from(self.tree_id) {
+                *TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex") = Some(TestSmoPauseInfo {
+                    tree_id: self.tree_id,
+                    level: node.level(),
+                    is_root: self.is_root(node),
+                    min_key: node.min_key().to_vec(),
+                    max_key: node.max_key().to_vec(),
+                });
+                while TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) == u64::from(self.tree_id) {
+                    let notified = TEST_SMO_BUILD_NOTIFY.notified();
+                    if TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) != u64::from(self.tree_id)
+                    {
+                        break;
+                    }
+                    notified.await;
+                }
+                *TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex") = None;
+            }
+
+            // A multi-way replacement of the root needs a new root above the
+            // successors — written before any lock is taken.
+            let new_root: Option<Arc<CachedNode>> = if self.is_root(node) && written.len() > 1 {
+                let dst = claim(ctx, &self.cache)?;
+                let dst_seq = self.next_seq();
+                let recs: Vec<Record> = successors
+                    .iter()
+                    .map(|s| {
+                        // RECORD seq 0 — the builder's separator convention.
+                        // Record seqs are the JOURNAL-domain per-key fold
+                        // order; `self.next_seq()` is the NODE-seq counter
+                        // (a different domain, uuid-based since the quick-
+                        // reformat burial fix). Stamping node seqs here made
+                        // every later pointer-flip record (ring-position seq)
+                        // fold BELOW the bootstrap separator — a permanent
+                        // stale route to a retired extent (the storm test's
+                        // child-retired loop). A fresh root has no earlier
+                        // records for these keys, so 0 is exact.
+                        Record::put(
+                            s.max_key().to_vec(),
+                            0,
+                            encode_interior_value(s.addr(), s.node_seq()),
+                        )
+                    })
+                    .collect();
+                let recs = sorted_by_key_seq(recs);
                 write_node(
                     &cfg.path,
                     layout,
@@ -1157,105 +1265,34 @@ impl KvTree {
                         node_addr: dst,
                         node_seq: dst_seq,
                         tree_id: node.tree_id(),
-                        level: node.level(),
-                        min_key: &min_key,
-                        max_key: &max_key,
+                        level: node.level() + 1,
+                        min_key: node.min_key(),
+                        max_key: node.max_key(),
                     },
-                    part,
+                    &recs,
                     horizon,
                 )
                 .await?;
-                written.push((dst, dst_seq));
-                min_key = key_successor(&max_key);
-            }
+                let loaded = load_node(&cfg.path, layout, dst, durable_tail).await?;
+                Some(CachedNode::from_loaded(
+                    loaded,
+                    true,
+                    self.cache.charge_gauge(),
+                )?)
+            } else {
+                None
+            };
+            Ok((written, successors, new_root))
         }
-        // Load-back the written successors (verifies the images; builds
-        // the snapshots zero-copy from the fresh extents).
-        let mut successors: Vec<Arc<CachedNode>> = Vec::with_capacity(written.len());
-        for (dst, _) in &written {
-            let loaded = load_node(&cfg.path, layout, *dst, durable_tail).await?;
-            let pinned = node.level() > 0 || (self.is_root(node) && written.len() == 1);
-            successors.push(CachedNode::from_loaded(
-                loaded,
-                pinned,
-                self.cache.charge_gauge(),
-            )?);
-        }
-
-        // Test seam (docs/design-smo-replay-currency.md §6 PR 1): park an
-        // armed build HERE — successor images are fixed on disk, no locks
-        // are held, and the flip's reservation is not yet taken — so user
-        // commits injected while parked reserve BELOW the flip's seq and
-        // reach the successors only as `take_overlay()` leftovers: the
-        // sub-mechanism (i) stranding window, held open deterministically.
-        // Unarmed cost: one relaxed load per SMO.
-        if TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) == u64::from(self.tree_id) {
-            *TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex") = Some(TestSmoPauseInfo {
-                tree_id: self.tree_id,
-                level: node.level(),
-                is_root: self.is_root(node),
-                min_key: node.min_key().to_vec(),
-                max_key: node.max_key().to_vec(),
-            });
-            while TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) == u64::from(self.tree_id) {
-                let notified = TEST_SMO_BUILD_NOTIFY.notified();
-                if TEST_SMO_BUILD_PAUSE_TREE.load(Ordering::Relaxed) != u64::from(self.tree_id) {
-                    break;
+        .await;
+        let (written, successors, new_root) = match build_out {
+            Ok(v) => v,
+            Err(e) => {
+                for ext in &claimed_extents {
+                    ctx.alloc.release_unpublished(*ext);
                 }
-                notified.await;
+                return Err(e);
             }
-            *TEST_SMO_BUILD_PAUSED.lock().expect("seam mutex") = None;
-        }
-
-        // A multi-way replacement of the root needs a new root above the
-        // successors — written before any lock is taken.
-        let new_root: Option<Arc<CachedNode>> = if self.is_root(node) && written.len() > 1 {
-            let dst = claim(ctx, &self.cache)?;
-            let dst_seq = self.next_seq();
-            let recs: Vec<Record> = successors
-                .iter()
-                .map(|s| {
-                    // RECORD seq 0 — the builder's separator convention.
-                    // Record seqs are the JOURNAL-domain per-key fold
-                    // order; `self.next_seq()` is the NODE-seq counter
-                    // (a different domain, uuid-based since the quick-
-                    // reformat burial fix). Stamping node seqs here made
-                    // every later pointer-flip record (ring-position seq)
-                    // fold BELOW the bootstrap separator — a permanent
-                    // stale route to a retired extent (the storm test's
-                    // child-retired loop). A fresh root has no earlier
-                    // records for these keys, so 0 is exact.
-                    Record::put(
-                        s.max_key().to_vec(),
-                        0,
-                        encode_interior_value(s.addr(), s.node_seq()),
-                    )
-                })
-                .collect();
-            let recs = sorted_by_key_seq(recs);
-            write_node(
-                &cfg.path,
-                layout,
-                &NodeWriteParams {
-                    node_addr: dst,
-                    node_seq: dst_seq,
-                    tree_id: node.tree_id(),
-                    level: node.level() + 1,
-                    min_key: node.min_key(),
-                    max_key: node.max_key(),
-                },
-                &recs,
-                horizon,
-            )
-            .await?;
-            let loaded = load_node(&cfg.path, layout, dst, durable_tail).await?;
-            Some(CachedNode::from_loaded(
-                loaded,
-                true,
-                self.cache.charge_gauge(),
-            )?)
-        } else {
-            None
         };
 
         // ---- K6b production journaling (before any lock): make the

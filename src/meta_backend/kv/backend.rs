@@ -2587,8 +2587,8 @@ impl KvMetaBackend {
         // keeps the preflight satisfiable-by-drained-ring on every legal
         // geometry, so a healthy volume can never be refused here).
         let geo = self.ring.core().geometry();
-        let need = super::journal::MAX_ENTRY_LEN
-            .min(geo.logical_len().saturating_sub(geo.reserve_bytes));
+        let need =
+            super::journal::MAX_ENTRY_LEN.min(geo.logical_len().saturating_sub(geo.reserve_bytes));
         let preflight = || self.ring.try_admit(need, AdmissionClass::User);
         if let Some(adm) = preflight() {
             self.ring.core().release(adm);

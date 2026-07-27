@@ -835,9 +835,7 @@ async fn maintenance_pass(be: &Arc<KvMetaBackend>) -> Result<(), KvError> {
         loop {
             match tree.run_maintenance(&mut smo).await {
                 Ok(_) => break,
-                Err(
-                    KvError::JournalReserveExhausted { .. } | KvError::PendingFreeFull { .. },
-                ) => {
+                Err(KvError::JournalReserveExhausted { .. } | KvError::PendingFreeFull { .. }) => {
                     be.checkpoint_cycle(&mut smo, true).await?;
                 }
                 Err(e) => return Err(e),
@@ -889,9 +887,7 @@ async fn tick(
         loop {
             match tree.run_maintenance(&mut smo).await {
                 Ok(_) => break,
-                Err(
-                    KvError::JournalReserveExhausted { .. } | KvError::PendingFreeFull { .. },
-                ) => {
+                Err(KvError::JournalReserveExhausted { .. } | KvError::PendingFreeFull { .. }) => {
                     be.checkpoint_cycle(&mut smo, true).await?;
                     *last_checkpoint = std::time::Instant::now();
                 }
@@ -1008,6 +1004,28 @@ impl KvMetaBackend {
                     log::debug!(
                         "checkpoint: SMO reserve exhausted ({needed} B) at node {addr:#x}; \
                          deferred to the next cycle"
+                    );
+                }
+                Err(KvError::NoSpace { free, reserve }) => {
+                    // ENOSPC-recovery ratchet (the preserved md-storm
+                    // image's third face): a heap drained to zero cannot
+                    // claim this compaction's successor extent — but
+                    // aborting the WHOLE cycle here would also abandon
+                    // the ledger + barrier that release parked
+                    // retirements (whose held bits ARE the missing
+                    // budget). Skip-and-defer exactly like the reserve
+                    // arm (the floor was restored inside
+                    // checkpoint_flush_node): the cycle completes,
+                    // barriers, drains every retirement its tail covers,
+                    // and the NEXT cycle's claim finds the returned
+                    // budget. A heap where nothing ever drains presents
+                    // as the audit's loud terminal, now with an honest
+                    // ENOSPC face in the log.
+                    log::warn!(
+                        "checkpoint: metadata heap exhausted (free={free}, \
+                         reserve={reserve}) at node {addr:#x}; compaction deferred to \
+                         the next cycle (parked pending-free retirements release at \
+                         this cycle's barrier and return budget)"
                     );
                 }
                 // NOTE: `KvError::PendingFreeFull` is structurally

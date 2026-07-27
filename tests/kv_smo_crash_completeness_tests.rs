@@ -1087,7 +1087,10 @@ async fn construct_pinned_floor_at_cap(kv: &Arc<KvMetaBackend>) -> u64 {
         2,
         "the construction saturates the FIFO to exactly cap"
     );
-    assert!(!kv.is_failed(), "construction must leave the volume healthy");
+    assert!(
+        !kv.is_failed(),
+        "construction must leave the volume healthy"
+    );
     fill_ino
 }
 
@@ -1400,8 +1403,7 @@ async fn ring_full_crash_mount_recovers_via_preclaim_drain() {
     // Shorten the park-escalation threshold so the DEV refusal face is
     // seconds, not minutes; the fixed gate never parks at all.
     std::env::set_var("SQUEEZEFS_TIMEOUT", "2");
-    let ckpts_before =
-        squeezefs::meta_backend::kv::META_KV_CHECKPOINTS.load(Ordering::Relaxed);
+    let ckpts_before = squeezefs::meta_backend::kv::META_KV_CHECKPOINTS.load(Ordering::Relaxed);
     let kv2 = reopen(file.path()).await; // a refusal panics here, loud
     std::env::remove_var("SQUEEZEFS_TIMEOUT");
 

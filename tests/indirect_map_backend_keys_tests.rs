@@ -684,6 +684,8 @@ async fn test_delete_spilled_file_frees_blocks_on_owning_volumes() {
         .delete_file(&path, &mut con)
         .await
         .expect("delete_file");
+    // Async block-reclaim: delete's frees finish on the background queue.
+    h.fs.router.backend_router.reclaim_drain().await;
 
     for vol in &h.volumes {
         assert_eq!(

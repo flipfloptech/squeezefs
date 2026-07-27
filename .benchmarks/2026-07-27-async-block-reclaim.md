@@ -115,7 +115,17 @@ elbencho -w -t 16 -s 192m -b 1m --direct /mnt/rb/d/f{1..16}   # fw, then ow1, ow
 ## 6. Field ledger inversion (three-session matrix) — 2026-07-27 follow-up
 
 **Branch / SHAs:** `fix/reclaim-field-ledger` off dev `78b9498` — tests
-`c84c655` (red), fix `f3c5a27`. Field venue: the user's 4-node
+`c84c655` (red: all three contracts fail on their conviction), fix
+`f3c5a27`, docs `a125ab9`. Full gate from zero at the branch tip: clippy
+`-D warnings` clean, fmt clean, `cargo test --all-features --
+--test-threads=1` **142 binaries / 1482 tests / 0 failed**, doc clean,
+bench smoke 23/23. (Two earlier gate attempts were aborted-and-restarted
+per the counted-run discipline: one starvation trip of the PRE-EXISTING
+fuse3 debug-only ≥1 s payload-lease wall-clock assert while a sibling
+campaign's fio matrix held the box at load 43–54 — signature-matched
+environmental, standalone reruns green, zero overlap with this diff —
+and one self-inflicted mid-run docs commit tripping the build-commit
+identity test.) Field venue: the user's 4-node
 NVMe-oF/TCP cluster, zram-lz4 data targets, dev tip `78b9498`, ONE daemon
 across all three sessions (counters cumulative). OQ-2's field re-measure
 arrived and INVERTED the design contract:

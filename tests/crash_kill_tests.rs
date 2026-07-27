@@ -37,6 +37,58 @@ fn ledger_append(path: &std::path::Path, line: &str) {
     f.sync_data().expect("fsync ledger");
 }
 
+/// The ledger protocol's own integrity contract (2026-07-27, the P2-recorded
+/// 1/8 "acked create lost after a mid-batch kill-9" flake): with 3 concurrent
+/// lanes appending through separate `O_APPEND` fds, every ledger line must
+/// land as ONE atomic `write(2)` — `writeln!` issues the payload and the
+/// `'\n'` as TWO writes, so lane payloads interleave before their newlines
+/// ("start create l2-f0start create l0-f0…" + empty lines, observed in green
+/// rounds' ledgers too). A fused `start unlink` line fails `parse_ledger`'s
+/// exact-token match, the supersession marker silently vanishes, and the
+/// model demands a file the child really unlinked — a HARNESS artifact
+/// masquerading as a crash-recovery bug (the failing names were always
+/// `i ≡ 0 (mod 3)`, the unlink cadence; the single-lane serial soak cannot
+/// interleave, matching batched-only).
+#[test]
+fn test_ledger_append_line_atomicity_under_concurrent_lanes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("ledger.log");
+    let mut lanes = Vec::new();
+    for lane in 0..3u32 {
+        let ledger = ledger.clone();
+        lanes.push(std::thread::spawn(move || {
+            for i in 0..500u32 {
+                ledger_append(&ledger, &format!("start create l{lane}-f{i}"));
+                ledger_append(&ledger, &format!("ack create l{lane}-f{i} {i}"));
+            }
+        }));
+    }
+    for l in lanes {
+        l.join().unwrap();
+    }
+    let text = std::fs::read_to_string(&ledger).unwrap();
+    let mut lines = 0usize;
+    for (n, line) in text.lines().enumerate() {
+        lines += 1;
+        let p: Vec<&str> = line.split_whitespace().collect();
+        let well_formed = matches!(
+            p.as_slice(),
+            ["start", "create", _] | ["ack", "create", _, _]
+        );
+        assert!(
+            well_formed,
+            "ledger line {} is not ONE appended record — concurrent lanes \
+             interleaved inside a single line (the two-write `writeln!` tear): {line:?}",
+            n + 1
+        );
+    }
+    assert_eq!(
+        lines, 3000,
+        "every appended record must land as exactly one line (empty/fused \
+         lines are the torn-append signature)"
+    );
+}
+
 #[derive(Debug, Default)]
 struct LedgerModel {
     lines: Vec<String>,

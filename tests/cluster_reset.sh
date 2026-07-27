@@ -56,15 +56,26 @@ fi
 pkill -f 'squeezefs moun[t]' 2>/dev/null || true
 sleep 1
 
-for h in "${HOSTS[@]}"; do
-  IFS=: read -r name _ _ _ <<<"$h"
-  "$SQZ" nvmeof disconnect --subnqn "$NQN_PREFIX:$name" 2>/dev/null || true
+# disconnect with verification: survivors auto-reconnect to rebuilt shares
+# and then poison step 3 with duplicate-connect failures, so this must be
+# LOUD, not best-effort.
+for attempt in 1 2 3; do
+  for h in "${HOSTS[@]}"; do
+    IFS=: read -r name _ _ _ <<<"$h"
+    "$SQZ" nvmeof disconnect --subnqn "$NQN_PREFIX:$name" 2>&1 | sed 's/^/    /' || true
+  done
+  gone=1
+  for _ in $(seq 1 15); do
+    if grep -lq "$NQN_PREFIX" /sys/class/nvme/nvme*/subsysnqn 2>/dev/null; then
+      gone=0; sleep 1
+    else
+      gone=1; break
+    fi
+  done
+  [ "$gone" = 1 ] && break
+  echo "  connections still present after disconnect (attempt $attempt) — retrying"
 done
-# wait until no squeezefs namespaces remain
-for _ in $(seq 1 20); do
-  grep -lq "$NQN_PREFIX" /sys/class/nvme/nvme*/subsysnqn 2>/dev/null || break
-  sleep 1
-done
+[ "$gone" = 1 ] || die "could not disconnect all $NQN_PREFIX connections; check 'nvme list-subsys'"
 
 # ---------- 2. Storage nodes: unshare, destroy, recreate, re-share ----------
 for h in "${HOSTS[@]}"; do
@@ -123,10 +134,24 @@ done
 
 # ---------- 3. Client: reconnect (both paths), multipath policy -------------
 log "3/5 client: connect both paths per subsystem"
+path_live() {  # path_live <nqn> <traddr> — is this exact path already connected?
+  local c
+  for c in /sys/class/nvme/nvme*; do
+    [ -e "$c/subsysnqn" ] || continue
+    [ "$(cat "$c/subsysnqn")" = "$1" ] || continue
+    grep -q "traddr=$2," "$c/address" 2>/dev/null && return 0
+  done
+  return 1
+}
 for h in "${HOSTS[@]}"; do
   IFS=: read -r name ip1 ip2 _ <<<"$h"
-  "$SQZ" nvmeof connect --ip "$ip1" --subnqn "$NQN_PREFIX:$name"
-  "$SQZ" nvmeof connect --ip "$ip2" --subnqn "$NQN_PREFIX:$name"
+  for ip in "$ip1" "$ip2"; do
+    if path_live "$NQN_PREFIX:$name" "$ip"; then
+      echo "  $name via $ip: already connected — keeping"
+    else
+      "$SQZ" nvmeof connect --ip "$ip" --subnqn "$NQN_PREFIX:$name"
+    fi
+  done
 done
 
 # wait for every namespace head to appear, then resolve NQN -> /dev node

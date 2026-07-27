@@ -6912,105 +6912,105 @@ impl SqueezefsFilesystem {
     ) -> Result<(), SqueezefsError> {
         let block_size = self.router.block_size.load(Ordering::Relaxed);
         {
-                    let block_snapshot = {
-                        let entry = self
-                            .active_block_buffers
-                            .get(cache_key)
-                            .expect("parked entry cannot vanish under the held block lock");
-                        debug_assert!(
-                            entry.value().is_content_valid() && !entry.value().seed_deferred(),
-                            "a coverage-complete buffer must be content-valid with \
+            let block_snapshot = {
+                let entry = self
+                    .active_block_buffers
+                    .get(cache_key)
+                    .expect("parked entry cannot vanish under the held block lock");
+                debug_assert!(
+                    entry.value().is_content_valid() && !entry.value().seed_deferred(),
+                    "a coverage-complete buffer must be content-valid with \
                              its deferral cleared (record_write's completion \
                              transition owns both)"
-                        );
-                        entry.value().snapshot()
-                    };
-                    match self
-                        .upload_full_block(ino, b, block_snapshot.clone(), fencing_token)
-                        .await
-                    {
-                        Ok(()) => {
-                            // Durable + published: the RAM entry retires
-                            // (reads flow to the block map / read tiers).
-                            self.retire_parked_overlay(cache_key);
-                            METRICS.write_through_blocks.fetch_add(1, Ordering::Relaxed);
-                            METRICS
-                                .write_through_bytes
-                                .fetch_add(block_size, Ordering::Relaxed);
-                            std::mem::drop(block_guard);
-                        }
-                        Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
-                            // A fenced-out writer must not publish anywhere —
-                            // not even to staging. Drop custody (the old
-                            // checked-out buffer was dropped here too) and
-                            // propagate; the caller invalidates the lease.
-                            self.retire_parked_overlay(cache_key);
-                            return Err(e);
-                        }
-                        Err(e) => {
-                            // Never-lossy fallback (uring backpressure /
-                            // allocator / device failure): degrade into
-                            // today's staging + writeback path.
-                            METRICS
-                                .write_through_fallbacks
-                                .fetch_add(1, Ordering::Relaxed);
-                            warn!(
-                                "write-through failed for ino {} block {} ({:?}); \
+                );
+                entry.value().snapshot()
+            };
+            match self
+                .upload_full_block(ino, b, block_snapshot.clone(), fencing_token)
+                .await
+            {
+                Ok(()) => {
+                    // Durable + published: the RAM entry retires
+                    // (reads flow to the block map / read tiers).
+                    self.retire_parked_overlay(cache_key);
+                    METRICS.write_through_blocks.fetch_add(1, Ordering::Relaxed);
+                    METRICS
+                        .write_through_bytes
+                        .fetch_add(block_size, Ordering::Relaxed);
+                    std::mem::drop(block_guard);
+                }
+                Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
+                    // A fenced-out writer must not publish anywhere —
+                    // not even to staging. Drop custody (the old
+                    // checked-out buffer was dropped here too) and
+                    // propagate; the caller invalidates the lease.
+                    self.retire_parked_overlay(cache_key);
+                    return Err(e);
+                }
+                Err(e) => {
+                    // Never-lossy fallback (uring backpressure /
+                    // allocator / device failure): degrade into
+                    // today's staging + writeback path.
+                    METRICS
+                        .write_through_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "write-through failed for ino {} block {} ({:?}); \
                                  falling back to staging",
-                                ino, b, e
-                            );
-                            let nvme_clone = self.router.cache.nvme.clone();
-                            let cache_key_clone = cache_key.to_string();
-                            let fencing_token_val = fencing_token;
-                            let put_len = block_snapshot.len() as u64;
-                            let staging_snapshot = block_snapshot;
-                            let wp_put = write_phase_start();
-                            let admitted = tokio::task::spawn_blocking(move || {
-                                nvme_clone.put_active_block(
-                                    &cache_key_clone,
-                                    &staging_snapshot,
-                                    fencing_token_val,
-                                )
-                            })
-                            .await
-                            .map_err(|e| std::io::Error::other(e.to_string()))?;
-                            write_phase_record(WritePhase::StagingPut, wp_put);
+                        ino, b, e
+                    );
+                    let nvme_clone = self.router.cache.nvme.clone();
+                    let cache_key_clone = cache_key.to_string();
+                    let fencing_token_val = fencing_token;
+                    let put_len = block_snapshot.len() as u64;
+                    let staging_snapshot = block_snapshot;
+                    let wp_put = write_phase_start();
+                    let admitted = tokio::task::spawn_blocking(move || {
+                        nvme_clone.put_active_block(
+                            &cache_key_clone,
+                            &staging_snapshot,
+                            fencing_token_val,
+                        )
+                    })
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    write_phase_record(WritePhase::StagingPut, wp_put);
 
-                            if admitted {
-                                // Staged custody landed: the RAM entry
-                                // retires (the ring copy is identical).
-                                self.retire_parked_overlay(cache_key);
-                            }
-                            std::mem::drop(block_guard);
-
-                            if admitted {
-                                METRICS
-                                    .staging_put_bytes_wt_fallback
-                                    .fetch_add(put_len, Ordering::Relaxed);
-                                let req = WritebackRequest {
-                                    ino,
-                                    block_idx: b as u32,
-                                    fencing_token,
-                                    attempts: 0,
-                                };
-                                self.enqueue_writeback(req).await?;
-                                METRICS
-                                    .writeback_enqueued_wt_fallback
-                                    .fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                // Staging refused too (never-lossy
-                                // backpressure): the block stays PARKED —
-                                // it never left the map — and rides the R5
-                                // admission pass like a partial block;
-                                // fsync's buffer flush re-attempts staging
-                                // or uploads it durably.
-                                let wp_park = write_phase_start();
-                                self.admit_parked_active_block(cache_key, fencing_token)
-                                    .await;
-                                write_phase_record(WritePhase::ParkSpill, wp_park);
-                            }
-                        }
+                    if admitted {
+                        // Staged custody landed: the RAM entry
+                        // retires (the ring copy is identical).
+                        self.retire_parked_overlay(cache_key);
                     }
+                    std::mem::drop(block_guard);
+
+                    if admitted {
+                        METRICS
+                            .staging_put_bytes_wt_fallback
+                            .fetch_add(put_len, Ordering::Relaxed);
+                        let req = WritebackRequest {
+                            ino,
+                            block_idx: b as u32,
+                            fencing_token,
+                            attempts: 0,
+                        };
+                        self.enqueue_writeback(req).await?;
+                        METRICS
+                            .writeback_enqueued_wt_fallback
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        // Staging refused too (never-lossy
+                        // backpressure): the block stays PARKED —
+                        // it never left the map — and rides the R5
+                        // admission pass like a partial block;
+                        // fsync's buffer flush re-attempts staging
+                        // or uploads it durably.
+                        let wp_park = write_phase_start();
+                        self.admit_parked_active_block(cache_key, fencing_token)
+                            .await;
+                        write_phase_record(WritePhase::ParkSpill, wp_park);
+                    }
+                }
+            }
         }
         Ok(())
     }

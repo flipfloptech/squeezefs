@@ -581,10 +581,9 @@ async fn t2_fenced_write_through_drops_custody_and_never_publishes() {
     let current = h.fs.dlm().get_fencing_token_ino(ino);
     assert!(current > 0, "the write path must have acquired a lease");
     let guard = block_lock_acquire(ino, 3, BlockLockSite::PipelineUpload).await;
-    let res = h
-        .fs
-        .write_through_complete_block(ino, 3, &cache_key, current - 1, guard)
-        .await;
+    let res =
+        h.fs.write_through_complete_block(ino, 3, &cache_key, current - 1, guard)
+            .await;
     assert!(
         matches!(res, Err(SqueezefsError::FencingTokenExpired { .. })),
         "a superseded era must be refused loud (got {res:?})"
@@ -640,6 +639,82 @@ async fn t3_fsync_drains_pending_pipeline_uploads_durably() {
     );
     let got = read_at(&h, ino, 0, data.len()).await;
     assert_eq!(got, data, "read-back after fsync");
+}
+
+/// T5 — the fsync-steal economy law: fsync draining a pipe-blocked
+/// coverage-complete block must ride the WRITE-THROUGH leg (one durable
+/// upload, counted in `write_through_blocks`), never the staging +
+/// writeback detour — that is the parked-straggler RMW pipeline the RW3b
+/// coverage suite killed, and it would resurface on every fsync that wins
+/// the race against a detached upload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t5_fsync_steal_rides_write_through_not_staging() {
+    let _s = serial().await;
+    let _g = OverrideGuard;
+    set_depth_override(Some(1)); // one slot — the test owns it first
+    let h = make(*b"wpd-t5-fsyncstl!", "wpd_ns_t5").await;
+    let ino = striped_fixture(&h, "t5").await;
+    let waits0 = h.fs.write_pipeline.admission_waits();
+
+    // Block the pipe; a covering write of a fresh block parks at admission
+    // with its COMPLETE custody in the overlay (readable, unpublished).
+    let blocker = h.fs.write_pipeline.admit(BS).await;
+    let data = pattern(BS as usize, 0x66);
+    let fs2 = h.fs.clone();
+    let req = h.req;
+    let d2 = bytes::Bytes::copy_from_slice(&data);
+    let w = tokio::spawn(async move {
+        fs2.write(req, ino, 0, 2 * BS, d2, 0, 0).await.unwrap();
+    });
+    let pipe = h.fs.write_pipeline.clone();
+    eventually(
+        async || pipe.admission_waits() > waits0,
+        "the write must park at admission",
+    )
+    .await;
+
+    // fsync steals the complete parked block: exactly one write-through,
+    // ZERO staging puts / writeback enqueues (the economy pin), durably
+    // mapped at fsync return.
+    let wt0 = METRICS.write_through_blocks.load(Ordering::Relaxed);
+    let sp0 = METRICS.staging_put_bytes_flush.load(Ordering::Relaxed);
+    let wb0 = METRICS.writeback_enqueued_flush.load(Ordering::Relaxed);
+    h.fs.fsync(h.req, ino, 0, false).await.unwrap();
+    assert_eq!(
+        METRICS.write_through_blocks.load(Ordering::Relaxed) - wt0,
+        1,
+        "fsync stealing a coverage-complete parked block must count as a \
+         write-through (the flush write-through leg)"
+    );
+    assert_eq!(
+        METRICS.staging_put_bytes_flush.load(Ordering::Relaxed) - sp0,
+        0,
+        "a coverage-complete block must NEVER take the fsync staging detour \
+         (the parked-straggler RMW pipeline is dead — RW3b)"
+    );
+    assert_eq!(
+        METRICS.writeback_enqueued_flush.load(Ordering::Relaxed) - wb0,
+        0,
+        "no writeback unit may be conjured for a stolen complete block"
+    );
+    assert!(
+        block_map_has(&h, ino, 2).await,
+        "the stolen block must be durably mapped at fsync return"
+    );
+
+    // The parked write then ACKs and its detached upload resolves as a
+    // clean no-op against the already-drained custody.
+    drop(blocker);
+    tokio::time::timeout(Duration::from_secs(10), w)
+        .await
+        .expect("the parked write must ACK once admitted")
+        .unwrap();
+    assert!(
+        h.fs.write_pipeline.quiesce(Duration::from_secs(10)).await,
+        "the no-op task must drain"
+    );
+    let got = read_at(&h, ino, 2 * BS, BS as usize).await;
+    assert_eq!(got, data, "read-back after the fsync steal");
 }
 
 /// T4 — teardown quiesce: the dismount path drains detached uploads

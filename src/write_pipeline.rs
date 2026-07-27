@@ -166,9 +166,7 @@ pub enum PipelineDisposition {
 }
 
 /// Map an upload outcome to its [`PipelineDisposition`].
-pub fn pipeline_disposition(
-    res: &Result<(), crate::error::SqueezefsError>,
-) -> PipelineDisposition {
+pub fn pipeline_disposition(res: &Result<(), crate::error::SqueezefsError>) -> PipelineDisposition {
     match res {
         Ok(()) => PipelineDisposition::Done,
         Err(crate::error::SqueezefsError::FencingTokenExpired { .. }) => {
@@ -358,12 +356,7 @@ impl WritePipeline {
             {
                 if self
                     .inflight_bytes
-                    .compare_exchange(
-                        cur,
-                        cur + block_bytes,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    )
+                    .compare_exchange(cur, cur + block_bytes, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
                 {
                     self.inflight_blocks.fetch_add(1, Ordering::AcqRel);
@@ -431,7 +424,9 @@ pub struct PipelinePermit {
 
 impl Drop for PipelinePermit {
     fn drop(&mut self) {
-        self.pipe.inflight_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.pipe
+            .inflight_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
         self.pipe.inflight_blocks.fetch_sub(1, Ordering::AcqRel);
         self.pipe.completions.notify_waiters();
     }

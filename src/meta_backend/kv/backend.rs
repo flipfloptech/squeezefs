@@ -794,11 +794,25 @@ impl KvMetaBackend {
         be.trace_guard_event("flock_acquired");
 
         // (3)+(4)+(5) The claim gate: decision, PR acquisition, claim
-        // commit + barrier. Any refusal drops the Arc — flock releases,
-        // nothing was spawned, nothing was written (PR registrations are
-        // rolled back best-effort inside the gate).
+        // commit + barrier. Any refusal returns Err with nothing spawned
+        // except (possibly) a conveyor pass task for the claim commit —
+        // no checkpoint/times-drain task exists, and PR registrations
+        // are rolled back best-effort inside the gate.
         if let Err(e) = be.writer_guard_gate().await {
             be.release_reservation().await;
+            // Layer A releases DETERMINISTICALLY before the error
+            // returns (2026-07-27 torn-claim remount flake): dropping
+            // the Arc is not enough — a failed claim COMMIT already
+            // spawned the conveyor pass task, whose per-iteration
+            // backend upgrade can outlive this scope by a scheduler
+            // quantum and pin the flock against our caller's instant
+            // remount, on a volume whose torn claim replays to nothing
+            // (unattributable — the same-process absorption refuses).
+            // Nothing of this mount writes after the gate refusal (the
+            // batch failure's rollback + hole checkpoint ran inside the
+            // pass, before its fan-out woke us), so releasing the lock
+            // here is exactly the drop-order release, made synchronous.
+            drop(be.guard_fd.lock().unwrap().take());
             return Err(e);
         }
 

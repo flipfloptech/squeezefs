@@ -2417,6 +2417,28 @@ pub struct Metrics {
     /// (device write failure / allocator failure / uring backpressure).
     /// ~0 on healthy mounts; sustained growth = device backpressure.
     pub write_through_fallbacks: Align64<AtomicU64>,
+    // Terminal-free device reclaim economy (the shim-write-amplification
+    // fix — `.benchmarks/2026-07-27-shim-write-amplification.md`;
+    // classification `routing::free_reclaim_op`, contract
+    // `tests/block_free_reclaim_tests.rs`). A field row's device-byte
+    // delta reconciles against these: data writes ≈ `write_through_bytes`
+    // family; reclaims live HERE and must never appear as device WRITE
+    // bandwidth (BLKDISCARD on namespaces, PUNCH_HOLE on file backings).
+    /// Terminal frees reclaimed via `BLKDISCARD` (block-device backing).
+    pub block_free_discards: Align64<AtomicU64>,
+    /// Bytes deallocated by `block_free_discards`.
+    pub block_free_discard_bytes: Align64<AtomicU64>,
+    /// Terminal frees reclaimed via `fallocate(PUNCH_HOLE)` (regular-file
+    /// backing — host-FS sparse reclaim, no device I/O).
+    pub block_free_file_punches: Align64<AtomicU64>,
+    /// Bytes deallocated by `block_free_file_punches`.
+    pub block_free_punch_bytes: Align64<AtomicU64>,
+    /// Terminal frees whose reclaim was refused/unsupported (discard
+    /// errno, non-file-non-bdev backing). Safe to skip — freed ranges are
+    /// never read (hole semantics + incarnation seqlock) — and NEVER
+    /// retried as a zeroing write; sustained growth on a thin-provisioned
+    /// substrate means space is not being returned to it.
+    pub block_free_reclaim_skipped: Align64<AtomicU64>,
     /// Seed-time memset bytes elided by §5.3 coverage tracking: for every
     /// Fresh accumulation buffer reaching content-validity, the block size
     /// minus the complement bytes actually zeroed. Sequential fills elide
@@ -4503,6 +4525,13 @@ impl SqueezefsFilesystem {
                 "write_through_blocks": METRICS.write_through_blocks.load(Ordering::Relaxed),
                 "write_through_bytes": METRICS.write_through_bytes.load(Ordering::Relaxed),
                 "write_through_fallbacks": METRICS.write_through_fallbacks.load(Ordering::Relaxed),
+                // Terminal-free reclaim economy (shim-write-amplification
+                // fix): reclaims must never surface as device WRITE bytes.
+                "block_free_discards": METRICS.block_free_discards.load(Ordering::Relaxed),
+                "block_free_discard_bytes": METRICS.block_free_discard_bytes.load(Ordering::Relaxed),
+                "block_free_file_punches": METRICS.block_free_file_punches.load(Ordering::Relaxed),
+                "block_free_punch_bytes": METRICS.block_free_punch_bytes.load(Ordering::Relaxed),
+                "block_free_reclaim_skipped": METRICS.block_free_reclaim_skipped.load(Ordering::Relaxed),
                 // RW1 rand-write device-byte ledger (design-random-small-
                 // writes §1.2 buckets; always-on — the G-RW2 gate's
                 // attribution source).

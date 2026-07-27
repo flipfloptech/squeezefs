@@ -454,6 +454,45 @@ fn probe_device_size_bytes(device_path: &str) -> u64 {
 pub const DAMAGED_MAPPING_PREFIX: &str = "damaged:";
 
 /// `true` ⇔ `mapping_str` is a §5.6a quarantined mapping.
+/// How a TERMINAL block free reclaims its device range
+/// (`.benchmarks/2026-07-27-shim-write-amplification.md`; contract pinned
+/// in `tests/block_free_reclaim_tests.rs`).
+///
+/// The field conviction: `fallocate(PUNCH_HOLE)` on a RAW BLOCK DEVICE is
+/// `blkdev_issue_zeroout` — a full block of Write-Zeroes WRITE bandwidth
+/// per freed block, so every steady-state overwrite/delete stream paid
+/// ~+1.0× device write amplification (field 1.85× at 98 % util; rig
+/// 2.000× exactly, kernel and shim paths alike). Deallocate is what a
+/// free means on a namespace: `BLKDISCARD` (NVMe DSM Deallocate — a
+/// range command, no data payload, not write-bandwidth-accounted).
+/// Regular-file backings keep `PUNCH_HOLE`: sparse-backing space reclaim
+/// is host-FS metadata there (the original ENOSPC motivation), not I/O.
+///
+/// Correctness does not depend on freed ranges reading zeros: unmapped
+/// blocks serve zeros from hole semantics (`hole_read_zeros_tests`), and
+/// reused offsets are guarded by write-before-publish + the incarnation
+/// seqlock (`reused_key_stale_fill_tests`) — so an unsupported/refused
+/// discard is SKIPPED and counted, never degraded into a zeroing write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreeReclaimOp {
+    /// Regular file backing: `fallocate(PUNCH_HOLE | KEEP_SIZE)`.
+    FilePunch,
+    /// Block device backing: `ioctl(BLKDISCARD)`.
+    BdevDiscard,
+    /// Anything else: reclaim nothing (and never zero-write).
+    Skip,
+}
+
+/// Classify a terminal free's reclaim op from the backing path's
+/// `st_mode` (`std::os::unix::fs::MetadataExt::mode()`).
+pub fn free_reclaim_op(mode: u32) -> FreeReclaimOp {
+    match mode & libc::S_IFMT {
+        libc::S_IFREG => FreeReclaimOp::FilePunch,
+        libc::S_IFBLK => FreeReclaimOp::BdevDiscard,
+        _ => FreeReclaimOp::Skip,
+    }
+}
+
 pub fn is_damaged_mapping(mapping_str: &str) -> bool {
     mapping_str.starts_with(DAMAGED_MAPPING_PREFIX)
 }

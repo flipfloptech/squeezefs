@@ -73,6 +73,23 @@ fn wait_spins() -> (u32, u32) {
     })
 }
 
+/// `SQUEEZEFS_IL_MAX_RUN_SLOTS` — TESTING ONLY: cap on every claimed
+/// run's slot count, so large ops chunk to `cap × slab` bytes and
+/// pipeline their flights. This is the write-amplification rig's
+/// deterministic stand-in for field slot fragmentation (a fleet under
+/// arena churn degrades run length the same way — P3's
+/// "fragmentation degrades run length, never refuses" pin);
+/// unset/0 = uncapped (the production posture).
+fn max_run_slots_cap() -> u32 {
+    static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("SQUEEZEFS_IL_MAX_RUN_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// Ctl-socket receive deadline (a dead daemon must not hang a bind).
 const CTL_RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -966,6 +983,16 @@ impl Session {
     /// via [`release_run`](Self::release_run). `None` = not one slot
     /// free (client-visible backpressure).
     fn claim_run(&self, want: u32) -> Option<(u32, u64, u32)> {
+        // `SQUEEZEFS_IL_MAX_RUN_SLOTS` (TESTING ONLY — the write-amplification
+        // rig's fragmentation simulator, tests/write_amp_rig.sh): cap every
+        // run's slot count so large ops chunk to `cap × slab` and pipeline
+        // their flights exactly as a slot-fragmented fleet arrives in the
+        // field (`.benchmarks/2026-07-27-shim-write-amplification.md`).
+        // Unset/0 = uncapped (production posture).
+        let want = match max_run_slots_cap() {
+            0 => want,
+            cap => want.min(cap),
+        };
         let slots = self.geometry.slots;
         let start = self.slot_hint.fetch_add(1, Ordering::Relaxed) % slots;
         // Pass 1 — aligned stride: try bases at multiples of `want` first,

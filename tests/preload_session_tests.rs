@@ -185,12 +185,23 @@ fn sink_host(
     name: &str,
     sink: Arc<dyn SessionSink>,
 ) -> (Arc<IpcHost>, tempfile::TempDir, std::fs::File, Session, u64) {
+    sink_host_geo(name, sink, test_geometry())
+}
+
+/// [`sink_host`] with an explicit geometry (the large-op economy pins use
+/// a multi-slab `max_op_bytes` window; the default fixture keeps its
+/// `max_op < slab` shape).
+fn sink_host_geo(
+    name: &str,
+    sink: Arc<dyn SessionSink>,
+    geometry: Geometry,
+) -> (Arc<IpcHost>, tempfile::TempDir, std::fs::File, Session, u64) {
     let cfg = IpcHostConfig {
         socket_name: format!("sqz-il0-session-{name}-{}", std::process::id()),
         socket_dir: None,
         build_commit: TEST_COMMIT.to_string(),
         allow_dev: false,
-        geometry: test_geometry(),
+        geometry,
         arena_cap_bytes: 64 * 1024 * 1024,
         per_uid_session_cap: 8,
         idle_secs: 0,
@@ -257,6 +268,12 @@ struct Fixture {
 
 impl Fixture {
     async fn new(name: &str) -> Fixture {
+        Self::new_geo(name, test_geometry()).await
+    }
+
+    /// [`Fixture::new`] with an explicit geometry (multi-slab windows for
+    /// the large-op economy pins).
+    async fn new_geo(name: &str, geometry: Geometry) -> Fixture {
         let (fs, backing, meta, staging) = sandbox_fs().await;
         let sink = Arc::new(InoMapSink {
             inner: DataPlaneSink::new(fs.clone()),
@@ -270,7 +287,7 @@ impl Fixture {
             socket_dir: Some(sockdir.path().to_path_buf()),
             build_commit: TEST_COMMIT.to_string(),
             allow_dev: false,
-            geometry: test_geometry(),
+            geometry,
             arena_cap_bytes: 64 * 1024 * 1024,
             per_uid_session_cap: 8,
             idle_secs: 0,
@@ -912,5 +929,345 @@ async fn establish_falls_back_to_the_path_socket_when_abstract_is_unreachable() 
         matches!(err, SessionError::Socket(_)),
         "both-rungs-dead is a socket refusal, got {err:?}"
     );
+    fx.host.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// DIALED P3 — large-op ring economy (the write matrix's >slab collapse,
+// .benchmarks/2026-07-27-write-side-economy.md): a ring write larger than
+// one arena slab must NOT degrade into serial slab-sized round trips. The
+// contract: chunks are sized to the full `max_op_bytes` window (multi-slab
+// contiguous arena runs), and every chunk of one op is SUBMITTED before the
+// client waits on any of them (pipelining). POSIX prefix semantics and slot
+// accounting are pinned alongside.
+// ---------------------------------------------------------------------------
+
+/// Multi-slab geometry: 16 slots × 128 KiB slabs, max_op 512 KiB (4 slabs
+/// per op window).
+fn wide_geometry() -> Geometry {
+    Geometry {
+        ring_entries: 16,
+        slots: 16,
+        arena_bytes: 2 * 1024 * 1024,
+        max_op_bytes: 512 * 1024,
+        _pad: 0,
+    }
+}
+
+/// Records every served WRITE `(offset, len)` and completes it fully.
+struct RecordingSink {
+    writes: std::sync::Mutex<Vec<(u64, u32)>>,
+}
+
+impl SessionSink for RecordingSink {
+    fn serve_data(&self, op: DataOp, completion: SlotCompletion) {
+        if op.desc.op == squeezefs_ipc::layout::OP_WRITE {
+            self.writes
+                .lock()
+                .expect("recording mutex never poisons")
+                .push((op.desc.offset, op.desc.len));
+        }
+        completion.complete(op.desc.len as i64);
+    }
+}
+
+/// Parks every WRITE completion until `need` distinct WRITE ops have
+/// arrived, then completes all of them fully — the pipelining proof: a
+/// serial-round-trip client strands on its first chunk (the op deadline
+/// fires); a pipelined client lands every chunk in one drain window.
+/// Never blocks the service thread (completions are stashed, not awaited).
+struct ParkUntilNSink {
+    need: usize,
+    parked: std::sync::Mutex<Vec<(u32, SlotCompletion)>>,
+}
+
+impl SessionSink for ParkUntilNSink {
+    fn serve_data(&self, op: DataOp, completion: SlotCompletion) {
+        let mut parked = self.parked.lock().expect("park mutex never poisons");
+        parked.push((op.desc.len, completion));
+        if parked.len() >= self.need {
+            for (len, c) in parked.drain(..) {
+                c.complete(len as i64);
+            }
+        }
+    }
+}
+
+/// Completes the FIRST write short (`short_n` bytes), everything after it
+/// fully — the POSIX prefix pin.
+struct ShortFirstSink {
+    short_n: i64,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl SessionSink for ShortFirstSink {
+    fn serve_data(&self, op: DataOp, completion: SlotCompletion) {
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            completion.complete(self.short_n);
+        } else {
+            completion.complete(op.desc.len as i64);
+        }
+    }
+}
+
+/// Errors the op whose offset matches `err_at` with -EIO, completes every
+/// other op fully.
+struct ErrAtSink {
+    err_at: u64,
+}
+
+impl SessionSink for ErrAtSink {
+    fn serve_data(&self, op: DataOp, completion: SlotCompletion) {
+        if op.desc.offset == self.err_at {
+            completion.complete(i64::from(-libc::EIO));
+        } else {
+            completion.complete(op.desc.len as i64);
+        }
+    }
+}
+
+/// Parks READ completions until released (slot-occupancy fixture for the
+/// fragmentation pin); WRITE ops complete inline.
+struct ParkReadsSink {
+    parked: std::sync::Mutex<Vec<SlotCompletion>>,
+}
+
+impl SessionSink for ParkReadsSink {
+    fn serve_data(&self, op: DataOp, completion: SlotCompletion) {
+        if op.desc.op == squeezefs_ipc::layout::OP_READ {
+            self.parked
+                .lock()
+                .expect("park mutex never poisons")
+                .push(completion);
+        } else {
+            completion.complete(op.desc.len as i64);
+        }
+    }
+}
+
+/// A >slab write must ride `max_op_bytes`-sized ring ops (multi-slab arena
+/// runs), not slab-sized serial chunks: 1 MiB over a 512 KiB window = 2
+/// ring ops, at offsets 0 and 512 KiB.
+#[test]
+fn large_write_is_one_ring_op_per_max_op_window() {
+    let sink = Arc::new(RecordingSink {
+        writes: std::sync::Mutex::new(Vec::new()),
+    });
+    let (host, _dir, _f, session, bid) = sink_host_geo("wide-opcount", sink.clone(), wide_geometry());
+
+    let buf = deterministic_bytes(1024 * 1024, 3);
+    match session.ring_pwrite(bid, &buf, 0) {
+        RingOutcome::Served(n) => assert_eq!(n, buf.len(), "full serve"),
+        other => panic!("ring_pwrite must serve, got {other:?}"),
+    }
+    let mut writes = sink.writes.lock().unwrap().clone();
+    writes.sort_unstable();
+    assert_eq!(
+        writes,
+        vec![(0, 512 * 1024), (512 * 1024, 512 * 1024)],
+        "1 MiB over a 512 KiB max_op window must be exactly two full-window \
+         ring ops — slab-sized serial chunking is the write-matrix collapse"
+    );
+    host.shutdown();
+}
+
+/// Every chunk of one large op is submitted BEFORE the client waits on any
+/// of them: a sink that completes nothing until both chunks arrived can
+/// only be satisfied by a pipelined client (a serial client strands its
+/// first chunk until the op deadline poisons the session).
+#[test]
+fn large_write_pipelines_all_chunks_before_waiting() {
+    let sink = Arc::new(ParkUntilNSink {
+        need: 2,
+        parked: std::sync::Mutex::new(Vec::new()),
+    });
+    let (host, _dir, f, _default_session, _bid) =
+        sink_host_geo("wide-pipeline", sink.clone(), wide_geometry());
+    // Short deadline so the RED shape (serial chunk stranding) fails fast
+    // instead of the 30 s default.
+    let blob = BootstrapBlob::decode(&host.bootstrap_blob()).unwrap();
+    let session = Session::establish_with_op_timeout_ms(&blob, f.as_raw_fd(), TEST_COMMIT, 2_000)
+        .expect("session establishes");
+    let bind = session.bind(f.as_raw_fd()).expect("bind succeeds");
+
+    let buf = deterministic_bytes(1024 * 1024, 4);
+    match session.ring_pwrite(bind.binding_id, &buf, 0) {
+        RingOutcome::Served(n) => assert_eq!(n, buf.len(), "both chunks in flight together"),
+        other => panic!(
+            "a pipelined large write must serve (serial chunking strands \
+             on the parked first chunk), got {other:?}"
+        ),
+    }
+    assert!(!session.poisoned(), "no deadline fired");
+    host.shutdown();
+}
+
+/// POSIX prefix semantics: the first (lowest-offset) chunk completing
+/// short ends the reported prefix, regardless of later chunks.
+#[test]
+fn large_write_short_first_completion_reports_posix_prefix() {
+    let sink = Arc::new(ShortFirstSink {
+        short_n: 100_000,
+        fired: std::sync::atomic::AtomicBool::new(false),
+    });
+    let (host, _dir, _f, session, bid) = sink_host_geo("wide-short", sink, wide_geometry());
+
+    let buf = deterministic_bytes(1024 * 1024, 5);
+    match session.ring_pwrite(bid, &buf, 0) {
+        RingOutcome::Served(n) => assert_eq!(
+            n, 100_000,
+            "prefix ends at the first short completion (POSIX short write)"
+        ),
+        other => panic!("short-completion write must serve a prefix, got {other:?}"),
+    }
+    host.shutdown();
+}
+
+/// Error semantics: an error on the FIRST chunk is the op's errno; an
+/// error after a completed prefix reports the prefix (POSIX short write —
+/// the caller's retry surfaces the errno).
+#[test]
+fn large_write_error_semantics_prefix_or_errno() {
+    // Error at offset 0 (first chunk) ⇒ Errno.
+    let (host, _dir, _f, session, bid) = sink_host_geo(
+        "wide-err0",
+        Arc::new(ErrAtSink { err_at: 0 }),
+        wide_geometry(),
+    );
+    let buf = deterministic_bytes(1024 * 1024, 6);
+    match session.ring_pwrite(bid, &buf, 0) {
+        RingOutcome::Errno(e) => assert_eq!(e, libc::EIO, "first-chunk error is the errno"),
+        other => panic!("first-chunk error must surface, got {other:?}"),
+    }
+    host.shutdown();
+
+    // Error at the second window ⇒ Served(first window).
+    let (host, _dir, _f, session, bid) = sink_host_geo(
+        "wide-err1",
+        Arc::new(ErrAtSink {
+            err_at: 512 * 1024,
+        }),
+        wide_geometry(),
+    );
+    match session.ring_pwrite(bid, &buf, 0) {
+        RingOutcome::Served(n) => assert_eq!(
+            n,
+            512 * 1024,
+            "mid-stream error reports the completed prefix"
+        ),
+        other => panic!("mid-stream error must report the prefix, got {other:?}"),
+    }
+    host.shutdown();
+}
+
+/// Slot accounting: a multi-slab op returns EVERY slot — the submitted
+/// base and the arena-extension holds — to FREE. All 16 slots must be
+/// claimable afterwards.
+#[test]
+fn large_write_releases_every_slot_after_serve() {
+    let sink = Arc::new(RecordingSink {
+        writes: std::sync::Mutex::new(Vec::new()),
+    });
+    let (host, _dir, _f, session, bid) = sink_host_geo("wide-slots", sink, wide_geometry());
+
+    let buf = deterministic_bytes(1024 * 1024, 7);
+    for _ in 0..3 {
+        match session.ring_pwrite(bid, &buf, 0) {
+            RingOutcome::Served(n) => assert_eq!(n, buf.len()),
+            other => panic!("serve expected, got {other:?}"),
+        }
+    }
+    // All 16 slots claimable ⇒ nothing leaked CLAIMED.
+    let slab = session.slab_bytes() as usize;
+    let mut tickets = Vec::new();
+    for i in 0..16u64 {
+        let t = session
+            .submit_pwrite_nowait(bid, &buf[..slab.min(4096)], i * 4096)
+            .unwrap_or_else(|| panic!("slot {i} must be claimable after large writes"));
+        tickets.push(t);
+    }
+    for t in tickets {
+        loop {
+            if let Some(r) = session.poll_ticket(t, None) {
+                assert!(r > 0, "ticket completes clean");
+                break;
+            }
+            std::hint::spin_loop();
+        }
+    }
+    host.shutdown();
+}
+
+/// Fragmented slot space still serves: with most slots held by parked
+/// tickets (no 4-slab run available), a 512 KiB write must degrade to
+/// smaller runs — never fail, never strand.
+#[test]
+fn fragmented_slots_still_serve_large_write_via_smaller_runs() {
+    let sink = Arc::new(ParkReadsSink {
+        parked: std::sync::Mutex::new(Vec::new()),
+    });
+    let (host, _dir, _f, session, bid) =
+        sink_host_geo("wide-frag", sink.clone(), wide_geometry());
+
+    // Park 13 of 16 slots behind never-completing reads.
+    let mut held = Vec::new();
+    for _ in 0..13 {
+        held.push(
+            session
+                .submit_pread_nowait(bid, 4096, 0)
+                .expect("hold ticket claims"),
+        );
+    }
+    let buf = deterministic_bytes(512 * 1024, 8);
+    match session.ring_pwrite(bid, &buf, 0) {
+        RingOutcome::Served(n) => assert_eq!(n, buf.len(), "fragmented slots still serve fully"),
+        other => panic!("fragmented large write must serve, got {other:?}"),
+    }
+    // Release the held slots (complete the parked reads) and consume.
+    {
+        let mut parked = sink.parked.lock().unwrap();
+        for c in parked.drain(..) {
+            c.complete(0);
+        }
+    }
+    for t in held {
+        loop {
+            if let Some(_r) = session.poll_ticket(t, None) {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+    }
+    host.shutdown();
+}
+
+/// Multi-slab arena windows through the REAL data-plane sink: byte parity
+/// end-to-end (the severed copy spans slabs), both transports agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_slab_ring_write_full_parity_through_real_sink() {
+    let fx = Fixture::new_geo("wide-parity", wide_geometry()).await;
+    let session = fx.establish();
+    let (ino, fd) = fx.create_file("wide-parity.bin", libc::O_RDWR).await;
+    let bind = session.bind(fd.as_raw_fd()).expect("bind succeeds");
+
+    let w = deterministic_bytes(1024 * 1024 + 12_345, 9); // odd tail chunk
+    match tokio::task::block_in_place(|| session.ring_pwrite(bind.binding_id, &w, 4096)) {
+        RingOutcome::Served(n) => assert_eq!(n, w.len(), "full serve"),
+        other => panic!("ring_pwrite must serve, got {other:?}"),
+    }
+    let fuse = fx.fuse_read(ino, 4096, w.len() as u32).await;
+    assert_eq!(fuse, w, "FUSE read parity after multi-slab ring write");
+    let ring = tokio::task::block_in_place(|| {
+        let mut buf = vec![0u8; w.len()];
+        match session.ring_pread(bind.binding_id, &mut buf, 4096) {
+            RingOutcome::Served(n) => {
+                buf.truncate(n);
+                buf
+            }
+            other => panic!("ring_pread must serve, got {other:?}"),
+        }
+    });
+    assert_eq!(ring, w, "ring read parity after multi-slab ring write");
+    session.unbind(bind.binding_id);
     fx.host.shutdown();
 }

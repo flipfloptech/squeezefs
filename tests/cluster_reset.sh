@@ -31,7 +31,8 @@ CACHE_DIR="/scratch/tmp/cache"
 META_SLOTS=8
 MDS_SIZE_MB=8192            # null_blk size per metadata namespace
 OSS_ZRAM_SIZE="64G"         # zram disksize per data namespace
-OSS_ZRAM_ALGO="zstd"        # try lz4 to A/B target compression cost
+OSS_ZRAM_ALGO="auto"        # auto = best available on the target (zstd>lz4>lzo-rle>lzo);
+                            # or name one explicitly to A/B compression cost
 MOUNT_EXTRA=(--interception --allow-other --log-file /tmp/sqz.log)
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=5)
 # ============================================================================
@@ -98,7 +99,20 @@ if [ -b /dev/zram0 ]; then
 else
   cat /sys/class/zram-control/hot_add >/dev/null
 fi
-echo "$ZALGO" > /sys/block/zram0/comp_algorithm
+avail=$(cat /sys/block/zram0/comp_algorithm | tr -d '[]')
+pick=""
+if [ "$ZALGO" != "auto" ]; then
+  for a in $avail; do [ "$a" = "$ZALGO" ] && pick="$ZALGO" && break; done
+  [ -n "$pick" ] || echo "note: '$ZALGO' not offered by this kernel (has: $avail) — auto-selecting" >&2
+fi
+if [ -z "$pick" ]; then
+  for cand in zstd lz4 lzo-rle lzo; do
+    for a in $avail; do [ "$a" = "$cand" ] && pick="$cand" && break 2; done
+  done
+fi
+[ -n "$pick" ] || { echo "no usable zram compression algorithm (offered: $avail)" >&2; exit 1; }
+echo "zram comp_algorithm: $pick"
+echo "$pick" > /sys/block/zram0/comp_algorithm
 echo "$ZSIZE" > /sys/block/zram0/disksize
 sz=$(blockdev --getsize64 /dev/zram0)
 [ "$sz" -gt 0 ] || { echo "zram0 has zero size after setup" >&2; exit 1; }

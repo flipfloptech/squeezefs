@@ -1063,6 +1063,11 @@ async fn test_write_through_reused_key_purges_stale_read_tiers() {
         .and_then(|bm| bm.get(&1).cloned())
         .expect("block 1 mapped");
     assert_ne!(k1_old, k1_new, "overwrite must publish a fresh key");
+    // Async block-reclaim: the displaced free's finish_free rides the
+    // background queue — drain it so the freed offset is deterministically
+    // free-listed before block 2's write-through allocates (the reuse
+    // precondition below).
+    h.fs.router.backend_router.reclaim_drain().await;
 
     // Simulate the raced reader: the dying incarnation's bytes land in both
     // read tiers under the now-freed key.

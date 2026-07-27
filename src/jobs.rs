@@ -2028,6 +2028,14 @@ impl JobFabric {
             let mut deferred_this_pass = 0u64;
             let mut moved_this_pass = 0u64;
             if census.tasks.is_empty() && census.blob_relocations.is_empty() {
+                // Mover-class convergence implies space RETURNED, not
+                // merely queued: displaced-source frees ride the
+                // background reclaim queue (src/block_reclaim.rs), so
+                // drain it before adjudicating — the D1 gauges an
+                // operator reads at Completed, and the Drain arm's
+                // `victim_used == 0` retire gate, must observe the
+                // vacated blocks actually finish_freed.
+                ctx.router.backend_router.reclaim_drain().await;
                 match objective {
                     MoverObjective::Rebalance | MoverObjective::Defrag { .. } => {
                         let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;

@@ -246,6 +246,9 @@ async fn parked_read_never_serves_reused_or_freed_key() {
     // COW-rewrite b0 (0xA1): displaces X from map[b0] and frees it — the
     // free list now holds exactly X.
     write_at(&h, ino, 0, &vec![0xA1u8; BS as usize]).await;
+    // Async block-reclaim: X's finish_free rides the background queue —
+    // drain so the reuse premise below stays deterministic.
+    h.fs.router.backend_router.reclaim_drain().await;
     // COW-rewrite b1 (0xB1): the allocator hands X to b1; b1's bytes are
     // DMA'd into X's device range and map[b1] = X is published.
     write_at(&h, ino, BS, &vec![0xB1u8; BS as usize]).await;

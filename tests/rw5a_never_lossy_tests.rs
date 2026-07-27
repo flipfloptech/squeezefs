@@ -642,7 +642,9 @@ async fn untracked_free_is_refused_never_a_second_release() {
     );
 
     // The offset stays allocatable exactly once and the machinery stays
-    // sane: realloc it, free it, realloc again.
+    // sane: realloc it, free it, realloc again. (Async block-reclaim:
+    // drain so free #1's finish_free lands before the realloc.)
+    h.fs.router.backend_router.reclaim_drain().await;
     let off2 = alloc.allocate_block().await.unwrap();
     assert_eq!(off, off2, "the single free-list entry is reusable");
     alloc.publish_block(off2);

@@ -781,8 +781,15 @@ pub struct NvmeStaging {
     max_read_bytes: u64,
     pub block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
     pub nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+    /// WEAK, deliberately (the `set_data_router` discipline: the router
+    /// owns the cache, never the reverse). A strong Arc here closed the
+    /// cycle `BackendRouter.read_tier_purge` closure → `TieredCache` →
+    /// this cell → `BackendRouter`, immortalizing every mount/fixture
+    /// graph — measured as ~65 leaked segment-file fds per dropped test
+    /// harness (EMFILE by suite end; 2026-07-27 write-pipeline campaign
+    /// conviction, pre-existing on dev).
     pub backend_router:
-        std::sync::Arc<once_cell::sync::OnceCell<std::sync::Arc<crate::routing::BackendRouter>>>,
+        std::sync::Arc<once_cell::sync::OnceCell<std::sync::Weak<crate::routing::BackendRouter>>>,
     redis_client: std::sync::Arc<crate::dlm::MetaClient>,
     /// Bounded merge-queue sender (P1-1). Full → StorageFull / backpressure.
     write_tx: mpsc::Sender<PendingStagedWrite>,
@@ -1091,7 +1098,7 @@ impl NvmeStaging {
     }
 
     pub fn set_backend_router(&self, router: std::sync::Arc<crate::routing::BackendRouter>) {
-        let _ = self.backend_router.set(router);
+        let _ = self.backend_router.set(std::sync::Arc::downgrade(&router));
     }
 
     /// Late-bind the owning `DataRouter` (weak) for merge-worker promotion.
@@ -2031,8 +2038,8 @@ impl NvmeStaging {
     /// (bare tooling) refuse the publish — a cache entry is never worth an
     /// unvalidated stick.
     pub fn cache_read_block_validated_self(&self, block_key: &str, data: Bytes) -> bool {
-        match self.backend_router.get() {
-            Some(router) => self.cache_read_block_validated(block_key, data, router),
+        match self.backend_router.get().and_then(|w| w.upgrade()) {
+            Some(router) => self.cache_read_block_validated(block_key, data, &router),
             None => false,
         }
     }

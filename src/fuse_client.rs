@@ -7211,6 +7211,154 @@ impl SqueezefsFilesystem {
     /// `ActiveBlockBuf::snapshot()` — zero-completed, block-sized,
     /// 4096-aligned (guaranteed `WriteData::Aligned` zero-copy submit) —
     /// never a transport-payload `Bytes`.
+    /// Contract 9 of `tests/async_block_reclaim_tests.rs` (field ledger
+    /// inversion, 2026-07-27): the **brim in-place rewrite**. A store at
+    /// fill 1.0 can never serve CoW's allocate-before-free, so a full
+    /// rewrite of existing files — a SPACE-NEUTRAL operation — degraded
+    /// into the never-lossy staging fallback forever: acked bytes piled
+    /// into staging, the writeback backlog spun on `StorageFull`, no
+    /// displacement free ever happened (the session-A ledger: `queued=0`,
+    /// zero device commands, `sync_drains` ≈ allocation attempts).
+    ///
+    /// When the write-through's allocation genuinely fails for space and
+    /// the block's CURRENT mapping is a sole-owned, undecorated
+    /// (whole-block), passthrough-stored key on an Active volume, the
+    /// complete new image lands IN PLACE at the mapping's own offset — the
+    /// W1 `begin_patch_sole_owner` incarnation fence, whole-block face
+    /// (design-random-small-writes §5.1; "only app-written sectors are
+    /// ever rewritten" holds trivially: coverage is the whole block). No
+    /// allocation, no free, no map change (same-key merge for the size
+    /// floor only), no staging detour; counted in
+    /// `write_through_inplace_rewrites`.
+    ///
+    /// `Ok(false)` = predicate fallback (transformed volume / decorated
+    /// mapping / shared or untracked offset / non-Active volume): the
+    /// caller surfaces the original `StorageFull` into the never-lossy
+    /// staging ladder — genuine space pressure, honestly counted.
+    async fn try_brim_inplace_rewrite(
+        &self,
+        ino: u64,
+        b: u32,
+        processed: bytes::Bytes,
+        fencing_token: u64,
+    ) -> Result<bool, SqueezefsError> {
+        // Passthrough only: an in-place image must occupy exactly the
+        // undecorated mapping's whole-block window; a transformed image's
+        // stored length varies with content.
+        if !self.router.get_crypto().is_passthrough() {
+            return Ok(false);
+        }
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        if processed.len() as u64 != block_size {
+            return Ok(false);
+        }
+        // The block's authoritative mapping under the caller's held block
+        // lock (the try_sole_owner_patch predicate-1 resolution).
+        let file_path = crate::keys::inode_path(ino);
+        let mapping = {
+            let cached = self
+                .router
+                .metadata_cache
+                .get(&ino)
+                .filter(|m| m.file_type == "striped");
+            let meta = match cached {
+                Some(m) => Some(m),
+                None => self
+                    .router
+                    .fetch_metadata(&file_path)
+                    .await
+                    .ok()
+                    .filter(|m| m.file_type == "striped"),
+            };
+            meta.and_then(|m| m.block_map.as_ref().and_then(|bm| bm.get(&b).cloned()))
+        };
+        let Some(mapping) = mapping else {
+            // Hole / not striped / indirect-mapped: nothing to rewrite over.
+            return Ok(false);
+        };
+        if !crate::routing::is_whole_block_mapping(&mapping) {
+            // Decorated `bk:off:len` (promoted staged): the stored window
+            // is not the whole chunk — never scribble over it.
+            return Ok(false);
+        }
+        let Ok((be_id, dev_offset)) = self.router.backend_router.parse_block_key(&mapping) else {
+            return Ok(false);
+        };
+        // Never write in place on a non-Active volume: the VL4 mover owns
+        // Draining copies (the same rule as the indirect-blob reuse gate).
+        if !self
+            .router
+            .backend_router
+            .volume_state_for_key_backend(&be_id)
+            .is_none_or(|state| state == crate::VOL_STATE_ACTIVE)
+        {
+            return Ok(false);
+        }
+        let Ok((allocator, device)) = self.router.backend_router.get_backend(&be_id) else {
+            return Ok(false);
+        };
+        // The §5.1 fence, whole-block face: retire the incarnation (racing
+        // validated fills of this key fail their seqlock re-check instead
+        // of publishing mid-rewrite bytes) → fence(SeqCst) → sole-owner
+        // re-check. Shared/untracked ⇒ re-stabilize (content unchanged)
+        // and let the caller take the honest StorageFull.
+        if !allocator.begin_patch_sole_owner(dev_offset) {
+            allocator.publish_block(dev_offset);
+            return Ok(false);
+        }
+        let dma = device.write_block(dev_offset, processed).await;
+        // Re-stabilize + purge on BOTH exits (the try_sole_owner_patch
+        // discipline): no tier may serve the dying generation's bytes.
+        allocator.publish_block(dev_offset);
+        self.router.cache.purge_block_key(&mapping);
+        dma?;
+        // Same-key merge (no displacement — the merge skips equal keys):
+        // the size floor and layout coherence ride the §5.3 one-merge
+        // discipline exactly like the CoW arm. A merge failure after the
+        // in-place DMA propagates into the caller's never-lossy staging
+        // fallback, which re-stages this same complete image — staging
+        // owns read authority for `b` until writeback converges.
+        let min_size = (b as u64 + 1) * block_size;
+        let entries = [(b, mapping)];
+        self.router
+            .merge_block_mappings(
+                ino,
+                crate::routing::BlockMapOp::Merge(&entries),
+                min_size,
+                crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
+                fencing_token,
+            )
+            .await?;
+        METRICS
+            .write_through_inplace_rewrites
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    /// The shared post-publish invalidation tail of a write-through (CoW
+    /// upload AND brim in-place rewrite): retire the parked RAM overlay,
+    /// drop the staged sibling, and drop stale whole-file snapshots.
+    async fn upload_invalidation_tail(&self, ino: u64, b: u32) -> Result<(), SqueezefsError> {
+        // Invalidate AFTER the meta publish: a read racing between DMA and
+        // publish still hits the RAM snapshot (correct); after removal it
+        // resolves via the published block map. Any stale queued
+        // WritebackRequest for this key becomes a no-op (its staged source
+        // is gone). A stale whole-file RAM snapshot would serve pre-write
+        // bytes — drop it, as the routing striped merge does.
+        let cache_key = crate::keys::active_block(ino, b as u64).to_string();
+        self.retire_parked_overlay(&cache_key);
+        // Blocking-pool hop: shard WRITE lock (invariant rule 2).
+        self.router
+            .cache
+            .nvme
+            .remove_active_block_async(cache_key)
+            .await?;
+        let file_path = crate::keys::inode_path(ino);
+        self.router.cache.write_lru.remove(&file_path);
+        self.router.cache.read_lru.remove(&file_path);
+        Ok(())
+    }
+
     async fn upload_full_block(
         &self,
         ino: u64,
@@ -7239,7 +7387,29 @@ impl SqueezefsFilesystem {
         // Marks the key's incarnation unstable: racing validated cache fills
         // of a reused key fail their seqlock check instead of caching
         // pre-DMA bytes.
-        let offset = block_allocator.allocate_block().await?;
+        let offset = match block_allocator.allocate_block().await {
+            Ok(o) => o,
+            Err(e)
+                if matches!(&e, SqueezefsError::Io(io)
+                    if io.kind() == std::io::ErrorKind::StorageFull) =>
+            {
+                // GENUINE space failure (the valve already drained any
+                // queued reclaims): a space-neutral rewrite of this
+                // block's own sole-owned mapping converges IN PLACE —
+                // contract 9 (field ledger inversion). Predicate misses
+                // surface the honest StorageFull into the caller's
+                // never-lossy staging fallback.
+                if self
+                    .try_brim_inplace_rewrite(ino, b, processed, fencing_token)
+                    .await?
+                {
+                    write_phase_record(WritePhase::UploadDma, wp_dma);
+                    return self.upload_invalidation_tail(ino, b).await;
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         // PR VL6a: live-owner registration across the allocate→merge
         // window (drops at function end, after the map merge below).
         let _inflight = block_allocator.inflight_register(offset);
@@ -7303,24 +7473,7 @@ impl SqueezefsFilesystem {
             let _ = self.router.backend_router.free_block(&bk).await;
         }
 
-        // Invalidate AFTER the meta publish: a read racing between DMA and
-        // publish still hits the RAM snapshot (correct); after removal it
-        // resolves via the published block map. Any stale queued
-        // WritebackRequest for this key becomes a no-op (its staged source
-        // is gone). A stale whole-file RAM snapshot would serve pre-write
-        // bytes — drop it, as the routing striped merge does.
-        let cache_key = crate::keys::active_block(ino, b as u64).to_string();
-        self.retire_parked_overlay(&cache_key);
-        // Blocking-pool hop: shard WRITE lock (invariant rule 2).
-        self.router
-            .cache
-            .nvme
-            .remove_active_block_async(cache_key)
-            .await?;
-        let file_path = crate::keys::inode_path(ino);
-        self.router.cache.write_lru.remove(&file_path);
-        self.router.cache.read_lru.remove(&file_path);
-        Ok(())
+        self.upload_invalidation_tail(ino, b).await
     }
 
     async fn flush_active_blocks_with_retry(

@@ -639,8 +639,14 @@ impl BackendRouter {
     /// allocation that would refuse for space force-drains the queued
     /// reclaims first — a full volume can never be wedged by
     /// lazily-queued space. The counter lives HERE so it means exactly
-    /// "valve drains" (0 except under real space pressure); explicit
-    /// drains (`reclaim_drain`, unmount) never bump it.
+    /// "valve drains that reclaimed queued space" (0 except under real
+    /// space pressure); explicit drains (`reclaim_drain`, unmount) never
+    /// bump it, and neither does a pass that found the queue EMPTY —
+    /// contract 8 (field ledger inversion, 2026-07-27): counting no-op
+    /// passes turned a genuinely-full store into an unbounded
+    /// `sync_drains` climb (one per failed allocation attempt, forever)
+    /// that read as "the reclaimer is not keeping up" when there was
+    /// nothing to reclaim at all.
     fn wire_space_pressure_valve(
         allocator: &std::sync::Arc<crate::block_allocator::BlockAllocator>,
         reclaim: &std::sync::Arc<crate::block_reclaim::ReclaimQueue>,
@@ -654,10 +660,11 @@ impl BackendRouter {
             if rq.fence_halted() {
                 return;
             }
-            METRICS
-                .block_free_reclaim_sync_drains
-                .fetch_add(1, Ordering::Relaxed);
-            rq.drain_sync();
+            if rq.drain_sync() > 0 {
+                METRICS
+                    .block_free_reclaim_sync_drains
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }));
     }
 
@@ -676,9 +683,11 @@ impl BackendRouter {
     /// reclaimed-or-consciously-skipped and `finish_free`d.
     pub async fn reclaim_drain(&self) {
         let q = self.reclaim.clone();
-        if tokio::task::spawn_blocking(move || q.drain_sync())
-            .await
-            .is_err()
+        if tokio::task::spawn_blocking(move || {
+            let _ = q.drain_sync();
+        })
+        .await
+        .is_err()
         {
             log::error!("reclaim_drain blocking task panicked");
         }

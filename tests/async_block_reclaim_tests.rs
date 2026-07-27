@@ -965,7 +965,7 @@ impl Drop for PatchOff {
 }
 
 async fn make_field_harness(test_id: &str) -> FieldH {
-    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", &FBS.to_string());
+    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", FBS.to_string());
     let dlm = DlmClient::new("local").unwrap();
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())
@@ -1019,18 +1019,17 @@ async fn make_field_harness(test_id: &str) -> FieldH {
 }
 
 async fn field_create(h: &FieldH, name: &str) -> u64 {
-    h.fs
-        .create(
-            h.req,
-            1,
-            std::ffi::OsStr::new(name),
-            libc::S_IFREG | 0o644,
-            0,
-        )
-        .await
-        .unwrap()
-        .attr
-        .ino
+    h.fs.create(
+        h.req,
+        1,
+        std::ffi::OsStr::new(name),
+        libc::S_IFREG | 0o644,
+        0,
+    )
+    .await
+    .unwrap()
+    .attr
+    .ino
 }
 
 async fn field_write(fs: &SqueezefsFilesystem, req: Request, ino: u64, off: u64, data: &[u8]) {
@@ -1042,8 +1041,7 @@ async fn field_write(fs: &SqueezefsFilesystem, req: Request, ino: u64, off: u64,
 }
 
 async fn field_read(h: &FieldH, ino: u64, off: u64, size: u32) -> Vec<u8> {
-    h.fs
-        .read(h.req, ino, 0, off, size, 0)
+    h.fs.read(h.req, ino, 0, off, size, 0)
         .await
         .unwrap_or_else(|e| panic!("read ino {ino} off {off} failed: {e:?}"))
         .data
@@ -1080,24 +1078,21 @@ async fn field_make_striped(h: &FieldH, name: &str, blocks: u64, seed: u8) -> u6
 /// Truncate to zero through the real setattr path: every mapped block is
 /// a terminal free riding the displacement/free machinery.
 async fn field_truncate_zero(h: &FieldH, ino: u64) {
-    h.fs
-        .setattr(
-            h.req,
-            ino,
-            None,
-            SetAttr {
-                size: Some(0),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("truncate to zero");
+    h.fs.setattr(
+        h.req,
+        ino,
+        None,
+        SetAttr {
+            size: Some(0),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("truncate to zero");
 }
 
 fn batches() -> u64 {
-    METRICS
-        .block_free_reclaim_batches
-        .load(Ordering::Relaxed)
+    METRICS.block_free_reclaim_batches.load(Ordering::Relaxed)
 }
 fn wt_blocks() -> u64 {
     METRICS.write_through_blocks.load(Ordering::Relaxed)

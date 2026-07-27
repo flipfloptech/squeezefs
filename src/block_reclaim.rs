@@ -26,6 +26,9 @@
 //! * **ENOSPC pressure valve**: `BlockAllocator::allocate_block` invokes
 //!   the wired [`ReclaimQueue::drain_sync`] before refusing for space —
 //!   a full volume can never be wedged by lazily-queued reclaims.
+//!   `block_free_reclaim_sync_drains` counts ONLY passes that actually
+//!   processed queued entries (contract 8, field ledger inversion
+//!   2026-07-27): an empty-queue pass is a no-op, never engagement.
 //! * **Crash posture** (kill-9 with queued entries): the queue is
 //!   RAM-only space-return work. The mount recovery walk rebuilds
 //!   refcounts/free-list from durable layout maps, so the freed offsets
@@ -161,8 +164,15 @@ impl ReclaimQueue {
 
     /// Queue one terminal free's reclaim. Past the bounded-memory cap the
     /// entry is processed INLINE (backpressure — the reclaimer is not
-    /// keeping up; conservation over latency).
+    /// keeping up; conservation over latency). `block_free_reclaim_queued`
+    /// counts BOTH arms — it means "entered the reclaim engine", so the
+    /// field ledger's `queued ≡ displaced blocks` identity holds even
+    /// when the cap forces inline processing (field ledger inversion,
+    /// 2026-07-27: an uncounted arm is how a live mount's ledger lies).
     pub fn enqueue(self: &Arc<Self>, entry: ReclaimEntry) {
+        METRICS
+            .block_free_reclaim_queued
+            .fetch_add(1, Ordering::Relaxed);
         if self.len.load(Ordering::Acquire) >= self.max_queued {
             self.processing.fetch_add(1, Ordering::AcqRel);
             METRICS
@@ -171,9 +181,6 @@ impl ReclaimQueue {
             self.process_entries(vec![entry]);
             return;
         }
-        METRICS
-            .block_free_reclaim_queued
-            .fetch_add(1, Ordering::Relaxed);
         METRICS
             .block_free_reclaim_queue_bytes
             .fetch_add(entry.size, Ordering::Relaxed);
@@ -267,23 +274,27 @@ impl ReclaimQueue {
     }
 
     /// Synchronously drain the queue to empty AND wait out in-flight
-    /// batches. Callers: the ENOSPC pressure valve (the caller counts
-    /// `block_free_reclaim_sync_drains`), unmount teardown, and tests via
+    /// batches. Callers: the ENOSPC pressure valve (which counts
+    /// `block_free_reclaim_sync_drains` ONLY when the returned processed
+    /// count is nonzero — contract 8: an empty-queue pass is a no-op, not
+    /// engagement), unmount teardown, and tests via
     /// `BackendRouter::reclaim_drain`. Blocking by design — run it on the
     /// blocking pool from async contexts unless you ARE the emergency
     /// path (the valve blocks its worker briefly; ENOSPC is rarer and
-    /// worse).
-    pub fn drain_sync(&self) {
+    /// worse). Returns the number of entries THIS call processed.
+    pub fn drain_sync(&self) -> u64 {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut processed = 0u64;
         loop {
             let batch = self.take_batch(self.batch_blocks as usize);
             if !batch.is_empty() {
+                processed += batch.len() as u64;
                 self.process_entries(batch);
                 continue;
             }
             if self.processing.load(Ordering::Acquire) == 0 && self.len.load(Ordering::Acquire) == 0
             {
-                return;
+                return processed;
             }
             if std::time::Instant::now() > deadline {
                 log::error!(
@@ -293,7 +304,7 @@ impl ReclaimQueue {
                     self.processing.load(Ordering::Relaxed),
                     self.len.load(Ordering::Relaxed)
                 );
-                return;
+                return processed;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }

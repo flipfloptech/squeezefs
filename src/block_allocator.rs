@@ -523,23 +523,37 @@ impl BlockAllocator {
 
     /// One allocation attempt (free list, then fresh mint) — the body
     /// [`Self::allocate_block`] wraps with the ENOSPC pressure valve.
+    ///
+    /// The free-list claim RETRIES until a `remove` wins or the list is
+    /// observed empty (field ledger inversion, 2026-07-27 — contract 7 of
+    /// `tests/async_block_reclaim_tests.rs`): concurrent allocators all
+    /// read the same list head, and the old lost-race arm fell straight
+    /// to `next_fresh_block()` — which refuses `StorageFull` on any
+    /// cursor-at-cap store (any store that has EVER been full;
+    /// `highest_block` never shrinks). Every lost race then fired the
+    /// ENOSPC valve: a spurious `sync_drains` count plus a synchronous
+    /// whole-queue reclaim drain ON THE WRITE PATH, at ANY fill (the
+    /// field's per-allocation valve storm and −33 % rewrite tax). Each
+    /// retry means another thread claimed that candidate — system-wide
+    /// progress — so the loop is livelock-free and terminates when the
+    /// list empties.
     fn try_allocate_block(&self) -> Result<u64> {
-        let mut found_idx = None;
-        for item in self.free_blocks.iter() {
-            found_idx = Some(*item);
-            break;
-        }
-        let (block_idx, src) = if let Some(idx) = found_idx {
+        loop {
+            let Some(idx) = self.free_blocks.iter().next().map(|item| *item) else {
+                break;
+            };
             if self.free_blocks.remove(&idx).is_some() {
-                (idx, "freelist")
-            } else {
-                (self.next_fresh_block()?, "fresh")
+                log::debug!(
+                    "allocate_block: offset {} (freelist)",
+                    idx * self.chunk_size
+                );
+                return Ok(self.claim_block_idx(idx));
             }
-        } else {
-            (self.next_fresh_block()?, "fresh")
-        };
+            // Lost the claim race: rescan for the next candidate.
+        }
+        let block_idx = self.next_fresh_block()?;
         log::debug!(
-            "allocate_block: offset {} ({src})",
+            "allocate_block: offset {} (fresh)",
             block_idx * self.chunk_size
         );
         Ok(self.claim_block_idx(block_idx))

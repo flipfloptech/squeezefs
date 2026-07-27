@@ -31,7 +31,13 @@ fn ledger_append(path: &std::path::Path, line: &str) {
         .append(true)
         .open(path)
         .expect("open ledger");
-    writeln!(f, "{line}").expect("append ledger");
+    // ONE write(2) per record: `writeln!` would issue the payload and the
+    // '\n' as two writes, and the batched soak's concurrent lanes then
+    // interleave payloads before their newlines — the torn-append flake
+    // pinned by test_ledger_append_line_atomicity_under_concurrent_lanes
+    // (O_APPEND makes a single write atomic between appenders).
+    f.write_all(format!("{line}\n").as_bytes())
+        .expect("append ledger");
     // Written+fsynced BEFORE the corresponding action proceeds: start
     // records are what make invariant 3's bound assertable.
     f.sync_data().expect("fsync ledger");

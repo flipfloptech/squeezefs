@@ -1220,9 +1220,13 @@ pub enum BlockLockSite {
     /// (`DataRouter::get_block_for_index`, `escalate_contended`) — one
     /// fetch serialized under the block's stripe.
     ReadEscalate = 9,
+    /// The detached write-pipeline upload task
+    /// (`pipeline_upload_parked_block`, 2026-07-27 campaign) — custody
+    /// re-validation + write-through under the block's stripe.
+    PipelineUpload = 10,
 }
 
-const BLOCK_LOCK_SITES: usize = 10;
+const BLOCK_LOCK_SITES: usize = 11;
 const BLOCK_LOCK_SITE_NAMES: [&str; BLOCK_LOCK_SITES] = [
     "write_checkout",
     "spill_victim",
@@ -1234,6 +1238,7 @@ const BLOCK_LOCK_SITE_NAMES: [&str; BLOCK_LOCK_SITES] = [
     "staged_write",
     "fold",
     "read_escalate",
+    "pipeline_upload",
 ];
 
 struct WriteProfState {
@@ -2434,6 +2439,12 @@ pub struct Metrics {
     /// no staging detour. 0 except at genuine space pressure; growth here
     /// with `write_through_fallbacks` quiet is the designed brim posture.
     pub write_through_inplace_rewrites: Align64<AtomicU64>,
+    /// Write-pipeline uploads whose custody was DROPPED on a mid-flight
+    /// fencing expiry (2026-07-27 campaign — the remount law applied to
+    /// detached uploads, FIND-M11-A). **Must stay 0 on healthy mounts**
+    /// (single-writer D0: only our own lease churn can race an upload);
+    /// investigate alongside `writer_guard_fenced`.
+    pub write_pipeline_fence_drops: Align64<AtomicU64>,
     // Terminal-free device reclaim economy (the shim-write-amplification
     // fix — `.benchmarks/2026-07-27-shim-write-amplification.md`;
     // classification `routing::free_reclaim_op`, contract
@@ -3361,6 +3372,11 @@ pub struct SqueezefsFilesystem {
     /// heartbeat publishes it as the ADDITIVE `job_endpoint` field
     /// remote workers discover the coordinator through.
     pub job_wire_endpoint: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// Write-pipeline depth authority (2026-07-27 campaign,
+    /// `src/write_pipeline.rs`): admission gate + adaptive BDP governor
+    /// for detached complete-block write-through uploads. Shared across
+    /// handler clones; public so tests/rigs can gauge and quiesce it.
+    pub write_pipeline: std::sync::Arc<crate::write_pipeline::WritePipeline>,
 }
 
 impl Clone for SqueezefsFilesystem {
@@ -3424,6 +3440,7 @@ impl Clone for SqueezefsFilesystem {
             ipc_host: self.ipc_host.clone(),
             job_fabric: self.job_fabric.clone(),
             job_wire_endpoint: self.job_wire_endpoint.clone(),
+            write_pipeline: self.write_pipeline.clone(),
         }
     }
 }
@@ -3529,6 +3546,7 @@ impl SqueezefsFilesystem {
             ipc_host: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             job_fabric: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             job_wire_endpoint: std::sync::Arc::new(std::sync::OnceLock::new()),
+            write_pipeline: crate::write_pipeline::WritePipeline::for_mount(),
         }
     }
 
@@ -4572,6 +4590,13 @@ impl SqueezefsFilesystem {
                 "write_through_bytes": METRICS.write_through_bytes.load(Ordering::Relaxed),
                 "write_through_fallbacks": METRICS.write_through_fallbacks.load(Ordering::Relaxed),
                 "write_through_inplace_rewrites": METRICS.write_through_inplace_rewrites.load(Ordering::Relaxed),
+                // Write-pipeline depth (2026-07-27 campaign): the internal
+                // instrument — the rig's iostat aqu-sz is the external one.
+                "write_pipeline_inflight_blocks": self.write_pipeline.inflight_blocks(),
+                "write_pipeline_inflight_bytes": self.write_pipeline.inflight_bytes(),
+                "write_pipeline_depth_target": self.write_pipeline.depth_target_bytes(self.router.block_size.load(Ordering::Relaxed)),
+                "write_pipeline_admission_waits": self.write_pipeline.admission_waits(),
+                "write_pipeline_fence_drops": METRICS.write_pipeline_fence_drops.load(Ordering::Relaxed),
                 // Terminal-free reclaim economy (shim-write-amplification
                 // fix): reclaims must never surface as device WRITE bytes.
                 "block_free_discards": METRICS.block_free_discards.load(Ordering::Relaxed),
@@ -6805,10 +6830,92 @@ impl SqueezefsFilesystem {
                 // removed only after the durable publish succeeds.
                 let is_block_complete = coverage_completed;
                 if is_block_complete {
+                    if crate::write_pipeline::sync_inline() {
+                        // A/B baseline lever (`SQUEEZEFS_WRITE_PIPELINE_
+                        // DEPTH_BLOCKS=0`): the pre-campaign synchronous
+                        // inline write-through — upload awaited before the
+                        // WRITE ACKs, errors surfaced to exactly this
+                        // write.
+                        self.write_through_complete_block(
+                            ino,
+                            b as u32,
+                            &cache_key,
+                            fencing_token,
+                            block_guard,
+                        )
+                        .await?;
+                    } else {
+                        // Write-pipeline depth (2026-07-27 campaign): the
+                        // completing WRITE ACKs with the block's custody
+                        // PARKED (readable RAM overlay — identical to the
+                        // partial-coverage and staging-fallback postures;
+                        // durability stays owed at fsync/close, exactly
+                        // the writeback-cache contract) and the upload
+                        // rides a detached task so per-writer closed loops
+                        // never bound device queue depth. Admission is the
+                        // honest-backpressure gate: awaited HERE, before
+                        // the ACK, bounded by the BDP governor and the R5
+                        // budget (write_pipeline.rs module docs).
+                        std::mem::drop(block_guard);
+                        let permit = self.write_pipeline.admit(block_size).await;
+                        let fs = self.clone();
+                        let key = cache_key.clone();
+                        // The fuse3 per-core handler lanes — the venue pin
+                        // (the 2026-07-26 handoff-economy law: never a
+                        // runtime-handle spawn onto the global inject
+                        // queue).
+                        fuse3::raw::tpc_spawn(async move {
+                            fs.pipeline_upload_parked_block(permit, ino, b as u32, key)
+                                .await;
+                        });
+                    }
+                } else {
+                    // Partial coverage: already parked (never left the
+                    // map); run the R5 byte-budget admission pass.
+                    let wp_park = write_phase_start();
+                    self.admit_parked_active_block(&cache_key, fencing_token)
+                        .await;
+                    write_phase_record(WritePhase::ParkSpill, wp_park);
+                    std::mem::drop(block_guard);
+                }
+
+                Ok::<(), SqueezefsError>(())
+            });
+        }
+
+        futures::future::try_join_all(futures).await?;
+
+        Ok(())
+    }
+
+    /// Upload one coverage-complete PARKED block durably under its HELD
+    /// [`BLOCK_FLUSH_LOCKS`] guard (consumed) — the write-through unit
+    /// factored from the WRITE handler (2026-07-27 write-pipeline-depth
+    /// campaign), now driven from two places: the handler's synchronous
+    /// A/B lever and the detached pipeline task
+    /// ([`Self::pipeline_upload_parked_block`]). Public for the campaign's
+    /// contract tests (`tests/write_pipeline_tests.rs` pins the fencing
+    /// custody-drop law with an explicitly stale token).
+    ///
+    /// Outcomes (unchanged from the inline arm this was factored from):
+    /// durable publish retires the overlay; a fencing expiry DROPS custody
+    /// (retire + propagate — a fenced writer must not publish anywhere);
+    /// any other failure rides the never-lossy ladder (staging fallback +
+    /// writeback, else keep parked + R5 admission).
+    pub async fn write_through_complete_block(
+        &self,
+        ino: u64,
+        b: u32,
+        cache_key: &str,
+        fencing_token: u64,
+        block_guard: tokio::sync::MutexGuard<'static, ()>,
+    ) -> Result<(), SqueezefsError> {
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        {
                     let block_snapshot = {
                         let entry = self
                             .active_block_buffers
-                            .get(&cache_key)
+                            .get(cache_key)
                             .expect("parked entry cannot vanish under the held block lock");
                         debug_assert!(
                             entry.value().is_content_valid() && !entry.value().seed_deferred(),
@@ -6819,13 +6926,13 @@ impl SqueezefsFilesystem {
                         entry.value().snapshot()
                     };
                     match self
-                        .upload_full_block(ino, b as u32, block_snapshot.clone(), fencing_token)
+                        .upload_full_block(ino, b, block_snapshot.clone(), fencing_token)
                         .await
                     {
                         Ok(()) => {
                             // Durable + published: the RAM entry retires
                             // (reads flow to the block map / read tiers).
-                            self.retire_parked_overlay(&cache_key);
+                            self.retire_parked_overlay(cache_key);
                             METRICS.write_through_blocks.fetch_add(1, Ordering::Relaxed);
                             METRICS
                                 .write_through_bytes
@@ -6837,7 +6944,7 @@ impl SqueezefsFilesystem {
                             // not even to staging. Drop custody (the old
                             // checked-out buffer was dropped here too) and
                             // propagate; the caller invalidates the lease.
-                            self.retire_parked_overlay(&cache_key);
+                            self.retire_parked_overlay(cache_key);
                             return Err(e);
                         }
                         Err(e) => {
@@ -6853,7 +6960,7 @@ impl SqueezefsFilesystem {
                                 ino, b, e
                             );
                             let nvme_clone = self.router.cache.nvme.clone();
-                            let cache_key_clone = cache_key.clone();
+                            let cache_key_clone = cache_key.to_string();
                             let fencing_token_val = fencing_token;
                             let put_len = block_snapshot.len() as u64;
                             let staging_snapshot = block_snapshot;
@@ -6872,7 +6979,7 @@ impl SqueezefsFilesystem {
                             if admitted {
                                 // Staged custody landed: the RAM entry
                                 // retires (the ring copy is identical).
-                                self.retire_parked_overlay(&cache_key);
+                                self.retire_parked_overlay(cache_key);
                             }
                             std::mem::drop(block_guard);
 
@@ -6898,29 +7005,78 @@ impl SqueezefsFilesystem {
                                 // fsync's buffer flush re-attempts staging
                                 // or uploads it durably.
                                 let wp_park = write_phase_start();
-                                self.admit_parked_active_block(&cache_key, fencing_token)
+                                self.admit_parked_active_block(cache_key, fencing_token)
                                     .await;
                                 write_phase_record(WritePhase::ParkSpill, wp_park);
                             }
                         }
                     }
-                } else {
-                    // Partial coverage: already parked (never left the
-                    // map); run the R5 byte-budget admission pass.
-                    let wp_park = write_phase_start();
-                    self.admit_parked_active_block(&cache_key, fencing_token)
-                        .await;
-                    write_phase_record(WritePhase::ParkSpill, wp_park);
-                    std::mem::drop(block_guard);
-                }
-
-                Ok::<(), SqueezefsError>(())
-            });
         }
-
-        futures::future::try_join_all(futures).await?;
-
         Ok(())
+    }
+
+    /// The detached write-pipeline upload task body (2026-07-27 campaign):
+    /// re-validates the parked custody under the block lock and drives
+    /// [`Self::write_through_complete_block`], holding its admission
+    /// `permit` for the task's whole lifetime (RAII release wakes parked
+    /// admissions). Public for the campaign's contract tests.
+    ///
+    /// FIND-M11-A discipline: the ino's **current** DLM generation is read
+    /// per attempt — deliberately BEFORE the block lock (also the fence
+    /// test's deterministic hold point). Dispositions
+    /// ([`crate::write_pipeline::pipeline_disposition`]): fencing expiry =
+    /// custody dropped loudly (`write_pipeline_fence_drops` — the remount
+    /// law); any other failure = custody stays parked/staged (never-lossy;
+    /// the fsync/drain machinery owns the retry); a vanished or
+    /// no-longer-complete entry = a clean no-op (a racing fsync flush,
+    /// truncate prune, or punch already owned the custody).
+    pub async fn pipeline_upload_parked_block(
+        &self,
+        permit: crate::write_pipeline::PipelinePermit,
+        ino: u64,
+        b: u32,
+        cache_key: String,
+    ) {
+        let _permit = permit;
+        let fencing_token = self.dlm.get_fencing_token_ino(ino);
+        let block_guard = block_lock_acquire(ino, b, BlockLockSite::PipelineUpload).await;
+        let ready = self
+            .active_block_buffers
+            .get(&cache_key)
+            .map(|e| {
+                let v = e.value();
+                !v.is_extent_repr() && v.is_content_valid() && !v.seed_deferred()
+            })
+            .unwrap_or(false);
+        if !ready {
+            drop(block_guard);
+            return;
+        }
+        let res = self
+            .write_through_complete_block(ino, b, &cache_key, fencing_token, block_guard)
+            .await;
+        match crate::write_pipeline::pipeline_disposition(&res) {
+            crate::write_pipeline::PipelineDisposition::Done => {}
+            crate::write_pipeline::PipelineDisposition::FenceDrop => {
+                METRICS
+                    .write_pipeline_fence_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    "pipeline upload for ino {ino} block {b} fenced ({:?}): custody \
+                     dropped (the remount law — a superseded writer era's staged \
+                     work discards; FIND-M11-A)",
+                    res
+                );
+            }
+            crate::write_pipeline::PipelineDisposition::StayParked => {
+                warn!(
+                    "pipeline upload for ino {ino} block {b} failed ({:?}); custody \
+                     stays parked/staged (never-lossy — the fsync/drain machinery \
+                     owns the retry)",
+                    res
+                );
+            }
+        }
     }
 
     /// Punch a hole: make `[offset, offset+length)` read back as zeros WITHOUT
@@ -7366,6 +7522,12 @@ impl SqueezefsFilesystem {
         plaintext: bytes::Bytes,
         fencing_token: u64,
     ) -> Result<(), SqueezefsError> {
+        // Write-pipeline governor sample: the WHOLE upload latency (crypto
+        // → allocate → DMA → merge) per backend lane — the pipeline's
+        // Little's-law basis must cover every leg the in-flight custody
+        // traverses, not just the device (write_pipeline.rs module docs).
+        let pipe_t0 = std::time::Instant::now();
+        let plaintext_len = plaintext.len() as u64;
         // RW1 H2 hold-time split: the device leg (crypto → allocate → DMA)
         // vs the map-merge leg below — both under the caller's held block
         // lock.
@@ -7467,6 +7629,10 @@ impl SqueezefsFilesystem {
             }
         };
         write_phase_record(WritePhase::UploadMapMerge, wp_merge);
+        // Feed the write-pipeline governor: one completed upload on this
+        // backend lane (whole-pipeline latency — see pipe_t0 above).
+        self.write_pipeline
+            .record_completion(&be_id, plaintext_len, pipe_t0.elapsed());
         // Free displaced keys only after the new map is published (durable +
         // cached), so no reader can resolve a block to a key we are freeing.
         for bk in displaced {
@@ -8997,6 +9163,29 @@ impl SqueezefsFilesystem {
     async fn run_dismount_teardown(&self) {
         info!("FUSE Daemon: Destroying mount. Force flushing all staged and memory data...");
 
+        // Write-pipeline drain (2026-07-27 campaign): detached uploads
+        // hold parked custody until their durable publish, so the sweep
+        // below serializes with mid-flight tasks on the block locks — but
+        // a task past its retire may still be merging when the sweep skips
+        // its (already-gone) entry. Quiesce FIRST so no upload is in
+        // flight when the meta volumes shut down (shutdown deletes the
+        // writer_claim; a merge racing it would fail loud, not lose data —
+        // this keeps teardown quiet AND deterministic).
+        if !self
+            .write_pipeline
+            .quiesce(std::time::Duration::from_secs(self.dismount_wait))
+            .await
+        {
+            warn!(
+                "dismount: write-pipeline uploads still in flight after {}s \
+                 ({} blocks / {} bytes) — proceeding; the staged sweep and \
+                 block locks own the residual custody",
+                self.dismount_wait,
+                self.write_pipeline.inflight_blocks(),
+                self.write_pipeline.inflight_bytes()
+            );
+        }
+
         // Phase 1 & 2: Force flush memory buffers to staging, then staged blocks to NVMe-oF backend
         let _ = self.force_flush_all_staged_data().await;
 
@@ -9245,6 +9434,23 @@ impl Filesystem for SqueezefsFilesystem {
                         shed_target.fetch_min(target, Ordering::Relaxed);
                         shed_kick.notify_one();
                     }),
+                ));
+                // Write-pipeline in-flight custody (2026-07-27 campaign):
+                // non-sheddable-by-force like transport payload buffers —
+                // in-flight DMAs DRAIN, they are never torn. Red clamps
+                // the admission target to its floor (WritePipeline::
+                // depth_target_bytes), so the gauge converges by
+                // completion — honest backpressure, never OOM. Under
+                // passthrough these bytes alias the parked-buffer gauge
+                // (snapshots share the backing); the over-count is the
+                // conservative direction for an admission authority.
+                let wp_gauge = self.write_pipeline.clone();
+                MEM_BUDGET.register(Component::new(
+                    "write_pipeline_inflight",
+                    0,
+                    1,
+                    Arc::new(move || wp_gauge.inflight_bytes()),
+                    Arc::new(|_| {}),
                 ));
                 // W2 (§5.2): extent-overlay payload slabs — a sheddable R5
                 // component of their own; the shed is the same parked

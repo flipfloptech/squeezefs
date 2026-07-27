@@ -17,7 +17,7 @@ SQZ="/scratch/tmp/squeezefs"
 REMOTE_SQZ="/scratch/tmp/squeezefs"
 
 # Storage nodes: "name:primary_ip:secondary_ip:kind"
-#   kind = mds (memory-backed null_blk) | oss (zram)
+#   kind = mds (memory-backed null_blk) | oss (backing per OSS_BACKING below)
 HOSTS=(
   "mds0:10.181.177.191:10.181.178.191:mds"
   "mds1:10.181.177.192:10.181.178.192:mds"
@@ -30,9 +30,22 @@ MOUNTPOINT="/scratch/tmp/test"
 CACHE_DIR="/scratch/tmp/cache"
 META_SLOTS=8
 MDS_SIZE_MB=8192            # null_blk size per metadata namespace
+
+# Data-node backing. The choice defines what the testbed measures:
+#   zram    — compressed RAM disk. CPU-priced writes (throughput depends on the
+#             benchmark's DATA PATTERN — label rows with it) but native discard,
+#             so it is the overwrite-tax / reclaim venue. RAM cost ≈ compressed.
+#   nullblk — memory-backed null_blk, no compression: the clean THROUGHPUT-
+#             CEILING venue (a raw fio bracket measured 6.7 GB/s/node vs zram's
+#             1.65 on the same fabric). RAM cost is 1:1 with device size —
+#             size OSS_NULLB_MB to the node's free RAM. Discard support on old
+#             kernels is absent/spotty: the daemon counts skipped reclaims and
+#             moves on, but overwrite-tax A/Bs are muted here.
+OSS_BACKING="zram"          # zram | nullblk
 OSS_ZRAM_SIZE="64G"         # zram disksize per data namespace
 OSS_ZRAM_ALGO="auto"        # auto = best available on the target (zstd>lz4>lzo-rle>lzo);
                             # or name one explicitly to A/B compression cost
+OSS_NULLB_MB=65536          # nullblk size (MiB) per data namespace
 MOUNT_EXTRA=(--interception --allow-other --log-file /tmp/sqz.log)
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=5)
 # ============================================================================
@@ -42,6 +55,7 @@ die()  { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo)"
 [ -x "$SQZ" ] || die "client binary not executable: $SQZ"
+case "$OSS_BACKING" in zram|nullblk) ;; *) die "OSS_BACKING must be zram or nullblk (got: $OSS_BACKING)";; esac
 
 echo "This DESTROYS all data on the cluster volumes and rebuilds from scratch."
 read -r -p "Type YES to continue: " ans
@@ -99,31 +113,63 @@ idx=$(cat "$d/index"); dev="/dev/nullb$idx"
 [ -b "$dev" ] || { echo "null_blk device missing: $dev" >&2; exit 1; }
 "$REMOTE_SQZ" nvmeof share "$dev" --target-stack nvmet --ip "$IP1,$IP2" --subnqn "$NQN"
 EOS
+  elif [ "$OSS_BACKING" = "nullblk" ]; then
+    # Same recipe as the mds nodes: memory-backed null_blk, no compression.
+    "${SSH[@]}" "root@$ip1" REMOTE_SQZ="$REMOTE_SQZ" NAME="$name" NQN="$NQN_PREFIX:$name" \
+        IP1="$ip1" IP2="$ip2" SIZE_MB="$OSS_NULLB_MB" 'bash -s' <<'EOS'
+set -euo pipefail
+"$REMOTE_SQZ" nvmeof unshare "$NQN" 2>/dev/null || true
+modprobe null_blk nr_devices=0 2>/dev/null || true
+d="/sys/kernel/config/nullb/$NAME"
+if [ -d "$d" ]; then echo 0 > "$d/power" 2>/dev/null || true; rmdir "$d"; fi
+mkdir "$d"
+echo "$SIZE_MB" > "$d/size"
+echo 4096       > "$d/blocksize"
+echo 1          > "$d/memory_backed"
+echo 1          > "$d/power"
+idx=$(cat "$d/index"); dev="/dev/nullb$idx"
+[ -b "$dev" ] || { echo "null_blk device missing: $dev" >&2; exit 1; }
+free_mb=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
+[ "$free_mb" -gt "$SIZE_MB" ] || \
+  echo "WARNING: nullblk size ${SIZE_MB} MiB exceeds MemAvailable ${free_mb} MiB — writes can OOM this node" >&2
+"$REMOTE_SQZ" nvmeof share "$dev" --target-stack nvmet --ip "$IP1,$IP2" --subnqn "$NQN"
+EOS
   else
     "${SSH[@]}" "root@$ip1" REMOTE_SQZ="$REMOTE_SQZ" NQN="$NQN_PREFIX:$name" \
         IP1="$ip1" IP2="$ip2" ZSIZE="$OSS_ZRAM_SIZE" ZALGO="$OSS_ZRAM_ALGO" 'bash -s' <<'EOS'
 set -euo pipefail
 "$REMOTE_SQZ" nvmeof unshare "$NQN" 2>/dev/null || true
 modprobe zram 2>/dev/null || true
+# Crypto modules are NOT auto-loaded on RHEL8-family kernels, so the
+# comp_algorithm listing hides algorithms the kernel actually ships (lz4,
+# sometimes zstd). Load them first, then pick by WRITE-AND-VERIFY — the
+# listing alone under-reports.
+modprobe lz4  2>/dev/null || true
+modprobe zstd 2>/dev/null || true
 if [ -b /dev/zram0 ]; then
   echo 1 > /sys/block/zram0/reset            # full wipe — the fresh store
 else
   cat /sys/class/zram-control/hot_add >/dev/null
 fi
-avail=$(cat /sys/block/zram0/comp_algorithm | tr -d '[]')
+try_algo() {
+  echo "$1" > /sys/block/zram0/comp_algorithm 2>/dev/null \
+    && grep -q "\[$1\]" /sys/block/zram0/comp_algorithm
+}
 pick=""
 if [ "$ZALGO" != "auto" ]; then
-  for a in $avail; do [ "$a" = "$ZALGO" ] && pick="$ZALGO" && break; done
-  [ -n "$pick" ] || echo "note: '$ZALGO' not offered by this kernel (has: $avail) — auto-selecting" >&2
+  if try_algo "$ZALGO"; then
+    pick="$ZALGO"
+  else
+    echo "note: '$ZALGO' not usable on this kernel (offered: $(cat /sys/block/zram0/comp_algorithm)) — auto-selecting" >&2
+  fi
 fi
 if [ -z "$pick" ]; then
   for cand in zstd lz4 lzo-rle lzo; do
-    for a in $avail; do [ "$a" = "$cand" ] && pick="$cand" && break 2; done
+    try_algo "$cand" && pick="$cand" && break
   done
 fi
-[ -n "$pick" ] || { echo "no usable zram compression algorithm (offered: $avail)" >&2; exit 1; }
+[ -n "$pick" ] || { echo "no usable zram compression algorithm (offered: $(cat /sys/block/zram0/comp_algorithm))" >&2; exit 1; }
 echo "zram comp_algorithm: $pick"
-echo "$pick" > /sys/block/zram0/comp_algorithm
 echo "$ZSIZE" > /sys/block/zram0/disksize
 sz=$(blockdev --getsize64 /dev/zram0)
 [ "$sz" -gt 0 ] || { echo "zram0 has zero size after setup" >&2; exit 1; }

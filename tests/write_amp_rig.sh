@@ -66,8 +66,8 @@ patch_writes patch_write_bytes active_block_ooo_runs write_block_revisits \
 parked_gate_waits parked_gate_self_flushes parked_gate_timeouts \
 mem_budget_yellow_events mem_budget_red_events \
 write_path_seed_read_bytes patch_edge_rmw_reads \
-write_partial_flush_blocks write_partial_flush_bytes write_partial_reflush_blocks \
-write_stream_flush_deferrals write_stream_flush_deferral_expiries \
+block_free_discards block_free_discard_bytes block_free_file_punches \
+block_free_punch_bytes block_free_reclaim_skipped \
 ipc_descriptor_rejects ipc_sessions_poisoned"
 
 INVALID=0

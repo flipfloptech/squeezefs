@@ -42,8 +42,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use squeezefs::fuse_client::{CLIENT_HEARTBEAT_INTERVAL_SECS, CLIENT_STALE_TTL_SECS};
 use squeezefs::meta_backend::kv::backend::{
     test_conveyor_hold_release, ClaimClearOutcome, KvMetaBackend, WriterClaim,
-    TEST_CONVEYOR_EMPTY_TAIL_PARKED, TEST_CONVEYOR_HOLD_EMPTY_DRAIN_TAIL,
-    TEST_CONVEYOR_HOLD_STAGE, WRITER_CLAIM_XATTR,
+    TEST_CONVEYOR_EMPTY_TAIL_PARKED, TEST_CONVEYOR_HOLD_EMPTY_DRAIN_TAIL, TEST_CONVEYOR_HOLD_STAGE,
+    WRITER_CLAIM_XATTR,
 };
 use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
 use squeezefs::meta_backend::reservation::{self, FakeNvmeNamespace, FakeReservationClient};

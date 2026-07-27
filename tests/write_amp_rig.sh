@@ -94,7 +94,8 @@ print("  stats: " + " ".join(f"{k}={delta.get(k, 0)}" for k in sel if delta.get(
 EOF
 }
 
-snap_disk() { awk -v d="$DATA_BASE" '$3==d {print $4, $6, $8, $10}' /proc/diskstats; }
+# reads, rsect, writes, wsect, discards, dsect
+snap_disk() { awk -v d="$DATA_BASE" '$3==d {print $4, $6, $8, $10, $15+0, $17+0}' /proc/diskstats; }
 
 kill_daemon() {
     umount "$MOUNT_DIR" 2>/dev/null || umount -l "$MOUNT_DIR" 2>/dev/null || true
@@ -112,7 +113,11 @@ format_fs() {
 
 mount_fs() {
     rm -f "$LOG"
+    # SQUEEZEFS_IPC_ALLOW_DEV on the DAEMON side too: dev-tree (-dirty)
+    # builds carry a degenerate KD-7 identity that both halves must
+    # explicitly forgive (counted in ipc_binds_dev_override).
     RUST_LOG=info SQUEEZEFS_IPC_SERVICE_THREADS="${SQZ_WA_SERVICE_THREADS:-8}" \
+        SQUEEZEFS_IPC_ALLOW_DEV=1 \
         ${SQZ_WA_DAEMON_ENV:-} "$SQUEEZEFS_BIN" mount \
         "sqmeta://$META_DEV" "$MOUNT_DIR" --daemon --allow-other --interception \
         --mem-cache-size "${SQZ_WA_CACHE:-1GB}" --log-file "$LOG" || fail "mount"
@@ -161,14 +166,15 @@ user = int(sys.argv[3]); mode = sys.argv[4]
 r_ops, r_sec = a[0]-b[0], a[1]-b[1]
 w_ops, w_sec = a[2]-b[2], a[3]-b[3]
 def req(ops, sec): return (sec*512/ops/1048576) if ops else 0
+d_ops, d_sec = a[4]-b[4], a[5]-b[5]
 if mode == "w":
     amp = w_sec*512/user if user else 0
     print(f"AMP={amp:.3f} w_MiB={w_sec*512//1048576} wareq={req(w_ops,w_sec):.2f}MiB "
-          f"w_ops={w_ops} r_MiB={r_sec*512//1048576}")
+          f"w_ops={w_ops} r_MiB={r_sec*512//1048576} d_ops={d_ops} d_MiB={d_sec*512//1048576}")
 else:
     amp = r_sec*512/user if user else 0
     print(f"AMP={amp:.3f} r_MiB={r_sec*512//1048576} rareq={req(r_ops,r_sec):.2f}MiB "
-          f"r_ops={r_ops} w_MiB={w_sec*512//1048576}")
+          f"r_ops={r_ops} w_MiB={w_sec*512//1048576} d_ops={d_ops} d_MiB={d_sec*512//1048576}")
 EOF
 )
     local elapsed; elapsed=$(echo "$t1 $t0" | awk '{print $1-$2}')

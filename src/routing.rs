@@ -1426,22 +1426,85 @@ impl BackendRouter {
         }
     }
 
-    fn punch_hole_sync(device_path: &str, offset: u64, size: u64) {
+    /// Reclaim a terminally-freed block's device range per
+    /// [`free_reclaim_op`] (the shim-write-amplification fix —
+    /// `.benchmarks/2026-07-27-shim-write-amplification.md`): PUNCH_HOLE
+    /// on regular-file backings (host-FS sparse reclaim, cheap metadata),
+    /// `BLKDISCARD` on block devices (NVMe Deallocate — no data payload,
+    /// no write bandwidth; the former unconditional PUNCH_HOLE was
+    /// `blkdev_issue_zeroout` there = a full block of Write-Zeroes per
+    /// freed block = the measured 1.85×-field / 2.000×-rig device write
+    /// amplification on every steady-state overwrite/delete stream).
+    /// Refused/unsupported reclaims are SKIPPED and counted — never
+    /// degraded into a zeroing write; freed ranges are never read (hole
+    /// semantics + write-before-publish + the incarnation seqlock).
+    fn reclaim_freed_range_sync(device_path: &str, offset: u64, size: u64) {
         #[cfg(target_os = "linux")]
         {
-            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(device_path) {
-                use std::os::unix::io::AsRawFd;
-                let fd = file.as_raw_fd();
-                unsafe {
-                    let _ = libc::fallocate(
-                        fd,
-                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                        offset as libc::off_t,
-                        size as libc::off_t,
-                    );
+            use std::os::unix::fs::MetadataExt;
+            use std::os::unix::io::AsRawFd;
+            use std::sync::atomic::Ordering;
+            let Ok(file) = std::fs::OpenOptions::new().write(true).open(device_path) else {
+                crate::fuse_client::METRICS
+                    .block_free_reclaim_skipped
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            let mode = file.metadata().map(|m| m.mode()).unwrap_or(0);
+            let fd = file.as_raw_fd();
+            match free_reclaim_op(mode) {
+                FreeReclaimOp::FilePunch => {
+                    let r = unsafe {
+                        libc::fallocate(
+                            fd,
+                            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                            offset as libc::off_t,
+                            size as libc::off_t,
+                        )
+                    };
+                    if r == 0 {
+                        crate::fuse_client::METRICS
+                            .block_free_file_punches
+                            .fetch_add(1, Ordering::Relaxed);
+                        crate::fuse_client::METRICS
+                            .block_free_punch_bytes
+                            .fetch_add(size, Ordering::Relaxed);
+                    } else {
+                        crate::fuse_client::METRICS
+                            .block_free_reclaim_skipped
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                FreeReclaimOp::BdevDiscard => {
+                    // BLKDISCARD = _IO(0x12, 119): REQ_OP_DISCARD (NVMe DSM
+                    // Deallocate). Not in the libc crate's const table.
+                    const BLKDISCARD: libc::c_ulong = 0x1277;
+                    let range: [u64; 2] = [offset, size];
+                    let r = unsafe { libc::ioctl(fd, BLKDISCARD as _, range.as_ptr()) };
+                    if r == 0 {
+                        crate::fuse_client::METRICS
+                            .block_free_discards
+                            .fetch_add(1, Ordering::Relaxed);
+                        crate::fuse_client::METRICS
+                            .block_free_discard_bytes
+                            .fetch_add(size, Ordering::Relaxed);
+                    } else {
+                        // Unsupported/refused deallocate: skip loud-once in
+                        // the counter, NEVER a zeroing-write fallback.
+                        crate::fuse_client::METRICS
+                            .block_free_reclaim_skipped
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                FreeReclaimOp::Skip => {
+                    crate::fuse_client::METRICS
+                        .block_free_reclaim_skipped
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (device_path, offset, size);
     }
 
     /// The allocator that owns a block key's offset (see incarnation seqlock in
@@ -1498,13 +1561,15 @@ impl BackendRouter {
         self.allocator_for_key(block_key).is_some()
     }
 
-    /// Free one reference on a block key. The hole punch is destructive
-    /// device I/O and runs ONLY on the terminal release (a non-terminal
-    /// free must never zero a clone's still-referenced bytes), and runs in
-    /// the `begin_free` → punch → `finish_free` window — the offset is not
-    /// reallocatable until after the punch, so the punch can never race a
-    /// new owner's DMA at the reused offset (the acked-write lost-update
-    /// class surfaced by PR 6's pinned striped concurrency test).
+    /// Free one reference on a block key. The device-range reclaim
+    /// (punch on file backings, `BLKDISCARD` on namespaces — see
+    /// [`free_reclaim_op`]) is destructive device I/O and runs ONLY on
+    /// the terminal release (a non-terminal free must never destroy a
+    /// clone's still-referenced bytes), and runs in the `begin_free` →
+    /// reclaim → `finish_free` window — the offset is not reallocatable
+    /// until after the reclaim, so it can never race a new owner's DMA
+    /// at the reused offset (the acked-write lost-update class surfaced
+    /// by PR 6's pinned striped concurrency test).
     pub async fn free_block(&self, block_key: &str) -> Result<()> {
         // Decoration-tolerant: size-carrying mappings (`bk:off:len` — see
         // `parse_block_mapping`) free their BASE block; a raw parse of the
@@ -1538,7 +1603,7 @@ impl BackendRouter {
                 purge(block_key);
             }
             let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
-            Self::punch_hole_sync(&device_path, offset, block_size);
+            Self::reclaim_freed_range_sync(&device_path, offset, block_size);
             allocator.finish_free(offset);
         }
         Ok(())

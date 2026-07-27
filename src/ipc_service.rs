@@ -303,6 +303,7 @@ impl DataPlaneSink {
             IpcDirectIneligible::Layout => &METRICS.ipc_direct_ineligible_layout,
             IpcDirectIneligible::Overlay => &METRICS.ipc_direct_ineligible_overlay,
             IpcDirectIneligible::Backend => &METRICS.ipc_direct_ineligible_backend,
+            IpcDirectIneligible::Policy => &METRICS.ipc_direct_ineligible_policy,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }

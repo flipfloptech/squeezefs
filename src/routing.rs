@@ -2050,21 +2050,51 @@ impl AdmissionGovernor {
         }
     }
 
+    /// The windowed clamp verdict — ONE definition for the authoritative
+    /// escalation site and the prelude peek. Eviction-side ratio: of the
+    /// admitted bytes the tier gave BACK this window, did at least half
+    /// pay for themselves? Admissions themselves are deliberately not in
+    /// the denominator — a burst must not dilute the ratio and unclamp
+    /// itself. Rolls the window and refreshes the `clamped` gauge.
+    fn clamp_engaged(&self, block_bytes: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.roll();
+        let evicted = Self::window(&self.evicted_cur, &self.evicted_prev);
+        let wasted = Self::window(&self.wasted_cur, &self.wasted_prev);
+        let clamped = wasted >= 2 * block_bytes.max(1) && wasted.saturating_mul(2) >= evicted;
+        self.clamped.store(clamped, Relaxed);
+        clamped
+    }
+
+    /// NON-RESERVING admission peek (DIALED P1.5 — the IPC direct-drive
+    /// prelude's "governor token check"): the clamp verdict + a plain
+    /// token-availability load, WITHOUT the reservation CAS. `false` = a
+    /// governor DENIAL (accounted; the caller direct-drives the miss as
+    /// a device-window read and records no cooldown, exactly the
+    /// authoritative site's denial semantics). `true` = grant-shaped —
+    /// the caller routes the op to the handler path, whose
+    /// [`Self::allow_escalation`] remains the ONLY reservation site (the
+    /// herd-safety argument is preserved: peeks can over-ADMIT into the
+    /// handler near a token boundary — bounded per epoch — but can never
+    /// over-SPEND the grant; the losing racers degrade to handler-side
+    /// ranged window reads, never to over-admission).
+    pub fn escalation_would_admit(&self, block_bytes: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.clamp_engaged(block_bytes) && self.tokens.load(Relaxed) < block_bytes {
+            METRICS
+                .read_admission_governor_denials
+                .fetch_add(1, Relaxed);
+            return false;
+        }
+        true
+    }
+
     /// The escalation-site decision: admit (accounting the block) or deny
     /// (counted; the caller falls back to the device-true ranged window
     /// read and records no cooldown).
     pub fn allow_escalation(&self, block_bytes: u64) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
-        self.roll();
-        let evicted = Self::window(&self.evicted_cur, &self.evicted_prev);
-        let wasted = Self::window(&self.wasted_cur, &self.wasted_prev);
-        // Eviction-side ratio: of the admitted bytes the tier gave BACK
-        // this window, did at least half pay for themselves? Admissions
-        // themselves are deliberately not in the denominator — a burst
-        // must not dilute the ratio and unclamp itself.
-        let clamped = wasted >= 2 * block_bytes.max(1) && wasted.saturating_mul(2) >= evicted;
-        self.clamped.store(clamped, Relaxed);
-        if clamped {
+        if self.clamp_engaged(block_bytes) {
             // RESERVATION, not check-then-add: under real mount
             // concurrency (256-deep O_DIRECT) a herd of simultaneous
             // attempts all passed a plain check before any spend landed —

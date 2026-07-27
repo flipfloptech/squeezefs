@@ -2853,6 +2853,15 @@ pub struct Metrics {
     /// `backend` = unhealthy/unknown volume, ring unavailable, or a
     /// volume not registered with the direct-drive uring.
     pub ipc_direct_ineligible_backend: Align64<AtomicU64>,
+    /// `policy` (DIALED P1.5, 2026-07-27): the DEFAULT-mount admission
+    /// policy routed a governed-shape O_DIRECT miss to the handler on
+    /// purpose — a non-`second-touch` admission mode, a §5.6
+    /// ranged-dispatch exclusion (threshold / stream-classified file),
+    /// or a GRANT-shaped escalation candidate (the admission fetch +
+    /// publish machinery rides the handler). NOT prelude rot — the
+    /// deliberate-routing sibling of the `ineligible_*` refusal classes
+    /// (docs/design-read-path.md §Observability).
+    pub ipc_direct_ineligible_policy: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -3064,6 +3073,12 @@ pub enum IpcDirectIneligible {
     /// Unhealthy/unknown backend volume, or one not registered with the
     /// direct-drive uring.
     Backend,
+    /// DIALED P1.5 (default-mount direct-drive): the admission policy
+    /// deliberately routed this governed-shape op to the handler —
+    /// non-`second-touch` admission mode, §5.6 ranged-dispatch exclusion
+    /// (threshold / stream-classified file), or a GRANT-shaped escalation
+    /// candidate (the admission fetch + publish stays on the handler).
+    Policy,
 }
 
 /// The direct-drive prelude's 795 custody snapshot: everything the CQE
@@ -4631,6 +4646,7 @@ impl SqueezefsFilesystem {
                 "ipc_direct_ineligible_layout": METRICS.ipc_direct_ineligible_layout.load(Ordering::Relaxed),
                 "ipc_direct_ineligible_overlay": METRICS.ipc_direct_ineligible_overlay.load(Ordering::Relaxed),
                 "ipc_direct_ineligible_backend": METRICS.ipc_direct_ineligible_backend.load(Ordering::Relaxed),
+                "ipc_direct_ineligible_policy": METRICS.ipc_direct_ineligible_policy.load(Ordering::Relaxed),
                 "write_lock_wait": METRICS.write_lock_wait.to_json(),
                 "block_lock_wait": METRICS.block_lock_wait.to_json(),
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),

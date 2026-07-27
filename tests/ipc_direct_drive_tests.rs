@@ -21,6 +21,13 @@
 //!   must revalidate at the CQE or the op falls back to the handler
 //!   (`ipc_direct_drive_fallbacks_post`).
 //!
+//! DIALED P1.5 (2026-07-27, section 7 below): on DEFAULT mounts the
+//! prelude runs the R1b admission decision synchronously — tier probe
+//! (hit ⇒ sync fast path, unchanged), ghost touch recording, governor
+//! token check (non-reserving peek). DENIED ⇒ direct-drive (+ denial
+//! accounting, no cooldown); GRANTED ⇒ handler path (admission fetch +
+//! publish machinery unchanged). O_DIRECT bindings only.
+//!
 //! Harness: the preload_parity_tests raw-protocol client (no kernel in
 //! the loop; the daemon side is the REAL host → service → sink path).
 
@@ -276,6 +283,52 @@ impl Fixture {
     }
 }
 
+/// Buffered (no O_DIRECT) stand-in: the binding's read class is captured
+/// at the §5.2 fd screen, so a plain open yields `odirect = false` — the
+/// hybrid-directive control (buffered ring reads must never direct-drive).
+fn buffered_standin(fx: &Fixture, dir: &tempfile::TempDir, name: &str, fs_ino: u64) -> OwnedFd {
+    let path = dir.path().join(name);
+    let mut f = std::fs::File::create(&path).expect("create buffered stand-in");
+    f.write_all(&[0u8; 16]).expect("stand-in bytes");
+    drop(f);
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(&path).expect("stand-in metadata");
+    fx.host.set_expected_st_dev(md.dev());
+    fx.sink
+        .map
+        .lock()
+        .expect("ino map mutex never poisons")
+        .insert(md.ino(), fs_ino);
+    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    // SAFETY: plain open(2); ownership taken immediately.
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
+    assert!(fd >= 0, "buffered open on {} failed", path.display());
+    // SAFETY: fresh owned fd.
+    unsafe { OwnedFd::from_raw_fd(fd) }
+}
+
+/// Cold-fixture helper for the DEFAULT-mount rows: purge every block-key
+/// tier (RAM LRU / hot / NVMe / GDS via the unified helper) so the sync
+/// fast path genuinely misses, and return the striped map.
+fn purge_tiers(fx: &Fixture, ino: u64) -> std::collections::HashMap<u32, String> {
+    let meta = fx
+        .fs
+        .router
+        .metadata_cache
+        .get(&ino)
+        .expect("metadata cache entry (prelude authority) must be resident");
+    let map = meta.block_map.clone().expect("striped fixture map");
+    for key in map.values() {
+        fx.fs.router.cache.purge_block_key(key);
+    }
+    (*map).clone()
+}
+
+/// The fixture writer's deterministic block content (seed = 100 + block).
+fn expect_bytes(block: u32, rel: usize, len: usize) -> Vec<u8> {
+    deterministic_bytes(BS as usize, 100 + block as u64)[rel..rel + len].to_vec()
+}
+
 /// O_DIRECT stand-in on a real filesystem (the repo dir — /tmp is often
 /// tmpfs, which refuses O_DIRECT); re-points the host's expected st_dev
 /// and registers the ino translation.
@@ -483,6 +536,10 @@ struct Deltas {
     inel_meta: u64,
     inel_layout: u64,
     inel_overlay: u64,
+    inel_policy: u64,
+    denials: u64,
+    escalations: u64,
+    fast_path: u64,
 }
 
 fn snap() -> Deltas {
@@ -499,6 +556,16 @@ fn snap() -> Deltas {
         inel_overlay: METRICS
             .ipc_direct_ineligible_overlay
             .load(Ordering::Relaxed),
+        inel_policy: METRICS
+            .ipc_direct_ineligible_policy
+            .load(Ordering::Relaxed),
+        denials: METRICS
+            .read_admission_governor_denials
+            .load(Ordering::Relaxed),
+        escalations: METRICS
+            .ranged_read_ghost_escalations
+            .load(Ordering::Relaxed),
+        fast_path: METRICS.ipc_fast_path_serves.load(Ordering::Relaxed),
     }
 }
 
@@ -515,6 +582,10 @@ fn delta(before: &Deltas) -> Deltas {
         inel_meta: now.inel_meta - before.inel_meta,
         inel_layout: now.inel_layout - before.inel_layout,
         inel_overlay: now.inel_overlay - before.inel_overlay,
+        inel_policy: now.inel_policy - before.inel_policy,
+        denials: now.denials - before.denials,
+        escalations: now.escalations - before.escalations,
+        fast_path: now.fast_path - before.fast_path,
     }
 }
 
@@ -886,4 +957,342 @@ async fn direct_drive_stats_fields_export() {
         assert!(m.get(key).is_some(), "stats inode must export {key}");
     }
     fx.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 7. DIALED P1.5 (2026-07-27): direct-drive for governor-denied misses on
+//    DEFAULT mounts. Post-governor, a denied miss on the default hybrid
+//    posture is semantically identical to a device-true serve — ranged
+//    device read, no tier publish, nothing to invalidate — so it must
+//    direct-drive. The prelude runs the admission decision synchronously:
+//    tier probe (hit ⇒ sync fast path, unchanged), ghost TOUCH RECORDING
+//    (skew evidence must still accumulate), governor token check.
+//    Denied ⇒ direct-drive (+ denial accounting, no cooldown). Granted ⇒
+//    handler path (the admission fetch + publish machinery stays there).
+//    O_DIRECT bindings only — buffered ring reads are untouched (the
+//    2026-07-15 hybrid-serve directive stays law).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_mount_governed_miss_ladder() {
+    let fx = Fixture::new("dflt-ladder").await;
+    fx.salt_inos(42).await;
+    let ino = fx.create_striped("dflt.bin", &[0, 1]).await;
+    purge_tiers(&fx, ino);
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("repo-dir tempdir");
+    let fd = odirect_standin(&fx, &dir, "dflt.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+    // DEFAULT posture: direct_device_true stays false for the whole test.
+
+    // (a) FIRST touch (ghost miss ⇒ no admission candidacy ⇒ denied
+    // shape) must DIRECT-DRIVE: no task, no tokio, no handler — and the
+    // op is accounted as a plain ranged device read, NEVER device-true
+    // (that family is the ddt escape's).
+    let before = snap();
+    let got = tokio::task::block_in_place(|| {
+        session.ring_pread(binding, 16 * 4096, 4096, 0, "default first touch")
+    });
+    assert_eq!(
+        got,
+        expect_bytes(0, 16 * 4096, 4096),
+        "byte parity on the default-mount direct-drive serve"
+    );
+    let d = delta(&before);
+    assert_eq!(
+        d.dd_serves, 1,
+        "a governor-denied (first-touch) miss on a DEFAULT mount must \
+         direct-drive (got {} serves)",
+        d.dd_serves
+    );
+    assert_eq!(d.handoffs, 0, "no async handoff on the denied slice");
+    assert_eq!(d.ops_read, 1, "ipc_ops_read counts the direct serve");
+    assert_eq!(d.ranged, 1, "the serve is a governed ranged device read");
+    assert_eq!(
+        d.device_true, 0,
+        "default-posture direct-drive must NOT count read_device_true_reads \
+         (that counter is the ddt escape's family)"
+    );
+    assert_eq!(d.denials, 0, "an unclamped first touch is not a governor denial");
+
+    // (b) SECOND touch of the same block key: the prelude's ghost
+    // recording in (a) is the evidence — the touch is now a GRANT-shaped
+    // escalation candidate (governor unclamped), and grants ride the
+    // HANDLER path where the admission fetch + publish machinery lives.
+    let before = snap();
+    let got = tokio::task::block_in_place(|| {
+        session.ring_pread(binding, 20 * 4096, 4096, 0, "default second touch")
+    });
+    assert_eq!(
+        got,
+        expect_bytes(0, 20 * 4096, 4096),
+        "byte parity on the granted-escalation handler serve"
+    );
+    let d = delta(&before);
+    assert_eq!(
+        d.dd_serves, 0,
+        "a GRANTED escalation must not direct-drive (admission fetch + \
+         publish stay on the handler)"
+    );
+    assert!(d.handoffs >= 1, "the granted op rides the async handoff");
+    assert!(
+        d.inel_policy >= 1,
+        "the policy ledger must record the grant-shaped routing"
+    );
+    assert_eq!(
+        d.escalations, 1,
+        "the handler must actually ESCALATE the granted second touch \
+         (whole-block ghost admission) — if the prelude had skipped the \
+         ghost bookkeeping this would still look like a first touch and \
+         hot subsets would never earn admission"
+    );
+
+    // (c) THIRD touch: the escalated block is hot-tier resident — an
+    // O_DIRECT tier hit on a default mount serves from the tier via the
+    // sync fast path (the hybrid-serve directive), never direct-drives.
+    let before = snap();
+    let got = tokio::task::block_in_place(|| {
+        session.ring_pread(binding, 24 * 4096, 4096, 0, "default tier hit")
+    });
+    assert_eq!(
+        got,
+        expect_bytes(0, 24 * 4096, 4096),
+        "byte parity on the post-admission tier serve"
+    );
+    let d = delta(&before);
+    assert_eq!(
+        d.fast_path, 1,
+        "an admitted (hot-tier-resident) block must serve on the sync \
+         fast path — direct-drive only reroutes the DENIED-miss slice"
+    );
+    assert_eq!(d.dd_serves, 0, "tier hits never direct-drive");
+    assert_eq!(d.handoffs, 0, "tier hits never hand off");
+
+    fx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_mount_clamped_denials_direct_drive_with_denial_accounting() {
+    let fx = Fixture::new("dflt-clamp").await;
+    fx.salt_inos(50).await;
+    let ino = fx.create_striped("clamp.bin", &[0, 1]).await;
+    purge_tiers(&fx, ino);
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("repo-dir tempdir");
+    let fd = odirect_standin(&fx, &dir, "clamp.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    // First touch records the ghost evidence (and direct-drives).
+    let before = snap();
+    let got = tokio::task::block_in_place(|| {
+        session.ring_pread(binding, 4096, 4096, 0, "clamp first touch")
+    });
+    assert_eq!(got, expect_bytes(0, 4096, 4096));
+    let d = delta(&before);
+    assert_eq!(d.dd_serves, 1, "first touch direct-drives");
+
+    // Engage the clamp deterministically: two whole-block admitted
+    // victims evicted with ZERO payback (the churn steady state) — the
+    // governor's waste window now refuses escalations that don't fit the
+    // (empty) token grant.
+    let gov = &fx.fs.router.cache.admission_governor;
+    let block = fx.fs.router.block_size.load(Ordering::Relaxed);
+    for _ in 0..2 {
+        gov.on_eviction(
+            block,
+            &squeezefs::tiering::memory::EvictClass::Protected { served_bytes: 0 },
+        );
+    }
+
+    // Ghost-hit touches under an engaged clamp with no tokens: DENIED ⇒
+    // direct-drive, one governor denial per op, NO cooldown recorded (a
+    // cooldown would silently strip the key's candidacy — the next read
+    // would direct-drive WITHOUT a denial, breaking the accounting).
+    for i in 0..3u64 {
+        let off = (2 + i) * 8192;
+        let before = snap();
+        let got = tokio::task::block_in_place(|| {
+            session.ring_pread(binding, off, 4096, 0, "clamped denied touch")
+        });
+        assert_eq!(got, expect_bytes(0, off as usize, 4096));
+        let d = delta(&before);
+        assert_eq!(
+            d.dd_serves, 1,
+            "clamped governor-denied miss {i} must direct-drive"
+        );
+        assert_eq!(
+            d.denials, 1,
+            "denied miss {i} must carry exactly one governor denial \
+             (denials ≈ direct-drive serves is the churn-row coherence \
+             tripwire)"
+        );
+        assert_eq!(d.escalations, 0, "denied misses never escalate");
+        assert_eq!(d.handoffs, 0, "denied misses never hand off");
+        assert_eq!(d.device_true, 0, "default posture stays non-device-true");
+    }
+    fx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn buffered_ring_misses_never_direct_drive() {
+    let fx = Fixture::new("dflt-buffered").await;
+    fx.salt_inos(58).await;
+    let ino = fx.create_striped("buf.bin", &[0, 1]).await;
+    purge_tiers(&fx, ino);
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("repo-dir tempdir");
+    let fd = buffered_standin(&fx, &dir, "buf.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    let before = snap();
+    let got = tokio::task::block_in_place(|| {
+        session.ring_pread(binding, 16 * 4096, 4096, 0, "buffered miss")
+    });
+    assert_eq!(got, expect_bytes(0, 16 * 4096, 4096), "buffered parity");
+    let d = delta(&before);
+    assert_eq!(
+        d.dd_serves, 0,
+        "buffered bindings must NOT direct-drive (O_DIRECT class only — \
+         the hybrid-serve directive stays law)"
+    );
+    assert!(d.handoffs >= 1, "buffered misses ride the handler");
+    assert_eq!(
+        d.inel_policy, 0,
+        "buffered ops never enter the prelude (not a policy routing)"
+    );
+    fx.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_classified_files_ride_the_handler_by_policy() {
+    let fx = Fixture::new("dflt-stream").await;
+    fx.salt_inos(66).await;
+    let ino = fx.create_striped("stream.bin", &[0, 1]).await;
+    purge_tiers(&fx, ino);
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("repo-dir tempdir");
+    let fd = odirect_standin(&fx, &dir, "stream.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    // Classify the file: 4 contiguous handler reads (the §5.3 run rule).
+    let sc0 = METRICS.read_streams_classified.load(Ordering::Relaxed);
+    for i in 0..4u64 {
+        let want = expect_bytes(0, (i * 4096) as usize, 4096);
+        let got = fx.fuse_read(ino, i * 4096, 4096).await;
+        assert_eq!(got, want, "classification run parity");
+    }
+    assert!(
+        METRICS.read_streams_classified.load(Ordering::Relaxed) > sc0,
+        "fixture: the contiguous run must classify a lane"
+    );
+
+    // A governed-shape O_DIRECT ring miss on the CLASSIFIED file inside
+    // the freshness window: the handler's §5.6 dispatch would not range
+    // this read (streams want whole blocks + the pipeline), so the
+    // prelude must route it to the handler — policy, not prelude rot.
+    let before = snap();
+    let got = tokio::task::block_in_place(|| {
+        session.ring_pread(binding, BS + 128 * 4096, 4096, 0, "classified-file miss")
+    });
+    assert_eq!(
+        got,
+        expect_bytes(1, 128 * 4096, 4096),
+        "classified-file fallback parity"
+    );
+    let d = delta(&before);
+    assert_eq!(
+        d.dd_serves, 0,
+        "stream-classified files must not direct-drive (whole-block + \
+         pipeline dispatch parity)"
+    );
+    assert!(d.inel_policy >= 1, "the policy ledger records the routing");
+    assert!(d.handoffs >= 1, "the op rides the handler");
+    fx.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 8. the governor peek is NON-RESERVING (pure API): the prelude's token
+//    check must not spend the grant — the ONLY reservation site stays the
+//    handler's authoritative `allow_escalation` (the herd-safety argument
+//    of the governor design is preserved verbatim).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn governor_peek_is_non_reserving_and_counts_denials() {
+    use squeezefs::routing::{AdmissionGovernor, TEST_ADMISSION_EPOCH_MS};
+    const EPOCH_MS: u64 = 200;
+    TEST_ADMISSION_EPOCH_MS.store(EPOCH_MS, Ordering::Relaxed);
+    let gov = AdmissionGovernor::new(5);
+    let block: u64 = 4 * 1024 * 1024;
+
+    // Unclamped: the peek admits, no denial.
+    let d0 = METRICS
+        .read_admission_governor_denials
+        .load(Ordering::Relaxed);
+    assert!(
+        gov.escalation_would_admit(block),
+        "unclamped peek must admit"
+    );
+    assert_eq!(
+        METRICS
+            .read_admission_governor_denials
+            .load(Ordering::Relaxed),
+        d0,
+        "unclamped peek records no denial"
+    );
+
+    // Engage the clamp (zero-payback whole-block victims) with an empty
+    // token grant: the peek DENIES and counts it.
+    for _ in 0..2 {
+        gov.on_eviction(
+            block,
+            &squeezefs::tiering::memory::EvictClass::Protected { served_bytes: 0 },
+        );
+    }
+    assert!(
+        !gov.escalation_would_admit(block),
+        "clamped + empty grant ⇒ the peek denies"
+    );
+    assert_eq!(
+        METRICS
+            .read_admission_governor_denials
+            .load(Ordering::Relaxed),
+        d0 + 1,
+        "the peek's denial is accounted (denials ≈ direct-drive serves)"
+    );
+
+    // Fund the NEXT epoch's grant, cross the boundary, keep the clamp
+    // engaged (fresh waste in the new window): N peeks must all admit —
+    // non-reserving — and the authoritative reservation must still find
+    // the FULL grant afterwards.
+    gov.note_foreground(80 * block * 20); // 5 % ⇒ 80 blocks
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let e0 = now_ms() / EPOCH_MS;
+    while now_ms() / EPOCH_MS == e0 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    for _ in 0..2 {
+        gov.on_eviction(
+            block,
+            &squeezefs::tiering::memory::EvictClass::Protected { served_bytes: 0 },
+        );
+    }
+    for i in 0..64 {
+        assert!(
+            gov.escalation_would_admit(block),
+            "peek {i} must admit while the grant covers a block"
+        );
+    }
+    let mut reserved = 0u64;
+    while gov.allow_escalation(block) {
+        reserved += 1;
+        assert!(reserved <= 80, "reservation must stop at the grant");
+    }
+    assert_eq!(
+        reserved, 80,
+        "64 peeks must not have consumed ANY of the 80-block grant \
+         (non-reserving — the handler stays the only reservation site)"
+    );
+    TEST_ADMISSION_EPOCH_MS.store(0, Ordering::Relaxed);
 }

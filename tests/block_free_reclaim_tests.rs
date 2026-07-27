@@ -203,10 +203,7 @@ async fn nonterminal_free_reclaims_and_counts_nothing() {
     let offset = ba.allocate_block().await.expect("alloc");
     let key = offset.to_string();
     ba.publish_block(offset);
-    assert!(
-        router.backend_router.increment_refcount(&key),
-        "clone pin"
-    );
+    assert!(router.backend_router.increment_refcount(&key), "clone pin");
 
     let (p0, d0, s0) = (punches(), discards(), skipped());
     router

@@ -45,6 +45,22 @@
 //!    re-enter the free list at recovery, allocation prefers the free
 //!    list, and the new owner's write-before-publish repurposes the
 //!    range; no journal-adjacent replay is needed.)
+//! 6. **Fenced writer guard halts all device reclaims**: the D0 fail-stop
+//!    lattice fences a usurped holder at its journal barriers, but the
+//!    reclaim worker runs on the blocking pool, decoupled from barriers —
+//!    unchecked, a fenced zombie with a deep queue would keep issuing
+//!    BLKDISCARD/PUNCH_HOLE ioctls that, on non-PR (detection-grade)
+//!    substrates, can land on offsets the successor writer has replayed
+//!    and reallocated (data corruption of the new writer's blocks). The
+//!    worker must observe the SAME `failed` latch the journal-barrier
+//!    escalation sets (`KvMetaBackend::is_failed`, the
+//!    `disabled_volumes` mirror source): once fenced, ZERO device
+//!    commands from any path — worker batches, explicit drains, AND the
+//!    ENOSPC valve (a fenced daemon must not sync-drain; allocation just
+//!    fails, the daemon is dead anyway). Halted entries drop WITHOUT
+//!    `finish_free` (the successor's recovery owns the accounting — the
+//!    contract-5 posture) and are counted in
+//!    `block_free_reclaim_fence_halts`.
 //!
 //! RED against dev 2bd041e: no reclaim queue exists; `free_block` punches
 //! synchronously inside the free window and none of the
@@ -155,6 +171,11 @@ fn queue_bytes() -> u64 {
 fn sync_drains() -> u64 {
     METRICS
         .block_free_reclaim_sync_drains
+        .load(Ordering::Relaxed)
+}
+fn fence_halts() -> u64 {
+    METRICS
+        .block_free_reclaim_fence_halts
         .load(Ordering::Relaxed)
 }
 fn double_frees() -> u64 {
@@ -432,6 +453,182 @@ async fn concurrent_frees_and_drains_reclaim_exactly_once() {
             .copied()
             .collect::<std::collections::HashSet<_>>(),
         "the reallocated set must be exactly the freed set"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Contract 6 — a fenced writer guard halts all device reclaims.
+// ---------------------------------------------------------------------------
+
+/// Format + open one v3 metadata volume (the dismount-tests fixture shape).
+async fn open_v3_meta(
+    path: &std::path::Path,
+    len: u64,
+) -> Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend> {
+    squeezefs::meta_backend::kv::builder::format_v3(
+        path,
+        len,
+        &squeezefs::meta_backend::kv::builder::FormatV3Options {
+            node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            force: true,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .expect("format v3 meta volume");
+    squeezefs::meta_backend::kv::backend::KvMetaBackend::open(path)
+        .await
+        .expect("open v3 meta volume")
+}
+
+/// Drive the REAL D0 fail-stop: poison the meta backing (chmod 000 — the
+/// next `uring_fs::fdatasync` open fails) and run `JOURNAL_FAILURE_LATCH`
+/// (= 3) consecutive durability barriers. This latches the SAME `failed`
+/// state a fenced holder's reservation-conflict barrier latches
+/// immediately (`note_barrier_failure` — the signal `disabled_volumes`
+/// mirrors and `check_volume_enabled` consults). No test-only backdoor.
+async fn fence_meta_volume(
+    routed: &squeezefs::meta_backend::RoutedMetaBackend,
+    meta_path: &std::path::Path,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(meta_path, std::fs::Permissions::from_mode(0o000))
+        .expect("poison meta backing");
+    for _ in 0..3 {
+        let _ = routed.volumes[0].sync_device().await;
+    }
+    assert!(
+        routed.volumes[0].is_failed(),
+        "harness premise: three failed durability barriers must latch the \
+         volume failed (the journal-barrier fail-stop rung)"
+    );
+}
+
+/// Contract 6a — the WORKER batch path: with the guard fenced BEFORE the
+/// frees, the live background worker must issue ZERO device commands —
+/// entries are dropped without finish_free and counted in
+/// `block_free_reclaim_fence_halts`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fenced_guard_halts_worker_batch_reclaims() {
+    let _g = serial().await;
+    let (router, ba, _backing, _s) = make_router().await;
+    let m = NamedTempFile::new().unwrap();
+    let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
+        open_v3_meta(m.path(), 64 * 1024 * 1024).await,
+    ]));
+    router.set_meta_backend(routed.clone());
+
+    let mut offsets = Vec::new();
+    for _ in 0..3 {
+        let o = ba.allocate_block().await.expect("alloc");
+        ba.publish_block(o);
+        offsets.push(o);
+    }
+
+    fence_meta_volume(&routed, m.path()).await;
+
+    let (p0, d0, s0, f0, qb0) = (
+        punches(),
+        discards(),
+        skipped(),
+        fence_halts(),
+        queue_bytes(),
+    );
+    for o in &offsets {
+        router
+            .backend_router
+            .free_block(&o.to_string())
+            .await
+            .expect("terminal free");
+    }
+    // The live worker consumes the entries; it must HALT, not reclaim.
+    eventually(
+        || fence_halts() - f0 == 3 && queue_bytes() == qb0,
+        "worker halts all 3 queued reclaims",
+    )
+    .await;
+    assert_eq!(
+        (punches() - p0) + (discards() - d0) + (skipped() - s0),
+        0,
+        "a fenced daemon must issue ZERO device reclaim commands — a \
+         zombie's discard can destroy the successor writer's reallocated \
+         blocks on detection-grade substrates"
+    );
+}
+
+/// Contract 6b — the SYNC-DRAIN + ENOSPC-valve paths: explicit drains on a
+/// fenced daemon issue zero device commands, and an allocation that would
+/// need the valve just fails StorageFull — no sync drain, no finish_free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fenced_guard_halts_sync_drain_and_enospc_valve() {
+    let _g = serial().await;
+    // Park the worker: the entries can only be consumed by the drain
+    // paths under test.
+    let _e = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_MS", "600000");
+    let (router, ba, _backing, _s) = make_router().await;
+    let m = NamedTempFile::new().unwrap();
+    let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
+        open_v3_meta(m.path(), 64 * 1024 * 1024).await,
+    ]));
+    router.set_meta_backend(routed.clone());
+
+    ba.set_capacity_bytes(3 * CHUNK_SIZE);
+    let mut offsets = Vec::new();
+    for _ in 0..3 {
+        let o = ba.allocate_block().await.expect("alloc");
+        ba.publish_block(o);
+        offsets.push(o);
+    }
+
+    fence_meta_volume(&routed, m.path()).await;
+
+    let (p0, d0, s0, f0, sd0, qb0) = (
+        punches(),
+        discards(),
+        skipped(),
+        fence_halts(),
+        sync_drains(),
+        queue_bytes(),
+    );
+    for o in &offsets {
+        router
+            .backend_router
+            .free_block(&o.to_string())
+            .await
+            .expect("terminal free");
+    }
+
+    // Explicit drain: consumes the entries, issues NOTHING.
+    router.backend_router.reclaim_drain().await;
+    assert_eq!(fence_halts() - f0, 3, "drain must halt-count all entries");
+    assert_eq!(
+        (punches() - p0) + (discards() - d0) + (skipped() - s0),
+        0,
+        "a fenced daemon's drain must issue zero device commands"
+    );
+    assert_eq!(queue_bytes(), qb0, "gauge reconciled on the halt path");
+
+    // ENOSPC valve: the freed offsets were NEVER finish_freed (the
+    // successor's recovery owns them now), so allocation on the full
+    // volume must fail StorageFull WITHOUT a valve drain — a fenced
+    // daemon must not sync-drain either.
+    let refused = ba.allocate_block().await;
+    match refused {
+        Err(squeezefs::error::SqueezefsError::Io(ref e))
+            if e.kind() == std::io::ErrorKind::StorageFull => {}
+        other => panic!("fenced-daemon allocation must fail StorageFull, got {other:?}"),
+    }
+    assert_eq!(
+        sync_drains() - sd0,
+        0,
+        "the ENOSPC valve must not sync-drain on a fenced daemon"
+    );
+    assert_eq!(
+        (punches() - p0) + (discards() - d0) + (skipped() - s0),
+        0,
+        "still zero device commands after the valve path"
     );
 }
 

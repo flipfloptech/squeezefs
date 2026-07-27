@@ -4,10 +4,11 @@
 #
 # Creates (and tears down) the repo's preferred pseudo-everything dev-box
 # substrate on machines with no spare raw NVMe: RAM block devices exposed as
-# real /dev/nvmeXnY namespaces through kernel NVMe-oF **loop** targets.
+# real /dev/nvmeXnY namespaces through kernel NVMe-oF **loop** targets — or,
+# with SQZ_DEVSUB_TRANSPORT=tcp, through **nvmet-tcp on localhost**.
 #
 #     metadata (mds):  memory-backed null_blk ──┐
-#                                               ├── nvmet loop subsystem ── nvme connect -t loop ── /dev/nvmeXnY
+#                                               ├── nvmet subsystem ── nvme connect -t {loop|tcp} ── /dev/nvmeXnY
 #     data     (oss):  zram (compressed RAM) ───┘
 #
 # Why this shape (measured, .benchmarks/2026-07-14-metadata-throughput-baseline.md):
@@ -17,6 +18,23 @@
 #   devices runs the full kernel NVMe target/host stack (~9 µs barrier, FUA +
 #   write-back cache, NVMe Persistent Reservations for the single-writer
 #   guard) — the closest local analog to the NVMe-oF production path.
+#
+# The TWO-SUBSTRATE RULE (2026-07-27 amplification campaign,
+# .benchmarks/2026-07-27-shim-write-amplification.md; methodology pinned in
+# AGENTS.md → Benchmarks & Profiling):
+#   * loop mode (default) — controlled-latency A/B: no network stack, the
+#     lowest-noise venue for per-op decomposition and barrier-bound work.
+#   * tcp mode — MANDATORY for fabric-sensitive rows (writes, bandwidth-
+#     bound shapes, multi-connection): nvmet-tcp on 127.0.0.1 runs the real
+#     NVMe/TCP queue/softirq machinery, so bandwidth-economy effects (write
+#     amplification, request-size collapse, per-connection contention) that
+#     the loop rig HIDES become measurable. Same backings (null_blk mds +
+#     zram oss), same verbs; the two modes coexist (disjoint names, state
+#     dirs, ports).
+#   tcp mode owns the TCP service-port slice **54100–54199** (default
+#   trsvcid 54129) — deliberately outside the NVMe-oF fidelity tier's
+#   54000–54099 slice (tests/nvmeof_target_substrate.sh) so both rigs can
+#   run on one box.
 #
 # Verbs
 #   create        build the substrate (idempotent: healthy ⇒ status + exit 0;
@@ -28,6 +46,16 @@
 #   systemd-unit  emit an optional systemd unit to stdout (NOT installed)
 #
 # Env knobs (defaults sized for a >= 64 GiB dev box; this repo's box: 109 GiB)
+#   SQZ_DEVSUB_TRANSPORT=loop     nvmet transport: loop (default) or tcp
+#                                 (localhost NVMe/TCP; see the two-substrate
+#                                 rule above). tcp mode namespaces everything
+#                                 apart: NQNs devsubtcp-*, null_blk items
+#                                 sqzdevsubtcp_*, state dir
+#                                 /run/squeezefs-devsub-tcp, port id 52027
+#   SQZ_DEVSUB_TCP_ADDR=127.0.0.1 tcp mode: target listen address
+#   SQZ_DEVSUB_TCP_SVC=54129      tcp mode: NVMe/TCP service port — keep it
+#                                 inside the devsub-tcp slice 54100–54199
+#                                 (54000–54099 belongs to the fidelity tier)
 #   SQZ_DEVSUB_MDS_COUNT=4        metadata namespaces (memory-backed null_blk)
 #   SQZ_DEVSUB_MDS_GB=1           GiB per metadata device (RAM, allocated on write)
 #   SQZ_DEVSUB_MDS_CACHE_MB=256   null_blk write-back cache MiB (>0 ⇒ real
@@ -40,13 +68,15 @@
 #                                 capped devices return EIO past the limit)
 #   SQZ_DEVSUB_NVME_IO_QUEUES=4   nvme connect -i (bounded: per-CPU queue counts
 #                                 hit blk_mq EXDEV on boxes with offlined CPUs)
-#   SQZ_DEVSUB_PORT_ID=52026      nvmet loop port id — ports carry no name, so
-#                                 ownership rides this well-known id; a foreign
-#                                 port squatting it makes create fail loud
-#                                 (override the knob), and the id is only ever
-#                                 removed when its links are all devsub-prefixed
+#   SQZ_DEVSUB_PORT_ID=52026      nvmet configfs port id (52027 in tcp mode) —
+#                                 ports carry no name, so ownership rides this
+#                                 well-known id; a foreign port squatting it
+#                                 makes create fail loud (override the knob),
+#                                 and the id is only ever removed when its
+#                                 links are all devsub-prefixed
 #   SQZ_DEVSUB_STATE_DIR=/run/squeezefs-devsub   ownership manifest (tmpfs —
-#                                 cleared on reboot, matching the RAM devices)
+#                                 cleared on reboot, matching the RAM devices;
+#                                 /run/squeezefs-devsub-tcp in tcp mode)
 #   SQZ_DEVSUB_FORCE=0            teardown: 1 = unmount filesystems mounted from
 #                                 OUR namespaces instead of refusing
 #
@@ -79,14 +109,43 @@
 #
 # Examples
 #   tests/dev_substrate.sh create
+#   SQZ_DEVSUB_TRANSPORT=tcp tests/dev_substrate.sh create
 #   SQZ_DEVSUB_OSS_GB=16 tests/dev_substrate.sh recreate
 #   tests/dev_substrate.sh status
-#   tests/dev_substrate.sh teardown
+#   SQZ_DEVSUB_TRANSPORT=tcp tests/dev_substrate.sh teardown
 #   tests/dev_substrate.sh systemd-unit > /etc/systemd/system/squeezefs-devsub.service
 
 set -euo pipefail
 
-STATE_DIR="${SQZ_DEVSUB_STATE_DIR:-/run/squeezefs-devsub}"
+TRANSPORT="${SQZ_DEVSUB_TRANSPORT:-loop}"
+case "$TRANSPORT" in
+loop | tcp) ;;
+*)
+    echo "[devsub] ERROR: SQZ_DEVSUB_TRANSPORT must be 'loop' or 'tcp' (got '$TRANSPORT')" >&2
+    exit 1
+    ;;
+esac
+TCP_ADDR="${SQZ_DEVSUB_TCP_ADDR:-127.0.0.1}"
+TCP_SVC="${SQZ_DEVSUB_TCP_SVC:-54129}"
+# Loop-mode port address: nvmet loop ports accept a free-form traddr, and
+# `nvme connect -t loop -a` selects by it — the only way to name OUR port
+# on a box that also carries foreign loop rigs (see create_port).
+LOOP_TRADDR="sqzdevsub"
+
+# Every ownership handle is transport-scoped and DISJOINT (prefix globs must
+# not overlap: a loop-mode stale-state sweep must never claim tcp-mode
+# objects, and vice versa), so both substrates can coexist on one box.
+if [ "$TRANSPORT" = "tcp" ]; then
+    STATE_DIR="${SQZ_DEVSUB_STATE_DIR:-/run/squeezefs-devsub-tcp}"
+    PORT_ID="${SQZ_DEVSUB_PORT_ID:-52027}"
+    NQN_PREFIX="nqn.2026-07.io.squeezefs:devsubtcp-"
+    NULLB_PREFIX="sqzdevsubtcp_"
+else
+    STATE_DIR="${SQZ_DEVSUB_STATE_DIR:-/run/squeezefs-devsub}"
+    PORT_ID="${SQZ_DEVSUB_PORT_ID:-52026}"
+    NQN_PREFIX="nqn.2026-07.io.squeezefs:devsub-"
+    NULLB_PREFIX="sqzdevsub_"
+fi
 MDS_COUNT="${SQZ_DEVSUB_MDS_COUNT:-4}"
 MDS_GB="${SQZ_DEVSUB_MDS_GB:-1}"
 MDS_CACHE_MB="${SQZ_DEVSUB_MDS_CACHE_MB:-256}"
@@ -95,11 +154,7 @@ OSS_GB="${SQZ_DEVSUB_OSS_GB:-8}"
 OSS_ALGO="${SQZ_DEVSUB_OSS_ALGO:-zstd}"
 OSS_MEM_LIMIT_GB="${SQZ_DEVSUB_OSS_MEM_LIMIT_GB:-0}"
 IO_QUEUES="${SQZ_DEVSUB_NVME_IO_QUEUES:-4}"
-PORT_ID="${SQZ_DEVSUB_PORT_ID:-52026}"
 FORCE="${SQZ_DEVSUB_FORCE:-0}"
-
-NQN_PREFIX="nqn.2026-07.io.squeezefs:devsub-"
-NULLB_PREFIX="sqzdevsub_"
 NVMET_CFS="/sys/kernel/config/nvmet"
 NULLB_CFS="/sys/kernel/config/nullb"
 MANIFEST="$STATE_DIR/manifest.tsv" # role idx nqn kind backing_id backing_dev
@@ -145,7 +200,12 @@ ensure_prereqs() {
     modprobe null_blk 2>/dev/null || true
     modprobe zram 2>/dev/null || true
     modprobe nvmet 2>/dev/null || true
-    modprobe nvme_loop 2>/dev/null || true
+    if [ "$TRANSPORT" = "tcp" ]; then
+        modprobe nvmet_tcp 2>/dev/null || true
+        modprobe nvme_tcp 2>/dev/null || true
+    else
+        modprobe nvme_loop 2>/dev/null || true
+    fi
     [ -d "$NULLB_CFS" ] || die "null_blk configfs missing ($NULLB_CFS) — kernel lacks CONFIG_BLK_DEV_NULL_BLK?"
     [ -d "$NVMET_CFS" ] || die "nvmet configfs missing ($NVMET_CFS) — kernel lacks nvmet?"
     [ -e /sys/class/zram-control/hot_add ] || die "zram hot_add missing — kernel lacks zram?"
@@ -238,10 +298,14 @@ configure_zram() { # idx gb algo mem_limit_gb
 # nvmet plumbing
 # ---------------------------------------------------------------------------
 # The port id is our ownership handle (ports carry no name). If the id exists
-# it must be a devsub leftover: loop transport and no foreign subsystem links.
+# it must be a devsub leftover: OUR mode's transport (+ our listen address in
+# tcp mode) and no foreign subsystem links.
 port_is_ours() { # id -> 0 if the existing port can only be ours
     local p="$NVMET_CFS/ports/$1" l nqn
-    [ "$(cat "$p/addr_trtype" 2>/dev/null)" = "loop" ] || return 1
+    [ "$(cat "$p/addr_trtype" 2>/dev/null)" = "$TRANSPORT" ] || return 1
+    if [ "$TRANSPORT" = "tcp" ]; then
+        [ "$(cat "$p/addr_traddr" 2>/dev/null)" = "$TCP_ADDR" ] || return 1
+    fi
     for l in "$p"/subsystems/*; do
         [ -L "$l" ] || continue
         nqn="$(basename "$l")"
@@ -258,11 +322,39 @@ create_port() { # id
     if [ -d "$p" ]; then
         port_is_ours "$1" ||
             die "nvmet port $1 exists and is NOT ours (foreign transport/links) — set SQZ_DEVSUB_PORT_ID to a free id"
-        warn "adopting existing devsub loop port $1 (stale from a previous run)"
-        return 0
+        if [ "$TRANSPORT" = "loop" ] &&
+            [ "$(cat "$p/addr_traddr" 2>/dev/null)" != "$LOOP_TRADDR" ]; then
+            # A pre-traddr devsub leftover: the addr attrs are write-locked
+            # once linked, and a bare-addressed loop port cannot be named
+            # by `connect -a` — recreate it (link-free by port_is_ours +
+            # the sweep, so this can only rebuild OUR stale port).
+            if [ -z "$(ls -A "$p/subsystems" 2>/dev/null)" ]; then
+                warn "recreating legacy devsub loop port $1 (no traddr stamp)"
+                rmdir "$p"
+            else
+                die "devsub loop port $1 predates traddr stamping and still has links — run teardown first"
+            fi
+        else
+            warn "adopting existing devsub $TRANSPORT port $1 (stale from a previous run)"
+            return 0
+        fi
     fi
     mkdir "$p"
-    echo loop >"$p/addr_trtype"
+    if [ "$TRANSPORT" = "tcp" ]; then
+        echo ipv4 >"$p/addr_adrfam"
+        echo "$TCP_ADDR" >"$p/addr_traddr"
+        echo "$TCP_SVC" >"$p/addr_trsvcid"
+        echo tcp >"$p/addr_trtype"
+    else
+        echo loop >"$p/addr_trtype"
+        # Loop-port disambiguation (2026-07-27): a bare `nvme connect -t
+        # loop` binds the FIRST registered loop port, so a box carrying a
+        # foreign loop rig (e.g. the fuse-per-op campaign's sqzlat port)
+        # rejects our subsystems with "connect request for invalid
+        # subsystem". Stamp our traddr and connect with `-a` (must be set
+        # BEFORE any subsystem link — the attr is write-locked after).
+        echo "$LOOP_TRADDR" >"$p/addr_traddr"
+    fi
 }
 
 create_subsys() { # nqn backing_dev port_id
@@ -286,7 +378,13 @@ create_subsys() { # nqn backing_dev port_id
 
 connect_subsys() { # nqn -> echoes /dev path of the namespace
     local nqn="$1" name
-    nvme connect -t loop -n "$nqn" -i "$IO_QUEUES" >/dev/null
+    if [ "$TRANSPORT" = "tcp" ]; then
+        nvme connect -t tcp -a "$TCP_ADDR" -s "$TCP_SVC" -n "$nqn" -i "$IO_QUEUES" >/dev/null
+    else
+        # -a names OUR loop port (see create_port) — never the box's
+        # first registered loop port.
+        nvme connect -t loop -a "$LOOP_TRADDR" -n "$nqn" -i "$IO_QUEUES" >/dev/null
+    fi
     wait_for "namespace of $nqn" 100 resolve_ns_dev "$nqn"
     name="$(resolve_ns_dev "$nqn")"
     wait_for "/dev/$name" 50 test -b "/dev/$name"
@@ -349,9 +447,10 @@ EOF
 
 cmd_status() {
     if [ ! -s "$MANIFEST" ]; then
-        log "no substrate (state dir $STATE_DIR empty or missing) — run: $0 create"
+        log "no $TRANSPORT substrate (state dir $STATE_DIR empty or missing) — run:${SQZ_DEVSUB_TRANSPORT:+ SQZ_DEVSUB_TRANSPORT=$TRANSPORT} $0 create"
         return 0
     fi
+    log "transport: $TRANSPORT (state $STATE_DIR)"
     local r nqn kind bdev name dev ctrl size inuse rows mds oss _
     rows="ROLE\tNQN\tBACKING\tSIZE\tCTRL\tNAMESPACE\tIN-USE-BY\n"
     while IFS=$'\t' read -r r _ nqn kind _ bdev; do
@@ -546,6 +645,13 @@ cmd_create() {
     require_int SQZ_DEVSUB_OSS_MEM_LIMIT_GB "$OSS_MEM_LIMIT_GB"
     require_int SQZ_DEVSUB_NVME_IO_QUEUES "$IO_QUEUES"
     require_int SQZ_DEVSUB_PORT_ID "$PORT_ID"
+    if [ "$TRANSPORT" = "tcp" ]; then
+        require_int SQZ_DEVSUB_TCP_SVC "$TCP_SVC"
+        if [ "$TCP_SVC" -lt 54100 ] || [ "$TCP_SVC" -gt 54199 ]; then
+            warn "SQZ_DEVSUB_TCP_SVC=$TCP_SVC is outside the devsub-tcp slice 54100–54199 \
+(54000–54099 belongs to the NVMe-oF fidelity tier — collisions make both rigs fail confusingly)"
+        fi
+    fi
     [ "$MDS_COUNT" -ge 1 ] && [ "$OSS_COUNT" -ge 1 ] || die "need at least 1 mds and 1 oss device"
 
     ensure_prereqs
@@ -568,7 +674,11 @@ cmd_create() {
     local port="$PORT_ID"
     create_port "$port"
     echo "$port" >"$PORT_FILE"
-    log "nvmet loop port $port created"
+    if [ "$TRANSPORT" = "tcp" ]; then
+        log "nvmet tcp port $port created ($TCP_ADDR:$TCP_SVC)"
+    else
+        log "nvmet loop port $port created"
+    fi
 
     local i nqn bdev nsdev idx name
     for ((i = 0; i < MDS_COUNT; i++)); do
@@ -594,12 +704,14 @@ cmd_create() {
     trap - ERR
     {
         echo "created_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "transport=$TRANSPORT"
+        [ "$TRANSPORT" = "tcp" ] && echo "tcp_addr=$TCP_ADDR tcp_svc=$TCP_SVC"
         echo "mds_count=$MDS_COUNT mds_gb=$MDS_GB mds_cache_mb=$MDS_CACHE_MB"
         echo "oss_count=$OSS_COUNT oss_gb=$OSS_GB oss_algo=$OSS_ALGO oss_mem_limit_gb=$OSS_MEM_LIMIT_GB"
         echo "io_queues=$IO_QUEUES"
     } >"$STATE_DIR/meta.env"
 
-    log "substrate ready: $MDS_COUNT mds (null_blk) + $OSS_COUNT oss (zram) namespaces over nvmet-loop"
+    log "substrate ready: $MDS_COUNT mds (null_blk) + $OSS_COUNT oss (zram) namespaces over nvmet-$TRANSPORT"
     log "RAM-backed and reboot-EPHEMERAL — dev/test only, never production data"
     cmd_status
     print_examples
@@ -628,6 +740,7 @@ RemainAfterExit=yes
 ExecStart=$self create
 ExecStop=$self teardown
 # Uncomment to override sizing (see the script header for all knobs):
+#Environment=SQZ_DEVSUB_TRANSPORT=loop
 #Environment=SQZ_DEVSUB_MDS_COUNT=4
 #Environment=SQZ_DEVSUB_MDS_GB=1
 #Environment=SQZ_DEVSUB_OSS_COUNT=4

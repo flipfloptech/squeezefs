@@ -2926,6 +2926,17 @@ impl DataRouter {
         backend.set_layout_and_size(ino, &bytes, m.size).await?;
         // Keep hot cache coherent without a remove+refetch on the next write.
         let mut cached = m.clone();
+        // The blob pointer must follow the SAVED layout (2026-07-27
+        // write-pipeline campaign conviction, red in
+        // tests/indirect_map_backend_keys_tests.rs): the indirect branch
+        // above allocates/relocates the blob and names it ONLY in `layout`
+        // — republishing the RAM entry with the caller's stale
+        // `block_map_id` made the NEXT dirty-RAM-based merge see a
+        // non-indirect id, allocate a fresh blob, and free nothing (one
+        // leaked blob incarnation per merge; ~130 orphans per 700-block
+        // spill burst measured). Sequential inline uploads masked it —
+        // the pipeline's size-bump/merge interleaving exposed it.
+        cached.block_map_id = layout.block_map_id.clone();
         cached.cached_at = std::time::Instant::now();
         self.metadata_cache.insert(ino, cached);
 

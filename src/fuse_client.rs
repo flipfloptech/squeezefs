@@ -4809,6 +4809,10 @@ impl SqueezefsFilesystem {
                     load(&meta_kv::META_KV_PENDING_FREE_RELEASED),
                 );
                 metrics.insert(
+                    "meta_kv_pending_free_overflow".into(),
+                    load(&meta_kv::META_KV_PENDING_FREE_OVERFLOW),
+                );
+                metrics.insert(
                     "meta_kv_commit_smo_retries".into(),
                     load(&meta_kv::META_KV_COMMIT_SMO_RETRIES),
                 );

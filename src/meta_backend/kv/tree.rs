@@ -851,7 +851,10 @@ impl KvTree {
             // local would die silently with the object.
             node.restore_dirty_floor(floor);
             let mut o = MaintenanceOutcome::default();
-            self.smo_replace(ctx, &node, &mut o).await
+            // Forced retirement: the flush pass is what discharges
+            // tail-pinning floors — its compaction must never be refused
+            // FIFO room (the §4.7 cycle-break; theorem on smo_replace).
+            self.smo_replace(ctx, &node, &mut o, true).await
         }
         .await;
         if out.is_err() {
@@ -904,7 +907,9 @@ impl KvTree {
             (node.take_dirty_floor(), forced)
         };
         node.restore_dirty_floor(floor);
-        let out = self.smo_replace(ctx, &node, out).await;
+        // Admission posture (not the flush pass): the defrag nudge keeps
+        // the FIFO valve + its bounded cycle-and-retry protocol.
+        let out = self.smo_replace(ctx, &node, out, false).await;
         if out.is_err() && forced_freeze {
             // Undo the empty forced freeze so the node stays writable —
             // there was no frozen delta to restore.
@@ -960,8 +965,11 @@ impl KvTree {
             }
             return Ok(());
         }
-        // Phase 3: the log is full — compact; oversized ⇒ split (§4.6 pt 1).
-        self.smo_replace(ctx, &node, out).await
+        // Phase 3: the log is full — compact; oversized ⇒ split (§4.6
+        // pt 1). Admission posture: threshold SMOs keep the §4.7 FIFO
+        // valve (at cap they refuse pre-swap and the maintenance arms
+        // force progress-audited checkpoint cycles).
+        self.smo_replace(ctx, &node, out, false).await
     }
 
     /// The §4.6 three-step node replacement. `node` is frozen (its
@@ -978,11 +986,53 @@ impl KvTree {
     /// retries); the reservation happens **inside** the parent-then-child
     /// lock window and the entry bytes are written after release — the
     /// same split as every commit (§4.4 pt 2).
+    ///
+    /// `forced_retirement` selects the §4.7 pending-free posture (the
+    /// cycle-break, P2 2026-07-26 §9 fix direction a):
+    ///
+    /// - `false` (threshold maintenance, the defrag nudge): the FIFO
+    ///   headroom valve applies — at cap the SMO refuses PRE-swap
+    ///   ([`KvError::PendingFreeFull`]) and the caller forces a
+    ///   progress-audited checkpoint cycle. This is §4.7's "pressure
+    ///   forces a checkpoint rather than unsafe reuse" pressure valve.
+    /// - `true` (the checkpoint cycle's flush pass, exclusively): the
+    ///   retirement is parked UNCONDITIONALLY — at cap it goes to the
+    ///   allocator's unbounded overflow, gated on the same durable tail.
+    ///   The flush pass's compactions are precisely the SMOs that
+    ///   discharge tail-pinning dirty floors; refusing one at cap closed
+    ///   the dependency cycle {parked frees await the tail} → {the tail
+    ///   awaits this node's floor} → {the floor awaits this SMO} → {the
+    ///   SMO awaits FIFO room} → {FIFO room awaits the parked frees} —
+    ///   the wedge that livelocked `checkpoint_now` callers, latched the
+    ///   maintenance arms' loud terminal on a RESOLVABLE shape, and
+    ///   persisted across remounts (the preserved 2026-07-26 md-storm
+    ///   image).
+    ///
+    /// **Progress theorem for the forced arm** (why no schedule can
+    /// re-close the cycle): in any barriered checkpoint cycle at head
+    /// `H`, the flush pass visits every dirty node once and — with
+    /// `forced_retirement` — NO visit is refused for FIFO reasons, so
+    /// every dirty floor `< H` is discharged (appended, or compacted
+    /// with the old floor folded into the cycle's dying-floor clamp,
+    /// which pins that cycle's tail but dies WITH that cycle's ledger
+    /// record). Every floor live at the NEXT cycle therefore belongs to
+    /// records ≥ H, so the next barriered cycle's tail is ≥ min(H, the
+    /// oldest in-flight reservation) — past every retirement gate parked
+    /// before H (gates are journal seqs < H by monotonicity). Hence any
+    /// parked retirement is released after at most TWO barriered cycles
+    /// unless the tail is pinned by something no flush can discharge (a
+    /// stuck in-flight reservation) — which is exactly the shape the
+    /// checkpoint cycle's bounded progress audit still fails loud.
+    /// Overflow occupancy is bounded by the same argument: entries
+    /// parked at cycle k drain at cycle k+1's barrier, so it never
+    /// exceeds ~one flush pass of SMO retirements (≤ the dirty-node
+    /// checkpoint cap).
     async fn smo_replace(
         &self,
         ctx: &mut SmoContext,
         node: &Arc<CachedNode>,
         out: &mut MaintenanceOutcome,
+        forced_retirement: bool,
     ) -> Result<(), KvError> {
         let cfg = self.cache.config();
         let layout = &cfg.layout;
@@ -1229,7 +1279,11 @@ impl KvTree {
             // floor restored by the caller) the maintenance arms remedy
             // with a forced checkpoint cycle — never the post-swap
             // custody leak (the extent falling out of the live FIFO).
-            if !ctx.alloc.pending_has_room() {
+            // The flush pass is exempt (`forced_retirement` — its
+            // retirement parks unconditionally at step 3): refusing THE
+            // SMO that discharges a tail-pinning floor is the §4.7
+            // closed dependency cycle (doc above).
+            if !forced_retirement && !ctx.alloc.pending_has_room() {
                 for e in &claimed_extents {
                     ctx.alloc.release_unpublished(*e);
                 }
@@ -1313,15 +1367,25 @@ impl KvTree {
                 outcome.was_freezing,
                 "SMO node must hold its frozen delta until the swap"
             );
-            // Leftover floor (FIND-SMO-TAIL §1b): the moved records'
-            // entry starts are not carried on `OwnedRec`, but the
-            // predecessor's floor lower-bounds every one of them (each
-            // fold at its apply rounded to its entry start, and the
-            // floor was restored before this SMO), so the successors
-            // inherit it. The raw min-seq backstop can only engage if
-            // the predecessor's floor was somehow MAX with a non-empty
-            // overlay — never weaker than the pre-§1b behavior.
-            let pred_floor = node.dirty_floor();
+            // Leftover floor (FIND-SMO-TAIL §1b, made EXACT by the
+            // per-record `entry_floor` stamp — P2 2026-07-26 §9's second
+            // cycle closer): each moved record carries its own entry-
+            // start floor from its original apply, so every successor
+            // gets exactly `min` over the records it actually receives.
+            // The former predecessor-floor inheritance ("pred_floor
+            // lower-bounds every one of them") was CORRECT but ruinously
+            // pessimistic: under continuous same-leaf churn every
+            // compaction has leftovers, so the predecessor's ancient
+            // floor — whose own records are durable in the successor
+            // IMAGES and coverage-clamped by the retire's dying-floor
+            // fold for exactly one cycle — chained through every
+            // successor generation and pinned the checkpoint tail
+            // forever (the tail never passed the parked retirement
+            // gates: the wedge's floor face). Exactness keeps §1b whole:
+            // entry_floor IS the containing entry's start (never a raw
+            // mid-entry seq), and the raw min-seq backstop only engages
+            // for records that somehow never passed apply_locked (MAX
+            // stamp) — never weaker than the pre-§1b behavior.
             for succ in &successors {
                 let mut sg = succ.lock().write().await;
                 let mine: Vec<OwnedRec> = leftovers
@@ -1330,8 +1394,11 @@ impl KvTree {
                     .cloned()
                     .collect();
                 if !mine.is_empty() {
-                    let floor =
-                        pred_floor.min(mine.iter().map(|r| r.seq).min().unwrap_or(u64::MAX));
+                    let floor = mine
+                        .iter()
+                        .map(|r| r.entry_floor.min(r.seq))
+                        .min()
+                        .unwrap_or(u64::MAX);
                     succ.apply_locked(&mut sg, mine, floor)?;
                 }
             }
@@ -1463,15 +1530,24 @@ impl KvTree {
             }
             None => self.next_seq(),
         };
-        // Defense-in-depth only: the admission headroom check before
-        // `try_admit` (clause a above) makes this cap refusal unreachable
-        // — the serialized SMO task is the FIFO's only producer, so
-        // headroom at admission holds here. It stays as a `?` because a
-        // FIFO refusal at this point would be a protocol bug (a second
-        // producer), and the §4.4-pt-4-style loud abort is the right
-        // failure mode for that.
-        ctx.alloc
-            .free_pending(self.cache.addr_extent(node.addr()), free_gate_seq)?;
+        if forced_retirement {
+            // The flush-pass posture: park unconditionally — at cap the
+            // retirement rides the allocator's unbounded overflow against
+            // the coming cycle's tail (the §4.7 cycle-break; progress
+            // theorem in the fn doc).
+            ctx.alloc
+                .free_pending_forced(self.cache.addr_extent(node.addr()), free_gate_seq);
+        } else {
+            // Defense-in-depth only: the admission headroom check before
+            // `try_admit` (clause a above) makes this cap refusal
+            // unreachable — the serialized SMO task is the FIFO's only
+            // producer, so headroom at admission holds here. It stays as
+            // a `?` because a FIFO refusal at this point would be a
+            // protocol bug (a second producer), and the §4.4-pt-4-style
+            // loud abort is the right failure mode for that.
+            ctx.alloc
+                .free_pending(self.cache.addr_extent(node.addr()), free_gate_seq)?;
+        }
         if let Some(parent) = &parent {
             let pg = parent.lock().read().await;
             let re = pg.overlay_bytes() >= cfg.writeback_delta_bytes;

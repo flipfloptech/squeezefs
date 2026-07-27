@@ -464,6 +464,7 @@ impl ExtentAllocator {
             replay_dirty.push(*extent);
         }
         parked.sort_unstable();
+        let mut overflowed = 0u64;
         for (seq, extent) in parked {
             // In-window by construction ⇒ the freeing swap/flips are not
             // durably covered (the mounted record itself may be page-
@@ -475,17 +476,29 @@ impl ExtentAllocator {
             // may live only in this same window (its claiming alloc
             // folded away under this key's LWW; the pages may predate
             // both) — set it before parking, idempotently, so the FIFO's
-            // claimed-while-pending contract holds. A full FIFO here is a
-            // broken K6b tail discipline (the load contract above),
-            // failed loud.
+            // claimed-while-pending contract holds. Parking is FORCED
+            // (never refused): a recovered window can legitimately carry
+            // more frees than the FIFO cap — a tail pinned pre-crash
+            // accumulates parked SMO retirements without bound on the
+            // window's budget, and the pre-fix loud refusal here made
+            // exactly that image UNMOUNTABLE (the §4.7 pinned-floor
+            // wedge's remount face, P2 2026-07-26 §9). Beyond-cap
+            // entries park in the overflow and drain at the first
+            // post-mount durable checkpoint like every other.
             core.mark_allocated(extent);
-            core.free_pending(extent, seq).map_err(|_| {
-                KvError::Corrupt(format!(
-                    "replayed pending-free overflow at extent {extent} (record seq \
-                     {seq}): journal window exceeds the pending-free cap"
-                ))
-            })?;
+            if core.free_pending_forced(extent, seq) {
+                overflowed += 1;
+                super::META_KV_PENDING_FREE_OVERFLOW
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             super::META_KV_PENDING_FREE_PARKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if overflowed > 0 {
+            log::warn!(
+                "mount: {overflowed} replayed pending-free record(s) exceeded the FIFO \
+                 cap and parked in the overflow (a pre-crash pinned tail accumulated \
+                 them); they drain at the first post-mount durable checkpoint"
+            );
         }
 
         let dirty: Vec<AtomicU64> = (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
@@ -590,12 +603,28 @@ impl ExtentAllocator {
         Ok(())
     }
 
+    /// [`Self::free_pending`] that can never be refused (the §4.7
+    /// cycle-break, P2 2026-07-26 §9 fix direction a): at cap the entry
+    /// parks in the core's unbounded overflow, gated on the same durable
+    /// tail. For retirements whose refusal would close the pinned-floor
+    /// dependency cycle ONLY — the checkpoint flush pass's own
+    /// compactions and mount-side re-parking of replayed in-window frees;
+    /// threshold SMOs keep the [`Self::pending_has_room`] admission
+    /// valve.
+    pub fn free_pending_forced(&self, extent: u64, gate_seq: u64) {
+        if self.core.free_pending_forced(extent, gate_seq) {
+            super::META_KV_PENDING_FREE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        }
+        super::META_KV_PENDING_FREE_PARKED.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Producer-side FIFO headroom (§4.7 at-cap protocol, design-smo-
     /// replay-currency PR 4 clause a): the serialized SMO task checks
     /// this at admission — BEFORE the swap — so `PendingFreeFull` can
     /// only ever surface pre-swap (clean abort, claims released) and the
     /// post-swap push is guaranteed to fit (this task is the FIFO's only
-    /// producer; drains only vacate).
+    /// producer; drains only vacate). The valve applies to threshold
+    /// SMOs only — see [`Self::free_pending_forced`].
     pub fn pending_has_room(&self) -> bool {
         self.core.pending_has_room()
     }

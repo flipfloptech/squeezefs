@@ -60,16 +60,26 @@
 //! budget. No task ever blocks on ring space while holding a node lock;
 //! parked user commits hold nothing the drain needs (§4.4 pt 5).
 //!
-//! The §4.7 pending-free cap rides the same discipline (design-smo-
-//! replay-currency PR 4): an SMO refused at the FIFO-headroom admission
-//! check surfaces as [`KvError::PendingFreeFull`] — the flush pass
-//! skips-and-defers that node exactly like the reserve arm (clause c),
-//! and the two `run_maintenance` arms remedy it with progress-audited
-//! forced cycles (`force_pending_free_cycle`, clause b): each forced
-//! cycle completes its non-SMO flushes, writes the ledger, barriers, and
-//! drains the FIFO via `after_durable_barrier`; `PENDING_FREE_FORCE_CYCLES`
-//! stalls without a `pending_count` decrease fail the volume loud (the
-//! genuinely-wedged-tail terminal — never an unbounded retry loop).
+//! The §4.7 pending-free cap is a pressure valve for THRESHOLD SMOs only
+//! (design-smo-replay-currency PR 4 clause a): one refused at the
+//! FIFO-headroom admission check surfaces as
+//! [`KvError::PendingFreeFull`] and the two `run_maintenance` arms force
+//! a barriered checkpoint cycle exactly like reserve exhaustion. The
+//! **flush pass itself is exempt** (the §4.7 cycle-break, P2 2026-07-26
+//! §9): its compactions run with forced retirement — at cap the old
+//! extent parks in the allocator's unbounded overflow against the coming
+//! tail instead of refusing — because the flush pass's SMOs are
+//! precisely what discharge tail-pinning dirty floors, and refusing one
+//! (the retired clause-c "skip-and-defer") closed a dependency cycle
+//! {parked frees ↔ pinned tail ↔ refused compaction} that no schedule
+//! could exit (progress theorem: `KvTree::smo_replace`). Every barriered
+//! cycle rides the centralized clause-b progress audit in
+//! `checkpoint_cycle` — retirements parked with neither a release nor a
+//! tail advance for `PENDING_FREE_FORCE_CYCLES` consecutive barriered
+//! cycles fail the volume loud (the genuinely-wedged-tail terminal — a
+//! tail pinned by something no flush can discharge, e.g. a stuck
+//! in-flight reservation — never an unbounded retry loop, and never the
+//! resolvable pinned-floor shape).
 //!
 //! ---
 //!
@@ -641,51 +651,19 @@ fn max_dirty_nodes() -> u64 {
 /// no other trigger fires (§4.6 pt 2 "every ≤ 1 s").
 const CHECKPOINT_MAX_AGE_MS: u128 = 1000;
 
-/// §4.7 at-cap forced-cycle bound (design-smo-replay-currency PR 4
+/// §4.7 wedged-tail audit bound (design-smo-replay-currency PR 4
 /// clause b; the [`KvMetaBackend::checkpoint_past`] precedent's shape):
-/// consecutive forced cycles without `pending_count` decreasing before
-/// the volume fails loud. Genuine wedges present here — a tail pinned by
-/// a skip loop fills the production cap in ≈ 70 s of sustained storm,
-/// too fast to leave to "the cadence will get to it", and a healthy
-/// convergence needs at most a couple of cycles (the first discharges
-/// dying floors, the second's tail covers the parked frees).
+/// consecutive barriered cycles with retirements parked, none released,
+/// and the ledger tail not advancing, before the volume fails loud. The
+/// audit is centralized in [`KvMetaBackend::checkpoint_cycle`] (P2
+/// 2026-07-26 §9: the pre-fix audit lived only on the maintenance arms,
+/// so direct-cycle callers livelocked silently). A healthy convergence
+/// needs at most a couple of cycles (the first discharges dying floors,
+/// the second's tail covers the parked frees), and since the §4.7
+/// cycle-break the RESOLVABLE pinned-floor shape always converges that
+/// way — what remains for the terminal is a tail pinned by something no
+/// flush pass can discharge (a stuck in-flight reservation).
 const PENDING_FREE_FORCE_CYCLES: u64 = 8;
-
-/// The §4.7 at-cap remedy shared by both `run_maintenance` arms
-/// (design-smo-replay-currency PR 4 clause b): "pressure forces a
-/// checkpoint rather than unsafe reuse", made mechanism. One forced
-/// cycle (`barrier_now` — the FIFO drains via `after_durable_barrier`
-/// inside it), progress-audited on the backend so the bound spans
-/// maintenance passes: any `pending_count` decrease resets the stall
-/// counter; [`PENDING_FREE_FORCE_CYCLES`] stalls without progress fail
-/// the volume loud (never an unbounded retry loop — and never the
-/// pre-fix silent post-swap leak).
-async fn force_pending_free_cycle(
-    be: &Arc<KvMetaBackend>,
-    smo: &mut SmoContext,
-) -> Result<(), KvError> {
-    let before = be.allocator().pending_count();
-    be.checkpoint_cycle(smo, true).await?;
-    if be.allocator().pending_count() < before {
-        be.pending_free_stalled_cycles.store(0, Ordering::Release);
-        return Ok(());
-    }
-    let stalled = be
-        .pending_free_stalled_cycles
-        .fetch_add(1, Ordering::AcqRel)
-        + 1;
-    if stalled >= PENDING_FREE_FORCE_CYCLES {
-        let msg = format!(
-            "pending-free FIFO saturated ({} parked) and {stalled} forced checkpoint \
-             cycles released nothing — the durable tail is wedged below every parked \
-             retirement (§4.7 at-cap bound, design-smo-replay-currency PR 4)",
-            be.allocator().pending_count()
-        );
-        be.fail_stop_loud(&msg);
-        return Err(KvError::Corrupt(msg));
-    }
-    Ok(())
-}
 
 /// Spawn the per-volume checkpoint/writeback task (called by
 /// `KvMetaBackend::open`). The task holds a `Weak` backend reference —
@@ -847,19 +825,20 @@ async fn checkpoint_task(
 /// exhaustion runs one full checkpoint cycle — the §4.4 pt 5 zero-ring-
 /// byte drain — exactly like the cadence tick's maintenance step; a
 /// pending-free-FIFO refusal (the SMO admission headroom check,
-/// design-smo-replay-currency PR 4 clause a) forces the same cycle
-/// through the progress-audited at-cap remedy (clause b).
+/// design-smo-replay-currency PR 4 clause a) forces the same cycle,
+/// whose flush pass now discharges the pinning floor itself (the §4.7
+/// cycle-break) and whose centralized progress audit (clause b, inside
+/// `checkpoint_cycle`) bounds a genuinely wedged tail loud.
 async fn maintenance_pass(be: &Arc<KvMetaBackend>) -> Result<(), KvError> {
     let mut smo = be.smo.lock().await;
     for tree in be.trees() {
         loop {
             match tree.run_maintenance(&mut smo).await {
                 Ok(_) => break,
-                Err(KvError::JournalReserveExhausted { .. }) => {
+                Err(
+                    KvError::JournalReserveExhausted { .. } | KvError::PendingFreeFull { .. },
+                ) => {
                     be.checkpoint_cycle(&mut smo, true).await?;
-                }
-                Err(KvError::PendingFreeFull { .. }) => {
-                    force_pending_free_cycle(be, &mut smo).await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -903,18 +882,17 @@ async fn tick(
     // 1. Threshold maintenance (appends + SMOs, serialized here — §4.6).
     //    Reserve exhaustion runs a drain cycle and retries; a pending-
     //    free-FIFO refusal (SMO admission headroom, design-smo-replay-
-    //    currency PR 4 clause a) forces the progress-audited at-cap
-    //    cycle (clause b) and retries the same way.
+    //    currency PR 4 clause a) forces the same cycle — its flush pass
+    //    discharges the pinning floor (the §4.7 cycle-break) and its
+    //    centralized progress audit (clause b) bounds genuine wedges.
     for tree in be.trees() {
         loop {
             match tree.run_maintenance(&mut smo).await {
                 Ok(_) => break,
-                Err(KvError::JournalReserveExhausted { .. }) => {
+                Err(
+                    KvError::JournalReserveExhausted { .. } | KvError::PendingFreeFull { .. },
+                ) => {
                     be.checkpoint_cycle(&mut smo, true).await?;
-                    *last_checkpoint = std::time::Instant::now();
-                }
-                Err(KvError::PendingFreeFull { .. }) => {
-                    force_pending_free_cycle(be, &mut smo).await?;
                     *last_checkpoint = std::time::Instant::now();
                 }
                 Err(e) => return Err(e),
@@ -1003,6 +981,10 @@ impl KvMetaBackend {
         barrier_now: bool,
     ) -> Result<(), KvError> {
         let h = self.journal_ring().core().head();
+        // The wedged-tail progress audit's inputs (see the barrier_now
+        // block at the end): captured before the cycle mutates anything.
+        let pending_before = self.allocator().pending_count();
+        let tail_before = self.last_ledger_tail.load(Ordering::Acquire);
 
         // ---- Flush pass: every dirty node once, snapshot-then-write.
         // SMO-reserve exhaustion skips the node (floor restored — the
@@ -1028,21 +1010,18 @@ impl KvMetaBackend {
                          deferred to the next cycle"
                     );
                 }
-                Err(KvError::PendingFreeFull { pending }) => {
-                    // design-smo-replay-currency PR 4 clause c: identical
-                    // skip-and-defer to the reserve arm (the floor was
-                    // restored inside checkpoint_flush_node), so a FORCED
-                    // cycle under a cap-saturated storm still completes
-                    // its non-SMO flushes, writes the ledger, barriers,
-                    // and drains the FIFO via after_durable_barrier —
-                    // aborting the whole cycle here would livelock the
-                    // at-cap remedy against the very pressure it exists
-                    // to relieve (ring reclamation wedging behind it).
-                    log::debug!(
-                        "checkpoint: pending-free FIFO full ({pending} parked) at node \
-                         {addr:#x}; SMO deferred to the next cycle"
-                    );
-                }
+                // NOTE: `KvError::PendingFreeFull` is structurally
+                // unreachable here since the §4.7 cycle-break — the flush
+                // pass runs its SMOs with `forced_retirement` (at-cap
+                // retirements park in the allocator's overflow, never
+                // refuse). The former clause-c "skip-and-defer" arm is
+                // exactly what closed the pinned-floor dependency cycle
+                // (P2 2026-07-26 §9): skipping THE compaction that
+                // discharges the tail-pinning floor restored the ancient
+                // floor every cycle, pinning the tail below every parked
+                // gate forever. An unexpected `PendingFreeFull` now falls
+                // through to the loud arm below — a protocol bug, never a
+                // deferral.
                 Err(e) => return Err(e),
             }
         }
@@ -1149,6 +1128,44 @@ impl KvMetaBackend {
             // pending-free, cache durable tail) advances before we
             // return — the R10 drain shape and the shutdown guarantee.
             self.sync_device().await.map_err(KvError::Io)?;
+
+            // The §4.7 wedged-tail progress audit (design-smo-replay-
+            // currency PR 4 clause b, CENTRALIZED here so EVERY barriered
+            // cycle rides it — the pre-fix audit lived only on the
+            // `run_maintenance` arms, so `checkpoint_now`/`checkpoint_past`/
+            // shutdown callers livelocked silently on a wedged tail, the
+            // P2 2026-07-26 §9 finding). Progress is either a parked
+            // retirement released or the ledger tail advancing: since the
+            // flush pass discharges every pre-cycle dirty floor (forced
+            // retirements — the smo_replace progress theorem), a
+            // barriered cycle whose tail does NOT advance while
+            // retirements stay parked means the tail is pinned by
+            // something no flush can discharge (a stuck in-flight
+            // reservation) — bounded cycles, then the volume fails loud.
+            // Never an unbounded retry loop, and — post-fix — never
+            // latched by the RESOLVABLE pinned-floor shape (its floor
+            // discharges in cycle 1, its tail advances in cycle 2).
+            let pending_after = self.allocator().pending_count();
+            if pending_after == 0 || pending_after < pending_before || tail > tail_before {
+                self.pending_free_stalled_cycles.store(0, Ordering::Release);
+            } else {
+                let stalled = self
+                    .pending_free_stalled_cycles
+                    .fetch_add(1, Ordering::AcqRel)
+                    + 1;
+                if stalled >= PENDING_FREE_FORCE_CYCLES {
+                    let msg = format!(
+                        "pending-free retirements wedged ({pending_after} parked) and \
+                         {stalled} consecutive barriered checkpoint cycles neither \
+                         released one nor advanced the ledger tail (stuck at {tail}) — \
+                         the durable tail is pinned by something no flush pass can \
+                         discharge (§4.7 wedged-tail bound, design-smo-replay-currency \
+                         PR 4 clause b)"
+                    );
+                    self.fail_stop_loud(&msg);
+                    return Err(KvError::Corrupt(msg));
+                }
+            }
         }
         Ok(())
     }

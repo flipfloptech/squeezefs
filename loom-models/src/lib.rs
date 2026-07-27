@@ -1256,6 +1256,86 @@ mod models {
         });
     }
 
+    /// Extent-allocator invariant #5 (the §4.7 cycle-break, P2
+    /// 2026-07-26 §9 fix direction a): a FORCED retirement pushed at
+    /// FIFO cap parks in the overflow and rides the SAME coverage gate —
+    /// never claimable before a durable tail passes its gate seq — while
+    /// racing drains stay exact: extents are conserved across the
+    /// FIFO + overflow split (each released exactly once, none leaked,
+    /// none early). The forced push races a concurrent `advance_durable`
+    /// (the drain may vacate a FIFO slot first, in which case the push
+    /// legally lands in the ring instead — both containers must uphold
+    /// the gate identically).
+    #[test]
+    fn alloc_ext_forced_overflow_gate_and_conservation() {
+        loom::model(|| {
+            // Cap 2, three extents: two parked entries saturate the FIFO;
+            // the third retirement is the forced one (gate 7).
+            let core = Arc::new(alloc_ext_core::ExtCore::new(3, 0, 2));
+            let a = core.claim(alloc_ext_core::AllocClass::User).expect("a");
+            let b = core.claim(alloc_ext_core::AllocClass::User).expect("b");
+            let c = core.claim(alloc_ext_core::AllocClass::User).expect("c");
+            core.free_pending(a, 3).expect("slot 1");
+            core.free_pending(b, 5).expect("slot 2");
+            assert!(!core.pending_has_room(), "FIFO saturated");
+
+            // Thread: a durable tail covering the two FIFO entries (6)
+            // but NOT the forced retirement (gate 7).
+            let t = {
+                let core = Arc::clone(&core);
+                thread::spawn(move || {
+                    core.advance_durable(6);
+                })
+            };
+
+            // Main = the serialized SMO task: the forced push must never
+            // refuse — at cap it overflows; if the racing drain vacated a
+            // slot first it may land in the ring instead (both legal).
+            core.free_pending_forced(c, 7);
+
+            // A racing claim can only ever win a, or b — never c: its
+            // gate (7) is uncovered until the 8-advance below, wherever
+            // it parked.
+            let mut raced = 0u32;
+            for _ in 0..2 {
+                match core.claim(alloc_ext_core::AllocClass::User) {
+                    Ok(got) => {
+                        assert_ne!(
+                            got, c,
+                            "the forced (overflow) retirement was claimable before a \
+                             durable tail covered its gate — the §4.7 coverage gate \
+                             does not hold across the FIFO/overflow split"
+                        );
+                        let gate = if got == a { 3 } else { 5 };
+                        assert!(
+                            core.durable_seq() >= gate,
+                            "extent reused before a durable tail covered its gate"
+                        );
+                        raced += 1;
+                    }
+                    Err(alloc_ext_core::ClaimError::NoSpace) => {}
+                }
+            }
+            t.join().unwrap();
+
+            // Cover the forced gate; every remaining extent drains and
+            // the population settles exactly: three claims total, no
+            // leak (an entry stuck in either container) and no double
+            // release (a budget overshoot).
+            core.advance_durable(8);
+            let mut total = raced;
+            while core.claim(alloc_ext_core::AllocClass::User).is_ok() {
+                total += 1;
+            }
+            assert_eq!(
+                total, 3,
+                "extents must be conserved across the FIFO + overflow split"
+            );
+            assert_eq!(core.pending_count(), 0, "nothing stays parked");
+            assert_eq!(core.free_extents(), 0, "budget settles: three live claims");
+        });
+    }
+
     /// Extent-allocator invariant #3 (design §4.7 ENOSPC semantics):
     /// the compaction reserve is never consumable by user claims — under
     /// a race, exactly one of two users fits the user budget while the

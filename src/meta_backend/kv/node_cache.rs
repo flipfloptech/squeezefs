@@ -342,6 +342,17 @@ pub struct OwnedRec {
     /// Never serialized: the freeze path writes [`Self::to_record`],
     /// which drops it — on-disk economics unchanged.
     pub(crate) folded: Option<FoldedHead>,
+    /// The record's own §4.6 pt 2 floor contribution — its containing
+    /// journal entry's START seq, stamped by [`CachedNode::apply_locked`]
+    /// from the batch floor (every apply site passes exactly that).
+    /// Carried so an SMO's leftover-overlay transfer can give each
+    /// successor the EXACT floor of the records it actually receives:
+    /// the former predecessor-floor inheritance chained an ancient floor
+    /// through every compaction of a continuously-written leaf — the
+    /// tail never advanced, the second closer of the §4.7 pinned-floor
+    /// wedge (P2 2026-07-26 §9; the first was the at-cap SMO refusal).
+    /// RAM bookkeeping only: freeze serialization drops it.
+    pub(crate) entry_floor: u64,
 }
 
 /// Fixed per-head charge beyond the owned value buffer (the enum + the
@@ -359,6 +370,9 @@ impl OwnedRec {
             kind,
             value,
             folded: None,
+            // Stamped by `apply_locked` (the batch floor); MAX = "no
+            // contribution" until then.
+            entry_floor: u64::MAX,
         }
     }
 
@@ -1184,6 +1198,13 @@ impl CachedNode {
             self.dirty_floor.fetch_min(floor, Ordering::AcqRel);
         }
         for mut rec in records {
+            // Stamp (or tighten) the record's own floor contribution so
+            // an SMO leftover transfer can rebuild successor floors
+            // EXACTLY (see the `entry_floor` field doc). An SMO-moved
+            // record arrives with its original stamp and keeps it (the
+            // successor apply's batch floor derives from these very
+            // stamps, so `min` is idempotent there).
+            rec.entry_floor = rec.entry_floor.min(floor);
             let pos = guard
                 .overlay
                 .partition_point(|r| (&r.key[..], r.seq) <= (&rec.key[..], rec.seq));

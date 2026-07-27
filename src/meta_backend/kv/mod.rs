@@ -164,6 +164,16 @@ pub static META_KV_PENDING_FREE_PARKED: AtomicU64 = AtomicU64::new(0);
 /// Surfaced as `meta_kv_pending_free_released`.
 pub static META_KV_PENDING_FREE_RELEASED: AtomicU64 = AtomicU64::new(0);
 
+/// The §4.7 cycle-break's engagement gauge (P2 2026-07-26 §9 fix
+/// direction a): retirements FORCED past the at-cap FIFO into the
+/// unbounded overflow — the checkpoint flush pass's own compactions
+/// (whose refusal was the closed pinned-floor dependency cycle) plus
+/// mount-side re-parking of beyond-cap replayed windows. Steady state is
+/// 0 (the FIFO absorbs everything below cap); sustained growth means the
+/// volume lives at the cap — durable-tail coverage is lagging SMO
+/// pressure. Surfaced as `meta_kv_pending_free_overflow`.
+pub static META_KV_PENDING_FREE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
 /// PR M6 (design-metadata-throughput §5.4 D4): kernel post-op ctime
 /// writeback echoes (`fuse_update_ctime` → `fuse_flush_times` →
 /// times-only `FUSE_SETATTR`) **absorbed with zero journal entries** —

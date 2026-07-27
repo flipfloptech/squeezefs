@@ -648,15 +648,16 @@ pub struct KvMetaBackend {
     /// Reset on barrier success; latches `failed` at
     /// [`JOURNAL_FAILURE_LATCH`].
     barrier_failures: AtomicU64,
-    /// §4.7 at-cap forced cycles that failed to shrink `pending_count`
-    /// (design-smo-replay-currency PR 4 clause b, the `checkpoint_past`
-    /// precedent): the two `run_maintenance` arms bump it per forced
-    /// cycle without progress and reset it on any decrease; at
-    /// [`PENDING_FREE_FORCE_CYCLES`] the volume fails loud — a genuinely
-    /// wedged tail must present there, never as an unbounded retry loop.
-    /// Persists across maintenance passes on purpose: one pass usually
-    /// contributes one forced cycle (the aborted SMO's queue entry is
-    /// consumed; the next threshold wake re-drives it).
+    /// §4.7 wedged-tail audit rung (design-smo-replay-currency PR 4
+    /// clause b, the `checkpoint_past` precedent — CENTRALIZED in
+    /// `checkpoint_cycle` since the P2 2026-07-26 §9 cycle-break, so
+    /// every barriered cycle rides it regardless of caller): bumped per
+    /// barriered cycle that leaves retirements parked with neither a
+    /// release nor a ledger-tail advance; reset on any progress; at
+    /// `PENDING_FREE_FORCE_CYCLES` the volume fails loud — a genuinely
+    /// wedged tail (one no flush pass can discharge — e.g. a stuck
+    /// in-flight reservation) must present there, never as an unbounded
+    /// retry loop. Persists across maintenance passes on purpose.
     pub(super) pending_free_stalled_cycles: AtomicU64,
     /// Guard-event trace of this backend's `open` (test/ops surface): the
     /// pinned order `flock_acquired` → `claim_committed` →
@@ -2527,6 +2528,24 @@ impl KvMetaBackend {
             self.pr_active.store(true, Ordering::Release);
         }
 
+        // Ring-recovery preflight (the preserved 2026-07-26 md-storm
+        // image's mount-refusal face, P2 §9): a crash with a pinned tail
+        // can leave a replay window that exhausts the user-admissible
+        // ring slice. The claim commit below is the volume's FIRST
+        // post-replay mutation and the checkpoint task does not exist
+        // yet — a parked claim has NO drain source and can only escalate
+        // through the journal-failure lattice into a mount refusal, on a
+        // volume that is perfectly healthy on disk. We hold the flock,
+        // the PR (where capable), and the B2 decision — we ARE the
+        // writer — so run bounded barriered recovery cycles inline until
+        // one max-size user entry admits. Ordering note (M1 §5.0 B2):
+        // "no maintenance record can precede the claim" pins the
+        // *checkpoint task spawn* after the claim barrier; these inline
+        // cycles are the mount's own guarded writes (checkpoint-class,
+        // DLM-exempt by architecture) and a fenced holder still
+        // fail-stops at their barriers — the guard ladder is unchanged.
+        self.preclaim_ring_recovery().await?;
+
         // Layer B2: commit our claim and make it durable — the volume's
         // first post-replay mutation, BEFORE the checkpoint task exists.
         let claim = WriterClaim {
@@ -2547,6 +2566,64 @@ impl KvMetaBackend {
             self.writer_guard_mode()
         );
         Ok(())
+    }
+
+    /// The mount gate's ring-recovery preflight (see the call site in
+    /// [`Self::writer_guard_gate`]): when the recovered replay window
+    /// leaves less than one max-size user entry admissible, run bounded
+    /// barriered checkpoint cycles inline — each flushes replayed dirt
+    /// (forced retirements break the §4.7 pinned-floor cycle), advances
+    /// the tail, and reclaims ring pages — until the preflight admission
+    /// succeeds. The probe admission is released immediately (nothing is
+    /// reserved); the bound is generous because each barriered cycle is
+    /// audited for progress (`checkpoint_cycle`'s clause-b rung), so a
+    /// genuinely wedged tail fails loud long before the bound with a
+    /// named cause — never a 30 s-per-rung silent park.
+    async fn preclaim_ring_recovery(&self) -> std::result::Result<(), KvError> {
+        const PRECLAIM_RECOVERY_CYCLES: u32 = 64;
+        // One max-size user entry, clamped to what this ring can EVER
+        // admit (a floor-size ring's user slice is slightly under
+        // MAX_ENTRY_LEN once page-header slots are excluded — the clamp
+        // keeps the preflight satisfiable-by-drained-ring on every legal
+        // geometry, so a healthy volume can never be refused here).
+        let geo = self.ring.core().geometry();
+        let need = super::journal::MAX_ENTRY_LEN
+            .min(geo.logical_len().saturating_sub(geo.reserve_bytes));
+        let preflight = || self.ring.try_admit(need, AdmissionClass::User);
+        if let Some(adm) = preflight() {
+            self.ring.core().release(adm);
+            return Ok(());
+        }
+        let core = self.ring.core();
+        log::warn!(
+            "meta volume {}: recovered replay window exhausts the journal ring \
+             (head={}, reusable_upto={}) — running pre-claim recovery checkpoint \
+             cycles (the mount-refusal wedge face, P2 2026-07-26 §9)",
+            self.path.display(),
+            core.head(),
+            core.reusable_upto(),
+        );
+        let mut smo = self.smo.lock().await;
+        for cycle in 0..PRECLAIM_RECOVERY_CYCLES {
+            self.checkpoint_cycle(&mut smo, true).await?;
+            if let Some(adm) = preflight() {
+                self.ring.core().release(adm);
+                log::info!(
+                    "meta volume {}: pre-claim ring recovery converged after {} cycle(s)",
+                    self.path.display(),
+                    cycle + 1
+                );
+                return Ok(());
+            }
+        }
+        Err(KvError::Corrupt(format!(
+            "{}: pre-claim ring recovery did not reclaim admissible space within \
+             {PRECLAIM_RECOVERY_CYCLES} barriered cycles (head={}, reusable_upto={}) — \
+             the durable tail is wedged below the replay window",
+            self.path.display(),
+            self.ring.core().head(),
+            self.ring.core().reusable_upto(),
+        )))
     }
 
     fn pr_error(&self, what: &str, e: std::io::Error) -> KvError {

@@ -45,7 +45,15 @@
 //!   at-cap protocol (SMO admission refusal + forced checkpoint cycles)
 //!   sound: the serialized SMO task is the only producer, so headroom
 //!   observed at admission still holds at the post-swap push (consumers
-//!   only ever vacate slots).
+//!   only ever vacate slots). The cap is a *pressure valve*, never a
+//!   liveness gate: retirements whose refusal would close the §4.7
+//!   pinned-floor dependency cycle — the checkpoint flush pass's own
+//!   compactions, and mount-side re-parking of replayed in-window frees
+//!   — go through [`ExtCore::free_pending_forced`], which parks in an
+//!   unbounded mutex-guarded overflow at cap instead of refusing (P2
+//!   2026-07-26 §9 fix direction a). Overflow entries ride the same
+//!   non-decreasing-gate order and the same durable-tail release clock;
+//!   only the container differs.
 //! - **Reserve accounting** (§4.7 ENOSPC semantics): `reserve` extents
 //!   (production: `max(8, 2 %)` — the wrapper computes it) are claimable
 //!   only by [`AllocClass::Internal`] (compaction / checkpoint / SMO
@@ -81,7 +89,17 @@ pub(crate) mod atomic {
     pub use std::sync::atomic::{AtomicU64, Ordering};
 }
 
+#[cfg(loom)]
+pub(crate) mod sync {
+    pub use loom::sync::Mutex;
+}
+#[cfg(not(loom))]
+pub(crate) mod sync {
+    pub use std::sync::Mutex;
+}
+
 use atomic::{AtomicU64, Ordering};
+use sync::Mutex;
 
 /// Who is asking for an extent (§4.7 ENOSPC semantics).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +171,24 @@ pub struct ExtCore {
     /// Debug guard: retire seqs must be non-decreasing in push order
     /// (§4.6's serialized checkpoint/SMO task guarantees it).
     last_retire_seq: AtomicU64,
+    /// FORCED-retirement overflow (the §4.7 cycle-break, P2 2026-07-26
+    /// §9 fix direction a): retirements the checkpoint cycle's flush pass
+    /// must park even when the bounded FIFO is at cap — refusing THE SMO
+    /// whose completion discharges the tail-pinning floor is the closed
+    /// dependency cycle (parked frees ↔ pinned tail ↔ refused compaction)
+    /// that wedged live volumes AND their remounts. Same `(extent,
+    /// gate_seq)` tuples, same non-decreasing-gate order (one serialized
+    /// producer), same durable-tail release clock — only the container
+    /// is unbounded. Boundedness in fact: the flush pass pushes at most
+    /// one per dirty node per cycle and every barriered cycle's tail
+    /// advance drains all previously-parked entries (the progress
+    /// theorem on the tree's `smo_replace` forced arm), so occupancy
+    /// is bounded by ~two cycles of flush-pass SMOs. A cold pressure
+    /// path: mutex-guarded, `overflow_len` keeps the hot paths lock-free
+    /// when it is empty (the steady state).
+    overflow: Mutex<std::collections::VecDeque<(u64, u64)>>,
+    /// Lock-free mirror of `overflow.len()` (hot-path emptiness checks).
+    overflow_len: AtomicU64,
 }
 
 impl ExtCore {
@@ -189,6 +225,8 @@ impl ExtCore {
             pending_head: AtomicU64::new(0),
             pending_tail: AtomicU64::new(0),
             last_retire_seq: AtomicU64::new(0),
+            overflow: Mutex::new(std::collections::VecDeque::new()),
+            overflow_len: AtomicU64::new(0),
         }
     }
 
@@ -207,21 +245,31 @@ impl ExtCore {
         self.free_budget.load(Ordering::Acquire)
     }
 
-    /// Entries currently parked in the pending-free FIFO (diagnostics —
-    /// includes in-flight pushes).
-    pub fn pending_count(&self) -> u64 {
+    /// FIFO occupancy alone (cursor distance; includes in-flight pushes).
+    fn fifo_count(&self) -> u64 {
         let head = self.pending_head.load(Ordering::Acquire);
         let tail = self.pending_tail.load(Ordering::Acquire);
         head.saturating_sub(tail)
+    }
+
+    /// Entries currently parked awaiting durable-tail coverage — the
+    /// bounded FIFO **plus** the forced-retirement overflow (the wedge-
+    /// detector gauge `meta_kv_pending_free` counts every parked
+    /// retirement, wherever it is parked).
+    pub fn pending_count(&self) -> u64 {
+        self.fifo_count() + self.overflow_len.load(Ordering::Acquire)
     }
 
     /// Producer-side headroom probe (the §4.7 at-cap protocol's admission
     /// check): whether one more [`Self::free_pending`] would fit. Sound
     /// for the serialized SMO task — the FIFO's only producer — because a
     /// racing [`Self::advance_durable`] only ever *vacates* slots, so
-    /// headroom observed here still holds at the later push.
+    /// headroom observed here still holds at the later push. Speaks only
+    /// for the bounded FIFO: it is the *pressure valve* for threshold
+    /// SMOs; forced retirements ([`Self::free_pending_forced`]) never
+    /// consult it.
     pub fn pending_has_room(&self) -> bool {
-        self.pending_count() < self.pending.len() as u64
+        self.fifo_count() < self.pending.len() as u64
     }
 
     /// Newest durable-coverage watermark (the durable journal tail since
@@ -396,6 +444,33 @@ impl ExtCore {
         }
     }
 
+    /// [`Self::free_pending`] that can NEVER be refused (the §4.7
+    /// cycle-break, design-cow-kv-metadata §4.7 / P2 2026-07-26 §9 fix
+    /// direction a): try the bounded FIFO first; at cap, park in the
+    /// unbounded overflow instead — same gate seq, same release clock
+    /// ([`Self::advance_durable`]). Returns `true` when the entry
+    /// overflowed (the caller's engagement counter). Reserved for
+    /// retirements whose refusal would close the pinned-floor dependency
+    /// cycle: the checkpoint cycle's flush-pass compactions (which are
+    /// what discharge tail-pinning floors) and mount-side re-parking of
+    /// replayed in-window frees (a recovered window may legitimately
+    /// carry more frees than the cap). Same producer contract as
+    /// `free_pending`: serialized SMO task / mount bootstrap,
+    /// non-decreasing gate seqs, bit already set.
+    pub fn free_pending_forced(&self, extent: u64, retire_seq: u64) -> bool {
+        if self.free_pending(extent, retire_seq).is_ok() {
+            return false;
+        }
+        let mut g = self.overflow.lock().unwrap();
+        debug_assert!(
+            g.back().is_none_or(|&(_, s)| s <= retire_seq),
+            "overflow gate seqs must be non-decreasing in push order"
+        );
+        g.push_back((extent, retire_seq));
+        self.overflow_len.store(g.len() as u64, Ordering::Release);
+        true
+    }
+
     /// Advance the durable-coverage watermark to `seq` (monotonic
     /// `fetch_max`; stale advances are no-ops) and drain every pending
     /// entry the watermark now covers: bit cleared, budget incremented —
@@ -417,7 +492,7 @@ impl ExtCore {
             let pos = self.pending_tail.load(Ordering::Acquire);
             let head = self.pending_head.load(Ordering::Acquire);
             if pos == head {
-                return released; // FIFO empty.
+                break; // FIFO empty.
             }
             let slot = &self.pending[(pos % cap) as usize];
             let stamp = slot.stamp.load(Ordering::Acquire);
@@ -425,7 +500,7 @@ impl ExtCore {
                 // The tail entry's producer claimed the position but has
                 // not published yet (or a racing consumer just vacated
                 // it); a later advance drains it.
-                return released;
+                break;
             }
             // Peek is stable while stamp == pos + 1: a producer can only
             // reuse the slot after a consumer stamps pos + cap, and only
@@ -434,7 +509,7 @@ impl ExtCore {
             if retire_seq > durable {
                 // FIFO order + non-decreasing tags ⇒ nothing behind this
                 // entry is releasable either: the §4.7 gate holds.
-                return released;
+                break;
             }
             let extent = slot.extent.load(Ordering::Relaxed);
             if self
@@ -450,6 +525,25 @@ impl ExtCore {
             }
             // CAS failure: a racing consumer took it; re-read the tail.
         }
+        // The forced-retirement overflow drains on the same clock — the
+        // gate check is identical per entry (release iff the durable tail
+        // covers its seq; front-stop is exact because gates are
+        // non-decreasing in push order). Lock-free when empty (the
+        // steady state); the mutex serializes racing consumers so each
+        // entry releases exactly once.
+        if self.overflow_len.load(Ordering::Acquire) > 0 {
+            let mut g = self.overflow.lock().unwrap();
+            while let Some(&(extent, gate)) = g.front() {
+                if gate > durable {
+                    break;
+                }
+                g.pop_front();
+                self.release(extent);
+                released.push(extent);
+            }
+            self.overflow_len.store(g.len() as u64, Ordering::Release);
+        }
+        released
     }
 
     /// Whether `extent` is allocated or pending-free (bit set).

@@ -1913,6 +1913,15 @@ impl JobFabric {
                 return Ok(());
             }
 
+            // Async block-reclaim settle (per pass, BEFORE planning): the
+            // planners and the contiguity-aware destination picks read
+            // free-list state, and displaced-source frees ride the
+            // background queue — planning against queued (not yet
+            // finish_freed) state defers moves spuriously and converges
+            // a defrag on a fragmented shape. Mover cadence, never the
+            // write path.
+            ctx.router.backend_router.reclaim_drain().await;
+
             // Plan regeneration per pass (KD-6): census from CURRENT
             // durable state — idempotent by construction.
             let (census, victim) = match objective {

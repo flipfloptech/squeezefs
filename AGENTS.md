@@ -536,7 +536,7 @@ sudo tests/run_elbencho_mount.sh
 
 Prerequisites: Volume formatted/mounted per `QUICKSTART.md`. Failures here can pass pure unit tests and still indicate mount regressions.
 
-Dev boxes without spare raw NVMe: `sudo tests/dev_substrate.sh create` builds the preferred pseudo-everything substrate — memory-backed null_blk (mds) + zram (oss) exposed as real `/dev/nvmeXnY` namespaces via nvmet-loop (QUICKSTART → *Dev Box: Virtual NVMe Substrate*). Do not measure barrier-bound work on file-backed-on-btrfs volumes: the substrate bracket is 165× on the journal barrier (`.benchmarks/2026-07-14-metadata-throughput-baseline.md`).
+Dev boxes without spare raw NVMe: `sudo tests/dev_substrate.sh create` builds the preferred pseudo-everything substrate — memory-backed null_blk (mds) + zram (oss) exposed as real `/dev/nvmeXnY` namespaces via nvmet-loop (QUICKSTART → *Dev Box: Virtual NVMe Substrate*); `SQZ_DEVSUB_TRANSPORT=tcp` builds the same shape over **nvmet-tcp on localhost** (the fabric-sensitive benchmark venue — see *Benchmark substrates* under Benchmarks & Profiling). Do not measure barrier-bound work on file-backed-on-btrfs volumes: the substrate bracket is 165× on the journal barrier (`.benchmarks/2026-07-14-metadata-throughput-baseline.md`).
 
 ### Test tiering (do not run acceptance suites at per-commit cadence)
 
@@ -572,6 +572,19 @@ fstests/LTP are **wall-clock-bound** (fixed-duration fsx/fsstress soaks, mount-c
 ---
 
 ## Benchmarks & Profiling
+
+### Benchmark substrates: the two-substrate rule (2026-07-27)
+
+The 2026-07-27 amplification campaign proved the nvmet-**loop** rig HIDES bandwidth-economy and network-stack effects (the 1.85×-amplification field capture reproduced on nvmet-tcp and was invisible on loop — `.benchmarks/2026-07-27-shim-write-amplification.md`). Both substrates come from `tests/dev_substrate.sh` (same backings — memory-backed null_blk mds + zram oss; same create/teardown/status verbs; the two coexist on one box via disjoint names/state dirs/ports):
+
+| Substrate | Build | Use for |
+|---|---|---|
+| **loop** (default) | `sudo tests/dev_substrate.sh create` | Controlled-latency A/B: per-op decomposition, barrier-bound metadata work, latency-shaped micro-comparisons — the lowest-noise venue |
+| **tcp** (`SQZ_DEVSUB_TRANSPORT=tcp`) | `sudo SQZ_DEVSUB_TRANSPORT=tcp tests/dev_substrate.sh create` | **MANDATORY for fabric-sensitive rows**: writes, bandwidth-bound shapes, multi-connection workloads. nvmet-tcp on `127.0.0.1` runs the real NVMe/TCP queue + softirq machinery, so device-bandwidth economy (write amplification, request-size collapse, per-connection contention) is measurable. TCP service-port slice **54100–54199** (default 54129) — never the fidelity tier's 54000–54099 |
+
+Every measurement states its substrate alongside its instrument (the standing instrument-alignment lesson). A loop-only result on a fabric-sensitive row is scoping evidence, never acceptance.
+
+**Write-amplification instrument (standing row requirement for write/bandwidth rows):** report **device bytes ÷ user bytes** on the DATA namespace (per-row `/proc/diskstats` deltas — meta rides its own namespace, so the data delta is exact), **`wareq-sz` vs the volume block size** (request-size collapse is the fragmentation face of the same failure), and the **`block_free_*` reclaim counters** (`block_free_{discards,discard_bytes,file_punches,punch_bytes,reclaim_skipped}` — a freed-block path that writes instead of deallocating shows here; the 2026-07-27 Write-Zeroes-on-free conviction). `tests/write_amp_rig.sh` is the packaged instrument (kernel/shim/shim-frag sides, per-row stats-inode deltas, charter-rule-4 engagement checks); a write row without its amplification columns is INVALID for scoreboard/acceptance purposes.
 
 ### Criterion benches
 

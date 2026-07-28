@@ -257,9 +257,27 @@ zram capacity exhaustion by the matrix's incompressible datasets on the
 8 GiB×4 substrate (a rig limitation, not a product row: the canonical
 matrix venue is memory-backed null_blk).
 
-## 5. Gates
+## 5. Gates (campaign-side status at the blocking-finding handoff)
 
-TBD.
+- clippy `-D warnings` clean (root all-features + fuse3 + preload
+  [interposers] + ipc crates); fmt clean everywhere; fuse3 standalone
+  suite 41/41.
+- New contract tests green: ingest_economy ×4 (+ the severed-pool
+  production-path pin), preload session_sizing ×2, ipc sizing ×1,
+  transport_lease_overlong ×1; directly-affected suites green
+  (ipc_host 21, preload_session 18, ipc_op_economy 3, ipc_direct_drive
+  11, preload_parity 14, preload_lifecycle 5).
+- statfs_tests ×10 under the stated load recipe + repro ×3 under load:
+  green, 0 hangs (with the watchdog fix present on this branch).
+- **The from-zero full suite + preload gate legs 1+2 rerun AFTER the
+  rebase onto dev+`fix/opeconomy-writeback-hang`** (orchestrator's
+  sequencing: the fix merges first; the campaign's first from-zero roll
+  is what surfaced the blocking finding and was aborted by it). On the
+  fix branch itself the full gate is complete from zero (148/148 test
+  binaries, doc, bench smoke — its evidence note carries it).
+- loom: not owed (no house lock-free core changed; crossbeam ArrayQueue
+  is a shipped dependency; the fuse3 change removes a panic from a Drop
+  without touching the release()/ordering protocol).
 
 ## 7. BLOCKING dev finding — the transport-lease watchdog daemon wedge (root-caused, fixed red-first)
 

@@ -273,12 +273,23 @@ matrix venue is memory-backed null_blk).
   11, preload_parity 14, preload_lifecycle 5).
 - statfs_tests ×10 under the stated load recipe + repro ×3 under load:
   green, 0 hangs (with the watchdog fix present on this branch).
-- **The from-zero full suite + preload gate legs 1+2 rerun AFTER the
-  rebase onto dev+`fix/opeconomy-writeback-hang`** (orchestrator's
-  sequencing: the fix merges first; the campaign's first from-zero roll
-  is what surfaced the blocking finding and was aborted by it). On the
-  fix branch itself the full gate is complete from zero (148/148 test
-  binaries, doc, bench smoke — its evidence note carries it).
+- **FINAL (rebased onto dev `e04501b` — the merged watchdog fix; the
+  interim fix-pair commits dropped cleanly on rebase):**
+  `cargo test --all-features -- --test-threads=1` from zero =
+  **exit 0, 149/149 test binaries ok** (one earlier roll tripped
+  `async_block_reclaim_tests::field_rewrite_...` — operator error, a
+  loom run overlapped the suite in one worktree, the exact class the
+  op-economy note recorded; standalone ×3 green, the exclusive
+  from-zero roll clean); loom **48/48**; `cargo doc --no-deps`
+  generated; bench smoke 0 errors; clippy `-D warnings` + fmt clean on
+  root (all-features) + fuse3 + preload(interposers) + ipc; fuse3
+  standalone suite green. `tests/run_preload_gate.sh` **legs 1+2
+  PASSED at the new session defaults** (sizing tie tests in-gate,
+  kill-9 soak ×5 + direct-drive kill-9 soak ×5 with zero
+  session/arena residue, foreign-netns rendezvous, engagement rows).
+  **statfs_tests ×10 under the stated load recipe on the final tip:
+  30/30 green, 0 hangs, zero waiting-connection residue** — the new
+  house standard row.
 - loom: not owed (no house lock-free core changed; crossbeam ArrayQueue
   is a shipped dependency; the fuse3 change removes a panic from a Drop
   without touching the release()/ordering protocol).

@@ -4562,23 +4562,32 @@ impl TpcScheduler {
                 None
             };
 
-            std::thread::spawn(move || {
-                if let Some(cid) = core_id {
-                    core_affinity::set_for_current(cid);
-                }
-
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-
-                let local = tokio::task::LocalSet::new();
-                local.block_on(&rt, async move {
-                    while let Some(fut) = rx.recv().await {
-                        tokio::task::spawn_local(fut);
+            // Named explicitly (ingest-economy 2026-07-28): an unnamed
+            // thread inherits the comm of whichever thread first touched
+            // the lazy scheduler — on interception mounts that is an ipc
+            // service thread, so every lane showed up in pidstat/perf as
+            // "sqz-ipc-svcN" (the field capture mis-attributed lane CPU
+            // to the service threads exactly this way).
+            std::thread::Builder::new()
+                .name(format!("fuse3-tpc{i}"))
+                .spawn(move || {
+                    if let Some(cid) = core_id {
+                        core_affinity::set_for_current(cid);
                     }
-                });
-            });
+
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+
+                    let local = tokio::task::LocalSet::new();
+                    local.block_on(&rt, async move {
+                        while let Some(fut) = rx.recv().await {
+                            tokio::task::spawn_local(fut);
+                        }
+                    });
+                })
+                .expect("fuse3 tpc lane thread spawns");
         }
 
         Self {

@@ -401,9 +401,31 @@ impl ArenaWindow {
 
     /// The data-plane write sever ([`Self::read_severed`] semantics —
     /// ONE arena read into private memory, §5.3.1 rule 2) as a
-    /// [`bytes::Bytes`] payload source for the write handler.
+    /// [`bytes::Bytes`] payload source for the write handler. The
+    /// destination is a pooled, page-warm buffer ([`SeveredPool`]) that
+    /// returns when the last `Bytes` clone drops — same single copy,
+    /// none of the per-op slab-alloc fault storm.
     pub fn read_severed_bytes(&self) -> bytes::Bytes {
-        bytes::Bytes::from(self.read_severed())
+        let pool = Arc::clone(&self._map.severed_pool);
+        let mut buf = pool.get();
+        if buf.capacity() < self.len {
+            // Structurally unreachable (desc.len ≤ max_op_bytes validated
+            // at dequeue) — reserve keeps the copy sound anyway.
+            buf.reserve(self.len - buf.len());
+        }
+        // SAFETY: `base..base+len` validated inside the arena at
+        // construction; destination capacity ensured above; source may
+        // race (client-writable) — a byte-wise copy of racing memory
+        // yields torn *content*, never UB. `set_len(len)` covers exactly
+        // the bytes the copy initialized.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.base, buf.as_mut_ptr(), self.len);
+            buf.set_len(self.len);
+        }
+        bytes::Bytes::from_owner(PooledSevered {
+            buf: Some(buf),
+            pool,
+        })
     }
 
     /// The window's base pointer — the direct-drive DMA destination
@@ -464,6 +486,105 @@ impl ArenaWindow {
     }
 }
 
+/// Severed-write buffer recycle pool (ingest-economy 2026-07-28): the
+/// §5.5.2 sever copy's DESTINATION buffers, one pool per host. The
+/// profiled engine it deletes: `vec![0u8; len]` per ring write is a
+/// slab-sized (`max_op_bytes`) allocation past jemalloc's tcache, so a
+/// streaming write paid arena mutex + extent recycle + MADV purge +
+/// ~256 page re-faults (with kernel re-zeroing the sever memcpy
+/// immediately overwrites) per op — measured 1.76 M minor faults/s
+/// across 5 saturated svc threads at 12.7 GB/s (the field's 81–87 %
+/// %system signature). Recycled buffers keep their pages mapped and
+/// warm: the sever becomes ONE user-space memcpy, exactly the copy the
+/// severance law already owns (zero new copies).
+///
+/// Sizing is derived, not constant: buffers are `max_op_bytes` (uniform
+/// class, `len` set per op), and the queue's slot count is the
+/// structural in-flight bound `arena_cap_bytes / max_op_bytes` —
+/// severed bytes in flight can never exceed the live session arenas R5
+/// admitted, so retained bytes are worst-case bounded by the same
+/// session-shm cap (and only reach it if that many severed bytes were
+/// ever simultaneously in flight). `ipc_severed_pool_bytes` gauges
+/// retention; hits/misses are the reuse-health counters. Lock-free
+/// (`crossbeam` `ArrayQueue` — a shipped dependency core, not a new
+/// house lock-free algorithm, hence no loom model).
+pub(crate) struct SeveredPool {
+    q: crossbeam::queue::ArrayQueue<Vec<u8>>,
+    buf_cap: usize,
+}
+
+impl SeveredPool {
+    fn new(max_op_bytes: u32, arena_cap_bytes: u64) -> Self {
+        let buf_cap = (max_op_bytes as usize).max(1);
+        // Rail 1..=65536 slots: a pathological env override can size the
+        // arena cap huge — the rail caps the (pointer-array) queue, and
+        // past-capacity returns simply free (graceful degradation).
+        let slots = ((arena_cap_bytes / buf_cap as u64).clamp(1, 65536)) as usize;
+        Self {
+            q: crossbeam::queue::ArrayQueue::new(slots),
+            buf_cap,
+        }
+    }
+
+    fn get(&self) -> Vec<u8> {
+        match self.q.pop() {
+            Some(buf) => {
+                METRICS.ipc_severed_pool_hits.fetch_add(1, Ordering::Relaxed);
+                METRICS
+                    .ipc_severed_pool_bytes
+                    .fetch_sub(self.buf_cap as u64, Ordering::Relaxed);
+                buf
+            }
+            None => {
+                METRICS
+                    .ipc_severed_pool_misses
+                    .fetch_add(1, Ordering::Relaxed);
+                Vec::with_capacity(self.buf_cap)
+            }
+        }
+    }
+
+    fn put(&self, mut buf: Vec<u8>) {
+        // Only full-class buffers recycle (a resized stray would skew the
+        // uniform-class accounting); a full queue drops — dealloc is then
+        // exactly the pre-pool behavior.
+        if buf.capacity() < self.buf_cap {
+            return;
+        }
+        buf.clear();
+        if self.q.push(buf).is_ok() {
+            METRICS
+                .ipc_severed_pool_bytes
+                .fetch_add(self.buf_cap as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The [`bytes::Bytes::from_owner`] owner for a pooled sever: the buffer
+/// returns to its pool when the LAST `Bytes` clone drops — custody can
+/// cross the async handoff and the write handler freely; retention by a
+/// parked payload only delays that buffer's reuse (the pool refills by
+/// allocation, never blocks).
+struct PooledSevered {
+    /// `Some` until drop (no unsafe take-dance needed for `AsRef`).
+    buf: Option<Vec<u8>>,
+    pool: Arc<SeveredPool>,
+}
+
+impl AsRef<[u8]> for PooledSevered {
+    fn as_ref(&self) -> &[u8] {
+        self.buf.as_deref().unwrap_or(&[])
+    }
+}
+
+impl Drop for PooledSevered {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            self.pool.put(buf);
+        }
+    }
+}
+
 /// The daemon-side mapping of one session memfd. Unmapped on drop — which
 /// is ordered after every accessor structurally (service passes and arena
 /// windows clone the `Arc`; §5.3.1 rule 4).
@@ -471,6 +592,9 @@ struct SessionMapping {
     base: *mut u8,
     layout: SessionLayout,
     geometry: Geometry,
+    /// The host's severed-write buffer pool (write severs ride the arena
+    /// window, which holds this mapping — the natural conduit).
+    severed_pool: Arc<SeveredPool>,
 }
 
 // SAFETY: the mapping is process-shared memory accessed only through
@@ -790,6 +914,9 @@ pub struct IpcHost {
     started: Instant,
     shutting_down: AtomicBool,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// The severed-write buffer recycle pool (one per host; every
+    /// session's mapping holds an `Arc` conduit).
+    severed_pool: Arc<SeveredPool>,
 }
 
 impl IpcHost {
@@ -824,6 +951,8 @@ impl IpcHost {
             }
         });
         let service_threads = service_thread_count();
+        let cfg_max_op_bytes = cfg.geometry.max_op_bytes;
+        let cfg_arena_cap_bytes = cfg.arena_cap_bytes;
         let host = Arc::new(Self {
             cfg,
             sink,
@@ -845,6 +974,10 @@ impl IpcHost {
             started: Instant::now(),
             shutting_down: AtomicBool::new(false),
             threads: Mutex::new(Vec::new()),
+            severed_pool: Arc::new(SeveredPool::new(
+                cfg_max_op_bytes,
+                cfg_arena_cap_bytes,
+            )),
         });
         // Spawn-on-bind (ingest-economy 2026-07-28): the gauge reports
         // SPAWNED service threads — 0 until a session admits. No thread
@@ -1383,7 +1516,11 @@ impl IpcHost {
         }
 
         // Establish: sealed memfd + mapping + registry entry.
-        let (memfd, map) = match create_session_shm(&self.cfg.geometry, layout) {
+        let (memfd, map) = match create_session_shm(
+            &self.cfg.geometry,
+            layout,
+            Arc::clone(&self.severed_pool),
+        ) {
             Ok(v) => v,
             Err(e) => {
                 log::error!("ipc host: session shm creation failed: {e}");
@@ -1788,6 +1925,7 @@ fn count_refusal(class: RefuseClass) {
 fn create_session_shm(
     geometry: &Geometry,
     layout: SessionLayout,
+    severed_pool: Arc<SeveredPool>,
 ) -> io::Result<(OwnedFd, SessionMapping)> {
     // SAFETY: memfd_create with a static name; ownership taken immediately.
     let fd = unsafe {
@@ -1823,6 +1961,7 @@ fn create_session_shm(
         base: base as *mut u8,
         layout,
         geometry: *geometry,
+        severed_pool,
     };
     // Write-once initialization before the fd is shared (the sharing act
     // is the synchronization point): header placement-write, ring cell

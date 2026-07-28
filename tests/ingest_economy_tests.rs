@@ -140,6 +140,10 @@ impl SessionSink for InstantSink {
 /// thread-free), +1 per distinct owner as sessions admit, a late-spawned
 /// thread actually serves, the gauge tracks the spawned count, and
 /// shutdown joins everything back to 0.
+///
+/// The OS-thread census assumes the gate's `--test-threads=1` (the
+/// other host-spawning test in this binary would race it in parallel
+/// mode — the preload_session suite documents the same posture).
 #[test]
 fn service_threads_spawn_on_bind_no_parked_spares() {
     assert_eq!(
@@ -448,3 +452,4 @@ async fn production_write_sever_recycles_pooled_buffers() {
     });
     host.shutdown();
 }
+

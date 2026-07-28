@@ -525,7 +525,7 @@ impl DataPlaneSink {
         // BEFORE the handoff counter increments (tests park the handoff
         // behind a held writer and scribble the arena: the scribble must
         // be inert).
-        let severed = bytes::Bytes::from(op.payload.read_severed());
+        let severed = op.payload.read_severed_bytes();
         METRICS.ipc_async_handoffs.fetch_add(1, Ordering::Relaxed);
         let fs = Arc::clone(&self.fs);
         let request = self.ring_request();

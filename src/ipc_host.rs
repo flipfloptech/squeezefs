@@ -399,6 +399,13 @@ impl ArenaWindow {
         buf
     }
 
+    /// The data-plane write sever ([`Self::read_severed`] semantics —
+    /// ONE arena read into private memory, §5.3.1 rule 2) as a
+    /// [`bytes::Bytes`] payload source for the write handler.
+    pub fn read_severed_bytes(&self) -> bytes::Bytes {
+        bytes::Bytes::from(self.read_severed())
+    }
+
     /// The window's base pointer — the direct-drive DMA destination
     /// (`crate::ipc_direct`): raw on purpose, same non-exclusivity
     /// contract as the copies above. Alignment is the CALLER's screen

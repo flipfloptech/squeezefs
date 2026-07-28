@@ -2893,8 +2893,20 @@ pub struct Metrics {
     /// Fast-path in-guard cache-miss demotions (attr/metadata/buffer) —
     /// growth on warm workloads = fast-path rot.
     pub ipc_fast_path_miss_demotions: Align64<AtomicU64>,
-    /// Gauge: pinned IPC service threads (`SQUEEZEFS_IPC_SERVICE_THREADS`).
+    /// Gauge: SPAWNED IPC service threads (spawn-on-bind, ingest-economy
+    /// 2026-07-28 — 0 on a session-less host; ceiling =
+    /// `SQUEEZEFS_IPC_SERVICE_THREADS` / the shared sizing derivation).
     pub ipc_service_threads: Align64<AtomicU64>,
+    /// Severed-write buffer pool (ingest-economy 2026-07-28): ring-write
+    /// severs served from a recycled buffer (`hits`) vs fresh slab-sized
+    /// allocations (`misses` — bounded by warmup + in-flight peaks;
+    /// steady growth on a streaming write workload = the profiled
+    /// 1.76M-faults/s per-op-alloc engine is back), plus the retained-
+    /// bytes gauge (worst case = the session-shm cap, reached only if
+    /// that many severed bytes were ever simultaneously in flight).
+    pub ipc_severed_pool_hits: Align64<AtomicU64>,
+    pub ipc_severed_pool_misses: Align64<AtomicU64>,
+    pub ipc_severed_pool_bytes: Align64<AtomicU64>,
     /// Owned-session doorbell parks taken by service threads (the
     /// bounded `futex_waitv` waits — idle no-session parks are not
     /// counted). Growth ≈ op rate on a busy stream = the spin window no
@@ -4789,6 +4801,9 @@ impl SqueezefsFilesystem {
                 "ipc_fast_path_miss_demotions": METRICS.ipc_fast_path_miss_demotions.load(Ordering::Relaxed),
                 "ipc_service_threads": METRICS.ipc_service_threads.load(Ordering::Relaxed),
                 "ipc_service_parks": METRICS.ipc_service_parks.load(Ordering::Relaxed),
+                "ipc_severed_pool_hits": METRICS.ipc_severed_pool_hits.load(Ordering::Relaxed),
+                "ipc_severed_pool_misses": METRICS.ipc_severed_pool_misses.load(Ordering::Relaxed),
+                "ipc_severed_pool_bytes": METRICS.ipc_severed_pool_bytes.load(Ordering::Relaxed),
                 "ipc_sessions_reaped": METRICS.ipc_sessions_reaped.load(Ordering::Relaxed),
                 "ipc_inval_notifies": METRICS.ipc_inval_notifies.load(Ordering::Relaxed),
                 "ipc_inval_suppressed": METRICS.ipc_inval_suppressed.load(Ordering::Relaxed),

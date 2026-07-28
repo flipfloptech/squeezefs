@@ -39,7 +39,7 @@ pub use raw::{
     COMMIT_BATCH_LABELS,
 };
 #[cfg(feature = "tokio-runtime")]
-pub use raw::{tpc_spawn, tpc_thread_count};
+pub use raw::{tpc_lane_redispatches, tpc_spawn, tpc_thread_count};
 
 mod errno;
 mod helper;

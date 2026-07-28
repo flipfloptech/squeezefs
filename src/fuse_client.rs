@@ -4792,6 +4792,12 @@ impl SqueezefsFilesystem {
                 "transport_commit_batch_commits": t_cb_commits,
                 "transport_wake_writes": t_wake_writes,
                 "transport_wakes_elided": t_wakes_elided,
+                // Shim-parity 2026-07-28 (ingest-economy board item 2):
+                // dead-TPC-lane re-dispatches — 0 on a healthy daemon;
+                // any growth = a handler lane thread died and its
+                // dispatch share is riding the survivors (investigate;
+                // the alternative was a silent 1/N dispatch blackhole).
+                "fuse3_tpc_lane_redispatches": fuse3::tpc_lane_redispatches(),
                 // PR 6 / N6 (design-nvmeof-target-management §6.9): the
                 // fabric_* family — box-wide sysfs controller-state
                 // sample published by the 10 s sampler task

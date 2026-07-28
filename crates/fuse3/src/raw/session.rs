@@ -4492,6 +4492,9 @@ where
     let _ = pin!(sender).send(Either::Left(data)).await;
 }
 
+/// One handler-lane future (boxed for the lane channels).
+type LaneFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
 struct TpcScheduler {
     senders: Vec<
         tokio::sync::mpsc::UnboundedSender<
@@ -4608,8 +4611,71 @@ impl TpcScheduler {
             .next_idx
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             % self.senders.len();
-        let _ = self.senders[idx].send(Box::pin(fut));
+        Self::dispatch(&self.senders, idx, Box::pin(fut));
     }
+
+    /// Lane dispatch with **loud dead-lane re-dispatch** (shim-parity
+    /// campaign 2026-07-28, ingest-economy board item 2): a lane whose
+    /// receiver is gone (its OS thread died — an escaped panic outside a
+    /// tokio task, a runtime build failure) must never silently blackhole
+    /// 1/N of all handler dispatches (each swallowed future is a FUSE
+    /// request whose reply never happens: the kernel waiter parks in
+    /// D-state forever and umount joins the wedge — the exact shape the
+    /// transport-lease watchdog hang exhibited). A closed channel returns
+    /// the future; we re-dispatch to the next lane, count it
+    /// ([`tpc_lane_redispatches`] — a NONZERO value means a lane thread
+    /// is dead and the daemon deserves investigation), and log loudly.
+    /// ALL lanes dead = the entire handler venue is gone: abort rather
+    /// than blackhole (a daemon that can never again answer a FUSE
+    /// request must fail loud, not wedge every mount user).
+    fn dispatch(
+        senders: &[tokio::sync::mpsc::UnboundedSender<LaneFuture>],
+        first_idx: usize,
+        mut fut: LaneFuture,
+    ) {
+        for attempt in 0..senders.len() {
+            let idx = (first_idx + attempt) % senders.len();
+            match senders[idx].send(fut) {
+                Ok(()) => {
+                    if attempt > 0 {
+                        TPC_LANE_REDISPATCHES
+                            .fetch_add(attempt as u64, std::sync::atomic::Ordering::Relaxed);
+                        error!(
+                            "fuse3: TPC lane {} is DEAD (channel closed) — dispatch \
+                             re-routed to lane {idx}; a dead handler lane means a lane \
+                             thread was lost (escaped panic / spawn failure) and deserves \
+                             investigation",
+                            (first_idx + attempt - 1) % senders.len(),
+                        );
+                    }
+                    return;
+                }
+                Err(tokio::sync::mpsc::error::SendError(returned)) => {
+                    fut = returned;
+                }
+            }
+        }
+        // Every lane's receiver is gone: no handler can ever run again on
+        // this process — every future dispatch would strand a FUSE waiter
+        // in D-state. Fail loud (the supervise/abort machinery restarts a
+        // dead daemon; a silently wedged one strands the mount forever).
+        error!(
+            "fuse3: ALL {} TPC handler lanes are dead — aborting rather than \
+             blackholing FUSE dispatch",
+            senders.len()
+        );
+        std::process::abort();
+    }
+}
+
+/// Dead-lane re-dispatches (see [`TpcScheduler::dispatch`]): 0 on a
+/// healthy daemon; any growth = a lane thread died and its traffic is
+/// riding the survivors.
+static TPC_LANE_REDISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The dead-lane re-dispatch counter (stats-inode surface).
+pub fn tpc_lane_redispatches() -> u64 {
+    TPC_LANE_REDISPATCHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static TPC_SCHEDULER: once_cell::sync::Lazy<TpcScheduler> =
@@ -5013,6 +5079,76 @@ mod kernel_init_tests {
             ki.flags & (1u64 << 41),
             1u64 << 41,
             "flags2 bit 9 must land at capability bit 41 (FUSE_OVER_IO_URING)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tpc_dispatch_tests {
+    use super::*;
+
+    type LaneFut = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+    fn lanes(
+        n: usize,
+    ) -> (
+        Vec<tokio::sync::mpsc::UnboundedSender<LaneFut>>,
+        Vec<tokio::sync::mpsc::UnboundedReceiver<LaneFut>>,
+    ) {
+        (0..n)
+            .map(|_| tokio::sync::mpsc::unbounded_channel::<LaneFut>())
+            .unzip()
+    }
+
+    fn drain(receivers: &mut [tokio::sync::mpsc::UnboundedReceiver<LaneFut>]) -> usize {
+        receivers
+            .iter_mut()
+            .map(|rx| {
+                let mut n = 0;
+                while rx.try_recv().is_ok() {
+                    n += 1;
+                }
+                n
+            })
+            .sum()
+    }
+
+    /// One test (the redispatch counter is process-global): healthy
+    /// lanes never pay the counter; a dead lane (dropped receiver = the
+    /// lane thread died, the ingest-economy board item 2 shape) must
+    /// never blackhole a dispatch — the future re-routes to a live lane,
+    /// counted loudly.
+    #[test]
+    fn dead_lane_redispatches_loudly_healthy_lanes_never() {
+        // Phase 1 — healthy: no counter movement.
+        let (senders, mut receivers) = lanes(2);
+        let before = tpc_lane_redispatches();
+        for first_idx in 0..4 {
+            TpcScheduler::dispatch(&senders, first_idx % 2, Box::pin(async {}));
+        }
+        assert_eq!(drain(&mut receivers), 4, "healthy lanes deliver everything");
+        assert_eq!(
+            tpc_lane_redispatches(),
+            before,
+            "healthy dispatch must not touch the dead-lane counter"
+        );
+
+        // Phase 2 — kill lane 1: every dispatch still lands on SOME live
+        // lane (a swallowed future is a FUSE reply that never happens —
+        // the D-state wedge), and the re-route is counted.
+        let (senders, mut receivers) = lanes(3);
+        receivers.remove(1);
+        for first_idx in 0..3 {
+            TpcScheduler::dispatch(&senders, first_idx, Box::pin(async {}));
+        }
+        assert_eq!(
+            drain(&mut receivers),
+            3,
+            "every dispatch must land on a live lane"
+        );
+        assert!(
+            tpc_lane_redispatches() > before,
+            "a dead-lane re-route must be counted (the loud half of the fix)"
         );
     }
 }

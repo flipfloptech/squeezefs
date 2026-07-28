@@ -2017,6 +2017,19 @@ pub struct Metrics {
     /// instead of invalidated, so the kernel's forced revalidation GETATTR
     /// is a ~µs cache hit rather than a contended backend fetch.
     pub fuse_attr_cache_refreshes: Align64<AtomicU64>,
+    /// FUSE_HANDLE_KILLPRIV_V2 negotiated for this mount (0/1 gauge —
+    /// killpriv campaign): 1 ⇒ the kernel's per-write(2)
+    /// GETXATTR("security.capability") killpriv probe is gone and the
+    /// daemon owns the clearing law; 0 ⇒ pre-5.11 kernel or the
+    /// SQUEEZEFS_FUSE_NO_KILLPRIV=1 testing escape (kernel-side probe
+    /// behavior unchanged — the correct degraded posture).
+    pub fuse_killpriv_negotiated: Align64<AtomicU64>,
+    /// Killpriv clears performed under the V2 contract: one count per
+    /// cleared thing (a suid/sgid mode commit; a security.capability
+    /// drop) across flagged WRITE / O_TRUNC OPEN / SETATTR. Steady
+    /// growth on a workload that never touches priv'd files means the
+    /// known-clean latch regressed.
+    pub fuse_killpriv_clears: Align64<AtomicU64>,
     pub meta_updates: Align64<AtomicU64>,
     pub put_obj: Align64<AtomicU64>,
     pub get_obj: Align64<AtomicU64>,
@@ -3355,6 +3368,20 @@ pub struct SqueezefsFilesystem {
     /// — the slot and its blocks leak until remount (the never-lossy
     /// direction) instead of re-arming a second data teardown.
     reclaim_inflight: std::sync::Arc<scc::HashSet<u64>>,
+    /// FUSE_HANDLE_KILLPRIV_V2 known-clean latch (killpriv campaign):
+    /// inos verified to carry no clearable priv state (no suid, no
+    /// group-exec sgid, no security.capability) — a flagged write's kill
+    /// obligation on a member is a contains-check no-op (the
+    /// overwhelmingly common case; zero metadata traffic, pinned in
+    /// tests/killpriv_v2_tests.rs). Latch-free (`scc`); members insert
+    /// BEFORE state is read (`apply_killpriv`) and every priv-state
+    /// mutation removes AFTER its commit (setattr-with-mode, setxattr of
+    /// security.capability), so a stale "clean" can never survive a
+    /// mutation (write-then-remove vs insert-then-read — every
+    /// interleaving converges; see apply_killpriv). Bounded by the set of
+    /// priv-checked inos per mount; v3 never reuses inos, so no reclaim
+    /// hook is needed.
+    killpriv_clean: std::sync::Arc<scc::HashSet<u64>>,
     pub next_dir_fh: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// L4 interception session host (design-preload-interception §5.2, PR
     /// L4-3): `None` on non-interception mounts. Shared across handler
@@ -3429,6 +3456,7 @@ impl Clone for SqueezefsFilesystem {
             kernel_ttls: self.kernel_ttls,
             reclaim_semaphore: self.reclaim_semaphore.clone(),
             reclaim_inflight: self.reclaim_inflight.clone(),
+            killpriv_clean: self.killpriv_clean.clone(),
             dismount_once: self.dismount_once.clone(),
             dismount_complete: self.dismount_complete.clone(),
             dismount_done: self.dismount_done.clone(),
@@ -3532,6 +3560,7 @@ impl SqueezefsFilesystem {
             )),
             kernel_ttls: KernelCacheTtls::from_env(),
             reclaim_inflight: std::sync::Arc::new(scc::HashSet::new()),
+            killpriv_clean: std::sync::Arc::new(scc::HashSet::new()),
             reclaim_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 reclaim_concurrency,
             )),
@@ -4397,6 +4426,8 @@ impl SqueezefsFilesystem {
                 "fuse_release_clean_fastpath": METRICS.fuse_release_clean_fastpath.load(Ordering::Relaxed),
                 "fuse_lookup_negative_replies": METRICS.fuse_lookup_negative_replies.load(Ordering::Relaxed),
                 "fuse_attr_cache_refreshes": METRICS.fuse_attr_cache_refreshes.load(Ordering::Relaxed),
+                "fuse_killpriv_negotiated": METRICS.fuse_killpriv_negotiated.load(Ordering::Relaxed),
+                "fuse_killpriv_clears": METRICS.fuse_killpriv_clears.load(Ordering::Relaxed),
                 "meta_updates": METRICS.meta_updates.load(Ordering::Relaxed),
                 "put_obj": METRICS.put_obj.load(Ordering::Relaxed),
                 "get_obj": METRICS.get_obj.load(Ordering::Relaxed),
@@ -5244,6 +5275,103 @@ impl SqueezefsFilesystem {
         if let Some(notify) = self.kernel_notify.load().as_ref() {
             let notify = notify.clone();
             notify.invalid_inode(ino, 0, 0).await;
+        }
+        Ok(())
+    }
+
+    /// FUSE_HANDLE_KILLPRIV_V2 kill obligation for a flagged WRITE
+    /// (`FUSE_WRITE_KILL_SUIDGID` — kernel or il-parity origin): clear
+    /// S_ISUID always, clear S_ISGID only when group-executable
+    /// (`kill_suidgid_mode` — the sgid-without-group-exec
+    /// mandatory-locking marker survives), drop `security.capability`.
+    /// The kernel already arbitrated CAP_FSETID (unflagged writes never
+    /// reach here), so the flag is obeyed unconditionally.
+    ///
+    /// Economy (the D4 pin in tests/killpriv_v2_tests.rs): membership in
+    /// `killpriv_clean` short-circuits to a contains-check — zero
+    /// metadata traffic on the no-priv-bits common case. The slow path
+    /// runs at most once per ino per mount plus once per re-arming
+    /// mutation; its reads are RAM-authoritative and a performed clear is
+    /// one ordinary setattr/removexattr commit (a per-transition cost,
+    /// never per-write).
+    ///
+    /// Race law: we INSERT the latch before reading state; mutators
+    /// commit state before REMOVING the latch. Any mutation racing this
+    /// probe either lands before our read (we clear it) or removes the
+    /// latch after our insert (the next flagged write re-probes) — a
+    /// stale "clean" cannot survive.
+    async fn apply_killpriv(&self, ino: u64) -> FuseResult<()> {
+        if self.killpriv_clean.contains_sync(&ino) {
+            return Ok(());
+        }
+        let Some(backend) = self.meta_backend.as_ref() else {
+            return Ok(());
+        };
+        let _ = self.killpriv_clean.insert_sync(ino);
+        let inode = match backend.getattr(ino).await {
+            Ok(inode) => inode,
+            // Reclaimed/unlinked ino racing a flushed write: the write
+            // path's orphan-discard contract owns this shape — nothing to
+            // clear, and the kill must never fail the write. Un-latch
+            // (symmetry with the error path; dead inos never return —
+            // v3 allocation is monotonic).
+            Err(ref e) if e.to_errno() == libc::ENOENT => {
+                self.killpriv_clean.remove_sync(&ino);
+                return Ok(());
+            }
+            Err(e) => {
+                self.killpriv_clean.remove_sync(&ino);
+                return Err(map_squeezefs_err(e));
+            }
+        };
+        let mode = inode.mode;
+        let killed_perm = kill_suidgid_mode(mode & 0o7777);
+        let clear_result: Result<(), SqueezefsError> = async {
+            if killed_perm != mode & 0o7777 {
+                backend
+                    .setattr(
+                        ino,
+                        Some((mode & libc::S_IFMT) | killed_perm),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                METRICS.fuse_killpriv_clears.fetch_add(1, Ordering::Relaxed);
+            }
+            if backend
+                .getxattr(ino, "security.capability")
+                .await?
+                .is_some()
+            {
+                backend.removexattr(ino, "security.capability").await?;
+                METRICS.fuse_killpriv_clears.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = clear_result {
+            // The clear did not verifiably complete — never latch over an
+            // unknown state. ENOENT mid-sequence is the reclaim race
+            // above (benign).
+            self.killpriv_clean.remove_sync(&ino);
+            if e.to_errno() == libc::ENOENT {
+                return Ok(());
+            }
+            return Err(map_squeezefs_err(e));
+        }
+        if killed_perm != mode & 0o7777 {
+            // The mode moved: re-seed caches + tell the kernel (its
+            // incore mode would show the pre-kill bits for an attr-TTL
+            // window otherwise — the fallocate-strip precedent).
+            self.refresh_attr_cache(ino).await;
+            if let Some(notify) = self.kernel_notify.load().as_ref() {
+                let notify = notify.clone();
+                notify.invalid_inode(ino, 0, 0).await;
+            }
         }
         Ok(())
     }
@@ -9550,6 +9678,26 @@ impl Filesystem for SqueezefsFilesystem {
             );
         }
 
+        // Killpriv campaign gauge: 1 ⇔ the INIT reply actually advertised
+        // FUSE_HANDLE_KILLPRIV_V2 (kernel offered it AND the mount armed
+        // it) — the per-write GETXATTR("security.capability") probe is
+        // gone and this daemon owns the clearing law. 0 on pre-5.11
+        // kernels / SQUEEZEFS_FUSE_NO_KILLPRIV=1 (probe unchanged — the
+        // correct degraded posture).
+        let killpriv_negotiated = fuse3::raw::negotiated_reply_flags()
+            .is_some_and(|f| f & fuse3::raw::flags::FUSE_HANDLE_KILLPRIV_V2 != 0);
+        METRICS
+            .fuse_killpriv_negotiated
+            .store(u64::from(killpriv_negotiated), Ordering::Relaxed);
+        info!(
+            "FUSE_HANDLE_KILLPRIV_V2 {} for this mount",
+            if killpriv_negotiated {
+                "negotiated (kernel killpriv probe deleted; daemon owns suid/sgid/caps clearing)"
+            } else {
+                "not negotiated (kernel-side killpriv probe remains)"
+            }
+        );
+
         if let Some(ref backend) = self.meta_backend {
             if let Ok(Some(val)) = backend.getxattr(1, "user.squeezefs.format_config").await {
                 if let Ok(config) = serde_json::from_slice::<crate::FormatConfig>(&val) {
@@ -10188,7 +10336,7 @@ impl Filesystem for SqueezefsFilesystem {
         req: Request,
         inode: Inode,
         flags: u32,
-        _open_flags: u32,
+        open_flags: u32,
     ) -> FuseResult<ReplyOpen> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         // VL8 item 2: register (the live wedge held 4 opens invisibly).
@@ -10252,12 +10400,19 @@ impl Filesystem for SqueezefsFilesystem {
         // guard order, same overlay/record prune, same backend commit as
         // an explicit truncate-to-zero.
         if flags & (libc::O_TRUNC as u32) != 0 {
+            // FUSE_OPEN_KILL_SUIDGID (HANDLE_KILLPRIV_V2): under
+            // ATOMIC_O_TRUNC the kernel never sends the SETATTR(size=0)
+            // fallback, so the kill obligation for a non-CAP_FSETID
+            // O_TRUNC opener arrives HERE — fold it into the same
+            // truncate-to-zero commit (suid always, sgid only if
+            // group-exec, caps xattr drop; tests/killpriv_v2_tests.rs).
             self.setattr(
                 req,
                 inode,
                 None,
                 SetAttr {
                     size: Some(0),
+                    kill_suidgid: open_flags & fuse3::raw::flags::FUSE_OPEN_KILL_SUIDGID != 0,
                     ..Default::default()
                 },
             )
@@ -10719,7 +10874,7 @@ impl Filesystem for SqueezefsFilesystem {
         _fh: u64,
         offset: u64,
         data: bytes::Bytes,
-        _write_flags: u32,
+        write_flags: u32,
         _flags: u32,
     ) -> FuseResult<ReplyWrite> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
@@ -10736,6 +10891,15 @@ impl Filesystem for SqueezefsFilesystem {
         // (pinned in tests/sparse_write_bounded_tests.rs).
         if offset.saturating_add(data.len() as u64) > self.max_file_size() {
             return Err(Errno::from(libc::EFBIG));
+        }
+
+        // FUSE_HANDLE_KILLPRIV_V2: the kernel (or the il parity shim)
+        // flagged this write's caller as non-CAP_FSETID — apply the
+        // clearing law BEFORE the data lands (the VFS
+        // privs-before-write order). Known-clean inos short-circuit on
+        // the latch (zero metadata traffic — the common case).
+        if write_flags & fuse3::raw::flags::FUSE_WRITE_KILL_SUIDGID != 0 {
+            self.apply_killpriv(ino).await?;
         }
 
         // D1.d: this open generation now has flushable state.
@@ -11136,6 +11300,22 @@ impl Filesystem for SqueezefsFilesystem {
                 let new_mode = (current_inode.mode & libc::S_IFMT) | (mode & 0o7777);
                 mode_to_set = Some(new_mode);
             }
+            // FATTR_KILL_SUIDGID (HANDLE_KILLPRIV_V2 — size-changing
+            // truncate / chown by a non-CAP_FSETID caller, or the OPEN
+            // O_TRUNC fold above): apply the clearing law to whatever
+            // mode this op would otherwise commit, FOLDED into the one
+            // existing setattr transaction (D4 economy — never a second
+            // journal entry; pinned in tests/killpriv_v2_tests.rs). The
+            // kernel never combines FATTR_MODE with the kill bit, but
+            // composing over `mode_to_set` keeps the law total anyway.
+            if set_attr.kill_suidgid {
+                let base = mode_to_set.unwrap_or(current_inode.mode);
+                let killed = (base & libc::S_IFMT) | kill_suidgid_mode(base & 0o7777);
+                if killed != base {
+                    mode_to_set = Some(killed);
+                    METRICS.fuse_killpriv_clears.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             if let Some(uid) = set_attr.uid {
                 uid_to_set = Some(uid);
             }
@@ -11261,6 +11441,31 @@ impl Filesystem for SqueezefsFilesystem {
                 .await;
             prof.mark_backend_done();
             let inode = backend_res.map_err(map_squeezefs_err)?;
+            // The kill's capability face: FATTR_KILL_SUIDGID also owns
+            // dropping security.capability (VFS truncate/chown kill file
+            // caps — do_truncate's dentry_needs_remove_privs / chown's
+            // ATTR_KILL_PRIV). Probe first (RAM-authoritative read): only
+            // files that actually carry the xattr pay the removal commit.
+            if set_attr.kill_suidgid {
+                match backend.getxattr(ino, "security.capability").await {
+                    Ok(Some(_)) => {
+                        backend
+                            .removexattr(ino, "security.capability")
+                            .await
+                            .map_err(map_squeezefs_err)?;
+                        METRICS.fuse_killpriv_clears.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Err(map_squeezefs_err(e)),
+                }
+            }
+            // Killpriv-clean latch hygiene: an explicit chmod can re-add
+            // priv bits (or grant group-exec to a parked sgid) — remove
+            // AFTER the commit (write-then-remove; see the latch's race
+            // law on the field doc).
+            if set_attr.mode.is_some() {
+                self.killpriv_clean.remove_sync(&ino);
+            }
             let mut attr = self.inode_to_file_attr(&inode);
             // A metadata-only setattr (chmod/chown/utimes — no `size` in the
             // request) must never change the file size. The durable inode can
@@ -12719,6 +12924,12 @@ impl Filesystem for SqueezefsFilesystem {
             .setxattr(inode, name_str, value)
             .await
             .map_err(map_squeezefs_err)?;
+        // Killpriv-clean latch hygiene: a fresh security.capability re-arms
+        // the flagged-write caps drop (write-then-remove — the latch's
+        // race law; tests/killpriv_v2_tests.rs).
+        if name_str == "security.capability" {
+            self.killpriv_clean.remove_sync(&inode);
+        }
         Ok(())
     }
 
@@ -12873,6 +13084,21 @@ fn reserved_xattr_name(name: &str) -> bool {
 /// enforcement is unaffected. Pinned in tests/job_fabric_tests.rs.
 fn posix_acl_xattr_name(name: &str) -> bool {
     name == "system.posix_acl_access" || name == "system.posix_acl_default"
+}
+
+/// The FUSE_HANDLE_KILLPRIV_V2 mode-clearing law (permission bits in,
+/// permission bits out — uapi include/uapi/linux/fuse.h + VFS
+/// `should_remove_suid`): S_ISUID always dies; S_ISGID dies **only when
+/// the file is group-executable** — sgid without S_IXGRP is the
+/// mandatory-locking marker and MUST be preserved (the classic
+/// killpriv-v2 trap, pinned in tests/killpriv_v2_tests.rs). CAP_FSETID
+/// arbitration is the kernel's: this law only runs on flagged requests.
+fn kill_suidgid_mode(perm: u32) -> u32 {
+    let mut killed = perm & !libc::S_ISUID;
+    if perm & libc::S_ISGID != 0 && perm & libc::S_IXGRP != 0 {
+        killed &= !libc::S_ISGID;
+    }
+    killed
 }
 
 /// Initialize the multi-threaded work-stealing tokio runtime
@@ -13128,6 +13354,23 @@ pub async fn start_mount<P: AsRef<Path>>(
     options.allow_other(allow_other);
     options.write_back(posture.write_back);
     options.default_permissions(true);
+    // FUSE_HANDLE_KILLPRIV_V2 (killpriv campaign): the daemon implements
+    // the clearing law (write/open/setattr handlers +
+    // tests/killpriv_v2_tests.rs), so advertise it whenever the kernel
+    // offers — deleting the per-write(2) GETXATTR("security.capability")
+    // killpriv probe (half of every write-syscall-bound stream's
+    // requests). SQUEEZEFS_FUSE_NO_KILLPRIV=1 is the TESTING-ONLY A/B
+    // escape (restores the kernel-side probe posture); never an
+    // operational recommendation.
+    let killpriv_v2 = !std::env::var("SQUEEZEFS_FUSE_NO_KILLPRIV").is_ok_and(|v| v == "1");
+    options.handle_killpriv_v2(killpriv_v2);
+    if !killpriv_v2 {
+        info!(
+            "FUSE_HANDLE_KILLPRIV_V2 negotiation DISABLED by \
+             SQUEEZEFS_FUSE_NO_KILLPRIV=1 (testing escape) — the kernel keeps \
+             its per-write killpriv GETXATTR probe"
+        );
+    }
     if let Some(ref opts) = custom_opts {
         // MS_NOSUID/MS_NODEV/MS_NOEXEC ride the mount(2) flags (root
         // path) / the fusermount option string (unprivileged path) —

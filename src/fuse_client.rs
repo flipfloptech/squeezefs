@@ -6082,7 +6082,7 @@ impl SqueezefsFilesystem {
                     .value()
                     .snapshot();
                 match self
-                    .upload_full_block(ino, b, snapshot, fencing_token)
+                    .upload_full_block_sized(ino, b, snapshot, fencing_token, false)
                     .await
                 {
                     Ok(()) => {
@@ -7578,6 +7578,32 @@ impl SqueezefsFilesystem {
         plaintext: bytes::Bytes,
         fencing_token: u64,
     ) -> Result<(), SqueezefsError> {
+        self.upload_full_block_sized(ino, b, plaintext, fencing_token, true)
+            .await
+    }
+
+    /// [`Self::upload_full_block`] with an explicit size posture.
+    /// `grow_size_to_block_end = true` is the ACK-path write-through
+    /// (coverage-union complete ⇒ every byte app-written ⇒ the file
+    /// legitimately extends to the block end). The FLUSH legs pass
+    /// `false`: a `content_valid` parked buffer can be *zero-completed* or
+    /// seeded custody (staging-refusal parks, spill victims) whose
+    /// trailing zeros were never app-written — merging a block-end size
+    /// floor there published size AHEAD of acked data, and a concurrent
+    /// reader composed zeros inside the freshly-extended range (the
+    /// generic/795 SIZE-NEVER-LEADS-DATA law; caught by
+    /// `sequential_recopy_readers_never_see_foreign_bytes` the day the
+    /// flush write-through leg landed). With `false` the merge still
+    /// floors at the RAM acked size (the merge discipline's
+    /// `cached.size`), which is exactly the honest bound.
+    async fn upload_full_block_sized(
+        &self,
+        ino: u64,
+        b: u32,
+        plaintext: bytes::Bytes,
+        fencing_token: u64,
+        grow_size_to_block_end: bool,
+    ) -> Result<(), SqueezefsError> {
         // Write-pipeline governor sample: the WHOLE upload latency (crypto
         // → allocate → DMA → merge) per backend lane — the pipeline's
         // Little's-law basis must cover every leg the in-flight custody
@@ -7659,10 +7685,16 @@ impl SqueezefsFilesystem {
 
         // Block-map merge via the shared primitive (§5.3 one merge
         // discipline) under INODE_META_LOCKS: current-map RMW, fencing
-        // revalidation, RAM cache republish, displaced-key tier purge. The
-        // completed write ends exactly at the block end, so the file is at
-        // least that large.
-        let min_size = (b as u64 + 1) * self.router.block_size.load(Ordering::Relaxed);
+        // revalidation, RAM cache republish, displaced-key tier purge. On
+        // the ACK path the completed write ends exactly at the block end,
+        // so the file is at least that large; the flush legs must not
+        // grow the size past the acked floor (see
+        // `upload_full_block_sized`).
+        let min_size = if grow_size_to_block_end {
+            (b as u64 + 1) * self.router.block_size.load(Ordering::Relaxed)
+        } else {
+            0
+        };
         let entries = [(b, new_key)];
         let wp_merge = write_phase_start();
         let displaced = match self
@@ -8548,7 +8580,7 @@ impl SqueezefsFilesystem {
                     .value()
                     .snapshot();
                 match self
-                    .upload_full_block(ino, b, snapshot, fencing_token)
+                    .upload_full_block_sized(ino, b, snapshot, fencing_token, false)
                     .await
                 {
                     Ok(()) => {

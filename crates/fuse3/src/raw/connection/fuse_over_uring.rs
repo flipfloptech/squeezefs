@@ -335,15 +335,33 @@ impl Drop for EntPayloadLease {
         let age_ms = self.born.elapsed().as_millis() as u64;
         TRANSPORT_LEASE_MAX_AGE_MS.fetch_max(age_ms, Ordering::Relaxed);
         TRANSPORT_LEASES_OUTSTANDING.fetch_sub(1, Ordering::Relaxed);
-        // §5.4 severance-boundary enforcement, armed in debug/test builds:
-        // a lease's lifetime is bounded by ONE handler invocation; anything
-        // second-scale means a payload escaped toward a long-lived cache
-        // and would park this ent's COMMIT_AND_FETCH indefinitely.
-        debug_assert!(
-            age_ms < 1000,
-            "transport payload lease held {age_ms} ms (≥ 1 s) — a FUSE_WRITE \
-             payload escaped its handler (lease-severance violation, §5.4)"
-        );
+        // §5.4 severance-boundary TRIPWIRE — loud, NEVER fatal (2026-07-28
+        // ingest-economy BLOCKING finding; the deterministic pin is
+        // tests/transport_lease_overlong_tests.rs in the root suite). This
+        // used to be a `debug_assert!(age < 1s)`: a firing PANICKED the
+        // write-handler task mid-flight, so (a) the FUSE reply was never
+        // sent — the kernel's writeback folio parked forever and fsync(2)
+        // sat in uninterruptible D-state (captured live: a hung gate with
+        // `waiting=28` lost requests on the connection, umount recursing
+        // into the same stuck sync) — and (b) the unwind skipped the
+        // `release()` below, parking this ent's COMMIT_AND_FETCH re-arm
+        // forever (permanent queue-depth loss). A watchdog must never take
+        // down the data plane. And ≥ 1 s is NOT proof of escape: one
+        // handler invocation legitimately exceeds it under write-pipeline
+        // admission backpressure on slow/debug substrates — load merely
+        // selects that schedule. Overlong leases now count
+        // (`transport_lease_overlong`, stats inode) and log loudly; a
+        // GENUINE §5.4 escape (payload parked toward a long-lived cache)
+        // shows as unbounded ages + growing `transport_parked_commits`,
+        // adjudicated by counter, never by killing the handler.
+        if age_ms >= 1000 {
+            TRANSPORT_LEASE_OVERLONG.fetch_add(1, Ordering::Relaxed);
+            error!(
+                "transport payload lease held {age_ms} ms (≥ 1 s) — overlong \
+                 handler invocation or a §5.4 severance escape; watch \
+                 transport_lease_overlong / transport_parked_commits"
+            );
+        }
         if self.state.release() {
             // Last lease gone with a commit parked: wake the queue worker.
             // L3 lever B — publish (the release above) happened first, so
@@ -645,6 +663,7 @@ static TRANSPORT_PAYLOAD_LEASES: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_PARKED_COMMITS: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_LEASES_OUTSTANDING: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_LEASE_MAX_AGE_MS: AtomicU64 = AtomicU64::new(0);
+static TRANSPORT_LEASE_OVERLONG: AtomicU64 = AtomicU64::new(0);
 // L3 lever B wake economy: eventfd writes performed vs elided by the
 // per-queue WakeCoalescer (submit_reply + lease-drop sites). Regression
 // signal: writes/(writes+elided) ≈ 1 under saturated load means the
@@ -692,18 +711,20 @@ pub fn over_uring_stats() -> (u64, u64, u64, u64) {
 }
 
 /// Transport payload-lease counters (§5.4): `(payload_leases,
-/// parked_commits, leases_outstanding, lease_max_age_ms)`.
+/// parked_commits, leases_outstanding, lease_max_age_ms, lease_overlong)`.
 /// `payload_leases` proves adoption (FUSE_WRITE rides leases, not copies);
 /// `parked_commits` ≫ 0 means handlers hold payloads past their reply or
 /// Q_DEPTH is too small; `leases_outstanding` returns to 0 at quiesce;
 /// `lease_max_age_ms` is the severance-boundary high-water mark (bounded by
-/// one handler invocation, hard-asserted in debug builds).
-pub fn transport_lease_stats() -> (u64, u64, u64, u64) {
+/// one handler invocation); `lease_overlong` counts ≥ 1 s lifetimes — the
+/// loud-never-fatal §5.4 tripwire (see `EntPayloadLease::drop`).
+pub fn transport_lease_stats() -> (u64, u64, u64, u64, u64) {
     (
         TRANSPORT_PAYLOAD_LEASES.load(Ordering::Relaxed),
         TRANSPORT_PARKED_COMMITS.load(Ordering::Relaxed),
         TRANSPORT_LEASES_OUTSTANDING.load(Ordering::Relaxed),
         TRANSPORT_LEASE_MAX_AGE_MS.load(Ordering::Relaxed),
+        TRANSPORT_LEASE_OVERLONG.load(Ordering::Relaxed),
     )
 }
 

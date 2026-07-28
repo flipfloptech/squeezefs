@@ -142,6 +142,16 @@ if engage != 'ok':
 EOF
         [ $? -eq 0 ] || fail "engagement $side/$row r$rep"
     done
+    # Capacity hygiene (fresh rows): drop this row's dataset once the row
+    # is done — the substrate's aggregate capacity (4 × 8 GiB) holds ONE
+    # 16 GiB dataset per transport plus the rand files, not their union.
+    if [ "$mode" = fresh ]; then
+        rm -rf "$dir"; sync -f "$MOUNT_DIR" 2>/dev/null || sync; sleep 2
+    fi
+}
+
+clean_dir() { # explicit dataset drop for keep-mode (rand) rows
+    rm -rf "$MOUNT_DIR/$1"; sync -f "$MOUNT_DIR" 2>/dev/null || sync; sleep 2
 }
 
 for i in "${!ORDER[@]}"; do
@@ -156,10 +166,12 @@ for i in "${!ORDER[@]}"; do
     fio_write_row "$side" "$pass" "il-rand4k-prep" 1 write 1m 512m il-rand4k keep --fallocate=none
     fio_write_row "$side" "$pass" "il-rand4k" 1 randwrite 4k 512m il-rand4k keep \
         --time_based --runtime=10
+    clean_dir il-rand4k
     fio_write_row "$side" "$pass" "kern-rand4k-prep" 0 write 1m 512m kern-rand4k keep \
         --fallocate=none
     fio_write_row "$side" "$pass" "kern-rand4k" 0 randwrite 4k 512m kern-rand4k keep \
         --time_based --runtime=10
+    clean_dir kern-rand4k
     kill_daemon
 done
 

@@ -55,7 +55,11 @@ CSV="$RESULTS/matrix.csv"
 [ "$(id -u)" -eq 0 ] || { echo "run as root"; exit 1; }
 [ -x "$SQUEEZEFS_BIN" ] || { echo "missing $SQUEEZEFS_BIN"; exit 1; }
 [ -f "$SO" ] || { echo "missing shim $SO"; exit 1; }
-[ -b "$META_DEV" ] && [ -b "$DATA_DEV" ] || { echo "missing rig devices"; exit 1; }
+# META/DATA may be comma-separated multi-volume lists (the TCP devsub
+# substrate needs the aggregate zram capacity for the seq rows).
+for d in ${META_DEV//,/ } ${DATA_DEV//,/ }; do
+    [ -b "$d" ] || { echo "missing rig device $d"; exit 1; }
+done
 mkdir -p "$RESULTS" "$MOUNT_DIR"
 
 # Counter deltas printed per row (full metrics diff persisted per rep).

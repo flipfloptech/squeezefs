@@ -1324,3 +1324,79 @@ async fn data_plane_stats_fields_export() {
     }
     fx.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// killpriv-v2 il parity (the 2026-07-28 campaign)
+// ---------------------------------------------------------------------------
+
+/// Intercepted write(2) bypasses the kernel VFS entirely —
+/// `file_remove_privs` never ran on the ring path (a PRE-EXISTING
+/// semantics gap, independent of FUSE_HANDLE_KILLPRIV_V2). Parity: the
+/// ipc write path applies the daemon's V2 clearing law using the
+/// session peer's SO_PEERCRED-verified class (uid + CAP_FSETID at
+/// HELLO) as the stand-in for the kernel's per-write
+/// `!capable(CAP_FSETID)`:
+///
+/// - suid clears on a ring write from a kill-class peer;
+/// - sgid-without-group-exec is PRESERVED (the mandatory-locking
+///   marker — same law, same trap);
+/// - an exempt peer (root / CAP_FSETID) clears nothing.
+///
+/// The expected class recomputes from this process's own credentials,
+/// so the test is exact under any runner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ring_write_applies_the_killpriv_clearing_law() {
+    let fx = Fixture::new("killpriv-parity").await;
+    let (suid_ino, suid_fd) = fx.create_file("suid").await;
+    let (marker_ino, marker_fd) = fx.create_file("marker").await;
+
+    // Arm the priv bits through the real SETATTR handler (attr cache
+    // carries them too — the latch must not shortcut a priv'd file).
+    for (ino, mode) in [(suid_ino, 0o4755u32), (marker_ino, 0o2644u32)] {
+        fx.fs
+            .setattr(
+                req(),
+                ino,
+                None,
+                fuse3::SetAttr {
+                    mode: Some(mode),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("chmod");
+    }
+
+    let (suid_session, suid_binding) = ClientSession::establish(&fx, &suid_fd);
+    suid_session.ring_write(suid_binding, 0, b"killpriv parity", "suid ring write");
+
+    let (marker_session, marker_binding) = ClientSession::establish(&fx, &marker_fd);
+    marker_session.ring_write(marker_binding, 0, b"killpriv parity", "marker ring write");
+
+    // SAFETY: plain getuid.
+    let kill_class =
+        squeezefs::ipc_host::peer_kill_priv(unsafe { libc::getuid() }, std::process::id());
+
+    let backend = fx.fs.meta_backend.as_ref().unwrap();
+    let suid_mode = backend.getattr(suid_ino).await.expect("getattr").mode & 0o7777;
+    let marker_mode = backend.getattr(marker_ino).await.expect("getattr").mode & 0o7777;
+
+    if kill_class {
+        assert_eq!(
+            suid_mode, 0o755,
+            "a ring write from a kill-class peer must clear suid (il parity \
+             with the kernel path's FUSE_WRITE_KILL_SUIDGID)"
+        );
+    } else {
+        assert_eq!(
+            suid_mode, 0o4755,
+            "an exempt (root/CAP_FSETID) peer's ring write must clear nothing"
+        );
+    }
+    assert_eq!(
+        marker_mode, 0o2644,
+        "sgid-without-group-exec (mandatory-locking marker) must survive \
+         ring writes in EVERY peer class"
+    );
+    fx.shutdown();
+}

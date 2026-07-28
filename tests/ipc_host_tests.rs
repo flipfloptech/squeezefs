@@ -1409,3 +1409,120 @@ fn stale_socket_file_is_replaced_on_spawn() {
     );
     host.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// killpriv-v2 il parity (the 2026-07-28 campaign): the session's peer
+// privilege class rides every write binding
+// ---------------------------------------------------------------------------
+
+/// The CapEff word parser the peer class rides on: CAP_FSETID is bit 4
+/// (linux/capability.h). A malformed word must classify as
+/// NOT-privileged (the conservative direction: clearing where the
+/// kernel might not is safe; preserving where the kernel would clear is
+/// the security hole).
+#[test]
+fn capeff_fsetid_bit_parsing_is_exact() {
+    use squeezefs::ipc_host::capeff_hex_has_fsetid;
+    assert!(
+        capeff_hex_has_fsetid("000001ffffffffff"),
+        "full root cap set carries CAP_FSETID"
+    );
+    assert!(capeff_hex_has_fsetid(" 0000000000000010 "), "bit 4 exactly");
+    assert!(
+        !capeff_hex_has_fsetid("0000000000000008"),
+        "bit 3 (CAP_FOWNER) is not CAP_FSETID"
+    );
+    assert!(!capeff_hex_has_fsetid("0000000000000000"), "empty cap set");
+    assert!(
+        !capeff_hex_has_fsetid("not-hex"),
+        "malformed CapEff classifies conservative (kill applies)"
+    );
+}
+
+/// The class computation the HELLO path uses: uid 0 is exempt; a
+/// non-root peer is exempt only when its /proc CapEff carries
+/// CAP_FSETID; an unreadable /proc (peer died) classifies kill.
+#[test]
+fn peer_kill_priv_classifies_self_consistently() {
+    use squeezefs::ipc_host::peer_kill_priv;
+    // SAFETY: plain getuid.
+    let uid = unsafe { libc::getuid() };
+    let me = peer_kill_priv(uid, std::process::id());
+    if uid == 0 {
+        assert!(!me, "root sessions are CAP_FSETID-exempt");
+    } else {
+        // An unprivileged test runner has no CAP_FSETID: kill applies.
+        // (A capability-endowed runner legitimately flips this — the
+        // assertion recomputes from the same /proc truth.)
+        let status =
+            std::fs::read_to_string(format!("/proc/{}/status", std::process::id())).unwrap();
+        let capeff = status
+            .lines()
+            .find_map(|l| l.strip_prefix("CapEff:"))
+            .expect("CapEff line");
+        assert_eq!(
+            me,
+            !squeezefs::ipc_host::capeff_hex_has_fsetid(capeff),
+            "peer_kill_priv must be exactly the inverse of the peer's CAP_FSETID"
+        );
+    }
+    // uid 0 is exempt whatever /proc says.
+    assert!(!peer_kill_priv(0, std::process::id()));
+    // A dead pid (unreadable /proc) classifies kill for non-root.
+    assert!(peer_kill_priv(12345, u32::MAX - 1));
+}
+
+/// End-to-end: every WRITE binding carries the session peer's kill
+/// class (`BindingRights::kill_priv`), computed at HELLO from the
+/// SO_PEERCRED-verified identity — the ipc write path's stand-in for
+/// the kernel's per-write `!capable(CAP_FSETID)` check (intercepted
+/// write(2) bypasses the VFS, so `file_remove_privs` never runs there).
+#[test]
+fn write_binding_carries_the_session_peers_kill_priv_class() {
+    use squeezefs::ipc_host::{DataOp, SessionSink, SlotCompletion};
+
+    struct KillPrivRecordingSink {
+        seen: std::sync::Mutex<Option<bool>>,
+    }
+    impl SessionSink for KillPrivRecordingSink {
+        fn serve_data(&self, op: DataOp, completion: SlotCompletion) {
+            *self.seen.lock().expect("recording mutex") = Some(op.binding.kill_priv);
+            completion.complete(i64::from(op.desc.len));
+        }
+    }
+
+    let sink = Arc::new(KillPrivRecordingSink {
+        seen: std::sync::Mutex::new(None),
+    });
+    let cfg = test_config("killpriv-class");
+    let host = IpcHost::spawn(cfg.clone(), sink.clone()).expect("host must spawn");
+    let mf = mount_file();
+    host.set_expected_st_dev(mf.st_dev);
+    let fd = open_flags(&mf.path, libc::O_RDWR);
+    let (sock, session) = establish(&cfg, &host, fd.as_raw_fd());
+    let binding = match bind(&sock, fd.as_raw_fd()) {
+        CtlMsg::BindOk { binding_id, .. } => binding_id,
+        other => panic!("bind must succeed, got {other:?}"),
+    };
+
+    let r = session.submit_wait(&SlotDescriptor {
+        op: OP_WRITE,
+        flags: 0,
+        binding,
+        offset: 0,
+        len: 16,
+        arena_off: 0,
+    });
+    assert_eq!(r, 16, "recording sink completes the write");
+
+    // SAFETY: plain getuid.
+    let expected =
+        squeezefs::ipc_host::peer_kill_priv(unsafe { libc::getuid() }, std::process::id());
+    assert_eq!(
+        sink.seen.lock().expect("recording mutex").take(),
+        Some(expected),
+        "BindingRights::kill_priv must be the session peer's class \
+         (uid + CAP_FSETID at HELLO)"
+    );
+    host.shutdown();
+}

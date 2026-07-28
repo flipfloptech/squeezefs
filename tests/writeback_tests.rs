@@ -392,6 +392,15 @@ async fn test_small_block_map_stays_inline() {
     let read_res_69 = fs.read(req, child_ino, 0, 69 * 4096, 1, 0).await.unwrap();
     assert_eq!(read_res_69.data.as_ref(), &[69]);
 
+    // Rendezvous with the async block reclaimer BEFORE counting (same as
+    // the end-of-test count below): the flush pass's fold of block 1's
+    // parked overlay displaced the chunk the initial 4097-byte write
+    // published, and that terminal free sits in begin_free limbo — counted
+    // as USED by get_used_blocks() — until the background reclaim batch
+    // finish_frees it. Without this drain the count races the batch window
+    // (the "72 vs 71" flake; deterministic here with the parked worker).
+    fs.router.backend_router.reclaim_drain().await;
+
     // Check used blocks count: 71 data blocks, NO indirect-map block.
     let used_blocks = block_alloc.get_used_blocks() - start_blocks;
     assert_eq!(

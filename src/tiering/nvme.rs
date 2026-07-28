@@ -1224,7 +1224,10 @@ impl NvmeCache {
         None
     }
 
-    pub fn get_static(&self, key: &Bytes) -> Option<NvmeCacheReadGuard> {
+    /// `&[u8]`-keyed on purpose (op-economy campaign): the warm serve
+    /// path probes with borrowed key bytes — `Bytes: Borrow<[u8]>` keeps
+    /// the map lookup and shard hash identical, with zero key mint.
+    pub fn get_static(&self, key: &[u8]) -> Option<NvmeCacheReadGuard> {
         let devices = self.devices.read();
         for dev in devices.iter() {
             if dev.online.load(Ordering::Relaxed) {

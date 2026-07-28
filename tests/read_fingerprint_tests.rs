@@ -27,7 +27,7 @@ fn striped_meta(entries: &[(u32, &str)]) -> CachedMetadata {
         m.insert(*b, k.to_string());
     }
     CachedMetadata {
-        file_type: "striped".to_string(),
+        file_type: "striped".into(),
         size: 64 * BS,
         block_map: Some(Arc::new(m)),
         ..Default::default()
@@ -167,9 +167,9 @@ fn multi_block_window_covers_every_block() {
 fn prefix_shape_fingerprints_and_detects_change() {
     let ino = fresh_ino();
     let mk = |prefix: &str| CachedMetadata {
-        file_type: "striped".to_string(),
+        file_type: "striped".into(),
         size: 64 * BS,
-        block_prefix: Some(prefix.to_string()),
+        block_prefix: Some(prefix.into()),
         ..Default::default()
     };
     let a = fp(&mk("pfx-a"), ino, 0, 4096).expect("prefix shape fingerprints");
@@ -186,9 +186,9 @@ fn map_vs_prefix_shape_flip_differs_unless_keys_agree() {
     // key + epoch) is the contract, not the representation.
     let ino = fresh_ino();
     let prefix_meta = CachedMetadata {
-        file_type: "striped".to_string(),
+        file_type: "striped".into(),
         size: 64 * BS,
-        block_prefix: Some("pfx".to_string()),
+        block_prefix: Some("pfx".into()),
         ..Default::default()
     };
     let same_key_map = striped_meta(&[(0, "pfx/part_0")]);
@@ -224,9 +224,9 @@ fn anomalous_map_id_shape_refuses_sync_build() {
     // it cannot see.
     let ino = fresh_ino();
     let meta = CachedMetadata {
-        file_type: "striped".to_string(),
+        file_type: "striped".into(),
         size: 64 * BS,
-        block_map_id: Some("indirect".to_string()),
+        block_map_id: Some("indirect".into()),
         ..Default::default()
     };
     assert!(

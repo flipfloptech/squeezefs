@@ -393,7 +393,38 @@ impl ArenaWindow {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base, n);
         }
     }
+}
 
+/// The §5.5.1 serve-into-arena destination (op-economy campaign): tier
+/// serve legs copy payload bytes straight into the validated window —
+/// no intermediate heap buffer. Same non-exclusivity contract as
+/// [`ArenaWindow::write`]; out-of-bounds spans clamp.
+impl crate::PayloadSink for ArenaWindow {
+    fn write_at(&self, off: usize, bytes: &[u8]) {
+        let Some(room) = self.len.checked_sub(off) else {
+            return;
+        };
+        let n = bytes.len().min(room);
+        // SAFETY: `base + off .. base + off + n` stays inside the window
+        // validated at construction; source is caller-private memory.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(off), n);
+        }
+    }
+
+    fn zero_at(&self, off: usize, len: usize) {
+        let Some(room) = self.len.checked_sub(off) else {
+            return;
+        };
+        let n = len.min(room);
+        // SAFETY: bounds as above.
+        unsafe {
+            std::ptr::write_bytes(self.base.add(off), 0, n);
+        }
+    }
+}
+
+impl ArenaWindow {
     pub fn len(&self) -> usize {
         self.len
     }
@@ -1532,6 +1563,10 @@ impl IpcHost {
         let mut seen_epoch = u64::MAX; // != any real epoch ⇒ first pass collects
         let mut last_progress = Instant::now();
         let spin_window = service_spin_window();
+        // Reused park snapshot (op-economy): the doorbell-snapshot Vec is
+        // cleared+refilled per park, never reallocated — qd1 RTT shapes
+        // park once per op, so per-park allocations are per-op costs.
+        let mut observed: Vec<u32> = Vec::new();
         while !self.shutting_down.load(Ordering::SeqCst) {
             let epoch = self.session_epoch.load(Ordering::Acquire);
             if epoch != seen_epoch {
@@ -1601,10 +1636,12 @@ impl IpcHost {
             for s in &sessions {
                 s.map.header().daemon_parked.store(1, Ordering::SeqCst);
             }
-            let observed: Vec<u32> = sessions
-                .iter()
-                .map(|s| s.map.header().doorbell.load(Ordering::SeqCst))
-                .collect();
+            observed.clear();
+            observed.extend(
+                sessions
+                    .iter()
+                    .map(|s| s.map.header().doorbell.load(Ordering::SeqCst)),
+            );
             let mut rescan_served = 0u32;
             let now = self.now_ms();
             for s in &sessions {
@@ -1624,12 +1661,13 @@ impl IpcHost {
                     std::thread::park_timeout(SERVICE_PARK_MAX);
                 } else {
                     METRICS.ipc_service_parks.fetch_add(1, Ordering::Relaxed);
-                    let waiters: Vec<(&AtomicU32, u32)> = sessions
-                        .iter()
-                        .zip(&observed)
-                        .map(|(s, o)| (&s.map.header().doorbell, *o))
-                        .collect();
-                    futex_wait_many(&waiters, SERVICE_PARK_MAX);
+                    futex_wait_many(
+                        sessions
+                            .iter()
+                            .zip(&observed)
+                            .map(|(s, o)| (&s.map.header().doorbell, *o)),
+                        SERVICE_PARK_MAX,
+                    );
                 }
             } else {
                 last_progress = Instant::now();
@@ -2096,6 +2134,7 @@ fn futex_wait(word: &AtomicU32, expected: u32, timeout: Duration) {
 /// `futex_waitv(2)` wait-multiple entry (Linux ≥ 5.16). Mirrors
 /// `include/uapi/linux/futex.h` — 32 bytes, `val`/`uaddr` as u64.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct FutexWaitv {
     val: u64,
     uaddr: u64,
@@ -2115,27 +2154,49 @@ const FUTEX_WAITV_MAX: usize = 128;
 /// waited on — the `timeout` bound still caps their latency (§5.3.1 rule
 /// 5). Kernels without `futex_waitv` (ENOSYS) fall back to the
 /// first-word single wait — the pre-fix posture, same bound.
-fn futex_wait_many(waiters: &[(&AtomicU32, u32)], timeout: Duration) {
-    debug_assert!(!waiters.is_empty());
-    if waiters.len() == 1 {
-        futex_wait(waiters[0].0, waiters[0].1, timeout);
+///
+/// Iterator-fed + stack waiter array (op-economy campaign): the park
+/// path is allocation-free — the former per-park `Vec` pair (caller
+/// waiter list + this array) was measurable allocator traffic at qd1
+/// RTT rates (one park cycle per op).
+fn futex_wait_many<'a>(waiters: impl Iterator<Item = (&'a AtomicU32, u32)>, timeout: Duration) {
+    let mut arr = [FutexWaitv {
+        val: 0,
+        uaddr: 0,
+        flags: FUTEX2_SIZE_U32,
+        __reserved: 0,
+    }; FUTEX_WAITV_MAX];
+    let mut first: Option<(&AtomicU32, u32)> = None;
+    let mut n = 0usize;
+    for (word, expected) in waiters {
+        if first.is_none() {
+            first = Some((word, expected));
+        }
+        if n == FUTEX_WAITV_MAX {
+            break;
+        }
+        arr[n] = FutexWaitv {
+            val: u64::from(expected),
+            uaddr: word.as_ptr() as u64,
+            flags: FUTEX2_SIZE_U32,
+            __reserved: 0,
+        };
+        n += 1;
+    }
+    let Some((first_word, first_expected)) = first else {
+        debug_assert!(false, "futex_wait_many with no waiters");
+        return;
+    };
+    if n == 1 {
+        futex_wait(first_word, first_expected, timeout);
         return;
     }
     static WAITV_SUPPORTED: AtomicBool = AtomicBool::new(true);
     if !WAITV_SUPPORTED.load(Ordering::Relaxed) {
-        futex_wait(waiters[0].0, waiters[0].1, timeout);
+        futex_wait(first_word, first_expected, timeout);
         return;
     }
-    let vec: Vec<FutexWaitv> = waiters
-        .iter()
-        .take(FUTEX_WAITV_MAX)
-        .map(|(word, expected)| FutexWaitv {
-            val: u64::from(*expected),
-            uaddr: word.as_ptr() as u64,
-            flags: FUTEX2_SIZE_U32,
-            __reserved: 0,
-        })
-        .collect();
+    let vec = &arr[..n];
     // futex_waitv takes an ABSOLUTE timeout (CLOCK_MONOTONIC).
     // SAFETY: clock_gettime into a zeroed timespec.
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
@@ -2168,7 +2229,7 @@ fn futex_wait_many(waiters: &[(&AtomicU32, u32)], timeout: Duration) {
         if errno == libc::ENOSYS {
             // Pre-5.16 kernel: remember, degrade to the single wait.
             WAITV_SUPPORTED.store(false, Ordering::Relaxed);
-            futex_wait(waiters[0].0, waiters[0].1, timeout);
+            futex_wait(first_word, first_expected, timeout);
         }
     }
 }

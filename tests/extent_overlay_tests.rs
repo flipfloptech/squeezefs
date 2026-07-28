@@ -799,11 +799,11 @@ async fn fold_seeds_decorated_promoted_mapping() {
         bm.iter().map(|(k, v)| (*k, v.clone())).collect();
     new_map.insert(1, decorated.clone());
     let layout = squeezefs::routing::LayoutMetadata {
-        file_type: m.file_type.clone(),
+        file_type: m.file_type.to_string(),
         size: m.size,
         block_map_id: Some(format!("block_map_{ino}")),
         block_prefix: None,
-        file_id: m.file_id.clone(),
+        file_id: m.file_id.as_deref().map(str::to_string),
         data_key: m.data_key.as_ref().map(|b| b.to_vec()),
         block_map: Some(new_map),
     };

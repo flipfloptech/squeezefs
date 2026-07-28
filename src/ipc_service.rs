@@ -353,14 +353,17 @@ impl DataPlaneSink {
         let lock = self.fs.get_inode_lock_ref(ino);
         match lock.try_read() {
             Ok(guard) => {
-                let probe = self
-                    .fs
-                    .ipc_read_probe_locked(ino, op.desc.offset, op.desc.len);
+                let probe =
+                    self.fs
+                        .ipc_read_probe_locked(ino, op.desc.offset, op.desc.len, &op.payload);
                 // Drop-guard-before-enqueue (§5.5.1, load-bearing): the
                 // guard must be gone before ANY continuation — the Miss
                 // handoff re-acquires this lock behind possibly-queued
                 // writers, and even the sync completions have no business
-                // extending the critical section past the probe.
+                // extending the critical section past the probe. (A
+                // `Served` probe already copied its payload into the
+                // arena under the guard — exactly the memcpy the tier leg
+                // used to spend on the intermediate buffer there.)
                 drop(guard);
                 match probe {
                     IpcReadProbe::Eof => {
@@ -376,6 +379,15 @@ impl DataPlaneSink {
                             .ipc_bytes_out
                             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                         completion.complete(bytes.len() as i64);
+                    }
+                    IpcReadProbe::Served(n) => {
+                        // Tier leg already wrote the payload into the
+                        // arena window (op-economy: zero intermediate
+                        // alloc/copy).
+                        METRICS.ipc_fast_path_serves.fetch_add(1, Ordering::Relaxed);
+                        METRICS.ipc_ops_read.fetch_add(1, Ordering::Relaxed);
+                        METRICS.ipc_bytes_out.fetch_add(n as u64, Ordering::Relaxed);
+                        completion.complete(n as i64);
                     }
                     IpcReadProbe::Miss => {
                         // DIALED P1.5 (2026-07-27): a governed O_DIRECT

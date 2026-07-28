@@ -121,11 +121,21 @@ pub struct LayoutMetadata {
 
 #[derive(Clone, Debug)]
 pub struct CachedMetadata {
-    pub file_type: String,
+    /// Layout class (`inline`/`staged`/`striped`) — [`CompactString`]
+    /// (op-economy campaign): every value inlines (≤ 24 B), so the
+    /// per-op moka-get clone of this struct stops allocating (`String`
+    /// here was a convicted warm-path allocation site).
+    ///
+    /// [`CompactString`]: compact_str::CompactString
+    pub file_type: compact_str::CompactString,
     pub size: u64,
-    pub block_map_id: Option<String>,
-    pub block_prefix: Option<String>,
-    pub file_id: Option<String>,
+    /// `Arc<str>` (op-economy): clone = refcount bump, never a heap copy
+    /// — this struct is handed out BY VALUE on every read.
+    pub block_map_id: Option<std::sync::Arc<str>>,
+    /// `Arc<str>` — see `block_map_id`.
+    pub block_prefix: Option<std::sync::Arc<str>>,
+    /// `Arc<str>` — see `block_map_id`.
+    pub file_id: Option<std::sync::Arc<str>>,
     pub cached_at: std::time::Instant,
     /// Inline payload held zero-copy: `Bytes` clones are O(1) refcount bumps, so
     /// hot-path `metadata_cache` gets / `meta.clone()` don't deep-copy the file.
@@ -157,7 +167,7 @@ pub fn metadata_entry_fresh_or_dirty(entry: &CachedMetadata) -> bool {
 impl Default for CachedMetadata {
     fn default() -> Self {
         Self {
-            file_type: "inline".to_string(),
+            file_type: "inline".into(),
             size: 0,
             block_map_id: None,
             block_prefix: None,
@@ -2758,11 +2768,11 @@ impl DataRouter {
                         }
                     }
                     return Ok(Some(CachedMetadata {
-                        file_type: layout.file_type,
+                        file_type: layout.file_type.into(),
                         size: layout.size,
-                        block_map_id: layout.block_map_id,
-                        block_prefix: layout.block_prefix,
-                        file_id: layout.file_id,
+                        block_map_id: layout.block_map_id.map(Into::into),
+                        block_prefix: layout.block_prefix.map(Into::into),
+                        file_id: layout.file_id.map(Into::into),
                         cached_at: std::time::Instant::now(),
                         data_key: layout.data_key.map(bytes::Bytes::from),
                         block_map: block_map.map(std::sync::Arc::new),
@@ -2798,11 +2808,11 @@ impl DataRouter {
         // the inline sentinel). The indirect branch below overwrites the map /
         // id only if the serialized value spills past the per-volume cap.
         let mut layout = LayoutMetadata {
-            file_type: m.file_type.clone(),
+            file_type: m.file_type.to_string(),
             size: m.size,
             block_map_id: m.block_map.as_ref().map(|_| format!("block_map_{}", ino)),
-            block_prefix: m.block_prefix.clone(),
-            file_id: m.file_id.clone(),
+            block_prefix: m.block_prefix.as_deref().map(str::to_string),
+            file_id: m.file_id.as_deref().map(str::to_string),
             data_key: m.data_key.as_ref().map(|b| b.to_vec()),
             block_map: m.block_map.as_deref().cloned(),
         };
@@ -2936,7 +2946,7 @@ impl DataRouter {
         // leaked blob incarnation per merge; ~130 orphans per 700-block
         // spill burst measured). Sequential inline uploads masked it —
         // the pipeline's size-bump/merge interleaving exposed it.
-        cached.block_map_id = layout.block_map_id.clone();
+        cached.block_map_id = layout.block_map_id.clone().map(Into::into);
         cached.cached_at = std::time::Instant::now();
         self.metadata_cache.insert(ino, cached);
 
@@ -4531,7 +4541,7 @@ impl DataRouter {
 
         // If not found, return a default inline metadata (e.g. newly created file)
         let m = CachedMetadata {
-            file_type: "inline".to_string(),
+            file_type: "inline".into(),
             size: 0,
             block_map_id: None,
             block_prefix: None,
@@ -5110,10 +5120,10 @@ impl DataRouter {
 
         match layout_flip {
             LayoutFlip::ToStripedKeepStagedIdentity => {
-                current.file_type = "striped".to_string();
+                current.file_type = "striped".into();
             }
             LayoutFlip::ToStripedClearStagedIdentity => {
-                current.file_type = "striped".to_string();
+                current.file_type = "striped".into();
                 current.file_id = None;
                 current.data_key = None;
             }
@@ -5189,13 +5199,20 @@ impl DataRouter {
     /// authoritative size (the fast path's guarded size check), and the
     /// per-inode read guard held (mutators excluded — the same currency
     /// the handler's serve legs rely on).
+    /// Sync tier serve **into the caller's sink** (the §5.5.1 warm fast
+    /// path; op-economy campaign 2026-07-28): payload bytes land directly
+    /// in the ring op's arena window — the former intermediate
+    /// `Bytes::copy_from_slice` bounce (one alloc + one memcpy per warm
+    /// op) is deleted. Returns the served byte count (short serves are
+    /// the handler's own semantics); `None` = not sync-servable, demote.
     pub fn try_read_range_sync(
         &self,
         file_path: &str,
         meta: &CachedMetadata,
         offset: u64,
         read_len: usize,
-    ) -> Option<bytes::Bytes> {
+        out: &dyn crate::PayloadSink,
+    ) -> Option<usize> {
         if read_len == 0 {
             return None;
         }
@@ -5206,22 +5223,20 @@ impl DataRouter {
         // overlay demotes to the handler's compose leg.
         if meta.file_type == "staged" {
             let file_id = meta.file_id.as_ref()?;
-            let guard = self.cache.nvme.read_staged_zero_copy(file_id)?;
-            if !self
-                .staged_extent_runs_in(file_path, 0, offset as usize, offset as usize + read_len)
-                .is_empty()
-            {
+            if self.has_staged_extent_runs(file_path, 0) {
                 return None;
             }
+            let guard = self.cache.nvme.read_staged_zero_copy(file_id)?;
             let start = (offset as usize).min(guard.len);
             let end = (offset as usize + read_len).min(guard.len);
             METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-            if end - start == read_len {
-                return Some(bytes::Bytes::copy_from_slice(&guard[start..end]));
+            out.write_at(0, &guard[start..end]);
+            if end - start < read_len {
+                // Truncate-up hole tail: zero-pad to the full length,
+                // exactly as the handler's staged serve would.
+                out.zero_at(end - start, read_len - (end - start));
             }
-            let mut out = vec![0u8; read_len];
-            out[..end - start].copy_from_slice(&guard[start..end]);
-            return Some(bytes::Bytes::from(out));
+            return Some(read_len);
         }
         if meta.file_type != "striped" {
             return None;
@@ -5239,10 +5254,7 @@ impl DataRouter {
 
         // W2 overlay present ⇒ the compose leg (async) owns this read
         // ("overlay never invisible" — one latch-free probe otherwise).
-        if !self
-            .staged_extent_runs_in(file_path, start_block, rel_s, rel_e)
-            .is_empty()
-        {
+        if self.has_staged_extent_runs(file_path, start_block) {
             return None;
         }
 
@@ -5250,11 +5262,24 @@ impl DataRouter {
         // handler's "check active block staging first" leg (short serves
         // included: a shorter staged image returns short, exactly as the
         // handler would).
-        let cache_key = crate::keys::active_block_for_path(file_path, start_block).to_string();
-        if let Some(guard) = self.cache.nvme.read_staged_zero_copy(&cache_key) {
+        let cache_key = crate::keys::StackKey::format(format_args!(
+            "active_block:{file_path}:block_{start_block}"
+        ));
+        let heap_key;
+        let cache_key: &str = match &cache_key {
+            Some(k) => k,
+            None => {
+                // Pathological path length (never an `inode_N` form):
+                // heap fallback — a truncated key would serve wrong data.
+                heap_key = crate::keys::active_block_for_path(file_path, start_block);
+                &heap_key
+            }
+        };
+        if let Some(guard) = self.cache.nvme.read_staged_zero_copy(cache_key) {
             let start = rel_s.min(guard.len);
             let end = rel_e.min(guard.len);
-            return Some(bytes::Bytes::copy_from_slice(&guard[start..end]));
+            out.write_at(0, &guard[start..end]);
+            return Some(end - start);
         }
 
         // Leg 2: the R4 hot tier. Skipped wholesale under the
@@ -5264,8 +5289,9 @@ impl DataRouter {
         if self.direct_device_true() {
             return None;
         }
-        let b_key = if let Some(map) = &meta.block_map {
-            map.get(&start_block).cloned()?
+        let part_key;
+        let b_key: &str = if let Some(map) = &meta.block_map {
+            map.get(&start_block)?
         } else if meta.block_map_id.is_some() {
             // Map-id without an inline map (anomalous — see
             // `load_striped_block_keys`): this sync leg cannot re-resolve
@@ -5273,15 +5299,23 @@ impl DataRouter {
             // never fabricate a miss/hole.
             return None;
         } else {
-            format!("{}/part_{}", meta.block_prefix.as_ref()?, start_block)
+            let prefix = meta.block_prefix.as_ref()?;
+            match crate::keys::StackKey::format(format_args!("{prefix}/part_{start_block}")) {
+                Some(k) => {
+                    part_key = k;
+                    &part_key
+                }
+                None => return None, // pathological prefix length: demote
+            }
         };
         // `get_serving`: real reader serve — credit the user bytes as
         // admission payback (the governor's earned-vs-waste basis).
-        if let Some(hot) = self.cache.hot_block.get_serving(&b_key, read_len as u64) {
+        if let Some(hot) = self.cache.hot_block.get_serving(b_key, read_len as u64) {
             let start = rel_s.min(hot.len());
             let end = rel_e.min(hot.len());
             METRICS.hot_block_hits.fetch_add(1, Ordering::Relaxed);
-            return Some(hot.slice(start..end));
+            out.write_at(0, &hot[start..end]);
+            return Some(end - start);
         }
 
         // Leg 3: the NVMe read-cache shard (sync mmap — the handler's
@@ -5292,12 +5326,13 @@ impl DataRouter {
         // update that map synchronously under the inode lock the caller
         // holds. Same currency class, no await.
         let guard = self.cache.nvme.get_cached_read_block_range_zero_copy(
-            &b_key,
+            b_key,
             rel_s as u64,
             read_len as u32,
         )?;
         METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
-        Some(bytes::Bytes::copy_from_slice(&guard))
+        out.write_at(0, &guard);
+        Some(guard.len)
     }
 
     pub async fn load_striped_block_keys(
@@ -5816,7 +5851,7 @@ impl DataRouter {
                 let _meta_guard = meta_lock_acquire(ino).await;
                 let fresh = self.metadata_cache.get(&ino);
                 let mut updated_meta = meta.clone();
-                updated_meta.file_type = "striped".to_string();
+                updated_meta.file_type = "striped".into();
                 updated_meta.size = new_size as u64;
                 updated_meta.block_map = Some(std::sync::Arc::new(block_map));
                 updated_meta.file_id = None;
@@ -5885,7 +5920,7 @@ impl DataRouter {
             let _meta_guard = meta_lock_acquire(ino).await;
             let fresh = self.metadata_cache.get(&ino);
             let mut updated_meta = meta.clone();
-            updated_meta.file_type = "inline".to_string();
+            updated_meta.file_type = "inline".into();
             updated_meta.size = new_size as u64;
             // Zero-copy store: `shared_data` is `Bytes`; clone is a refcount bump,
             // not a payload copy (was `shared_data.to_vec()` = full memcpy per write).
@@ -5919,7 +5954,7 @@ impl DataRouter {
             let new_file_id = meta
                 .file_id
                 .clone()
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
+                .unwrap_or_else(|| Uuid::new_v4().to_string().into());
 
             let stage_res = self
                 .cache
@@ -5954,7 +5989,7 @@ impl DataRouter {
                     // we release.
                     let ring_resident = self.cache.nvme.staged_len(&new_file_id).is_some();
                     let mut updated_meta = meta.clone();
-                    updated_meta.file_type = "staged".to_string();
+                    updated_meta.file_type = "staged".into();
                     updated_meta.size = new_size as u64;
                     updated_meta.file_id = Some(new_file_id);
                     updated_meta.data_key = None;
@@ -6072,9 +6107,9 @@ impl DataRouter {
                     let _meta_guard = meta_lock_acquire(ino).await;
                     let fresh = self.metadata_cache.get(&ino);
                     let mut updated_meta = meta.clone();
-                    updated_meta.file_type = "staged".to_string();
+                    updated_meta.file_type = "staged".into();
                     updated_meta.size = new_size as u64;
-                    updated_meta.file_id = Some(spill_file_id);
+                    updated_meta.file_id = Some(spill_file_id.into());
                     updated_meta.data_key = None;
                     updated_meta.block_map = Some(std::sync::Arc::new(block_map));
                     // Durable backend write already happened — commit layout now.
@@ -6671,7 +6706,7 @@ impl DataRouter {
                         let fresh = self.freshest_layout_identity(file_path).await;
                         let still_bound = fresh.as_ref().is_some_and(|f| {
                             f.file_type == "staged"
-                                && f.file_id.as_deref() == Some(file_id.as_str())
+                                && f.file_id.as_deref() == Some(&file_id[..])
                                 && f.block_map
                                     .as_ref()
                                     .and_then(|bm| bm.get(&0))
@@ -6723,7 +6758,7 @@ impl DataRouter {
                     // No mapping either: re-resolve the identity.
                     if let Some(fresh) = self.freshest_layout_identity(file_path).await {
                         if fresh.file_type != "staged"
-                            || fresh.file_id.as_deref() != Some(file_id.as_str())
+                            || fresh.file_id.as_deref() != Some(&file_id[..])
                         {
                             // The identity MOVED (layout flip, spill re-id,
                             // re-created file): re-dispatch against it.
@@ -7811,9 +7846,9 @@ impl DataRouter {
                 let mut block_map = std::collections::HashMap::new();
                 block_map.insert(0, stored_block_key.clone());
                 let mut updated_meta = meta.clone();
-                updated_meta.file_type = "staged".to_string();
+                updated_meta.file_type = "staged".into();
                 updated_meta.size = updated_meta.size.max(img_len);
-                updated_meta.file_id = Some(spill_file_id);
+                updated_meta.file_id = Some(spill_file_id.into());
                 updated_meta.data_key = None;
                 updated_meta.block_map = Some(std::sync::Arc::new(block_map));
                 updated_meta.layout_dirty = false;
@@ -7909,6 +7944,25 @@ impl DataRouter {
     /// occupancy probe when no record exists (R6: the empty-map cost is
     /// today's miss); bad records never compose (the recovery sweep and
     /// the checkout absorb dispose of them loudly).
+    /// Zero-alloc W2 overlay **existence** gate for the sync serve legs
+    /// (op-economy campaign): does ANY staged extent record exist for
+    /// `(file_path, b)`? Conservative on purpose — presence demotes to
+    /// the async handler's compose leg regardless of range overlap
+    /// ("overlay never invisible"; a record-bearing block is not a warm
+    /// clean block, so the demotion costs nothing on the warm path).
+    /// One latch-free occupancy-index probe, stack-formatted key.
+    pub(crate) fn has_staged_extent_runs(&self, file_path: &str, b: u32) -> bool {
+        match crate::keys::StackKey::format(format_args!("active_block_ext:{file_path}:block_{b}"))
+        {
+            Some(key) => self.cache.nvme.has_staged_extent_record(&key),
+            None => {
+                // Pathological path length: heap key, same probe.
+                let key = crate::keys::active_block_ext_for_path(file_path, b);
+                self.cache.nvme.has_staged_extent_record(&key)
+            }
+        }
+    }
+
     pub(crate) fn staged_extent_runs_in(
         &self,
         file_path: &str,
@@ -8055,7 +8109,7 @@ impl DataRouter {
                     Err(e) => return Err(e),
                 }
             }
-            updated_meta.file_id = Some(new_file_id);
+            updated_meta.file_id = Some(new_file_id.into());
         } else if meta.file_type == "striped" {
             // All-or-nothing pin of every source block, VALIDATED (§5.1
             // clone/patch fence, design-random-small-writes). Two ways a
@@ -8550,7 +8604,11 @@ impl DataRouter {
         if meta.file_type == "staged" {
             if let Some(ref file_id) = meta.file_id {
                 // Blocking-pool hop: shard WRITE lock (invariant rule 2).
-                let _ = self.cache.nvme.remove_staged_async(file_id.clone()).await;
+                let _ = self
+                    .cache
+                    .nvme
+                    .remove_staged_async(file_id.to_string())
+                    .await;
             }
         }
 

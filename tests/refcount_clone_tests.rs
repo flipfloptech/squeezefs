@@ -106,7 +106,7 @@ async fn mk_ino(routed: &squeezefs::meta_backend::RoutedMetaBackend, name: &str)
 
 fn striped_meta(block_map: &[(u32, String)], size: u64, dirty: bool) -> CachedMetadata {
     CachedMetadata {
-        file_type: "striped".to_string(),
+        file_type: "striped".into(),
         size,
         block_map: Some(std::sync::Arc::new(block_map.iter().cloned().collect())),
         layout_dirty: dirty,

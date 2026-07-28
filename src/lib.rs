@@ -169,6 +169,20 @@ impl std::fmt::Display for FsKey {
     }
 }
 
+/// Destination for sync-serve payload bytes (the 2026-07-28 op-economy
+/// campaign): the §5.5.1 tier serve legs write straight into the ring
+/// op's arena window instead of bouncing through an intermediate
+/// heap-allocated buffer (one alloc + one memcpy per warm op, deleted).
+/// Implementors tolerate concurrent client writes to the destination
+/// (the ipc arena is client-writable shared memory — §5.3.1).
+pub trait PayloadSink {
+    /// Copy `bytes` to `off` within the sink (clamped to the sink's
+    /// bounds by the implementor).
+    fn write_at(&self, off: usize, bytes: &[u8]);
+    /// Zero `len` bytes at `off` (hole/short-tail composition).
+    fn zero_at(&self, off: usize, len: usize);
+}
+
 pub fn build_fs_key(suffix: &str) -> FsKey {
     let prefix = fs_prefix();
     let mut s = compact_str::CompactString::with_capacity(prefix.len() + 1 + suffix.len());
@@ -203,6 +217,72 @@ pub mod keys {
     use super::FsKey;
     use compact_str::CompactString;
     use std::fmt::Write;
+
+    /// Fixed-capacity **stack** key: zero-heap formatting for the sync
+    /// serve prelude (the 2026-07-28 op-economy campaign — every heap key
+    /// on the warm §5.5.1 fast path was a convicted allocation site).
+    /// Capacity covers every `active_block[_ext]:inode_{u64}:block_{u64}`
+    /// form with headroom; [`StackKey::format`] returns `None` on
+    /// overflow so pathological inputs fall back to the heap helpers
+    /// instead of truncating (a truncated key would serve wrong data).
+    pub struct StackKey {
+        buf: [u8; 192],
+        len: usize,
+    }
+
+    impl StackKey {
+        /// Format `args` into a stack key; `None` = capacity overflow
+        /// (caller falls back to the heap form — never truncates).
+        #[inline]
+        pub fn format(args: std::fmt::Arguments<'_>) -> Option<Self> {
+            let mut k = StackKey {
+                buf: [0; 192],
+                len: 0,
+            };
+            struct W<'a>(&'a mut StackKey);
+            impl Write for W<'_> {
+                fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                    let end = self.0.len.checked_add(s.len()).ok_or(std::fmt::Error)?;
+                    if end > self.0.buf.len() {
+                        return Err(std::fmt::Error);
+                    }
+                    self.0.buf[self.0.len..end].copy_from_slice(s.as_bytes());
+                    self.0.len = end;
+                    Ok(())
+                }
+            }
+            let mut w = W(&mut k);
+            w.write_fmt(args).ok()?;
+            Some(k)
+        }
+
+        #[inline]
+        pub fn as_str(&self) -> &str {
+            // SAFETY-free: only whole `&str`s were copied in, at valid
+            // boundaries (write_str appends complete UTF-8 slices).
+            std::str::from_utf8(&self.buf[..self.len]).expect("StackKey holds concatenated strs")
+        }
+    }
+
+    impl std::ops::Deref for StackKey {
+        type Target = str;
+        fn deref(&self) -> &str {
+            self.as_str()
+        }
+    }
+
+    /// Zero-heap `inode_{ino}` (fits always: 6 + ≤ 20 chars).
+    #[inline]
+    pub fn inode_path_stack(ino: u64) -> StackKey {
+        StackKey::format(format_args!("inode_{ino}")).expect("inode path fits StackKey capacity")
+    }
+
+    /// Zero-heap `active_block:inode_{ino}:block_{block}` (fits always).
+    #[inline]
+    pub fn active_block_stack(ino: u64, block: u64) -> StackKey {
+        StackKey::format(format_args!("active_block:inode_{ino}:block_{block}"))
+            .expect("active_block key fits StackKey capacity")
+    }
 
     /// Logical file path used as the in-process cache / layout identity: `inode_{ino}`.
     ///

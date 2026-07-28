@@ -150,7 +150,7 @@ fn bench_metadata_clone(c: &mut Criterion) {
     let mut group = c.benchmark_group("metadata_clone");
 
     let inline_4k = squeezefs::routing::CachedMetadata {
-        file_type: "inline".to_string(),
+        file_type: "inline".into(),
         size: 4096,
         data_key: Some(bytes::Bytes::from(vec![0xABu8; 4096])),
         ..Default::default()

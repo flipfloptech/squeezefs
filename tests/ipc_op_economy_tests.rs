@@ -488,12 +488,7 @@ fn deterministic_bytes(len: usize, seed: u64) -> Vec<u8> {
 /// Drive `ops` warm 4 KiB ring reads on slot 0 and return
 /// `(alloc delta, fast-path serve delta)`. The caller must have warmed
 /// the shape (attr cache + sync-servable tier) already.
-fn measure_warm_window(
-    session: &ClientSession,
-    binding: u64,
-    offset: u64,
-    ops: u64,
-) -> (u64, u64) {
+fn measure_warm_window(session: &ClientSession, binding: u64, offset: u64, ops: u64) -> (u64, u64) {
     let serves0 = METRICS.ipc_fast_path_serves.load(Ordering::Relaxed);
     let allocs0 = allocs_now();
     for _ in 0..ops {

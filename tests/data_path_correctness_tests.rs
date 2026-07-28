@@ -1435,7 +1435,7 @@ fn striped_map_meta(n: usize, block_size: u64) -> CachedMetadata {
         bm.insert(i, (i as u64 * block_size).to_string());
     }
     CachedMetadata {
-        file_type: "striped".to_string(),
+        file_type: "striped".into(),
         size: n as u64 * block_size,
         block_map: Some(std::sync::Arc::new(bm)),
         layout_dirty: true,
@@ -1574,7 +1574,7 @@ async fn test_v3_spill_boundary_roundtrips_both_directions() {
 
     // (d) shrink back under the cap → re-inlines (indirect mechanism unchanged).
     let mut shrunk = striped_map_meta(80, K8_BLOCK_SIZE);
-    shrunk.block_map_id = grown.block_map_id.clone(); // let save free the old indirect block
+    shrunk.block_map_id = grown.block_map_id.clone().map(|s| s.to_string().into()); // let save free the old indirect block
     router.metadata_cache.insert(ino, shrunk);
     persist_under_lease(&router, &dlm, &path).await;
     assert!(

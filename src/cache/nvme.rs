@@ -470,6 +470,22 @@ impl StagedMetadata {
         buf
     }
 
+    /// Zero-alloc header peek (op-economy campaign): `original_size`
+    /// with EXACTLY `deserialize`'s validation (length arithmetic + the
+    /// path UTF-8 check) and none of its `file_path` String.
+    pub fn peek_original_size(bytes: &[u8]) -> Option<u64> {
+        if bytes.len() < 20 {
+            return None;
+        }
+        let original_size = u64::from_be_bytes(bytes[8..16].try_into().ok()?);
+        let path_len = u32::from_be_bytes(bytes[16..20].try_into().ok()?) as usize;
+        if bytes.len() < 20 + path_len {
+            return None;
+        }
+        std::str::from_utf8(&bytes[20..20 + path_len]).ok()?;
+        Some(original_size)
+    }
+
     pub fn deserialize(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 20 {
             return None;
@@ -1828,22 +1844,26 @@ impl NvmeStaging {
         &self,
         file_id: &str,
     ) -> Option<crate::tiering::nvme::NvmeCacheReadGuard> {
-        let key_bytes = Bytes::copy_from_slice(file_id.as_bytes());
-        let mut guard = self.staging_nvme_cache.get_static(&key_bytes)?;
+        let mut guard = self.staging_nvme_cache.get_static(file_id.as_bytes())?;
         let bytes = &guard.guard.mmap[guard.offset..guard.offset + guard.len];
         if bytes.len() >= 8 {
             let meta_len = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
             if bytes.len() >= 8 + meta_len {
-                if let Some(meta) = StagedMetadata::deserialize(&bytes[8..8 + meta_len]) {
+                // Zero-alloc header peek (op-economy campaign): this leg
+                // only needs `original_size` — same field/UTF-8
+                // validation as `deserialize`, no `file_path` String.
+                if let Some(original_size) =
+                    StagedMetadata::peek_original_size(&bytes[8..8 + meta_len])
+                {
                     let data_start = if key_is_block_family(file_id) {
                         4096
                     } else {
                         8 + meta_len
                     };
-                    let data_end = data_start + meta.original_size as usize;
+                    let data_end = data_start + original_size as usize;
                     if bytes.len() >= data_end {
                         guard.offset += data_start;
-                        guard.len = meta.original_size as usize;
+                        guard.len = original_size as usize;
                         return Some(guard);
                     }
                 }
@@ -2102,8 +2122,7 @@ impl NvmeStaging {
         offset: u64,
         size: u32,
     ) -> Option<crate::tiering::nvme::NvmeCacheReadGuard> {
-        let key_bytes = Bytes::copy_from_slice(block_key.as_bytes());
-        let mut guard = self.read_nvme_cache.get_static(&key_bytes)?;
+        let mut guard = self.read_nvme_cache.get_static(block_key.as_bytes())?;
         let start = guard.offset + offset as usize;
         if start >= guard.offset + guard.len {
             guard.offset += guard.len;

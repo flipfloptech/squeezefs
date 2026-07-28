@@ -528,7 +528,7 @@ async fn test_spill_roundtrip_preserves_prefixed_keys_and_versioned_header() {
     router.metadata_cache.insert(
         ino,
         CachedMetadata {
-            file_type: "striped".to_string(),
+            file_type: "striped".into(),
             size: (SPILL_BLOCKS * BLOCK) as u64,
             block_map: Some(std::sync::Arc::new(map.clone())),
             layout_dirty: true,
@@ -843,7 +843,7 @@ async fn fetch_with_planted_blob(
     router.backend_router.default_allocator.publish_block(off);
 
     let layout = LayoutMetadata {
-        file_type: "striped".to_string(),
+        file_type: "striped".into(),
         size: 2 * BLOCK as u64,
         block_map_id: Some(format!("indirect:{off}")),
         block_prefix: None,

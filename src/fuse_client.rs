@@ -1027,7 +1027,7 @@ impl ReadCustodyFp {
             None
         } else {
             meta.block_prefix.as_ref().map(|p| ReadCustodyFp::Prefix {
-                prefix: p.clone(),
+                prefix: p.to_string(),
                 start,
                 epochs,
             })
@@ -3203,8 +3203,16 @@ pub enum IpcReadProbe {
     /// `offset ≥ size` under the guarded size authority: complete 0 bytes.
     Eof,
     /// Sync-servable bytes (active-buffer covered hit) — a CoW-stable
-    /// snapshot slice, immutable for the completion's lifetime.
+    /// snapshot slice, immutable for the completion's lifetime. The
+    /// caller copies it out AFTER the inode guard drops (the snapshot is
+    /// guard-independent; keeping the copy outside minimizes the
+    /// critical section).
     Hit(bytes::Bytes),
+    /// The tier legs (staging mmap / R4 hot / NVMe read cache) served
+    /// `n` bytes directly into the caller's [`crate::PayloadSink`]
+    /// (op-economy campaign: no intermediate heap buffer). Short serves
+    /// are the handler's own semantics.
+    Served(usize),
     /// Any shape needing async work: demote (release the guard, then
     /// enqueue the handoff — never the reverse order).
     Miss,
@@ -5582,7 +5590,13 @@ impl SqueezefsFilesystem {
         true
     }
 
-    pub fn ipc_read_probe_locked(&self, ino: u64, offset: u64, size: u32) -> IpcReadProbe {
+    pub fn ipc_read_probe_locked(
+        &self,
+        ino: u64,
+        offset: u64,
+        size: u32,
+        out: &dyn crate::PayloadSink,
+    ) -> IpcReadProbe {
         // Attr-cache size — a miss would need the handler's async
         // `backend.getattr` fallback, unreachable from a sync service
         // thread: demote (§5.5.1 normative rule).
@@ -5593,7 +5607,10 @@ impl SqueezefsFilesystem {
         // Size coherency override (same rationale as the handler): the
         // router metadata cache is updated synchronously by the write
         // path; the durable attr caches can lag a just-committed write.
-        if let Some(m) = self.router.metadata_cache.get(&ino) {
+        // ONE get (op-economy campaign): the clone is reused by the tier
+        // legs below — the former second get was one more per-op clone.
+        let meta = self.router.metadata_cache.get(&ino);
+        if let Some(m) = &meta {
             file_size = m.size;
         }
         if offset >= file_size {
@@ -5607,18 +5624,20 @@ impl SqueezefsFilesystem {
             // Multi-block reads flush dirty active blocks first (async).
             return IpcReadProbe::Miss;
         }
-        let cache_key = crate::keys::active_block(ino, start_block).to_string();
-        let Some(buf) = self.active_block_buffers.get(&cache_key) else {
+        let cache_key = crate::keys::active_block_stack(ino, start_block);
+        let Some(buf) = self.active_block_buffers.get(cache_key.as_str()) else {
             // No active buffer: try the SYNC tier serves (staging mmap
             // ring, R4 hot tier — L4-8, the §5.5.1 tier→arena engine);
-            // anything they decline demotes to the handoff.
-            if let Some(m) = self.router.metadata_cache.get(&ino) {
-                let file_path = crate::keys::inode_path(ino);
-                if let Some(bytes) = self
+            // anything they decline demotes to the handoff. Served
+            // payloads land directly in the caller's sink (the arena
+            // window) — no intermediate heap buffer.
+            if let Some(m) = &meta {
+                let file_path = crate::keys::inode_path_stack(ino);
+                if let Some(n) = self
                     .router
-                    .try_read_range_sync(&file_path, &m, offset, read_len)
+                    .try_read_range_sync(&file_path, m, offset, read_len, out)
                 {
-                    return IpcReadProbe::Hit(bytes);
+                    return IpcReadProbe::Served(n);
                 }
             }
             return IpcReadProbe::Miss;
@@ -10293,7 +10312,7 @@ impl Filesystem for SqueezefsFilesystem {
             self.router.metadata_cache.insert(
                 inode.ino,
                 crate::routing::CachedMetadata {
-                    file_type: "inline".to_string(),
+                    file_type: "inline".into(),
                     size: 0,
                     block_map_id: None,
                     block_prefix: None,
@@ -10981,7 +11000,7 @@ impl Filesystem for SqueezefsFilesystem {
             // Prefer hot caches for path selection (avoids meta RTT on every small write).
             // write_file still loads authoritative layout when it mutates data.
             let (old_size, file_type) = if let Some(m) = self.router.metadata_cache.get(&ino) {
-                (m.size, m.file_type.clone())
+                (m.size, m.file_type.to_string())
             } else if let Some((attr, cached_at)) = self.attr_cache.get(&ino) {
                 if cached_at.elapsed() < Duration::from_secs(1) {
                     let ft = if attr.size > block_size {
@@ -10998,7 +11017,7 @@ impl Filesystem for SqueezefsFilesystem {
                         .fetch_metadata(&file_path)
                         .await
                         .map_err(map_squeezefs_err)?;
-                    (meta.size, meta.file_type.clone())
+                    (meta.size, meta.file_type.to_string())
                 }
             } else {
                 let meta = self
@@ -11006,7 +11025,7 @@ impl Filesystem for SqueezefsFilesystem {
                     .fetch_metadata(&file_path)
                     .await
                     .map_err(map_squeezefs_err)?;
-                (meta.size, meta.file_type.clone())
+                (meta.size, meta.file_type.to_string())
             };
             let is_striped = file_type == "striped";
 

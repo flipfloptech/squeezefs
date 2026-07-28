@@ -74,6 +74,36 @@ where
     fuse3::raw::tpc_spawn(fut);
 }
 
+thread_local! {
+    /// PLACED-write handoffs deferred to the end of the drain pass
+    /// (shim-parity 2026-07-28): a placed sever's whole win is that every
+    /// sibling chunk of a block lands in the shared assembly BEFORE the
+    /// first handler merge parks the overlay entry (an entry-present
+    /// block can never adopt, and post-creation chunks pay the 2-copy
+    /// fallback). Spawning the handler at `serve_data` raced the rest of
+    /// the drain pass — measured ~50 % sever engagement / ~28 % merge
+    /// elision on the t16×4MiB bracket — so placed handoffs queue here
+    /// (service-thread-local) and [`DataPlaneSink::flush`] spawns them
+    /// after the pass severed everything in flight. This is exactly the
+    /// [`SessionSink::flush`] liveness contract ("work deferred during
+    /// serve_data MUST become kernel-visible here"); pooled writes and
+    /// read demotions keep their immediate spawn (latency shape
+    /// unchanged where the deferral buys nothing).
+    static PENDING_PLACED_HANDOFFS: std::cell::RefCell<
+        Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain the service thread's deferred placed-write handoffs onto the
+/// handler lanes (called from [`DataPlaneSink::flush`] at end-of-sweep).
+fn spawn_pending_placed() {
+    PENDING_PLACED_HANDOFFS.with(|q| {
+        for fut in q.borrow_mut().drain(..) {
+            fuse3::raw::tpc_spawn(fut);
+        }
+    });
+}
+
 /// The read handoff body, factored free of the sink so the direct-drive
 /// engine's CQE fallback (`crate::ipc_direct`) rides the IDENTICAL path
 /// — same venue (`handoff_spawn` → per-core handler lanes), same
@@ -532,6 +562,7 @@ impl DataPlaneSink {
         // SAFETY: the dequeued op's validated arena window is alive for
         // this synchronous call (racing client writes are torn CONTENT,
         // never UB — the pooled sever's own contract).
+        let mut placed = true;
         let severed = unsafe {
             self.fs.placed_sever_for(
                 op.binding.ino,
@@ -540,7 +571,10 @@ impl DataPlaneSink {
                 op.payload.as_base_ptr(),
             )
         }
-        .unwrap_or_else(|| op.payload.read_severed_bytes());
+        .unwrap_or_else(|| {
+            placed = false;
+            op.payload.read_severed_bytes()
+        });
         METRICS.ipc_async_handoffs.fetch_add(1, Ordering::Relaxed);
         let fs = Arc::clone(&self.fs);
         let request = self.ring_request();
@@ -560,7 +594,7 @@ impl DataPlaneSink {
         } else {
             0
         };
-        handoff_spawn(async move {
+        let fut = async move {
             match fs
                 .write(request, ino, 0, offset, severed, write_flags, 0)
                 .await
@@ -582,7 +616,18 @@ impl DataPlaneSink {
                     completion.complete(i64::from(libc::c_int::from(errno)));
                 }
             }
-        });
+        };
+        if placed {
+            // Placed writes defer their handler spawn to end-of-sweep
+            // (see PENDING_PLACED_HANDOFFS): the sibling chunks still in
+            // this drain pass must sever into the shared assembly before
+            // any merge parks the overlay entry. Custody is already
+            // severed (above, synchronously) — the deferral moves only
+            // WHERE the handler starts, never what it writes.
+            PENDING_PLACED_HANDOFFS.with(|q| q.borrow_mut().push(Box::pin(fut)));
+        } else {
+            handoff_spawn(fut);
+        }
     }
 }
 
@@ -605,9 +650,13 @@ impl SessionSink for DataPlaneSink {
     }
 
     fn flush(&self) {
+        // Placed-write handoffs deferred during this sweep (the
+        // SessionSink::flush liveness rule — deferred work MUST become
+        // visible before the service thread can park).
+        spawn_pending_placed();
         // Direct-drive submit-batch economy: one `io_uring_enter` per
-        // drain sweep (SessionSink::flush liveness rule — a published
-        // SQE must be kernel-visible before the service thread parks).
+        // drain sweep (a published SQE must be kernel-visible before the
+        // service thread parks).
         if let Some(Some(engine)) = self.direct.get() {
             engine.flush();
         }

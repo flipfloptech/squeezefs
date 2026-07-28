@@ -623,10 +623,20 @@ impl Session {
         let mut short = false; // a chunk completed short — stop extending
         let mut failed: Option<i32> = None; // first failure's errno
         loop {
-            // Submit phase: keep the pipeline full while no terminal
-            // condition holds. `claim_run` refusing (all slots busy) just
-            // ends this phase — reaping a flight below frees slots and the
-            // loop re-enters here.
+            // Submit phase — TWO halves (shim-parity 2026-07-28, batch
+            // publish): (a) claim + arena-copy + STAGE every chunk the
+            // slot table allows, (b) ring-push them together under ONE
+            // doorbell. The pre-batch shape (push + doorbell per chunk,
+            // with a slab-run memcpy between pushes) let the daemon's
+            // drain outrun the stream — sibling chunks of one block
+            // landed in DIFFERENT drain passes, so the placed sever's
+            // shared-assembly adoption raced the first merge (measured
+            // ~50 % sever engagement at t16×4MiB). Arriving together,
+            // the whole flight severs in one pass; it is also strictly
+            // fewer doorbell/wake edges. `claim_run` refusing (all slots
+            // busy) just ends the phase — reaping a flight below frees
+            // slots and the loop re-enters here.
+            let mut staged: Vec<WriteFlight> = Vec::new();
             while failed.is_none() && !short && submitted < buf.len() && !self.poisoned() {
                 let remaining = buf.len() - submitted;
                 let want_bytes = remaining.min(max_chunk);
@@ -646,28 +656,35 @@ impl Session {
                     arena_off: u64::from(base) * self.slab,
                 });
                 slot.core.publish_submitted();
-                if !self.ring().push(base) {
-                    // Unreachable for an honest client (slots ≤ ring
-                    // entries) — our state is corrupt; poison loudly. The
-                    // submitted-but-unpushed run is abandoned with the
-                    // session (never reused).
-                    self.poison();
-                    break;
-                }
-                // Doorbell (§5.3 protocol rule 1) per push; the coalescer
-                // elides the syscall unless the daemon is parked.
-                let header = self.header();
-                header.doorbell.fetch_add(1, Ordering::Release);
-                if header.daemon_parked.load(Ordering::SeqCst) != 0 {
-                    futex_wake(&header.doorbell);
-                }
-                flights.push_back(WriteFlight {
+                staged.push(WriteFlight {
                     base,
                     gen,
                     run,
                     chunk,
                 });
                 submitted += chunk;
+            }
+            if !staged.is_empty() {
+                for fl in staged {
+                    if !self.ring().push(fl.base) {
+                        // Unreachable for an honest client (slots ≤ ring
+                        // entries) — our state is corrupt; poison loudly.
+                        // The submitted-but-unpushed run is abandoned with
+                        // the session (never reused).
+                        self.poison();
+                        break;
+                    }
+                    flights.push_back(fl);
+                }
+                // ONE doorbell for the whole staged batch (§5.3 protocol
+                // rule 1 is per-publication liveness; the coalescer
+                // already made per-push doorbells elide-to-one — this
+                // moves the batching to the publish side too).
+                let header = self.header();
+                header.doorbell.fetch_add(1, Ordering::Release);
+                if header.daemon_parked.load(Ordering::SeqCst) != 0 {
+                    futex_wake(&header.doorbell);
+                }
             }
             // Reap phase: consume the oldest (lowest-offset) flight.
             let Some(fl) = flights.pop_front() else {

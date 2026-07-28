@@ -579,14 +579,18 @@ async fn stalled_serve_times_out_poisons_and_falls_through() {
 }
 
 // ---------------------------------------------------------------------------
-// ticket parks (the 2026-07-26 reap economy): event-driven, never polled
+// reap parks (2026-07-26 reap economy, re-based on the 2026-07-28 cqe
+// doorbell): event-driven, never polled
 // ---------------------------------------------------------------------------
 
 /// The libaio reap's wait is EVENT-DRIVEN: a parked reaper is woken by
-/// the daemon's completion (the slot protocol's WAITER bit), not by a
-/// poll quantum. The wait admission is race-free: a completion landing
-/// between `ticket_wait_entry` and `wait_any` fails the futex admission
-/// (state word changed) — the wait returns immediately, never strands.
+/// the daemon's completion (the session cqe doorbell — op-economy
+/// 2026-07-28; formerly the per-ticket WAITER bit), not by a poll
+/// quantum. The park is race-free by the register→snapshot→re-scan
+/// protocol: a completion landing before `cqe_park_begin` is found by
+/// the post-registration scan; one landing after it either fails the
+/// futex admission (seq bumped) or pays the wake (parked gate) — the
+/// `ipc_cqe_parked_reaper_never_stranded` loom model.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ticket_park_wait_is_event_driven_not_quantum_polled() {
     let (host, _dir, _f, session, binding) = delay_host("ticket-park", 100);
@@ -600,12 +604,15 @@ async fn ticket_park_wait_is_event_driven_not_quantum_polled() {
     assert!(!session.ticket_done(t), "op is in flight");
     let start = std::time::Instant::now();
     tokio::task::block_in_place(|| loop {
-        match session.ticket_wait_entry(t) {
-            None => break, // DONE — consume below
-            Some(entry) => {
-                squeezefs_il::session::wait_any(&[entry], std::time::Duration::from_secs(10));
-            }
+        // The reap-loop protocol: register + snapshot, then the
+        // mandatory pending re-scan, then the bounded wait.
+        let entry = session.cqe_park_begin();
+        if session.ticket_done(t) {
+            session.cqe_park_end();
+            break;
         }
+        squeezefs_il::session::wait_any(&[entry], std::time::Duration::from_secs(10));
+        session.cqe_park_end();
         assert!(
             start.elapsed() < std::time::Duration::from_secs(9),
             "parked reaper was not woken by the completion (slept toward \
@@ -624,8 +631,8 @@ async fn ticket_park_wait_is_event_driven_not_quantum_polled() {
         .expect("done");
     assert_eq!(res, 4096);
 
-    // Ready path: the op already completed — `ticket_wait_entry` must
-    // refuse to hand out a park (None), directing the caller to consume.
+    // Ready path: the op already completed — the post-registration
+    // re-scan must consume it without sleeping toward any bound.
     let t2 = session
         .submit_pread_nowait(binding, 512, 0)
         .expect("slot claim");
@@ -634,9 +641,17 @@ async fn ticket_park_wait_is_event_driven_not_quantum_polled() {
         assert!(std::time::Instant::now() < deadline, "sink must complete");
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
+    let ready_probe = std::time::Instant::now();
+    let _entry = session.cqe_park_begin();
     assert!(
-        session.ticket_wait_entry(t2).is_none(),
-        "a DONE ticket must never park (Ready ⇒ consume immediately)"
+        session.ticket_done(t2),
+        "a DONE ticket must be found by the post-registration scan \
+         (register→snapshot→re-scan) — never parked toward a bound"
+    );
+    session.cqe_park_end();
+    assert!(
+        ready_probe.elapsed() < std::time::Duration::from_secs(1),
+        "the Ready path must not sleep"
     );
     assert_eq!(
         session
@@ -647,10 +662,11 @@ async fn ticket_park_wait_is_event_driven_not_quantum_polled() {
     host.shutdown();
 }
 
-/// Wake breadth: EVERY waiter parked on a slot's state word is woken by
-/// its completion. Two reapers legally park on the same in-flight op
+/// Wake breadth: EVERY reaper parked on a session's completion doorbell
+/// is woken by a completion. Two reapers legally park on one session
 /// (split submitter/reaper pairs re-snapshot the same pending set); a
-/// single-waiter wake would strand the loser for its full bound.
+/// single-waiter wake would strand the loser for its full bound —
+/// `SlotCompletion::complete` wakes the cqe word at breadth `i32::MAX`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slot_completion_wakes_every_parked_waiter() {
     let (host, _dir, _f, session, binding) = delay_host("wake-breadth", 300);
@@ -665,11 +681,14 @@ async fn slot_completion_wakes_every_parked_waiter() {
         .map(|_| {
             let session = Arc::clone(&session);
             std::thread::spawn(move || {
-                // A None here means the op already completed (the race is
-                // legal) — trivially "woken".
-                if let Some(entry) = session.ticket_wait_entry(t) {
+                // A DONE hit in the post-registration scan means the op
+                // already completed (the race is legal) — trivially
+                // "woken".
+                let entry = session.cqe_park_begin();
+                if !session.ticket_done(t) {
                     squeezefs_il::session::wait_any(&[entry], std::time::Duration::from_secs(6));
                 }
+                session.cqe_park_end();
                 start.elapsed()
             })
         })

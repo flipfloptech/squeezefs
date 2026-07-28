@@ -625,7 +625,7 @@ fn print_site_table() {
         *sites.entry(key).or_insert(0) += 1;
     }
     let mut rows: Vec<(u64, String)> = sites.into_iter().map(|(k, v)| (v, k)).collect();
-    rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_unstable_by_key(|r| std::cmp::Reverse(r.0));
     println!("== alloc-site table (count × site, top frames) ==");
     for (count, site) in rows {
         println!("--- {count} allocs ---\n{site}\n");

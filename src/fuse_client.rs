@@ -2907,6 +2907,31 @@ pub struct Metrics {
     pub ipc_severed_pool_hits: Align64<AtomicU64>,
     pub ipc_severed_pool_misses: Align64<AtomicU64>,
     pub ipc_severed_pool_bytes: Align64<AtomicU64>,
+    /// Placed sever (shim-parity 2026-07-28): ring WRITE payloads severed
+    /// DIRECTLY into the block's future `ActiveBlockBuf` backing at
+    /// dequeue — the 1-copy ring write path (kernel-parity: lease→merge
+    /// = one copy there, arena→backing = one copy here). `fallbacks`
+    /// counts ELIGIBLE shapes refused at claim time (overlap / sealed /
+    /// assembly cap) — growth on a plain stream = claim-protocol rot;
+    /// shape-ineligible ops (small/unaligned/non-striped/entry-present)
+    /// ride the pooled sever uncounted (the normal population).
+    pub ipc_placed_severs: Align64<AtomicU64>,
+    pub ipc_placed_sever_fallbacks: Align64<AtomicU64>,
+    /// Merge-side placed-sever accounting: `placed_adoptions` = overlay
+    /// entries born by ADOPTING the ring assembly as their backing;
+    /// `placed_merge_elides` = merges whose copy was elided by the
+    /// pointer proof (payload region IS the current backing region —
+    /// includes the adopting write's own merge). On a saturated
+    /// whole-block chunk stream `elides ≈ ipc_placed_severs` (one per
+    /// chunk) and `adoptions ≈ blocks`; a widening `severs − elides` gap
+    /// = assemblies being CoW'd/raced away (the 2-copy fallback —
+    /// correct, but the parity win is rotting).
+    pub placed_adoptions: Align64<AtomicU64>,
+    pub placed_merge_elides: Align64<AtomicU64>,
+    /// Gauge: live pre-adoption assembly bytes (block-size backings held
+    /// by in-flight placed ring writes; R5 component `placed_assemblies`,
+    /// non-sheddable — converges by adoption/drop, never by shedding).
+    pub placed_assembly_bytes: Align64<AtomicU64>,
     /// Owned-session doorbell parks taken by service threads (the
     /// bounded `futex_waitv` waits — idle no-session parks are not
     /// counted). Growth ≈ op rate on a busy stream = the spin window no
@@ -4804,6 +4829,15 @@ impl SqueezefsFilesystem {
                 "ipc_severed_pool_hits": METRICS.ipc_severed_pool_hits.load(Ordering::Relaxed),
                 "ipc_severed_pool_misses": METRICS.ipc_severed_pool_misses.load(Ordering::Relaxed),
                 "ipc_severed_pool_bytes": METRICS.ipc_severed_pool_bytes.load(Ordering::Relaxed),
+                // Placed sever (shim-parity 2026-07-28): the 1-copy ring
+                // write path — dequeue severs landing in the block
+                // assembly, merge-side adoptions + elided copies, the
+                // live-assembly gauge (R5 `placed_assemblies`).
+                "ipc_placed_severs": METRICS.ipc_placed_severs.load(Ordering::Relaxed),
+                "ipc_placed_sever_fallbacks": METRICS.ipc_placed_sever_fallbacks.load(Ordering::Relaxed),
+                "placed_adoptions": METRICS.placed_adoptions.load(Ordering::Relaxed),
+                "placed_merge_elides": METRICS.placed_merge_elides.load(Ordering::Relaxed),
+                "placed_assembly_bytes": METRICS.placed_assembly_bytes.load(Ordering::Relaxed),
                 "ipc_sessions_reaped": METRICS.ipc_sessions_reaped.load(Ordering::Relaxed),
                 "ipc_inval_notifies": METRICS.ipc_inval_notifies.load(Ordering::Relaxed),
                 "ipc_inval_suppressed": METRICS.ipc_inval_suppressed.load(Ordering::Relaxed),

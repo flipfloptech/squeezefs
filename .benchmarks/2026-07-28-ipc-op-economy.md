@@ -181,41 +181,148 @@ section + stats surface).
   its cargo test binaries + the `sqzdevsub_*` null_blk items). Run
   before merge: `sudo tests/run_preload_gate.sh`.
 
-## 5. Phase B — PENDING (quiet box only; explicit TODO)
+## 5. Phase B — the counted acceptance brackets (2026-07-28, quiet box)
 
-The box was contended by the v1.1 release gate for the entire session:
-**no counted IOPS row in this note is acceptance**. When the box is
-quiet:
+Rebased onto dev `22c31ac` first (clean 7/7; the write-times
+single-authority fix composes — `park_write_times` rides the write
+handler after the attr publish and never touches the retyped
+`CachedMetadata` fields; ring writes inherit the single-authority stamp
+through the same handler; `write_times_durability_tests` green).
 
-1. Build the fabric-latency rig (loop substrate for the latency A/B,
-   plus the tcp substrate if any write rows are bracketed):
-   `sudo tests/dev_substrate.sh create` (and
-   `sudo SQZ_DEVSUB_TRANSPORT=tcp tests/dev_substrate.sh create` for
-   fabric-sensitive rows). State the substrate per row.
-2. A-B-B-A brackets vs dev tip `f3579f7` (KD-7 pairs per side, fresh
-   mount per side, medians of 3, engagement exact — `ipc_ops_*` deltas
-   account for every row; alternating order per the standing
-   A-B-B-A rule):
-   - **Warm il row** (the lever-1 acceptance): elbencho sync t8/t32
-     rand-4k over a warm 4×200 MiB set, default interception mount —
-     expect the warm ceiling to move with the freed ~12 allocs/op +
-     one memcpy/op; also re-run the 2026-07-19 G-L4-2 warm shape
-     (1.02 M IOPS reference).
-   - **Reap rows** (the lever-2 acceptance): fio/elbencho libaio
-     t16qd16 + t32qd32, sessions ∈ {1,4,8}, plus the 16-process fio
-     fleet — watch `ipc_cqe_wake_writes/(writes+elided)`,
-     svc voluntary ctx switches, completion clat avg/max (the
-     9.3 ms tail class), and the ~525 k plateau.
-   - **Protected rows** (must not regress): il sync t32 qd1
-     (the psync-class row), il libaio t1 qd1 RTT (~35 µs il
-     advantage), kernel rows as context.
-3. `REAP_EVENT_PARK_MAX` A/B at qd32 (event-parked vs 24-batched under
-   the NEW wake economics) — retune or keep, counted.
-4. `sudo tests/run_preload_gate.sh` leg 2 (mount parity + engagement +
-   kill-9 ×5 and fork-kill-parent soaks — the reaper-parked-leak
-   posture rides these).
-5. Record everything as an addendum to this note; only then may the
-   campaign's rows feed the scoreboard.
+### B.0 Setup
+
+- **Sides (KD-7 same-commit daemon+shim pairs, clean identities, no dev
+  override):** BASE = dev tip `22c31ac`; CAMP = the campaign tip
+  (`e45e221` for the bracket, `62cdb76` after the retune below).
+- **Venues:** `V-zram` = devsub loop (null_blk mds `/dev/nvme1n1` +
+  zram oss `/dev/nvme5n1`) — the G-L4-2 acceptance venue, warm/dt/write
+  rows; `V-lat` = devsub mds + a 235 µs fabric-latency data namespace
+  (memory null_blk `completion_nsec=235000`, irqmode=2 → nvmet-loop,
+  `nvme connect -i 8`; fio psync qd1 raw: 4,141 IOPS ≈ 241 µs — the
+  2026-07-26 reap-economy venue) — every libaio/park row. LOOP
+  substrate throughout (per-op-economy campaign; no bandwidth-bound row
+  is claimed, so no tcp/write-amp columns are owed).
+- **Instruments:** elbencho 3.1-10 (dynamic; sync + `--iodepth` libaio
+  drivers) and fio 3.42 (dynamic; qd1 RTT + the 16-process fleet). 4 KiB
+  `--rand --direct`, dataset 8 × 256 MiB striped (coverage-bound il
+  rows: engagement delta == 524,288 == the full dataset op count, the
+  strongest §3-rule-4 form). fio rows: 10/15 s time_based, engagement =
+  fio `total_ios` == `ipc_ops_read` delta. Warm rows: hot tier sized
+  over the dataset (`SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB=3072`), two
+  shim-side warm passes (second-touch admission), fast-path share 99 %.
+- **Discipline:** fresh format + fresh mount per side invocation,
+  medians of 3 per row, A-B-B-A across side invocations, no-shim kernel
+  rows as the box-state CANARY. Driver: `/tmp/sqz-phaseb/rig.sh`
+  (row = IOPS + every engagement/wake/CPU delta from the stats inode).
+
+### B.1 Bracket 1 (counted; clean window 14:01–14:13 UTC, canaries stable ±2 %)
+
+Medians of 3; engagement exact on every il cell (`dR`/`dW` == ops; a
+warm cell is 99 % `ipc_fast_path_serves`, a dt/aio cell is 100 %
+`ipc_direct_drive_serves`).
+
+**Lever 1 (V-zram):**
+
+| row | BASE-1 | CAMP-1 | CAMP-2 | BASE-2 | verdict |
+|---|---|---|---|---|---|
+| warm-il-t8 (IOPS) | 1,435,257 | 1,747,958 | 1,855,525 | 1,443,762 | **+22–29 %, order-independent** |
+| … daemon CPU / 524 k ops | 1,370 ms | 1,120 ms | 1,000 ms | 1,300 ms | **−18–23 % CPU/op** |
+| warm-il-t32 | 1,169,502 | 1,546,763 | 1,355,211 | 1,196,065 | **+15–30 %** |
+| warm-kernel-t8 (canary, no shim) | 248,740 | 252,506 | 250,310 | 242,672 | flat ✓ (box stable) |
+| il-randwrite-t8 | 141,022 | 140,364 | 139,302 | 134,410 | **wash** (writes are handoffs — lever 1 never touched them; stated) |
+| dt-il-t256 | 507,601 | 502,599 | 496,197 | 489,608 | **wash** (direct-drive path, lever-1-free by design) |
+
+**Lever 2 (V-lat, doorbell at the un-retuned park threshold 24):**
+
+| row | BASE-1 | CAMP-1 | CAMP-2 | BASE-2 | verdict |
+|---|---|---|---|---|---|
+| il-aio-t16qd16 | 486,633 | 380,133 | 373,397 | 477,878 | **−21 % REGRESSION — found by the bracket** (below) |
+| il-aio-t32qd32 | 535,031 | 529,077 | 515,429 | 514,831 | wash (deep regime batches, wakes ≈ 0) |
+| il-aio-rtt-qd1 (fio) | 3,968 / 251 µs | 3,964 / 251 µs | 3,971 / 250 µs | 3,956 / 251 µs | wash; **the qd1 latency contract held** (cqeW == ops there by design) |
+| il-fleet-16proc (fio) | 482,930 | 475,028 | 478,841 | 468,733 | wash (one reaper per session ⇒ herd size 1) |
+| kern-aio-t16qd16 (canary) | 361,091 | 349,993 | 342,180 | 344,704 | ±3 % ✓ |
+
+### B.2 The found regression and its mechanism (the wake counters convict it)
+
+At t16qd16 the campaign side paid `ipc_cqe_wake_writes` ≈ 519 k per
+524 k ops: qd16 per ctx ≤ the old park threshold (24) kept elbencho's
+16 threads event-parked, and the SESSION-level doorbell — 16 threads
+sharing 4 fd-sharded sessions — wakes EVERY parked reaper on the
+session per completion (breadth is the no-strand law): a wake herd +
+spurious rescans the per-ticket WAITER parks never paid. The fleet
+(one reaper per session) and qd32 (deep regime, batched) were immune —
+exactly the counter signature.
+
+### B.3 The `REAP_EVENT_PARK_MAX` A/B (flagged in Phase A; campaign side, V-lat, same clean window)
+
+| config | t16qd16 | t32qd32 | rtt-qd1 (clat) | fleet (daemon CPU) |
+|---|---|---|---|---|
+| 24 (old default) | 380,133 / 373,397 | 529,077 / 515,429 | 3,964–3,971 (250–251 µs) | 475,028 / 478,841 (70.9–71.1 s) |
+| 4096 (event-park all) | 366,068 | **256,054 (−52 %)** | 3,957 (251 µs) | 477,379 (70.7 s) |
+| 0 (batch all) | 505,356 | 525,612 | **3,301 (301 µs — the 50 µs quantum tax)** | 484,527 (64.4 s) |
+| **2 (shipped default, `62cdb76`)** | **505,952** | **526,867** | **3,965 (251 µs)** | **488,089 (63.9 s)** |
+
+**Retune adjudicated 24 → 2** (commit `62cdb76`): qd ≤ 2 keeps the
+event-driven wake (the latency-contract shapes — qd1 RTT byte-identical
+to baseline), everything deeper batches on the 50 µs quantum whose
+latency share is invisible at depth. Against the counted baselines:
+t16qd16 **505,952 vs 486,633/477,878 (+4–6 %, the regression is now a
+win)**, t32qd32 wash (−2 %/+2 % vs the two baseline sides), rtt wash,
+fleet **+1–4 % with −10 % daemon CPU** (63.9 s vs 70.2–71.2 s per
+~7.2 M ops). `ipc_cqe_wake_writes` ≈ 0 at depth (7–164 per 524 k ops),
+== ops at qd1 — the elision gauge behaves exactly as designed.
+
+### B.4 Contaminated brackets (recorded, NOT counted)
+
+A second full bracket (CAMP-3/BASE-3/CAMP-4, 14:26–14:37) and a
+confirmation pair (CAMP-5/BASE-4, 14:43–14:51) ran while the box
+degraded (a desktop slicer + kswapd churn): the no-shim kernel CANARY
+rows collapsed −55–65 % on BOTH sides simultaneously (e.g.
+warm-kernel-t8 249 k → 93–117 k), so those pairs are invalid as counts.
+Recorded because their WITHIN-window direction corroborates every
+verdict above (CAMP-5 vs BASE-4: warm-t8 1,494 k vs 1,195 k, t16qd16
+242 k vs 220 k, t32qd32 236 k vs 213 k, fleet 241 k vs 217 k — campaign
+ahead on every il row at the retuned default). The canary discipline is
+the takeaway: **a bracket without a no-change context row cannot even
+see this failure mode.**
+
+### B.5 Preload gate (final binary `62cdb76` pair)
+
+`sudo tests/run_preload_gate.sh` — **both legs PASSED**: leg 1
+(sanctioned build, Issue-4 guard, passthrough battery, libaio lifecycle
+×3), leg 2 (mount parity + engagement, notify delivery, dup /
+close_range / lseek pins, fio + elbencho + fio-libaio verify,
+foreign-netns rendezvous, **kill-9 soak ×5 and fork-then-kill-parent —
+zero session/arena residue on the ABI-2 doorbell**, establish-refused
+shape, direct-drive kill-9 soak).
+
+### B.6 Post-rebase / final-tree gates
+
+- Rebase onto dev `22c31ac`: clean (7/7, zero conflicts); directly-
+  affected suites green post-rebase (ipc_op_economy, preload_session,
+  **write_times_durability**, killpriv_v2, metrics_counter).
+- Final tree (`perf/ipc-op-economy` @ the retune tip): clippy
+  `-D warnings` clean (root + ipc + preload), fmt clean, **loom 48/48**,
+  bench smoke green, `cargo doc --no-deps` = the 3 pre-existing
+  warnings that reproduce byte-identically at dev tip `22c31ac`
+  (handoff_spawn/GhostTable private-item links — inherited, recorded).
+- `cargo test --all-features -- --test-threads=1` from zero:
+  **147/147 test binaries green** (the acceptance pass). One earlier
+  from-zero roll hit `writeback_tests::test_small_block_map_stays_inline`
+  ("72 vs 71 allocated data blocks") — **reproduced on the UNTOUCHED
+  baseline worktree at dev tip `22c31ac` (1-of-3 full-binary rolls)**:
+  a pre-existing intermittent inherited from dev, recorded here so it
+  is not silently absorbed; not this branch's surface. (A second
+  apparent failure, `async_block_reclaim_tests::field_rewrite_...`,
+  came from an operator error — two overlapped full-suite runs in one
+  worktree — and is not evidence of anything.)
+
+### B.7 Rig teardown
+
+`/mnt/sqz-phaseb` unmounted, daemons killed; `tests/dev_substrate.sh
+teardown` + the `sqzlat_oss0` fabric-latency device torn down
+(nvme disconnect, nvmet port/subsystem removed, null_blk powered off) —
+zero-residue verified in the closing checklist.
 
 ## 6. Found while profiling (recorded)
 

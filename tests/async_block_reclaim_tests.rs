@@ -1060,6 +1060,16 @@ async fn field_make_striped(h: &FieldH, name: &str, blocks: u64, seed: u8) -> u6
     let ino = field_create(h, name).await;
     let p = field_pattern((blocks * FBS) as usize, seed);
     field_write(&h.fs, h.req, ino, 0, &p).await;
+    // Write-pipeline drain (2026-07-27 depth campaign): coverage-complete
+    // writes ACK with custody parked; the mapped-premise and every
+    // fill/ledger observation downstream are deterministic only at the
+    // pipeline's drain point.
+    assert!(
+        h.fs.write_pipeline
+            .quiesce(std::time::Duration::from_secs(30))
+            .await,
+        "fixture write pipeline must drain"
+    );
     let path = squeezefs::keys::inode_path(ino);
     h.fs.router.metadata_cache.remove(&ino);
     let meta = h.fs.router.fetch_metadata(&path).await.unwrap();
@@ -1375,6 +1385,15 @@ async fn brim_rewrite_converges_in_place_with_honest_ledger() {
         let p = field_pattern(FBS as usize, 100 + b as u8);
         field_write(&h.fs, h.req, f1, b * FBS, &p).await;
     }
+    // The rewrites' detached uploads settle at the drain point (the
+    // standing pipeline-rendezvous adaptation — the counters below are
+    // exact only once every admitted upload completed).
+    assert!(
+        h.fs.write_pipeline
+            .quiesce(std::time::Duration::from_secs(30))
+            .await,
+        "rewrite pipeline must drain"
+    );
 
     assert_eq!(
         wt_fallbacks() - fb0,

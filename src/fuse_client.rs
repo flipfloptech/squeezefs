@@ -7451,12 +7451,25 @@ impl SqueezefsFilesystem {
     /// mapping / shared or untracked offset / non-Active volume): the
     /// caller surfaces the original `StorageFull` into the never-lossy
     /// staging ladder — genuine space pressure, honestly counted.
+    ///
+    /// Write-pipeline composition (2026-07-27 depth campaign): the brim
+    /// rewrite runs INSIDE `upload_full_block_sized`, so it rides its
+    /// caller's admission verbatim — the detached ACK-path task's held
+    /// `PipelinePermit` (RAII, spans this whole call) or the flush legs'
+    /// deliberate no-permit drain context. It is never a second
+    /// admission, and it feeds the depth governor one completion sample
+    /// on the MAPPING's lane (`grow_size_to_block_end` carries the
+    /// caller's size posture: the flush legs' merges must not grow the
+    /// size floor — the generic/795 SIZE-NEVER-LEADS-DATA law, see
+    /// `upload_full_block_sized`).
     async fn try_brim_inplace_rewrite(
         &self,
         ino: u64,
         b: u32,
         processed: bytes::Bytes,
         fencing_token: u64,
+        grow_size_to_block_end: bool,
+        pipeline_t0: std::time::Instant,
     ) -> Result<bool, SqueezefsError> {
         // Passthrough only: an in-place image must occupy exactly the
         // undecorated mapping's whole-block window; a transformed image's
@@ -7534,7 +7547,15 @@ impl SqueezefsFilesystem {
         // in-place DMA propagates into the caller's never-lossy staging
         // fallback, which re-stages this same complete image — staging
         // owns read authority for `b` until writeback converges.
-        let min_size = (b as u64 + 1) * block_size;
+        // The caller's size posture rides through (SIZE NEVER LEADS DATA
+        // on the flush legs — union-complete custody's acked floor
+        // already covers the block end there, `cached.size` in the merge
+        // discipline carries it).
+        let min_size = if grow_size_to_block_end {
+            (b as u64 + 1) * block_size
+        } else {
+            0
+        };
         let entries = [(b, mapping)];
         self.router
             .merge_block_mappings(
@@ -7548,6 +7569,11 @@ impl SqueezefsFilesystem {
         METRICS
             .write_through_inplace_rewrites
             .fetch_add(1, Ordering::Relaxed);
+        // Feed the depth governor: one completed upload on the MAPPING's
+        // lane (the in-place DMA is a genuine device write; the brim is
+        // exactly the regime where the target must keep adapting).
+        self.write_pipeline
+            .record_completion(&be_id, block_size, pipeline_t0.elapsed());
         Ok(true)
     }
 
@@ -7646,9 +7672,19 @@ impl SqueezefsFilesystem {
                 // block's own sole-owned mapping converges IN PLACE —
                 // contract 9 (field ledger inversion). Predicate misses
                 // surface the honest StorageFull into the caller's
-                // never-lossy staging fallback.
+                // never-lossy staging fallback. Depth-pipeline
+                // composition: this path stays under the caller's
+                // admission (the detached task's held permit) — never a
+                // second admit; the governor sample records inside.
                 if self
-                    .try_brim_inplace_rewrite(ino, b, processed, fencing_token)
+                    .try_brim_inplace_rewrite(
+                        ino,
+                        b,
+                        processed,
+                        fencing_token,
+                        grow_size_to_block_end,
+                        pipe_t0,
+                    )
                     .await?
                 {
                     write_phase_record(WritePhase::UploadDma, wp_dma);

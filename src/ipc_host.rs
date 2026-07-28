@@ -156,11 +156,15 @@ mod spin_window_tests {
     }
 }
 
-/// IPC service-thread ceiling (§5.5.1; knob
-/// `SQUEEZEFS_IPC_SERVICE_THREADS`, clamp 1..=64). Default scales with
-/// the box — the 2026-07-19 sweep measured the warm il row's ceiling as
-/// exactly this count (2 threads = 643 k IOPS, 8 threads = 1.48 M on a
-/// 32-CPU box; fast-path serves execute ON these threads).
+/// IPC service-thread CEILING (§5.5.1; knob
+/// `SQUEEZEFS_IPC_SERVICE_THREADS`, clamp 1..=64). Default = the shared
+/// ingest-economy derivation [`squeezefs_ipc::sizing::il_sessions_default`]
+/// — the SAME function the shim's per-mount session default rides, so
+/// the pair cannot drift (the 2026-07-28 field conviction: 4 shim
+/// sessions vs 8 daemon threads left half the drain capacity idle at
+/// 7.5 GB/s of a 16.6 GB/s ceiling). Threads spawn ON SESSION ADMISSION
+/// up to this ceiling ([`IpcHost::ensure_service_threads`]) — a
+/// session-less host owns zero service threads.
 fn service_thread_count() -> usize {
     service_thread_ceiling_from(
         std::env::var("SQUEEZEFS_IPC_SERVICE_THREADS")
@@ -172,11 +176,13 @@ fn service_thread_count() -> usize {
     )
 }
 
-/// Pure sizing form (unit-pinned by `tests/ingest_economy_tests.rs`).
+/// Pure sizing form (unit-pinned by `tests/ingest_economy_tests.rs`;
+/// the paired shim-side pin is `session_sizing_tests` in
+/// `squeezefs-preload`).
 pub fn service_thread_ceiling_from(env: Option<&str>, cpus: usize) -> usize {
     env.and_then(|v| v.trim().parse::<usize>().ok())
         .map(|n| n.clamp(1, 64))
-        .unwrap_or_else(|| (cpus / 4).clamp(2, 8))
+        .unwrap_or_else(|| squeezefs_ipc::sizing::il_sessions_default(cpus))
 }
 
 /// Host configuration (mount-time; tests construct directly).
@@ -760,9 +766,19 @@ pub struct IpcHost {
     uid_sessions: Mutex<HashMap<u32, usize>>,
     next_session_id: AtomicU64,
     next_binding_id: AtomicU64,
-    /// Pinned service-thread count (§5.5.1) — sessions are assigned an
-    /// owner index in `0..service_threads` at admission, forever.
+    /// Service-thread CEILING (§5.5.1) — sessions are assigned an owner
+    /// index in `0..service_threads` at admission, forever. Threads
+    /// spawn on demand as owners first receive a session
+    /// ([`Self::ensure_service_threads`], ingest-economy 2026-07-28) —
+    /// a session-less host (every default mount's control-plane-only
+    /// posture) owns ZERO service threads.
     service_threads: usize,
+    /// Spawned service threads (dense: owners fill lowest-first, so
+    /// spawned == the highest owner ever assigned + 1). Monotonic within
+    /// a host's lifetime — a thread that has served stays (its empty
+    /// park is the 5 ms-bounded doorbell wait); the field bug was
+    /// threads that NEVER had a ring to drain.
+    svc_spawned: std::sync::atomic::AtomicUsize,
     /// Host epoch for the sessions' `last_active_ms` clocks.
     started: Instant,
     shutting_down: AtomicBool,
@@ -818,13 +834,15 @@ impl IpcHost {
             next_session_id: AtomicU64::new(1),
             next_binding_id: AtomicU64::new(1),
             service_threads,
+            svc_spawned: std::sync::atomic::AtomicUsize::new(0),
             started: Instant::now(),
             shutting_down: AtomicBool::new(false),
             threads: Mutex::new(Vec::new()),
         });
-        METRICS
-            .ipc_service_threads
-            .store(service_threads as u64, Ordering::Relaxed);
+        // Spawn-on-bind (ingest-economy 2026-07-28): the gauge reports
+        // SPAWNED service threads — 0 until a session admits. No thread
+        // spawns here; `ensure_service_threads` runs at admission.
+        METRICS.ipc_service_threads.store(0, Ordering::Relaxed);
 
         let accept_host = Arc::clone(&host);
         let accept = std::thread::Builder::new()
@@ -837,14 +855,6 @@ impl IpcHost {
                 std::thread::Builder::new()
                     .name("sqz-ipc-accept-p".into())
                     .spawn(move || path_host.accept_loop(AcceptOn::Path))?,
-            );
-        }
-        for idx in 0..service_threads {
-            let service_host = Arc::clone(&host);
-            spawned.push(
-                std::thread::Builder::new()
-                    .name(format!("sqz-ipc-svc{idx}"))
-                    .spawn(move || service_host.service_loop(idx))?,
             );
         }
         if host.cfg.idle_secs > 0 {
@@ -1375,6 +1385,8 @@ impl IpcHost {
         };
         // §5.5.1 pinning: admit to the lightest service thread (live
         // sessions never rebalance — natural churn is the only mover).
+        // Ties resolve to the LOWEST index, so owners fill densely —
+        // the invariant `ensure_service_threads` relies on.
         let owner = {
             let sessions = self
                 .sessions
@@ -1391,6 +1403,13 @@ impl IpcHost {
                 .map(|(i, _)| i)
                 .unwrap_or(0)
         };
+        // Spawn-on-bind (ingest-economy 2026-07-28): the owner's thread
+        // must exist before the session publishes — a session pinned to
+        // a never-spawned owner would strand its ops forever.
+        if let Err(e) = self.ensure_service_threads(owner) {
+            log::error!("ipc host: service thread spawn failed: {e}");
+            return refuse(RefuseClass::Internal);
+        }
         let session = Arc::new(IpcSession {
             id: self.next_session_id.fetch_add(1, Ordering::Relaxed),
             uid: cred.uid,
@@ -1568,6 +1587,44 @@ impl IpcHost {
     // validation + ECHO inline, READ/WRITE through the sink (fast path
     // or async handoff; PR L4-4)
     // ---------------------------------------------------------------
+
+    /// Spawn-on-bind (ingest-economy 2026-07-28): guarantee owner index
+    /// `owner`'s service thread exists before its first session
+    /// publishes. Owners fill lowest-first (the admission pick resolves
+    /// ties to the lowest index), so spawned threads stay DENSE — this
+    /// spawns every missing index up to `owner`. Serialized on the
+    /// `threads` mutex (which also orders it against `shutdown`'s
+    /// handle take: a spawn that wins the mutex before the take lands
+    /// its handle in the joined vec; one that loses observes
+    /// `shutting_down` and refuses — no leaked thread either way).
+    fn ensure_service_threads(self: &Arc<Self>, owner: usize) -> io::Result<()> {
+        if owner < self.svc_spawned.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut threads = self
+            .threads
+            .lock()
+            .expect("thread registry mutex never poisons");
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(io::Error::other("host shutting down"));
+        }
+        let mut spawned = self.svc_spawned.load(Ordering::Acquire);
+        while spawned <= owner {
+            let service_host = Arc::clone(self);
+            threads.push(
+                std::thread::Builder::new()
+                    .name(format!("sqz-ipc-svc{spawned}"))
+                    .spawn(move || service_host.service_loop(spawned))?,
+            );
+            spawned += 1;
+            self.svc_spawned.store(spawned, Ordering::Release);
+            // The gauge reports SPAWNED (live) service threads.
+            METRICS
+                .ipc_service_threads
+                .store(spawned as u64, Ordering::Relaxed);
+        }
+        Ok(())
+    }
 
     fn service_loop(self: Arc<Self>, idx: usize) {
         // Owned-session snapshot, re-collected ONLY when the registry

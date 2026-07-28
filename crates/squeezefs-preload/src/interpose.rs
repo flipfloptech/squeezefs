@@ -68,8 +68,11 @@ fn dev_cache() -> &'static NegativeDevCache {
 /// plateau (~285 k IOPS flat from 64 to 256 client threads, perf
 /// showing only svc0 hot). Sharding bindings across K sessions BY FD
 /// keeps every session single-consumer while letting the daemon's
-/// admission spread them over service threads. K =
-/// `SQUEEZEFS_IL_SESSIONS` (default 4, clamp 1..=8).
+/// admission spread them over service threads. K defaults to the shared
+/// ingest-economy derivation `clamp(cpus/4, 2, 16)`
+/// (`squeezefs_ipc::sizing::il_sessions_default` — the same function
+/// the daemon's service-thread ceiling rides); `SQUEEZEFS_IL_SESSIONS`
+/// is an override lever only (clamp 1..=16).
 const MAX_SESSIONS: usize = 32;
 
 fn sessions_per_mount() -> usize {
@@ -84,12 +87,15 @@ fn sessions_per_mount() -> usize {
     })
 }
 
-/// Pure sizing form (unit-pinned below).
+/// Pure sizing form (unit-pinned below): default = the shared
+/// ingest-economy derivation (`clamp(cpus/4, 2, 16)` — the SAME
+/// function the daemon's service-thread ceiling rides, so the pair
+/// cannot drift); the env var is an override lever only, clamped to
+/// the derivation ceiling.
 fn sessions_per_mount_from(env: Option<&str>, cpus: usize) -> usize {
-    let _ = cpus;
     env.and_then(|v| v.trim().parse::<usize>().ok())
-        .map(|n| n.clamp(1, 8))
-        .unwrap_or(4)
+        .map(|n| n.clamp(1, 16))
+        .unwrap_or_else(|| squeezefs_ipc::sizing::il_sessions_default(cpus))
 }
 
 struct Registry {

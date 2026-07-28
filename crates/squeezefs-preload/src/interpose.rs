@@ -1950,16 +1950,22 @@ const KERNEL_LANE_SLICE: std::time::Duration = std::time::Duration::from_millis(
 const RING_PARK_RECHECK: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Above this many in-flight ring ops the reap batches on a 50 µs
-/// bounded sleep instead of event-parking. Sized (2026-07-26) under the
-/// per-ticket WAITER economics — one daemon wake syscall per completion
-/// plus an O(qd) waitv array per park; the 2026-07-28 completion
-/// doorbell collapsed both terms (one wait word per session, wakes only
-/// while registered). Default 24 keeps qd ≤ 16 pipelines fully
-/// event-driven (measured best there) and batches qd32+;
-/// `SQUEEZEFS_IL_REAP_PARK_MAX` is the measurement A/B lever (the
-/// `SQUEEZEFS_IL_SPINS` precedent — clamp 0..=4096, read once), NOT an
-/// operational default change.
-const REAP_EVENT_PARK_MAX: usize = 24;
+/// bounded sleep instead of event-parking. RE-SIZED **24 → 2** by the
+/// 2026-07-28 Phase B counted A/B (fabric-latency venue, medians of 3,
+/// engagement exact — `.benchmarks/2026-07-28-ipc-op-economy.md` §B.3):
+/// under the completion DOORBELL, an event-parked reaper on a SHARED
+/// session is woken by EVERY completion on that session — at qd16 ×
+/// shared sessions that is a wake herd (one syscall per completion +
+/// spurious rescans; measured −21 % on elbencho t16qd16 at the old 24,
+/// −52 % at qd32 fully event-parked), where the 50 µs batch quantum's
+/// latency share is invisible at depth. qd ≤ 2 stays event-driven —
+/// the near-idle/latency shapes where the wake IS the contract (qd1
+/// RTT clat 250–251 µs preserved; batching them cost −17 % and
+/// +50 µs). At 2: t16qd16 505 k (> the 487 k pre-doorbell baseline),
+/// t32qd32/fleet wash-or-better with −10 % daemon CPU, completion
+/// wakes ≈ 0 at depth. `SQUEEZEFS_IL_REAP_PARK_MAX` is the measurement
+/// lever (clamp 0..=4096, read once).
+const REAP_EVENT_PARK_MAX: usize = 2;
 
 fn reap_event_park_max() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
@@ -2112,12 +2118,13 @@ pub unsafe extern "C" fn io_cancel(ctx: u64, iocb: *mut RawIocb, evt: *mut RawIo
 mod reap_park_max_tests {
     use super::*;
 
-    /// The adjudicated default is 24 (2026-07-26 sizing, kept across the
-    /// 2026-07-28 doorbell pending the counted A/B); the env form is an
+    /// The adjudicated default is **2** (the 2026-07-28 Phase B counted
+    /// A/B — see the constant's doc: shared-session wake herding above
+    /// qd2, latency-contract event parks at/below); the env form is an
     /// explicit measurement lever, clamped, unparseable ⇒ default.
     #[test]
     fn reap_park_max_default_and_clamp() {
-        assert_eq!(reap_event_park_max_from(None), 24);
+        assert_eq!(reap_event_park_max_from(None), 2);
         assert_eq!(reap_event_park_max_from(Some("0")), 0);
         assert_eq!(reap_event_park_max_from(Some("64")), 64);
         assert_eq!(
@@ -2125,6 +2132,6 @@ mod reap_park_max_tests {
             4096,
             "clamp ceiling"
         );
-        assert_eq!(reap_event_park_max_from(Some("garbage")), 24);
+        assert_eq!(reap_event_park_max_from(Some("garbage")), 2);
     }
 }

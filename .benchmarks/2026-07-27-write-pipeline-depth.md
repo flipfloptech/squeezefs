@@ -158,22 +158,34 @@ engagement-exact (`ipc_ops_write` Δ = 16384 = user ops).
 
 ### 5.2 Dialed-latency venue (the mechanism row)
 
+Mid-campaign binary (`2797979`-era), medians of 3:
+
 | Cell | A MiB/s | B MiB/s | A aqu-sz | B aqu-sz | A depth_target |
 |---|---|---|---|---|---|
-| kernel 4t × 4M | **1652** | **361** | 47.4 | **2.0** | 136–195 MB (runtime-derived) |
+| kernel 4t × 4M | 1652 | 361 | 47.4 | **2.0** | 136–195 MB (runtime-derived) |
 | kernel 16t × 4M | 1667 | 1577 | 50.3 | 13.4 | 216–259 MB |
 
-**The 4t row is the field shape reproduced end-to-end: dev-tip walls at
-361 MiB/s with aqu-sz 2.0 — the same < 2 per-device depth the field
-iostat showed — while the depth-governed pipeline runs 1652 MiB/s
-(4.6×) at aqu-sz 47, its target grown by the governor from measured
-bandwidth × uncongested latency, not a constant.** At 16t the venue's
-daemon-CPU ceiling (~1.7 GiB/s) re-binds both binaries; the pipeline
-still holds 3.7× the queue depth. Against the dialed venue's fio
-ceilings the branch achieves 0.54× of qd32 (3.0 GiB/s) and ~0.90× of
-what its own achieved aqu would predict absent CPU limits; stated
-honestly: **on localhost rigs the post-depth wall is daemon data-path
-CPU, spread across cores (§6), not device depth.**
+**FINAL branch binary (`1a6a147`, all four §8 fixes in), medians of 3,
+quiet box:**
+
+| Cell | A MiB/s | B MiB/s | ratio | A aqu-sz | B aqu-sz | amp |
+|---|---|---|---|---|---|---|
+| kernel 4t × 4M (dialed) | **3939** | **374** | **10.5×** | 32–58 | **2.0** | 1.000 |
+| kernel 16t × 4M (zram) | 1284 | 1254 | 1.02× | 9.8 | 4.7 | 1.002 |
+| kernel 16t × 4M `--sync` (zram, durable-labeled) | 1195 | 1204 | 0.99× | 9.1 | 4.7 | 1.002 |
+
+**The 4t dialed row is the field shape reproduced end-to-end: dev-tip
+walls at 374 MiB/s with aqu-sz 2.0 — the same < 2 per-device depth the
+field iostat showed — while the depth-governed pipeline runs
+3,939 MiB/s (10.5×) at aqu-sz 32–58, its target grown by the governor
+from measured bandwidth × uncongested latency, not a constant.**
+Against the dialed venue's fio qd32×4 ceiling (4,528 MiB/s) the final
+branch achieves **0.87×**; against single-job qd32 (3,040 MiB/s),
+**1.30×** (elbencho spreads 4 files). At 16t the zram venue's daemon-CPU
+ceiling (~1.3–1.7 GiB/s) re-binds both binaries; the pipeline still
+holds ~2× the queue depth. Stated honestly: **on localhost rigs the
+post-depth wall is daemon data-path CPU, spread across cores (§6), not
+device depth.**
 
 ### 5.3 write_matrix (charter (c): 40-row sweep, REPS=1 RUNTIME=6 — reduced-rep
 

@@ -1826,7 +1826,7 @@ unsafe fn aio_reap_served(
             // regime — where the 200 µs/5 ms quantum actually shaped
             // completion latency and max-latency tails — stays fully
             // event-driven below.
-            if parks.len() > REAP_EVENT_PARK_MAX {
+            if parks.len() > reap_event_park_max() {
                 let quantum = std::time::Duration::from_micros(50);
                 let bound = match deadline {
                     None => quantum,
@@ -1954,11 +1954,26 @@ const RING_PARK_RECHECK: std::time::Duration = std::time::Duration::from_millis(
 /// per-ticket WAITER economics — one daemon wake syscall per completion
 /// plus an O(qd) waitv array per park; the 2026-07-28 completion
 /// doorbell collapsed both terms (one wait word per session, wakes only
-/// while registered), so this threshold is a Phase B re-measure
-/// candidate — kept verbatim until the counted A/B says otherwise.
-/// 24 keeps qd ≤ 16 pipelines fully event-driven (measured best there)
-/// and batches qd32+ (measured −6 % event-parked, recovered batched).
+/// while registered). Default 24 keeps qd ≤ 16 pipelines fully
+/// event-driven (measured best there) and batches qd32+;
+/// `SQUEEZEFS_IL_REAP_PARK_MAX` is the measurement A/B lever (the
+/// `SQUEEZEFS_IL_SPINS` precedent — clamp 0..=4096, read once), NOT an
+/// operational default change.
 const REAP_EVENT_PARK_MAX: usize = 24;
+
+fn reap_event_park_max() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        reap_event_park_max_from(std::env::var("SQUEEZEFS_IL_REAP_PARK_MAX").ok().as_deref())
+    })
+}
+
+/// Pure sizing form (unit-pinned like `service_spin_window_from`).
+fn reap_event_park_max_from(v: Option<&str>) -> usize {
+    v.and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(0, 4096))
+        .unwrap_or(REAP_EVENT_PARK_MAX)
+}
 
 /// # Safety
 /// C ABI interposer; argument contracts are libaio's own.
@@ -2090,5 +2105,26 @@ pub unsafe extern "C" fn io_cancel(ctx: u64, iocb: *mut RawIocb, evt: *mut RawIo
             panic_poison();
             fallback(real)
         }
+    }
+}
+
+#[cfg(test)]
+mod reap_park_max_tests {
+    use super::*;
+
+    /// The adjudicated default is 24 (2026-07-26 sizing, kept across the
+    /// 2026-07-28 doorbell pending the counted A/B); the env form is an
+    /// explicit measurement lever, clamped, unparseable ⇒ default.
+    #[test]
+    fn reap_park_max_default_and_clamp() {
+        assert_eq!(reap_event_park_max_from(None), 24);
+        assert_eq!(reap_event_park_max_from(Some("0")), 0);
+        assert_eq!(reap_event_park_max_from(Some("64")), 64);
+        assert_eq!(
+            reap_event_park_max_from(Some("999999")),
+            4096,
+            "clamp ceiling"
+        );
+        assert_eq!(reap_event_park_max_from(Some("garbage")), 24);
     }
 }

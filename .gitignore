@@ -19,3 +19,6 @@ dhat-heap.json
 # editor / assistant litter
 .gemini/
 .vscode/
+
+# cloud bench-cluster local state (tests/cloud_bench_cluster.sh)
+.cloud-bench/

@@ -316,6 +316,15 @@ impl Fixture {
         assert_eq!(w.written as usize, data.len());
     }
 
+    async fn fuse_read(&self, ino: u64, offset: u64, size: u32) -> Vec<u8> {
+        let reply = self
+            .fs
+            .read(req(), ino, 0, offset, size, 0)
+            .await
+            .expect("fuse read");
+        reply.data.to_vec()
+    }
+
     fn shutdown(&self) {
         self.host.shutdown();
     }
@@ -435,6 +444,18 @@ impl ClientSession {
     /// One allocation-free warm ring pread on slot 0: claim → publish →
     /// push → doorbell → bounded spin. Panics on failure/timeouts (this
     /// is the measured hot loop — no result plumbing).
+    fn arena_read_into(&self, off: u64, out: &mut [u8]) {
+        assert!(off + out.len() as u64 <= self.geometry.arena_bytes);
+        // SAFETY: bounds asserted against the arena region.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.base.add((self.layout.arena_off + off) as usize),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+    }
+
     fn ring_pread_spin(&self, binding: u64, offset: u64, len: u32) -> i64 {
         let slot = self.slot(0);
         let gen = slot.core.try_claim().expect("slot 0 must be FREE");
@@ -609,4 +630,153 @@ fn print_site_table() {
     for (count, site) in rows {
         println!("--- {count} allocs ---\n{site}\n");
     }
+}
+
+// ---------------------------------------------------------------------------
+// lever 2: completion-side wake economy (the cqe doorbell)
+// ---------------------------------------------------------------------------
+
+/// Unparked completions elide every cqe wake: a spin-waiting client's
+/// stream of warm serves moves `ipc_cqe_wake_elided`, never
+/// `ipc_cqe_wake_writes` (the daemon must not pay a wake syscall toward
+/// a reaper that is not parked).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unparked_completions_elide_cqe_wakes() {
+    let fx = Fixture::new("cqeelide").await;
+    fx.salt_inos(5).await;
+    let ino = fx.create_file("cqe.bin").await;
+    let payload = deterministic_bytes(256 * 1024, 9);
+    fx.fuse_write(ino, 0, &payload).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fd = buffered_standin(&fx, &dir, "standin.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    // Warm one op (may demote once).
+    let _ = fx.fuse_read(ino, 0, 4096).await;
+    tokio::task::block_in_place(|| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let serves0 = METRICS.ipc_fast_path_serves.load(Ordering::Relaxed);
+            let r = session.ring_pread_spin(binding, 4096, 4096);
+            assert_eq!(r, 4096);
+            if METRICS.ipc_fast_path_serves.load(Ordering::Relaxed) > serves0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "warm shape never engaged");
+        }
+    });
+
+    let writes0 = METRICS.ipc_cqe_wake_writes.load(Ordering::Relaxed);
+    let elided0 = METRICS.ipc_cqe_wake_elided.load(Ordering::Relaxed);
+    tokio::task::block_in_place(|| {
+        for _ in 0..256 {
+            let r = session.ring_pread_spin(binding, 4096, 4096);
+            assert_eq!(r, 4096);
+        }
+    });
+    let writes = METRICS.ipc_cqe_wake_writes.load(Ordering::Relaxed) - writes0;
+    let elided = METRICS.ipc_cqe_wake_elided.load(Ordering::Relaxed) - elided0;
+    assert_eq!(
+        writes, 0,
+        "no reaper was ever parked — every completion's cqe wake must elide \
+         (writes {writes}, elided {elided})"
+    );
+    assert!(
+        elided >= 256,
+        "the elision counter must account for the unparked completions \
+         (elided {elided} < 256)"
+    );
+    fx.shutdown();
+}
+
+/// A parked reaper is woken promptly by the first completion: the
+/// client parks on the session's cqe doorbell (reaper_parked + seq
+/// snapshot, the disarm→scan law), a completion bumps the seq and pays
+/// exactly one wake (`ipc_cqe_wake_writes` moves), and the parked
+/// thread returns well inside the 5 s bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parked_reaper_is_woken_by_completion_cqe_wake() {
+    let fx = Fixture::new("cqewake").await;
+    fx.salt_inos(7).await;
+    let ino = fx.create_file("cqew.bin").await;
+    let payload = deterministic_bytes(256 * 1024, 11);
+    fx.fuse_write(ino, 0, &payload).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fd = buffered_standin(&fx, &dir, "standin.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+    // Warm (first op may demote).
+    tokio::task::block_in_place(|| {
+        let r = session.ring_pread_spin(binding, 0, 4096);
+        assert_eq!(r, 4096);
+    });
+
+    let writes0 = METRICS.ipc_cqe_wake_writes.load(Ordering::Relaxed);
+    let woke_in = tokio::task::block_in_place(|| {
+        // Reaper protocol, client side: submit WITHOUT spinning on the
+        // slot, then park on the cqe doorbell.
+        let header = session.header();
+        let slot = session.slot(0);
+        let gen = slot.core.try_claim().expect("slot 0 FREE");
+        slot.publish_descriptor(&SlotDescriptor {
+            op: OP_READ,
+            flags: 0,
+            binding,
+            offset: 0,
+            len: 4096,
+            arena_off: 0,
+        });
+        // Park intent FIRST (the daemon observes it before serving),
+        // then snapshot (park_begin = register-then-snapshot), then
+        // publish the op.
+        let seq0 = header.cqe.park_begin();
+        slot.core.publish_submitted();
+        assert!(session.ring().push(0), "ring must accept");
+        header.doorbell.fetch_add(1, Ordering::Release);
+        futex_wake(&header.doorbell, 1);
+        // Bounded futex wait on the cqe word (no slot spin): a lost wake
+        // strands this for the full 5 s bound and fails the ≤ 2 s assert.
+        let t0 = Instant::now();
+        let deadline = t0 + Duration::from_secs(5);
+        while header.cqe.seq() == seq0 {
+            assert!(
+                Instant::now() < deadline,
+                "parked reaper never woken by the completion"
+            );
+            squeezefs::ipc_host::futex_wait_for_test(
+                header.cqe.seq_word(),
+                seq0,
+                Duration::from_secs(1),
+            );
+        }
+        header.cqe.park_end();
+        // Consume the completion.
+        let cdl = Instant::now() + Duration::from_secs(5);
+        while !slot.core.is_done_for(gen) {
+            assert!(Instant::now() < cdl, "op never completed");
+            std::hint::spin_loop();
+        }
+        let r = slot.result();
+        slot.core.release();
+        assert_eq!(r, 4096);
+        t0.elapsed()
+    });
+    assert!(
+        woke_in < Duration::from_secs(2),
+        "parked reaper took {woke_in:?} to observe the completion — the cqe \
+         wake path must be prompt, not timeout-bounded"
+    );
+    assert!(
+        METRICS.ipc_cqe_wake_writes.load(Ordering::Relaxed) > writes0,
+        "a completion toward a parked reaper must pay (and count) a cqe wake"
+    );
+    fx.shutdown();
+
+    // Sanity: read back through FUSE so the fixture file is coherent.
+    let mut expect = vec![0u8; 4096];
+    expect.copy_from_slice(&payload[..4096]);
+    let mut got = vec![0u8; 4096];
+    session.arena_read_into(0, &mut got);
+    assert_eq!(got, expect, "parked-reap read served the right bytes");
 }

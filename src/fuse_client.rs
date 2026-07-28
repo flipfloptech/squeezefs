@@ -2912,6 +2912,16 @@ pub struct Metrics {
     /// write-storm economy gauge (notifies ≫ suppressed on rand-write
     /// workloads = window regression).
     pub ipc_inval_suppressed: Align64<AtomicU64>,
+    /// Completion-doorbell wakes PAID (op-economy 2026-07-28, the
+    /// `transport_wake_*` naming discipline): a completion observed a
+    /// parked reaper and issued the cqe `FUTEX_WAKE`. Sparse-regime
+    /// tails ride these; ≈ 0 at spin/deep saturation.
+    pub ipc_cqe_wake_writes: Align64<AtomicU64>,
+    /// Completion-doorbell wakes ELIDED (no reaper parked) — the wake
+    /// economy gauge: `writes/(writes+elided) ≈ 1` under a saturated
+    /// reaping client means the parked gate stopped eliding (the
+    /// pre-campaign one-wake-syscall-per-completion posture).
+    pub ipc_cqe_wake_elided: Align64<AtomicU64>,
     /// DIALED P1 direct-drive families (design-preload-interception
     /// §5.5/§12 fallback shape; `perf/ipc-direct-drive`): governed ranged
     /// ring reads the service thread submitted DIRECTLY on the ipc-host-
@@ -4779,6 +4789,8 @@ impl SqueezefsFilesystem {
                 "ipc_sessions_reaped": METRICS.ipc_sessions_reaped.load(Ordering::Relaxed),
                 "ipc_inval_notifies": METRICS.ipc_inval_notifies.load(Ordering::Relaxed),
                 "ipc_inval_suppressed": METRICS.ipc_inval_suppressed.load(Ordering::Relaxed),
+                "ipc_cqe_wake_writes": METRICS.ipc_cqe_wake_writes.load(Ordering::Relaxed),
+                "ipc_cqe_wake_elided": METRICS.ipc_cqe_wake_elided.load(Ordering::Relaxed),
                 // DIALED P1 direct-drive (perf/ipc-direct-drive): the
                 // governed miss shape served from the ipc-host uring +
                 // the prelude decision ledger.

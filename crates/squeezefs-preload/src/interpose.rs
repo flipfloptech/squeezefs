@@ -1815,15 +1815,14 @@ unsafe fn aio_reap_served(
                 std::thread::sleep(std::time::Duration::from_micros(200));
                 continue;
             }
-            // Ring ops pending, nothing ready. Deep-pending sets batch on
-            // a SHORT bounded sleep instead of event-parking: at qd32
-            // saturation an event park costs a full waitv cycle client-
-            // side plus one daemon futex_wake syscall PER COMPLETION
-            // (the WAITER bit), where the old ladder amortized several
-            // completions per wake — measured −6 % on t32qd32 (sizing
-            // note §5). The quantum is 50 µs (¼ the old ladder's), only
-            // ever taken with ≥ REAP_EVENT_PARK_MAX ops in flight, so
-            // its latency contribution is bounded by depth; the SPARSE
+            // Ring ops pending, nothing ready. Deep-pending sets batch
+            // on a SHORT bounded sleep instead of event-parking (sized
+            // 2026-07-26 under the per-ticket WAITER economics; the
+            // completion doorbell collapsed those costs — see the
+            // REAP_EVENT_PARK_MAX doc — so the threshold is a Phase B
+            // re-measure candidate). The quantum is 50 µs, only ever
+            // taken with ≥ REAP_EVENT_PARK_MAX ops in flight, so its
+            // latency contribution is bounded by depth; the SPARSE
             // regime — where the 200 µs/5 ms quantum actually shaped
             // completion latency and max-latency tails — stays fully
             // event-driven below.
@@ -1864,28 +1863,50 @@ unsafe fn aio_reap_served(
             if ready {
                 continue;
             }
-            // Park admission per pending ticket (sets the WAITER bit the
-            // daemon's completion wakes; a Ready here means a completion
-            // raced the snapshot — re-harvest immediately). The wait is
-            // bounded: ring-only shapes re-check on a coarse cap (cross-
-            // thread submits add tickets this wait does not cover);
-            // both-lanes shapes cap at the kernel-probe slice (kernel
-            // completions cannot wake a futex).
-            let mut entries: Vec<crate::session::WaitEntry<'static>> =
-                Vec::with_capacity(parks.len().min(128));
-            for (token, t) in parks.iter().take(128) {
+            // Park admission per DISTINCT session (op-economy
+            // 2026-07-28; replaces the per-ticket WAITER parks): register
+            // on each session's completion doorbell — register-then-
+            // snapshot (`cqe_park_begin`) — then RE-SCAN the pending set
+            // (the disarm→scan law: a completion that beat the
+            // registration is found here, and one that lands after it
+            // either fails the wait's admission or pays the wake — the
+            // `ipc_cqe_parked_reaper_never_stranded` loom model). One
+            // wait word per session (≤ the IL_SESSIONS shard count)
+            // instead of a `futex_waitv` array per pending ticket, and
+            // the daemon pays completion wakes ONLY while this park is
+            // registered. The wait stays bounded: ring-only shapes
+            // re-check on a coarse cap (cross-thread submits on OTHER
+            // ctxs sharing a session wake us spuriously — bounded,
+            // re-scan); both-lanes shapes cap at the kernel-probe slice
+            // (kernel completions cannot wake a futex).
+            let mut entries: Vec<crate::session::WaitEntry<'static>> = Vec::with_capacity(4);
+            let mut parked_tokens: Vec<usize> = Vec::with_capacity(4);
+            for (token, _) in parks.iter() {
+                if parked_tokens.contains(token) {
+                    continue;
+                }
                 let Some(session) = registry().by_token(*token) else {
                     continue; // session gone: its poll resolves next pass
                 };
-                match session.ticket_wait_entry(*t) {
-                    Some(e) => entries.push(e),
-                    None => {
-                        ready = true; // completed in the gap
-                        break;
-                    }
+                entries.push(session.cqe_park_begin());
+                parked_tokens.push(*token);
+            }
+            // The mandatory post-registration re-scan.
+            for (token, t) in parks.iter() {
+                if registry()
+                    .by_token(*token)
+                    .is_some_and(|s| s.ticket_done(*t))
+                {
+                    ready = true;
+                    break;
                 }
             }
             if ready || entries.is_empty() {
+                for token in &parked_tokens {
+                    if let Some(s) = registry().by_token(*token) {
+                        s.cqe_park_end();
+                    }
+                }
                 if entries.is_empty() && !ready {
                     // No waitable session (all poisoned/gone): the next
                     // pass resolves the tickets as -EIO; don't spin the
@@ -1906,6 +1927,11 @@ unsafe fn aio_reap_served(
                     .min(cap),
             };
             crate::session::wait_any(&entries, bound);
+            for token in &parked_tokens {
+                if let Some(s) = registry().by_token(*token) {
+                    s.cqe_park_end();
+                }
+            }
         }
     }
 }
@@ -1918,15 +1944,18 @@ unsafe fn aio_reap_served(
 const KERNEL_LANE_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// Ring-only park cap: the wake is event-driven (the daemon FUTEX_WAKEs
-/// the slot word), so this bound only covers tickets the wait does not
-/// — cross-thread submits after the snapshot and > FUTEX_WAITV_MAX
-/// pending sets.
+/// the session completion doorbell while a reaper is registered), so
+/// this bound only covers what the wait does not — cross-thread submits
+/// on sessions this park never registered on.
 const RING_PARK_RECHECK: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Above this many in-flight ring ops the reap batches on a 50 µs
-/// bounded sleep instead of event-parking (per-completion wake cost
-/// exceeds the deep-regime quantum's amortized latency share; the
-/// sparse regime — where quantums shaped tails — stays event-driven).
+/// bounded sleep instead of event-parking. Sized (2026-07-26) under the
+/// per-ticket WAITER economics — one daemon wake syscall per completion
+/// plus an O(qd) waitv array per park; the 2026-07-28 completion
+/// doorbell collapsed both terms (one wait word per session, wakes only
+/// while registered), so this threshold is a Phase B re-measure
+/// candidate — kept verbatim until the counted A/B says otherwise.
 /// 24 keeps qd ≤ 16 pipelines fully event-driven (measured best there)
 /// and batches qd32+ (measured −6 % event-parked, recovered batched).
 const REAP_EVENT_PARK_MAX: usize = 24;

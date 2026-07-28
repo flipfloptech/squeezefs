@@ -824,26 +824,33 @@ impl Session {
         self.slot(t.slot).core.is_done_for(t.gen)
     }
 
-    /// Park admission for one in-flight ticket (the 2026-07-26
-    /// event-driven reap): sets the slot's WAITER bit and returns the
-    /// `(futex word, expected value)` pair a [`wait_any`] over the
-    /// pending set sleeps on. `None` = the slot is already DONE
-    /// (possibly for a LATER generation — a recycled slot; either way:
-    /// do not park, re-harvest). The admission is race-free by the slot
-    /// protocol: a completion racing this RMW either observes the
-    /// WAITER bit (the daemon wakes the word) or changes the word so
-    /// the wait's admission fails — `park_prepare`'s publish-then-
-    /// recheck shape, verified by the `ipc_slot_multi_park_admission_
-    /// never_strands` loom model.
-    pub fn ticket_wait_entry(&self, t: OpTicket) -> Option<WaitEntry<'_>> {
-        let slot = self.slot(t.slot);
-        match slot.core.park_prepare() {
-            ParkOutcome::Ready => None,
-            ParkOutcome::Park { expected } => Some(WaitEntry {
-                word: slot.core.state_futex_word(),
-                expected,
-            }),
+    /// Completion-doorbell park entry (op-economy 2026-07-28; replaces
+    /// the per-ticket slot-WAITER parks): register parked intent on the
+    /// session's [`CqeDoorbell`] and snapshot the expected seq —
+    /// register-then-snapshot, then the caller MUST re-scan its pending
+    /// set (the disarm→scan law) before sleeping on the returned entry.
+    /// One session = one wait word regardless of pending depth (the
+    /// former shape built a `futex_waitv` array per PENDING TICKET —
+    /// O(qd) setup per park — and made the daemon pay one wake syscall
+    /// per completion toward the WAITER bits; the doorbell pays wakes
+    /// only while a reaper is parked, elision loom-verified by
+    /// `ipc_cqe_parked_reaper_never_stranded`). Balance every call with
+    /// [`Self::cqe_park_end`].
+    ///
+    /// [`CqeDoorbell`]: squeezefs_ipc::cqe_core::CqeDoorbell
+    pub fn cqe_park_begin(&self) -> WaitEntry<'_> {
+        let cqe = &self.header().cqe;
+        let expected = cqe.park_begin();
+        WaitEntry {
+            word: cqe.seq_word(),
+            expected,
         }
+    }
+
+    /// Deregister a [`Self::cqe_park_begin`] after the wait returns
+    /// (wake, EAGAIN, or timeout — every §5.3.1-rule-5-bounded exit).
+    pub fn cqe_park_end(&self) {
+        self.header().cqe.park_end();
     }
 
     /// Non-blocking completion probe. `Some(res)` CONSUMES the ticket

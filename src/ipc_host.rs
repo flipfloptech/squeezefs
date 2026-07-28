@@ -301,6 +301,19 @@ impl SlotCompletion {
             // pinned by `slot_completion_wakes_every_parked_waiter`.
             futex_wake(slot.core.state_futex_word(), i32::MAX);
         }
+        // Completion doorbell (op-economy 2026-07-28): bump the session
+        // cqe seq; pay the wake ONLY toward a parked reaper (the
+        // `ipc_cqe_doorbell_*` loom-verified elision — an unparked
+        // reaping client costs zero completion wake syscalls, the former
+        // per-completion collect-and-wake serialization term). Breadth
+        // i32::MAX: every parked reaper on the session re-scans.
+        let cqe = &self.map.header().cqe;
+        if cqe.complete() {
+            METRICS.ipc_cqe_wake_writes.fetch_add(1, Ordering::Relaxed);
+            futex_wake(cqe.seq_word(), i32::MAX);
+        } else {
+            METRICS.ipc_cqe_wake_elided.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -2106,6 +2119,14 @@ pub fn futex_wake(word: &AtomicU32, n: i32) {
             0u32,
         );
     }
+}
+
+/// Bounded `FUTEX_WAIT` for the in-process test harnesses (the op-economy
+/// suite's raw-protocol reaper parks on the session cqe word exactly like
+/// the shim's reap loop). Production daemon code never waits through this
+/// — the daemon only wakes.
+pub fn futex_wait_for_test(word: &AtomicU32, expected: u32, timeout: Duration) {
+    futex_wait(word, expected, timeout);
 }
 
 /// Bounded `FUTEX_WAIT`: sleep while `*word == expected`, at most

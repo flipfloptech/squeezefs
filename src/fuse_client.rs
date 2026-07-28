@@ -13661,6 +13661,21 @@ pub async fn start_mount<P: AsRef<Path>>(
                         move |target| host.shed_to(target)
                     }),
                 );
+                // Ingest-economy 2026-07-28: severed-write buffer retention
+                // is R5-visible as its own NON-SHEDDABLE component (the
+                // `write_pipeline_inflight` pattern): pooled buffers are
+                // peak-in-flight working set structurally bounded by the
+                // same session-shm cap the arenas ride, and they converge
+                // by reuse, never by shedding — the budget must SEE the
+                // bytes (Yellow/Red engage honestly) without a shed hook
+                // that could not act.
+                crate::mem_budget::MEM_BUDGET.register(crate::mem_budget::Component::new(
+                    "ipc_severed_buffers",
+                    0,
+                    1,
+                    std::sync::Arc::new(|| METRICS.ipc_severed_pool_bytes.load(Ordering::Relaxed)),
+                    std::sync::Arc::new(|_| {}),
+                ));
                 info!(
                     "IPC session host armed (socket {}, session shm cap {} MiB)",
                     host.socket_name(),

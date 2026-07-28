@@ -104,7 +104,11 @@ slots = `arena_cap_bytes / max_op_bytes` (the structural in-flight
 bound — severed bytes in flight can never exceed the R5-admitted
 session arenas), railed 1..=65536; retention gauged
 (`ipc_severed_pool_bytes`), reuse-health counters
-(`ipc_severed_pool_{hits,misses}`). `crossbeam::queue::ArrayQueue` is a
+(`ipc_severed_pool_{hits,misses}`). Retention is R5-visible as its own
+NON-SHEDDABLE component (`ipc_severed_buffers`, the
+`write_pipeline_inflight` pattern): the budget sees the bytes —
+Yellow/Red engage honestly — while convergence stays by-reuse (a shed
+hook could not act on live in-flight custody). `crossbeam::queue::ArrayQueue` is a
 shipped dependency core, not a new house lock-free algorithm — no loom
 model owed. Standing pin:
 `production_write_sever_recycles_pooled_buffers`
@@ -394,3 +398,26 @@ zero-waiting-connections residue sweep after the runs.
   zero_buffers = device-bound vs client-bound regimes) is this rig's
   face of the standing instrument-alignment lesson — both stated on
   every row here.
+
+## 8. Board items (filed)
+
+1. **Sever-into-ActiveBlockBuf** — the next ingest lever: post-campaign
+   the kernel path out-streams the ring path ~15 % at t16-b4m
+   (11.7 vs 9.9–10.1 GiB/s) because a ring write still pays shim-copy +
+   sever-copy + merge vs the kernel path's payload-lease + merge.
+   Severing DIRECTLY into the exclusive-owner ActiveBlockBuf would fold
+   two copies into one — an OQ-3-class write-fast-path design question
+   (service-thread custody vs the inode/flush lock order), deliberately
+   NOT taken in this campaign.
+2. **fuse3 TPC lane-death dispatch blackhole** — a panicked lane task
+   is caught by tokio, but a DEAD lane thread (any escaped panic /
+   spawn failure) leaves its mpsc sender in the round-robin: 1/N of all
+   future handler dispatches silently drop (`let _ = send(...)`).
+   Deserves a panic-guard/respawn or closed-channel re-dispatch,
+   independent of the merged watchdog fix.
+3. **Streaming partial-union flushes** — the mystery-reads residual:
+   why does ~1 block/file flush before its coverage union completes at
+   full streaming rate (the `overwrite_seed_materialized` trickle)?
+   Bounded (~0.4 % of blocks, ~1 % of field bandwidth), legitimate, but
+   a targeted look at the flush boundary racing 4-chunk ring reassembly
+   could zero it.

@@ -872,7 +872,7 @@ async fn write_rig_phases_and_sites_record() {
 
 async fn read_stats_json(h: &H) -> serde_json::Value {
     let opened =
-        h.fs.open(h.req, STATS_INODE, libc::O_RDONLY as u32)
+        h.fs.open(h.req, STATS_INODE, libc::O_RDONLY as u32, 0)
             .await
             .expect("open .stats");
     let data =

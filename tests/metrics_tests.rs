@@ -153,7 +153,7 @@ async fn stats_snapshot_getattr_size_matches_served_bytes_under_churn() {
             .expect("lookup .stats");
         // … OPEN (pins a generation) …
         let opened = fs
-            .open(req, STATS_INODE, libc::O_RDONLY as u32)
+            .open(req, STATS_INODE, libc::O_RDONLY as u32, 0)
             .await
             .expect("open .stats");
         // … counters churn (a storm is running; here: force a size-visible

@@ -55,6 +55,10 @@ pub const FATTR_ATIME_NOW: u32 = 1 << 7;
 pub const FATTR_MTIME_NOW: u32 = 1 << 8;
 pub const FATTR_LOCKOWNER: u32 = 1 << 9;
 pub const FATTR_CTIME: u32 = 1 << 10;
+/// FUSE_HANDLE_KILLPRIV_V2: the daemon must clear suid / group-exec
+/// sgid / security.capability alongside this SETATTR (size-changing
+/// truncates by non-CAP_FSETID callers; non-directory chowns).
+pub const FATTR_KILL_SUIDGID: u32 = 1 << 11;
 
 #[cfg(target_os = "macos")]
 pub const FATTR_CRTIME: u32 = 1 << 28;
@@ -154,6 +158,15 @@ pub const FUSE_EXPLICIT_INVAL_DATA: u32 = 1 << 25;
 /// map_alignment field is valid
 pub const FUSE_MAP_ALIGNMENT: u32 = 1 << 26;
 
+/// fs kills suid/sgid/cap on write/chown/trunc — v2 (Linux ≥ 5.11):
+/// unlike v1's unconditional kill, the kernel only flags requests whose
+/// caller lacks CAP_FSETID (write/trunc) and the daemon must preserve
+/// sgid on non-group-exec files (the mandatory-locking-marker class).
+/// Negotiating this deletes the kernel's per-write(2)
+/// GETXATTR("security.capability") killpriv probe (the OQ-1 §4 finding:
+/// half of every write-syscall-bound stream's requests).
+pub const FUSE_HANDLE_KILLPRIV_V2: u32 = 1 << 28;
+
 /// extended fuse_init_in request (fuse ≥ 7.36): `flags2` at byte offset
 /// 16 carries init flag bits 32..63 (`FUSE_OVER_IO_URING` = bit 41 lives
 /// there). `handle_init` folds it into the published `KernelInit`
@@ -196,6 +209,16 @@ pub const FUSE_WRITE_CACHE: u32 = 1 << 0;
 #[allow(dead_code)]
 /// lock_owner field is valid
 pub const FUSE_WRITE_LOCKOWNER: u32 = 1 << 1;
+
+/// FUSE_HANDLE_KILLPRIV_V2: kill suid + group-exec sgid + the
+/// security.capability xattr for this WRITE (caller lacks CAP_FSETID).
+pub const FUSE_WRITE_KILL_SUIDGID: u32 = 1 << 2;
+
+// Open flags (fuse_open_in.open_flags)
+/// FUSE_HANDLE_KILLPRIV_V2: kill suid + group-exec sgid + the
+/// security.capability xattr on this O_TRUNC open (caller lacks
+/// CAP_FSETID).
+pub const FUSE_OPEN_KILL_SUIDGID: u32 = 1 << 0;
 
 #[allow(dead_code)]
 // Read flags
@@ -650,7 +673,9 @@ pub struct fuse_setattr_in {
 #[allow(non_camel_case_types)]
 pub struct fuse_open_in {
     pub flags: u32,
-    pub(crate) _unused: u32,
+    /// `FUSE_OPEN_*` bits (uapi ≥ 7.33; zero on older kernels) —
+    /// carries [`FUSE_OPEN_KILL_SUIDGID`] under FUSE_HANDLE_KILLPRIV_V2.
+    pub open_flags: u32,
 }
 
 pub const FUSE_CREATE_IN_SIZE: usize = mem::size_of::<fuse_create_in>();

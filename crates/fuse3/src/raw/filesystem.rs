@@ -147,8 +147,20 @@ pub trait Filesystem {
     ///
     /// See `fuse_file_info` structure in
     /// [fuse_common.h](https://libfuse.github.io/doxygen/include_2fuse__common_8h_source.html) for
-    /// more details.
-    async fn open(&self, req: Request, inode: Inode, flags: u32) -> Result<ReplyOpen> {
+    /// more details. `open_flags` carries the kernel's `FUSE_OPEN_*`
+    /// request bits (`fuse_open_in.open_flags` — zero on kernels older
+    /// than 7.33): under FUSE_HANDLE_KILLPRIV_V2,
+    /// [`FUSE_OPEN_KILL_SUIDGID`](crate::raw::flags::FUSE_OPEN_KILL_SUIDGID)
+    /// arrives here on O_TRUNC opens by non-CAP_FSETID callers and the
+    /// handler must clear suid / group-exec sgid / security.capability.
+    async fn open(
+        &self,
+        req: Request,
+        inode: Inode,
+        flags: u32,
+        open_flags: u32,
+    ) -> Result<ReplyOpen> {
+        let _ = open_flags;
         Err(libc::ENOSYS.into())
     }
 

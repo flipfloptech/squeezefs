@@ -10183,7 +10183,13 @@ impl Filesystem for SqueezefsFilesystem {
         res
     }
 
-    async fn open(&self, req: Request, inode: Inode, flags: u32) -> FuseResult<ReplyOpen> {
+    async fn open(
+        &self,
+        req: Request,
+        inode: Inode,
+        flags: u32,
+        _open_flags: u32,
+    ) -> FuseResult<ReplyOpen> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         // VL8 item 2: register (the live wedge held 4 opens invisibly).
         let _prof = OpProf::begin(FuseOpKind::Open, inode);

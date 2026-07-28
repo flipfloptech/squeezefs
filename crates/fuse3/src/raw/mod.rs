@@ -18,7 +18,8 @@ use futures_util::future::Either;
 pub use request::Request;
 #[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
 pub use session::{
-    kernel_init_info, tpc_spawn, tpc_thread_count, KernelInit, MountHandle, Session,
+    kernel_init_info, negotiated_reply_flags, tpc_spawn, tpc_thread_count, KernelInit, MountHandle,
+    Session,
 };
 
 pub(crate) type FuseData = Either<

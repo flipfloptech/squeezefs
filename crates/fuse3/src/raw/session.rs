@@ -108,6 +108,22 @@ pub fn kernel_init_info() -> Option<KernelInit> {
     KERNEL_INIT.get().copied()
 }
 
+/// The classical reply-flags word this process's first session actually
+/// echoed back to the kernel (the intersection of the kernel's offer and
+/// the daemon's implemented capabilities — one kernel, one negotiation
+/// per process, like [`KERNEL_INIT`]).
+static NEGOTIATED_REPLY_FLAGS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// The INIT reply flags this process advertised to the kernel (`None`
+/// until a session has processed `FUSE_INIT`). The daemon's capability
+/// gauges read this — e.g. `fuse_killpriv_negotiated` is
+/// `flags & FUSE_HANDLE_KILLPRIV_V2` (the killpriv campaign), which
+/// [`kernel_init_info`] alone cannot answer (that is the kernel's OFFER,
+/// not what we accepted).
+pub fn negotiated_reply_flags() -> Option<u32> {
+    NEGOTIATED_REPLY_FLAGS.get().copied()
+}
+
 /// A Future which returns when a file system is unmounted
 ///
 /// when drop the [`MountHandle`], it will unmount Filesystem in background task, if user want to
@@ -1251,6 +1267,10 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         ));
 
         let reply_flags = negotiate_reply_flags(init_in.flags, &self.mount_options);
+        // Published BEFORE `fs.init` (like KERNEL_INIT above) so the
+        // filesystem's init hook can gauge what was actually accepted
+        // (fuse_killpriv_negotiated et al.).
+        let _ = NEGOTIATED_REPLY_FLAGS.set(reply_flags);
 
         // TODO: pass init_in to init, so the file system will know which flags are in use.
         let reply = match fs.init(request).await {
@@ -2276,11 +2296,14 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         spawn(debug_span!("fuse_open"), async move {
             debug!(
-                "open unique {} inode {} flags {}",
-                request.unique, in_header.nodeid, open_in.flags
+                "open unique {} inode {} flags {} open_flags {}",
+                request.unique, in_header.nodeid, open_in.flags, open_in.open_flags
             );
 
-            let opened = match fs.open(request, in_header.nodeid, open_in.flags).await {
+            let opened = match fs
+                .open(request, in_header.nodeid, open_in.flags, open_in.open_flags)
+                .await
+            {
                 Err(err) => {
                     reply_error_in_place(err, request, resp_sender).await;
 
@@ -4824,6 +4847,17 @@ fn negotiate_reply_flags(init_in_flags: u32, mount_options: &MountOptions) -> u3
         debug!("enable FUSE_HANDLE_KILLPRIV");
 
         reply_flags |= FUSE_HANDLE_KILLPRIV;
+    }
+
+    // Killpriv v2 (the 2026-07-28 campaign): deletes the kernel's
+    // per-write(2) GETXATTR("security.capability") probe — the daemon
+    // must implement the clearing law (suid always; sgid only when
+    // group-executable; drop security.capability) on flagged
+    // WRITE/OPEN/SETATTR, which is what the mount option attests.
+    if init_in_flags & FUSE_HANDLE_KILLPRIV_V2 > 0 && mount_options.handle_killpriv_v2 {
+        debug!("enable FUSE_HANDLE_KILLPRIV_V2");
+
+        reply_flags |= FUSE_HANDLE_KILLPRIV_V2;
     }
 
     // FUSE_POSIX_ACL is deliberately NOT echoed: the daemon implements no

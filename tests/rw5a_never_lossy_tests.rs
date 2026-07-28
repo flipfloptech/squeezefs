@@ -659,7 +659,7 @@ async fn release_while_other_handles_open_keeps_the_lease() {
     let _g = serial().await;
     let h = make(*b"rw5a_lease_keep!", "rw5a_lease_a", "64MB").await;
     let ino = create(&h, "shared").await; // create() opens handle #1
-    h.fs.open(h.req, ino, libc::O_RDWR as u32).await.unwrap(); // handle #2
+    h.fs.open(h.req, ino, libc::O_RDWR as u32, 0).await.unwrap(); // handle #2
 
     write_at(&h, ino, 0, &pat(8192, 0x31)).await;
     let tok_before = h.fs.dlm().get_fencing_token_ino(ino);

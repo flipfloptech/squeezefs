@@ -216,7 +216,7 @@ impl Rng {
 /// pattern, ODD units keep the faulted bytes, and the kernel writes back
 /// WHOLE dirty pages — out of order, coalesced, concurrent.
 async fn run_generation(h: &HRef, ino: u64, generation: u32, rng: &mut Rng) {
-    h.fs.open(h.req, ino, (libc::O_RDWR | libc::O_TRUNC) as u32)
+    h.fs.open(h.req, ino, (libc::O_RDWR | libc::O_TRUNC) as u32, 0)
         .await
         .expect("open(O_TRUNC)");
     truncate_to(h, ino, FILE_SIZE as u64).await;
@@ -415,7 +415,7 @@ async fn open_o_trunc_truncates_daemon_state() {
 
     // The kernel's atomic-O_TRUNC open: FUSE_OPEN with O_TRUNC, NO
     // SETATTR follows (that is the negotiated contract).
-    h.fs.open(h.req, ino, (libc::O_RDWR | libc::O_TRUNC) as u32)
+    h.fs.open(h.req, ino, (libc::O_RDWR | libc::O_TRUNC) as u32, 0)
         .await
         .expect("open(O_TRUNC)");
 
@@ -489,7 +489,7 @@ async fn open_o_trunc_never_races_lease_churn_into_eio() {
             }
         });
         let opened =
-            h.fs.open(h.req, ino, (libc::O_RDWR | libc::O_TRUNC) as u32)
+            h.fs.open(h.req, ino, (libc::O_RDWR | libc::O_TRUNC) as u32, 0)
                 .await;
         acquirer.await.expect("acquirer task");
         assert!(

@@ -42,6 +42,7 @@ pub struct MountOptions {
     pub(crate) no_open_support: bool,
     pub(crate) no_open_dir_support: bool,
     pub(crate) handle_killpriv: bool,
+    pub(crate) handle_killpriv_v2: bool,
     pub(crate) write_back: bool,
     pub(crate) force_readdir_plus: bool,
 
@@ -183,6 +184,22 @@ impl MountOptions {
     /// fs handle killing `suid`/`sgid`/`cap` on `write`/`chown`/`trunc`, default is disable.
     pub fn handle_killpriv(&mut self, handle_killpriv: bool) -> &mut Self {
         self.handle_killpriv = handle_killpriv;
+
+        self
+    }
+
+    /// fs handles killing `suid`/`sgid`/`cap` on `write`/`chown`/`trunc`
+    /// under the **v2** contract (`FUSE_HANDLE_KILLPRIV_V2`, Linux ≥ 5.11):
+    /// the kernel stops its per-write(2) `GETXATTR("security.capability")`
+    /// killpriv probe and instead flags requests
+    /// (`FUSE_WRITE_KILL_SUIDGID` / `FUSE_OPEN_KILL_SUIDGID` /
+    /// `FATTR_KILL_SUIDGID`) whose handler must clear S_ISUID always,
+    /// S_ISGID only when the file is group-executable (sgid without
+    /// group-exec is the mandatory-locking marker and must survive), and
+    /// drop the `security.capability` xattr. Default is disable — only
+    /// enable when the filesystem implements that clearing law.
+    pub fn handle_killpriv_v2(&mut self, handle_killpriv_v2: bool) -> &mut Self {
+        self.handle_killpriv_v2 = handle_killpriv_v2;
 
         self
     }

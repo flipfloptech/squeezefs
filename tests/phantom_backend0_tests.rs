@@ -607,7 +607,7 @@ async fn cat_virtual(h: &H, ino: u64) -> (u64, Vec<u8>) {
             .await
             .expect("lookup virtual inode");
     let opened =
-        h.fs.open(h.req, ino, libc::O_RDONLY as u32)
+        h.fs.open(h.req, ino, libc::O_RDONLY as u32, 0)
             .await
             .expect("open virtual inode");
     let attr =

@@ -31,8 +31,8 @@ pub use helper::{mode_from_kind_and_perm, perm_from_mode_and_kind};
 pub use mount_options::MountOptions;
 use nix::sys::stat::mode_t;
 use raw::abi::{
-    fuse_setattr_in, FATTR_ATIME, FATTR_ATIME_NOW, FATTR_CTIME, FATTR_GID, FATTR_LOCKOWNER,
-    FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID,
+    fuse_setattr_in, FATTR_ATIME, FATTR_ATIME_NOW, FATTR_CTIME, FATTR_GID, FATTR_KILL_SUIDGID,
+    FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID,
 };
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use raw::{
@@ -115,6 +115,12 @@ pub struct SetAttr {
     pub mtime: Option<Timestamp>,
     /// set file or directory ctime.
     pub ctime: Option<Timestamp>,
+    /// `FATTR_KILL_SUIDGID` (FUSE_HANDLE_KILLPRIV_V2): the handler must
+    /// clear S_ISUID, clear S_ISGID only when the file is
+    /// group-executable (sgid without group-exec — the
+    /// mandatory-locking marker — must be preserved), and drop the
+    /// `security.capability` xattr, folded into this SETATTR's commit.
+    pub kill_suidgid: bool,
     #[cfg(target_os = "macos")]
     pub crtime: Option<Timestamp>,
     #[cfg(target_os = "macos")]
@@ -192,6 +198,10 @@ impl From<&fuse_setattr_in> for SetAttr {
 
         if setattr_in.valid & FATTR_CTIME > 0 {
             set_attr.ctime = fsai2ts!(setattr_in.ctime, setattr_in.ctimensec);
+        }
+
+        if setattr_in.valid & FATTR_KILL_SUIDGID > 0 {
+            set_attr.kill_suidgid = true;
         }
 
         set_attr

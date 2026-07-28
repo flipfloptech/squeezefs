@@ -666,7 +666,10 @@ async fn release(h: &H, ino: u64) {
 }
 
 async fn open(h: &H, ino: u64) {
-    let _ = h.fs.open(h.req, ino, libc::O_RDONLY as u32).await.unwrap();
+    let _ =
+        h.fs.open(h.req, ino, libc::O_RDONLY as u32, 0)
+            .await
+            .unwrap();
 }
 
 /// Never-dirtied handle: FLUSH and RELEASE take the fast path (counters
@@ -1163,7 +1166,7 @@ async fn open_racing_reclaim_never_reads_a_destroyed_ino() {
             tokio::spawn(async move {
                 let mut granted = 0u32;
                 while !done.load(std::sync::atomic::Ordering::Acquire) {
-                    match h.fs.open(h.req, ino, libc::O_RDONLY as u32).await {
+                    match h.fs.open(h.req, ino, libc::O_RDONLY as u32, 0).await {
                         Ok(reply) => {
                             granted += 1;
                             // Handle granted: the inode must stay fully

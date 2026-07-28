@@ -250,7 +250,7 @@ async fn write_rig_disabled_records_nothing_and_path_is_byte_identical() {
     // 4. The disabled stats surface: ledger present, rig families ABSENT
     //    (the M2 byte-identical-JSON contract extends to RW1's families).
     let opened =
-        h.fs.open(h.req, STATS_INODE, libc::O_RDONLY as u32)
+        h.fs.open(h.req, STATS_INODE, libc::O_RDONLY as u32, 0)
             .await
             .expect("open .stats");
     let data =

@@ -531,7 +531,17 @@ where
         })
     }
 
-    async fn open(&self, req: Request, inode: u64, flags: u32) -> Result<ReplyOpen> {
+    // The path layer does not surface FUSE_OPEN_* request bits (no
+    // PathFilesystem consumer implements the killpriv-v2 clearing law,
+    // so the capability is never negotiated for them) — the bit is
+    // deliberately dropped here.
+    async fn open(
+        &self,
+        req: Request,
+        inode: u64,
+        flags: u32,
+        _open_flags: u32,
+    ) -> Result<ReplyOpen> {
         let inode_name_manager = self.inode_name_manager.read().await;
         let path = inode_name_manager
             .get_absolute_path(inode)

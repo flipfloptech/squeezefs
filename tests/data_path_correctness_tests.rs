@@ -526,7 +526,7 @@ async fn test_virtual_inodes_open_direct_io() {
     let h = make().await;
 
     let stats =
-        h.fs.open(h.req, squeezefs::fuse_client::STATS_INODE, 0)
+        h.fs.open(h.req, squeezefs::fuse_client::STATS_INODE, 0, 0)
             .await
             .expect("open .stats");
     assert_ne!(
@@ -536,7 +536,7 @@ async fn test_virtual_inodes_open_direct_io() {
     );
 
     let config =
-        h.fs.open(h.req, squeezefs::fuse_client::CONFIG_INODE, 0)
+        h.fs.open(h.req, squeezefs::fuse_client::CONFIG_INODE, 0, 0)
             .await
             .expect("open .config");
     assert_ne!(

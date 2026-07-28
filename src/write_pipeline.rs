@@ -245,9 +245,12 @@ impl Lane {
 
 /// The per-mount write-pipeline authority: admission gate + depth
 /// governor + in-flight gauges. Shared `Arc` across handler clones.
+/// The lock-free admission accounting lives in
+/// [`crate::write_pipeline_core::AdmissionCore`] — loom-modeled
+/// (`loom-models/`, `write_pipeline_admission_*`): bounded admission,
+/// single oversized empty-pipe bypass, exact settle-to-zero.
 pub struct WritePipeline {
-    inflight_bytes: AtomicU64,
-    inflight_blocks: AtomicU64,
+    core: crate::write_pipeline_core::AdmissionCore,
     admission_waits: AtomicU64,
     lanes: scc::HashMap<String, Arc<Lane>>,
     completions: tokio::sync::Notify,
@@ -274,8 +277,7 @@ impl WritePipeline {
         budget_cap_bytes: Option<u64>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            inflight_bytes: AtomicU64::new(0),
-            inflight_blocks: AtomicU64::new(0),
+            core: crate::write_pipeline_core::AdmissionCore::new(),
             admission_waits: AtomicU64::new(0),
             lanes: scc::HashMap::new(),
             completions: tokio::sync::Notify::new(),
@@ -350,27 +352,26 @@ impl WritePipeline {
         let mut waited = false;
         loop {
             let target = self.depth_target_bytes(block_bytes.max(1));
-            let cur = self.inflight_bytes.load(Ordering::Relaxed);
-            if self.inflight_blocks.load(Ordering::Relaxed) == 0
-                || cur.saturating_add(block_bytes) <= target
-            {
-                if self
-                    .inflight_bytes
-                    .compare_exchange(cur, cur + block_bytes, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    self.inflight_blocks.fetch_add(1, Ordering::AcqRel);
+            match self.core.try_admit_once(block_bytes, target) {
+                crate::write_pipeline_core::AdmitAttempt::Admitted => {
                     return PipelinePermit {
                         pipe: self.clone(),
                         bytes: block_bytes,
                     };
                 }
-                continue; // CAS raced a completion/admission — re-evaluate.
+                crate::write_pipeline_core::AdmitAttempt::Raced => {
+                    continue; // CAS raced a completion/admission — re-evaluate.
+                }
+                crate::write_pipeline_core::AdmitAttempt::Full => {}
             }
             if !waited {
                 waited = true;
                 self.admission_waits.fetch_add(1, Ordering::Relaxed);
             }
+            // Park: `notify_waiters` stores no permit, so a wake can be
+            // lost to a not-yet-parked waiter — the 5 ms tick is the
+            // liveness backstop BY DESIGN (also how Red/target changes
+            // are observed). See write_pipeline_core.rs module docs.
             tokio::select! {
                 _ = self.completions.notified() => {}
                 _ = tokio::time::sleep(Duration::from_millis(5)) => {}
@@ -383,7 +384,7 @@ impl WritePipeline {
     /// flight.
     pub async fn quiesce(&self, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
-        while self.inflight_blocks.load(Ordering::Acquire) != 0 {
+        while self.core.inflight_blocks() != 0 {
             if tokio::time::Instant::now() >= deadline {
                 return false;
             }
@@ -399,12 +400,12 @@ impl WritePipeline {
     /// `write_pipeline_inflight_bytes` gauge and the R5
     /// `write_pipeline_inflight` component source).
     pub fn inflight_bytes(&self) -> u64 {
-        self.inflight_bytes.load(Ordering::Relaxed)
+        self.core.inflight_bytes()
     }
 
     /// In-flight admitted uploads, blocks (`write_pipeline_inflight_blocks`).
     pub fn inflight_blocks(&self) -> u64 {
-        self.inflight_blocks.load(Ordering::Relaxed)
+        self.core.inflight_blocks()
     }
 
     /// Admissions that parked at least once (`write_pipeline_admission_waits`
@@ -424,10 +425,7 @@ pub struct PipelinePermit {
 
 impl Drop for PipelinePermit {
     fn drop(&mut self) {
-        self.pipe
-            .inflight_bytes
-            .fetch_sub(self.bytes, Ordering::AcqRel);
-        self.pipe.inflight_blocks.fetch_sub(1, Ordering::AcqRel);
+        self.pipe.core.release(self.bytes);
         self.pipe.completions.notify_waiters();
     }
 }

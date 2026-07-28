@@ -120,6 +120,19 @@
 //!   published snapshot covers every mint whose record-apply
 //!   happened-before it (the latch-free reader vs publisher edge the
 //!   PR-plan loom clause names).
+//! - [`write_pipeline_core`]: the 2026-07-27 depth campaign's admission
+//!   accounting (`AdmissionCore` — the CAS heart of
+//!   `WritePipeline::admit` / `PipelinePermit::drop`) — invariants:
+//!   bounded admission (no interleaving of admitters and releasers ever
+//!   carries `inflight_bytes` past the target except through the
+//!   empty-pipe bypass); at most ONE oversized bypass lands on an empty
+//!   pipe (the CAS serializes racing bypassers); gauges settle to
+//!   exactly zero once every admission released (no lost/duplicated
+//!   accounting). **Stated precondition** (module docs): wake liveness
+//!   is tick-bounded by design (`notify_waiters` stores no permit; the
+//!   5 ms re-poll is the backstop) — the model checks accounting, not
+//!   permit-style wake delivery, which the implementation does not
+//!   claim.
 //!
 //! Models run only under `--cfg loom` (see `tests/run_loom.sh`); a plain
 //! `cargo test` here compiles the cores against std atomics and runs
@@ -155,13 +168,15 @@ pub mod slot_cursor_core;
 pub mod slot_gate_core;
 #[path = "../../crates/fuse3/src/raw/connection/wake_core.rs"]
 pub mod wake_core;
+#[path = "../../src/write_pipeline_core.rs"]
+pub mod write_pipeline_core;
 
 #[cfg(all(test, loom))]
 mod models {
     use crate::{
         alloc_ext_core, conveyor_core, gauge_core, incarnation_core, ipc_ring_core, ipc_slot_core,
         journal_core, lease_core, node_state_core, patch_clone_core, refcount_core,
-        slot_cursor_core, slot_gate_core, wake_core,
+        slot_cursor_core, slot_gate_core, wake_core, write_pipeline_core,
     };
     use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use loom::sync::Arc;
@@ -2752,4 +2767,165 @@ mod models {
             assert_ne!(a, b, "two mints returned the same ino");
         });
     }
+    // =====================================================================
+    // write_pipeline_core (2026-07-27 depth campaign)
+    // =====================================================================
+
+    /// Bounded admission: with a non-empty pipe, no interleaving of two
+    /// admitters against one releaser ever carries `inflight_bytes` past
+    /// the target — every successful CAS observed `cur + bytes <= target`
+    /// atomically against the charge.
+    #[test]
+    fn write_pipeline_admission_never_exceeds_target() {
+        loom::model(|| {
+            const TARGET: u64 = 2;
+            let core = Arc::new(write_pipeline_core::AdmissionCore::new());
+            // Pre-admitted holder: the pipe is non-empty (bypass off) and
+            // at TARGET - 1.
+            assert_eq!(
+                core.try_admit_once(1, TARGET),
+                write_pipeline_core::AdmitAttempt::Admitted
+            );
+
+            let admits: Vec<_> = (0..2)
+                .map(|_| {
+                    let core = core.clone();
+                    thread::spawn(move || {
+                        // One shipped-loop iteration: Raced re-attempts
+                        // (bounded — loom needs finite paths), Full parks.
+                        let mut admitted = false;
+                        for _ in 0..3 {
+                            match core.try_admit_once(1, TARGET) {
+                                write_pipeline_core::AdmitAttempt::Admitted => {
+                                    admitted = true;
+                                    break;
+                                }
+                                write_pipeline_core::AdmitAttempt::Raced => continue,
+                                write_pipeline_core::AdmitAttempt::Full => break,
+                            }
+                        }
+                        // THE invariant, observed at the admitter itself:
+                        // whatever the interleaving, the gauge this thread
+                        // helped build never exceeds TARGET (the releaser
+                        // below only ever lowers it).
+                        assert!(
+                            core.inflight_bytes() <= TARGET,
+                            "over-admission: {} > target {TARGET}",
+                            core.inflight_bytes()
+                        );
+                        admitted
+                    })
+                })
+                .collect();
+            // Racing releaser (the RAII permit drop of the pre-admitted
+            // holder).
+            let releaser = {
+                let core = core.clone();
+                thread::spawn(move || core.release(1))
+            };
+
+            let mut landed = 1u64; // the pre-admitted holder
+            for t in admits {
+                if t.join().unwrap() {
+                    landed += 1;
+                }
+            }
+            releaser.join().unwrap();
+            landed -= 1; // the releaser returned the holder's byte
+
+            assert!(
+                core.inflight_bytes() <= TARGET,
+                "settled over target: {}",
+                core.inflight_bytes()
+            );
+            assert_eq!(
+                core.inflight_bytes(),
+                landed,
+                "bytes gauge diverged from outstanding admissions"
+            );
+            assert_eq!(
+                core.inflight_blocks(),
+                landed,
+                "blocks gauge diverged from outstanding admissions"
+            );
+        });
+    }
+
+    /// The empty-pipe bypass admits ONE oversized block: two racing
+    /// bypassers both pass the `blocks == 0` predicate, but the CAS on
+    /// `inflight_bytes` serializes them — the loser re-observes a
+    /// non-empty pipe (Raced, then Full) and parks.
+    #[test]
+    fn write_pipeline_empty_pipe_bypass_is_single() {
+        loom::model(|| {
+            const TARGET: u64 = 1;
+            const OVERSIZED: u64 = 4; // > TARGET: only the bypass admits it
+            let core = Arc::new(write_pipeline_core::AdmissionCore::new());
+
+            let ts: Vec<_> = (0..2)
+                .map(|_| {
+                    let core = core.clone();
+                    thread::spawn(move || {
+                        let mut admitted = false;
+                        for _ in 0..3 {
+                            match core.try_admit_once(OVERSIZED, TARGET) {
+                                write_pipeline_core::AdmitAttempt::Admitted => {
+                                    admitted = true;
+                                    break;
+                                }
+                                write_pipeline_core::AdmitAttempt::Raced => continue,
+                                write_pipeline_core::AdmitAttempt::Full => break,
+                            }
+                        }
+                        admitted
+                    })
+                })
+                .collect();
+
+            let admitted: u64 = ts.into_iter().map(|t| u64::from(t.join().unwrap())).sum();
+            assert_eq!(
+                admitted, 1,
+                "exactly one oversized bypass may land on an empty pipe \
+                 (got {admitted})"
+            );
+            assert_eq!(core.inflight_bytes(), OVERSIZED);
+            assert_eq!(core.inflight_blocks(), 1);
+        });
+    }
+
+    /// Exact settle: admit/release pairs racing each other (the detached
+    /// upload tasks' RAII permit drops vs fresh WRITE admissions) leave
+    /// the gauges at exactly zero — no lost, duplicated, or wrapped
+    /// accounting (a wrapped blocks gauge would wedge `quiesce` forever).
+    #[test]
+    fn write_pipeline_gauges_settle_to_zero() {
+        loom::model(|| {
+            let core = Arc::new(write_pipeline_core::AdmissionCore::new());
+
+            let ts: Vec<_> = (0..2)
+                .map(|i| {
+                    let core = core.clone();
+                    thread::spawn(move || {
+                        let bytes = 1 + i as u64; // distinct sizes
+                        loop {
+                            match core.try_admit_once(bytes, u64::MAX) {
+                                write_pipeline_core::AdmitAttempt::Admitted => break,
+                                // u64::MAX target: Full is unreachable,
+                                // Raced retries are CAS-bounded.
+                                _ => continue,
+                            }
+                        }
+                        core.release(bytes);
+                    })
+                })
+                .collect();
+            for t in ts {
+                t.join().unwrap();
+            }
+
+            assert_eq!(core.inflight_bytes(), 0, "bytes gauge leaked");
+            assert_eq!(core.inflight_blocks(), 0, "blocks gauge leaked");
+        });
+    }
+
 }

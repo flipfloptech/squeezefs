@@ -53,6 +53,7 @@ pub mod supervisor;
 pub mod uring_fs;
 pub mod version;
 pub mod write_pipeline;
+pub(crate) mod write_pipeline_core;
 
 use parking_lot::RwLock;
 

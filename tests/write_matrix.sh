@@ -2,11 +2,22 @@
 # tests/write_matrix.sh — DIALED P3: the write-side characterization matrix
 # (.benchmarks/2026-07-27-write-side-economy.md §2 — the campaign's map).
 #
-#   {4k, 64k, 256k, 1m} × {O_DIRECT, buffered} × {kernel, shim} × {rand, seq}
-#   on the ARMED (--interception, KD-11 write-through) mount, plus
-#   RW6-convention durable tails (fsync-each-file + syncfs, timed) on every
-#   seq row, plus the UNARMED kernel-buffered rows (writeback cache ON —
-#   the user's likely "normal writes" comparison).
+# THE GOVERNING RULE (user directive, 2026-07-28 shim-parity campaign,
+# verbatim): "The kernel and IPC should always at minimum be at par with
+# the IPC out pacing the kernel in the majority of benchmarks."
+# This script ENFORCES it: every armed shim row is paired with its kernel
+# twin; a shim row trailing its kernel twin beyond the stated noise band
+# (SQZ_WM_NOISE_PCT, default 10) FAILS the sweep (nonzero exit, row
+# named), and the summary asserts the shim WINS the majority of decided
+# (non-par) pairs.
+#
+#   {4k, 64k, 256k, 1m, 4m} × {O_DIRECT, buffered} × {kernel, shim} ×
+#   {rand, seq} on the ARMED (--interception, KD-11 write-through) mount,
+#   plus RW6-convention durable tails (fsync-each-file + syncfs, timed) on
+#   every seq row, plus the UNARMED kernel-buffered rows (writeback cache
+#   ON — the user's likely "normal writes" comparison). The 4m seq rows
+#   are the shim-parity campaign's known-violation venue (t16×4MiB
+#   streaming — ingest-economy board item 1).
 #
 # Instrument (stated, per the L1-A lesson): fio psync, --thread, numjobs=16,
 # qd1 sync syscalls — fio page-aligns its buffers. Rand rows are time_based
@@ -33,6 +44,9 @@ ROW_FILTER="${1:-.}"
 REPS="${SQZ_WM_REPS:-3}"
 THREADS="${SQZ_WM_THREADS:-16}"
 RUNTIME="${SQZ_WM_RUNTIME:-10}"
+# The il-vs-kernel parity noise band (percent): a shim row within
+# ±band of its kernel twin is PAR; below is a LOSS (sweep failure).
+NOISE_PCT="${SQZ_WM_NOISE_PCT:-10}"
 SQUEEZEFS_BIN="${SQUEEZEFS_BIN:-$REPO_DIR/target/release/squeezefs}"
 SO="${SQZ_WM_SO:-$REPO_DIR/target/preload-release/libsqueezefs_il.so}"
 LOG="$RESULTS/daemon.log"
@@ -111,8 +125,12 @@ fio_elapsed() { python3 -c "import json,sys;j=json.load(open('$1'));print(max(jo
 seq_size_for_bs() { # per-file size, scaled so op counts stay sane
     case "$1" in
         4k) echo 64m ;; 64k) echo 256m ;; 256k) echo 512m ;; 1m) echo 512m ;;
+        4m) echo 512m ;;
     esac
 }
+
+# Per-row median IOPS ledger — the parity verdict input.
+declare -A MEDIANS
 
 run_row() { # run_row <rowname> <shim 0|1> <rw seq|rand> <bs> <direct 0|1> <dir>
     local row="$1" shim="$2" rw="$3" bs="$4" direct="$5" dir="$6"
@@ -178,6 +196,7 @@ run_row() { # run_row <rowname> <shim 0|1> <rw seq|rand> <bs> <direct 0|1> <dir>
     med=$(printf '%s\n' "${iops_list[@]}" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
     echo "ROW $row median_iops=$med"
     echo "$row,median,$med,,,,,,," >> "$CSV"
+    MEDIANS[$row]=$med
 }
 
 prealloc_rand() { # prealloc_rand <dir> — 16 × 1 GiB striped whole-block files
@@ -214,7 +233,8 @@ for path in kernel shim; do
     sh=0; [ "$path" = shim ] && sh=1
     for direct in 1 0; do
         dl=odirect; [ "$direct" = 0 ] && dl=buffered
-        for bs in 4k 64k 256k 1m; do
+        # 4m seq = the shim-parity campaign's t16×4MiB streaming venue.
+        for bs in 4k 64k 256k 1m 4m; do
             run_row "armed-$path-seq-$bs-$dl" "$sh" seq "$bs" "$direct" "$SEQ_DIR"
         done
     done
@@ -242,4 +262,55 @@ echo "=== matrix complete → $CSV ==="
 column -s, -t "$CSV" | tail -n +1
 if [ "$INVALID" -ne 0 ]; then
     echo "ENGAGEMENT INVALID rows present"; exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# il-vs-kernel PARITY VERDICT (the governing rule, header): each armed shim
+# row against its kernel twin, by median IOPS. Within ±NOISE_PCT% = PAR;
+# above = WIN; below = LOSS. ANY loss fails the sweep (row named); the
+# summary asserts the shim wins the MAJORITY of decided (non-par) pairs.
+# ---------------------------------------------------------------------------
+echo
+echo "=== il-vs-kernel parity verdict (band ±${NOISE_PCT}%) ==="
+WINS=0; LOSSES=0; PARS=0
+echo "pair,shim_median,kernel_median,ratio,verdict" > "$RESULTS/parity.csv"
+for row in $(printf '%s\n' "${!MEDIANS[@]}" | grep '^armed-shim-' | sort); do
+    twin="${row/armed-shim-/armed-kernel-}"
+    [ -n "${MEDIANS[$twin]:-}" ] || continue
+    s="${MEDIANS[$row]}"; k="${MEDIANS[$twin]}"
+    read -r ratio verdict <<< "$(python3 -c "
+s=float($s); k=float($k); band=float($NOISE_PCT)/100.0
+r = s/k if k > 0 else float('inf')
+v = 'PAR' if k <= 0 or abs(s-k) <= band*k else ('WIN' if s > k else 'LOSS')
+print(f'{r:.3f} {v}')")"
+    pair="${row#armed-shim-}"
+    printf '  %-24s shim=%-9s kernel=%-9s il/kern=%-7s %s\n' \
+        "$pair" "$s" "$k" "$ratio" "$verdict"
+    echo "$pair,$s,$k,$ratio,$verdict" >> "$RESULTS/parity.csv"
+    case "$verdict" in
+        WIN) WINS=$((WINS+1)) ;;
+        LOSS) LOSSES=$((LOSSES+1)); echo "  PARITY LOSS: $row trails $twin beyond ${NOISE_PCT}%" ;;
+        PAR) PARS=$((PARS+1)) ;;
+    esac
+done
+TOTAL=$((WINS+LOSSES+PARS))
+echo "parity summary: pairs=$TOTAL win=$WINS loss=$LOSSES par=$PARS"
+if [ "$TOTAL" -gt 0 ]; then
+    # Rule half 1 — at minimum par: ANY beyond-band loss fails.
+    if [ "$LOSSES" -gt 0 ]; then
+        echo "PARITY FAIL: il trails kernel beyond the ±${NOISE_PCT}% band on $LOSSES row(s) — the governing rule requires at-minimum par"
+        exit 3
+    fi
+    # Rule half 2 — majority out-pacing: of the DECIDED (non-par) pairs,
+    # il must win the majority. (With losses already fatal above, any
+    # decided pair is a win; the check stays explicit so a future
+    # allow-loss lever cannot silently drop the majority clause.)
+    DECIDED=$((WINS+LOSSES))
+    if [ "$DECIDED" -gt 0 ] && [ "$WINS" -le $((DECIDED / 2)) ]; then
+        echo "PARITY FAIL: il must out-pace the kernel in the majority of decided pairs (win=$WINS of $DECIDED)"
+        exit 3
+    fi
+    if [ "$DECIDED" -eq 0 ]; then
+        echo "note: all pairs PAR — at-minimum-par holds; no decided pairs for the majority clause"
+    fi
 fi

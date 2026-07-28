@@ -366,7 +366,13 @@ async fn production_write_sever_recycles_pooled_buffers() {
         pid: std::process::id(),
     };
     let created = fs
-        .create(req, 1, std::ffi::OsStr::new("w.bin"), 0o644, libc::O_RDWR as u32)
+        .create(
+            req,
+            1,
+            std::ffi::OsStr::new("w.bin"),
+            0o644,
+            libc::O_RDWR as u32,
+        )
         .await
         .expect("fs create");
     let fs_ino = created.attr.ino;
@@ -452,4 +458,3 @@ async fn production_write_sever_recycles_pooled_buffers() {
     });
     host.shutdown();
 }
-

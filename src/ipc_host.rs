@@ -529,7 +529,9 @@ impl SeveredPool {
     fn get(&self) -> Vec<u8> {
         match self.q.pop() {
             Some(buf) => {
-                METRICS.ipc_severed_pool_hits.fetch_add(1, Ordering::Relaxed);
+                METRICS
+                    .ipc_severed_pool_hits
+                    .fetch_add(1, Ordering::Relaxed);
                 METRICS
                     .ipc_severed_pool_bytes
                     .fetch_sub(self.buf_cap as u64, Ordering::Relaxed);
@@ -974,10 +976,7 @@ impl IpcHost {
             started: Instant::now(),
             shutting_down: AtomicBool::new(false),
             threads: Mutex::new(Vec::new()),
-            severed_pool: Arc::new(SeveredPool::new(
-                cfg_max_op_bytes,
-                cfg_arena_cap_bytes,
-            )),
+            severed_pool: Arc::new(SeveredPool::new(cfg_max_op_bytes, cfg_arena_cap_bytes)),
         });
         // Spawn-on-bind (ingest-economy 2026-07-28): the gauge reports
         // SPAWNED service threads — 0 until a session admits. No thread
@@ -1516,17 +1515,14 @@ impl IpcHost {
         }
 
         // Establish: sealed memfd + mapping + registry entry.
-        let (memfd, map) = match create_session_shm(
-            &self.cfg.geometry,
-            layout,
-            Arc::clone(&self.severed_pool),
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                log::error!("ipc host: session shm creation failed: {e}");
-                return refuse(RefuseClass::Internal);
-            }
-        };
+        let (memfd, map) =
+            match create_session_shm(&self.cfg.geometry, layout, Arc::clone(&self.severed_pool)) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("ipc host: session shm creation failed: {e}");
+                    return refuse(RefuseClass::Internal);
+                }
+            };
         // §5.5.1 pinning: admit to the lightest service thread (live
         // sessions never rebalance — natural churn is the only mover).
         // Ties resolve to the LOWEST index, so owners fill densely —

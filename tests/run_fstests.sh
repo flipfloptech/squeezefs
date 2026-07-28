@@ -610,14 +610,61 @@ SQUEEZEFS_FSTESTS_QUICK=(
 # and 634's before/after-remount diff shows exactly the six saturated
 # rows below. Kernel-interface-only (the 131/478/504 exception class).
 # Any OTHER diff on 634 = regression.
+# generic/003 (re-adjudicated 2026-07-28, release-gate fix loop —
+# .benchmarks/2026-07-28-release-gate-v1.1.md): the FOUR atime lines are
+# the noatime-by-design core (mandatory, every run). The former
+# deterministic ctime lines were a daemon bug — layout persistence
+# fabricated a second ctime authority — fixed with its cargo repro
+# (tests/write_times_durability_tests.rs). What remains is
+# KERNEL-INTERFACE-ONLY (the 131/478/504/634 class): under the FUSE
+# writeback cache the kernel authors regular-file m/ctime at write(2),
+# overrides GETATTR times incore for the inode's lifetime, and sends the
+# daemon its stamp ONLY on fsync — never on close (probed live: WRITE is
+# delivered at FLUSH time, no flush-times SETATTR follows). The daemon's
+# best durable estimate is its WRITE-arrival stamp, µs later — so about
+# 1 run in 5 the two straddle a coarse tick and the remount legs show a
+# PAIRED modify+change divergence for that file. The tolerated shapes are
+# the ENUMERATED byte-exact set below (variant 1 = mandatory core; 2 =
+# file1 pair; 3 = file3 pair; 4 = both). Unpaired time lines or any
+# other line still abort.
 expected_shape_diff() {
     case "$1" in
     generic/003) cat <<'EOF'
+1a2,5
+> ERROR: access time has not been updated after accessing file1 first time
+> ERROR: access time has not been updated after accessing file2
+> ERROR: access time has not been updated after accessing file3 second time
+> ERROR: access time has not been updated after accessing file3 third time
+EOF
+        ;;
+    generic/003@2) cat <<'EOF'
 1a2,7
 > ERROR: access time has not been updated after accessing file1 first time
+> ERROR: modify time has changed for file1 after remount
 > ERROR: change time has changed for file1 after remount
 > ERROR: access time has not been updated after accessing file2
 > ERROR: access time has not been updated after accessing file3 second time
+> ERROR: access time has not been updated after accessing file3 third time
+EOF
+        ;;
+    generic/003@3) cat <<'EOF'
+1a2,7
+> ERROR: access time has not been updated after accessing file1 first time
+> ERROR: access time has not been updated after accessing file2
+> ERROR: access time has not been updated after accessing file3 second time
+> ERROR: modify time has changed after accessing file3 second time
+> ERROR: change time has changed after accessing file3 second time
+> ERROR: access time has not been updated after accessing file3 third time
+EOF
+        ;;
+    generic/003@4) cat <<'EOF'
+1a2,9
+> ERROR: access time has not been updated after accessing file1 first time
+> ERROR: modify time has changed for file1 after remount
+> ERROR: change time has changed for file1 after remount
+> ERROR: access time has not been updated after accessing file2
+> ERROR: access time has not been updated after accessing file3 second time
+> ERROR: modify time has changed after accessing file3 second time
 > ERROR: change time has changed after accessing file3 second time
 > ERROR: access time has not been updated after accessing file3 third time
 EOF
@@ -717,15 +764,23 @@ dmesg_failure_is_host_noise() {
     return 0
 }
 
-# A failed test continues only if its out.bad diff IS its pinned shape.
+# A failed test continues only if its out.bad diff IS one of its pinned
+# shapes (a test may pin an ENUMERATED variant set as "<t>@2", "<t>@3", …
+# — generic/003's kernel-clock-race pairs; each variant is still matched
+# byte-exact, so anything outside the enumeration aborts).
 failure_is_expected_shape() {
     local t="$1"
     local golden="tests/${t}.out" bad="results/${t}.out.bad"
-    local want got
-    want="$(expected_shape_diff "$t")" || return 1
+    local want got variant
     [ -f "$golden" ] && [ -f "$bad" ] || return 1
     got="$(diff "$golden" "$bad" 2>/dev/null || true)"
-    [ "$got" = "$want" ]
+    for variant in "$t" "$t@2" "$t@3" "$t@4"; do
+        want="$(expected_shape_diff "$variant")" || continue
+        if [ "$got" = "$want" ]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Per-test driver: abort on the first unexpected failure.

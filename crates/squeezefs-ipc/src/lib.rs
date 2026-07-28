@@ -27,6 +27,7 @@
 pub mod cqe_core;
 pub mod layout;
 pub mod ring_core;
+pub mod sizing;
 pub mod slot_core;
 pub mod wire;
 

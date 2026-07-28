@@ -156,23 +156,27 @@ mod spin_window_tests {
     }
 }
 
-/// IPC service-thread count (§5.5.1; knob
+/// IPC service-thread ceiling (§5.5.1; knob
 /// `SQUEEZEFS_IPC_SERVICE_THREADS`, clamp 1..=64). Default scales with
-/// the box: `clamp(cpus/4, 2, 8)` — the 2026-07-19 sweep measured the
-/// warm il row's ceiling as exactly this count (2 threads = 643 k
-/// IOPS, 8 threads = 1.48 M on a 32-CPU box; fast-path serves execute
-/// ON these threads), and 8 saturated it.
+/// the box — the 2026-07-19 sweep measured the warm il row's ceiling as
+/// exactly this count (2 threads = 643 k IOPS, 8 threads = 1.48 M on a
+/// 32-CPU box; fast-path serves execute ON these threads).
 fn service_thread_count() -> usize {
-    std::env::var("SQUEEZEFS_IPC_SERVICE_THREADS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
+    service_thread_ceiling_from(
+        std::env::var("SQUEEZEFS_IPC_SERVICE_THREADS")
+            .ok()
+            .as_deref(),
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8),
+    )
+}
+
+/// Pure sizing form (unit-pinned by `tests/ingest_economy_tests.rs`).
+pub fn service_thread_ceiling_from(env: Option<&str>, cpus: usize) -> usize {
+    env.and_then(|v| v.trim().parse::<usize>().ok())
         .map(|n| n.clamp(1, 64))
-        .unwrap_or_else(|| {
-            let cpus = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(8);
-            (cpus / 4).clamp(2, 8)
-        })
+        .unwrap_or_else(|| (cpus / 4).clamp(2, 8))
 }
 
 /// Host configuration (mount-time; tests construct directly).

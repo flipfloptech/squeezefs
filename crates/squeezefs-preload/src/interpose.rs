@@ -75,12 +75,21 @@ const MAX_SESSIONS: usize = 32;
 fn sessions_per_mount() -> usize {
     static K: OnceLock<usize> = OnceLock::new();
     *K.get_or_init(|| {
-        std::env::var("SQUEEZEFS_IL_SESSIONS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .map(|n| n.clamp(1, 8))
-            .unwrap_or(4)
+        sessions_per_mount_from(
+            std::env::var("SQUEEZEFS_IL_SESSIONS").ok().as_deref(),
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8),
+        )
     })
+}
+
+/// Pure sizing form (unit-pinned below).
+fn sessions_per_mount_from(env: Option<&str>, cpus: usize) -> usize {
+    let _ = cpus;
+    env.and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(1, 8))
+        .unwrap_or(4)
 }
 
 struct Registry {
@@ -2111,6 +2120,49 @@ pub unsafe extern "C" fn io_cancel(ctx: u64, iocb: *mut RawIocb, evt: *mut RawIo
             panic_poison();
             fallback(real)
         }
+    }
+}
+
+#[cfg(test)]
+mod session_sizing_tests {
+    use super::*;
+
+    /// Ingest-economy contract (2026-07-28): the shim's per-mount session
+    /// default IS `squeezefs_ipc::sizing::il_sessions_default` — the same
+    /// function the daemon's service-thread ceiling default rides (its
+    /// tie test lives in the root suite), so the pair cannot drift. The
+    /// field's flat-4-sessions vs cpus/4-threads mismatch left half the
+    /// daemon's drain capacity idle at 7.5 GB/s of a 16.6 GB/s ceiling.
+    #[test]
+    fn sessions_default_ties_to_shared_derivation() {
+        for cpus in [1, 2, 4, 8, 16, 22, 32, 48, 64, 128, 256] {
+            assert_eq!(
+                sessions_per_mount_from(None, cpus),
+                squeezefs_ipc::sizing::il_sessions_default(cpus),
+                "shim session default must ride the shared derivation \
+                 (cpus={cpus})"
+            );
+        }
+    }
+
+    /// `SQUEEZEFS_IL_SESSIONS` remains an override LEVER only: honored
+    /// verbatim within the clamp (1..=16 — the derivation ceiling; the
+    /// registry keeps 32 slots across all mounts), unparseable falls
+    /// back to the derived default.
+    #[test]
+    fn sessions_env_override_is_a_lever() {
+        assert_eq!(sessions_per_mount_from(Some("3"), 32), 3);
+        assert_eq!(sessions_per_mount_from(Some("0"), 32), 1, "clamp floor");
+        assert_eq!(
+            sessions_per_mount_from(Some("99"), 32),
+            16,
+            "clamp ceiling = the derivation ceiling"
+        );
+        assert_eq!(
+            sessions_per_mount_from(Some("garbage"), 32),
+            squeezefs_ipc::sizing::il_sessions_default(32),
+            "unparseable falls back to the derivation"
+        );
     }
 }
 

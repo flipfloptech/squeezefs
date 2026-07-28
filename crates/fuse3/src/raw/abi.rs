@@ -74,9 +74,9 @@ pub const FATTR_FLAGS: u32 = 1 << 31;
 pub const FUSE_ASYNC_READ: u32 = 1 << 0;
 
 // Referenced only by the INIT-negotiation pins (the capability is
-// deliberately never echoed — kernel-local POSIX locks) and the
-// feature-gated lock plumbing.
-#[cfg(any(test, feature = "file-lock"))]
+// deliberately never echoed — kernel-local POSIX locks; the `file-lock`
+// plumbing itself never reads it).
+#[cfg(test)]
 /// locking for POSIX file locks
 pub const FUSE_POSIX_LOCKS: u32 = 1 << 1;
 

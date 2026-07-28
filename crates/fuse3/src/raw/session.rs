@@ -19,17 +19,6 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 
-#[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
-use async_fs::read_dir;
-#[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
-use async_global_executor::{self as task, Task as JoinHandle};
-#[cfg(all(
-    target_os = "linux",
-    not(feature = "tokio-runtime"),
-    feature = "async-io-runtime",
-    feature = "unprivileged"
-))]
-use async_process::Command;
 use bincode::Options;
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_util::future::{Either, FutureExt};
@@ -41,14 +30,13 @@ use nix::mount;
 use nix::mount::MntFlags;
 #[cfg(all(
     target_os = "linux",
-    not(feature = "async-io-runtime"),
     feature = "tokio-runtime",
     feature = "unprivileged"
 ))]
 use tokio::process::Command;
-#[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+#[cfg(feature = "tokio-runtime")]
 use tokio::task::JoinHandle;
-#[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+#[cfg(feature = "tokio-runtime")]
 use tokio::{fs::read_dir, task};
 use tracing::{debug, debug_span, error, instrument, warn, Instrument, Span};
 
@@ -57,7 +45,7 @@ use crate::find_fusermount3;
 use crate::helper::*;
 use crate::notify::Notify;
 use crate::raw::abi::*;
-#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
+#[cfg(feature = "tokio-runtime")]
 use crate::raw::connection::FuseConnection;
 use crate::raw::filesystem::Filesystem;
 use crate::raw::reply::ReplyXAttr;
@@ -160,12 +148,7 @@ impl Drop for MountHandle {
                 return;
             }
 
-            #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
-            {
-                task::spawn(inner.inner_unmount()).detach();
-            }
-
-            #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+            #[cfg(feature = "tokio-runtime")]
             {
                 task::spawn(inner.inner_unmount());
             }
@@ -188,40 +171,7 @@ impl MountHandleInner {
     async fn inner_unmount(self) -> IoResult<()> {
         self.destroy_notify.notify();
 
-        #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
-        {
-            // wait destroy done
-            self.task.await?;
-
-            // TODO: freebsd mount is unprivileged, then unmount is unprivileged too?
-            #[cfg(target_os = "freebsd")]
-            {
-                task::spawn_blocking(move || {
-                    mount::unmount(&self.mount_path, MntFlags::MNT_SYNCHRONOUS)
-                })
-                .await?;
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                #[cfg(all(target_os = "linux", feature = "unprivileged"))]
-                if self.unprivileged {
-                    let binary_path = find_fusermount3()?;
-                    let mut child = Command::new(binary_path)
-                        .args([OsStr::new("-u"), self.mount_path.as_os_str()])
-                        .spawn()?;
-                    if !child.status().await?.success() {
-                        return Err(IoError::other("call fusermount3 -u to unmount failed"));
-                    }
-
-                    return Ok(());
-                }
-
-                task::spawn_blocking(move || mount::umount(&self.mount_path)).await?;
-            }
-        }
-
-        #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+        #[cfg(feature = "tokio-runtime")]
         {
             // wait destroy done
             if !self.task.is_finished() {
@@ -291,23 +241,17 @@ impl MountHandleInner {
 impl Future for MountHandle {
     type Output = IoResult<()>;
 
-    #[cfg(feature = "async-io-runtime")]
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.inner.as_mut().expect("inner should be Some()").task).poll(cx)
-    }
-
     #[cfg(feature = "tokio-runtime")]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // The unwrap is necessary in order to provide the same API for both runtimes, and actually
-        // unwrap should not panic, when MountHandle is canceled by unmount method, user has no
-        // chance to poll again
+        // The unwrap actually should not panic: when MountHandle is canceled by the unmount
+        // method, user has no chance to poll again
         Pin::new(&mut self.inner.as_mut().expect("inner should be Some()").task)
             .poll(cx)
             .map(Result::unwrap)
     }
 }
 
-#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
+#[cfg(feature = "tokio-runtime")]
 /// fuse filesystem session, inode based.
 pub struct Session<FS> {
     fuse_connection: Option<Arc<FuseConnection>>,
@@ -351,7 +295,7 @@ impl Debug for ReadResult {
     }
 }
 
-#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
+#[cfg(feature = "tokio-runtime")]
 impl<FS> Session<FS> {
     /// new a fuse filesystem session.
     pub fn new(mount_options: MountOptions) -> Self {
@@ -391,21 +335,12 @@ impl<FS> Session<FS> {
     }
 }
 
-#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
+#[cfg(feature = "tokio-runtime")]
 impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     async fn mount_empty_check(&self, mount_path: &Path) -> IoResult<()> {
-        #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
         if !self.mount_options.nonempty
             && matches!(read_dir(mount_path).await?.next_entry().await, Ok(Some(_)))
         {
-            return Err(IoError::new(
-                ErrorKind::AlreadyExists,
-                "mount point is not empty",
-            ));
-        }
-
-        #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
-        if !self.mount_options.nonempty && read_dir(mount_path).await?.next().await.is_some() {
             return Err(IoError::new(
                 ErrorKind::AlreadyExists,
                 "mount point is not empty",
@@ -573,12 +508,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let dispatch_task = self.dispatch_with_max_write(max_write).fuse();
         let mut dispatch_task = pin!(dispatch_task);
 
-        #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
         let reply_task = task::spawn(Self::reply_fuse(fuse_write_connection, receiver))
             .map(Result::unwrap)
             .fuse();
-        #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
-        let reply_task = task::spawn(Self::reply_fuse(fuse_write_connection, receiver)).fuse();
 
         let mut reply_task = pin!(reply_task);
 
@@ -644,11 +576,6 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let dispatch_task = self.dispatch_with_max_write(max_write).fuse();
         let mut dispatch_task = pin!(dispatch_task);
 
-        #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
-        let reply_task =
-            task::spawn(async move { Self::reply_fuse(fuse_write_connection, receiver).await })
-                .fuse();
-        #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
         let reply_task = task::spawn(Self::reply_fuse(fuse_write_connection, receiver))
             .map(Result::unwrap)
             .fuse();
@@ -4685,15 +4612,12 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    #[cfg(feature = "tokio-runtime")]
     {
         TPC_SCHEDULER.spawn(async move {
             let _ = fut.instrument(span).await;
         });
     }
-
-    #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
-    task::spawn(fut.instrument(span)).detach()
 }
 
 pub fn tpc_spawn<F>(fut: F)

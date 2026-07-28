@@ -16,7 +16,7 @@ pub use connection::fuse_over_uring::{
 pub use filesystem::Filesystem;
 use futures_util::future::Either;
 pub use request::Request;
-#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
+#[cfg(feature = "tokio-runtime")]
 pub use session::{
     kernel_init_info, negotiated_reply_flags, tpc_spawn, tpc_thread_count, KernelInit, MountHandle,
     Session,

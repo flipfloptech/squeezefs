@@ -117,9 +117,9 @@ use nix::sys::uio;
 use tokio::io::{unix::AsyncFd, Interest};
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 use tokio::process::Command;
-#[cfg(target_os = "linux")]
-use tokio::task;
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
+use tokio::task;
+#[cfg(target_os = "linux")]
 use tracing::debug;
 #[cfg(target_os = "freebsd")]
 use tracing::warn;
@@ -449,11 +449,6 @@ impl FuseConnection {
                     classical_sideband: std::sync::atomic::AtomicBool::new(false),
                 })
             }
-            #[cfg(not(feature = "unprivileged"))]
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Cloning non-blocking connections is not supported",
-            )),
         }
     }
 

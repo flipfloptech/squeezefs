@@ -1923,6 +1923,36 @@ impl KvMetaBackend {
         }
     }
 
+    /// Park a WRITE op's kernel-domain times stamp as a pending
+    /// refinement (generic/003 remount-divergence fix, 2026-07-28): the
+    /// FUSE write handler publishes ONE `coarse_realtime_ns` stamp to the
+    /// attr cache, and THIS is how the same stamp becomes durable —
+    /// fold-visible immediately, journaled by the batched drain. Layout
+    /// persistence (`set_layout_and_size`) never authors times, so the
+    /// served view and the remount view can never diverge by a clock
+    /// tick. Monotone per-field (signed — i64 ns in the u64 word), like
+    /// the fold: a parked stamp never regresses a fresher refinement.
+    pub fn park_times_refinement(&self, ino: Ino, mtime: u64, ctime: u64) {
+        match self.pending_times.entry_sync(ino) {
+            scc::hash_map::Entry::Occupied(mut o) => {
+                let p = o.get_mut();
+                if (mtime as i64) > (p.0 as i64) {
+                    p.0 = mtime;
+                }
+                if (ctime as i64) > (p.1 as i64) {
+                    p.1 = ctime;
+                }
+            }
+            scc::hash_map::Entry::Vacant(slot) => {
+                slot.insert_entry((mtime, ctime));
+                self.pending_times_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if self.pending_times_count.load(Ordering::Relaxed) >= PENDING_TIMES_DRAIN_CAP {
+            self.times_drain_wake.notify_one();
+        }
+    }
+
     /// Retire an ino's pending refinement (a committed inode write now
     /// carries — or supersedes — it). Callers hold the ino's DLM I-guard,
     /// so retirement never races an absorb.
@@ -1976,14 +2006,23 @@ impl KvMetaBackend {
                 match self.read_inode_value(ino).await? {
                     None => drained.push(ino), // destroyed: GC, no record
                     Some(v) => {
-                        if pc > v.ctime || pm > v.mtime {
+                        // SIGNED per-field advance (i64 ns in the u64
+                        // word, matching `fold_pending_times`): an
+                        // unsigned compare read a pre-epoch stored stamp
+                        // as huge and silently dropped the refinement —
+                        // the fold served it, the drain lost it.
+                        let adv_m = (pm as i64) > (v.mtime as i64);
+                        let adv_c = (pc as i64) > (v.ctime as i64);
+                        if adv_m || adv_c {
                             // Stage only the advance (mtime is invariant-
                             // equal to stored for echo-born refinements;
                             // the times form is the belt).
-                            let delta = if pm > v.mtime {
-                                InodeDelta::times(pm.max(v.mtime), pc.max(v.ctime))
+                            let m = if adv_m { pm } else { v.mtime };
+                            let c = if adv_c { pc } else { v.ctime };
+                            let delta = if adv_m {
+                                InodeDelta::times(m, c)
                             } else {
-                                InodeDelta::ctime(pc)
+                                InodeDelta::ctime(c)
                             };
                             tx.stage_delta(TREE_INODES, inode_key(ino), &delta);
                             records += 1;
@@ -5240,7 +5279,16 @@ impl KvMetaBackend {
             .await?
             .ok_or_else(|| Self::not_found(format!("Inode {ino} not found")))?;
         v.size = size;
-        v.ctime = Self::now_ns();
+        // NEVER author times here (generic/003 remount divergence,
+        // 2026-07-28): this is size+layout bookkeeping for data whose
+        // times the writing op already stamped (the handler's parked
+        // refinement / the kernel's flush-times SETATTR). A fabricated
+        // fresh-tick ctime was a second clock authority that outran every
+        // value the daemon had served — visible only after remount.
+        // (`read_inode_value` is deliberately unfolded here: the write's
+        // parked refinement stays pending across this Put — still
+        // fold-visible on reads, still drained as a Δtime on top of it —
+        // so the Put can never regress the freshest served times.)
         let tx0 = KvTx::new();
         let (_existing, key) = self.xattr_slot(&tx0, ino, "layout").await?;
         let mut tx = tx0;
@@ -5311,22 +5359,12 @@ impl KvMetaBackend {
         if times_only && mtime.is_none_or(|m| m == v.mtime) {
             if let Some(req_ctime) = ctime {
                 super::META_KV_TIMES_ECHO_ABSORBED.fetch_add(1, Ordering::Relaxed);
-                if req_ctime > v.ctime {
+                // SIGNED compare (i64 ns in the u64 word — fold parity):
+                // unsigned read a pre-epoch stored ctime as huge and
+                // refused every post-epoch echo forever.
+                if (req_ctime as i64) > (v.ctime as i64) {
                     v.ctime = req_ctime;
-                    match self.pending_times.entry_sync(ino) {
-                        scc::hash_map::Entry::Occupied(mut o) => {
-                            let p = o.get_mut();
-                            p.0 = v.mtime;
-                            p.1 = p.1.max(req_ctime);
-                        }
-                        scc::hash_map::Entry::Vacant(slot) => {
-                            slot.insert_entry((v.mtime, req_ctime));
-                            self.pending_times_count.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    if self.pending_times_count.load(Ordering::Relaxed) >= PENDING_TIMES_DRAIN_CAP {
-                        self.times_drain_wake.notify_one();
-                    }
+                    self.park_times_refinement(ino, v.mtime, req_ctime);
                 }
                 // A refinement at-or-behind the folded view persists
                 // nothing (monotonicity: ctime never moves backwards) —

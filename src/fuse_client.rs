@@ -10879,6 +10879,12 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyWrite> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         crate::coz_progress!("fuse_write");
+        debug!(
+            "FUSE Write: ino = {}, offset = {}, len = {}",
+            ino,
+            offset,
+            data.len()
+        );
 
         if ino == CONFIG_INODE || ino == STATS_INODE {
             return Err(Errno::from(libc::EACCES));
@@ -11152,6 +11158,22 @@ impl Filesystem for SqueezefsFilesystem {
                 self.attr_cache
                     .insert(ino, (attr, std::time::Instant::now()));
             }
+            // Single-authority durable times (generic/003 remount
+            // divergence): THE SAME stamp published above is parked as
+            // the ino's pending-times refinement — fold-visible reads,
+            // journaled by the batched drain — and layout persistence
+            // never authors times. Unconditional (an evicted attr entry
+            // must not cost the write its durable times); best-effort
+            // like the drain (µs-grade time polish — never worth failing
+            // an acked write over).
+            if let Some(backend) = self.meta_backend.as_ref() {
+                if let Err(e) = backend
+                    .park_write_times(ino, now_ns as u64, now_ns as u64)
+                    .await
+                {
+                    debug!("FUSE Write: ino {ino} times refinement park skipped: {e}");
+                }
+            }
             Ok(ReplyWrite {
                 written: bytes_written,
             })
@@ -11260,6 +11282,7 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<ReplyAttr> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
+        debug!("FUSE SetAttr: ino = {}, set_attr = {:?}", ino, set_attr);
 
         if ino == CONFIG_INODE {
             return Err(Errno::from(libc::EACCES));

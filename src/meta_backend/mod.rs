@@ -2125,6 +2125,22 @@ impl RoutedMetaBackend {
         }
         out
     }
+
+    /// Park a WRITE op's kernel-domain times stamp as the ino's pending
+    /// refinement (generic/003 remount-divergence fix): the ONE durable
+    /// authority for the write's mtime/ctime — the same stamp the FUSE
+    /// handler publishes to the attr cache. RAM-parked (zero hot-path
+    /// journal entries), fold-visible on every read, journaled by the
+    /// M6 batched drain / the fsync/unmount durability points.
+    pub async fn park_write_times(&self, ino: Ino, mtime: u64, ctime: u64) -> Result<()> {
+        // §5.5.2a cutover gate — a mid-migration park must land on the
+        // slot the drain will run against.
+        let _gate = self.slot_gate_enter(&[ino]).await;
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        self.volumes[v_idx].park_times_refinement(local_ino, mtime, ctime);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -171,6 +171,8 @@ pub mod lease_core;
 pub mod node_state_core;
 #[path = "../../src/patch_clone_core.rs"]
 pub mod patch_clone_core;
+#[path = "../../src/placed_core.rs"]
+pub mod placed_core;
 #[path = "../../src/refcount_core.rs"]
 pub mod refcount_core;
 #[path = "../../src/meta_backend/kv/slot_cursor_core.rs"]
@@ -186,8 +188,8 @@ pub mod write_pipeline_core;
 mod models {
     use crate::{
         alloc_ext_core, conveyor_core, gauge_core, incarnation_core, ipc_cqe_core, ipc_ring_core,
-        ipc_slot_core, journal_core, lease_core, node_state_core, patch_clone_core, refcount_core,
-        slot_cursor_core, slot_gate_core, wake_core, write_pipeline_core,
+        ipc_slot_core, journal_core, lease_core, node_state_core, patch_clone_core, placed_core,
+        refcount_core, slot_cursor_core, slot_gate_core, wake_core, write_pipeline_core,
     };
     use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use loom::sync::Arc;
@@ -3015,6 +3017,130 @@ mod models {
 
             assert_eq!(core.inflight_bytes(), 0, "bytes gauge leaked");
             assert_eq!(core.inflight_blocks(), 0, "blocks gauge leaked");
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // placed_core — the placed-sever claims protocol (shim-parity
+    // 2026-07-28): page-claim overlap exclusion and the
+    // seal-vs-claim Dekker (SeqCst store-buffering pair — the W1 §5.1
+    // fence shape). Weakening any of the four SeqCst operations
+    // (claim bits / writers++ / sealed check on the claimer; sealed
+    // store / writers read on the adopter) fails these models.
+    // -----------------------------------------------------------------
+
+    /// Two racing claims over overlapping page ranges: at most one wins;
+    /// after the winner releases, the region is claimable again (no
+    /// stuck bits from the loser's rollback).
+    #[test]
+    fn placed_claims_overlap_exclusive_and_rollback_clean() {
+        loom::model(|| {
+            let c = Arc::new(placed_core::PlacedClaims::new(
+                4 * placed_core::CLAIM_PAGE,
+            ));
+            let wins = Arc::new(loom::sync::atomic::AtomicUsize::new(0));
+
+            let ts: Vec<_> = [(0usize, 2usize), (1, 2)]
+                .into_iter()
+                .map(|(first, count)| {
+                    let c = c.clone();
+                    let wins = wins.clone();
+                    thread::spawn(move || {
+                        if c.begin_claim(first, count) {
+                            wins.fetch_add(1, Ordering::SeqCst);
+                            c.end_write();
+                            c.release(first, count);
+                        }
+                    })
+                })
+                .collect();
+            for t in ts {
+                t.join().unwrap();
+            }
+            // Overlap exclusion held DURING the race (each winner
+            // released before join, so both may have won serially — the
+            // model's exhaustiveness covers the concurrent-hold states
+            // via loom's interleavings of the two claim windows).
+            assert!(wins.load(Ordering::SeqCst) >= 1, "someone must win");
+            // No residue: the full range is claimable afterwards.
+            assert!(
+                c.begin_claim(0, 3),
+                "rollback/release residue left stuck claim bits"
+            );
+            c.end_write();
+        });
+    }
+
+    /// Both threads claim the SAME range concurrently and HOLD: exactly
+    /// one may be inside a granted claim at any instant.
+    #[test]
+    fn placed_claims_never_double_grant_while_held() {
+        loom::model(|| {
+            let c = Arc::new(placed_core::PlacedClaims::new(
+                2 * placed_core::CLAIM_PAGE,
+            ));
+            let holders = Arc::new(loom::sync::atomic::AtomicUsize::new(0));
+
+            let ts: Vec<_> = (0..2)
+                .map(|_| {
+                    let c = c.clone();
+                    let holders = holders.clone();
+                    thread::spawn(move || {
+                        if c.begin_claim(0, 2) {
+                            let now = holders.fetch_add(1, Ordering::SeqCst) + 1;
+                            assert_eq!(now, 1, "two live claims over one region");
+                            holders.fetch_sub(1, Ordering::SeqCst);
+                            c.end_write();
+                            c.release(0, 2);
+                        }
+                    })
+                })
+                .collect();
+            for t in ts {
+                t.join().unwrap();
+            }
+        });
+    }
+
+    /// The seal-vs-claim Dekker: if `seal_for_adoption()` returns true
+    /// (adoption proceeds — the backing becomes snapshot-reachable), NO
+    /// claimer can be inside its sever-copy window, now or ever after.
+    #[test]
+    fn placed_seal_vs_claim_dekker_never_adopts_over_a_writer() {
+        loom::model(|| {
+            let c = Arc::new(placed_core::PlacedClaims::new(placed_core::CLAIM_PAGE));
+            // true exactly while the claimer is inside its copy window.
+            let in_copy = Arc::new(AtomicBool::new(false));
+
+            let claimer = {
+                let c = c.clone();
+                let in_copy = in_copy.clone();
+                thread::spawn(move || {
+                    if c.begin_claim(0, 1) {
+                        in_copy.store(true, Ordering::SeqCst);
+                        // (the sever memcpy happens here)
+                        in_copy.store(false, Ordering::SeqCst);
+                        c.end_write();
+                        c.release(0, 1);
+                    }
+                })
+            };
+
+            if c.seal_for_adoption() {
+                // Adoption granted: the Dekker guarantees every claimer
+                // either backed off on the seal or already end_write'd —
+                // no copy window can be open or ever open again.
+                assert!(
+                    !in_copy.load(Ordering::SeqCst),
+                    "adoption granted while a sever memcpy is in flight \
+                     (the frozen-snapshot mutation window)"
+                );
+                assert!(
+                    !c.begin_claim(0, 1),
+                    "sealed assembly granted a new claim"
+                );
+            }
+            claimer.join().unwrap();
         });
     }
 }

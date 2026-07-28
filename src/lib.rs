@@ -29,6 +29,8 @@ pub mod meta_backend;
 pub mod nvmeof;
 pub mod p2p;
 pub(crate) mod patch_clone_core;
+pub(crate) mod placed_core;
+pub(crate) mod placed_sever;
 pub mod recovery;
 pub(crate) mod refcount_core;
 pub mod routing;

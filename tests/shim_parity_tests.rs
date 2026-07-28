@@ -35,7 +35,9 @@ use squeezefs::ipc_host::{
     SlotCompletion,
 };
 use squeezefs::ipc_service::DataPlaneSink;
-use squeezefs_ipc::layout::{Geometry, IpcSlot, SessionHeader, SessionLayout, SlotDescriptor, OP_WRITE};
+use squeezefs_ipc::layout::{
+    Geometry, IpcSlot, SessionHeader, SessionLayout, SlotDescriptor, OP_WRITE,
+};
 use squeezefs_ipc::ring_core::{MpscRingView, RingCell};
 use squeezefs_ipc::wire::CtlMsg;
 
@@ -239,7 +241,11 @@ impl Fixture {
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         // SAFETY: plain open(2); ownership taken immediately.
         let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
-        assert!(fd >= 0, "open stand-in: {}", std::io::Error::last_os_error());
+        assert!(
+            fd >= 0,
+            "open stand-in: {}",
+            std::io::Error::last_os_error()
+        );
         // SAFETY: fresh owned fd.
         (fs_ino, unsafe { OwnedFd::from_raw_fd(fd) })
     }
@@ -251,23 +257,6 @@ impl Fixture {
             .await
             .expect("fuse read");
         reply.data.to_vec()
-    }
-
-    async fn fuse_write(&self, ino: u64, offset: u64, data: &[u8]) -> u32 {
-        let reply = self
-            .fs
-            .write(
-                req(),
-                ino,
-                0,
-                offset,
-                bytes::Bytes::copy_from_slice(data),
-                0,
-                0,
-            )
-            .await
-            .expect("fuse write");
-        reply.written
     }
 
     /// Grow `ino` into a STRIPED file of `mib` MiB via the FUSE handler
@@ -497,7 +486,10 @@ impl Drop for ClientSession {
     fn drop(&mut self) {
         // SAFETY: unmapping the mapping created in establish.
         unsafe {
-            libc::munmap(self.base as *mut libc::c_void, self.layout.total_bytes as usize);
+            libc::munmap(
+                self.base as *mut libc::c_void,
+                self.layout.total_bytes as usize,
+            );
         }
     }
 }
@@ -552,7 +544,11 @@ async fn streaming_ring_write_severs_into_block_buffer_one_copy() {
     let lock = fx.fs.get_inode_lock_ref(ino);
     let guard = lock.write().await;
 
-    // Overwrite block 1 (offset 4..8 MiB) as 4 × 1 MiB chunks.
+    // EXTEND into block 2 (offset 8..12 MiB) as 4 × 1 MiB chunks — the
+    // field's streaming-ingest shape: a fresh block of a striped file
+    // (no staged sibling, no existing bytes; a previously-staged block
+    // legitimately seeds from its NEWER staged image instead — that
+    // shape stays on the copy path by design).
     let payload = deterministic_bytes(4 * MIB as usize, 7);
     let mut gens = Vec::new();
     for c in 0..4u64 {
@@ -564,7 +560,7 @@ async fn streaming_ring_write_severs_into_block_buffer_one_copy() {
                 op: OP_WRITE,
                 flags: 0,
                 binding,
-                offset: 4 * MIB + c * MIB,
+                offset: 8 * MIB + c * MIB,
                 len: MIB as u32,
                 arena_off: c * MIB,
             },
@@ -608,12 +604,12 @@ async fn streaming_ring_write_severs_into_block_buffer_one_copy() {
         4,
         "every chunk's merge must elide its copy (pointer-proof)"
     );
-    // RW3b unchanged: the covering stream completes the union — no seed
-    // read, deferral cleared.
+    // RW3b unchanged: a fresh extending block never touches the seed
+    // machinery, and the write path never pays a seed read.
     assert_eq!(
-        METRICS.overwrite_seed_skipped.load(Ordering::Relaxed) - seedskip0,
-        1,
-        "coverage completion must still skip the overwrite seed"
+        METRICS.overwrite_seed_skipped.load(Ordering::Relaxed),
+        seedskip0,
+        "a fresh (extending) block arms no seed deferral"
     );
     assert_eq!(
         METRICS.write_path_seed_read_bytes.load(Ordering::Relaxed),
@@ -622,7 +618,7 @@ async fn streaming_ring_write_severs_into_block_buffer_one_copy() {
     );
 
     // Content: the acked (pre-scribble) bytes, exactly.
-    let read_back = fx.fuse_read(ino, 4 * MIB, 4 * MIB as u32).await;
+    let read_back = fx.fuse_read(ino, 8 * MIB, 4 * MIB as u32).await;
     assert_eq!(
         read_back, payload,
         "read-back must be the severed pre-scribble payload"
@@ -700,7 +696,10 @@ async fn ineligible_shapes_ride_the_pooled_sever_unchanged() {
             arena_off: 0,
         },
     );
-    assert_eq!(session2.wait_done(0, gen, "non-striped"), w_tiny.len() as i64);
+    assert_eq!(
+        session2.wait_done(0, gen, "non-striped"),
+        w_tiny.len() as i64
+    );
     let rb = fx.fuse_read(small_ino, 0, w_tiny.len() as u32).await;
     assert_eq!(rb, w_tiny, "non-striped write content");
 

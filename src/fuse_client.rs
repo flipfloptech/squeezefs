@@ -3459,6 +3459,12 @@ pub struct SqueezefsFilesystem {
     /// for detached complete-block write-through uploads. Shared across
     /// handler clones; public so tests/rigs can gauge and quiesce it.
     pub write_pipeline: std::sync::Arc<crate::write_pipeline::WritePipeline>,
+    /// Placed-sever assemblies (shim-parity 2026-07-28,
+    /// `src/placed_sever.rs`): the pre-adoption `(ino, block)` → shared
+    /// backing registry behind the 1-copy ring write path. Shared across
+    /// handler clones (the sink severs on service threads; the write
+    /// merge adopts under the block lock).
+    pub(crate) placed_assemblies: std::sync::Arc<crate::placed_sever::PlacedSeverRegistry>,
 }
 
 impl Clone for SqueezefsFilesystem {
@@ -3524,6 +3530,7 @@ impl Clone for SqueezefsFilesystem {
             job_fabric: self.job_fabric.clone(),
             job_wire_endpoint: self.job_wire_endpoint.clone(),
             write_pipeline: self.write_pipeline.clone(),
+            placed_assemblies: self.placed_assemblies.clone(),
         }
     }
 }
@@ -3631,6 +3638,7 @@ impl SqueezefsFilesystem {
             job_fabric: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             job_wire_endpoint: std::sync::Arc::new(std::sync::OnceLock::new()),
             write_pipeline: crate::write_pipeline::WritePipeline::for_mount(),
+            placed_assemblies: std::sync::Arc::new(crate::placed_sever::PlacedSeverRegistry::new()),
         }
     }
 
@@ -5654,6 +5662,71 @@ impl SqueezefsFilesystem {
         true
     }
 
+    /// Placed sever (shim-parity 2026-07-28): decide — synchronously, on
+    /// the foreign service thread, latch-free — whether this ring WRITE's
+    /// §5.5.2 sever copy can land DIRECTLY in the block's future
+    /// `ActiveBlockBuf` backing, and perform it (the ONE arena read).
+    /// `None` ⇒ the caller severs through the pooled path (every screen
+    /// is fallback-is-correctness).
+    ///
+    /// Screens (cheapest first; each names why the shape cannot target
+    /// the block buffer):
+    /// 1. Geometry: nonzero page-aligned `[rel, rel + len)` inside ONE
+    ///    block of a 4 KiB-multiple block size (claims are page-granular;
+    ///    a multi-block op has no single placement).
+    /// 2. `len > patch_max_bytes()` — at or below the W1 cap the op may
+    ///    be absorbed by the patch/extent machinery before the merge
+    ///    (mutually exclusive by the same lever, so a raised cap widens
+    ///    patch and narrows placement together, never overlaps).
+    /// 3. `offset + len ≤ max_file_size()` — the handler's EFBIG screen,
+    ///    mirrored (an EFBIG op must leave no side effects).
+    /// 4. Cached layout class == striped — ONLY striped writes reach
+    ///    `write_file_staged`'s merge; router-path writes (inline/staged
+    ///    /promotions) sever their own copy anyway. A cache miss demotes
+    ///    (conservative).
+    /// 5. No live overlay entry for the block — an existing entry can
+    ///    never adopt a new backing (the merge would copy regardless).
+    ///
+    /// # Safety
+    /// `src` must be valid for `len` byte reads for the duration of the
+    /// call (the dequeued op's arena window — racing client writes yield
+    /// torn CONTENT, never UB, exactly like the pooled sever).
+    pub(crate) unsafe fn placed_sever_for(
+        &self,
+        ino: u64,
+        offset: u64,
+        len: usize,
+        src: *const u8,
+    ) -> Option<bytes::Bytes> {
+        let bs = self.router.block_size.load(Ordering::Relaxed);
+        if len == 0 || bs == 0 || bs % 4096 != 0 {
+            return None;
+        }
+        let rel = (offset % bs) as usize;
+        if rel % 4096 != 0
+            || len % 4096 != 0
+            || rel + len > bs as usize
+            || (len as u64) <= patch_max_bytes()
+            || offset + len as u64 > self.max_file_size()
+        {
+            return None;
+        }
+        match self.router.metadata_cache.get(&ino) {
+            Some(meta) if meta.file_type.as_str() == "striped" => {}
+            _ => return None,
+        }
+        let block = offset / bs;
+        if self
+            .active_block_buffers
+            .contains_key(crate::keys::active_block_stack(ino, block).as_str())
+        {
+            return None;
+        }
+        // SAFETY: forwarded caller contract.
+        self.placed_assemblies
+            .sever(ino, block, rel, len, bs as usize, src)
+    }
+
     pub fn ipc_read_probe_locked(
         &self,
         ino: u64,
@@ -6962,6 +7035,31 @@ impl SqueezefsFilesystem {
                     let seed = if let Some(d) = self.router.cache.nvme.read_staged(&cache_key) {
                         METRICS.write_block_revisits.fetch_add(1, Ordering::Relaxed);
                         crate::cache::active_block::ActiveBlockBuf::seeded(&d, block_size as usize)
+                    } else if let Some(shared) = self.placed_assemblies.take_for_adoption(
+                        ino,
+                        b,
+                        file_data_slice.as_ptr(),
+                        (write_start - b_start_offset) as usize,
+                    ) {
+                        // Placed-sever ADOPTION (shim-parity 2026-07-28):
+                        // this write's ring sever already landed its bytes
+                        // in the shared assembly at dequeue — adopt it as
+                        // the backing (pointer-proven, sealed, no sever
+                        // mid-copy per the claims Dekker). Seed class is
+                        // IDENTICAL to the fresh/deferred arms below —
+                        // adoption changes WHERE the backing memory came
+                        // from, never the coverage/seed law; the §2 merge
+                        // records coverage and elides its copy.
+                        if block_has_existing_bytes {
+                            METRICS
+                                .overwrite_seed_deferred
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        METRICS.placed_adoptions.fetch_add(1, Ordering::Relaxed);
+                        crate::cache::active_block::ActiveBlockBuf::adopted(
+                            &shared,
+                            block_has_existing_bytes,
+                        )
                     } else if !block_has_existing_bytes {
                         // Fresh entry: no existing data for this block, so the
                         // seed-time zero-fill is elided (§5.3) — the written
@@ -7083,11 +7181,29 @@ impl SqueezefsFilesystem {
                         .active_block_buffers
                         .get_mut(&cache_key)
                         .expect("parked entry cannot vanish under the held block lock");
+                    // Placed-sever merge elision (shim-parity 2026-07-28,
+                    // the pointer proof): the payload region IS the
+                    // entry's CURRENT Full backing at exactly this offset
+                    // ⇒ the ring sever already landed these bytes at
+                    // dequeue, and nothing can have overwritten them
+                    // since — in-place mutation requires backing
+                    // uniqueness (impossible while the placed payload's
+                    // shared handle is alive), claims keep sibling severs
+                    // disjoint, and any CoW moved the backing so this
+                    // test fails and the ordinary copy below runs.
+                    let self_backed = entry
+                        .value()
+                        .full_ptr_at(rel_start, slice_len)
+                        .is_some_and(|p| std::ptr::eq(p, file_data_slice.as_ptr()));
                     let completed = entry
                         .value_mut()
                         .record_write(rel_start, rel_start + slice_len);
-                    entry.value_mut().make_mut()[rel_start..rel_start + slice_len]
-                        .copy_from_slice(file_data_slice);
+                    if self_backed {
+                        METRICS.placed_merge_elides.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        entry.value_mut().make_mut()[rel_start..rel_start + slice_len]
+                            .copy_from_slice(file_data_slice);
+                    }
                     completed
                 };
                 write_phase_record(WritePhase::MergeCopy, wp_merge);
@@ -13708,6 +13824,19 @@ pub async fn start_mount<P: AsRef<Path>>(
                     0,
                     1,
                     std::sync::Arc::new(|| METRICS.ipc_severed_pool_bytes.load(Ordering::Relaxed)),
+                    std::sync::Arc::new(|_| {}),
+                ));
+                // Shim-parity 2026-07-28: live placed-sever assembly
+                // bytes (pre-adoption block backings held by in-flight
+                // ring writes) — same non-sheddable pattern: creation is
+                // capped at min(budget/8, 2 GiB) and refuses gracefully
+                // (pooled fallback); convergence is by adoption/drop, a
+                // shed hook could not act on in-flight custody.
+                crate::mem_budget::MEM_BUDGET.register(crate::mem_budget::Component::new(
+                    "placed_assemblies",
+                    0,
+                    1,
+                    std::sync::Arc::new(|| METRICS.placed_assembly_bytes.load(Ordering::Relaxed)),
                     std::sync::Arc::new(|_| {}),
                 ));
                 info!(

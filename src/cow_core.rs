@@ -50,6 +50,17 @@ impl<T> CowCell<T> {
         }
     }
 
+    /// Adopt an ALREADY-SHARED payload (the placed-sever adoption,
+    /// shim-parity 2026-07-28): the cell becomes the owner of a payload
+    /// other handles still reference (the ring assembly + its in-flight
+    /// placed payload `Bytes`). The protocol is unchanged — the cell
+    /// starts non-unique, so the FIRST [`CowCell::owned_mut`] that runs
+    /// while any foreign handle lives copies (exactly the live-snapshot
+    /// rule); uniqueness returns when the last foreign handle drops.
+    pub fn adopt(shared: Arc<T>) -> Self {
+        Self { inner: shared }
+    }
+
     /// Zero-copy shared snapshot handle. The payload it references is
     /// immutable for as long as any handle lives: a later
     /// [`CowCell::owned_mut`] that finds the cell shared copies first.

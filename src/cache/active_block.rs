@@ -122,6 +122,62 @@ impl Drop for AlignedBlock {
     }
 }
 
+/// A SHARED handle to a block-sized aligned allocation — the placed-sever
+/// assembly backing (shim-parity 2026-07-28): ring WRITE severs copy into
+/// it at dequeue, and the first merging handler ADOPTS it as an
+/// [`ActiveBlockBuf`] backing ([`ActiveBlockBuf::adopted`]) so the merge
+/// copy is elided. Holding a `SharedBlock` (or any clone) makes the
+/// adopted cell non-unique — every in-place mutation path CoWs away
+/// instead of touching this memory (the destruction-safety that lets
+/// in-flight placed payloads keep reading their regions).
+#[derive(Clone)]
+pub(crate) struct SharedBlock(Arc<AlignedBlock>);
+
+impl SharedBlock {
+    /// Allocate a `len`-byte shared block (pool-recycled, 4096-aligned,
+    /// initialized memory — same class as every overlay backing).
+    pub(crate) fn alloc(len: usize) -> Self {
+        Self(Arc::new(AlignedBlock::alloc_raw(len)))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len
+    }
+
+    /// The backing base pointer — the placed-merge pointer-identity proof
+    /// input (never dereferenced by callers).
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.0.ptr
+    }
+
+    /// Copy `len` bytes from `src` into `[off, off + len)`.
+    ///
+    /// # Safety
+    /// The caller must hold an exclusive [`crate::placed_core`] claim over
+    /// the region (no other writer, no reader forms a reference over it:
+    /// pre-adoption the block is reachable only through claim-disjoint
+    /// [`SharedBlock::region`] views, and adoption is fenced against
+    /// in-progress writers by the claims Dekker), `off + len` must be in
+    /// bounds, and `src` must be valid for `len` reads (torn CONTENT from
+    /// racing client memory is fine; the destination region is exclusive).
+    pub(crate) unsafe fn write_at(&self, off: usize, src: *const u8, len: usize) {
+        debug_assert!(off + len <= self.0.len);
+        std::ptr::copy_nonoverlapping(src, self.0.ptr.add(off), len);
+    }
+
+    /// A shared view of `[off, off + len)` — the placed payload's
+    /// `AsRef<[u8]>` source. Sound per the claims protocol: the region's
+    /// bytes are written exactly once (by its own claim's sever, which
+    /// happens-before every reader via the handoff edge) and every
+    /// post-adoption mutation path CoWs away while this handle lives.
+    pub(crate) fn region(&self, off: usize, len: usize) -> &[u8] {
+        assert!(off + len <= self.0.len, "region out of block bounds");
+        // SAFETY: bounds asserted; memory initialized (pool birth);
+        // exclusivity per the method docs.
+        unsafe { std::slice::from_raw_parts(self.0.ptr.add(off), len) }
+    }
+}
+
 /// Keep-alive owner behind [`ActiveBlockBuf::snapshot`] `Bytes`: pins the
 /// block allocation (and thereby forces CoW on any later writer) until the
 /// last snapshot handle drops.
@@ -296,6 +352,50 @@ impl ActiveBlockBuf {
     /// escape.
     pub fn deferred(block_size: usize) -> Self {
         Self::new_full(block_size, true)
+    }
+
+    /// ADOPT a placed-sever assembly as this block's backing (shim-parity
+    /// 2026-07-28): identical semantics to [`ActiveBlockBuf::fresh`]
+    /// (`deferred == false`) / [`ActiveBlockBuf::deferred`] (`true`) —
+    /// born unwritten, coverage machinery untouched — except the backing
+    /// is the SHARED assembly the ring severs already landed in, so the
+    /// adopting merge (and every sibling-chunk merge that passes the
+    /// pointer proof) records coverage without copying. While any foreign
+    /// `SharedBlock`/placed-payload handle lives, the cell is non-unique:
+    /// [`ActiveBlockBuf::make_mut`] and every content-establishing exit
+    /// ([`ActiveBlockBuf::zero_complete`] /
+    /// [`ActiveBlockBuf::fill_complement_from`]) copy first — in-flight
+    /// placed payloads can never have their severed bytes destroyed.
+    pub(crate) fn adopted(shared: &SharedBlock, deferred: bool) -> Self {
+        gauge_full().fetch_add(shared.len() as u64, Ordering::Relaxed);
+        Self {
+            repr: Repr::Full(CowCell::adopt(Arc::clone(&shared.0))),
+            block_size: shared.len() as u32,
+            written: (0, 0),
+            written_extra: Vec::new(),
+            content_valid: false,
+            deferred_seed: deferred,
+        }
+    }
+
+    /// The current Full-repr backing pointer at `rel` when `[rel,
+    /// rel + len)` is in bounds — the placed-merge pointer-identity probe
+    /// (`None` on the extent repr). Equality with a payload slice pointer
+    /// PROVES the payload region IS this backing region at this offset:
+    /// only a placed sever can produce a payload inside an overlay
+    /// backing, and any mutation since adoption either happened in place
+    /// (impossible while the placed payload's shared handle keeps the
+    /// cell non-unique) or CoW'd the backing (pointer changed — the probe
+    /// fails and the caller copies).
+    pub(crate) fn full_ptr_at(&self, rel: usize, len: usize) -> Option<*const u8> {
+        match &self.repr {
+            Repr::Full(cell) if rel + len <= self.block_size as usize => {
+                // SAFETY: in-bounds pointer arithmetic on the backing
+                // allocation; the pointer is compared, never dereferenced.
+                Some(unsafe { cell.peek().ptr.add(rel) })
+            }
+            _ => None,
+        }
     }
 
     /// W2 (§5.2): a COMPACT extent-overlay buffer for the small-write

@@ -524,8 +524,23 @@ impl DataPlaneSink {
         // §5.5.2 severance — the ONE arena read, on the service thread,
         // BEFORE the handoff counter increments (tests park the handoff
         // behind a held writer and scribble the arena: the scribble must
-        // be inert).
-        let severed = op.payload.read_severed_bytes();
+        // be inert). Placed first (shim-parity 2026-07-28): whole-block-
+        // stream shapes sever DIRECTLY into the block's future
+        // `ActiveBlockBuf` backing so the handler merge elides its copy —
+        // the 1-copy ring write path; everything else severs through the
+        // pooled buffers exactly as before.
+        // SAFETY: the dequeued op's validated arena window is alive for
+        // this synchronous call (racing client writes are torn CONTENT,
+        // never UB — the pooled sever's own contract).
+        let severed = unsafe {
+            self.fs.placed_sever_for(
+                op.binding.ino,
+                op.desc.offset,
+                op.payload.len(),
+                op.payload.as_base_ptr(),
+            )
+        }
+        .unwrap_or_else(|| op.payload.read_severed_bytes());
         METRICS.ipc_async_handoffs.fetch_add(1, Ordering::Relaxed);
         let fs = Arc::clone(&self.fs);
         let request = self.ring_request();

@@ -1,0 +1,325 @@
+//! Placed-sever **assemblies** (shim-parity campaign, 2026-07-28) — the
+//! 1-copy ring write path.
+//!
+//! The ring write path paid TWO userspace copies where the kernel path
+//! pays one: arena → severed buffer (§5.5.2 severance at dequeue), then
+//! severed buffer → `ActiveBlockBuf` (the merge). This module makes the
+//! severed DESTINATION be the block's future backing: whole-block-stream
+//! chunks of one `(ino, block)` sever into one shared **assembly**
+//! ([`crate::cache::active_block::SharedBlock`]), the first merging
+//! handler ADOPTS it as the overlay backing, and every sibling merge is a
+//! coverage record with the copy elided (pointer proof) — one copy per
+//! byte end to end, kernel parity.
+//!
+//! Custody laws (all inherited, none weakened):
+//!
+//! - **§5.5.2 severance at dequeue** — the arena is still read exactly
+//!   once, synchronously on the service thread, before the handoff can
+//!   park; the destination is private until adoption and claim-exclusive
+//!   after ([`crate::placed_core::PlacedClaims`]).
+//! - **CoW destruction-safety** — every in-flight placed payload holds
+//!   the assembly's shared handle, so the adopted cell is non-unique:
+//!   in-place mutation (`make_mut`, `zero_complete`,
+//!   `fill_complement_from`) copies away instead of touching severed
+//!   bytes. A payload whose pointer proof fails at merge simply copies —
+//!   its severed region is intact by construction.
+//! - **Fallback-is-correctness** — every refusal (overlap, sealed, cap,
+//!   shape) rides the pooled sever unchanged.
+//!
+//! Memory honesty: live assembly bytes are gauged
+//! (`placed_assembly_bytes`) and R5-visible as the non-sheddable
+//! `placed_assemblies` component (the `ipc_severed_buffers` pattern —
+//! the budget must SEE the bytes; convergence is by adoption/drop, a
+//! shed hook could not act on in-flight custody). Creation refuses past
+//! the cap (`min(budget/8, 2 GiB)` — the session-shm cap shape).
+
+use crate::cache::active_block::SharedBlock;
+use crate::fuse_client::METRICS;
+use crate::placed_core::{PlacedClaims, CLAIM_PAGE};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+/// The assembly-bytes hard cap: the session-shm cap shape
+/// (`min(budget/8, 2 GiB)`). Past it, placed severs refuse (pooled
+/// fallback) — graceful, counted. Before the R5 authority arms (mount
+/// worker not started — unit tests, early bring-up) the budget reads 0;
+/// the cap then rests at the 2 GiB rail alone (assemblies stay
+/// structurally bounded by in-flight ring ops — each holds ≤ one block
+/// per live claim — and the gauge is registered the moment the host
+/// arms).
+fn assembly_cap_bytes() -> u64 {
+    const RAIL: u64 = 2 * 1024 * 1024 * 1024;
+    match crate::mem_budget::MEM_BUDGET.budget_bytes() {
+        0 => RAIL,
+        b => (b / 8).min(RAIL),
+    }
+}
+
+/// One pre-adoption assembly: the shared backing + its claim state.
+pub(crate) struct BlockAssembly {
+    block: SharedBlock,
+    claims: PlacedClaims,
+    /// Live placed payload handles (claims not yet released) — the
+    /// registry-reap gate.
+    outstanding: AtomicUsize,
+}
+
+impl Drop for BlockAssembly {
+    fn drop(&mut self) {
+        crate::gauge_core::sub_saturating(&METRICS.placed_assembly_bytes, self.block.len() as u64);
+    }
+}
+
+/// The per-filesystem `(ino, block)` → assembly registry (latch-free).
+pub(crate) struct PlacedSeverRegistry {
+    map: scc::HashMap<(u64, u64), Arc<BlockAssembly>, ahash::RandomState>,
+}
+
+impl PlacedSeverRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            map: scc::HashMap::with_hasher(ahash::RandomState::new()),
+        }
+    }
+
+    /// The placed sever: claim `[rel, rel + len)` of `(ino, block)`'s
+    /// assembly (creating it when absent, under the cap), copy the arena
+    /// window in (the ONE §5.5.2 arena read), and return the payload
+    /// `Bytes` backed by the assembly region. `None` ⇒ the caller falls
+    /// back to the pooled sever.
+    ///
+    /// # Safety
+    /// `src` must be valid for `len` byte reads for the duration of the
+    /// call (the arena window is alive across the synchronous dequeue —
+    /// torn content from racing client writes is the client's own
+    /// POSIX-legal race, exactly like the pooled sever).
+    pub(crate) unsafe fn sever(
+        self: &Arc<Self>,
+        ino: u64,
+        block: u64,
+        rel: usize,
+        len: usize,
+        block_size: usize,
+        src: *const u8,
+    ) -> Option<bytes::Bytes> {
+        debug_assert!(rel % CLAIM_PAGE == 0 && len % CLAIM_PAGE == 0 && rel + len <= block_size);
+        let key = (ino, block);
+        // Get-or-create + claim + outstanding++ under the entry guard
+        // (serializes against the payload-drop reap of the same key).
+        let assembly = {
+            let entry = self.map.entry_sync(key);
+            let assembly = match entry {
+                scc::hash_map::Entry::Occupied(o) => Arc::clone(o.get()),
+                scc::hash_map::Entry::Vacant(v) => {
+                    // Cap check at creation only (an existing assembly is
+                    // already-charged custody).
+                    let charged = METRICS
+                        .placed_assembly_bytes
+                        .fetch_add(block_size as u64, Ordering::Relaxed)
+                        + block_size as u64;
+                    if charged > assembly_cap_bytes() {
+                        crate::gauge_core::sub_saturating(
+                            &METRICS.placed_assembly_bytes,
+                            block_size as u64,
+                        );
+                        METRICS
+                            .ipc_placed_sever_fallbacks
+                            .fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                    let a = Arc::new(BlockAssembly {
+                        block: SharedBlock::alloc(block_size),
+                        claims: PlacedClaims::new(block_size),
+                        outstanding: AtomicUsize::new(0),
+                    });
+                    v.insert_entry(Arc::clone(&a));
+                    a
+                }
+            };
+            if !assembly
+                .claims
+                .begin_claim(rel / CLAIM_PAGE, len / CLAIM_PAGE)
+            {
+                // Overlap with a live claim or a sealed (post-adoption)
+                // assembly: pooled fallback (correctness owns ambiguity).
+                METRICS
+                    .ipc_placed_sever_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            assembly.outstanding.fetch_add(1, Ordering::SeqCst);
+            assembly
+        };
+        // The ONE arena read — outside the entry guard (a 1 MiB memcpy
+        // must not hold the per-key latch), inside the claims writer
+        // window (the adoption Dekker fences against it).
+        // SAFETY: exclusive claim over [rel, rel+len) just granted; src
+        // per the caller contract; bounds debug-asserted above and
+        // enforced by the claim range.
+        assembly.block.write_at(rel, src, len);
+        assembly.claims.end_write();
+        METRICS.ipc_placed_severs.fetch_add(1, Ordering::Relaxed);
+        Some(bytes::Bytes::from_owner(PlacedSevered {
+            registry: Arc::clone(self),
+            key,
+            assembly,
+            rel,
+            len,
+        }))
+    }
+
+    /// The adoption probe (called by the write merge under the block's
+    /// `BLOCK_FLUSH_LOCKS` guard, entry-absent branch): if `(ino, block)`
+    /// has an assembly whose region at `rel` IS `payload_ptr` (pointer
+    /// proof — only a placed sever can satisfy it), seal it against
+    /// further claims and, when no sever is mid-copy (the Dekker), remove
+    /// it from the registry and hand the backing over for
+    /// [`crate::cache::active_block::ActiveBlockBuf::adopted`]. `None` ⇒
+    /// the merge copies as before.
+    pub(crate) fn take_for_adoption(
+        &self,
+        ino: u64,
+        block: u64,
+        payload_ptr: *const u8,
+        rel: usize,
+    ) -> Option<SharedBlock> {
+        let key = (ino, block);
+        let mut shared = None;
+        self.map.remove_if_sync(&key, |a| {
+            let matches = rel < a.block.len()
+                // SAFETY: in-bounds arithmetic (rel < len); compared only.
+                && std::ptr::eq(unsafe { a.block.as_ptr().add(rel) }, payload_ptr);
+            if matches && a.claims.seal_for_adoption() {
+                shared = Some(a.block.clone());
+                true
+            } else {
+                // Pointer mismatch (foreign payload) or a sever mid-copy:
+                // never adopt. A sealed non-adopted assembly drains via
+                // payload drops; a mismatch keeps serving its own ops.
+                false
+            }
+        });
+        shared
+    }
+
+    /// Payload-drop reap: release the claim and drop the registry entry
+    /// once no placed payload references the (never-adopted) assembly.
+    fn reap(&self, key: (u64, u64), assembly: &Arc<BlockAssembly>) {
+        self.map.remove_if_sync(&key, |a| {
+            Arc::ptr_eq(a, assembly) && a.outstanding.load(Ordering::SeqCst) == 0
+        });
+    }
+
+    /// Test/teardown visibility: live assemblies.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+/// The placed payload owner: `AsRef` = the assembly region; drop releases
+/// the claim and reaps the registry entry at zero outstanding.
+struct PlacedSevered {
+    registry: Arc<PlacedSeverRegistry>,
+    key: (u64, u64),
+    assembly: Arc<BlockAssembly>,
+    rel: usize,
+    len: usize,
+}
+
+impl AsRef<[u8]> for PlacedSevered {
+    fn as_ref(&self) -> &[u8] {
+        self.assembly.block.region(self.rel, self.len)
+    }
+}
+
+impl Drop for PlacedSevered {
+    fn drop(&mut self) {
+        self.assembly
+            .claims
+            .release(self.rel / CLAIM_PAGE, self.len / CLAIM_PAGE);
+        if self.assembly.outstanding.fetch_sub(1, Ordering::SeqCst) == 1 {
+            // Last payload out: reap the entry if it was never adopted
+            // (adoption already removed it; ptr_eq keeps a racing
+            // successor assembly safe).
+            self.registry.reap(self.key, &self.assembly);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sever_ok(
+        reg: &Arc<PlacedSeverRegistry>,
+        ino: u64,
+        block: u64,
+        rel: usize,
+        payload: &[u8],
+        block_size: usize,
+    ) -> Option<bytes::Bytes> {
+        // SAFETY: payload is a live slice for the call.
+        unsafe { reg.sever(ino, block, rel, payload.len(), block_size, payload.as_ptr()) }
+    }
+
+    #[test]
+    fn placed_payload_reads_back_and_reaps_at_zero() {
+        let reg = Arc::new(PlacedSeverRegistry::new());
+        let a = vec![0xA1u8; 8192];
+        let b = vec![0xB2u8; 4096];
+        let pa = sever_ok(&reg, 7, 3, 0, &a, 64 * 1024).expect("first claim");
+        let pb = sever_ok(&reg, 7, 3, 8192, &b, 64 * 1024).expect("disjoint claim");
+        assert_eq!(&pa[..], &a[..], "payload view is the severed bytes");
+        assert_eq!(&pb[..], &b[..]);
+        assert_eq!(reg.len(), 1, "one shared assembly per (ino, block)");
+        // Overlap refuses.
+        assert!(
+            sever_ok(&reg, 7, 3, 4096, &b, 64 * 1024).is_none(),
+            "overlapping live claim must refuse"
+        );
+        drop(pa);
+        assert_eq!(reg.len(), 1, "assembly lives while any payload does");
+        drop(pb);
+        assert_eq!(reg.len(), 0, "last payload drop reaps the assembly");
+        // Region is claimable again through a FRESH assembly.
+        let pc = sever_ok(&reg, 7, 3, 4096, &b, 64 * 1024).expect("fresh assembly");
+        drop(pc);
+    }
+
+    #[test]
+    fn adoption_takes_the_backing_and_seals_new_claims_out() {
+        let reg = Arc::new(PlacedSeverRegistry::new());
+        let a = vec![0x5Au8; 4096];
+        let pa = sever_ok(&reg, 9, 1, 4096, &a, 64 * 1024).expect("claim");
+        let shared = reg
+            .take_for_adoption(9, 1, pa.as_ptr(), 4096)
+            .expect("pointer proof adopts");
+        assert_eq!(shared.region(4096, 4096), &a[..]);
+        assert_eq!(reg.len(), 0, "adoption removes the registry entry");
+        // The payload stays readable after adoption (shared handle).
+        assert_eq!(&pa[..], &a[..]);
+        // A foreign pointer never adopts.
+        assert!(
+            reg.take_for_adoption(9, 1, a.as_ptr(), 4096).is_none(),
+            "no entry / foreign pointer must not adopt"
+        );
+        drop(pa);
+    }
+
+    #[test]
+    fn foreign_pointer_never_adopts_a_live_assembly() {
+        let reg = Arc::new(PlacedSeverRegistry::new());
+        let a = vec![0x11u8; 4096];
+        let pa = sever_ok(&reg, 4, 2, 0, &a, 64 * 1024).expect("claim");
+        let foreign = vec![0x22u8; 4096];
+        assert!(
+            reg.take_for_adoption(4, 2, foreign.as_ptr(), 0).is_none(),
+            "a pooled payload's pointer must fail the proof"
+        );
+        assert_eq!(reg.len(), 1, "mismatch must not remove the assembly");
+        // The real payload still adopts.
+        assert!(reg.take_for_adoption(4, 2, pa.as_ptr(), 0).is_some());
+        drop(pa);
+    }
+}

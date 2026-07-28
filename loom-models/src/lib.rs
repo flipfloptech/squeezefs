@@ -90,6 +90,15 @@
 //!   snapshot is the single linearization read of the descriptor
 //!   (§5.3.1 rule 1 — post-snapshot client mutation never changes the
 //!   served op, and the snapshot never reads pre-submit values).
+//! - [`ipc_cqe_core`] (`squeezefs-ipc`, op-economy 2026-07-28): the
+//!   completion doorbell — invariants: a reaper that parks via
+//!   `park_begin` (register-then-snapshot) and re-scans is never
+//!   stranded by a racing completion (either the scan sees DONE, the
+//!   futex admission fails on the bumped seq, or the daemon's parked
+//!   gate pays the wake); the unparked-stream wake elision never
+//!   strands a racing parker. Removing a Dekker fence, weakening the
+//!   daemon's `parked` load, or snapshotting before registering each
+//!   fails the model.
 //! - `ipc_wake_core` (composition, §5.3 protocol rule 3): the shipped
 //!   [`wake_core::WakeCoalescer`] composed with [`ipc_ring_core`]
 //!   publication exactly as the session doorbell ships — N submissions
@@ -148,6 +157,8 @@ pub mod cow_core;
 pub mod gauge_core;
 #[path = "../../src/incarnation_core.rs"]
 pub mod incarnation_core;
+#[path = "../../crates/squeezefs-ipc/src/cqe_core.rs"]
+pub mod ipc_cqe_core;
 #[path = "../../crates/squeezefs-ipc/src/ring_core.rs"]
 pub mod ipc_ring_core;
 #[path = "../../crates/squeezefs-ipc/src/slot_core.rs"]
@@ -174,8 +185,8 @@ pub mod write_pipeline_core;
 #[cfg(all(test, loom))]
 mod models {
     use crate::{
-        alloc_ext_core, conveyor_core, gauge_core, incarnation_core, ipc_ring_core, ipc_slot_core,
-        journal_core, lease_core, node_state_core, patch_clone_core, refcount_core,
+        alloc_ext_core, conveyor_core, gauge_core, incarnation_core, ipc_cqe_core, ipc_ring_core,
+        ipc_slot_core, journal_core, lease_core, node_state_core, patch_clone_core, refcount_core,
         slot_cursor_core, slot_gate_core, wake_core, write_pipeline_core,
     };
     use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2202,7 +2213,10 @@ mod models {
                 );
             }
             let gen2 = second_life.join().unwrap();
-            assert!(gen2 > hold_gen, "generations strictly monotonic across holds");
+            assert!(
+                gen2 > hold_gen,
+                "generations strictly monotonic across holds"
+            );
             assert!(slot.is_done_for(gen2), "the live generation consumes");
         });
     }
@@ -2428,6 +2442,82 @@ mod models {
                     );
                 }
             }
+        });
+    }
+
+    /// IPC completion doorbell (`ipc_cqe_core`, op-economy 2026-07-28):
+    /// the SHIPPED `CqeDoorbell` composed with the SHIPPED slot DONE
+    /// publication, exactly as the daemon/reaper wire them. Daemon:
+    /// serve + `SlotCore::complete` (the DONE publish) → `cqe.complete()`
+    /// (seq bump, parked gate) → futex-wake stand-in when gated on.
+    /// Reaper: `park_begin` (register-then-snapshot) → pending re-scan
+    /// (the disarm→scan law) → futex admission against the snapshot.
+    /// Strand-freedom: an ADMITTED park (seq still equals the snapshot
+    /// at admission time) is always covered by a wake; a failed
+    /// admission or a scan hit consumes without sleeping. The unparked
+    /// elision (`complete()` returning false) is safe in every
+    /// interleaving — that is the wake-syscall economy the campaign
+    /// ships.
+    ///
+    /// Weakening evidence (verified 2026-07-28, then restored): (a)
+    /// removing either §Dekker `fence(SeqCst)` in `cqe_core`, (b)
+    /// permuting `park_begin` to snapshot-before-register, and (c)
+    /// weakening the daemon's `parked` load to `Relaxed` each produce
+    /// the strand assert — an admitted sleeper on a completed op with
+    /// no wake coming.
+    #[test]
+    fn ipc_cqe_parked_reaper_never_stranded() {
+        loom::model(|| {
+            let slot = Arc::new(ipc_slot_core::SlotCore::new());
+            let cqe = Arc::new(ipc_cqe_core::CqeDoorbell::new());
+            let wake = Arc::new(AtomicBool::new(false));
+
+            // Sequential prologue: one op claimed + submitted.
+            let gen = slot.try_claim().expect("fresh slot must claim");
+            slot.publish_submitted();
+
+            // Daemon: serve, DONE-publish, completion doorbell.
+            let server = {
+                let slot = Arc::clone(&slot);
+                let cqe = Arc::clone(&cqe);
+                let wake = Arc::clone(&wake);
+                thread::spawn(move || {
+                    assert!(slot.try_begin_serve(), "submitted slot must serve");
+                    // The reaper does not set per-slot WAITER bits — the
+                    // cqe doorbell owns the completion-direction wake.
+                    let _slot_waiter = slot.complete();
+                    if cqe.complete() {
+                        wake.store(true, Ordering::SeqCst);
+                    }
+                })
+            };
+
+            // Reaper: register-then-snapshot, re-scan, admission.
+            let expected = cqe.park_begin();
+            let scan_found = slot.is_done_for(gen);
+            if !scan_found {
+                // The futex admission is atomic against the word: model
+                // it as one SeqCst load at park entry.
+                let admitted = cqe.seq() == expected;
+                server.join().unwrap();
+                if admitted {
+                    // Sleeping: the completion (now fully applied) must
+                    // have paid the wake — the strand otherwise.
+                    assert!(
+                        wake.load(Ordering::SeqCst),
+                        "cqe strand: reaper admitted the park on a \
+                         completed op and no wake is coming \
+                         (expected {expected}, seq now {}, parked {})",
+                        cqe.seq(),
+                        cqe.parked(),
+                    );
+                }
+                // EAGAIN path needs no wake: the reaper re-scans.
+            } else {
+                server.join().unwrap();
+            }
+            cqe.park_end();
+            assert!(slot.is_done_for(gen), "the op completed exactly once");
         });
     }
 
@@ -2927,5 +3017,4 @@ mod models {
             assert_eq!(core.inflight_blocks(), 0, "blocks gauge leaked");
         });
     }
-
 }

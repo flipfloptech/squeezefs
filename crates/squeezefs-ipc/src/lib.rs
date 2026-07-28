@@ -24,6 +24,7 @@
 //! The protocol is same-host, same-boot, and version-locked to the build
 //! commit (design KD-7) — explicitly **not** a stable ABI.
 
+pub mod cqe_core;
 pub mod layout;
 pub mod ring_core;
 pub mod slot_core;

@@ -31,6 +31,7 @@
 //! geometry authority is private), and snapshots descriptors exactly once
 //! ([`IpcSlot::snapshot_descriptor`]).
 
+use crate::cqe_core::CqeDoorbell;
 use crate::slot_core::SlotCore;
 use crate::wake_core::WakeCoalescer;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -38,7 +39,9 @@ use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 /// Coarse structural ABI guard; bump on ANY change to this module's types
 /// or the region arithmetic. Fine-grained skew is caught by the
 /// build-commit equality check at bind (design §5.2 screen rule 4).
-pub const IPC_ABI: u32 = 1;
+/// v2: the completion doorbell ([`crate::cqe_core::CqeDoorbell`]) took
+/// the header's reserved line 2 (op-economy campaign, 2026-07-28).
+pub const IPC_ABI: u32 = 2;
 
 /// Session mapping magic: `SQZIPC01` little-endian.
 pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"SQZIPC01");
@@ -274,13 +277,15 @@ pub struct SessionHeader {
     /// fuse3 (`crate::wake_core` — §5.3.2 sharing direction).
     pub doorbell_coalescer: WakeCoalescer,
     pub _pad2: [u8; 55],
-    // -- line 2: reserved --------------------------------------------------
-    /// Reserved line. (The producer-contended ring tail deliberately does
-    /// NOT live in the header: it owns the first line of the ring region —
-    /// [`SessionLayout::ring_off`] — so tail CAS traffic never shares a
-    /// line with the wake words above.) Also keeps the geometry copy off
-    /// the wake line.
-    pub _pad3: [u8; 64],
+    // -- line 2: completion wake words (daemon-written, reaper-parked) ---
+    /// The completion doorbell (op-economy campaign, 2026-07-28): the
+    /// per-session completion seq + parked-reaper count the daemon's
+    /// wake elision and the libaio reaper's event parks ride. Its own
+    /// cache line on purpose — completion-side bumps never contend the
+    /// submit wake words above, and the producer-contended ring tail
+    /// still lives in the ring region ([`SessionLayout::ring_off`]).
+    pub cqe: CqeDoorbell,
+    pub _pad3: [u8; 56],
     // -- geometry copy (write-once, for the CLIENT's map-time read) ------
     pub geometry: Geometry,
 }
@@ -299,7 +304,8 @@ impl SessionHeader {
             daemon_parked: AtomicU32::new(0),
             doorbell_coalescer: WakeCoalescer::new(),
             _pad2: [0; 55],
-            _pad3: [0; 64],
+            cqe: CqeDoorbell::new(),
+            _pad3: [0; 56],
             geometry,
         }
     }
@@ -446,7 +452,8 @@ const _: () = {
     // Wake words start at line 1, ring-tail pad at line 2 (cacheline
     // separation of identity / wake / producer-contended words).
     assert!(std::mem::offset_of!(SessionHeader, doorbell) == 64);
-    assert!(std::mem::offset_of!(SessionHeader, _pad3) == 128);
+    assert!(std::mem::offset_of!(SessionHeader, cqe) == 128);
+    assert!(std::mem::size_of::<CqeDoorbell>() == 8);
     assert!(std::mem::offset_of!(SessionHeader, geometry) == 192);
 };
 

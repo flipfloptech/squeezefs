@@ -6051,10 +6051,14 @@ impl SqueezefsFilesystem {
             let (deferred, complete) = match self.active_block_buffers.get(&key) {
                 Some(entry) => {
                     let v = entry.value();
-                    (
-                        v.seed_deferred(),
-                        !v.is_extent_repr() && v.is_content_valid() && !v.seed_deferred(),
-                    )
+                    // is_union_complete, NOT is_content_valid: seeded /
+                    // zero-completed custody is content-valid without
+                    // being app-written-complete and belongs to the
+                    // staged-writeback ladder (its supersession/fencing
+                    // semantics are load-bearing — FIND-M11-A suites);
+                    // only the accumulated-coverage-complete class rides
+                    // the write-through leg.
+                    (v.seed_deferred(), v.is_union_complete())
                 }
                 None => {
                     drop(block_guard);
@@ -8553,10 +8557,14 @@ impl SqueezefsFilesystem {
             let (deferred, complete) = match self.active_block_buffers.get(&key) {
                 Some(entry) => {
                     let v = entry.value();
-                    (
-                        v.seed_deferred(),
-                        !v.is_extent_repr() && v.is_content_valid() && !v.seed_deferred(),
-                    )
+                    // is_union_complete, NOT is_content_valid: seeded /
+                    // zero-completed custody is content-valid without
+                    // being app-written-complete and belongs to the
+                    // staged-writeback ladder (its supersession/fencing
+                    // semantics are load-bearing — FIND-M11-A suites);
+                    // only the accumulated-coverage-complete class rides
+                    // the write-through leg.
+                    (v.seed_deferred(), v.is_union_complete())
                 }
                 None => {
                     drop(block_guard);

@@ -241,6 +241,15 @@ backpressure — 84–3,943 per bracket run, scaling with thread count),
    at `78b9498` under `ulimit -n 1800`). The staging host now holds the
    router weak; pinned by `tests/fd_release_tests.rs` (leak==0, red 65).
    Residual: ~8 fds/fixture from a different holder — open question.
+4. **Flush-leg size floor** (`fix(write)` 9e4bf2f): the flush
+   write-through leg inherited `upload_full_block`'s block-end
+   `min_size` — correct for coverage-union-complete ACK-path blocks,
+   WRONG for zero-completed/seeded parked custody, where it published a
+   size acked data cannot back (the generic/795 SIZE-NEVER-LEADS-DATA
+   law; its repro-port `sequential_recopy_readers_never_see_foreign_
+   bytes` went deterministic-red the day the leg landed and bisected to
+   it exactly). Flush legs now merge with `min_size = 0` (the RAM acked
+   floor stays the honest bound); the ACK path keeps block-end verbatim.
 
 ## 9. Open questions
 

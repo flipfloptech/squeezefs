@@ -691,6 +691,17 @@ impl ActiveBlockBuf {
         self.written == (0, self.block_size)
     }
 
+    /// Every byte is APP-WRITTEN (the accumulated coverage union spans the
+    /// block) — the write-through class. Strictly stronger than
+    /// [`ActiveBlockBuf::is_content_valid`]: seeded / zero-completed /
+    /// seed-filled custody is content-valid without being app-complete,
+    /// and belongs to the staged-writeback ladder, never the write-through
+    /// legs (2026-07-27 write-pipeline campaign — the flush write-through
+    /// leg's admission predicate).
+    pub fn is_union_complete(&self) -> bool {
+        !self.is_extent_repr() && self.union_is_full()
+    }
+
     fn coalesce_extras_into_primary(&mut self) {
         let (mut p0, mut p1) = self.written;
         self.written_extra.retain(|&(s, e)| {

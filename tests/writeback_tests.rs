@@ -290,7 +290,17 @@ async fn test_small_block_map_stays_inline() {
     .await
     .unwrap();
 
+    // Park this harness's background reclaim worker (knob read at router
+    // construction; the module-documented test lever): every terminal free
+    // below then sits in begin_free limbo — counted as USED by
+    // `get_used_blocks()` — until this test's EXPLICIT `reclaim_drain`
+    // rendezvous. That turns the former schedule race on the mid-test
+    // count (the 1-in-N "72 vs 71" flake: the flush pass's displaced-block
+    // free racing the 2 ms reclaim batch window) into a deterministic
+    // contract: no drain, no pass.
+    std::env::set_var("SQUEEZEFS_RECLAIM_BATCH_MS", "600000");
     let router = DataRouter::new(dlm.clone(), cache, block_alloc.clone(), nvme_dev);
+    std::env::remove_var("SQUEEZEFS_RECLAIM_BATCH_MS");
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
 
     let meta_temp = NamedTempFile::new().unwrap();

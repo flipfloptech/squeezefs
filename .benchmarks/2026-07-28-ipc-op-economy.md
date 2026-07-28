@@ -163,16 +163,23 @@ section + stats surface).
 
 - `cargo clippy --all-targets --all-features -- -D warnings` — clean
   (root; ipc + preload crates too).
-- `cargo fmt --check` — clean (root + fuse3-excluded subcrates).
+- `cargo fmt --check` — clean (root + ipc + preload crates).
 - `cargo test --all-features -- --test-threads=1` — from zero on the
-  final tree (result recorded below).
+  final tree: **146/146 test binaries green** (zero FAILED, zero
+  panics; the definitive persisted-log run, 21.6 min contended).
 - `cargo doc --no-deps` — clean.
-- `cargo bench --benches -- --test` — bench smoke green.
-- loom: 48/48 (`tests/run_loom.sh`).
-- `tests/run_preload_gate.sh` leg 1 (unprivileged) — result recorded
-  below. **Leg 2 (sudo) PENDING**: the release gate owns the box's
-  root substrate; run before merge:
-  `sudo tests/run_preload_gate.sh` (leg 2 auto-runs as root).
+- `cargo bench --benches -- --test` — bench smoke green (all four
+  bench binaries).
+- loom: **48/48** (`tests/run_loom.sh` — 47 existing + the new cqe
+  model).
+- `tests/run_preload_gate.sh` leg 1 (unprivileged) — **PASSED**
+  (sanctioned preload-release build + crate clippy/fmt/tests, Issue-4
+  wrong-profile guard proof, plain-file passthrough battery, libaio
+  lifecycle passthrough ×3 orderings).
+- **Leg 2 (sudo) PENDING**: the v1.1 release gate was actively running
+  on the main tree's substrate for the whole session (verified live —
+  its cargo test binaries + the `sqzdevsub_*` null_blk items). Run
+  before merge: `sudo tests/run_preload_gate.sh`.
 
 ## 5. Phase B — PENDING (quiet box only; explicit TODO)
 

@@ -10916,6 +10916,25 @@ impl Filesystem for SqueezefsFilesystem {
             offset,
             data.len()
         );
+        // TEST SEAM (`SQUEEZEFS_TEST_WRITE_STALL_MS`, 2026-07-28
+        // transport-lease-watchdog repro): stall every WRITE handler
+        // invocation while `data` — on the kernel path a §5.4 transport
+        // payload LEASE — is held. Load does not cause the overlong-lease
+        // schedule; it selects it: this lever selects it deterministically
+        // (tests/transport_lease_overlong_tests.rs). Read once; zero cost
+        // unset; never set in production.
+        {
+            static STALL_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let stall = *STALL_MS.get_or_init(|| {
+                std::env::var("SQUEEZEFS_TEST_WRITE_STALL_MS")
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0)
+            });
+            if stall > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
+            }
+        }
 
         if ino == CONFIG_INODE || ino == STATS_INODE {
             return Err(Errno::from(libc::EACCES));

@@ -211,10 +211,7 @@ impl MountHandleInner {
                         .args([OsStr::new("-u"), self.mount_path.as_os_str()])
                         .spawn()?;
                     if !child.status().await?.success() {
-                        return Err(IoError::new(
-                            ErrorKind::Other,
-                            "call fusermount3 -u to unmount failed",
-                        ));
+                        return Err(IoError::other("call fusermount3 -u to unmount failed"));
                     }
 
                     return Ok(());
@@ -260,10 +257,7 @@ impl MountHandleInner {
                         }
                     }
                     if !success {
-                        return Err(IoError::new(
-                            ErrorKind::Other,
-                            "call fusermount3 -u to unmount failed",
-                        ));
+                        return Err(IoError::other("call fusermount3 -u to unmount failed"));
                     }
 
                     return Ok(());
@@ -285,10 +279,7 @@ impl MountHandleInner {
                     }
                 }
                 if !success {
-                    return Err(IoError::new(
-                        ErrorKind::Other,
-                        "umount failed after retries",
-                    ));
+                    return Err(IoError::other("umount failed after retries"));
                 }
             }
         }
@@ -755,10 +746,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
                 reply_error_in_place(libc::ENOSYS.into(), request, &self.response_sender).await;
 
-                return Err(IoError::new(
-                    ErrorKind::Other,
-                    format!("receive unknown opcode {}", err.0),
-                ));
+                return Err(IoError::other(format!("receive unknown opcode {}", err.0)));
             }
 
             Ok(opcode) => opcode,
@@ -769,10 +757,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         if opcode != fuse_opcode::FUSE_INIT {
             error!(?opcode, "received unexpected opcode");
 
-            return Err(IoError::new(
-                ErrorKind::Other,
-                format!("unexpected opcode {opcode:?}"),
-            ));
+            return Err(IoError::other(format!("unexpected opcode {opcode:?}")));
         }
 
         let data_size = in_header.len as usize - FUSE_IN_HEADER_SIZE;
@@ -808,19 +793,14 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 // Classical path: ENODEV (pre-FUSE_ABORT_ERROR) or ECONNABORTED.
                 // Uring path: we surface ENOTCONN / NotConnected when the pool dies.
                 let disconnect = match err.raw_os_error() {
-                    Some(e)
-                        if matches!(
-                            e,
-                            libc::ENODEV
-                                | libc::ECONNABORTED
-                                | libc::ENOTCONN
-                                | libc::EPIPE
-                                | libc::EBADF
-                                | libc::ESHUTDOWN
-                        ) =>
-                    {
-                        true
-                    }
+                    Some(
+                        libc::ENODEV
+                        | libc::ECONNABORTED
+                        | libc::ENOTCONN
+                        | libc::EPIPE
+                        | libc::EBADF
+                        | libc::ESHUTDOWN,
+                    ) => true,
                     _ => {
                         err.kind() == ErrorKind::NotConnected || err.kind() == ErrorKind::BrokenPipe
                     }
@@ -858,8 +838,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             );
 
             return ReadResult::Request {
-                in_header: Err(IoError::new(
-                    ErrorKind::Other,
+                in_header: Err(IoError::other(
                     "read_vectored n is less then FUSE_IN_HEADER_SIZE",
                 )),
                 header_buffer,
@@ -873,7 +852,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 error!("deserialize fuse_in_header failed {}", err);
 
                 return ReadResult::Request {
-                    in_header: Err(IoError::new(ErrorKind::Other, err)),
+                    in_header: Err(IoError::other(err)),
                     header_buffer,
                     data_buffer,
                     uring_payload,
@@ -5054,8 +5033,7 @@ mod init_negotiation_tests {
         // Not offered ⇒ never invented (older kernels keep the classical
         // kernel-side killpriv probe — the correct degraded posture).
         assert_eq!(
-            negotiate_reply_flags(u32::MAX & !FUSE_HANDLE_KILLPRIV_V2, &opts)
-                & FUSE_HANDLE_KILLPRIV_V2,
+            negotiate_reply_flags(!FUSE_HANDLE_KILLPRIV_V2, &opts) & FUSE_HANDLE_KILLPRIV_V2,
             0,
             "FUSE_HANDLE_KILLPRIV_V2 must never be invented when the kernel \
              does not offer it"

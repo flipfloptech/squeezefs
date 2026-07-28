@@ -139,9 +139,12 @@ pub struct InboundUringReq {
     pub unique: u64,
 }
 
+/// One pending ring entry: `(qid, ent_idx, commit_id)`.
+type PendingEnt = (u16, u16, u64);
+
 /// Sharded unique → (qid, ent_idx, commit_id) map (see field doc).
 struct PendingMap {
-    shards: Vec<Mutex<HashMap<u64, (u16, u16, u64)>>>,
+    shards: Vec<Mutex<HashMap<u64, PendingEnt>>>,
 }
 
 impl PendingMap {
@@ -1510,7 +1513,7 @@ fn connection_watch(pool: Arc<FuseOverUring>) {
         }
         let mut pfd = libc::pollfd {
             fd: pool.fuse_fd,
-            events: (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) as i16,
+            events: libc::POLLERR | libc::POLLHUP | libc::POLLNVAL,
             revents: 0,
         };
         let r = unsafe { libc::poll(&mut pfd, 1, 250) };
@@ -1527,7 +1530,7 @@ fn connection_watch(pool: Arc<FuseOverUring>) {
             continue;
         }
         let rev = pfd.revents;
-        if rev & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) as i16 != 0 {
+        if rev & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             info!(
                 "fuse-over-uring watch: /dev/fuse revents={rev:#x} (abort/unmount); shutting down"
             );
@@ -2081,7 +2084,7 @@ fn apply_reply(ent: &mut Ent, header: &[u8], body: &Bytes) {
     if header.len() < OUT_HDR {
         // Degenerate — treat as IO error header.
         ent.header.in_out[..4].copy_from_slice(&((OUT_HDR as u32).to_le_bytes()));
-        ent.header.in_out[4..8].copy_from_slice(&((-libc::EIO as i32).to_le_bytes()));
+        ent.header.in_out[4..8].copy_from_slice(&(-libc::EIO).to_le_bytes());
         ent.header.ring_ent_in_out.payload_sz = 0;
         return;
     }

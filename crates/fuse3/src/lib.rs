@@ -21,7 +21,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
-use std::io::{self, ErrorKind};
+use std::io;
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -153,7 +153,7 @@ fn coarse_now_timestamp() -> Timestamp {
     // SAFETY: clock_gettime with a valid clock id and a valid out pointer;
     // CLOCK_REALTIME_COARSE cannot fail on Linux.
     unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut t) };
-    Timestamp::new(t.tv_sec as i64, t.tv_nsec as u32)
+    Timestamp::new(t.tv_sec, t.tv_nsec as u32)
 }
 
 impl From<&fuse_setattr_in> for SetAttr {
@@ -242,12 +242,8 @@ impl From<SystemTime> for Timestamp {
 
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 fn find_fusermount3() -> io::Result<PathBuf> {
-    which::which("fusermount3").map_err(|err| {
-        io::Error::new(
-            ErrorKind::Other,
-            format!("find fusermount3 binary failed {err:?}"),
-        )
-    })
+    which::which("fusermount3")
+        .map_err(|err| io::Error::other(format!("find fusermount3 binary failed {err:?}")))
 }
 
 #[cfg(test)]

@@ -9,6 +9,11 @@ use crate::raw::request::Request;
 use crate::{Inode, Result, SetAttr};
 
 #[allow(unused_variables)]
+// Wire-shaped trait: several FUSE ops (write, setxattr, rename2, ...) carry
+// 8+ kernel-defined arguments; the trait mirrors the uapi rather than
+// inventing carrier structs (the per-method allows do not reach the
+// trait_make-generated companion items, so the allow sits on the trait).
+#[allow(clippy::too_many_arguments)]
 #[trait_make::make(Send)]
 /// Inode based filesystem trait.
 pub trait Filesystem {

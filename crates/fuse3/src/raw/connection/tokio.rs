@@ -82,12 +82,6 @@ impl std::fmt::Debug for DebugUring {
     }
 }
 
-#[cfg(any(
-    all(target_os = "linux", feature = "unprivileged"),
-    target_os = "freebsd"
-))]
-use std::io::ErrorKind;
-
 #[cfg(target_os = "freebsd")]
 use std::io::IoSlice;
 
@@ -1123,7 +1117,7 @@ impl NonBlockFuseConnection {
             .open(DEV_FUSE)
         {
             Err(e) => {
-                if e.kind() == ErrorKind::NotFound {
+                if e.kind() == io::ErrorKind::NotFound {
                     warn!("Cannot open /dev/fuse.  Is the module loaded?");
                 }
                 Err(e)
@@ -1171,10 +1165,7 @@ impl NonBlockFuseConnection {
             .spawn()?;
 
         if !child.wait().await?.success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "fusermount run failed",
-            ));
+            return Err(io::Error::other("fusermount run failed"));
         }
 
         let fd1 = sock1.as_raw_fd();
@@ -1199,12 +1190,12 @@ impl NonBlockFuseConnection {
 
             let fd = if let Some(ControlMessageOwned::ScmRights(fds)) = msg.cmsgs()?.next() {
                 if fds.is_empty() {
-                    return Err(io::Error::new(ErrorKind::Other, "no fuse fd"));
+                    return Err(io::Error::other("no fuse fd"));
                 }
 
                 fds[0]
             } else {
-                return Err(io::Error::new(ErrorKind::Other, "get fuse fd failed"));
+                return Err(io::Error::other("get fuse fd failed"));
             };
 
             Ok(fd)

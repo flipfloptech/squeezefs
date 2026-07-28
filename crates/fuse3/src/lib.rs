@@ -239,3 +239,59 @@ fn find_fusermount3() -> io::Result<PathBuf> {
         )
     })
 }
+
+#[cfg(test)]
+mod setattr_killpriv_tests {
+    use bincode::Options;
+
+    use super::*;
+    use crate::helper::get_bincode_config;
+    use crate::raw::abi::{fuse_setattr_in, FATTR_KILL_SUIDGID, FATTR_SIZE};
+
+    /// Wire-shaped `fuse_setattr_in` (Linux layout, 88 bytes): only
+    /// `valid` and `size` populated — everything else zero.
+    fn setattr_in_bytes(valid: u32, size: u64) -> Vec<u8> {
+        let mut b = Vec::with_capacity(88);
+        b.extend_from_slice(&valid.to_le_bytes()); // valid
+        b.extend_from_slice(&0u32.to_le_bytes()); // _padding
+        b.extend_from_slice(&0u64.to_le_bytes()); // fh
+        b.extend_from_slice(&size.to_le_bytes()); // size
+        for _ in 0..4 {
+            b.extend_from_slice(&0u64.to_le_bytes()); // lock_owner, atime, mtime, ctime
+        }
+        for _ in 0..8 {
+            b.extend_from_slice(&0u32.to_le_bytes()); // *nsec, mode, unused4, uid, gid, unused5
+        }
+        b
+    }
+
+    /// FUSE_HANDLE_KILLPRIV_V2 contract (killpriv campaign): a
+    /// size-changing SETATTR from a non-CAP_FSETID caller carries
+    /// `FATTR_KILL_SUIDGID` — the daemon (not the kernel) must clear
+    /// suid / group-exec sgid / security.capability. The bit must
+    /// surface on [`SetAttr`] or the handler can never honor it.
+    #[test]
+    fn setattr_in_fattr_kill_suidgid_surfaces_on_set_attr() {
+        let bytes = setattr_in_bytes(FATTR_SIZE | FATTR_KILL_SUIDGID, 0);
+        let setattr_in: fuse_setattr_in = get_bincode_config()
+            .deserialize(&bytes)
+            .expect("wire-shaped fuse_setattr_in decodes");
+        let set_attr = SetAttr::from(&setattr_in);
+        assert_eq!(set_attr.size, Some(0), "FATTR_SIZE still maps");
+        assert!(
+            set_attr.kill_suidgid,
+            "FATTR_KILL_SUIDGID must surface as SetAttr::kill_suidgid"
+        );
+
+        // And absent ⇒ false (an unflagged truncate must clear nothing).
+        let bytes = setattr_in_bytes(FATTR_SIZE, 4096);
+        let setattr_in: fuse_setattr_in = get_bincode_config()
+            .deserialize(&bytes)
+            .expect("wire-shaped fuse_setattr_in decodes");
+        let set_attr = SetAttr::from(&setattr_in);
+        assert!(
+            !set_attr.kill_suidgid,
+            "kill_suidgid must be false when the kernel did not flag it"
+        );
+    }
+}

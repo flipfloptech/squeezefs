@@ -1092,3 +1092,52 @@ pub struct fuse_copy_file_range_in {
     pub len: u64,
     pub flags: u64,
 }
+
+#[cfg(test)]
+mod killpriv_abi_tests {
+    use bincode::Options;
+
+    use super::*;
+    use crate::helper::get_bincode_config;
+
+    /// `fuse_open_in.open_flags` is the uapi's second word (byte offset
+    /// 4) — the kernel puts `FUSE_OPEN_KILL_SUIDGID` there on O_TRUNC
+    /// opens by non-CAP_FSETID callers once `FUSE_HANDLE_KILLPRIV_V2` is
+    /// negotiated. Pre-campaign the fork read it as `_unused`; this pins
+    /// both the layout (size stays 8) and the decode.
+    #[test]
+    fn fuse_open_in_carries_open_flags_at_offset_4() {
+        assert_eq!(
+            mem::size_of::<fuse_open_in>(),
+            8,
+            "uapi fuse_open_in is 8 bytes"
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(libc::O_TRUNC as u32 | libc::O_WRONLY as u32).to_le_bytes());
+        bytes.extend_from_slice(&FUSE_OPEN_KILL_SUIDGID.to_le_bytes());
+        let open_in: fuse_open_in = get_bincode_config()
+            .deserialize(&bytes)
+            .expect("8-byte fuse_open_in decodes");
+        assert_eq!(
+            open_in.flags,
+            libc::O_TRUNC as u32 | libc::O_WRONLY as u32,
+            "flags word unchanged at offset 0"
+        );
+        assert_eq!(
+            open_in.open_flags, FUSE_OPEN_KILL_SUIDGID,
+            "open_flags (FUSE_OPEN_KILL_SUIDGID) must decode from offset 4"
+        );
+    }
+
+    /// The uapi bit values the killpriv-v2 contract rides on
+    /// (include/uapi/linux/fuse.h): init bit 28, write flag bit 2, open
+    /// flag bit 0, setattr valid bit 11. A silent renumbering here would
+    /// negotiate one thing and honor another.
+    #[test]
+    fn killpriv_v2_uapi_bits_are_pinned() {
+        assert_eq!(FUSE_HANDLE_KILLPRIV_V2, 1 << 28);
+        assert_eq!(FUSE_WRITE_KILL_SUIDGID, 1 << 2);
+        assert_eq!(FUSE_OPEN_KILL_SUIDGID, 1 << 0);
+        assert_eq!(FATTR_KILL_SUIDGID, 1 << 11);
+    }
+}

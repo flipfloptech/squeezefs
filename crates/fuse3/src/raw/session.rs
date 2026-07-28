@@ -4985,6 +4985,65 @@ mod init_negotiation_tests {
             "no kernel-offered capability may be invented by the daemon"
         );
     }
+
+    /// FUSE_HANDLE_KILLPRIV_V2 (the 2026-07-28 killpriv campaign —
+    /// `.benchmarks/2026-07-27-oq1-overwrite-op-economy.md` §4/§5): without
+    /// it the kernel probes `GETXATTR("security.capability")` once per
+    /// `write(2)` syscall (`file_remove_privs` — HALF of every
+    /// write-syscall-bound stream's FUSE requests, answered ENODATA every
+    /// time). Negotiating V2 transfers the suid/sgid/caps-killing
+    /// obligation to the daemon (`FUSE_WRITE_KILL_SUIDGID` /
+    /// `FUSE_OPEN_KILL_SUIDGID` / `FATTR_KILL_SUIDGID`) and deletes the
+    /// probe. Option-gated: the daemon only advertises it when its
+    /// handlers implement the clearing law (a capability the daemon does
+    /// not implement must never be advertised).
+    #[test]
+    fn init_reply_advertises_handle_killpriv_v2_when_offered_and_enabled() {
+        let mut opts = MountOptions::default();
+        opts.handle_killpriv_v2(true);
+        let flags = negotiate_reply_flags(u32::MAX, &opts);
+        assert!(
+            flags & FUSE_HANDLE_KILLPRIV_V2 > 0,
+            "FUSE_HANDLE_KILLPRIV_V2 must echo when the kernel offers it and \
+             the mount enables it (the per-write GETXATTR killpriv probe \
+             economy)"
+        );
+        // V1 must never ride along uninvited: it is the coarser
+        // unconditional-kill contract (no group-exec sgid preservation)
+        // and the daemon deliberately adopts V2 only.
+        assert_eq!(
+            flags & FUSE_HANDLE_KILLPRIV,
+            0,
+            "FUSE_HANDLE_KILLPRIV (v1) must not echo — the daemon implements \
+             the V2 clearing law, not v1's unconditional kill"
+        );
+        // Not offered ⇒ never invented (older kernels keep the classical
+        // kernel-side killpriv probe — the correct degraded posture).
+        assert_eq!(
+            negotiate_reply_flags(u32::MAX & !FUSE_HANDLE_KILLPRIV_V2, &opts)
+                & FUSE_HANDLE_KILLPRIV_V2,
+            0,
+            "FUSE_HANDLE_KILLPRIV_V2 must never be invented when the kernel \
+             does not offer it"
+        );
+    }
+
+    /// The option gate: a mount that has not armed the daemon-side
+    /// clearing handlers (`MountOptions::handle_killpriv_v2`) must never
+    /// advertise the capability, whatever the kernel offers — advertising
+    /// an unimplemented capability silently disables the kernel's own
+    /// killpriv machinery (a security regression, not a perf bug).
+    #[test]
+    fn init_reply_never_advertises_handle_killpriv_v2_when_option_off() {
+        let opts = MountOptions::default();
+        let flags = negotiate_reply_flags(u32::MAX, &opts);
+        assert_eq!(
+            flags & FUSE_HANDLE_KILLPRIV_V2,
+            0,
+            "FUSE_HANDLE_KILLPRIV_V2 echoed without MountOptions::handle_killpriv_v2 \
+             — the kernel would stop killing privs and nothing would"
+        );
+    }
 }
 
 #[cfg(test)]

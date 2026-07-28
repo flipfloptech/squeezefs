@@ -246,7 +246,7 @@ impl Lane {
 /// The per-mount write-pipeline authority: admission gate + depth
 /// governor + in-flight gauges. Shared `Arc` across handler clones.
 /// The lock-free admission accounting lives in
-/// [`crate::write_pipeline_core::AdmissionCore`] — loom-modeled
+/// `crate::write_pipeline_core::AdmissionCore` — loom-modeled
 /// (`loom-models/`, `write_pipeline_admission_*`): bounded admission,
 /// single oversized empty-pipe bypass, exact settle-to-zero.
 pub struct WritePipeline {

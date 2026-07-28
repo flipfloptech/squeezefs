@@ -520,8 +520,24 @@ impl DataPlaneSink {
         let inval = self.inval.clone();
         let ino = op.binding.ino;
         let offset = op.desc.offset;
+        // Killpriv-v2 il parity (2026-07-28 campaign): intercepted
+        // write(2) never runs the kernel's file_remove_privs, so the
+        // session peer's HELLO-time class (BindingRights::kill_priv —
+        // uid + CAP_FSETID, SO_PEERCRED-verified) stands in for the
+        // kernel's per-write !capable(CAP_FSETID) and rides the SAME
+        // daemon clearing law the kernel path uses. Known-clean inos
+        // short-circuit on the handler's latch — the common case pays a
+        // contains-check, nothing more.
+        let write_flags = if op.binding.kill_priv {
+            fuse3::raw::flags::FUSE_WRITE_KILL_SUIDGID
+        } else {
+            0
+        };
         handoff_spawn(async move {
-            match fs.write(request, ino, 0, offset, severed, 0, 0).await {
+            match fs
+                .write(request, ino, 0, offset, severed, write_flags, 0)
+                .await
+            {
                 Ok(reply) => {
                     METRICS.ipc_ops_write.fetch_add(1, Ordering::Relaxed);
                     METRICS

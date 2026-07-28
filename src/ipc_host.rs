@@ -245,6 +245,17 @@ pub struct BindingRights {
     /// F_SETFL toggling O_DIRECT later unbinds shim-side — the class is
     /// per-description and captured once, like the rights.)
     pub odirect: bool,
+    /// Killpriv-v2 il parity (2026-07-28 campaign): the session peer's
+    /// privilege class — `true` ⇒ ring writes on this binding carry the
+    /// daemon's `FUSE_WRITE_KILL_SUIDGID` clearing obligation (suid /
+    /// group-exec sgid / security.capability), mirroring the kernel
+    /// path's per-write `!capable(CAP_FSETID)`. Computed ONCE at HELLO
+    /// from the SO_PEERCRED-verified identity ([`peer_kill_priv`]) —
+    /// a documented approximation: the kernel samples the writing
+    /// task's capability per syscall, the ring samples the session
+    /// peer's at establishment (a client changing CAP_FSETID
+    /// mid-session keeps its HELLO-time class until it reconnects).
+    pub kill_priv: bool,
 }
 
 /// A validated data-plane op (direction-checked, bounds-checked) handed to
@@ -474,6 +485,10 @@ impl Drop for SessionMapping {
 struct IpcSession {
     id: u64,
     uid: u32,
+    /// Peer privilege class for the killpriv-v2 write obligation
+    /// (`BindingRights::kill_priv` copies this per BIND) — computed at
+    /// HELLO from the SO_PEERCRED identity via [`peer_kill_priv`].
+    kill_priv: bool,
     /// The §5.5.1 session-ownership invariant: pinned to exactly ONE
     /// service thread at admission, for the session's whole lifetime (the
     /// `ipc_ring_core` single-consumer precondition). No drain handoff, no
@@ -1057,6 +1072,7 @@ impl IpcHost {
                                 read_ok,
                                 write_ok,
                                 odirect,
+                                kill_priv: session.kill_priv,
                             };
                             let _ = session.bindings.insert_sync(binding_id, rights);
                             METRICS.ipc_binds.fetch_add(1, Ordering::Relaxed);
@@ -1330,6 +1346,7 @@ impl IpcHost {
         let session = Arc::new(IpcSession {
             id: self.next_session_id.fetch_add(1, Ordering::Relaxed),
             uid: cred.uid,
+            kill_priv: peer_kill_priv(cred.uid, cred.pid as u32),
             owner,
             map: Arc::new(map),
             charged_bytes: footprint,
@@ -1995,6 +2012,42 @@ fn peer_cred(sock: &UnixStream) -> Option<libc::ucred> {
         }
         Some(cred)
     }
+}
+
+/// CAP_FSETID is bit 4 of a `/proc/<pid>/status` `CapEff:` word
+/// (linux/capability.h). A malformed word classifies `false`
+/// (NOT-privileged — the conservative direction for the killpriv
+/// obligation: clearing where the kernel might not is safe; preserving
+/// where the kernel would clear is the security hole). Pinned in
+/// tests/ipc_host_tests.rs.
+pub fn capeff_hex_has_fsetid(hex: &str) -> bool {
+    const CAP_FSETID_BIT: u64 = 1 << 4;
+    u64::from_str_radix(hex.trim(), 16)
+        .map(|word| word & CAP_FSETID_BIT != 0)
+        .unwrap_or(false)
+}
+
+/// The killpriv-v2 il-parity peer class (2026-07-28 campaign): does
+/// this session's writes carry the daemon's suid/sgid/caps clearing
+/// obligation? Mirrors the kernel path's `!capable(CAP_FSETID)`:
+/// uid 0 is exempt; a non-root peer is exempt only when its effective
+/// capability set carries CAP_FSETID (read once from
+/// `/proc/<pid>/status` at HELLO — the pid is SO_PEERCRED-verified).
+/// An unreadable /proc (peer already died, hidepid) classifies kill —
+/// conservative, see [`capeff_hex_has_fsetid`].
+pub fn peer_kill_priv(uid: u32, pid: u32) -> bool {
+    if uid == 0 {
+        return false;
+    }
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return true;
+    };
+    let has_fsetid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .map(capeff_hex_has_fsetid)
+        .unwrap_or(false);
+    !has_fsetid
 }
 
 // -------------------------------------------------------------------

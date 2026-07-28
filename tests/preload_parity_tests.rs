@@ -38,6 +38,7 @@ use squeezefs_ipc::wire::CtlMsg;
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
+use squeezefs::meta_backend::Metadata as _;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::Write;

@@ -1258,6 +1258,292 @@ fn fragmented_slots_still_serve_large_write_via_smaller_runs() {
     host.shutdown();
 }
 
+// ---------------------------------------------------------------------------
+// Read-saturation campaign (2026-07-29) — the READ twins of the P3 pins.
+// A ring read larger than one arena slab must NOT degrade into serial
+// slab-sized round trips either: on the fabric-latency field shape a 1 MiB
+// il streaming read paid 16 × 64 KiB device round trips per MiB (measured:
+// `ipc_ops_read`/user-op = 16.02 on the baseline rig row) while the write
+// side rode ONE multi-slab ring op. The contract mirrors ring_pwrite's:
+// chunks size to the full `max_op_bytes` window via contiguous multi-slab
+// runs, every chunk of one op is submitted before any is waited on, POSIX
+// short-read prefix semantics, slot accounting, fragmentation degradation.
+// ---------------------------------------------------------------------------
+
+/// The deterministic read pattern: byte at ABSOLUTE file offset `o` is a
+/// pure function of `o`, so any chunking of a read window can be verified
+/// byte-exactly against the reassembled buffer.
+fn read_pattern(offset: u64, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| ((offset + i as u64).wrapping_mul(31).wrapping_add(7) % 251) as u8)
+        .collect()
+}
+
+/// Records every served READ `(offset, len)`, serves the deterministic
+/// pattern into the arena window, completes fully.
+struct PatternReadSink {
+    reads: std::sync::Mutex<Vec<(u64, u32)>>,
+}
+
+impl SessionSink for PatternReadSink {
+    fn serve_data(&self, op: DataOp, completion: SlotCompletion) {
+        if op.desc.op == squeezefs_ipc::layout::OP_READ {
+            self.reads
+                .lock()
+                .expect("recording mutex never poisons")
+                .push((op.desc.offset, op.desc.len));
+            op.payload
+                .write(&read_pattern(op.desc.offset, op.desc.len as usize));
+        }
+        completion.complete(op.desc.len as i64);
+    }
+}
+
+/// Serves the pattern but completes the FIRST read short (`short_n`),
+/// everything after it fully — the POSIX read-prefix pin (EOF shape).
+struct ShortFirstReadSink {
+    short_n: i64,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl SessionSink for ShortFirstReadSink {
+    fn serve_data(&self, op: DataOp, completion: SlotCompletion) {
+        op.payload
+            .write(&read_pattern(op.desc.offset, op.desc.len as usize));
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            completion.complete(self.short_n);
+        } else {
+            completion.complete(op.desc.len as i64);
+        }
+    }
+}
+
+/// A >slab read must ride `max_op_bytes`-sized ring ops (multi-slab arena
+/// runs), not slab-sized serial chunks: 1 MiB over a 512 KiB window = 2
+/// ring ops, at offsets 0 and 512 KiB — and byte-exact reassembly.
+#[test]
+fn large_read_is_one_ring_op_per_max_op_window() {
+    let sink = Arc::new(PatternReadSink {
+        reads: std::sync::Mutex::new(Vec::new()),
+    });
+    let (host, _dir, _f, session, bid) =
+        sink_host_geo("wide-read-opcount", sink.clone(), wide_geometry());
+
+    let mut buf = vec![0u8; 1024 * 1024];
+    match session.ring_pread(bid, &mut buf, 0) {
+        RingOutcome::Served(n) => assert_eq!(n, buf.len(), "full serve"),
+        other => panic!("ring_pread must serve, got {other:?}"),
+    }
+    assert_eq!(buf, read_pattern(0, 1024 * 1024), "byte-exact reassembly");
+    let mut reads = sink.reads.lock().unwrap().clone();
+    reads.sort_unstable();
+    assert_eq!(
+        reads,
+        vec![(0, 512 * 1024), (512 * 1024, 512 * 1024)],
+        "1 MiB over a 512 KiB max_op window must be exactly two full-window \
+         ring ops — slab-sized serial chunking is the il streaming-read \
+         round-trip collapse (16 RTTs per MiB at default geometry)"
+    );
+    host.shutdown();
+}
+
+/// Every chunk of one large read is submitted BEFORE the client waits on
+/// any of them: a sink that completes nothing until both chunks arrived
+/// can only be satisfied by a pipelined client.
+#[test]
+fn large_read_pipelines_all_chunks_before_waiting() {
+    let sink = Arc::new(ParkUntilNSink {
+        need: 2,
+        parked: std::sync::Mutex::new(Vec::new()),
+    });
+    let (host, _dir, f, _default_session, _bid) =
+        sink_host_geo("wide-read-pipeline", sink.clone(), wide_geometry());
+    let blob = BootstrapBlob::decode(&host.bootstrap_blob()).unwrap();
+    let session = Session::establish_with_op_timeout_ms(&blob, f.as_raw_fd(), TEST_COMMIT, 2_000)
+        .expect("session establishes");
+    let bind = session.bind(f.as_raw_fd()).expect("bind succeeds");
+
+    let mut buf = vec![0u8; 1024 * 1024];
+    match session.ring_pread(bind.binding_id, &mut buf, 0) {
+        RingOutcome::Served(n) => assert_eq!(n, buf.len(), "both chunks in flight together"),
+        other => panic!(
+            "a pipelined large read must serve (serial chunking strands \
+             on the parked first chunk), got {other:?}"
+        ),
+    }
+    assert!(!session.poisoned(), "no deadline fired");
+    host.shutdown();
+}
+
+/// POSIX read-prefix semantics: the first (lowest-offset) chunk completing
+/// short (the EOF shape) ends the reported prefix; later in-flight chunks
+/// are drained and ignored.
+#[test]
+fn large_read_short_first_completion_reports_posix_prefix() {
+    let sink = Arc::new(ShortFirstReadSink {
+        short_n: 100_000,
+        fired: std::sync::atomic::AtomicBool::new(false),
+    });
+    let (host, _dir, _f, session, bid) = sink_host_geo("wide-read-short", sink, wide_geometry());
+
+    let mut buf = vec![0u8; 1024 * 1024];
+    match session.ring_pread(bid, &mut buf, 0) {
+        RingOutcome::Served(n) => {
+            assert_eq!(
+                n, 100_000,
+                "prefix ends at the first short completion (POSIX short read)"
+            );
+            assert_eq!(
+                &buf[..n],
+                &read_pattern(0, n)[..],
+                "served prefix is byte-exact"
+            );
+        }
+        other => panic!("short-completion read must serve a prefix, got {other:?}"),
+    }
+    host.shutdown();
+}
+
+/// Error semantics: an error on the FIRST chunk is the op's errno; an
+/// error after a completed prefix reports the prefix.
+#[test]
+fn large_read_error_semantics_prefix_or_errno() {
+    // Error at offset 0 (first chunk) ⇒ Errno.
+    let (host, _dir, _f, session, bid) = sink_host_geo(
+        "wide-read-err0",
+        Arc::new(ErrAtSink { err_at: 0 }),
+        wide_geometry(),
+    );
+    let mut buf = vec![0u8; 1024 * 1024];
+    match session.ring_pread(bid, &mut buf, 0) {
+        RingOutcome::Errno(e) => assert_eq!(e, libc::EIO, "first-chunk error is the errno"),
+        other => panic!("first-chunk error must surface, got {other:?}"),
+    }
+    host.shutdown();
+
+    // Error at the second window ⇒ Served(first window).
+    let (host, _dir, _f, session, bid) = sink_host_geo(
+        "wide-read-err1",
+        Arc::new(ErrAtSink { err_at: 512 * 1024 }),
+        wide_geometry(),
+    );
+    let mut buf = vec![0u8; 1024 * 1024];
+    match session.ring_pread(bid, &mut buf, 0) {
+        RingOutcome::Served(n) => assert_eq!(
+            n,
+            512 * 1024,
+            "mid-stream error reports the completed prefix"
+        ),
+        other => panic!("mid-stream error must report the prefix, got {other:?}"),
+    }
+    host.shutdown();
+}
+
+/// Slot accounting: a multi-slab read returns EVERY slot (submitted base +
+/// arena-extension holds) to FREE — all 16 slots claimable afterwards.
+#[test]
+fn large_read_releases_every_slot_after_serve() {
+    let sink = Arc::new(PatternReadSink {
+        reads: std::sync::Mutex::new(Vec::new()),
+    });
+    let (host, _dir, _f, session, bid) = sink_host_geo("wide-read-slots", sink, wide_geometry());
+
+    let mut buf = vec![0u8; 1024 * 1024];
+    for _ in 0..3 {
+        match session.ring_pread(bid, &mut buf, 0) {
+            RingOutcome::Served(n) => assert_eq!(n, buf.len()),
+            other => panic!("serve expected, got {other:?}"),
+        }
+    }
+    let mut tickets = Vec::new();
+    for i in 0..16u64 {
+        let t = session
+            .submit_pread_nowait(bid, 4096, i * 4096)
+            .unwrap_or_else(|| panic!("slot {i} must be claimable after large reads"));
+        tickets.push(t);
+    }
+    for t in tickets {
+        loop {
+            if let Some(r) = session.poll_ticket(t, None) {
+                assert!(r > 0, "ticket completes clean");
+                break;
+            }
+            std::hint::spin_loop();
+        }
+    }
+    host.shutdown();
+}
+
+/// Fragmented slot space still serves reads via smaller runs — never
+/// fails, never strands (the write pin's read twin).
+#[test]
+fn fragmented_slots_still_serve_large_read_via_smaller_runs() {
+    let sink = Arc::new(ParkReadsUntilReleasedSink {
+        parked: std::sync::Mutex::new(Vec::new()),
+        park_offset: 1 << 40,
+    });
+    let (host, _dir, _f, session, bid) =
+        sink_host_geo("wide-read-frag", sink.clone(), wide_geometry());
+
+    // Park 13 of 16 slots behind never-completing reads at the park
+    // offset; ordinary reads serve the pattern inline.
+    let mut held = Vec::new();
+    for _ in 0..13 {
+        held.push(
+            session
+                .submit_pread_nowait(bid, 4096, 1 << 40)
+                .expect("hold ticket claims"),
+        );
+    }
+    let mut buf = vec![0u8; 512 * 1024];
+    match session.ring_pread(bid, &mut buf, 0) {
+        RingOutcome::Served(n) => {
+            assert_eq!(n, buf.len(), "fragmented slots still serve fully");
+            assert_eq!(buf, read_pattern(0, buf.len()), "byte-exact under fragmentation");
+        }
+        other => panic!("fragmented large read must serve, got {other:?}"),
+    }
+    {
+        let mut parked = sink.parked.lock().unwrap();
+        for c in parked.drain(..) {
+            c.complete(0);
+        }
+    }
+    for t in held {
+        loop {
+            if let Some(_r) = session.poll_ticket(t, None) {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+    }
+    host.shutdown();
+}
+
+/// Parks READ completions whose offset matches `park_offset` (the slot
+/// occupancy fixture); every other read serves the pattern inline.
+struct ParkReadsUntilReleasedSink {
+    parked: std::sync::Mutex<Vec<SlotCompletion>>,
+    park_offset: u64,
+}
+
+impl SessionSink for ParkReadsUntilReleasedSink {
+    fn serve_data(&self, op: DataOp, completion: SlotCompletion) {
+        if op.desc.op == squeezefs_ipc::layout::OP_READ && op.desc.offset == self.park_offset {
+            self.parked
+                .lock()
+                .expect("park mutex never poisons")
+                .push(completion);
+        } else {
+            if op.desc.op == squeezefs_ipc::layout::OP_READ {
+                op.payload
+                    .write(&read_pattern(op.desc.offset, op.desc.len as usize));
+            }
+            completion.complete(op.desc.len as i64);
+        }
+    }
+}
+
 /// Multi-slab arena windows through the REAL data-plane sink: byte parity
 /// end-to-end (the severed copy spans slabs), both transports agree.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

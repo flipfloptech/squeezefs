@@ -588,6 +588,8 @@ Every measurement states its substrate alongside its instrument (the standing in
 
 **A-B-B-A alternating-order brackets (standing comparison rule, 2026-07-27):** any A-vs-B comparison where a shared store AGES across the runs — overwrite rows against an already-written file set, before/after-binary brackets over one formatted volume, anything where run order changes free-list shape, staging temperature, or device thin-state — must run **A-B-B-A** (both orders) and cite BOTH brackets; a single-order delta on an aging store is an ordering artifact until the reversed bracket reproduces it (the first-write-vs-overwrite field conviction was proven order-independent exactly this way).
 
+**Sustained-state rows (standing measurement rule, 2026-07-29 — user directive: speeds must SUSTAIN):** every headline perf claim must include a **sustained steady-state row** — ≥ 60 s (`--infloop --timelimit` or equivalent), throughput flat across the window (no decay beyond noise between the first and last third) — alongside any short bracket rows. A burst number that decays is a FAILED row, not a result: report the sustained figure as the claim and the burst separately if informative (the field's 1.2 M → 250 k seq-read collapse — a warm-tier burst masking the cold ceiling — is the motivating case). Cache-warm bursts, first-pass-only rates, and any row shorter than the machinery's convergence horizon (governor probing, reclaim drain, tier churn) are label-only.
+
 ### Criterion benches
 
 Two Criterion benches, both `harness = false`:

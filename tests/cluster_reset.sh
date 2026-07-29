@@ -27,9 +27,19 @@ HOSTS=(
 
 NQN_PREFIX="nqn.2026-07.io.squeezefs"
 MOUNTPOINT="/scratch/tmp/test"
-CACHE_DIR="/scratch/tmp/cache"
+CACHE_DIR=""                # staging/cache dir; EMPTY = cache-less format (the right
+                            # posture when local disk is slower than the fabric — the
+                            # SATA-cache lesson: same throughput, tails 238ms -> 58ms)
 META_SLOTS=8
 MDS_SIZE_MB=8192            # null_blk size per metadata namespace
+
+# Data-plane width. Every data namespace is its own subsystem (own nvme-tcp
+# queue set), named "$NQN_PREFIX:<node>-d<i>".
+OSS_NAMESPACES=1            # data namespaces per data-serving node
+                            # (per-node RAM cost = OSS_NAMESPACES x backing size)
+DATA_ON_MDS=0               # 1 = mds nodes ALSO serve OSS_NAMESPACES data namespaces
+                            # each (the 4-wide data plane: 2-target raw ceiling was
+                            # ~16.6 GB/s; 4 targets ~= double the headroom)
 
 # Data-node backing. The choice defines what the testbed measures:
 #   zram    — compressed RAM disk. CPU-priced writes (throughput depends on the
@@ -56,6 +66,11 @@ die()  { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo)"
 [ -x "$SQZ" ] || die "client binary not executable: $SQZ"
 case "$OSS_BACKING" in zram|nullblk) ;; *) die "OSS_BACKING must be zram or nullblk (got: $OSS_BACKING)";; esac
+[[ "$OSS_NAMESPACES" =~ ^[1-9][0-9]*$ ]] || die "OSS_NAMESPACES must be a positive integer (got: $OSS_NAMESPACES)"
+case "$DATA_ON_MDS" in 0|1) ;; *) die "DATA_ON_MDS must be 0 or 1 (got: $DATA_ON_MDS)";; esac
+
+# serves_data <kind> — does this node export data namespaces?
+serves_data() { [ "$1" = "oss" ] || { [ "$1" = "mds" ] && [ "$DATA_ON_MDS" = 1 ]; }; }
 
 echo "This DESTROYS all data on the cluster volumes and rebuilds from scratch."
 read -r -p "Type YES to continue: " ans
@@ -74,9 +89,12 @@ sleep 1
 # and then poison step 3 with duplicate-connect failures, so this must be
 # LOUD, not best-effort.
 for attempt in 1 2 3; do
-  for h in "${HOSTS[@]}"; do
-    IFS=: read -r name _ _ _ <<<"$h"
-    "$SQZ" nvmeof disconnect --subnqn "$NQN_PREFIX:$name" 2>&1 | sed 's/^/    /' || true
+  # enumerate LIVE prefixed NQNs (robust across topology changes — old
+  # single-namespace layouts, wide layouts, drift) and disconnect each.
+  for f in /sys/class/nvme/nvme*/subsysnqn; do
+    [ -e "$f" ] || continue
+    nqn=$(cat "$f")
+    case "$nqn" in "$NQN_PREFIX"*) "$SQZ" nvmeof disconnect --subnqn "$nqn" 2>&1 | sed 's/^/    /' || true;; esac
   done
   gone=1
   for _ in $(seq 1 15); do
@@ -94,13 +112,22 @@ done
 # ---------- 2. Storage nodes: unshare, destroy, recreate, re-share ----------
 for h in "${HOSTS[@]}"; do
   IFS=: read -r name ip1 ip2 kind <<<"$h"
-  log "2/5 $name ($ip1): rebuild $kind backing + re-share"
+  log "2/5 $name ($ip1): rebuild backings + re-share"
+
+  # Stale-share sweep first: the legacy single-namespace NQN plus a generous
+  # -dN range, so topology changes (1-wide <-> N-wide, data-on-mds on/off)
+  # never leave orphan exports for the client to trip over.
+  "${SSH[@]}" "root@$ip1" REMOTE_SQZ="$REMOTE_SQZ" BASE="$NQN_PREFIX:$name" 'bash -s' <<'EOS'
+set -u
+"$REMOTE_SQZ" nvmeof unshare "$BASE" 2>/dev/null || true
+for i in $(seq 0 15); do "$REMOTE_SQZ" nvmeof unshare "$BASE-d$i" 2>/dev/null || true; done
+exit 0
+EOS
 
   if [ "$kind" = "mds" ]; then
     "${SSH[@]}" "root@$ip1" REMOTE_SQZ="$REMOTE_SQZ" NAME="$name" NQN="$NQN_PREFIX:$name" \
         IP1="$ip1" IP2="$ip2" SIZE_MB="$MDS_SIZE_MB" 'bash -s' <<'EOS'
 set -euo pipefail
-"$REMOTE_SQZ" nvmeof unshare "$NQN" 2>/dev/null || true
 modprobe null_blk nr_devices=0 2>/dev/null || true
 d="/sys/kernel/config/nullb/$NAME"
 if [ -d "$d" ]; then echo 0 > "$d/power" 2>/dev/null || true; rmdir "$d"; fi
@@ -113,32 +140,37 @@ idx=$(cat "$d/index"); dev="/dev/nullb$idx"
 [ -b "$dev" ] || { echo "null_blk device missing: $dev" >&2; exit 1; }
 "$REMOTE_SQZ" nvmeof share "$dev" --target-stack nvmet --ip "$IP1,$IP2" --subnqn "$NQN"
 EOS
-  elif [ "$OSS_BACKING" = "nullblk" ]; then
-    # Same recipe as the mds nodes: memory-backed null_blk, no compression.
-    "${SSH[@]}" "root@$ip1" REMOTE_SQZ="$REMOTE_SQZ" NAME="$name" NQN="$NQN_PREFIX:$name" \
-        IP1="$ip1" IP2="$ip2" SIZE_MB="$OSS_NULLB_MB" 'bash -s' <<'EOS'
+  fi
+
+  if serves_data "$kind"; then
+    if [ "$OSS_BACKING" = "nullblk" ]; then
+      # Memory-backed null_blk data namespaces, one subsystem each.
+      "${SSH[@]}" "root@$ip1" REMOTE_SQZ="$REMOTE_SQZ" NAME="$name" BASE="$NQN_PREFIX:$name" \
+          IP1="$ip1" IP2="$ip2" SIZE_MB="$OSS_NULLB_MB" COUNT="$OSS_NAMESPACES" 'bash -s' <<'EOS'
 set -euo pipefail
-"$REMOTE_SQZ" nvmeof unshare "$NQN" 2>/dev/null || true
 modprobe null_blk nr_devices=0 2>/dev/null || true
-d="/sys/kernel/config/nullb/$NAME"
-if [ -d "$d" ]; then echo 0 > "$d/power" 2>/dev/null || true; rmdir "$d"; fi
-mkdir "$d"
-echo "$SIZE_MB" > "$d/size"
-echo 4096       > "$d/blocksize"
-echo 1          > "$d/memory_backed"
-echo 1          > "$d/power"
-idx=$(cat "$d/index"); dev="/dev/nullb$idx"
-[ -b "$dev" ] || { echo "null_blk device missing: $dev" >&2; exit 1; }
 free_mb=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
-[ "$free_mb" -gt "$SIZE_MB" ] || \
-  echo "WARNING: nullblk size ${SIZE_MB} MiB exceeds MemAvailable ${free_mb} MiB — writes can OOM this node" >&2
-"$REMOTE_SQZ" nvmeof share "$dev" --target-stack nvmet --ip "$IP1,$IP2" --subnqn "$NQN"
+total_mb=$((SIZE_MB * COUNT))
+[ "$free_mb" -gt "$total_mb" ] || \
+  echo "WARNING: $COUNT x ${SIZE_MB} MiB nullblk = ${total_mb} MiB exceeds MemAvailable ${free_mb} MiB — writes can OOM this node" >&2
+for i in $(seq 0 $((COUNT - 1))); do
+  d="/sys/kernel/config/nullb/$NAME-d$i"
+  if [ -d "$d" ]; then echo 0 > "$d/power" 2>/dev/null || true; rmdir "$d"; fi
+  mkdir "$d"
+  echo "$SIZE_MB" > "$d/size"
+  echo 4096       > "$d/blocksize"
+  echo 1          > "$d/memory_backed"
+  echo 1          > "$d/power"
+  idx=$(cat "$d/index"); dev="/dev/nullb$idx"
+  [ -b "$dev" ] || { echo "null_blk device missing: $dev" >&2; exit 1; }
+  "$REMOTE_SQZ" nvmeof share "$dev" --target-stack nvmet --ip "$IP1,$IP2" --subnqn "$BASE-d$i"
+done
 EOS
-  else
-    "${SSH[@]}" "root@$ip1" REMOTE_SQZ="$REMOTE_SQZ" NQN="$NQN_PREFIX:$name" \
-        IP1="$ip1" IP2="$ip2" ZSIZE="$OSS_ZRAM_SIZE" ZALGO="$OSS_ZRAM_ALGO" 'bash -s' <<'EOS'
+    else
+      # zram data namespaces, one subsystem each.
+      "${SSH[@]}" "root@$ip1" REMOTE_SQZ="$REMOTE_SQZ" BASE="$NQN_PREFIX:$name" \
+          IP1="$ip1" IP2="$ip2" ZSIZE="$OSS_ZRAM_SIZE" ZALGO="$OSS_ZRAM_ALGO" COUNT="$OSS_NAMESPACES" 'bash -s' <<'EOS'
 set -euo pipefail
-"$REMOTE_SQZ" nvmeof unshare "$NQN" 2>/dev/null || true
 modprobe zram 2>/dev/null || true
 # Crypto modules are NOT auto-loaded on RHEL8-family kernels, so the
 # comp_algorithm listing hides algorithms the kernel actually ships (lz4,
@@ -146,35 +178,35 @@ modprobe zram 2>/dev/null || true
 # listing alone under-reports.
 modprobe lz4  2>/dev/null || true
 modprobe zstd 2>/dev/null || true
-if [ -b /dev/zram0 ]; then
-  echo 1 > /sys/block/zram0/reset            # full wipe — the fresh store
-else
-  cat /sys/class/zram-control/hot_add >/dev/null
-fi
-try_algo() {
-  echo "$1" > /sys/block/zram0/comp_algorithm 2>/dev/null \
-    && grep -q "\[$1\]" /sys/block/zram0/comp_algorithm
+try_algo() {  # try_algo <dev-index> <algo>
+  echo "$2" > "/sys/block/zram$1/comp_algorithm" 2>/dev/null \
+    && grep -q "\[$2\]" "/sys/block/zram$1/comp_algorithm"
 }
-pick=""
-if [ "$ZALGO" != "auto" ]; then
-  if try_algo "$ZALGO"; then
-    pick="$ZALGO"
-  else
-    echo "note: '$ZALGO' not usable on this kernel (offered: $(cat /sys/block/zram0/comp_algorithm)) — auto-selecting" >&2
+for i in $(seq 0 $((COUNT - 1))); do
+  while [ ! -b "/dev/zram$i" ]; do cat /sys/class/zram-control/hot_add >/dev/null; done
+  echo 1 > "/sys/block/zram$i/reset"           # full wipe — the fresh store
+  pick=""
+  if [ "$ZALGO" != "auto" ]; then
+    if try_algo "$i" "$ZALGO"; then
+      pick="$ZALGO"
+    else
+      echo "note: '$ZALGO' not usable on this kernel (offered: $(cat /sys/block/zram$i/comp_algorithm)) — auto-selecting" >&2
+    fi
   fi
-fi
-if [ -z "$pick" ]; then
-  for cand in zstd lz4 lzo-rle lzo; do
-    try_algo "$cand" && pick="$cand" && break
-  done
-fi
-[ -n "$pick" ] || { echo "no usable zram compression algorithm (offered: $(cat /sys/block/zram0/comp_algorithm))" >&2; exit 1; }
-echo "zram comp_algorithm: $pick"
-echo "$ZSIZE" > /sys/block/zram0/disksize
-sz=$(blockdev --getsize64 /dev/zram0)
-[ "$sz" -gt 0 ] || { echo "zram0 has zero size after setup" >&2; exit 1; }
-"$REMOTE_SQZ" nvmeof share /dev/zram0 --target-stack nvmet --ip "$IP1,$IP2" --subnqn "$NQN"
+  if [ -z "$pick" ]; then
+    for cand in zstd lz4 lzo-rle lzo; do
+      try_algo "$i" "$cand" && pick="$cand" && break
+    done
+  fi
+  [ -n "$pick" ] || { echo "no usable zram compression algorithm (offered: $(cat /sys/block/zram$i/comp_algorithm))" >&2; exit 1; }
+  echo "zram$i comp_algorithm: $pick"
+  echo "$ZSIZE" > "/sys/block/zram$i/disksize"
+  sz=$(blockdev --getsize64 "/dev/zram$i")
+  [ "$sz" -gt 0 ] || { echo "zram$i has zero size after setup" >&2; exit 1; }
+  "$REMOTE_SQZ" nvmeof share "/dev/zram$i" --target-stack nvmet --ip "$IP1,$IP2" --subnqn "$BASE-d$i"
+done
 EOS
+    fi
   fi
 done
 
@@ -189,22 +221,48 @@ path_live() {  # path_live <nqn> <traddr> — is this exact path already connect
   done
   return 1
 }
+# Build the full subsystem list: meta per mds node, data per data-serving node.
+# SUFFIXES orders meta first, then data in HOSTS order — the format URIs below
+# reproduce this order deterministically.
+META_SUFFIXES=(); DATA_SUFFIXES=()
 for h in "${HOSTS[@]}"; do
-  IFS=: read -r name ip1 ip2 _ <<<"$h"
+  IFS=: read -r name _ _ kind <<<"$h"
+  [ "$kind" = "mds" ] && META_SUFFIXES+=("$name")
+done
+for h in "${HOSTS[@]}"; do
+  IFS=: read -r name _ _ kind <<<"$h"
+  if serves_data "$kind"; then
+    for i in $(seq 0 $((OSS_NAMESPACES - 1))); do DATA_SUFFIXES+=("$name-d$i"); done
+  fi
+done
+[ "${#META_SUFFIXES[@]}" -ge 1 ] || die "no mds hosts configured"
+[ "${#DATA_SUFFIXES[@]}" -ge 1 ] || die "no data namespaces configured"
+
+# host_ips <suffix> -> "ip1 ip2" of the node that serves it
+host_ips() {
+  local h name ip1 ip2 _
+  for h in "${HOSTS[@]}"; do
+    IFS=: read -r name ip1 ip2 _ <<<"$h"
+    case "$1" in "$name"|"$name"-d*) echo "$ip1 $ip2"; return 0;; esac
+  done
+  return 1
+}
+
+for suffix in "${META_SUFFIXES[@]}" "${DATA_SUFFIXES[@]}"; do
+  read -r ip1 ip2 <<<"$(host_ips "$suffix")"
   for ip in "$ip1" "$ip2"; do
-    if path_live "$NQN_PREFIX:$name" "$ip"; then
-      echo "  $name via $ip: already connected — keeping"
+    if path_live "$NQN_PREFIX:$suffix" "$ip"; then
+      echo "  $suffix via $ip: already connected — keeping"
     else
-      "$SQZ" nvmeof connect --ip "$ip" --subnqn "$NQN_PREFIX:$name"
+      "$SQZ" nvmeof connect --ip "$ip" --subnqn "$NQN_PREFIX:$suffix"
     fi
   done
 done
 
 # wait for every namespace head to appear, then resolve NQN -> /dev node
 declare -A DEV
-for h in "${HOSTS[@]}"; do
-  IFS=: read -r name _ _ _ <<<"$h"
-  want="$NQN_PREFIX:$name"; found=""
+for suffix in "${META_SUFFIXES[@]}" "${DATA_SUFFIXES[@]}"; do
+  want="$NQN_PREFIX:$suffix"; found=""
   for _ in $(seq 1 30); do
     for s in /sys/class/nvme-subsystem/nvme-subsys*; do
       [ -e "$s/subsysnqn" ] || continue
@@ -220,7 +278,7 @@ for h in "${HOSTS[@]}"; do
     sleep 1
   done
   [ -n "$found" ] || die "namespace for $want never appeared"
-  DEV[$name]="$found"
+  DEV[$suffix]="$found"
   echo "  $want -> $found"
 done
 for s in /sys/class/nvme-subsystem/nvme-subsys*/iopolicy; do
@@ -228,11 +286,20 @@ for s in /sys/class/nvme-subsystem/nvme-subsys*/iopolicy; do
 done
 
 # ---------- 4. Format --------------------------------------------------------
-log "4/5 format (meta-slots=$META_SLOTS)"
-mkdir -p "$CACHE_DIR" "$MOUNTPOINT"
-META_URI="sqmeta://${DEV[mds0]},${DEV[mds1]}"
-DATA_URI="sqdata://${DEV[oss0]},${DEV[oss1]}"
-"$SQZ" format "$META_URI" "$DATA_URI" --meta-slots "$META_SLOTS" --disk-cache-paths "$CACHE_DIR"
+log "4/5 format (meta-slots=$META_SLOTS, data plane: ${#DATA_SUFFIXES[@]} namespaces)"
+mkdir -p "$MOUNTPOINT"
+meta_devs=""; for s in "${META_SUFFIXES[@]}"; do meta_devs+="${meta_devs:+,}${DEV[$s]}"; done
+data_devs=""; for s in "${DATA_SUFFIXES[@]}"; do data_devs+="${data_devs:+,}${DEV[$s]}"; done
+META_URI="sqmeta://$meta_devs"
+DATA_URI="sqdata://$data_devs"
+FORMAT_ARGS=("$META_URI" "$DATA_URI" --meta-slots "$META_SLOTS")
+if [ -n "$CACHE_DIR" ]; then
+  mkdir -p "$CACHE_DIR"
+  FORMAT_ARGS+=(--disk-cache-paths "$CACHE_DIR")
+else
+  echo "  cache-less format (CACHE_DIR empty)"
+fi
+"$SQZ" format "${FORMAT_ARGS[@]}"
 
 # ---------- 5. Mount + verify -------------------------------------------------
 log "5/5 mount + verify"

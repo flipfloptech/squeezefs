@@ -36,7 +36,7 @@ SECS="${PUG_FUNNEL_SECS:-60}"
 [ "$(id -u)" -eq 0 ] || { echo "run as root"; exit 1; }
 [ -x "$BIN_A" ] && [ -x "$BIN_B" ] || { echo "missing binaries"; exit 1; }
 mkdir -p "$RESULTS" "$MNT"
-echo "cell,binary,rep,mibs,third1,third2,third3,aqu,sync_drains,adm_waits,probe_ups,probe_backoffs,fence_drops,inflight_mid" >"$CSV"
+echo "cell,binary,rep,mibs,third1,third2,third3,aqu,sync_drains,adm_waits,probe_ups,probe_backoffs,fence_drops,inflight_mid,ipc_w,engage" >"$CSV"
 
 wsec() { awk '$3 ~ /nvme2[5-8]n1/ {s+=$10} END {print s}' /proc/diskstats; }
 wq() { awk '$3 ~ /nvme2[5-8]n1/ {q+=$14} END {print q}' /proc/diskstats; }
@@ -56,7 +56,8 @@ run_one() { # cell blabel bin so rep depth
     env LD_PRELOAD="$so" elbencho --write --direct -t 32 -b 4M -s 512m --nolive \
         "$MNT"/bench/f{1..32} >"$RESULTS/$tag.pre.txt" 2>&1
 
-    local sd0 aw0 pu0 pb0 fd0
+    local sd0 aw0 pu0 pb0 fd0 iw0
+    iw0=$(stat_get ipc_ops_write)
     sd0=$(stat_get block_free_reclaim_sync_drains)
     aw0=$(stat_get write_pipeline_admission_waits)
     pu0=$(stat_get write_pipeline_depth_probe_ups)
@@ -81,6 +82,11 @@ run_one() { # cell blabel bin so rep depth
     pu=$(( $(stat_get write_pipeline_depth_probe_ups) - pu0 ))
     pb=$(( $(stat_get write_pipeline_depth_probe_backoffs) - pb0 ))
     fd=$(( $(stat_get write_pipeline_fence_drops) - fd0 ))
+    local iw engage=ok
+    iw=$(( $(stat_get ipc_ops_write) - iw0 ))
+    # Charter rule 4 (KD-7 tripwire): a mismatched daemon/shim pair
+    # HELLO-refuses into silent passthrough and the il row is INVALID.
+    [ "$iw" -gt 0 ] || { engage=INVALID-passthrough; ENGAGE_FAIL=1; }
     local row
     row=$(python3 -c "
 el=$t1-$t0
@@ -89,7 +95,7 @@ t2=($s2-$s1)*512/1048576.0/$third
 t3=($s3-$s2)*512/1048576.0/(el-2*$third)
 aqu=($q1-$q0)/1000.0/el
 print(f'{t1:.0f},{t2:.0f},{t3:.0f},{aqu:.1f}')")
-    echo "$cell,$blabel,$rep,${mibs:-0},$row,$sd,$aw,$pu,$pb,$fd,$im" >>"$CSV"
+    echo "$cell,$blabel,$rep,${mibs:-0},$row,$sd,$aw,$pu,$pb,$fd,$im,$iw,$engage" >>"$CSV"
     tail -1 "$CSV"
     "$bin" umount "$MNT" >>"$RESULTS/$tag.log" 2>&1 || umount "$MNT" || true
     for _ in $(seq 1 120); do
@@ -110,7 +116,9 @@ bracket() { # cell depth
     run_one "$cell" A "$BIN_A" "$SO_A" 3 "$depth"
 }
 
+ENGAGE_FAIL=0
 bracket storm_f128 128
 bracket storm_default ""
 
 echo "DONE -> $CSV"
+[ "$ENGAGE_FAIL" = 0 ] || { echo "ENGAGEMENT INVALID rows present (KD-7 pair mismatch?)"; exit 1; }

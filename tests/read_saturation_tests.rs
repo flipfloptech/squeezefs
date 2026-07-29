@@ -681,6 +681,70 @@ async fn sequential_ring_stream_engages_the_prefetch_pipeline() {
 //    handler's observation destroys its own classification).
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 4. Warm-path economy: fully-resident ring traffic must not pay the
+//    lane-claim machinery. A warm serve can CONTINUE a lane a miss
+//    started (the granted-escalation regime classifies through warm
+//    ops 3-4), but it must never CLAIM one: a fully-warm stream has
+//    nothing to prefetch, and on the 1M-IOPS warm rows the per-op
+//    foreign-scan/claim path measured -6..-16 % vs the
+//    SQUEEZEFS_READ_PREFETCH_WINDOW=0 kill switch (rsat rig,
+//    interleaved same-binary A/B).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fully_warm_sequential_ring_rereads_stay_laneless() {
+    let fx = Fixture::new("warm-laneless").await;
+    fx.salt_inos(27).await;
+    let ino = fx.create_striped("warmlane.bin", &[0, 1]).await;
+    purge_tiers(&fx, ino);
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("repo-dir tempdir");
+    let fd = odirect_standin(&fx, &dir, "warmlane.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    // Make block 0 resident WITHOUT classifying: two spaced (non-
+    // contiguous) handler reads — the second is the ghost second touch
+    // that escalates the whole-block admission.
+    let _ = fx
+        .fs
+        .read(req(), ino, 0, 64 * 4096, 4096, libc::O_DIRECT as u32)
+        .await
+        .expect("warm-up read 1");
+    let _ = fx
+        .fs
+        .read(req(), ino, 0, 128 * 4096, 4096, libc::O_DIRECT as u32)
+        .await
+        .expect("warm-up read 2");
+
+    // Sequential 4k ring re-reads over the resident block: every op is
+    // a sync fast-path serve; NONE of them may claim a lane or
+    // classify (nothing to prefetch on a fully-warm stream — and the
+    // claim/foreign scan is the measured warm-row tax).
+    let before = snap();
+    let pattern = deterministic_bytes(BS as usize, 100);
+    for op in 0..256u64 {
+        let off = op * 4096;
+        let got = session.ring_pread(binding, off, 4096, 0, "warm laneless stream");
+        assert_eq!(
+            got,
+            &pattern[(off as usize)..(off as usize + 4096)],
+            "byte parity at warm op {op}"
+        );
+    }
+    let d = delta(&before);
+    assert_eq!(
+        d.fast_path, 256,
+        "engagement: every op must be a warm fast-path serve"
+    );
+    assert_eq!(
+        d.classified, 0,
+        "fully-warm ring re-reads must never classify (a warm serve may \
+         CONTINUE a miss-claimed lane, never CLAIM one)"
+    );
+    assert_eq!(d.get_obj, 0, "no device traffic on a fully-warm stream");
+    fx.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn buffered_ring_stream_classifies_exactly_once() {
     let fx = Fixture::new("seq-buffered").await;

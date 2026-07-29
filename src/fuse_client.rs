@@ -4691,6 +4691,12 @@ impl SqueezefsFilesystem {
                 "write_pipeline_inflight_blocks": self.write_pipeline.inflight_blocks(),
                 "write_pipeline_inflight_bytes": self.write_pipeline.inflight_bytes(),
                 "write_pipeline_depth_target": self.write_pipeline.depth_target_bytes(self.router.block_size.load(Ordering::Relaxed)),
+                // Probe-up governor (2026-07-29): base = the un-probed BDP
+                // target (current-vs-base is the live probe contribution);
+                // ups/backoffs = probe engagement vs dead-gain retreats.
+                "write_pipeline_depth_target_base": self.write_pipeline.depth_target_base_bytes(self.router.block_size.load(Ordering::Relaxed)),
+                "write_pipeline_depth_probe_ups": self.write_pipeline.depth_probe_ups(),
+                "write_pipeline_depth_probe_backoffs": self.write_pipeline.depth_probe_backoffs(),
                 "write_pipeline_admission_waits": self.write_pipeline.admission_waits(),
                 "write_pipeline_fence_drops": METRICS.write_pipeline_fence_drops.load(Ordering::Relaxed),
                 // Terminal-free reclaim economy (shim-write-amplification

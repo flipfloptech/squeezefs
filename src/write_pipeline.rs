@@ -53,6 +53,30 @@
 //! plateaus (bw_peak stops growing) — "depth grows while the device
 //! drains faster than arrival", bounded as above.
 //!
+//! ## The probe-up governor (2026-07-29 campaign)
+//!
+//! The pure-BDP target is a **self-fulfilling equilibrium**: it targets
+//! measured bandwidth × measured service time, which SUSTAINS the current
+//! operating point instead of discovering headroom (field conviction,
+//! 4-node 2×200GbE cluster: default 11.6 GB/s at aqu-sz ≈ its own BDP;
+//! forced depth 64 = 13.7 GB/s, +18 %, against a 16.6 GB/s raw ceiling
+//! with client CPU at ~28 % — `.benchmarks/2026-07-29-probe-up-governor
+//! .md`). A BBR-flavored probe layer ([`ProbeCore`], loom-included core)
+//! multiplies the governed sum: on **saturated** epochs (admission parked
+//! or the pipe at target) with **headroom** (below the R5 cap, not Red)
+//! it raises the target by ¼ and measures the delivery-rate response —
+//! responsive ⇒ ADOPT and compound; dead gain ⇒ RETREAT to the pre-probe
+//! multiplier and cool down (the dead-gain latency tax is duty-cycle
+//! bounded); adopted depth that stops delivering steps back down; and
+//! **unsaturated epochs bleed the multiplier back to 1.0** — the latency
+//! guard: low-offered-load workloads never inherit streaming queue depth
+//! (qd1 RTT stays flat). Still no constants anywhere: the multiplier is
+//! dimensionless, the multiplicand is the measured BDP, and the R5
+//! budget cap + Red clamp stay senior to every probe. Gauges:
+//! `write_pipeline_depth_probe_{ups,backoffs}` (engagement/retreat) and
+//! `write_pipeline_depth_target_base` (the un-probed BDP target —
+//! current-vs-base shows the probe's contribution live).
+//!
 //! ## A/B lever (measurement only — never an operational escape)
 //!
 //! `SQUEEZEFS_WRITE_PIPELINE_DEPTH_BLOCKS`: unset = the adaptive governor
@@ -65,6 +89,10 @@
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+pub use crate::write_pipeline_core::{
+    ProbeCore, PROBE_COOLDOWN_EPOCHS, PROBE_EPOCH_MS, PROBE_MUL_MAX, PROBE_MUL_ONE,
+};
 
 /// Cold-start / Red-clamp floor: blocks per known backend lane (and the
 /// aggregate floor while no lane has reported). Small on purpose — the
@@ -253,6 +281,12 @@ pub struct WritePipeline {
     core: crate::write_pipeline_core::AdmissionCore,
     admission_waits: AtomicU64,
     lanes: scc::HashMap<String, Arc<Lane>>,
+    /// Probe-up layer over the BDP target (2026-07-29 campaign — see
+    /// module docs §"The probe-up governor").
+    probe: ProbeCore,
+    /// `admission_waits` snapshot at the last probe-epoch roll: waits
+    /// growth within an epoch is the saturation signal.
+    probe_waits_snap: AtomicU64,
     completions: tokio::sync::Notify,
     /// `None` = live `MEM_BUDGET ÷ BUDGET_CAP_DIVISOR`; `Some` = explicit
     /// (tests).
@@ -280,6 +314,8 @@ impl WritePipeline {
             core: crate::write_pipeline_core::AdmissionCore::new(),
             admission_waits: AtomicU64::new(0),
             lanes: scc::HashMap::new(),
+            probe: ProbeCore::new(),
+            probe_waits_snap: AtomicU64::new(0),
             completions: tokio::sync::Notify::new(),
             budget_cap_bytes,
             red,
@@ -310,6 +346,27 @@ impl WritePipeline {
             }
         };
         l.record(bytes, dur_ns, now_ms);
+
+        // Probe-up layer (dormant under a pinned A/B override — the
+        // lever stays verbatim): count delivery, and roll the probe epoch
+        // with this epoch's saturation + headroom observations.
+        if depth_override().is_none() {
+            self.probe.on_bytes(bytes);
+            let waits = self.admission_waits.load(Ordering::Relaxed);
+            let bs = bytes.max(1);
+            let target = self.depth_target_bytes(bs);
+            // Saturated = writers parked this epoch (waits grew), or the
+            // pipe sits at/above target right now. No saturation ⇒ extra
+            // depth serves nothing — the latency guard's input.
+            let saturated = waits > self.probe_waits_snap.load(Ordering::Relaxed)
+                || self.core.inflight_bytes() >= target;
+            // Headroom = below the R5 cap and not Red: probing where the
+            // budget cannot follow is pure latency tax.
+            let headroom = !(self.red)() && target < self.cap_bytes(bs);
+            if self.probe.roll(now_ms, saturated, headroom) {
+                self.probe_waits_snap.store(waits, Ordering::Relaxed);
+            }
+        }
     }
 
     /// The aggregate depth target in bytes (see module docs): pinned
@@ -324,23 +381,51 @@ impl WritePipeline {
         let raw = match depth_override() {
             Some(n) if n > 0 => n.saturating_mul(bs),
             _ => {
-                let mut sum = 0u64;
-                self.lanes.iter_sync(|_, l| {
-                    sum = sum.saturating_add(lane_target_bytes(
-                        l.bw_peak_bps.load(Ordering::Relaxed),
-                        l.lat_floor_ns.load(Ordering::Relaxed),
-                        bs,
-                    ));
-                    true
-                });
-                sum.max(floor)
+                // The probe multiplier scales the whole governed sum
+                // (BDP-learned lanes AND cold-lane floors — cold streams
+                // discover headroom the same way; u128: 32× of an
+                // 800GbE-class sum must not wrap).
+                let sum = self.governed_sum_bytes(bs);
+                let scaled = ((sum as u128 * self.probe.mul_q6() as u128) / PROBE_MUL_ONE as u128)
+                    .min(u64::MAX as u128) as u64;
+                scaled.max(floor)
             }
         };
         let raw = if (self.red)() { raw.min(floor) } else { raw };
-        let cap = self
-            .budget_cap_bytes
-            .unwrap_or_else(|| crate::mem_budget::MEM_BUDGET.budget_bytes() / BUDGET_CAP_DIVISOR);
-        raw.min(cap.max(bs))
+        raw.min(self.cap_bytes(bs))
+    }
+
+    /// The pure-BDP governed target (probe multiplier at 1.0) — the
+    /// `write_pipeline_depth_target_base` gauge: current-vs-base is the
+    /// probe-engagement instrument.
+    pub fn depth_target_base_bytes(&self, block_size: u64) -> u64 {
+        let bs = block_size.max(1);
+        let floor = FLOOR_BLOCKS_PER_LANE.saturating_mul(bs);
+        self.governed_sum_bytes(bs)
+            .max(floor)
+            .min(self.cap_bytes(bs))
+    }
+
+    /// Σ per-lane BDP targets (each floored) — the probe multiplicand.
+    fn governed_sum_bytes(&self, bs: u64) -> u64 {
+        let mut sum = 0u64;
+        self.lanes.iter_sync(|_, l| {
+            sum = sum.saturating_add(lane_target_bytes(
+                l.bw_peak_bps.load(Ordering::Relaxed),
+                l.lat_floor_ns.load(Ordering::Relaxed),
+                bs,
+            ));
+            true
+        });
+        sum
+    }
+
+    /// The R5 hard bound (never below one block: admission must always be
+    /// able to make progress).
+    fn cap_bytes(&self, bs: u64) -> u64 {
+        self.budget_cap_bytes
+            .unwrap_or_else(|| crate::mem_budget::MEM_BUDGET.budget_bytes() / BUDGET_CAP_DIVISOR)
+            .max(bs)
     }
 
     /// Admit `block_bytes` of upload custody into the pipeline — **the
@@ -412,6 +497,18 @@ impl WritePipeline {
     /// — the writer-backpressure gauge).
     pub fn admission_waits(&self) -> u64 {
         self.admission_waits.load(Ordering::Relaxed)
+    }
+
+    /// Probes launched (`write_pipeline_depth_probe_ups` — the probe
+    /// engagement gauge; 0 on latency-sensitive/low-offered-load mounts).
+    pub fn depth_probe_ups(&self) -> u64 {
+        self.probe.probe_ups()
+    }
+
+    /// Probe retreats + hold step-downs
+    /// (`write_pipeline_depth_probe_backoffs` — dead marginal gain).
+    pub fn depth_probe_backoffs(&self) -> u64 {
+        self.probe.probe_backoffs()
     }
 }
 

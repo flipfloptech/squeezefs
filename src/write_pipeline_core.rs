@@ -112,3 +112,203 @@ impl AdmissionCore {
         self.inflight_blocks.load(Ordering::Acquire)
     }
 }
+
+// =========================================================================
+// Probe-up governor core (2026-07-29 campaign)
+// =========================================================================
+
+/// Probe epoch length (ms) — two governor bandwidth windows: long enough
+/// that a windowed delivery rate is meaningful, short enough that a full
+/// headroom ramp (floor → 32× at +1/4 per adopted epoch, ~15 epochs)
+/// completes in seconds on a saturated stream.
+pub const PROBE_EPOCH_MS: u64 = 500;
+
+/// Fixed-point unit of the probe multiplier (Q6: 64 = ×1.0).
+pub const PROBE_MUL_ONE: u64 = 64;
+
+/// Probe multiplier bound: ×32 over the BDP-governed target. Purely a
+/// runaway guard — the R5 budget cap is the operative absolute bound
+/// (never a depth constant: the multiplicand is the measured BDP).
+pub const PROBE_MUL_MAX: u64 = PROBE_MUL_ONE * 32;
+
+/// Saturated epochs to hold after a DEAD-GAIN retreat before probing
+/// again: bounds the dead-gain latency tax to ~1/(N+1) of epochs (the
+/// BBR probe duty-cycle shape).
+pub const PROBE_COOLDOWN_EPOCHS: u64 = 8;
+
+/// Probe state: multiplier held (probe may launch).
+const PROBE_STATE_HOLD: u64 = 0;
+/// Probe state: a raised multiplier is being measured against baseline.
+const PROBE_STATE_PROBING: u64 = 1;
+
+/// The BBR-flavored probe-up layer over the pure-BDP depth target
+/// (2026-07-29 campaign; field conviction: a target of measured
+/// bandwidth × measured service time converges to sustaining the CURRENT
+/// operating point — a self-fulfilling equilibrium that left 18 % on a
+/// 4-node 2×200GbE cluster).
+///
+/// Cycle, per [`PROBE_EPOCH_MS`] epoch (rolled by whichever completion
+/// thread wins the epoch CAS — the `Lane` window shape):
+///
+/// * **HOLD, unsaturated** — decay the multiplier by 1/8 toward 1.0 (the
+///   latency guard: low offered load never inherits streaming depth).
+/// * **HOLD, saturated, elevated, delivery collapsed** (< 7/8 of the
+///   adopted rate) — step back one gain (×0.8): adopted depth keeps
+///   paying rent. Senior to launching — a collapsed baseline must never
+///   seed a fresh probe.
+/// * **HOLD, saturated, headroom, cooled** — LAUNCH: baseline = this
+///   epoch's delivery rate, multiplier += 1/4.
+/// * **PROBING → delivery ≥ baseline + 1/16** — ADOPT (keep the raised
+///   multiplier, re-arm immediately: discovery compounds).
+/// * **PROBING → otherwise** — RETREAT to the pre-probe multiplier;
+///   dead gain also COOLS DOWN ([`PROBE_COOLDOWN_EPOCHS`]).
+///
+/// All fields are approximate latch-free gauges (the `Lane` posture): a
+/// torn roll self-heals within one epoch. Only the epoch CAS is
+/// serialization-bearing — and only its ATOMICITY (single roller), not
+/// its ordering; the loom model verifies the single-roll and bound
+/// invariants and was weakening-verified against a non-CAS roll.
+#[derive(Default)]
+pub struct ProbeCore {
+    mul_q6: AtomicU64,
+    prev_mul_q6: AtomicU64,
+    state: AtomicU64,
+    /// Delivery rate (B/s) of the epoch that launched the running probe.
+    baseline_bps: AtomicU64,
+    /// Delivery rate (B/s) that justified the current adopted multiplier.
+    adopted_bps: AtomicU64,
+    cooldown: AtomicU64,
+    epoch_start_ms: AtomicU64,
+    epoch_bytes: AtomicU64,
+    ups: AtomicU64,
+    backoffs: AtomicU64,
+}
+
+impl ProbeCore {
+    pub fn new() -> Self {
+        Self {
+            mul_q6: AtomicU64::new(PROBE_MUL_ONE),
+            prev_mul_q6: AtomicU64::new(PROBE_MUL_ONE),
+            state: AtomicU64::new(PROBE_STATE_HOLD),
+            baseline_bps: AtomicU64::new(0),
+            adopted_bps: AtomicU64::new(0),
+            cooldown: AtomicU64::new(0),
+            epoch_start_ms: AtomicU64::new(0),
+            epoch_bytes: AtomicU64::new(0),
+            ups: AtomicU64::new(0),
+            backoffs: AtomicU64::new(0),
+        }
+    }
+
+    /// Count `bytes` of completed upload delivery into the running epoch.
+    pub fn on_bytes(&self, bytes: u64) {
+        self.epoch_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Roll the probe epoch if due. `saturated` = offered load filled the
+    /// current target this epoch (admission parked, or the pipe sat at
+    /// target); `headroom` = the effective target is below the R5 cap and
+    /// the budget is not Red. Returns `true` iff THIS call rolled (the
+    /// caller then refreshes its saturation snapshot).
+    pub fn roll(&self, now_ms: u64, saturated: bool, headroom: bool) -> bool {
+        let ws = self.epoch_start_ms.load(Ordering::Relaxed);
+        if ws == 0 {
+            let _ = self.epoch_start_ms.compare_exchange(
+                0,
+                now_ms.max(1),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            return false;
+        }
+        let elapsed = now_ms.saturating_sub(ws);
+        if elapsed < PROBE_EPOCH_MS
+            || self
+                .epoch_start_ms
+                .compare_exchange(ws, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+        {
+            return false;
+        }
+        // This thread rolls the epoch.
+        let bps = self
+            .epoch_bytes
+            .swap(0, Ordering::Relaxed)
+            .saturating_mul(1000)
+            / elapsed.max(1);
+        let mul = self.mul_q6.load(Ordering::Relaxed);
+        match self.state.load(Ordering::Relaxed) {
+            PROBE_STATE_PROBING => {
+                let baseline = self.baseline_bps.load(Ordering::Relaxed);
+                if saturated && bps >= baseline.saturating_add((baseline / 16).max(1)) {
+                    // ADOPT: delivery responded to the raised depth. Keep
+                    // the multiplier and re-arm immediately (discovery
+                    // compounds while the backend keeps responding).
+                    self.adopted_bps.store(bps, Ordering::Relaxed);
+                    self.state.store(PROBE_STATE_HOLD, Ordering::Relaxed);
+                } else {
+                    // RETREAT to the pre-probe multiplier (the BDP
+                    // posture). Dead gain under saturation also cools
+                    // down; an unsaturated probe epoch is merely
+                    // inconclusive (no cool-down — load may return).
+                    self.mul_q6
+                        .store(self.prev_mul_q6.load(Ordering::Relaxed), Ordering::Relaxed);
+                    self.state.store(PROBE_STATE_HOLD, Ordering::Relaxed);
+                    if saturated {
+                        self.cooldown
+                            .store(PROBE_COOLDOWN_EPOCHS, Ordering::Relaxed);
+                    }
+                    self.backoffs.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            _ => {
+                let adopted = self.adopted_bps.load(Ordering::Relaxed);
+                let collapsed =
+                    mul > PROBE_MUL_ONE && adopted > 0 && bps < adopted.saturating_sub(adopted / 8);
+                if !saturated {
+                    // The latency guard: bleed the multiplier toward 1.0
+                    // while offered load does not fill the pipe.
+                    let decayed = (mul - mul / 8).max(PROBE_MUL_ONE);
+                    self.mul_q6.store(decayed, Ordering::Relaxed);
+                } else if collapsed {
+                    // HOLD re-validation (senior to launching — a
+                    // collapsed baseline must never seed a fresh probe):
+                    // adopted depth must keep paying rent, so a collapsed
+                    // delivery rate steps back one probe gain (×0.8)
+                    // toward the BDP.
+                    self.mul_q6
+                        .store((mul - mul / 5).max(PROBE_MUL_ONE), Ordering::Relaxed);
+                    self.adopted_bps.store(bps, Ordering::Relaxed);
+                    self.backoffs.fetch_add(1, Ordering::Relaxed);
+                } else if self.cooldown.load(Ordering::Relaxed) > 0 {
+                    self.cooldown.fetch_sub(1, Ordering::Relaxed);
+                } else if headroom && mul < PROBE_MUL_MAX && bps > 0 {
+                    // LAUNCH: baseline this epoch's delivery, raise the
+                    // target by the probe gain (+1/4).
+                    self.prev_mul_q6.store(mul, Ordering::Relaxed);
+                    self.baseline_bps.store(bps, Ordering::Relaxed);
+                    self.mul_q6
+                        .store((mul + mul / 4).min(PROBE_MUL_MAX), Ordering::Relaxed);
+                    self.state.store(PROBE_STATE_PROBING, Ordering::Relaxed);
+                    self.ups.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        true
+    }
+
+    /// Current probe multiplier (Q6 fixed point; [`PROBE_MUL_ONE`] = ×1.0).
+    pub fn mul_q6(&self) -> u64 {
+        self.mul_q6.load(Ordering::Relaxed)
+    }
+
+    /// Probes launched (`write_pipeline_depth_probe_ups`).
+    pub fn probe_ups(&self) -> u64 {
+        self.ups.load(Ordering::Relaxed)
+    }
+
+    /// Retreats/step-downs (`write_pipeline_depth_probe_backoffs`).
+    pub fn probe_backoffs(&self) -> u64 {
+        self.backoffs.load(Ordering::Relaxed)
+    }
+}

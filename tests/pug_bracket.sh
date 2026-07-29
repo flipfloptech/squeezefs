@@ -39,6 +39,7 @@ BIN_A="${PUG_BIN_A:-/tmp/sqz-pug-target/release/squeezefs}"
 BIN_B="${PUG_BIN_B:-/tmp/sqz-dev-tip/target/release/squeezefs}"
 META="${PUG_META:-sqmeta:///dev/nvme17n1,/dev/nvme18n1,/dev/nvme19n1,/dev/nvme20n1}"
 DIAL_DATA="${PUG_DIAL_DATA:-sqdata:///dev/nvme25n1}"
+DIAL_DEV="${PUG_DIAL_DEV:-$(basename "${DIAL_DATA#sqdata://}")}"
 ZRAM_DATA="${PUG_ZRAM_DATA:-sqdata:///dev/nvme21n1,/dev/nvme22n1,/dev/nvme23n1,/dev/nvme24n1}"
 MNT=/mnt/sqz_pug
 CSV="$RESULTS/bracket.csv"
@@ -118,12 +119,12 @@ run_dial() { # cell blabel bin rep depth_env
     echo "=== $tag"
     mount_fs "$bin" "$DIAL_DATA" "$depth" "$tag"
     local s0 s1 t0 t1 out
-    s0=$(ds_snap nvme25n1)
+    s0=$(ds_snap "$DIAL_DEV")
     t0=$(date +%s.%N)
     out=$(elbencho --write --direct -t 4 -b 4M -s 4g --nolive \
         "$MNT/bench/f1" "$MNT/bench/f2" "$MNT/bench/f3" "$MNT/bench/f4" 2>&1)
     t1=$(date +%s.%N)
-    s1=$(ds_snap nvme25n1)
+    s1=$(ds_snap "$DIAL_DEV")
     echo "$out" >"$RESULTS/$tag.elbencho.txt"
     local mibs
     mibs=$(echo "$out" | awk '/Throughput MiB\/s/ { print $NF }' | tail -1)

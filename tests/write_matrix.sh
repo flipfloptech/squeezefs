@@ -96,9 +96,15 @@ EOF
 }
 
 kill_daemon() {
+    # Scope strictly to THIS rig's mount: multi-daemon boxes are the norm
+    # (a bare `killall squeezefs` here once aimed at a live release-gate
+    # daemon belonging to another tree — never kill by bare comm name).
     umount "$MOUNT_DIR" 2>/dev/null || umount -l "$MOUNT_DIR" 2>/dev/null || true
-    for _ in $(seq 30); do pidof squeezefs >/dev/null || break; sleep 0.5; done
-    killall -9 squeezefs 2>/dev/null || true
+    for _ in $(seq 30); do
+        pgrep -f "squeezefs mount .* $MOUNT_DIR" >/dev/null || break
+        sleep 0.5
+    done
+    pkill -9 -f "squeezefs mount .* $MOUNT_DIR" 2>/dev/null || true
     sleep 1
 }
 trap kill_daemon EXIT

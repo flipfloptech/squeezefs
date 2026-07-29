@@ -42,8 +42,9 @@ use squeezefs::meta_backend::RoutedMetaBackend;
 use squeezefs::routing::DataRouter;
 use squeezefs::write_pipeline::{
     depth_override, lane_target_bytes, pipeline_disposition, rolled_bw_peak, rolled_lat_floor,
-    set_depth_override, sync_inline, PipelineDisposition, WritePipeline, BUDGET_CAP_DIVISOR,
-    FLOOR_BLOCKS_PER_LANE, HEADROOM,
+    set_depth_override, sync_inline, PipelineDisposition, ProbeCore, WritePipeline,
+    BUDGET_CAP_DIVISOR, FLOOR_BLOCKS_PER_LANE, HEADROOM, PROBE_COOLDOWN_EPOCHS, PROBE_EPOCH_MS,
+    PROBE_MUL_MAX, PROBE_MUL_ONE,
 };
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -251,6 +252,357 @@ async fn red_clamps_target_to_floor_and_pinned_override_wins_verbatim() {
         5 * BS,
         "the pinned A/B override wins verbatim over the governor"
     );
+}
+
+// =========================================================================
+// 2b. Probe-up governor — the 2026-07-29 campaign (field finding: the
+//     pure-BDP target converges to sustaining the CURRENT operating point;
+//     forced depth 64 bought +18 % on the 4-node cluster. BBR-flavored
+//     law: probe up when throughput responds, retreat when marginal gain
+//     dies, never inflate on low offered load).
+// =========================================================================
+
+/// Probe launch + adoption: a saturated epoch with headroom launches a
+/// probe (+1/4 target); a probe epoch whose delivery responds ADOPTS the
+/// raised multiplier and may probe again — exponential headroom discovery,
+/// never a constant.
+#[test]
+fn probe_core_probes_up_on_responsive_saturated_epochs() {
+    let p = ProbeCore::new();
+    assert_eq!(p.mul_q6(), PROBE_MUL_ONE, "cold probe multiplier is 1.0");
+    // First call only opens the epoch window.
+    p.on_bytes(1_000_000);
+    assert!(!p.roll(10, true, true), "first roll call opens the epoch");
+    // Epoch 1 closes saturated with headroom: the probe LAUNCHES.
+    p.on_bytes(100_000_000);
+    assert!(p.roll(10 + PROBE_EPOCH_MS + 10, true, true));
+    assert_eq!(p.probe_ups(), 1, "saturated + headroom must launch a probe");
+    assert_eq!(
+        p.mul_q6(),
+        PROBE_MUL_ONE + PROBE_MUL_ONE / 4,
+        "a probe raises the target by 1/4 (the probe gain)"
+    );
+    // The probe epoch delivers +25 %: ADOPT (multiplier kept)…
+    p.on_bytes(125_000_000);
+    assert!(p.roll(10 + 2 * (PROBE_EPOCH_MS + 10), true, true));
+    assert_eq!(
+        p.mul_q6(),
+        PROBE_MUL_ONE + PROBE_MUL_ONE / 4,
+        "responsive delivery must ADOPT the probed multiplier"
+    );
+    assert_eq!(p.probe_backoffs(), 0);
+    // …and the next saturated epoch probes AGAIN from the adopted level.
+    p.on_bytes(160_000_000);
+    assert!(p.roll(10 + 3 * (PROBE_EPOCH_MS + 10), true, true));
+    assert_eq!(p.probe_ups(), 2, "adoption re-arms the probe immediately");
+    assert!(
+        p.mul_q6() > PROBE_MUL_ONE + PROBE_MUL_ONE / 4,
+        "discovery compounds while the backend keeps responding"
+    );
+}
+
+/// Backoff + cool-down: a probe whose delivery does NOT respond retreats
+/// to the pre-probe multiplier (the BDP posture) and cools down — the
+/// dead-gain latency tax is bounded to ~1/(cooldown+1) of epochs.
+#[test]
+fn probe_core_backs_off_when_gain_dies_and_cools_down() {
+    let p = ProbeCore::new();
+    let step = PROBE_EPOCH_MS + 10;
+    p.roll(10, true, true); // open
+    p.on_bytes(100_000_000);
+    assert!(p.roll(10 + step, true, true));
+    assert_eq!(p.probe_ups(), 1);
+    // Probe epoch: +1 % only — below the adoption threshold.
+    p.on_bytes(101_000_000);
+    assert!(p.roll(10 + 2 * step, true, true));
+    assert_eq!(
+        p.mul_q6(),
+        PROBE_MUL_ONE,
+        "a dead-gain probe must RETREAT to the pre-probe multiplier"
+    );
+    assert_eq!(p.probe_backoffs(), 1, "the retreat must count");
+    // Cool-down: the next PROBE_COOLDOWN_EPOCHS saturated epochs hold.
+    for i in 0..PROBE_COOLDOWN_EPOCHS {
+        p.on_bytes(100_000_000);
+        assert!(p.roll(10 + (3 + i) * step, true, true));
+        assert_eq!(p.probe_ups(), 1, "cool-down must hold at epoch {i}");
+    }
+    // After the cool-down the governor may probe again.
+    p.on_bytes(100_000_000);
+    assert!(p.roll(10 + (3 + PROBE_COOLDOWN_EPOCHS) * step, true, true));
+    assert_eq!(p.probe_ups(), 2, "cool-down expiry re-arms the probe");
+}
+
+/// The latency guard: unsaturated epochs never launch probes, and an
+/// elevated multiplier DECAYS back to 1.0 once offered load stops filling
+/// the pipe — low-offered-load / latency-sensitive workloads must never
+/// inherit streaming-era queue depth.
+#[test]
+fn probe_core_latency_guard_never_inflates_without_saturation_and_decays() {
+    let p = ProbeCore::new();
+    let step = PROBE_EPOCH_MS + 10;
+    p.roll(10, false, true); // open
+    for i in 1..=20u64 {
+        p.on_bytes(10_000_000);
+        p.roll(10 + i * step, false, true);
+    }
+    assert_eq!(p.probe_ups(), 0, "no saturation ⇒ no probe, ever");
+    assert_eq!(p.mul_q6(), PROBE_MUL_ONE);
+
+    // Elevate: launch + adopt twice (saturated, responsive).
+    p.on_bytes(100_000_000);
+    p.roll(10 + 21 * step, true, true); // launch 1
+    p.on_bytes(130_000_000);
+    p.roll(10 + 22 * step, true, true); // adopt 1
+    p.on_bytes(130_000_000);
+    p.roll(10 + 23 * step, true, true); // launch 2
+    p.on_bytes(170_000_000);
+    p.roll(10 + 24 * step, true, true); // adopt 2
+    let elevated = p.mul_q6();
+    assert!(elevated > PROBE_MUL_ONE, "fixture: multiplier elevated");
+
+    // Starve: unsaturated epochs bleed the multiplier back to 1.0.
+    for i in 25..80u64 {
+        p.on_bytes(1_000);
+        p.roll(10 + i * step, false, true);
+    }
+    assert_eq!(
+        p.mul_q6(),
+        PROBE_MUL_ONE,
+        "an idle/low-load pipe must bleed the probe multiplier back to \
+         the BDP posture (qd1 RTT rows stay flat)"
+    );
+}
+
+/// Hold re-validation: an ADOPTED multiplier keeps paying rent — if
+/// delivery collapses while holding elevated depth, the governor steps
+/// back toward the BDP (the unresponsive-backend retreat).
+#[test]
+fn probe_core_hold_revalidation_retreats_when_delivery_collapses() {
+    let p = ProbeCore::new();
+    let step = PROBE_EPOCH_MS + 10;
+    p.roll(10, true, true); // open
+    p.on_bytes(100_000_000);
+    p.roll(10 + step, true, true); // launch
+    p.on_bytes(130_000_000);
+    p.roll(10 + 2 * step, true, true); // adopt at ~260 MB/s
+    let adopted = p.mul_q6();
+    assert!(adopted > PROBE_MUL_ONE);
+    // Saturated HOLD epochs at collapsed delivery (~120 MB/s « adopted).
+    p.on_bytes(60_000_000);
+    assert!(p.roll(10 + 3 * step, true, true));
+    assert!(
+        p.mul_q6() < adopted,
+        "collapsed delivery under an adopted multiplier must step the \
+         target back toward the BDP"
+    );
+    assert!(p.probe_backoffs() >= 1, "the step-down must count");
+}
+
+/// Bounds: the multiplier never exceeds PROBE_MUL_MAX however responsive
+/// the backend, and a headroom-less epoch (R5 cap / Red) never launches.
+#[test]
+fn probe_core_is_bounded_and_never_probes_without_headroom() {
+    let p = ProbeCore::new();
+    let step = PROBE_EPOCH_MS + 10;
+    p.roll(10, true, true); // open
+    let mut bytes = 1_000_000u64;
+    for i in 1..=200u64 {
+        p.on_bytes(bytes);
+        p.roll(10 + i * step, true, true);
+        bytes += bytes / 3; // always-responsive backend
+        if bytes > 1 << 60 {
+            bytes = 1 << 60;
+        }
+        assert!(
+            p.mul_q6() <= PROBE_MUL_MAX,
+            "the probe multiplier must stay bounded (got {})",
+            p.mul_q6()
+        );
+    }
+    assert_eq!(p.mul_q6(), PROBE_MUL_MAX, "fixture: rode to the bound");
+
+    let q = ProbeCore::new();
+    q.roll(10, true, false); // open
+    for i in 1..=10u64 {
+        q.on_bytes(100_000_000 * i);
+        q.roll(10 + i * step, true, false);
+    }
+    assert_eq!(
+        q.probe_ups(),
+        0,
+        "no headroom (R5 cap reached / Red) ⇒ the probe never launches"
+    );
+    assert_eq!(q.mul_q6(), PROBE_MUL_ONE);
+}
+
+/// End-to-end: on a saturated, responsive pipe the DEFAULT governor's
+/// depth target must GROW BEYOND the pure-BDP/floor equilibrium (the
+/// field's self-limiting conviction), the probe gauges must move, and the
+/// target must RETREAT to the floor once offered load stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pipeline_probe_grows_depth_target_beyond_bdp_and_retreats() {
+    let _s = serial().await;
+    let _g = OverrideGuard;
+    set_depth_override(None);
+    let pipe = WritePipeline::with_caps(never_red(), Some(1 << 40));
+    let floor = FLOOR_BLOCKS_PER_LANE * BS;
+
+    // Saturating writer fleet: 32 loops of admit → hold → release against
+    // a floor-sized pipe (admission_waits grows every epoch — the
+    // production saturation signature).
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..32)
+        .map(|_| {
+            let pipe = pipe.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    let permit = pipe.admit(BS).await;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    drop(permit);
+                }
+            })
+        })
+        .collect();
+
+    // Drive epochs with an ever-responsive delivery script (tiny service
+    // time keeps the pure-BDP term far below the floor: any growth beyond
+    // the floor is the PROBE, not the BDP).
+    let mut now = 10u64;
+    let mut bytes = 50_000_000u64;
+    pipe.record_completion_at("vol-a", 1, 1_000, now);
+    let mut grown = false;
+    for _ in 0..60 {
+        now += PROBE_EPOCH_MS + 10;
+        pipe.record_completion_at("vol-a", bytes, 1_000, now);
+        bytes += bytes / 4;
+        if pipe.depth_target_bytes(BS) >= 2 * floor {
+            grown = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        grown,
+        "the DEFAULT governor must discover headroom past the BDP/floor \
+         equilibrium on a saturated responsive pipe (the field's +18 % \
+         forced-depth conviction; target {} floor {floor})",
+        pipe.depth_target_bytes(BS)
+    );
+    assert!(
+        pipe.depth_probe_ups() >= 1,
+        "probe engagement must gauge (write_pipeline_depth_probe_ups)"
+    );
+    assert!(
+        pipe.depth_target_base_bytes(BS) < pipe.depth_target_bytes(BS),
+        "the base (pure-BDP) target gauge must sit below the probed target"
+    );
+
+    // Stop the offered load: the target must retreat to the floor.
+    stop.store(true, Ordering::Relaxed);
+    for w in writers {
+        w.await.unwrap();
+    }
+    assert!(
+        pipe.quiesce(Duration::from_secs(5)).await,
+        "writer fleet must drain"
+    );
+    for _ in 0..60 {
+        now += PROBE_EPOCH_MS + 10;
+        pipe.record_completion_at("vol-a", 1_000, 1_000, now);
+        if pipe.depth_target_bytes(BS) == floor {
+            break;
+        }
+    }
+    assert_eq!(
+        pipe.depth_target_bytes(BS),
+        floor,
+        "the probe multiplier must bleed off once offered load vanishes \
+         (the latency guard — qd1 rows stay flat)"
+    );
+}
+
+/// The R5 postures are senior to the probe: a budget-capped pipe never
+/// probes past the cap, and Red clamps a probed target to the floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipeline_probe_respects_budget_cap_and_red_clamp() {
+    let _s = serial().await;
+    let _g = OverrideGuard;
+    set_depth_override(None);
+
+    // Cap below the floor: the target must never exceed the cap and the
+    // probe must never launch (no headroom).
+    let capped = WritePipeline::with_caps(never_red(), Some(2 * BS));
+    let mut now = 10u64;
+    capped.record_completion_at("vol-a", 1, 1_000, now);
+    let mut bytes = 50_000_000u64;
+    for _ in 0..10 {
+        now += PROBE_EPOCH_MS + 10;
+        capped.record_completion_at("vol-a", bytes, 1_000, now);
+        bytes += bytes / 4;
+        assert_eq!(
+            capped.depth_target_bytes(BS),
+            2 * BS,
+            "the R5 budget cap bounds the probed target"
+        );
+    }
+    assert_eq!(
+        capped.depth_probe_ups(),
+        0,
+        "a capped pipe has no headroom — the probe must not launch"
+    );
+
+    // Red: a probed-up pipe clamps to the floor while Red holds. Elevate
+    // via a parking writer fleet (the production saturation signal) +
+    // responsive delivery, then flip Red.
+    let red = Arc::new(AtomicBool::new(false));
+    let red2 = red.clone();
+    let pipe = WritePipeline::with_caps(
+        Arc::new(move || red2.load(Ordering::Relaxed)),
+        Some(1 << 40),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..16)
+        .map(|_| {
+            let pipe = pipe.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    let permit = pipe.admit(BS).await;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    drop(permit);
+                }
+            })
+        })
+        .collect();
+    let mut now = 10u64;
+    let mut bytes = 50_000_000u64;
+    pipe.record_completion_at("vol-a", 1, 1_000, now);
+    for _ in 0..60 {
+        now += PROBE_EPOCH_MS + 10;
+        pipe.record_completion_at("vol-a", bytes, 1_000, now);
+        bytes += bytes / 4;
+        if pipe.depth_target_bytes(BS) > FLOOR_BLOCKS_PER_LANE * BS {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        pipe.depth_target_bytes(BS) > FLOOR_BLOCKS_PER_LANE * BS,
+        "fixture: probed above the floor"
+    );
+    red.store(true, Ordering::Relaxed);
+    assert_eq!(
+        pipe.depth_target_bytes(BS),
+        FLOOR_BLOCKS_PER_LANE * BS,
+        "Red must clamp a probed target to the floor — honest backpressure, \
+         never OOM"
+    );
+    stop.store(true, Ordering::Relaxed);
+    for w in writers {
+        w.await.unwrap();
+    }
 }
 
 // =========================================================================

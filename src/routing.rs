@@ -1821,7 +1821,6 @@ pub struct DataRouterInner {
     pub crypto:
         std::sync::Arc<once_cell::sync::OnceCell<crate::crypto_compress::CryptoCompressState>>,
     pub prefetcher: std::sync::Arc<IoUringPrefetcher>,
-    pub stripe_write_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone)]
@@ -3067,12 +3066,6 @@ impl DataRouter {
         let total_memory = sys.total_memory();
         let metadata_capacity = std::cmp::max(10_000, total_memory / 200_000);
 
-        // Process parallelism, not the (possibly core-pinned) constructor
-        // thread's mask — the Hang-1 sizing poison collapsed this to 4.
-        let stripe_permits = crate::cpu::process_parallelism() * 4;
-        let stripe_write_semaphore =
-            std::sync::Arc::new(tokio::sync::Semaphore::new(stripe_permits));
-
         let router = Self {
             inner: std::sync::Arc::new(DataRouterInner {
                 dlm,
@@ -3109,7 +3102,6 @@ impl DataRouter {
                 stream_gauge: StreamActivityGauge::new(),
                 crypto: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
                 prefetcher: std::sync::Arc::new(IoUringPrefetcher::new()),
-                stripe_write_semaphore,
             }),
         };
         // Merge-worker promotion commits layout through the router (weak:

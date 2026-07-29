@@ -2433,6 +2433,15 @@ pub(crate) struct LaneRef<'a> {
 pub struct ReadClassHint {
     /// The request rode an O_DIRECT file description.
     pub odirect: bool,
+    /// The request already fed the stream lanes at the IPC sink
+    /// (read-saturation campaign, 2026-07-29): ring reads observe into
+    /// the §5.3 classifier ONCE, at [`DataRouter::ring_read_lane_touch`]
+    /// — a ring op that then demotes to the handler must not observe
+    /// again (a second observation of an already-advanced lane looks
+    /// like foreign traffic, and 16 of them destroy the very
+    /// classification that routed the op here — the §5.3 declassify
+    /// rule). The handler's `pipeline_touch` sites skip when set.
+    pub lane_pre_fed: bool,
 }
 
 impl StreamLanes {
@@ -3677,9 +3686,15 @@ impl DataRouter {
         if self.prefetch_window_cap == 0 || meta.file_type != "striped" {
             return;
         }
-        let lanes = self.stream_lanes.get_with(file_path.to_string(), || {
-            std::sync::Arc::new(StreamLanes::new())
-        });
+        // Borrowed-key get first: the warm ring path calls this per op
+        // (op-economy: allocation-free), so the owned-key `get_with`
+        // runs only on the entry-create miss (once per file).
+        let lanes = match self.stream_lanes.get(file_path) {
+            Some(l) => l,
+            None => self.stream_lanes.get_with(file_path.to_string(), || {
+                std::sync::Arc::new(StreamLanes::new())
+            }),
+        };
         let (lane_idx, streaming) = {
             let Some(lane_ref) = lanes.observe(offset, len) else {
                 return;
@@ -3854,6 +3869,93 @@ impl DataRouter {
                 break;
             }
         }
+    }
+
+    /// Ring-side stream feed (read-saturation campaign, 2026-07-29): the
+    /// §5.3 classifier + §5.5 pipeline driver for IPC ring reads. The
+    /// kernel lane feeds the lanes from the read handler; ring ops never
+    /// reach it on the warm path (sync fast-path serves are silent
+    /// consumption — without this feed the pipeline wedges at its
+    /// window and, worse, a sequential il stream NEVER classifies, so
+    /// every 4k miss pays one ranged fabric round trip via direct-drive
+    /// forever: the field's burst-then-collapse signature, reproduced
+    /// as `read_streams_classified = 0` / `prefetch_issued = 0` on the
+    /// baseline rig rows).
+    ///
+    /// One call per ring read, at the sink, BEFORE the miss ladder runs
+    /// — the 4th contiguous op's classification must veto direct-drive
+    /// for the 5th (`ranged_eligible`'s streaming veto). Ops that then
+    /// demote to the handler carry `ReadClassHint::lane_pre_fed` so the
+    /// handler's `pipeline_touch` sites skip them (double observation
+    /// declassifies — §5.3's 16-foreign rule).
+    ///
+    /// Latch-free, and allocation-free on the warm path (moka gets +
+    /// lane atomics; the lanes entry allocates once per file). Callable
+    /// from the foreign IPC service threads: the top-up's spawn rides
+    /// the runtime-agnostic [`crate::bg_admit::spawn_bg`].
+    /// `meta`: the caller's already-fetched metadata entry when it has
+    /// one (the §5.5.1 probe's — a second per-op `metadata_cache.get`
+    /// re-inflated the op-economy alloc pin via moka read-buffer
+    /// housekeeping); `None` looks it up (rare paths only).
+    pub fn ring_read_lane_touch(
+        &self,
+        meta: Option<&CachedMetadata>,
+        ino: u64,
+        offset: u64,
+        len: u32,
+        missed: bool,
+    ) {
+        if len == 0 || self.prefetch_window_cap == 0 {
+            return;
+        }
+        let looked_up;
+        let meta = match meta {
+            Some(m) => m,
+            None => {
+                let Some(m) = self.metadata_cache.get(&ino) else {
+                    return;
+                };
+                looked_up = m;
+                &looked_up
+            }
+        };
+        if meta.file_type != "striped" {
+            return;
+        }
+        let block_size = self.block_size.load(Ordering::Relaxed);
+        if block_size == 0 {
+            return;
+        }
+        let end_offset = offset + u64::from(len);
+        let start_block = (offset / block_size) as u32;
+        let end_block = ((end_offset - 1) / block_size) as u32;
+        let file_path = crate::keys::inode_path_stack(ino);
+        // The evicted-unconsumed detector + the foreground-wait growth
+        // trigger ride MISSES only (a warm serve is by definition
+        // resident); warm serves keep the prelude lean — consume
+        // bookkeeping + top-up need no key resolution.
+        let (first_key, will_wait) = if missed {
+            let k = meta
+                .block_map
+                .as_ref()
+                .and_then(|m| m.get(&start_block))
+                .map(String::as_str);
+            let ww = k.is_some_and(|k| self.inflight_block_reads.read_sync(k, |_, _| ()).is_some());
+            (k, ww)
+        } else {
+            (None, false)
+        };
+        self.pipeline_touch(
+            &file_path,
+            meta,
+            block_size,
+            offset,
+            u64::from(len),
+            start_block,
+            end_block,
+            will_wait,
+            first_key,
+        );
     }
 
     /// One §5.5 pipeline fetch: through the single-flight (dedupes with
@@ -6955,8 +7057,10 @@ impl DataRouter {
                         // the serve probes: consume bookkeeping, growth on
                         // foreground-wait (key already in the single-
                         // flight = the reader caught the pipeline), and
-                        // the windowed top-up.
-                        if !device_true {
+                        // the windowed top-up. Ring-originated requests
+                        // fed the lanes at the sink (`lane_pre_fed`) —
+                        // observing them again would declassify (§5.3).
+                        if !device_true && !hint.lane_pre_fed {
                             let first_key = block_keys.first().and_then(|(_, k)| k.as_deref());
                             let will_wait = first_key.is_some_and(|k| {
                                 self.inflight_block_reads.read_sync(k, |_, _| ()).is_some()
@@ -7479,8 +7583,9 @@ impl DataRouter {
                     // §5.5: multi-block reads advance the pipeline past
                     // end_block (consume span + top-up). The consume-time
                     // detector probes the first block's key like the
-                    // single-block arm.
-                    if !device_true {
+                    // single-block arm. Ring-originated requests fed the
+                    // lanes at the sink (`lane_pre_fed`, §5.3).
+                    if !device_true && !hint.lane_pre_fed {
                         self.pipeline_touch(
                             file_path,
                             &meta,

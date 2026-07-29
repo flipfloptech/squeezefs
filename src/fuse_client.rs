@@ -5739,19 +5739,24 @@ impl SqueezefsFilesystem {
             .sever(ino, block, rel, len, bs as usize, src)
     }
 
+    /// Returns the probe verdict PLUS the router metadata entry it
+    /// already fetched (read-saturation campaign): the sink's ring-side
+    /// lane feed needs the same entry, and a second `metadata_cache.get`
+    /// per warm op measurably re-inflated the op-economy alloc pin
+    /// (moka read-buffer housekeeping) — one get, shared.
     pub fn ipc_read_probe_locked(
         &self,
         ino: u64,
         offset: u64,
         size: u32,
         out: &dyn crate::PayloadSink,
-    ) -> IpcReadProbe {
+    ) -> (IpcReadProbe, Option<crate::routing::CachedMetadata>) {
         // Attr-cache size — a miss would need the handler's async
         // `backend.getattr` fallback, unreachable from a sync service
         // thread: demote (§5.5.1 normative rule).
         let mut file_size = match self.attr_cache.get(&ino) {
             Some((attr, _)) => attr.size,
-            None => return IpcReadProbe::Miss,
+            None => return (IpcReadProbe::Miss, None),
         };
         // Size coherency override (same rationale as the handler): the
         // router metadata cache is updated synchronously by the write
@@ -5763,7 +5768,7 @@ impl SqueezefsFilesystem {
             file_size = m.size;
         }
         if offset >= file_size {
-            return IpcReadProbe::Eof;
+            return (IpcReadProbe::Eof, meta);
         }
         let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
         let block_size = self.router.block_size.load(Ordering::Relaxed);
@@ -5771,7 +5776,7 @@ impl SqueezefsFilesystem {
         let end_block = (offset + read_len as u64 - 1) / block_size;
         if start_block != end_block {
             // Multi-block reads flush dirty active blocks first (async).
-            return IpcReadProbe::Miss;
+            return (IpcReadProbe::Miss, meta);
         }
         let cache_key = crate::keys::active_block_stack(ino, start_block);
         let Some(buf) = self.active_block_buffers.get(cache_key.as_str()) else {
@@ -5786,10 +5791,10 @@ impl SqueezefsFilesystem {
                     .router
                     .try_read_range_sync(&file_path, m, offset, read_len, out)
                 {
-                    return IpcReadProbe::Served(n);
+                    return (IpcReadProbe::Served(n), meta);
                 }
             }
-            return IpcReadProbe::Miss;
+            return (IpcReadProbe::Miss, meta);
         };
         let block_start = start_block * block_size;
         let rel_offset = (offset - block_start) as usize;
@@ -5800,13 +5805,13 @@ impl SqueezefsFilesystem {
         // snapshot regardless of seed deferral (exactly the handler's
         // `contained` branch: covered runs never overlap the owed gaps).
         if buf.value().is_extent_repr() || !buf.value().covered_contains(rel_offset, rel_end) {
-            return IpcReadProbe::Miss;
+            return (IpcReadProbe::Miss, meta);
         }
         // The handler's common case: zero-copy CoW-stable snapshot slice
         // (immutable for the reply's lifetime — a later write copies).
         let snapshot = buf.value().snapshot();
         drop(buf);
-        IpcReadProbe::Hit(snapshot.slice(rel_offset..rel_end))
+        (IpcReadProbe::Hit(snapshot.slice(rel_offset..rel_end)), meta)
     }
 
     /// Write/refresh this client's mount registration (`client:{id}` xattr on the
@@ -10704,7 +10709,18 @@ impl Filesystem for SqueezefsFilesystem {
                 .read_odirect_requests
                 .fetch_add(1, Ordering::Relaxed);
         }
-        let read_hint = crate::routing::ReadClassHint { odirect };
+        // Ring-originated requests (the IPC handoff path) carry
+        // `unique == 0` — `DataPlaneSink::ring_request` is the only
+        // unique-0 Request producer on the read path (kernel uniques are
+        // kernel-allocated and nonzero). Those ops already fed the
+        // stream lanes at the sink (`ring_read_lane_touch`); observing
+        // them again in `pipeline_touch` would declassify the stream
+        // that routed them here (§5.3 — pinned by
+        // tests/read_saturation_tests.rs).
+        let read_hint = crate::routing::ReadClassHint {
+            odirect,
+            lane_pre_fed: _req.unique == 0,
+        };
 
         if ino == CONFIG_INODE {
             let bytes = if let Some(cached) = self.open_virtual_files.get(&fh) {

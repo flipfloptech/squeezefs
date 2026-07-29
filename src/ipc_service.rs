@@ -383,9 +383,19 @@ impl DataPlaneSink {
         let lock = self.fs.get_inode_lock_ref(ino);
         match lock.try_read() {
             Ok(guard) => {
-                let probe =
+                let (probe, meta) =
                     self.fs
                         .ipc_read_probe_locked(ino, op.desc.offset, op.desc.len, &op.payload);
+                // Ring-side stream feed (read-saturation campaign): every
+                // ring read observes into the §5.3 lanes exactly once, in
+                // the arms below, strictly AFTER the guard drops — warm
+                // serves are the pipeline's silent consumption (the
+                // consume edge must advance or issue wedges at its
+                // window); misses feed BEFORE the ladder so the 4th
+                // contiguous op's classification vetoes direct-drive (the
+                // field's 4k sequential burst-then-collapse). EOF probes
+                // carry no block content and stay silent; the ddt branch
+                // above keeps its device-true posture untouched.
                 // Drop-guard-before-enqueue (§5.5.1, load-bearing): the
                 // guard must be gone before ANY continuation — the Miss
                 // handoff re-acquires this lock behind possibly-queued
@@ -409,6 +419,13 @@ impl DataPlaneSink {
                             .ipc_bytes_out
                             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                         completion.complete(bytes.len() as i64);
+                        self.fs.router.ring_read_lane_touch(
+                            meta.as_ref(),
+                            ino,
+                            op.desc.offset,
+                            op.desc.len,
+                            false,
+                        );
                     }
                     IpcReadProbe::Served(n) => {
                         // Tier leg already wrote the payload into the
@@ -418,8 +435,28 @@ impl DataPlaneSink {
                         METRICS.ipc_ops_read.fetch_add(1, Ordering::Relaxed);
                         METRICS.ipc_bytes_out.fetch_add(n as u64, Ordering::Relaxed);
                         completion.complete(n as i64);
+                        self.fs.router.ring_read_lane_touch(
+                            meta.as_ref(),
+                            ino,
+                            op.desc.offset,
+                            op.desc.len,
+                            false,
+                        );
                     }
                     IpcReadProbe::Miss => {
+                        // The miss feeds FIRST (missed = true: the
+                        // foreground-wait growth trigger + the
+                        // evicted-unconsumed detector live on this
+                        // shape), so a 4th contiguous op classifies and
+                        // `ranged_eligible`'s streaming veto governs the
+                        // ladder below for THIS op already.
+                        self.fs.router.ring_read_lane_touch(
+                            meta.as_ref(),
+                            ino,
+                            op.desc.offset,
+                            op.desc.len,
+                            true,
+                        );
                         // DIALED P1.5 (2026-07-27): a governed O_DIRECT
                         // miss on the DEFAULT mount runs the R1b
                         // admission decision synchronously in the
@@ -452,7 +489,12 @@ impl DataPlaneSink {
             }
             Err(_) => {
                 // A writer holds (or queues on) the inode lock: the op
-                // was about to wait anyway — demote (§5.5.1).
+                // was about to wait anyway — demote (§5.5.1). Feed the
+                // lanes first: the handoff carries `lane_pre_fed` (the
+                // handler must not observe this op again).
+                self.fs
+                    .router
+                    .ring_read_lane_touch(None, ino, op.desc.offset, op.desc.len, true);
                 METRICS
                     .ipc_fast_path_lock_demotions
                     .fetch_add(1, Ordering::Relaxed);

@@ -84,10 +84,25 @@ where
             crate::fuse_client::METRICS
                 .bg_spawn_admitted
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tokio::spawn(async move {
+            let task = async move {
                 let _permit = permit;
                 fut.await;
-            });
+            };
+            // Venue: the caller's runtime when there is one; otherwise
+            // the fuse3 per-core handler lanes. The read-saturation
+            // campaign's ring-side pipeline feed spawns prefetch tasks
+            // from the IPC service threads — foreign OS threads with no
+            // tokio context, where `tokio::spawn` panics. The TPC lanes
+            // are the established foreign-thread venue (the 2026-07-26
+            // handoff-economy rule: they are where kernel-lane handlers
+            // run, and their per-core current-thread runtimes take
+            // foreign submissions without the global-inject-queue tax).
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(task);
+                }
+                Err(_) => fuse3::raw::tpc_spawn(task),
+            }
             true
         }
         Err(_) => {

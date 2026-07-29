@@ -137,7 +137,10 @@
 //!   empty-pipe bypass); at most ONE oversized bypass lands on an empty
 //!   pipe (the CAS serializes racing bypassers); gauges settle to
 //!   exactly zero once every admission released (no lost/duplicated
-//!   accounting). **Stated precondition** (module docs): wake liveness
+//!   accounting); and the probe-up governor's epoch roll (`ProbeCore`,
+//!   2026-07-29) is single-winner — racing completion threads apply
+//!   exactly one probe transition per epoch, multiplier bounded.
+//!   **Stated precondition** (module docs): wake liveness
 //!   is tick-bounded by design (`notify_waiters` stores no permit; the
 //!   5 ms re-poll is the backstop) — the model checks accounting, not
 //!   permit-style wake delivery, which the implementation does not
@@ -3020,6 +3023,52 @@ mod models {
         });
     }
 
+    /// Probe-up governor (2026-07-29 campaign): the epoch roll is
+    /// single-winner — two completion threads racing `roll` past the
+    /// epoch boundary produce exactly ONE state transition (one probe
+    /// launch, one gain application), and the multiplier stays within
+    /// [ONE, MAX]. The property rides the CAS's ATOMICITY on
+    /// `epoch_start_ms`, not any ordering (every other field is a
+    /// declared-approximate latch-free gauge, the `Lane` posture);
+    /// weakening-verified by replacing the CAS with a check-then-store
+    /// roll — both threads then roll and the model goes red (ups == 2).
+    #[test]
+    fn write_pipeline_probe_epoch_roll_is_single_winner() {
+        loom::model(|| {
+            let p = Arc::new(write_pipeline_core::ProbeCore::new());
+            // Open the epoch window at t=1.
+            assert!(!p.roll(1, true, true));
+            p.on_bytes(1_000_000);
+
+            let now = 1 + write_pipeline_core::PROBE_EPOCH_MS + 10;
+            let ts: Vec<_> = (0..2)
+                .map(|_| {
+                    let p = p.clone();
+                    thread::spawn(move || {
+                        p.on_bytes(1_000_000);
+                        p.roll(now, true, true)
+                    })
+                })
+                .collect();
+            let rolled: u64 = ts.into_iter().map(|t| u64::from(t.join().unwrap())).sum();
+            assert_eq!(
+                rolled, 1,
+                "exactly one racing completion thread may roll the epoch"
+            );
+            assert_eq!(
+                p.probe_ups(),
+                1,
+                "a double roll would double-launch the probe"
+            );
+            assert_eq!(
+                p.mul_q6(),
+                write_pipeline_core::PROBE_MUL_ONE + write_pipeline_core::PROBE_MUL_ONE / 4,
+                "exactly one probe gain applied"
+            );
+            assert!(p.mul_q6() <= write_pipeline_core::PROBE_MUL_MAX);
+        });
+    }
+
     // -----------------------------------------------------------------
     // placed_core — the placed-sever claims protocol (shim-parity
     // 2026-07-28): page-claim overlap exclusion and the
@@ -3035,9 +3084,7 @@ mod models {
     #[test]
     fn placed_claims_overlap_exclusive_and_rollback_clean() {
         loom::model(|| {
-            let c = Arc::new(placed_core::PlacedClaims::new(
-                4 * placed_core::CLAIM_PAGE,
-            ));
+            let c = Arc::new(placed_core::PlacedClaims::new(4 * placed_core::CLAIM_PAGE));
             let wins = Arc::new(loom::sync::atomic::AtomicUsize::new(0));
 
             let ts: Vec<_> = [(0usize, 2usize), (1, 2)]
@@ -3076,9 +3123,7 @@ mod models {
     #[test]
     fn placed_claims_never_double_grant_while_held() {
         loom::model(|| {
-            let c = Arc::new(placed_core::PlacedClaims::new(
-                2 * placed_core::CLAIM_PAGE,
-            ));
+            let c = Arc::new(placed_core::PlacedClaims::new(2 * placed_core::CLAIM_PAGE));
             let holders = Arc::new(loom::sync::atomic::AtomicUsize::new(0));
 
             let ts: Vec<_> = (0..2)
@@ -3135,10 +3180,7 @@ mod models {
                     "adoption granted while a sever memcpy is in flight \
                      (the frozen-snapshot mutation window)"
                 );
-                assert!(
-                    !c.begin_claim(0, 1),
-                    "sealed assembly granted a new claim"
-                );
+                assert!(!c.begin_claim(0, 1), "sealed assembly granted a new claim");
             }
             claimer.join().unwrap();
         });

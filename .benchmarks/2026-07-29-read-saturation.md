@@ -2,7 +2,7 @@
 
 Branch `perf/read-saturation` off dev tip `b26c293`. Commits: red
 `a5ba2db` (large-op ring READ economy contracts), green `b1e4b16`
-(multi-slab pipelined `ring_pread`), red `<fix2-red>` (ring reads must
+(multi-slab pipelined `ring_pread`), red `fde3da0` (ring reads must
 feed the classifier/pipeline), green `af342aa` (ring-side lane feed +
 `lane_pre_fed` + runtime-agnostic `spawn_bg`), red `9829d02` (window-
 economy decision tables), green `d50b119` (budget-derived cap + split
@@ -148,7 +148,66 @@ every il row (`ipc_ops_read` Δ accounts the row's ring ops;
 per-second logs + per-side loadavg: `/tmp/rsat/bracket-counted/`
 (preserved with the run).
 
-<!-- BRACKET TABLE -->
+Contention, labeled honestly: the whole bracket ran concurrently with
+the sibling write-governor campaign's own fio matrix (its daemon at
+1–2 cores + row bursts; per-side loadavg logged 11–34, of which our own
+rows contribute ~15–40 runnable threads while running). The alternating
+order and the kernel twins are the noise defense; verdicts below cite
+both CAMP windows.
+
+Sides: CAMP = `0e984a8` pair, BASE = dev `b26c293` pair (both clean
+identities — an earlier bracket attempt with a `-dirty` CAMP pair was
+DISCARDED whole: the KD-7 identity screen passthrough'd every il row of
+one side, the per-row engagement enforcement now aborts the rig on any
+`ipc_ops_read Δ = 0` il row, and the count restarted from zero).
+
+| row (median IOPS) | CAMP1 | BASE1 | BASE2 | CAMP2 | camp/base (medians) |
+|---|---|---|---|---|---|
+| **il seq-4k cold 25 s (the collapse row)** | 1,213,505 | 654,986 | 604,907 | 1,420,330 | **2.09×** |
+| — sustained window (10–24 s, per-second logs) | 1,300,362 | 543,073 | 524,816 | 1,432,714 | **2.5×** — BASE sits ON the collapse floor (525–543k ≈ the baseline's 560k); CAMP sustains 1.28–1.46M ≈ the warm serve ceiling. The field's burst-then-collapse is CLOSED; the new limiter is the sync fast-path serve rate (service-thread CPU), named below |
+| kern seq-4k cold (twin/canary) | 94,079 | 218,356 | 95,250 | 470,897 | kernel context — wildly contention-sensitive (its qd16 classification instability is pre-existing); il beats its kernel twin on every CAMP window |
+| il seq-1M single-pass cold (GiB/s) | 9.1 | 4.2† | 9.8 | 9.7 | 1.34× by medians; †BASE1's reps (3.5/7.3/4.2) took the worst sibling burst — by the quiet windows this row is par-to-modest-gain ON THIS RIG (localhost RTTs hide the round-trip economy; the op ledger below is the transferable proof) |
+| kern seq-1M single-pass (twin) | 5.0 | 6.3 | 4.5 | 7.4 | il ≥ kernel on both CAMP windows (9.1 vs 5.0, 9.7 vs 7.4) |
+| il warm rand-4k fit-small | 1,003,210 | 1,138,260 | 1,248,906 | 1,089,742 | 0.88× in-bracket (contention-tainted: both CAMP windows ran hotter). Same-binary interleaved kill-switch A/B on the final pair (`SQUEEZEFS_READ_PREFETCH_WINDOW=0` vs armed, fresh mounts): **−0.4 % and −8 %** across two load windows — the ring-touch tax after the warm-laneless fix is bounded by the moka lanes get + 4-lane scan; residual filed (§7) |
+| il rand-4k t32qd32 churn (flagship) | 405,424 | 388,713 | 457,549 | 349,977 | 0.89× — inside this bracket's own BASE spread (389k vs 458k = ±9 %) under the sibling's variable load; governor behavior identical (denials ≈ serves, escalations trickle-bounded, `read_device_true_reads = 0`) |
+
+**The per-op economy ledger (engagement-exact, from the row deltas):**
+
+- il seq-1M: CAMP `ipc_ops_read = 24,576` for 24,576 user ops (**1.00
+  ring op / MiB**) vs BASE `393,216` (**16.0** — the slab-chunk
+  collapse). CAMP `get_obj = 7,511` device read ops for 6,144 unique
+  blocks (1.22×, prefetch-deduped); classified = 16/16 streams,
+  prefetch engaged (~1,500 issues).
+- il seq-4k (CAMP2 r1): 35.8M ring ops → **35.1M sync fast-path serves
+  (98 %)**, 670k handoffs (1.9 %), **34 direct-drive serves** (vs
+  BASE's 11.7M per-op ranged RTTs on the baseline row), `ranged_reads =
+  332`, `get_obj = 44,108` (whole-block fetches ≈ passes × 6,144
+  blocks), governor denials 0.
+- Amplification: CAMP seq rows fetch whole blocks once per pass
+  (`get_obj` ≈ blocks + prefetch dedupe ≤ 1.3×); no seed reads;
+  `read_device_true_reads = 0` everywhere (default posture).
+
+**Bars adjudicated:**
+
+- (a) Raw fio READ ceiling measured: 33.2 GiB/s seq-1M / 895k rand-4k
+  (zram zero-page reads — a memcpy-class ceiling this daemon's
+  2-copy-per-byte serve path cannot reach on 22 CPUs by construction).
+- (b) il seq-1M cold streaming: **9.1–9.8 GiB/s ≈ 0.29× of the raw
+  memcpy ceiling** on this rig, il ≥ kernel on every matched window,
+  ring ops/MiB 16 → 1. The transferable claims for the field's
+  2×200GbE wall are the op ledger (1 RTT/MiB instead of 16) and the
+  engaged pipeline — the absolute 15/16 GB/s mark needs the field's 32
+  CPUs and real NICs, and the remaining rig-side residual is
+  §7's serve-path copy economy.
+- (c) il seq-4k cold sustained: **525–543k → 1.28–1.46M sustained
+  (2.5×)**, order-independent; limiter now the sync fast-path serve
+  rate (service-thread CPU on 5 derived threads), not fabric RTTs.
+- (d) warm rows: −0.4 %/−8 % by same-binary kill-switch interleave
+  (contention-bounded); never below 1M in any counted window.
+- (e) rand-4k t32qd32: in-band (±9 % BASE self-spread), governor
+  posture identical.
+- (f) write rows: write_matrix armed-odirect parity sweep — see §6.
+
 
 ## 6. Gates
 
@@ -175,4 +234,38 @@ per-second logs + per-side loadavg: `/tmp/rsat/bracket-counted/`
 
 ## 7. Residuals (recorded, not chased)
 
-<!-- RESIDUALS -->
+- **The warm-touch residual**: after the warm-laneless fix the ring
+  touch still costs a moka `stream_lanes` get + 4-lane scan per warm
+  op (kill-switch interleave bounds: −0.4 %..−8 % across load
+  windows). Named next lever if the fleet wants it back: gate warm
+  feeds on a leak-proof active-streams hint (the `stream_gauge`
+  pattern) — the design must keep the granted-regime classification
+  path (warm ops 3–4 CONTINUING a miss-started run), which a naive
+  gauge gate would break.
+- **Classification churn under qd16 reordering**: the seq-4k rows
+  re-classify ~4–7×/file/25 s (lane contiguity vs out-of-order
+  arrivals) — delivery is already at the serve ceiling, so this is
+  bookkeeping noise; a block-granular lane matcher is the refinement
+  if the field's deeper queues make it visible.
+- **Kernel-path seq-4k qd16 instability** (its own twin rows: 94k–471k
+  under load): pre-existing, untouched by this campaign; the same
+  block-granular matcher would serve it.
+- **Prefetch coverage on 24 GiB single-pass streams** is ~20–30 % of
+  fetches (resident-share = 1 block/lane at 16 streams × 128 MiB hot
+  budget; `prefetch_evicted_unconsumed` ≈ 700/pass keeps the AIMD
+  honest): the reader fronts most fetches as single-flight joiners.
+  Raising the hot budget (or fewer/deeper streams) deepens it; the
+  split-bounds change makes that a budget decision instead of a
+  structural depth-1 cap.
+- **This rig's absolute streaming ceiling is serve-path memcpy-bound**
+  (~10 GiB/s at 16 streams: one hot-tier copy into the arena + one
+  shim copy-out per byte on il; the raw 33 GiB/s ceiling is zram
+  zero-page memcpy). The field's 15/16 GB/s bar rides the op economy
+  + pipeline landed here plus the field's CPU/NIC budget; if the
+  fleet's rig-measured wall lands on this term, the next campaign is
+  the read twin of the placed-sever/lease copy economy (serve into
+  the arena without the hot-tier bounce, or lease the tier bytes).
+- The bracket ran against sibling-campaign load throughout (labeled
+  per side); a quiet-box confirmation pass of the warm/rand rows is
+  cheap insurance when the box frees up.
+

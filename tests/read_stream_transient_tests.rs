@@ -361,11 +361,18 @@ async fn fitting_disk_tier_reread_stream_still_converges() {
     // Re-read passes with the epoch seam at 100 ms: grants flow while
     // unclamped, the trickle + window release cover the rest. A bounded
     // deadline loop is convergence-waiting, not sleep-synchronization.
+    //
+    // Convergence, defined honestly: a full pass with the DEVICE FLAT —
+    // the whole set serving from the tiers. Residency is legitimately
+    // MIXED: disk-tier blocks (published grants) plus hot-RAM residents
+    // (a block the 2-slot hot tier retains never re-fills, so it never
+    // gets another publish decision — that is service, not starvation).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut converged = false;
     while std::time::Instant::now() < deadline {
+        let g0 = get_obj();
         stream_pass(&h, ino, blocks, |b| (b % 250) as u8 + 1).await;
-        if (0..blocks as u32).all(|b| tier_has(&h, map.get(&b).unwrap())) {
+        if get_obj() == g0 {
             converged = true;
             break;
         }
@@ -373,17 +380,28 @@ async fn fitting_disk_tier_reread_stream_still_converges() {
     }
     assert!(
         converged,
-        "a disk-tier-fitting re-read stream must converge to the tier \
+        "a disk-tier-fitting re-read stream must converge to tier service \
          (the 9.2-vs-16.6 lineage: a full stream ghost bypass never \
          converges and stays device-bound forever)"
     );
-    // Converged steady state: the device goes flat (tier serves).
+    // The disk tier must hold real convergence evidence (published stream
+    // grants), not just hot-RAM luck: with a 2-slot hot tier and a
+    // 6-block set, at least 4 blocks must have published.
+    let tier_resident = (0..blocks as u32)
+        .filter(|b| tier_has(&h, map.get(b).unwrap()))
+        .count();
+    assert!(
+        tier_resident >= 4,
+        "granted stream admissions must publish to the disk tier \
+         ({tier_resident} of {blocks} resident)"
+    );
+    // Converged steady state holds: another pass, still device-flat.
     let g0 = get_obj();
     stream_pass(&h, ino, blocks, |b| (b % 250) as u8 + 1).await;
     assert_eq!(
         get_obj() - g0,
         0,
-        "converged re-read stream serves from the disk tier, device flat"
+        "converged re-read stream keeps serving from the tiers"
     );
     squeezefs::routing::TEST_ADMISSION_EPOCH_MS.store(0, Ordering::Relaxed);
     drop(h);

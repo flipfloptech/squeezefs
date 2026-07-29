@@ -13,6 +13,10 @@ type EvictReceiver = tokio::sync::mpsc::Receiver<(String, Bytes, EvictClass)>;
 enum PutClass {
     /// referenced=true, protected=true — keep-worthy by definition.
     Protected,
+    /// referenced=true, protected=true, stream-admitted marker set (the
+    /// transient stream window, 2026-07-29): a governor-granted stream
+    /// admission — within-pass consumption credits no payback.
+    ProtectedStream,
     /// referenced=false, protected=false — one-pass residue, first in line.
     Probation,
     /// referenced=true, protected=false — §5.5 pipeline fill: one-lap
@@ -228,6 +232,12 @@ impl LruCache {
         self.put_with(key, data, PutClass::ProbationReferenced);
     }
 
+    /// [`crate::tiering::memory::MemoryCache::put_protected_stream`] —
+    /// the transient stream window's GRANTED arm (2026-07-29).
+    pub fn put_protected_stream(&self, key: &str, data: Bytes) {
+        self.put_with(key, data, PutClass::ProtectedStream);
+    }
+
     /// R5 Red clamp (§5.7): force-evict toward `target` bytes. Victims are
     /// DROPPED at the source (counted) — never dehydrated: the Yellow
     /// dehydration pause is already active below Red, and a clamp that
@@ -261,6 +271,7 @@ impl LruCache {
             let key_bytes = Bytes::copy_from_slice(key.as_bytes());
             let mut evicted = match class {
                 PutClass::Protected => self.inner.put(key_bytes, data),
+                PutClass::ProtectedStream => self.inner.put_protected_stream(key_bytes, data),
                 PutClass::Probation => self.inner.put_probationary(key_bytes, data),
                 PutClass::ProbationReferenced => {
                     self.inner.put_probationary_referenced(key_bytes, data)

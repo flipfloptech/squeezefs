@@ -2169,10 +2169,7 @@ impl AdmissionGovernor {
         use std::sync::atomic::Ordering::Relaxed;
         let crate::tiering::memory::EvictClass::Protected {
             served_bytes,
-            // Scaffolding (red): the pre-campaign semantics ignore the
-            // stream marker; the green commit exempts stream victims
-            // from the unhit tripwire.
-            stream_admitted: _,
+            stream_admitted,
         } = class
         else {
             return;
@@ -2187,7 +2184,13 @@ impl AdmissionGovernor {
         METRICS
             .read_admission_wasted_bytes
             .fetch_add(waste, Relaxed);
-        if *served_bytes == 0 {
+        // Stream-admitted victims report full shortfall by construction
+        // (their within-pass consumption credits nothing — the honest
+        // basis that lets the clamp SEE beyond-budget stream admissions
+        // as the waste they are) but are exempt from the unhit tripwire:
+        // that counter keeps meaning admitted-and-NEVER-touched, the ops
+        // signal the 2026-07-26 campaign defined.
+        if *served_bytes == 0 && !stream_admitted {
             METRICS.read_admission_evicted_unhit.fetch_add(1, Relaxed);
         }
     }
@@ -2231,29 +2234,31 @@ impl AdmissionGovernor {
         true
     }
 
+    /// The one token RESERVATION, not check-then-add: under real mount
+    /// concurrency (256-deep O_DIRECT) a herd of simultaneous attempts
+    /// all passed a plain check before any spend landed — measured on
+    /// the rig as ~6× the configured budget (93 admits/s where 5 % of
+    /// foreground allowed 15). The single-word token CAS makes the check
+    /// and the spend one atomic step with no cross-word snapshot to
+    /// race. Shared by the ranged escalation site and the stream-fill
+    /// admission site — one grant economy, two instruments.
+    fn reserve_tokens(&self, block_bytes: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.tokens
+            .fetch_update(Relaxed, Relaxed, |t| t.checked_sub(block_bytes))
+            .is_ok()
+    }
+
     /// The escalation-site decision: admit (accounting the block) or deny
     /// (counted; the caller falls back to the device-true ranged window
     /// read and records no cooldown).
     pub fn allow_escalation(&self, block_bytes: u64) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
-        if self.clamp_engaged(block_bytes) {
-            // RESERVATION, not check-then-add: under real mount
-            // concurrency (256-deep O_DIRECT) a herd of simultaneous
-            // attempts all passed a plain check before any spend landed —
-            // measured on the rig as ~6× the configured budget (93
-            // admits/s where 5 % of foreground allowed 15). The
-            // single-word token CAS makes the check and the spend one
-            // atomic step with no cross-word snapshot to race.
-            let reserved = self
-                .tokens
-                .fetch_update(Relaxed, Relaxed, |t| t.checked_sub(block_bytes))
-                .is_ok();
-            if !reserved {
-                METRICS
-                    .read_admission_governor_denials
-                    .fetch_add(1, Relaxed);
-                return false;
-            }
+        if self.clamp_engaged(block_bytes) && !self.reserve_tokens(block_bytes) {
+            METRICS
+                .read_admission_governor_denials
+                .fetch_add(1, Relaxed);
+            return false;
         }
         true
     }
@@ -2261,12 +2266,24 @@ impl AdmissionGovernor {
     /// The STREAM-fill admission decision (the transient stream window,
     /// 2026-07-29): may a classified stream's ghost-hit re-fill admit
     /// protected (+ publish), or must it ride the transient window
-    /// (probation, publish skipped, ledger-invisible)? Scaffolding (red):
-    /// carries the pre-campaign semantics — every stream ghost hit
-    /// admits; the green commit routes it through the clamp + token
-    /// reservation with refusals counted on
-    /// `read_admission_stream_transients` (never the ranged instrument).
-    pub fn allow_stream_admission(&self, _block_bytes: u64) -> bool {
+    /// (probation, publish skipped, waste-ledger-invisible)? Same clamp +
+    /// token reservation as the ranged site — under an engaged clamp the
+    /// grant trickle is bounded to `fill_pct` % of the stream's own
+    /// foreground device spend (streaming fills feed `note_foreground`,
+    /// so the governor's documented bounded-waste law holds on this
+    /// shape too) — but refusals count `read_admission_stream_transients`
+    /// and NEVER `read_admission_governor_denials`: a held-transient fill
+    /// still serves its reader from hot probation (nothing degraded),
+    /// while a ranged denial names a read that stayed device-true. Two
+    /// meanings, two instruments.
+    pub fn allow_stream_admission(&self, block_bytes: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.clamp_engaged(block_bytes) && !self.reserve_tokens(block_bytes) {
+            METRICS
+                .read_admission_stream_transients
+                .fetch_add(1, Relaxed);
+            return false;
+        }
         true
     }
 
@@ -2499,6 +2516,34 @@ pub struct RangedDest {
 // writer. Sending the pointer across the executor's threads moves that
 // exclusive access, never shares it.
 unsafe impl Send for RangedDest {}
+
+/// A block fill's provenance at the validated fill site
+/// (`get_cached_or_fetch_block_traced`) — the transient stream window's
+/// dispatch input (2026-07-29):
+///
+/// * `Demand` — an ordinary foreground fill (random/unclassified files,
+///   GDS warmers, ranged-escalation whole-block fetches). Today's
+///   admission semantics verbatim.
+/// * `DemandStream` — a foreground fill for a file holding a FRESH §5.3
+///   streaming classification: its device fetch feeds the governor's
+///   foreground basis, and its ghost hit admits only through
+///   `allow_stream_admission`.
+/// * `Prefetch` — a §5.5 pipeline fill (streaming by definition): same
+///   stream admission arbitration, but never feeds the foreground basis
+///   (no self-funding), and its non-admitted hot put carries the
+///   one-lap clock grace.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FillClass {
+    Demand,
+    DemandStream,
+    Prefetch,
+}
+
+impl FillClass {
+    fn streaming(self) -> bool {
+        matches!(self, FillClass::DemandStream | FillClass::Prefetch)
+    }
+}
 
 /// The classifier verdict handed back to the read path: which lane (if
 /// any) this request rides, and whether that lane is classified streaming.
@@ -3358,7 +3403,7 @@ impl DataRouter {
         block_key: &str,
     ) -> Result<crate::cache::pool::ReadBlockValue> {
         Ok(self
-            .get_cached_or_fetch_block_traced(block_key, false)
+            .get_cached_or_fetch_block_traced(block_key, FillClass::Demand)
             .await?
             .0)
     }
@@ -3375,23 +3420,34 @@ impl DataRouter {
     /// re-resolve — serving them for a resolved block index is exactly the
     /// reused-key stale-fill corruption.
     ///
-    /// `speculative`: the fill is a §5.5 pipeline prefetch. It keeps FULL
-    /// ghost semantics (record + hit): with the pipeline fetching every
-    /// block of every classified pass, a ghost BYPASS (tried first) meant
-    /// a genuinely re-read stream never admitted to the disk tier — warm
-    /// re-reads stayed device-bound forever (measured: 9.2 GiB/s vs the
-    /// 16.6 lineage; R-1's mitigation stack broken). Same-pass fake heat
-    /// is prevented MECHANICALLY instead: the one-lap clock grace + the
-    /// progress-clocked quiescence keep one pass ≈ one miss per key
-    /// (`prefetch_evicted_unconsumed` ≈ 0), so a second recorded miss is
-    /// real cross-pass re-read heat regardless of which agent fetched.
-    /// What `speculative` DOES change: a non-admitted fill's hot put
-    /// carries the one-lap grace (`put_probationary_referenced`) — clock
-    /// parity with the consumed residue it races (never stickiness).
+    /// `class`: the fill's provenance (see [`FillClass`]). Prefetch fills
+    /// keep FULL ghost semantics (record + hit): with the pipeline
+    /// fetching every block of every classified pass, a ghost BYPASS
+    /// (tried first) meant a genuinely re-read stream never admitted to
+    /// the disk tier — warm re-reads stayed device-bound forever
+    /// (measured: 9.2 GiB/s vs the 16.6 lineage; R-1's mitigation stack
+    /// broken). Same-pass fake heat is prevented MECHANICALLY instead:
+    /// the one-lap clock grace + the progress-clocked quiescence keep one
+    /// pass ≈ one miss per key (`prefetch_evicted_unconsumed` ≈ 0), so a
+    /// second recorded miss is real cross-pass re-read heat regardless of
+    /// which agent fetched.
+    ///
+    /// What the class changes (the transient stream window, 2026-07-29):
+    /// a STREAM-class fill's ghost hit admits protected + publish only
+    /// through [`AdmissionGovernor::allow_stream_admission`] — held
+    /// transient (probation, publish skipped) under the clamp, with
+    /// `DemandStream` fills funding the trickle via `note_foreground`
+    /// (their whole-block fetch IS the workload's own device spend;
+    /// `Prefetch` never self-funds — the ranged site's rule). Granted
+    /// stream admissions enter marked (`put_protected_stream`) so their
+    /// within-pass consumption never dilutes the waste ledger. A
+    /// non-admitted `Prefetch` fill's hot put carries the one-lap grace
+    /// (`put_probationary_referenced`) — clock parity with the consumed
+    /// residue it races (never stickiness).
     async fn get_cached_or_fetch_block_traced(
         &self,
         block_key: &str,
-        speculative: bool,
+        class: FillClass,
     ) -> Result<(crate::cache::pool::ReadBlockValue, bool)> {
         // §5.6a quarantined mapping: EIO before any tier probe (the damaged
         // key itself is never cache-published, but the contract is a loud
@@ -3570,6 +3626,20 @@ impl DataRouter {
                         // correctness-safe: absence ⇒ the next reader goes
                         // to the device; every RETAINED publish keeps the
                         // full validated-fill discipline untouched.
+                        // Foreground basis (the transient stream window):
+                        // a DemandStream fill's whole-block fetch is the
+                        // workload's own device spend — under an engaged
+                        // clamp it mints the admission trickle, so the
+                        // bounded-waste law (waste ≤ fill_pct % of what
+                        // the workload already pays) holds on the
+                        // streaming shape exactly as it does for ranged.
+                        // Prefetch never self-funds (the ranged site's
+                        // no-self-funding rule).
+                        if class == FillClass::DemandStream {
+                            self.cache
+                                .admission_governor
+                                .note_foreground(downloaded_bytes.len() as u64);
+                        }
                         let ghost_admit = if downloaded_bytes.len() <= 256 * 1024 {
                             true
                         } else {
@@ -3587,7 +3657,18 @@ impl DataRouter {
                                             .read_tier_admission_ghost_hits
                                             .fetch_add(1, Ordering::Relaxed);
                                     }
-                                    hit
+                                    // The transient stream window
+                                    // (2026-07-29): a classified stream's
+                                    // ghost hit is not admission-by-right —
+                                    // the governor arbitrates. Denied ⇒
+                                    // probation + publish skipped (the
+                                    // fill still serves its reader; the
+                                    // ledger never sees the victim).
+                                    hit && (!class.streaming()
+                                        || self
+                                            .cache
+                                            .admission_governor
+                                            .allow_stream_admission(downloaded_bytes.len() as u64))
                                 }
                             }
                         };
@@ -3676,10 +3757,22 @@ impl DataRouter {
                             // line; any read promotes in place, sticky).
                             METRICS.hot_block_misses.fetch_add(1, Ordering::Relaxed);
                             if ghost_admit && self.tier_admission == TierAdmission::SecondTouch {
-                                self.cache
-                                    .hot_block
-                                    .put(block_key, downloaded_bytes.clone());
-                            } else if speculative {
+                                if class.streaming() {
+                                    // Governor-granted stream admission:
+                                    // protected, MARKED — its within-pass
+                                    // consumption credits no payback (see
+                                    // put_protected_stream), so the clamp
+                                    // keeps seeing beyond-budget stream
+                                    // admissions honestly.
+                                    self.cache
+                                        .hot_block
+                                        .put_protected_stream(block_key, downloaded_bytes.clone());
+                                } else {
+                                    self.cache
+                                        .hot_block
+                                        .put(block_key, downloaded_bytes.clone());
+                                }
+                            } else if class == FillClass::Prefetch {
                                 // §5.5 pipeline fill: probation class WITH
                                 // the one-lap clock grace — parity with
                                 // consumed residue whose serves re-arm
@@ -4223,7 +4316,10 @@ impl DataRouter {
             // Speculative: full ghost semantics + the graced probation put
             // — see the get_cached_or_fetch_block_traced doc for why the
             // ghost bypass was rejected (warm-re-read convergence).
-            match router.get_cached_or_fetch_block_traced(&key, true).await {
+            match router
+                .get_cached_or_fetch_block_traced(&key, FillClass::Prefetch)
+                .await
+            {
                 Ok(_) => settle(true),
                 Err(err) => {
                     debug!("Prefetch: failed to fetch block {key}: {err:?}");
@@ -4368,6 +4464,21 @@ impl DataRouter {
         const MAX_REBINDS: usize = 24;
         const BACKOFF_AFTER: usize = 4;
         const CONTENDED_BEFORE_ESCALATE: usize = 2;
+        // Fill provenance (the transient stream window, 2026-07-29):
+        // computed ONCE per call — a file holding a fresh §5.3 streaming
+        // classification fills as DemandStream (its ghost hits are
+        // governor-arbitrated and its device fetches fund the trickle).
+        // One moka get per FILL, never per warm op.
+        let fill_class = if !device_true
+            && self
+                .stream_lanes
+                .get(file_path)
+                .is_some_and(|lanes| lanes.any_streaming_fresh())
+        {
+            FillClass::DemandStream
+        } else {
+            FillClass::Demand
+        };
         // Never-invisible hole revalidation (fstests generic/795): a None
         // binding handed in from the caller's ENTRY-TIME map snapshot may
         // be stale-absent — a concurrent write-through / writeback publish
@@ -4412,7 +4523,8 @@ impl DataRouter {
             let fetched = if device_true || escalated {
                 self.fetch_block_device_true(&cur_key).await
             } else {
-                self.get_cached_or_fetch_block_traced(&cur_key, false).await
+                self.get_cached_or_fetch_block_traced(&cur_key, fill_class)
+                    .await
             };
             let (val, incarnation_valid) = match fetched {
                 Ok(x) => x,

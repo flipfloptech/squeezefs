@@ -96,10 +96,17 @@ impl MemoryCacheShard {
         let entry = self.map.get_sync(key)?;
         let (value, state) = entry.get();
         state.referenced.store(true, Ordering::Relaxed);
-        if served_bytes > 0 {
+        if served_bytes > 0 && !state.stream_admitted.load(Ordering::Relaxed) {
             // Serve-site payback credit (admission governor): only real
             // reader serves pass a length; probes and residency checks
-            // pass 0 and never inflate an entry's payback.
+            // pass 0 and never inflate an entry's payback. STREAM-admitted
+            // entries credit NOTHING (the transient stream window,
+            // 2026-07-29): probation would have served their within-pass
+            // consumption identically, so the admission's marginal value
+            // is cross-pass retention only — counting consumption diluted
+            // the governor's waste ratio and held the clamp open under
+            // beyond-budget stream loops (the 4 GB/s ledger-pollution
+            // face; scan resistance broken for co-tenants).
             state
                 .served_bytes
                 .fetch_add(served_bytes, Ordering::Relaxed);

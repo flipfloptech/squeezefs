@@ -2372,6 +2372,47 @@ impl StreamActivityGauge {
     }
 }
 
+/// §5.5 window-economy decisions (read-saturation campaign, 2026-07-29),
+/// extracted pure so `tests/read_prefetch_window_tests.rs` pins their
+/// tables — `pipeline_touch` routes through these three functions.
+///
+/// The default window cap: the prefetch share of the hot budget, in
+/// blocks (no fixed depth — the house no-constants law; an explicit
+/// `SQUEEZEFS_READ_PREFETCH_WINDOW` wins verbatim). Rails: floor 4 (below
+/// it the AIMD start of 2 cannot even double once), cap 4096 (bounds a
+/// pathological budget/block ratio).
+pub fn derived_prefetch_window_cap(share_pct: u64, hot_budget: u64, block_size: u64) -> u32 {
+    let _ = (share_pct, hot_budget, block_size);
+    // Scaffolding at the pre-campaign posture (the fixed cap this
+    // campaign retires) — red against the derivation table.
+    16
+}
+
+/// One §5.5 issue-admission decision: may this lane issue one more
+/// prefetch fetch? `resident_share` is the lane's landed-fill budget in
+/// blocks (`share% × hot_budget / block / active_streams`).
+pub fn prefetch_issue_admits(
+    window: u32,
+    cap: u32,
+    resident_share: u64,
+    in_flight: u32,
+    unconsumed: u32,
+) -> bool {
+    // Scaffolding at the pre-campaign semantics: in-flight fetches are
+    // charged against the resident share (the measured 16-stream
+    // depth-1 starvation) — red against the split-bounds table.
+    let effective = (window.min(cap) as u64).min(resident_share);
+    u64::from(in_flight) + u64::from(unconsumed) < effective
+}
+
+/// One §5.5 window-growth decision (the AIMD up-edge).
+pub fn prefetch_window_grows(will_wait: bool, overran: bool, detect_streak: u32, green: bool) -> bool {
+    let _ = (overran, detect_streak);
+    // Scaffolding at the pre-campaign trigger (foreground-wait only) —
+    // red against the overrun rows.
+    will_wait && green
+}
+
 /// K = 4 offset lanes per file, so concurrent sequential readers of one
 /// file do not mutually reset each other. More than K concurrent readers
 /// degrade the excess to the random class — a later pipeline start,

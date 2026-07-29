@@ -704,15 +704,26 @@ async fn fully_warm_sequential_ring_rereads_stay_laneless() {
 
     // Make block 0 resident WITHOUT classifying: two spaced (non-
     // contiguous) handler reads — the second is the ghost second touch
-    // that escalates the whole-block admission.
+    // that escalates the whole-block admission. OFF the stream's 4 KiB
+    // grid (+1 KiB), so the lanes these misses legitimately claim can
+    // never be CONTINUED by the aligned warm stream below (continuing
+    // a miss-started lane is allowed by design; this test pins the
+    // CLAIM path only).
     let _ = fx
         .fs
-        .read(req(), ino, 0, 64 * 4096, 4096, libc::O_DIRECT as u32)
+        .read(req(), ino, 0, 64 * 4096 + 1024, 4096, libc::O_DIRECT as u32)
         .await
         .expect("warm-up read 1");
     let _ = fx
         .fs
-        .read(req(), ino, 0, 128 * 4096, 4096, libc::O_DIRECT as u32)
+        .read(
+            req(),
+            ino,
+            0,
+            128 * 4096 + 1024,
+            4096,
+            libc::O_DIRECT as u32,
+        )
         .await
         .expect("warm-up read 2");
 

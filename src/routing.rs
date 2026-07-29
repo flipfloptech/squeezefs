@@ -2566,7 +2566,16 @@ impl StreamLanes {
     /// stalest idle lane (resetting its run AND abandoning its pipeline:
     /// generation bump, plan cleared, window collapsed — §5.5
     /// cancellation), else the read is Random.
-    pub(crate) fn observe(&self, offset: u64, len: u64) -> Option<LaneRef<'_>> {
+    ///
+    /// `claim`: whether a non-matching offset may run the foreign-count
+    /// + stalest-lane-claim machinery (read-saturation campaign): warm
+    /// ring serves pass `false` — they may CONTINUE a lane a miss
+    /// started (contiguity match above), but a fully-warm stream has
+    /// nothing to prefetch and the per-op claim path was the measured
+    /// warm-row tax (−6..−16 % on the 1M-IOPS rand-4k rows vs the
+    /// pipeline kill switch). Misses and every kernel-path request keep
+    /// `true` (kernel semantics unchanged).
+    pub(crate) fn observe(&self, offset: u64, len: u64, claim: bool) -> Option<LaneRef<'_>> {
         use std::sync::atomic::Ordering::Relaxed;
         let now = Self::now_ms();
         // Lane match: continue the run.
@@ -2592,6 +2601,9 @@ impl StreamLanes {
                     streaming: false,
                 });
             }
+        }
+        if !claim {
+            return None;
         }
         // No lane matched: a foreign read. A long-enough foreign run
         // means random traffic dominates this file — clear every lane's
@@ -3776,21 +3788,25 @@ impl DataRouter {
         end_block: u32,
         will_wait_inflight: bool,
         first_key: Option<&str>,
+        lane_claim: bool,
     ) {
         if self.prefetch_disabled() || meta.file_type != "striped" {
             return;
         }
         // Borrowed-key get first: the warm ring path calls this per op
         // (op-economy: allocation-free), so the owned-key `get_with`
-        // runs only on the entry-create miss (once per file).
+        // runs only on the entry-create miss (once per file) — and only
+        // for claiming callers: a warm serve on a never-missed file has
+        // no lanes to continue and must not mint any.
         let lanes = match self.stream_lanes.get(file_path) {
             Some(l) => l,
-            None => self.stream_lanes.get_with(file_path.to_string(), || {
+            None if lane_claim => self.stream_lanes.get_with(file_path.to_string(), || {
                 std::sync::Arc::new(StreamLanes::new())
             }),
+            None => return,
         };
         let (lane_idx, streaming) = {
-            let Some(lane_ref) = lanes.observe(offset, len) else {
+            let Some(lane_ref) = lanes.observe(offset, len, lane_claim) else {
                 return;
             };
             let idx = lanes
@@ -4077,6 +4093,9 @@ impl DataRouter {
             end_block,
             will_wait,
             first_key,
+            // Warm serves continue lanes, never claim them (the
+            // warm-row tax — see `StreamLanes::observe`).
+            missed,
         );
     }
 
@@ -7197,6 +7216,7 @@ impl DataRouter {
                                 end_block,
                                 will_wait,
                                 first_key,
+                                true,
                             );
                         }
                         if let Some((_, b_key_opt)) = block_keys.first() {
@@ -7718,6 +7738,7 @@ impl DataRouter {
                             end_block,
                             false,
                             block_keys.first().and_then(|(_, k)| k.as_deref()),
+                            true,
                         );
                     }
 

@@ -1,4 +1,4 @@
-# 2026-07-29 — Read saturation: large-op ring reads, ring-fed stream classification, and the prefetch window economy
+# 2026-07-29 — Read saturation: large-op ring reads, ring-fed stream classification, the prefetch window economy, and the transient stream window
 
 Branch `perf/read-saturation` off dev tip `b26c293`. Commits: red
 `a5ba2db` (large-op ring READ economy contracts), green `b1e4b16`
@@ -6,9 +6,12 @@ Branch `perf/read-saturation` off dev tip `b26c293`. Commits: red
 feed the classifier/pipeline), green `af342aa` (ring-side lane feed +
 `lane_pre_fed` + runtime-agnostic `spawn_bg`), red `9829d02` (window-
 economy decision tables), green `d50b119` (budget-derived cap + split
-issue bounds + overrun growth), plus the docs/evidence commits.
-Design amendments: `docs/design-read-path.md` §5.5 (2026-07-29 note),
-`docs/design-preload-interception.md` Rev 15.
+issue bounds + overrun growth), red `e3db374` (transient stream window
+contracts), green `8a5d2e4` (governor-arbitrated stream re-fill
+admission — §8 below), plus the docs/evidence commits.
+Design amendments: `docs/design-read-path.md` §5.5 (2026-07-29 note) +
+§5.3 admission-decision amendment (part 2, the transient stream
+window), `docs/design-preload-interception.md` Rev 15.
 
 ## 0. The governing law (user directive, verbatim)
 
@@ -30,6 +33,31 @@ collapse to 200–300k sustained.** Interpretation confirmed by rig
 reproduction (§3): the burst is the warm RAM-tier ceiling; the collapse
 floor is the cold-miss fabric-RTT ceiling — every 4k op paying one
 ranged round trip via direct-drive, forever.
+
+**The live field capture (2026-07-29, same cluster, 4-wide nullblk
+plane, binary `b26c293`, elbencho `-r -t 32 -b 4k --direct` sequential
+infloop over 32×512 MiB — 32 GiB ≫ the RAM budget):** sustained
+**307k IOPS / 1.2 GB/s** after the warm burst; device truth during the
+collapse: each of 4 heads serving 40–50k reads/s at **exactly ~4.1 KB**
+(`rareq-sz` 4.08–4.18) — every user 4k read one 4k fabric round trip,
+no whole-block fetches, no batching. Mount-lifetime counters:
+`read_admission_governor_denials` ≈ 9.1 M, `ranged_reads` ≈ 19.6 M vs
+**`prefetch_issued` ≈ 97 total** (the pipeline never engages on this
+path), `prefetch_foreground_waits` ≈ 1.5 k,
+`read_admission_wasted_bytes` ≈ 659 GB. The mechanism chain:
+beyond-budget sequential stream → the scan-resistant admission governor
+(2026-07-26) correctly refuses admission → governor-denied O_DIRECT
+misses take the P1.5 direct-drive path → each 4k op device-true,
+bypassing BOTH the 1024×-per-block amortization AND the R2 pipeline.
+Two individually-correct mechanisms composing badly on exactly one
+shape. **Reference proof of available headroom on the same mount:** the
+EXA validation harness (fio 32 jobs × 1 MiB × QD8 libaio, KERNEL path,
+no shim) pulled **16.9 GB/s reads** — the hardware and the FS read path
+saturate when the app supplies its own deep parallelism; elbencho psync
+t32×1 MiB il reads sustained only 6.9 GB/s (4.66 ms/op — Little-bound;
+prefetch not hiding fabric latency there either, `b26c293` having no il
+classification at all). The 4k collapse and the 1 MiB 6.9 GB/s are the
+same disease at two block sizes.
 
 ## 2. Substrate & instruments (labeled)
 
@@ -268,4 +296,86 @@ one side, the per-row engagement enforcement now aborts the rig on any
 - The bracket ran against sibling-campaign load throughout (labeled
   per side); a quiet-box confirmation pass of the warm/rand rows is
   cheap insurance when the box frees up.
+
+## 8. The transient stream window (continuation session, 2026-07-29)
+
+The §1 live field capture arrived after §5's bracket: the SUSTAINED
+face of the same disease. Verification + fix, all on the rsat rig
+(instance `rsat`, nvmet-tcp — substrate/instrument stated per row).
+
+### 8.1 The conviction, reproduced (the field shape, verbatim)
+
+Row: dynamic elbencho 3.1-10, `-r -t 32 -b 4k --direct --infloop
+--timelimit 120`, 32×512 MiB (16 GiB ≫ the 128 MiB hot tier), il, fresh
+format + cold mount. Artifacts `/tmp/rsat/field-repro/`.
+
+| side (pair) | sustained (per-second series) | device truth | the counters |
+|---|---|---|---|
+| BASE (`b26c293` ≡ dev tip `778d6d0` code) | burst ~976k → **~280k flat floor** (the field's 307k), with ~900k spikes at each 32 s cooldown-epoch roll | `rareq-sz` **4.2 KiB** (field: 4.08–4.18) | 30.5 M of 44.2 M ops = per-op 4k ranged direct-drive RTTs; `classified = 1` of 32, `prefetch_issued = 2`, escalations cooldown-cycled (~13/s trickle + epoch-roll bursts) |
+| CAMP (`0e984a8`, pre-§8) | **1.32 M flat ×120 s** (4.7× the floor) — the collapse is closed by the §4 ring-fed classifier | whole-block (`get_obj` ≈ 2.3 k/s × 4 MiB) | direct-drive 56 of 158.8 M ops; **but `read_admission_wasted_bytes` +454 GB/120 s ≈ 4 GB/s = 42 % of device reads** — the field mount's 659 GB lifetime face, still growing |
+
+The rig face of the deny-and-direct-drive chain is the 32 s escalation
+COOLDOWN (denials = 0 here because the clamp never engages on the
+25–120 s single-mount window); the field face is the governor clamp
+(9.1 M denials on a long-lived mount). Same composition, same floor:
+either denial source ⇒ per-op device-true 4k RTTs.
+
+### 8.2 The residual mechanism (measured, then pinned red)
+
+At `0e984a8` the §5.3 admission table's **Streaming row was never wired
+at the fill site** — the ghost decision sees only the block key. On a
+sustained loop every pass-2+ stream refill ghost-hits and admits
+**protected + published**: the waste ledger runs at 4 GB/s (42 % of
+device bandwidth; `wasted_bytes ÷ device-bytes ≤ ~5 %` is the
+documented bounded-waste verdict), the within-pass `get_serving` credit
+(~58 % payback) dilutes the clamp ratio so the governor can never
+engage on it — re-opening the 2026-07-26 scan-resistance hole for
+co-tenants — and a cache-ful mount would re-pay the R1b publish tax
+once per block per pass. Red contracts: `tests/read_stream_transient_
+tests.rs` (`e3db374`) — the beyond-budget loop's wasted delta measured
+exactly 48 refills × 128 KiB shortfall at the parent.
+
+### 8.3 The fix (green `8a5d2e4`)
+
+`FillClass::{Demand, DemandStream, Prefetch}` provenance at the fill
+site (one lanes probe per FILL, never per warm op); a streaming fill's
+ghost hit admits only through `AdmissionGovernor::allow_stream_
+admission` — the same clamp + token reservation as the ranged site
+(one grant economy), refusals on the NEW counter `read_admission_
+stream_transients` (never `governor_denials`: a held-transient fill
+still serves its reader from hot probation). Granted stream admissions
+enter marked (`put_protected_stream`): `get_serving` credits them
+nothing (the admission's marginal value is cross-pass retention only),
+victims report full shortfall (the clamp finally SEES beyond-budget
+stream admissions) but are exempt from the `evicted_unhit` tripwire.
+`DemandStream` fills feed `note_foreground` (their whole-block fetch IS
+the workload's own device spend; `Prefetch` never self-funds), so the
+clamped grant trickle is `fill_pct` % (default 5) of the stream's own
+bandwidth. The 9.2-vs-16.6 GiB/s lineage (disk-tier re-read
+convergence) is pinned green: convergence = device-flat tier service
+(hot-RAM residents + published grants), reached through the unclamped
+start + the trickle + the 2-epoch window release.
+
+### 8.4 Fixed pair on the field shape (`0b60160` pair, 120 s)
+
+**1.2 M IOPS sustained flat ×120 s** (per-second series 1.13–1.32 M, no
+decay trend), `rareq-sz` **4,090 KiB** (whole blocks), direct-drive 334
+of 145.8 M ops, `read_device_true_reads = 0`, engagement exact. The
+ledger: **wasted 447 MB/s ÷ device 8.6 GB/s = 5.2 %** — the `fill_pct`
+bound holding on the streaming shape (vs 42 % unfixed, an 8×
+reduction); `read_admission_stream_transients` = 234,828 carried ~95 %
+of refills; `read_admission_evicted_unhit` = **1** in 120 s (tripwire
+semantics preserved). A KD-7 note: the first fixed-pair attempt ran a
+`-dirty` shim against a clean daemon — the identity screen
+passthrough'd every il op and the rig's per-row engagement enforcement
+aborted loudly (`ipc_ops_read Δ = 0`), exactly as designed; the pair
+was rebuilt clean and the row re-run.
+
+### 8.5 Sustained counted A-B-B-A bracket (the ≥60 s law)
+
+<!-- BRACKET2 TABLE -->
+
+### 8.6 Gates (continuation session)
+
+<!-- GATES2 -->
 

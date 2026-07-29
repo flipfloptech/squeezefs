@@ -3772,14 +3772,23 @@ impl DataRouter {
                                         .hot_block
                                         .put(block_key, downloaded_bytes.clone());
                                 }
-                            } else if class == FillClass::Prefetch {
+                            } else if class.streaming() {
                                 // §5.5 pipeline fill: probation class WITH
                                 // the one-lap clock grace — parity with
                                 // consumed residue whose serves re-arm
                                 // `referenced`; without it the clock evicts
                                 // the pipeline's future to keep the
                                 // stream's past (595 refetches on the
-                                // row-2 shape, measured).
+                                // row-2 shape, measured). The SAME
+                                // argument covers a transient-window
+                                // DemandStream fill (2026-07-29): its
+                                // requester's remaining sub-reads consume
+                                // it IMMEDIATELY, and without the grace it
+                                // loses the clock race mid-consumption to
+                                // sibling streams (measured on the
+                                // sustained bracket: kern seq-1M −9 %,
+                                // fetch ratio 1.19× vs the protected
+                                // baseline's 1.07×).
                                 self.cache.hot_block.put_probationary_referenced(
                                     block_key,
                                     downloaded_bytes.clone(),

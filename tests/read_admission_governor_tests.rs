@@ -517,7 +517,10 @@ fn herd_phase() {
         assert!(gov.allow_escalation(block), "pre-clamp admissions flow");
         gov.on_eviction(
             block,
-            &squeezefs::tiering::memory::EvictClass::Protected { served_bytes: 0 },
+            &squeezefs::tiering::memory::EvictClass::Protected {
+                served_bytes: 0,
+                stream_admitted: false,
+            },
         );
     }
 

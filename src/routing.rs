@@ -2167,7 +2167,14 @@ impl AdmissionGovernor {
     /// never count.
     pub fn on_eviction(&self, len: u64, class: &crate::tiering::memory::EvictClass) {
         use std::sync::atomic::Ordering::Relaxed;
-        let crate::tiering::memory::EvictClass::Protected { served_bytes } = class else {
+        let crate::tiering::memory::EvictClass::Protected {
+            served_bytes,
+            // Scaffolding (red): the pre-campaign semantics ignore the
+            // stream marker; the green commit exempts stream victims
+            // from the unhit tripwire.
+            stream_admitted: _,
+        } = class
+        else {
             return;
         };
         self.roll();
@@ -2248,6 +2255,18 @@ impl AdmissionGovernor {
                 return false;
             }
         }
+        true
+    }
+
+    /// The STREAM-fill admission decision (the transient stream window,
+    /// 2026-07-29): may a classified stream's ghost-hit re-fill admit
+    /// protected (+ publish), or must it ride the transient window
+    /// (probation, publish skipped, ledger-invisible)? Scaffolding (red):
+    /// carries the pre-campaign semantics — every stream ghost hit
+    /// admits; the green commit routes it through the clamp + token
+    /// reservation with refusals counted on
+    /// `read_admission_stream_transients` (never the ranged instrument).
+    pub fn allow_stream_admission(&self, _block_bytes: u64) -> bool {
         true
     }
 

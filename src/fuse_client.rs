@@ -2095,6 +2095,15 @@ pub struct Metrics {
     pub read_admission_evicted_unhit: Align64<AtomicU64>,
     pub read_admission_wasted_bytes: Align64<AtomicU64>,
     pub read_admission_governor_denials: Align64<AtomicU64>,
+    /// The transient stream window (read-saturation campaign,
+    /// 2026-07-29): classified-stream ghost-hit re-fills the governor
+    /// held TRANSIENT (hot probation, publish skipped, waste-ledger
+    /// invisible) instead of admitting protected. Sustained growth on a
+    /// beyond-budget stream loop is the DESIGNED steady state (grants
+    /// ride the `fill_pct` trickle); the ranged-path
+    /// `read_admission_governor_denials` instrument is deliberately
+    /// untouched by these.
+    pub read_admission_stream_transients: Align64<AtomicU64>,
     /// R5 (§5.7 Yellow row): dehydration-worker victims dropped because the
     /// memory authority paused dehydration entirely (protected included —
     /// disk-tier warmth is the cheapest sacrifice under memory pressure).
@@ -4515,6 +4524,7 @@ impl SqueezefsFilesystem {
                 "read_admission_evicted_unhit": METRICS.read_admission_evicted_unhit.load(Ordering::Relaxed),
                 "read_admission_wasted_bytes": METRICS.read_admission_wasted_bytes.load(Ordering::Relaxed),
                 "read_admission_governor_denials": METRICS.read_admission_governor_denials.load(Ordering::Relaxed),
+                "read_admission_stream_transients": METRICS.read_admission_stream_transients.load(Ordering::Relaxed),
                 "read_admission_governor_clamped": self.router.cache.admission_governor.clamped(),
                 "mem_budget_bytes": crate::mem_budget::MEM_BUDGET.budget_bytes(),
                 "mem_budget_pressure_bytes": crate::mem_budget::MEM_BUDGET.pressure_bytes(),

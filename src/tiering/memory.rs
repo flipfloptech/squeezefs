@@ -18,7 +18,18 @@ use xxhash_rust::xxh3::xxh3_64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvictClass {
     Probation,
-    Protected { served_bytes: u64 },
+    Protected {
+        served_bytes: u64,
+        /// The entry was admitted by a classified STREAM's ghost hit
+        /// (read-saturation campaign, 2026-07-29 — the transient stream
+        /// window): its payback basis excludes within-pass consumption
+        /// (`get_serving` credits nothing — probation would have served
+        /// those sub-reads identically, so the admission's marginal value
+        /// is cross-pass retention only), and its eviction is exempt from
+        /// the `read_admission_evicted_unhit` tripwire (that counter
+        /// keeps meaning admitted-and-never-touched).
+        stream_admitted: bool,
+    },
 }
 
 /// Entry state: the shard value grows ONE sticky class bit beside the
@@ -45,6 +56,13 @@ struct EntryState {
     /// eviction. Relaxed accumulate; a racy lost add is a slightly
     /// stiffer clamp, never a correctness event.
     served_bytes: AtomicU64,
+    /// Stream-admitted marker (see [`EvictClass::Protected`]): set by
+    /// [`MemoryCache::put_protected_stream`], cleared when a NON-stream
+    /// protected re-put lands (the entry earned real re-read heat
+    /// through a random path — restore the ordinary payback basis).
+    /// Same racy-tolerance class as its siblings: a lost update is one
+    /// mis-based victim report, never a correctness event.
+    stream_admitted: AtomicBool,
 }
 
 /// A single thread-safe shard of the Clock cache.
@@ -106,6 +124,7 @@ impl MemoryCacheShard {
         value: Bytes,
         protected: bool,
         referenced: bool,
+        stream: bool,
         evicted: &mut Vec<(Bytes, Bytes, EvictClass)>,
     ) {
         let val_len = value.len();
@@ -126,8 +145,12 @@ impl MemoryCacheShard {
                 if protected {
                     // A protected re-put promotes; a probationary
                     // re-put never DEMOTES an entry something already
-                    // read (sticky).
+                    // read (sticky). Protected re-puts own the payback
+                    // basis: a NON-stream protected re-put clears the
+                    // stream marker (real random re-read heat), a
+                    // stream re-put sets it.
                     state.protected.store(true, Ordering::Relaxed);
+                    state.stream_admitted.store(stream, Ordering::Relaxed);
                 }
                 old_len = Some(old.len());
             })
@@ -147,6 +170,7 @@ impl MemoryCacheShard {
                         referenced: AtomicBool::new(referenced),
                         protected: AtomicBool::new(protected),
                         served_bytes: AtomicU64::new(0),
+                        stream_admitted: AtomicBool::new(stream),
                     },
                 )
             });
@@ -182,6 +206,7 @@ impl MemoryCacheShard {
                     let class = if state.protected.load(Ordering::Relaxed) {
                         EvictClass::Protected {
                             served_bytes: state.served_bytes.load(Ordering::Relaxed),
+                            stream_admitted: state.stream_admitted.load(Ordering::Relaxed),
                         }
                     } else {
                         EvictClass::Probation
@@ -232,6 +257,9 @@ impl MemoryCacheShard {
                                 class = if state.protected.load(Ordering::Relaxed) {
                                     EvictClass::Protected {
                                         served_bytes: state.served_bytes.load(Ordering::Relaxed),
+                                        stream_admitted: state
+                                            .stream_admitted
+                                            .load(Ordering::Relaxed),
                                     }
                                 } else {
                                     EvictClass::Probation
@@ -330,7 +358,21 @@ impl MemoryCache {
     /// P2-7: reuse a thread-local eviction buffer so the common no-eviction
     /// path does not allocate a fresh `Vec` on every put.
     pub fn put(&self, key: Bytes, value: Bytes) -> Vec<(Bytes, Bytes, EvictClass)> {
-        self.put_with_class(key, value, true, true)
+        self.put_with_class(key, value, true, true, false)
+    }
+
+    /// PROTECTED insert carrying the STREAM-ADMITTED marker (the
+    /// transient stream window, 2026-07-29): a classified stream's
+    /// governor-granted ghost admission. Clock/class semantics identical
+    /// to [`Self::put`]; the marker changes only the payback basis
+    /// (`get_serving` credits nothing) and the victim's unhit-tripwire
+    /// exemption — see [`EvictClass::Protected`].
+    pub fn put_protected_stream(
+        &self,
+        key: Bytes,
+        value: Bytes,
+    ) -> Vec<(Bytes, Bytes, EvictClass)> {
+        self.put_with_class(key, value, true, true, true)
     }
 
     /// Insert with referenced=false AND protected=false (§5.4): a one-pass
@@ -338,7 +380,7 @@ impl MemoryCache {
     /// cannot displace a protected entry that still has its second chance.
     /// Any `get` promotes it in place (sticky `protected`).
     pub fn put_probationary(&self, key: Bytes, value: Bytes) -> Vec<(Bytes, Bytes, EvictClass)> {
-        self.put_with_class(key, value, false, false)
+        self.put_with_class(key, value, false, false, false)
     }
 
     /// Probation CLASS with the one-lap second chance (referenced=true,
@@ -354,7 +396,7 @@ impl MemoryCache {
         key: Bytes,
         value: Bytes,
     ) -> Vec<(Bytes, Bytes, EvictClass)> {
-        self.put_with_class(key, value, false, true)
+        self.put_with_class(key, value, false, true, false)
     }
 
     fn put_with_class(
@@ -363,6 +405,7 @@ impl MemoryCache {
         value: Bytes,
         protected: bool,
         referenced: bool,
+        stream: bool,
     ) -> Vec<(Bytes, Bytes, EvictClass)> {
         let idx = self.get_shard_idx(&key);
         thread_local! {
@@ -372,7 +415,7 @@ impl MemoryCache {
         EVICT_BUF.with(|cell| {
             let mut evicted = cell.borrow_mut();
             evicted.clear();
-            self.shards[idx].put(key, value, protected, referenced, &mut evicted);
+            self.shards[idx].put(key, value, protected, referenced, stream, &mut evicted);
             if evicted.is_empty() {
                 Vec::new()
             } else {

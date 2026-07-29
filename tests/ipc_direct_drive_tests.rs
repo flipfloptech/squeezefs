@@ -1099,7 +1099,10 @@ async fn default_mount_clamped_denials_direct_drive_with_denial_accounting() {
     for _ in 0..2 {
         gov.on_eviction(
             block,
-            &squeezefs::tiering::memory::EvictClass::Protected { served_bytes: 0 },
+            &squeezefs::tiering::memory::EvictClass::Protected {
+                served_bytes: 0,
+                stream_admitted: false,
+            },
         );
     }
 
@@ -1243,7 +1246,10 @@ fn governor_peek_is_non_reserving_and_counts_denials() {
     for _ in 0..2 {
         gov.on_eviction(
             block,
-            &squeezefs::tiering::memory::EvictClass::Protected { served_bytes: 0 },
+            &squeezefs::tiering::memory::EvictClass::Protected {
+                served_bytes: 0,
+                stream_admitted: false,
+            },
         );
     }
     assert!(
@@ -1276,7 +1282,10 @@ fn governor_peek_is_non_reserving_and_counts_denials() {
     for _ in 0..2 {
         gov.on_eviction(
             block,
-            &squeezefs::tiering::memory::EvictClass::Protected { served_bytes: 0 },
+            &squeezefs::tiering::memory::EvictClass::Protected {
+                served_bytes: 0,
+                stream_admitted: false,
+            },
         );
     }
     for i in 0..64 {

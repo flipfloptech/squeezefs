@@ -583,7 +583,10 @@ async fn clamped_sequential_ring_stream_classifies_and_rides_whole_blocks() {
     for _ in 0..2 {
         gov.on_eviction(
             block,
-            &squeezefs::tiering::memory::EvictClass::Protected { served_bytes: 0 },
+            &squeezefs::tiering::memory::EvictClass::Protected {
+                served_bytes: 0,
+                stream_admitted: false,
+            },
         );
     }
 

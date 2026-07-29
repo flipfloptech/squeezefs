@@ -112,15 +112,28 @@ trap kill_daemon EXIT
 format_fs() {
     "$SQUEEZEFS_BIN" format "sqmeta://$META_DEV" "sqdata://$DATA_DEV" --force \
         >> "$RESULTS/format.log" 2>&1 || fail "format"
+    # Post-format, systemd-udevd re-probes the changed device nodes under
+    # an exclusive BSD flock; the D0 writer guard honestly refuses that
+    # foreign holder if mount races it (same mitigation as pug_bracket.sh).
+    udevadm settle --timeout=10 2>/dev/null || true
 }
 
 mount_fs() { # mount_fs armed|unarmed
     rm -f "$LOG"
     local extra=()
     [ "$1" = armed ] && extra=(--interception)
-    RUST_LOG=info SQUEEZEFS_IPC_SERVICE_THREADS=8 "$SQUEEZEFS_BIN" mount \
-        "sqmeta://$META_DEV" "$MOUNT_DIR" --daemon --allow-other \
-        --mem-cache-size 1GB --log-file "$LOG" "${extra[@]}" || fail "mount $1"
+    # Bounded retry: a lingering udev flock window is transient — a
+    # genuinely-held writer lock keeps refusing and still fails loud.
+    local m_ok=0
+    for _ in 1 2 3 4 5; do
+        if RUST_LOG=info SQUEEZEFS_IPC_SERVICE_THREADS=8 "$SQUEEZEFS_BIN" mount \
+            "sqmeta://$META_DEV" "$MOUNT_DIR" --daemon --allow-other \
+            --mem-cache-size 1GB --log-file "$LOG" "${extra[@]}"; then
+            m_ok=1; break
+        fi
+        sleep 1
+    done
+    [ "$m_ok" = 1 ] || fail "mount $1"
     for _ in $(seq 20); do mountpoint -q "$MOUNT_DIR" && break; sleep 0.5; done
     mountpoint -q "$MOUNT_DIR" || { tail -20 "$LOG"; fail "mount $1 not up"; }
     chmod 1777 "$MOUNT_DIR"
@@ -220,6 +233,21 @@ prealloc_rand() { # prealloc_rand <dir> — 16 × 1 GiB striped whole-block file
     sleep 2
 }
 
+rand_row() { # rand_row <rowname> <shim 0|1> <bs> <direct 0|1> <dir>
+    echo "$1" | grep -Eq "$ROW_FILTER" || return 0
+    # Every rand row measures the W1 patch shape BY DEFINITION (header):
+    # time_based overwrites of preallocated striped whole-block-mapped
+    # files. A rand row at one granularity leaves parked-extent overlays
+    # on the shared files (patch_ineligible_overlay ramps; fold/seed
+    # convergence then eats the next row's 10 s window — the 2026-07-29
+    # clean-box mirror scatter: both binaries flipped WIN/LOSS on
+    # buffered rand rows by ramp position alone). Re-prealloc restores
+    # the row's stated precondition so it measures its shape, not the
+    # previous row's residue.
+    prealloc_rand "$5"
+    run_row "$1" "$2" rand "$3" "$4" "$5"
+}
+
 echo "results: $RESULTS (filter: $ROW_FILTER)"
 echo "row,rep,iops,bw_mib_s,elapsed_s,durable_tail_s,fio_ops,ipc_ops_write,ring_per_op,engagement" > "$CSV"
 
@@ -229,22 +257,29 @@ format_fs
 mount_fs armed
 RAND_DIR="$MOUNT_DIR/rand"; SEQ_DIR="$MOUNT_DIR/seqd"
 mkdir -p "$RAND_DIR" "$SEQ_DIR"; chmod 1777 "$RAND_DIR" "$SEQ_DIR"
-prealloc_rand "$RAND_DIR"
-for path in kernel shim; do
-    sh=0; [ "$path" = shim ] && sh=1
-    for direct in 1 0; do
-        dl=odirect; [ "$direct" = 0 ] && dl=buffered
-        for bs in 4k 64k 256k 1m; do
-            run_row "armed-$path-rand-$bs-$dl" "$sh" rand "$bs" "$direct" "$RAND_DIR"
+# Twin ADJACENCY (2026-07-29): each shim row runs immediately after its
+# kernel twin. The volume ages monotonically (allocation cursor, free-list
+# shape, reclaim state); with all-kernel-then-all-shim ordering the twins
+# of one pair executed ~10 rows apart and the parity verdict measured AGE
+# SKEW, not the transport — WIN/LOSS flipped per pass in both directions
+# on BOTH binaries (dev-tip failed its own sweep). Adjacent twins bound
+# the skew to one row. (The A-B-B-A aging-store rule, applied within the
+# rig's own pairing.)
+for direct in 1 0; do
+    dl=odirect; [ "$direct" = 0 ] && dl=buffered
+    for bs in 4k 64k 256k 1m; do
+        for path in kernel shim; do
+            sh=0; [ "$path" = shim ] && sh=1
+            rand_row "armed-$path-rand-$bs-$dl" "$sh" "$bs" "$direct" "$RAND_DIR"
         done
     done
 done
-for path in kernel shim; do
-    sh=0; [ "$path" = shim ] && sh=1
-    for direct in 1 0; do
-        dl=odirect; [ "$direct" = 0 ] && dl=buffered
-        # 4m seq = the shim-parity campaign's t16×4MiB streaming venue.
-        for bs in 4k 64k 256k 1m 4m; do
+for direct in 1 0; do
+    dl=odirect; [ "$direct" = 0 ] && dl=buffered
+    # 4m seq = the shim-parity campaign's t16×4MiB streaming venue.
+    for bs in 4k 64k 256k 1m 4m; do
+        for path in kernel shim; do
+            sh=0; [ "$path" = shim ] && sh=1
             run_row "armed-$path-seq-$bs-$dl" "$sh" seq "$bs" "$direct" "$SEQ_DIR"
         done
     done
@@ -257,9 +292,8 @@ if echo "unarmed" | grep -Eq "$ROW_FILTER" || [ "$ROW_FILTER" = "." ]; then
     mount_fs unarmed
     RAND_DIR="$MOUNT_DIR/rand"; SEQ_DIR="$MOUNT_DIR/seqd"
     mkdir -p "$RAND_DIR" "$SEQ_DIR"; chmod 1777 "$RAND_DIR" "$SEQ_DIR"
-    prealloc_rand "$RAND_DIR"
     for bs in 4k 64k 256k 1m; do
-        run_row "unarmed-kernel-rand-$bs-buffered" 0 rand "$bs" 0 "$RAND_DIR"
+        rand_row "unarmed-kernel-rand-$bs-buffered" 0 "$bs" 0 "$RAND_DIR"
     done
     for bs in 4k 64k 256k 1m; do
         run_row "unarmed-kernel-seq-$bs-buffered" 0 seq "$bs" 0 "$SEQ_DIR"

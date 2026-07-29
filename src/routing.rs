@@ -662,20 +662,34 @@ impl BackendRouter {
         reclaim: &std::sync::Arc<crate::block_reclaim::ReclaimQueue>,
     ) {
         let rq = reclaim.clone();
-        allocator.set_space_pressure_valve(std::sync::Arc::new(move || {
-            // Contract 6: a fenced daemon must not sync-drain — the
-            // queued entries' finish_free belongs to the successor
-            // writer's recovery now; allocation just fails StorageFull
-            // (this daemon is dead until remount anyway).
-            if rq.fence_halted() {
-                return;
-            }
-            if rq.drain_sync() > 0 {
-                METRICS
-                    .block_free_reclaim_sync_drains
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }));
+        let rq_pending = reclaim.clone();
+        allocator.set_space_pressure_valve(
+            std::sync::Arc::new(move || {
+                let rq = rq.clone();
+                Box::pin(async move {
+                    // Contract 6: a fenced daemon must not drain — the
+                    // queued entries' finish_free belongs to the
+                    // successor writer's recovery now; allocation just
+                    // fails StorageFull (this daemon is dead until
+                    // remount anyway).
+                    if rq.fence_halted() {
+                        return;
+                    }
+                    // Contract 2b (probe-up campaign): the drain runs
+                    // OFF the caller's executor thread — only the
+                    // allocating task awaits (see
+                    // ReclaimQueue::drain_off_thread). Supply-wait in
+                    // allocate_block makes this the ESCALATION path,
+                    // not the steady state.
+                    if rq.drain_off_thread().await > 0 {
+                        METRICS
+                            .block_free_reclaim_sync_drains
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            }),
+            std::sync::Arc::new(move || rq_pending.pending()),
+        );
     }
 
     /// Wire the writer-guard fence probe into the reclaim queue

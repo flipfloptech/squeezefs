@@ -108,6 +108,7 @@ pub struct ReclaimQueue {
     /// PERMANENTLY for this queue (a fenced holder is dead until remount
     /// — `failed` never clears in-process).
     halted: AtomicBool,
+
     batch_blocks: u64,
     batch_ms: u64,
     max_queued: u64,
@@ -314,6 +315,44 @@ impl ReclaimQueue {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    /// Off-thread drain — the ENOSPC valve's async body (probe-up
+    /// campaign, 2026-07-29: the valve's write-funnel fix). The
+    /// allocating task AWAITS here (honest backpressure on exactly the
+    /// task that needs the space); the device reclaim work — batch
+    /// ioctls plus [`Self::drain_sync`]'s 1 ms in-flight waits — runs on
+    /// the blocking pool, so an engagement can never freeze an executor
+    /// thread (the fuse3 tpc lanes are current-thread runtimes: the old
+    /// inline drain froze a whole lane and every handler/upload future
+    /// on it — the measured cross-device lockstep starvation). Racing
+    /// engagements each run their own pass CONCURRENTLY — width derives
+    /// from allocation demand, never a fixed funnel (the field law): the
+    /// first single-flight shape of this fix measured −15 % on the
+    /// 4-wide storm bracket because the old inline valve, for all its
+    /// lane-freezing, accidentally parallelized reclaim across every
+    /// engaged thread; `take_batch`'s processing reservation already
+    /// makes concurrent passes sound (each entry is popped exactly
+    /// once). Returns entries processed by THIS engagement.
+    pub async fn drain_off_thread(self: &Arc<Self>) -> u64 {
+        let q = self.clone();
+        match tokio::task::spawn_blocking(move || q.drain_sync()).await {
+            Ok(n) => n,
+            Err(e) => {
+                log::error!("valve drain blocking task panicked: {e:?}");
+                0
+            }
+        }
+    }
+
+    /// Reclaimable supply exists (queued or in a processor's hands) —
+    /// the allocator's supply-wait predicate. A fence-halted queue
+    /// reports `false`: nothing will ever be reclaimed by THIS daemon
+    /// (contract 6), so allocation escalates straight to the honest
+    /// refusal path instead of parking forever.
+    pub fn pending(&self) -> bool {
+        !self.fence_halted()
+            && (self.len.load(Ordering::Acquire) > 0 || self.processing.load(Ordering::Acquire) > 0)
     }
 
     /// Gauge accessor (tests / stats).

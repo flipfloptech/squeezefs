@@ -111,6 +111,11 @@ pub struct ReclaimQueue {
     batch_blocks: u64,
     batch_ms: u64,
     max_queued: u64,
+    /// Test seam (`SQUEEZEFS_TEST_RECLAIM_STALL_MS`): stall each
+    /// processed batch — deterministic slow-device schedules for the
+    /// valve-liveness contract (`enospc_valve_never_blocks_executor_
+    /// threads`). 0 in production.
+    test_stall_ms: u64,
 }
 
 impl ReclaimQueue {
@@ -126,6 +131,7 @@ impl ReclaimQueue {
             batch_blocks: env_u64("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", 64, 1, 1024),
             batch_ms: env_u64("SQUEEZEFS_RECLAIM_BATCH_MS", 2, 0, 600_000),
             max_queued: env_u64("SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS", 4096, 1, 1 << 20),
+            test_stall_ms: env_u64("SQUEEZEFS_TEST_RECLAIM_STALL_MS", 0, 0, 600_000),
         })
     }
 
@@ -323,6 +329,10 @@ impl ReclaimQueue {
     /// Panic-safe accounting: the guard reconciles `processing` and the
     /// byte gauge for every entry, processed or unwound.
     fn process_entries(&self, entries: Vec<ReclaimEntry>) {
+        if self.test_stall_ms > 0 {
+            // Deterministic slow-device seam (test-only; see field doc).
+            std::thread::sleep(std::time::Duration::from_millis(self.test_stall_ms));
+        }
         struct BatchGuard<'a> {
             q: &'a ReclaimQueue,
             remaining: usize,

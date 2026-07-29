@@ -313,6 +313,85 @@ async fn nonterminal_free_queues_nothing() {
 // Contract 2 — the ENOSPC pressure valve.
 // ---------------------------------------------------------------------------
 
+/// Contract 2b (probe-up-governor campaign, 2026-07-29 — the write-funnel
+/// conviction): the ENOSPC valve's device-reclaim work must run OFF the
+/// caller's executor thread. The old shape ran `drain_sync()` (1 ms
+/// thread-sleeps + synchronous device discard/punch ioctls) INLINE in the
+/// allocating task — on the fuse3 tpc lanes (current-thread runtimes)
+/// each engagement froze a whole lane, stalling every handler and upload
+/// future queued there: at steady-state rewrite near volume fill the
+/// valve fires constantly (275 engagements / 30 s measured on the 4-wide
+/// nvmet-tcp rig), so admitted pipeline blocks parked while ALL devices
+/// starved in lockstep — the field's aqu-sz 2–4.5 with a full 512 MiB
+/// pipe. Valve engagement must stall only the ALLOCATING TASK (honest
+/// backpressure), never sibling tasks on the runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enospc_valve_never_blocks_executor_threads() {
+    let _g = serial().await;
+    // Park the background worker (valve-only completion) and stall the
+    // reclaim work itself (the deterministic seam: reclaim = slow device).
+    let _e = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_MS", "600000");
+    let _s = EnvGuard::set("SQUEEZEFS_TEST_RECLAIM_STALL_MS", "300");
+    let (router, ba, _backing, _staging) = make_router().await;
+
+    ba.set_capacity_bytes(4 * CHUNK_SIZE);
+    let mut offsets = Vec::new();
+    for _ in 0..4 {
+        let o = ba.allocate_block().await.expect("fill volume");
+        ba.publish_block(o);
+        offsets.push(o);
+    }
+    for o in &offsets[..2] {
+        router
+            .backend_router
+            .free_block(&o.to_string())
+            .await
+            .expect("terminal free");
+    }
+
+    // Canary: a sibling task on the same runtime. If the valve blocks
+    // executor threads, the timer-driven canary starves.
+    let ticks = Arc::new(AtomicU64::new(0));
+    let t2 = ticks.clone();
+    let canary = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t2.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    // Two concurrent brim allocations on SEPARATE tasks (one per worker
+    // thread — the lane-freeze shape): both engage the (stalled) valve.
+    let t0 = std::time::Instant::now();
+    let ba1 = ba.clone();
+    let ba2 = ba.clone();
+    let h1 = tokio::spawn(async move { ba1.allocate_block().await });
+    let h2 = tokio::spawn(async move { ba2.allocate_block().await });
+    let (a, b) = (h1.await.unwrap(), h2.await.unwrap());
+    let elapsed = t0.elapsed();
+    let a = a.expect("valve must recover the queued space");
+    let b = b.expect("valve must recover the queued space");
+    assert!(offsets[..2].contains(&a) && offsets[..2].contains(&b) && a != b);
+    assert!(
+        elapsed >= std::time::Duration::from_millis(300),
+        "fixture: the stalled valve must actually have engaged \
+         (elapsed {elapsed:?})"
+    );
+
+    let observed = ticks.load(Ordering::Relaxed);
+    canary.abort();
+    // 300+ ms of valve engagement at 5 ms ticks ⇒ a live runtime observes
+    // dozens; a runtime whose workers are frozen in the inline drain
+    // observes ~0 (generous floor: 20).
+    assert!(
+        observed >= 20,
+        "ENOSPC valve engagement must not freeze the runtime's executor \
+         threads — device reclaim belongs on the blocking pool, with only \
+         the ALLOCATING task awaiting (canary ticked {observed}× during \
+         {elapsed:?})"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enospc_pressure_valve_drains_queued_reclaims_before_refusing() {
     let _g = serial().await;

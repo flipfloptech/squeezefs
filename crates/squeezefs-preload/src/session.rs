@@ -548,29 +548,124 @@ impl Session {
         false
     }
 
-    /// Positional ring read into `buf` (chunked to the slab ceiling).
+    /// Positional ring read into `buf` — the read twin of
+    /// [`Session::ring_pwrite`]'s DIALED P3 **large-op ring economy**
+    /// (read-saturation campaign, 2026-07-29):
+    ///
+    /// - Chunks size to the full `max_op_bytes` window via **contiguous
+    ///   multi-slab slot runs** (`claim_run`) — a 1 MiB read is ONE ring
+    ///   op at default geometry, not 16 serial slab RTTs (the daemon has
+    ///   always validated `len ≤ max_op_bytes` + arena bounds; the il
+    ///   streaming-read collapse was purely this client's chunk sizing:
+    ///   measured 16 fabric round trips per MiB of sequential stream).
+    /// - Every chunk of the op is **submitted before any is waited on**
+    ///   (pipelined flights, reaped in offset order), so ops larger than
+    ///   `max_op_bytes` overlap their windows instead of serializing.
+    ///
+    /// POSIX prefix semantics: the reported count is the contiguous
+    /// served prefix ending at the first short (EOF) or failed chunk;
+    /// later in-flight chunks are drained and their results ignored.
+    /// Arena bytes copy out only AFTER the chunk's completion is
+    /// consumed (`wait_consume`'s Acquire orders the daemon's arena
+    /// write before the copy — same rule as the serial path).
     pub fn ring_pread(&self, binding_id: u64, buf: &mut [u8], offset: u64) -> RingOutcome {
-        let mut done = 0usize;
-        while done < buf.len() {
-            let chunk = (buf.len() - done).min(self.slab as usize);
-            match self.one_op(OP_READ, binding_id, offset + done as u64, chunk, None) {
+        let slab = self.slab as usize;
+        // Single-slab ops (the ≤64 KiB hot rows) keep the allocation-free
+        // serial path: one claim, one wait, zero flight bookkeeping.
+        if buf.len() <= slab {
+            return match self.one_op(OP_READ, binding_id, offset, buf.len(), None) {
                 OpResult::Done { slot, n } => {
-                    let n = n.min(chunk);
-                    self.slab_read(slot, &mut buf[done..done + n]);
+                    let n = n.min(buf.len());
+                    self.slab_read(slot, &mut buf[..n]);
                     self.release_slot(slot);
-                    done += n;
-                    if n < chunk {
-                        break; // EOF short read
+                    RingOutcome::Served(n)
+                }
+                OpResult::Errno(e) => RingOutcome::Errno(e),
+                OpResult::Fallthrough => RingOutcome::Fallthrough,
+            };
+        }
+        let max_chunk = (self.geometry.max_op_bytes as usize).max(1);
+        let mut flights: std::collections::VecDeque<WriteFlight> =
+            std::collections::VecDeque::new();
+        let mut submitted = 0usize; // bytes handed to flights
+        let mut done = 0usize; // contiguous served prefix
+        let mut short = false; // a chunk completed short — stop extending
+        let mut failed: Option<i32> = None; // first failure's errno
+        loop {
+            // Submit phase: claim + STAGE every chunk the slot table
+            // allows, then ring-push the batch under ONE doorbell (the
+            // shim-parity batch-publish shape; reads have no arena copy
+            // to stage, so this is claim + descriptor publish only).
+            let mut staged: Vec<WriteFlight> = Vec::new();
+            while failed.is_none() && !short && submitted < buf.len() && !self.poisoned() {
+                let remaining = buf.len() - submitted;
+                let want_bytes = remaining.min(max_chunk);
+                let want_slots = want_bytes.div_ceil(slab).max(1) as u32;
+                let Some((base, gen, run)) = self.claim_run(want_slots) else {
+                    break;
+                };
+                let chunk = want_bytes.min(run as usize * slab);
+                let slot = self.slot(base);
+                slot.publish_descriptor(&SlotDescriptor {
+                    op: OP_READ,
+                    flags: 0,
+                    binding: binding_id,
+                    offset: offset + submitted as u64,
+                    len: chunk as u32,
+                    arena_off: u64::from(base) * self.slab,
+                });
+                slot.core.publish_submitted();
+                staged.push(WriteFlight {
+                    base,
+                    gen,
+                    run,
+                    chunk,
+                });
+                submitted += chunk;
+            }
+            if !staged.is_empty() {
+                for fl in staged {
+                    if !self.ring().push(fl.base) {
+                        // Unreachable for an honest client (slots ≤ ring
+                        // entries) — our state is corrupt; poison loudly.
+                        self.poison();
+                        break;
                     }
+                    flights.push_back(fl);
                 }
-                OpResult::Errno(e) => {
-                    return if done > 0 {
-                        RingOutcome::Served(done) // POSIX short read
-                    } else {
-                        RingOutcome::Errno(e)
-                    };
+                let header = self.header();
+                header.doorbell.fetch_add(1, Ordering::Release);
+                if header.daemon_parked.load(Ordering::SeqCst) != 0 {
+                    futex_wake(&header.doorbell);
                 }
-                OpResult::Fallthrough => {
+            }
+            // Reap phase: consume the oldest (lowest-offset) flight.
+            let Some(fl) = flights.pop_front() else {
+                break; // nothing in flight and nothing submittable
+            };
+            match self.wait_consume(fl.base, fl.gen) {
+                WaitConsume::Done(r) => {
+                    if r < 0 {
+                        if failed.is_none() && !short {
+                            failed = Some((-r) as i32);
+                        }
+                    } else if failed.is_none() && !short {
+                        let n = (r as usize).min(fl.chunk);
+                        // The flight's window starts at the prefix edge by
+                        // reap order (flights reap lowest-offset first and
+                        // `done` only advances on full chunks).
+                        self.slab_read_run(fl.base, &mut buf[done..done + n]);
+                        done += n;
+                        if n < fl.chunk {
+                            short = true; // EOF short read ends the prefix
+                        }
+                    }
+                    self.release_run(fl.base, fl.run);
+                }
+                WaitConsume::Abandoned => {
+                    // §5.4.1 deadline (session now poisoned) or a poison
+                    // broadcast: never reuse the run's slots — the daemon
+                    // may complete into the run's arena arbitrarily late.
                     return if done > 0 {
                         RingOutcome::Served(done)
                     } else {
@@ -579,7 +674,25 @@ impl Session {
                 }
             }
         }
-        RingOutcome::Served(done)
+        if let Some(e) = failed {
+            return if done > 0 {
+                RingOutcome::Served(done)
+            } else if e == libc::EINVAL {
+                // Protocol-class reject on the first chunk: OUR
+                // bookkeeping diverged — the real call is the correct
+                // answer (mirrors `consume`).
+                RingOutcome::Fallthrough
+            } else {
+                RingOutcome::Errno(e)
+            };
+        }
+        if done > 0 || buf.is_empty() {
+            RingOutcome::Served(done)
+        } else {
+            // No slot was ever claimable (client-visible backpressure) or
+            // the session is poisoned: this op takes the real call.
+            RingOutcome::Fallthrough
+        }
     }
 
     /// Positional ring write from `buf` — the DIALED P3 **large-op ring
@@ -1132,7 +1245,20 @@ impl Session {
 
     fn slab_read(&self, slot_idx: u32, out: &mut [u8]) {
         debug_assert!(out.len() as u64 <= self.slab);
-        let off = self.layout.arena_off + u64::from(slot_idx) * self.slab;
+        self.slab_read_run(slot_idx, out);
+    }
+
+    /// Copy the contiguous arena window based at `base`'s slab out into
+    /// `out` — the multi-slab run read (the run's slots are all CLAIMED
+    /// by this thread; callers copy strictly AFTER the completion's
+    /// Acquire and strictly BEFORE releasing the run, so no other
+    /// claimant can overwrite the window mid-copy).
+    fn slab_read_run(&self, base: u32, out: &mut [u8]) {
+        let off = self.layout.arena_off + u64::from(base) * self.slab;
+        debug_assert!(
+            u64::from(base) * self.slab + out.len() as u64 <= self.geometry.arena_bytes,
+            "run window inside the arena by claim_run construction"
+        );
         // SAFETY: as slab_write; the daemon may race writes here only
         // for THIS op's completion, which is ordered by is_done_for's
         // Acquire before this copy.
@@ -1161,8 +1287,10 @@ enum OpResult {
     Fallthrough,
 }
 
-/// One in-flight chunk of a pipelined large write: the submitted base
-/// slot (+ its ABA generation) and the arena-extension run behind it.
+/// One in-flight chunk of a pipelined large op (write OR read — the
+/// read-saturation campaign reuses the flight shape verbatim): the
+/// submitted base slot (+ its ABA generation) and the arena-extension
+/// run behind it.
 struct WriteFlight {
     base: u32,
     gen: u64,

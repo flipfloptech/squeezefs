@@ -1499,7 +1499,11 @@ fn fragmented_slots_still_serve_large_read_via_smaller_runs() {
     match session.ring_pread(bid, &mut buf, 0) {
         RingOutcome::Served(n) => {
             assert_eq!(n, buf.len(), "fragmented slots still serve fully");
-            assert_eq!(buf, read_pattern(0, buf.len()), "byte-exact under fragmentation");
+            assert_eq!(
+                buf,
+                read_pattern(0, buf.len()),
+                "byte-exact under fragmentation"
+            );
         }
         other => panic!("fragmented large read must serve, got {other:?}"),
     }

@@ -1786,9 +1786,12 @@ pub struct DataRouterInner {
     /// `pub` so the pipeline suite can simulate silent moka eviction (the
     /// lane-leak self-repair phase).
     pub stream_lanes: moka::sync::Cache<String, std::sync::Arc<StreamLanes>>,
-    /// §5.5 window cap (`SQUEEZEFS_READ_PREFETCH_WINDOW`, default 16;
-    /// 0 disables the pipeline outright).
-    pub(crate) prefetch_window_cap: u32,
+    /// §5.5 window-cap OVERRIDE (`SQUEEZEFS_READ_PREFETCH_WINDOW`;
+    /// explicit value wins verbatim, railed ≤ 4096; 0 disables the
+    /// pipeline outright). `None` = the budget-derived default
+    /// (`derived_prefetch_window_cap` — no fixed depth, the house
+    /// no-constants law).
+    pub(crate) prefetch_window_override: Option<u32>,
     /// §5.5 contention scaling: prefetch's share of the hot-tier budget
     /// (`SQUEEZEFS_READ_PREFETCH_SHARE_PCT`, default 50).
     pub(crate) prefetch_share_pct: u64,
@@ -2382,15 +2385,30 @@ impl StreamActivityGauge {
 /// it the AIMD start of 2 cannot even double once), cap 4096 (bounds a
 /// pathological budget/block ratio).
 pub fn derived_prefetch_window_cap(share_pct: u64, hot_budget: u64, block_size: u64) -> u32 {
-    let _ = (share_pct, hot_budget, block_size);
-    // Scaffolding at the pre-campaign posture (the fixed cap this
-    // campaign retires) — red against the derivation table.
-    16
+    if block_size == 0 {
+        // Unconfigured geometry (pre-mount router): no basis to derive —
+        // the floor, defensively.
+        return 4;
+    }
+    ((share_pct.min(100) * hot_budget / 100) / block_size).clamp(4, 4096) as u32
 }
 
 /// One §5.5 issue-admission decision: may this lane issue one more
 /// prefetch fetch? `resident_share` is the lane's landed-fill budget in
-/// blocks (`share% × hot_budget / block / active_streams`).
+/// blocks (`share% × hot_budget / block / active_streams`). The two
+/// bounds are split deliberately (the campaign's core change):
+///
+/// - **Landed-unconsumed ≤ resident share** — completed fills occupy the
+///   hot tier until their consumer arrives; the budget must see them.
+///   A share of 0 (the lane cannot retain even ONE block) never
+///   speculates: every fill would be evicted-before-consume by
+///   construction (the §5.5 no-floor rationale, preserved verbatim).
+/// - **In-flight + unconsumed ≤ min(window, cap)** — the AIMD plan
+///   bound. In-flight fetch bytes are transient DMA buffers charged to
+///   R5 via `prefetch_inflight_bytes`, NOT hot-tier residents; charging
+///   them against the resident share (the pre-campaign formula) made
+///   the 16-stream default shape a structurally depth-1 pipeline that
+///   could never overlap fetch latency with consumption.
 pub fn prefetch_issue_admits(
     window: u32,
     cap: u32,
@@ -2398,19 +2416,29 @@ pub fn prefetch_issue_admits(
     in_flight: u32,
     unconsumed: u32,
 ) -> bool {
-    // Scaffolding at the pre-campaign semantics: in-flight fetches are
-    // charged against the resident share (the measured 16-stream
-    // depth-1 starvation) — red against the split-bounds table.
-    let effective = (window.min(cap) as u64).min(resident_share);
-    u64::from(in_flight) + u64::from(unconsumed) < effective
+    if resident_share == 0 {
+        return false;
+    }
+    u64::from(unconsumed) < resident_share
+        && u64::from(in_flight) + u64::from(unconsumed) < u64::from(window.min(cap))
 }
 
-/// One §5.5 window-growth decision (the AIMD up-edge).
-pub fn prefetch_window_grows(will_wait: bool, overran: bool, detect_streak: u32, green: bool) -> bool {
-    let _ = (overran, detect_streak);
-    // Scaffolding at the pre-campaign trigger (foreground-wait only) —
-    // red against the overrun rows.
-    will_wait && green
+/// One §5.5 window-growth decision (the AIMD up-edge): foreground-wait
+/// (the reader caught an in-flight fetch — depth, unconditionally) or a
+/// clean plan overrun (the reader passed the whole issued plan — the
+/// silent-consumption regime's shallowness signal: warm ring serves
+/// never wait on the single flight, so an il stream's only depth
+/// evidence is the front miss). Overrun growth is refused while the
+/// lane carries an evicted-unconsumed streak — growing into
+/// demonstrated starvation feeds the R-5 spiral the AIMD collapse is
+/// fighting. All growth is mem-budget-Green-gated (§5.7).
+pub fn prefetch_window_grows(
+    will_wait: bool,
+    overran: bool,
+    detect_streak: u32,
+    green: bool,
+) -> bool {
+    green && (will_wait || (overran && detect_streak == 0))
 }
 
 /// K = 4 offset lanes per file, so concurrent sequential readers of one
@@ -3075,13 +3103,17 @@ impl DataRouter {
 
         // §5.5 pipeline knobs (env-resolved once; unrecognized values
         // refuse loud, forward-only).
-        let prefetch_window_cap = match std::env::var("SQUEEZEFS_READ_PREFETCH_WINDOW") {
-            Ok(v) => v.trim().parse::<u32>().unwrap_or_else(|e| {
-                panic!("SQUEEZEFS_READ_PREFETCH_WINDOW must be an integer: {e}")
-            }),
-            Err(_) => 16,
-        }
-        .min(16);
+        let prefetch_window_override = match std::env::var("SQUEEZEFS_READ_PREFETCH_WINDOW") {
+            Ok(v) => Some(
+                v.trim()
+                    .parse::<u32>()
+                    .unwrap_or_else(|e| {
+                        panic!("SQUEEZEFS_READ_PREFETCH_WINDOW must be an integer: {e}")
+                    })
+                    .min(4096),
+            ),
+            Err(_) => None,
+        };
         let prefetch_share_pct = match std::env::var("SQUEEZEFS_READ_PREFETCH_SHARE_PCT") {
             Ok(v) => v.trim().parse::<u64>().unwrap_or_else(|e| {
                 panic!("SQUEEZEFS_READ_PREFETCH_SHARE_PCT must be an integer percent: {e}")
@@ -3147,7 +3179,7 @@ impl DataRouter {
                 tier_admission,
                 ranged_threshold,
                 direct_device_true: std::sync::atomic::AtomicBool::new(direct_device_true),
-                prefetch_window_cap,
+                prefetch_window_override,
                 prefetch_share_pct,
                 stream_gauge: StreamActivityGauge::new(),
                 crypto: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
@@ -3711,6 +3743,27 @@ impl DataRouter {
     /// reader's own plan-rebase spans as evictions and froze healthy lanes
     /// (measured: issued ≈ 33, false `evicted_unconsumed` ≈ 1 700 on the
     /// clean row-2 shape).
+    /// §5.5 pipeline kill switch: an explicit
+    /// `SQUEEZEFS_READ_PREFETCH_WINDOW=0`.
+    pub(crate) fn prefetch_disabled(&self) -> bool {
+        self.prefetch_window_override == Some(0)
+    }
+
+    /// The effective §5.5 window cap: the explicit override verbatim,
+    /// else the budget-derived default (`derived_prefetch_window_cap` —
+    /// resolved per touch because the mount's block size lands after
+    /// router construction).
+    pub(crate) fn prefetch_window_cap(&self) -> u32 {
+        match self.prefetch_window_override {
+            Some(v) => v,
+            None => derived_prefetch_window_cap(
+                self.prefetch_share_pct,
+                self.cache.hot_block.max_bytes(),
+                self.block_size.load(Ordering::Relaxed),
+            ),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn pipeline_touch(
         &self,
@@ -3724,7 +3777,7 @@ impl DataRouter {
         will_wait_inflight: bool,
         first_key: Option<&str>,
     ) {
-        if self.prefetch_window_cap == 0 || meta.file_type != "striped" {
+        if self.prefetch_disabled() || meta.file_type != "striped" {
             return;
         }
         // Borrowed-key get first: the warm ring path calls this per op
@@ -3819,31 +3872,58 @@ impl DataRouter {
             return;
         }
 
-        // Foreground caught the pipeline: window ×2 (capped).
-        if will_wait_inflight && mem_level == crate::mem_budget::Level::Green {
+        // Window growth (the AIMD up-edge, one pure decision —
+        // `prefetch_window_grows`): foreground-wait, or a CLEAN plan
+        // overrun. The overrun trigger is the read-saturation campaign's
+        // addition: on the il path warm serves are silent consumption
+        // (they never wait on the single flight), so the only depth
+        // evidence a healthy ring stream produces is the reader passing
+        // the whole issued plan — pre-campaign that shape re-based the
+        // plan without ever growing it, pinning il pipelines at the
+        // start window. `issued_edge`/`issued_base` were loaded above
+        // (consume bookkeeping): `edge > base` = a plan existed;
+        // `end_block ≥ edge` = the reader passed it.
+        let overran = issued_edge > issued_base && end_block >= issued_edge;
+        if prefetch_window_grows(
+            will_wait_inflight,
+            overran,
+            lane.detect_streak.load(Relaxed),
+            mem_level == crate::mem_budget::Level::Green,
+        ) {
             METRICS.prefetch_foreground_waits.fetch_add(1, Relaxed);
-            let _ = lane.window.fetch_update(Relaxed, Relaxed, |w| {
-                Some((w.saturating_mul(2)).min(self.prefetch_window_cap))
-            });
+            let cap = self.prefetch_window_cap();
+            let _ = lane
+                .window
+                .fetch_update(Relaxed, Relaxed, |w| Some((w.saturating_mul(2)).min(cap)));
         }
 
-        // Contention-scaled effective window (§5.5 mechanism ii). NO floor:
+        // Contention-scaled RESIDENT share (§5.5 mechanism ii). NO floor:
         // the doc's formula truncating to 0 is a signal, not an edge case —
         // when the per-lane share of the hot budget cannot retain even ONE
         // block, every speculative fill is guaranteed evicted-before-
         // consume, so the only non-wasteful window is empty (a .max(1)
         // floor here kept 4 contention-phase lanes thrashing a 2-block
-        // budget: 104 fetches for 48 unique — measured).
+        // budget: 104 fetches for 48 unique — measured). Since the
+        // read-saturation campaign the share bounds LANDED-unconsumed
+        // fills only; in-flight depth rides the AIMD window (see
+        // `prefetch_issue_admits` — the split is the campaign's core
+        // change: in-flight DMA bytes are R5-charged transients, not
+        // hot-tier residents, and charging them here made the 16-stream
+        // default shape a structurally depth-1 pipeline).
         let active = self.stream_gauge.touch(lane) as u64;
         let hot_budget = self.cache.hot_block.max_bytes();
-        let share_blocks = self.prefetch_share_pct * hot_budget / 100 / block_size.max(1) / active;
-        let window = lane.window.load(Relaxed).min(self.prefetch_window_cap);
-        let effective = (window as u64).min(share_blocks) as u32;
+        let resident_share =
+            self.prefetch_share_pct * hot_budget / 100 / block_size.max(1) / active;
+        let cap = self.prefetch_window_cap();
+        let window = lane.window.load(Relaxed);
+        // The plan bound (the gauge's meaning is unchanged: how deep the
+        // pipeline may currently run).
+        let plan_bound = u64::from(window.min(cap));
         let hwm = METRICS.prefetch_window_hwm.load(Relaxed);
-        if (effective as u64) > hwm {
-            METRICS.prefetch_window_hwm.store(effective as u64, Relaxed);
+        if plan_bound > hwm {
+            METRICS.prefetch_window_hwm.store(plan_bound, Relaxed);
         }
-        if effective == 0 {
+        if resident_share == 0 {
             return;
         }
 
@@ -3855,8 +3935,9 @@ impl DataRouter {
             lane.issued_base.store(end_block + 1, Relaxed);
         }
 
-        // Top up: resident-unconsumed + in-flight bounded by the window
-        // (§5.5 mechanism i — issue stops; the spiral cannot start), and
+        // Top up: landed-unconsumed bounded by the resident share,
+        // in-flight + unconsumed bounded by the AIMD window (§5.5
+        // mechanism i — issue stops; the spiral cannot start), and
         // gated by the progress-clocked quiescence arm (sustained
         // starvation pauses issue instead of re-feeding the evict cycle).
         if lane.consumed_edge.load(Relaxed) < lane.suppress_until_edge.load(Relaxed) {
@@ -3866,7 +3947,7 @@ impl DataRouter {
         loop {
             let in_flight = lane.inflight.load(Relaxed);
             let unconsumed = lane.unconsumed.load(Relaxed);
-            if in_flight.saturating_add(unconsumed) >= effective {
+            if !prefetch_issue_admits(window, cap, resident_share, in_flight, unconsumed) {
                 break;
             }
             let next = lane.next_prefetch_block.load(Relaxed);
@@ -3946,7 +4027,7 @@ impl DataRouter {
         len: u32,
         missed: bool,
     ) {
-        if len == 0 || self.prefetch_window_cap == 0 {
+        if len == 0 || self.prefetch_disabled() {
             return;
         }
         let looked_up;

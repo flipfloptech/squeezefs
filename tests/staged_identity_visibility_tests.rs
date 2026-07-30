@@ -717,18 +717,17 @@ async fn warm_read_loop_yields_to_peer_tasks_on_one_worker() {
 
     // Warm the serve once: the loop below must be all-RAM Ready-immediate.
     let file_path = squeezefs::keys::inode_path(ino);
-    let (data, _b) = h
-        .fs
-        .router
-        .read_file_range_zero_copy(
-            &file_path,
-            0,
-            1024,
-            None,
-            squeezefs::routing::ReadClassHint::default(),
-        )
-        .await
-        .expect("warmup read");
+    let (data, _b) =
+        h.fs.router
+            .read_file_range_zero_copy(
+                &file_path,
+                0,
+                1024,
+                None,
+                squeezefs::routing::ReadClassHint::default(),
+            )
+            .await
+            .expect("warmup read");
     assert_eq!(data.len(), 1024);
 
     let flag = Arc::new(AtomicBool::new(false));

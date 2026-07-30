@@ -261,7 +261,7 @@ fn publish_coalesce_cell() -> &'static std::sync::atomic::AtomicI64 {
     })
 }
 
-/// Current publish-coalesce cap (see [`publish_coalesce_cell`]).
+/// Current publish-coalesce cap (see `publish_coalesce_cell`).
 pub fn publish_coalesce_max() -> usize {
     publish_coalesce_cell().load(std::sync::atomic::Ordering::Relaxed) as usize
 }
@@ -297,7 +297,7 @@ fn layout_delta_chain_cell() -> &'static std::sync::atomic::AtomicI64 {
     })
 }
 
-/// Current layout-delta chain cap (see [`layout_delta_chain_cell`]).
+/// Current layout-delta chain cap (see `layout_delta_chain_cell`).
 pub fn layout_delta_max_chain() -> u32 {
     layout_delta_chain_cell().load(std::sync::atomic::Ordering::Relaxed) as u32
 }

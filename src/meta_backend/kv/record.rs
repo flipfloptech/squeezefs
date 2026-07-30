@@ -1015,7 +1015,7 @@ impl FoldedHead {
 /// - `Put` ⇒ the new value (LWW — shadows everything below);
 /// - `Delete` ⇒ tombstone (shadows everything below);
 /// - `Delta` onto a live head ⇒ class-branched (the
-///   [`fold_deltas_onto_put`] algebra run one step at a time): an inode
+///   `fold_deltas_onto_put` algebra run one step at a time): an inode
 ///   delta is [`InodeDelta::apply`] onto the decoded base (decoding it
 ///   first only if the head was a borrowed plain-`Put`); a **layout
 ///   delta** ([`crate::layout_wire`] magic) folds the head's

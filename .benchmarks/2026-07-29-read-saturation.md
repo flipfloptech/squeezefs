@@ -1,6 +1,8 @@
 # 2026-07-29 — Read saturation: large-op ring reads, ring-fed stream classification, the prefetch window economy, and the transient stream window
 
-Branch `perf/read-saturation` off dev tip `b26c293`. Commits: red
+Branch `perf/read-saturation` off dev tip `b26c293`, rebased onto
+`fcde1dc` for landing (§8.8 — commit map, semantic rebase check, and
+the confirmation bracket vs the current base). Commits: red
 `a5ba2db` (large-op ring READ economy contracts), green `b1e4b16`
 (multi-slab pipelined `ring_pread`), red `fde3da0` (ring reads must
 feed the classifier/pipeline), green `af342aa` (ring-side lane feed +
@@ -456,7 +458,12 @@ brackets (il ≥ kern on every CAMP window).
   parity + §3 rule-4 engagement, dup/close_range/lseek, fio libaio
   verify, kill-9 + fork-kill-parent soaks, direct-drive kill-9 soak
   engaged +15,360 serves, zero residue) PASSED.
-- **statfs ×10 loaded soak**: <!-- STATFS -->
+- **statfs ×10 loaded soak**: **30/30 green, 0 hangs** on the rebased
+  tip `817f4af` (load recipe: looping fat release build with `touch
+  src/lib.rs` per iteration in a second worktree, live for the whole
+  window — loadavg 2.3–5.3; 82–89 s/roll under the 2.0–2.2 GHz
+  governor vs the 62 s quiet nominal), fusectl waiting-connections
+  residue sweep clean, zero squeezefs mounts left behind.
 - **Loom**: not owed — the new tier/governor state is single-word
   `Relaxed` atomics with no cross-word invariant (the GhostTable /
   EntryState racy-tolerance class, documented on the types).
@@ -481,7 +488,105 @@ brackets (il ≥ kern on every CAMP window).
   borderline sets earn their credit back.
 - The two brackets ran under materially different ambient load
   (labeled per side); the quiet-box confirmation pass of the
-  warm/flagship rows remains cheap insurance when the box frees up —
-  bracket A (which had the quieter CAMP2/BASE2 windows) is the
-  cleaner read on those two rows.
+  warm/flagship rows was owed — **delivered in §8.8** (flag 1.00×,
+  warm 1.03× on the campaign-only window, vs the CURRENT dev base).
+
+### 8.8 Rebase onto `fcde1dc` + the confirmation bracket vs the CURRENT base (closing session, 2026-07-30)
+
+Brackets A+B (§8.5) ran vs the `b26c293`/`778d6d0`-class base. Dev
+then landed the probe-up write governor + the async-reclaim ENOSPC
+valve (`778d6d0..fcde1dc`) and the branch was **rebased onto
+`fcde1dc`** — textually clean (no overlapping hunks; the dev range
+touches `src/routing.rs`/`src/fuse_client.rs` only in write-path
+regions). Semantic check, both named suspects:
+
+- **Stream/prefetch window vs `ProbeCore`** (the probe-up governor):
+  same posture family — growth only on demand evidence
+  (foreground-wait / clean overrun ↔ saturated-epoch delivery
+  response), refusal under waste evidence (evicted-unconsumed streak ↔
+  dead-gain backoff), both R5-Green-gated — but **fully disjoint
+  state**: read-lane AIMD windows vs the write pipeline's depth
+  multiplier share no code, counters, or feedback loop. No coupling to
+  re-verify beyond the bracket below.
+- **Async valve blocking-pool usage** (`a9f50a6`): the valve's
+  `spawn_blocking` drains live in `src/block_reclaim.rs` /
+  `write_pipeline` — untouched by this campaign. The campaign's
+  `spawn_bg` never touches the blocking pool: caller's runtime when
+  present, else `fuse3::raw::tpc_spawn` (the 2026-07-26
+  handoff-economy venue rule), with the admitted/shed verdict rolling
+  back issue-side accounting on shed.
+
+**Commit map** (the §§1–8.7 evidence hashes are the pre-rebase
+identities of the binaries that ran those brackets; the rebased
+branch): `a5ba2db→d3d43ea`, `b1e4b16→9b38b95`, `fde3da0→2725dbd`,
+`af342aa→175ebdb`, `9829d02→e7d30e1`, `d50b119→d97864b` (+
+`f60a6dc`/`d76b809` warm-laneless pair), `e3db374→bae7768`,
+`8a5d2e4→84579b3`, `3623139→d09440f`; bracket build points `0e984a8`
+(§5) and `0b60160` (§8.4) are superseded by the rebased tip.
+
+**The confirmation bracket** (`/tmp/rsat/confirm_bracket.sh`,
+artifacts `/tmp/rsat/confirm-final/`): CAMP = rebased tip `817f4af`
+pair vs BASE = **dev tip `fcde1dc`** pair (both clean KD-7
+identities, `--version` verified per build). rsat nvmet-tcp devsub,
+fresh format + il-written dataset per side, fresh mount per cold rep,
+order CAMP1-BASE1-BASE2-CAMP2, medians of 3, ≥60 s per row (field
+90 s), engagement enforced per row by the rig (abort on
+`ipc_ops_read Δ = 0` or `read_device_true_reads ≠ 0` — zero aborts).
+**Campaign-only window**: no sibling campaign load (per-row loadavg
+logged is dominated by our own runnable threads — field CAMP rows
+28–34 = their own 32 elbencho threads actually running; BASE field
+rows 12–15 because theirs sit in fabric RTTs).
+
+| row (median, side-median means) | CAMP1 | BASE1 | BASE2 | CAMP2 | camp/base |
+|---|---|---|---|---|---|
+| **field** (elbencho t32 4k O_DIRECT seq infloop 32×512 MiB, 90 s) | 1,250,902 | 253,472 | 254,971 | 1,220,372 | **4.86×** — BASE sits ON the field floor (253–255k ≈ the field's 307k, `rareq-sz` 7 KiB, 13.8–14.0M direct-drive RTTs of ~22.9M ops); CAMP serves whole blocks (`rareq-sz` ~4,090 KiB, dd ≤ 247 of ~110–117M ops), flat (first-done vs last-done IOPS within 0.01 %) |
+| il seq-1M sustained (fio psync t16 looped, 60 s) | 7,477 | 5,925 | 5,715 | 7,412 | **1.28×** (MiB/s) — CAMP 1.00 ring op/MiB + engaged pipeline (~530 issues/row); BASE per-64 KiB-chunk direct-drive (dd ≈ 16/user-op, `rareq` 68 KiB); 7.4 GiB/s ≈ 0.28× of §8.5's 26.9 GiB/s raw memcpy ceiling (the §7 serve-path copy residual owns the gap) |
+| il rand-4k t32qd32 churn (flagship) | 324,000 | 328,000 | 325,000 | 330,000 | **1.00×** — governor posture identical (denials 14.8–15.9M vs BASE 13.6–17.1M against ~19–20M dd serves/row both sides); `evicted_unhit` 131–750/row both sides |
+| il warm rand-4k fit-small (t16 qd8) | 1,033,000 | 1,048,000 | 890,000 | 969,000 | **1.03×** — never below 941k in any CAMP rep; the quiet-box read on the row brackets A/B saw at 1.02×/0.83× under variable load |
+
+**The ledger on the confirmation rows** (per-row deltas, medians):
+field CAMP wasted 34.0–34.6 GB / 90 s ÷ device 7.4–7.8 GB/s = **5.0 %**
+(the `fill_pct` bound, holding vs 42 % unfixed); transients carried
+~144k grants/row, denials ≤ 205, `evicted_unhit` ≤ 1. Flagship: CAMP
+wasted 4.2–4.7 % of device vs BASE 4.2–4.6 % — **scan resistance not
+regressed on random churn** (the fix's contract, reconfirmed vs the
+current base). Warm: the §8.7 borderline-fit-small residual's ledger
+face reproduced exactly as recorded — CAMP classifies the fit-small
+set (~17–19k classify events) and pays ~3.4 GB/s of device re-reads
+(`rareq` 42–50 KiB) vs BASE's 0.6 GB/s, with the clamp engaging on
+both sides (CAMP 108–144k denials first-rep decaying to 0.8–6k; BASE
+278–365k first-rep then 0) — IOPS lands 1.03× because the row is
+service-thread-CPU-bound (§5's named limiter); the §8.7 refinement
+(clear `stream_admitted` on real block reuse) remains the named
+lever.
+
+**Thermal validity, labeled:** the external 2.0–2.2 GHz governor ran
+throughout (as for every row in this note). seq1m/flagship reps: 0
+governor steps. Field CAMP reps each overlapped exactly 1 step (plus
+warm CAMP1 r3 / CAMP2 r1): the row **self-heats** — 1.2M IOPS across
+32 threads trips the 85 °C step within its own window, so a re-take
+can never produce a step-free rep at this clock (BASE at the 254k
+floor never trips it). The error direction is strictly against CAMP
+(part of each row at 2.0 GHz), within-side rep spread is ±2 %, and
+the 4.86× verdict stands with the step counted against it.
+
+**Gates on the rebased tip `817f4af`, from zero:** first attempt
+aborted per the fail-fast law — `async_block_reclaim_tests::field_
+rewrite_free_list_regime_runs_off_the_write_path` (dev's own
+`aa8c5e9` valve-liveness contract, wall-clock deadlines) failed while
+the BASE pair's 9m54s fat release build saturated the box;
+attributable load flake, count restarted from zero on the quiet box
+(`/tmp/rsat/gate4-rebased.log`): clippy `-D warnings` clean, `fmt
+--check` clean, `cargo test --all-features -- --test-threads=1` exit
+0, `cargo doc --no-deps` generated, bench smoke 26/26. **Loom**
+(`tests/run_loom.sh`, the full model suite from zero on the tip):
+**52/52 ok** — cheap insurance on top of the §8.6 not-owed ruling; no
+model touches campaign state. **Preload gate legs 1+2** PASSED
+end-to-end on the final pair (`/tmp/rsat/preload-gate3.log` — mount
+parity + engagement, dup/close_range/lseek, fio libaio verify,
+foreign-netns rendezvous, kill-9 + fork-kill-parent soaks, libaio
+lifecycle ×3, direct-drive kill-9 soak engaged +15,360 serves, zero
+residue). **statfs ×10 loaded soak**: §8.6's 30/30 on this tip.
+Substrates torn down after the last row (`dev_substrate.sh status`
+reports none); no stray mounts.
 

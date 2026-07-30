@@ -1045,10 +1045,15 @@ async fn test_write_through_reused_key_purges_stale_read_tiers() {
     // sandbox block size a whole-block aligned overwrite is W1
     // patch-ELIGIBLE (in place, same key — no displace, no reuse), which
     // starves the machinery under test; disable the patch route for this
-    // test only. On real 4 MiB-block volumes whole-block overwrites always
-    // ride this CoW path (the 512 KiB patch cap forbids block-covering
-    // patches), so the pinned machinery is the production path.
+    // test only. Same for the write-wall iteration-1 default in-place
+    // overwrite (whole-block face of the same law — it would land block
+    // 1 in place, no displace, no reuse); its own purge law is pinned in
+    // `tests/inplace_overwrite_tests.rs`. On real 4 MiB-block volumes
+    // ineligible shapes (clone-shared, transformed, decorated) still
+    // ride this CoW path, so the pinned machinery stays a production
+    // path.
     squeezefs::fuse_client::set_patch_max_bytes(0);
+    squeezefs::fuse_client::set_inplace_overwrite(false);
     let block = 65536usize;
     let ino = create(&h, "reuse_purge").await;
     let path = format!("inode_{ino}");
@@ -1131,6 +1136,7 @@ async fn test_write_through_reused_key_purges_stale_read_tiers() {
         "reused block key served the dead incarnation's cached bytes — the \
          no-put write-through owner must purge the key's read tiers"
     );
+    squeezefs::fuse_client::set_inplace_overwrite(true);
 }
 
 // ---------------------------------------------------------------------------

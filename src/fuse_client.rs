@@ -2528,6 +2528,24 @@ pub struct Metrics {
     /// this daemon was fenced — always investigate alongside
     /// `writer_guard_fenced`.
     pub block_free_reclaim_fence_halts: Align64<AtomicU64>,
+    /// At-cap inline-backpressure engagements on the ENQUEUE path (the
+    /// 2026-07-31 write-wall campaign's rewrite-wall engagement
+    /// instrument): a terminal free found the queue at
+    /// `SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS` and processed its reclaim
+    /// INLINE — a device round-trip back on the write path. The arm is
+    /// the conservation-over-latency backstop and **must stay 0**: the
+    /// worker's demand-derived parallel lanes are sized to outrun any
+    /// sustainable displacement rate (contract 10,
+    /// `tests/async_block_reclaim_tests.rs`); growth here means the
+    /// drain is losing to displacement again (the field's 6.3 GB/s
+    /// rewrite wall: queue pinned at cap, most discards inline).
+    pub block_free_reclaim_inline_spills: Align64<AtomicU64>,
+    /// Device reclaim COMMANDS issued (BLKDISCARD / PUNCH_HOLE calls,
+    /// success or refusal) — the command-economy face of adjacent-range
+    /// coalescing: `block_free_{discards,file_punches}` stay per-BLOCK
+    /// (the field ledger), this counts per-COMMAND, so
+    /// blocks ÷ commands is the live coalesce factor (contract 11).
+    pub block_free_reclaim_commands: Align64<AtomicU64>,
     /// Seed-time memset bytes elided by §5.3 coverage tracking: for every
     /// Fresh accumulation buffer reaching content-validity, the block size
     /// minus the complement bytes actually zeroed. Sequential fills elide
@@ -4741,6 +4759,8 @@ impl SqueezefsFilesystem {
                 "block_free_reclaim_batches": METRICS.block_free_reclaim_batches.load(Ordering::Relaxed),
                 "block_free_reclaim_sync_drains": METRICS.block_free_reclaim_sync_drains.load(Ordering::Relaxed),
                 "block_free_reclaim_fence_halts": METRICS.block_free_reclaim_fence_halts.load(Ordering::Relaxed),
+                "block_free_reclaim_inline_spills": METRICS.block_free_reclaim_inline_spills.load(Ordering::Relaxed),
+                "block_free_reclaim_commands": METRICS.block_free_reclaim_commands.load(Ordering::Relaxed),
                 // RW1 rand-write device-byte ledger (design-random-small-
                 // writes §1.2 buckets; always-on — the G-RW2 gate's
                 // attribution source).

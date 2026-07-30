@@ -44,13 +44,43 @@
 //!   blocking pool (`spawn_blocking`), never on a tokio worker and never
 //!   on the FUSE write path.
 //!
+//! * **Demand-derived parallel drain** (2026-07-31 write-wall campaign —
+//!   the rewrite-wall fix; contract 10, `tests/async_block_reclaim_tests.rs`):
+//!   the field capture (4-node NVMe-oF/TCP, mid-rewrite at 6.3 GB/s)
+//!   showed the queue pinned at its cap (17.4 GB ≈ 4,153 × 4 MiB;
+//!   196,747 queued vs 589 worker batches) — the single serial worker
+//!   drained ~500 blocks/s against ~1,650 blocks/s of displacement, so
+//!   the at-cap inline-backpressure arm became the STEADY STATE and put
+//!   the discard stream back on the write path (the exact stream the
+//!   2026-07-27 campaign moved off it). The worker now fans each popped
+//!   span out across parallel blocking-pool lanes: group by device, sort
+//!   by offset, chunk CONSECUTIVE slices of the sorted order (adjacency
+//!   runs survive — coalescing happens inside each lane), one lane per
+//!   `batch_blocks` of that device's queued demand, capped at
+//!   `lanes_per_dev` — width = Σ over backends of min(demand, cap), the
+//!   "backends × demand" law: a shallow queue keeps today's single-lane
+//!   shape, a displacement storm overlaps up to `lanes_per_dev` fabric
+//!   round-trips per device. Every entry stays `processing`-reserved for
+//!   its lane's whole lifetime (valve/pending/drain predicates exact),
+//!   the fence check runs per lane, and per-block counting is unchanged.
+//!   Engagement instruments: `block_free_reclaim_inline_spills` (at-cap
+//!   inline processing — **must stay 0**) and
+//!   `block_free_reclaim_commands` (device commands; blocks ÷ commands =
+//!   the live coalesce factor).
+//!
 //! Knobs (read at queue construction — i.e. per `BackendRouter`):
 //! `SQUEEZEFS_RECLAIM_BATCH_BLOCKS` (max entries per worker batch,
 //! default 64, clamp 1..=1024), `SQUEEZEFS_RECLAIM_BATCH_MS`
 //! (accumulation window after first wake, default 2, clamp 0..=600000 —
-//! large values park the worker, used by tests), and
+//! large values park the worker, used by tests),
 //! `SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS` (bounded-memory cap, default
-//! 4096; an enqueue past the cap processes INLINE as backpressure).
+//! 4096; an enqueue past the cap processes INLINE as backpressure), and
+//! `SQUEEZEFS_RECLAIM_LANES_PER_DEV` (per-device parallel-drain lane
+//! cap, default 8, clamp 1..=64 — 8 overlapped DSM deallocates per
+//! device multiply the field's serial ~500 blocks/s drain well past any
+//! displacement rate a write stream can sustain, while staying far
+//! under NVMe queue depths and bounding blocking-pool footprint at
+//! backends × 8 threads during a storm).
 
 use crate::block_allocator::{BlockAllocator, InflightAllocGuard};
 use crate::fuse_client::METRICS;
@@ -112,6 +142,10 @@ pub struct ReclaimQueue {
     batch_blocks: u64,
     batch_ms: u64,
     max_queued: u64,
+    /// Per-device parallel-drain lane cap (see module docs, demand-derived
+    /// parallel drain). Width in use = Σ over devices of
+    /// min(ceil(device demand / batch_blocks), this).
+    lanes_per_dev: u64,
     /// Test seam (`SQUEEZEFS_TEST_RECLAIM_STALL_MS`): stall each
     /// processed batch — deterministic slow-device schedules for the
     /// valve-liveness contract (`enospc_valve_never_blocks_executor_
@@ -132,6 +166,7 @@ impl ReclaimQueue {
             batch_blocks: env_u64("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", 64, 1, 1024),
             batch_ms: env_u64("SQUEEZEFS_RECLAIM_BATCH_MS", 2, 0, 600_000),
             max_queued: env_u64("SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS", 4096, 1, 1 << 20),
+            lanes_per_dev: env_u64("SQUEEZEFS_RECLAIM_LANES_PER_DEV", 8, 1, 64),
             test_stall_ms: env_u64("SQUEEZEFS_TEST_RECLAIM_STALL_MS", 0, 0, 600_000),
         })
     }
@@ -181,6 +216,16 @@ impl ReclaimQueue {
             .block_free_reclaim_queued
             .fetch_add(1, Ordering::Relaxed);
         if self.len.load(Ordering::Acquire) >= self.max_queued {
+            // The conservation-over-latency backstop — and a device
+            // round-trip back on the write path, so its engagement is
+            // counted LOUD (`block_free_reclaim_inline_spills`, must
+            // stay 0): the parallel worker lanes are sized to outrun
+            // any sustainable displacement rate (contract 10; the
+            // field's rewrite wall was this arm running as the steady
+            // state).
+            METRICS
+                .block_free_reclaim_inline_spills
+                .fetch_add(1, Ordering::Relaxed);
             self.processing.fetch_add(1, Ordering::AcqRel);
             METRICS
                 .block_free_reclaim_queue_bytes
@@ -232,28 +277,17 @@ impl ReclaimQueue {
                 }
                 loop {
                     let Some(q) = weak.upgrade() else { return };
-                    let batch = q.take_batch(q.batch_blocks as usize);
+                    // Demand-derived take: up to one full fan-out's
+                    // worth per pass (batch_blocks × lanes_per_dev) — a
+                    // deep queue fills every lane, a shallow one stays a
+                    // single batch, and the bigger sorted span coalesces
+                    // MORE adjacency than per-batch windows could.
+                    let take = (q.batch_blocks * q.lanes_per_dev) as usize;
+                    let batch = q.take_batch(take);
                     if batch.is_empty() {
                         break;
                     }
-                    METRICS
-                        .block_free_reclaim_batches
-                        .fetch_add(1, Ordering::Relaxed);
-                    // Synchronous ioctls — blocking pool, never a tokio
-                    // worker (see module doc, io_uring posture).
-                    let res = tokio::task::spawn_blocking(move || {
-                        let n = batch.len();
-                        q.process_entries(batch);
-                        n
-                    })
-                    .await;
-                    if res.is_err() {
-                        // Panic in the blocking task: the batch guard
-                        // already reconciled the counters; entries were
-                        // dropped (guards deregistered) — fsck C6 heals
-                        // any begin_free limbo. Loud, never silent.
-                        log::error!("block-reclaim batch panicked; see fsck C6");
-                    }
+                    q.dispatch_lanes(batch).await;
                 }
             }
         });
@@ -278,6 +312,57 @@ impl ReclaimQueue {
             }
         }
         out
+    }
+
+    /// Fan one popped span out across demand-derived parallel lanes (the
+    /// 2026-07-31 write-wall campaign's rewrite-wall fix; contract 10):
+    /// group by device, sort by offset, chunk CONSECUTIVE slices of the
+    /// sorted order (adjacency runs survive into each lane's coalescer),
+    /// one blocking-pool lane per `batch_blocks` of that device's queued
+    /// demand, capped at `lanes_per_dev` — width = Σ over backends of
+    /// min(demand, cap), never a fixed funnel. Awaits every lane before
+    /// returning (the worker never outruns its own submissions); entries
+    /// stay `processing`-reserved throughout, so the valve/pending/drain
+    /// predicates observe them exactly as before. Synchronous ioctls stay
+    /// on the blocking pool, never a tokio worker (module doc, io_uring
+    /// posture); the fence check runs per lane inside `process_entries`.
+    async fn dispatch_lanes(self: &Arc<Self>, entries: Vec<ReclaimEntry>) {
+        let mut by_dev: BTreeMap<String, Vec<ReclaimEntry>> = BTreeMap::new();
+        for e in entries {
+            by_dev.entry(e.device_path.clone()).or_default().push(e);
+        }
+        let mut lanes = Vec::new();
+        for (_dev, mut group) in by_dev {
+            group.sort_by_key(|e| e.offset);
+            let n_lanes = group
+                .len()
+                .div_ceil(self.batch_blocks.max(1) as usize)
+                .clamp(1, self.lanes_per_dev as usize);
+            let chunk = group.len().div_ceil(n_lanes);
+            let mut it = group.into_iter();
+            loop {
+                let c: Vec<ReclaimEntry> = it.by_ref().take(chunk).collect();
+                if c.is_empty() {
+                    break;
+                }
+                METRICS
+                    .block_free_reclaim_batches
+                    .fetch_add(1, Ordering::Relaxed);
+                let q = self.clone();
+                lanes.push(tokio::task::spawn_blocking(move || {
+                    q.process_entries(c);
+                }));
+            }
+        }
+        for lane in lanes {
+            if lane.await.is_err() {
+                // Panic in a lane: the batch guard already reconciled
+                // the counters; entries were dropped (guards
+                // deregistered) — fsck C6 heals any begin_free limbo.
+                // Loud, never silent.
+                log::error!("block-reclaim lane panicked; see fsck C6");
+            }
+        }
     }
 
     /// Synchronously drain the queue to empty AND wait out in-flight
@@ -490,6 +575,12 @@ fn reclaim_device_group(device_path: &str, group: &[ReclaimEntry]) {
     }
 
     for (start, len, k) in ranges {
+        // Per-COMMAND economy counter (contract 11): blocks ÷ commands is
+        // the live coalesce factor; the per-block ledger stays on the
+        // punch/discard/skip counters below.
+        METRICS
+            .block_free_reclaim_commands
+            .fetch_add(1, Ordering::Relaxed);
         match op {
             FreeReclaimOp::FilePunch => {
                 let r = unsafe {

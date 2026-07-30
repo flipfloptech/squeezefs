@@ -261,6 +261,18 @@ pub struct JournalRing {
     space_notify: tokio::sync::Notify,
     /// Wakes `wait_completed_upto` waiters when the watermark advances.
     completion_notify: tokio::sync::Notify,
+    /// **Per-volume** mirror of the global `META_KV_JOURNAL_ENTRIES`
+    /// accounting (perf/meta-plane-writes, 2026-07-30): entries written
+    /// into THIS ring. The process-global counter cannot attribute
+    /// journal traffic to a volume — the exact blindness that let the
+    /// field's one-volume meta-plane ceiling (its sibling at 0.00
+    /// device-writes/s) hide from the stats inode. Surfaced as
+    /// `meta_kv_journal_entries_per_volume`.
+    written_entries: std::sync::atomic::AtomicU64,
+    /// Per-volume mirror of `META_KV_JOURNAL_BYTES` (`res.len` per
+    /// committed entry, headers included). Surfaced as
+    /// `meta_kv_journal_bytes_per_volume`.
+    written_bytes: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -322,6 +334,8 @@ impl JournalRing {
             inflight: Mutex::new(Inflight::default()),
             space_notify: tokio::sync::Notify::new(),
             completion_notify: tokio::sync::Notify::new(),
+            written_entries: std::sync::atomic::AtomicU64::new(0),
+            written_bytes: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -366,6 +380,8 @@ impl JournalRing {
             }),
             space_notify: tokio::sync::Notify::new(),
             completion_notify: tokio::sync::Notify::new(),
+            written_entries: std::sync::atomic::AtomicU64::new(0),
+            written_bytes: std::sync::atomic::AtomicU64::new(0),
         };
         Ok((ring, recovery))
     }
@@ -376,6 +392,21 @@ impl JournalRing {
     /// three phases.
     pub fn core(&self) -> &JournalCore {
         &self.core
+    }
+
+    /// Journal entries written into THIS ring since open — the per-volume
+    /// attribution instrument (`meta_kv_journal_entries_per_volume`; see
+    /// the field-conviction note on the struct field).
+    pub fn written_entries(&self) -> u64 {
+        self.written_entries
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Entry bytes written into THIS ring since open (headers included) —
+    /// `meta_kv_journal_bytes_per_volume`.
+    pub fn written_bytes(&self) -> u64 {
+        self.written_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Non-parking admission (the checkpoint task's own records, §4.4
@@ -571,6 +602,10 @@ impl JournalRing {
         // pages (headers included) — one half of the v3 device-byte story.
         super::META_KV_JOURNAL_BYTES.fetch_add(res.len, std::sync::atomic::Ordering::Relaxed);
         super::META_KV_JOURNAL_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.written_bytes
+            .fetch_add(res.len, std::sync::atomic::Ordering::Relaxed);
+        self.written_entries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -608,6 +643,10 @@ impl JournalRing {
         let bytes: u64 = parts.iter().map(|(r, _)| r.len).sum();
         super::META_KV_JOURNAL_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         super::META_KV_JOURNAL_ENTRIES
+            .fetch_add(parts.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.written_bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        self.written_entries
             .fetch_add(parts.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }

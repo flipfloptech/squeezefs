@@ -5173,6 +5173,19 @@ impl SqueezefsFilesystem {
                     "meta_kv_journal_full_stalls".into(),
                     per_volume(&|be| be.journal_full_stalls()),
                 );
+                // perf/meta-plane-writes (2026-07-30): per-volume journal
+                // write attribution — the field-adjudication instrument
+                // for the one-volume meta-plane ceiling (a balanced set
+                // shows every volume moving; the conviction's shape was
+                // volume 0 at ~21-25k device-writes/s, volume 1 at 0.00).
+                metrics.insert(
+                    "meta_kv_journal_entries_per_volume".into(),
+                    per_volume(&|be| be.journal_ring().written_entries()),
+                );
+                metrics.insert(
+                    "meta_kv_journal_bytes_per_volume".into(),
+                    per_volume(&|be| be.journal_ring().written_bytes()),
+                );
                 metrics.insert(
                     "meta_kv_free_extents".into(),
                     per_volume(&|be| be.free_extents()),

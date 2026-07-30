@@ -449,6 +449,8 @@ Extending the stats-inode JSON (AGENTS.md: prefer live signals), all counters on
 | `meta_format_version` | per-volume string | `"2"` / `"3"` |
 | `meta_kv_node_cache_hits` / `_misses` / `_evictions` / `_bytes` | counters/gauge | hit rate is the Stat-regression early signal |
 | `meta_kv_node_appends` / `_compactions` / `_splits` | counters | compaction:append ratio > ~1:8 ⇒ node_size or cadence mistuned |
+| `meta_kv_node_freeze_shadow_dropped` | counter | freeze-time shadow-fold engagement (2026-07-30 meta-plane-writes): overlay records excluded from frozen bsets because a newer same-key `Put`/`Delete` in the same freeze shadows them (fold algebra §4.2) — high under same-key commit storms by design; 0 on such a workload ⇒ the fold regressed |
+| `meta_kv_journal_entries_per_volume` / `_bytes_per_volume` | per-volume arrays | journal attribution — the meta-plane balance instrument (`.benchmarks/2026-07-30-meta-plane-writes.md`): every volume of a healthy multi-volume set moves under load; one volume saturated with its sibling at 0 = placement/routing regression |
 | `meta_kv_node_lock_wait_ns` | histogram | successor of `meta_sector_lock_wait_ns`; the §4.2 revisit-shard-trees trigger |
 | `meta_kv_journal_bytes` / `_entries` / `_reservation_cas_retries` / `_full_stalls` | counters | `_full_stalls` counts **ring-admission parks** (§4.4 pt 5 — before any node lock); > 0 ⇒ checkpoint lagging — investigate |
 | `meta_kv_checkpoint_age_ms` / `_dirty_nodes` | gauges | age > 5 s ⇒ alert (mount-replay window growing) |

@@ -371,11 +371,117 @@ passthrough'd every il op and the rig's per-row engagement enforcement
 aborted loudly (`ipc_ops_read Δ = 0`), exactly as designed; the pair
 was rebuilt clean and the row re-run.
 
-### 8.5 Sustained counted A-B-B-A bracket (the ≥60 s law)
+### 8.5 Sustained counted A-B-B-A brackets (the ≥60 s law)
 
-<!-- BRACKET2 TABLE -->
+Two counted brackets, order CAMP-BASE-BASE-CAMP, fresh format + dataset
+per side, fresh mount per row, medians of 3 per row, engagement exact
+(`ipc_ops_read` Δ accounts every il row; `read_device_true_reads = 0`
+throughout), per-second series + diskstats per row (artifacts
+`/tmp/rsat/bracket2-final/`, `/tmp/rsat/bracket3-final/`). Substrate:
+rsat nvmet-tcp devsub. Contention labeled per side (the sibling
+campaign's nvmet-tcp load came and went across the window — loadavg
+7–26 logged per side; alternating order + kernel twins are the
+defense). BASE = `b26c293` pair (≡ dev tip `778d6d0` code).
+
+**Raw fio READ ceilings, sustained 60 s (the finish line):** seq-1M
+16×qd16 across the 4 namespaces = **26.9 GiB/s**; rand-4k = **842k
+IOPS** (zram zero-page memcpy-class ceilings).
+
+**Bracket A (CAMP = `0b60160`, the transient window):** medians of 3
+per side, camp/base of side-medians:
+
+| row (median IOPS / MiB/s) | CAMP1 | BASE1 | BASE2 | CAMP2 | camp/base |
+|---|---|---|---|---|---|
+| **il field row** (elbencho t32 4k O_DIRECT seq infloop 32×512 MiB) | 1,013,443 | 288,866 | 384,591 | 1,259,403 | **3.37×** — the field's 307k floor raised to 1.26 M flat (CAMP2 thirds −0.6 %; CAMP1's −22 % decay tracks the just-finished cargo gate's decaying load, labeled) |
+| il seq-4k fio twin (t16 qd16, 24 GiB set) | 1,071,658 | 536,436 | 651,042 | 1,328,926 | **2.02×** |
+| il seq-1M sustained (psync t16 looped) | 9,736 | 4,965 | 8,505 | 10,767 | **1.52×** (MiB/s) — BASE's sustained loop collapses to per-64 KiB-chunk direct-drive RTTs (`dd_serves` ≈ 16/user-op); CAMP2 10.8 GiB/s = 0.40× the raw memcpy ceiling |
+| kern seq-1M twin | 8,740 | 9,684 | 10,272 | 9,442 | 0.91× — the one soft row: denied-transient fills entered plain probation and lost the clock race mid-consumption (fetch ratio 1.19× vs 1.07×); fixed by the grace refinement (`3623139`, Bracket B) |
+| kern seq-4k twin | 278,961 | 397,509 | 546,788 | 539,903 | 0.87× (qd16 kernel classification instability, pre-existing — same residual as §7) |
+| il rand-4k t32qd32 churn (flagship) | 350,744 | 323,868 | 477,150 | 449,759 | **1.00×** — governor posture identical (denials ≈ dd serves both sides) |
+| il warm rand-4k fit-small | 1,072,613 | 979,427 | 1,115,709 | 1,059,736 | **1.02×** — never below 979k in any counted window |
+
+**The bounded-waste verdict (wasted_bytes ÷ device read bytes, medians
+— the AGENTS ≤ ~`fill_pct` % law):** CAMP holds **≤ 5.0 % on every row
+family** (field 5.0, seq-1M 4.9, seq-4k 4.8, flagship 4.2, warm 5.0);
+BASE runs **27.8 % on kern seq-1M** (the unfixed fill-site pollution, ~3
+GB/s of ledger waste + `evicted_unhit` ≈ 5.5 k/row) and shows low il
+waste only because its il streams never classify at all (the collapse).
+Flagship random churn: CAMP 4.2 % vs BASE 4.9 % — **the scan-resistance
+bound did not regress** (the fix's contract).
+
+**Bracket B (final pair `3623139`, the grace refinement; CAMPA-BASEA-
+BASEB-CAMPB — fully contended window, sibling nvmet-tcp load loadavg
+8–26 across all four sides, labeled):**
+
+| row (median IOPS / MiB/s) | CAMPA | BASEA | BASEB | CAMPB | camp/base |
+|---|---|---|---|---|---|
+| **il field row** | 1,250,985 | 369,304 | 378,264 | 1,108,604 | **3.16×** |
+| il seq-4k fio twin | 1,396,632 | 614,319 | 704,682 | 1,335,410 | **2.07×** |
+| il seq-1M sustained (MiB/s) | 8,858 | 8,397 | 8,538 | 9,971 | **1.11×** (bracket A: 1.52× — BASE's own row is bimodal 4.9–8.5 GiB/s across windows; CAMP spans 8.9–10.8; il ≥ its kernel twin on every CAMP window in both brackets) |
+| kern seq-1M twin (MiB/s) | 8,810 | 9,841 | 9,877 | 8,674 | 0.89× — **attributed** (below) |
+| kern seq-4k twin | 525,964 | 532,173 | 539,443 | 422,175 | 0.88× (±11 % CAMP self-spread under the load; pre-existing qd16 instability) |
+| il rand-4k t32qd32 churn | 455,373 | 471,473 | 449,579 | 364,276 | 0.89× (CAMPB's window ran hottest; bracket A: 1.00× — BASE self-spread across the two brackets 324–477k) |
+| il warm rand-4k fit-small | 945,959 | 1,141,766 | 1,013,969 | 852,550 | 0.83× (bracket A: 1.02×; the warm serve rate is service-thread-CPU-bound — the §5 named limiter — and CAMPB's window carried the heaviest sibling load; BASE self-spread 979–1,142k across brackets) |
+
+Waste ratios, bracket B medians: CAMP ≤ **4.9 %** on every family
+(flagship 4.3 vs BASE 4.8 — scan resistance intact); BASE kern-seq-1M
+**27.8 %** with `evicted_unhit` ≈ 5.5 k/row (the outlawed pollution,
+reproduced in both brackets).
+
+**The kern seq-1M −10 %, attributed (order-independent in both
+brackets, CAMP and BASE each self-consistent):** BASE admits every
+pass-2+ stream fill PROTECTED — under 16-way mutual eviction pressure
+those fills carry two clock lives mid-consumption where the transient
+window's grace carries one, so BASE loses fewer blocks to sibling
+streams (fetch ratio 1.07× vs CAMP 1.16–1.19×) — a real retention
+benefit BASE buys with the 27.8 %-of-device-bandwidth waste ledger, the
+broken co-tenant clamp, and (on cache-ful mounts) a per-pass 4 MiB
+publish per block. The grace refinement recovered part of it (CAMP3
+directional row hit par at 10.1 GiB/s); the remaining −10 % is the
+price of the honest ledger on this one twin and is recorded as a
+residual (§8.7) — the il face of the same row is a WIN in both
+brackets (il ≥ kern on every CAMP window).
 
 ### 8.6 Gates (continuation session)
 
-<!-- GATES2 -->
+- **Full cargo gate from zero** (`8a5d2e4` tree + docs): clippy
+  `-D warnings` clean, `fmt --check` clean, `cargo test --all-features
+  -- --test-threads=1` **156/156 suites ok** (an earlier run had a
+  single defrag_tests failure while my own elbencho field row ran
+  concurrently — attributable load flake; the count restarted from
+  zero on the quiet box per the multi-run discipline and passed clean
+  end-to-end), `cargo doc --no-deps` generated, bench smoke 26/26,
+  exit 0 (`/tmp/rsat/gate2.log`).
+- **Preload gate**: leg 1 (unprivileged) PASSED; leg 2 (root — mount
+  parity + §3 rule-4 engagement, dup/close_range/lseek, fio libaio
+  verify, kill-9 + fork-kill-parent soaks, direct-drive kill-9 soak
+  engaged +15,360 serves, zero residue) PASSED.
+- **statfs ×10 loaded soak**: <!-- STATFS -->
+- **Loom**: not owed — the new tier/governor state is single-word
+  `Relaxed` atomics with no cross-word invariant (the GhostTable /
+  EntryState racy-tolerance class, documented on the types).
+
+### 8.7 Residuals (continuation session)
+
+- **kern seq-1M twin −10 %**: the transient window's one-lap grace
+  retains less mid-consumption than BASE's outlawed protected
+  pollution under 16-way stream pressure (attribution above). Named
+  lever if the fleet wants it back: a consume-cursor-aware eviction
+  hint (spare blocks AHEAD of their lane's consume edge, evict blocks
+  behind it) — strictly better than class inflation and ledger-honest.
+- **Borderline fit-small sets under spurious classification** (the
+  warm row's shape): randread on small files occasionally lands 4
+  contiguous ops, classifies a lane, and the zero-credit basis then
+  reports genuinely-reused stream-granted blocks as full-shortfall
+  waste (CAMP warm wasted ≈ 5 % of device instead of BASE's 0.1 %) and
+  can engage the clamp on a set that pays back. IOPS impact sits
+  inside the known warm-touch band (§7); the ledger noise is bounded
+  by the same 5 % law. Refinement if needed: clear `stream_admitted`
+  on plain-`get` block-level re-access (real reuse evidence) so
+  borderline sets earn their credit back.
+- The two brackets ran under materially different ambient load
+  (labeled per side); the quiet-box confirmation pass of the
+  warm/flagship rows remains cheap insurance when the box frees up —
+  bracket A (which had the quieter CAMP2/BASE2 windows) is the
+  cleaner read on those two rows.
 

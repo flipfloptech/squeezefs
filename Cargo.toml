@@ -43,7 +43,7 @@ bincode = "1.3"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rcgen = "0.13"
-tokio = { version = "1.36", features = ["full"] }
+tokio = { version = "1.48", features = ["full"] }
 # `file-lock` is deliberately OFF: POSIX byte-range locks are KERNEL-LOCAL
 # (FUSE_POSIX_LOCKS is never advertised — fstests generic/131/478/504; see
 # the fuse3 negotiation pins). The feature would re-require daemon

@@ -1693,10 +1693,7 @@ async fn displacement_storm_never_caps_queue_or_spills_inline() {
     // Conservation unchanged: every block reclaimed-or-consciously-
     // skipped exactly once, gauge converges to baseline.
     eventually_within(
-        || {
-            (punches() - p0) + (skipped() - s0) + (discards() - d0) == 256
-                && queue_bytes() == qb0
-        },
+        || (punches() - p0) + (skipped() - s0) + (discards() - d0) == 256 && queue_bytes() == qb0,
         std::time::Duration::from_secs(30),
         "storm blocks reclaimed exactly once, gauge back to baseline",
     )

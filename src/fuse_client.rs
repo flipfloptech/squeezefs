@@ -1675,6 +1675,95 @@ pub fn write_profile_phase_json() -> serde_json::Value {
     serde_json::Value::Object(phases)
 }
 
+// ===========================================================================
+// Write-pipeline residence decomposition (`write_pipeline_phase_ns`) — the
+// 2026-07-31 write-wall campaign's conviction-2 instrument
+// (`tests/write_pipeline_phase_tests.rs`; evidence
+// `.benchmarks/2026-07-31-write-wall.md`).
+//
+// The field showed ~13 ms/block of UNATTRIBUTED pipeline residence (fresh
+// writes at 10.6 GB/s: ~45 blocks in-pipe = ~17 ms/block by Little's law,
+// devices holding each block only ~3–4 ms) — and the meta hypothesis died
+// twice before anyone measured. This family timestamps every boundary an
+// admitted block crosses, admission → release, so residence is named by
+// numbers, not guessed.
+//
+// Deliberately ALWAYS-ON (not `SQUEEZEFS_OP_PROFILE`-gated, unlike the
+// per-op rigs above): the cost is one `Instant::now()` + one relaxed
+// `fetch_add` per phase per 4 MiB-class block — invisible at any credible
+// block rate (10 phases × 4,000 blocks/s ≈ 40 k clock reads/s) — and the
+// field needs the decomposition on production mounts without a
+// remount-to-arm round trip.
+// ===========================================================================
+
+/// Write-pipeline residence sub-phases (`write_pipeline_phase_ns`).
+/// `repr(usize)` indexes the histogram table directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum PipelinePhase {
+    /// WRITE handler: `WritePipeline::admit` park (the honest-backpressure
+    /// gate — governor-target waits show here).
+    AdmitWait = 0,
+    /// Permit granted → detached task's first poll (`tpc_spawn` lane
+    /// scheduling latency — a saturated handler lane queues here).
+    DetachLag = 1,
+    /// Detached task: `BLOCK_FLUSH_LOCKS` acquire (per-block
+    /// serialization against flush/fold/punch owners).
+    LockWait = 2,
+    /// `process_write_async` (compression/encryption; passthrough ≈ 0).
+    Crypto = 3,
+    /// `allocate_block` (free-list claim / fresh mint / ENOSPC valve).
+    Allocate = 4,
+    /// `write_block` — the device DMA leg.
+    Dma = 5,
+    /// `merge_block_mappings_coalesced` — publish conveyor wait + the
+    /// batch commit (the write-commit-economy lever-1 leg).
+    Publish = 6,
+    /// Displaced-key frees (reclaim ENQUEUES — fresh paths must show
+    /// ~0 here; growth is a reclaim interaction leaking back in).
+    DisplacedFree = 7,
+    /// `upload_invalidation_tail` — overlay retire + staged-sibling
+    /// remove + whole-file snapshot drops.
+    InvalTail = 8,
+    /// Admission start → task end (≈ permit release): the whole
+    /// residence every in-pipe block pays — Little's law's numerator.
+    Total = 9,
+}
+
+const PIPELINE_PHASES: usize = 10;
+const PIPELINE_PHASE_NAMES: [&str; PIPELINE_PHASES] = [
+    "admit_wait",
+    "detach_lag",
+    "lock_wait",
+    "crypto",
+    "allocate",
+    "dma",
+    "publish",
+    "displaced_free",
+    "inval_tail",
+    "total",
+];
+
+static PIPELINE_PROF: Lazy<[LatencyHistogram; PIPELINE_PHASES]> =
+    Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
+
+/// Record one residence span started at `t0` against `phase` (always-on;
+/// see the module block above for the cost contract).
+#[inline]
+pub fn pipeline_phase_record(phase: PipelinePhase, t0: std::time::Instant) {
+    PIPELINE_PROF[phase as usize].record(t0.elapsed());
+}
+
+/// `write_pipeline_phase_ns` stats payload: `{phase: histogram}` —
+/// surfaced UNGATED on the stats inode.
+pub fn write_pipeline_phase_json() -> serde_json::Value {
+    let mut phases = serde_json::Map::new();
+    for (pi, pname) in PIPELINE_PHASE_NAMES.iter().enumerate() {
+        phases.insert((*pname).to_string(), PIPELINE_PROF[pi].to_json());
+    }
+    serde_json::Value::Object(phases)
+}
+
 /// `block_lock_wait_by_site` stats payload: `{site: histogram}`.
 pub fn block_lock_site_json() -> serde_json::Value {
     let mut sites = serde_json::Map::new();
@@ -4737,6 +4826,12 @@ impl SqueezefsFilesystem {
                 "write_pipeline_depth_probe_backoffs": self.write_pipeline.depth_probe_backoffs(),
                 "write_pipeline_admission_waits": self.write_pipeline.admission_waits(),
                 "write_pipeline_fence_drops": METRICS.write_pipeline_fence_drops.load(Ordering::Relaxed),
+                // Residence decomposition (2026-07-31 write-wall
+                // campaign, conviction 2): ALWAYS-ON per-phase histograms
+                // — admission → detach → lock → crypto → allocate → DMA
+                // → publish → displaced-free → invalidation → total.
+                // Deliberately ungated (see the PipelinePhase block).
+                "write_pipeline_phase_ns": write_pipeline_phase_json(),
                 // Write-commit-economy (2026-07-30): lever-1 coalescing
                 // engagement (blocks/batch = the live coalesce factor)
                 // and lever-2 layout-delta engagement (delta vs full
@@ -7328,16 +7423,27 @@ impl SqueezefsFilesystem {
                         // the ACK, bounded by the BDP governor and the R5
                         // budget (write_pipeline.rs module docs).
                         std::mem::drop(block_guard);
+                        // Residence decomposition (write-wall conviction 2):
+                        // t_admit anchors the block's WHOLE pipeline
+                        // residence (Little's-law numerator).
+                        let t_admit = std::time::Instant::now();
                         let permit = self.write_pipeline.admit(block_size).await;
+                        pipeline_phase_record(PipelinePhase::AdmitWait, t_admit);
                         let fs = self.clone();
                         let key = cache_key.clone();
                         // The fuse3 per-core handler lanes — the venue pin
                         // (the 2026-07-26 handoff-economy law: never a
                         // runtime-handle spawn onto the global inject
                         // queue).
+                        let t_detach = std::time::Instant::now();
                         fuse3::raw::tpc_spawn(async move {
+                            pipeline_phase_record(PipelinePhase::DetachLag, t_detach);
                             fs.pipeline_upload_parked_block(permit, ino, b as u32, key)
                                 .await;
+                            // Task end ≈ permit release (the permit drops
+                            // inside the upload body's scope): the whole
+                            // residence every in-pipe block pays.
+                            pipeline_phase_record(PipelinePhase::Total, t_admit);
                         });
                     }
                 } else {
@@ -7510,7 +7616,9 @@ impl SqueezefsFilesystem {
     ) {
         let _permit = permit;
         let fencing_token = self.dlm.get_fencing_token_ino(ino);
+        let t_lock = std::time::Instant::now();
         let block_guard = block_lock_acquire(ino, b, BlockLockSite::PipelineUpload).await;
+        pipeline_phase_record(PipelinePhase::LockWait, t_lock);
         let ready = self
             .active_block_buffers
             .get(&cache_key)
@@ -7992,6 +8100,7 @@ impl SqueezefsFilesystem {
     /// upload AND brim in-place rewrite): retire the parked RAM overlay,
     /// drop the staged sibling, and drop stale whole-file snapshots.
     async fn upload_invalidation_tail(&self, ino: u64, b: u32) -> Result<(), SqueezefsError> {
+        let t0 = std::time::Instant::now();
         // Invalidate AFTER the meta publish: a read racing between DMA and
         // publish still hits the RAM snapshot (correct); after removal it
         // resolves via the published block map. Any stale queued
@@ -8009,6 +8118,7 @@ impl SqueezefsFilesystem {
         let file_path = crate::keys::inode_path(ino);
         self.router.cache.write_lru.remove(&file_path);
         self.router.cache.read_lru.remove(&file_path);
+        pipeline_phase_record(PipelinePhase::InvalTail, t0);
         Ok(())
     }
 
@@ -8057,11 +8167,13 @@ impl SqueezefsFilesystem {
         let wp_dma = write_phase_start();
         // Passthrough returns the same `Bytes` (0 copy); non-passthrough
         // transforms into a fresh buffer (§5.7).
+        let t_crypto = std::time::Instant::now();
         let processed = self
             .router
             .get_crypto()
             .process_write_async(plaintext)
             .await?;
+        pipeline_phase_record(PipelinePhase::Crypto, t_crypto);
         let (be_id, block_allocator, nvme_writer) =
             self.router.backend_router.get_active_backend()?;
         crate::block_allocator::ensure_stored_block_image_fits(
@@ -8072,7 +8184,12 @@ impl SqueezefsFilesystem {
         // Marks the key's incarnation unstable: racing validated cache fills
         // of a reused key fail their seqlock check instead of caching
         // pre-DMA bytes.
-        let offset = match block_allocator.allocate_block().await {
+        // Residence phase: the span deliberately includes ENOSPC-valve
+        // engagements — reclaim leaking onto fresh paths shows HERE.
+        let t_alloc = std::time::Instant::now();
+        let alloc_res = block_allocator.allocate_block().await;
+        pipeline_phase_record(PipelinePhase::Allocate, t_alloc);
+        let offset = match alloc_res {
             Ok(o) => o,
             Err(e)
                 if matches!(&e, SqueezefsError::Io(io)
@@ -8108,7 +8225,10 @@ impl SqueezefsFilesystem {
         // PR VL6a: live-owner registration across the allocate→merge
         // window (drops at function end, after the map merge below).
         let _inflight = block_allocator.inflight_register(offset);
-        if let Err(e) = nvme_writer.write_block(offset, processed).await {
+        let t_dma = std::time::Instant::now();
+        let dma_res = nvme_writer.write_block(offset, processed).await;
+        pipeline_phase_record(PipelinePhase::Dma, t_dma);
+        if let Err(e) = dma_res {
             let _ = block_allocator.free_block(offset).await;
             return Err(e);
         }
@@ -8153,7 +8273,8 @@ impl SqueezefsFilesystem {
         // delta) instead of N serialized O(map) commits. Semantics per
         // op are the direct primitive's, verbatim
         // (`tests/publish_coalesce_tests.rs`).
-        let displaced = match self
+        let t_publish = std::time::Instant::now();
+        let merge_res = self
             .router
             .merge_block_mappings_coalesced(
                 ino,
@@ -8162,8 +8283,9 @@ impl SqueezefsFilesystem {
                 crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
                 fencing_token,
             )
-            .await
-        {
+            .await;
+        pipeline_phase_record(PipelinePhase::Publish, t_publish);
+        let displaced = match merge_res {
             Ok(d) => d,
             Err(e) => {
                 // The DMA'd block is unreachable (never published to the
@@ -8179,9 +8301,13 @@ impl SqueezefsFilesystem {
             .record_completion(&be_id, plaintext_len, pipe_t0.elapsed());
         // Free displaced keys only after the new map is published (durable +
         // cached), so no reader can resolve a block to a key we are freeing.
+        // Residence phase: reclaim ENQUEUES only — fresh paths must sit at
+        // ~0 here, and inline-backpressure spills would show loudly.
+        let t_free = std::time::Instant::now();
         for bk in displaced {
             let _ = self.router.backend_router.free_block(&bk).await;
         }
+        pipeline_phase_record(PipelinePhase::DisplacedFree, t_free);
 
         self.upload_invalidation_tail(ino, b).await
     }

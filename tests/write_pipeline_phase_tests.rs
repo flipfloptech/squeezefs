@@ -36,8 +36,8 @@ use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::{
-    pipeline_phase_record, write_pipeline_phase_json, PipelinePhase, SqueezefsFilesystem,
-    METRICS, STATS_INODE,
+    pipeline_phase_record, write_pipeline_phase_json, PipelinePhase, SqueezefsFilesystem, METRICS,
+    STATS_INODE,
 };
 use squeezefs::routing::DataRouter;
 use std::sync::Arc;
@@ -196,16 +196,16 @@ async fn phase_family_is_always_on_with_exact_keys() {
     // Stats-inode surface, ungated: a real fixture's stats JSON carries
     // the family with the profile rig off.
     let h = make_harness("wp_phase_stats_surface").await;
-    let reply = h
-        .fs
-        .read(h.req, STATS_INODE, 0, 0, 1 << 22, 0)
-        .await
-        .expect("read stats inode");
+    let reply =
+        h.fs.read(h.req, STATS_INODE, 0, 0, 1 << 22, 0)
+            .await
+            .expect("read stats inode");
     let stats: serde_json::Value =
         serde_json::from_slice(&reply.data).expect("stats inode must be valid JSON");
     let fam = stats
-        .get("write_pipeline_phase_ns")
-        .expect("stats inode must carry write_pipeline_phase_ns UNGATED");
+        .get("metrics")
+        .and_then(|m| m.get("write_pipeline_phase_ns"))
+        .expect("stats inode metrics must carry write_pipeline_phase_ns UNGATED");
     for p in PHASES {
         let _ = phase_count(fam, p);
     }
@@ -220,17 +220,13 @@ async fn pipeline_write_through_records_every_residence_phase() {
     let _g = serial().await;
     let h = make_harness("wp_phase_write_through").await;
 
-    let before = write_pipeline_phase_json();
-    let wt0 = METRICS
-        .write_through_blocks
-        .load(std::sync::atomic::Ordering::Relaxed);
-
-    // One 8-block coverage-complete write: 8 admissions, 8 detached
-    // uploads, 8 publishes.
+    // Striped fixture: fresh write + fsync + drain (the fresh small-file
+    // route promotes via staging in this venue; the pipelined
+    // write-through — the phases-under-test venue — is the striped
+    // coverage-complete path, so the measured pass below is a rewrite).
     let blocks = 8u64;
-    let ino = h
-        .fs
-        .create(
+    let ino =
+        h.fs.create(
             h.req,
             1,
             std::ffi::OsStr::new("phased"),
@@ -241,13 +237,37 @@ async fn pipeline_write_through_records_every_residence_phase() {
         .expect("create")
         .attr
         .ino;
-    let p = pattern((blocks * FBS) as usize, 42);
-    let w = h
-        .fs
-        .write(h.req, ino, 0, 0, bytes::Bytes::copy_from_slice(&p), 0, 0)
-        .await
-        .expect("write");
-    assert_eq!(w.written as u64, blocks * FBS, "short write");
+    let p0 = pattern((blocks * FBS) as usize, 42);
+    let w =
+        h.fs.write(h.req, ino, 0, 0, bytes::Bytes::copy_from_slice(&p0), 0, 0)
+            .await
+            .expect("fixture write");
+    assert_eq!(w.written as u64, blocks * FBS, "short fixture write");
+    h.fs.fsync(h.req, ino, 0, false).await.expect("fsync");
+    assert!(
+        h.fs.write_pipeline
+            .quiesce(std::time::Duration::from_secs(30))
+            .await,
+        "fixture pipeline must drain"
+    );
+    let path = squeezefs::keys::inode_path(ino);
+    h.fs.router.metadata_cache.remove(&ino);
+    let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
+    assert_eq!(meta.file_type, "striped", "fixture premise: striped");
+
+    let before = write_pipeline_phase_json();
+    let wt0 = METRICS
+        .write_through_blocks
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    // The measured pass: one 8-block coverage-complete rewrite — 8
+    // admissions, 8 detached uploads, 8 publishes, 8 displaced frees.
+    let p1 = pattern((blocks * FBS) as usize, 77);
+    let w =
+        h.fs.write(h.req, ino, 0, 0, bytes::Bytes::copy_from_slice(&p1), 0, 0)
+            .await
+            .expect("rewrite");
+    assert_eq!(w.written as u64, blocks * FBS, "short rewrite");
     assert!(
         h.fs.write_pipeline
             .quiesce(std::time::Duration::from_secs(30))
@@ -260,8 +280,8 @@ async fn pipeline_write_through_records_every_residence_phase() {
             .load(std::sync::atomic::Ordering::Relaxed)
             - wt0,
         blocks,
-        "fixture premise: all {blocks} blocks must ride the pipelined \
-         write-through (the phases-under-test venue)"
+        "fixture premise: all {blocks} rewrite blocks must ride the \
+         pipelined write-through (the phases-under-test venue)"
     );
 
     let after = write_pipeline_phase_json();

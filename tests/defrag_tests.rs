@@ -471,6 +471,13 @@ async fn test_report_only_gauges_match_independent_census() {
     for i in (1..8).step_by(2) {
         unlink(&fx, &format!("f{i}.bin"), inos[i]).await;
     }
+    // Settle the async block reclaimer (2026-07-27 machinery): unlink
+    // frees ENQUEUE their device reclaim and the blocks rejoin the
+    // allocator census only at finish_free — measuring mid-drain raced
+    // the report against the independent census below (pre-existing
+    // flake, 4/5 red at f16d5a9 on the loaded gate box: report saw
+    // (3,2,0) free-run state, the census taken µs later saw (12,3,2)).
+    fx.fs.router.backend_router.reclaim_drain().await;
 
     let report = squeezefs::defrag::measure(&fx.meta, &fx.fs.router)
         .await

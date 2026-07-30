@@ -88,7 +88,12 @@ if not a:
     print(f"[phases] {label}: family absent (baseline binary)"); sys.exit(0)
 order = ["admit_wait","detach_lag","lock_wait","crypto","allocate","dma",
          "publish","displaced_free","inval_tail","total"]
-labels = list(next(iter(a.values())).keys())
+# CANONICAL bucket order (serde_json maps serialize alphabetically — a
+# positional read over the JSON key order misprices every bucket).
+labels = ["<=1us","<=2us","<=4us","<=8us","<=16us","<=32us","<=64us",
+          "<=128us","<=256us","<=512us","<=1024us","<=2ms","<=4ms","<=8ms",
+          "<=16ms","<=32ms","<=64ms","<=128ms","<=256ms","<=512ms",
+          "<=1024ms","<=2s","<=4s","<=8s","<=16s",">16s"]
 def mid_us(i):  # bucket i spans (2^(i-1), 2^i] us; 0 = <=1us
     return 1.0 if i == 0 else 1.5 * (1 << (i - 1))
 print(f"[phases] {label}: phase, spans, est_mean_ms, est_total_ms")

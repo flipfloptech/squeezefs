@@ -1439,6 +1439,7 @@ fn striped_map_meta(n: usize, block_size: u64) -> CachedMetadata {
         size: n as u64 * block_size,
         block_map: Some(std::sync::Arc::new(bm)),
         layout_dirty: true,
+        layout_delta_chain: squeezefs::routing::LAYOUT_DELTA_CHAIN_INELIGIBLE,
         ..Default::default()
     }
 }

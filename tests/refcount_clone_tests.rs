@@ -110,6 +110,7 @@ fn striped_meta(block_map: &[(u32, String)], size: u64, dirty: bool) -> CachedMe
         size,
         block_map: Some(std::sync::Arc::new(block_map.iter().cloned().collect())),
         layout_dirty: dirty,
+        layout_delta_chain: squeezefs::routing::LAYOUT_DELTA_CHAIN_INELIGIBLE,
         ..Default::default()
     }
 }

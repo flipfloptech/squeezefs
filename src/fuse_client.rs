@@ -2467,6 +2467,16 @@ pub struct Metrics {
     /// (single-writer D0: only our own lease churn can race an upload);
     /// investigate alongside `writer_guard_fenced`.
     pub write_pipeline_fence_drops: Align64<AtomicU64>,
+    /// Write-commit-economy lever 1 (2026-07-30): publish-conveyor
+    /// passes committed (one save each). With
+    /// `layout_publish_batched_blocks` gives the live coalesce factor —
+    /// blocks/batch ≈ 1 on a streaming shape means the conveyor
+    /// regressed to the pre-campaign serialized-per-block posture.
+    pub layout_publish_batches: Align64<AtomicU64>,
+    /// Block publishes carried by conveyor batches (the lever-1
+    /// engagement instrument: a streaming row is INVALID unless this
+    /// accounts for its published blocks).
+    pub layout_publish_batched_blocks: Align64<AtomicU64>,
     // Terminal-free device reclaim economy (the shim-write-amplification
     // fix — `.benchmarks/2026-07-27-shim-write-amplification.md`;
     // classification `routing::free_reclaim_op`, contract
@@ -4709,6 +4719,16 @@ impl SqueezefsFilesystem {
                 "write_pipeline_depth_probe_backoffs": self.write_pipeline.depth_probe_backoffs(),
                 "write_pipeline_admission_waits": self.write_pipeline.admission_waits(),
                 "write_pipeline_fence_drops": METRICS.write_pipeline_fence_drops.load(Ordering::Relaxed),
+                // Write-commit-economy (2026-07-30): lever-1 coalescing
+                // engagement (blocks/batch = the live coalesce factor)
+                // and lever-2 layout-delta engagement (delta vs full
+                // commits; delta bytes = the collapsed O(batch) term).
+                "layout_publish_batches": METRICS.layout_publish_batches.load(Ordering::Relaxed),
+                "layout_publish_batched_blocks": METRICS.layout_publish_batched_blocks.load(Ordering::Relaxed),
+                "layout_delta_commits": crate::meta_backend::kv::META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed),
+                "layout_full_commits": crate::meta_backend::kv::META_KV_LAYOUT_FULL_COMMITS.load(Ordering::Relaxed),
+                "layout_delta_bytes": crate::meta_backend::kv::META_KV_LAYOUT_DELTA_BYTES.load(Ordering::Relaxed),
+                "layout_delta_folds": crate::meta_backend::kv::META_KV_LAYOUT_DELTA_FOLDS.load(Ordering::Relaxed),
                 // Terminal-free reclaim economy (shim-write-amplification
                 // fix): reclaims must never surface as device WRITE bytes.
                 "block_free_discards": METRICS.block_free_discards.load(Ordering::Relaxed),
@@ -8106,13 +8126,18 @@ impl SqueezefsFilesystem {
         } else {
             0
         };
-        let entries = [(b, new_key)];
         let wp_merge = write_phase_start();
+        // Write-commit-economy lever 1 (2026-07-30): the publish rides
+        // the per-ino coalescing conveyor — concurrent pipeline uploads
+        // of one ino merge as ONE commit (one journal entry, one layout
+        // delta) instead of N serialized O(map) commits. Semantics per
+        // op are the direct primitive's, verbatim
+        // (`tests/publish_coalesce_tests.rs`).
         let displaced = match self
             .router
-            .merge_block_mappings(
+            .merge_block_mappings_coalesced(
                 ino,
-                crate::routing::BlockMapOp::Merge(&entries),
+                vec![(b, new_key)],
                 min_size,
                 crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
                 fencing_token,
@@ -10545,6 +10570,7 @@ impl Filesystem for SqueezefsFilesystem {
                     data_key: None,
                     block_map: None,
                     layout_dirty: false,
+                    layout_delta_chain: crate::routing::LAYOUT_DELTA_CHAIN_INELIGIBLE,
                 },
             );
             self.bump_dir_generation(parent);

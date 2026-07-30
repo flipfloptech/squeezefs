@@ -147,7 +147,20 @@ pub struct CachedMetadata {
     pub block_map: Option<std::sync::Arc<std::collections::HashMap<u32, String>>>,
     /// When true, layout/size live only in RAM (+ staging mmap); must persist on fsync/release.
     pub layout_dirty: bool,
+    /// Write-commit-economy (2026-07-30): the caller half of the layout
+    /// delta eligibility ladder — how many delta records the persisted
+    /// base currently folds under (0 = fresh inline bincode base, delta-
+    /// eligible; [`LAYOUT_DELTA_CHAIN_INELIGIBLE`] = the persisted base
+    /// is JSON/indirect/unknown, full-`Put` only). Set by
+    /// `fetch_metadata_from_backend` (what the backend actually holds)
+    /// and by every save's republish; the DEFAULT is ineligible so any
+    /// synthesized entry conservatively re-bases with a full save.
+    pub layout_delta_chain: u32,
 }
+
+/// [`CachedMetadata::layout_delta_chain`] sentinel: the persisted base
+/// cannot fold a delta (JSON/indirect/unknown provenance).
+pub const LAYOUT_DELTA_CHAIN_INELIGIBLE: u32 = u32::MAX;
 
 /// The `fetch_metadata` serve gate, extracted (P2 per-op economy): a
 /// DIRTY layout is the local authority (never re-validated — see the
@@ -171,6 +184,7 @@ impl Default for CachedMetadata {
             data_key: None,
             block_map: None,
             layout_dirty: false,
+            layout_delta_chain: LAYOUT_DELTA_CHAIN_INELIGIBLE,
         }
     }
 }
@@ -218,6 +232,99 @@ pub enum BlockMapOp<'a> {
 /// EXPLICIT parameter, because the converted writers disagree today and a
 /// silent "extracted-body default" would change the flush paths'
 /// side-effects.
+/// One queued block-publish op on an ino's publish conveyor (lever 1,
+/// write-commit-economy 2026-07-30): the `Merge`-arm parameters of
+/// [`DataRouter::merge_block_mappings`] plus the submitter's result
+/// channel (per-op displaced keys / per-op error — same surface as the
+/// direct call).
+pub(crate) struct QueuedPublish {
+    entries: Vec<(u32, String)>,
+    min_size: u64,
+    flip: LayoutFlip,
+    fencing_token: u64,
+    done: tokio::sync::oneshot::Sender<Result<Vec<String>>>,
+}
+
+/// `SQUEEZEFS_PUBLISH_COALESCE_MAX` cell: max block-publish ops drained
+/// per conveyor pass. `<= 1` disables coalescing (the A/B lever — the
+/// pre-campaign serialized per-op path). Env read once; runtime-settable
+/// via [`set_publish_coalesce_override`] (tests/acceptance).
+fn publish_coalesce_cell() -> &'static std::sync::atomic::AtomicI64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicI64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let v = std::env::var("SQUEEZEFS_PUBLISH_COALESCE_MAX")
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|v| *v >= 0)
+            .unwrap_or(64);
+        std::sync::atomic::AtomicI64::new(v)
+    })
+}
+
+/// Current publish-coalesce cap (see [`publish_coalesce_cell`]).
+pub fn publish_coalesce_max() -> usize {
+    publish_coalesce_cell().load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+/// Set the coalesce cap override (`None` restores the env/default) —
+/// the `set_depth_override` pattern.
+pub fn set_publish_coalesce_override(v: Option<usize>) {
+    let default = std::env::var("SQUEEZEFS_PUBLISH_COALESCE_MAX")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|x| *x >= 0)
+        .unwrap_or(64);
+    publish_coalesce_cell().store(
+        v.map(|n| n as i64).unwrap_or(default),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// `SQUEEZEFS_LAYOUT_DELTA_MAX_CHAIN` cell: how many layout delta
+/// records may fold on one persisted base before the next publish
+/// re-bases with a full `Put` (bounds cold-read fold chains and the
+/// journal-replay working set per key). `0` disables layout deltas
+/// entirely (the lever-2 A/B lever). Default 64.
+fn layout_delta_chain_cell() -> &'static std::sync::atomic::AtomicI64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicI64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let v = std::env::var("SQUEEZEFS_LAYOUT_DELTA_MAX_CHAIN")
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|v| *v >= 0)
+            .unwrap_or(64);
+        std::sync::atomic::AtomicI64::new(v)
+    })
+}
+
+/// Current layout-delta chain cap (see [`layout_delta_chain_cell`]).
+pub fn layout_delta_max_chain() -> u32 {
+    layout_delta_chain_cell().load(std::sync::atomic::Ordering::Relaxed) as u32
+}
+
+/// Test seam (write-commit-economy lever 1; the
+/// [`TEST_TIER_PUBLISH_DELAY_MS`] precedent): artificial delay, in
+/// milliseconds, injected at the head of every publish-conveyor pass —
+/// reproduces the field's ms-scale commit latency on µs-commit
+/// sandboxes so the batching contract is deterministic. One relaxed
+/// load per pass; zero-cost when unset.
+pub static TEST_PUBLISH_PASS_DELAY_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Set the chain-cap override (`None` restores the env/default).
+pub fn set_layout_delta_chain_override(v: Option<u32>) {
+    let default = std::env::var("SQUEEZEFS_LAYOUT_DELTA_MAX_CHAIN")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|x| *x >= 0)
+        .unwrap_or(64);
+    layout_delta_chain_cell().store(
+        v.map(|n| n as i64).unwrap_or(default),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutFlip {
     /// Flush-path merges (`flush_single_active_block`, `flush_due_…`,
     /// `upload_active_block_bytes`, write-through): force
@@ -1819,6 +1926,20 @@ pub struct DataRouterInner {
     pub crypto:
         std::sync::Arc<once_cell::sync::OnceCell<crate::crypto_compress::CryptoCompressState>>,
     pub prefetcher: std::sync::Arc<IoUringPrefetcher>,
+    /// Write-commit-economy (2026-07-30, lever 1): per-ino **publish
+    /// conveyors** — block-publish merges enqueue here and a
+    /// leader-elected detached pass drains batches, applying the whole
+    /// batch under ONE `INODE_META_LOCKS` section and persisting it as
+    /// ONE commit (the M7 conveyor pattern one level up; the core is
+    /// the same loom-modeled `ConveyorCore`). Entries are removed when
+    /// their conveyor idles (the pass's last unlead), so the map stays
+    /// bounded by concurrently-writing inos.
+    pub(crate) publish_conveyors: std::sync::Arc<
+        scc::HashMap<
+            u64,
+            std::sync::Arc<crate::meta_backend::kv::conveyor_core::ConveyorCore<QueuedPublish>>,
+        >,
+    >,
 }
 
 #[derive(Clone)]
@@ -2899,6 +3020,20 @@ impl DataRouter {
                     bincode::deserialize::<LayoutMetadata>(&bytes).ok()
                 };
                 if let Some(layout) = layout_opt {
+                    // Write-commit-economy: the fetched value IS the
+                    // persisted base — an inline bincode layout is
+                    // delta-eligible (chain restarts at 0); JSON-era and
+                    // indirect bases are full-Put only.
+                    let base_is_json = bytes.starts_with(b"{");
+                    let base_is_indirect = layout
+                        .block_map_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("indirect:"));
+                    let layout_delta_chain = if base_is_json || base_is_indirect {
+                        LAYOUT_DELTA_CHAIN_INELIGIBLE
+                    } else {
+                        0
+                    };
                     let mut block_map = layout.block_map.clone();
                     if let Some(ref map_id) = layout.block_map_id {
                         if map_id.starts_with("indirect:") {
@@ -2939,6 +3074,7 @@ impl DataRouter {
                         data_key: layout.data_key.map(bytes::Bytes::from),
                         block_map: block_map.map(std::sync::Arc::new),
                         layout_dirty: false,
+                        layout_delta_chain,
                     }));
                 }
             }
@@ -2951,6 +3087,26 @@ impl DataRouter {
         ino: u64,
         m: &CachedMetadata,
         fencing_token: u64,
+    ) -> Result<()> {
+        self.save_metadata_to_backend_ext(ino, m, fencing_token, None)
+            .await
+    }
+
+    /// [`Self::save_metadata_to_backend`] with the write-commit-economy
+    /// publish face: `publish_entries = Some(batch)` marks this save as
+    /// a pure block-map-insert publish, eligible to persist as an
+    /// O(batch) **layout delta record** instead of the re-serialized
+    /// whole layout — when the caller half of the eligibility ladder
+    /// holds (inline persisted base of known bincode provenance, chain
+    /// under the cap, no indirect spill). Everything else about the
+    /// save (fencing, indirect handling, RAM republish coherence) is
+    /// identical.
+    async fn save_metadata_to_backend_ext(
+        &self,
+        ino: u64,
+        m: &CachedMetadata,
+        fencing_token: u64,
+        publish_entries: Option<&[(u32, String)]>,
     ) -> Result<()> {
         let backend = self.inner.meta_backend.get().ok_or_else(|| {
             SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
@@ -3095,9 +3251,51 @@ impl DataRouter {
             inline_bytes
         };
 
-        backend.set_layout_and_size(ino, &bytes, m.size).await?;
+        // Write-commit-economy lever 2: a merge-class publish persists
+        // as an O(batch) delta when the whole eligibility ladder holds —
+        // the backend's half (live non-JSON base + incompat ratchet)
+        // decides the rest and returns what it staged.
+        let max_chain = layout_delta_max_chain();
+        let delta_eligible = publish_entries.is_some()
+            && !needs_indirect
+            && max_chain > 0
+            && m.layout_delta_chain < max_chain
+            && !m
+                .block_map_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("indirect:"));
+        let delta_used = if delta_eligible {
+            let delta = crate::layout_wire::LayoutDelta::from_final_state(
+                &layout.file_type,
+                m.size,
+                layout.block_map_id.as_deref(),
+                layout.block_prefix.as_deref(),
+                layout.file_id.as_deref(),
+                layout.data_key.as_deref(),
+                publish_entries
+                    .expect("delta_eligible requires entries")
+                    .to_vec(),
+            );
+            backend
+                .merge_layout_and_size(ino, &delta, &bytes, m.size)
+                .await?
+        } else {
+            backend.set_layout_and_size(ino, &bytes, m.size).await?;
+            false
+        };
         // Keep hot cache coherent without a remove+refetch on the next write.
         let mut cached = m.clone();
+        // Chain accounting (the caller half of the eligibility ladder):
+        // a delta save deepens the chain; a full inline save re-bases it
+        // (eligible at 0); an indirect save is full-Put-only until the
+        // map collapses back inline.
+        cached.layout_delta_chain = if delta_used {
+            m.layout_delta_chain.saturating_add(1)
+        } else if needs_indirect {
+            LAYOUT_DELTA_CHAIN_INELIGIBLE
+        } else {
+            0
+        };
         // The blob pointer must follow the SAVED layout (2026-07-27
         // write-pipeline campaign conviction, red in
         // tests/indirect_map_backend_keys_tests.rs): the indirect branch
@@ -3255,6 +3453,7 @@ impl DataRouter {
                 stream_gauge: StreamActivityGauge::new(),
                 crypto: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
                 prefetcher: std::sync::Arc::new(IoUringPrefetcher::new()),
+                publish_conveyors: std::sync::Arc::new(scc::HashMap::new()),
             }),
         };
         // Merge-worker promotion commits layout through the router (weak:
@@ -4934,6 +5133,7 @@ impl DataRouter {
             data_key: None,
             block_map: None,
             layout_dirty: false,
+            layout_delta_chain: LAYOUT_DELTA_CHAIN_INELIGIBLE,
         };
         self.metadata_cache.insert(ino, m.clone());
         Ok(m)
@@ -5520,6 +5720,294 @@ impl DataRouter {
         self.save_metadata_to_backend(ino, &current, fencing_token)
             .await?;
         Ok(Some(displaced))
+    }
+
+    /// Write-commit-economy lever 1 (2026-07-30): the **coalescing**
+    /// face of [`Self::merge_block_mappings`] for the block-publish hot
+    /// path (unconditional `Merge` shapes only). Ops enqueue on the
+    /// ino's publish conveyor; a leader-elected detached pass drains
+    /// whatever accumulated (no timers — the batch is what queued while
+    /// the previous commit was in flight, the jbd2/M7 shape), applies
+    /// the WHOLE batch under one `INODE_META_LOCKS` section with the
+    /// exact per-op semantics of the direct primitive (dirty-authority
+    /// RMW base, per-op fencing, displaced-key purge, size floors,
+    /// flips), and persists it as ONE commit — an O(batch) layout delta
+    /// where the eligibility ladder allows.
+    ///
+    /// Durability contract: the returned future resolves only after the
+    /// op's batch COMMITTED — there is no parked window an fsync could
+    /// race (fsync's own flush merges ride the same conveyor and their
+    /// completion precedes its barrier, exactly as with the direct
+    /// path). Blocks awaiting their batch are precisely as crash-exposed
+    /// as blocks awaiting the direct path's serialized merge queue.
+    pub async fn merge_block_mappings_coalesced(
+        &self,
+        ino: u64,
+        entries: Vec<(u32, String)>,
+        min_size: u64,
+        flip: LayoutFlip,
+        fencing_token: u64,
+    ) -> Result<Vec<String>> {
+        if publish_coalesce_max() <= 1 {
+            // A/B lever (`SQUEEZEFS_PUBLISH_COALESCE_MAX=1`): the
+            // pre-campaign serialized per-op path, verbatim.
+            return self
+                .merge_block_mappings(
+                    ino,
+                    BlockMapOp::Merge(&entries),
+                    min_size,
+                    flip,
+                    fencing_token,
+                )
+                .await;
+        }
+        let conveyor = match self.publish_conveyors.read_sync(&ino, |_, c| c.clone()) {
+            Some(c) => c,
+            None => match self.publish_conveyors.entry_sync(ino) {
+                scc::hash_map::Entry::Occupied(occ) => occ.get().clone(),
+                scc::hash_map::Entry::Vacant(vac) => {
+                    let fresh = std::sync::Arc::new(
+                        crate::meta_backend::kv::conveyor_core::ConveyorCore::new(),
+                    );
+                    vac.insert_entry(fresh.clone());
+                    fresh
+                }
+            },
+        };
+        let (done, rx) = tokio::sync::oneshot::channel();
+        let blocks = entries.len() as u64;
+        // Enqueue-then-elect with no await between (the conveyor_core
+        // no-lost-wakeup protocol): a cancelled submitter can never
+        // strand its entry without a responsible leader.
+        conveyor.enqueue(
+            QueuedPublish {
+                entries,
+                min_size,
+                flip,
+                fencing_token,
+                done,
+            },
+            blocks,
+        );
+        if conveyor.try_lead() {
+            // Detached (the M7 cancellation-safety law): no
+            // client-visible cancellation can drop a batch mid-commit.
+            let router = self.clone();
+            let conveyor = conveyor.clone();
+            tokio::spawn(async move {
+                router.publish_pass_task(ino, conveyor).await;
+            });
+        }
+        match rx.await {
+            Ok(out) => out,
+            Err(_) => Err(SqueezefsError::Io(std::io::Error::other(
+                "publish conveyor pass dropped its result channel (pass panic — \
+                 publish failed loud; custody stays with the caller's never-lossy ladder)",
+            ))),
+        }
+    }
+
+    /// The detached publish pass (lever 1): drain → batch-apply → one
+    /// save → fan out, until the queue idles; then release leadership
+    /// (release-then-recheck) and retire the conveyor's map entry when
+    /// it is provably idle. The drop guard contains a panicking pass:
+    /// queued ops fail LOUD (their callers run the never-lossy ladder)
+    /// and leadership is released so later publishes elect fresh passes
+    /// — never a wedged conveyor.
+    async fn publish_pass_task(
+        &self,
+        ino: u64,
+        conveyor: std::sync::Arc<
+            crate::meta_backend::kv::conveyor_core::ConveyorCore<QueuedPublish>,
+        >,
+    ) {
+        struct PassGuard {
+            conveyor:
+                std::sync::Arc<crate::meta_backend::kv::conveyor_core::ConveyorCore<QueuedPublish>>,
+            clean: bool,
+        }
+        impl Drop for PassGuard {
+            fn drop(&mut self) {
+                if self.clean {
+                    return;
+                }
+                // Panic containment (the M7 pass-guard shape): fail out
+                // everything queued behind the dead pass, then release
+                // leadership so later publishes are never stranded.
+                loop {
+                    for q in self.conveyor.drain(usize::MAX, u64::MAX) {
+                        let _ = q.done.send(Err(SqueezefsError::Io(std::io::Error::other(
+                            "publish conveyor pass panicked — publish failed loud",
+                        ))));
+                    }
+                    if !self.conveyor.unlead_and_recheck() {
+                        break;
+                    }
+                }
+            }
+        }
+        let mut guard = PassGuard {
+            conveyor: conveyor.clone(),
+            clean: false,
+        };
+        let cap = publish_coalesce_max();
+        loop {
+            let batch = conveyor.drain(cap, u64::MAX);
+            if batch.is_empty() {
+                if !conveyor.unlead_and_recheck() {
+                    break;
+                }
+                continue;
+            }
+            self.publish_pass(ino, batch).await;
+        }
+        guard.clean = true;
+        drop(guard);
+        // Idle retirement: drop the map entry when this conveyor is
+        // still installed and provably empty. A racing submitter that
+        // already cloned the Arc keeps working on it (it elects its own
+        // leader on that handle); a later submitter mints a fresh entry
+        // — two conveyors for one ino only ever serialize on
+        // `INODE_META_LOCKS`, never diverge.
+        self.publish_conveyors.remove_if_sync(&ino, |c| {
+            std::sync::Arc::ptr_eq(c, &conveyor) && c.pending() == 0
+        });
+    }
+
+    /// One publish batch: the exact per-op semantics of
+    /// [`Self::merge_block_mappings`]'s `Merge` arm, applied N times
+    /// under ONE `INODE_META_LOCKS` section, persisted with ONE save.
+    async fn publish_pass(&self, ino: u64, batch: Vec<QueuedPublish>) {
+        // Test seam (the `TEST_TIER_PUBLISH_DELAY_MS` pattern — one
+        // relaxed load, zero-cost when unset, no `#[cfg(test)]` fork):
+        // an artificial pass delay reproduces the field's ms-scale
+        // commit latency on µs-commit sandboxes, so the batching
+        // contract (`tests/publish_coalesce_tests.rs`) is deterministic.
+        let delay = TEST_PUBLISH_PASS_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        let _map_guard = meta_lock_acquire(ino).await;
+
+        // Fan an unclonable error out to every waiter, preserving the
+        // fencing classification (`pipeline_disposition` keys on it).
+        fn dup_err(e: &SqueezefsError) -> SqueezefsError {
+            match e {
+                SqueezefsError::FencingTokenExpired { token, expected } => {
+                    SqueezefsError::FencingTokenExpired {
+                        token: *token,
+                        expected: *expected,
+                    }
+                }
+                other => SqueezefsError::Io(std::io::Error::other(format!(
+                    "coalesced publish failed: {other}"
+                ))),
+            }
+        }
+
+        // RMW base — the dirty-authority rule, verbatim from the direct
+        // primitive (FIND-RW5-A face 5).
+        let mut current = match self.metadata_cache.get(&ino) {
+            Some(m) if m.layout_dirty => m,
+            cached => match self.fetch_metadata_from_backend(ino).await {
+                Ok(Some(m)) => m,
+                Ok(None) => cached.unwrap_or_default(),
+                Err(e) => {
+                    for op in batch {
+                        let _ = op.done.send(Err(dup_err(&e)));
+                    }
+                    return;
+                }
+            },
+        };
+        let current_fencing = self.inner.dlm.get_fencing_token_ino(ino);
+
+        // CoW publish (item A): held reader snapshots keep their map.
+        let mut block_map_arc = current.block_map.take().unwrap_or_default();
+        let block_map = std::sync::Arc::make_mut(&mut block_map_arc);
+        let mut applied: Vec<(
+            tokio::sync::oneshot::Sender<Result<Vec<String>>>,
+            Vec<String>,
+        )> = Vec::new();
+        let mut fenced: Vec<(tokio::sync::oneshot::Sender<Result<Vec<String>>>, u64)> = Vec::new();
+        let mut batch_entries: Vec<(u32, String)> = Vec::new();
+        let mut save_token = 0u64;
+        for op in batch {
+            // Per-op fencing: a stale op fails ALONE (the supersession
+            // law); the batch's fresh members proceed.
+            if op.fencing_token < current_fencing {
+                fenced.push((op.done, op.fencing_token));
+                continue;
+            }
+            let mut displaced: Vec<String> = Vec::new();
+            for (b, new_key) in &op.entries {
+                if let Some(prev) = block_map.insert(*b, new_key.clone()) {
+                    if prev != *new_key {
+                        // Purge every tier for a displaced key — its
+                        // offset will be reallocated under the SAME key
+                        // string once freed (the primitive's rule).
+                        self.cache.purge_block_key(&prev);
+                        displaced.push(prev);
+                    }
+                }
+            }
+            // Size floor: never below the op's bound (the freshest RAM
+            // floor is applied once, below).
+            current.size = std::cmp::max(current.size, op.min_size);
+            match op.flip {
+                LayoutFlip::ToStripedKeepStagedIdentity => {
+                    current.file_type = "striped".into();
+                }
+                LayoutFlip::ToStripedClearStagedIdentity => {
+                    current.file_type = "striped".into();
+                    current.file_id = None;
+                    current.data_key = None;
+                }
+                LayoutFlip::KeepLayout => {}
+            }
+            save_token = save_token.max(op.fencing_token);
+            METRICS
+                .layout_publish_batched_blocks
+                .fetch_add(op.entries.len() as u64, Ordering::Relaxed);
+            batch_entries.extend(op.entries.iter().cloned());
+            applied.push((op.done, displaced));
+        }
+        // The freshest RAM size floor (writes publish size to the RAM
+        // cache ahead of the deferred layout commit — a merge must not
+        // regress it). Once per batch ≡ once per op serially.
+        if let Some(cached) = self.metadata_cache.get(&ino) {
+            if cached.size > current.size {
+                current.size = cached.size;
+            }
+        }
+        current.block_map = Some(block_map_arc);
+        for (done, token) in fenced {
+            let _ = done.send(Err(SqueezefsError::FencingTokenExpired {
+                token,
+                expected: current_fencing,
+            }));
+        }
+        if applied.is_empty() {
+            return;
+        }
+        METRICS
+            .layout_publish_batches
+            .fetch_add(1, Ordering::Relaxed);
+        match self
+            .save_metadata_to_backend_ext(ino, &current, save_token, Some(&batch_entries))
+            .await
+        {
+            Ok(()) => {
+                for (done, displaced) in applied {
+                    let _ = done.send(Ok(displaced));
+                }
+            }
+            Err(e) => {
+                for (done, _) in applied {
+                    let _ = done.send(Err(dup_err(&e)));
+                }
+            }
+        }
     }
 
     /// Bump the RAM metadata entry's size floor (write handler's

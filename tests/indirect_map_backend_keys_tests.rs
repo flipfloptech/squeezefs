@@ -532,6 +532,7 @@ async fn test_spill_roundtrip_preserves_prefixed_keys_and_versioned_header() {
             size: (SPILL_BLOCKS * BLOCK) as u64,
             block_map: Some(std::sync::Arc::new(map.clone())),
             layout_dirty: true,
+            layout_delta_chain: squeezefs::routing::LAYOUT_DELTA_CHAIN_INELIGIBLE,
             ..Default::default()
         },
     );

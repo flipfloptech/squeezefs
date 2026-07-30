@@ -133,6 +133,16 @@ pub static META_KV_JOURNAL_ENTRIES: AtomicU64 = AtomicU64::new(0);
 /// as `meta_kv_node_appends` (design §10) in PR K7.
 pub static META_KV_NODE_APPENDS: AtomicU64 = AtomicU64::new(0);
 
+/// Freeze-time shadow-fold drops (perf/meta-plane-writes, 2026-07-30):
+/// overlay records excluded from frozen bsets because a newer same-key
+/// `Put`/`Delete` in the same freeze completely shadows them (fold
+/// algebra §4.2) — pure device-byte savings, the engagement gauge for
+/// the node-writeback half of the per-block meta write economy. High
+/// rates are the DESIGNED steady state under same-key commit storms
+/// (block publishes, claim heartbeats); 0 on such a workload means the
+/// fold regressed. Surfaced as `meta_kv_node_freeze_shadow_dropped`.
+pub static META_KV_NODE_FREEZE_SHADOW_DROPPED: AtomicU64 = AtomicU64::new(0);
+
 /// Bytes of those appended frames (4 KiB-padded) — the second half of the
 /// §8 row 7 "node writeback counters" accounting. Surfaced as
 /// `meta_kv_node_append_bytes` in PR K7.

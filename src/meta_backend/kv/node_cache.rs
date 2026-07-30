@@ -1452,6 +1452,28 @@ impl CachedNode {
     /// serialized), and leave the append/compact to run **outside** the
     /// lock. No-op returning the existing frozen delta if one is already
     /// awaiting I/O.
+    ///
+    /// **Freeze-time shadow-fold** (perf/meta-plane-writes, 2026-07-30;
+    /// contract in `tests/meta_write_economy_audit_tests.rs`): the frozen
+    /// bset carries, per key, only the newest **base-establishing**
+    /// record (`Put`/`Delete`) and any `Delta`s newer than it — records
+    /// completely shadowed by the fold algebra (everything older than
+    /// the newest base; §4.2) never reach the device. Delta-only runs
+    /// keep every record (their base lives in an older bset/the base
+    /// index). The field's block-publish storm appended W full layout
+    /// values per cadence window for exactly this supersession waste.
+    ///
+    /// Crash safety is unchanged: within one freeze the shadowing record
+    /// and its dropped victims share a bset, which either fully survives
+    /// (the shadow serves — fold-identical) or is fully dropped by the
+    /// §4.5 torn-tail classifier (the journal window still re-supplies
+    /// every dropped seq — the checkpoint tail cannot pass this freeze's
+    /// records until the covering ledger record is durable). Shadowed
+    /// records are always from COMMITTED transactions: a failing tx
+    /// holds its 4a DLM guards across rollback, so no newer same-key
+    /// record can exist above it at freeze time (its record — if a
+    /// freeze raced the failed write — is the newest of its key run and
+    /// is kept, preserving the §4.4 pt 4 compensation detection).
     pub fn freeze_locked(
         &self,
         guard: &mut NodeDirty,
@@ -1466,8 +1488,41 @@ impl CachedNode {
         self.state.begin_freeze().map_err(|e| {
             KvError::Corrupt(format!("freeze refused on node {:#x}: {e:?}", self.addr))
         })?;
-        let records: Vec<Record> = guard.overlay.iter().map(|r| r.to_record()).collect();
-        let horizon = records.iter().map(|r| r.seq).max().unwrap_or(0);
+        // The overlay is sorted by (key, seq) ascending (apply_locked's
+        // partition_point insert), so shadow-folding is one linear pass
+        // over per-key runs.
+        let overlay = &guard.overlay;
+        let mut records: Vec<Record> = Vec::with_capacity(overlay.len());
+        let mut dropped = 0u64;
+        let mut i = 0;
+        while i < overlay.len() {
+            let mut j = i + 1;
+            while j < overlay.len() && overlay[j].key == overlay[i].key {
+                j += 1;
+            }
+            // Newest base-establishing record in the run (runs are seq-
+            // ascending); none ⇒ delta-only run, keep everything.
+            let keep_from = overlay[i..j]
+                .iter()
+                .rposition(|r| matches!(r.kind, RecordKind::Put | RecordKind::Delete))
+                .map_or(i, |base| i + base);
+            dropped += (keep_from - i) as u64;
+            records.extend(overlay[keep_from..j].iter().map(|r| r.to_record()));
+            i = j;
+        }
+        if dropped > 0 {
+            super::META_KV_NODE_FREEZE_SHADOW_DROPPED
+                .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+        }
+        // The horizon covers the WHOLE overlay (its max seq is the newest
+        // record of some key run, which is always kept — asserted by the
+        // equality of the two computations in debug builds).
+        let horizon = guard.overlay.iter().map(|r| r.seq).max().unwrap_or(0);
+        debug_assert_eq!(
+            horizon,
+            records.iter().map(|r| r.seq).max().unwrap_or(0),
+            "the overlay's newest record must survive the shadow-fold"
+        );
         let frame = encode_bset_frame(layout, self.node_seq, &records, horizon)?;
         let frame_len = frame.len();
         let frame = Bytes::from(frame);

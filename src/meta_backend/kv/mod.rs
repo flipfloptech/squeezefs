@@ -255,6 +255,29 @@ pub static META_KV_FOLD_MEMO_BYTES: AtomicU64 = AtomicU64::new(0);
 /// `meta_kv_fold_*` fields above; this is the tests' and profiler's pin).
 pub static META_KV_FOLD_RECORD_DECODES: AtomicU64 = AtomicU64::new(0);
 
+/// Write-commit-economy campaign (2026-07-30): block-publish commits
+/// that staged a **layout delta record** (O(batch) journal bytes)
+/// instead of re-serializing the whole layout — the lever-2 engagement
+/// gauge (`layout_delta_commits` on the stats inode). A streaming write
+/// workload whose publishes stopped moving this while
+/// [`META_KV_LAYOUT_FULL_COMMITS`] grows means the eligibility ladder
+/// regressed (every publish is paying O(block_map) journal bytes again).
+pub static META_KV_LAYOUT_DELTA_COMMITS: AtomicU64 = AtomicU64::new(0);
+
+/// Write-commit-economy campaign: layout publishes that took the
+/// full-`Put` path (first-ever persist, indirect spill, truncate/punch
+/// shapes, chain-cap re-bases, ratchet fallbacks). Healthy streaming
+/// keeps this ≪ [`META_KV_LAYOUT_DELTA_COMMITS`].
+pub static META_KV_LAYOUT_FULL_COMMITS: AtomicU64 = AtomicU64::new(0);
+
+/// Journal-value bytes carried by layout delta records (the collapsed
+/// O(batch) term; compare against `meta_kv_journal_bytes` growth).
+pub static META_KV_LAYOUT_DELTA_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Layout delta records folded onto a base at read/compaction/replay
+/// time (fold-side engagement; each count is one delta applied).
+pub static META_KV_LAYOUT_DELTA_FOLDS: AtomicU64 = AtomicU64::new(0);
+
 /// PR M7 (design-metadata-throughput §5.5 D5): transactions per conveyor
 /// batch — the group-formation histogram the G3 gate reads
 /// (`meta_commit_group_size`; strict-mode median ≥ 4 under the 8-writer

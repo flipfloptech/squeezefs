@@ -25,6 +25,7 @@ pub(crate) mod ipc_direct;
 pub mod ipc_host;
 pub mod ipc_service;
 pub mod job_wire;
+pub mod layout_wire;
 pub mod meta_backend;
 pub mod nvmeof;
 pub mod p2p;

@@ -131,13 +131,29 @@ pub const FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE: u64 = 1 << 3;
 /// non-participating volumes — they stay byte-identical.
 pub const FEATURE_INCOMPAT_KV_SLOT_MIGRATION: u64 = 1 << 4;
 
+/// `features_incompat` bit 5: the volume may carry **layout delta
+/// records** — `Delta`-kind records on `TREE_XATTRS` layout keys whose
+/// payload is the write-commit-economy campaign's `LayoutDelta` wire
+/// (`crate::layout_wire`, 2026-07-30). A pre-campaign binary's fold
+/// would reject the payload as corruption at read/replay/compaction
+/// time (its `InodeDelta::decode` refuses the magic), so the bit makes
+/// the refusal a clean mount-time gate instead. Ordering invariant
+/// (the KD-14 pattern): **(1)** this bit is written and barriered
+/// durably **before (2)** the volume's first layout-delta journal
+/// entry. A crash between (1) and (2) is harmless — old binaries are
+/// refused with zero delta records present, this binary mounts
+/// unchanged. Never set on volumes that never staged a delta — they
+/// stay bit-identical.
+pub const FEATURE_INCOMPAT_KV_LAYOUT_DELTAS: u64 = 1 << 5;
+
 /// Incompat feature bits this binary understands. Any other set bit
 /// refuses the mount naming the bit (§6.1).
 pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
     | FEATURE_INCOMPAT_NODE_SEQ_WATERMARK
     | FEATURE_INCOMPAT_KV_GUEST_SLOTS
     | FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE
-    | FEATURE_INCOMPAT_KV_SLOT_MIGRATION;
+    | FEATURE_INCOMPAT_KV_SLOT_MIGRATION
+    | FEATURE_INCOMPAT_KV_LAYOUT_DELTAS;
 
 /// The §5.5.1a ledger-slot space cap: at most 64 hosted slots per volume,
 /// so a worst-case root-ledger record (24 B header + 34 B fixed prefix +
@@ -758,6 +774,15 @@ pub async fn set_volume_lifecycle_bit(path: &Path) -> Result<bool, KvError> {
 /// zeroed first, so no crash prefix is mountable by any binary at all.
 pub async fn set_guest_slots_bit(path: &Path) -> Result<bool, KvError> {
     set_incompat_bit(path, FEATURE_INCOMPAT_KV_GUEST_SLOTS, "guest-slots").await
+}
+
+/// Stamp [`FEATURE_INCOMPAT_KV_LAYOUT_DELTAS`] on `path`'s superblock —
+/// step **(1)** of the bit-before-first-delta-record ordering invariant
+/// (see the constant's doc). Callers must invoke this (and let the
+/// write land durably — the backend barriers with `sync_device`)
+/// **before** the volume's first layout-delta journal entry is written.
+pub async fn set_layout_deltas_bit(path: &Path) -> Result<bool, KvError> {
+    set_incompat_bit(path, FEATURE_INCOMPAT_KV_LAYOUT_DELTAS, "layout-deltas").await
 }
 
 /// Stamp [`FEATURE_INCOMPAT_KV_SLOT_MIGRATION`] on `path`'s superblock —

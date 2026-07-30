@@ -108,16 +108,11 @@ pub fn parse_inode_from_path(path: &str) -> u64 {
 /// for the non-block-map layout fields. 4 KiB at every knob setting.
 const LAYOUT_INLINE_HEADROOM: usize = 4096;
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Default, Debug)]
-pub struct LayoutMetadata {
-    pub file_type: String,
-    pub size: u64,
-    pub block_map_id: Option<String>,
-    pub block_prefix: Option<String>,
-    pub file_id: Option<String>,
-    pub data_key: Option<Vec<u8>>,
-    pub block_map: Option<std::collections::HashMap<u32, String>>,
-}
+/// The persisted `"layout"` xattr value — lives in [`crate::layout_wire`]
+/// since the write-commit-economy campaign (the KV fold layer folds
+/// layout delta records onto it); re-exported here so every historical
+/// `routing::LayoutMetadata` path keeps working.
+pub use crate::layout_wire::LayoutMetadata;
 
 #[derive(Clone, Debug)]
 pub struct CachedMetadata {

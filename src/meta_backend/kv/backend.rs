@@ -5306,6 +5306,32 @@ impl KvMetaBackend {
         self.commit_tx(tx).await?;
         Ok(())
     }
+
+    /// Write-commit-economy campaign (2026-07-30): the block-publish
+    /// commit — [`Self::set_layout_and_size`] semantics with an
+    /// O(batch)-bytes **layout delta record** where a live inline base
+    /// exists to fold onto, and the caller-provided full layout as the
+    /// always-correct fallback. Returns whether the delta was staged
+    /// (the caller's chain accounting). One two-record transaction
+    /// either way: {layout delta | layout Put} + inode Put — size can
+    /// never lead its data's map (they ride ONE checksummed journal
+    /// entry; the generic/795 law by construction).
+    pub async fn merge_layout_and_size(
+        &self,
+        ino: Ino,
+        delta: &crate::layout_wire::LayoutDelta,
+        full_layout: &[u8],
+        size: u64,
+    ) -> Result<bool> {
+        // Skeleton (red-first contract commit): the always-correct
+        // full-`Put` fallback only — the delta path lands with the fold
+        // integration. Economy contracts in
+        // `tests/write_commit_economy_tests.rs` are RED against this.
+        let _ = delta;
+        super::META_KV_LAYOUT_FULL_COMMITS.fetch_add(1, Ordering::Relaxed);
+        self.set_layout_and_size(ino, full_layout, size).await?;
+        Ok(false)
+    }
 }
 
 impl KvMetaBackend {

@@ -2150,6 +2150,31 @@ impl RoutedMetaBackend {
         out
     }
 
+    /// Write-commit-economy campaign: [`Self::set_layout_and_size`] with
+    /// a layout **delta** carrying the publish batch — the volume stages
+    /// an O(batch) delta record where a live inline base exists, the
+    /// full layout otherwise. Returns whether the delta was staged.
+    pub async fn merge_layout_and_size(
+        &self,
+        ino: Ino,
+        delta: &crate::layout_wire::LayoutDelta,
+        full_layout: &[u8],
+        size: u64,
+    ) -> Result<bool> {
+        // §5.5.2a cutover gate — before the backend's own I-guard and
+        // before route derivation (the `set_layout_and_size` discipline).
+        let _gate = self.slot_gate_enter(&[ino]).await;
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let out = self.volumes[v_idx]
+            .merge_layout_and_size(local_ino, delta, full_layout, size)
+            .await;
+        if out.is_err() {
+            self.mirror_volume_failure(v_idx);
+        }
+        out
+    }
+
     /// Park a WRITE op's kernel-domain times stamp as the ino's pending
     /// refinement (generic/003 remount-divergence fix): the ONE durable
     /// authority for the write's mtime/ctime — the same stamp the FUSE

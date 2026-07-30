@@ -692,3 +692,88 @@ async fn dead_ring_extents_do_not_retain_rss() {
     let expect = ((2000u32 - 1) % 251) as u8;
     assert!(payload.iter().all(|&x| x == expect), "live payload damaged");
 }
+
+// ---------------------------------------------------------------------------
+// OQ-5 (lost-wakeup wedge, 2026-07-30): the warm all-RAM read serve had ZERO
+// tokio coop-budget leaves — a task looping warm reads never ended its poll,
+// so tokio's unstealable LIFO slot starved any task woken from inside that
+// loop (the storm test's times-drain task, woken by a DLM guard drop, was
+// scheduled into the reading worker's LIFO slot and never polled again; its
+// fully-assigned RwLock permits died with it and the staged→striped
+// promotion parked forever on a permit-less stripe semaphore).
+//
+// Contract pinned here: `read_file_range_zero_copy` consumes coop budget, so
+// a warm-read loop yields to peer tasks on the SAME worker within one budget
+// window (≤ 128 iterations), even when every serve is Ready-immediately.
+// Deterministic single-threaded shape: without the budget leaf, task A's
+// poll never ends and B never runs (A completes all 100k iterations); with
+// it, A yields within ~128 iterations and observes B's flag.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn warm_read_loop_yields_to_peer_tasks_on_one_worker() {
+    let h = make("oq5c", "64MB").await;
+    let ino = create(&h, "warm_read_coop").await;
+    write_at(&h, ino, 0, &vec![0xAAu8; STAGED_LEN]).await;
+
+    // Warm the serve once: the loop below must be all-RAM Ready-immediate.
+    let file_path = squeezefs::keys::inode_path(ino);
+    let (data, _b) = h
+        .fs
+        .router
+        .read_file_range_zero_copy(
+            &file_path,
+            0,
+            1024,
+            None,
+            squeezefs::routing::ReadClassHint::default(),
+        )
+        .await
+        .expect("warmup read");
+    assert_eq!(data.len(), 1024);
+
+    let flag = Arc::new(AtomicBool::new(false));
+
+    // A: spawned FIRST — the current-thread scheduler polls it before B.
+    let reader = {
+        let router = h.fs.router.clone();
+        let file_path = file_path.clone();
+        let flag = flag.clone();
+        tokio::spawn(async move {
+            let mut iters = 0u32;
+            while iters < 100_000 {
+                let (data, _b) = router
+                    .read_file_range_zero_copy(
+                        &file_path,
+                        0,
+                        1024,
+                        None,
+                        squeezefs::routing::ReadClassHint::default(),
+                    )
+                    .await
+                    .expect("warm read");
+                assert_eq!(data.len(), 1024);
+                iters += 1;
+                if flag.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            iters
+        })
+    };
+    // B: can only run if A's poll ends while A still loops.
+    let peer = {
+        let flag = flag.clone();
+        tokio::spawn(async move {
+            flag.store(true, Ordering::Release);
+        })
+    };
+
+    let iters = reader.await.expect("reader task");
+    peer.await.expect("peer task");
+    assert!(
+        iters < 100_000,
+        "warm read loop starved a peer task on the same worker for 100k \
+         iterations: the read serve consumed no coop budget (OQ-5 lost-wakeup \
+         wedge shape — the LIFO-slot victim never runs)"
+    );
+}

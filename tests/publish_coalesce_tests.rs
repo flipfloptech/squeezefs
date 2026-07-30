@@ -29,6 +29,10 @@
 //! 5. SIZE-NEVER-LEADS-DATA through replay: a drop-without-shutdown
 //!    reopen folds a size that never exceeds its mapped coverage
 //!    (size and map ride one checksummed journal entry).
+//! 6. The REWRITE shape (the field conviction's 6.7 GB/s face): a
+//!    second pass over published blocks coalesces identically,
+//!    displaces EVERY prior binding (the purge path engaged), keeps
+//!    size exact, serves the new bytes, and remounts to the same fold.
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -334,6 +338,161 @@ async fn streaming_publishes_coalesce_and_fsync_is_durably_complete() {
     // Read-back correctness through the published map.
     let got = read_at(&h, ino, 5 * BS, BS as usize).await;
     assert_eq!(got, payload, "read-back through the coalesced publish");
+}
+
+// =========================================================================
+// 2b. The REWRITE shape (the field's 6.7 GB/s conviction face): a second
+//     streaming pass over already-published blocks must coalesce
+//     identically, DISPLACE every prior binding (each rewritten block's
+//     key changes — the displaced-key purge engaged), keep size exact
+//     (rewrite grows nothing), serve the NEW bytes, and remount to the
+//     same folded truth.
+// =========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rewrite_pass_coalesces_and_displaces_every_prior_binding() {
+    let _s = serial().await;
+    let _k = KnobGuard;
+    set_publish_coalesce_override(None);
+    set_layout_delta_chain_override(None);
+
+    let meta = NamedTempFile::new().unwrap();
+    meta.as_file().set_len(128 * 1024 * 1024).unwrap();
+    let h = make(*b"pc-t1b-rewrite!!", "pc_ns_t1b", meta.path(), true).await;
+    let ino = striped_fixture(&h, "t1b").await;
+
+    const N: u32 = 48;
+    // Fresh pass: stream N whole blocks and make them durable.
+    let fresh = pattern(BS as usize, 0x42);
+    let mut writers = Vec::new();
+    for b in 2..2 + N {
+        let fs = h.fs.clone();
+        let req = h.req;
+        let data = bytes::Bytes::copy_from_slice(&fresh);
+        writers.push(tokio::spawn(async move {
+            let w = fs
+                .write(req, ino, 0, b as u64 * BS, data, 0, 0)
+                .await
+                .unwrap();
+            assert_eq!(w.written as u64, BS, "short fresh write at block {b}");
+        }));
+    }
+    for w in writers {
+        w.await.unwrap();
+    }
+    h.fs.fsync(h.req, ino, 0, false).await.unwrap();
+    assert!(
+        h.fs.write_pipeline.quiesce(Duration::from_secs(30)).await,
+        "fresh pipeline must drain"
+    );
+    let before = persisted_layout(&h, ino).await;
+    let map_before = before.block_map.clone().expect("fresh map persisted");
+
+    // Rewrite pass: same blocks, new bytes, concurrent (the parallel dio
+    // shape), against ms-scale commits (the pass-delay seam).
+    squeezefs::routing::TEST_PUBLISH_PASS_DELAY_MS.store(5, Ordering::Relaxed);
+    let batched_0 = METRICS
+        .layout_publish_batched_blocks
+        .load(Ordering::Relaxed);
+    let batches_0 = METRICS.layout_publish_batches.load(Ordering::Relaxed);
+    let deltas_0 = META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed);
+    let rewrite = pattern(BS as usize, 0x77);
+    let mut writers = Vec::new();
+    for b in 2..2 + N {
+        let fs = h.fs.clone();
+        let req = h.req;
+        let data = bytes::Bytes::copy_from_slice(&rewrite);
+        writers.push(tokio::spawn(async move {
+            let w = fs
+                .write(req, ino, 0, b as u64 * BS, data, 0, 0)
+                .await
+                .unwrap();
+            assert_eq!(w.written as u64, BS, "short rewrite at block {b}");
+        }));
+    }
+    for w in writers {
+        w.await.unwrap();
+    }
+    h.fs.fsync(h.req, ino, 0, false).await.unwrap();
+    assert!(
+        h.fs.write_pipeline.quiesce(Duration::from_secs(30)).await,
+        "rewrite pipeline must drain"
+    );
+    squeezefs::routing::TEST_PUBLISH_PASS_DELAY_MS.store(0, Ordering::Relaxed);
+
+    let batched = METRICS
+        .layout_publish_batched_blocks
+        .load(Ordering::Relaxed)
+        - batched_0;
+    let batches = METRICS.layout_publish_batches.load(Ordering::Relaxed) - batches_0;
+    let deltas = META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed) - deltas_0;
+    println!("rewrite phase: {batched} publishes in {batches} batches ({deltas} delta commits)");
+    assert!(
+        batched >= N as u64,
+        "every rewrite publish must ride the conveyor ({batched} < {N})"
+    );
+    assert!(
+        batches < batched,
+        "rewrite publishes against ms-scale commits must coalesce \
+         (got {batches} batches for {batched} publishes)"
+    );
+    assert!(
+        deltas >= 1,
+        "rewrites onto a persisted base must engage the delta path"
+    );
+
+    // Displacement face: every rewritten block's binding CHANGED (the
+    // pipeline uploads to fresh offsets; the batch apply displaced and
+    // purged the prior key — a rewrite that reuses the old binding
+    // never displaced anything and the purge path went untested).
+    let after = persisted_layout(&h, ino).await;
+    let map_after = after.block_map.clone().expect("rewritten map persisted");
+    assert_eq!(
+        map_before.keys().collect::<std::collections::BTreeSet<_>>(),
+        map_after.keys().collect::<std::collections::BTreeSet<_>>(),
+        "a pure rewrite maps exactly the same block set"
+    );
+    let changed = (2..2 + N)
+        .filter(|b| map_before.get(b) != map_after.get(b))
+        .count();
+    assert_eq!(
+        changed, N as usize,
+        "every rewritten block must displace its prior binding \
+         ({changed}/{N} changed — the displaced-key purge did not engage)"
+    );
+    assert_eq!(
+        after.size, before.size,
+        "a pure rewrite grows nothing (size must be exact)"
+    );
+
+    // The NEW bytes serve — through RAM and through the durable fold.
+    let got = read_at(&h, ino, 7 * BS, BS as usize).await;
+    assert_eq!(got, rewrite, "read-back must serve the rewritten bytes");
+
+    // Remount equivalence: clean shutdown → reopen → the fold agrees.
+    let routed = h.fs.meta_backend.clone().unwrap();
+    drop(h);
+    for vol in &routed.volumes {
+        vol.shutdown().await.expect("shutdown");
+    }
+    drop(routed);
+    let be = KvMetaBackend::open(meta.path()).await.unwrap();
+    let reopened = RoutedMetaBackend::new(vec![be]);
+    let bytes = reopened
+        .getxattr(ino, "layout")
+        .await
+        .expect("getxattr")
+        .expect("layout present after remount");
+    let refolded = bincode::deserialize::<LayoutMetadata>(&bytes).expect("layout");
+    assert_eq!(refolded.size, after.size, "remounted size must match");
+    assert_eq!(
+        refolded.block_map.as_ref().expect("map"),
+        &map_after,
+        "the remounted fold must reconstruct the rewritten map exactly"
+    );
+    for vol in &reopened.volumes {
+        vol.shutdown().await.expect("shutdown");
+    }
 }
 
 // =========================================================================

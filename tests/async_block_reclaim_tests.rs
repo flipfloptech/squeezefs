@@ -105,6 +105,38 @@
 //! fs.write / fs.setattr — the write-through + displacement machinery),
 //! never a hand-armed queue: the fidelity gap that let the original suite
 //! stay green while the field disengaged.
+//!
+//! ## Rewrite-wall drain rate (2026-07-31 write-wall campaign) — contracts 10–11
+//!
+//! Field conviction (4-node cluster, dev c9921f1, mid-rewrite at
+//! 6.3–6.8 GB/s): `block_free_reclaim_queue_bytes` pinned at the queue
+//! cap (17,418,944,512 B ≈ 4,153 × 4 MiB) with 196,747 queued vs 589
+//! worker batches — the at-cap enqueue arm processed MOST displaced
+//! blocks INLINE on the write path (the conservation-over-latency
+//! backstop engaged as the steady state) because the single serial
+//! worker drained ~500 blocks/s while the rewrite displaced ~1,650/s.
+//! Backpressure is the DESIGNED last resort; a drain rate below any
+//! sustainable displacement rate makes it the norm.
+//!
+//! 10. **Drain rate must exceed any sustainable displacement rate**: the
+//!     worker fans device groups out across demand-derived parallel
+//!     lanes (backends × queued demand, bounded per device); a
+//!     displacement storm arriving at ~4× the SERIAL drain rate (the
+//!     deterministic slow-device seam prices each lane pass) must never
+//!     cap the queue — ZERO inline spills
+//!     (`block_free_reclaim_inline_spills`, the engagement instrument) —
+//!     while conservation (per-block ledger, exactly-once, gauge
+//!     convergence) holds unchanged.
+//! 11. **Adjacent-range coalescing survives the fan-out**: contiguous
+//!     displaced ranges merge into FEW device commands
+//!     (`block_free_reclaim_commands` — the command-economy face) while
+//!     the per-block discard/punch ledger stays exact; lane chunking
+//!     never splits what one batch could coalesce.
+//!
+//! RED against dev c9921f1: neither `block_free_reclaim_inline_spills`
+//! nor `block_free_reclaim_commands` exists, and the worker drains
+//! serially (one batch of `SQUEEZEFS_RECLAIM_BATCH_BLOCKS` per pass —
+//! contract 10's storm caps the queue and spills inline).
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -221,6 +253,14 @@ fn fence_halts() -> u64 {
 }
 fn double_frees() -> u64 {
     METRICS.block_double_frees.load(Ordering::Relaxed)
+}
+fn inline_spills() -> u64 {
+    METRICS
+        .block_free_reclaim_inline_spills
+        .load(Ordering::Relaxed)
+}
+fn reclaim_commands() -> u64 {
+    METRICS.block_free_reclaim_commands.load(Ordering::Relaxed)
 }
 
 /// Poll until `cond` holds or ~5 s elapse (background-worker completion —
@@ -1567,4 +1607,162 @@ async fn brim_rewrite_converges_in_place_with_honest_ledger() {
 
 fn staged_field_key(ino: u64, b: u64) -> String {
     squeezefs::keys::active_block(ino, b).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Contract 10 — drain rate: a displacement storm at ~4× the SERIAL drain
+// rate must never cap the queue (zero inline spills) while conservation
+// holds. The 2026-07-31 write-wall campaign's rewrite-wall conviction.
+// ---------------------------------------------------------------------------
+
+/// Poll like [`eventually`] but with a longer deadline (a 256-block
+/// storm's full drain on a seam-priced slow device).
+async fn eventually_within(
+    mut cond: impl FnMut() -> bool,
+    deadline: std::time::Duration,
+    what: &str,
+) {
+    let deadline = std::time::Instant::now() + deadline;
+    while !cond() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background reclaim never converged: {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn displacement_storm_never_caps_queue_or_spills_inline() {
+    let _g = serial().await;
+    // Deterministic drain-rate pricing (the field's slow-target shape):
+    // each lane pass costs 50 ms (the seam), batches are 8 blocks, so the
+    // SERIAL drain rate is 8 / 50 ms = 160 blocks/s. The storm below
+    // arrives at ~640 blocks/s — 4× serial — and the cap is 96: the
+    // pre-campaign single-lane worker caps within ~0.2 s and spills
+    // inline; the demand-derived fan-out must not.
+    let _b = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", "8");
+    let _m = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_MS", "0");
+    let _s = EnvGuard::set("SQUEEZEFS_TEST_RECLAIM_STALL_MS", "50");
+    let _c = EnvGuard::set("SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS", "96");
+    let (router, ba, _backing, _staging) = make_router().await;
+
+    // 256 published blocks to displace (offsets may run past the sparse
+    // backing's EOF — a refused punch is a counted skip, and the
+    // conservation ledger below accepts punched-or-skipped).
+    let mut offsets = Vec::with_capacity(256);
+    for _ in 0..256 {
+        let o = ba.allocate_block().await.expect("alloc");
+        ba.publish_block(o);
+        offsets.push(o);
+    }
+
+    let (sp0, p0, s0, d0, df0, qb0) = (
+        inline_spills(),
+        punches(),
+        skipped(),
+        discards(),
+        double_frees(),
+        queue_bytes(),
+    );
+
+    // The storm: 256 terminal frees paced at ~640 blocks/s (8 per
+    // 12.5 ms tick — pacing is the WORKLOAD shape, not synchronization).
+    for chunk in offsets.chunks(8) {
+        for o in chunk {
+            router
+                .backend_router
+                .free_block(&o.to_string())
+                .await
+                .expect("terminal free");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(12)).await;
+    }
+
+    // THE contract: the queue never capped — no displaced block's reclaim
+    // ran inline on the (simulated) write path.
+    assert_eq!(
+        inline_spills() - sp0,
+        0,
+        "a displacement storm at 4× the serial drain rate must never \
+         engage the at-cap inline-backpressure arm — the reclaim worker's \
+         demand-derived lanes must outrun any sustainable displacement \
+         rate (the 2026-07-31 rewrite-wall conviction)"
+    );
+
+    // Conservation unchanged: every block reclaimed-or-consciously-
+    // skipped exactly once, gauge converges to baseline.
+    eventually_within(
+        || {
+            (punches() - p0) + (skipped() - s0) + (discards() - d0) == 256
+                && queue_bytes() == qb0
+        },
+        std::time::Duration::from_secs(30),
+        "storm blocks reclaimed exactly once, gauge back to baseline",
+    )
+    .await;
+    assert_eq!(double_frees() - df0, 0, "exactly-once under the fan-out");
+}
+
+// ---------------------------------------------------------------------------
+// Contract 11 — adjacent-range coalescing survives the fan-out: few
+// device commands, exact per-block ledger.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adjacent_displaced_ranges_coalesce_into_fewer_device_commands() {
+    let _g = serial().await;
+    // One accumulation window collects the whole burst into one take.
+    let _b = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", "64");
+    let _m = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_MS", "100");
+    let (router, ba, _backing, _staging) = make_router().await;
+
+    // 64 CONTIGUOUS blocks (fresh allocator: sequential chunk cursor —
+    // asserted, the premise must be loud).
+    let mut offsets = Vec::with_capacity(64);
+    for _ in 0..64 {
+        let o = ba.allocate_block().await.expect("alloc");
+        ba.publish_block(o);
+        offsets.push(o);
+    }
+    for (i, o) in offsets.iter().enumerate() {
+        assert_eq!(
+            *o,
+            offsets[0] + i as u64 * CHUNK_SIZE,
+            "premise: fresh allocator must hand out contiguous chunks"
+        );
+    }
+
+    let (c0, p0, s0, qb0) = (reclaim_commands(), punches(), skipped(), queue_bytes());
+
+    // Burst-free all 64 inside the accumulation window.
+    for o in &offsets {
+        router
+            .backend_router
+            .free_block(&o.to_string())
+            .await
+            .expect("terminal free");
+    }
+
+    eventually(
+        || (punches() - p0) + (skipped() - s0) == 64 && queue_bytes() == qb0,
+        "burst reclaimed with per-block ledger intact",
+    )
+    .await;
+    assert_eq!(
+        skipped() - s0,
+        0,
+        "premise: contiguous in-file ranges must actually punch"
+    );
+
+    // The command-economy face: 64 adjacent blocks must merge into FEW
+    // device commands (one per lane chunk at most — coalescing must
+    // survive the parallel fan-out).
+    let cmds = reclaim_commands() - c0;
+    assert!(
+        (1..=8).contains(&cmds),
+        "64 contiguous displaced blocks must coalesce into ≤ 8 device \
+         commands (got {cmds}); per-block counting stays exact by the \
+         punches assertion above"
+    );
 }

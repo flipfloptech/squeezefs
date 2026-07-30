@@ -1225,6 +1225,7 @@ impl CachedNode {
                     RecordKind::Put => Some(FoldedHead::Live {
                         value: rec.value.clone(),
                         decoded: None,
+                        materialized: false,
                     }),
                     RecordKind::Delete => Some(FoldedHead::Tombstone),
                     RecordKind::Delta => {
@@ -1341,6 +1342,7 @@ impl CachedNode {
                     LiveLookup::Live(v) => FoldedHead::Live {
                         value: v.clone(),
                         decoded: None,
+                        materialized: false,
                     },
                     LiveLookup::Tombstone => FoldedHead::Tombstone,
                     LiveLookup::Absent => FoldedHead::Absent,
@@ -1365,6 +1367,9 @@ impl CachedNode {
                     std::borrow::Cow::Borrowed(v) => Bytes::copy_from_slice(v),
                 },
                 decoded: None,
+                // Either arm owns a fresh buffer (folded or copied) —
+                // charge it (the honest-budget face of `owned_bytes`).
+                materialized: true,
             },
         })
     }

@@ -543,6 +543,16 @@ pub struct KvMetaBackend {
     journal_failures: AtomicU64,
     /// `meta_kv_journal_full_stalls` (§4.4 pt 5): ring-admission parks.
     stalls: AtomicU64,
+    /// Write-commit-economy (2026-07-30): whether this volume is cleared
+    /// to stage layout delta records — `true` once the
+    /// `KV_LAYOUT_DELTAS` incompat bit is durably on the superblock
+    /// (seeded at open; ratcheted by [`Self::layout_deltas_ready`]
+    /// before the FIRST delta record, per the KD-14
+    /// bit-before-durable-record ordering).
+    layout_deltas_ok: AtomicBool,
+    /// Serializes the one-time incompat ratchet (sector-0 RMW must not
+    /// race itself); contended at most once per volume lifetime.
+    layout_delta_ratchet: tokio::sync::Mutex<()>,
     // ---- PR M7: the §5.5 D5 commit conveyor ----
     /// The per-volume conveyor: all user commits enqueue here; a
     /// leader-elect committer spawns the detached pass task that drains
@@ -1107,6 +1117,8 @@ impl KvMetaBackend {
         };
         let strict = crate::meta_backend::resolve_flush_interval_ms() == 0;
         let read_only = sb.unknown_ro() != 0;
+        let layout_deltas_stamped =
+            sb.features_incompat & super::superblock::FEATURE_INCOMPAT_KV_LAYOUT_DELTAS != 0;
         let sync = Arc::new(SyncCoalescer::new());
         let retire_seq = Arc::new(AtomicU64::new(ledger.seq + 1));
         let smo = tokio::sync::Mutex::new(SmoContext::with_journal(
@@ -1146,6 +1158,8 @@ impl KvMetaBackend {
             failed: AtomicBool::new(false),
             journal_failures: AtomicU64::new(0),
             stalls: AtomicU64::new(0),
+            layout_deltas_ok: AtomicBool::new(layout_deltas_stamped),
+            layout_delta_ratchet: tokio::sync::Mutex::new(()),
             conveyor: Arc::new(ConveyorCore::new()),
             conveyor_self: std::sync::OnceLock::new(),
             batch_max_txs: commit_batch_txs_env(),
@@ -3187,6 +3201,13 @@ impl KvTx {
             RecordKind::Delta,
             Bytes::from(delta.encode()),
         ));
+    }
+
+    /// Stage a pre-encoded `Delta` payload (the layout-delta class —
+    /// `crate::layout_wire` wire bytes; write-commit-economy 2026-07-30).
+    fn stage_delta_raw(&mut self, tree_id: u8, key: impl Into<Vec<u8>>, payload: impl Into<Bytes>) {
+        self.staged
+            .push((tree_id, key.into(), RecordKind::Delta, payload.into()));
     }
 
     fn stage_delete(&mut self, tree_id: u8, key: impl Into<Vec<u8>>) {
@@ -5309,13 +5330,22 @@ impl KvMetaBackend {
 
     /// Write-commit-economy campaign (2026-07-30): the block-publish
     /// commit — [`Self::set_layout_and_size`] semantics with an
-    /// O(batch)-bytes **layout delta record** where a live inline base
-    /// exists to fold onto, and the caller-provided full layout as the
-    /// always-correct fallback. Returns whether the delta was staged
-    /// (the caller's chain accounting). One two-record transaction
-    /// either way: {layout delta | layout Put} + inode Put — size can
-    /// never lead its data's map (they ride ONE checksummed journal
-    /// entry; the generic/795 law by construction).
+    /// O(batch)-bytes **layout delta record** where a live inline
+    /// bincode base exists to fold onto, and the caller-provided full
+    /// layout as the always-correct fallback. Returns whether the delta
+    /// was staged (the caller's chain accounting). One two-record
+    /// transaction either way: {layout delta | layout Put} + inode Put —
+    /// size can never lead its data's map (they ride ONE checksummed
+    /// journal entry; the generic/795 law by construction).
+    ///
+    /// Delta eligibility here is the backend's OWN half of the ladder:
+    /// a live layout record must exist at the slot and must not be a
+    /// legacy-JSON value (byte peek). The **caller** owns the other
+    /// half — never passing a delta whose base is `indirect:` or whose
+    /// RAM authority diverged from the persisted base outside the map
+    /// (the routing `layout_delta_chain` accounting); the fold's
+    /// `decode_base_layout` refusals make a violated rule loud, never
+    /// silent.
     pub async fn merge_layout_and_size(
         &self,
         ino: Ino,
@@ -5323,14 +5353,89 @@ impl KvMetaBackend {
         full_layout: &[u8],
         size: u64,
     ) -> Result<bool> {
-        // Skeleton (red-first contract commit): the always-correct
-        // full-`Put` fallback only — the delta path lands with the fold
-        // integration. Economy contracts in
-        // `tests/write_commit_economy_tests.rs` are RED against this.
-        let _ = delta;
-        super::META_KV_LAYOUT_FULL_COMMITS.fetch_add(1, Ordering::Relaxed);
-        self.set_layout_and_size(ino, full_layout, size).await?;
-        Ok(false)
+        self.write_gate()?;
+        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+        let mut v = self
+            .read_inode_value(ino)
+            .await?
+            .ok_or_else(|| Self::not_found(format!("Inode {ino} not found")))?;
+        v.size = size;
+        // NEVER author times here — the `set_layout_and_size` clock-
+        // authority rule verbatim (generic/003; the unfolded
+        // `read_inode_value` keeps parked Δtime refinements pending).
+        let tx0 = KvTx::new();
+        let (existing, key) = self.xattr_slot(&tx0, ino, "layout").await?;
+        let mut tx = tx0;
+
+        // The backend eligibility half: a live, non-JSON base to fold
+        // onto (one point lookup under the held I-guard), and the
+        // incompat bit durably stamped (the one-time ratchet).
+        let mut use_delta = false;
+        if existing {
+            if let Some(cur) = self.xattrs.lookup(&key).await? {
+                let base_ok = XattrValue::decode(&cur)
+                    .map(|x| !x.value.starts_with(b"{"))
+                    .unwrap_or(false);
+                if base_ok {
+                    use_delta = self.layout_deltas_ready().await;
+                }
+            }
+        }
+        if use_delta {
+            let wire = delta.encode();
+            super::META_KV_LAYOUT_DELTA_BYTES.fetch_add(wire.len() as u64, Ordering::Relaxed);
+            super::META_KV_LAYOUT_DELTA_COMMITS.fetch_add(1, Ordering::Relaxed);
+            tx.stage_delta_raw(TREE_XATTRS, key, wire);
+        } else {
+            super::META_KV_LAYOUT_FULL_COMMITS.fetch_add(1, Ordering::Relaxed);
+            tx.stage_put(
+                TREE_XATTRS,
+                key,
+                XattrValue::encode_parts(b"layout", full_layout)?,
+            );
+        }
+        tx.stage_put(TREE_INODES, inode_key(ino), v.encode());
+        tx.hold_guards(guards);
+        self.commit_tx(tx).await?;
+        Ok(use_delta)
+    }
+
+    /// The one-time `KV_LAYOUT_DELTAS` ratchet (KD-14 ordering: the bit
+    /// is durable BEFORE the volume's first delta record can be).
+    /// `false` = the ratchet could not complete — the caller falls back
+    /// to the always-correct full `Put` (never block writes on it).
+    async fn layout_deltas_ready(&self) -> bool {
+        if self.layout_deltas_ok.load(Ordering::Acquire) {
+            return true;
+        }
+        let _g = self.layout_delta_ratchet.lock().await;
+        if self.layout_deltas_ok.load(Ordering::Acquire) {
+            return true;
+        }
+        match super::superblock::set_layout_deltas_bit(&self.path).await {
+            Ok(_newly_set) => {
+                // Barrier the sector-0 write before any delta entry can
+                // become durable (same device — one fdatasync covers it).
+                if let Err(e) = self.sync_device().await {
+                    log::warn!(
+                        "meta volume {}: layout-delta ratchet barrier failed ({e}); \
+                         staying on the full-Put path",
+                        self.path.display()
+                    );
+                    return false;
+                }
+                self.layout_deltas_ok.store(true, Ordering::Release);
+                true
+            }
+            Err(e) => {
+                log::warn!(
+                    "meta volume {}: could not stamp KV_LAYOUT_DELTAS ({e}); \
+                     staying on the full-Put path",
+                    self.path.display()
+                );
+                false
+            }
+        }
     }
 }
 

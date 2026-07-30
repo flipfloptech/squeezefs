@@ -287,27 +287,9 @@ impl LayoutDelta {
     /// the folded value canonically re-encoded. Refuses non-inline
     /// bases loud (module docs "Refusals").
     pub fn apply(&self, base: &[u8]) -> Result<Vec<u8>, LayoutWireError> {
-        if base.first() == Some(&b'{') {
-            return Err(LayoutWireError::BadBase(
-                "legacy JSON layout base — deltas require a bincode base".into(),
-            ));
-        }
-        let mut layout: LayoutMetadata = bincode::deserialize(base).map_err(|e| {
-            LayoutWireError::BadBase(format!("base does not decode as a bincode layout: {e}"))
-        })?;
-        if layout
-            .block_map_id
-            .as_deref()
-            .is_some_and(|id| id.starts_with("indirect:"))
-        {
-            return Err(LayoutWireError::BadBase(
-                "indirect base — its map lives in a data-plane blob; a delta cannot fold onto it"
-                    .into(),
-            ));
-        }
+        let mut layout = decode_base_layout(base)?;
         self.apply_to(&mut layout);
-        bincode::serialize(&layout)
-            .map_err(|e| LayoutWireError::Malformed(format!("re-encode failed: {e}")))
+        encode_layout(&layout)
     }
 
     /// The in-place fold: map inserts + absolute non-map overwrite.
@@ -325,6 +307,38 @@ impl LayoutDelta {
         layout.file_id = self.file_id.clone();
         layout.data_key = self.data_key.clone();
     }
+}
+
+/// Decode a delta's BASE layout value with the refusal ladder (module
+/// docs "Refusals"): legacy-JSON, undecodable, and `indirect:` bases
+/// are loud errors — a delta staged onto any of them is corruption.
+pub fn decode_base_layout(base: &[u8]) -> Result<LayoutMetadata, LayoutWireError> {
+    if base.first() == Some(&b'{') {
+        return Err(LayoutWireError::BadBase(
+            "legacy JSON layout base — deltas require a bincode base".into(),
+        ));
+    }
+    let layout: LayoutMetadata = bincode::deserialize(base).map_err(|e| {
+        LayoutWireError::BadBase(format!("base does not decode as a bincode layout: {e}"))
+    })?;
+    if layout
+        .block_map_id
+        .as_deref()
+        .is_some_and(|id| id.starts_with("indirect:"))
+    {
+        return Err(LayoutWireError::BadBase(
+            "indirect base — its map lives in a data-plane blob; a delta cannot fold onto it"
+                .into(),
+        ));
+    }
+    Ok(layout)
+}
+
+/// Canonical layout encoding (deterministic — the struct's sorted-map
+/// serializer; see module docs).
+pub fn encode_layout(layout: &LayoutMetadata) -> Result<Vec<u8>, LayoutWireError> {
+    bincode::serialize(layout)
+        .map_err(|e| LayoutWireError::Malformed(format!("layout re-encode failed: {e}")))
 }
 
 /// Minimal strict reader (the `record.rs` `Reader` shape, local so this

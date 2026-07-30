@@ -8,6 +8,7 @@
 //! records, carry a leading varint version tag for future extension.
 
 use super::KvError;
+use crate::layout_wire::{self, LayoutDelta};
 use bytes::Bytes;
 use std::borrow::Cow;
 
@@ -808,6 +809,65 @@ impl Folded<'_> {
     }
 }
 
+/// Apply a collected delta chain (**newest-first** slice) onto its base
+/// `Put` value — the §4.2 algebra's one value-aware step, branched by
+/// delta **class** (write-commit-economy campaign, 2026-07-30):
+///
+/// - **Layout deltas** ([`crate::layout_wire`] magic): the base is an
+///   [`XattrValue`] envelope around a bincode layout; each delta merges
+///   its `(block → key)` entries and overwrites the absolute non-map
+///   fields; the folded value re-encodes canonically (deterministic —
+///   the digest-walk / replay-twice requirement).
+/// - **Inode deltas** (everything else): the historical
+///   [`InodeDelta::apply`] onto an [`InodeValue`].
+///
+/// A chain mixing classes on one key is representable only by
+/// corruption (inode and xattr keys never alias) and fails loud.
+fn fold_deltas_onto_put(base_value: &[u8], deltas: &[RecordRef<'_>]) -> Result<Vec<u8>, KvError> {
+    debug_assert!(!deltas.is_empty());
+    // PR M9 decode pin (§5.7): one count per record decoded — the base
+    // Put plus every collected delta. Overlay-head / memo serves must
+    // keep this at zero on the read path.
+    super::META_KV_FOLD_RECORD_DECODES.fetch_add(
+        1 + deltas.len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let corrupt = |e: layout_wire::LayoutWireError| KvError::Corrupt(format!("{e}"));
+    if layout_wire::is_layout_delta(deltas[0].value) {
+        let x = XattrValue::decode(base_value)?;
+        let mut layout = layout_wire::decode_base_layout(&x.value).map_err(corrupt)?;
+        // Ascending seq order: oldest delta first, newest last wins.
+        for d in deltas.iter().rev() {
+            if !layout_wire::is_layout_delta(d.value) {
+                return Err(KvError::Corrupt(
+                    "mixed delta classes in one key's chain".into(),
+                ));
+            }
+            LayoutDelta::decode(d.value)
+                .map_err(corrupt)?
+                .apply_to(&mut layout);
+        }
+        super::META_KV_LAYOUT_DELTA_FOLDS
+            .fetch_add(deltas.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        XattrValue::encode_parts(
+            &x.name,
+            &layout_wire::encode_layout(&layout).map_err(corrupt)?,
+        )
+    } else {
+        let mut base = InodeValue::decode(base_value)?;
+        // Ascending seq order: oldest delta first, newest last wins.
+        for d in deltas.iter().rev() {
+            if layout_wire::is_layout_delta(d.value) {
+                return Err(KvError::Corrupt(
+                    "mixed delta classes in one key's chain".into(),
+                ));
+            }
+            InodeDelta::decode(d.value)?.apply(&mut base);
+        }
+        Ok(base.encode())
+    }
+}
+
 /// Fold one key's records, presented **newest-seq-first** (ties across
 /// sources keep input order and are legal only for identical-effect records,
 /// e.g. a node bset overlapping the journal replay window).
@@ -851,20 +911,8 @@ where
                         seq: r.seq,
                     });
                 }
-                // PR M9 decode pin (§5.7): one count per record decoded —
-                // the base Put plus every collected delta. Overlay-head /
-                // memo serves must keep this at zero on the read path.
-                super::META_KV_FOLD_RECORD_DECODES.fetch_add(
-                    1 + deltas.len() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                let mut base = InodeValue::decode(r.value)?;
-                // Ascending seq order: oldest delta first, newest last wins.
-                for d in deltas.iter().rev() {
-                    InodeDelta::decode(d.value)?.apply(&mut base);
-                }
                 return Ok(Folded::Put {
-                    value: Cow::Owned(base.encode()),
+                    value: Cow::Owned(fold_deltas_onto_put(r.value, &deltas)?),
                     seq: deltas[0].seq,
                 });
             }
@@ -924,13 +972,16 @@ pub fn compact_fold(
 /// (already decoded)").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FoldedHead {
-    /// The key folds to a live value. `decoded` is `Some` exactly when
-    /// the head was produced by delta application (a fresh owned buffer);
-    /// a plain-`Put` head borrows the record's own bytes and defers the
-    /// decode to the first delta that needs it.
+    /// The key folds to a live value. `decoded` carries the
+    /// already-decoded INODE value across inode-delta applies (layout
+    /// heads re-decode from `value` — their class is self-describing);
+    /// `materialized` is `true` exactly when `value` is a fresh owned
+    /// buffer produced by delta application or a cold re-fold (a
+    /// plain-`Put` head refcounts the record's existing buffer).
     Live {
         value: Bytes,
         decoded: Option<InodeValue>,
+        materialized: bool,
     },
     /// A tombstone shadows the key.
     Tombstone,
@@ -940,15 +991,16 @@ pub enum FoldedHead {
 
 impl FoldedHead {
     /// Heap bytes this head OWNS beyond its enum footprint: the folded
-    /// value buffer when it was materialized by delta application (a
-    /// plain-`Put` head refcounts the record's existing buffer — no new
-    /// heap). The §5.7 budget accounting charges exactly this plus a
-    /// fixed per-head overhead.
+    /// value buffer when it was materialized by delta application or a
+    /// cold re-fold (a plain-`Put` head refcounts the record's existing
+    /// buffer — no new heap). The §5.7 budget accounting charges exactly
+    /// this plus a fixed per-head overhead.
     pub fn owned_bytes(&self) -> usize {
         match self {
             FoldedHead::Live {
                 value,
-                decoded: Some(_),
+                materialized: true,
+                ..
             } => value.len(),
             _ => 0,
         }
@@ -962,8 +1014,12 @@ impl FoldedHead {
 ///
 /// - `Put` ⇒ the new value (LWW — shadows everything below);
 /// - `Delete` ⇒ tombstone (shadows everything below);
-/// - `Delta` onto a live head ⇒ [`InodeDelta::apply`] onto the decoded
-///   base (decoding it first only if the head was a borrowed plain-`Put`);
+/// - `Delta` onto a live head ⇒ class-branched (the
+///   [`fold_deltas_onto_put`] algebra run one step at a time): an inode
+///   delta is [`InodeDelta::apply`] onto the decoded base (decoding it
+///   first only if the head was a borrowed plain-`Put`); a **layout
+///   delta** ([`crate::layout_wire`] magic) folds the head's
+///   [`XattrValue`] layout envelope and re-encodes canonically;
 /// - `Delta` onto a tombstone ⇒ still the tombstone (the scan hits the
 ///   `Delete` before any `Put` — §4.2's "collected deltas discarded");
 /// - `Delta` onto absent ⇒ still absent (the Δ-without-base counted
@@ -975,8 +1031,8 @@ impl FoldedHead {
 /// apply-path semantics (the node cache) map them to "no head — fall back
 /// to the read-time fold", which reproduces today's behavior byte-for-
 /// byte. The equivalence property `fold_forward ≡ fold_newest_first` over
-/// randomized histories is pinned by proptest below and by
-/// `tests/kv_fold_slimming_tests.rs` end-to-end (risk R7).
+/// randomized histories is pinned by proptest below (both delta classes)
+/// and by `tests/kv_fold_slimming_tests.rs` end-to-end (risk R7).
 pub fn fold_forward(
     prev: &FoldedHead,
     kind: RecordKind,
@@ -986,10 +1042,38 @@ pub fn fold_forward(
         RecordKind::Put => Ok(FoldedHead::Live {
             value: value.clone(),
             decoded: None,
+            materialized: false,
         }),
         RecordKind::Delete => Ok(FoldedHead::Tombstone),
         RecordKind::Delta => match prev {
-            FoldedHead::Live { value: v, decoded } => {
+            FoldedHead::Live {
+                value: v, decoded, ..
+            } => {
+                if layout_wire::is_layout_delta(value) {
+                    // Layout class: base envelope decode + one delta
+                    // apply + canonical re-encode (deterministic bytes —
+                    // the digest-walk requirement).
+                    let corrupt =
+                        |e: layout_wire::LayoutWireError| KvError::Corrupt(format!("{e}"));
+                    super::META_KV_FOLD_RECORD_DECODES
+                        .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+                    let x = XattrValue::decode(v)?;
+                    let mut layout = layout_wire::decode_base_layout(&x.value).map_err(corrupt)?;
+                    LayoutDelta::decode(value)
+                        .map_err(corrupt)?
+                        .apply_to(&mut layout);
+                    super::META_KV_LAYOUT_DELTA_FOLDS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let folded = XattrValue::encode_parts(
+                        &x.name,
+                        &layout_wire::encode_layout(&layout).map_err(corrupt)?,
+                    )?;
+                    return Ok(FoldedHead::Live {
+                        value: Bytes::from(folded),
+                        decoded: None,
+                        materialized: true,
+                    });
+                }
                 let mut base = match decoded {
                     Some(iv) => *iv,
                     None => {
@@ -1006,6 +1090,7 @@ pub fn fold_forward(
                 Ok(FoldedHead::Live {
                     value: Bytes::from(base.encode()),
                     decoded: Some(base),
+                    materialized: true,
                 })
             }
             FoldedHead::Tombstone => Ok(FoldedHead::Tombstone),
@@ -1851,7 +1936,7 @@ mod tests {
             // Byte-equal on the user-visible projection AND on the
             // tombstone/absent distinction (stronger than live_value).
             match (&head, &from_scratch) {
-                (FoldedHead::Live { value, decoded }, Folded::Put { value: v, .. }) => {
+                (FoldedHead::Live { value, decoded, .. }, Folded::Put { value: v, .. }) => {
                     proptest::prop_assert_eq!(
                         value.as_ref(),
                         v.as_ref(),

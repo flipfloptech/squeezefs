@@ -38,6 +38,7 @@ use squeezefs::meta_backend::kv::record::{inode_key, RecordKind, TREE_INODES};
 use squeezefs::meta_backend::kv::tree::{ApplyOutcome, KvTree, SmoContext};
 use squeezefs::meta_backend::kv::{
     alloc_ext::ExtentAllocator, META_KV_NODE_APPEND_BYTES, META_KV_NODE_APPENDS,
+    META_KV_NODE_COMPACTIONS, META_KV_NODE_FREEZE_SHADOW_DROPPED, META_KV_NODE_REWRITE_BYTES,
 };
 use squeezefs::meta_backend::{open_routed_meta_set, Metadata};
 use std::path::{Path, PathBuf};
@@ -386,6 +387,9 @@ async fn audit_block_publish_meta_economy() {
     let mut prev = (ring.written_entries(), ring.written_bytes());
     let appends_before = META_KV_NODE_APPENDS.load(Ordering::Relaxed);
     let append_bytes_before = META_KV_NODE_APPEND_BYTES.load(Ordering::Relaxed);
+    let rewrite_bytes_before = META_KV_NODE_REWRITE_BYTES.load(Ordering::Relaxed);
+    let compactions_before = META_KV_NODE_COMPACTIONS.load(Ordering::Relaxed);
+    let shadow_before = META_KV_NODE_FREEZE_SHADOW_DROPPED.load(Ordering::Relaxed);
 
     let mut window = 0;
     for k in 1..=K {
@@ -440,9 +444,13 @@ async fn audit_block_publish_meta_economy() {
         full.len()
     );
     println!(
-        "node appends: {} frames, {} bytes",
+        "node writeback: {} append frames / {} B, {} compactions / {} rewrite B, \
+         {} shadow-dropped records",
         META_KV_NODE_APPENDS.load(Ordering::Relaxed) - appends_before,
         META_KV_NODE_APPEND_BYTES.load(Ordering::Relaxed) - append_bytes_before,
+        META_KV_NODE_COMPACTIONS.load(Ordering::Relaxed) - compactions_before,
+        META_KV_NODE_REWRITE_BYTES.load(Ordering::Relaxed) - rewrite_bytes_before,
+        META_KV_NODE_FREEZE_SHADOW_DROPPED.load(Ordering::Relaxed) - shadow_before,
     );
 
     // Count economy: ~1 entry per publish in every window (heartbeats /

@@ -6917,6 +6917,22 @@ impl DataRouter {
         bytes::Bytes,
         Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     )> {
+        // OQ-5 (lost-wakeup wedge, 2026-07-30): the warm all-RAM serve legs
+        // below (fresh/dirty moka meta + staging-ring mmap / hot-block RAM
+        // tier) can complete with ZERO tokio coop-budget leaves — a caller
+        // task looping warm reads then never ends its poll, and any task it
+        // wakes mid-loop (e.g. the M6 times-drain via a DLM stripe guard
+        // drop) is scheduled into this worker's UNSTEALABLE LIFO slot and
+        // starves forever (tokio's documented LIFO footgun, #4323/#4941;
+        // the stealable-LIFO change #7431 was reverted upstream in 1.52.2
+        // for perf). One budget unit per read op bounds every such loop to
+        // one budget window (≤128) before the task yields; on foreign
+        // threads without a runtime context this is a no-op (unconstrained
+        // budget), so the IPC sync-lane serve is untouched. Pinned by
+        // `warm_read_loop_yields_to_peer_tasks_on_one_worker` and the
+        // OQ-5 storm-squeeze acceptance (.benchmarks/2026-07-30-oq5-*).
+        tokio::task::coop::consume_budget().await;
+
         // Fetch metadata first. The whole-file RAM snapshot (read_lru /
         // write_lru keyed by file_path) is deliberately NOT consulted on the
         // read data path: it is a whole-file copy that goes stale under

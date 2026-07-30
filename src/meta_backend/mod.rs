@@ -754,6 +754,57 @@ impl RoutedMetaBackend {
         score
     }
 
+    /// Health-banded round-robin mint placement for freshly created
+    /// inodes — directories AND regular files (perf/meta-plane-writes,
+    /// 2026-07-30; contract in `tests/meta_plane_distribution_tests.rs`).
+    ///
+    /// History: only directories striped; regular files were
+    /// parent-sticky (`target = parent volume`). Because every
+    /// data-plane meta commit (block publish / size flip / extent
+    /// spill / destroy) routes by the FILE's ino, a workload whose
+    /// files live under one directory — the field's 32 root-dir files
+    /// — drove 100 % of journal traffic into one volume's journal +
+    /// conveyor (~21-25 k meta device-writes/s ceiling) while its
+    /// sibling idled at 0.00. Minting files across the healthy band
+    /// spreads the per-volume journal/conveyor/checkpoint pipelines,
+    /// which is what the multi-volume meta plane exists for.
+    ///
+    /// Economy note: a cross-volume regular create costs two whole-tx
+    /// entries (mint on target + dentry/parent-times on parent) instead
+    /// of one — but they land on DIFFERENT volumes, so per-volume
+    /// entries/op stays ≈ 1 and the create ceiling is unchanged while
+    /// the data plane gains the full set's journal bandwidth. Single-
+    /// volume sets short-circuit to volume 0 (no health probe on the
+    /// hot path — exactly the pre-VL5a create shape).
+    async fn pick_mint_volume(&self, parent_v_idx: usize) -> usize {
+        if self.volumes.len() <= 1 {
+            return parent_v_idx;
+        }
+        let mut candidates = Vec::new();
+        for (i, _) in self.volumes.iter().enumerate() {
+            if self.disabled_volumes.contains_key(&i) {
+                continue;
+            }
+            let health = self.get_volume_health(i).await;
+            candidates.push((i, health));
+        }
+        if candidates.is_empty() {
+            return parent_v_idx;
+        }
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        let max_health = candidates[0].1;
+        let top_candidates: Vec<_> = candidates
+            .into_iter()
+            .filter(|c| c.1 >= (max_health * 9) / 10)
+            .collect();
+
+        static META_COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let idx =
+            META_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % top_candidates.len();
+        top_candidates[idx].0
+    }
+
     /// Batched reclaim (design-wal-crash-consistency §4.5): group the inos
     /// by owning volume and destroy each volume's group as one
     /// `destroy_inodes` transaction. All-or-nothing per call — the first
@@ -1114,34 +1165,7 @@ impl Metadata for RoutedMetaBackend {
         let (parent_v_idx, local_parent) = self.route_ino(parent);
         self.check_volume_enabled(parent_v_idx)?;
         let is_dir = (mode & libc::S_IFMT) == libc::S_IFDIR;
-        let target_v_idx = if is_dir {
-            let mut candidates = Vec::new();
-            for (i, _) in self.volumes.iter().enumerate() {
-                if self.disabled_volumes.contains_key(&i) {
-                    continue;
-                }
-                let health = self.get_volume_health(i).await;
-                candidates.push((i, health));
-            }
-            if candidates.is_empty() {
-                parent_v_idx
-            } else {
-                candidates.sort_by(|a, b| b.1.cmp(&a.1));
-                let max_health = candidates[0].1;
-                let top_candidates: Vec<_> = candidates
-                    .into_iter()
-                    .filter(|c| c.1 >= (max_health * 9) / 10)
-                    .collect();
-
-                static META_COUNTER: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                let idx = META_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    % top_candidates.len();
-                top_candidates[idx].0
-            }
-        } else {
-            parent_v_idx
-        };
+        let target_v_idx = self.pick_mint_volume(parent_v_idx).await;
         self.check_volume_enabled(target_v_idx)?;
         // The mint slot is a touched slot too (the new inode record
         // lands in its keyspace) — still before any 4a lock. A park

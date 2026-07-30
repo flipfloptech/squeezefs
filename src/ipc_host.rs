@@ -914,6 +914,15 @@ pub struct IpcHost {
     svc_spawned: std::sync::atomic::AtomicUsize,
     /// Host epoch for the sessions' `last_active_ms` clocks.
     started: Instant,
+    /// The empty-pass spin window ([`service_spin_window`]) — resolved
+    /// ONCE at [`Self::spawn`], on the caller's thread, so the knob has
+    /// a deterministic read point. Reading the env on each service
+    /// thread's first pass raced the spawner (threads spawn lazily at
+    /// session admission — ingest-economy 2026-07-28), which is exactly
+    /// the race `preload_session_tests::service_thread_stays_hot_…`
+    /// kept losing under in-binary contention (set_var → spawn →
+    /// remove_var vs the admission-time thread start).
+    spin_window: Duration,
     shutting_down: AtomicBool,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// The severed-write buffer recycle pool (one per host; every
@@ -974,6 +983,7 @@ impl IpcHost {
             service_threads,
             svc_spawned: std::sync::atomic::AtomicUsize::new(0),
             started: Instant::now(),
+            spin_window: service_spin_window(),
             shutting_down: AtomicBool::new(false),
             threads: Mutex::new(Vec::new()),
             severed_pool: Arc::new(SeveredPool::new(cfg_max_op_bytes, cfg_arena_cap_bytes)),
@@ -1776,7 +1786,7 @@ impl IpcHost {
         let mut sessions: Vec<Arc<IpcSession>> = Vec::new();
         let mut seen_epoch = u64::MAX; // != any real epoch ⇒ first pass collects
         let mut last_progress = Instant::now();
-        let spin_window = service_spin_window();
+        let spin_window = self.spin_window;
         // Reused park snapshot (op-economy): the doorbell-snapshot Vec is
         // cleared+refilled per park, never reallocated — qd1 RTT shapes
         // park once per op, so per-park allocations are per-op costs.

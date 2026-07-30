@@ -5,7 +5,10 @@ merge/push without orchestrator review**). Commits: red instrument+contract
 `a3b2190` (`tests/meta_plane_distribution_tests.rs` + per-volume journal
 counters), fix `cc4f46a` (regular-file mint striping), red audit `36f5278`
 (`tests/meta_write_economy_audit_tests.rs`), economy fix `15ee403`
-(freeze-time shadow-fold), audit-print split `3a8b1ce`, fmt `(chore)`.
+(freeze-time shadow-fold), audit-print split `3a8b1ce`, fmt `8b6fea7`,
+this note `359f962`, plus two pre-existing-flake fixes the from-zero gate
+convicted (`b587988` ipc spin-window read point, `d2feaf3` defrag census
+reclaim settle — both reproduced red on BASE f16d5a9 first; §6).
 
 **Dev-box numbers in this note are SCOPING-ONLY** (isolated worktree,
 thermal-governed 2.0–2.2 GHz box, debug-profile sandboxes). The evidence
@@ -258,16 +261,33 @@ nvme0/nvme2 diverges from ~0.2 ms.
   `meta_kv_node_freeze_shadow_dropped` (engagement) with the same
   nvme0-vs-nvme2 iostat capture.
 
-## 6. Gates
+## 6. Gates (all at `d2feaf3`, the branch tip)
 
 - Red→green chain: `a3b2190` (red: `[32,0]`/`[288,0]`) → `cc4f46a`
   (green); `36f5278` (red: 17-records freeze) → `15ee403` (green).
 - `cargo clippy --all-targets --all-features -- -D warnings` clean;
   `cargo fmt --check` clean.
-- `cargo test --all-features -- --test-threads=1` full suite from zero:
-  see the campaign report (run on the throttled shared dev box).
-- `cargo doc --no-deps`, `cargo bench --benches -- --test`: see report.
-- statfs ×10 loaded soak: see report.
+- `cargo test --all-features -- --test-threads=1` **full suite from
+  zero: PASS** (exit 0, ~28 min on the throttled shared box). Two
+  PRE-EXISTING flakes blocked earlier from-zero attempts and were fixed
+  fail-fast, each reproduced on BASE `f16d5a9` before attribution:
+  - `preload_session_tests::service_thread_stays_hot_between_back_to_back_ops`
+    (5/5 red at base whole-binary): the `SQUEEZEFS_IPC_SPIN_US` env was
+    read on each lazily-spawned service thread, racing the test's
+    `remove_var` — fixed by resolving the knob once at `IpcHost::spawn`
+    (`b587988`; whole-binary ×10 green).
+  - `defrag_tests::test_report_only_gauges_match_independent_census`
+    (4/5 red at base): D1 measured mid-async-reclaim-drain — fixed by
+    settling via `BackendRouter::reclaim_drain` before the census
+    (`d2feaf3`; ×10 green).
+- `cargo doc --no-deps` builds (4 pre-existing intra-doc-link warnings
+  on dev-tip surfaces untouched by this branch: `ipc_host.rs:405`,
+  `ipc_service.rs:24/26`, `routing.rs:2052`).
+- `cargo bench --benches -- --test` bench smoke green.
+- **statfs ×10 loaded soak: 10/10 green** (real FUSE-over-io_uring
+  mounts, 3 contracts each; load = 8 CPU spinners + an fsync-dd write
+  loop; the counting loop in fact executed each run twice — 20
+  consecutive green suite executions).
 - Loom: not re-run — no lock-free core changed (`freeze_locked` runs
   under the node write lock; `journal_core`/`node_state_core`/
   `alloc_ext_core` untouched).

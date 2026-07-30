@@ -133,10 +133,36 @@
 //!     the per-block discard/punch ledger stays exact; lane chunking
 //!     never splits what one batch could coalesce.
 //!
-//! RED against dev c9921f1: neither `block_free_reclaim_inline_spills`
-//! nor `block_free_reclaim_commands` exists, and the worker drains
-//! serially (one batch of `SQUEEZEFS_RECLAIM_BATCH_BLOCKS` per pass —
-//! contract 10's storm caps the queue and spills inline).
+//! RED against dev c9921f1: neither counter family exists, and the
+//! worker drains serially (one batch of `SQUEEZEFS_RECLAIM_BATCH_BLOCKS`
+//! per pass — contract 10's storm caps the queue and spills inline).
+//!
+//! ## Reclaim manners + park-don't-spill (write-wall iteration 1) — contracts 12–13
+//!
+//! Field verdict v2 (f629b46): the fresh row ran minutes after a
+//! 128 GiB `rm` and paid −17 % to the backlog drain flooding the fabric
+//! (settled re-measure: 12.3 GB/s vs the dirty 8.8), the rewrite row
+//! still spilled 11,265 at-cap inline discards, and the width
+//! experiments measured the TARGET deallocate service as the drain
+//! ceiling (idle ~2,700 cmd/s at width 32 / ~5,900 at 128; under
+//! foreground load ~1,700 at ANY width). Laws pinned here:
+//!
+//! 12. **The deferred-drain law**: foreground device I/O moving + queue
+//!     below cap ⇒ ZERO device commands (the backlog waits); foreground
+//!     idle ⇒ full-width catch-up to empty. Foreground detection is
+//!     DEVICE-byte movement (stats pollers and RAM-served reads never
+//!     hold the drain deferred); injectable seam for determinism.
+//! 13. **Park-don't-spill**: an at-cap enqueue PARKS (async, bounded by
+//!     `SQUEEZEFS_RECLAIM_CAP_PARK_MS`, counted
+//!     `block_free_reclaim_cap_parks`) until the drain — which runs
+//!     at-cap REGARDLESS of foreground — relieves it; bound expiry
+//!     soft-overflows (`block_free_reclaim_cap_overflow`, ≈ 0 steady
+//!     state). Device commands NEVER issue from the enqueue context
+//!     (the retired inline arm charged a field-measured 12–22 ms
+//!     synchronous fabric round-trip to the write path).
+//!
+//! RED against dev f629b46: the inline at-cap arm exists (spills), no
+//! deferral exists, and neither cap_parks nor cap_overflow exists.
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -254,9 +280,12 @@ fn fence_halts() -> u64 {
 fn double_frees() -> u64 {
     METRICS.block_double_frees.load(Ordering::Relaxed)
 }
-fn inline_spills() -> u64 {
+fn cap_parks() -> u64 {
+    METRICS.block_free_reclaim_cap_parks.load(Ordering::Relaxed)
+}
+fn cap_overflow() -> u64 {
     METRICS
-        .block_free_reclaim_inline_spills
+        .block_free_reclaim_cap_overflow
         .load(Ordering::Relaxed)
 }
 fn reclaim_commands() -> u64 {
@@ -1083,6 +1112,24 @@ impl Drop for PatchOff {
     }
 }
 
+/// Pin the CoW-always venue (write-wall iteration 1): contracts 7/9 pin
+/// the COW displacement ledger and the StorageFull-triggered brim arm —
+/// with the default in-place-overwrite arm ON, eligible rewrites never
+/// reach either (they land in place BEFORE allocation;
+/// `tests/inplace_overwrite_tests.rs` owns that venue).
+struct InplaceOff;
+impl InplaceOff {
+    fn arm() -> Self {
+        squeezefs::fuse_client::set_inplace_overwrite(false);
+        Self
+    }
+}
+impl Drop for InplaceOff {
+    fn drop(&mut self) {
+        squeezefs::fuse_client::set_inplace_overwrite(true);
+    }
+}
+
 async fn make_field_harness(test_id: &str) -> FieldH {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", FBS.to_string());
     let dlm = DlmClient::new("local").unwrap();
@@ -1256,6 +1303,7 @@ fn untracked_refusals() -> u64 {
 async fn field_rewrite_free_list_regime_runs_off_the_write_path() {
     let _g = serial().await;
     let _p = PatchOff::arm();
+    let _i = InplaceOff::arm();
     let h = make_field_harness("field_free_list_regime").await;
 
     // 32-chunk volume, filled to the brim by 8 × 4-block fresh files —
@@ -1473,6 +1521,7 @@ async fn valve_counts_only_genuine_nonempty_drains() {
 async fn brim_rewrite_converges_in_place_with_honest_ledger() {
     let _g = serial().await;
     let _p = PatchOff::arm();
+    let _i = InplaceOff::arm();
     let h = make_field_harness("field_brim_rewrite").await;
 
     // 8-chunk volume filled exactly by two 4-block files: fill 1.0,
@@ -1657,8 +1706,9 @@ async fn displacement_storm_never_caps_queue_or_spills_inline() {
         offsets.push(o);
     }
 
-    let (sp0, p0, s0, d0, df0, qb0) = (
-        inline_spills(),
+    let (sp0, ov0, p0, s0, d0, df0, qb0) = (
+        cap_parks(),
+        cap_overflow(),
         punches(),
         skipped(),
         discards(),
@@ -1679,16 +1729,17 @@ async fn displacement_storm_never_caps_queue_or_spills_inline() {
         tokio::time::sleep(std::time::Duration::from_millis(12)).await;
     }
 
-    // THE contract: the queue never capped — no displaced block's reclaim
-    // ran inline on the (simulated) write path.
+    // THE contract: the queue never capped — no displaced block's free
+    // ever parked (nor overflowed) on the (simulated) write path.
     assert_eq!(
-        inline_spills() - sp0,
+        cap_parks() - sp0,
         0,
         "a displacement storm at 4× the serial drain rate must never \
-         engage the at-cap inline-backpressure arm — the reclaim worker's \
+         reach the deferred-space cap — the reclaim worker's \
          demand-derived lanes must outrun any sustainable displacement \
          rate (the 2026-07-31 rewrite-wall conviction)"
     );
+    assert_eq!(cap_overflow() - ov0, 0, "and never soft-overflow");
 
     // Conservation unchanged: every block reclaimed-or-consciously-
     // skipped exactly once, gauge converges to baseline.
@@ -1762,4 +1813,152 @@ async fn adjacent_displaced_ranges_coalesce_into_fewer_device_commands() {
          commands (got {cmds}); per-block counting stays exact by the \
          punches assertion above"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Contract 12 — reclaim manners (write-wall iteration 1): the drain
+// DEFERS while foreground device I/O moves and the queue sits below the
+// cap; a foreground-idle fabric gets the full-width catch-up. Field
+// motivation: verdict-v2's fresh row paid −17 % to a 128 GiB rm-backlog
+// drain flooding the fabric, and the width experiments measured ZERO
+// drain-rate gain from client width under foreground load — deferring is
+// the only move that returns fabric/target capacity to the foreground.
+// ---------------------------------------------------------------------------
+
+/// An injectable foreground signal: `advance=true` ⇒ every probe reads a
+/// fresh value (foreground device I/O moving); `false` ⇒ frozen (idle).
+struct FgSeam {
+    val: Arc<AtomicU64>,
+    advance: Arc<std::sync::atomic::AtomicBool>,
+}
+impl FgSeam {
+    fn install(br: &squeezefs::routing::BackendRouter) -> Self {
+        let val = Arc::new(AtomicU64::new(1));
+        let advance = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (v, a) = (val.clone(), advance.clone());
+        br.set_reclaim_foreground_signal(Arc::new(move || {
+            if a.load(Ordering::Relaxed) {
+                v.fetch_add(1, Ordering::Relaxed) + 1
+            } else {
+                v.load(Ordering::Relaxed)
+            }
+        }));
+        Self { val, advance }
+    }
+    fn idle(&self) {
+        self.advance.store(false, Ordering::Relaxed);
+        // One extra bump so the worker's NEXT probe observes one final
+        // advance, then quiescence (the realistic end-of-row shape).
+        self.val.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_defers_under_foreground_and_catches_up_idle() {
+    let _g = serial().await;
+    let _m = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_MS", "0");
+    let (router, ba, _backing, _staging) = make_router().await;
+    let seam = FgSeam::install(&router.backend_router);
+
+    let mut offsets = Vec::with_capacity(16);
+    for _ in 0..16 {
+        let o = ba.allocate_block().await.expect("alloc");
+        ba.publish_block(o);
+        offsets.push(o);
+    }
+    let (p0, s0, c0, qb0) = (punches(), skipped(), reclaim_commands(), queue_bytes());
+    for o in &offsets {
+        router
+            .backend_router
+            .free_block(&o.to_string())
+            .await
+            .expect("terminal free");
+    }
+
+    // Foreground moving + queue below cap ⇒ ZERO device commands. (A
+    // negative assertion needs an observation window — 500 ms spans ten
+    // 50 ms manners re-evaluations; generous by construction.)
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        (punches() - p0) + (skipped() - s0),
+        0,
+        "the drain must DEFER while foreground device I/O moves (the \
+         manners law — a deferred backlog waits for idle fabric)"
+    );
+    assert_eq!(reclaim_commands() - c0, 0, "zero device commands too");
+    assert!(
+        queue_bytes() > qb0,
+        "the deferred backlog is visibly queued (gauge)"
+    );
+
+    // Foreground idle ⇒ the full-width catch-up drains to empty.
+    seam.idle();
+    eventually(
+        || (punches() - p0) + (skipped() - s0) == 16 && queue_bytes() == qb0,
+        "idle catch-up drains the deferred backlog to empty",
+    )
+    .await;
+    assert_eq!(double_frees(), 0, "exactly-once under deferral");
+}
+
+// ---------------------------------------------------------------------------
+// Contract 13 — park-don't-spill at the cap: an at-cap enqueue PARKS and
+// the drain relieves it REGARDLESS of foreground (parked enqueues are
+// foreground writers too); device commands never issue from the enqueue
+// context (the retired inline arm charged a field-measured 12–22 ms
+// synchronous fabric round-trip to the write path).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_cap_enqueue_parks_until_drain_relieves_and_never_overflows() {
+    let _g = serial().await;
+    let _b = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", "8");
+    let _m = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_MS", "0");
+    let _c = EnvGuard::set("SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS", "8");
+    let _s = EnvGuard::set("SQUEEZEFS_TEST_RECLAIM_STALL_MS", "50");
+    let _p = EnvGuard::set("SQUEEZEFS_RECLAIM_CAP_PARK_MS", "60000");
+    let (router, ba, _backing, _staging) = make_router().await;
+    // Foreground stays MOVING the whole time: the cap-relief drain must
+    // override the manners deferral.
+    let _seam = FgSeam::install(&router.backend_router);
+
+    let mut offsets = Vec::with_capacity(32);
+    for _ in 0..32 {
+        let o = ba.allocate_block().await.expect("alloc");
+        ba.publish_block(o);
+        offsets.push(o);
+    }
+    let (pk0, ov0, p0, s0, qb0, df0) = (
+        cap_parks(),
+        cap_overflow(),
+        punches(),
+        skipped(),
+        queue_bytes(),
+        double_frees(),
+    );
+    for o in &offsets {
+        router
+            .backend_router
+            .free_block(&o.to_string())
+            .await
+            .expect("terminal free (parks at cap, never spills inline)");
+    }
+    assert!(
+        cap_parks() - pk0 > 0,
+        "a 32-block burst against an 8-block cap must park enqueues \
+         (the engagement gauge of park-don't-spill)"
+    );
+    assert_eq!(
+        cap_overflow() - ov0,
+        0,
+        "the drain relieves parked enqueues well inside the liveness \
+         bound — no soft overflow"
+    );
+    eventually_within(
+        || (punches() - p0) + (skipped() - s0) == 32 && queue_bytes() == qb0,
+        std::time::Duration::from_secs(30),
+        "every burst block reclaimed exactly once through the park path",
+    )
+    .await;
+    assert_eq!(double_frees() - df0, 0, "exactly-once under parking");
 }

@@ -11,7 +11,7 @@
 #
 # Campaign instruments on every write pass:
 #   * conviction 1 (rewrite wall): block_free_reclaim_{queued,commands,
-#     batches,sync_drains} deltas, block_free_reclaim_inline_spills
+#     batches,sync_drains} deltas, block_free_reclaim_cap_parks
 #     (MUST be 0 — the at-cap engagement tripwire), and a 20 Hz sampler
 #     recording the MAX block_free_reclaim_queue_bytes seen during the
 #     pass (the queue-never-caps proof).
@@ -48,7 +48,7 @@ CSV="$RESULTS/bracket.csv"
 [ "$(id -u)" -eq 0 ] || { echo "run as root"; exit 1; }
 [ -x "$BIN_A" ] && [ -x "$BIN_B" ] || { echo "missing binaries"; exit 1; }
 mkdir -p "$RESULTS" "$MNT"
-[ -f "$CSV" ] || echo "cell,pass,binary,rep,mibs_or_iops,meta_writes,meta_wbytes,journal_entries,journal_bytes,pub_batches,pub_blocks,wt_blocks,adm_waits,rq_queued,rq_spills,rq_cmds,rq_batches,rq_syncdrains,rq_qbytes_max,data_aqu,data_wareq_kib,data_amp" >"$CSV"
+[ -f "$CSV" ] || echo "cell,pass,binary,rep,mibs_or_iops,meta_writes,meta_wbytes,journal_entries,journal_bytes,pub_batches,pub_blocks,wt_blocks,adm_waits,rq_queued,rq_parks,rq_cmds,rq_batches,rq_syncdrains,rq_qbytes_max,data_aqu,data_wareq_kib,data_amp" >"$CSV"
 
 ds_snap() { # <devs...> -> "writes sectors weighted_ms"
     awk -v devs="$*" '
@@ -65,7 +65,7 @@ snap_gauges() { # -> one line of campaign gauges
     echo "$(stat_get meta_kv_journal_entries) $(stat_get meta_kv_journal_bytes) \
 $(stat_get layout_publish_batches) $(stat_get layout_publish_batched_blocks) \
 $(stat_get write_through_blocks) $(stat_get write_pipeline_admission_waits) \
-$(stat_get block_free_reclaim_queued) $(stat_get block_free_reclaim_inline_spills) \
+$(stat_get block_free_reclaim_queued) $(stat_get block_free_reclaim_cap_parks) \
 $(stat_get block_free_reclaim_commands) $(stat_get block_free_reclaim_batches) \
 $(stat_get block_free_reclaim_sync_drains)"
 }

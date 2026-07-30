@@ -215,9 +215,24 @@ async fn phase_family_is_always_on_with_exact_keys() {
 // Contract 2 — the real pipeline write path drives every phase.
 // ---------------------------------------------------------------------------
 
+/// Restore the in-place-overwrite default on scope exit (knob hygiene).
+struct InplaceGuard;
+impl Drop for InplaceGuard {
+    fn drop(&mut self) {
+        squeezefs::fuse_client::set_inplace_overwrite(true);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pipeline_write_through_records_every_residence_phase() {
     let _g = serial().await;
+    // This contract pins the COW pipeline's full decomposition (all ten
+    // phases incl. allocate/displaced_free); the write-wall iteration-1
+    // default routes eligible rewrites IN PLACE (no allocate, no
+    // displacement — `tests/inplace_overwrite_tests.rs` owns that
+    // venue), so the CoW-always A/B lever pins this venue.
+    let _l = InplaceGuard;
+    squeezefs::fuse_client::set_inplace_overwrite(false);
     let h = make_harness("wp_phase_write_through").await;
 
     // Striped fixture: fresh write + fsync + drain (the fresh small-file

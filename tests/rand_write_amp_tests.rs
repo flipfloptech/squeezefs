@@ -793,8 +793,12 @@ async fn write_rig_phases_and_sites_record() {
     // pipeline every W1-patch-ineligible shape still rides. The aligned
     // storm shape became patch-eligible in RW2 (zero spills, zero seeds,
     // zero churn), so this pin runs with the patch OFF; the flipped
-    // G-RW2 gate below measures the same shape with the patch ON.
+    // G-RW2 gate below measures the same shape with the patch ON. The
+    // write-wall iteration-1 in-place-overwrite default is pinned off
+    // for the same reason (whole-block face of the same law — it elides
+    // the map-merge/seed phases this rig pin asserts).
     squeezefs::fuse_client::set_patch_max_bytes(0);
+    squeezefs::fuse_client::set_inplace_overwrite(false);
     let ino = create(&h, "rig.dat").await;
     let blocks: u64 = PARKED_CAP + 16;
     make_striped(&h, ino, blocks, 29).await;
@@ -868,6 +872,7 @@ async fn write_rig_phases_and_sites_record() {
     ] {
         assert!(!m[key].is_null(), "armed .stats surface must carry {key}");
     }
+    squeezefs::fuse_client::set_inplace_overwrite(true);
 }
 
 async fn read_stats_json(h: &H) -> serde_json::Value {

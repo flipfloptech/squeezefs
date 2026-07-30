@@ -503,8 +503,12 @@ async fn stale_hot_entry_under_dead_key_is_never_served() {
     // starves the machinery under test. On real 4 MiB-block volumes the
     // 512 KiB patch cap forbids block-covering patches, so the pinned
     // machinery is the production whole-block-overwrite path;
-    // extent_patch_tests owns the patched-shape twin contracts.
+    // extent_patch_tests owns the patched-shape twin contracts. The
+    // write-wall iteration-1 in-place-overwrite default (the same law's
+    // whole-block face) is pinned off for the same reason —
+    // inplace_overwrite_tests owns its twin.
     squeezefs::fuse_client::set_patch_max_bytes(0);
+    squeezefs::fuse_client::set_inplace_overwrite(false);
     let ino = create(&h, "hot_stale").await;
     write_at(&h, ino, 0, &vec![0x21u8; BS as usize]).await;
     write_at(&h, ino, BS, &vec![0x2Fu8; BS as usize]).await; // striped layout
@@ -530,6 +534,7 @@ async fn stale_hot_entry_under_dead_key_is_never_served() {
         "resolution goes through the CURRENT map + binding recheck — a \
          stale hot entry under a dead key must be unreachable"
     );
+    squeezefs::fuse_client::set_inplace_overwrite(true);
 }
 
 /// Cache-less volumes (no staging dirs): striped blocks get a RAM tier for

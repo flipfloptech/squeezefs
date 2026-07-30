@@ -217,8 +217,12 @@ async fn parked_read_never_serves_reused_or_freed_key() {
     // reuse), which starves the ABA shape under test. On real 4 MiB-block
     // volumes the 512 KiB patch cap forbids block-covering patches, so the
     // pinned machinery is the production whole-block-overwrite path;
-    // extent_patch_tests owns the patched-shape twin contracts.
+    // extent_patch_tests owns the patched-shape twin contracts. The
+    // write-wall iteration-1 in-place-overwrite default (the same law's
+    // whole-block face) is pinned off for the same reason —
+    // inplace_overwrite_tests owns its twin.
     squeezefs::fuse_client::set_patch_max_bytes(0);
+    squeezefs::fuse_client::set_inplace_overwrite(false);
     let ino = create(&h, "aba").await;
 
     // Striped 2-block file: b0 = 0xA0, b1 = 0xB0 (full-block write-through).
@@ -325,6 +329,7 @@ async fn parked_read_never_serves_reused_or_freed_key() {
             && fresh[BS as usize..].iter().all(|&v| v == 0xB1),
         "[{tag}] post-race fresh read corrupted"
     );
+    squeezefs::fuse_client::set_inplace_overwrite(true);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

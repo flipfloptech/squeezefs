@@ -355,6 +355,19 @@ async fn rewrite_pass_coalesces_and_displaces_every_prior_binding() {
     let _k = KnobGuard;
     set_publish_coalesce_override(None);
     set_layout_delta_chain_override(None);
+    // This contract pins the CoW DISPLACEMENT rewrite's conveyor economy
+    // (displaced-key purge per prior binding); the write-wall iteration-1
+    // in-place default routes eligible whole-block rewrites at their own
+    // offsets (no displacement — inplace_overwrite_tests owns that
+    // venue), so the CoW-always lever pins this one.
+    struct InplaceOn;
+    impl Drop for InplaceOn {
+        fn drop(&mut self) {
+            squeezefs::fuse_client::set_inplace_overwrite(true);
+        }
+    }
+    let _i = InplaceOn;
+    squeezefs::fuse_client::set_inplace_overwrite(false);
 
     let meta = NamedTempFile::new().unwrap();
     meta.as_file().set_len(128 * 1024 * 1024).unwrap();

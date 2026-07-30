@@ -72,7 +72,7 @@ mount_fresh() { # <bin> <tag>
     udevadm settle --timeout=10 2>/dev/null || true
     local ok=0
     for _ in 1 2 3 4 5; do
-        if "$bin" mount "$META" "$MNT" --daemon --allow-others \
+        if "$bin" mount "$META" "$MNT" --daemon --allow-other \
             --log-file "$RESULTS/$tag.daemon.log" >>"$RESULTS/$tag.log" 2>&1; then
             ok=1; break
         fi
@@ -192,6 +192,7 @@ run_read() { # blabel bin rep
 run_meta() { # blabel bin rep — create+unlink storm, journal entries/op
     local blabel="$1" bin="$2" rep="$3" tag="meta_${1}_r${3}"
     mount_fresh "$bin" "$tag"
+    mkdir -p "$MNT/bench/meta"
     local n=2000
     local g0 g1 t0 t1 m0 m1
     g0=$(snap_gauges); m0=$(ds_snap "${META_DEVS[@]}")

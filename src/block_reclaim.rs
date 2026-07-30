@@ -63,24 +63,65 @@
 //!   round-trips per device. Every entry stays `processing`-reserved for
 //!   its lane's whole lifetime (valve/pending/drain predicates exact),
 //!   the fence check runs per lane, and per-block counting is unchanged.
-//!   Engagement instruments: `block_free_reclaim_inline_spills` (at-cap
-//!   inline processing — **must stay 0**) and
-//!   `block_free_reclaim_commands` (device commands; blocks ÷ commands =
-//!   the live coalesce factor).
+//!   Engagement instrument: `block_free_reclaim_commands` (device
+//!   commands; blocks ÷ commands = the live coalesce factor).
+//!
+//! * **Reclaim manners — the deferred-drain law** (write-wall iteration
+//!   1, field-measured on the 4-node cluster; contracts 12–13): device
+//!   reclaims MUST yield to foreground device I/O. The field verdict-v2
+//!   fresh row ran minutes after a 128 GiB `rm` and paid −17 % to the
+//!   backlog drain flooding the fabric; the width experiments proved
+//!   the TARGET-side deallocate service is the drain ceiling (idle
+//!   ~2,700 cmd/s at width 32, ~5,900 at width 128; under foreground
+//!   write load ~1,700 cmd/s at ANY width), so drain aggressiveness
+//!   under load buys nothing and steals target CPU from foreground
+//!   writes. The law:
+//!
+//!   - **Foreground device I/O active + queue below cap ⇒ DEFER** (zero
+//!     device commands — the backlog waits; queued space is bounded by
+//!     the cap budget and the ENOSPC valve force-drains if allocation
+//!     actually needs it).
+//!   - **Queue at cap ⇒ drain regardless of foreground** (parked
+//!     enqueues — see below — are foreground writers too; the cap is
+//!     the deferred-space budget, and relieving it is what they wait
+//!     on).
+//!   - **Foreground idle ⇒ full-width drain to empty** (the fast idle
+//!     catch-up: the field's 128 GiB backlog clears in ~12 s).
+//!
+//!   Foreground detection is DEVICE-byte movement, not op counts: the
+//!   probe sums the device-plane counters (write-through/patch/staging
+//!   bytes + ranged-read bytes + device-true reads + tier misses), so
+//!   a 1 Hz stats poller or RAM-served reads never hold the drain
+//!   deferred (they move no device bytes). Injectable for tests via
+//!   [`ReclaimQueue::set_foreground_signal`].
+//!
+//! * **Park-don't-spill at the cap** (write-wall iteration 1; contract
+//!   13): an enqueue that finds the queue at the cap **never issues
+//!   device commands from the enqueue context** (the retired inline
+//!   arm charged a measured ~12–22 ms synchronous fabric round-trip to
+//!   the write path — and ran it ON the tpc handler lane). It PARKS
+//!   (async, 5 ms ticks) until the drain relieves the cap, bounded by
+//!   `SQUEEZEFS_RECLAIM_CAP_PARK_MS` (default 1000, clamp 0..=60000;
+//!   `0` = never park); a bound expiry soft-overflows the entry into
+//!   the queue (counted `block_free_reclaim_cap_overflow` — RAM-bounded
+//!   growth, conservation preserved by the valve/unmount/idle drains).
+//!   Engagement gauges: `block_free_reclaim_cap_parks` (parked
+//!   enqueues) and `block_free_reclaim_cap_overflow` (bound expiries —
+//!   ≈ 0 in steady state).
 //!
 //! Knobs (read at queue construction — i.e. per `BackendRouter`):
 //! `SQUEEZEFS_RECLAIM_BATCH_BLOCKS` (max entries per worker batch,
 //! default 64, clamp 1..=1024), `SQUEEZEFS_RECLAIM_BATCH_MS`
 //! (accumulation window after first wake, default 2, clamp 0..=600000 —
 //! large values park the worker, used by tests),
-//! `SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS` (bounded-memory cap, default
-//! 4096; an enqueue past the cap processes INLINE as backpressure), and
-//! `SQUEEZEFS_RECLAIM_LANES_PER_DEV` (per-device parallel-drain lane
-//! cap, default 8, clamp 1..=64 — 8 overlapped DSM deallocates per
-//! device multiply the field's serial ~500 blocks/s drain well past any
-//! displacement rate a write stream can sustain, while staying far
-//! under NVMe queue depths and bounding blocking-pool footprint at
-//! backends × 8 threads during a storm).
+//! `SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS` (the deferred-space budget,
+//! default 4096; an enqueue past the cap PARKS — see park-don't-spill),
+//! `SQUEEZEFS_RECLAIM_CAP_PARK_MS` (park liveness bound, default 1000),
+//! and `SQUEEZEFS_RECLAIM_LANES_PER_DEV` (per-device parallel-drain
+//! lane cap, default 32, clamp 1..=64 — engaged only on idle-fabric
+//! catch-up drains since the manners law; the field width experiment
+//! measured idle drain 2,700 → 5,900 cmd/s from 8 → 32 lanes/device,
+//! and NO width sensitivity under foreground load).
 
 use crate::block_allocator::{BlockAllocator, InflightAllocGuard};
 use crate::fuse_client::METRICS;
@@ -95,6 +136,24 @@ fn env_u64(key: &str, default: u64, lo: u64, hi: u64) -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(default)
         .clamp(lo, hi)
+}
+
+/// The production foreground device-activity signal (the manners law's
+/// input): a monotonic sum of DEVICE-plane movement — write-through /
+/// patch / staging bytes and device-read work. Deliberately NOT op
+/// counts: a 1 Hz stats poller or RAM-tier-served reads move no device
+/// bytes and must never hold a deferred backlog's drain hostage.
+fn device_activity_signal() -> u64 {
+    let m = &*METRICS;
+    m.write_through_bytes
+        .load(Ordering::Relaxed)
+        .wrapping_add(m.patch_write_bytes.load(Ordering::Relaxed))
+        .wrapping_add(m.staging_put_bytes_drain.load(Ordering::Relaxed))
+        .wrapping_add(m.staging_put_bytes_flush.load(Ordering::Relaxed))
+        .wrapping_add(m.staging_put_bytes_wt_fallback.load(Ordering::Relaxed))
+        .wrapping_add(m.ranged_read_bytes.load(Ordering::Relaxed))
+        .wrapping_add(m.read_device_true_reads.load(Ordering::Relaxed))
+        .wrapping_add(m.hot_block_misses.load(Ordering::Relaxed))
 }
 
 /// One terminally-freed block whose device reclaim + `finish_free` the
@@ -144,8 +203,17 @@ pub struct ReclaimQueue {
     max_queued: u64,
     /// Per-device parallel-drain lane cap (see module docs, demand-derived
     /// parallel drain). Width in use = Σ over devices of
-    /// min(ceil(device demand / batch_blocks), this).
+    /// min(ceil(device demand / batch_blocks), this) — and 1 under
+    /// foreground device I/O (the manners law).
     lanes_per_dev: u64,
+    /// Park liveness bound for at-cap enqueues (ms; see park-don't-spill).
+    cap_park_ms: u64,
+    /// Foreground device-activity signal (a monotonic device-byte/op
+    /// sum; ANY advance between worker passes = foreground active).
+    /// Defaults to the METRICS device-plane sum; injectable for tests.
+    fg_signal: std::sync::OnceLock<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    /// The signal value at the worker's previous manners decision.
+    fg_last: AtomicU64,
     /// Test seam (`SQUEEZEFS_TEST_RECLAIM_STALL_MS`): stall each
     /// processed batch — deterministic slow-device schedules for the
     /// valve-liveness contract (`enospc_valve_never_blocks_executor_
@@ -166,7 +234,10 @@ impl ReclaimQueue {
             batch_blocks: env_u64("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", 64, 1, 1024),
             batch_ms: env_u64("SQUEEZEFS_RECLAIM_BATCH_MS", 2, 0, 600_000),
             max_queued: env_u64("SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS", 4096, 1, 1 << 20),
-            lanes_per_dev: env_u64("SQUEEZEFS_RECLAIM_LANES_PER_DEV", 8, 1, 64),
+            lanes_per_dev: env_u64("SQUEEZEFS_RECLAIM_LANES_PER_DEV", 32, 1, 64),
+            cap_park_ms: env_u64("SQUEEZEFS_RECLAIM_CAP_PARK_MS", 1000, 0, 60_000),
+            fg_signal: std::sync::OnceLock::new(),
+            fg_last: AtomicU64::new(0),
             test_stall_ms: env_u64("SQUEEZEFS_TEST_RECLAIM_STALL_MS", 0, 0, 600_000),
         })
     }
@@ -204,34 +275,43 @@ impl ReclaimQueue {
         false
     }
 
-    /// Queue one terminal free's reclaim. Past the bounded-memory cap the
-    /// entry is processed INLINE (backpressure — the reclaimer is not
-    /// keeping up; conservation over latency). `block_free_reclaim_queued`
-    /// counts BOTH arms — it means "entered the reclaim engine", so the
-    /// field ledger's `queued ≡ displaced blocks` identity holds even
-    /// when the cap forces inline processing (field ledger inversion,
-    /// 2026-07-27: an uncounted arm is how a live mount's ledger lies).
-    pub fn enqueue(self: &Arc<Self>, entry: ReclaimEntry) {
+    /// Queue one terminal free's reclaim. Past the deferred-space cap the
+    /// caller PARKS (bounded) until the drain relieves the cap — it
+    /// **never issues device commands from the enqueue context** (the
+    /// retired inline arm charged a measured 12–22 ms synchronous fabric
+    /// round-trip to the write path, on the tpc handler lane; write-wall
+    /// iteration 1). A bound expiry soft-overflows into the queue
+    /// (RAM-bounded growth; conservation preserved by the valve /
+    /// unmount / idle drains). `block_free_reclaim_queued` counts every
+    /// entry — "entered the reclaim engine" — so the field ledger's
+    /// `queued ≡ displaced blocks` identity holds in all arms.
+    pub async fn enqueue(self: &Arc<Self>, entry: ReclaimEntry) {
         METRICS
             .block_free_reclaim_queued
             .fetch_add(1, Ordering::Relaxed);
-        if self.len.load(Ordering::Acquire) >= self.max_queued {
-            // The conservation-over-latency backstop — and a device
-            // round-trip back on the write path, so its engagement is
-            // counted LOUD (`block_free_reclaim_inline_spills`, must
-            // stay 0): the parallel worker lanes are sized to outrun
-            // any sustainable displacement rate (contract 10; the
-            // field's rewrite wall was this arm running as the steady
-            // state).
+        if self.len.load(Ordering::Acquire) >= self.max_queued && !self.fence_halted() {
             METRICS
-                .block_free_reclaim_inline_spills
+                .block_free_reclaim_cap_parks
                 .fetch_add(1, Ordering::Relaxed);
-            self.processing.fetch_add(1, Ordering::AcqRel);
-            METRICS
-                .block_free_reclaim_queue_bytes
-                .fetch_add(entry.size, Ordering::Relaxed);
-            self.process_entries(vec![entry]);
-            return;
+            // Make sure a drain is actually running to relieve us (the
+            // manners law drains at-cap queues regardless of foreground).
+            self.ensure_worker();
+            self.notify.notify_one();
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(self.cap_park_ms);
+            loop {
+                if self.len.load(Ordering::Acquire) < self.max_queued || self.fence_halted() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    METRICS
+                        .block_free_reclaim_cap_overflow
+                        .fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+                // 5 ms tick — the admit-park liveness pattern.
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
         }
         METRICS
             .block_free_reclaim_queue_bytes
@@ -242,6 +322,25 @@ impl ReclaimQueue {
         self.q.push(entry);
         self.ensure_worker();
         self.notify.notify_one();
+    }
+
+    /// Inject the foreground device-activity signal (tests). Set once;
+    /// later calls are no-ops. Production uses the METRICS device-plane
+    /// sum (see [`device_activity_signal`]).
+    pub fn set_foreground_signal(&self, sig: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        let _ = self.fg_signal.set(sig);
+    }
+
+    /// `true` ⇔ foreground device I/O moved since the worker's previous
+    /// manners decision (the deferred-drain law's input). One counter
+    /// sum + one swap per worker pass — never on the enqueue path.
+    fn foreground_active(&self) -> bool {
+        let sig = match self.fg_signal.get() {
+            Some(f) => f(),
+            None => device_activity_signal(),
+        };
+        let prev = self.fg_last.swap(sig, Ordering::AcqRel);
+        sig != prev
     }
 
     /// Spawn the background worker once (lazily — the first enqueue runs
@@ -277,6 +376,26 @@ impl ReclaimQueue {
                 }
                 loop {
                     let Some(q) = weak.upgrade() else { return };
+                    // The manners law (write-wall iteration 1): defer
+                    // while foreground device I/O is moving and the
+                    // queue sits below the deferred-space cap — the
+                    // width experiments proved drain aggressiveness
+                    // under load buys no drain rate and steals target
+                    // CPU from foreground writes. At cap, drain
+                    // regardless (parked enqueues are foreground
+                    // writers too); idle, full-width catch-up.
+                    let at_cap = q.len.load(Ordering::Acquire) >= q.max_queued;
+                    if q.foreground_active() && !at_cap {
+                        if q.len.load(Ordering::Acquire) == 0 {
+                            break; // nothing deferred — park on notify
+                        }
+                        // Deferred: re-evaluate on a coarse tick (drop
+                        // the Arc across the sleep — the health-worker
+                        // sentinel discipline).
+                        drop(q);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
                     // Demand-derived take: up to one full fan-out's
                     // worth per pass (batch_blocks × lanes_per_dev) — a
                     // deep queue fills every lane, a shallow one stays a

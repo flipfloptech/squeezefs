@@ -291,6 +291,40 @@ pub fn set_patch_max_bytes(v: u64) {
     patch_max_bytes_cell().store(v, Ordering::Relaxed);
 }
 
+/// Default in-place full-block overwrite (write-wall iteration 1 —
+/// `SQUEEZEFS_INPLACE_OVERWRITE`, default ON; `0` = the CoW-always A/B
+/// lever, measurement only, never an operational escape): an eligible
+/// full-block overwrite (sole-owned, undecorated, passthrough,
+/// whole-block-mapped, Active volume — the W1 sole-owner law's
+/// whole-block face, the contract-9 brim machinery promoted to the
+/// default) lands in place with ZERO displacement: no allocation, no
+/// free, no discard, same-key merge. Field-measured motivation: the
+/// TARGET-side deallocate service (~2,700 cmd/s at any client width,
+/// ~1,700 under load) makes CoW-rewrite structurally dealloc-bound —
+/// `.benchmarks/2026-07-31-write-wall.md` §iteration-1. Crash class per
+/// the W1 precedent: only app-written sectors are rewritten (all of
+/// them, by this write); clone-shared / transformed / decorated shapes
+/// keep CoW verbatim (`tests/inplace_overwrite_tests.rs`).
+fn inplace_overwrite_cell() -> &'static std::sync::atomic::AtomicBool {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let on = std::env::var("SQUEEZEFS_INPLACE_OVERWRITE")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true);
+        std::sync::atomic::AtomicBool::new(on)
+    })
+}
+
+/// Whether eligible full-block overwrites land in place (default true).
+pub fn inplace_overwrite_enabled() -> bool {
+    inplace_overwrite_cell().load(Ordering::Relaxed)
+}
+
+/// Set the in-place-overwrite lever (tests / A-B acceptance runs).
+pub fn set_inplace_overwrite(on: bool) {
+    inplace_overwrite_cell().store(on, Ordering::Relaxed);
+}
+
 /// W2 fold trigger — extent COUNT threshold (`SQUEEZEFS_FOLD_MAX_EXTENTS`,
 /// design §6): an extent overlay reaching this many parked runs enqueues a
 /// background fold. Env read once; runtime-settable for tests/acceptance.
@@ -2550,6 +2584,13 @@ pub struct Metrics {
     /// no staging detour. 0 except at genuine space pressure; growth here
     /// with `write_through_fallbacks` quiet is the designed brim posture.
     pub write_through_inplace_rewrites: Align64<AtomicU64>,
+    /// DEFAULT-path in-place full-block overwrites (write-wall iteration
+    /// 1 — the rewrite-wall fix; see [`inplace_overwrite_enabled`]): an
+    /// eligible full-block overwrite landed at its own mapped offset
+    /// with zero displacement. THE rewrite engagement instrument — a
+    /// full-rewrite row of eligible files must account ~every block
+    /// here, with `block_free_reclaim_queued` flat.
+    pub write_through_inplace_overwrites: Align64<AtomicU64>,
     /// Write-pipeline uploads whose custody was DROPPED on a mid-flight
     /// fencing expiry (2026-07-27 campaign — the remount law applied to
     /// detached uploads, FIND-M11-A). **Must stay 0 on healthy mounts**
@@ -2617,18 +2658,24 @@ pub struct Metrics {
     /// this daemon was fenced — always investigate alongside
     /// `writer_guard_fenced`.
     pub block_free_reclaim_fence_halts: Align64<AtomicU64>,
-    /// At-cap inline-backpressure engagements on the ENQUEUE path (the
-    /// 2026-07-31 write-wall campaign's rewrite-wall engagement
-    /// instrument): a terminal free found the queue at
-    /// `SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS` and processed its reclaim
-    /// INLINE — a device round-trip back on the write path. The arm is
-    /// the conservation-over-latency backstop and **must stay 0**: the
-    /// worker's demand-derived parallel lanes are sized to outrun any
-    /// sustainable displacement rate (contract 10,
-    /// `tests/async_block_reclaim_tests.rs`); growth here means the
-    /// drain is losing to displacement again (the field's 6.3 GB/s
-    /// rewrite wall: queue pinned at cap, most discards inline).
-    pub block_free_reclaim_inline_spills: Align64<AtomicU64>,
+    /// At-cap enqueue PARKS (write-wall iteration 1 — park-don't-spill):
+    /// a terminal free found the queue at the deferred-space cap
+    /// (`SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS`) and parked (async, bounded
+    /// by `SQUEEZEFS_RECLAIM_CAP_PARK_MS`) until the drain relieved it —
+    /// it NEVER issues device commands from the enqueue context (the
+    /// retired inline arm charged a field-measured 12–22 ms synchronous
+    /// fabric round-trip to the write path, on the tpc handler lane).
+    /// Sustained growth = displacement outrunning the under-load drain
+    /// ceiling — the CoW-displacement shapes' honest backpressure
+    /// (eligible full-block overwrites ride the in-place path instead
+    /// and never displace).
+    pub block_free_reclaim_cap_parks: Align64<AtomicU64>,
+    /// Park liveness-bound expiries: the entry soft-overflowed into the
+    /// queue past the cap (RAM-bounded growth; conservation preserved by
+    /// the valve/unmount/idle drains). **≈ 0 in steady state** — growth
+    /// means the drain is wedged or the bound is mis-sized for the
+    /// fabric.
+    pub block_free_reclaim_cap_overflow: Align64<AtomicU64>,
     /// Device reclaim COMMANDS issued (BLKDISCARD / PUNCH_HOLE calls,
     /// success or refusal) — the command-economy face of adjacent-range
     /// coalescing: `block_free_{discards,file_punches}` stay per-BLOCK
@@ -4813,6 +4860,7 @@ impl SqueezefsFilesystem {
                 "write_through_bytes": METRICS.write_through_bytes.load(Ordering::Relaxed),
                 "write_through_fallbacks": METRICS.write_through_fallbacks.load(Ordering::Relaxed),
                 "write_through_inplace_rewrites": METRICS.write_through_inplace_rewrites.load(Ordering::Relaxed),
+                "write_through_inplace_overwrites": METRICS.write_through_inplace_overwrites.load(Ordering::Relaxed),
                 // Write-pipeline depth (2026-07-27 campaign): the internal
                 // instrument — the rig's iostat aqu-sz is the external one.
                 "write_pipeline_inflight_blocks": self.write_pipeline.inflight_blocks(),
@@ -4854,7 +4902,8 @@ impl SqueezefsFilesystem {
                 "block_free_reclaim_batches": METRICS.block_free_reclaim_batches.load(Ordering::Relaxed),
                 "block_free_reclaim_sync_drains": METRICS.block_free_reclaim_sync_drains.load(Ordering::Relaxed),
                 "block_free_reclaim_fence_halts": METRICS.block_free_reclaim_fence_halts.load(Ordering::Relaxed),
-                "block_free_reclaim_inline_spills": METRICS.block_free_reclaim_inline_spills.load(Ordering::Relaxed),
+                "block_free_reclaim_cap_parks": METRICS.block_free_reclaim_cap_parks.load(Ordering::Relaxed),
+                "block_free_reclaim_cap_overflow": METRICS.block_free_reclaim_cap_overflow.load(Ordering::Relaxed),
                 "block_free_reclaim_commands": METRICS.block_free_reclaim_commands.load(Ordering::Relaxed),
                 // RW1 rand-write device-byte ledger (design-random-small-
                 // writes §1.2 buckets; always-on — the G-RW2 gate's
@@ -7971,17 +8020,24 @@ impl SqueezefsFilesystem {
     /// caller surfaces the original `StorageFull` into the never-lossy
     /// staging ladder — genuine space pressure, honestly counted.
     ///
-    /// Write-pipeline composition (2026-07-27 depth campaign): the brim
-    /// rewrite runs INSIDE `upload_full_block_sized`, so it rides its
-    /// caller's admission verbatim — the detached ACK-path task's held
-    /// `PipelinePermit` (RAII, spans this whole call) or the flush legs'
-    /// deliberate no-permit drain context. It is never a second
-    /// admission, and it feeds the depth governor one completion sample
-    /// on the MAPPING's lane (`grow_size_to_block_end` carries the
-    /// caller's size posture: the flush legs' merges must not grow the
-    /// size floor — the generic/795 SIZE-NEVER-LEADS-DATA law, see
+    /// Write-pipeline composition (2026-07-27 depth campaign): the
+    /// in-place rewrite runs INSIDE `upload_full_block_sized`, so it
+    /// rides its caller's admission verbatim — the detached ACK-path
+    /// task's held `PipelinePermit` (RAII, spans this whole call) or the
+    /// flush legs' deliberate no-permit drain context. It is never a
+    /// second admission, and it feeds the depth governor one completion
+    /// sample on the MAPPING's lane (`grow_size_to_block_end` carries
+    /// the caller's size posture: the flush legs' merges must not grow
+    /// the size floor — the generic/795 SIZE-NEVER-LEADS-DATA law, see
     /// `upload_full_block_sized`).
-    async fn try_brim_inplace_rewrite(
+    ///
+    /// Two arms share this body (write-wall iteration 1): the DEFAULT
+    /// eligible-overwrite arm (`space_pressure = false` — zero
+    /// displacement, the rewrite-wall fix; gated by
+    /// [`inplace_overwrite_enabled`]) and the contract-9 brim arm
+    /// (`space_pressure = true` — genuine `StorageFull` convergence).
+    /// Each counts its own engagement gauge.
+    async fn try_inplace_rewrite(
         &self,
         ino: u64,
         b: u32,
@@ -7989,6 +8045,7 @@ impl SqueezefsFilesystem {
         fencing_token: u64,
         grow_size_to_block_end: bool,
         pipeline_t0: std::time::Instant,
+        space_pressure: bool,
     ) -> Result<bool, SqueezefsError> {
         // Passthrough only: an in-place image must occupy exactly the
         // undecorated mapping's whole-block window; a transformed image's
@@ -8001,16 +8058,17 @@ impl SqueezefsFilesystem {
             return Ok(false);
         }
         // The block's authoritative mapping under the caller's held block
-        // lock (the try_sole_owner_patch predicate-1 resolution).
+        // lock (the try_sole_owner_patch predicate-1 resolution). The RAM
+        // cache is the dirty authority: a PRESENT non-striped entry
+        // resolves ineligible WITHOUT a backend fetch (the default arm
+        // runs per block on the write hot path — fresh-file writes must
+        // pay one cache probe, never a meta round-trip); only a cold
+        // cache falls through to one fetch.
         let file_path = crate::keys::inode_path(ino);
         let mapping = {
-            let cached = self
-                .router
-                .metadata_cache
-                .get(&ino)
-                .filter(|m| m.file_type == "striped");
-            let meta = match cached {
-                Some(m) => Some(m),
+            let meta = match self.router.metadata_cache.get(&ino) {
+                Some(m) if m.file_type == "striped" => Some(m),
+                Some(_) => None,
                 None => self
                     .router
                     .fetch_metadata(&file_path)
@@ -8054,7 +8112,9 @@ impl SqueezefsFilesystem {
             allocator.publish_block(dev_offset);
             return Ok(false);
         }
+        let t_dma = std::time::Instant::now();
         let dma = device.write_block(dev_offset, processed).await;
+        pipeline_phase_record(PipelinePhase::Dma, t_dma);
         // Re-stabilize + purge on BOTH exits (the try_sole_owner_patch
         // discipline): no tier may serve the dying generation's bytes.
         allocator.publish_block(dev_offset);
@@ -8075,22 +8135,41 @@ impl SqueezefsFilesystem {
         } else {
             0
         };
-        let entries = [(b, mapping)];
-        self.router
-            .merge_block_mappings(
+        // Same-key merge on the COALESCING conveyor (write-wall iteration
+        // 1: the default arm runs per block on the rewrite hot path — a
+        // direct per-op commit here would re-create the serialized
+        // publish wall the write-commit-economy campaign closed). The
+        // merge skips equal keys, so the batch's layout delta carries ~no
+        // map inserts (size floor / timestamps only) and nothing
+        // displaces.
+        let t_publish = std::time::Instant::now();
+        let displaced = self
+            .router
+            .merge_block_mappings_coalesced(
                 ino,
-                crate::routing::BlockMapOp::Merge(&entries),
+                vec![(b, mapping)],
                 min_size,
                 crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
                 fencing_token,
             )
             .await?;
-        METRICS
-            .write_through_inplace_rewrites
-            .fetch_add(1, Ordering::Relaxed);
+        pipeline_phase_record(PipelinePhase::Publish, t_publish);
+        debug_assert!(
+            displaced.is_empty(),
+            "a same-key in-place merge can displace nothing"
+        );
+        if space_pressure {
+            METRICS
+                .write_through_inplace_rewrites
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            METRICS
+                .write_through_inplace_overwrites
+                .fetch_add(1, Ordering::Relaxed);
+        }
         // Feed the depth governor: one completed upload on the MAPPING's
-        // lane (the in-place DMA is a genuine device write; the brim is
-        // exactly the regime where the target must keep adapting).
+        // lane (the in-place DMA is a genuine device write — on the
+        // default arm this IS the rewrite steady state).
         self.write_pipeline
             .record_completion(&be_id, block_size, pipeline_t0.elapsed());
         Ok(true)
@@ -8174,6 +8253,31 @@ impl SqueezefsFilesystem {
             .process_write_async(plaintext)
             .await?;
         pipeline_phase_record(PipelinePhase::Crypto, t_crypto);
+        // Write-wall iteration 1 — the DEFAULT in-place overwrite arm
+        // (the rewrite-wall fix): an eligible full-block overwrite lands
+        // at its own mapped offset with ZERO displacement — no
+        // allocation, no free, no discard, no dealloc coupling (the
+        // field-measured target deallocate ceiling made CoW-rewrite
+        // structurally dealloc-bound). Ineligible shapes (fresh blocks,
+        // clone-shared, transformed, decorated, non-Active) fall through
+        // to the CoW path verbatim; `SQUEEZEFS_INPLACE_OVERWRITE=0` is
+        // the CoW-always A/B lever.
+        if inplace_overwrite_enabled()
+            && self
+                .try_inplace_rewrite(
+                    ino,
+                    b,
+                    processed.clone(),
+                    fencing_token,
+                    grow_size_to_block_end,
+                    pipe_t0,
+                    false,
+                )
+                .await?
+        {
+            write_phase_record(WritePhase::UploadDma, wp_dma);
+            return self.upload_invalidation_tail(ino, b).await;
+        }
         let (be_id, block_allocator, nvme_writer) =
             self.router.backend_router.get_active_backend()?;
         crate::block_allocator::ensure_stored_block_image_fits(
@@ -8205,13 +8309,14 @@ impl SqueezefsFilesystem {
                 // admission (the detached task's held permit) — never a
                 // second admit; the governor sample records inside.
                 if self
-                    .try_brim_inplace_rewrite(
+                    .try_inplace_rewrite(
                         ino,
                         b,
                         processed,
                         fencing_token,
                         grow_size_to_block_end,
                         pipe_t0,
+                        true,
                     )
                     .await?
                 {

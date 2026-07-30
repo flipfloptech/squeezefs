@@ -803,6 +803,17 @@ impl BackendRouter {
         self.reclaim.set_fence_signal(sig);
     }
 
+    /// Inject the reclaim manners' foreground device-activity signal
+    /// (contracts 12–13, `tests/async_block_reclaim_tests.rs`).
+    /// Production needs no wiring — the queue defaults to the METRICS
+    /// device-plane sum.
+    pub fn set_reclaim_foreground_signal(
+        &self,
+        sig: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) {
+        self.reclaim.set_foreground_signal(sig);
+    }
+
     /// Drain the background reclaim queue to empty (blocking work runs on
     /// the blocking pool): unmount teardown and tests. Conservation face:
     /// after this returns, every previously-enqueued range has been
@@ -1729,13 +1740,15 @@ impl BackendRouter {
             // shields the begin_free-limbo offset from fsck's C2/C3/C6
             // adjudication while the queue owns it.
             let inflight = allocator.inflight_register(offset);
-            self.reclaim.enqueue(crate::block_reclaim::ReclaimEntry {
-                allocator,
-                inflight,
-                device_path,
-                offset,
-                size: block_size,
-            });
+            self.reclaim
+                .enqueue(crate::block_reclaim::ReclaimEntry {
+                    allocator,
+                    inflight,
+                    device_path,
+                    offset,
+                    size: block_size,
+                })
+                .await;
         }
         Ok(())
     }

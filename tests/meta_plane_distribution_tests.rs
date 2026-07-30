@@ -68,9 +68,7 @@ async fn format_stamped_set(metas: &[PathBuf], width: u32) {
 }
 
 /// Per-volume journal-entry snapshot (the new instrument under test).
-fn journal_entries_per_volume(
-    routed: &squeezefs::meta_backend::RoutedMetaBackend,
-) -> Vec<u64> {
+fn journal_entries_per_volume(routed: &squeezefs::meta_backend::RoutedMetaBackend) -> Vec<u64> {
     routed
         .volumes
         .iter()

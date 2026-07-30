@@ -37,7 +37,7 @@ use squeezefs::meta_backend::kv::node_cache::{CachedNode, NodeCache, NodeCacheCo
 use squeezefs::meta_backend::kv::record::{inode_key, RecordKind, TREE_INODES};
 use squeezefs::meta_backend::kv::tree::{ApplyOutcome, KvTree, SmoContext};
 use squeezefs::meta_backend::kv::{
-    alloc_ext::ExtentAllocator, META_KV_NODE_APPEND_BYTES, META_KV_NODE_APPENDS,
+    alloc_ext::ExtentAllocator, META_KV_NODE_APPENDS, META_KV_NODE_APPEND_BYTES,
     META_KV_NODE_COMPACTIONS, META_KV_NODE_FREEZE_SHADOW_DROPPED, META_KV_NODE_REWRITE_BYTES,
 };
 use squeezefs::meta_backend::{open_routed_meta_set, Metadata};

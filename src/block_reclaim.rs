@@ -326,7 +326,7 @@ impl ReclaimQueue {
 
     /// Inject the foreground device-activity signal (tests). Set once;
     /// later calls are no-ops. Production uses the METRICS device-plane
-    /// sum (see [`device_activity_signal`]).
+    /// sum (see `device_activity_signal`).
     pub fn set_foreground_signal(&self, sig: Arc<dyn Fn() -> u64 + Send + Sync>) {
         let _ = self.fg_signal.set(sig);
     }

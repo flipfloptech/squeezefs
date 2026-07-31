@@ -568,6 +568,76 @@ async fn lane_engages_on_zero_share_streams_and_stays_ledger_invisible() {
 }
 
 // ---------------------------------------------------------------------------
+// Contract 8 (round 3 — the field's qd-reorder wedge): a CLASSIFIED
+// stream whose requests arrive with completion swaps (the libaio qd
+// arrival order) keeps lane membership — the lane keeps issuing and
+// classification does not churn. Under the exact-contiguity matcher a
+// single swap wedged the lane forever (field: 0.7 % arrival match,
+// 1,233 declassify/reclassify events per 70 s row, lane engagement 3 %).
+// Run-BUILDING stays exact: the random-vs-stream discriminator is
+// pinned by the sibling governor suites.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reordered_qd_stream_keeps_membership_and_lane_engagement() {
+    set_zero_share_env();
+    let h = make_with(*b"read-lane-test06", "rdlane_ns_f", false).await;
+    clear_zero_share_env();
+
+    let blocks = 16u64;
+    let (ino, _map) = striped_file(&h, "reorder", blocks).await;
+    let (f0, c0) = (
+        lane_fetches(),
+        METRICS.read_streams_classified.load(Ordering::Relaxed),
+    );
+
+    let q = BS / 4;
+    // Classify with 4 exact-contiguous requests (run building is exact
+    // by design), then stream the rest with a persistent qd-style swap
+    // in every pair — each pair arrives (n+1, n): NO request after the
+    // 4th matches exact contiguity.
+    for i in 0..4u64 {
+        let d = read_at(&h, ino, i * q, q as u32).await;
+        assert!(d.iter().all(|&x| x == 1));
+    }
+    let total = blocks * BS / q;
+    let mut i = 4u64;
+    while i + 1 < total {
+        for j in [i + 1, i] {
+            let off = j * q;
+            let b = off / BS;
+            let d = read_at(&h, ino, off, q as u32).await;
+            assert!(
+                d.iter().all(|&x| x == (b % 250) as u8 + 1),
+                "parity at swapped offset {off}"
+            );
+        }
+        i += 2;
+    }
+
+    for _ in 0..200 {
+        if h.fs.router.read_lane_inflight_bytes() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let df = lane_fetches() - f0;
+    let dc = METRICS.read_streams_classified.load(Ordering::Relaxed) - c0;
+    assert!(
+        df >= blocks / 2,
+        "a swapped-arrival stream must keep its lane engaged \
+         (read_lane_fetches = {df} across {blocks} blocks — 0 is the \
+         field's exact-contiguity wedge)"
+    );
+    assert!(
+        dc <= 2,
+        "membership tolerance must stop the declassify/reclassify churn \
+         (classify events = {dc})"
+    );
+    drop(h);
+}
+
+// ---------------------------------------------------------------------------
 // Contract 3 — deep-qd cohort stability: a sub-read that lost both the
 // single-flight window and the hot-probation clock race serves from the
 // hold, never refetches; coverage retirement empties the hold.

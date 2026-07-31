@@ -2810,6 +2810,49 @@ impl StreamLanes {
                 });
             }
         }
+        // CLASSIFIED-MEMBERSHIP tolerance (read-lane campaign round 3,
+        // 2026-08-01 — the field's qd-reorder wedge): once a lane is
+        // classified, an out-of-order sibling of the same stream must
+        // keep MEMBERSHIP even though it breaks exact contiguity — a
+        // libaio qd8 completion swap otherwise wedges the lane forever
+        // (`next_expected_offset` names a request that already arrived;
+        // measured: 0.7 % of a qd8 stream's arrivals matched, 1,233
+        // declassify/reclassify churn events per 70 s row, the lane
+        // starved at ~3 % engagement). The window is
+        // REQUEST-LENGTH-scaled — `±64 × len`, capped at 16 blocks'
+        // worth of bytes via the caller's own len (a qd-64 reorder span
+        // of the stream's own requests) — so small-request random
+        // traffic stays foreign (4 KiB ⇒ ±256 KiB: the 2026-07-26
+        // mid-row shape declassifies exactly as before; simulated 0 %
+        // member across the random harm shapes, 88–100 % across the
+        // seq reorder shapes). RUN-BUILDING stays exact-contiguity —
+        // the pinned random-vs-stream discriminator is untouched;
+        // membership applies only to lanes that already earned
+        // classification, while they are fresh. `next_expected_offset`
+        // advances max-forward (racy-tolerant: a lost update is a
+        // slightly stale edge inside the tolerance).
+        for lane in &self.lanes {
+            if lane.classified.load(Relaxed)
+                && now.saturating_sub(lane.last_seen_ms.load(Relaxed)) < 2_000
+            {
+                let exp = lane.next_expected_offset.load(Relaxed);
+                if exp == u64::MAX {
+                    continue;
+                }
+                let tol = len.saturating_mul(64);
+                if offset.saturating_add(tol) >= exp && offset <= exp.saturating_add(tol) {
+                    self.foreign_since_match.store(0, Relaxed);
+                    if offset + len > exp {
+                        lane.next_expected_offset.store(offset + len, Relaxed);
+                    }
+                    lane.last_seen_ms.store(now, Relaxed);
+                    return Some(LaneRef {
+                        lane,
+                        streaming: true,
+                    });
+                }
+            }
+        }
         if !claim {
             return None;
         }

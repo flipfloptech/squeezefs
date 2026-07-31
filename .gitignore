@@ -22,3 +22,6 @@ dhat-heap.json
 
 # cloud bench-cluster local state (tests/cloud_bench_cluster.sh)
 .cloud-bench/
+
+# Proprietary exa client performance scripts
+exa-client-performance-scripts/

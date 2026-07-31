@@ -83,7 +83,10 @@ Write rows additionally carry the standing amplification columns:
 excludes ramp I/O while diskstats includes it, so the printed ratio
 overestimates by roughly `(runtime+ramp)/runtime` — use `--ramp 0` when
 the amp column is the row's verdict, or quote `tests/write_amp_rig.sh`
-(the packaged instrument, incl. `wareq-sz` and `block_free_*`).
+(the packaged instrument, incl. `wareq-sz` and `block_free_*`). On
+PASS-BOUND write rows (`fresh_write_pass.job`) the window closes at fio
+exit while the ACK-before-DMA pipeline is still draining — quote amp
+from sustained (time_based) rows only.
 
 ## How `.benchmarks` notes cite rows
 

@@ -231,6 +231,25 @@ impl NumaTopology {
         self.distance[exec_node][mem_node] == min
     }
 
+    /// Sibling rotation for same-origin placements (fd-sharded sessions
+    /// of one pid): sibling `k` lands on the k-th CPU-owning node ranked
+    /// by distance from `base` (nearest first, ties by index, wrapping).
+    /// One session ⇒ the inferred node exactly; N sessions of one app
+    /// spread across sockets nearest-first instead of piling onto the
+    /// base (the drain-capacity-halving shape). Single node ⇒ constant.
+    pub fn rotate_exec_from(&self, base: usize, k: usize) -> usize {
+        let base = base.min(self.nodes.len().saturating_sub(1));
+        let exec: Vec<usize> = self.ranked[base]
+            .iter()
+            .copied()
+            .filter(|&n| !self.nodes[n].cpus.is_empty())
+            .collect();
+        if exec.is_empty() {
+            return base;
+        }
+        exec[k % exec.len()]
+    }
+
     /// Owner-index → node partition for a pool of `count` slots: a
     /// largest-remainder weighted round-robin over the nodes that own
     /// CPUs, weight = CPU share (pool sizes stay THE existing

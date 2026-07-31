@@ -689,6 +689,9 @@ impl Drop for SessionMapping {
 struct IpcSession {
     id: u64,
     uid: u32,
+    /// SO_PEERCRED pid — the same-pid sibling counter's key (NUMA
+    /// session rotation; accounting only, never authorization).
+    pid: u32,
     /// Peer privilege class for the killpriv-v2 write obligation
     /// (`BindingRights::kill_priv` copies this per BIND) — computed at
     /// HELLO from the SO_PEERCRED identity via [`peer_kill_priv`].
@@ -1551,8 +1554,21 @@ impl IpcHost {
         // Session→node inference (NUMA-affinity campaign 2026-07-31,
         // daemon-side only — no wire/ABI change): the peer's last-run
         // CPU via the SO_PEERCRED-verified pid, mapped through the
-        // runtime topology. `None` on single-node maps.
-        let session_node = crate::numa::session_node_for_pid(cred.pid as u32);
+        // runtime topology; SIBLING sessions of the same pid (fd-sharded
+        // multi-threaded apps) rotate across exec nodes nearest-first —
+        // one app must never pile every arena + service thread onto one
+        // socket (the drain-capacity-halving shape). `None` on
+        // single-node maps.
+        let session_node = crate::numa::session_node_for_pid(cred.pid as u32).map(|base| {
+            let siblings = self
+                .sessions
+                .lock()
+                .expect("session registry mutex never poisons")
+                .values()
+                .filter(|s| s.pid == cred.pid as u32)
+                .count();
+            crate::numa_core::topology().rotate_exec_from(base, siblings)
+        });
         // Establish: sealed memfd + mapping + registry entry.
         let (memfd, map) = match create_session_shm(
             &self.cfg.geometry,
@@ -1615,6 +1631,7 @@ impl IpcHost {
         let session = Arc::new(IpcSession {
             id: self.next_session_id.fetch_add(1, Ordering::Relaxed),
             uid: cred.uid,
+            pid: cred.pid as u32,
             kill_priv: peer_kill_priv(cred.uid, cred.pid as u32),
             owner,
             map: Arc::new(map),

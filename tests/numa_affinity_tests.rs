@@ -195,6 +195,44 @@ fn cxl_and_nicless_nodes_resolve_by_distance() {
 }
 
 // ---------------------------------------------------------------------
+// same-pid sibling rotation (fd-sharded sessions of one app)
+// ---------------------------------------------------------------------
+
+/// One multi-threaded app opens N fd-sharded sessions from one pid; its
+/// main-thread CPU sample must not pile every arena + service thread
+/// onto one socket (drain capacity halves — the ingest-economy wall
+/// shape). Law: sibling k of a pid lands on the k-th exec node ranked
+/// by distance from the inferred base (nearest first, ties by index).
+#[test]
+fn same_pid_sessions_rotate_across_exec_nodes() {
+    let t = field_two_socket();
+    // Base node 1: rank [1, 0] — siblings alternate 1,0,1,0…
+    assert_eq!(t.rotate_exec_from(1, 0), 1);
+    assert_eq!(t.rotate_exec_from(1, 1), 0);
+    assert_eq!(t.rotate_exec_from(1, 2), 1);
+    assert_eq!(t.rotate_exec_from(1, 7), 0);
+
+    // NPS: base 1 ranks exec nodes [1(10), 0(12), 2(32), 3(32)].
+    let nps = nps_four_node();
+    assert_eq!(nps.rotate_exec_from(1, 0), 1);
+    assert_eq!(nps.rotate_exec_from(1, 1), 0);
+    assert_eq!(nps.rotate_exec_from(1, 2), 2);
+    assert_eq!(nps.rotate_exec_from(1, 3), 3);
+    assert_eq!(nps.rotate_exec_from(1, 4), 1, "wraps");
+
+    // CPU-less nodes never enter the rotation.
+    let cxl = cxl_three_node();
+    for k in 0..6 {
+        assert_ne!(cxl.rotate_exec_from(0, k), 2, "CXL node excluded");
+    }
+
+    // Single node: every sibling lands on the one node (no-op).
+    let single = NumaTopology::synthetic(vec![(0, vec![0, 1])], vec![vec![10]])
+        .expect("valid single-node topology");
+    assert_eq!(single.rotate_exec_from(0, 3), 0);
+}
+
+// ---------------------------------------------------------------------
 // weighted owner partition (asymmetric CPU counts)
 // ---------------------------------------------------------------------
 

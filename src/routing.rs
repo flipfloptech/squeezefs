@@ -4712,13 +4712,22 @@ impl DataRouter {
             .prefetch_active_streams
             .load(Ordering::Relaxed)
             .min(u64::from(u32::MAX)) as u32;
+        // Fallback consume-window depth: the derived §5.5 window cap —
+        // the cohort span a deep-qd reorder window can spread a
+        // block's sub-reads across (no constants: share% × hot budget
+        // / block, railed [4, 4096]).
+        let window_depth = derived_prefetch_window_cap(
+            self.prefetch_share_pct,
+            self.cache.hot_block.max_bytes(),
+            block_size,
+        );
         self.read_lane
             .hold_budget()
             .max(crate::read_lane::hold_budget_bytes(
                 crate::read_lane::effective_mem_budget(),
                 block_size,
                 streams,
-                crate::read_lane::READ_LANE_FLOOR_BLOCKS,
+                window_depth,
             ))
     }
 
@@ -4770,16 +4779,13 @@ impl DataRouter {
         let budget_cap =
             crate::read_lane::effective_mem_budget() / crate::read_lane::READ_LANE_BUDGET_DIVISOR;
         let lane = &lanes.lanes[lane_idx];
-        // Depth = the lane's live AIMD window (foreground-wait growth /
-        // evicted-unconsumed collapse — the §5.5 machinery, which keeps
-        // running in this regime), bounded by the derived cap. The
-        // round-2 field bracket falsified a pure-BDP derivation here
-        // (the write campaign's self-fulfilling-equilibrium lesson,
-        // reproduced on reads — see read_lane_depth_blocks).
-        let window = lane.window.load(Relaxed).min(self.prefetch_window_cap());
+        // Ahead depth: the explicit pin only (default 0 — the campaign
+        // brackets falsified ahead speculation on demand-concurrent
+        // venues; see read_lane_depth_blocks). The hold keeps working
+        // regardless: demand deposits + cohort serves are the measured
+        // win.
         let streams = active_streams.min(u64::from(u32::MAX)) as u32;
         let depth = self.read_lane.depth_blocks(
-            window,
             block_size,
             streams,
             mem_level == crate::mem_budget::Level::Red,

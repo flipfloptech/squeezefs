@@ -19,31 +19,34 @@
 //! live blocks), and stragglers refetch whole blocks (measured
 //! `read_amp` 1.05 → 1.41 from qd8 → qd32).
 //!
-//! ## The mechanism (two coordinated pieces, one lever)
+//! ## The mechanism (the hold, plus an opt-in ahead lane; one lever)
 //!
-//! 1. **The lane fetch pipeline**: when a lane is classified streaming
-//!    and R2 declines with a zero resident share, the read lane issues
-//!    pipelined whole-block fetches — **ledger-invisible**: no ghost
-//!    recording, no governor arbitration, no hot/NVMe-tier publication,
-//!    no admission-waste accounting — the 2026-07-26 scan-resistance
-//!    verdict STANDS; the lane adds fetch concurrency, never tier
-//!    residency. Depth is **derived at runtime** (BDP: measured fetch
-//!    service floor × delivered fetch bandwidth — the write-pipeline
-//!    governor's estimate shape, reusing its pure window rolls), never a
-//!    constant; floor [`READ_LANE_FLOOR_BLOCKS`] per stream, bounded by
-//!    the R5 budget cap ([`READ_LANE_BUDGET_DIVISOR`]) and clamped to
-//!    zero speculation under Red (in-flight bytes converge by
-//!    completion — the `write_pipeline_inflight` pattern).
-//! 2. **The hold** ([`ReadLaneHold`]): completed whole-block fills —
-//!    lane fetches AND demand primaries (> 256 KiB, validated-fill
-//!    window only) — park in a ledger-invisible, purge-integrated,
-//!    coverage-retired holding store. Foreground readers serve from it
-//!    (binding-rechecked exactly like hot-tier hits) and every serve
-//!    credits consumed bytes; full coverage retires the entry, so
-//!    memory converges by consumption. This is the deep-qd cohort
-//!    stability fix: a straggling same-block sub-read that missed the
+//! 1. **The hold** ([`ReadLaneHold`]) — **the shipped default win**:
+//!    completed whole-block fills (demand primaries AND pinned-lane
+//!    fetches; > 256 KiB, validated-fill window only) park in a
+//!    ledger-invisible, purge-integrated, coverage-retired holding
+//!    store. Foreground readers serve from it (binding-rechecked
+//!    exactly like hot-tier hits) and every consumption path credits
+//!    consumed bytes; full coverage retires the entry, so memory
+//!    converges by consumption. This is the deep-qd cohort stability
+//!    fix: a straggling same-block sub-read that missed the
 //!    single-flight window and lost the hot-probation clock race hits
-//!    the hold instead of refetching 4 MiB.
+//!    the hold instead of refetching 4 MiB. Field bracket (same
+//!    binary, A-B-B-A vs the A0 lever): qd8 **+11 %** (25.98 vs 23.50
+//!    GB/s), qd32 **+12 %** (20.91 vs 18.60) with read_amp 1.404 →
+//!    1.147 — every serve/credit path measured engagement-exact.
+//! 2. **The ahead lane** (opt-in, `SQUEEZEFS_READ_LANE_DEPTH=N`): when
+//!    a lane is classified streaming and R2 declines with a zero
+//!    resident share, issue pinned-depth whole-block fetches —
+//!    **ledger-invisible**: no ghost recording, no governor
+//!    arbitration, no hot/NVMe-tier publication, no admission-waste
+//!    accounting — the 2026-07-26 scan-resistance verdict STANDS.
+//!    Bounded by the reader-tied horizon, a per-file single issue
+//!    owner, the R5 budget cap ([`READ_LANE_BUDGET_DIVISOR`]) and
+//!    clamped to zero under Red (in-flight bytes converge by
+//!    completion — the `write_pipeline_inflight` pattern). Default 0:
+//!    the campaign's counted brackets falsified ahead speculation on
+//!    demand-concurrent venues (see [`read_lane_depth_blocks`]).
 //!
 //! ## Correctness posture (nothing new is proven here)
 //!
@@ -81,11 +84,6 @@
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Cold-start / minimum useful pipeline: blocks in flight per stream
-/// while the BDP estimates learn (the campaign charter's "≥ 2 blocks in
-/// flight per stream" floor — one consuming, one fetching).
-pub const READ_LANE_FLOOR_BLOCKS: u32 = 2;
-
 /// The R5 bound: lane in-flight fetch bytes (and the hold's insert-time
 /// budget) never exceed `MEM_BUDGET / this`. Deliberately junior to the
 /// write pipeline's `/4` — read speculation must never crowd out write
@@ -97,34 +95,28 @@ pub const READ_LANE_BUDGET_DIVISOR: u64 = 8;
 /// verbatim — it already has a RAM tier).
 pub const READ_LANE_MIN_FILL_BYTES: usize = 256 * 1024;
 
-/// Per-stream lane depth, in blocks (pure — pinned by
-/// `tests/read_lane_tests.rs` depth tables). NO fixed depth anywhere:
-/// the adaptive value is the lane's live §5.5 AIMD `window` —
-/// foreground-wait growth (the reader demonstrably caught the
-/// pipeline: too shallow) / evicted-unconsumed collapse + quiescence
-/// (demonstrated waste), already Green-gated and capped by the derived
-/// `prefetch_window_cap` upstream — floored at
-/// [`READ_LANE_FLOOR_BLOCKS`] and bounded by the per-stream share of
-/// the R5 budget cap.
+/// Per-stream lane AHEAD-issue depth, in blocks (pure — pinned by
+/// `tests/read_lane_tests.rs` depth tables). **Default 0 — ahead-issue
+/// is opt-in** (`SQUEEZEFS_READ_LANE_DEPTH=N`, verbatim): the campaign
+/// field brackets falsified BOTH adaptive derivations on the reset-v3
+/// venue — pure-BDP (the write campaign's self-fulfilling-equilibrium
+/// lesson, reproduced: floor-locked at 32+ streams) and the §5.5 AIMD
+/// window (engaged at depth 2/4/16 alike, the ahead-fetches
+/// systematically died FIFO-unconsumed before their reader and cost
+/// −19 % vs the hold alone: 21.0 vs 26.0 GB/s at qd8, read_amp 1.16
+/// vs 0.71 — every armed row worse than every hold-only row). On a
+/// venue where the client's own qd × streams already covers the
+/// fabric BDP, ahead speculation only competes with the demand
+/// cohort's perfect single-flight amortization. The pin remains for
+/// high-latency / low-qd fabrics pending the engage-governor
+/// follow-on (probe-adopt-retreat, the ProbeCore shape — named in the
+/// campaign note).
 ///
-/// A pure-BDP derivation (measured lane-fetch bandwidth × latency
-/// floor, the write-pipeline estimate shape) was built first and
-/// FALSIFIED by the field bracket (2026-08-01 round 2, the campaign
-/// note §round-2): it is the same self-fulfilling equilibrium the
-/// 2026-07-29 probe-up campaign convicted on writes — it targets the
-/// CURRENT delivery point (the plateau bandwidth × its own service
-/// floor ⇒ floor depth at 32+ streams) and discovers nothing. The
-/// AIMD window is the read side's honest probe: it grows only on
-/// reader-wait evidence and collapses on demonstrated waste.
-///
-/// Red returns 0 — speculation stops, the in-flight gauge converges
-/// by completion (Red is senior to the measurement pin, the
-/// write-pipeline precedent). A budget cap that cannot hold even one
-/// block per stream never speculates (share-0 rationale, preserved
-/// from §5.5).
+/// Red returns 0 — senior to the pin (the write-pipeline precedent).
+/// A budget cap that cannot hold one block per stream never
+/// speculates.
 pub fn read_lane_depth_blocks(
     override_depth: Option<u32>,
-    window: u32,
     block_size: u64,
     active_streams: u32,
     red: bool,
@@ -133,16 +125,13 @@ pub fn read_lane_depth_blocks(
     if red {
         return 0;
     }
-    if let Some(d) = override_depth {
-        return d;
-    }
+    let Some(depth) = override_depth else {
+        return 0;
+    };
     let bs = block_size.max(1);
     let streams = u64::from(active_streams.max(1));
     let cap = (budget_cap_bytes / bs / streams).min(u64::from(u32::MAX)) as u32;
-    if cap == 0 {
-        return 0;
-    }
-    window.max(READ_LANE_FLOOR_BLOCKS).min(cap)
+    depth.min(cap)
 }
 
 /// One lane-issue admission decision (pure): per-lane depth bound AND
@@ -436,11 +425,10 @@ impl ReadLaneGovernor {
         self.enabled
     }
 
-    /// Live per-stream depth (blocks) — [`read_lane_depth_blocks`] over
-    /// the lane's AIMD window.
+    /// Live per-stream ahead depth (blocks) — [`read_lane_depth_blocks`]
+    /// over the pin.
     pub fn depth_blocks(
         &self,
-        window: u32,
         block_size: u64,
         active_streams: u32,
         red: bool,
@@ -448,7 +436,6 @@ impl ReadLaneGovernor {
     ) -> u32 {
         read_lane_depth_blocks(
             self.depth_override,
-            window,
             block_size,
             active_streams,
             red,

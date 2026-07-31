@@ -55,7 +55,6 @@ use squeezefs::meta_backend::RoutedMetaBackend;
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::read_lane::{
     hold_budget_bytes, lane_issue_admits, read_lane_depth_blocks, ReadLaneHold,
-    READ_LANE_FLOOR_BLOCKS,
 };
 use squeezefs::routing::DataRouter;
 use std::ffi::OsStr;
@@ -74,69 +73,31 @@ fn depth_derivation_tables() {
     let gib = 1024 * 1024 * 1024u64;
     let bs = 4 * 1024 * 1024u64;
 
-    // Cold start (window at its AIMD start of 2): the floor, per stream.
-    assert_eq!(
-        read_lane_depth_blocks(None, 2, bs, 32, false, 64 * gib),
-        READ_LANE_FLOOR_BLOCKS,
-        "cold-start depth is the per-stream floor"
-    );
+    // Ahead-issue is OPT-IN (default 0): the campaign brackets
+    // falsified both adaptive derivations (pure-BDP = the write
+    // campaign's self-fulfilling equilibrium; the AIMD window = -19%
+    // vs the hold alone on demand-concurrent venues — ahead-fetches
+    // died FIFO-unconsumed racing the cohort). The pin remains for
+    // high-latency/low-qd fabrics.
+    assert_eq!(read_lane_depth_blocks(None, bs, 32, false, 64 * gib), 0);
+    assert_eq!(read_lane_depth_blocks(None, bs, 1, false, 64 * gib), 0);
 
-    // The depth IS the lane's AIMD window (the round-2 field
-    // falsification of a pure-BDP derivation: it targeted the current
-    // delivery point and never discovered — the write campaign's
-    // probe-up lesson reproduced on reads). Foreground-wait growth
-    // raises the window; the depth follows verbatim.
-    assert_eq!(
-        read_lane_depth_blocks(None, 16, bs, 32, false, 64 * gib),
-        16
-    );
-    // A collapsed window still speculates at the floor (2 = one
-    // consuming + one fetching).
-    assert_eq!(
-        read_lane_depth_blocks(None, 1, bs, 32, false, 64 * gib),
-        READ_LANE_FLOOR_BLOCKS
-    );
+    // The pin wins verbatim (0 = no ahead issue).
+    assert_eq!(read_lane_depth_blocks(Some(7), bs, 32, false, 64 * gib), 7);
+    assert_eq!(read_lane_depth_blocks(Some(0), bs, 32, false, 64 * gib), 0);
+
+    // The R5 budget cap is senior to the pin: a cap that holds 3
+    // blocks/stream clamps a deeper pin to 3; a cap that cannot hold
+    // even ONE block per stream never speculates.
+    assert_eq!(read_lane_depth_blocks(Some(16), bs, 2, false, 6 * bs), 3);
+    assert_eq!(read_lane_depth_blocks(Some(16), bs, 32, false, 16 * bs), 0);
+
+    // Red stops speculation outright and is SENIOR to the pin (the
+    // write-pipeline Red-clamp precedent).
+    assert_eq!(read_lane_depth_blocks(Some(8), bs, 32, true, 64 * gib), 0);
 
     // Zero streams behaves as one (defensive).
-    assert_eq!(
-        read_lane_depth_blocks(None, 2, bs, 0, false, 64 * gib),
-        READ_LANE_FLOOR_BLOCKS
-    );
-
-    // The R5 budget cap is senior to the window: a cap that holds 3
-    // blocks/stream clamps a deeper window to 3.
-    assert_eq!(
-        read_lane_depth_blocks(None, 16, bs, 2, false, 6 * bs),
-        3,
-        "budget cap clamps the window"
-    );
-
-    // A budget that cannot hold even ONE block per stream never
-    // speculates (the zero-share rationale, preserved).
-    assert_eq!(
-        read_lane_depth_blocks(None, 16, bs, 32, false, 16 * bs),
-        0,
-        "sub-one-block budget share must not speculate"
-    );
-
-    // Red stops speculation outright and is SENIOR to the measurement
-    // pin (the write-pipeline Red-clamp precedent).
-    assert_eq!(read_lane_depth_blocks(None, 16, bs, 32, true, 64 * gib), 0);
-    assert_eq!(
-        read_lane_depth_blocks(Some(8), 16, bs, 32, true, 64 * gib),
-        0,
-        "Red is senior to the depth pin"
-    );
-
-    // The measurement pin wins verbatim otherwise (0 = no lane issue).
-    assert_eq!(
-        read_lane_depth_blocks(Some(7), 2, bs, 32, false, 64 * gib),
-        7
-    );
-    assert_eq!(
-        read_lane_depth_blocks(Some(0), 16, bs, 32, false, 64 * gib),
-        0
-    );
+    assert_eq!(read_lane_depth_blocks(Some(2), bs, 0, false, 64 * gib), 2);
 
     // Issue admission: per-lane depth bound AND the aggregate cap.
     assert!(lane_issue_admits(1, 2, 0, bs, 64 * gib));
@@ -147,11 +108,10 @@ fn depth_derivation_tables() {
     );
 
     // Hold budget: the live consume-behind window (4 x streams x depth
-    // blocks — ahead window + straggler cohort + FIFO-skew margin),
-    // floored at 4 blocks, capped by the R5 share. Round-2 field
-    // lesson: a flat mem/8 budget pinned 23.6 GiB of FIFO churn;
-    // round-4: a 2x window still evicted half the deposits unconsumed
-    // under 38-stream FIFO skew.
+    // blocks — cohort span + FIFO-skew margin), floored at 4 blocks,
+    // capped by the R5 share. Round-2 field lesson: a flat mem/8
+    // budget pinned 23.6 GiB of FIFO churn; round-4: a 2x window still
+    // evicted half the deposits unconsumed under 38-stream FIFO skew.
     assert_eq!(hold_budget_bytes(80 * gib, bs, 32, 16), 4 * 32 * 16 * bs);
     assert_eq!(hold_budget_bytes(80 * gib, bs, 1, 2), 8 * bs);
     assert_eq!(
@@ -462,6 +422,16 @@ fn clear_zero_share_env() {
     std::env::remove_var("SQUEEZEFS_READ_PREFETCH_SHARE_PCT");
     std::env::remove_var("SQUEEZEFS_READ_RANGED_THRESHOLD");
 }
+/// Ahead-issue contracts additionally pin the opt-in depth (the
+/// shipped default is hold-only — ahead-issue was falsified on
+/// demand-concurrent venues and remains the high-latency-fabric
+/// lever).
+fn set_ahead_env() {
+    std::env::set_var("SQUEEZEFS_READ_LANE_DEPTH", "4");
+}
+fn clear_ahead_env() {
+    std::env::remove_var("SQUEEZEFS_READ_LANE_DEPTH");
+}
 
 // ---------------------------------------------------------------------------
 // Contracts 1 + 2 — engagement in the zero-share regime, ledger
@@ -472,7 +442,9 @@ fn clear_zero_share_env() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lane_engages_on_zero_share_streams_and_stays_ledger_invisible() {
     set_zero_share_env();
+    set_ahead_env();
     let h = make_with(*b"read-lane-test01", "rdlane_ns_a", true).await;
+    clear_ahead_env();
     clear_zero_share_env();
 
     let blocks = 16u64;
@@ -596,7 +568,9 @@ async fn lane_engages_on_zero_share_streams_and_stays_ledger_invisible() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reordered_qd_stream_keeps_membership_and_lane_engagement() {
     set_zero_share_env();
+    set_ahead_env();
     let h = make_with(*b"read-lane-test06", "rdlane_ns_f", false).await;
+    clear_ahead_env();
     clear_zero_share_env();
 
     let blocks = 16u64;
@@ -803,7 +777,9 @@ async fn lever_off_is_exact_prior_behavior() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn red_stops_lane_speculation_and_deposits_and_converges() {
     set_zero_share_env();
+    set_ahead_env();
     let h = make_with(*b"read-lane-test04", "rdlane_ns_d", false).await;
+    clear_ahead_env();
     clear_zero_share_env();
 
     let (ino, _map) = striped_file(&h, "redlane", 8).await;

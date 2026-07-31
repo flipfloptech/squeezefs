@@ -103,10 +103,20 @@ dev_bytes() { # dev_bytes w|r → summed bytes on the data namespaces
 
 daemon_pid() { pgrep -f "$BIN mount" | head -1; }
 
-thp_kb() { # daemon shmem PMD-mapped KiB (arena THP engagement)
+thp_kb_now() { # daemon shmem PMD-mapped KiB (arena THP engagement)
     local pid; pid=$(daemon_pid)
     awk '/^ShmemPmdMapped:/{print $2; found=1} END{if(!found)print 0}' \
         "/proc/$pid/smaps_rollup" 2>/dev/null | head -1
+}
+
+thp_sampler() { # max ShmemPmdMapped observed while a row runs (sessions
+                # are reaped at client exit, so post-row reads see 0)
+    local out="$1" max=0 v
+    : > "$out"
+    while :; do
+        v=$(thp_kb_now); [ "${v:-0}" -gt "$max" ] && { max=$v; echo "$max" > "$out"; }
+        sleep 1
+    done
 }
 
 mount_side() { # fresh format + interception mount with the side's levers
@@ -150,6 +160,7 @@ row() { # row <name> <shim01> <rw> <fresh|keep|cold> [extra fio args...]
         local dw0 dr0 dpid
         dw0=$(dev_bytes w); dr0=$(dev_bytes r); dpid=$(daemon_pid)
         snap_stats "$base.pre.json"
+        thp_sampler "$base.thp" & local thppid=$!
         # Daemon-attached perf for exactly the row window.
         perf stat -p "$dpid" -e "$PERF_EVENTS" -o "$base.dmn.perf" &
         local perfpid=$!
@@ -160,11 +171,13 @@ row() { # row <name> <shim01> <rw> <fresh|keep|cold> [extra fio args...]
             --rw="$rw" --direct=1 --zero_buffers --size=1g \
             --time_based --runtime="$RUNTIME" \
             --output-format=json --output="$base.fio.json" "$@" >/dev/null 2>&1 \
-            || { kill -INT "$perfpid" 2>/dev/null; fail "fio $LABEL/$name r$rep"; }
+            || { kill -INT "$perfpid" 2>/dev/null; kill "$thppid" 2>/dev/null; fail "fio $LABEL/$name r$rep"; }
         kill -INT "$perfpid" 2>/dev/null; wait "$perfpid" 2>/dev/null
+        kill "$thppid" 2>/dev/null; wait "$thppid" 2>/dev/null
         snap_stats "$base.post.json"
         local dw1 dr1 tkb
-        dw1=$(dev_bytes w); dr1=$(dev_bytes r); tkb=$(thp_kb)
+        dw1=$(dev_bytes w); dr1=$(dev_bytes r); tkb=$(cat "$base.thp" 2>/dev/null || echo 0)
+        tkb=${tkb:-0}
         python3 - "$LABEL" "$name" "$rep" "$base" "$shim" "$((dw1-dw0))" "$((dr1-dr0))" "$tkb" "$CSV" <<'EOF'
 import json, re, sys
 label, row, rep, base, shim, devw, devr, tkb, csv = sys.argv[1:10]

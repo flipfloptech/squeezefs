@@ -1,5 +1,12 @@
 # 2026-07-31 — fio gap accounting: the canon, the ladder, THE GAP NAMED
 
+> **SUPERSESSION (same day):** every "26.1 GB/s raw write ceiling"
+> reference below is RETIRED — the approved re-sweep measured the true
+> ceiling at **49.7 GB/s (dual-200GbE line rate)**, re-verdicting §8.1
+> to FS-write = 0.63× raw (~18 GB/s headroom). See
+> `.benchmarks/2026-07-31-raw-write-ceiling-resweep.md` (source of
+> record). The read-side verdict (§6.2/§8.2) is unchanged.
+
 Branch `perf/fio-gap-accounting` (off dev tip `3ea474b`, **unmerged —
 do not merge/push without orchestrator review**). Governing user
 directives (verbatim): *"Finding the gap is the most important thing we

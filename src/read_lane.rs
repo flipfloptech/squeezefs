@@ -86,11 +86,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// flight per stream" floor — one consuming, one fetching).
 pub const READ_LANE_FLOOR_BLOCKS: u32 = 2;
 
-/// BDP multiplier: absorbs fetch-service variance and the serve-side
-/// legs so the DEVICE leg stays at ≥ 1×BDP occupancy (the
-/// write-pipeline `HEADROOM` shape).
-pub const READ_LANE_HEADROOM: u64 = 3;
-
 /// The R5 bound: lane in-flight fetch bytes (and the hold's insert-time
 /// budget) never exceed `MEM_BUDGET / this`. Deliberately junior to the
 /// write pipeline's `/4` — read speculation must never crowd out write
@@ -104,17 +99,32 @@ pub const READ_LANE_MIN_FILL_BYTES: usize = 256 * 1024;
 
 /// Per-stream lane depth, in blocks (pure — pinned by
 /// `tests/read_lane_tests.rs` depth tables). NO fixed depth anywhere:
-/// the adaptive value is `max(floor, BDP × HEADROOM / streams)` with
-/// `BDP = bw_peak × lat_floor / block_size`, bounded by the per-stream
-/// share of the R5 budget cap. Red returns 0 — speculation stops, the
-/// in-flight gauge converges by completion (Red is senior to the
-/// measurement pin, the write-pipeline precedent). A budget cap that
-/// cannot hold even one block per stream never speculates (share-0
-/// rationale, preserved from §5.5).
+/// the adaptive value is the lane's live §5.5 AIMD `window` —
+/// foreground-wait growth (the reader demonstrably caught the
+/// pipeline: too shallow) / evicted-unconsumed collapse + quiescence
+/// (demonstrated waste), already Green-gated and capped by the derived
+/// `prefetch_window_cap` upstream — floored at
+/// [`READ_LANE_FLOOR_BLOCKS`] and bounded by the per-stream share of
+/// the R5 budget cap.
+///
+/// A pure-BDP derivation (measured lane-fetch bandwidth × latency
+/// floor, the write-pipeline estimate shape) was built first and
+/// FALSIFIED by the field bracket (2026-08-01 round 2, the campaign
+/// note §round-2): it is the same self-fulfilling equilibrium the
+/// 2026-07-29 probe-up campaign convicted on writes — it targets the
+/// CURRENT delivery point (the plateau bandwidth × its own service
+/// floor ⇒ floor depth at 32+ streams) and discovers nothing. The
+/// AIMD window is the read side's honest probe: it grows only on
+/// reader-wait evidence and collapses on demonstrated waste.
+///
+/// Red returns 0 — speculation stops, the in-flight gauge converges
+/// by completion (Red is senior to the measurement pin, the
+/// write-pipeline precedent). A budget cap that cannot hold even one
+/// block per stream never speculates (share-0 rationale, preserved
+/// from §5.5).
 pub fn read_lane_depth_blocks(
     override_depth: Option<u32>,
-    bw_peak_bps: u64,
-    lat_floor_ns: u64,
+    window: u32,
     block_size: u64,
     active_streams: u32,
     red: bool,
@@ -132,11 +142,7 @@ pub fn read_lane_depth_blocks(
     if cap == 0 {
         return 0;
     }
-    let bdp_blocks = ((bw_peak_bps as u128 * lat_floor_ns as u128) / 1_000_000_000u128 / bs as u128)
-        .min(u128::from(u32::MAX)) as u64;
-    let per_stream =
-        (bdp_blocks.saturating_mul(READ_LANE_HEADROOM) / streams).min(u64::from(u32::MAX)) as u32;
-    per_stream.max(READ_LANE_FLOOR_BLOCKS).min(cap)
+    window.max(READ_LANE_FLOOR_BLOCKS).min(cap)
 }
 
 /// One lane-issue admission decision (pure): per-lane depth bound AND
@@ -151,11 +157,31 @@ pub fn lane_issue_admits(
     rl_inflight < depth && inflight_bytes.saturating_add(block_size) <= budget_cap_bytes
 }
 
-/// The hold's insert-time byte budget (pure): the R5 share, floored at
-/// 4 blocks (below that the hold cannot even cover one stream's
-/// consume-behind window plus one straggler block).
-pub fn hold_budget_bytes(mem_budget_bytes: u64, block_size: u64) -> u64 {
-    (mem_budget_bytes / READ_LANE_BUDGET_DIVISOR).max(4 * block_size.max(1))
+/// The hold's insert-time byte budget (pure): sized to the live
+/// CONSUME-BEHIND WINDOW — 2× the aggregate pipeline (streams × depth
+/// × block: one being consumed + one landing per stream, doubled for
+/// cohort stragglers) — floored at 4 blocks and capped by the R5 share.
+/// Round-2 field lesson (2026-08-01): a flat `mem/8` budget pinned
+/// 23.6 GiB of FIFO churn on a looping beyond-budget row (~50 % of
+/// deposits evicted unconsumed — RAM spent on entries whose reader
+/// was minutes away); the consume-window sizing keeps the hold at the
+/// working set the pipeline actually needs and lets the
+/// `hold_evicted_unconsumed` detector mean starvation again.
+pub fn hold_budget_bytes(
+    mem_budget_bytes: u64,
+    block_size: u64,
+    active_streams: u32,
+    depth: u32,
+) -> u64 {
+    let bs = block_size.max(1);
+    let window = 2u64
+        .saturating_mul(u64::from(active_streams.max(1)))
+        .saturating_mul(u64::from(depth))
+        .saturating_mul(bs);
+    window
+        .max(4 * bs)
+        .min(mem_budget_bytes / READ_LANE_BUDGET_DIVISOR)
+        .max(4 * bs)
 }
 
 /// The R5 budget the lane derives from: the live authority when the
@@ -348,28 +374,18 @@ impl ReadLaneHold {
     }
 }
 
-/// Coarse monotonic milliseconds since process start (window clock —
-/// the write-pipeline shape).
-fn coarse_ms() -> u64 {
-    static START: once_cell::sync::Lazy<std::time::Instant> =
-        once_cell::sync::Lazy::new(std::time::Instant::now);
-    START.elapsed().as_millis() as u64
-}
-
-/// Per-mount read-lane authority: the arm/disarm lever, the BDP fetch
-/// estimates (reusing the write-pipeline pure window rolls), and the
-/// aggregate in-flight gauge (the R5 `read_lane_inflight` component
-/// source). All fields latch-free approximate gauges — a torn window
-/// roll self-heals within one window.
+/// Per-mount read-lane authority: the arm/disarm lever, the depth pin,
+/// and the aggregate in-flight gauge (the R5 `read_lane_inflight`
+/// component source).
 pub struct ReadLaneGovernor {
     enabled: bool,
     depth_override: Option<u32>,
-    ewma_lat_ns: AtomicU64,
-    lat_floor_ns: AtomicU64,
-    bw_peak_bps: AtomicU64,
-    win_start_ms: AtomicU64,
-    win_bytes: AtomicU64,
     inflight_bytes: AtomicU64,
+    /// The live consume-behind hold budget (bytes), cached by the issue
+    /// path (which knows streams × depth) for the deposit sites (which
+    /// do not). 0 = never derived yet (deposit sites fall back to the
+    /// floor-shaped derivation).
+    hold_budget: AtomicU64,
 }
 
 impl ReadLaneGovernor {
@@ -389,12 +405,8 @@ impl ReadLaneGovernor {
         Self {
             enabled,
             depth_override,
-            ewma_lat_ns: AtomicU64::new(0),
-            lat_floor_ns: AtomicU64::new(0),
-            bw_peak_bps: AtomicU64::new(0),
-            win_start_ms: AtomicU64::new(0),
-            win_bytes: AtomicU64::new(0),
             inflight_bytes: AtomicU64::new(0),
+            hold_budget: AtomicU64::new(0),
         }
     }
 
@@ -404,66 +416,11 @@ impl ReadLaneGovernor {
         self.enabled
     }
 
-    /// Record one completed lane fetch: feeds the BDP estimates
-    /// (write-pipeline `Lane::record` shape — min-tracking latency floor
-    /// decayed upward bounded by the EWMA, windowed bandwidth peak with
-    /// fast-up/slow-down decay; queueing inflation never feeds the BDP).
-    pub fn record_fetch(&self, bytes: u64, dur_ns: u64) {
-        self.record_fetch_at(bytes, dur_ns, coarse_ms());
-    }
-
-    /// [`Self::record_fetch`] with an explicit window clock (tests).
-    pub fn record_fetch_at(&self, bytes: u64, dur_ns: u64, now_ms: u64) {
-        let dur_ns = dur_ns.max(1);
-        let prev = self.ewma_lat_ns.load(Ordering::Relaxed);
-        let ewma = if prev == 0 {
-            dur_ns
-        } else {
-            prev - prev / 8 + dur_ns / 8
-        };
-        self.ewma_lat_ns.store(ewma, Ordering::Relaxed);
-        let floor = self.lat_floor_ns.load(Ordering::Relaxed);
-        if floor == 0 || dur_ns < floor {
-            self.lat_floor_ns.store(dur_ns, Ordering::Relaxed);
-        }
-        self.win_bytes.fetch_add(bytes, Ordering::Relaxed);
-
-        let ws = self.win_start_ms.load(Ordering::Relaxed);
-        if ws == 0 {
-            let _ = self.win_start_ms.compare_exchange(
-                0,
-                now_ms.max(1),
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            );
-            return;
-        }
-        let elapsed = now_ms.saturating_sub(ws);
-        if elapsed >= crate::write_pipeline::WINDOW_MS
-            && self
-                .win_start_ms
-                .compare_exchange(ws, now_ms, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-        {
-            let wb = self.win_bytes.swap(0, Ordering::Relaxed);
-            let peak = crate::write_pipeline::rolled_bw_peak(
-                self.bw_peak_bps.load(Ordering::Relaxed),
-                wb,
-                elapsed,
-            );
-            self.bw_peak_bps.store(peak, Ordering::Relaxed);
-            let f = crate::write_pipeline::rolled_lat_floor(
-                self.lat_floor_ns.load(Ordering::Relaxed),
-                self.ewma_lat_ns.load(Ordering::Relaxed),
-            );
-            self.lat_floor_ns.store(f, Ordering::Relaxed);
-        }
-    }
-
     /// Live per-stream depth (blocks) — [`read_lane_depth_blocks`] over
-    /// the current estimates.
+    /// the lane's AIMD window.
     pub fn depth_blocks(
         &self,
+        window: u32,
         block_size: u64,
         active_streams: u32,
         red: bool,
@@ -471,13 +428,23 @@ impl ReadLaneGovernor {
     ) -> u32 {
         read_lane_depth_blocks(
             self.depth_override,
-            self.bw_peak_bps.load(Ordering::Relaxed),
-            self.lat_floor_ns.load(Ordering::Relaxed),
+            window,
             block_size,
             active_streams,
             red,
             budget_cap_bytes,
         )
+    }
+
+    /// Cache the issue path's consume-window hold-budget derivation for
+    /// the deposit sites.
+    pub fn set_hold_budget(&self, bytes: u64) {
+        self.hold_budget.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The cached consume-window hold budget (0 = never derived).
+    pub fn hold_budget(&self) -> u64 {
+        self.hold_budget.load(Ordering::Relaxed)
     }
 
     /// Aggregate in-flight lane-fetch bytes (the R5 `read_lane_inflight`

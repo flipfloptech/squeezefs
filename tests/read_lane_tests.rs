@@ -74,66 +74,67 @@ fn depth_derivation_tables() {
     let gib = 1024 * 1024 * 1024u64;
     let bs = 4 * 1024 * 1024u64;
 
-    // Cold start (no estimates): the floor, per stream.
+    // Cold start (window at its AIMD start of 2): the floor, per stream.
     assert_eq!(
-        read_lane_depth_blocks(None, 0, 0, bs, 32, false, 64 * gib),
+        read_lane_depth_blocks(None, 2, bs, 32, false, 64 * gib),
         READ_LANE_FLOOR_BLOCKS,
         "cold-start depth is the per-stream floor"
     );
 
-    // The field shape: 21 GB/s delivered at a 12 ms fetch floor over
-    // 4 MiB blocks, 32 streams => BDP 60 blocks x3 headroom / 32 = 5.
-    let d = read_lane_depth_blocks(None, 21_000_000_000, 12_000_000, bs, 32, false, 64 * gib);
-    assert!(
-        (4..=8).contains(&d),
-        "field-shape BDP depth must land near 5-6/stream (got {d})"
-    );
-
-    // Fewer streams get deeper pipelines from the same BDP.
-    let d1 = read_lane_depth_blocks(None, 21_000_000_000, 12_000_000, bs, 1, false, 64 * gib);
-    assert!(d1 > d, "per-stream depth scales inversely with streams");
-
-    // Zero streams behaves as one (defensive).
+    // The depth IS the lane's AIMD window (the round-2 field
+    // falsification of a pure-BDP derivation: it targeted the current
+    // delivery point and never discovered — the write campaign's
+    // probe-up lesson reproduced on reads). Foreground-wait growth
+    // raises the window; the depth follows verbatim.
     assert_eq!(
-        read_lane_depth_blocks(None, 0, 0, bs, 0, false, 64 * gib),
+        read_lane_depth_blocks(None, 16, bs, 32, false, 64 * gib),
+        16
+    );
+    // A collapsed window still speculates at the floor (2 = one
+    // consuming + one fetching).
+    assert_eq!(
+        read_lane_depth_blocks(None, 1, bs, 32, false, 64 * gib),
         READ_LANE_FLOOR_BLOCKS
     );
 
-    // The R5 budget cap is senior to the BDP: a cap that holds 3
-    // blocks/stream clamps a deeper derivation to 3.
+    // Zero streams behaves as one (defensive).
     assert_eq!(
-        read_lane_depth_blocks(None, 100_000_000_000, 100_000_000, bs, 2, false, 6 * bs),
+        read_lane_depth_blocks(None, 2, bs, 0, false, 64 * gib),
+        READ_LANE_FLOOR_BLOCKS
+    );
+
+    // The R5 budget cap is senior to the window: a cap that holds 3
+    // blocks/stream clamps a deeper window to 3.
+    assert_eq!(
+        read_lane_depth_blocks(None, 16, bs, 2, false, 6 * bs),
         3,
-        "budget cap clamps the BDP derivation"
+        "budget cap clamps the window"
     );
 
     // A budget that cannot hold even ONE block per stream never
     // speculates (the zero-share rationale, preserved).
     assert_eq!(
-        read_lane_depth_blocks(None, 21_000_000_000, 12_000_000, bs, 32, false, 16 * bs),
+        read_lane_depth_blocks(None, 16, bs, 32, false, 16 * bs),
         0,
         "sub-one-block budget share must not speculate"
     );
 
     // Red stops speculation outright and is SENIOR to the measurement
     // pin (the write-pipeline Red-clamp precedent).
+    assert_eq!(read_lane_depth_blocks(None, 16, bs, 32, true, 64 * gib), 0);
     assert_eq!(
-        read_lane_depth_blocks(None, 21_000_000_000, 12_000_000, bs, 32, true, 64 * gib),
-        0
-    );
-    assert_eq!(
-        read_lane_depth_blocks(Some(8), 21_000_000_000, 12_000_000, bs, 32, true, 64 * gib),
+        read_lane_depth_blocks(Some(8), 16, bs, 32, true, 64 * gib),
         0,
         "Red is senior to the depth pin"
     );
 
     // The measurement pin wins verbatim otherwise (0 = no lane issue).
     assert_eq!(
-        read_lane_depth_blocks(Some(7), 21_000_000_000, 12_000_000, bs, 32, false, 64 * gib),
+        read_lane_depth_blocks(Some(7), 2, bs, 32, false, 64 * gib),
         7
     );
     assert_eq!(
-        read_lane_depth_blocks(Some(0), 21_000_000_000, 12_000_000, bs, 32, false, 64 * gib),
+        read_lane_depth_blocks(Some(0), 16, bs, 32, false, 64 * gib),
         0
     );
 
@@ -145,9 +146,27 @@ fn depth_derivation_tables() {
         "aggregate R5 cap bounds issue"
     );
 
-    // Hold budget: the R5 share, floored at 4 blocks.
-    assert_eq!(hold_budget_bytes(80 * gib, bs), 10 * gib);
-    assert_eq!(hold_budget_bytes(0, bs), 4 * bs, "4-block floor");
+    // Hold budget: the live consume-behind window (2 x streams x depth
+    // blocks), floored at 4 blocks, capped by the R5 share — the
+    // round-2 field lesson: a flat mem/8 budget pinned 23.6 GiB of
+    // FIFO churn (~50 % of deposits evicted unconsumed) on a looping
+    // beyond-budget row.
+    assert_eq!(hold_budget_bytes(80 * gib, bs, 32, 16), 2 * 32 * 16 * bs);
+    assert_eq!(
+        hold_budget_bytes(80 * gib, bs, 1, 2),
+        4 * bs,
+        "4-block floor"
+    );
+    assert_eq!(
+        hold_budget_bytes(64 * bs * 8, bs, 64, 64),
+        64 * bs,
+        "the R5 share caps the consume window"
+    );
+    assert_eq!(
+        hold_budget_bytes(0, bs, 1, 2),
+        4 * bs,
+        "floor survives a zero budget"
+    );
 }
 
 // ---------------------------------------------------------------------------

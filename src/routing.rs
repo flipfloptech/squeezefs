@@ -4645,13 +4645,23 @@ impl DataRouter {
     }
 
     /// The hold's live insert-time byte budget (read-lane campaign):
-    /// the R5 share, floored at 4 blocks — see
-    /// [`crate::read_lane::hold_budget_bytes`].
+    /// the issue path's cached consume-window derivation when the lane
+    /// has run, else the floor-shaped derivation over the live stream
+    /// gauge — see [`crate::read_lane::hold_budget_bytes`].
     pub(crate) fn read_lane_hold_budget(&self) -> u64 {
-        crate::read_lane::hold_budget_bytes(
-            crate::read_lane::effective_mem_budget(),
-            self.block_size.load(Ordering::Relaxed),
-        )
+        let block_size = self.block_size.load(Ordering::Relaxed);
+        let streams = METRICS
+            .prefetch_active_streams
+            .load(Ordering::Relaxed)
+            .min(u64::from(u32::MAX)) as u32;
+        self.read_lane
+            .hold_budget()
+            .max(crate::read_lane::hold_budget_bytes(
+                crate::read_lane::effective_mem_budget(),
+                block_size,
+                streams,
+                crate::read_lane::READ_LANE_FLOOR_BLOCKS,
+            ))
     }
 
     /// The read-lane issue path (2026-08-01 campaign — the §5.5
@@ -4687,9 +4697,19 @@ impl DataRouter {
         }
         let budget_cap =
             crate::read_lane::effective_mem_budget() / crate::read_lane::READ_LANE_BUDGET_DIVISOR;
+        let lane = &lanes.lanes[lane_idx];
+        // Depth = the lane's live AIMD window (foreground-wait growth /
+        // evicted-unconsumed collapse — the §5.5 machinery, which keeps
+        // running in this regime), bounded by the derived cap. The
+        // round-2 field bracket falsified a pure-BDP derivation here
+        // (the write campaign's self-fulfilling-equilibrium lesson,
+        // reproduced on reads — see read_lane_depth_blocks).
+        let window = lane.window.load(Relaxed).min(self.prefetch_window_cap());
+        let streams = active_streams.min(u64::from(u32::MAX)) as u32;
         let depth = self.read_lane.depth_blocks(
+            window,
             block_size,
-            active_streams.min(u64::from(u32::MAX)) as u32,
+            streams,
             mem_level == crate::mem_budget::Level::Red,
             budget_cap,
         );
@@ -4699,7 +4719,15 @@ impl DataRouter {
         if depth == 0 {
             return;
         }
-        let lane = &lanes.lanes[lane_idx];
+        // Cache the consume-window hold budget for the deposit sites
+        // (streams × depth are known only here).
+        self.read_lane
+            .set_hold_budget(crate::read_lane::hold_budget_bytes(
+                crate::read_lane::effective_mem_budget(),
+                block_size,
+                streams,
+                depth,
+            ));
         // (Re)base the plan when it is uninitialized or fell behind the
         // reader (the R2 rule verbatim: the skipped span was never
         // issued, so it empties with the base).
@@ -4714,6 +4742,14 @@ impl DataRouter {
             return;
         }
         let total_blocks = meta.size.div_ceil(block_size) as u32;
+        // The reader-tied horizon: issue only inside
+        // (end_block, end_block + 1 + depth] — a skip-settled task (the
+        // demand front already owns the flight) must not let the cursor
+        // sprint to EOF fetching bytes the reader is minutes away from
+        // (round-2 field lesson: an unbounded cursor turned the hold
+        // into a 23.6 GiB FIFO with ~50 % of deposits evicted
+        // unconsumed).
+        let horizon = end_block.saturating_add(1).saturating_add(depth);
         loop {
             let in_flight = lane.rl_inflight.load(Relaxed);
             if !crate::read_lane::lane_issue_admits(
@@ -4726,7 +4762,7 @@ impl DataRouter {
                 break;
             }
             let next = lane.next_prefetch_block.load(Relaxed);
-            if next >= total_blocks {
+            if next >= total_blocks || next > horizon {
                 break;
             }
             if lane
@@ -4871,11 +4907,9 @@ impl DataRouter {
             completed: std::cell::Cell::new(false),
         };
         let incarnation = self.backend_router.fill_incarnation(block_key);
-        let started = std::time::Instant::now();
         let downloaded = self.fetch_block_from_remote(block_key).await?;
         // Guard drop broadcasts None on the error path above (waiters
         // fail fast into the re-check loop — the §5.2 contract).
-        let dur_ns = started.elapsed().as_nanos() as u64;
         let mut serve_valid = !self.backend_router.key_incarnation_tracked(block_key);
         if let Some(before) =
             incarnation.filter(|&b| self.backend_router.fill_incarnation_still(block_key, b))
@@ -4898,7 +4932,6 @@ impl DataRouter {
                 self.cache.purge_block_key(block_key);
             }
         }
-        self.read_lane.record_fetch(downloaded.len() as u64, dur_ns);
         METRICS.read_lane_fetches.fetch_add(1, Ordering::Relaxed);
         METRICS
             .read_lane_fetch_bytes

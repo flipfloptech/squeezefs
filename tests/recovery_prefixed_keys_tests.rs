@@ -471,6 +471,11 @@ async fn test_multi_volume_inline_map_remount_recovery_smoke() {
          the regression needs oss2+ placement",
         map.len()
     );
+    // Deterministic reclaim rendezvous before the truth snapshot (the
+    // async-block-reclaim fixture discipline; since the write-wall
+    // manners law the burst's own foreground writes legitimately DEFER
+    // the promotion-displaced free past this point).
+    h.fs.router.backend_router.reclaim_drain().await;
     let used_before: Vec<u64> = h
         .volumes
         .iter()

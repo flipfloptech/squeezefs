@@ -244,6 +244,19 @@ fn hold_store_unit_semantics() {
     // Shed hook: trim_to(0) empties (unconsumed evictions counted).
     hold.trim_to(0);
     assert_eq!(hold.bytes(), 0);
+
+    // Hold-budget cache hysteresis (round-4 flap lesson): fast-up,
+    // 1/8-per-epoch down — a pass-boundary lane claim at window 2 must
+    // not trim a healthy multi-GiB hold.
+    let gov = squeezefs::read_lane::ReadLaneGovernor::from_env();
+    gov.set_hold_budget_at(8 * BS, 10_000);
+    assert_eq!(gov.hold_budget(), 8 * BS, "fast up");
+    gov.set_hold_budget_at(BS, 10_500);
+    assert_eq!(gov.hold_budget(), 8 * BS, "no shrink within the epoch");
+    gov.set_hold_budget_at(BS, 12_500);
+    assert_eq!(gov.hold_budget(), 7 * BS, "1/8 decay per epoch");
+    gov.set_hold_budget_at(16 * BS, 12_600);
+    assert_eq!(gov.hold_budget(), 16 * BS, "fast up again");
 }
 
 // ---------------------------------------------------------------------------

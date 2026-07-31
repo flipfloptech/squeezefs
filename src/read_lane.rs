@@ -379,6 +379,14 @@ impl ReadLaneHold {
     }
 }
 
+/// Coarse monotonic milliseconds since process start (budget-decay
+/// clock — the write-pipeline shape).
+fn coarse_ms() -> u64 {
+    static START: once_cell::sync::Lazy<std::time::Instant> =
+        once_cell::sync::Lazy::new(std::time::Instant::now);
+    START.elapsed().as_millis() as u64
+}
+
 /// Per-mount read-lane authority: the arm/disarm lever, the depth pin,
 /// and the aggregate in-flight gauge (the R5 `read_lane_inflight`
 /// component source).
@@ -389,8 +397,14 @@ pub struct ReadLaneGovernor {
     /// The live consume-behind hold budget (bytes), cached by the issue
     /// path (which knows streams × depth) for the deposit sites (which
     /// do not). 0 = never derived yet (deposit sites fall back to the
-    /// floor-shaped derivation).
+    /// floor-shaped derivation). FAST-UP / SLOW-DOWN (round-4 field
+    /// lesson): the raw derivation flaps with whichever lane touched
+    /// last (a pass-boundary lane claim starts at window 2 ⇒ a 1.2 GiB
+    /// derivation trimming a healthy 9.7 GiB hold — half the row's
+    /// deposits evicted unconsumed, each a paid-for device fetch
+    /// thrown away); shrink is decayed ⅛ per 2 s epoch.
     hold_budget: AtomicU64,
+    hold_budget_decay_ms: AtomicU64,
 }
 
 impl ReadLaneGovernor {
@@ -412,6 +426,7 @@ impl ReadLaneGovernor {
             depth_override,
             inflight_bytes: AtomicU64::new(0),
             hold_budget: AtomicU64::new(0),
+            hold_budget_decay_ms: AtomicU64::new(0),
         }
     }
 
@@ -442,9 +457,29 @@ impl ReadLaneGovernor {
     }
 
     /// Cache the issue path's consume-window hold-budget derivation for
-    /// the deposit sites.
+    /// the deposit sites — fast-up, ⅛-per-2 s-epoch down (see the field
+    /// doc; a flapping budget trims healthy deposits).
     pub fn set_hold_budget(&self, bytes: u64) {
-        self.hold_budget.store(bytes, Ordering::Relaxed);
+        self.set_hold_budget_at(bytes, coarse_ms());
+    }
+
+    /// [`Self::set_hold_budget`] with an explicit clock (tests).
+    pub fn set_hold_budget_at(&self, bytes: u64, now_ms: u64) {
+        let cur = self.hold_budget.load(Ordering::Relaxed);
+        if bytes >= cur {
+            self.hold_budget.store(bytes, Ordering::Relaxed);
+            return;
+        }
+        let last = self.hold_budget_decay_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) >= 2_000
+            && self
+                .hold_budget_decay_ms
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.hold_budget
+                .store(bytes.max(cur - cur / 8), Ordering::Relaxed);
+        }
     }
 
     /// The cached consume-window hold budget (0 = never derived).

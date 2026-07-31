@@ -471,6 +471,18 @@ impl ReadLaneGovernor {
             return;
         }
         let last = self.hold_budget_decay_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            // Anchor the first decay epoch at the first shrink
+            // observation (a 0 anchor would let the first-ever shrink
+            // fire immediately).
+            let _ = self.hold_budget_decay_ms.compare_exchange(
+                0,
+                now_ms.max(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            return;
+        }
         if now_ms.saturating_sub(last) >= 2_000
             && self
                 .hold_budget_decay_ms

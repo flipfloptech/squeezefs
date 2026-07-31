@@ -1114,12 +1114,27 @@ fn evaluate_allocator_classes(
             }
         }
 
-        // C6: used-blocks arithmetic vs the tracked population.
+        // C6: used-blocks arithmetic vs the tracked population. In-flight-
+        // registered offsets are exempt from the arithmetic (the same §5.6
+        // live-owner shield C2/C3 consult per offset): an offset in the
+        // allocate→publish window or the begin_free→reclaim window is
+        // "used" by the arithmetic but deliberately untracked — and since
+        // the write-wall manners law the begin_free limbo legitimately
+        // spans whole foreground-busy periods (the deferred reclaim
+        // backlog), so the old settle-window absorption can no longer
+        // cover it (the 2026-07-31 iteration-loop FP).
         if !sharded {
+            let inflight = v
+                .alloc
+                .inflight_offsets()
+                .into_iter()
+                .filter(|off| !tracked.contains_key(off))
+                .count() as u64;
             let used = v
                 .alloc
                 .highest_block_index()
-                .saturating_sub(v.alloc.free_blocks_count());
+                .saturating_sub(v.alloc.free_blocks_count())
+                .saturating_sub(inflight);
             let tracked_count = tracked.len() as u64;
             if used != tracked_count {
                 suspects.push(Suspect {

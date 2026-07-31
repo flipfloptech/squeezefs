@@ -238,6 +238,21 @@ impl BlockAllocator {
         self.inflight.read_sync(&offset, |_, _| ()).is_some()
     }
 
+    /// Snapshot of the in-flight-registered offsets — fsck's C6
+    /// aggregate-census exemption source (the same §5.6 live-owner
+    /// shield `inflight_contains` serves per offset; since the
+    /// write-wall manners law the begin_free→reclaim limbo legitimately
+    /// spans whole foreground-busy periods as the deferred reclaim
+    /// backlog).
+    pub fn inflight_offsets(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        self.inflight.iter_sync(|k, _| {
+            out.push(*k);
+            true
+        });
+        out
+    }
+
     /// Snapshot of the tracked (refcounted) population — fsck's C2/C3
     /// allocator-side ground truth.
     pub fn tracked_offsets(&self) -> Vec<(u64, u32)> {

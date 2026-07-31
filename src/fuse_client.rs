@@ -7454,8 +7454,8 @@ impl SqueezefsFilesystem {
                         // here. Cost-optimized: the destination's next
                         // consumer is device DMA, so the copy may use NT
                         // stores (no RFO, no LLC sweep) — engagement gauged.
-                        let dst = &mut entry.value_mut().make_mut()
-                            [rel_start..rel_start + slice_len];
+                        let dst =
+                            &mut entry.value_mut().make_mut()[rel_start..rel_start + slice_len];
                         if crate::nt_copy::dma_copy(dst, file_data_slice) {
                             METRICS
                                 .nt_copy_bytes

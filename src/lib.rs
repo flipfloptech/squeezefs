@@ -9,9 +9,9 @@ pub mod nt_copy;
 // production-sharing precedent: the ipc LIBRARY stays dependency-free,
 // while both consumers already link libc). Two type identities exist by
 // construction; instances never cross the crate boundary.
+pub mod nvme_dev;
 #[path = "../crates/squeezefs-ipc/src/thp.rs"]
 pub mod thp;
-pub mod nvme_dev;
 pub mod tiering;
 
 pub mod bench;

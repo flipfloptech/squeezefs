@@ -83,7 +83,9 @@ fn anon_mapping_takes_madv_hugepage_and_shows_hg_flag() {
     );
     let entry = smaps_entry_for(base as usize);
     assert!(
-        entry.lines().any(|l| l.starts_with("VmFlags:") && l.contains(" hg")),
+        entry
+            .lines()
+            .any(|l| l.starts_with("VmFlags:") && l.contains(" hg")),
         "vma must carry the hg flag after MADV_HUGEPAGE; smaps entry:\n{entry}"
     );
     // SAFETY: mapped above.
@@ -122,7 +124,7 @@ fn shmem_populate_collapse_reports_and_shows_pmd_backing_when_granted() {
         "session mappings must be PMD-aligned or the collapse buys nothing"
     );
 
-    let outcome = thp::advise_hugepages(base as *mut u8, len, thp::ThpMode::PopulateCollapse);
+    let outcome = thp::advise_hugepages(base, len, thp::ThpMode::PopulateCollapse);
     let entry = smaps_entry_for(base as usize);
     if outcome.collapse_ok {
         let pmd = entry

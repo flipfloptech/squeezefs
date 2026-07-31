@@ -194,9 +194,7 @@ unsafe fn copy_body(dst: *mut u8, src: *const u8, len: usize) -> bool {
 /// `dst`/`src` valid for `len` bytes, non-overlapping.
 #[cfg(target_arch = "x86_64")]
 unsafe fn copy_nt_x86(mut dst: *mut u8, mut src: *const u8, len: usize) {
-    use std::arch::x86_64::{
-        _mm_loadu_si128, _mm_sfence, _mm_stream_si128, __m128i,
-    };
+    use std::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_sfence, _mm_stream_si128};
     let mut remaining = len;
 
     // Head: bring dst to 16-byte alignment.

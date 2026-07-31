@@ -32,11 +32,6 @@ use std::sync::Arc;
 
 use squeezefs::nt_copy;
 
-/// Reference copy for equivalence checks.
-fn reference(dst: &mut [u8], src: &[u8]) {
-    dst.copy_from_slice(src);
-}
-
 /// Contract 1: exactness across head/tail alignment shapes, and no
 /// out-of-window writes (guard bytes).
 #[test]
@@ -108,7 +103,10 @@ fn dma_copy_raw_matches_slice_semantics() {
 #[test]
 fn policy_is_pure_and_pinned() {
     let p = nt_copy::policy_from(None, None);
-    assert!(p.enabled, "default posture is enabled (measured 2026-07-31)");
+    assert!(
+        p.enabled,
+        "default posture is enabled (measured 2026-07-31)"
+    );
     assert_eq!(p.min_bytes, 256 * 1024, "default floor is 256 KiB");
 
     let off = nt_copy::policy_from(Some("0"), None);

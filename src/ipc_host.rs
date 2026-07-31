@@ -1965,29 +1965,27 @@ fn create_session_shm(
     // (huge shmem folios only map through PMDs on aligned vmas; plain
     // mmap fallback keeps alignment an optimization, never a
     // correctness need).
-    let base = match crate::thp::map_shared_pmd_aligned(
-        memfd.as_raw_fd(),
-        layout.total_bytes as usize,
-    ) {
-        Some(p) => p as *mut libc::c_void,
-        None => {
-            // SAFETY: shared RW mapping of the full memfd.
-            let p = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    layout.total_bytes as usize,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    memfd.as_raw_fd(),
-                    0,
-                )
-            };
-            if p == libc::MAP_FAILED {
-                return Err(io::Error::last_os_error());
+    let base =
+        match crate::thp::map_shared_pmd_aligned(memfd.as_raw_fd(), layout.total_bytes as usize) {
+            Some(p) => p as *mut libc::c_void,
+            None => {
+                // SAFETY: shared RW mapping of the full memfd.
+                let p = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        layout.total_bytes as usize,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED,
+                        memfd.as_raw_fd(),
+                        0,
+                    )
+                };
+                if p == libc::MAP_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
+                p
             }
-            p
-        }
-    };
+        };
     // Session-arena THP (near-zero-copy 2026-07-31): shmem is
     // policy-gated separately from anon THP (`shmem_enabled` is `never`
     // on the field fleet), so the daemon populates + collapses the

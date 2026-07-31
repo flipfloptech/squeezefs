@@ -7445,8 +7445,22 @@ impl SqueezefsFilesystem {
                     if self_backed {
                         METRICS.placed_merge_elides.fetch_add(1, Ordering::Relaxed);
                     } else {
-                        entry.value_mut().make_mut()[rel_start..rel_start + slice_len]
-                            .copy_from_slice(file_data_slice);
+                        // The ONE kernel-path userspace copy — load-bearing
+                        // (near-zero-copy census 2026-07-31): the lease must
+                        // die inside this handler (§5.4 severance law — a
+                        // retained lease parks the ent's COMMIT re-arm) and
+                        // the WRITE ACK detaches from the DMA (pipeline-depth
+                        // law), so the bytes must leave the transport buffer
+                        // here. Cost-optimized: the destination's next
+                        // consumer is device DMA, so the copy may use NT
+                        // stores (no RFO, no LLC sweep) — engagement gauged.
+                        let dst = &mut entry.value_mut().make_mut()
+                            [rel_start..rel_start + slice_len];
+                        if crate::nt_copy::dma_copy(dst, file_data_slice) {
+                            METRICS
+                                .nt_copy_bytes
+                                .fetch_add(slice_len as u64, Ordering::Relaxed);
+                        }
                     }
                     completed
                 };

@@ -162,7 +162,16 @@ impl SharedBlock {
     /// racing client memory is fine; the destination region is exclusive).
     pub(crate) unsafe fn write_at(&self, off: usize, src: *const u8, len: usize) {
         debug_assert!(off + len <= self.0.len);
-        std::ptr::copy_nonoverlapping(src, self.0.ptr.add(off), len);
+        // The ONE ring-path userspace copy (§5.5.2 sever — load-bearing:
+        // the arena is client-writable for the whole serve, so the daemon
+        // must sever before it can trust a byte; near-zero-copy census
+        // 2026-07-31). Destination is the block's future DMA'd backing —
+        // NT stores are legal and gauged (`nt_copy_bytes`).
+        if crate::nt_copy::dma_copy_raw(self.0.ptr.add(off), src, len) {
+            crate::fuse_client::METRICS
+                .nt_copy_bytes
+                .fetch_add(len as u64, Ordering::Relaxed);
+        }
     }
 
     /// A shared view of `[off, off + len)` — the placed payload's

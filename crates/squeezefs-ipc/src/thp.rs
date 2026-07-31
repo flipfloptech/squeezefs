@@ -1,6 +1,47 @@
 //! Session-arena transparent-huge-page economy — near-zero-copy
-//! campaign, 2026-07-31 (red-commit skeleton: contracts first, the
-//! madvise/populate/collapse body lands in the green commit).
+//! campaign, 2026-07-31 (`.benchmarks/2026-07-31-near-zero-copy.md`).
+//!
+//! The L4 session shm (sealed memfd, `squeezefs_ipc::layout`) is
+//! **shmem**, and shmem THP is policy-gated separately from anonymous
+//! THP (`/sys/kernel/mm/transparent_hugepage/shmem_enabled`): `advise`
+//! on the dev rig, **`never` on the field fleet** (Rocky 8 default).
+//! Anonymous memory (daemon block pools, jemalloc heaps) already rides
+//! 2 MiB pages on every fleet host (`enabled=always`), so the arena is
+//! the one hot mapping paying 4 KiB dTLB entries under the ring data
+//! plane's large copies (app→arena on client cores, the §5.5.2 sever
+//! read on service threads).
+//!
+//! Two best-effort levers, both refusal-tolerant (the shim calls this
+//! inside arbitrary applications — a refusal must be invisible):
+//!
+//! * [`ThpMode::Advise`] — `MADV_HUGEPAGE`: fault-time PMD allocation
+//!   where the shmem policy is `advise`/`within_size`/`always`; inert
+//!   where it is `never`. Both sides apply it at map time.
+//! * [`ThpMode::PopulateCollapse`] — additionally
+//!   `MADV_POPULATE_WRITE` then `MADV_COLLAPSE`: **`MADV_COLLAPSE`
+//!   operates independent of every sysfs THP setting** (madvise(2)), so
+//!   it is THE lever on `shmem_enabled=never` fleets. Populate-first
+//!   makes the collapse deterministic (no hole refusals). Daemon-side
+//!   only, at session admission — one-time cost off the data path; the
+//!   arena's bytes are already budget-charged at full geometry
+//!   (`ipc_arena_bytes`), so the eager commit changes when pages fault,
+//!   not what R5 sees.
+//!
+//! Once the daemon's collapse lands, the memfd's PAGE CACHE pages are
+//! PMD-sized; the shim's own mapping of the same memfd then maps them
+//! huge wherever its vma alignment allows (its `Advise` posture plus
+//! the kernel's shmem `get_unmapped_area` alignment).
+//!
+//! Canonical file in the `squeezefs-ipc` tree, `#[path]`-included by
+//! the root crate and `squeezefs-preload` (the `wake_core`
+//! production-sharing precedent): the ipc LIBRARY stays
+//! dependency-free while both consumers already link libc. Two type
+//! identities exist by construction; instances never cross a crate
+//! boundary.
+//!
+//! Env: `SQUEEZEFS_IPC_ARENA_THP=0` disables both sides (A/B lever;
+//! read by the call sites, not here — this core is env-free and pure
+//! per call).
 
 /// How aggressively to pursue huge pages for a mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,12 +58,39 @@ pub enum ThpMode {
 /// Best-effort outcome — refusals are reported, never raised.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ThpOutcome {
+    /// `MADV_HUGEPAGE` took.
     pub madvise_ok: bool,
+    /// `MADV_COLLAPSE` took (PMD backing established synchronously).
     pub collapse_ok: bool,
 }
 
+/// `MADV_COLLAPSE` — in libc but named here to keep one obvious source
+/// for the constant against older libc pins (value stable in the UAPI).
+const MADV_COLLAPSE: libc::c_int = 25;
+
 /// Advise/populate/collapse huge pages over `[base, base + len)`.
 /// Never fails: every refusal degrades to a `false` in the outcome.
-pub fn advise_hugepages(_base: *mut u8, _len: usize, _mode: ThpMode) -> ThpOutcome {
-    ThpOutcome::default()
+/// `base` must be page-aligned (an mmap result); `len` need not be —
+/// the kernel rounds madvise lengths up to page granularity.
+pub fn advise_hugepages(base: *mut u8, len: usize, mode: ThpMode) -> ThpOutcome {
+    let mut out = ThpOutcome::default();
+    if base.is_null() || len == 0 {
+        return out;
+    }
+    let addr = base as *mut libc::c_void;
+    // SAFETY: madvise on a caller-supplied range is advisory — on an
+    // invalid range the kernel returns ENOMEM/EINVAL, which we report
+    // as a refusal; it never touches memory itself.
+    out.madvise_ok = unsafe { libc::madvise(addr, len, libc::MADV_HUGEPAGE) } == 0;
+    if matches!(mode, ThpMode::PopulateCollapse) {
+        // Populate first so the collapse sees no holes. Refusal (old
+        // kernel without MADV_POPULATE_WRITE, or a genuinely bad range)
+        // just makes the collapse best-effort.
+        // SAFETY: as above — advisory, kernel-validated.
+        unsafe { libc::madvise(addr, len, libc::MADV_POPULATE_WRITE) };
+        // SAFETY: as above; MADV_COLLAPSE is synchronous best-effort
+        // and returns nonzero when any PMD range could not collapse.
+        out.collapse_ok = unsafe { libc::madvise(addr, len, MADV_COLLAPSE) } == 0;
+    }
+    out
 }

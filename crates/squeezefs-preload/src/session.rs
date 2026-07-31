@@ -427,6 +427,23 @@ impl Session {
             // SAFETY: errno read directly after the failing call.
             return Err(SessionError::Map(unsafe { *libc::__errno_location() }));
         }
+        // Session-arena THP (near-zero-copy 2026-07-31), shim posture:
+        // advise-only — the daemon's admission-time populate+collapse
+        // made the memfd's page-cache pages PMD-sized where granted;
+        // MADV_HUGEPAGE here lets this mapping's faults map them huge.
+        // Best-effort inside an arbitrary app: refusals are invisible.
+        // `SQUEEZEFS_IPC_ARENA_THP=0` disables (the daemon's lever's
+        // client half).
+        if !matches!(
+            std::env::var("SQUEEZEFS_IPC_ARENA_THP").ok().as_deref(),
+            Some("0")
+        ) {
+            let _ = crate::thp::advise_hugepages(
+                base as *mut u8,
+                layout.total_bytes as usize,
+                crate::thp::ThpMode::Advise,
+            );
+        }
         // The mapping holds the memory; the fd is no longer needed.
         drop(memfd_guard);
 

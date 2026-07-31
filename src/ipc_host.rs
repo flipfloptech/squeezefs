@@ -1927,6 +1927,18 @@ fn count_refusal(class: RefuseClass) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
+/// `SQUEEZEFS_IPC_ARENA_THP` (default on; `0` disables) — the session
+/// huge-page A/B lever, read once per process.
+fn arena_thp_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("SQUEEZEFS_IPC_ARENA_THP").ok().as_deref(),
+            Some("0")
+        )
+    })
+}
+
 /// Create + seed + seal one session memfd, and map it daemon-side.
 fn create_session_shm(
     geometry: &Geometry,
@@ -1962,6 +1974,27 @@ fn create_session_shm(
     };
     if base == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
+    }
+    // Session-arena THP (near-zero-copy 2026-07-31): shmem is
+    // policy-gated separately from anon THP (`shmem_enabled` is `never`
+    // on the field fleet), so the daemon populates + collapses the
+    // session at admission — MADV_COLLAPSE bypasses the sysfs policy;
+    // one-time cost off the data path, bytes already budget-charged at
+    // full geometry (`ipc_arena_bytes`). Best-effort: a refusal leaves a
+    // fully-functional 4 KiB-paged session. `SQUEEZEFS_IPC_ARENA_THP=0`
+    // is the A/B lever.
+    if arena_thp_enabled() {
+        let outcome = crate::thp::advise_hugepages(
+            base as *mut u8,
+            layout.total_bytes as usize,
+            crate::thp::ThpMode::PopulateCollapse,
+        );
+        log::debug!(
+            "ipc session shm THP: madvise_ok={} collapse_ok={} ({} bytes)",
+            outcome.madvise_ok,
+            outcome.collapse_ok,
+            layout.total_bytes
+        );
     }
     let map = SessionMapping {
         base: base as *mut u8,

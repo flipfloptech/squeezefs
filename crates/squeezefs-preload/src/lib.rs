@@ -27,6 +27,12 @@ pub mod fd_table;
 #[cfg(feature = "interposers")]
 pub mod interpose;
 pub mod session;
+// Session-arena THP helper — canonical file in the squeezefs-ipc tree,
+// `#[path]`-included here and by the root crate (the `wake_core`
+// production-sharing precedent: the ipc LIBRARY stays dependency-free,
+// both consumers link libc). Instances never cross the crate boundary.
+#[path = "../../squeezefs-ipc/src/thp.rs"]
+pub mod thp;
 
 /// This shim's build identity (`<full-hash>[-dirty]`, `src/version.rs`
 /// form) — the KD-7 skew-gate key, compared against the daemon's

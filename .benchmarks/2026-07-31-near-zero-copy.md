@@ -115,7 +115,67 @@ default)** — so while every anon pool already rides 2 MiB pages
 
 ## 4. Rig measurement (TCP devsub, the fabric-sensitive venue)
 
-_(filled by the census runs below)_
+**Substrate (stated):** TCP devsub (`SQZ_DEVSUB_TRANSPORT=tcp`,
+nvmet-tcp on localhost; meta = 4× memory null_blk, data = 4× 8 GiB
+zram, ports 54100-slice), coexisting with the box's idle loop devsub.
+**Instrument (stated):** `tests/copy_census_rig.sh` — fio psync
+`--direct=1 --zero_buffers` t8 × 1 MiB time_based 30 s (sustained rows
+60 s), medians of 3, order **A-B-B-A** (A = tip `3d3cc8f` pair, B = dev
+`b4edafc` pair; KD-7 same-commit daemon+shim pairs; the one
+post-binary source commit is whitespace-only fmt) + an **A0 pass**
+(tip binary, `SQUEEZEFS_NT_COPY=0 SQUEEZEFS_IPC_ARENA_THP=0`) for
+lever isolation. **Box honesty:** 32-CPU AMD Strix Halo under the
+external 2.0–2.4 GHz thermal governor, with the main tree's fstests
+release gate running throughout (stated background load — constant,
+not bursty); no uncore DRAM counters exist on this platform, so the
+traffic instrument is the per-process core-PMU proxy
+`cache-misses × 64 / user_bytes` (prefetch traffic undercounted; the
+proxy's VALUE is relative A-vs-B on identical rows). zram stores age
+across reps (rep-1 fresh-format vs rep-2/3 — the write-wall
+hysteresis shape), so bw verdicts are read per-rep-position and from
+the sustained rows, never from pooled medians. Raw CSV + fio/perf/THP
+snapshots: `/tmp/nzc_census/` (log `/tmp/nzc_census_log.txt`).
+
+### 4.1 The traffic proxies (the stable columns on this venue)
+
+Daemon LLC-miss bytes per payload byte (median of 3, per pass):
+
+| Row | A1 | A2 | B1 | B2 | A0 (levers off) | Δ A vs B |
+|---|---|---|---|---|---|---|
+| wr-il | 1.11 | 0.97 | 1.30 | 1.31 | **1.28** | **−20…−25 %** |
+| wr-kern | 1.98 | 1.65 | 2.23 | 2.15 | 1.91 | **−15…−23 %** |
+| rd-il | 0.72 | 0.74 | 0.89 | 0.74 | — | ≈ par (no NT on reads by design) |
+| rd-kern | 0.86 | 0.79 | 0.85 | 0.79 | — | par (untouched path) |
+
+- **A0 ≈ B on every proxy** (1.28 vs 1.30/1.31 il; 1.91 vs 2.23/2.15
+  kern) — the deltas are THE LEVERS, not binary drift.
+- Daemon dTLB misses/MiB on wr-il: A 678–1131 vs B 872–957 vs
+  sustained A 597 vs B 862 (**−31 % sustained**) — the arena-THP face.
+- `nt_copy_bytes` ≡ user bytes on every A write row (engagement
+  exact); `ShmemPmdMapped` 448 MiB sampled live on every A il row
+  (7 sessions × 64 MiB); `write_path_seed_read_bytes` 0 throughout;
+  amp ≈ 1.00 on every write row (dev_w ≈ user).
+
+### 4.2 Throughput (per-rep-position brackets + sustained)
+
+| Row | rep1 A/B | rep2 A/B | rep3 A/B | sustained 60 s A vs B |
+|---|---|---|---|---|
+| wr-il | **1.28** | 0.96 | 1.04 | **8,268 vs 7,510 (+10.1 %)** |
+| wr-kern | 1.11 | 1.14 | 1.00 | **6,337 vs 6,123 (+3.5 %)** |
+| rd-il | 1.13 | 1.20 | 1.10 | — |
+| rd-kern | 1.01 | 1.07 | 1.05 | — |
+
+The sustained rows are the verdict (standing sustained-state rule);
+the single-pass rep spreads carry the zram aging + busy-box noise
+(both directions present in the brackets, stated). Reads do not
+regress (il reads trend ahead — consistent with the LLC no longer
+being swept by write streams on this shared-workload venue, but not
+claimed as a proven mechanism).
+
+**Lever defaults adjudicated: both stay ON** (`SQUEEZEFS_NT_COPY=1`
+floor 256 KiB, `SQUEEZEFS_IPC_ARENA_THP=1`) — the traffic proxies move
+exactly where the ledger predicts, the sustained rows gain, no row
+regresses beyond the venue's own spread, and A0 pins attribution.
 
 ## 5. Kernel TX/RX posture (charter item 2 — verified on the field, read-only)
 
@@ -162,7 +222,49 @@ off; verified `src/nvmeof/initiator.rs` + module params), NIC
 
 ## 7. Field projection (PROJECTIONS — the orchestrator runs the field verdict)
 
-_(filled after rig rows)_
+The field's stated ceiling is client memory traffic per payload byte
+(fabric exonerated at ~11 % NIC util; both paths plateau at their copy
+count). Per the §1.1 weights, the campaign changes the write-side
+fabric-traffic weight from ≈ 7 B/B to ≈ 6 B/B (kernel path: M1 3→2)
+and ≈ 5 B/B (shim path: S2 3→2 plus the arena's RFO share of S1
+reduced by THP/TLB economy) — a **projected +10–20 % on the
+copy-bound write plateau**, consistent with the rig's sustained
++10.1 % (il) / +3.5 % (kern) measured under a 2.0–2.4 GHz governor.
+Field-specific notes for the verdict run:
+
+- **THP:** field clients run `shmem_enabled=never` — the daemon-side
+  `MADV_COLLAPSE` is the live lever there (verified independent of the
+  sysfs policy) and the PMD-alignment fix is what makes it map. The
+  post-deploy check is `ShmemPmdMapped > 0` on the daemon's
+  smaps_rollup DURING a row (sessions reap at client exit).
+- **NT:** Sapphire Rapids (Xeon 6426Y) NT-store fill-buffer economics
+  differ from this rig's Zen 5 — the A/B lever is
+  `SQUEEZEFS_NT_COPY=0` per mount, one alternating-order bracket per
+  the standing rule; `nt_copy_bytes` must account for the row's bytes.
+- **NUMA (2-socket clients):** unmeasured here — cross-socket
+  S1/S2/NIC placement is a real term the ledger names but this
+  campaign does not touch.
+- The engagement checks are all stats-inode reads (journaled,
+  non-destructive): `nt_copy_bytes`, `ShmemPmdMapped` sampling,
+  `placed_merge_elides ≈ ipc_placed_severs`, seed-read tripwire 0.
+
+## 9. Open questions
+
+1. **App→arena NT?** Deliberately not attempted (destination is
+   CPU-read by the sever within ~one op). If a future field profile
+   shows the arena copy RFO-bound on 2-socket clients, re-run the §4
+   lever bracket with an NT variant of `slab_write` — expected to lose
+   while the sever reads hot lines, stated so the negative is cheap to
+   re-check.
+2. **Kernel FUSE zc-receive:** K1 stays irreducible until the kernel
+   grows registered-user-buffer FUSE payloads; re-open the M1
+   discussion only then (the lease law would need a re-design, not a
+   tweak).
+3. **fuse3 PayloadArena THP:** individual 1 MiB payload buffers are
+   sub-PMD and jemalloc-backed (anon THP `always` fleet-wide covers
+   them opportunistically); a dedicated 2 MiB-aligned arena per queue
+   was left unpursued — bounded win, measurable via the same dTLB
+   column if revisited.
 
 ## 8. Gates
 

@@ -1914,6 +1914,14 @@ pub struct DataRouterInner {
     /// construction: increment-only per epoch, aged by the roll — lanes
     /// die silently inside moka, so a dec path would leak upward).
     pub(crate) stream_gauge: StreamActivityGauge,
+    /// The cold-stream read lane (2026-08-01 campaign,
+    /// `src/read_lane.rs`): the arm/disarm lever
+    /// (`SQUEEZEFS_READ_LANE=0` = off, the A0 attribution control), the
+    /// BDP fetch estimates deriving the per-stream depth, and the
+    /// aggregate in-flight gauge (R5 `read_lane_inflight`). Engages
+    /// only in the R2 zero-resident-share regime (`pipeline_touch`);
+    /// its fills land in `cache.read_lane_hold`, never a tier.
+    pub(crate) read_lane: crate::read_lane::ReadLaneGovernor,
     /// R1b ghost table — second-touch admission memory for >256 KiB fills.
     pub(crate) ghost: std::sync::Arc<GhostTable>,
     /// Hybrid-I/O escalation cooldown — bounds ranged re-admission churn
@@ -3463,6 +3471,7 @@ impl DataRouter {
                 direct_device_true: std::sync::atomic::AtomicBool::new(direct_device_true),
                 prefetch_window_override,
                 prefetch_share_pct,
+                read_lane: crate::read_lane::ReadLaneGovernor::from_env(),
                 stream_gauge: StreamActivityGauge::new(),
                 crypto: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
                 prefetcher: std::sync::Arc::new(IoUringPrefetcher::new()),
@@ -3531,6 +3540,18 @@ impl DataRouter {
     pub fn direct_device_true(&self) -> bool {
         self.direct_device_true
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the cold-stream read lane is armed (the
+    /// `read_lane_armed` stats field; `SQUEEZEFS_READ_LANE=0` = off).
+    pub fn read_lane_enabled(&self) -> bool {
+        self.read_lane.enabled()
+    }
+
+    /// Aggregate in-flight lane-fetch bytes (the `read_lane_inflight_bytes`
+    /// stats field and the R5 `read_lane_inflight` component source).
+    pub fn read_lane_inflight_bytes(&self) -> u64 {
+        self.read_lane.inflight_bytes()
     }
 
     pub async fn read_nvme_block(&self, block_key: &str) -> Result<bytes::Bytes> {

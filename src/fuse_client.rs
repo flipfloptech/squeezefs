@@ -2315,6 +2315,31 @@ pub struct Metrics {
     pub prefetch_foreground_waits: Align64<AtomicU64>,
     pub prefetch_evicted_unconsumed: Align64<AtomicU64>,
     pub prefetch_active_streams: Align64<AtomicU64>,
+    /// The cold-stream read lane (2026-08-01 campaign,
+    /// `src/read_lane.rs`; docs/design-read-path.md §Observability):
+    /// `fetches`/`fetch_bytes` = lane-issued whole-block device fetches
+    /// (THE engagement instrument on governed cold streams — ≈ 0 on the
+    /// EXA shape means the lane regressed to the serial-RTT plateau);
+    /// `holds` = ledger-invisible deposits (lane fills + demand
+    /// primaries); `serves`/`serve_bytes` = foreground reads served
+    /// from the hold (the cohort-stability instrument — a qd32 row with
+    /// read_amp > 1.05 and serves ≈ 0 means the hold regressed);
+    /// `hold_retired` = coverage retirements (memory converges by
+    /// consumption); `hold_evicted_unconsumed` = budget evictions of
+    /// never-fully-consumed entries (the lane's refetch-spiral
+    /// detector — sustained growth means the hold budget cannot carry
+    /// the stream population); `wasted` = shed/stale-generation lane
+    /// tasks; `depth_target` = the live derived per-stream depth gauge
+    /// (0 under Red or the kill lever).
+    pub read_lane_fetches: Align64<AtomicU64>,
+    pub read_lane_fetch_bytes: Align64<AtomicU64>,
+    pub read_lane_holds: Align64<AtomicU64>,
+    pub read_lane_serves: Align64<AtomicU64>,
+    pub read_lane_serve_bytes: Align64<AtomicU64>,
+    pub read_lane_hold_retired: Align64<AtomicU64>,
+    pub read_lane_hold_evicted_unconsumed: Align64<AtomicU64>,
+    pub read_lane_wasted: Align64<AtomicU64>,
+    pub read_lane_depth_target: Align64<AtomicU64>,
     /// Layout mix (write path outcomes).
     pub layout_inline_writes: Align64<AtomicU64>,
     pub layout_staged_writes: Align64<AtomicU64>,
@@ -4775,6 +4800,18 @@ impl SqueezefsFilesystem {
                 "prefetch_foreground_waits": METRICS.prefetch_foreground_waits.load(Ordering::Relaxed),
                 "prefetch_evicted_unconsumed": METRICS.prefetch_evicted_unconsumed.load(Ordering::Relaxed),
                 "prefetch_active_streams": METRICS.prefetch_active_streams.load(Ordering::Relaxed),
+                "read_lane_armed": self.router.read_lane_enabled(),
+                "read_lane_fetches": METRICS.read_lane_fetches.load(Ordering::Relaxed),
+                "read_lane_fetch_bytes": METRICS.read_lane_fetch_bytes.load(Ordering::Relaxed),
+                "read_lane_holds": METRICS.read_lane_holds.load(Ordering::Relaxed),
+                "read_lane_serves": METRICS.read_lane_serves.load(Ordering::Relaxed),
+                "read_lane_serve_bytes": METRICS.read_lane_serve_bytes.load(Ordering::Relaxed),
+                "read_lane_hold_retired": METRICS.read_lane_hold_retired.load(Ordering::Relaxed),
+                "read_lane_hold_evicted_unconsumed": METRICS.read_lane_hold_evicted_unconsumed.load(Ordering::Relaxed),
+                "read_lane_wasted": METRICS.read_lane_wasted.load(Ordering::Relaxed),
+                "read_lane_depth_target": METRICS.read_lane_depth_target.load(Ordering::Relaxed),
+                "read_lane_hold_bytes": self.router.cache.read_lane_hold.bytes(),
+                "read_lane_inflight_bytes": self.router.read_lane_inflight_bytes(),
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
                 "staged_spill_escalations": METRICS.staged_spill_escalations.load(Ordering::Relaxed),

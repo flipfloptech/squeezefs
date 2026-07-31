@@ -30,6 +30,14 @@ pub struct TieredCache {
     /// hot-block tier's evictions and foreground bytes by the ranged
     /// device-read site.
     pub admission_governor: std::sync::Arc<crate::routing::AdmissionGovernor>,
+    /// The read-lane completed-fill hold (2026-08-01 campaign,
+    /// `src/read_lane.rs`): the LEDGER-INVISIBLE landing zone for
+    /// governed cold-stream lane fetches and the deep-qd cohort
+    /// stability store. A block-key-addressed byte store, so it joins
+    /// the unified purge below (the R-6 law) — but it is deliberately
+    /// NOT a cache tier: no admission, no ghost, no governor ledger, no
+    /// dehydration; entries retire on consumption coverage.
+    pub read_lane_hold: std::sync::Arc<crate::read_lane::ReadLaneHold>,
     pub nvme: nvme::NvmeStaging,
 }
 
@@ -304,6 +312,7 @@ impl TieredCache {
             write_lru,
             hot_block,
             admission_governor,
+            read_lane_hold: std::sync::Arc::new(crate::read_lane::ReadLaneHold::new()),
             nvme,
         })
     }
@@ -321,6 +330,10 @@ impl TieredCache {
     pub fn purge_block_key(&self, block_key: &str) {
         self.read_lru.remove(block_key);
         self.hot_block.remove(block_key);
+        // The read-lane hold (2026-08-01): a fifth block-key byte store
+        // joins the unified purge or it does not exist (the R-6 law) —
+        // a displaced/freed key must never serve stale from the hold.
+        self.read_lane_hold.purge(block_key);
         self.nvme.remove_cached_read_block(block_key);
         // The 4th block-key tier: `.gds_cache` files are keyed by block
         // key, written by the prefetch GDS arm and read_direct, and served

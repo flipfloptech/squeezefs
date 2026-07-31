@@ -436,6 +436,13 @@ impl ArenaWindow {
         self.base
     }
 
+    /// The dense NUMA node the session arena's pages landed on (the
+    /// locality instrument's memory-node source + the node-targeted
+    /// handoff venue key). `None` = unknown.
+    pub(crate) fn arena_node(&self) -> Option<usize> {
+        self._map.arena_node
+    }
+
     /// Write `bytes` into the window (completion payloads).
     pub fn write(&self, bytes: &[u8]) {
         let n = bytes.len().min(self.len);
@@ -444,6 +451,8 @@ impl ArenaWindow {
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base, n);
         }
+        // Locality instrument: one CPU pass over arena bytes.
+        crate::numa::count_current_pass(self._map.arena_node, n);
     }
 }
 
@@ -462,6 +471,8 @@ impl crate::PayloadSink for ArenaWindow {
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(off), n);
         }
+        // Locality instrument: the §5.5.1 serve-into-arena CPU pass.
+        crate::numa::count_current_pass(self._map.arena_node, n);
     }
 
     fn zero_at(&self, off: usize, len: usize) {
@@ -597,6 +608,12 @@ struct SessionMapping {
     /// The host's severed-write buffer pool (write severs ride the arena
     /// window, which holds this mapping — the natural conduit).
     severed_pool: Arc<SeveredPool>,
+    /// The dense NUMA node the arena's pages ACTUALLY landed on (queried
+    /// once at admission, post-placement — the locality instrument's
+    /// memory-node source and the node-targeted handoff venue's key).
+    /// `None` = query failed / unknown: stays out of the instrument,
+    /// handoffs ride the global rotation.
+    arena_node: Option<usize>,
 }
 
 // SAFETY: the mapping is process-shared memory accessed only through
@@ -906,6 +923,12 @@ pub struct IpcHost {
     /// a session-less host (every default mount's control-plane-only
     /// posture) owns ZERO service threads.
     service_threads: usize,
+    /// Owner index → dense NUMA node (NUMA-affinity campaign 2026-07-31):
+    /// the `numa_core::owner_nodes` CPU-weighted interleaved partition,
+    /// computed once at spawn. Single-node maps produce all-zeros and the
+    /// partition is inert (pins refuse, picks reduce to load-then-index —
+    /// the structural no-op law).
+    owner_nodes: Vec<usize>,
     /// Spawned service threads (dense: owners fill lowest-first, so
     /// spawned == the highest owner ever assigned + 1). Monotonic within
     /// a host's lifetime — a thread that has served stays (its empty
@@ -981,6 +1004,7 @@ impl IpcHost {
             next_session_id: AtomicU64::new(1),
             next_binding_id: AtomicU64::new(1),
             service_threads,
+            owner_nodes: crate::numa_core::topology().owner_nodes(service_threads),
             svc_spawned: std::sync::atomic::AtomicUsize::new(0),
             started: Instant::now(),
             spin_window: service_spin_window(),
@@ -1524,19 +1548,34 @@ impl IpcHost {
             }
         }
 
+        // Session→node inference (NUMA-affinity campaign 2026-07-31,
+        // daemon-side only — no wire/ABI change): the peer's last-run
+        // CPU via the SO_PEERCRED-verified pid, mapped through the
+        // runtime topology. `None` on single-node maps.
+        let session_node = crate::numa::session_node_for_pid(cred.pid as u32);
         // Establish: sealed memfd + mapping + registry entry.
-        let (memfd, map) =
-            match create_session_shm(&self.cfg.geometry, layout, Arc::clone(&self.severed_pool)) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::error!("ipc host: session shm creation failed: {e}");
-                    return refuse(RefuseClass::Internal);
-                }
-            };
+        let (memfd, map) = match create_session_shm(
+            &self.cfg.geometry,
+            layout,
+            Arc::clone(&self.severed_pool),
+            session_node,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("ipc host: session shm creation failed: {e}");
+                return refuse(RefuseClass::Internal);
+            }
+        };
         // §5.5.1 pinning: admit to the lightest service thread (live
         // sessions never rebalance — natural churn is the only mover).
         // Ties resolve to the LOWEST index, so owners fill densely —
-        // the invariant `ensure_service_threads` relies on.
+        // the invariant `ensure_service_threads` relies on. With an
+        // active multi-node placement the pick is locality-FIRST
+        // (distance, then load, then index — `numa_core::pick_owner`);
+        // on single-node maps / `SQUEEZEFS_NUMA=0` that reduces to
+        // exactly the load-then-index pick below (structural no-op),
+        // and the ARENA's actual node (not the inference) is the key —
+        // the service thread must sit where the memory is.
         let owner = {
             let sessions = self
                 .sessions
@@ -1546,12 +1585,25 @@ impl IpcHost {
             for s in sessions.values() {
                 counts[s.owner] += 1;
             }
-            counts
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, n)| **n)
-                .map(|(i, _)| i)
-                .unwrap_or(0)
+            let placement_node = if crate::numa_core::placement_active() {
+                map.arena_node.or(session_node)
+            } else {
+                None
+            };
+            match placement_node {
+                Some(n) => crate::numa_core::pick_owner(
+                    crate::numa_core::topology(),
+                    n,
+                    &self.owner_nodes,
+                    &counts,
+                ),
+                None => counts
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, n)| **n)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0),
+            }
         };
         // Spawn-on-bind (ingest-economy 2026-07-28): the owner's thread
         // must exist before the session publishes — a session pinned to
@@ -1777,6 +1829,13 @@ impl IpcHost {
     }
 
     fn service_loop(self: Arc<Self>, idx: usize) {
+        // NUMA-affinity (2026-07-31): pin this owner to its partition
+        // node's CPU set (∩ process mask — taskset never widened).
+        // Gated internally (`SQUEEZEFS_NUMA=0` / single-node no-op);
+        // refusal leaves the thread free-running exactly as before.
+        if let Some(&node) = self.owner_nodes.get(idx) {
+            crate::numa::pin_service_thread(node);
+        }
         // Owned-session snapshot, re-collected ONLY when the registry
         // epoch moves (admission/teardown) — the drain hot pass is
         // registry-mutex-free (2026-07-26 service economy). Staleness
@@ -1944,6 +2003,7 @@ fn create_session_shm(
     geometry: &Geometry,
     layout: SessionLayout,
     severed_pool: Arc<SeveredPool>,
+    node_hint: Option<usize>,
 ) -> io::Result<(OwnedFd, SessionMapping)> {
     // SAFETY: memfd_create with a static name; ownership taken immediately.
     let fd = unsafe {
@@ -1986,6 +2046,12 @@ fn create_session_shm(
                 p
             }
         };
+    // NUMA arena placement (NUMA-affinity campaign 2026-07-31): bind the
+    // session to prefer the peer's node BEFORE first touch, so the THP
+    // populate below faults the pages on the right node and the collapse
+    // keeps them there (compose order is load-bearing). Gated internally
+    // (`SQUEEZEFS_NUMA=0` / single-node maps); best-effort.
+    crate::numa::bind_session_arena(base as *mut u8, layout.total_bytes as usize, node_hint);
     // Session-arena THP (near-zero-copy 2026-07-31): shmem is
     // policy-gated separately from anon THP (`shmem_enabled` is `never`
     // on the field fleet), so the daemon populates + collapses the
@@ -2007,11 +2073,17 @@ fn create_session_shm(
             layout.total_bytes
         );
     }
+    // The locality instrument's memory-node truth: where the arena's
+    // pages ACTUALLY landed (post-bind, post-populate — get_mempolicy
+    // faults the base page per the vma policy if still untouched). One
+    // syscall per admission, off the data path.
+    let arena_node = crate::numa_core::topology().node_of_addr(base as *const u8);
     let map = SessionMapping {
         base: base as *mut u8,
         layout,
         geometry: *geometry,
         severed_pool,
+        arena_node,
     };
     // Write-once initialization before the fd is shared (the sharing act
     // is the synchronization point): header placement-write, ring cell

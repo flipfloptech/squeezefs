@@ -238,10 +238,21 @@ struct QueueHandle {
 /// it. A leaked lease degrades to a leaked buffer, never a dangling
 /// pointer.
 struct PayloadArena {
-    /// `*mut u8` stored as `usize` (one stable allocation per ring ent;
-    /// never reallocated for the arena's life).
+    /// One anonymous mmap span carrying every ent's payload buffer at a
+    /// 4 KiB-aligned stride (NUMA-affinity campaign 2026-07-31 — the
+    /// near-zero-copy note's OQ-3 shape): a single vma lets the arena be
+    /// node-BOUND before first touch (`mbind` + populate when placement
+    /// is active) and `MADV_HUGEPAGE`d as one range, and its pages'
+    /// ACTUAL nodes are queried once per buffer for the locality
+    /// instrument. Stored as `usize` (stable for the arena's life).
+    base: usize,
+    span: usize,
+    /// Per-ent buffer bases inside the span (stride-spaced).
     bufs: Vec<usize>,
-    layout: std::alloc::Layout,
+    /// Dense node index each buffer's first page ACTUALLY landed on
+    /// (queried post-placement — the instrument's memory-node source;
+    /// `None` = query failed / unmapped node).
+    buf_nodes: Vec<Option<usize>>,
     /// dup(2) of the queue eventfd: lease drops wake the worker through the
     /// arena so the fd is alive exactly as long as any lease can write it.
     wake: OwnedFd,
@@ -251,11 +262,18 @@ struct PayloadArena {
 }
 
 impl PayloadArena {
+    /// `node` = the queue's intended NUMA node (`node_of_cpu(qid)` on
+    /// queue-per-possible-CPU sessions; `None` = no placement intent —
+    /// testing queue overrides, single-node maps, `SQUEEZEFS_NUMA=0`).
+    /// Placement is best-effort: a refused bind leaves a fully
+    /// functional arena, and the instrument reports where pages REALLY
+    /// landed either way.
     fn new(
         depth: usize,
         payload_sz: usize,
         wake_fd: RawFd,
         wake_coalescer: Arc<WakeCoalescer>,
+        node: Option<usize>,
     ) -> io::Result<Arc<Self>> {
         let dup = unsafe { libc::dup(wake_fd) };
         if dup < 0 {
@@ -263,27 +281,63 @@ impl PayloadArena {
         }
         // SAFETY: `dup` just returned a fresh owned descriptor.
         let wake = unsafe { OwnedFd::from_raw_fd(dup) };
-        let layout =
-            std::alloc::Layout::from_size_align(payload_sz, 4096).map_err(io::Error::other)?;
-        let mut bufs = Vec::with_capacity(depth);
-        for _ in 0..depth {
-            // SAFETY: `layout` has non-zero size (payload_sz ≥ 8192).
-            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-            if ptr.is_null() {
-                for &p in &bufs {
-                    // SAFETY: allocated above with the same layout.
-                    unsafe { std::alloc::dealloc(p as *mut u8, layout) };
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "payload arena allocation failed",
-                ));
-            }
-            bufs.push(ptr as usize);
+        let stride = payload_sz
+            .checked_next_multiple_of(4096)
+            .ok_or_else(|| io::Error::other("payload_sz overflow"))?;
+        let span = stride
+            .checked_mul(depth)
+            .ok_or_else(|| io::Error::other("payload arena span overflow"))?;
+        // SAFETY: fresh anonymous RW mapping, kernel-validated length.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                span,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "payload arena mmap failed",
+            ));
         }
+        let base = base as usize;
+        // Anon THP is opportunistic fleet-wide (`enabled=always`); the
+        // advise makes it explicit where the policy is `madvise`.
+        // SAFETY: madvise over our own fresh mapping — advisory only.
+        unsafe {
+            libc::madvise(base as *mut libc::c_void, span, libc::MADV_HUGEPAGE);
+        }
+        let numa = crate::numa_core::topology();
+        if let Some(n) = node {
+            if crate::numa_core::placement_active() {
+                // Bind BEFORE first touch, then populate so the pages
+                // fault deterministically on the queue's node (the same
+                // compose-order the session-arena THP lever uses).
+                let bound = numa.bind_region_preferred(base as *mut u8, span, n);
+                // SAFETY: advisory populate of our own mapping.
+                unsafe {
+                    libc::madvise(base as *mut libc::c_void, span, libc::MADV_POPULATE_WRITE);
+                }
+                debug!("fuse-over-uring payload arena: node {n} bind took={bound} ({span} B)");
+            }
+        }
+        let bufs: Vec<usize> = (0..depth).map(|i| base + i * stride).collect();
+        // The instrument's memory-node truth: where each buffer's first
+        // page ACTUALLY landed (get_mempolicy faults it in if needed —
+        // one-time, off the data path).
+        let buf_nodes: Vec<Option<usize>> = bufs
+            .iter()
+            .map(|&p| numa.node_of_addr(p as *const u8))
+            .collect();
         Ok(Arc::new(Self {
+            base,
+            span,
             bufs,
-            layout,
+            buf_nodes,
             wake,
             wake_coalescer,
         }))
@@ -292,14 +346,18 @@ impl PayloadArena {
     fn buf(&self, idx: usize) -> Option<*mut u8> {
         self.bufs.get(idx).map(|&p| p as *mut u8)
     }
+
+    /// Dense node index buffer `idx`'s pages landed on (`None` stays out
+    /// of the locality instrument).
+    fn node_of_buf(&self, idx: usize) -> Option<usize> {
+        self.buf_nodes.get(idx).copied().flatten()
+    }
 }
 
 impl Drop for PayloadArena {
     fn drop(&mut self) {
-        for &p in &self.bufs {
-            // SAFETY: allocated in `new` with `self.layout`; dropped once.
-            unsafe { std::alloc::dealloc(p as *mut u8, self.layout) };
-        }
+        // SAFETY: unmapping the span mapped in `new`; dropped once.
+        unsafe { libc::munmap(self.base as *mut libc::c_void, self.span) };
     }
 }
 
@@ -471,6 +529,12 @@ pub struct FuseOverUring {
     workers: Mutex<Vec<JoinHandle<()>>>,
     fuse_fd: RawFd,
     payload_sz: usize,
+    /// True when qid == kernel cpu id (queue count == kernel possible
+    /// CPUs — the production default). The NUMA placement/instrument
+    /// derives each queue's node from its qid ONLY under this
+    /// correspondence; testing queue overrides break it and disable
+    /// per-queue placement rather than mis-derive.
+    qid_is_cpu: bool,
     // metrics
     pub stats_requests: AtomicU64,
     pub stats_replies: AtomicU64,
@@ -679,6 +743,45 @@ pub fn transport_wake_stats() -> (u64, u64) {
         TRANSPORT_WAKES_ELIDED.load(Ordering::Relaxed),
     )
 }
+// NUMA-affinity campaign (2026-07-31): the transport half of the
+// UPI-crossing estimate instrument — payload bytes whose instrumented
+// CPU pass was / was not a minimal-distance choice
+// (`numa_core::is_local_choice`). Sites: FUSE_WRITE lease delivery
+// (exec ≈ the qid CPU the kernel copied from, mem = the ent buffer's
+// actual node — the K1 crossing estimate) and the reply body copy into
+// the ent payload (`apply_reply`, exec = the queue worker). Bytes with
+// an unknown node on either side never enter the instrument. Surfaced
+// as `fuse3_numa_{local,remote}_bytes` on the stats inode.
+static FUSE3_NUMA_LOCAL_BYTES: AtomicU64 = AtomicU64::new(0);
+static FUSE3_NUMA_REMOTE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Distance-based locality classification for one transport CPU pass
+/// over `bytes` payload bytes (unknown nodes stay out — never guessed).
+fn numa_classify_pass(exec_node: Option<usize>, mem_node: Option<usize>, bytes: usize) {
+    let (Some(e), Some(m)) = (exec_node, mem_node) else {
+        return;
+    };
+    let t = crate::numa_core::topology();
+    if e >= t.len() || m >= t.len() {
+        return;
+    }
+    if t.is_local_choice(e, m) {
+        FUSE3_NUMA_LOCAL_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    } else {
+        FUSE3_NUMA_REMOTE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
+/// Transport-side locality gauge (stats inode `fuse3_numa_local_bytes`).
+pub fn numa_local_bytes() -> u64 {
+    FUSE3_NUMA_LOCAL_BYTES.load(Ordering::Relaxed)
+}
+
+/// Transport-side locality gauge (stats inode `fuse3_numa_remote_bytes`).
+pub fn numa_remote_bytes() -> u64 {
+    FUSE3_NUMA_REMOTE_BYTES.load(Ordering::Relaxed)
+}
+
 // Post-arm classical sideband deliveries (kernel-mandated: FORGET/INTERRUPT/
 // resends + `fiq->ops` switchover stragglers ride the classical device even
 // with the ring armed). Zero here after an unlink storm means sideband
@@ -778,6 +881,22 @@ fn default_buffer_cap() -> u64 {
     ((pages as u64).saturating_mul(page_sz as u64) / 8).min(TRANSPORT_BUFFER_CAP_CEILING)
 }
 
+/// Kernel possible-CPU count (`_SC_NPROCESSORS_CONF` — what
+/// fuse_uring_create() sizes queues by). Shared by the geometry resolve
+/// and the qid↔cpu correspondence check (NUMA placement relies on
+/// qid == kernel cpu id, which holds exactly when the queue count is
+/// the kernel's own).
+fn kernel_possible_cpus() -> usize {
+    let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
+    if n > 0 {
+        n as usize
+    } else {
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+    }
+}
+
 /// The resolved per-session transport geometry + INIT background limits.
 /// Resolved ONCE per session (in `Session::init_filesystem`, before the
 /// INIT reply is serialized) and passed unchanged into
@@ -816,16 +935,7 @@ impl TransportGeometry {
         // the kernel never switches off the classical path → permanent
         // hang. Override only for testing; production must match the
         // kernel.
-        let kernel_nqueues = {
-            let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
-            if n > 0 {
-                n as usize
-            } else {
-                std::thread::available_parallelism()
-                    .map(|p| p.get())
-                    .unwrap_or(4)
-            }
-        };
+        let kernel_nqueues = kernel_possible_cpus();
         let env_queues = std::env::var("SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES")
             .ok()
             .and_then(|s| s.parse().ok());
@@ -1053,6 +1163,7 @@ impl FuseOverUring {
             workers: Mutex::new(Vec::new()),
             fuse_fd,
             payload_sz,
+            qid_is_cpu: nqueues == kernel_possible_cpus(),
             stats_requests: AtomicU64::new(0),
             stats_replies: AtomicU64::new(0),
             stats_cqe_err: AtomicU64::new(0),
@@ -1490,6 +1601,9 @@ struct Ent {
     /// (kept alive past worker exit by lease/pool Arcs).
     payload_ptr: *mut u8,
     payload_len: usize,
+    /// The buffer's ACTUAL NUMA node (dense index; the locality
+    /// instrument's memory-node source — `None` stays uncounted).
+    node: Option<usize>,
     iov: [libc::iovec; 2],
 }
 
@@ -1569,8 +1683,27 @@ fn queue_worker(
     commit_rx: std::sync::mpsc::Receiver<CommitMsg>,
     wake_fd: RawFd,
 ) -> io::Result<()> {
-    // Best-effort pin to core qid
-    let _ = core_affinity::set_for_current(core_affinity::CoreId { id: qid as usize });
+    // The queue's NUMA node (NUMA-affinity campaign 2026-07-31): the
+    // kernel routes requests to the queue of the requester's CPU, so on
+    // queue-per-possible-CPU sessions qid IS a kernel cpu id and the
+    // queue's home node is a map lookup. Testing queue overrides break
+    // the correspondence — no per-queue node, no placement.
+    let queue_node = if pool.qid_is_cpu {
+        crate::numa_core::topology().node_of_cpu(qid as usize)
+    } else {
+        None
+    };
+    // Best-effort pin to core qid; when the exact core is outside the
+    // process mask (taskset-restricted mounts) fall back to the queue's
+    // NODE cpu set (intersected with the process mask) so the worker's
+    // reply serves and the arena stay co-located.
+    if !core_affinity::set_for_current(core_affinity::CoreId { id: qid as usize }) {
+        if let Some(n) = queue_node {
+            if crate::numa_core::placement_active() {
+                let _ = crate::numa_core::topology().pin_current_to_node(n);
+            }
+        }
+    }
 
     let sq_entries = (depth as u32 + 8).next_power_of_two().max(16);
     // §5.3 D3.b: plain SQE128 ring by default; SQPOLL leader/attach
@@ -1591,7 +1724,13 @@ fn queue_worker(
     // worker exit (§5.4). The arena shares the queue's wake coalescer so
     // lease-drop wakes elide through the same flag as reply submissions.
     let wake_coalescer = Arc::clone(&pool.queues[qid as usize].wake_coalescer);
-    let arena = PayloadArena::new(depth, payload_sz, wake_fd, Arc::clone(&wake_coalescer))?;
+    let arena = PayloadArena::new(
+        depth,
+        payload_sz,
+        wake_fd,
+        Arc::clone(&wake_coalescer),
+        queue_node,
+    )?;
     // One lease state per ring ent + the worker-local parked commit slots.
     let lease_states: Vec<Arc<EntLeaseState>> =
         (0..depth).map(|_| Arc::new(EntLeaseState::new())).collect();
@@ -1605,6 +1744,7 @@ fn queue_worker(
                 header,
                 payload_ptr: arena.buf(idx).expect("arena sized to depth"),
                 payload_len: payload_sz,
+                node: arena.node_of_buf(idx),
                 iov: [
                     libc::iovec {
                         iov_base: std::ptr::null_mut(),
@@ -1912,6 +2052,10 @@ fn queue_worker(
                 debug_assert_eq!(prev, 0, "delivery on a still-leased ent");
                 TRANSPORT_PAYLOAD_LEASES.fetch_add(1, Ordering::Relaxed);
                 TRANSPORT_LEASES_OUTSTANDING.fetch_add(1, Ordering::Relaxed);
+                // K1 crossing estimate: the kernel copied this payload
+                // from the app on ≈ CPU qid (queue selection is by
+                // requester CPU) into the ent buffer's actual node.
+                numa_classify_pass(queue_node, arena.node_of_buf(ent_idx), capped_sz);
                 Bytes::from_owner(EntPayloadLease {
                     arena: Arc::clone(&arena),
                     state,
@@ -2122,6 +2266,14 @@ fn apply_reply(ent: &mut Ent, header: &[u8], body: &Bytes) {
     let body_len = body.len().min(ent.payload_len - payload_len);
     if body_len > 0 && body.as_ptr() != unsafe { ent.payload_ptr.add(payload_len) as *const u8 } {
         ent.payload_mut()[payload_len..payload_len + body_len].copy_from_slice(&body[..body_len]);
+        // Reply-serve locality (the worker executes this copy; the
+        // zero-copy serve-into-payload path above elides it and is
+        // deliberately NOT counted — no CPU pass happened here).
+        numa_classify_pass(
+            crate::numa_core::topology().current_node(),
+            ent.node,
+            body_len,
+        );
     }
     payload_len += body_len;
 
@@ -2317,6 +2469,7 @@ mod tests {
             8192,
             efd_owned.as_raw_fd(),
             Arc::new(WakeCoalescer::new()),
+            None,
         )
         .unwrap();
 
@@ -2504,6 +2657,7 @@ mod tests {
             8192,
             efd_owned.as_raw_fd(),
             Arc::new(WakeCoalescer::new()),
+            None,
         )
         .unwrap();
         let state = Arc::new(EntLeaseState::new());

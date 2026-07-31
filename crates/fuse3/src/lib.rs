@@ -34,17 +34,25 @@ use raw::abi::{
 };
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use raw::{
-    over_uring_classical_sideband, over_uring_commit_batch_stats, over_uring_geometry,
-    over_uring_sessions_active, over_uring_stats, transport_lease_stats, transport_wake_stats,
-    COMMIT_BATCH_LABELS,
+    numa_local_bytes, numa_remote_bytes, over_uring_classical_sideband,
+    over_uring_commit_batch_stats, over_uring_geometry, over_uring_sessions_active,
+    over_uring_stats, transport_lease_stats, transport_wake_stats, COMMIT_BATCH_LABELS,
 };
 #[cfg(feature = "tokio-runtime")]
-pub use raw::{tpc_lane_redispatches, tpc_spawn, tpc_thread_count};
+pub use raw::{tpc_lane_redispatches, tpc_spawn, tpc_spawn_on_node, tpc_thread_count};
 
 mod errno;
 mod helper;
 mod mount_options;
 pub mod notify;
+// N-topology-general NUMA nearest-resource map — canonical file in the
+// squeezefs-ipc tree, `#[path]`-included here and by the root crate (the
+// `thp.rs`/`wake_core` production-sharing precedent). Both consumers
+// build the map from the same sysfs through the same code, so the DENSE
+// NODE INDICES agree across the crate boundary by construction (only
+// plain `usize` indices ever cross it).
+#[path = "../../squeezefs-ipc/src/numa_core.rs"]
+pub mod numa_core;
 pub mod path;
 pub mod raw;
 

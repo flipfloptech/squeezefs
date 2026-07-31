@@ -3102,6 +3102,22 @@ pub struct Metrics {
     /// delta accounts for the row's merge/sever bytes. 0 on
     /// `SQUEEZEFS_NT_COPY=0` mounts and on sub-floor (< 256 KiB) shapes.
     pub nt_copy_bytes: Align64<AtomicU64>,
+    /// NUMA-affinity campaign (2026-07-31) — the UPI-crossing estimate
+    /// instrument: payload bytes moved by instrumented CPU passes whose
+    /// memory node WAS a minimal-distance choice from the executing node
+    /// (`numa_core::is_local_choice` — distance-based, honest on any
+    /// topology; single-node maps classify everything local). Sites: the
+    /// §5.5.2 ring-write sever (arena read on the service thread) and the
+    /// §5.5.1 arena completion serves; the fuse3 transport's own pair
+    /// rides `fuse3_numa_{local,remote}_bytes`. Bytes with an unknown
+    /// node on either side never enter the instrument.
+    pub numa_local_bytes: Align64<AtomicU64>,
+    /// The remote half of the pair: the crossing-rate proof is
+    /// `remote/(local+remote)` per row — ~50 % on an unplaced 2-socket
+    /// client under round-robin session spread, → local under stage-1
+    /// placement (the engagement gauge: an affinity row is INVALID
+    /// unless the split swings local).
+    pub numa_remote_bytes: Align64<AtomicU64>,
     /// Merge-side placed-sever accounting: `placed_adoptions` = overlay
     /// entries born by ADOPTING the ring assembly as their backing;
     /// `placed_merge_elides` = merges whose copy was elided by the
@@ -5068,6 +5084,15 @@ impl SqueezefsFilesystem {
                 // engagement at the DMA-destined copy sites (merge +
                 // placed sever) — the census rig's engagement instrument.
                 "nt_copy_bytes": METRICS.nt_copy_bytes.load(Ordering::Relaxed),
+                // NUMA-affinity campaign (2026-07-31): the distance-based
+                // UPI-crossing estimate instrument (daemon copy passes) +
+                // the fuse3 transport's own pair + the map's node count
+                // (the field-verification handle: 1 = structural no-op).
+                "numa_local_bytes": METRICS.numa_local_bytes.load(Ordering::Relaxed),
+                "numa_remote_bytes": METRICS.numa_remote_bytes.load(Ordering::Relaxed),
+                "fuse3_numa_local_bytes": fuse3::numa_local_bytes(),
+                "fuse3_numa_remote_bytes": fuse3::numa_remote_bytes(),
+                "numa_nodes": crate::numa_core::topology().len() as u64,
                 "ipc_sessions_reaped": METRICS.ipc_sessions_reaped.load(Ordering::Relaxed),
                 "ipc_inval_notifies": METRICS.ipc_inval_notifies.load(Ordering::Relaxed),
                 "ipc_inval_suppressed": METRICS.ipc_inval_suppressed.load(Ordering::Relaxed),

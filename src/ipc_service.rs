@@ -89,8 +89,13 @@ thread_local! {
     /// serve_data MUST become kernel-visible here"); pooled writes and
     /// read demotions keep their immediate spawn (latency shape
     /// unchanged where the deferral buys nothing).
+    /// Entries carry the payload's arena node so the end-of-sweep spawn
+    /// can prefer a node-local handler lane (NUMA-affinity 2026-07-31).
     static PENDING_PLACED_HANDOFFS: std::cell::RefCell<
-        Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+        Vec<(
+            Option<usize>,
+            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        )>,
     > = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -98,10 +103,26 @@ thread_local! {
 /// handler lanes (called from [`DataPlaneSink::flush`] at end-of-sweep).
 fn spawn_pending_placed() {
     PENDING_PLACED_HANDOFFS.with(|q| {
-        for fut in q.borrow_mut().drain(..) {
-            fuse3::raw::tpc_spawn(fut);
+        for (node, fut) in q.borrow_mut().drain(..) {
+            handoff_spawn_on(node, fut);
         }
     });
+}
+
+/// Node-targeted handoff (NUMA-affinity campaign 2026-07-31): prefer a
+/// handler lane pinned on the payload's arena node so the merge/serve
+/// executes where the bytes live. Gated by the placement lever
+/// (`SQUEEZEFS_NUMA=0` / single-node maps ⇒ exactly [`handoff_spawn`],
+/// the pre-campaign venue); a node without lanes falls back inside
+/// fuse3 — locality is a preference, never an availability constraint.
+fn handoff_spawn_on<F>(node: Option<usize>, fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match node {
+        Some(n) if crate::numa_core::placement_active() => fuse3::raw::tpc_spawn_on_node(n, fut),
+        _ => handoff_spawn(fut),
+    }
 }
 
 /// The read handoff body, factored free of the sink so the direct-drive
@@ -132,7 +153,11 @@ pub(crate) fn spawn_read_handoff(
     } else {
         0
     };
-    handoff_spawn(async move {
+    // NUMA-affinity 2026-07-31: serve on a lane local to the arena the
+    // reply bytes will be written into (gated inside; fallback = the
+    // pre-campaign global rotation).
+    let arena_node = op.payload.arena_node();
+    handoff_spawn_on(arena_node, async move {
         // Re-seed a cold attr cache so warm workloads return to the
         // sync fast path after ONE miss demotion (the handler's own
         // fallback reads the backend but does not populate the cache).
@@ -617,6 +642,11 @@ impl DataPlaneSink {
             placed = false;
             op.payload.read_severed_bytes()
         });
+        // Locality instrument (NUMA-affinity 2026-07-31): the sever is
+        // ONE CPU pass over the arena bytes on this service thread —
+        // classified once here for BOTH sever paths (placed + pooled).
+        let arena_node = op.payload.arena_node();
+        crate::numa::count_current_pass(arena_node, op.payload.len());
         METRICS.ipc_async_handoffs.fetch_add(1, Ordering::Relaxed);
         let fs = Arc::clone(&self.fs);
         let request = self.ring_request();
@@ -666,9 +696,9 @@ impl DataPlaneSink {
             // any merge parks the overlay entry. Custody is already
             // severed (above, synchronously) — the deferral moves only
             // WHERE the handler starts, never what it writes.
-            PENDING_PLACED_HANDOFFS.with(|q| q.borrow_mut().push(Box::pin(fut)));
+            PENDING_PLACED_HANDOFFS.with(|q| q.borrow_mut().push((arena_node, Box::pin(fut))));
         } else {
-            handoff_spawn(fut);
+            handoff_spawn_on(arena_node, fut);
         }
     }
 }

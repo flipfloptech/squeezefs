@@ -4502,6 +4502,19 @@ struct TpcScheduler {
         >,
     >,
     next_idx: std::sync::atomic::AtomicUsize,
+    /// NUMA-affinity campaign (2026-07-31): lane indices grouped by the
+    /// dense node of each lane's pinned core (`node_lanes[node]` — empty
+    /// for nodes without lanes: CPU-less nodes, taskset-excluded
+    /// sockets). Node-targeted dispatch ([`tpc_spawn_on_node`]) picks
+    /// round-robin WITHIN a node's lanes and falls back to the global
+    /// rotation whenever the node has none — locality is a preference,
+    /// never a availability constraint. Single-node maps produce one
+    /// group == the global set, so the whole mechanism degenerates to
+    /// today's rotation (the structural no-op law).
+    node_lanes: Vec<Vec<usize>>,
+    /// Per-node rotation cursors (same cache-pressure shape as
+    /// `next_idx`).
+    node_next: Vec<std::sync::atomic::AtomicUsize>,
 }
 
 impl TpcScheduler {
@@ -4553,6 +4566,16 @@ impl TpcScheduler {
             core_ids.len()
         };
 
+        // Lane → node grouping for node-targeted dispatch: the node of
+        // each lane's PINNED core (unpinned lanes — empty core_ids —
+        // join no group and ride the global rotation only).
+        let topo = crate::numa_core::topology();
+        let mut node_lanes: Vec<Vec<usize>> = vec![Vec::new(); topo.len()];
+        let mut node_next = Vec::with_capacity(topo.len());
+        for _ in 0..topo.len() {
+            node_next.push(std::sync::atomic::AtomicUsize::new(0));
+        }
+
         for i in 0..core_count {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<
                 std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
@@ -4564,6 +4587,11 @@ impl TpcScheduler {
             } else {
                 None
             };
+            if let Some(cid) = core_id {
+                if let Some(node) = topo.node_of_cpu(cid.id) {
+                    node_lanes[node].push(i);
+                }
+            }
 
             // Named explicitly (ingest-economy 2026-07-28): an unnamed
             // thread inherits the comm of whichever thread first touched
@@ -4596,6 +4624,8 @@ impl TpcScheduler {
         Self {
             senders,
             next_idx: std::sync::atomic::AtomicUsize::new(0),
+            node_lanes,
+            node_next,
         }
     }
 
@@ -4612,6 +4642,27 @@ impl TpcScheduler {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             % self.senders.len();
         Self::dispatch(&self.senders, idx, Box::pin(fut));
+    }
+
+    /// Node-targeted spawn: round-robin WITHIN `node`'s lane group when
+    /// it has lanes, the global rotation otherwise (locality is a
+    /// preference — a node without lanes, an out-of-range index, or a
+    /// single-node map all take exactly the [`Self::spawn`] path). The
+    /// dead-lane re-dispatch walk still covers EVERY lane, so a dead
+    /// node-local lane degrades cross-node before it ever blackholes.
+    fn spawn_on_node<F>(&self, node: usize, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if let Some(lanes) = self.node_lanes.get(node) {
+            if !lanes.is_empty() && !self.senders.is_empty() {
+                let k = self.node_next[node].fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % lanes.len();
+                Self::dispatch(&self.senders, lanes[k], Box::pin(fut));
+                return;
+            }
+        }
+        self.spawn(fut);
     }
 
     /// Lane dispatch with **loud dead-lane re-dispatch** (shim-parity
@@ -4700,6 +4751,20 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     TPC_SCHEDULER.spawn(fut);
+}
+
+/// Node-targeted handler-lane spawn (NUMA-affinity campaign 2026-07-31):
+/// prefer a lane pinned on dense node `node` (the caller's payload/arena
+/// node — a `numa_core` dense index; both crates build the map from the
+/// same sysfs, so indices agree by construction). Falls back to the
+/// global rotation when the node has no lanes — locality is a
+/// preference, never an availability constraint, and single-node maps
+/// take exactly the [`tpc_spawn`] path (structural no-op).
+pub fn tpc_spawn_on_node<F>(node: usize, fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    TPC_SCHEDULER.spawn_on_node(node, fut);
 }
 
 pub fn tpc_thread_count() -> usize {

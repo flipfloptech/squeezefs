@@ -9,10 +9,18 @@ pub mod nt_copy;
 // production-sharing precedent: the ipc LIBRARY stays dependency-free,
 // while both consumers already link libc). Two type identities exist by
 // construction; instances never cross the crate boundary.
+// N-topology-general NUMA nearest-resource map — canonical file in the
+// squeezefs-ipc tree, `#[path]`-included here and by the fuse3 fork
+// (the `thp.rs` production-sharing precedent). `src/numa.rs` is the
+// METRICS-wired policy/instrument layer over it.
+#[path = "../crates/squeezefs-ipc/src/numa_core.rs"]
+pub mod numa_core;
 pub mod nvme_dev;
 #[path = "../crates/squeezefs-ipc/src/thp.rs"]
 pub mod thp;
 pub mod tiering;
+
+pub mod numa;
 
 pub mod bench;
 pub mod bg_admit;

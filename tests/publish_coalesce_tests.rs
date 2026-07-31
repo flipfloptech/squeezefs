@@ -363,7 +363,7 @@ async fn rewrite_pass_coalesces_and_displaces_every_prior_binding() {
     struct InplaceOn;
     impl Drop for InplaceOn {
         fn drop(&mut self) {
-            squeezefs::fuse_client::set_inplace_overwrite(true);
+            squeezefs::fuse_client::set_inplace_overwrite(false);
         }
     }
     let _i = InplaceOn;

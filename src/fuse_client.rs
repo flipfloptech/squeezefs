@@ -291,31 +291,35 @@ pub fn set_patch_max_bytes(v: u64) {
     patch_max_bytes_cell().store(v, Ordering::Relaxed);
 }
 
-/// Default in-place full-block overwrite (write-wall iteration 1 —
-/// `SQUEEZEFS_INPLACE_OVERWRITE`, default ON; `0` = the CoW-always A/B
-/// lever, measurement only, never an operational escape): an eligible
-/// full-block overwrite (sole-owned, undecorated, passthrough,
+/// In-place full-block overwrite (write-wall iterations 1–2 —
+/// `SQUEEZEFS_INPLACE_OVERWRITE=1` opts IN; **default OFF**): an
+/// eligible full-block overwrite (sole-owned, undecorated, passthrough,
 /// whole-block-mapped, Active volume — the W1 sole-owner law's
-/// whole-block face, the contract-9 brim machinery promoted to the
-/// default) lands in place with ZERO displacement: no allocation, no
-/// free, no discard, same-key merge. Field-measured motivation: the
-/// TARGET-side deallocate service (~2,700 cmd/s at any client width,
-/// ~1,700 under load) makes CoW-rewrite structurally dealloc-bound —
-/// `.benchmarks/2026-07-31-write-wall.md` §iteration-1. Crash class per
-/// the W1 precedent: only app-written sectors are rewritten (all of
-/// them, by this write); clone-shared / transformed / decorated shapes
-/// keep CoW verbatim (`tests/inplace_overwrite_tests.rs`).
+/// whole-block face, the contract-9 brim machinery generalized) lands
+/// in place with ZERO displacement: no allocation, no free, no discard,
+/// same-key merge. The default is SUBSTRATE-measured, not guessed
+/// (`.benchmarks/2026-07-31-write-wall.md` §iteration loop): on the
+/// field's zram-lz4 targets an in-place slot-replace write costs ≈ 2× a
+/// fresh-slot write (A-B-B-A ×3: rewrite −20 % with engagement exact),
+/// so CoW + deferred discard + the reclaim manners law wins there —
+/// while substrates whose in-place rewrite is cheap (real-SSD DSM
+/// fleets) can opt in and shed the whole displacement/dealloc stream.
+/// Crash class per the W1 precedent: only app-written sectors are
+/// rewritten (all of them, by this write); clone-shared / transformed /
+/// decorated shapes keep CoW verbatim
+/// (`tests/inplace_overwrite_tests.rs`).
 fn inplace_overwrite_cell() -> &'static std::sync::atomic::AtomicBool {
     static CELL: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {
         let on = std::env::var("SQUEEZEFS_INPLACE_OVERWRITE")
-            .map(|v| v.trim() != "0")
-            .unwrap_or(true);
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
         std::sync::atomic::AtomicBool::new(on)
     })
 }
 
-/// Whether eligible full-block overwrites land in place (default true).
+/// Whether eligible full-block overwrites land in place (default false —
+/// substrate-measured; see `inplace_overwrite_cell`'s doc).
 pub fn inplace_overwrite_enabled() -> bool {
     inplace_overwrite_cell().load(Ordering::Relaxed)
 }

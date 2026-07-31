@@ -11,19 +11,28 @@
 //! ~1,900/s and would need 3,750/s at the 15 GB/s bar. Conservation
 //! makes CoW-rewrite structurally dealloc-bound on this fabric.
 //!
-//! The fix: a full-block overwrite of a sole-owned, undecorated,
+//! The machinery: a full-block overwrite of a sole-owned, undecorated,
 //! passthrough, whole-block-mapped striped block on an Active volume
-//! lands **IN PLACE** by default — the W1 sole-owner patch law's
-//! whole-block face, and exactly the machinery contract 9 shipped for
-//! the brim (`try_brim_inplace_rewrite`), promoted from
-//! genuine-StorageFull-only to the default eligible path. No
-//! allocation, no displacement, no discard, same-key merge (no
-//! displaced purge). Crash/concurrency class UNCHANGED from the W1
+//! can land **IN PLACE** — the W1 sole-owner patch law's whole-block
+//! face, and exactly the machinery contract 9 shipped for the brim
+//! (`try_inplace_rewrite`), generalized to an OPT-IN default-eligible
+//! path. No allocation, no displacement, no discard, same-key merge
+//! (no displaced purge). Crash/concurrency class UNCHANGED from the W1
 //! precedent: the §5.1 incarnation fence (`begin_patch_sole_owner`)
 //! covers racing validated fills; only app-written sectors are ever
 //! rewritten (here: every sector of the block, written by THIS write);
 //! clone-shared / transformed / decorated / non-Active shapes keep the
 //! CoW path verbatim.
+//!
+//! **Default posture (iteration-2 field verdict): OFF —
+//! `SQUEEZEFS_INPLACE_OVERWRITE=1` opts in.** The A-B-B-A ×3 field
+//! bracket measured the in-place path −20 % on rewrite with engagement
+//! EXACT (32,768/32,768 in place, zero displacement): on the field's
+//! zram-lz4 targets a slot-replace write costs ≈ 2× a fresh-slot write
+//! (rewrite ≈ fresh ÷ 2, exactly), so CoW + deferred discard + the
+//! reclaim manners law wins there. Substrates whose in-place rewrite
+//! is cheap (real-SSD DSM fleets) opt in and shed the whole
+//! displacement/dealloc stream.
 //!
 //! Contracts:
 //! 1. **Engagement**: a full-block rewrite of an eligible striped block
@@ -34,9 +43,9 @@
 //! 2. **Clone-shared blocks keep CoW**: after `increment_refcount`, the
 //!    rewrite displaces (mapping changes, reclaim enqueued, in-place
 //!    counter still) — never scribbles a shared block.
-//! 3. **A/B lever**: `SQUEEZEFS_INPLACE_OVERWRITE=0` /
-//!    `set_inplace_overwrite(false)` restores the CoW-always posture
-//!    verbatim (measurement lever, never an operational escape).
+//! 3. **The lever**: `set_inplace_overwrite(false)` (= the unset-env
+//!    default) is the CoW-always posture, verbatim;
+//!    `SQUEEZEFS_INPLACE_OVERWRITE=1` opts a substrate in.
 //! 4. **The brim arm is unchanged**: at genuine StorageFull the brim
 //!    rewrite still engages (its own counter) — the two counters split
 //!    default-path vs space-pressure engagements.
@@ -68,11 +77,11 @@ async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
-/// Restore the default-on posture on scope exit (knob hygiene).
+/// Restore the default-OFF posture on scope exit (knob hygiene).
 struct LeverGuard;
 impl Drop for LeverGuard {
     fn drop(&mut self) {
-        squeezefs::fuse_client::set_inplace_overwrite(true);
+        squeezefs::fuse_client::set_inplace_overwrite(false);
     }
 }
 

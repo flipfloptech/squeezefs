@@ -534,7 +534,7 @@ async fn stale_hot_entry_under_dead_key_is_never_served() {
         "resolution goes through the CURRENT map + binding recheck — a \
          stale hot entry under a dead key must be unreachable"
     );
-    squeezefs::fuse_client::set_inplace_overwrite(true);
+    squeezefs::fuse_client::set_inplace_overwrite(false);
 }
 
 /// Cache-less volumes (no staging dirs): striped blocks get a RAM tier for

@@ -872,7 +872,7 @@ async fn write_rig_phases_and_sites_record() {
     ] {
         assert!(!m[key].is_null(), "armed .stats surface must carry {key}");
     }
-    squeezefs::fuse_client::set_inplace_overwrite(true);
+    squeezefs::fuse_client::set_inplace_overwrite(false);
 }
 
 async fn read_stats_json(h: &H) -> serde_json::Value {

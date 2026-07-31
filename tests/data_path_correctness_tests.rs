@@ -1136,7 +1136,7 @@ async fn test_write_through_reused_key_purges_stale_read_tiers() {
         "reused block key served the dead incarnation's cached bytes — the \
          no-put write-through owner must purge the key's read tiers"
     );
-    squeezefs::fuse_client::set_inplace_overwrite(true);
+    squeezefs::fuse_client::set_inplace_overwrite(false);
 }
 
 // ---------------------------------------------------------------------------

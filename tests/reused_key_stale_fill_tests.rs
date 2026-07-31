@@ -329,7 +329,7 @@ async fn parked_read_never_serves_reused_or_freed_key() {
             && fresh[BS as usize..].iter().all(|&v| v == 0xB1),
         "[{tag}] post-race fresh read corrupted"
     );
-    squeezefs::fuse_client::set_inplace_overwrite(true);
+    squeezefs::fuse_client::set_inplace_overwrite(false);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

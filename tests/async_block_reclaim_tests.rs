@@ -1126,7 +1126,7 @@ impl InplaceOff {
 }
 impl Drop for InplaceOff {
     fn drop(&mut self) {
-        squeezefs::fuse_client::set_inplace_overwrite(true);
+        squeezefs::fuse_client::set_inplace_overwrite(false);
     }
 }
 

@@ -219,7 +219,7 @@ async fn phase_family_is_always_on_with_exact_keys() {
 struct InplaceGuard;
 impl Drop for InplaceGuard {
     fn drop(&mut self) {
-        squeezefs::fuse_client::set_inplace_overwrite(true);
+        squeezefs::fuse_client::set_inplace_overwrite(false);
     }
 }
 

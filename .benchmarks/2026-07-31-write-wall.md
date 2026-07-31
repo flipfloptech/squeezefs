@@ -277,7 +277,83 @@ it are docs-only — this note + AGENTS.md counter-family updates):
   13 ms names itself in one sustained fresh window; whatever phase
   carries it is the next fix, red-first.
 
-## 6. Open questions
+## 6. Iteration loop (post-merge; branch `perf/write-wall-2` off dev `f629b46`)
+
+The orchestrator's **field verdict v2** (f629b46, single-order, dirty
+sequence): fresh 8,824 (down from 10,616) / rewrite 7,017 (up from
+6,347) / read 19,786; mid-rewrite `inline_spills = 11,265`,
+`queue_bytes = 18.6 GB`, coalesce ≈ 1.05. Its fresh bracket ran minutes
+after a 128 GiB `rm`; its phase-residence grep matched nothing because
+the stats JSON is pretty-printed (python `json` is the verified capture
+— every table below uses it).
+
+### 6.1 Iteration-1 field measurement (f629b46, settled, hygiene-controlled)
+
+Settle protocol: reclaim `queue_bytes → 0` ×3 before every row; every
+row fill+order-labeled; 1 Hz gauge sampler per row. Instrument:
+elbencho 3.1-10, kernel path, `--direct -t 32 -b 4m`, 16 × 8 GiB
+(32,768 × 4 MiB blocks/pass); artifacts `~/tmp/ww2_iter1/`.
+
+| Row (order) | MiB/s | Key gauges |
+|---|---|---|
+| rm 128 GiB + idle drain | — | 32,768 queued drained in **12.1 s** (≈ 2,700 cmd/s at width 32); 1,128 spills during the rm burst itself |
+| fresh (settled, fill 0→51 %) | **12,275** | spills 0; **verdict-v2's 8,824 was the rm-storm artifact** |
+| rewrite ×1 (settled) | 7,798 | arrival ~1,950/s vs drain ~1,700/s ⇒ queue → 15.3 GB, **7,749 spills** |
+| sustained rewrite 60 s | 7,502 | 36,795 spills (33 % of displaced); queue pinned ~18 GB |
+| read (dirty vs settled) | 16,740 / 16,431 | shape-consistent pair (this instrument ≠ the orchestrator's read row) |
+
+**Phase tables (the conviction-2 instrument, field):** fresh total
+19.4 ms = admit 3.3 + **dma 15.0** + publish 0.9 (+ ~0.1 bookkeeping) —
+the "13 ms" lives in the DEVICE leg (fabric queueing above the 3–4 ms
+service), not client bookkeeping. Rewrite total 51.7 ms = admit 3.5 +
+dma 16.8 + **publish 28.8** + displaced_free 1.8 (spill poison — the
+at-cap arm ran its 12–22 ms ioctl ON the tpc lane).
+
+### 6.2 Width/depth experiments (env levers, same binary — the decisive negatives)
+
+| Experiment | Result | Verdict |
+|---|---|---|
+| E1: idle rm-drain at `LANES_PER_DEV=32` (width 128) | 12.2 s — burst 5,900 cmd/s vs 2,700 at width 32 | idle drain scales sub-linearly with width |
+| E2: rewrite at width 128 | 7,656 MiB/s; under-load drain ~1,600–1,800 cmd/s — **identical to width 32** | **the TARGET deallocate service is the under-load drain ceiling; client width buys nothing under load** |
+| E3/E3b: fresh at pinned depth 96 vs governed | 12,030 vs 12,231; dma 32.3 ms vs 15.2 (2× latency, zero rate) | fresh is NOT depth-bound: devices at ~3.05 GB/s each, util ~100 %, svctm ~1.1 ms — **the per-device downstream write-service ceiling** (4 × 3.05 ≈ 12.2 GB/s) |
+
+### 6.3 Iteration-1 fixes (commits `43b1c20` red / `d7f31c4` impl / `8ac446d` doc)
+
+1. **Default in-place full-block overwrite** (`SQUEEZEFS_INPLACE_OVERWRITE`,
+   the contract-9 brim machinery promoted to the default; same-key merge
+   on the coalescing conveyor; W1 crash/concurrency class;
+   clone-shared/transformed keep CoW — `tests/inplace_overwrite_tests.rs`).
+2. **Reclaim manners — the deferred-drain law** (foreground device-byte
+   movement + below-cap ⇒ zero device commands; at-cap ⇒ drain
+   regardless; idle ⇒ full-width catch-up; contracts 12–13).
+3. **Park-don't-spill** (at-cap enqueue parks bounded, NEVER issues
+   device commands from the enqueue context; `cap_parks`/`cap_overflow`
+   replace `inline_spills`; lanes default 8 → 32, idle-engaged only).
+
+### 6.4 Iteration-1 field verdict (A-B-B-A ×3, settled rows, A = 8ac446d, B = f629b46)
+
+| Row | A med | B med | Δ |
+|---|---|---|---|
+| fresh (settled) | 12,106 | 11,959 | +1.2 % |
+| rewrite | 6,054 | 7,604 | **−20.4 %** |
+| sustained 60 s | 6,043 | 7,425 | −18.6 % |
+| read (settled) | 16,300 | 16,333 | −0.2 % |
+
+Engagement PERFECT on every A row (`inplace_ow ≡ wt_blocks` 32,768,
+queued 0, parks 0, queue 0) — and rewrite went DOWN 20 %. Phase tables
+name it: A rewrite dma 14.0 ms / publish 15.3 vs B dma 15.2 / publish
+20.0 — the client got FASTER per phase at lower throughput, i.e. the
+loss is downstream: **on zram-lz4 targets an in-place slot-replace
+write costs ≈ 2× a fresh-slot write** (A rewrite 6,054 ≈ fresh 12,106 ÷
+2, exactly; B's CoW writes fresh slots at fresh speed and pays dealloc
+LATER, deferred off the row). The dealloc work is conserved on this
+substrate — in-place just moves it inline into every target write.
+**Iteration-2 consequence: the in-place default flips to opt-in**
+(`SQUEEZEFS_INPLACE_OVERWRITE=1` for substrates where in-place rewrite
+is cheap — real-SSD DSM fleets); CoW + deferred discard + manners +
+park is the right default HERE.
+
+## 7. Open questions
 
 * **OQ-1:** the field deploy for conviction-2's table (this branch,
   orchestrator-owned) — the rig cannot reproduce the field's residence

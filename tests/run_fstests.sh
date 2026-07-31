@@ -104,6 +104,19 @@ if [ -n "$FSGQA_HOME" ] && [ ! -d "$FSGQA_HOME" ]; then
     mkdir -p "$FSGQA_HOME"
     chown fsgqa:fsgqa "$FSGQA_HOME"
 fi
+# glibc >= 2.42 exports F_GETDELEG/F_SETDELEG from <fcntl.h>, so
+# locktest.c's `#ifndef F_GETDELEG` fallback (which also declares
+# struct delegation) never fires — but struct delegation itself lives
+# only in <linux/fcntl.h>, which locktest.c does not include: the
+# suite fails to COMPILE on bleeding-edge glibc (incomplete type).
+# Force the local fallback — its values are identical to the kernel's
+# (F_LINUX_SPECIFIC_BASE = 1024). Pure instrument header skew, same
+# class as the generic/062 setfattr sed below; idempotent.
+if ! grep -q 'squeezefs runner: force delegation fallback' src/locktest.c; then
+    sed -i 's|^#ifndef F_GETDELEG$|#if 1 /* squeezefs runner: force delegation fallback — glibc 2.42+ defines F_GETDELEG in <fcntl.h> without struct delegation */\n#undef F_GETDELEG\n#undef F_SETDELEG|' \
+        src/locktest.c
+fi
+
 if [ ! -f "src/open_by_handle" ]; then
     echo "Compiling xfstests..."
     make

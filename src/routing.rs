@@ -2626,6 +2626,19 @@ pub fn prefetch_window_grows(
 /// never wrongness.
 pub struct StreamLanes {
     lanes: [StreamLane; 4],
+    /// Read-lane round-4 (2026-08-01): the FILE-level issue owner —
+    /// exactly ONE lane cursor per file drives the read-lane ahead
+    /// pipeline at a time. Under qd reorder the pre-classification
+    /// claim path routinely mints 2+ classified lanes for ONE reader
+    /// (measured: ~2 classify events per file-pass), and sibling
+    /// cursors each issuing `[end+1, end+depth]` doubled the ahead
+    /// spend into FIFO churn (r3C1: 190k of 349k deposits evicted
+    /// unconsumed, read_amp 1.27). Ownership is sticky while fresh
+    /// (< 2 s) and rotates on staleness — a real second reader takes
+    /// over within one staleness window. Racy-tolerant: a lost CAS
+    /// costs one skipped top-up.
+    issue_owner_idx: std::sync::atomic::AtomicUsize,
+    issue_owner_ms: std::sync::atomic::AtomicU64,
     /// Consecutive reads of this file that matched NO lane — the
     /// random-dominated signature. A spurious classification (random
     /// traffic occasionally lands 4 contiguous offsets) would otherwise
@@ -2742,6 +2755,8 @@ impl StreamLanes {
         Self {
             lanes: [mk(), mk(), mk(), mk()],
             foreign_since_match: std::sync::atomic::AtomicU32::new(0),
+            issue_owner_idx: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            issue_owner_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -4737,6 +4752,20 @@ impl DataRouter {
             || block_size <= crate::read_lane::READ_LANE_MIN_FILL_BYTES as u64
         {
             return;
+        }
+        // File-level single issuer (round 4 — see the StreamLanes field
+        // doc): sibling classified lanes minted by reorder claims must
+        // not each drive an ahead pipeline.
+        {
+            use std::sync::atomic::Ordering::Relaxed as R;
+            let now = StreamLanes::now_ms();
+            let owner = lanes.issue_owner_idx.load(R);
+            let owner_ms = lanes.issue_owner_ms.load(R);
+            if owner != lane_idx && owner != usize::MAX && now.saturating_sub(owner_ms) < 2_000 {
+                return;
+            }
+            lanes.issue_owner_idx.store(lane_idx, R);
+            lanes.issue_owner_ms.store(now, R);
         }
         let budget_cap =
             crate::read_lane::effective_mem_budget() / crate::read_lane::READ_LANE_BUDGET_DIVISOR;

@@ -146,14 +146,16 @@ fn depth_derivation_tables() {
         "aggregate R5 cap bounds issue"
     );
 
-    // Hold budget: the live consume-behind window (2 x streams x depth
-    // blocks), floored at 4 blocks, capped by the R5 share — the
-    // round-2 field lesson: a flat mem/8 budget pinned 23.6 GiB of
-    // FIFO churn (~50 % of deposits evicted unconsumed) on a looping
-    // beyond-budget row.
-    assert_eq!(hold_budget_bytes(80 * gib, bs, 32, 16), 2 * 32 * 16 * bs);
+    // Hold budget: the live consume-behind window (4 x streams x depth
+    // blocks — ahead window + straggler cohort + FIFO-skew margin),
+    // floored at 4 blocks, capped by the R5 share. Round-2 field
+    // lesson: a flat mem/8 budget pinned 23.6 GiB of FIFO churn;
+    // round-4: a 2x window still evicted half the deposits unconsumed
+    // under 38-stream FIFO skew.
+    assert_eq!(hold_budget_bytes(80 * gib, bs, 32, 16), 4 * 32 * 16 * bs);
+    assert_eq!(hold_budget_bytes(80 * gib, bs, 1, 2), 8 * bs);
     assert_eq!(
-        hold_budget_bytes(80 * gib, bs, 1, 2),
+        hold_budget_bytes(80 * gib, bs, 1, 0),
         4 * bs,
         "4-block floor"
     );
@@ -586,7 +588,8 @@ async fn reordered_qd_stream_keeps_membership_and_lane_engagement() {
 
     let blocks = 16u64;
     let (ino, _map) = striped_file(&h, "reorder", blocks).await;
-    let (f0, c0) = (
+    let (g0, f0, c0) = (
+        get_obj(),
         lane_fetches(),
         METRICS.read_streams_classified.load(Ordering::Relaxed),
     );
@@ -628,6 +631,13 @@ async fn reordered_qd_stream_keeps_membership_and_lane_engagement() {
         "a swapped-arrival stream must keep its lane engaged \
          (read_lane_fetches = {df} across {blocks} blocks — 0 is the \
          field's exact-contiguity wedge)"
+    );
+    let dg = get_obj() - g0;
+    assert!(
+        dg <= blocks + 4,
+        "single-issuer economy: sibling reorder-claimed cursors must not \
+         over-fetch ({dg} device fetches for {blocks} blocks — the r3C1 \
+         duplicate-cursor waste class)"
     );
     assert!(
         dc <= 2,

@@ -174,7 +174,12 @@ pub fn hold_budget_bytes(
     depth: u32,
 ) -> u64 {
     let bs = block_size.max(1);
-    let window = 2u64
+    // 4× the aggregate pipeline: the ahead window itself + the
+    // straggler cohort + the global-FIFO skew margin (round-4 field
+    // lesson: 2× left half the deposits evicted-unconsumed under
+    // 38-stream FIFO skew — each such eviction is a paid-for device
+    // fetch thrown away).
+    let window = 4u64
         .saturating_mul(u64::from(active_streams.max(1)))
         .saturating_mul(u64::from(depth))
         .saturating_mul(bs);

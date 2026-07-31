@@ -1,0 +1,31 @@
+# tests/fio/gap_probe_write.job — the gap-accounting WRITE probe shape.
+#
+# Same family as exa_write_bw.job but every discriminating dimension is
+# a parameter, so one job file serves the whole sweep:
+#   iodepth {1,4,8,32} x bs {1M,4M} x njobs {8,16,32}
+# via run_fio_row.sh --iodepth/--bs/--njobs. The dimension that recovers
+# throughput names the bottleneck class:
+#   depth  => per-op latency chain (submission-to-completion serialization)
+#   njobs  => per-stream / queue concentration
+#   bs     => per-op overhead (fixed cost per request)
+#
+# Sweep incantation (see tests/fio/README.md):
+#   for qd in 1 4 8 32; do for bs in 1M 4M; do for nj in 8 16 32; do
+#     tests/fio/run_fio_row.sh --job tests/fio/gap_probe_write.job \
+#       --dir "$M/gap" --iodepth $qd --bs $bs --njobs $nj ...
+#   done; done; done
+[global]
+group_reporting=1
+ioengine=${SQZ_FIO_ENGINE}
+readwrite=write
+direct=1
+bs=${SQZ_FIO_BS}
+size=${SQZ_FIO_SIZE}
+iodepth=${SQZ_FIO_IODEPTH}
+norandommap=0
+fallocate=none
+time_based
+runtime=${SQZ_FIO_RUNTIME}
+ramp_time=${SQZ_FIO_RAMP}
+filename_format=sqzfio.$jobnum.$filenum
+directory=${SQZ_FIO_DIR}

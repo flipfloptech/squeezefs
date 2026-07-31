@@ -1,0 +1,24 @@
+# tests/fio/gap_probe_read.job — the gap-accounting READ probe shape.
+#
+# Same family as exa_read_bw.job but every discriminating dimension is a
+# parameter (see gap_probe_write.job for the sweep grammar and the
+# bottleneck-class decoding table).
+#
+# Fill discipline: prefill the same --dir/--njobs/--size with
+# gap_probe_write.job (same filename_format => same files) so reads are
+# real, and label the fill in the row.
+[global]
+group_reporting=1
+ioengine=${SQZ_FIO_ENGINE}
+readwrite=read
+direct=1
+bs=${SQZ_FIO_BS}
+size=${SQZ_FIO_SIZE}
+iodepth=${SQZ_FIO_IODEPTH}
+norandommap=0
+fallocate=none
+time_based
+runtime=${SQZ_FIO_RUNTIME}
+ramp_time=${SQZ_FIO_RAMP}
+filename_format=sqzfio.$jobnum.$filenum
+directory=${SQZ_FIO_DIR}

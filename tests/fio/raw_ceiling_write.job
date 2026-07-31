@@ -1,0 +1,28 @@
+# tests/fio/raw_ceiling_write.job
+#
+# !!! DESTRUCTIVE !!! — this shape WRITES DIRECTLY TO RAW BLOCK DEVICES
+# and destroys every byte of data (filesystems, superblocks, formats) on
+# them. tests/fio/run_fio_row.sh refuses to run it without
+# --i-know-this-destroys-data, and never run it against a device that is
+# part of a live SqueezeFS volume set.
+#
+# The device-sweep raw WRITE ceiling shape: libaio, bs=4m, iodepth=16,
+# 8 jobs per device (SQZ_FIO_NJOBS_PER_DEV), filename= parametrized —
+# run_fio_row.sh --devices /dev/a:/dev/b emits one [section] per device.
+# This is the "26.1 GB/s raw" reference incantation class: it measures
+# what the DEVICES + fabric can absorb with no filesystem in the path.
+#
+# NOTE: the 8 jobs of one device each write sequentially from offset 0
+# (the vendor sweep shape). Set SQZ_FIO_OFFSET_INC (e.g. 12%) to spread
+# jobs across distinct LBA regions instead.
+[global]
+group_reporting=1
+ioengine=${SQZ_FIO_ENGINE}
+readwrite=write
+direct=1
+bs=${SQZ_FIO_BS}
+iodepth=${SQZ_FIO_IODEPTH}
+norandommap=0
+time_based
+runtime=${SQZ_FIO_RUNTIME}
+ramp_time=${SQZ_FIO_RAMP}

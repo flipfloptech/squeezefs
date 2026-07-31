@@ -273,7 +273,20 @@ async fn striped_file(
 async fn beyond_budget_stream_loop_stays_transient_and_bounds_the_waste_ledger() {
     std::env::set_var("SQUEEZEFS_READ_TIER_ADMISSION", "second-touch");
     std::env::set_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", "1"); // 2 slots
+                                                                 // Read-lane campaign (2026-08-01): this phase pins the TRANSIENT
+                                                                 // WINDOW mechanism — governor-arbitrated stream re-fill admission
+                                                                 // at the fill site — which requires the refills to REACH the fill
+                                                                 // site. With the read lane armed, this exact shape's pass
+                                                                 // boundaries drop the per-lane resident share to 0 and the lane
+                                                                 // covers the refills ledger-invisibly (never a ghost decision at
+                                                                 // all; economy + bounded waste hold by construction — pinned in
+                                                                 // tests/read_lane_tests.rs). Pin the pre-lane regime explicitly:
+                                                                 // the transient window still governs every demand refill the lane
+                                                                 // does not front-run (fitting shares, mixed shapes, lane-off
+                                                                 // mounts).
+    std::env::set_var("SQUEEZEFS_READ_LANE", "0");
     let h = make_with(*b"stream-trans-001", "strans_ns_a", false).await;
+    std::env::remove_var("SQUEEZEFS_READ_LANE");
     std::env::remove_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB");
     std::env::remove_var("SQUEEZEFS_READ_TIER_ADMISSION");
     let blocks = 16u64; // 8 MiB working set vs 1 MiB hot budget

@@ -560,34 +560,45 @@ async fn hold_serves_cohort_stragglers_across_hot_eviction_without_refetch() {
     let h = make_with(*b"read-lane-test02", "rdlane_ns_b", false).await;
     clear_zero_share_env();
 
-    let (ino, _map) = striped_file(&h, "cohort", 3).await;
+    // The straggler file is ONE block (nothing ahead for the lane to
+    // legitimately speculate on when the straggler run classifies);
+    // the interleaver is a 3-block file read in never-contiguous
+    // quarter order (never classifies — pure demand fills whose hot
+    // inserts evict the straggler's block from the 2-slot hot tier:
+    // the qd32 clock-race face).
+    let (ino_a, _ma) = striped_file(&h, "cohort_a", 1).await;
+    let (ino_x, _mx) = striped_file(&h, "cohort_x", 3).await;
     let (g0, r0) = (
         get_obj(),
         METRICS.read_lane_hold_retired.load(Ordering::Relaxed),
     );
 
-    // The straggler shape: one sub-read of block A, then B and C fully
-    // (evicting A from the 2-slot hot tier — the qd32 clock-race face),
-    // then A's remaining sub-reads arrive late.
     let q = (BS / 4) as u32;
-    let a = read_at(&h, ino, 0, q).await;
+    // One sub-read of A (demand fill: hot insert + hold deposit)…
+    let a = read_at(&h, ino_a, 0, q).await;
     assert!(a.iter().all(|&x| x == 1));
-    for i in 0..8u64 {
-        let off = BS + i * u64::from(q);
-        let b = off / BS;
-        let d = read_at(&h, ino, off, q).await;
-        assert!(d.iter().all(|&x| x == (b % 250) as u8 + 1));
+    // …then the interleaver: each X block fully consumed but in
+    // non-contiguous quarter order (q0,q2,q1,q3) so no lane ever
+    // classifies — 3 demand fills evict A from the 2-slot hot tier.
+    for b in 0..3u64 {
+        for quarter in [0u64, 2, 1, 3] {
+            let off = b * BS + quarter * u64::from(q);
+            let d = read_at(&h, ino_x, off, q).await;
+            assert!(d.iter().all(|&x| x == (b % 250) as u8 + 1));
+        }
     }
+    // A's straggler sub-reads arrive after the eviction: the hold — not
+    // a whole-block refetch — must serve them.
     for i in 1..4u64 {
-        let d = read_at(&h, ino, i * u64::from(q), q).await;
+        let d = read_at(&h, ino_a, i * u64::from(q), q).await;
         assert!(d.iter().all(|&x| x == 1), "straggler sub-read {i} parity");
     }
 
     let dg = get_obj() - g0;
     assert_eq!(
-        dg, 3,
-        "cohort stability: 3 blocks => 3 device fetches (a 4th is the \
-         qd32 straggler-refetch regression this contract outlaws)"
+        dg, 4,
+        "cohort stability: 4 unique blocks => 4 device fetches (a 5th is \
+         the qd32 straggler-refetch regression this contract outlaws)"
     );
 
     // Memory converges by consumption: every block was fully covered,
@@ -604,7 +615,7 @@ async fn hold_serves_cohort_stragglers_across_hot_eviction_without_refetch() {
         "full coverage must retire every hold entry"
     );
     assert!(
-        METRICS.read_lane_hold_retired.load(Ordering::Relaxed) - r0 >= 3,
+        METRICS.read_lane_hold_retired.load(Ordering::Relaxed) - r0 >= 4,
         "coverage retirements must be counted"
     );
     drop(h);
@@ -623,7 +634,8 @@ async fn lever_off_is_exact_prior_behavior() {
     std::env::remove_var("SQUEEZEFS_READ_LANE");
     clear_zero_share_env();
 
-    let (ino, _map) = striped_file(&h, "leveroff", 3).await;
+    let (ino_a, _ma) = striped_file(&h, "leveroff_a", 1).await;
+    let (ino_x, _mx) = striped_file(&h, "leveroff_x", 3).await;
     let (g0, f0, h0, s0) = (
         get_obj(),
         lane_fetches(),
@@ -633,23 +645,24 @@ async fn lever_off_is_exact_prior_behavior() {
 
     // The contract-3 straggler shape…
     let q = (BS / 4) as u32;
-    let a = read_at(&h, ino, 0, q).await;
+    let a = read_at(&h, ino_a, 0, q).await;
     assert!(a.iter().all(|&x| x == 1));
-    for i in 0..8u64 {
-        let off = BS + i * u64::from(q);
-        let b = off / BS;
-        let d = read_at(&h, ino, off, q).await;
-        assert!(d.iter().all(|&x| x == (b % 250) as u8 + 1));
+    for b in 0..3u64 {
+        for quarter in [0u64, 2, 1, 3] {
+            let off = b * BS + quarter * u64::from(q);
+            let d = read_at(&h, ino_x, off, q).await;
+            assert!(d.iter().all(|&x| x == (b % 250) as u8 + 1));
+        }
     }
     for i in 1..4u64 {
-        let d = read_at(&h, ino, i * u64::from(q), q).await;
+        let d = read_at(&h, ino_a, i * u64::from(q), q).await;
         assert!(d.iter().all(|&x| x == 1));
     }
 
-    // …reproduces the prior shape: block A is refetched after eviction.
+    // …reproduces the prior shape: A is refetched after eviction.
     assert_eq!(
         get_obj() - g0,
-        4,
+        5,
         "lever-off must reproduce the pre-campaign refetch shape exactly"
     );
     // And a full stream pass leaves R2 declined with the lane dark.

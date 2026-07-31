@@ -801,6 +801,12 @@ async fn advisory_integration_phases() {
     let d = read_at(&h, ino, 0, 65536).await;
     assert!(d.iter().all(|&x| x == 1));
     h.fs.router.cache.hot_block.remove(map.get(&0).unwrap());
+    // Read-lane campaign (2026-08-01): the fill also parked a copy in
+    // the ledger-invisible hold — this phase simulates "every RAM copy
+    // evicted" so the next miss must be REAL (the ghost-admitted
+    // second miss that makes block 0 protected); drop the hold copy
+    // alongside the hot one.
+    h.fs.router.cache.read_lane_hold.purge(map.get(&0).unwrap());
     let d = read_at(&h, ino, 128 * 1024, 65536).await;
     assert!(d.iter().all(|&x| x == 1));
     h.fs.router

@@ -10425,6 +10425,33 @@ impl Filesystem for SqueezefsFilesystem {
                     Arc::new(move || hot.current_bytes()),
                     Arc::new(move |target| hot_shed.shed_to(target)),
                 ));
+                // Read-lane hold (2026-08-01): sheddable — the trim is
+                // oldest-first FIFO over completed speculative fills
+                // (a dropped entry costs one refetch, never
+                // correctness); steady-state bytes converge by
+                // consumption coverage.
+                let rlh = self.router.cache.read_lane_hold.clone();
+                let rlh_shed = self.router.cache.read_lane_hold.clone();
+                MEM_BUDGET.register(Component::new(
+                    "read_lane_hold",
+                    0,
+                    2,
+                    Arc::new(move || rlh.bytes()),
+                    Arc::new(move |target| rlh_shed.trim_to(target)),
+                ));
+                // Read-lane in-flight fetch custody: non-sheddable-by-
+                // force like `write_pipeline_inflight` — in-flight DMAs
+                // DRAIN; Red clamps the lane depth to zero
+                // (`read_lane_depth_blocks`), so the gauge converges by
+                // completion.
+                let rl_router = self.router.clone();
+                MEM_BUDGET.register(Component::new(
+                    "read_lane_inflight",
+                    0,
+                    1,
+                    Arc::new(move || rl_router.read_lane_inflight_bytes()),
+                    Arc::new(|_| {}),
+                ));
                 let rl = self.router.cache.read_lru.clone();
                 let rl_shed = self.router.cache.read_lru.clone();
                 MEM_BUDGET.register(Component::new(

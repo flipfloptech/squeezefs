@@ -2449,6 +2449,12 @@ pub struct StreamLane {
     window: std::sync::atomic::AtomicU32,
     /// Issued-but-not-completed fills.
     inflight: std::sync::atomic::AtomicU32,
+    /// Read-lane (2026-08-01) issued-but-not-completed lane fetches —
+    /// deliberately separate from `inflight`: the two issue regimes are
+    /// disjoint (the lane runs exactly where R2's resident share is 0)
+    /// but the share flips with `active_streams`, and conflated
+    /// accounting across a flip would wedge whichever regime resumes.
+    rl_inflight: std::sync::atomic::AtomicU32,
     /// Completed fills not yet foreground-consumed — the resident-
     /// unconsumed bound (§5.5 mechanism i).
     unconsumed: std::sync::atomic::AtomicU32,
@@ -2724,6 +2730,7 @@ impl StreamLanes {
             next_prefetch_block: std::sync::atomic::AtomicU32::new(0),
             window: std::sync::atomic::AtomicU32::new(2),
             inflight: std::sync::atomic::AtomicU32::new(0),
+            rl_inflight: std::sync::atomic::AtomicU32::new(0),
             unconsumed: std::sync::atomic::AtomicU32::new(0),
             consumed_edge: std::sync::atomic::AtomicU32::new(0),
             issued_base: std::sync::atomic::AtomicU32::new(0),
@@ -2841,6 +2848,10 @@ impl StreamLanes {
             lane.next_prefetch_block.store(0, Relaxed);
             lane.window.store(2, Relaxed);
             lane.unconsumed.store(0, Relaxed);
+            // `inflight`/`rl_inflight` deliberately NOT reset: in-flight
+            // tasks decrement their own counters at settle (a reset here
+            // would underflow them); the generation bump makes their
+            // completions land as wasted.
             lane.consumed_edge.store(0, Relaxed);
             lane.issued_base.store(0, Relaxed);
             lane.suppress_until_edge.store(0, Relaxed);
@@ -3743,6 +3754,23 @@ impl DataRouter {
                 return Ok((crate::cache::pool::ReadBlockValue::Bytes(bytes), true));
             }
 
+            // Read-lane hold (2026-08-01): the anti-refetch serve for
+            // cohort stragglers — a completed fill whose hot-probation
+            // copy lost the clock race is still findable here until its
+            // consumption coverage completes. Zero credit (this loop
+            // cannot know the caller's slice; the single-block arm's
+            // fast path and the primary-slice sites own the coverage
+            // accounting). Hold entries hold current-incarnation bytes
+            // by the hot-tier argument (validated deposits + unified
+            // purge), and block-serving callers recheck the binding.
+            if self.read_lane.enabled() {
+                if let Some(held) = self.cache.read_lane_hold.serve(block_key, 0) {
+                    METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    METRICS.read_lane_serves.fetch_add(1, Ordering::Relaxed);
+                    return Ok((crate::cache::pool::ReadBlockValue::Bytes(held), true));
+                }
+            }
+
             if std::time::Instant::now() >= deadline {
                 return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -3965,6 +3993,35 @@ impl DataRouter {
                                 }
                             })
                             .await;
+                        }
+                        // Read-lane hold deposit (2026-08-01): every
+                        // > 256 KiB demand primary parks its completed
+                        // fill in the ledger-invisible hold — the
+                        // deep-qd cohort stability fix (a same-block
+                        // straggler that lost this flight's window AND
+                        // the hot clock race serves from here instead
+                        // of refetching 4 MiB — the qd32 read_amp-1.41
+                        // face). A `Bytes` refcount clone; retired by
+                        // consumption coverage; purged with the tiers
+                        // on movement (the undo below). Red pauses new
+                        // deposits (R5 posture). `Prefetch`-class fills
+                        // are EXCLUDED: R2's regime keeps its
+                        // hot-probation landing and its
+                        // evicted-unconsumed spiral detector verbatim
+                        // (pinned by read_prefetch_pipeline_tests) —
+                        // the lane's own fetches deposit in
+                        // `lane_fetch_block`, the regimes stay
+                        // disjoint.
+                        if self.read_lane.enabled()
+                            && class != FillClass::Prefetch
+                            && downloaded_bytes.len() > crate::read_lane::READ_LANE_MIN_FILL_BYTES
+                            && crate::mem_budget::level() != crate::mem_budget::Level::Red
+                        {
+                            self.cache.read_lane_hold.insert(
+                                block_key,
+                                downloaded_bytes.clone(),
+                                self.read_lane_hold_budget(),
+                            );
                         }
                         // Avoid flooding RAM LRU with full 4 MiB blocks under
                         // multi-GB sequential reads. Small blocks still cache.
@@ -4197,6 +4254,12 @@ impl DataRouter {
                     let resident = self.cache.hot_block.get_no_promote(k).is_some()
                         || self.cache.read_lru.get_no_promote(k).is_some()
                         || self.cache.nvme.has_cached_read_block(k)
+                        // Read-lane hold residency (2026-08-01): a
+                        // lane-held fill is findable — without this arm
+                        // every lane-covered consume would fire the
+                        // evicted-unconsumed detector and quiesce
+                        // healthy lanes.
+                        || (self.read_lane.enabled() && self.cache.read_lane_hold.contains(k))
                         || self.inflight_block_reads.read_sync(k, |_, _| ()).is_some();
                     if !resident {
                         METRICS.prefetch_evicted_unconsumed.fetch_add(1, Relaxed);
@@ -4289,6 +4352,21 @@ impl DataRouter {
             METRICS.prefetch_window_hwm.store(plan_bound, Relaxed);
         }
         if resident_share == 0 {
+            // R2 declines: the per-lane share of the hot budget cannot
+            // retain even ONE landed block, so hot-landing speculation
+            // is guaranteed evicted-before-consume (the §5.5 no-floor
+            // rationale). THE READ LANE (2026-08-01 campaign) engages
+            // exactly here — the field's 0.49×-of-raw plateau regime
+            // (`.benchmarks/2026-07-31-fio-gap-accounting.md` §6.2):
+            // pipelined whole-block fetches landing in the
+            // ledger-invisible hold instead of the hot tier, so the
+            // stream's next blocks are in flight while the current one
+            // serves. Depth derives at runtime (BDP); the governor's
+            // scan-resistance verdict stands untouched.
+            self.read_lane_top_up(
+                file_path, meta, block_size, end_block, &lanes, lane_idx, generation, active,
+                mem_level,
+            );
             return;
         }
 
@@ -4564,6 +4642,273 @@ impl DataRouter {
                 }
             }
         })
+    }
+
+    /// The hold's live insert-time byte budget (read-lane campaign):
+    /// the R5 share, floored at 4 blocks — see
+    /// [`crate::read_lane::hold_budget_bytes`].
+    pub(crate) fn read_lane_hold_budget(&self) -> u64 {
+        crate::read_lane::hold_budget_bytes(
+            crate::read_lane::effective_mem_budget(),
+            self.block_size.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The read-lane issue path (2026-08-01 campaign — the §5.5
+    /// zero-resident-share regime's pipeline): top the lane up to the
+    /// BDP-derived per-stream depth with whole-block fetches through
+    /// [`Self::lane_fetch_block`] — single-flight-deduped with the
+    /// foreground, landing in the ledger-invisible hold, never a tier.
+    /// Shares the R2 plan cursor (`next_prefetch_block`/`issued_base` —
+    /// rebase-past-the-reader semantics verbatim) and the
+    /// progress-clocked quiescence arm; carries its OWN in-flight
+    /// bound (`rl_inflight`) and the aggregate R5 cap.
+    #[allow(clippy::too_many_arguments)]
+    fn read_lane_top_up(
+        &self,
+        file_path: &str,
+        meta: &CachedMetadata,
+        block_size: u64,
+        end_block: u32,
+        lanes: &std::sync::Arc<StreamLanes>,
+        lane_idx: usize,
+        generation: u64,
+        active_streams: u64,
+        mem_level: crate::mem_budget::Level,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // The R1b size boundary, mirrored: ≤ 256 KiB blocks keep
+        // today's behavior verbatim (they have a RAM tier already and
+        // their share never truncates to 0 on real budgets).
+        if !self.read_lane.enabled()
+            || block_size <= crate::read_lane::READ_LANE_MIN_FILL_BYTES as u64
+        {
+            return;
+        }
+        let budget_cap =
+            crate::read_lane::effective_mem_budget() / crate::read_lane::READ_LANE_BUDGET_DIVISOR;
+        let depth = self.read_lane.depth_blocks(
+            block_size,
+            active_streams.min(u64::from(u32::MAX)) as u32,
+            mem_level == crate::mem_budget::Level::Red,
+            budget_cap,
+        );
+        METRICS
+            .read_lane_depth_target
+            .store(u64::from(depth), Relaxed);
+        if depth == 0 {
+            return;
+        }
+        let lane = &lanes.lanes[lane_idx];
+        // (Re)base the plan when it is uninitialized or fell behind the
+        // reader (the R2 rule verbatim: the skipped span was never
+        // issued, so it empties with the base).
+        if lane.next_prefetch_block.load(Relaxed) <= end_block {
+            lane.next_prefetch_block.store(end_block + 1, Relaxed);
+            lane.issued_base.store(end_block + 1, Relaxed);
+        }
+        // Progress-clocked quiescence (§5.5): sustained starvation —
+        // here, hold trims racing the consumer — pauses issue instead
+        // of re-feeding the evict cycle.
+        if lane.consumed_edge.load(Relaxed) < lane.suppress_until_edge.load(Relaxed) {
+            return;
+        }
+        let total_blocks = meta.size.div_ceil(block_size) as u32;
+        loop {
+            let in_flight = lane.rl_inflight.load(Relaxed);
+            if !crate::read_lane::lane_issue_admits(
+                in_flight,
+                depth,
+                self.read_lane.inflight_bytes(),
+                block_size,
+                budget_cap,
+            ) {
+                break;
+            }
+            let next = lane.next_prefetch_block.load(Relaxed);
+            if next >= total_blocks {
+                break;
+            }
+            if lane
+                .next_prefetch_block
+                .compare_exchange(next, next + 1, Relaxed, Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            lane.rl_inflight.fetch_add(1, Relaxed);
+            self.read_lane.add_inflight(block_size);
+            if !self.spawn_read_lane_task(
+                file_path.to_string(),
+                meta.clone(),
+                next,
+                block_size,
+                lanes.clone(),
+                lane_idx,
+                generation,
+            ) {
+                // Admission shed the task un-run (foreground always
+                // wins): roll the issue accounting back HERE — the
+                // task's settle path never executes.
+                lane.rl_inflight.fetch_sub(1, Relaxed);
+                self.read_lane.sub_inflight(block_size);
+                METRICS.read_lane_wasted.fetch_add(1, Relaxed);
+                break;
+            }
+        }
+    }
+
+    /// One read-lane fetch task: resolve the block's key, skip if the
+    /// fill is already resident anywhere (hold/hot/LRU/tier/flight),
+    /// else run the ledger-invisible fetch. Same admission
+    /// (`spawn_bg`), generation fencing, and shed-rollback contract as
+    /// [`Self::spawn_prefetch_task`]. Returns `spawn_bg`'s verdict:
+    /// `false` = shed un-run, the CALLER rolls back.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_read_lane_task(
+        &self,
+        file_path: String,
+        meta: CachedMetadata,
+        block: u32,
+        block_size: u64,
+        lanes: std::sync::Arc<StreamLanes>,
+        lane_idx: usize,
+        generation: u64,
+    ) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let router = self.clone();
+        crate::bg_admit::spawn_bg(async move {
+            let lane = &lanes.lanes[lane_idx];
+            let settle = |completed: bool| {
+                lane.rl_inflight.fetch_sub(1, Relaxed);
+                router.read_lane.sub_inflight(block_size);
+                if !completed || lane.generation.load(Relaxed) != generation {
+                    METRICS.read_lane_wasted.fetch_add(1, Relaxed);
+                }
+            };
+            if lane.generation.load(Relaxed) != generation {
+                settle(false);
+                return;
+            }
+            let key = match router
+                .load_striped_block_keys(&file_path, &meta, block, block)
+                .await
+            {
+                Ok(mut keys) => match keys.pop().and_then(|(_, k)| k) {
+                    Some(k) => k,
+                    None => {
+                        // Hole in the current map: nothing to fetch.
+                        settle(true);
+                        return;
+                    }
+                },
+                Err(err) => {
+                    debug!("read-lane: failed to resolve block key: {err:?}");
+                    settle(false);
+                    return;
+                }
+            };
+            // Already resident or in flight: the reader will find it.
+            if router.cache.read_lane_hold.contains(&key)
+                || router.cache.hot_block.get_no_promote(&key).is_some()
+                || router.cache.read_lru.get_no_promote(&key).is_some()
+                || router.cache.nvme.has_cached_read_block(&key)
+                || router
+                    .inflight_block_reads
+                    .read_sync(&key, |_, _| ())
+                    .is_some()
+            {
+                settle(true);
+                return;
+            }
+            match router.lane_fetch_block(&key).await {
+                Ok(()) => settle(true),
+                Err(err) => {
+                    debug!("read-lane: failed to fetch block {key}: {err:?}");
+                    settle(false);
+                }
+            }
+        })
+    }
+
+    /// The LEDGER-INVISIBLE whole-block fetch (read-lane campaign): a
+    /// single-flight-registered device fetch that deposits its
+    /// validated fill in the hold and hands the cohort its
+    /// `FillResult` — and does NOTHING else. No ghost recording, no
+    /// admission governor arbitration or ledger movement, no hot/LRU/
+    /// NVMe-tier publication: the 2026-07-26 scan-resistance verdict
+    /// stands, the lane adds fetch concurrency, never tier residency.
+    ///
+    /// Correctness is the validated-fill discipline verbatim:
+    /// incarnation snapshot before the device read, deposit only while
+    /// stable, still-check after, unified purge on movement (the hold
+    /// is a `purge_block_key` arm). Waiters receive the same
+    /// serve-validity verdict as every primary; block-serving callers
+    /// recheck the binding downstream.
+    async fn lane_fetch_block(&self, block_key: &str) -> Result<()> {
+        // §5.6a quarantined mapping: same loud-refusal contract as the
+        // cached fetch path.
+        if is_damaged_mapping(block_key) {
+            return Err(SqueezefsError::Io(std::io::Error::from_raw_os_error(
+                libc::EIO,
+            )));
+        }
+        let (tx, _rx) = tokio::sync::broadcast::channel(4);
+        if self
+            .inflight_block_reads
+            .insert_sync(block_key.to_string(), tx.clone())
+            .is_err()
+        {
+            // Another fetcher owns the flight — the reader dedupes onto
+            // it; nothing for the lane to do.
+            return Ok(());
+        }
+        METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
+        let guard = InflightBlockReadGuard {
+            key: block_key.to_string(),
+            inflight_block_reads: self.inflight_block_reads.clone(),
+            tx,
+            completed: std::cell::Cell::new(false),
+        };
+        let incarnation = self.backend_router.fill_incarnation(block_key);
+        let started = std::time::Instant::now();
+        let downloaded = self.fetch_block_from_remote(block_key).await?;
+        // Guard drop broadcasts None on the error path above (waiters
+        // fail fast into the re-check loop — the §5.2 contract).
+        let dur_ns = started.elapsed().as_nanos() as u64;
+        let mut serve_valid = !self.backend_router.key_incarnation_tracked(block_key);
+        if let Some(before) =
+            incarnation.filter(|&b| self.backend_router.fill_incarnation_still(block_key, b))
+        {
+            // Deposit inside the publishable window; Red pauses new
+            // deposits (the R5 posture — in-flight/hold converge).
+            if crate::mem_budget::level() != crate::mem_budget::Level::Red {
+                self.cache.read_lane_hold.insert(
+                    block_key,
+                    downloaded.clone(),
+                    self.read_lane_hold_budget(),
+                );
+            }
+            // Publish-then-revalidate (the seqlock completion rule):
+            // movement purges the deposit — never sticky.
+            serve_valid = self
+                .backend_router
+                .fill_incarnation_still(block_key, before);
+            if !serve_valid {
+                self.cache.purge_block_key(block_key);
+            }
+        }
+        self.read_lane.record_fetch(downloaded.len() as u64, dur_ns);
+        METRICS.read_lane_fetches.fetch_add(1, Ordering::Relaxed);
+        METRICS
+            .read_lane_fetch_bytes
+            .fetch_add(downloaded.len() as u64, Ordering::Relaxed);
+        let _ = guard.tx.send(Some(FillResult {
+            bytes: downloaded,
+            serve_valid,
+        }));
+        guard.completed.set(true);
+        Ok(())
     }
 
     /// The CURRENT block-index→key binding of `(file_path, b)`, as fresh as
@@ -7948,6 +8293,15 @@ impl DataRouter {
                                                 .read_odirect_tier_serves
                                                 .fetch_add(1, Ordering::Relaxed);
                                         }
+                                        // Read-lane coverage credit: this
+                                        // consumption path retires the
+                                        // hold's copy too (no-op when the
+                                        // key is not held).
+                                        if self.read_lane.enabled() {
+                                            self.cache
+                                                .read_lane_hold
+                                                .credit(b_key, (end - start) as u64);
+                                        }
                                         return Ok((data, None));
                                     }
                                     METRICS
@@ -7957,6 +8311,78 @@ impl DataRouter {
                                         "stale-binding rebind (hot-tier hit): file={} block={} key={}",
                                         file_path, start_block, b_key
                                     );
+                                }
+                            }
+                            // Read-lane hold fast path (2026-08-01): the
+                            // deep-qd cohort stability serve — a completed
+                            // fill evicted from hot probation before its
+                            // stragglers arrived is still here until its
+                            // coverage completes. SAME proof obligation as
+                            // the hot/tier hits: hold entries carry
+                            // current-incarnation bytes (validated
+                            // deposits + unified purge), binding currency
+                            // validates the serve; coverage is credited
+                            // only on a proven serve. Probed strictly
+                            // AFTER the hot tier so warm hot entries keep
+                            // funding the governor's payback basis.
+                            if self.read_lane.enabled() {
+                                if let Some(b_key) = b_key_opt.as_ref().filter(|_| !device_true) {
+                                    if let Some(held) = self.cache.read_lane_hold.serve(b_key, 0) {
+                                        let start = std::cmp::min(slice_start as usize, held.len());
+                                        let end = std::cmp::min(
+                                            (slice_start + slice_len as u64) as usize,
+                                            held.len(),
+                                        );
+                                        let data = if let Some(dest) = dest_addr {
+                                            let len = end - start;
+                                            let dest_ptr = dest as *mut u8;
+                                            unsafe {
+                                                std::ptr::copy_nonoverlapping(
+                                                    held[start..end].as_ptr(),
+                                                    dest_ptr,
+                                                    len,
+                                                );
+                                            }
+                                            bytes::Bytes::from_owner(
+                                                crate::cache::pool::UringBufOwner {
+                                                    ptr: dest_ptr,
+                                                    len,
+                                                },
+                                            )
+                                        } else {
+                                            held.slice(start..end)
+                                        };
+                                        if self
+                                            .current_block_binding(file_path, start_block)
+                                            .await?
+                                            .as_deref()
+                                            == Some(b_key.as_str())
+                                        {
+                                            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                                            METRICS
+                                                .read_lane_serves
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            METRICS
+                                                .read_lane_serve_bytes
+                                                .fetch_add((end - start) as u64, Ordering::Relaxed);
+                                            if hint.odirect {
+                                                METRICS
+                                                    .read_odirect_tier_serves
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            self.cache
+                                                .read_lane_hold
+                                                .credit(b_key, (end - start) as u64);
+                                            return Ok((data, None));
+                                        }
+                                        METRICS
+                                            .stale_binding_rebinds
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        debug!(
+                                            "stale-binding rebind (read-lane hold hit): file={} block={} key={}",
+                                            file_path, start_block, b_key
+                                        );
+                                    }
                                 }
                             }
                             // Tier fast path with binding recheck (reused-key
@@ -8007,6 +8433,11 @@ impl DataRouter {
                                             METRICS
                                                 .read_odirect_tier_serves
                                                 .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        // Read-lane coverage credit (see
+                                        // the hot fast path).
+                                        if self.read_lane.enabled() {
+                                            self.cache.read_lane_hold.credit(b_key, len as u64);
                                         }
                                         return Ok((data, None));
                                     }
@@ -8335,6 +8766,22 @@ impl DataRouter {
 
                             match downloaded {
                                 Some(downloaded) => {
+                                    // Read-lane coverage credit
+                                    // (2026-08-01): the primary's own
+                                    // slice is consumption too — without
+                                    // it a streamed block would sit one
+                                    // sub-read short of retirement
+                                    // forever (no-op when not held).
+                                    if !device_true && self.read_lane.enabled() {
+                                        if let Some(bk) = b_key_opt.as_deref() {
+                                            let served = std::cmp::min(
+                                                slice_len as u64,
+                                                (downloaded.len() as u64)
+                                                    .saturating_sub(slice_start),
+                                            );
+                                            self.cache.read_lane_hold.credit(bk, served);
+                                        }
+                                    }
                                     if let Some(dest) = dest_addr {
                                         let len = (end_offset - offset) as usize;
                                         let data = bytes::Bytes::from_owner(

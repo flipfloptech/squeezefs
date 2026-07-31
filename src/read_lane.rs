@@ -158,6 +158,21 @@ pub fn hold_budget_bytes(mem_budget_bytes: u64, block_size: u64) -> u64 {
     (mem_budget_bytes / READ_LANE_BUDGET_DIVISOR).max(4 * block_size.max(1))
 }
 
+/// The R5 budget the lane derives from: the live authority when the
+/// sampler has resolved it, else a memoized one-shot resolution (the
+/// same flag→env→cgroup→RAM order) — daemonless contexts (tests,
+/// offline tools) must not read a zero budget and refuse to speculate
+/// forever.
+pub fn effective_mem_budget() -> u64 {
+    let live = crate::mem_budget::MEM_BUDGET.budget_bytes();
+    if live != 0 {
+        return live;
+    }
+    static FALLBACK: once_cell::sync::Lazy<u64> =
+        once_cell::sync::Lazy::new(|| crate::mem_budget::MEM_BUDGET.resolve_budget_now());
+    *FALLBACK
+}
+
 struct HoldEntry {
     bytes: Bytes,
     /// Consumed-byte credit (serves + primary-slice credits). Crossing

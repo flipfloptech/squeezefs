@@ -2315,22 +2315,21 @@ pub struct Metrics {
     pub prefetch_foreground_waits: Align64<AtomicU64>,
     pub prefetch_evicted_unconsumed: Align64<AtomicU64>,
     pub prefetch_active_streams: Align64<AtomicU64>,
-    /// The cold-stream read lane (2026-08-01 campaign,
-    /// `src/read_lane.rs`; docs/design-read-path.md §Observability):
-    /// `fetches`/`fetch_bytes` = lane-issued whole-block device fetches
-    /// (THE engagement instrument on governed cold streams — ≈ 0 on the
-    /// EXA shape means the lane regressed to the serial-RTT plateau);
-    /// `holds` = ledger-invisible deposits (lane fills + demand
-    /// primaries); `serves`/`serve_bytes` = foreground reads served
-    /// from the hold (the cohort-stability instrument — a qd32 row with
-    /// read_amp > 1.05 and serves ≈ 0 means the hold regressed);
-    /// `hold_retired` = coverage retirements (memory converges by
-    /// consumption); `hold_evicted_unconsumed` = budget evictions of
-    /// never-fully-consumed entries (the lane's refetch-spiral
-    /// detector — sustained growth means the hold budget cannot carry
-    /// the stream population); `wasted` = shed/stale-generation lane
-    /// tasks; `depth_target` = the live derived per-stream depth gauge
-    /// (0 under Red or the kill lever).
+    /// The read-lane campaign (2026-08-01, `src/read_lane.rs`;
+    /// docs/design-read-path.md §Observability): `holds` =
+    /// ledger-invisible deposits (demand primaries + pinned-lane
+    /// fills); `serves`/`serve_bytes` = foreground reads served from
+    /// the hold — **the cohort-stability instrument** (a deep-qd row
+    /// with read_amp ≫ 1.1 and serves ≈ 0 on an armed mount means the
+    /// hold regressed); `hold_retired` = coverage retirements (memory
+    /// converges by consumption); `hold_evicted_unconsumed` = budget
+    /// evictions of never-fully-consumed entries (the refetch-spiral
+    /// detector); `fetches`/`fetch_bytes`/`depth_target`/`wasted` =
+    /// the AHEAD lane, which is **opt-in**
+    /// (`SQUEEZEFS_READ_LANE_DEPTH=N`; default 0 — the campaign's
+    /// counted brackets falsified ahead speculation on
+    /// demand-concurrent venues): 0 on default mounts BY DESIGN, the
+    /// engagement instrument on pinned mounts.
     pub read_lane_fetches: Align64<AtomicU64>,
     pub read_lane_fetch_bytes: Align64<AtomicU64>,
     pub read_lane_holds: Align64<AtomicU64>,

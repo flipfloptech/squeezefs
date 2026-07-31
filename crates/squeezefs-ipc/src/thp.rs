@@ -68,6 +68,70 @@ pub struct ThpOutcome {
 /// for the constant against older libc pins (value stable in the UAPI).
 const MADV_COLLAPSE: libc::c_int = 25;
 
+/// PMD size on the supported fleets (x86_64 huge page).
+const PMD_SIZE: usize = 2 * 1024 * 1024;
+
+/// `mmap` a shared RW mapping of `fd` (offset 0, `len` bytes) whose base
+/// is **PMD-aligned** — the precondition for huge shmem folios to map
+/// through PMDs (a huge folio only maps huge when
+/// `vaddr ≡ file_offset (mod 2 MiB)`; the census rig's first smoke
+/// caught `collapse_ok=true` with `ShmemPmdMapped=0` on an unaligned
+/// default-placement base). Implementation: over-reserve `len + 2 MiB`
+/// of `PROT_NONE` address space, then `MAP_FIXED` the real mapping at
+/// the aligned offset and trim the slack — never racy (the reservation
+/// owns the range).
+///
+/// Returns `None` on any mmap failure (caller falls back to a plain
+/// `mmap` — alignment is an optimization, not a correctness need).
+pub fn map_shared_pmd_aligned(fd: std::os::raw::c_int, len: usize) -> Option<*mut u8> {
+    let span = len.checked_add(PMD_SIZE)?;
+    // SAFETY: fresh anonymous PROT_NONE reservation.
+    let reserve = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            span,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if reserve == libc::MAP_FAILED {
+        return None;
+    }
+    let addr = reserve as usize;
+    let aligned = (addr + PMD_SIZE - 1) & !(PMD_SIZE - 1);
+    let head = aligned - addr;
+    let tail = span - head - len;
+    // SAFETY: MAP_FIXED inside our own reservation; the fd mapping
+    // replaces the PROT_NONE pages atomically.
+    let base = unsafe {
+        libc::mmap(
+            aligned as *mut libc::c_void,
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_FIXED,
+            fd,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        // SAFETY: unmapping our own reservation.
+        unsafe { libc::munmap(reserve, span) };
+        return None;
+    }
+    // SAFETY: trimming the slack of our own reservation.
+    unsafe {
+        if head > 0 {
+            libc::munmap(reserve, head);
+        }
+        if tail > 0 {
+            libc::munmap((aligned + len) as *mut libc::c_void, tail);
+        }
+    }
+    Some(base as *mut u8)
+}
+
 /// Advise/populate/collapse huge pages over `[base, base + len)`.
 /// Never fails: every refusal degrades to a `false` in the outcome.
 /// `base` must be page-aligned (an mmap result); `len` need not be —

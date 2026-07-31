@@ -110,18 +110,17 @@ fn shmem_populate_collapse_reports_and_shows_pmd_backing_when_granted() {
     assert!(fd >= 0);
     // SAFETY: our own fresh fd.
     assert_eq!(unsafe { libc::ftruncate(fd, len as libc::off_t) }, 0);
-    // SAFETY: full-length shared mapping of the memfd.
-    let base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            fd,
-            0,
-        )
-    };
-    assert_ne!(base, libc::MAP_FAILED);
+    // The PMD-alignment law (found by the census rig's first smoke:
+    // collapse_ok=true with ShmemPmdMapped=0): huge folios in the page
+    // cache only map through PMDs when the vma base is 2 MiB-aligned
+    // (vaddr ≡ file offset mod 2 MiB) — so the session-mapping helper
+    // must hand back an aligned base, both sides.
+    let base = thp::map_shared_pmd_aligned(fd, len).expect("aligned shared mapping");
+    assert_eq!(
+        base as usize % (2 * 1024 * 1024),
+        0,
+        "session mappings must be PMD-aligned or the collapse buys nothing"
+    );
 
     let outcome = thp::advise_hugepages(base as *mut u8, len, thp::ThpMode::PopulateCollapse);
     let entry = smaps_entry_for(base as usize);
@@ -140,14 +139,14 @@ fn shmem_populate_collapse_reports_and_shows_pmd_backing_when_granted() {
         // Kernel refused (old kernel / no THP shmem support) — the
         // outcome must say so honestly; the mapping stays fully usable.
         // SAFETY: in-bounds write to the live mapping.
-        unsafe { *(base as *mut u8) = 0xA5 };
+        unsafe { *base = 0xA5 };
         // SAFETY: in-bounds read of the byte just written.
         assert_eq!(unsafe { *(base as *const u8) }, 0xA5);
         eprintln!("note: kernel refused shmem collapse here (posture-dependent); outcome honest");
     }
     // SAFETY: mapped/opened above.
     unsafe {
-        libc::munmap(base, len);
+        libc::munmap(base as *mut libc::c_void, len);
         libc::close(fd);
     }
 }

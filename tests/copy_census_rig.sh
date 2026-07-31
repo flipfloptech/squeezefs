@@ -65,8 +65,8 @@ fail() { echo "FAIL: $*"; exit 1; }
 META_DEVS=(); DATA_DEVS=()
 for c in /sys/class/nvme/nvme*; do
     nqn=$(cat "$c/subsysnqn" 2>/dev/null) || continue
-    ns=$(ls -d "$c"/nvme*n1 2>/dev/null | head -1) || continue
-    dev="/dev/$(basename "$ns")"
+    dev="/dev/$(basename "$c")n1"
+    [ -b "$dev" ] || continue
     case "$nqn" in
         *devsubtcp*-mds*) META_DEVS+=("$dev") ;;
         *devsubtcp*-oss*) DATA_DEVS+=("$dev") ;;

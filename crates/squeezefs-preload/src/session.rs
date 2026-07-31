@@ -412,21 +412,33 @@ impl Session {
         let memfd_guard = FdGuard(memfd);
         let layout = SessionLayout::compute(&geometry).map_err(|_| SessionError::Protocol)?;
 
-        // SAFETY: shared mapping of the sealed memfd, full layout length.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                layout.total_bytes as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                memfd,
-                0,
-            )
+        // Shared mapping of the sealed memfd, full layout length —
+        // PMD-aligned when possible (near-zero-copy 2026-07-31: the
+        // daemon's admission-time collapse makes the memfd's page-cache
+        // pages huge; this mapping only maps them through PMDs when its
+        // base is 2 MiB-aligned). Plain mmap fallback on any refusal.
+        let base = match crate::thp::map_shared_pmd_aligned(memfd, layout.total_bytes as usize) {
+            Some(p) => p as *mut libc::c_void,
+            None => {
+                // SAFETY: shared mapping of the sealed memfd, full layout
+                // length.
+                let p = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        layout.total_bytes as usize,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED,
+                        memfd,
+                        0,
+                    )
+                };
+                if p == libc::MAP_FAILED {
+                    // SAFETY: errno read directly after the failing call.
+                    return Err(SessionError::Map(unsafe { *libc::__errno_location() }));
+                }
+                p
+            }
         };
-        if base == libc::MAP_FAILED {
-            // SAFETY: errno read directly after the failing call.
-            return Err(SessionError::Map(unsafe { *libc::__errno_location() }));
-        }
         // Session-arena THP (near-zero-copy 2026-07-31), shim posture:
         // advise-only — the daemon's admission-time populate+collapse
         // made the memfd's page-cache pages PMD-sized where granted;

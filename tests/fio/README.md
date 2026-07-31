@@ -75,10 +75,14 @@ AGENTS.md:
    include a ≥ 60 s sustained row (`--runtime 60` or more, throughput
    flat across the window).
 
-Write rows additionally carry the standing amplification columns
-(device bytes ÷ user bytes from `/proc/diskstats` deltas on the data
-namespace, `wareq-sz` vs block size, `block_free_*`) — see
-`tests/write_amp_rig.sh` for the packaged instrument.
+Write rows additionally carry the standing amplification columns:
+`--data-devs nvme4n1:nvme6n1:..` makes the runner diff
+`/proc/diskstats` across the row and print `write_amp`/`read_amp`
+(device bytes ÷ user bytes). Caveat: with `ramp_time > 0` the fio JSON
+excludes ramp I/O while diskstats includes it, so the printed ratio
+overestimates by roughly `(runtime+ramp)/runtime` — use `--ramp 0` when
+the amp column is the row's verdict, or quote `tests/write_amp_rig.sh`
+(the packaged instrument, incl. `wareq-sz` and `block_free_*`).
 
 ## How `.benchmarks` notes cite rows
 

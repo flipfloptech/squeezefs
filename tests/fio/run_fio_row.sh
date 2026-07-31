@@ -45,6 +45,7 @@ usage: run_fio_row.sh --job <file.job> (--dir <dir> | --devices <d1:d2:..>)
        [--mount <mountpoint>] [--shim <libsqueezefs_il.so>]
        [--njobs N] [--bs 1M] [--iodepth 8] [--size 1g]
        [--runtime 30] [--ramp 10] [--engine libaio]
+       [--data-devs <nvme4n1:nvme6n1:..>]   # diskstats amp columns
        [--label S] [--substrate S] [--fill S] [--order S]
        [--results DIR] [--journal FILE] [--no-numa] [--emit-only]
        [--i-know-this-destroys-data]
@@ -54,7 +55,7 @@ EOF
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-JOB="" DIR="" DEVICES="" MOUNT="" SHIM=""
+JOB="" DIR="" DEVICES="" MOUNT="" SHIM="" DATA_DEVS=""
 NJOBS="" BS="1M" IODEPTH="8" SIZE="1g" RUNTIME="30" RAMP="10"
 ENGINE="libaio" LABEL="row" SUBSTRATE="unlabeled" FILL="unlabeled"
 ORDER="unlabeled" RESULTS="" JOURNAL="" NO_NUMA=0 DESTROY_OK=0 EMIT_ONLY=0
@@ -66,6 +67,7 @@ while [ $# -gt 0 ]; do
         --devices) DEVICES="$2"; shift 2 ;;
         --mount) MOUNT="$2"; shift 2 ;;
         --shim) SHIM="$2"; shift 2 ;;
+        --data-devs) DATA_DEVS="$2"; shift 2 ;;
         --njobs) NJOBS="$2"; shift 2 ;;
         --bs) BS="$2"; shift 2 ;;
         --iodepth) IODEPTH="$2"; shift 2 ;;
@@ -205,6 +207,16 @@ snap_stats() { # <outfile>
 }
 if [ -n "$MOUNT" ]; then snap_stats "$RESULTS/${LABEL}.stats_before.json"; fi
 
+# /proc/diskstats snapshot for the standing amplification columns:
+# per --data-devs device, sectors-read ($6) and sectors-written ($10).
+snap_disk() { # <outfile>
+    if [ -n "$DATA_DEVS" ]; then
+        awk -v devs="$DATA_DEVS" 'BEGIN{n=split(devs,a,":");for(i=1;i<=n;i++)want[a[i]]=1}
+             $3 in want {print $3, $6, $10}' /proc/diskstats > "$1"
+    fi
+}
+snap_disk "$RESULTS/${LABEL}.disk_before.txt"
+
 journal() {
     [ -n "$JOURNAL" ] || return 0
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) fio-row: $*" >> "$JOURNAL" 2>/dev/null || true
@@ -248,6 +260,36 @@ keys = ["ipc_ops_read", "ipc_ops_write", "ipc_bytes_in", "ipc_bytes_out",
         "block_free_reclaim_cap_parks", "prefetch_issued", "ranged_reads"]
 print("  stats: " + " ".join(f"{k}={delta[k]}" for k in keys if delta.get(k)))
 EOF
+fi
+
+# ---- amplification columns (device bytes vs user bytes) -------------------
+AMP_LINE=""
+if [ -n "$DATA_DEVS" ]; then
+    snap_disk "$RESULTS/${LABEL}.disk_after.txt"
+    AMP_LINE="$(python3 - "$RESULTS/${LABEL}.disk_before.txt" \
+        "$RESULTS/${LABEL}.disk_after.txt" "$OUT" <<'EOF'
+import json, sys
+def read(p):
+    d = {}
+    for line in open(p):
+        f = line.split()
+        if len(f) == 3:
+            d[f[0]] = (int(f[1]), int(f[2]))
+    return d
+b, a = read(sys.argv[1]), read(sys.argv[2])
+dr = sum((a[k][0] - b.get(k, (0, 0))[0]) * 512 for k in a)
+dw = sum((a[k][1] - b.get(k, (0, 0))[1]) * 512 for k in a)
+fio = json.load(open(sys.argv[3]))
+ur = sum(j.get("read", {}).get("io_bytes", 0) for j in fio.get("jobs", []))
+uw = sum(j.get("write", {}).get("io_bytes", 0) for j in fio.get("jobs", []))
+parts = []
+if uw:
+    parts.append(f"write_amp {dw/uw:.3f} (dev {dw/1e9:.2f} GB / user {uw/1e9:.2f} GB)")
+if ur:
+    parts.append(f"read_amp {dr/ur:.3f} (dev {dr/1e9:.2f} GB / user {ur/1e9:.2f} GB)")
+print("; ".join(parts) if parts else "no user bytes")
+EOF
+)"
 fi
 
 # ---- summarize + engagement verdict ---------------------------------------
@@ -316,7 +358,8 @@ json.dump({
     "dir": "$DIR", "devices": "$DEVICES", "shim": "$SHIM",
     "path_kind": "$PATHKIND",
     "substrate": "$SUBSTRATE", "fill": "$FILL", "order": "$ORDER",
-    "engagement": "$ENGAGE", "row": "$ROWLINE",
+    "engagement": "$ENGAGE", "amplification": "$AMP_LINE",
+    "row": "$ROWLINE",
 }, open(sys.argv[1], "w"), indent=1)
 EOF
 
@@ -324,6 +367,7 @@ echo "ROW label=$LABEL | $ROWLINE"
 echo "  shape: $(basename "$JOB") engine=$ENGINE bs=$BS qd=$IODEPTH njobs=$NJOBS_TOTAL (numa_fanout=$USE_NUMA/$NNODES nodes) runtime=${RUNTIME}s ramp=${RAMP}s size=$SIZE"
 echo "  venue: instrument=\"$FIO_VERSION\" substrate=\"$SUBSTRATE\" fill=\"$FILL\" order=\"$ORDER\" path=$PATHKIND"
 echo "  engagement: $ENGAGE"
+[ -n "$AMP_LINE" ] && echo "  amplification: $AMP_LINE"
 echo "  artifacts: $RESULTS"
 journal "DONE label=$LABEL rc=$RC | $ROWLINE | engagement=$ENGAGE"
 exit "$RC"

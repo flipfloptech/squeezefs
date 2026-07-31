@@ -3,6 +3,14 @@
 // recursion limit (128) — compile-time only, no runtime effect.
 #![recursion_limit = "2048"]
 pub mod mem_budget;
+pub mod nt_copy;
+// Session-arena THP helper — canonical file in the squeezefs-ipc tree,
+// `#[path]`-included here and by `squeezefs-preload` (the `wake_core`
+// production-sharing precedent: the ipc LIBRARY stays dependency-free,
+// while both consumers already link libc). Two type identities exist by
+// construction; instances never cross the crate boundary.
+#[path = "../crates/squeezefs-ipc/src/thp.rs"]
+pub mod thp;
 pub mod nvme_dev;
 pub mod tiering;
 

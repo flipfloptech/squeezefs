@@ -3094,6 +3094,14 @@ pub struct Metrics {
     /// ride the pooled sever uncounted (the normal population).
     pub ipc_placed_severs: Align64<AtomicU64>,
     pub ipc_placed_sever_fallbacks: Align64<AtomicU64>,
+    /// Non-temporal DMA-destined copy engagement (near-zero-copy
+    /// campaign, 2026-07-31): bytes moved by the NT-store body at the
+    /// two DMA-destined copy sites — the kernel-path lease→`ActiveBlockBuf`
+    /// merge and the placed-sever arena→assembly copy. The census rig's
+    /// engagement instrument: an NT-lever row is INVALID unless this
+    /// delta accounts for the row's merge/sever bytes. 0 on
+    /// `SQUEEZEFS_NT_COPY=0` mounts and on sub-floor (< 256 KiB) shapes.
+    pub nt_copy_bytes: Align64<AtomicU64>,
     /// Merge-side placed-sever accounting: `placed_adoptions` = overlay
     /// entries born by ADOPTING the ring assembly as their backing;
     /// `placed_merge_elides` = merges whose copy was elided by the
@@ -5056,6 +5064,10 @@ impl SqueezefsFilesystem {
                 "placed_adoptions": METRICS.placed_adoptions.load(Ordering::Relaxed),
                 "placed_merge_elides": METRICS.placed_merge_elides.load(Ordering::Relaxed),
                 "placed_assembly_bytes": METRICS.placed_assembly_bytes.load(Ordering::Relaxed),
+                // Near-zero-copy campaign (2026-07-31): NT-store copy
+                // engagement at the DMA-destined copy sites (merge +
+                // placed sever) — the census rig's engagement instrument.
+                "nt_copy_bytes": METRICS.nt_copy_bytes.load(Ordering::Relaxed),
                 "ipc_sessions_reaped": METRICS.ipc_sessions_reaped.load(Ordering::Relaxed),
                 "ipc_inval_notifies": METRICS.ipc_inval_notifies.load(Ordering::Relaxed),
                 "ipc_inval_suppressed": METRICS.ipc_inval_suppressed.load(Ordering::Relaxed),

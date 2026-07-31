@@ -46,6 +46,7 @@ labeled row:
 | `exa_randread_iops.job` | randread, bs=4k fixed, otherwise same | The EXA random-read IOPS shape (prefill first) |
 | `gap_probe_write.job` | seq write, ALL dims parametrized | The gap-accounting sweep probe: `iodepth {1,4,8,32} × bs {1M,4M} × njobs {8,16,32}` — the dimension that recovers throughput names the bottleneck class (depth ⇒ latency chain; njobs ⇒ per-stream/queue concentration; bs ⇒ per-op overhead) |
 | `gap_probe_read.job` | seq read, ALL dims parametrized | Read-side sibling of the sweep probe |
+| `fresh_write_pass.job` | seq write, ONE pass (not time_based), dims parametrized | Fresh-ingest face (raw-ceiling-comparable); rm + settle before each rep, label pass-bound |
 | `raw_ceiling_write.job` | seq write, bs=4m, qd=16, 8 jobs/device, `filename=` per device | **DESTRUCTIVE** device-sweep raw write ceiling — runner refuses without `--i-know-this-destroys-data`; never against a live volume set |
 | `raw_ceiling_read.job` | seq read, same dims | Device-sweep raw read ceiling (read-only) |
 

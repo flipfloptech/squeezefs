@@ -1,0 +1,22 @@
+# tests/fio/fresh_write_pass.job — ONE sequential write pass over fresh
+# files (volume-bound, NOT time_based): the fresh-ingest face, comparable
+# to a raw-ceiling pass (which is also a fresh pass) and to the rewrite
+# rows the time_based shapes produce (which loop over their files and pay
+# displacement/reclaim).
+#
+# Label these rows "pass-bound" — a size-bound pass shorter than the
+# sustained window is a burst row under the sustained-state rule; pick
+# --size x --njobs so the pass lasts long enough to mean something, and
+# rm the file set + settle before each rep (fill discipline: fresh).
+[global]
+group_reporting=1
+ioengine=${SQZ_FIO_ENGINE}
+readwrite=write
+direct=1
+bs=${SQZ_FIO_BS}
+size=${SQZ_FIO_SIZE}
+iodepth=${SQZ_FIO_IODEPTH}
+norandommap=0
+fallocate=none
+filename_format=sqzfio.$jobnum.$filenum
+directory=${SQZ_FIO_DIR}

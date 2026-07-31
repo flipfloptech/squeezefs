@@ -353,16 +353,102 @@ substrate — in-place just moves it inline into every target write.
 is cheap — real-SSD DSM fleets); CoW + deferred discard + manners +
 park is the right default HERE.
 
+### 6.5 Iteration-2 field verdict (A′-B-B-A′ ×3; A′ = 8ac446d + `INPLACE=0` ≡ the final tip `57959a3` defaults, B = f629b46)
+
+Same hygiene; each leg adds the **dirty-fresh row** (prefill → rm
+128 GiB → fresh IMMEDIATELY, no settle — the verdict-v2 artifact venue
+and the manners acceptance row). Fill 51 % labeled on every non-fresh
+row; artifacts `/scratch/tmp/ww2_verdict2/` + `~/tmp/ww2_verdict2.csv`.
+
+| Row | A′ med | B med | Δ | Reading |
+|---|---|---|---|---|
+| **dirty-fresh** | **6,444** (6965/6436/6444) | 5,431 (5352/7166/5431) | **+18.7 %** | THE manners row: A′ defers the 32 k-block backlog (cmds ≈ 18 k of 22–24 k queued land AFTER the row); B drains concurrently into the foreground |
+| rewrite ×1 | 4,890 (7226/4890/4659) | 5,706 (5706/7048/5136) | −14.3 % | NOT adjudicable: both binaries swing 4.6–7.2 GB/s leg-to-leg (per-bracket +27 %/−31 %/−9 % — mixed) — the aging 51 %-fill store dominates single-pass rows |
+| **sustained 60 s** | 5,036 (5190/5017/5036) | 5,092 (5935/4681/5092) | **−1.1 %** | the converged rewrite verdict: PARITY (overlapping spreads) |
+| read (settled) | 15,478 | 15,655 | −1.1 % | parity — no read regression |
+
+A′ engagement: `cap_parks` 27–2,684/row with `cap_overflow` 0–201
+(bounded, RAM-safe — the park law working as designed; B has no
+counters and no parks, its at-cap arm spills inline). Note the store
+HYSTERESIS across verdicts (B's own sustained fell 7.4 → 5.1 GB/s
+between verdict-1 and verdict-2 sequences at identical binaries/fill):
+single-order cross-sequence comparisons are invalid on this store —
+only within-sequence A-B-B-A rows are cited.
+
+### 6.6 The bar, adjudicated (named structural limits on THIS substrate)
+
+The user's bar — fresh AND rewrite ≥ 15 GB/s sustained, reads ≥ the
+19.8–20.2 floor — is **not reachable client-side on this cluster's
+zram-lz4 targets**, with three independent measurements naming the
+walls:
+
+1. **Fresh ≈ 12.1–12.3 GB/s ceiling** = 4 × ~3.05 GB/s per-device
+   downstream write service (util ~100 %, svctm ~1.1 ms; pinned depth
+   96 vs governed ~50: rate IDENTICAL, dma latency 15 → 32 ms — the
+   textbook saturated-server signature). More/faster data namespaces or
+   target-side write path work is the only move.
+2. **Rewrite ≈ 5–7.6 GB/s** — target-side work is CONSERVED both ways:
+   CoW pays the deallocate stream (target service ~2,700 cmd/s idle /
+   ~1,700 under load at ANY client width — §6.2), in-place pays the
+   ~2× slot-replace write (§6.4). No client-side scheduling can beat a
+   conserved target cost.
+3. **Reads 19.8–20.25** (the orchestrator's floor instrument) — A′ at
+   parity on every read row here (−0.2 % / −1.1 % on this note's
+   instrument); the floor is not regressed.
+
+What the iteration loop DID deliver on this substrate: the dirty-fresh
++18.7 % (manners), the verdict-v2 fresh artifact eliminated (settled
+fresh 12.1–12.3 both binaries), the write-path spill poison
+structurally removed (park-don't-spill), the phase instrument that
+names residence on live mounts, and the opt-in in-place lever for
+substrates whose rewrite economics invert.
+
+### 6.7 Iteration-loop gates (final tip `e423072`)
+
+Iteration commits: `43b1c20` (red contracts) → `d7f31c4` (in-place +
+manners + park) → `eb8301e`/`5014423` (CoW-venue pins) → `8ac446d`
+(doc-link) → `57959a3` (default flip, iteration-2 verdict) → `d7e24a5`
+(fsck C6 in-flight exemption — the manners law legitimately widens the
+begin_free limbo, caught red in-tree) → `e423072` (recovery-fixture
+reclaim rendezvous). Field deploys used the containerized rocky8 build
+(`go-task build:rocky8`, glibc ≤ 2.28 verified, KD-7 pair) under temp
+names on `/scratch/tmp`; the dev binary was restored after every
+bracket; every action journaled in `/scratch/tmp/agent_runs.log`.
+
+- clippy `-D warnings` PASS; fmt PASS (final tip).
+- `cargo test --all-features -- --test-threads=1` **full suite from
+  zero: PASS** (exit 0; counted restart after each fix per the
+  discipline — the two interaction failures the sweep caught red,
+  fsck C6 and the recovery snapshot race, are §6.3's manners law
+  meeting pre-existing settle assumptions, both fixed above).
+- doc: the 4 pre-existing lib warnings only; bench smoke PASS; loom
+  52/52 (no lock-free core changed — the SegQueue pop/`processing`
+  protocol is untouched; manners/park are plain async + atomics).
+- **pjdfstests (final tip, from zero, alone): PASS** (238 files /
+  8,798 tests). **Full LTP (final tip, from zero, alone): PASS**
+  (174/0/0, 9 TCONF).
+
 ## 7. Open questions
 
-* **OQ-1:** the field deploy for conviction-2's table (this branch,
-  orchestrator-owned) — the rig cannot reproduce the field's residence
-  shape (§2).
-* **OQ-2:** rewrite rows on this rig sit ~1.2× below fresh on BOTH
-  binaries (the pre-existing overwrite `fuse_ops` doubling — the
-  async-block-reclaim note's OQ-1); unchanged by this campaign,
-  still the dominant venue-local fw→ow residual.
-* **OQ-3:** `SQUEEZEFS_RECLAIM_LANES_PER_DEV` default 8 is a clamp, not
-  a measurement — if the field's target deallocate cost is higher than
-  ~2 ms/command, raise per-device lanes there and re-measure (the knob
-  is live at mount).
+* ~~OQ-1: field deploy for conviction-2's table~~ — DONE (iteration
+  loop, §6.1): fresh residence is the device leg (dma 15 ms), fully
+  attributed; the phase family is live on production mounts.
+* ~~OQ-3: per-command deallocate cost~~ — MEASURED (§6.1/§6.2): ~12 ms
+  effective at width 32 idle, target-service-bound (~2,700 cmd/s idle /
+  ~1,700 under load at any width); lanes default now 32 (idle-engaged
+  under the manners law).
+* **OQ-2 (standing):** the overwrite `fuse_ops` doubling
+  (async-block-reclaim OQ-1) — unchanged, still a metadata-economy
+  candidate, though on this substrate it is shadowed by the target
+  walls (§6.6).
+* **OQ-4 (new):** the 15 GB/s bar on THIS cluster needs substrate work
+  (§6.6): more/faster data namespaces (fresh scales at ~3.05 GB/s per
+  device) and a cheaper target dealloc/rewrite path. Client-side, the
+  next honest lever is contiguity-aware allocation (raise the field's
+  coalesce factor above 1.05 so the drain's command count collapses) —
+  filed, unpursued (bounded win: dealloc looked per-byte-ish on zram,
+  §6.2 E1's sublinear width scaling).
+* **OQ-5 (new):** `SQUEEZEFS_RECLAIM_CAP_PARK_MS` (default 1000) and
+  the cap (4096 blocks) are liveness bounds, not measurements — if a
+  substrate shows sustained `cap_overflow` growth, derive the cap from
+  drain-rate × acceptable-lag there.

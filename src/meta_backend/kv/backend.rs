@@ -1407,7 +1407,7 @@ impl KvMetaBackend {
     /// registrations) resolve through this.
     pub fn slot0_root_ino(&self) -> Ino {
         match self.membership_stamp() {
-            Some(st) if st.slots_hosted.contains(&0) && st.resolved_native_slot() != Some(0) => {
+            Some(st) if st.slots_hosted.contains(0) && st.resolved_native_slot() != Some(0) => {
                 crate::meta_backend::guest_local_ino(0, 1)
             }
             _ => 1,
@@ -2824,7 +2824,7 @@ impl KvMetaBackend {
         // both roots.
         let mut roots: Vec<Ino> = vec![1];
         if let Some(stamp) = self.membership_stamp() {
-            if stamp.slots_hosted.contains(&0) && stamp.resolved_native_slot() != Some(0) {
+            if stamp.slots_hosted.contains(0) && stamp.resolved_native_slot() != Some(0) {
                 roots.push(crate::meta_backend::guest_local_ino(0, 1));
             }
         }

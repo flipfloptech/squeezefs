@@ -427,20 +427,17 @@ impl ImageBuilder {
             self.cfg.uuid,
             self.cfg.hash_seed,
         )?;
-        if let Some(stamp) = &self.membership_stamp {
-            // PR VL5a: a slot-mapped member carries KV_GUEST_SLOTS. The
-            // §5.5.1a bit-before-first-stamp invariant is subsumed by
-            // format's flip discipline: sector 0 was zeroed above the
-            // stamped ledger write, and the bit-carrying superblock is
-            // stamped LAST behind the barrier — no crash prefix leaves a
-            // stamped volume mountable by ANY binary without the bit.
-            sb.features_incompat |= super::superblock::FEATURE_INCOMPAT_KV_GUEST_SLOTS;
-            if stamp.is_extended() {
-                // PR VL5b: an extended stamp (fresh add-meta member)
-                // additionally carries KV_SLOT_MIGRATION — same flip
-                // discipline subsumes the bit-first ordering.
-                sb.features_incompat |= super::superblock::FEATURE_INCOMPAT_KV_SLOT_MIGRATION;
-            }
+        if self.membership_stamp.is_some() {
+            // Every stamped member carries the stamp bits (2/4) beside
+            // the format-time dynamic-routing bit 6 (the superblock plan
+            // default). The §5.5.1a bit-before-first-stamp invariant is
+            // subsumed by format's flip discipline: sector 0 was zeroed
+            // above the stamped ledger write, and the bit-carrying
+            // superblock is stamped LAST behind the barrier — no crash
+            // prefix leaves a stamped volume mountable by ANY binary
+            // without the bits.
+            sb.features_incompat |= super::superblock::FEATURE_INCOMPAT_KV_GUEST_SLOTS
+                | super::superblock::FEATURE_INCOMPAT_KV_SLOT_MIGRATION;
         }
 
         // §9 quick-format hygiene: zero SB + ledger + ring + bitmap.
@@ -863,7 +860,10 @@ pub async fn format_preflight(
 /// [`format_preflight`] (already-formatted volumes refused without
 /// `force`, live clients refuse even with it), grows regular files to
 /// `volume_len`, optionally full-wipes, then builds an empty (plus
-/// optional config xattr) image via [`ImageBuilder`].
+/// optional config xattr) image via [`ImageBuilder`]. The built image
+/// is a SINGLE-MEMBER dynamic-routing set (synthesized stamp, derived
+/// width — design-dynamic-meta-routing §5.1); multi-member sets format
+/// each member through [`format_v3_stamped`] with one shared plan.
 pub async fn format_v3(
     path: &Path,
     volume_len: u64,
@@ -872,11 +872,11 @@ pub async fn format_v3(
     format_v3_inner(path, volume_len, opts, None).await
 }
 
-/// [`format_v3`] for one member of a `--meta-slots` set (PR VL5a,
-/// design-volume-lifecycle §5.5.1a): the built image carries `stamp` in
-/// its bootstrap ledger record and `KV_GUEST_SLOTS` (bit 2) on its
-/// superblock — the lifecycle-shaped format. Default formats go through
-/// [`format_v3`] and stay legacy byte-identical.
+/// [`format_v3`] for one member of a multi-volume set (PR VL5a,
+/// design-volume-lifecycle §5.5.1a): the built image carries the
+/// caller's `stamp` (one shared [`crate::meta_backend::MetaSlotPlan`]
+/// across the set) in its bootstrap ledger record, plus the stamp bits
+/// on its superblock.
 pub async fn format_v3_stamped(
     path: &Path,
     volume_len: u64,
@@ -910,21 +910,29 @@ async fn format_v3_inner(
         zero_range(path, 0, volume_len).await?;
     }
 
+    // Dynamic meta routing (design-dynamic-meta-routing §5.1): EVERY
+    // format is a stamped set member now — a caller-less single-volume
+    // format synthesizes its own single-member plan (fresh set uuid,
+    // derived width, one stride run), so growth by `volume add-meta` is
+    // open to every filesystem from birth.
+    let stamp = match stamp {
+        Some(st) => st,
+        None => {
+            let mut plan = crate::meta_backend::plan_meta_slot_set(1)?;
+            plan.stamps.remove(0)
+        }
+    };
     let mut builder = ImageBuilder::new(BuilderConfig {
         node_size: opts.node_size,
         journal_len_override: opts.journal_len_override,
-        // PR VL5b: slot-mapped members share ONE set-wide hash seed,
-        // derived from the (random, per-format) set uuid — record keys
-        // must stay byte-identical across hosts or a migrated slot's
-        // seeded dentry/xattr hashes could never resolve on its new
-        // volume. Same §9 secrecy class as the per-volume seed (both
-        // are minted from fresh format-time randomness and both live
-        // plaintext in sector 0). Legacy formats keep their random
-        // per-volume seed verbatim.
-        hash_seed: match &stamp {
-            Some(st) => xxhash_rust::xxh3::xxh3_64(&st.set_uuid),
-            None => rand::random::<u64>(),
-        },
+        // Set members share ONE set-wide hash seed, derived from the
+        // (random, per-format) set uuid — record keys must stay
+        // byte-identical across hosts or a migrated slot's seeded
+        // dentry/xattr hashes could never resolve on its new volume.
+        // Same §9 secrecy class as the per-volume seed (both are minted
+        // from fresh format-time randomness and both live plaintext in
+        // sector 0).
+        hash_seed: xxhash_rust::xxh3::xxh3_64(&stamp.set_uuid),
         ..BuilderConfig::new(opts.node_size)
     })?;
     // Root stamping: the root directory belongs to the INVOKING user
@@ -938,8 +946,6 @@ async fn format_v3_inner(
     if let Some(cfg) = &opts.format_config_xattr {
         builder.set_xattr(ROOT_INO, FORMAT_CONFIG_XATTR, cfg)?;
     }
-    if let Some(stamp) = stamp {
-        builder.set_membership_stamp(stamp);
-    }
+    builder.set_membership_stamp(stamp);
     Ok(builder.build(path, volume_len).await?)
 }

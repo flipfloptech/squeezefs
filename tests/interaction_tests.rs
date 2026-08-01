@@ -102,7 +102,7 @@ fn base_format_config(data_lvs: &[&Path]) -> FormatConfig {
         upload_delay: None,
         fuse_io_uring_sqpoll_idle_ms: None,
         meta_routing_width: None,
-        meta_slot_map: None,
+        meta_slot_runs: None,
         meta_volumes: None,
     }
 }
@@ -129,7 +129,7 @@ async fn format_meta(meta: &Path, data_lvs: &[&Path]) {
 async fn format_stamped_metas(metas: &[PathBuf], width: u32, data_lvs: &[&Path]) {
     let cfg = base_format_config(data_lvs);
     let plan =
-        squeezefs::meta_backend::plan_meta_slot_set(metas.len(), width).expect("plan admits");
+        squeezefs::meta_backend::plan_meta_slot_set_with_width(metas.len(), width).expect("plan admits");
     for (i, m) in metas.iter().enumerate() {
         squeezefs::meta_backend::kv::builder::format_v3_stamped(
             m,

@@ -109,17 +109,19 @@
 //!   alloc_bitmap_generation: u64
 //!   n_roots: u16
 //!   n_roots × { tree_id: u8, node_addr: u64, node_seq: u64 }
-//!   [membership stamp — OPTIONAL suffix, PR VL5a, §5.5.1a]:
+//!   [membership stamp — OPTIONAL suffix; stride-run wire, dynamic meta
+//!    routing (docs/design-dynamic-meta-routing.md §5.2), behind incompat
+//!    bit 6]:
 //!     set_uuid: [u8; 16]
 //!     set_epoch: u64
 //!     member_position: u16
 //!     member_count: u16
 //!     routing_width: u32
-//!     n_slots: u16          (≤ 64 — the ledger-slot space cap)
-//!     n_slots × u16         hosted slot ids
-//!   [VL5b extension — OPTIONAL suffix behind incompat bit 4, §5.5.2]:
-//!     native_slot_plus1: u16   (0 = no legacy-keyspace slot)
-//!     n_cursors: u16           (≤ 64)
+//!     n_runs: u16              (≤ STAMP_MAX_RUNS)
+//!     n_runs × { start: u16, stride: u16, count: u32 }  hosted-slot runs
+//!     native_slot_plus1: u32   (0 = no legacy-keyspace slot; u32 —
+//!                               a u16 plus1 overflows at slot 65535)
+//!     n_cursors: u16           (≤ STAMP_MAX_CURSORS)
 //!     n_cursors × { slot: u16, next_local_ino: u64 }  per-slot cursors
 //! ```
 //!
@@ -127,16 +129,16 @@
 //! slots are written as full zero-padded 4 KiB images so a shorter record
 //! can never leave stale bytes of a longer predecessor parseable.
 //!
-//! Format note (forward-only, design-volume-lifecycle §5.5.1a): the
-//! membership stamp widens the payload PAST the historical
-//! `fixed + n_roots × 17` equation, so a stamp-extended slot fails the
-//! pre-VL5a decoder's length-consistency check and **decodes as
-//! absent** — which is why the superblock incompat bit
-//! [`super::superblock::FEATURE_INCOMPAT_KV_GUEST_SLOTS`] must be
-//! barriered durably BEFORE a volume's first stamped slot (the numbered
-//! bit-before-first-stamp invariant): old binaries then refuse at the
-//! superblock gate before any slot is read, instead of silently falling
-//! back to a stale pre-stamp record.
+//! Format note (forward-only, design-dynamic-meta-routing §5.2): this is
+//! the ONE stamp wire this binary reads or writes. The retired dense
+//! slot-list encodings (VL5a's `n_slots × u16` and the VL5b optional
+//! extension) belonged to frozen-routing-width volumes, which the
+//! superblock gate refuses BEFORE any ledger slot is read (bit 6 —
+//! [`super::superblock::FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING`] — is
+//! presence-required, and every bit-6 format stamps this wire from
+//! birth), so the decoder never meets them. Old binaries refuse bit-6
+//! volumes at their own superblock gates — no crash prefix exists in
+//! which either side silently misparses the other's stamps.
 
 use super::backend::KvMetaBackend;
 use super::tree::SmoContext;
@@ -169,16 +171,26 @@ const PAYLOAD_FIXED_LEN: usize = 8 + 8 + 8 + 8 + 2;
 /// Encoded size of one tree root: `tree_id | node_addr | node_seq`.
 const ROOT_ENC_LEN: usize = 1 + 8 + 8;
 
-/// The §5.5.1a hosted-slot cap per volume: a documented operational
-/// limit (mirrored by `superblock::META_SLOTS_PER_VOLUME_CAP` at format
-/// and re-enforced at migration preflight in VL5b) that exists precisely
-/// so the worst-case ledger record can never overflow its 4096-B slot:
-/// 24 (header) + 34 (fixed prefix) + 197 roots × 17 + the 162-B 64-slot
-/// stamp = 3 569 < 4 096.
-pub const MEMBERSHIP_MAX_HOSTED_SLOTS: usize = 64;
+/// The stamp encoding budget's RUN cap (design-dynamic-meta-routing
+/// §5.3 — what replaced the retired 64-hosted-slot cap): a volume may
+/// host tens of thousands of slots as ONE stride run; what the 4096-B
+/// ledger slot bounds is encoding COMPLEXITY. Worst-case record:
+/// 24 (header) + 34 (fixed prefix) + 5 roots × 17 (85) +
+/// stamp (34 + 128 runs × 8 + 4 + 256 cursors × 10) = 3 765 < 4 096,
+/// with 19 spare roots of headroom. Enforced loud here at encode and by
+/// the migration/add-meta preflights (a refusal names the consolidation
+/// remedy before any copy starts).
+pub const STAMP_MAX_RUNS: usize = 128;
+/// The stamp encoding budget's CURSOR cap (same budget equation):
+/// cursors exist only for ever-minted guest slots — `MINT_SPREAD` (64)
+/// fresh mint cursors consume ¼ of it, leaving ¾ for cursors travelling
+/// in with migrated slots.
+pub const STAMP_MAX_CURSORS: usize = 256;
 /// Fixed stamp prefix: `set_uuid | set_epoch | member_position |
-/// member_count | routing_width | n_slots`.
+/// member_count | routing_width | n_runs`.
 const STAMP_FIXED_LEN: usize = 16 + 8 + 2 + 2 + 4 + 2;
+/// Encoded size of one hosted-slot run: `start | stride | count`.
+const RUN_ENC_LEN: usize = 2 + 2 + 4;
 
 /// The per-volume set-membership stamp (PR VL5a, design-volume-lifecycle
 /// §5.5.1a): rides the root-ledger record payload — the one structure
@@ -192,8 +204,8 @@ const STAMP_FIXED_LEN: usize = 16 + 8 + 2 + 2 + 4 + 2;
 /// `meta_slot_map` / `meta_volumes`) is human-readable only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MembershipStamp {
-    /// The SET identity (minted once per `format --meta-slots`
-    /// invocation; distinct from the per-volume superblock uuid).
+    /// The SET identity (minted once per `squeezefs format` invocation;
+    /// distinct from the per-volume superblock uuid).
     pub set_uuid: [u8; 16],
     /// Membership epoch (§5.5.2b protocol; format mints 1). VL5a refuses
     /// mixed epochs loud — the highest-complete-epoch resolution is
@@ -204,46 +216,33 @@ pub struct MembershipStamp {
     pub member_position: u16,
     /// Members in this epoch's set (mount cross-checks completeness).
     pub member_count: u16,
-    /// The frozen routing width W (KD-7): `route_ino`/`make_global_ino`
-    /// modulo, eternally stable across set changes.
+    /// The DERIVED routing width W (design-dynamic-meta-routing §5.1;
+    /// `crate::meta_backend::DERIVED_ROUTING_WIDTH` at format):
+    /// `route_ino`/`make_global_ino` modulo, eternally stable across set
+    /// changes. Stored — never re-derived at mount — so a future
+    /// derivation change can never re-route an existing set.
     pub routing_width: u32,
-    /// The slots this volume hosts, ≤ [`MEMBERSHIP_MAX_HOSTED_SLOTS`].
-    pub slots_hosted: Vec<u16>,
-    /// PR VL5b (§5.5.2): the slot whose records live in this volume's
-    /// LEGACY (un-namespaced) keyspace — the volume's format-time native
-    /// slot. `None` on VL5a-era stamps (derived as `member_position`)
-    /// and on fresh `add-meta` members (all their slots are guests).
-    /// Encoding this field flips the stamp to the VL5b-extended form,
-    /// which requires incompat **bit 4** on the superblock FIRST
-    /// (bit-before-first-extended-record).
+    /// The slots this volume hosts, as stride runs (≤
+    /// [`STAMP_MAX_RUNS`] of them — the §5.3 encoding budget).
+    pub slots_hosted: super::slot_set::SlotSet,
+    /// The slot whose records live in this volume's LEGACY
+    /// (un-namespaced) keyspace — the volume's format-time native slot.
+    /// `None` on fresh `add-meta` members (all their slots are guests).
     pub native_slot: Option<u16>,
-    /// PR VL5b: per-slot GUEST ino-allocation cursors — `(slot,
-    /// next_local_ino)` for every hosted slot whose keyspace is a guest
-    /// namespace. A migrated slot's cursor travels with the slot, so a
-    /// new host can mint local inos without colliding with migrated
-    /// ones. Empty on VL5a-era stamps and on volumes hosting no guests.
+    /// Per-slot GUEST ino-allocation cursors — `(slot, next_local_ino)`
+    /// for every hosted slot whose guest keyspace has minted (the
+    /// MINT_SPREAD rotation's durable half) or whose cursor travelled in
+    /// with a migrated slot. ≤ [`STAMP_MAX_CURSORS`].
     pub slot_cursors: Vec<(u16, u64)>,
 }
 
 impl MembershipStamp {
-    /// Whether this stamp needs the VL5b-extended encoding (and
-    /// therefore incompat bit 4 on the superblock).
-    pub fn is_extended(&self) -> bool {
-        self.native_slot.is_some() || !self.slot_cursors.is_empty()
-    }
-
-    /// The slot whose records live in this volume's LEGACY keyspace:
-    /// explicit on VL5b-extended stamps; DERIVED as `member_position` on
-    /// VL5a-era stamps (the identity plan gives every founding member
-    /// its own position as the native slot). A fresh `add-meta` member
-    /// (extended, `native_slot = None`) truly has none — every slot it
-    /// hosts is a guest.
+    /// The slot whose records live in this volume's LEGACY keyspace.
+    /// (The pre-dynamic-routing derivation — "unextended stamps default
+    /// to `member_position`" — died with the dense wire; the field is
+    /// always explicit now.)
     pub fn resolved_native_slot(&self) -> Option<u16> {
-        if self.is_extended() {
-            self.native_slot
-        } else {
-            Some(self.member_position)
-        }
+        self.native_slot
     }
 
     /// The travelling cursor recorded for `slot`, if any.
@@ -255,12 +254,11 @@ impl MembershipStamp {
     }
 
     fn encoded_len(&self) -> usize {
-        let base = STAMP_FIXED_LEN + self.slots_hosted.len() * 2;
-        if self.is_extended() {
-            base + 2 + 2 + self.slot_cursors.len() * 10
-        } else {
-            base
-        }
+        STAMP_FIXED_LEN
+            + self.slots_hosted.runs().len() * RUN_ENC_LEN
+            + 4 // native_slot_plus1 (u32)
+            + 2 // n_cursors
+            + self.slot_cursors.len() * 10
     }
 }
 
@@ -331,19 +329,19 @@ impl LedgerRecord {
     /// total-size check stays as defense in depth for the root count.
     pub fn encode_slot(&self) -> Result<Vec<u8>, KvError> {
         if let Some(stamp) = &self.membership_stamp {
-            if stamp.slots_hosted.len() > MEMBERSHIP_MAX_HOSTED_SLOTS {
+            if stamp.slots_hosted.runs().len() > STAMP_MAX_RUNS {
                 return Err(KvError::Corrupt(format!(
-                    "membership stamp hosts {} slots — at most {MEMBERSHIP_MAX_HOSTED_SLOTS} \
-                     slots per volume (the §5.5.1a ledger-slot space cap; 64 is the \
-                     documented operational limit)",
-                    stamp.slots_hosted.len()
+                    "membership stamp needs {} hosted-slot runs — at most {STAMP_MAX_RUNS} \
+                     (the design-dynamic-meta-routing §5.3 encoding budget; consolidate \
+                     the volume's hosted slots via stride-preserving migration)",
+                    stamp.slots_hosted.runs().len()
                 )));
             }
-            if stamp.slot_cursors.len() > MEMBERSHIP_MAX_HOSTED_SLOTS {
+            if stamp.slot_cursors.len() > STAMP_MAX_CURSORS {
                 return Err(KvError::Corrupt(format!(
                     "membership stamp carries {} slot cursors — at most \
-                     {MEMBERSHIP_MAX_HOSTED_SLOTS} (one per hosted slot; the same \
-                     §5.5.1a ledger-slot space cap)",
+                     {STAMP_MAX_CURSORS} (the same §5.3 encoding budget; migrate \
+                     cursor-bearing slots off this volume)",
                     stamp.slot_cursors.len()
                 )));
             }
@@ -395,27 +393,29 @@ impl LedgerRecord {
             pos += 2;
             image[pos..pos + 4].copy_from_slice(&stamp.routing_width.to_le_bytes());
             pos += 4;
-            image[pos..pos + 2].copy_from_slice(&(stamp.slots_hosted.len() as u16).to_le_bytes());
+            let runs = stamp.slots_hosted.runs();
+            image[pos..pos + 2].copy_from_slice(&(runs.len() as u16).to_le_bytes());
             pos += 2;
-            for slot in &stamp.slots_hosted {
+            for run in runs {
+                image[pos..pos + 2].copy_from_slice(&run.start.to_le_bytes());
+                pos += 2;
+                image[pos..pos + 2].copy_from_slice(&run.stride.to_le_bytes());
+                pos += 2;
+                image[pos..pos + 4].copy_from_slice(&run.count.to_le_bytes());
+                pos += 4;
+            }
+            // u32 on the wire: a u16 `plus1` would overflow at slot
+            // 65535, which the derived width makes reachable.
+            let native_plus1 = stamp.native_slot.map_or(0u32, |s| u32::from(s) + 1);
+            image[pos..pos + 4].copy_from_slice(&native_plus1.to_le_bytes());
+            pos += 4;
+            image[pos..pos + 2].copy_from_slice(&(stamp.slot_cursors.len() as u16).to_le_bytes());
+            pos += 2;
+            for (slot, next) in &stamp.slot_cursors {
                 image[pos..pos + 2].copy_from_slice(&slot.to_le_bytes());
                 pos += 2;
-            }
-            if stamp.is_extended() {
-                // VL5b extension (module docs) — encoded ONLY when
-                // needed, so VL5a-shaped stamps stay byte-identical.
-                let native_plus1 = stamp.native_slot.map_or(0u16, |s| s + 1);
-                image[pos..pos + 2].copy_from_slice(&native_plus1.to_le_bytes());
-                pos += 2;
-                image[pos..pos + 2]
-                    .copy_from_slice(&(stamp.slot_cursors.len() as u16).to_le_bytes());
-                pos += 2;
-                for (slot, next) in &stamp.slot_cursors {
-                    image[pos..pos + 2].copy_from_slice(&slot.to_le_bytes());
-                    pos += 2;
-                    image[pos..pos + 8].copy_from_slice(&next.to_le_bytes());
-                    pos += 8;
-                }
+                image[pos..pos + 8].copy_from_slice(&next.to_le_bytes());
+                pos += 8;
             }
         }
         let sum = slot_checksum(&image, payload_len);
@@ -501,71 +501,78 @@ impl LedgerRecord {
             pos += 2;
             let routing_width = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
             pos += 4;
-            let n_slots = usize::from(u16::from_le_bytes(
+            let n_runs = usize::from(u16::from_le_bytes(
                 payload[pos..pos + 2].try_into().unwrap(),
             ));
             pos += 2;
-            if n_slots > MEMBERSHIP_MAX_HOSTED_SLOTS {
+            if n_runs > STAMP_MAX_RUNS {
                 return Err(KvError::Corrupt(format!(
-                    "membership stamp claims {n_slots} hosted slots (cap \
-                     {MEMBERSHIP_MAX_HOSTED_SLOTS})"
+                    "membership stamp claims {n_runs} hosted-slot runs (cap \
+                     {STAMP_MAX_RUNS})"
                 )));
             }
-            if pos + n_slots * 2 > payload_len {
+            if pos + n_runs * RUN_ENC_LEN > payload_len {
                 return Err(KvError::Corrupt(format!(
-                    "membership stamp n_slots {n_slots} inconsistent with payload \
+                    "membership stamp n_runs {n_runs} inconsistent with payload \
                      length {payload_len}"
                 )));
             }
-            let mut slots_hosted = Vec::with_capacity(n_slots);
-            for _ in 0..n_slots {
-                slots_hosted.push(u16::from_le_bytes(
-                    payload[pos..pos + 2].try_into().unwrap(),
-                ));
-                pos += 2;
+            let mut runs = Vec::with_capacity(n_runs);
+            for _ in 0..n_runs {
+                runs.push(super::slot_set::SlotRun {
+                    start: u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()),
+                    stride: u16::from_le_bytes(payload[pos + 2..pos + 4].try_into().unwrap()),
+                    count: u32::from_le_bytes(payload[pos + 4..pos + 8].try_into().unwrap()),
+                });
+                pos += RUN_ENC_LEN;
             }
-            // What follows the hosted slots is either nothing (the VL5a
-            // encoding) or the VL5b extension, whose own length equation
-            // must close the payload exactly (the same forward-only
-            // discipline: an extended stamp decodes-as-absent to VL5a
-            // binaries, which is why incompat bit 4 gates it).
-            let (native_slot, slot_cursors) = if pos == payload_len {
-                (None, Vec::new())
-            } else {
-                if pos + 4 > payload_len {
-                    return Err(KvError::Corrupt(format!(
-                        "membership stamp tail of {} bytes is not a VL5b extension",
-                        payload_len - pos
-                    )));
-                }
-                let native_plus1 = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap());
+            // Validate-before-trust (§9): malformed run geometry —
+            // overlaps, zero counts, namespace escapes — refuses loud
+            // here, never reaches routing.
+            let slots_hosted = super::slot_set::SlotSet::from_runs(runs)?;
+            if pos + 4 + 2 > payload_len {
+                return Err(KvError::Corrupt(format!(
+                    "membership stamp tail of {} bytes truncates the native/cursor \
+                     suffix",
+                    payload_len - pos
+                )));
+            }
+            let native_plus1 = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let n_cursors = usize::from(u16::from_le_bytes(
+                payload[pos..pos + 2].try_into().unwrap(),
+            ));
+            pos += 2;
+            if n_cursors > STAMP_MAX_CURSORS {
+                return Err(KvError::Corrupt(format!(
+                    "membership stamp claims {n_cursors} slot cursors (cap \
+                     {STAMP_MAX_CURSORS})"
+                )));
+            }
+            if pos + n_cursors * 10 != payload_len {
+                return Err(KvError::Corrupt(format!(
+                    "membership stamp n_cursors {n_cursors} inconsistent with payload \
+                     length {payload_len}"
+                )));
+            }
+            let mut cursors = Vec::with_capacity(n_cursors);
+            for _ in 0..n_cursors {
+                let slot = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap());
                 pos += 2;
-                let n_cursors = usize::from(u16::from_le_bytes(
-                    payload[pos..pos + 2].try_into().unwrap(),
-                ));
-                pos += 2;
-                if n_cursors > MEMBERSHIP_MAX_HOSTED_SLOTS {
-                    return Err(KvError::Corrupt(format!(
-                        "membership stamp claims {n_cursors} slot cursors (cap \
-                         {MEMBERSHIP_MAX_HOSTED_SLOTS})"
-                    )));
-                }
-                if pos + n_cursors * 10 != payload_len {
-                    return Err(KvError::Corrupt(format!(
-                        "membership stamp n_cursors {n_cursors} inconsistent with payload \
-                         length {payload_len}"
-                    )));
-                }
-                let mut cursors = Vec::with_capacity(n_cursors);
-                for _ in 0..n_cursors {
-                    let slot = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap());
-                    pos += 2;
-                    let next = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
-                    pos += 8;
-                    cursors.push((slot, next));
-                }
-                (native_plus1.checked_sub(1), cursors)
+                let next = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+                pos += 8;
+                cursors.push((slot, next));
+            }
+            let native_slot = match native_plus1 {
+                0 => None,
+                p1 => Some(u16::try_from(p1 - 1).map_err(|_| {
+                    KvError::Corrupt(format!(
+                        "membership stamp native slot {} escapes the u16 slot-id namespace",
+                        p1 - 1
+                    ))
+                })?),
             };
+            let slot_cursors = cursors;
             Some(MembershipStamp {
                 set_uuid,
                 set_epoch,

@@ -884,7 +884,7 @@ async fn commit_volume_records(
 /// D0-guarded open + clean shutdown (the final checkpoint makes it
 /// durable).
 pub async fn repair_meta_set(meta_lvs: &[String]) -> Result<Vec<String>> {
-    use crate::meta_backend::kv::checkpoint::{MembershipStamp, MEMBERSHIP_MAX_HOSTED_SLOTS};
+    use crate::meta_backend::kv::checkpoint::{MembershipStamp, STAMP_MAX_RUNS};
     if meta_lvs.is_empty() {
         return Err(SqueezefsError::InvalidOperation(
             "at least one metadata volume is required".to_string(),
@@ -978,7 +978,7 @@ pub async fn repair_meta_set(meta_lvs: &[String]) -> Result<Vec<String>> {
             return refuse(format!("{prev} and {} both stamp position {pos}", o.path));
         }
         pos_holder[pos] = Some(&o.path);
-        for &s in &st.slots_hosted {
+        for s in st.slots_hosted.iter() {
             let s = usize::from(s);
             if s >= width {
                 return refuse(format!("{} hosts slot {s} out of range", o.path));
@@ -1020,8 +1020,9 @@ pub async fn repair_meta_set(meta_lvs: &[String]) -> Result<Vec<String>> {
                 st.native_slot = st.resolved_native_slot();
                 st.set_epoch = max_epoch;
                 st.slots_hosted
-                    .retain(|&s| matches!(slot_claim[usize::from(s)], Some((ci, _)) if ci == oi));
-                st.slot_cursors.retain(|(s, _)| st.slots_hosted.contains(s));
+                    .retain(|s| matches!(slot_claim[usize::from(s)], Some((ci, _)) if ci == oi));
+                let kept = st.slots_hosted.clone();
+                st.slot_cursors.retain(|(s, _)| kept.contains(*s));
                 to_write.push((o.path.clone(), st));
             }
         }
@@ -1047,10 +1048,13 @@ pub async fn repair_meta_set(meta_lvs: &[String]) -> Result<Vec<String>> {
                 .filter(|(_, &h)| !h)
                 .map(|(s, _)| s as u16)
                 .collect();
-            if missing_slots.is_empty() || missing_slots.len() > MEMBERSHIP_MAX_HOSTED_SLOTS {
+            let complement = crate::meta_backend::kv::slot_set::SlotSet::from_slots(&missing_slots);
+            if complement.is_empty() || complement.runs().len() > STAMP_MAX_RUNS {
                 return refuse(format!(
-                    "the unhosted slot complement ({} slots) cannot belong to one member",
-                    missing_slots.len()
+                    "the unhosted slot complement ({} slots in {} runs) cannot belong to \
+                     one member",
+                    complement.len(),
+                    complement.runs().len()
                 ));
             }
             let inferred = MembershipStamp {
@@ -1059,9 +1063,9 @@ pub async fn repair_meta_set(meta_lvs: &[String]) -> Result<Vec<String>> {
                 member_position: pos as u16,
                 member_count: first.member_count,
                 routing_width: first.routing_width,
-                slots_hosted: missing_slots,
-                // VL5a-shaped inference (native = position; no guests).
-                native_slot: None,
+                slots_hosted: complement,
+                // Position-native inference (no guests minted yet).
+                native_slot: Some(pos as u16),
                 slot_cursors: Vec::new(),
             };
             println!(
@@ -1453,7 +1457,7 @@ pub async fn add_meta_volume_with(
     // census — a source may never lose its LAST slot.
     let hosted_by = |m: &MemberObs| m.stamp.slots_hosted.clone();
     let taken: Vec<u16> = match (&dev_stamp, take) {
-        (Some(st), _) if !st.slots_hosted.is_empty() => st.slots_hosted.clone(),
+        (Some(st), _) if !st.slots_hosted.is_empty() => st.slots_hosted.to_vec(),
         (_, TakeSlots::List(slots)) => {
             let mut slots = slots.clone();
             slots.sort_unstable();
@@ -1493,11 +1497,24 @@ pub async fn add_meta_volume_with(
                 if hosted.len() < 2 {
                     continue;
                 }
-                // A member may lose all but one slot.
+                // A member may lose all but one slot. Census economy
+                // (design-dynamic-meta-routing §5.6): only the native
+                // slot and cursor-bearing guest slots can carry records
+                // — virgin hosted slots are empty BY CONSTRUCTION (the
+                // same law that makes lazy cursors sound), so they
+                // census as zero without a probe and only ever pad the
+                // ranking's tail.
                 let native = m.stamp.resolved_native_slot();
                 let mut loads = Vec::new();
-                for &s in &hosted {
-                    loads.push((slot_record_count(&m.path, s, native).await?, s));
+                let mut loaded_probed = 0usize;
+                for s in hosted.iter() {
+                    let bearing = Some(s) == native || m.stamp.cursor_for(s).is_some();
+                    if bearing {
+                        loads.push((slot_record_count(&m.path, s, native).await?, s));
+                        loaded_probed += 1;
+                    } else if loads.len() < loaded_probed + usize::try_from(*k).unwrap_or(usize::MAX) {
+                        loads.push((0, s));
+                    }
                 }
                 loads.sort_by(|a, b| b.0.cmp(&a.0));
                 loads.pop(); // the host keeps its least-loaded slot
@@ -1550,7 +1567,7 @@ pub async fn add_meta_volume_with(
                 member_position: new_position,
                 member_count: old_count + 1,
                 routing_width: width,
-                slots_hosted: Vec::new(),
+                slots_hosted: crate::meta_backend::kv::slot_set::SlotSet::new(),
                 native_slot: None,
                 slot_cursors: Vec::new(),
             },
@@ -1596,7 +1613,7 @@ pub async fn add_meta_volume_with(
                 .iter()
                 .filter_map(|(p, be)| {
                     be.membership_stamp()
-                        .filter(|st| st.slots_hosted.contains(&slot))
+                        .filter(|st| st.slots_hosted.contains(slot))
                         .map(|st| (p.clone(), be.clone(), st))
                 })
                 .max_by_key(|(_, _, st)| st.set_epoch);
@@ -1627,7 +1644,7 @@ pub async fn add_meta_volume_with(
         claim.set_epoch = epoch;
         claim.member_count = old_count + 1;
         claim.member_position = new_position;
-        claim.slots_hosted = taken.clone();
+        claim.slots_hosted = crate::meta_backend::kv::slot_set::SlotSet::from_slots(&taken);
         claim.native_slot = None;
         claim.slot_cursors = cursors;
         target.set_membership_stamp(claim);
@@ -1650,7 +1667,7 @@ pub async fn add_meta_volume_with(
             st.native_slot = st.resolved_native_slot();
             st.set_epoch = epoch;
             st.member_count = old_count + 1;
-            st.slots_hosted.retain(|s| !taken.contains(s));
+            st.slots_hosted.retain(|s| !taken.contains(&s));
             st.slot_cursors.retain(|(s, _)| !taken.contains(s));
             for s in &taken {
                 be.remove_guest_cursor(*s);
@@ -1801,7 +1818,7 @@ pub async fn remove_meta_volume(meta_lvs: &[String], victim: &str) -> Result<()>
     let body = async {
         // Migrate every victim-hosted slot to the emptiest survivor.
         let mut placed: Vec<(u16, usize, u64)> = Vec::new(); // (slot, survivor idx, cursor)
-        for &slot in &victim_slots {
+        for slot in victim_slots.iter() {
             let (ti, target) = survivors
                 .iter()
                 .enumerate()
@@ -1846,10 +1863,7 @@ pub async fn remove_meta_volume(meta_lvs: &[String], victim: &str) -> Result<()>
             st.member_count = old_count - 1;
             for (slot, ti, cur) in &placed {
                 if *ti == i {
-                    if !st.slots_hosted.contains(slot) {
-                        st.slots_hosted.push(*slot);
-                        st.slots_hosted.sort_unstable();
-                    }
+                    st.slots_hosted.insert(*slot);
                     st.slot_cursors.retain(|(s, _)| s != slot);
                     st.slot_cursors.push((*slot, *cur));
                 }
@@ -1866,7 +1880,7 @@ pub async fn remove_meta_volume(meta_lvs: &[String], victim: &str) -> Result<()>
         let mut tomb = members[victim_idx].stamp.clone();
         tomb.set_epoch = epoch;
         tomb.member_count = 0;
-        tomb.slots_hosted = Vec::new();
+        tomb.slots_hosted = crate::meta_backend::kv::slot_set::SlotSet::new();
         tomb.slot_cursors = Vec::new();
         tomb.native_slot = victim_native;
         victim_be.set_membership_stamp(tomb);
@@ -1893,7 +1907,26 @@ pub async fn remove_meta_volume(meta_lvs: &[String], victim: &str) -> Result<()>
     Ok(())
 }
 
-/// Rewrite the informational FormatConfig meta mirror (width / slot map
+/// Per-member hosted-slot runs for the FormatConfig mirror: O(runs)
+/// per member, never O(W) (design-dynamic-meta-routing §5.6).
+fn slot_runs_mirror(volume_count: usize, slot_to_volume: &[usize]) -> Vec<Vec<(u16, u16, u32)>> {
+    let mut hosted: Vec<Vec<u16>> = vec![Vec::new(); volume_count];
+    for (slot, &v) in slot_to_volume.iter().enumerate() {
+        hosted[v].push(slot as u16);
+    }
+    hosted
+        .into_iter()
+        .map(|slots| {
+            crate::meta_backend::kv::slot_set::SlotSet::from_slots(&slots)
+                .runs()
+                .iter()
+                .map(|r| (r.start, r.stride, r.count))
+                .collect()
+        })
+        .collect()
+}
+
+/// Rewrite the informational FormatConfig meta mirror (width / slot runs
 /// / member records) from the authoritative stamps — shared tail of the
 /// membership verbs. Best-effort mirror content, but committed through
 /// the guarded routed open (the config xattr is real state).
@@ -1918,7 +1951,10 @@ async fn update_meta_config_mirror(meta_lvs: &[String]) -> Result<()> {
                 .map(|o| o.stamp.as_ref().map(|s| s.member_position).unwrap_or(0))
                 .collect()
         };
-        cfg.meta_slot_map = Some(disc.slot_to_volume.iter().map(|&v| positions[v]).collect());
+        cfg.meta_slot_runs = Some(slot_runs_mirror(
+            disc.ordered_paths.len(),
+            &disc.slot_to_volume,
+        ));
         cfg.meta_volumes = Some(
             disc.ordered_paths
                 .iter()

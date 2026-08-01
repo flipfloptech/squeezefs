@@ -423,14 +423,24 @@ fn test_stamp_round_trips_through_the_ledger_slot() {
 
 #[test]
 fn test_encoding_budget_caps_encode_at_cap_refuse_past_it() {
-    // Exactly STAMP_MAX_RUNS singleton runs + STAMP_MAX_CURSORS cursors
-    // must encode (the worst-case budget equation is load-bearing).
+    // Exactly STAMP_MAX_RUNS runs + STAMP_MAX_CURSORS cursors must
+    // encode (the worst-case budget equation is load-bearing). Built
+    // via `from_runs` (the decode path, which preserves runs verbatim)
+    // because normalization would coalesce evenly-spaced singletons.
+    let singleton_runs = |n: usize| {
+        SlotSet::from_runs(
+            (0..n)
+                .map(|k| SlotRun {
+                    start: (k * 5) as u16,
+                    stride: 1,
+                    count: 1,
+                })
+                .collect(),
+        )
+        .expect("disjoint singletons admit")
+    };
     let mut st = fresh_stamp(0, 1);
-    st.slots_hosted = SlotSet::from_slots(
-        &(0..STAMP_MAX_RUNS as u16)
-            .map(|k| k * 2) // spaced singletons — no coalescing
-            .collect::<Vec<_>>(),
-    );
+    st.slots_hosted = singleton_runs(STAMP_MAX_RUNS);
     assert_eq!(st.slots_hosted.runs().len(), STAMP_MAX_RUNS);
     st.slot_cursors = (0..STAMP_MAX_CURSORS as u16)
         .map(|s| (s, 7u64))
@@ -442,13 +452,7 @@ fn test_encoding_budget_caps_encode_at_cap_refuse_past_it() {
 
     // One more run refuses loud.
     let mut over_runs = st.clone();
-    over_runs
-        .slots_hosted
-        .insert(STAMP_MAX_RUNS as u16 * 2 + 101); // a new isolated singleton
-    assert!(
-        over_runs.slots_hosted.runs().len() > STAMP_MAX_RUNS,
-        "constructed past the run cap"
-    );
+    over_runs.slots_hosted = singleton_runs(STAMP_MAX_RUNS + 1);
     let err = rec(Some(over_runs)).encode_slot().expect_err("cap+1 refuses");
     assert!(
         format!("{err}").contains("run"),

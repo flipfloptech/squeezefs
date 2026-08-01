@@ -762,10 +762,7 @@ async fn cutover_window(
         })?;
         st.native_slot = st.resolved_native_slot();
         st.set_epoch = epoch;
-        if !st.slots_hosted.contains(&slot) {
-            st.slots_hosted.push(slot);
-            st.slots_hosted.sort_unstable();
-        }
+        st.slots_hosted.insert(slot);
         st.slot_cursors.retain(|(s, _)| *s != slot);
         st.slot_cursors.push((slot, travelling_cursor));
         st.slot_cursors.sort_unstable_by_key(|(s, _)| *s);
@@ -788,7 +785,7 @@ async fn cutover_window(
         })?;
         st.native_slot = st.resolved_native_slot();
         st.set_epoch = epoch;
-        st.slots_hosted.retain(|s| *s != slot);
+        st.slots_hosted.remove(slot);
         st.slot_cursors.retain(|(s, _)| *s != slot);
         src.remove_guest_cursor(slot);
         src.set_membership_stamp(st);
@@ -834,12 +831,12 @@ async fn finish_flip(routed: &Arc<RoutedMetaBackend>, slot: u16, target_idx: usi
         let Some(mut st) = be.membership_stamp() else {
             continue;
         };
-        if st.slots_hosted.contains(&slot) {
+        if st.slots_hosted.contains(slot) {
             // A stale claimer (window-1 residue): release at the
             // resolved epoch — the idempotent re-do of flip write 2.
             st.native_slot = st.resolved_native_slot();
             st.set_epoch = target_epoch;
-            st.slots_hosted.retain(|s| *s != slot);
+            st.slots_hosted.remove(slot);
             st.slot_cursors.retain(|(s, _)| *s != slot);
             be.remove_guest_cursor(slot);
             be.set_membership_stamp(st);
@@ -871,17 +868,24 @@ async fn update_slot_map_mirror(routed: &Arc<RoutedMetaBackend>) {
     let Ok(mut cfg) = serde_json::from_slice::<crate::FormatConfig>(&bytes) else {
         return;
     };
-    // Mirror slot → member_position: positions come from the stamps.
-    let positions: Vec<u16> = routed
-        .volumes
-        .iter()
-        .map(|be| {
-            be.membership_stamp()
-                .map(|s| s.member_position)
-                .unwrap_or(0)
-        })
-        .collect();
-    cfg.meta_slot_map = Some(map.iter().map(|&v| positions[v]).collect());
+    // Mirror per-member hosted-slot runs (O(runs), never O(W) —
+    // design-dynamic-meta-routing §5.6).
+    let mut hosted: Vec<Vec<u16>> = vec![Vec::new(); routed.volumes.len()];
+    for (slot, &v) in map.iter().enumerate() {
+        hosted[v].push(slot as u16);
+    }
+    cfg.meta_slot_runs = Some(
+        hosted
+            .into_iter()
+            .map(|slots| {
+                crate::meta_backend::kv::slot_set::SlotSet::from_slots(&slots)
+                    .runs()
+                    .iter()
+                    .map(|r| (r.start, r.stride, r.count))
+                    .collect()
+            })
+            .collect(),
+    );
     if let Ok(out) = serde_json::to_vec(&cfg) {
         if let Err(e) = routed
             .setxattr(

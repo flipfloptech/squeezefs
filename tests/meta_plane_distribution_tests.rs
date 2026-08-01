@@ -29,7 +29,7 @@
 //! - **Directory striping keeps working** (the pre-existing good
 //!   behavior, pinned so the fix can never regress it).
 
-use squeezefs::meta_backend::{open_routed_meta_set, plan_meta_slot_set, Metadata};
+use squeezefs::meta_backend::{open_routed_meta_set, plan_meta_slot_set_with_width, Metadata};
 use std::path::{Path, PathBuf};
 
 const VOL_LEN: u64 = 256 * 1024 * 1024;
@@ -54,7 +54,7 @@ fn opts() -> squeezefs::meta_backend::kv::builder::FormatV3Options {
 /// (identity slot distribution, epoch 1) — the exact field shape
 /// (`sqmeta:///dev/nvme0n1,/dev/nvme2n1 --meta-slots 8`).
 async fn format_stamped_set(metas: &[PathBuf], width: u32) {
-    let plan = plan_meta_slot_set(metas.len(), width).expect("plan admits the bounds");
+    let plan = plan_meta_slot_set_with_width(metas.len(), width).expect("plan admits the bounds");
     for (i, m) in metas.iter().enumerate() {
         squeezefs::meta_backend::kv::builder::format_v3_stamped(
             m,

@@ -59,6 +59,7 @@ pub mod node_cache;
 pub mod node_state_core;
 pub mod record;
 pub mod slot_cursor_core;
+pub mod slot_set;
 pub mod superblock;
 pub mod tree;
 

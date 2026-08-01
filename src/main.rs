@@ -134,20 +134,19 @@ enum Commands {
         /// clamp(volume/64, 8 MiB, 32 MiB).
         #[arg(long)]
         meta_journal_mb: Option<u64>,
-        // Anchors: design-volume-lifecycle §5.5.1 / KD-7; an explicit W
-        // stamps membership + the KV_GUEST_SLOTS incompat bit (pre-VL5a
-        // binaries refuse it loud); the implicit default stays
-        // byte-identical to pre-VL5a formats.
-        /// Frozen metadata routing width W ("meta slots")
+        // RETIRED (design-dynamic-meta-routing §5.1, forward-only):
+        // routing widths are DERIVED now, never chosen. The arg stays
+        // declared so the refusal is ours (loud, naming the successor)
+        // instead of clap's generic unknown-flag error.
+        /// RETIRED: metadata routing width is derived, never chosen
         ///
-        /// Default: W = metadata volume count, recorded implicitly, so
-        /// the volume set stays readable by older squeezefs releases.
-        /// Explicit values mark the set as slot-mapped: older squeezefs
-        /// releases refuse to open it afterwards. Bounds: volumes <= W
-        /// <= 64 x volumes. Recommended >= 4x volumes for growth-planned
-        /// deployments; metadata-volume migration granularity is 1/W of
-        /// the inode space.
-        #[arg(long)]
+        /// Every format freezes the derived virtual width (the full
+        /// 65536-slot id namespace) and spreads minting so any volume's
+        /// load is divisible from birth. Growth needs no planning: use
+        /// `squeezefs volume add-meta --take-slots ...` (offline) or
+        /// `squeezefs volume migrate-meta-slot` (online). Passing this
+        /// flag is a hard error.
+        #[arg(long, hide = true)]
         meta_slots: Option<u32>,
     },
     /// Show filesystem status
@@ -3350,6 +3349,21 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             meta_journal_mb,
             meta_slots,
         } => {
+            // Dynamic meta routing (design-dynamic-meta-routing §5.1,
+            // forward-only): the width is DERIVED — the retired
+            // `--meta-slots` knob refuses loud naming its successor
+            // BEFORE any destructive step.
+            if let Some(w) = meta_slots {
+                return Err(format!(
+                    "--meta-slots {w}: RETIRED — metadata routing widths are derived, never \
+                     chosen (dynamic meta routing): every format freezes the derived \
+                     virtual width ({} slots) and spreads minting so growth needs no \
+                     planning; grow with `squeezefs volume add-meta --take-slots ...` \
+                     (offline) or `squeezefs volume migrate-meta-slot` (online)",
+                    squeezefs::meta_backend::DERIVED_ROUTING_WIDTH
+                )
+                .into());
+            }
             let mut meta_lvs = Vec::new();
             let mut data_lvs = Vec::new();
 
@@ -3432,30 +3446,19 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             let meta_journal_override = meta_journal_mb.map(|mb| mb * 1024 * 1024);
 
-            // PR VL5a (design-volume-lifecycle §5.5.1/KD-7): an explicit
-            // --meta-slots freezes the routing width and makes the set
-            // slot-mapped — identity slot plan, membership stamps in every
-            // bootstrap ledger record, KV_GUEST_SLOTS (bit 2) on every
-            // member superblock. Bounds refuse BEFORE any destructive
-            // step. Default formats stay legacy-shaped (implicit
-            // W = volume count, nothing written, byte-identical).
-            let meta_slot_plan = match meta_slots {
-                Some(w) => Some(
-                    squeezefs::meta_backend::plan_meta_slot_set(meta_lvs.len(), w)
-                        .map_err(|e| format!("--meta-slots {w}: {e}"))?,
+            let meta_slot_plan = squeezefs::meta_backend::plan_meta_slot_set(meta_lvs.len())
+                .map_err(|e| format!("meta slot plan: {e}"))?;
+            println!(
+                "Meta routing: derived virtual width W = {} over {} volume(s), mint spread \
+                 {} slots/volume — grow any time with `volume add-meta` / \
+                 `migrate-meta-slot` (no planning knob; pre-dynamic-routing binaries \
+                 refuse this set).",
+                meta_slot_plan.routing_width,
+                meta_lvs.len(),
+                squeezefs::meta_backend::MINT_SPREAD.min(
+                    (meta_slot_plan.routing_width as usize).div_ceil(meta_lvs.len().max(1))
                 ),
-                None => None,
-            };
-            if let Some(ref plan) = meta_slot_plan {
-                println!(
-                    "Meta routing width frozen at W = {} over {} volume(s) (slot-mapped set: \
-                     membership stamps + KV_GUEST_SLOTS; pre-VL5a binaries refuse this set). \
-                     Migration granularity is 1/{} of the ino space.",
-                    plan.routing_width,
-                    meta_lvs.len(),
-                    plan.routing_width
-                );
-            }
+            );
 
             let requested_block_size = parse_human_readable_size(&block_size)?;
             // Every logical block lives in one fixed allocator chunk: a
@@ -3519,9 +3522,21 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 fuse_io_uring_sqpoll_idle_ms,
                 // PR VL5a mirrors (the §5.5.1a stamps are authoritative;
                 // None on default formats keeps the config byte-identical).
-                meta_routing_width: meta_slot_plan.as_ref().map(|p| p.routing_width),
-                meta_slot_map: meta_slot_plan.as_ref().map(|p| p.slot_map.clone()),
-                meta_volumes: meta_slot_plan.as_ref().map(|_| {
+                meta_routing_width: Some(meta_slot_plan.routing_width),
+                meta_slot_runs: Some(
+                    meta_slot_plan
+                        .stamps
+                        .iter()
+                        .map(|st| {
+                            st.slots_hosted
+                                .runs()
+                                .iter()
+                                .map(|r| (r.start, r.stride, r.count))
+                                .collect()
+                        })
+                        .collect(),
+                ),
+                meta_volumes: Some({
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
                         .map(|d| d.as_secs())
@@ -3587,7 +3602,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 // PR VL5a: each member's §5.5.1a stamp, by format order
                 // (= member_position; the canonical set order).
-                let stamp = meta_slot_plan.as_ref().map(|p| p.stamps[position].clone());
+                let stamp = Some(meta_slot_plan.stamps[position].clone());
                 let handle = tokio::task::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     // Volume length: block devices use their physical

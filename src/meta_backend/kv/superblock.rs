@@ -146,6 +146,22 @@ pub const FEATURE_INCOMPAT_KV_SLOT_MIGRATION: u64 = 1 << 4;
 /// stay bit-identical.
 pub const FEATURE_INCOMPAT_KV_LAYOUT_DELTAS: u64 = 1 << 5;
 
+/// `features_incompat` bit 6: **dynamic meta routing**
+/// (docs/design-dynamic-meta-routing.md; user ruling 2026-08-02): the
+/// volume's membership stamps use the stride-run slot-set encoding over
+/// the DERIVED routing width (`W = 2^16`, never a user knob), and
+/// minting spreads across the per-volume mint set. Set at format on
+/// EVERY volume (the `NODE_SEQ_WATERMARK` presence-required pattern):
+/// a v3 volume WITHOUT this bit was formatted with the frozen
+/// user-chosen routing width — its stamps carry the retired dense
+/// slot-list wire this binary no longer decodes — and refuses loud,
+/// reformat required (forward-only). One refusal covers both legacy
+/// identity sets and `--meta-slots`-era stamped sets. Old binaries
+/// refuse bit-6 volumes via their `FEATURES_INCOMPAT_KNOWN` gate (the
+/// bit intersects no prior mask — pinned in
+/// `tests/dynamic_meta_routing_tests.rs`).
+pub const FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING: u64 = 1 << 6;
+
 /// Incompat feature bits this binary understands. Any other set bit
 /// refuses the mount naming the bit (§6.1).
 pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
@@ -153,48 +169,8 @@ pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
     | FEATURE_INCOMPAT_KV_GUEST_SLOTS
     | FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE
     | FEATURE_INCOMPAT_KV_SLOT_MIGRATION
-    | FEATURE_INCOMPAT_KV_LAYOUT_DELTAS;
-
-/// The §5.5.1a ledger-slot space cap: at most 64 hosted slots per volume,
-/// so a worst-case root-ledger record (24 B header + 34 B fixed prefix +
-/// (64 × 3 guest + ≤ 5 native) roots × 17 B + the membership stamp)
-/// stays under the 4096-B slot. Enforced here at format
-/// ([`validate_meta_slots`]) and by the stamp encoder
-/// ([`super::checkpoint::MembershipStamp`]); migration preflight (VL5b)
-/// re-enforces it per assignment.
-pub const META_SLOTS_PER_VOLUME_CAP: u32 = 64;
-
-/// Validate `format --meta-slots` (design-volume-lifecycle §5.5.1, KD-7):
-/// the frozen routing width must satisfy
-/// `volumes ≤ W ≤ 64 × volumes` — the lower bound because every volume
-/// must host at least one slot (its native mint slot), the upper bound
-/// because the round-robin identity distribution must respect the
-/// [`META_SLOTS_PER_VOLUME_CAP`] ledger-slot space cap on every member.
-pub fn validate_meta_slots(width: u32, volume_count: usize) -> Result<(), KvError> {
-    let n = u32::try_from(volume_count)
-        .map_err(|_| KvError::Corrupt(format!("absurd meta volume count {volume_count}")))?;
-    if n == 0 {
-        return Err(KvError::Corrupt(
-            "--meta-slots requires at least one metadata volume".to_string(),
-        ));
-    }
-    if width < n {
-        return Err(KvError::Corrupt(format!(
-            "--meta-slots {width} is below the volume count {n}: every metadata volume \
-             must host at least one routing slot (volumes ≤ W ≤ 64 × volumes, \
-             design-volume-lifecycle §5.5.1)"
-        )));
-    }
-    let cap = n.saturating_mul(META_SLOTS_PER_VOLUME_CAP);
-    if width > cap {
-        return Err(KvError::Corrupt(format!(
-            "--meta-slots {width} exceeds 64 × {n} volumes = {cap}: at most 64 hosted \
-             slots per volume — the §5.5.1a ledger-slot space cap keeps the worst-case \
-             root-ledger record inside its 4096-byte slot"
-        )));
-    }
-    Ok(())
-}
+    | FEATURE_INCOMPAT_KV_LAYOUT_DELTAS
+    | FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING;
 
 /// Read-only feature bits this binary understands (none yet — §4.11
 /// reserves the mechanism for snapshots). Unknown bits mount read-only.
@@ -322,7 +298,12 @@ impl SuperblockV3 {
 
         Ok(Self {
             node_size: node_size as u32,
-            features_incompat: FEATURE_INCOMPAT_KV_V3 | FEATURE_INCOMPAT_NODE_SEQ_WATERMARK,
+            // Every fresh format is dynamic-routing (bit 6 — presence
+            // REQUIRED at decode, the NODE_SEQ_WATERMARK pattern); the
+            // stamp bits (2/4) ride the builder's stamped image path.
+            features_incompat: FEATURE_INCOMPAT_KV_V3
+                | FEATURE_INCOMPAT_NODE_SEQ_WATERMARK
+                | FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING,
             features_ro: 0,
             root_ledger,
             journal,
@@ -461,6 +442,21 @@ impl SuperblockV3 {
             return Err(KvError::Corrupt(
                 "pre-watermark v3 volume: formatted before the node-seq mint watermark \
                  (Finding A) and no longer supported; reformat required"
+                    .to_string(),
+            ));
+        }
+        // Dynamic-meta-routing gate (design-dynamic-meta-routing §6,
+        // forward-only): checked only when THIS binary's mask knows bit 6
+        // — the old-mask refusal tests exercise pre-campaign gates whose
+        // binaries had no such requirement, and `known_incompat` is
+        // exactly the mask that models the deciding binary.
+        if known_incompat & FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING != 0
+            && sb.features_incompat & FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING == 0
+        {
+            return Err(KvError::Corrupt(
+                "v3 volume formatted with a frozen routing width (pre-dynamic-meta-routing) \
+                 — no longer supported: routing widths are derived now, never chosen; \
+                 reformat required (`squeezefs format --force`, destroys the old contents)"
                     .to_string(),
             ));
         }

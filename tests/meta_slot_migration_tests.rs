@@ -60,7 +60,7 @@ use squeezefs::meta_backend::slot_migration::{
     MigrationTestHooks, PhaseHold,
 };
 use squeezefs::meta_backend::{
-    discover_meta_set, guest_local_ino, open_routed_meta_set, plan_meta_slot_set, route_ino_width,
+    discover_meta_set, guest_local_ino, open_routed_meta_set, plan_meta_slot_set_with_width, route_ino_width,
     split_guest_local, volume_set_generation, Metadata, RoutedMetaBackend, GUEST_NS_BASE,
     GUEST_NS_SHIFT,
 };
@@ -87,7 +87,7 @@ fn opts() -> squeezefs::meta_backend::kv::builder::FormatV3Options {
 
 /// Format a stamped set the way `format --meta-slots W` does.
 async fn format_stamped_set(metas: &[PathBuf], width: u32) {
-    let plan = plan_meta_slot_set(metas.len(), width).expect("plan admits the bounds");
+    let plan = plan_meta_slot_set_with_width(metas.len(), width).expect("plan admits the bounds");
     for (i, m) in metas.iter().enumerate() {
         squeezefs::meta_backend::kv::builder::format_v3_stamped(
             m,
@@ -278,7 +278,7 @@ fn test_guest_ino_namespace_partition_disjoint_and_round_trips() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_extended_stamp_round_trip_and_v1_byte_identity() {
+fn test_stamp_round_trip_with_and_without_cursors() {
     let uuid = [7u8; 16];
     let v1 = MembershipStamp {
         set_uuid: uuid,
@@ -286,7 +286,7 @@ fn test_extended_stamp_round_trip_and_v1_byte_identity() {
         member_position: 1,
         member_count: 2,
         routing_width: 4,
-        slots_hosted: vec![1, 3],
+        slots_hosted: squeezefs::meta_backend::kv::slot_set::SlotSet::from_slots(&[1, 3]),
         native_slot: None,
         slot_cursors: Vec::new(),
     };
@@ -299,11 +299,10 @@ fn test_extended_stamp_round_trip_and_v1_byte_identity() {
         node_seq_watermark: 2,
         membership_stamp: Some(st),
     };
-    // Unextended stamps keep the VL5a byte encoding exactly (KD-14's
-    // untouched-sets law one level up: sets that never migrate stay
-    // bit-identical).
-    let img_v1 = rec_of(v1.clone()).encode_slot().expect("v1 encodes");
-    let back = LedgerRecord::decode_slot(&img_v1).expect("v1 decodes");
+    // One stamp wire (stride runs, dynamic meta routing): a cursor-free
+    // stamp round-trips byte-faithfully.
+    let img_v1 = rec_of(v1.clone()).encode_slot().expect("cursor-free encodes");
+    let back = LedgerRecord::decode_slot(&img_v1).expect("cursor-free decodes");
     assert_eq!(back.membership_stamp.as_ref(), Some(&v1));
 
     let v2 = MembershipStamp {
@@ -318,8 +317,8 @@ fn test_extended_stamp_round_trip_and_v1_byte_identity() {
     );
     let back = LedgerRecord::decode_slot(&img_v2).expect("v2 decodes");
     assert_eq!(back.membership_stamp.as_ref(), Some(&v2));
-    // The extension provably widens the payload past the VL5a equation
-    // (decode-as-absent to VL5a binaries — the bit-4 rationale).
+    // Cursors provably widen the payload (the length equation closes
+    // exactly on both shapes).
     let payload_len = |img: &[u8]| u32::from_le_bytes(img[4..8].try_into().unwrap()) as usize;
     assert!(payload_len(&img_v2) > payload_len(&img_v1));
 }
@@ -393,20 +392,23 @@ async fn test_slot_migration_equivalence_isolation_and_ino_stability() {
     shutdown_routed(&routed).await;
     drop(routed);
 
-    // Non-participation contract: volume 2 never grew bit 4, never
-    // hosts a guest record, and its own slots' logical state is
-    // untouched (ordinary mount activity — claims/checkpoints — moves
-    // device bytes on EVERY volume, so the contract is representational,
-    // not a device-image freeze).
+    // Non-participation contract: the migration changed NOTHING on
+    // volume 2's superblock (the stamp bits are format-time since
+    // dynamic meta routing — every member carries 2|4|6 from birth, so
+    // the contract is "unchanged by the flip", not bit absence), and
+    // its own slots' logical state is untouched (ordinary mount
+    // activity — claims/checkpoints — moves device bytes on EVERY
+    // volume, so the contract is representational, not a device-image
+    // freeze).
     let squeezefs::meta_backend::kv::superblock::VolumeFormat::V3(sb2) =
         classify_volume(&metas[2]).await.unwrap()
     else {
         panic!("v3");
     };
-    assert_eq!(
+    assert_ne!(
         sb2.features_incompat & FEATURE_INCOMPAT_KV_SLOT_MIGRATION,
         0,
-        "a non-participating volume must never grow incompat bit 4"
+        "the stamp bits are format-time on every member"
     );
 
     // Remount: discovery resolves the new map (highest-epoch-wins on the
@@ -706,12 +708,37 @@ async fn test_cutover_gate_parks_cross_slot_rename_with_zero_guards() {
     let routed = open_routed_meta_set(&paths).await.expect("open");
     populate(&routed, 4, 2).await;
 
-    // Find a directory hosted on volume 1 (the migrating slot 1) and one
-    // on volume 0 — the cross-slot rename spans them.
+    // Find a directory hosted on slot 1 (the migrating slot) and one on
+    // slot 0 — the cross-slot rename spans them. Mint spread rotates
+    // fresh inos across each volume's mint set, so mint dirs until both
+    // slots are covered (bounded).
     let mut src_dir = None;
     let mut dst_dir = None;
     for d in 0..4 {
         let ino = routed.lookup(1, &format!("dir{d}")).await.expect("dir").ino;
+        let (slot, _) = route_ino_width(ino, 4);
+        if slot == 1 && src_dir.is_none() {
+            src_dir = Some(ino);
+        }
+        if slot == 0 && dst_dir.is_none() {
+            dst_dir = Some(ino);
+        }
+    }
+    for extra in 0..64 {
+        if src_dir.is_some() && dst_dir.is_some() {
+            break;
+        }
+        let ino = routed
+            .create(
+                1,
+                &format!("gatedir{extra}"),
+                libc::S_IFDIR | 0o755,
+                1000,
+                1000,
+            )
+            .await
+            .expect("mint an extra dir")
+            .ino;
         let (slot, _) = route_ino_width(ino, 4);
         if slot == 1 && src_dir.is_none() {
             src_dir = Some(ino);
@@ -983,7 +1010,7 @@ async fn test_flip_torn_claim_slot_falls_back_and_rerun_converges() {
         if rec
             .membership_stamp
             .as_ref()
-            .is_some_and(|st| st.slots_hosted.contains(&1))
+            .is_some_and(|st| st.slots_hosted.contains(1))
         {
             f.seek(SeekFrom::Start(
                 sb.root_ledger.start + slot_idx * ROOT_LEDGER_SLOT_LEN + 48,
@@ -1195,7 +1222,7 @@ async fn test_remove_meta_capacity_preflight_refuses_honestly() {
     // A tiny survivor: cannot absorb the victim's extents + headroom.
     let m0 = make_file(dir.path(), "m0", 32 * 1024 * 1024);
     let m1 = make_file(dir.path(), "m1", VOL_LEN);
-    let plan = plan_meta_slot_set(2, 2).expect("plan");
+    let plan = plan_meta_slot_set_with_width(2, 2).expect("plan");
     squeezefs::meta_backend::kv::builder::format_v3_stamped(
         &m0,
         32 * 1024 * 1024,

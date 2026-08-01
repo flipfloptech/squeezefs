@@ -563,17 +563,18 @@ pub struct FormatConfig {
     pub upload_delay: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fuse_io_uring_sqpoll_idle_ms: Option<u32>,
-    /// PR VL5a (KD-7): the frozen routing width W recorded at a
-    /// `--meta-slots` format. `None` = legacy set: W is implicitly the
-    /// meta volume count, nothing written, config byte-identical.
-    /// MIRROR ONLY — mounts read W from the §5.5.1a membership stamps.
+    /// The DERIVED routing width W recorded at format
+    /// (design-dynamic-meta-routing §5.1 — never a knob). MIRROR ONLY —
+    /// mounts read W from the §5.5.1a membership stamps.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta_routing_width: Option<u32>,
-    /// PR VL5a: the durable slot map, `slot s → member_position`
-    /// (identity distribution at format: slot k → position k mod N).
-    /// MIRROR ONLY — the stamps' `slots_hosted` sets are authoritative.
+    /// Per member (canonical order): the hosted-slot stride runs
+    /// `(start, stride, count)` — O(runs), never O(W), so the mirror
+    /// stays xattr-sized at the derived width (the retired per-slot
+    /// `meta_slot_map` mirror was O(W)). MIRROR ONLY — the stamps'
+    /// `slots_hosted` sets are authoritative.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub meta_slot_map: Option<Vec<u16>>,
+    pub meta_slot_runs: Option<Vec<Vec<(u16, u16, u32)>>>,
     /// PR VL5a: the durable meta-volume identity records
     /// ([`MetaVolumeRecord`]), in `member_position` order. MIRROR ONLY.
     #[serde(skip_serializing_if = "Option::is_none")]

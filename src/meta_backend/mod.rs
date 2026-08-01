@@ -35,6 +35,28 @@ pub const GUEST_NS_SHIFT: u32 = 40;
 /// First guest-namespaced local ino; native locals live strictly below.
 pub const GUEST_NS_BASE: u64 = 1 << GUEST_NS_SHIFT;
 
+/// The DERIVED virtual routing width (docs/design-dynamic-meta-routing.md
+/// §5.1; user ruling 2026-08-02 — widths are derived, never chosen):
+/// the FULL slot-id namespace the guest-keyspace wire encoding already
+/// reserves (slot ids are u16 in [`guest_local_ino`], the membership
+/// stamp, and the cutover gate map). Every `squeezefs format` freezes
+/// this value into its stamps; mounts route over the STORED width, so a
+/// future derivation change can never re-route an existing set. Growth
+/// ceiling = 65536 meta volumes (each member hosts ≥ 1 slot) —
+/// unreachable by ≥ 100× at any contemplated deployment.
+pub const DERIVED_ROUTING_WIDTH: u32 = (u16::MAX as u32) + 1;
+
+/// Per-volume mint-set size (design-dynamic-meta-routing §5.4): minting
+/// rotates across the volume's first `MINT_SPREAD` hosted slots, which
+/// is what makes the derived width REAL migration granularity (1/64 of
+/// a volume's load per slot) instead of a cosmetic constant — a single
+/// mint slot per volume would put every record in V of 65536 slots.
+/// Derived from the stamp cursor budget
+/// ([`kv::checkpoint::STAMP_MAX_CURSORS`] / 4): a freshly-spread volume
+/// consumes ≤ ¼ of its cursor budget, leaving ¾ for cursors travelling
+/// in with migrated slots.
+pub const MINT_SPREAD: usize = kv::checkpoint::STAMP_MAX_CURSORS / 4;
+
 /// The guest-namespace key ino of guest slot `slot`'s raw local `local`.
 pub fn guest_local_ino(slot: u16, local: Ino) -> Ino {
     debug_assert!(
@@ -418,15 +440,35 @@ pub struct RoutedMetaBackend {
     /// PR VL5b: one slot migration at a time per routed set (the
     /// coordinator's one-flip-per-slot law, made structural).
     pub(crate) migration_lock: tokio::sync::Mutex<()>,
+    /// Per-volume mint rotors (design-dynamic-meta-routing §5.4): a
+    /// relaxed counter whose modulo over the mint set picks each fresh
+    /// ino's slot. Relaxed is sufficient — the rotor feeds a pure
+    /// distribution choice, never an ordering edge.
+    mint_rr: Vec<std::sync::atomic::AtomicUsize>,
 }
 
 /// The latch-free routing tables `route_ino`/`make_global_ino` read.
 struct RouteTable {
     /// `slot → volumes index`.
     slot_to_volume: Vec<usize>,
-    /// Per volume: its native MINT slot (smallest hosted slot — where
-    /// freshly-allocated locals encode, see [`validate_slot_map`]).
-    mint_slot: Vec<u64>,
+    /// Per volume: its MINT SET — the first `min(MINT_SPREAD, hosted)`
+    /// hosted slots ascending, derived from the map on every publish
+    /// (design-dynamic-meta-routing §5.4; no new durable state — the
+    /// per-slot cursors are the durable half and already travel at
+    /// cutover). [`RoutedMetaBackend::pick_mint_slot`] rotates over it.
+    mint_slots: Vec<Vec<u16>>,
+}
+
+/// Derive each volume's mint set from an expanded slot map: the first
+/// `min(MINT_SPREAD, hosted)` hosted slots ascending.
+fn derive_mint_slots(volume_count: usize, slot_to_volume: &[usize]) -> Vec<Vec<u16>> {
+    let mut mint: Vec<Vec<u16>> = vec![Vec::new(); volume_count];
+    for (slot, &v) in slot_to_volume.iter().enumerate() {
+        if mint[v].len() < MINT_SPREAD {
+            mint[v].push(slot as u16);
+        }
+    }
+    mint
 }
 
 /// PR VL5b (§5.5.2a): the armed cutover gates. `armed` is the zero-cost
@@ -480,11 +522,14 @@ impl RoutedMetaBackend {
             routing_width: n as u64,
             route: arc_swap::ArcSwap::from_pointee(RouteTable {
                 slot_to_volume: (0..n).collect(),
-                mint_slot: (0..n as u64).collect(),
+                mint_slots: (0..n).map(|v| vec![v as u16]).collect(),
             }),
             legacy_slot: (0..n).map(|v| Some(v as u16)).collect(),
             gates: SlotGates::new(),
             migration_lock: tokio::sync::Mutex::new(()),
+            mint_rr: (0..n)
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
         }
     }
 
@@ -514,7 +559,7 @@ impl RoutedMetaBackend {
         slot_to_volume: Vec<usize>,
         legacy_slot: Vec<Option<u16>>,
     ) -> Result<Self> {
-        let mint_slot = validate_slot_map(volumes.len(), routing_width, &slot_to_volume)?;
+        validate_slot_map(volumes.len(), routing_width, &slot_to_volume)?;
         if legacy_slot.len() != volumes.len() {
             return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                 "metadata slot map invalid: {} legacy-keyspace slots for {} volumes",
@@ -522,6 +567,8 @@ impl RoutedMetaBackend {
                 volumes.len()
             )));
         }
+        let n = volumes.len();
+        let mint_slots = derive_mint_slots(n, &slot_to_volume);
         Ok(Self {
             volumes,
             disabled_volumes: std::sync::Arc::new(dashmap::DashMap::with_hasher(
@@ -530,11 +577,14 @@ impl RoutedMetaBackend {
             routing_width,
             route: arc_swap::ArcSwap::from_pointee(RouteTable {
                 slot_to_volume,
-                mint_slot,
+                mint_slots,
             }),
             legacy_slot,
             gates: SlotGates::new(),
             migration_lock: tokio::sync::Mutex::new(()),
+            mint_rr: (0..n)
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
         })
     }
 
@@ -543,10 +593,11 @@ impl RoutedMetaBackend {
     /// guarantees no admitted mutation straddles it). Refuses malformed
     /// maps loud, leaving the old table serving.
     pub fn publish_slot_map(&self, slot_to_volume: Vec<usize>) -> Result<()> {
-        let mint_slot = validate_slot_map(self.volumes.len(), self.routing_width, &slot_to_volume)?;
+        validate_slot_map(self.volumes.len(), self.routing_width, &slot_to_volume)?;
+        let mint_slots = derive_mint_slots(self.volumes.len(), &slot_to_volume);
         self.route.store(std::sync::Arc::new(RouteTable {
             slot_to_volume,
-            mint_slot,
+            mint_slots,
         }));
         Ok(())
     }
@@ -909,17 +960,34 @@ impl RoutedMetaBackend {
         Some(make_global_ino_width(raw, slot, self.routing_width))
     }
 
-    /// PR VL5b: mint one fresh ino on `volume_idx` — from the volume's
-    /// native watermark when its mint slot is its legacy keyspace, from
-    /// the slot's travelling guest cursor otherwise. Returns
+    /// Pick the slot the NEXT fresh ino on `volume_idx` mints into
+    /// (design-dynamic-meta-routing §5.4): the per-volume rotor over the
+    /// mint set — `min(MINT_SPREAD, hosted)` slots, so a volume's load
+    /// is divisible into that many movable slices from birth. Callers on
+    /// the gated op paths pick FIRST, gate the picked slot, then mint
+    /// into it ([`Self::allocate_local_ino_in_slot`]).
+    pub fn pick_mint_slot(&self, volume_idx: usize) -> u64 {
+        if self.routing_width <= 1 {
+            return 0;
+        }
+        let t = self.route.load();
+        let mints = &t.mint_slots[volume_idx];
+        debug_assert!(!mints.is_empty(), "every volume hosts ≥ 1 slot");
+        let k = self.mint_rr[volume_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % mints.len();
+        u64::from(mints[k])
+    }
+
+    /// PR VL5b: mint one fresh ino on `volume_idx` in `mint` (a slot the
+    /// caller picked via [`Self::pick_mint_slot`] and gated) — from the
+    /// volume's native watermark when `mint` is its legacy keyspace,
+    /// from the slot's travelling guest cursor otherwise. Returns
     /// `(effective local key ino, global ino)`.
-    pub fn allocate_local_ino(&self, volume_idx: usize) -> Result<(Ino, Ino)> {
+    pub fn allocate_local_ino_in_slot(&self, volume_idx: usize, mint: u64) -> Result<(Ino, Ino)> {
         if self.routing_width <= 1 {
             let local = self.volumes[0].allocate_ino();
             return Ok((local, local));
         }
-        let t = self.route.load();
-        let mint = t.mint_slot[volume_idx];
         if self.legacy_slot[volume_idx] == Some(mint as u16) {
             let raw = self.volumes[volume_idx].allocate_ino();
             if raw >= GUEST_NS_BASE {
@@ -937,6 +1005,14 @@ impl RoutedMetaBackend {
                 make_global_ino_width(raw, mint, self.routing_width),
             ))
         }
+    }
+
+    /// [`Self::pick_mint_slot`] + [`Self::allocate_local_ino_in_slot`] —
+    /// the ungated convenience (control-plane and test surface; the
+    /// FUSE-facing op paths pick-then-gate-then-mint explicitly).
+    pub fn allocate_local_ino(&self, volume_idx: usize) -> Result<(Ino, Ino)> {
+        let mint = self.pick_mint_slot(volume_idx);
+        self.allocate_local_ino_in_slot(volume_idx, mint)
     }
 
     // -----------------------------------------------------------------
@@ -1168,11 +1244,13 @@ impl Metadata for RoutedMetaBackend {
         let target_v_idx = self.pick_mint_volume(parent_v_idx).await;
         self.check_volume_enabled(target_v_idx)?;
         // The mint slot is a touched slot too (the new inode record
-        // lands in its keyspace) — still before any 4a lock. A park
-        // here can span a flip: re-derive the parent's route after.
+        // lands in its keyspace) — still before any 4a lock. The rotor
+        // picks it HERE so the gate covers the exact slot the mint will
+        // use (design-dynamic-meta-routing §5.4). A park here can span
+        // a flip: re-derive the parent's route after.
+        let mint_slot = self.pick_mint_slot(target_v_idx);
         {
-            let mint = self.route.load().mint_slot[target_v_idx];
-            if self.slot_gate_extend_slots(&mut _gate, &[mint]).await
+            if self.slot_gate_extend_slots(&mut _gate, &[mint_slot]).await
                 && self.route_ino(parent) != (parent_v_idx, local_parent)
             {
                 // The parent's slot flipped while we parked on the mint
@@ -1219,7 +1297,8 @@ impl Metadata for RoutedMetaBackend {
             // the volume's mint slot's keyspace/cursor, so the backend
             // stays keyspace-agnostic. (A failed create burns the ino —
             // the standing §4.8 monotonic-allocation law.)
-            let (new_local, new_global) = self.allocate_local_ino(target_v_idx)?;
+            let (new_local, new_global) =
+                self.allocate_local_ino_in_slot(target_v_idx, mint_slot)?;
             let be = &self.volumes[target_v_idx];
             let out = be
                 .routed_create_local(
@@ -1264,8 +1343,10 @@ impl Metadata for RoutedMetaBackend {
 
             let is_dir_flag = is_dir;
             // Target side: mint the child inode record (PR VL5b: the
-            // routed allocation rides the mint slot's keyspace/cursor).
-            let (new_local_ino, global_child_ino) = self.allocate_local_ino(target_v_idx)?;
+            // routed allocation rides the GATED mint slot's
+            // keyspace/cursor).
+            let (new_local_ino, global_child_ino) =
+                self.allocate_local_ino_in_slot(target_v_idx, mint_slot)?;
             let target_be = &self.volumes[target_v_idx];
             let minted = target_be
                 .routed_mint_inode(
@@ -1687,10 +1768,11 @@ impl Metadata for RoutedMetaBackend {
         // RENAME_WHITEOUT (fstests generic/631, the overlayfs-upper
         // contract) mints a fresh char-0:0 inode in the old parent's
         // volume: its mint slot joins the gate BEFORE any 4a acquisition
-        // (the create-path discipline — a park here can span a flip, so
-        // both parents' routes are re-verified after).
-        if flags & libc::RENAME_WHITEOUT != 0 {
-            let mint = self.route.load().mint_slot[old_parent_v_idx];
+        // (the create-path discipline — the rotor picks here so the gate
+        // covers the exact slot the mint will use; a park here can span
+        // a flip, so both parents' routes are re-verified after).
+        let whiteout_mint_slot = if flags & libc::RENAME_WHITEOUT != 0 {
+            let mint = self.pick_mint_slot(old_parent_v_idx);
             if self.slot_gate_extend_slots(&mut _gate, &[mint]).await
                 && (self.route_ino(old_parent) != (old_parent_v_idx, local_old_parent)
                     || self.route_ino(new_parent) != (new_parent_v_idx, local_new_parent))
@@ -1699,7 +1781,10 @@ impl Metadata for RoutedMetaBackend {
                     std::io::Error::from_raw_os_error(libc::EAGAIN),
                 ));
             }
-        }
+            Some(mint)
+        } else {
+            None
+        };
 
         // Per-volume lock sets in ascending volume order, each internally
         // canonical (I before D, stripe-deduped by lock_many). Interleaving
@@ -1815,10 +1900,9 @@ impl Metadata for RoutedMetaBackend {
             // global) pair — minted in the old parent's volume, rides
             // the same whole-tx entry. (A failed rename burns the ino —
             // the standing §4.8 monotonic-allocation law, as at create.)
-            let whiteout = if flags & libc::RENAME_WHITEOUT != 0 {
-                Some(self.allocate_local_ino(old_parent_v_idx)?)
-            } else {
-                None
+            let whiteout = match whiteout_mint_slot {
+                Some(mint) => Some(self.allocate_local_ino_in_slot(old_parent_v_idx, mint)?),
+                None => None,
             };
             let out = be
                 .routed_rename_local(
@@ -1955,8 +2039,9 @@ impl Metadata for RoutedMetaBackend {
                 // posture; the crash window leaves the rename done
                 // without its whiteout, exactly like the other
                 // cross-volume fragments).
-                if flags & libc::RENAME_WHITEOUT != 0 {
-                    let (w_local, w_global) = self.allocate_local_ino(old_parent_v_idx)?;
+                if let Some(mint) = whiteout_mint_slot {
+                    let (w_local, w_global) =
+                        self.allocate_local_ino_in_slot(old_parent_v_idx, mint)?;
                     let minted = self.volumes[old_parent_v_idx]
                         .routed_mint_inode(w_local, libc::S_IFCHR, 0, 0, 0, guards.clone())
                         .await;
@@ -2286,17 +2371,20 @@ pub async fn discover_meta_set(paths: &[String]) -> Result<MetaSetDiscovery> {
 
     let stamped_count = obs.iter().filter(|o| o.stamp.is_some()).count();
     if stamped_count == 0 {
-        // Legacy set: nothing durable to consult — implicit W = count,
-        // identity map, URI order authoritative (today's behavior).
-        return Ok(MetaSetDiscovery {
-            ordered_paths: obs.iter().map(|o| o.path.clone()).collect(),
-            uuids: obs.iter().map(|o| o.uuid).collect(),
-            routing_width: obs.len().max(1) as u64,
-            slot_to_volume: (0..obs.len()).collect(),
-            stamped: false,
-            native_slots: (0..obs.len()).map(|v| Some(v as u16)).collect(),
-            set_epoch: 0,
-        });
+        // Defense in depth (design-dynamic-meta-routing §5.6): every
+        // dynamic-routing format stamps its bootstrap ledger record, and
+        // the superblock gate already refused pre-dynamic-routing
+        // volumes before this point — an all-stampless bit-6 set means
+        // torn formats or foreign ledgers, never a mountable legacy set
+        // (the pre-campaign implicit-identity arm died with the frozen
+        // widths it served).
+        let listed: Vec<&str> = obs.iter().map(|o| o.path.as_str()).collect();
+        return refuse(format!(
+            "metadata volumes {listed:?} carry NO §5.5.1a membership stamps — every \
+             dynamic-routing format stamps its members at format time, so these ledgers \
+             are torn or foreign; reformat required (`squeezefs format --force`, destroys \
+             the old contents)"
+        ));
     }
     if stamped_count < obs.len() {
         let stampless: Vec<&str> = obs
@@ -2408,7 +2496,7 @@ pub async fn discover_meta_set(paths: &[String]) -> Result<MetaSetDiscovery> {
     let mut slot_claims: Vec<Option<(usize, u64)>> = vec![None; first.routing_width as usize];
     for (vol_idx, o) in ordered.iter().enumerate() {
         let st = o.stamp.as_ref().expect("all stamped");
-        for &slot in &st.slots_hosted {
+        for slot in st.slots_hosted.iter() {
             let s = usize::from(slot);
             if s >= slot_claims.len() {
                 return refuse(format!(
@@ -2477,53 +2565,84 @@ pub async fn discover_meta_set(paths: &[String]) -> Result<MetaSetDiscovery> {
     })
 }
 
-/// The format-time §5.5.1 slot plan for `format --meta-slots W`: one
+/// The format-time slot plan (design-dynamic-meta-routing §5.1): one
 /// fresh set uuid, epoch 1, the identity slot distribution
-/// (`slot k → member position k mod N` — every member's native mint slot
-/// is its own position), and one membership stamp per member. Bounds per
-/// [`kv::superblock::validate_meta_slots`] (`volumes ≤ W ≤ 64 ×
-/// volumes`), refused loud.
+/// (`slot k → member position k mod N` — exactly ONE stride run per
+/// member; every member's native mint slot is its own position), and
+/// one membership stamp per member, over the DERIVED routing width.
 #[derive(Debug, Clone)]
 pub struct MetaSlotPlan {
     /// The set identity every member's stamp carries.
     pub set_uuid: [u8; 16],
-    /// The frozen routing width W.
+    /// The derived routing width W.
     pub routing_width: u32,
-    /// `slot → member_position` (the `FormatConfig.meta_slot_map`
-    /// mirror).
-    pub slot_map: Vec<u16>,
     /// Per-member stamps, indexed by `member_position`.
     pub stamps: Vec<kv::checkpoint::MembershipStamp>,
 }
 
-/// Build the [`MetaSlotPlan`] for `volume_count` members at frozen width
-/// `width` (see the struct docs).
-pub fn plan_meta_slot_set(volume_count: usize, width: u32) -> Result<MetaSlotPlan> {
-    kv::superblock::validate_meta_slots(width, volume_count)?;
-    let n = volume_count as u32;
+/// Build the [`MetaSlotPlan`] for `volume_count` members over the
+/// DERIVED width ([`DERIVED_ROUTING_WIDTH`] — never a knob; the retired
+/// `format --meta-slots` refuses loud naming this derivation).
+pub fn plan_meta_slot_set(volume_count: usize) -> Result<MetaSlotPlan> {
+    plan_meta_slot_set_with_width(volume_count, DERIVED_ROUTING_WIDTH)
+}
+
+/// [`plan_meta_slot_set`]'s width-parametric core. Production formats
+/// always pass [`DERIVED_ROUTING_WIDTH`]; small explicit widths remain
+/// valid ROUTING geometries and are the geometry-test surface
+/// (`tests/meta_slot_tests.rs` exercises flip/discovery/refusal shapes
+/// at W = 8 where every slot is enumerable by hand).
+pub fn plan_meta_slot_set_with_width(volume_count: usize, width: u32) -> Result<MetaSlotPlan> {
+    let n = u32::try_from(volume_count).map_err(|_| {
+        crate::error::SqueezefsError::InvalidOperation(format!(
+            "absurd meta volume count {volume_count}"
+        ))
+    })?;
+    if n == 0 {
+        return Err(crate::error::SqueezefsError::InvalidOperation(
+            "at least one metadata volume is required".to_string(),
+        ));
+    }
+    if width < n {
+        return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+            "routing width {width} below the volume count {n}: every metadata volume \
+             must host at least one slot"
+        )));
+    }
+    if width > DERIVED_ROUTING_WIDTH {
+        return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+            "routing width {width} exceeds the u16 slot-id namespace \
+             ({DERIVED_ROUTING_WIDTH})"
+        )));
+    }
     let set_uuid = *uuid::Uuid::new_v4().as_bytes();
-    let slot_map: Vec<u16> = (0..width).map(|s| (s % n) as u16).collect();
     let stamps = (0..n)
-        .map(|pos| kv::checkpoint::MembershipStamp {
-            set_uuid,
-            set_epoch: 1,
-            member_position: pos as u16,
-            member_count: n as u16,
-            routing_width: width,
-            slots_hosted: (0..width)
-                .filter(|s| s % n == pos)
-                .map(|s| s as u16)
-                .collect(),
-            // VL5a-shaped (unextended) stamps: format images stay
-            // byte-identical; the native slot derives as the position.
-            native_slot: None,
-            slot_cursors: Vec::new(),
+        .map(|pos| {
+            // Member pos hosts {pos + k·n | pos + k·n < width}: one
+            // stride run (singletons canonicalize to stride 1 — a
+            // 65536-member set's stride would overflow u16).
+            let count = (width - pos).div_ceil(n);
+            let run = kv::slot_set::SlotRun {
+                start: pos as u16,
+                stride: if count == 1 { 1 } else { n as u16 },
+                count,
+            };
+            Ok(kv::checkpoint::MembershipStamp {
+                set_uuid,
+                set_epoch: 1,
+                member_position: pos as u16,
+                member_count: n as u16,
+                routing_width: width,
+                slots_hosted: kv::slot_set::SlotSet::from_runs(vec![run])
+                    .map_err(crate::error::SqueezefsError::from)?,
+                native_slot: Some(pos as u16),
+                slot_cursors: Vec::new(),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(MetaSlotPlan {
         set_uuid,
         routing_width: width,
-        slot_map,
         stamps,
     })
 }

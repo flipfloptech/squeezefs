@@ -2715,6 +2715,47 @@ pub struct Metrics {
     pub read_lane_hold_evicted_unconsumed: Align64<AtomicU64>,
     pub read_lane_wasted: Align64<AtomicU64>,
     pub read_lane_depth_target: Align64<AtomicU64>,
+    /// The READ copy ledger (read-copy-count campaign, 2026-08-02): every
+    /// daemon CPU pass over read payload bytes is attributed to exactly
+    /// one of these families, so `user bytes served ≈ dest + bounce +
+    /// dest_dma (+ arena for il)` CLOSES per row — the read twin of the
+    /// write path's copy census (`.benchmarks/2026-07-31-near-zero-copy.md`).
+    ///
+    /// `read_copy_dest_bytes`: serve copies INTO the zero-copy final
+    /// destination (registered uring ent payload / il arena dest) — the
+    /// ONE lawful serve copy on the kernel path (hot/hold/tier/cold
+    /// slice-out arms).
+    pub read_copy_dest_bytes: Align64<AtomicU64>,
+    /// Serve copies into intermediate heap memory (None-dest arms; tier
+    /// mmap-guard copy-outs). After the zero-copy cold slice, a
+    /// `Bytes`-backed cold fill served without a dest contributes 0 here
+    /// — growth on il cold rows means the slice bounce regressed.
+    pub read_copy_bounce_bytes: Align64<AtomicU64>,
+    /// Device DMA landing DIRECTLY in the final destination (raw
+    /// full-block dest leg, ranged zero-copy leg, ipc direct-drive) —
+    /// the zero-daemon-copy engagement gauge.
+    pub read_dest_dma_bytes: Align64<AtomicU64>,
+    /// Device DMA into pooled fill intermediates (whole-block fills +
+    /// ranged bounce windows) — the nvme-tcp RX-copy pricing denominator.
+    pub read_fill_dma_bytes: Align64<AtomicU64>,
+    /// il boundary copies into the client-visible session arena
+    /// (`ArenaWindow::{write, write_at}` — completion payloads + §5.5.1
+    /// sink serves). Direct-drive aligned legs and arena-dest handler
+    /// serves bypass it (0 bytes here, counted in `read_dest_dma_bytes` /
+    /// `read_copy_dest_bytes`).
+    pub ipc_arena_copy_bytes: Align64<AtomicU64>,
+    /// il cold reads served IN PLACE into the arena window by the read
+    /// handler (`SQUEEZEFS_IL_READ_DEST`, default on) — the reply's
+    /// intermediate `payload.write` arena copy was elided. The E-IL2
+    /// engagement gauge: on a cold il row this must account for ≈ every
+    /// miss-demoted read.
+    pub ipc_read_dest_serves: Align64<AtomicU64>,
+    /// NT-store engagement at the dest-arm read serve copies
+    /// (`SQUEEZEFS_NT_READ_SERVE=1`, default off — a measurement lever:
+    /// the destination is CPU-read by the kernel commit copy, so NT here
+    /// trades the RFO for a possible consumer DRAM miss; counted A/B
+    /// only).
+    pub nt_read_serve_bytes: Align64<AtomicU64>,
     /// Layout mix (write path outcomes).
     pub layout_inline_writes: Align64<AtomicU64>,
     pub layout_staged_writes: Align64<AtomicU64>,
@@ -5251,6 +5292,13 @@ impl SqueezefsFilesystem {
                 "read_lane_depth_target": METRICS.read_lane_depth_target.load(Ordering::Relaxed),
                 "read_lane_hold_bytes": self.router.cache.read_lane_hold.bytes(),
                 "read_lane_inflight_bytes": self.router.read_lane_inflight_bytes(),
+                "read_copy_dest_bytes": METRICS.read_copy_dest_bytes.load(Ordering::Relaxed),
+                "read_copy_bounce_bytes": METRICS.read_copy_bounce_bytes.load(Ordering::Relaxed),
+                "read_dest_dma_bytes": METRICS.read_dest_dma_bytes.load(Ordering::Relaxed),
+                "read_fill_dma_bytes": METRICS.read_fill_dma_bytes.load(Ordering::Relaxed),
+                "ipc_arena_copy_bytes": METRICS.ipc_arena_copy_bytes.load(Ordering::Relaxed),
+                "ipc_read_dest_serves": METRICS.ipc_read_dest_serves.load(Ordering::Relaxed),
+                "nt_read_serve_bytes": METRICS.nt_read_serve_bytes.load(Ordering::Relaxed),
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
                 "staged_spill_escalations": METRICS.staged_spill_escalations.load(Ordering::Relaxed),

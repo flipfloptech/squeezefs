@@ -164,6 +164,56 @@ pub unsafe fn dma_copy_raw_forced(dst: *mut u8, src: *const u8, len: usize) -> b
     copy_body(dst, src, len)
 }
 
+/// READ-serve NT policy (read-copy-count campaign, 2026-08-02) — the
+/// dest-arm serve copies (block buffer → registered uring ent payload /
+/// arena dest). **Default OFF**, unlike the write-side DMA-destined
+/// sites: the destination's next consumer is a CPU (the kernel's
+/// ring→user commit copy / the shim's `slab_read`), so NT here trades
+/// the destination RFO for a possible consumer-side DRAM miss. At
+/// LLC-outrunning stream rates the consumer pays DRAM either way, which
+/// is exactly the counted A/B `SQUEEZEFS_NT_READ_SERVE=1` exists to
+/// decide per the fastest-wins ruling — a measurement lever, never an
+/// ambient default without the bracket. Floor shares
+/// `SQUEEZEFS_NT_COPY_MIN` semantics via its own
+/// `SQUEEZEFS_NT_READ_SERVE_MIN` (default [`DEFAULT_MIN_BYTES`]).
+pub fn read_serve_policy_from(nt: Option<&str>, min: Option<&str>) -> NtPolicy {
+    let enabled = matches!(nt.map(str::trim), Some("1") | Some("true"));
+    let min_bytes = min
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MIN_BYTES);
+    NtPolicy { enabled, min_bytes }
+}
+
+/// Process-wide cached read-serve policy (env read once).
+fn read_serve_policy() -> NtPolicy {
+    static POLICY: OnceLock<NtPolicy> = OnceLock::new();
+    *POLICY.get_or_init(|| {
+        read_serve_policy_from(
+            std::env::var("SQUEEZEFS_NT_READ_SERVE").ok().as_deref(),
+            std::env::var("SQUEEZEFS_NT_READ_SERVE_MIN").ok().as_deref(),
+        )
+    })
+}
+
+/// Policy-gated read-serve copy (raw form — the serve sites hold raw
+/// dest pointers). Returns `true` iff the NT body ran — callers feed
+/// `nt_read_serve_bytes` from it. The internal `sfence` (see module
+/// docs) is what makes the subsequent reply-commit publication edges
+/// (mpsc send + eventfd) sufficient for the queue worker / kernel.
+///
+/// # Safety
+/// `dst` and `src` must be valid for `len` bytes and non-overlapping.
+#[inline]
+pub unsafe fn read_serve_copy_raw(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    let p = read_serve_policy();
+    if p.enabled && len >= p.min_bytes {
+        copy_body(dst, src, len)
+    } else {
+        std::ptr::copy_nonoverlapping(src, dst, len);
+        false
+    }
+}
+
 /// The copy body: NT-store implementation on x86_64, plain
 /// `copy_nonoverlapping` elsewhere. Returns `true` iff NT stores ran.
 ///

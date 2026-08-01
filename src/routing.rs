@@ -3847,9 +3847,22 @@ impl DataRouter {
             // by the hot-tier argument (validated deposits + unified
             // purge), and block-serving callers recheck the binding.
             if self.read_lane.enabled() {
-                if let Some(held) = self.cache.read_lane_hold.serve(block_key, 0) {
+                if let Some((held, ledger_visible)) = self
+                    .cache
+                    .read_lane_hold
+                    .serve_with_provenance(block_key, 0)
+                {
                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                     METRICS.read_lane_serves.fetch_add(1, Ordering::Relaxed);
+                    // Ledger visibility (the 2026-07-31 fix): a
+                    // demand-deposited entry served here — every tier
+                    // probe above missed — is the pre-lane refetch in
+                    // serve form and carries the R1b ceremony with it
+                    // (ghost touch, second-touch publish, hot
+                    // re-landing). Lane deposits stay invisible.
+                    if ledger_visible {
+                        self.hold_serve_admission(block_key, &held, class).await;
+                    }
                     if sf_waited {
                         read_serve_phase_record(ReadServePhase::SfWait, sf_t0);
                     }
@@ -4118,7 +4131,12 @@ impl DataRouter {
                             && downloaded_bytes.len() > crate::read_lane::READ_LANE_MIN_FILL_BYTES
                             && crate::mem_budget::level() != crate::mem_budget::Level::Red
                         {
-                            self.cache.read_lane_hold.insert(
+                            // DEMAND provenance: serves of this entry
+                            // carry the R1b ledger (the 2026-07-31
+                            // ledger-visibility fix) — a hold serve
+                            // after this fill's hot copy is evicted is
+                            // the pre-lane refetch in serve form.
+                            self.cache.read_lane_hold.insert_demand(
                                 block_key,
                                 downloaded_bytes.clone(),
                                 self.read_lane_hold_budget(),
@@ -4774,6 +4792,128 @@ impl DataRouter {
                 streams,
                 window_depth,
             ))
+    }
+
+    /// The R1b admission ceremony for a LEDGER-VISIBLE hold serve (the
+    /// 2026-07-31 ledger-visibility fix): both hold serve sites fire
+    /// only after every tier probe missed, so a serve of a
+    /// demand-deposited entry stands in for exactly the device refetch
+    /// the pre-lane read would have paid — and must touch the ledger
+    /// the way that refetch did, or re-read heat never converges to
+    /// the disk tier and the dehydration gate never sees a protected
+    /// victim (the read_tier_admission_tests regression). This mirrors
+    /// the primary-fill admission arm verbatim for the > 256 KiB
+    /// population (hold entries are all > 256 KiB by the deposit
+    /// gates): ghost check-and-record, second-touch publish (awaited,
+    /// the refetch-churn discipline), governor arbitration for
+    /// streaming classes, and the protected/probation hot landing —
+    /// under the same incarnation seqlock discipline
+    /// (publish-then-revalidate + the unified-purge undo). Lane-fetch
+    /// deposits never reach this (scan-resistance stands — pinned by
+    /// read_lane_tests contract 2).
+    ///
+    /// Two deliberate differences from the fill-path arm:
+    ///   * no `note_foreground` — the serve pays ZERO device bytes,
+    ///     and the governor's bounded-waste law prices admission
+    ///     tokens against real device spend (the escalation-fetch
+    ///     no-self-funding rule);
+    ///   * no hold re-deposit / read_lru arm — the entry is already
+    ///     held and always above the small-fill boundary.
+    ///
+    /// Cost posture: this runs only on ledger-visible hold serves —
+    /// the shape that pre-lane paid a whole device fetch plus this
+    /// exact ceremony — and the re-landed hot copy serves the block's
+    /// remaining sub-reads, so per re-miss it runs at most ~once
+    /// (concurrent same-key serves may duplicate it — the GhostTable's
+    /// racy-tolerant class; puts and validated publishes are
+    /// idempotent).
+    async fn hold_serve_admission(&self, block_key: &str, held: &bytes::Bytes, class: FillClass) {
+        // Mirror the fill path's publishable window: an unstable or
+        // untracked incarnation skips the whole arm (no ledger touch,
+        // no publish, no hot landing) — exactly as the primary fill
+        // skips its admission arm outside the window.
+        let incarnation = self.backend_router.fill_incarnation(block_key);
+        let Some(before) =
+            incarnation.filter(|&b| self.backend_router.fill_incarnation_still(block_key, b))
+        else {
+            return;
+        };
+        let ghost_admit = match self.tier_admission {
+            TierAdmission::Always => true,
+            TierAdmission::Never => false,
+            TierAdmission::SecondTouch => {
+                let hit = self.ghost.check_and_record(block_key);
+                if hit {
+                    METRICS
+                        .read_tier_admission_ghost_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                // The transient stream window (2026-07-29): a
+                // streaming-class re-miss stays governor-arbitrated —
+                // a hold serve must not become a clamp bypass.
+                hit && (!class.streaming()
+                    || self
+                        .cache
+                        .admission_governor
+                        .allow_stream_admission(held.len() as u64))
+            }
+        };
+        if !ghost_admit {
+            METRICS
+                .read_fill_publishes_skipped
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            METRICS.read_tier_admissions.fetch_add(1, Ordering::Relaxed);
+            // AWAITED publish, same rationale as the fill path (the
+            // read-tier refetch-churn fix): the tier copy is visible
+            // before this serve returns, so the admission-suite
+            // contract "the SECOND miss publishes" is observable at
+            // the serve boundary. Blocking pool for the same reason as
+            // the fill path's put (tier-shard lock + megabytes moved).
+            let nvme_clone = self.cache.nvme.clone();
+            let backend_router = self.backend_router.clone();
+            let bk_clone = block_key.to_string();
+            let held_clone = held.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if !backend_router.fill_incarnation_still(&bk_clone, before) {
+                    return;
+                }
+                let _ = nvme_clone.cache_read_block(&bk_clone, held_clone);
+                if !backend_router.fill_incarnation_still(&bk_clone, before) {
+                    nvme_clone.remove_cached_read_block(&bk_clone);
+                }
+            })
+            .await;
+        }
+        // Hot landing — the pre-lane refetch's warmth propagation
+        // (class ladder identical to the fill path's > 256 KiB arm).
+        METRICS.hot_block_misses.fetch_add(1, Ordering::Relaxed);
+        if ghost_admit && self.tier_admission == TierAdmission::SecondTouch {
+            if class.streaming() {
+                self.cache
+                    .hot_block
+                    .put_protected_stream(block_key, held.clone());
+            } else {
+                self.cache.hot_block.put(block_key, held.clone());
+            }
+        } else if class.streaming() {
+            self.cache
+                .hot_block
+                .put_probationary_referenced(block_key, held.clone());
+        } else {
+            self.cache
+                .hot_block
+                .put_probationary(block_key, held.clone());
+        }
+        // Seqlock completion (publish-then-revalidate): undo across
+        // every tier on movement — the unified purge, exactly the fill
+        // path's rule.
+        if !self
+            .backend_router
+            .fill_incarnation_still(block_key, before)
+        {
+            self.cache.purge_block_key(block_key);
+        }
     }
 
     /// The read-lane issue path (2026-08-01 campaign — the §5.5
@@ -8503,7 +8643,9 @@ impl DataRouter {
                             // funding the governor's payback basis.
                             if self.read_lane.enabled() {
                                 if let Some(b_key) = b_key_opt.as_ref().filter(|_| !device_true) {
-                                    if let Some(held) = self.cache.read_lane_hold.serve(b_key, 0) {
+                                    if let Some((held, ledger_visible)) =
+                                        self.cache.read_lane_hold.serve_with_provenance(b_key, 0)
+                                    {
                                         read_serve_phase_record(
                                             ReadServePhase::ClassifyProbe,
                                             probe_t0,
@@ -8560,6 +8702,31 @@ impl DataRouter {
                                             self.cache
                                                 .read_lane_hold
                                                 .credit(b_key, (end - start) as u64);
+                                            // Ledger visibility (the
+                                            // 2026-07-31 fix): a demand-
+                                            // deposited entry served after
+                                            // the hot/tier probes missed is
+                                            // the pre-lane refetch in serve
+                                            // form — run the R1b ceremony
+                                            // with the same class the
+                                            // refetch would have filled
+                                            // under (one lanes probe, the
+                                            // fill_class rule; only on the
+                                            // visible arm — lane deposits
+                                            // stay invisible).
+                                            if ledger_visible {
+                                                let class = if self
+                                                    .stream_lanes
+                                                    .get(file_path)
+                                                    .is_some_and(|l| l.any_streaming_fresh())
+                                                {
+                                                    FillClass::DemandStream
+                                                } else {
+                                                    FillClass::Demand
+                                                };
+                                                self.hold_serve_admission(b_key, &held, class)
+                                                    .await;
+                                            }
                                             return Ok((data, None));
                                         }
                                         METRICS

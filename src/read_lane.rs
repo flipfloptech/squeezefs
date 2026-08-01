@@ -24,8 +24,16 @@
 //! 1. **The hold** ([`ReadLaneHold`]) — **the shipped default win**:
 //!    completed whole-block fills (demand primaries AND pinned-lane
 //!    fetches; > 256 KiB, validated-fill window only) park in a
-//!    ledger-invisible, purge-integrated, coverage-retired holding
-//!    store. Foreground readers serve from it (binding-rechecked
+//!    retention-ledger-invisible, purge-integrated, coverage-retired
+//!    holding store — RETENTION never publishes, never mutates
+//!    admission state, never exerts eviction pressure. SERVES split by
+//!    deposit provenance (the 2026-07-31 ledger-visibility fix):
+//!    a demand-deposited entry's serve stands in for the pre-lane
+//!    device refetch and carries the R1b admission ledger with it
+//!    (ghost touch → second-touch publish → protected hot landing —
+//!    `DataRouter::hold_serve_admission`); lane-fetch deposits stay
+//!    invisible end to end (the scan-resistance verdict).
+//!    Foreground readers serve from it (binding-rechecked
 //!    exactly like hot-tier hits) and every consumption path credits
 //!    consumed bytes; full coverage retires the entry, so memory
 //!    converges by consumption. This is the deep-qd cohort stability
@@ -201,6 +209,19 @@ struct HoldEntry {
     /// FIFO identity: a trim pop only removes the entry it enqueued
     /// (re-inserted keys carry a fresh seq; stale tombstones skip).
     seq: u64,
+    /// R1b ledger provenance (the 2026-07-31 ledger-visibility fix):
+    /// `true` for DEMAND-primary deposits — a serve of such an entry
+    /// after every tier probe missed stands in for exactly the device
+    /// refetch the pre-lane read would have paid, so the serve sites
+    /// run the ghost/second-touch admission ceremony on it
+    /// (`DataRouter::hold_serve_admission`). `false` for lane-fetch
+    /// deposits, which stay ledger-invisible end to end (the
+    /// scan-resistance verdict — read_lane_tests contract 2).
+    /// "Ledger-invisible" was always a claim about RETENTION (no tier
+    /// publish, no admission mutation, no eviction pressure FROM the
+    /// hold) — never a license for serves to hide re-read heat from
+    /// the R1b convergence contract.
+    ledger_visible: bool,
 }
 
 /// The ledger-invisible completed-fill holding store (module docs §2).
@@ -244,13 +265,29 @@ impl ReadLaneHold {
         self.entries.contains_sync(block_key)
     }
 
-    /// Deposit a completed validated fill. An existing entry for the key
+    /// Deposit a completed validated LANE fill (ledger-invisible serves
+    /// — the scan-resistance posture). An existing entry for the key
     /// is kept (same incarnation ⇒ identical bytes; a changed incarnation
     /// purges first). Then trims oldest-first to `budget` — evictions of
     /// never-fully-consumed entries count
     /// `read_lane_hold_evicted_unconsumed` (the lane's refetch-spiral
     /// detector).
     pub fn insert(&self, block_key: &str, bytes: Bytes, budget: u64) {
+        self.insert_class(block_key, bytes, budget, false);
+    }
+
+    /// [`Self::insert`] with DEMAND provenance: serves of this entry
+    /// carry the R1b admission ledger (see `HoldEntry::ledger_visible`).
+    /// Duplicate-insert keeps the existing entry's provenance — a lane
+    /// deposit racing a demand primary at worst downgrades one ledger
+    /// touch to a missed publish, which is always correctness-safe (the
+    /// next reader goes to the device — the GhostTable's racy-tolerant
+    /// class).
+    pub fn insert_demand(&self, block_key: &str, bytes: Bytes, budget: u64) {
+        self.insert_class(block_key, bytes, budget, true);
+    }
+
+    fn insert_class(&self, block_key: &str, bytes: Bytes, budget: u64, ledger_visible: bool) {
         let len = bytes.len() as u64;
         if len == 0 || budget == 0 {
             return;
@@ -264,6 +301,7 @@ impl ReadLaneHold {
                     bytes,
                     served: AtomicU64::new(0),
                     seq,
+                    ledger_visible,
                 },
             )
             .is_ok()
@@ -281,6 +319,15 @@ impl ReadLaneHold {
     /// serve only, e.g. the single-flight loop probe where the caller's
     /// slice length is unknown). Full coverage retires the entry.
     pub fn serve(&self, block_key: &str, credit: u64) -> Option<Bytes> {
+        self.serve_with_provenance(block_key, credit)
+            .map(|(b, _)| b)
+    }
+
+    /// [`Self::serve`] plus the entry's ledger provenance: `true` when
+    /// the serve must run the R1b admission ceremony (demand-deposited
+    /// entry — see `HoldEntry::ledger_visible`). The router serve
+    /// sites are the only callers that act on the flag.
+    pub fn serve_with_provenance(&self, block_key: &str, credit: u64) -> Option<(Bytes, bool)> {
         let mut retire = false;
         let out = self.entries.read_sync(block_key, |_, e| {
             if credit > 0 {
@@ -290,7 +337,7 @@ impl ReadLaneHold {
                     retire = true;
                 }
             }
-            e.bytes.clone()
+            (e.bytes.clone(), e.ledger_visible)
         })?;
         if retire {
             self.retire(block_key);

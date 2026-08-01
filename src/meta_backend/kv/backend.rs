@@ -1321,6 +1321,14 @@ impl KvMetaBackend {
         Ok(c.mint())
     }
 
+    /// LIVE guest-cursor count (mint-spread + travelled cursors — what
+    /// the next checkpoint's stamp will carry): the
+    /// `meta_slot_stamp_cursors_max` encoding-budget pressure gauge's
+    /// input (design-dynamic-meta-routing §5.8).
+    pub fn guest_cursor_count(&self) -> usize {
+        self.guest_cursors.len()
+    }
+
     /// PR VL5b: the current cursor snapshot for `slot` (the migration
     /// engine reads the SOURCE's travelling cursor at cutover). `None` =
     /// no guest cursor — the slot's keyspace is this volume's legacy one

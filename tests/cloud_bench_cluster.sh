@@ -102,7 +102,6 @@ ELBENCHO_BIN="${ELBENCHO_BIN:-$ARTIFACT_DIR/elbencho}"   # DYNAMIC build (house 
 NQN_PREFIX="nqn.2026-07.io.squeezefs"
 MOUNTPOINT="/scratch/mnt"
 CACHE_DIR="/scratch/cache"
-META_SLOTS=8
 MOUNT_EXTRA="--interception --allow-other --log-file /tmp/sqz.log"
 
 # --- Benchmark battery knobs ------------------------------------------------
@@ -760,7 +759,7 @@ EOS
   # on purpose).
   remote "$client_ip" \
     SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" CACHE="$CACHE_DIR" \
-    META_SPECS="$meta_specs" DATA_SPECS="$data_specs" SLOTS="$META_SLOTS" \
+    META_SPECS="$meta_specs" DATA_SPECS="$data_specs" \
     MOUNT_EXTRA_STR="$(printf '%s' "$MOUNT_EXTRA" | tr ' ' ',')" <<'EOS'
 set -euo pipefail
 modprobe nvme-tcp 2>/dev/null || true
@@ -822,7 +821,7 @@ data_devs="$(connect_all "$DATA_SPECS")"
 META_URI="sqmeta://$meta_devs"
 DATA_URI="sqdata://$data_devs"
 echo "format: $META_URI $DATA_URI"
-"$SQZ" format "$META_URI" "$DATA_URI" --meta-slots "$SLOTS" --disk-cache-paths "$CACHE"
+"$SQZ" format "$META_URI" "$DATA_URI" --disk-cache-paths "$CACHE"
 
 read -ra EXTRA <<<"$(printf '%s' "$MOUNT_EXTRA_STR" | tr ',' ' ')"
 "$SQZ" mount "$META_URI" "$MNT" --daemon "${EXTRA[@]}"

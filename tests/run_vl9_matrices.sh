@@ -284,7 +284,7 @@ run_m2() {
         truncate -s 256M "$RIG/meta2"
         truncate -s 2G   "$RIG/oss1"
         "$BIN" format "sqmeta://$RIG/meta1,$RIG/meta2" "sqdata://$RIG/oss1" \
-            --disk-cache-paths "$RIG/staging" --meta-slots 8 --force >/dev/null
+            --disk-cache-paths "$RIG/staging" --force >/dev/null
         do_mount "sqmeta://$RIG/meta1,$RIG/meta2"
         mkdir -p "$MNT/dataset"
         for d in 0 1 2 3; do

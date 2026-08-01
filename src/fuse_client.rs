@@ -5733,6 +5733,42 @@ impl SqueezefsFilesystem {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default(),
+                // Dynamic meta routing (design-dynamic-meta-routing §5.8):
+                // the set's STORED derived width (constant per set —
+                // operators key on it like meta_format_version), the
+                // effective mint spread, and the stamp encoding-budget
+                // pressure gauges (approaching STAMP_MAX_RUNS /
+                // STAMP_MAX_CURSORS means consolidate before a migration
+                // preflight refuses).
+                "meta_routing_width": self
+                    .meta_backend
+                    .as_ref()
+                    .map(|mb| mb.routing_width())
+                    .unwrap_or(0),
+                "meta_slot_mint_spread": crate::meta_backend::MINT_SPREAD,
+                "meta_slot_stamp_runs_max": self
+                    .meta_backend
+                    .as_ref()
+                    .map(|mb| {
+                        mb.volumes
+                            .iter()
+                            .filter_map(|v| v.membership_stamp())
+                            .map(|st| st.slots_hosted.runs().len())
+                            .max()
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0),
+                "meta_slot_stamp_cursors_max": self
+                    .meta_backend
+                    .as_ref()
+                    .map(|mb| {
+                        mb.volumes
+                            .iter()
+                            .map(|v| v.guest_cursor_count())
+                            .max()
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0),
             },
             "cache_capacities": {
                 "read_lru_current_bytes": self.router.cache.read_lru.current_bytes(),

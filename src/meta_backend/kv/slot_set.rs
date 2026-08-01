@@ -55,9 +55,8 @@ impl SlotRun {
     }
 
     fn iter(&self) -> impl Iterator<Item = u16> + '_ {
-        (0..self.count).map(|k| {
-            (u64::from(self.start) + u64::from(k) * u64::from(self.stride)) as u16
-        })
+        (0..self.count)
+            .map(|k| (u64::from(self.start) + u64::from(k) * u64::from(self.stride)) as u16)
     }
 }
 
@@ -247,9 +246,7 @@ mod tests {
         // The fresh distribution for member v of V: {v + kV}.
         for v_count in [1u16, 2, 3, 8] {
             for pos in 0..v_count {
-                let slots: Vec<u16> = (pos..=u16::MAX)
-                    .step_by(usize::from(v_count))
-                    .collect();
+                let slots: Vec<u16> = (pos..=u16::MAX).step_by(usize::from(v_count)).collect();
                 let set = SlotSet::from_slots(&slots);
                 assert_eq!(set.runs().len(), 1, "V={v_count} pos={pos}");
                 assert_eq!(set.len(), slots.len());

@@ -113,7 +113,8 @@ async fn wipe_ledger(meta: &Path) {
     use std::io::{Seek, SeekFrom, Write};
     let mut f = std::fs::OpenOptions::new().write(true).open(meta).unwrap();
     f.seek(SeekFrom::Start(sb.root_ledger.start)).unwrap();
-    f.write_all(&vec![0u8; sb.root_ledger.len as usize]).unwrap();
+    f.write_all(&vec![0u8; sb.root_ledger.len as usize])
+        .unwrap();
     f.sync_all().unwrap();
 }
 
@@ -146,7 +147,9 @@ fn stamp(pos: u16, count: u16, width: u32, epoch: u64, uuid: [u8; 16]) -> Member
         member_count: count,
         routing_width: width,
         slots_hosted: SlotSet::from_slots(
-            &(0..width as u16).filter(|s| s % count == pos).collect::<Vec<_>>(),
+            &(0..width as u16)
+                .filter(|s| s % count == pos)
+                .collect::<Vec<_>>(),
         ),
         native_slot: Some(pos),
         slot_cursors: Vec::new(),
@@ -380,7 +383,11 @@ async fn test_in_ram_constructor_routes_identity_for_one_volume() {
         .await
         .expect("open legacy volume");
     let routed = RoutedMetaBackend::new(vec![kv]);
-    assert_eq!(routed.routing_width(), 1, "in-RAM constructor: W = volume count");
+    assert_eq!(
+        routed.routing_width(),
+        1,
+        "in-RAM constructor: W = volume count"
+    );
     for ino in [1u64, 2, 3, 999_999] {
         assert_eq!(routed.route_ino(ino), (0, ino), "identity short-circuit");
         assert_eq!(routed.make_global_ino(ino, 0), ino);

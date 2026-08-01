@@ -110,7 +110,7 @@ truncate -s 8G   "$BASE/oss1"
 truncate -s 8G   "$BASE/oss2"
 META_URI="sqmeta://$BASE/meta1,$BASE/meta2"
 "$BIN" format "$META_URI" "sqdata://$BASE/oss1,$BASE/oss2" \
-    --disk-cache-paths "$BASE/staging" --meta-slots 8 --force >/dev/null
+    --disk-cache-paths "$BASE/staging" --force >/dev/null
 
 # Rotation state (persists across iterations — the CONTINUING set).
 OSS3_ID=""            # active vol- id of the oss3 device ("" = not a member)

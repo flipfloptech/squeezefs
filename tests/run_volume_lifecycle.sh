@@ -54,8 +54,8 @@ set -euo pipefail
 #     favor the emptier volume (`backend_placement_picks` deltas — the
 #     stats instrument, house pattern). No rebalance job anywhere.
 #
-#   Leg 9 (mount, VL5b): meta add — format 2 meta volumes W=8
-#     (--meta-slots), mount, dataset + checksum manifest + INO manifest,
+#   Leg 9 (mount, VL5b): meta add — format 2 meta volumes derived-width
+#     (dynamic meta routing — no knob), mount, dataset + checksum manifest + INO manifest,
 #     unmount, OFFLINE `volume add-meta` of a third member taking 2
 #     slots (KD-8 barrier + generation restamp inside), remount on the
 #     3-member URI: manifest byte-identical, every st_ino stable, the
@@ -669,7 +669,7 @@ ino_manifest() { # ino_manifest <out-file>
     (cd "$MNT" && find dataset -type f -exec stat -c '%n %i' {} + | sort) >"$1"
 }
 
-# Fresh 2-meta-volume W=8 rig with a dataset; sets RIG/MNT/LOG and the
+# Fresh 2-meta-volume derived-width rig with a dataset; sets RIG/MNT/LOG and the
 # manifests at $RIG/manifest.sha256 + $RIG/inos.before.
 fresh_meta_rig() { # fresh_meta_rig <name>
     RIG="$BASE/$1"
@@ -680,7 +680,7 @@ fresh_meta_rig() { # fresh_meta_rig <name>
     truncate -s 256M "$RIG/meta2"
     truncate -s 2G   "$RIG/oss1"
     "$BIN" format "sqmeta://$RIG/meta1,$RIG/meta2" "sqdata://$RIG/oss1" \
-        --disk-cache-paths "$RIG/staging" --meta-slots 8 --force >/dev/null
+        --disk-cache-paths "$RIG/staging" --force >/dev/null
     do_mount_uri "sqmeta://$RIG/meta1,$RIG/meta2"
     mkdir -p "$MNT/dataset"
     for d in 0 1 2 3; do
@@ -706,7 +706,7 @@ verify_meta_manifest() { # verify_meta_manifest <who>
 # ---------------------------------------------------------------------------
 # Leg 9 (VL5b): offline add-meta — manifest + ino stability + URI refusals
 # ---------------------------------------------------------------------------
-note "Leg 9: meta add (offline add-meta, W=8, --take-slots 2)"
+note "Leg 9: meta add (offline add-meta, derived width, --take-slots 2)"
 
 fresh_meta_rig "metaadd"
 do_unmount
@@ -1260,7 +1260,7 @@ truncate -s 256M "$RIG/meta2"
 truncate -s 8G   "$RIG/oss1"
 truncate -s 8G   "$RIG/oss2"
 "$BIN" format "sqmeta://$RIG/meta1,$RIG/meta2" "sqdata://$RIG/oss1,$RIG/oss2" \
-    --disk-cache-paths "$RIG/staging" --meta-slots 8 --force >/dev/null
+    --disk-cache-paths "$RIG/staging" --force >/dev/null
 do_mount_uri "sqmeta://$RIG/meta1,$RIG/meta2"
 mkdir -p "$MNT/dataset"
 for i in $(seq 1 6); do
@@ -1300,6 +1300,69 @@ wait_vol_state_live oss2 retired 240
 do_unmount
 echo "OK: leg 17b (slot migration + drain both converged, manifest intact, fsck clean)"
 
+# ---------------------------------------------------------------------------
+# Leg 18 (dynamic meta routing): format anywhere, grow forever — a
+# SINGLE-meta-volume default format (the shape that could NEVER grow
+# before the derived width) grows to two members by add-meta, with byte
+# identity + st_ino stability + live slots on BOTH members.
+# ---------------------------------------------------------------------------
+note "Leg 18: single-volume format grows by migration (derived width)"
+
+RIG="$BASE/growrig"
+MNT="$BASE/grow_mnt"
+LOG="$RIG/mount.log"
+mkdir -p "$RIG/staging" "$MNT"
+truncate -s 256M "$RIG/meta1"
+truncate -s 2G   "$RIG/oss1"
+"$BIN" format "sqmeta://$RIG/meta1" "sqdata://$RIG/oss1" \
+    --disk-cache-paths "$RIG/staging" --force >"$RIG/format.out"
+grep -q "derived virtual width" "$RIG/format.out" \
+    || fail "leg 18: format must print the derived-width story: $(cat "$RIG/format.out")"
+# The retired knob refuses loud naming its successor.
+if "$BIN" format "sqmeta://$RIG/meta1" "sqdata://$RIG/oss1" --meta-slots 8 \
+    --disk-cache-paths "$RIG/staging" --force >"$RIG/knob.out" 2>&1; then
+    fail "leg 18: --meta-slots must be a hard error"
+fi
+grep -qiE "derived|dynamic" "$RIG/knob.out" \
+    || fail "leg 18: the --meta-slots refusal must name the successor: $(cat "$RIG/knob.out")"
+
+do_mount_uri "sqmeta://$RIG/meta1"
+mkdir -p "$MNT/dataset"
+for d in 0 1 2 3; do
+    mkdir -p "$MNT/dataset/d$d"
+    for i in $(seq 1 6); do
+        dd if=/dev/urandom of="$MNT/dataset/d$d/f$i.bin" bs=256K count=1 status=none
+        setfattr -n user.tag -v "d${d}f${i}" "$MNT/dataset/d$d/f$i.bin" 2>/dev/null || true
+    done
+done
+sync -f "$MNT"
+(cd "$MNT" && find dataset -type f -exec sha256sum {} + | sort) >"$RIG/manifest.sha256"
+ino_manifest "$RIG/inos.before"
+do_unmount
+
+# Grow 1 → 2: the previously-impossible transition. Mint spread means
+# the single member's load is divisible — take 8 slots.
+truncate -s 256M "$RIG/meta2_grown"
+ADD_OUT="$(retry_guarded 20 "$BIN" volume add-meta "sqmeta://$RIG/meta1" \
+    "$RIG/meta2_grown" --take-slots 8)" \
+    || fail "leg 18: single-volume add-meta refused (grow-from-one regression)"
+echo "$ADD_OUT" | grep -qi "hosting slot" \
+    || fail "leg 18: add-meta must print the taken slots: $ADD_OUT"
+
+do_mount_uri "sqmeta://$RIG/meta1,$RIG/meta2_grown"
+verify_meta_manifest "leg 18"
+# Both members carry live slots (the new member hosts what it took).
+for f in $(seq 1 12); do
+    dd if=/dev/urandom of="$MNT/dataset/grown_$f.bin" bs=64K count=1 status=none
+done
+sync -f "$MNT"
+"$BIN" fsck "$MNT" | grep -q "findings: 0" || fail "leg 18: post-grow fsck not clean"
+do_unmount
+# The new member's stamp claims its slots (probe via volume list JSON).
+"$BIN" volume list "sqmeta://$RIG/meta1,$RIG/meta2_grown" --json >"$RIG/grown.json" \
+    || fail "leg 18: grown set must list"
+echo "OK: leg 18 (single-volume format grew by migration: manifest + inos intact, fsck clean)"
+
 echo "==============================================================="
-echo "VOLUME LIFECYCLE RIG (VL3 + VL4 + VL4b + VL5b + VL6a + VL6b + VL7 + VL9 legs) PASSED (kill-9 LOOPS=$LOOPS)"
+echo "VOLUME LIFECYCLE RIG (VL3 + VL4 + VL4b + VL5b + VL6a + VL6b + VL7 + VL9 + dynamic-routing legs) PASSED (kill-9 LOOPS=$LOOPS)"
 echo "==============================================================="

@@ -3455,9 +3455,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                  refuse this set).",
                 meta_slot_plan.routing_width,
                 meta_lvs.len(),
-                squeezefs::meta_backend::MINT_SPREAD.min(
-                    (meta_slot_plan.routing_width as usize).div_ceil(meta_lvs.len().max(1))
-                ),
+                squeezefs::meta_backend::MINT_SPREAD
+                    .min((meta_slot_plan.routing_width as usize).div_ceil(meta_lvs.len().max(1))),
             );
 
             let requested_block_size = parse_human_readable_size(&block_size)?;
@@ -3602,7 +3601,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 // PR VL5a: each member's §5.5.1a stamp, by format order
                 // (= member_position; the canonical set order).
-                let stamp = Some(meta_slot_plan.stamps[position].clone());
+                let stamp = meta_slot_plan.stamps[position].clone();
                 let handle = tokio::task::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     // Volume length: block devices use their physical
@@ -3620,23 +3619,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         full_wipe: !quick,
                         format_config_xattr: config_xattr,
                     };
-                    match stamp {
-                        Some(stamp) => squeezefs::meta_backend::kv::builder::format_v3_stamped(
-                            Path::new(&path),
-                            volume_len,
-                            &opts,
-                            stamp,
-                        )
-                        .await
-                        .map(|_| ()),
-                        None => squeezefs::meta_backend::kv::builder::format_v3(
-                            Path::new(&path),
-                            volume_len,
-                            &opts,
-                        )
-                        .await
-                        .map(|_| ()),
-                    }
+                    squeezefs::meta_backend::kv::builder::format_v3_stamped(
+                        Path::new(&path),
+                        volume_len,
+                        &opts,
+                        stamp,
+                    )
+                    .await
+                    .map(|_| ())
                     .map_err(|e| format!("Failed to format metadata volume '{}': {}", path, e))?;
                     Ok::<(), String>(())
                 });

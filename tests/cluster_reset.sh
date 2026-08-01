@@ -30,7 +30,6 @@ MOUNTPOINT="/scratch/tmp/test"
 CACHE_DIR=""                # staging/cache dir; EMPTY = cache-less format (the right
                             # posture when local disk is slower than the fabric — the
                             # SATA-cache lesson: same throughput, tails 238ms -> 58ms)
-META_SLOTS=8
 MDS_SIZE_MB=8192            # null_blk size per metadata namespace
 
 # Data-plane width. Every data namespace is its own subsystem (own nvme-tcp
@@ -286,13 +285,13 @@ for s in /sys/class/nvme-subsystem/nvme-subsys*/iopolicy; do
 done
 
 # ---------- 4. Format --------------------------------------------------------
-log "4/5 format (meta-slots=$META_SLOTS, data plane: ${#DATA_SUFFIXES[@]} namespaces)"
+log "4/5 format (derived meta routing width, data plane: ${#DATA_SUFFIXES[@]} namespaces)"
 mkdir -p "$MOUNTPOINT"
 meta_devs=""; for s in "${META_SUFFIXES[@]}"; do meta_devs+="${meta_devs:+,}${DEV[$s]}"; done
 data_devs=""; for s in "${DATA_SUFFIXES[@]}"; do data_devs+="${data_devs:+,}${DEV[$s]}"; done
 META_URI="sqmeta://$meta_devs"
 DATA_URI="sqdata://$data_devs"
-FORMAT_ARGS=("$META_URI" "$DATA_URI" --meta-slots "$META_SLOTS")
+FORMAT_ARGS=("$META_URI" "$DATA_URI")
 if [ -n "$CACHE_DIR" ]; then
   mkdir -p "$CACHE_DIR"
   FORMAT_ARGS+=(--disk-cache-paths "$CACHE_DIR")

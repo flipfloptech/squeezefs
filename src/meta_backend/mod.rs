@@ -2340,14 +2340,12 @@ pub struct MetaSetDiscovery {
     /// Superblock uuids in the same canonical order (the
     /// [`volume_set_generation`] inputs).
     pub uuids: Vec<[u8; 16]>,
-    /// The frozen routing width W (legacy: the volume count).
+    /// The stored (derived-at-format) routing width W.
     pub routing_width: u64,
-    /// `slot → canonical volume index` (legacy: identity).
+    /// `slot → canonical volume index`.
     pub slot_to_volume: Vec<usize>,
-    /// Whether §5.5.1a stamps drove the reconstruction.
-    pub stamped: bool,
-    /// PR VL5b: per canonical volume, the slot whose records live in its
-    /// LEGACY keyspace (`MembershipStamp::resolved_native_slot`).
+    /// Per canonical volume, the slot whose records live in its LEGACY
+    /// keyspace (`MembershipStamp::resolved_native_slot`).
     pub native_slots: Vec<Option<u16>>,
     /// PR VL5b: the highest membership epoch observed across the set
     /// (the flip protocol's clock; legacy sets report 0).
@@ -2357,8 +2355,10 @@ pub struct MetaSetDiscovery {
 /// §5.5.1a order-independent discovery: probe every URI-listed volume's
 /// stamp FIRST (before any tree routing), reconstruct the membership by
 /// `member_position`, cross-check `set_uuid`/`set_epoch`/completeness,
-/// and only then let callers route ino 1. Legacy sets (no stamps): URI
-/// order stays authoritative, byte-identical to pre-VL5a behavior.
+/// and only then let callers route ino 1. All-stampless sets refuse
+/// loud (torn formats / foreign ledgers — every dynamic-routing format
+/// stamps at format time; the legacy implicit-identity arm died with
+/// the frozen widths, design-dynamic-meta-routing §5.6).
 /// **Every disagreement is a loud refusal naming the volumes**: mixed
 /// stamped/unstamped members, foreign `set_uuid`s, torn/mixed epochs
 /// (crash mid-protocol — the refusal names `squeezefs volume
@@ -2559,7 +2559,6 @@ pub async fn discover_meta_set(paths: &[String]) -> Result<MetaSetDiscovery> {
         uuids: ordered.iter().map(|o| o.uuid).collect(),
         routing_width: width,
         slot_to_volume: map,
-        stamped: true,
         native_slots,
         set_epoch,
     })

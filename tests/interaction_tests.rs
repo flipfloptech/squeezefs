@@ -128,8 +128,8 @@ async fn format_meta(meta: &Path, data_lvs: &[&Path]) {
 /// xattr on member 0 only) — the pin (d) fixture shape.
 async fn format_stamped_metas(metas: &[PathBuf], width: u32, data_lvs: &[&Path]) {
     let cfg = base_format_config(data_lvs);
-    let plan =
-        squeezefs::meta_backend::plan_meta_slot_set_with_width(metas.len(), width).expect("plan admits");
+    let plan = squeezefs::meta_backend::plan_meta_slot_set_with_width(metas.len(), width)
+        .expect("plan admits");
     for (i, m) in metas.iter().enumerate() {
         squeezefs::meta_backend::kv::builder::format_v3_stamped(
             m,

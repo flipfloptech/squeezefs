@@ -60,9 +60,9 @@ use squeezefs::meta_backend::slot_migration::{
     MigrationTestHooks, PhaseHold,
 };
 use squeezefs::meta_backend::{
-    discover_meta_set, guest_local_ino, open_routed_meta_set, plan_meta_slot_set_with_width, route_ino_width,
-    split_guest_local, volume_set_generation, Metadata, RoutedMetaBackend, GUEST_NS_BASE,
-    GUEST_NS_SHIFT,
+    discover_meta_set, guest_local_ino, open_routed_meta_set, plan_meta_slot_set_with_width,
+    route_ino_width, split_guest_local, volume_set_generation, Metadata, RoutedMetaBackend,
+    GUEST_NS_BASE, GUEST_NS_SHIFT,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -301,7 +301,9 @@ fn test_stamp_round_trip_with_and_without_cursors() {
     };
     // One stamp wire (stride runs, dynamic meta routing): a cursor-free
     // stamp round-trips byte-faithfully.
-    let img_v1 = rec_of(v1.clone()).encode_slot().expect("cursor-free encodes");
+    let img_v1 = rec_of(v1.clone())
+        .encode_slot()
+        .expect("cursor-free encodes");
     let back = LedgerRecord::decode_slot(&img_v1).expect("cursor-free decodes");
     assert_eq!(back.membership_stamp.as_ref(), Some(&v1));
 

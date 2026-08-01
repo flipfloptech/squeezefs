@@ -1265,11 +1265,10 @@ async fn observe_stamped_members(meta_lvs: &[String]) -> Result<Vec<MemberObs>> 
         let crate::meta_backend::MetaVolumeObservation { path, uuid, stamp } = o;
         let Some(stamp) = stamp else {
             return Err(SqueezefsError::InvalidOperation(format!(
-                "metadata volume {path} carries no §5.5.1a membership stamp — meta membership \
-                 changes need a `format --meta-slots` set (a legacy set's routing width \
-                 equals its volume count: every slot is its host's only slot, so there is \
-                 nothing a new member could take — the W-granularity law, \
-                 design-volume-lifecycle §5.5.1/operations.md)"
+                "metadata volume {path} carries no §5.5.1a membership stamp — every \
+                 dynamic-routing format stamps its members at format time, so this ledger \
+                 is torn or foreign; run `squeezefs volume repair-set` (inferable states) \
+                 or reformat"
             )));
         };
         out.push(MemberObs { path, uuid, stamp });
@@ -1512,7 +1511,9 @@ pub async fn add_meta_volume_with(
                     if bearing {
                         loads.push((slot_record_count(&m.path, s, native).await?, s));
                         loaded_probed += 1;
-                    } else if loads.len() < loaded_probed + usize::try_from(*k).unwrap_or(usize::MAX) {
+                    } else if loads.len()
+                        < loaded_probed + usize::try_from(*k).unwrap_or(usize::MAX)
+                    {
                         loads.push((0, s));
                     }
                 }

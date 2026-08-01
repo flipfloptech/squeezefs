@@ -33,9 +33,8 @@ use squeezefs::meta_backend::kv::checkpoint::{
 use squeezefs::meta_backend::kv::slot_set::{SlotRun, SlotSet};
 use squeezefs::meta_backend::kv::superblock::{
     FEATURES_INCOMPAT_KNOWN, FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING, FEATURE_INCOMPAT_KV_GUEST_SLOTS,
-    FEATURE_INCOMPAT_KV_LAYOUT_DELTAS, FEATURE_INCOMPAT_KV_SLOT_MIGRATION,
-    FEATURE_INCOMPAT_KV_V3, FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE,
-    FEATURE_INCOMPAT_NODE_SEQ_WATERMARK,
+    FEATURE_INCOMPAT_KV_LAYOUT_DELTAS, FEATURE_INCOMPAT_KV_SLOT_MIGRATION, FEATURE_INCOMPAT_KV_V3,
+    FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE, FEATURE_INCOMPAT_NODE_SEQ_WATERMARK,
 };
 use squeezefs::meta_backend::{
     discover_meta_set, make_global_ino_width, open_routed_meta_set, plan_meta_slot_set,
@@ -307,7 +306,10 @@ fn test_slot_set_coalesces_and_mutates() {
     set2.remove(10);
     assert!(!set2.contains(10));
     assert_eq!(set2.len(), 99);
-    assert!(set2.runs().len() <= 3, "one hole splits into at most 3 runs");
+    assert!(
+        set2.runs().len() <= 3,
+        "one hole splits into at most 3 runs"
+    );
     set2.insert(10);
     assert_eq!(set2.len(), 100);
     assert_eq!(set2.runs().len(), 1, "re-coalesced after heal");
@@ -410,7 +412,9 @@ proptest! {
 #[test]
 fn test_stamp_round_trips_through_the_ledger_slot() {
     let mut st = fresh_stamp(1, 3);
-    st.slot_cursors = (0..64u16).map(|s| (s * 3 + 1, 1000 + u64::from(s))).collect();
+    st.slot_cursors = (0..64u16)
+        .map(|s| (s * 3 + 1, 1000 + u64::from(s)))
+        .collect();
     st.native_slot = Some(1);
     let image = rec(Some(st.clone())).encode_slot().expect("encodes");
     let back = LedgerRecord::decode_slot(&image).expect("decodes");
@@ -442,9 +446,7 @@ fn test_encoding_budget_caps_encode_at_cap_refuse_past_it() {
     let mut st = fresh_stamp(0, 1);
     st.slots_hosted = singleton_runs(STAMP_MAX_RUNS);
     assert_eq!(st.slots_hosted.runs().len(), STAMP_MAX_RUNS);
-    st.slot_cursors = (0..STAMP_MAX_CURSORS as u16)
-        .map(|s| (s, 7u64))
-        .collect();
+    st.slot_cursors = (0..STAMP_MAX_CURSORS as u16).map(|s| (s, 7u64)).collect();
     st.native_slot = Some(0);
     rec(Some(st.clone()))
         .encode_slot()
@@ -453,7 +455,9 @@ fn test_encoding_budget_caps_encode_at_cap_refuse_past_it() {
     // One more run refuses loud.
     let mut over_runs = st.clone();
     over_runs.slots_hosted = singleton_runs(STAMP_MAX_RUNS + 1);
-    let err = rec(Some(over_runs)).encode_slot().expect_err("cap+1 refuses");
+    let err = rec(Some(over_runs))
+        .encode_slot()
+        .expect_err("cap+1 refuses");
     assert!(
         format!("{err}").contains("run"),
         "refusal names the run budget: {err}"
@@ -462,7 +466,9 @@ fn test_encoding_budget_caps_encode_at_cap_refuse_past_it() {
     // One more cursor refuses loud.
     let mut over_cur = st;
     over_cur.slot_cursors.push((u16::MAX, 9));
-    let err = rec(Some(over_cur)).encode_slot().expect_err("cursor cap+1 refuses");
+    let err = rec(Some(over_cur))
+        .encode_slot()
+        .expect_err("cursor cap+1 refuses");
     assert!(
         format!("{err}").contains("cursor"),
         "refusal names the cursor budget: {err}"
@@ -510,7 +516,7 @@ proptest! {
 async fn test_mint_spread_rotates_across_the_mint_set_and_survives_remount() {
     let dir = tempfile::tempdir().unwrap();
     let meta = make_file(dir.path(), "meta", VOL_LEN);
-    format_set(&[meta.clone()]).await;
+    format_set(std::slice::from_ref(&meta)).await;
     let uri = vec![meta.display().to_string()];
 
     let routed = open_routed_meta_set(&uri).await.expect("open routed set");
@@ -593,7 +599,10 @@ async fn test_created_inos_stable_across_slot_migration_and_remount() {
     for (name, ino) in &made {
         let looked = routed.lookup(1, name).await.expect("lookup").ino;
         assert_eq!(looked, *ino, "st_ino stable across migration: {name}");
-        routed.getattr(*ino).await.expect("getattr routes post-flip");
+        routed
+            .getattr(*ino)
+            .await
+            .expect("getattr routes post-flip");
     }
     shutdown_routed(&routed).await;
 

@@ -1632,6 +1632,13 @@ impl Ent {
 
 /// Poll `/dev/fuse` until the connection is aborted/closed or the pool shuts down.
 fn connection_watch(pool: Arc<FuseOverUring>) {
+    // A std thread inherits its SPAWNER's affinity — here a core-pinned
+    // tokio runtime worker, leaving the watch 1-CPU hostage. Node scope
+    // (transport-ingress campaign) resets it to the process mask; the
+    // `core` lever keeps the historical inherited posture.
+    if crate::raw::affinity::pin_scope() == crate::raw::affinity::PinScope::Node {
+        let _ = crate::raw::affinity::set_current_affinity(&crate::raw::affinity::process_cpus());
+    }
     let mut last_seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut last_scan = Instant::now();
     while pool.active.load(Ordering::Relaxed) {
@@ -1696,15 +1703,46 @@ fn queue_worker(
     } else {
         None
     };
-    // Best-effort pin to core qid; when the exact core is outside the
-    // process mask (taskset-restricted mounts) fall back to the queue's
-    // NODE cpu set (intersected with the process mask) so the worker's
-    // reply serves and the arena stay co-located.
-    if !core_affinity::set_for_current(core_affinity::CoreId { id: qid as usize }) {
-        if let Some(n) = queue_node {
-            if crate::numa_core::placement_active() {
-                let _ = crate::numa_core::topology().pin_current_to_node(n);
+    // Affinity posture (transport-ingress campaign 2026-08-01): node
+    // scope by DEFAULT — the worker keeps its queue's home node (arena
+    // binding + reply-serve locality unchanged) but may run on any
+    // process-mask CPU of it, so the reap wake stops paying the pinned
+    // core's runqueue wait (the same hostage mechanism the fuse3-tpc
+    // lanes measured; that wait lands in the KERNEL-SIDE residue term).
+    // `SQUEEZEFS_FUSE_PIN_SCOPE=core` restores the pre-campaign posture.
+    match crate::raw::affinity::pin_scope() {
+        crate::raw::affinity::PinScope::Core => {
+            // Best-effort pin to core qid; when the exact core is outside
+            // the process mask (taskset-restricted mounts) fall back to
+            // the queue's NODE cpu set (intersected with the process mask)
+            // so the worker's reply serves and the arena stay co-located.
+            if !core_affinity::set_for_current(core_affinity::CoreId { id: qid as usize }) {
+                if let Some(n) = queue_node {
+                    if crate::numa_core::placement_active() {
+                        let _ = crate::numa_core::topology().pin_current_to_node(n);
+                    }
+                }
             }
+        }
+        crate::raw::affinity::PinScope::Node => {
+            // Home = cpu qid when qid IS a kernel cpu id; the derivation
+            // degrades to the whole process mask for testing queue
+            // overrides / unknown nodes / masks excluding the node.
+            let topo = crate::numa_core::topology();
+            let avail = crate::raw::affinity::process_cpus();
+            let cpus = crate::raw::affinity::scoped_affinity_cpus(
+                crate::raw::affinity::PinScope::Node,
+                qid as usize,
+                &avail,
+                |c| topo.node_of_cpu(c),
+                |n| {
+                    topo.nodes()
+                        .get(n)
+                        .map(|d| d.cpus.clone())
+                        .unwrap_or_default()
+                },
+            );
+            let _ = crate::raw::affinity::set_current_affinity(&cpus);
         }
     }
 

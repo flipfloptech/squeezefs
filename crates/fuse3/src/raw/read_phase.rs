@@ -147,6 +147,26 @@ pub fn read_inplace_replies() -> u64 {
     READ_INPLACE_REPLIES.load(Ordering::Relaxed)
 }
 
+static WRITE_INPLACE_REPLIES: AtomicU64 = AtomicU64::new(0);
+
+/// Count one in-place WRITE reply (the READ P2 arm's WRITE twin: a
+/// synchronous COMMIT enqueue from the handler task — the reply-channel +
+/// reply-task hop, whose wake pays the pinned main-runtime hostage class,
+/// is gone).
+#[inline]
+pub(crate) fn note_write_inplace_reply() {
+    WRITE_INPLACE_REPLIES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// In-place WRITE reply engagement gauge (stats inode
+/// `fuse3_write_inplace_replies`): on an armed over-uring session this
+/// must account ≈ every successful WRITE — the gauge is what keeps the
+/// arm wired (the READ arm sat structurally disengaged for weeks because
+/// nothing measured it; see [`read_inplace_replies`]).
+pub fn write_inplace_replies() -> u64 {
+    WRITE_INPLACE_REPLIES.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod transport_phase_tests {
     use super::*;

@@ -5158,6 +5158,9 @@ impl SqueezefsFilesystem {
                 // connection, so handle_read's in-place arm never fired;
                 // on an armed session this must account ≈ every READ).
                 "fuse3_read_inplace_replies": fuse3::read_inplace_replies(),
+                // The WRITE twin (transport-ingress campaign): the gauge
+                // is what keeps the in-place arm wired.
+                "fuse3_write_inplace_replies": fuse3::write_inplace_replies(),
                 // Write-commit-economy (2026-07-30): lever-1 coalescing
                 // engagement (blocks/batch = the live coalesce factor)
                 // and lever-2 layout-delta engagement (delta vs full

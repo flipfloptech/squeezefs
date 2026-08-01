@@ -2459,6 +2459,14 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
+        // P2 per-op economy, WRITE twin (transport-ingress campaign): on
+        // an armed over-uring session the WRITE reply is completed in
+        // place from the handler task (a synchronous COMMIT enqueue;
+        // the §5.4 commit gate still parks it while the payload lease
+        // lives) instead of hopping through the unbounded reply channel
+        // + the per-queue reply task — one cross-thread task wake per op
+        // saved on the write wall's ACK chain.
+        let reply_conn = self.fuse_connection.clone();
 
         spawn(debug_span!("fuse_write"), async move {
             crate::raw::read_phase::write_transport_phase_record(
@@ -2509,11 +2517,33 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 .serialize_into(&mut data, &write_out)
                 .expect("won't happened");
 
-            let _ = resp_sender.send(Either::Left(data)).await;
-            // `reply_commit`: handler returned → reply handed to the
-            // transport (channel arm: the hand-off toward the per-queue
-            // reply task — the in-place WRITE arm, when it lands, makes
-            // this the synchronous COMMIT enqueue like the READ twin).
+            // In-place reply on an armed session; the channel path stays
+            // for INIT-phase/classical sessions (pool not ready) and any
+            // clone without a connection handle. Error semantics mirror
+            // `reply_fuse`: NotFound = interrupted/double reply (benign);
+            // anything else is logged loud — the session's dispatch task
+            // observes a dead connection through its own read path.
+            match reply_conn.filter(|c| c.over_uring_ready()) {
+                Some(conn) => {
+                    if let Err(err) = conn.write_vectored(data, None::<Bytes>).await.1 {
+                        if err.kind() == ErrorKind::NotFound {
+                            warn!(
+                                "may reply interrupted fuse request, ignore this error {}",
+                                err
+                            );
+                        } else {
+                            error!("in-place write reply failed {}", err);
+                        }
+                    }
+                    crate::raw::read_phase::note_write_inplace_reply();
+                }
+                None => {
+                    let _ = resp_sender.send(Either::Left(data)).await;
+                }
+            }
+            // `reply_commit`: handler returned → reply committed to the
+            // transport (in-place arm: the synchronous COMMIT enqueue;
+            // the channel arm measures the hand-off — INIT-phase only).
             crate::raw::read_phase::write_transport_phase_record(
                 crate::raw::read_phase::TransportPhase::ReplyCommit,
                 reply_t0.elapsed(),
@@ -4591,41 +4621,11 @@ struct TpcScheduler {
 }
 
 impl TpcScheduler {
-    /// CPU ids of the PROCESS affinity mask (the main thread's — tid == pid
-    /// — which is never core-pinned), NOT the calling thread's.
-    ///
-    /// `TPC_SCHEDULER` is a `Lazy` first touched from a FUSE dispatch task,
-    /// which the embedding daemon runs on a runtime worker pinned to ONE
-    /// core. `core_affinity::get_core_ids()` consults the calling thread's
-    /// mask, so sizing from it collapsed the whole handler pool to a single
-    /// LocalSet thread — every handler future serialized onto it, and one
-    /// synchronously parked handler wedged every FUSE request on the mount
-    /// (the SqueezeFS Hang-1 fsx `copy_file_range` wedge).
-    fn process_core_ids() -> Vec<core_affinity::CoreId> {
-        // SAFETY: zeroed cpu_set_t is a valid empty set; sched_getaffinity
-        // writes at most size_of::<cpu_set_t>() bytes into it.
-        unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            if libc::sched_getaffinity(
-                std::process::id() as libc::pid_t,
-                std::mem::size_of::<libc::cpu_set_t>(),
-                &mut set,
-            ) == 0
-            {
-                let ids: Vec<core_affinity::CoreId> = (0..libc::CPU_SETSIZE as usize)
-                    .filter(|&i| libc::CPU_ISSET(i, &set))
-                    .map(|id| core_affinity::CoreId { id })
-                    .collect();
-                if !ids.is_empty() {
-                    return ids;
-                }
-            }
-        }
-        core_affinity::get_core_ids().unwrap_or_default()
-    }
-
     fn new() -> Self {
-        let mut core_ids = Self::process_core_ids();
+        // CPU ids come from the PROCESS affinity mask, never the calling
+        // thread's (`affinity::process_cpus` — the Hang-1 pinned-first-
+        // toucher lesson lives on its doc).
+        let mut core_ids = crate::raw::affinity::process_cpus();
         if core_ids.len() > 1 {
             core_ids.remove(0); // Reserve Core 0 for OS kernel tasks
         }
@@ -4640,8 +4640,8 @@ impl TpcScheduler {
         };
 
         // Lane → node grouping for node-targeted dispatch: the node of
-        // each lane's PINNED core (unpinned lanes — empty core_ids —
-        // join no group and ride the global rotation only).
+        // each lane's HOME core (homeless lanes — empty core_ids — join
+        // no group and ride the global rotation only).
         let topo = crate::numa_core::topology();
         let mut node_lanes: Vec<Vec<usize>> = vec![Vec::new(); topo.len()];
         let mut node_next = Vec::with_capacity(topo.len());
@@ -4649,22 +4649,47 @@ impl TpcScheduler {
             node_next.push(std::sync::atomic::AtomicUsize::new(0));
         }
 
+        let scope = crate::raw::affinity::pin_scope();
         for i in 0..core_count {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<
                 std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
             >();
             senders.push(tx);
 
-            let core_id = if !core_ids.is_empty() {
+            let home_cpu = if !core_ids.is_empty() {
                 Some(core_ids[i % core_ids.len()])
             } else {
                 None
             };
-            if let Some(cid) = core_id {
-                if let Some(node) = topo.node_of_cpu(cid.id) {
+            if let Some(home) = home_cpu {
+                if let Some(node) = topo.node_of_cpu(home) {
                     node_lanes[node].push(i);
                 }
             }
+
+            // Affinity posture (transport-ingress campaign 2026-08-01):
+            // node scope by DEFAULT — the lane keeps its home node (the
+            // grouping above and `tpc_spawn_on_node` locality are exactly
+            // as before) but may run on any available CPU of it, so a
+            // cross-thread wake lands on the first idle core instead of
+            // waiting ms-class for one specific busy core's runqueue (the
+            // measured queue_wait/dispatch_lag mechanism). The
+            // `SQUEEZEFS_FUSE_PIN_SCOPE=core` lever restores the
+            // pre-campaign 1-CPU pin (A0 control + operational escape).
+            let lane_cpus: Option<Vec<usize>> = home_cpu.map(|home| {
+                crate::raw::affinity::scoped_affinity_cpus(
+                    scope,
+                    home,
+                    &core_ids,
+                    |c| topo.node_of_cpu(c),
+                    |n| {
+                        topo.nodes()
+                            .get(n)
+                            .map(|d| d.cpus.clone())
+                            .unwrap_or_default()
+                    },
+                )
+            });
 
             // Named explicitly (ingest-economy 2026-07-28): an unnamed
             // thread inherits the comm of whichever thread first touched
@@ -4675,8 +4700,8 @@ impl TpcScheduler {
             std::thread::Builder::new()
                 .name(format!("fuse3-tpc{i}"))
                 .spawn(move || {
-                    if let Some(cid) = core_id {
-                        core_affinity::set_for_current(cid);
+                    if let Some(cpus) = lane_cpus {
+                        crate::raw::affinity::set_current_affinity(&cpus);
                     }
 
                     let rt = tokio::runtime::Builder::new_current_thread()

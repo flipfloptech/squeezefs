@@ -481,7 +481,10 @@ impl Mount {
     }
 
     fn unmount(mut self) {
-        let _ = Command::new("fusermount3").arg("-u").arg(&self.mnt).status();
+        let _ = Command::new("fusermount3")
+            .arg("-u")
+            .arg(&self.mnt)
+            .status();
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match self.child.try_wait().expect("try_wait mount child") {
@@ -600,7 +603,9 @@ fn default_posture_is_node_scoped_lever_restores_core_pins() {
     if !transport_supported() {
         return;
     }
-    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     if cpus <= 2 {
         eprintln!("[SKIP] needs > 2 CPUs to discriminate postures");
         return;
@@ -609,7 +614,10 @@ fn default_posture_is_node_scoped_lever_restores_core_pins() {
     // Default: node scope.
     let m = mount_fs("pin_default", &[]);
     let affs = m.thread_affinities();
-    let lanes: Vec<_> = affs.iter().filter(|(c, _)| c.starts_with("fuse3-tpc")).collect();
+    let lanes: Vec<_> = affs
+        .iter()
+        .filter(|(c, _)| c.starts_with("fuse3-tpc"))
+        .collect();
     let workers: Vec<_> = affs
         .iter()
         .filter(|(c, _)| c.starts_with("fuse-over-uring"))
@@ -634,7 +642,10 @@ fn default_posture_is_node_scoped_lever_restores_core_pins() {
     // A0 lever: the pre-campaign core pins, byte-for-byte posture.
     let m = mount_fs("pin_core", &[("SQUEEZEFS_FUSE_PIN_SCOPE", "core")]);
     let affs = m.thread_affinities();
-    let lanes: Vec<_> = affs.iter().filter(|(c, _)| c.starts_with("fuse3-tpc")).collect();
+    let lanes: Vec<_> = affs
+        .iter()
+        .filter(|(c, _)| c.starts_with("fuse3-tpc"))
+        .collect();
     assert!(!lanes.is_empty(), "no fuse3-tpc lanes visible: {affs:?}");
     for (comm, n) in &lanes {
         assert_eq!(

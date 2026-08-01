@@ -6,6 +6,7 @@
 //! want to control the inode or do the path<->inode map on yourself, [`Filesystem`] is the only one
 //! choose.
 
+pub use affinity::{pin_scope_from_env, scoped_affinity_cpus, PinScope};
 use bytes::Bytes;
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use connection::fuse_over_uring::{
@@ -17,7 +18,8 @@ pub use filesystem::Filesystem;
 use futures_util::future::Either;
 pub use read_phase::{
     read_inplace_replies, read_transport_phase_record, read_transport_phase_snapshot,
-    write_transport_phase_record, write_transport_phase_snapshot, TransportPhase,
+    write_inplace_replies, write_transport_phase_record, write_transport_phase_snapshot,
+    TransportPhase,
 };
 pub use request::Request;
 #[cfg(feature = "tokio-runtime")]
@@ -36,6 +38,7 @@ pub(crate) type FuseData = Either<
 >;
 
 pub(crate) mod abi;
+pub(crate) mod affinity;
 pub mod connection;
 mod filesystem;
 pub mod flags;

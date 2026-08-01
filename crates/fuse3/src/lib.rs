@@ -39,8 +39,9 @@ pub use raw::{
     over_uring_stats, transport_lease_stats, transport_wake_stats, COMMIT_BATCH_LABELS,
 };
 pub use raw::{
-    read_inplace_replies, read_transport_phase_record, read_transport_phase_snapshot,
-    write_transport_phase_record, write_transport_phase_snapshot, TransportPhase,
+    pin_scope_from_env, read_inplace_replies, read_transport_phase_record,
+    read_transport_phase_snapshot, scoped_affinity_cpus, write_inplace_replies,
+    write_transport_phase_record, write_transport_phase_snapshot, PinScope, TransportPhase,
 };
 #[cfg(feature = "tokio-runtime")]
 pub use raw::{tpc_lane_redispatches, tpc_spawn, tpc_spawn_on_node, tpc_thread_count};

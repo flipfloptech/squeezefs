@@ -146,23 +146,44 @@ columns, and labels all come from the runner.
 
 * **KD-7 screen**: refuses loud before any row when the shim does not
   embed the mounted daemon's `build_commit`.
+* **Fairness, visible by construction** (2026-08-02 il-anomalies
+  window): psync is structurally qd=1, so psync shim passes scale njobs
+  to `njobs x qd` by DEFAULT so offered in-flight matches the kernel
+  pass (`--no-match-inflight` restores raw njobs); the per-pass
+  **in-flight figure prints in the table** either way. Read passes are
+  COLD only via `--allow-remount` (captured daemon cmdline+env, same
+  binary, restore-verified) or when the fileset >= 2x the R5
+  `mem_budget_bytes` (cold-by-overflow); un-guaranteed read passes
+  print `WARM (label-only)` — never a bare number.
 * **Per-pass engine law** (labeled in the table): kernel pass = libaio
   qd=8 (EXA canon); shim pass = psync for bs=1M rows / libaio for bs=4k
-  rows (v1.1: libaio ops past the session slab ride the kernel lane —
-  a large-bs libaio "shim" row silently measures the kernel path).
-  A shim pass failing the runner's engagement check is printed
-  `INVALID (passthrough)`, never presented as a shim number.
+  rows (measured 2026-08-02: bs=1M libaio through the shim = engagement
+  0.000 — those ops ride the kernel lane). A shim pass failing the
+  runner's engagement check is printed `INVALID (passthrough)`.
 * **Budget hint**: `ipc_bind_refused_budget` growth during a shim pass
   prints the fix (pre-eb94f0c binaries: raise `SQUEEZEFS_IPC_MEM_MAX`
   on the daemon; later binaries derive the cap).
 * `--sustain` lifts rows to 60 s per the sustain law (the report states
   which mode ran); `--rows` subsets; `--emit-only` prints the plan.
 
+Sample table (field smoke, 12 s SMOKE-labeled rows):
+
+```
+row        bs  kernel (engine)          shim (engine)              delta  shim engagement        verdict
+--------------------------------------------------------------------------------------------------------
+write_bw   1M    31.87 GB/s (libaio)      30.18 GB/s (psync)       -5.3%  0.935 (>=0.90 OK)      shim OK
+               kernel: in-flight 256 (njobs 32) | clat_mean 8.334 ms | write_amp 1.804 (...)
+               shim: in-flight 256 (njobs 256) | clat_mean 8.781 ms | write_amp 1.714 (...)
+randread   4k    231.3 kIOPS (libaio)     212.2 kIOPS (libaio)     -8.3%  1.812 (>=0.90 OK)      shim OK
+               kernel: in-flight 256 (njobs 32) | clat_mean 1.103 ms | cold (remount, restore-verified) | ...
+               shim: in-flight 256 (njobs 32) | clat_mean 1.206 ms | cold (remount, restore-verified) | ...
+```
+
 ```bash
-# Full battery, sustained, with amp columns, journaled:
+# Full battery, sustained, cold reads via remount, amp columns, journaled:
 tests/fio/exa_client_perf.sh --mount "$M" --shim "$SO" --sustain \
-  --data-devs nvme4n1:nvme6n1:nvme8n1:nvme10n1 \
-  --substrate "field 4-node nvme-tcp" --fill "fresh set this session" \
+  --allow-remount --data-devs nvme4n1:nvme6n1:nvme8n1:nvme10n1 \
+  --substrate "field 5-wide nvme-tcp" --fill "fresh set this session" \
   --journal /scratch/tmp/agent_runs.log
 
 # Just the BW pair, quick:

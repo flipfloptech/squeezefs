@@ -2783,6 +2783,14 @@ pub(crate) struct LaneRef<'a> {
 pub struct ReadClassHint {
     /// The request rode an O_DIRECT file description.
     pub odirect: bool,
+    /// The serve dest is a client-visible session ARENA window (E-IL2 —
+    /// read-copy-count 2026-08-02), not a registered uring ent payload.
+    /// NT-store serve copies are EXEMPTED for arena dests: the consumer
+    /// is the client's `slab_read` within ~one op, and the counted field
+    /// bracket showed NT there LOSES (−2.8 % rd-il) while ring-ent dests
+    /// WIN (+11 % rd-kern) — the destination's next reader distance is
+    /// the whole story, measured per the fastest-wins ruling.
+    pub dest_arena: bool,
     /// The request already fed the stream lanes at the IPC sink
     /// (read-saturation campaign, 2026-07-29): ring reads observe into
     /// the §5.3 classifier ONCE, at [`DataRouter::ring_read_lane_touch`]
@@ -2792,6 +2800,31 @@ pub struct ReadClassHint {
     /// classification that routed the op here — the §5.3 declassify
     /// rule). The handler's `pipeline_touch` sites skip when set.
     pub lane_pre_fed: bool,
+}
+
+/// The dest-arm serve copy (read-copy-count 2026-08-02): NT-policied for
+/// registered uring ent payload dests (the counted +11 % EXA-cold-read
+/// win — `SQUEEZEFS_NT_READ_SERVE`, default on, floor 256 KiB), CACHED
+/// for client-visible arena dests (`dest_arena` — the counted −2.8 % il
+/// negative: the client's `slab_read` consumes those lines within ~one
+/// op). Returns `true` iff the NT body ran — callers feed
+/// `nt_read_serve_bytes` from it.
+///
+/// # Safety
+/// `dst`/`src` valid for `len` bytes, non-overlapping.
+#[inline]
+pub(crate) unsafe fn serve_copy_to_dest(
+    dst: *mut u8,
+    src: *const u8,
+    len: usize,
+    dest_arena: bool,
+) -> bool {
+    if dest_arena {
+        std::ptr::copy_nonoverlapping(src, dst, len);
+        false
+    } else {
+        crate::nt_copy::read_serve_copy_raw(dst, src, len)
+    }
 }
 
 impl StreamLanes {
@@ -8792,10 +8825,11 @@ impl DataRouter {
                                         // memory ≥ len; source is the
                                         // hot entry's private bytes.
                                         if unsafe {
-                                            crate::nt_copy::read_serve_copy_raw(
+                                            serve_copy_to_dest(
                                                 dest_ptr,
                                                 hot[start..end].as_ptr(),
                                                 len,
+                                                hint.dest_arena,
                                             )
                                         } {
                                             METRICS
@@ -8888,10 +8922,11 @@ impl DataRouter {
                                             // (see the hot arm).
                                             // SAFETY: as the hot arm.
                                             if unsafe {
-                                                crate::nt_copy::read_serve_copy_raw(
+                                                serve_copy_to_dest(
                                                     dest_ptr,
                                                     held[start..end].as_ptr(),
                                                     len,
+                                                    hint.dest_arena,
                                                 )
                                             } {
                                                 METRICS
@@ -9005,10 +9040,11 @@ impl DataRouter {
                                         // the tier mmap under guard).
                                         // SAFETY: as the hot arm.
                                         unsafe {
-                                            if crate::nt_copy::read_serve_copy_raw(
+                                            if serve_copy_to_dest(
                                                 dest_ptr,
                                                 guard.as_ptr(),
                                                 len,
+                                                hint.dest_arena,
                                             ) {
                                                 METRICS
                                                     .nt_read_serve_bytes
@@ -9351,10 +9387,11 @@ impl DataRouter {
                                                             // the hot arm) —
                                                             // the EXA cold
                                                             // slice_out.
-                                                            if crate::nt_copy::read_serve_copy_raw(
+                                                            if serve_copy_to_dest(
                                                                 dest_ptr,
                                                                 val[start..end].as_ptr(),
                                                                 len,
+                                                                hint.dest_arena,
                                                             ) {
                                                                 METRICS
                                                                     .nt_read_serve_bytes
@@ -9433,10 +9470,11 @@ impl DataRouter {
                                                 unsafe {
                                                     // Copy ledger + NT lever
                                                     // (see the hot arm).
-                                                    if crate::nt_copy::read_serve_copy_raw(
+                                                    if serve_copy_to_dest(
                                                         dest_ptr,
                                                         val[start..end].as_ptr(),
                                                         len,
+                                                        hint.dest_arena,
                                                     ) {
                                                         METRICS.nt_read_serve_bytes.fetch_add(
                                                             len as u64,

@@ -165,19 +165,21 @@ pub unsafe fn dma_copy_raw_forced(dst: *mut u8, src: *const u8, len: usize) -> b
 }
 
 /// READ-serve NT policy (read-copy-count campaign, 2026-08-02) — the
-/// dest-arm serve copies (block buffer → registered uring ent payload /
-/// arena dest). **Default OFF**, unlike the write-side DMA-destined
-/// sites: the destination's next consumer is a CPU (the kernel's
-/// ring→user commit copy / the shim's `slab_read`), so NT here trades
-/// the destination RFO for a possible consumer-side DRAM miss. At
-/// LLC-outrunning stream rates the consumer pays DRAM either way, which
-/// is exactly the counted A/B `SQUEEZEFS_NT_READ_SERVE=1` exists to
-/// decide per the fastest-wins ruling — a measurement lever, never an
-/// ambient default without the bracket. Floor shares
-/// `SQUEEZEFS_NT_COPY_MIN` semantics via its own
-/// `SQUEEZEFS_NT_READ_SERVE_MIN` (default [`DEFAULT_MIN_BYTES`]).
+/// dest-arm serve copies into REGISTERED URING ENT payloads (arena
+/// dests are exempted upstream — `routing::serve_copy_to_dest`).
+/// **Default ON**, adjudicated by the counted field brackets
+/// (`.benchmarks/2026-08-02-read-copy-count.md` §4): +11 % on the EXA
+/// cold kernel read row (26.0 → 28.9 GB/s, DRAM/payload −14 %,
+/// engagement exact) — at LLC-outrunning stream rates the consumer (the
+/// kernel's ring→user commit copy) pays DRAM either way, so the deleted
+/// destination RFO is pure win. The consumer-proximity negative is real
+/// where the reader is close: the il ARENA dest bracket lost −2.8 %
+/// (client `slab_read` within ~one op), which is why arena dests are
+/// structurally exempt, and the 256 KiB floor keeps sub-floor serves
+/// (rand-4k, warm-small) cached. `SQUEEZEFS_NT_READ_SERVE=0` is the A/B
+/// escape; `SQUEEZEFS_NT_READ_SERVE_MIN` retunes the floor.
 pub fn read_serve_policy_from(nt: Option<&str>, min: Option<&str>) -> NtPolicy {
-    let enabled = matches!(nt.map(str::trim), Some("1") | Some("true"));
+    let enabled = !matches!(nt.map(str::trim), Some("0"));
     let min_bytes = min
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_MIN_BYTES);

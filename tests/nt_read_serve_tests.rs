@@ -1,12 +1,14 @@
 //! `SQUEEZEFS_NT_READ_SERVE` — the read-serve NT-store measurement lever
 //! (read-copy-count campaign, 2026-08-02).
 //!
-//! Contracts (red-first):
-//! - **Policy purity + default-OFF**: unlike the write-side DMA-destined
-//!   sites (`SQUEEZEFS_NT_COPY`, default on), the read-serve destination
-//!   is CPU-read next (kernel commit copy / shim `slab_read`), so the NT
-//!   posture is opt-in per the counted-A/B rule — `read_serve_policy_from`
-//!   is pure and defaults to disabled.
+//! Contracts (red-first; the default contract AMENDED 2026-08-02 by the
+//! counted field brackets — see `read_serve_policy_from` docs):
+//! - **Policy purity + default-ON**: the field A/B adjudicated NT for
+//!   registered-ent dests (+11 % EXA cold kernel read, DRAM/payload
+//!   −14 %, engagement exact ×2 + late control); the consumer-proximity
+//!   negative is handled STRUCTURALLY (arena dests exempt upstream —
+//!   pinned by the ledger suite's il test; sub-floor serves cached).
+//!   `SQUEEZEFS_NT_READ_SERVE=0` is the A/B escape.
 //! - **Byte exactness with guard bytes** at every alignment/length shape
 //!   the serve sites produce (unaligned sources — pooled buffers sliced
 //!   at request offsets; 4 KiB-aligned dests — registered payloads).
@@ -32,14 +34,18 @@ fn nt_read_serve_policy_exactness_and_engagement() {
     std::env::set_var("SQUEEZEFS_NT_READ_SERVE", "1");
     std::env::set_var("SQUEEZEFS_NT_READ_SERVE_MIN", "64");
 
-    // --- Policy purity (pure core, env-independent).
+    // --- Policy purity (pure core, env-independent). Default ON per the
+    // 2026-08-02 counted brackets (module docs); "0" is the kill escape.
     let p = nt_copy::read_serve_policy_from(None, None);
-    assert!(!p.enabled, "read-serve NT must default OFF (opt-in lever)");
+    assert!(
+        p.enabled,
+        "read-serve NT defaults ON (counted +11 % kernel-dest bracket)"
+    );
     assert_eq!(p.min_bytes, nt_copy::DEFAULT_MIN_BYTES);
     assert!(nt_copy::read_serve_policy_from(Some("1"), None).enabled);
     assert!(nt_copy::read_serve_policy_from(Some("true"), None).enabled);
     assert!(!nt_copy::read_serve_policy_from(Some("0"), None).enabled);
-    assert!(!nt_copy::read_serve_policy_from(Some(""), None).enabled);
+    assert!(nt_copy::read_serve_policy_from(Some(""), None).enabled);
     assert_eq!(
         nt_copy::read_serve_policy_from(Some("1"), Some("131072")).min_bytes,
         131072

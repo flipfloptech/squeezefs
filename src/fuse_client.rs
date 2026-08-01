@@ -11728,8 +11728,13 @@ impl Filesystem for SqueezefsFilesystem {
         // them again in `pipeline_touch` would declassify the stream
         // that routed them here (§5.3 — pinned by
         // tests/read_saturation_tests.rs).
+        // E-IL2 arena-dest probe (before the hint so the NT exemption
+        // travels with the class): a ring-origin handoff's task-local
+        // window override, if any (see `ipc_service::ipc_read_dest_override`).
+        let arena_dest = crate::ipc_service::ipc_read_dest_override(size);
         let read_hint = crate::routing::ReadClassHint {
             odirect,
+            dest_arena: arena_dest.is_some(),
             lane_pre_fed: _req.unique == 0,
         };
 
@@ -12035,11 +12040,12 @@ impl Filesystem for SqueezefsFilesystem {
         // Serve destination: ring-origin handoffs carry the op's
         // validated arena window as a task-local override (E-IL2,
         // read-copy-count 2026-08-02 — the il twin of the registered
-        // uring payload dest; exposure argument at
-        // `ipc_service::ipc_read_dest_override`); kernel requests derive
-        // the registered ent payload from the connection as before.
+        // uring payload dest, probed above into `read_hint.dest_arena`;
+        // exposure argument at `ipc_service::ipc_read_dest_override`);
+        // kernel requests derive the registered ent payload from the
+        // connection as before.
         let conn_guard = self.session_connection.load();
-        let dest_addr = crate::ipc_service::ipc_read_dest_override(size).or_else(|| {
+        let dest_addr = arena_dest.or_else(|| {
             conn_guard
                 .as_ref()
                 .as_ref()

@@ -320,6 +320,7 @@ async fn ledger_closes_and_cold_none_dest_slice_is_zero_copy() {
     let dest = AlignedDest::new(BS as usize);
     let s0 = snap();
     let hot0 = METRICS.hot_block_hits.load(Ordering::Relaxed);
+    let nt0 = METRICS.nt_read_serve_bytes.load(Ordering::Relaxed);
     let (data, _backing) =
         h.fs.router
             .read_file_range_zero_copy_with_meta(
@@ -357,6 +358,14 @@ async fn ledger_closes_and_cold_none_dest_slice_is_zero_copy() {
     assert_eq!(d.bounce, 0, "phase B: no intermediate copy");
     assert_eq!(d.fill_dma, 0, "phase B: warm — no device fetch");
     assert_eq!(d.dest_dma, 0, "phase B: warm — no dest DMA");
+    // NT default-ON engagement (2026-08-02 brackets): a ≥-floor serve
+    // into a NON-arena dest runs the NT body and feeds the gauge.
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(
+        METRICS.nt_read_serve_bytes.load(Ordering::Relaxed) - nt0,
+        part as u64,
+        "phase B: default-ON NT engagement on the registered-dest serve"
+    );
     drop(data);
 
     // ---- Phase C (the zero-daemon-copy cold leg): full-block read with
@@ -791,6 +800,7 @@ async fn il_cold_read_serves_in_place_into_the_arena_window() {
     let arena0 = METRICS.ipc_arena_copy_bytes.load(Ordering::Relaxed);
     let dest_serves0 = METRICS.ipc_read_dest_serves.load(Ordering::Relaxed);
     let handoffs0 = METRICS.ipc_async_handoffs.load(Ordering::Relaxed);
+    let nt0 = METRICS.nt_read_serve_bytes.load(Ordering::Relaxed);
 
     let r = tokio::task::block_in_place(|| session.ring_pread_spin(binding, BS, part));
     assert_eq!(r, i64::from(part), "cold ring read serves full length");
@@ -831,6 +841,15 @@ async fn il_cold_read_serves_in_place_into_the_arena_window() {
         "one serve copy, fill → arena dest (the lawful il serve copy)"
     );
     assert_eq!(d.bounce, 0, "no intermediate reply bounce (E-IL1 + E-IL2)");
+    // The ARENA-dest NT exemption (2026-08-02 brackets: NT into the
+    // client-visible arena LOSES — the client's slab_read consumes the
+    // lines within ~one op): even under the default-ON policy, an
+    // arena-dest serve stays cached.
+    assert_eq!(
+        METRICS.nt_read_serve_bytes.load(Ordering::Relaxed) - nt0,
+        0,
+        "arena-dest serves are NT-exempt (structural, not policy)"
+    );
 
     fx.host.shutdown();
 }

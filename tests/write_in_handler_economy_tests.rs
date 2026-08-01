@@ -294,7 +294,10 @@ async fn planted_staged_sibling_is_still_removed_at_checkout() {
     let token = h.dlm.get_fencing_token_ino(ino);
     let staged = pattern(FBS as usize, 9);
     assert!(
-        h.fs.router.cache.nvme.put_active_block(&key, &staged, token),
+        h.fs.router
+            .cache
+            .nvme
+            .put_active_block(&key, &staged, token),
         "fixture premise: the staging put must be admitted"
     );
 

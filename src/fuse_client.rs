@@ -3079,12 +3079,27 @@ pub struct Metrics {
     /// sibling — already owned the block): quantifies the §1.2 block-revisit
     /// discount (+12–26 % above the 12 MiB/op model on the scoreboard row).
     pub write_block_revisits: Align64<AtomicU64>,
-    /// H1 evidence: the per-write staged-sibling `spawn_blocking` remove
-    /// hop, counted per striped-write checkout (fires whether or not
-    /// anything is staged — the pure-overhead face). The RW1 cost pin
-    /// asserts probes == striped block writes; RW3's lock-free probe flips
-    /// that pin when it elides the hop.
+    /// H1 evidence: the per-write staged-sibling probe, counted per
+    /// striped-write checkout (fires whether or not anything is staged).
+    /// Since the 2026-08-01 write in-handler campaign the probe itself is
+    /// LATCH-FREE (occupancy index read); the `spawn_blocking` remove hop
+    /// dispatches only when the index says present.
     pub staging_sibling_probes: Align64<AtomicU64>,
+    /// Write in-handler campaign engagement gauge: checkouts whose
+    /// staged-sibling `spawn_blocking` remove hop was ELIDED because the
+    /// occupancy index said absent — exact under the held block lock
+    /// (every staging put site for a key holds that key's block lock).
+    /// On sibling-free venues this tracks striped block writes 1:1; the
+    /// field row it was built from paid 2.14 M hops for 0 siblings.
+    pub staging_sibling_hops_elided: Align64<AtomicU64>,
+    /// Write in-handler campaign engagement gauge: over-cap parked
+    /// admission passes short-circuited on a CACHE-LESS volume (empty
+    /// `staging_dirs`), where BOTH spill arms (extent records + full
+    /// images) can only ever be refused — the pass is structurally
+    /// futile (the field row paid 980 k refused puts + 4 MiB seed reads
+    /// per 70 s for zero gauge reduction). The R5 Red machinery (durable
+    /// self-flush) is untouched.
+    pub spill_pass_cacheless_skips: Align64<AtomicU64>,
     /// H3 evidence: `ALIGNED_BUF_POOL`/`RANGED_BUF_POOL` handouts that
     /// missed the recycle queue and paid the mmap/page-fault allocation
     /// path.
@@ -5226,6 +5241,11 @@ impl SqueezefsFilesystem {
                 "restage_churn_bytes": METRICS.restage_churn_bytes.load(Ordering::Relaxed),
                 "write_block_revisits": METRICS.write_block_revisits.load(Ordering::Relaxed),
                 "staging_sibling_probes": METRICS.staging_sibling_probes.load(Ordering::Relaxed),
+                // Write in-handler economy engagement gauges (2026-08-01):
+                // the elided spawn_blocking sibling hop + the cache-less
+                // spill short-circuit.
+                "staging_sibling_hops_elided": METRICS.staging_sibling_hops_elided.load(Ordering::Relaxed),
+                "spill_pass_cacheless_skips": METRICS.spill_pass_cacheless_skips.load(Ordering::Relaxed),
                 "aligned_pool_misses": METRICS.aligned_pool_misses.load(Ordering::Relaxed),
                 "aligned_pool_hits": METRICS.aligned_pool_hits.load(Ordering::Relaxed),
                 // RW2 W1 sole-owner extent patch families (design-random-
@@ -7680,26 +7700,48 @@ impl SqueezefsFilesystem {
                 // lock_exclusive).
                 {
                     // RW1: the H1 probe counter (fires per checkout, staged
-                    // sibling or not — the pure-overhead face) + the §1.2
-                    // bucket-4 churn ledger (a revisit discarding the staged
-                    // image an earlier spill already paid for).
+                    // sibling or not) + the §1.2 bucket-4 churn ledger (a
+                    // revisit discarding the staged image an earlier spill
+                    // already paid for).
+                    //
+                    // 2026-08-01 write in-handler economy: the probe is
+                    // LATCH-FREE (occupancy index read) and the
+                    // `spawn_blocking` remove hop dispatches only when the
+                    // index says present. Index-absent is EXACT under the
+                    // HELD block lock: the index is conservative-present
+                    // (indexed before the ring write, un-indexed strictly
+                    // after removal), and every staging put site for a key
+                    // holds that key's `BLOCK_FLUSH_LOCKS` guard (checkout
+                    // fallback, spill victims via try_lock, writeback
+                    // flush, the staged-route block-0 guard), so no sibling
+                    // can appear while we hold this one. The field row this
+                    // was built from paid 2.14 M blocking-pool hops for
+                    // ZERO siblings found — 0.45 ms/op mean at saturation,
+                    // under the held block lock
+                    // (.benchmarks/2026-08-01-write-in-handler.md).
                     let wp_sibling = write_phase_start();
                     METRICS
                         .staging_sibling_probes
                         .fetch_add(1, Ordering::Relaxed);
-                    let nvme = self.router.cache.nvme.clone();
-                    let key = cache_key.clone();
-                    let removed =
-                        tokio::task::spawn_blocking(move || nvme.remove_active_block(&key))
-                            .await
-                            .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    if let Some(prev) = removed {
+                    if self.router.cache.nvme.has_staged_active_block(&cache_key) {
+                        let nvme = self.router.cache.nvme.clone();
+                        let key = cache_key.clone();
+                        let removed =
+                            tokio::task::spawn_blocking(move || nvme.remove_active_block(&key))
+                                .await
+                                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        if let Some(prev) = removed {
+                            METRICS
+                                .restage_churn_removes
+                                .fetch_add(1, Ordering::Relaxed);
+                            METRICS
+                                .restage_churn_bytes
+                                .fetch_add(prev.len() as u64, Ordering::Relaxed);
+                        }
+                    } else {
                         METRICS
-                            .restage_churn_removes
+                            .staging_sibling_hops_elided
                             .fetch_add(1, Ordering::Relaxed);
-                        METRICS
-                            .restage_churn_bytes
-                            .fetch_add(prev.len() as u64, Ordering::Relaxed);
                     }
                     write_phase_record(WritePhase::SiblingRemove, wp_sibling);
                 }
@@ -9194,6 +9236,27 @@ impl SqueezefsFilesystem {
     /// caller's own block — is skipped; the cap is soft, §5.3).
     async fn spill_parked_toward_cap(&self, fencing_token: u64) {
         let cap_bytes = self.parked_cap_bytes();
+        // 2026-08-01 write in-handler economy: on a CACHE-LESS volume
+        // (empty `staging_dirs` — a format-time, mount-immutable fact)
+        // this pass is structurally futile: BOTH spill arms land in
+        // staging, and `put_active_block`/`put_extent_record` refuse
+        // unconditionally there. Running it anyway paid victim
+        // zero-complete/snapshot CPU, deferred-victim 4 MiB seed READS,
+        // and a blocking-pool hop per pass — all to be refused — while
+        // holding victim block locks against live writers (the field
+        // row: 980 k refused puts + 1,898 futile seed reads per 70 s,
+        // .benchmarks/2026-08-01-write-in-handler.md). The cap stays
+        // soft exactly as the refusal path always left it (RAM is the
+        // custody; fsync/close and the R5 Red DURABLE self-flush own
+        // convergence — neither is a staging arm, both untouched).
+        if self.router.cache.nvme.staging_dirs().is_empty() {
+            if Self::parked_gauge_bytes() > cap_bytes {
+                METRICS
+                    .spill_pass_cacheless_skips
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
         'spill: while Self::parked_gauge_bytes() > cap_bytes {
             // Candidate keys snapshotted first so the map is never mutated
             // under a live iterator guard.

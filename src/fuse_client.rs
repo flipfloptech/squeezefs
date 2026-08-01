@@ -14787,14 +14787,17 @@ pub async fn start_mount<P: AsRef<Path>>(
             max_op_bytes,
             ..squeezefs_ipc::layout::Geometry::default_v1()
         };
-        // Session-shm admission cap: min(budget/8, 2 GiB), env-overridable
-        // (SQUEEZEFS_IPC_MEM_MAX, MiB) — the R5 `ipc_session_arenas`
-        // component bound (design §5.7).
-        let arena_cap_bytes = std::env::var("SQUEEZEFS_IPC_MEM_MAX")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(|mb| mb * 1024 * 1024)
-            .unwrap_or_else(|| crate::mem_budget::ipc_arena_cap(mem_budget));
+        // Session-shm admission cap — the R5 `ipc_session_arenas`
+        // component bound (design §5.7). Derived, no fixed ceiling
+        // (2026-08-01 ruling): absolute override (SQUEEZEFS_IPC_MEM_MAX,
+        // MiB, explicit-wins-verbatim) > percentage of the R5 budget
+        // (SQUEEZEFS_IPC_MEM_PCT) > budget/8 (12.5 %, the budget itself
+        // is machine-derived).
+        let arena_cap_bytes = crate::mem_budget::resolve_ipc_arena_cap(
+            mem_budget,
+            std::env::var("SQUEEZEFS_IPC_MEM_MAX").ok().as_deref(),
+            std::env::var("SQUEEZEFS_IPC_MEM_PCT").ok().as_deref(),
+        );
         // OQ-6 (v1.1): the path-socket runtime dir for container-netns
         // clients. `SQUEEZEFS_IPC_SOCKET_DIR` overrides (the literal
         // `none` disables); default = /run/squeezefs for root mounts,

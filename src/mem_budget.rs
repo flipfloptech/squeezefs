@@ -596,17 +596,76 @@ pub fn transport_buffer_cap(budget_bytes: u64) -> u64 {
     (budget_bytes / 8).min(TRANSPORT_BUFFER_CAP_CEILING)
 }
 
-/// L4 interception session-shm cap ceiling (design-preload-interception
-/// §5.7): even on huge budgets, never admit more than this in live
-/// session arenas.
-pub const IPC_ARENA_CAP_CEILING: u64 = 2 * 1024 * 1024 * 1024;
+/// L4 `ipc_session_arenas` default admission fraction (design-preload-
+/// interception §5.7): 12.5 % of the resolved memory budget — the same
+/// budget/8 fraction the transport payload cap uses, kept because the
+/// budget itself is machine-derived (§5.7 resolution order), so the
+/// fraction is scale-free on every box size.
+pub const IPC_ARENA_CAP_DEFAULT_PCT: f64 = 12.5;
 
-/// The L4 `ipc_session_arenas` admission cap: an eighth of the resolved
-/// memory budget, ceilinged at [`IPC_ARENA_CAP_CEILING`] — deliberately
-/// the same shape as [`transport_buffer_cap`] (the session arenas are the
-/// interception transport's payload buffers).
+/// The derived L4 `ipc_session_arenas` admission cap:
+/// [`IPC_ARENA_CAP_DEFAULT_PCT`] of the resolved memory budget, computed
+/// exactly as `budget / 8`. There is deliberately **no absolute byte
+/// ceiling** (2026-08-01 user ruling — the former fixed 2 GiB
+/// `IPC_ARENA_CAP_CEILING` starved big-RAM fleet clients: on the 251 GB
+/// field box it clamped the pool to ~31 × 64 MiB sessions against a
+/// 48-HELLO fleet, `ipc_bind_refused_budget` 13/48). The pool is already
+/// bounded without a constant: the R5 budget scales the cap, per-uid
+/// session caps + idle reap bound the population, and Red shedding
+/// refuses new sessions under pressure — a second absolute bound
+/// duplicated R5's job with a number.
 pub fn ipc_arena_cap(budget_bytes: u64) -> u64 {
-    (budget_bytes / 8).min(IPC_ARENA_CAP_CEILING)
+    budget_bytes / 8
+}
+
+/// §5.7 `ipc_session_arenas` admission-cap resolution, pure (env strings
+/// in, cap out — the [`resolve_budget_from`] pattern; never panics,
+/// never refuses the mount): **absolute > percentage > derived
+/// default**.
+///
+/// - `mem_max_mib` (`SQUEEZEFS_IPC_MEM_MAX`, MiB): explicit wins
+///   verbatim — the compat spelling, semantics unchanged (including 0).
+///   Garbage warns and falls through.
+/// - `mem_pct` (`SQUEEZEFS_IPC_MEM_PCT`, percent of the resolved
+///   budget — the preferred spelling): clamped into (0, 100]. Values
+///   over 100 clamp to 100 with a warning; non-positive / non-finite /
+///   unparseable values warn and fall through (the IPC knob-family
+///   convention — a bad env string never fails a mount).
+/// - Neither: [`ipc_arena_cap`] (budget/8 =
+///   [`IPC_ARENA_CAP_DEFAULT_PCT`]).
+pub fn resolve_ipc_arena_cap(
+    budget_bytes: u64,
+    mem_max_mib: Option<&str>,
+    mem_pct: Option<&str>,
+) -> u64 {
+    if let Some(raw) = mem_max_mib {
+        match raw.trim().parse::<u64>() {
+            Ok(mib) => return mib.saturating_mul(1024 * 1024),
+            Err(e) => {
+                log::warn!("SQUEEZEFS_IPC_MEM_MAX={raw:?} is not a MiB integer ({e}) — ignored")
+            }
+        }
+    }
+    if let Some(raw) = mem_pct {
+        match raw.trim().parse::<f64>() {
+            Ok(p) if p.is_finite() && p > 0.0 => {
+                let pct = if p > 100.0 {
+                    log::warn!("SQUEEZEFS_IPC_MEM_PCT={raw:?} > 100 — clamped to 100");
+                    100.0
+                } else {
+                    p
+                };
+                return (budget_bytes as f64 * (pct / 100.0)) as u64;
+            }
+            Ok(p) => log::warn!(
+                "SQUEEZEFS_IPC_MEM_PCT={raw:?} must be a percent in (0, 100] (got {p}) — ignored"
+            ),
+            Err(e) => {
+                log::warn!("SQUEEZEFS_IPC_MEM_PCT={raw:?} is not a number ({e}) — ignored")
+            }
+        }
+    }
+    ipc_arena_cap(budget_bytes)
 }
 
 /// Register the L4 `ipc_session_arenas` component (design-preload-

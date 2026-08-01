@@ -1212,9 +1212,22 @@ pub enum WritePhase {
     ParkSpill = 7,
     /// `put_active_block` staging writes (spill / flush / fallback).
     StagingPut = 8,
+    /// `get_or_acquire_lease` in the WRITE handler (2026-08-01 write
+    /// in-handler campaign — cached-hit fast path vs DLM acquisition;
+    /// ⊂ route_classify, split out so the classify residue closes).
+    LeaseAcquire = 9,
+    /// The `try_extent_park` call in the per-block future — the W2
+    /// patch-ineligible small-write park probe; every striped block
+    /// write pays at least its refusal path.
+    ExtentProbe = 10,
+    /// The write-pipeline admission park awaited IN the handler before
+    /// the completing write's ACK (the per-op twin of the always-on
+    /// `write_pipeline_phase_ns.admit_wait`, recorded here so the
+    /// in-handler table composes in one family).
+    AdmitGate = 11,
 }
 
-const WRITE_PHASES: usize = 9;
+const WRITE_PHASES: usize = 12;
 const WRITE_PHASE_NAMES: [&str; WRITE_PHASES] = [
     "route_classify",
     "checkout",
@@ -1225,6 +1238,9 @@ const WRITE_PHASE_NAMES: [&str; WRITE_PHASES] = [
     "upload_map_merge",
     "park_spill",
     "staging_put",
+    "lease_acquire",
+    "extent_probe",
+    "admit_gate",
 ];
 
 /// `BLOCK_FLUSH_LOCKS` acquiring call-site classes (`block_lock_wait_by_site`).
@@ -7497,7 +7513,8 @@ impl SqueezefsFilesystem {
                 // block-size deferred buffer. `true` = absorbed (ACK).
                 {
                     let rel = (write_start - b_start_offset) as usize;
-                    if self
+                    let wp_probe = write_phase_start();
+                    let parked = self
                         .try_extent_park(
                             ino,
                             b as u32,
@@ -7508,8 +7525,9 @@ impl SqueezefsFilesystem {
                             stream_adjacent,
                             fencing_token,
                         )
-                        .await?
-                    {
+                        .await?;
+                    write_phase_record(WritePhase::ExtentProbe, wp_probe);
+                    if parked {
                         std::mem::drop(block_guard);
                         return Ok::<(), SqueezefsError>(());
                     }
@@ -7786,6 +7804,15 @@ impl SqueezefsFilesystem {
                         let t_admit = std::time::Instant::now();
                         let permit = self.write_pipeline.admit(block_size).await;
                         pipeline_phase_record(PipelinePhase::AdmitWait, t_admit);
+                        // Per-op twin of the always-on AdmitWait above:
+                        // the in-handler pre-ACK admission residence,
+                        // recorded in the write family so the in-handler
+                        // table composes in one family (rig-gated; reuses
+                        // the same start instant — no extra clock read).
+                        write_phase_record(
+                            WritePhase::AdmitGate,
+                            op_profile_enabled().then_some(t_admit),
+                        );
                         let fs = self.clone();
                         let key = cache_key.clone();
                         // The fuse3 per-core handler lanes — the venue pin
@@ -11872,10 +11899,12 @@ impl Filesystem for SqueezefsFilesystem {
             }
 
             // 1. Get or acquire lease (fencing token)
+            let wp_lease = write_phase_start();
             let fencing_token = self
                 .get_or_acquire_lease(ino)
                 .await
                 .map_err(map_squeezefs_err)?;
+            write_phase_record(WritePhase::LeaseAcquire, wp_lease);
 
             let file_path = crate::keys::inode_path(ino);
             let block_size = self.router.block_size.load(Ordering::Relaxed);

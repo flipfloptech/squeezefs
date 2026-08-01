@@ -74,6 +74,52 @@ where
     fuse3::raw::tpc_spawn(fut);
 }
 
+tokio::task_local! {
+    /// E-IL2 (read-copy-count 2026-08-02): the arena-dest override for a
+    /// ring-origin read handoff — `(window base ptr, window len)` of the
+    /// op's VALIDATED arena window. Scoped around exactly one handler
+    /// invocation by [`spawn_read_handoff`]; the read handler consults it
+    /// through [`ipc_read_dest_override`] where the kernel path derives
+    /// its registered payload dest. Task-local (never thread-local): the
+    /// handler awaits, and lanes interleave tasks.
+    static IPC_READ_DEST: (u64, usize);
+}
+
+/// The read handler's il dest probe (see [`IPC_READ_DEST`]): `Some(ptr)`
+/// only when the calling task carries a window override large enough for
+/// the request. Exposure note (the §5.2 boundary argument): every byte a
+/// dest-armed serve writes into the window is a binding-validated serve
+/// of a file the session presented a kernel-granted fd for — the same
+/// bytes the committed completion would expose; mid-serve partial
+/// visibility (and the 795 retry loop's overwrites) are the client's own
+/// concurrent-buffer POSIX hazard, exactly `ArenaWindow::write`'s
+/// standing contract.
+pub(crate) fn ipc_read_dest_override(size: u32) -> Option<u64> {
+    IPC_READ_DEST
+        .try_with(|&(ptr, len)| {
+            if len >= size as usize {
+                Some(ptr)
+            } else {
+                None
+            }
+        })
+        .ok()
+        .flatten()
+}
+
+/// `SQUEEZEFS_IL_READ_DEST` — the E-IL2 A/B lever (default ON; `0`
+/// restores the pre-campaign reply-bounce posture: handler serves into
+/// heap Bytes, `payload.write` copies into the arena).
+fn il_read_dest_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("SQUEEZEFS_IL_READ_DEST").ok().as_deref(),
+            Some("0")
+        )
+    })
+}
+
 thread_local! {
     /// PLACED-write handoffs deferred to the end of the drain pass
     /// (shim-parity 2026-07-28): a placed sever's whole win is that every
@@ -157,6 +203,16 @@ pub(crate) fn spawn_read_handoff(
     // reply bytes will be written into (gated inside; fallback = the
     // pre-campaign global rotation).
     let arena_node = op.payload.arena_node();
+    // E-IL2 (read-copy-count 2026-08-02): hand the handler the op's
+    // validated arena window as its serve destination — the same
+    // dest-armed serve legs the kernel transport rides land the bytes IN
+    // PLACE, eliding the reply's heap bounce AND the `payload.write`
+    // arena copy (1 MiB-class alloc + full CPU pass per cold il read).
+    let dest = if il_read_dest_enabled() && !op.payload.is_empty() {
+        Some((op.payload.as_base_ptr() as u64, op.payload.len()))
+    } else {
+        None
+    };
     handoff_spawn_on(arena_node, async move {
         // Re-seed a cold attr cache so warm workloads return to the
         // sync fast path after ONE miss demotion (the handler's own
@@ -164,11 +220,29 @@ pub(crate) fn spawn_read_handoff(
         if fs.attr_cache.get(&ino).is_none() {
             fs.refresh_attr_cache(ino).await;
         }
-        match fs.read(request, ino, 0, offset, len, flags).await {
+        let res = match dest {
+            Some(d) => {
+                IPC_READ_DEST
+                    .scope(d, fs.read(request, ino, 0, offset, len, flags))
+                    .await
+            }
+            None => fs.read(request, ino, 0, offset, len, flags).await,
+        };
+        match res {
             Ok(reply) => {
-                // Into the SNAPSHOT window (§5.3.1: bounds validated at
-                // dequeue; mid-serve descriptor mutation is inert).
-                op.payload.write(&reply.data);
+                // In-place check: dest-armed serve legs return bytes
+                // BACKED BY the window base (heap replies — staged/
+                // inline/virtual arms, parked-run rebuilds — still
+                // bounce through `payload.write` below).
+                let in_place = !reply.data.is_empty()
+                    && reply.data.as_ptr() == op.payload.as_base_ptr() as *const u8;
+                if in_place {
+                    METRICS.ipc_read_dest_serves.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // Into the SNAPSHOT window (§5.3.1: bounds validated
+                    // at dequeue; mid-serve descriptor mutation is inert).
+                    op.payload.write(&reply.data);
+                }
                 METRICS.ipc_ops_read.fetch_add(1, Ordering::Relaxed);
                 METRICS
                     .ipc_bytes_out

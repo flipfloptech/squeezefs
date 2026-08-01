@@ -12032,12 +12032,20 @@ impl Filesystem for SqueezefsFilesystem {
             guard_meta
         };
 
+        // Serve destination: ring-origin handoffs carry the op's
+        // validated arena window as a task-local override (E-IL2,
+        // read-copy-count 2026-08-02 — the il twin of the registered
+        // uring payload dest; exposure argument at
+        // `ipc_service::ipc_read_dest_override`); kernel requests derive
+        // the registered ent payload from the connection as before.
         let conn_guard = self.session_connection.load();
-        let dest_addr = conn_guard
-            .as_ref()
-            .as_ref()
-            .and_then(|conn| conn.get_payload_buffer(_req.unique))
-            .map(|(ptr, _sz)| ptr);
+        let dest_addr = crate::ipc_service::ipc_read_dest_override(size).or_else(|| {
+            conn_guard
+                .as_ref()
+                .as_ref()
+                .and_then(|conn| conn.get_payload_buffer(_req.unique))
+                .map(|(ptr, _sz)| ptr)
+        });
 
         // OVERLAY NEVER INVISIBLE — the moving-custody read protocol
         // (fstests generic/795, VL10 release gate). A block's acked bytes

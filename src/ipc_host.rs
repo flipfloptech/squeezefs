@@ -453,6 +453,10 @@ impl ArenaWindow {
         }
         // Locality instrument: one CPU pass over arena bytes.
         crate::numa::count_current_pass(self._map.arena_node, n);
+        // Copy ledger: the il boundary copy (read-copy-count 2026-08-02).
+        crate::fuse_client::METRICS
+            .ipc_arena_copy_bytes
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -473,6 +477,10 @@ impl crate::PayloadSink for ArenaWindow {
         }
         // Locality instrument: the §5.5.1 serve-into-arena CPU pass.
         crate::numa::count_current_pass(self._map.arena_node, n);
+        // Copy ledger: the il boundary copy (read-copy-count 2026-08-02).
+        crate::fuse_client::METRICS
+            .ipc_arena_copy_bytes
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn zero_at(&self, off: usize, len: usize) {

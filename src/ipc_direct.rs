@@ -553,6 +553,17 @@ impl DirectDriveEngine {
                 // fully DMA-covered by the exact-length check above.
                 let slice = unsafe { std::slice::from_raw_parts(bptr.0.add(win_skew), req_len) };
                 op.payload.write(slice);
+                // Copy ledger: window DMA landed in the pooled bounce
+                // (the arena copy above is counted at the write site).
+                METRICS
+                    .read_fill_dma_bytes
+                    .fetch_add(window as u64, Ordering::Relaxed);
+            } else {
+                // Copy ledger: device DMA straight into the arena window
+                // — the zero-daemon-copy direct-drive leg.
+                METRICS
+                    .read_dest_dma_bytes
+                    .fetch_add(window as u64, Ordering::Relaxed);
             }
             METRICS.get_obj.fetch_add(1, Ordering::Relaxed);
             METRICS.ipc_ops_read.fetch_add(1, Ordering::Relaxed);

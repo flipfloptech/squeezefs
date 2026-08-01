@@ -3811,6 +3811,12 @@ impl DataRouter {
             self.read_nvme_block(block_key).await?
         };
         read_fill_phase_record(ReadFillPhase::FetchDma, t_dma);
+        // Copy ledger: device DMA into the pooled fill intermediate — the
+        // nvme-tcp RX-copy pricing denominator (raw device bytes; decode
+        // below is a no-op on passthrough volumes).
+        METRICS
+            .read_fill_dma_bytes
+            .fetch_add(raw.len() as u64, Ordering::Relaxed);
 
         let t_dec = std::time::Instant::now();
         let decompressed = self.get_crypto().process_read_async(raw).await?;
@@ -5771,14 +5777,26 @@ impl DataRouter {
                 Some(d) => {
                     // DMA straight into the registered payload dest; the
                     // value below is constructed only after validation.
-                    self.backend_router
+                    let b = self
+                        .backend_router
                         .read_block_range(&cur_key, aligned_start, window, Some(d.ptr as u64))
-                        .await?
+                        .await?;
+                    // Copy ledger: device DMA straight into the dest.
+                    METRICS
+                        .read_dest_dma_bytes
+                        .fetch_add(window as u64, Ordering::Relaxed);
+                    b
                 }
                 None => {
-                    self.backend_router
+                    let b = self
+                        .backend_router
                         .read_block_range(&cur_key, aligned_start, window, None)
-                        .await?
+                        .await?;
+                    // Copy ledger: window DMA into the pooled bounce.
+                    METRICS
+                        .read_fill_dma_bytes
+                        .fetch_add(window as u64, Ordering::Relaxed);
+                    b
                 }
             };
 
@@ -5859,6 +5877,11 @@ impl DataRouter {
                         std::ptr::write_bytes(d.ptr.add(len), 0, req_len - len);
                     }
                 }
+                // Copy ledger: serve copy into the dest (escalation /
+                // exhaustion tail of the ranged dispatch).
+                crate::fuse_client::METRICS
+                    .read_copy_dest_bytes
+                    .fetch_add(len as u64, Ordering::Relaxed);
                 crate::cache::pool::ReadBlockValue::Bytes(bytes::Bytes::from_owner(
                     crate::cache::pool::UringBufOwner {
                         ptr: d.ptr,
@@ -5867,8 +5890,19 @@ impl DataRouter {
                 ))
             }
             None => {
+                // Zero-copy slice for `Bytes`-backed whole values (the
+                // fill-loop population — E-IL1's sibling); pooled reprs
+                // bounce, counted.
+                if end - start == req_len {
+                    if let crate::cache::pool::ReadBlockValue::Bytes(b) = &val {
+                        return crate::cache::pool::ReadBlockValue::Bytes(b.slice(start..end));
+                    }
+                }
                 let mut out = vec![0u8; req_len];
                 out[..end - start].copy_from_slice(&val[start..end]);
+                crate::fuse_client::METRICS
+                    .read_copy_bounce_bytes
+                    .fetch_add((end - start) as u64, Ordering::Relaxed);
                 crate::cache::pool::ReadBlockValue::Bytes(bytes::Bytes::from(out))
             }
         }
@@ -8749,13 +8783,28 @@ impl DataRouter {
                                     let data = if let Some(dest) = dest_addr {
                                         let len = end - start;
                                         let dest_ptr = dest as *mut u8;
-                                        unsafe {
-                                            std::ptr::copy_nonoverlapping(
-                                                hot[start..end].as_ptr(),
+                                        // Copy ledger: the lawful serve
+                                        // copy into the zero-copy dest
+                                        // (NT lever site — read serves
+                                        // default cached, see nt_copy).
+                                        // SAFETY: dest is registered
+                                        // payload / validated arena
+                                        // memory ≥ len; source is the
+                                        // hot entry's private bytes.
+                                        if unsafe {
+                                            crate::nt_copy::read_serve_copy_raw(
                                                 dest_ptr,
+                                                hot[start..end].as_ptr(),
                                                 len,
-                                            );
+                                            )
+                                        } {
+                                            METRICS
+                                                .nt_read_serve_bytes
+                                                .fetch_add(len as u64, Ordering::Relaxed);
                                         }
+                                        METRICS
+                                            .read_copy_dest_bytes
+                                            .fetch_add(len as u64, Ordering::Relaxed);
                                         bytes::Bytes::from_owner(
                                             crate::cache::pool::UringBufOwner {
                                                 ptr: dest_ptr,
@@ -8835,13 +8884,23 @@ impl DataRouter {
                                         let data = if let Some(dest) = dest_addr {
                                             let len = end - start;
                                             let dest_ptr = dest as *mut u8;
-                                            unsafe {
-                                                std::ptr::copy_nonoverlapping(
-                                                    held[start..end].as_ptr(),
+                                            // Copy ledger + NT lever
+                                            // (see the hot arm).
+                                            // SAFETY: as the hot arm.
+                                            if unsafe {
+                                                crate::nt_copy::read_serve_copy_raw(
                                                     dest_ptr,
+                                                    held[start..end].as_ptr(),
                                                     len,
-                                                );
+                                                )
+                                            } {
+                                                METRICS
+                                                    .nt_read_serve_bytes
+                                                    .fetch_add(len as u64, Ordering::Relaxed);
                                             }
+                                            METRICS
+                                                .read_copy_dest_bytes
+                                                .fetch_add(len as u64, Ordering::Relaxed);
                                             bytes::Bytes::from_owner(
                                                 crate::cache::pool::UringBufOwner {
                                                     ptr: dest_ptr,
@@ -8941,12 +9000,23 @@ impl DataRouter {
                                     let slice_t0 = std::time::Instant::now();
                                     let data = if let Some(dest) = dest_addr {
                                         let dest_ptr = dest as *mut u8;
+                                        // Copy ledger + NT lever (see
+                                        // the hot arm; source here is
+                                        // the tier mmap under guard).
+                                        // SAFETY: as the hot arm.
                                         unsafe {
-                                            std::ptr::copy_nonoverlapping(
-                                                guard.as_ptr(),
+                                            if crate::nt_copy::read_serve_copy_raw(
                                                 dest_ptr,
+                                                guard.as_ptr(),
                                                 len,
-                                            );
+                                            ) {
+                                                METRICS
+                                                    .nt_read_serve_bytes
+                                                    .fetch_add(len as u64, Ordering::Relaxed);
+                                            }
+                                            METRICS
+                                                .read_copy_dest_bytes
+                                                .fetch_add(len as u64, Ordering::Relaxed);
                                             bytes::Bytes::from_owner(
                                                 crate::cache::pool::UringBufOwner {
                                                     ptr: dest_ptr,
@@ -8955,6 +9025,13 @@ impl DataRouter {
                                             )
                                         }
                                     } else {
+                                        // Copy ledger: the mmap guard
+                                        // cannot live across an await —
+                                        // this bounce is structural for
+                                        // None-dest tier serves.
+                                        METRICS
+                                            .read_copy_bounce_bytes
+                                            .fetch_add(len as u64, Ordering::Relaxed);
                                         bytes::Bytes::copy_from_slice(&guard)
                                     };
                                     drop(guard);
@@ -9013,10 +9090,16 @@ impl DataRouter {
                                     && (slice_len as u64) % 4096 == 0
                                     && rel.end <= block_size;
                                 let rdest = match dest_addr {
-                                    // The payload arena is 4 KiB-aligned by
-                                    // construction; offer the dest only on
-                                    // the zero-copy leg (window == request).
-                                    Some(d) if aligned => Some(RangedDest {
+                                    // Offer the dest only on the zero-copy
+                                    // leg (window == request) AND when the
+                                    // dest pointer itself is 4 KiB-aligned
+                                    // (O_DIRECT DMA contract): the kernel
+                                    // payload arena is aligned by
+                                    // construction, but arena-dest il
+                                    // serves (E-IL2) hand arbitrary window
+                                    // pointers — unaligned dests take the
+                                    // bounce leg.
+                                    Some(d) if aligned && d % 4096 == 0 => Some(RangedDest {
                                         ptr: d as *mut u8,
                                         cap: slice_len as usize,
                                     }),
@@ -9068,6 +9151,11 @@ impl DataRouter {
                                                         );
                                                     }
                                                 }
+                                                // Copy ledger: serve copy
+                                                // into the dest.
+                                                METRICS
+                                                    .read_copy_dest_bytes
+                                                    .fetch_add(len as u64, Ordering::Relaxed);
                                                 bytes::Bytes::from_owner(
                                                     crate::cache::pool::UringBufOwner {
                                                         ptr: dest_ptr,
@@ -9077,7 +9165,17 @@ impl DataRouter {
                                             }
                                             None => match val {
                                                 crate::cache::pool::ReadBlockValue::Bytes(b) => b,
-                                                other => bytes::Bytes::copy_from_slice(&other),
+                                                other => {
+                                                    // Copy ledger: pooled
+                                                    // value bounce (rare —
+                                                    // ranged values are
+                                                    // Bytes-backed).
+                                                    METRICS.read_copy_bounce_bytes.fetch_add(
+                                                        other.len() as u64,
+                                                        Ordering::Relaxed,
+                                                    );
+                                                    bytes::Bytes::copy_from_slice(&other)
+                                                }
                                             },
                                         };
                                         return Ok((data, None));
@@ -9132,6 +9230,15 @@ impl DataRouter {
                                             if slice_start == 0
                                                 && slice_len as u64 == block_size
                                                 && self.get_crypto().is_passthrough()
+                                                // O_DIRECT DMA contract: the
+                                                // kernel payload arena is
+                                                // 4 KiB-aligned by
+                                                // construction; arena-dest
+                                                // il serves (E-IL2) must
+                                                // prove it (unaligned dests
+                                                // ride the validated loop's
+                                                // memcpy slice instead).
+                                                && dest % 4096 == 0
                                             {
                                                 // Zero-copy device→payload DMA. The raw read
                                                 // bypasses the single-flight fill, so it
@@ -9152,6 +9259,12 @@ impl DataRouter {
                                                         Some(dest),
                                                     )
                                                     .await?;
+                                                // Copy ledger: device DMA
+                                                // straight into the dest —
+                                                // zero daemon copies.
+                                                METRICS
+                                                    .read_dest_dma_bytes
+                                                    .fetch_add(block_size, Ordering::Relaxed);
                                                 let incarnation_ok = !tracked
                                                     || before.is_some_and(|bf| {
                                                         self.backend_router
@@ -9233,10 +9346,26 @@ impl DataRouter {
                                                         let len = end - start;
                                                         let dest_ptr = dest as *mut u8;
                                                         unsafe {
-                                                            std::ptr::copy_nonoverlapping(
-                                                                val[start..end].as_ptr(),
+                                                            // Copy ledger +
+                                                            // NT lever (see
+                                                            // the hot arm) —
+                                                            // the EXA cold
+                                                            // slice_out.
+                                                            if crate::nt_copy::read_serve_copy_raw(
                                                                 dest_ptr,
+                                                                val[start..end].as_ptr(),
                                                                 len,
+                                                            ) {
+                                                                METRICS
+                                                                    .nt_read_serve_bytes
+                                                                    .fetch_add(
+                                                                        len as u64,
+                                                                        Ordering::Relaxed,
+                                                                    );
+                                                            }
+                                                            METRICS.read_copy_dest_bytes.fetch_add(
+                                                                len as u64,
+                                                                Ordering::Relaxed,
                                                             );
                                                             // Unwritten remainder of the reused
                                                             // uring dest region must never replay
@@ -9302,11 +9431,21 @@ impl DataRouter {
                                                 let len = end - start;
                                                 let dest_ptr = dest as *mut u8;
                                                 unsafe {
-                                                    std::ptr::copy_nonoverlapping(
-                                                        val[start..end].as_ptr(),
+                                                    // Copy ledger + NT lever
+                                                    // (see the hot arm).
+                                                    if crate::nt_copy::read_serve_copy_raw(
                                                         dest_ptr,
+                                                        val[start..end].as_ptr(),
                                                         len,
-                                                    );
+                                                    ) {
+                                                        METRICS.nt_read_serve_bytes.fetch_add(
+                                                            len as u64,
+                                                            Ordering::Relaxed,
+                                                        );
+                                                    }
+                                                    METRICS
+                                                        .read_copy_dest_bytes
+                                                        .fetch_add(len as u64, Ordering::Relaxed);
                                                     if len < slice_len as usize {
                                                         std::ptr::write_bytes(
                                                             dest_ptr.add(len),
@@ -9368,8 +9507,30 @@ impl DataRouter {
                                             (slice_start + slice_len as u64) as usize,
                                             downloaded.len(),
                                         );
-                                        let slice: &[u8] = &downloaded[start..end];
-                                        let data = bytes::Bytes::copy_from_slice(slice);
+                                        // E-IL1 (read-copy-count 2026-08-02):
+                                        // `Bytes`-backed fills serve a
+                                        // REFCOUNT slice — the former
+                                        // `copy_from_slice` here was a
+                                        // 1 MiB-class alloc + full CPU
+                                        // pass per cold il read (the None-
+                                        // dest transport shape). Retention
+                                        // is unchanged: the backing was
+                                        // already returned alongside.
+                                        let data = match &downloaded {
+                                            crate::cache::pool::ReadBlockValue::Bytes(b) => {
+                                                b.slice(start..end)
+                                            }
+                                            other => {
+                                                // Copy ledger: pooled-repr
+                                                // bounce (PooledBuf cannot
+                                                // share refcounts).
+                                                METRICS.read_copy_bounce_bytes.fetch_add(
+                                                    (end - start) as u64,
+                                                    Ordering::Relaxed,
+                                                );
+                                                bytes::Bytes::copy_from_slice(&other[start..end])
+                                            }
+                                        };
                                         read_serve_phase_record(ReadServePhase::SliceOut, slice_t0);
                                         return Ok((data, Some(std::sync::Arc::new(downloaded))));
                                     }
@@ -9454,6 +9615,10 @@ impl DataRouter {
                     // never holds N permits while spawning (can deadlock the semaphore
                     // when block_count > permit pool under nested multi-block reads).
                     let mut futures = Vec::new();
+                    // Copy ledger classification for the per-block assembly
+                    // copies below: writes land either in the zero-copy
+                    // dest (dest_addr) or the pooled final_buf (bounce).
+                    let assembly_into_dest = final_buf_opt.is_none();
                     for (b_idx, b_key_opt) in block_keys {
                         let router = self.clone();
                         let b_start_offset = b_idx as u64 * block_size;
@@ -9583,6 +9748,16 @@ impl DataRouter {
                                 // punched/truncated index): zero the whole region.
                                 0
                             };
+                            // Copy ledger: one serve copy per assembled
+                            // block slice, classified by destination.
+                            if written > 0 {
+                                let ctr = if assembly_into_dest {
+                                    &METRICS.read_copy_dest_bytes
+                                } else {
+                                    &METRICS.read_copy_bounce_bytes
+                                };
+                                ctr.fetch_add(written as u64, Ordering::Relaxed);
+                            }
                             if written < copy_len {
                                 unsafe {
                                     std::ptr::write_bytes(
@@ -9622,8 +9797,13 @@ impl DataRouter {
                     }
 
                     if let Some(final_buf) = final_buf_opt {
-                        let data = bytes::Bytes::copy_from_slice(&final_buf[..final_len]);
-                        return Ok((data, Some(std::sync::Arc::new(final_buf))));
+                        // Copy ledger: the assembled pooled buffer is
+                        // handed out as a zero-copy `Bytes` view (E-IL1's
+                        // multi-block sibling — the former full-length
+                        // `copy_from_slice` bounce is gone).
+                        debug_assert_eq!(final_buf.len(), final_len);
+                        let data = final_buf.into_bytes();
+                        return Ok((data, None));
                     } else {
                         let data = bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner {
                             ptr: dest_addr.unwrap() as *mut u8,

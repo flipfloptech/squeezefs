@@ -174,10 +174,58 @@ fn bench_metadata_clone(c: &mut Criterion) {
     group.finish();
 }
 
+/// Dynamic meta routing (docs/design-dynamic-meta-routing.md §5.9): the
+/// derived-width hot-path arithmetic and the SlotSet control-plane ops —
+/// the idle-cost claims' standing regression instrument.
+fn bench_dynamic_meta_routing(c: &mut Criterion) {
+    use squeezefs::meta_backend::kv::slot_set::SlotSet;
+    use squeezefs::meta_backend::{
+        make_global_ino_width, plan_meta_slot_set, route_ino_width, DERIVED_ROUTING_WIDTH,
+    };
+
+    let mut group = c.benchmark_group("dynamic_meta_routing");
+    let w = u64::from(DERIVED_ROUTING_WIDTH);
+
+    // The per-op routing arithmetic at the derived width (§5.9: ~1 ns).
+    group.bench_function("route_ino_round_trip_w65536", |b| {
+        let mut ino = 2u64;
+        b.iter(|| {
+            let (slot, local) = route_ino_width(black_box(ino), w);
+            ino = ino.wrapping_add(7919).max(2);
+            black_box(make_global_ino_width(local, slot, w))
+        });
+    });
+
+    // The O(W) format-time plan (one stride run per member).
+    group.bench_function("plan_meta_slot_set_v4", |b| {
+        b.iter(|| black_box(plan_meta_slot_set(black_box(4)).unwrap()));
+    });
+
+    // SlotSet membership over a fresh half-width run.
+    let half: Vec<u16> = (0..=u16::MAX).step_by(2).collect();
+    let set = SlotSet::from_slots(&half);
+    group.bench_function("slot_set_contains_half_width", |b| {
+        let mut s = 0u16;
+        b.iter(|| {
+            s = s.wrapping_add(31);
+            black_box(set.contains(black_box(s)))
+        });
+    });
+
+    // Control-plane normalization: coalesce 32768 slots back to runs
+    // (the migration-mutation cost shape).
+    group.bench_function("slot_set_from_slots_half_width", |b| {
+        b.iter(|| black_box(SlotSet::from_slots(black_box(&half))));
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_high_concurrency,
     bench_cluster_dlm,
-    bench_metadata_clone
+    bench_metadata_clone,
+    bench_dynamic_meta_routing
 );
 criterion_main!(benches);

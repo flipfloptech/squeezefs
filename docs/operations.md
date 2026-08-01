@@ -349,7 +349,7 @@ squeezefs volume migrate-meta-slot <mountpoint> <slot> <volume-index>      # ONL
 squeezefs volume repair-set <sqmeta-uri>                # reconcile membership stamps after a crashed change
 ```
 
-- Metadata routing granularity is the **routing width** frozen at format (default = the metadata volume count at format). **W-granularity honesty**: a filesystem formatted with one metadata volume has W = 1 — one slot — so adding metadata volumes later cannot spread existing metadata (the verb warns loudly). Plan growth at format time with `format --meta-slots <n>`.
+- Metadata routing granularity: **format anywhere, grow forever, no knobs** (dynamic meta routing, 2026-08-02). Every format freezes the DERIVED virtual width (65536 slots — never chosen) and spreads minting across 64 slots per metadata volume, so any volume's existing metadata is divisible into ≥ 64 movable slices from birth: a single-metadata-volume filesystem grows to two (or two hundred) by `volume add-meta --take-slots …` / `migrate-meta-slot` with no format-time planning. The retired `format --meta-slots` flag is a hard error naming these verbs; volumes formatted under the old frozen-width scheme refuse loud (reformat required — forward-only).
 - Membership changes are crash-safe: interrupted `add-meta`/`remove-meta` **re-run with the same arguments and converge**; `repair-set` reconciles the stamps when a crash left them mid-flip. Old binaries refuse lifecycle-marked sets loudly (forward-only).
 - Set changes drain local staging first, then rebind the staging generation — durable staged payloads survive the membership change.
 

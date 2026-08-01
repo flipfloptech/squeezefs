@@ -81,7 +81,7 @@ deltas stated where they happen:
    have one NIC), so the dual-path connect loop and the round-robin
    `iopolicy` write from `cluster_reset.sh` are deliberately absent.
 3. Client instance store is formatted and mounted at `/scratch` (cache +
-   staging dirs), then `squeezefs format … --meta-slots 8 --disk-cache-paths`
+   staging dirs), then `squeezefs format … --disk-cache-paths`
    and `squeezefs mount … --daemon --interception --allow-other`.
 4. **build_commit ritual:** artifact sha256 is verified on every node at
    deploy, and after mount the `.stats` `build_commit` must appear in the

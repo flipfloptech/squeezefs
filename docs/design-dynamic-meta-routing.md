@@ -1,6 +1,6 @@
 # Design: Dynamic Meta Routing — the derived virtual width
 
-**Status:** Rev 1 — 2026-08-02. Campaign `feat/dynamic-meta-routing`.
+**Status:** Rev 2 — 2026-08-02, IMPLEMENTED (campaign `feat/dynamic-meta-routing`).
 **Charter:** direct user ruling (2026-08-02, verbatim): the frozen, user-chosen
 routing width is "a horrible / restrictive design decision... it needs to be
 dynamic." The no-fixed-constants law and the forward-only law (no backwards
@@ -230,7 +230,13 @@ pub const FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING: u64 = 1 << 6;
 ```
 set_uuid(16) | set_epoch(8) | member_position(2) | member_count(2) |
 routing_width(4) | n_runs(2) | n_runs × { start(2) | stride(2) | count(4) } |
-native_slot_plus1(2) | n_cursors(2) | n_cursors × { slot(2) | next(8) }
+native_slot_plus1(4) | n_cursors(2) | n_cursors × { slot(2) | next(8) }
+```
+
+  (`native_slot_plus1` is u32 on the wire — a u16 `plus1` would overflow
+  at slot 65535, which the derived width makes reachable.)
+
+```
 ```
 
   `slots_hosted` becomes a `SlotSet` (ordered stride runs; `contains`,
@@ -248,7 +254,7 @@ stamp):
 ```
 STAMP_MAX_RUNS    = 128   // 8 B each = 1024 B
 STAMP_MAX_CURSORS = 256   // 10 B each = 2560 B
-34 + 1024 + 4 + 2560 = 3622 ≤ 3953  ✓  (worst-case image re-derived in the consts' docs)
+34 + 1024 + 4 + 2 + 2560 = 3624 ≤ 3953  ✓  (worst-case image re-derived in the consts' docs)
 ```
 
 - `MEMBERSHIP_MAX_HOSTED_SLOTS` (= 64) and `META_SLOTS_PER_VOLUME_CAP`
@@ -371,11 +377,21 @@ structural mirrors of the exact open-path passes), W = 65536:
 | route table RAM | 512 KiB (`Vec<usize>`) / 128 KiB (u16) — per mount | | | |
 | fresh stamp bytes (1 run + 63 cursors) | **676 B** vs the 3953-B budget | | | |
 
+Real end-to-end numbers post-implementation (`idle_cost_probe`,
+file-backed sandbox, debug build — a conservative upper bound; the
+probe stays in `tests/dynamic_meta_routing_tests.rs` as an explicitly
+invoked instrument):
+
+| Shape | format | discover | open (guarded, replay) | at-rest stamp | route table |
+|---|---|---|---|---|---|
+| V=1, W=65536 | 7.0 ms | 7.8 ms | 20.9 ms | **48 B** (fresh; ≤ 674 B with a full mint-cursor set) | 512 KiB RAM |
+| V=2, W=65536 | 7.6 ms | 6.7 ms | 27.9 ms | 48 B/member | 512 KiB RAM |
+
 Verdict: per-slot idle cost aggregates to O(1)-per-volume on disk and
 sub-ms/sub-MiB per mount — **displaced nothing**; architecture A stands.
-Real end-to-end format/mount deltas on the file-backed sandbox are
-recorded in the campaign evidence note
-(`.benchmarks/2026-08-02-dynamic-meta-routing.md`) after implementation.
+The standing regression instrument is the `dynamic_meta_routing`
+Criterion group in `benches/high_concurrency_bench.rs`; the campaign
+evidence note is `.benchmarks/2026-08-02-dynamic-meta-routing.md`.
 
 ## 6. Forward-only surface (the refusal matrix)
 
@@ -446,4 +462,5 @@ rewritten).
 
 | Rev | Date | Change |
 |---|---|---|
+| 2 | 2026-08-02 | Implementation record: `native_slot_plus1` widened to u32 on the wire (u16 plus1 overflows at slot 65535); §5.9 gains the measured end-to-end probe numbers (7–8 ms format / 21–28 ms open / 48 B at-rest stamps on the file-backed sandbox); the idle-cost probe and the `dynamic_meta_routing` Criterion group named as standing instruments |
 | 1 | 2026-08-02 | Initial design: constraints verified against code (ino-pin arithmetic, ledger/xattr/census cost sites, the mint-slot cosmetic-W trap); A vs B priced with B's key-encoding rewrite named as the disqualifier; A adjudicated on measured idle costs (µs/KiB-scale at W = 65536); derived W = 2^16 (slot-id namespace), stride-run stamp wire under incompat bit 6, encoding-budget caps replacing the 64-slot cap, MINT_SPREAD = 64 minting rotation, census + mirror economy, forward-only refusal matrix |

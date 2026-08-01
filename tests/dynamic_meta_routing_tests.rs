@@ -647,6 +647,58 @@ async fn test_discovery_is_uri_order_independent_at_derived_width() {
 }
 
 // ---------------------------------------------------------------------------
+// The idle-cost probe (design-dynamic-meta-routing §5.9) — an explicitly
+// invoked instrument, not a gate: `cargo test --test
+// dynamic_meta_routing_tests -- --ignored idle_cost_probe --nocapture`.
+// Prints end-to-end format/open walls at the derived width on the
+// file-backed sandbox substrate (debug build — a conservative UPPER
+// bound on the release numbers) plus the at-rest stamp bytes.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement instrument — run explicitly with --ignored"]
+async fn idle_cost_probe() {
+    for v in [1usize, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let metas: Vec<PathBuf> = (0..v)
+            .map(|i| make_file(dir.path(), &format!("m{i}"), VOL_LEN))
+            .collect();
+        let t = std::time::Instant::now();
+        let plan = format_set(&metas).await;
+        let format_ms = t.elapsed().as_secs_f64() * 1e3;
+
+        let uri = uris(&metas);
+        let t = std::time::Instant::now();
+        let disc = discover_meta_set(&uri).await.expect("discover");
+        let discover_ms = t.elapsed().as_secs_f64() * 1e3;
+
+        let t = std::time::Instant::now();
+        let routed = open_routed_meta_set(&uri).await.expect("open");
+        let open_ms = t.elapsed().as_secs_f64() * 1e3;
+
+        let stamp_bytes: Vec<usize> = plan
+            .stamps
+            .iter()
+            .map(|st| {
+                // Encoded record length minus a stampless twin = the
+                // stamp's at-rest cost.
+                let with = rec(Some(st.clone())).encode_slot().unwrap();
+                let without = rec(None).encode_slot().unwrap();
+                let len = |img: &[u8]| u32::from_le_bytes(img[4..8].try_into().unwrap()) as usize;
+                len(&with) - len(&without)
+            })
+            .collect();
+        let table_bytes = disc.slot_to_volume.len() * std::mem::size_of::<usize>();
+        println!(
+            "IDLE-COST v={v} W={} | format {format_ms:.1} ms | discover {discover_ms:.2} ms | \
+             open {open_ms:.1} ms | stamp {stamp_bytes:?} B | route table {table_bytes} B",
+            plan.routing_width
+        );
+        shutdown_routed(&routed).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // `format --meta-slots` dies loud naming its successor
 // ---------------------------------------------------------------------------
 

@@ -8,7 +8,17 @@ Squeezefs is a high-performance distributed POSIX FUSE filesystem (Rust + tokio 
 
 ## Non-Negotiables
 
+### Performance is the only terminal requirement (user ruling 2026-08-01)
+
+**Nothing in this section is dogma — "the goal is the absolute fastest we can be."** Every mechanism below (io_uring transports included) holds its slot on **measured evidence**, and any of it may be displaced by counted A/B evidence that an alternative is faster at the relevant shape on target hardware. What stays banned is displacement by *convenience*: switching to a classical mechanism to dodge a bug or make a test pass is still an anti-pattern — displacement requires measurement, not frustration. (FUSE-over-io_uring currently holds its slot on evidence: 44k → 316k IOPS, `.benchmarks/2026-07-15-iops-parity-decomposition.md`.)
+
+### Portable by default (user directive 2026-07, NT-store campaign)
+
+No CPU-model-specific code paths and no per-CPU tuning matrices. Microarchitecture-sensitive optimizations are admissible only when they are (a) measured wins across the target hardware set, (b) derived from **runtime behavior** (never CPU-ID tables), and (c) harmless where the microarch trait is absent. Same law for topology: anything NUMA-aware must scale on its own across arbitrary domain counts (not all hosts have 2 domains — see `crates/squeezefs-ipc/src/numa_core.rs` for the pattern).
+
 ### Always use io_uring when we can
+
+*(Presumption, not dogma — see the 2026-08-01 ruling above: this slot is held by measurement and is displaceable by measurement.)*
 
 **Policy for agents and humans:** prefer and require **io_uring** for every I/O path where the Linux kernel can do it. Do **not** “temporarily” fall back to classical `read`/`write`/`pread`/`pwrite`/`/dev/fuse` polling as a way to unblock a bug. Fix the uring path, or fail loud.
 
@@ -243,7 +253,7 @@ git checkout -b feat/short-description   # or fix/short-description
 
 #### SqueezeFS I/O constraint (always io_uring when we can)
 
-This repo is Linux + **io_uring**-first. When planning or implementing:
+This repo is Linux + **io_uring**-first. The 2026-08-01 ruling applies here too: io_uring is the measured-fastest presumption, not dogma — a counted A/B showing a faster arrangement displaces it; a failing test never does. When planning or implementing:
 
 - **Default to io_uring** for FUSE request traffic (FUSE-over-io_uring after arm), NVMe/block I/O (`NvmeBlockDev`), and local file I/O (`crate::uring_fs`) whenever the kernel can support it.
 - **Do not** introduce or re-enable classical `/dev/fuse` or POSIX file I/O fallbacks to “make it work.” That is an anti-pattern here. Fix the uring path or fail loud.

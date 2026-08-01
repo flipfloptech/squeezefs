@@ -38,6 +38,10 @@ pub use raw::{
     over_uring_commit_batch_stats, over_uring_geometry, over_uring_sessions_active,
     over_uring_stats, transport_lease_stats, transport_wake_stats, COMMIT_BATCH_LABELS,
 };
+pub use raw::{
+    read_inplace_replies, read_transport_phase_record, read_transport_phase_snapshot,
+    ReadTransportPhase,
+};
 #[cfg(feature = "tokio-runtime")]
 pub use raw::{tpc_lane_redispatches, tpc_spawn, tpc_spawn_on_node, tpc_thread_count};
 
@@ -53,6 +57,12 @@ pub mod notify;
 // plain `usize` indices ever cross it).
 #[path = "../../squeezefs-ipc/src/numa_core.rs"]
 pub mod numa_core;
+// µs-bucket latency-histogram core — canonical file in the squeezefs-ipc
+// tree, `#[path]`-included here (the read_transport_phase_ns rig) and by
+// the root crate (LatencyHistogram), so transport- and daemon-side phase
+// histograms bucket identically by construction.
+#[path = "../../squeezefs-ipc/src/latency_core.rs"]
+pub mod latency_core;
 pub mod path;
 pub mod raw;
 

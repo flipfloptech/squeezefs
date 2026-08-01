@@ -4,7 +4,9 @@ use crate::dlm::DlmClient;
 pub const MAX_INLINE_SIZE: usize = 4096;
 
 use crate::error::{Result, SqueezefsError};
-use crate::fuse_client::METRICS;
+use crate::fuse_client::{
+    read_fill_phase_record, read_serve_phase_record, ReadFillPhase, ReadServePhase, METRICS,
+};
 use crate::meta_backend::Metadata;
 use crate::stripe_locks::StripeLocks;
 use log::debug;
@@ -3675,6 +3677,11 @@ impl DataRouter {
     }
 
     async fn fetch_block_from_remote(&self, block_key: &str) -> Result<bytes::Bytes> {
+        // read_fill_phase_ns: `fetch_dma` = the whole device-fetch await
+        // (worker channel + device queue + service + oneshot wake — the
+        // dev_queue/dev_service sub-spans record at the NvmeBlockDev
+        // funnel); `decode` = the transform leg (passthrough ≈ 0).
+        let t_dma = std::time::Instant::now();
         let raw = if let Some(dht) = self.cache.nvme.dht_node.get() {
             let client = crate::p2p::P2pClient::new();
             if let Ok(data) = client.download_block_from_peer(dht, block_key).await {
@@ -3685,8 +3692,11 @@ impl DataRouter {
         } else {
             self.read_nvme_block(block_key).await?
         };
+        read_fill_phase_record(ReadFillPhase::FetchDma, t_dma);
 
+        let t_dec = std::time::Instant::now();
         let decompressed = self.get_crypto().process_read_async(raw).await?;
+        read_fill_phase_record(ReadFillPhase::Decode, t_dec);
         Ok(decompressed)
     }
 
@@ -3760,6 +3770,12 @@ impl DataRouter {
         // bounded wait so FUSE cannot wedge permanently (also blocks .config).
         const WAIT_SLICE: Duration = Duration::from_millis(50);
         const MAX_WAIT: Duration = Duration::from_secs(60);
+        // read_serve_phase_ns `sf_wait`: entry → served WITHOUT becoming
+        // the primary, for any caller that subscribed to an in-flight
+        // fill at least once (the deep-qd cohort-wait term). Primaries
+        // record the fill chain instead (`read_fill_phase_ns`).
+        let sf_t0 = std::time::Instant::now();
+        let mut sf_waited = false;
         let deadline = std::time::Instant::now() + MAX_WAIT;
 
         loop {
@@ -3780,6 +3796,9 @@ impl DataRouter {
                 // block-level re-access, never self-consumption.
                 METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                 METRICS.hot_block_hits.fetch_add(1, Ordering::Relaxed);
+                if sf_waited {
+                    read_serve_phase_record(ReadServePhase::SfWait, sf_t0);
+                }
                 return Ok((
                     crate::cache::pool::ReadBlockValue::Bytes(cached_block),
                     true,
@@ -3788,6 +3807,9 @@ impl DataRouter {
 
             if let Some(cached_block) = self.cache.read_lru.get(block_key) {
                 METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                if sf_waited {
+                    read_serve_phase_record(ReadServePhase::SfWait, sf_t0);
+                }
                 return Ok((
                     crate::cache::pool::ReadBlockValue::Bytes(cached_block),
                     true,
@@ -3809,6 +3831,9 @@ impl DataRouter {
                 // device-validated fills (below) and legitimate owners;
                 // NVMe-tier hits stay NVMe-tier hits — the bytes still
                 // serve this caller.
+                if sf_waited {
+                    read_serve_phase_record(ReadServePhase::SfWait, sf_t0);
+                }
                 return Ok((crate::cache::pool::ReadBlockValue::Bytes(bytes), true));
             }
 
@@ -3825,6 +3850,9 @@ impl DataRouter {
                 if let Some(held) = self.cache.read_lane_hold.serve(block_key, 0) {
                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                     METRICS.read_lane_serves.fetch_add(1, Ordering::Relaxed);
+                    if sf_waited {
+                        read_serve_phase_record(ReadServePhase::SfWait, sf_t0);
+                    }
                     return Ok((crate::cache::pool::ReadBlockValue::Bytes(held), true));
                 }
             }
@@ -3840,6 +3868,7 @@ impl DataRouter {
                 let tx = entry.get().clone();
                 drop(entry);
                 let mut rx = tx.subscribe();
+                sf_waited = true;
                 // Completion may have raced between get_sync and subscribe — recheck.
                 if let Some(cached_block) = self
                     .cache
@@ -3848,6 +3877,7 @@ impl DataRouter {
                     .or_else(|| self.cache.read_lru.get(block_key))
                 {
                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    read_serve_phase_record(ReadServePhase::SfWait, sf_t0);
                     return Ok((
                         crate::cache::pool::ReadBlockValue::Bytes(cached_block),
                         true,
@@ -3868,6 +3898,7 @@ impl DataRouter {
                         METRICS
                             .singleflight_waiter_result_serves
                             .fetch_add(1, Ordering::Relaxed);
+                        read_serve_phase_record(ReadServePhase::SfWait, sf_t0);
                         return Ok((
                             crate::cache::pool::ReadBlockValue::Bytes(res.bytes),
                             res.serve_valid,
@@ -3894,6 +3925,9 @@ impl DataRouter {
             {
                 Ok(_) => {
                     METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
+                    // read_fill_phase_ns `fill_total`: primary claim →
+                    // fill complete — what a whole cohort waits on.
+                    let fill_t0 = std::time::Instant::now();
                     let guard = InflightBlockReadGuard {
                         key: block_key.to_string(),
                         inflight_block_reads: self.inflight_block_reads.clone(),
@@ -3928,6 +3962,10 @@ impl DataRouter {
                             .fill_incarnation_still(block_key, before)
                     });
                     if let Some(before) = publishable {
+                        // read_fill_phase_ns `admission`: the ghost/
+                        // governor decision + the awaited tier publish
+                        // when admitted (skip ≈ 0 — the R1b posture).
+                        let adm_t0 = std::time::Instant::now();
                         // R1b admission (§5.3): the disk-tier publish
                         // decision for the > 256 KiB population. FIRST
                         // touch skips (the 16.5 GiB-per-16 GiB tax kill —
@@ -4052,6 +4090,11 @@ impl DataRouter {
                             })
                             .await;
                         }
+                        read_fill_phase_record(ReadFillPhase::Admission, adm_t0);
+                        // read_fill_phase_ns `deposit`: the cache landing
+                        // — hold deposit + RAM-LRU/hot put + the seqlock
+                        // completion check below.
+                        let dep_t0 = std::time::Instant::now();
                         // Read-lane hold deposit (2026-08-01): every
                         // > 256 KiB demand primary parks its completed
                         // fill in the ledger-invisible hold — the
@@ -4166,6 +4209,7 @@ impl DataRouter {
                             // unified purge (R4 §5.4).
                             self.cache.purge_block_key(block_key);
                         }
+                        read_fill_phase_record(ReadFillPhase::Deposit, dep_t0);
                     }
                     // R1a (§5.2): hand the cohort its fill — after the
                     // publishes and the final still-check, so waiters
@@ -4179,6 +4223,7 @@ impl DataRouter {
                         serve_valid,
                     }));
                     guard.completed.set(true);
+                    read_fill_phase_record(ReadFillPhase::FillTotal, fill_t0);
                     return Ok((
                         crate::cache::pool::ReadBlockValue::Bytes(downloaded_bytes),
                         serve_valid,
@@ -5255,7 +5300,9 @@ impl DataRouter {
             if recheck_delay > 0 {
                 tokio::time::sleep(Duration::from_millis(recheck_delay)).await;
             }
+            let bind_t0 = std::time::Instant::now();
             let current = self.current_block_binding(file_path, b).await?;
+            read_serve_phase_record(ReadServePhase::BindingCheck, bind_t0);
             if incarnation_valid && current.as_deref() == Some(cur_key.as_str()) {
                 return Ok(Some(val));
             }
@@ -7915,10 +7962,14 @@ impl DataRouter {
         // serves from its authoritative, mutation-tracking tier instead: the
         // inline `data_key`, the staging ring (staged), or the per-block read
         // caches / hole map (striped).
+        // read_serve_phase_ns `meta_resolve` (≈ 0 with a fresh handler
+        // hint; the backend round trip when the hint is stale/absent).
+        let meta_t0 = std::time::Instant::now();
         let mut meta = match meta_hint {
             Some(h) if metadata_entry_fresh_or_dirty(&h) => h,
             _ => self.fetch_metadata(file_path).await?,
         };
+        read_serve_phase_record(ReadServePhase::MetaResolve, meta_t0);
 
         // POSIX full-length below-EOF contract (the generic/617 short-read
         // family): every leg below returns EXACTLY
@@ -8305,9 +8356,15 @@ impl DataRouter {
                         }
 
                         // Check the RAM tiers, then the NVMe read block cache
+                        // (read_serve_phase_ns: `key_resolve` = the map
+                        // resolve; `classify_probe` runs from here to the
+                        // serve-or-fetch decision).
+                        let key_t0 = std::time::Instant::now();
                         let block_keys = self
                             .load_striped_block_keys(file_path, &meta, start_block, end_block)
                             .await?;
+                        read_serve_phase_record(ReadServePhase::KeyResolve, key_t0);
+                        let probe_t0 = std::time::Instant::now();
                         // Hybrid-I/O diagnostic escape (user directive
                         // 2026-07-15): device-true O_DIRECT requests skip
                         // the classifier/pipeline (prefetch fills are
@@ -8363,11 +8420,16 @@ impl DataRouter {
                                 if let Some(hot) =
                                     self.cache.hot_block.get_serving(b_key, slice_len as u64)
                                 {
+                                    read_serve_phase_record(
+                                        ReadServePhase::ClassifyProbe,
+                                        probe_t0,
+                                    );
                                     let start = std::cmp::min(slice_start as usize, hot.len());
                                     let end = std::cmp::min(
                                         (slice_start + slice_len as u64) as usize,
                                         hot.len(),
                                     );
+                                    let slice_t0 = std::time::Instant::now();
                                     let data = if let Some(dest) = dest_addr {
                                         let len = end - start;
                                         let dest_ptr = dest as *mut u8;
@@ -8387,12 +8449,15 @@ impl DataRouter {
                                     } else {
                                         hot.slice(start..end)
                                     };
-                                    if self
+                                    read_serve_phase_record(ReadServePhase::SliceOut, slice_t0);
+                                    let bind_t0 = std::time::Instant::now();
+                                    let still_bound = self
                                         .current_block_binding(file_path, start_block)
                                         .await?
                                         .as_deref()
-                                        == Some(b_key.as_str())
-                                    {
+                                        == Some(b_key.as_str());
+                                    read_serve_phase_record(ReadServePhase::BindingCheck, bind_t0);
+                                    if still_bound {
                                         METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                                         METRICS.hot_block_hits.fetch_add(1, Ordering::Relaxed);
                                         if hint.odirect {
@@ -8439,11 +8504,16 @@ impl DataRouter {
                             if self.read_lane.enabled() {
                                 if let Some(b_key) = b_key_opt.as_ref().filter(|_| !device_true) {
                                     if let Some(held) = self.cache.read_lane_hold.serve(b_key, 0) {
+                                        read_serve_phase_record(
+                                            ReadServePhase::ClassifyProbe,
+                                            probe_t0,
+                                        );
                                         let start = std::cmp::min(slice_start as usize, held.len());
                                         let end = std::cmp::min(
                                             (slice_start + slice_len as u64) as usize,
                                             held.len(),
                                         );
+                                        let slice_t0 = std::time::Instant::now();
                                         let data = if let Some(dest) = dest_addr {
                                             let len = end - start;
                                             let dest_ptr = dest as *mut u8;
@@ -8463,12 +8533,18 @@ impl DataRouter {
                                         } else {
                                             held.slice(start..end)
                                         };
-                                        if self
+                                        read_serve_phase_record(ReadServePhase::SliceOut, slice_t0);
+                                        let bind_t0 = std::time::Instant::now();
+                                        let still_bound = self
                                             .current_block_binding(file_path, start_block)
                                             .await?
                                             .as_deref()
-                                            == Some(b_key.as_str())
-                                        {
+                                            == Some(b_key.as_str());
+                                        read_serve_phase_record(
+                                            ReadServePhase::BindingCheck,
+                                            bind_t0,
+                                        );
+                                        if still_bound {
                                             METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
                                             METRICS
                                                 .read_lane_serves
@@ -8514,7 +8590,12 @@ impl DataRouter {
                                     )
                                 {
                                     METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                                    read_serve_phase_record(
+                                        ReadServePhase::ClassifyProbe,
+                                        probe_t0,
+                                    );
                                     let len = guard.len();
+                                    let slice_t0 = std::time::Instant::now();
                                     let data = if let Some(dest) = dest_addr {
                                         let dest_ptr = dest as *mut u8;
                                         unsafe {
@@ -8534,12 +8615,15 @@ impl DataRouter {
                                         bytes::Bytes::copy_from_slice(&guard)
                                     };
                                     drop(guard);
-                                    if self
+                                    read_serve_phase_record(ReadServePhase::SliceOut, slice_t0);
+                                    let bind_t0 = std::time::Instant::now();
+                                    let still_bound = self
                                         .current_block_binding(file_path, start_block)
                                         .await?
                                         .as_deref()
-                                        == Some(b_key.as_str())
-                                    {
+                                        == Some(b_key.as_str());
+                                    read_serve_phase_record(ReadServePhase::BindingCheck, bind_t0);
+                                    if still_bound {
                                         if hint.odirect {
                                             METRICS
                                                 .read_odirect_tier_serves
@@ -8595,6 +8679,7 @@ impl DataRouter {
                                     }),
                                     _ => None,
                                 };
+                                read_serve_phase_record(ReadServePhase::ClassifyProbe, probe_t0);
                                 let served = self
                                     .get_block_range_for_index(
                                         file_path,
@@ -8680,9 +8765,14 @@ impl DataRouter {
                             // payload dest when possible (revalidated afterwards),
                             // else the binding-validated fetch loop. `None` = the
                             // block is a hole in the CURRENT map.
+                            // (read_serve_phase_ns: every probe missed —
+                            // the cold leg; `block_fetch` spans each fetch
+                            // await below, `slice_out` the reply copies.)
+                            read_serve_phase_record(ReadServePhase::ClassifyProbe, probe_t0);
                             let downloaded: Option<crate::cache::pool::ReadBlockValue> =
                                 match b_key_opt {
                                     Some(b_key) => {
+                                        let fetch_t0 = std::time::Instant::now();
                                         let mut resolved = None;
                                         if let Some(dest) = dest_addr {
                                             // §5.6 sibling-leg hygiene: this raw
@@ -8759,7 +8849,13 @@ impl DataRouter {
                                             }
                                         }
                                         match resolved {
-                                            Some(r) => Some(r),
+                                            Some(r) => {
+                                                read_serve_phase_record(
+                                                    ReadServePhase::BlockFetch,
+                                                    fetch_t0,
+                                                );
+                                                Some(r)
+                                            }
                                             None => {
                                                 // Device-true on a transform
                                                 // volume reaches here (decode
@@ -8775,6 +8871,11 @@ impl DataRouter {
                                                         true,
                                                     )
                                                     .await?;
+                                                read_serve_phase_record(
+                                                    ReadServePhase::BlockFetch,
+                                                    fetch_t0,
+                                                );
+                                                let slice_t0 = std::time::Instant::now();
                                                 match (val, dest_addr) {
                                                     (Some(val), Some(dest)) => {
                                                         let start = std::cmp::min(
@@ -8805,6 +8906,10 @@ impl DataRouter {
                                                                 );
                                                             }
                                                         }
+                                                        read_serve_phase_record(
+                                                            ReadServePhase::SliceOut,
+                                                            slice_t0,
+                                                        );
                                                         let b = bytes::Bytes::from_owner(
                                                             crate::cache::pool::UringBufOwner {
                                                                 ptr: dest_ptr,
@@ -8828,6 +8933,7 @@ impl DataRouter {
                                     // re-resolves freshest-first; only a
                                     // fresh-map absence is a hole.
                                     None => {
+                                        let fetch_t0 = std::time::Instant::now();
                                         let val = self
                                             .get_block_for_index(
                                                 file_path,
@@ -8837,6 +8943,11 @@ impl DataRouter {
                                                 true,
                                             )
                                             .await?;
+                                        read_serve_phase_record(
+                                            ReadServePhase::BlockFetch,
+                                            fetch_t0,
+                                        );
+                                        let slice_t0 = std::time::Instant::now();
                                         match (val, dest_addr) {
                                             (Some(val), Some(dest)) => {
                                                 let start =
@@ -8861,6 +8972,10 @@ impl DataRouter {
                                                         );
                                                     }
                                                 }
+                                                read_serve_phase_record(
+                                                    ReadServePhase::SliceOut,
+                                                    slice_t0,
+                                                );
                                                 let b = bytes::Bytes::from_owner(
                                                     crate::cache::pool::UringBufOwner {
                                                         ptr: dest_ptr,
@@ -8903,6 +9018,7 @@ impl DataRouter {
                                         );
                                         return Ok((data, Some(std::sync::Arc::new(downloaded))));
                                     } else {
+                                        let slice_t0 = std::time::Instant::now();
                                         let start =
                                             std::cmp::min(slice_start as usize, downloaded.len());
                                         let end = std::cmp::min(
@@ -8911,6 +9027,7 @@ impl DataRouter {
                                         );
                                         let slice: &[u8] = &downloaded[start..end];
                                         let data = bytes::Bytes::copy_from_slice(slice);
+                                        read_serve_phase_record(ReadServePhase::SliceOut, slice_t0);
                                         return Ok((data, Some(std::sync::Arc::new(downloaded))));
                                     }
                                 }
@@ -8941,9 +9058,15 @@ impl DataRouter {
                     }
 
                     // 2. Multi-block or cache miss: load and assemble using pooled buffer
+                    // (read_serve_phase_ns: the common phases record here
+                    // too; per-block `block_fetch` spans record in the
+                    // parallel tasks below — the single-block leg above is
+                    // the fully-tiled decomposition venue.)
+                    let key_t0 = std::time::Instant::now();
                     let block_keys = self
                         .load_striped_block_keys(file_path, &meta, start_block, end_block)
                         .await?;
+                    read_serve_phase_record(ReadServePhase::KeyResolve, key_t0);
                     // Hybrid-I/O diagnostic escape: same contract as the
                     // single-block arm (no classifier/pipeline, no tier
                     // serves, no admission — validated device reads only).
@@ -9079,16 +9202,20 @@ impl DataRouter {
                                     }
                                     None => 0,
                                 }
-                            } else if let Some(downloaded) = router
-                                .get_block_for_index(
-                                    &file_path_clone,
-                                    b_idx,
-                                    b_key_opt.as_deref(),
-                                    device_true,
-                                    true,
-                                )
-                                .await?
-                            {
+                            } else if let Some(downloaded) = {
+                                let fetch_t0 = std::time::Instant::now();
+                                let val = router
+                                    .get_block_for_index(
+                                        &file_path_clone,
+                                        b_idx,
+                                        b_key_opt.as_deref(),
+                                        device_true,
+                                        true,
+                                    )
+                                    .await?;
+                                read_serve_phase_record(ReadServePhase::BlockFetch, fetch_t0);
+                                val
+                            } {
                                 // Binding-validated serve (reused-key stale-fill
                                 // family): the RAM-LRU fast path lives inside the
                                 // primitive; a stale b→key resolution re-resolves

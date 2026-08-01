@@ -105,6 +105,9 @@ enum UringRequest {
         size: usize,
         bytes: bytes::Bytes,
         tx: oneshot::Sender<Result<bytes::Bytes>>,
+        /// Enqueue stamp — feeds `read_fill_phase_ns.dev_queue`
+        /// (channel + slot wait before the SQE submits).
+        enq: std::time::Instant,
     },
     Write {
         offset: u64,
@@ -119,6 +122,9 @@ enum UringResponse {
         size: usize,
         offset: u64,
         tx: oneshot::Sender<Result<bytes::Bytes>>,
+        /// SQE-submit stamp — feeds `read_fill_phase_ns.dev_service`
+        /// (submit → CQE completion).
+        submitted: std::time::Instant,
     },
     Write {
         tx: oneshot::Sender<Result<()>>,
@@ -310,13 +316,22 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                     size,
                     bytes,
                     tx,
+                    enq,
                 } => {
+                    // read_fill_phase_ns: `dev_queue` = enqueue → SQE
+                    // build (channel + slot wait); `dev_service` starts
+                    // here and records at CQE completion.
+                    crate::fuse_client::read_fill_phase_record(
+                        crate::fuse_client::ReadFillPhase::DevQueue,
+                        enq,
+                    );
                     active[slot_idx] = Some(ActiveReq {
                         response: UringResponse::Read {
                             bytes,
                             size,
                             offset,
                             tx,
+                            submitted: std::time::Instant::now(),
                         },
                         free_ptr: None,
                         _keep_alive: None,
@@ -401,7 +416,12 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                                 size,
                                 offset,
                                 tx,
+                                submitted,
                             } => {
+                                crate::fuse_client::read_fill_phase_record(
+                                    crate::fuse_client::ReadFillPhase::DevService,
+                                    submitted,
+                                );
                                 let _ = tx.send(finish_read(io_res, bytes, size, offset));
                             }
                             UringResponse::Write { tx } => {
@@ -498,7 +518,12 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                             size,
                             offset,
                             tx,
+                            submitted,
                         } => {
+                            crate::fuse_client::read_fill_phase_record(
+                                crate::fuse_client::ReadFillPhase::DevService,
+                                submitted,
+                            );
                             let _ = tx.send(finish_read(io_res, bytes, size, offset));
                         }
                         UringResponse::Write { tx } => {
@@ -896,6 +921,7 @@ impl NvmeBlockDev {
                 size,
                 bytes,
                 tx,
+                enq: std::time::Instant::now(),
             })
             .map_err(|e| {
                 crate::fuse_client::METRICS

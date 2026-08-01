@@ -137,6 +137,9 @@ pub struct InboundUringReq {
     /// FUSE request unique (also embedded in `header_and_op`).
     #[allow(dead_code)]
     pub unique: u64,
+    /// Reap stamp (transport epoch ns, `read_phase::transport_now_ns`) —
+    /// anchors `read_transport_phase_ns`'s `queue_wait`/`transport_total`.
+    pub arrived_ns: u64,
 }
 
 /// One pending ring entry: `(qid, ent_idx, commit_id)`.
@@ -2090,6 +2093,7 @@ fn queue_worker(
                     header_and_op,
                     payload,
                     unique,
+                    arrived_ns: crate::raw::read_phase::transport_now_ns(),
                 });
                 // FORGET payloads are copies (never leased) and this ent's
                 // previous commit passed the refs == 0 gate: the immediate
@@ -2126,6 +2130,7 @@ fn queue_worker(
                 header_and_op,
                 payload,
                 unique,
+                arrived_ns: crate::raw::read_phase::transport_now_ns(),
             });
         }
         if disconnect {
@@ -2971,6 +2976,7 @@ mod inbound_queue_tests {
             header_and_op: vec![0; 40],
             payload: Bytes::new(),
             unique,
+            arrived_ns: crate::raw::read_phase::transport_now_ns(),
         }
     }
 

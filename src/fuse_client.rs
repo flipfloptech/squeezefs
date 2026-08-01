@@ -1802,6 +1802,192 @@ pub fn write_pipeline_phase_json() -> serde_json::Value {
     serde_json::Value::Object(phases)
 }
 
+// ===========================================================================
+// Read-serve residence decomposition (`read_serve_phase_ns` +
+// `read_fill_phase_ns`) — the 2026-08-01 serve-latency decomposition
+// campaign's read-side instrument (`tests/read_serve_phase_tests.rs`;
+// evidence `.benchmarks/2026-08-01-serve-decomposition.md`), the read twin
+// of `write_pipeline_phase_ns` above.
+//
+// The read-lane campaign left the read plateau Little-closed at
+// ~10.4 ms/op vs 6.2 ms raw at identical in-flight bytes (EXA cold-read
+// shape) — a PER-OP LATENCY CHAIN with no instrument able to name which
+// leg owns the ~4 ms (`.benchmarks/2026-08-01-read-lane.md` §7). These
+// families timestamp every boundary a data-read op / block fill crosses so
+// the residual is named by numbers.
+//
+// Deliberately ALWAYS-ON (the write_pipeline_phase_ns cost contract): one
+// `Instant::now()` + one relaxed `fetch_add` per phase boundary actually
+// crossed — a warm serve crosses ~6 boundaries, a cold serve ~12, and the
+// field needs the decomposition on production mounts without a
+// remount-to-arm round trip. The fuse3-side transport family
+// (`read_transport_phase_ns`) buckets through the SAME shared core
+// (`crate::latency_core`), so the three tables compose end-to-end.
+//
+// Containment map (the no-unexplained-residue law; every phase is a span,
+// sums are bucket-midpoint estimates per row):
+//
+//   total ≈ prelude + meta_resolve + key_resolve + classify_probe
+//           + (warm: slice_out + binding_check | cold: block_fetch + slice_out)
+//           + post_validate
+//   block_fetch ⊇ {sf_wait (cohort waiter) | fill_total + binding_check
+//                  (primary)}
+//   fill_total  ≈ fetch_dma + decode + admission + deposit
+//   fetch_dma   ⊇ dev_queue + dev_service (+ oneshot-wake residue)
+//   transport_total ≈ queue_wait + dispatch_lag + [handler total]
+//                     + reply_commit             (fuse3 family)
+//
+// Scope: the single-block striped serve (the production 4 MiB-block shape)
+// is the fully-tiled venue; multi-block requests record the common phases
+// plus per-block `block_fetch` spans. `dev_queue`/`dev_service` cover every
+// data-device read at the NvmeBlockDev funnel (ranged windows included);
+// `admission`/`deposit` record on publishable fills only.
+// ===========================================================================
+
+/// Read-serve residence sub-phases (`read_serve_phase_ns`).
+/// `repr(usize)` indexes the histogram table directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum ReadServePhase {
+    /// Data-read handler entry → router dispatch (inode guard, attr/size
+    /// coherency, active-buffer probe, custody fingerprint, payload-dest
+    /// bind).
+    Prelude = 0,
+    /// Router metadata resolve (`fetch_metadata` / fresh-hint check).
+    MetaResolve = 1,
+    /// Block-key map resolve (`load_striped_block_keys`).
+    KeyResolve = 2,
+    /// Stream classify + hot/hold/NVMe-tier probes, up to the
+    /// serve-or-fetch decision.
+    ClassifyProbe = 3,
+    /// Single-flight cohort wait: traced-fn entry → served without
+    /// becoming primary (the deep-qd cohort-wait term).
+    SfWait = 4,
+    /// The cold whole-block resolve leg (validated fetch + rebinds; the
+    /// raw dest-DMA leg included).
+    BlockFetch = 5,
+    /// Post-bytes binding revalidation (`current_block_binding`) on the
+    /// read-serve path (warm serves + the fetch loop's recheck).
+    BindingCheck = 6,
+    /// Bytes-in-hand → reply payload (uring-dest memcpy / `Bytes` slice).
+    SliceOut = 7,
+    /// Router return → handler return (parked-run overlay + custody
+    /// fingerprint re-check).
+    PostValidate = 8,
+    /// Data-read handler entry → return: the per-op residence — Little's
+    /// law's numerator for the read wall.
+    Total = 9,
+}
+
+const READ_SERVE_PHASES: usize = 10;
+const READ_SERVE_PHASE_NAMES: [&str; READ_SERVE_PHASES] = [
+    "prelude",
+    "meta_resolve",
+    "key_resolve",
+    "classify_probe",
+    "sf_wait",
+    "block_fetch",
+    "binding_check",
+    "slice_out",
+    "post_validate",
+    "total",
+];
+
+/// Read-fill residence sub-phases (`read_fill_phase_ns`) — the block-fetch
+/// chain `ReadServePhase::BlockFetch` waits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum ReadFillPhase {
+    /// NvmeBlockDev read request enqueue → SQE submitted (worker channel
+    /// + slot wait — client-side device queueing).
+    DevQueue = 0,
+    /// SQE submitted → CQE completion handed back (device/fabric service).
+    DevService = 1,
+    /// `read_nvme_block` span: dev_queue + dev_service + oneshot wake.
+    FetchDma = 2,
+    /// `process_read_async` (decompress/decrypt; passthrough ≈ 0).
+    Decode = 3,
+    /// Ghost/governor admission decision + the awaited tier publish when
+    /// admitted (skip ≈ 0 — the R1b posture).
+    Admission = 4,
+    /// Cache landing: read-lane hold deposit + RAM LRU / hot-tier put +
+    /// incarnation completion check.
+    Deposit = 5,
+    /// Primary claim → fill complete (what a whole cohort waits on).
+    FillTotal = 6,
+}
+
+const READ_FILL_PHASES: usize = 7;
+const READ_FILL_PHASE_NAMES: [&str; READ_FILL_PHASES] = [
+    "dev_queue",
+    "dev_service",
+    "fetch_dma",
+    "decode",
+    "admission",
+    "deposit",
+    "fill_total",
+];
+
+static READ_SERVE_PROF: Lazy<[LatencyHistogram; READ_SERVE_PHASES]> =
+    Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
+
+static READ_FILL_PROF: Lazy<[LatencyHistogram; READ_FILL_PHASES]> =
+    Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
+
+/// Record one serve-residence span started at `t0` (always-on; see the
+/// module block above for the cost contract).
+#[inline]
+pub fn read_serve_phase_record(phase: ReadServePhase, t0: std::time::Instant) {
+    READ_SERVE_PROF[phase as usize].record(t0.elapsed());
+}
+
+/// Record one fill-residence span started at `t0` (always-on).
+#[inline]
+pub fn read_fill_phase_record(phase: ReadFillPhase, t0: std::time::Instant) {
+    READ_FILL_PROF[phase as usize].record(t0.elapsed());
+}
+
+/// `read_serve_phase_ns` stats payload: `{phase: histogram}` — UNGATED.
+pub fn read_serve_phase_json() -> serde_json::Value {
+    let mut phases = serde_json::Map::new();
+    for (pi, pname) in READ_SERVE_PHASE_NAMES.iter().enumerate() {
+        phases.insert((*pname).to_string(), READ_SERVE_PROF[pi].to_json());
+    }
+    serde_json::Value::Object(phases)
+}
+
+/// `read_fill_phase_ns` stats payload: `{phase: histogram}` — UNGATED.
+pub fn read_fill_phase_json() -> serde_json::Value {
+    let mut phases = serde_json::Map::new();
+    for (pi, pname) in READ_FILL_PHASE_NAMES.iter().enumerate() {
+        phases.insert((*pname).to_string(), READ_FILL_PROF[pi].to_json());
+    }
+    serde_json::Value::Object(phases)
+}
+
+/// `read_transport_phase_ns` stats payload — the fuse3-side over-uring
+/// READ transport family (queue_wait / dispatch_lag / reply_commit /
+/// transport_total), rendered with the shared-core bucket labels (the
+/// fuse3 rig buckets through the same `latency_core`, so labels align
+/// index-for-index by construction).
+pub fn read_transport_phase_json() -> serde_json::Value {
+    let mut phases = serde_json::Map::new();
+    for (pname, buckets) in fuse3::read_transport_phase_snapshot() {
+        let mut map = serde_json::Map::new();
+        for (i, label) in crate::latency_core::LATENCY_BUCKET_LABELS
+            .iter()
+            .enumerate()
+        {
+            map.insert(
+                label.to_string(),
+                serde_json::Value::Number(serde_json::Number::from(buckets[i])),
+            );
+        }
+        phases.insert(pname.to_string(), serde_json::Value::Object(map));
+    }
+    serde_json::Value::Object(phases)
+}
+
 /// `block_lock_wait_by_site` stats payload: `{site: histogram}`.
 pub fn block_lock_site_json() -> serde_json::Value {
     let mut sites = serde_json::Map::new();
@@ -2028,24 +2214,21 @@ impl Default for LatencyHistogram {
 
 impl LatencyHistogram {
     pub fn record(&self, duration: Duration) {
+        // Bucketing delegates to the shared core (`crate::latency_core`),
+        // the same function the fuse3 fork's transport-side histograms
+        // use — root and transport phase tables are bucket-for-bucket
+        // comparable by construction.
         let micros = duration.as_micros() as u64;
-        let bucket_idx = if micros <= 1 {
-            0
-        } else {
-            let idx = (micros - 1).ilog2() as usize + 1;
-            std::cmp::min(idx, 25)
-        };
+        let bucket_idx = crate::latency_core::latency_bucket_index(micros);
         self.buckets[bucket_idx].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn to_json(&self) -> serde_json::Value {
-        const LABELS: &[&str] = &[
-            "<=1us", "<=2us", "<=4us", "<=8us", "<=16us", "<=32us", "<=64us", "<=128us", "<=256us",
-            "<=512us", "<=1024us", "<=2ms", "<=4ms", "<=8ms", "<=16ms", "<=32ms", "<=64ms",
-            "<=128ms", "<=256ms", "<=512ms", "<=1024ms", "<=2s", "<=4s", "<=8s", "<=16s", ">16s",
-        ];
         let mut map = serde_json::Map::new();
-        for (i, label) in LABELS.iter().enumerate() {
+        for (i, label) in crate::latency_core::LATENCY_BUCKET_LABELS
+            .iter()
+            .enumerate()
+        {
             let val = self.buckets[i].load(Ordering::Relaxed);
             map.insert(
                 label.to_string(),
@@ -4944,6 +5127,20 @@ impl SqueezefsFilesystem {
                 // → publish → displaced-free → invalidation → total.
                 // Deliberately ungated (see the PipelinePhase block).
                 "write_pipeline_phase_ns": write_pipeline_phase_json(),
+                // Read-serve residence decomposition (2026-08-01
+                // serve-latency decomposition campaign): ALWAYS-ON
+                // per-phase histograms — the read twin of the family
+                // above (serve chain / fill chain / fuse3 transport
+                // chain; see the ReadServePhase block for the
+                // containment map). Deliberately ungated.
+                "read_serve_phase_ns": read_serve_phase_json(),
+                "read_fill_phase_ns": read_fill_phase_json(),
+                "read_transport_phase_ns": read_transport_phase_json(),
+                // The P2 in-place READ reply engagement gauge (found
+                // mis-wired by this campaign: dispatch takes the session
+                // connection, so handle_read's in-place arm never fired;
+                // on an armed session this must account ≈ every READ).
+                "fuse3_read_inplace_replies": fuse3::read_inplace_replies(),
                 // Write-commit-economy (2026-07-30): lever-1 coalescing
                 // engagement (blocks/batch = the live coalesce factor)
                 // and lever-2 layout-delta engagement (delta vs full
@@ -11195,6 +11392,12 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let prof = OpProf::begin(FuseOpKind::Read, ino);
+        // Serve-residence decomposition (read_serve_phase_ns, always-on):
+        // t0 anchors `prelude` and `total`; the router records the inner
+        // phases; `post_validate` covers the last iteration's overlay +
+        // fingerprint work. Error exits deliberately record nothing (they
+        // are loud on their own).
+        let serve_t0 = std::time::Instant::now();
         let file_path = crate::keys::inode_path(ino);
         let lock = self.get_inode_lock_ref(ino);
 
@@ -11476,7 +11679,7 @@ impl Filesystem for SqueezefsFilesystem {
         // IS the movement signal.
         let mut meta_hint = guard_meta;
         let mut attempts = 0u32;
-        let (data, backing) = loop {
+        let (data, backing, router_done_at) = loop {
             let pre_runs = self.capture_parked_runs(ino, offset, read_len);
 
             // Backend / cache read without holding the inode lock (readers
@@ -11489,9 +11692,15 @@ impl Filesystem for SqueezefsFilesystem {
                 read_hint,
                 meta_hint.take(),
             );
+            if attempts == 0 {
+                // First dispatch only: retries are movement-signal
+                // re-reads, not prelude work.
+                read_serve_phase_record(ReadServePhase::Prelude, serve_t0);
+            }
             prof.mark_backend_start();
             let read_res = read_future.await;
             prof.mark_backend_done();
+            let router_done_at = std::time::Instant::now();
             let (data, backing) = match read_res {
                 Ok(res) => res,
                 Err(e) => {
@@ -11508,11 +11717,15 @@ impl Filesystem for SqueezefsFilesystem {
                 .read_custody_fingerprint(None, &file_path, ino, offset, read_len)
                 .await;
             if read_custody_fp_matches(&bindings_after, &bindings_before) || attempts >= 4 {
-                break (data, backing);
+                break (data, backing, router_done_at);
             }
             attempts += 1;
             bindings_before = bindings_after;
         };
+        // Last iteration's overlay-apply + fingerprint re-check span, then
+        // the whole per-op residence.
+        read_serve_phase_record(ReadServePhase::PostValidate, router_done_at);
+        read_serve_phase_record(ReadServePhase::Total, serve_t0);
         Ok(ReplyData { data, backing })
     }
 

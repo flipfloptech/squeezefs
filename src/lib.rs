@@ -15,6 +15,12 @@ pub mod nt_copy;
 // METRICS-wired policy/instrument layer over it.
 #[path = "../crates/squeezefs-ipc/src/numa_core.rs"]
 pub mod numa_core;
+// µs-bucket latency-histogram core — canonical file in the squeezefs-ipc
+// tree, `#[path]`-included here (LatencyHistogram delegates to it) and by
+// the fuse3 fork (read_transport_phase_ns), so root- and transport-side
+// phase histograms bucket identically by construction.
+#[path = "../crates/squeezefs-ipc/src/latency_core.rs"]
+pub mod latency_core;
 pub mod nvme_dev;
 #[path = "../crates/squeezefs-ipc/src/thp.rs"]
 pub mod thp;

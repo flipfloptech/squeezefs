@@ -15,6 +15,10 @@ pub use connection::fuse_over_uring::{
 };
 pub use filesystem::Filesystem;
 use futures_util::future::Either;
+pub use read_phase::{
+    read_inplace_replies, read_transport_phase_record, read_transport_phase_snapshot,
+    ReadTransportPhase,
+};
 pub use request::Request;
 #[cfg(feature = "tokio-runtime")]
 pub use session::{
@@ -35,6 +39,7 @@ pub(crate) mod abi;
 pub mod connection;
 mod filesystem;
 pub mod flags;
+pub(crate) mod read_phase;
 pub mod reply;
 mod request;
 pub(crate) mod session;

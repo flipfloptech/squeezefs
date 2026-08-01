@@ -806,7 +806,14 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     }
 
     async fn dispatch_with_max_write(&mut self, max_write: usize) -> IoResult<()> {
-        let fuse_connection = self.fuse_connection.take().unwrap();
+        // CLONE, never take: `handle_read`'s P2 in-place reply arm reads
+        // `self.fuse_connection` — the historical `take()` left it None for
+        // the whole dispatch loop, so every READ reply silently fell back
+        // to the unbounded reply channel + reply-task hop the P2 commit
+        // (`be82794`) had deleted (found by the 2026-08-01 serve-
+        // decomposition campaign; `fuse3_read_inplace_replies` is the
+        // engagement gauge that keeps this wired).
+        let fuse_connection = self.fuse_connection.clone().unwrap();
         let fs = self.filesystem.take().expect("filesystem not init");
         let buffer_size = (max_write + FUSE_WRITE_IN_SIZE).max(FUSE_MIN_READ_BUFFER_SIZE);
 
@@ -2248,6 +2255,19 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         data: &[u8],
         fs: &Arc<FS>,
     ) {
+        // read_transport_phase_ns: dispatch stamp + the uring arrival the
+        // dispatch loop just parked (0 = classical delivery — the
+        // arrival-anchored phases skip). Error replies record nothing.
+        let dispatch_t0 = std::time::Instant::now();
+        #[cfg(target_os = "linux")]
+        let arrival_ns = self
+            .fuse_connection
+            .as_ref()
+            .map(|c| c.take_read_arrival_ns())
+            .unwrap_or(0);
+        #[cfg(not(target_os = "linux"))]
+        let arrival_ns = 0u64;
+
         let read_in = match get_bincode_config().deserialize::<fuse_read_in>(data) {
             Err(err) => {
                 error!(
@@ -2272,6 +2292,10 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let reply_conn = self.fuse_connection.clone();
 
         spawn(debug_span!("fuse_read"), async move {
+            crate::raw::read_phase::read_transport_phase_record(
+                crate::raw::read_phase::ReadTransportPhase::DispatchLag,
+                dispatch_t0.elapsed(),
+            );
             debug!(
                 "read unique {} inode {} {:?}",
                 request.unique, in_header.nodeid, read_in
@@ -2297,6 +2321,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 Ok(reply_data) => (reply_data.data, reply_data.backing),
             };
 
+            let reply_t0 = std::time::Instant::now();
             if reply_data.len() > read_in.size as _ {
                 reply_data.truncate(read_in.size as _);
             }
@@ -2331,6 +2356,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                             error!("in-place read reply failed {}", err);
                         }
                     }
+                    crate::raw::read_phase::note_read_inplace_reply();
                     drop(backing);
                 }
                 None => {
@@ -2338,6 +2364,20 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         .send(Either::Right((data_buf, reply_data, backing)))
                         .await;
                 }
+            }
+            // `reply_commit`: handler returned → reply committed to the
+            // transport (in-place arm: the synchronous COMMIT enqueue; the
+            // channel arm measures the hand-off — INIT-phase only).
+            crate::raw::read_phase::read_transport_phase_record(
+                crate::raw::read_phase::ReadTransportPhase::ReplyCommit,
+                reply_t0.elapsed(),
+            );
+            if arrival_ns > 0 {
+                let now_ns = crate::raw::read_phase::transport_now_ns();
+                crate::raw::read_phase::read_transport_phase_record(
+                    crate::raw::read_phase::ReadTransportPhase::TransportTotal,
+                    std::time::Duration::from_nanos(now_ns.saturating_sub(arrival_ns)),
+                );
             }
         });
     }

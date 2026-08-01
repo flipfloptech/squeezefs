@@ -265,11 +265,7 @@ async fn phase_families_are_always_on_with_exact_keys() {
         (read_transport_phase_json(), &TRANSPORT_PHASES[..]),
     ] {
         let obj = family.as_object().expect("family must be an object");
-        assert_eq!(
-            obj.len(),
-            phases.len(),
-            "exactly the named phases: {obj:?}"
-        );
+        assert_eq!(obj.len(), phases.len(), "exactly the named phases: {obj:?}");
         for p in phases {
             let _ = phase_count(&family, p); // key exists, histogram-shaped
         }
@@ -402,7 +398,10 @@ async fn cohort_waiters_record_sf_wait() {
     let h = make("rsp_cohort", *b"rsp-cohortvol-v3").await;
 
     let ino = create(&h, "cohort_probe").await;
+    // Two blocks: multi-block files take the striped layout on flush
+    // (a lone 512 KiB blob stays staged); all four readers target block 0.
     write_at(&h, ino, 0, &vec![0xC5u8; BS as usize]).await;
+    write_at(&h, ino, BS, &vec![0xD6u8; BS as usize]).await;
     let map = make_cold(&h, ino).await;
     assert!(map.contains_key(&0), "fixture: block 0 mapped");
 

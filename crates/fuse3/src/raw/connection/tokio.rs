@@ -205,6 +205,15 @@ pub struct FuseConnection {
     /// unmount wedge).
     #[cfg(target_os = "linux")]
     classical_sideband: std::sync::atomic::AtomicBool,
+    /// Arrival stamp (transport epoch ns) of the most recent FUSE_READ
+    /// this connection's dispatch loop popped from the uring inbound
+    /// queue (`read_transport_phase_ns`): the dispatch loop is one
+    /// sequential task per worker connection, and each worker owns its
+    /// own clone, so a relaxed store-then-load pair per READ is exact.
+    /// 0 = none (classical delivery) — `handle_read` skips the
+    /// arrival-anchored phases.
+    #[cfg(target_os = "linux")]
+    last_read_arrival_ns: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for FuseConnection {
@@ -238,6 +247,7 @@ impl FuseConnection {
                 classical_inflight: std::sync::Arc::new(ClassicalInflight::new()),
                 assigned_qid: None,
                 classical_sideband: std::sync::atomic::AtomicBool::new(false),
+                last_read_arrival_ns: std::sync::atomic::AtomicU64::new(0),
             })
         }
     }
@@ -330,6 +340,7 @@ impl FuseConnection {
             classical_inflight: std::sync::Arc::new(ClassicalInflight::new()),
             assigned_qid: None,
             classical_sideband: std::sync::atomic::AtomicBool::new(false),
+            last_read_arrival_ns: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -362,6 +373,7 @@ impl FuseConnection {
                     classical_inflight: self.classical_inflight.clone(),
                     assigned_qid: None,
                     classical_sideband: std::sync::atomic::AtomicBool::new(false),
+                    last_read_arrival_ns: std::sync::atomic::AtomicU64::new(0),
                 })
             }
             #[cfg(feature = "unprivileged")]
@@ -447,6 +459,7 @@ impl FuseConnection {
                     classical_inflight: self.classical_inflight.clone(),
                     assigned_qid: None,
                     classical_sideband: std::sync::atomic::AtomicBool::new(false),
+                    last_read_arrival_ns: std::sync::atomic::AtomicU64::new(0),
                 })
             }
         }
@@ -463,6 +476,16 @@ impl FuseConnection {
     pub fn set_classical_sideband(&self) {
         self.classical_sideband
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Consume the arrival stamp of the READ this connection's dispatch
+    /// loop just popped (`read_transport_phase_ns` — see the field doc).
+    /// `swap(0)` so a classically-delivered READ never anchors against a
+    /// stale uring arrival. 0 = no uring arrival recorded.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_read_arrival_ns(&self) -> u64 {
+        self.last_read_arrival_ns
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
@@ -555,6 +578,21 @@ impl FuseConnection {
                 // from op_in; every other opcode keeps the reconstruction
                 // below verbatim.
                 let opcode = u32::from_le_bytes(inbound.header_and_op[4..8].try_into().unwrap());
+                // read_transport_phase_ns `queue_wait` (READ only): CQE
+                // reap → this dispatch pop. The arrival stamp is parked on
+                // the connection for `handle_read`'s `transport_total`
+                // anchor — this dispatch loop is one sequential task and
+                // each worker owns its own connection clone, so the
+                // store-then-read pairing per READ is exact.
+                if opcode == crate::raw::abi::fuse_opcode::FUSE_READ as u32 {
+                    let now_ns = crate::raw::read_phase::transport_now_ns();
+                    crate::raw::read_phase::read_transport_phase_record(
+                        crate::raw::read_phase::ReadTransportPhase::QueueWait,
+                        std::time::Duration::from_nanos(now_ns.saturating_sub(inbound.arrived_ns)),
+                    );
+                    self.last_read_arrival_ns
+                        .store(inbound.arrived_ns, std::sync::atomic::Ordering::Relaxed);
+                }
                 if opcode == crate::raw::abi::fuse_opcode::FUSE_WRITE as u32
                     && body_need >= FUSE_WRITE_IN_SIZE
                     && !payload.is_empty()

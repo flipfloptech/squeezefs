@@ -81,7 +81,7 @@ async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
-const PHASES: [&str; 8] = [
+const PHASES: [&str; 12] = [
     "queue_wait",
     "lock_wait",
     "base_fetch",
@@ -89,6 +89,10 @@ const PHASES: [&str; 8] = [
     "save_encode",
     "blob_write",
     "meta_commit",
+    "commit_guard",
+    "commit_inode_read",
+    "commit_slot_probe",
+    "commit_tx_wait",
     "total",
 ];
 
@@ -248,7 +252,7 @@ async fn publish_phase_family_is_always_on_with_exact_keys() {
     assert_eq!(
         obj.len(),
         PHASES.len(),
-        "exactly the eight publish phases: {obj:?}"
+        "exactly the twelve publish phases: {obj:?}"
     );
     for p in PHASES {
         let _ = phase_count(&family, p); // key exists, histogram-shaped
@@ -310,6 +314,7 @@ async fn coalesced_stream_records_phases_with_closed_ledger() {
         .load(Ordering::Relaxed);
     let dirty_0 = METRICS.publish_base_dirty_serves.load(Ordering::Relaxed);
     let fetch_0 = METRICS.publish_base_fetches.load(Ordering::Relaxed);
+    let delta_0 = squeezefs::meta_backend::kv::META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed);
 
     let n_blocks = 24u32;
     stream_blocks(&h, ino, 2, n_blocks, 0x33).await;
@@ -369,6 +374,27 @@ async fn coalesced_stream_records_phases_with_closed_ledger() {
         assert!(
             d(p) >= batches,
             "{p} spans ({}) must account every committed batch ({batches})",
+            d(p)
+        );
+    }
+    // The meta_commit INTERIOR (the field's dominant constituent —
+    // 2.07 ms/pass rewrite vs 0.39 fresh): every DELTA save records the
+    // guard/inode-read/slot-probe/tx-wait split.
+    let delta_commits =
+        squeezefs::meta_backend::kv::META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed) - delta_0;
+    assert!(
+        delta_commits >= 1,
+        "fixture premise: the stream must stage layout deltas"
+    );
+    for p in [
+        "commit_guard",
+        "commit_inode_read",
+        "commit_slot_probe",
+        "commit_tx_wait",
+    ] {
+        assert!(
+            d(p) >= delta_commits,
+            "{p} spans ({}) must account every delta save ({delta_commits})",
             d(p)
         );
     }

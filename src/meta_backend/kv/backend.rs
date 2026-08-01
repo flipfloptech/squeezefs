@@ -5353,16 +5353,25 @@ impl KvMetaBackend {
         full_layout: &[u8],
         size: u64,
     ) -> Result<bool> {
+        use crate::fuse_client::{publish_phase_record, PublishPhase};
         self.write_gate()?;
+        // Publish decomposition (2026-08-01): the meta_commit interior —
+        // guard / inode read / slot probe / tx wait — on the delta-save
+        // path (100 % of rewrite publish batches per the field ledger).
+        let t_guard = std::time::Instant::now();
         let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+        publish_phase_record(PublishPhase::CommitGuard, t_guard);
+        let t_iread = std::time::Instant::now();
         let mut v = self
             .read_inode_value(ino)
             .await?
             .ok_or_else(|| Self::not_found(format!("Inode {ino} not found")))?;
+        publish_phase_record(PublishPhase::CommitInodeRead, t_iread);
         v.size = size;
         // NEVER author times here — the `set_layout_and_size` clock-
         // authority rule verbatim (generic/003; the unfolded
         // `read_inode_value` keeps parked Δtime refinements pending).
+        let t_slot = std::time::Instant::now();
         let tx0 = KvTx::new();
         let (existing, key) = self.xattr_slot(&tx0, ino, "layout").await?;
         let mut tx = tx0;
@@ -5381,6 +5390,7 @@ impl KvMetaBackend {
                 }
             }
         }
+        publish_phase_record(PublishPhase::CommitSlotProbe, t_slot);
         if use_delta {
             let wire = delta.encode();
             super::META_KV_LAYOUT_DELTA_BYTES.fetch_add(wire.len() as u64, Ordering::Relaxed);
@@ -5396,7 +5406,9 @@ impl KvMetaBackend {
         }
         tx.stage_put(TREE_INODES, inode_key(ino), v.encode());
         tx.hold_guards(guards);
+        let t_tx = std::time::Instant::now();
         self.commit_tx(tx).await?;
+        publish_phase_record(PublishPhase::CommitTxWait, t_tx);
         Ok(use_delta)
     }
 

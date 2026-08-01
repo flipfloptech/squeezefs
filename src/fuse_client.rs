@@ -1865,14 +1865,28 @@ pub enum PublishPhase {
     /// publish-class indirect save; 0 on inline-map venues).
     BlobWrite = 5,
     /// Save: the backend commit call — DLM I-guard + inode read + tx
-    /// stage + journal-conveyor commit (per publish-class save).
+    /// stage + journal-conveyor commit (per publish-class save; the
+    /// four `commit_*` phases below are its interior on delta saves).
     MetaCommit = 6,
+    /// Delta save: 4a DLM `lock_inode_exclusive` acquire (per delta
+    /// save — the per-object guard the batch commit serializes on).
+    CommitGuard = 7,
+    /// Delta save: `read_inode_value` (unfolded point lookup — the
+    /// inode Put's RMW base).
+    CommitInodeRead = 8,
+    /// Delta save: `xattr_slot` + the live-base eligibility lookup
+    /// (THE per-save fold site — a deep unrebased delta chain folds
+    /// here on every save).
+    CommitSlotProbe = 9,
+    /// Delta save: `commit_tx` — journal-conveyor admission + batch
+    /// write (+ strict-mode barrier) + fan-out wait.
+    CommitTxWait = 10,
     /// Op enqueue → own batch terminal fan-out (per op): the publish
     /// span each pipelined block pays — the pipeline `publish` twin.
-    Total = 7,
+    Total = 11,
 }
 
-const PUBLISH_PHASES: usize = 8;
+const PUBLISH_PHASES: usize = 12;
 const PUBLISH_PHASE_NAMES: [&str; PUBLISH_PHASES] = [
     "queue_wait",
     "lock_wait",
@@ -1881,6 +1895,10 @@ const PUBLISH_PHASE_NAMES: [&str; PUBLISH_PHASES] = [
     "save_encode",
     "blob_write",
     "meta_commit",
+    "commit_guard",
+    "commit_inode_read",
+    "commit_slot_probe",
+    "commit_tx_wait",
     "total",
 ];
 

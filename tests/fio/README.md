@@ -134,3 +134,37 @@ tests/fio/run_fio_row.sh --job tests/fio/raw_ceiling_write.job \
   --devices /dev/nvme1n1:/dev/nvme2n1 --label raw-write \
   --i-know-this-destroys-data
 ```
+
+## The EXA client perf battery (`exa_client_perf.sh`)
+
+Our version of the EXA client perf script: one command runs the four
+EXA-parity rows kernel-path first, then through the shim, and prints
+the results side-by-side (aligned table + venue header; persisted to a
+timestamped report under the artifacts dir). Execution rides
+`run_fio_row.sh` verbatim — NUMA fan-out, engagement verification, amp
+columns, and labels all come from the runner.
+
+* **KD-7 screen**: refuses loud before any row when the shim does not
+  embed the mounted daemon's `build_commit`.
+* **Per-pass engine law** (labeled in the table): kernel pass = libaio
+  qd=8 (EXA canon); shim pass = psync for bs=1M rows / libaio for bs=4k
+  rows (v1.1: libaio ops past the session slab ride the kernel lane —
+  a large-bs libaio "shim" row silently measures the kernel path).
+  A shim pass failing the runner's engagement check is printed
+  `INVALID (passthrough)`, never presented as a shim number.
+* **Budget hint**: `ipc_bind_refused_budget` growth during a shim pass
+  prints the fix (pre-eb94f0c binaries: raise `SQUEEZEFS_IPC_MEM_MAX`
+  on the daemon; later binaries derive the cap).
+* `--sustain` lifts rows to 60 s per the sustain law (the report states
+  which mode ran); `--rows` subsets; `--emit-only` prints the plan.
+
+```bash
+# Full battery, sustained, with amp columns, journaled:
+tests/fio/exa_client_perf.sh --mount "$M" --shim "$SO" --sustain \
+  --data-devs nvme4n1:nvme6n1:nvme8n1:nvme10n1 \
+  --substrate "field 4-node nvme-tcp" --fill "fresh set this session" \
+  --journal /scratch/tmp/agent_runs.log
+
+# Just the BW pair, quick:
+tests/fio/exa_client_perf.sh --mount "$M" --shim "$SO" --rows write_bw,read_bw
+```

@@ -518,6 +518,76 @@ async fn dehydration_skips_tier_resident_protected_victims() {
     );
 }
 
+/// Hold-serve ledger visibility, fetch-loop arm (the read-lane
+/// regression fix, 2026-07-31): a DEMAND-deposited hold entry served
+/// after every tier probe missed is the pre-lane REFETCH in serve form —
+/// it must touch the R1b ledger exactly as that refetch did (ghost
+/// touch → second-touch publish → protected hot landing) while paying
+/// zero device fetches. The FUSE-surface twin of this contract is
+/// `second_touch_admission_first_skip_then_publish` (the single-block
+/// fast path); this one pins the single-flight fetch loop's hold arm
+/// through the router API directly. Lane-fetch deposits stay
+/// ledger-invisible — that half is pinned by tests/read_lane_tests.rs
+/// contract 2 (the 2026-07-26 scan-resistance verdict).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hold_serve_counts_as_ghost_touch_through_the_fetch_loop() {
+    std::env::set_var("SQUEEZEFS_READ_TIER_ADMISSION", "second-touch");
+    let h = make_bs("524288", *b"admission-hl4-v3").await;
+    std::env::remove_var("SQUEEZEFS_READ_TIER_ADMISSION");
+    let ino = create(&h, "adm_hold_loop").await;
+    write_at(&h, ino, 0, &vec![0xF1u8; BS as usize]).await;
+    write_at(&h, ino, BS, &vec![0xF2u8; BS as usize]).await;
+    let map = make_cold(&h, ino).await;
+    let k0 = map.get(&0).unwrap().clone();
+
+    // Touch 1 (device fill): ghost-records, lands hot probation AND
+    // deposits in the hold (demand provenance).
+    let d = read_at(&h, ino, 0, 64 * 1024).await;
+    assert!(d.iter().all(|&x| x == 0xF1));
+    assert!(
+        h.fs.router.cache.read_lane_hold.contains(&k0),
+        "fixture: the demand fill must deposit in the hold"
+    );
+    assert!(
+        !tier_has(&h, &k0),
+        "fixture: first touch skipped the publish"
+    );
+
+    // Kill the hot copy so the next fetch misses every tier and can only
+    // be served by the HOLD (pre-lane: a device refetch).
+    h.fs.router.cache.hot_block.remove(&k0);
+    let ghost0 = METRICS
+        .read_tier_admission_ghost_hits
+        .load(Ordering::Relaxed);
+    let dev0 = METRICS.get_obj.load(Ordering::Relaxed);
+    let v = h.fs.router.get_cached_or_fetch_block(&k0).await.unwrap();
+    assert!(v.iter().all(|&x| x == 0xF1), "hold serve byte parity");
+    assert_eq!(
+        METRICS.get_obj.load(Ordering::Relaxed) - dev0,
+        0,
+        "fixture: the serve must come from the hold, not a device refetch \
+         (otherwise this test degenerates into the fill-path contract)"
+    );
+    assert!(
+        METRICS
+            .read_tier_admission_ghost_hits
+            .load(Ordering::Relaxed)
+            > ghost0,
+        "a hold serve is a tier-bypassing re-miss and must count a ghost \
+         touch — ledger visibility is serve-side, not retention-side"
+    );
+    assert!(
+        tier_has(&h, &k0),
+        "the ghost-hit hold serve must publish (second-touch admission \
+         through the hold arm)"
+    );
+    assert!(
+        hot_has(&h, &k0),
+        "the ghost-hit hold serve must re-land the block hot (protected) — \
+         warmth propagation is what feeds the dehydration gate"
+    );
+}
+
 /// The DEFAULT admission mode is `second-touch` — the §5.3 policy — as of
 /// PR 5: the R-5 evict-before-consume spiral that forced PR 4's temporary
 /// `always` default is closed by the pipeline's per-lane resident-

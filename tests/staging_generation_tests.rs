@@ -492,22 +492,28 @@ async fn volume_set_generation_identity_contracts() {
         "the v2 refusal must be the precise 'no longer supported' message: {err}"
     );
 
-    // Volume-set identity is the ORDERED join (route_ino stripes by
-    // order: a reordered set is a different metadata view).
+    // Two INDEPENDENTLY-formatted volumes are two different
+    // single-member SETS under dynamic meta routing — deriving one
+    // generation for them refuses loud (foreign set uuids), which is
+    // strictly STRONGER staging protection than the old ordered-join
+    // contract: a foreign mix cannot even discover, let alone adopt a
+    // staging identity. (Genuine multi-member sets share one plan and
+    // their generation is still the member-position-ordered uuid join —
+    // pinned in tests/dynamic_meta_routing_tests.rs.)
     let second = NamedTempFile::new().unwrap();
     format_meta(second.path(), false).await;
     let second_path = second.path().to_string_lossy().into_owned();
-    let s = volume_set_generation(std::slice::from_ref(&second_path))
+    volume_set_generation(std::slice::from_ref(&second_path))
         .await
         .unwrap();
-    let ab = volume_set_generation(&[v3_path.clone(), second_path.clone()])
+    let err = volume_set_generation(&[v3_path.clone(), second_path.clone()])
         .await
-        .unwrap();
-    let ba = volume_set_generation(&[second_path, v3_path])
-        .await
-        .unwrap();
-    assert_eq!(ab, format!("{b}|{s}"), "set identity joins per-volume ids");
-    assert_ne!(ab, ba, "volume order is part of the identity");
+        .expect_err("independently-formatted volumes are foreign sets")
+        .to_string();
+    assert!(
+        err.contains("DIFFERENT sets"),
+        "the foreign-set refusal names the class: {err}"
+    );
 }
 
 /// Contract 4a — the upgrade path (the user's poisoned `~/.squeeze`):

@@ -322,10 +322,10 @@ impl LedgerRecord {
     }
 
     /// Encode into a full zero-padded 4 KiB slot image. Errors when the
-    /// record cannot fit a slot — the §5.5.1a space-cap check is
-    /// load-bearing here: a stamp with more than
-    /// [`MEMBERSHIP_MAX_HOSTED_SLOTS`] hosted slots refuses LOUD (the
-    /// cap exists precisely so the worst-case record fits), and the
+    /// record cannot fit a slot — the encoding-budget checks are
+    /// load-bearing here: a stamp past [`STAMP_MAX_RUNS`] hosted-slot
+    /// runs or [`STAMP_MAX_CURSORS`] cursors refuses LOUD (the caps
+    /// exist precisely so the worst-case record fits), and the
     /// total-size check stays as defense in depth for the root count.
     pub fn encode_slot(&self) -> Result<Vec<u8>, KvError> {
         if let Some(stamp) = &self.membership_stamp {

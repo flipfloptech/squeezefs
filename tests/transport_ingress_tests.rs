@@ -34,6 +34,25 @@
 //! RED against dev 3cd528b: `fuse3::TransportPhase`,
 //! `fuse3::write_transport_phase_{record,snapshot}` and the root
 //! `write_transport_phase_json` / stats-inode key do not exist.
+//!
+//! Phase 3 (the build — contracts 4/5/6 below): the mechanism hunt named
+//! the term **pinned-thread runqueue hostage** — every fuse3-tpc lane (and
+//! every fuse-over-uring queue worker) is hard-pinned to ONE core, so
+//! under load a cross-thread wake waits ms-class for that specific core's
+//! runqueue (local discriminators: lanes at 2.3–13.7 s runqueue wait vs
+//! ~2.4 s CPU per 35 s window; SCHED_FIFO and affinity-widening each
+//! collapse queue_wait+dispatch_lag 3.1+2.9 → 0.04+0.04 ms, −98.6 %).
+//! The fix: **node-scoped affinity** — a lane/queue-worker thread stays
+//! on its home NUMA node (locality preserved: `node_lanes` grouping,
+//! arena binding, `tpc_spawn_on_node` unchanged) but may run on ANY
+//! process-mask CPU of that node. `SQUEEZEFS_FUSE_PIN_SCOPE=core` is the
+//! A0 measurement lever (the exact pre-campaign 1-CPU pin posture) and
+//! the operational escape. Plus the in-place WRITE reply arm (the READ
+//! P2 twin): an armed session's WRITE reply is a synchronous COMMIT
+//! enqueue from the handler task — no reply-channel + reply-task hop
+//! (whose wake pays the same hostage class on the pinned main runtime) —
+//! with `fuse3_write_inplace_replies` as the engagement gauge that keeps
+//! it wired (the READ arm's silent-disengagement lesson).
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -47,8 +66,12 @@ use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
 use squeezefs::meta_backend::RoutedMetaBackend;
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tempfile::{tempdir, NamedTempFile, TempDir};
 
 const TRANSPORT_PHASES: [&str; 4] = [
@@ -295,4 +318,386 @@ async fn stats_inode_carries_write_transport_family_ungated() {
             let _ = phase_count(fam, p);
         }
     }
+    // The in-place WRITE reply engagement gauge rides along (the READ
+    // arm's silent-disengagement lesson: a gauge is what keeps it wired).
+    let v = metrics
+        .get("fuse3_write_inplace_replies")
+        .expect("stats inode metrics must carry fuse3_write_inplace_replies");
+    assert!(v.is_u64(), "fuse3_write_inplace_replies is a counter");
+}
+
+// ---------------------------------------------------------------------------
+// Contract 4 — pin-scope derivation is pure and exact: `core` = the
+// pre-campaign 1-CPU pin; `node` = every AVAILABLE cpu of the home cpu's
+// node (locality preserved, hostage deleted); an unknown node degrades to
+// the whole available set (freedom is the safe direction — a 1-CPU pin is
+// the measured failure). Env: default node; `core` honored; junk = node.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pin_scope_parse_and_affinity_derivation() {
+    use fuse3::PinScope;
+
+    assert_eq!(fuse3::pin_scope_from_env(None), PinScope::Node);
+    assert_eq!(fuse3::pin_scope_from_env(Some("node")), PinScope::Node);
+    assert_eq!(fuse3::pin_scope_from_env(Some("core")), PinScope::Core);
+    assert_eq!(
+        fuse3::pin_scope_from_env(Some("bogus")),
+        PinScope::Node,
+        "unknown value must degrade to the default posture (loudly), never crash"
+    );
+
+    // avail = process-mask cores after the lane pool's core-0 reserve;
+    // node_of: cpus 0..4 on node 0, 4..8 on node 1, cpu 9 unknown.
+    let avail = vec![1usize, 2, 3, 4, 5, 6, 7, 9];
+    let node_of = |cpu: usize| -> Option<usize> {
+        match cpu {
+            0..=3 => Some(0),
+            4..=7 => Some(1),
+            _ => None,
+        }
+    };
+    let node_cpus = |node: usize| -> Vec<usize> {
+        match node {
+            0 => vec![0, 1, 2, 3],
+            1 => vec![4, 5, 6, 7],
+            _ => vec![],
+        }
+    };
+
+    // core scope: exactly the home cpu.
+    assert_eq!(
+        fuse3::scoped_affinity_cpus(PinScope::Core, 2, &avail, node_of, node_cpus),
+        vec![2]
+    );
+    // node scope: home 2 (node 0) ⇒ node-0 cpus ∩ avail (core 0 stays
+    // reserved because it is not in avail).
+    assert_eq!(
+        fuse3::scoped_affinity_cpus(PinScope::Node, 2, &avail, node_of, node_cpus),
+        vec![1, 2, 3]
+    );
+    // node scope on the other node keeps locality.
+    assert_eq!(
+        fuse3::scoped_affinity_cpus(PinScope::Node, 5, &avail, node_of, node_cpus),
+        vec![4, 5, 6, 7]
+    );
+    // unknown node ⇒ the whole available set (never a 1-CPU hostage).
+    assert_eq!(
+        fuse3::scoped_affinity_cpus(PinScope::Node, 9, &avail, node_of, node_cpus),
+        avail
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Mount harness (the transport_concurrency_tests shape: real unprivileged
+// mount, kernel FUSE-over-io_uring; skips honestly where unsupported).
+// ---------------------------------------------------------------------------
+
+fn transport_supported() -> bool {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("[SKIP] /dev/fuse not present");
+        return false;
+    }
+    match std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring") {
+        Ok(v)
+            if matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "y" | "1" | "yes" | "true" | "on"
+            ) => {}
+        Ok(_) | Err(_) => {
+            eprintln!("[SKIP] fuse.enable_uring not enabled");
+            return false;
+        }
+    }
+    if which_fusermount().is_none() {
+        eprintln!("[SKIP] fusermount3 not found");
+        return false;
+    }
+    true
+}
+
+fn which_fusermount() -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join("fusermount3"))
+            .find(|p| p.exists())
+    })
+}
+
+struct Mount {
+    child: Child,
+    mnt: PathBuf,
+    base: PathBuf,
+    log: PathBuf,
+}
+
+impl Mount {
+    fn stats(&self) -> serde_json::Value {
+        let raw = std::fs::read_to_string(self.mnt.join(".stats")).expect("read .stats");
+        serde_json::from_str(&raw).expect("stats JSON")
+    }
+
+    fn metric_u64(&self, key: &str) -> u64 {
+        self.stats()["metrics"][key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("metric {key} missing/not-u64"))
+    }
+
+    /// `(comm, Cpus_allowed_count)` for every daemon thread.
+    fn thread_affinities(&self) -> Vec<(String, u32)> {
+        let pid = self.child.id();
+        let mut out = Vec::new();
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            return out;
+        };
+        for t in tasks.flatten() {
+            let dir = t.path();
+            let Ok(comm) = std::fs::read_to_string(dir.join("comm")) else {
+                continue;
+            };
+            let Ok(status) = std::fs::read_to_string(dir.join("status")) else {
+                continue;
+            };
+            let count = status
+                .lines()
+                .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+                .map(|l| {
+                    l.trim()
+                        .split(',')
+                        .map(|range| match range.split_once('-') {
+                            Some((a, b)) => {
+                                b.trim().parse::<u32>().unwrap_or(0)
+                                    - a.trim().parse::<u32>().unwrap_or(0)
+                                    + 1
+                            }
+                            None => 1,
+                        })
+                        .sum::<u32>()
+                })
+                .unwrap_or(0);
+            out.push((comm.trim().to_string(), count));
+        }
+        out
+    }
+
+    fn unmount(mut self) {
+        let _ = Command::new("fusermount3").arg("-u").arg(&self.mnt).status();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.child.try_wait().expect("try_wait mount child") {
+                Some(_) => break,
+                None if Instant::now() > deadline => {
+                    let _ = self.child.kill();
+                    panic!(
+                        "mount daemon did not exit within 30s of unmount; log:\n{}",
+                        std::fs::read_to_string(&self.log).unwrap_or_default()
+                    );
+                }
+                None => std::thread::sleep(Duration::from_millis(200)),
+            }
+        }
+    }
+}
+
+impl Drop for Mount {
+    fn drop(&mut self) {
+        let _ = Command::new("fusermount3")
+            .arg("-uz")
+            .arg(&self.mnt)
+            .status();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
+
+fn mount_fs(tag: &str, envs: &[(&str, &str)]) -> Mount {
+    let bin = env!("CARGO_BIN_EXE_squeezefs");
+    let base = std::env::temp_dir().join(format!("sqfs_tingress_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let meta = base.join("meta.bin");
+    let data = base.join("data.bin");
+    let staging = base.join("staging");
+    let mnt = base.join("mnt");
+    let log = base.join("mount.log");
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::create_dir_all(&mnt).unwrap();
+    std::fs::File::create(&meta)
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    std::fs::File::create(&data)
+        .unwrap()
+        .set_len(2 * 1024 * 1024 * 1024)
+        .unwrap();
+
+    let fmt = Command::new(bin)
+        .arg("format")
+        .arg(format!("sqmeta://{}", meta.display()))
+        .arg(format!("sqdata://{}", data.display()))
+        .arg("--disk-cache-paths")
+        .arg(&staging)
+        .output()
+        .expect("run squeezefs format");
+    assert!(
+        fmt.status.success(),
+        "format failed: {}\n{}",
+        String::from_utf8_lossy(&fmt.stdout),
+        String::from_utf8_lossy(&fmt.stderr)
+    );
+
+    let logf = std::fs::File::create(&log).unwrap();
+    let mut cmd = Command::new(bin);
+    cmd.arg("mount")
+        .arg(format!("sqmeta://{}", meta.display()))
+        .arg(&mnt)
+        .arg("--uid")
+        .arg(unsafe { libc::getuid() }.to_string())
+        .arg("--gid")
+        .arg(unsafe { libc::getgid() }.to_string());
+    cmd.env_remove("SQUEEZEFS_FUSE_PIN_SCOPE");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let child = cmd
+        .stdout(Stdio::from(logf.try_clone().unwrap()))
+        .stderr(Stdio::from(logf))
+        .spawn()
+        .expect("spawn squeezefs mount");
+
+    let mount = Mount {
+        child,
+        mnt,
+        base,
+        log,
+    };
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        if std::fs::read_to_string(mount.mnt.join(".stats")).is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mount did not become ready in 90s; log:\n{}",
+            std::fs::read_to_string(&mount.log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    mount
+}
+
+// ---------------------------------------------------------------------------
+// Contract 5 — the live affinity posture: by DEFAULT every fuse3-tpc lane
+// and every fuse-over-uring thread is schedulable on more than one CPU
+// (the pinned-runqueue hostage is gone); under the A0 lever
+// (`SQUEEZEFS_FUSE_PIN_SCOPE=core`) the lanes are 1-CPU pinned exactly as
+// before the campaign (the measurement control is the prior posture, live).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn default_posture_is_node_scoped_lever_restores_core_pins() {
+    if !transport_supported() {
+        return;
+    }
+    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    if cpus <= 2 {
+        eprintln!("[SKIP] needs > 2 CPUs to discriminate postures");
+        return;
+    }
+
+    // Default: node scope.
+    let m = mount_fs("pin_default", &[]);
+    let affs = m.thread_affinities();
+    let lanes: Vec<_> = affs.iter().filter(|(c, _)| c.starts_with("fuse3-tpc")).collect();
+    let workers: Vec<_> = affs
+        .iter()
+        .filter(|(c, _)| c.starts_with("fuse-over-uring"))
+        .collect();
+    assert!(!lanes.is_empty(), "no fuse3-tpc lanes visible: {affs:?}");
+    assert!(!workers.is_empty(), "no fuse-over-uring threads visible");
+    for (comm, n) in &lanes {
+        assert!(
+            *n > 1,
+            "default posture: lane {comm} is 1-CPU pinned (the hostage posture); \
+             affinities: {affs:?}"
+        );
+    }
+    for (comm, n) in &workers {
+        assert!(
+            *n > 1,
+            "default posture: queue thread {comm} is 1-CPU pinned; affinities: {affs:?}"
+        );
+    }
+    m.unmount();
+
+    // A0 lever: the pre-campaign core pins, byte-for-byte posture.
+    let m = mount_fs("pin_core", &[("SQUEEZEFS_FUSE_PIN_SCOPE", "core")]);
+    let affs = m.thread_affinities();
+    let lanes: Vec<_> = affs.iter().filter(|(c, _)| c.starts_with("fuse3-tpc")).collect();
+    assert!(!lanes.is_empty(), "no fuse3-tpc lanes visible: {affs:?}");
+    for (comm, n) in &lanes {
+        assert_eq!(
+            *n, 1,
+            "core lever: lane {comm} must be exactly 1-CPU pinned; affinities: {affs:?}"
+        );
+    }
+    assert!(
+        affs.iter()
+            .any(|(c, n)| c.starts_with("fuse-over-uring") && *n == 1),
+        "core lever: at least the online-qid queue workers must be 1-CPU pinned"
+    );
+    m.unmount();
+}
+
+// ---------------------------------------------------------------------------
+// Contract 6 — the in-place WRITE reply arm engages on an armed session
+// (fuse3_write_inplace_replies accounts the row's WRITEs — the gauge that
+// keeps the arm wired), the write transport family records live spans,
+// and data round-trips byte-exact through the in-place arm.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn write_inplace_replies_engage_and_round_trip() {
+    if !transport_supported() {
+        return;
+    }
+    let m = mount_fs("wr_inplace", &[]);
+
+    let g0 = m.metric_u64("fuse3_write_inplace_replies");
+    let fam0 = m.stats()["metrics"]["write_transport_phase_ns"].clone();
+
+    // 8 MiB buffered write + fsync: the kernel issues >= 8 FUSE_WRITEs
+    // (max_write = 1 MiB) over the armed transport.
+    let path = m.mnt.join("inplace_probe.bin");
+    let payload: Vec<u8> = (0..8 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    {
+        let mut f = std::fs::File::create(&path).expect("create probe file");
+        f.write_all(&payload).expect("write probe payload");
+        f.sync_all().expect("fsync probe payload");
+    }
+
+    let g1 = m.metric_u64("fuse3_write_inplace_replies");
+    assert!(
+        g1 - g0 >= 8,
+        "armed-session WRITE replies must ride the in-place arm \
+         (fuse3_write_inplace_replies moved {} for an 8 MiB write)",
+        g1 - g0
+    );
+
+    let fam1 = m.stats()["metrics"]["write_transport_phase_ns"].clone();
+    for p in TRANSPORT_PHASES {
+        assert!(
+            phase_count(&fam1, p) > phase_count(&fam0, p),
+            "live armed-session WRITEs must record write transport phase {p}"
+        );
+    }
+
+    // Round-trip through a fresh open (page cache still proves the reply
+    // path acked the right bytes; the fsync above forced real WRITEs).
+    let got = std::fs::read(&path).expect("read probe back");
+    assert_eq!(got.len(), payload.len(), "probe length");
+    assert_eq!(got, payload, "probe content must round-trip byte-exact");
+
+    m.unmount();
 }

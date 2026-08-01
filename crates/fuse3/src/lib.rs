@@ -40,7 +40,7 @@ pub use raw::{
 };
 pub use raw::{
     read_inplace_replies, read_transport_phase_record, read_transport_phase_snapshot,
-    ReadTransportPhase,
+    write_transport_phase_record, write_transport_phase_snapshot, TransportPhase,
 };
 #[cfg(feature = "tokio-runtime")]
 pub use raw::{tpc_lane_redispatches, tpc_spawn, tpc_spawn_on_node, tpc_thread_count};

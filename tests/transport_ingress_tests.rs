@@ -13,14 +13,14 @@
 //! Phases (identical semantics to the READ family — one shared
 //! `TransportPhase` enum, two op-class tables):
 //!
-//! - `queue_wait`    — ring CQE reaped (inbound push) → session dispatch
-//!                     pop (the WRITE stamps ride the same dispatch loop).
-//! - `dispatch_lag`  — dispatch → the write-handler future's first poll.
-//! - `reply_commit`  — `fs.write` returned → the reply handed to the
-//!                     transport.
+//! - `queue_wait` — ring CQE reaped (inbound push) → session dispatch
+//!   pop (the WRITE stamps ride the same dispatch loop).
+//! - `dispatch_lag` — dispatch → the write-handler future's first poll.
+//! - `reply_commit` — `fs.write` returned → the reply handed to the
+//!   transport.
 //! - `transport_total` — inbound push → reply committed; `fio clat −
-//!                     transport_total` = the kernel-side residue for
-//!                     WRITE, statable by subtraction (the §4.1 split).
+//!   transport_total` = the kernel-side residue for WRITE, statable by
+//!   subtraction (the §4.1 split).
 //!
 //! Always-on (the `write_pipeline_phase_ns` cost contract: ≤ 4 `Instant`
 //! reads per WRITE actually delivered over the armed uring transport);

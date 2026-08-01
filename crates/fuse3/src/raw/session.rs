@@ -2293,7 +2293,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         spawn(debug_span!("fuse_read"), async move {
             crate::raw::read_phase::read_transport_phase_record(
-                crate::raw::read_phase::ReadTransportPhase::DispatchLag,
+                crate::raw::read_phase::TransportPhase::DispatchLag,
                 dispatch_t0.elapsed(),
             );
             debug!(
@@ -2369,13 +2369,13 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             // transport (in-place arm: the synchronous COMMIT enqueue; the
             // channel arm measures the hand-off — INIT-phase only).
             crate::raw::read_phase::read_transport_phase_record(
-                crate::raw::read_phase::ReadTransportPhase::ReplyCommit,
+                crate::raw::read_phase::TransportPhase::ReplyCommit,
                 reply_t0.elapsed(),
             );
             if arrival_ns > 0 {
                 let now_ns = crate::raw::read_phase::transport_now_ns();
                 crate::raw::read_phase::read_transport_phase_record(
-                    crate::raw::read_phase::ReadTransportPhase::TransportTotal,
+                    crate::raw::read_phase::TransportPhase::TransportTotal,
                     std::time::Duration::from_nanos(now_ns.saturating_sub(arrival_ns)),
                 );
             }
@@ -2391,6 +2391,19 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         uring_payload: Option<Bytes>,
         fs: &Arc<FS>,
     ) {
+        // write_transport_phase_ns: dispatch stamp + the uring arrival the
+        // dispatch loop just parked (0 = classical delivery — the
+        // arrival-anchored phases skip). Error replies record nothing.
+        let dispatch_t0 = std::time::Instant::now();
+        #[cfg(target_os = "linux")]
+        let arrival_ns = self
+            .fuse_connection
+            .as_ref()
+            .map(|c| c.take_write_arrival_ns())
+            .unwrap_or(0);
+        #[cfg(not(target_os = "linux"))]
+        let arrival_ns = 0u64;
+
         let write_in = match get_bincode_config().deserialize::<fuse_write_in>(data) {
             Err(err) => {
                 error!(
@@ -2448,6 +2461,10 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_write"), async move {
+            crate::raw::read_phase::write_transport_phase_record(
+                crate::raw::read_phase::TransportPhase::DispatchLag,
+                dispatch_t0.elapsed(),
+            );
             debug!(
                 "write unique {} inode {} {:?}",
                 request.unique, in_header.nodeid, write_in
@@ -2474,6 +2491,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 Ok(reply_write) => reply_write,
             };
 
+            let reply_t0 = std::time::Instant::now();
             let write_out: fuse_write_out = reply_write.into();
 
             let out_header = fuse_out_header {
@@ -2492,6 +2510,21 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 .expect("won't happened");
 
             let _ = resp_sender.send(Either::Left(data)).await;
+            // `reply_commit`: handler returned → reply handed to the
+            // transport (channel arm: the hand-off toward the per-queue
+            // reply task — the in-place WRITE arm, when it lands, makes
+            // this the synchronous COMMIT enqueue like the READ twin).
+            crate::raw::read_phase::write_transport_phase_record(
+                crate::raw::read_phase::TransportPhase::ReplyCommit,
+                reply_t0.elapsed(),
+            );
+            if arrival_ns > 0 {
+                let now_ns = crate::raw::read_phase::transport_now_ns();
+                crate::raw::read_phase::write_transport_phase_record(
+                    crate::raw::read_phase::TransportPhase::TransportTotal,
+                    std::time::Duration::from_nanos(now_ns.saturating_sub(arrival_ns)),
+                );
+            }
         });
     }
 

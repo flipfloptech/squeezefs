@@ -484,7 +484,7 @@ async fn transport_family_shape_and_bucket_tie() {
     // Phase-exact recording through the fuse3-side rig.
     let snap0 = fuse3::read_transport_phase_snapshot();
     fuse3::read_transport_phase_record(
-        fuse3::ReadTransportPhase::QueueWait,
+        fuse3::TransportPhase::QueueWait,
         std::time::Duration::from_micros(100),
     );
     let snap1 = fuse3::read_transport_phase_snapshot();

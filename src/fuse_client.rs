@@ -1971,8 +1971,22 @@ pub fn read_fill_phase_json() -> serde_json::Value {
 /// fuse3 rig buckets through the same `latency_core`, so labels align
 /// index-for-index by construction).
 pub fn read_transport_phase_json() -> serde_json::Value {
+    transport_phase_json(fuse3::read_transport_phase_snapshot())
+}
+
+/// `write_transport_phase_ns` stats payload — the WRITE twin (transport
+/// ingress economy campaign: converts the write wall's inferred
+/// pre-handler leg into measurement; same phases, same shared-core
+/// buckets).
+pub fn write_transport_phase_json() -> serde_json::Value {
+    transport_phase_json(fuse3::write_transport_phase_snapshot())
+}
+
+fn transport_phase_json(
+    snapshot: [(&'static str, [u64; crate::latency_core::LATENCY_BUCKETS]); 4],
+) -> serde_json::Value {
     let mut phases = serde_json::Map::new();
-    for (pname, buckets) in fuse3::read_transport_phase_snapshot() {
+    for (pname, buckets) in snapshot {
         let mut map = serde_json::Map::new();
         for (i, label) in crate::latency_core::LATENCY_BUCKET_LABELS
             .iter()
@@ -5136,6 +5150,9 @@ impl SqueezefsFilesystem {
                 "read_serve_phase_ns": read_serve_phase_json(),
                 "read_fill_phase_ns": read_fill_phase_json(),
                 "read_transport_phase_ns": read_transport_phase_json(),
+                // The WRITE twin (transport-ingress campaign): the write
+                // wall's pre-handler leg, measured — no longer inferred.
+                "write_transport_phase_ns": write_transport_phase_json(),
                 // The P2 in-place READ reply engagement gauge (found
                 // mis-wired by this campaign: dispatch takes the session
                 // connection, so handle_read's in-place arm never fired;

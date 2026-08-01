@@ -17,7 +17,7 @@ pub use filesystem::Filesystem;
 use futures_util::future::Either;
 pub use read_phase::{
     read_inplace_replies, read_transport_phase_record, read_transport_phase_snapshot,
-    ReadTransportPhase,
+    write_transport_phase_record, write_transport_phase_snapshot, TransportPhase,
 };
 pub use request::Request;
 #[cfg(feature = "tokio-runtime")]

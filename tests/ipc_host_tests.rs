@@ -972,13 +972,79 @@ fn session_teardown_on_eof_frees_arena_and_gauges() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn ipc_arena_cap_mirrors_transport_payload_cap_shape() {
-    use squeezefs::mem_budget::{ipc_arena_cap, IPC_ARENA_CAP_CEILING};
-    assert_eq!(ipc_arena_cap(8 * 1024 * 1024 * 1024), 1024 * 1024 * 1024);
+fn ipc_arena_cap_is_budget_fraction_no_fixed_ceiling() {
+    use squeezefs::mem_budget::{ipc_arena_cap, resolve_budget_from};
+    let mib = 1024 * 1024u64;
+    let gib = 1024 * mib;
+    // Small box: the established fraction (budget/8 = 12.5 %) unchanged.
+    assert_eq!(ipc_arena_cap(8 * gib), gib);
     assert_eq!(ipc_arena_cap(0), 0);
-    // Huge budgets are ceilinged at 2 GiB.
-    assert_eq!(ipc_arena_cap(u64::MAX / 2), IPC_ARENA_CAP_CEILING);
-    assert_eq!(IPC_ARENA_CAP_CEILING, 2 * 1024 * 1024 * 1024);
+    // The 251 GB field client (2026-08-01 rewrite-publish-drain rider):
+    // 70 % RAM budget ≈ 176 GiB. The deleted 2 GiB ceiling clamped the
+    // pool to ~31 × 64 MiB sessions against a 48-HELLO fleet
+    // (ipc_bind_refused_budget 13/48, engagement-INVALID il rows). The
+    // derived cap must admit the whole fleet with headroom.
+    let field_budget = resolve_budget_from(None, None, None, 251 * 1000 * 1000 * 1000);
+    let cap = ipc_arena_cap(field_budget);
+    assert_eq!(cap, field_budget / 8, "the fraction, nothing else");
+    assert!(
+        cap >= 48 * 64 * mib,
+        "48 × 64 MiB sessions must fit the derived cap (got {cap} B)"
+    );
+    // Huge budgets scale with the machine — no fixed byte ceiling
+    // anywhere (the budget is already machine-derived; per-uid session
+    // caps + idle reap + R5 shedding bound the pool).
+    assert_eq!(ipc_arena_cap(u64::MAX / 2), u64::MAX / 2 / 8);
+}
+
+#[test]
+fn ipc_arena_cap_resolution_precedence_absolute_pct_default() {
+    use squeezefs::mem_budget::resolve_ipc_arena_cap;
+    let mib = 1024 * 1024u64;
+    let gib = 1024 * mib;
+    // Absolute (SQUEEZEFS_IPC_MEM_MAX, MiB) wins verbatim over both.
+    assert_eq!(
+        resolve_ipc_arena_cap(8 * gib, Some("8192"), Some("50")),
+        8192 * mib
+    );
+    // Explicit-wins-verbatim includes 0 (compat semantics unchanged).
+    assert_eq!(resolve_ipc_arena_cap(8 * gib, Some("0"), Some("50")), 0);
+    // Percentage (SQUEEZEFS_IPC_MEM_PCT) beats the derived default.
+    assert_eq!(resolve_ipc_arena_cap(8 * gib, None, Some("50")), 4 * gib);
+    // Fractional percentages are legal (the default fraction IS 12.5).
+    assert_eq!(resolve_ipc_arena_cap(8 * gib, None, Some("12.5")), gib);
+    // Neither set: the derived default (budget/8 = 12.5 %).
+    assert_eq!(resolve_ipc_arena_cap(8 * gib, None, None), gib);
+    // Garbage absolute falls through to the percentage.
+    assert_eq!(
+        resolve_ipc_arena_cap(8 * gib, Some("lots"), Some("25")),
+        2 * gib
+    );
+}
+
+#[test]
+fn ipc_arena_cap_pct_clamps_and_ignores_garbage() {
+    use squeezefs::mem_budget::resolve_ipc_arena_cap;
+    let gib = 1024 * 1024 * 1024u64;
+    // pct clamps into (0, 100]: over-100 clamps to 100 (warn, not refuse).
+    assert_eq!(resolve_ipc_arena_cap(8 * gib, None, Some("150")), 8 * gib);
+    assert_eq!(resolve_ipc_arena_cap(8 * gib, None, Some("100")), 8 * gib);
+    // Non-positive / non-finite / garbage percentages warn and fall back
+    // to the derived default (the IPC knob-family convention: never
+    // panic, never fail the mount on a bad env string).
+    assert_eq!(resolve_ipc_arena_cap(8 * gib, None, Some("0")), gib);
+    assert_eq!(resolve_ipc_arena_cap(8 * gib, None, Some("-5")), gib);
+    assert_eq!(resolve_ipc_arena_cap(8 * gib, None, Some("NaN")), gib);
+    assert_eq!(resolve_ipc_arena_cap(8 * gib, None, Some("inf")), gib);
+    assert_eq!(resolve_ipc_arena_cap(8 * gib, None, Some("pct")), gib);
+    assert_eq!(resolve_ipc_arena_cap(8 * gib, None, Some("")), gib);
+    // Whitespace is trimmed like every sibling knob.
+    assert_eq!(resolve_ipc_arena_cap(8 * gib, None, Some(" 25 ")), 2 * gib);
+    assert_eq!(
+        resolve_ipc_arena_cap(8 * gib, Some(" 1024 "), None),
+        gib,
+        "absolute MiB trims whitespace too"
+    );
 }
 
 #[test]

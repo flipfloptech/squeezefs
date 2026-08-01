@@ -458,6 +458,72 @@ async fn rewrite_on_clean_persisted_base_pays_backend_fetch() {
 }
 
 // =========================================================================
+// Contract 5 — the M7 journal-conveyor pass interior (`meta_txpass_
+// phase_ns`): the field named commit_tx_wait (2.23 of 2.26 ms) as the
+// dominant publish constituent, but that span mixes conveyor queueing,
+// the union leaf-lock window (checkpoint-freeze interference), and the
+// journal device write — different Phase 2 builds. This family closes
+// the residue: per-tx queue wait + per-pass admission/leaf-locks/
+// journal-write/total.
+// =========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn meta_txpass_family_records_the_conveyor_interior() {
+    let _g = serial().await;
+    let h = make([0xA4; 16], "pub_phase_txpass").await;
+    let ino = create(&h, "txp").await;
+    stream_blocks(&h, ino, 0, 2, 0x66).await;
+
+    let f0 = squeezefs::fuse_client::meta_txpass_phase_json();
+    let passes_0 = squeezefs::meta_backend::kv::META_CONVEYOR_LEADER_PASSES.load(Ordering::Relaxed);
+    stream_blocks(&h, ino, 2, 8, 0x77).await;
+    let f1 = squeezefs::fuse_client::meta_txpass_phase_json();
+    let passes =
+        squeezefs::meta_backend::kv::META_CONVEYOR_LEADER_PASSES.load(Ordering::Relaxed) - passes_0;
+    assert!(passes >= 1, "fixture premise: conveyor passes must run");
+
+    let d = |p: &str| phase_count(&f1, p) - phase_count(&f0, p);
+    assert!(
+        d("tx_queue_wait") >= passes,
+        "tx_queue_wait ({}) must account every drained tx (>= {passes} passes)",
+        d("tx_queue_wait")
+    );
+    for p in [
+        "pass_admission",
+        "pass_leaf_locks",
+        "pass_journal_write",
+        "pass_total",
+    ] {
+        assert!(
+            d(p) >= passes,
+            "{p} spans ({}) must account every committed pass ({passes})",
+            d(p)
+        );
+    }
+
+    // Stats-inode surface, ungated.
+    let reply =
+        h.fs.read(h.req, STATS_INODE, 0, 0, 1 << 22, 0)
+            .await
+            .expect("read stats inode");
+    let stats: serde_json::Value =
+        serde_json::from_slice(&reply.data).expect("stats inode must be valid JSON");
+    let fam = stats
+        .get("metrics")
+        .and_then(|m| m.get("meta_txpass_phase_ns"))
+        .expect("stats inode metrics must carry meta_txpass_phase_ns UNGATED");
+    for p in [
+        "tx_queue_wait",
+        "pass_admission",
+        "pass_leaf_locks",
+        "pass_journal_write",
+        "pass_total",
+    ] {
+        let _ = phase_count(fam, p);
+    }
+}
+
+// =========================================================================
 // Contract 4 — recording is phase-exact (pure).
 // =========================================================================
 

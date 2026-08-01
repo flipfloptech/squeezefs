@@ -1923,6 +1923,65 @@ pub fn publish_phase_json() -> serde_json::Value {
 }
 
 // ===========================================================================
+// M7 journal-conveyor pass interior (`meta_txpass_phase_ns`) — the
+// rewrite-publish-drain campaign's second-level split. The field named
+// `commit_tx_wait` (2.23 of the 2.26 ms meta_commit) as the dominant
+// publish constituent, but that span mixes conveyor queueing, the §4.4
+// union leaf-lock window (checkpoint-freeze/SMO interference shows
+// there), and the journal device write — DIFFERENT Phase 2 builds.
+// Recorded once per drained tx / per conveyor pass (a few thousand
+// per second at any credible commit rate — same cost contract).
+// ===========================================================================
+
+/// M7 conveyor pass sub-phases (`meta_txpass_phase_ns`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum MetaTxPassPhase {
+    /// Tx enqueue → drained into a pass batch (per tx — the conveyor
+    /// queueing the committer pays before its batch even starts).
+    TxQueueWait = 0,
+    /// Pass: Σ ring admission (`admit_user_budget` — journal-ring
+    /// backpressure parks show here).
+    PassAdmission = 1,
+    /// Pass: the §4.4 (3–5) union locked window — leaf resolve + lock
+    /// acquire + revalidate + pre-images + reservation + RAM apply
+    /// (checkpoint-freeze / SMO interference shows here).
+    PassLeafLocks = 2,
+    /// Pass: journal device write + completed-prefix wait (+ the
+    /// strict-mode coalesced barrier).
+    PassJournalWrite = 3,
+    /// Pass: drain → terminal outcomes staged (the whole `run_batch`).
+    PassTotal = 4,
+}
+
+const META_TXPASS_PHASES: usize = 5;
+const META_TXPASS_PHASE_NAMES: [&str; META_TXPASS_PHASES] = [
+    "tx_queue_wait",
+    "pass_admission",
+    "pass_leaf_locks",
+    "pass_journal_write",
+    "pass_total",
+];
+
+static META_TXPASS_PROF: Lazy<[LatencyHistogram; META_TXPASS_PHASES]> =
+    Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
+
+/// Record one conveyor-pass span started at `t0` against `phase`.
+#[inline]
+pub fn meta_txpass_phase_record(phase: MetaTxPassPhase, t0: std::time::Instant) {
+    META_TXPASS_PROF[phase as usize].record(t0.elapsed());
+}
+
+/// `meta_txpass_phase_ns` stats payload — surfaced UNGATED.
+pub fn meta_txpass_phase_json() -> serde_json::Value {
+    let mut phases = serde_json::Map::new();
+    for (pi, pname) in META_TXPASS_PHASE_NAMES.iter().enumerate() {
+        phases.insert((*pname).to_string(), META_TXPASS_PROF[pi].to_json());
+    }
+    serde_json::Value::Object(phases)
+}
+
+// ===========================================================================
 // Read-serve residence decomposition (`read_serve_phase_ns` +
 // `read_fill_phase_ns`) — the 2026-08-01 serve-latency decomposition
 // campaign's read-side instrument (`tests/read_serve_phase_tests.rs`;
@@ -5344,6 +5403,7 @@ impl SqueezefsFilesystem {
                 // plus the base-provenance ledger (dirty_serves + fetches
                 // == passes, exact) and the full-save decision ledger.
                 "publish_phase_ns": publish_phase_json(),
+                "meta_txpass_phase_ns": meta_txpass_phase_json(),
                 "publish_base_dirty_serves": METRICS.publish_base_dirty_serves.load(Ordering::Relaxed),
                 "publish_base_fetches": METRICS.publish_base_fetches.load(Ordering::Relaxed),
                 "publish_full_save_indirect": METRICS.publish_full_save_indirect.load(Ordering::Relaxed),

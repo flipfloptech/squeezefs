@@ -3236,6 +3236,9 @@ struct QueuedTx {
     /// Exact journal entry length ([`entry_len_for`]) — the Σ-admission
     /// and the drain byte cap read it.
     len: u64,
+    /// Enqueue instant (`meta_txpass_phase_ns` tx_queue_wait — the
+    /// rewrite-publish-drain decomposition, 2026-08-01).
+    enqueued_at: std::time::Instant,
     /// D4.a: the `KvTx` construction site (counted on success).
     site: &'static std::panic::Location<'static>,
     /// Issue 13 (§5.5 revision 2): the tx's DLM I/D guards, held by THIS
@@ -3490,6 +3493,7 @@ impl KvMetaBackend {
             QueuedTx {
                 recs,
                 len,
+                enqueued_at: std::time::Instant::now(),
                 site,
                 _guards: tx.guards,
                 done,
@@ -3624,10 +3628,17 @@ impl KvMetaBackend {
         self: &Arc<Self>,
         batch: Vec<QueuedTx>,
     ) -> Vec<(QueuedTx, std::result::Result<(), KvError>)> {
+        use crate::fuse_client::{meta_txpass_phase_record, MetaTxPassPhase};
         super::META_CONVEYOR_LEADER_PASSES.fetch_add(1, Ordering::Relaxed);
         super::META_COMMIT_GROUP_SIZE.record(batch.len());
         super::META_COMMIT_GROUP_BYTES
             .fetch_add(batch.iter().map(|q| q.len).sum::<u64>(), Ordering::Relaxed);
+        // Pass decomposition (2026-08-01): queue residence per drained tx
+        // + the whole-pass span.
+        let t_pass = std::time::Instant::now();
+        for q in &batch {
+            meta_txpass_phase_record(MetaTxPassPhase::TxQueueWait, q.enqueued_at);
+        }
 
         // Issue-13 structural invariant, debug-asserted (it must be
         // UNFIREABLE now: a conflicting same-key writer cannot co-queue
@@ -3686,6 +3697,7 @@ impl KvMetaBackend {
             "the batch pipeline must reach a terminal outcome for every entry on every \
              non-panic path (the sentinel is for unwinds only)"
         );
+        meta_txpass_phase_record(MetaTxPassPhase::PassTotal, t_pass);
         std::mem::take(&mut sentinel.outcomes)
     }
 
@@ -3694,6 +3706,7 @@ impl KvMetaBackend {
     /// state; on every normal path (success and failure alike) it fans
     /// out per-tx results and empties the sentinel itself.
     async fn run_batch_pipeline(&self, s: &mut PassSentinel<'_>) {
+        use crate::fuse_client::{meta_txpass_phase_record, MetaTxPassPhase};
         // Inherited liveness re-checks (§5.5: "the shutdown/failure-flag
         // re-checks it inherits from commit_tx's admission loop").
         if self.is_shutting_down() || self.is_failed() {
@@ -3710,6 +3723,7 @@ impl KvMetaBackend {
         // the way today's parked committers hold theirs; the checkpoint
         // drain takes no DLM locks, ever), with the D1.b park-escalation
         // rung moved verbatim from the per-tx pipeline.
+        let t_adm = std::time::Instant::now();
         match self.admit_user_budget(total_len).await {
             Ok(adm) => s.admission = Some(adm),
             Err(e) => {
@@ -3717,6 +3731,7 @@ impl KvMetaBackend {
                 return;
             }
         }
+        meta_txpass_phase_record(MetaTxPassPhase::PassAdmission, t_adm);
 
         // Test seam (PR M4 D1.b, same protocol position as the per-tx
         // pipeline: admission held, nothing reserved — the historical
@@ -3731,6 +3746,10 @@ impl KvMetaBackend {
         // (3–5) The union locked window, with the whole-set
         // drop-all-and-relock retry (§5.5 lock-order analysis: never
         // re-resolving one member while holding the others' locks).
+        // `pass_leaf_locks` spans the WHOLE (3–5) window — resolve, lock
+        // acquire (checkpoint-freeze/SMO interference shows here),
+        // revalidate, pre-images, reservation, RAM apply.
+        let t_locks = std::time::Instant::now();
         let mut attempt = 0usize;
         let (res, undo, failed) = loop {
             attempt += 1;
@@ -3955,12 +3974,14 @@ impl KvMetaBackend {
             }
             break (res, undo, failed);
         };
+        meta_txpass_phase_record(MetaTxPassPhase::PassLeafLocks, t_locks);
 
         // (6) The pass's own bytes, outside every lock: the surviving
         // members' entries — N ORDINARY checksummed entries in the one
         // contiguous reservation, one `write_at_batch` submission. A
         // failed member's sub-range stays unwritten (the §4.4 pt 4
         // unwritten-hole mechanism; replay's checksum walk drops it).
+        let t_jwrite = std::time::Instant::now();
         let write_out = {
             let mut parts: Vec<(Reservation, &[(u8, Record)])> = Vec::new();
             let mut seq_cursor = res.start;
@@ -4023,6 +4044,7 @@ impl KvMetaBackend {
                     }
                     Ok(())
                 };
+                meta_txpass_phase_record(MetaTxPassPhase::PassJournalWrite, t_jwrite);
                 s.applied_unrolled = false;
 
                 // Terminal outcomes, in queue order (the pass task fans

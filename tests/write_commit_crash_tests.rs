@@ -122,7 +122,12 @@ fn wce_crash_child_entry() {
                     vec![(b, key)],
                 );
                 backend
-                    .merge_layout_and_size(ino, &delta, &full, layout.size)
+                    .merge_layout_and_size(
+                        ino,
+                        &delta,
+                        bytes::Bytes::from(full.clone()),
+                        layout.size,
+                    )
                     .await
                     .unwrap();
             }

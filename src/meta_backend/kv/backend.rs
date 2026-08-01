@@ -164,6 +164,14 @@ pub static TEST_CONVEYOR_POISON_APPLY_INO: AtomicU64 = AtomicU64::new(0);
 /// Vyukov stamp-aliasing floor, hard-asserted there).
 pub static TEST_PENDING_FREE_CAP: AtomicU64 = AtomicU64::new(0);
 
+/// Test seam (rewrite-publish-drain Lever B, 2026-08-01; the
+/// [`crate::routing::TEST_PUBLISH_PASS_DELAY_MS`] pattern): artificial
+/// delay, in milliseconds, at the head of every layout-merge conveyor
+/// pass iteration — lets concurrent-ino saves accumulate
+/// deterministically so the one-KvTx aggregation contract is testable
+/// on µs-commit sandboxes. One relaxed load per pass; zero-cost unset.
+pub static TEST_LAYOUT_MERGE_HOLD_MS: AtomicU64 = AtomicU64::new(0);
+
 /// `SQUEEZEFS_TIMEOUT` as the D1.b watchdog/escalation threshold
 /// (design-metadata-throughput §6): read per `open` (control-plane —
 /// never on an op path), default 30 s. Deliberately NOT process-memoized:
@@ -567,6 +575,12 @@ pub struct KvMetaBackend {
     /// immediately after `Arc::new`, on every open path — the
     /// checkpoint-task `Weak` discipline).
     conveyor_self: std::sync::OnceLock<Weak<KvMetaBackend>>,
+    /// Rewrite-publish-drain Lever B (2026-08-01): the per-volume
+    /// layout-merge conveyor — delta-class layout saves aggregate into
+    /// ONE multi-ino KvTx per pass (one journal entry, one ring write,
+    /// one fan-out) instead of one commit per ino. Same lifecycle
+    /// discipline as `conveyor` (leader-elect, Weak upgrade per batch).
+    layout_conveyor: Arc<ConveyorCore<QueuedLayoutMerge>>,
     /// `SQUEEZEFS_META_COMMIT_BATCH_TXS` (default 64), read at open.
     batch_max_txs: usize,
     /// `SQUEEZEFS_META_COMMIT_BATCH_BYTES` (default 256 KiB) clamped to
@@ -1162,6 +1176,7 @@ impl KvMetaBackend {
             layout_delta_ratchet: tokio::sync::Mutex::new(()),
             conveyor: Arc::new(ConveyorCore::new()),
             conveyor_self: std::sync::OnceLock::new(),
+            layout_conveyor: Arc::new(ConveyorCore::new()),
             batch_max_txs: commit_batch_txs_env(),
             batch_max_bytes,
             timeout_threshold: squeezefs_timeout_env(),
@@ -3230,6 +3245,21 @@ struct UndoKey {
 /// One transaction on the commit conveyor (PR M7, §5.5 D5): the encoded
 /// records, the exact entry length, the D4.a attribution site, the
 /// co-owned DLM guard set, and the committer's result channel.
+/// One queued delta-class layout save on the volume's layout-merge
+/// conveyor (rewrite-publish-drain Lever B, 2026-08-01): the
+/// `merge_layout_and_size` parameters plus the submitter's result
+/// channel (`use_delta` on success — the caller's chain accounting).
+struct QueuedLayoutMerge {
+    ino: Ino,
+    /// Pre-encoded `LayoutDelta` wire bytes (encoded once, at enqueue).
+    delta_wire: Bytes,
+    /// The caller-provided full layout — the always-correct fallback
+    /// where the backend eligibility half refuses the delta.
+    full_layout: Bytes,
+    size: u64,
+    done: tokio::sync::oneshot::Sender<crate::error::Result<bool>>,
+}
+
 struct QueuedTx {
     /// The tx's records, seqs stamped by the pass inside the lock window.
     recs: Vec<(u8, Record)>,
@@ -5369,6 +5399,283 @@ impl KvMetaBackend {
     /// `decode_base_layout` refusals make a violated rule loud, never
     /// silent.
     pub async fn merge_layout_and_size(
+        &self,
+        ino: Ino,
+        delta: &crate::layout_wire::LayoutDelta,
+        full_layout: Bytes,
+        size: u64,
+    ) -> Result<bool> {
+        // Rewrite-publish-drain Lever B (2026-08-01): delta-class layout
+        // saves aggregate on the per-volume layout-merge conveyor — one
+        // multi-ino KvTx per drained window (one journal entry, one ring
+        // write, one fan-out) instead of one commit per ino. The field
+        // decomposition named the per-ino commit chain (guard → inode
+        // read → slot probe → commit_tx → wake, 2.2 ms at a 92 %-utilized
+        // journal-conveyor server) as the dominant rewrite publish
+        // constituent; aggregation divides the commits, ring writes, and
+        // wake hops by the window. `SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX=1`
+        // is the A/B lever — the pre-campaign per-save path, verbatim.
+        self.write_gate()?;
+        if crate::routing::publish_commit_group_max() == Some(1) {
+            return self
+                .merge_layout_and_size_direct(ino, delta, &full_layout, size)
+                .await;
+        }
+        let (done, rx) = tokio::sync::oneshot::channel();
+        let delta_wire = Bytes::from(delta.encode());
+        let weight = (delta_wire.len() + full_layout.len()) as u64;
+        // Enqueue-then-elect with no await between (the conveyor_core
+        // no-lost-wakeup protocol).
+        self.layout_conveyor.enqueue(
+            QueuedLayoutMerge {
+                ino,
+                delta_wire,
+                full_layout,
+                size,
+                done,
+            },
+            weight,
+        );
+        if self.layout_conveyor.try_lead() {
+            let conveyor = Arc::clone(&self.layout_conveyor);
+            let weak = self.conveyor_self.get().cloned().ok_or_else(|| {
+                KvError::Corrupt(
+                    "conveyor identity missing (layout merge before open wiring?)".to_string(),
+                )
+            })?;
+            // Detached (the M7 cancellation-safety law): no client-visible
+            // cancellation can drop a batch mid-commit.
+            tokio::spawn(Self::layout_merge_pass_task(conveyor, weak));
+        }
+        match rx.await {
+            Ok(out) => out,
+            Err(_) => Err(self.eio(
+                "layout-merge conveyor pass dropped its result channel (pass panic — \
+                 save failed loud; custody stays with the caller's never-lossy ladder)",
+            )),
+        }
+    }
+
+    /// The detached layout-merge pass task (Lever B): drain → one
+    /// aggregated commit → fan out, until the queue idles; then release
+    /// leadership (release-then-recheck). Holds the backend per batch
+    /// only (Weak between batches — the M7 lifecycle discipline).
+    async fn layout_merge_pass_task(
+        conveyor: Arc<ConveyorCore<QueuedLayoutMerge>>,
+        weak: Weak<KvMetaBackend>,
+    ) {
+        loop {
+            // Test seam: let concurrent-ino saves accumulate
+            // deterministically (`TEST_LAYOUT_MERGE_HOLD_MS`).
+            let hold = TEST_LAYOUT_MERGE_HOLD_MS.load(Ordering::Relaxed);
+            if hold > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
+            }
+            let Some(be) = weak.upgrade() else {
+                // Backend dropped without shutdown: queued entries are
+                // dropped-committer residue — fail them loud, release
+                // leadership (the M7 pass shape).
+                loop {
+                    for q in conveyor.drain(usize::MAX, u64::MAX) {
+                        let _ = q.done.send(Err(crate::error::SqueezefsError::Io(
+                            std::io::Error::other(
+                                "meta volume dropped with layout merges still queued",
+                            ),
+                        )));
+                    }
+                    if !conveyor.unlead_and_recheck() {
+                        return;
+                    }
+                }
+            };
+            let cap = crate::routing::publish_commit_group_max().unwrap_or(be.batch_max_txs);
+            let batch = conveyor.drain(cap, be.batch_max_bytes);
+            if batch.is_empty() {
+                drop(be); // never park on leadership holding the backend
+                if !conveyor.unlead_and_recheck() {
+                    return;
+                }
+                continue;
+            }
+            be.layout_merge_pass(batch).await;
+            drop(be);
+        }
+    }
+
+    /// One aggregated layout-merge batch: the batch's I-guards in ONE
+    /// deduped ascending `lock_many` plan, every member's
+    /// {layout delta | full Put} + inode Put staged into ONE KvTx, ONE
+    /// `commit_tx` — with per-op isolation (a NotFound / slot-probe
+    /// failure fails that member ALONE; survivors commit). The panic
+    /// guard fails everything queued loud (never a wedged conveyor).
+    async fn layout_merge_pass(self: &Arc<Self>, batch: Vec<QueuedLayoutMerge>) {
+        use crate::fuse_client::{publish_phase_record, PublishPhase};
+        struct PassGuard {
+            conveyor: Arc<ConveyorCore<QueuedLayoutMerge>>,
+            clean: bool,
+        }
+        impl Drop for PassGuard {
+            fn drop(&mut self) {
+                if self.clean {
+                    return;
+                }
+                loop {
+                    for q in self.conveyor.drain(usize::MAX, u64::MAX) {
+                        let _ = q.done.send(Err(crate::error::SqueezefsError::Io(
+                            std::io::Error::other(
+                                "layout-merge conveyor pass panicked — save failed loud",
+                            ),
+                        )));
+                    }
+                    if !self.conveyor.unlead_and_recheck() {
+                        break;
+                    }
+                }
+            }
+        }
+        let mut guard = PassGuard {
+            conveyor: Arc::clone(&self.layout_conveyor),
+            clean: false,
+        };
+
+        // Duplicate an unclonable error to every surviving member,
+        // preserving nothing but the message (fencing/NotFound classes
+        // are per-op and never duplicated).
+        fn dup_err(e: &crate::error::SqueezefsError) -> crate::error::SqueezefsError {
+            crate::error::SqueezefsError::Io(std::io::Error::other(format!(
+                "aggregated layout commit failed: {e}"
+            )))
+        }
+
+        // The batch's 4a I-guards, ONE deduped ascending plan (the
+        // `destroy_inodes` precedent — deadlock-free by ordering).
+        let t_guard = std::time::Instant::now();
+        let lock_plan: Vec<(u64, LockMode)> =
+            batch.iter().map(|q| (q.ino, LockMode::Exclusive)).collect();
+        let guards: Arc<[DlmGuard]> = Arc::from(self.dlm.lock_many(&lock_plan, &[]).await);
+        publish_phase_record(PublishPhase::CommitGuard, t_guard);
+
+        let mut tx = KvTx::new();
+        // Per-op outcomes: staged members await the shared commit;
+        // failed members own their error immediately.
+        let mut staged: Vec<(
+            tokio::sync::oneshot::Sender<crate::error::Result<bool>>,
+            bool,
+        )> = Vec::new();
+        let mut failed: Vec<(
+            tokio::sync::oneshot::Sender<crate::error::Result<bool>>,
+            crate::error::SqueezefsError,
+        )> = Vec::new();
+        for op in batch {
+            let t_iread = std::time::Instant::now();
+            let v = match self.read_inode_value(op.ino).await {
+                Ok(Some(mut v)) => {
+                    v.size = op.size;
+                    v
+                }
+                Ok(None) => {
+                    // The reclaimed-ino face: NotFound classification is
+                    // load-bearing for the never-lossy ladder's
+                    // verified-orphan-discard arm — per-op, never shared.
+                    failed.push((
+                        op.done,
+                        Self::not_found(format!("Inode {} not found", op.ino)),
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    failed.push((op.done, e.into()));
+                    continue;
+                }
+            };
+            publish_phase_record(PublishPhase::CommitInodeRead, t_iread);
+            // NEVER author times here — the `set_layout_and_size`
+            // clock-authority rule verbatim (generic/003; the unfolded
+            // `read_inode_value` keeps parked Δtime refinements pending).
+            let t_slot = std::time::Instant::now();
+            let (existing, key) = match self.xattr_slot(&tx, op.ino, "layout").await {
+                Ok(x) => x,
+                Err(e) => {
+                    failed.push((op.done, e.into()));
+                    continue;
+                }
+            };
+            // The backend eligibility half, per member: a live non-JSON
+            // base + the durable incompat ratchet.
+            let mut use_delta = false;
+            if existing {
+                match self.xattrs.lookup(&key).await {
+                    Ok(Some(cur)) => {
+                        let base_ok = XattrValue::decode(&cur)
+                            .map(|x| !x.value.starts_with(b"{"))
+                            .unwrap_or(false);
+                        if base_ok {
+                            use_delta = self.layout_deltas_ready().await;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        failed.push((op.done, e.into()));
+                        continue;
+                    }
+                }
+            }
+            publish_phase_record(PublishPhase::CommitSlotProbe, t_slot);
+            if use_delta {
+                super::META_KV_LAYOUT_DELTA_BYTES
+                    .fetch_add(op.delta_wire.len() as u64, Ordering::Relaxed);
+                super::META_KV_LAYOUT_DELTA_COMMITS.fetch_add(1, Ordering::Relaxed);
+                tx.stage_delta_raw(TREE_XATTRS, key, op.delta_wire);
+            } else {
+                super::META_KV_LAYOUT_FULL_COMMITS.fetch_add(1, Ordering::Relaxed);
+                let full = match XattrValue::encode_parts(b"layout", &op.full_layout) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        failed.push((op.done, e.into()));
+                        continue;
+                    }
+                };
+                tx.stage_put(TREE_XATTRS, key, full);
+            }
+            tx.stage_put(TREE_INODES, inode_key(op.ino), v.encode());
+            staged.push((op.done, use_delta));
+        }
+        for (done, e) in failed {
+            let _ = done.send(Err(e));
+        }
+        if staged.is_empty() {
+            guard.clean = true;
+            return;
+        }
+        crate::fuse_client::METRICS
+            .publish_commit_groups
+            .fetch_add(1, Ordering::Relaxed);
+        crate::fuse_client::METRICS
+            .publish_commit_group_saves
+            .fetch_add(staged.len() as u64, Ordering::Relaxed);
+        tx.hold_guards(guards);
+        let t_tx = std::time::Instant::now();
+        let out = self.commit_tx(tx).await;
+        publish_phase_record(PublishPhase::CommitTxWait, t_tx);
+        match out {
+            Ok(()) => {
+                for (done, use_delta) in staged {
+                    let _ = done.send(Ok(use_delta));
+                }
+            }
+            Err(e) => {
+                let e: crate::error::SqueezefsError = e.into();
+                for (done, _) in staged {
+                    let _ = done.send(Err(dup_err(&e)));
+                }
+            }
+        }
+        guard.clean = true;
+    }
+
+    /// The pre-aggregation single-ino body (the
+    /// `SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX=1` A/B path, verbatim).
+    async fn merge_layout_and_size_direct(
         &self,
         ino: Ino,
         delta: &crate::layout_wire::LayoutDelta,

@@ -210,6 +210,35 @@ async fn persisted_layout(h: &H, ino: u64) -> LayoutMetadata {
     bincode::deserialize::<LayoutMetadata>(&bytes).expect("bincode layout")
 }
 
+/// Reopen a just-dropped meta volume, tolerating the D0 writer flock's
+/// release latency (detached pass tasks drop their per-batch backend
+/// refs within ms of the last user Arc — a bounded retry on `Busy` is
+/// the drop-without-shutdown reopen discipline, not a sync-by-sleep).
+async fn reopen_backend_with_retry(meta: &Path) -> RoutedMetaBackend {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match KvMetaBackend::open(meta).await {
+            Ok(be) => return RoutedMetaBackend::new(vec![be]),
+            Err(e)
+                if format!("{e}").contains("writer lock")
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("reopen failed: {e}"),
+        }
+    }
+}
+
+async fn persisted_layout_at(routed: &RoutedMetaBackend, ino: u64) -> LayoutMetadata {
+    let bytes = routed
+        .getxattr(ino, "layout")
+        .await
+        .expect("getxattr")
+        .expect("layout present");
+    bincode::deserialize::<LayoutMetadata>(&bytes).expect("bincode layout")
+}
+
 /// Whole-block rewrite stream + fsync + pipeline drain.
 async fn stream_blocks(h: &H, ino: u64, start: u32, blocks: u32, tag: u8) {
     for b in start..start + blocks {
@@ -284,8 +313,8 @@ async fn rewrite_publish_base_serves_from_coherent_ram() {
     assert_eq!(got, expect, "rewrite bytes must serve exactly");
     let before = persisted_layout(&h, ino).await;
     drop(h);
-    let h2 = make(*b"pd-a1-ram-base!!", "pd_ns_a1_r", meta.path(), false).await;
-    let after = persisted_layout(&h2, ino).await;
+    let reopened = reopen_backend_with_retry(meta.path()).await;
+    let after = persisted_layout_at(&reopened, ino).await;
     assert_eq!(after.size, before.size, "remounted size must match");
     assert_eq!(
         after.block_map, before.block_map,
@@ -318,8 +347,7 @@ async fn rewrite_chain_rebases_at_the_cap() {
     stream_blocks(&h, ino, 0, n, 0x31).await;
 
     let cap_0 = METRICS.publish_full_save_chain_cap.load(Ordering::Relaxed);
-    let delta_0 =
-        squeezefs::meta_backend::kv::META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed);
+    let delta_0 = squeezefs::meta_backend::kv::META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed);
     // 10 rewrite passes over the same blocks: enough delta saves to
     // cross the C=4 cap repeatedly.
     for pass in 0..10u8 {
@@ -367,12 +395,11 @@ async fn foreign_era_ram_base_is_refused_and_refetched() {
     // Poison the RAM entry: clean, map present, but stamped with a
     // FOREIGN era token (a pre-lease-loss survivor) and a WRONG map
     // binding for block 0. A coherent-base serve would leak it.
-    let mut entry = h
-        .fs
-        .router
-        .metadata_cache
-        .get(&ino)
-        .expect("cached entry present after fsync");
+    let mut entry =
+        h.fs.router
+            .metadata_cache
+            .get(&ino)
+            .expect("cached entry present after fsync");
     assert!(!entry.layout_dirty, "fixture premise: clean after fsync");
     let true_map = persisted_layout(&h, ino).await.block_map.unwrap();
     let mut poisoned = (*entry.block_map.take().expect("map present")).clone();
@@ -511,7 +538,15 @@ async fn aggregated_batch_member_fails_alone() {
     let dead = create(&h, "b2_dead").await;
     stream_blocks(&h, dead, 0, 2, 0x72).await;
     // Destroy the second ino's inode record out from under its publish
-    // (the reclaimed-ino face).
+    // (the reclaimed-ino face): backend-level unlink (nlink → 0; the
+    // routing cache entry stays coherent so the op still rides the
+    // delta/aggregated path) + the batched destroy reap.
+    h.fs.meta_backend
+        .as_ref()
+        .unwrap()
+        .unlink(1, "b2_dead")
+        .await
+        .expect("backend unlink");
     h.fs.meta_backend
         .as_ref()
         .unwrap()
@@ -626,11 +661,14 @@ async fn aggregated_commit_survives_replay() {
     j2.await.unwrap().expect("i2 publish");
     squeezefs::meta_backend::kv::backend::TEST_LAYOUT_MERGE_HOLD_MS.store(0, Ordering::Relaxed);
 
-    // Drop WITHOUT shutdown: replay must fold both publishes.
+    // Drop WITHOUT shutdown: replay must fold both publishes. The
+    // test-local router clone must drop FIRST (it pins the backend Arc
+    // — and with it the D0 writer flock — across the reopen).
+    drop(router);
     drop(h);
-    let h2 = make(*b"pd-b3-replay!!!!", "pd_ns_b3_r", meta.path(), false).await;
+    let reopened = reopen_backend_with_retry(meta.path()).await;
     for (ino, key) in [(i1, "backend_0://910000"), (i2, "backend_0://920000")] {
-        let l = persisted_layout(&h2, ino).await;
+        let l = persisted_layout_at(&reopened, ino).await;
         assert_eq!(
             l.block_map.as_ref().unwrap().get(&9),
             Some(&key.to_string()),

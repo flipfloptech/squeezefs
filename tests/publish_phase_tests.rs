@@ -278,6 +278,9 @@ async fn publish_phase_family_is_always_on_with_exact_keys() {
     for k in [
         "publish_base_dirty_serves",
         "publish_base_fetches",
+        "publish_base_ram_serves",
+        "publish_commit_groups",
+        "publish_commit_group_saves",
         "publish_full_save_indirect",
         "publish_full_save_chain_cap",
         "publish_full_save_other",
@@ -314,7 +317,9 @@ async fn coalesced_stream_records_phases_with_closed_ledger() {
         .load(Ordering::Relaxed);
     let dirty_0 = METRICS.publish_base_dirty_serves.load(Ordering::Relaxed);
     let fetch_0 = METRICS.publish_base_fetches.load(Ordering::Relaxed);
+    let ram_0 = METRICS.publish_base_ram_serves.load(Ordering::Relaxed);
     let delta_0 = squeezefs::meta_backend::kv::META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed);
+    let groups_0 = METRICS.publish_commit_groups.load(Ordering::Relaxed);
 
     let n_blocks = 24u32;
     stream_blocks(&h, ino, 2, n_blocks, 0x33).await;
@@ -327,6 +332,7 @@ async fn coalesced_stream_records_phases_with_closed_ledger() {
         - blocks_0;
     let dirty = METRICS.publish_base_dirty_serves.load(Ordering::Relaxed) - dirty_0;
     let fetch = METRICS.publish_base_fetches.load(Ordering::Relaxed) - fetch_0;
+    let ram = METRICS.publish_base_ram_serves.load(Ordering::Relaxed) - ram_0;
 
     assert!(
         pub_blocks >= n_blocks as u64,
@@ -361,10 +367,10 @@ async fn coalesced_stream_records_phases_with_closed_ledger() {
         );
     }
     assert_eq!(
-        dirty + fetch,
+        dirty + fetch + ram,
         d("lock_wait"),
         "base-provenance ledger must close: dirty_serves {dirty} + fetches \
-         {fetch} == passes {}",
+         {fetch} + ram_serves {ram} == passes {}",
         d("lock_wait")
     );
 
@@ -378,23 +384,31 @@ async fn coalesced_stream_records_phases_with_closed_ledger() {
         );
     }
     // The meta_commit INTERIOR (the field's dominant constituent —
-    // 2.07 ms/pass rewrite vs 0.39 fresh): every DELTA save records the
-    // guard/inode-read/slot-probe/tx-wait split.
+    // 2.07 ms/pass rewrite vs 0.39 fresh): delta saves record the
+    // per-op legs (inode read / slot probe); the aggregated commit
+    // (Lever B) records guard / tx-wait once per GROUP.
     let delta_commits =
         squeezefs::meta_backend::kv::META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed) - delta_0;
+    let groups = METRICS.publish_commit_groups.load(Ordering::Relaxed) - groups_0;
     assert!(
         delta_commits >= 1,
         "fixture premise: the stream must stage layout deltas"
     );
-    for p in [
-        "commit_guard",
-        "commit_inode_read",
-        "commit_slot_probe",
-        "commit_tx_wait",
-    ] {
+    assert!(
+        groups >= 1,
+        "fixture premise: delta saves must ride the aggregated commit"
+    );
+    for p in ["commit_inode_read", "commit_slot_probe"] {
         assert!(
             d(p) >= delta_commits,
             "{p} spans ({}) must account every delta save ({delta_commits})",
+            d(p)
+        );
+    }
+    for p in ["commit_guard", "commit_tx_wait"] {
+        assert!(
+            d(p) >= groups,
+            "{p} spans ({}) must account every aggregated commit ({groups})",
             d(p)
         );
     }
@@ -406,13 +420,18 @@ async fn coalesced_stream_records_phases_with_closed_ledger() {
 }
 
 // =========================================================================
-// Contract 3 — the rewrite conviction is OBSERVABLE: a persisted-and-
-// cleaned base makes the rewrite's publish passes pay backend fetches
-// (the constituent the fresh path dodges via dirty RAM authority).
+// Contract 3 — the rewrite base provenance is OBSERVABLE. Phase 1's
+// red pinned the conviction (a persisted-and-cleaned base made every
+// rewrite pass pay a backend refetch); Phase 2's Lever A moved the law
+// — this contract moved with it, as its red-phase text promised: the
+// rewrite now serves its RMW base from the era-coherent RAM entry
+// (`publish_base_ram_serves`), and the ledger still accounts every
+// pass. The full Lever A suite lives in
+// `tests/publish_drain_economy_tests.rs`.
 // =========================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rewrite_on_clean_persisted_base_pays_backend_fetch() {
+async fn rewrite_on_clean_persisted_base_is_ledger_attributed() {
     let _g = serial().await;
     let h = make([0xA3; 16], "pub_phase_rewrite").await;
     let ino = create(&h, "rw").await;
@@ -436,6 +455,8 @@ async fn rewrite_on_clean_persisted_base_pays_backend_fetch() {
     );
 
     let fetch_0 = METRICS.publish_base_fetches.load(Ordering::Relaxed);
+    let ram_0 = METRICS.publish_base_ram_serves.load(Ordering::Relaxed);
+    let batches_0 = METRICS.layout_publish_batches.load(Ordering::Relaxed);
     let f0 = publish_phase_json();
 
     // The rewrite: same blocks, new bytes — size never grows, so no
@@ -443,17 +464,25 @@ async fn rewrite_on_clean_persisted_base_pays_backend_fetch() {
     stream_blocks(&h, ino, 0, n_blocks, 0x55).await;
 
     let fetch = METRICS.publish_base_fetches.load(Ordering::Relaxed) - fetch_0;
+    let ram = METRICS.publish_base_ram_serves.load(Ordering::Relaxed) - ram_0;
+    let batches = METRICS.layout_publish_batches.load(Ordering::Relaxed) - batches_0;
     let f1 = publish_phase_json();
+    assert!(batches >= 1, "rewrite passes must publish");
     assert!(
-        fetch >= 1,
-        "the rewrite-publish conviction must be observable: rewrite passes \
-         on a clean persisted base pay publish_base_fetches (got 0 — either \
-         the ledger is not wired or the base provenance changed; if Phase 2 \
-         moved the law, THIS contract moves with it)"
+        ram >= batches.saturating_sub(fetch),
+        "rewrite passes on a clean persisted base must serve the RMW base \
+         from the era-coherent RAM entry (ram {ram}, fetch {fetch}, \
+         batches {batches})"
+    );
+    assert!(
+        fetch <= 1,
+        "the Lever A law: at most one backend fetch on a steady rewrite \
+         (got {fetch})"
     );
     assert!(
         phase_count(&f1, "base_fetch") > phase_count(&f0, "base_fetch"),
-        "base_fetch spans must record on the rewrite passes"
+        "base_fetch spans record the resolution on every pass (RAM serves \
+         included — the span is the resolve, not the fetch)"
     );
 }
 

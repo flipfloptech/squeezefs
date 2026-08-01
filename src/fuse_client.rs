@@ -3020,11 +3020,25 @@ pub struct Metrics {
     /// fresh-stream posture: size-floor bumps mark the entry dirty
     /// ahead of every publish).
     pub publish_base_dirty_serves: Align64<AtomicU64>,
-    /// Publish passes whose RMW base needed a backend fetch (clean or
-    /// absent RAM entry — the rewrite posture: fold + decode + map
-    /// clone per pass, plus an indirect map rehydrate where the map
-    /// spilled). THE rewrite-publish conviction instrument.
+    /// Publish passes whose RMW base needed a backend fetch (absent,
+    /// unknown-provenance, or FOREIGN-ERA RAM entry — post-Lever-A this
+    /// is the cross-era safety arm plus first-touch; a steady rewrite
+    /// must keep it ≈ 0). Pre-Lever-A this was the rewrite posture:
+    /// fold + decode + map clone per pass — the conviction instrument.
     pub publish_base_fetches: Align64<AtomicU64>,
+    /// Lever A engagement (2026-08-01): publish passes whose RMW base
+    /// was a CLEAN, era-coherent RAM entry (`layout_base_token` ==
+    /// current fencing token). The steady-rewrite posture.
+    pub publish_base_ram_serves: Align64<AtomicU64>,
+    /// Lever B engagement (2026-08-01): aggregated multi-ino layout
+    /// commits (one KvTx / one journal entry each). With
+    /// `publish_commit_group_saves` gives the live aggregation factor —
+    /// saves/groups ≈ 1 under aggregation-eligible concurrency means
+    /// the lever regressed to per-save commits.
+    pub publish_commit_groups: Align64<AtomicU64>,
+    /// Delta-class layout saves carried by aggregated commits (every
+    /// conveyor-routed save accounts here exactly once).
+    pub publish_commit_group_saves: Align64<AtomicU64>,
     // The full-save decision ledger: why a publish-class save fell off
     // the O(batch) delta path (the write-commit-economy lever-2
     // collapse). Growth here under rewrite names the constituent.
@@ -5406,6 +5420,9 @@ impl SqueezefsFilesystem {
                 "meta_txpass_phase_ns": meta_txpass_phase_json(),
                 "publish_base_dirty_serves": METRICS.publish_base_dirty_serves.load(Ordering::Relaxed),
                 "publish_base_fetches": METRICS.publish_base_fetches.load(Ordering::Relaxed),
+                "publish_base_ram_serves": METRICS.publish_base_ram_serves.load(Ordering::Relaxed),
+                "publish_commit_groups": METRICS.publish_commit_groups.load(Ordering::Relaxed),
+                "publish_commit_group_saves": METRICS.publish_commit_group_saves.load(Ordering::Relaxed),
                 "publish_full_save_indirect": METRICS.publish_full_save_indirect.load(Ordering::Relaxed),
                 "publish_full_save_chain_cap": METRICS.publish_full_save_chain_cap.load(Ordering::Relaxed),
                 "publish_full_save_other": METRICS.publish_full_save_other.load(Ordering::Relaxed),
@@ -11461,6 +11478,9 @@ impl Filesystem for SqueezefsFilesystem {
                     block_map: None,
                     layout_dirty: false,
                     layout_delta_chain: crate::routing::LAYOUT_DELTA_CHAIN_INELIGIBLE,
+                    // Synthesized create seed: never a coherent publish
+                    // base (Lever A).
+                    layout_base_token: 0,
                 },
             );
             self.bump_dir_generation(parent);

@@ -159,6 +159,17 @@ pub struct CachedMetadata {
     /// and by every save's republish; the DEFAULT is ineligible so any
     /// synthesized entry conservatively re-bases with a full save.
     pub layout_delta_chain: u32,
+    /// Rewrite-publish-drain Lever A (2026-08-01): the fencing era this
+    /// entry's layout state is coherent with — stamped by
+    /// `fetch_metadata_from_backend` (backend-true at fetch) and by every
+    /// save's republish (just persisted). The coalesced publish pass may
+    /// use a CLEAN cached entry as its RMW base ONLY while this equals
+    /// the ino's CURRENT fencing token (every layout mutation republishes
+    /// the cache under `INODE_META_LOCKS`, so a same-era clean entry is
+    /// coherent by construction; a foreign era — lease lost/reacquired,
+    /// possible cross-client mutation — refetches, the pre-campaign
+    /// posture). `0` = unknown provenance, never serve as base.
+    pub layout_base_token: u64,
 }
 
 /// [`CachedMetadata::layout_delta_chain`] sentinel: the persisted base
@@ -188,6 +199,7 @@ impl Default for CachedMetadata {
             block_map: None,
             layout_dirty: false,
             layout_delta_chain: LAYOUT_DELTA_CHAIN_INELIGIBLE,
+            layout_base_token: 0,
         }
     }
 }
@@ -326,6 +338,48 @@ pub fn set_layout_delta_chain_override(v: Option<u32>) {
         .filter(|x| *x >= 0)
         .unwrap_or(64);
     layout_delta_chain_cell().store(
+        v.map(|n| n as i64).unwrap_or(default),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// `SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX` cell (rewrite-publish-drain
+/// Lever B, 2026-08-01): max delta-class layout saves aggregated into
+/// ONE multi-ino commit by the per-volume layout-merge conveyor.
+/// `0` (default) = derive from the volume's ring-admission batch cap
+/// (`SQUEEZEFS_META_COMMIT_BATCH_TXS` — no new constant); `1` = the
+/// pre-campaign per-save commit path verbatim (the A/B lever).
+fn publish_commit_group_cell() -> &'static std::sync::atomic::AtomicI64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicI64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let v = std::env::var("SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX")
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|v| *v >= 0)
+            .unwrap_or(0);
+        std::sync::atomic::AtomicI64::new(v)
+    })
+}
+
+/// Current publish-commit aggregation cap: `None` = derive from the
+/// volume's batch cap, `Some(1)` = per-save commits (A/B), `Some(n)` =
+/// explicit.
+pub fn publish_commit_group_max() -> Option<usize> {
+    match publish_commit_group_cell().load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n as usize),
+    }
+}
+
+/// Set the aggregation-cap override (`None` restores the env/default) —
+/// tests/acceptance.
+pub fn set_publish_commit_group_override(v: Option<usize>) {
+    let default = std::env::var("SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|x| *x >= 0)
+        .unwrap_or(0);
+    publish_commit_group_cell().store(
         v.map(|n| n as i64).unwrap_or(default),
         std::sync::atomic::Ordering::Relaxed,
     );
@@ -3183,6 +3237,9 @@ impl DataRouter {
                         block_map: block_map.map(std::sync::Arc::new),
                         layout_dirty: false,
                         layout_delta_chain,
+                        // Lever A: backend-true at fetch — coherent with
+                        // the CURRENT era by definition.
+                        layout_base_token: self.inner.dlm.get_fencing_token_ino(ino),
                     }));
                 }
             }
@@ -3402,8 +3459,11 @@ impl DataRouter {
                     .expect("delta_eligible requires entries")
                     .to_vec(),
             );
+            // The full layout moves as `Bytes` (Lever B: the aggregated
+            // conveyor parks it as the always-correct fallback — a move,
+            // never a per-save copy).
             backend
-                .merge_layout_and_size(ino, &delta, &bytes, m.size)
+                .merge_layout_and_size(ino, &delta, bytes::Bytes::from(bytes), m.size)
                 .await?
         } else {
             backend.set_layout_and_size(ino, &bytes, m.size).await?;
@@ -3455,6 +3515,9 @@ impl DataRouter {
         // the pipeline's size-bump/merge interleaving exposed it.
         cached.block_map_id = layout.block_map_id.clone().map(Into::into);
         cached.cached_at = std::time::Instant::now();
+        // Lever A (2026-08-01): the republished entry IS the just-
+        // persisted state — coherent with the save's fencing era.
+        cached.layout_base_token = fencing_token;
         self.metadata_cache.insert(ino, cached);
 
         if let Some(ref old_key) = old_indirect_to_free {
@@ -5866,6 +5929,9 @@ impl DataRouter {
             block_map: None,
             layout_dirty: false,
             layout_delta_chain: LAYOUT_DELTA_CHAIN_INELIGIBLE,
+            // Synthesized (backend has no layout): never a coherent
+            // publish base.
+            layout_base_token: 0,
         };
         self.metadata_cache.insert(ino, m.clone());
         Ok(m)
@@ -6647,15 +6713,30 @@ impl DataRouter {
         }
 
         // RMW base — the dirty-authority rule, verbatim from the direct
-        // primitive (FIND-RW5-A face 5). Base-provenance ledger
-        // (2026-08-01): dirty serve vs backend fetch, exactly one per
-        // pass — the rewrite-publish conviction instrument (fresh
-        // streams ride dirty RAM; rewrites re-fetch per pass today).
+        // primitive (FIND-RW5-A face 5), plus the Lever A coherent-RAM
+        // arm (2026-08-01): a CLEAN cached entry whose `layout_base_token`
+        // matches the ino's CURRENT fencing era serves as the base —
+        // every layout mutation republishes the cache under
+        // `INODE_META_LOCKS`, so a same-era clean entry is coherent by
+        // construction (the pre-campaign clean⇒refetch paid a backend
+        // getxattr per pass that folded the ino's whole unrebased delta
+        // chain and cloned the map — 6.3 M fold applies per 60 s field
+        // rewrite row — and its chain-accounting reset kept the on-disk
+        // chain from EVER re-basing). A foreign-era or unknown entry
+        // refetches exactly as before: the lease-loss stale-map hazard
+        // stays closed (`tests/publish_drain_economy_tests.rs`).
+        let current_fencing = self.inner.dlm.get_fencing_token_ino(ino);
         let t_base = std::time::Instant::now();
         let mut current = match self.metadata_cache.get(&ino) {
             Some(m) if m.layout_dirty => {
                 METRICS
                     .publish_base_dirty_serves
+                    .fetch_add(1, Ordering::Relaxed);
+                m
+            }
+            Some(m) if m.layout_base_token != 0 && m.layout_base_token == current_fencing => {
+                METRICS
+                    .publish_base_ram_serves
                     .fetch_add(1, Ordering::Relaxed);
                 m
             }
@@ -6676,7 +6757,6 @@ impl DataRouter {
             }
         };
         publish_phase_record(PublishPhase::BaseFetch, t_base);
-        let current_fencing = self.inner.dlm.get_fencing_token_ino(ino);
 
         // CoW publish (item A): held reader snapshots keep their map.
         let t_apply = std::time::Instant::now();

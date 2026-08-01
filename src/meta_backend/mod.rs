@@ -2158,7 +2158,7 @@ impl RoutedMetaBackend {
         &self,
         ino: Ino,
         delta: &crate::layout_wire::LayoutDelta,
-        full_layout: &[u8],
+        full_layout: bytes::Bytes,
         size: u64,
     ) -> Result<bool> {
         // §5.5.2a cutover gate — before the backend's own I-guard and

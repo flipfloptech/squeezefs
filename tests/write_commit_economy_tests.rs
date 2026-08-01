@@ -91,7 +91,7 @@ async fn publish_block(
         vec![(b, key)],
     );
     routed
-        .merge_layout_and_size(ino, &delta, &full, layout.size)
+        .merge_layout_and_size(ino, &delta, bytes::Bytes::from(full.clone()), layout.size)
         .await
         .expect("publish")
 }

@@ -995,6 +995,15 @@ fn ipc_arena_cap_is_budget_fraction_no_fixed_ceiling() {
     // anywhere (the budget is already machine-derived; per-uid session
     // caps + idle reap + R5 shedding bound the pool).
     assert_eq!(ipc_arena_cap(u64::MAX / 2), u64::MAX / 2 / 8);
+    // Tie test (the il_sessions_default pattern): the documented default
+    // percentage IS the /8 derivation — drift between the constant and
+    // the arithmetic is a red test.
+    let budget = 8 * gib;
+    assert_eq!(
+        (budget as f64 * (squeezefs::mem_budget::IPC_ARENA_CAP_DEFAULT_PCT / 100.0)) as u64,
+        ipc_arena_cap(budget),
+        "IPC_ARENA_CAP_DEFAULT_PCT must equal the budget/8 derivation"
+    );
 }
 
 #[test]

@@ -151,6 +151,7 @@ async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
     let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
     let m = NamedTempFile::new().unwrap();
+    m.as_file().set_len(128 * 1024 * 1024).unwrap();
     ImageBuilder::new(BuilderConfig {
         node_size: DEFAULT_NODE_SIZE,
         journal_len_override: None,
@@ -297,6 +298,10 @@ async fn coalesced_stream_records_phases_with_closed_ledger() {
     let _g = serial().await;
     let h = make([0xA2; 16], "pub_phase_stream").await;
     let ino = create(&h, "phased").await;
+    // Striped fixture first: the fresh small-file route promotes via
+    // staging (direct primitive, not the conveyor) — the measured
+    // stream below is all write-through.
+    stream_blocks(&h, ino, 0, 2, 0x22).await;
 
     let f0 = publish_phase_json();
     let batches_0 = METRICS.layout_publish_batches.load(Ordering::Relaxed);
@@ -307,7 +312,7 @@ async fn coalesced_stream_records_phases_with_closed_ledger() {
     let fetch_0 = METRICS.publish_base_fetches.load(Ordering::Relaxed);
 
     let n_blocks = 24u32;
-    stream_blocks(&h, ino, 0, n_blocks, 0x33).await;
+    stream_blocks(&h, ino, 2, n_blocks, 0x33).await;
 
     let f1 = publish_phase_json();
     let batches = METRICS.layout_publish_batches.load(Ordering::Relaxed) - batches_0;
@@ -394,12 +399,11 @@ async fn rewrite_on_clean_persisted_base_pays_backend_fetch() {
 
     // fsync persisted + CLEANED the layout (persist_dirty_layout_if_
     // needed): the RAM entry is now clean — the rewrite premise.
-    let clean = h
-        .fs
-        .router
-        .metadata_cache
-        .get(&ino)
-        .expect("fixture premise: cached entry present after fsync");
+    let clean =
+        h.fs.router
+            .metadata_cache
+            .get(&ino)
+            .expect("fixture premise: cached entry present after fsync");
     assert!(
         !clean.layout_dirty,
         "fixture premise: fsync must persist-and-clean the layout"

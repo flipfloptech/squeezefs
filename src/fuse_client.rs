@@ -1819,6 +1819,92 @@ pub fn write_pipeline_phase_json() -> serde_json::Value {
 }
 
 // ===========================================================================
+// Publish decomposition (`publish_phase_ns`) — the 2026-08-01
+// rewrite-publish-drain campaign's Phase 1 instrument
+// (`tests/publish_phase_tests.rs`; evidence
+// `.benchmarks/2026-08-01-rewrite-publish-drain.md`).
+//
+// The pipeline family above names `publish` as the rewrite drain's
+// anomaly (6.36 ms/block rewrite vs 0.83 fresh — a 7.7× tax feeding the
+// conserved `admit_gate` queue), but `publish` is a compound span:
+// conveyor wait + pass lock + RMW base resolve + batch apply + save
+// encode + (indirect blob write) + meta commit. This family decomposes
+// it so the rewrite-specific constituent is NAMED, not guessed (five
+// hypotheses died to instruments this month).
+//
+// Same ALWAYS-ON cost contract as `write_pipeline_phase_ns`: one
+// `Instant::now()` + one relaxed `fetch_add` per boundary per publish
+// op/pass — pass-level boundaries fire once per BATCH, op-level twice
+// per block.
+//
+// Containment: pipeline `publish` (per op) ≈ queue_wait + own pass's
+// (lock_wait + base_fetch + apply + save_encode [+ blob_write]
+// + meta_commit) ≈ `total`.
+// ===========================================================================
+
+/// Publish sub-phases (`publish_phase_ns`). `repr(usize)` indexes the
+/// histogram table directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum PublishPhase {
+    /// Op enqueue → drained into a pass batch (per op).
+    QueueWait = 0,
+    /// Pass: `INODE_META_LOCKS` acquire (per pass).
+    LockWait = 1,
+    /// Pass: RMW base resolve — ~0 on dirty-RAM serves; the backend
+    /// fetch (fold + decode + map clone, indirect map rehydrate) on
+    /// clean/absent entries (per pass; see the base-provenance ledger).
+    BaseFetch = 2,
+    /// Pass: batch apply loop — map inserts, displaced-key tier purges,
+    /// size floors, layout flips (per pass).
+    Apply = 3,
+    /// Save: full-layout inline serialize + the indirect/delta
+    /// eligibility determination (per publish-class save).
+    SaveEncode = 4,
+    /// Save: indirect blob encode + allocate + device DMA (per
+    /// publish-class indirect save; 0 on inline-map venues).
+    BlobWrite = 5,
+    /// Save: the backend commit call — DLM I-guard + inode read + tx
+    /// stage + journal-conveyor commit (per publish-class save).
+    MetaCommit = 6,
+    /// Op enqueue → own batch terminal fan-out (per op): the publish
+    /// span each pipelined block pays — the pipeline `publish` twin.
+    Total = 7,
+}
+
+const PUBLISH_PHASES: usize = 8;
+const PUBLISH_PHASE_NAMES: [&str; PUBLISH_PHASES] = [
+    "queue_wait",
+    "lock_wait",
+    "base_fetch",
+    "apply",
+    "save_encode",
+    "blob_write",
+    "meta_commit",
+    "total",
+];
+
+static PUBLISH_PROF: Lazy<[LatencyHistogram; PUBLISH_PHASES]> =
+    Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
+
+/// Record one publish span started at `t0` against `phase` (always-on;
+/// see the module block above for the cost contract).
+#[inline]
+pub fn publish_phase_record(phase: PublishPhase, t0: std::time::Instant) {
+    PUBLISH_PROF[phase as usize].record(t0.elapsed());
+}
+
+/// `publish_phase_ns` stats payload: `{phase: histogram}` — surfaced
+/// UNGATED on the stats inode.
+pub fn publish_phase_json() -> serde_json::Value {
+    let mut phases = serde_json::Map::new();
+    for (pi, pname) in PUBLISH_PHASE_NAMES.iter().enumerate() {
+        phases.insert((*pname).to_string(), PUBLISH_PROF[pi].to_json());
+    }
+    serde_json::Value::Object(phases)
+}
+
+// ===========================================================================
 // Read-serve residence decomposition (`read_serve_phase_ns` +
 // `read_fill_phase_ns`) — the 2026-08-01 serve-latency decomposition
 // campaign's read-side instrument (`tests/read_serve_phase_tests.rs`;
@@ -2848,6 +2934,41 @@ pub struct Metrics {
     /// engagement instrument: a streaming row is INVALID unless this
     /// accounts for its published blocks).
     pub layout_publish_batched_blocks: Align64<AtomicU64>,
+    // Publish decomposition ledgers (rewrite-publish-drain campaign,
+    // 2026-08-01 — `tests/publish_phase_tests.rs`). The base-provenance
+    // pair closes EXACTLY against the pass count (`publish_phase_ns`
+    // lock_wait spans): every publish pass resolves exactly one RMW
+    // base.
+    /// Publish passes whose RMW base was the dirty RAM authority (the
+    /// fresh-stream posture: size-floor bumps mark the entry dirty
+    /// ahead of every publish).
+    pub publish_base_dirty_serves: Align64<AtomicU64>,
+    /// Publish passes whose RMW base needed a backend fetch (clean or
+    /// absent RAM entry — the rewrite posture: fold + decode + map
+    /// clone per pass, plus an indirect map rehydrate where the map
+    /// spilled). THE rewrite-publish conviction instrument.
+    pub publish_base_fetches: Align64<AtomicU64>,
+    // The full-save decision ledger: why a publish-class save fell off
+    // the O(batch) delta path (the write-commit-economy lever-2
+    // collapse). Growth here under rewrite names the constituent.
+    /// Publish-class full saves forced by an indirect map spill (the
+    /// whole blob rewrites per save — O(map) encode + device DMA).
+    pub publish_full_save_indirect: Align64<AtomicU64>,
+    /// Publish-class full saves forced by the delta chain cap
+    /// (`SQUEEZEFS_LAYOUT_DELTA_MAX_CHAIN` re-base — O(map) journal
+    /// bytes once per chain).
+    pub publish_full_save_chain_cap: Align64<AtomicU64>,
+    /// Publish-class full saves for every other reason (lever off,
+    /// JSON/indirect base provenance).
+    pub publish_full_save_other: Align64<AtomicU64>,
+    /// Bytes DMA'd to indirect map blobs by publish-class saves (the
+    /// `blob_write` phase's byte face).
+    pub publish_indirect_blob_bytes: Align64<AtomicU64>,
+    /// Indirect block-map rehydrates (whole-block device READS on the
+    /// meta-fetch path — publish-pass base fetches, cold meta reads).
+    pub layout_indirect_map_reads: Align64<AtomicU64>,
+    /// Bytes read by `layout_indirect_map_reads`.
+    pub layout_indirect_map_read_bytes: Align64<AtomicU64>,
     // Terminal-free device reclaim economy (the shim-write-amplification
     // fix — `.benchmarks/2026-07-27-shim-write-amplification.md`;
     // classification `routing::free_reclaim_op`, contract
@@ -5198,6 +5319,21 @@ impl SqueezefsFilesystem {
                 // commits; delta bytes = the collapsed O(batch) term).
                 "layout_publish_batches": METRICS.layout_publish_batches.load(Ordering::Relaxed),
                 "layout_publish_batched_blocks": METRICS.layout_publish_batched_blocks.load(Ordering::Relaxed),
+                // Publish decomposition (rewrite-publish-drain campaign,
+                // 2026-08-01): ALWAYS-ON per-phase histograms — conveyor
+                // wait → pass lock → RMW base resolve → apply → save
+                // encode → indirect blob write → meta commit → total —
+                // plus the base-provenance ledger (dirty_serves + fetches
+                // == passes, exact) and the full-save decision ledger.
+                "publish_phase_ns": publish_phase_json(),
+                "publish_base_dirty_serves": METRICS.publish_base_dirty_serves.load(Ordering::Relaxed),
+                "publish_base_fetches": METRICS.publish_base_fetches.load(Ordering::Relaxed),
+                "publish_full_save_indirect": METRICS.publish_full_save_indirect.load(Ordering::Relaxed),
+                "publish_full_save_chain_cap": METRICS.publish_full_save_chain_cap.load(Ordering::Relaxed),
+                "publish_full_save_other": METRICS.publish_full_save_other.load(Ordering::Relaxed),
+                "publish_indirect_blob_bytes": METRICS.publish_indirect_blob_bytes.load(Ordering::Relaxed),
+                "layout_indirect_map_reads": METRICS.layout_indirect_map_reads.load(Ordering::Relaxed),
+                "layout_indirect_map_read_bytes": METRICS.layout_indirect_map_read_bytes.load(Ordering::Relaxed),
                 "layout_delta_commits": crate::meta_backend::kv::META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed),
                 "layout_full_commits": crate::meta_backend::kv::META_KV_LAYOUT_FULL_COMMITS.load(Ordering::Relaxed),
                 "layout_delta_bytes": crate::meta_backend::kv::META_KV_LAYOUT_DELTA_BYTES.load(Ordering::Relaxed),

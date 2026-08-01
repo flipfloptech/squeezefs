@@ -5,7 +5,8 @@ pub const MAX_INLINE_SIZE: usize = 4096;
 
 use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::{
-    read_fill_phase_record, read_serve_phase_record, ReadFillPhase, ReadServePhase, METRICS,
+    publish_phase_record, read_fill_phase_record, read_serve_phase_record, PublishPhase,
+    ReadFillPhase, ReadServePhase, METRICS,
 };
 use crate::meta_backend::Metadata;
 use crate::stripe_locks::StripeLocks;
@@ -245,6 +246,10 @@ pub(crate) struct QueuedPublish {
     flip: LayoutFlip,
     fencing_token: u64,
     done: tokio::sync::oneshot::Sender<Result<Vec<String>>>,
+    /// Publish decomposition (2026-08-01): the op's enqueue instant —
+    /// `publish_phase_ns` queue_wait records at pass drain, total at
+    /// terminal fan-out.
+    enqueued_at: std::time::Instant,
 }
 
 /// `SQUEEZEFS_PUBLISH_COALESCE_MAX` cell: max block-publish ops drained
@@ -3136,6 +3141,17 @@ impl DataRouter {
                                 .backend_router
                                 .read_block(block_key, block_size)
                                 .await?;
+                            // Rewrite-publish-drain ledger (2026-08-01):
+                            // every indirect map rehydrate is a whole-
+                            // block device READ on the meta-fetch path —
+                            // publish-pass base fetches pay it per pass
+                            // on spilled maps.
+                            METRICS
+                                .layout_indirect_map_reads
+                                .fetch_add(1, Ordering::Relaxed);
+                            METRICS
+                                .layout_indirect_map_read_bytes
+                                .fetch_add(raw_bytes.len() as u64, Ordering::Relaxed);
                             // Rehydrate the persisted key strings VERBATIM:
                             // they are backend-true (`persist_block_key`
                             // output) and must resolve to the same device
@@ -3213,6 +3229,11 @@ impl DataRouter {
             });
         }
 
+        // Publish decomposition (2026-08-01): per-save spans record on
+        // publish-class saves only (the pipeline hot path under test) —
+        // plain layout persists stay unrecorded.
+        let is_publish = publish_entries.is_some();
+        let t_encode = std::time::Instant::now();
         let mut old_indirect_to_free = None;
         // The layout as it would be persisted INLINE (block map retained under
         // the inline sentinel). The indirect branch below overwrites the map /
@@ -3245,10 +3266,14 @@ impl DataRouter {
                 > backend
                     .xattr_value_cap(ino)
                     .saturating_sub(LAYOUT_INLINE_HEADROOM);
+        if is_publish {
+            publish_phase_record(PublishPhase::SaveEncode, t_encode);
+        }
 
         // PR VL6a: a freshly allocated indirect blob is registered
         // in-flight until this function's `set_layout_and_size` publishes
         // the layout naming it (the guard drops at function end).
+        let t_blob = std::time::Instant::now();
         let mut _blob_inflight: Option<crate::block_allocator::InflightAllocGuard> = None;
         let bytes = if needs_indirect {
             let bm = m.block_map.as_ref().unwrap();
@@ -3320,17 +3345,25 @@ impl DataRouter {
 
             let block_key = self.backend_router.persist_block_key(&be_id, offset);
             let data_bytes = bytes::Bytes::from(serialized_map);
+            let blob_len = data_bytes.len() as u64;
             nvme_writer.write_block(offset, data_bytes).await?;
 
             layout.block_map = None;
             layout.block_map_id = Some(format!("indirect:{}", block_key));
 
-            bincode::serialize(&layout).map_err(|e| {
+            let out = bincode::serialize(&layout).map_err(|e| {
                 SqueezefsError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("Failed to serialize binary layout: {:?}", e),
                 ))
-            })?
+            })?;
+            if is_publish {
+                publish_phase_record(PublishPhase::BlobWrite, t_blob);
+                METRICS
+                    .publish_indirect_blob_bytes
+                    .fetch_add(blob_len, Ordering::Relaxed);
+            }
+            out
         } else {
             // Collapsing back to (or staying) inline: free any old indirect
             // block; the inline layout value is already serialized above.
@@ -3356,6 +3389,7 @@ impl DataRouter {
                 .block_map_id
                 .as_deref()
                 .is_some_and(|id| id.starts_with("indirect:"));
+        let t_commit = std::time::Instant::now();
         let delta_used = if delta_eligible {
             let delta = crate::layout_wire::LayoutDelta::from_final_state(
                 &layout.file_type,
@@ -3375,6 +3409,27 @@ impl DataRouter {
             backend.set_layout_and_size(ino, &bytes, m.size).await?;
             false
         };
+        if is_publish {
+            publish_phase_record(PublishPhase::MetaCommit, t_commit);
+            // The full-save decision ledger (2026-08-01): why a
+            // publish-class save fell off the O(batch) delta path —
+            // rewrite-tax attribution. `delta_used` (not the caller-half
+            // eligibility) is the arbiter so backend-half refusals land
+            // in the ledger too.
+            if !delta_used {
+                let ctr = if needs_indirect {
+                    &METRICS.publish_full_save_indirect
+                } else if max_chain > 0
+                    && m.layout_delta_chain != LAYOUT_DELTA_CHAIN_INELIGIBLE
+                    && m.layout_delta_chain >= max_chain
+                {
+                    &METRICS.publish_full_save_chain_cap
+                } else {
+                    &METRICS.publish_full_save_other
+                };
+                ctr.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         // Keep hot cache coherent without a remove+refetch on the next write.
         let mut cached = m.clone();
         // Chain accounting (the caller half of the eligibility ladder):
@@ -6463,6 +6518,7 @@ impl DataRouter {
                 flip,
                 fencing_token,
                 done,
+                enqueued_at: std::time::Instant::now(),
             },
             blocks,
         );
@@ -6555,6 +6611,12 @@ impl DataRouter {
     /// [`Self::merge_block_mappings`]'s `Merge` arm, applied N times
     /// under ONE `INODE_META_LOCKS` section, persisted with ONE save.
     async fn publish_pass(&self, ino: u64, batch: Vec<QueuedPublish>) {
+        // Publish decomposition (2026-08-01): queue_wait per drained op,
+        // recorded BEFORE the test-delay seam (the seam models commit
+        // latency, not queue residence).
+        for op in &batch {
+            publish_phase_record(PublishPhase::QueueWait, op.enqueued_at);
+        }
         // Test seam (the `TEST_TIER_PUBLISH_DELAY_MS` pattern — one
         // relaxed load, zero-cost when unset, no `#[cfg(test)]` fork):
         // an artificial pass delay reproduces the field's ms-scale
@@ -6564,7 +6626,9 @@ impl DataRouter {
         if delay > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
         }
+        let t_lock = std::time::Instant::now();
         let _map_guard = meta_lock_acquire(ino).await;
+        publish_phase_record(PublishPhase::LockWait, t_lock);
 
         // Fan an unclonable error out to every waiter, preserving the
         // fencing classification (`pipeline_disposition` keys on it).
@@ -6583,37 +6647,61 @@ impl DataRouter {
         }
 
         // RMW base — the dirty-authority rule, verbatim from the direct
-        // primitive (FIND-RW5-A face 5).
+        // primitive (FIND-RW5-A face 5). Base-provenance ledger
+        // (2026-08-01): dirty serve vs backend fetch, exactly one per
+        // pass — the rewrite-publish conviction instrument (fresh
+        // streams ride dirty RAM; rewrites re-fetch per pass today).
+        let t_base = std::time::Instant::now();
         let mut current = match self.metadata_cache.get(&ino) {
-            Some(m) if m.layout_dirty => m,
-            cached => match self.fetch_metadata_from_backend(ino).await {
-                Ok(Some(m)) => m,
-                Ok(None) => cached.unwrap_or_default(),
-                Err(e) => {
-                    for op in batch {
-                        let _ = op.done.send(Err(dup_err(&e)));
+            Some(m) if m.layout_dirty => {
+                METRICS
+                    .publish_base_dirty_serves
+                    .fetch_add(1, Ordering::Relaxed);
+                m
+            }
+            cached => {
+                METRICS.publish_base_fetches.fetch_add(1, Ordering::Relaxed);
+                match self.fetch_metadata_from_backend(ino).await {
+                    Ok(Some(m)) => m,
+                    Ok(None) => cached.unwrap_or_default(),
+                    Err(e) => {
+                        publish_phase_record(PublishPhase::BaseFetch, t_base);
+                        for op in batch {
+                            publish_phase_record(PublishPhase::Total, op.enqueued_at);
+                            let _ = op.done.send(Err(dup_err(&e)));
+                        }
+                        return;
                     }
-                    return;
                 }
-            },
+            }
         };
+        publish_phase_record(PublishPhase::BaseFetch, t_base);
         let current_fencing = self.inner.dlm.get_fencing_token_ino(ino);
 
         // CoW publish (item A): held reader snapshots keep their map.
+        let t_apply = std::time::Instant::now();
         let mut block_map_arc = current.block_map.take().unwrap_or_default();
         let block_map = std::sync::Arc::make_mut(&mut block_map_arc);
-        let mut applied: Vec<(
-            tokio::sync::oneshot::Sender<Result<Vec<String>>>,
-            Vec<String>,
-        )> = Vec::new();
-        let mut fenced: Vec<(tokio::sync::oneshot::Sender<Result<Vec<String>>>, u64)> = Vec::new();
+        /// One op's terminal-fan-out bookkeeping (sender + per-op payload
+        /// + the enqueue instant for the `total` publish phase).
+        struct Outcome<T> {
+            done: tokio::sync::oneshot::Sender<Result<Vec<String>>>,
+            payload: T,
+            enqueued_at: std::time::Instant,
+        }
+        let mut applied: Vec<Outcome<Vec<String>>> = Vec::new();
+        let mut fenced: Vec<Outcome<u64>> = Vec::new();
         let mut batch_entries: Vec<(u32, String)> = Vec::new();
         let mut save_token = 0u64;
         for op in batch {
             // Per-op fencing: a stale op fails ALONE (the supersession
             // law); the batch's fresh members proceed.
             if op.fencing_token < current_fencing {
-                fenced.push((op.done, op.fencing_token));
+                fenced.push(Outcome {
+                    done: op.done,
+                    payload: op.fencing_token,
+                    enqueued_at: op.enqueued_at,
+                });
                 continue;
             }
             let mut displaced: Vec<String> = Vec::new();
@@ -6647,7 +6735,11 @@ impl DataRouter {
                 .layout_publish_batched_blocks
                 .fetch_add(op.entries.len() as u64, Ordering::Relaxed);
             batch_entries.extend(op.entries.iter().cloned());
-            applied.push((op.done, displaced));
+            applied.push(Outcome {
+                done: op.done,
+                payload: displaced,
+                enqueued_at: op.enqueued_at,
+            });
         }
         // The freshest RAM size floor (writes publish size to the RAM
         // cache ahead of the deferred layout commit — a merge must not
@@ -6658,9 +6750,11 @@ impl DataRouter {
             }
         }
         current.block_map = Some(block_map_arc);
-        for (done, token) in fenced {
-            let _ = done.send(Err(SqueezefsError::FencingTokenExpired {
-                token,
+        publish_phase_record(PublishPhase::Apply, t_apply);
+        for o in fenced {
+            publish_phase_record(PublishPhase::Total, o.enqueued_at);
+            let _ = o.done.send(Err(SqueezefsError::FencingTokenExpired {
+                token: o.payload,
                 expected: current_fencing,
             }));
         }
@@ -6675,13 +6769,15 @@ impl DataRouter {
             .await
         {
             Ok(()) => {
-                for (done, displaced) in applied {
-                    let _ = done.send(Ok(displaced));
+                for o in applied {
+                    publish_phase_record(PublishPhase::Total, o.enqueued_at);
+                    let _ = o.done.send(Ok(o.payload));
                 }
             }
             Err(e) => {
-                for (done, _) in applied {
-                    let _ = done.send(Err(dup_err(&e)));
+                for o in applied {
+                    publish_phase_record(PublishPhase::Total, o.enqueued_at);
+                    let _ = o.done.send(Err(dup_err(&e)));
                 }
             }
         }

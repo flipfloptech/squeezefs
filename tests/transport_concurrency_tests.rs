@@ -127,14 +127,6 @@ fn possible_cpus() -> u64 {
     n as u64
 }
 
-/// The normative L1 depth policy, mirrored test-side (the conformance
-/// contract): env override wins verbatim; otherwise desired 32 degraded
-/// to the payload-buffer cap with the pre-L1 floor of 4 — through the
-/// variable-ent mirror above.
-fn expected_depth(queues: u64, cap_bytes: u64, env_depth: Option<u64>) -> u64 {
-    expected_geometry(queues, cap_bytes, env_depth).1
-}
-
 /// The normative L1 buffer-cap policy: min(budget / 8, 2 GiB).
 fn expected_cap(budget_bytes: u64) -> u64 {
     (budget_bytes / 8).min(2 * GIB)

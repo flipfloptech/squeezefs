@@ -156,7 +156,11 @@ impl Drop for Mount {
 
 /// Format + mount a sandbox volume (default 4M block size unless
 /// `block_size` says otherwise) with per-child env.
-fn try_mount_fs(tag: &str, envs: &[(&str, &str)], block_size: Option<&str>) -> Result<Mount, String> {
+fn try_mount_fs(
+    tag: &str,
+    envs: &[(&str, &str)],
+    block_size: Option<&str>,
+) -> Result<Mount, String> {
     let bin = env!("CARGO_BIN_EXE_squeezefs");
     let base = std::env::temp_dir().join(format!("sqfs_geom_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
@@ -228,13 +232,7 @@ fn try_mount_fs(tag: &str, envs: &[(&str, &str)], block_size: Option<&str>) -> R
         if std::fs::read_to_string(mount.mnt.join(".stats")).is_ok() {
             return Ok(mount);
         }
-        if let Some(status) = mount
-            .child
-            .try_wait()
-            .ok()
-            .flatten()
-            .map(|s| s.to_string())
-        {
+        if let Some(status) = mount.child.try_wait().ok().flatten().map(|s| s.to_string()) {
             return Err(format!(
                 "mount daemon exited ({status}) before ready; log:\n{}",
                 std::fs::read_to_string(&mount.log).unwrap_or_default()
@@ -282,9 +280,7 @@ fn test_default_mount_gauges_negotiated_write_geometry() {
     );
     assert_eq!(
         mount.metric(&stats, "transport_payload_buffer_bytes"),
-        mount.metric(&stats, "transport_queues")
-            * mount.metric(&stats, "transport_q_depth")
-            * mw,
+        mount.metric(&stats, "transport_queues") * mount.metric(&stats, "transport_q_depth") * mw,
         "ent payload size must equal the negotiated max_write (ample budget)"
     );
 

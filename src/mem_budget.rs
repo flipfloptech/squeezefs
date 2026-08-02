@@ -963,7 +963,24 @@ pub fn spawn_sampler() {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            MEM_BUDGET.tick();
+            tick_off_thread().await;
         }
     });
+}
+
+/// RES-11 (pre-RC engineering spec §7): run one [`MemBudget::tick`] OFF
+/// the async workers.
+///
+/// The tick reads procfs (`/proc/self/statm`, the cgroup memory files),
+/// calls every registered gauge closure, and — on a Red tick — runs
+/// `arena.4096.purge`, a full jemalloc all-arena purge. That is tens of
+/// milliseconds of uninterruptible syscall-heavy work, once per second,
+/// and the pre-fix sampler ran it on a tokio worker *precisely when the
+/// daemon is under memory pressure* and every handler sharing that
+/// worker is the thing being measured.
+///
+/// Awaited, so ticks never overlap: the hysteresis ladder, the backstop
+/// sustain count and the shed pass are all single-tick state machines.
+pub async fn tick_off_thread() {
+    let _ = tokio::task::spawn_blocking(|| MEM_BUDGET.tick()).await;
 }

@@ -646,8 +646,17 @@ enum Commands {
         iterations: usize,
     },
     /// Clone a file metadata-only (instant Copy-on-Write cloning)
+    ///
+    /// Runs offline under the exclusive writer guard (refused while the
+    /// set is mounted): the clone's map names the source's blocks and
+    /// their reference counts rise — no data is copied. A file whose
+    /// payload is still in a mount's local staging cannot be cloned
+    /// offline; clone it on the live mount (`cp --reflink=always`).
     Clone {
-        /// Optional Metadata URI (sqmeta://...)
+        /// Metadata URI (sqmeta://...) — required
+        ///
+        /// Both paths resolve through this metadata set, and the
+        /// writer guard is taken over it for the clone's duration.
         #[arg(
             long,
             short = 'g',
@@ -1518,15 +1527,6 @@ static DAEMON_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32:
 
 const FUSE_IO_URING_SQPOLL_IDLE_MS_ENV: &str = "SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS";
 const FUSE_IO_URING_SQPOLL_CPU_ENV: &str = "SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU";
-
-fn get_default_staging_dir() -> PathBuf {
-    let uid = unsafe { libc::getuid() };
-    if uid == 0 {
-        PathBuf::from("/tmp/squeezefs_staging")
-    } else {
-        PathBuf::from(format!("/tmp/squeezefs_staging_{}", uid))
-    }
-}
 
 /// Resolve the mountpoint from the `mount` CLI shape: the first positional
 /// when `--meta-lv` supplies the volumes, else the last. `None` when the
@@ -4906,66 +4906,26 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             src,
             dest,
         } => {
-            let fs_name = "squeezefs".to_string();
-            squeezefs::set_fs_prefix(&fs_name);
-            let staging_dirs = vec![get_default_staging_dir()];
-
-            // D0 single-writer guard preflight (RW2 audit,
-            // docs/design-random-small-writes.md §5.1): this offline verb
-            // builds a THROWAWAY allocator whose RAM refcounts a live
-            // daemon never sees — cloning under a live write mount could
-            // pin nothing and alias blocks the daemon concurrently frees.
-            // Opening each meta volume takes the same flock + writer_claim
-            // the daemon holds: a live writer makes this REFUSE loudly
-            // (never bypass), and on success the held guards exclude a
-            // racing mount for the clone's duration.
-            let mut _writer_guards = Vec::new();
-            if let Some(uri) = meta_uri.as_deref() {
-                for path in parse_block_uri(uri, "sqmeta://")? {
-                    let be = squeezefs::meta_backend::kv::backend::KvMetaBackend::open(
-                        std::path::Path::new(&path),
-                    )
-                    .await
-                    .map_err(|e| {
-                        format!(
-                            "clone refused: meta volume '{path}' is not exclusively \
-                             claimable (a live writer may hold it — the single-writer \
-                             guard forbids offline clones under a live write mount): {e}"
-                        )
-                    })?;
-                    _writer_guards.push(be);
-                }
-            }
-
-            let dlm = DlmClient::new()?;
-
-            // Reconstruct block allocator and nvme block dev for clone operation
-            let block_alloc = std::sync::Arc::new(
-                squeezefs::block_allocator::BlockAllocator::new(&fs_name).await?,
+            squeezefs::set_fs_prefix("squeezefs");
+            // The metadata set is NOT optional: both paths are resolved
+            // through it, and the D0 single-writer guard is taken over it
+            // (RW2 audit, docs/design-random-small-writes.md §5.1 — an
+            // unguarded clone could pin nothing and alias blocks a live
+            // daemon concurrently frees). Without it there is literally
+            // nothing to clone, which is exactly how this verb spent its
+            // life exiting 0 having done nothing.
+            let uri = meta_uri.ok_or_else(|| {
+                "Error: no metadata volume specified — pass sqmeta://<meta_dev>[,<meta_dev>…] \
+                 (or set SQUEEZEFS_META_URI). `clone` resolves both paths through the \
+                 metadata set and takes the single-writer guard over it."
+                    .to_string()
+            })?;
+            let meta_lvs = parse_block_uri(&uri, "sqmeta://")?;
+            println!(
+                "Cloning file from {} to {} (metadata-only CoW)...",
+                src, dest
             );
-
-            let nvme_path = format!("{}/.squeezefs_nvme", staging_dirs[0].display());
-            let nvme_dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(&nvme_path));
-
-            let cache = TieredCache::new(
-                staging_dirs,
-                None,
-                None,
-                None,
-                None,
-                block_alloc.clone(),
-                nvme_dev.clone(),
-                // Offline tool without a metadata volume set: no filesystem
-                // generation to bind — adopt existing staging untouched.
-                None,
-            )
-            .await?;
-            let router = DataRouter::new(dlm, cache, block_alloc.clone(), nvme_dev.clone());
-
-            // Runs purely offline: the bare router's placement table
-            // serves the `backend_0` default slot.
-            println!("Cloning file from {} to {}...", src, dest);
-            router.clone_path(&src, &dest).await?;
+            squeezefs::config_ops::clone_path_offline(&meta_lvs, &src, &dest).await?;
             println!("File cloned successfully.");
         }
         Commands::Df {

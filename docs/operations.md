@@ -434,9 +434,9 @@ squeezefs tune
   ```bash
   squeezefs umount <mountpoint> [--force]
   ```
-* **Instant metadata clone (CoW)**:
+* **Instant metadata clone (CoW)** — OFFLINE and D0-guarded (like every offline mutating verb: refused while the set is mounted). The `sqmeta://` URI is **required** — both paths are resolved through the metadata set, and the single-writer guard is taken over it for the clone's duration. Metadata-only: the clone's map names the source's blocks and their refcounts rise; not one data byte is copied. A **staged** source is refused loudly (its acked payload lives in the mount's isolated staging, which the offline coordinator never opens) — clone those through a live mount (`cp --reflink=always`, which rides `copy_file_range`):
   ```bash
-  squeezefs clone <src> <dest>
+  squeezefs clone -g sqmeta://<meta_dev>[,<meta_dev>…] <src> <dest>
   ```
 * **Storage pools & volumes (LVM)**:
   ```bash

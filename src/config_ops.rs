@@ -1004,6 +1004,93 @@ async fn offline_drain_body(
     }
 }
 
+/// `squeezefs clone <src> <dest>` — the OFFLINE, D0-guarded, instant
+/// copy-on-write clone (metadata duplicated, block refcounts
+/// incremented, not one data byte copied).
+///
+/// The verb was a **silent no-op** before this function existed: the CLI
+/// arm built a bare `DataRouter` with no metadata backend, so
+/// `resolve_path_to_inode` short-circuited to ino 1 and `clone_path`'s
+/// whole body (an `if let Some(backend) = …`) was skipped — it printed
+/// success having created nothing (`tests/cli_clone_tests.rs`).
+///
+/// Posture, identical to the sibling offline mutating verbs
+/// (`volume remove-data`, `fsck --repair`, `defrag` offline):
+///
+/// * the format preflight refuses loudly under a **live mount** (a
+///   throwaway allocator's RAM refcounts a live daemon never sees could
+///   pin nothing and alias blocks the daemon concurrently frees);
+/// * [`crate::meta_backend::open_routed_meta_set`] takes the **D0
+///   claims** (flock + PR + `writer_claim`) for the clone's duration —
+///   unconditionally, not only when a flag happens to be passed;
+/// * `defrag::build_offline_router` (private) wires the mount-shaped data
+///   plane (the recorded data volumes, the block-size, allocator
+///   **refcount recovery** — without which every striped pin refuses as
+///   untracked and the clone would fail loud instead of sharing blocks);
+/// * a **staged** source refuses loudly: its acked payload lives in the
+///   mount's per-mount-isolated staging, which this coordinator
+///   deliberately never opens (the `remove-data` staging note), so
+///   cloning it would mint a zero-filled "successful" clone.
+pub async fn clone_path_offline(meta_lvs: &[String], src: &str, dest: &str) -> Result<()> {
+    for path in meta_lvs {
+        crate::meta_backend::kv::builder::format_preflight(Path::new(path), true)
+            .await
+            .map_err(|e| {
+                SqueezefsError::InvalidOperation(format!(
+                    "clone refused: metadata volume '{path}' is not exclusively claimable \
+                     (a live writer may hold it — the single-writer guard forbids offline \
+                     clones under a live write mount): {e}"
+                ))
+            })?;
+    }
+    let routed = crate::meta_backend::open_routed_meta_set(meta_lvs).await?;
+    let result = clone_offline_body(&routed, meta_lvs, src, dest).await;
+    for vol in &routed.volumes {
+        if let Err(e) = vol.shutdown().await {
+            log::warn!("releasing guard after offline clone: {e}");
+        }
+    }
+    result
+}
+
+/// [`clone_path_offline`]'s body, split so the D0 guards are released on
+/// every path.
+async fn clone_offline_body(
+    routed: &std::sync::Arc<crate::meta_backend::RoutedMetaBackend>,
+    meta_lvs: &[String],
+    src: &str,
+    dest: &str,
+) -> Result<()> {
+    let router = crate::defrag::build_offline_router(routed, meta_lvs).await?;
+    // Resolve the source FIRST: a missing path must refuse loudly (the
+    // no-op verb "succeeded" on every nonexistent source).
+    let src_ino = router.resolve_path_to_inode(src).await.map_err(|e| {
+        SqueezefsError::InvalidOperation(format!("clone source '{src}' cannot be resolved: {e}"))
+    })?;
+    if src_ino == 1 {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "clone source '{src}' resolves to the filesystem root — name a file"
+        )));
+    }
+    let meta = router
+        .fetch_metadata(crate::keys::inode_path(src_ino).as_str())
+        .await?;
+    if meta.file_type == "staged" {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "clone source '{src}' carries a STAGED layout: its acked payload lives in the \
+             mount's isolated staging, which the offline coordinator never opens (cloning \
+             it would mint a zero-filled clone). Clone it through a live mount \
+             (`cp --reflink=always`, which rides copy_file_range) or flush/promote the \
+             file first"
+        )));
+    }
+    let out = router.clone_path(src, dest).await;
+    // Claim-release law (the `remove-data` tail): return every queued
+    // device range BEFORE the caller releases the D0 claims.
+    router.backend_router.reclaim_drain().await;
+    out
+}
+
 /// The shared durable tail of every offline lifecycle commit: guarded
 /// open of the whole set (D0 claims — excludes racing mounts for the
 /// commit's duration), **bit 3 on every member superblock first**, then

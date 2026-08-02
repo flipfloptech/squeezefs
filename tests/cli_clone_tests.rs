@@ -183,10 +183,14 @@ async fn open_fixture(meta_path: &Path, recs: &[DataVolumeRecord]) -> Fx {
     }
     router.backend_router.set_volume_records(recs.to_vec());
 
-    let kv = squeezefs::meta_backend::kv::backend::KvMetaBackend::open(meta_path)
+    // The MOUNT's open (not the in-RAM `RoutedMetaBackend::new`
+    // constructor): the derived routing width + mint spread decide which
+    // global inos this process mints, and the binary under test opens the
+    // same way — a fixture on the identity map would route the verb's
+    // freshly minted global ino to a nonexistent local one.
+    let routed = squeezefs::meta_backend::open_routed_meta_set(&[meta_path.display().to_string()])
         .await
-        .expect("open meta volume");
-    let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![kv]));
+        .expect("routed open of the meta set");
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
     fs.router.set_meta_backend(routed.clone());
     fs.meta_backend = Some(routed.clone());
@@ -269,12 +273,17 @@ impl Fx {
     }
 
     async fn lookup(&self, name: &str) -> Option<u64> {
-        self.meta
-            .lookup(1, name)
-            .await
-            .ok()
-            .map(|inode| inode.ino)
-            .filter(|&ino| ino != 0)
+        match self.meta.lookup(1, name).await {
+            Ok(inode) if inode.ino != 0 => Some(inode.ino),
+            Ok(inode) => {
+                eprintln!("lookup({name}) returned ino {}", inode.ino);
+                None
+            }
+            Err(e) => {
+                eprintln!("lookup({name}) failed: {e:?}");
+                None
+            }
+        }
     }
 }
 
@@ -336,7 +345,11 @@ async fn test_cli_clone_verb_produces_a_real_cow_clone() {
         let fx = open_fixture(&meta, &recs).await;
         let (ino, expected) = build_striped_source(&fx, "src.bin", 2).await;
         let map = fx.mappings(ino).await;
-        assert_eq!(map.len(), 2, "source must be striped over 2 blocks: {map:?}");
+        assert_eq!(
+            map.len(),
+            2,
+            "source must be striped over 2 blocks: {map:?}"
+        );
         for (_, mapping) in &map {
             assert_eq!(
                 fx.refcount_of(mapping),
@@ -496,17 +509,9 @@ async fn test_cli_clone_staged_source_refuses_loudly() {
             .attr
             .ino;
         let data = pattern(8192, 0x11);
-        fs.write(
-            req(),
-            ino,
-            0,
-            0,
-            bytes::Bytes::copy_from_slice(&data),
-            0,
-            0,
-        )
-        .await
-        .expect("staged write");
+        fs.write(req(), ino, 0, 0, bytes::Bytes::copy_from_slice(&data), 0, 0)
+            .await
+            .expect("staged write");
         fs.fsync(req(), ino, 0, false).await.expect("fsync");
         let meta_snapshot = fs
             .router

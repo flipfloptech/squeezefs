@@ -716,6 +716,9 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                         response: UringResponse::Write { tx },
                         free_ptr: None,
                         _keep_alive: None,
+                        // MEM-1: a barrier carries no payload destination,
+                        // so it owns no §5.4 lease token.
+                        dest_token: None,
                     });
                     let flags = if datasync {
                         types::FsyncFlags::DATASYNC
@@ -1051,10 +1054,7 @@ impl NvmeBlockDev {
                 let (tx, rx) = oneshot::channel();
                 self.worker
                     .sender()
-                    .try_send(UringRequest::Fsync {
-                        datasync: true,
-                        tx,
-                    })
+                    .try_send(UringRequest::Fsync { datasync: true, tx })
                     .map_err(|e| {
                         crate::fuse_client::METRICS
                             .uring_queue_full

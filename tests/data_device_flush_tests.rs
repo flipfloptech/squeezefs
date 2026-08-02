@@ -128,9 +128,7 @@ fn test_write_cache_probe_classifies_honestly() {
         WriteCacheClass::FileBacked
     );
     assert_eq!(
-        squeezefs::write_cache::probe_data_volume(std::path::Path::new(
-            "/nonexistent/data/volume"
-        )),
+        squeezefs::write_cache::probe_data_volume(std::path::Path::new("/nonexistent/data/volume")),
         WriteCacheClass::Unknown
     );
     // sysfs `queue/write_cache` strings, verbatim.

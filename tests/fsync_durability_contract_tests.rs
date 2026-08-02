@@ -63,7 +63,7 @@ async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
     // this suite pins, not the W1 in-place patch (at production block
     // sizes a 1 MiB write into a 4 MiB block is patch-oversize anyway).
     squeezefs::fuse_client::set_patch_max_bytes(0);
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
@@ -72,11 +72,7 @@ async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         b.path().to_str().unwrap(),
     ));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), alloc_ns)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(alloc_ns).await.unwrap());
     let s = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -84,7 +80,6 @@ async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
         Some("64MB"),
         Some("16MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,
@@ -300,7 +295,12 @@ async fn test_data_barrier_precedes_the_metadata_barrier() {
     let patch = pattern(HALF as usize, 0x77);
     write_at(&h, ino, 4 * BS, &patch).await;
 
-    let dev_path = h.fs.router.backend_router.default_device.device_path.clone();
+    let dev_path =
+        h.fs.router
+            .backend_router
+            .default_device
+            .device_path
+            .clone();
     squeezefs::dev_power_cut::arm_barrier_error(&dev_path, libc::EIO);
     let m0 = METRICS.meta_device_syncs.load(Ordering::Relaxed);
 

@@ -99,7 +99,7 @@ async fn make(uuid: [u8; 16], ns: &str) -> H {
     // The read-lane hold would serve a completed fill from RAM after the
     // cut — this suite must read the DEVICE.
     std::env::set_var("SQUEEZEFS_READ_LANE", "0");
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
@@ -107,9 +107,7 @@ async fn make(uuid: [u8; 16], ns: &str) -> H {
         .unwrap();
     let dev_path = b.path().to_str().unwrap().to_string();
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(&dev_path));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), ns).await.unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(ns).await.unwrap());
     let s = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -117,7 +115,6 @@ async fn make(uuid: [u8; 16], ns: &str) -> H {
         Some("64MB"),
         Some("16MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

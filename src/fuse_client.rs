@@ -2359,9 +2359,7 @@ enum FlushDriver {
 impl FlushDriver {
     fn staging_put_bytes_counter(self) -> &'static AtomicU64 {
         match self {
-            FlushDriver::FsyncClose | FlushDriver::FsyncDurable => {
-                &METRICS.staging_put_bytes_flush
-            }
+            FlushDriver::FsyncClose | FlushDriver::FsyncDurable => &METRICS.staging_put_bytes_flush,
             FlushDriver::ParkedDrain => &METRICS.staging_put_bytes_drain,
         }
     }

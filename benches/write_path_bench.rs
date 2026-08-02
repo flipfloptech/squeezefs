@@ -78,11 +78,13 @@ fn bench_flush_coalescing(c: &mut Criterion) {
 
     group.bench_function("flush_serial", |b| {
         let dev = dev.clone();
-        b.to_async(&rt)
-            .iter(|| {
-                let dev = dev.clone();
-                async move { black_box(dev.flush().await.expect("barrier")) }
-            });
+        b.to_async(&rt).iter(|| {
+            let dev = dev.clone();
+            async move {
+                dev.flush().await.expect("barrier");
+                black_box(&dev);
+            }
+        });
     });
 
     // N concurrent callers per iteration: the coalescing width. The

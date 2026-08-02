@@ -22,7 +22,7 @@
 //!   (DUR-2's `Fsync { DATASYNC }` op) covers everything journaled before
 //!   it started; covered entries leave the journal and the device's
 //!   barrier **epoch** advances;
-//! * **cut** — [`power_cut`] restores, in reverse admission order,
+//! * **cut** — [`power_cut()`](crate::dev_power_cut::power_cut) restores, in reverse admission order,
 //!   everything still uncovered, then settles the bytes. The caller must
 //!   have quiesced the device (no in-flight I/O), exactly as a crash
 //!   point does.
@@ -34,10 +34,10 @@
 //!
 //! ## Cost when disarmed
 //!
-//! One relaxed atomic load per submitted write ([`ARMED`], the
-//! `uring_fs::FAULTS_ACTIVE` precedent). Nothing else runs, nothing is
+//! One relaxed atomic load per submitted write (the private `ARMED`
+//! flag — the `uring_fs::FAULTS_ACTIVE` precedent). Nothing else runs, nothing is
 //! allocated, no fd is opened. Arming is available in-process
-//! ([`arm_power_cut`], the shim's API shape) or — the
+//! ([`arm_power_cut()`](crate::dev_power_cut::arm_power_cut), the shim's API shape) or — the
 //! `SQUEEZEFS_TEST_WRITE_STALL_MS` precedent, read ONCE per worker and
 //! never in production — via `SQUEEZEFS_TEST_POWER_CUT_DEVS`, a
 //! comma-separated device-path list armed as each worker starts.
@@ -98,8 +98,7 @@ struct DevJournal {
     barriers: Vec<BarrierRec>,
 }
 
-static STATE: Lazy<Mutex<HashMap<PathBuf, DevJournal>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static STATE: Lazy<Mutex<HashMap<PathBuf, DevJournal>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Begin volatile-cache tracking on `device_path`: every subsequent write
 /// the `NvmeBlockDev` worker submits is captured (original bytes) until a
@@ -158,11 +157,7 @@ fn note_write_cold(device_path: &str, offset: u64, len: usize) {
     if let Some(j) = st.get_mut(path) {
         let seq = j.next_seq;
         j.next_seq += 1;
-        j.entries.push(Entry {
-            seq,
-            offset,
-            prior,
-        });
+        j.entries.push(Entry { seq, offset, prior });
     }
 }
 

@@ -1,7 +1,5 @@
 # SqueezeFS
 
-![SqueezeFS Header](github.jpeg)
-
 SqueezeFS is a high-performance distributed POSIX filesystem for Linux, built in Rust on `tokio` and `io_uring`. It decouples metadata from data: file metadata lives on dedicated block-based metadata volumes (**MetaLV**, a copy-on-write key/value store), while file contents are striped across local NVMe or NVMe-oF block devices. A FUSE client daemon exposes the filesystem — with no external database or coordination service — at bare-metal throughput.
 
 > **Concurrency scope, stated plainly.** What ships today is **one write mount per volume set**, enforced (not merely advised) by the single-writer mount guard: a second concurrent mount is refused loudly. The 15,000-node scale target is the design's destination, and the program to get there — read-only coherent mounts first, then multi-writer — is specified in `docs/pre-rc-engineering-spec.md` §6 with its staging plan and gates. Every capability claim in this README describes shipped behavior; roadmap items say so.

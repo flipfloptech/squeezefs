@@ -8,6 +8,9 @@
 # scratch repro harness (user-local, intentionally untracked)
 tests/ltp_repro.sh
 ltp_syscalls.results
+
+# fio verify-state artifacts (ENG-9)
+*-verify.state
 loom-models/target/
 dhat-heap.json
 

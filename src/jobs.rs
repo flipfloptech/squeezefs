@@ -56,6 +56,20 @@ const ROOT_INO: u64 = 1;
 const CHECKPOINT_TASKS: u64 = 256;
 const CHECKPOINT_SECS: u64 = 5;
 
+/// TEST SEAM (RES-7, `tests/job_worker_panic_tests.rs`): panic inside a
+/// `Noop` job after N tasks. One relaxed load per task, zero cost when
+/// unset, no `#[cfg(test)]` fork — the `TEST_PUBLISH_PASS_DELAY_MS` /
+/// `SQUEEZEFS_TEST_WRITE_STALL_MS` pattern. A worker panic is otherwise
+/// only reachable through a genuine bug, and load-dependent worker loss
+/// is exactly the class the guard must pin deterministically.
+static TEST_JOB_PANIC_AFTER: AtomicU64 = AtomicU64::new(0);
+
+/// Arm (`n > 0`) or disarm (`0`) the job-panic seam. Production never
+/// calls it.
+pub fn set_test_job_panic_after(n: u64) {
+    TEST_JOB_PANIC_AFTER.store(n, Ordering::Relaxed);
+}
+
 /// VL10 (G-VL-3 b): how many independent block moves an UNTHROTTLED
 /// drain/rebalance pass keeps in flight (join_all window). Each move is
 /// device-I/O-bound (read + write + verify-read per block); 4 overlaps
@@ -1836,6 +1850,11 @@ impl JobFabric {
             ctl.done.fetch_add(1, Ordering::Relaxed);
             METRICS.job_tasks_done.fetch_add(1, Ordering::Relaxed);
             since_checkpoint += 1;
+            // RES-7 test seam (see TEST_JOB_PANIC_AFTER).
+            let panic_after = TEST_JOB_PANIC_AFTER.load(Ordering::Relaxed);
+            if panic_after > 0 && ctl.done.load(Ordering::Relaxed) >= panic_after {
+                panic!("RES-7 test seam: injected job-worker panic");
+            }
 
             if since_checkpoint >= CHECKPOINT_TASKS
                 || last_checkpoint.elapsed() >= Duration::from_secs(CHECKPOINT_SECS)

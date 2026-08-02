@@ -3240,6 +3240,12 @@ pub struct Metrics {
     /// mover-class job per volume at a time; counted once per deferral
     /// episode — KD-6 idempotence makes queueing safe).
     pub job_serialized_waits: Align64<AtomicU64>,
+    /// RES-7 (pre-RC engineering spec §7): job executions that UNWOUND.
+    /// The worker survives (the claim is released, the record flips
+    /// `Failed` loudly), but the panic itself is a bug — **0 on a
+    /// healthy daemon**; any growth names a job type that panicked
+    /// instead of returning an error.
+    pub job_worker_panics: Align64<AtomicU64>,
     /// Drains self-paused by the §5.2 checkpoint-time capacity
     /// re-verification (state `paused-capacity`) instead of running the
     /// survivors to StorageFull.
@@ -5984,6 +5990,8 @@ impl SqueezefsFilesystem {
                 "job_copy_buffer_bytes": METRICS.job_copy_buffer_bytes.load(Ordering::Relaxed),
                 "job_paused_mem_pressure": METRICS.job_paused_mem_pressure.load(Ordering::Relaxed),
                 "job_serialized_waits": METRICS.job_serialized_waits.load(Ordering::Relaxed),
+                // RES-7: worker unwinds (must stay 0 on a healthy daemon).
+                "job_worker_panics": METRICS.job_worker_panics.load(Ordering::Relaxed),
                 "job_paused_capacity": METRICS.job_paused_capacity.load(Ordering::Relaxed),
                 "evacuate_blocks_moved": METRICS.evacuate_blocks_moved.load(Ordering::Relaxed),
                 "evacuate_bytes_moved": METRICS.evacuate_bytes_moved.load(Ordering::Relaxed),

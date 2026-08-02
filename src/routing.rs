@@ -2246,68 +2246,76 @@ impl BackendRouter {
         // left an immortal worker probing its dead device each tick.
         // Upgrading per tick lets the worker exit with its router.
         let weak = std::sync::Arc::downgrade(self);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
-            // Per-backend probe hysteresis: only FAILURE_THRESHOLD consecutive
-            // hard failures mark a backend unhealthy (a starved probe under
-            // saturation is inconclusive, never a flip — see crate::health).
-            let mut states: std::collections::HashMap<String, crate::health::HealthState> =
-                std::collections::HashMap::new();
-            loop {
-                interval.tick().await;
-                let Some(router) = weak.upgrade() else {
-                    return; // router dropped: exit, leak nothing
-                };
+        // RES-8: a panic in this LOOP ends backend health probing for
+        // the life of the mount — contained + counted.
+        tokio::spawn(crate::detached::contain(
+            "backend_health_worker",
+            async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                // Per-backend probe hysteresis: only FAILURE_THRESHOLD consecutive
+                // hard failures mark a backend unhealthy (a starved probe under
+                // saturation is inconclusive, never a flip — see crate::health).
+                let mut states: std::collections::HashMap<String, crate::health::HealthState> =
+                    std::collections::HashMap::new();
+                loop {
+                    interval.tick().await;
+                    let Some(router) = weak.upgrade() else {
+                        return; // router dropped: exit, leak nothing
+                    };
 
-                // Probe the default slot under the legacy `backend_0` name
-                // only on bare routers: on real mounts the first volume's
-                // device IS the default slot and is probed under its real
-                // name — a phantom probe would double-count it and leak the
-                // reserved alias into health state and logs.
-                let mut outcomes: Vec<(String, crate::health::Probe)> = Vec::new();
-                if router.backends.is_empty() {
-                    outcomes.push((
-                        "backend_0".to_string(),
-                        perform_device_health_check(&router.default_device).await,
-                    ));
-                }
-                for entry in router.backends.iter() {
-                    outcomes.push((
-                        entry.key().clone(),
-                        perform_device_health_check(&entry.value().device).await,
-                    ));
-                }
+                    // Probe the default slot under the legacy `backend_0` name
+                    // only on bare routers: on real mounts the first volume's
+                    // device IS the default slot and is probed under its real
+                    // name — a phantom probe would double-count it and leak the
+                    // reserved alias into health state and logs.
+                    let mut outcomes: Vec<(String, crate::health::Probe)> = Vec::new();
+                    if router.backends.is_empty() {
+                        outcomes.push((
+                            "backend_0".to_string(),
+                            perform_device_health_check(&router.default_device).await,
+                        ));
+                    }
+                    for entry in router.backends.iter() {
+                        outcomes.push((
+                            entry.key().clone(),
+                            perform_device_health_check(&entry.value().device).await,
+                        ));
+                    }
 
-                for (be_id, probe) in outcomes {
-                    let state = states.entry(be_id.clone()).or_default();
-                    match state.observe(probe) {
-                        crate::health::Transition::WentUnhealthy => {
-                            log::error!(
+                    for (be_id, probe) in outcomes {
+                        let state = states.entry(be_id.clone()).or_default();
+                        match state.observe(probe) {
+                            crate::health::Transition::WentUnhealthy => {
+                                log::error!(
                                 "Backend health check: backend '{}' is UNHEALTHY ({} consecutive probe failures)!",
                                 be_id,
                                 crate::health::HealthState::FAILURE_THRESHOLD
                             );
-                            router.unhealthy_backends.insert(be_id, true);
+                                router.unhealthy_backends.insert(be_id, true);
+                            }
+                            crate::health::Transition::Recovered => {
+                                log::info!(
+                                    "Backend health check: backend '{}' has recovered.",
+                                    be_id
+                                );
+                                router.unhealthy_backends.remove(&be_id);
+                            }
+                            crate::health::Transition::None => {}
                         }
-                        crate::health::Transition::Recovered => {
-                            log::info!("Backend health check: backend '{}' has recovered.", be_id);
-                            router.unhealthy_backends.remove(&be_id);
-                        }
-                        crate::health::Transition::None => {}
                     }
-                }
 
-                // §5.9: republish the placement snapshot every tick — the
-                // refresh cadence for fill drift, and the pickup point
-                // for probe-driven health transitions. Failover IS the
-                // republish: every write picks from this table
-                // (`get_active_backend`), so an unhealthy/Draining volume
-                // drops out of placement here — there is no sticky
-                // active-backend pointer to repoint (deleted with the
-                // KD-16 PlacementTable landing; it had no readers left).
-                router.refresh_placement_table();
-            }
-        });
+                    // §5.9: republish the placement snapshot every tick — the
+                    // refresh cadence for fill drift, and the pickup point
+                    // for probe-driven health transitions. Failover IS the
+                    // republish: every write picks from this table
+                    // (`get_active_backend`), so an unhealthy/Draining volume
+                    // drops out of placement here — there is no sticky
+                    // active-backend pointer to repoint (deleted with the
+                    // KD-16 PlacementTable landing; it had no readers left).
+                    router.refresh_placement_table();
+                }
+            },
+        ));
     }
 }
 
@@ -7120,33 +7128,39 @@ impl DataRouter {
             return;
         };
         let weak = std::sync::Arc::downgrade(&self.inner);
-        handle.spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                let Some(inner) = weak.upgrade() else { return };
-                let router = DataRouter { inner };
-                let now = epoch_coarse_ms();
-                let mut idle: Vec<u64> = Vec::new();
-                router.inner.rewrite_epochs.iter_sync(|ino, e| {
-                    if now.saturating_sub(e.last_record_ms.load(Ordering::Relaxed))
-                        >= EPOCH_IDLE_HORIZON_MS
-                    {
-                        idle.push(*ino);
+        // RES-8: a panic in this LOOP ends idle epoch closes for the
+        // life of the mount (RAM-only bindings then wait for an explicit
+        // fsync forever). Contained + counted.
+        handle.spawn(crate::detached::contain(
+            "rewrite_epoch_sweeper",
+            async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let Some(inner) = weak.upgrade() else { return };
+                    let router = DataRouter { inner };
+                    let now = epoch_coarse_ms();
+                    let mut idle: Vec<u64> = Vec::new();
+                    router.inner.rewrite_epochs.iter_sync(|ino, e| {
+                        if now.saturating_sub(e.last_record_ms.load(Ordering::Relaxed))
+                            >= EPOCH_IDLE_HORIZON_MS
+                        {
+                            idle.push(*ino);
+                        }
+                        true
+                    });
+                    for ino in idle {
+                        let token = router.inner.dlm.get_fencing_token_ino(ino);
+                        if let Err(e) = router.close_rewrite_epoch(ino, token).await {
+                            log::warn!("idle epoch close for ino {ino} failed: {e:?}");
+                        }
                     }
-                    true
-                });
-                for ino in idle {
-                    let token = router.inner.dlm.get_fencing_token_ino(ino);
-                    if let Err(e) = router.close_rewrite_epoch(ino, token).await {
-                        log::warn!("idle epoch close for ino {ino} failed: {e:?}");
-                    }
+                    // No Arc across the tick sleep.
+                    drop(router);
                 }
-                // No Arc across the tick sleep.
-                drop(router);
-            }
-        });
+            },
+        ));
     }
 
     pub async fn merge_block_mappings(
@@ -7427,9 +7441,12 @@ impl DataRouter {
             // client-visible cancellation can drop a batch mid-commit.
             let router = self.clone();
             let conveyor = conveyor.clone();
-            tokio::spawn(async move {
+            // RES-8: the PassGuard inside already releases leadership on
+            // unwind; the wrapper adds the missing RECORD (the pass's
+            // waiters see only a dropped oneshot otherwise).
+            tokio::spawn(crate::detached::contain("publish_pass", async move {
                 router.publish_pass_task(ino, conveyor).await;
-            });
+            }));
         }
         match rx.await {
             Ok(out) => out,
@@ -7954,7 +7971,9 @@ impl DataRouter {
                     let router = self.clone();
                     let bk = b_key.to_string();
                     let held_for_ceremony = held.clone();
-                    fuse3::raw::tpc_spawn(async move {
+                    // RES-8: contained + counted (a lost ceremony is a
+                    // silently-missing R1b admission).
+                    crate::detached::tpc_spawn_guarded("hold_serve_admission", async move {
                         router
                             .hold_serve_admission(&bk, &held_for_ceremony, class)
                             .await;

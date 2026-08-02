@@ -336,6 +336,50 @@ fn bench_deferred_free_collect(c: &mut Criterion) {
     group.finish();
 }
 
+/// RES-8 (pre-RC engineering spec §7): the price of the unwind-catching
+/// detached-spawn wrapper on the write ACK path.
+///
+/// The completing WRITE replies with the block's custody parked and the
+/// durable upload rides a detached handler-lane task — one per
+/// coverage-complete block, so this wrapper is paid at the block rate of
+/// the write path (the field's rewrite rows displace ~1,650 blocks/s per
+/// `.benchmarks/2026-07-31-write-wall.md`). What it costs is one
+/// `catch_unwind` frame around the body; what it buys is that a panic
+/// there is COUNTED instead of vanishing into an under-reported phase
+/// histogram.
+fn bench_detached_guard(c: &mut Criterion) {
+    use tokio::runtime::Runtime;
+
+    let rt = Runtime::new().expect("bench runtime");
+    let mut group = c.benchmark_group("write_detached_guard");
+    group.throughput(Throughput::Elements(1));
+
+    // Baseline: the bare body, awaited (the pre-RES-8 shape minus the
+    // spawn, which both arms pay identically).
+    group.bench_function("bare_body", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                black_box(async { black_box(0u64) }.await);
+            })
+        });
+    });
+
+    // The guarded body: `contain` = catch_unwind + the (not-taken)
+    // counting arm.
+    group.bench_function("contained_body", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                squeezefs::detached::contain("bench", async {
+                    black_box(0u64);
+                })
+                .await;
+            })
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_layout_publish(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_layout_publish");
 
@@ -427,6 +471,7 @@ criterion_group!(
     bench_extent_overlay,
     bench_supersession,
     bench_deferred_free_collect,
+    bench_detached_guard,
     bench_layout_publish,
     bench_indirect_map_codec,
     bench_flush_coalescing

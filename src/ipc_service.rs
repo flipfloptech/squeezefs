@@ -67,11 +67,15 @@ use std::sync::Arc;
 /// per-core current-thread runtimes (unbounded FIFO submission, no
 /// inject-queue starvation from a foreign thread), which is what the
 /// venue pins below assert.
+///
+/// RES-8: the body is unwind-contained and counted — a panicking ring
+/// handoff would otherwise drop its ticket with no record at all (the
+/// client then waits out `SQUEEZEFS_IL_OP_TIMEOUT_MS` for nothing).
 fn handoff_spawn<F>(fut: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    fuse3::raw::tpc_spawn(fut);
+    crate::detached::tpc_spawn_guarded("ipc_handoff", fut);
 }
 
 tokio::task_local! {
@@ -165,8 +169,11 @@ fn handoff_spawn_on<F>(node: Option<usize>, fut: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    // RES-8: same containment on the node-targeted arm.
     match node {
-        Some(n) if crate::numa_core::placement_active() => fuse3::raw::tpc_spawn_on_node(n, fut),
+        Some(_) if crate::numa_core::placement_active() => {
+            crate::detached::tpc_spawn_guarded_on_node(node, "ipc_handoff", fut)
+        }
         _ => handoff_spawn(fut),
     }
 }

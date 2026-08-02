@@ -196,7 +196,9 @@ impl TieredCache {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let nvme_clone = nvme.clone();
                 let channel_gauge = read_lru.clone();
-                handle.spawn(async move {
+                // RES-8: a panic in this LOOP ends dehydration for the
+                // life of the mount (warmth silently stops) — contained.
+                handle.spawn(crate::detached::contain("read_lru_dehydrate", async move {
                     while let Some((key, data, _class)) = evict_rx.recv().await {
                         // R5: credit the channel byte gauge per message.
                         channel_gauge.evict_channel_sub(data.len() as u64);
@@ -230,77 +232,83 @@ impl TieredCache {
                             }
                         }
                     }
-                });
+                }));
             }
         }
         if let Some(mut evict_rx) = hot_block.take_evict_rx() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let nvme_clone = nvme.clone();
                 let channel_gauge = hot_block.clone();
-                handle.spawn(async move {
-                    while let Some((key, data, class)) = evict_rx.recv().await {
-                        // R5: credit the channel byte gauge per message.
-                        channel_gauge.evict_channel_sub(data.len() as u64);
-                        crate::fuse_client::METRICS
-                            .hot_block_evictions
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        match class {
-                            // R1b gate flip (§5.3, PR 4): a probation
-                            // victim nothing ever read is a one-pass
-                            // stream's residue — dehydrating it is the
-                            // publish tax in RAM-eviction form. Drop it.
-                            crate::tiering::memory::EvictClass::Probation => {
-                                crate::fuse_client::METRICS
-                                    .hot_block_probation_drops
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            // A protected victim was worth keeping (read-
-                            // promoted or ghost-admitted): preserve its
-                            // warmth on the NVMe tier via the validated
-                            // non-owner publish (074 discipline). No
-                            // legacy `blocks/` key filter here — hot-tier
-                            // keys are offset strings; the filter belongs
-                            // to the read_lru worker's historical
-                            // population only.
-                            //
-                            // DEDUPE at the channel mouth: under
-                            // second-touch, every ghost-admitted fill
-                            // published at fetch time AND landed protected
-                            // in hot — its warmth is already tier-durable,
-                            // and re-writing it here per hot eviction is
-                            // duplicate-write churn (measured on the
-                            // rand-4k bench row: ~100% protected
-                            // evictions, each a redundant multi-MiB
-                            // spawn_blocking write competing with the
-                            // reads). Index-membership probe only; a
-                            // racing tier eviction after the probe just
-                            // re-cools one block — the always-true device
-                            // fallback, never wrongness.
-                            crate::tiering::memory::EvictClass::Protected { .. } => {
-                                // R5 Yellow+ (§5.7): dehydration paused
-                                // entirely — protected victims INCLUDED
-                                // (an escalation over the steady-state
-                                // probation-drop policy; frees the queued
-                                // Bytes and stops tier-mmap dirty growth).
-                                if crate::mem_budget::level() >= crate::mem_budget::Level::Yellow {
+                // RES-8: same — contained + counted.
+                handle.spawn(crate::detached::contain(
+                    "hot_block_dehydrate",
+                    async move {
+                        while let Some((key, data, class)) = evict_rx.recv().await {
+                            // R5: credit the channel byte gauge per message.
+                            channel_gauge.evict_channel_sub(data.len() as u64);
+                            crate::fuse_client::METRICS
+                                .hot_block_evictions
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            match class {
+                                // R1b gate flip (§5.3, PR 4): a probation
+                                // victim nothing ever read is a one-pass
+                                // stream's residue — dehydrating it is the
+                                // publish tax in RAM-eviction form. Drop it.
+                                crate::tiering::memory::EvictClass::Probation => {
                                     crate::fuse_client::METRICS
-                                        .mem_budget_dehydrate_paused
+                                        .hot_block_probation_drops
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                } else if nvme_clone.has_cached_read_block(&key) {
-                                    crate::fuse_client::METRICS
-                                        .hot_block_dehydrate_skips
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                } else {
-                                    let nvme_inner = nvme_clone.clone();
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        nvme_inner.cache_read_block_validated_self(&key, data)
-                                    })
-                                    .await;
+                                }
+                                // A protected victim was worth keeping (read-
+                                // promoted or ghost-admitted): preserve its
+                                // warmth on the NVMe tier via the validated
+                                // non-owner publish (074 discipline). No
+                                // legacy `blocks/` key filter here — hot-tier
+                                // keys are offset strings; the filter belongs
+                                // to the read_lru worker's historical
+                                // population only.
+                                //
+                                // DEDUPE at the channel mouth: under
+                                // second-touch, every ghost-admitted fill
+                                // published at fetch time AND landed protected
+                                // in hot — its warmth is already tier-durable,
+                                // and re-writing it here per hot eviction is
+                                // duplicate-write churn (measured on the
+                                // rand-4k bench row: ~100% protected
+                                // evictions, each a redundant multi-MiB
+                                // spawn_blocking write competing with the
+                                // reads). Index-membership probe only; a
+                                // racing tier eviction after the probe just
+                                // re-cools one block — the always-true device
+                                // fallback, never wrongness.
+                                crate::tiering::memory::EvictClass::Protected { .. } => {
+                                    // R5 Yellow+ (§5.7): dehydration paused
+                                    // entirely — protected victims INCLUDED
+                                    // (an escalation over the steady-state
+                                    // probation-drop policy; frees the queued
+                                    // Bytes and stops tier-mmap dirty growth).
+                                    if crate::mem_budget::level()
+                                        >= crate::mem_budget::Level::Yellow
+                                    {
+                                        crate::fuse_client::METRICS
+                                            .mem_budget_dehydrate_paused
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    } else if nvme_clone.has_cached_read_block(&key) {
+                                        crate::fuse_client::METRICS
+                                            .hot_block_dehydrate_skips
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    } else {
+                                        let nvme_inner = nvme_clone.clone();
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            nvme_inner.cache_read_block_validated_self(&key, data)
+                                        })
+                                        .await;
+                                    }
                                 }
                             }
                         }
-                    }
-                });
+                    },
+                ));
             }
         }
 

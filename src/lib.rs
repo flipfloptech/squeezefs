@@ -37,6 +37,9 @@ pub(crate) mod cow_core;
 pub mod cpu;
 pub mod crypto_compress;
 pub mod defrag;
+/// RES-8 (pre-RC spec §7): unwind containment + counting for detached
+/// (fire-and-forget) data-path tasks.
+pub mod detached;
 /// TEST-1 (pre-RC spec §11): the data-device power-cut harness — the
 /// `uring_fs` volatile-cache simulator's coverage extended to the
 /// `NvmeBlockDev` worker. Test-only; inert until armed.

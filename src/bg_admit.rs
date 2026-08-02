@@ -95,11 +95,15 @@ where
             // handoff-economy rule: they are where kernel-lane handlers
             // run, and their per-core current-thread runtimes take
             // foreign submissions without the global-inject-queue tax).
+            // RES-8: contained + counted at both venues — an admitted
+            // background task that panics silently drops its permit's
+            // worth of work (prefetch fills, tier publishes) with no
+            // record.
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
-                    handle.spawn(task);
+                    handle.spawn(crate::detached::contain("bg_admit", task));
                 }
-                Err(_) => fuse3::raw::tpc_spawn(task),
+                Err(_) => crate::detached::tpc_spawn_guarded("bg_admit", task),
             }
             true
         }

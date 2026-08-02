@@ -3246,6 +3246,11 @@ pub struct Metrics {
     /// healthy daemon**; any growth names a job type that panicked
     /// instead of returning an error.
     pub job_worker_panics: Align64<AtomicU64>,
+    /// RES-8 (pre-RC engineering spec §7): DETACHED data-path tasks that
+    /// unwound (`crate::detached::contain`). Nothing joins a detached
+    /// task, so this counter is the only record its work was lost —
+    /// **0 on a healthy daemon**; the log line names the site.
+    pub detached_task_panics: Align64<AtomicU64>,
     /// Drains self-paused by the §5.2 checkpoint-time capacity
     /// re-verification (state `paused-capacity`) instead of running the
     /// survivors to StorageFull.
@@ -5992,6 +5997,10 @@ impl SqueezefsFilesystem {
                 "job_serialized_waits": METRICS.job_serialized_waits.load(Ordering::Relaxed),
                 // RES-7: worker unwinds (must stay 0 on a healthy daemon).
                 "job_worker_panics": METRICS.job_worker_panics.load(Ordering::Relaxed),
+                // RES-8: detached data-path task unwinds — the only
+                // record a fire-and-forget task's work was lost
+                // (must stay 0 on a healthy daemon).
+                "detached_task_panics": METRICS.detached_task_panics.load(Ordering::Relaxed),
                 "job_paused_capacity": METRICS.job_paused_capacity.load(Ordering::Relaxed),
                 "evacuate_blocks_moved": METRICS.evacuate_blocks_moved.load(Ordering::Relaxed),
                 "evacuate_bytes_moved": METRICS.evacuate_bytes_moved.load(Ordering::Relaxed),
@@ -7966,7 +7975,9 @@ impl SqueezefsFilesystem {
             None => return,
         };
         let fs = self.clone();
-        tokio::spawn(async move {
+        // RES-8: a panic in this LOOP ends extent folding for the life
+        // of the mount — contained + counted.
+        tokio::spawn(crate::detached::contain("extent_fold_worker", async move {
             while let Some((ino, b)) = rx.recv().await {
                 if let Err(e) = fs.fold_extent_block(ino, b).await {
                     warn!(
@@ -7975,7 +7986,7 @@ impl SqueezefsFilesystem {
                     );
                 }
             }
-        });
+        }));
     }
 
     /// W2 mount-time extent-record sweep (design §5.2 crash/recovery/
@@ -9161,7 +9172,11 @@ impl SqueezefsFilesystem {
                         // runtime-handle spawn onto the global inject
                         // queue).
                         let t_detach = std::time::Instant::now();
-                        fuse3::raw::tpc_spawn(async move {
+                        // RES-8: contained + counted. A panic here loses
+                        // the block's write-back and nothing joins this
+                        // task; without the guard the phase histogram
+                        // merely UNDER-REPORTS (no `Total` sample).
+                        crate::detached::tpc_spawn_guarded("write_pipeline_upload", async move {
                             pipeline_phase_record(PipelinePhase::DetachLag, t_detach);
                             fs.pipeline_upload_parked_block(permit, ino, b as u32, key)
                                 .await;
@@ -10848,16 +10863,22 @@ impl SqueezefsFilesystem {
             return;
         }
         let fs = self.clone();
-        tokio::spawn(async move {
-            loop {
-                fs.parked_drain_kick.notified().await;
-                let target = fs.parked_drain_target.swap(u64::MAX, Ordering::Relaxed);
-                if target == u64::MAX {
-                    continue;
+        // RES-8: a panic in this LOOP kills the R5 parked shed for the
+        // life of the mount — the Red response would stop responding
+        // with no record at all. Contained + counted.
+        tokio::spawn(crate::detached::contain(
+            "parked_drain_worker",
+            async move {
+                loop {
+                    fs.parked_drain_kick.notified().await;
+                    let target = fs.parked_drain_target.swap(u64::MAX, Ordering::Relaxed);
+                    if target == u64::MAX {
+                        continue;
+                    }
+                    fs.drain_parked_toward(target).await;
                 }
-                fs.drain_parked_toward(target).await;
-            }
-        });
+            },
+        ));
     }
 
     /// The parked-write BYTE gauge (W2 §5.2): full-repr backings + extent
@@ -17498,7 +17519,9 @@ async fn run_constant_writeback_worker(
         let sem_clone = upload_semaphore.clone();
         let requeue_tx = requeue_tx.clone();
 
-        tokio::spawn(async move {
+        // RES-8: the never-lossy writeback unit rides this detached
+        // task; a panic loses the block's retry with no record.
+        tokio::spawn(crate::detached::contain("writeback_upload", async move {
             let _permit = match sem_clone.acquire().await {
                 Ok(p) => p,
                 Err(e) => {
@@ -17556,7 +17579,7 @@ async fn run_constant_writeback_worker(
                     requeue_or_hard_fail(&requeue_tx, req, format!("{e:?}")).await;
                 }
             }
-        });
+        }));
     }
 }
 
@@ -18201,10 +18224,15 @@ async fn run_reclaim_worker_pool(
         let fs_clone = fs_arc.clone();
         let sem_clone = semaphore.clone();
         let permit = sem_clone.acquire_owned().await.unwrap();
-        tokio::spawn(async move {
-            let _permit = permit;
-            fs_clone.reclaim_orphaned_batch(batch).await;
-        });
+        // RES-8: an orphan-reclaim batch that panics leaves its inos
+        // in the in-flight set until the next mount — contained.
+        tokio::spawn(crate::detached::contain(
+            "reclaim_orphaned_batch",
+            async move {
+                let _permit = permit;
+                fs_clone.reclaim_orphaned_batch(batch).await;
+            },
+        ));
     }
 }
 

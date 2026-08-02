@@ -884,6 +884,32 @@ fn default_buffer_cap() -> u64 {
     ((pages as u64).saturating_mul(page_sz as u64) / 8).min(TRANSPORT_BUFFER_CAP_CEILING)
 }
 
+/// The kernel's `fs.fuse.max_pages_limit` sysctl — the ceiling
+/// `process_init_reply` clamps our advertised `max_pages` to
+/// (`fc->max_pages = min(fc->max_pages_limit, max(arg->max_pages, 1))`,
+/// fs/fuse/inode.c). Default 256, writable 1..65535, absent on kernels
+/// that predate the sysctl — the 256 fallback is the compiled-in default
+/// those kernels still carry.
+fn max_pages_limit() -> usize {
+    std::fs::read_to_string("/proc/sys/fs/fuse/max_pages_limit")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(256)
+        .clamp(1, u16::MAX as usize)
+}
+
+/// Runtime page size (the kernel's `PAGE_SIZE` in the max_pages math) —
+/// derived, never assumed 4 KiB (portable-by-default: 16K/64K-page arm64
+/// boxes compute the same geometry the kernel does).
+fn page_size() -> usize {
+    let sz = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
+    if sz > 0 {
+        sz as usize
+    } else {
+        4096
+    }
+}
+
 /// Kernel possible-CPU count (`_SC_NPROCESSORS_CONF` — what
 /// fuse_uring_create() sizes queues by). Shared by the geometry resolve
 /// and the qid↔cpu correspondence check (NUMA placement relies on
@@ -917,6 +943,14 @@ pub struct TransportGeometry {
     /// Per-entry payload buffer size:
     /// max(FUSE_MIN_READ_BUFFER, max_write, max_pages × page).
     pub payload_sz: usize,
+    /// NEGOTIATED INIT-reply `max_write` (the filesystem's desired value
+    /// gated by the kernel's `fs.fuse.max_pages_limit` and the payload
+    /// budget ladder).
+    pub max_write: usize,
+    /// INIT-reply `max_pages` — must describe [`Self::max_write`] exactly
+    /// so the kernel's `ring->max_payload_sz` can never exceed the
+    /// registered ents.
+    pub max_pages: u16,
     /// INIT-reply `max_background`.
     pub max_background: u16,
     /// INIT-reply `congestion_threshold`.
@@ -924,10 +958,12 @@ pub struct TransportGeometry {
 }
 
 impl TransportGeometry {
-    /// Resolve the session geometry: environment + sysconf inputs, then
-    /// the pure [`Self::plan`].
+    /// Resolve the session geometry: environment + sysconf + sysctl
+    /// inputs, then the pure [`Self::plan`]. `desired_max_write` is the
+    /// filesystem's INIT desire; the plan negotiates it against the
+    /// kernel's `fs.fuse.max_pages_limit` and the payload budget.
     pub fn resolve(
-        max_write: usize,
+        desired_max_write: usize,
         buffer_cap_bytes: Option<u64>,
         max_background_override: Option<u16>,
         congestion_threshold_override: Option<u16>,
@@ -949,7 +985,9 @@ impl TransportGeometry {
             kernel_nqueues,
             env_queues,
             env_depth,
-            max_write,
+            desired_max_write,
+            max_pages_limit(),
+            page_size(),
             buffer_cap_bytes.unwrap_or_else(default_buffer_cap),
             max_background_override,
             congestion_threshold_override,
@@ -969,8 +1007,8 @@ impl TransportGeometry {
     /// - `nqueues`: env override clamped 1..512, else kernel possible CPUs.
     /// - `payload_sz`: must be ≥ kernel `ring->max_payload_sz` =
     ///   max(FUSE_MIN_READ_BUFFER, max_write, max_pages × PAGE_SIZE)
-    ///   (fs/fuse/dev_uring.c; kernel clamps max_pages to
-    ///   fuse_max_pages_limit = 256).
+    ///   (fs/fuse/dev_uring.c; `fc->max_pages` =
+    ///   min(`fs.fuse.max_pages_limit`, advertised max_pages)).
     /// - `depth`: env override wins verbatim (clamped 1..[`Q_DEPTH_DESIRED`]
     ///   — explicit operator intent bypasses the budget); otherwise
     ///   clamp(cap / (nqueues × payload_sz), [`Q_DEPTH_FLOOR`],
@@ -982,19 +1020,22 @@ impl TransportGeometry {
     ///   [`MAX_BACKGROUND_CEILING`]) — scaled with delivered ring capacity.
     /// - `congestion_threshold`: override (> 0) wins, else ¾ of
     ///   `max_background` (the kernel's own default ratio).
+    #[allow(clippy::too_many_arguments)] // pure policy core: every input is a policy input
     fn plan(
         kernel_nqueues: usize,
         env_queues: Option<usize>,
         env_depth: Option<usize>,
-        max_write: usize,
+        desired_max_write: usize,
+        _max_pages_limit: usize,
+        page_sz: usize,
         buffer_cap_bytes: u64,
         max_background_override: Option<u16>,
         congestion_threshold_override: Option<u16>,
     ) -> Self {
         const FUSE_MIN_READ_BUFFER: usize = 8192;
         const KERNEL_MAX_PAGES_LIMIT: usize = 256;
-        let page = 4096usize;
-        let payload_sz = max_write
+        let page = page_sz;
+        let payload_sz = desired_max_write
             .max(FUSE_MIN_READ_BUFFER)
             .max(KERNEL_MAX_PAGES_LIMIT * page);
 
@@ -1025,6 +1066,8 @@ impl TransportGeometry {
             nqueues,
             depth,
             payload_sz,
+            max_write: desired_max_write,
+            max_pages: u16::MAX,
             max_background,
             congestion_threshold,
         }
@@ -2391,10 +2434,13 @@ mod tests {
 
     // -----------------------------------------------------------------
     // L1 transport-concurrency policy (pure core). MiB payload = the
-    // SqueezeFS shape (max_write 1 MiB = 256 kernel pages).
+    // SqueezeFS shape (max_write 1 MiB = 256 kernel pages), planned at
+    // the kernel-default `fs.fuse.max_pages_limit` (256) unless a test
+    // says otherwise.
     // -----------------------------------------------------------------
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * 1024 * 1024;
+    const PAGE: usize = 4096;
 
     fn plan(
         nq: usize,
@@ -2404,7 +2450,219 @@ mod tests {
         mb: Option<u16>,
         ct: Option<u16>,
     ) -> TransportGeometry {
-        TransportGeometry::plan(nq, env_q, env_d, 1024 * 1024, cap, mb, ct)
+        TransportGeometry::plan(nq, env_q, env_d, 1024 * 1024, 256, PAGE, cap, mb, ct)
+    }
+
+    /// Full-input planner for the sysctl-geometry tests: desired
+    /// max_write + `fs.fuse.max_pages_limit` explicit.
+    fn plan_mw(
+        nq: usize,
+        desired_max_write: usize,
+        max_pages_limit: usize,
+        cap: u64,
+    ) -> TransportGeometry {
+        TransportGeometry::plan(
+            nq,
+            None,
+            None,
+            desired_max_write,
+            max_pages_limit,
+            PAGE,
+            cap,
+            None,
+            None,
+        )
+    }
+
+    /// The kernel's exact REGISTER acceptance bound, mirrored from
+    /// fs/fuse/dev_uring.c (`fuse_uring_create` + the `Invalid req
+    /// payload len` refusal at ent REGISTER):
+    ///
+    /// ```c
+    /// fc->max_pages   = min(fc->max_pages_limit, max(arg->max_pages, 1));
+    /// fc->max_write   = max(4096, arg->max_write);
+    /// ring->max_payload_sz = max(FUSE_MIN_READ_BUFFER, fc->max_write,
+    ///                            fc->max_pages * PAGE_SIZE);
+    /// // REGISTER refuses iov[1].iov_len < ring->max_payload_sz
+    /// ```
+    ///
+    /// Every planned geometry must satisfy
+    /// `payload_sz >= kernel_ring_max_payload_sz(limit, geom)` — this
+    /// mirror IS the geometry-bug contract (2026-08-04 campaign; the
+    /// pre-fix planner hardcoded 256 pages while the INIT reply
+    /// advertised `max_pages = u16::MAX`, so any raised sysctl made the
+    /// kernel bound exceed the ents and every REGISTER refused ⇒ mount
+    /// failed).
+    fn kernel_ring_max_payload_sz(max_pages_limit: usize, g: &TransportGeometry) -> usize {
+        const FUSE_MIN_READ_BUFFER: usize = 8192;
+        let fc_max_pages = max_pages_limit.min((g.max_pages as usize).max(1));
+        FUSE_MIN_READ_BUFFER
+            .max(g.max_write.max(4096))
+            .max(fc_max_pages * PAGE)
+    }
+
+    // -----------------------------------------------------------------
+    // Geometry-bug contracts (fuse3 transport geometry + zc adoption
+    // campaign, 2026-08-04): the planner derives ent payload size from
+    // the NEGOTIATED max_write/max_pages — no hardcoded 256-page
+    // constant — and the INIT reply advertises the max_pages the plan
+    // stands on, so the kernel-side REGISTER bound can never exceed the
+    // registered ents.
+    // -----------------------------------------------------------------
+
+    /// THE bug shape: default daemon (desired max_write 1 MiB) on a box
+    /// whose operator raised `fs.fuse.max_pages_limit` past 256. The
+    /// pre-fix planner kept 1 MiB ents while advertising
+    /// `max_pages = 65535`, so the kernel bound became `sysctl × 4 KiB`
+    /// and every REGISTER refused. The plan must keep the kernel bound
+    /// and the ents EQUAL by advertising max_pages consistent with the
+    /// negotiated max_write.
+    #[test]
+    fn test_plan_raised_sysctl_register_bound_holds() {
+        for limit in [512usize, 1024, 4096, 65535] {
+            let g = plan_mw(32, MIB as usize, limit, 2 * GIB);
+            assert_eq!(
+                g.payload_sz,
+                kernel_ring_max_payload_sz(limit, &g),
+                "limit={limit}: ent payload must exactly satisfy the kernel \
+                 REGISTER bound (refused REGISTER = failed mount)"
+            );
+            assert_eq!(g.max_write, MIB as usize, "desired 1 MiB stands");
+            assert_eq!(
+                g.max_pages, 256,
+                "advertised max_pages must describe the negotiated max_write, \
+                 never a blanket u16::MAX"
+            );
+            assert_eq!(g.payload_sz, MIB as usize, "1 MiB ents stay 1 MiB");
+        }
+    }
+
+    /// The today-shape pin: at the kernel-default sysctl (256) and the
+    /// shipped 1 MiB desired max_write, the resolved geometry is
+    /// byte-identical to the pre-campaign plan — same ents, same depth,
+    /// same INIT limits.
+    #[test]
+    fn test_plan_default_sysctl_shape_is_byte_identical() {
+        let g = plan_mw(32, MIB as usize, 256, 2 * GIB);
+        assert_eq!(g.nqueues, 32);
+        assert_eq!(g.depth, 32);
+        assert_eq!(g.payload_sz, MIB as usize);
+        assert_eq!(g.max_write, MIB as usize);
+        assert_eq!(g.max_pages, 256);
+        assert_eq!(g.max_background, 256);
+        assert_eq!(g.congestion_threshold, 192);
+        assert_eq!(g.total_payload_bytes(), GIB);
+    }
+
+    /// 4 MiB negotiation (candidate 1): a 4 MiB desired max_write rides
+    /// verbatim when the sysctl admits it (1024+), and degrades to the
+    /// sysctl ceiling gracefully when it does not (fleet kernels at the
+    /// 256 default keep today's 1 MiB shape — never a refused mount).
+    #[test]
+    fn test_plan_4mib_max_write_sysctl_gated() {
+        // sqz-host posture: fs.fuse.max_pages_limit=1024.
+        let g = plan_mw(32, 4 * MIB as usize, 1024, 2 * GIB);
+        assert_eq!(g.max_write, 4 * MIB as usize);
+        assert_eq!(g.max_pages, 1024);
+        assert_eq!(g.payload_sz, 4 * MIB as usize);
+        assert_eq!(g.payload_sz, kernel_ring_max_payload_sz(1024, &g));
+        assert_eq!(
+            g.depth, 16,
+            "the L1 ladder re-derived for 4 MiB ents: 2 GiB / (32 × 4 MiB) = 16"
+        );
+        assert_eq!(g.total_payload_bytes(), 2 * GIB);
+        assert_eq!(g.max_background, 256, "32×16 = 512 clamps to 256");
+
+        // Fleet kernel at the default sysctl: the desire degrades to the
+        // 256-page ceiling — today's shape, mount succeeds.
+        let g = plan_mw(32, 4 * MIB as usize, 256, 2 * GIB);
+        assert_eq!(g.max_write, MIB as usize, "sysctl 256 gates 4 MiB to 1 MiB");
+        assert_eq!(g.max_pages, 256);
+        assert_eq!(g.payload_sz, MIB as usize);
+        assert_eq!(g.depth, 32, "1 MiB ents keep the measured depth-32 class");
+        assert_eq!(g.payload_sz, kernel_ring_max_payload_sz(256, &g));
+
+        // A sysctl LOWERED below the default gates the same way (the
+        // writable range is 1..65535) — the bound law is symmetric.
+        let g = plan_mw(32, MIB as usize, 64, 2 * GIB);
+        assert_eq!(g.max_write, 64 * PAGE);
+        assert_eq!(g.max_pages, 64);
+        assert_eq!(g.payload_sz, kernel_ring_max_payload_sz(64, &g));
+    }
+
+    /// The variable-ent budget ladder (the L1 depth-degradation policy
+    /// re-derived — design amendment §degradation table): depth degrades
+    /// 32→4 first; only when the floor-4 arena still exceeds the cap
+    /// does the payload leg engage, degrading max_write toward the
+    /// 1 MiB base (yesterday's shipped ent size) — never below it, so no
+    /// box regresses below the pre-campaign posture.
+    #[test]
+    fn test_plan_budget_ladder_degrades_payload_before_floor_violation() {
+        // 4 MiB target, cap fits floor-4 at 4 MiB: depth leg only.
+        // 32q × 4 × 4 MiB = 512 MiB ≤ 819 MiB ⇒ depth = 819M/(32×4M) = 6.
+        let g = plan_mw(32, 4 * MIB as usize, 1024, 819 * MIB);
+        assert_eq!(g.max_write, 4 * MIB as usize, "payload leg must not engage");
+        assert_eq!(g.depth, 6);
+
+        // Cap below the floor-4 arena at 4 MiB (32q × 4 × 4 MiB =
+        // 512 MiB > 256 MiB): the payload leg degrades the ent size to
+        // fit floor 4 — 256 MiB / (32 × 4) = 2 MiB.
+        let g = plan_mw(32, 4 * MIB as usize, 1024, 256 * MIB);
+        assert_eq!(g.depth, 4, "floor holds");
+        assert_eq!(g.max_write, 2 * MIB as usize, "ents degrade to fit the cap");
+        assert_eq!(g.max_pages, 512);
+        assert_eq!(g.payload_sz, kernel_ring_max_payload_sz(1024, &g));
+
+        // Cap below even the floor-4 × 1 MiB base arena: payload pins at
+        // the base and depth pins at the floor — exactly the pre-L1
+        // posture, the standing never-regress law.
+        let g = plan_mw(32, 4 * MIB as usize, 1024, 64 * MIB);
+        assert_eq!(g.depth, 4);
+        assert_eq!(g.max_write, MIB as usize, "base = yesterday's 1 MiB ents");
+        assert_eq!(g.max_pages, 256);
+
+        // Cap 0 (unknown RAM): base + floor, never below.
+        let g = plan_mw(32, 4 * MIB as usize, 1024, 0);
+        assert_eq!(g.depth, 4);
+        assert_eq!(g.max_write, MIB as usize);
+    }
+
+    /// Small desired max_write: the planner sizes ents to the actual
+    /// negotiated geometry — no 256-page inflation (the pre-fix planner
+    /// paid 1 MiB ents for an 8 KiB max_write because the kernel bound
+    /// it mirrored was pinned at the sysctl default it hardcoded).
+    #[test]
+    fn test_plan_small_max_write_stops_inflating_to_256_pages() {
+        let g = plan_mw(8, 4096, 256, 32 * MIB);
+        assert_eq!(g.max_write, 4096, "kernel max_write floor is 4096");
+        assert_eq!(g.max_pages, 1);
+        assert_eq!(
+            g.payload_sz, 8192,
+            "FUSE_MIN_READ_BUFFER floors the ent, not 256 pages"
+        );
+        assert_eq!(g.payload_sz, kernel_ring_max_payload_sz(256, &g));
+        assert_eq!(g.depth, 32, "small ents leave the whole depth budget open");
+    }
+
+    /// Env depth override semantics are unchanged by the variable-ent
+    /// ladder: explicit operator intent wins verbatim and bypasses the
+    /// budget entirely (payload stays at the sysctl-gated target).
+    #[test]
+    fn test_plan_env_depth_bypasses_payload_ladder() {
+        let g = TransportGeometry::plan(
+            32,
+            None,
+            Some(8),
+            4 * MIB as usize,
+            1024,
+            PAGE,
+            64 * MIB, // would force base + floor without the override
+            None,
+            None,
+        );
+        assert_eq!(g.depth, 8, "env depth wins verbatim");
+        assert_eq!(g.max_write, 4 * MIB as usize, "payload target stands");
+        assert_eq!(g.payload_sz, kernel_ring_max_payload_sz(1024, &g));
     }
 
     /// Ample budget ⇒ the measured 316k-class defaults: depth 32,
@@ -2487,16 +2745,6 @@ mod tests {
         let g = plan(32, None, None, 2 * GIB, Some(0), Some(0));
         assert_eq!(g.max_background, 256);
         assert_eq!(g.congestion_threshold, 192);
-    }
-
-    /// payload_sz respects the kernel minimum even for small max_write —
-    /// the arena math (and therefore the depth degradation) is anchored
-    /// to the real registered size, not the caller's max_write.
-    #[test]
-    fn test_plan_payload_floor_governs_arena() {
-        let g = TransportGeometry::plan(8, None, None, 4096, 32 * MIB, None, None);
-        assert_eq!(g.payload_sz, 256 * 4096, "kernel max_pages floor");
-        assert_eq!(g.depth, 4, "32 MiB / (8 × 1 MiB) = 4");
     }
 
     /// Arena buffers: one stable, 4096-aligned, zeroed allocation per ring

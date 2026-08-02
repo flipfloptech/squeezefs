@@ -77,23 +77,31 @@ never a product path).
 
 ## 3. Inaugural numbers (the reference baseline)
 
-**PENDING MEASUREMENT — no numbers exist yet.** The authoring session
-ended before `tests/run_bench_baseline.sh save` was run:
-`.benchmarks/criterion-baselines/` does not exist, and no criterion
-result trees (`target/criterion/`, `crates/fuse3/target/criterion/`)
-were produced in this worktree. Nothing in this section is a measured
-figure, and none may be added except from a real `save` run.
+**Recorded 2026-08-02** (`tests/run_bench_baseline.sh save`, exit 0):
+**99 medians** (92 root + 7 fuse3, all 28 groups present) →
+`.benchmarks/criterion-baselines/reference.json`, stamped
+`strixhalo` @ `3ce65cc`. Venue: the thermally-capped dev box in the
+harness's **paced mode** (`SQZ_BENCH_PACED=1`, added post-merge on
+`test/bench-baseline-pacing`: build all targets first, then one bench
+binary per quiet window — resume < 65 °C and no foreign cargo/rustc,
+poll-never-contend; 16 pacing events over the ~94 min run, so no
+binary measured on a heat-soaked or contended box). Same-box relative
+tripwire semantics unchanged — these figures are `check`-mode
+reference points on this host, never absolute claims.
 
-Closing checklist for the quiet-box session that completes this:
+Headline primitives (medians, ns/op, read from `reference.json`):
 
-1. `tests/run_bench_baseline.sh save` under the script's own gates
-   (thermal ≤ 80 °C, no foreign cargo/rustc, quiet-core pins).
-2. Commit `.benchmarks/criterion-baselines/reference.json` (the harness
-   `check` mode fails loudly until it exists).
-3. Replace this section with the headline-primitives table read from
-   that same `reference.json` (NT-vs-std at the 256 KiB floor, sever
-   hit-vs-miss, doorbell elide-vs-wake, kv_journal create-shape, hold
-   serve/miss, classifier arms) — figures from the reference file only.
+| Primitive | Bench | Median |
+|---|---|---|
+| NT copy vs std, 256 KiB (the `SQUEEZEFS_NT_COPY_MIN` floor) | `copy_path_nt/{nt,std}/256k` | **6,173 vs 6,899** (NT −10.5 %) |
+| NT copy vs std, 4 KiB (below-floor shape — std must win) | `copy_path_nt/{nt,std}/4k` | 218 vs **50** (std 4.4×, floor law confirmed) |
+| Severed-pool hit vs alloc miss, 1 MiB | `copy_path_sever/{pooled_hit,alloc_miss}_1m` | 33,796 vs 33,914 (parity at 1 MiB — the pool's win is fault-rate under saturation, not single-op ns) |
+| Serve-prelude key mint, stack vs heap | `copy_path_serve_prelude/{stack,heap}_key_active_block` | **58 vs 65** |
+| Doorbell complete, parked vs unparked | `cqe_doorbell/complete_{parked,unparked}` | 18 vs 18 (park/begin/end 28) |
+| KV journal entry encode+checksum, create shape | `kv_journal/entry_encode_checksum_create` | **75** |
+| KV journal publish batch-64 encode / decode | `kv_journal/entry_{encode,decode}…publish_batch64` | 1,458 / 7,178 |
+| Read-lane hold: miss probe / credit-0 serve probe | `read_lane_hold/{miss_probe,serve_credit0_probe}` | 43 / 83 |
+| Read classifier: seq match arm / foreign-random claim / reorder pair | `read_classifier/…` | 65 / 54 / 96 |
 
 ## 4. Surprises / findings (filed, not fixed here)
 

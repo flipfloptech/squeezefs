@@ -2756,6 +2756,20 @@ pub struct Metrics {
     /// trades the RFO for a possible consumer DRAM miss; counted A/B
     /// only).
     pub nt_read_serve_bytes: Align64<AtomicU64>,
+    /// zcrx read lane (docs/design-zcrx-read-lane.md §9). `zcrx_lane_armed`
+    /// is 0/1 per mount; `zcrx_fill_bytes` is the fill-provenance engagement
+    /// gauge (a lane row is INVALID unless its delta accounts for the row's
+    /// cold-fill bytes); `zcrx_fill_fallbacks` counts per-op lane→kernel
+    /// retries (≈ 0 by design); `zcrx_frame_violations` is a must-stay-0
+    /// tripwire (any growth poisoned a session loud); `zcrx_hdr_copy_bytes`
+    /// prices the bounded PDU-header edge copy (≪ 1 % of fill bytes).
+    pub zcrx_lane_armed: Align64<AtomicU64>,
+    pub zcrx_fills: Align64<AtomicU64>,
+    pub zcrx_fill_bytes: Align64<AtomicU64>,
+    pub zcrx_fill_fallbacks: Align64<AtomicU64>,
+    pub zcrx_frame_violations: Align64<AtomicU64>,
+    pub zcrx_conn_errors: Align64<AtomicU64>,
+    pub zcrx_hdr_copy_bytes: Align64<AtomicU64>,
     /// Layout mix (write path outcomes).
     pub layout_inline_writes: Align64<AtomicU64>,
     pub layout_staged_writes: Align64<AtomicU64>,
@@ -5315,6 +5329,13 @@ impl SqueezefsFilesystem {
                 "ipc_arena_copy_bytes": METRICS.ipc_arena_copy_bytes.load(Ordering::Relaxed),
                 "ipc_read_dest_serves": METRICS.ipc_read_dest_serves.load(Ordering::Relaxed),
                 "nt_read_serve_bytes": METRICS.nt_read_serve_bytes.load(Ordering::Relaxed),
+                "zcrx_lane_armed": METRICS.zcrx_lane_armed.load(Ordering::Relaxed),
+                "zcrx_fills": METRICS.zcrx_fills.load(Ordering::Relaxed),
+                "zcrx_fill_bytes": METRICS.zcrx_fill_bytes.load(Ordering::Relaxed),
+                "zcrx_fill_fallbacks": METRICS.zcrx_fill_fallbacks.load(Ordering::Relaxed),
+                "zcrx_frame_violations": METRICS.zcrx_frame_violations.load(Ordering::Relaxed),
+                "zcrx_conn_errors": METRICS.zcrx_conn_errors.load(Ordering::Relaxed),
+                "zcrx_hdr_copy_bytes": METRICS.zcrx_hdr_copy_bytes.load(Ordering::Relaxed),
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
                 "staged_spill_escalations": METRICS.staged_spill_escalations.load(Ordering::Relaxed),

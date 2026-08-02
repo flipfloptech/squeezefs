@@ -1,0 +1,780 @@
+//! zcrx read lane contracts (docs/design-zcrx-read-lane.md, PR Z1):
+//! PDU codec laws, the mini-initiator association + read machinery against
+//! an in-process mock NVMe/TCP target, capability-probe refusals, the
+//! disarmed-default byte-identical law, and the funnel wire-in engagement
+//! gauges. The gate runs `--test-threads=1`, so env mutation per test is
+//! safe; every test restores the env it touches.
+
+use squeezefs::zcrx_lane::{initiator::LaneTarget, pdu, probe, LaneSession};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+// ---------------------------------------------------------------- mock target
+
+#[derive(Clone)]
+struct MockCfg {
+    /// ICResp digest byte (nonzero must refuse the arm loud).
+    icresp_digest: u8,
+    /// Max bytes per C2HData PDU (forces multi-PDU reassembly).
+    c2h_span: usize,
+    /// Complete reads with the SUCCESS flag on the last C2HData (no
+    /// CapsuleResp) instead of an explicit response capsule.
+    success_elision: bool,
+    /// Complete reads with this nonzero status (error injection).
+    fail_status: Option<u16>,
+    /// Emit a C2HData whose datao exceeds the command length (framing
+    /// violation injection).
+    corrupt_datao: bool,
+    /// PDO padding to insert between C2HData header and payload.
+    c2h_pdo_pad: usize,
+}
+
+impl Default for MockCfg {
+    fn default() -> Self {
+        Self {
+            icresp_digest: 0,
+            c2h_span: 8192,
+            success_elision: false,
+            fail_status: None,
+            corrupt_datao: false,
+            c2h_pdo_pad: 0,
+        }
+    }
+}
+
+struct MockTarget {
+    port: u16,
+    device: Arc<Vec<u8>>,
+    _accept: tokio::task::JoinHandle<()>,
+}
+
+const MOCK_SUBNQN: &str = "nqn.2026-08.io.squeezefs:zcrx-lane-mock";
+const MOCK_CNTLID: u16 = 0x1234;
+const MOCK_LBA_SHIFT: u32 = 9;
+
+async fn read_exact_or_eof(s: &mut TcpStream, buf: &mut [u8]) -> Option<()> {
+    match s.read_exact(buf).await {
+        Ok(_) => Some(()),
+        Err(_) => None,
+    }
+}
+
+fn le16(b: &[u8]) -> u16 {
+    u16::from_le_bytes([b[0], b[1]])
+}
+fn le32(b: &[u8]) -> u32 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+fn le64(b: &[u8]) -> u64 {
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+fn capsule_resp(cid: u16, dw0: u32, status_field: u16) -> Vec<u8> {
+    let mut pdu = vec![0u8; 24];
+    pdu[0] = 0x05; // CapsuleResp
+    pdu[2] = 24;
+    pdu[4..8].copy_from_slice(&24u32.to_le_bytes());
+    pdu[8..12].copy_from_slice(&dw0.to_le_bytes());
+    pdu[20..22].copy_from_slice(&cid.to_le_bytes());
+    pdu[22..24].copy_from_slice(&(status_field << 1).to_le_bytes());
+    pdu
+}
+
+async fn mock_conn(mut s: TcpStream, device: Arc<Vec<u8>>, cfg: MockCfg) -> Option<()> {
+    // ICReq / ICResp
+    let mut icreq = [0u8; 128];
+    read_exact_or_eof(&mut s, &mut icreq).await?;
+    assert_eq!(icreq[0], 0x00, "first PDU must be ICReq");
+    assert_eq!(icreq[11], 0, "lane must negotiate digests off");
+    let mut icresp = [0u8; 128];
+    icresp[0] = 0x01;
+    icresp[2] = 128;
+    icresp[4..8].copy_from_slice(&128u32.to_le_bytes());
+    icresp[11] = cfg.icresp_digest;
+    icresp[12..16].copy_from_slice(&(128 * 1024u32).to_le_bytes());
+    s.write_all(&icresp).await.ok()?;
+
+    let mut cc_enabled = false;
+    loop {
+        let mut ch = [0u8; 8];
+        read_exact_or_eof(&mut s, &mut ch).await?;
+        assert_eq!(ch[0], 0x04, "host must only send CapsuleCmd after IC");
+        let plen = le32(&ch[4..8]) as usize;
+        let mut rest = vec![0u8; plen - 8];
+        read_exact_or_eof(&mut s, &mut rest).await?;
+        let sqe = &rest[..64];
+        let opcode = sqe[0];
+        let cid = le16(&sqe[2..4]);
+        match opcode {
+            0x7F => {
+                let fctype = sqe[4];
+                match fctype {
+                    0x01 => {
+                        // Connect: validate in-capsule data geometry.
+                        let data = &rest[64..64 + 4096];
+                        let subnqn = std::str::from_utf8(&data[256..512])
+                            .unwrap()
+                            .trim_end_matches('\0');
+                        assert_eq!(subnqn, MOCK_SUBNQN, "connect subnqn mismatch");
+                        let hostnqn = std::str::from_utf8(&data[512..768])
+                            .unwrap()
+                            .trim_end_matches('\0');
+                        assert!(!hostnqn.is_empty(), "hostnqn must be present");
+                        let qid = le16(&sqe[42..44]);
+                        if qid != 0 {
+                            let cntlid = le16(&data[16..18]);
+                            assert_eq!(cntlid, MOCK_CNTLID, "IO connect must carry cntlid");
+                        }
+                        let kato = le32(&sqe[48..52]);
+                        assert_eq!(kato, 0, "lane v1 connects with KATO 0");
+                        s.write_all(&capsule_resp(cid, MOCK_CNTLID as u32, 0))
+                            .await
+                            .ok()?;
+                    }
+                    0x00 => {
+                        // Property Set (CC).
+                        let off = le32(&sqe[44..48]);
+                        let val = le64(&sqe[48..56]);
+                        if off == 0x14 && val & 1 == 1 {
+                            cc_enabled = true;
+                        }
+                        s.write_all(&capsule_resp(cid, 0, 0)).await.ok()?;
+                    }
+                    0x04 => {
+                        // Property Get: CAP or CSTS.
+                        let off = le32(&sqe[44..48]);
+                        let dw0 = match off {
+                            0x00 => 127u32, // CAP low: MQES = 127
+                            0x1C => u32::from(cc_enabled),
+                            other => panic!("mock: unexpected property get {other:#x}"),
+                        };
+                        s.write_all(&capsule_resp(cid, dw0, 0)).await.ok()?;
+                    }
+                    other => panic!("mock: unexpected fctype {other:#x}"),
+                }
+            }
+            0x02 => {
+                // NVM Read.
+                let nsid = le32(&sqe[4..8]);
+                assert_eq!(nsid, 1, "lane must address the discovered nsid");
+                assert_eq!(sqe[39], 0x5A, "read must use the Transport SGL descriptor");
+                let xfer = le32(&sqe[32..36]) as usize;
+                let slba = le64(&sqe[40..48]);
+                let nlb0 = le16(&sqe[48..50]) as usize;
+                assert_eq!(
+                    (nlb0 + 1) << MOCK_LBA_SHIFT,
+                    xfer,
+                    "SGL length must equal the LBA span"
+                );
+                if let Some(status) = cfg.fail_status {
+                    s.write_all(&capsule_resp(cid, 0, status)).await.ok()?;
+                    continue;
+                }
+                let start = (slba as usize) << MOCK_LBA_SHIFT;
+                let payload = &device[start..start + xfer];
+                let mut off = 0usize;
+                while off < xfer {
+                    let span = cfg.c2h_span.min(xfer - off);
+                    let last = off + span == xfer;
+                    let datao = if cfg.corrupt_datao {
+                        (xfer + 4096) as u32
+                    } else {
+                        off as u32
+                    };
+                    let pdo = 24 + cfg.c2h_pdo_pad;
+                    let mut hdr = vec![0u8; pdo];
+                    hdr[0] = 0x07;
+                    hdr[1] = if last { 0x04 } else { 0 }
+                        | if last && cfg.success_elision { 0x08 } else { 0 };
+                    hdr[2] = 24;
+                    hdr[3] = pdo as u8;
+                    hdr[4..8].copy_from_slice(&((pdo + span) as u32).to_le_bytes());
+                    hdr[8..10].copy_from_slice(&cid.to_le_bytes());
+                    hdr[12..16].copy_from_slice(&datao.to_le_bytes());
+                    hdr[16..20].copy_from_slice(&(span as u32).to_le_bytes());
+                    s.write_all(&hdr).await.ok()?;
+                    s.write_all(&payload[off..off + span]).await.ok()?;
+                    off += span;
+                }
+                if !cfg.success_elision {
+                    s.write_all(&capsule_resp(cid, 0, 0)).await.ok()?;
+                }
+            }
+            other => panic!("mock: unexpected opcode {other:#x}"),
+        }
+    }
+}
+
+impl MockTarget {
+    async fn start(cfg: MockCfg, device_len: usize) -> Self {
+        let device: Arc<Vec<u8>> =
+            Arc::new((0..device_len).map(|i| (i / 512 + i % 251) as u8).collect());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dev = Arc::clone(&device);
+        let accept = tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = listener.accept().await else {
+                    break;
+                };
+                let dev = Arc::clone(&dev);
+                let cfg = cfg.clone();
+                tokio::spawn(async move {
+                    let _ = mock_conn(s, dev, cfg).await;
+                });
+            }
+        });
+        MockTarget {
+            port,
+            device,
+            _accept: accept,
+        }
+    }
+
+    fn target(&self, io_queues: u16, queue_depth: u16) -> LaneTarget {
+        LaneTarget {
+            traddr: "127.0.0.1".into(),
+            trsvcid: self.port.to_string(),
+            subnqn: MOCK_SUBNQN.into(),
+            nsid: 1,
+            lba_shift: MOCK_LBA_SHIFT,
+            max_xfer_bytes: 256 * 1024,
+            io_queues,
+            queue_depth,
+        }
+    }
+}
+
+fn zcrx_metric(name: &str) -> u64 {
+    let m = &squeezefs::fuse_client::METRICS;
+    match name {
+        "armed" => m.zcrx_lane_armed.load(Ordering::Relaxed),
+        "fills" => m.zcrx_fills.load(Ordering::Relaxed),
+        "fill_bytes" => m.zcrx_fill_bytes.load(Ordering::Relaxed),
+        "fallbacks" => m.zcrx_fill_fallbacks.load(Ordering::Relaxed),
+        "frame_violations" => m.zcrx_frame_violations.load(Ordering::Relaxed),
+        "conn_errors" => m.zcrx_conn_errors.load(Ordering::Relaxed),
+        "hdr_copy_bytes" => m.zcrx_hdr_copy_bytes.load(Ordering::Relaxed),
+        _ => panic!("unknown metric {name}"),
+    }
+}
+
+// ------------------------------------------------------------------ codec laws
+
+#[test]
+fn test_codec_common_header_roundtrip() {
+    let icreq = pdu::encode_icreq();
+    let ch = pdu::parse_common(&icreq).expect("icreq CH parses");
+    assert_eq!(ch.pdu_type, pdu::PDU_ICREQ);
+    assert_eq!(ch.hlen, 128);
+    assert_eq!(ch.plen, 128);
+    // digests off, pfv 0, hpda 0 on the wire
+    assert_eq!(&icreq[8..16], &[0u8; 8]);
+}
+
+#[test]
+fn test_codec_connect_capsule_layout() {
+    let hostid = [7u8; 16];
+    let c = pdu::encode_connect_capsule(3, 63, 0, 9, &hostid, 0xBEEF, "nqn.sub", "nqn.host");
+    assert_eq!(c.len(), 72 + 4096);
+    assert_eq!(c[0], pdu::PDU_CAPSULE_CMD);
+    assert_eq!(c[3], 72, "pdo must point at the in-capsule data");
+    assert_eq!(u32::from_le_bytes([c[4], c[5], c[6], c[7]]), 72 + 4096);
+    let sqe = &c[8..72];
+    assert_eq!(sqe[0], pdu::OPC_FABRICS);
+    assert_eq!(sqe[4], pdu::FCTYPE_CONNECT);
+    assert_eq!(le16(&sqe[2..4]), 9, "cid");
+    assert_eq!(le16(&sqe[42..44]), 3, "qid");
+    assert_eq!(le16(&sqe[44..46]), 63, "sqsize (0-based)");
+    assert_eq!(le32(&sqe[48..52]), 0, "kato");
+    assert_eq!(sqe[39], 0x01, "in-capsule SGL descriptor type");
+    let data = &c[72..];
+    assert_eq!(&data[0..16], &hostid);
+    assert_eq!(le16(&data[16..18]), 0xBEEF, "cntlid rides the connect data");
+    assert_eq!(&data[256..263], b"nqn.sub");
+    assert_eq!(&data[512..520], b"nqn.host");
+}
+
+#[test]
+fn test_codec_read_capsule_layout() {
+    let c = pdu::encode_read_capsule(0x42, 5, 0x1_0000_0001, 2048, 2048 * 512);
+    assert_eq!(c.len(), 72);
+    let sqe = &c[8..72];
+    assert_eq!(sqe[0], pdu::OPC_READ);
+    assert_eq!(le32(&sqe[4..8]), 5, "nsid");
+    assert_eq!(le64(&sqe[40..48]), 0x1_0000_0001, "slba spans cdw10/11");
+    assert_eq!(le16(&sqe[48..50]), 2047, "nlb is 0-based");
+    assert_eq!(sqe[39], 0x5A, "transport SGL descriptor");
+    assert_eq!(le32(&sqe[32..36]), 2048 * 512, "SGL length");
+}
+
+#[test]
+fn test_codec_icresp_negotiation_laws() {
+    let mut icresp = [0u8; 128];
+    icresp[0] = pdu::PDU_ICRESP;
+    icresp[2] = 128;
+    icresp[4..8].copy_from_slice(&128u32.to_le_bytes());
+    let ok = pdu::parse_icresp(&icresp).expect("clean icresp accepted");
+    assert_eq!(ok.digest, 0);
+
+    let mut digests = icresp;
+    digests[11] = 0x3;
+    let err = pdu::parse_icresp(&digests).expect_err("digests must refuse");
+    assert!(matches!(err, pdu::FrameError::Negotiation(_)), "{err}");
+
+    let mut pfv = icresp;
+    pfv[8] = 1;
+    assert!(pdu::parse_icresp(&pfv).is_err(), "nonzero PFV must refuse");
+
+    let mut wrong = icresp;
+    wrong[0] = pdu::PDU_CAPSULE_RESP;
+    assert!(pdu::parse_icresp(&wrong).is_err(), "wrong type must refuse");
+}
+
+#[test]
+fn test_codec_c2h_geometry_law() {
+    let mut hdr = [0u8; 24];
+    hdr[0] = pdu::PDU_C2H_DATA;
+    hdr[1] = pdu::C2H_FLAG_LAST | pdu::C2H_FLAG_SUCCESS;
+    hdr[2] = 24;
+    hdr[3] = 24;
+    hdr[4..8].copy_from_slice(&(24u32 + 100).to_le_bytes());
+    hdr[8..10].copy_from_slice(&7u16.to_le_bytes());
+    hdr[12..16].copy_from_slice(&512u32.to_le_bytes());
+    hdr[16..20].copy_from_slice(&100u32.to_le_bytes());
+    let ch = pdu::parse_common(&hdr).unwrap();
+    let c2h = pdu::parse_c2h_data(ch, &hdr).expect("clean c2h parses");
+    assert_eq!(
+        (c2h.cccid, c2h.datao, c2h.datal, c2h.last, c2h.success),
+        (7, 512, 100, true, true)
+    );
+
+    // plen != pdo + datal is a framing violation.
+    let mut bad = hdr;
+    bad[4..8].copy_from_slice(&(24u32 + 99).to_le_bytes());
+    let ch = pdu::parse_common(&bad).unwrap();
+    assert!(matches!(
+        pdu::parse_c2h_data(ch, &bad),
+        Err(pdu::FrameError::Geometry(_))
+    ));
+}
+
+#[test]
+fn test_codec_cqe_status_strips_phase_bit() {
+    let mut b = [0u8; 16];
+    b[12..14].copy_from_slice(&0xABCDu16.to_le_bytes());
+    b[14..16].copy_from_slice(&((0x0002u16 << 1) | 1).to_le_bytes());
+    let cqe = pdu::parse_cqe(&b).unwrap();
+    assert_eq!(cqe.cid, 0xABCD);
+    assert_eq!(cqe.status, 0x0002, "phase bit must not leak into status");
+}
+
+// ------------------------------------------------------------- probe contracts
+
+#[test]
+fn test_probe_sysfs_discovery_tcp_and_refusals() {
+    let root = tempfile::tempdir().unwrap();
+    let ctrl = root.path().join("class/nvme/nvme4");
+    let blk = root.path().join("block/nvme4n1/queue");
+    std::fs::create_dir_all(&ctrl).unwrap();
+    std::fs::create_dir_all(&blk).unwrap();
+    std::fs::write(ctrl.join("transport"), "tcp\n").unwrap();
+    std::fs::write(ctrl.join("address"), "traddr=10.181.177.191,trsvcid=4420\n").unwrap();
+    std::fs::write(ctrl.join("subsysnqn"), "nqn.test:sub\n").unwrap();
+    std::fs::write(root.path().join("block/nvme4n1/nsid"), "1\n").unwrap();
+    std::fs::write(blk.join("logical_block_size"), "512\n").unwrap();
+    std::fs::write(blk.join("max_hw_sectors_kb"), "4096\n").unwrap();
+
+    let t = probe::nvme_tcp_target_for_with_root("/dev/nvme4n1", root.path())
+        .expect("tcp device resolves");
+    assert_eq!(t.traddr, "10.181.177.191");
+    assert_eq!(t.trsvcid, "4420");
+    assert_eq!(t.subnqn, "nqn.test:sub");
+    assert_eq!(t.nsid, 1);
+    assert_eq!(t.lba_shift, 9);
+    assert_eq!(t.max_xfer_bytes, 4096 * 1024);
+    assert!(t.io_queues >= 1 && t.queue_depth >= 4, "derived geometry");
+
+    // Non-tcp transport is ineligible.
+    std::fs::write(ctrl.join("transport"), "pcie\n").unwrap();
+    assert!(
+        probe::nvme_tcp_target_for_with_root("/dev/nvme4n1", root.path()).is_none(),
+        "pcie transport must be ineligible"
+    );
+    std::fs::write(ctrl.join("transport"), "tcp\n").unwrap();
+
+    // Paths that are not plain nvme<C>n<N> are ineligible.
+    for p in ["/dev/sda", "/dev/nvme4", "/dev/nvme4n1p2", "/dev/nvme4c4n1"] {
+        assert!(
+            probe::nvme_tcp_target_for_with_root(p, root.path()).is_none(),
+            "{p} must be ineligible"
+        );
+    }
+}
+
+// -------------------------------------------------- association + read laws
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_association_and_multi_pdu_read() {
+    let mock = MockTarget::start(MockCfg::default(), 1 << 20).await;
+    let sess = LaneSession::connect(mock.target(2, 8)).await.expect("arm");
+    assert!(!sess.poisoned());
+
+    // 512 KiB read spans multiple sub-commands? (max_xfer 256 KiB ⇒ 2) and
+    // each sub-command reassembles from 8 KiB C2HData PDUs.
+    let mut buf = vec![0u8; 512 * 1024];
+    sess.read_into_slice(4096, &mut buf).await.expect("read");
+    assert_eq!(
+        &buf[..],
+        &mock.device[4096..4096 + 512 * 1024],
+        "reassembled bytes must match the namespace"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_success_flag_elision_completes() {
+    let cfg = MockCfg {
+        success_elision: true,
+        ..Default::default()
+    };
+    let mock = MockTarget::start(cfg, 1 << 20).await;
+    let sess = LaneSession::connect(mock.target(1, 4)).await.expect("arm");
+    let mut buf = vec![0u8; 64 * 1024];
+    sess.read_into_slice(0, &mut buf).await.expect("read");
+    assert_eq!(&buf[..], &mock.device[..64 * 1024]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_c2h_pdo_padding_is_skipped_and_priced() {
+    let cfg = MockCfg {
+        c2h_pdo_pad: 8,
+        ..Default::default()
+    };
+    let mock = MockTarget::start(cfg, 1 << 20).await;
+    let before = zcrx_metric("hdr_copy_bytes");
+    let sess = LaneSession::connect(mock.target(1, 4)).await.expect("arm");
+    let mut buf = vec![0u8; 64 * 1024];
+    sess.read_into_slice(0, &mut buf).await.expect("read");
+    assert_eq!(&buf[..], &mock.device[..64 * 1024]);
+    assert!(
+        zcrx_metric("hdr_copy_bytes") > before,
+        "the header edge copy must be priced"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_digest_demand_refuses_arm_loud() {
+    let cfg = MockCfg {
+        icresp_digest: 0x3,
+        ..Default::default()
+    };
+    let mock = MockTarget::start(cfg, 4096).await;
+    let err = LaneSession::connect(mock.target(1, 4))
+        .await
+        .expect_err("digest demand must refuse the arm");
+    assert!(
+        err.to_string().contains("digest"),
+        "refusal must name the law: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_error_status_fails_op_not_session() {
+    let cfg = MockCfg {
+        fail_status: Some(0x0281), // e.g. LBA out of range class
+        ..Default::default()
+    };
+    let mock = MockTarget::start(cfg, 1 << 20).await;
+    let sess = LaneSession::connect(mock.target(1, 4)).await.expect("arm");
+    let mut buf = vec![0u8; 4096];
+    let err = sess
+        .read_into_slice(0, &mut buf)
+        .await
+        .expect_err("error status must surface");
+    assert!(err.to_string().contains("status"), "{err}");
+    assert!(
+        !sess.poisoned(),
+        "a per-op controller error is not a session poison"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_frame_violation_poisons_session_and_counts() {
+    let cfg = MockCfg {
+        corrupt_datao: true,
+        ..Default::default()
+    };
+    let mock = MockTarget::start(cfg, 1 << 20).await;
+    let before = zcrx_metric("frame_violations");
+    let sess = LaneSession::connect(mock.target(1, 4)).await.expect("arm");
+    let mut buf = vec![0u8; 8192];
+    let err = sess
+        .read_into_slice(0, &mut buf)
+        .await
+        .expect_err("frame violation must fail the op");
+    assert!(!err.to_string().is_empty());
+    // Poison propagates (reader task observed the violation).
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !sess.poisoned() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("session must poison after a framing violation");
+    assert!(
+        zcrx_metric("frame_violations") > before,
+        "the tripwire must count"
+    );
+    // Subsequent ops refuse fast.
+    assert!(sess.read_into_slice(0, &mut buf).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_reads_complete_by_cid() {
+    let mock = MockTarget::start(MockCfg::default(), 4 << 20).await;
+    let sess = LaneSession::connect(mock.target(2, 8)).await.expect("arm");
+    let mut handles = Vec::new();
+    for i in 0..16u64 {
+        let sess = Arc::clone(&sess);
+        let dev = Arc::clone(&mock.device);
+        handles.push(tokio::spawn(async move {
+            let off = i * 128 * 1024;
+            let mut buf = vec![0u8; 128 * 1024];
+            sess.read_into_slice(off, &mut buf).await.expect("read");
+            assert_eq!(
+                &buf[..],
+                &dev[off as usize..off as usize + 128 * 1024],
+                "cid-matched completion must land the right region"
+            );
+        }));
+    }
+    for h in handles {
+        h.await.expect("no leaked/panicked read tasks");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_unaligned_range_is_ineligible() {
+    let mock = MockTarget::start(MockCfg::default(), 1 << 20).await;
+    let sess = LaneSession::connect(mock.target(1, 4)).await.expect("arm");
+    assert!(!sess.range_eligible(1, 512), "unaligned offset");
+    assert!(!sess.range_eligible(512, 100), "unaligned length");
+    assert!(!sess.range_eligible(0, 0), "empty range");
+    assert!(sess.range_eligible(512, 512));
+    let mut buf = vec![0u8; 100];
+    assert!(
+        sess.read_into_slice(512, &mut buf).await.is_err(),
+        "ineligible ranges must refuse (the funnel routes them to the kernel path)"
+    );
+}
+
+// ------------------------------------------------------- funnel wire-in laws
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_disarmed_default_is_byte_identical_and_gauge_silent() {
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blockfile");
+    let mut content = vec![0u8; 256 * 1024];
+    for (i, b) in content.iter_mut().enumerate() {
+        *b = (i % 253) as u8;
+    }
+    std::fs::write(&path, &content).unwrap();
+
+    let before_fills = zcrx_metric("fills");
+    let before_armed = zcrx_metric("armed");
+    let dev = squeezefs::nvme_dev::NvmeBlockDev::new(path.to_str().unwrap());
+    let got = dev.read_block(4096, 65536).await.expect("kernel-path read");
+    assert_eq!(&got[..], &content[4096..4096 + 65536]);
+    assert_eq!(
+        zcrx_metric("fills"),
+        before_fills,
+        "disarmed mount must never touch the lane"
+    );
+    assert_eq!(zcrx_metric("armed"), before_armed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_funnel_engagement_via_target_override() {
+    // Arm the lane at a mock target through the funnel: the device node is a
+    // plain file (kernel path would serve file bytes); the lane serves MOCK
+    // namespace bytes — differing content proves engagement structurally,
+    // and the gauges must account for it.
+    let mock = MockTarget::start(MockCfg::default(), 4 << 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blockfile");
+    std::fs::write(&path, vec![0xEEu8; 4 << 20]).unwrap();
+
+    std::env::set_var("SQUEEZEFS_ZCRX_LANE", "1");
+    std::env::set_var("SQUEEZEFS_ZCRX_LANE_FORCE_COPY", "1");
+    std::env::set_var(
+        "SQUEEZEFS_ZCRX_LANE_TARGET",
+        format!(
+            "127.0.0.1,{},{},1,{},262144,2,8",
+            mock.port, MOCK_SUBNQN, MOCK_LBA_SHIFT
+        ),
+    );
+
+    let before_fills = zcrx_metric("fills");
+    let before_bytes = zcrx_metric("fill_bytes");
+    let dev = squeezefs::nvme_dev::NvmeBlockDev::new(path.to_str().unwrap());
+    let got = dev.read_block(8192, 128 * 1024).await.expect("lane read");
+
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE");
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE_FORCE_COPY");
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE_TARGET");
+
+    assert_eq!(
+        &got[..],
+        &mock.device[8192..8192 + 128 * 1024],
+        "the lane must have served the read (namespace bytes, not file bytes)"
+    );
+    assert_eq!(zcrx_metric("fills"), before_fills + 1, "fills gauge");
+    assert_eq!(
+        zcrx_metric("fill_bytes"),
+        before_bytes + 128 * 1024,
+        "fill-bytes engagement gauge"
+    );
+    assert_eq!(zcrx_metric("armed"), 1, "armed gauge");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_funnel_gauge_closure_byte_exact() {
+    // Closure law (design §9): over any run, `zcrx_fill_bytes` must account
+    // byte-exactly for every lane-served fill, and `zcrx_fills` for every
+    // funnel read — the engagement instrument the field bracket keys on.
+    let mock = MockTarget::start(MockCfg::default(), 8 << 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blockfile");
+    std::fs::write(&path, vec![0u8; 8 << 20]).unwrap();
+
+    std::env::set_var("SQUEEZEFS_ZCRX_LANE", "1");
+    std::env::set_var("SQUEEZEFS_ZCRX_LANE_FORCE_COPY", "1");
+    std::env::set_var(
+        "SQUEEZEFS_ZCRX_LANE_TARGET",
+        format!(
+            "127.0.0.1,{},{},1,{},262144,2,8",
+            mock.port, MOCK_SUBNQN, MOCK_LBA_SHIFT
+        ),
+    );
+
+    let before_fills = zcrx_metric("fills");
+    let before_bytes = zcrx_metric("fill_bytes");
+    let before_fallbacks = zcrx_metric("fallbacks");
+    let dev = squeezefs::nvme_dev::NvmeBlockDev::new(path.to_str().unwrap());
+    // Varied sizes incl. > max_xfer (sub-command split must not double-count).
+    let sizes = [4096usize, 512 * 1024, 1 << 20, 65536];
+    let mut expect = 0u64;
+    for (i, sz) in sizes.iter().enumerate() {
+        let off = (i as u64) * (2 << 20);
+        let got = dev.read_block(off, *sz).await.expect("lane read");
+        assert_eq!(
+            &got[..],
+            &mock.device[off as usize..off as usize + sz],
+            "content law"
+        );
+        expect += *sz as u64;
+    }
+
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE");
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE_FORCE_COPY");
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE_TARGET");
+
+    assert_eq!(
+        zcrx_metric("fill_bytes") - before_bytes,
+        expect,
+        "fill_bytes must close byte-exact against served fills"
+    );
+    assert_eq!(
+        zcrx_metric("fills") - before_fills,
+        sizes.len() as u64,
+        "one fill per funnel read regardless of sub-command split"
+    );
+    assert_eq!(
+        zcrx_metric("fallbacks"),
+        before_fallbacks,
+        "a clean run pays zero fallbacks"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_funnel_lane_error_falls_back_to_kernel_path() {
+    // Per-op fallback law (design §6): a lane error surfaces NOWHERE — the
+    // kernel path serves the read (idempotent), and the retry is counted in
+    // `zcrx_fill_fallbacks`.
+    let cfg = MockCfg {
+        fail_status: Some(0x0281),
+        ..Default::default()
+    };
+    let mock = MockTarget::start(cfg, 1 << 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blockfile");
+    let content: Vec<u8> = (0..1 << 20).map(|i| (i % 241) as u8).collect();
+    std::fs::write(&path, &content).unwrap();
+
+    std::env::set_var("SQUEEZEFS_ZCRX_LANE", "1");
+    std::env::set_var("SQUEEZEFS_ZCRX_LANE_FORCE_COPY", "1");
+    std::env::set_var(
+        "SQUEEZEFS_ZCRX_LANE_TARGET",
+        format!(
+            "127.0.0.1,{},{},1,{},262144,1,4",
+            mock.port, MOCK_SUBNQN, MOCK_LBA_SHIFT
+        ),
+    );
+
+    let before_fallbacks = zcrx_metric("fallbacks");
+    let before_fills = zcrx_metric("fills");
+    let dev = squeezefs::nvme_dev::NvmeBlockDev::new(path.to_str().unwrap());
+    let got = dev
+        .read_block(4096, 65536)
+        .await
+        .expect("the op must succeed via the kernel path");
+
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE");
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE_FORCE_COPY");
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE_TARGET");
+
+    assert_eq!(
+        &got[..],
+        &content[4096..4096 + 65536],
+        "kernel path must serve the FILE bytes (fallback engaged)"
+    );
+    assert!(
+        zcrx_metric("fallbacks") > before_fallbacks,
+        "the fallback must be counted"
+    );
+    assert_eq!(
+        zcrx_metric("fills"),
+        before_fills,
+        "a failed lane op is not a fill"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_funnel_arm_refusal_without_force_copy_stays_kernel_path() {
+    // SQUEEZEFS_ZCRX_LANE=1 alone (no FORCE_COPY seam): PR Z1 must refuse to
+    // arm (zcrx backend not shipped) and serve the kernel path byte-identical.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blockfile");
+    let content = vec![0xABu8; 1 << 20];
+    std::fs::write(&path, &content).unwrap();
+
+    std::env::set_var("SQUEEZEFS_ZCRX_LANE", "1");
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE_FORCE_COPY");
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE_TARGET");
+
+    let before_fills = zcrx_metric("fills");
+    let dev = squeezefs::nvme_dev::NvmeBlockDev::new(path.to_str().unwrap());
+    let got = dev.read_block(0, 65536).await.expect("kernel-path read");
+
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE");
+
+    assert_eq!(&got[..], &content[..65536]);
+    assert_eq!(
+        zcrx_metric("fills"),
+        before_fills,
+        "refused arm must not serve through the lane"
+    );
+}

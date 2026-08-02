@@ -80,6 +80,7 @@ pub mod uring_fs;
 pub mod version;
 pub mod write_pipeline;
 pub(crate) mod write_pipeline_core;
+pub mod zcrx_lane;
 
 use parking_lot::RwLock;
 

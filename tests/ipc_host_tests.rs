@@ -1875,3 +1875,169 @@ fn an_established_but_idle_connection_survives_the_recv_timeout() {
     }
     host.shutdown();
 }
+
+/// A sink that parks every completion handle instead of completing it —
+/// the VAL-5c rows need ops that STAY in flight (a device-bound serve,
+/// modelled without a device).
+struct ParkingSink {
+    held: std::sync::Mutex<Vec<squeezefs::ipc_host::SlotCompletion>>,
+}
+
+impl squeezefs::ipc_host::SessionSink for ParkingSink {
+    fn serve_data(
+        &self,
+        _op: squeezefs::ipc_host::DataOp,
+        completion: squeezefs::ipc_host::SlotCompletion,
+    ) {
+        self.held
+            .lock()
+            .expect("parked completion mutex")
+            .push(completion);
+    }
+}
+
+/// Hostile submit of `slot_index`: force the client-writable state word
+/// back to SUBMITTED and publish the ring entry again. The honest
+/// protocol claims a FREE slot and submits it once; this is exactly the
+/// forgery VAL-5c says the daemon may not trust. Returns `false` when the
+/// daemon stopped consuming (session poisoned/torn down).
+fn hostile_resubmit(session: &ClientSession, slot_index: u32, d: &SlotDescriptor) -> bool {
+    use squeezefs_ipc::slot_core::STATE_SUBMITTED;
+    let slot = session.slot(slot_index as usize);
+    slot.publish_descriptor(d);
+    slot.core
+        .state_futex_word()
+        .store(STATE_SUBMITTED, Ordering::Release);
+    if !session.ring().push(slot_index) {
+        return false; // ring full: the daemon stopped draining
+    }
+    session.header().doorbell.fetch_add(1, Ordering::Release);
+    futex_wake(&session.header().doorbell, 1);
+    // Wait for the daemon to take it (SUBMITTED → SERVING).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while slot.core.state_futex_word().load(Ordering::Acquire) == STATE_SUBMITTED {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::hint::spin_loop();
+    }
+    true
+}
+
+/// VAL-5c: `try_begin_serve` succeeds for any slot whose (client-writable)
+/// state word reads SUBMITTED, and nothing anywhere counted ops in
+/// flight. Honest in-flight is bounded by `slots`; a re-submitted slot is
+/// not — each accepted op severs up to `max_op_bytes` and hands the sink
+/// a live payload, so an unbounded re-submit loop is an unauthenticated
+/// memory-growth engine (`SeveredPool` caps RETENTION, not allocation).
+/// Exceeding `slots` is a protocol violation: poison the session.
+#[test]
+fn resubmitting_slots_past_the_in_flight_bound_poisons_the_session() {
+    let sink = Arc::new(ParkingSink {
+        held: std::sync::Mutex::new(Vec::new()),
+    });
+    let cfg = test_config("inflight-forge");
+    let host = IpcHost::spawn(cfg.clone(), sink.clone()).expect("host must spawn");
+    let mf = mount_file();
+    host.set_expected_st_dev(mf.st_dev);
+    let fd = open_flags(&mf.path, libc::O_RDWR);
+    let (sock, session) = establish(&cfg, &host, fd.as_raw_fd());
+    let binding = match bind(&sock, fd.as_raw_fd()) {
+        CtlMsg::BindOk { binding_id, .. } => binding_id,
+        other => panic!("bind must succeed, got {other:?}"),
+    };
+    let poisoned_before = METRICS.ipc_sessions_poisoned.load(Ordering::Relaxed);
+
+    let desc = SlotDescriptor {
+        op: OP_READ,
+        flags: 0,
+        binding,
+        offset: 0,
+        len: 4096,
+        arena_off: 0,
+    };
+    // `slots` re-submits of ONE slot are already `slots` ops in flight
+    // (the sink never completes them); the next one exceeds what the
+    // geometry can honestly hold.
+    let slots = test_geometry().slots;
+    for _ in 0..slots + 4 {
+        if !hostile_resubmit(&session, 0, &desc) {
+            break; // the daemon stopped serving us — the expected end
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while METRICS.ipc_sessions_poisoned.load(Ordering::Relaxed) == poisoned_before {
+        assert!(
+            Instant::now() < deadline,
+            "VAL-5c: {} forged in-flight ops accepted without a poison — \
+             the daemon has no in-flight accounting",
+            slots + 4
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    wait_sessions_active(0, "a poisoned session is torn down");
+    host.shutdown();
+}
+
+/// VAL-5c control: `slots` HONEST concurrent ops (one per claimed slot,
+/// all parked daemon-side) are exactly the protocol's bound and must
+/// serve without a poison — the counter is a protocol check, not a
+/// throughput cap.
+#[test]
+fn honest_in_flight_up_to_the_slot_count_never_poisons() {
+    let sink = Arc::new(ParkingSink {
+        held: std::sync::Mutex::new(Vec::new()),
+    });
+    let cfg = test_config("inflight-honest");
+    let host = IpcHost::spawn(cfg.clone(), sink.clone()).expect("host must spawn");
+    let mf = mount_file();
+    host.set_expected_st_dev(mf.st_dev);
+    let fd = open_flags(&mf.path, libc::O_RDWR);
+    let (sock, session) = establish(&cfg, &host, fd.as_raw_fd());
+    let binding = match bind(&sock, fd.as_raw_fd()) {
+        CtlMsg::BindOk { binding_id, .. } => binding_id,
+        other => panic!("bind must succeed, got {other:?}"),
+    };
+    let poisoned_before = METRICS.ipc_sessions_poisoned.load(Ordering::Relaxed);
+
+    let slots = test_geometry().slots;
+    for i in 0..slots {
+        let slot = session.slot(i as usize);
+        slot.core.try_claim().expect("every slot starts FREE");
+        slot.publish_descriptor(&SlotDescriptor {
+            op: OP_READ,
+            flags: 0,
+            binding,
+            offset: 0,
+            len: 4096,
+            arena_off: u64::from(i) * 4096,
+        });
+        slot.core.publish_submitted();
+        assert!(session.ring().push(i), "ring holds one entry per slot");
+        session.header().doorbell.fetch_add(1, Ordering::Release);
+        futex_wake(&session.header().doorbell, 1);
+    }
+
+    // All `slots` ops must reach the sink, and the session must live.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while sink.held.lock().expect("parked completions").len() < slots as usize {
+        assert!(
+            Instant::now() < deadline,
+            "only {} of {slots} honest ops were served",
+            sink.held.lock().expect("parked completions").len()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        METRICS.ipc_sessions_poisoned.load(Ordering::Relaxed),
+        poisoned_before,
+        "VAL-5c: the in-flight bound poisoned an HONEST client at exactly `slots`"
+    );
+    wait_sessions_active(1, "the honest session stays live");
+
+    // Completing them releases the ledger: the same session can serve
+    // another full window afterwards.
+    sink.held.lock().expect("parked completions").clear();
+    host.shutdown();
+}

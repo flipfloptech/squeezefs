@@ -37,8 +37,13 @@ pub(crate) fn admission_units(len: usize) -> u32 {
 /// Shared state of one area queue.
 pub(crate) struct AreaShared {
     pub table: FillTable,
-    pub free_cids: tokio::sync::Mutex<Vec<u16>>,
+    /// Free CID pool (std mutex — push/pop only, no await inside; lock
+    /// order where both are held: fill-table `pending` → `free_cids`).
+    pub free_cids: std::sync::Mutex<Vec<u16>>,
     pub cid_gate: tokio::sync::Semaphore,
+    /// CID namespace size (== queue depth) — the `cid_slots` diagnostic's
+    /// denominator (the MEM-3 no-leak instrument).
+    pub cid_capacity: usize,
     /// In-flight payload admission (see [`admission_permits`]).
     pub admission: tokio::sync::Semaphore,
     pub poisoned: AtomicBool,
@@ -48,8 +53,9 @@ impl AreaShared {
     pub(crate) fn new(depth: u16, area: &ZcrxArea) -> Arc<AreaShared> {
         Arc::new(AreaShared {
             table: FillTable::new(),
-            free_cids: tokio::sync::Mutex::new((0..depth).collect()),
+            free_cids: std::sync::Mutex::new((0..depth).collect()),
             cid_gate: tokio::sync::Semaphore::new(depth as usize),
+            cid_capacity: depth as usize,
             admission: tokio::sync::Semaphore::new(admission_permits(
                 area.len(),
                 area.chunk_bytes(),

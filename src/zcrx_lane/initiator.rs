@@ -70,8 +70,14 @@ struct Pending {
 
 struct QueueShared {
     pending: Mutex<std::collections::HashMap<u16, Pending>>,
-    free_cids: Mutex<Vec<u16>>,
+    /// Free CID pool (std mutex — critical sections are push/pop only,
+    /// no await inside; the FillTable precedent). Lock order where both
+    /// are held: `pending` → `free_cids`.
+    free_cids: std::sync::Mutex<Vec<u16>>,
     cid_gate: tokio::sync::Semaphore,
+    /// CID namespace size (== queue depth) — the `cid_slots` diagnostic's
+    /// denominator (the MEM-3 no-leak instrument).
+    cid_capacity: usize,
     poisoned: AtomicBool,
 }
 
@@ -291,6 +297,28 @@ impl LaneSession {
         backend: LaneBackend,
     ) -> Result<Arc<LaneSession>> {
         Self::connect_inner(target, backend).await
+    }
+
+    /// Free-CID diagnostics `(free, total)` summed over the session's
+    /// queues — the MEM-3 no-leak instrument: at quiescence (no op in
+    /// flight, cancelled ops completed by the target) `free == total`
+    /// on a healthy queue; anything less is a leaked CID.
+    pub fn cid_slots(&self) -> (usize, usize) {
+        let mut free = 0;
+        let mut total = 0;
+        for q in &self.queues {
+            match q {
+                QueueHandle::Classic(q) => {
+                    free += q.shared.free_cids.lock().expect("cid pool lock").len();
+                    total += q.shared.cid_capacity;
+                }
+                QueueHandle::Area(q) => {
+                    free += q.shared.free_cids.lock().expect("cid pool lock").len();
+                    total += q.shared.cid_capacity;
+                }
+            }
+        }
+        (free, total)
     }
 
     /// Area-chunk diagnostics `(free, total)` summed over the session's
@@ -610,6 +638,26 @@ impl LaneSession {
         self.read_into_wrapped(byte_offset, dest, len)
     }
 
+    /// Pool-backed destination read (the funnel's arm): `keepalive` is a
+    /// handle on the allocation behind `dest` (a clone of the pooled
+    /// `Bytes`); the lane holds it until no lane context can touch the
+    /// destination — the MEM-3 cancellation-custody law (a dropped caller
+    /// future must never let the pool recycle a buffer a reader task can
+    /// still write).
+    pub fn read_into_pooled(
+        &self,
+        byte_offset: u64,
+        dest: *mut u8,
+        len: usize,
+        keepalive: bytes::Bytes,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
+        // Scaffold (red): custody not yet wired — the keep-alive drops at
+        // issue, exactly the pre-MEM-3 behavior the contracts fail on.
+        drop(keepalive);
+        let dest = SendMutPtr(dest);
+        self.read_into_wrapped(byte_offset, dest, len)
+    }
+
     async fn read_into_wrapped(
         &self,
         byte_offset: u64,
@@ -699,7 +747,7 @@ impl LaneSession {
         let cid = shared
             .free_cids
             .lock()
-            .await
+            .expect("cid pool lock")
             .pop()
             .ok_or_else(|| io_err("lane CID pool exhausted (permit/pool desync)".into()))?;
         let rx = shared.table.insert(cid, len);
@@ -709,7 +757,7 @@ impl LaneSession {
         let capsule = pdu::encode_read_capsule(cid, self.target.nsid, slba, nlb, len as u32);
         if q.sink.send(capsule).is_err() {
             shared.table.cancel(cid);
-            shared.free_cids.lock().await.push(cid);
+            shared.free_cids.lock().expect("cid pool lock").push(cid);
             return Err(io_err("lane command sink gone".into()));
         }
 
@@ -743,7 +791,7 @@ impl LaneSession {
             }
         };
         if !shared.poisoned.load(Ordering::SeqCst) {
-            shared.free_cids.lock().await.push(cid);
+            shared.free_cids.lock().expect("cid pool lock").push(cid);
         }
         res
     }
@@ -768,7 +816,7 @@ impl LaneSession {
             .shared
             .free_cids
             .lock()
-            .await
+            .expect("cid pool lock")
             .pop()
             .ok_or_else(|| io_err("lane CID pool exhausted (permit/pool desync)".into()))?;
 
@@ -788,7 +836,7 @@ impl LaneSession {
         let capsule = pdu::encode_read_capsule(cid, self.target.nsid, slba, nlb, len as u32);
         if q.to_writer.send(capsule).is_err() {
             q.shared.pending.lock().await.remove(&cid);
-            q.shared.free_cids.lock().await.push(cid);
+            q.shared.free_cids.lock().expect("cid pool lock").push(cid);
             return Err(io_err("lane writer task gone".into()));
         }
 
@@ -817,7 +865,7 @@ impl LaneSession {
             }
         };
         if !q.shared.poisoned.load(Ordering::SeqCst) {
-            q.shared.free_cids.lock().await.push(cid);
+            q.shared.free_cids.lock().expect("cid pool lock").push(cid);
         }
         res
     }
@@ -826,8 +874,9 @@ impl LaneSession {
 fn spawn_queue(stream: TcpStream, depth: u16, session_poison: Arc<AtomicBool>) -> IoQueue {
     let shared = Arc::new(QueueShared {
         pending: Mutex::new(std::collections::HashMap::new()),
-        free_cids: Mutex::new((0..depth).collect()),
+        free_cids: std::sync::Mutex::new((0..depth).collect()),
         cid_gate: tokio::sync::Semaphore::new(depth as usize),
+        cid_capacity: depth as usize,
         poisoned: AtomicBool::new(false),
     });
     let (read_half, write_half) = stream.into_split();

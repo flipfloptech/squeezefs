@@ -32,6 +32,15 @@ struct MockCfg {
     /// Drop the connection mid-C2HData payload (mid-flight death
     /// injection — the PR Z2 poison-lattice venue).
     die_mid_c2h: bool,
+    /// Gate NVM Read service: each read acquires ONE permit before any
+    /// C2HData/response is emitted (the MEM-3 cancellation venue — the
+    /// test cancels the requester while the target withholds the
+    /// response, then `add_permits` releases the completions).
+    read_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// Read capsules received (counted at arrival, BEFORE the gate) —
+    /// the deterministic "capsule is on the wire" edge the cancellation
+    /// tests key their aborts on.
+    reads_seen: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl Default for MockCfg {
@@ -44,6 +53,8 @@ impl Default for MockCfg {
             corrupt_datao: false,
             c2h_pdo_pad: 0,
             die_mid_c2h: false,
+            read_gate: None,
+            reads_seen: None,
         }
     }
 }
@@ -161,6 +172,12 @@ async fn mock_conn(mut s: TcpStream, device: Arc<Vec<u8>>, cfg: MockCfg) -> Opti
             }
             0x02 => {
                 // NVM Read.
+                if let Some(seen) = &cfg.reads_seen {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                if let Some(gate) = &cfg.read_gate {
+                    gate.acquire().await.ok()?.forget();
+                }
                 let nsid = le32(&sqe[4..8]);
                 assert_eq!(nsid, 1, "lane must address the discovered nsid");
                 assert_eq!(sqe[39], 0x5A, "read must use the Transport SGL descriptor");
@@ -1151,4 +1168,238 @@ async fn test_z2_classic_backend_leaves_area_gauges_silent() {
     assert_eq!(zcrx_metric("gather_bytes"), before_gather);
     assert_eq!(zcrx_metric("area_bytes"), before_area);
     assert_eq!(zcrx_metric("admission_waits"), before_waits);
+}
+
+// ================================================================ MEM-3 laws
+// Cancellation safety (pre-rc spec §2 MEM-3 — the D5 gate chain's first
+// link): dropping a requester future mid-op must (a) never let the
+// destination allocation recycle while a lane context can still write it,
+// and (b) never leak the op's CID — after `queue_depth` cancellations the
+// pool would be empty and the lane silently degraded for the mount
+// lifetime. Cancellation is NOT a poison event: `zcrx_lane_poisoned` is a
+// must-stay-0 tripwire and routine future-drops must keep it honest.
+
+/// Poll `cond` until true or `secs` elapse (suite idiom — the existing
+/// poison-propagation tests poll the same way).
+async fn poll_true(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
+    tokio::time::timeout(std::time::Duration::from_secs(secs), async {
+        while !cond() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// Keep-alive canary: flips `flag` when the last `Bytes` clone drops —
+/// the observable for "the lane held the destination allocation".
+struct DropFlagOwner {
+    buf: Vec<u8>,
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AsRef<[u8]> for DropFlagOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+impl Drop for DropFlagOwner {
+    fn drop(&mut self) {
+        self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_mem3_classic_cancellation_returns_cids_and_lane_survives() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cfg = MockCfg {
+        read_gate: Some(Arc::clone(&gate)),
+        reads_seen: Some(Arc::clone(&seen)),
+        ..Default::default()
+    };
+    let mock = MockTarget::start(cfg, 1 << 20).await;
+    let before_poisoned = zcrx_metric("poisoned");
+    // One cancellation per queue (the mock services one connection
+    // sequentially, so a gated read parks that connection's parse loop —
+    // each cancel needs its own connection to observe the capsule edge).
+    let sess = LaneSession::connect(mock.target(4, 2)).await.expect("arm");
+    assert_eq!(sess.cid_slots(), (8, 8), "full pool at arm");
+
+    // Cancel one in-flight op per queue: each read's capsule reaches the
+    // target (withheld response), then the requester future is dropped.
+    // Destination buffers are TEST-OWNED and outlive the whole test so
+    // the un-fixed lane cannot scribble on freed memory while proving
+    // the CID leak.
+    let len = 32 * 1024usize;
+    let mut bufs: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; len]).collect();
+    for (i, buf) in bufs.iter_mut().enumerate() {
+        let sess2 = Arc::clone(&sess);
+        let ptr = buf.as_mut_ptr() as usize;
+        let h = tokio::spawn(async move {
+            let _ = sess2.read_into_ptr(0, ptr as *mut u8, len).await;
+        });
+        assert!(
+            poll_true(5, || seen.load(std::sync::atomic::Ordering::SeqCst) > i).await,
+            "read capsule {i} must reach the target before the cancel"
+        );
+        h.abort();
+        let _ = h.await;
+    }
+
+    // Release the withheld completions: once the driver finishes the
+    // abandoned ops every CID must return to the pool — a leak here is
+    // the mount-lifetime lane degradation MEM-3 names.
+    gate.add_permits(64);
+    assert!(
+        poll_true(5, || sess.cid_slots() == (8, 8)).await,
+        "cancelled ops must return their CIDs once the driver completes \
+         them (got {:?} of (8, 8))",
+        sess.cid_slots()
+    );
+
+    // The lane survives at full depth, content-correct, zero poison.
+    let mut buf = vec![0u8; 64 * 1024];
+    sess.read_into_slice(4096, &mut buf)
+        .await
+        .expect("post-cancellation read must succeed (no CID/permit desync)");
+    assert_eq!(&buf[..], &mock.device[4096..4096 + 64 * 1024]);
+    assert_eq!(
+        zcrx_metric("poisoned"),
+        before_poisoned,
+        "cancellation is not a poison event (the must-stay-0 tripwire \
+         stays honest under D5 default-on)"
+    );
+    drop(bufs);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_mem3_classic_cancellation_holds_destination_keepalive() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cfg = MockCfg {
+        read_gate: Some(Arc::clone(&gate)),
+        reads_seen: Some(Arc::clone(&seen)),
+        ..Default::default()
+    };
+    let mock = MockTarget::start(cfg, 1 << 20).await;
+    let before_poisoned = zcrx_metric("poisoned");
+    let sess = LaneSession::connect(mock.target(1, 4)).await.expect("arm");
+
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let len = 64 * 1024usize;
+    let buf = vec![0u8; len];
+    let ptr = buf.as_ptr() as usize; // Vec buffer address is stable across the move below
+    let keep = bytes::Bytes::from_owner(DropFlagOwner {
+        buf,
+        flag: Arc::clone(&flag),
+    });
+
+    let sess2 = Arc::clone(&sess);
+    let h = tokio::spawn(async move {
+        let _ = sess2
+            .read_into_pooled(0, ptr as *mut u8, len, keep)
+            .await;
+    });
+    assert!(
+        poll_true(5, || seen.load(std::sync::atomic::Ordering::SeqCst) > 0).await,
+        "read capsule must reach the target before the cancel"
+    );
+    h.abort();
+    let _ = h.await;
+
+    // The SendMutPtr custody law: with the requester future dropped and
+    // the completion still withheld, the reader task can still write the
+    // destination — the lane MUST be holding the keep-alive.
+    assert!(
+        !flag.load(std::sync::atomic::Ordering::SeqCst),
+        "cancellation must not release the destination allocation while \
+         a lane context can still write it (MEM-3 recycled-buffer write)"
+    );
+
+    // Completion releases custody: the abandoned entry drops, the buffer
+    // frees (no leak either), the CID returns, nothing poisoned.
+    gate.add_permits(64);
+    assert!(
+        poll_true(5, || flag.load(std::sync::atomic::Ordering::SeqCst)).await,
+        "the abandoned entry must release the keep-alive at completion"
+    );
+    assert!(
+        poll_true(5, || sess.cid_slots() == (4, 4)).await,
+        "abandoned op's CID must return (got {:?})",
+        sess.cid_slots()
+    );
+    assert_eq!(zcrx_metric("poisoned"), before_poisoned);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_mem3_area_cancellation_returns_cids_chunks_and_stays_clean() {
+    // The area lane's face of MEM-3: the driver never writes the
+    // destination (the requester gathers), but a dropped requester must
+    // still return its CID at driver completion, release every chunk
+    // ref (the fill drops in the dead completion channel), and leave
+    // admission accounting exact — all with zero poison.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cfg = MockCfg {
+        read_gate: Some(Arc::clone(&gate)),
+        reads_seen: Some(Arc::clone(&seen)),
+        ..Default::default()
+    };
+    let mock = MockTarget::start(cfg, 2 << 20).await;
+    let before_poisoned = zcrx_metric("poisoned");
+    // One cancellation per queue (one connection each — see the classic
+    // test's venue note).
+    let sess = LaneSession::connect_with(mock.target(2, 2), LaneBackend::AreaSim)
+        .await
+        .expect("area-sim arm");
+    assert_eq!(sess.cid_slots(), (4, 4));
+
+    let len = 64 * 1024usize;
+    let mut bufs: Vec<Vec<u8>> = (0..2).map(|_| vec![0u8; len]).collect();
+    for (i, buf) in bufs.iter_mut().enumerate() {
+        let sess2 = Arc::clone(&sess);
+        let ptr = buf.as_mut_ptr() as usize;
+        let h = tokio::spawn(async move {
+            let _ = sess2.read_into_ptr(0, ptr as *mut u8, len).await;
+        });
+        assert!(
+            poll_true(5, || seen.load(std::sync::atomic::Ordering::SeqCst) > i).await,
+            "read capsule {i} must reach the target before the cancel"
+        );
+        h.abort();
+        let _ = h.await;
+    }
+
+    gate.add_permits(64);
+    assert!(
+        poll_true(5, || sess.cid_slots() == (4, 4)).await,
+        "cancelled area ops must return their CIDs at driver completion \
+         (got {:?} of (4, 4))",
+        sess.cid_slots()
+    );
+    assert!(
+        poll_true(5, || {
+            let (free, total) = sess.area_chunks();
+            free == total
+        })
+        .await,
+        "abandoned fills must release every chunk ref (got {:?})",
+        sess.area_chunks()
+    );
+
+    // Full-depth follow-up read serves content-correct (admission and
+    // gate accounting are exact — no permit desync).
+    let mut buf = vec![0u8; 128 * 1024];
+    sess.read_into_slice(8192, &mut buf)
+        .await
+        .expect("post-cancellation area read");
+    assert_eq!(&buf[..], &mock.device[8192..8192 + 128 * 1024]);
+    assert_eq!(
+        zcrx_metric("poisoned"),
+        before_poisoned,
+        "area cancellation is not a poison event"
+    );
+    drop(bufs);
 }

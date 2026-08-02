@@ -550,6 +550,7 @@ async fn clean_unmount_drains_queued_reclaims() {
         uid: 0,
         gid: 0,
         pid: 0,
+        ..Default::default()
     };
     fs.destroy(req).await;
 
@@ -1157,6 +1158,7 @@ async fn make_field_harness(test_id: &str) -> FieldH {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     FieldH {
         fs: Arc::new(fs),

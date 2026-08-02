@@ -100,6 +100,7 @@ async fn make(uuid: [u8; 16], alloc_ns: &str, staging_write_budget: &str) -> H {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     H {
         fs,

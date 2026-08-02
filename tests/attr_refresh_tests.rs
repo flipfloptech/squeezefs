@@ -99,6 +99,7 @@ async fn make() -> H {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     H {
         fs,
@@ -564,6 +565,7 @@ async fn unprivileged_fallocate_drops_suid_sgid() {
         uid: 1000,
         gid: 1000,
         pid: 2,
+        ..Default::default()
     };
     h.fs.fallocate(user_req, ino, 0, 0, 65_536, 0)
         .await
@@ -592,6 +594,7 @@ async fn unprivileged_fallocate_drops_suid_sgid() {
         uid: 0,
         gid: 0,
         pid: 3,
+        ..Default::default()
     };
     h.fs.fallocate(root_req, ino, 0, 0, 65_536, 0)
         .await

@@ -452,6 +452,7 @@ async fn router_h(tag: &str, meta_path: &std::path::Path, staging: &std::path::P
         uid,
         gid,
         pid: 1234,
+        ..Default::default()
     };
     RouterH {
         fs,

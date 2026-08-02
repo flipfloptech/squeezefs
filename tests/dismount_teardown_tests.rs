@@ -88,6 +88,7 @@ async fn make() -> (SqueezefsFilesystem, Request, NamedTempFile, NamedTempFile) 
         uid: 0,
         gid: 0,
         pid: 0,
+        ..Default::default()
     };
     std::mem::forget(s); // staging dir must outlive the fs in this test
     (fs, req, b, m)

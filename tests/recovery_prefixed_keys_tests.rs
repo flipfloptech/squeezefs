@@ -181,6 +181,7 @@ async fn mount_h(specs: &[VolSpec], meta_path: &std::path::Path, format: bool) -
         uid,
         gid,
         pid: 1234,
+        ..Default::default()
     };
 
     H {

@@ -5476,6 +5476,31 @@ impl SqueezefsFilesystem {
         let (t_wake_writes, t_wakes_elided) = fuse3::transport_wake_stats();
         #[cfg(not(target_os = "linux"))]
         let (t_wake_writes, t_wakes_elided) = (0u64, 0u64);
+        // FUSE-2 reply integrity (pre-RC spec): the exactly-one-reply
+        // invariant's instruments, ALWAYS ON (the two detectors that
+        // existed before were `transport_debug`-gated, i.e. off in
+        // production). `transport_requests_abandoned` is the must-stay-0
+        // tripwire — growth means a request left its ring slot with no
+        // COMMIT_AND_FETCH, i.e. an application parked in uninterruptible
+        // sleep and an `umount` that returns EBUSY.
+        #[cfg(target_os = "linux")]
+        let (
+            t_failed_synthetic,
+            t_abandoned,
+            t_refused_stale,
+            t_dropped_no_slot,
+            t_ents_retired,
+            t_slots_overdue,
+        ) = fuse3::transport_reply_integrity_stats();
+        #[cfg(not(target_os = "linux"))]
+        let (
+            t_failed_synthetic,
+            t_abandoned,
+            t_refused_stale,
+            t_dropped_no_slot,
+            t_ents_retired,
+            t_slots_overdue,
+        ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         // D3.a (design-metadata-throughput §5.3/§9): COMMIT_AND_FETCH SQEs
         // per queue-worker ring flush. Mean batch (commits / flushes) ≈ 1
         // under storm load means the S2 submit batching regressed to
@@ -6030,6 +6055,14 @@ impl SqueezefsFilesystem {
                 "transport_commit_batch_commits": t_cb_commits,
                 "transport_wake_writes": t_wake_writes,
                 "transport_wakes_elided": t_wakes_elided,
+                // FUSE-2 reply integrity (spec §4 FUSE-2): see the gather
+                // site above. `transport_requests_abandoned` must stay 0.
+                "transport_requests_failed_synthetic": t_failed_synthetic,
+                "transport_requests_abandoned": t_abandoned,
+                "transport_replies_refused_stale": t_refused_stale,
+                "transport_replies_dropped_no_slot": t_dropped_no_slot,
+                "transport_ents_retired": t_ents_retired,
+                "transport_slots_overdue": t_slots_overdue,
                 // Shim-parity 2026-07-28 (ingest-economy board item 2):
                 // dead-TPC-lane re-dispatches — 0 on a healthy daemon;
                 // any growth = a handler lane thread died and its
@@ -13200,7 +13233,7 @@ impl Filesystem for SqueezefsFilesystem {
             conn_guard
                 .as_ref()
                 .as_ref()
-                .and_then(|conn| conn.get_payload_buffer(_req.unique))
+                .and_then(|conn| conn.get_payload_buffer(_req.slot))
                 .map(|(ptr, _sz)| ptr)
         });
 

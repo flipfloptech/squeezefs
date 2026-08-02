@@ -153,6 +153,7 @@ async fn make_with(test_id: &str, write_disk: &str, block_size: &str) -> H {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     H {
         fs,

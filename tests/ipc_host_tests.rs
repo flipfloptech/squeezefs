@@ -1220,6 +1220,7 @@ async fn bootstrap_xattr_synthesis_filter_and_stats_fields() {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: std::process::id(),
+        ..Default::default()
     };
 
     let create = fs

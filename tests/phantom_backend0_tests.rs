@@ -161,6 +161,7 @@ async fn harness(volume_names: &[&str]) -> H {
         uid,
         gid,
         pid: 1234,
+        ..Default::default()
     };
 
     H {

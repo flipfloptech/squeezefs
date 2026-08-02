@@ -289,6 +289,7 @@ fn req() -> Request {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 4242,
+        ..Default::default()
     }
 }
 

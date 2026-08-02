@@ -112,6 +112,7 @@ async fn make_with(block_size: &str, uuid: [u8; 16], alloc_ns: &str) -> H {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     H {
         fs,

@@ -137,6 +137,7 @@ async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     H {
         fs,
@@ -674,6 +675,7 @@ async fn crash_with_ooo_parked_segments_leaves_old_blocks_intact() {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             pid: 1,
+            ..Default::default()
         };
         let b = NamedTempFile::new().unwrap();
         let m = NamedTempFile::new().unwrap();

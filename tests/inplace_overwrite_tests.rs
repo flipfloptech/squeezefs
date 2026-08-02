@@ -148,6 +148,7 @@ async fn make_harness(test_id: &str) -> H {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     H {
         fs: Arc::new(fs),

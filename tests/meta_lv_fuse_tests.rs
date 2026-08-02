@@ -112,6 +112,7 @@ async fn test_metalv_fuse_integration() {
         uid,
         gid,
         pid: 1234,
+        ..Default::default()
     };
 
     // 1. FUSE lookup non-existent: a MISS is a cacheable negative entry

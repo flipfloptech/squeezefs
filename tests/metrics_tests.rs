@@ -136,6 +136,7 @@ async fn stats_snapshot_getattr_size_matches_served_bytes_under_churn() {
         uid: 1000,
         gid: 1000,
         pid: 1,
+        ..Default::default()
     };
 
     // Two full "cat" cycles with counter churn in the middle of each —

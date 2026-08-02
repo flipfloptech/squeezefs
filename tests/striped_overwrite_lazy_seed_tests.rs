@@ -105,6 +105,7 @@ async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     H {
         fs,
@@ -502,6 +503,7 @@ async fn crash_inside_window_leaves_old_block_intact() {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             pid: 1,
+            ..Default::default()
         };
         // Dummy owned tempfiles: the REAL volumes are the caller's.
         let b = NamedTempFile::new().unwrap();

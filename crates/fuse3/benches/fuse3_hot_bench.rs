@@ -22,6 +22,13 @@
 //!   regions, the state machine only; the kernel surface needs the sqz
 //!   kernel. Geometry: depth 32 (the Q_DEPTH clamp), 1 MiB payloads
 //!   (the L1 full-size payload-buffer law).
+//! * `reply_addressing` — FUSE-2 ⊕ PERF-16: answering "where does this
+//!   reply go?". The `pending_map_*` arms reproduce the DELETED sharded
+//!   `unique → (qid, ent_idx, commit_id)` map (64 shards, `unique >> 1`
+//!   selector, depth-32 queues, kernel-shaped uniques stepping by 2) so
+//!   the win stays measurable once the map is out of the tree; the
+//!   `carried_slot_*` arms are the shipped path, where the address rides
+//!   the request.
 //! * `conn_prelude` — the session pool-slot probes the request path pays
 //!   4× per READ (pre-rc spec PERF-2: dispatch venue, reply venue,
 //!   payload-buffer resolve, ready gate — ~4 M slot reads/s at 1 M
@@ -40,6 +47,7 @@ use fuse3::raw::abi::{fuse_attr, fuse_attr_out, fuse_entry_out, fuse_in_header, 
 use fuse3::raw::connection::fuse_over_uring::{CommitBatchHistogram, FuseOverUring};
 use fuse3::raw::connection::kmbuf::{KmbufQueue, IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_BUFFER};
 use fuse3::raw::connection::FuseConnection;
+use fuse3::raw::{ReplySlot, Request};
 use fuse3::raw::reply::FileAttr;
 use fuse3::{FileType, Timestamp};
 use std::hint::black_box;
@@ -227,13 +235,155 @@ fn bench_conn_prelude(c: &mut Criterion) {
         b.iter(|| black_box(conn.over_uring_ready()));
     });
 
-    // Armed READ-reply prelude: slot probe + sharded pending miss (the
-    // reply body is not an arena slice — the common non-zc shape).
+    // Armed READ-reply prelude: the slot probe + a direct
+    // (qid, ent_idx) index — the shape the reply path pays per READ.
+    let slot = ReplySlot::Ring {
+        qid: 0,
+        ent_idx: 7,
+        commit_id: 0xDEAD_BEEF,
+    };
     group.bench_function("payload_buffer_probe_armed", |b| {
-        b.iter(|| black_box(conn.get_payload_buffer(black_box(0xDEAD_BEEF))));
+        b.iter(|| black_box(conn.get_payload_buffer(black_box(slot))));
     });
 
     group.finish();
+}
+
+/// FUSE-2 ⊕ PERF-16 — reply ADDRESSING: what it costs to answer "where
+/// does this reply go?" on every request.
+///
+/// Before: a sharded `unique → (qid, ent_idx, commit_id)` map, paid
+/// three times per request (insert at delivery, get in the handler's
+/// payload-buffer resolve, remove at reply) — a mutex acquisition plus a
+/// hash probe each time, across 32 queue workers plus the handler and
+/// reply tasks. After: the address rides the request, so the reply is a
+/// move of three integers.
+///
+/// The `pending_map_*` arms reproduce the DELETED map exactly (64
+/// shards, `unique >> 1` selector — kernel uniques step by 2 because bit
+/// 0 is `FUSE_INT_REQ_BIT`, so the low bit carried no entropy) so the
+/// delta stays measurable after the map is gone from the tree. Shape:
+/// depth-32 queues (the `Q_DEPTH_DESIRED` clamp), uniques stepping by 2
+/// like the kernel's.
+fn bench_reply_addressing(c: &mut Criterion) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    const SHARDS: usize = 64;
+    const DEPTH: usize = 32;
+
+    struct PendingMap {
+        shards: Vec<Mutex<HashMap<u64, (u16, u16, u64)>>>,
+    }
+
+    impl PendingMap {
+        fn new() -> Self {
+            Self {
+                shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            }
+        }
+        #[inline]
+        fn shard(&self, unique: u64) -> &Mutex<HashMap<u64, (u16, u16, u64)>> {
+            &self.shards[((unique >> 1) as usize) & (SHARDS - 1)]
+        }
+        fn insert(&self, unique: u64, v: (u16, u16, u64)) {
+            self.shard(unique).lock().unwrap().insert(unique, v);
+        }
+        fn get(&self, unique: u64) -> Option<(u16, u16, u64)> {
+            self.shard(unique).lock().unwrap().get(&unique).copied()
+        }
+        fn remove(&self, unique: u64) -> Option<(u16, u16, u64)> {
+            self.shard(unique).lock().unwrap().remove(&unique)
+        }
+    }
+
+    let mut group = c.benchmark_group("fuse3_reply_addressing");
+    group.throughput(Throughput::Elements(1));
+
+    let map = PendingMap::new();
+    let mut unique = 2u64;
+
+    // The FULL per-request address round trip: what the map cost from
+    // delivery to reply (insert → handler probe → reply remove).
+    group.bench_function("pending_map_request_roundtrip", |b| {
+        b.iter(|| {
+            let u = unique;
+            unique = unique.wrapping_add(2);
+            let ent = (u as usize / 2) % DEPTH;
+            map.insert(u, (0, ent as u16, u));
+            black_box(map.get(u));
+            black_box(map.remove(u))
+        });
+    });
+
+    // The same round trip on the shipped path: the address is BORN with
+    // the request and travels with it — nothing to look up, nothing to
+    // remove.
+    group.bench_function("carried_slot_request_roundtrip", |b| {
+        b.iter(|| {
+            let u = unique;
+            unique = unique.wrapping_add(2);
+            let ent = ((u as usize / 2) % DEPTH) as u16;
+            let slot = ReplySlot::Ring {
+                qid: 0,
+                ent_idx: ent,
+                commit_id: u,
+            };
+            let mut req = Request {
+                unique: u,
+                uid: 0,
+                gid: 0,
+                pid: 0,
+                slot,
+            };
+            req.slot = black_box(req.slot);
+            black_box(resolve_ring_slot(black_box(req.slot)))
+        });
+    });
+
+    // The single reply-time lookup in isolation (the `submit_reply`
+    // prelude: one hash + one mutex, vs a three-word destructure).
+    let hot: Vec<u64> = (0..DEPTH as u64).map(|i| 2 + i * 2).collect();
+    for u in &hot {
+        map.insert(*u, (0, ((*u / 2) % DEPTH as u64) as u16, *u));
+    }
+    group.bench_function("pending_map_reply_lookup", |b| {
+        let mut i = 0usize;
+        b.iter(|| {
+            let u = hot[i % hot.len()];
+            i += 1;
+            black_box(map.get(black_box(u)))
+        });
+    });
+    group.bench_function("carried_slot_reply_lookup", |b| {
+        let mut i = 0usize;
+        b.iter(|| {
+            let u = hot[i % hot.len()];
+            i += 1;
+            let slot = ReplySlot::Ring {
+                qid: 0,
+                ent_idx: ((u / 2) % DEPTH as u64) as u16,
+                commit_id: u,
+            };
+            black_box(resolve_ring_slot(black_box(slot)))
+        });
+    });
+
+    group.finish();
+}
+
+/// The shipped reply-address resolve: destructure the slot the request
+/// carried (`submit_reply`'s prelude).
+#[inline]
+fn resolve_ring_slot(slot: ReplySlot) -> Option<(u16, u16, u64)> {
+    match slot {
+        ReplySlot::Ring {
+            qid,
+            ent_idx,
+            commit_id,
+        } => Some((qid, ent_idx, commit_id)),
+        ReplySlot::Classical => None,
+    }
 }
 
 criterion_group!(
@@ -241,6 +391,7 @@ criterion_group!(
     bench_ent_codec,
     bench_commit_batch,
     bench_kmbuf_attach,
-    bench_conn_prelude
+    bench_conn_prelude,
+    bench_reply_addressing
 );
 criterion_main!(benches);

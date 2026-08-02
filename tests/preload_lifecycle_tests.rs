@@ -107,6 +107,7 @@ fn req() -> Request {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: std::process::id(),
+        ..Default::default()
     }
 }
 

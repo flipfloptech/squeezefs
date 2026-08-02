@@ -398,6 +398,9 @@ impl DataPlaneSink {
             uid: self.req_uid,
             gid: self.req_gid,
             pid: self.req_pid,
+            // Ring-origin op: the reply rides the IPC completion, not a
+            // FUSE ring slot.
+            slot: fuse3::raw::ReplySlot::Classical,
         }
     }
 

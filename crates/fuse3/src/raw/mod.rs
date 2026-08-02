@@ -12,7 +12,8 @@ use bytes::Bytes;
 pub use connection::fuse_over_uring::{
     numa_local_bytes, numa_remote_bytes, over_uring_classical_sideband,
     over_uring_commit_batch_stats, over_uring_geometry, over_uring_negotiated_write,
-    over_uring_sessions_active, over_uring_stats, transport_lease_stats, transport_wake_stats,
+    over_uring_sessions_active, over_uring_stats, transport_lease_stats,
+    transport_reply_integrity_stats, transport_wake_stats,
     COMMIT_BATCH_LABELS,
 };
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
@@ -24,7 +25,7 @@ pub use read_phase::{
     write_inplace_replies, write_transport_phase_record, write_transport_phase_snapshot,
     TransportPhase,
 };
-pub use request::Request;
+pub use request::{ReplySlot, Request};
 #[cfg(feature = "tokio-runtime")]
 pub use session::{
     kernel_init_info, negotiated_reply_flags, tpc_lane_redispatches, tpc_spawn, tpc_spawn_on_node,
@@ -39,6 +40,19 @@ pub(crate) type FuseData = Either<
         Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     ),
 >;
+
+/// One reply travelling to the reply task: the serialized bytes plus the
+/// **slot they must be committed against** (FUSE-2 ⊕ PERF-16).
+///
+/// Carrying the address with the reply is what replaced the transport's
+/// sharded `unique → (qid, ent_idx, commit_id)` map: the reply task no
+/// longer asks "where does this unique live?" (three sharded-mutex
+/// acquisitions per request), it commits against the slot the request
+/// was delivered on.
+pub(crate) struct FuseReply {
+    pub(crate) data: FuseData,
+    pub(crate) slot: request::ReplySlot,
+}
 
 // `pub` + doc(hidden) for the microbench program (2026-08-04): the
 // transport bench (`benches/fuse3_hot_bench.rs`) measures the per-op

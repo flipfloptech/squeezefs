@@ -592,6 +592,8 @@ impl DirectDriveEngine {
                 uid: self.req_uid,
                 gid: self.req_gid,
                 pid: self.req_pid,
+                // Ring-origin op: no kernel delivery, no reply slot.
+                slot: fuse3::raw::ReplySlot::Classical,
             };
             crate::ipc_service::spawn_read_handoff(Arc::clone(&self.fs), request, op, completion);
         }

@@ -5,9 +5,7 @@ use std::os::unix::ffi::OsStrExt;
 
 use bincode::Options;
 use bytes::{Buf, Bytes};
-use futures_channel::mpsc::UnboundedSender;
 use futures_util::future::Either;
-use futures_util::sink::SinkExt;
 
 use crate::helper::get_bincode_config;
 use crate::raw::abi::{
@@ -18,16 +16,19 @@ use crate::raw::abi::{
     FUSE_NOTIFY_POLL_WAKEUP_OUT_SIZE, FUSE_NOTIFY_RETRIEVE_OUT_SIZE, FUSE_NOTIFY_STORE_OUT_SIZE,
     FUSE_OUT_HEADER_SIZE,
 };
-use crate::raw::FuseData;
+use crate::raw::session::ReplyTx;
 
 #[derive(Debug, Clone)]
 /// notify kernel there are something need to handle.
 pub struct Notify {
-    sender: UnboundedSender<FuseData>,
+    /// Daemon-initiated notifications carry no request and owe no reply
+    /// — they ride the classical device write (FUSE-2's `ReplySlot`
+    /// routing sends them there by construction).
+    sender: ReplyTx,
 }
 
 impl Notify {
-    pub(crate) fn new(sender: UnboundedSender<FuseData>) -> Self {
+    pub(crate) fn new(sender: ReplyTx) -> Self {
         Self { sender }
     }
 

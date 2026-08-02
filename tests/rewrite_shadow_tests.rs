@@ -150,6 +150,7 @@ async fn make_harness_on(
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     H {
         fs: Arc::new(fs),

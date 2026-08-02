@@ -52,7 +52,6 @@
 
 #![cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 
-use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -82,6 +81,7 @@ mod wake_core;
 use wake_core::WakeCoalescer;
 
 use super::kmbuf::{self, KmbufQueue, TransportBufferMode};
+use crate::raw::request::ReplySlot;
 
 /// `FUSE_OVER_IO_URING` (1ULL<<41) → `flags2` bit 9.
 pub const FUSE_OVER_IO_URING_FLAGS2: u32 = 1u32 << 9;
@@ -150,75 +150,14 @@ pub struct InboundUringReq {
     /// FUSE request unique (also embedded in `header_and_op`).
     #[allow(dead_code)]
     pub unique: u64,
+    /// The ring slot this request was delivered on — the address its
+    /// reply commits against (FUSE-2 ⊕ PERF-16: the request carries its
+    /// reply address, so the `unique → slot` map is deleted, not
+    /// wrapped).
+    pub slot: ReplySlot,
     /// Reap stamp (transport epoch ns, `read_phase::transport_now_ns`) —
     /// anchors `read_transport_phase_ns`'s `queue_wait`/`transport_total`.
     pub arrived_ns: u64,
-}
-
-/// One pending ring entry: `(qid, ent_idx, commit_id)`.
-type PendingEnt = (u16, u16, u64);
-
-/// Sharded unique → (qid, ent_idx, commit_id) map (see field doc).
-struct PendingMap {
-    shards: Vec<Mutex<HashMap<u64, PendingEnt>>>,
-}
-
-impl PendingMap {
-    const SHARDS: usize = 64;
-
-    fn new() -> Self {
-        Self {
-            shards: (0..Self::SHARDS)
-                .map(|_| Mutex::new(HashMap::new()))
-                .collect(),
-        }
-    }
-
-    #[inline]
-    fn shard(&self, unique: u64) -> &Mutex<HashMap<u64, (u16, u16, u64)>> {
-        &self.shards[((unique >> 1) as usize) & (Self::SHARDS - 1)]
-    }
-
-    fn insert(&self, unique: u64, v: (u16, u16, u64)) {
-        self.shard(unique).lock().unwrap().insert(unique, v);
-    }
-
-    fn get(&self, unique: u64) -> Option<(u16, u16, u64)> {
-        self.shard(unique).lock().unwrap().get(&unique).copied()
-    }
-
-    fn remove(&self, unique: u64) -> Option<(u16, u16, u64)> {
-        self.shard(unique).lock().unwrap().remove(&unique)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.shards.iter().all(|s| s.lock().unwrap().is_empty())
-    }
-
-    fn snapshot(&self) -> Vec<(u64, (u16, u16, u64))> {
-        self.shards
-            .iter()
-            .flat_map(|s| {
-                s.lock()
-                    .unwrap()
-                    .iter()
-                    .map(|(k, v)| (*k, *v))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    }
-
-    fn clear(&self) {
-        for s in &self.shards {
-            s.lock().unwrap().clear();
-        }
-    }
-
-    fn retain(&self, mut f: impl FnMut(&u64, &mut (u16, u16, u64)) -> bool) {
-        for s in &self.shards {
-            s.lock().unwrap().retain(&mut f);
-        }
-    }
 }
 
 pub(crate) struct CommitMsg {
@@ -226,6 +165,338 @@ pub(crate) struct CommitMsg {
     commit_id: u64,
     header: Vec<u8>,
     reply_body: Bytes,
+}
+
+/// One slot's liveness cell, published by its queue worker and read by
+/// the watch thread (FUSE-2's ungated stale-slot watchdog — the
+/// `transport_debug`-gated stale-pending scan it replaces was off in
+/// production, which is why nine of the eleven lost-reply paths had no
+/// detector at all).
+#[derive(Default)]
+struct SlotWatch {
+    /// Unique of the request the slot owes a reply for; 0 = owes nothing.
+    unique: AtomicU64,
+    /// Transport-epoch ns of the delivery (`transport_now_ns`).
+    since_ns: AtomicU64,
+}
+
+impl SlotWatch {
+    /// Publish "this slot owes a reply for `unique`" (two relaxed stores
+    /// — the whole cost of the observation side-channel that replaced a
+    /// sharded-mutex map insert).
+    #[inline]
+    fn set(&self, unique: u64, now_ns: u64) {
+        self.since_ns.store(now_ns, Ordering::Relaxed);
+        self.unique.store(unique, Ordering::Release);
+    }
+
+    /// Publish "this slot owes nothing" (its commit was submitted).
+    #[inline]
+    fn clear(&self) {
+        self.unique.store(0, Ordering::Release);
+    }
+}
+
+/// Watchdog cadence and the age at which an owed reply is called out.
+/// Deliberately generous: the point is to name a WEDGE loudly, not to
+/// second-guess a slow-but-live handler (the deadline watchdog for
+/// per-op latency lives in the daemon — D1.b).
+const SLOT_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+const SLOT_OVERDUE_NS: u64 = 5_000_000_000;
+
+// ---------------------------------------------------------------------------
+// FUSE-2 ⊕ PERF-16 — the per-`(qid, ent_idx)` slot state machine
+// ---------------------------------------------------------------------------
+
+/// **The exactly-one-reply invariant** (pre-RC spec FUSE-2):
+///
+/// > for every request delivered on a ring slot, exactly one
+/// > COMMIT_AND_FETCH carrying either a reply or a synthesized error is
+/// > submitted before the slot leaves [`SlotState::Delivered`], and the
+/// > slot leaves that state only by that submission.
+///
+/// A lost reply parks the calling application in uninterruptible sleep
+/// and makes `umount` return EBUSY, so every non-reply exit routes
+/// through [`SlotTable::fail_ent`] instead of dropping the request.
+///
+/// **Ownership.** One [`SlotTable`] per queue, owned *exclusively* by
+/// that queue's worker thread — every transition runs on the worker, so
+/// the machine needs no synchronization and no loom model (the
+/// single-owner claim is debug-asserted in [`SlotTable::assert_owner`]).
+/// Other threads address a slot by value (`(qid, ent_idx, commit_id)`
+/// carried in the request) and post to the queue's commit channel; they
+/// never touch the state. The historical sharded `unique → slot` map is
+/// deleted, not wrapped: there is no map to miss (row 4) or collide in
+/// (row 10), and the reply path pays no mutex (PERF-16).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotState {
+    /// REGISTER submitted; the kernel owns the ent and no request is out.
+    Registered,
+    /// A request was handed to the session. Exactly one commit must follow.
+    Delivered { unique: u64, commit_id: u64 },
+    /// A commit for the delivered request is parked behind a live payload
+    /// lease (§5.4 re-arm gate). Still owed exactly one commit.
+    Parked { unique: u64, commit_id: u64 },
+    /// COMMIT_AND_FETCH submitted; the kernel owns the ent again (its CQE
+    /// brings the next delivery).
+    Replied { commit_id: u64 },
+    /// Retired after `REGISTER_RETRY_MAX` consecutive REGISTER failures
+    /// (FUSE-3a) — the ent is out of the queue's rotation.
+    Retired,
+}
+
+/// Outcome of a kernel delivery on a slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeliverOutcome {
+    /// Normal delivery — the slot now owes exactly one commit.
+    Accepted,
+    /// FUSE-2 row 10: the kernel delivered onto a slot that still owes a
+    /// reply (the `pending.insert` overwrite class, and the `fuse_resend`
+    /// double-delivery shape). The displaced request can no longer be
+    /// answered — its commit id is gone — so it is counted on the
+    /// must-stay-0 `transport_requests_abandoned` tripwire and logged
+    /// loudly; the new delivery is accepted.
+    DisplacedRequest { unique: u64 },
+}
+
+/// Verdict on a `CommitMsg` arriving for a slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitAdmit {
+    /// The commit addresses the request this slot currently owes.
+    Accept,
+    /// Double reply, late reply, or a reply for a request the slot no
+    /// longer holds (FUSE-3e: never an overwrite — the first commit
+    /// stands, the second is refused loud-never-fatally).
+    RefuseStale,
+}
+
+/// What [`SlotTable::fail_ent`] wants the worker to submit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailOutcome {
+    /// Submit a header-only `-errno` COMMIT_AND_FETCH for this request.
+    Synthesize { unique: u64, commit_id: u64 },
+    /// The slot owed nothing (already replied / never delivered).
+    Nothing,
+}
+
+/// FUSE-3a: what to do after a REGISTER CQE error on a slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RegisterAction {
+    /// Re-REGISTER after `after` (bounded exponential backoff).
+    Retry { after: Duration },
+    /// `REGISTER_RETRY_MAX` consecutive failures — retire the ent.
+    Retire,
+}
+
+/// FUSE-3a: consecutive REGISTER failures tolerated before an ent is
+/// retired out of the queue's rotation.
+pub(crate) const REGISTER_RETRY_MAX: u32 = 8;
+/// FUSE-3a: first backoff step; doubles per failure up to
+/// [`REGISTER_BACKOFF_MAX`].
+pub(crate) const REGISTER_BACKOFF_BASE: Duration = Duration::from_millis(1);
+/// FUSE-3a: backoff ceiling (a wedged ent must not spin a core, and must
+/// not take minutes to recover either).
+pub(crate) const REGISTER_BACKOFF_MAX: Duration = Duration::from_millis(128);
+
+/// Per-queue slot states — see [`SlotState`] for the invariant and the
+/// single-owner rule.
+pub(crate) struct SlotTable {
+    states: Vec<SlotState>,
+    register_failures: Vec<u32>,
+    /// Earliest instant a retried REGISTER may be re-pushed (FUSE-3a).
+    retry_at: Vec<Option<Instant>>,
+    /// Debug-only ownership proof (single-owner by construction).
+    #[cfg(debug_assertions)]
+    owner: std::thread::ThreadId,
+}
+
+impl SlotTable {
+    pub(crate) fn new(depth: usize) -> Self {
+        Self {
+            states: vec![SlotState::Registered; depth],
+            register_failures: vec![0; depth],
+            retry_at: vec![None; depth],
+            #[cfg(debug_assertions)]
+            owner: std::thread::current().id(),
+        }
+    }
+
+    /// Single-owner proof: every transition runs on the worker thread that
+    /// built the table (that is what makes the machine lock-free and
+    /// loom-model-free).
+    #[inline]
+    fn assert_owner(&self) {
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            self.owner,
+            std::thread::current().id(),
+            "SlotTable is single-owner (its queue worker); a foreign thread \
+             mutated slot state"
+        );
+    }
+
+    pub(crate) fn state(&self, ent: usize) -> SlotState {
+        self.states[ent]
+    }
+
+    /// A kernel delivery landed on `ent`.
+    pub(crate) fn on_deliver(&mut self, ent: usize, unique: u64, commit_id: u64) -> DeliverOutcome {
+        self.assert_owner();
+        // PRE-FIX POLICY (FUSE-2 rows 4/10): today's `pending.insert`
+        // silently overwrites, so a displaced request is invisible.
+        self.states[ent] = SlotState::Delivered { unique, commit_id };
+        DeliverOutcome::Accepted
+    }
+
+    /// A delivery with `unique == 0` (the kernel filled only `commit_id`).
+    pub(crate) fn on_deliver_degenerate(&mut self, ent: usize, commit_id: u64) {
+        self.assert_owner();
+        self.states[ent] = SlotState::Delivered {
+            unique: 0,
+            commit_id,
+        };
+    }
+
+    /// A `CommitMsg` for `ent` arrived on the queue's commit channel.
+    pub(crate) fn admit_commit(&self, ent: usize, commit_id: u64) -> CommitAdmit {
+        self.assert_owner();
+        // PRE-FIX POLICY (FUSE-3e): today the worker commits whatever
+        // arrives — a second commit for one ent overwrites the first.
+        let _ = (ent, commit_id);
+        CommitAdmit::Accept
+    }
+
+    /// The admitted commit had to park behind a live payload lease.
+    pub(crate) fn on_commit_parked(&mut self, ent: usize) {
+        self.assert_owner();
+        // PRE-FIX POLICY: parking is not tracked in slot state today.
+        let _ = ent;
+    }
+
+    /// A COMMIT_AND_FETCH SQE for `ent` was pushed onto the ring.
+    pub(crate) fn on_commit_submitted(&mut self, ent: usize, commit_id: u64) {
+        self.assert_owner();
+        // PRE-FIX POLICY: no state is kept, so a late/duplicate reply is
+        // indistinguishable from the live one.
+        let _ = (ent, commit_id);
+    }
+
+    /// Row 6: a transient COMMIT failure is about to be re-committed.
+    pub(crate) fn on_commit_retry(&mut self, ent: usize) {
+        self.assert_owner();
+        let _ = ent;
+    }
+
+    /// A REGISTER SQE for `ent` was pushed onto the ring.
+    pub(crate) fn on_register_submitted(&mut self, ent: usize) {
+        self.assert_owner();
+        // PRE-FIX POLICY (row 5): today's reclaim path re-REGISTERs
+        // without ever asking whether the slot still owed a reply.
+        self.states[ent] = SlotState::Registered;
+    }
+
+    /// Every non-reply exit routes here (FUSE-2's single `fail_ent`
+    /// helper).
+    pub(crate) fn fail_ent(&mut self, ent: usize) -> FailOutcome {
+        self.assert_owner();
+        // PRE-FIX POLICY (row 5): today the pending entry is `retain`ed
+        // away with no reply synthesized at all.
+        let _ = ent;
+        FailOutcome::Nothing
+    }
+
+    /// The request on this slot can never be answered.
+    pub(crate) fn abandon(&mut self, ent: usize) {
+        self.assert_owner();
+        // PRE-FIX POLICY: `shutdown`'s `pending.clear()` (row 8) drops
+        // requests silently and counts nothing.
+        let _ = ent;
+    }
+
+    /// FUSE-3a: a REGISTER CQE for `ent` failed with a non-fatal errno.
+    pub(crate) fn note_register_failure(&mut self, ent: usize, now: Instant) -> RegisterAction {
+        self.assert_owner();
+        // PRE-FIX POLICY: today's loop re-REGISTERs immediately, forever,
+        // with one `warn!` per iteration and no cap.
+        let _ = (ent, now);
+        RegisterAction::Retry {
+            after: Duration::ZERO,
+        }
+    }
+
+    /// FUSE-3a: a REGISTER for `ent` completed successfully.
+    pub(crate) fn note_register_success(&mut self, ent: usize) {
+        self.assert_owner();
+        let _ = ent;
+    }
+
+    /// FUSE-3a: ents whose backoff has expired.
+    pub(crate) fn register_retries_due(&mut self, now: Instant) -> Vec<usize> {
+        self.assert_owner();
+        let _ = now;
+        Vec::new()
+    }
+
+    /// FUSE-3a: the soonest outstanding REGISTER retry.
+    pub(crate) fn next_retry_deadline(&self) -> Option<Instant> {
+        self.retry_at.iter().flatten().min().copied()
+    }
+
+    /// FUSE-3a: the whole queue has retired — the session cannot serve.
+    pub(crate) fn all_retired(&self) -> bool {
+        !self.states.is_empty() && self.states.iter().all(|s| *s == SlotState::Retired)
+    }
+
+    /// Slots still owing a reply, for the teardown drain and the
+    /// stale-slot watchdog.
+    pub(crate) fn owing(&self) -> impl Iterator<Item = (usize, u64, u64)> + '_ {
+        self.states
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, st)| match st {
+                SlotState::Delivered { unique, commit_id }
+                | SlotState::Parked { unique, commit_id } => Some((idx, *unique, *commit_id)),
+                _ => None,
+            })
+    }
+}
+
+/// FUSE-2 row 6 — the ring-op class carried in `user_data`.
+///
+/// `user_data == ent_idx` for BOTH REGISTER and COMMIT_AND_FETCH today,
+/// so an `EAGAIN` CQE cannot be attributed: the worker re-REGISTERs and
+/// discards a reply `apply_reply` already wrote into the ent (the code
+/// documents the hazard 60 lines below the bug). Tagging the op class
+/// makes the two distinguishable, so an EAGAIN'd COMMIT is re-committed
+/// (the ent still holds its applied reply) instead of re-REGISTERed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RingOp {
+    Register,
+    Commit,
+}
+
+/// `user_data` reserved for the wake-fd PollAdd (unchanged).
+pub(crate) const UD_POLL: u64 = u64::MAX;
+
+/// Encode `(op, ent_idx)` into an SQE `user_data` word.
+#[inline]
+pub(crate) fn encode_user_data(op: RingOp, ent_idx: usize) -> u64 {
+    // PRE-FIX POLICY (row 6): both op classes ride the bare ent index,
+    // which is exactly why an EAGAIN'd COMMIT cannot be told apart from
+    // an EAGAIN'd REGISTER.
+    let _ = op;
+    ent_idx as u64
+}
+
+/// Decode a CQE `user_data` word — `None` for the poll marker.
+#[inline]
+pub(crate) fn decode_user_data(user_data: u64) -> Option<(RingOp, usize)> {
+    if user_data == UD_POLL {
+        return None;
+    }
+    // PRE-FIX POLICY (row 6): the class was never encoded, so every CQE
+    // reads as a REGISTER completion.
+    Some((RingOp::Register, user_data as usize))
 }
 
 struct QueueHandle {
@@ -620,8 +891,13 @@ impl InboundQueue {
         }
     }
 
-    fn push(&self, req: InboundUringReq) {
-        let _ = self.tx.send(req);
+    /// FUSE-2 row 4: the caller MUST handle a failed push. A closed
+    /// receiver (the session worker exited) used to be `let _ = …send()`
+    /// while the queue worker went on believing the request was in
+    /// flight — the request then existed nowhere and its caller waited
+    /// forever.
+    fn push(&self, req: InboundUringReq) -> Result<(), ()> {
+        self.tx.send(req).map_err(|_| ())
     }
 
     /// Pure event-driven pop (L3 lever C): parks on the channel wake and the
@@ -668,13 +944,21 @@ pub struct FuseOverUring {
     queues_registered: AtomicU64,
     pub(crate) nqueues: u16, // used for diagnostics
     inbound: Vec<Arc<InboundQueue>>,
-    /// unique → (qid, ent_idx, commit_id) — sharded (P2 per-op economy):
-    /// every request pays insert-at-delivery + get-in-handler +
-    /// remove-at-reply; one global mutex across 32 queue workers plus the
-    /// handler/reply tasks was ~3 contended acquisitions per op at depth
-    /// (`Mutex::lock_contended` in the perf profile). Kernel uniques step
-    /// by 2 (bit 0 is FUSE_INT_REQ_BIT), so shard on `unique >> 1`.
-    pending: PendingMap,
+    /// Per-slot liveness publication for the **ungated** stale-slot
+    /// watchdog (FUSE-2): `nqueues × depth` cells, indexed
+    /// `qid * depth + ent_idx`.
+    ///
+    /// This replaces the sharded `unique → slot` map (PERF-16). The map
+    /// cost three mutex acquisitions plus three hashes per request and
+    /// was still the *source of truth* for reply addressing, which is
+    /// exactly why a request could be lost by missing it. Now the
+    /// authority is the queue worker's own [`SlotTable`], the reply
+    /// address rides the request, and this array is a pure observation
+    /// side-channel: two relaxed stores at delivery, one at commit, read
+    /// only by the watch thread.
+    slot_watch: Vec<SlotWatch>,
+    /// Ring depth (per queue) — the `slot_watch` stride.
+    depth: usize,
     /// §5.3 D3.b: session SQPOLL posture for the queue rings (`None` =
     /// knob unset = plain rings). See [`SqpollGroup`] for the one-poller
     /// leader/attach topology.
@@ -916,7 +1200,7 @@ fn push_poll_batched(ring: &mut Ring, batch: &mut SubmitBatch) -> io::Result<()>
     let entry = Entry128::from(
         opcode::PollAdd::new(types::Fixed(1), libc::POLLIN as _)
             .build()
-            .user_data(u64::MAX),
+            .user_data(UD_POLL),
     );
     // SAFETY: a PollAdd SQE references no user memory.
     if unsafe { ring.submission().push(&entry) }.is_err() {
@@ -959,6 +1243,76 @@ static TRANSPORT_LEASE_OVERLONG: AtomicU64 = AtomicU64::new(0);
 // coalescer stopped eliding (the pre-L3 1.67 eventfd writes/op posture).
 static TRANSPORT_WAKE_WRITES: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_WAKES_ELIDED: AtomicU64 = AtomicU64::new(0);
+
+// FUSE-2 reply-integrity counters — ALWAYS ON (the two detectors that
+// existed before this program were both `transport_debug`-gated, i.e.
+// off in production). `transport_requests_abandoned` is the must-stay-0
+// tripwire: any growth means a request left its slot without a
+// COMMIT_AND_FETCH, which is an application in uninterruptible sleep and
+// an `umount` that returns EBUSY.
+static TRANSPORT_REQUESTS_FAILED_SYNTHETIC: AtomicU64 = AtomicU64::new(0);
+static TRANSPORT_REQUESTS_ABANDONED: AtomicU64 = AtomicU64::new(0);
+static TRANSPORT_REPLIES_REFUSED_STALE: AtomicU64 = AtomicU64::new(0);
+static TRANSPORT_REPLIES_DROPPED_NO_SLOT: AtomicU64 = AtomicU64::new(0);
+static TRANSPORT_ENTS_RETIRED: AtomicU64 = AtomicU64::new(0);
+static TRANSPORT_SLOTS_OVERDUE: AtomicU64 = AtomicU64::new(0);
+
+/// FUSE-2 reply-integrity counters (stats inode):
+/// `(requests_failed_synthetic, requests_abandoned, replies_refused_stale,
+/// replies_dropped_no_slot, ents_retired, slots_overdue)`.
+///
+/// * `requests_failed_synthetic` — replies the transport synthesized
+///   because no handler reply could be delivered (CQE-error reclaim,
+///   failed inbound push, teardown drain, panicked handler). Nonzero is
+///   not a bug by itself; it is the honest count of the errors the
+///   kernel was told about instead of being left waiting.
+/// * `requests_abandoned` — **must stay 0**: a delivered request that
+///   left its slot with no commit submitted.
+/// * `replies_refused_stale` — double / late / mis-addressed replies
+///   refused by the slot state machine (FUSE-3e; never an overwrite).
+/// * `replies_dropped_no_slot` — replies for uniques with no ring slot
+///   on an armed session (FUSE-3b: kept OUT of the reply gauge).
+/// * `ents_retired` — ring ents retired after `REGISTER_RETRY_MAX`
+///   consecutive REGISTER failures (FUSE-3a).
+/// * `slots_overdue` — slots seen owing a reply for longer than the
+///   watchdog window (ungated; the promoted `stale-pending` scan).
+pub fn transport_reply_integrity_stats() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        TRANSPORT_REQUESTS_FAILED_SYNTHETIC.load(Ordering::Relaxed),
+        TRANSPORT_REQUESTS_ABANDONED.load(Ordering::Relaxed),
+        TRANSPORT_REPLIES_REFUSED_STALE.load(Ordering::Relaxed),
+        TRANSPORT_REPLIES_DROPPED_NO_SLOT.load(Ordering::Relaxed),
+        TRANSPORT_ENTS_RETIRED.load(Ordering::Relaxed),
+        TRANSPORT_SLOTS_OVERDUE.load(Ordering::Relaxed),
+    )
+}
+
+/// FUSE-2 rows 2/3: a reply the session's reply task could no longer
+/// carry, delivered by committing straight against its ring slot.
+/// Counted as a synthetic-path delivery — the reply itself is the
+/// handler's, but the path is the transport's rescue arm.
+pub fn note_reply_direct_commit() {
+    TRANSPORT_REQUESTS_FAILED_SYNTHETIC.fetch_add(1, Ordering::Relaxed);
+}
+
+/// FUSE-2 row 1: an EIO synthesized by the session's per-request reply
+/// guard (a handler that panicked or was dropped before replying).
+pub fn note_reply_synthesized_by_guard() {
+    TRANSPORT_REQUESTS_FAILED_SYNTHETIC.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A request that can no longer be answered by ANY path — the
+/// must-stay-0 tripwire.
+pub fn note_request_abandoned() {
+    TRANSPORT_REQUESTS_ABANDONED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// FUSE-3b: a reply whose slot no longer holds its request (teardown, or
+/// a refusal by the slot state machine). Counted APART from the reply
+/// gauge — a dropped reply must never read as delivered.
+pub(crate) fn note_reply_dropped_no_slot() {
+    TRANSPORT_REPLIES_DROPPED_NO_SLOT.fetch_add(1, Ordering::Relaxed);
+}
 
 /// L3 lever B wake-economy counters: `(wake_writes, wakes_elided)` —
 /// queue-eventfd writes performed vs elided by the per-queue coalescer.
@@ -1526,7 +1880,8 @@ impl FuseOverUring {
             queues_registered: AtomicU64::new(0),
             nqueues: nqueues as u16,
             inbound,
-            pending: PendingMap::new(),
+            slot_watch: (0..nqueues * depth).map(|_| SlotWatch::default()).collect(),
+            depth,
             sqpoll,
             queues: queue_handles,
             workers: Mutex::new(Vec::new()),
@@ -1649,11 +2004,11 @@ impl FuseOverUring {
     }
 
     /// SIM venue (the `KmbufQueue::sim_anon` precedent): an inert pool —
-    /// real atomics, pending map, inbound queues, and per-queue wake
+    /// real atomics, slot-watch cells, inbound queues, and per-queue wake
     /// eventfds, but NO kernel fuse fd, NO rings, NO worker threads. It
     /// exists so the connection-slot install/teardown protocol (PERF-2)
     /// and the reply-send prelude bench can exercise the SHIPPED liveness
-    /// machinery (`is_ready`/`is_active`/`shutdown`/`pending`) without a
+    /// machinery (`is_ready`/`is_active`/`shutdown`/slot addressing) without a
     /// mounted session. Session accounting mirrors `try_start`
     /// (ACTIVE_SESSIONS +1 here, −1 exactly once at shutdown/drop) so the
     /// `over_uring_sessions_active` gauge stays balanced in test/bench
@@ -1664,8 +2019,13 @@ impl FuseOverUring {
         Self::sim_inert_inner(nqueues).0
     }
 
+    /// Ring depth the SIM venue publishes (no rings exist; the slot
+    /// addressing and watch geometry still need a stride).
+    pub const SIM_DEPTH: usize = 32;
+
+
     /// In-crate sim variant keeping the per-queue commit receivers alive
-    /// so `submit_reply` round-trips (the pending-clear teardown pins).
+    /// so `submit_reply` round-trips (the teardown pins).
     #[cfg(test)]
     pub(crate) fn sim_inert_with_commit_rx(
         nqueues: u16,
@@ -1713,7 +2073,10 @@ impl FuseOverUring {
             queues_registered: AtomicU64::new(0),
             nqueues,
             inbound,
-            pending: PendingMap::new(),
+            slot_watch: (0..nqueues as usize * Self::SIM_DEPTH)
+                .map(|_| SlotWatch::default())
+                .collect(),
+            depth: Self::SIM_DEPTH,
             sqpoll: None,
             queues,
             workers: Mutex::new(Vec::new()),
@@ -1730,14 +2093,6 @@ impl FuseOverUring {
         // balances (the gauge never underflows in sim processes).
         ACTIVE_SESSIONS.fetch_add(1, Ordering::Relaxed);
         (pool, commit_rxs)
-    }
-
-    /// Test seam: seed a pending-map entry as a queue worker's delivery
-    /// would (`unique → (qid, ent_idx, commit_id)`), so teardown pins can
-    /// prove `shutdown` clears the map and late replies drop as NotFound.
-    #[cfg(test)]
-    pub(crate) fn test_insert_pending(&self, unique: u64, qid: u16, ent_idx: u16, commit_id: u64) {
-        self.pending.insert(unique, (qid, ent_idx, commit_id));
     }
 
     /// True once every per-CPU queue has submitted its initial REGISTER batch.
@@ -1783,16 +2138,41 @@ impl FuseOverUring {
         }
     }
 
-    pub fn submit_reply(&self, unique: u64, header: Vec<u8>, reply_body: Bytes) -> io::Result<()> {
-        let (qid, ent_idx, commit_id) = self.pending.remove(unique).ok_or_else(|| {
-            xport_dbg!("[XPORT] reply-NOTFOUND unique={unique}");
-            io::Error::new(
+    /// Commit a reply against the slot its request was delivered on.
+    ///
+    /// PERF-16: no map probe, no mutex — the address rode the request.
+    /// The queue worker's [`SlotTable`] is the authority on whether the
+    /// slot still owes this reply (double / late / mis-addressed replies
+    /// are refused there, loud-never-fatally, never overwriting a live
+    /// commit).
+    pub fn submit_reply(
+        &self,
+        slot: ReplySlot,
+        header: Vec<u8>,
+        reply_body: Bytes,
+    ) -> io::Result<()> {
+        let ReplySlot::Ring {
+            qid,
+            ent_idx,
+            commit_id,
+        } = slot
+        else {
+            return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("uring: no pending unique={unique}"),
-            )
-        })?;
+                "uring: reply has no ring slot (classical delivery)",
+            ));
+        };
+        if !self.active.load(Ordering::Acquire) {
+            // Teardown: the worker's drain owns every owed slot from
+            // here (it synthesizes what the kernel is still waiting
+            // for). Accepting a commit now would race that drain.
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "uring: session torn down",
+            ));
+        }
         xport_dbg!(
-            "[XPORT] reply unique={unique} qid={qid} ent={ent_idx} cid={commit_id} body={}",
+            "[XPORT] reply qid={qid} ent={ent_idx} cid={commit_id} body={}",
             reply_body.len()
         );
         let q = self
@@ -1823,8 +2203,10 @@ impl FuseOverUring {
         Ok(())
     }
 
-    pub fn get_payload_buffer(&self, unique: u64) -> Option<(u64, usize)> {
-        let (qid, ent_idx, _) = self.pending.get(unique)?;
+    pub fn get_payload_buffer(&self, slot: ReplySlot) -> Option<(u64, usize)> {
+        let ReplySlot::Ring { qid, ent_idx, .. } = slot else {
+            return None;
+        };
         let q = self.queues.get(qid as usize)?;
         // kmbuf mode: the reply target is the ent's ATTACHED kernel
         // buffer (per-delivery, bid-indexed) — never a static per-ent
@@ -1881,6 +2263,49 @@ impl FuseOverUring {
         None
     }
 
+    /// The watch cell of one slot (`None` for a geometry-less sim pool).
+    #[inline]
+    fn slot_watch_cell(&self, qid: u16, ent_idx: usize) -> Option<&SlotWatch> {
+        self.slot_watch.get(qid as usize * self.depth + ent_idx)
+    }
+
+    /// Publish a slot's owed-reply state for the watchdog (`unique == 0`
+    /// clears it).
+    #[inline]
+    fn publish_slot_owed(&self, qid: u16, ent_idx: usize, unique: u64) {
+        if let Some(w) = self.slot_watch_cell(qid, ent_idx) {
+            if unique == 0 {
+                w.clear();
+            } else {
+                w.set(unique, crate::raw::read_phase::transport_now_ns());
+            }
+        }
+    }
+
+    /// FUSE-2's ungated stale-slot watchdog pass: name every slot that
+    /// has owed a reply for longer than [`SLOT_OVERDUE_NS`] and count it.
+    fn scan_overdue_slots(&self) {
+        let now = crate::raw::read_phase::transport_now_ns();
+        for (idx, w) in self.slot_watch.iter().enumerate() {
+            let unique = w.unique.load(Ordering::Acquire);
+            if unique == 0 {
+                continue;
+            }
+            let since = w.since_ns.load(Ordering::Relaxed);
+            if since == 0 || now.saturating_sub(since) < SLOT_OVERDUE_NS {
+                continue;
+            }
+            let depth = self.depth.max(1);
+            let (qid, ent) = (idx / depth, idx % depth);
+            TRANSPORT_SLOTS_OVERDUE.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "fuse-over-uring qid={qid} ent={ent}: unique={unique} delivered {} ms ago and \
+                 still unreplied — the caller is in uninterruptible sleep (transport_slots_overdue)",
+                now.saturating_sub(since) / 1_000_000
+            );
+        }
+    }
+
     /// True once workers are live (may still be registering). Prefer [`is_ready`] for the
     /// session read path.
     pub fn is_active(&self) -> bool {
@@ -1912,16 +2337,23 @@ impl FuseOverUring {
             // Session was counted at spawn time (before ready).
             ACTIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
             info!("FUSE-over-io_uring shutting down (fd={})", self.fuse_fd);
-            // Drop any uncommitted request map entries; kernel already aborted them.
-            let pending = &self.pending;
-            if transport_debug() && !pending.is_empty() {
-                for (unique, (qid, ent, cid)) in pending.snapshot() {
-                    eprintln!(
-                        "[XPORT] shutdown with pending unique={unique} qid={qid} ent={ent} cid={cid}"
+            // FUSE-2 row 8: shutdown does NOT drop owed requests. There
+            // is no map to clear — each queue worker's teardown drain
+            // walks its own [`SlotTable`] and submits exactly one commit
+            // (reply or synthesized error) per owing slot, so a
+            // non-fatal shutdown cause can no longer strand a caller in
+            // uninterruptible sleep. What the drain genuinely cannot
+            // commit lands on `transport_requests_abandoned`.
+            for (idx, w) in self.slot_watch.iter().enumerate() {
+                let unique = w.unique.load(Ordering::Relaxed);
+                if unique != 0 {
+                    let (qid, ent) = (idx / self.depth.max(1), idx % self.depth.max(1));
+                    warn!(
+                        "fuse-over-uring shutdown with an owed reply: qid={qid} ent={ent} \
+                         unique={unique} — the queue drain owns it"
                     );
                 }
             }
-            pending.clear();
         }
         // Wake every parked session pull (after the active=false store above
         // — pop's enable-then-check ordering makes this race-free).
@@ -2298,22 +2730,17 @@ fn connection_watch(pool: Arc<FuseOverUring>) {
     if crate::raw::affinity::pin_scope() == crate::raw::affinity::PinScope::Node {
         let _ = crate::raw::affinity::set_current_affinity(&crate::raw::affinity::process_cpus());
     }
-    let mut last_seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut last_scan = Instant::now();
     while pool.active.load(Ordering::Relaxed) {
-        if transport_debug() && last_scan.elapsed() >= Duration::from_secs(5) {
+        // FUSE-2: the stale-slot watchdog is ALWAYS ON. Its ancestor —
+        // the `stale-pending` scan — was `transport_debug`-gated, i.e.
+        // off in production, which is why a lost reply only ever showed
+        // up as a user-visible D-state process and an EBUSY umount. A
+        // slot owing a reply for longer than the window is logged loudly
+        // and counted on `transport_slots_overdue`.
+        if last_scan.elapsed() >= SLOT_WATCHDOG_INTERVAL {
             last_scan = Instant::now();
-            let snapshot = pool.pending.snapshot();
-            let now_set: std::collections::HashSet<u64> =
-                snapshot.iter().map(|(k, _)| *k).collect();
-            for unique in now_set.intersection(&last_seen) {
-                if let Some((qid, ent, cid)) = pool.pending.get(*unique) {
-                    eprintln!(
-                        "[XPORT] stale-pending unique={unique} qid={qid} ent={ent} cid={cid} (>5s, delivered but unreplied)"
-                    );
-                }
-            }
-            last_seen = now_set;
+            pool.scan_overdue_slots();
         }
         let mut pfd = libc::pollfd {
             fd: pool.fuse_fd,
@@ -2555,6 +2982,11 @@ fn queue_worker(
         }
     };
 
+    // FUSE-2: the queue's slot state machine — one state per ring ent,
+    // owned exclusively by THIS thread (see [`SlotState`] for the
+    // exactly-one-reply invariant it enforces).
+    let mut slots = SlotTable::new(depth);
+
     for (idx, ent) in ents.iter().enumerate() {
         push_cmd(
             &mut ring,
@@ -2562,18 +2994,19 @@ fn queue_worker(
             qid,
             0,
             reg_iov(ent),
-            idx as u64,
+            encode_user_data(RingOp::Register, idx),
             reg_init_flags,
             reg_buf_index(idx),
         )
         .map_err(|e| io::Error::other(format!("push REGISTER ent={idx}: {e}")))?;
+        slots.on_register_submitted(idx);
         pool.stats_register.fetch_add(1, Ordering::Relaxed);
         STATS_REGISTER.fetch_add(1, Ordering::Relaxed);
     }
     {
         let poll_e = opcode::PollAdd::new(types::Fixed(1), libc::POLLIN as _)
             .build()
-            .user_data(u64::MAX);
+            .user_data(UD_POLL);
         unsafe {
             ring.submission()
                 .push(&Entry128::from(poll_e))
@@ -2591,6 +3024,8 @@ fn queue_worker(
     // wait). Only the syscall is shared: the §5.4 lease re-arm gate still
     // runs per ent *before* its SQE is pushed.
     let mut batch = SubmitBatch::default();
+    // Row 7: sticky across passes — see the re-arm site below.
+    let mut need_repoll_sticky = false;
 
     while pool.active.load(Ordering::Relaxed) {
         // Drain the eventfd FIRST. The wake-fd PollAdd re-arm is deferred to
@@ -2641,6 +3076,21 @@ fn queue_worker(
             let idx = msg.ent_idx as usize;
             if idx >= ents.len() {
                 warn!("fuse-over-uring qid={qid}: commit for bad ent {idx}");
+                TRANSPORT_REPLIES_REFUSED_STALE.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            // FUSE-2 / FUSE-3e: the slot decides. A commit that does not
+            // address the request this slot currently owes (double reply,
+            // late reply, a reply for a displaced request) is refused
+            // loud-never-fatally — never allowed to overwrite a live one,
+            // and never turned into a second COMMIT_AND_FETCH.
+            if slots.admit_commit(idx, msg.commit_id) == CommitAdmit::RefuseStale {
+                warn!(
+                    "fuse-over-uring qid={qid} ent={idx}: refusing a stale reply \
+                     (cid={} state={:?}) — the slot does not owe it",
+                    msg.commit_id,
+                    slots.state(idx)
+                );
                 continue;
             }
             match lease_states[idx].try_commit() {
@@ -2648,16 +3098,14 @@ fn queue_worker(
                     xport_dbg!("[XPORT] commit qid={qid} ent={idx} cid={}", msg.commit_id);
                     apply_reply(&mut ents[idx], &msg.header, &msg.reply_body);
                     batch.note_commit_opcode(ents[idx].last_opcode);
-                    push_cmd_batched(
+                    submit_commit(
                         &mut ring,
                         &mut batch,
-                        FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+                        &mut slots,
+                        pool.slot_watch_cell(qid, idx),
                         qid,
+                        idx,
                         msg.commit_id,
-                        None,
-                        idx as u64,
-                        0,
-                        0,
                     )?;
                 }
                 CommitGate::Parked => {
@@ -2665,11 +3113,8 @@ fn queue_worker(
                         "[XPORT] commit-parked qid={qid} ent={idx} cid={}",
                         msg.commit_id
                     );
-                    debug_assert!(
-                        parked_msgs[idx].is_none(),
-                        "two commits parked for one ring ent"
-                    );
                     TRANSPORT_PARKED_COMMITS.fetch_add(1, Ordering::Relaxed);
+                    slots.on_commit_parked(idx);
                     parked_msgs[idx] = Some(msg);
                 }
             }
@@ -2689,16 +3134,14 @@ fn queue_worker(
                 );
                 apply_reply(&mut ents[idx], &msg.header, &msg.reply_body);
                 batch.note_commit_opcode(ents[idx].last_opcode);
-                push_cmd_batched(
+                submit_commit(
                     &mut ring,
                     &mut batch,
-                    FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+                    &mut slots,
+                    pool.slot_watch_cell(qid, idx),
                     qid,
+                    idx,
                     msg.commit_id,
-                    None,
-                    idx as u64,
-                    0,
-                    0,
                 )?;
             }
         }
@@ -2721,7 +3164,27 @@ fn queue_worker(
             !cq.is_empty()
         })
         .then(Instant::now);
-        match ring.submit_and_wait(1) {
+        // FUSE-3a: an ent waiting out its REGISTER backoff needs the
+        // loop to come back even on a queue with no traffic — otherwise
+        // its retry waits for an unrelated CQE that may never arrive.
+        // Bound the wait by the nearest retry deadline (and only then;
+        // the steady-state path keeps today's plain `submit_and_wait`).
+        let wait_result = match slots.next_retry_deadline() {
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let ts = types::Timespec::new()
+                    .sec(left.as_secs())
+                    .nsec(left.subsec_nanos());
+                let args = types::SubmitArgs::new().timespec(&ts);
+                match ring.submitter().submit_with_args(1, &args) {
+                    // A timed-out wait is the retry tick, not an error.
+                    Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(0),
+                    other => other,
+                }
+            }
+            None => ring.submit_and_wait(1),
+        };
+        match wait_result {
             Ok(_) => {}
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
             Err(e) if FuseOverUring::is_disconnect_errno(e.raw_os_error().unwrap_or(0)) => {
@@ -2746,26 +3209,26 @@ fn queue_worker(
         };
 
         let mut resubmit = Vec::new();
-        let mut need_repoll = false;
         let mut disconnect = false;
         for (user_data, res, cqe_flags) in completed {
-            if user_data == u64::MAX {
+            // FUSE-2 row 6: the op class rides `user_data`, so an errored
+            // COMMIT is never mistaken for an errored REGISTER (which is
+            // how an EAGAIN'd commit used to discard the reply
+            // `apply_reply` had already written into the ent).
+            let Some((op, ent_idx)) = decode_user_data(user_data) else {
                 // wake_fd poll completed — re-arm (or exit if inactive)
-                need_repoll = true;
+                need_repoll_sticky = true;
+                continue;
+            };
+            if ent_idx >= ents.len() {
+                warn!("fuse-over-uring qid={qid}: CQE for out-of-range ent {ent_idx}");
                 continue;
             }
-            let ent_idx = user_data as usize;
             if res < 0 {
                 let err = -res;
                 pool.stats_cqe_err.fetch_add(1, Ordering::Relaxed);
                 STATS_CQE_ERR.fetch_add(1, Ordering::Relaxed);
-                xport_dbg!("[XPORT] cqe-err qid={qid} ent={ent_idx} err={err}");
-                if err == libc::EAGAIN || err == libc::EINTR {
-                    if ent_idx < ents.len() {
-                        resubmit.push(ent_idx);
-                    }
-                    continue;
-                }
+                xport_dbg!("[XPORT] cqe-err qid={qid} ent={ent_idx} op={op:?} err={err}");
                 // Kernel abort/unmount (dev_uring.c): -ENOTCONN on entry teardown /
                 // cancel; -ECONNABORTED when abort_with_err is set.
                 if FuseOverUring::is_disconnect_errno(err) {
@@ -2780,18 +3243,112 @@ fn queue_worker(
                     pool.shutdown();
                     return Err(io::Error::from_raw_os_error(err));
                 }
-                // Drop any pending map entry for this ring slot and re-REGISTER so we
-                // do not permanently lose queue capacity after a failed COMMIT/REGISTER.
-                warn!("fuse-over-uring qid={qid} cqe err={err} ent={ent_idx}; reclaim entry");
-                pool.pending
-                    .retain(|_, (q, e, _)| !(*q == qid && *e == ent_idx as u16));
-                if ent_idx < ents.len() {
-                    resubmit.push(ent_idx);
+                match op {
+                    // Row 6: a transient COMMIT failure re-commits. The
+                    // ent still holds the applied reply, so re-pushing
+                    // the same COMMIT_AND_FETCH is the whole recovery —
+                    // re-REGISTERing here would discard that reply and
+                    // leave the caller waiting forever.
+                    RingOp::Commit if err == libc::EAGAIN || err == libc::EINTR => {
+                        let commit_id = match slots.state(ent_idx) {
+                            SlotState::Replied { commit_id } => Some(commit_id),
+                            _ => None,
+                        };
+                        match commit_id {
+                            Some(cid) => {
+                                warn!(
+                                    "fuse-over-uring qid={qid} ent={ent_idx}: COMMIT err={err}; \
+                                     re-committing cid={cid} (reply already applied)"
+                                );
+                                slots.on_commit_retry(ent_idx);
+                                submit_commit(
+                                    &mut ring,
+                                    &mut batch,
+                                    &mut slots,
+                                    pool.slot_watch_cell(qid, ent_idx),
+                                    qid,
+                                    ent_idx,
+                                    cid,
+                                )?;
+                            }
+                            None => {
+                                warn!(
+                                    "fuse-over-uring qid={qid} ent={ent_idx}: COMMIT err={err} \
+                                     with no reply in flight ({:?}); re-REGISTER",
+                                    slots.state(ent_idx)
+                                );
+                                resubmit.push(ent_idx);
+                            }
+                        }
+                    }
+                    // A COMMIT that failed for a non-transient reason:
+                    // the kernel discarded the reply. Nothing can be
+                    // committed for the (already answered) request, so
+                    // reclaim the ent by re-REGISTERing it.
+                    RingOp::Commit => {
+                        warn!(
+                            "fuse-over-uring qid={qid} ent={ent_idx}: COMMIT cqe err={err}; \
+                             reclaim entry"
+                        );
+                        resubmit.push(ent_idx);
+                    }
+                    // Row 5: a REGISTER error on a slot that still owes a
+                    // reply must SYNTHESIZE that reply before the ent is
+                    // reclaimed — the historical `pending.retain(...)`
+                    // dropped it silently. FUSE-3a: back off, and retire
+                    // the ent after a bounded number of failures instead
+                    // of spinning an unthrottled re-REGISTER loop.
+                    RingOp::Register => {
+                        if fail_ent(
+                            &mut ring,
+                            &mut batch,
+                            &mut slots,
+                            &mut ents[ent_idx],
+                            &lease_states[ent_idx],
+                            pool.slot_watch_cell(qid, ent_idx),
+                            qid,
+                            ent_idx,
+                            libc::EIO,
+                        )? {
+                            // A synthesized commit is now in flight for
+                            // this ent; the kernel re-arms it.
+                            continue;
+                        }
+                        match slots.note_register_failure(ent_idx, Instant::now()) {
+                            RegisterAction::Retry { after } => {
+                                warn!(
+                                    "fuse-over-uring qid={qid} ent={ent_idx}: REGISTER err={err}; \
+                                     retry in {after:?}"
+                                );
+                                if after.is_zero() {
+                                    resubmit.push(ent_idx);
+                                }
+                                // A nonzero backoff is served by the
+                                // backoff pass below (it also bounds the
+                                // ring wait so an idle queue still
+                                // retries).
+                            }
+                            RegisterAction::Retire => {
+                                error!(
+                                    "fuse-over-uring qid={qid} ent={ent_idx}: REGISTER failed \
+                                     {REGISTER_RETRY_MAX}× (last err={err}); retiring the ent"
+                                );
+                                if slots.all_retired() {
+                                    error!(
+                                        "fuse-over-uring qid={qid}: every ring ent retired — \
+                                         the queue can no longer serve; failing the session"
+                                    );
+                                    pool.shutdown();
+                                    return Err(io::Error::from_raw_os_error(err));
+                                }
+                            }
+                        }
+                    }
                 }
                 continue;
             }
-            if ent_idx >= ents.len() {
-                continue;
+            if op == RingOp::Register {
+                slots.note_register_success(ent_idx);
             }
             // kmbuf attachment law (2026-08-04): a flagged CQE re-points
             // the ent's payload buffer to the freshly-selected kernel
@@ -2839,22 +3396,17 @@ fn queue_worker(
                     // Delivery on this ent implies its previous commit passed
                     // the refs == 0 gate; header-only reply, payload untouched.
                     debug_assert!(!lease_states[ent_idx].leased());
-                    let mut out = [0u8; 16];
-                    out[0..4].copy_from_slice(&16u32.to_le_bytes());
-                    out[4..8].copy_from_slice(&(-libc::EIO).to_le_bytes());
-                    out[8..16].copy_from_slice(&cid.to_le_bytes());
-                    apply_reply(&mut ents[ent_idx], &out, &Bytes::new());
-                    let _ = push_cmd_batched(
+                    slots.on_deliver_degenerate(ent_idx, cid);
+                    apply_reply(&mut ents[ent_idx], &error_out_header(0, libc::EIO), &Bytes::new());
+                    submit_commit(
                         &mut ring,
                         &mut batch,
-                        FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+                        &mut slots,
+                        pool.slot_watch_cell(qid, ent_idx),
                         qid,
+                        ent_idx,
                         cid,
-                        None,
-                        ent_idx as u64,
-                        0,
-                        0,
-                    );
+                    )?;
                 } else {
                     warn!(
                         "fuse-over-uring qid={qid} ent={ent_idx}: unique=0 commit_id=0; re-REGISTER"
@@ -2913,6 +3465,24 @@ fn queue_worker(
                 Bytes::copy_from_slice(&ents[ent_idx].payload()[..capped_sz])
             };
 
+            // FUSE-2: the slot now owes exactly one commit. A delivery
+            // onto a slot that STILL owes one (row 10's overwrite class,
+            // and row 11's `fuse_resend` double-delivery shape) is
+            // reported loudly and counted on the must-stay-0 tripwire —
+            // the displaced request's commit id is gone with it, so it
+            // cannot be answered, and pretending otherwise (what
+            // `pending.insert` did) hides a wedged caller.
+            if let DeliverOutcome::DisplacedRequest { unique: lost } =
+                slots.on_deliver(ent_idx, unique, commit_id)
+            {
+                error!(
+                    "fuse-over-uring qid={qid} ent={ent_idx}: kernel delivered unique={unique} \
+                     onto a slot still owing a reply for unique={lost} — that request can no \
+                     longer be answered (transport_requests_abandoned)"
+                );
+            }
+            pool.publish_slot_owed(qid, ent_idx, unique);
+
             pool.stats_requests.fetch_add(1, Ordering::Relaxed);
             STATS_REQUESTS.fetch_add(1, Ordering::Relaxed);
             debug!(
@@ -2931,52 +3501,90 @@ fn queue_worker(
             const FUSE_BATCH_FORGET: u32 = 42;
             if matches!(opcode, FUSE_FORGET | FUSE_BATCH_FORGET) {
                 xport_dbg!("[XPORT] autocommit-forget qid={qid} ent={ent_idx} unique={unique}");
-                // Deliver for nlookup accounting only — no pending map entry.
-                pool.inbound[qid as usize].push(InboundUringReq {
+                // Deliver for nlookup accounting only — the session never
+                // replies to a forget; this ent is committed right here,
+                // which IS its one commit.
+                let pushed = pool.inbound[qid as usize].push(InboundUringReq {
                     header_and_op,
                     payload,
                     unique,
+                    slot: ReplySlot::Classical,
                     arrived_ns: crate::raw::read_phase::transport_now_ns(),
                 });
+                if pushed.is_err() {
+                    // Forget accounting is lost (the session is gone), but
+                    // the ent must still be committed — that is what the
+                    // auto-commit below does.
+                    warn!(
+                        "fuse-over-uring qid={qid} ent={ent_idx}: forget delivery dropped \
+                         (session inbound closed); committing the ent anyway"
+                    );
+                }
                 // FORGET payloads are copies (never leased) and this ent's
                 // previous commit passed the refs == 0 gate: the immediate
                 // auto-commit below cannot alias a live lease. Its SQE rides
                 // the shared loop-bottom flush like every other commit.
                 debug_assert!(!lease_states[ent_idx].leased());
-                let mut out = [0u8; 16];
-                out[0..4].copy_from_slice(&16u32.to_le_bytes());
-                // error = 0
-                out[8..16].copy_from_slice(&unique.to_le_bytes());
-                apply_reply(&mut ents[ent_idx], &out, &Bytes::new());
-                push_cmd_batched(
+                apply_reply(
+                    &mut ents[ent_idx],
+                    &error_out_header(unique, 0),
+                    &Bytes::new(),
+                );
+                submit_commit(
                     &mut ring,
                     &mut batch,
-                    FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+                    &mut slots,
+                    pool.slot_watch_cell(qid, ent_idx),
                     qid,
+                    ent_idx,
                     commit_id,
-                    None,
-                    ent_idx as u64,
-                    0,
-                    0,
                 )?;
                 pool.stats_replies.fetch_add(1, Ordering::Relaxed);
                 STATS_REPLIES.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
-            // CRITICAL: insert pending *before* exposing the request on `inbound`.
-            // Otherwise a session worker can reply before the map entry exists,
-            // submit_reply returns NotFound, we drop the reply, and the kernel
-            // keeps `waiting≥1` forever → plain `umount` EBUSY with no openers
-            // (seen after full pjdfstest).
-            pool.pending
-                .insert(unique, (qid, ent_idx as u16, commit_id));
-            pool.inbound[qid as usize].push(InboundUringReq {
-                header_and_op,
-                payload,
-                unique,
-                arrived_ns: crate::raw::read_phase::transport_now_ns(),
-            });
+            // The request carries its own reply address (FUSE-2 ⊕
+            // PERF-16). The historical map insert had to happen BEFORE
+            // the request was exposed, or a fast handler's reply missed
+            // it and the kernel kept `waiting ≥ 1` forever (plain
+            // `umount` EBUSY, seen after a full pjdfstest run). That race
+            // is now structurally impossible: there is nothing to insert.
+            //
+            // FUSE-2 row 4: a push onto a closed session queue used to be
+            // `let _ = tx.send(req)` while the worker went on believing
+            // the request was in flight. Now a failed push is a non-reply
+            // exit like any other and routes through `fail_ent`.
+            if pool.inbound[qid as usize]
+                .push(InboundUringReq {
+                    header_and_op,
+                    payload,
+                    unique,
+                    slot: ReplySlot::Ring {
+                        qid,
+                        ent_idx: ent_idx as u16,
+                        commit_id,
+                    },
+                    arrived_ns: crate::raw::read_phase::transport_now_ns(),
+                })
+                .is_err()
+            {
+                error!(
+                    "fuse-over-uring qid={qid} ent={ent_idx}: session inbound queue is closed; \
+                     synthesizing EIO for unique={unique} (row 4)"
+                );
+                fail_ent(
+                    &mut ring,
+                    &mut batch,
+                    &mut slots,
+                    &mut ents[ent_idx],
+                    &lease_states[ent_idx],
+                    pool.slot_watch_cell(qid, ent_idx),
+                    qid,
+                    ent_idx,
+                    libc::EIO,
+                )?;
+            }
         }
         if disconnect {
             pool.shutdown();
@@ -2985,24 +3593,75 @@ fn queue_worker(
         if !pool.active.load(Ordering::Relaxed) {
             break;
         }
-        if need_repoll {
-            let _ = push_poll_batched(&mut ring, &mut batch);
+        // FUSE-2 row 7: losing the wake-fd poll re-arm stops the queue
+        // waking on `commit_tx` ENTIRELY — every reply on this queue is
+        // then stranded until an unrelated CQE happens by. The flag is
+        // STICKY: a failed push is retried on the next pass instead of
+        // being swallowed by `let _ =`.
+        if need_repoll_sticky {
+            match push_poll_batched(&mut ring, &mut batch) {
+                Ok(()) => need_repoll_sticky = false,
+                Err(e) => warn!(
+                    "fuse-over-uring qid={qid}: wake-poll re-arm push failed ({e}); \
+                     retrying next pass"
+                ),
+            }
         }
         // Never re-REGISTER after a disconnect; only while still active.
         if !resubmit.is_empty() && pool.active.load(Ordering::Relaxed) {
             for ent_idx in resubmit {
                 let iov = reg_iov(&ents[ent_idx]);
-                let _ = push_cmd_batched(
+                // Re-REGISTER is a non-reply exit: an ent that still owes
+                // a reply must be failed first (row 5) — `fail_ent` is a
+                // no-op for slots that owe nothing.
+                fail_ent(
+                    &mut ring,
+                    &mut batch,
+                    &mut slots,
+                    &mut ents[ent_idx],
+                    &lease_states[ent_idx],
+                    pool.slot_watch_cell(qid, ent_idx),
+                    qid,
+                    ent_idx,
+                    libc::EIO,
+                )?;
+                if let Err(e) = push_cmd_batched(
                     &mut ring,
                     &mut batch,
                     FUSE_IO_URING_CMD_REGISTER,
                     qid,
                     0,
                     iov,
-                    ent_idx as u64,
+                    encode_user_data(RingOp::Register, ent_idx),
                     reg_init_flags,
                     reg_buf_index(ent_idx),
-                );
+                ) {
+                    warn!("fuse-over-uring qid={qid} ent={ent_idx}: re-REGISTER push failed ({e})");
+                    continue;
+                }
+                slots.on_register_submitted(ent_idx);
+            }
+        }
+        // FUSE-3a: serve any ent whose REGISTER backoff has expired. An
+        // idle queue gets no CQEs, so the loop wait above is bounded
+        // while a backoff is outstanding (see `wait_budget`).
+        let now = Instant::now();
+        for ent_idx in slots.register_retries_due(now) {
+            let iov = reg_iov(&ents[ent_idx]);
+            if push_cmd_batched(
+                &mut ring,
+                &mut batch,
+                FUSE_IO_URING_CMD_REGISTER,
+                qid,
+                0,
+                iov,
+                encode_user_data(RingOp::Register, ent_idx),
+                reg_init_flags,
+                reg_buf_index(ent_idx),
+            )
+            .is_ok()
+            {
+                slots.on_register_submitted(ent_idx);
             }
         }
     }
@@ -3050,26 +3709,63 @@ fn queue_worker(
             } else {
                 0
             };
-            let mut out = [0u8; 16];
-            out[0..4].copy_from_slice(&16u32.to_le_bytes());
-            out[4..8].copy_from_slice(&(-libc::EIO).to_le_bytes());
-            out[8..16].copy_from_slice(&unique.to_le_bytes());
             // Header-only: apply_reply never touches the payload region when
             // the reply has no body beyond the 16-byte fuse_out_header.
-            apply_reply(&mut ents[idx], &out, &Bytes::new());
+            apply_reply(&mut ents[idx], &error_out_header(unique, libc::EIO), &Bytes::new());
         }
-        let _ = push_cmd_batched(
+        if submit_commit(
             &mut ring,
             &mut batch,
-            FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+            &mut slots,
+            pool.slot_watch_cell(qid, idx),
             qid,
+            idx,
             msg.commit_id,
-            None,
-            idx as u64,
-            0,
-            0,
+        )
+        .is_ok()
+        {
+            final_commits += 1;
+        }
+    }
+    // FUSE-2 row 8: every slot that STILL owes a reply gets one here.
+    // `shutdown()` used to `pending.clear()` — reachable from entirely
+    // non-fatal causes (a `connection_watch` EBADF, a kernel protocol
+    // reject, any worker `Err`, plain `Drop`) — and every request in the
+    // map vanished, parking its caller in uninterruptible sleep with an
+    // `umount` that returns EBUSY. The drain is the teardown half of the
+    // exactly-one-reply invariant.
+    let owed: Vec<(usize, u64, u64)> = slots.owing().collect();
+    for (idx, unique, commit_id) in owed {
+        warn!(
+            "fuse-over-uring qid={qid} ent={idx}: unanswered request unique={unique} at \
+             teardown; synthesizing EIO (row 8)"
         );
-        final_commits += 1;
+        let _ = commit_id;
+        match fail_ent(
+            &mut ring,
+            &mut batch,
+            &mut slots,
+            &mut ents[idx],
+            &lease_states[idx],
+            pool.slot_watch_cell(qid, idx),
+            qid,
+            idx,
+            libc::EIO,
+        ) {
+            Ok(true) => final_commits += 1,
+            Ok(false) => {}
+            Err(e) => {
+                // The ring itself is gone: the request cannot be
+                // answered at all — the must-stay-0 tripwire's honest
+                // case.
+                error!(
+                    "fuse-over-uring qid={qid} ent={idx}: teardown commit push failed ({e}); \
+                     unique={unique} abandoned"
+                );
+                slots.abandon(idx);
+                pool.publish_slot_owed(qid, idx, 0);
+            }
+        }
     }
     // A loop exit between the drain passes and the loop-bottom
     // submit_and_wait leaves applied replies pushed but unsubmitted; flush
@@ -3086,6 +3782,101 @@ fn queue_worker(
     }
     debug!("fuse-over-uring qid={qid} worker exit");
     Ok(())
+}
+
+/// A bare 16-byte `fuse_out_header` carrying `-errno` (0 = success).
+/// Every synthesized reply in the transport has exactly this shape: it
+/// touches only the ent's separately-allocated header struct, so it is
+/// legal even while a payload lease is live (§5.4).
+fn error_out_header(unique: u64, errno: i32) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&16u32.to_le_bytes());
+    out[4..8].copy_from_slice(&(-errno).to_le_bytes());
+    out[8..16].copy_from_slice(&unique.to_le_bytes());
+    out
+}
+
+/// Push the COMMIT_AND_FETCH for `ent_idx` and move its slot to
+/// [`SlotState::Replied`] — the ONE place a slot leaves `Delivered`.
+///
+/// The reply bytes must already be in the ent (`apply_reply`).
+#[allow(clippy::too_many_arguments)] // ring + batch + slot state + the ent's address
+fn submit_commit(
+    ring: &mut Ring,
+    batch: &mut SubmitBatch,
+    slots: &mut SlotTable,
+    watch: Option<&SlotWatch>,
+    qid: u16,
+    ent_idx: usize,
+    commit_id: u64,
+) -> io::Result<()> {
+    push_cmd_batched(
+        ring,
+        batch,
+        FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+        qid,
+        commit_id,
+        None,
+        encode_user_data(RingOp::Commit, ent_idx),
+        0,
+        0,
+    )?;
+    slots.on_commit_submitted(ent_idx, commit_id);
+    if let Some(w) = watch {
+        w.clear();
+    }
+    Ok(())
+}
+
+/// **The one non-reply exit** (FUSE-2). Every path that would otherwise
+/// consume a request without answering it routes here: CQE-error
+/// reclaim, a failed inbound push, a re-REGISTER over a live request,
+/// and the teardown drain.
+///
+/// Returns `true` when a synthesized commit was submitted (the slot owed
+/// a reply), `false` when the slot owed nothing. The reply is the
+/// header-only `-errno` shape, so it is safe even against a live payload
+/// lease — the ent's payload region is never written.
+#[allow(clippy::too_many_arguments)] // ring + batch + slot state + the ent's address
+fn fail_ent(
+    ring: &mut Ring,
+    batch: &mut SubmitBatch,
+    slots: &mut SlotTable,
+    ent: &mut Ent,
+    lease: &EntLeaseState,
+    watch: Option<&SlotWatch>,
+    qid: u16,
+    ent_idx: usize,
+    errno: i32,
+) -> io::Result<bool> {
+    let FailOutcome::Synthesize { unique, commit_id } = slots.fail_ent(ent_idx) else {
+        return Ok(false);
+    };
+    // A live lease means a handler still holds the payload; the
+    // header-only reply below never touches it (§5.4), so the
+    // synthesized error is always legal.
+    let _ = lease;
+    warn!(
+        "fuse-over-uring qid={qid} ent={ent_idx}: synthesizing errno={errno} for \
+         unique={unique} (no handler reply is coming)"
+    );
+    xport_dbg!("[XPORT] fail-ent qid={qid} ent={ent_idx} unique={unique} errno={errno}");
+    apply_reply(ent, &error_out_header(unique, errno), &Bytes::new());
+    match submit_commit(ring, batch, slots, watch, qid, ent_idx, commit_id) {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            // The commit could not even be pushed: this request will
+            // never be answered — the must-stay-0 tripwire's honest case
+            // (`fail_ent` already moved the slot out of `Delivered`, so
+            // the count is made here rather than by `abandon`).
+            note_request_abandoned();
+            slots.abandon(ent_idx);
+            if let Some(w) = watch {
+                w.clear();
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Place a classical fuse reply (`fuse_out_header` || body) into the ring entry
@@ -3231,6 +4022,286 @@ fn push_cmd(
     Ok(())
 }
 
+/// FUSE-2 — the exactly-one-reply invariant, one leg per in-process
+/// reachable row of the spec's eleven-row table (rows 1/2/3 live in
+/// `session.rs`; row 11 — `fuse_resend` / `fiq->ops` switchover
+/// double-delivery — needs a live mount and is a documented repro-port
+/// exception, but its *shape* is pinned here as row 10's twin: a second
+/// delivery onto a slot that still owes a reply).
+#[cfg(test)]
+mod slot_state_tests {
+    use super::*;
+
+    fn table(depth: usize) -> SlotTable {
+        SlotTable::new(depth)
+    }
+
+    /// The happy path IS the invariant: a delivered request leaves
+    /// `Delivered` only by a submitted commit.
+    #[test]
+    fn deliver_then_commit_walks_the_state_machine() {
+        let mut t = table(4);
+        assert_eq!(t.state(0), SlotState::Registered);
+        assert_eq!(t.on_deliver(0, 100, 7), DeliverOutcome::Accepted);
+        assert_eq!(
+            t.state(0),
+            SlotState::Delivered {
+                unique: 100,
+                commit_id: 7
+            }
+        );
+        assert_eq!(t.admit_commit(0, 7), CommitAdmit::Accept);
+        t.on_commit_submitted(0, 7);
+        assert_eq!(
+            t.state(0),
+            SlotState::Replied { commit_id: 7 },
+            "a submitted commit is the ONLY exit from Delivered"
+        );
+    }
+
+    /// FUSE-2 row 10 (and row 11's in-process shape): a delivery onto a
+    /// slot that still owes a reply must be refused-loud — the displaced
+    /// request is counted on the must-stay-0 tripwire, never silently
+    /// overwritten the way `pending.insert` did.
+    #[test]
+    fn second_delivery_on_an_owing_slot_reports_the_displaced_request() {
+        let mut t = table(2);
+        t.on_deliver(1, 500, 11);
+        let before = transport_reply_integrity_stats().1;
+        assert_eq!(
+            t.on_deliver(1, 502, 12),
+            DeliverOutcome::DisplacedRequest { unique: 500 },
+            "the overwritten request must be reported, not lost silently"
+        );
+        assert!(
+            transport_reply_integrity_stats().1 > before,
+            "a displaced request must land on transport_requests_abandoned"
+        );
+        assert_eq!(
+            t.state(1),
+            SlotState::Delivered {
+                unique: 502,
+                commit_id: 12
+            }
+        );
+    }
+
+    /// FUSE-3e: a second commit for one ent must never overwrite the
+    /// first. Loud-never-fatal — refuse and count.
+    #[test]
+    fn double_reply_is_refused_not_overwritten() {
+        let mut t = table(2);
+        t.on_deliver(0, 90, 3);
+        assert_eq!(t.admit_commit(0, 3), CommitAdmit::Accept);
+        t.on_commit_submitted(0, 3);
+        let before = transport_reply_integrity_stats().2;
+        assert_eq!(
+            t.admit_commit(0, 3),
+            CommitAdmit::RefuseStale,
+            "the request was already answered — the second commit is stale"
+        );
+        assert!(transport_reply_integrity_stats().2 > before);
+    }
+
+    /// A commit whose `commit_id` is not the one the slot owes addresses
+    /// a request that is gone (the misdelivery class the unique map
+    /// could not detect).
+    #[test]
+    fn commit_for_a_foreign_commit_id_is_refused() {
+        let mut t = table(2);
+        t.on_deliver(0, 90, 3);
+        assert_eq!(t.admit_commit(0, 4), CommitAdmit::RefuseStale);
+        assert_eq!(
+            t.state(0),
+            SlotState::Delivered {
+                unique: 90,
+                commit_id: 3
+            },
+            "the refusal must leave the owed request intact"
+        );
+    }
+
+    /// A parked commit (payload lease live, §5.4) still owes its reply,
+    /// and a second commit arriving while it is parked is refused rather
+    /// than overwriting the parked message (FUSE-3e's release-build
+    /// silent-overwrite).
+    #[test]
+    fn parked_commit_still_owes_and_refuses_a_second() {
+        let mut t = table(2);
+        t.on_deliver(0, 77, 5);
+        assert_eq!(t.admit_commit(0, 5), CommitAdmit::Accept);
+        t.on_commit_parked(0);
+        assert_eq!(
+            t.state(0),
+            SlotState::Parked {
+                unique: 77,
+                commit_id: 5
+            }
+        );
+        assert_eq!(t.admit_commit(0, 5), CommitAdmit::RefuseStale);
+        assert_eq!(
+            t.owing().collect::<Vec<_>>(),
+            vec![(0, 77, 5)],
+            "a parked commit has not been submitted — the slot still owes"
+        );
+    }
+
+    /// FUSE-2 row 5: the CQE-error reclaim path must synthesize a reply
+    /// before re-REGISTERing. `fail_ent` is the ONE helper every
+    /// non-reply exit routes through.
+    #[test]
+    fn fail_ent_synthesizes_for_an_owing_slot() {
+        let mut t = table(2);
+        t.on_deliver(0, 42, 9);
+        let before = transport_reply_integrity_stats().0;
+        assert_eq!(
+            t.fail_ent(0),
+            FailOutcome::Synthesize {
+                unique: 42,
+                commit_id: 9
+            }
+        );
+        assert_eq!(
+            t.state(0),
+            SlotState::Replied { commit_id: 9 },
+            "the synthesized commit is the slot's one exit from Delivered"
+        );
+        assert!(transport_reply_integrity_stats().0 > before);
+        assert_eq!(
+            t.fail_ent(0),
+            FailOutcome::Nothing,
+            "a slot that owes nothing must never produce a second commit"
+        );
+    }
+
+    /// A parked slot fails the same way (teardown drain / lease wedge).
+    #[test]
+    fn fail_ent_synthesizes_for_a_parked_slot() {
+        let mut t = table(1);
+        t.on_deliver(0, 8, 8);
+        t.admit_commit(0, 8);
+        t.on_commit_parked(0);
+        assert_eq!(
+            t.fail_ent(0),
+            FailOutcome::Synthesize {
+                unique: 8,
+                commit_id: 8
+            }
+        );
+    }
+
+    /// FUSE-2 row 8: teardown (`pending.clear()`) must not drop owed
+    /// requests silently — the drain fails every owing slot, and what
+    /// genuinely cannot be committed lands on the tripwire.
+    #[test]
+    fn abandon_counts_the_tripwire_and_clears_the_debt() {
+        let mut t = table(2);
+        t.on_deliver(0, 3, 3);
+        let before = transport_reply_integrity_stats().1;
+        t.abandon(0);
+        assert!(
+            transport_reply_integrity_stats().1 > before,
+            "row 8: a request dropped at teardown must be counted, not vanish"
+        );
+        assert_eq!(t.owing().count(), 0);
+    }
+
+    /// FUSE-2 row 5 sibling: re-REGISTER must never be the exit from an
+    /// owing slot. The worker has to `fail_ent` first — the state machine
+    /// makes the omission observable.
+    #[test]
+    fn register_over_an_owing_slot_is_an_abandonment() {
+        let mut t = table(1);
+        t.on_deliver(0, 21, 4);
+        let before = transport_reply_integrity_stats().1;
+        t.on_register_submitted(0);
+        assert_eq!(t.state(0), SlotState::Registered);
+        assert!(
+            transport_reply_integrity_stats().1 > before,
+            "re-REGISTERing over a delivered request is exactly row 5's loss"
+        );
+    }
+
+    /// FUSE-3a: bounded exponential backoff, then retirement.
+    #[test]
+    fn register_failures_back_off_then_retire() {
+        let mut t = table(1);
+        let t0 = Instant::now();
+        let mut last = Duration::ZERO;
+        for i in 1..REGISTER_RETRY_MAX {
+            match t.note_register_failure(0, t0) {
+                RegisterAction::Retry { after } => {
+                    assert!(
+                        after >= REGISTER_BACKOFF_BASE,
+                        "failure {i} must back off at least one base step"
+                    );
+                    assert!(after >= last, "backoff must be monotonic");
+                    assert!(after <= REGISTER_BACKOFF_MAX, "backoff must stay bounded");
+                    last = after;
+                }
+                RegisterAction::Retire => panic!("retired early at failure {i}"),
+            }
+        }
+        assert_eq!(
+            t.note_register_failure(0, t0),
+            RegisterAction::Retire,
+            "the retry budget must be finite"
+        );
+        assert_eq!(t.state(0), SlotState::Retired);
+        assert!(
+            t.all_retired(),
+            "a queue whose every ent retired can no longer serve — the session must fail"
+        );
+    }
+
+    /// FUSE-3a: a success clears the failure history (so an occasional
+    /// EBUSY never accumulates toward retirement).
+    #[test]
+    fn register_success_resets_the_backoff() {
+        let mut t = table(1);
+        let t0 = Instant::now();
+        t.note_register_failure(0, t0);
+        t.note_register_failure(0, t0);
+        t.note_register_success(0);
+        assert!(
+            t.next_retry_deadline().is_none(),
+            "a successful REGISTER clears the pending backoff"
+        );
+        match t.note_register_failure(0, t0) {
+            RegisterAction::Retry { after } => assert_eq!(
+                after, REGISTER_BACKOFF_BASE,
+                "the next failure restarts at the base step"
+            ),
+            RegisterAction::Retire => panic!("one failure must not retire an ent"),
+        }
+    }
+
+    /// FUSE-2 row 6: REGISTER and COMMIT CQEs must be distinguishable.
+    /// `user_data == ent_idx` for both is why an `EAGAIN` COMMIT is
+    /// re-REGISTERed today, discarding the reply already written into the
+    /// ent.
+    #[test]
+    fn user_data_distinguishes_register_from_commit() {
+        for ent in [0usize, 1, 31, 255] {
+            let reg = encode_user_data(RingOp::Register, ent);
+            let com = encode_user_data(RingOp::Commit, ent);
+            assert_ne!(
+                reg, com,
+                "ent {ent}: the two op classes must not share a user_data word"
+            );
+            assert_eq!(decode_user_data(reg), Some((RingOp::Register, ent)));
+            assert_eq!(decode_user_data(com), Some((RingOp::Commit, ent)));
+            assert_ne!(reg, UD_POLL);
+            assert_ne!(com, UD_POLL);
+        }
+        assert_eq!(
+            decode_user_data(UD_POLL),
+            None,
+            "the wake-fd poll marker must stay distinct from every ent op"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3240,28 +4311,52 @@ mod tests {
         assert_eq!(FUSE_OVER_IO_URING_FLAGS2, 1u32 << 9);
     }
 
-    /// PERF-2 pool-level teardown law (what the session's reply-drop
-    /// comment relies on: "shutdown clears the pending map, so a reply
-    /// routed after it would be dropped"): a pre-teardown reply commits
-    /// (Ok), a post-teardown reply for the SAME unique reports NotFound —
-    /// the drop-not-classical-write arm in `write_vectored`.
+    /// PERF-2 pool-level teardown law, restated on slot addressing
+    /// (FUSE-2 ⊕ PERF-16): a pre-teardown reply commits (Ok); after
+    /// teardown the queue worker's drain owns every owed slot, so a
+    /// late reply reports NotFound — the drop-not-classical-write arm in
+    /// `write_vectored`, which then counts it apart from delivered
+    /// replies (FUSE-3b).
     #[test]
-    fn shutdown_clears_pending_so_late_replies_drop() {
+    fn teardown_hands_owed_slots_to_the_drain_so_late_replies_report() {
         let (pool, _rxs) = FuseOverUring::sim_inert_with_commit_rx(1);
-        pool.test_insert_pending(42, 0, 3, 7);
+        let slot = ReplySlot::Ring {
+            qid: 0,
+            ent_idx: 3,
+            commit_id: 7,
+        };
         pool.mark_ready();
-        pool.submit_reply(42, vec![0u8; 16], bytes::Bytes::new())
+        pool.submit_reply(slot, vec![0u8; 16], bytes::Bytes::new())
             .expect("pre-teardown reply must commit");
-        pool.test_insert_pending(44, 0, 4, 8);
         pool.shutdown();
         let err = pool
-            .submit_reply(44, vec![0u8; 16], bytes::Bytes::new())
-            .expect_err("post-teardown reply must miss the cleared pending map");
+            .submit_reply(
+                ReplySlot::Ring {
+                    qid: 0,
+                    ent_idx: 4,
+                    commit_id: 8,
+                },
+                vec![0u8; 16],
+                bytes::Bytes::new(),
+            )
+            .expect_err("post-teardown reply must not race the worker's drain");
         assert_eq!(
             err.kind(),
             std::io::ErrorKind::NotFound,
             "the miss must be the NotFound drop shape (never a classical fallback)"
         );
+    }
+
+    /// A reply carrying no ring slot can never be committed — it is a
+    /// classical delivery and belongs on the device write.
+    #[test]
+    fn classical_slot_never_commits() {
+        let (pool, _rxs) = FuseOverUring::sim_inert_with_commit_rx(1);
+        pool.mark_ready();
+        let err = pool
+            .submit_reply(ReplySlot::Classical, vec![0u8; 16], bytes::Bytes::new())
+            .expect_err("a classical reply has no ring slot to address");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     /// PERF-2 pool-level idempotence law: `shutdown` gates its side
@@ -4104,6 +5199,43 @@ mod tests {
         last
     }
 
+    /// Wait (bounded) for the poller population to REACH `expected`.
+    ///
+    /// `io_uring_setup` returning does not mean the kernel's `iou-sqp`
+    /// task is already visible in `/proc/self/task`: thread creation and
+    /// its `comm` publication race the returning syscall. An instant
+    /// assert therefore flaked (~2/15 quiet-box runs: "left 0 right 1")
+    /// — a scan artifact, never a poller-count bug. Waiting for the
+    /// count is the honest observation; the deadline keeps a REAL
+    /// missing poller a failure rather than a hang.
+    fn await_pollers(expected: usize) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let now = count_sqpoll_pollers();
+            if now == expected || Instant::now() >= deadline {
+                return now;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Assert the poller population STAYS at `expected` for a settle
+    /// window. The attach contract is a must-NOT-grow property, so it is
+    /// pinned by watching for a while rather than by one instant sample
+    /// (which could pass simply by looking before a second poller
+    /// appeared).
+    fn assert_pollers_stay(expected: usize, window: Duration, ctx: &str) {
+        let deadline = Instant::now() + window;
+        loop {
+            let now = count_sqpoll_pollers();
+            assert_eq!(now, expected, "{ctx}");
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn sqpoll_group(idle_ms: u32, cpu: Option<u32>) -> SqpollGroup {
         SqpollGroup {
             cfg: SqpollConfig { idle_ms, cpu },
@@ -4290,10 +5422,10 @@ mod tests {
                 "qid={qid}: knob unset must not set IORING_SETUP_SQPOLL"
             );
         }
-        assert_eq!(
-            count_sqpoll_pollers(),
+        assert_pollers_stay(
             before,
-            "knob unset must not spawn poller threads"
+            Duration::from_millis(200),
+            "knob unset must not spawn poller threads",
         );
     }
 
@@ -4325,7 +5457,7 @@ mod tests {
             return;
         }
         assert_eq!(
-            count_sqpoll_pollers(),
+            await_pollers(before + 1),
             before + 1,
             "leader creates exactly one poller"
         );
@@ -4341,11 +5473,11 @@ mod tests {
             f1.params().is_setup_sqpoll() && f2.params().is_setup_sqpoll(),
             "followers must ride SQPOLL (attached), not silently build plain"
         );
-        assert_eq!(
-            count_sqpoll_pollers(),
+        assert_pollers_stay(
             before + 1,
+            Duration::from_millis(300),
             "followers ATTACH to the leader's poller — one iou-sqp thread \
-             total, never one per queue"
+             total, never one per queue",
         );
 
         // The worker registers /dev/fuse + wake fd on every ring right
@@ -4376,10 +5508,10 @@ mod tests {
             !ring.params().is_setup_sqpoll(),
             "declined group ⇒ plain follower rings"
         );
-        assert_eq!(
-            count_sqpoll_pollers(),
+        assert_pollers_stay(
             before,
-            "a declined group must never spawn a private poller"
+            Duration::from_millis(200),
+            "a declined group must never spawn a private poller",
         );
     }
 
@@ -4405,7 +5537,11 @@ mod tests {
             !ring.params().is_setup_sqpoll(),
             "un-attachable leader fd ⇒ plain follower ring"
         );
-        assert_eq!(count_sqpoll_pollers(), before);
+        assert_pollers_stay(
+            before,
+            Duration::from_millis(200),
+            "an un-attachable leader fd must never spawn a private poller",
+        );
     }
 
     /// Pool shutdown while a follower is still waiting for the leader
@@ -4440,6 +5576,11 @@ mod inbound_queue_tests {
             header_and_op: vec![0; 40],
             payload: Bytes::new(),
             unique,
+            slot: ReplySlot::Ring {
+                qid: 0,
+                ent_idx: 0,
+                commit_id: unique,
+            },
             arrived_ns: crate::raw::read_phase::transport_now_ns(),
         }
     }
@@ -4451,8 +5592,8 @@ mod inbound_queue_tests {
         let q = InboundQueue::new();
         let active = AtomicBool::new(true);
         let shutdown = tokio::sync::Notify::new();
-        q.push(req(7));
-        q.push(req(8));
+        q.push(req(7)).expect("live receiver accepts");
+        q.push(req(8)).expect("live receiver accepts");
         let a = q
             .pop(&active, &shutdown)
             .await

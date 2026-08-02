@@ -122,6 +122,7 @@ async fn make_with(block_size: &str, uuid: [u8; 16], alloc_ns: &str) -> H {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     H {
         fs,
@@ -738,6 +739,7 @@ async fn il_cold_read_serves_in_place_into_the_arena_window() {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: std::process::id(),
+        ..Default::default()
     };
 
     // Striped cold fixture (12 × BS pattern, fsync, purge).

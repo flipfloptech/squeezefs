@@ -99,6 +99,7 @@ async fn test_writeback_queue_full_deadlock() {
         uid,
         gid,
         pid: 1234,
+        ..Default::default()
     };
 
     // Create file
@@ -212,6 +213,7 @@ async fn test_inline_file_layout_overflow() {
         uid,
         gid,
         pid: 1234,
+        ..Default::default()
     };
 
     let create_res = fs
@@ -304,6 +306,7 @@ async fn test_small_block_map_stays_inline() {
         uid,
         gid,
         pid: 1234,
+        ..Default::default()
     };
 
     let create_res = fs
@@ -706,6 +709,7 @@ async fn make_flush_fs(test_id: &str) -> FlushHarness {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1234,
+        ..Default::default()
     };
     FlushHarness {
         fs,
@@ -1130,6 +1134,7 @@ async fn test_block_allocator_recovery() {
         uid,
         gid,
         pid: 0,
+        ..Default::default()
     };
 
     // Create file
@@ -1260,6 +1265,7 @@ async fn test_stale_token_writeback_adopts_current_epoch_no_leak() {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
 
     let ino = fs

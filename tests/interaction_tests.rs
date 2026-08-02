@@ -66,6 +66,7 @@ fn req() -> Request {
         uid: 1000,
         gid: 1000,
         pid: 4321,
+        ..Default::default()
     }
 }
 

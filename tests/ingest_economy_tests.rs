@@ -371,6 +371,7 @@ async fn production_write_sever_recycles_pooled_buffers() {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: std::process::id(),
+        ..Default::default()
     };
     let created = fs
         .create(

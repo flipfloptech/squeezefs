@@ -346,6 +346,7 @@ async fn test_batch_forget_queues_reclaim_like_forget() {
         uid: 1000,
         gid: 1000,
         pid: 1,
+        ..Default::default()
     };
     fs.batch_forget(req, &inos).await;
 

@@ -112,6 +112,7 @@ async fn make_with_write_cap(write_disk_cap: &str) -> H {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     H {
         fs,

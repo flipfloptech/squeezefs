@@ -196,6 +196,7 @@ async fn mount_stack(meta: &Path, staging: &Path, data: &Path, alloc_name: &str)
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     H { fs, req, nvme }
 }

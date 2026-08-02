@@ -158,6 +158,7 @@ async fn make_fs(test_id: &str, block_size: &str) -> Harness {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1234,
+        ..Default::default()
     };
 
     Harness {

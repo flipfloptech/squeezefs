@@ -132,53 +132,6 @@ use crate::raw::abi::FUSE_WRITE_IN_SIZE;
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 use crate::MountOptions;
 
-/// Uniques delivered via classical `/dev/fuse` (INIT, the REGISTER
-/// handoff window, the post-arm classical sideband). Replies for these
-/// must use classical write even after the uring pool is armed.
-///
-/// Per-op economy (P2): on an armed steady-state session this set is
-/// (almost always) EMPTY — only sideband stragglers enter it — yet every
-/// reply paid the global mutex + hash probe. `len` (bumped AFTER a
-/// successful insert, decremented AFTER a successful remove) gates the
-/// probe: a reply observing `len == 0` may skip the lock because a
-/// unique's own classical insert is ordered strictly before its reply
-/// (delivery → session dispatch → handler → reply crosses synchronized
-/// channel/task edges, so the bump is visible by reply time); other
-/// uniques' racing entries are irrelevant to this unique's verdict — the
-/// set is keyed by unique and only the owner ever removes its entry.
-#[cfg(target_os = "linux")]
-struct ClassicalInflight {
-    len: std::sync::atomic::AtomicUsize,
-    set: std::sync::Mutex<std::collections::HashSet<u64>>,
-}
-
-#[cfg(target_os = "linux")]
-impl ClassicalInflight {
-    fn new() -> Self {
-        Self {
-            len: std::sync::atomic::AtomicUsize::new(0),
-            set: std::sync::Mutex::new(std::collections::HashSet::new()),
-        }
-    }
-
-    fn insert(&self, unique: u64) {
-        if self.set.lock().unwrap().insert(unique) {
-            self.len.fetch_add(1, std::sync::atomic::Ordering::Release);
-        }
-    }
-
-    fn remove(&self, unique: u64) -> bool {
-        if self.len.load(std::sync::atomic::Ordering::Acquire) == 0 {
-            return false;
-        }
-        let removed = self.set.lock().unwrap().remove(&unique);
-        if removed {
-            self.len.fetch_sub(1, std::sync::atomic::Ordering::Release);
-        }
-        removed
-    }
-}
-
 pub struct FuseConnection {
     unmount_notify: Arc<Notify>,
     mode: ConnectionMode,
@@ -202,11 +155,6 @@ pub struct FuseConnection {
     #[cfg(target_os = "linux")]
     over_uring:
         std::sync::Arc<std::sync::OnceLock<std::sync::Arc<super::fuse_over_uring::FuseOverUring>>>,
-    /// Uniques delivered via classical `/dev/fuse` (INIT, the REGISTER handoff,
-    /// and the post-arm classical sideband). Replies for these must use
-    /// classical write even after the uring pool is armed.
-    #[cfg(target_os = "linux")]
-    classical_inflight: std::sync::Arc<ClassicalInflight>,
     #[cfg(target_os = "linux")]
     pub(crate) assigned_qid: Option<u16>,
     /// Post-arm classical sideband servicer (primary session only). The kernel
@@ -263,7 +211,6 @@ impl FuseConnection {
                 unmount_notify,
                 mode: ConnectionMode::Block(connection),
                 over_uring: std::sync::Arc::new(std::sync::OnceLock::new()),
-                classical_inflight: std::sync::Arc::new(ClassicalInflight::new()),
                 assigned_qid: None,
                 classical_sideband: std::sync::atomic::AtomicBool::new(false),
                 last_read_arrival_ns: std::sync::atomic::AtomicU64::new(0),
@@ -355,12 +302,47 @@ impl FuseConnection {
     }
 
     #[cfg(target_os = "linux")]
-    pub fn get_payload_buffer(&self, unique: u64) -> Option<(u64, usize)> {
+    pub fn get_payload_buffer(&self, slot: crate::raw::ReplySlot) -> Option<(u64, usize)> {
         // Lock-free slot read (PERF-2; the field doc carries the
-        // not-arc-swap rationale) — a plain acquire load + the pool's
-        // sharded pending probe, zero RMWs.
+        // not-arc-swap rationale) — a plain acquire load, then a direct
+        // (qid, ent_idx) index: no map probe, no mutex (PERF-16).
         let pool = self.over_uring.get()?;
-        pool.get_payload_buffer(unique)
+        pool.get_payload_buffer(slot)
+    }
+
+    /// FUSE-2 rows 2 and 3: commit a reply against its ring slot
+    /// **directly**, bypassing the session's reply task.
+    ///
+    /// The transport's per-queue commit channel is independent of the
+    /// reply task, so a handler whose reply task has died (or that
+    /// panicked before replying) still reaches the kernel instead of
+    /// leaving the caller in uninterruptible sleep. Errors here are the
+    /// genuinely unaddressable cases and are counted by the caller.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn commit_reply_direct(
+        &self,
+        slot: crate::raw::ReplySlot,
+        header: Vec<u8>,
+        body: bytes::Bytes,
+    ) -> io::Result<()> {
+        let pool = self
+            .over_uring
+            .get()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no over-uring pool"))?;
+        pool.submit_reply(slot, header, body)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn commit_reply_direct(
+        &self,
+        _slot: crate::raw::ReplySlot,
+        _header: Vec<u8>,
+        _body: bytes::Bytes,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no FUSE-over-io_uring transport on this platform",
+        ))
     }
 
     /// MEM-1: claim a DMA-destination owner token over `[addr, addr+len)`
@@ -410,7 +392,6 @@ impl FuseConnection {
             unmount_notify,
             mode: ConnectionMode::NonBlock(connection),
             over_uring: std::sync::Arc::new(std::sync::OnceLock::new()),
-            classical_inflight: std::sync::Arc::new(ClassicalInflight::new()),
             assigned_qid: None,
             classical_sideband: std::sync::atomic::AtomicBool::new(false),
             last_read_arrival_ns: std::sync::atomic::AtomicU64::new(0),
@@ -444,7 +425,6 @@ impl FuseConnection {
                     mode: ConnectionMode::Block(connection),
                     // Share over-uring pool so multi-queue session workers pull the same inbound queue.
                     over_uring: self.over_uring.clone(),
-                    classical_inflight: self.classical_inflight.clone(),
                     assigned_qid: None,
                     classical_sideband: std::sync::atomic::AtomicBool::new(false),
                     last_read_arrival_ns: std::sync::atomic::AtomicU64::new(0),
@@ -531,7 +511,6 @@ impl FuseConnection {
                     mode: ConnectionMode::NonBlock(connection),
                     // Share over-uring pool so multi-queue session workers pull the same inbound queue.
                     over_uring: self.over_uring.clone(),
-                    classical_inflight: self.classical_inflight.clone(),
                     assigned_qid: None,
                     classical_sideband: std::sync::atomic::AtomicBool::new(false),
                     last_read_arrival_ns: std::sync::atomic::AtomicU64::new(0),
@@ -574,11 +553,16 @@ impl FuseConnection {
             .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Read one request. The fourth tuple element is the reply address
+    /// of the delivery (FUSE-2 ⊕ PERF-16): the ring slot it arrived on,
+    /// or [`crate::raw::ReplySlot::Classical`]. Carrying it out of the
+    /// read is what lets the reply commit against its slot with no
+    /// `unique → slot` map in between.
     pub async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
         &self,
         header_buf: Vec<u8>,
         data_buf: T,
-    ) -> Option<((Vec<u8>, T, Option<Bytes>), io::Result<usize>)> {
+    ) -> Option<((Vec<u8>, T, Option<Bytes>, crate::raw::ReplySlot), io::Result<usize>)> {
         let mut unmount_fut = pin!(self.unmount_notify.notified().fuse());
         let mut read_fut = pin!(self.inner_read_vectored(header_buf, data_buf).fuse());
 
@@ -592,7 +576,7 @@ impl FuseConnection {
         &self,
         mut header_buf: Vec<u8>,
         mut data_buf: T,
-    ) -> ((Vec<u8>, T, Option<Bytes>), io::Result<usize>) {
+    ) -> ((Vec<u8>, T, Option<Bytes>, crate::raw::ReplySlot), io::Result<usize>) {
         // After arm, the request hot path is FUSE-over-io_uring. The classical
         // device is still read pre-arm (INIT — the kernel rejects REGISTER until
         // fch->initialized) and, post-arm, by the dedicated classical sideband
@@ -628,7 +612,7 @@ impl FuseConnection {
                     Some(r) => r,
                     None => {
                         return (
-                            (header_buf, data_buf, None),
+                            (header_buf, data_buf, None, crate::raw::ReplySlot::Classical),
                             Err(io::Error::new(
                                 io::ErrorKind::NotConnected,
                                 "fuse-over-uring inactive (unmounted or aborted)",
@@ -644,7 +628,7 @@ impl FuseConnection {
                 // after the header (e.g. LOOKUP name). Use in_header.len to size it.
                 if inbound.header_and_op.len() < 40 || header_buf.len() < 40 {
                     return (
-                        (header_buf, data_buf, None),
+                        (header_buf, data_buf, None, crate::raw::ReplySlot::Classical),
                         Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "short fuse-over-uring header",
@@ -694,7 +678,10 @@ impl FuseConnection {
                 {
                     let n = FUSE_WRITE_IN_SIZE.min(op_in.len()).min(data_buf.len());
                     data_buf[..n].copy_from_slice(&op_in[..n]);
-                    return ((header_buf, data_buf, Some(inbound.payload)), Ok(40 + n));
+                    return (
+                        (header_buf, data_buf, Some(inbound.payload), inbound.slot),
+                        Ok(40 + n),
+                    );
                 }
                 // Bytes of body that live in op_in (first in_arg); remainder in payload.
                 // NOTE: We keep payload as Bytes for zero-copy writes!
@@ -733,7 +720,7 @@ impl FuseConnection {
                     }
                 }
                 return (
-                    (header_buf, data_buf, Some(inbound.payload)),
+                    (header_buf, data_buf, Some(inbound.payload), inbound.slot),
                     Ok(40 + filled),
                 );
             }
@@ -753,14 +740,17 @@ impl FuseConnection {
                 connection.read_vectored(header_buf, data_buf).await
             }
         };
-        // Track unique so the reply uses classical write (both the mark_ready
-        // race window and the post-arm sideband). FORGET/BATCH_FORGET carry a
-        // unique but are never replied to — tracking them would leak the set.
+        // Sideband accounting only. The `classical_inflight` set this
+        // used to feed is GONE (FUSE-2 ⊕ PERF-16): a reply is classical
+        // because its request carries `ReplySlot::Classical`, not
+        // because a shared `HashSet<u64>` behind a global mutex says so.
+        // That deletes the per-reply set probe AND the whole leak class
+        // FUSE-3h describes — a never-removed unique (opcode 41
+        // `FUSE_NOTIFY_REPLY`, which is never replied to) used to make
+        // every reply on every queue take that mutex forever.
         #[cfg(target_os = "linux")]
         if let ((ref hdr, _), Ok(n)) = &result {
             if *n >= 16 {
-                let unique = u64::from_le_bytes(hdr[8..16].try_into().unwrap_or([0; 8]));
-                let op = u32::from_le_bytes(hdr[4..8].try_into().unwrap_or([0; 4]));
                 if self
                     .classical_sideband
                     .load(std::sync::atomic::Ordering::Acquire)
@@ -768,95 +758,88 @@ impl FuseConnection {
                     super::fuse_over_uring::note_classical_sideband();
                 }
                 if super::fuse_over_uring::transport_debug() {
+                    let unique = u64::from_le_bytes(hdr[8..16].try_into().unwrap_or([0; 8]));
+                    let op = u32::from_le_bytes(hdr[4..8].try_into().unwrap_or([0; 4]));
                     eprintln!("[XPORT] classical-deliver unique={unique} op={op}");
-                }
-                // FUSE_FORGET = 2, FUSE_BATCH_FORGET = 42: no reply exists.
-                if unique != 0 && !matches!(op, 2 | 42) {
-                    self.classical_inflight.insert(unique);
                 }
             }
         }
         let (buffers, res) = result;
         let (hdr, data) = buffers;
-        ((hdr, data, None), res)
+        // Classical delivery: the reply rides the device write.
+        ((hdr, data, None, crate::raw::ReplySlot::Classical), res)
     }
 
+    /// Reply to one request. `slot` is the address the request was
+    /// delivered on (FUSE-2 ⊕ PERF-16): a ring slot commits against that
+    /// ent, [`crate::raw::ReplySlot::Classical`] takes the device write.
+    ///
+    /// Routing by SLOT rather than by "is the pool ready and is this
+    /// unique in the classical set?" is what closes FUSE-2 row 9: a
+    /// post-shutdown ring reply can no longer fall through to a classical
+    /// write that returns `ENOENT` and loses the reply.
     pub async fn write_vectored<T: Deref<Target = [u8]> + Send, U: Deref<Target = [u8]> + Send>(
         &self,
         data: T,
         body_extend_data: Option<U>,
+        slot: crate::raw::ReplySlot,
     ) -> CompleteIoResult<(T, Option<U>), usize> {
-        // After arm: uring-delivered requests reply via COMMIT_AND_FETCH.
-        // Requests that were still on the classical device queue during the
-        // REGISTER handoff must be completed with a classical write — if we only
-        // try COMMIT they miss the pending map, stay in kernel `waiting`, and
-        // plain `umount` returns EBUSY forever.
+        // After arm: uring-delivered requests reply via COMMIT_AND_FETCH
+        // against their own slot. Classical deliveries (INIT, the
+        // kernel-mandated sideband, switchover-window stragglers) and
+        // daemon-initiated notifications carry `ReplySlot::Classical` and
+        // must be completed with a device write — if they tried COMMIT
+        // they would stay in kernel `waiting` and plain `umount` would
+        // return EBUSY forever.
         #[cfg(target_os = "linux")]
-        {
+        if slot.is_ring() {
             // Lock-free slot read; borrow — the slot never empties
             // (teardown contract 2), so no refcount RMW per reply.
-            let pool = self.over_uring.get();
-            if let Some(pool) = pool.filter(|p| p.is_ready()) {
+            if let Some(pool) = self.over_uring.get() {
                 // unique is at offset 8 in fuse_out_header (len u32, error i32, unique u64)
                 let unique = if data.deref().len() >= 16 {
                     u64::from_le_bytes(data.deref()[8..16].try_into().unwrap())
                 } else {
                     0
                 };
-                // Notifications (unique == 0, e.g. FUSE_NOTIFY_INVAL_INODE
-                // for the L4 W1 handoff) have NO over-uring mechanism: the
-                // kernel's COMMIT protocol keys on a request unique, and
-                // notifies are daemon-initiated. They ride the classical
-                // device write below — the same kernel-mandated classical
-                // sideband the post-arm FORGET/INTERRUPT traffic uses,
-                // never a hot-path fallback. (Pre-L4-6 this arm errored
-                // Unsupported, which the session loop treated as FATAL —
-                // the first live notify on an armed session killed the
-                // mount; the gate's notify-delivery row pins the fix.)
-                let is_classical = unique == 0 || self.classical_inflight.remove(unique);
-                if is_classical {
-                    if super::fuse_over_uring::transport_debug() {
-                        eprintln!("[XPORT] classical-reply unique={unique}");
-                    }
-                    // Fall through to classical write below.
-                } else {
-                    let body_bytes = if let Some(ref ext) = body_extend_data {
-                        let slice = ext.deref();
-                        let dest_addr = pool
-                            .get_payload_buffer(unique)
-                            .map(|(ptr, _)| ptr as *const u8);
-                        if let Some(addr) = dest_addr {
-                            if slice.as_ptr() == addr {
-                                bytes::Bytes::from_owner(UringBufOwner {
-                                    ptr: slice.as_ptr(),
-                                    len: slice.len(),
-                                })
-                            } else {
-                                bytes::Bytes::copy_from_slice(slice)
-                            }
+                let body_bytes = if let Some(ref ext) = body_extend_data {
+                    let slice = ext.deref();
+                    let dest_addr = pool.get_payload_buffer(slot).map(|(ptr, _)| ptr as *const u8);
+                    if let Some(addr) = dest_addr {
+                        if slice.as_ptr() == addr {
+                            bytes::Bytes::from_owner(UringBufOwner {
+                                ptr: slice.as_ptr(),
+                                len: slice.len(),
+                            })
                         } else {
                             bytes::Bytes::copy_from_slice(slice)
                         }
                     } else {
-                        bytes::Bytes::new()
-                    };
-                    let len = data.deref().len() + body_bytes.len();
-                    match pool.submit_reply(unique, data.deref().to_vec(), body_bytes) {
-                        Ok(()) => return ((data, body_extend_data), Ok(len)),
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                            // Double-reply or auto-COMMITed FORGET — do not classical-write
-                            // (that path has stalled the single reply task under load).
-                            debug!(
-                                unique,
-                                "fuse-over-uring COMMIT miss; drop (no classical fallback)"
-                            );
-                            if super::fuse_over_uring::transport_debug() {
-                                eprintln!("[XPORT] reply-dropped-notfound unique={unique}");
-                            }
-                            return ((data, body_extend_data), Ok(len));
-                        }
-                        Err(e) => return ((data, body_extend_data), Err(e)),
+                        bytes::Bytes::copy_from_slice(slice)
                     }
+                } else {
+                    bytes::Bytes::new()
+                };
+                let len = data.deref().len() + body_bytes.len();
+                match pool.submit_reply(slot, data.deref().to_vec(), body_bytes) {
+                    Ok(()) => return ((data, body_extend_data), Ok(len)),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        // The slot no longer holds this request (teardown,
+                        // or a double reply the state machine refused).
+                        // FUSE-3b: this reply was NOT delivered — it must
+                        // not be reported as `Ok(len)` and counted on the
+                        // reply gauge. Count it apart and tell the caller.
+                        super::fuse_over_uring::note_reply_dropped_no_slot();
+                        debug!(
+                            unique,
+                            "fuse-over-uring COMMIT miss; drop (no classical fallback)"
+                        );
+                        if super::fuse_over_uring::transport_debug() {
+                            eprintln!("[XPORT] reply-dropped-notfound unique={unique}");
+                        }
+                        return ((data, body_extend_data), Err(e));
+                    }
+                    Err(e) => return ((data, body_extend_data), Err(e)),
                 }
             }
         }
@@ -1779,7 +1762,11 @@ mod over_uring_slot_tests {
         );
         assert_eq!(c.num_uring_queues(), None, "no pool — no queue geometry");
         assert_eq!(
-            c.get_payload_buffer(7),
+            c.get_payload_buffer(crate::raw::ReplySlot::Ring {
+                qid: 0,
+                ent_idx: 7,
+                commit_id: 7,
+            }),
             None,
             "no pool — no payload buffer can resolve"
         );

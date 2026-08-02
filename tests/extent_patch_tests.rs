@@ -166,6 +166,7 @@ async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     H {
         fs,
@@ -1025,6 +1026,7 @@ async fn clone_cfr_vs_patch_storm() {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             pid: 1,
+            ..Default::default()
         };
         let h = Arc::new(H {
             fs,
@@ -1209,6 +1211,7 @@ async fn clone_cfr_vs_patch_storm() {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     let h2 = H {
         fs: fs2,
@@ -1487,6 +1490,7 @@ async fn crash_after_acked_patch_foreign_bytes_intact_window_old_or_new() {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             pid: 1,
+            ..Default::default()
         };
         let h = H {
             fs,
@@ -1516,6 +1520,7 @@ async fn crash_after_acked_patch_foreign_bytes_intact_window_old_or_new() {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     let h2 = H {
         fs: fs2,
@@ -1583,6 +1588,7 @@ async fn crash_mid_patch_dma_failure_leaves_old_block_intact() {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             pid: 1,
+            ..Default::default()
         };
         let h = H {
             fs,
@@ -1605,6 +1611,7 @@ async fn crash_mid_patch_dma_failure_leaves_old_block_intact() {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     let h2 = H {
         fs: fs2,

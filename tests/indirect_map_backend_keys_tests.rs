@@ -897,3 +897,230 @@ async fn test_unknown_version_indirect_blob_fails_loud() {
     );
     assert_eq!(err.to_errno(), libc::EIO, "surfaces as EIO to the app");
 }
+
+// ---------------------------------------------------------------------------
+// 7. DUR-6 — the indirect blob is checksummed, CoW, and barriered.
+//
+// Three composed defects the pre-RC spec (§1 DUR-6) names:
+//   1. in-place rewrite of live durable state (the only non-CoW mutation
+//      in the metadata plane) — a tear destroys the COMMITTED map;
+//   2. no digest — old and new images share a header and entry offsets are
+//      stable across rewrites, so a tear at a sector boundary deserializes
+//      CLEANLY into a plausible map with WRONG block keys (the only silent
+//      -corruption path in the metadata plane);
+//   3. no ordering barrier before the naming commit — the layout can name
+//      a blob whose bytes are still volatile.
+// ---------------------------------------------------------------------------
+
+/// A blob spliced at a sector boundary from two images of the SAME shape
+/// (same entry count, same key widths — what a rewrite in place actually
+/// produces mid-tear) must be REFUSED, not decoded. Without a digest it
+/// decodes cleanly and every entry past the tear names the wrong block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dur6_a_torn_indirect_blob_refuses_instead_of_decoding_wrong_keys() {
+    let _serial = serial().await;
+    let _ = env_logger::builder().is_test(true).try_init();
+    let (router, routed, _dlm, _b, _m, _s) = crafted_blob_harness("imap_torn").await;
+
+    // Two same-shape images: identical count and key WIDTHS, different
+    // offsets — the pre/post state of one rewrite.
+    let entries_old: Vec<(u32, String)> = (0..400u32)
+        .map(|i| (i, format!("{:010}", 1_000_000 + i as u64)))
+        .collect();
+    let entries_new: Vec<(u32, String)> = (0..400u32)
+        .map(|i| (i, format!("{:010}", 2_000_000 + i as u64)))
+        .collect();
+    let mk = |entries: &Vec<(u32, String)>| {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(INDIRECT_MAGIC);
+        blob.extend_from_slice(&INDIRECT_VERSION.to_le_bytes());
+        blob.extend_from_slice(&bincode::serialize(entries).unwrap());
+        blob
+    };
+    let old = mk(&entries_old);
+    let new = mk(&entries_new);
+    assert_eq!(
+        old.len(),
+        new.len(),
+        "the two images must be the same shape"
+    );
+    assert!(old.len() > 1024, "the tear needs a multi-sector image");
+
+    // The tear: the first sector landed, the rest is the predecessor.
+    let mut torn = new.clone();
+    torn[512..].copy_from_slice(&old[512..]);
+
+    let res = fetch_with_planted_blob(&router, &routed, "torn_blob.bin", torn).await;
+    match res {
+        Err(e) => {
+            let dbg = format!("{e:?}");
+            assert!(
+                dbg.contains("IndirectMapFormat"),
+                "a torn blob must fail as a typed indirect-map format error, got: {dbg}"
+            );
+            assert_eq!(e.to_errno(), libc::EIO, "surfaces as EIO to the app");
+        }
+        Ok(meta) => {
+            let map = meta.block_map.clone().expect("rehydrated map");
+            let wrong = map
+                .iter()
+                .filter(|(i, k)| *k != &format!("{:010}", 2_000_000 + **i as u64))
+                .count();
+            panic!(
+                "a torn indirect blob DESERIALIZED CLEANLY — {wrong} of {} entries name the \
+                 predecessor's blocks (spec DUR-6 §2: the only silent-corruption path in \
+                 the metadata plane)",
+                map.len()
+            );
+        }
+    }
+}
+
+/// Republishing an indirect map must be copy-on-write: a FRESH block per
+/// publish, the previous one freed only after the layout commit that
+/// stopped naming it. Rewriting the live blob in place means a tear
+/// destroys the committed map, not just the new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dur6_indirect_publish_is_cow_and_frees_the_predecessor() {
+    let _serial = serial().await;
+    let _ = env_logger::builder().is_test(true).try_init();
+    let (router, routed, dlm, _b, _m, _s) = crafted_blob_harness("imap_cow").await;
+
+    let ino = routed
+        .create(1, "cow.bin", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("create")
+        .ino;
+    let path = squeezefs::keys::inode_path(ino).to_string();
+
+    let mut map = std::collections::HashMap::new();
+    for i in 0..SPILL_BLOCKS as u32 {
+        map.insert(i, ((1000 + i as u64) * CHUNK).to_string());
+    }
+    router.metadata_cache.insert(
+        ino,
+        CachedMetadata {
+            file_type: "striped".into(),
+            size: (SPILL_BLOCKS * BLOCK) as u64,
+            block_map: Some(std::sync::Arc::new(map.clone())),
+            layout_dirty: true,
+            layout_delta_chain: squeezefs::routing::LAYOUT_DELTA_CHAIN_INELIGIBLE,
+            ..Default::default()
+        },
+    );
+    persist_under_lease(&router, &dlm, &path).await;
+    let first = persisted_layout(&routed, ino).await;
+    assert!(is_indirect(&first), "the map must spill");
+    let first_key = first
+        .block_map_id
+        .as_deref()
+        .unwrap()
+        .strip_prefix("indirect:")
+        .unwrap()
+        .to_string();
+    let used_after_first = router.backend_router.default_allocator.get_used_blocks();
+
+    // A second publish of a CHANGED map, off the state a cold fetch
+    // produces — carrying `block_map_id`, which is what arms the in-place
+    // reuse arm in production.
+    map.insert(0, (99_000u64 * CHUNK).to_string());
+    router.metadata_cache.invalidate(&ino);
+    let base = router.fetch_metadata(&path).await.expect("cold fetch");
+    assert!(
+        base.block_map_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("indirect:")),
+        "the fetched entry must name the blob (else the reuse arm is untested)"
+    );
+    router.metadata_cache.insert(
+        ino,
+        CachedMetadata {
+            block_map: Some(std::sync::Arc::new(map.clone())),
+            layout_dirty: true,
+            layout_delta_chain: squeezefs::routing::LAYOUT_DELTA_CHAIN_INELIGIBLE,
+            ..base.clone()
+        },
+    );
+    persist_under_lease(&router, &dlm, &path).await;
+    let second = persisted_layout(&routed, ino).await;
+    let second_key = second
+        .block_map_id
+        .as_deref()
+        .unwrap()
+        .strip_prefix("indirect:")
+        .unwrap()
+        .to_string();
+
+    assert_ne!(
+        first_key, second_key,
+        "the indirect blob was rewritten IN PLACE — a tear would destroy the committed \
+         map, not just the new one (spec DUR-6 §1: the only non-CoW mutation in the \
+         metadata plane)"
+    );
+    assert_eq!(
+        router.backend_router.default_allocator.get_used_blocks(),
+        used_after_first,
+        "the predecessor blob must be freed after the layout commit stopped naming it \
+         (CoW must not leak one block per publish)"
+    );
+
+    // The published map is the new one, read back through the new blob.
+    router.metadata_cache.invalidate(&ino);
+    let fetched = router.fetch_metadata(&path).await.expect("cold fetch");
+    assert_eq!(
+        fetched.block_map.expect("map").get(&0).map(String::as_str),
+        Some((99_000u64 * CHUNK).to_string().as_str()),
+        "the CoW publish must serve the NEW map"
+    );
+}
+
+/// The layout must never name a blob whose bytes are still volatile: the
+/// data device is barriered between the blob write and the naming commit.
+/// Measured on the TEST-1 data-device power-cut harness — the blob's write
+/// sequence must be covered by a COMPLETED barrier by the time the publish
+/// returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dur6_the_blob_is_barriered_before_the_layout_names_it() {
+    let _serial = serial().await;
+    let _ = env_logger::builder().is_test(true).try_init();
+    let (router, routed, dlm, backing, _m, _s) = crafted_blob_harness("imap_barrier").await;
+    let dev = backing.path().to_str().unwrap().to_string();
+
+    let ino = routed
+        .create(1, "barrier.bin", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("create")
+        .ino;
+    let path = squeezefs::keys::inode_path(ino).to_string();
+    let mut map = std::collections::HashMap::new();
+    for i in 0..SPILL_BLOCKS as u32 {
+        map.insert(i, ((1000 + i as u64) * CHUNK).to_string());
+    }
+
+    squeezefs::dev_power_cut::arm_power_cut(&dev);
+    let seq_before = squeezefs::dev_power_cut::next_write_seq(&dev);
+
+    router.metadata_cache.insert(
+        ino,
+        CachedMetadata {
+            file_type: "striped".into(),
+            size: (SPILL_BLOCKS * BLOCK) as u64,
+            block_map: Some(std::sync::Arc::new(map)),
+            layout_dirty: true,
+            layout_delta_chain: squeezefs::routing::LAYOUT_DELTA_CHAIN_INELIGIBLE,
+            ..Default::default()
+        },
+    );
+    persist_under_lease(&router, &dlm, &path).await;
+
+    let layout = persisted_layout(&routed, ino).await;
+    assert!(is_indirect(&layout), "the map must spill");
+    let wrote = squeezefs::dev_power_cut::next_write_seq(&dev) > seq_before;
+    assert!(wrote, "no device write was journaled — the leg is vacuous");
+    assert!(
+        squeezefs::dev_power_cut::covering_epoch(&dev, seq_before).is_some(),
+        "the layout names an indirect blob whose bytes were never barriered to the data \
+         device (spec DUR-6 §3: durable metadata naming volatile data)"
+    );
+    squeezefs::dev_power_cut::clear_faults();
+}

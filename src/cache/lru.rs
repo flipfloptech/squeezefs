@@ -46,6 +46,14 @@ pub struct LruCache {
     /// channel — pre-R5 that queue silently held up to 16,384 live
     /// payloads with no drain path at all.
     evict_rx_taken: Arc<std::sync::atomic::AtomicBool>,
+    /// RES-4: the R5 shed target for this channel, honored ONLY while the
+    /// budget is Yellow+ (see [`Self::evict_channel_bound`]). Shedding a
+    /// channel cannot pull messages back out of it, so the shed clamps
+    /// the SEND side: new victims drop at the source (counted) while the
+    /// dehydration worker drains what is already parked — the never-lossy
+    /// R5 discipline. Green restores the static bound, so one Red pulse
+    /// cannot cold-start the disk tier forever.
+    evict_channel_shed_target: Arc<std::sync::atomic::AtomicU64>,
     /// R1b: drop Probation victims at the eviction source (count only —
     /// no channel traffic). Set for the hot-block tier; read_lru keeps
     /// full-channel behavior (its inserts are all protected anyway).
@@ -128,6 +136,7 @@ impl LruCache {
             evict_channel_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             evict_channel_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             evict_rx_taken: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            evict_channel_shed_target: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             drop_probation_evictions: false,
             admission_governor: None,
         }
@@ -140,6 +149,27 @@ impl LruCache {
     pub fn evict_channel_bytes(&self) -> u64 {
         self.evict_channel_bytes
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// RES-4: the R5 shed hook for this channel — see
+    /// `evict_channel_shed_target`.
+    pub fn shed_evict_channel(&self, target: u64) {
+        self.evict_channel_shed_target
+            .store(target, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The effective send-side admission bound: the static bound at
+    /// Green, `min(bound, shed target)` under pressure.
+    fn evict_channel_bound(&self) -> u64 {
+        if crate::mem_budget::level() >= crate::mem_budget::Level::Yellow {
+            std::cmp::min(
+                Self::EVICT_CHANNEL_BYTE_BOUND,
+                self.evict_channel_shed_target
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        } else {
+            Self::EVICT_CHANNEL_BYTE_BOUND
+        }
     }
 
     /// Victims dropped at the send side by the byte/slot bound.
@@ -314,7 +344,7 @@ impl LruCache {
                 if !self
                     .evict_rx_taken
                     .load(std::sync::atomic::Ordering::Relaxed)
-                    || self.evict_channel_bytes() + len > Self::EVICT_CHANNEL_BYTE_BOUND
+                    || self.evict_channel_bytes() + len > self.evict_channel_bound()
                 {
                     self.evict_channel_drops
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

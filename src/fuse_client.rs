@@ -12619,6 +12619,15 @@ impl Filesystem for SqueezefsFilesystem {
                     Arc::new(move || wl.current_bytes()),
                     Arc::new(move |target| wl_shed.shed_to(target)),
                 ));
+                // RES-4: the two eviction channels that actually park
+                // payloads (write_lru never arms a receiver, so its
+                // victims drop at the source and it has nothing to
+                // register).
+                crate::mem_budget::register_lru_evict_channel_components(
+                    &MEM_BUDGET,
+                    &self.router.cache.read_lru,
+                    &self.router.cache.hot_block,
+                );
                 let lanes = self.router.stream_lanes.clone();
                 MEM_BUDGET.register(Component::new(
                     "prefetch_inflight",

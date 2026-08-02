@@ -765,6 +765,42 @@ pub fn register_ipc_session_arena_component(
     mb.register(Component::new("ipc_session_arenas", 0, 1, current, shed));
 }
 
+/// RES-4 (pre-RC engineering spec §7): register the two LRU eviction
+/// channels that actually park payloads.
+///
+/// `LruCache` bounds each channel at `EVICT_CHANNEL_BYTE_BOUND` and
+/// gauges it, but the bytes were never in the registry — up to 512 MiB
+/// of live multi-MiB `Bytes` outside the authority, which is the exact
+/// shape of the cage-OOM class the bound was added for. Only caches that
+/// ARMED a dehydration receiver park anything (`write_lru` never takes
+/// one, so its victims drop at the source and it has no channel to
+/// register).
+///
+/// Floor 0 (warmth is the cheapest sacrifice), weight 1, and a real shed:
+/// the closure clamps SEND-side admission — a channel's parked messages
+/// belong to the worker draining them and are never torn (never-lossy),
+/// but new victims stop parking until the gauge is back under target.
+pub fn register_lru_evict_channel_components(
+    mb: &MemBudget,
+    read_lru: &crate::cache::lru::LruCache,
+    hot_block: &crate::cache::lru::LruCache,
+) {
+    for (name, cache) in [
+        ("read_lru_evict_channel", read_lru),
+        ("hot_block_evict_channel", hot_block),
+    ] {
+        let gauge = cache.clone();
+        let shed = cache.clone();
+        mb.register(Component::new(
+            name,
+            0,
+            1,
+            Arc::new(move || gauge.evict_channel_bytes()),
+            Arc::new(move |target| shed.shed_evict_channel(target)),
+        ));
+    }
+}
+
 /// One-atomic-load disk-tier publish gate (the finding-#2 escalation) —
 /// read by [`crate::cache::NvmeStaging::cache_read_block`], the single
 /// funnel every tier producer (fill path, dehydration) routes

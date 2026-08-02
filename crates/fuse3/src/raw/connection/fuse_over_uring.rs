@@ -1911,15 +1911,20 @@ fn build_plain_queue_ring(sq_entries: u32) -> io::Result<Ring> {
     build_plain_queue_ring_with(
         sq_entries,
         modern_queue_ring_flags_probed(),
-        |sq, _posture| {
-            IoUring::<squeue::Entry128, cqueue::Entry>::builder()
-                .setup_cqsize(sq * 2)
-                .build(sq)
-                .map_err(|e| {
-                    io::Error::other(format!(
-                        "SQE128 IoUring build(sq={sq}): {e} — need IORING_SETUP_SQE128"
-                    ))
-                })
+        |sq, posture| {
+            let mut builder = IoUring::<squeue::Entry128, cqueue::Entry>::builder();
+            builder.setup_cqsize(sq * 2);
+            if posture == QueueRingPosture::Modern {
+                // The pair (kernel refuses DEFER_TASKRUN without
+                // SINGLE_ISSUER); safe by construction — the worker
+                // thread builds, submits, and reaps this ring alone.
+                builder.setup_single_issuer().setup_defer_taskrun();
+            }
+            builder.build(sq).map_err(|e| {
+                io::Error::other(format!(
+                    "SQE128 IoUring build(sq={sq}, {posture:?}): {e} — need IORING_SETUP_SQE128"
+                ))
+            })
         },
     )
 }
@@ -1965,15 +1970,20 @@ fn build_plain_queue_ring_with<F>(sq_entries: u32, modern: bool, mut build: F) -
 where
     F: FnMut(u32, QueueRingPosture) -> io::Result<Ring>,
 {
-    // Pre-fix stub (RED): the probed posture is recognized but NOT yet
-    // engaged — every ring builds Plain, exactly today's behavior (the
-    // battery compiles and fails honestly; the green commit engages the
-    // Modern arm).
-    let _recognized = if modern {
-        QueueRingPosture::Modern
-    } else {
-        QueueRingPosture::Plain
-    };
+    if modern {
+        match build(sq_entries, QueueRingPosture::Modern) {
+            Ok(ring) => return Ok(ring),
+            Err(e) => {
+                // Probed-present but refused at build (seccomp/lockdown
+                // surprises past the probe): warn-and-degrade — an
+                // accelerator never fails the mount.
+                warn!(
+                    "fuse-over-uring: SINGLE_ISSUER+DEFER_TASKRUN refused at \
+                     ring build despite probe ({e}); plain ring"
+                );
+            }
+        }
+    }
     build(sq_entries, QueueRingPosture::Plain)
 }
 

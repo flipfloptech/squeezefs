@@ -41,11 +41,56 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// One 1 MiB FUSE_WRITE-class payload buffer per ring entry:
-/// payload_sz = max(max_write = 1 MiB, FUSE_MIN_READ_BUFFER, 256 pages).
-const PAYLOAD_SZ: u64 = 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Runtime page size (the kernel PAGE_SIZE the max_pages math uses).
+fn page_size() -> u64 {
+    let sz = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
+    assert!(sz > 0);
+    sz as u64
+}
+
+/// The kernel's advertisable max_pages ceiling — `fs.fuse.max_pages_limit`
+/// (256 fallback on kernels predating the sysctl).
+fn max_pages_limit() -> u64 {
+    std::fs::read_to_string("/proc/sys/fs/fuse/max_pages_limit")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(256)
+        .clamp(1, u16::MAX as u64)
+}
+
+/// The normative variable-ent geometry mirror (2026-08-04 campaign —
+/// fuse3 `TransportGeometry::plan`): the sandbox volumes are 4 MiB-block,
+/// so the daemon desires 4 MiB max_write, gated by the live sysctl; the
+/// budget ladder degrades depth first (32→4), then the payload leg
+/// degrades max_write toward the 1 MiB base (yesterday's ent) only when
+/// the floor-4 arena still exceeds the cap. Returns
+/// `(payload_sz, depth)`.
+fn expected_geometry(queues: u64, cap_bytes: u64, env_depth: Option<u64>) -> (u64, u64) {
+    let limit = max_pages_limit();
+    let page = page_size();
+    let target = (4 * MIB).clamp(page.max(4096), limit * page);
+    let pages_for = |mw: u64| mw.div_ceil(page).clamp(1, limit);
+    let payload_for = |mw: u64| 8192u64.max(mw).max(pages_for(mw) * page);
+    match env_depth {
+        Some(d) => (payload_for(target), d.clamp(1, 32)),
+        None => {
+            let depth_at = |mw: u64| (cap_bytes / (queues * payload_for(mw))).clamp(4, 32);
+            let depth = depth_at(target);
+            let base = target.min(MIB);
+            let floor_arena = queues * 4 * payload_for(target);
+            if depth > 4 || floor_arena <= cap_bytes || target <= base {
+                (payload_for(target), depth)
+            } else {
+                let fit = cap_bytes / (queues * 4);
+                let mw = (fit / page * page).clamp(base, target);
+                (payload_for(mw), depth_at(mw))
+            }
+        }
+    }
+}
 
 fn transport_supported() -> bool {
     if !Path::new("/dev/fuse").exists() {
@@ -84,12 +129,10 @@ fn possible_cpus() -> u64 {
 
 /// The normative L1 depth policy, mirrored test-side (the conformance
 /// contract): env override wins verbatim; otherwise desired 32 degraded
-/// to the payload-buffer cap with the pre-L1 floor of 4.
+/// to the payload-buffer cap with the pre-L1 floor of 4 — through the
+/// variable-ent mirror above.
 fn expected_depth(queues: u64, cap_bytes: u64, env_depth: Option<u64>) -> u64 {
-    match env_depth {
-        Some(d) => d.clamp(1, 32),
-        None => (cap_bytes / (queues * PAYLOAD_SZ)).clamp(4, 32),
-    }
+    expected_geometry(queues, cap_bytes, env_depth).1
 }
 
 /// The normative L1 buffer-cap policy: min(budget / 8, 2 GiB).
@@ -314,7 +357,7 @@ fn test_default_mount_transport_geometry_and_init_limits() {
     let mut mount = mount_fs("default", &[("SQUEEZEFS_MEM_BUDGET_MB", "65536")], &[]);
 
     let q = possible_cpus();
-    let depth = expected_depth(q, expected_cap(budget), None);
+    let (payload_sz, depth) = expected_geometry(q, expected_cap(budget), None);
     let (mb, ct) = expected_background(q, depth);
 
     let stats = mount.stats();
@@ -330,7 +373,7 @@ fn test_default_mount_transport_geometry_and_init_limits() {
     );
     assert_eq!(
         mount.metric(&stats, "transport_payload_buffer_bytes"),
-        q * depth * PAYLOAD_SZ,
+        q * depth * payload_sz,
         "payload arena gauge must equal queues × depth × payload_sz"
     );
     assert_eq!(
@@ -362,7 +405,7 @@ fn test_default_mount_transport_geometry_and_init_limits() {
     );
     assert_eq!(
         comp["current"].as_u64().unwrap(),
-        q * depth * PAYLOAD_SZ,
+        q * depth * payload_sz,
         "component gauge must match the arena bytes"
     );
 
@@ -388,18 +431,19 @@ fn test_small_budget_mount_degrades_q_depth_gracefully() {
 
     let q = possible_cpus();
     let cap = expected_cap(budget);
-    let depth = expected_depth(q, cap, None);
+    let (payload_sz, depth) = expected_geometry(q, cap, None);
     let (mb, ct) = expected_background(q, depth);
 
     let stats = mount.stats();
     assert_eq!(mount.metric(&stats, "transport_q_depth"), depth);
     let arena = mount.metric(&stats, "transport_payload_buffer_bytes");
-    assert_eq!(arena, q * depth * PAYLOAD_SZ);
-    // The degradation contract: never above the cap unless the floor-of-4
-    // (pre-L1 posture) IS the cap violation, and never below floor 4.
+    assert_eq!(arena, q * depth * payload_sz);
+    // The degradation contract (variable-ent ladder): never above the cap
+    // unless the floor-of-4 × 1 MiB-base arena (yesterday's posture) IS
+    // the cap violation, and never below floor 4.
     assert!(
-        arena <= cap.max(q * 4 * PAYLOAD_SZ),
-        "arena {arena} B exceeds the budget cap {cap} B beyond the depth-4 floor"
+        arena <= cap.max(q * 4 * MIB),
+        "arena {arena} B exceeds the budget cap {cap} B beyond the depth-4 × base floor"
     );
     assert!(
         depth >= 4,
@@ -444,7 +488,8 @@ fn test_env_q_depth_override_wins_over_budget() {
     );
     assert_eq!(
         mount.metric(&stats, "transport_payload_buffer_bytes"),
-        q * 6 * PAYLOAD_SZ
+        q * 6 * expected_geometry(q, 0, Some(6)).0,
+        "env depth bypasses the budget; payload stays at the sysctl-gated target"
     );
     assert_eq!(mount.fusectl_u64("max_background"), mb);
     assert_eq!(mount.fusectl_u64("congestion_threshold"), ct);

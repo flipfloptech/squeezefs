@@ -4696,23 +4696,26 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .store(std::sync::Arc::new(Some(fabric.clone())));
 
             // PR VL2b: the §5.1.6 job-shard execution wire — the
-            // coordinator's TCP listener (plaintext OQ-A default-
-            // permissive posture until a cluster security config is
-            // plumbed at mount — the listener logs it loud), the WERO
-            // fence over the data namespaces, and the endpoint published
-            // through the mount-registration heartbeat for worker
-            // discovery. PR VL4: the PRODUCTION RouterShardDevice seam
-            // (allocation + block I/O over the registered backends'
-            // io_uring workers); mover job types themselves stay
-            // local-pool (`JobType::wire_executable`).
-            let wire_cfg = squeezefs::job_wire::JobWireConfig {
-                bind_addr: "0.0.0.0:0".parse().expect("literal addr"),
-                data_device_paths: resolved_data_lvs
+            // coordinator's TCP listener, the WERO fence over the data
+            // namespaces, and the endpoint published through the
+            // mount-registration heartbeat for worker discovery. PR VL4:
+            // the PRODUCTION RouterShardDevice seam (allocation + block
+            // I/O over the registered backends' io_uring workers); mover
+            // job types themselves stay local-pool
+            // (`JobType::wire_executable`).
+            //
+            // VAL-6: the posture is now OPERATOR-EXPRESSIBLE
+            // (`SQUEEZEFS_JOB_WIRE_*` — bind/disable, CA-pinned mTLS,
+            // verify sampling, connection cap, challenge freshness).
+            // Unset ⇒ ruling D2's default verbatim: bind `0.0.0.0:0`,
+            // plaintext, mandatory-100 % verify-reads.
+            let wire_cfg = squeezefs::job_wire::JobWireConfig::from_env(
+                resolved_data_lvs
                     .iter()
                     .map(std::path::PathBuf::from)
                     .collect(),
-                ..Default::default()
-            };
+            )
+            .map_err(|e| format!("job wire configuration refused: {e}"))?;
             let wire_seam = squeezefs::job_wire::RouterShardDevice::new(
                 fs_engine.router.backend_router.clone(),
                 format_config.block_size as usize,
@@ -4720,13 +4723,17 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let wire = squeezefs::job_wire::JobWireHost::start(fabric, wire_cfg, wire_seam)
                 .await
                 .map_err(|e| format!("job wire start failed: {e}"))?;
-            let advertised = format!(
-                "{}:{}",
-                squeezefs::job_wire::local_advertise_ip(),
-                wire.endpoint().port()
-            );
-            let _ = fs_engine.job_wire_endpoint.set(advertised.clone());
-            log::info!("job wire: endpoint {advertised} (published via the mount registration)");
+            if wire.listening() {
+                let advertised = format!(
+                    "{}:{}",
+                    squeezefs::job_wire::local_advertise_ip(),
+                    wire.endpoint().port()
+                );
+                let _ = fs_engine.job_wire_endpoint.set(advertised.clone());
+                log::info!(
+                    "job wire: endpoint {advertised} (published via the mount registration)"
+                );
+            }
 
             let opt_idle = if resolved_fuse_io_uring_sqpoll_idle_ms > 0 {
                 Some(resolved_fuse_io_uring_sqpoll_idle_ms)

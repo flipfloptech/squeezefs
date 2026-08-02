@@ -189,10 +189,12 @@ fn pre_enrollment_class_cap_is_far_below_the_frame_cap() {
     // Post-enrollment frames (ShardAssign/ResultSubmit) may be large;
     // a hello never is. The class cap is what an unauthenticated peer
     // gets to spend.
-    assert!(
-        MAX_HELLO_FRAME_BYTES < MAX_FRAME_BYTES / 64,
-        "the pre-enrollment class must be far below the post-enrollment cap"
-    );
+    const {
+        assert!(
+            MAX_HELLO_FRAME_BYTES < MAX_FRAME_BYTES / 64,
+            "the pre-enrollment class must be far below the post-enrollment cap"
+        )
+    };
     let rt = rt();
     let mut cursor = std::io::Cursor::new(bare_prefix(MAX_HELLO_FRAME_BYTES + 1));
     let err = rt
@@ -318,8 +320,12 @@ fn from_env_defaults_reproduce_todays_posture_and_bound_the_listener() {
         std::net::IpAddr::from([0, 0, 0, 0]),
         "D2: default bind stays 0.0.0.0 (peers are auto-discovered)"
     );
-    assert_eq!(cfg.bind_addr.port(), 0, "ephemeral port, published via the \
-         mount registration");
+    assert_eq!(
+        cfg.bind_addr.port(),
+        0,
+        "ephemeral port, published via the \
+         mount registration"
+    );
     assert!(
         cfg.security.is_none(),
         "unset ⇒ today's plaintext behavior, unchanged"
@@ -354,7 +360,7 @@ fn from_env_expresses_bind_caps_and_a_ca_pinned_channel() {
 
     let cert_path = dir.path().join("ca.der");
     let key_path = dir.path().join("ca-key.pem");
-    std::fs::write(&cert_path, ca_cert.der().to_vec()).expect("write ca der");
+    std::fs::write(&cert_path, ca_cert.der()).expect("write ca der");
     std::fs::write(&key_path, ca_key.serialize_pem()).expect("write ca key pem");
 
     std::env::set_var("SQUEEZEFS_JOB_WIRE_BIND", "127.0.0.1:0");
@@ -369,7 +375,10 @@ fn from_env_expresses_bind_caps_and_a_ca_pinned_channel() {
     assert_eq!(cfg.max_connections, 64, "absolute override wins verbatim");
     assert_eq!(cfg.verify_sample_permille, 250);
     assert_eq!(cfg.enroll_freshness, Duration::from_millis(5000));
-    let sec = cfg.security.as_ref().expect("CA pair populates the security config");
+    let sec = cfg
+        .security
+        .as_ref()
+        .expect("CA pair populates the security config");
     assert!(sec.ca_cert.is_some() && sec.ca_key.is_some());
     assert!(
         squeezefs::job_wire::channel_authenticated(sec),
@@ -424,8 +433,10 @@ fn wire_schema_advanced_for_the_challenge_handshake() {
     // The coordinator-issued challenge is a protocol change: a v1 worker
     // (worker-chosen nonce, no registry) must refuse loud, not silently
     // enroll on a replayable proof.
-    assert!(
-        WIRE_SCHEMA >= 2,
-        "the challenge handshake carries its own schema version"
-    );
+    const {
+        assert!(
+            WIRE_SCHEMA >= 2,
+            "the challenge handshake carries its own schema version"
+        )
+    };
 }

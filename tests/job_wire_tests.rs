@@ -914,6 +914,11 @@ async fn enrollment_challenge_nonce_is_single_use() {
         WireFrame::EnrollOk { .. } => {}
         other => panic!("a fresh challenge must admit: {other:?}"),
     }
+    assert_eq!(
+        host.outstanding_challenges(),
+        0,
+        "an answered challenge leaves no registry residue (single use)"
+    );
 
     // …and replay it verbatim on a second connection.
     let refused0 = METRICS.job_remote_enroll_refused.load(Ordering::Relaxed);
@@ -937,9 +942,11 @@ async fn enrollment_challenge_nonce_is_single_use() {
         }
         other => panic!("a replayed hello must be refused, got {other:?}"),
     }
-    poll_until("replay counted as an enroll refusal", Duration::from_secs(5), || {
-        METRICS.job_remote_enroll_refused.load(Ordering::Relaxed) >= refused0 + 1
-    })
+    poll_until(
+        "replay counted as an enroll refusal",
+        Duration::from_secs(5),
+        || METRICS.job_remote_enroll_refused.load(Ordering::Relaxed) > refused0,
+    )
     .await;
 
     drop(conn);

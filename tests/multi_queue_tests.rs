@@ -21,7 +21,9 @@
 //! 2. **Single-queue `Q_DEPTH = 4` small-file storm** (real unprivileged
 //!    mount, storm pinned to one CPU so one queue serves it): the
 //!    Issue-pattern `echo foo > file` × thousands must not stall,
-//!    `transport_parked_commits` stays ≈ 0, `transport_leases_outstanding`
+//!    `transport_parked_commits ≡ transport_unparked_commits` (the re-arm
+//!    gate's ledger closes — parking is the gate working; a park that
+//!    never resolves is the wedge), `transport_leases_outstanding`
 //!    returns to 0 at quiesce, `transport_lease_max_age_ms` stays bounded
 //!    by one handler invocation, data round-trips byte-exact, and the
 //!    unmount is clean (no parked-ent EBUSY). RED today: the
@@ -413,10 +415,11 @@ mod storm {
         ///
         /// PR 5's teardown contract — no parked commit or live lease may
         /// wedge the unmount — is proven by the transport stats the caller
-        /// asserts *before* calling this (`transport_parked_commits == 0`,
-        /// `transport_leases_outstanding == 0`): a lease-caused wedge cannot
-        /// exist with both at zero, and would additionally have shown up as
-        /// a storm stall.
+        /// asserts *before* calling this (`transport_parked_commits ≡
+        /// transport_unparked_commits`, `transport_leases_outstanding == 0`):
+        /// a lease-caused wedge cannot exist with the park ledger closed and
+        /// no lease outstanding, and would additionally have shown up as a
+        /// storm stall.
         ///
         /// Separately, the dev baseline has a PRE-EXISTING intermittent
         /// wedge under small-file storms: one kernel request occasionally
@@ -583,9 +586,10 @@ mod storm {
     }
 
     /// §5.4 single-queue starvation test: a small-file write storm pinned to
-    /// one CPU (⇒ one uring queue, depth 4) must not stall; parked commits
-    /// stay ≈ 0 (leases drop inside one handler invocation by construction —
-    /// the severance boundary); every lease is returned at quiesce; the
+    /// one CPU (⇒ one uring queue, depth 4) must not stall; every parked
+    /// commit RESOLVES (the re-arm gate's ledger closes — parking itself is
+    /// the gate working, and how often it engages is a benign race);
+    /// every lease is returned at quiesce; the
     /// max-age high-water stays far below the 1 s debug-assertion bound; and
     /// the unmount is clean under interleaved FORGET storms (kernel-driven
     /// at unmount). Adoption is asserted too: `transport_payload_leases`
@@ -679,16 +683,39 @@ mod storm {
         let stats = mount.stats();
         let leases = mount.metric(&stats, "transport_payload_leases");
         let parked = mount.metric(&stats, "transport_parked_commits");
+        let unparked = mount.metric(&stats, "transport_unparked_commits");
         let outstanding = mount.metric(&stats, "transport_leases_outstanding");
         let max_age = mount.metric(&stats, "transport_lease_max_age_ms");
         assert!(
             leases > 0,
             "no FUSE_WRITE payload leases taken — transport still copies (audit #1 not killed)"
         );
+        // The §5.4 re-arm gate's RESOLUTION ledger, not its engagement
+        // count. A parked commit is the gate WORKING: the kernel's COMMIT
+        // arrived while the request's payload lease still held a
+        // reference, so the worker defers the payload write until the
+        // lease drops (mutation-under-alias is the UB class the protocol
+        // exists to remove). Whether it engages at all is a race between
+        // the handler's `Bytes` drop and the commit send — a cheaper reply
+        // path parks MORE often, for a strictly benign reason, which is
+        // exactly why the old `parked == 0` assertion flaked (2/5 on dev
+        // tip; the counter's own doc says "≈ 0").
+        //
+        // The WEDGE is a park that never resolves: `release()` failing to
+        // demand a wake, or the worker's parked scan never running, leaves
+        // the reply undelivered forever and that ent's ring slot dead. So
+        // assert the ledger closes — every park un-parked and committed —
+        // which stays RED under a genuinely wedged gate (a stranded park
+        // can never be counted here) while being immune to how often the
+        // benign race is won. The storm is quiesced at this point: every
+        // write's reply reached the kernel (that is what let `write(2)`
+        // return), so a park still open here is one that never resolved.
         assert_eq!(
-            parked, 0,
-            "parked commits under a severed-lease storm must be ≈ 0 \
-             (a handler is holding payloads past its reply)"
+            parked, unparked,
+            "{} parked commit(s) never un-parked: the §5.4 re-arm gate wedged \
+             (a lease drop that owes a wake, or a parked scan that never ran) — \
+             leases={leases}, outstanding={outstanding}",
+            parked.saturating_sub(unparked)
         );
         assert_eq!(
             outstanding, 0,

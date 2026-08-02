@@ -4933,6 +4933,12 @@ impl KvMetaBackend {
         uid: u32,
         gid: u32,
         rdev: u32,
+        // POSIX-3: the inode's size AT CREATE, committed in this same
+        // whole-tx entry. 0 for every ordinary create; the symlink
+        // handler passes strlen(target) so the DURABLE record sizes the
+        // link (a cache-only patch reported st_size == 0 on the first
+        // post-TTL lstat()).
+        initial_size: u64,
         // PR VL5b: the routed layer pre-allocates BOTH — the effective
         // local key ino (native watermark or guest-namespaced cursor
         // mint) and its global encoding (which rides the mint slot, not
@@ -4968,7 +4974,8 @@ impl KvMetaBackend {
             nlink: if is_dir { 2 } else { 1 },
             flags: 0,
             rdev,
-            size: 0,
+            // POSIX-3: durable at create (0 for every ordinary create).
+            size: initial_size,
             atime: now,
             mtime: now,
             ctime: now,
@@ -4999,6 +5006,8 @@ impl KvMetaBackend {
         uid: u32,
         gid: u32,
         rdev: u32,
+        // POSIX-3: see `routed_create_local`.
+        initial_size: u64,
         guards: Arc<[DlmGuard]>,
     ) -> Result<InodeValue> {
         self.write_gate()?;
@@ -5011,7 +5020,8 @@ impl KvMetaBackend {
             nlink: if is_dir { 2 } else { 1 },
             flags: 0,
             rdev,
-            size: 0,
+            // POSIX-3: durable at create (0 for every ordinary create).
+            size: initial_size,
             atime: now,
             mtime: now,
             ctime: now,

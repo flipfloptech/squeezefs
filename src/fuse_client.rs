@@ -13762,8 +13762,25 @@ impl Filesystem for SqueezefsFilesystem {
 
             let final_mode = 0o777 | libc::S_IFLNK;
             prof.mark_backend_start();
+            // POSIX-3: `size = strlen(target)` is committed IN the create
+            // transaction — a symlink's size is its target length for the
+            // life of the inode (it can never be written or truncated),
+            // so the durable record must carry it. Patching it into the
+            // reply and the attr cache alone made the first `lstat()`
+            // after the attr TTL lapsed report `st_size == 0` (the
+            // `get_attr_internal` size-coherency repair is
+            // regular-files-only), and tools that size a `readlink()`
+            // buffer from `st_size` then recorded EMPTY targets.
             let inode = backend
-                .create(parent, &name_str, final_mode, req.uid, req.gid)
+                .create_with_rdev_size(
+                    parent,
+                    &name_str,
+                    final_mode,
+                    req.uid,
+                    req.gid,
+                    0,
+                    link_str.len() as u64,
+                )
                 .await
                 .map_err(map_squeezefs_err)?;
             backend
@@ -13772,7 +13789,7 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_squeezefs_err)?;
             prof.mark_backend_done();
             let mut attr = self.inode_to_file_attr(&inode);
-            attr.size = link_str.len() as u64;
+            debug_assert_eq!(attr.size, link_str.len() as u64);
             attr.blocks = 1;
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));

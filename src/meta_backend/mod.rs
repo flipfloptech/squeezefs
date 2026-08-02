@@ -1172,59 +1172,20 @@ impl RoutedMetaBackend {
             .readdir_page(local_dir, offset, max)
             .await
     }
-}
 
-#[async_trait::async_trait]
-impl Metadata for RoutedMetaBackend {
-    async fn lookup(&self, parent: Ino, name: &str) -> Result<Inode> {
-        // ".." — the FUSE_EXPORT_SUPPORT directory-handle reconnect path
-        // (fstests generic/467): no parent pointer exists in the inode
-        // record, so the parent resolves by reverse dentry scan — cold
-        // and rare by construction (see
-        // `KvMetaBackend::find_parent_of_child` for the priced cost
-        // note). Loud NotFound when no dentry names the child (an
-        // orphaned/racing-unlinked dir) — never a fabricated parent.
-        if name == ".." {
-            if parent == 1 {
-                return self.getattr(1).await;
-            }
-            for (v_idx, vol) in self.volumes.iter().enumerate() {
-                self.check_volume_enabled(v_idx)?;
-                if let Some(local_p) = vol.find_parent_of_child(parent).await? {
-                    return self.getattr(self.make_global_ino(local_p, v_idx)).await;
-                }
-            }
-            return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("no dentry names ino {parent} — cannot resolve \"..\""),
-            )));
-        }
-        let (v_idx, local_parent) = self.route_ino(parent);
-        self.check_volume_enabled(v_idx)?;
-        // Drop the D-guard before getattr's I-lock (canonical class order —
-        // holding a D-stripe while waiting on an I-stripe inverts the class
-        // order: ABBA against unlink's held child-I under stripe
-        // collisions). Snapshot semantics are unchanged — lookup→getattr
-        // was never atomic.
-        let child_ino = {
-            let _guard = self.volumes[v_idx]
-                .dlm()
-                .lock_dentry_shared(local_parent, name)
-                .await;
-            match self.find_dentry_routed(v_idx, local_parent, name).await? {
-                Some((child_ino, _ft)) => child_ino,
-                None => {
-                    return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("Dentry {} not found in parent {}", name, parent),
-                    )))
-                }
-            }
-        };
-        self.getattr(child_ino).await
-    }
-
-    async fn create_with_rdev(
+    /// [`Metadata::create_with_rdev`] with an INITIAL SIZE committed in
+    /// the SAME create transaction (POSIX-3). A *non-trait* capability
+    /// (the `Metadata` trait stays unchanged, §5.1 — the
+    /// `xattr_value_cap` precedent): the only caller is the FUSE
+    /// `symlink` handler, which must commit `size = strlen(target)`
+    /// durably. Patching the size into the reply and the daemon attr
+    /// cache alone made the first post-TTL `lstat()` report `st_size ==
+    /// 0` (the size-coherency repair in `get_attr_internal` is
+    /// regular-files-only), so tools that size a `readlink()` buffer
+    /// from `st_size` recorded empty targets. Everything else about the
+    /// create (routing, gating, locking, setgid inheritance, the
+    /// one-whole-tx journal entry) is identical.
+    pub async fn create_with_rdev_size(
         &self,
         parent: Ino,
         name: &str,
@@ -1232,6 +1193,7 @@ impl Metadata for RoutedMetaBackend {
         uid: u32,
         gid: u32,
         rdev: u32,
+        initial_size: u64,
     ) -> Result<Inode> {
         // §5.5.2a cutover gate: BEFORE any 4a acquisition — a parked
         // create holds nothing. Routes are derived AFTER admission: a
@@ -1308,6 +1270,7 @@ impl Metadata for RoutedMetaBackend {
                     uid,
                     gid,
                     rdev,
+                    initial_size,
                     new_local,
                     new_global,
                     guards,
@@ -1355,6 +1318,7 @@ impl Metadata for RoutedMetaBackend {
                     uid,
                     final_gid,
                     rdev,
+                    initial_size,
                     guards.clone(),
                 )
                 .await;
@@ -1402,6 +1366,70 @@ impl Metadata for RoutedMetaBackend {
                 ..child_inode
             })
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl Metadata for RoutedMetaBackend {
+    async fn lookup(&self, parent: Ino, name: &str) -> Result<Inode> {
+        // ".." — the FUSE_EXPORT_SUPPORT directory-handle reconnect path
+        // (fstests generic/467): no parent pointer exists in the inode
+        // record, so the parent resolves by reverse dentry scan — cold
+        // and rare by construction (see
+        // `KvMetaBackend::find_parent_of_child` for the priced cost
+        // note). Loud NotFound when no dentry names the child (an
+        // orphaned/racing-unlinked dir) — never a fabricated parent.
+        if name == ".." {
+            if parent == 1 {
+                return self.getattr(1).await;
+            }
+            for (v_idx, vol) in self.volumes.iter().enumerate() {
+                self.check_volume_enabled(v_idx)?;
+                if let Some(local_p) = vol.find_parent_of_child(parent).await? {
+                    return self.getattr(self.make_global_ino(local_p, v_idx)).await;
+                }
+            }
+            return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no dentry names ino {parent} — cannot resolve \"..\""),
+            )));
+        }
+        let (v_idx, local_parent) = self.route_ino(parent);
+        self.check_volume_enabled(v_idx)?;
+        // Drop the D-guard before getattr's I-lock (canonical class order —
+        // holding a D-stripe while waiting on an I-stripe inverts the class
+        // order: ABBA against unlink's held child-I under stripe
+        // collisions). Snapshot semantics are unchanged — lookup→getattr
+        // was never atomic.
+        let child_ino = {
+            let _guard = self.volumes[v_idx]
+                .dlm()
+                .lock_dentry_shared(local_parent, name)
+                .await;
+            match self.find_dentry_routed(v_idx, local_parent, name).await? {
+                Some((child_ino, _ft)) => child_ino,
+                None => {
+                    return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Dentry {} not found in parent {}", name, parent),
+                    )))
+                }
+            }
+        };
+        self.getattr(child_ino).await
+    }
+
+    async fn create_with_rdev(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u32,
+    ) -> Result<Inode> {
+        self.create_with_rdev_size(parent, name, mode, uid, gid, rdev, 0)
+            .await
     }
 
     async fn unlink(&self, parent: Ino, name: &str) -> Result<Ino> {
@@ -2043,7 +2071,7 @@ impl Metadata for RoutedMetaBackend {
                     let (w_local, w_global) =
                         self.allocate_local_ino_in_slot(old_parent_v_idx, mint)?;
                     let minted = self.volumes[old_parent_v_idx]
-                        .routed_mint_inode(w_local, libc::S_IFCHR, 0, 0, 0, guards.clone())
+                        .routed_mint_inode(w_local, libc::S_IFCHR, 0, 0, 0, 0, guards.clone())
                         .await;
                     if minted.is_err() {
                         self.mirror_volume_failure(old_parent_v_idx);

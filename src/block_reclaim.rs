@@ -189,12 +189,15 @@ pub fn set_discard_elision(on: bool) {
 /// file-backed and could otherwise never exercise the elision arms —
 /// contracts 1–3 of `tests/discard_elision_tests.rs`). Production keeps
 /// the bdev-only predicate; contract 5 pins the file-backing fence.
+/// (The cell itself is private; [`set_elision_class_all`] is the seam.)
 fn elision_class_all_cell() -> &'static AtomicBool {
     static CELL: std::sync::OnceLock<AtomicBool> = std::sync::OnceLock::new();
     CELL.get_or_init(|| AtomicBool::new(false))
 }
 
-/// Set the class-all test seam (see [`elision_class_all_cell`]).
+/// Set the class-all test seam: treat every backing class as elidable
+/// (test harnesses are file-backed; production keeps the bdev-only
+/// predicate — contract 5 pins the file-backing fence).
 pub fn set_elision_class_all(on: bool) {
     elision_class_all_cell().store(on, Ordering::Relaxed);
 }
@@ -250,7 +253,7 @@ enum IssueVenue {
 }
 
 /// The per-mount debt drainer: owns the idle/pressure venues (the
-/// fstrim/defrag venue calls [`Self::drain_target_sync`] directly via
+/// fstrim/defrag venue calls `drain_debt_sync` directly via
 /// `BackendRouter::trim_elided`). One detached worker per router, armed
 /// lazily on the first elided free (the `ReclaimQueue::ensure_worker`
 /// pattern, Weak-held). Venue law (KD-4.5):

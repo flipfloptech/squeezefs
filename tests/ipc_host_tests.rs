@@ -1601,3 +1601,194 @@ fn write_binding_carries_the_session_peers_kill_priv_class() {
     );
     host.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// VAL-5 (pre-RC engineering spec §3, P0) — control-plane resource bounds
+//
+// Every row below speaks the raw protocol from an untrusted client, which
+// is the whole point: this socket is reachable by any process in the
+// namespace, and none of these bounds existed. The five items:
+//
+//   a. `recv_ctl` derived one fd per SCM_RIGHTS cmsg, never consulting
+//      `cmsg_len`, and never tested MSG_CTRUNC — extras were installed in
+//      the daemon and never closed, BEFORE any validation ran.
+//   b. `connection_loop` blocked on its first datagram with no
+//      SO_RCVTIMEO, was in no registry, and its thread was joined
+//      unconditionally by `shutdown()`.
+//   c. `try_begin_serve` trusted the client-writable state word: no
+//      in-flight counter anywhere, no admission gate in the serve path.
+//   d. `accept4` spawned an unbounded OS thread per connection before any
+//      validation, and `self.threads` was push-only.
+//   e. `IpcSession::drain` popped without a per-pass budget: one busy
+//      session starved every sibling pinned to its service thread.
+// ---------------------------------------------------------------------------
+
+/// How many descriptors in THIS process currently point at `path` — the
+/// leak instrument for the fd-passing rows (the host runs in the test
+/// process, so an fd it installs and forgets is visible right here).
+fn fds_pointing_at(path: &std::path::Path) -> usize {
+    let target = std::fs::canonicalize(path).expect("canonicalize marker");
+    std::fs::read_dir("/proc/self/fd")
+        .expect("/proc/self/fd")
+        .filter(|e| {
+            e.as_ref()
+                .ok()
+                .and_then(|e| std::fs::read_link(e.path()).ok())
+                .map(|l| l == target)
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// Send one ctl datagram with `fds` attached in a SINGLE `SCM_RIGHTS`
+/// control message (the hostile shape: `cmsg_len` says N, the pre-fix
+/// daemon read exactly one and installed the rest silently).
+fn send_ctl_many_fds(sock: &UnixStream, msg: &CtlMsg, fds: &[RawFd]) {
+    let bytes = msg.encode();
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_ptr() as *mut libc::c_void,
+        iov_len: bytes.len(),
+    };
+    let payload = std::mem::size_of_val(fds);
+    // SAFETY: CMSG_SPACE with a runtime length; the buffer is sized from it.
+    let space = unsafe { libc::CMSG_SPACE(payload as u32) } as usize;
+    let mut cmsg_buf = vec![0u8; space];
+    // SAFETY: zeroed msghdr is a valid all-default value.
+    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    hdr.msg_iov = &mut iov;
+    hdr.msg_iovlen = 1;
+    hdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    hdr.msg_controllen = space as libc::size_t;
+    // SAFETY: standard CMSG_FIRSTHDR/CMSG_DATA over the buffer sized above.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&hdr);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(payload as u32) as libc::size_t;
+        std::ptr::copy_nonoverlapping(fds.as_ptr() as *const u8, libc::CMSG_DATA(cmsg), payload);
+    }
+    // SAFETY: sendmsg with the msghdr assembled above.
+    let n = unsafe { libc::sendmsg(sock.as_raw_fd(), &hdr, libc::MSG_NOSIGNAL) };
+    assert!(n > 0, "sendmsg: {}", std::io::Error::last_os_error());
+}
+
+/// Wait for the daemon's ctl thread to finish with a connection (it drops
+/// the socket, which EOFs our end) — the settle point for the fd-leak
+/// assertions.
+fn wait_for_peer_close(sock: &UnixStream) {
+    set_recv_timeout(sock, Duration::from_secs(5));
+    // Either an explicit refusal or EOF; both mean the daemon is done.
+    let _ = recv_ctl(sock);
+}
+
+/// VAL-5a: a HELLO carrying MANY fds in ONE `SCM_RIGHTS` cmsg must be
+/// refused, and the daemon must install exactly zero of them. Pre-fix the
+/// loop copied `sizeof(int)` bytes per cmsg and ignored `cmsg_len`, so the
+/// other N−1 descriptors landed in the daemon's fd table with no owner
+/// and no close — an unauthenticated remote fd-table exhaustion.
+#[test]
+fn hello_with_many_fds_in_one_cmsg_refuses_and_installs_none() {
+    let (host, cfg) = spawn_host("cmsg-many");
+    let mf = mount_file();
+    host.set_expected_st_dev(mf.st_dev);
+
+    // 8 dups of one marker file: `fds_pointing_at` then counts exactly
+    // the descriptors this row is responsible for.
+    let fds: Vec<OwnedFd> = (0..8).map(|_| open_flags(&mf.path, libc::O_RDWR)).collect();
+    let raw: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
+    let baseline = fds_pointing_at(&mf.path);
+
+    let sock = abstract_connect(&cfg.socket_name).expect("connect");
+    send_ctl_many_fds(
+        &sock,
+        &CtlMsg::Hello {
+            abi: squeezefs_ipc::layout::IPC_ABI,
+            pid: std::process::id(),
+            // SAFETY: getuid is trivially safe.
+            uid: unsafe { libc::getuid() },
+            build_commit: cfg.build_commit.clone(),
+            nonce: host.current_nonce(),
+        },
+        &raw,
+    );
+    wait_for_peer_close(&sock);
+
+    // The datagram is refused: no session may exist off a descriptor set
+    // the daemon could not account for.
+    wait_sessions_active(0, "multi-fd HELLO must not establish a session");
+    let after = fds_pointing_at(&mf.path);
+    assert_eq!(
+        after,
+        baseline,
+        "VAL-5a: the daemon installed {} descriptors it will never close \
+         (one SCM_RIGHTS cmsg carried 8 fds; cmsg_len was ignored)",
+        after - baseline
+    );
+    host.shutdown();
+}
+
+/// VAL-5a: the truncation arm. The 64-byte control buffer holds ~12 fds;
+/// a client that attaches 24 gets `MSG_CTRUNC` and a partial install —
+/// which the pre-fix code never tested for. Truncated control data means
+/// the daemon cannot know what it received: refuse and close everything.
+#[test]
+fn hello_with_truncated_control_data_refuses_and_installs_none() {
+    let (host, cfg) = spawn_host("cmsg-trunc");
+    let mf = mount_file();
+    host.set_expected_st_dev(mf.st_dev);
+
+    let fds: Vec<OwnedFd> = (0..24)
+        .map(|_| open_flags(&mf.path, libc::O_RDWR))
+        .collect();
+    let raw: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
+    let baseline = fds_pointing_at(&mf.path);
+
+    let sock = abstract_connect(&cfg.socket_name).expect("connect");
+    send_ctl_many_fds(
+        &sock,
+        &CtlMsg::Hello {
+            abi: squeezefs_ipc::layout::IPC_ABI,
+            pid: std::process::id(),
+            // SAFETY: getuid is trivially safe.
+            uid: unsafe { libc::getuid() },
+            build_commit: cfg.build_commit.clone(),
+            nonce: host.current_nonce(),
+        },
+        &raw,
+    );
+    wait_for_peer_close(&sock);
+
+    wait_sessions_active(0, "MSG_CTRUNC HELLO must not establish a session");
+    let after = fds_pointing_at(&mf.path);
+    assert_eq!(
+        after,
+        baseline,
+        "VAL-5a: {} truncated-cmsg descriptors stayed installed in the daemon",
+        after.saturating_sub(baseline)
+    );
+    host.shutdown();
+}
+
+/// VAL-5a control: the honest single-fd HELLO is untouched by the bound
+/// (a fix that refuses the legitimate shape is not a fix).
+#[test]
+fn hello_with_exactly_one_fd_still_establishes() {
+    let (host, cfg) = spawn_host("cmsg-one");
+    let mf = mount_file();
+    host.set_expected_st_dev(mf.st_dev);
+    let fd = open_flags(&mf.path, libc::O_RDWR);
+    let baseline = fds_pointing_at(&mf.path);
+    let (_sock, session) = establish(&cfg, &host, fd.as_raw_fd());
+    drop(session);
+    // The daemon's dup of the credential fd closes right after the screen
+    // (§5.2: it needs the metadata, never a live handle).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fds_pointing_at(&mf.path) != baseline {
+        assert!(
+            Instant::now() < deadline,
+            "the accepted credential fd was never closed by the daemon"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    host.shutdown();
+}

@@ -54,7 +54,6 @@ tokio = { version = "1.48", features = ["full"] }
 fuse3 = { version = "1.1", features = ["tokio-runtime", "unprivileged"] }
 io-uring = "0.6"
 dashmap = "5.5"
-zerocopy = { version = "0.8.52", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sysinfo = "0.30"
@@ -70,8 +69,6 @@ clap = { version = "4.4", features = ["derive", "env"] }
 indicatif = "0.17"
 colored = "2.1"
 libloading = { version = "0.8", optional = true }
-hyper-014 = { package = "hyper", version = "0.14", features = ["full"] }
-hyper-rustls-024 = { package = "hyper-rustls", version = "0.24", features = ["webpki-roots", "tokio-runtime", "http1", "http2"] }
 moka = { version = "0.12.15", features = ["sync"] }
 fastrand = "2.0"
 core_affinity = "0.8"
@@ -90,7 +87,6 @@ hmac = "0.12"
 # verifier machinery — NOT the quinn wrap.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 ahash = "0.8"
-twox-hash = "1.6"
 bytes = { version = "1.5", features = ["serde"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crossbeam = "0.8"

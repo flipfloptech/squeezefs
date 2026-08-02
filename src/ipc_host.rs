@@ -963,6 +963,11 @@ pub struct IpcHost {
     spin_window: Duration,
     shutting_down: AtomicBool,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Live ctl connections (VAL-5b/VAL-5d): incremented in the accept
+    /// loop BEFORE the thread spawns (so the admission bound is exact
+    /// against a connect storm) and decremented by the connection's own
+    /// exit guard.
+    ctl_live: std::sync::atomic::AtomicUsize,
     /// The severed-write buffer recycle pool (one per host; every
     /// session's mapping holds an `Arc` conduit).
     severed_pool: Arc<SeveredPool>,
@@ -1025,6 +1030,7 @@ impl IpcHost {
             spin_window: service_spin_window(),
             shutting_down: AtomicBool::new(false),
             threads: Mutex::new(Vec::new()),
+            ctl_live: std::sync::atomic::AtomicUsize::new(0),
             severed_pool: Arc::new(SeveredPool::new(cfg_max_op_bytes, cfg_arena_cap_bytes)),
         });
         // Spawn-on-bind (ingest-economy 2026-07-28): the gauge reports
@@ -1126,6 +1132,12 @@ impl IpcHost {
     /// This host's build-commit identity (bootstrap-blob synthesis).
     pub fn build_commit(&self) -> &str {
         &self.cfg.build_commit
+    }
+
+    /// Live ctl connections — the VAL-5b/VAL-5d bound's gauge (accepted
+    /// and not yet exited, admin and data plane alike).
+    pub fn ctl_conns_live(&self) -> usize {
+        self.ctl_live.load(Ordering::Relaxed)
     }
 
     /// Live session-shm bytes (the R5 component gauge source).
@@ -1260,6 +1272,7 @@ impl IpcHost {
             }
             // SAFETY: fresh owned fd from accept4.
             let sock = unsafe { UnixStream::from_raw_fd(fd) };
+            self.ctl_live.fetch_add(1, Ordering::Relaxed);
             let host = Arc::clone(&self);
             let handle = std::thread::Builder::new()
                 .name("sqz-ipc-ctl".into())
@@ -1270,7 +1283,10 @@ impl IpcHost {
                     .lock()
                     .expect("thread registry mutex never poisons")
                     .push(h),
-                Err(e) => log::error!("ipc host: ctl thread spawn failed: {e}"),
+                Err(e) => {
+                    self.ctl_live.fetch_sub(1, Ordering::Relaxed);
+                    log::error!("ipc host: ctl thread spawn failed: {e}");
+                }
             }
         }
     }
@@ -1278,6 +1294,7 @@ impl IpcHost {
     /// One connection = at most one session: HELLO (screen) → SessionOk /
     /// Refuse; then BIND/UNBIND until EOF (client death — §5.7).
     fn connection_loop(self: Arc<Self>, sock: UnixStream) {
+        let _live = CtlConnLive(&self);
         let sock = Arc::new(sock);
         // First datagram routes the connection: AdminHello opens the
         // control-plane lane (VL2 §5.1.4), Hello the data plane.
@@ -1988,6 +2005,17 @@ impl IpcHost {
                 s.map.header().daemon_parked.store(0, Ordering::SeqCst);
             }
         }
+    }
+}
+
+/// RAII half of the [`IpcHost::ctl_conns_live`] gauge: the accept loop
+/// counts a connection in before spawning its thread, and the thread's
+/// guard counts it out on EVERY exit path (return, break, panic).
+struct CtlConnLive<'a>(&'a IpcHost);
+
+impl Drop for CtlConnLive<'_> {
+    fn drop(&mut self) {
+        self.0.ctl_live.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

@@ -1792,3 +1792,86 @@ fn hello_with_exactly_one_fd_still_establishes() {
     }
     host.shutdown();
 }
+
+/// Block until `host` has accepted `n` ctl connections (the accept is
+/// asynchronous; every row that reasons about ctl threads needs this
+/// settle point rather than a sleep).
+fn wait_ctl_conns(host: &IpcHost, n: usize, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while host.ctl_conns_live() < n {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: ctl_conns_live never reached {n} (now {})",
+            host.ctl_conns_live()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// VAL-5b: a connection that sends NOTHING must not wedge daemon
+/// teardown. `connection_loop` blocked in its first `recv` with no
+/// SO_RCVTIMEO, was registered nowhere, and its `JoinHandle` was joined
+/// unconditionally by `shutdown()` — so any process in the namespace
+/// could hold a mount's umount hostage with one `connect(2)` and silence.
+#[test]
+fn a_silent_connection_cannot_wedge_host_shutdown() {
+    let (host, cfg) = spawn_host("silent-conn");
+    let mf = mount_file();
+    host.set_expected_st_dev(mf.st_dev);
+
+    // The hostile client: connect, then say nothing, ever.
+    let silent = abstract_connect(&cfg.socket_name).expect("connect");
+    wait_ctl_conns(&host, 1, "the silent connection must be accepted");
+
+    let shutdown_host = Arc::clone(&host);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let joiner = std::thread::spawn(move || {
+        shutdown_host.shutdown();
+        let _ = tx.send(());
+    });
+    let done = rx.recv_timeout(Duration::from_secs(15)).is_ok();
+    // Keep the connection open until the verdict: dropping it early
+    // would EOF the ctl thread and hide the wedge.
+    drop(silent);
+    assert!(
+        done,
+        "VAL-5b: host.shutdown() wedged on a silent connection's ctl thread"
+    );
+    let _ = joiner.join();
+}
+
+/// VAL-5b control: an ESTABLISHED session's ctl thread parks in `recv`
+/// between binds for as long as the client lives — the timeout must not
+/// tear that connection down (a bound that kills idle-but-live sessions
+/// would break every long-running app).
+#[test]
+fn an_established_but_idle_connection_survives_the_recv_timeout() {
+    let (host, cfg) = spawn_host("idle-established");
+    let mf = mount_file();
+    host.set_expected_st_dev(mf.st_dev);
+    let fd = open_flags(&mf.path, libc::O_RDWR);
+    let (sock, session) = establish(&cfg, &host, fd.as_raw_fd());
+    let binding = match bind(&sock, fd.as_raw_fd()) {
+        CtlMsg::BindOk { binding_id, .. } => binding_id,
+        other => panic!("bind must succeed, got {other:?}"),
+    };
+
+    // Sit idle well past any handshake deadline, then keep using the
+    // session: the connection, the binding and the ring must all live.
+    std::thread::sleep(Duration::from_millis(1500));
+    wait_sessions_active(1, "an idle established session stays live");
+    let r = session.submit_wait(&SlotDescriptor {
+        op: OP_ECHO,
+        flags: 0,
+        binding,
+        offset: 0,
+        len: 0,
+        arena_off: 0,
+    });
+    assert_eq!(r, 0, "the idle session still serves");
+    match bind(&sock, fd.as_raw_fd()) {
+        CtlMsg::BindOk { .. } => {}
+        other => panic!("the ctl lane still serves BINDs after idling, got {other:?}"),
+    }
+    host.shutdown();
+}

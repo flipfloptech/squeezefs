@@ -71,6 +71,13 @@ const OFF_HEAP: usize = 80;
 const OFF_UUID: usize = 96;
 const OFF_HASH_SEED: usize = 112;
 const OFF_CHECKSUM: usize = 120;
+/// **DUR-5**: the superblock generation, carved out of the sector's zero
+/// padding. It is covered by the existing whole-sector checksum and read
+/// by nothing that predates DUR-5, so adding it is not a format change:
+/// an older binary verifies and decodes the sector byte-identically and
+/// simply ignores the field. Every writer bumps it; the reader resolves
+/// primary vs [`backup_offset`] copy by newest-valid-wins.
+const OFF_SB_GENERATION: usize = 128;
 
 /// Format version this module writes and mounts.
 pub const SUPERBLOCK_V3_VERSION: u32 = 3;
@@ -299,8 +306,14 @@ impl SuperblockV3 {
             len: bitmap_region_len(upper_extents),
         };
 
+        // DUR-5: hold back the LAST aligned sector for the redundant
+        // superblock copy. Costs at most one heap extent and is what
+        // makes the copy guaranteed-present on every fresh format (the
+        // geometry is self-describing, so an older binary mounts such a
+        // volume unchanged — it just sees a marginally smaller heap).
         let heap_start = alloc_bitmap.end().div_ceil(node_size) * node_size;
-        let total_extents = volume_len.saturating_sub(heap_start) / node_size;
+        let usable = volume_len.saturating_sub(SUPERBLOCK_V3_LEN as u64);
+        let total_extents = usable.saturating_sub(heap_start) / node_size;
         // A usable volume must hold the §4.7 compaction reserve plus room
         // for the three tree roots and growth.
         let min_extents = compaction_reserve_extents(total_extents) + 4;
@@ -364,8 +377,25 @@ impl SuperblockV3 {
         self.features_ro & !FEATURES_RO_KNOWN
     }
 
-    /// Encode into a checksummed whole-sector image.
+    /// Encode into a checksummed whole-sector image (generation 0 — the
+    /// format-time image; runtime writers use
+    /// [`Self::encode_sector_at_generation`]).
     pub fn encode_sector(&self) -> Result<Vec<u8>, KvError> {
+        self.encode_sector_at_generation(0)
+    }
+
+    /// [`Self::encode_sector`] stamped with a DUR-5 superblock
+    /// generation (see [`OFF_SB_GENERATION`]).
+    pub fn encode_sector_at_generation(&self, generation: u64) -> Result<Vec<u8>, KvError> {
+        let mut img = self.encode_sector_body()?;
+        img[OFF_SB_GENERATION..OFF_SB_GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
+        let sum = sector_checksum(&img);
+        img[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&sum.to_le_bytes());
+        Ok(img)
+    }
+
+    /// The sector image with every field but the checksum populated.
+    fn encode_sector_body(&self) -> Result<Vec<u8>, KvError> {
         self.validate_geometry()?;
         let mut img = vec![0u8; SUPERBLOCK_V3_LEN];
         img[OFF_MAGIC..OFF_MAGIC + 8].copy_from_slice(MAGIC_VALUE);
@@ -385,8 +415,6 @@ impl SuperblockV3 {
         }
         img[OFF_UUID..OFF_UUID + 16].copy_from_slice(&self.uuid);
         img[OFF_HASH_SEED..OFF_HASH_SEED + 8].copy_from_slice(&self.hash_seed.to_le_bytes());
-        let sum = sector_checksum(&img);
-        img[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&sum.to_le_bytes());
         Ok(img)
     }
 
@@ -709,46 +737,248 @@ pub fn classify_sector0(sector: &[u8]) -> Result<VolumeFormat, KvError> {
     }
 }
 
-/// Read sector 0 of `path` via `crate::uring_fs` (io_uring-only,
-/// AGENTS.md) and [`classify_sector0`] it. Never grows or mutates the
-/// volume.
+/// The DUR-5 generation stamped in a sector image (0 on any image an
+/// older binary or `format` wrote). Only meaningful for images that
+/// already passed [`classify_sector0`].
+pub fn sector_generation(sector: &[u8]) -> u64 {
+    if sector.len() < OFF_SB_GENERATION + 8 {
+        return 0;
+    }
+    u64::from_le_bytes(
+        sector[OFF_SB_GENERATION..OFF_SB_GENERATION + 8]
+            .try_into()
+            .expect("8 bytes"),
+    )
+}
+
+/// Byte length of `path` — file size or block-device capacity (the
+/// `seek(End)` form the CLI's `get_backing_device_size` uses, which is
+/// correct for both). A control-plane probe at mount/format, never an
+/// I/O path.
+fn volume_len(path: &Path) -> Option<u64> {
+    use std::io::Seek;
+    if let Ok(mut f) = std::fs::File::open(path) {
+        if let Ok(n) = f.seek(std::io::SeekFrom::End(0)) {
+            if n > 0 {
+                return Some(n);
+            }
+        }
+    }
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| m.len())
+        .filter(|n| *n > 0)
+}
+
+/// **DUR-5** — where the redundant superblock copy lives: the LAST
+/// aligned sector of the volume.
+///
+/// *Why the tail and not a second sector next to sector 0:* every
+/// existing v3 volume puts the root ledger at offset 4096 (`plan`), so
+/// there is no reserved space beside sector 0 to A/B into — claiming one
+/// would move the ledger, i.e. break the on-disk layout for every
+/// formatted volume. The tail sector needs no layout change at all:
+/// fresh formats reserve it out of the heap (one extent at most), and on
+/// a volume whose heap already runs to the end the copy is simply not
+/// written (honest degradation, logged once) rather than scribbled over
+/// a live node.
+pub fn backup_offset(volume_len: u64) -> Option<u64> {
+    let sector = SUPERBLOCK_V3_LEN as u64;
+    let aligned = (volume_len / sector) * sector;
+    // Below two sectors there is no volume to speak of; the copy must
+    // never alias sector 0.
+    aligned.checked_sub(sector).filter(|off| *off >= sector)
+}
+
+/// The backup slot for `sb` on a `volume_len`-byte volume, or `None`
+/// when the geometry leaves no room for it (a heap that runs to the end
+/// — pre-DUR-5 formats).
+fn backup_slot_for(sb: &SuperblockV3, volume_len: u64) -> Option<u64> {
+    backup_offset(volume_len).filter(|off| *off >= sb.heap.end())
+}
+
+/// Read one 4 KiB sector, zero-extending a short read (a stub file
+/// smaller than the sector classifies as Blank, which is what it is).
+async fn read_sector(path: &Path, offset: u64) -> Result<Vec<u8>, KvError> {
+    let got = crate::uring_fs::read_at(path, offset, SUPERBLOCK_V3_LEN).await?;
+    let mut full = vec![0u8; SUPERBLOCK_V3_LEN];
+    let n = got.len().min(SUPERBLOCK_V3_LEN);
+    full[..n].copy_from_slice(&got[..n]);
+    Ok(full)
+}
+
+/// Which copy answered a resolved superblock read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuperblockSlot {
+    Primary,
+    Backup,
+}
+
+/// Read + classify sector 0 of `path` via `crate::uring_fs` (io_uring-
+/// only, AGENTS.md), falling back to the DUR-5 redundant copy when the
+/// primary is unusable. Never grows or mutates the volume.
 pub async fn classify_volume(path: &Path) -> Result<VolumeFormat, KvError> {
-    let got = crate::uring_fs::read_at(path, 0, SUPERBLOCK_V3_LEN).await?;
-    // A short read (file smaller than one sector) zero-extends: zeros
-    // classify as Blank, exactly what a never-formatted stub file is.
-    let sector: std::borrow::Cow<'_, [u8]> = if got.len() == SUPERBLOCK_V3_LEN {
-        std::borrow::Cow::Borrowed(&got)
-    } else {
-        let mut full = vec![0u8; SUPERBLOCK_V3_LEN];
-        full[..got.len().min(SUPERBLOCK_V3_LEN)]
-            .copy_from_slice(&got[..got.len().min(SUPERBLOCK_V3_LEN)]);
-        std::borrow::Cow::Owned(full)
-    };
-    classify_sector0(&sector).map_err(|e| match e {
+    classify_volume_slot(path).await.map(|(fmt, _)| fmt)
+}
+
+/// [`classify_volume`] plus which copy answered — the input to the
+/// mount-time self-heal ([`repair_primary_superblock`]).
+pub async fn classify_volume_slot(path: &Path) -> Result<(VolumeFormat, SuperblockSlot), KvError> {
+    let named = |e: KvError| match e {
         // Prefix classification failures with the volume path — these are
         // operator-facing mount/format refusals.
         KvError::Corrupt(msg) => KvError::Corrupt(format!("{}: {msg}", path.display())),
         other => other,
-    })
+    };
+    let primary = read_sector(path, 0).await?;
+    let primary_res = classify_sector0(&primary);
+
+    // The redundant copy is consulted ONLY when the primary cannot serve:
+    // a readable primary is authoritative, so a stale or crafted tail
+    // sector can never displace it.
+    if let Ok(fmt) = &primary_res {
+        if !matches!(fmt, VolumeFormat::V3(_)) {
+            return primary_res
+                .map(|f| (f, SuperblockSlot::Primary))
+                .map_err(named);
+        }
+        return Ok((primary_res.map_err(named)?, SuperblockSlot::Primary));
+    }
+    let primary_err = primary_res.err().expect("checked above");
+
+    let Some(len) = volume_len(path) else {
+        return Err(named(primary_err));
+    };
+    let Some(off) = backup_offset(len) else {
+        return Err(named(primary_err));
+    };
+    let backup = read_sector(path, off).await?;
+    match classify_sector0(&backup) {
+        // The recovered image must itself reserve the slot it was read
+        // from: on a volume whose heap runs to the tail those bytes are a
+        // live node, never a superblock.
+        Ok(VolumeFormat::V3(sb)) if off >= sb.heap.end() => {
+            log::error!(
+                "{}: sector 0 is unreadable ({primary_err}) — mounting from the redundant \
+                 superblock copy at offset {off} (generation {}). Sector 0 is repaired on \
+                 the next write mount; investigate the device.",
+                path.display(),
+                sector_generation(&backup)
+            );
+            Ok((VolumeFormat::V3(sb), SuperblockSlot::Backup))
+        }
+        _ => Err(named(primary_err)),
+    }
 }
 
-/// Write `sb` to sector 0 of `path` (one checksummed whole-sector
-/// `uring_fs::write_at` — the single-sector commit-point class).
+/// Write `sb` to `path`: the DUR-5 redundant copy FIRST (barriered), then
+/// sector 0 (barriered). A tear on sector 0 therefore always recovers
+/// FORWARD to this image, and a tear on the copy leaves the durable
+/// primary untouched.
+///
+/// Both images carry `generation`; callers derive it with
+/// [`next_superblock_generation`] so newest-valid-wins is decidable.
 pub async fn write_superblock_v3(path: &Path, sb: &SuperblockV3) -> Result<(), KvError> {
-    let img = sb.encode_sector()?;
+    let generation = next_superblock_generation(path).await;
+    write_superblock_at_generation(path, sb, generation).await
+}
+
+/// [`write_superblock_v3`] with an explicit generation.
+async fn write_superblock_at_generation(
+    path: &Path,
+    sb: &SuperblockV3,
+    generation: u64,
+) -> Result<(), KvError> {
+    let img = sb.encode_sector_at_generation(generation)?;
+    match volume_len(path).and_then(|len| backup_slot_for(sb, len)) {
+        Some(off) => {
+            crate::uring_fs::write_at(path, off, img.clone()).await?;
+            crate::uring_fs::fdatasync(path.to_path_buf()).await?;
+        }
+        None => log::warn!(
+            "{}: no room for the redundant superblock copy (the heap runs to the end of \
+             the volume — a pre-DUR-5 format); sector 0 has no backup. Reformatting \
+             reserves the tail sector.",
+            path.display()
+        ),
+    }
     crate::uring_fs::write_at(path, 0, img).await?;
+    crate::uring_fs::fdatasync(path.to_path_buf()).await?;
     Ok(())
 }
 
+/// One past the highest generation either copy carries.
+async fn next_superblock_generation(path: &Path) -> u64 {
+    let mut newest = 0u64;
+    if let Ok(sector) = read_sector(path, 0).await {
+        if classify_sector0(&sector).is_ok() {
+            newest = newest.max(sector_generation(&sector));
+        }
+    }
+    if let Some(off) = volume_len(path).and_then(backup_offset) {
+        if let Ok(sector) = read_sector(path, off).await {
+            if classify_sector0(&sector).is_ok() {
+                newest = newest.max(sector_generation(&sector));
+            }
+        }
+    }
+    newest + 1
+}
+
+/// Mount-time self-heal (DUR-5): if the volume mounted off the redundant
+/// copy, rewrite sector 0 from it. Returns whether a repair was
+/// performed. Write mounts only — a read-only probe must never write.
+pub async fn repair_primary_superblock(path: &Path) -> Result<bool, KvError> {
+    match classify_volume_slot(path).await? {
+        (VolumeFormat::V3(sb), SuperblockSlot::Backup) => {
+            let generation = next_superblock_generation(path).await;
+            let img = sb.encode_sector_at_generation(generation)?;
+            crate::uring_fs::write_at(path, 0, img).await?;
+            crate::uring_fs::fdatasync(path.to_path_buf()).await?;
+            log::error!(
+                "{}: repaired a damaged sector 0 from the redundant superblock copy \
+                 (generation {generation})",
+                path.display()
+            );
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Per-path serialization of the sector-0 read-modify-write (DUR-5).
+/// Two concurrent stampers used to both read the old feature word and the
+/// second write erased the first's bit — which defeats the whole point of
+/// the bits, whose ordering law is "durable BEFORE the record it gates".
+/// Cross-process exclusion is the D0 single-writer mount guard's job;
+/// this closes the in-process race.
+static SB_WRITE_LOCKS: once_cell::sync::Lazy<
+    std::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    >,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn sb_write_lock(path: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    SB_WRITE_LOCKS
+        .lock()
+        .unwrap()
+        .entry(path.to_path_buf())
+        .or_default()
+        .clone()
+}
+
 /// Stamp one incompat `bit` on `path`'s superblock (shared body of the
-/// two KD-14 bit setters). Returns whether the bit was NEWLY set
-/// (`false` = already stamped, no write). Refuses blank / legacy-v2 /
-/// corrupt volumes loud.
+/// KD-14 bit setters). Returns whether the bit was NEWLY set (`false` =
+/// already stamped, no write). Refuses blank / legacy-v2 / corrupt
+/// volumes loud.
 ///
-/// Sector 0 is written only here and at format, never by the live
-/// backend (checkpoints flip the root ledger), so the whole-sector
-/// checksummed rewrite is race-free against an open volume.
+/// Sector 0 is written only here and at format, never by the live backend
+/// (checkpoints flip the root ledger). The read-modify-write is
+/// serialized per path (DUR-5) so concurrent stampers compose, and each
+/// write lands on the redundant copy before sector 0.
 async fn set_incompat_bit(path: &Path, bit: u64, what: &str) -> Result<bool, KvError> {
+    let lock = sb_write_lock(path);
+    let _held = lock.lock().await;
     match classify_volume(path).await? {
         VolumeFormat::V3(mut sb) => {
             if sb.features_incompat & bit != 0 {

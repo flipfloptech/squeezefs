@@ -999,6 +999,19 @@ impl KvMetaBackend {
             }
         };
 
+        // (1b) DUR-5 self-heal: a volume that mounts off the redundant
+        // superblock copy gets its sector 0 rewritten HERE — under the
+        // writer flock, on the write-mount path only (a read-only probe
+        // must never write). A no-op (one 4 KiB read) when sector 0 is
+        // healthy; loud when it is not.
+        if let Err(e) = super::superblock::repair_primary_superblock(path).await {
+            log::error!(
+                "{}: superblock repair pass failed: {e} (continuing — the mount below \
+                 refuses if the superblock is genuinely unusable)",
+                path.display()
+            );
+        }
+
         // (2) Bootstrap replay (sets `boot_id` — shared with probes).
         let mut inner = Self::open_inner(path).await?;
         *inner.guard_fd.get_mut().unwrap() = Some(guard_fd);

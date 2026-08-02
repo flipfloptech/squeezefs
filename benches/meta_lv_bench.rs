@@ -785,6 +785,64 @@ fn bench_xattr_name_screen(c: &mut Criterion) {
     group.finish();
 }
 
+/// **DUR-5 · the superblock encode/verify cycle.** The redundant-copy
+/// design put sector 0 on a commit-adjacent path: `layout_deltas_ready()`
+/// stamps `KV_LAYOUT_DELTAS` during ordinary write traffic, and every
+/// stamp now costs one extra encode plus the classify passes that resolve
+/// primary vs backup. This group prices the CPU half of that cycle (the
+/// device half is two 4 KiB writes + two barriers, measured by the
+/// durability rigs, not here).
+///
+/// Field shape: the geometry `SuperblockV3::plan` produces for the
+/// shipped default metadata volume — 256 KiB nodes on a 64 GiB volume,
+/// the `dev_substrate.sh` mds namespace size.
+fn bench_superblock_cycle(c: &mut Criterion) {
+    use squeezefs::meta_backend::kv::superblock::{
+        backup_offset, classify_sector0, sector_generation, SuperblockV3,
+    };
+
+    const VOL_LEN: u64 = 64 * 1024 * 1024 * 1024;
+    let sb = SuperblockV3::plan(VOL_LEN, DEFAULT_NODE_SIZE, None, [0x5A; 16], 0x5EED_F00D)
+        .expect("plan the shipped default geometry");
+    let img = sb
+        .encode_sector_at_generation(7)
+        .expect("encode the sector");
+
+    let mut group = c.benchmark_group("kv_superblock");
+    group.throughput(criterion::Throughput::Bytes(img.len() as u64));
+
+    // The write half: geometry validation + field pack + whole-sector
+    // xxh3. Paid TWICE per stamp (primary + redundant copy).
+    group.bench_function("encode_sector", |b| {
+        b.iter(|| {
+            black_box(
+                black_box(&sb)
+                    .encode_sector_at_generation(black_box(7))
+                    .expect("encode"),
+            )
+        })
+    });
+
+    // The read half: magic/version gate + whole-sector checksum verify +
+    // bounds-checked geometry + the feature gate. Paid once per mount on
+    // the primary, twice when the primary is torn.
+    group.bench_function("classify_sector0", |b| {
+        b.iter(|| black_box(classify_sector0(black_box(&img)).expect("classify")))
+    });
+
+    // Slot arbitration: the generation read that decides newest-valid-wins.
+    group.bench_function("sector_generation", |b| {
+        b.iter(|| black_box(sector_generation(black_box(&img))))
+    });
+
+    // The backup-slot derivation every write and every fallback performs.
+    group.bench_function("backup_offset", |b| {
+        b.iter(|| black_box(backup_offset(black_box(VOL_LEN))))
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_kv_meta_metadata,
@@ -793,6 +851,7 @@ criterion_group!(
     bench_kv_tree,
     bench_kv_fold,
     bench_kv_journal,
-    bench_xattr_name_screen
+    bench_xattr_name_screen,
+    bench_superblock_cycle
 );
 criterion_main!(benches);

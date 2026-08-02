@@ -1197,6 +1197,18 @@ async fn test_block_allocator_recovery() {
         .unwrap();
     }
 
+    // Idea 2 composition: the detached pipeline uploads no longer hold
+    // their block locks across the DMA, so the teardown flush below can
+    // race an in-flight upload and win — the superseded task then frees
+    // its orphan, leaving the durable map on non-contiguous indices
+    // (correct, but this contract pins the exact 0..5 index identity).
+    // Quiesce FIRST so the pipeline owns all five publishes.
+    assert!(
+        fs.write_pipeline
+            .quiesce(std::time::Duration::from_secs(30))
+            .await,
+        "pipeline must drain before the flush"
+    );
     // Force flush all staged data to block storage
     fs.flush_all_memory_buffers_to_staging().await.unwrap();
     let summary = fs.flush_all_staged_blocks_to_backend().await;

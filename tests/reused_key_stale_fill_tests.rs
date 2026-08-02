@@ -223,6 +223,18 @@ async fn parked_read_never_serves_reused_or_freed_key() {
     // inplace_overwrite_tests owns its twin.
     squeezefs::fuse_client::set_patch_max_bytes(0);
     squeezefs::fuse_client::set_inplace_overwrite(false);
+    // The rewrite-shadow epoch (Idea 1) PARKS displaced keys until the
+    // swap — the freed-offset-reuse premise this ABA repro depends on
+    // needs the durable per-block displace+free, so the lever is off
+    // (tests/rewrite_shadow_tests.rs owns the epoch venue).
+    struct ShadowOff;
+    impl Drop for ShadowOff {
+        fn drop(&mut self) {
+            squeezefs::routing::set_rewrite_shadow(true);
+        }
+    }
+    let _so = ShadowOff;
+    squeezefs::routing::set_rewrite_shadow(false);
     let ino = create(&h, "aba").await;
 
     // Striped 2-block file: b0 = 0xA0, b1 = 0xB0 (full-block write-through).

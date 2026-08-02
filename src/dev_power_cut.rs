@@ -82,6 +82,12 @@ struct BarrierRec {
 
 #[derive(Default)]
 struct DevJournal {
+    /// Armed barrier fault: every [`crate::nvme_dev::NvmeBlockDev::flush`]
+    /// on this device fails with this raw errno while set, WITHOUT
+    /// covering anything — the data-device face of
+    /// `uring_fs::arm_barrier_error`. Writes and reads proceed untouched,
+    /// exactly like a device that accepts I/O and rejects the flush.
+    barrier_error: Option<i32>,
     /// Still-volatile writes, in admission order.
     entries: Vec<Entry>,
     /// Sequence of the next journaled write.
@@ -192,6 +198,42 @@ pub fn complete_barrier(device_path: &str, covered_upto: u64) {
             covered_upto,
         });
     }
+}
+
+/// Arm the barrier fault on `device_path`: every data-device flush fails
+/// with `raw_os_error` until [`disarm_barrier_error`] / [`clear_faults`],
+/// while writes and reads proceed untouched. Arms tracking too, so the
+/// uncovered writes stay revertible. This is the ordering-injection point
+/// DUR-1's "data barrier strictly before the metadata barrier" leg needs:
+/// a barrier that fails must fail its fsync, never let the metadata that
+/// names those blocks commit.
+pub fn arm_barrier_error(device_path: impl AsRef<Path>, raw_os_error: i32) {
+    let mut st = STATE.lock().unwrap();
+    st.entry(device_path.as_ref().to_path_buf())
+        .or_default()
+        .barrier_error = Some(raw_os_error);
+    ARMED.store(true, Ordering::Relaxed);
+}
+
+/// Disarm the barrier fault on `device_path` (the next flush succeeds).
+pub fn disarm_barrier_error(device_path: impl AsRef<Path>) {
+    if let Some(j) = STATE.lock().unwrap().get_mut(device_path.as_ref()) {
+        j.barrier_error = None;
+    }
+}
+
+/// The armed barrier errno for `device_path`, if any — consulted by
+/// [`crate::nvme_dev::NvmeBlockDev::flush`] before it submits.
+#[inline]
+pub(crate) fn barrier_fault(device_path: &str) -> Option<i32> {
+    if !ARMED.load(Ordering::Relaxed) {
+        return None;
+    }
+    STATE
+        .lock()
+        .unwrap()
+        .get(Path::new(device_path))
+        .and_then(|j| j.barrier_error)
 }
 
 /// Simulate power loss on `device_path`: revert (in reverse admission

@@ -1038,6 +1038,13 @@ impl NvmeBlockDev {
                 crate::fuse_client::METRICS
                     .data_device_syncs
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // TEST-1 barrier fault (armed only): the device accepts
+                // I/O and rejects the flush — nothing becomes covered.
+                if let Some(code) = crate::dev_power_cut::barrier_fault(&self.device_path) {
+                    return Err(crate::error::SqueezefsError::Io(
+                        std::io::Error::from_raw_os_error(code),
+                    ));
+                }
                 // TEST-1 coverage frontier: everything journaled before
                 // this op started is durable when it completes.
                 let covered = crate::dev_power_cut::mark_barrier_start(&self.device_path);

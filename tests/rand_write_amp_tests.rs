@@ -647,8 +647,13 @@ async fn ledger_buckets_reconcile_and_attribute_drivers() {
         );
     }
 
-    // Bucket 3 driver isolation — the fsync/close family lands in `flush`,
-    // not in `drain`, and requests its own durable-upload chain.
+    // Bucket 3 driver isolation — the fsync family lands in the `flush`
+    // buckets, never `drain`, and (DUR-1) makes the block DURABLE BY
+    // RETURN: its staging leg escalates to one durable upload instead of
+    // `put_active_block` + a queued writeback the caller cannot wait for.
+    // Device bytes are unchanged (one block image either way); only the
+    // attribution moves, from `staging_put_bytes_flush` +
+    // `writeback_enqueued_flush` to `durable_upload_bytes_escalation`.
     let ino2 = create(&h, "buckets2.dat").await;
     make_striped(&h, ino2, 4, 13).await;
     // W2 (RW4): >= 25 % of the block parks a FULL partial buffer — the
@@ -663,12 +668,15 @@ async fn ledger_buckets_reconcile_and_attribute_drivers() {
     let flush = ledger().delta(&before_flush);
     flush.print("flush_inode_to_backend (fsync family)", p.len() as u64);
     assert!(
-        flush.staging_put_bytes_flush >= BS,
-        "the fsync family stages under the FLUSH driver"
+        flush.durable_upload_bytes_escalation >= BS,
+        "DUR-1: the fsync family must make the partial block durable by \
+         return (one escalated upload), not stage it behind a queued \
+         writeback"
     );
-    assert!(
-        flush.writeback_enqueued_flush >= 1,
-        "the fsync family's durable chain is requested under the FLUSH driver"
+    assert_eq!(
+        flush.writeback_enqueued_flush, 0,
+        "DUR-1: fsync must not hand its block to a background queue the \
+         caller cannot wait for"
     );
     assert_eq!(flush.staging_put_bytes_drain, 0);
     assert_eq!(flush.writeback_enqueued_drain, 0);

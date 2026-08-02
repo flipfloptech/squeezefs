@@ -2345,6 +2345,13 @@ pub fn write_inflight_json() -> serde_json::Value {
 enum FlushDriver {
     /// fsync / FLUSH / close-background family.
     FsyncClose,
+    /// DUR-1: the fsync-family flush that owes DURABILITY BY RETURN
+    /// (`flush_inode_to_backend`). Same ledger attribution as
+    /// [`FlushDriver::FsyncClose`] — the FLUSH/RELEASE handlers are
+    /// deliberately SOFT ("sync_all/fsync is the durable barrier") and
+    /// keep the staged-then-writeback ladder; only the durable barrier
+    /// escalates.
+    FsyncDurable,
     /// The R5-pressure parked drain (`drain_parked_toward`).
     ParkedDrain,
 }
@@ -2352,16 +2359,31 @@ enum FlushDriver {
 impl FlushDriver {
     fn staging_put_bytes_counter(self) -> &'static AtomicU64 {
         match self {
-            FlushDriver::FsyncClose => &METRICS.staging_put_bytes_flush,
+            FlushDriver::FsyncClose | FlushDriver::FsyncDurable => {
+                &METRICS.staging_put_bytes_flush
+            }
             FlushDriver::ParkedDrain => &METRICS.staging_put_bytes_drain,
         }
     }
 
     fn writeback_enqueued_counter(self) -> &'static AtomicU64 {
         match self {
-            FlushDriver::FsyncClose => &METRICS.writeback_enqueued_flush,
+            FlushDriver::FsyncClose | FlushDriver::FsyncDurable => {
+                &METRICS.writeback_enqueued_flush
+            }
             FlushDriver::ParkedDrain => &METRICS.writeback_enqueued_drain,
         }
+    }
+
+    /// DUR-1: does this driver owe DURABILITY BY RETURN? Only the fsync
+    /// barrier does — its caller is a POSIX durability op — so its
+    /// staging leg escalates to one durable upload instead of
+    /// `put_active_block` + a queued writeback (custody the caller cannot
+    /// wait for). The soft FLUSH/RELEASE family and the R5-pressure drain
+    /// do not: they move bytes off RAM, and the staged-then-writeback
+    /// ladder is their never-lossy contract.
+    fn durable_by_return(self) -> bool {
+        matches!(self, FlushDriver::FsyncDurable)
     }
 }
 
@@ -7677,10 +7699,47 @@ impl SqueezefsFilesystem {
                     continue;
                 }
             };
+            let put_len = staging_copy.len() as u64;
+
+            // DUR-1 (pre-RC spec §1): the fsync/close family owes
+            // DURABILITY BY RETURN, so its staging leg escalates to one
+            // durable upload — `put_active_block` + `enqueue_writeback`
+            // handed the block to a background queue the caller cannot
+            // wait for, and `flush_active_blocks_with_retry` (whose work
+            // list the retire below had just emptied) never picked it
+            // up. Transient failure falls THROUGH to the staging leg:
+            // fsync fails loud, but the acked bytes keep their
+            // never-lossy custody in staging behind the retry ladder.
+            let mut escalation_err: Option<SqueezefsError> = None;
+            if driver.durable_by_return() {
+                match upload_active_block_bytes(ino, b, staging_copy.clone(), &self.router).await {
+                    Ok(()) => {
+                        METRICS
+                            .durable_upload_bytes_escalation
+                            .fetch_add(put_len, Ordering::Relaxed);
+                        self.retire_parked_overlay(&key);
+                        drop(block_guard);
+                        continue;
+                    }
+                    Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
+                        // A fenced writer must not publish anywhere.
+                        self.retire_parked_overlay(&key);
+                        drop(block_guard);
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "fsync durable upload failed for ino {ino} block {b} ({e:?}); \
+                             preserving the acked bytes in staging and failing the fsync"
+                        );
+                        escalation_err = Some(e);
+                    }
+                }
+            }
+
             let nvme_clone = self.router.cache.nvme.clone();
             let key_clone = key.clone();
             let staging_snapshot = staging_copy.clone();
-            let put_len = staging_copy.len() as u64;
             let wp_put = write_phase_start();
             let admitted = tokio::task::spawn_blocking(move || {
                 nvme_clone.put_active_block(&key_clone, &staging_snapshot, fencing_token)
@@ -7721,6 +7780,14 @@ impl SqueezefsFilesystem {
                     .fetch_add(put_len, Ordering::Relaxed);
                 self.retire_parked_overlay(&key);
                 drop(block_guard);
+            }
+
+            // DUR-1: the bytes are safe in staging (never-lossy), but the
+            // caller asked for durability BY RETURN and did not get it —
+            // fail loud rather than report a durability the device does
+            // not have.
+            if let Some(e) = escalation_err {
+                return Err(e);
             }
         }
 
@@ -9784,40 +9851,68 @@ impl SqueezefsFilesystem {
         Ok(false)
     }
 
-    async fn flush_active_blocks_with_retry(
-        &self,
-        ino: u64,
-        fencing_token: u64,
-    ) -> Result<(), SqueezefsError> {
+    /// DUR-1: the ino's flushable active-block indices — the UNION of its
+    /// in-RAM partial buffers and everything currently STAGED under its
+    /// `active_block:` prefix. The staged half is served by the latch-free
+    /// occupancy index (O(present), the delete-sweep primitive), never the
+    /// O(staged_files) key-space scan the old comment warned about.
+    fn collect_flushable_block_indices(&self, ino: u64) -> Vec<u32> {
         let prefix = crate::keys::active_block_ino_prefix(ino);
-
-        // Collect block indices from in-RAM partial buffers only. Do NOT scan the
-        // entire staging key space (was O(staged_files) per fsync and dominated
-        // small-file sync_all benches as n grew).
-        let mut block_indices: Vec<u32> = Vec::new();
+        let mut out: Vec<u32> = Vec::new();
         for r in self.active_block_buffers.iter() {
             let key = r.key();
             if !key.starts_with(prefix.as_str()) {
                 continue;
             }
-            let b_str = key
-                .trim_start_matches(prefix.as_str())
-                .trim_start_matches("block_");
-            if let Ok(b) = b_str.parse::<u32>() {
-                block_indices.push(b);
+            if let Some((_, b)) = Self::parse_active_block_key(key) {
+                out.push(b);
             }
         }
+        for key in self
+            .router
+            .cache
+            .nvme
+            .staged_keys_with_prefix(prefix.as_str())
+        {
+            if let Some((_, b)) = Self::parse_active_block_key(&key) {
+                if !out.contains(&b) {
+                    out.push(b);
+                }
+            }
+        }
+        out
+    }
 
-        // Also flush complete active blocks already in the mmap staging segment
-        // under known keys (without a full list_keys scan): probe block indices
-        // that have a staged active_block entry via the in-RAM set above, plus
-        // any indices still referenced by a pending writeback for this ino is
-        // handled by the writeback worker. For pure file_id staged small files
-        // there are no active_block keys — this returns immediately.
+    async fn flush_active_blocks_with_retry(
+        &self,
+        ino: u64,
+        fencing_token: u64,
+    ) -> Result<(), SqueezefsError> {
+        // DUR-1 (pre-RC spec §1): the work list is captured BEFORE the
+        // memory-buffer flush and UNIONED with the post-flush state. The
+        // old list was built exclusively from `active_block_buffers`
+        // AFTER that flush had retired the parked overlays — so for a
+        // partially-covered block the map was empty here, the early
+        // return fired, and `flush_one_active_block` (the function that
+        // DMAs staged bytes to the data device and merges the block map)
+        // was never invoked at all: fsync returned success with the acked
+        // bytes living only in staging behind a queued writeback.
+        let mut block_indices = self.collect_flushable_block_indices(ino);
+
         if !block_indices.is_empty() {
-            // Spill RAM buffers to staging first so flush_single can see them.
+            // Resolve RAM custody first (the durability-now driver
+            // publishes it straight to the device; the never-lossy
+            // fallback stages it).
             self.flush_memory_buffers_for_inode(ino, fencing_token)
                 .await?;
+            // Re-probe: the flush may have retired overlays (already
+            // durable — their unit resolves as a clean no-op) or staged
+            // new siblings. Union so nothing acked is left behind.
+            for b in self.collect_flushable_block_indices(ino) {
+                if !block_indices.contains(&b) {
+                    block_indices.push(b);
+                }
+            }
             flush_due_active_blocks_for_inode(
                 ino,
                 block_indices,
@@ -9838,7 +9933,11 @@ impl SqueezefsFilesystem {
         ino: u64,
         fencing_token: u64,
     ) -> Result<(), SqueezefsError> {
-        self.flush_memory_buffers_for_inode(ino, fencing_token)
+        // DUR-1: the DURABLE driver — a partially-covered block's staging
+        // leg escalates to one durable upload instead of
+        // `put_active_block` + a queued writeback the caller cannot wait
+        // for (the FLUSH/RELEASE handlers stay soft by design).
+        self.flush_memory_buffers_driven(ino, fencing_token, FlushDriver::FsyncDurable)
             .await?;
         self.flush_active_blocks_with_retry(ino, fencing_token)
             .await?;
@@ -9848,35 +9947,42 @@ impl SqueezefsFilesystem {
             .get(&ino)
             .and_then(|m| m.file_id.clone());
 
-        let sync_data_fut = async {
-            if let Some(file_id) = file_id_opt {
-                let key_bytes = bytes::Bytes::copy_from_slice(file_id.as_bytes());
-                self.router
-                    .cache
-                    .nvme
-                    .staging_nvme_cache
-                    .sync_key(&key_bytes)
-                    .await?;
-            }
-            Ok::<(), SqueezefsError>(())
-        };
+        // DUR-1 ORDERING (pre-RC spec §1): the data barrier completes
+        // STRICTLY BEFORE the metadata barrier that names its blocks.
+        // These two halves used to run under `tokio::try_join!` — i.e.
+        // concurrently — so no ordering edge existed at all, and the
+        // data half barriered nothing on the data device anyway (DUR-2:
+        // there was no flush primitive). On power loss that produced
+        // durable metadata naming a block whose contents were still in
+        // the device's volatile cache — and `close_rewrite_epoch` may
+        // already have freed the displaced predecessor.
 
-        let sync_meta_fut = async {
-            // Idea 1 (KD-1.6): fsync/flush is a swap trigger — the epoch
-            // closes (one whole-tx save + the parked frees) BEFORE the
-            // meta barrier below covers it. Fencing refusals propagate
-            // (a fenced fsync must fail loud — the remount law).
-            self.router.close_rewrite_epoch(ino, fencing_token).await?;
+        // 1. Data plane. Staged-layout payloads (`file_id`) live in the
+        //    staging segment; striped/patched blocks live on the data
+        //    device(s) and need the DUR-2 barrier.
+        if let Some(file_id) = file_id_opt {
+            let key_bytes = bytes::Bytes::copy_from_slice(file_id.as_bytes());
             self.router
-                .persist_dirty_layout_if_needed(&crate::keys::inode_path(ino), fencing_token)
+                .cache
+                .nvme
+                .staging_nvme_cache
+                .sync_key(&key_bytes)
                 .await?;
-            if let Some(backend) = self.meta_backend.as_ref() {
-                backend.sync_device_for_ino(ino).await?;
-            }
-            Ok::<(), SqueezefsError>(())
-        };
+        }
+        self.router.backend_router.flush_data_devices().await?;
 
-        tokio::try_join!(sync_data_fut, sync_meta_fut)?;
+        // 2. Metadata plane, only once the data it names is durable.
+        //    Idea 1 (KD-1.6): fsync/flush is a swap trigger — the epoch
+        //    closes (one whole-tx save + the parked frees) BEFORE the
+        //    meta barrier below covers it. Fencing refusals propagate
+        //    (a fenced fsync must fail loud — the remount law).
+        self.router.close_rewrite_epoch(ino, fencing_token).await?;
+        self.router
+            .persist_dirty_layout_if_needed(&crate::keys::inode_path(ino), fencing_token)
+            .await?;
+        if let Some(backend) = self.meta_backend.as_ref() {
+            backend.sync_device_for_ino(ino).await?;
+        }
         Ok(())
     }
 

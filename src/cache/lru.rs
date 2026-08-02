@@ -382,6 +382,12 @@ impl LruCache {
         self.max_bytes
     }
 
+    /// RES-10: eviction-queue nodes across the shards (the
+    /// tombstone-backlog probe — the byte gauge counts payload only).
+    pub fn eviction_queue_len(&self) -> usize {
+        self.inner.eviction_queue_len()
+    }
+
     pub fn keys(&self) -> Vec<String> {
         self.inner
             .keys()

@@ -457,6 +457,15 @@ impl MemoryCache {
             .sum()
     }
 
+    /// RES-10: total eviction-queue nodes across shards — the
+    /// tombstone-backlog probe. The byte gauge above counts PAYLOAD, so
+    /// it cannot see the ordering queue; this is what keeps the
+    /// reclamation invariant honest
+    /// (`tests/memory_shard_tombstone_tests.rs`).
+    pub fn eviction_queue_len(&self) -> usize {
+        self.shards.iter().map(|s| s.eviction_queue.len()).sum()
+    }
+
     /// Get all keys in the cache.
     pub fn keys(&self) -> Vec<Bytes> {
         let mut keys = Vec::new();

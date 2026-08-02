@@ -1,14 +1,67 @@
 # Design: the zcrx read lane — a userspace NVMe/TCP initiator for cold read fills
 
-Rev 2 — 2026-08-04. Branch `perf/zcrx-lane-z2` (Rev 1: `perf/zcrx-lane`,
-2026-08-03). Status: **Phase-1 bracket GO**
+Rev 3 — 2026-08-04. Branch `perf/zcrx-z3` (Rev 2: `perf/zcrx-lane-z2`;
+Rev 1: `perf/zcrx-lane`, 2026-08-03). Status: **Phase-1 bracket GO**
 (`.benchmarks/2026-08-03-zcrx-lane.md`); PR Z1 shipped the initiator
-core + probes + gauges + opt-in wire-in; **PR Z2 (this branch) ships the
-zcrx recv backend** — the area/refill/gather machinery, the steering
+core + probes + gauges + opt-in wire-in; PR Z2 shipped the
+zcrx recv backend — the area/refill/gather machinery, the steering
 state machine + live ethtool/netlink surface, and the raw
 `REGISTER_ZCRX_IFQ`/`RECV_ZC` driver (local contracts + loom;
 live-NIC execution field-owed — `.benchmarks/2026-08-04-zcrx-z2.md`);
-PR Z3 ships gather-serve fusion + default adjudication.
+**PR Z3 (this branch) ships MEM-3 cancellation custody + gather-serve
+fusion** (`.benchmarks/2026-08-04-zcrx-z3.md`); default-on adjudication
+stays field-owed behind the D5 gate chain (MEM-3 ✓ → TEST-6 → Z3 field
+rows).
+
+**Rev 3 amendments (Z3 as built):**
+
+* **Gather fusion (the PERF-1 win)**: registered-destination funnel
+  reads (`dest_addr` — the routing raw full-block DMA leg that serves
+  EXA-class cold reads, and the R3 ranged zero-copy leg) are
+  lane-eligible: each sub-command's ONE completion gather lands
+  DIRECTLY in the caller's dest (`LaneSession::read_into_dest`). The
+  Z2 intermediate on these shapes (gather → pooled bounce → upstream
+  serve copy) is deleted — dest-less pooled reads keep the Z2 shape by
+  design (§4.4: memory that outlives the serve pays the pooled
+  gather). New gauge `zcrx_dest_gather_bytes` = the fused SUBSET of
+  `zcrx_gather_bytes` (a fused row must account its dest-read bytes;
+  `gather − dest_gather` is the remaining two-pass traffic). Routing's
+  `read_dest_dma_bytes` keeps counting dest-leg bytes (ledger closure
+  unchanged); the lane gauge separately attributes the CPU pass.
+* **Dest fusion is AREA-BACKEND-ONLY by law**
+  (`dest_serve_eligible()`): the classic backend's reader task writes
+  destinations from a FOREIGN task — the MEM-1 hazard class for
+  registered ent/arena memory under cancellation. Area backends gather
+  on the REQUESTER: a dropped future gathers nothing, so no lane
+  context ever writes a registered dest after its op resolves.
+  Classic ineligibility is not a fallback (the ≈ 0 gauge stays
+  honest); per-op lane errors retry on the kernel path into the SAME
+  dest (idempotent — partial gathers overwritten).
+* **MEM-3 cancellation custody (the D5 gate chain's first link,
+  closed)**: CID + depth permit live in the PENDING ENTRY as RAII
+  (`CidSlot`), returning exactly when the driver destroys the entry —
+  never on the requester's happy path, so a dropped future leaks
+  nothing (pre-fix: `queue_depth` cancellations emptied the pool and
+  the lane degraded for the mount lifetime). Classic entries own a
+  destination keep-alive (`read_into_pooled` — a clone of the pooled
+  `Bytes`; `read_into_slice` bounces through an op-owned allocation),
+  so the pool can never recycle a buffer the reader still holds a span
+  pointer into; `read_into_ptr` keeps a documented raw contract
+  (caller-owned lifetime past cancellation — area backends meet it
+  trivially). Area admission permits ride `PendingFill` → `ZcrxFill`
+  (released after the gather or in the dead completion channel —
+  exact accounting under future-drop). Drain discipline:
+  poison(drain=true) only where the destination writer provably writes
+  no more (reader/driver exiting, or abort+JOINED); writer-side
+  failures poison flags only. **Cancellation is NOT a poison event** —
+  `zcrx_lane_poisoned` stays an honest must-stay-0 tripwire under
+  default-on. (Deliberate deviation from the pre-rc spec's minimal
+  poison-from-drop-guard prescription; same acceptance, lane
+  survives.) No lock-free protocol changed — `SpanLedger` + its loom
+  models untouched (re-run green).
+* **Microbench**: `benches/zcrx_bench.rs` `zcrx_gather` group — the Z2
+  two-pass vs Z3 fused gather at the 128 KiB MDTS-face and 4 MiB
+  whole-block span shapes (sim venue, real area/ledger machinery).
 
 **Rev 2 amendments (Z2 as built):**
 
@@ -277,8 +330,11 @@ accounts for the row's cold-fill bytes), `zcrx_fill_fallbacks`
 (per-op lane→kernel retries, ≈ 0), `zcrx_frame_violations`
 (must-stay-0 tripwire), `zcrx_conn_errors`, `zcrx_area_bytes` (R5
 component gauge), `zcrx_hdr_copy_bytes` (the priced header edge copy —
-bounded ≪ 1 % of fill bytes by construction). Ledger closure extension
-per §4.4.
+bounded ≪ 1 % of fill bytes by construction),
+`zcrx_dest_gather_bytes` (Z3 — the fused-serve subset of
+`zcrx_gather_bytes`: gathers that landed directly in registered
+dests; a fused row is engaged iff its delta accounts for the row's
+dest-read bytes). Ledger closure extension per §4.4.
 
 ## 10. PR sequence + merge bars
 
@@ -297,10 +353,17 @@ per §4.4.
   NIC exists locally): engagement exact (fill provenance == area),
   `zcrx_frame_violations`=0, wedge tripwires 0, A-B-B-A cold-read
   bracket vs `SQUEEZEFS_ZCRX_LANE=0`, loaded soak.
-* **Z3**: gather-serve into `serve_copy_to_dest`, NUMA placement,
-  Identify-verify hardening, derived-sizing retune, default-on
-  adjudication. Bar: sustained-state rows both substrates + the
-  standing no-regression table.
+* **Z3** (shipped 2026-08-04, `perf/zcrx-z3` —
+  `.benchmarks/2026-08-04-zcrx-z3.md`): MEM-3 cancellation custody
+  (the D5 gate chain's first link) + gather fusion on
+  registered-destination funnel reads (`read_into_dest` — the Rev 3
+  amendments above) + the `zcrx_gather` microbench pair. Local bar
+  met (contract suites, loom re-attested, clippy/fmt, bench smoke).
+  **Field-owed remainder** (the reformat-window bracket): live-NIC
+  fused rows (sustained ≥ 60 s, both substrates), NUMA placement
+  retune, Identify-verify hardening, derived-sizing retune vs real
+  C2HData grain, and the default-on adjudication behind the D5 gate
+  chain (MEM-3 ✓ → TEST-6 → Z3 rows + engagement laws).
 
 ## 11. Residual risks (named)
 

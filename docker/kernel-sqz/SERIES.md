@@ -19,8 +19,11 @@ lore thread (`t.mbox.gz` of the cover):
 * The series is **self-contained**: patches 01–12 are the kmbuf io_uring
   infrastructure, 13–19 the FUSE refactors + kmbuf ring, 20–23 the rsrc
   bvec-registration refactor, 24 the FUSE zero-copy, 25 docs.
-* UAPI surface it adds: FUSE `7.46` (`fuse_uring_cmd_req.init.flags`
-  with `FUSE_URING_BUF_RING` / `FUSE_URING_ZERO_COPY` + `queue_depth`),
+* UAPI surface it adds: the `fuse_uring_cmd_req.init.flags` union
+  (`FUSE_URING_BUF_RING` / `FUSE_URING_ZERO_COPY` + `queue_depth`;
+  the series adds a "7.46" version-history comment but leaves
+  `FUSE_KERNEL_MINOR_VERSION` at 45 — negotiation rides the init
+  flags, not a minor bump),
   io_uring `IORING_REGISTER_KMBUF_RING=37` / `IORING_UNREGISTER_KMBUF_RING=38`,
   `IORING_OFF_KMBUF_RING`. It adds **no new Kconfig symbols** (rides
   `CONFIG_FUSE_IO_URING` + `CONFIG_IO_URING`).

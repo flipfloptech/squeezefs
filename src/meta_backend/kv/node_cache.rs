@@ -2045,3 +2045,196 @@ impl NodeCache {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Contracts (spec §11 TEST-5/TEST-9)
+// ---------------------------------------------------------------------------
+//
+// `node_cache.rs` carries 19 atomics and had ZERO in-module tests — its
+// only coverage was incidental, through the KV integration suites. The
+// pieces below are the ones whose failure mode is SILENT rather than a
+// wrong answer: the §5.7 memory-charge gauges.
+//
+// A charge gauge that loses a credit reads as "the cache is fuller than
+// it is" and evicts forever; one that over-credits WRAPS a `u64` through
+// zero and reads as "the cache is full forever" — exactly the bug class
+// `gauge_core` was extracted and loom-modelled for after it shipped once.
+// The memo's accounting is Drop-owned, so the law is conservation across
+// populate/drop under racing claims.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn baseline() -> u64 {
+        super::super::META_KV_FOLD_MEMO_BYTES.load(Ordering::Acquire)
+    }
+
+    #[test]
+    fn memo_populate_charges_both_gauges_and_drop_credits_exactly() {
+        let charge = Arc::new(AtomicU64::new(0));
+        let global0 = baseline();
+        {
+            let memo = FoldMemo::new(Arc::clone(&charge));
+            memo.populate(
+                Bytes::from_static(b"key-one"),
+                LiveLookup::Live(Bytes::from_static(b"0123456789")),
+                7,
+            );
+            let charged = charge.load(Ordering::Acquire);
+            assert_eq!(
+                charged,
+                (b"key-one".len() + MEMO_CELL_OVERHEAD + 10) as u64,
+                "the charge must be key + fixed cell overhead + owned value"
+            );
+            assert_eq!(
+                super::super::META_KV_FOLD_MEMO_BYTES.load(Ordering::Acquire) - global0,
+                charged,
+                "the per-cache budget and the global gauge must move together"
+            );
+            // A tombstone/absent outcome refcounts snapshot memory the
+            // node already pays for: key + overhead only.
+            memo.populate(Bytes::from_static(b"key-two"), LiveLookup::Tombstone, 8);
+            assert_eq!(
+                charge.load(Ordering::Acquire) - charged,
+                (b"key-two".len() + MEMO_CELL_OVERHEAD) as u64,
+                "a tombstone memo must not charge a value it does not own"
+            );
+        }
+        assert_eq!(
+            charge.load(Ordering::Acquire),
+            0,
+            "Drop must credit EXACTLY what populate charged — a lost credit \
+             makes the cache read fuller than it is and evict forever"
+        );
+        assert_eq!(
+            baseline(),
+            global0,
+            "and the global fold-memo gauge must return to its baseline"
+        );
+    }
+
+    #[test]
+    fn a_full_memo_drops_entries_rather_than_growing_its_charge() {
+        let charge = Arc::new(AtomicU64::new(0));
+        let global0 = baseline();
+        {
+            let memo = FoldMemo::new(Arc::clone(&charge));
+            for i in 0..(FOLD_MEMO_CAPACITY * 4) {
+                memo.populate(
+                    Bytes::from(format!("k{i:04}")),
+                    LiveLookup::Live(Bytes::from_static(b"v")),
+                    i as u64,
+                );
+            }
+            let per_cell = (5 + MEMO_CELL_OVERHEAD + 1) as u64;
+            assert_eq!(
+                charge.load(Ordering::Acquire),
+                per_cell * FOLD_MEMO_CAPACITY as u64,
+                "the fixed capacity IS the §5.7 per-node memory bound — a \
+                 32-key storm must charge 8 cells, not 32"
+            );
+            // Everything that fit is still probeable; the overflow is gone.
+            assert!(memo.probe(b"k0000").is_some(), "the first claim survives");
+            assert!(
+                memo.probe(b"k0031").is_none(),
+                "an over-capacity entry is dropped, not stored"
+            );
+        }
+        assert_eq!(charge.load(Ordering::Acquire), 0);
+        assert_eq!(baseline(), global0);
+    }
+
+    #[test]
+    fn racing_same_key_populates_charge_at_most_once() {
+        // The populate-once claim: a same-key racer's duplicate is
+        // prevented by the post-loss re-check. Double-charging one key
+        // would inflate the budget with no memory behind it.
+        let charge = Arc::new(AtomicU64::new(0));
+        let global0 = baseline();
+        {
+            let memo = Arc::new(FoldMemo::new(Arc::clone(&charge)));
+            let mut hs = Vec::new();
+            for _ in 0..8 {
+                let memo = Arc::clone(&memo);
+                hs.push(std::thread::spawn(move || {
+                    memo.populate(
+                        Bytes::from_static(b"contended"),
+                        LiveLookup::Live(Bytes::from_static(b"value")),
+                        1,
+                    );
+                }));
+            }
+            for h in hs {
+                h.join().expect("no populate may panic");
+            }
+            let one = (b"contended".len() + MEMO_CELL_OVERHEAD + 5) as u64;
+            let got = charge.load(Ordering::Acquire);
+            assert!(
+                got == one,
+                "8 racing populates of ONE key must charge it once (got \
+                 {got}, one cell is {one})"
+            );
+            assert!(memo.probe(b"contended").is_some());
+        }
+        assert_eq!(
+            charge.load(Ordering::Acquire),
+            0,
+            "and the contended charge credits back exactly"
+        );
+        assert_eq!(baseline(), global0);
+    }
+
+    #[test]
+    fn racing_distinct_key_populates_conserve_the_charge_across_drop() {
+        // The conservation law under full contention: whatever N racing
+        // distinct-key claims charge, Drop credits back to zero. A gauge
+        // that over-credits WRAPS a u64 through zero and then reads as
+        // "full forever" — the bug class `gauge_core` exists for.
+        let charge = Arc::new(AtomicU64::new(0));
+        let global0 = baseline();
+        {
+            let memo = Arc::new(FoldMemo::new(Arc::clone(&charge)));
+            let mut hs = Vec::new();
+            for t in 0..8u64 {
+                let memo = Arc::clone(&memo);
+                hs.push(std::thread::spawn(move || {
+                    memo.populate(
+                        Bytes::from(format!("k{t}")),
+                        LiveLookup::Live(Bytes::from_static(b"vv")),
+                        t,
+                    );
+                }));
+            }
+            for h in hs {
+                h.join().expect("no populate may panic");
+            }
+            let charged = charge.load(Ordering::Acquire);
+            assert!(charged > 0, "the racers charged something");
+            assert_eq!(
+                super::super::META_KV_FOLD_MEMO_BYTES.load(Ordering::Acquire) - global0,
+                charged,
+                "both gauges must agree after a contended populate storm"
+            );
+        }
+        assert_eq!(
+            charge.load(Ordering::Acquire),
+            0,
+            "conservation: charge - credit == 0, never a wrap"
+        );
+        assert_eq!(baseline(), global0);
+    }
+
+    #[test]
+    fn an_empty_memo_charges_nothing_and_credits_nothing() {
+        let charge = Arc::new(AtomicU64::new(0));
+        let global0 = baseline();
+        {
+            let memo = FoldMemo::new(Arc::clone(&charge));
+            assert!(memo.probe(b"absent").is_none());
+            assert_eq!(charge.load(Ordering::Acquire), 0);
+        }
+        assert_eq!(charge.load(Ordering::Acquire), 0, "no spurious credit");
+        assert_eq!(baseline(), global0);
+    }
+}

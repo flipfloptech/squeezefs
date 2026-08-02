@@ -17,10 +17,20 @@
 //!   law), (a) 32 × 4 KiB-payload PDUs (rand-4k-class completion stream)
 //!   and (b) one 128 KiB-payload PDU (the MDTS-face sub-command read —
 //!   `.benchmarks/2026-08-04-zcrx-z2.md` seam-split contract).
+//! * gather fusion (PR Z3, design §4.4/§10) — the Z2 two-pass shape
+//!   (completion gather → pooled bounce, then the upstream serve copy)
+//!   vs the Z3 fused shape (ONE gather straight into the registered
+//!   dest). Field shapes: page-grain payload spans over a 128 KiB
+//!   MDTS-face sub-command (32 spans) and a 4 MiB whole-block read
+//!   (1024 spans — the EXA cold raw-dest leg the fusion serves). Both
+//!   legs use cached copies (the serve NT floor is 256 KiB and the
+//!   bench isolates the PASS-COUNT delta, not NT policy — priced in
+//!   copy_path_bench).
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use squeezefs::zcrx_lane::area::{chunk_bytes_default, AreaSlice, ZcrxArea};
 use squeezefs::zcrx_lane::area_core::SpanLedger;
+use squeezefs::zcrx_lane::fill_table::ZcrxFill;
 use squeezefs::zcrx_lane::pdu_stream::{ParseEvent, StreamParser};
 use std::hint::black_box;
 use std::sync::Arc;
@@ -162,5 +172,71 @@ fn bench_pdu_stream(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_span_ledger, bench_pdu_stream);
+/// PR Z3 gather fusion vs the Z2 two-pass shape (design §4.4/§10; the
+/// pass the Phase-1 bracket priced at −65–68 % RX CPU): identical
+/// page-grain span scatter, (a) Z2 = gather into a pooled bounce + the
+/// upstream serve copy into the dest, (b) Z3 = ONE fused gather into
+/// the dest. Sim venue — no NIC required (the area is the real mapped
+/// machinery, spans are real ledger-refcounted `AreaSlice`s).
+fn bench_gather_fusion(c: &mut Criterion) {
+    let chunk = chunk_bytes_default();
+    let area = ZcrxArea::new(2048 * chunk as u64, chunk, None).expect("area map");
+
+    let mut group = c.benchmark_group("zcrx_gather");
+    for (label, len) in [
+        // The MDTS-face sub-command completion (128 KiB, 32 spans).
+        ("128k", 128 * 1024usize),
+        // The EXA cold whole-block raw-dest read (4 MiB, 1024 spans).
+        ("4m", 4 * 1024 * 1024usize),
+    ] {
+        let spans: Vec<(u32, AreaSlice)> = (0..len / chunk)
+            .map(|i| {
+                let grant = area.try_grant_chunk().expect("area has free chunks");
+                let ptr = grant.chunk_ptr();
+                // SAFETY: exclusive chunk custody via the fresh grant.
+                unsafe { std::ptr::write_bytes(ptr, 0xC3, chunk) };
+                (
+                    (i * chunk) as u32,
+                    AreaSlice::new(grant, ptr as *const u8, chunk),
+                )
+            })
+            .collect();
+        let fill = ZcrxFill::from_parts(spans, len);
+        let mut dest = vec![0u8; len];
+        let mut bounce = vec![0u8; len];
+        group.throughput(Throughput::Bytes(len as u64));
+
+        group.bench_function(format!("z2_two_pass_{label}"), |b| {
+            b.iter(|| {
+                // Pass 1: the Z2 completion gather into the pooled bounce.
+                fill.gather_into(bounce.as_mut_ptr());
+                // Pass 2: the upstream serve copy (routing R-S) the Z2
+                // shape still pays on the dest leg.
+                // SAFETY: bench-owned non-overlapping buffers of `len`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bounce.as_ptr(), dest.as_mut_ptr(), len);
+                }
+                black_box(dest[len - 1]);
+            });
+        });
+
+        group.bench_function(format!("z3_fused_{label}"), |b| {
+            b.iter(|| {
+                // The ONE fused gather (Z3): area spans → dest, done.
+                fill.gather_into(dest.as_mut_ptr());
+                black_box(dest[len - 1]);
+            });
+        });
+
+        drop(fill); // release the chunk grants for the next shape
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_span_ledger,
+    bench_pdu_stream,
+    bench_gather_fusion
+);
 criterion_main!(benches);

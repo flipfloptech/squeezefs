@@ -43,6 +43,17 @@ pub struct ZcrxFill {
 }
 
 impl ZcrxFill {
+    /// Bench/contract constructor (`benches/zcrx_bench.rs` — the sim
+    /// venue's fused-vs-two-pass gather pair): a fill over caller-built
+    /// spans, no admission custody.
+    pub fn from_parts(segs: Vec<(u32, AreaSlice)>, len: usize) -> ZcrxFill {
+        ZcrxFill {
+            segs,
+            len,
+            _admission: None,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }

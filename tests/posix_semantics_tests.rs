@@ -264,3 +264,105 @@ async fn statfs_iused_counts_hardlinked_and_open_inodes_as_live() {
     // Silence the unused-import lint until the POSIX-4 legs land.
     let _ = METRICS.fuse_ops.load(Ordering::Relaxed);
 }
+
+// ---------------------------------------------------------------------------
+// POSIX-3 — lstat() on a symlink must report strlen(target) DURABLY.
+// ---------------------------------------------------------------------------
+
+/// Targets across the interesting shapes: short, a realistic absolute
+/// path, and a long (multi-component) one.
+const SYMLINK_TARGETS: [&str; 3] = [
+    "a",
+    "/usr/lib/x86_64-linux-gnu/libsqueezefs_il.so.1.1.0",
+    "../../../../var/lib/squeezefs/very/deep/relative/target/with/many/components/file.dat",
+];
+
+/// The durable inode record — not the reply, not the daemon attr cache —
+/// must carry `size == strlen(target)`. `symlink()` patched the size into
+/// the ReplyEntry and the cache only; the create transaction committed
+/// size 0, and the `get_attr_internal` size-coherency repair is
+/// regular-files-only, so the FIRST stat after the attr TTL lapsed
+/// reported `st_size == 0` forever. Tools that size a `readlink()` buffer
+/// from `st_size` (tar, rsync, cpio, `cp -a`) then record EMPTY targets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn symlink_commits_target_length_into_the_durable_inode() {
+    use squeezefs::meta_backend::Metadata;
+    let h = make().await;
+    for (i, target) in SYMLINK_TARGETS.iter().enumerate() {
+        let name = format!("posix3_durable_{i}");
+        let entry =
+            h.fs.symlink(h.req, 1, OsStr::new(&name), OsStr::new(target))
+                .await
+                .unwrap();
+        let ino = entry.attr.ino;
+        assert_eq!(
+            entry.attr.size,
+            target.len() as u64,
+            "the symlink reply must size the link"
+        );
+
+        let durable =
+            h.fs.meta_backend
+                .as_ref()
+                .unwrap()
+                .getattr(ino)
+                .await
+                .unwrap();
+        assert_eq!(
+            durable.size,
+            target.len() as u64,
+            "the DURABLE inode record for '{name}' -> '{target}' must carry \
+             size = strlen(target); got {}",
+            durable.size
+        );
+    }
+}
+
+/// The user-visible face: once the attr cache no longer holds the entry
+/// (the 1 s TTL lapsing on a real mount — forced deterministically here
+/// by an invalidation rather than a sleep), `getattr` must still report
+/// the link length.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn symlink_size_survives_attr_cache_expiry() {
+    let h = make().await;
+    for (i, target) in SYMLINK_TARGETS.iter().enumerate() {
+        let name = format!("posix3_ttl_{i}");
+        let ino =
+            h.fs.symlink(h.req, 1, OsStr::new(&name), OsStr::new(target))
+                .await
+                .unwrap()
+                .attr
+                .ino;
+
+        // Deterministic TTL lapse: drop the daemon-side cached attr, so
+        // the next stat is served from the durable record.
+        h.fs.attr_cache.invalidate(&ino);
+
+        let attr = h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr;
+        assert_eq!(
+            attr.size,
+            target.len() as u64,
+            "post-TTL lstat of '{name}' must report strlen('{target}') = {}; \
+             got {} — a readlink() buffer sized from this records an EMPTY target",
+            target.len(),
+            attr.size
+        );
+
+        // And a fresh LOOKUP (the path every cold `ls -l` takes) agrees.
+        h.fs.attr_cache.invalidate(&ino);
+        let looked = h.fs.lookup(h.req, 1, OsStr::new(&name)).await.unwrap().attr;
+        assert_eq!(
+            looked.size,
+            target.len() as u64,
+            "LOOKUP must size the link"
+        );
+
+        // The target itself is unchanged by any of this.
+        let data = h.fs.readlink(h.req, ino).await.unwrap().data;
+        assert_eq!(
+            data.as_ref(),
+            target.as_bytes(),
+            "readlink must still return the exact target"
+        );
+    }
+}

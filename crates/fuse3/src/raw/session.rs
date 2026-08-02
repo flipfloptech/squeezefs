@@ -797,14 +797,6 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         }
     }
 
-    #[allow(dead_code)]
-    async fn dispatch(&mut self) -> IoResult<()> {
-        let fuse_connection = self.fuse_connection.clone().unwrap();
-        let fs = self.filesystem.clone().expect("filesystem not init");
-        let max_write = self.init_filesystem(&fs, &fuse_connection).await?.get() as usize;
-        self.dispatch_with_max_write(max_write).await
-    }
-
     async fn dispatch_with_max_write(&mut self, max_write: usize) -> IoResult<()> {
         // CLONE, never take: `handle_read`'s P2 in-place reply arm reads
         // `self.fuse_connection` — the historical `take()` left it None for

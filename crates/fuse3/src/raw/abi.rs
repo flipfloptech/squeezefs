@@ -18,6 +18,14 @@
 //!
 //! Items without a version annotation are valid with ABI 7.8 and later
 
+// Protocol-completeness exception to the no-dead-code law (AGENTS.md): this
+// module mirrors the kernel's fuse_kernel.h ABI surface verbatim — opcodes,
+// structs, and fields exist because the wire defines them, not because the
+// daemon consumes each one yet. One documented module-level allow replaces
+// the former 17 item-level `#[allow(dead_code)]` attributes (pre-rc spec
+// §10 ENG-14).
+#![allow(dead_code)]
+
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::mem;
@@ -111,11 +119,9 @@ pub const FUSE_DONT_MASK: u32 = 1 << 6;
 // (1<<9) were deleted with the reply-path splice machinery (L3 lever A):
 // the daemon implements no splice path and must not advertise one.
 
-#[allow(dead_code)]
 /// locking for BSD style file locks
 pub const FUSE_FLOCK_LOCKS: u32 = 1 << 10;
 
-#[allow(dead_code)]
 /// kernel supports ioctl on directories
 pub const FUSE_HAS_IOCTL_DIR: u32 = 1 << 11;
 
@@ -149,7 +155,6 @@ pub const FUSE_HANDLE_KILLPRIV: u32 = 1 << 19;
 /// filesystem supports posix acls
 pub const FUSE_POSIX_ACL: u32 = 1 << 20;
 
-#[allow(dead_code)]
 /// reading the device after abort returns ECONNABORTED
 pub const FUSE_ABORT_ERROR: u32 = 1 << 21;
 
@@ -162,11 +167,9 @@ pub const FUSE_CACHE_SYMLINKS: u32 = 1 << 23;
 /// kernel supports zero-message opendir
 pub const FUSE_NO_OPENDIR_SUPPORT: u32 = 1 << 24;
 
-#[allow(dead_code)]
 /// only invalidate cached pages on explicit request
 pub const FUSE_EXPLICIT_INVAL_DATA: u32 = 1 << 25;
 
-#[allow(dead_code)]
 /// map_alignment field is valid
 pub const FUSE_MAP_ALIGNMENT: u32 = 1 << 26;
 
@@ -215,22 +218,18 @@ pub const FUSE_XTIMES: u32 = 1 << 31;
 // Release flags
 pub const FUSE_RELEASE_FLUSH: u32 = 1 << 0;
 
-#[allow(dead_code)]
 pub const FUSE_RELEASE_FLOCK_UNLOCK: u32 = 1 << 1;
 
 // Getattr flags
 pub const FUSE_GETATTR_FH: u32 = 1 << 0;
 
-#[allow(dead_code)]
 // Lock flags, this is BSD file lock
 pub const FUSE_LK_FLOCK: u32 = 1 << 0;
 
-#[allow(dead_code)]
 // Write flags
 /// delayed write from page cache, file handle is guessed
 pub const FUSE_WRITE_CACHE: u32 = 1 << 0;
 
-#[allow(dead_code)]
 /// lock_owner field is valid
 pub const FUSE_WRITE_LOCKOWNER: u32 = 1 << 1;
 
@@ -244,32 +243,25 @@ pub const FUSE_WRITE_KILL_SUIDGID: u32 = 1 << 2;
 /// CAP_FSETID).
 pub const FUSE_OPEN_KILL_SUIDGID: u32 = 1 << 0;
 
-#[allow(dead_code)]
 // Read flags
 pub const FUSE_READ_LOCKOWNER: u32 = 1 << 1;
 
 // IOCTL flags
-#[allow(dead_code)]
 /// 32bit compat ioctl on 64bit machine
 pub const FUSE_IOCTL_COMPAT: u32 = 1 << 0;
 
-#[allow(dead_code)]
 /// not restricted to well-formed ioctls, retry allowed
 pub const FUSE_IOCTL_UNRESTRICTED: u32 = 1 << 1;
 
-#[allow(dead_code)]
 /// retry with new iovecs
 pub const FUSE_IOCTL_RETRY: u32 = 1 << 2;
 
-#[allow(dead_code)]
 /// 32bit ioctl
 pub const FUSE_IOCTL_32BIT: u32 = 1 << 3;
 
-#[allow(dead_code)]
 /// is a directory
 pub const FUSE_IOCTL_DIR: u32 = 1 << 4;
 
-#[allow(dead_code)]
 /// maximum of in_iovecs + out_iovecs
 pub const FUSE_IOCTL_MAX_IOV: u32 = 256;
 
@@ -330,7 +322,6 @@ pub struct fuse_kstatfs {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[allow(non_camel_case_types)]
-#[allow(dead_code)]
 pub struct fuse_file_lock {
     pub start: u64,
     pub end: u64,
@@ -957,7 +948,7 @@ pub struct fuse_ioctl_in {
 }
 
 #[derive(Debug)]
-#[allow(non_camel_case_types, dead_code)]
+#[allow(non_camel_case_types)]
 pub struct fuse_ioctl_iovec {
     pub base: u64,
     pub len: u64,

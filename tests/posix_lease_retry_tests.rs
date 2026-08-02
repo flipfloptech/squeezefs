@@ -371,3 +371,30 @@ fn the_backoff_schedule_is_bounded_and_non_decreasing() {
         prev = d;
     }
 }
+
+// ---------------------------------------------------------------------------
+// POSIX-13 (spec §5): fallocate's EXTEND arm must hold the shared lease.
+// ---------------------------------------------------------------------------
+
+/// `fallocate(mode = 0)` that grows a file is a size mutation like any
+/// other, but its extend arm took a bare fencing-token SNAPSHOT
+/// (`get_fencing_token_ino`) instead of the shared lease — the pattern
+/// `setattr` was already moved off (a snapshot can be stale the moment
+/// it is read, and nothing serializes the mutation against the lease
+/// holder). Under a permanently held lease it must refuse exactly like
+/// its punch/zero sibling, not proceed on a snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallocate_extend_takes_the_shared_lease() {
+    let h = make().await;
+    let (ino, _hold) = wedged_file(&h, "p13-extend").await;
+    let before = exhaustions();
+    let err =
+        h.fs.fallocate(h.req, ino, 0, 0, 8192, 0)
+            .await
+            .expect_err("the extend arm must not proceed on a bare token snapshot");
+    assert_eq!(libc::c_int::from(err), -libc::EIO, "fallocate extend: {err}");
+    assert!(
+        exhaustions() > before,
+        "the extend arm must go through the shared lease ladder"
+    );
+}

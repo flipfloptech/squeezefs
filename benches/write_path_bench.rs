@@ -313,12 +313,42 @@ fn bench_layout_publish(c: &mut Criterion) {
     group.finish();
 }
 
+/// **DUR-6 · the indirect block-map blob's encode + digest.** The spill
+/// path re-serializes the WHOLE map per publish and now checksums it, and
+/// since the same campaign made the publish copy-on-write, that cost is
+/// paid on every indirect publish — commit-adjacent by construction.
+///
+/// Field shapes, both from `tests/indirect_map_backend_keys_tests.rs`
+/// (which derives them from the real spill boundary): 700 entries — the
+/// first map that spills past the 64 KiB-node inline cap — and 4,096
+/// entries, a ~16 GiB file at the shipped 4 MiB block size.
+fn bench_indirect_map_codec(c: &mut Criterion) {
+    use squeezefs::routing::{decode_indirect_block_map, encode_indirect_block_map};
+
+    let mut group = c.benchmark_group("write_indirect_map");
+    for entries in [700usize, 4096] {
+        let map: HashMap<u32, String> = (0..entries as u32)
+            .map(|b| (b, format!("vol-00aa11bb://{}", (b as u64) * (4 << 20))))
+            .collect();
+        let img = encode_indirect_block_map(&map).expect("encode");
+        group.throughput(Throughput::Bytes(img.len() as u64));
+        group.bench_function(format!("encode_checksum_{entries}"), |b| {
+            b.iter(|| black_box(encode_indirect_block_map(black_box(&map)).expect("encode")));
+        });
+        group.bench_function(format!("verify_decode_{entries}"), |b| {
+            b.iter(|| black_box(decode_indirect_block_map(black_box(&img)).expect("decode")));
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_coverage_union,
     bench_extent_overlay,
     bench_supersession,
     bench_layout_publish,
+    bench_indirect_map_codec,
     bench_flush_coalescing
 );
 criterion_main!(benches);

@@ -68,7 +68,56 @@ const CHUNK: u64 = 4 * 1024 * 1024;
 /// here as raw bytes on purpose: the test asserts the FORMAT, not whatever
 /// helper the implementation uses.
 const INDIRECT_MAGIC: &[u8; 8] = b"SQFSIMAP";
-const INDIRECT_VERSION: u32 = 1;
+/// The retired unchecksummed image (still DECODED so volumes carrying one
+/// keep mounting — never written again; spec DUR-6).
+const INDIRECT_VERSION_V1: u32 = 1;
+/// The written image since DUR-6: `magic(8) | version(4) | payload_len(4)
+/// | xxh3_64(8)` + bincode, the digest covering the header (own field
+/// zeroed) and the payload.
+const INDIRECT_VERSION: u32 = 2;
+const INDIRECT_HDR_LEN: usize = 24;
+const INDIRECT_SUM_OFF: usize = 16;
+
+/// Build a v2 blob image for `entries` — the on-disk shape, recomputed
+/// here rather than borrowed from the implementation (this suite pins the
+/// FORMAT).
+fn v2_blob(entries: &[(u32, String)]) -> Vec<u8> {
+    let payload = bincode::serialize(&entries.to_vec()).expect("serialize entries");
+    let mut blob = Vec::with_capacity(INDIRECT_HDR_LEN + payload.len());
+    blob.extend_from_slice(INDIRECT_MAGIC);
+    blob.extend_from_slice(&INDIRECT_VERSION.to_le_bytes());
+    blob.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&0u64.to_le_bytes());
+    blob.extend_from_slice(&payload);
+    let sum = xxhash_rust::xxh3::xxh3_64(&blob);
+    blob[INDIRECT_SUM_OFF..INDIRECT_SUM_OFF + 8].copy_from_slice(&sum.to_le_bytes());
+    blob
+}
+
+/// Verify + decode a v2 blob image the way a reader must.
+fn v2_decode(raw: &[u8]) -> Vec<(u32, String)> {
+    assert!(raw.len() >= INDIRECT_HDR_LEN, "short v2 image");
+    assert_eq!(&raw[..8], INDIRECT_MAGIC, "magic");
+    assert_eq!(
+        u32::from_le_bytes(raw[8..12].try_into().unwrap()),
+        INDIRECT_VERSION,
+        "indirect blob header version"
+    );
+    let payload_len = u32::from_le_bytes(raw[12..16].try_into().unwrap()) as usize;
+    let stored = u64::from_le_bytes(
+        raw[INDIRECT_SUM_OFF..INDIRECT_SUM_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let mut hdr = raw[..INDIRECT_HDR_LEN].to_vec();
+    hdr[INDIRECT_SUM_OFF..INDIRECT_SUM_OFF + 8].fill(0);
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    h.update(&hdr);
+    h.update(&raw[INDIRECT_HDR_LEN..INDIRECT_HDR_LEN + payload_len]);
+    assert_eq!(h.digest(), stored, "indirect blob digest");
+    bincode::deserialize(&raw[INDIRECT_HDR_LEN..INDIRECT_HDR_LEN + payload_len])
+        .expect("v2 payload is bincode Vec<(u32, String)>")
+}
 
 /// Format (or reopen) one v3 metadata volume with 64 KiB nodes.
 async fn open_v3_meta(path: &std::path::Path, len: u64, format: bool) -> Arc<KvMetaBackend> {
@@ -549,16 +598,14 @@ async fn test_spill_roundtrip_preserves_prefixed_keys_and_versioned_header() {
         .await
         .expect("read indirect block");
     assert!(
-        raw.len() >= 12 && &raw[..8] == INDIRECT_MAGIC,
+        raw.len() >= INDIRECT_HDR_LEN && &raw[..8] == INDIRECT_MAGIC,
         "indirect blob must start with the {} magic (got first bytes {:02x?}) — \
          unversioned blobs can never be format-evolved without a break",
         String::from_utf8_lossy(INDIRECT_MAGIC),
         &raw[..raw.len().min(12)]
     );
-    let version = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
-    assert_eq!(version, INDIRECT_VERSION, "indirect blob header version");
-    let entries: Vec<(u32, String)> =
-        bincode::deserialize(&raw[12..]).expect("indirect payload is bincode Vec<(u32, String)>");
+    // DUR-6: the on-disk image is the CHECKSUMMED v2 shape.
+    let entries: Vec<(u32, String)> = v2_decode(&raw);
     assert_eq!(entries.len(), expect.len(), "blob holds every entry");
     for (b, key) in &entries {
         assert_eq!(
@@ -930,15 +977,8 @@ async fn dur6_a_torn_indirect_blob_refuses_instead_of_decoding_wrong_keys() {
     let entries_new: Vec<(u32, String)> = (0..400u32)
         .map(|i| (i, format!("{:010}", 2_000_000 + i as u64)))
         .collect();
-    let mk = |entries: &Vec<(u32, String)>| {
-        let mut blob = Vec::new();
-        blob.extend_from_slice(INDIRECT_MAGIC);
-        blob.extend_from_slice(&INDIRECT_VERSION.to_le_bytes());
-        blob.extend_from_slice(&bincode::serialize(entries).unwrap());
-        blob
-    };
-    let old = mk(&entries_old);
-    let new = mk(&entries_new);
+    let old = v2_blob(&entries_old);
+    let new = v2_blob(&entries_new);
     assert_eq!(
         old.len(),
         new.len(),
@@ -1057,6 +1097,9 @@ async fn dur6_indirect_publish_is_cow_and_frees_the_predecessor() {
          map, not just the new one (spec DUR-6 §1: the only non-CoW mutation in the \
          metadata plane)"
     );
+    // Terminal frees queue their device reclaim (`block_reclaim`), so
+    // drain before counting.
+    router.backend_router.reclaim_drain().await;
     assert_eq!(
         router.backend_router.default_allocator.get_used_blocks(),
         used_after_first,
@@ -1123,4 +1166,38 @@ async fn dur6_the_blob_is_barriered_before_the_layout_names_it() {
          device (spec DUR-6 §3: durable metadata naming volatile data)"
     );
     squeezefs::dev_power_cut::clear_faults();
+}
+
+/// The retired v1 image (no digest) must still REHYDRATE: DUR-6 bumped the
+/// written version without an incompat bit, so any volume carrying a v1
+/// blob from an older binary keeps mounting and reading. Its successor
+/// publish rewrites it at v2 (CoW), which is how a fleet migrates without
+/// a reformat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dur6_legacy_v1_blobs_still_rehydrate() {
+    let _serial = serial().await;
+    let _ = env_logger::builder().is_test(true).try_init();
+    let (router, routed, _dlm, _b, _m, _s) = crafted_blob_harness("imap_v1compat").await;
+
+    let entries: Vec<(u32, String)> = vec![
+        (0, "0".to_string()),
+        (1, CHUNK.to_string()),
+        (2, format!("other_vol://{}", 2 * CHUNK)),
+    ];
+    let mut blob = Vec::new();
+    blob.extend_from_slice(INDIRECT_MAGIC);
+    blob.extend_from_slice(&INDIRECT_VERSION_V1.to_le_bytes());
+    blob.extend_from_slice(&bincode::serialize(&entries).unwrap());
+
+    let meta = fetch_with_planted_blob(&router, &routed, "legacy_v1.bin", blob)
+        .await
+        .expect("a v1 indirect blob must still rehydrate (no incompat bit was spent)");
+    let map = meta.block_map.expect("rehydrated map");
+    for (idx, key) in &entries {
+        assert_eq!(
+            map.get(idx).map(String::as_str),
+            Some(key.as_str()),
+            "v1 entry {idx} must rehydrate verbatim"
+        );
+    }
 }

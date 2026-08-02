@@ -867,10 +867,32 @@ fn lost_staged_range_len(meta_size: u64, offset: u64, size: u32) -> usize {
 /// the SAME backend-true key strings the inline map persists
 /// ([`BackendRouter::persist_block_key`] output, verbatim — bare offset on
 /// the default slot, `name://offset` elsewhere). The header exists so the
-/// NEXT encoding change is a version bump, not a format break.
+/// NEXT encoding change is a version bump, not a format break — which is
+/// exactly what **DUR-6** spends:
+///
+/// * **v1** (read-only now): `magic(8) | version(4)` + bare bincode. No
+///   digest. Old and new images share a header and entry offsets are
+///   stable across rewrites, so a tear at a sector boundary deserializes
+///   cleanly into a plausible map with WRONG block keys — the only
+///   silent-corruption path in the metadata plane. Still decoded so
+///   volumes carrying v1 blobs keep mounting; never written again.
+/// * **v2** (written): `magic(8) | version(4) | payload_len(4) |
+///   xxh3_64(8)` + bincode. The digest covers the header (with its own
+///   field zeroed) AND the payload, so a torn or misdirected image fails
+///   LOUD instead of decoding. Trailing 4 KiB padding is excluded by
+///   `payload_len` — the blob is written block-aligned and read back
+///   whole-block.
+///
+/// A pre-DUR-6 binary reading a v2 blob refuses loud on the version gate
+/// (never a silent misread) — the forward-only posture, same as every
+/// other format bump in this tree.
 const INDIRECT_MAP_MAGIC: [u8; 8] = *b"SQFSIMAP";
-const INDIRECT_MAP_VERSION: u32 = 1;
-const INDIRECT_MAP_HEADER_LEN: usize = 12;
+const INDIRECT_MAP_VERSION_V1: u32 = 1;
+const INDIRECT_MAP_VERSION: u32 = 2;
+const INDIRECT_MAP_HEADER_LEN_V1: usize = 12;
+const INDIRECT_MAP_HEADER_LEN: usize = 24;
+/// Offset of the v2 digest inside the header.
+const INDIRECT_MAP_SUM_OFF: usize = 16;
 
 /// Serialize a block map for its indirect spill block (see
 /// [`INDIRECT_MAP_MAGIC`]). Entries are sorted by block index for
@@ -878,7 +900,7 @@ const INDIRECT_MAP_HEADER_LEN: usize = 12;
 /// `Vec<(u32, u64)>` bare offsets, which lost the owning backend: on
 /// multi-volume mounts every over-spill file's non-first-volume blocks were
 /// read/freed from the wrong device after rehydrate (the 8380049 residual).
-fn encode_indirect_block_map(
+pub fn encode_indirect_block_map(
     block_map: &std::collections::HashMap<u32, String>,
 ) -> Result<Vec<u8>> {
     let mut entries: Vec<(u32, &str)> = block_map
@@ -892,10 +914,20 @@ fn encode_indirect_block_map(
             format!("Failed to serialize indirect block map: {:?}", e),
         ))
     })?;
+    let payload_len = u32::try_from(payload.len()).map_err(|_| {
+        SqueezefsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("indirect block map payload {} B exceeds u32", payload.len()),
+        ))
+    })?;
     let mut out = Vec::with_capacity(INDIRECT_MAP_HEADER_LEN + payload.len());
     out.extend_from_slice(&INDIRECT_MAP_MAGIC);
     out.extend_from_slice(&INDIRECT_MAP_VERSION.to_le_bytes());
+    out.extend_from_slice(&payload_len.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes()); // digest placeholder
     out.extend_from_slice(&payload);
+    let sum = xxhash_rust::xxh3::xxh3_64(&out[..INDIRECT_MAP_HEADER_LEN + payload.len()]);
+    out[INDIRECT_MAP_SUM_OFF..INDIRECT_MAP_SUM_OFF + 8].copy_from_slice(&sum.to_le_bytes());
     Ok(out)
 }
 
@@ -907,8 +939,8 @@ fn encode_indirect_block_map(
 /// rehydrating bare keys is exactly the wrong-device corruption this format
 /// bump retired, and there is no fleet to stay compatible with (always
 /// forward).
-pub(crate) fn decode_indirect_block_map(raw: &[u8]) -> Result<Vec<(u32, String)>> {
-    if raw.len() < INDIRECT_MAP_HEADER_LEN || raw[..8] != INDIRECT_MAP_MAGIC {
+pub fn decode_indirect_block_map(raw: &[u8]) -> Result<Vec<(u32, String)>> {
+    if raw.len() < INDIRECT_MAP_HEADER_LEN_V1 || raw[..8] != INDIRECT_MAP_MAGIC {
         return Err(SqueezefsError::IndirectMapFormat {
             detail: format!(
                 "missing {} header; first bytes {:02x?}",
@@ -918,14 +950,62 @@ pub(crate) fn decode_indirect_block_map(raw: &[u8]) -> Result<Vec<(u32, String)>
         });
     }
     let version = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
-    if version != INDIRECT_MAP_VERSION {
-        return Err(SqueezefsError::IndirectMapFormat {
-            detail: format!(
-                "unsupported version {version} (this build reads version {INDIRECT_MAP_VERSION})"
-            ),
-        });
-    }
-    bincode::deserialize::<Vec<(u32, String)>>(&raw[INDIRECT_MAP_HEADER_LEN..]).map_err(|e| {
+    let payload = match version {
+        // v1: no digest — read-only legacy (DUR-6). A torn v1 image can
+        // still decode into a plausible map; nothing can be done about
+        // that after the fact, which is why v2 exists and why every
+        // publish rewrites the blob CoW at v2.
+        INDIRECT_MAP_VERSION_V1 => &raw[INDIRECT_MAP_HEADER_LEN_V1..],
+        INDIRECT_MAP_VERSION => {
+            if raw.len() < INDIRECT_MAP_HEADER_LEN {
+                return Err(SqueezefsError::IndirectMapFormat {
+                    detail: format!("short version-2 header ({} B)", raw.len()),
+                });
+            }
+            let payload_len = u32::from_le_bytes(raw[12..16].try_into().expect("4 bytes")) as usize;
+            let end = INDIRECT_MAP_HEADER_LEN
+                .checked_add(payload_len)
+                .filter(|end| *end <= raw.len())
+                .ok_or_else(|| SqueezefsError::IndirectMapFormat {
+                    detail: format!(
+                        "version-2 payload length {payload_len} exceeds the {} B image",
+                        raw.len()
+                    ),
+                })?;
+            let stored = u64::from_le_bytes(
+                raw[INDIRECT_MAP_SUM_OFF..INDIRECT_MAP_SUM_OFF + 8]
+                    .try_into()
+                    .expect("8 bytes"),
+            );
+            // Digest over header (own field zeroed) + payload.
+            let mut hdr = [0u8; INDIRECT_MAP_HEADER_LEN];
+            hdr.copy_from_slice(&raw[..INDIRECT_MAP_HEADER_LEN]);
+            hdr[INDIRECT_MAP_SUM_OFF..INDIRECT_MAP_SUM_OFF + 8].fill(0);
+            let mut h = xxhash_rust::xxh3::Xxh3::new();
+            h.update(&hdr);
+            h.update(&raw[INDIRECT_MAP_HEADER_LEN..end]);
+            let computed = h.digest();
+            if computed != stored {
+                return Err(SqueezefsError::IndirectMapFormat {
+                    detail: format!(
+                        "checksum mismatch: stored {stored:#018x}, computed {computed:#018x} \
+                         — the blob is torn or misdirected (a same-shape predecessor tail \
+                         would otherwise decode cleanly into WRONG block keys)"
+                    ),
+                });
+            }
+            &raw[INDIRECT_MAP_HEADER_LEN..end]
+        }
+        other => {
+            return Err(SqueezefsError::IndirectMapFormat {
+                detail: format!(
+                    "unsupported version {other} (this build reads versions \
+                     {INDIRECT_MAP_VERSION_V1}..={INDIRECT_MAP_VERSION})"
+                ),
+            })
+        }
+    };
+    bincode::deserialize::<Vec<(u32, String)>>(payload).map_err(|e| {
         SqueezefsError::IndirectMapFormat {
             detail: format!("undecodable version-{version} payload: {e:?}"),
         }
@@ -3717,6 +3797,9 @@ impl DataRouter {
         // the layout naming it (the guard drops at function end).
         let t_blob = std::time::Instant::now();
         let mut _blob_inflight: Option<crate::block_allocator::InflightAllocGuard> = None;
+        // DUR-6: the CoW blob's mint guard — armed at allocate, disarmed
+        // once the layout commit below names it (custody transfer).
+        let mut blob_minted: Option<crate::assembly_tasks::MintedBlockGuard> = None;
         let bytes = if needs_indirect {
             let bm = m.block_map.as_ref().unwrap();
             // Backend-true spill (versioned v1 blob): the SAME key strings
@@ -3747,48 +3830,41 @@ impl DataRouter {
             let aligned_len = (serialized_map.len() + 4095) & !4095;
             serialized_map.resize(aligned_len, 0);
 
-            // Allocate or reuse indirect block offset
-            let mut reuse_info = None;
+            // **DUR-6 §1 — the blob is COPY-ON-WRITE.** Every publish
+            // allocates a FRESH block; the predecessor is freed only after
+            // the layout commit below stopped naming it (the
+            // `old_indirect_to_free` tail). The retired arm rewrote the
+            // currently-referenced blob in place — the only non-CoW
+            // mutation in the metadata plane — so a torn write destroyed
+            // the COMMITTED map, not just the new one. As a side effect
+            // the VL4 relocation special case disappears: a blob on a
+            // Draining/Retired volume relocates by construction, because
+            // every publish relocates.
             if let Some(ref map_id) = m.block_map_id {
-                if map_id.starts_with("indirect:") {
-                    let old_block_key = map_id.strip_prefix("indirect:").unwrap();
-                    if let Ok((be_id, off)) = self.backend_router.parse_block_key(old_block_key) {
-                        reuse_info = Some((be_id, off));
-                    }
+                if let Some(old_block_key) = map_id.strip_prefix("indirect:") {
+                    old_indirect_to_free = Some(old_block_key.to_string());
                 }
             }
-
-            // VL4 (§5.4): an indirect blob may only be rewritten IN PLACE
-            // on a placement-eligible volume. A blob living on a
-            // Draining/Retired volume relocates to a fresh allocation (and
-            // the old blob block is freed after the layout commit) — this
-            // is how the mover's empty-merge "blob relocation" tasks and
-            // every ordinary merge on a draining set migrate the map block
-            // itself off the victim.
-            let reuse_info = reuse_info.filter(|(be, _)| {
-                self.backend_router
-                    .volume_state_for_key_backend(be)
-                    .is_none_or(|state| state == crate::VOL_STATE_ACTIVE)
-            });
-            let (be_id, offset, nvme_writer) = if let Some((be, off)) = reuse_info {
-                let (_, dev) = self.backend_router.get_backend(&be)?;
-                (be, off, dev)
-            } else {
-                if let Some(ref map_id) = m.block_map_id {
-                    if let Some(old_block_key) = map_id.strip_prefix("indirect:") {
-                        old_indirect_to_free = Some(old_block_key.to_string());
-                    }
-                }
-                let (be, block_allocator, dev) = self.backend_router.get_active_backend()?;
-                let off = block_allocator.allocate_block().await?;
-                _blob_inflight = Some(block_allocator.inflight_register(off));
-                (be, off, dev)
-            };
+            let (be_id, block_allocator, nvme_writer) = self.backend_router.get_active_backend()?;
+            let offset = block_allocator.allocate_block().await?;
+            _blob_inflight = Some(block_allocator.inflight_register(offset));
+            // RES-9 mint guard: any `?` between here and the layout commit
+            // frees the fresh blob instead of leaking an allocated block
+            // that no map will ever name.
+            blob_minted = Some(crate::assembly_tasks::MintedBlockGuard::new(
+                block_allocator.clone(),
+                offset,
+            ));
 
             let block_key = self.backend_router.persist_block_key(&be_id, offset);
             let data_bytes = bytes::Bytes::from(serialized_map);
             let blob_len = data_bytes.len() as u64;
             nvme_writer.write_block(offset, data_bytes).await?;
+            // **DUR-6 §3 — barrier before the naming commit.** The device
+            // write above is volatile until its cache is flushed (DUR-2);
+            // committing the layout first would name a blob whose bytes
+            // can vanish on power loss.
+            nvme_writer.flush().await?;
 
             layout.block_map = None;
             layout.block_map_id = Some(format!("indirect:{}", block_key));
@@ -3854,6 +3930,10 @@ impl DataRouter {
             backend.set_layout_and_size(ino, &bytes, m.size).await?;
             false
         };
+        // DUR-6: the commit named the fresh blob — custody transferred.
+        if let Some(mut guard) = blob_minted.take() {
+            guard.disarm();
+        }
         if is_publish {
             publish_phase_record(PublishPhase::MetaCommit, t_commit);
             // The full-save decision ledger (2026-08-01): why a

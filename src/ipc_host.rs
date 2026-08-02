@@ -199,6 +199,27 @@ pub fn service_thread_ceiling_from(env: Option<&str>, cpus: usize) -> usize {
         .unwrap_or_else(|| squeezefs_ipc::sizing::il_sessions_default(cpus))
 }
 
+/// VAL-5d: the concurrent ctl-thread (= live connection) bound, DERIVED
+/// from the session budget rather than picked (AGENTS.md: resource caps
+/// derive from system resources).
+///
+/// A connection exists to become a session, and the R5-derived
+/// `arena_cap_bytes` already says how many sessions this host can ever
+/// admit: `arena_cap_bytes / session footprint`. Doubling that leaves
+/// room for the honest concurrent shapes — a handshake in flight while
+/// every admitted session holds its own connection — plus the ADMIN lane.
+///
+/// * floor 32: the ADMIN lane plus a small handshake burst must work even
+///   on a host whose arena budget admits one session (a shed-to-zero
+///   mount still has to be administrable);
+/// * rail 4096: every ctl connection is an OS thread, so a pathological
+///   env-set arena cap must not turn into thread exhaustion (the same
+///   rail-the-derivation pattern `SeveredPool::new` uses on its queue).
+fn ctl_conn_cap_from(arena_cap_bytes: u64, session_footprint: u64) -> usize {
+    let sessions = arena_cap_bytes / session_footprint.max(1);
+    (sessions.saturating_mul(2).clamp(32, 4096)) as usize
+}
+
 /// Host configuration (mount-time; tests construct directly).
 #[derive(Debug, Clone)]
 pub struct IpcHostConfig {
@@ -1059,6 +1080,12 @@ pub struct IpcHost {
     /// against a connect storm) and decremented by the connection's own
     /// exit guard.
     ctl_live: std::sync::atomic::AtomicUsize,
+    /// VAL-5d: the derived concurrent-connection bound
+    /// ([`ctl_conn_cap_from`]), resolved once at spawn.
+    ctl_cap: usize,
+    /// One loud line per cap episode, not per refused connect (a storm
+    /// must not turn the log into the DoS).
+    ctl_cap_logged: AtomicBool,
     /// The severed-write buffer recycle pool (one per host; every
     /// session's mapping holds an `Arc` conduit).
     severed_pool: Arc<SeveredPool>,
@@ -1098,6 +1125,12 @@ impl IpcHost {
         let service_threads = service_thread_count();
         let cfg_max_op_bytes = cfg.geometry.max_op_bytes;
         let cfg_arena_cap_bytes = cfg.arena_cap_bytes;
+        // VAL-5d: the connection bound rides the SAME session-footprint
+        // arithmetic admission uses.
+        let session_footprint = SessionLayout::compute(&cfg.geometry)
+            .expect("geometry validated above")
+            .total_bytes;
+        let ctl_cap = ctl_conn_cap_from(cfg_arena_cap_bytes, session_footprint);
         let host = Arc::new(Self {
             cfg,
             sink,
@@ -1122,6 +1155,8 @@ impl IpcHost {
             shutting_down: AtomicBool::new(false),
             threads: Mutex::new(Vec::new()),
             ctl_live: std::sync::atomic::AtomicUsize::new(0),
+            ctl_cap,
+            ctl_cap_logged: AtomicBool::new(false),
             severed_pool: Arc::new(SeveredPool::new(cfg_max_op_bytes, cfg_arena_cap_bytes)),
         });
         // Spawn-on-bind (ingest-economy 2026-07-28): the gauge reports
@@ -1229,6 +1264,22 @@ impl IpcHost {
     /// and not yet exited, admin and data plane alike).
     pub fn ctl_conns_live(&self) -> usize {
         self.ctl_live.load(Ordering::Relaxed)
+    }
+
+    /// The derived concurrent ctl-connection bound (VAL-5d) — the
+    /// admission ceiling the accept loop enforces.
+    pub fn ctl_conn_cap(&self) -> usize {
+        self.ctl_cap
+    }
+
+    /// `JoinHandle`s the host still retains (VAL-5d): the accept loop
+    /// prunes finished ones, so this stays bounded by the live thread
+    /// population instead of counting every connection ever accepted.
+    pub fn retained_thread_handles(&self) -> usize {
+        self.threads
+            .lock()
+            .expect("thread registry mutex never poisons")
+            .len()
     }
 
     /// Live session-shm bytes (the R5 component gauge source).

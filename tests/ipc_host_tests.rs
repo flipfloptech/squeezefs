@@ -2041,3 +2041,88 @@ fn honest_in_flight_up_to_the_slot_count_never_poisons() {
     sink.held.lock().expect("parked completions").clear();
     host.shutdown();
 }
+
+/// VAL-5d: `accept4` spawned an unbounded OS thread per connection —
+/// before ANY validation — and `self.threads` was push-only: one
+/// `JoinHandle` retained per connection ever accepted. Any process in the
+/// namespace could therefore turn `connect(2)` into daemon thread (and
+/// memory) exhaustion, with the removal pattern sitting 160 lines away
+/// (`admin_conns` already used `retain`).
+#[test]
+fn a_connect_storm_is_capped_at_the_derived_ctl_conn_bound() {
+    let (host, cfg) = spawn_host("conn-storm");
+    let mf = mount_file();
+    host.set_expected_st_dev(mf.st_dev);
+    let cap = host.ctl_conn_cap();
+    assert!(cap >= 32, "the floor keeps the ADMIN lane usable: {cap}");
+
+    // Silent connections, well past the bound: none of them validate,
+    // none of them will ever be a session.
+    let storm: Vec<UnixStream> = (0..cap + 16)
+        .filter_map(|_| abstract_connect(&cfg.socket_name).ok())
+        .collect();
+    assert!(storm.len() > cap, "the test must actually exceed the cap");
+
+    // The bound holds while the storm is connected.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let live = host.ctl_conns_live();
+        assert!(
+            live <= cap,
+            "VAL-5d: {live} concurrent ctl threads past the derived cap of {cap}"
+        );
+        if live >= cap || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // And the over-cap connections are refused promptly (loud, not
+    // silently parked): the last one must hear something back.
+    let last = storm.last().expect("storm is non-empty");
+    set_recv_timeout(last, Duration::from_secs(5));
+    match recv_ctl(last) {
+        Ok((CtlMsg::Refuse { class }, _)) => {
+            assert_eq!(class, RefuseClass::Budget, "over-cap refusal class")
+        }
+        Ok((other, _)) => panic!("expected a Budget refusal, got {other:?}"),
+        Err(e) => assert!(
+            e.kind() == std::io::ErrorKind::UnexpectedEof
+                || e.kind() == std::io::ErrorKind::ConnectionReset,
+            "over-cap connections are refused or closed, got {e:?}"
+        ),
+    }
+    drop(storm);
+    host.shutdown();
+}
+
+/// VAL-5d: finished ctl threads must not accumulate `JoinHandle`s. Each
+/// accept prunes the finished ones (`retain(|h| !h.is_finished())`), so a
+/// long-lived mount serving thousands of short client sessions keeps a
+/// handle vector sized by LIVE threads, not by history.
+#[test]
+fn finished_ctl_threads_do_not_accumulate_join_handles() {
+    let (host, cfg) = spawn_host("handle-reap");
+    let mf = mount_file();
+    host.set_expected_st_dev(mf.st_dev);
+    let baseline = host.retained_thread_handles();
+
+    for _ in 0..150 {
+        let sock = abstract_connect(&cfg.socket_name).expect("connect");
+        drop(sock); // immediate EOF: the ctl thread exits at once
+    }
+    // Give the last accepts a moment to run their prune pass.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut retained = host.retained_thread_handles();
+    while retained > baseline + 32 && Instant::now() < deadline {
+        // One more accept drives the prune (it happens per accept).
+        drop(abstract_connect(&cfg.socket_name).expect("connect"));
+        std::thread::sleep(Duration::from_millis(10));
+        retained = host.retained_thread_handles();
+    }
+    assert!(
+        retained <= baseline + 32,
+        "VAL-5d: {retained} JoinHandles retained after 150 short connections \
+         (baseline {baseline}) — the registry is push-only"
+    );
+    host.shutdown();
+}

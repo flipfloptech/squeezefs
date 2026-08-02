@@ -138,6 +138,22 @@ async fn create_in(h: &H, parent: u64, name: &str) -> u64 {
     ino
 }
 
+/// Leave a DENTRY whose inode record is gone — the shape a torn or
+/// partially-completed reclaim leaves behind, and the only way a
+/// `getattr` on a listed child legitimately fails. `destroy_inodes`
+/// refuses a linked inode, so the nlink is dropped first through the
+/// backend's own adjustment path (the dentry is untouched by both).
+async fn orphan_the_dentry(h: &H, ino: u64) {
+    let guards: std::sync::Arc<[squeezefs::meta_backend::dlm::DlmGuard]> =
+        std::sync::Arc::from(Vec::new());
+    h.be.volumes[0]
+        .routed_nlink_adjust(ino, -1, false, guards)
+        .await
+        .expect("drop the link count");
+    h.be.destroy_inodes(&[ino]).await.expect("destroy inode");
+    h.fs.attr_cache.invalidate(&ino);
+}
+
 async fn readdir_names(h: &H, dir: u64) -> HashSet<String> {
     let reply = h.fs.readdir(h.req, dir, 0, 0).await.expect("readdir");
     reply
@@ -181,8 +197,7 @@ async fn readdirplus_reports_entries_whose_getattr_fails() {
     let broken = create_in(&h, dir, "broken.txt").await;
 
     // Destroy the child's INODE record, leaving its dentry in place.
-    h.be.destroy_inodes(&[broken]).await.expect("destroy inode");
-    h.fs.attr_cache.invalidate(&broken);
+    orphan_the_dentry(&h, broken).await;
 
     let plain = readdir_names(&h, dir).await;
     let plus = readdirplus_names(&h, dir).await;
@@ -195,7 +210,10 @@ async fn readdirplus_reports_entries_whose_getattr_fails() {
         "POSIX-9: readdirplus must name exactly what readdir names — a \
          dropped entry is the `rm -rf` ENOTEMPTY trap"
     );
-    assert!(plus.contains("good.txt"), "the healthy sibling is still listed");
+    assert!(
+        plus.contains("good.txt"),
+        "the healthy sibling is still listed"
+    );
     let _ = good;
 }
 
@@ -212,8 +230,11 @@ async fn a_placeholder_readdirplus_entry_is_never_cacheable() {
             .attr
             .ino;
     let broken = create_in(&h, dir, "gone.txt").await;
-    h.be.destroy_inodes(&[broken]).await.expect("destroy inode");
-    h.fs.attr_cache.invalidate(&broken);
+    orphan_the_dentry(&h, broken).await;
+    assert!(
+        h.be.getattr(broken).await.is_err(),
+        "the harness must actually break the child's getattr"
+    );
 
     let reply =
         h.fs.readdirplus(h.req, dir, 0, 0, 0)
@@ -347,4 +368,34 @@ async fn the_writeback_latch_is_per_inode() {
         libc::c_int::from(h.fs.fsync(h.req, a, 0, false).await.unwrap_err()),
         -libc::EIO
     );
+}
+
+// ---------------------------------------------------------------------------
+// POSIX-18 — PATH_MAX counts the NUL.
+// ---------------------------------------------------------------------------
+
+/// A 4096-byte symlink target cannot round-trip through any `PATH_MAX`
+/// buffer: `readlink` into `char buf[PATH_MAX]` truncates it and
+/// resolving it is ENAMETOOLONG. 4095 is the longest usable target, so
+/// 4096 must be refused at creation (ext4/xfs do), not stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn symlink_targets_stop_one_byte_below_path_max() {
+    let h = make("posix18").await;
+
+    let longest = "a".repeat(4095);
+    h.fs.symlink(h.req, 1, OsStr::new("p18-ok"), OsStr::new(longest.as_str()))
+        .await
+        .expect("4095 bytes is the longest legal target");
+
+    let too_long = "a".repeat(4096);
+    let err =
+        h.fs.symlink(
+            h.req,
+            1,
+            OsStr::new("p18-toolong"),
+            OsStr::new(too_long.as_str()),
+        )
+        .await
+        .expect_err("4096 bytes leaves no room for the NUL");
+    assert_eq!(libc::c_int::from(err), -libc::ENAMETOOLONG);
 }

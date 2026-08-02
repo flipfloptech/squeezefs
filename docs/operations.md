@@ -9,6 +9,11 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
   - [Metadata Durability (crash contract)](#metadata-durability-crash-contract)
   - [Single-writer mount guard (guarantee classes)](#single-writer-mount-guard-guarantee-classes)
   - [Format v3 (CoW KV metadata)](#format-v3-cow-kv-metadata)
+- [POSIX semantics — declared deviations](#posix-semantics--declared-deviations)
+  - [`fallocate(mode = 0)` does not reserve space](#fallocatemode--0--posix_fallocate-does-not-reserve-space-posix-12)
+  - [`noatime` is the only atime policy](#noatime-is-the-only-atime-policy--the-tool-classes-that-notice-posix-17)
+  - [Rename-overwrite leaves a crash-window orphan](#rename-overwrite-leaves-a-crash-window-orphan-posix-15)
+  - [Writable shared `mmap` and interception](#writable-shared-mmap-and-interception-posix-7)
 - [Breaking changes & migration notes](#breaking-changes--migration-notes)
 - [Removed verbs & flags](#removed-verbs--flags)
 - [Configuration reference](#configuration-reference)
@@ -132,6 +137,88 @@ Capacity/scale: ≥ 100 M inodes per volume, 1 M+ entries per directory, unlimit
 
 > **Legacy format v2**: support was removed entirely (always forward — no backwards compatibility). A v2 superblock refuses to mount with a precise "no longer supported; reformat required" error; `squeezefs format --force` reformats such a volume to v3 (destroying the old contents). The offline `squeezefs migrate` v2→v3 converter was deleted along with v2 support.
 
+## POSIX semantics — declared deviations
+
+Everything here is behavior an application can observe and a conformance
+suite can measure. It is DECLARED, not accidental: each entry names what
+POSIX/Linux would do, what SqueezeFS does, and what it costs you. (The
+pre-RC audit's POSIX board — `docs/pre-rc-engineering-spec.md` §5 — is
+the source; items not listed here were fixed rather than declared.)
+
+### `fallocate(mode = 0)` / `posix_fallocate` does not reserve space (POSIX-12)
+
+A successful `posix_fallocate()` promises that the subsequent writes into
+that range will not fail with `ENOSPC`. SqueezeFS **extends the file's
+size and reserves nothing**: the striped backend is thin — blocks are
+allocated at write time — so a later write into the "preallocated" range
+can still return `ENOSPC` if the volume filled in between. Databases and
+media writers that preallocate for this guarantee (PostgreSQL WAL,
+SQLite, `ffmpeg`) get the size, not the guarantee.
+
+Rationale: honoring it means a real reservation ledger — allocator space
+held against an inode, surviving crashes and unlink, and subtracted from
+`statfs` free — which is a feature, not a flag. Until it exists the
+honest posture is a declared deviation rather than a silent one. (This
+is a different statement from the thin-provisioning reporting
+adjudication of fstests generic/213: that one is about what `df`
+reports, this one is about what `fallocate` promises.)
+
+Operationally: size your volumes with headroom, and treat `ENOSPC` on a
+write into a preallocated range as expected on a full filesystem rather
+than as a bug.
+
+### `noatime` is the only atime policy — the tool classes that notice (POSIX-17)
+
+SqueezeFS never updates access times (mounting `relatime`/`strictatime`
+does not change that; the fstests adjudications for generic/003 and
+generic/192 record it as by-design). `st_atime` therefore tracks the
+inode's other timestamps rather than reads, and every consumer of
+"when was this last READ" silently no-ops. The classes that matter in
+practice:
+
+- **Maildir new-mail detection** — MUAs and `biff`-class notifiers
+  compare `atime` against `mtime` on `new/` to decide "unread mail
+  arrived"; with a frozen atime the heuristic mis-fires (typically
+  reporting new mail forever, or never).
+- **`tmpwatch --atime` / `tmpreaper` / systemd-tmpfiles age policies** —
+  cleanup keyed on access age deletes files that ARE being read. Key
+  those policies on mtime/ctime (`tmpwatch --mtime`) on SqueezeFS
+  filesystems.
+- **`updatedb` / locate freshness heuristics** — index-staleness
+  decisions that consult atime lose their signal (correctness is
+  unaffected; refresh cadence is not).
+- **HSM / tiering agents** (external ones — SqueezeFS's own tiering uses
+  its internal counters, not atime) — "demote what has not been read in
+  N days" demotes hot data. Point such agents at the `.stats` read
+  counters or run them off application-level telemetry.
+- **`find -atime` / `-anewer`, du-style reporting on access age** —
+  return whatever the other timestamps imply, not read history.
+
+### Rename-overwrite leaves a crash-window orphan (POSIX-15)
+
+`rename()` over an existing file unlinks the destination inode, but its
+teardown is deferred to the kernel's FORGET (a still-open replaced file
+must survive to its last close, exactly like `unlink`). A daemon exit
+INSIDE that window — between the rename commit and the FORGET —
+leaves the replaced inode's record and its blocks allocated with no name
+pointing at them, and **there is no mount-time reconciliation sweep**:
+`fsck`'s classes cover node integrity, block/refcount cross-checks,
+staged custody, accounting, and the data scrub, but nothing walks the
+inode tree for unreferenced records. The space is not lost data — it is
+leaked capacity, bounded by how many rename-overwrites were in flight at
+the crash.
+
+### Writable shared `mmap` and interception (POSIX-7)
+
+Within one process the shim handles it: any `MAP_SHARED` mapping unbinds
+every in-process binding on that inode AND poisons it, so the ring is
+never re-armed underneath the mapping (a later `open()` of the same file
+stays kernel-served for the process's lifetime). **Across processes it
+is unsupported and undetectable** — see the interception section's
+"Unsupported mixes": a peer's mapping is invisible to this process's
+shim, and the kernel never tells the daemon about mappings. Run
+mmap-writer workloads without the shim.
+
 ## Breaking changes & migration notes
 
 SqueezeFS moves **always forward** — no backwards compatibility. Refusals are loud, name their cause, and state the remedy. Current refusal classes an operator can hit:
@@ -228,8 +315,8 @@ Opt-in at **both** ends (`docs/design-preload-interception.md`, v1 posture): the
 - **Observability:** `.stats` carries the refusal ledger (`ipc_bind_refused_{version,nonce,flags,mode,budget,peercred}`), lifecycle gauges (`ipc_sessions_{active,total}`, `ipc_arena_bytes`, `ipc_binds`, `ipc_admission_refusals`) and two **must-stay-0 tripwires**: `ipc_descriptor_rejects` and `ipc_sessions_poisoned` — nonzero means a client bug or an attack (one loud log line per event).
 
 **Unsupported mixes (documented contract, not detected):**
-- **Concurrent cross-process `MAP_SHARED` mmap-writers + ring writers on the same file** — page-granularity writeback can clobber ring-written bytes (lost updates). Same-process mmap is handled: the shim unbinds *all* in-process bindings on the mapped inode. Cross-process is declared unsupported; run such workloads without the shim.
-- **Cross-process buffered/mmap readers** can observe a bounded staleness window on ring-written data (same class as attr-TTL staleness); the daemon's `notify_inval_inode` handoff bounds it — fired on bind and rate-limited per `(ino, window)` on ring writes (`SQUEEZEFS_IPC_INVAL_WINDOW_MS`, default 1000; `.stats` `ipc_inval_{notifies,suppressed}`), delivered over the classical sideband even on armed over-uring sessions.
+- **Concurrent cross-process `MAP_SHARED` mmap-writers + ring writers on the same file** — page-granularity writeback can clobber ring-written bytes (lost updates). Same-process mmap is fully handled (POSIX-7): the shim unbinds *all* in-process bindings on the mapped inode AND **poisons** the inode, so a later `open()` of the same file — or an `mmap()` that preceded the first open — can never re-arm the ring underneath a live mapping; that fd stays kernel-served for the process's lifetime (the poison set is fail-safe: if it ever fills, the whole mount degrades to kernel-served rather than forgetting an entry). Cross-process remains declared unsupported — a peer's mapping is invisible to this shim and the kernel never tells the daemon about mappings; run such workloads without the shim.
+- **Cross-process buffered/mmap readers** can observe a bounded staleness window on ring-written data (same class as attr-TTL staleness); the daemon's `notify_inval_inode` handoff bounds it — fired on bind and rate-limited per `(ino, window)` on ring writes (`SQUEEZEFS_IPC_INVAL_WINDOW_MS`, default 1000; `.stats` `ipc_inval_{notifies,suppressed}`), delivered over the classical sideband even on armed over-uring sessions. **Size coherence is exempt from that window (POSIX-8):** a ring write that GROWS the file always fires an attrs-only invalidation (`.stats` `ipc_inval_attrs_only`) — no page-cache work — so `lseek(SEEK_END)` and `stat` never read a stale `i_size` and an append can never land at a stale offset; the last unbind of an inode fires one whole-inode shootdown so nothing the window suppressed outlives the bindings.
 - **Mixed-ABI fd lifecycles**: apps that close *and* recreate fds exclusively through raw `syscall(2)`/io_uring (invisible to the shim) and then issue libc data calls on the reused number are unsupported under the shim (`SQUEEZEFS_IL_PARANOID_FSTAT=1` is the triage knob).
 - **Containers with their own network namespace** *(solved in v1.1 — OQ-6)*: the abstract-socket rendezvous is per-netns, so pre-v1.1 such apps silently stayed on kernel FUSE. Since v1.1 the daemon **also binds a filesystem-path ctl socket** and advertises it in the bootstrap blob; the shim's connect ladder tries abstract first (same-netns fast path), then the path. **Operator contract for container fleets:** bind-mount the socket runtime dir into the container alongside the filesystem — default `/run/squeezefs` (root mounts) or `$XDG_RUNTIME_DIR/squeezefs`, else `/tmp/squeezefs-il-<uid>` (user mounts); override with `SQUEEZEFS_IPC_SOCKET_DIR=<dir>` (`none` disables, restoring the v1 zero-residue posture). The socket file is mode 0666 **because connecting is not a credential** — `SO_PEERCRED` + the daemon fd screen remain the security boundary, identical over both rendezvous. Note the user-mount default under `$XDG_RUNTIME_DIR` is a 0700 dir: other uids cannot reach it (user mounts serve same-uid apps; point `SQUEEZEFS_IPC_SOCKET_DIR` at a shared dir if you need more). A failed path bind degrades loudly to abstract-only and never fails the mount; the file is unlinked at daemon shutdown (zero residue restored), and a same-name stale file from a crash is replaced at the next spawn (names embed pid+random, so a collision is always our own residue).
 

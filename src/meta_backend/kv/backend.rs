@@ -5019,6 +5019,24 @@ impl KvMetaBackend {
                 // through the parent-side decrement.
                 if pv.nlink > 2 {
                     pv.nlink -= dec;
+                } else {
+                    // POSIX-11: the floor SUPPRESSED a real decrement, so
+                    // the parent's link count is permanently one too low
+                    // for the subdirectories it still holds — and `find`'s
+                    // leaf optimization (`nlink == 2` ⇒ "no subdirs")
+                    // then SKIPS them. The guard stays (a count that
+                    // underflows is worse), but a suppression is a
+                    // BUG SIGNAL, never routine: count it and say so.
+                    crate::fuse_client::METRICS
+                        .dir_nlink_underflows
+                        .fetch_add(1, Ordering::Relaxed);
+                    log::warn!(
+                        "directory nlink underflow guard fired on parent {parent}: nlink \
+                         {} cannot absorb a -{dec} parent-side decrement — the count is \
+                         already at/below the floor and the deficit is now permanent \
+                         (POSIX-11; run `squeezefs fsck` on this volume)",
+                        pv.nlink
+                    );
                 }
             }
             std::cmp::Ordering::Equal => {}
@@ -5477,6 +5495,18 @@ impl KvMetaBackend {
             std::cmp::Ordering::Less => {
                 if pv.nlink > 2 {
                     pv.nlink -= (-delta) as u32;
+                } else {
+                    // POSIX-11 (the cross-volume face — same law as
+                    // `stage_parent_update`'s guard).
+                    crate::fuse_client::METRICS
+                        .dir_nlink_underflows
+                        .fetch_add(1, Ordering::Relaxed);
+                    log::warn!(
+                        "directory nlink underflow guard fired on parent {local_parent}: \
+                         nlink {} cannot absorb a {delta} decrement — the deficit is \
+                         permanent (POSIX-11; run `squeezefs fsck` on this volume)",
+                        pv.nlink
+                    );
                 }
             }
             std::cmp::Ordering::Equal => return Ok(()),

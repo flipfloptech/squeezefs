@@ -1135,6 +1135,59 @@ pub fn op_watchdog_tick(threshold: Duration) -> Vec<OverdueOp> {
     overdue
 }
 
+/// **POSIX-16 gatekeeper**: may this writeback failure be LATCHED for
+/// close-time reporting, or does the never-lossy ladder still own it?
+///
+/// The distinction is load-bearing history, not taste. A failed
+/// writeback unit's bytes are SAFE in staging and the ladder retries at
+/// capped backoff **forever** (`requeue_or_hard_fail`), so reporting its
+/// transient error to userspace announces data loss that did not happen
+/// — and did: a sticky per-ino error map turned transient upload
+/// failures into an fsync EIO cascade for durable-safe data
+/// (the multi-volume bench-suite incident recorded on that ladder).
+///
+/// So: everything the ladder heals stays UNREPORTED (the retry is the
+/// answer), and only failures that will never resolve themselves reach
+/// the latch. Superseded/no-op resolutions never get here at all — the
+/// flush unit returns `Ok` for them (FIND-M11-A).
+fn writeback_error_is_terminal(e: &SqueezefsError) -> bool {
+    match e {
+        // Supersession + lease races: the ladder's own healthy churn.
+        SqueezefsError::FencingTokenExpired { .. } | SqueezefsError::LockFailed { .. } => false,
+        // Deadline/backpressure/memory-pressure classes: retried.
+        SqueezefsError::Timeout | SqueezefsError::CacheOverflow => false,
+        SqueezefsError::Io(io) => {
+            !matches!(
+                io.raw_os_error(),
+                // EAGAIN/EWOULDBLOCK (same value), EINTR, ETIMEDOUT, EBUSY:
+                // transient. ENOSPC: staging pressure — the drain frees
+                // space and the unit lands (the FIND-RW5-A never-lossy
+                // StorageFull escalation is exactly this path).
+                Some(libc::EAGAIN)
+                    | Some(libc::EINTR)
+                    | Some(libc::ETIMEDOUT)
+                    | Some(libc::EBUSY)
+                    | Some(libc::ENOSPC)
+            ) && !matches!(
+                io.kind(),
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::StorageFull
+                    | std::io::ErrorKind::ResourceBusy
+            )
+        }
+        // Refusals, corrupt on-disk state, GDS faults, backend loss: no
+        // amount of retrying makes these land.
+        _ => true,
+    }
+}
+
+/// `PATH_MAX` as the kernel defines it — the buffer size INCLUDING the
+/// terminating NUL, so a path/symlink-target STRING is at most
+/// `PATH_MAX - 1` bytes (POSIX-18).
+const PATH_MAX_WITH_NUL: usize = 4096;
+
 /// Watchdog tick cadence (design §5.1 D1.b: "one per-daemon task ticks
 /// every 5 s"). Also the coarse clock's refresh period, so overdue ages
 /// are accurate to ± one tick.
@@ -3143,6 +3196,25 @@ pub struct Metrics {
     pub lease_retry_exhaustions: Align64<AtomicU64>,
     /// Writeback path: durable flush hard failures (sticky).
     pub writeback_retry_exhaustions: Align64<AtomicU64>,
+    /// POSIX-11: directory parent-nlink decrements SUPPRESSED by the
+    /// `nlink > 2` underflow floor. Each one leaves the parent's link
+    /// count permanently one too low for the subdirectories it holds,
+    /// and `find`'s leaf optimization (`nlink == 2` ⇒ no subdirectories)
+    /// then skips real subtrees. **Must stay 0**: growth means a
+    /// mismatched increment/decrement pair upstream — the fsck C-class
+    /// walk is the repair, this counter is the detector.
+    pub dir_nlink_underflows: Align64<AtomicU64>,
+    /// POSIX-16 close-time error reporting: writeback failures LATCHED
+    /// against an inode (the errseq-equivalent). Must stay 0 on a
+    /// healthy mount — growth means close-time data loss is being
+    /// reported to applications (which is the point) and something
+    /// upstream is failing.
+    pub writeback_errors_latched: Align64<AtomicU64>,
+    /// POSIX-16: latched errors CONSUMED by an fsync/flush report. The
+    /// difference `latched - reported` is the set of failures still
+    /// waiting for a reader (an inode nobody fsyncs again keeps its
+    /// latch until unmount).
+    pub writeback_errors_reported: Align64<AtomicU64>,
     /// Writeback units resolved as SUPERSEDED no-ops (staged stamp no
     /// longer matches the unit's token: a newer write re-staged the block
     /// and owns its custody chain). The healthy churn outcome — the
@@ -4497,6 +4569,24 @@ pub struct SqueezefsFilesystem {
     /// stale snapshots die by key mismatch, not by eager moka
     /// invalidation.
     dir_gen: std::sync::Arc<scc::HashMap<u64, std::sync::atomic::AtomicU64>>,
+    /// **POSIX-16** — the per-inode writeback error latch (the kernel's
+    /// `errseq_t` in miniature).
+    ///
+    /// Close-time writeback errors used to reach the application
+    /// NOWHERE: `flush` discarded its flush result and `release`
+    /// discarded three more (memory buffers, active blocks, dirty
+    /// layout), because that work is deliberately backgrounded — "fsync
+    /// is the durable barrier". But a `close()` whose data never landed
+    /// must not report success, and nothing else ever told the caller.
+    ///
+    /// Semantics (spec §5 POSIX-16): the FIRST unreported errno per
+    /// inode is latched and consumed ONCE by the next `fsync`/`flush` on
+    /// ANY fd — the fd-granular errseq the kernel keeps is not
+    /// reconstructible here (`fh == ino`, POSIX-14), and one report is
+    /// strictly better than none. `errors` is the map; `error_count` is
+    /// the zero-cost gate that keeps every clean flush off it.
+    writeback_errors: std::sync::Arc<scc::HashMap<u64, i32>>,
+    writeback_error_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub dismount_wait: u64,
     /// Bounded writeback queue (P1-2). Full → synchronous flush of that block.
     writeback_tx: tokio::sync::mpsc::Sender<WritebackRequest>,
@@ -4675,6 +4765,8 @@ impl Clone for SqueezefsFilesystem {
             lease_locks: self.lease_locks.clone(),
             active_inode_locks: self.active_inode_locks.clone(),
             attr_cache: self.attr_cache.clone(),
+            writeback_errors: self.writeback_errors.clone(),
+            writeback_error_count: self.writeback_error_count.clone(),
             dir_entry_cache_v3: self.dir_entry_cache_v3.clone(),
             parent_memo: self.parent_memo.clone(),
             dir_gen: self.dir_gen.clone(),
@@ -4789,6 +4881,8 @@ impl SqueezefsFilesystem {
             dir_entry_cache_v3,
             parent_memo,
             dir_gen: std::sync::Arc::new(scc::HashMap::new()),
+            writeback_errors: std::sync::Arc::new(scc::HashMap::new()),
+            writeback_error_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dismount_wait: 10,
             writeback_tx,
             writeback_rx: std::sync::Arc::new(std::sync::Mutex::new(Some(writeback_rx))),
@@ -5869,6 +5963,9 @@ impl SqueezefsFilesystem {
                 "lease_retry_waits": METRICS.lease_retry_waits.load(Ordering::Relaxed),
                 "lease_retry_exhaustions": METRICS.lease_retry_exhaustions.load(Ordering::Relaxed),
                 "writeback_retry_exhaustions": METRICS.writeback_retry_exhaustions.load(Ordering::Relaxed),
+                "dir_nlink_underflows": METRICS.dir_nlink_underflows.load(Ordering::Relaxed),
+                "writeback_errors_latched": METRICS.writeback_errors_latched.load(Ordering::Relaxed),
+                "writeback_errors_reported": METRICS.writeback_errors_reported.load(Ordering::Relaxed),
                 "fuse_reserved_xattr_refusals": METRICS.fuse_reserved_xattr_refusals.load(Ordering::Relaxed),
                 "job_submitted": METRICS.job_submitted.load(Ordering::Relaxed),
                 "job_completed": METRICS.job_completed.load(Ordering::Relaxed),
@@ -7445,6 +7542,73 @@ impl SqueezefsFilesystem {
             self.get_or_acquire_lease_bounded(ino, wait)
         })
         .await
+    }
+
+    /// **POSIX-16**: latch a writeback failure against `ino` so the next
+    /// `fsync`/`flush` on any of its fds reports it.
+    ///
+    /// FIRST error wins (the kernel's `errseq_t` discipline: a later,
+    /// possibly-derivative failure must not mask the original cause),
+    /// and success never clears a latched error — only a report does.
+    /// Callers are the paths whose results were previously dropped on
+    /// the floor: the close-time flush, RELEASE's backgrounded flush /
+    /// active-block drain / layout persist.
+    pub fn note_writeback_error(&self, ino: u64, errno: i32) {
+        if ino <= 1 || errno == 0 {
+            return;
+        }
+        // FIRST error wins: `insert_sync` fails when a latch is already
+        // present, and that failure is the "already reported-pending"
+        // signal (no counter bump, no second log line).
+        if self.writeback_errors.insert_sync(ino, errno).is_ok() {
+            self.writeback_error_count.fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .writeback_errors_latched
+                .fetch_add(1, Ordering::Relaxed);
+            error!(
+                "writeback error latched for ino {ino}: errno {errno} — the next \
+                 fsync/flush on this inode reports it (POSIX-16)"
+            );
+        }
+    }
+
+    /// The [`SqueezefsError`] face of [`Self::note_writeback_error`] —
+    /// used where the dropped result is a `Result<_, SqueezefsError>`.
+    /// Transient classes are filtered by
+    /// [`writeback_error_is_terminal`]: latching one is the EIO-cascade
+    /// bug, not the POSIX-16 fix.
+    fn note_writeback_result<T>(&self, ino: u64, r: &Result<T, SqueezefsError>) {
+        if let Err(e) = r {
+            if writeback_error_is_terminal(e) {
+                self.note_writeback_error(ino, e.to_errno());
+            } else {
+                debug!(
+                    "writeback error for ino {ino} is a RETRIED class ({e}) — the bytes are \
+                     safe in staging and the never-lossy ladder owns them; not latched"
+                );
+            }
+        }
+    }
+
+    /// **POSIX-16**: consume `ino`'s latched writeback error, if any.
+    /// Exactly one reporter wins (the `remove_sync` is the arbiter), so
+    /// concurrent `fsync`s never both report the same failure.
+    ///
+    /// The `writeback_error_count` gate keeps the healthy path free: a
+    /// mount that has never failed a writeback pays one relaxed load per
+    /// flush/fsync and never touches the map.
+    pub fn take_writeback_error(&self, ino: u64) -> Option<i32> {
+        if self.writeback_error_count.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let taken = self.writeback_errors.remove_sync(&ino).map(|(_, e)| e);
+        if taken.is_some() {
+            self.writeback_error_count.fetch_sub(1, Ordering::Relaxed);
+            METRICS
+                .writeback_errors_reported
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        taken
     }
 
     /// Drop a locally cached lease (e.g. after `FencingTokenExpired` or lock loss).
@@ -11572,6 +11736,32 @@ impl SqueezefsFilesystem {
                 .has_staged_extent_record(&crate::keys::active_block_ext(ino, b))
     }
 
+    /// POSIX-9: the attrs a `readdirplus` entry carries when its inode
+    /// record cannot be read. Everything here comes from the DENTRY —
+    /// the only thing the directory itself asserts — and the caller
+    /// pairs it with zero TTLs, so nothing is cached and the kernel
+    /// re-`LOOKUP`s the name (which then answers ENOENT or the truth).
+    /// Sizes and times are zero: a placeholder must never look like
+    /// data.
+    fn placeholder_dir_attr(&self, d: &crate::meta_backend::DirEntry) -> FileAttr {
+        let kind = self.mode_to_file_type(d.file_type);
+        FileAttr {
+            ino: d.ino,
+            size: 0,
+            blocks: 0,
+            atime: as_timestamp(0),
+            mtime: as_timestamp(0),
+            ctime: as_timestamp(0),
+            kind,
+            perm: 0,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 4096,
+        }
+    }
+
     fn inode_to_file_attr(&self, inode: &crate::meta_backend::Inode) -> FileAttr {
         FileAttr {
             ino: inode.ino,
@@ -14220,7 +14410,13 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         check_component_name_len(name)?;
-        if link.len() > 4096 {
+        // POSIX-18: `PATH_MAX` (4096) COUNTS THE NUL, so the longest
+        // legal symlink target is 4095 bytes — a 4096-byte target
+        // accepted here cannot round-trip through any `PATH_MAX` buffer
+        // (`readlink` into `char buf[PATH_MAX]` truncates it, and
+        // resolving it is ENAMETOOLONG). Refuse it at creation, like
+        // ext4/xfs, instead of storing a target nothing can use.
+        if link.len() >= PATH_MAX_WITH_NUL {
             return Err(Errno::from(libc::ENAMETOOLONG));
         }
         let name_str = osstr_to_cow(name);
@@ -14466,7 +14662,22 @@ impl Filesystem for SqueezefsFilesystem {
                 // POSIX-4: an overwritten target is unlinked — drop any
                 // parent edge it held.
                 self.parent_memo.invalidate(&d_ino);
-                // Reclaim overwritten target via forget, not here.
+                // POSIX-15: the replaced inode's teardown is deferred to
+                // FORGET (`queue_reclaim_inode`), which is correct while
+                // the daemon lives — a still-open replaced file must
+                // survive until its last close, exactly like unlink.
+                //
+                // HONEST RESIDUAL (verified 2026-08: there is NO
+                // mount-time reconciliation sweep — fsck's classes are
+                // C1 node integrity, C2/C3 block/refcount, C4/C5
+                // staging, C6 accounting, C7 scrub; none walks for
+                // unreferenced INODE records): a daemon exit between
+                // this rename and the FORGET leaves the replaced inode's
+                // record and its blocks allocated with no name pointing
+                // at them, and nothing reclaims them later. Documented
+                // in docs/operations.md (Known deviations); closing it
+                // means an fsck class that walks inodes for zero-nlink
+                // orphans, not a comment.
             }
             Ok(())
         };
@@ -14568,7 +14779,10 @@ impl Filesystem for SqueezefsFilesystem {
             }
             if let Some(d_ino) = dest_ino {
                 self.refresh_attr_cache(d_ino).await;
-                // Overwritten target reclaimed on forget only (not RENAME_EXCHANGE).
+                // Overwritten target reclaimed on forget only (not
+                // RENAME_EXCHANGE) — see the POSIX-15 note in `rename`
+                // for the crash-window residual this leaves and why
+                // there is no mount-time sweep to lean on.
             }
             Ok(())
         };
@@ -14710,14 +14924,25 @@ impl Filesystem for SqueezefsFilesystem {
                     });
                 }
                 for (cookie, d) in page {
-                    let attr = match self.get_attr_internal(d.ino).await {
-                        Ok(a) => a,
+                    // POSIX-9: an entry whose `getattr` fails is still an
+                    // ENTRY. Dropping it made readdirplus disagree with
+                    // readdir about what a directory holds — `rm -rf`
+                    // deletes what its readdir named and then trips
+                    // ENOTEMPTY on the entry readdirplus never mentioned.
+                    // Report it with the dentry's own truth (name, ino,
+                    // type) and ZERO TTLs, so the kernel caches nothing
+                    // and re-`LOOKUP`s the name before anything trusts
+                    // it — the same answer plain readdir gives.
+                    let (attr, cacheable) = match self.get_attr_internal(d.ino).await {
+                        Ok(a) => (a, true),
                         Err(e) => {
                             error!(
-                                "readdirplus failed to get attr for child {}: {:?}",
+                                "readdirplus: attr for child {} unavailable ({:?}) — \
+                                 reporting the entry with placeholder attrs and zero TTLs \
+                                 (POSIX-9: readdir and readdirplus must never disagree)",
                                 d.ino, e
                             );
-                            continue;
+                            (self.placeholder_dir_attr(&d), false)
                         }
                     };
                     // POSIX-4: memoize the parent edge of every
@@ -14725,14 +14950,19 @@ impl Filesystem for SqueezefsFilesystem {
                     if attr.kind == FileType::Directory {
                         self.memoize_parent(d.ino, parent);
                     }
+                    let (entry_ttl, attr_ttl) = if cacheable {
+                        (self.entry_ttl_for(attr.kind), self.kernel_ttls.attr)
+                    } else {
+                        (Duration::ZERO, Duration::ZERO)
+                    };
                     entries.push(DirectoryEntryPlus {
                         name: d.name.into(),
                         kind: attr.kind,
                         inode: d.ino,
                         generation: 1,
                         attr,
-                        entry_ttl: self.entry_ttl_for(attr.kind),
-                        attr_ttl: self.kernel_ttls.attr,
+                        entry_ttl,
+                        attr_ttl,
                         offset: cookie as i64,
                     });
                 }
@@ -14960,9 +15190,16 @@ impl Filesystem for SqueezefsFilesystem {
                 .await
                 .map_err(map_squeezefs_err)?;
 
-            // Update destination attributes size and times in metadata backend
+            // POSIX-10 (the clone fast path's face): the destination was
+            // written, so it owes mtime/ctime, and the commit's error is
+            // the caller's — a swallowed failure acked a clone whose
+            // size never reached the metadata volume.
             if let Some(ref backend) = self.meta_backend {
-                let _ = backend
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or(Duration::ZERO)
+                    .as_nanos() as u64;
+                backend
                     .setattr(
                         inode_out,
                         None,
@@ -14970,10 +15207,11 @@ impl Filesystem for SqueezefsFilesystem {
                         None,
                         Some(src_size),
                         None,
-                        None,
-                        None,
+                        Some(now),
+                        Some(now),
                     )
-                    .await;
+                    .await
+                    .map_err(map_squeezefs_err)?;
             }
 
             self.attr_cache.invalidate(&inode_out);
@@ -15101,10 +15339,18 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_squeezefs_err)?;
         }
 
-        // Update destination size and times in metadata backend
-
+        // POSIX-10: the destination was MODIFIED, so it owes mtime and
+        // ctime like any other write (a copy that leaves the timestamp
+        // alone defeats every staleness check built on it — `make`,
+        // rsync's quick check, backup scanners), and the commit's error
+        // is the caller's business: swallowing it acked a copy whose
+        // size (and now times) never reached the metadata volume.
         if let Some(ref backend) = self.meta_backend {
-            let _ = backend
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_nanos() as u64;
+            backend
                 .setattr(
                     inode_out,
                     None,
@@ -15112,10 +15358,11 @@ impl Filesystem for SqueezefsFilesystem {
                     None,
                     Some(new_dest_size),
                     None,
-                    None,
-                    None,
+                    Some(now),
+                    Some(now),
                 )
-                .await;
+                .await
+                .map_err(map_squeezefs_err)?;
         }
 
         self.attr_cache.invalidate(&inode_out);
@@ -15307,6 +15554,15 @@ impl Filesystem for SqueezefsFilesystem {
         // the durable barrier) and their close-time daemon flush rides
         // RELEASE's background path. The prof still drops → the rig's op
         // count stays exact.
+        // POSIX-16: a latched writeback error outranks the clean-handle
+        // elision. That fast path exists to skip WORK, not to drop the
+        // one report `close(2)` is entitled to — and a background
+        // writeback that failed after the last write is exactly the case
+        // where the handle looks clean. One relaxed load when nothing is
+        // latched (the always case).
+        if let Some(errno) = self.take_writeback_error(ino) {
+            return Err(Errno::from(errno));
+        }
         if !self.handle_dirty(ino) {
             METRICS
                 .fuse_flush_clean_fastpath
@@ -15322,10 +15578,27 @@ impl Filesystem for SqueezefsFilesystem {
 
         // Soft flush path: do not block FUSE flush on MetaLV layout persist or
         // full active-block promotion. sync_all/fsync is the durable barrier.
-        let _ = self
+        //
+        // POSIX-16: the result is no longer DISCARDED — but "report it"
+        // is filtered by the never-lossy law: a transient failure leaves
+        // the bytes safe in staging with the ladder retrying forever, and
+        // announcing EIO for durable-safe data is the recorded cascade
+        // bug. A TERMINAL failure is real close-time data loss and is
+        // reported here, which is the only place `close(2)` can hear it.
+        let flushed = self
             .flush_memory_buffers_for_inode(ino, fencing_token)
             .await;
         prof.mark_backend_done();
+        if let Err(e) = flushed {
+            if writeback_error_is_terminal(&e) {
+                error!("FUSE Flush: terminal writeback failure for ino {ino}: {e:?}");
+                return Err(map_squeezefs_err(e));
+            }
+            debug!(
+                "FUSE Flush: retried-class writeback failure for ino {ino} ({e}) — bytes \
+                 stay staged, the never-lossy ladder owns them"
+            );
+        }
 
         Ok(())
     }
@@ -15366,13 +15639,23 @@ impl Filesystem for SqueezefsFilesystem {
             if let Ok(fencing_token) = self.get_or_acquire_lease(ino).await {
                 let fs = self.clone();
                 crate::bg_admit::spawn_bg(async move {
-                    let _ = fs.flush_memory_buffers_for_inode(ino, fencing_token).await;
-                    let _ = fs.flush_active_blocks_with_retry(ino, fencing_token).await;
+                    // POSIX-16: these three ran with their results
+                    // dropped on the floor — a close whose data never
+                    // landed reported success and the failure reached
+                    // the application nowhere. They stay BACKGROUNDED
+                    // (close must stay cheap; fsync is the durable
+                    // barrier), but each failure now latches against the
+                    // inode for the next fsync/flush to report.
+                    let r = fs.flush_memory_buffers_for_inode(ino, fencing_token).await;
+                    fs.note_writeback_result(ino, &r);
+                    let r = fs.flush_active_blocks_with_retry(ino, fencing_token).await;
+                    fs.note_writeback_result(ino, &r);
                     let file_path = crate::keys::inode_path(ino);
-                    let _ = fs
+                    let r = fs
                         .router
                         .persist_dirty_layout_if_needed(&file_path, fencing_token)
                         .await;
+                    fs.note_writeback_result(ino, &r);
                 });
             }
 
@@ -15381,6 +15664,7 @@ impl Filesystem for SqueezefsFilesystem {
                     "FUSE Release: Failed to complete multipart upload for inode {}: {:?}",
                     ino, e
                 );
+                self.note_writeback_error(ino, e.to_errno());
             }
         }
 
@@ -15415,6 +15699,15 @@ impl Filesystem for SqueezefsFilesystem {
 
         if ino == STATS_INODE || ino == CONFIG_INODE {
             return Ok(());
+        }
+
+        // POSIX-16: report a latched TERMINAL writeback error first —
+        // `fsync` is the contract point for "did everything land?", and
+        // the failure it names happened before this call (a backgrounded
+        // RELEASE flush). Consumed here, so the next fsync is clean.
+        if let Some(errno) = self.take_writeback_error(ino) {
+            error!("FUSE Fsync: reporting latched writeback error for ino {ino}: {errno}");
+            return Err(Errno::from(errno));
         }
 
         // P0-3: durable ops must not mask backend write failures.
@@ -15539,7 +15832,16 @@ impl Filesystem for SqueezefsFilesystem {
             // freshest-size gate inside extend_file_size cannot race a
             // concurrent size change.
             let _guard = self.active_inode_locks.get_inode_lock(ino).write().await;
-            let fencing_token = self.dlm.get_fencing_token_ino(ino);
+            // POSIX-13: the SHARED lease (lock order 2), never a bare
+            // `get_fencing_token_ino` snapshot — the pattern `setattr`
+            // was moved off for the recorded reason. A snapshot is stale
+            // the instant it is read and serializes this size mutation
+            // against nothing; the punch/zero arm above already holds
+            // the lease, and this arm mutates the same size.
+            let fencing_token = self
+                .acquire_write_lease(ino)
+                .await
+                .map_err(map_squeezefs_err)?;
             let target_size = offset + length;
             self.extend_file_size(ino, target_size, fencing_token)
                 .await
@@ -15564,8 +15866,10 @@ impl Filesystem for SqueezefsFilesystem {
     /// BATCH_FORGET (kernel mass evictions: memory pressure, drop_caches,
     /// pre-umount sweeps) must behave exactly like N FORGETs. fuse3's
     /// default impl is a NO-OP — leaving this unimplemented leaked every
-    /// batch-evicted orphan's inode slot until the next mount's
-    /// reconciliation.
+    /// batch-evicted orphan's inode slot for the LIFE OF THE MOUNT.
+    /// (POSIX-15, corrected 2026-08: there is no mount-time
+    /// reconciliation sweep to fall back on — the FORGET path is the
+    /// only reclaimer, which is exactly why losing one matters.)
     async fn batch_forget(&self, _req: Request, inodes: &[u64]) {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE BatchForget: {} inodes", inodes.len());

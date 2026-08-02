@@ -392,7 +392,11 @@ async fn fallocate_extend_takes_the_shared_lease() {
         h.fs.fallocate(h.req, ino, 0, 0, 8192, 0)
             .await
             .expect_err("the extend arm must not proceed on a bare token snapshot");
-    assert_eq!(libc::c_int::from(err), -libc::EIO, "fallocate extend: {err}");
+    assert_eq!(
+        libc::c_int::from(err),
+        -libc::EIO,
+        "fallocate extend: {err}"
+    );
     assert!(
         exhaustions() > before,
         "the extend arm must go through the shared lease ladder"

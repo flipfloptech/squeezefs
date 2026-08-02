@@ -2666,6 +2666,23 @@ pub struct Metrics {
     /// instead of invalidated, so the kernel's forced revalidation GETATTR
     /// is a ~µs cache hit rather than a contended backend fetch.
     pub fuse_attr_cache_refreshes: Align64<AtomicU64>,
+    /// POSIX-2 sparse-export engagement: `lseek(SEEK_HOLE)` replies that
+    /// named a hole (a real unmapped block run, or the implicit hole at
+    /// EOF that terminates a data run). 0 across a `cp --sparse` /
+    /// `tar -S` run means no tool ever learned about a hole — either the
+    /// handler regressed to the all-data fallback or nothing sparse was
+    /// touched.
+    pub lseek_holes_reported: Align64<AtomicU64>,
+    /// POSIX-4: reverse dentry SCANS — `find_parent_of_child` walks, the
+    /// unindexed O(total dentries) range scan over a volume's whole
+    /// dentry tree. Legitimate only on the `open_by_handle_at` reconnect
+    /// path (cold and rare by construction); growth per `readdir` means
+    /// the `..` parent memo stopped serving and every `ls`/`find`/`du`
+    /// walk is paying the scan per directory again.
+    pub meta_parent_scans: Align64<AtomicU64>,
+    /// POSIX-4: `..` syntheses served from the parent memo — the
+    /// [`Self::meta_parent_scans`] twin (memo hit vs. scan).
+    pub readdir_parent_memo_hits: Align64<AtomicU64>,
     /// FUSE_HANDLE_KILLPRIV_V2 negotiated for this mount (0/1 gauge —
     /// killpriv campaign): 1 ⇒ the kernel's per-write(2)
     /// GETXATTR("security.capability") killpriv probe is gone and the
@@ -5508,6 +5525,9 @@ impl SqueezefsFilesystem {
                 "fuse_release_clean_fastpath": METRICS.fuse_release_clean_fastpath.load(Ordering::Relaxed),
                 "fuse_lookup_negative_replies": METRICS.fuse_lookup_negative_replies.load(Ordering::Relaxed),
                 "fuse_attr_cache_refreshes": METRICS.fuse_attr_cache_refreshes.load(Ordering::Relaxed),
+                "lseek_holes_reported": METRICS.lseek_holes_reported.load(Ordering::Relaxed),
+                "meta_parent_scans": METRICS.meta_parent_scans.load(Ordering::Relaxed),
+                "readdir_parent_memo_hits": METRICS.readdir_parent_memo_hits.load(Ordering::Relaxed),
                 "fuse_killpriv_negotiated": METRICS.fuse_killpriv_negotiated.load(Ordering::Relaxed),
                 "fuse_killpriv_clears": METRICS.fuse_killpriv_clears.load(Ordering::Relaxed),
                 "meta_updates": METRICS.meta_updates.load(Ordering::Relaxed),
@@ -11134,6 +11154,74 @@ impl SqueezefsFilesystem {
         }
     }
 
+    /// POSIX-2: `st_blocks` (512-B units) derived from what the layout
+    /// actually ALLOCATES, or `None` when this layout carries no
+    /// allocation information and the size-derived synthesis stands.
+    ///
+    /// Per layout class:
+    /// * **striped** — the mapped block indices, each counted for the
+    ///   logical extent it covers (`min(block_size, size − b·bs)`).
+    ///   Unmapped indices are holes (they read zeros — `hole_read_zeros_tests`)
+    ///   and must not be counted, which is exactly what makes
+    ///   `cp --sparse=auto`'s `st_blocks·512 < st_size` heuristic fire.
+    ///   An anomalous entry carrying a `block_map_id` without an inline
+    ///   map resolves to `None` (never a fabricated 0 — the read path's
+    ///   `load_striped_block_keys` takes the same never-fabricate stance).
+    /// * **inline** — the persisted payload length: a truncate-up inline
+    ///   file has a real hole in its tail.
+    /// * **staged** — `None`: the staging segment holds the whole logical
+    ///   extent, so the size-derived answer is the honest one.
+    ///
+    /// **Bound (documented, deliberate):** this reads only the RAM
+    /// metadata entry — `getattr` never pays a metadata transaction or a
+    /// device read for `st_blocks` (`readdirplus` calls it per entry, and
+    /// an indirect block-map rehydrate is a device READ). A cold stat
+    /// therefore reports the size-derived upper bound; anything that has
+    /// touched the file's layout in the last second (open+read, write,
+    /// `lseek(SEEK_HOLE)`) reports the allocation-true value.
+    fn allocated_blocks_from_layout(
+        m: &crate::routing::CachedMetadata,
+        block_size: u64,
+    ) -> Option<u64> {
+        match m.file_type.as_str() {
+            "striped" => {
+                let map = m.block_map.as_ref()?;
+                let bs = block_size.max(1);
+                let mut bytes = 0u64;
+                for b in map.keys() {
+                    let start = u64::from(*b).saturating_mul(bs);
+                    bytes = bytes.saturating_add(m.size.saturating_sub(start).min(bs));
+                }
+                Some(bytes.div_ceil(512))
+            }
+            "inline" => Some((m.data_key.as_ref()?.len() as u64).div_ceil(512)),
+            _ => None,
+        }
+    }
+
+    /// POSIX-2: does block `b` of `ino` hold bytes that are NOT (yet) in
+    /// the published block map — a RAM overlay, a staged whole-block
+    /// image, or a W2 staged extent record?
+    ///
+    /// The same three-way latch-free probe the W1 patch predicate uses
+    /// (design-random-small-writes §5.1 predicate 2 / review Issue 10):
+    /// no `spawn_blocking`, no staging-shard write lock. `lseek` consults
+    /// it because dirty custody is DATA — a `cp --sparse` racing
+    /// writeback must never be told a hole sits where acked bytes do.
+    /// Conservative-present by construction (the corruption-safe
+    /// direction): a false positive costs a hole not reported; a false
+    /// negative would drop bytes from a sparse copy.
+    fn block_has_parked_custody(&self, ino: u64, b: u64) -> bool {
+        let cache_key = crate::keys::active_block(ino, b);
+        self.active_block_buffers.contains_key(&*cache_key)
+            || self.router.cache.nvme.has_staged_active_block(&cache_key)
+            || self
+                .router
+                .cache
+                .nvme
+                .has_staged_extent_record(&crate::keys::active_block_ext(ino, b))
+    }
+
     fn inode_to_file_attr(&self, inode: &crate::meta_backend::Inode) -> FileAttr {
         FileAttr {
             ino: inode.ino,
@@ -11280,9 +11368,24 @@ impl SqueezefsFilesystem {
         // writeback cache.
         if attr.kind == FileType::RegularFile {
             if let Some(m) = self.router.metadata_cache.get(&ino) {
+                let mut changed = false;
                 if m.size != attr.size {
                     attr.size = m.size;
                     attr.blocks = m.size.div_ceil(512);
+                    changed = true;
+                }
+                // POSIX-2: `st_blocks` from ALLOCATION, not from size —
+                // the same layout the read path resolves holes from.
+                if let Some(blocks) = Self::allocated_blocks_from_layout(
+                    &m,
+                    self.router.block_size.load(Ordering::Relaxed),
+                ) {
+                    if blocks != attr.blocks {
+                        attr.blocks = blocks;
+                        changed = true;
+                    }
+                }
+                if changed {
                     self.attr_cache
                         .insert(ino, (attr, std::time::Instant::now()));
                 }
@@ -14614,6 +14717,109 @@ impl Filesystem for SqueezefsFilesystem {
         self.attr_cache.invalidate(&inode_out);
 
         Ok(ReplyCopyFileRange { copied: copied_len })
+    }
+
+    /// POSIX-2: `lseek(fd, off, SEEK_DATA | SEEK_HOLE)` — the sparse-file
+    /// export.
+    ///
+    /// Without this handler the kernel latches `fc->no_lseek` on the
+    /// first ENOSYS and answers every future query itself with "the whole
+    /// file is data" (SEEK_HOLE ⇒ EOF, SEEK_DATA ⇒ the offset), so
+    /// `cp --sparse`, `tar -S`, `rsync -S`, and `qemu-img convert` expand
+    /// every hole this filesystem genuinely stores.
+    ///
+    /// Resolution is BLOCK-granular on the striped layout (POSIX allows
+    /// any granularity ≥ the allocation unit): an index absent from the
+    /// block map is a hole — that is precisely how the read path serves
+    /// zeros for it — unless the block still holds parked custody
+    /// ([`Self::block_has_parked_custody`]). Inline and staged layouts
+    /// carry no hole map, and every layout the daemon cannot resolve
+    /// falls back to the same all-data answer the kernel would have
+    /// synthesized: reporting a hole where data lives would make a sparse
+    /// copy silently drop bytes, so every uncertain arm resolves to DATA.
+    async fn lseek(
+        &self,
+        _req: Request,
+        ino: u64,
+        _fh: u64,
+        offset: u64,
+        whence: u32,
+    ) -> FuseResult<ReplyLSeek> {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        let seek_data = match whence as i32 {
+            libc::SEEK_DATA => true,
+            libc::SEEK_HOLE => false,
+            // The kernel only ever sends SEEK_DATA/SEEK_HOLE here (it
+            // serves SET/CUR/END itself); anything else is a protocol
+            // violation, not a fallback case.
+            _ => return Err(Errno::from(libc::EINVAL)),
+        };
+        debug!("FUSE lseek: ino = {ino}, offset = {offset}, seek_data = {seek_data}");
+
+        let size = if ino == STATS_INODE {
+            self.latest_stats_size.load(Ordering::Acquire)
+        } else if ino == CONFIG_INODE {
+            self.latest_config_size.load(Ordering::Acquire)
+        } else {
+            self.get_attr_internal(ino)
+                .await
+                .map_err(map_squeezefs_err)?
+                .size
+        };
+
+        // POSIX: an offset at or past EOF is ENXIO for BOTH whences.
+        if offset >= size {
+            return Err(Errno::from(libc::ENXIO));
+        }
+        // The all-data answer, used by every arm that cannot prove a hole.
+        let all_data = || {
+            Ok(ReplyLSeek {
+                offset: if seek_data { offset } else { size },
+            })
+        };
+        if ino == STATS_INODE || ino == CONFIG_INODE {
+            return all_data();
+        }
+
+        let file_path = crate::keys::inode_path(ino);
+        let meta = match self.router.fetch_metadata(&file_path).await {
+            Ok(m) => m,
+            Err(e) => {
+                // Never turn an unreadable layout into a fabricated hole.
+                debug!("lseek: ino {ino} layout unavailable ({e:?}) — reporting all-data");
+                return all_data();
+            }
+        };
+        let Some(map) = meta
+            .block_map
+            .as_ref()
+            .filter(|_| meta.file_type == "striped")
+        else {
+            // Inline / staged / anomalous striped entries carry no hole
+            // information (see `allocated_blocks_from_layout`).
+            return all_data();
+        };
+
+        let bs = self.router.block_size.load(Ordering::Relaxed).max(1);
+        let last_block = (size - 1) / bs;
+        for b in (offset / bs)..=last_block {
+            let occupied = map.contains_key(&(b as u32)) || self.block_has_parked_custody(ino, b);
+            if occupied == seek_data {
+                let at = std::cmp::max(offset, b.saturating_mul(bs));
+                if !seek_data {
+                    METRICS.lseek_holes_reported.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(ReplyLSeek { offset: at });
+            }
+        }
+        if seek_data {
+            // No data between `offset` and EOF.
+            Err(Errno::from(libc::ENXIO))
+        } else {
+            // The implicit hole at EOF always terminates the last run.
+            METRICS.lseek_holes_reported.fetch_add(1, Ordering::Relaxed);
+            Ok(ReplyLSeek { offset: size })
+        }
     }
 
     async fn statfs(&self, _req: Request, _ino: u64) -> FuseResult<ReplyStatFs> {

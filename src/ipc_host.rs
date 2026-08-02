@@ -304,12 +304,26 @@ pub struct DataOp {
 pub struct SlotCompletion {
     map: Arc<SessionMapping>,
     slot_index: u32,
+    /// VAL-5c: the session's in-flight ledger entry for THIS op. Taken
+    /// (and released) by `complete`; the `Drop` impl releases it on any
+    /// path that drops the handle without completing, so a sink bug can
+    /// never wedge the session's admission (it only loses the reply,
+    /// which the §5.4.1 client deadline already covers).
+    inflight: Option<Arc<SessionInflight>>,
 }
 
 impl SlotCompletion {
     /// Publish `result` (`bytes` or `-errno`) and wake a parked client.
     /// Consumes the handle: exactly one completion per dequeued op.
-    pub fn complete(self, result: i64) {
+    pub fn complete(mut self, result: i64) {
+        // VAL-5c: leave the ledger FIRST — the slot goes FREE for the
+        // client the instant `core.complete()` lands below, so a
+        // resubmission racing this completion must find the room already
+        // returned (releasing after would make an honest client's
+        // back-to-back submit look like an over-admission).
+        if let Some(ledger) = self.inflight.take() {
+            ledger.finish();
+        }
         let slot = self
             .map
             .slot(self.slot_index)
@@ -338,6 +352,46 @@ impl SlotCompletion {
         } else {
             METRICS.ipc_cqe_wake_elided.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+impl Drop for SlotCompletion {
+    fn drop(&mut self) {
+        // A completion handle dropped without `complete` is a sink bug
+        // (the client's op stalls until its §5.4.1 deadline), but it must
+        // not leak an in-flight reservation — that would slowly starve
+        // the session's admission and end in a spurious poison.
+        if let Some(ledger) = self.inflight.take() {
+            ledger.finish();
+        }
+    }
+}
+
+/// VAL-5c: one session's in-flight op ledger. Incremented when the drain
+/// dequeues an op, decremented when its [`SlotCompletion`] resolves (or
+/// is dropped). The honest protocol can never exceed `slots` — one ring
+/// entry per CLAIMED slot — so a higher count means the client
+/// re-published a slot it did not own: a §5.3 rule-4 protocol violation.
+#[derive(Debug, Default)]
+struct SessionInflight {
+    live: AtomicU32,
+}
+
+impl SessionInflight {
+    /// Admit one dequeued op; returns the resulting in-flight count.
+    fn begin(&self) -> u32 {
+        self.live.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Release one op's reservation (completion or dropped handle). The
+    /// saturating floor keeps a hypothetical double-release from wrapping
+    /// into a permanent over-admission.
+    fn finish(&self) {
+        let _ = self
+            .live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 }
 
@@ -744,6 +798,9 @@ struct IpcSession {
     /// Milliseconds-since-host-start of the last ring/ctl activity —
     /// the §5.7 idle-reap clock. Served ops and BINDs refresh it.
     last_active_ms: AtomicU64,
+    /// VAL-5c: ops dequeued and not yet completed. Shared with every
+    /// live [`SlotCompletion`] of this session.
+    inflight: Arc<SessionInflight>,
     torn_down: AtomicBool,
 }
 
@@ -775,12 +832,30 @@ impl IpcSession {
                 );
                 return None;
             }
+            // VAL-5c admission gate: count this op in BEFORE it is served
+            // (the serve severs up to `max_op_bytes` and may park in a
+            // sink). The honest protocol cannot exceed `slots` — one ring
+            // entry per CLAIMED slot — so a higher count proves the
+            // client re-published a slot it does not own (the state word
+            // it forged is client-writable memory). §5.3 rule 4: poison.
+            let live = self.inflight.begin();
+            if live > self.map.geometry.slots {
+                log::error!(
+                    "ipc session {}: {live} ops in flight with only {} slots — the client \
+                     re-published an in-flight slot; poisoning session (§5.3 rule 4, VAL-5c)",
+                    self.id,
+                    self.map.geometry.slots
+                );
+                self.inflight.finish();
+                return None;
+            }
             // THE one linearization read of the descriptor (§5.3.1 rule 1):
             // validate the copy, serve from the copy, never re-read.
             let desc = slot.snapshot_descriptor();
             let completion = SlotCompletion {
                 map: Arc::clone(&self.map),
                 slot_index: index,
+                inflight: Some(Arc::clone(&self.inflight)),
             };
             self.serve_validated(&desc, sink, completion);
             served += 1;
@@ -1745,6 +1820,7 @@ impl IpcHost {
             consumer: Mutex::new(RingConsumer::new()),
             sock: Arc::clone(sock),
             last_active_ms: AtomicU64::new(0),
+            inflight: Arc::new(SessionInflight::default()),
             torn_down: AtomicBool::new(false),
         });
         session

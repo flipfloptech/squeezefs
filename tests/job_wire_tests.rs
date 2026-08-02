@@ -823,7 +823,7 @@ async fn unauthenticated_tls_is_plaintext_class_for_the_ladder() {
     let (meta, _mf) = meta_fixture().await;
     let fab = fabric(&meta, 0).await;
     let mut cfg = wire_cfg(30_000, 10_000);
-    cfg.security = Some(squeezefs::tiering::dht::ClusterSecurityConfig::default());
+    cfg.security = Some(squeezefs::tiering::cluster_tls::ClusterSecurityConfig::default());
     cfg.verify_sample_permille = 100; // ask for 10 % sampling…
     let host = JobWireHost::start(fab, cfg, FakeShardDevice::new(0, 0))
         .await
@@ -863,7 +863,7 @@ async fn ca_cert_without_key_refuses_the_listener() {
     let (meta, _mf) = meta_fixture().await;
     let fab = fabric(&meta, 0).await;
     let mut cfg = wire_cfg(30_000, 10_000);
-    cfg.security = Some(squeezefs::tiering::dht::ClusterSecurityConfig {
+    cfg.security = Some(squeezefs::tiering::cluster_tls::ClusterSecurityConfig {
         ca_cert: Some(ca_cert.der().to_vec()),
         ca_key: None,
     });

@@ -1522,7 +1522,7 @@ impl JobWireHost {
                 }
                 Err(e) => {
                     // VAL-6: the old arm `continue`d, so a persistent
-                    // EMFILE/ENFILE condition span the accept loop at
+                    // EMFILE/ENFILE condition spun the accept loop at
                     // 100 % of a core. Back off, capped, and say so.
                     let d = next_accept_backoff(backoff);
                     backoff = Some(d);

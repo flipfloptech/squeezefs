@@ -120,11 +120,128 @@ fn bench_cqe_doorbell(c: &mut Criterion) {
     g.finish();
 }
 
+/// The **job-wire frame decode floor** — the other protocol surface in
+/// this tree, and the only one whose input is UNTRUSTED: every write
+/// mount opens the §5.1.6 listener on `0.0.0.0` (execution-plan ruling
+/// D2), so `read_frame` is attacker-reachable before any
+/// authentication. VAL-6 rebuilt it (chunk-bounded body commit,
+/// per-class caps and deadlines); this group prices what it costs on
+/// the honest shapes AND what a hostile prefix costs the coordinator.
+///
+/// Field-derived input shapes (`docs/design-volume-lifecycle.md`
+/// §5.1.6; anchors in `src/job_wire.rs`):
+///
+/// * `decode_enroll` — the ONLY pre-enrollment shape: worker id + two
+///   UUID nonces + a 64-hex HMAC ≈ 300 B, well inside the 8 KiB
+///   `MAX_HELLO_FRAME_BYTES` class.
+/// * `decode_result_submit_64` — a mover shard's result proposal: 64
+///   `BlockChecksum` entries (one per destination block, the VL4 shard
+///   granularity — blocks move over shared storage, only their
+///   checksums ride the wire).
+/// * `refuse_oversize_prefix` — the cheapest hostile shape: four bytes
+///   claiming more than the cap. Must be a comparison, never an
+///   allocation.
+/// * `refuse_lying_prefix_16mib` — the expensive hostile shape: a
+///   `MAX_FRAME_BYTES` claim with a 4 KiB body. This is the DoS unit
+///   cost per connection, and the reason body memory is committed
+///   `FRAME_CHUNK_BYTES` at a time instead of up front.
+fn bench_job_wire_frames(c: &mut Criterion) {
+    use squeezefs::job_wire::{
+        read_frame, read_frame_limited, write_frame, BlockChecksum, DestTuple, WireFrame,
+        MAX_FRAME_BYTES, MAX_HELLO_FRAME_BYTES, WIRE_SCHEMA,
+    };
+    use tokio::runtime::Runtime;
+
+    let rt = Runtime::new().expect("bench runtime");
+
+    let enroll = WireFrame::Enroll {
+        wire_schema: WIRE_SCHEMA,
+        worker_id: "sqz-worker-a3f1c2".to_string(),
+        server_nonce: "0f1c2d3e-4a5b-6c7d-8e9f-a0b1c2d3e4f5".to_string(),
+        endpoint_nonce: "9e8d7c6b-5a49-3827-1605-f4e3d2c1b0a9".to_string(),
+        hmac: "5f".repeat(32),
+        pr_key: Some(0xA0),
+    };
+    let submit = WireFrame::ResultSubmit {
+        job_id: "job-0f1c2d3e".to_string(),
+        shard: 0,
+        shard_fencing: 3,
+        checksums: (0..64u64)
+            .map(|i| BlockChecksum {
+                dest: DestTuple {
+                    backend_id: (i % 4) as u32,
+                    offset: i * 4 * 1024 * 1024,
+                },
+                len: 4 * 1024 * 1024,
+                xxh3: 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i + 1),
+            })
+            .collect(),
+    };
+
+    let encode = |f: &WireFrame| -> Vec<u8> {
+        let mut buf = Vec::new();
+        rt.block_on(write_frame(&mut buf, f)).expect("encode");
+        buf
+    };
+    let enroll_wire = encode(&enroll);
+    let submit_wire = encode(&submit);
+    let oversize_prefix = (MAX_FRAME_BYTES + 1).to_be_bytes().to_vec();
+    let lying_prefix = {
+        let mut v = MAX_FRAME_BYTES.to_be_bytes().to_vec();
+        v.extend(std::iter::repeat_n(b'x', 4096));
+        v
+    };
+
+    let mut g = c.benchmark_group("job_wire_frame");
+    g.throughput(Throughput::Elements(1));
+
+    g.bench_function("decode_enroll", |b| {
+        b.to_async(&rt).iter(|| async {
+            let mut cur = std::io::Cursor::new(enroll_wire.as_slice());
+            let f = read_frame_limited(&mut cur, MAX_HELLO_FRAME_BYTES, None)
+                .await
+                .expect("valid hello")
+                .expect("one frame");
+            std::hint::black_box(f)
+        })
+    });
+
+    g.bench_function("decode_result_submit_64", |b| {
+        b.to_async(&rt).iter(|| async {
+            let mut cur = std::io::Cursor::new(submit_wire.as_slice());
+            let f = read_frame(&mut cur)
+                .await
+                .expect("valid submit")
+                .expect("one frame");
+            std::hint::black_box(f)
+        })
+    });
+
+    g.bench_function("refuse_oversize_prefix", |b| {
+        b.to_async(&rt).iter(|| async {
+            let mut cur = std::io::Cursor::new(oversize_prefix.as_slice());
+            let e = read_frame(&mut cur).await.expect_err("past the cap");
+            std::hint::black_box(e)
+        })
+    });
+
+    g.bench_function("refuse_lying_prefix_16mib", |b| {
+        b.to_async(&rt).iter(|| async {
+            let mut cur = std::io::Cursor::new(lying_prefix.as_slice());
+            let e = read_frame(&mut cur).await.expect_err("truncated body");
+            std::hint::black_box(e)
+        })
+    });
+
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_ring_push_pop,
     bench_slot_cycle,
     bench_payload_moves,
-    bench_cqe_doorbell
+    bench_cqe_doorbell,
+    bench_job_wire_frames
 );
 criterion_main!(benches);

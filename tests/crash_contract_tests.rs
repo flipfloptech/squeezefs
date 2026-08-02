@@ -1355,7 +1355,9 @@ async fn test_kv_alloc_torn_newest_root_after_churn_predecessor_extents_intact()
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{digest_backend, BuilderConfig, ImageBuilder, ROOT_INO};
 use squeezefs::meta_backend::kv::checkpoint::write_ledger_slot as kv_write_ledger_slot;
-use squeezefs::meta_backend::kv::superblock::{classify_volume, write_superblock_v3};
+use squeezefs::meta_backend::kv::superblock::{
+    classify_volume, write_superblock_v3, SUPERBLOCK_V3_LEN,
+};
 
 const K6A_VOL_LEN: u64 = 64 * 1024 * 1024;
 
@@ -1379,21 +1381,23 @@ async fn k6a_built_volume() -> NamedTempFile {
     f
 }
 
-/// K6a crash case (a): a TORN superblock write ⇒ the version gate and the
-/// mount fail loud (§4.10 "loud mount failures are reserved for units with
-/// durable-coverage arguments (superblock, …)"). The tear is injected with
-/// the honest in-flight shim: the rewrite persists only a prefix, exactly
-/// a format racing power loss.
+/// K6a crash case (a), **as amended by DUR-5**: a torn sector-0 write no
+/// longer condemns the volume — the redundant superblock copy carries it
+/// and the write mount repairs sector 0 — but a tear that takes BOTH
+/// copies still fails loud (§4.10 "loud mount failures are reserved for
+/// units with durable-coverage arguments (superblock, …)"). The tear is
+/// injected with the honest in-flight shim: the rewrite persists only a
+/// prefix, exactly a format racing power loss.
 #[tokio::test]
-async fn test_kv_v3_torn_superblock_fails_mount_loud() {
+async fn test_kv_v3_torn_superblock_recovers_then_fails_loud_when_both_slots_die() {
     let f = k6a_built_volume().await;
     let _g = FaultGuard;
 
     // Grab the valid superblock, then re-write a CHANGED one torn (a
     // re-format with a fresh identity racing power loss): 100 bytes of
     // the new image survive — magic/version plus the new uuid's first
-    // bytes land, while the new checksum (offset 120) is lost — so the
-    // sector holds a hybrid no checksum can bless. (A tear whose
+    // bytes land, while the new checksum (offset 120) is lost — so
+    // sector 0 holds a hybrid no checksum can bless. (A tear whose
     // persisted prefix is byte-identical to what it replaced is
     // indistinguishable from a complete write by construction — the K3
     // ledger case states the same.)
@@ -1409,26 +1413,60 @@ async fn test_kv_v3_torn_superblock_fails_mount_loud() {
     assert!(matches!(err, KvError::Io(_)), "got {err:?}");
     uring_fs::clear_faults();
 
-    // The gate refuses loud — as corruption, never as "run format" and
+    // DUR-5: the redundant copy (written and barriered BEFORE sector 0)
+    // carries the image, so the volume classifies and MOUNTS instead of
+    // being condemned — and the write mount repairs sector 0.
+    match classify_volume(f.path()).await {
+        Ok(squeezefs::meta_backend::kv::superblock::VolumeFormat::V3(rec)) => assert_eq!(
+            rec.uuid, sb.uuid,
+            "the recovered superblock must be the newest valid image"
+        ),
+        other => panic!("a torn sector 0 with an intact copy must classify: {other:?}"),
+    }
+    let be = KvMetaBackend::open(f.path())
+        .await
+        .expect("the mount recovers from the redundant superblock copy");
+    be.shutdown().await.expect("shutdown");
+    drop(be);
+    // Sector 0 itself is healed: a raw read of it decodes on its own.
+    let raw = uring_fs::read_at(f.path(), 0, SUPERBLOCK_V3_LEN)
+        .await
+        .expect("read sector 0");
+    squeezefs::meta_backend::kv::superblock::classify_sector0(&raw)
+        .expect("the write mount must repair sector 0 from the copy");
+
+    // Both slots dead ⇒ loud, as corruption, never as "run format" and
     // never by silently limping into a mount.
+    let len = std::fs::metadata(f.path()).unwrap().len();
+    let backup = squeezefs::meta_backend::kv::superblock::backup_offset(len)
+        .expect("the volume reserves a backup slot");
+    for off in [0u64, backup] {
+        uring_fs::write_at(
+            f.path(),
+            off,
+            bytes::Bytes::from(vec![0xA5u8; SUPERBLOCK_V3_LEN]),
+        )
+        .await
+        .expect("scribble a slot");
+    }
     let err = classify_volume(f.path())
         .await
-        .expect_err("a torn superblock must classify loud")
+        .expect_err("both slots dead must classify loud")
         .to_string();
     assert!(
-        err.contains("checksum") || err.contains("corrupt"),
+        err.contains("magic") || err.contains("checksum") || err.contains("corrupt"),
         "the refusal must name the corruption, got: {err}"
     );
     assert!(
         !err.to_lowercase().contains("not formatted"),
-        "a torn SB is corruption, not a blank volume: {err}"
+        "a scribbled SB is corruption, not a blank volume: {err}"
     );
     let err = KvMetaBackend::open(f.path())
         .await
-        .expect_err("the mount must refuse the torn superblock")
+        .expect_err("the mount must refuse when both superblock slots are gone")
         .to_string();
     assert!(
-        err.contains("checksum") || err.contains("corrupt"),
+        err.contains("magic") || err.contains("checksum") || err.contains("corrupt"),
         "got: {err}"
     );
 }

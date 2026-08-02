@@ -1510,9 +1510,24 @@ mod tests {
             cap0,
             "overflow bounce must not touch the pool"
         );
+        // DUR-8e: the read side bounds a declared plaintext by the
+        // configured block size, so this deliberately-oversized image is
+        // read back by a state sized for it (a 2×-block plaintext is not
+        // a shape the product's write paths can produce — they are all
+        // per-block or smaller — which is exactly why the bound is safe).
+        let reader = CryptoCompressState::new(
+            "lz4".to_string(),
+            "aes256gcm-rsa".to_string(),
+            Some(&TEST_PEM),
+        );
+        reader.init_scratch_pool(2 * bs);
         assert_eq!(
-            state.process_read(&out).unwrap().as_ref(),
+            reader.process_read(&out).unwrap().as_ref(),
             oversized.as_ref()
+        );
+        assert!(
+            state.process_read(&out).is_err(),
+            "a plaintext above the configured block size must be refused, not allocated"
         );
     }
 

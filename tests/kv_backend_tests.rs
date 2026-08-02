@@ -408,13 +408,20 @@ async fn version_gate_distinguishes_blank_v2_v3_foreign_future() {
         .build(future.path(), V3_VOL_LEN)
         .await
         .unwrap();
-    squeezefs::uring_fs::write_at(
-        future.path(),
-        8,
-        bytes::Bytes::copy_from_slice(&99u32.to_le_bytes()),
-    )
-    .await
-    .unwrap();
+    // DUR-5: sector-0 damage alone is survivable now (the redundant copy
+    // carries the volume), so the gate is exercised by stamping the
+    // future version on BOTH slots.
+    let future_backup = squeezefs::meta_backend::kv::superblock::backup_offset(V3_VOL_LEN)
+        .expect("a fresh format reserves the backup slot");
+    for off in [8u64, future_backup + 8] {
+        squeezefs::uring_fs::write_at(
+            future.path(),
+            off,
+            bytes::Bytes::copy_from_slice(&99u32.to_le_bytes()),
+        )
+        .await
+        .unwrap();
+    }
     let err = classify_volume(future.path())
         .await
         .expect_err("a future version must refuse loud")
@@ -444,6 +451,22 @@ async fn v3_superblock_checksum_covers_the_whole_sector() {
     squeezefs::uring_fs::write_at(file.path(), 900, bytes::Bytes::from_static(&[0xFF]))
         .await
         .unwrap();
+    // DUR-5 first: with only sector 0 damaged the redundant copy carries
+    // the volume — that IS the durability fix, and it must not mask the
+    // checksum contract below.
+    assert!(
+        classify_volume(file.path()).await.is_ok(),
+        "sector-0 padding corruption alone must recover from the redundant copy"
+    );
+    let backup = squeezefs::meta_backend::kv::superblock::backup_offset(V3_VOL_LEN)
+        .expect("a fresh format reserves the backup slot");
+    squeezefs::uring_fs::write_at(
+        file.path(),
+        backup + 900,
+        bytes::Bytes::from_static(&[0xFF]),
+    )
+    .await
+    .unwrap();
     let err = classify_volume(file.path())
         .await
         .expect_err("padding corruption must fail the whole-sector checksum")

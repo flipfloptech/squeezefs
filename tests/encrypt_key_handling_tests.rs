@@ -752,21 +752,6 @@ fn format_refuses_an_encrypted_volume_with_no_key_and_a_key_with_no_algo() {
     assert!(!out.status.success(), "a key with no algo must refuse");
 }
 
-fn fuse_available() -> bool {
-    Path::new("/dev/fuse").exists() && which_fusermount().is_some()
-}
-
-fn which_fusermount() -> Option<PathBuf> {
-    [
-        "/usr/bin/fusermount3",
-        "/bin/fusermount3",
-        "/usr/local/bin/fusermount3",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .find(|p| p.exists())
-}
-
 struct Mount {
     child: std::process::Child,
     mnt: PathBuf,
@@ -853,8 +838,10 @@ fn wait_ready(m: &Mount, secs: u64) -> bool {
 /// garbage.
 #[test]
 fn format_with_a_key_path_produces_a_mountable_writable_encrypted_volume() {
-    if !fuse_available() {
-        eprintln!("SKIP: /dev/fuse or fusermount3 unavailable");
+    // TEST-2: the ONE shared environment gate, so this skip lands in the
+    // machine-readable ledger and `SQUEEZEFS_TEST_REQUIRE_MOUNT=1` can
+    // promote it to a failure on the release gate.
+    if !squeezefs_testkit::mount_supported(squeezefs_testkit::site!()) {
         return;
     }
     let base = scratch("acceptance-mount");

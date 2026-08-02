@@ -31,3 +31,12 @@ exa-client-performance-scripts/
 # sqz kernel program scratch (tarballs, extracted trees, mboxes)
 .kernel-sqz-work/
 dist/
+
+# cargo-fuzz local state (spec §11 TEST-4): its own workspace target,
+# the grown corpora, and any crash artifacts. Corpora are per-box growth,
+# not source; a reproducing crash input gets committed as a fixture WITH
+# its cargo repro-port (the repro-port mandate), never as loose bytes.
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/

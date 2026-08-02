@@ -41,7 +41,7 @@
 
 use squeezefs_testkit::{mount_supported_with_fusectl, site};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -513,7 +513,7 @@ fn test_mount_option_max_background_override() {
 /// leaves `waiting >= 1` and the unmount would hang instead of returning.
 #[test]
 fn test_every_request_gets_exactly_one_reply() {
-    if !transport_supported() {
+    if !mount_supported_with_fusectl(site!()) {
         return;
     }
     let mut mount = mount_fs("fuse2", &[("SQUEEZEFS_MEM_BUDGET_MB", "65536")], &[]);

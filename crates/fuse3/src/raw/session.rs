@@ -1222,6 +1222,24 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         #[cfg(not(all(target_os = "linux", feature = "tokio-runtime")))]
         let flags2 = 0u32;
 
+        // sqz FUSE_TIME_LIMITS (kernel-sqz patch 0027): when the kernel
+        // offered folded capability bit 62, echo it and carry the daemon's
+        // exact-round-trip inode-timestamp range so VFS
+        // timestamp_truncate() clamps incore exactly where the daemon
+        // clamps durable state (fstests generic/634 becomes expected-PASS
+        // on sqz-kernel hosts; the fleet-kernel adjudication stays
+        // pinned). Stock kernels never offer the bit: fields stay zero and
+        // the reply is bit-identical to the pre-0027 daemon.
+        let time_limits =
+            negotiate_time_limits((init_in.flags as u64) | ((init_flags2 as u64) << 32));
+        let flags2 = if time_limits.is_some() {
+            debug!("advertising FUSE_TIME_LIMITS in init flags2 (sqz kernel offered bit 62)");
+            flags2 | ((FUSE_TIME_LIMITS >> 32) as u32)
+        } else {
+            flags2
+        };
+        let (time_min, time_max) = time_limits.unwrap_or((0, 0));
+
         // L1 (IOPS-parity program): resolve the session transport geometry
         // BEFORE serializing the INIT reply, so the `max_background` /
         // `congestion_threshold` the kernel learns here always describe the
@@ -1274,8 +1292,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             max_stack_depth: 0,
             request_timeout: 0,
             unused: [0; 3],
-            time_min: 0,
-            time_max: 0,
+            time_min,
+            time_max,
         };
 
         debug!("fuse init out {:?}", init_out);
@@ -4907,8 +4925,11 @@ pub(crate) const TIME_LIMITS_MAX_SEC: i64 = 9_223_372_036;
 /// bit 62; `None` on stock kernels, keeping the INIT reply bit-identical
 /// (fields zero, flag unechoed) — feature-absent must be unobservable.
 fn negotiate_time_limits(kernel_capabilities: u64) -> Option<(i64, i64)> {
-    let _ = kernel_capabilities;
-    None
+    if kernel_capabilities & FUSE_TIME_LIMITS != 0 {
+        Some((TIME_LIMITS_MIN_SEC, TIME_LIMITS_MAX_SEC))
+    } else {
+        None
+    }
 }
 
 fn negotiate_reply_flags(init_in_flags: u32, mount_options: &MountOptions) -> u32 {
@@ -5215,7 +5236,7 @@ mod init_negotiation_tests {
     fn time_limits_absent_without_offer() {
         assert_eq!(negotiate_time_limits(0), None);
         assert_eq!(
-            negotiate_time_limits(u64::MAX & !FUSE_TIME_LIMITS),
+            negotiate_time_limits(!FUSE_TIME_LIMITS),
             None,
             "every other capability set must not conjure time limits"
         );

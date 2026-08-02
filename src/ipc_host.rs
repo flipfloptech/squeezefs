@@ -86,6 +86,20 @@ const NONCE_TTL: Duration = Duration::from_secs(60);
 /// daemon wait on a client-writable word ever exceeds this.
 const SERVICE_PARK_MAX: Duration = Duration::from_millis(5);
 
+/// VAL-5b: `SO_RCVTIMEO` on every accepted ctl connection. This is a
+/// LIVENESS poll, not a deadline — an established session's ctl lane is
+/// idle between opens, so an expiry just re-checks `shutting_down` and
+/// parks again. The registry sever in `shutdown` is the primary unblock;
+/// this is the backstop that bounds teardown even if a sever is missed
+/// (a connection accepted in the same instant as the sever sweep).
+const CTL_RECV_POLL: Duration = Duration::from_millis(500);
+
+/// VAL-5b: how long an UNESTABLISHED peer may stay silent before its
+/// connection is dropped. Matched to the shim's own ctl deadline
+/// (`session.rs` `CTL_RECV_TIMEOUT`, 10 s): a client that has not sent
+/// its HELLO by then has already given up on us.
+const CTL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Empty-pass spin window before a service thread parks (time-based —
 /// the §5.5.1 "spin → short wait" ladder's spin rung, restored; knob
 /// `SQUEEZEFS_IPC_SPIN_US`, default 0 — see below). The former 64 bare `spin_loop`
@@ -900,10 +914,12 @@ pub struct IpcHost {
     cfg: IpcHostConfig,
     sink: Arc<dyn SessionSink>,
     admin: arc_swap::ArcSwap<Option<Arc<dyn AdminSink>>>,
-    /// Live ADMIN connections (raw fds): severed at shutdown so their
-    /// ctl threads unblock and join — a lingering admin client must
-    /// never wedge daemon teardown (caught by the VL2 red suite).
-    admin_conns: Mutex<Vec<Arc<UnixStream>>>,
+    /// Live ctl connections — **every** accepted connection, admin and
+    /// data plane alike (VAL-5b; before the pre-RC pass only the ADMIN
+    /// lane registered here). Severed at shutdown so their ctl threads
+    /// unblock and join: a lingering — or deliberately silent — client
+    /// must never wedge daemon teardown.
+    conns: Mutex<Vec<Arc<UnixStream>>>,
     listener_fd: OwnedFd,
     /// OQ-6 path-socket listener + its on-disk path (unlinked at
     /// shutdown). `None` = disabled or degraded to abstract-only.
@@ -1011,7 +1027,7 @@ impl IpcHost {
             cfg,
             sink,
             admin: arc_swap::ArcSwap::from_pointee(None),
-            admin_conns: Mutex::new(Vec::new()),
+            conns: Mutex::new(Vec::new()),
             listener_fd,
             path_listener,
             nonce: Mutex::new(NonceState::fresh()),
@@ -1175,14 +1191,15 @@ impl IpcHost {
             // Zero residue restored: the socket file dies with the host.
             let _ = std::fs::remove_file(path);
         }
-        // Sever live ADMIN connections: their ctl threads park in recv
-        // between verbs and must unblock for the join below (a
-        // lingering admin client must never wedge teardown).
+        // Sever EVERY live ctl connection (VAL-5b): their threads park
+        // in recv — between verbs for an established peer, on the FIRST
+        // datagram for one that never speaks — and all of them must
+        // unblock for the join below.
         for conn in std::mem::take(
             &mut *self
-                .admin_conns
+                .conns
                 .lock()
-                .expect("admin conn registry mutex never poisons"),
+                .expect("ctl conn registry mutex never poisons"),
         ) {
             // SAFETY: plain shutdown(2) on a connection we own an Arc of.
             unsafe {
@@ -1291,16 +1308,64 @@ impl IpcHost {
         }
     }
 
+    /// VAL-5b: register a live ctl connection so `shutdown` can sever it;
+    /// the returned guard removes it on every exit path.
+    fn register_conn(&self, sock: &Arc<UnixStream>) -> CtlConnRegistration<'_> {
+        self.conns
+            .lock()
+            .expect("ctl conn registry mutex never poisons")
+            .push(Arc::clone(sock));
+        CtlConnRegistration {
+            host: self,
+            sock: Arc::clone(sock),
+        }
+    }
+
+    /// VAL-5b: the FIRST datagram, under a handshake deadline. A peer
+    /// that connects and says nothing is dropped rather than holding a
+    /// ctl thread (and, before this bound, the whole teardown) forever.
+    /// `None` = give up on this connection (silence, EOF, malformed, or
+    /// host teardown).
+    fn recv_handshake(&self, sock: &Arc<UnixStream>) -> Option<(CtlMsg, Option<OwnedFd>)> {
+        let deadline = Instant::now() + CTL_HANDSHAKE_TIMEOUT;
+        loop {
+            match recv_ctl(sock) {
+                Ok(v) => return Some(v),
+                Err(e) if is_recv_timeout(&e) => {
+                    if self.shutting_down.load(Ordering::SeqCst) {
+                        return None;
+                    }
+                    if Instant::now() >= deadline {
+                        log::warn!(
+                            "ipc host: connection sent no HELLO within {} s — dropping (VAL-5b)",
+                            CTL_HANDSHAKE_TIMEOUT.as_secs()
+                        );
+                        return None;
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
     /// One connection = at most one session: HELLO (screen) → SessionOk /
     /// Refuse; then BIND/UNBIND until EOF (client death — §5.7).
     fn connection_loop(self: Arc<Self>, sock: UnixStream) {
         let _live = CtlConnLive(&self);
         let sock = Arc::new(sock);
+        // VAL-5b: every accepted connection is registered (so `shutdown`
+        // can sever it) and every receive on it is bounded (so a peer
+        // that stops speaking cannot pin this thread past teardown).
+        let _reg = self.register_conn(&sock);
+        let _ = sock.set_read_timeout(Some(CTL_RECV_POLL));
         // First datagram routes the connection: AdminHello opens the
-        // control-plane lane (VL2 §5.1.4), Hello the data plane.
-        let first = match recv_ctl(&sock) {
-            Ok(v) => v,
-            Err(_) => return,
+        // control-plane lane (VL2 §5.1.4), Hello the data plane. An
+        // unestablished peer gets `CTL_HANDSHAKE_TIMEOUT` to say
+        // something and is then dropped — it holds no state worth
+        // waiting on, and the slot it occupies is bounded (VAL-5d).
+        let first = match self.recv_handshake(&sock) {
+            Some(v) => v,
+            None => return,
         };
         if let (CtlMsg::AdminHello { pid, uid }, _) = &first {
             self.admin_loop(&sock, *pid, *uid);
@@ -1326,6 +1391,15 @@ impl IpcHost {
         };
         loop {
             match recv_ctl(&sock) {
+                // VAL-5b: the receive poll expiring is not an event — an
+                // ESTABLISHED session's ctl lane is legitimately idle
+                // between opens. Re-check teardown and park again.
+                Err(e) if is_recv_timeout(&e) => {
+                    if self.shutting_down.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    continue;
+                }
                 Ok((CtlMsg::Bind, Some(fd))) => {
                     let reply = match self.screen_fd(fd.as_raw_fd()) {
                         Ok((rights_ino, read_ok, write_ok, odirect)) => {
@@ -1417,12 +1491,18 @@ impl IpcHost {
             return;
         }
         log::info!("ipc host: ADMIN session opened by pid {pid} uid {uid}");
-        self.admin_conns
-            .lock()
-            .expect("admin conn registry mutex never poisons")
-            .push(Arc::clone(sock));
+        // (Registration happens once, for every connection, in
+        // `connection_loop` — VAL-5b.)
         loop {
             match recv_ctl(sock) {
+                // VAL-5b: an admin client parks between verbs; the poll
+                // expiring only re-checks teardown.
+                Err(e) if is_recv_timeout(&e) => {
+                    if self.shutting_down.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    continue;
+                }
                 Ok((CtlMsg::AdminReq { verb, arg }, _)) => {
                     let reply = match self.admin.load().as_ref() {
                         Some(sink) => {
@@ -1445,10 +1525,6 @@ impl IpcHost {
                 Err(_) => break, // EOF / transport torn / shutdown sever
             }
         }
-        self.admin_conns
-            .lock()
-            .expect("admin conn registry mutex never poisons")
-            .retain(|c| !Arc::ptr_eq(c, sock));
     }
 
     /// Wire the admin-verb handler (post-spawn; requests refuse until
@@ -2006,6 +2082,34 @@ impl IpcHost {
             }
         }
     }
+}
+
+/// RAII half of the VAL-5b connection registry: a connection is
+/// deregistered when its ctl thread leaves, whatever the exit path.
+struct CtlConnRegistration<'a> {
+    host: &'a IpcHost,
+    sock: Arc<UnixStream>,
+}
+
+impl Drop for CtlConnRegistration<'_> {
+    fn drop(&mut self) {
+        self.host
+            .conns
+            .lock()
+            .expect("ctl conn registry mutex never poisons")
+            .retain(|c| !Arc::ptr_eq(c, &self.sock));
+    }
+}
+
+/// Is this receive error the SO_RCVTIMEO poll expiring (VAL-5b) rather
+/// than a real transport failure? Linux reports `EAGAIN` on a timed-out
+/// `recvmsg`; the std mapping is `WouldBlock`, and `TimedOut` covers
+/// platforms/paths that report `ETIMEDOUT`.
+fn is_recv_timeout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+    )
 }
 
 /// RAII half of the [`IpcHost::ctl_conns_live`] gauge: the accept loop

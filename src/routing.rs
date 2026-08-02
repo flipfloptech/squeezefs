@@ -8750,8 +8750,35 @@ impl DataRouter {
         // binding snapshot that ages while the task waits to run — exactly
         // the reused-key stale-fill window — so every RMW seed now resolves
         // through the binding-validated fetch inside its task.
-        use futures::stream::{FuturesUnordered, StreamExt};
-        let tasks = FuturesUnordered::new();
+        //
+        // MEM-2/RES-9: the per-block RMW tasks are OWNED. Outer cancellation
+        // (this future dropped mid-write) must not detach tasks that go on
+        // to allocate + publish blocks no map will ever name: the salvage
+        // hook frees every surfaced (block, key) on the cancel path, and
+        // each task's mint guard frees its own offset when the task errors
+        // or is aborted inside the allocate→publish window.
+        let salvage_router = self.clone();
+        let mut tasks = crate::assembly_tasks::OwnedTaskSet::with_salvage(
+            "striped block write",
+            Box::new(
+                move |outs: Vec<(u32, String, crate::block_allocator::InflightAllocGuard)>|
+                      -> futures::future::BoxFuture<'static, ()> {
+                    Box::pin(async move {
+                        if outs.is_empty() {
+                            return;
+                        }
+                        log::warn!(
+                            "write_striped cancelled mid-assembly: freeing {} surfaced \
+                             minted block(s) (RES-9)",
+                            outs.len()
+                        );
+                        for (_b, key, _inflight) in outs {
+                            let _ = salvage_router.backend_router.free_block(&key).await;
+                        }
+                    })
+                },
+            ),
+        );
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
             crate::bg_admit::striped_block_concurrency(),
         ));
@@ -8800,7 +8827,7 @@ impl DataRouter {
             let full_coverage = rel_start == 0 && rel_end == block_size as usize;
 
             let sem_clone = sem.clone();
-            tasks.push(tokio::spawn(async move {
+            tasks.spawn(async move {
                 let _permit = sem_clone.acquire().await.map_err(|e| {
                     SqueezefsError::Io(std::io::Error::other(format!(
                         "Semaphore acquire error: {:?}",
@@ -8872,6 +8899,13 @@ impl DataRouter {
                 // PR VL6a: live-owner registration rides the task result
                 // back to the caller, which holds it across the merge.
                 let inflight = block_allocator.inflight_register(offset);
+                // RES-9 mint guard: any exit between here and the Ok return
+                // that surfaces this block — a `?` error, a panic, or a
+                // JoinSet abort landing at one of the awaits below — frees
+                // the minted offset instead of leaking an allocated(-and-
+                // possibly-published) block only fsck could find.
+                let mut minted =
+                    crate::assembly_tasks::MintedBlockGuard::new(block_allocator.clone(), offset);
                 let stored_new_block_key = router_clone
                     .backend_router
                     .persist_block_key(&be_id, offset);
@@ -8882,6 +8916,9 @@ impl DataRouter {
                     block_allocator.chunk_size(),
                     "striped RMW block write",
                 ) {
+                    // Synchronous free (pre-existing behavior); disarm so
+                    // the mint guard does not double-free.
+                    minted.disarm();
                     let _ = block_allocator.free_block(offset).await;
                     return Err(e);
                 }
@@ -8900,35 +8937,29 @@ impl DataRouter {
                 router_clone.cache.purge_block_key(&stored_new_block_key);
                 read_lru.put(&stored_new_block_key, block_bytes);
                 block_allocator.publish_block(offset);
+                // Published and about to surface to the caller (or the
+                // cancel-path salvage hook): custody transfers.
+                minted.disarm();
 
                 Ok::<_, SqueezefsError>((b, stored_new_block_key, inflight))
-            }));
+            });
         }
 
-        let mut results = Vec::new();
+        // MEM-2: join EVERY task — never short-circuits. The first inner
+        // error / panic is reported only after the last sibling joined, so
+        // the error path below frees a COMPLETE set of surfaced keys.
+        // Cancellation mid-join hands the surfaced outputs to the salvage
+        // hook above (RES-9).
+        let (outputs, first_err) = tasks.join_all().await;
+        let mut results = Vec::with_capacity(outputs.len());
         // Held across the merge below (VL6a live-owner window); dropped
         // with the function — after the publish — or on the error path
         // where the blocks are freed.
-        let mut _inflight_guards: Vec<crate::block_allocator::InflightAllocGuard> = Vec::new();
-        let mut first_err: Option<SqueezefsError> = None;
-        let mut tasks_stream = tasks;
-        while let Some(task_res) = tasks_stream.next().await {
-            match task_res.map_err(|e| {
-                SqueezefsError::Io(std::io::Error::other(format!(
-                    "Block write task panicked: {:?}",
-                    e
-                )))
-            }) {
-                Ok(Ok((b, key, guard))) => {
-                    results.push((b, key));
-                    _inflight_guards.push(guard);
-                }
-                Ok(Err(e)) | Err(e) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
-                }
-            }
+        let mut _inflight_guards: Vec<crate::block_allocator::InflightAllocGuard> =
+            Vec::with_capacity(outputs.len());
+        for (b, key, guard) in outputs {
+            results.push((b, key));
+            _inflight_guards.push(guard);
         }
         if let Some(e) = first_err {
             for (_b, new_key) in &results {
@@ -10321,24 +10352,41 @@ impl DataRouter {
                     }
 
                     let final_len = (end_offset - offset) as usize;
-                    let (raw_ptr, final_buf_opt) = if let Some(dest) = dest_addr {
-                        (dest as usize, None)
+                    // MEM-2: the assembly destination is an OWNED object
+                    // (`Arc<AssemblyDest>`) shared with every block task —
+                    // never a usize-laundered pointer. A task that outlives
+                    // this future (sibling panic, outer cancellation) writes
+                    // through its own Arc into memory that is still owned,
+                    // and the pooled backing recycles only when the LAST
+                    // owner drops (`assembly_tasks` module).
+                    let assembly_into_dest = dest_addr.is_some();
+                    let dest = std::sync::Arc::new(if let Some(dest) = dest_addr {
+                        // SAFETY: `dest` addresses this request's registered
+                        // uring payload region and is valid for `final_len`
+                        // bytes of writes — §5.4 payload-lease exclusivity
+                        // makes this request the region's only accessor for
+                        // the handler invocation. Cancellation aborts the
+                        // owned task set below (no detached writers); the
+                        // ent re-arm window itself is MEM-1's owner-token
+                        // territory.
+                        unsafe {
+                            crate::assembly_tasks::AssemblyDest::payload(dest as *mut u8, final_len)
+                        }
                     } else {
                         let mut final_buf = BUFFER_POOL.alloc();
                         final_buf.resize(final_len, 0);
-                        let ptr = final_buf.as_mut_ptr() as usize;
-                        (ptr, Some(final_buf))
-                    };
+                        crate::assembly_tasks::AssemblyDest::pooled(final_buf)
+                    });
 
                     // Spawn concurrent tasks to download block data in parallel.
                     // Acquire the admission permit *inside* each task so the coordinator
                     // never holds N permits while spawning (can deadlock the semaphore
                     // when block_count > permit pool under nested multi-block reads).
-                    let mut futures = Vec::new();
                     // Copy ledger classification for the per-block assembly
                     // copies below: writes land either in the zero-copy
-                    // dest (dest_addr) or the pooled final_buf (bounce).
-                    let assembly_into_dest = final_buf_opt.is_none();
+                    // dest (dest_addr) or the pooled backing (bounce).
+                    let mut tasks =
+                        crate::assembly_tasks::OwnedTaskSet::new("parallel block download");
                     for (b_idx, b_key_opt) in block_keys {
                         let router = self.clone();
                         let b_start_offset = b_idx as u64 * block_size;
@@ -10351,8 +10399,10 @@ impl DataRouter {
                         let rel_start = (slice_start - b_start_offset) as usize;
                         let file_path_clone = file_path.to_string();
                         let sem = crate::bg_admit::STRIPED_IO_SEM.clone();
+                        // MEM-2: each task co-owns the destination.
+                        let dest = std::sync::Arc::clone(&dest);
 
-                        futures.push(tokio::spawn(async move {
+                        tasks.spawn(async move {
                             let _permit = sem.acquire_owned().await.map_err(|_| {
                                 SqueezefsError::InvalidOperation(
                                     "striped read admission closed".to_string(),
@@ -10377,13 +10427,14 @@ impl DataRouter {
                                 let end = std::cmp::min(rel_start + copy_len, active_data.len());
                                 let actual_copy = end - start;
                                 if actual_copy > 0 {
+                                    // SAFETY: [dest_start, dest_start +
+                                    // copy_len) is this block task's
+                                    // exclusive region (block regions
+                                    // partition the request span), and the
+                                    // destination is alive — this task's
+                                    // `Arc<AssemblyDest>` owns it.
                                     unsafe {
-                                        let dest = (raw_ptr + dest_start) as *mut u8;
-                                        std::ptr::copy_nonoverlapping(
-                                            active_data[start..end].as_ptr(),
-                                            dest,
-                                            actual_copy,
-                                        );
+                                        dest.write_at(dest_start, &active_data[start..end]);
                                     }
                                 }
                                 actual_copy
@@ -10417,13 +10468,12 @@ impl DataRouter {
                                     Some(ranged) => {
                                         let actual_copy = std::cmp::min(ranged.len(), copy_len);
                                         if actual_copy > 0 {
+                                            // SAFETY: within this block
+                                            // task's exclusive region (see
+                                            // the staged-copy site above);
+                                            // liveness via this task's Arc.
                                             unsafe {
-                                                let dest = (raw_ptr + dest_start) as *mut u8;
-                                                std::ptr::copy_nonoverlapping(
-                                                    ranged.as_ptr(),
-                                                    dest,
-                                                    actual_copy,
-                                                );
+                                                dest.write_at(dest_start, &ranged[..actual_copy]);
                                             }
                                         }
                                         actual_copy
@@ -10453,13 +10503,12 @@ impl DataRouter {
                                 let end = std::cmp::min(rel_start + copy_len, downloaded.len());
                                 let actual_copy = end - start;
                                 if actual_copy > 0 {
+                                    // SAFETY: within this block task's
+                                    // exclusive region (see the staged-copy
+                                    // site above); liveness via this task's
+                                    // Arc.
                                     unsafe {
-                                        let dest = (raw_ptr + dest_start) as *mut u8;
-                                        std::ptr::copy_nonoverlapping(
-                                            downloaded[start..end].as_ptr(),
-                                            dest,
-                                            actual_copy,
-                                        );
+                                        dest.write_at(dest_start, &downloaded[start..end]);
                                     }
                                 }
                                 actual_copy
@@ -10479,12 +10528,12 @@ impl DataRouter {
                                 ctr.fetch_add(written as u64, Ordering::Relaxed);
                             }
                             if written < copy_len {
+                                // SAFETY: the tail of this block task's
+                                // exclusive region (see the write_at
+                                // sites); zeroing enforces the
+                                // reused-payload replay rule stated above.
                                 unsafe {
-                                    std::ptr::write_bytes(
-                                        (raw_ptr + dest_start + written) as *mut u8,
-                                        0,
-                                        copy_len - written,
-                                    );
+                                    dest.zero_range(dest_start + written, copy_len - written);
                                 }
                             }
                             // W2 (§5.2): overlay the block's staged extent
@@ -10496,41 +10545,37 @@ impl DataRouter {
                                 rel_start,
                                 rel_start + copy_len,
                             ) {
+                                // SAFETY: staged extent runs are clipped to
+                                // [rel_start, rel_start + copy_len), so the
+                                // write lands inside this block task's
+                                // exclusive region; liveness via this
+                                // task's Arc.
                                 unsafe {
-                                    let dst = (raw_ptr + dest_start + (s - rel_start)) as *mut u8;
-                                    std::ptr::copy_nonoverlapping(d.as_ptr(), dst, d.len());
+                                    dest.write_at(dest_start + (s - rel_start), &d);
                                 }
                             }
                             Ok::<(), SqueezefsError>(())
-                        }));
-                    }
-
-                    let results = futures::future::try_join_all(futures).await.map_err(|e| {
-                        SqueezefsError::Io(std::io::Error::other(format!(
-                            "Parallel block download task panicked: {:?}",
-                            e
-                        )))
-                    })?;
-
-                    for res in results {
-                        res?;
-                    }
-
-                    if let Some(final_buf) = final_buf_opt {
-                        // Copy ledger: the assembled pooled buffer is
-                        // handed out as a zero-copy `Bytes` view (E-IL1's
-                        // multi-block sibling — the former full-length
-                        // `copy_from_slice` bounce is gone).
-                        debug_assert_eq!(final_buf.len(), final_len);
-                        let data = final_buf.into_bytes();
-                        return Ok((data, None));
-                    } else {
-                        let data = bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner {
-                            ptr: dest_addr.unwrap() as *mut u8,
-                            len: final_len,
                         });
-                        return Ok((data, None));
                     }
+
+                    // MEM-2: join EVERY sibling before the destination can
+                    // be handed out or released — the first error (inner or
+                    // panic) is reported only AFTER the last task joined, so
+                    // no exit path leaves a writer behind. Outer
+                    // cancellation drops `tasks` (JoinSet abort) while each
+                    // task's own Arc keeps the pooled destination alive.
+                    let (_completed, first_err) = tasks.join_all().await;
+                    if let Some(e) = first_err {
+                        return Err(e);
+                    }
+
+                    // Copy ledger: the assembled pooled buffer is handed
+                    // out as a zero-copy `Bytes` view (E-IL1's multi-block
+                    // sibling — the former full-length `copy_from_slice`
+                    // bounce is gone); the payload arm hands out the same
+                    // `UringBufOwner` view as before. Every writer joined
+                    // above, so the view is quiescent.
+                    return Ok((dest.into_bytes(), None));
                 }
                 _ => {
                     return Err(SqueezefsError::InvalidOperation(format!(

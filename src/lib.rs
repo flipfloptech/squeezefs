@@ -28,6 +28,7 @@ pub mod tiering;
 
 pub mod numa;
 
+pub mod assembly_tasks;
 pub mod bench;
 pub mod bg_admit;
 pub mod cache;

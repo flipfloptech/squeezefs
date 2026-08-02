@@ -71,7 +71,9 @@ async fn try_join_all_over_join_handles_is_a_detach_footgun() {
     assert_eq!(pool.len(), 1, "destination recycled on the error path");
     // The DETACHED sibling is still alive and reaches its copy site
     // AFTER the recycle — the MEM-2 corruption window.
-    sibling_go_tx.send(()).expect("detached sibling still parked");
+    sibling_go_tx
+        .send(())
+        .expect("detached sibling still parked");
     let seen = sibling_saw_rx
         .await
         .expect("detached sibling still runs after the coordinator returned");
@@ -368,7 +370,9 @@ async fn payload_arm_writes_land_and_bytes_view_matches() {
             "task {i} write did not land"
         );
         assert!(
-            bytes[i * 1024 + 512..(i + 1) * 1024].iter().all(|&b| b == 0),
+            bytes[i * 1024 + 512..(i + 1) * 1024]
+                .iter()
+                .all(|&b| b == 0),
             "task {i} tail not zeroed"
         );
     }

@@ -510,7 +510,10 @@ fn classify_and_bind(fd: c_int, epoch: u64) {
             if flags < 0 || classify_fd(flags, st.st_mode, st.st_nlink as u64).is_err() {
                 return;
             }
-            match Session::establish(&blob, fd, crate::BUILD_COMMIT) {
+            // VAL-4: `st.st_uid` is the mount-root owner this ladder
+            // already `fstat`ed above — the daemon-authentication trust
+            // anchor (never re-stat'ed inside `establish`).
+            match Session::establish(&blob, fd, crate::BUILD_COMMIT, st.st_uid) {
                 Ok(s) => registry().insert(st.st_dev, shard, s),
                 Err(e) => {
                     // Reason-bearing refusal line (user directive

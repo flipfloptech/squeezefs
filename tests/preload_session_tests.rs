@@ -225,7 +225,7 @@ fn sink_host_geo(
         .unwrap();
     let blob = BootstrapBlob::decode(&host.bootstrap_blob()).unwrap();
     let session =
-        Session::establish(&blob, f.as_raw_fd(), TEST_COMMIT).expect("session establishes");
+        Session::establish(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid()).expect("session establishes");
     let bind = session.bind(f.as_raw_fd()).expect("bind succeeds");
     (host, dir, f, session, bind.binding_id)
 }
@@ -254,6 +254,14 @@ fn test_geometry() -> Geometry {
 }
 
 const TEST_COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+/// VAL-4 (daemon-authentication ladder): the mount-root owner the shim
+/// checks the socket peer against. Harness "mounts" are tempdirs owned
+/// by the test user, so the honest anchor is our own uid.
+fn my_uid() -> u32 {
+    // SAFETY: getuid is trivially safe.
+    unsafe { libc::getuid() }
+}
 
 struct Fixture {
     fs: squeezefs::fuse_client::SqueezefsFilesystem,
@@ -325,7 +333,7 @@ impl Fixture {
         let path = self.dir.path().join(".hello-cred");
         std::fs::write(&path, b"x").expect("cred file");
         let f = std::fs::File::open(&path).expect("open cred");
-        Session::establish(&self.blob(), f.as_raw_fd(), TEST_COMMIT)
+        Session::establish(&self.blob(), f.as_raw_fd(), TEST_COMMIT, my_uid())
             .expect("session must establish")
     }
 
@@ -505,7 +513,7 @@ async fn establish_refuses_on_commit_skew() {
     let f = std::fs::File::open(&path).unwrap();
     let other_commit = "b".repeat(40);
     assert!(
-        Session::establish(&fx.blob(), f.as_raw_fd(), &other_commit).is_err(),
+        Session::establish(&fx.blob(), f.as_raw_fd(), &other_commit, my_uid()).is_err(),
         "a skewed shim identity must refuse to establish (KD-7)"
     );
     fx.host.shutdown();
@@ -548,7 +556,7 @@ async fn stalled_serve_times_out_poisons_and_falls_through() {
         .unwrap();
 
     let blob = BootstrapBlob::decode(&host.bootstrap_blob()).unwrap();
-    let session = Session::establish_with_op_timeout_ms(&blob, f.as_raw_fd(), TEST_COMMIT, 200)
+    let session = Session::establish_with_op_timeout_ms(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid(), 200)
         .expect("session establishes");
     let bind = session.bind(f.as_raw_fd()).expect("bind succeeds");
 
@@ -820,7 +828,7 @@ async fn new_session_on_a_busy_thread_is_served_promptly() {
         .unwrap();
     let blob = BootstrapBlob::decode(&host.bootstrap_blob()).unwrap();
     let session_b =
-        Session::establish(&blob, f_b.as_raw_fd(), TEST_COMMIT).expect("session B establishes");
+        Session::establish(&blob, f_b.as_raw_fd(), TEST_COMMIT, my_uid()).expect("session B establishes");
     let bind_b = session_b.bind(f_b.as_raw_fd()).expect("bind B succeeds");
 
     let start = std::time::Instant::now();
@@ -928,7 +936,7 @@ async fn establish_falls_back_to_the_path_socket_when_abstract_is_unreachable() 
     std::fs::write(&path, b"x").expect("cred file");
     let f = std::fs::File::open(&path).expect("open cred");
     let session = tokio::task::block_in_place(|| {
-        Session::establish(&blob, f.as_raw_fd(), TEST_COMMIT)
+        Session::establish(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid())
             .expect("path-socket fallback must establish")
     });
     assert!(!session.poisoned(), "fallback session is live");
@@ -939,7 +947,7 @@ async fn establish_falls_back_to_the_path_socket_when_abstract_is_unreachable() 
     dead.socket = format!("sqz-il0-nowhere2-{}", std::process::id());
     dead.socket_path = "/tmp/sqz-il0-does-not-exist.sock".to_string();
     let err = tokio::task::block_in_place(|| {
-        match Session::establish(&dead, f.as_raw_fd(), TEST_COMMIT) {
+        match Session::establish(&dead, f.as_raw_fd(), TEST_COMMIT, my_uid()) {
             Ok(_) => panic!("no rendezvous must refuse"),
             Err(e) => e,
         }
@@ -1106,7 +1114,7 @@ fn large_write_pipelines_all_chunks_before_waiting() {
     // Short deadline so the RED shape (serial chunk stranding) fails fast
     // instead of the 30 s default.
     let blob = BootstrapBlob::decode(&host.bootstrap_blob()).unwrap();
-    let session = Session::establish_with_op_timeout_ms(&blob, f.as_raw_fd(), TEST_COMMIT, 2_000)
+    let session = Session::establish_with_op_timeout_ms(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid(), 2_000)
         .expect("session establishes");
     let bind = session.bind(f.as_raw_fd()).expect("bind succeeds");
 
@@ -1359,7 +1367,7 @@ fn large_read_pipelines_all_chunks_before_waiting() {
     let (host, _dir, f, _default_session, _bid) =
         sink_host_geo("wide-read-pipeline", sink.clone(), wide_geometry());
     let blob = BootstrapBlob::decode(&host.bootstrap_blob()).unwrap();
-    let session = Session::establish_with_op_timeout_ms(&blob, f.as_raw_fd(), TEST_COMMIT, 2_000)
+    let session = Session::establish_with_op_timeout_ms(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid(), 2_000)
         .expect("session establishes");
     let bind = session.bind(f.as_raw_fd()).expect("bind succeeds");
 

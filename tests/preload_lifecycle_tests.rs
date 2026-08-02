@@ -164,6 +164,14 @@ impl InvalLog {
 
 const TEST_COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+/// VAL-4 (daemon-authentication ladder): the mount-root owner the shim
+/// checks the socket peer against. Harness "mounts" are tempdirs owned
+/// by the test user, so the honest anchor is our own uid.
+fn my_uid() -> u32 {
+    // SAFETY: getuid is trivially safe.
+    unsafe { libc::getuid() }
+}
+
 struct Fixture {
     fs: squeezefs::fuse_client::SqueezefsFilesystem,
     host: Arc<IpcHost>,
@@ -238,7 +246,7 @@ impl Fixture {
         std::fs::write(&path, b"x").expect("cred file");
         let f = std::fs::File::open(&path).expect("open cred");
         let blob = BootstrapBlob::decode(&self.host.bootstrap_blob()).expect("blob decodes");
-        Session::establish(&blob, f.as_raw_fd(), TEST_COMMIT).expect("session must establish")
+        Session::establish(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid()).expect("session must establish")
     }
 
     async fn create_file(&self, name: &str) -> (u64, OwnedFd) {

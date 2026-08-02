@@ -90,6 +90,14 @@ fn service_ceiling_env_override_is_a_lever() {
 
 const TEST_COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+/// VAL-4 (daemon-authentication ladder): the mount-root owner the shim
+/// checks the socket peer against. Harness "mounts" are tempdirs owned
+/// by the test user, so the honest anchor is our own uid.
+fn my_uid() -> u32 {
+    // SAFETY: getuid is trivially safe.
+    unsafe { libc::getuid() }
+}
+
 fn test_geometry() -> Geometry {
     Geometry {
         ring_entries: 16,
@@ -198,7 +206,7 @@ fn service_threads_spawn_on_bind_no_parked_spares() {
         .open(&path_a)
         .expect("open a");
     let session_a =
-        Session::establish(&blob, f_a.as_raw_fd(), TEST_COMMIT).expect("session A establishes");
+        Session::establish(&blob, f_a.as_raw_fd(), TEST_COMMIT, my_uid()).expect("session A establishes");
     let bind_a = session_a.bind(f_a.as_raw_fd()).expect("bind A");
     wait_for_svc_threads(1, "after session A admitted");
     assert_eq!(
@@ -223,7 +231,7 @@ fn service_threads_spawn_on_bind_no_parked_spares() {
         .open(&path_b)
         .expect("open b");
     let session_b =
-        Session::establish(&blob, f_b.as_raw_fd(), TEST_COMMIT).expect("session B establishes");
+        Session::establish(&blob, f_b.as_raw_fd(), TEST_COMMIT, my_uid()).expect("session B establishes");
     let _bind_b = session_b.bind(f_b.as_raw_fd()).expect("bind B");
     wait_for_svc_threads(2, "after session B admitted");
     assert_eq!(
@@ -418,7 +426,7 @@ async fn production_write_sever_recycles_pooled_buffers() {
         .open(&path)
         .expect("open");
     let session =
-        Session::establish(&blob, f.as_raw_fd(), TEST_COMMIT).expect("session establishes");
+        Session::establish(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid()).expect("session establishes");
     let bind = session.bind(f.as_raw_fd()).expect("bind");
 
     let payload = vec![0xa5u8; 64 * 1024];

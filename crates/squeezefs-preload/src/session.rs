@@ -208,6 +208,16 @@ pub enum SessionError {
     Map(i32),
     /// Session is poisoned (bind on a poisoned session).
     Poisoned,
+    /// VAL-4 step 2: the process answering the socket the MOUNT named is
+    /// neither root nor the mount owner — the credential fd is not sent.
+    PeerUntrusted { peer_uid: u32, mount_uid: u32 },
+    /// VAL-4 step 3: the received session memfd is missing one of
+    /// `F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW` (or the seals could
+    /// not be read) — a mapping the other end can still resize.
+    Unsealed { seals: i32 },
+    /// VAL-4 step 1: the advertised path rendezvous does not resolve
+    /// under a directory an accepted daemon could own — not connected.
+    UntrustedRendezvous,
 }
 
 impl SessionError {
@@ -220,6 +230,11 @@ impl SessionError {
             Self::VersionSkew => 1,
             Self::Protocol => 2,
             Self::Poisoned => 3,
+            // VAL-4 ladder rungs — distinct keys so a mount that refuses
+            // for one authentication cause and later another prints both.
+            Self::PeerUntrusted { .. } => 4,
+            Self::Unsealed { .. } => 5,
+            Self::UntrustedRendezvous => 6,
             Self::Socket(e) => 0x1000 | (*e as u32 & 0xFFF),
             Self::Map(e) => 0x2000 | (*e as u32 & 0xFFF),
             Self::Refused(c) => 0x4000 | (*c & 0xFFF),
@@ -255,6 +270,20 @@ impl SessionError {
             Self::Protocol => "malformed ctl reply / session layout".into(),
             Self::Map(e) => format!("session shm map failed (os error {e})"),
             Self::Poisoned => "session poisoned".into(),
+            Self::PeerUntrusted {
+                peer_uid,
+                mount_uid,
+            } => format!(
+                "daemon authentication failed: socket peer uid {peer_uid} is neither \
+                 root nor the mount owner ({mount_uid}) — not sending the credential fd"
+            ),
+            Self::Unsealed { seals } => format!(
+                "daemon authentication failed: session memfd is not sealed \
+                 (F_GET_SEALS = {seals:#x}; need SEAL|SHRINK|GROW)"
+            ),
+            Self::UntrustedRendezvous => "daemon authentication failed: the advertised \
+                 socket path does not resolve under a root- or owner-private directory"
+                .into(),
         }
     }
 }
@@ -370,10 +399,18 @@ impl Session {
     /// Establish a session from a decoded bootstrap blob + a screened
     /// credential fd (any bound-eligible fd on the mount). `my_commit`
     /// is this shim's build identity (KD-7 equality with the daemon).
+    ///
+    /// `mount_uid` is the **mount root's `st_uid`** — the `fstat` the
+    /// interposer already performed on `cred_fd` before classifying it
+    /// (`interpose.rs`, never re-stat'ed here). It is the trust anchor of
+    /// the VAL-4 daemon-authentication ladder: the blob (socket name
+    /// included) comes from the mount, so the shim must independently
+    /// establish that whoever answers is root or that owner.
     pub fn establish(
         blob: &BootstrapBlob,
         cred_fd: RawFd,
         my_commit: &str,
+        mount_uid: u32,
     ) -> Result<Session, SessionError> {
         let ms = std::env::var("SQUEEZEFS_IL_OP_TIMEOUT_MS")
             .ok()
@@ -383,6 +420,7 @@ impl Session {
             blob,
             cred_fd,
             my_commit,
+            mount_uid,
             ms.map(Duration::from_millis).unwrap_or(OP_TIMEOUT_DEFAULT),
         )
     }
@@ -393,17 +431,28 @@ impl Session {
         blob: &BootstrapBlob,
         cred_fd: RawFd,
         my_commit: &str,
+        mount_uid: u32,
         timeout_ms: u64,
     ) -> Result<Session, SessionError> {
-        Self::establish_inner(blob, cred_fd, my_commit, Duration::from_millis(timeout_ms))
+        Self::establish_inner(
+            blob,
+            cred_fd,
+            my_commit,
+            mount_uid,
+            Duration::from_millis(timeout_ms),
+        )
     }
 
     fn establish_inner(
         blob: &BootstrapBlob,
         cred_fd: RawFd,
         my_commit: &str,
+        mount_uid: u32,
         op_timeout: Duration,
     ) -> Result<Session, SessionError> {
+        // VAL-4 (P0): the daemon-authentication ladder consumes this in
+        // the following commit — red-first, this is pure plumbing.
+        let _ = mount_uid;
         // Client-side KD-7 pre-check: skip the doomed round trip (the
         // daemon enforces the same law authoritatively).
         let allow_dev = std::env::var("SQUEEZEFS_IPC_ALLOW_DEV").is_ok_and(|v| v == "1");

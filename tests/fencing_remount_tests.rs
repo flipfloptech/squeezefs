@@ -12,14 +12,19 @@
 //!
 //! Two contracts here:
 //!
-//! 1. **The remount contract (KNOWN-RED, `#[ignore]`d)**: a real
-//!    process-death (child process stages records from two fencing eras
-//!    for one ino, then `exit()`s without drain) followed by a remount in
-//!    a FRESH process must discard the superseded era's record and keep
-//!    the newest era's record. Red today: the fresh process reads
-//!    `current == 0`, `T1 < 0` is false, and BOTH records are adopted.
+//! 1. **The remount contract (GREEN at S2)**: a real process-death
+//!    (child process stages records from two fencing eras for one ino,
+//!    then `exit()`s without drain) followed by a remount in a FRESH
+//!    process must discard the superseded era's record and keep the
+//!    newest era's record. Red pre-S2: the fresh process read
+//!    `current == 0`, `T1 < 0` was false, and BOTH records were adopted.
 //!    DLM stage **S2** (durable `WriterClaim.term` + composed tokens,
-//!    incompat bit 7 — spec §6.9) is the green-maker.
+//!    incompat bit 7 — spec §6.9) is the green-maker: the remount's term
+//!    bump makes every pre-crash stamp a FOREIGN era, and the sweep
+//!    classifies a foreign era's records against the newest surviving
+//!    stamp FOR THAT INO (per-ino currency — a blanket "discard every
+//!    pre-crash record" would fail the `recovered == 1` arm below, which
+//!    is exactly the crash residue the W2 recovery contract adopts).
 //!
 //! 2. **The in-RAM monotonicity pin (non-ignored)**: the SAME two-era
 //!    shape inside one process must classify correctly — the superseded
@@ -268,24 +273,25 @@ async fn crash_child_stage_two_era_records() {
     std::process::exit(0);
 }
 
-/// §6.11 KNOWN-RED — **the remount contract**: after a real process death,
-/// the mount sweep must still enforce the remount law — the record stamped
+/// §6.11 — **the remount contract**: after a real process death, the
+/// mount sweep must still enforce the remount law — the record stamped
 /// by the SUPERSEDED era (t1, provably older than t2 which is itself
 /// staged beside it) is discarded loudly; the newest-era record is
 /// recovered.
 ///
-/// RED TODAY (spec §6.11): the fresh process's fencing generators read 0,
-/// `t1 < 0` is false, and both records are adopted —
-/// `extent_records_stale_discarded` cannot move at mount time.
+/// RED PRE-S2 (spec §6.11): the fresh process's fencing generators read
+/// 0, `t1 < 0` is false, and both records are adopted —
+/// `extent_records_stale_discarded` could not move at mount time.
 ///
-/// TRACKING: DLM stage **S2** (durable `WriterClaim.term`, composed tokens
+/// GREEN AT S2 (durable `WriterClaim.term`, composed tokens
 /// `(term << 40) | grant_seq`, incompat bit 7 — spec §6.7 decision 4 +
-/// §6.9) is the green-maker; un-ignore this test when S2 lands. S0/S1
-/// deliberately do NOT green it: they change the mint, not its durability.
+/// §6.9): the remount bumps the durable term, so the pre-crash stamps
+/// are a foreign era and the live read can no longer classify them —
+/// the sweep uses the newest surviving stamp for the ino instead, which
+/// discriminates *per-ino currency* (t1 discarded, t2 adopted) rather
+/// than blanket-discarding crash residue. S0/S1 deliberately did NOT
+/// green it: they changed the mint, not its durability.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "KNOWN-RED (spec §6.11): fencing tokens restart at 0 across remount, so the \
-            remount law cannot fire at mount time. DLM stage S2 (durable WriterClaim.term \
-            + composed tokens, incompat bit 7 — spec §6.9) is the green-maker."]
 async fn remount_after_crash_discards_superseded_fencing_records() {
     let _g = serial().await;
     let dir = tempdir().unwrap();

@@ -820,7 +820,11 @@ async fn checkpoint_task(
         }
         if cadence || shutting_down {
             if let Err(e) = tick(&be, &mut last_checkpoint, shutting_down).await {
-                log::warn!(
+                // ENG-3 re-triage: error, not warn — a failed cycle can
+                // carry a failed allocator-bitmap page write (DUR-4's
+                // dirty-set exposure), and this line is the operator's
+                // only signal until that item lands.
+                log::error!(
                     "kv checkpoint tick failed on {:?}: {e} (state stays RAM-consistent; \
                      retrying next tick — barrier failures additionally escalate through \
                      the sync_device rungs, design-metadata-throughput §5.0)",

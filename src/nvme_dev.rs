@@ -212,8 +212,13 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
     let file = match open_opts.open(&device_path) {
         Ok(f) => f,
         Err(_) => {
-            log::warn!(
-                "WARNING: Failed to open NVMe device {:?} with O_DIRECT. Falling back to standard buffered I/O.",
+            // ENG-3 re-triage: error, not warn — in buffered mode nothing
+            // ever flushes these writes (no fsync path on the data device
+            // today), so acknowledged data can be lost on power failure.
+            log::error!(
+                "Failed to open NVMe device {:?} with O_DIRECT; falling back to buffered \
+                 I/O — buffered device writes have no flush path, so acknowledged data \
+                 may be lost on power failure",
                 device_path
             );
             let mut open_opts = OpenOptions::new();

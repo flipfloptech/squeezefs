@@ -89,6 +89,182 @@ pub fn invoking_owner() -> (u32, u32) {
     )
 }
 
+/// System roots the staging stamp refuses to wipe under ANY flag (the
+/// ENG-4 staging-wipe guard): `stamp_staging_dir` runs `remove_dir_all`
+/// on an operator-supplied path — usually as root — so one mistyped
+/// `--disk-cache-paths` must never become a recursive delete of a system
+/// tree. A supplied path is hard-refused (consent never overrides) when,
+/// after normalization AND symlink resolution, it equals one of these
+/// entries or is a path-prefix of one (`/` therefore guards them all).
+/// Subdirectories BELOW an entry (e.g. `/var/cache/squeezefs`) stay
+/// legal — those are exactly where dedicated staging roots live; the
+/// marker/consent precondition still applies to them.
+pub const STAGING_WIPE_DENYLIST: &[&str] =
+    &["/", "/home", "/etc", "/usr", "/var", "/boot", "/root"];
+
+/// The per-mount isolation container mounts create under a staging root
+/// (`<root>/squeezefs/<sanitized-mountpoint>/` — see the mount-side
+/// staging isolation in `fuse_client.rs`). Recognition input for
+/// [`staging_wipe_precheck`].
+const STAGING_ISOLATION_CONTAINER: &str = "squeezefs";
+
+/// Absolute, lexically normalized form of `dir` (trailing slashes and
+/// `.` segments dropped; relative paths anchored at the cwd). No symlink
+/// resolution — [`denylist_refusal`] additionally checks the
+/// canonicalized form when the path exists.
+fn absolute_lexical(dir: &Path) -> PathBuf {
+    let abs = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(dir))
+            .unwrap_or_else(|_| dir.to_path_buf())
+    };
+    abs.components().collect()
+}
+
+/// [`STAGING_WIPE_DENYLIST`] check: `Some(refusal)` when `dir` (lexical
+/// or canonical form) is a protected system path. Runs BEFORE any
+/// filesystem mutation and is consent-independent.
+fn denylist_refusal(dir: &Path) -> Option<SqueezefsError> {
+    let mut candidates = vec![absolute_lexical(dir)];
+    if let Ok(canon) = std::fs::canonicalize(dir) {
+        if !candidates.contains(&canon) {
+            candidates.push(canon);
+        }
+    }
+    for cand in &candidates {
+        for entry in STAGING_WIPE_DENYLIST {
+            let e = Path::new(entry);
+            if cand.as_path() == e || e.starts_with(cand) {
+                return Some(SqueezefsError::InvalidOperation(format!(
+                    "refusing to wipe '{}': it is a protected system path ('{}' matches the \
+                     denylist {}); staging/cache directories must be dedicated \
+                     subdirectories, never system roots",
+                    dir.display(),
+                    cand.display(),
+                    STAGING_WIPE_DENYLIST.join(", "),
+                )));
+            }
+        }
+    }
+    None
+}
+
+/// Does `dir` look like a previously used squeezefs staging root? True
+/// iff its ONLY top-level entry is the `squeezefs/` isolation container
+/// and at least one per-mount dir below it carries the staging
+/// generation marker. Foreign top-level content beside the container
+/// de-recognizes the root: those bytes are not ours to wipe without
+/// consent.
+fn is_recognized_staging_root(dir: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut saw_container = false;
+    for ent in rd.flatten() {
+        if ent.file_name() == std::ffi::OsStr::new(STAGING_ISOLATION_CONTAINER) {
+            saw_container = true;
+        } else {
+            return false;
+        }
+    }
+    if !saw_container {
+        return false;
+    }
+    let Ok(rd) = std::fs::read_dir(dir.join(STAGING_ISOLATION_CONTAINER)) else {
+        return false;
+    };
+    rd.flatten().any(|e| {
+        e.path()
+            .join(crate::cache::nvme::STAGING_GENERATION_MARKER)
+            .is_file()
+    })
+}
+
+/// What a sanctioned wipe of one staging root is about to delete —
+/// printed BEFORE acting (the ENG-4 deletion plan).
+struct StagingWipePlan {
+    total: usize,
+    preview: Vec<String>,
+    recognized: bool,
+}
+
+/// The ENG-4 wipe guard, pure of side effects: denylist hard-refusal,
+/// then the marker/consent precondition. `Ok(None)` = nothing to delete
+/// (missing or empty dir); `Ok(Some(plan))` = the wipe is sanctioned
+/// (recognized staging root, or explicit consent) and `plan` is what
+/// will be removed.
+fn staging_wipe_precheck(dir: &Path, wipe_consent: bool) -> Result<Option<StagingWipePlan>> {
+    if let Some(refusal) = denylist_refusal(dir) {
+        return Err(refusal);
+    }
+    let entries: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(SqueezefsError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to inspect staging/cache dir '{}': {e}",
+                    dir.display()
+                ),
+            )))
+        }
+    };
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let recognized = is_recognized_staging_root(dir);
+    let total = entries.len();
+    let mut preview = entries;
+    preview.sort();
+    preview.truncate(5);
+    if !recognized && !wipe_consent {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "staging/cache directory '{}' is not empty ({total} top-level {}: {}{}) and \
+             carries no squeezefs staging marker — refusing to wipe it. Verify the path, \
+             then re-run with --force to confirm the wipe (config set-cache-paths also \
+             accepts --yes), or point at an empty/new directory",
+            dir.display(),
+            if total == 1 { "entry" } else { "entries" },
+            preview.join(", "),
+            if total > preview.len() { ", …" } else { "" },
+        )));
+    }
+    Ok(Some(StagingWipePlan {
+        total,
+        preview,
+        recognized,
+    }))
+}
+
+/// Print the deletion plan for one sanctioned wipe (ENG-4: the plan is
+/// shown BEFORE anything is removed).
+fn print_wipe_plan(dir: &Path, plan: &StagingWipePlan) {
+    let more = plan.total.saturating_sub(plan.preview.len());
+    println!(
+        "Staging wipe plan for '{}': {} top-level {} will be permanently removed: {}{}{}",
+        dir.display(),
+        plan.total,
+        if plan.total == 1 { "entry" } else { "entries" },
+        plan.preview.join(", "),
+        if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        },
+        if plan.recognized {
+            " [recognized squeezefs staging root]"
+        } else {
+            " [confirmed via --force]"
+        },
+    );
+}
+
 /// Wipe + recreate + OWNERSHIP-STAMP one staging/cache root: the shared
 /// format-grade stamp used by `format --disk-cache-paths` and
 /// `config set-cache-paths`. The root comes up empty (fresh staging
@@ -97,7 +273,34 @@ pub fn invoking_owner() -> (u32, u32) {
 /// `chown -R`. The chown only runs as root (elsewhere it is a no-op by
 /// construction); failures are loud — a half-stamped root is exactly the
 /// EACCES-later trap this exists to close.
-pub async fn stamp_staging_dir(dir: &Path) -> Result<()> {
+///
+/// Guarded (ENG-4): the wipe precheck runs first — protected system
+/// paths ([`STAGING_WIPE_DENYLIST`]) are hard-refused, and a non-empty
+/// dir that does not look like a previously used staging root only
+/// wipes with `wipe_consent` (the caller's `--force`/`--yes`). The
+/// deletion plan prints before the wipe.
+pub async fn stamp_staging_dir(dir: &Path, wipe_consent: bool) -> Result<()> {
+    let plan = staging_wipe_precheck(dir, wipe_consent)?;
+    stamp_precleared_staging_dir(dir, plan.as_ref()).await
+}
+
+/// [`stamp_staging_dir`] for a whole declared set: prechecks EVERY dir
+/// before wiping ANY (a refusal must abort with all directories intact —
+/// never a partial wipe with an unchanged format config).
+pub async fn stamp_staging_dirs(dirs: &[PathBuf], wipe_consent: bool) -> Result<()> {
+    let mut plans = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        plans.push(staging_wipe_precheck(dir, wipe_consent)?);
+    }
+    for (dir, plan) in dirs.iter().zip(&plans) {
+        log::info!("Stamping local staging/cache directory: {:?}", dir);
+        stamp_precleared_staging_dir(dir, plan.as_ref()).await?;
+    }
+    Ok(())
+}
+
+/// The stamp itself, after [`staging_wipe_precheck`] sanctioned it.
+async fn stamp_precleared_staging_dir(dir: &Path, plan: Option<&StagingWipePlan>) -> Result<()> {
     let ctx = |what: &str, e: &std::io::Error| {
         SqueezefsError::Io(std::io::Error::new(
             e.kind(),
@@ -107,6 +310,9 @@ pub async fn stamp_staging_dir(dir: &Path) -> Result<()> {
             ),
         ))
     };
+    if let Some(plan) = plan {
+        print_wipe_plan(dir, plan);
+    }
     match tokio::fs::remove_dir_all(dir).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -240,14 +446,21 @@ pub async fn get_cache_paths(meta_lvs: &[String]) -> Result<Option<Vec<PathBuf>>
 ///   mount stamps a fresh staging generation into empty dirs it can
 ///   actually write (no discard noise, no EACCES). Content safety does
 ///   not depend on the wipe: staging generation-binding discards foreign
-///   content at mount anyway.
+///   content at mount anyway;
+/// - the wipe itself is guarded (ENG-4): system paths are hard-refused
+///   and non-empty dirs with no staging marker need `wipe_consent` (the
+///   CLI's `--force`/`--yes`) — ALL dirs precheck before ANY is wiped.
 ///
 /// The rewrite itself is one setxattr transaction on the FIRST volume's
 /// root inode (where format recorded it), made durable by the v3 journal
 /// and closed with a clean checkpoint shutdown.
 ///
 /// [`format_preflight`]: crate::meta_backend::kv::builder::format_preflight
-pub async fn set_cache_paths(meta_lvs: &[String], paths: &[PathBuf]) -> Result<()> {
+pub async fn set_cache_paths(
+    meta_lvs: &[String],
+    paths: &[PathBuf],
+    wipe_consent: bool,
+) -> Result<()> {
     let first = config_home_volume(meta_lvs).await?;
     let first = &first;
     if paths.is_empty() {
@@ -265,10 +478,10 @@ pub async fn set_cache_paths(meta_lvs: &[String], paths: &[PathBuf]) -> Result<(
     let mut cfg = read_format_config(first).await?;
 
     // 3. Wipe + recreate + ownership-stamp the NEW dirs (format-grade
-    //    cleanliness AND the SUDO_UID ownership rule).
-    for dir in paths {
-        stamp_staging_dir(dir).await?;
-    }
+    //    cleanliness AND the SUDO_UID ownership rule), behind the ENG-4
+    //    guard: every dir prechecks before any is wiped, so a refusal
+    //    leaves all directories AND the recorded config untouched.
+    stamp_staging_dirs(paths, wipe_consent).await?;
 
     // 4. Rewrite the format config on the first volume (journal-durable
     //    commit + clean checkpoint shutdown).

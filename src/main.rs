@@ -1320,13 +1320,23 @@ enum ConfigActions {
     ///
     /// Guarded like format: fails while any client has the volume
     /// mounted. The new directories are wiped so the next mount stamps
-    /// a fresh staging generation into them.
+    /// a fresh staging generation into them. A directory that is not
+    /// empty and was not previously used for squeezefs staging is only
+    /// wiped when --force (or --yes) is passed; system paths such as
+    /// /usr are never wiped.
     SetCachePaths {
         /// Metadata URI (sqmeta://...) of the filesystem to change
         uri: String,
         /// New staging/cache directory paths (replaces the recorded set)
         #[arg(required = true)]
         paths: Vec<PathBuf>,
+        /// Confirm wiping a non-empty directory
+        ///
+        /// The deletion plan is printed before anything is removed.
+        /// Without this flag, only empty, new, or previously used
+        /// squeezefs staging directories are accepted.
+        #[arg(long, short = 'f', alias = "yes")]
+        force: bool,
     },
     /// Show the staging/cache directories recorded at format
     GetCachePaths {
@@ -2302,6 +2312,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut cli = Cli::parse();
 
+    // ENG-3 (the daemon must be audible): the --log-file target must be
+    // openable BEFORE anything else runs. In daemon mode stdio is
+    // redirected to /dev/null, so a swallowed open error means a daemon
+    // running with ALL logging discarded. Checked here in the parent,
+    // pre-fork: the refusal is loud on the caller's console for
+    // foreground and --daemon alike, and nothing is mounted.
+    if let Some(ref log_path) = cli.log_file {
+        if let Err(e) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            eprintln!("Error: cannot open --log-file {}: {e}", log_path.display());
+            std::process::exit(1);
+        }
+    }
+
     // Cache-path policy: staging/cache directories are DECLARED AT FORMAT
     // and recorded in the format config — the single source of truth. A
     // mount-time override is exactly how the stale-staging poisoning
@@ -2573,11 +2600,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 libc::dup2(null_file.as_raw_fd(), 0);
             }
             let output_file = if let Some(ref path) = cli.log_file {
-                std::fs::OpenOptions::new()
+                match std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(path)
-                    .ok()
+                {
+                    Ok(f) => Some(f),
+                    Err(e) => {
+                        // ENG-3: the parent preflighted this open; a
+                        // post-fork failure (target unlinked/permission
+                        // flipped in between) still FAILS the mount over
+                        // the handshake pipe — the daemon must never run
+                        // with all logging discarded.
+                        mount_bootstrap_fail(&format!(
+                            "cannot open --log-file {}: {e}",
+                            path.display()
+                        ));
+                    }
+                }
             } else {
                 None
             };
@@ -2824,14 +2864,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let mut builder = env_logger::Builder::from_default_env();
+    // ENG-3 (the daemon must be audible): default filter is `info` when
+    // RUST_LOG is unset — a stock mount at Error-only silently discarded
+    // reservation preemptions, the job-wire security notice, shard lease
+    // expiries, the O_DIRECT→buffered degradation, checkpoint/bitmap
+    // write failures and teardown failures. An explicit RUST_LOG wins
+    // verbatim (the env-knob convention).
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
     if let Some(ref log_path) = cli.log_file {
-        if let Ok(file) = std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(log_path)
         {
-            builder.target(env_logger::Target::Pipe(Box::new(file)));
+            Ok(file) => {
+                builder.target(env_logger::Target::Pipe(Box::new(file)));
+            }
+            Err(e) => {
+                // Preflighted at startup; a failure here is still never
+                // swallowed — logging must go where the operator asked.
+                eprintln!("Error: cannot open --log-file {}: {e}", log_path.display());
+                std::process::exit(1);
+            }
         }
     }
     builder.init();
@@ -3563,15 +3618,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Wipe + recreate + OWNERSHIP-STAMP every declared staging
-            // root (config_ops::stamp_staging_dir): owned by the INVOKING
+            // root (config_ops::stamp_staging_dirs): owned by the INVOKING
             // user under sudo (SUDO_UID:SUDO_GID), root only for a genuine
             // root deployment — a later user-mode mount must never EACCES
-            // on its own staging.
+            // on its own staging. ENG-4 wipe guard: system paths are
+            // hard-refused and non-empty unmarked dirs need consent —
+            // format's own `--force` doubles as the wipe consent; every
+            // dir prechecks before any is wiped.
             if let Some(ref paths) = disk_cache_paths {
-                for dir in paths {
-                    log::info!("Stamping local staging/cache directory: {:?}", dir);
-                    squeezefs::config_ops::stamp_staging_dir(dir).await?;
-                }
+                squeezefs::config_ops::stamp_staging_dirs(paths, force).await?;
             }
 
             let quick = !full;
@@ -4921,9 +4976,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                          volume-lifecycle capacity verbs land)",
                     ));
                 }
-                ConfigActions::SetCachePaths { uri, paths } => {
+                ConfigActions::SetCachePaths { uri, paths, force } => {
                     let meta_lvs = parse_block_uri(&uri, "sqmeta://")?;
-                    squeezefs::config_ops::set_cache_paths(&meta_lvs, &paths)
+                    squeezefs::config_ops::set_cache_paths(&meta_lvs, &paths, force)
                         .await
                         .map_err(|e| format!("cannot change cache paths: {}", e))?;
                     println!(

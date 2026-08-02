@@ -393,7 +393,10 @@ async fn test_missing_empty_and_marked_dirs_stamp_without_consent() {
         msg.contains("junk") && msg.contains("--force"),
         "the refusal must name the dir and the consent remedy, got: {msg}"
     );
-    assert!(junk.join("stale_junk.bin").exists(), "refusal must not delete");
+    assert!(
+        junk.join("stale_junk.bin").exists(),
+        "refusal must not delete"
+    );
 
     let _ = std::fs::remove_dir_all(&base);
 }

@@ -11419,7 +11419,11 @@ impl SqueezefsFilesystem {
         if let Some(ref backend) = self.meta_backend {
             for vol in &backend.volumes {
                 if let Err(e) = vol.shutdown().await {
-                    warn!("Meta volume unmount teardown failed: {:?}", e);
+                    // ENG-3 re-triage: error, not warn — a failed final
+                    // checkpoint leaves a replay window for the next
+                    // mount (sound, but the clean-shutdown guarantee was
+                    // missed) and must be visible on a stock mount.
+                    error!("Meta volume unmount teardown failed: {:?}", e);
                 }
             }
         }

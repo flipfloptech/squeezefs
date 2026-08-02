@@ -180,6 +180,10 @@ harness = false
 name = "write_path_bench"
 harness = false
 
+[[bench]]
+name = "nvme_issue_bench"
+harness = false
+
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

@@ -665,19 +665,21 @@ fn test_resolve_invoking_owner_rule() {
 async fn test_stamp_staging_dir_creates_wipes_and_owns() {
     let base = scratch("stamp_unit");
 
-    // Missing at stamp: created.
+    // Missing at stamp: created (no wipe consent needed — ENG-4 guard).
     let fresh = base.join("fresh");
-    squeezefs::config_ops::stamp_staging_dir(&fresh)
+    squeezefs::config_ops::stamp_staging_dir(&fresh, false)
         .await
         .expect("stamp a missing staging root");
     assert!(fresh.is_dir(), "stamp must create a missing staging root");
     assert_eq!(owner(&fresh), me(), "non-root stamp keeps self-ownership");
 
-    // Pre-existing with junk: wiped empty.
+    // Pre-existing with junk: wiped empty — with explicit consent (the
+    // ENG-4 staging-wipe guard refuses unmarked non-empty dirs otherwise;
+    // `tests/staging_wipe_guard_tests.rs` pins the refusal classes).
     let dirty = base.join("dirty");
     std::fs::create_dir_all(dirty.join("nested")).unwrap();
     std::fs::write(dirty.join("nested/stale.bin"), b"poison").unwrap();
-    squeezefs::config_ops::stamp_staging_dir(&dirty)
+    squeezefs::config_ops::stamp_staging_dir(&dirty, true)
         .await
         .expect("stamp a pre-existing staging root");
     assert!(dirty.is_dir(), "stamped root must exist");

@@ -18,6 +18,8 @@
 //!    like format (live-mounted volumes refuse), rewrites the format
 //!    config, and wipes the NEW dirs so the next mount stamps a fresh
 //!    generation. `config get-cache-paths <sqmeta-uri>` for symmetry.
+//!    (Since ENG-4 the wipe itself is guarded: non-empty dirs with no
+//!    staging marker need `--force`/`--yes` — `staging_wipe_guard_tests`.)
 //!
 //! All CLI tests drive the real binary (`CARGO_BIN_EXE_squeezefs`); the
 //! library-level contract test pins the cache-less `TieredCache` surface
@@ -531,13 +533,17 @@ fn test_set_cache_paths_admin_op_end_to_end() {
     drop(mount);
 
     // Unmounted: pre-seed junk into the NEW dir — the op must wipe it.
+    // `--force` = the ENG-4 wipe-guard consent: a non-empty dir carrying
+    // no staging marker only wipes with explicit consent (the refusal
+    // classes are pinned in `tests/staging_wipe_guard_tests.rs`).
     std::fs::create_dir_all(&staging_b).unwrap();
     std::fs::write(staging_b.join("stale_junk.bin"), b"poison").unwrap();
     let mut cmd = Command::new(bin());
     cmd.arg("config")
         .arg("set-cache-paths")
         .arg(&meta_uri)
-        .arg(&staging_b);
+        .arg(&staging_b)
+        .arg("--force");
     let (out, _) = run_with_deadline(cmd, Duration::from_secs(30), "set-cache-paths (unmounted)");
     assert!(
         out.status.success(),

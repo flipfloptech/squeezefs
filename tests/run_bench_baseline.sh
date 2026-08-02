@@ -29,6 +29,20 @@
 #                                intersecting benches judged; missing-bench
 #                                detection is skipped)
 #   SQZ_BENCH_THRESHOLD_PCT=N  — override the DEFAULT threshold (10)
+#   SQZ_BENCH_PACED=1          — paced mode: build everything first, then run
+#                                ONE bench binary at a time, waiting between
+#                                binaries until the CPU cools below
+#                                SQZ_BENCH_RESUME_C (default 65 °C) and no
+#                                foreign cargo/rustc is running. Criterion
+#                                persists each group's estimates as it
+#                                completes, so the harvested trees — and the
+#                                resulting reference.json — are identical to
+#                                a monolithic run. For thermally-capped dev
+#                                boxes where one heat-soaked pass would bias
+#                                late groups against early ones.
+#   SQZ_BENCH_RESUME_C=N       — paced-mode resume threshold, °C (default 65)
+#   SQZ_BENCH_WAIT_MAX_S=N     — paced-mode max wait per pause (default 1800);
+#                                exceeding it FAILS loudly (never measures hot)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -47,17 +61,12 @@ fail() { printf '\033[1;31m[bench-baseline] FAIL:\033[0m %s\n' "$*" >&2; exit 1;
 
 command -v python3 >/dev/null || fail "python3 required (median extraction)"
 
-# ── Preflight: quiet box or refuse ──────────────────────────────────────
-preflight() {
-    # Foreign cargo/rustc work: measurement demands a quiet box. Anything
-    # already running when we start is foreign by construction.
-    local busy
-    busy=$(pgrep -x cargo || true; pgrep -x rustc || true)
-    if [[ -n "$busy" ]]; then
-        fail "foreign cargo/rustc running (pids: $(echo "$busy" | tr '\n' ' ')) — poll, never contend"
-    fi
-    # Thermal law: refuse ≥ 80 °C (Tctl/Tdie via hwmon: zenpower/k10temp/coretemp).
-    local hw name t max_mc=0
+# ── Quiet-box probes (shared by preflight and paced-mode waits) ─────────
+
+# Max CPU package temp in millidegrees across the known hwmon drivers
+# (Tctl/Tdie: zenpower/k10temp/coretemp); prints 0 when no sensor exists.
+cpu_temp_mc() {
+    local hw name t v max_mc=0
     for hw in /sys/class/hwmon/hwmon*; do
         [[ -r "$hw/name" ]] || continue
         name=$(<"$hw/name")
@@ -65,12 +74,62 @@ preflight() {
         zenpower|k10temp|coretemp)
             for t in "$hw"/temp[12]_input; do
                 [[ -r "$t" ]] || continue
-                local v; v=$(<"$t")
+                v=$(<"$t")
                 (( v > max_mc )) && max_mc=$v
             done
             ;;
         esac
     done
+    printf '%s\n' "$max_mc"
+}
+
+foreign_work() { pgrep -x cargo || true; pgrep -x rustc || true; }
+
+PACED="${SQZ_BENCH_PACED:-0}"
+RESUME_C="${SQZ_BENCH_RESUME_C:-65}"
+WAIT_MAX_S="${SQZ_BENCH_WAIT_MAX_S:-1800}"
+
+# Paced-mode pause: block until the CPU is below the RESUME threshold AND
+# no foreign cargo/rustc is running. Refuses loudly past WAIT_MAX_S — the
+# harness never measures hot, it just also never gives up silently.
+wait_quiet() {
+    local waited=0 announced=0 mc busy
+    while :; do
+        mc=$(cpu_temp_mc)
+        busy=$(foreign_work)
+        if [[ -z "$busy" ]] && { (( mc == 0 )) || (( mc < RESUME_C * 1000 )); }; then
+            (( waited > 0 )) && say "quiet after ${waited}s (cpu $((mc / 1000)) °C, no foreign work)"
+            return 0
+        fi
+        if (( announced == 0 )); then
+            say "pacing wait: cpu $((mc / 1000)) °C (resume < ${RESUME_C} °C)${busy:+, foreign cargo/rustc: $(echo "$busy" | tr '\n' ' ')} — polling, never contending"
+            announced=1
+        fi
+        sleep 15
+        waited=$(( waited + 15 ))
+        (( waited >= WAIT_MAX_S )) && fail "paced wait exceeded ${WAIT_MAX_S}s without a quiet window — box never cooled/freed (SQZ_BENCH_WAIT_MAX_S raises)"
+    done
+}
+
+# ── Preflight: quiet box or refuse ──────────────────────────────────────
+preflight() {
+    if [[ "$PACED" == "1" ]]; then
+        # Paced mode waits for quiet instead of refusing — same conditions,
+        # poll-never-contend made literal.
+        say "PACED mode: waiting for a quiet window instead of refusing"
+        wait_quiet
+        say "pinning to cpus $CPUS, nice 10, $JOBS build jobs (house thermal law)"
+        return 0
+    fi
+    # Foreign cargo/rustc work: measurement demands a quiet box. Anything
+    # already running when we start is foreign by construction.
+    local busy
+    busy=$(foreign_work)
+    if [[ -n "$busy" ]]; then
+        fail "foreign cargo/rustc running (pids: $(echo "$busy" | tr '\n' ' ')) — poll, never contend"
+    fi
+    # Thermal law: refuse ≥ 80 °C (Tctl/Tdie via hwmon: zenpower/k10temp/coretemp).
+    local max_mc; max_mc=$(cpu_temp_mc)
     if (( max_mc == 0 )); then
         say "WARN: no CPU temperature sensor found — thermal gate skipped"
     elif (( max_mc >= 80000 )); then
@@ -86,12 +145,50 @@ preflight() {
 # structurally noisier (thread contention, async fixture-heavy groups).
 
 run_benches() {
+    if [[ "$PACED" == "1" ]]; then
+        run_benches_paced
+        return
+    fi
     say "running root bench set (this is the NIGHTLY tier — expect tens of minutes)"
     taskset -c "$CPUS" nice -n 10 env CARGO_BUILD_JOBS="$JOBS" \
         cargo bench --benches -- ${FILTER:+"$FILTER"}
     say "running fuse3 bench set (own workspace; --benches: bench targets only)"
     (cd crates/fuse3 && taskset -c "$CPUS" nice -n 10 env CARGO_BUILD_JOBS="$JOBS" \
         cargo bench --benches --features "tokio-runtime,unprivileged" -- ${FILTER:+"$FILTER"})
+}
+
+# Paced mode: compile everything up front (build heat is not measurement
+# heat), then run ONE bench binary at a time behind wait_quiet(). Criterion
+# writes each group's estimates to target/criterion as it completes, so the
+# harvested trees are identical to a monolithic run's.
+run_benches_paced() {
+    local bench
+    say "PACED: building all bench targets first (unmeasured — heat is free here)"
+    env CARGO_BUILD_JOBS="$JOBS" cargo bench --benches --no-run
+    (cd crates/fuse3 && env CARGO_BUILD_JOBS="$JOBS" \
+        cargo bench --benches --features "tokio-runtime,unprivileged" --no-run)
+    # Root workspace: one binary per pause. Names come from the manifest so
+    # a new [[bench]] can never be silently skipped (the missing-bench law).
+    for bench in $(python3 -c '
+import tomllib
+with open("Cargo.toml","rb") as f: m = tomllib.load(f)
+print("\n".join(b["name"] for b in m.get("bench", [])))
+'); do
+        wait_quiet
+        say "PACED: root bench '$bench'"
+        taskset -c "$CPUS" nice -n 10 env CARGO_BUILD_JOBS="$JOBS" \
+            cargo bench --bench "$bench" -- ${FILTER:+"$FILTER"}
+    done
+    for bench in $(cd crates/fuse3 && python3 -c '
+import tomllib
+with open("Cargo.toml","rb") as f: m = tomllib.load(f)
+print("\n".join(b["name"] for b in m.get("bench", [])))
+'); do
+        wait_quiet
+        say "PACED: fuse3 bench '$bench'"
+        (cd crates/fuse3 && taskset -c "$CPUS" nice -n 10 env CARGO_BUILD_JOBS="$JOBS" \
+            cargo bench --bench "$bench" --features "tokio-runtime,unprivileged" -- ${FILTER:+"$FILTER"})
+    done
 }
 
 # Extract {bench_id: median_ns} from both criterion trees into $1.

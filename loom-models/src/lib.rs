@@ -147,6 +147,14 @@
 //!   claim.
 //!
 //! Models run only under `--cfg loom` (see `tests/run_loom.sh`); a plain
+//! - [`zcrx_area_core`]: the zcrx area grant ledger (PR Z2 — per-slot
+//!   refcounts + the MPSC free-return stack feeding the refill ring) —
+//!   invariants: a recycled chunk's re-write never races any consumer's
+//!   payload read (the Arc-pattern Release/Acquire chain extended
+//!   through the stack push/pop), and racing last-ref releases recycle
+//!   each slot exactly once (no loss, no double). Single grant consumer
+//!   is a stated structural precondition (one driver per queue).
+//!
 //! `cargo test` here compiles the cores against std atomics and runs
 //! nothing.
 
@@ -186,6 +194,123 @@ pub mod slot_gate_core;
 pub mod wake_core;
 #[path = "../../src/write_pipeline_core.rs"]
 pub mod write_pipeline_core;
+#[path = "../../src/zcrx_lane/area_core.rs"]
+pub mod zcrx_area_core;
+
+#[cfg(all(test, loom))]
+mod zcrx_area_models {
+    //! [`zcrx_area_core`]: the zcrx area grant ledger (design-zcrx-read-
+    //! lane §4.3/§5, PR Z2) — per-slot refcounts + the MPSC free-return
+    //! stack that feeds the refill ring. Invariants:
+    //! * **recycle-never-races-consumers**: a chunk re-granted to the
+    //!   driver (and re-written — NIC DMA stand-in) can never race a
+    //!   consumer's payload read: every holder's reads happen-before the
+    //!   recycle via the Arc-pattern `fetch_sub(Release)` + 0-crossing
+    //!   `fence(Acquire)`, extended to the driver by the stack's
+    //!   Release-push / Acquire-pop chain. Weakening the fetch_sub to
+    //!   Relaxed, removing the fence, or weakening the push CAS fails
+    //!   this model (weakening-verified — Z2 evidence note).
+    //! * **exactly-once return, no loss**: racing last-ref releases of
+    //!   distinct slots against the single consumer's pops recycle each
+    //!   slot exactly once (none lost, none doubled).
+    //!
+    //! Model precondition (stated because the model cannot see its
+    //! violation, the ipc_ring_core lesson): ONE grant consumer per
+    //! ledger — structural (one driver per queue); the models own a
+    //! single consumer context.
+    use crate::zcrx_area_core::SpanLedger;
+    use loom::cell::UnsafeCell;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    #[test]
+    fn zcrx_chunk_recycle_never_races_consumers() {
+        loom::model(|| {
+            let ledger = Arc::new(SpanLedger::new(1));
+            let cell = Arc::new(UnsafeCell::new(0u32));
+            let slot = ledger.try_grant().expect("fresh ledger grants");
+            // Driver writes the payload (NIC DMA stand-in) BEFORE
+            // publishing refs to the consumers.
+            cell.with_mut(|p| unsafe { *p = 1 });
+            ledger.add_ref(slot); // the second consumer's ref
+            let (l1, c1) = (Arc::clone(&ledger), Arc::clone(&cell));
+            let t1 = thread::spawn(move || {
+                c1.with(|p| assert_eq!(unsafe { *p }, 1, "consumer 1 payload read"));
+                l1.release(0);
+            });
+            let (l2, c2) = (Arc::clone(&ledger), Arc::clone(&cell));
+            let t2 = thread::spawn(move || {
+                c2.with(|p| assert_eq!(unsafe { *p }, 1, "consumer 2 payload read"));
+                l2.release(0);
+            });
+            // The driver polls for the recycle (bounded — loom needs
+            // finite paths); on re-grant it overwrites the payload: if
+            // any consumer read can still be in flight, loom's
+            // UnsafeCell access tracking reports the race.
+            let mut regranted = false;
+            for _ in 0..2 {
+                if let Some(s) = ledger.try_grant() {
+                    assert_eq!(s, 0);
+                    cell.with_mut(|p| unsafe { *p = 2 });
+                    regranted = true;
+                    break;
+                }
+                thread::yield_now();
+            }
+            t1.join().unwrap();
+            t2.join().unwrap();
+            if !regranted {
+                let s = ledger
+                    .try_grant()
+                    .expect("all refs dropped ⇒ the slot recycled");
+                assert_eq!(s, 0);
+                cell.with_mut(|p| unsafe { *p = 2 });
+            }
+            assert!(ledger.try_grant().is_none(), "exactly one recycle grant");
+            assert_eq!(ledger.free_count(), 0);
+        });
+    }
+
+    #[test]
+    fn zcrx_free_stack_returns_exactly_once_no_loss() {
+        loom::model(|| {
+            let ledger = Arc::new(SpanLedger::new(2));
+            let s0 = ledger.try_grant().expect("slot 0");
+            let s1 = ledger.try_grant().expect("slot 1");
+            assert!(ledger.try_grant().is_none(), "ledger drained");
+            let l1 = Arc::clone(&ledger);
+            let t1 = thread::spawn(move || {
+                l1.release(s0);
+            });
+            let l2 = Arc::clone(&ledger);
+            let t2 = thread::spawn(move || {
+                l2.release(s1);
+            });
+            // Single consumer racing both pushes.
+            let mut got = Vec::new();
+            for _ in 0..2 {
+                if let Some(s) = ledger.try_grant() {
+                    got.push(s);
+                }
+            }
+            t1.join().unwrap();
+            t2.join().unwrap();
+            while got.len() < 2 {
+                got.push(
+                    ledger
+                        .try_grant()
+                        .expect("both released ⇒ both grantable (no loss)"),
+                );
+            }
+            got.sort_unstable();
+            let mut want = [s0, s1];
+            want.sort_unstable();
+            assert_eq!(got, want, "each slot recycled exactly once");
+            assert!(ledger.try_grant().is_none(), "no double-recycle");
+            assert_eq!(ledger.free_count(), 0);
+        });
+    }
+}
 
 #[cfg(all(test, loom))]
 mod models {

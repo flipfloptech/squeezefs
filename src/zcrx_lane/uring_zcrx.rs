@@ -571,7 +571,9 @@ pub(crate) fn spawn_ring_driver(
             let shared = Arc::clone(&cfg.shared);
             let poison = Arc::clone(&cfg.session_poison);
             if let Err(why) = drive(cfg, ready, go) {
-                shared.poison(&why, &poison);
+                // drain=true: the driver thread is exiting — no further
+                // events can reach the fill table from this queue.
+                shared.poison(&why, &poison, true);
             }
         })
         .expect("spawn zcrx driver thread")

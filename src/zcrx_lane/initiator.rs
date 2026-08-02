@@ -52,13 +52,64 @@ pub(crate) fn mark_session_poisoned(flag: &AtomicBool) {
     }
 }
 
-/// Raw destination pointer crossing into the reader task. SAFETY contract:
-/// the pointee outlives the op (the caller awaits the op's oneshot before
-/// releasing the buffer), and exactly one reader task writes any given
-/// destination span (per-CID ownership).
+/// Raw destination pointer crossing into the reader task. SAFETY contract
+/// (MEM-3 custody law): the pointee outlives every lane write because
+/// EITHER the caller awaits the op's oneshot before releasing the buffer
+/// (the timeout arm aborts AND joins the queue tasks first), OR the
+/// pending entry owns a keep-alive on the destination allocation
+/// ([`Pending::_keepalive`] — the [`LaneSession::read_into_pooled`] arm),
+/// so a cancelled requester future can never let the allocation recycle
+/// while the reader can still write it. Exactly one reader task writes
+/// any given destination span (per-CID ownership).
 struct SendMutPtr(*mut u8);
 unsafe impl Send for SendMutPtr {}
 unsafe impl Sync for SendMutPtr {}
+
+/// RAII custody of one CID + its depth permit (MEM-3): held by the
+/// PENDING ENTRY, not the requester — the CID and its `cid_gate` permit
+/// return to the pool exactly when the entry is destroyed (driver
+/// completion, send-failure cleanup, or poison drain), never on the
+/// requester's happy path. A cancelled requester future therefore leaks
+/// nothing: the entry survives it and the driver's completion returns
+/// the custody.
+pub(crate) struct CidSlot {
+    cid: u16,
+    pool: Arc<std::sync::Mutex<Vec<u16>>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl CidSlot {
+    pub(crate) fn cid(&self) -> u16 {
+        self.cid
+    }
+}
+
+impl Drop for CidSlot {
+    fn drop(&mut self) {
+        self.pool.lock().expect("cid pool lock").push(self.cid);
+    }
+}
+
+/// Acquire a depth permit + pop a CID as one RAII unit (see [`CidSlot`]).
+pub(crate) async fn take_cid(
+    gate: &Arc<tokio::sync::Semaphore>,
+    pool: &Arc<std::sync::Mutex<Vec<u16>>>,
+) -> Result<CidSlot> {
+    let permit = Arc::clone(gate)
+        .acquire_owned()
+        .await
+        .map_err(|_| io_err("lane queue closed".into()))?;
+    let cid = pool
+        .lock()
+        .expect("cid pool lock")
+        .pop()
+        .ok_or_else(|| io_err("lane CID pool exhausted (permit/pool desync)".into()))?;
+    Ok(CidSlot {
+        cid,
+        pool: Arc::clone(pool),
+        _permit: permit,
+    })
+}
 
 struct Pending {
     dest: SendMutPtr,
@@ -66,15 +117,26 @@ struct Pending {
     received: u64,
     /// CapsuleResp or SUCCESS-elision seen (completion condition).
     tx: Option<oneshot::Sender<Result<()>>>,
+    /// Destination keep-alive (MEM-3): a handle on the allocation behind
+    /// `dest`, held until the entry is destroyed — i.e. until no lane
+    /// context can write the destination. `None` only on the raw
+    /// [`LaneSession::read_into_ptr`] contract, where the CALLER owns
+    /// the allocation's lifetime past cancellation.
+    _keepalive: Option<bytes::Bytes>,
+    /// CID + depth-permit custody (returns at entry destruction).
+    _slot: CidSlot,
 }
 
 struct QueueShared {
-    pending: Mutex<std::collections::HashMap<u16, Pending>>,
-    /// Free CID pool (std mutex — critical sections are push/pop only,
-    /// no await inside; the FillTable precedent). Lock order where both
-    /// are held: `pending` → `free_cids`.
-    free_cids: std::sync::Mutex<Vec<u16>>,
-    cid_gate: tokio::sync::Semaphore,
+    /// std mutex (MEM-3): every critical section is map ops + pointer
+    /// pushes with no await inside (the FillTable precedent), and the
+    /// poison drain must be reliable, not `try_lock`-lossy. Lock order
+    /// where both are held: `pending` → `free_cids` (entry drops return
+    /// CIDs while the map lock is held).
+    pending: std::sync::Mutex<std::collections::HashMap<u16, Pending>>,
+    /// Free CID pool (push/pop only; shared with [`CidSlot`] custody).
+    free_cids: Arc<std::sync::Mutex<Vec<u16>>>,
+    cid_gate: Arc<tokio::sync::Semaphore>,
     /// CID namespace size (== queue depth) — the `cid_slots` diagnostic's
     /// denominator (the MEM-3 no-leak instrument).
     cid_capacity: usize,
@@ -82,18 +144,29 @@ struct QueueShared {
 }
 
 impl QueueShared {
-    fn poison(&self, why: &str, session_poison: &AtomicBool) {
+    /// Queue poison. `drain_pending` MUST be true only when the reader
+    /// task provably writes no destination afterwards (it is exiting, it
+    /// was abort+JOINED, or it never started): draining drops the
+    /// entries' keep-alives, which is what lets destination buffers
+    /// recycle. A writer-side failure passes `false` — the reader is
+    /// still live on the (soon-dead) socket and its own exit performs
+    /// the drain; waiters it would have failed fall back via their own
+    /// 30 s timeouts instead (bounded, loud, never a recycled write).
+    fn poison(&self, why: &str, session_poison: &AtomicBool, drain_pending: bool) {
         if !self.poisoned.swap(true, Ordering::SeqCst) {
             log::error!("zcrx-lane: IO queue poisoned: {why} — lane disarms, kernel path serves");
             mark_session_poisoned(session_poison);
         }
+        if !drain_pending {
+            return;
+        }
         // Fail every waiter loud; their ops retry on the kernel path
-        // (reads are idempotent — design §6).
-        if let Ok(mut map) = self.pending.try_lock() {
-            for (_, mut p) in map.drain() {
-                if let Some(tx) = p.tx.take() {
-                    let _ = tx.send(Err(io_err(format!("lane queue poisoned: {why}"))));
-                }
+        // (reads are idempotent — design §6). Entry drops return CID +
+        // permit custody and release the keep-alives.
+        let mut map = self.pending.lock().expect("pending lock");
+        for (_, mut p) in map.drain() {
+            if let Some(tx) = p.tx.take() {
+                let _ = tx.send(Err(io_err(format!("lane queue poisoned: {why}"))));
             }
         }
     }
@@ -623,11 +696,17 @@ impl LaneSession {
     /// Read `len` bytes at `byte_offset` into `dest`, chunked at the target's
     /// transfer cap, sub-commands issued concurrently (idempotent reads).
     ///
-    /// SAFETY: `dest..dest+len` must be writable and outlive this call; the
-    /// caller keeps the backing allocation alive across the await (pooled
-    /// `Bytes` in the funnel, `&mut [u8]` in [`Self::read_into_slice`]).
-    /// The pointer is wrapped before the async body so the returned future
-    /// stays `Send` (funnel callers run on the multi-thread runtime).
+    /// SAFETY (raw contract): `dest..dest+len` must be writable and the
+    /// caller must keep the backing allocation alive until the op
+    /// COMPLETES — which under cancellation (this future dropped mid-op)
+    /// extends past the drop until the session's driver finishes or the
+    /// session quiesces. Product callers use [`Self::read_into_pooled`]
+    /// (entry-held keep-alive — custody survives cancellation) instead;
+    /// area-backend destinations are only ever written by THIS future
+    /// (requester-side gather), so the raw contract is trivially met
+    /// there. The pointer is wrapped before the async body so the
+    /// returned future stays `Send` (funnel callers run on the
+    /// multi-thread runtime).
     pub fn read_into_ptr(
         &self,
         byte_offset: u64,
@@ -635,15 +714,15 @@ impl LaneSession {
         len: usize,
     ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
         let dest = SendMutPtr(dest);
-        self.read_into_wrapped(byte_offset, dest, len)
+        self.read_into_wrapped(byte_offset, dest, len, None)
     }
 
     /// Pool-backed destination read (the funnel's arm): `keepalive` is a
     /// handle on the allocation behind `dest` (a clone of the pooled
-    /// `Bytes`); the lane holds it until no lane context can touch the
-    /// destination — the MEM-3 cancellation-custody law (a dropped caller
-    /// future must never let the pool recycle a buffer a reader task can
-    /// still write).
+    /// `Bytes`); every classic-lane pending entry holds a clone until the
+    /// driver is finished with its span — the MEM-3 cancellation-custody
+    /// law (a dropped caller future must never let the pool recycle a
+    /// buffer a reader task can still write).
     pub fn read_into_pooled(
         &self,
         byte_offset: u64,
@@ -651,11 +730,8 @@ impl LaneSession {
         len: usize,
         keepalive: bytes::Bytes,
     ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
-        // Scaffold (red): custody not yet wired — the keep-alive drops at
-        // issue, exactly the pre-MEM-3 behavior the contracts fail on.
-        drop(keepalive);
         let dest = SendMutPtr(dest);
-        self.read_into_wrapped(byte_offset, dest, len)
+        self.read_into_wrapped(byte_offset, dest, len, Some(keepalive))
     }
 
     async fn read_into_wrapped(
@@ -663,6 +739,7 @@ impl LaneSession {
         byte_offset: u64,
         dest: SendMutPtr,
         len: usize,
+        keepalive: Option<bytes::Bytes>,
     ) -> Result<()> {
         if self.poisoned() {
             return Err(io_err("lane session poisoned".into()));
@@ -680,7 +757,7 @@ impl LaneSession {
             let seg = cap.min(len - done);
             let seg_off = byte_offset + done as u64;
             let seg_dest = SendMutPtr(unsafe { dest.0.add(done) });
-            futs.push(self.read_segment(seg_off, seg_dest, seg));
+            futs.push(self.read_segment(seg_off, seg_dest, seg, keepalive.clone()));
             done += seg;
         }
         for r in futures::future::join_all(futs).await {
@@ -689,16 +766,39 @@ impl LaneSession {
         Ok(())
     }
 
-    /// Slice-destination convenience (tests + non-pooled callers).
+    /// Slice-destination convenience (tests + non-pooled callers):
+    /// cancellation-safe by construction — the wire read lands in an
+    /// op-owned allocation under the pooled custody law and the slice is
+    /// filled only on success (one extra copy, priced acceptable for a
+    /// convenience API; the funnel never rides this).
     pub async fn read_into_slice(&self, byte_offset: u64, dest: &mut [u8]) -> Result<()> {
-        self.read_into_ptr(byte_offset, dest.as_mut_ptr(), dest.len())
-            .await
+        let len = dest.len();
+        let mut owned = vec![0u8; len];
+        let ptr = owned.as_mut_ptr();
+        // Vec buffer address is stable across the move into the owner.
+        let keep = bytes::Bytes::from_owner(owned);
+        self.read_into_pooled(byte_offset, ptr, len, keep.clone())
+            .await?;
+        dest.copy_from_slice(&keep[..len]);
+        Ok(())
     }
 
-    async fn read_segment(&self, byte_offset: u64, dest: SendMutPtr, len: usize) -> Result<()> {
+    async fn read_segment(
+        &self,
+        byte_offset: u64,
+        dest: SendMutPtr,
+        len: usize,
+        keepalive: Option<bytes::Bytes>,
+    ) -> Result<()> {
         let q = &self.queues[self.next_q.fetch_add(1, Ordering::Relaxed) % self.queues.len()];
         match q {
-            QueueHandle::Classic(q) => self.read_segment_classic(q, byte_offset, dest, len).await,
+            QueueHandle::Classic(q) => {
+                self.read_segment_classic(q, byte_offset, dest, len, keepalive)
+                    .await
+            }
+            // Area backends never hand `dest` to a driver task — the
+            // requester gathers at completion — so the entry needs no
+            // destination keep-alive.
             QueueHandle::Area(q) => self.read_segment_area(q, byte_offset, dest, len).await,
         }
     }
@@ -721,17 +821,20 @@ impl LaneSession {
             return Err(io_err("lane queue poisoned".into()));
         }
         // Admission backpressure (design §4.3): bounded in-flight fills,
-        // never a mid-stream stall. Parking is counted honest.
+        // never a mid-stream stall. Parking is counted honest. The
+        // OWNED permit rides the entry → the fill (MEM-3): admission
+        // accounting stays exact under cancellation — released when the
+        // fill drops (after the requester's gather, or inside the dead
+        // completion channel on a dropped future), never early.
         let units = admission_units(len);
-        let _admission = match shared.admission.try_acquire_many(units) {
+        let admission = match Arc::clone(&shared.admission).try_acquire_many_owned(units) {
             Ok(p) => p,
             Err(tokio::sync::TryAcquireError::NoPermits) => {
                 crate::fuse_client::METRICS
                     .zcrx_area_admission_waits
                     .fetch_add(1, Ordering::Relaxed);
-                shared
-                    .admission
-                    .acquire_many(units)
+                Arc::clone(&shared.admission)
+                    .acquire_many_owned(units)
                     .await
                     .map_err(|_| io_err("lane queue closed".into()))?
             }
@@ -739,29 +842,25 @@ impl LaneSession {
                 return Err(io_err("lane queue closed".into()));
             }
         };
-        let _permit = shared
-            .cid_gate
-            .acquire()
-            .await
-            .map_err(|_| io_err("lane queue closed".into()))?;
-        let cid = shared
-            .free_cids
-            .lock()
-            .expect("cid pool lock")
-            .pop()
-            .ok_or_else(|| io_err("lane CID pool exhausted (permit/pool desync)".into()))?;
-        let rx = shared.table.insert(cid, len);
+        // CID + depth-permit custody lives in the pending entry (MEM-3):
+        // it returns when the driver destroys the entry — completion,
+        // send-failure cancel, or poison drain — never on this
+        // requester's exits, so a dropped future leaks nothing.
+        let slot = take_cid(&shared.cid_gate, &shared.free_cids).await?;
+        let cid = slot.cid();
+        let rx = shared.table.insert(cid, len, slot, Some(admission));
 
         let slba = byte_offset >> self.target.lba_shift;
         let nlb = (len >> self.target.lba_shift) as u32;
         let capsule = pdu::encode_read_capsule(cid, self.target.nsid, slba, nlb, len as u32);
         if q.sink.send(capsule).is_err() {
+            // Capsule never reached the wire: destroy the entry (custody
+            // returns with it).
             shared.table.cancel(cid);
-            shared.free_cids.lock().expect("cid pool lock").push(cid);
             return Err(io_err("lane command sink gone".into()));
         }
 
-        let res = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
             Ok(Ok(Ok(fill))) => {
                 // The gather law (design §4.4): ONE pass from refcounted
                 // area chunks into the destination; dropping the fill
@@ -780,20 +879,17 @@ impl LaneSession {
             Err(_) => {
                 // Quiescence law: drain (abort-and-join tasks / close +
                 // join the ring driver) so no lane context survives
-                // holding chunk refs, then poison loud.
+                // holding chunk refs, then poison loud (drain=true: the
+                // drivers are provably joined).
                 shared.poisoned.store(true, Ordering::SeqCst);
                 mark_session_poisoned(&self.poisoned);
                 q.drain().await;
-                shared.poison("read timed out after 30 s", &self.poisoned);
+                shared.poison("read timed out after 30 s", &self.poisoned, true);
                 Err(io_err(format!(
                     "lane read timed out (offset={byte_offset}, len={len})"
                 )))
             }
-        };
-        if !shared.poisoned.load(Ordering::SeqCst) {
-            shared.free_cids.lock().expect("cid pool lock").push(cid);
         }
-        res
     }
 
     async fn read_segment_classic(
@@ -802,32 +898,28 @@ impl LaneSession {
         byte_offset: u64,
         dest: SendMutPtr,
         len: usize,
+        keepalive: Option<bytes::Bytes>,
     ) -> Result<()> {
         if q.shared.poisoned.load(Ordering::SeqCst) {
             return Err(io_err("lane queue poisoned".into()));
         }
-        let _permit = q
-            .shared
-            .cid_gate
-            .acquire()
-            .await
-            .map_err(|_| io_err("lane queue closed".into()))?;
-        let cid = q
-            .shared
-            .free_cids
-            .lock()
-            .expect("cid pool lock")
-            .pop()
-            .ok_or_else(|| io_err("lane CID pool exhausted (permit/pool desync)".into()))?;
+        // CID + depth-permit custody lives in the pending entry (MEM-3),
+        // alongside the destination keep-alive: the reader task writes
+        // only destinations whose entries exist, and the entry outlives
+        // any cancelled requester — no recycled-buffer write, no leak.
+        let slot = take_cid(&q.shared.cid_gate, &q.shared.free_cids).await?;
+        let cid = slot.cid();
 
         let (tx, rx) = oneshot::channel();
-        q.shared.pending.lock().await.insert(
+        q.shared.pending.lock().expect("pending lock").insert(
             cid,
             Pending {
                 dest,
                 len,
                 received: 0,
                 tx: Some(tx),
+                _keepalive: keepalive,
+                _slot: slot,
             },
         );
 
@@ -835,19 +927,21 @@ impl LaneSession {
         let nlb = (len >> self.target.lba_shift) as u32;
         let capsule = pdu::encode_read_capsule(cid, self.target.nsid, slba, nlb, len as u32);
         if q.to_writer.send(capsule).is_err() {
-            q.shared.pending.lock().await.remove(&cid);
-            q.shared.free_cids.lock().expect("cid pool lock").push(cid);
+            // Capsule never reached the wire: destroy the entry (custody
+            // returns with it).
+            q.shared.pending.lock().expect("pending lock").remove(&cid);
             return Err(io_err("lane writer task gone".into()));
         }
 
-        let res = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => Err(io_err("lane completion channel dropped".into())),
             Err(_) => {
                 // Quiescence law: the reader task holds raw pointers into
                 // this (and other) destination buffers. Before this frame
                 // returns — and the caller's buffer can be dropped/recycled
-                // — abort AND join the queue's tasks so no writer survives.
+                // — abort AND join the queue's tasks so no writer survives;
+                // only then drain (dropping entry keep-alives).
                 q.shared.poisoned.store(true, Ordering::SeqCst);
                 mark_session_poisoned(&self.poisoned);
                 let mut ts = q.tasks.lock().await;
@@ -858,24 +952,21 @@ impl LaneSession {
                     let _ = t.await;
                 }
                 drop(ts);
-                q.shared.poison("read timed out after 30 s", &self.poisoned);
+                q.shared
+                    .poison("read timed out after 30 s", &self.poisoned, true);
                 Err(io_err(format!(
                     "lane read timed out (offset={byte_offset}, len={len})"
                 )))
             }
-        };
-        if !q.shared.poisoned.load(Ordering::SeqCst) {
-            q.shared.free_cids.lock().expect("cid pool lock").push(cid);
         }
-        res
     }
 }
 
 fn spawn_queue(stream: TcpStream, depth: u16, session_poison: Arc<AtomicBool>) -> IoQueue {
     let shared = Arc::new(QueueShared {
-        pending: Mutex::new(std::collections::HashMap::new()),
-        free_cids: std::sync::Mutex::new((0..depth).collect()),
-        cid_gate: tokio::sync::Semaphore::new(depth as usize),
+        pending: std::sync::Mutex::new(std::collections::HashMap::new()),
+        free_cids: Arc::new(std::sync::Mutex::new((0..depth).collect())),
+        cid_gate: Arc::new(tokio::sync::Semaphore::new(depth as usize)),
         cid_capacity: depth as usize,
         poisoned: AtomicBool::new(false),
     });
@@ -886,13 +977,18 @@ fn spawn_queue(stream: TcpStream, depth: u16, session_poison: Arc<AtomicBool>) -
     let p2 = Arc::clone(&session_poison);
     let writer = tokio::spawn(async move {
         if let Err(why) = writer_loop(write_half, rx).await {
-            s2.poison(&why, &p2);
+            // drain=false: the reader may still be mid-write on a live
+            // entry — its own exit (or the timeout arm's abort+join)
+            // performs the drain (MEM-3 drain discipline).
+            s2.poison(&why, &p2, false);
         }
     });
     let s3 = Arc::clone(&shared);
     let reader = tokio::spawn(async move {
         if let Err(why) = reader_loop(read_half, &s3).await {
-            s3.poison(&why, &session_poison);
+            // drain=true: the reader is exiting — no further destination
+            // writes are possible from this queue.
+            s3.poison(&why, &session_poison, true);
         }
     });
 
@@ -928,7 +1024,7 @@ async fn reader_loop(
     loop {
         if let Err(e) = r.read_exact(&mut hdr[..8]).await {
             // EOF with nothing pending = orderly teardown.
-            if shared.pending.lock().await.is_empty()
+            if shared.pending.lock().expect("pending lock").is_empty()
                 && e.kind() == std::io::ErrorKind::UnexpectedEof
             {
                 return Ok(());
@@ -968,51 +1064,58 @@ async fn reader_loop(
                     .zcrx_hdr_copy_bytes
                     .fetch_add(ch.pdo as u64, Ordering::Relaxed);
 
-                let mut map = shared.pending.lock().await;
-                let p = match map.get_mut(&c2h.cccid) {
-                    Some(p) => p,
-                    None => {
+                // Guard scope-bounded: a std MutexGuard must provably end
+                // before the socket await (the future stays Send).
+                let span = {
+                    let mut map = shared.pending.lock().expect("pending lock");
+                    let p = match map.get_mut(&c2h.cccid) {
+                        Some(p) => p,
+                        None => {
+                            metrics
+                                .zcrx_frame_violations
+                                .fetch_add(1, Ordering::Relaxed);
+                            return Err(format!("C2HData for unknown CID {}", c2h.cccid));
+                        }
+                    };
+                    let end = c2h.datao as usize + c2h.datal as usize;
+                    if end > p.len {
                         metrics
                             .zcrx_frame_violations
                             .fetch_add(1, Ordering::Relaxed);
-                        return Err(format!("C2HData for unknown CID {}", c2h.cccid));
+                        return Err(format!(
+                            "C2HData span {}..{} exceeds command length {}",
+                            c2h.datao, end, p.len
+                        ));
                     }
+                    // SAFETY: per-CID span ownership (struct contract) — the
+                    // destination is kept alive by the pending entry (or the
+                    // raw-contract caller) and only this reader writes it.
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            p.dest.0.add(c2h.datao as usize),
+                            c2h.datal as usize,
+                        )
+                    }
+                    // map lock ends here — never held across socket I/O
                 };
-                let end = c2h.datao as usize + c2h.datal as usize;
-                if end > p.len {
-                    metrics
-                        .zcrx_frame_violations
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(format!(
-                        "C2HData span {}..{} exceeds command length {}",
-                        c2h.datao, end, p.len
-                    ));
-                }
-                // SAFETY: per-CID span ownership (struct contract) — the
-                // destination outlives the op and only this reader writes it.
-                let span = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        p.dest.0.add(c2h.datao as usize),
-                        c2h.datal as usize,
-                    )
-                };
-                drop(map); // never hold the map lock across socket I/O
                 r.read_exact(span)
                     .await
                     .map_err(|e| format!("C2HData payload read: {e}"))?;
 
-                let mut map = shared.pending.lock().await;
-                if let Some(p) = map.get_mut(&c2h.cccid) {
-                    p.received += c2h.datal as u64;
-                    if c2h.success {
-                        if !c2h.last {
-                            metrics
-                                .zcrx_frame_violations
-                                .fetch_add(1, Ordering::Relaxed);
-                            return Err("SUCCESS on a non-LAST C2HData".into());
+                {
+                    let mut map = shared.pending.lock().expect("pending lock");
+                    if let Some(p) = map.get_mut(&c2h.cccid) {
+                        p.received += c2h.datal as u64;
+                        if c2h.success {
+                            if !c2h.last {
+                                metrics
+                                    .zcrx_frame_violations
+                                    .fetch_add(1, Ordering::Relaxed);
+                                return Err("SUCCESS on a non-LAST C2HData".into());
+                            }
+                            let mut p = map.remove(&c2h.cccid).expect("checked above");
+                            complete(&mut p, metrics);
                         }
-                        let mut p = map.remove(&c2h.cccid).expect("checked above");
-                        complete(&mut p, metrics);
                     }
                 }
             }
@@ -1028,7 +1131,7 @@ async fn reader_loop(
                     return Err(format!("CapsuleResp hlen {hlen} < 24"));
                 }
                 let cqe = pdu::parse_cqe(&hdr[8..24]).map_err(|e| e.to_string())?;
-                let mut map = shared.pending.lock().await;
+                let mut map = shared.pending.lock().expect("pending lock");
                 let Some(mut p) = map.remove(&cqe.cid) else {
                     metrics
                         .zcrx_frame_violations

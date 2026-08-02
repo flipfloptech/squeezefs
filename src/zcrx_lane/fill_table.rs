@@ -31,10 +31,15 @@ fn io_err(msg: String) -> SqueezefsError {
 
 /// One completed fill: the command's payload as refcounted area spans.
 /// Dropping it releases every chunk ref (the refill discipline's last
-/// edge); [`ZcrxFill::gather_into`] is the ONE priced completion pass.
+/// edge) AND the op's admission permits — on the requester's normal exit
+/// after the gather, or inside the dead completion channel when the
+/// requester future was cancelled (MEM-3: admission accounting stays
+/// exact under future-drop). [`ZcrxFill::gather_into`] is the ONE priced
+/// completion pass.
 pub struct ZcrxFill {
     segs: Vec<(u32, AreaSlice)>,
     len: usize,
+    _admission: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl ZcrxFill {
@@ -70,6 +75,14 @@ struct PendingFill {
     received: u64,
     segs: Vec<(u32, AreaSlice)>,
     tx: Option<oneshot::Sender<Result<ZcrxFill>>>,
+    /// Admission custody: moves into the completed [`ZcrxFill`]; released
+    /// with the entry on error/poison paths (MEM-3 exact accounting).
+    admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// CID + depth-permit custody — returns when the entry is destroyed
+    /// (completion, send-failure cancel, or poison drain), never on the
+    /// requester's exits (the MEM-3 no-leak law; lock order: this table's
+    /// `pending` → the slot's CID pool).
+    _slot: super::initiator::CidSlot,
 }
 
 /// CID → in-flight fill map (see module docs).
@@ -88,8 +101,16 @@ impl FillTable {
     }
 
     /// Register an in-flight command; the receiver resolves at
-    /// completion (fill or op error).
-    pub fn insert(&self, cid: u16, len: usize) -> oneshot::Receiver<Result<ZcrxFill>> {
+    /// completion (fill or op error). The entry takes custody of the
+    /// op's CID slot and admission permits (see [`PendingFill`]).
+    pub(crate) fn insert(
+        &self,
+        cid: u16,
+        len: usize,
+        slot: super::initiator::CidSlot,
+        admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> oneshot::Receiver<Result<ZcrxFill>> {
+        debug_assert_eq!(slot.cid(), cid, "slot/cid custody mismatch");
         let (tx, rx) = oneshot::channel();
         let prev = self.pending.lock().expect("fill table lock").insert(
             cid,
@@ -98,14 +119,17 @@ impl FillTable {
                 received: 0,
                 segs: Vec::new(),
                 tx: Some(tx),
+                admission,
+                _slot: slot,
             },
         );
         debug_assert!(prev.is_none(), "CID reuse while pending");
         rx
     }
 
-    /// Cancel a registration (send-side failure before the wire).
-    pub fn cancel(&self, cid: u16) {
+    /// Cancel a registration (send-side failure before the wire — the
+    /// entry drop returns CID/permit custody).
+    pub(crate) fn cancel(&self, cid: u16) {
         self.pending.lock().expect("fill table lock").remove(&cid);
     }
 
@@ -190,7 +214,11 @@ impl FillTable {
 
 /// Completion law (exact length — the nvme_dev exact-length contract):
 /// short data with a success status is a framing violation, never
-/// partial data (counted here, matching the Z1 classic path).
+/// partial data (counted here, matching the Z1 classic path). Admission
+/// custody rides the fill; the entry's CID slot returns when `p` drops —
+/// after the send, so a fresh op can only reuse the CID once this entry
+/// is gone (cancelled requesters included: the failed send drops the
+/// fill, releasing spans + admission right here).
 fn complete(mut p: PendingFill) {
     let ok = p.received == p.len as u64;
     if !ok {
@@ -203,6 +231,7 @@ fn complete(mut p: PendingFill) {
             Ok(ZcrxFill {
                 segs: std::mem::take(&mut p.segs),
                 len: p.len,
+                _admission: p.admission.take(),
             })
         } else {
             Err(io_err(format!(

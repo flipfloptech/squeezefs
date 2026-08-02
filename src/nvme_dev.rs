@@ -678,7 +678,14 @@ impl NvmeBlockDev {
             return None;
         }
         let (buf_ptr, bytes) = crate::cache::pool::read_bounce_pool(size).alloc();
-        match sess.read_into_ptr(offset, buf_ptr, size).await {
+        // MEM-3 custody: the lane holds a clone of the pooled `Bytes`
+        // until no lane context can write the destination — a cancelled
+        // funnel future can never let the pool recycle a buffer the
+        // classic reader task still holds a span pointer into.
+        match sess
+            .read_into_pooled(offset, buf_ptr, size, bytes.clone())
+            .await
+        {
             Ok(()) => {
                 let m = &crate::fuse_client::METRICS;
                 m.zcrx_fills

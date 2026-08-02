@@ -1298,9 +1298,7 @@ async fn test_mem3_classic_cancellation_holds_destination_keepalive() {
 
     let sess2 = Arc::clone(&sess);
     let h = tokio::spawn(async move {
-        let _ = sess2
-            .read_into_pooled(0, ptr as *mut u8, len, keep)
-            .await;
+        let _ = sess2.read_into_pooled(0, ptr as *mut u8, len, keep).await;
     });
     assert!(
         poll_true(5, || seen.load(std::sync::atomic::Ordering::SeqCst) > 0).await,

@@ -37,15 +37,19 @@ pub(crate) fn admission_units(len: usize) -> u32 {
 /// Shared state of one area queue.
 pub(crate) struct AreaShared {
     pub table: FillTable,
-    /// Free CID pool (std mutex — push/pop only, no await inside; lock
-    /// order where both are held: fill-table `pending` → `free_cids`).
-    pub free_cids: std::sync::Mutex<Vec<u16>>,
-    pub cid_gate: tokio::sync::Semaphore,
+    /// Free CID pool (std mutex — push/pop only, no await inside; shared
+    /// with [`super::initiator::CidSlot`] custody. Lock order where both
+    /// are held: fill-table `pending` → `free_cids`).
+    pub free_cids: Arc<std::sync::Mutex<Vec<u16>>>,
+    pub cid_gate: Arc<tokio::sync::Semaphore>,
     /// CID namespace size (== queue depth) — the `cid_slots` diagnostic's
     /// denominator (the MEM-3 no-leak instrument).
     pub cid_capacity: usize,
-    /// In-flight payload admission (see [`admission_permits`]).
-    pub admission: tokio::sync::Semaphore,
+    /// In-flight payload admission (see [`admission_permits`]); Arc'd so
+    /// OWNED permits can ride the pending fill → the completed
+    /// [`super::fill_table::ZcrxFill`] (exact accounting under
+    /// cancellation — the MEM-3 custody law's admission face).
+    pub admission: Arc<tokio::sync::Semaphore>,
     pub poisoned: AtomicBool,
 }
 
@@ -53,25 +57,31 @@ impl AreaShared {
     pub(crate) fn new(depth: u16, area: &ZcrxArea) -> Arc<AreaShared> {
         Arc::new(AreaShared {
             table: FillTable::new(),
-            free_cids: std::sync::Mutex::new((0..depth).collect()),
-            cid_gate: tokio::sync::Semaphore::new(depth as usize),
+            free_cids: Arc::new(std::sync::Mutex::new((0..depth).collect())),
+            cid_gate: Arc::new(tokio::sync::Semaphore::new(depth as usize)),
             cid_capacity: depth as usize,
-            admission: tokio::sync::Semaphore::new(admission_permits(
+            admission: Arc::new(tokio::sync::Semaphore::new(admission_permits(
                 area.len(),
                 area.chunk_bytes(),
-            )),
+            ))),
             poisoned: AtomicBool::new(false),
         })
     }
 
-    /// Queue-level poison: fail every waiter (their segs drop → chunks
-    /// recycle) and propagate to the session lattice (counted once).
-    pub(crate) fn poison(&self, why: &str, session_poison: &AtomicBool) {
+    /// Queue-level poison: propagate to the session lattice (counted
+    /// once) and — when `drain` is true — fail every waiter (their segs
+    /// drop → chunks recycle; entry drops return CID/permit custody).
+    /// `drain` MUST be true only when the queue's driver provably pushes
+    /// no further events (it is exiting, or it was joined) — the MEM-3
+    /// drain discipline mirrored from the classic lane.
+    pub(crate) fn poison(&self, why: &str, session_poison: &AtomicBool, drain: bool) {
         if !self.poisoned.swap(true, Ordering::SeqCst) {
             log::error!("zcrx-lane: IO queue poisoned: {why} — lane disarms, kernel path serves");
             mark_session_poisoned(session_poison);
         }
-        self.table.fail_all(why);
+        if drain {
+            self.table.fail_all(why);
+        }
     }
 }
 
@@ -140,14 +150,17 @@ pub(crate) fn spawn_area_queue(
     let p2 = Arc::clone(&session_poison);
     let writer = tokio::spawn(async move {
         if let Err(why) = super::initiator::writer_loop(write_half, rx).await {
-            s2.poison(&why, &p2);
+            // drain=false: the reader/driver may still be applying events
+            // — its own exit performs the drain (MEM-3 drain discipline).
+            s2.poison(&why, &p2, false);
         }
     });
     let s3 = Arc::clone(&shared);
     let a3 = Arc::clone(&area);
     let reader = tokio::spawn(async move {
         if let Err(why) = sim_reader_loop(read_half, &a3, &s3).await {
-            s3.poison(&why, &session_poison);
+            // drain=true: the driver is exiting — no further events.
+            s3.poison(&why, &session_poison, true);
         }
     });
 

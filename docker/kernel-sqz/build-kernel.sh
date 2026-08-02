@@ -73,12 +73,15 @@ make -j"${JOBS}" INSTALL_MOD_STRIP=1 binrpm-pkg 2>&1 | tail -40
 echo "== artifacts =="
 mkdir -p /out
 # binrpm-pkg writes into the in-tree rpmbuild _topdir (see the rpmbuild
-# --define in scripts/Makefile.package), not ~/rpmbuild.
-found=$(find "/work/linux-${KVER}/rpmbuild/RPMS" /root/rpmbuild/RPMS \
-	-name '*.rpm' 2>/dev/null | wc -l)
+# --define in scripts/Makefile.package), not ~/rpmbuild — but probe both.
+# NOTE: find must tolerate the absent probe path: under `set -euo pipefail`
+# a bare `found=$(find missing … | wc -l)` dies on find's nonzero exit
+# BEFORE the guard runs (the v2 build's first artifact-stage failure).
+found=$( { find "/work/linux-${KVER}/rpmbuild/RPMS" /root/rpmbuild/RPMS \
+	-name '*.rpm' 2>/dev/null || true; } | wc -l)
 [ "$found" -gt 0 ] || { echo "no RPMs produced"; exit 1; }
-find "/work/linux-${KVER}/rpmbuild/RPMS" /root/rpmbuild/RPMS \
-	-name '*.rpm' -exec cp -v {} /out/ \; 2>/dev/null
+{ find "/work/linux-${KVER}/rpmbuild/RPMS" /root/rpmbuild/RPMS \
+	-name '*.rpm' -exec cp -v {} /out/ \; 2>/dev/null || true; }
 cp .config /out/config-${KVER}-sqz
 sha256sum /out/*.rpm | tee /out/SHA256SUMS
 echo "sqz kernel build complete: $(make -s kernelrelease)"

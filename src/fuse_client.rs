@@ -3575,6 +3575,22 @@ pub struct Metrics {
     /// Fast-path in-guard cache-miss demotions (attr/metadata/buffer) —
     /// growth on warm workloads = fast-path rot.
     pub ipc_fast_path_miss_demotions: Align64<AtomicU64>,
+    /// IL hold-probe engagement pair (il-hold-probe campaign,
+    /// 2026-08-03; charter `.benchmarks/2026-08-02-il-anomalies.md` §2 —
+    /// the ~220 k/row warm serves the DIALED-P1.5 prelude was missing):
+    /// ring reads served from the read-lane hold by the §5.5.1 sync
+    /// fast path's hold leg, on the service thread, before any
+    /// demotion/direct-drive. A bracket row is INVALID unless these
+    /// deltas account for its hold serves. 0 by construction under
+    /// `SQUEEZEFS_READ_LANE=0` (the A0 lever — probe structurally
+    /// inert) and on `direct_device_true` mounts (kernel-parity: the
+    /// device-true posture skips every warm leg by POLICY).
+    pub ipc_hold_probe_serves: Align64<AtomicU64>,
+    /// The pair's miss half: hold probes that ran (lane armed, binding
+    /// resolved, hot leg missed) and found nothing — the op continues
+    /// on its existing path unchanged (leg 3 → demote/direct-drive).
+    /// `serves + misses` ≈ executed probes: the engagement instrument.
+    pub ipc_hold_probe_misses: Align64<AtomicU64>,
     /// Gauge: SPAWNED IPC service threads (spawn-on-bind, ingest-economy
     /// 2026-07-28 — 0 on a session-less host; ceiling =
     /// `SQUEEZEFS_IPC_SERVICE_THREADS` / the shared sizing derivation).
@@ -5634,6 +5650,8 @@ impl SqueezefsFilesystem {
                 "ipc_async_handoffs": METRICS.ipc_async_handoffs.load(Ordering::Relaxed),
                 "ipc_fast_path_lock_demotions": METRICS.ipc_fast_path_lock_demotions.load(Ordering::Relaxed),
                 "ipc_fast_path_miss_demotions": METRICS.ipc_fast_path_miss_demotions.load(Ordering::Relaxed),
+                "ipc_hold_probe_serves": METRICS.ipc_hold_probe_serves.load(Ordering::Relaxed),
+                "ipc_hold_probe_misses": METRICS.ipc_hold_probe_misses.load(Ordering::Relaxed),
                 "ipc_service_threads": METRICS.ipc_service_threads.load(Ordering::Relaxed),
                 "ipc_service_parks": METRICS.ipc_service_parks.load(Ordering::Relaxed),
                 "ipc_severed_pool_hits": METRICS.ipc_severed_pool_hits.load(Ordering::Relaxed),

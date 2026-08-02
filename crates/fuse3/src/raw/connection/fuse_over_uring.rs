@@ -1879,17 +1879,102 @@ struct SqpollGroup {
 /// deadline even on a badly oversubscribed box.
 const SQPOLL_LEADER_WAIT: Duration = Duration::from_secs(10);
 
+/// Queue-ring setup posture (PERF-5, pre-rc spec §9).
+///
+/// `Modern` = today's SQE128 + cqsize setup PLUS
+/// `IORING_SETUP_SINGLE_ISSUER` + `IORING_SETUP_DEFER_TASKRUN` (the
+/// flags pair — the kernel refuses DEFER_TASKRUN without SINGLE_ISSUER).
+/// The queue workers are one-thread-per-ring by construction
+/// (`queue_worker` builds its ring on its own spawned thread and is the
+/// only submitter/reaper — `submit_and_wait(1)` at the loop bottom), so
+/// SINGLE_ISSUER is free, and DEFER_TASKRUN moves completion task-work
+/// onto that same thread's `io_uring_enter` instead of inter-processor
+/// interrupts.
+///
+/// `Plain` = today's setup byte-identical — the landing spot for
+/// probe-miss kernels (SILENT — portable-by-default: probe, never
+/// version-check) and for a Modern build refusal (warn-and-degrade; an
+/// accelerator never fails the mount).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueueRingPosture {
+    Modern,
+    Plain,
+}
+
 /// The knob-unset queue-ring builder — today's SQE128 ring, and the
-/// landing spot for every SQPOLL refusal (warn-and-degrade).
+/// landing spot for every SQPOLL refusal (warn-and-degrade). NOTE the
+/// SQPOLL builders in [`build_queue_ring`] never take the Modern flags:
+/// DEFER_TASKRUN is kernel-incompatible with SQPOLL (the poller owns
+/// task-work), and the SQPOLL posture is a knob-only measured-not-
+/// recommended lever (M10).
 fn build_plain_queue_ring(sq_entries: u32) -> io::Result<Ring> {
-    IoUring::<squeue::Entry128, cqueue::Entry>::builder()
-        .setup_cqsize(sq_entries * 2)
-        .build(sq_entries)
-        .map_err(|e| {
-            io::Error::other(format!(
-                "SQE128 IoUring build(sq={sq_entries}): {e} — need IORING_SETUP_SQE128"
-            ))
-        })
+    build_plain_queue_ring_with(
+        sq_entries,
+        modern_queue_ring_flags_probed(),
+        |sq, _posture| {
+            IoUring::<squeue::Entry128, cqueue::Entry>::builder()
+                .setup_cqsize(sq * 2)
+                .build(sq)
+                .map_err(|e| {
+                    io::Error::other(format!(
+                        "SQE128 IoUring build(sq={sq}): {e} — need IORING_SETUP_SQE128"
+                    ))
+                })
+        },
+    )
+}
+
+/// PERF-5 runtime capability probe (portable-by-default: probe, NEVER a
+/// kernel-version check): can this kernel build the queue-ring shape
+/// with `IORING_SETUP_SINGLE_ISSUER` + `IORING_SETUP_DEFER_TASKRUN`?
+/// A scratch SQE128 ring is built with the exact flag set and dropped;
+/// pre-6.1 kernels refuse at `io_uring_setup` (EINVAL) ⇒ `false` ⇒ the
+/// Plain posture, today's setup byte-identical. Memoized per process
+/// (the capability is process-invariant; the kmbuf-probe convention) —
+/// derived defaults resolve at spawn, never on a cadence.
+fn modern_queue_ring_flags_probed() -> bool {
+    static PROBE: OnceLock<bool> = OnceLock::new();
+    *PROBE.get_or_init(|| {
+        let ok = IoUring::<squeue::Entry128, cqueue::Entry>::builder()
+            .setup_cqsize(8)
+            .setup_single_issuer()
+            .setup_defer_taskrun()
+            .build(4)
+            .is_ok();
+        info!(
+            "fuse-over-uring queue-ring setup probe: SINGLE_ISSUER+DEFER_TASKRUN {}",
+            if ok {
+                "available"
+            } else {
+                "unavailable — plain setup (pre-6.1 kernel)"
+            }
+        );
+        ok
+    })
+}
+
+/// The injectable setup seam (PERF-5 fallback contract, pinned by
+/// `queue_ring_posture_tests`):
+/// - `modern == true` (the runtime probe found the flags) ⇒ attempt the
+///   [`QueueRingPosture::Modern`] build FIRST; a refusal warns and lands
+///   on the Plain build — never fails the mount over an accelerator.
+/// - `modern == false` (probe miss — pre-6.1 kernels) ⇒ build Plain
+///   directly, SILENTLY: today's setup, byte-identical, zero extra
+///   syscalls per ring.
+fn build_plain_queue_ring_with<F>(sq_entries: u32, modern: bool, mut build: F) -> io::Result<Ring>
+where
+    F: FnMut(u32, QueueRingPosture) -> io::Result<Ring>,
+{
+    // Pre-fix stub (RED): the probed posture is recognized but NOT yet
+    // engaged — every ring builds Plain, exactly today's behavior (the
+    // battery compiles and fails honestly; the green commit engages the
+    // Modern arm).
+    let _recognized = if modern {
+        QueueRingPosture::Modern
+    } else {
+        QueueRingPosture::Plain
+    };
+    build(sq_entries, QueueRingPosture::Plain)
 }
 
 /// Build one queue ring per the session's SQPOLL posture (§5.3 D3.b).
@@ -3846,6 +3931,116 @@ mod tests {
             }),
             "bad _CPU ⇒ unpinned, idle still honored"
         );
+    }
+
+    /// PERF-5 fallback contract on the injectable setup seam
+    /// (`build_plain_queue_ring_with`): a probed-modern kernel attempts
+    /// SINGLE_ISSUER+DEFER_TASKRUN first, a Modern refusal degrades to
+    /// the Plain build (never fails the mount), and a probe-miss kernel
+    /// builds Plain directly and SILENTLY — today's setup with zero
+    /// extra build attempts (portable-by-default: the probe is the only
+    /// capability source, never a version check).
+    mod queue_ring_posture {
+        use super::*;
+
+        fn real_plain_ring(sq: u32) -> io::Result<Ring> {
+            IoUring::<squeue::Entry128, cqueue::Entry>::builder()
+                .setup_cqsize(sq * 2)
+                .build(sq)
+                .map_err(io::Error::other)
+        }
+
+        /// Probe hit ⇒ the Modern posture is attempted FIRST and its
+        /// success is the delivered ring (exactly one build attempt).
+        #[test]
+        fn probed_modern_attempts_modern_first() {
+            let mut seq = Vec::new();
+            let ring = build_plain_queue_ring_with(16, true, |sq, posture| {
+                seq.push(posture);
+                real_plain_ring(sq)
+            })
+            .expect("modern build accepted");
+            drop(ring);
+            assert_eq!(
+                seq,
+                vec![QueueRingPosture::Modern],
+                "a probed-modern kernel must get the Modern setup flags \
+                 on the first (and only) build attempt"
+            );
+        }
+
+        /// Probe hit but the Modern build refuses (e.g. a seccomp/lockdown
+        /// surprise past the probe) ⇒ warn-and-degrade to Plain; the
+        /// mount still gets its ring.
+        #[test]
+        fn modern_refusal_lands_on_plain() {
+            let mut seq = Vec::new();
+            let ring = build_plain_queue_ring_with(16, true, |sq, posture| {
+                seq.push(posture);
+                match posture {
+                    QueueRingPosture::Modern => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+                    QueueRingPosture::Plain => real_plain_ring(sq),
+                }
+            })
+            .expect("the Plain fallback must deliver the ring");
+            drop(ring);
+            assert_eq!(
+                seq,
+                vec![QueueRingPosture::Modern, QueueRingPosture::Plain],
+                "a Modern refusal must land on the Plain build — an \
+                 accelerator never fails the mount"
+            );
+        }
+
+        /// Probe miss (pre-6.1 kernels) ⇒ Plain directly, silently:
+        /// today's setup, byte-identical, no Modern attempt ever.
+        #[test]
+        fn probe_miss_builds_plain_silently() {
+            let mut seq = Vec::new();
+            let ring = build_plain_queue_ring_with(16, false, |sq, posture| {
+                seq.push(posture);
+                real_plain_ring(sq)
+            })
+            .expect("plain build");
+            drop(ring);
+            assert_eq!(
+                seq,
+                vec![QueueRingPosture::Plain],
+                "a probe-miss kernel must degrade to today's setup \
+                 SILENTLY — exactly one Plain build, no Modern attempt"
+            );
+        }
+
+        /// Plain-arm errors still propagate loudly (the pre-PERF-5
+        /// failure surface is unchanged: no ring ⇒ the worker ⇒ the
+        /// mount fails, never a silent no-transport session).
+        #[test]
+        fn plain_refusal_stays_loud() {
+            match build_plain_queue_ring_with(16, false, |_sq, _posture| {
+                Err(io::Error::from_raw_os_error(libc::ENOMEM))
+            }) {
+                Err(err) => assert_eq!(err.raw_os_error(), Some(libc::ENOMEM)),
+                Ok(_) => panic!("a Plain refusal must propagate"),
+            }
+        }
+
+        /// LIVE engagement: on a kernel where the probe finds the flags,
+        /// the shipped `build_plain_queue_ring` must deliver a ring with
+        /// SINGLE_ISSUER actually set (DEFER_TASKRUN rides the same
+        /// build call — the seam's Modern posture is the pair by
+        /// construction); on a probe-miss kernel it must deliver today's
+        /// plain ring. Either way the branch it takes IS the capability
+        /// lattice (the kmbuf-probe convention).
+        #[test]
+        fn shipped_builder_engages_probed_flags() {
+            let ring = build_plain_queue_ring(16).expect("queue ring builds");
+            assert_eq!(
+                ring.params().is_setup_single_issuer(),
+                modern_queue_ring_flags_probed(),
+                "the shipped builder must engage SINGLE_ISSUER exactly \
+                 when the runtime probe found the flags"
+            );
+        }
     }
 
     /// Knob unset ⇒ every queue ring builds exactly as today: no SQPOLL

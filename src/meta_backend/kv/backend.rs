@@ -2166,6 +2166,17 @@ impl KvMetaBackend {
         self.checkpoint_cycle(&mut smo, true).await
     }
 
+    /// The **cadence** face of [`Self::checkpoint_now`] (`barrier_now =
+    /// false`): the steady-state shape the background tick runs once per
+    /// `SQUEEZEFS_META_FLUSH_INTERVAL_MS` — write the ledger slot, push
+    /// the tail onto `pending_reclaim`, and defer durability to a later
+    /// barrier. Exposed so the DUR-3 reclamation-epoch legs can drive
+    /// that exact shape deterministically instead of racing the tick.
+    pub async fn checkpoint_cadence(&self) -> std::result::Result<(), KvError> {
+        let mut smo = self.smo.lock().await;
+        self.checkpoint_cycle(&mut smo, false).await
+    }
+
     /// The §4.4 pt 4 hole discipline's checkpoint: cycle until the
     /// written ledger tail reaches at least `pos` (the unwritten hole's
     /// END), so replay's chain walk — which starts AT the tail — can

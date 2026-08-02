@@ -351,6 +351,34 @@ struct FaultState {
     /// conflict surfaces only at the durability barrier
     /// (design-metadata-throughput §5.0 B1 pt 3, Issue 14).
     barrier_errors: std::collections::HashMap<PathBuf, i32>,
+    /// Barrier stalls ([`arm_barrier_stall`]): per path, the barriers held
+    /// in flight.
+    barrier_stalls: std::collections::HashMap<PathBuf, HeldOps>,
+    /// Write stalls ([`arm_write_stall`]): per path, the range that parks
+    /// and the writes held there.
+    write_stalls: std::collections::HashMap<PathBuf, WriteStall>,
+}
+
+/// Operations parked by a stall, plus the arrival tap a test awaits.
+struct HeldOps {
+    arrived: tokio::sync::mpsc::UnboundedSender<()>,
+    held: Vec<HeldOp>,
+}
+
+/// One parked operation, resumable verbatim.
+enum HeldOp {
+    Fdatasync(oneshot::Sender<Result<()>>),
+    WriteAt {
+        offset: u64,
+        data: bytes::Bytes,
+        tx: oneshot::Sender<Result<()>>,
+    },
+}
+
+/// An armed write stall: the byte range that parks and its held ops.
+struct WriteStall {
+    range: (u64, u64),
+    ops: HeldOps,
 }
 
 static FAULT_STATE: Lazy<std::sync::Mutex<FaultState>> =
@@ -394,6 +422,110 @@ pub fn arm_barrier_error(path: impl AsRef<Path>, raw_os_error: i32) {
         .barrier_errors
         .insert(path.as_ref().to_path_buf(), raw_os_error);
     FAULTS_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Arm the **barrier stall** on `path`: an arriving `fdatasync` is held
+/// IN FLIGHT — admitted (so its coverage snapshot is taken exactly where
+/// a real submission would take it: writes admitted after this point stay
+/// volatile) but not completed until [`release_barrier_stall`] resubmits
+/// it for real.
+///
+/// This is the only seam that can put a third party's state push INSIDE a
+/// barrier's window, which is precisely the shape spec **DUR-3** names
+/// ("state a third party pushed while the barrier was in flight"). Unlike
+/// [`arm_barrier_error`] nothing fails: the barrier eventually succeeds,
+/// late.
+///
+/// Returns an arrival receiver — awaiting it proves a barrier really
+/// reached the stall, so a test never races the window open.
+pub fn arm_barrier_stall(path: impl AsRef<Path>) -> tokio::sync::mpsc::UnboundedReceiver<()> {
+    let (arrived_tx, arrived_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut st = FAULT_STATE.lock().unwrap();
+    st.barrier_stalls.insert(
+        path.as_ref().to_path_buf(),
+        HeldOps {
+            arrived: arrived_tx,
+            held: Vec::new(),
+        },
+    );
+    FAULTS_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    arrived_rx
+}
+
+/// Disarm `path`'s barrier stall and resubmit every held barrier for real
+/// (each caller's `fdatasync` completes normally, late).
+pub fn release_barrier_stall(path: impl AsRef<Path>) {
+    let held = match FAULT_STATE
+        .lock()
+        .unwrap()
+        .barrier_stalls
+        .remove(path.as_ref())
+    {
+        Some(stall) => stall.held,
+        None => return,
+    };
+    for tx in held {
+        let tx = match tx {
+            HeldOp::Fdatasync(tx) => tx,
+            HeldOp::WriteAt { tx, .. } => tx,
+        };
+        let _ = URING_FS.sender().try_send(FsReq::Fdatasync {
+            path: path.as_ref().to_path_buf(),
+            tx,
+        });
+    }
+}
+
+/// Arm the **write stall** on `path` for writes intersecting
+/// `[offset, offset + len)`: matching `write_at` requests are held
+/// (never admitted — nothing lands) until [`release_write_stall`]
+/// resubmits them. The durability sibling of [`arm_barrier_stall`]: it
+/// parks a caller at a known point in its commit sequence, so a test can
+/// build an exact interleaving instead of racing one.
+///
+/// Returns an arrival receiver, like [`arm_barrier_stall`].
+pub fn arm_write_stall(
+    path: impl AsRef<Path>,
+    offset: u64,
+    len: u64,
+) -> tokio::sync::mpsc::UnboundedReceiver<()> {
+    let (arrived_tx, arrived_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut st = FAULT_STATE.lock().unwrap();
+    st.write_stalls.insert(
+        path.as_ref().to_path_buf(),
+        WriteStall {
+            range: (offset, offset + len),
+            ops: HeldOps {
+                arrived: arrived_tx,
+                held: Vec::new(),
+            },
+        },
+    );
+    FAULTS_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    arrived_rx
+}
+
+/// Disarm `path`'s write stall and resubmit every held write for real.
+pub fn release_write_stall(path: impl AsRef<Path>) {
+    let held = match FAULT_STATE
+        .lock()
+        .unwrap()
+        .write_stalls
+        .remove(path.as_ref())
+    {
+        Some(stall) => stall.ops.held,
+        None => return,
+    };
+    for op in held {
+        if let HeldOp::WriteAt { offset, data, tx } = op {
+            let _ = URING_FS.sender().try_send(FsReq::WriteAt {
+                path: path.as_ref().to_path_buf(),
+                offset,
+                data,
+                tx,
+            });
+        }
+    }
 }
 
 /// Disarm the barrier fault on `path` (the next `fdatasync` succeeds —
@@ -448,6 +580,11 @@ pub fn clear_faults() {
     st.poisoned.clear();
     st.tracked.clear();
     st.barrier_errors.clear();
+    // Held ops are dropped, not resumed: their callers see the closed
+    // oneshot as a worker-closed error, which is the honest outcome for a
+    // suite that tore its own fault state down mid-flight.
+    st.barrier_stalls.clear();
+    st.write_stalls.clear();
     FAULTS_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -559,6 +696,16 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
                 let _ = tx.send(Err(fault_eio("write torn mid-sector, device died")));
                 return None;
             }
+            // Write stall: park the whole request (nothing lands) until
+            // `release_write_stall` resubmits it.
+            if let Some(stall) = st.write_stalls.get_mut(&path) {
+                let (lo, hi) = stall.range;
+                if offset < hi && offset + data.len() as u64 > lo {
+                    let _ = stall.ops.arrived.send(());
+                    stall.ops.held.push(HeldOp::WriteAt { offset, data, tx });
+                    return None;
+                }
+            }
             if let Some(log) = st.tracked.get_mut(&path) {
                 let cap = capture_original(&path, offset, data.len());
                 log.push(cap);
@@ -623,6 +770,15 @@ fn fault_intercept(req: FsReq) -> Option<FsReq> {
             // window, so clearing at admission is exact for its users.
             if let Some(log) = st.tracked.get_mut(&path) {
                 log.clear();
+            }
+            // Barrier stall: the coverage snapshot above already happened
+            // (this barrier IS submitted, in the model); only its
+            // completion is held, so anything written from here on stays
+            // volatile — the DUR-3 window, exactly.
+            if let Some(stall) = st.barrier_stalls.get_mut(&path) {
+                let _ = stall.arrived.send(());
+                stall.held.push(HeldOp::Fdatasync(tx));
+                return None;
             }
             Some(FsReq::Fdatasync { path, tx })
         }

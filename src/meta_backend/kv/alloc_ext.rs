@@ -581,6 +581,26 @@ impl ExtentAllocator {
                 free: self.core.free_extents(),
                 reserve: self.core.reserve(),
             }),
+            // RES-14: the core's budget and bitmap disagree. Pre-fix this
+            // SPUN forever in a sync fn called from async (a permanently
+            // consumed worker, no log line, no counter). It is now a
+            // bounded refusal — loud here, where crate logging exists.
+            Err(ClaimError::InvariantDrift) => {
+                log::error!(
+                    "KV extent allocator INVARIANT DRIFT: the free budget won an \
+                     entitlement the bitmap could not honour after {} full rescans \
+                     (free={}, reserve={}, total={}). Refusing the claim instead of \
+                     spinning; the volume needs an fsck (class C2/C3)",
+                    64,
+                    self.core.free_extents(),
+                    self.core.reserve(),
+                    self.core.total(),
+                );
+                Err(KvError::NoSpace {
+                    free: self.core.free_extents(),
+                    reserve: self.core.reserve(),
+                })
+            }
         }
     }
 

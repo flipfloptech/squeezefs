@@ -61,6 +61,15 @@ pub type SpaceValve =
 /// background reclaimer still owes finish_frees (queued or in-flight).
 pub type SpacePending = Arc<dyn Fn() -> bool + Send + Sync>;
 
+/// RES-14/RES-15 liveness floor: drain-and-retry passes
+/// [`BlockAllocator::allocate_block`]'s ENOSPC pressure valve will make
+/// before the `StorageFull` verdict stands. Each pass awaits a FULL
+/// queue drain, so this is a generous ceiling on "the reclaimer is
+/// gaining on the demand", not a tuning knob — the pre-fix loop had no
+/// bound at all and spun whenever concurrent reclaim traffic kept
+/// `pending` true.
+const ENOSPC_VALVE_MAX_ATTEMPTS: u32 = 32;
+
 fn is_storage_full(e: &crate::error::SqueezefsError) -> bool {
     matches!(e, crate::error::SqueezefsError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull)
 }
@@ -663,7 +672,15 @@ impl BlockAllocator {
         // allocates, or drains supply someone allocated (system-wide
         // progress, the try_allocate_block retry argument), or observes
         // nothing pending and refuses StorageFull honestly.
-        loop {
+        //
+        // RES-1 5 (pre-RC engineering spec §7): the `pending` exit alone
+        // is not a bound. Under concurrent reclaim traffic OTHER writers
+        // keep the queue non-empty, so every pass observes `pending ==
+        // true` and the honest-refusal exit is never reached — the
+        // allocating task spins on a genuinely full store instead of
+        // returning `StorageFull`. The attempt cap below is the
+        // liveness floor: past it the verdict stands, loudly.
+        for attempt in 0..ENOSPC_VALVE_MAX_ATTEMPTS {
             if let ok @ Ok(_) = self.try_allocate_block() {
                 return ok;
             }
@@ -676,7 +693,16 @@ impl BlockAllocator {
                 // stands (genuine fullness refuses StorageFull).
                 return self.try_allocate_block();
             }
+            let _ = attempt;
         }
+        log::error!(
+            "allocate_block: the ENOSPC pressure valve ran {ENOSPC_VALVE_MAX_ATTEMPTS} \
+             drain-and-retry passes with reclaims still pending and never freed a \
+             block — refusing StorageFull rather than spinning (the store is full \
+             and the reclaimer is not gaining on it; check \
+             block_free_reclaim_queue_bytes and block_free_reclaim_fence_halts)"
+        );
+        self.try_allocate_block()
     }
 
     /// One allocation attempt (free list, then fresh mint) — the body

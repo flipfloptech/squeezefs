@@ -121,7 +121,23 @@ pub enum ClaimError {
     /// "free ≤ reserve" — the §4.7 ENOSPC condition with the reserve
     /// intact; for `Internal` it is a genuinely exhausted heap.
     NoSpace,
+    /// RES-14 (pre-RC engineering spec §7): the free-budget CAS won an
+    /// entitlement the bitmap cannot honour — a full rescan found no
+    /// clear bit, repeatedly. The budget and the bitmap disagree, which
+    /// the protocol says is impossible; the pre-fix code SPUN on it,
+    /// forever, inside a sync fn called from async. It is now a loud
+    /// typed refusal, kept distinct from [`Self::NoSpace`] so an operator
+    /// never reads a broken invariant as an honest full heap. The won
+    /// entitlement is returned to the budget before this is raised.
+    InvariantDrift,
 }
+
+/// RES-14: full-bitmap rescans a [`ExtCore::claim`] will do before
+/// declaring [`ClaimError::InvariantDrift`]. A rescan is only ever needed
+/// because a concurrent release landed behind the cursor, so the
+/// legitimate need is O(racing releases); this is a generous ceiling on
+/// that, not a tuning knob.
+const CLAIM_RESCAN_LIMIT: u32 = 64;
 
 /// Pending-free FIFO full (§4.7 "capped"): the caller must force a
 /// checkpoint + durable-advance to drain it — never reuse unsafely.
@@ -308,7 +324,7 @@ impl ExtCore {
         // The budget win entitles this caller to exactly one clear bit;
         // the scan must find one (module docs).
         let start = self.hint.load(Ordering::Relaxed).min(self.total);
-        loop {
+        for _ in 0..CLAIM_RESCAN_LIMIT {
             for idx in (start..self.total).chain(0..start) {
                 let w = (idx / 64) as usize;
                 let mask = 1u64 << (idx % 64);
@@ -318,14 +334,32 @@ impl ExtCore {
                 }
             }
             // A release between the budget win and this pass can land
-            // behind the cursor; rescan. Bounded: the budget win
-            // guarantees a clear bit exists and stays clear until some
-            // claimant (possibly this one) takes it.
+            // behind the cursor; rescan. The budget win guarantees a clear
+            // bit exists and stays clear until some claimant (possibly
+            // this one) takes it — so a handful of rescans is the entire
+            // legitimate need, and RES-14 caps them: the pre-fix `loop`
+            // had no exit at all if budget and bitmap ever disagreed, and
+            // this runs SYNCHRONOUSLY on an async worker.
             #[cfg(loom)]
             loom::thread::yield_now();
             #[cfg(not(loom))]
             core::hint::spin_loop();
         }
+        // RES-14: hand the entitlement back (the caller never got a bit)
+        // and refuse LOUD in its own class. Callers with crate access
+        // (`super::alloc_ext`) log the drift; this core stays
+        // dependency-free for the loom model.
+        self.free_budget.fetch_add(1, Ordering::AcqRel);
+        Err(ClaimError::InvariantDrift)
+    }
+
+    /// TEST SEAM (RES-14): inflate the free budget without clearing a
+    /// bit — the invariant drift the protocol says cannot happen, so that
+    /// the bounded-and-loud behaviour can be pinned deterministically
+    /// (`tests/unbounded_loop_bounds_tests.rs`). Production never calls
+    /// it; no crate dependency, so the loom model still compiles.
+    pub fn inflate_free_budget_for_test(&self, n: u64) {
+        self.free_budget.fetch_add(n, Ordering::AcqRel);
     }
 
     /// Mark `extent` allocated — mount seeding only (newest-valid bitmap

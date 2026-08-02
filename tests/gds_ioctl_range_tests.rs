@@ -83,8 +83,12 @@ fn whole_file_at_max_file_size_is_refused_not_a_four_billion_block_span() {
 fn empty_and_past_eof_requests_resolve_to_nothing_to_do() {
     // `end_offset == 0` must early-return instead of computing
     // `(end_offset - 1)` (the wrap the reviewer named).
-    assert!(gds_read_block_range(0, 4096, 0, BS).expect("empty file").is_none());
-    assert!(gds_read_block_range(0, 0, 8 * BS, BS).expect("zero-size read").is_none());
+    assert!(gds_read_block_range(0, 4096, 0, BS)
+        .expect("empty file")
+        .is_none());
+    assert!(gds_read_block_range(0, 0, 8 * BS, BS)
+        .expect("zero-size read")
+        .is_none());
     assert!(gds_read_block_range(8 * BS, 4096, 8 * BS, BS)
         .expect("at EOF")
         .is_none());
@@ -140,7 +144,10 @@ fn the_per_call_ceiling_derives_from_the_memory_budget_with_a_physical_floor() {
     // An unresolved (0) budget can never refuse honest work: the floor
     // is a physical minimum, not a tuning constant.
     let floor = max_block_keys_for_budget(0);
-    assert!(floor >= 262_144, "floor must cover the largest legitimate span");
+    assert!(
+        floor >= 262_144,
+        "floor must cover the largest legitimate span"
+    );
     assert_eq!(max_block_keys_for_budget(1), floor);
 
     // It grows with the budget and never wraps at the extremes.

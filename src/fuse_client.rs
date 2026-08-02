@@ -11349,6 +11349,83 @@ pub struct GdsReadArgs {
 
 pub const SQUEEZEFS_IOC_GDS_READ: u32 = 0x80186601;
 
+/// The block range one GDS read resolves to — the output of
+/// [`gds_read_block_range`], inclusive on both block ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GdsBlockRange {
+    pub start_block: u32,
+    pub end_block: u32,
+    /// The clamped end of the request in file bytes (`min(offset + size,
+    /// file_size)`) — the per-block slice arithmetic's upper bound.
+    pub end_offset: u64,
+}
+
+/// VAL-1 (pre-RC engineering spec §3): the ONE place a GDS ioctl's
+/// **caller-supplied** `(offset, size)` becomes a block range.
+///
+/// `GdsReadArgs` is read verbatim out of the calling process's memory and
+/// the release profile sets no `overflow-checks`, so every step here is
+/// explicitly checked:
+///
+/// - `offset + size` is a [`u64::checked_add`] — the historical unchecked
+///   add wrapped (`offset = 1, size = u64::MAX` → 0), `end_offset - 1`
+///   wrapped under it, and `as u32` truncated the result to `0xFFFF_FFFF`;
+/// - a zero `end_offset` (empty file) returns "nothing to do" instead of
+///   computing `end_offset - 1`;
+/// - `end_block` is clamped to the file's real last block, so a request
+///   running past EOF can never name a block the file does not have;
+/// - the resulting span is bounded by [`max_block_keys_per_call`] — the
+///   amplifier ([`crate::routing::DataRouter::load_striped_block_keys`])
+///   materializes one `Vec` entry per block, and 4.29 G of them is ~137 GB
+///   (reachable WITHOUT any overflow via a file at `max_file_size()`).
+///   A caller that genuinely wants more issues more requests.
+///
+/// `Ok(None)` = nothing to read (empty file, zero size, at/past EOF);
+/// `Err(errno)` = the arguments do not describe a servable range.
+pub fn gds_read_block_range(
+    offset: u64,
+    size: u64,
+    file_size: u64,
+    block_size: u64,
+) -> std::result::Result<Option<GdsBlockRange>, i32> {
+    if block_size == 0 {
+        return Err(libc::EINVAL);
+    }
+    // Unrepresentable requests are refused, never silently clamped: a
+    // wrapped range is indistinguishable from an honest one downstream.
+    let request_end = offset.checked_add(size).ok_or(libc::EINVAL)?;
+    if size == 0 || file_size == 0 || offset >= file_size {
+        return Ok(None);
+    }
+    let end_offset = std::cmp::min(request_end, file_size);
+    if end_offset == 0 {
+        return Ok(None);
+    }
+    let start_block = offset / block_size;
+    // The file's real block count bounds the answer (`end_offset <=
+    // file_size` already, but the clamp is the invariant, not a
+    // side effect of the min above).
+    let last_block = (file_size - 1) / block_size;
+    let end_block = std::cmp::min((end_offset - 1) / block_size, last_block);
+    if start_block > end_block {
+        return Ok(None);
+    }
+    // u32 block-index representability (`max_file_size`): a range that
+    // cannot be named in u32 is invalid, never truncated.
+    if end_block > u64::from(u32::MAX) {
+        return Err(libc::EINVAL);
+    }
+    let span = end_block - start_block + 1;
+    if span > u64::from(crate::routing::max_block_keys_per_call()) {
+        return Err(libc::EINVAL);
+    }
+    Ok(Some(GdsBlockRange {
+        start_block: start_block as u32,
+        end_block: end_block as u32,
+        end_offset,
+    }))
+}
+
 // Implement fuse3 Raw Filesystem interface
 impl SqueezefsFilesystem {
     /// The single-run dismount teardown body (extracted from `destroy`,
@@ -14774,6 +14851,14 @@ impl Filesystem for SqueezefsFilesystem {
         );
 
         match cmd {
+            // VAL-1: the GDS read arm exists ONLY in a `gds` build. It
+            // reads a caller-supplied argument struct out of
+            // `/proc/<pid>/mem` and drives a direct-to-VRAM DMA with it —
+            // an attack surface no default mount has any use for (without
+            // the feature the GPU path cannot serve anything anyway).
+            // Builds without the feature answer ENOTTY through the
+            // catch-all arm below.
+            #[cfg(feature = "gds")]
             SQUEEZEFS_IOC_GDS_READ => {
                 // 1. Read GdsReadArgs from client process memory
                 let pid = _req.pid;
@@ -14837,18 +14922,33 @@ impl Filesystem for SqueezefsFilesystem {
                 let block_size = self.router.block_size.load(Ordering::Relaxed);
                 let file_size = meta.size;
 
-                if args.offset >= file_size {
-                    return Ok(ReplyIoctl {
-                        result: 0,
-                        flags: 0,
-                        in_iovs: 0,
-                        out_iovs: 0,
-                    });
-                }
-
-                let end_offset = std::cmp::min(args.offset + args.size, file_size);
-                let start_block = (args.offset / block_size) as u32;
-                let end_block = ((end_offset - 1) / block_size) as u32;
+                // VAL-1: every bit of `(offset, size)` arithmetic is
+                // checked in ONE place — `args` came verbatim out of the
+                // caller's memory.
+                let nothing_to_do = ReplyIoctl {
+                    result: 0,
+                    flags: 0,
+                    in_iovs: 0,
+                    out_iovs: 0,
+                };
+                let range =
+                    match gds_read_block_range(args.offset, args.size, file_size, block_size) {
+                        Ok(Some(r)) => r,
+                        Ok(None) => return Ok(nothing_to_do),
+                        Err(errno) => {
+                            error!(
+                                "GDS ioctl: refusing unservable range (offset {}, size {}, \
+                                 file_size {file_size}, block_size {block_size})",
+                                args.offset, args.size
+                            );
+                            return Err(Errno::from(errno));
+                        }
+                    };
+                let GdsBlockRange {
+                    start_block,
+                    end_block,
+                    end_offset,
+                } = range;
 
                 let block_keys = match self
                     .router
@@ -14868,15 +14968,54 @@ impl Filesystem for SqueezefsFilesystem {
                         None => continue, // Sparse hole
                     };
 
-                    let b_start_offset = b_idx as u64 * block_size;
-                    let b_end_offset = b_start_offset + block_size;
+                    // VAL-1: the per-block slice arithmetic is checked
+                    // too — `b_idx` is bounded by the resolved range, but
+                    // `vram_address` is still caller memory and the
+                    // block/offset products must not wrap into a DMA
+                    // descriptor.
+                    let b_start_offset = match u64::from(b_idx).checked_mul(block_size) {
+                        Some(v) => v,
+                        None => return Err(Errno::from(libc::EINVAL)),
+                    };
+                    let b_end_offset = match b_start_offset.checked_add(block_size) {
+                        Some(v) => v,
+                        None => return Err(Errno::from(libc::EINVAL)),
+                    };
 
                     let read_start = std::cmp::max(args.offset, b_start_offset);
                     let read_end = std::cmp::min(end_offset, b_end_offset);
+                    if read_end <= read_start {
+                        continue; // no overlap with this block
+                    }
                     let block_read_offset = read_start - b_start_offset;
-                    let block_read_size = (read_end - read_start) as usize;
+                    let block_read_size = read_end - read_start;
+                    // A slice can never exceed the block it is cut from
+                    // (a corrupt geometry or a future range bug must fail
+                    // loud, never hand an oversized length to the DMA).
+                    if block_read_offset >= block_size || block_read_size > block_size {
+                        error!(
+                            "GDS ioctl: refusing block slice off {block_read_offset} len \
+                             {block_read_size} against block_size {block_size}"
+                        );
+                        return Err(Errno::from(libc::EINVAL));
+                    }
+                    let block_read_size = block_read_size as usize;
 
-                    let dest_vram_address = args.vram_address + (read_start - args.offset);
+                    let dest_vram_address = match args
+                        .vram_address
+                        .checked_add(read_start - args.offset)
+                        .and_then(|dst| dst.checked_add(block_read_size as u64).map(|_| dst))
+                    {
+                        Some(dst) => dst,
+                        None => {
+                            error!(
+                                "GDS ioctl: refusing destination address (vram_address {}, \
+                                 read_start {read_start})",
+                                args.vram_address
+                            );
+                            return Err(Errno::from(libc::EINVAL));
+                        }
+                    };
 
                     if let Err(e) = self
                         .router

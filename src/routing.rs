@@ -117,6 +117,37 @@ const LAYOUT_INLINE_HEADROOM: usize = 4096;
 /// `routing::LayoutMetadata` path keeps working.
 pub use crate::layout_wire::LayoutMetadata;
 
+/// Bytes charged to one [`DataRouter::load_striped_block_keys`] entry:
+/// the `(u32, Option<String>)` tuple itself (32 B) plus the heap key the
+/// `Some` arm carries (`{prefix}/part_{n}`, ~64 B at the shipped prefix
+/// shapes).
+const BLOCK_KEY_ENTRY_BYTES: u64 = 96;
+
+/// Physical floor for [`max_block_keys_per_call`] — never a tuning knob:
+/// the largest span any legitimate caller can present is one request's
+/// worth of blocks, and 1 GiB (the largest single I/O the read paths ever
+/// assemble) at the smallest supported 4 KiB block geometry is exactly
+/// this many blocks. An unresolved or tiny R5 budget can therefore never
+/// refuse honest work.
+const MIN_BLOCK_KEYS_PER_CALL: u32 = 1024 * 1024 * 1024 / 4096;
+
+/// VAL-1 ceiling (pre-RC engineering spec §3), derived from the R5 memory
+/// budget: at most 1/1024 of the budget may be spent materializing ONE
+/// block-key resolve, at [`BLOCK_KEY_ENTRY_BYTES`] per entry, floored at
+/// [`MIN_BLOCK_KEYS_PER_CALL`]. Pure function of the budget so the
+/// derivation is tie-testable (`tests/gds_ioctl_range_tests.rs`).
+pub fn max_block_keys_for_budget(budget_bytes: u64) -> u32 {
+    let derived = budget_bytes / 1024 / BLOCK_KEY_ENTRY_BYTES;
+    derived.clamp(u64::from(MIN_BLOCK_KEYS_PER_CALL), u64::from(u32::MAX)) as u32
+}
+
+/// [`max_block_keys_for_budget`] against the live R5 budget — the bound
+/// [`DataRouter::load_striped_block_keys`] and the GDS ioctl's
+/// [`crate::fuse_client::gds_read_block_range`] enforce.
+pub fn max_block_keys_per_call() -> u32 {
+    max_block_keys_for_budget(crate::mem_budget::MEM_BUDGET.budget_bytes())
+}
+
 #[derive(Clone, Debug)]
 pub struct CachedMetadata {
     /// Layout class (`inline`/`staged`/`striped`) — [`CompactString`]
@@ -7762,6 +7793,17 @@ impl DataRouter {
         Some(guard.len)
     }
 
+    /// Resolve `[start_block, end_block]` (inclusive) into per-block keys.
+    ///
+    /// **VAL-1 bound (pre-RC engineering spec §3):** the span is capped by
+    /// [`max_block_keys_per_call`] before a single entry is pushed. This
+    /// resolve materializes one `Vec` entry per block, so an unbounded
+    /// span is an unbounded allocation driven by a caller-supplied range —
+    /// the GDS ioctl reached `0..=u32::MAX` here (~137 GB, fatal under
+    /// `panic = "abort"`), and a file at `max_file_size()` reaches 4.29 G
+    /// entries with no overflow at all. Read spans are bounded by the
+    /// request size and never approach the ceiling; callers that want more
+    /// issue more calls.
     pub async fn load_striped_block_keys(
         &self,
         file_path: &str,
@@ -7769,6 +7811,14 @@ impl DataRouter {
         start_block: u32,
         end_block: u32,
     ) -> Result<Vec<(u32, Option<String>)>> {
+        let span = u64::from(end_block.saturating_sub(start_block)) + 1;
+        let cap = u64::from(max_block_keys_per_call());
+        if end_block >= start_block && span > cap {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "block-key resolve span {span} (blocks {start_block}..={end_block}) exceeds \
+                 the per-call ceiling of {cap} entries — split the request"
+            )));
+        }
         let mut block_keys = Vec::new();
 
         if let Some(block_map) = &meta.block_map {

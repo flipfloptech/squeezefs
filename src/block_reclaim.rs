@@ -274,8 +274,19 @@ pub struct DebtDrainer {
     /// the two workers' movement observations stay independent).
     reclaim: Arc<ReclaimQueue>,
     fg_last: AtomicU64,
+    /// Consecutive quiet manners ticks observed (the idle-CONFIRM
+    /// counter): a single flat 50 ms tick is NOT idle — rows have
+    /// sub-second lulls (fsync barriers, per-file closes) and the
+    /// charter's zero-mid-row-discards gate counts them as "during the
+    /// row". The idle venue engages only after the signal has been flat
+    /// for the whole confirm horizon (`IDLE_CONFIRM_TICKS` × the 50 ms
+    /// manners tick = 1 s — the reclaim park-bound scale).
+    quiet_ticks: AtomicU64,
     batch_blocks: u64,
 }
+
+/// Idle-confirm horizon in 50 ms manners ticks (see `quiet_ticks`).
+const IDLE_CONFIRM_TICKS: u64 = 20;
 
 impl DebtDrainer {
     pub fn new(reclaim: Arc<ReclaimQueue>) -> Arc<Self> {
@@ -286,6 +297,7 @@ impl DebtDrainer {
             worker_armed: AtomicBool::new(false),
             reclaim,
             fg_last: AtomicU64::new(0),
+            quiet_ticks: AtomicU64::new(0),
             batch_blocks,
         })
     }
@@ -311,10 +323,20 @@ impl DebtDrainer {
         out
     }
 
-    fn foreground_active(&self) -> bool {
+    /// One manners observation: `true` while the venue must DEFER —
+    /// either the device-plane signal moved since the last tick, or it
+    /// has not yet been flat for the whole idle-confirm horizon. The
+    /// charter's zero-mid-row-discards gate treats a row's sub-second
+    /// lulls (fsync barriers, file-close gaps) as "during the row", so a
+    /// single quiet tick never counts as idle.
+    fn must_defer(&self) -> bool {
         let sig = self.reclaim.foreground_value();
         let prev = self.fg_last.swap(sig, Ordering::AcqRel);
-        sig != prev
+        if sig != prev {
+            self.quiet_ticks.store(0, Ordering::Relaxed);
+            return true;
+        }
+        self.quiet_ticks.fetch_add(1, Ordering::Relaxed) + 1 < IDLE_CONFIRM_TICKS
     }
 
     fn ensure_worker(self: &Arc<Self>) {
@@ -339,7 +361,7 @@ impl DebtDrainer {
                     let mut outstanding = 0u64;
                     let mut drained_any = false;
                     let mut deferred_any = false;
-                    let fg = d.foreground_active();
+                    let fg = d.must_defer();
                     for (device_path, allocator) in targets {
                         let debt = allocator.elided_debt_bytes_local();
                         if debt == 0 {

@@ -273,15 +273,18 @@ run_row_matrix() { # <row> <sides...>
 }
 
 # Row settle hygiene (rewrite rows): no reclaim backlog may drain into a
-# measured window (the standing settle rule).
+# measured window (the standing settle rule) — the queued reclaimer AND
+# the elided-discard debt (Idea 4: the idle venue drains it between
+# rows; a row must start with a zero debt gauge or the drain's tail
+# lands mid-row).
 settle_reclaim() {
-    for _ in $(seq 60); do
+    for _ in $(seq 90); do
         local qb
-        qb=$(python3 -c "import json;m=json.load(open('$MOUNT_DIR/.stats'))['metrics'];print(int(m.get('block_free_reclaim_queue_bytes',0)))" 2>/dev/null || echo 0)
+        qb=$(python3 -c "import json;m=json.load(open('$MOUNT_DIR/.stats'))['metrics'];print(int(m.get('block_free_reclaim_queue_bytes',0))+int(m.get('block_free_elided_debt_bytes',0)))" 2>/dev/null || echo 0)
         [ "${qb:-0}" -eq 0 ] && return 0
         sleep 1
     done
-    echo "  WARN: reclaim queue did not settle before the row"
+    echo "  WARN: reclaim queue/debt did not settle before the row"
 }
 
 # Rewrite-program loop_rewrite row (Idea 17, design §2.2 face 2):

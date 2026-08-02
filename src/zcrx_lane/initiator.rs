@@ -109,28 +109,44 @@ enum QueueHandle {
     Area(super::area_queue::AreaQueue),
 }
 
-impl QueueHandle {
-    fn tasks(&self) -> &Mutex<Vec<tokio::task::JoinHandle<()>>> {
-        match self {
-            QueueHandle::Classic(q) => &q.tasks,
-            QueueHandle::Area(q) => &q.tasks,
-        }
-    }
-}
-
 /// One armed lane association to a target subsystem.
 pub struct LaneSession {
     target: LaneTarget,
     queues: Vec<QueueHandle>,
     next_q: AtomicUsize,
     poisoned: Arc<AtomicBool>,
+    /// The recorded NIC steering to restore at disarm/unmount (real
+    /// backend only; design §5 record-and-restore law).
+    steering: std::sync::Mutex<Option<SteeringHold>>,
     /// Keeps the admin connection (and thus the association) alive.
     _admin_hold: tokio::task::JoinHandle<()>,
+}
+
+impl LaneSession {
+    /// Restore recorded NIC state (idempotent; disarm/unmount/quiesce).
+    fn restore_steering(&self) {
+        if let Ok(mut hold) = self.steering.lock() {
+            if let Some(mut h) = hold.take() {
+                h.restore();
+            }
+        }
+    }
 }
 
 impl Drop for LaneSession {
     fn drop(&mut self) {
         self._admin_hold.abort();
+        // Ring drivers exit on their doorbell close (quiesce path) or
+        // observe the poisoned flag; the steering restore must not wait
+        // for either — ioctls are sync and fast.
+        self.restore_steering();
+        for q in &self.queues {
+            if let QueueHandle::Area(q) = q {
+                if let super::area_queue::CommandSink::Ring(cmds) = &q.sink {
+                    cmds.close();
+                }
+            }
+        }
     }
 }
 
@@ -232,7 +248,7 @@ fn sim_chunk_bytes() -> usize {
 }
 
 /// Which receive backend a lane queue runs (design §5/§6/§10).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaneBackend {
     /// Classic in-process recv into the destination (copy-parity with the
     /// kernel path — the PR Z1 contract venue; `FORCE_COPY` seam).
@@ -241,6 +257,35 @@ pub enum LaneBackend {
     /// area chunks (`AREA_SIM` seam — the chunk-parser/refill/gather
     /// contract venue; never a product posture).
     AreaSim,
+    /// The REAL zcrx receive backend (design §5): registered ifqs on
+    /// dedicated NIC RX queues, RECV_ZC delivery, steering armed after
+    /// connect and restored at disarm. Field-owed execution — the arm
+    /// ladder reaches this only behind the full probe chain.
+    Zcrx(ZcrxPlan),
+}
+
+/// The NIC facts the real arm resolved before bring-up (design §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZcrxPlan {
+    pub ifname: String,
+    pub ifindex: u32,
+    pub numa_node: Option<usize>,
+    /// One dedicated RX queue per lane IO queue (highest-indexed picks).
+    pub rx_queues: Vec<u32>,
+}
+
+/// The armed NIC state a session must restore at disarm/unmount.
+struct SteeringHold {
+    nic: super::ethtool::EthtoolNic,
+    guard: super::steering::SteeringGuard,
+}
+
+impl SteeringHold {
+    fn restore(&mut self) {
+        if let Err(e) = self.guard.restore(&mut self.nic) {
+            log::error!("zcrx-lane: {e}");
+        }
+    }
 }
 
 impl LaneSession {
@@ -267,19 +312,26 @@ impl LaneSession {
         (free, total)
     }
 
-    /// Abort AND join every queue task — the poison-drain quiescence law
-    /// (design §7): after this returns no lane task holds destination
-    /// pointers or area-chunk refs.
+    /// Abort AND join every queue driver — the poison-drain quiescence
+    /// law (design §7): after this returns no lane task or thread holds
+    /// destination pointers or area-chunk refs, and any recorded NIC
+    /// steering has been restored.
     pub async fn quiesce(&self) {
         for q in &self.queues {
-            let mut ts = q.tasks().lock().await;
-            for t in ts.iter() {
-                t.abort();
-            }
-            for t in ts.drain(..) {
-                let _ = t.await;
+            match q {
+                QueueHandle::Classic(q) => {
+                    let mut ts = q.tasks.lock().await;
+                    for t in ts.iter() {
+                        t.abort();
+                    }
+                    for t in ts.drain(..) {
+                        let _ = t.await;
+                    }
+                }
+                QueueHandle::Area(q) => q.drain().await,
             }
         }
+        self.restore_steering();
     }
 
     /// Bring up the association (design §4.2): ICReq/ICResp (digests-off
@@ -349,6 +401,9 @@ impl LaneSession {
         let poisoned = Arc::new(AtomicBool::new(false));
         let depth = target.queue_depth.min(mqes.saturating_add(1)).max(2);
         let mut queues = Vec::with_capacity(target.io_queues as usize);
+        // Real-backend bring-up state (empty on the other backends).
+        let mut go_txs: Vec<std::sync::mpsc::Sender<bool>> = Vec::new();
+        let mut flows: Vec<super::steering::FlowRule> = Vec::new();
         for qid in 1..=target.io_queues {
             let mut s = TcpStream::connect(&addr)
                 .await
@@ -367,7 +422,7 @@ impl LaneSession {
             );
             let cqe = admin_roundtrip(&mut s, &connect).await?;
             check_status("IO Connect", &cqe)?;
-            match backend {
+            match &backend {
                 LaneBackend::Classic => {
                     queues.push(QueueHandle::Classic(spawn_queue(
                         s,
@@ -392,8 +447,98 @@ impl LaneSession {
                         Arc::clone(&poisoned),
                     )));
                 }
+                LaneBackend::Zcrx(plan) => {
+                    let rxq = *plan.rx_queues.get(qid as usize - 1).ok_or_else(|| {
+                        io_err(format!(
+                            "zcrx plan has {} rx queues for IO queue {qid}",
+                            plan.rx_queues.len()
+                        ))
+                    })?;
+                    let local = s
+                        .local_addr()
+                        .map_err(|e| io_err(format!("lane queue local addr: {e}")))?;
+                    let peer = s
+                        .peer_addr()
+                        .map_err(|e| io_err(format!("lane queue peer addr: {e}")))?;
+                    // Registration order (design §5): area (NUMA-bound) →
+                    // ring + ifq registration ON the driver thread
+                    // (SINGLE_ISSUER law) → steering after ALL connects →
+                    // RECV_ZC arms on the go signal.
+                    let area = super::area::ZcrxArea::new(
+                        super::area::area_bytes_per_queue(depth, target.max_xfer_bytes),
+                        super::area::chunk_bytes_default(),
+                        plan.numa_node,
+                    )?;
+                    let shared = super::area_queue::AreaShared::new(depth, &area);
+                    let cmds = super::uring_zcrx::RingCmd::new().map_err(io_err)?;
+                    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                    let (go_tx, go_rx) = std::sync::mpsc::channel();
+                    let driver = super::uring_zcrx::spawn_ring_driver(
+                        super::uring_zcrx::RingDriverConfig {
+                            ifindex: plan.ifindex,
+                            rxq,
+                            numa_node: plan.numa_node,
+                            rq_entries: super::area::rq_entries_for(area.chunk_count() as u64),
+                            sq_entries: (depth as u32 + 8).next_power_of_two(),
+                            area: Arc::clone(&area),
+                            shared: Arc::clone(&shared),
+                            cmds: Arc::clone(&cmds),
+                            session_poison: Arc::clone(&poisoned),
+                            sock: s
+                                .into_std()
+                                .map_err(|e| io_err(format!("lane queue into_std: {e}")))?,
+                        },
+                        ready_tx,
+                        go_rx,
+                    );
+                    // A refusal here (or any later `?`) unwinds cleanly:
+                    // dropping go_tx makes every parked driver exit
+                    // silently — nothing armed, NIC untouched (steering
+                    // is the LAST step).
+                    tokio::task::spawn_blocking(move || ready_rx.recv())
+                        .await
+                        .map_err(|e| io_err(format!("lane driver ready join: {e}")))?
+                        .map_err(|_| io_err("lane driver died during setup".into()))?
+                        .map_err(io_err)?;
+                    go_txs.push(go_tx);
+                    flows.push(super::steering::FlowRule {
+                        src: local,
+                        dst: peer,
+                        queue: rxq,
+                    });
+                    queues.push(QueueHandle::Area(super::area_queue::AreaQueue {
+                        shared,
+                        sink: super::area_queue::CommandSink::Ring(cmds),
+                        tasks: tokio::sync::Mutex::new(Vec::new()),
+                        driver: std::sync::Mutex::new(Some(driver)),
+                        area,
+                    }));
+                }
             }
         }
+
+        // Real backend: steer the lane flows to their ZC queues (design
+        // §5 — the LAST mutating step, so every earlier refusal leaves
+        // the NIC byte-identical), then release the parked drivers to
+        // arm RECV_ZC.
+        let steering_hold = if let LaneBackend::Zcrx(plan) = &backend {
+            let ifname = plan.ifname.clone();
+            let flows_owned = std::mem::take(&mut flows);
+            let hold = tokio::task::spawn_blocking(move || -> Result<SteeringHold> {
+                let mut nic = super::ethtool::EthtoolNic::open(&ifname).map_err(io_err)?;
+                let guard = super::steering::arm_steering(&mut nic, &flows_owned)
+                    .map_err(|e| io_err(format!("zcrx steering arm: {e}")))?;
+                Ok(SteeringHold { nic, guard })
+            })
+            .await
+            .map_err(|e| io_err(format!("steering join: {e}")))??;
+            for tx in &go_txs {
+                let _ = tx.send(true);
+            }
+            Some(hold)
+        } else {
+            None
+        };
 
         // Park the admin socket: any read (data or EOF) after bring-up is an
         // association event — poison loud, the kernel path keeps serving.
@@ -421,9 +566,10 @@ impl LaneSession {
             target.io_queues,
             depth,
             target.max_xfer_bytes,
-            match backend {
+            match &backend {
                 LaneBackend::Classic => "classic-recv contract venue — PR Z1",
                 LaneBackend::AreaSim => "area-sim contract venue — PR Z2",
+                LaneBackend::Zcrx(_) => "zcrx RECV_ZC — PR Z2",
             },
         );
         Ok(Arc::new(LaneSession {
@@ -431,6 +577,7 @@ impl LaneSession {
             queues,
             next_q: AtomicUsize::new(0),
             poisoned,
+            steering: std::sync::Mutex::new(steering_hold),
             _admin_hold: admin_hold,
         }))
     }
@@ -564,10 +711,10 @@ impl LaneSession {
         let slba = byte_offset >> self.target.lba_shift;
         let nlb = (len >> self.target.lba_shift) as u32;
         let capsule = pdu::encode_read_capsule(cid, self.target.nsid, slba, nlb, len as u32);
-        if q.to_writer.send(capsule).is_err() {
+        if q.sink.send(capsule).is_err() {
             shared.table.cancel(cid);
             shared.free_cids.lock().await.push(cid);
-            return Err(io_err("lane writer task gone".into()));
+            return Err(io_err("lane command sink gone".into()));
         }
 
         let res = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
@@ -584,18 +731,12 @@ impl LaneSession {
             Ok(Ok(Err(e))) => Err(e),
             Ok(Err(_)) => Err(io_err("lane completion channel dropped".into())),
             Err(_) => {
-                // Quiescence law: abort AND join the queue tasks so no
-                // driver survives holding chunk refs, then poison loud.
+                // Quiescence law: drain (abort-and-join tasks / close +
+                // join the ring driver) so no lane context survives
+                // holding chunk refs, then poison loud.
                 shared.poisoned.store(true, Ordering::SeqCst);
                 mark_session_poisoned(&self.poisoned);
-                let mut ts = q.tasks.lock().await;
-                for t in ts.iter() {
-                    t.abort();
-                }
-                for t in ts.drain(..) {
-                    let _ = t.await;
-                }
-                drop(ts);
+                q.drain().await;
                 shared.poison("read timed out after 30 s", &self.poisoned);
                 Err(io_err(format!(
                     "lane read timed out (offset={byte_offset}, len={len})"

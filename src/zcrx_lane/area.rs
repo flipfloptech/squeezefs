@@ -151,6 +151,28 @@ impl ZcrxArea {
         })
     }
 
+    /// Re-materialize a grant whose ledger ref the caller holds RAW
+    /// (via [`GrantRef::into_raw_slot`]).
+    ///
+    /// # Safety
+    /// The caller must own exactly one outstanding raw ref for `slot`
+    /// (this transfers it back into RAII custody — never a resurrection).
+    pub unsafe fn adopt_grant(self: &Arc<Self>, slot: u32) -> GrantRef {
+        GrantRef {
+            area: Arc::clone(self),
+            slot,
+        }
+    }
+
+    /// Release a RAW-held ledger ref (the driver-exit cleanup arm for
+    /// slots that never re-materialized).
+    ///
+    /// # Safety
+    /// As [`Self::adopt_grant`]: the caller must own the ref it drops.
+    pub unsafe fn release_raw(&self, slot: u32) {
+        self.release_slot(slot);
+    }
+
     fn release_slot(&self, slot: u32) {
         if self.ledger.release(slot) {
             self.freed.notify_waiters();
@@ -237,6 +259,20 @@ impl GrantRef {
     }
     pub fn area(&self) -> &Arc<ZcrxArea> {
         &self.area
+    }
+    /// Disassemble into the raw slot, KEEPING the ledger ref (the caller
+    /// now owns it — rebuild custody with [`ZcrxArea::adopt_grant`] or
+    /// drop it with [`ZcrxArea::release_raw`]). The embedded area `Arc`
+    /// is dropped properly (the caller's own handle keeps the area
+    /// alive), so this never leaks the mapping the way a bare
+    /// `mem::forget` would.
+    pub fn into_raw_slot(self) -> u32 {
+        let mut this = std::mem::ManuallyDrop::new(self);
+        let slot = this.slot;
+        // SAFETY: the field is taken exactly once out of ManuallyDrop;
+        // GrantRef::drop is skipped, so the ledger ref stays held.
+        unsafe { std::ptr::drop_in_place(&mut this.area) };
+        slot
     }
     /// The chunk's base pointer.
     pub fn chunk_ptr(&self) -> *mut u8 {

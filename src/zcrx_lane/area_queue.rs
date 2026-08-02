@@ -45,6 +45,19 @@ pub(crate) struct AreaShared {
 }
 
 impl AreaShared {
+    pub(crate) fn new(depth: u16, area: &ZcrxArea) -> Arc<AreaShared> {
+        Arc::new(AreaShared {
+            table: FillTable::new(),
+            free_cids: tokio::sync::Mutex::new((0..depth).collect()),
+            cid_gate: tokio::sync::Semaphore::new(depth as usize),
+            admission: tokio::sync::Semaphore::new(admission_permits(
+                area.len(),
+                area.chunk_bytes(),
+            )),
+            poisoned: AtomicBool::new(false),
+        })
+    }
+
     /// Queue-level poison: fail every waiter (their segs drop → chunks
     /// recycle) and propagate to the session lattice (counted once).
     pub(crate) fn poison(&self, why: &str, session_poison: &AtomicBool) {
@@ -56,13 +69,54 @@ impl AreaShared {
     }
 }
 
+/// How a queue's capsules reach its wire: the sim's tokio writer task or
+/// the real ring driver's doorbell lane.
+pub(crate) enum CommandSink {
+    Chan(mpsc::UnboundedSender<Vec<u8>>),
+    Ring(Arc<super::uring_zcrx::RingCmd>),
+}
+
+impl CommandSink {
+    pub(crate) fn send(&self, capsule: Vec<u8>) -> Result<(), ()> {
+        match self {
+            CommandSink::Chan(tx) => tx.send(capsule).map_err(|_| ()),
+            CommandSink::Ring(cmds) => cmds.send(capsule),
+        }
+    }
+}
+
 pub(crate) struct AreaQueue {
     pub shared: Arc<AreaShared>,
-    pub to_writer: mpsc::UnboundedSender<Vec<u8>>,
-    /// Reader + writer tasks — abort-and-join is the quiescence law
-    /// (poison drain; timeout path).
+    pub sink: CommandSink,
+    /// Sim reader + writer tasks — abort-and-join is the quiescence law
+    /// (poison drain; timeout path). Empty on the ring backend.
     pub tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The real backend's driver thread (None on the sim backend).
+    pub driver: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     pub area: Arc<ZcrxArea>,
+}
+
+impl AreaQueue {
+    /// The drain half of the quiescence law: stop the wire (close the
+    /// ring doorbell / abort the sim tasks), then JOIN every driver so
+    /// no lane context survives holding chunk refs.
+    pub(crate) async fn drain(&self) {
+        if let CommandSink::Ring(cmds) = &self.sink {
+            cmds.close();
+        }
+        let mut ts = self.tasks.lock().await;
+        for t in ts.iter() {
+            t.abort();
+        }
+        for t in ts.drain(..) {
+            let _ = t.await;
+        }
+        drop(ts);
+        let handle = self.driver.lock().expect("driver handle lock").take();
+        if let Some(h) = handle {
+            let _ = tokio::task::spawn_blocking(move || h.join()).await;
+        }
+    }
 }
 
 /// Spawn the SIM area queue over an established (post-Connect) stream.
@@ -72,13 +126,7 @@ pub(crate) fn spawn_area_queue(
     area: Arc<ZcrxArea>,
     session_poison: Arc<AtomicBool>,
 ) -> AreaQueue {
-    let shared = Arc::new(AreaShared {
-        table: FillTable::new(),
-        free_cids: tokio::sync::Mutex::new((0..depth).collect()),
-        cid_gate: tokio::sync::Semaphore::new(depth as usize),
-        admission: tokio::sync::Semaphore::new(admission_permits(area.len(), area.chunk_bytes())),
-        poisoned: AtomicBool::new(false),
-    });
+    let shared = AreaShared::new(depth, &area);
     let (read_half, write_half) = stream.into_split();
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -99,8 +147,9 @@ pub(crate) fn spawn_area_queue(
 
     AreaQueue {
         shared,
-        to_writer: tx,
+        sink: CommandSink::Chan(tx),
         tasks: tokio::sync::Mutex::new(vec![reader, writer]),
+        driver: std::sync::Mutex::new(None),
         area,
     }
 }

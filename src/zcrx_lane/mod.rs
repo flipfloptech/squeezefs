@@ -14,12 +14,15 @@
 pub mod area;
 pub mod area_core;
 mod area_queue;
+mod ethtool;
+mod ethtool_nl;
 pub mod fill_table;
 pub mod initiator;
 pub mod pdu;
 pub mod pdu_stream;
 pub mod probe;
 pub mod steering;
+mod uring_zcrx;
 
 pub use initiator::{LaneBackend, LaneSession, LaneTarget};
 
@@ -119,24 +122,107 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
             }
         };
     }
-    if !lane_force_copy_backend() {
-        // PR Z1: the zero-copy recv backend is not shipped yet. Refuse to
-        // arm rather than silently adding a copy lane (design §6).
-        if !probe::recv_zc_supported() {
-            log::warn!(
-                "zcrx-lane: SQUEEZEFS_ZCRX_LANE=1 but this kernel lacks IORING_OP_RECV_ZC \
-                 — lane not armed for {device_path}; kernel path serves (byte-identical)"
-            );
-        } else {
-            log::warn!(
-                "zcrx-lane: kernel supports RECV_ZC but the zcrx recv backend is PR Z2 \
-                 — lane not armed for {device_path}; kernel path serves \
-                 (SQUEEZEFS_ZCRX_LANE_FORCE_COPY=1 arms the classic contract backend)"
-            );
-        }
+    if lane_force_copy_backend() {
+        // The Z1 classic contract venue (copy-parity, never a win).
+        return match LaneSession::connect(target).await {
+            Ok(sess) => {
+                crate::fuse_client::METRICS
+                    .zcrx_lane_armed
+                    .store(1, Ordering::Relaxed);
+                Some(sess)
+            }
+            Err(e) => {
+                crate::fuse_client::METRICS
+                    .zcrx_conn_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                log::error!(
+                    "zcrx-lane: arm failed for {device_path}: {e} — kernel path serves \
+                     (byte-identical)"
+                );
+                None
+            }
+        };
+    }
+
+    // The REAL backend's probe ladder (design §5/§7): every gate refuses
+    // loud and leaves today's kernel path byte-identical; the ONLY
+    // NIC-mutating step (steering) is the last one inside connect and
+    // rolls itself back on refusal.
+    if !probe::recv_zc_supported() {
+        log::warn!(
+            "zcrx-lane: SQUEEZEFS_ZCRX_LANE=1 but this kernel lacks IORING_OP_RECV_ZC \
+             — lane not armed for {device_path}; kernel path serves (byte-identical)"
+        );
         return None;
     }
-    match LaneSession::connect(target).await {
+    let Ok(ip) = target.traddr.parse::<std::net::IpAddr>() else {
+        log::warn!(
+            "zcrx-lane: traddr {:?} is not an IP literal — lane not armed for \
+             {device_path}; kernel path serves",
+            target.traddr
+        );
+        return None;
+    };
+    let Some(ifname) = ethtool::route_ifname_for(&ip) else {
+        log::warn!(
+            "zcrx-lane: no local interface routes to {ip} — lane not armed for \
+             {device_path}; kernel path serves"
+        );
+        return None;
+    };
+    // HDS gate up front (fail before ANY bring-up work; arm_steering
+    // re-checks under the same law — the corrected ATTR-compare probe).
+    match ethtool_nl::tcp_data_split_on(&ifname) {
+        Ok(true) => {}
+        Ok(false) => {
+            log::warn!(
+                "zcrx-lane: {ifname} has tcp-data-split OFF — zcrx needs HDS; lane \
+                 not armed for {device_path}; kernel path serves (byte-identical)"
+            );
+            return None;
+        }
+        Err(e) => {
+            log::warn!(
+                "zcrx-lane: HDS probe on {ifname} failed ({e}) — lane not armed for \
+                 {device_path}; kernel path serves (byte-identical)"
+            );
+            return None;
+        }
+    }
+    let Some(ifindex) = ethtool::nic_ifindex(&ifname) else {
+        log::warn!("zcrx-lane: no ifindex for {ifname} — lane not armed for {device_path}");
+        return None;
+    };
+    let channels = match ethtool::EthtoolNic::open(&ifname)
+        .and_then(|mut nic| steering::NicControl::combined_channels(&mut nic))
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!(
+                "zcrx-lane: channel probe on {ifname} failed ({e}) — lane not armed \
+                 for {device_path}; kernel path serves"
+            );
+            return None;
+        }
+    };
+    let picks = steering::lane_queue_picks(channels, target.io_queues);
+    if picks.is_empty() {
+        log::warn!(
+            "zcrx-lane: {ifname} has {channels} queues — too narrow to dedicate ZC \
+             queues (needs ≥ 4); lane not armed for {device_path}"
+        );
+        return None;
+    }
+    let mut target = target;
+    target.io_queues = picks.len() as u16;
+    let plan = initiator::ZcrxPlan {
+        numa_node: ethtool::nic_numa_node(&ifname),
+        ifname,
+        ifindex,
+        rx_queues: picks,
+    };
+    area::register_r5_component();
+    match LaneSession::connect_with(target, LaneBackend::Zcrx(plan)).await {
         Ok(sess) => {
             crate::fuse_client::METRICS
                 .zcrx_lane_armed
@@ -148,8 +234,8 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
                 .zcrx_conn_errors
                 .fetch_add(1, Ordering::Relaxed);
             log::error!(
-                "zcrx-lane: arm failed for {device_path}: {e} — kernel path serves \
-                 (byte-identical)"
+                "zcrx-lane: zcrx arm failed for {device_path}: {e} — kernel path \
+                 serves (byte-identical)"
             );
             None
         }

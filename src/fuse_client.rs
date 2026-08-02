@@ -324,6 +324,59 @@ pub fn inplace_overwrite_enabled() -> bool {
     inplace_overwrite_cell().load(Ordering::Relaxed)
 }
 
+/// TEST SEAM (`SQUEEZEFS_TEST_UPLOAD_STALL_MS`, Idea 2 —
+/// design-rewrite-program §4.2): stall the pipeline upload's UNLOCKED
+/// window between the snapshot and the DMA — the deterministic form of
+/// "a rewrite lands while the prior image is in flight" (the
+/// `SQUEEZEFS_TEST_WRITE_STALL_MS` pattern; load selects such schedules,
+/// this lever selects them deterministically —
+/// `tests/write_supersession_tests.rs`). One relaxed load unset; never
+/// set in production.
+fn test_upload_stall_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let v = std::env::var("SQUEEZEFS_TEST_UPLOAD_STALL_MS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        std::sync::atomic::AtomicU64::new(v)
+    })
+}
+
+/// Set the upload-stall test seam (tests only; `0` disables).
+pub fn set_test_upload_stall_ms(ms: u64) {
+    test_upload_stall_cell().store(ms, Ordering::Relaxed);
+}
+
+/// Stall-window entries (tests only — the seam's sequencing observable:
+/// a planted-stale schedule polls it to know the in-flight snapshots are
+/// parked in the window before landing the superseding write). Bumped
+/// only when the stall seam is armed; untouched in production.
+fn test_upload_stall_entries_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::atomic::AtomicU64::new(0))
+}
+
+/// Read the stall-window entry count (tests only).
+pub fn test_upload_stall_entries() -> u64 {
+    test_upload_stall_entries_cell().load(Ordering::Relaxed)
+}
+
+/// Completed device-phase custody of a write-through upload (Idea 2
+/// factoring — `upload_block_dma_phase`): a fresh, DMA'd,
+/// incarnation-published, map-unnamed offset plus its live-owner
+/// registration. Consumed by `upload_block_publish_phase` (merge names
+/// the key; the guard drops after the publish is visible) or freed as an
+/// orphan by a superseded completion.
+struct UploadDmaOut {
+    be_id: String,
+    allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
+    offset: u64,
+    new_key: String,
+    processed_len: u64,
+    _inflight: crate::block_allocator::InflightAllocGuard,
+}
+
 /// Set the in-place-overwrite lever (tests / A-B acceptance runs).
 pub fn set_inplace_overwrite(on: bool) {
     inplace_overwrite_cell().store(on, Ordering::Relaxed);
@@ -3086,6 +3139,19 @@ pub struct Metrics {
     /// (single-writer D0: only our own lease churn can race an upload);
     /// investigate alongside `writer_guard_fenced`.
     pub write_pipeline_fence_drops: Align64<AtomicU64>,
+    // Idea 2 — latest-wins supersession (design-rewrite-program §4;
+    // tests/write_supersession_tests.rs): the overlapping-face
+    // loop-rewrite engagement instrument.
+    /// In-flight pipeline uploads whose completion observed a newer
+    /// write generation (or a retired entry) at revalidation and
+    /// published NOTHING — the stale image's orphan offset freed, the
+    /// parked buffer (the retained dirty authority) left to the newest
+    /// generation's publish.
+    pub write_pipeline_supersessions: Align64<AtomicU64>,
+    /// Bytes of superseded stale images (device work paid, publish
+    /// elided) — with `write_through_bytes` this prices the latest-wins
+    /// coalesce on overlapping rewrite rows.
+    pub write_pipeline_superseded_bytes: Align64<AtomicU64>,
     /// Write-commit-economy lever 1 (2026-07-30): publish-conveyor
     /// passes committed (one save each). With
     /// `layout_publish_batched_blocks` gives the live coalesce factor —
@@ -5533,6 +5599,10 @@ impl SqueezefsFilesystem {
                 "write_pipeline_depth_probe_backoffs": self.write_pipeline.depth_probe_backoffs(),
                 "write_pipeline_admission_waits": self.write_pipeline.admission_waits(),
                 "write_pipeline_fence_drops": METRICS.write_pipeline_fence_drops.load(Ordering::Relaxed),
+                // Idea 2 — latest-wins supersession
+                // (design-rewrite-program §4).
+                "write_pipeline_supersessions": METRICS.write_pipeline_supersessions.load(Ordering::Relaxed),
+                "write_pipeline_superseded_bytes": METRICS.write_pipeline_superseded_bytes.load(Ordering::Relaxed),
                 // Residence decomposition (2026-07-31 write-wall
                 // campaign, conviction 2): ALWAYS-ON per-phase histograms
                 // — admission → detach → lock → crypto → allocate → DMA
@@ -8481,13 +8551,160 @@ impl SqueezefsFilesystem {
         cache_key: String,
     ) {
         let _permit = permit;
+        // KD-2.3 (design-rewrite-program §4.2): the in-place overwrite
+        // arm mutates the LIVE mapped offset — its DMA must stay under
+        // the block lock, so the lever keeps the serialized upload
+        // verbatim. The default (CoW) path runs the supersession flow:
+        // snapshot + epoch under the lock, device phase UNLOCKED,
+        // revalidate-then-publish.
+        if inplace_overwrite_enabled() {
+            return self.pipeline_upload_serialized(ino, b, &cache_key).await;
+        }
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        // Latest-wins re-drive loop: a superseded completion frees its
+        // orphan and re-snapshots the (newer) parked bytes — the newest
+        // generation owns the single durable publish, and a hot block
+        // absorbs rewrites at RAM speed while the device drains at its
+        // own pace (device writes ≈ surviving generations, not ops).
+        loop {
+            let fencing_token = self.dlm.get_fencing_token_ino(ino);
+            let t_lock = std::time::Instant::now();
+            let block_guard = block_lock_acquire(ino, b, BlockLockSite::PipelineUpload).await;
+            pipeline_phase_record(PipelinePhase::LockWait, t_lock);
+            let snap = self.active_block_buffers.get(&cache_key).and_then(|e| {
+                let v = e.value();
+                (!v.is_extent_repr() && v.is_content_valid() && !v.seed_deferred())
+                    .then(|| (v.snapshot(), v.write_epoch()))
+            });
+            let Some((snapshot, epoch)) = snap else {
+                // Retired (a flush/punch/truncate won) or not-ready
+                // custody: nothing owed here.
+                drop(block_guard);
+                return;
+            };
+            drop(block_guard);
+
+            // TEST SEAM: deterministic in-flight window (see
+            // `set_test_upload_stall_ms`).
+            let stall = test_upload_stall_cell().load(Ordering::Relaxed);
+            if stall > 0 {
+                test_upload_stall_entries_cell().fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
+            }
+
+            // The UNLOCKED device phase: crypto → allocate → DMA →
+            // incarnation publish, all against fresh unpublished state.
+            let pipe_t0 = std::time::Instant::now();
+            let wp_dma = write_phase_start();
+            let t_crypto = std::time::Instant::now();
+            let processed = match self.router.get_crypto().process_write_async(snapshot).await {
+                Ok(p) => p,
+                Err(_) => {
+                    // Degrade to the serialized path — it owns every
+                    // never-lossy ladder (staging fallback, brim arm).
+                    return self.pipeline_upload_serialized(ino, b, &cache_key).await;
+                }
+            };
+            pipeline_phase_record(PipelinePhase::Crypto, t_crypto);
+            let dma = match self.upload_block_dma_phase(processed).await {
+                Ok(d) => d,
+                Err(_) => {
+                    // StorageFull (the brim in-place arm is LOCKED
+                    // machinery), device failure, uring backpressure:
+                    // the serialized path owns the ladders.
+                    return self.pipeline_upload_serialized(ino, b, &cache_key).await;
+                }
+            };
+            write_phase_record(WritePhase::UploadDma, wp_dma);
+
+            // Revalidate under the lock (the CQE-supersession law,
+            // KD-2.4): a stale completion must not publish over a newer
+            // generation. Both the stamp and this check run under
+            // BLOCK_FLUSH_LOCKS — lock-serialized by design, no fence
+            // protocol; global epoch uniqueness closes the
+            // retire→re-park ABA.
+            let t_lock2 = std::time::Instant::now();
+            let block_guard = block_lock_acquire(ino, b, BlockLockSite::PipelineUpload).await;
+            pipeline_phase_record(PipelinePhase::LockWait, t_lock2);
+            let current = self
+                .active_block_buffers
+                .get(&cache_key)
+                .map(|e| e.value().write_epoch());
+            if current != Some(epoch) {
+                // Superseded (newer merge) or retired (a durable flush
+                // won): free the orphan — it was never named by any map
+                // — and leave the parked buffer (the retained dirty
+                // authority) to the newest generation.
+                let _ = dma.allocator.free_block(dma.offset).await;
+                METRICS
+                    .write_pipeline_supersessions
+                    .fetch_add(1, Ordering::Relaxed);
+                METRICS
+                    .write_pipeline_superseded_bytes
+                    .fetch_add(block_size, Ordering::Relaxed);
+                drop(block_guard);
+                if current.is_none() {
+                    // The surviving generation is durable (flush leg) or
+                    // the block died (punch/truncate) — nothing owed.
+                    return;
+                }
+                continue; // re-drive with the newest bytes
+            }
+            // Current generation: publish under the held guard (the
+            // classic ordering — merge, retire, invalidation tail).
+            let wp_merge = write_phase_start();
+            let res = self
+                .upload_block_publish_phase(
+                    ino,
+                    b,
+                    dma,
+                    true,
+                    fencing_token,
+                    block_size,
+                    pipe_t0,
+                )
+                .await;
+            match res {
+                Ok(()) => {
+                    write_phase_record(WritePhase::UploadMapMerge, wp_merge);
+                    self.retire_parked_overlay(&cache_key);
+                    METRICS.write_through_blocks.fetch_add(1, Ordering::Relaxed);
+                    METRICS
+                        .write_through_bytes
+                        .fetch_add(block_size, Ordering::Relaxed);
+                    drop(block_guard);
+                    if let Err(e) = self.upload_invalidation_tail(ino, b).await {
+                        warn!(
+                            "pipeline upload invalidation tail for ino {ino} block {b} \
+                             failed ({e:?}); tiers converge via the purge-on-free law"
+                        );
+                    }
+                    return;
+                }
+                Err(_) => {
+                    // The publish phase freed the orphan; degrade to the
+                    // serialized path for the never-lossy/fencing
+                    // ladders (it re-snapshots the newest bytes).
+                    drop(block_guard);
+                    return self.pipeline_upload_serialized(ino, b, &cache_key).await;
+                }
+            }
+        }
+    }
+
+    /// The pre-supersession serialized pipeline upload (the classic
+    /// under-lock flow): `write_through_complete_block` with the block
+    /// lock held across the whole body — the in-place lever's venue
+    /// (KD-2.3) and the never-lossy/fencing fallback for every
+    /// supersession-path error.
+    async fn pipeline_upload_serialized(&self, ino: u64, b: u32, cache_key: &str) {
         let fencing_token = self.dlm.get_fencing_token_ino(ino);
         let t_lock = std::time::Instant::now();
         let block_guard = block_lock_acquire(ino, b, BlockLockSite::PipelineUpload).await;
         pipeline_phase_record(PipelinePhase::LockWait, t_lock);
         let ready = self
             .active_block_buffers
-            .get(&cache_key)
+            .get(cache_key)
             .map(|e| {
                 let v = e.value();
                 !v.is_extent_repr() && v.is_content_valid() && !v.seed_deferred()
@@ -8498,7 +8715,7 @@ impl SqueezefsFilesystem {
             return;
         }
         let res = self
-            .write_through_complete_block(ino, b, &cache_key, fencing_token, block_guard)
+            .write_through_complete_block(ino, b, cache_key, fencing_token, block_guard)
             .await;
         match crate::write_pipeline::pipeline_disposition(&res) {
             crate::write_pipeline::PipelineDisposition::Done => {}
@@ -9106,24 +9323,8 @@ impl SqueezefsFilesystem {
             write_phase_record(WritePhase::UploadDma, wp_dma);
             return self.upload_invalidation_tail(ino, b).await;
         }
-        let (be_id, block_allocator, nvme_writer) =
-            self.router.backend_router.get_active_backend()?;
-        let processed_len = processed.len() as u64;
-        crate::block_allocator::ensure_stored_block_image_fits(
-            processed.len(),
-            block_allocator.chunk_size(),
-            "write-through block upload",
-        )?;
-        // Marks the key's incarnation unstable: racing validated cache fills
-        // of a reused key fail their seqlock check instead of caching
-        // pre-DMA bytes.
-        // Residence phase: the span deliberately includes ENOSPC-valve
-        // engagements — reclaim leaking onto fresh paths shows HERE.
-        let t_alloc = std::time::Instant::now();
-        let alloc_res = block_allocator.allocate_block().await;
-        pipeline_phase_record(PipelinePhase::Allocate, t_alloc);
-        let offset = match alloc_res {
-            Ok(o) => o,
+        let dma = match self.upload_block_dma_phase(processed.clone()).await {
+            Ok(d) => d,
             Err(e)
                 if matches!(&e, SqueezefsError::Io(io)
                     if io.kind() == std::io::ErrorKind::StorageFull) =>
@@ -9156,9 +9357,57 @@ impl SqueezefsFilesystem {
             }
             Err(e) => return Err(e),
         };
+        write_phase_record(WritePhase::UploadDma, wp_dma);
+        let wp_merge = write_phase_start();
+        self.upload_block_publish_phase(
+            ino,
+            b,
+            dma,
+            grow_size_to_block_end,
+            fencing_token,
+            plaintext_len,
+            pipe_t0,
+        )
+        .await?;
+        write_phase_record(WritePhase::UploadMapMerge, wp_merge);
+        self.upload_invalidation_tail(ino, b).await
+    }
+
+    /// The device phase of a write-through upload (Idea 2 factoring —
+    /// design-rewrite-program §4.2): allocate a fresh offset, DMA the
+    /// processed image, publish the incarnation, purge the new key's
+    /// read tiers. Touches ONLY fresh unpublished state and holds no
+    /// locks — the supersession path runs it OUTSIDE the block lock (no
+    /// clone, reader or fill can observe the offset: refcount 1,
+    /// incarnation unstable until the post-DMA publish, key purged
+    /// before any map names it). StorageFull surfaces to the caller —
+    /// the brim in-place arm and the never-lossy ladders are LOCKED
+    /// machinery and stay with the serialized paths.
+    async fn upload_block_dma_phase(
+        &self,
+        processed: bytes::Bytes,
+    ) -> Result<UploadDmaOut, SqueezefsError> {
+        let (be_id, block_allocator, nvme_writer) =
+            self.router.backend_router.get_active_backend()?;
+        let processed_len = processed.len() as u64;
+        crate::block_allocator::ensure_stored_block_image_fits(
+            processed.len(),
+            block_allocator.chunk_size(),
+            "write-through block upload",
+        )?;
+        // Marks the key's incarnation unstable: racing validated cache fills
+        // of a reused key fail their seqlock check instead of caching
+        // pre-DMA bytes.
+        // Residence phase: the span deliberately includes ENOSPC-valve
+        // engagements — reclaim leaking onto fresh paths shows HERE.
+        let t_alloc = std::time::Instant::now();
+        let alloc_res = block_allocator.allocate_block().await;
+        pipeline_phase_record(PipelinePhase::Allocate, t_alloc);
+        let offset = alloc_res?;
         // PR VL6a: live-owner registration across the allocate→merge
-        // window (drops at function end, after the map merge below).
-        let _inflight = block_allocator.inflight_register(offset);
+        // window (rides the returned custody; drops after the publish is
+        // visible — or with the caller's orphan free).
+        let inflight = block_allocator.inflight_register(offset);
         let t_dma = std::time::Instant::now();
         let dma_res = nvme_writer.write_block(offset, processed).await;
         pipeline_phase_record(PipelinePhase::Dma, t_dma);
@@ -9166,7 +9415,6 @@ impl SqueezefsFilesystem {
             let _ = block_allocator.free_block(offset).await;
             return Err(e);
         }
-        write_phase_record(WritePhase::UploadDma, wp_dma);
         // Publish after the device write (incarnation ordering). No
         // `read_lru.put` for the striped hot path — deliberately mirroring
         // `flush_single_active_block`'s `!is_striped` gate: a 10 GiB stream
@@ -9187,7 +9435,32 @@ impl SqueezefsFilesystem {
         // leaves no interleaving that can serve the dead incarnation's
         // bytes for this block.
         self.router.cache.purge_block_key(&new_key);
+        Ok(UploadDmaOut {
+            be_id,
+            allocator: block_allocator,
+            offset,
+            new_key,
+            processed_len,
+            _inflight: inflight,
+        })
+    }
 
+    /// The publish phase of a write-through upload (Idea 2 factoring):
+    /// the §5.3 one-merge discipline + SLO attribution + governor sample
+    /// + displaced frees. Callers hold `BLOCK_FLUSH_LOCKS(ino, b)`. On a
+    /// merge failure the DMA'd block is unreachable (never published to
+    /// the map) and is freed here before the error surfaces.
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_block_publish_phase(
+        &self,
+        ino: u64,
+        b: u32,
+        dma: UploadDmaOut,
+        grow_size_to_block_end: bool,
+        fencing_token: u64,
+        plaintext_len: u64,
+        pipe_t0: std::time::Instant,
+    ) -> Result<(), SqueezefsError> {
         // Block-map merge via the shared primitive (§5.3 one merge
         // discipline) under INODE_META_LOCKS: current-map RMW, fencing
         // revalidation, RAM cache republish, displaced-key tier purge. On
@@ -9200,7 +9473,6 @@ impl SqueezefsFilesystem {
         } else {
             0
         };
-        let wp_merge = write_phase_start();
         // Write-commit-economy lever 1 (2026-07-30): the publish rides
         // the per-ino coalescing conveyor — concurrent pipeline uploads
         // of one ino merge as ONE commit (one journal entry, one layout
@@ -9212,7 +9484,7 @@ impl SqueezefsFilesystem {
             .router
             .merge_block_mappings_coalesced(
                 ino,
-                vec![(b, new_key)],
+                vec![(b, dma.new_key.clone())],
                 min_size,
                 crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
                 fencing_token,
@@ -9224,11 +9496,10 @@ impl SqueezefsFilesystem {
             Err(e) => {
                 // The DMA'd block is unreachable (never published to the
                 // map): free it before surfacing the error.
-                let _ = block_allocator.free_block(offset).await;
+                let _ = dma.allocator.free_block(dma.offset).await;
                 return Err(e);
             }
         };
-        write_phase_record(WritePhase::UploadMapMerge, wp_merge);
         // Idea 17 SLO attribution (design-rewrite-program §2): a publish
         // that displaced an existing different mapping is a rewrite-class
         // block — user bytes are the plaintext the app wrote, device
@@ -9241,12 +9512,12 @@ impl SqueezefsFilesystem {
                 .fetch_add(plaintext_len, Ordering::Relaxed);
             METRICS
                 .rewrite_device_write_bytes
-                .fetch_add(processed_len, Ordering::Relaxed);
+                .fetch_add(dma.processed_len, Ordering::Relaxed);
         }
         // Feed the write-pipeline governor: one completed upload on this
         // backend lane (whole-pipeline latency — see pipe_t0 above).
         self.write_pipeline
-            .record_completion(&be_id, plaintext_len, pipe_t0.elapsed());
+            .record_completion(&dma.be_id, plaintext_len, pipe_t0.elapsed());
         // Free displaced keys only after the new map is published (durable +
         // cached), so no reader can resolve a block to a key we are freeing.
         // Residence phase: reclaim ENQUEUES only — fresh paths must sit at
@@ -9256,8 +9527,7 @@ impl SqueezefsFilesystem {
             let _ = self.router.backend_router.free_block(&bk).await;
         }
         pipeline_phase_record(PipelinePhase::DisplacedFree, t_free);
-
-        self.upload_invalidation_tail(ino, b).await
+        Ok(())
     }
 
     async fn flush_active_blocks_with_retry(

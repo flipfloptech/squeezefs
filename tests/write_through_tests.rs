@@ -1015,10 +1015,17 @@ async fn test_write_through_fallback_never_lossy_on_device_error() {
     let p0 = make_striped(&h, ino, 2 * BS as usize + 1, 14).await;
 
     let fallbacks_before = wt_fallbacks();
-    squeezefs::nvme_dev::set_fail_next_writes(1);
+    // TWO injected failures = a PERSISTENT device error (Idea 2 —
+    // design-rewrite-program §4.2): the supersession path's unlocked DMA
+    // consumes the first and degrades to the serialized upload, which
+    // retries the device ONCE before the staging ladder — a one-shot
+    // transient blip now heals without the staging detour (strictly
+    // better; the never-lossy fallback contract pinned here is the
+    // PERSISTENT-error posture).
+    squeezefs::nvme_dev::set_fail_next_writes(2);
     let p1 = pattern(BS as usize + 1, 120);
-    write_at(&h, ino, 0, &p1).await; // block 0 completes; its DMA fails once
-                                     // The detached upload must consume the injected failure before the
+    write_at(&h, ino, 0, &p1).await; // block 0 completes; its DMAs fail
+                                     // The detached upload must consume the injected failures before the
                                      // poison is cleared (make_striped drained, so it is the only writer).
     drain_pipeline(&h).await;
     squeezefs::nvme_dev::clear_fail_next_writes();

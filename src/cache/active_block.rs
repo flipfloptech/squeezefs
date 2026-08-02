@@ -301,6 +301,26 @@ pub struct ActiveBlockBuf {
     /// exits gate their seed fetch on `seed_deferred()`, so a fully
     /// covered buffer can never pay one.
     deferred_seed: bool,
+    /// Idea 2 — the supersession generation (design-rewrite-program §4):
+    /// a PROCESS-GLOBALLY-UNIQUE stamp advanced by every
+    /// [`ActiveBlockBuf::record_write`] merge (under the entry's
+    /// `BLOCK_FLUSH_LOCKS` — the coverage-mutation law). The pipeline
+    /// upload captures it with its snapshot and revalidates it before
+    /// the merge: a mismatch means newer bytes merged while the DMA was
+    /// in flight — the stale completion publishes nothing. Global
+    /// uniqueness (one shared counter, never per-buffer 0-reset) closes
+    /// the retire→re-park ABA: a recreated buffer can never repeat a
+    /// retired buffer's stamp.
+    write_epoch: u64,
+}
+
+/// The shared supersession-generation counter (see
+/// [`ActiveBlockBuf::write_epoch`]). Relaxed: uniqueness is the only
+/// contract; ordering rides the block lock every reader/writer of the
+/// stamp already holds.
+fn next_write_epoch() -> u64 {
+    static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    GEN.fetch_add(1, Ordering::Relaxed)
 }
 
 /// RAII gauge charge: `parked_full_buffer_bytes` for `Full`,
@@ -338,6 +358,7 @@ impl ActiveBlockBuf {
             written_extra: Vec::new(),
             content_valid: false,
             deferred_seed,
+            write_epoch: next_write_epoch(),
         }
     }
 
@@ -384,6 +405,7 @@ impl ActiveBlockBuf {
             written_extra: Vec::new(),
             content_valid: false,
             deferred_seed: deferred,
+            write_epoch: next_write_epoch(),
         }
     }
 
@@ -422,6 +444,7 @@ impl ActiveBlockBuf {
             written_extra: Vec::new(),
             content_valid: false,
             deferred_seed: deferred,
+            write_epoch: next_write_epoch(),
         }
     }
 
@@ -667,6 +690,7 @@ impl ActiveBlockBuf {
             written_extra: Vec::new(),
             content_valid: true,
             deferred_seed: false,
+            write_epoch: next_write_epoch(),
         }
     }
 
@@ -761,9 +785,17 @@ impl ActiveBlockBuf {
             start <= end && end <= len,
             "write range out of block bounds"
         );
-        if start == end || self.union_is_full() {
-            // Degenerate / already-complete: no transition to report (a
-            // re-write of a completed union must not double-fire).
+        if start == end {
+            return false;
+        }
+        // Idea 2 supersession stamp: EVERY content merge advances the
+        // buffer's generation (including re-writes of an already-complete
+        // union — exactly the latest-wins shape an in-flight upload must
+        // observe and yield to). Under the caller's held block lock.
+        self.write_epoch = next_write_epoch();
+        if self.union_is_full() {
+            // Already-complete: no transition to report (a re-write of a
+            // completed union must not double-fire the write-through).
             return false;
         }
         let (s, e) = (start as u32, end as u32);
@@ -798,6 +830,12 @@ impl ActiveBlockBuf {
         // Extras are disjoint from the primary, so a full primary implies
         // no extras.
         self.written == (0, self.block_size)
+    }
+
+    /// The supersession generation (Idea 2 — see the field doc): capture
+    /// with a snapshot under the block lock; revalidate before the merge.
+    pub fn write_epoch(&self) -> u64 {
+        self.write_epoch
     }
 
     /// Every byte is APP-WRITTEN (the accumulated coverage union spans the

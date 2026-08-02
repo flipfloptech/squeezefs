@@ -253,6 +253,11 @@ impl ClientSession {
     }
 }
 
+// SAFETY (test harness): the mapping is plain shared memory reached only
+// through atomics and bounded raw copies; one test thread owns a given
+// `ClientSession` at a time (the VAL-5e saturator MOVES it, never shares).
+unsafe impl Send for ClientSession {}
+
 impl Drop for ClientSession {
     fn drop(&mut self) {
         // SAFETY: unmapping the mapping created in `map`.
@@ -2124,5 +2129,171 @@ fn finished_ctl_threads_do_not_accumulate_join_handles() {
         "VAL-5d: {retained} JoinHandles retained after 150 short connections \
          (baseline {baseline}) — the registry is push-only"
     );
+    host.shutdown();
+}
+
+/// A sink whose serve BLOCKS the service thread for a fixed span before
+/// completing — a device-bound serve, modelled without a device. The
+/// VAL-5e rows need the drain loop to be the scarce resource.
+struct SlowSink {
+    per_op: Duration,
+}
+
+impl squeezefs::ipc_host::SessionSink for SlowSink {
+    fn serve_data(
+        &self,
+        op: squeezefs::ipc_host::DataOp,
+        completion: squeezefs::ipc_host::SlotCompletion,
+    ) {
+        std::thread::sleep(self.per_op);
+        completion.complete(i64::from(op.desc.len));
+    }
+}
+
+/// Keep `session`'s ring topped up: release every finished slot and
+/// re-submit it. One call tops up every free slot; called in a loop it is
+/// a client that never lets its ring go empty.
+fn top_up(session: &ClientSession, gens: &mut Vec<Option<u64>>, desc: &SlotDescriptor) -> usize {
+    let mut recycled = 0usize;
+    for i in 0..gens.len() {
+        let slot = session.slot(i);
+        if let Some(g) = gens[i] {
+            if slot.core.is_done_for(g) {
+                slot.core.release();
+                gens[i] = None;
+                recycled += 1;
+            } else {
+                continue;
+            }
+        }
+        let Some(g) = slot.core.try_claim() else {
+            continue;
+        };
+        slot.publish_descriptor(desc);
+        slot.core.publish_submitted();
+        if session.ring().push(i as u32) {
+            gens[i] = Some(g);
+            session.header().doorbell.fetch_add(1, Ordering::Release);
+            futex_wake(&session.header().doorbell, 1);
+        } else {
+            slot.core.release_claimed();
+        }
+    }
+    recycled
+}
+
+/// VAL-5e: `IpcSession::drain` was `while let Some(i) = consumer.pop(...)`
+/// with no per-pass budget. Sessions are PINNED to one service thread
+/// (§5.5.1) and `service_loop` walks them serially, so a client that
+/// keeps its ring non-empty owns that thread forever: every sibling
+/// session pinned to it is starved — one unprivileged process starving
+/// another process's I/O — and, because the loop never returns to the
+/// pass top, a NEWLY admitted session is never even collected.
+#[test]
+fn a_saturating_session_cannot_starve_its_service_thread_siblings() {
+    // One service thread ⇒ both sessions are pinned to it (the shape the
+    // §5.5.1 ownership invariant makes ordinary at scale: sessions
+    // outnumber threads).
+    std::env::set_var("SQUEEZEFS_IPC_SERVICE_THREADS", "1");
+    let cfg = test_config("drain-fairness");
+    let host = IpcHost::spawn(
+        cfg.clone(),
+        Arc::new(SlowSink {
+            per_op: Duration::from_micros(200),
+        }),
+    )
+    .expect("host must spawn");
+    std::env::remove_var("SQUEEZEFS_IPC_SERVICE_THREADS");
+
+    let mf = mount_file();
+    host.set_expected_st_dev(mf.st_dev);
+    let fd_a = open_flags(&mf.path, libc::O_RDWR);
+    let fd_b = open_flags(&mf.path, libc::O_RDWR);
+    let (sock_a, sess_a) = establish(&cfg, &host, fd_a.as_raw_fd());
+    let bind_a = match bind(&sock_a, fd_a.as_raw_fd()) {
+        CtlMsg::BindOk { binding_id, .. } => binding_id,
+        other => panic!("bind A: {other:?}"),
+    };
+
+    // A saturates from its OWN thread: the ring must stay non-empty
+    // across everything the main thread does below (B's whole ctl
+    // handshake included) or the starvation shape evaporates.
+    let slots = test_geometry().slots as usize;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let served_a = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let saturator = {
+        let stop = Arc::clone(&stop);
+        let served_a = Arc::clone(&served_a);
+        std::thread::spawn(move || {
+            let desc = SlotDescriptor {
+                op: OP_READ,
+                flags: 0,
+                binding: bind_a,
+                offset: 0,
+                len: 4096,
+                arena_off: 0,
+            };
+            let mut gens: Vec<Option<u64>> = vec![None; slots];
+            while !stop.load(Ordering::Relaxed) {
+                let n = top_up(&sess_a, &mut gens, &desc);
+                served_a.fetch_add(n, Ordering::Relaxed);
+            }
+            sess_a // hand it back so the mapping outlives the daemon's use
+        })
+    };
+
+    // Wait until A is genuinely saturating (its ring has cycled).
+    let warm = Instant::now() + Duration::from_secs(10);
+    while served_a.load(Ordering::Relaxed) < slots * 2 {
+        assert!(
+            Instant::now() < warm,
+            "A never reached saturation ({} ops)",
+            served_a.load(Ordering::Relaxed)
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // NOW B joins — mid-drain — and submits ONE op.
+    let (sock_b, sess_b) = establish(&cfg, &host, fd_b.as_raw_fd());
+    let bind_b = match bind(&sock_b, fd_b.as_raw_fd()) {
+        CtlMsg::BindOk { binding_id, .. } => binding_id,
+        other => panic!("bind B: {other:?}"),
+    };
+    let slot_b = sess_b.slot(0);
+    let gen_b = slot_b.core.try_claim().expect("B slot 0 is FREE");
+    slot_b.publish_descriptor(&SlotDescriptor {
+        op: OP_READ,
+        flags: 0,
+        binding: bind_b,
+        offset: 0,
+        len: 4096,
+        arena_off: 0,
+    });
+    slot_b.core.publish_submitted();
+    assert!(sess_b.ring().push(0), "B's ring accepts");
+    sess_b.header().doorbell.fetch_add(1, Ordering::Release);
+    futex_wake(&sess_b.header().doorbell, 1);
+
+    // A fair drain serves B within one budget window (`slots` A-ops);
+    // an unbudgeted one never does.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let starved = loop {
+        if slot_b.core.is_done_for(gen_b) {
+            break false;
+        }
+        if Instant::now() >= deadline {
+            break true;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    stop.store(true, Ordering::Relaxed);
+    let _sess_a = saturator.join().expect("saturator thread");
+    assert!(
+        !starved,
+        "VAL-5e: a saturating session starved its sibling for 10 s ({} A-ops \
+         served meanwhile) — the drain has no per-pass budget",
+        served_a.load(Ordering::Relaxed)
+    );
+    assert_eq!(slot_b.result(), 4096, "B's op is served, not just noticed");
     host.shutdown();
 }

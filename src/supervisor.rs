@@ -326,3 +326,268 @@ pub fn run_supervisor(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Contracts (spec §11 TEST-9)
+// ---------------------------------------------------------------------------
+//
+// The supervisor is the external watchdog that unwedges a hung mount, and
+// it had ONE test reference tree-wide. Its escalation state machine is
+// deliberately pure ("no clocks of its own ... so tests drive it without
+// sleeping") and its sysfs helpers all take an explicit `sysfs_root` — so
+// everything below runs unprivileged, deterministically, in microseconds.
+// The only untestable rung is the real `/sys/fs/fuse/connections` write,
+// which needs root and a live wedged mount.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t0() -> Instant {
+        Instant::now()
+    }
+
+    fn policy(unresponsive_secs: u64) -> SupervisorPolicy {
+        SupervisorPolicy {
+            probe_interval: Duration::from_millis(1),
+            unresponsive_after: Duration::from_secs(unresponsive_secs),
+            write_abort: true,
+        }
+    }
+
+    #[test]
+    fn healthy_probes_never_escalate_and_never_report_recovery() {
+        let start = t0();
+        let mut st = SupervisorState::new(start);
+        let p = policy(30);
+        for i in 1..=10u64 {
+            let now = start + Duration::from_secs(i * 5);
+            assert_eq!(
+                st.observe(true, now, &p),
+                SupervisorAction::None,
+                "a healthy mount is silent — a 'Recovered' log with no prior \
+                 failure is a false alarm operators learn to ignore"
+            );
+        }
+    }
+
+    #[test]
+    fn failures_inside_the_grace_window_do_not_escalate() {
+        let start = t0();
+        let mut st = SupervisorState::new(start);
+        let p = policy(30);
+        // 29 s of silence: still inside the window. Aborting here would
+        // destroy a mount that is merely slow.
+        for secs in [1u64, 5, 10, 20, 29] {
+            assert_eq!(
+                st.observe(false, start + Duration::from_secs(secs), &p),
+                SupervisorAction::None,
+                "escalated at {secs}s, inside a 30s grace window"
+            );
+        }
+    }
+
+    #[test]
+    fn sustained_silence_escalates_exactly_once_until_a_success_rearms() {
+        let start = t0();
+        let mut st = SupervisorState::new(start);
+        let p = policy(30);
+        assert_eq!(
+            st.observe(false, start + Duration::from_secs(10), &p),
+            SupervisorAction::None
+        );
+        match st.observe(false, start + Duration::from_secs(31), &p) {
+            SupervisorAction::Escalate { unresponsive_for } => {
+                assert!(
+                    unresponsive_for >= Duration::from_secs(31),
+                    "the escalation must carry the true silence duration"
+                );
+            }
+            other => panic!("31s of silence past a 30s window must escalate, got {other:?}"),
+        }
+        // The abort is DESTRUCTIVE: re-firing it on a dead connection is
+        // noise, so escalation is one-shot until a probe succeeds.
+        for secs in [32u64, 60, 600] {
+            assert_eq!(
+                st.observe(false, start + Duration::from_secs(secs), &p),
+                SupervisorAction::None,
+                "re-escalated at {secs}s without an intervening success"
+            );
+        }
+        // A success re-arms and reports the recovery once.
+        assert_eq!(
+            st.observe(true, start + Duration::from_secs(601), &p),
+            SupervisorAction::Recovered
+        );
+        assert_eq!(
+            st.observe(true, start + Duration::from_secs(606), &p),
+            SupervisorAction::None,
+            "recovery is reported once, not on every subsequent probe"
+        );
+        // ...and a NEW sustained outage escalates again.
+        assert_eq!(
+            st.observe(false, start + Duration::from_secs(610), &p),
+            SupervisorAction::None
+        );
+        assert!(matches!(
+            st.observe(false, start + Duration::from_secs(700), &p),
+            SupervisorAction::Escalate { .. }
+        ));
+    }
+
+    #[test]
+    fn the_silence_clock_measures_from_the_last_success_not_the_first_failure() {
+        // A flapping mount (fail, succeed, fail, succeed …) must never
+        // accumulate its way to an abort: each success resets the clock.
+        let start = t0();
+        let mut st = SupervisorState::new(start);
+        let p = policy(30);
+        for i in 0..20u64 {
+            let base = start + Duration::from_secs(i * 20);
+            assert_eq!(
+                st.observe(false, base + Duration::from_secs(10), &p),
+                SupervisorAction::None
+            );
+            let a = st.observe(true, base + Duration::from_secs(19), &p);
+            assert_eq!(a, SupervisorAction::Recovered, "flap {i} recovered");
+        }
+    }
+
+    #[test]
+    fn a_boundary_exact_window_escalates() {
+        let start = t0();
+        let mut st = SupervisorState::new(start);
+        let p = policy(30);
+        assert!(
+            matches!(
+                st.observe(false, start + Duration::from_secs(30), &p),
+                SupervisorAction::Escalate { .. }
+            ),
+            "the threshold is >=, not > — a mount silent for exactly the \
+             configured window is unresponsive"
+        );
+    }
+
+    #[test]
+    fn the_default_policy_matches_the_documented_cadence() {
+        let p = SupervisorPolicy::default();
+        assert_eq!(p.probe_interval, Duration::from_secs(5));
+        assert_eq!(p.unresponsive_after, Duration::from_secs(30));
+        assert!(p.write_abort, "the abort rung is armed by default");
+    }
+
+    #[test]
+    fn connection_waiting_reads_the_sysfs_counter_and_tolerates_every_absence() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sysfs = root.path();
+        // No connection directory at all (already unmounted).
+        assert_eq!(connection_waiting(sysfs, 42), None);
+
+        let dir = sysfs.join("42");
+        std::fs::create_dir_all(&dir).expect("conn dir");
+        // Directory present, file absent.
+        assert_eq!(connection_waiting(sysfs, 42), None);
+
+        std::fs::write(dir.join("waiting"), "7\n").expect("write");
+        assert_eq!(
+            connection_waiting(sysfs, 42),
+            Some(7),
+            "waiting >= 1 is the umount-EBUSY / wedge signal — it must parse"
+        );
+        std::fs::write(dir.join("waiting"), "  0  \n").expect("write");
+        assert_eq!(connection_waiting(sysfs, 42), Some(0));
+        // Unparseable content must be None, never a panic and never a
+        // fabricated zero (which would read as "healthy").
+        std::fs::write(dir.join("waiting"), "not-a-number").expect("write");
+        assert_eq!(connection_waiting(sysfs, 42), None);
+        std::fs::write(dir.join("waiting"), "").expect("write");
+        assert_eq!(connection_waiting(sysfs, 42), None);
+    }
+
+    #[test]
+    fn abort_writes_exactly_one_to_the_connections_abort_file() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sysfs = root.path();
+        let dir = sysfs.join("99");
+        std::fs::create_dir_all(&dir).expect("conn dir");
+        abort_fuse_connection(sysfs, 99).expect("abort write");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("abort")).expect("abort file"),
+            "1",
+            "the kernel's unwedge is literally the byte '1'"
+        );
+    }
+
+    #[test]
+    fn abort_on_a_vanished_connection_fails_loud_rather_than_silently() {
+        let root = tempfile::tempdir().expect("tempdir");
+        // No directory: the mount is already gone. The supervisor must
+        // learn that from an Err, not treat it as a successful unwedge.
+        let err = abort_fuse_connection(root.path(), 1234)
+            .expect_err("aborting a connection that does not exist must fail");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn conn_dir_keys_by_the_decimal_connection_id() {
+        let d = conn_dir(Path::new("/sys/fs/fuse/connections"), 4242);
+        assert_eq!(d, Path::new("/sys/fs/fuse/connections/4242"));
+    }
+
+    #[test]
+    fn minor_of_dev_round_trips_wide_minors() {
+        // FUSE connection ids are the mount root's st_dev MINOR, and the
+        // glibc extended encoding puts minor bits on both sides of the
+        // major field — an 8-bit-only decode silently aliases connections
+        // on a busy host.
+        for minor in [0u64, 1, 255, 256, 4095, 1_048_575] {
+            let dev = libc::makedev(0, minor as libc::c_uint);
+            assert_eq!(
+                minor_of_dev(dev),
+                minor,
+                "minor {minor} must survive the dev_t round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_of_a_missing_mountpoint_is_a_failed_probe_not_a_hang() {
+        let root = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !probe_stats_inode(&root.path().join("no-such-mount"), Duration::from_secs(5)),
+            "a missing .stats inode is an unhealthy probe"
+        );
+    }
+
+    #[test]
+    fn probe_of_a_real_directory_with_a_stats_entry_succeeds() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join(".stats"), "{}").expect("stats");
+        assert!(probe_stats_inode(root.path(), Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn daemon_alive_tracks_a_real_pid() {
+        assert!(
+            daemon_alive(std::process::id()),
+            "our own pid must read alive"
+        );
+        // pid 0 is 'the caller's process group' for kill(2) — never used
+        // as a daemon pid; a very high pid is reliably absent.
+        assert!(
+            !daemon_alive(0x7FFF_FFFE),
+            "an absent pid must read dead so the supervisor exits"
+        );
+    }
+
+    #[test]
+    fn dump_daemon_state_is_best_effort_and_never_panics() {
+        let mine = dump_daemon_state(std::process::id());
+        assert!(mine.contains("daemon state dump"), "header present");
+        assert!(mine.contains("tid "), "at least this thread is listed");
+        let gone = dump_daemon_state(0x7FFF_FFFE);
+        assert!(
+            gone.contains("unavailable"),
+            "a dead pid produces a note, never a panic: {gone}"
+        );
+    }
+}

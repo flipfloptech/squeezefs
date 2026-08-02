@@ -632,6 +632,21 @@ impl ReclaimQueue {
         false
     }
 
+    /// Latch the sticky halt the writer-guard fence probe sets, directly:
+    /// device reclaims cease PERMANENTLY for this queue — queued and
+    /// future entries drop without `finish_free` (counted
+    /// `block_free_reclaim_fence_halts`; successor recovery owns the
+    /// accounting, the kill-9 crash posture). The in-process process-death
+    /// analog for custody holders that end without a clean drain: a
+    /// holder's straggler punch outliving its claims can land on offsets
+    /// the SUCCESSOR writer has reallocated (the same hazard class the
+    /// fence probe closes for fenced zombies). Production fencing rides
+    /// the wired fence probe; this verb is the teardown/crash-analog arm
+    /// (`BackendRouter::reclaim_cease`).
+    pub fn halt_device_reclaims(&self) {
+        self.halted.store(true, Ordering::Release);
+    }
+
     /// Queue one terminal free's reclaim. Past the deferred-space cap the
     /// caller PARKS (bounded) until the drain relieves the cap — it
     /// **never issues device commands from the enqueue context** (the

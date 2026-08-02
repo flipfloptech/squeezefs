@@ -1003,6 +1003,17 @@ impl BackendRouter {
         self.reclaim.set_foreground_signal(sig);
     }
 
+    /// Cease all device reclaims permanently (the fence-halt latch,
+    /// [`crate::block_reclaim::ReclaimQueue::halt_device_reclaims`]): the
+    /// in-process kill-9/teardown analog — a custody holder that ends
+    /// without a clean drain must never issue another device command,
+    /// or its straggler punch can land on offsets the successor writer
+    /// has reallocated (`.benchmarks/2026-08-04-volume-drain-flake.md`).
+    /// Queued/future entries drop into `block_free_reclaim_fence_halts`.
+    pub fn reclaim_cease(&self) {
+        self.reclaim.halt_device_reclaims();
+    }
+
     /// Drain the background reclaim queue to empty (blocking work runs on
     /// the blocking pool): unmount teardown and tests. Conservation face:
     /// after this returns, every previously-enqueued range has been

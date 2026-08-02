@@ -760,6 +760,7 @@ async fn offline_drain_body(
                     );
                     if st.state == crate::jobs::JobState::PausedCapacity {
                         fabric.shutdown_abrupt().await;
+                        router.backend_router.reclaim_drain().await;
                         return Err(E::InvalidOperation(
                             "drain self-paused (paused-capacity): survivors ran out of \
                              slack — free space and re-run `volume remove-data` (the job \
@@ -772,6 +773,13 @@ async fn offline_drain_body(
         }
     };
     fabric.shutdown_abrupt().await;
+    // Claim-release law (the dismount posture; the mover's own pass
+    // drains already cover the Completed path — this is the belt for
+    // every terminal outcome): return every queued device range BEFORE
+    // the caller releases the D0 claims. A queued punch outliving the
+    // claims can land on offsets a successor writer has reallocated
+    // (`.benchmarks/2026-08-04-volume-drain-flake.md`).
+    router.backend_router.reclaim_drain().await;
     match end {
         // The CLI arm owns the user-facing outcome line (this library
         // path reports progress only — printing it here too made the

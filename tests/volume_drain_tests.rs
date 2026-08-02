@@ -226,6 +226,12 @@ async fn open_fixture(meta: &Path, records: &[DataVolumeRecord]) -> Fx {
 impl Fx {
     async fn close(self) {
         self.fabric.shutdown_abrupt().await;
+        // Mount-faithful clean unmount (the dismount law, `fuse_client`
+        // dismount): return every queued device range BEFORE the claims
+        // release — a straggler punch outliving custody can land on
+        // offsets the next holder's recovered allocator reallocates
+        // (`.benchmarks/2026-08-04-volume-drain-flake.md`).
+        self.fs.router.backend_router.reclaim_drain().await;
         for vol in &self.meta.volumes {
             vol.shutdown().await.expect("clean shutdown");
         }
@@ -235,7 +241,15 @@ impl Fx {
     /// WITHOUT a clean shutdown path for the workers (the meta volumes
     /// still close their claims so the same process can reopen).
     async fn crash(self) {
+        // Kill-9 fidelity: a dead process never issues another device
+        // command — cease reclaims permanently (fence-halt posture),
+        // then drop the backlog command-free (breaks the queue's
+        // entry→allocator→valve→queue keep-alive cycle; entries count
+        // into `block_free_reclaim_fence_halts`, successor recovery
+        // owns the accounting — the un-punched-space crash story).
+        self.fs.router.backend_router.reclaim_cease();
         self.fabric.shutdown_abrupt().await;
+        self.fs.router.backend_router.reclaim_drain().await;
         for vol in &self.meta.volumes {
             let _ = vol.shutdown().await;
         }
@@ -1494,7 +1508,10 @@ async fn test_close_returns_queued_reclaims_before_custody_release() {
         .await
         .expect("delete the churn file");
     let queued = METRICS.block_free_reclaim_queued.load(Ordering::Relaxed) - queued0;
-    assert!(queued > 0, "engagement: the delete must queue terminal reclaims");
+    assert!(
+        queued > 0,
+        "engagement: the delete must queue terminal reclaims"
+    );
 
     fx.close().await;
 
@@ -1633,7 +1650,10 @@ async fn test_crash_analog_ceases_device_reclaims() {
         .await
         .expect("delete the churn file");
     let queued = METRICS.block_free_reclaim_queued.load(Ordering::Relaxed) - queued0;
-    assert!(queued > 0, "engagement: the delete must queue terminal reclaims");
+    assert!(
+        queued > 0,
+        "engagement: the delete must queue terminal reclaims"
+    );
 
     let br = fx.fs.router.backend_router.clone();
     fx.crash().await;

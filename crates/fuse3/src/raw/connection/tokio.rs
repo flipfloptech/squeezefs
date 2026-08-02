@@ -259,11 +259,18 @@ impl FuseConnection {
 
     #[cfg(target_os = "linux")]
     pub fn num_uring_queues(&self) -> Option<usize> {
-        self.over_uring
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|p| p.nqueues as usize)
+        self.over_uring_pool().map(|p| p.nqueues as usize)
+    }
+
+    /// Read seam for the installed pool (post-INIT `mark_ready`,
+    /// diagnostics). Hot paths go through the same slot — see
+    /// `get_payload_buffer` / `over_uring_ready` / the venue filters in
+    /// `inner_read_vectored` / `write_vectored`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn over_uring_pool(
+        &self,
+    ) -> Option<std::sync::Arc<super::fuse_over_uring::FuseOverUring>> {
+        self.over_uring.lock().unwrap().clone()
     }
 
     /// Start kernel FUSE-over-io_uring workers after FUSE_INIT. Required transport.
@@ -293,8 +300,48 @@ impl FuseConnection {
                 ),
             )
         })?;
-        *self.over_uring.lock().unwrap() = Some(pool);
+        if let Err(loser) = self.install_over_uring(pool) {
+            // Another enable won the install race (never on the live INIT
+            // path — enables are sequential there): shut the fresh pool
+            // down instead of orphaning armed workers on the session fd.
+            loser.shutdown();
+        }
         Ok(())
+    }
+
+    /// Install-once seam for the session's FUSE-over-io_uring pool —
+    /// shared across every [`Self::clone_connection`] worker clone. At
+    /// most ONE pool is ever installed per connection family: the first
+    /// caller wins, later callers get their pool back untouched
+    /// (`Err(pool)`) and own its teardown. Public for the sim venue
+    /// ([`super::fuse_over_uring::FuseOverUring::sim_inert`] — slot
+    /// protocol tests + the reply-send prelude bench).
+    #[cfg(target_os = "linux")]
+    pub fn install_over_uring(
+        &self,
+        pool: std::sync::Arc<super::fuse_over_uring::FuseOverUring>,
+    ) -> Result<(), std::sync::Arc<super::fuse_over_uring::FuseOverUring>> {
+        let mut slot = self.over_uring.lock().unwrap();
+        if slot.is_some() {
+            return Err(pool);
+        }
+        *slot = Some(pool);
+        Ok(())
+    }
+
+    /// Teardown seam (session disconnect + FUSE_DESTROY): shut the
+    /// installed pool down. Idempotent — racing teardowns from multiple
+    /// worker clones are safe (`FuseOverUring::shutdown` gates its
+    /// side effects on the `active` swap). The installed pool stays
+    /// OBSERVABLE afterwards: hot-path venue reads derive liveness from
+    /// the pool's own `ready`/`active` atomics, never from slot
+    /// emptiness, so a concurrent lock-free venue probe can never race a
+    /// slot tear-out.
+    #[cfg(target_os = "linux")]
+    pub fn teardown_over_uring(&self) {
+        if let Some(pool) = self.over_uring.lock().unwrap().take() {
+            pool.shutdown();
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1660,6 +1707,197 @@ impl AsFd for FuseConnection {
             ))]
             ConnectionMode::NonBlock(connection) => connection.fd.as_fd(),
         }
+    }
+}
+
+/// PERF-2 (pre-rc spec §9) — the session pool slot's contract, pinned
+/// BEFORE the mutex→lock-free swap so the swap is provably semantics-
+/// preserving. The slot is taken 4× per READ on the request path
+/// (`inner_read_vectored`, `write_vectored`, `get_payload_buffer`,
+/// `over_uring_ready`) while it is only ever WRITTEN twice per session
+/// (install after INIT, teardown at disconnect/DESTROY). The contract:
+///
+/// 1. **Install-once**: at most one pool per connection family, first
+///    caller wins, losers get their pool back and own its teardown.
+/// 2. **Liveness rides the pool's atomics, never slot emptiness**: venue
+///    reads gate on `is_ready()`/`is_active()`; after teardown the
+///    installed pool stays observable (shut down) so a lock-free venue
+///    probe can never race a slot tear-out. Post-teardown routing is
+///    identical either way — `ready == false` ⇒ classical reply venue,
+///    `active == false` ⇒ dispatch pulls fail loud (NotConnected).
+/// 3. **Teardown is idempotent**: every worker clone may call it on the
+///    disconnect path; `FuseOverUring::shutdown` gates side effects on
+///    the `active` swap.
+///
+/// Sim venue: [`FuseOverUring::sim_inert`] — the shipped liveness
+/// machinery with no kernel session (the `KmbufQueue::sim_anon`
+/// precedent).
+#[cfg(all(test, target_os = "linux"))]
+mod over_uring_slot_tests {
+    use super::super::fuse_over_uring::FuseOverUring;
+    use super::FuseConnection;
+    use async_notify::Notify;
+    use std::sync::Arc;
+
+    fn conn() -> FuseConnection {
+        FuseConnection::new(Arc::new(Notify::new()))
+            .expect("/dev/fuse (0666) + io_uring must be available on the test box")
+    }
+
+    /// Empty slot (pre-INIT): every venue read routes classical and no
+    /// payload buffer resolves — the arm-window posture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_slot_routes_classical() {
+        let c = conn();
+        assert!(
+            !c.over_uring_ready(),
+            "no pool installed — reply venue must be classical"
+        );
+        assert_eq!(c.num_uring_queues(), None, "no pool — no queue geometry");
+        assert_eq!(
+            c.get_payload_buffer(7),
+            None,
+            "no pool — no payload buffer can resolve"
+        );
+    }
+
+    /// Contract 1: the second install is refused and the caller gets its
+    /// pool back untouched (it owns the teardown); the first pool's
+    /// geometry stays the slot's answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_once_second_pool_refused() {
+        let c = conn();
+        let winner = FuseOverUring::sim_inert(3);
+        let loser = FuseOverUring::sim_inert(5);
+        assert!(
+            c.install_over_uring(winner).is_ok(),
+            "first install must win"
+        );
+        let returned = c
+            .install_over_uring(loser)
+            .expect_err("second install must be refused");
+        assert_eq!(
+            returned.nqueues, 5,
+            "the refused install must hand the LOSER back (caller owns its teardown)"
+        );
+        assert_eq!(
+            c.num_uring_queues(),
+            Some(3),
+            "the slot must keep answering with the winner's geometry"
+        );
+        returned.shutdown();
+    }
+
+    /// Contract 1 under a real race: N concurrent installs admit exactly
+    /// one pool, every loser is returned, and every observer agrees on
+    /// the winner's geometry afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_installs_admit_exactly_one_pool() {
+        let c = conn();
+        let mut wins = 0usize;
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8u16)
+                .map(|i| {
+                    let c = &c;
+                    s.spawn(move || {
+                        let pool = FuseOverUring::sim_inert(i + 1);
+                        match c.install_over_uring(pool) {
+                            Ok(()) => None,
+                            Err(loser) => {
+                                let n = loser.nqueues;
+                                loser.shutdown();
+                                Some(n)
+                            }
+                        }
+                    })
+                })
+                .collect();
+            let mut losers = Vec::new();
+            for h in handles {
+                match h.join().expect("installer thread") {
+                    None => wins += 1,
+                    Some(n) => losers.push(n),
+                }
+            }
+            assert_eq!(wins, 1, "exactly one install may win");
+            assert_eq!(losers.len(), 7, "every loser must be handed back");
+        });
+        let winner_nq = c.num_uring_queues().expect("winner installed") as u16;
+        assert!(
+            (1..=8).contains(&winner_nq),
+            "the observed geometry must be one racer's pool"
+        );
+    }
+
+    /// Contract 2, live side: the reply venue follows the pool's own
+    /// ready/active word — pre-ready classical, ready over-uring, shut
+    /// down classical again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reply_venue_follows_pool_liveness() {
+        let c = conn();
+        let pool = FuseOverUring::sim_inert(2);
+        assert!(
+            c.install_over_uring(Arc::clone(&pool)).is_ok(),
+            "first install must win"
+        );
+        assert!(
+            !c.over_uring_ready(),
+            "installed-but-not-ready must stay classical (the INIT→REGISTER window)"
+        );
+        pool.mark_ready();
+        assert!(c.over_uring_ready(), "ready pool arms the uring venue");
+        pool.shutdown();
+        assert!(
+            !c.over_uring_ready(),
+            "shutdown pool must route classical again"
+        );
+    }
+
+    /// Contract 2 + 3, teardown side: after `teardown_over_uring` the
+    /// pool is DEAD by its own atomics but STAYS observable through the
+    /// slot — liveness is never derived from slot emptiness, so lock-free
+    /// venue reads cannot race a tear-out. Teardown is idempotent, and
+    /// the slot never reopens for a second install.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_keeps_pool_reachable_for_liveness_routing() {
+        let c = conn();
+        let pool = FuseOverUring::sim_inert(3);
+        assert!(
+            c.install_over_uring(Arc::clone(&pool)).is_ok(),
+            "first install must win"
+        );
+        pool.mark_ready();
+
+        c.teardown_over_uring();
+        assert!(!pool.is_ready(), "teardown must drop ready");
+        assert!(!pool.is_active(), "teardown must drop active");
+        assert!(
+            !c.over_uring_ready(),
+            "post-teardown reply venue must be classical"
+        );
+        assert_eq!(
+            c.num_uring_queues(),
+            Some(3),
+            "teardown must NOT empty the slot — liveness rides the pool's \
+             ready/active atomics, never slot emptiness (contract 2)"
+        );
+
+        // Contract 3: every worker clone may race the teardown path.
+        c.teardown_over_uring();
+        assert_eq!(
+            c.num_uring_queues(),
+            Some(3),
+            "teardown must stay idempotent and non-emptying"
+        );
+
+        // Install-once is for the CONNECTION's lifetime: teardown never
+        // reopens the slot (no live path re-installs after teardown; a
+        // late enable must not resurrect a dead session's transport).
+        let late = FuseOverUring::sim_inert(4);
+        let returned = c
+            .install_over_uring(late)
+            .expect_err("teardown must not reopen the install-once slot");
+        returned.shutdown();
     }
 }
 

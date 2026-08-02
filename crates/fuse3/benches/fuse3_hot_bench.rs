@@ -22,16 +22,28 @@
 //!   regions, the state machine only; the kernel surface needs the sqz
 //!   kernel. Geometry: depth 32 (the Q_DEPTH clamp), 1 MiB payloads
 //!   (the L1 full-size payload-buffer law).
+//! * `conn_prelude` — the session pool-slot probes the request path pays
+//!   4× per READ (pre-rc spec PERF-2: dispatch venue, reply venue,
+//!   payload-buffer resolve, ready gate — ~4 M slot reads/s at 1 M
+//!   IOPS): `over_uring_ready()` on the empty (pre-arm) and armed
+//!   shapes, and the `get_payload_buffer` prelude (slot probe + sharded
+//!   pending miss — the READ-reply shape where the reply body is not an
+//!   arena slice). SIM venue (`FuseOverUring::sim_inert`) — the shipped
+//!   slot + liveness machinery, no kernel session; before/after
+//!   comparable across the PERF-2 mutex→lock-free swap.
 
 use bincode::Options;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use fuse3::get_bincode_config;
 use fuse3::raw::abi::{fuse_attr, fuse_attr_out, fuse_entry_out, fuse_in_header, fuse_out_header};
-use fuse3::raw::connection::fuse_over_uring::CommitBatchHistogram;
+use fuse3::raw::connection::fuse_over_uring::{CommitBatchHistogram, FuseOverUring};
 use fuse3::raw::connection::kmbuf::{KmbufQueue, IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_BUFFER};
+use fuse3::raw::connection::FuseConnection;
 use fuse3::raw::reply::FileAttr;
 use fuse3::{FileType, Timestamp};
+use async_notify::Notify;
 use std::hint::black_box;
+use std::sync::Arc;
 
 fn sample_attr() -> fuse_attr {
     FileAttr {
@@ -182,10 +194,53 @@ fn bench_kmbuf_attach(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_conn_prelude(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fuse3_conn_prelude");
+    group.throughput(Throughput::Elements(1));
+
+    // AsyncFd registration needs a live reactor; the probes themselves
+    // are synchronous.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bench runtime");
+    let _guard = rt.enter();
+    let conn =
+        FuseConnection::new(Arc::new(Notify::new())).expect("/dev/fuse (0666) + io_uring on box");
+
+    // Pre-arm shape: the INIT/REGISTER window's venue probe (empty slot).
+    group.bench_function("reply_venue_probe_empty", |b| {
+        b.iter(|| black_box(conn.over_uring_ready()));
+    });
+
+    let pool = FuseOverUring::sim_inert(2);
+    assert!(
+        conn.install_over_uring(Arc::clone(&pool)).is_ok(),
+        "install into fresh slot"
+    );
+    pool.mark_ready();
+
+    // Armed steady state: the per-reply venue probe (session.rs reply
+    // task + the in-place reply gate) — the exact call the request path
+    // pays.
+    group.bench_function("reply_venue_probe_armed", |b| {
+        b.iter(|| black_box(conn.over_uring_ready()));
+    });
+
+    // Armed READ-reply prelude: slot probe + sharded pending miss (the
+    // reply body is not an arena slice — the common non-zc shape).
+    group.bench_function("payload_buffer_probe_armed", |b| {
+        b.iter(|| black_box(conn.get_payload_buffer(black_box(0xDEAD_BEEF))));
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_ent_codec,
     bench_commit_batch,
-    bench_kmbuf_attach
+    bench_kmbuf_attach,
+    bench_conn_prelude
 );
 criterion_main!(benches);

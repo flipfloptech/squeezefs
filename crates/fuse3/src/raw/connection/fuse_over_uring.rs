@@ -1561,6 +1561,87 @@ impl FuseOverUring {
         Ok(pool)
     }
 
+    /// SIM venue (the `KmbufQueue::sim_anon` precedent): an inert pool —
+    /// real atomics, pending map, inbound queues, and per-queue wake
+    /// eventfds, but NO kernel fuse fd, NO rings, NO worker threads. It
+    /// exists so the connection-slot install/teardown protocol (PERF-2)
+    /// and the reply-send prelude bench can exercise the SHIPPED liveness
+    /// machinery (`is_ready`/`is_active`/`shutdown`/`pending`) without a
+    /// mounted session. Session accounting mirrors `try_start`
+    /// (ACTIVE_SESSIONS +1 here, −1 exactly once at shutdown/drop) so the
+    /// `over_uring_sessions_active` gauge stays balanced in test/bench
+    /// processes. The commit receivers are dropped — a `submit_reply`
+    /// against a sim pool reports BrokenPipe (use
+    /// `sim_inert_with_commit_rx` in-crate to hold them live).
+    pub fn sim_inert(nqueues: u16) -> Arc<Self> {
+        Self::sim_inert_inner(nqueues).0
+    }
+
+    /// In-crate sim variant keeping the per-queue commit receivers alive
+    /// so `submit_reply` round-trips (the pending-clear teardown pins).
+    #[cfg(test)]
+    pub(crate) fn sim_inert_with_commit_rx(
+        nqueues: u16,
+    ) -> (Arc<Self>, Vec<std::sync::mpsc::Receiver<CommitMsg>>) {
+        Self::sim_inert_inner(nqueues)
+    }
+
+    fn sim_inert_inner(nqueues: u16) -> (Arc<Self>, Vec<std::sync::mpsc::Receiver<CommitMsg>>) {
+        let mut inbound = Vec::with_capacity(nqueues as usize);
+        let mut queues = Vec::with_capacity(nqueues as usize);
+        let mut commit_rxs = Vec::with_capacity(nqueues as usize);
+        for _ in 0..nqueues {
+            inbound.push(Arc::new(InboundQueue::new()));
+            let (commit_tx, commit_rx) = std::sync::mpsc::channel();
+            let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            assert!(efd >= 0, "sim_inert eventfd: {}", io::Error::last_os_error());
+            // SAFETY: efd is a freshly-created, owned eventfd (checked >= 0).
+            let wake = unsafe { OwnedFd::from_raw_fd(efd) };
+            let wake_fd = wake.as_raw_fd();
+            queues.push(QueueHandle {
+                commit_tx,
+                wake_fd,
+                _wake: wake,
+                wake_coalescer: Arc::new(WakeCoalescer::new()),
+                arena: std::sync::Mutex::new(None),
+                kmbuf: std::sync::Mutex::new(None),
+            });
+            commit_rxs.push(commit_rx);
+        }
+        let pool = Arc::new(Self {
+            ready: AtomicBool::new(false),
+            active: AtomicBool::new(true),
+            shutdown_notify: tokio::sync::Notify::new(),
+            queues_registered: AtomicU64::new(0),
+            nqueues,
+            inbound,
+            pending: PendingMap::new(),
+            sqpoll: None,
+            queues,
+            workers: Mutex::new(Vec::new()),
+            fuse_fd: -1,
+            payload_sz: 1 << 20,
+            buffer_mode: TransportBufferMode::UserEnts,
+            qid_is_cpu: false,
+            stats_requests: AtomicU64::new(0),
+            stats_replies: AtomicU64::new(0),
+            stats_cqe_err: AtomicU64::new(0),
+            stats_register: AtomicU64::new(0),
+        });
+        // Mirror try_start's session accounting so shutdown's decrement
+        // balances (the gauge never underflows in sim processes).
+        ACTIVE_SESSIONS.fetch_add(1, Ordering::Relaxed);
+        (pool, commit_rxs)
+    }
+
+    /// Test seam: seed a pending-map entry as a queue worker's delivery
+    /// would (`unique → (qid, ent_idx, commit_id)`), so teardown pins can
+    /// prove `shutdown` clears the map and late replies drop as NotFound.
+    #[cfg(test)]
+    pub(crate) fn test_insert_pending(&self, unique: u64, qid: u16, ent_idx: u16, commit_id: u64) {
+        self.pending.insert(unique, (qid, ent_idx, commit_id));
+    }
+
     /// True once every per-CPU queue has submitted its initial REGISTER batch.
     /// Kernel `is_ring_ready` requires this before it switches `fiq->ops` to uring.
     pub fn all_queues_registered(&self) -> bool {
@@ -2911,6 +2992,62 @@ mod tests {
     #[test]
     fn test_flags2_bit() {
         assert_eq!(FUSE_OVER_IO_URING_FLAGS2, 1u32 << 9);
+    }
+
+    /// PERF-2 pool-level teardown law (what the session's reply-drop
+    /// comment relies on: "shutdown clears the pending map, so a reply
+    /// routed after it would be dropped"): a pre-teardown reply commits
+    /// (Ok), a post-teardown reply for the SAME unique reports NotFound —
+    /// the drop-not-classical-write arm in `write_vectored`.
+    #[test]
+    fn shutdown_clears_pending_so_late_replies_drop() {
+        let (pool, _rxs) = FuseOverUring::sim_inert_with_commit_rx(1);
+        pool.test_insert_pending(42, 0, 3, 7);
+        pool.mark_ready();
+        pool.submit_reply(42, vec![0u8; 16], bytes::Bytes::new())
+            .expect("pre-teardown reply must commit");
+        pool.test_insert_pending(44, 0, 4, 8);
+        pool.shutdown();
+        let err = pool
+            .submit_reply(44, vec![0u8; 16], bytes::Bytes::new())
+            .expect_err("post-teardown reply must miss the cleared pending map");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "the miss must be the NotFound drop shape (never a classical fallback)"
+        );
+    }
+
+    /// PERF-2 pool-level idempotence law: `shutdown` gates its side
+    /// effects on the `active` swap — racing teardowns from every worker
+    /// clone decrement the session gauge exactly once and leave the
+    /// liveness word stable.
+    #[test]
+    fn shutdown_is_idempotent() {
+        let pool = FuseOverUring::sim_inert(2);
+        pool.mark_ready();
+        assert!(pool.is_ready() && pool.is_active());
+        pool.shutdown();
+        assert!(!pool.is_ready() && !pool.is_active());
+        // Second (and racing Nth) shutdown: no panic, flags stable.
+        pool.shutdown();
+        pool.shutdown();
+        assert!(!pool.is_ready() && !pool.is_active());
+    }
+
+    /// The venue predicates' truth table on the pool's own atomics
+    /// (contract 2's pool half): `is_ready` = ready && active — never
+    /// true pre-ready, never true post-shutdown.
+    #[test]
+    fn is_ready_requires_ready_and_active() {
+        let pool = FuseOverUring::sim_inert(1);
+        assert!(!pool.is_ready(), "fresh pool: active but not ready");
+        assert!(pool.is_active());
+        pool.mark_ready();
+        assert!(pool.is_ready());
+        pool.shutdown();
+        assert!(!pool.is_ready());
+        assert!(!pool.is_active());
     }
 
     #[test]

@@ -735,11 +735,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 if disconnect {
                     debug!("fuse connection dead ({err}); ending session");
                     #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
-                    {
-                        if let Some(pool) = fuse_connection.over_uring.lock().unwrap().take() {
-                            pool.shutdown();
-                        }
-                    }
+                    fuse_connection.teardown_over_uring();
                     return ReadResult::Destroy;
                 }
 
@@ -896,9 +892,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                             .write_vectored::<_, Vec<u8>>(hdr, None)
                             .await
                             .1;
-                        if let Some(pool) = fuse_connection.over_uring.lock().unwrap().take() {
-                            pool.shutdown();
-                        }
+                        fuse_connection.teardown_over_uring();
                     }
                     #[cfg(not(all(target_os = "linux", feature = "tokio-runtime")))]
                     {
@@ -1330,7 +1324,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
         {
             fuse_connection.enable_fuse_over_uring(transport_geom)?;
-            if let Some(pool) = fuse_connection.over_uring.lock().unwrap().clone() {
+            if let Some(pool) = fuse_connection.over_uring_pool() {
                 pool.mark_ready();
             }
             eprintln!("FUSE-over-io_uring transport armed for this session");

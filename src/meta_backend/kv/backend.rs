@@ -65,7 +65,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-/// `SQUEEZEFS_META_NODE_CACHE_MB` (§5.1; default 512 — §4.5).
+/// `SQUEEZEFS_META_NODE_CACHE_MB` (§5.1; absolute MiB, explicit wins
+/// verbatim — default derived, see [`resolve_node_cache_budget`]).
 pub const NODE_CACHE_MB_ENV: &str = "SQUEEZEFS_META_NODE_CACHE_MB";
 
 /// Pending-free FIFO capacity handed to the K4 allocator at mount. K6b's

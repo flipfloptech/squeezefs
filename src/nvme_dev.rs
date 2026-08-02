@@ -41,6 +41,124 @@ pub fn clear_fail_next_writes() {
     FAIL_NEXT_WRITES.store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Test seam: the worker stalls the next N read submissions by
+/// [`read_stall_ms`] each — the deterministic stand-in for a
+/// wedged/fabric-stalled device (the `SQUEEZEFS_TEST_WRITE_STALL_MS`
+/// precedent: load selects such schedules; this lever selects them
+/// deterministically — `tests/nvme_dest_ownership_tests.rs`, MEM-1).
+/// One relaxed load unset; never set in production.
+static STALL_NEXT_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static STALL_READ_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Arm the read-stall test seam: the next `count` worker read submissions
+/// each stall `ms` milliseconds (`0` disables).
+pub fn set_test_read_stall(count: usize, ms: u64) {
+    STALL_READ_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+    STALL_NEXT_READS.store(count, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Caller-side wait bound (ms) on the uring-worker read oneshot. Default
+/// 30 000 — a wedged device/worker must not freeze the whole FUSE session
+/// (pre-MEM-1 posture, unchanged); the MEM-1 stall legs shorten it via
+/// [`set_test_read_timeout_ms`] / `SQUEEZEFS_TEST_NVME_READ_TIMEOUT_MS`
+/// so the repro runs in test time.
+fn read_timeout_ms_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let v = std::env::var("SQUEEZEFS_TEST_NVME_READ_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(30_000);
+        std::sync::atomic::AtomicU64::new(v.max(1))
+    })
+}
+
+/// Set the read-timeout test seam (tests only; clamped to ≥ 1 ms).
+pub fn set_test_read_timeout_ms(ms: u64) {
+    read_timeout_ms_cell().store(ms.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// MEM-1 (pre-rc engineering spec §2, P0): zero-copy read-destination
+// ownership. A `dest_addr` read DMAs device bytes straight into memory the
+// worker does not own — for kernel READs that is the FUSE-over-io_uring
+// registered ent payload buffer, whose COMMIT_AND_FETCH re-arm hands it to
+// a NEW kernel request. If the awaiting future times out (or is dropped)
+// while the SQE is still in flight, the handler replies, the ent re-arms,
+// and the late DMA lands in someone else's buffer: cross-request
+// corruption. The registry below closes it with the transport's own §5.4
+// grain: at request build the read path CLAIMS an owner token covering the
+// destination (for transport dests, a `fuse3` `DestDmaLease` holding the
+// ent's lease refs); the token rides inside the worker's in-flight request
+// and drops only at CQE completion (or worker teardown), so the transport
+// commit gate parks the re-arm until no SQE can still write the buffer.
+// ---------------------------------------------------------------------------
+
+/// Owner token for one in-flight zero-copy read destination. Opaque to the
+/// worker: it is held for exactly the SQE's lifetime and dropped at CQE
+/// completion — the drop is what releases the destination back to its
+/// owner (for transport payload dests: the §5.4 lease release that lets a
+/// parked COMMIT_AND_FETCH re-arm proceed).
+pub type DestToken = Box<dyn std::any::Any + Send>;
+
+/// Resolver: `(dest_addr, len)` → an owner token when the window lies
+/// inside a region this resolver owns (`None` = not mine). Must be cheap
+/// and lock-free — it runs once per dest-bearing device read.
+pub type DestResolver = Arc<dyn Fn(u64, usize) -> Option<DestToken> + Send + Sync>;
+
+struct DestResolverEntry {
+    /// Liveness anchor (the session connection): a dead anchor is skipped
+    /// at claim time and pruned on the next registration, so sessions
+    /// never need an explicit unregister.
+    anchor: std::sync::Weak<dyn std::any::Any + Send + Sync>,
+    resolve: DestResolver,
+}
+
+/// Lock-free read-mostly registry (`ArcSwap` — registrations happen once
+/// per mount; claims are hot-ish, once per dest-bearing device read).
+fn dest_resolvers() -> &'static arc_swap::ArcSwap<Vec<Arc<DestResolverEntry>>> {
+    static CELL: std::sync::OnceLock<arc_swap::ArcSwap<Vec<Arc<DestResolverEntry>>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| arc_swap::ArcSwap::from_pointee(Vec::new()))
+}
+
+/// Register a zero-copy destination resolver (mount arm path). `anchor`
+/// scopes its life: claims skip entries whose anchor is gone, and dead
+/// entries are pruned on the next registration.
+pub fn register_dest_resolver(
+    anchor: std::sync::Weak<dyn std::any::Any + Send + Sync>,
+    resolve: DestResolver,
+) {
+    // Serialize writers only (registration is a per-mount event); readers
+    // stay lock-free through the ArcSwap.
+    static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = WRITER.lock().expect("dest-resolver writer lock");
+    let cur = dest_resolvers().load_full();
+    let mut next: Vec<Arc<DestResolverEntry>> = cur
+        .iter()
+        .filter(|e| e.anchor.strong_count() > 0)
+        .cloned()
+        .collect();
+    next.push(Arc::new(DestResolverEntry { anchor, resolve }));
+    dest_resolvers().store(Arc::new(next));
+}
+
+/// Claim the owner token covering `[addr, addr + len)`. `None` = no
+/// registered owner claims the window — e.g. IPC-arena dests, whose
+/// session mapping has lifetime machinery of its own.
+pub fn claim_dest_token(addr: u64, len: usize) -> Option<DestToken> {
+    let entries = dest_resolvers().load();
+    for e in entries.iter() {
+        if e.anchor.strong_count() == 0 {
+            continue;
+        }
+        if let Some(t) = (e.resolve)(addr, len) {
+            return Some(t);
+        }
+    }
+    None
+}
+
 struct SendPtr(*mut u8);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
@@ -329,6 +447,31 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                     tx,
                     enq,
                 } => {
+                    // Test seam: deterministic device-order stall (MEM-1
+                    // repro) — the request already owns its dest token, so
+                    // the ownership property under test spans this window
+                    // exactly like an in-flight DMA.
+                    loop {
+                        let cur = STALL_NEXT_READS.load(std::sync::atomic::Ordering::SeqCst);
+                        if cur == 0 {
+                            break;
+                        }
+                        if STALL_NEXT_READS
+                            .compare_exchange(
+                                cur,
+                                cur - 1,
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::SeqCst,
+                            )
+                            .is_ok()
+                        {
+                            let ms = STALL_READ_MS.load(std::sync::atomic::Ordering::SeqCst);
+                            if ms > 0 {
+                                std::thread::sleep(std::time::Duration::from_millis(ms));
+                            }
+                            break;
+                        }
+                    }
                     // read_fill_phase_ns: `dev_queue` = enqueue → SQE
                     // build (channel + slot wait); `dev_service` starts
                     // here and records at CQE completion.
@@ -1075,24 +1218,28 @@ impl NvmeBlockDev {
 
         // Never wait unbounded on the uring worker (wedged device/worker must not
         // freeze the entire FUSE session including virtual .config reads).
-        let res = match tokio::time::timeout(std::time::Duration::from_secs(30), rx_oneshot).await {
-            Ok(Ok(r)) => r?,
-            Ok(Err(e)) => {
-                return Err(crate::error::SqueezefsError::InvalidOperation(format!(
-                    "Worker thread closed receiver: {:?}",
-                    e
-                )));
-            }
-            Err(_) => {
-                return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "NvmeBlockDev read timed out after 30s (offset={}, size={})",
-                        offset, size
-                    ),
-                )));
-            }
-        };
+        let timeout_ms = read_timeout_ms_cell().load(std::sync::atomic::Ordering::Relaxed);
+        let res =
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx_oneshot)
+                .await
+            {
+                Ok(Ok(r)) => r?,
+                Ok(Err(e)) => {
+                    return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                        "Worker thread closed receiver: {:?}",
+                        e
+                    )));
+                }
+                Err(_) => {
+                    return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "NvmeBlockDev read timed out after {} ms (offset={}, size={})",
+                            timeout_ms, offset, size
+                        ),
+                    )));
+                }
+            };
 
         if count_in_get_obj {
             crate::fuse_client::METRICS

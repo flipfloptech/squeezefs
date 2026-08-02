@@ -68,9 +68,11 @@ use tracing::{debug, error, info, warn};
 /// Payload-lease re-arm protocol core (refs/parked publish-then-recheck).
 /// `#[path]`-included so `loom-models` can model-check the exact shipped
 /// code (SqueezeFS zero-copy write-path design §5.4, house extracted-core
-/// convention).
+/// convention). `pub` (MEM-1): the SqueezeFS root suite composes the
+/// dest-ownership tests against the REAL gate type
+/// (`tests/nvme_dest_ownership_tests.rs`).
 #[path = "lease_core.rs"]
-mod lease_core;
+pub mod lease_core;
 use lease_core::{CommitGate, EntLeaseState};
 
 /// Queue-worker eventfd wake-coalescing core (L3 transport-economy lever

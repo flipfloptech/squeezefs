@@ -163,6 +163,17 @@ version = "0.29.0"
 features = ["user", "ioctl"]
 default-features = false
 
+# The microbench program (2026-08-04, root
+# .benchmarks/2026-08-04-microbench-program.md): transport hot-path
+# Criterion groups. `autobenches = false` above, so the target is
+# declared explicitly — house style `harness = false`.
+[dev-dependencies.criterion]
+version = "0.5"
+
+[[bench]]
+name = "fuse3_hot_bench"
+harness = false
+
 # `lease_core.rs` (FUSE-over-io_uring payload-lease protocol core) is
 # `#[path]`-included by the SqueezeFS loom-models crate and switches its
 # atomics on `cfg(loom)`; the main build never sets it.

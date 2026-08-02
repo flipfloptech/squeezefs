@@ -672,8 +672,17 @@ pub struct CommitBatchHistogram {
     buckets: [AtomicU64; 11],
 }
 
+impl Default for CommitBatchHistogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CommitBatchHistogram {
-    const fn new() -> Self {
+    // `pub` methods below (new/record) exist for the microbench program
+    // (2026-08-04): `benches/fuse3_hot_bench.rs` prices the per-flush
+    // batch accounting the queue-worker drain pays on every submit.
+    pub const fn new() -> Self {
         Self {
             buckets: [
                 AtomicU64::new(0),
@@ -702,7 +711,7 @@ impl CommitBatchHistogram {
     }
 
     /// Record one flush that carried `n ≥ 1` COMMIT_AND_FETCH SQEs.
-    fn record(&self, n: usize) {
+    pub fn record(&self, n: usize) {
         self.buckets[Self::bucket_index(n)].fetch_add(1, Ordering::Relaxed);
     }
 

@@ -484,6 +484,71 @@ impl KmbufQueue {
         })
     }
 
+    /// SIM venue (tests + the 2026-08-04 microbench program): the same
+    /// two regions as [`KmbufQueue::setup`] mapped ANONYMOUSLY — no
+    /// io_uring, no `IORING_REGISTER_KMBUF_RING`, no kernel surface —
+    /// so the attachment-law state machine ([`KmbufQueue::note_delivery`]
+    /// / [`KmbufQueue::attached_ptr`]) runs over real mapped memory on
+    /// stock kernels. Never a product constructor: the daemon only ever
+    /// reaches a `KmbufQueue` through the probed `setup` path.
+    #[doc(hidden)]
+    pub fn sim_anon(depth: usize, payload_sz: usize) -> io::Result<Self> {
+        let page = {
+            let sz = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
+            if sz > 0 {
+                sz as usize
+            } else {
+                4096
+            }
+        };
+        if payload_sz % page != 0 {
+            return Err(io::Error::other(format!(
+                "kmbuf sim buf_size {payload_sz} not page-aligned (page {page})"
+            )));
+        }
+        let ring_entries = depth.next_power_of_two().max(1) as u32;
+        let headers_span = (depth * REQ_HEADER_SZ).next_multiple_of(page);
+        let region_span = ring_entries as usize * payload_sz;
+        let map_anon = |span: usize| -> io::Result<usize> {
+            // SAFETY: fresh anonymous RW mapping, kernel-validated length.
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    span,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "kmbuf sim region mmap failed",
+                ));
+            }
+            Ok(p as usize)
+        };
+        let headers_base = map_anon(headers_span)?;
+        let region_base = match map_anon(region_span) {
+            Ok(b) => b,
+            Err(e) => {
+                // SAFETY: error-path unmap of the mapping created above.
+                unsafe { libc::munmap(headers_base as *mut libc::c_void, headers_span) };
+                return Err(e);
+            }
+        };
+        Ok(Self {
+            headers_base,
+            headers_span,
+            region_base,
+            region_span,
+            buf_size: payload_sz,
+            ring_entries,
+            attached: (0..depth).map(|_| AtomicU64::new(NO_BUF)).collect(),
+        })
+    }
+
     /// Registered buffer entries (pow2 ≥ depth) — the true kernel-side
     /// payload allocation this queue pins (`entries × buf_size`), for
     /// honest arena gauging.

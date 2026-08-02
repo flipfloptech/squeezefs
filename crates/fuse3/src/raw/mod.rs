@@ -40,7 +40,12 @@ pub(crate) type FuseData = Either<
     ),
 >;
 
-pub(crate) mod abi;
+// `pub` + doc(hidden) for the microbench program (2026-08-04): the
+// transport bench (`benches/fuse3_hot_bench.rs`) measures the per-op
+// hot-struct codec cost (fuse_in_header decode, out-header + attr/entry/
+// write-out encode). Not a stable API surface.
+#[doc(hidden)]
+pub mod abi;
 pub(crate) mod affinity;
 pub mod connection;
 mod filesystem;

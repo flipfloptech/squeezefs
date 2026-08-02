@@ -49,6 +49,11 @@ pub use raw::{tpc_lane_redispatches, tpc_spawn, tpc_spawn_on_node, tpc_thread_co
 
 mod errno;
 mod helper;
+// Bench seam (microbench program 2026-08-04): the exact bincode options
+// the session hot path serializes headers with — `benches/
+// fuse3_hot_bench.rs` must measure the shipping codec, not a lookalike.
+#[doc(hidden)]
+pub use helper::get_bincode_config;
 mod mount_options;
 pub mod notify;
 // N-topology-general NUMA nearest-resource map — canonical file in the

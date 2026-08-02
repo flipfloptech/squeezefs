@@ -162,6 +162,26 @@ for h in "${HOSTS[@]}"; do
   # port: that releases the listeners), then namespaces -> subsystems.
   # Expectation-named teardown ("unshare $BASE-dN for N in 0..15") left
   # orphan exports+listeners on oss2 and poisoned the client reconnect.
+  # LEDGER teardown first, via the product verb (first-run lesson #2,
+  # 2026-08-02): the configfs sweep below removes live nvmet state but the
+  # product SHARE LEDGER survives it, and `nvmeof share` refuses an NQN the
+  # ledger already carries. Only oss2 collided (its old- and new-epoch names
+  # are identical) but every node carries stale old-name rows — enumerate
+  # the ledger under our prefix and unshare each row, whatever a previous
+  # epoch named it. WARN-and-continue: the configfs belt plus the share
+  # verb's own refusal stay the loud backstops.
+  "${SSH[@]}" "root@$ip1" "REMOTE_SQZ='$REMOTE_SQZ' NQN_PREFIX='$NQN_PREFIX' bash -s" <<'EOS'
+set -u
+[ -x "$REMOTE_SQZ" ] || exit 0
+"$REMOTE_SQZ" nvmeof list 2>/dev/null \
+  | awk -v p="$NQN_PREFIX" '$1 == "NQN:" && index($2, p ":") == 1 { print $2 }' \
+  | while read -r nqn; do
+      echo "  ledger unshare: $nqn"
+      "$REMOTE_SQZ" nvmeof unshare "$nqn" || echo "WARN: unshare $nqn failed (share will refuse loudly if the row survives)" >&2
+    done
+exit 0
+EOS
+
   # NOTE: the env prefix must be quoted AS ONE REMOTE WORD-SEQUENCE: ssh
   # concatenates its argv with spaces and the REMOTE shell re-parses it, so
   # an unquoted-remotely IPS="$ip1 $ip2" splits — the remote runs

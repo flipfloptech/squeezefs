@@ -161,10 +161,31 @@ A/B methodology: same workload, `SQUEEZEFS_FUSE_KMBUF` on/off,
   failed** (13 new: 6 geometry-law + 7 kmbuf/wire contracts);
   `cargo clippy --all-targets --all-features -- -D warnings` clean;
   `cargo fmt --check` clean.
-- **Root:** full gate green — clippy `-D warnings` clean, fmt clean,
-  `cargo test --all-features -- --test-threads=1` complete-suite pass,
-  `cargo doc --no-deps` clean, bench smoke green (see the closing gate
-  run recorded in the branch tip commit).
+- **Root:** clippy `-D warnings` clean, fmt clean, `cargo doc
+  --no-deps` clean (the 4 standing intra-doc-link warnings pre-exist on
+  dev tip verbatim), bench smoke green (`cargo bench --benches --
+  --test`, exit 0). `cargo test --all-features -- --test-threads=1`:
+  **three full passes, 176+ suites green each**, with a rotating
+  singleton failure per pass — every one attributed ENVIRONMENTAL, not
+  branch-caused (a sibling campaign's full suite ran concurrently on
+  this box the whole window, loadavg 4–10):
+  - `multi_queue_tests::storm::test_single_queue_qdepth4_...` —
+    `transport_parked_commits` 1–3 vs the exact-0 assert. **Reproduced
+    on the UNMODIFIED dev tip `6d87b11` under the same load: A-B-B-A
+    (A pass, B fail, B fail, A FAIL) + A-side ×4 = 5/6 dev-tip
+    failures.** Pre-existing load-selected schedule (a reply racing its
+    payload-severance drop by microseconds parks 1 commit of ~1.8 k
+    leases); same class as the 2026-07-29/30 storm-wedge forensics'
+    CPU-starved-schedule findings. Passes on this branch whenever the
+    box load allows.
+  - `volume_drain_tests` (pass 2 only) and
+    `cli_clients_df_tests::test_df_answers_against_live_mounted_volume`
+    (pass 3 only — daemon teardown missed its exit timeout at
+    loadavg ≈ 10): both green standalone immediately after
+    (14/14, 9/9).
+  No failure was ever reproducible standalone on this branch, and none
+  touches the changed surfaces' contracts (the 19 transport-suite tests
+  are green in every pass).
 - **Red-first record:** geometry contracts committed RED
   (5 failed / 28 prior green) against a stubbed pre-fix planner, then
   the fix; root gauge contracts committed RED (missing
@@ -208,12 +229,14 @@ standing rule). **The reformat window's manifest grows these rows:**
 
 ## 6. Staging & hygiene
 
-Rocky8 container pair (KD-7 same-commit daemon+shim) staged at
-`/scratch/tmp/{squeezefs,libsqueezefs_il.so}.fzc` + `fzc.sha` (sha256
-verified byte-exact after transfer; journaled in
-`/scratch/tmp/agent_runs.log` at drop time). **File drop only — NO
-mounts, no deploys** (epoch lock). The staged `--version` line + the
-sha file on-box name the exact commit. Dev-box hygiene: builds under
+Rocky8 container pair (KD-7 same-commit daemon+shim; in-container
+checks passed, glibc ≤ 2.28) staged at
+`/scratch/tmp/{squeezefs,libsqueezefs_il.so}.fzc` + `fzc.sha`:
+`squeezefs 1.1.0 (969ba31d311e / 969ba31d311ee3aed021d1a646b50fdce973793e)`,
+sha256 `2a0395f5…` / `8e76920e…`, verified byte-exact after transfer
+(`sha256sum -c fzc.sha` OK on-box) and journaled in
+`/scratch/tmp/agent_runs.log` (2026-08-02T09:17:43Z line). **File drop
+only — NO mounts, no deploys** (epoch lock). Dev-box hygiene: builds under
 taskset 8-15 / 8 jobs / nice 10; Tctl never above ~65 °C observed;
 pre-fix proof worktree removed; sysctl restored to 256 after every
 privileged row.

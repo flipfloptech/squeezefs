@@ -1179,7 +1179,16 @@ impl KvMetaBackend {
         // free-record VALUES (byte-for-byte format compat) — the release
         // GATE itself rides the tail (design-smo-replay-currency §2-A).
         self.retire_seq.store(ckpt_seq + 1, Ordering::Release);
-        self.pending_reclaim.lock().unwrap().push(tail);
+        // DUR-3: stamp the push with the barrier epoch AS OF the moment
+        // the record's write completed. Barriers already in flight cannot
+        // have flushed it, so `after_durable_barrier` releases this entry
+        // only once a barrier that started later completes — one cycle of
+        // extra latency in the deferred case, never a released watermark
+        // over an undurable record.
+        self.pending_reclaim
+            .lock()
+            .unwrap()
+            .push((tail, self.barrier_push_epoch()));
         super::META_KV_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
 
         if barrier_now {

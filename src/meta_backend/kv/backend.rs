@@ -728,11 +728,28 @@ pub struct KvMetaBackend {
     /// §4.7/§4.6 retire tag for SMO frees: always `checkpoint_seq + 1`
     /// (the NEXT ledger record); shared with the SMO hooks.
     pub(super) retire_seq: Arc<AtomicU64>,
-    /// Ledger records written but not yet known durable, by their
-    /// `journal_tail_seq` — the §4.6 pt 3 pending-reclaim watermark and,
-    /// since the Option-A coverage fix, the pending-free gate's clock too
-    /// (design-smo-replay-currency §2-A); drained after the next barrier.
-    pub(super) pending_reclaim: std::sync::Mutex<Vec<u64>>,
+    /// Ledger records written but not yet known durable, as
+    /// `(journal_tail_seq, push_epoch)` — the §4.6 pt 3 pending-reclaim
+    /// watermark and, since the Option-A coverage fix, the pending-free
+    /// gate's clock too (design-smo-replay-currency §2-A).
+    ///
+    /// **DUR-3**: the `push_epoch` is [`Self::barrier_starts`] read at
+    /// push time, i.e. after the record's write completed. An entry is
+    /// released only by a barrier whose `sync_fn` STARTED after that
+    /// (`push_epoch < barrier_durable`) — a barrier already in flight
+    /// when the record was written cannot have made it durable, and
+    /// releasing on it is the journal-hole / unmountable-volume vector
+    /// the spec names. The coalescer is correct; this consumer used to
+    /// misread its guarantee (it covers the caller's OWN prior write,
+    /// never a third party's push into the window).
+    pub(super) pending_reclaim: std::sync::Mutex<Vec<(u64, u64)>>,
+    /// Monotonic barrier-start ticket counter: every `sync_fn` invocation
+    /// takes the next value as it begins (DUR-3).
+    barrier_starts: AtomicU64,
+    /// The highest barrier-start ticket whose barrier COMPLETED
+    /// successfully (`fetch_max`). Bounded-out barriers never publish
+    /// here — their outcome is unknown, so they certify nothing.
+    barrier_durable: AtomicU64,
     /// Checkpoint-task lifecycle: shutdown flag + wake + join handle +
     /// liveness probe (`Weak<()>` of the token the task owns).
     shutting_down: AtomicBool,
@@ -1392,6 +1409,8 @@ impl KvMetaBackend {
             smo,
             retire_seq,
             pending_reclaim: std::sync::Mutex::new(Vec::new()),
+            barrier_starts: AtomicU64::new(0),
+            barrier_durable: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
             ckpt_wake: Arc::new(tokio::sync::Notify::new()),
             ckpt_join: std::sync::Mutex::new(None),
@@ -2078,9 +2097,20 @@ impl KvMetaBackend {
                 crate::fuse_client::METRICS
                     .meta_device_syncs
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // DUR-3: this invocation's start ticket, taken BEFORE the
+                // device op. Everything pushed onto `pending_reclaim`
+                // after this point carries an epoch ≥ `started_at` and is
+                // therefore NOT covered by this barrier.
+                let started_at = self.barrier_starts.fetch_add(1, Ordering::AcqRel) + 1;
                 let out = crate::uring_fs::fdatasync(self.path.clone()).await;
                 match &out {
-                    Ok(()) => self.note_barrier_success(),
+                    Ok(()) => {
+                        // Publish coverage before the fan-out, so every
+                        // waiter this barrier releases (leader and
+                        // followers alike) drains against it.
+                        self.barrier_durable.fetch_max(started_at, Ordering::AcqRel);
+                        self.note_barrier_success();
+                    }
                     Err(e) => self.note_barrier_failure(e),
                 }
                 out
@@ -2088,6 +2118,13 @@ impl KvMetaBackend {
             .await?;
         self.after_durable_barrier();
         Ok(())
+    }
+
+    /// The DUR-3 push epoch: barriers already started (hence unable to
+    /// cover anything written from now on). Read by `checkpoint_cycle`
+    /// AFTER its ledger record's write completed.
+    pub(super) fn barrier_push_epoch(&self) -> u64 {
+        self.barrier_starts.load(Ordering::Acquire)
     }
 
     /// Barrier succeeded: reset the consecutive-failure rung.
@@ -2145,11 +2182,18 @@ impl KvMetaBackend {
     /// recycled-extent stale-route mechanism (child-seq mount refusals).
     /// All three §4.6-pt-3 watermarks now advance on one clock.
     pub(super) fn after_durable_barrier(&self) {
-        let drained: Vec<u64> = {
+        // DUR-3: release only what a COMPLETED barrier covers. A record
+        // pushed at epoch `e` was written while barriers 1..=e were
+        // already started, so only a barrier that started at `e + 1` or
+        // later can have flushed it. Push epochs are non-decreasing, so
+        // the covered set is always a prefix.
+        let covered = self.barrier_durable.load(Ordering::Acquire);
+        let drained: Vec<(u64, u64)> = {
             let mut g = self.pending_reclaim.lock().unwrap();
-            std::mem::take(&mut *g)
+            let split = g.partition_point(|&(_, epoch)| epoch < covered);
+            g.drain(..split).collect()
         };
-        for tail in drained {
+        for (tail, _) in drained {
             self.alloc.advance_durable(tail);
             self.cache.set_durable_tail(tail);
             self.ring.advance_reusable_upto(tail);

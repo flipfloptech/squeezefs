@@ -25,7 +25,23 @@ by inspection.
 | DUR-8b | the durable delta chain reached 5 with the cap at 4 (and 255/255 in the economy suite) | the backend re-bases at the cap in both commit paths | `dur8b_the_chain_cap_bounds_the_durable_delta_chain` |
 | DUR-8c | `next_ino` came back 2 with the replay window mentioning inos 4 000 and 9 000 | the watermark folds dentry-value and xattr-key inos | `dur8c_replay_watermark_folds_dentry_and_xattr_inos` |
 | DUR-8e | a 4 GiB declared plaintext allocated | refused before the allocation; zstd bounded at the reader | `dur8e_declared_plaintext_length_is_bounded_by_the_block_size` |
-| DUR-8f | two `?` exits abandoned an allocated, unnamed block | `MintedBlockGuard` frees on every exit before custody transfer | covered by the existing spill suites + the guard's own contract (MEM-2) |
+| DUR-8f | two `?` exits abandoned an allocated, unnamed block | `MintedBlockGuard` frees on every exit before custody transfer | **no dedicated red leg** — see the honesty note below |
+
+### DUR-8f — landed without a dedicated red leg (stated, not hidden)
+
+The two remaining leak sites (`routing.rs`, the staged-spill arm's device
+write and layout commit) now carry a `MintedBlockGuard`, pattern-identical
+to the `write_striped` sites MEM-2 already closed and verified. A red leg
+would need BOTH a staging-full condition (to enter the spill arm at all)
+and an injected failure after the allocation (the cleanest is a
+deliberately stale fencing token, so `save_metadata_to_backend` refuses
+with `FencingTokenExpired`), then an allocator used-block count across a
+`reclaim_drain`. That fixture is a half-day of harness on its own and the
+guard it would pin is a five-line RAII with an existing verified twin, so
+it is recorded here as owed rather than claimed: **the row's acceptance is
+the MEM-2 guard contract plus the spill suites staying green**
+(`rw5a_never_lossy_tests`, `staged_rmw_alloc_tests`,
+`staged_crash_recovery_tests` — all green on this branch).
 
 ### DUR-5 — layout verdict
 

@@ -1517,8 +1517,8 @@ mod tests {
         // per-block or smaller — which is exactly why the bound is safe).
         let reader = CryptoCompressState::new(
             "lz4".to_string(),
-            "aes256gcm-rsa".to_string(),
-            Some(&TEST_PEM),
+            "aes256gcm".to_string(),
+            Some(&TEST_KEY),
         );
         reader.init_scratch_pool(2 * bs);
         assert_eq!(

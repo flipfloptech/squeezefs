@@ -87,7 +87,7 @@ Hardening: pool not marked ready until all queues submit REGISTER; per-qid commi
 ## High-Performance Distributed Filesystem Architecture
 
 ### Target Scale & Layout
-* **Scale:** 15,000+ Concurrent Nodes.
+* **Scale:** 15,000+ Concurrent Nodes — the **design target**, meaning (user ruling D1, 2026-08-02) 15 k nodes all reading AND writing but rarely the same files (at-scale AI-training mixed workloads). **Shipped today: one write mount per volume set** (D0 guard, enforced). The gap is spec §6's program; scale claims must cite their evidence tier (measured-real / measured-simulated / arithmetic-on-measured-constants) per `docs/rc-manifest.md`.
 * **Architecture Type:** Decoupled metadata (MetaLV) + **block data** (local NVMe / NVMe-oF), exposed via POSIX FUSE.
 
 ### Technology Stack
@@ -107,11 +107,13 @@ Writes that grow past thresholds promote layouts **durably** (block I/O before m
 
 ### Distributed Lock Manager (DLM) & Consistency
 
-Write custody maps to cluster leases on Metadata Volumes:
+**Shipped scope (corrected 2026-08-02, spec §6.1/§6.12 — the prior text described an unimplemented design):** `src/dlm.rs` is a **process-local** lock manager — a `scc::HashMap` with no network, no persistence, no TTL on a held lease, no renewal, no revocation, no shared mode, and no cross-process visibility. It serializes writers *within* one mount; **cross-mount exclusion is the D0 single-writer mount guard's job, not this module's.** Fencing tokens are monotonic per file **per process** and restart at 0 on every mount (spec §6.11 — the "stale tokens discard staged work" remount law cannot fire at mount time today; the staging generation stamp is what actually protects that path). The DLM program that makes this genuinely distributed is spec §6.9 stages S0–S11; treat every claim below as *design intent under construction*, and never write code that assumes a capability the stage table has not landed.
+
+Write custody maps to leases on Metadata Volumes:
 * **Acquisition:** Lease locking + fencing token `INCR` (no external distributed database required).
 * **Granularity:** File-level write leases; never directory-wide for data.
-* **Leases & Heartbeats:** TTL + background renewal; local caches must re-validate after lock key loss.
-* **Fencing Tokens:** Monotonic per-file tokens; writers present tokens; stale tokens → `FencingTokenExpired` / reject.
+* **Leases & Heartbeats:** TTL + background renewal — **NOT IMPLEMENTED** (the `ttl` argument is the *waiter's* deadline; a held lease has no expiry). Target state, stage S5+.
+* **Fencing Tokens:** Monotonic per-file tokens; writers present tokens; stale tokens → `FencingTokenExpired` / reject. **Monotone per process only** until S1/S2 (global `grant_seq` + durable `WriterClaim.term`).
 * **POSIX advisory locks (fcntl byte-range, OFD, flock) are KERNEL-LOCAL** (2026-07-22, VL10 release gate — fstests generic/131/478/504): the INIT reply never advertises `FUSE_POSIX_LOCKS`/`FUSE_FLOCK_LOCKS` (pinned in the fuse3 fork's negotiation tests), so the kernel's canonical `posix_lock_file` arbitrates per mount — full POSIX semantics (unlock-on-close, splits, OFD owners, `/proc/locks`) for free. Intra-mount arbitration is the whole requirement under the D0 single-writer mount guard; the former daemon lock table and the DLM per-inode delegation surface it rode were deleted (never construct a daemon lock path "for the cluster" — cross-mount write exclusion is D0's job).
 
 ### Tiered Caching & Paths

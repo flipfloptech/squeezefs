@@ -166,6 +166,25 @@ harness = false
 name = "ipc_hop_bench"
 harness = false
 
+# The microbench program (2026-08-04,
+# .benchmarks/2026-08-04-microbench-program.md): hot-path Criterion
+# groups + the baseline-comparison harness (tests/run_bench_baseline.sh).
+[[bench]]
+name = "copy_path_bench"
+harness = false
+
+[[bench]]
+name = "zcrx_bench"
+harness = false
+
+[[bench]]
+name = "read_path_bench"
+harness = false
+
+[[bench]]
+name = "write_path_bench"
+harness = false
+
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

@@ -500,11 +500,141 @@ fn bench_kv_fold(c: &mut Criterion) {
     group.finish();
 }
 
+/// Microbench program (2026-08-04,
+/// `.benchmarks/2026-08-04-microbench-program.md`): the journal-entry
+/// codec + the lock-free reservation core — the per-commit device-plane
+/// price of design-cow-kv-metadata §4.1/§4.4 (one tx = one checksummed
+/// entry; the entry checksum is `xxh3_64` over the whole entry).
+///
+/// Shapes:
+/// * `create` — the D4 entry-economy shape (design-metadata-throughput):
+///   one create's whole-tx entry = dentry Put + inode Put + parent
+///   Δtime (measured ≈ 1.0 entries/op — this is what one op encodes).
+/// * `publish_batch64` — the write-commit-economy lever-B group
+///   (`.benchmarks/2026-07-30-write-commit-economy.md`): 64 delta-class
+///   layout saves drained into ONE multi-ino entry
+///   (`SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX` derives from the conveyor's
+///   batch default 64); ~128 B xattr-delta values.
+/// * `journal_core` — the §4.4 pt 5 wait-free admission/reservation
+///   cycle on a production-geometry ring (8 MiB: 2,048 × 4,072 B data
+///   pages, the `clamp(volume/64, 8 MiB, 32 MiB)` floor).
+fn bench_kv_journal(c: &mut Criterion) {
+    use squeezefs::meta_backend::kv::journal::{
+        checkpoint_reserve_bytes, decode_entry_payload, encode_entry_payload, entry_len_for,
+        JOURNAL_PAGE_DATA_LEN,
+    };
+    use squeezefs::meta_backend::kv::journal_core::{AdmissionClass, CoreGeometry, JournalCore};
+    use squeezefs::meta_backend::kv::record::{
+        xattr_key, xattr_name_hash56, DentryValue, InodeDelta, XattrValue, TREE_DENTRIES,
+        TREE_XATTRS,
+    };
+
+    let mut group = c.benchmark_group("kv_journal");
+    const HASH_SEED: u64 = 0x5EED_F00D;
+
+    // The create-shape whole-tx entry: dentry Put + inode Put + parent Δtime.
+    let create_records: Vec<(u8, Record)> = vec![
+        (
+            TREE_DENTRIES,
+            Record::put(
+                dentry_key(1, dentry_name_hash54(b"file_000042", HASH_SEED), 0).to_vec(),
+                101,
+                DentryValue::encode_parts(42, 8, b"file_000042").expect("dentry encode"),
+            ),
+        ),
+        (
+            TREE_INODES,
+            Record::put(
+                inode_key(42).to_vec(),
+                101,
+                InodeValue {
+                    mode: 0o100644,
+                    nlink: 1,
+                    ..InodeValue::default()
+                }
+                .encode(),
+            ),
+        ),
+        (
+            TREE_INODES,
+            Record::delta(inode_key(1).to_vec(), 101, &InodeDelta::times(7, 7)),
+        ),
+    ];
+    group.bench_function("entry_encode_checksum_create", |b| {
+        b.iter(|| {
+            let len = entry_len_for(black_box(&create_records)).expect("fits");
+            let payload = encode_entry_payload(black_box(&create_records));
+            let sum = xxhash_rust::xxh3::xxh3_64(&payload);
+            black_box((len, payload.len(), sum))
+        });
+    });
+
+    // The lever-B publish group: 64 per-ino layout xattr deltas in ONE entry.
+    let delta_value = vec![0x4C; 128]; // ~128 B per-ino LayoutDelta image
+    let publish_records: Vec<(u8, Record)> = (0..64u64)
+        .map(|i| {
+            (
+                TREE_XATTRS,
+                Record::put(
+                    xattr_key(1000 + i, xattr_name_hash56(b"layout", HASH_SEED), 0).to_vec(),
+                    2000 + i,
+                    XattrValue::encode_parts(b"layout", &delta_value).expect("xattr encode"),
+                ),
+            )
+        })
+        .collect();
+    let publish_image = encode_entry_payload(&publish_records);
+    group.throughput(criterion::Throughput::Bytes(publish_image.len() as u64));
+    group.bench_function("entry_encode_checksum_publish_batch64", |b| {
+        b.iter(|| {
+            let payload = encode_entry_payload(black_box(&publish_records));
+            black_box(xxhash_rust::xxh3::xxh3_64(&payload))
+        });
+    });
+    group.bench_function("entry_decode_publish_batch64", |b| {
+        b.iter(|| black_box(decode_entry_payload(black_box(&publish_image)).expect("decode")));
+    });
+
+    // The wait-free reservation core: admit → reserve → (instant
+    // durability) watermark advance — the commit path's §4.4 pt 5 cycle;
+    // and admit → release — the failed-before-reservation give-back.
+    group.throughput(criterion::Throughput::Elements(1));
+    let ring_len = 2048 * JOURNAL_PAGE_DATA_LEN;
+    let geo = CoreGeometry {
+        page_data_len: JOURNAL_PAGE_DATA_LEN,
+        pages: 2048,
+        reserve_bytes: checkpoint_reserve_bytes(ring_len),
+    };
+    let core = JournalCore::new(geo, 0, 0);
+    let entry_len = entry_len_for(&create_records).expect("fits");
+    group.bench_function("core_admit_reserve_advance", |b| {
+        b.iter(|| {
+            let adm = core
+                .try_admit(entry_len, AdmissionClass::User)
+                .expect("ring has space");
+            let res = core.reserve(adm);
+            core.advance_reusable_upto(res.end());
+            black_box(res.seq())
+        });
+    });
+    group.bench_function("core_admit_release", |b| {
+        b.iter(|| {
+            let adm = core
+                .try_admit(entry_len, AdmissionClass::User)
+                .expect("ring has space");
+            core.release(adm);
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_kv_meta_metadata,
     bench_kv_bset,
     bench_kv_tree,
-    bench_kv_fold
+    bench_kv_fold,
+    bench_kv_journal
 );
 criterion_main!(benches);

@@ -72,10 +72,59 @@ fn bench_payload_moves(c: &mut Criterion) {
     g.finish();
 }
 
+/// Microbench program (2026-08-04,
+/// `.benchmarks/2026-08-04-microbench-program.md`): the completion
+/// doorbell (the 2026-07-28 ipc op-economy campaign, lever 2 —
+/// `.benchmarks/2026-07-28-ipc-op-economy.md`). Both Dekker
+/// `fence(SeqCst)` sides are load-bearing (loom-verified ×3), so their
+/// cost IS the protocol's cost:
+/// * `complete_unparked` — the saturated-reap steady state (wake
+///   ELIDED; the pre-campaign posture paid a `FUTEX_WAKE` here — the
+///   collect-and-wake serialization term past ~525 k IOPS);
+/// * `complete_parked` — the wake-decision path (`true` = the caller
+///   pays the syscall; the syscall itself is the rig's to measure);
+/// * `park_begin_end` — the reaper's register→snapshot→deregister
+///   ceremony around each sparse-regime wait
+///   (`REAP_EVENT_PARK_MAX` = 2 keeps this off deep-qd paths).
+fn bench_cqe_doorbell(c: &mut Criterion) {
+    use squeezefs_ipc::cqe_core::CqeDoorbell;
+
+    let mut g = c.benchmark_group("cqe_doorbell");
+    g.throughput(Throughput::Elements(1));
+
+    let bell = CqeDoorbell::new();
+    g.bench_function("complete_unparked", |b| {
+        b.iter(|| {
+            assert!(!bell.complete(), "no reaper is parked");
+        })
+    });
+
+    let parked_bell = CqeDoorbell::new();
+    let _snapshot = parked_bell.park_begin(); // one parked reaper, held
+    g.bench_function("complete_parked", |b| {
+        b.iter(|| {
+            assert!(parked_bell.complete(), "a parked reaper needs the wake");
+        })
+    });
+    parked_bell.park_end();
+
+    let cycle_bell = CqeDoorbell::new();
+    g.bench_function("park_begin_end", |b| {
+        b.iter(|| {
+            let seq = cycle_bell.park_begin();
+            cycle_bell.park_end();
+            std::hint::black_box(seq)
+        })
+    });
+
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_ring_push_pop,
     bench_slot_cycle,
-    bench_payload_moves
+    bench_payload_moves,
+    bench_cqe_doorbell
 );
 criterion_main!(benches);

@@ -527,13 +527,17 @@ impl ArenaWindow {
 /// retention; hits/misses are the reuse-health counters. Lock-free
 /// (`crossbeam` `ArrayQueue` — a shipped dependency core, not a new
 /// house lock-free algorithm, hence no loom model).
-pub(crate) struct SeveredPool {
+// `pub` (not `pub(crate)`) for the microbench program (2026-08-04):
+// `benches/copy_path_bench.rs` measures the get→copy→put hit cycle vs the
+// per-op-alloc miss path — the ingest-economy campaign's engine
+// (`.benchmarks/2026-07-28-ingest-economy.md`).
+pub struct SeveredPool {
     q: crossbeam::queue::ArrayQueue<Vec<u8>>,
     buf_cap: usize,
 }
 
 impl SeveredPool {
-    fn new(max_op_bytes: u32, arena_cap_bytes: u64) -> Self {
+    pub fn new(max_op_bytes: u32, arena_cap_bytes: u64) -> Self {
         let buf_cap = (max_op_bytes as usize).max(1);
         // Rail 1..=65536 slots: a pathological env override can size the
         // arena cap huge — the rail caps the (pointer-array) queue, and
@@ -545,7 +549,7 @@ impl SeveredPool {
         }
     }
 
-    fn get(&self) -> Vec<u8> {
+    pub fn get(&self) -> Vec<u8> {
         match self.q.pop() {
             Some(buf) => {
                 METRICS
@@ -565,7 +569,7 @@ impl SeveredPool {
         }
     }
 
-    fn put(&self, mut buf: Vec<u8>) {
+    pub fn put(&self, mut buf: Vec<u8>) {
         // Only full-class buffers recycle (a resized stray would skew the
         // uniform-class accounting); a full queue drops — dealloc is then
         // exactly the pre-pool behavior.

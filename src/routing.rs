@@ -2921,6 +2921,12 @@ pub fn prefetch_window_grows(
     green && (will_wait || (overran && detect_streak == 0))
 }
 
+impl Default for StreamLanes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// K = 4 offset lanes per file, so concurrent sequential readers of one
 /// file do not mutually reset each other. More than K concurrent readers
 /// degrade the excess to the random class — a later pipeline start,
@@ -3004,9 +3010,20 @@ impl FillClass {
 
 /// The classifier verdict handed back to the read path: which lane (if
 /// any) this request rides, and whether that lane is classified streaming.
-pub(crate) struct LaneRef<'a> {
+// `pub` (not `pub(crate)`) for the microbench program (2026-08-04):
+// `benches/read_path_bench.rs` measures `StreamLanes::observe`'s three
+// arms; fields stay crate-private.
+pub struct LaneRef<'a> {
     pub(crate) lane: &'a StreamLane,
     pub(crate) streaming: bool,
+}
+
+impl LaneRef<'_> {
+    /// Whether the matched lane holds a streaming classification
+    /// (bench/diagnostic accessor; the read path uses the field).
+    pub fn is_streaming(&self) -> bool {
+        self.streaming
+    }
 }
 
 /// Per-request read classifier hint (hybrid I/O, user directive
@@ -3068,7 +3085,10 @@ pub(crate) unsafe fn serve_copy_to_dest(
 }
 
 impl StreamLanes {
-    fn new() -> Self {
+    // `pub` for the microbench program (2026-08-04): the classifier bench
+    // constructs a bare lane set (production sites build them inside the
+    // per-path moka entry).
+    pub fn new() -> Self {
         let mk = || StreamLane {
             next_expected_offset: std::sync::atomic::AtomicU64::new(u64::MAX),
             run_reads: std::sync::atomic::AtomicU32::new(0),
@@ -3132,7 +3152,10 @@ impl StreamLanes {
     /// warm-row tax (−6..−16 % on the 1M-IOPS rand-4k rows vs the
     /// pipeline kill switch). Misses and every kernel-path request keep
     /// `true` (kernel semantics unchanged).
-    pub(crate) fn observe(&self, offset: u64, len: u64, claim: bool) -> Option<LaneRef<'_>> {
+    // `pub` for the microbench program (2026-08-04): the per-request
+    // classifier cost (match arm / membership tolerance / foreign claim)
+    // is measured in `benches/read_path_bench.rs`.
+    pub fn observe(&self, offset: u64, len: u64, claim: bool) -> Option<LaneRef<'_>> {
         use std::sync::atomic::Ordering::Relaxed;
         let now = Self::now_ms();
         // Lane match: continue the run.

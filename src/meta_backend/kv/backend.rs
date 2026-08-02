@@ -195,23 +195,34 @@ const COMMIT_RETRY_BUDGET: usize = 256;
 /// read at `open` like every backend knob.
 pub const COMMIT_BATCH_TXS_ENV: &str = "SQUEEZEFS_META_COMMIT_BATCH_TXS";
 pub const COMMIT_BATCH_BYTES_ENV: &str = "SQUEEZEFS_META_COMMIT_BATCH_BYTES";
-const DEFAULT_COMMIT_BATCH_TXS: usize = 64;
-const DEFAULT_COMMIT_BATCH_BYTES: u64 = 256 * 1024;
+/// The shipped M7 batch caps — the derived defaults' FLOORS since the
+/// 2026-08-04 derivation sweep (never-regress-below-shipped, the
+/// `Q_DEPTH_FLOOR` house law).
+const COMMIT_BATCH_TXS_FLOOR: usize = 64;
+const COMMIT_BATCH_BYTES_FLOOR: u64 = 256 * 1024;
 
-fn commit_batch_txs_env() -> usize {
-    std::env::var(COMMIT_BATCH_TXS_ENV)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+/// `SQUEEZEFS_META_COMMIT_BATCH_TXS` resolution, pure (2026-08-04
+/// derivation sweep): env (≥ 1) wins verbatim; derived default =
+/// `max(64, cpus × 2)` — committer arrivals scale with handler
+/// parallelism (transport queues = kernel possible CPUs), floor 64 =
+/// the shipped M7 posture (a 32-CPU box derives exactly 64).
+pub fn resolve_commit_batch_txs(env: Option<&str>, cpus: usize) -> usize {
+    env.and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(DEFAULT_COMMIT_BATCH_TXS)
+        .unwrap_or_else(|| cpus.saturating_mul(2).max(COMMIT_BATCH_TXS_FLOOR))
 }
 
-fn commit_batch_bytes_env() -> u64 {
-    std::env::var(COMMIT_BATCH_BYTES_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
+/// `SQUEEZEFS_META_COMMIT_BATCH_BYTES` resolution, pure (2026-08-04
+/// derivation sweep): env (≥ 1) wins verbatim; derived default =
+/// `max(256 KiB, ring user-capacity / 16)` — a batch is a fixed
+/// fraction of ITS volume's journal ring so ≥ 16 batch reservations
+/// always cycle (the liveness-margin shape); floor 256 KiB = the
+/// shipped M7 posture. The senior per-volume clamp to the ring's
+/// admissible capacity (§4.4 pt 5, applied at open) is unchanged.
+pub fn resolve_commit_batch_bytes(env: Option<&str>, ring_user_capacity: u64) -> u64 {
+    env.and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(DEFAULT_COMMIT_BATCH_BYTES)
+        .unwrap_or_else(|| (ring_user_capacity / 16).max(COMMIT_BATCH_BYTES_FLOOR))
 }
 
 /// PR M6: pending-times drain batch — inos per DLM `lock_many` set / per
@@ -581,9 +592,11 @@ pub struct KvMetaBackend {
     /// one fan-out) instead of one commit per ino. Same lifecycle
     /// discipline as `conveyor` (leader-elect, Weak upgrade per batch).
     layout_conveyor: Arc<ConveyorCore<QueuedLayoutMerge>>,
-    /// `SQUEEZEFS_META_COMMIT_BATCH_TXS` (default 64), read at open.
+    /// `SQUEEZEFS_META_COMMIT_BATCH_TXS` (default `max(64, cpus × 2)` —
+    /// [`resolve_commit_batch_txs`]), read at open.
     batch_max_txs: usize,
-    /// `SQUEEZEFS_META_COMMIT_BATCH_BYTES` (default 256 KiB) clamped to
+    /// `SQUEEZEFS_META_COMMIT_BATCH_BYTES` (default `max(256 KiB,
+    /// ring/16)` — [`resolve_commit_batch_bytes`]) clamped to
     /// the ring's user-admissible capacity, so one Σ-admission can
     /// always eventually succeed (a batch larger than the admissible
     /// ring would park forever — the liveness clamp).
@@ -718,13 +731,70 @@ impl std::fmt::Debug for KvMetaBackend {
     }
 }
 
-/// Resolve the node-cache budget knob (bytes).
+/// Node-cache budget resolution, pure (2026-08-04 derivation sweep):
+/// **absolute > percentage > derived** — the ipc-arena-cap precedence
+/// pattern, a bad env string never fails a mount.
+///
+/// - `mb_env` (`SQUEEZEFS_META_NODE_CACHE_MB`, MiB): explicit wins
+///   verbatim (the A0 lever — `512` restores the pre-sweep flat
+///   default). Garbage warns and falls through.
+/// - `pct_env` (`SQUEEZEFS_META_NODE_CACHE_PCT`, percent of the resolved
+///   R5 budget): clamped into (0, 100]; garbage/non-positive warns and
+///   falls through.
+/// - Neither: `max(budget/16, 512 MiB)` — the fraction is scale-free
+///   (the budget itself is machine-derived, §5.7 resolution order); the
+///   floor is the shipped
+///   [`super::node_cache::DEFAULT_CACHE_BUDGET_BYTES`] posture
+///   (never-regress: every box ran 512 MiB before the sweep). Per
+///   VOLUME, like the flat default it replaces — multi-meta-volume sets
+///   multiply it (the pre-sweep behavior; eviction is the cache's own
+///   clock).
+pub fn resolve_node_cache_budget(
+    budget_bytes: u64,
+    mb_env: Option<&str>,
+    pct_env: Option<&str>,
+) -> u64 {
+    if let Some(raw) = mb_env {
+        match raw.trim().parse::<u64>() {
+            Ok(mib) => return mib.saturating_mul(1024 * 1024),
+            Err(e) => {
+                log::warn!("{NODE_CACHE_MB_ENV}={raw:?} is not a MiB integer ({e}) — ignored")
+            }
+        }
+    }
+    if let Some(raw) = pct_env {
+        match raw.trim().parse::<f64>() {
+            Ok(p) if p.is_finite() && p > 0.0 => {
+                let pct = if p > 100.0 {
+                    log::warn!("SQUEEZEFS_META_NODE_CACHE_PCT={raw:?} > 100 — clamped to 100");
+                    100.0
+                } else {
+                    p
+                };
+                return (budget_bytes as f64 * (pct / 100.0)) as u64;
+            }
+            Ok(p) => log::warn!(
+                "SQUEEZEFS_META_NODE_CACHE_PCT={raw:?} must be a percent in (0, 100] \
+                 (got {p}) — ignored"
+            ),
+            Err(e) => {
+                log::warn!("SQUEEZEFS_META_NODE_CACHE_PCT={raw:?} is not a number ({e}) — ignored")
+            }
+        }
+    }
+    (budget_bytes / 16).max(super::node_cache::DEFAULT_CACHE_BUDGET_BYTES)
+}
+
+/// Resolve the node-cache budget knob (bytes) against the live R5
+/// budget.
 fn node_cache_budget_bytes() -> u64 {
-    std::env::var(NODE_CACHE_MB_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|mb| mb * 1024 * 1024)
-        .unwrap_or(super::node_cache::DEFAULT_CACHE_BUDGET_BYTES)
+    resolve_node_cache_budget(
+        crate::mem_budget::MEM_BUDGET.resolve_budget_now(),
+        std::env::var(NODE_CACHE_MB_ENV).ok().as_deref(),
+        std::env::var("SQUEEZEFS_META_NODE_CACHE_PCT")
+            .ok()
+            .as_deref(),
+    )
 }
 
 impl KvMetaBackend {
@@ -1127,7 +1197,11 @@ impl KvMetaBackend {
         let batch_max_bytes = {
             let user_capacity = (sb.journal_pages() * super::journal::JOURNAL_PAGE_DATA_LEN)
                 .saturating_sub(checkpoint_reserve_bytes(sb.journal.len));
-            commit_batch_bytes_env().min(user_capacity.max(1))
+            resolve_commit_batch_bytes(
+                std::env::var(COMMIT_BATCH_BYTES_ENV).ok().as_deref(),
+                user_capacity,
+            )
+            .min(user_capacity.max(1))
         };
         let strict = crate::meta_backend::resolve_flush_interval_ms() == 0;
         let read_only = sb.unknown_ro() != 0;
@@ -1177,7 +1251,10 @@ impl KvMetaBackend {
             conveyor: Arc::new(ConveyorCore::new()),
             conveyor_self: std::sync::OnceLock::new(),
             layout_conveyor: Arc::new(ConveyorCore::new()),
-            batch_max_txs: commit_batch_txs_env(),
+            batch_max_txs: resolve_commit_batch_txs(
+                std::env::var(COMMIT_BATCH_TXS_ENV).ok().as_deref(),
+                crate::cpu::process_parallelism(),
+            ),
             batch_max_bytes,
             timeout_threshold: squeezefs_timeout_env(),
             smo,

@@ -264,12 +264,16 @@ pub fn op_profile_enabled() -> bool {
 }
 
 /// `SQUEEZEFS_PATCH_MAX_BYTES` cell (design-random-small-writes §6): max
-/// length of a W1 sole-owner in-place patch. Default **512 KiB**; `0`
-/// disables the patch path — the A/B lever for acceptance runs (and the
-/// pin lever for tests that document the patch-INELIGIBLE accumulation
-/// pipeline), not an operational escape hatch. Env is read once
-/// (memoized — never on the per-op path); the atomic cell keeps the
-/// A/B flip runtime-settable via [`set_patch_max_bytes`].
+/// length of a W1 sole-owner in-place patch. Default = **block_size/8**
+/// ([`derived_patch_max_bytes`], applied at mount by
+/// [`apply_derived_write_knobs`] — 512 KiB on the shipped 4 MiB block,
+/// the pre-sweep constant; the cell seeds 512 KiB until the volume's
+/// block size resolves). `0` disables the patch path — the A/B lever for
+/// acceptance runs (and the pin lever for tests that document the
+/// patch-INELIGIBLE accumulation pipeline), not an operational escape
+/// hatch. Env is read once (memoized — never on the per-op path) and
+/// wins verbatim over the derivation; the atomic cell keeps the A/B
+/// flip runtime-settable via [`set_patch_max_bytes`].
 fn patch_max_bytes_cell() -> &'static AtomicU64 {
     static CELL: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {
@@ -407,7 +411,9 @@ pub fn set_fold_max_extents(v: u64) {
 }
 
 /// W2 fold trigger — parked payload BYTE threshold per block
-/// (`SQUEEZEFS_FOLD_MAX_BYTES`, design §6). Default 1 MiB.
+/// (`SQUEEZEFS_FOLD_MAX_BYTES`, design §6). Default = **block_size/4**
+/// ([`derived_fold_max_bytes`], applied at mount — 1 MiB on the shipped
+/// 4 MiB block, the pre-sweep constant; env wins verbatim).
 fn fold_max_bytes_cell() -> &'static AtomicU64 {
     static CELL: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {
@@ -427,6 +433,73 @@ pub fn fold_max_bytes() -> u64 {
 /// Set the W2 fold byte trigger (tests/acceptance).
 pub fn set_fold_max_bytes(v: u64) {
     fold_max_bytes_cell().store(v, Ordering::Relaxed);
+}
+
+/// Derived `SQUEEZEFS_PATCH_MAX_BYTES` default (2026-08-04 derivation
+/// sweep): **block_size / 8** — the natural denominator for a sub-block
+/// patch bound. On the shipped 4 MiB block this is exactly the former
+/// flat 512 KiB (field-identical); smaller/larger block geometries scale
+/// with their volume instead of inheriting a 4 MiB-era constant.
+pub fn derived_patch_max_bytes(block_size: u64) -> u64 {
+    block_size / 8
+}
+
+/// Derived `SQUEEZEFS_FOLD_MAX_BYTES` default (2026-08-04 derivation
+/// sweep): **block_size / 4** — the former flat 1 MiB on the shipped
+/// 4 MiB block (field-identical). `SQUEEZEFS_FOLD_MAX_EXTENTS` stays the
+/// measured amortization trigger (class C — filed, not converted).
+pub fn derived_fold_max_bytes(block_size: u64) -> u64 {
+    block_size / 4
+}
+
+/// Derived parked-write budget in buffers' worth (2026-08-04 derivation
+/// sweep): `SQUEEZEFS_PARKED_BUFFERS` explicit wins verbatim; otherwise
+/// **max(256, budget/16 ÷ block_size)** — parked buffers are RAM the R5
+/// authority already gauges and sheds (`parked_full_buffer_bytes`
+/// component; Red halves the effective cap via
+/// [`crate::mem_budget::effective_parked_cap`]), so the admission cap
+/// scales with the machine. Floor 256 = the shipped
+/// `MAX_ACTIVE_BLOCK_BUFFERS` posture (never-regress). A zero
+/// `block_size` (not yet resolved) sizes against the 4 MiB default
+/// shape.
+pub fn resolve_parked_cap_buffers(env: Option<&str>, budget_bytes: u64, block_size: u64) -> u64 {
+    if let Some(raw) = env {
+        match raw.trim().parse::<u64>() {
+            Ok(n) if n > 0 => return n,
+            _ => log::warn!(
+                "SQUEEZEFS_PARKED_BUFFERS={raw:?} is not a positive buffer count — ignored"
+            ),
+        }
+    }
+    let bs = if block_size == 0 {
+        crate::block_allocator::CHUNK_SIZE
+    } else {
+        block_size
+    };
+    (budget_bytes / 16 / bs).max(MAX_ACTIVE_BLOCK_BUFFERS as u64)
+}
+
+/// Mount-time application of the block-size/budget-derived write-path
+/// knob defaults (2026-08-04 derivation sweep). Explicit env always wins
+/// verbatim — including `SQUEEZEFS_PATCH_MAX_BYTES=0` (the A/B lever)
+/// and `SQUEEZEFS_PARKED_BUFFERS=256` (the pre-sweep posture); the
+/// runtime `set_*` seams stay live for tests/acceptance. A zero block
+/// size (unresolved) leaves the block-size-derived cells at their
+/// shipped defaults.
+pub fn apply_derived_write_knobs(budget_bytes: u64, block_size: u64) {
+    if block_size > 0 {
+        if std::env::var("SQUEEZEFS_PATCH_MAX_BYTES").is_err() {
+            set_patch_max_bytes(derived_patch_max_bytes(block_size));
+        }
+        if std::env::var("SQUEEZEFS_FOLD_MAX_BYTES").is_err() {
+            set_fold_max_bytes(derived_fold_max_bytes(block_size));
+        }
+    }
+    set_parked_cap_buffers(resolve_parked_cap_buffers(
+        std::env::var("SQUEEZEFS_PARKED_BUFFERS").ok().as_deref(),
+        budget_bytes,
+        block_size,
+    ));
 }
 
 /// W2 parked-write budget, in BUFFERS' WORTH of bytes (× block size): the
@@ -3988,7 +4061,12 @@ pub struct OpenEntry {
 
 /// Max automatic retries for a single background writeback unit (P0-3).
 const WRITEBACK_MAX_ATTEMPTS: u32 = 4;
-/// P1-3: max partial blocks held only in RAM (not yet staged).
+/// P1-3: max partial blocks held only in RAM (not yet staged) — since
+/// the 2026-08-04 derivation sweep this is the derived default's FLOOR
+/// (the shipped posture, never-regress): the live cap is
+/// [`resolve_parked_cap_buffers`] = `max(256, budget/16 ÷ block_size)`
+/// applied at mount by [`apply_derived_write_knobs`]
+/// (`SQUEEZEFS_PARKED_BUFFERS` explicit wins verbatim).
 const MAX_ACTIVE_BLOCK_BUFFERS: usize = 256;
 
 /// Kernel ABI (include/uapi/linux/fuse.h, fuse ≥ 7.38 / Linux ≥ 6.2):
@@ -15338,18 +15416,34 @@ pub async fn start_mount<P: AsRef<Path>>(
     }
 
     // L1 payload-arena budget: an eighth of the §5.7-resolved memory
-    // budget, ceilinged at 2 GiB. The FUSE-over-io_uring geometry resolver
+    // budget — derived, no fixed ceiling (2026-08-04 derivation sweep;
+    // the structural bound is the geometry's own demand cap, nqueues ×
+    // desired-depth × payload). The FUSE-over-io_uring geometry resolver
     // degrades per-queue ring depth from the desired 32 toward the pre-L1
     // floor of 4 to fit under this cap — small-RAM boxes keep yesterday's
     // footprint, everything else ships the measured 316k-IOPS geometry by
-    // default.
+    // default. Precedence: SQUEEZEFS_TRANSPORT_MEM_MAX (MiB, absolute,
+    // the A0 lever) > SQUEEZEFS_TRANSPORT_MEM_PCT > budget/8.
     let mem_budget = crate::mem_budget::MEM_BUDGET.resolve_budget_now();
-    let transport_cap = crate::mem_budget::transport_buffer_cap(mem_budget);
+    let transport_cap = crate::mem_budget::resolve_transport_buffer_cap(
+        mem_budget,
+        std::env::var("SQUEEZEFS_TRANSPORT_MEM_MAX").ok().as_deref(),
+        std::env::var("SQUEEZEFS_TRANSPORT_MEM_PCT").ok().as_deref(),
+    );
     options.transport_buffer_cap_bytes(transport_cap);
     info!(
         "Transport payload-buffer cap: {} MiB (memory budget {} MiB)",
         transport_cap / (1024 * 1024),
         mem_budget / (1024 * 1024)
+    );
+
+    // Derivation sweep (2026-08-04): block-size/budget-derived write-path
+    // knob defaults — explicit env always wins verbatim (the A0 levers).
+    apply_derived_write_knobs(
+        mem_budget,
+        fs.router
+            .block_size
+            .load(std::sync::atomic::Ordering::Relaxed),
     );
 
     // L4 interception session host (PR L4-3): armed pre-mount so the
@@ -15364,21 +15458,6 @@ pub async fn start_mount<P: AsRef<Path>>(
     // refuse before any fd screen, so no shm sessions, no arenas, no
     // service dispatch exist on a default mount.
     {
-        let arena_mb = std::env::var("SQUEEZEFS_IPC_ARENA_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(64);
-        let max_op_bytes = std::env::var("SQUEEZEFS_IPC_MAX_OP_BYTES")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(squeezefs_ipc::layout::DEFAULT_MAX_OP_BYTES);
-        let geometry = squeezefs_ipc::layout::Geometry {
-            arena_bytes: arena_mb * 1024 * 1024,
-            max_op_bytes,
-            ..squeezefs_ipc::layout::Geometry::default_v1()
-        };
         // Session-shm admission cap — the R5 `ipc_session_arenas`
         // component bound (design §5.7). Derived, no fixed ceiling
         // (2026-08-01 ruling): absolute override (SQUEEZEFS_IPC_MEM_MAX,
@@ -15390,6 +15469,23 @@ pub async fn start_mount<P: AsRef<Path>>(
             std::env::var("SQUEEZEFS_IPC_MEM_MAX").ok().as_deref(),
             std::env::var("SQUEEZEFS_IPC_MEM_PCT").ok().as_deref(),
         );
+        // Per-session arena: derived from the admission cap (2026-08-04
+        // derivation sweep — max(64 MiB shipped floor, PMD-aligned
+        // cap/128); SQUEEZEFS_IPC_ARENA_MB explicit wins verbatim).
+        let arena_bytes = crate::mem_budget::resolve_ipc_arena_bytes(
+            std::env::var("SQUEEZEFS_IPC_ARENA_MB").ok().as_deref(),
+            arena_cap_bytes,
+        );
+        let max_op_bytes = std::env::var("SQUEEZEFS_IPC_MAX_OP_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(squeezefs_ipc::layout::DEFAULT_MAX_OP_BYTES);
+        let geometry = squeezefs_ipc::layout::Geometry {
+            arena_bytes,
+            max_op_bytes,
+            ..squeezefs_ipc::layout::Geometry::default_v1()
+        };
         // OQ-6 (v1.1): the path-socket runtime dir for container-netns
         // clients. `SQUEEZEFS_IPC_SOCKET_DIR` overrides (the literal
         // `none` disables); default = /run/squeezefs for root mounts,

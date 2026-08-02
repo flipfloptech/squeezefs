@@ -29,16 +29,31 @@
 //! suite) turn any future divergence into a red test.
 //!
 //! The rails: floor 2 (a single-session process serializes on one
-//! dequeue thread — the pre-L4-8 plateau), ceiling 16 (the shim
-//! registry holds 32 slots across all mounts, and 16 sessions × the
-//! default 64 MiB arena = 1 GiB sits inside the R5 session-shm cap of
-//! `min(mem_budget/8, 2 GiB)`; admission refusals past the cap remain
-//! honest — refused shards passthrough, counted). `cpus/4` is the
+//! dequeue thread — the pre-L4-8 plateau), ceiling
+//! [`SESSION_REGISTRY_SLOTS`]`/2` (derivation sweep 2026-08-04: the
+//! former literal 16 is now DERIVED from the structural binder — the
+//! shim's fixed-size session registry, leaving headroom for a second
+//! concurrently-bound mount; the old R5-arena-math leg of the 16
+//! rationale dissolved when the fixed 2 GiB session-shm ceiling was
+//! deleted, 2026-08-02). Admission refusals past the R5 cap remain
+//! honest — refused shards passthrough, counted. `cpus/4` is the
 //! measured drain-thread saturation slope from the 2026-07-19 service
 //! sweep (unchanged), now applied to BOTH sides.
-/// `clamp(cpus/4, 2, 16)` — see the module docs for the derivation.
+
+/// The shim's session-registry capacity across ALL mounts — a
+/// STRUCTURAL constant, not tuning: the LD_PRELOAD shim keeps its
+/// session table as a fixed static array (constructor-safe, alloc-free
+/// — the interposer environment's law), so this is the physical binder
+/// every per-mount session ceiling derives from. Growing it is a shim
+/// table change, not a knob (`squeezefs-preload` ties its `MAX_SESSIONS`
+/// to this constant — drift is a red test on both sides).
+pub const SESSION_REGISTRY_SLOTS: usize = 32;
+
+/// `clamp(cpus/4, 2, SESSION_REGISTRY_SLOTS/2)` — see the module docs
+/// for the derivation (the ceiling = half the registry: two
+/// concurrently-bound mounts' worth of headroom).
 pub fn il_sessions_default(cpus: usize) -> usize {
-    (cpus / 4).clamp(2, 16)
+    (cpus / 4).clamp(2, SESSION_REGISTRY_SLOTS / 2)
 }
 
 #[cfg(test)]
@@ -66,7 +81,20 @@ mod tests {
         assert_eq!(
             il_sessions_default(256),
             16,
-            "ceiling: registry (32 slots) and R5 arena math bound it"
+            "ceiling: the structural registry bound (32 slots ÷ 2 mounts)"
+        );
+    }
+
+    /// Derivation sweep 2026-08-04: the ceiling is DERIVED from the
+    /// structural registry capacity (half of it — two concurrently-
+    /// bound mounts' headroom), never a free-floating literal. Growing
+    /// the registry grows the ceiling with it; drift is red here.
+    #[test]
+    fn ceiling_is_registry_derived() {
+        assert_eq!(
+            il_sessions_default(usize::MAX),
+            SESSION_REGISTRY_SLOTS / 2,
+            "ceiling must equal half the shim session registry"
         );
     }
 }

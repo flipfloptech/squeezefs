@@ -579,21 +579,77 @@ pub fn level() -> Level {
     MEM_BUDGET.level()
 }
 
-/// L1 (IOPS-parity program) transport payload-buffer cap ceiling: even
-/// on huge budgets, never pin more than this in registered
-/// FUSE-over-io_uring payload arenas (256 possible CPUs × depth 32 ×
-/// 1 MiB would be 8 GiB uncapped).
-pub const TRANSPORT_BUFFER_CAP_CEILING: u64 = 2 * 1024 * 1024 * 1024;
-
 /// The L1 transport payload-buffer cap: an eighth of the resolved memory
-/// budget, ceilinged at [`TRANSPORT_BUFFER_CAP_CEILING`]. The
+/// budget — the same scale-free fraction as [`ipc_arena_cap`]. The
 /// FUSE-over-io_uring geometry degrades its per-queue depth from the
 /// desired 32 toward the pre-L1 floor of 4 to fit under this cap
 /// (`TransportGeometry` in the vendored fuse3), so small-RAM boxes keep
 /// (at worst) yesterday's shipped arena footprint while the measured
 /// 316k-IOPS geometry ships by default everywhere else.
+///
+/// There is deliberately **no absolute byte ceiling** (2026-08-04
+/// derivation sweep; user directive 2026-08-02 — the former fixed 2 GiB
+/// `TRANSPORT_BUFFER_CAP_CEILING` degraded depth below the measured-best
+/// 32 on > 64-possible-CPU big-RAM boxes for no physical reason): the
+/// pinned-arena bound is STRUCTURAL — the geometry never registers more
+/// than `nqueues × Q_DEPTH_DESIRED × payload_sz` (the demand cap; depth
+/// is clamped to the desired 32 by construction), so the budget fraction
+/// only decides how far below the demand the depth ladder degrades.
+/// `SQUEEZEFS_TRANSPORT_MEM_MAX=2048` is the A0 lever that restores the
+/// retired ceiling exactly ([`resolve_transport_buffer_cap`]).
 pub fn transport_buffer_cap(budget_bytes: u64) -> u64 {
-    (budget_bytes / 8).min(TRANSPORT_BUFFER_CAP_CEILING)
+    budget_bytes / 8
+}
+
+/// Transport payload-buffer cap resolution, pure (env strings in, cap
+/// out — the [`resolve_ipc_arena_cap`] pattern; never panics, never
+/// refuses the mount): **absolute > percentage > derived default**.
+///
+/// - `mem_max_mib` (`SQUEEZEFS_TRANSPORT_MEM_MAX`, MiB): explicit wins
+///   verbatim (including 0 — the depth ladder then floors at 4, the
+///   pre-L1 shipped posture). Garbage warns and falls through.
+/// - `mem_pct` (`SQUEEZEFS_TRANSPORT_MEM_PCT`, percent of the resolved
+///   budget): clamped into (0, 100]; > 100 clamps to 100 with a
+///   warning; non-positive / non-finite / unparseable warns and falls
+///   through (the knob-family convention — a bad env string never
+///   fails a mount).
+/// - Neither: [`transport_buffer_cap`] (budget/8).
+pub fn resolve_transport_buffer_cap(
+    budget_bytes: u64,
+    mem_max_mib: Option<&str>,
+    mem_pct: Option<&str>,
+) -> u64 {
+    if let Some(raw) = mem_max_mib {
+        match raw.trim().parse::<u64>() {
+            Ok(mib) => return mib.saturating_mul(1024 * 1024),
+            Err(e) => {
+                log::warn!(
+                    "SQUEEZEFS_TRANSPORT_MEM_MAX={raw:?} is not a MiB integer ({e}) — ignored"
+                )
+            }
+        }
+    }
+    if let Some(raw) = mem_pct {
+        match raw.trim().parse::<f64>() {
+            Ok(p) if p.is_finite() && p > 0.0 => {
+                let pct = if p > 100.0 {
+                    log::warn!("SQUEEZEFS_TRANSPORT_MEM_PCT={raw:?} > 100 — clamped to 100");
+                    100.0
+                } else {
+                    p
+                };
+                return (budget_bytes as f64 * (pct / 100.0)) as u64;
+            }
+            Ok(p) => log::warn!(
+                "SQUEEZEFS_TRANSPORT_MEM_PCT={raw:?} must be a percent in (0, 100] (got {p}) \
+                 — ignored"
+            ),
+            Err(e) => {
+                log::warn!("SQUEEZEFS_TRANSPORT_MEM_PCT={raw:?} is not a number ({e}) — ignored")
+            }
+        }
+    }
+    transport_buffer_cap(budget_bytes)
 }
 
 /// L4 `ipc_session_arenas` default admission fraction (design-preload-
@@ -666,6 +722,34 @@ pub fn resolve_ipc_arena_cap(
         }
     }
     ipc_arena_cap(budget_bytes)
+}
+
+/// The shipped per-session IPC arena size — the derived default's FLOOR
+/// (never-regress-below-shipped, the `Q_DEPTH_FLOOR` house law: every
+/// box ran 64 MiB sessions before the 2026-08-04 derivation sweep).
+pub const IPC_ARENA_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Per-session IPC arena default resolution, pure (2026-08-04 derivation
+/// sweep): `SQUEEZEFS_IPC_ARENA_MB` explicit (MiB, > 0) wins verbatim;
+/// otherwise `max(64 MiB, pmd_align_down(admission_cap / 128))` —
+/// cap/128 is the per-uid session cap (64) × 2 safety margin, so even a
+/// full per-uid population of default-size arenas fits in HALF the
+/// admission cap; the PMD (2 MiB) round-down keeps the arena-THP
+/// collapse law (`map_shared_pmd_aligned`) intact and never exceeds the
+/// cap fraction. Garbage warns and falls through (knob-family
+/// convention).
+pub fn resolve_ipc_arena_bytes(arena_mb_env: Option<&str>, arena_cap_bytes: u64) -> u64 {
+    const PMD: u64 = 2 * 1024 * 1024;
+    if let Some(raw) = arena_mb_env {
+        match raw.trim().parse::<u64>() {
+            Ok(mib) if mib > 0 => return mib.saturating_mul(1024 * 1024),
+            Ok(_) => log::warn!("SQUEEZEFS_IPC_ARENA_MB must be > 0 — ignored"),
+            Err(e) => {
+                log::warn!("SQUEEZEFS_IPC_ARENA_MB={raw:?} is not a MiB integer ({e}) — ignored")
+            }
+        }
+    }
+    (arena_cap_bytes / 128 / PMD * PMD).max(IPC_ARENA_FLOOR_BYTES)
 }
 
 /// Register the L4 `ipc_session_arenas` component (design-preload-

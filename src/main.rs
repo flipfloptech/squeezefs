@@ -6298,18 +6298,22 @@ pub fn tune_system() -> Result<(), std::io::Error> {
                 let max_bg_path = conn_path.join("max_background");
                 let cong_path = conn_path.join("congestion_threshold");
                 if max_bg_path.exists() {
-                    if let Ok(curr) = std::fs::read_to_string(&max_bg_path) {
-                        println!(
-                            "FUSE Connection {:?}: max_background = {}",
-                            entry.file_name(),
-                            curr.trim()
-                        );
-                    }
-                    if is_root {
-                        // L1 policy ceiling (IOPS-parity program): mounts
-                        // now negotiate up to 256/192 at INIT — `tune`
-                        // must never LOWER a live connection back to the
-                        // pre-L1 64/48.
+                    let current: u64 = std::fs::read_to_string(&max_bg_path)
+                        .ok()
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    println!(
+                        "FUSE Connection {:?}: max_background = {}",
+                        entry.file_name(),
+                        current
+                    );
+                    if is_root && current < 256 {
+                        // Raise-only floor (L1 policy; derivation sweep
+                        // 2026-08-04): mounts negotiate max_background =
+                        // ring capacity at INIT (often > 256 now) —
+                        // `tune` must never LOWER a live connection, so
+                        // it only lifts pre-L1-class values (< 256) to
+                        // the 256/192 measured class.
                         let _ = std::fs::write(max_bg_path, "256\n");
                         let _ = std::fs::write(cong_path, "192\n");
                     }

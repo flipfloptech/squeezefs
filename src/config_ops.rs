@@ -1782,10 +1782,16 @@ pub async fn remove_meta_volume(meta_lvs: &[String], victim: &str) -> Result<()>
         for p in &survivors_paths {
             let be = KvMetaBackend::open_probe(Path::new(p)).await?;
             avail = avail.saturating_add(be.free_extents());
-            let max_dirty = std::env::var("SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(4096);
+            // The SAME resolver the checkpoint task uses (derivation
+            // sweep 2026-08-04) — the preflight headroom must price the
+            // cap the survivors will actually run.
+            let max_dirty = crate::meta_backend::kv::checkpoint::resolve_max_dirty_nodes(
+                crate::mem_budget::MEM_BUDGET.resolve_budget_now(),
+                u64::from(be.superblock().node_size),
+                std::env::var(crate::meta_backend::kv::checkpoint::CHECKPOINT_MAX_DIRTY_NODES_ENV)
+                    .ok()
+                    .as_deref(),
+            );
             headroom = headroom.max((2 * max_dirty).min(be.superblock().total_extents() / 4));
         }
         if avail < victim_used.saturating_add(headroom) {

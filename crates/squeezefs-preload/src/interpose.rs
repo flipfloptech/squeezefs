@@ -69,11 +69,17 @@ fn dev_cache() -> &'static NegativeDevCache {
 /// showing only svc0 hot). Sharding bindings across K sessions BY FD
 /// keeps every session single-consumer while letting the daemon's
 /// admission spread them over service threads. K defaults to the shared
-/// ingest-economy derivation `clamp(cpus/4, 2, 16)`
+/// ingest-economy derivation `clamp(cpus/4, 2, SESSION_REGISTRY_SLOTS/2)`
 /// (`squeezefs_ipc::sizing::il_sessions_default` — the same function
 /// the daemon's service-thread ceiling rides); `SQUEEZEFS_IL_SESSIONS`
-/// is an override lever only (clamp 1..=16).
-const MAX_SESSIONS: usize = 32;
+/// is an override lever only (clamped to the registry-derived ceiling).
+///
+/// The registry capacity itself is the shared STRUCTURAL constant
+/// (`sizing::SESSION_REGISTRY_SLOTS` — the fixed static session table
+/// the alloc-free interposer environment requires; derivation sweep
+/// 2026-08-04): the per-mount ceiling derives from it on both sides,
+/// so growing the table grows every ceiling with it.
+const MAX_SESSIONS: usize = squeezefs_ipc::sizing::SESSION_REGISTRY_SLOTS;
 
 fn sessions_per_mount() -> usize {
     static K: OnceLock<usize> = OnceLock::new();
@@ -88,13 +94,13 @@ fn sessions_per_mount() -> usize {
 }
 
 /// Pure sizing form (unit-pinned below): default = the shared
-/// ingest-economy derivation (`clamp(cpus/4, 2, 16)` — the SAME
-/// function the daemon's service-thread ceiling rides, so the pair
-/// cannot drift); the env var is an override lever only, clamped to
-/// the derivation ceiling.
+/// ingest-economy derivation (`clamp(cpus/4, 2,
+/// SESSION_REGISTRY_SLOTS/2)` — the SAME function the daemon's
+/// service-thread ceiling rides, so the pair cannot drift); the env var
+/// is an override lever only, clamped to the registry-derived ceiling.
 fn sessions_per_mount_from(env: Option<&str>, cpus: usize) -> usize {
     env.and_then(|v| v.trim().parse::<usize>().ok())
-        .map(|n| n.clamp(1, 16))
+        .map(|n| n.clamp(1, squeezefs_ipc::sizing::SESSION_REGISTRY_SLOTS / 2))
         .unwrap_or_else(|| squeezefs_ipc::sizing::il_sessions_default(cpus))
 }
 
@@ -2176,22 +2182,34 @@ mod session_sizing_tests {
     }
 
     /// `SQUEEZEFS_IL_SESSIONS` remains an override LEVER only: honored
-    /// verbatim within the clamp (1..=16 — the derivation ceiling; the
-    /// registry keeps 32 slots across all mounts), unparseable falls
-    /// back to the derived default.
+    /// verbatim within the clamp (1..=SESSION_REGISTRY_SLOTS/2 — the
+    /// registry-derived ceiling), unparseable falls back to the derived
+    /// default.
     #[test]
     fn sessions_env_override_is_a_lever() {
         assert_eq!(sessions_per_mount_from(Some("3"), 32), 3);
         assert_eq!(sessions_per_mount_from(Some("0"), 32), 1, "clamp floor");
         assert_eq!(
             sessions_per_mount_from(Some("99"), 32),
-            16,
-            "clamp ceiling = the derivation ceiling"
+            squeezefs_ipc::sizing::SESSION_REGISTRY_SLOTS / 2,
+            "clamp ceiling = the registry-derived derivation ceiling"
         );
         assert_eq!(
             sessions_per_mount_from(Some("garbage"), 32),
             squeezefs_ipc::sizing::il_sessions_default(32),
             "unparseable falls back to the derivation"
+        );
+    }
+
+    /// Derivation sweep 2026-08-04: the shim's registry capacity IS the
+    /// shared structural constant — drift between the static table and
+    /// the sizing derivation's binder is red here.
+    #[test]
+    fn registry_ties_to_shared_structural_constant() {
+        assert_eq!(
+            MAX_SESSIONS,
+            squeezefs_ipc::sizing::SESSION_REGISTRY_SLOTS,
+            "the shim session table and the sizing binder must be one constant"
         );
     }
 }

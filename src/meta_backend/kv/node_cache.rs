@@ -49,9 +49,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-/// Default node-cache budget: 512 MiB (§3 / §4.5 — the
-/// `SQUEEZEFS_META_NODE_CACHE_MB` default; plumbed as a parameter until
-/// K6a wires the mount path).
+/// The shipped node-cache budget (§3 / §4.5): 512 MiB — since the
+/// 2026-08-04 derivation sweep this is the derived default's FLOOR
+/// (never-regress-below-shipped): the live default is `max(budget/16,
+/// 512 MiB)` of the resolved R5 memory budget
+/// (`backend::resolve_node_cache_budget`; `SQUEEZEFS_META_NODE_CACHE_MB`
+/// absolute / `SQUEEZEFS_META_NODE_CACHE_PCT` percentage win over it).
+/// Tests plumb this constant directly as a deterministic budget.
 pub const DEFAULT_CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Default writeback threshold: freeze/append once a node's open delta

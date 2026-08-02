@@ -999,22 +999,20 @@ pub const Q_DEPTH_FLOOR: usize = 4;
 pub const PAYLOAD_BASE: usize = 1024 * 1024;
 /// `max_background` floor: the intent of the historical (dead-letter)
 /// `max_background=64` mount-option string — never ship less delivered
-/// background concurrency than that on any geometry.
+/// background concurrency than that on any geometry (the never-regress-
+/// below-shipped floor law).
 pub const MAX_BACKGROUND_FLOOR: u16 = 64;
-/// `max_background` ceiling: the measured 316k-class value. Beyond 256 is
-/// unmeasured; the row scales with `max_background` once depth is open, so
-/// raising this requires new evidence, not a bigger constant.
-pub const MAX_BACKGROUND_CEILING: u16 = 256;
-/// Absolute payload-arena cap when the embedder gives no budget-derived
-/// cap (and the ceiling of the SqueezeFS-side `min(budget/8, 2 GiB)`
-/// formula): keeps huge-CPU boxes from pinning silly registered-buffer
-/// totals (256 possible CPUs × 32 × 1 MiB would be 8 GiB uncapped).
-pub const TRANSPORT_BUFFER_CAP_CEILING: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Fallback payload-buffer cap for embedders that pass no cap through
 /// [`crate::MountOptions::transport_buffer_cap_bytes`]: an eighth of
-/// physical RAM, ceilinged — the same shape SqueezeFS derives from its
-/// resolved memory budget.
+/// physical RAM — the same scale-free fraction SqueezeFS derives from
+/// its resolved memory budget. No absolute byte ceiling (2026-08-04
+/// derivation sweep; the former fixed 2 GiB
+/// `TRANSPORT_BUFFER_CAP_CEILING` degraded depth below the measured-best
+/// 32 on > 64-possible-CPU big-RAM boxes for no physical reason): the
+/// pinned-arena bound is STRUCTURAL — [`TransportGeometry::plan`] never
+/// registers more than `nqueues × Q_DEPTH_DESIRED × payload_sz` (the
+/// demand cap; depth is clamped to the desired 32 by construction).
 fn default_buffer_cap() -> u64 {
     let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
     let page_sz = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
@@ -1022,7 +1020,7 @@ fn default_buffer_cap() -> u64 {
         // Cannot size RAM: fall back to the floor geometry (depth 4).
         return 0;
     }
-    ((pages as u64).saturating_mul(page_sz as u64) / 8).min(TRANSPORT_BUFFER_CAP_CEILING)
+    (pages as u64).saturating_mul(page_sz as u64) / 8
 }
 
 /// The kernel's `fs.fuse.max_pages_limit` sysctl — the ceiling
@@ -1177,8 +1175,16 @@ impl TransportGeometry {
     ///      base, floor 4 pins regardless, exactly the pre-L1 posture
     ///      (no box regresses below the behavior it already ran).
     /// - `max_background`: override (> 0) wins, else
-    ///   clamp(nqueues × depth, [`MAX_BACKGROUND_FLOOR`],
-    ///   [`MAX_BACKGROUND_CEILING`]) — scaled with delivered ring capacity.
+    ///   clamp(nqueues × depth, [`MAX_BACKGROUND_FLOOR`], u16::MAX) —
+    ///   scaled with delivered ring capacity; the only ceiling is the
+    ///   INIT-reply wire format (`max_background` is a u16 — a
+    ///   protocol bound, not a policy constant). The former fixed 256
+    ///   ceiling (the 316k-measurement's largest bracketed value) was
+    ///   retired by the 2026-08-04 derivation sweep: it bound at
+    ///   ≥ 64-CPU geometries with no physical basis, and the measured
+    ///   row scales with `max_background` once depth is open. The old
+    ///   posture stays reachable verbatim via `-o max_background=256`
+    ///   (the field A0 lever).
     /// - `congestion_threshold`: override (> 0) wins, else ¾ of
     ///   `max_background` (the kernel's own default ratio).
     #[allow(clippy::too_many_arguments)] // pure policy core: every input is a policy input
@@ -1250,8 +1256,8 @@ impl TransportGeometry {
         let max_background = match max_background_override {
             Some(mb) if mb > 0 => mb,
             _ => u16::try_from(nqueues.saturating_mul(depth))
-                .unwrap_or(MAX_BACKGROUND_CEILING)
-                .clamp(MAX_BACKGROUND_FLOOR, MAX_BACKGROUND_CEILING),
+                .unwrap_or(u16::MAX)
+                .max(MAX_BACKGROUND_FLOOR),
         };
         let congestion_threshold = match congestion_threshold_override {
             Some(ct) if ct > 0 => ct,
@@ -3106,9 +3112,10 @@ mod tests {
     }
 
     /// The today-shape pin: at the kernel-default sysctl (256) and the
-    /// shipped 1 MiB desired max_write, the resolved geometry is
-    /// byte-identical to the pre-campaign plan — same ents, same depth,
-    /// same INIT limits.
+    /// shipped 1 MiB desired max_write, the resolved geometry keeps the
+    /// pre-campaign ents/depth; `max_background` = the delivered ring
+    /// capacity (32×32 = 1024 — the 2026-08-04 derivation sweep retired
+    /// the fixed 256 ceiling; `-o max_background=256` is the A0 lever).
     #[test]
     fn test_plan_default_sysctl_shape_is_byte_identical() {
         let g = plan_mw(32, MIB as usize, 256, 2 * GIB);
@@ -3117,8 +3124,8 @@ mod tests {
         assert_eq!(g.payload_sz, MIB as usize);
         assert_eq!(g.max_write, MIB as usize);
         assert_eq!(g.max_pages, 256);
-        assert_eq!(g.max_background, 256);
-        assert_eq!(g.congestion_threshold, 192);
+        assert_eq!(g.max_background, 1024, "ring capacity 32×32");
+        assert_eq!(g.congestion_threshold, 768);
         assert_eq!(g.total_payload_bytes(), GIB);
     }
 
@@ -3139,7 +3146,10 @@ mod tests {
             "the L1 ladder re-derived for 4 MiB ents: 2 GiB / (32 × 4 MiB) = 16"
         );
         assert_eq!(g.total_payload_bytes(), 2 * GIB);
-        assert_eq!(g.max_background, 256, "32×16 = 512 clamps to 256");
+        assert_eq!(
+            g.max_background, 512,
+            "ring capacity 32×16 (no fixed ceiling)"
+        );
 
         // Fleet kernel at the default sysctl: the desire degrades to the
         // 256-page ceiling — today's shape, mount succeeds.
@@ -3233,8 +3243,11 @@ mod tests {
         assert_eq!(g.payload_sz, kernel_ring_max_payload_sz(1024, &g));
     }
 
-    /// Ample budget ⇒ the measured 316k-class defaults: depth 32,
-    /// max_background 256, congestion 192, on a 32-CPU geometry.
+    /// Ample budget ⇒ the measured 316k-class depth with the
+    /// ring-capacity `max_background` (derivation sweep 2026-08-04: the
+    /// fixed 256 ceiling retired — the measured row scales with
+    /// max_background once depth is open; `-o max_background=256` is
+    /// the A0 lever).
     #[test]
     fn test_plan_default_ample_budget_is_measured_class() {
         let g = plan(32, None, None, 2 * GIB, None, None);
@@ -3242,8 +3255,8 @@ mod tests {
         assert_eq!(g.depth, 32, "desired depth under an ample cap");
         assert_eq!(g.payload_sz, 1024 * 1024);
         assert_eq!(g.total_payload_bytes(), GIB);
-        assert_eq!(g.max_background, 256, "clamp(32×32, 64, 256)");
-        assert_eq!(g.congestion_threshold, 192, "¾ of max_background");
+        assert_eq!(g.max_background, 1024, "clamp(32×32, 64, u16::MAX)");
+        assert_eq!(g.congestion_threshold, 768, "¾ of max_background");
     }
 
     /// The budget degrades depth exactly (integer division), floor 4 —
@@ -3254,11 +3267,11 @@ mod tests {
         // 819 MiB cap on 32 queues × 1 MiB ⇒ depth 25 (the 8G-cage row).
         let g = plan(32, None, None, 819 * MIB, None, None);
         assert_eq!(g.depth, 25);
-        assert_eq!(g.max_background, 256, "32×25=800 clamps to 256");
+        assert_eq!(g.max_background, 800, "ring capacity 32×25");
         // 128 MiB cap ⇒ exactly the floor.
         let g = plan(32, None, None, 128 * MIB, None, None);
         assert_eq!(g.depth, 4, "floor = pre-L1 default");
-        assert_eq!(g.max_background, 128, "32×4 within [64,256]");
+        assert_eq!(g.max_background, 128, "32×4 within [64, u16::MAX]");
         assert_eq!(g.congestion_threshold, 96);
         // Cap 0 (unknown RAM) ⇒ still the floor, never below.
         let g = plan(32, None, None, 0, None, None);
@@ -3267,11 +3280,27 @@ mod tests {
         let g = plan(4, None, None, 179 * MIB, None, None);
         assert_eq!(g.depth, 32);
         assert_eq!(g.max_background, 128, "4×32 = 128");
-        // Huge-CPU box under the 2 GiB ceiling: 256 queues ⇒ depth 8.
+        // Huge-CPU box on a 2 GiB budget: 256 queues ⇒ depth 8 (the
+        // depth ladder is now driven by the budget fraction alone — a
+        // bigger budget restores depth 32 where the retired 2 GiB
+        // ceiling used to pin it).
         let g = plan(256, None, None, 2 * GIB, None, None);
         assert_eq!(g.depth, 8);
         assert_eq!(g.total_payload_bytes(), 2 * GIB);
-        assert_eq!(g.max_background, 256);
+        assert_eq!(g.max_background, 2048, "ring capacity 256×8");
+        // The same huge-CPU box with a big-RAM budget fraction (the
+        // shape the fixed ceiling used to bind): depth restores to the
+        // measured 32 and the arena is the structural demand cap.
+        let g = plan(256, None, None, 9 * GIB + 512 * MIB, None, None);
+        assert_eq!(
+            g.depth, 32,
+            "no fixed ceiling: 9.5 GiB budget opens depth 32"
+        );
+        assert_eq!(
+            g.total_payload_bytes(),
+            8 * GIB,
+            "the demand cap: 256×32×1 MiB"
+        );
     }
 
     /// Env depth wins verbatim over the cap (explicit operator intent),
@@ -3280,7 +3309,7 @@ mod tests {
     fn test_plan_env_depth_override_wins() {
         let g = plan(32, None, Some(6), 0, None, None);
         assert_eq!(g.depth, 6, "env bypasses the budget cap");
-        assert_eq!(g.max_background, 192, "32×6 = 192 within [64,256]");
+        assert_eq!(g.max_background, 192, "32×6 = 192 within [64, u16::MAX]");
         assert_eq!(plan(32, None, Some(64), 2 * GIB, None, None).depth, 32);
         assert_eq!(plan(32, None, Some(0), 2 * GIB, None, None).depth, 1);
     }
@@ -3309,10 +3338,10 @@ mod tests {
         let g = plan(32, None, None, 2 * GIB, Some(100), None);
         assert_eq!(g.max_background, 100);
         assert_eq!(g.congestion_threshold, 75);
-        // Zero overrides are ignored.
+        // Zero overrides are ignored (policy default = ring capacity).
         let g = plan(32, None, None, 2 * GIB, Some(0), Some(0));
-        assert_eq!(g.max_background, 256);
-        assert_eq!(g.congestion_threshold, 192);
+        assert_eq!(g.max_background, 1024);
+        assert_eq!(g.congestion_threshold, 768);
     }
 
     /// Arena buffers: one stable, 4096-aligned, zeroed allocation per ring

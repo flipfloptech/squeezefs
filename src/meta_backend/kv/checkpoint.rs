@@ -14,8 +14,10 @@
 //!    (the v2 `needs_flush` discipline, via the volume's `SyncCoalescer`);
 //! 3. runs a **checkpoint cycle** when due — every ≤ 1 s, or journal
 //!    distance > ring/2, or dirty-node count >
-//!    `SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES` (default 4096, the §3
-//!    mount-replay bound), or on shutdown.
+//!    `SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES` (default derived:
+//!    `max(4096, budget/32 ÷ node_size)` — the §3 mount-replay bound,
+//!    budget-scaled since the 2026-08-04 derivation sweep), or on
+//!    shutdown.
 //!
 //! ## One checkpoint cycle (§4.6 pt 2, pinned order)
 //!
@@ -643,15 +645,46 @@ pub async fn read_newest_ledger(
 // PR K6b: the checkpoint/writeback task (module docs above).
 // ---------------------------------------------------------------------------
 
-/// `SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES` (§5.1; default 4096 — the
-/// §3 mount-replay working-set bound).
+/// `SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES` (§5.1; the §3
+/// mount-replay working-set bound). Since the 2026-08-04 derivation
+/// sweep the default derives from the machine
+/// ([`resolve_max_dirty_nodes`]); the env stays absolute-verbatim.
 pub const CHECKPOINT_MAX_DIRTY_NODES_ENV: &str = "SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES";
 
-fn max_dirty_nodes() -> u64 {
-    std::env::var(CHECKPOINT_MAX_DIRTY_NODES_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(4096)
+/// The shipped dirty-node cap — the derived default's FLOOR since the
+/// 2026-08-04 derivation sweep (never-regress-below-shipped: a lower
+/// cap checkpoints more often than any box ever shipped — pure
+/// overhead, no RAM won).
+pub const CHECKPOINT_MAX_DIRTY_NODES_FLOOR: u64 = 4096;
+
+/// Dirty-node cap resolution, pure (2026-08-04 derivation sweep): env
+/// wins verbatim; derived default = `max(4096, budget/32 ÷ node_size)`
+/// — the cap bounds RAM pinned by dirty nodes AND the mount-replay
+/// working set, so it scales with the resolved R5 budget instead of a
+/// 512 MiB-era constant (a zero `node_size` is defensive-floored).
+pub fn resolve_max_dirty_nodes(budget_bytes: u64, node_size: u64, env: Option<&str>) -> u64 {
+    if let Some(raw) = env {
+        match raw.trim().parse::<u64>() {
+            Ok(n) => return n,
+            Err(e) => log::warn!(
+                "{CHECKPOINT_MAX_DIRTY_NODES_ENV}={raw:?} is not an integer ({e}) — ignored"
+            ),
+        }
+    }
+    if node_size == 0 {
+        return CHECKPOINT_MAX_DIRTY_NODES_FLOOR;
+    }
+    (budget_bytes / 32 / node_size).max(CHECKPOINT_MAX_DIRTY_NODES_FLOOR)
+}
+
+fn max_dirty_nodes(node_size: u64) -> u64 {
+    resolve_max_dirty_nodes(
+        crate::mem_budget::MEM_BUDGET.resolve_budget_now(),
+        node_size,
+        std::env::var(CHECKPOINT_MAX_DIRTY_NODES_ENV)
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Checkpoint cadence ceiling: a cycle runs at least this often even when
@@ -926,7 +959,7 @@ async fn tick(
     });
     let due = final_cycle
         || ring_pressure
-        || dirty_nodes > max_dirty_nodes()
+        || dirty_nodes > max_dirty_nodes(u64::from(be.superblock().node_size))
         || last_checkpoint.elapsed().as_millis() >= CHECKPOINT_MAX_AGE_MS;
     if due && (final_cycle || dirty_nodes > 0 || distance > 0) {
         // Immediate post-ledger barrier under pressure or at shutdown:

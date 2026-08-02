@@ -132,17 +132,33 @@ impl UringFsWorker {
 }
 
 /// Size of the io_uring file-worker pool. Override with
-/// `SQUEEZEFS_URING_FS_WORKERS`; defaults to `clamp(nproc, 4, 8)`.
+/// `SQUEEZEFS_URING_FS_WORKERS` (clamp 1..=64); defaults to
+/// `clamp(cpus/4, 4, 64)`.
 fn worker_count() -> usize {
-    if let Ok(v) = std::env::var("SQUEEZEFS_URING_FS_WORKERS") {
-        if let Ok(n) = v.parse::<usize>() {
+    resolve_worker_count(
+        std::env::var("SQUEEZEFS_URING_FS_WORKERS").ok().as_deref(),
+        crate::cpu::process_parallelism(),
+    )
+}
+
+/// Pure sizing form (2026-08-04 derivation sweep; pinned by
+/// `tests/derivation_sweep_tests.rs`): env wins verbatim (clamp 1..=64,
+/// the pre-existing operator sanity clamp); derived default =
+/// `clamp(cpus/4, 4, 64)` — cpus/4 is the measured drain-thread slope
+/// (the ingest-economy `il_sessions_default` precedent applied to the
+/// sibling file-I/O pool; the retired `clamp(nproc, 4, 8)` pinned every
+/// box ≥ 8 CPUs at 8 workers with no basis for the 8), floor 4 = the
+/// shipped floor, ceiling 64 = env-clamp parity. `cpus` must be the
+/// PROCESS parallelism ([`crate::cpu::process_parallelism`]) — the old
+/// site read `available_parallelism()` from whatever thread touched the
+/// Lazy first (the Hang-1 pinned-first-toucher sizing poison).
+pub fn resolve_worker_count(env: Option<&str>, cpus: usize) -> usize {
+    if let Some(raw) = env {
+        if let Ok(n) = raw.trim().parse::<usize>() {
             return n.clamp(1, 64);
         }
     }
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(4, 8)
+    (cpus / 4).clamp(4, 64)
 }
 
 impl Drop for UringFsWorker {

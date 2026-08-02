@@ -17059,10 +17059,38 @@ mod tests {
         );
         assert_eq!(
             regular_open_reply_flags(),
-            FOPEN_NOFLUSH | FOPEN_PARALLEL_DIRECT_WRITES,
-            "regular files must advertise exactly NOFLUSH + parallel \
-             direct writes (no FOPEN_DIRECT_IO — the page-cache path \
-             stays enabled)"
+            FOPEN_NOFLUSH | FOPEN_PARALLEL_DIRECT_WRITES | (1 << 1),
+            "regular files must advertise exactly KEEP_CACHE + NOFLUSH + \
+             parallel direct writes (no FOPEN_DIRECT_IO — the page-cache \
+             path stays enabled)"
+        );
+    }
+
+    /// PERF-6 / FUSE-4a (pre-rc spec §9/§4): regular-file open/create
+    /// replies must advertise FOPEN_KEEP_CACHE (kernel ABI bit 1 << 1).
+    /// Without it `fuse_open_common` → `fuse_finish_open` invalidates the
+    /// inode's whole page cache on EVERY open, so a warm double-read pays
+    /// the full READ stream twice despite FUSE_WRITEBACK_CACHE being
+    /// negotiated. Safety is the spec's FUSE-4a rationale:
+    /// FUSE_AUTO_INVAL_DATA is already negotiated (pinned in the fuse3
+    /// fork's `init_reply_echoes_implemented_caps`), so the kernel itself
+    /// invalidates cached pages when it observes a size/mtime change —
+    /// and under the D0 single-writer mount guard there is no cross-mount
+    /// writer to observe in the first place. Older kernels ignore unknown
+    /// open flags (the FOPEN_PARALLEL_DIRECT_WRITES precedent), so
+    /// advertising is always safe. Interactions pinned elsewhere stay
+    /// intact: NOFLUSH/killpriv semantics are per-handle close/priv laws,
+    /// orthogonal to open-time cache retention, and the virtual
+    /// .stats/.config inodes keep their separate FOPEN_DIRECT_IO reply
+    /// (`data_path_correctness_tests.rs`).
+    #[test]
+    fn regular_open_reply_advertises_keep_cache() {
+        assert_eq!(
+            regular_open_reply_flags() & (1 << 1),
+            1 << 1,
+            "regular files must advertise FOPEN_KEEP_CACHE (1 << 1) — \
+             without it the kernel drops the page cache on every open \
+             (PERF-6/FUSE-4a)"
         );
     }
 

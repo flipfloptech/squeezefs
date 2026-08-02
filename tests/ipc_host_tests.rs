@@ -2153,14 +2153,14 @@ impl squeezefs::ipc_host::SessionSink for SlowSink {
 /// Keep `session`'s ring topped up: release every finished slot and
 /// re-submit it. One call tops up every free slot; called in a loop it is
 /// a client that never lets its ring go empty.
-fn top_up(session: &ClientSession, gens: &mut Vec<Option<u64>>, desc: &SlotDescriptor) -> usize {
+fn top_up(session: &ClientSession, gens: &mut [Option<u64>], desc: &SlotDescriptor) -> usize {
     let mut recycled = 0usize;
-    for i in 0..gens.len() {
+    for (i, gen) in gens.iter_mut().enumerate() {
         let slot = session.slot(i);
-        if let Some(g) = gens[i] {
+        if let Some(g) = *gen {
             if slot.core.is_done_for(g) {
                 slot.core.release();
-                gens[i] = None;
+                *gen = None;
                 recycled += 1;
             } else {
                 continue;
@@ -2172,7 +2172,7 @@ fn top_up(session: &ClientSession, gens: &mut Vec<Option<u64>>, desc: &SlotDescr
         slot.publish_descriptor(desc);
         slot.core.publish_submitted();
         if session.ring().push(i as u32) {
-            gens[i] = Some(g);
+            *gen = Some(g);
             session.header().doorbell.fetch_add(1, Ordering::Release);
             futex_wake(&session.header().doorbell, 1);
         } else {

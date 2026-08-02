@@ -826,10 +826,20 @@ struct IpcSession {
 }
 
 impl IpcSession {
-    /// Drain + serve everything currently published on this session's
-    /// ring. Returns ops served, or `None` when the session must be
-    /// poisoned (§5.3 rule 4: impossible ring/slot observation).
-    fn drain(&self, sink: &Arc<dyn SessionSink>) -> Option<u32> {
+    /// Drain + serve up to `budget` ops published on this session's ring.
+    /// Returns ops served, or `None` when the session must be poisoned
+    /// (§5.3 rule 4: impossible ring/slot observation).
+    ///
+    /// **VAL-5e — the budget is a fairness bound, not a throughput cap.**
+    /// Sessions are pinned to one service thread for life (§5.5.1) and
+    /// the loop walks them serially, so an unbudgeted drain lets one
+    /// client that keeps its ring non-empty own the thread forever (it
+    /// never even returns to the pass top to re-collect the registry).
+    /// The quantum is `geometry.slots` — one session's HONEST in-flight
+    /// bound (VAL-5c makes that exact), so a fully-loaded honest client
+    /// still drains its whole window in a single pass and pays nothing;
+    /// what the bound costs is only the ability to starve a sibling.
+    fn drain(&self, sink: &Arc<dyn SessionSink>, budget: u32) -> Option<u32> {
         let mut served = 0u32;
         let mut consumer = self
             .consumer
@@ -880,6 +890,9 @@ impl IpcSession {
             };
             self.serve_validated(&desc, sink, completion);
             served += 1;
+            if served >= budget {
+                break;
+            }
         }
         Some(served)
     }
@@ -1083,6 +1096,9 @@ pub struct IpcHost {
     /// VAL-5d: the derived concurrent-connection bound
     /// ([`ctl_conn_cap_from`]), resolved once at spawn.
     ctl_cap: usize,
+    /// VAL-5e: ops one session may be served per drain pass — the
+    /// geometry's `slots`, i.e. exactly one honest in-flight window.
+    drain_budget: u32,
     /// One loud line per cap episode, not per refused connect (a storm
     /// must not turn the log into the DoS).
     ctl_cap_logged: AtomicBool,
@@ -1131,6 +1147,8 @@ impl IpcHost {
             .expect("geometry validated above")
             .total_bytes;
         let ctl_cap = ctl_conn_cap_from(cfg_arena_cap_bytes, session_footprint);
+        // VAL-5e: the fair per-pass quantum = one honest in-flight window.
+        let cfg_slots = cfg.geometry.slots.max(1);
         let host = Arc::new(Self {
             cfg,
             sink,
@@ -1157,6 +1175,7 @@ impl IpcHost {
             ctl_live: std::sync::atomic::AtomicUsize::new(0),
             ctl_cap,
             ctl_cap_logged: AtomicBool::new(false),
+            drain_budget: cfg_slots,
             severed_pool: Arc::new(SeveredPool::new(cfg_max_op_bytes, cfg_arena_cap_bytes)),
         });
         // Spawn-on-bind (ingest-economy 2026-07-28): the gauge reports
@@ -2114,6 +2133,32 @@ impl IpcHost {
         Ok(())
     }
 
+    /// One budgeted, round-robin drain sweep over `sessions` (VAL-5e).
+    /// `start` rotates per pass, so the per-session budget bounds how far
+    /// ahead of its siblings a saturating session can get AND no session
+    /// permanently sits at the head of the queue. Returns ops served;
+    /// a session that reports a protocol violation is poisoned here.
+    fn drain_pass(&self, sessions: &[Arc<IpcSession>], start: usize) -> u32 {
+        if sessions.is_empty() {
+            return 0;
+        }
+        let mut served = 0u32;
+        let now = self.now_ms();
+        for k in 0..sessions.len() {
+            let s = &sessions[(start.wrapping_add(k)) % sessions.len()];
+            match s.drain(&self.sink, self.drain_budget) {
+                Some(0) => {}
+                Some(n) => {
+                    served += n;
+                    // §5.7 idle clock: served ring ops are activity.
+                    s.last_active_ms.store(now, Ordering::Relaxed);
+                }
+                None => self.poison_session(s, "ring/slot protocol violation"),
+            }
+        }
+        served
+    }
+
     fn service_loop(self: Arc<Self>, idx: usize) {
         // NUMA-affinity (2026-07-31): pin this owner to its partition
         // node's CPU set (∩ process mask — taskset never widened).
@@ -2130,6 +2175,10 @@ impl IpcHost {
         // pinned by `new_session_on_a_busy_thread_is_served_promptly`).
         let mut sessions: Vec<Arc<IpcSession>> = Vec::new();
         let mut seen_epoch = u64::MAX; // != any real epoch ⇒ first pass collects
+                                       // VAL-5e: the round-robin cursor — every sweep starts one session
+                                       // further along, so the per-session budget cannot be gamed by
+                                       // always being first in the collected order.
+        let mut rr_start = 0usize;
         let mut last_progress = Instant::now();
         let spin_window = self.spin_window;
         // Reused park snapshot (op-economy): the doorbell-snapshot Vec is
@@ -2149,19 +2198,8 @@ impl IpcHost {
                     .collect();
                 seen_epoch = epoch;
             }
-            let mut served = 0u32;
-            let now = self.now_ms();
-            for s in &sessions {
-                match s.drain(&self.sink) {
-                    Some(0) => {}
-                    Some(n) => {
-                        served += n;
-                        // §5.7 idle clock: served ring ops are activity.
-                        s.last_active_ms.store(now, Ordering::Relaxed);
-                    }
-                    None => self.poison_session(s, "ring/slot protocol violation"),
-                }
-            }
+            let served = self.drain_pass(&sessions, rr_start);
+            rr_start = rr_start.wrapping_add(1);
             // One flush per sweep (SessionSink::flush liveness rule):
             // direct-drive SQEs published during the drain become
             // kernel-visible before this thread can park.
@@ -2211,18 +2249,8 @@ impl IpcHost {
                     .iter()
                     .map(|s| s.map.header().doorbell.load(Ordering::SeqCst)),
             );
-            let mut rescan_served = 0u32;
-            let now = self.now_ms();
-            for s in &sessions {
-                match s.drain(&self.sink) {
-                    Some(0) => {}
-                    Some(n) => {
-                        rescan_served += n;
-                        s.last_active_ms.store(now, Ordering::Relaxed);
-                    }
-                    None => self.poison_session(s, "ring/slot protocol violation"),
-                }
-            }
+            let rescan_served = self.drain_pass(&sessions, rr_start);
+            rr_start = rr_start.wrapping_add(1);
             // Same liveness rule on the pre-park rescan sweep.
             self.sink.flush();
             if rescan_served == 0 {

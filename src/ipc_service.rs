@@ -559,7 +559,14 @@ impl DataPlaneSink {
                         // DIALED P1.5 (2026-07-27): a governed O_DIRECT
                         // miss on the DEFAULT mount runs the R1b
                         // admission decision synchronously in the
-                        // prelude — a DENIED miss (the majority on
+                        // prelude. An op reaching here has already run
+                        // the FULL §5.5.1 warm ladder inside
+                        // `ipc_read_probe_locked` — staging, hot, the
+                        // read-lane hold (il hold-probe campaign
+                        // 2026-08-03: the kernel path's ~µs warm serves
+                        // the P1.5 posture was missing), NVMe read-cache
+                        // — so a direct-drive here is a genuinely cold
+                        // miss. A DENIED miss (the majority on
                         // working sets ≫ budget) is semantically a
                         // device-true serve (ranged device read, no tier
                         // publish, nothing to invalidate) and

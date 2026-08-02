@@ -1723,37 +1723,50 @@ fn recv_ctl(sock: RawFd) -> Result<(CtlMsg, Option<RawFd>), SessionError> {
     if n < 0 {
         return Err(SessionError::Socket(errno()));
     }
-    let mut rx_fd = None;
-    // SAFETY: CMSG walk over the kernel-filled control buffer.
+    // VAL-5a (client side): own EVERY descriptor the kernel installed —
+    // the count comes from `cmsg_len`, never "one per cmsg". A daemon
+    // that attaches extras (or truncates the control data) is refused
+    // and everything it installed is closed: the app's fd table is not
+    // the daemon's to fill, and the establish ladder runs on every
+    // eligible open.
+    let mut rx_fds: Vec<FdGuard> = Vec::new();
+    // SAFETY: CMSG walk over the kernel-filled control buffer; each
+    // `CMSG_DATA` span is `cmsg_len - CMSG_LEN(0)` bytes of fds the
+    // kernel just installed in this process.
     unsafe {
+        let hdr_bytes = libc::CMSG_LEN(0) as usize;
         let mut cmsg = libc::CMSG_FIRSTHDR(&hdr);
         while !cmsg.is_null() {
             if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let mut fd: RawFd = -1;
-                std::ptr::copy_nonoverlapping(
-                    libc::CMSG_DATA(cmsg),
-                    &mut fd as *mut RawFd as *mut u8,
-                    std::mem::size_of::<RawFd>(),
-                );
-                if fd >= 0 {
-                    rx_fd = Some(fd);
+                let payload = ((*cmsg).cmsg_len as usize).saturating_sub(hdr_bytes);
+                let data = libc::CMSG_DATA(cmsg);
+                for i in 0..payload / std::mem::size_of::<RawFd>() {
+                    let mut fd: RawFd = -1;
+                    std::ptr::copy_nonoverlapping(
+                        data.add(i * std::mem::size_of::<RawFd>()),
+                        &mut fd as *mut RawFd as *mut u8,
+                        std::mem::size_of::<RawFd>(),
+                    );
+                    if fd >= 0 {
+                        rx_fds.push(FdGuard(fd));
+                    }
                 }
             }
             cmsg = libc::CMSG_NXTHDR(&hdr, cmsg);
         }
     }
+    // Truncated control data ⇒ the kernel installed fds we cannot
+    // enumerate; more than one ⇒ no reply in this protocol carries two.
+    // Both refuse; the guards close what arrived.
+    if hdr.msg_flags & libc::MSG_CTRUNC != 0 || rx_fds.len() > 1 {
+        return Err(SessionError::Protocol);
+    }
     if n == 0 {
         return Err(SessionError::Socket(0)); // EOF: daemon gone
     }
     match CtlMsg::decode(&buf[..n as usize]) {
-        Ok(m) => Ok((m, rx_fd)),
-        Err(_) => {
-            if let Some(fd) = rx_fd {
-                // SAFETY: closing an fd we own.
-                unsafe { libc::close(fd) };
-            }
-            Err(SessionError::Protocol)
-        }
+        Ok(m) => Ok((m, rx_fds.pop().map(|g| g.release()))),
+        Err(_) => Err(SessionError::Protocol),
     }
 }
 

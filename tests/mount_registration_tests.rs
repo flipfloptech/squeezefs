@@ -9,7 +9,6 @@
 use squeezefs::fuse_client::CLIENT_STALE_TTL_SECS;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
-use squeezefs::meta_backend::Metadata;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
@@ -48,9 +47,13 @@ async fn formatted_volume() -> NamedTempFile {
 async fn set_registration(meta: &NamedTempFile, id: &str, value: Option<&[u8]>) {
     let be = KvMetaBackend::open(meta.path()).await.unwrap();
     let name = format!("client:{id}");
+    // VAL-2: `client:{id}` is an internal record — the generic
+    // `Metadata::{set,remove}xattr` mirror the FUSE allowlist and refuse
+    // it. The daemon's registration writer (which this impersonates)
+    // rides the unscreened internal entry point.
     match value {
-        Some(v) => be.setxattr(1, &name, v).await.unwrap(),
-        None => be.removexattr(1, &name).await.unwrap(),
+        Some(v) => be.setxattr_internal(1, &name, v).await.unwrap(),
+        None => be.removexattr_internal(1, &name).await.unwrap(),
     }
     be.shutdown().await.unwrap();
 }
@@ -118,7 +121,8 @@ async fn set_claim(meta: &NamedTempFile, ts: u64) {
         pid: 4_100_000,
         boot: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
     };
-    be.setxattr(1, WRITER_CLAIM_XATTR, &claim.encode())
+    // VAL-2: the guard's own record — the unscreened internal writer.
+    be.setxattr_internal(1, WRITER_CLAIM_XATTR, &claim.encode())
         .await
         .unwrap();
     be.sync_device().await.unwrap();

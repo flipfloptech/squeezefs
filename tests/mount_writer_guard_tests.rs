@@ -102,7 +102,11 @@ fn dead_pid() -> u32 {
 /// holder leaves.
 async fn forge_claim(path: &std::path::Path, claim: &WriterClaim) {
     let be = KvMetaBackend::open(path).await.expect("forge open");
-    Metadata::setxattr(be.as_ref(), 1, WRITER_CLAIM_XATTR, &claim.encode())
+    // VAL-2: `writer_claim` is an internal record — the generic
+    // `Metadata::setxattr` mirrors the FUSE allowlist and refuses it.
+    // The guard's own writers (which this forge impersonates) ride the
+    // unscreened internal entry point.
+    be.setxattr_internal(1, WRITER_CLAIM_XATTR, &claim.encode())
         .await
         .expect("forge setxattr");
     be.sync_device().await.expect("forge barrier");
@@ -515,7 +519,7 @@ async fn test_guard_heartbeat_refreshes_claim_timestamp() {
     // Age our own claim far past the TTL, as if the heartbeat had stalled.
     let mut aged = be.read_writer_claim().await.expect("claimed at mount");
     aged.ts = now_secs().saturating_sub(CLIENT_STALE_TTL_SECS + 300);
-    Metadata::setxattr(be.as_ref(), 1, WRITER_CLAIM_XATTR, &aged.encode())
+    be.setxattr_internal(1, WRITER_CLAIM_XATTR, &aged.encode())
         .await
         .unwrap();
 

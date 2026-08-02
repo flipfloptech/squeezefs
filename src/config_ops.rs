@@ -490,8 +490,12 @@ pub async fn set_cache_paths(
         SqueezefsError::InvalidOperation(format!("failed to serialize the format config: {e}"))
     })?;
     let vol = crate::meta_backend::open_volume_for_mount(first).await?;
-    crate::meta_backend::Metadata::setxattr(
-        vol.as_ref(),
+    // VAL-2: the daemon's OWN record writer, so it rides the unscreened
+    // internal entry point. The generic `Metadata::setxattr` on a
+    // `KvMetaBackend` mirrors the FUSE allowlist and would refuse
+    // `user.squeezefs.format_config` (EPERM) — the screen is the client
+    // boundary, never a ban on the administrator of the record.
+    vol.setxattr_internal(
         1,
         crate::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
         &bytes,

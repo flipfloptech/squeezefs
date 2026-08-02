@@ -137,5 +137,81 @@ fn bench_classifier(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_hold, bench_classifier);
+fn bench_assembly_join(c: &mut Criterion) {
+    // Fan-out/join bookkeeping of the multi-block assembly (MEM-2
+    // ownership fix, fix/assembly-task-ownership): spawn N per-block
+    // tasks + join ALL of them. Field shapes: N = 2 is the kernel-FUSE
+    // multi-block read — a max_read (1 MiB) request straddling a 4 MiB
+    // block boundary never spans more than two blocks; N = 16 is the
+    // interior large-op fan-out (`squeezefs bench` / il ring reads).
+    // Comparator: the RETIRED detached shape (Vec<JoinHandle> +
+    // futures::future::try_join_all over a usize-laundered pointer) —
+    // the A/B this bench exists for. The owned shape's per-task delta
+    // is one `Arc<AssemblyDest>` clone/drop + JoinSet bookkeeping; the
+    // copy work itself is identical on both sides, so tasks here are
+    // deliberately trivial (the bookkeeping IS the measurement).
+    use squeezefs::assembly_tasks::{AssemblyDest, OwnedTaskSet};
+    use squeezefs::cache::pool::BufferPool;
+    use std::sync::Arc;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("bench runtime");
+    let pool = Arc::new(BufferPool::new(1, 4096));
+    let mut buf = pool.alloc();
+    buf.resize(4096, 0);
+    let dest = Arc::new(AssemblyDest::pooled(buf));
+
+    let mut group = c.benchmark_group("assembly_join");
+    for n in [2usize, 16] {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_function(format!("owned_join_set_{n}"), |b| {
+            let dest = Arc::clone(&dest);
+            b.to_async(&rt).iter(move || {
+                let dest = Arc::clone(&dest);
+                async move {
+                    let mut tasks: OwnedTaskSet<()> = OwnedTaskSet::new("bench assembly");
+                    for i in 0..n {
+                        let dest = Arc::clone(&dest);
+                        tasks.spawn(async move {
+                            // The ownership the fix added: each task
+                            // co-owns the destination.
+                            black_box((&dest, i));
+                            Ok(())
+                        });
+                    }
+                    let (completed, err) = tasks.join_all().await;
+                    assert!(err.is_none());
+                    black_box(completed.len())
+                }
+            });
+        });
+        group.bench_function(format!("detached_try_join_all_{n}"), |b| {
+            b.to_async(&rt).iter(move || async move {
+                let mut handles = Vec::with_capacity(n);
+                for i in 0..n {
+                    // The retired shape: tasks capture a plain word (the
+                    // usize-laundered pointer), no owner.
+                    let laundered: usize = i;
+                    handles.push(tokio::spawn(async move {
+                        black_box(laundered);
+                        Ok::<(), std::io::Error>(())
+                    }));
+                }
+                let results = futures::future::try_join_all(handles)
+                    .await
+                    .expect("bench tasks never panic");
+                for r in results {
+                    r.expect("bench tasks never error");
+                }
+                black_box(n)
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_hold, bench_classifier, bench_assembly_join);
 criterion_main!(benches);

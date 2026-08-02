@@ -41,6 +41,20 @@ pub enum SqueezefsError {
     #[error("{msg}")]
     Refused { errno: libc::c_int, msg: String },
 
+    /// RES-6 (pre-RC engineering spec §7): this mount's D0 writer claim
+    /// was fenced / fail-stopped, so the DATA plane is closed — a fenced
+    /// zombie's DMA can land on offsets the successor writer has
+    /// replayed and reallocated. Classified as a fence drop by
+    /// [`crate::write_pipeline::pipeline_disposition`]: custody is
+    /// discarded (the W5 law — publish nothing, free nothing, successor
+    /// accounting owns it), never retried.
+    #[error(
+        "writer guard FENCED: this mount's D0 claim was lost or fail-stopped; the data \
+         plane is closed permanently (remount required) — successor accounting owns \
+         these offsets"
+    )]
+    WriterGuardFenced,
+
     #[error(
         "indirect block map: unsupported on-disk encoding ({detail}); \
          pre-beta or foreign blob — reformat required (no backwards compatibility)"
@@ -121,6 +135,7 @@ impl SqueezefsError {
             // The message is prose, not wire format (POSIX-6).
             SqueezefsError::InvalidOperation(_) => libc::EINVAL,
             SqueezefsError::Refused { errno, .. } => *errno,
+            SqueezefsError::WriterGuardFenced => libc::EIO,
             SqueezefsError::IndirectMapFormat { .. } => libc::EIO,
             SqueezefsError::GdsError(_) => libc::EIO,
             SqueezefsError::CacheOverflow => libc::ENOMEM,

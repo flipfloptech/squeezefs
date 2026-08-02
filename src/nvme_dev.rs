@@ -923,11 +923,68 @@ struct NodeProbe {
     seen: std::sync::atomic::AtomicBool,
 }
 
+/// RES-6 (pre-RC engineering spec §7): the DATA plane's D0 writer-guard
+/// fence.
+///
+/// The reclaim queue already observes the mount's `failed` latch so a
+/// fenced zombie can never issue another destructive discard
+/// (`block_reclaim::ReclaimQueue::fence_halted`). This is the same
+/// predicate for DMA SUBMISSION: NVMe reservations cover metadata
+/// volumes only, so on a detection-grade substrate a fenced holder's
+/// writes would otherwise keep landing on offsets the successor writer
+/// has replayed and reallocated.
+///
+/// Sticky by construction — a fenced holder is dead until remount, so
+/// the steady-state cost is exactly one relaxed load per submit.
+pub(crate) struct DeviceFence {
+    signal: std::sync::OnceLock<Arc<dyn Fn() -> bool + Send + Sync>>,
+    halted: std::sync::atomic::AtomicBool,
+}
+
+impl DeviceFence {
+    fn new() -> Self {
+        Self {
+            signal: std::sync::OnceLock::new(),
+            halted: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// `true` ⇔ writes are (now) fence-halted. One relaxed load once
+    /// latched; one cheap probe (a few atomic loads over the meta set)
+    /// otherwise. Latches sticky and loud on the first observation.
+    #[inline]
+    fn halted(&self, device_path: &str) -> bool {
+        if self.halted.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
+        let Some(sig) = self.signal.get() else {
+            return false;
+        };
+        if sig() {
+            if !self.halted.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                log::error!(
+                    "data volume {device_path}: writer guard FENCED / volume fail-stopped \
+                     — refusing ALL further data-plane DMA permanently (a fenced zombie's \
+                     write can land on offsets the successor writer has replayed and \
+                     reallocated). Counted in data_dma_fence_refusals; remount required"
+                );
+            }
+            return true;
+        }
+        false
+    }
+}
+
 #[derive(Clone)]
 pub struct NvmeBlockDev {
     pub device_path: String,
     worker: Arc<UringWorker>,
     node_probe: Arc<NodeProbe>,
+    /// RES-6: the D0 writer-guard fence, shared across clones (they
+    /// describe the same device). Wired by `DataRouter::set_meta_backend`
+    /// with the same probe the reclaim queue uses; bare devices (tests,
+    /// offline tools) have no probe and never halt.
+    fence: Arc<DeviceFence>,
     /// DUR-2: per-device barrier coalescer — many concurrent `fsync`s on
     /// one device need one device flush each in principle, and one
     /// `Fsync` op satisfies every caller whose write completed before it
@@ -996,7 +1053,35 @@ impl NvmeBlockDev {
             // a per-op path — the derived-defaults law).
             write_cache: crate::write_cache::probe_data_volume(std::path::Path::new(device_path)),
             lane: Arc::new(tokio::sync::OnceCell::new()),
+            fence: Arc::new(DeviceFence::new()),
         }
+    }
+
+    /// RES-6: wire the D0 writer-guard fence probe (the SAME per-volume
+    /// `failed` latch `set_reclaim_fence_signal` gives the reclaim
+    /// queue). Set once at meta-backend wiring; later calls are no-ops.
+    pub fn set_fence_signal(&self, sig: Arc<dyn Fn() -> bool + Send + Sync>) {
+        let _ = self.fence.signal.set(sig);
+    }
+
+    /// `true` ⇔ this device's data plane is fence-halted (stats /
+    /// tests). Sticky: a fenced holder is dead until remount.
+    pub fn fenced(&self) -> bool {
+        self.fence.halted(&self.device_path)
+    }
+
+    /// RES-6 submit gate: refuse loudly and count. Reads are deliberately
+    /// NOT gated — a fenced holder reading its own device corrupts
+    /// nothing, and refusing would turn a fail-stop into a hang.
+    #[inline]
+    fn fence_gate(&self) -> Result<()> {
+        if self.fence.halted(&self.device_path) {
+            crate::fuse_client::METRICS
+                .data_dma_fence_refusals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(crate::error::SqueezefsError::WriterGuardFenced);
+        }
+        Ok(())
     }
 
     /// Mount-path constructor (DUR-2 decision (a)): probe `O_DIRECT`
@@ -1205,6 +1290,8 @@ impl NvmeBlockDev {
     }
 
     pub async fn write_block(&self, offset: u64, data: bytes::Bytes) -> Result<()> {
+        // RES-6: the D0 writer-guard gate — one relaxed load per submit.
+        self.fence_gate()?;
         // Fault injection for atomicity / durability tests (no-op when counter is 0).
         loop {
             let cur = FAIL_NEXT_WRITES.load(std::sync::atomic::Ordering::SeqCst);

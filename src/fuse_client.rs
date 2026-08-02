@@ -3468,6 +3468,13 @@ pub struct Metrics {
     /// (single-writer D0: only our own lease churn can race an upload);
     /// investigate alongside `writer_guard_fenced`.
     pub write_pipeline_fence_drops: Align64<AtomicU64>,
+    /// RES-6 (pre-RC engineering spec §7): data-plane DMA submissions
+    /// REFUSED because this mount's D0 writer guard is fenced /
+    /// fail-stopped (`NvmeBlockDev`'s submit gate — the write-path twin
+    /// of `block_free_reclaim_fence_halts`). **0 on healthy mounts**;
+    /// any growth means a fenced zombie tried to write and was stopped —
+    /// investigate alongside `writer_guard_fenced`.
+    pub data_dma_fence_refusals: Align64<AtomicU64>,
     // Idea 2 — latest-wins supersession (design-rewrite-program §4;
     // tests/write_supersession_tests.rs): the overlapping-face
     // loop-rewrite engagement instrument.
@@ -6076,6 +6083,10 @@ impl SqueezefsFilesystem {
                 "write_pipeline_depth_probe_backoffs": self.write_pipeline.depth_probe_backoffs(),
                 "write_pipeline_admission_waits": self.write_pipeline.admission_waits(),
                 "write_pipeline_fence_drops": METRICS.write_pipeline_fence_drops.load(Ordering::Relaxed),
+                // RES-6: the D0 latch's write-path face (must stay 0 on
+                // healthy mounts — read alongside writer_guard_fenced and
+                // block_free_reclaim_fence_halts).
+                "data_dma_fence_refusals": METRICS.data_dma_fence_refusals.load(Ordering::Relaxed),
                 // Idea 2 — latest-wins supersession
                 // (design-rewrite-program §4).
                 "write_pipeline_supersessions": METRICS.write_pipeline_supersessions.load(Ordering::Relaxed),

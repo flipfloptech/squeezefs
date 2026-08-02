@@ -200,6 +200,10 @@ pub fn pipeline_disposition(res: &Result<(), crate::error::SqueezefsError>) -> P
         Err(crate::error::SqueezefsError::FencingTokenExpired { .. }) => {
             PipelineDisposition::FenceDrop
         }
+        // RES-6: the D0 latch's face. A fenced holder that retried
+        // forever would park custody until the R5 budget went Red and
+        // stayed there; the W5 law is publish nothing, free nothing.
+        Err(crate::error::SqueezefsError::WriterGuardFenced) => PipelineDisposition::FenceDrop,
         Err(_) => PipelineDisposition::StayParked,
     }
 }

@@ -712,6 +712,11 @@ pub struct BackendRouter {
     /// (`OnceCell`: the tiers outlive the router; bare routers in tests
     /// simply have no tiers to purge).
     read_tier_purge: once_cell::sync::OnceCell<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    /// RES-6: the D0 writer-guard fence probe, held so devices published
+    /// AFTER `set_meta_backend` (online `volume add-data`, the mount's
+    /// per-record registration loop) inherit the same gate. `OnceCell`:
+    /// wired once at meta-backend wiring; bare routers never gate.
+    dma_fence: once_cell::sync::OnceCell<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
     /// The durable data-volume records this router was registered from
     /// (KD-5; empty on bare routers). Lock-free snapshot swap: readers
     /// (stats, admin verbs) load; the mount wiring and the online
@@ -1030,6 +1035,7 @@ impl BackendRouter {
             )),
             block_size,
             read_tier_purge: once_cell::sync::OnceCell::new(),
+            dma_fence: once_cell::sync::OnceCell::new(),
             volume_records: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
             placement_table: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
                 PlacementTable::empty(),
@@ -1101,6 +1107,24 @@ impl BackendRouter {
     /// queue ceases all device reclaims permanently.
     pub fn set_reclaim_fence_signal(&self, sig: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {
         self.reclaim.set_fence_signal(sig);
+    }
+
+    /// RES-6 (pre-RC engineering spec §7): wire the SAME D0 fence probe
+    /// into every data device's DMA submit gate. Reservations cover
+    /// metadata volumes only, so without this a fenced zombie kept
+    /// writing over offsets the successor writer had reallocated.
+    ///
+    /// Stored so volumes registered LATER (online `volume add-data`, the
+    /// mount's per-record loop) inherit it — a device that joins after
+    /// the meta backend must not be the unguarded one.
+    pub fn set_dma_fence_signal(&self, sig: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {
+        if self.dma_fence.set(sig.clone()).is_err() {
+            return;
+        }
+        self.default_device.set_fence_signal(sig.clone());
+        for entry in self.backends.iter() {
+            entry.value().device.set_fence_signal(sig.clone());
+        }
     }
 
     /// Inject the reclaim manners' foreground device-activity signal
@@ -1406,6 +1430,11 @@ impl BackendRouter {
                 format!("data volume '{id}' is already registered"),
             )),
             dashmap::mapref::entry::Entry::Vacant(v) => {
+                // RES-6: a device published after the meta backend was
+                // wired must inherit the D0 DMA gate too.
+                if let Some(sig) = self.dma_fence.get() {
+                    backend.device.set_fence_signal(sig.clone());
+                }
                 v.insert(backend);
                 self.refresh_placement_table();
                 Ok(())
@@ -3549,12 +3578,21 @@ impl DataRouter {
         // router (a dropped backend reads as not-fenced, which is the
         // process-teardown shape).
         let weak = std::sync::Arc::downgrade(&meta_backend);
-        self.backend_router
-            .set_reclaim_fence_signal(std::sync::Arc::new(move || {
+        let probe: std::sync::Arc<dyn Fn() -> bool + Send + Sync> =
+            std::sync::Arc::new(move || {
                 weak.upgrade()
                     .map(|mb| mb.volumes.iter().any(|v| v.is_failed()))
                     .unwrap_or(false)
-            }));
+            });
+        self.backend_router.set_reclaim_fence_signal(probe.clone());
+        // RES-6 (pre-RC engineering spec §7): the SAME latch gates
+        // data-plane DMA SUBMISSION. Reservations cover metadata volumes
+        // only, so on a detection-grade substrate a fenced holder's
+        // writes would otherwise keep landing on offsets the successor
+        // writer has replayed and reallocated. (The cross-host face — a
+        // data-namespace reservation held for the mount lifetime — is
+        // DLM stage S7; this is the local face.)
+        self.backend_router.set_dma_fence_signal(probe);
         let _ = self.inner.meta_backend.set(meta_backend);
     }
 

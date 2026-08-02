@@ -12049,10 +12049,25 @@ impl Filesystem for SqueezefsFilesystem {
             if let Ok(Some(val)) = backend.getxattr(1, "user.squeezefs.format_config").await {
                 if let Ok(config) = serde_json::from_slice::<crate::FormatConfig>(&val) {
                     self.router.set_block_size(config.block_size);
+                    // VAL-3 (docs/design-key-handling.md §4/§6): the key is
+                    // NEVER read from the volume. It resolves from the
+                    // mount flag / SQUEEZEFS_ENCRYPT_KEY_FILE /
+                    // /etc/squeezefs/keys/<key_id>.key, and a pre-KW-1
+                    // (RSA-wrap) volume refuses here with its remedy. The
+                    // CLI preflights this too; a mount reached by any
+                    // other route (tests, embedders) still gets the gate.
+                    let volume_key = match crate::keyfile::mount_volume_key(&config) {
+                        Ok(k) => k,
+                        Err(msg) => {
+                            error!("{msg}");
+                            eprintln!("squeezefs: {msg}");
+                            return Err(libc::EINVAL.into());
+                        }
+                    };
                     let crypto_state = crate::crypto_compress::CryptoCompressState::new(
                         config.compression.clone(),
                         config.encrypt_algo.clone(),
-                        config.encrypt_key.as_deref(),
+                        volume_key.as_ref(),
                     );
                     // FIND-RW4-A geometry gate (forward-only): a transformed
                     // volume whose block_size leaves no chunk headroom for

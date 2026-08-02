@@ -52,6 +52,9 @@ pub(crate) mod ipc_direct;
 pub mod ipc_host;
 pub mod ipc_service;
 pub mod job_wire;
+/// Encryption key input, derivation, and mount-time resolution
+/// (VAL-3 + KW-1 — `docs/design-key-handling.md`).
+pub mod keyfile;
 pub mod layout_wire;
 pub mod meta_backend;
 pub mod nvmeof;
@@ -538,8 +541,22 @@ pub struct FormatConfig {
     pub inodes: u64,
     pub compression: String,
     pub encrypt_algo: String,
+    /// LEGACY, READ-ONLY (VAL-3): pre-KW-1 binaries stored the RSA private
+    /// key PEM **here**, in cleartext, on the volume it encrypts. It still
+    /// deserializes so [`crate::keyfile::legacy_encrypted_volume_refusal`]
+    /// can name such a volume precisely; `skip_serializing` means no
+    /// current binary can ever write key material back (a config rewritten
+    /// by `config set-cache-paths` drops the field). Redacting `Debug` +
+    /// zeroize-on-drop live on [`keyfile::RedactedSecret`].
+    #[serde(default, skip_serializing)]
+    pub encrypt_key: Option<keyfile::RedactedSecret>,
+    /// The whole persisted key surface on a KW-1 volume: a KDF salt and a
+    /// key id, neither of them secret. The key itself resolves at mount
+    /// from the flag, `SQUEEZEFS_ENCRYPT_KEY_FILE`, or
+    /// `/etc/squeezefs/keys/<key_id>.key`
+    /// (`docs/design-key-handling.md` §4).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub encrypt_key: Option<String>,
+    pub encrypt_key_ref: Option<keyfile::EncryptKeyRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mem_cache_size: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

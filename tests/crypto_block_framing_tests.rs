@@ -52,7 +52,7 @@ async fn make(
     staging: bool,
     comp: &str,
     enc: &str,
-    pem: Option<&str>,
+    volume_key: Option<&squeezefs::keyfile::VolumeKey>,
 ) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "524288");
     let dlm = DlmClient::new().unwrap();
@@ -103,7 +103,7 @@ async fn make(
     fs.router.set_crypto(CryptoCompressState::new(
         comp.to_string(),
         enc.to_string(),
-        pem,
+        volume_key,
     ));
     let req = Request {
         unique: 1,
@@ -239,14 +239,14 @@ async fn zstd_cold_striped_reads_decode() {
 /// without framing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lz4_aes_cold_striped_reads_decode() {
-    let pem = test_pem();
+    let volume_key = test_volume_key();
     let h = make(
         *b"framing-d-pr6-00",
         "frame_ns_d",
         false,
         "lz4",
-        "aes256gcm-rsa",
-        Some(&pem),
+        "aes256gcm",
+        Some(&volume_key),
     )
     .await;
     roundtrip(&h, "f_aes", (6 * BS) as usize).await;
@@ -295,11 +295,13 @@ async fn frame_contract_padded_legacy_truncated_passthrough() {
     assert_eq!(pt.process_read(&img).unwrap().as_ref(), data.as_ref());
 }
 
-fn test_pem() -> String {
-    use rsa::pkcs1::EncodeRsaPrivateKey;
-    let mut rng = rand::thread_rng();
-    let key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
-    key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
-        .unwrap()
-        .to_string()
+/// The mount-resolved volume key these tests encrypt under (KW-1: the
+/// operator's key file material + the volume's KDF salt — never a PEM;
+/// `docs/design-key-handling.md`).
+fn test_volume_key() -> squeezefs::keyfile::VolumeKey {
+    let material = squeezefs::keyfile::KeyMaterial::from_bytes(
+        b"squeezefs-test-key-material-0123456789".to_vec(),
+    )
+    .expect("test key material");
+    squeezefs::keyfile::derive_volume_key(&material, &[0x33u8; 32])
 }

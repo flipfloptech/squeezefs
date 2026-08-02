@@ -101,6 +101,7 @@ fn base_format_config(data_lvs: &[&Path]) -> FormatConfig {
         compression: "none".to_string(),
         encrypt_algo: "none".to_string(),
         encrypt_key: None,
+        encrypt_key_ref: None,
         mem_cache_size: None,
         disk_cache_size: None,
         disk_cache_paths: None,
@@ -896,13 +897,15 @@ async fn test_c6_census_drift_detected() {
 // C7 — the three scrub arms (KD-17)
 // ---------------------------------------------------------------------------
 
-fn test_pem() -> String {
-    use rsa::pkcs1::EncodeRsaPrivateKey;
-    let mut rng = rand::thread_rng();
-    let key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
-    key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
-        .unwrap()
-        .to_string()
+/// The mount-resolved volume key these tests encrypt under (KW-1: the
+/// operator's key file material + the volume's KDF salt — never a PEM;
+/// `docs/design-key-handling.md`).
+fn test_volume_key() -> squeezefs::keyfile::VolumeKey {
+    let material = squeezefs::keyfile::KeyMaterial::from_bytes(
+        b"squeezefs-test-key-material-0123456789".to_vec(),
+    )
+    .expect("test key material");
+    squeezefs::keyfile::derive_volume_key(&material, &[0x33u8; 32])
 }
 
 /// Corrupt the stored image of `ino`'s first striped block on the data
@@ -964,13 +967,13 @@ async fn test_c7_aead_corruption_detected() {
     format_meta(&meta, &[&oss1]).await;
     let recs = base_format_config(&[&oss1]).resolved_data_volumes();
     let fx = open_fixture(&meta, &recs).await;
-    let pem = test_pem();
+    let volume_key = test_volume_key();
     fx.fs
         .router
         .set_crypto(squeezefs::crypto_compress::CryptoCompressState::new(
             "none".to_string(),
-            "aes256gcm-rsa".to_string(),
-            Some(&pem),
+            "aes256gcm".to_string(),
+            Some(&volume_key),
         ));
 
     let ino = create_file(&fx, "enc.bin").await;

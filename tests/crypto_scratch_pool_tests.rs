@@ -28,17 +28,17 @@ use squeezefs::routing::DataRouter;
 use std::sync::Arc;
 use tempfile::{tempdir, NamedTempFile, TempDir};
 
-static TEST_PEM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static TEST_KEY: std::sync::OnceLock<squeezefs::keyfile::VolumeKey> = std::sync::OnceLock::new();
 
-fn test_pem() -> &'static str {
-    TEST_PEM.get_or_init(|| {
-        use rsa::pkcs1::EncodeRsaPrivateKey;
-        let mut rng = rand::thread_rng();
-        rsa::RsaPrivateKey::new(&mut rng, 2048)
-            .unwrap()
-            .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
-            .unwrap()
-            .to_string()
+/// The mount-resolved volume key these tests encrypt under (KW-1 — the
+/// operator's key file material + the volume's KDF salt, never a PEM).
+fn test_key() -> &'static squeezefs::keyfile::VolumeKey {
+    TEST_KEY.get_or_init(|| {
+        let material = squeezefs::keyfile::KeyMaterial::from_bytes(
+            b"squeezefs-test-key-material-0123456789".to_vec(),
+        )
+        .expect("test key material");
+        squeezefs::keyfile::derive_volume_key(&material, &[0x33u8; 32])
     })
 }
 
@@ -105,8 +105,8 @@ async fn test_set_crypto_inits_scratch_pool_from_block_size() {
 
     let state = CryptoCompressState::new(
         "lz4".to_string(),
-        "aes256gcm-rsa".to_string(),
-        Some(test_pem()),
+        "aes256gcm".to_string(),
+        Some(test_key()),
     );
     h.router.set_crypto(state);
 
@@ -128,8 +128,8 @@ async fn test_set_crypto_inits_scratch_pool_from_block_size() {
     // key agrees exactly (same §5.7 formula, same actual wrapped-key blob).
     let reference = CryptoCompressState::new(
         "lz4".to_string(),
-        "aes256gcm-rsa".to_string(),
-        Some(test_pem()),
+        "aes256gcm".to_string(),
+        Some(test_key()),
     );
     reference.init_scratch_pool(bs);
     assert_eq!(Some(buf_len), reference.scratch_pool_buf_len());
@@ -157,8 +157,8 @@ async fn test_pooled_transform_dma_read_back_parity() {
     h.router.set_block_size(bs as u64);
     h.router.set_crypto(CryptoCompressState::new(
         "lz4".to_string(),
-        "aes256gcm-rsa".to_string(),
-        Some(test_pem()),
+        "aes256gcm".to_string(),
+        Some(test_key()),
     ));
     let crypto = h.router.get_crypto();
     assert!(crypto.scratch_pool_buf_len().is_some());

@@ -1,10 +1,10 @@
 use crate::cache::pool::{BufferPool, POOLED_BUF_ALIGN};
 use crate::error::SqueezefsError;
+use crate::keyfile::VolumeKey;
 use ring::aead::{LessSafeKey, Nonce, UnboundKey, AES_256_GCM, CHACHA20_POLY1305};
 use ring::rand::{SecureRandom, SystemRandom};
-use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::RsaPrivateKey;
 use std::sync::Arc;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Self-delimiting transform frame: every non-passthrough `process_write`
 /// image is prefixed `[u32 LE word]` where `word = image_len |
@@ -40,10 +40,24 @@ const ENCRYPT_HEADER_PREFIX_LEN: usize = 3;
 const NONCE_LEN: usize = 12;
 
 /// §5.7: conservative wrapped-key bound for scratch sizing when no
-/// prewrapped session-key blob exists at pool-init time — an RSA-4096 OAEP
-/// wrap (a 256 B RSA-2048 assumption would silently push 4096-bit-key
-/// configs onto the overflow bounce the pool exists to avoid).
+/// prewrapped session-key blob exists at pool-init time. KW-1 wraps are
+/// [`WRAP_V2_LEN`] = 63 B, but this bound also sizes the ON-DISK geometry
+/// gate ([`CryptoCompressState::max_stored_image_len`], which decides the
+/// format-time `block_size` clamp), so it stays at the retired RSA-4096
+/// value this wave: shrinking it moves the clamp, i.e. it is an on-disk
+/// change owed to the Phase-8 reformat window
+/// (`docs/design-key-handling.md` §7).
 const WRAPPED_KEY_LEN_FALLBACK: usize = 512;
+
+/// KW-1 wrap-blob layout (`docs/design-key-handling.md` §2):
+/// `"SK" ‖ version ‖ nonce(12) ‖ AEAD_seal(KEK, aad = key_id, data key)`.
+const WRAP_MAGIC: [u8; 2] = *b"SK";
+const WRAP_VERSION_V2: u8 = 2;
+const WRAP_PREFIX_LEN: usize = 3;
+/// The AEAD data key both supported record algorithms take.
+const DATA_KEY_LEN: usize = 32;
+/// Total wrap-blob length: prefix + nonce + ciphertext + tag.
+const WRAP_V2_LEN: usize = WRAP_PREFIX_LEN + NONCE_LEN + DATA_KEY_LEN + AEAD_TAG_LEN_MAX;
 
 /// Largest AEAD tag either supported algorithm emits (AES-256-GCM and
 /// ChaCha20-Poly1305 are both 16 B) — the conservative term in
@@ -54,8 +68,9 @@ const AEAD_TAG_LEN_MAX: usize = 16;
 /// (compressed/encrypted) volume must reserve inside each allocator chunk
 /// so that a full `block_size` payload stored RAW (the incompressible-
 /// block escape) still fits: frame word + worst-case AEAD envelope
-/// (`[2B wrapped_key_len][1B nonce_len]` + RSA-4096 wrap + nonce + tag =
-/// 547 B), rounded up to one 4 KiB LBA so chunk-interior windows stay
+/// (`[2B wrapped_key_len][1B nonce_len]` + the conservative
+/// [`WRAPPED_KEY_LEN_FALLBACK`] wrap + nonce + tag = 547 B), rounded up to
+/// one 4 KiB LBA so chunk-interior windows stay
 /// O_DIRECT-aligned. `format` clamps `block_size` to
 /// `CHUNK_SIZE - TRANSFORM_BLOCK_HEADROOM` on transformed volumes; mounts
 /// refuse transformed volumes whose geometry cannot satisfy it (pre-fix
@@ -63,7 +78,8 @@ const AEAD_TAG_LEN_MAX: usize = 16;
 pub const TRANSFORM_BLOCK_HEADROOM: u64 = 4096;
 
 // The headroom must cover the worst-case non-payload bytes of a stored
-// raw-escape image (frame + AEAD header + RSA-4096 wrap + nonce + tag).
+// raw-escape image (frame + AEAD header + the conservative wrap bound +
+// nonce + tag).
 const _: () = assert!(
     TRANSFORM_BLOCK_HEADROOM as usize
         >= FRAME_LEN_BYTES
@@ -81,12 +97,15 @@ pub enum CompressionMode {
     Zstd,
 }
 
-/// Resolved encryption mode (P2-3).
+/// Resolved encryption mode (P2-3). The record cipher; the key-wrap
+/// scheme is named by [`crate::keyfile::EncryptKeyRef::scheme`], not here
+/// (KW-1 — the `-rsa` spellings are deprecated aliases retained only so a
+/// pre-KW-1 config still parses far enough to be refused precisely).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncryptMode {
     None,
-    Aes256GcmRsa,
-    ChaCha20Rsa,
+    Aes256Gcm,
+    ChaCha20,
 }
 
 impl CompressionMode {
@@ -106,19 +125,31 @@ impl EncryptMode {
     pub fn parse(s: &str) -> Result<Self, SqueezefsError> {
         match s.trim() {
             "none" | "" => Ok(Self::None),
-            "aes256gcm-rsa" => Ok(Self::Aes256GcmRsa),
-            "chacha20-rsa" => Ok(Self::ChaCha20Rsa),
+            // The `-rsa` spellings are the pre-KW-1 on-disk names: the
+            // record cipher was always this AEAD; only the wrap changed.
+            "aes256gcm" | "aes256gcm-rsa" => Ok(Self::Aes256Gcm),
+            "chacha20" | "chacha20-rsa" => Ok(Self::ChaCha20),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "Unsupported encryption algo: {other}"
             ))),
         }
     }
 
+    /// The canonical spelling `format` persists (KW-1 — never a `-rsa`
+    /// name on a volume this binary formats).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Aes256Gcm => "aes256gcm",
+            Self::ChaCha20 => "chacha20",
+        }
+    }
+
     fn algorithm(self) -> Option<&'static ring::aead::Algorithm> {
         match self {
             Self::None => None,
-            Self::Aes256GcmRsa => Some(&AES_256_GCM),
-            Self::ChaCha20Rsa => Some(&CHACHA20_POLY1305),
+            Self::Aes256Gcm => Some(&AES_256_GCM),
+            Self::ChaCha20 => Some(&CHACHA20_POLY1305),
         }
     }
 }
@@ -130,11 +161,16 @@ pub struct CryptoCompressState {
     /// Pre-parsed modes for the hot path (P2-3).
     pub compression_mode: CompressionMode,
     pub encrypt_mode: EncryptMode,
-    pub private_key: Option<Arc<RsaPrivateKey>>,
+    /// KW-1: the key-encryption key derived at mount from the operator's
+    /// key file ([`crate::keyfile`]). `None` on plaintext volumes and on
+    /// ad-hoc states; an encrypted state without one refuses every
+    /// transform loud (it must never silently store plaintext).
+    kek: Option<Arc<WrapKey>>,
     pub unwrap_cache: moka::sync::Cache<Vec<u8>, Arc<LessSafeKey>>,
     pub key_unwrap_count: Arc<std::sync::atomic::AtomicUsize>,
-    /// Session data key: RSA-wrapped blob (shared) + raw key bytes for fallback paths.
-    pub prewrapped_key: Option<(Arc<[u8]>, [u8; 32])>,
+    /// Session data key: the wrap blob every block header carries (shared)
+    /// + the raw key bytes for the fallback paths (zeroized on drop).
+    pub prewrapped_key: Option<(Arc<[u8]>, Zeroizing<[u8; DATA_KEY_LEN]>)>,
     pub precomputed_encrypt_key: Option<Arc<LessSafeKey>>,
     /// AEAD tag length for the configured algorithm (0 if encrypt is off).
     pub aead_tag_len: usize,
@@ -148,38 +184,110 @@ pub struct CryptoCompressState {
     scratch_pool: Arc<once_cell::sync::OnceCell<Arc<BufferPool>>>,
 }
 
+/// The key-encryption key: the AEAD built over the KDF-derived KEK plus
+/// the key id that binds every wrap blob as AAD. Never `Debug`-printable.
+struct WrapKey {
+    aead: LessSafeKey,
+    key_id: [u8; 8],
+}
+
+/// VAL-3: nothing that holds key material may print it. A manual `Debug`
+/// (rather than none) also stops a future `#[derive(Debug)]` from
+/// reintroducing the leak.
+impl std::fmt::Debug for CryptoCompressState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CryptoCompressState")
+            .field("compression", &self.compression)
+            .field("encrypt_algo", &self.encrypt_algo)
+            .field("keyed", &self.kek.is_some())
+            .field("key_id", &self.kek.as_ref().map(|k| hex8(&k.key_id)))
+            .field("session_key", &"<redacted>")
+            .finish()
+    }
+}
+
+fn hex8(bytes: &[u8; 8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(16);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// KW-1 wrap: `"SK" ‖ 0x02 ‖ nonce ‖ AEAD_seal(KEK, nonce, aad = key_id,
+/// data key)`. Free function so the constructor can wrap before `Self`
+/// exists.
+fn wrap_with(
+    kek: Option<&WrapKey>,
+    data_key: &[u8; DATA_KEY_LEN],
+) -> Result<Vec<u8>, SqueezefsError> {
+    let kek = kek.ok_or_else(|| {
+        SqueezefsError::InvalidOperation(
+            "no encryption key is configured for this volume: provide it with \
+             `--encrypt-key <path>`, SQUEEZEFS_ENCRYPT_KEY_FILE, or \
+             /etc/squeezefs/keys/<key_id>.key"
+                .to_string(),
+        )
+    })?;
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    SystemRandom::new().fill(&mut nonce_bytes).map_err(|_| {
+        SqueezefsError::InvalidOperation("failed to generate a key-wrap nonce".to_string())
+    })?;
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+    let mut in_out = Vec::with_capacity(DATA_KEY_LEN + AEAD_TAG_LEN_MAX);
+    in_out.extend_from_slice(data_key);
+    kek.aead
+        .seal_in_place_append_tag(nonce, ring::aead::Aad::from(kek.key_id), &mut in_out)
+        .map_err(|_| SqueezefsError::InvalidOperation("key wrap failed".to_string()))?;
+    let mut blob = Vec::with_capacity(WRAP_V2_LEN);
+    blob.extend_from_slice(&WRAP_MAGIC);
+    blob.push(WRAP_VERSION_V2);
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&in_out);
+    debug_assert_eq!(blob.len(), WRAP_V2_LEN, "the KW-1 wrap blob is fixed-width");
+    Ok(blob)
+}
+
 impl CryptoCompressState {
-    pub fn new(compression: String, encrypt_algo: String, private_key_pem: Option<&str>) -> Self {
+    /// `volume_key` is the mount-resolved [`VolumeKey`]
+    /// (`docs/design-key-handling.md` §4) — NEVER a PEM string, and never
+    /// anything that came off `argv` or the volume.
+    pub fn new(
+        compression: String,
+        encrypt_algo: String,
+        volume_key: Option<&VolumeKey>,
+    ) -> Self {
         let compression_mode =
             CompressionMode::parse(&compression).unwrap_or(CompressionMode::None);
         let encrypt_mode = EncryptMode::parse(&encrypt_algo).unwrap_or(EncryptMode::None);
 
-        let private_key = private_key_pem.and_then(|pem| {
-            if pem.is_empty() || pem == "none" {
-                None
-            } else {
-                RsaPrivateKey::from_pkcs1_pem(pem)
-                    .inspect_err(|e| {
-                        log::error!("Failed to parse private key PEM: {:?}", e);
-                    })
-                    .ok()
-                    .map(Arc::new)
-            }
-        });
+        // The wrap rides the volume's OWN record AEAD (one primitive per
+        // volume, KW-1 §2). Ad-hoc/plaintext states carry no KEK.
+        let kek = match (volume_key, encrypt_mode.algorithm()) {
+            (Some(vk), Some(algorithm)) => match UnboundKey::new(algorithm, vk.kek()) {
+                Ok(unbound) => Some(Arc::new(WrapKey {
+                    aead: LessSafeKey::new(unbound),
+                    key_id: *vk.key_id(),
+                })),
+                Err(_) => {
+                    log::error!("failed to build the key-wrap AEAD from the derived KEK");
+                    None
+                }
+            },
+            _ => None,
+        };
 
         let mut prewrapped_key = None;
-        if let Some(ref priv_key) = private_key {
-            if encrypt_mode != EncryptMode::None {
-                let mut key_bytes = [0u8; 32];
-                let mut rng = rand::thread_rng();
-                if SystemRandom::new().fill(&mut key_bytes).is_ok() {
-                    let public_key = priv_key.to_public_key();
-                    if let Ok(wrapped) =
-                        public_key.encrypt(&mut rng, rsa::Oaep::new::<sha2::Sha256>(), &key_bytes)
-                    {
+        if kek.is_some() {
+            let mut key_bytes = Zeroizing::new([0u8; DATA_KEY_LEN]);
+            if SystemRandom::new().fill(key_bytes.as_mut()).is_ok() {
+                match wrap_with(kek.as_deref(), &key_bytes) {
+                    Ok(wrapped) => {
                         let wrapped: Arc<[u8]> = Arc::from(wrapped.into_boxed_slice());
                         prewrapped_key = Some((wrapped, key_bytes));
                     }
+                    Err(e) => log::error!("failed to wrap the session data key: {e}"),
                 }
             }
         }
@@ -189,7 +297,7 @@ impl CryptoCompressState {
         if let Some((_, ref key_bytes)) = prewrapped_key {
             if let Some(algorithm) = encrypt_mode.algorithm() {
                 aead_tag_len = algorithm.tag_len();
-                if let Ok(unbound_key) = UnboundKey::new(algorithm, key_bytes) {
+                if let Ok(unbound_key) = UnboundKey::new(algorithm, key_bytes.as_ref()) {
                     precomputed_encrypt_key = Some(Arc::new(LessSafeKey::new(unbound_key)));
                 }
             }
@@ -208,7 +316,7 @@ impl CryptoCompressState {
             encrypt_algo,
             compression_mode,
             encrypt_mode,
-            private_key,
+            kek,
             unwrap_cache,
             key_unwrap_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             prewrapped_key,
@@ -232,8 +340,9 @@ impl CryptoCompressState {
     }
 
     /// §5.7 on-disk AEAD overhead: `[2B wrapped_key_len][1B nonce_len]`
-    /// header + the ACTUAL prewrapped session-key blob (512 B RSA-4096
-    /// fallback when none exists at pool-init time) + nonce + tag.
+    /// header + the ACTUAL prewrapped session-key blob
+    /// ([`WRAPPED_KEY_LEN_FALLBACK`] when none exists at pool-init time —
+    /// a KW-1 wrap is [`WRAP_V2_LEN`]) + nonce + tag.
     fn scratch_encrypt_overhead(&self) -> usize {
         if self.encrypt_mode == EncryptMode::None {
             return 0;
@@ -259,8 +368,8 @@ impl CryptoCompressState {
     /// `payload_len`-byte payload. With the store-raw escape the
     /// compression term never exceeds the raw payload, so the bound is
     /// `frame + worst-case AEAD envelope + payload`. Deliberately
-    /// CONSERVATIVE on the wrapped-key term (RSA-4096 fallback, never the
-    /// session blob actually present in THIS process): readers size their
+    /// CONSERVATIVE on the wrapped-key term ([`WRAPPED_KEY_LEN_FALLBACK`],
+    /// never the blob actually present in THIS process): readers size their
     /// device windows with it, and a window must cover any writer's
     /// output regardless of which process wrote the block. Passthrough
     /// states store byte-identical payloads (no frame).
@@ -388,11 +497,78 @@ impl CryptoCompressState {
         }
     }
 
-    /// Resolve the RSA-wrapped data-key blob + AEAD key for a write —
-    /// session-key fast path (P2-3: reuse RSA-wrapped blob + precomputed
+    /// KW-1: wrap a 32-byte session data key under this volume's KEK. The
+    /// blob is what every block header carries; it is versioned and bound
+    /// to the key id as AAD, so a blob from another volume fails the tag
+    /// check instead of unwrapping to a wrong key.
+    pub fn wrap_session_key(
+        &self,
+        data_key: &[u8; DATA_KEY_LEN],
+    ) -> Result<Vec<u8>, SqueezefsError> {
+        wrap_with(self.kek.as_deref(), data_key)
+    }
+
+    /// KW-1 inverse. Refuses an unknown version, a short blob, a foreign
+    /// key and a tampered blob — never panics on attacker-shaped bytes.
+    pub fn unwrap_session_key(
+        &self,
+        blob: &[u8],
+    ) -> Result<Zeroizing<[u8; DATA_KEY_LEN]>, SqueezefsError> {
+        let kek = self.kek.as_deref().ok_or_else(|| {
+            SqueezefsError::InvalidOperation(
+                "no encryption key is configured for this volume: provide it with \
+                 `--encrypt-key <path>`, SQUEEZEFS_ENCRYPT_KEY_FILE, or \
+                 /etc/squeezefs/keys/<key_id>.key"
+                    .to_string(),
+            )
+        })?;
+        if blob.len() < WRAP_PREFIX_LEN + NONCE_LEN || blob[..2] != WRAP_MAGIC {
+            return Err(SqueezefsError::InvalidOperation(
+                "malformed key-wrap blob in the block header".to_string(),
+            ));
+        }
+        if blob[2] != WRAP_VERSION_V2 {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "unsupported key-wrap version {} in the block header (this binary \
+                 implements version {WRAP_VERSION_V2})",
+                blob[2]
+            )));
+        }
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        nonce_bytes.copy_from_slice(&blob[WRAP_PREFIX_LEN..WRAP_PREFIX_LEN + NONCE_LEN]);
+        let mut in_out = blob[WRAP_PREFIX_LEN + NONCE_LEN..].to_vec();
+        let plain = kek
+            .aead
+            .open_in_place(
+                Nonce::assume_unique_for_key(nonce_bytes),
+                ring::aead::Aad::from(kek.key_id),
+                &mut in_out,
+            )
+            .map_err(|_| {
+                SqueezefsError::InvalidOperation(
+                    "key unwrap failed: this block was written under a different \
+                     encryption key (or the header is corrupt)"
+                        .to_string(),
+                )
+            })?;
+        if plain.len() != DATA_KEY_LEN {
+            in_out.zeroize();
+            return Err(SqueezefsError::InvalidOperation(
+                "key unwrap produced a data key of the wrong length".to_string(),
+            ));
+        }
+        let mut out = Zeroizing::new([0u8; DATA_KEY_LEN]);
+        out.copy_from_slice(plain);
+        in_out.zeroize();
+        Ok(out)
+    }
+
+    /// Resolve the wrapped data-key blob + AEAD key for a write —
+    /// session-key fast path (P2-3: reuse the wrap blob + precomputed
     /// `LessSafeKey`) or the per-write wrap fallback. Shared by the heap
-    /// `encrypt` and the §5.7 pooled scratch path.
-    fn resolve_encrypt_key(&self) -> Result<(Arc<[u8]>, Arc<LessSafeKey>), SqueezefsError> {
+    /// `encrypt` and the §5.7 pooled scratch path; `pub` because it is
+    /// also the microbenched cached-resolve fast path.
+    pub fn resolve_encrypt_key(&self) -> Result<(Arc<[u8]>, Arc<LessSafeKey>), SqueezefsError> {
         if let Some(ref key) = self.precomputed_encrypt_key {
             let wrapped = self
                 .prewrapped_key
@@ -406,27 +582,14 @@ impl CryptoCompressState {
             return Ok((wrapped, key.clone()));
         }
 
-        let (wrapped_key, key_bytes) = if let Some((ref wrapped, key)) = self.prewrapped_key {
-            (wrapped.clone(), key)
+        let (wrapped_key, key_bytes) = if let Some((ref wrapped, ref key)) = self.prewrapped_key {
+            (wrapped.clone(), key.clone())
         } else {
-            let mut key_bytes = [0u8; 32];
-            SystemRandom::new().fill(&mut key_bytes).map_err(|_| {
+            let mut key_bytes = Zeroizing::new([0u8; DATA_KEY_LEN]);
+            SystemRandom::new().fill(key_bytes.as_mut()).map_err(|_| {
                 SqueezefsError::InvalidOperation("Failed to generate random data key".to_string())
             })?;
-
-            let private_key = self.private_key.as_ref().ok_or_else(|| {
-                SqueezefsError::InvalidOperation(
-                    "RSA Private Key is required for encryption but not configured".to_string(),
-                )
-            })?;
-            let public_key = private_key.to_public_key();
-
-            let mut rng = rand::thread_rng();
-            let wrapped_key = public_key
-                .encrypt(&mut rng, rsa::Oaep::new::<sha2::Sha256>(), &key_bytes)
-                .map_err(|e| {
-                    SqueezefsError::InvalidOperation(format!("RSA key wrap failed: {:?}", e))
-                })?;
+            let wrapped_key = self.wrap_session_key(&key_bytes)?;
             (Arc::from(wrapped_key.into_boxed_slice()), key_bytes)
         };
 
@@ -437,7 +600,7 @@ impl CryptoCompressState {
             ))
         })?;
 
-        let unbound_key = UnboundKey::new(algorithm, &key_bytes).map_err(|_| {
+        let unbound_key = UnboundKey::new(algorithm, key_bytes.as_ref()).map_err(|_| {
             SqueezefsError::InvalidOperation("Failed to create unbound key".to_string())
         })?;
         Ok((wrapped_key, Arc::new(LessSafeKey::new(unbound_key))))
@@ -510,16 +673,7 @@ impl CryptoCompressState {
         let less_safe_key = if let Some(cached_key) = self.unwrap_cache.get(wrapped_key) {
             cached_key
         } else {
-            let private_key = self.private_key.as_ref().ok_or_else(|| {
-                SqueezefsError::InvalidOperation(
-                    "RSA Private Key is required for decryption but not configured".to_string(),
-                )
-            })?;
-            let decrypted_key = private_key
-                .decrypt(rsa::Oaep::new::<sha2::Sha256>(), wrapped_key)
-                .map_err(|e| {
-                    SqueezefsError::InvalidOperation(format!("RSA key unwrap failed: {:?}", e))
-                })?;
+            let decrypted_key = self.unwrap_session_key(wrapped_key)?;
 
             let algorithm = self.encrypt_mode.algorithm().ok_or_else(|| {
                 SqueezefsError::InvalidOperation(format!(
@@ -528,7 +682,7 @@ impl CryptoCompressState {
                 ))
             })?;
 
-            let unbound_key = UnboundKey::new(algorithm, &decrypted_key).map_err(|_| {
+            let unbound_key = UnboundKey::new(algorithm, decrypted_key.as_ref()).map_err(|_| {
                 SqueezefsError::InvalidOperation("Failed to create unbound key".to_string())
             })?;
             let key = Arc::new(LessSafeKey::new(unbound_key));
@@ -822,7 +976,15 @@ impl CryptoCompressState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsa::pkcs1::EncodeRsaPrivateKey;
+
+    /// The mount-resolved volume key every keyed test uses (KW-1: derived
+    /// from operator key material + the volume's KDF salt, never a PEM).
+    fn test_key() -> crate::keyfile::VolumeKey {
+        let material =
+            crate::keyfile::KeyMaterial::from_bytes(b"unit-test-key-material-0123456789".to_vec())
+                .expect("material");
+        crate::keyfile::derive_volume_key(&material, &[0x11u8; 32])
+    }
 
     /// Frame an image the way the writers do (test-side reference).
     fn framed(image: &[u8]) -> Vec<u8> {
@@ -842,22 +1004,19 @@ mod tests {
 
     #[test]
     fn test_crypto_unwrap_caching() {
-        let mut rng = rand::thread_rng();
-        let priv_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let pem = priv_key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap();
-
+        let key = test_key();
         let state =
-            CryptoCompressState::new("none".to_string(), "aes256gcm-rsa".to_string(), Some(&pem));
+            CryptoCompressState::new("none".to_string(), "aes256gcm".to_string(), Some(&key));
         let data = b"some block payload";
 
         assert!(state.precomputed_encrypt_key.is_some());
         assert!(state.prewrapped_key.is_some());
         assert!(state.aead_tag_len > 0);
-        assert_eq!(state.encrypt_mode, EncryptMode::Aes256GcmRsa);
+        assert_eq!(state.encrypt_mode, EncryptMode::Aes256Gcm);
 
         let encrypted = state.encrypt(data).unwrap();
 
-        // First decryption: should miss cache and decrypt via RSA
+        // First decryption: should miss the cache and unwrap
         let decrypted1 = state.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted1, data);
         assert_eq!(
@@ -867,7 +1026,7 @@ mod tests {
             1
         );
 
-        // Second decryption: should hit cache and bypass RSA decryption
+        // Second decryption: should hit the cache and bypass the unwrap
         let decrypted2 = state.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted2, data);
         assert_eq!(
@@ -880,16 +1039,14 @@ mod tests {
 
     #[test]
     fn test_session_key_reused_across_encrypts() {
-        let mut rng = rand::thread_rng();
-        let priv_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let pem = priv_key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap();
+        let key = test_key();
         let state =
-            CryptoCompressState::new("none".to_string(), "aes256gcm-rsa".to_string(), Some(&pem));
+            CryptoCompressState::new("none".to_string(), "aes256gcm".to_string(), Some(&key));
 
         let a = state.encrypt(b"block-a").unwrap();
         let b = state.encrypt(b"block-b").unwrap();
 
-        // Same RSA-wrapped session key prefix (2-byte len + wrapped key bytes).
+        // Same wrapped session-key prefix (2-byte len + wrap blob bytes).
         let wrap_len = ((a[0] as usize) << 8) + (a[1] as usize);
         assert_eq!(&a[3..3 + wrap_len], &b[3..3 + wrap_len]);
         // Nonces/ciphertexts differ.
@@ -922,7 +1079,7 @@ mod tests {
         assert_eq!(CompressionMode::parse("lz4").unwrap(), CompressionMode::Lz4);
         assert_eq!(
             EncryptMode::parse("chacha20-rsa").unwrap(),
-            EncryptMode::ChaCha20Rsa
+            EncryptMode::ChaCha20
         );
         assert!(CompressionMode::parse("bogus").is_err());
     }
@@ -945,7 +1102,8 @@ mod tests {
     //  - pool buffers are sized at init as worst_case(block_size) =
     //    on-disk header ([2B wrapped_key_len][1B nonce_len][wrapped_key]
     //    [nonce]) with the ACTUAL prewrapped key blob length (512 B
-    //    RSA-4096 fallback when none exists at pool-init time) + nonce
+    //    conservative WRAPPED_KEY_LEN_FALLBACK when none exists at
+    //    pool-init time) + nonce
     //    (12 B) + max(4-byte-prefixed lz4 maximum output, zstd compress
     //    bound) + AEAD tag, rounded up to the next 4 KiB;
     //  - pooled lz4 output is BYTE-IDENTICAL to `compress_prepend_size`
@@ -966,16 +1124,9 @@ mod tests {
 
     use rstest::rstest;
 
-    /// One RSA-2048 keypair for every scratch-pool test (keygen is the
-    /// slow part; the tests pin transform behavior, not keygen).
-    static TEST_PEM: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
-        let mut rng = rand::thread_rng();
-        RsaPrivateKey::new(&mut rng, 2048)
-            .unwrap()
-            .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
-            .unwrap()
-            .to_string()
-    });
+    /// One mount-resolved volume key for every scratch-pool test.
+    static TEST_KEY: once_cell::sync::Lazy<crate::keyfile::VolumeKey> =
+        once_cell::sync::Lazy::new(test_key);
 
     /// Deterministic high-entropy filler (no rand dependency on content).
     fn lcg_bytes(len: usize, mut seed: u64) -> Vec<u8> {
@@ -1029,18 +1180,15 @@ mod tests {
     #[test]
     fn test_scratch_pool_sizing_uses_actual_prewrapped_key_blob() {
         let bs = 256 * 1024;
-        let state = CryptoCompressState::new(
-            "lz4".to_string(),
-            "aes256gcm-rsa".to_string(),
-            Some(&TEST_PEM),
-        );
+        let state =
+            CryptoCompressState::new("lz4".to_string(), "aes256gcm".to_string(), Some(&TEST_KEY));
         let wrapped_len = state
             .prewrapped_key
             .as_ref()
-            .expect("session key must prewrap with a private key configured")
+            .expect("session key must prewrap with a volume key configured")
             .0
             .len();
-        assert_eq!(wrapped_len, 256, "RSA-2048 wrap must be 256 bytes");
+        assert_eq!(wrapped_len, WRAP_V2_LEN, "the KW-1 wrap is a fixed 63 bytes");
 
         state.init_scratch_pool(bs);
         let buf_len = state
@@ -1062,20 +1210,21 @@ mod tests {
     }
 
     #[test]
-    fn test_scratch_pool_sizing_falls_back_to_512b_rsa4096_wrap() {
-        // Encryption configured but no private key at pool-init time: no
-        // prewrapped blob exists, so sizing must assume a 512 B RSA-4096
-        // wrap (a 256 B RSA-2048 assumption would silently push
-        // 4096-bit-key configs onto the overflow bounce).
+    fn test_scratch_pool_sizing_falls_back_to_the_conservative_wrap_bound() {
+        // Encryption configured but no volume key at pool-init time: no
+        // prewrapped blob exists, so sizing must assume the conservative
+        // WRAPPED_KEY_LEN_FALLBACK (the geometry bound readers size their
+        // device windows with — see its doc comment).
         let bs = 256 * 1024;
-        let state = CryptoCompressState::new("lz4".to_string(), "aes256gcm-rsa".to_string(), None);
+        let state = CryptoCompressState::new("lz4".to_string(), "aes256gcm".to_string(), None);
         assert!(state.prewrapped_key.is_none());
         state.init_scratch_pool(bs);
         let compress_term = std::cmp::max(
             4 + lz4_flex::block::get_maximum_output_size(bs),
             zstd::zstd_safe::compress_bound(bs),
         );
-        let expected = (compress_term + 3 + 512 + 12 + state.aead_tag_len).next_multiple_of(4096);
+        let expected = (compress_term + 3 + WRAPPED_KEY_LEN_FALLBACK + 12 + state.aead_tag_len)
+            .next_multiple_of(4096);
         assert_eq!(state.scratch_pool_buf_len(), Some(expected));
     }
 
@@ -1154,10 +1303,10 @@ mod tests {
     #[rstest]
     #[case::lz4("lz4", "none")]
     #[case::zstd("zstd", "none")]
-    #[case::aes("none", "aes256gcm-rsa")]
-    #[case::chacha("none", "chacha20-rsa")]
-    #[case::lz4_aes("lz4", "aes256gcm-rsa")]
-    #[case::zstd_chacha("zstd", "chacha20-rsa")]
+    #[case::aes("none", "aes256gcm")]
+    #[case::chacha("none", "chacha20")]
+    #[case::lz4_aes("lz4", "aes256gcm")]
+    #[case::zstd_chacha("zstd", "chacha20")]
     fn test_pre_scratch_volume_read_back_parity(#[case] comp: &str, #[case] enc: &str) {
         // Heap-vs-pooled writer parity through the framed read path, plus
         // the forward-only legacy rule: an UNFRAMED pre-framing blob (the
@@ -1166,12 +1315,12 @@ mod tests {
         // and a sniffing shim is exactly what the standing directive
         // forbids.
         let bs = 128 * 1024;
-        let pem = if enc == "none" {
+        let key = if enc == "none" {
             None
         } else {
-            Some(TEST_PEM.as_str())
+            Some(&*TEST_KEY)
         };
-        let state = CryptoCompressState::new(comp.to_string(), enc.to_string(), pem);
+        let state = CryptoCompressState::new(comp.to_string(), enc.to_string(), key);
         state.init_scratch_pool(bs);
         let payload = mixed_payload(96 * 1024);
 
@@ -1221,8 +1370,8 @@ mod tests {
         let bs = 256 * 1024;
         let state = CryptoCompressState::new(
             "lz4".to_string(),
-            "aes256gcm-rsa".to_string(),
-            Some(&TEST_PEM),
+            "aes256gcm".to_string(),
+            Some(&TEST_KEY),
         );
         state.init_scratch_pool(bs);
         let cap0 = pool_len(&state);
@@ -1291,8 +1440,8 @@ mod tests {
         let bs = 64 * 1024;
         let state = CryptoCompressState::new(
             "lz4".to_string(),
-            "aes256gcm-rsa".to_string(),
-            Some(&TEST_PEM),
+            "aes256gcm".to_string(),
+            Some(&TEST_KEY),
         );
         state.init_scratch_pool(bs);
         let cap0 = pool_len(&state);
@@ -1338,8 +1487,8 @@ mod tests {
         let bs = 128 * 1024;
         let state = CryptoCompressState::new(
             "zstd".to_string(),
-            "chacha20-rsa".to_string(),
-            Some(&TEST_PEM),
+            "chacha20".to_string(),
+            Some(&TEST_KEY),
         );
         state.init_scratch_pool(bs);
         let pristine = mixed_payload(bs);
@@ -1389,8 +1538,8 @@ mod tests {
         let bs = 128 * 1024;
         let state = CryptoCompressState::new(
             "lz4".to_string(),
-            "aes256gcm-rsa".to_string(),
-            Some(&TEST_PEM),
+            "aes256gcm".to_string(),
+            Some(&TEST_KEY),
         );
         state.init_scratch_pool(bs);
         let payload = mixed_payload(64 * 1024);

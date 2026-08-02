@@ -116,6 +116,7 @@ fn base_format_config(data_lvs: &[&Path]) -> FormatConfig {
         compression: "none".to_string(),
         encrypt_algo: "none".to_string(),
         encrypt_key: None,
+        encrypt_key_ref: None,
         mem_cache_size: None,
         disk_cache_size: None,
         disk_cache_paths: None,

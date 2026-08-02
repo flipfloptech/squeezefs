@@ -100,11 +100,19 @@ enum Commands {
         /// Compression algorithm (lz4, zstd, none, default: none)
         #[arg(long, default_value = "none")]
         compression: String,
-        /// Encryption algorithm (aes256gcm-rsa, chacha20-rsa, none, default: none)
+        /// Encryption algorithm (aes256gcm, chacha20, none, default: none)
         #[arg(long, default_value = "none")]
         encrypt_algo: String,
-        /// Path to RSA private key PEM file for client-side encryption
-        #[arg(long)]
+        /// Path to the encryption key FILE (or "-" to read it from stdin)
+        ///
+        /// The file must hold at least 32 bytes of key material (not a
+        /// passphrase) and be mode 0600, owned by you:
+        /// `head -c 32 /dev/urandom | base64 > key && chmod 600 key`.
+        /// The key NEVER lands on the volume — only a KDF salt and a key
+        /// id are persisted — and it is never passed on argv. Keep the
+        /// file: mount needs it (`--encrypt-key`,
+        /// SQUEEZEFS_ENCRYPT_KEY_FILE, or /etc/squeezefs/keys/<id>.key).
+        #[arg(long, value_name = "PATH")]
         encrypt_key: Option<String>,
         /// Seconds to wait for staged writes to drain on dismount
         ///
@@ -493,6 +501,17 @@ enum Commands {
         /// pinning.
         #[arg(long, env = "SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU")]
         fuse_io_uring_sqpoll_cpu: Option<u32>,
+
+        // Anchor: docs/design-key-handling.md §4 (VAL-3 — the key
+        // resolves at mount; the volume stores only a salt and an id).
+        /// Path to the encryption key FILE for an encrypted volume
+        ///
+        /// Required to mount a volume formatted with --encrypt-algo,
+        /// unless the key is at SQUEEZEFS_ENCRYPT_KEY_FILE or
+        /// /etc/squeezefs/keys/<key_id>.key. "-" reads it from stdin
+        /// (read before --daemon forks). Mode 0600, owned by you.
+        #[arg(long, value_name = "PATH")]
+        encrypt_key: Option<String>,
 
         /// Custom FUSE options (comma-separated list, e.g. "ro,nonempty")
         #[arg(short = 'o', long)]
@@ -2363,6 +2382,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // VAL-3 (docs/design-key-handling.md §3/§4): read the encryption key
+    // material HERE — in the parent, before `--daemon` forks — so `-`
+    // (stdin) works for daemonized mounts and so a bad key file fails on
+    // the caller's console instead of over the handshake pipe. What
+    // crosses the fork is the material in memory, never argv, never the
+    // volume. The parent clears its copy the moment the child owns one.
+    #[cfg(unix)]
+    if let Commands::Mount {
+        encrypt_key: Some(spec),
+        ..
+    } = &cli.command
+    {
+        match squeezefs::keyfile::read_key_source(spec) {
+            Ok(material) => squeezefs::keyfile::stash_key_material(material),
+            Err(msg) => {
+                eprintln!("Error: {msg}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     #[cfg(unix)]
     if let Commands::Mount {
         ref args,
@@ -2407,6 +2447,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // whenever the child had not been reaped yet (the
                 // live-diagnosed non-empty-mountpoint symptom).
                 libc::close(pipefd[1]);
+
+                // VAL-3/VAL-7h: the child owns the key material now; the
+                // waiting parent must not keep a copy alive.
+                squeezefs::keyfile::clear_key_material();
 
                 let mut child_output = String::new();
                 let mut ready = false;
@@ -2797,6 +2841,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         };
+
+        // VAL-3 (docs/design-key-handling.md §4/§6): resolve the
+        // encryption key BEFORE any runtime or FUSE machinery spins up —
+        // a pre-KW-1 (RSA-wrap) volume refuses loud with its remedy, and a
+        // missing/wrong key file names every source instead of failing
+        // every read later. The resolved key is re-derived at FUSE init
+        // from the same sources (the material crossed the fork in
+        // memory), so this is a preflight, not the only gate.
+        if let Err(msg) = squeezefs::keyfile::mount_volume_key(&format_config) {
+            mount_bootstrap_fail(&msg);
+        }
 
         let resolved_mem_cache_size = mem_cache_size
             .as_deref()
@@ -3415,6 +3470,50 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .into());
             }
+
+            // VAL-3 + KW-1 (docs/design-key-handling.md): the key comes
+            // from a FILE (or stdin), never from argv, and only its KDF
+            // salt + key id are ever persisted. Resolved BEFORE any
+            // destructive step so a bad key file costs nothing.
+            let encrypt_mode = squeezefs::crypto_compress::EncryptMode::parse(&encrypt_algo)
+                .map_err(|e| e.to_string())?;
+            let canonical_encrypt_algo = encrypt_mode.as_str().to_string();
+            let encrypt_key_ref = if encrypt_mode
+                != squeezefs::crypto_compress::EncryptMode::None
+            {
+                let spec = encrypt_key.as_deref().ok_or_else(|| {
+                    format!(
+                        "--encrypt-algo {canonical_encrypt_algo} requires --encrypt-key \
+                         <path> (the path to a key FILE, or \"-\" to read the key from \
+                         stdin). Generate one with `head -c 32 /dev/urandom | base64 > \
+                         volume.key && chmod 600 volume.key`. The key never lands on the \
+                         volume and never rides argv — keep the file: mount needs it."
+                    )
+                })?;
+                let material = squeezefs::keyfile::read_key_source(spec)?;
+                let salt = squeezefs::keyfile::new_kdf_salt();
+                let volume_key = squeezefs::keyfile::derive_volume_key(&material, &salt);
+                let key_id = volume_key.key_id_hex();
+                println!(
+                    "Encryption: {canonical_encrypt_algo}, key id {key_id} (wrap scheme \
+                     {}).\n  The key file is NOT stored on the volume — only a KDF salt \
+                     and this id are.\n  To mount: `--encrypt-key <path>`, \
+                     `{}=<path>`, or place the same key file at {}.",
+                    squeezefs::keyfile::KEY_WRAP_SCHEME_V2,
+                    squeezefs::keyfile::KEY_FILE_ENV,
+                    squeezefs::keyfile::default_key_path(&key_id).display(),
+                );
+                Some(squeezefs::keyfile::make_key_ref(&salt, &volume_key))
+            } else {
+                if encrypt_key.is_some() {
+                    return Err("--encrypt-key was given but --encrypt-algo is \"none\": \
+                                nothing would be encrypted. Pass --encrypt-algo \
+                                aes256gcm (or chacha20), or drop --encrypt-key."
+                        .into());
+                }
+                None
+            };
+
             let mut meta_lvs = Vec::new();
             let mut data_lvs = Vec::new();
 
@@ -3530,9 +3629,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let transform_active = squeezefs::crypto_compress::CompressionMode::parse(&compression)
                 .map_err(|e| e.to_string())?
                 != squeezefs::crypto_compress::CompressionMode::None
-                || squeezefs::crypto_compress::EncryptMode::parse(&encrypt_algo)
-                    .map_err(|e| e.to_string())?
-                    != squeezefs::crypto_compress::EncryptMode::None;
+                || encrypt_mode != squeezefs::crypto_compress::EncryptMode::None;
             let transform_cap = chunk - squeezefs::crypto_compress::TRANSFORM_BLOCK_HEADROOM;
             let parsed_block_size = if transform_active && requested_block_size > transform_cap {
                 println!(
@@ -3553,8 +3650,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 capacity: total_capacity,
                 inodes,
                 compression: compression.clone(),
-                encrypt_algo: encrypt_algo.clone(),
-                encrypt_key: encrypt_key.clone(),
+                // KW-1: the canonical spelling, never a `-rsa` name.
+                encrypt_algo: canonical_encrypt_algo.clone(),
+                // VAL-3: key MATERIAL never reaches the volume — this
+                // legacy field is write-never (skip_serializing) and only
+                // the salt + id below are persisted.
+                encrypt_key: None,
+                encrypt_key_ref: encrypt_key_ref.clone(),
                 mem_cache_size: mem_cache_size.clone(),
                 disk_cache_size: disk_cache_size.clone(),
                 disk_cache_paths: disk_cache_paths.clone(),
@@ -3767,7 +3869,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 parsed_block_size,
                 total_capacity,
                 &compression,
-                &encrypt_algo,
+                &canonical_encrypt_algo,
                 &meta_lvs,
                 &data_lvs,
                 resolved_mem,
@@ -4281,6 +4383,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             job_cpu_limit,
             write_verification: _,
             write_verification_sample: _,
+            // VAL-3: consumed pre-fork in `main` (the material crossed
+            // into this process in memory, never on argv); the resolution
+            // itself happens against the volume's key reference.
+            encrypt_key: _,
         } => {
             let (meta_lvs, mountpoint) = if let Some(ref m_lvs) = meta_lv {
                 if args.is_empty() {

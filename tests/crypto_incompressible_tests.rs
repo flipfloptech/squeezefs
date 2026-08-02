@@ -94,7 +94,7 @@ async fn make(
     staging: bool,
     comp: &str,
     enc: &str,
-    pem: Option<&str>,
+    volume_key: Option<&squeezefs::keyfile::VolumeKey>,
     block_size: u64,
 ) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", block_size.to_string());
@@ -149,7 +149,7 @@ async fn make(
     fs.router.set_crypto(CryptoCompressState::new(
         comp.to_string(),
         enc.to_string(),
-        pem,
+        volume_key,
     ));
     let req = Request {
         unique: 1,
@@ -316,14 +316,14 @@ async fn incompressible_zstd_striped_cold_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn incompressible_lz4_aes_striped_cold_roundtrip() {
     let _g = serial().await;
-    let pem = test_pem();
+    let volume_key = test_volume_key();
     let h = make(
         *b"rw4a-l4a-0000001",
         "rw4a_lz4_aes",
         false,
         "lz4",
-        "aes256gcm-rsa",
-        Some(&pem),
+        "aes256gcm",
+        Some(&volume_key),
         BS_SMALL,
     )
     .await;
@@ -333,14 +333,14 @@ async fn incompressible_lz4_aes_striped_cold_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn incompressible_zstd_chacha_striped_cold_roundtrip() {
     let _g = serial().await;
-    let pem = test_pem();
+    let volume_key = test_volume_key();
     let h = make(
         *b"rw4a-zch-0000001",
         "rw4a_zstd_cha",
         false,
         "zstd",
-        "chacha20-rsa",
-        Some(&pem),
+        "chacha20",
+        Some(&volume_key),
         BS_SMALL,
     )
     .await;
@@ -353,14 +353,14 @@ async fn incompressible_zstd_chacha_striped_cold_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn incompressible_aes_only_striped_cold_roundtrip() {
     let _g = serial().await;
-    let pem = test_pem();
+    let volume_key = test_volume_key();
     let h = make(
         *b"rw4a-aes-0000001",
         "rw4a_aes_only",
         false,
         "none",
-        "aes256gcm-rsa",
-        Some(&pem),
+        "aes256gcm",
+        Some(&volume_key),
         BS_SMALL,
     )
     .await;
@@ -682,6 +682,7 @@ async fn set_format_config(h: &H, block_size: u64, comp: &str, enc: &str) {
         compression: comp.to_string(),
         encrypt_algo: enc.to_string(),
         encrypt_key: None,
+        encrypt_key_ref: None,
         mem_cache_size: None,
         disk_cache_size: None,
         disk_cache_paths: None,
@@ -834,11 +835,13 @@ async fn failed_incompressible_upload_keeps_old_data() {
     assert_eq!(cold, expected, "v2 must be durable + cold-readable");
 }
 
-fn test_pem() -> String {
-    use rsa::pkcs1::EncodeRsaPrivateKey;
-    let mut rng = rand::thread_rng();
-    let key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
-    key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
-        .unwrap()
-        .to_string()
+/// The mount-resolved volume key these tests encrypt under (KW-1: the
+/// operator's key file material + the volume's KDF salt — never a PEM;
+/// `docs/design-key-handling.md`).
+fn test_volume_key() -> squeezefs::keyfile::VolumeKey {
+    let material = squeezefs::keyfile::KeyMaterial::from_bytes(
+        b"squeezefs-test-key-material-0123456789".to_vec(),
+    )
+    .expect("test key material");
+    squeezefs::keyfile::derive_volume_key(&material, &[0x33u8; 32])
 }

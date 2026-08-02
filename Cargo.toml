@@ -76,8 +76,12 @@ dhat = { version = "0.3.3", optional = true }
 coz = { version = "0.1", optional = true }
 lz4_flex = "0.11"
 zstd = "0.13"
-rsa = { version = "0.9", features = ["pem"] }
+# KW-1 / ruling D3: the RSA key-wrap primitive (`rsa 0.9`, RUSTSEC-2023-0071
+# "Marvin", no fixed release in the 0.9 line) was REPLACED, not adjudicated —
+# the wrap is now HKDF-SHA-256 -> the volume's own AEAD, both from `ring`
+# (docs/design-key-handling.md §2). Do not reintroduce `rsa`.
 ring = "0.17"
+zeroize = "1"
 rand = "0.8"
 sha2 = "0.10"
 hmac = "0.12"

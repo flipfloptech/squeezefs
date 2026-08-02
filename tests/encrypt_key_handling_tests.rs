@@ -448,7 +448,7 @@ fn a_pre_kw1_encrypted_volume_refuses_with_an_exact_remedy() {
         );
     }
     assert!(
-        msg.contains("cleartext"),
+        msg.to_lowercase().contains("cleartext") && msg.to_lowercase().contains("compromised"),
         "a config that carried the key must say the key is compromised:\n{msg}"
     );
     assert!(keyfile::mount_volume_key(&c).is_err());
@@ -552,48 +552,52 @@ fn an_encrypted_volume_with_no_key_source_refuses_naming_every_source() {
 // 7. VAL-7h — a process holding key material is not dumpable
 // ---------------------------------------------------------------------------
 
-/// Runs `f` in a forked child and asserts it exits 0. `harden_process_memory`
-/// is process-global and irreversible, so it must not run in the test
-/// process itself.
-fn in_child(f: impl FnOnce() -> bool) {
-    let pid = unsafe { libc::fork() };
-    assert!(pid >= 0, "fork");
-    if pid == 0 {
-        let ok = f();
-        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
-    }
-    let mut status = 0i32;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
-    let code = if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else {
-        -1
-    };
-    assert_eq!(code, 0, "child assertions failed");
-}
+/// `harden_process_memory` is process-global and (for `RLIMIT_CORE`)
+/// irreversible, so this test re-executes ITSELF in a fresh process rather
+/// than mutating the shared harness process.
+const HARDEN_CHILD_ENV: &str = "SQZ_VAL3_HARDEN_CHILD";
 
 #[test]
 fn handling_key_material_makes_the_process_undumpable_with_no_core() {
-    let d = scratch("harden");
-    let p = key_file(&d, "k", &material_a());
-    in_child(move || {
-        // Baseline: a fresh process IS dumpable.
-        if unsafe { libc::prctl(libc::PR_GET_DUMPABLE) } != 1 {
-            return false;
-        }
-        let _m = keyfile::read_key_file(&p).expect("read");
-        if unsafe { libc::prctl(libc::PR_GET_DUMPABLE) } != 0 {
-            return false;
-        }
+    if let Ok(key_path) = std::env::var(HARDEN_CHILD_ENV) {
+        // --- the fresh child process ---
+        // A process that has not touched key material is dumpable.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_GET_DUMPABLE) },
+            1,
+            "baseline: a process holding no key material is dumpable"
+        );
+        let _m = keyfile::read_key_file(Path::new(&key_path)).expect("read key");
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_GET_DUMPABLE) },
+            0,
+            "reading key material must set PR_SET_DUMPABLE(0)"
+        );
         let mut rl = libc::rlimit {
             rlim_cur: 1,
             rlim_max: 1,
         };
-        if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut rl) } != 0 {
-            return false;
-        }
-        rl.rlim_cur == 0
-    });
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut rl) }, 0);
+        assert_eq!((rl.rlim_cur, rl.rlim_max), (0, 0), "core dumps must be off");
+        return;
+    }
+
+    let d = scratch("harden");
+    let p = key_file(&d, "k", &material_a());
+    let out = Command::new(std::env::current_exe().expect("test binary path"))
+        .arg("handling_key_material_makes_the_process_undumpable_with_no_core")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(HARDEN_CHILD_ENV, &p)
+        .output()
+        .expect("re-exec the test binary");
+    assert!(
+        out.status.success(),
+        "hardening child failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -851,9 +855,13 @@ fn format_with_a_key_path_produces_a_mountable_writable_encrypted_volume() {
             fh.sync_all().expect("fsync");
         }
         let mut back = Vec::new();
-        let mut fh = std::fs::File::open(&f).unwrap();
-        fh.seek(SeekFrom::Start(0)).unwrap();
-        fh.read_to_end(&mut back).unwrap();
+        {
+            // Scoped: an open handle on the mount makes `fusermount3 -u`
+            // return EBUSY.
+            let mut fh = std::fs::File::open(&f).unwrap();
+            fh.seek(SeekFrom::Start(0)).unwrap();
+            fh.read_to_end(&mut back).unwrap();
+        }
         assert_eq!(back, payload, "read-back through the encrypted path");
         m.unmount();
     }

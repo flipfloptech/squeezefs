@@ -27,6 +27,39 @@ pub const STATS_INODE: u64 = 0xffff_ffff_ffff_fffd;
 /// stream through `readdir(dir, offset, max)` instead.
 pub const DIR_ENTRY_CACHE_MAX_ENTRIES: usize = 10_000;
 
+/// POSIX-2: the block-granular `SEEK_DATA`/`SEEK_HOLE` resolution over a
+/// striped block map — the pure core of [`SqueezefsFilesystem::lseek`]
+/// (`pub` for the Criterion group that prices it: `read_path_bench`'s
+/// `sparse_lseek`).
+///
+/// A block index absent from `map` is a hole — exactly how the read path
+/// serves zeros for it — unless `parked` reports custody the map does not
+/// name yet (RAM overlay / staged image / W2 extent record), which is
+/// DATA. Returns the resolved offset, or `None` for the `SEEK_DATA` case
+/// with no data left before EOF (ENXIO). `SEEK_HOLE` always resolves:
+/// EOF is an implicit hole that terminates the last data run.
+///
+/// Callers must have established `offset < size` (POSIX: ENXIO at or past
+/// EOF, both whences).
+pub fn seek_scan_striped<F: Fn(u64) -> bool>(
+    map: &std::collections::HashMap<u32, String>,
+    size: u64,
+    block_size: u64,
+    offset: u64,
+    seek_data: bool,
+    parked: F,
+) -> Option<u64> {
+    let bs = block_size.max(1);
+    let last_block = size.saturating_sub(1) / bs;
+    for b in (offset / bs)..=last_block {
+        let occupied = map.contains_key(&(b as u32)) || parked(b);
+        if occupied == seek_data {
+            return Some(std::cmp::max(offset, b.saturating_mul(bs)));
+        }
+    }
+    (!seek_data).then_some(size)
+}
+
 /// Readdir cookie of the root's virtual `.config` entry on v3 volumes
 /// (design §5.1, PR K7): real-entry cookies occupy
 /// `[3, 3 + ((2^54−1)·2^8 + 255)] = [3, 2^62 + 2]`, so the virtual entries
@@ -14931,25 +14964,18 @@ impl Filesystem for SqueezefsFilesystem {
             return all_data();
         };
 
-        let bs = self.router.block_size.load(Ordering::Relaxed).max(1);
-        let last_block = (size - 1) / bs;
-        for b in (offset / bs)..=last_block {
-            let occupied = map.contains_key(&(b as u32)) || self.block_has_parked_custody(ino, b);
-            if occupied == seek_data {
-                let at = std::cmp::max(offset, b.saturating_mul(bs));
+        let bs = self.router.block_size.load(Ordering::Relaxed);
+        match seek_scan_striped(map, size, bs, offset, seek_data, |b| {
+            self.block_has_parked_custody(ino, b)
+        }) {
+            Some(at) => {
                 if !seek_data {
                     METRICS.lseek_holes_reported.fetch_add(1, Ordering::Relaxed);
                 }
-                return Ok(ReplyLSeek { offset: at });
+                Ok(ReplyLSeek { offset: at })
             }
-        }
-        if seek_data {
             // No data between `offset` and EOF.
-            Err(Errno::from(libc::ENXIO))
-        } else {
-            // The implicit hole at EOF always terminates the last run.
-            METRICS.lseek_holes_reported.fetch_add(1, Ordering::Relaxed);
-            Ok(ReplyLSeek { offset: size })
+            None => Err(Errno::from(libc::ENXIO)),
         }
     }
 

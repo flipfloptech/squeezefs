@@ -213,5 +213,122 @@ fn bench_assembly_join(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_hold, bench_classifier, bench_assembly_join);
+/// POSIX-2 (`docs/pre-rc-engineering-spec.md` §5): the
+/// `lseek(SEEK_DATA/SEEK_HOLE)` resolution — `seek_scan_striped`, the
+/// pure core of the FUSE `lseek` handler.
+///
+/// **Field-derived shape.** The sparse consumers are `cp --sparse`,
+/// `tar -S`, `rsync -S`, and `qemu-img convert`, which walk a file
+/// hole-to-data-to-hole: one lseek pair per RUN, not per block. The
+/// inputs are a 4 GiB file at the shipped 4 MiB block size (1,024 block
+/// indices — the `block_map` size the layout code spills to an indirect
+/// map beyond, see `routing::save_metadata_to_backend`) in three shapes:
+/// * `dense` — every index mapped: SEEK_HOLE walks the whole map to the
+///   EOF hole. The worst case, and what a `cp --sparse=always` of a
+///   fully-allocated image pays once.
+/// * `alternating` — every other index mapped (the `qemu-img` shape a
+///   discard-heavy guest leaves behind): resolution is O(1) runs but the
+///   walk is repeated per run.
+/// * `single_run` — one 64-block data island in a mostly-empty file (the
+///   `dd seek=` / sparse-log shape).
+fn bench_sparse_lseek(c: &mut Criterion) {
+    use squeezefs::fuse_client::seek_scan_striped;
+    use std::collections::HashMap;
+
+    const BS: u64 = 4 * 1024 * 1024; // shipped block size
+    const BLOCKS: u64 = 1024; // 4 GiB
+    const SIZE: u64 = BLOCKS * BS;
+
+    let mk = |f: &dyn Fn(u64) -> bool| -> HashMap<u32, String> {
+        (0..BLOCKS)
+            .filter(|b| f(*b))
+            .map(|b| (b as u32, format!("be://{}", b * BS)))
+            .collect()
+    };
+    let dense = mk(&|_| true);
+    let alternating = mk(&|b| b % 2 == 0);
+    let single_run = mk(&|b| (512..576).contains(&b));
+
+    let mut group = c.benchmark_group("sparse_lseek");
+    group.throughput(Throughput::Elements(1));
+
+    // The full-length walks: worst case for each shape.
+    group.bench_function("dense_seek_hole_1024_blocks", |b| {
+        b.iter(|| {
+            black_box(seek_scan_striped(
+                black_box(&dense),
+                SIZE,
+                BS,
+                0,
+                false,
+                |_| false,
+            ))
+        });
+    });
+    group.bench_function("alternating_seek_hole", |b| {
+        b.iter(|| {
+            black_box(seek_scan_striped(
+                black_box(&alternating),
+                SIZE,
+                BS,
+                0,
+                false,
+                |_| false,
+            ))
+        });
+    });
+    group.bench_function("single_run_seek_data_scan_512", |b| {
+        b.iter(|| {
+            black_box(seek_scan_striped(
+                black_box(&single_run),
+                SIZE,
+                BS,
+                0,
+                true,
+                |_| false,
+            ))
+        });
+    });
+    // The steady per-run step a sparse copier actually repeats: resolve
+    // from just inside the current run.
+    group.bench_function("single_run_seek_hole_from_run_start", |b| {
+        b.iter(|| {
+            black_box(seek_scan_striped(
+                black_box(&single_run),
+                SIZE,
+                BS,
+                512 * BS,
+                false,
+                |_| false,
+            ))
+        });
+    });
+    // The parked-custody probe arm: a hole candidate must consult the
+    // three-way overlay probe before it may be called a hole (the
+    // dirty-custody-is-DATA law). Priced with a probe that always
+    // answers "parked", i.e. every candidate pays it.
+    group.bench_function("alternating_seek_hole_all_parked", |b| {
+        b.iter(|| {
+            black_box(seek_scan_striped(
+                black_box(&alternating),
+                SIZE,
+                BS,
+                0,
+                false,
+                |_| true,
+            ))
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_hold,
+    bench_classifier,
+    bench_assembly_join,
+    bench_sparse_lseek
+);
+
 criterion_main!(benches);

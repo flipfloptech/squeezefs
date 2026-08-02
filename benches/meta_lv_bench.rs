@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use squeezefs::meta_backend::kv::alloc_ext::ExtentAllocator;
 use squeezefs::meta_backend::kv::backend::{xattr_name_allowed, KvMetaBackend};
 use squeezefs::meta_backend::kv::bset::{build_bset, lookup, merge, BsetView};
@@ -150,6 +150,100 @@ fn dentry_bset_records(parent: u64, count: usize, hash_seed: u64) -> Vec<Record>
             )
         })
         .collect()
+}
+
+/// POSIX-4 (`docs/pre-rc-engineering-spec.md` §5): the cost of resolving
+/// `readdir`'s `..` entry, scan vs memo.
+///
+/// **Field-derived shape.** The scan arm is `find_parent_of_child` — an
+/// unindexed range scan of a volume's ENTIRE dentry tree, so its input
+/// size is the volume's total dentry count, not the directory's. Sizes
+/// here (256 / 2,048 / 16,384 dentries) are the measurable low end of a
+/// v3 volume whose caps are 1 M entries per directory and ≥ 100 M inodes
+/// (AGENTS.md, design-cow-kv-metadata §4.2): the arm is LINEAR in that
+/// count, and the shipped `..` path used to pay one per `readdir`, i.e.
+/// once per directory of every `ls -R` / `find` / `du` / `rsync` / `tar`
+/// walk. The worst position is measured deliberately — the probe child
+/// is the LAST dentry inserted, which is where a full scan ends up on a
+/// memcmp-ordered tree for a high ino.
+///
+/// The memo arm prices what ships instead: one `moka::sync::Cache<u64,
+/// u64, ahash::RandomState>` get, built exactly as
+/// `SqueezefsFilesystem::parent_memo` is (the field itself is private to
+/// the daemon).
+fn bench_readdir_parent(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("readdir_parent");
+    group.throughput(criterion::Throughput::Elements(1));
+
+    for dentries in [256u64, 2_048, 16_384] {
+        let file = NamedTempFile::new().unwrap();
+        file.as_file().set_len(512 * 1024 * 1024).unwrap();
+        let (backend, probe) = rt.block_on(async {
+            format_v3(
+                file.path(),
+                512 * 1024 * 1024,
+                &FormatV3Options {
+                    node_size: DEFAULT_NODE_SIZE,
+                    journal_len_override: None,
+                    force: false,
+                    full_wipe: false,
+                    format_config_xattr: None,
+                },
+            )
+            .await
+            .expect("format v3");
+            let be = KvMetaBackend::open(file.path()).await.expect("mount v3");
+            // One directory of `dentries` children; the LAST one is the
+            // probe (worst-case scan position).
+            let dir = be
+                .create(1, "walkdir", 0o755 | 0o040000, 0, 0)
+                .await
+                .unwrap();
+            let mut last = dir.ino;
+            for i in 0..dentries {
+                last = be
+                    .create(dir.ino, &format!("child_{i:07}"), 0o644, 0, 0)
+                    .await
+                    .unwrap()
+                    .ino;
+            }
+            (be, last)
+        });
+
+        group.bench_with_input(
+            BenchmarkId::new("scan_find_parent_of_child", dentries),
+            &probe,
+            |b, &child| {
+                b.to_async(&rt).iter(|| {
+                    let be = &backend;
+                    async move { black_box(be.find_parent_of_child(child).await.unwrap()) }
+                });
+            },
+        );
+    }
+
+    // The shipped path: a memo get. Sized/typed exactly like
+    // `SqueezefsFilesystem::parent_memo`.
+    let memo: moka::sync::Cache<u64, u64, ahash::RandomState> = moka::sync::Cache::builder()
+        .max_capacity(50_000)
+        .time_to_live(std::time::Duration::from_secs(300))
+        .build_with_hasher(ahash::RandomState::new());
+    for child in 0..10_000u64 {
+        memo.insert(child + 2, 1);
+    }
+    group.bench_function("memo_hit", |b| {
+        let mut n = 0u64;
+        b.iter(|| {
+            n = (n + 1) % 10_000;
+            black_box(memo.get(black_box(&(n + 2))))
+        });
+    });
+    group.bench_function("memo_miss", |b| {
+        b.iter(|| black_box(memo.get(black_box(&u64::MAX))));
+    });
+
+    group.finish();
 }
 
 /// PR K1 micro-benches: bset build / search / merge / fold (design PR plan).
@@ -694,6 +788,7 @@ fn bench_xattr_name_screen(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_kv_meta_metadata,
+    bench_readdir_parent,
     bench_kv_bset,
     bench_kv_tree,
     bench_kv_fold,

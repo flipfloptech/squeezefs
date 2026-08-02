@@ -41,8 +41,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 
-/// Reserved xattr prefix for fabric records on ino 1 (§5.1.2; the FUSE
-/// layer screens it — `src/fuse_client.rs` `reserved_xattr_name`).
+/// Reserved xattr prefix for fabric records on ino 1 (§5.1.2; screened
+/// by the VAL-2 allowlist —
+/// [`crate::meta_backend::kv::backend::xattr_name_allowed`] — at both the
+/// FUSE boundary and the backend's `Metadata` xattr entry points).
 pub const JOB_XATTR_PREFIX: &str = "job:";
 
 /// Root ino: job records live on the volume root (the same home as the

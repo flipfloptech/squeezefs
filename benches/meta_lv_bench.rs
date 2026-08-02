@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use squeezefs::meta_backend::kv::alloc_ext::ExtentAllocator;
-use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+use squeezefs::meta_backend::kv::backend::{xattr_name_allowed, KvMetaBackend};
 use squeezefs::meta_backend::kv::bset::{build_bset, lookup, merge, BsetView};
 use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
 use squeezefs::meta_backend::kv::node::{NodeLayout, DEFAULT_NODE_SIZE};
@@ -629,12 +629,75 @@ fn bench_kv_journal(c: &mut Criterion) {
     group.finish();
 }
 
+/// VAL-2 (pre-RC engineering spec §3): the xattr-name ALLOWLIST screen,
+/// which every `getxattr`/`setxattr`/`removexattr` pays TWICE — once at
+/// the FUSE boundary and once at this backend's `Metadata` entry points —
+/// and once per listed name in `listxattr`.
+///
+/// Shapes are the field's actual names, not synthetic strings:
+/// * `allow_user` — `user.mime_type`: the ordinary user xattr; matches
+///   `user.` then walks the 10-byte `squeezefs.` non-match. The common
+///   allow path.
+/// * `allow_security_capability` — `security.capability`: the killpriv
+///   name the kernel probes per write(2) on pre-`HANDLE_KILLPRIV_V2`
+///   kernels (`.benchmarks/2026-07-28-fuse-killpriv-v2.md`) — the
+///   highest-frequency screened name on such a fleet.
+/// * `refuse_layout` / `refuse_writer_claim` — the internal records the
+///   screen exists for (`layout` = the per-inode block map + wrapped
+///   data-key material, `writer_claim` = the D0 guard): the SHORT refuse
+///   path, no prefix match at all.
+/// * `refuse_user_squeezefs` — `user.squeezefs.format_config`: the
+///   worst-case classification (matches `user.`, then must walk the full
+///   `squeezefs.` prefix to refuse).
+/// * `refuse_client_record` — `client:{uuid}`: the live-client
+///   registration shape (`fuse_client.rs` heartbeat).
+/// * `list_page_32` — one `listxattr` reply's worth of names (31 user
+///   names beside one internal record on ino 1), the per-name filter
+///   cost the listing pays.
+fn bench_xattr_name_screen(c: &mut Criterion) {
+    let mut group = c.benchmark_group("kv_xattr_screen");
+    group.throughput(criterion::Throughput::Elements(1));
+
+    for (label, name) in [
+        ("allow_user", "user.mime_type"),
+        ("allow_security_capability", "security.capability"),
+        ("refuse_layout", "layout"),
+        ("refuse_writer_claim", "writer_claim"),
+        ("refuse_user_squeezefs", "user.squeezefs.format_config"),
+        (
+            "refuse_client_record",
+            "client:6f1c2b3a-9d4e-4a71-8c0f-2b5e7d9a1c33",
+        ),
+    ] {
+        group.bench_function(label, |b| {
+            b.iter(|| black_box(xattr_name_allowed(black_box(name))))
+        });
+    }
+
+    // One listing page: 31 permitted names + the one internal record
+    // that must be filtered out of it.
+    let page: Vec<String> = (0..31)
+        .map(|i| format!("user.attr_{i:02}"))
+        .chain(std::iter::once("layout".to_string()))
+        .collect();
+    group.throughput(criterion::Throughput::Elements(page.len() as u64));
+    group.bench_function("list_page_32", |b| {
+        b.iter(|| {
+            let kept = page.iter().filter(|n| xattr_name_allowed(n)).count();
+            black_box(kept)
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_kv_meta_metadata,
     bench_kv_bset,
     bench_kv_tree,
     bench_kv_fold,
-    bench_kv_journal
+    bench_kv_journal,
+    bench_xattr_name_screen
 );
 criterion_main!(benches);

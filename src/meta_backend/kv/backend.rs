@@ -235,6 +235,50 @@ const PENDING_TIMES_DRAIN_BATCH: usize = 128;
 /// just time).
 const PENDING_TIMES_DRAIN_CAP: u64 = 512;
 
+/// VAL-2 (pre-RC engineering spec §3): the **positive allowlist** every
+/// externally-reachable xattr name must pass — the FUSE boundary
+/// (`src/fuse_client.rs` set/get/list/removexattr) and this backend's
+/// generic [`Metadata`] entry points both enforce it.
+///
+/// Permitted: `user.*` (minus the internal `user.squeezefs.` family),
+/// `security.*` (the kernel's own killpriv/LSM namespace) and `trusted.*`
+/// (VFS-gated on `CAP_SYS_ADMIN`). **Everything else is refused** — EPERM
+/// on set/remove, absent on get, filtered from listings.
+///
+/// A denylist could not hold this line: SqueezeFS keeps unprefixed
+/// internal records in the same keyspace, and the pre-RC denylist
+/// (`job:` + `user.squeezefs.`) left four of them writable from any
+/// unprivileged shell —
+///
+/// - `system.symlink` — every symlink's target. The Linux VFS deliberately
+///   performs NO permission check for `system.*` (`xattr_permission()`
+///   returns 0 early: "Decision on these is left to the underlying
+///   filesystem"), so the daemon is the ONLY enforcement point;
+/// - `layout` — the per-inode block map, `block_prefix`, `file_id` and
+///   wrapped data-key material. A write of another file's decodable value
+///   redirects reads to that file's blocks;
+/// - [`WRITER_CLAIM_XATTR`] — the D0 single-writer guard. Removing it
+///   presents the volume set as unclaimed to another host's takeover
+///   ladder;
+/// - `client:{id}` — the live-client registrations guarding
+///   `config set-cache-paths`.
+///
+/// An allowlist also refuses internal records nobody has invented yet,
+/// which is the property a denylist can never have.
+///
+/// The daemon's own record writers never come through here: they use the
+/// `*_internal` entry points ([`KvMetaBackend::setxattr_internal`],
+/// [`KvMetaBackend::removexattr_internal`], and the inherent
+/// `getxattr`/`listxattr`).
+pub fn xattr_name_allowed(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix("user.") {
+        // `user.squeezefs.` is the internal family (format config, the L4
+        // bootstrap blob, future records); `user.squeezefsX` is not.
+        return !rest.starts_with("squeezefs.");
+    }
+    name.starts_with("security.") || name.starts_with("trusted.")
+}
+
 /// The single-writer mount guard's claim record: an xattr on ino 1 beside
 /// the `client:{id}` registrations (design-metadata-throughput §5.0 B2).
 /// JSON `{"id","ts","pid","boot"}`; staleness follows the ONE staleness
@@ -2214,7 +2258,7 @@ impl KvMetaBackend {
         // D0: delete OUR claim exactly once — best-effort (a fenced or
         // failed volume cannot write; the claim then ages out by TTL).
         if self.claimed.swap(false, Ordering::AcqRel) && !self.is_failed() {
-            if let Err(e) = Metadata::removexattr(self, 1, WRITER_CLAIM_XATTR).await {
+            if let Err(e) = self.removexattr_internal(1, WRITER_CLAIM_XATTR).await {
                 log::warn!(
                     "meta volume {}: clean unmount could not delete the writer_claim: \
                      {e} (it will age out by TTL)",
@@ -2764,7 +2808,8 @@ impl KvMetaBackend {
             pid: std::process::id(),
             boot: self.boot_id.clone(),
         };
-        Metadata::setxattr(&**self, 1, WRITER_CLAIM_XATTR, &claim.encode()).await?;
+        self.setxattr_internal(1, WRITER_CLAIM_XATTR, &claim.encode())
+            .await?;
         self.claimed.store(true, Ordering::Release);
         self.trace_guard_event("claim_committed");
         self.sync_device().await.map_err(KvError::Io)?;
@@ -3141,7 +3186,10 @@ impl KvMetaBackend {
                 pid: std::process::id(),
                 boot: self.boot_id.clone(),
             };
-            if let Err(e) = Metadata::setxattr(self, 1, WRITER_CLAIM_XATTR, &claim.encode()).await {
+            if let Err(e) = self
+                .setxattr_internal(1, WRITER_CLAIM_XATTR, &claim.encode())
+                .await
+            {
                 log::warn!(
                     "meta volume {}: writer_claim heartbeat refresh failed: {e}",
                     self.path.display()
@@ -3229,7 +3277,7 @@ impl KvMetaBackend {
         // Stale (or unattributable — clearable by the same attestation):
         // remove durably: commit + barrier + checkpoint (this backend has
         // no checkpoint task; drive the cycle explicitly).
-        Metadata::removexattr(&*be, 1, WRITER_CLAIM_XATTR).await?;
+        be.removexattr_internal(1, WRITER_CLAIM_XATTR).await?;
         be.sync_device().await.map_err(KvError::Io)?;
         be.checkpoint_now().await?;
         log::info!(
@@ -6066,6 +6114,37 @@ impl KvMetaBackend {
         self.commit_tx(tx).await?;
         Ok(())
     }
+
+    /// VAL-2 internal writer: `setxattr` **without** the
+    /// [`xattr_name_allowed`] screen — the path the daemon's own record
+    /// writers take ([`WRITER_CLAIM_XATTR`], `client:{id}`, `layout`,
+    /// `system.symlink`). Identical to the [`Metadata::setxattr`] body
+    /// minus the screen; never reachable from a client.
+    pub async fn setxattr_internal(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        self.write_gate()?;
+        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+        self.setxattr_locked(ino, name, value, guards).await
+    }
+
+    /// VAL-2 internal writer: `removexattr` without the screen (see
+    /// [`Self::setxattr_internal`]).
+    pub async fn removexattr_internal(&self, ino: Ino, name: &str) -> Result<()> {
+        self.write_gate()?;
+        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+        self.removexattr_locked(ino, name, guards).await
+    }
+}
+
+/// The VAL-2 refusal for a screened name on a mutating path: EPERM,
+/// counted on the stats inode's `fuse_reserved_xattr_refusals` (the same
+/// gauge the FUSE boundary bumps — a refusal here means something inside
+/// the daemon reached a generic entry point with an internal name).
+fn screened_xattr_refusal(name: &str) -> crate::error::SqueezefsError {
+    crate::fuse_client::METRICS
+        .fuse_reserved_xattr_refusals
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    log::warn!("refusing xattr op on reserved name {name:?} (VAL-2 allowlist)");
+    crate::error::SqueezefsError::Io(std::io::Error::from_raw_os_error(libc::EPERM))
 }
 
 /// The full mutating `Metadata` surface on v3 (PR K6b): every op the v2
@@ -6422,29 +6501,48 @@ impl Metadata for KvMetaBackend {
             .await
     }
 
+    /// VAL-2: internal records read as ABSENT through the generic entry
+    /// point (the FUSE boundary renders this ENODATA) — a name filtered
+    /// out of [`Metadata::listxattr`] must not have its existence
+    /// confirmed by a get. Daemon reads use the inherent
+    /// [`KvMetaBackend::getxattr`].
     async fn getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
+        if !xattr_name_allowed(name) {
+            return Ok(None);
+        }
         KvMetaBackend::getxattr(self, ino, name).await
     }
 
     /// Set/overwrite one xattr (§4.2: unlimited count, value ≤ the
     /// per-volume cap `min(65,536, node_size/4)` — the capability lift
     /// over v2's 3 × 8 KiB blocks).
+    ///
+    /// VAL-2: screened by [`xattr_name_allowed`] — the generic entry
+    /// point never writes an internal record. The daemon's own record
+    /// writers use [`KvMetaBackend::setxattr_internal`].
     async fn setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
-        self.write_gate()?;
-        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
-        self.setxattr_locked(ino, name, value, guards).await
+        if !xattr_name_allowed(name) {
+            return Err(screened_xattr_refusal(name));
+        }
+        self.setxattr_internal(ino, name, value).await
     }
 
     /// Remove one xattr; absent names fail loud with the v2 NotFound
-    /// shape.
+    /// shape. VAL-2-screened (see [`Metadata::setxattr`]).
     async fn removexattr(&self, ino: Ino, name: &str) -> Result<()> {
-        self.write_gate()?;
-        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
-        self.removexattr_locked(ino, name, guards).await
+        if !xattr_name_allowed(name) {
+            return Err(screened_xattr_refusal(name));
+        }
+        self.removexattr_internal(ino, name).await
     }
 
+    /// VAL-2: internal records are filtered out of the generic listing
+    /// (the daemon's own listing is the inherent
+    /// [`KvMetaBackend::listxattr`], which sees everything).
     async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
-        KvMetaBackend::listxattr(self, ino).await
+        let mut names = KvMetaBackend::listxattr(self, ino).await?;
+        names.retain(|n| xattr_name_allowed(n));
+        Ok(names)
     }
 
     async fn destroy_inode(&self, ino: Ino) -> Result<()> {

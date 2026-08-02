@@ -153,7 +153,10 @@ fn the_per_call_ceiling_derives_from_the_memory_budget_with_a_physical_floor() {
     // It grows with the budget and never wraps at the extremes.
     let big = max_block_keys_for_budget(1 << 40);
     assert!(big > floor, "a 1 TiB budget must derive above the floor");
-    assert!(max_block_keys_for_budget(u64::MAX) <= u32::MAX);
+    // A u64::MAX budget saturates at the u32 block-index ceiling instead
+    // of wrapping (the return type is what bounds it — the assertion
+    // here is that the derivation is monotonic all the way up).
+    assert_eq!(max_block_keys_for_budget(u64::MAX), u32::MAX);
     assert!(max_block_keys_for_budget(u64::MAX) >= big);
 
     // The live accessor is the same function against the live budget.

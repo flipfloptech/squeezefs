@@ -15067,18 +15067,18 @@ impl Filesystem for SqueezefsFilesystem {
             Some(s) => s,
             None => return Err(Errno::from(libc::EINVAL)),
         };
-        // Reserved-namespace screen (design-volume-lifecycle §5.1.2,
-        // generalizing the L4 BOOTSTRAP_XATTR rule): internal records —
-        // job fabric bookkeeping, the format config, anything under
-        // `user.squeezefs.` — never cross the FUSE boundary. Without
-        // this, any user could FORGE or DELETE the durable lease/
-        // fencing bookkeeping of an in-flight drain from an
-        // unprivileged shell (the format config was already exposed
-        // pre-VL2 — a real hole, pinned closed by tests).
+        // Namespace ALLOWLIST (VAL-2, generalizing the §5.1.2 screen and
+        // the L4 BOOTSTRAP_XATTR rule): only `user.*` (minus
+        // `user.squeezefs.`), `security.*` and `trusted.*` cross the FUSE
+        // boundary in either direction. Everything else is an internal
+        // record — job fabric bookkeeping, the format config,
+        // `system.symlink`, `layout`, `writer_claim`, `client:{id}`,
+        // and anything added later — and a write to one FORGES or
+        // DESTROYS durable daemon state from an unprivileged shell.
         if posix_acl_xattr_name(name_str) {
             return Err(Errno::from(libc::EOPNOTSUPP));
         }
-        if reserved_xattr_name(name_str) {
+        if !xattr_name_allowed(name_str) {
             METRICS
                 .fuse_reserved_xattr_refusals
                 .fetch_add(1, Ordering::Relaxed);
@@ -15133,18 +15133,26 @@ impl Filesystem for SqueezefsFilesystem {
             }
             return Ok(fuse3::raw::reply::ReplyXAttr::Data(blob.into()));
         }
-        // Reserved-namespace screen (§5.1.2): internal record bytes
-        // never serve through FUSE (daemon/probe paths read the meta
-        // backend directly). The bootstrap name above is the one
-        // deliberate exception — synthesized, never on-disk bytes.
+        // Namespace ALLOWLIST (VAL-2): internal record bytes never serve
+        // through FUSE (daemon/probe paths read the meta backend
+        // directly). The bootstrap name above is the one deliberate
+        // exception — synthesized, never on-disk bytes.
+        //
+        // A screened name reads as ABSENT (ENODATA), not EPERM: it is
+        // filtered out of `listxattr`, so confirming its existence here
+        // would contradict the listing and hand a prober a census of the
+        // daemon's internal records.
         if posix_acl_xattr_name(name_str) {
             return Err(Errno::from(libc::EOPNOTSUPP));
         }
-        if reserved_xattr_name(name_str) {
+        if !xattr_name_allowed(name_str) {
             METRICS
                 .fuse_reserved_xattr_refusals
                 .fetch_add(1, Ordering::Relaxed);
-            return Err(Errno::from(libc::EPERM));
+            #[cfg(target_os = "macos")]
+            return Err(Errno::from(libc::ENOATTR));
+            #[cfg(not(target_os = "macos"))]
+            return Err(Errno::from(libc::ENODATA));
         }
 
         let backend = self
@@ -15185,10 +15193,10 @@ impl Filesystem for SqueezefsFilesystem {
         let keys = backend.listxattr(inode).await.map_err(map_squeezefs_err)?;
         let mut data = Vec::new();
         for key in keys {
-            // Reserved names are filtered unconditionally (§5.1.2 screen,
-            // subsuming the L4 bootstrap rule): internal records are
-            // invisible through FUSE.
-            if reserved_xattr_name(&key) {
+            // Non-allowlisted names are filtered unconditionally
+            // (VAL-2, subsuming the §5.1.2 screen and the L4 bootstrap
+            // rule): internal records are invisible through FUSE.
+            if !xattr_name_allowed(&key) {
                 continue;
             }
             data.extend_from_slice(key.as_bytes());
@@ -15209,13 +15217,15 @@ impl Filesystem for SqueezefsFilesystem {
             Some(s) => s,
             None => return Err(Errno::from(libc::EINVAL)),
         };
-        // Reserved-namespace screen (§5.1.2). Pre-VL2 this handler had
-        // NO screen at all — `removexattr("user.squeezefs.format_config")`
-        // deleted the durable format config from any unprivileged shell.
+        // Namespace ALLOWLIST (VAL-2). Pre-VL2 this handler had NO
+        // screen at all — `removexattr("user.squeezefs.format_config")`
+        // deleted the durable format config from any unprivileged shell;
+        // pre-RC the denylist still left `writer_claim` (the D0 guard),
+        // `layout`, `system.symlink` and `client:{id}` removable.
         if posix_acl_xattr_name(name_str) {
             return Err(Errno::from(libc::EOPNOTSUPP));
         }
-        if reserved_xattr_name(name_str) {
+        if !xattr_name_allowed(name_str) {
             METRICS
                 .fuse_reserved_xattr_refusals
                 .fetch_add(1, Ordering::Relaxed);
@@ -15233,15 +15243,19 @@ impl Filesystem for SqueezefsFilesystem {
     }
 }
 
-/// §5.1.2 reserved-namespace predicate (design-volume-lifecycle): names
-/// that carry SqueezeFS-internal durable records — the job fabric's
-/// `job:` family, everything under `user.squeezefs.` (format config,
-/// the L4 bootstrap name, future internal records) — never cross the
-/// FUSE boundary in either direction. The daemon, offline probes, and
-/// admin verbs read them through the meta backend directly.
-fn reserved_xattr_name(name: &str) -> bool {
-    name.starts_with(crate::jobs::JOB_XATTR_PREFIX) || name.starts_with("user.squeezefs.")
-}
+// The VAL-2 namespace ALLOWLIST (pre-RC engineering spec §3), replacing
+// the §5.1.2 reserved-name DENYLIST that lived here: names that carry
+// SqueezeFS-internal durable records never cross the FUSE boundary in
+// either direction, and "internal" is now everything OUTSIDE
+// `user.*` (minus `user.squeezefs.`) / `security.*` / `trusted.*`.
+//
+// Its home is the meta backend (`meta_backend::kv::backend`) because the
+// screen is mirrored there — `KvMetaBackend`'s `Metadata` xattr entry
+// points enforce the same predicate, so the FUSE layer is not the only
+// enforcement point, and the backend cannot depend on the FUSE layer for
+// it. The daemon, offline probes, and admin verbs read/write internal
+// records through the backend's internal (`*_internal`) path.
+use crate::meta_backend::kv::backend::xattr_name_allowed;
 
 /// POSIX ACL xattrs refuse ENOTSUP (the no-ACL filesystem class —
 /// fstests generic/099/319, VL10 release gate): SqueezeFS implements no

@@ -16,7 +16,7 @@
 //! sweeper, the writeback requeue worker). One panic in any of them ends
 //! that machinery for the life of the mount, silently.
 //!
-//! [`contain`] is the whole mechanism: catch the unwind, count it in
+//! [`crate::detached::contain`] is the whole mechanism: catch the unwind, count it in
 //! `detached_task_panics` (stats inode — 0 on a healthy daemon), and log
 //! it loudly with the site name. It is deliberately NOT a retry: the
 //! panic is a bug, and swallowing-then-retrying would turn a bug into an

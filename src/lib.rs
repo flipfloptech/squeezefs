@@ -55,7 +55,6 @@ pub(crate) mod patch_clone_core;
 pub(crate) mod placed_core;
 pub(crate) mod placed_sever;
 pub mod read_lane;
-pub mod recovery;
 pub(crate) mod refcount_core;
 pub mod routing;
 

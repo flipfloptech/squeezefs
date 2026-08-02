@@ -451,7 +451,8 @@ fn next_stage_generation() -> u64 {
 }
 
 /// Binary header for staged / active-block payloads on local NVMe staging.
-/// Shared with crash recovery (`recovery::recover_staging`) — must stay stable.
+/// Shared with the mount-time staging recovery scan (`NvmeStaging::new`) —
+/// must stay stable.
 #[derive(Clone, Debug)]
 pub struct StagedMetadata {
     pub fencing_token: u64,

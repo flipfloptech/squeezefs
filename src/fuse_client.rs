@@ -135,7 +135,8 @@ pub fn lease_retry_backoff(attempt: u32) -> Duration {
 /// `tests/posix_lease_retry_tests.rs`).
 ///
 /// `attempt_fn` is handed the wait budget for THIS attempt — the
-/// remaining budget clamped to [`DLM_LEASE_WAIT`] — and returns either
+/// remaining budget clamped to the per-attempt `DLM_LEASE_WAIT`
+/// ceiling (private) — and returns either
 /// the fencing token or an error. A [`SqueezefsError::LockFailed`] is a
 /// *lost wait*, not a failure: it is retried with
 /// [`lease_retry_backoff`] until the budget (the op watchdog's

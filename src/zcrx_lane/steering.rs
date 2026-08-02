@@ -11,6 +11,10 @@
 //! * disarm restores the exact recorded prior state;
 //! * stale reserved-range rules from a crashed daemon are reaped at arm;
 //!   rules outside the range are NEVER touched (operator-owned).
+//!
+//! Why steering is arm-fatal (design §5): a mis-steered flow degrades
+//! zcrx to the kernel's copy fallback SILENTLY — banned by construction,
+//! so any steering refusal refuses the whole arm loud.
 
 use std::net::SocketAddr;
 
@@ -58,21 +62,41 @@ pub trait NicControl {
 /// Lane ZC queue picks: the HIGHEST-indexed `want` queues, bounded so the
 /// RSS set keeps ≥ ¾ of the NIC (design §8). Empty = NIC too narrow (the
 /// caller refuses the arm loud).
-pub fn lane_queue_picks(_channels: u32, _want: u16) -> Vec<u32> {
-    Vec::new() // Z2 phase A stub — contracts red
+pub fn lane_queue_picks(channels: u32, want: u16) -> Vec<u32> {
+    let cap = channels / 4;
+    let take = (want as u32).min(cap);
+    (channels - take..channels).collect()
 }
 
 /// The reserved ntuple loc range `[lo, hi)`: the top
-/// [`STEERING_RESERVED_SLOTS`] of the rule table (clamped for tiny tables).
+/// [`STEERING_RESERVED_SLOTS`] of the rule table (clamped for tiny
+/// tables — at least one slot as long as the table is non-empty).
 pub fn reserved_loc_range(table_size: u32) -> (u32, u32) {
-    (0, table_size) // Z2 phase A stub — contracts red
+    let width = STEERING_RESERVED_SLOTS.min(table_size.max(1)).max(1);
+    (table_size.saturating_sub(width), table_size)
 }
 
 /// Prior RSS table with the lane queues excluded: non-lane entries are
 /// preserved verbatim; entries that pointed at a lane queue are remapped
 /// round-robin over the remaining queues.
-pub fn restricted_rss(prior: &[u32], _lane_queues: &[u32], _channels: u32) -> Vec<u32> {
-    prior.to_vec() // Z2 phase A stub — contracts red
+pub fn restricted_rss(prior: &[u32], lane_queues: &[u32], channels: u32) -> Vec<u32> {
+    let keep: Vec<u32> = (0..channels).filter(|q| !lane_queues.contains(q)).collect();
+    if keep.is_empty() {
+        return prior.to_vec();
+    }
+    let mut rr = 0usize;
+    prior
+        .iter()
+        .map(|&e| {
+            if lane_queues.contains(&e) {
+                let v = keep[rr % keep.len()];
+                rr += 1;
+                v
+            } else {
+                e
+            }
+        })
+        .collect()
 }
 
 /// Recorded prior NIC state + applied steps — the restore/rollback ledger.
@@ -80,13 +104,58 @@ pub fn restricted_rss(prior: &[u32], _lane_queues: &[u32], _channels: u32) -> Ve
 pub struct SteeringGuard {
     prior_rss: Option<Vec<u32>>,
     rule_locs: Vec<u32>,
+    restored: bool,
 }
 
 impl SteeringGuard {
-    /// Restore the exact recorded prior state (disarm / unmount / poison).
-    pub fn restore(&mut self, _nic: &mut dyn NicControl) -> Result<(), String> {
-        let _ = (&self.prior_rss, &self.rule_locs);
-        Err("zcrx steering not implemented (PR Z2 phase A)".into())
+    /// Restore the exact recorded prior state (disarm / unmount / poison
+    /// / arm rollback). Idempotent; collects every failure loud (a
+    /// half-restored NIC must still attempt the remaining steps).
+    pub fn restore(&mut self, nic: &mut dyn NicControl) -> Result<(), String> {
+        if self.restored {
+            return Ok(());
+        }
+        self.restored = true;
+        let mut errs = Vec::new();
+        for loc in self.rule_locs.drain(..) {
+            if let Err(e) = nic.delete_ntuple(loc) {
+                errs.push(format!("delete rule @{loc}: {e}"));
+            }
+        }
+        if let Some(prior) = self.prior_rss.take() {
+            if let Err(e) = nic.set_rxfh_indir(&prior) {
+                errs.push(format!("restore RSS: {e}"));
+            }
+        }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "zcrx steering restore incomplete on {}: {}",
+                nic.ifname(),
+                errs.join("; ")
+            ))
+        }
+    }
+
+    /// Whether restore already ran (Drop-audit hook).
+    pub fn restored(&self) -> bool {
+        self.restored
+    }
+}
+
+impl Drop for SteeringGuard {
+    fn drop(&mut self) {
+        if !self.restored && (self.prior_rss.is_some() || !self.rule_locs.is_empty()) {
+            // A dropped-unrestored guard means NIC state leaked past the
+            // session — loud; the reserved-loc reap makes the residue
+            // recoverable at the next arm (crash-residue law).
+            log::error!(
+                "zcrx-lane: steering guard dropped without restore — NIC state \
+                 leaked (next arm reaps reserved-range rules; RSS needs operator \
+                 attention or a re-arm)"
+            );
+        }
     }
 }
 
@@ -94,9 +163,83 @@ impl SteeringGuard {
 /// reserved-range rules → record + restrict RSS → install per-flow rules.
 /// Any refusal rolls back every applied step and returns the failing step
 /// loud; success returns the restore ledger.
-pub fn arm_steering(
-    _nic: &mut dyn NicControl,
-    _flows: &[FlowRule],
-) -> Result<SteeringGuard, String> {
-    Err("zcrx steering not implemented (PR Z2 phase A)".into())
+pub fn arm_steering(nic: &mut dyn NicControl, flows: &[FlowRule]) -> Result<SteeringGuard, String> {
+    if flows.is_empty() {
+        return Err("zcrx steering: no lane flows to steer (refusing a silent no-op arm)".into());
+    }
+    // Probes first — every gate refuses BEFORE any mutation.
+    let hds = nic
+        .tcp_data_split_on()
+        .map_err(|e| format!("HDS probe on {}: {e}", nic.ifname()))?;
+    if !hds {
+        return Err(format!(
+            "NIC {} has tcp-data-split OFF — zcrx requires HDS; arm refused \
+             (NIC untouched)",
+            nic.ifname()
+        ));
+    }
+    let channels = nic
+        .combined_channels()
+        .map_err(|e| format!("channel probe on {}: {e}", nic.ifname()))?;
+    let table_size = nic
+        .ntuple_table_size()
+        .map_err(|e| format!("ntuple table probe on {}: {e}", nic.ifname()))?;
+    let (lo, hi) = reserved_loc_range(table_size);
+    if flows.len() as u32 > hi - lo {
+        return Err(format!(
+            "zcrx steering: {} flows exceed the {} reserved rule slots on {}",
+            flows.len(),
+            hi - lo,
+            nic.ifname()
+        ));
+    }
+    let lane_queues: Vec<u32> = {
+        let mut qs: Vec<u32> = flows.iter().map(|f| f.queue).collect();
+        qs.sort_unstable();
+        qs.dedup();
+        qs
+    };
+
+    // Crash-residue reap (design §5): stale rules in the reserved range
+    // are ALWAYS lane-owned (dead 4-tuples — inert but must not leak);
+    // rules outside the range are operator-owned and never touched.
+    let existing = nic
+        .ntuple_locs()
+        .map_err(|e| format!("rule enumeration on {}: {e}", nic.ifname()))?;
+    for loc in existing.iter().filter(|l| (lo..hi).contains(l)) {
+        nic.delete_ntuple(*loc)
+            .map_err(|e| format!("stale lane rule reap @{loc} on {}: {e}", nic.ifname()))?;
+    }
+
+    let mut guard = SteeringGuard {
+        prior_rss: None,
+        rule_locs: Vec::new(),
+        restored: false,
+    };
+
+    // Record → restrict RSS.
+    let prior = match nic.rxfh_indir() {
+        Ok(p) => p,
+        Err(e) => return Err(format!("RSS read on {}: {e}", nic.ifname())),
+    };
+    let restricted = restricted_rss(&prior, &lane_queues, channels);
+    if let Err(e) = nic.set_rxfh_indir(&restricted) {
+        return Err(format!("RSS restrict on {}: {e}", nic.ifname()));
+    }
+    guard.prior_rss = Some(prior);
+
+    // Install per-flow rules in the reserved range; any refusal rolls
+    // back EVERYTHING applied so far (rules then RSS).
+    for (i, flow) in flows.iter().enumerate() {
+        let loc = lo + i as u32;
+        if let Err(e) = nic.insert_ntuple(loc, flow) {
+            let step = format!("ntuple insert @{loc} on {}: {e}", nic.ifname());
+            if let Err(rb) = guard.restore(nic) {
+                return Err(format!("{step}; ROLLBACK ALSO FAILED: {rb}"));
+            }
+            return Err(format!("{step} (rolled back — NIC untouched)"));
+        }
+        guard.rule_locs.push(loc);
+    }
+    Ok(guard)
 }

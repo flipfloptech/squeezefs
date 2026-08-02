@@ -109,26 +109,25 @@ fn budget_resolution_order_flag_env_cgroup_ram() {
     );
 }
 
-/// L1 (IOPS-parity program): the transport payload-buffer cap is an
-/// eighth of the resolved budget, ceilinged at 2 GiB — the input the
-/// FUSE-over-io_uring depth policy degrades against.
+/// L1 (IOPS-parity program) × the 2026-08-04 derivation sweep: the
+/// transport payload-buffer cap is an eighth of the resolved budget —
+/// the former fixed 2 GiB ceiling is DELETED (the ipc-arena-cap
+/// sibling's law; the pinned-arena bound is the STRUCTURAL demand cap
+/// `nqueues × Q_DEPTH_DESIRED × payload_sz`, never a byte constant).
+/// The full derivation/precedence contracts live in
+/// `tests/derivation_sweep_tests.rs`.
 #[test]
-fn transport_buffer_cap_is_budget_eighth_ceilinged() {
+fn transport_buffer_cap_is_budget_fraction() {
     let mib = 1024 * 1024u64;
     let gib = 1024 * mib;
-    // 8G-cage class: budget 6.4 GiB ⇒ 819 MiB class cap.
+    // 8G-cage class: budget 6.4 GiB ⇒ 819 MiB class cap (byte-identical
+    // to the pre-sweep law — the ceiling never bound here).
     assert_eq!(
         mem_budget::transport_buffer_cap(6 * gib + 410 * mib),
         (6 * gib + 410 * mib) / 8
     );
-    // Big-RAM boxes hit the 2 GiB ceiling (the decomposition box: 76 GiB
-    // budget would otherwise allow 9.5 GiB of pinned arenas).
-    assert_eq!(mem_budget::transport_buffer_cap(76 * gib), 2 * gib);
-    assert_eq!(
-        mem_budget::TRANSPORT_BUFFER_CAP_CEILING,
-        2 * gib,
-        "ceiling constant is the documented policy value"
-    );
+    // Big-RAM boxes are no longer ceilinged (the decomposition box).
+    assert_eq!(mem_budget::transport_buffer_cap(76 * gib), 76 * gib / 8);
     // Tiny/unknown budgets degrade to 0 — the geometry floor (depth 4)
     // then holds the pre-L1 footprint.
     assert_eq!(mem_budget::transport_buffer_cap(0), 0);

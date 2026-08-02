@@ -16,7 +16,9 @@
 //! - queues = kernel possible CPUs (unchanged; kernel readiness requires
 //!   every queue registered — `SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES` stays
 //!   a testing-only override).
-//! - payload buffer cap = min(mem_budget / 8, 2 GiB), mem_budget resolved
+//! - payload buffer cap = mem_budget / 8 (no fixed ceiling — derivation
+//!   sweep 2026-08-04; the structural bound is the geometry's demand cap),
+//!   mem_budget resolved
 //!   at mount by the §5.7 order (flag → env → cgroup×0.8 → 70 % RAM).
 //! - per-queue depth: env `SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH` wins
 //!   verbatim (clamped 1..32, bypasses the cap — explicit operator
@@ -24,7 +26,7 @@
 //!   — desired 32 (the measured 316k config), floor 4 (the pre-L1 shipped
 //!   default: no box regresses below today's footprint).
 //! - INIT `max_background` = `-o max_background=N` override (> 0) else
-//!   clamp(queues × depth, 64, 256); `congestion_threshold` =
+//!   clamp(queues × depth, 64, u16::MAX); `congestion_threshold` =
 //!   `-o congestion_threshold=N` override (> 0) else max_background × 3/4.
 //!
 //! Suites (all real unprivileged mounts, kernel FUSE-over-io_uring):
@@ -42,7 +44,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const MIB: u64 = 1024 * 1024;
-const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Runtime page size (the kernel PAGE_SIZE the max_pages math uses).
 fn page_size() -> u64 {
@@ -127,15 +128,19 @@ fn possible_cpus() -> u64 {
     n as u64
 }
 
-/// The normative L1 buffer-cap policy: min(budget / 8, 2 GiB).
+/// The normative L1 buffer-cap policy: budget / 8 — the fixed 2 GiB
+/// ceiling was retired by the 2026-08-04 derivation sweep (the arena
+/// bound is the geometry's structural demand cap).
 fn expected_cap(budget_bytes: u64) -> u64 {
-    (budget_bytes / 8).min(2 * GIB)
+    budget_bytes / 8
 }
 
-/// The normative L1 background policy: clamp(queues × depth, 64, 256),
-/// congestion threshold ¾ of it.
+/// The normative L1 background policy: clamp(queues × depth, 64,
+/// u16::MAX) — the ceiling is the INIT-reply wire format, not a policy
+/// constant (derivation sweep 2026-08-04; `-o max_background` is the
+/// override); congestion threshold ¾ of it.
 fn expected_background(queues: u64, depth: u64) -> (u64, u64) {
-    let mb = (queues * depth).clamp(64, 256);
+    let mb = (queues * depth).clamp(64, u16::MAX as u64);
     (mb, mb * 3 / 4)
 }
 
@@ -371,7 +376,7 @@ fn test_default_mount_transport_geometry_and_init_limits() {
     assert_eq!(
         mount.metric(&stats, "transport_max_background"),
         mb,
-        "INIT max_background must follow clamp(queues × depth, 64, 256)"
+        "INIT max_background must follow clamp(queues × depth, 64, u16::MAX)"
     );
 
     // The kernel's own view — the INIT reply actually landed.

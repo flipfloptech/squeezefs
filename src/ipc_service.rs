@@ -256,20 +256,50 @@ pub(crate) fn spawn_read_handoff(
     });
 }
 
+/// What a W1 invalidation shoots down (POSIX-8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalScope {
+    /// **Attributes only** — `FUSE_NOTIFY_INVAL_INODE` with `off < 0`,
+    /// which the kernel treats as "drop the cached attrs (and ACLs),
+    /// touch no page". Cheap by construction, which is exactly why it
+    /// is EXEMPT from the write rate limiter: size coherence is not a
+    /// cache economy.
+    AttrsOnly,
+    /// **Whole inode** — attrs plus the full page range (`off 0, len
+    /// -1`): bind, the first ring write per window, and the last unbind.
+    Whole,
+}
+
 /// The §5.6.2 W1 invalidation policy: fire on BIND, fire on the FIRST
 /// ring write per (ino, window), suppress in-window repeats, never on
 /// reads. The hook is injectable (tests record; production pushes
 /// `FUSE_NOTIFY_INVAL_INODE` through the fuse3 [`Notify`] handle) — the
 /// policy is identical either way and pinned by the lifecycle suite.
 ///
+/// **POSIX-8** (spec §5) adds the size law on top of that economy. Ring
+/// writes never touch the kernel's `i_size`, so while the window
+/// suppressed shootdowns a `lseek(SEEK_END)` — including the shim's
+/// own, which PERF-7 deliberately routes to the kernel — read a stale
+/// size and appended over live data. Every ring write that GROWS the
+/// file therefore fires an [`InvalScope::AttrsOnly`] refresh regardless
+/// of the window, and the last unbind of an inode fires a whole-inode
+/// shootdown so nothing the window suppressed outlives the bindings.
+///
 /// [`Notify`]: fuse3::raw::Notify
 struct Invalidator {
-    hook: Arc<dyn Fn(u64) + Send + Sync>,
+    hook: Arc<dyn Fn(u64, InvalScope) + Send + Sync>,
     window: std::time::Duration,
     /// ino → last write-fired instant (latch-free; bounded by the set of
     /// ring-written inos — entries are two words, never reclaimed within
     /// a mount, same leak class as the shim's fd-table cells).
     last_write: scc::HashMap<u64, std::time::Instant>,
+    /// POSIX-8: ino → the highest end offset any ring write has reached
+    /// (the announced-size high-water). A write past it can only be a
+    /// size change, and a write within it cannot be one — the exact test
+    /// the size exemption needs, for one latch-free probe and no
+    /// metadata round trip on the hot path. Reset at bind and dropped at
+    /// last unbind, so a re-opened file re-announces.
+    write_hwm: scc::HashMap<u64, u64>,
 }
 
 impl Invalidator {
@@ -277,12 +307,31 @@ impl Invalidator {
     /// from before this process bound), does NOT consume the write
     /// window (the first write after bind still fires — pinned).
     fn on_bind(&self, ino: u64) {
-        METRICS.ipc_inval_notifies.fetch_add(1, Ordering::Relaxed);
-        (self.hook)(ino);
+        // POSIX-8: a fresh bind re-establishes the announced-size
+        // high-water — the file may have been truncated through the
+        // kernel path since the last binding, and a stale high-water
+        // would swallow the next size change.
+        self.write_hwm.remove_sync(&ino);
+        self.fire(ino, InvalScope::Whole);
     }
 
-    /// Write-path invalidation, rate-limited per (ino, window).
-    fn on_write(&self, ino: u64) {
+    /// The last binding on `ino` went away (POSIX-8): one whole-inode
+    /// shootdown so the window's suppressed page invalidations cannot
+    /// outlive the bindings, and the high-water is forgotten.
+    fn on_last_unbind(&self, ino: u64) {
+        self.write_hwm.remove_sync(&ino);
+        self.fire(ino, InvalScope::Whole);
+    }
+
+    /// Write-path invalidation. `end` is this write's end offset
+    /// (`offset + written`).
+    ///
+    /// Ladder: the window's whole-inode shootdown when it is due (it
+    /// subsumes attrs, so it is never doubled); otherwise the POSIX-8
+    /// attrs-only refresh when the write grew the file; otherwise
+    /// suppressed.
+    fn on_write(&self, ino: u64, end: u64) {
+        let grew = self.note_write_end(ino, end);
         let now = std::time::Instant::now();
         let mut fire = false;
         match self.last_write.entry_sync(ino) {
@@ -298,11 +347,41 @@ impl Invalidator {
             }
         }
         if fire {
-            METRICS.ipc_inval_notifies.fetch_add(1, Ordering::Relaxed);
-            (self.hook)(ino);
+            self.fire(ino, InvalScope::Whole);
+        } else if grew {
+            // POSIX-8: exempt from the window — this is the kernel's
+            // only chance to learn the new size before a SEEK_END.
+            self.fire(ino, InvalScope::AttrsOnly);
         } else {
             METRICS.ipc_inval_suppressed.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Record this write's end offset; `true` ⇔ it advanced the
+    /// announced-size high-water (i.e. the file grew).
+    fn note_write_end(&self, ino: u64, end: u64) -> bool {
+        match self.write_hwm.entry_sync(ino) {
+            scc::hash_map::Entry::Occupied(mut o) => {
+                if end > *o.get() {
+                    *o.get_mut() = end;
+                    true
+                } else {
+                    false
+                }
+            }
+            scc::hash_map::Entry::Vacant(v) => {
+                v.insert_entry(end);
+                true
+            }
+        }
+    }
+
+    fn fire(&self, ino: u64, scope: InvalScope) {
+        METRICS.ipc_inval_notifies.fetch_add(1, Ordering::Relaxed);
+        if scope == InvalScope::AttrsOnly {
+            METRICS.ipc_inval_attrs_only.fetch_add(1, Ordering::Relaxed);
+        }
+        (self.hook)(ino, scope);
     }
 }
 
@@ -362,7 +441,7 @@ impl DataPlaneSink {
     /// rate window (production default 1000, `SQUEEZEFS_IPC_INVAL_WINDOW_MS`).
     pub fn with_invalidator(
         fs: SqueezefsFilesystem,
-        hook: Arc<dyn Fn(u64) + Send + Sync>,
+        hook: Arc<dyn Fn(u64, InvalScope) + Send + Sync>,
         window_ms: u64,
     ) -> Self {
         Self {
@@ -371,6 +450,7 @@ impl DataPlaneSink {
                 hook,
                 window: std::time::Duration::from_millis(window_ms),
                 last_write: scc::HashMap::new(),
+                write_hwm: scc::HashMap::new(),
             })),
             // SAFETY: plain getuid/getgid — always successful.
             req_uid: unsafe { libc::getuid() },
@@ -385,6 +465,15 @@ impl DataPlaneSink {
     pub fn on_bind(&self, ino: u64) {
         if let Some(iv) = &self.inval {
             iv.on_bind(ino);
+        }
+    }
+
+    /// The host's last-unbind hook (POSIX-8): the inode has no bindings
+    /// left in ANY session — one whole-inode shootdown retires whatever
+    /// the write window suppressed.
+    pub fn on_last_unbind(&self, ino: u64) {
+        if let Some(iv) = &self.inval {
+            iv.on_last_unbind(ino);
         }
     }
 
@@ -764,8 +853,12 @@ impl DataPlaneSink {
                     // §5.6.2 W1: invalidate AFTER the write landed (the
                     // kernel's refetch must observe the new state);
                     // rate-limited per (ino, window); reads never fire.
+                    // POSIX-8: the write's END OFFSET rides along — a
+                    // write past the announced high-water grew the file
+                    // and owes the kernel an attrs refresh whatever the
+                    // window says.
                     if let Some(iv) = inval {
-                        iv.on_write(ino);
+                        iv.on_write(ino, offset.saturating_add(u64::from(reply.written)));
                     }
                 }
                 Err(errno) => {
@@ -803,6 +896,10 @@ impl SessionSink for DataPlaneSink {
 
     fn on_bind(&self, ino: u64) {
         DataPlaneSink::on_bind(self, ino);
+    }
+
+    fn on_last_unbind(&self, ino: u64) {
+        DataPlaneSink::on_last_unbind(self, ino);
     }
 
     fn flush(&self) {

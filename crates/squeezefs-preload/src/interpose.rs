@@ -45,6 +45,7 @@
 use crate::bailout::{classify_fd, rwf_passthrough};
 use crate::dev_cache::NegativeDevCache;
 use crate::fd_table::{Binding, FdTable};
+use crate::mapped_inos::{mapping_poisons_bindings, MappedInoSet};
 use crate::session::{refuse_reason, RefusalOnce, RingOutcome, Session, SessionError};
 use squeezefs_ipc::wire::{BootstrapBlob, BOOTSTRAP_XATTR};
 
@@ -69,6 +70,13 @@ fn table() -> &'static FdTable {
 fn dev_cache() -> &'static NegativeDevCache {
     static CACHE: OnceLock<NegativeDevCache> = OnceLock::new();
     CACHE.get_or_init(NegativeDevCache::new)
+}
+
+/// POSIX-7: inodes this process has given a `MAP_SHARED` mapping. The
+/// ring is never re-armed on one (`crate::mapped_inos` module docs).
+fn mapped_inos() -> &'static MappedInoSet {
+    static MAPPED: OnceLock<MappedInoSet> = OnceLock::new();
+    MAPPED.get_or_init(MappedInoSet::new)
 }
 
 /// Session registry: (st_dev, shard) → leaked Session, slot index = the
@@ -148,6 +156,17 @@ impl Registry {
             }
         }
         None
+    }
+
+    /// Does this process have ANY established session on `dev`? The
+    /// POSIX-7 mmap poison's cheap "is this our mount" screen (shard
+    /// agnostic — the fd's shard is irrelevant to the question).
+    fn has_dev(&self, dev: u64) -> bool {
+        let tagged = dev.wrapping_add(1);
+        (0..MAX_SESSIONS).any(|i| {
+            self.devs[i].load(Ordering::Acquire) == tagged
+                && !self.ptrs[i].load(Ordering::Acquire).is_null()
+        })
     }
 
     fn by_token(&self, token: usize) -> Option<&Session> {
@@ -457,6 +476,15 @@ fn classify_and_bind(fd: c_int, epoch: u64) {
         return;
     }
     if dev_cache().contains(st.st_dev) {
+        return;
+    }
+    // POSIX-7: this inode has a `MAP_SHARED` mapping in this process.
+    // The kernel page cache is its authority — arming the ring here
+    // would put a second, invisible writer on the same bytes. The fd
+    // stays kernel-served for the process's lifetime (the mapping's
+    // lifetime is not observable to us; `munmap` is deliberately not
+    // interposed — see the module docs).
+    if mapped_inos().contains(st.st_dev, st.st_ino) {
         return;
     }
 
@@ -1630,6 +1658,14 @@ type MmapFn = unsafe extern "C" fn(*mut c_void, size_t, c_int, c_int, c_int, off
 /// bindings on the mapped inode FIRST, then the real mmap proceeds —
 /// the kernel page cache becomes that file's authority.
 ///
+/// **POSIX-7** (spec §5) adds the memory: a `MAP_SHARED` mapping also
+/// POISONS the inode, so the ring is never re-armed on it — the unbind
+/// alone was a point-in-time act that the next `open()` (or an `mmap()`
+/// that preceded the first one) undid, putting a writable mapping and
+/// ring writes on the same bytes with no arbiter. The poison covers the
+/// fd's inode even when the fd is UNBOUND (mapping a file this process
+/// has never bound is exactly the ordering that defeated the unbind).
+///
 /// # Safety
 /// C ABI interposer; argument contracts are libc's own.
 #[no_mangle]
@@ -1648,6 +1684,24 @@ pub unsafe extern "C" fn mmap(
     if fd >= 0 {
         if let Some(_g) = Guard::enter() {
             let walk = catch_unwind(AssertUnwindSafe(|| {
+                // POSIX-7 poison, BEFORE the real mmap: a bound fd names
+                // its inode for free; an unbound one costs one `fstat`
+                // (mmap is control-plane — the shim's per-op budget is
+                // untouched), and only on mounts not already classified
+                // foreign, and only when a session exists at all.
+                if mapping_poisons_bindings(flags) {
+                    // SAFETY: fstat into a zeroed buf.
+                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                    // SAFETY: plain fstat(2) on the caller's fd.
+                    let ok = unsafe { libc::fstat(fd, &mut st) } == 0;
+                    if ok
+                        && (st.st_mode & libc::S_IFMT) == libc::S_IFREG
+                        && !dev_cache().contains(st.st_dev)
+                        && (table().lookup(fd).is_some() || registry().has_dev(st.st_dev))
+                    {
+                        mapped_inos().insert(st.st_dev, st.st_ino);
+                    }
+                }
                 if let Some(b) = table().lookup(fd) {
                     let mut released = Vec::new();
                     let mut flushes = Vec::new();

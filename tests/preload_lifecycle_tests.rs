@@ -454,18 +454,27 @@ async fn invalidation_fires_on_bind_and_rate_limited_writes_never_reads() {
     tokio::task::block_in_place(|| ring_write_ok(&session, grant.binding_id, &w, 4096));
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
-        fx.inval.count_for(ino),
+        fx.inval.count_scope(ino, InvalScope::Whole),
         2,
         "a second write inside the window must be suppressed"
+    );
+    // POSIX-8 refinement: that second write is at offset 4096 — it GREW
+    // the file, so it owes the kernel an attrs-only size refresh (no
+    // page-cache work, exempt from the window). The suppression law
+    // above is unchanged; it is now a law about SHOOTDOWNS.
+    assert_eq!(
+        fx.inval.count_scope(ino, InvalScope::AttrsOnly),
+        1,
+        "a size-changing write refreshes attrs even inside the window"
     );
     let suppressed = METRICS.ipc_inval_suppressed.load(Ordering::Relaxed);
     assert!(suppressed >= 1, "suppression is counted");
 
-    // Past the window, the next write fires again.
+    // Past the window, the next write fires a shootdown again.
     tokio::time::sleep(Duration::from_millis(350)).await;
     tokio::task::block_in_place(|| ring_write_ok(&session, grant.binding_id, &w, 8192));
     wait_until("post-window invalidation", Duration::from_secs(5), || {
-        fx.inval.count_for(ino) >= 3
+        fx.inval.count_scope(ino, InvalScope::Whole) >= 3
     });
 
     // Reads NEVER invalidate.
@@ -630,7 +639,9 @@ async fn the_last_unbind_of_an_inode_fires_a_whole_inode_invalidation() {
     let (ino, fd) = fx.create_file("posix8-unbind.bin").await;
 
     let first = session.bind(fd.as_raw_fd()).expect("bind");
-    let second = session.bind(fd.as_raw_fd()).expect("second bind on the ino");
+    let second = session
+        .bind(fd.as_raw_fd())
+        .expect("second bind on the ino");
     wait_until("bind invalidations", Duration::from_secs(5), || {
         fx.inval.count_scope(ino, InvalScope::Whole) >= 2
     });

@@ -82,9 +82,7 @@ fn overflow_refuses_every_binding_rather_than_forgetting_one() {
 fn only_shared_mappings_poison() {
     const MAP_SHARED_VALIDATE: libc::c_int = 0x03;
     assert!(mapping_poisons_bindings(libc::MAP_SHARED));
-    assert!(mapping_poisons_bindings(
-        libc::MAP_SHARED | libc::MAP_FIXED
-    ));
+    assert!(mapping_poisons_bindings(libc::MAP_SHARED | libc::MAP_FIXED));
     assert!(mapping_poisons_bindings(MAP_SHARED_VALIDATE));
     assert!(!mapping_poisons_bindings(libc::MAP_PRIVATE));
     assert!(!mapping_poisons_bindings(

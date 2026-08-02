@@ -26,6 +26,7 @@ pub mod dev_cache;
 pub mod fd_table;
 #[cfg(feature = "interposers")]
 pub mod interpose;
+pub mod mapped_inos;
 pub mod session;
 // Session-arena THP helper — canonical file in the squeezefs-ipc tree,
 // `#[path]`-included here and by the root crate (the `wake_core`

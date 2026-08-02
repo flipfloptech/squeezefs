@@ -4090,6 +4090,13 @@ pub struct Metrics {
     /// write-storm economy gauge (notifies ≫ suppressed on rand-write
     /// workloads = window regression).
     pub ipc_inval_suppressed: Align64<AtomicU64>,
+    /// POSIX-8 size-coherence refreshes: ATTRS-ONLY invalidations fired
+    /// because a ring write GREW the file while the rate window was
+    /// suppressing whole-inode shootdowns. A subset of
+    /// `ipc_inval_notifies` (no page-cache work). Zero on an
+    /// append-free workload; zero on an APPEND workload means the
+    /// exemption regressed and `lseek(SEEK_END)` is reading stale sizes.
+    pub ipc_inval_attrs_only: Align64<AtomicU64>,
     /// Completion-doorbell wakes PAID (op-economy 2026-07-28, the
     /// `transport_wake_*` naming discipline): a completion observed a
     /// parked reaper and issued the cqe `FUTEX_WAKE`. Sparse-regime
@@ -6252,6 +6259,7 @@ impl SqueezefsFilesystem {
                 "ipc_sessions_reaped": METRICS.ipc_sessions_reaped.load(Ordering::Relaxed),
                 "ipc_inval_notifies": METRICS.ipc_inval_notifies.load(Ordering::Relaxed),
                 "ipc_inval_suppressed": METRICS.ipc_inval_suppressed.load(Ordering::Relaxed),
+                "ipc_inval_attrs_only": METRICS.ipc_inval_attrs_only.load(Ordering::Relaxed),
                 "ipc_cqe_wake_writes": METRICS.ipc_cqe_wake_writes.load(Ordering::Relaxed),
                 "ipc_cqe_wake_elided": METRICS.ipc_cqe_wake_elided.load(Ordering::Relaxed),
                 // DIALED P1 direct-drive (perf/ipc-direct-drive): the
@@ -16486,16 +16494,27 @@ pub async fn start_mount<P: AsRef<Path>>(
             std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None));
         ipc_notify_cell = Some(notify_cell.clone());
         let hook_runtime = tokio::runtime::Handle::current();
-        let hook: std::sync::Arc<dyn Fn(u64) + Send + Sync> = std::sync::Arc::new(move |ino| {
-            if let Some(notify) = notify_cell.load().as_ref() {
-                let notify = notify.clone();
-                // Whole-inode shootdown: attrs + the full page range
-                // (off 0, len -1) — the kernel refetches size and data.
-                hook_runtime.spawn(async move {
-                    notify.invalid_inode(ino, 0, -1).await;
-                });
-            }
-        });
+        let hook: std::sync::Arc<dyn Fn(u64, crate::ipc_service::InvalScope) + Send + Sync> =
+            std::sync::Arc::new(move |ino, scope| {
+                if let Some(notify) = notify_cell.load().as_ref() {
+                    let notify = notify.clone();
+                    // Whole-inode shootdown: attrs + the full page range
+                    // (off 0, len -1) — the kernel refetches size and
+                    // data. POSIX-8's size refresh instead passes
+                    // `off < 0`, which fs/fuse's
+                    // `fuse_reverse_inval_inode` reads as "invalidate
+                    // the attrs (and cached ACLs), touch no page" — the
+                    // cheap refresh that makes it safe to fire on every
+                    // size-changing ring write.
+                    let (off, len) = match scope {
+                        crate::ipc_service::InvalScope::Whole => (0, -1),
+                        crate::ipc_service::InvalScope::AttrsOnly => (-1, 0),
+                    };
+                    hook_runtime.spawn(async move {
+                        notify.invalid_inode(ino, off, len).await;
+                    });
+                }
+            });
         let sink = std::sync::Arc::new(crate::ipc_service::DataPlaneSink::with_invalidator(
             fs.clone(),
             hook,

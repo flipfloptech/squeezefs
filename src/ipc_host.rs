@@ -432,6 +432,12 @@ pub trait SessionSink: Send + Sync + 'static {
     /// host-isolation sink has no kernel cache to shoot down.
     fn on_bind(&self, _ino: u64) {}
 
+    /// The LAST binding on `ino` — across every live session — is gone
+    /// (POSIX-8: the data plane fires one whole-inode invalidation from
+    /// here, so page invalidations the W1 write window suppressed cannot
+    /// outlive the bindings). Default: nothing.
+    fn on_last_unbind(&self, _ino: u64) {}
+
     /// End-of-sweep hook: the service loop calls this once after every
     /// drain pass over its owned sessions. The direct-drive sink uses
     /// it to flush pushed-but-unsubmitted SQEs in ONE `io_uring_enter`
@@ -1379,6 +1385,23 @@ impl IpcHost {
         }
     }
 
+    /// POSIX-8: is `ino` still bound by ANY live session? Answered from
+    /// the session registry (control-plane cadence — see the Unbind
+    /// arm); a peer session still serving the inode keeps the ring
+    /// authoritative, so the last-unbind shootdown must not fire.
+    fn ino_bound_anywhere(&self, ino: u64) -> bool {
+        let sessions: Vec<Arc<IpcSession>> = self
+            .sessions
+            .lock()
+            .expect("session registry mutex never poisons")
+            .values()
+            .cloned()
+            .collect();
+        sessions
+            .iter()
+            .any(|s| s.bindings.any_sync(|_, rights| rights.ino == ino).is_some())
+    }
+
     /// Synthesize the bootstrap virtual-xattr blob (§5.2) for this host.
     pub fn bootstrap_blob(&self) -> Vec<u8> {
         BootstrapBlob {
@@ -1628,7 +1651,21 @@ impl IpcHost {
                     return;
                 }
                 Ok((CtlMsg::Unbind { binding_id }, _)) => {
-                    let _ = session.bindings.remove_sync(&binding_id);
+                    let ino = session
+                        .bindings
+                        .remove_sync(&binding_id)
+                        .map(|(_, rights)| rights.ino);
+                    // POSIX-8: was that the last binding on the inode,
+                    // anywhere? Control-plane cadence (one unbind per
+                    // close of the last dup), so the registry walk is
+                    // affordable and the answer is host-wide — a peer
+                    // session still serving the inode keeps the ring
+                    // authoritative and must NOT be shot down.
+                    if let Some(ino) = ino {
+                        if !self.ino_bound_anywhere(ino) {
+                            self.sink.on_last_unbind(ino);
+                        }
+                    }
                 }
                 Ok((other, _)) => {
                     self.poison_session(&session, &format!("unexpected ctl message {other:?}"));

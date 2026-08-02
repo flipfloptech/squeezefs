@@ -177,6 +177,18 @@ pub const FUSE_HANDLE_KILLPRIV_V2: u32 = 1 << 28;
 /// capability word.
 pub const FUSE_INIT_EXT: u32 = 1 << 30;
 
+/// sqz-kernel private INIT capability (kernel-sqz patch 0027 —
+/// `docker/kernel-sqz/V2-CANDIDATES.md` candidate 5): folded capability
+/// bit 62 = flags2 bit 30, deliberately far above upstream's bit-42
+/// watermark so an upstream collision is a recompile, not an ABI trap.
+/// When the kernel offers it and the daemon echoes it with a nonzero
+/// `time_max`, `fuse_init_out.time_{min,max}` become the superblock's
+/// `s_time_min`/`s_time_max`, making VFS `timestamp_truncate()` clamp
+/// incore exactly where the daemon clamps durable state (the fstests
+/// generic/634 finite-timestamp-range class). Stock kernels never offer
+/// the bit and never read the fields.
+pub const FUSE_TIME_LIMITS: u64 = 1 << 62;
+
 #[cfg(target_os = "macos")]
 pub const FUSE_ALLOCATE: u32 = 1 << 27;
 #[cfg(target_os = "macos")]
@@ -862,11 +874,20 @@ pub struct fuse_init_out {
     pub time_gran: u32,
     pub max_pages: u16,
     pub map_alignment: u16,
-    /// High 32 init flags (bits 32..63). Bit 9 = `FUSE_OVER_IO_URING` (1ULL<<41).
+    /// High 32 init flags (bits 32..63). Bit 9 = `FUSE_OVER_IO_URING` (1ULL<<41),
+    /// bit 30 = `FUSE_TIME_LIMITS` (1ULL<<62, sqz-kernel private).
     pub flags2: u32,
     pub max_stack_depth: u32,
     pub request_timeout: u16,
-    pub unused: [u16; 11],
+    pub unused: [u16; 3],
+    /// sqz `FUSE_TIME_LIMITS` (kernel-sqz patch 0027): inode-timestamp
+    /// floor in seconds; 0 unless the kernel offered the capability. The
+    /// i64 pair sits AFTER the shrunk `unused[3]` so both stay naturally
+    /// aligned and the struct stays the uapi's 64 bytes.
+    pub time_min: i64,
+    /// sqz `FUSE_TIME_LIMITS`: inode-timestamp ceiling in seconds; the
+    /// kernel gates on the echoed flag AND a nonzero `time_max`.
+    pub time_max: i64,
 }
 
 /*#[derive(Debug)]

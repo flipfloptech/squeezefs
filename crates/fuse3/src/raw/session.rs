@@ -1273,7 +1273,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             flags2,
             max_stack_depth: 0,
             request_timeout: 0,
-            unused: [0; 11],
+            unused: [0; 3],
+            time_min: 0,
+            time_max: 0,
         };
 
         debug!("fuse init out {:?}", init_out);
@@ -4888,6 +4890,27 @@ pub fn tpc_thread_count() -> usize {
 /// options gate the optional ones). Pure — pinned by
 /// `init_negotiation_tests`: a capability the daemon does not implement
 /// must never be advertised back to the kernel.
+/// The daemon's advertised inode-timestamp range for the sqz
+/// `FUSE_TIME_LIMITS` INIT capability: ±9,223,372,036 s — the whole-second
+/// interior of the i64-nanosecond storage word (the saturation law pinned
+/// in `tests/attr_refresh_tests.rs::out_of_range_timestamps_saturate_*`).
+/// Deliberately conservative by one second on the floor: the exact ns
+/// floor is −9,223,372,037 s + 145,224,192 ns, so advertising
+/// −9,223,372,036 keeps every kernel-clamped `(sec, nsec=0)` exactly
+/// representable — incore and durable state can never disagree.
+pub(crate) const TIME_LIMITS_MIN_SEC: i64 = -9_223_372_036;
+/// See [`TIME_LIMITS_MIN_SEC`]; the i64-ns ceiling's whole-second interior.
+pub(crate) const TIME_LIMITS_MAX_SEC: i64 = 9_223_372_036;
+
+/// sqz `FUSE_TIME_LIMITS` negotiation (kernel-sqz patch 0027):
+/// `Some((time_min, time_max))` iff the kernel offered folded capability
+/// bit 62; `None` on stock kernels, keeping the INIT reply bit-identical
+/// (fields zero, flag unechoed) — feature-absent must be unobservable.
+fn negotiate_time_limits(kernel_capabilities: u64) -> Option<(i64, i64)> {
+    let _ = kernel_capabilities;
+    None
+}
+
 fn negotiate_reply_flags(init_in_flags: u32, mount_options: &MountOptions) -> u32 {
     let mut reply_flags = 0;
 
@@ -5136,6 +5159,107 @@ mod init_negotiation_tests {
             flags & FUSE_POSIX_ACL,
             0,
             "INIT reply advertised FUSE_POSIX_ACL but the daemon refuses ACL xattrs"
+        );
+    }
+
+    /// sqz `FUSE_TIME_LIMITS` (kernel-sqz patch 0027, V2-CANDIDATES.md
+    /// candidate 5): the capability rides flags2 high space — folded
+    /// capability bit 62 = flags2 bit 30, deliberately far above
+    /// upstream's bit-42 watermark. The fold placement is the ABI: a
+    /// kernel offering flags2 bit 30 must read back as capability bit 62.
+    #[test]
+    fn time_limits_capability_is_folded_bit_62() {
+        assert_eq!(FUSE_TIME_LIMITS, 1u64 << 62, "the sqz-private bit");
+        assert_eq!(
+            (FUSE_TIME_LIMITS >> 32) as u32,
+            1u32 << 30,
+            "bit 62 must arrive as flags2 bit 30"
+        );
+        let ki = KernelInit::new(7, 45, 0, 1 << 30);
+        assert_ne!(
+            ki.flags & FUSE_TIME_LIMITS,
+            0,
+            "KernelInit fold must surface flags2 bit 30 as capability bit 62"
+        );
+    }
+
+    /// Offered ⇒ populated: the daemon answers with the exact-round-trip
+    /// ±9,223,372,036 s range (the whole-second interior of the i64-ns
+    /// storage word — the saturation law pinned in
+    /// `tests/attr_refresh_tests.rs`), so the kernel's incore clamp
+    /// (`timestamp_truncate`) and the daemon's durable clamp can never
+    /// disagree.
+    #[test]
+    fn time_limits_populate_when_offered() {
+        assert_eq!(
+            negotiate_time_limits(FUSE_TIME_LIMITS | (1 << 41) | 0xdead),
+            Some((TIME_LIMITS_MIN_SEC, TIME_LIMITS_MAX_SEC)),
+            "kernel offered bit 62: the reply must carry the timestamp range"
+        );
+        assert_eq!(TIME_LIMITS_MAX_SEC, 9_223_372_036);
+        assert_eq!(TIME_LIMITS_MIN_SEC, -9_223_372_036);
+        // Exact representability of the kernel-clamped extremes (sec, 0)
+        // inside the daemon's i64-ns word — the floor is conservative by
+        // one second BY DESIGN (the exact ns floor has nsec 145,224,192,
+        // which a kernel clamp to (floor_sec, 0) could not round-trip).
+        assert!(TIME_LIMITS_MAX_SEC.checked_mul(1_000_000_000).is_some());
+        assert!(TIME_LIMITS_MIN_SEC.checked_mul(1_000_000_000).is_some());
+    }
+
+    /// Stock kernel (bit not offered) ⇒ `None`: fields stay zero, the
+    /// flag is not echoed — the INIT reply must be BIT-IDENTICAL to the
+    /// pre-0027 daemon (feature-absent is unobservable; the kernel
+    /// additionally gates on nonzero `time_max`, so zeros are inert even
+    /// against a misbehaving offer).
+    #[test]
+    fn time_limits_absent_without_offer() {
+        assert_eq!(negotiate_time_limits(0), None);
+        assert_eq!(
+            negotiate_time_limits(u64::MAX & !FUSE_TIME_LIMITS),
+            None,
+            "every other capability set must not conjure time limits"
+        );
+    }
+
+    /// The INIT reply ABI (kernel-sqz patch 0027 uapi layout): the reply
+    /// stays 64 bytes with `time_min`/`time_max` at byte offsets 48/56 —
+    /// `unused[3]` precedes the i64 pair so both stay naturally aligned.
+    /// This is the wire contract REGISTER-side kernels deserialize; a
+    /// drifted offset silently corrupts `s_time_min/max`.
+    #[test]
+    fn init_out_abi_64_bytes_time_limits_at_48_56() {
+        let out = fuse_init_out {
+            major: FUSE_KERNEL_VERSION,
+            minor: FUSE_KERNEL_MINOR_VERSION,
+            max_readahead: 0,
+            flags: 0,
+            max_background: 0,
+            congestion_threshold: 0,
+            max_write: 0,
+            time_gran: 1,
+            max_pages: 0,
+            map_alignment: 0,
+            flags2: (FUSE_TIME_LIMITS >> 32) as u32,
+            max_stack_depth: 0,
+            request_timeout: 0,
+            unused: [0; 3],
+            time_min: TIME_LIMITS_MIN_SEC,
+            time_max: TIME_LIMITS_MAX_SEC,
+        };
+        let bytes = get_bincode_config()
+            .serialize(&out)
+            .expect("fuse_init_out must serialize");
+        assert_eq!(bytes.len(), 64, "fuse_init_out must stay the uapi 64 bytes");
+        assert_eq!(bytes.len(), FUSE_INIT_OUT_SIZE);
+        assert_eq!(
+            &bytes[48..56],
+            &TIME_LIMITS_MIN_SEC.to_le_bytes(),
+            "time_min must sit at byte offset 48"
+        );
+        assert_eq!(
+            &bytes[56..64],
+            &TIME_LIMITS_MAX_SEC.to_le_bytes(),
+            "time_max must sit at byte offset 56"
         );
     }
 

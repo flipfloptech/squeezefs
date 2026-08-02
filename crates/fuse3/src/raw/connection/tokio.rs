@@ -375,9 +375,10 @@ impl FuseConnection {
         addr: u64,
         len: usize,
     ) -> Option<super::fuse_over_uring::DestDmaLease> {
-        // Same uncontended-mutex posture as `get_payload_buffer` above
-        // (deliberately not arc-swap — the P2 md-storm forensics note).
-        let pool = self.over_uring.lock().unwrap().clone()?;
+        // PERF-2: a plain acquire load on the install-once `OnceLock` —
+        // no RMW on the request path (the pool is installed once at arm
+        // and never replaced; liveness rides the pool's own atomics).
+        let pool = self.over_uring.get()?;
         pool.lease_dest_window(addr, len)
     }
 

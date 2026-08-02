@@ -339,8 +339,34 @@ impl AsRef<[u8]> for ReadBlockValue {
     }
 }
 
+/// PERF-4 (b): one contiguous 4 KiB-aligned allocation carrying a pool's
+/// entire initial capacity — registerable with io_uring as ONE fixed
+/// buffer (`register_buffers` takes a single iovec covering every slot),
+/// so slab-resident read bounces skip the per-op page pin (gup) every
+/// unregistered DMA pays. The region lives for the pool's life; slots are
+/// never freed piecewise (see [`AlignedBufPool::trim_to`]).
+struct SlabRegion {
+    base: *mut u8,
+    len: usize,
+}
+
+impl SlabRegion {
+    fn contains(&self, ptr: *mut u8) -> bool {
+        let p = ptr as usize;
+        let b = self.base as usize;
+        p >= b && p < b + self.len
+    }
+}
+
 pub struct AlignedBufPool {
+    /// Fresh (individually-allocated) backings — the over-capacity /
+    /// pool-exhausted class; freed on over-capacity recycle and by
+    /// `trim_to`.
     queue: ArrayQueue<*mut u8>,
+    /// Idle slab slots (slab-backed pools only). Sized exactly to the
+    /// slot count, so a slab-slot recycle can never overflow into a free.
+    slab_queue: Option<ArrayQueue<*mut u8>>,
+    slab: Option<SlabRegion>,
     buf_size: usize,
 }
 
@@ -401,20 +427,68 @@ impl AlignedBufPool {
         for _ in 0..capacity {
             let _ = queue.push(alloc_pooled(buf_size));
         }
-        Self { queue, buf_size }
+        Self {
+            queue,
+            slab_queue: None,
+            slab: None,
+            buf_size,
+        }
+    }
+
+    /// PERF-4 (b): slab-backed constructor — the initial `capacity`
+    /// backings are `capacity` stride-`buf_size` slots of ONE contiguous
+    /// aligned allocation ([`SlabRegion`]), exposed via
+    /// [`Self::slab_range`] for io_uring fixed-buffer registration. Same
+    /// bytes the per-buffer constructor eagerly allocated (zeroed at
+    /// birth, lazily committed until touched — registration is what
+    /// commits/pins them); over-capacity traffic still rides fresh
+    /// individually-freed backings.
+    pub fn new_slabbed(capacity: usize, buf_size: usize) -> Self {
+        let total = capacity
+            .checked_mul(buf_size)
+            .expect("slab pool geometry overflow");
+        let base = alloc_pooled(total);
+        let slab_queue = ArrayQueue::new(capacity);
+        for i in 0..capacity {
+            // SAFETY: `i * buf_size < total` — inside the slab allocation.
+            let _ = slab_queue.push(unsafe { base.add(i * buf_size) });
+        }
+        Self {
+            queue: ArrayQueue::new(capacity),
+            slab_queue: Some(slab_queue),
+            slab: Some(SlabRegion { base, len: total }),
+            buf_size,
+        }
+    }
+
+    /// The pool's registerable slab window `(base, len)`, when slab-backed
+    /// (PERF-4 (b)). Pool statics live for the process, so a fixed-buffer
+    /// registration over this range can never dangle.
+    pub fn slab_range(&self) -> Option<(usize, usize)> {
+        self.slab.as_ref().map(|s| (s.base as usize, s.len))
     }
 
     /// R5 gauge: bytes of IDLE (queued) pool backings (see
     /// [`BufferPool::allocated_bytes`] for the double-count rationale).
     pub fn allocated_bytes(&self) -> u64 {
-        self.queue.len() as u64 * self.buf_size as u64
+        let slab_idle = self
+            .slab_queue
+            .as_ref()
+            .map(|q| q.len() as u64 * self.buf_size as u64)
+            .unwrap_or(0);
+        self.queue.len() as u64 * self.buf_size as u64 + slab_idle
     }
 
-    /// R5 Red trim (§5.7): free queued (idle) backings toward `target`.
+    /// R5 Red trim (§5.7): free queued (idle) FRESH backings toward
+    /// `target`. Slab slots are one allocation and cannot be freed
+    /// piecewise — and once registered as an io_uring fixed buffer their
+    /// pages are kernel-pinned, so trimming them would return nothing.
     pub fn trim_to(&self, target: u64) {
         while self.allocated_bytes() > target {
             let Some(ptr) = self.queue.pop() else { break };
-            // SAFETY: every queued pointer came from `alloc_pooled(self.buf_size)`.
+            // SAFETY: every `queue` pointer came from
+            // `alloc_pooled(self.buf_size)` (slab slots live only in
+            // `slab_queue`).
             unsafe { dealloc_pooled(ptr, self.buf_size) };
         }
     }
@@ -433,8 +507,16 @@ impl AlignedBufPool {
 
     /// Take a 4096-aligned buffer of [`Self::buf_size`] without wrapping in
     /// `Bytes` (P2-4: nvme unaligned write path recycles via [`Self::recycle`]).
+    /// Slab slots are preferred (PERF-4 (b): they ride the registered
+    /// fixed buffer, skipping per-op page pins), then fresh recycles,
+    /// then allocation.
     pub fn alloc_raw(self: &Arc<Self>) -> *mut u8 {
-        let ptr = match self.queue.pop() {
+        let pooled = self
+            .slab_queue
+            .as_ref()
+            .and_then(|q| q.pop())
+            .or_else(|| self.queue.pop());
+        let ptr = match pooled {
             Some(p) => {
                 crate::fuse_client::METRICS
                     .aligned_pool_hits
@@ -480,9 +562,19 @@ impl AlignedBufPool {
             0,
             "recycled pointer violates the alignment contract"
         );
+        // Slab slots return to their own queue (sized exactly to the slot
+        // count — the push can never fail) and are NEVER freed piecewise:
+        // they are windows of one allocation, and possibly a registered
+        // (kernel-pinned) fixed buffer.
+        if let (Some(slab), Some(sq)) = (&self.slab, &self.slab_queue) {
+            if slab.contains(ptr) {
+                let _ = sq.push(ptr);
+                return;
+            }
+        }
         if self.queue.push(ptr).is_err() {
             // Pool full — free the over-capacity buffer.
-            // SAFETY: every buffer recycled here was produced by
+            // SAFETY: every non-slab buffer recycled here was produced by
             // `alloc_pooled(self.buf_size)`.
             unsafe { dealloc_pooled(ptr, self.buf_size) };
         }
@@ -496,9 +588,20 @@ impl AlignedBufPool {
 impl Drop for AlignedBufPool {
     fn drop(&mut self) {
         while let Some(ptr) = self.queue.pop() {
-            // SAFETY: every queued pointer came from
+            // SAFETY: every `queue` pointer came from
             // `alloc_pooled(self.buf_size)`.
             unsafe { dealloc_pooled(ptr, self.buf_size) };
+        }
+        // Slab slots are windows of one allocation — drain the queue (the
+        // pointers are not individually owned) and free the region once.
+        if let Some(sq) = &self.slab_queue {
+            while sq.pop().is_some() {}
+        }
+        if let Some(slab) = self.slab.take() {
+            // SAFETY: `base` came from `alloc_pooled(len)` in
+            // `new_slabbed`; outstanding handouts hold an `Arc` to the
+            // pool, so by Drop time none exist.
+            unsafe { dealloc_pooled(slab.base, slab.len) };
         }
     }
 }
@@ -531,8 +634,12 @@ pub static RANGED_BUF_POOL: Lazy<Arc<AlignedBufPool>> = Lazy::new(|| {
     // reads), not block count: 64 KiB backings are cheap (cores × 64 ≈
     // 92 MiB on a 23-CPU box), and exhaustion degrades to ordinary
     // allocation — counted by `aligned_pool_misses`.
+    // Slab-backed (PERF-4 (b)): the NvmeBlockDev workers register the
+    // slab as ONE io_uring fixed buffer, so ranged cold fills DMA without
+    // per-op page pins. Same derived byte budget as before — one mapping
+    // instead of `capacity` of them.
     let capacity = std::cmp::max(cores * 64, 512);
-    Arc::new(AlignedBufPool::new(capacity, RANGED_BUF_SIZE))
+    Arc::new(AlignedBufPool::new_slabbed(capacity, RANGED_BUF_SIZE))
 });
 
 /// Pick the read-bounce pool for a device read of `size` bytes (routing
@@ -542,5 +649,124 @@ pub fn read_bounce_pool(size: usize) -> &'static Arc<AlignedBufPool> {
         &RANGED_BUF_POOL
     } else {
         &ALIGNED_BUF_POOL
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PERF-4 (b): slab-backed pools hand out slab-resident, 4 KiB-aligned
+    /// slots first, and every slot lies inside the advertised
+    /// `slab_range` (the fixed-buffer registration window).
+    #[test]
+    fn slabbed_pool_hands_out_slab_resident_slots() {
+        let pool = Arc::new(AlignedBufPool::new_slabbed(4, 8192));
+        let (base, len) = pool.slab_range().expect("slab-backed pool");
+        assert_eq!(len, 4 * 8192);
+        assert_eq!(base % POOLED_BUF_ALIGN, 0);
+
+        let ptrs: Vec<*mut u8> = (0..4).map(|_| pool.alloc_raw()).collect();
+        for &p in &ptrs {
+            let a = p as usize;
+            assert!(
+                a >= base && a + 8192 <= base + len,
+                "initial handout escaped the slab window"
+            );
+            assert_eq!(a % POOLED_BUF_ALIGN, 0);
+        }
+        for p in ptrs {
+            // SAFETY: every `p` came from this pool's `alloc_raw` above and
+            // is returned exactly once, still unaliased (the handout vec is
+            // consumed here).
+            unsafe { pool.recycle(p) };
+        }
+    }
+
+    /// Slab slots recycle into the slab queue and are handed out again —
+    /// never freed piecewise, even when over-capacity fresh recycles have
+    /// filled the fresh queue (the failure mode that would free a window
+    /// of the one slab allocation / a registered fixed buffer).
+    #[test]
+    fn slab_slots_survive_fresh_queue_saturation() {
+        let pool = Arc::new(AlignedBufPool::new_slabbed(2, 4096));
+        let (base, len) = pool.slab_range().unwrap();
+
+        // Drain the slab, then force fresh allocations…
+        let s1 = pool.alloc_raw();
+        let s2 = pool.alloc_raw();
+        let f1 = pool.alloc_raw();
+        let f2 = pool.alloc_raw();
+        let f3 = pool.alloc_raw();
+        assert!(
+            !(f1 as usize >= base && (f1 as usize) < base + len),
+            "exhausted slab must serve fresh backings"
+        );
+        // …and saturate the fresh queue (capacity 2) before the slab
+        // slots come home.
+        // SAFETY: f1..f3 and s1..s2 each came from this pool's `alloc_raw`
+        // above and are each returned exactly once, still unaliased.
+        unsafe {
+            pool.recycle(f1);
+            pool.recycle(f2);
+            pool.recycle(f3); // over-capacity fresh: freed
+            pool.recycle(s1);
+            pool.recycle(s2);
+        }
+
+        // Both slab slots must be reusable (they went to the slab queue,
+        // not the saturated fresh queue).
+        let r1 = pool.alloc_raw() as usize;
+        let r2 = pool.alloc_raw() as usize;
+        assert!(
+            r1 >= base && r1 < base + len && r2 >= base && r2 < base + len,
+            "recycled slab slots must be handed out again (slab queue)"
+        );
+    }
+
+    /// R5 trim frees fresh idle backings but never slab slots (one
+    /// allocation; kernel-pinned once registered) — and the idle gauge
+    /// counts both classes.
+    #[test]
+    fn trim_keeps_slab_and_gauge_counts_idle_slots() {
+        let pool = Arc::new(AlignedBufPool::new_slabbed(2, 4096));
+        assert_eq!(pool.allocated_bytes(), 2 * 4096);
+
+        // Park one fresh backing in the fresh queue.
+        let s1 = pool.alloc_raw();
+        let s2 = pool.alloc_raw();
+        let f1 = pool.alloc_raw();
+        // SAFETY: f1/s1/s2 each came from this pool's `alloc_raw` above and
+        // are each returned exactly once, still unaliased.
+        unsafe {
+            pool.recycle(f1);
+            pool.recycle(s1);
+            pool.recycle(s2);
+        }
+        assert_eq!(pool.allocated_bytes(), 3 * 4096);
+
+        // Trim to zero: only the fresh backing can go.
+        pool.trim_to(0);
+        assert_eq!(
+            pool.allocated_bytes(),
+            2 * 4096,
+            "trim must free fresh idle backings and keep every slab slot"
+        );
+        // Slab slots still serve.
+        let r = pool.alloc_raw() as usize;
+        let (base, len) = pool.slab_range().unwrap();
+        assert!(r >= base && r < base + len);
+    }
+
+    /// Non-slab pools advertise no slab window (the register arm in
+    /// nvme_dev must fall back to plain reads).
+    #[test]
+    fn per_buffer_pool_has_no_slab_range() {
+        let pool = Arc::new(AlignedBufPool::new(2, 4096));
+        assert!(pool.slab_range().is_none());
+        let p = pool.alloc_raw();
+        // SAFETY: `p` came from this pool's `alloc_raw` above and is
+        // returned exactly once, still unaliased.
+        unsafe { pool.recycle(p) };
     }
 }

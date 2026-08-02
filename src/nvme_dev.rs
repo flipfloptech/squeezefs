@@ -333,6 +333,36 @@ impl Drop for UringWorker {
     }
 }
 
+/// PERF-4 (a): build the worker ring with the strongest issue-economy
+/// flags the running kernel accepts — a RUNTIME probe ladder, never a
+/// kernel-version table (portable law). `SINGLE_ISSUER` is free by
+/// construction (the worker thread that builds the ring is its only
+/// submitter); `DEFER_TASKRUN` moves completion task-work onto this
+/// thread's own `io_uring_enter` instead of async IPI/task_work
+/// interrupts (requires SINGLE_ISSUER, 6.1+); `COOP_TASKRUN` is the
+/// milder 5.19+ variant. Each refusal falls back one rung; the last rung
+/// is today's plain ring.
+fn build_worker_ring(entries: u32) -> std::io::Result<(IoUring, &'static str)> {
+    if let Ok(r) = IoUring::builder()
+        .setup_single_issuer()
+        .setup_defer_taskrun()
+        .build(entries)
+    {
+        return Ok((r, "single_issuer+defer_taskrun"));
+    }
+    if let Ok(r) = IoUring::builder()
+        .setup_single_issuer()
+        .setup_coop_taskrun()
+        .build(entries)
+    {
+        return Ok((r, "single_issuer+coop_taskrun"));
+    }
+    if let Ok(r) = IoUring::builder().setup_single_issuer().build(entries) {
+        return Ok((r, "single_issuer"));
+    }
+    Ok((IoUring::new(entries)?, "plain"))
+}
+
 fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<UringRequest>) {
     let mut open_opts = OpenOptions::new();
     open_opts.read(true).write(true);
@@ -368,8 +398,16 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
 
     let fd = file.as_raw_fd();
 
-    let mut ring = match IoUring::new(1024) {
-        Ok(r) => r,
+    let mut ring = match build_worker_ring(1024) {
+        Ok((r, flags)) => {
+            log::debug!(
+                "NvmeBlockDev worker ring for {:?}: {} ({} entries)",
+                device_path,
+                flags,
+                1024
+            );
+            r
+        }
         Err(e) => {
             log::error!("Failed to initialize worker io_uring: {:?}", e);
             return;
@@ -395,6 +433,48 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
             );
             false
         }
+    };
+
+    // PERF-4 (b): register the ranged read-bounce slab as ONE fixed
+    // buffer (index 0), so slab-resident cold-fill DMAs ride ReadFixed
+    // and skip the per-op page pin (gup) every unregistered DMA pays —
+    // the tree's first `register_buffers` user. Same probe-fallback
+    // pattern as the fixed-file registration above: a refusal (memlock
+    // caps, old kernel) degrades to plain Read SQEs. The slab is
+    // process-static pool memory, and registration is what commits/pins
+    // its pages (once per worker ring; the pages themselves commit once).
+    // The whole-block 4 MiB pool is deliberately NOT registered: pinning
+    // cores×16×4 MiB (GiBs) trades real RAM for a pin cost already
+    // amortized across 4 MiB DMAs.
+    let slab_range = crate::cache::pool::RANGED_BUF_POOL.slab_range();
+    let use_fixed_buf = match slab_range {
+        Some((base, len)) => {
+            let iov = libc::iovec {
+                iov_base: base as *mut libc::c_void,
+                iov_len: len,
+            };
+            // SAFETY: the iovec covers the RANGED_BUF_POOL slab — a
+            // process-static allocation that outlives every ring.
+            match unsafe { ring.submitter().register_buffers(&[iov]) } {
+                Ok(()) => {
+                    log::debug!(
+                        "NvmeBlockDev: registered read-bounce slab ({} MiB) as fixed buffer 0",
+                        len >> 20
+                    );
+                    true
+                }
+                Err(e) => {
+                    log::debug!(
+                        "NvmeBlockDev: fixed-buffer register failed for {:?}: {:?} \
+                         (ranged reads use plain Read)",
+                        device_path,
+                        e
+                    );
+                    false
+                }
+            }
+        }
+        None => false,
     };
 
     struct ActiveReq {
@@ -452,7 +532,6 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
     let mut disconnected = false;
 
     loop {
-        let mut pushed = 0;
         loop {
             let req = if active_count == 0 {
                 match rx.recv() {
@@ -544,16 +623,33 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                         _keep_alive: None,
                         dest_token,
                     });
-                    if use_fixed {
-                        opcode::Read::new(types::Fixed(0), buf_ptr.0, size as _)
+                    // PERF-4 (b): slab-resident bounces ride the
+                    // registered fixed buffer (no per-op page pin); dest
+                    // and fresh-backing reads stay on plain Read.
+                    let in_slab = use_fixed_buf
+                        && slab_range.is_some_and(|(base, len)| {
+                            let p = buf_ptr.0 as usize;
+                            p >= base && p + size <= base + len
+                        });
+                    match (in_slab, use_fixed) {
+                        (true, true) => {
+                            opcode::ReadFixed::new(types::Fixed(0), buf_ptr.0, size as _, 0)
+                                .offset(offset)
+                                .build()
+                                .user_data(slot_idx as u64)
+                        }
+                        (true, false) => opcode::ReadFixed::new(Fd(fd), buf_ptr.0, size as _, 0)
                             .offset(offset)
                             .build()
-                            .user_data(slot_idx as u64)
-                    } else {
-                        opcode::Read::new(Fd(fd), buf_ptr.0, size as _)
+                            .user_data(slot_idx as u64),
+                        (false, true) => opcode::Read::new(types::Fixed(0), buf_ptr.0, size as _)
                             .offset(offset)
                             .build()
-                            .user_data(slot_idx as u64)
+                            .user_data(slot_idx as u64),
+                        (false, false) => opcode::Read::new(Fd(fd), buf_ptr.0, size as _)
+                            .offset(offset)
+                            .build()
+                            .user_data(slot_idx as u64),
                     }
                 }
                 UringRequest::Write { offset, data, tx } => {
@@ -595,7 +691,7 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
             };
 
             let mut pushed_sqe = false;
-            for retry in 0..3 {
+            for _retry in 0..3 {
                 unsafe {
                     if let Ok(()) = ring.submission().push(&sqe) {
                         pushed_sqe = true;
@@ -603,8 +699,18 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                     }
                 }
 
-                // If push failed, submission queue is full. Submit existing and drain.
-                let _ = ring.submit();
+                // Push failed: the submission ring is full of this pass's
+                // not-yet-submitted SQEs. ONE enter both flushes them and
+                // waits for ≥ 1 completion (PERF-4 (c) — and the only
+                // DEFER_TASKRUN-correct shape: a plain submit() runs no
+                // completion task-work, so the old submit-then-peek pass
+                // drained nothing on deferred rings).
+                if let Err(e) = ring.submit_and_wait(1) {
+                    log::error!(
+                        "Uring worker: submit_and_wait(1) failed on SQ full: {:?}",
+                        e
+                    );
+                }
                 let mut cq = ring.completion();
                 cq.sync();
                 let mut completed_slots = Vec::new();
@@ -626,15 +732,6 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                 for idx in completed_slots {
                     free_slots.push(idx);
                     active_count -= 1;
-                }
-
-                if retry == 1 {
-                    if let Err(e) = ring.submit_and_wait(1) {
-                        log::error!(
-                            "Uring worker: submit_and_wait(1) failed on SQ full: {:?}",
-                            e
-                        );
-                    }
                 }
             }
 
@@ -668,15 +765,13 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
             }
 
             active_count += 1;
-            pushed += 1;
         }
 
-        if pushed > 0 {
-            if let Err(e) = ring.submit() {
-                log::error!("io_uring submit failed: {:?}", e);
-            }
-        }
-
+        // PERF-4 (c): ONE io_uring_enter per pass — submit_and_wait both
+        // flushes every SQE this pass pushed and parks for ≥ 1 completion
+        // (the old shape paid submit() + submit_and_wait(1) = two enters).
+        // A successful push always increments active_count, so pushed > 0
+        // ⇒ active_count > 0 and nothing is ever left unflushed here.
         if active_count > 0 {
             if let Err(e) = ring.submit_and_wait(1) {
                 log::error!("io_uring submit_and_wait failed: {:?}", e);

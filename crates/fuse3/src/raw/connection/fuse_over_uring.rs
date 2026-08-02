@@ -1696,6 +1696,13 @@ impl FuseOverUring {
                 wake_coalescer: Arc::new(WakeCoalescer::new()),
                 arena: std::sync::Mutex::new(None),
                 kmbuf: std::sync::Mutex::new(None),
+                // MEM-1: the sim venue arms no ring, but the §5.4 lease
+                // words must still exist so dest-claim paths compile and
+                // read as "no owner" here (sim_inert never DMAs). The
+                // inert venue registers no ents, so an empty set is the
+                // honest shape.
+                lease_states: Vec::new(),
+                dest_window: std::sync::OnceLock::new(),
             });
             commit_rxs.push(commit_rx);
         }

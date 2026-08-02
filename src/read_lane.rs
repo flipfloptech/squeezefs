@@ -234,7 +234,19 @@ pub struct ReadLaneHold {
     fifo: crossbeam::queue::SegQueue<(u64, String)>,
     seq: AtomicU64,
     bytes: AtomicU64,
+    /// Live entry count — the exact O(1) input to the RES-3 tombstone
+    /// trigger (`scc::HashMap::len` walks buckets; this is one atomic).
+    live: AtomicU64,
+    /// Single-reclaimer latch: at most one [`Self::reclaim_fifo`] pass
+    /// runs at a time (a second caller simply skips — the backlog is
+    /// already being drained).
+    reclaiming: std::sync::atomic::AtomicBool,
 }
+
+/// RES-3 hysteresis floor: below this many nodes a backlog is not worth
+/// a drain pass (an amortization floor, not a resource cap — the bound
+/// that matters is the `2 × live` term, which scales with the hold).
+const FIFO_RECLAIM_SLACK: u64 = 32;
 
 impl Default for ReadLaneHold {
     fn default() -> Self {
@@ -249,6 +261,8 @@ impl ReadLaneHold {
             fifo: crossbeam::queue::SegQueue::new(),
             seq: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            live: AtomicU64::new(0),
+            reclaiming: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -315,11 +329,18 @@ impl ReadLaneHold {
             .is_ok()
         {
             self.bytes.fetch_add(len, Ordering::Relaxed);
+            self.live.fetch_add(1, Ordering::Relaxed);
             self.fifo.push((seq, block_key.to_string()));
             crate::fuse_client::METRICS
                 .read_lane_holds
                 .fetch_add(1, Ordering::Relaxed);
             self.trim_to(budget);
+            // RES-3: `trim_to` runs only while `bytes > target`, so in
+            // the healthy steady state (every entry retires on coverage)
+            // it never pops and the ordering queue grows a node per
+            // deposit — unbounded, and invisible to the R5 payload-byte
+            // gauge. Reclaim the backlog here, amortized.
+            self.reclaim_fifo();
         }
     }
 
@@ -394,6 +415,7 @@ impl ReadLaneHold {
             if let Some((_, e)) = self.entries.remove_if_sync(&key, |e| e.seq == seq) {
                 let len = e.bytes.len() as u64;
                 self.bytes.fetch_sub(len, Ordering::Relaxed);
+                crate::gauge_core::sub_saturating(&self.live, 1);
                 if e.served.load(Ordering::Relaxed) < len {
                     crate::fuse_client::METRICS
                         .read_lane_hold_evicted_unconsumed
@@ -408,6 +430,9 @@ impl ReadLaneHold {
             crate::fuse_client::METRICS
                 .read_lane_hold_retired
                 .fetch_add(1, Ordering::Relaxed);
+            // RES-3: retirement is what MINTS the tombstone; a hold that
+            // stops taking deposits must still shed its backlog.
+            self.reclaim_fifo();
         }
     }
 
@@ -416,10 +441,58 @@ impl ReadLaneHold {
         if let Some((_, e)) = self.entries.remove_sync(block_key) {
             self.bytes
                 .fetch_sub(e.bytes.len() as u64, Ordering::Relaxed);
+            crate::gauge_core::sub_saturating(&self.live, 1);
             true
         } else {
             false
         }
+    }
+
+    /// RES-3: drop the FIFO nodes whose entry is gone (retired, purged,
+    /// or re-inserted under a fresher seq).
+    ///
+    /// A `SegQueue` has no interior removal, so this is a drain-and-refill
+    /// pass, gated on the backlog exceeding `2 × live + slack` — amortized
+    /// O(1) per deposit, and it bounds the node count at that multiple of
+    /// the live set instead of at "every deposit this mount ever made".
+    /// A head-only skim cannot do the job: a long-lived unconsumed entry
+    /// sits at the head while tombstones pile up behind it.
+    ///
+    /// Ordering: kept nodes are re-pushed in their original relative
+    /// order. Nodes pushed CONCURRENTLY with a pass land ahead of them,
+    /// so a trim in that window can pick a slightly-out-of-order victim
+    /// — an LRU-hint imprecision over at most the handful of deposits
+    /// made during one pass, whose cost is one refetch (the store's
+    /// standing eviction posture), never correctness.
+    fn reclaim_fifo(&self) {
+        let backlog = self.fifo.len() as u64;
+        if backlog <= self.live.load(Ordering::Relaxed) * 2 + FIFO_RECLAIM_SLACK {
+            return;
+        }
+        if self
+            .reclaiming
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let mut keep: Vec<(u64, String)> = Vec::new();
+        for _ in 0..backlog {
+            let Some((seq, key)) = self.fifo.pop() else {
+                break;
+            };
+            if self
+                .entries
+                .read_sync(&key, |_, e| e.seq == seq)
+                .unwrap_or(false)
+            {
+                keep.push((seq, key));
+            }
+        }
+        for node in keep {
+            self.fifo.push(node);
+        }
+        self.reclaiming
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 

@@ -41,7 +41,9 @@ fn bench_hold(c: &mut Criterion) {
         b.iter(|| {
             hold.insert_demand("bench:block_00000042", payload.clone(), budget);
             for _ in 0..4 {
-                black_box(hold.serve_with_provenance("bench:block_00000042", SUB_READ));
+                let served = hold.serve_with_provenance("bench:block_00000042", SUB_READ);
+                assert!(served.is_some(), "hold must serve until coverage retires");
+                black_box(served);
             }
         });
     });
@@ -81,7 +83,13 @@ fn bench_classifier(c: &mut Criterion) {
         b.iter(|| {
             let r = lanes.observe(black_box(off), SUB_READ, true);
             off += SUB_READ;
-            black_box(r.map(|l| l.is_streaming()))
+            // Engagement assert: this bench measures the CLASSIFIED match
+            // arm — anything else is measuring the wrong path.
+            assert!(
+                r.as_ref().is_some_and(|l| l.is_streaming()),
+                "steady seq stream must ride the classified match arm"
+            );
+            black_box(r.is_some())
         });
     });
 
@@ -97,11 +105,16 @@ fn bench_classifier(c: &mut Criterion) {
     group.bench_function("membership_reorder_pair", |b| {
         b.iter(|| {
             // Out-of-order sibling first (advances the edge), then the
-            // in-order request the swap displaced.
+            // in-order request the swap displaced. Both must keep
+            // MEMBERSHIP (streaming) — losing it means this bench slid
+            // onto the foreign/claim arm (the pre-fix wedge behavior).
             let a = lanes2.observe(black_box(edge + SUB_READ), SUB_READ, true);
             let b2 = lanes2.observe(black_box(edge), SUB_READ, true);
             edge += 2 * SUB_READ;
-            black_box((a.is_some(), b2.is_some()))
+            assert!(
+                a.is_some_and(|l| l.is_streaming()) && b2.is_some_and(|l| l.is_streaming()),
+                "reorder pair must stay inside the classified-membership window"
+            );
         });
     });
 

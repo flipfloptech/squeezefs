@@ -299,6 +299,7 @@ fn zcrx_metric(name: &str) -> u64 {
         "gather_bytes" => m.zcrx_gather_bytes.load(Ordering::Relaxed),
         "admission_waits" => m.zcrx_area_admission_waits.load(Ordering::Relaxed),
         "poisoned" => m.zcrx_lane_poisoned.load(Ordering::Relaxed),
+        "dest_gather_bytes" => m.zcrx_dest_gather_bytes.load(Ordering::Relaxed),
         _ => panic!("unknown metric {name}"),
     }
 }
@@ -1400,4 +1401,210 @@ async fn test_mem3_area_cancellation_returns_cids_chunks_and_stays_clean() {
         "area cancellation is not a poison event"
     );
     drop(bufs);
+}
+
+// ================================================================== Z3 laws
+// Gather fusion (design §4.4/§10 PR Z3 — pre-rc spec §9 PERF-1): when the
+// funnel read carries a registered destination (`dest_addr` — the routing
+// raw full-block leg and the R3 ranged zero-copy leg), the lane's ONE
+// completion gather lands DIRECTLY in that destination. The Z2
+// intermediate (gather → pooled bounce → serve copy) is deleted on this
+// shape — the pass the Phase-1 bracket priced at −65–68 % RX CPU. Every
+// Z2 law is preserved: gather ≡ fill byte-exact, poison lattice,
+// `zcrx_lane_poisoned` must-stay-0, R5 Red arm gate, `SQUEEZEFS_ZCRX_LANE=0`
+// kill switch, kernel path byte-identical when unarmed.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_z3_dest_fused_serve_engages_and_closes() {
+    // AREA_SIM lane armed through the funnel; a dest-carrying read must be
+    // lane-served (mock namespace bytes, not file bytes) with the gather
+    // fused into the destination: `zcrx_dest_gather_bytes` accounts the
+    // row byte-exactly and gather ≡ fill still closes across sub-command
+    // splits (512 KiB = 2 × 256 KiB max_xfer segments into ONE dest).
+    let mock = MockTarget::start(MockCfg::default(), 8 << 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blockfile");
+    std::fs::write(&path, vec![0xEEu8; 8 << 20]).unwrap();
+
+    let env = LaneEnv::area_sim(&mock, 2, 8);
+    let before_fills = zcrx_metric("fills");
+    let before_bytes = zcrx_metric("fill_bytes");
+    let before_gather = zcrx_metric("gather_bytes");
+    let before_dest_gather = zcrx_metric("dest_gather_bytes");
+    let before_fallbacks = zcrx_metric("fallbacks");
+
+    let dev = squeezefs::nvme_dev::NvmeBlockDev::new(path.to_str().unwrap());
+    // Registered-destination stand-in: a pooled 4 KiB-aligned buffer held
+    // alive by the test across the op (the read_block_with_dest contract).
+    let (dest_ptr, dest_bytes) = squeezefs::cache::pool::ALIGNED_BUF_POOL.alloc();
+    let size = 512 * 1024usize;
+    let got = dev
+        .read_block_with_dest(8192, size, Some(dest_ptr as u64))
+        .await
+        .expect("dest read");
+    drop(env);
+
+    assert_eq!(
+        &got[..size],
+        &mock.device[8192..8192 + size],
+        "the lane must serve the dest read (namespace bytes, not file \
+         bytes) — the fused arm engages on dest_addr shapes"
+    );
+    // SAFETY: test-owned pooled buffer, op complete.
+    let landed = unsafe { std::slice::from_raw_parts(dest_ptr, size) };
+    assert_eq!(
+        landed,
+        &mock.device[8192..8192 + size],
+        "the gather must land IN the destination (no intermediate)"
+    );
+    assert_eq!(zcrx_metric("fills") - before_fills, 1, "one fill per read");
+    assert_eq!(
+        zcrx_metric("fill_bytes") - before_bytes,
+        size as u64,
+        "fill-provenance engagement"
+    );
+    assert_eq!(
+        zcrx_metric("gather_bytes") - before_gather,
+        size as u64,
+        "gather ≡ fill closure preserved under fusion"
+    );
+    assert_eq!(
+        zcrx_metric("dest_gather_bytes") - before_dest_gather,
+        size as u64,
+        "the fused-serve gauge must account the dest row byte-exactly \
+         (Z2 kept this 0 — the intermediate-copy shape)"
+    );
+    assert_eq!(zcrx_metric("fallbacks"), before_fallbacks, "clean run");
+    drop(dest_bytes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_z3_pooled_reads_stay_two_pass_and_dest_gauge_silent() {
+    // Backend-shape distinction: pooled (dest-less) funnel reads keep the
+    // Z2 shape — `zcrx_gather_bytes` moves, `zcrx_dest_gather_bytes` must
+    // NOT (those bytes still pay the serve pass upstream; the fused gauge
+    // must never lie about them).
+    let mock = MockTarget::start(MockCfg::default(), 4 << 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blockfile");
+    std::fs::write(&path, vec![0xEEu8; 4 << 20]).unwrap();
+
+    let env = LaneEnv::area_sim(&mock, 1, 8);
+    let before_gather = zcrx_metric("gather_bytes");
+    let before_dest_gather = zcrx_metric("dest_gather_bytes");
+    let dev = squeezefs::nvme_dev::NvmeBlockDev::new(path.to_str().unwrap());
+    let got = dev.read_block(4096, 128 * 1024).await.expect("lane read");
+    drop(env);
+
+    assert_eq!(&got[..], &mock.device[4096..4096 + 128 * 1024]);
+    assert_eq!(
+        zcrx_metric("gather_bytes") - before_gather,
+        128 * 1024,
+        "pooled reads still pay their ONE gather"
+    );
+    assert_eq!(
+        zcrx_metric("dest_gather_bytes"),
+        before_dest_gather,
+        "dest-fused gauge stays silent on pooled reads"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_z3_dest_reads_never_ride_the_classic_backend() {
+    // The classic (FORCE_COPY contract) backend's reader task writes the
+    // destination from a foreign task — for a registered dest that is the
+    // MEM-1 hazard class, so dest fusion is area-backend-only BY LAW:
+    // classic sessions must leave dest reads on the kernel path (file
+    // bytes), with no fill, no fallback (ineligibility is not an error).
+    let mock = MockTarget::start(MockCfg::default(), 1 << 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blockfile");
+    let content: Vec<u8> = (0..1 << 20).map(|i| (i % 249) as u8).collect();
+    std::fs::write(&path, &content).unwrap();
+
+    std::env::set_var("SQUEEZEFS_ZCRX_LANE", "1");
+    std::env::set_var("SQUEEZEFS_ZCRX_LANE_FORCE_COPY", "1");
+    std::env::set_var(
+        "SQUEEZEFS_ZCRX_LANE_TARGET",
+        format!(
+            "127.0.0.1,{},{},1,{},262144,1,4",
+            mock.port, MOCK_SUBNQN, MOCK_LBA_SHIFT
+        ),
+    );
+
+    let before_fills = zcrx_metric("fills");
+    let before_fallbacks = zcrx_metric("fallbacks");
+    let before_dest_gather = zcrx_metric("dest_gather_bytes");
+    let dev = squeezefs::nvme_dev::NvmeBlockDev::new(path.to_str().unwrap());
+    let (dest_ptr, dest_bytes) = squeezefs::cache::pool::ALIGNED_BUF_POOL.alloc();
+    let size = 64 * 1024usize;
+    let got = dev
+        .read_block_with_dest(4096, size, Some(dest_ptr as u64))
+        .await
+        .expect("kernel-path dest read");
+
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE");
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE_FORCE_COPY");
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE_TARGET");
+
+    assert_eq!(
+        &got[..size],
+        &content[4096..4096 + size],
+        "classic-backend dest reads must stay on the kernel path (FILE bytes)"
+    );
+    assert_eq!(zcrx_metric("fills"), before_fills, "no lane fill");
+    assert_eq!(
+        zcrx_metric("fallbacks"),
+        before_fallbacks,
+        "ineligibility is not a fallback (the ≈0 gauge stays honest)"
+    );
+    assert_eq!(zcrx_metric("dest_gather_bytes"), before_dest_gather);
+    drop(dest_bytes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_z3_dest_lane_error_falls_back_to_kernel_path() {
+    // Per-op fallback law on the fused arm (design §6): a lane error on a
+    // dest read surfaces NOWHERE — the kernel path serves the read into
+    // the SAME destination (idempotent), counted in zcrx_fill_fallbacks.
+    let cfg = MockCfg {
+        fail_status: Some(0x0281),
+        ..Default::default()
+    };
+    let mock = MockTarget::start(cfg, 1 << 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blockfile");
+    let content: Vec<u8> = (0..1 << 20).map(|i| (i % 241) as u8).collect();
+    std::fs::write(&path, &content).unwrap();
+
+    let env = LaneEnv::area_sim(&mock, 1, 4);
+    let before_fallbacks = zcrx_metric("fallbacks");
+    let before_fills = zcrx_metric("fills");
+    let before_dest_gather = zcrx_metric("dest_gather_bytes");
+    let dev = squeezefs::nvme_dev::NvmeBlockDev::new(path.to_str().unwrap());
+    let (dest_ptr, dest_bytes) = squeezefs::cache::pool::ALIGNED_BUF_POOL.alloc();
+    let size = 64 * 1024usize;
+    let got = dev
+        .read_block_with_dest(4096, size, Some(dest_ptr as u64))
+        .await
+        .expect("the op must succeed via the kernel path");
+    drop(env);
+
+    assert_eq!(
+        &got[..size],
+        &content[4096..4096 + size],
+        "kernel path must serve the FILE bytes into the dest after the \
+         lane error"
+    );
+    assert!(
+        zcrx_metric("fallbacks") > before_fallbacks,
+        "the dest-arm fallback must be counted"
+    );
+    assert_eq!(
+        zcrx_metric("fills"),
+        before_fills,
+        "a failed op is not a fill"
+    );
+    assert_eq!(zcrx_metric("dest_gather_bytes"), before_dest_gather);
+    drop(dest_bytes);
 }

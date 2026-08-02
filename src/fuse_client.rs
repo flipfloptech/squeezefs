@@ -2910,6 +2910,13 @@ pub struct Metrics {
     pub zcrx_gather_bytes: Align64<AtomicU64>,
     pub zcrx_area_admission_waits: Align64<AtomicU64>,
     pub zcrx_lane_poisoned: Align64<AtomicU64>,
+    /// PR Z3 (gather fusion): the subset of `zcrx_gather_bytes` whose ONE
+    /// completion gather landed DIRECTLY in the funnel caller's registered
+    /// destination (`dest_addr` reads — the routing raw full-block leg and
+    /// the R3 ranged zero-copy leg). `gather − dest_gather` is the
+    /// remaining Z2 two-pass (pooled-bounce) traffic; a fused row is
+    /// engaged iff this delta accounts for the row's dest-read bytes.
+    pub zcrx_dest_gather_bytes: Align64<AtomicU64>,
     /// Layout mix (write path outcomes).
     pub layout_inline_writes: Align64<AtomicU64>,
     pub layout_staged_writes: Align64<AtomicU64>,
@@ -5586,6 +5593,7 @@ impl SqueezefsFilesystem {
                 "zcrx_gather_bytes": METRICS.zcrx_gather_bytes.load(Ordering::Relaxed),
                 "zcrx_area_admission_waits": METRICS.zcrx_area_admission_waits.load(Ordering::Relaxed),
                 "zcrx_lane_poisoned": METRICS.zcrx_lane_poisoned.load(Ordering::Relaxed),
+                "zcrx_dest_gather_bytes": METRICS.zcrx_dest_gather_bytes.load(Ordering::Relaxed),
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
                 "staged_spill_escalations": METRICS.staged_spill_escalations.load(Ordering::Relaxed),

@@ -173,6 +173,6 @@ coordination rule).
 | `cargo test --all-features -- --test-threads=1` (full root suite, from zero) | pass |
 | fuse3 standalone suite | pass (lib 60/60 + suites) |
 | squeezefs-ipc / squeezefs-preload suites | pass |
-| `cargo doc --no-deps` | clean |
+| `cargo doc --no-deps` | no NEW warnings (4 pre-existing private-link warnings on dev `68e8474` in untouched files — `placed_sever`/`ipc_service`/`routing`; out of this sweep's scope) |
 | `cargo bench --benches -- --test` (criterion smoke) | pass |
 | Field A/B rows | deferred to the reformat window (§3 manifest) |

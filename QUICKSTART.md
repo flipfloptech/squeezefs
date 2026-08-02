@@ -507,8 +507,10 @@ The metadata crash contract is documented in [docs/operations.md → Metadata Du
 # Strict sync-on-commit metadata durability (default is a 50 ms deferred window):
 SQUEEZEFS_META_FLUSH_INTERVAL_MS=0 ./target/release/squeezefs mount …
 
-# v3 node-cache RAM budget (default 512 MiB) and dirty-node checkpoint cap
-# (default 4096; bounds the mount-replay working set):
+# v3 node-cache RAM budget (default derived: max(budget/16, 512 MiB) —
+# SQUEEZEFS_META_NODE_CACHE_PCT is the percentage spelling) and dirty-node
+# checkpoint cap (default derived: max(4096, budget/32 ÷ node_size);
+# bounds the mount-replay working set):
 SQUEEZEFS_META_NODE_CACHE_MB=1024 \
 SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES=8192 \
   ./target/release/squeezefs mount …

@@ -112,6 +112,102 @@ fn get_fuse_timeout() -> Duration {
 // and the lock-order documentation continue to work).
 pub use crate::stripe_locks::StripeLocks;
 
+/// One lease-acquisition attempt's wait budget — the historical
+/// `acquire_lock(…, 5 s)` (design-metadata-throughput lever 9: measured
+/// ZERO waits on metadata storms). The POSIX-5 ladder clamps it to the
+/// op's REMAINING watchdog budget, so it is a ceiling, not a fixed cost.
+const DLM_LEASE_WAIT: Duration = Duration::from_secs(5);
+
+/// Backoff between POSIX-5 lease-retry attempts: 50 ms doubling to a
+/// 1 s ceiling.
+///
+/// It is never zero (spinning on the DLM map starves the holder's own
+/// conveyor pass — the very stall the retry exists to outlast) and never
+/// unbounded (the op must re-test the lease often enough that a normal
+/// batch stall costs one backoff, not a whole budget).
+pub fn lease_retry_backoff(attempt: u32) -> Duration {
+    const BASE_MS: u64 = 50;
+    const CEIL_MS: u64 = 1000;
+    Duration::from_millis((BASE_MS.saturating_mul(1u64 << attempt.min(20))).min(CEIL_MS))
+}
+
+/// **POSIX-5** lease-retry ladder (the policy core, pinned by
+/// `tests/posix_lease_retry_tests.rs`).
+///
+/// `attempt_fn` is handed the wait budget for THIS attempt — the
+/// remaining budget clamped to [`DLM_LEASE_WAIT`] — and returns either
+/// the fencing token or an error. A [`SqueezefsError::LockFailed`] is a
+/// *lost wait*, not a failure: it is retried with
+/// [`lease_retry_backoff`] until the budget (the op watchdog's
+/// threshold) is spent, at which point the op fails **EIO**. Every other
+/// error returns immediately — retrying a dead backend for a whole
+/// watchdog budget would turn every hard failure into a hang.
+///
+/// At least one attempt always runs, even at a zero budget.
+pub async fn acquire_lease_with_retry<F, Fut>(
+    ino: u64,
+    budget: Duration,
+    mut attempt_fn: F,
+) -> Result<u64, SqueezefsError>
+where
+    F: FnMut(Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<u64, SqueezefsError>>,
+{
+    let started = tokio::time::Instant::now();
+    let mut attempt: u32 = 0;
+    loop {
+        let spent = started.elapsed();
+        let remaining = budget.saturating_sub(spent);
+        // Clamp this attempt's wait to what is left (a 5 s wait inside a
+        // 1 s budget would overshoot the watchdog by 4 s), but never to
+        // zero on the first attempt.
+        let wait = if attempt == 0 {
+            remaining.min(DLM_LEASE_WAIT).max(Duration::from_millis(1))
+        } else {
+            remaining.min(DLM_LEASE_WAIT)
+        };
+        match attempt_fn(wait).await {
+            Ok(token) => {
+                if attempt > 0 {
+                    METRICS.lease_retry_waits.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(token);
+            }
+            Err(e @ SqueezefsError::LockFailed { .. }) => {
+                let spent = started.elapsed();
+                if spent >= budget {
+                    METRICS
+                        .lease_retry_exhaustions
+                        .fetch_add(1, Ordering::Relaxed);
+                    error!(
+                        "lease acquisition for ino {ino} lost every wait for {spent:?} \
+                         ({} attempts, budget {budget:?}): failing the op EIO — \
+                         POSIX reserves EAGAIN for O_NONBLOCK, and a writer that \
+                         holds this long is a wedge, not a transient ({e})",
+                        attempt + 1
+                    );
+                    return Err(SqueezefsError::refused(
+                        libc::EIO,
+                        format!(
+                            "lease for ino {ino} unavailable after {spent:?} \
+                             ({} attempts): {e}",
+                            attempt + 1
+                        ),
+                    ));
+                }
+                debug!(
+                    "lease acquisition for ino {ino} lost its wait (attempt {}, \
+                     {spent:?} of {budget:?} spent): backing off",
+                    attempt + 1
+                );
+                tokio::time::sleep(lease_retry_backoff(attempt)).await;
+                attempt = attempt.saturating_add(1);
+            }
+            Err(other) => return Err(other),
+        }
+    }
+}
+
 /// Per-class kernel cache TTLs (design-metadata-throughput §5.2 D2.b/D2.c
 /// + the reference-client survey P1-C rider: DAOS ships the per-class
 /// split as container attributes, JuiceFS as mount flags — SqueezeFS
@@ -3035,6 +3131,16 @@ pub struct Metrics {
     /// DLM lease acquire outcomes (coarse lock-wait signal).
     pub lease_acquire_ok: Align64<AtomicU64>,
     pub lease_acquire_fail: Align64<AtomicU64>,
+    /// POSIX-5 retry ladder: mutating ops whose lease wait was LOST and
+    /// then won on a later attempt (the transient the ladder exists to
+    /// absorb — a conveyor batch stall outlasting one wait). Growth here
+    /// with `lease_retry_exhaustions` at 0 is the ladder working.
+    pub lease_retry_waits: Align64<AtomicU64>,
+    /// POSIX-5 retry ladder: ops that spent the whole watchdog budget
+    /// without ever winning the lease and failed **EIO**. A wedge
+    /// indicator — must stay 0 on a healthy mount; investigate alongside
+    /// `fuse_op_watchdog_overdue`.
+    pub lease_retry_exhaustions: Align64<AtomicU64>,
     /// Writeback path: durable flush hard failures (sticky).
     pub writeback_retry_exhaustions: Align64<AtomicU64>,
     /// Writeback units resolved as SUPERSEDED no-ops (staged stamp no
@@ -5753,6 +5859,8 @@ impl SqueezefsFilesystem {
                 "nvme_unaligned_write_fallbacks": METRICS.nvme_unaligned_write_fallbacks.load(Ordering::Relaxed),
                 "lease_acquire_ok": METRICS.lease_acquire_ok.load(Ordering::Relaxed),
                 "lease_acquire_fail": METRICS.lease_acquire_fail.load(Ordering::Relaxed),
+                "lease_retry_waits": METRICS.lease_retry_waits.load(Ordering::Relaxed),
+                "lease_retry_exhaustions": METRICS.lease_retry_exhaustions.load(Ordering::Relaxed),
                 "writeback_retry_exhaustions": METRICS.writeback_retry_exhaustions.load(Ordering::Relaxed),
                 "fuse_reserved_xattr_refusals": METRICS.fuse_reserved_xattr_refusals.load(Ordering::Relaxed),
                 "job_submitted": METRICS.job_submitted.load(Ordering::Relaxed),
@@ -7261,6 +7369,18 @@ impl SqueezefsFilesystem {
     }
 
     async fn get_or_acquire_lease(&self, ino: u64) -> Result<u64, SqueezefsError> {
+        self.get_or_acquire_lease_bounded(ino, DLM_LEASE_WAIT).await
+    }
+
+    /// [`Self::get_or_acquire_lease`] with an explicit per-attempt wait
+    /// budget — the POSIX-5 retry ladder's arm: it clamps each attempt to
+    /// what is left of the op's watchdog budget, so a wedged lease costs
+    /// the budget rather than `ceil(budget / 5 s)` five-second waits.
+    async fn get_or_acquire_lease_bounded(
+        &self,
+        ino: u64,
+        wait: Duration,
+    ) -> Result<u64, SqueezefsError> {
         // Hot path: return cached fencing token without re-validating the DLM map
         // on every write (was a lock/hash hit per op). Stale tokens are rejected by
         // write_file / save_metadata fencing checks; callers invalidate on that path.
@@ -7283,11 +7403,7 @@ impl SqueezefsFilesystem {
         // this slow path (the cached-lease hot path above acquires
         // nothing and stays counter-silent). Spec §6.1 last row: both
         // counters were rendered but never incremented (permanently 0).
-        let lease = match self
-            .dlm
-            .acquire_lock(&file_path, None, Duration::from_secs(5))
-            .await
-        {
+        let lease = match self.dlm.acquire_lock(&file_path, None, wait).await {
             Ok(lease) => {
                 METRICS.lease_acquire_ok.fetch_add(1, Ordering::Relaxed);
                 lease
@@ -7301,6 +7417,26 @@ impl SqueezefsFilesystem {
         let token = lease.fencing_token();
         self.active_leases.insert(ino, lease);
         Ok(token)
+    }
+
+    /// **POSIX-5**: acquire the write lease for a user-visible mutating
+    /// op (`write`/`ftruncate`/`fsync`/`flush`/`fallocate`/
+    /// `copy_file_range`), retrying a LOST WAIT with backoff for the op
+    /// watchdog's budget and failing `EIO` — never `EAGAIN` — when the
+    /// holder never lets go.
+    ///
+    /// `EAGAIN` on those calls is reserved by POSIX for `O_NONBLOCK`
+    /// descriptors; userspace reads it as "nothing is wrong, retry", so
+    /// a lost 5 s lease wait wearing it made `cp` abort mid-copy
+    /// (fstests generic/795). The budget is deliberately the watchdog
+    /// threshold (`SQUEEZEFS_TIMEOUT`): the op stays visible-and-loud
+    /// while it waits, and gives up exactly when the watchdog has
+    /// already said so.
+    async fn acquire_write_lease(&self, ino: u64) -> Result<u64, SqueezefsError> {
+        acquire_lease_with_retry(ino, get_fuse_timeout(), |wait| {
+            self.get_or_acquire_lease_bounded(ino, wait)
+        })
+        .await
     }
 
     /// Drop a locally cached lease (e.g. after `FencingTokenExpired` or lock loss).
@@ -13514,7 +13650,7 @@ impl Filesystem for SqueezefsFilesystem {
             // 1. Get or acquire lease (fencing token)
             let wp_lease = write_phase_start();
             let fencing_token = self
-                .get_or_acquire_lease(ino)
+                .acquire_write_lease(ino)
                 .await
                 .map_err(map_squeezefs_err)?;
             write_phase_record(WritePhase::LeaseAcquire, wp_lease);
@@ -13623,7 +13759,7 @@ impl Filesystem for SqueezefsFilesystem {
                             }
                             attempt += 1;
                             token = self
-                                .get_or_acquire_lease(ino)
+                                .acquire_write_lease(ino)
                                 .await
                                 .map_err(map_squeezefs_err)?;
                         }
@@ -13669,7 +13805,7 @@ impl Filesystem for SqueezefsFilesystem {
                             }
                             attempt += 1;
                             token = self
-                                .get_or_acquire_lease(ino)
+                                .acquire_write_lease(ino)
                                 .await
                                 .map_err(map_squeezefs_err)?;
                         }
@@ -13924,7 +14060,7 @@ impl Filesystem for SqueezefsFilesystem {
                 // (no bump) or the acquisition serializes behind the
                 // transient holder — no stale-token window exists.
                 let fencing_token = self
-                    .get_or_acquire_lease(ino)
+                    .acquire_write_lease(ino)
                     .await
                     .map_err(map_squeezefs_err)?;
                 // Classify grow-vs-shrink against the FRESHEST size, never the
@@ -14734,8 +14870,14 @@ impl Filesystem for SqueezefsFilesystem {
         // TEMPORARY leases still returned EAGAIN to userspace whenever a
         // conveyor tx co-owned the ino's 4a guard across a >5s batch stall
         // — cp aborted the copy, fstests generic/795's
-        // "Resource temporarily unavailable"). One brief bounded retry
-        // absorbs the stall; a persistent holder still fails loud.
+        // "Resource temporarily unavailable").
+        //
+        // POSIX-5: the ad-hoc "two 250 ms retries then EAGAIN" ladder
+        // that first absorbed that stall is now the SHARED
+        // `acquire_write_lease` ladder — same provenance, same
+        // absorption, but it runs to the op watchdog's budget and
+        // exhausts into EIO. `cp` reading EAGAIN off a blocking fd was
+        // the whole bug.
         let mut lease_tokens: [(u64, u64); 2] = [(inode, 0), (inode_out, 0)];
         {
             let mut order = [inode.min(inode_out), inode.max(inode_out)];
@@ -14743,23 +14885,10 @@ impl Filesystem for SqueezefsFilesystem {
                 order[1] = 0; // dedup sentinel (ino 0 never occurs)
             }
             for &i in order.iter().filter(|&&i| i != 0) {
-                let mut attempt = 0u32;
-                let tok = loop {
-                    match self.get_or_acquire_lease(i).await {
-                        Ok(t) => break t,
-                        Err(e) if attempt < 2 => {
-                            attempt += 1;
-                            debug!(
-                                "copy_file_range: lease wait on ino {i} lost (attempt {attempt}): {e:?}; retrying"
-                            );
-                            tokio::time::sleep(Duration::from_millis(250)).await;
-                        }
-                        Err(e) => {
-                            error!("copy_file_range: failed to acquire lease on ino {i}: {e:?}");
-                            return Err(Errno::from(libc::EAGAIN));
-                        }
-                    }
-                };
+                let tok = self.acquire_write_lease(i).await.map_err(|e| {
+                    error!("copy_file_range: failed to acquire lease on ino {i}: {e:?}");
+                    map_squeezefs_err(e)
+                })?;
                 for slot in lease_tokens.iter_mut() {
                     if slot.0 == i {
                         slot.1 = tok;
@@ -15179,7 +15308,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         prof.mark_backend_start();
         let fencing_token = self
-            .get_or_acquire_lease(ino)
+            .acquire_write_lease(ino)
             .await
             .map_err(map_squeezefs_err)?;
 
@@ -15284,7 +15413,7 @@ impl Filesystem for SqueezefsFilesystem {
         let prof = OpProf::begin(FuseOpKind::Fsync, ino);
         prof.mark_backend_start();
         let fencing_token = self
-            .get_or_acquire_lease(ino)
+            .acquire_write_lease(ino)
             .await
             .map_err(map_squeezefs_err)?;
 
@@ -15373,7 +15502,7 @@ impl Filesystem for SqueezefsFilesystem {
             // Lock order (P1-9): inode write guard (1) BEFORE the lease (2).
             let _guard = self.active_inode_locks.get_inode_lock(ino).write().await;
             let fencing_token = self
-                .get_or_acquire_lease(ino)
+                .acquire_write_lease(ino)
                 .await
                 .map_err(map_squeezefs_err)?;
 

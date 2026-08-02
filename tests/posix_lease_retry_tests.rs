@@ -31,7 +31,9 @@ use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::error::SqueezefsError;
-use squeezefs::fuse_client::{acquire_lease_with_retry, lease_retry_backoff, SqueezefsFilesystem};
+use squeezefs::fuse_client::{
+    acquire_lease_with_retry, lease_retry_backoff, SqueezefsFilesystem, METRICS,
+};
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
 use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
@@ -40,6 +42,7 @@ use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
 use std::cell::Cell;
 use std::ffi::OsStr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::{tempdir, NamedTempFile, TempDir};
@@ -264,6 +267,14 @@ async fn wedged_file(h: &H, name: &str) -> (u64, squeezefs::dlm::LockLease) {
     (ino, hold)
 }
 
+/// The ladder's engagement instrument: an op that gives up under a
+/// permanently held lease must have RUN the ladder (spent the budget,
+/// retried), not merely inherited `LockFailed`'s errno mapping. Deltas
+/// only ever grow, so `>= 1` is parallel-safe.
+fn exhaustions() -> u64 {
+    METRICS.lease_retry_exhaustions.load(Ordering::Relaxed)
+}
+
 /// `write(2)` — the headline. Under a permanently held lease the reply
 /// is EIO; it was EAGAIN, which `cp`/`dd`/glibc treat as "nothing is
 /// wrong, try again" on a blocking fd.
@@ -271,11 +282,17 @@ async fn wedged_file(h: &H, name: &str) -> (u64, squeezefs::dlm::LockLease) {
 async fn write_under_a_held_lease_is_eio_never_eagain() {
     let h = make().await;
     let (ino, _hold) = wedged_file(&h, "p5-write").await;
+    let before = exhaustions();
     let err =
         h.fs.write(h.req, ino, 0, 0, bytes::Bytes::from_static(b"hello"), 0, 0)
             .await
             .expect_err("a permanently held lease must fail the write");
     assert_eq!(libc::c_int::from(err), -libc::EIO, "write(2): {err}");
+    assert!(
+        exhaustions() > before,
+        "the write handler must run the POSIX-5 ladder, not just inherit \
+         LockFailed's errno"
+    );
 }
 
 /// `ftruncate` (SETATTR size) — same law.
@@ -284,6 +301,7 @@ async fn truncate_under_a_held_lease_is_eio_never_eagain() {
     use fuse3::SetAttr;
     let h = make().await;
     let (ino, _hold) = wedged_file(&h, "p5-truncate").await;
+    let before = exhaustions();
     let err =
         h.fs.setattr(
             h.req,
@@ -297,6 +315,7 @@ async fn truncate_under_a_held_lease_is_eio_never_eagain() {
         .await
         .expect_err("a permanently held lease must fail the truncate");
     assert_eq!(libc::c_int::from(err), -libc::EIO, "ftruncate: {err}");
+    assert!(exhaustions() > before, "SETATTR must run the ladder");
 }
 
 /// `fsync` — same law (a `fsync` that says EAGAIN is a data-loss trap:
@@ -305,11 +324,13 @@ async fn truncate_under_a_held_lease_is_eio_never_eagain() {
 async fn fsync_under_a_held_lease_is_eio_never_eagain() {
     let h = make().await;
     let (ino, _hold) = wedged_file(&h, "p5-fsync").await;
+    let before = exhaustions();
     let err =
         h.fs.fsync(h.req, ino, 0, false)
             .await
             .expect_err("a permanently held lease must fail the fsync");
     assert_eq!(libc::c_int::from(err), -libc::EIO, "fsync: {err}");
+    assert!(exhaustions() > before, "fsync must run the ladder");
 }
 
 /// `fallocate(PUNCH_HOLE)` — same law.
@@ -317,6 +338,7 @@ async fn fsync_under_a_held_lease_is_eio_never_eagain() {
 async fn fallocate_under_a_held_lease_is_eio_never_eagain() {
     let h = make().await;
     let (ino, _hold) = wedged_file(&h, "p5-fallocate").await;
+    let before = exhaustions();
     let err =
         h.fs.fallocate(
             h.req,
@@ -329,6 +351,7 @@ async fn fallocate_under_a_held_lease_is_eio_never_eagain() {
         .await
         .expect_err("a permanently held lease must fail the fallocate");
     assert_eq!(libc::c_int::from(err), -libc::EIO, "fallocate: {err}");
+    assert!(exhaustions() > before, "fallocate must run the ladder");
 }
 
 /// The backoff schedule: strictly non-decreasing, capped, and never

@@ -6584,6 +6584,10 @@ impl DataRouter {
         allocator.publish_block(offset);
 
         let ino = parse_inode_from_path(file_path);
+        // RES-1: keys displaced under the commit's level-3.5 guard are
+        // collected here and freed after it drops (`free_block`'s at-cap
+        // enqueue parks up to `SQUEEZEFS_RECLAIM_CAP_PARK_MS`).
+        let mut deferred: Vec<String> = Vec::new();
         let commit = async {
             let _meta_guard = meta_lock_acquire(ino).await;
             // Authoritative meta: RAM cache first (post-write truth), then
@@ -6623,9 +6627,10 @@ impl DataRouter {
             self.metadata_cache.insert(ino, updated);
             if let Some(prev) = displaced {
                 if prev != block_key {
-                    // Re-promotion over an older durable copy: purge + free it.
+                    // Re-promotion over an older durable copy: purge here
+                    // (ordering-sensitive), free after the guard drops.
                     self.cache.purge_block_key(&prev);
-                    let _ = self.backend_router.free_block(&prev).await;
+                    deferred.push(prev);
                 }
             }
             // Ring-entry release INSIDE the commit's lock section — the
@@ -6651,6 +6656,9 @@ impl DataRouter {
             Ok(true)
         }
         .await;
+
+        // RES-1: the commit's guard is gone with its future — free now.
+        self.free_deferred_keys(deferred).await;
 
         // TEMP-PROBE (leg5-v2 rail a; stripped before commit)
         match commit {
@@ -6766,25 +6774,52 @@ impl DataRouter {
     /// the failure tape). A promotion that lands between the caller's
     /// snapshot and its lock cannot leak: its published mapping IS the
     /// under-lock state this frees.
+    ///
+    /// **RES-1 (pre-RC spec §7)**: the destructive ring-entry release
+    /// stays here — it is the step that MUST be serialized with every
+    /// layout commit (the leg-5 zeros-LOSS family, see
+    /// `promote_staged_file`'s comment) — but the displaced block keys
+    /// are returned, NOT freed. `free_block`'s at-cap reclaim enqueue
+    /// parks up to `SQUEEZEFS_RECLAIM_CAP_PARK_MS` **per key**, so
+    /// freeing here would hold the level-3.5 stripe for
+    /// `keys × cap_park_ms`. Callers drop the guard, then hand the list
+    /// to [`Self::free_deferred_keys`] — strictly later than the publish,
+    /// so the §5.2 law is satisfied a fortiori (the same order
+    /// `write_striped` and `truncate_layout` already use).
+    #[must_use = "the displaced keys must be freed after the meta guard drops (RES-1)"]
     async fn release_superseded_staged(
         &self,
         old_ring_id: Option<&str>,
         old_map: Option<&std::collections::HashMap<u32, String>>,
         keep_block_key: Option<&str>,
-    ) {
+    ) -> Vec<String> {
         if let Some(fid) = old_ring_id {
             // Blocking-pool hop: shard WRITE lock (invariant rule 2).
             let _ = self.cache.nvme.remove_staged_async(fid.to_string()).await;
         }
         let mut freed = std::collections::HashSet::new();
+        let mut deferred = Vec::new();
         for map in old_map.into_iter() {
             for bk in map.values() {
                 if keep_block_key == Some(bk.as_str()) || !freed.insert(bk.clone()) {
                     continue;
                 }
+                // The read-tier purge is the ordering-sensitive half and
+                // stays under the lock; only the device free defers.
                 self.cache.purge_block_key(bk);
-                let _ = self.backend_router.free_block(bk).await;
+                deferred.push(bk.clone());
             }
+        }
+        deferred
+    }
+
+    /// RES-1: free block keys collected under `INODE_META_LOCKS` **after**
+    /// the guard dropped. Every caller of this is a layout commit whose
+    /// publish already happened, so the §5.2 "free only after the new
+    /// layout is published" law holds by construction.
+    async fn free_deferred_keys(&self, keys: Vec<String>) {
+        for bk in keys {
+            let _ = self.backend_router.free_block(&bk).await;
         }
     }
 
@@ -6943,7 +6978,7 @@ impl DataRouter {
         {
             return Ok(false);
         }
-        let _map_guard = meta_lock_acquire(ino).await;
+        let map_guard = meta_lock_acquire(ino).await;
         // Resolve the entry WHILE the epoch is still registered (a cache
         // miss refetch-composes the shadow — KD-1.9).
         let current = match self.metadata_cache.get(&ino) {
@@ -6977,9 +7012,18 @@ impl DataRouter {
         };
         match save_res {
             Ok(()) => {
-                // Frees strictly AFTER the durable save (§5.2).
+                // Frees strictly AFTER the durable save (§5.2) — and
+                // RES-1: after the level-3.5 guard too. This loop is the
+                // worst park amplifier in the tree (one displaced key per
+                // rewritten block, each capable of parking
+                // `SQUEEZEFS_RECLAIM_CAP_PARK_MS` at the reclaim cap), so
+                // it COLLECTS under the lock and frees outside it. The A
+                // keys stay allocated until `free_block` runs, so no
+                // writer admitted into the released window can be handed
+                // one of them.
+                let mut deferred = Vec::new();
                 while let Some(k) = epoch.displaced.pop() {
-                    let _ = self.backend_router.free_block(&k).await;
+                    deferred.push(k);
                 }
                 while epoch.guards.pop().is_some() {} // deregister B owners
                 METRICS.rewrite_shadow_swaps.fetch_add(1, Ordering::Relaxed);
@@ -6987,6 +7031,8 @@ impl DataRouter {
                     epoch.recorded_bytes.load(Ordering::Relaxed),
                     Ordering::Relaxed,
                 );
+                drop(map_guard);
+                self.free_deferred_keys(deferred).await;
                 Ok(true)
             }
             Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
@@ -8433,7 +8479,7 @@ impl DataRouter {
                 block_map.insert(idx, key);
             }
 
-            {
+            let deferred = {
                 let _meta_guard = meta_lock_acquire(ino).await;
                 let fresh = self.metadata_cache.get(&ino);
                 let mut updated_meta = meta.clone();
@@ -8455,8 +8501,10 @@ impl DataRouter {
                     fresh.as_ref().and_then(|f| f.block_map.as_deref()),
                     None,
                 )
-                .await;
-            }
+                .await
+            };
+            // RES-1: guard dropped — free the displaced keys now.
+            self.free_deferred_keys(deferred).await;
             if fold_rider {
                 self.retire_rider_record(ino).await;
             }
@@ -8503,30 +8551,34 @@ impl DataRouter {
                 .fetch_add(1, Ordering::Relaxed);
             let shared_data = payload_bytes;
 
-            let _meta_guard = meta_lock_acquire(ino).await;
-            let fresh = self.metadata_cache.get(&ino);
-            let mut updated_meta = meta.clone();
-            updated_meta.file_type = "inline".into();
-            updated_meta.size = new_size as u64;
-            // Zero-copy store: `shared_data` is `Bytes`; clone is a refcount bump,
-            // not a payload copy (was `shared_data.to_vec()` = full memcpy per write).
-            updated_meta.data_key = Some(shared_data.clone());
-            updated_meta.file_id = None;
-            updated_meta.block_map = None;
-            updated_meta.layout_dirty = true;
-            updated_meta.cached_at = std::time::Instant::now();
+            let deferred = {
+                let _meta_guard = meta_lock_acquire(ino).await;
+                let fresh = self.metadata_cache.get(&ino);
+                let mut updated_meta = meta.clone();
+                updated_meta.file_type = "inline".into();
+                updated_meta.size = new_size as u64;
+                // Zero-copy store: `shared_data` is `Bytes`; clone is a refcount bump,
+                // not a payload copy (was `shared_data.to_vec()` = full memcpy per write).
+                updated_meta.data_key = Some(shared_data.clone());
+                updated_meta.file_id = None;
+                updated_meta.block_map = None;
+                updated_meta.layout_dirty = true;
+                updated_meta.cached_at = std::time::Instant::now();
 
-            self.cache.write_lru.put(file_path, shared_data.clone());
-            self.cache.read_lru.put(file_path, shared_data);
-            self.metadata_cache.insert(ino, updated_meta);
-            // A truncated-then-rewritten staged/spilled file leaves a ring
-            // entry and/or a durable copy behind: release them.
-            self.release_superseded_staged(
-                meta.file_id.as_deref(),
-                fresh.as_ref().and_then(|f| f.block_map.as_deref()),
-                None,
-            )
-            .await;
+                self.cache.write_lru.put(file_path, shared_data.clone());
+                self.cache.read_lru.put(file_path, shared_data);
+                self.metadata_cache.insert(ino, updated_meta);
+                // A truncated-then-rewritten staged/spilled file leaves a ring
+                // entry and/or a durable copy behind: release them.
+                self.release_superseded_staged(
+                    meta.file_id.as_deref(),
+                    fresh.as_ref().and_then(|f| f.block_map.as_deref()),
+                    None,
+                )
+                .await
+            };
+            // RES-1: guard dropped — free the displaced keys now.
+            self.free_deferred_keys(deferred).await;
             if fold_rider {
                 self.retire_rider_record(ino).await;
             }
@@ -8557,7 +8609,7 @@ impl DataRouter {
 
             match stage_res {
                 Ok(_) => {
-                    let _meta_guard = meta_lock_acquire(ino).await;
+                    let meta_guard = meta_lock_acquire(ino).await;
                     let fresh = self.metadata_cache.get(&ino);
                     // Ring-residency check (leg 5 of the zeros-LOSS family).
                     // A promotion enqueued by THIS stage's high-water
@@ -8608,17 +8660,23 @@ impl DataRouter {
                     // The fresh stage supersedes any promoted/spilled durable
                     // copy of older content — release it ONLY when the ring
                     // entry actually survives to be authoritative.
-                    if ring_resident {
+                    let deferred = if ring_resident {
                         self.release_superseded_staged(
                             None,
                             fresh.as_ref().and_then(|f| f.block_map.as_deref()),
                             None,
                         )
-                        .await;
-                    }
+                        .await
+                    } else {
+                        Vec::new()
+                    };
                     if fold_rider {
                         self.retire_rider_record(ino).await;
                     }
+                    // RES-1: drop the level-3.5 guard BEFORE the device
+                    // frees — each one can park at the reclaim cap.
+                    drop(meta_guard);
+                    self.free_deferred_keys(deferred).await;
                 }
                 Err(SqueezefsError::Io(ref e)) if e.kind() == std::io::ErrorKind::StorageFull => {
                     // FIND-RW5-A: the never-lossy escalation, counted.
@@ -8700,7 +8758,7 @@ impl DataRouter {
                     // layout with pre-spill content.
                     let spill_file_id = Uuid::new_v4().to_string();
 
-                    let _meta_guard = meta_lock_acquire(ino).await;
+                    let meta_guard = meta_lock_acquire(ino).await;
                     let fresh = self.metadata_cache.get(&ino);
                     let mut updated_meta = meta.clone();
                     updated_meta.file_type = "staged".into();
@@ -8718,15 +8776,20 @@ impl DataRouter {
                     self.metadata_cache.insert(ino, updated_meta);
                     // Release the superseded stale ring entry (returns its
                     // budget) and any older durable copy it had.
-                    self.release_superseded_staged(
-                        meta.file_id.as_deref(),
-                        fresh.as_ref().and_then(|f| f.block_map.as_deref()),
-                        Some(&stored_block_key),
-                    )
-                    .await;
+                    let deferred = self
+                        .release_superseded_staged(
+                            meta.file_id.as_deref(),
+                            fresh.as_ref().and_then(|f| f.block_map.as_deref()),
+                            Some(&stored_block_key),
+                        )
+                        .await;
                     if fold_rider {
                         self.retire_rider_record(ino).await;
                     }
+                    // RES-1: drop the level-3.5 guard BEFORE the device
+                    // frees — each one can park at the reclaim cap.
+                    drop(meta_guard);
+                    self.free_deferred_keys(deferred).await;
                 }
                 Err(e) => return Err(e),
             }
@@ -10851,7 +10914,7 @@ impl DataRouter {
                 // durable image, and an in-flight promotion of the old id
                 // must fail its generation check.
                 let spill_file_id = Uuid::new_v4().to_string();
-                let _meta_guard = meta_lock_acquire(ino).await;
+                let meta_guard = meta_lock_acquire(ino).await;
                 let fresh = self.metadata_cache.get(&ino);
                 let still_ours = fresh
                     .as_ref()
@@ -10884,12 +10947,17 @@ impl DataRouter {
                 self.cache.write_lru.remove(&file_path);
                 self.cache.read_lru.remove(&file_path);
                 // Release the superseded ring entry + any older durable copy.
-                self.release_superseded_staged(
-                    Some(&fid),
-                    fresh.as_ref().and_then(|f| f.block_map.as_deref()),
-                    Some(&stored_block_key),
-                )
-                .await;
+                let deferred = self
+                    .release_superseded_staged(
+                        Some(&fid),
+                        fresh.as_ref().and_then(|f| f.block_map.as_deref()),
+                        Some(&stored_block_key),
+                    )
+                    .await;
+                // RES-1: drop the level-3.5 guard BEFORE the device frees
+                // — each one can park at the reclaim cap.
+                drop(meta_guard);
+                self.free_deferred_keys(deferred).await;
             }
             Err(e) => return Err(e),
         }
@@ -11483,6 +11551,12 @@ impl DataRouter {
         // FRESHEST meta (the promote-commit discipline — a promotion/spill
         // that committed since our snapshot must not be clobbered with a
         // pre-commit block_map).
+        //
+        // RES-1: keys pruned under the guard are collected here and freed
+        // after it drops — `free_block`'s at-cap reclaim enqueue parks up
+        // to `SQUEEZEFS_RECLAIM_CAP_PARK_MS` PER KEY, and a truncate-to-0
+        // of a large file prunes the whole map.
+        let mut deferred: Vec<String> = Vec::new();
         let commit = async {
             let _meta_guard = meta_lock_acquire(ino).await;
             // NOTE: `fetch_metadata` would retake this lock.
@@ -11535,21 +11609,18 @@ impl DataRouter {
             self.cache.read_lru.remove(&file_path);
 
             // Displaced/pruned durable copies die only AFTER the publish
-            // (release-superseded order): purge read tiers, then free.
+            // (release-superseded order): purge read tiers here (the
+            // ordering-sensitive half), free after the guard drops.
             for bk in &blocks_to_free {
                 self.cache.purge_block_key(bk);
             }
-            if !blocks_to_free.is_empty() {
-                let cleaned: Vec<String> = blocks_to_free
-                    .iter()
-                    .map(|bk| clean_block_key(bk))
-                    .collect();
-                let refs: Vec<&str> = cleaned.iter().map(|s| s.as_str()).collect();
-                let _ = self.backend_router.free_blocks(&refs).await;
-            }
+            deferred.extend(blocks_to_free.iter().map(|bk| clean_block_key(bk)));
             Ok::<bool, SqueezefsError>(published)
         }
         .await;
+
+        // RES-1: the commit's guard is gone with its future — free now.
+        self.free_deferred_keys(deferred).await;
 
         match commit {
             Ok(published) => {

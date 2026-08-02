@@ -257,6 +257,85 @@ fn bench_supersession(c: &mut Criterion) {
     group.finish();
 }
 
+/// RES-1 (pre-RC engineering spec §7): the price of hoisting terminal
+/// frees OUT of the `INODE_META_LOCKS` (level 3.5) critical section.
+///
+/// `BackendRouter::free_block`'s at-cap reclaim enqueue parks up to
+/// `SQUEEZEFS_RECLAIM_CAP_PARK_MS` (default 1000) **per key**, so every
+/// layout commit now COLLECTS its displaced keys under the guard and
+/// frees them after it drops. What the collect costs is exactly this
+/// group; what it buys is `keys × cap_park_ms` of a per-inode stripe
+/// nobody else can take.
+///
+/// Field-shape sources:
+/// * `epoch_displaced_drain` — `close_rewrite_epoch`'s `displaced`
+///   `SegQueue` (design-rewrite-program §5, KD-1.4): one displaced A key
+///   per rewritten block. 1 = a lone RMW; 64 = the
+///   `SQUEEZEFS_PUBLISH_COALESCE_MAX` window
+///   (`.benchmarks/2026-07-30-write-commit-economy.md`); 1,024 = a 4 GiB
+///   file's whole map at 4 MiB blocks (the truncate-to-0 / full-rewrite
+///   epoch — the shape whose in-lock free loop could hold the stripe for
+///   ~17 minutes at the default park bound).
+/// * `superseded_collect` — `release_superseded_staged`'s dedup pass over
+///   the last-published map (staged layouts carry `block_map[0]`; the
+///   striped-promotion arm carries the whole map).
+fn bench_deferred_free_collect(c: &mut Criterion) {
+    use std::collections::HashSet;
+
+    let mut group = c.benchmark_group("write_deferred_free");
+
+    let key = |b: u32| format!("sqz:vol-00aa11bb:blk_{b:012x}_0000");
+
+    for &n in &[1usize, 64, 1024] {
+        // The close's drain: SegQueue<String> → Vec<String>, which is
+        // what replaced the in-lock `while let Some(k) = pop { free(k) }`.
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_function(format!("epoch_displaced_drain_{n}"), |b| {
+            b.iter_batched(
+                || {
+                    let q = crossbeam::queue::SegQueue::new();
+                    for i in 0..n as u32 {
+                        q.push(key(i));
+                    }
+                    q
+                },
+                |q| {
+                    let mut deferred = Vec::new();
+                    while let Some(k) = q.pop() {
+                        deferred.push(k);
+                    }
+                    black_box(deferred.len())
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    // The superseded-release dedup pass (unchanged in shape — only its
+    // `free_block` await moved out): iterate the published map, skip the
+    // kept key, dedup, collect.
+    for &n in &[1usize, 1024] {
+        let map: HashMap<u32, String> = (0..n as u32).map(|b| (b, key(b))).collect();
+        let keep = key(0);
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_function(format!("superseded_collect_{n}"), |b| {
+            b.iter(|| {
+                let mut seen = HashSet::new();
+                let mut deferred = Vec::new();
+                for bk in black_box(&map).values() {
+                    if bk.as_str() == keep || !seen.insert(bk.clone()) {
+                        continue;
+                    }
+                    deferred.push(bk.clone());
+                }
+                black_box(deferred.len())
+            });
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_layout_publish(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_layout_publish");
 
@@ -347,6 +426,7 @@ criterion_group!(
     bench_coverage_union,
     bench_extent_overlay,
     bench_supersession,
+    bench_deferred_free_collect,
     bench_layout_publish,
     bench_indirect_map_codec,
     bench_flush_coalescing

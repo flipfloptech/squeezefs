@@ -73,12 +73,49 @@ fn ino_of_path(path: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-/// Lock table: object → owner nonce. Owner identity is a process-unique
-/// `u64` (not a cloned `String` per acquisition).
-static LOCK_MAP: Lazy<scc::HashMap<ObjectKey, u64>> = Lazy::new(scc::HashMap::new);
-/// Fencing generators: file object → shared monotonic counter. `Arc` so a
-/// lease caches its generator and later reads are a plain atomic load.
-static FENCING_MAP: Lazy<scc::HashMap<ObjectKey, Arc<AtomicU64>>> = Lazy::new(scc::HashMap::new);
+/// A held lock entry: the owner's process-unique nonce plus the fencing
+/// token minted at grant. The token is atomic because a byte-range grant
+/// on the same FILE identity bumps a live whole-file entry (ranges share
+/// the file's generator — the historical `fencing_generator:{path}`
+/// semantic the router's stale-token checks are written against).
+struct HeldLock {
+    owner_nonce: u64,
+    token: AtomicU64,
+}
+
+/// Lock table: object → held entry. Entries are removed at release
+/// (nonce-conditional), so this map is bounded by CONCURRENTLY HELD
+/// leases — never by distinct objects ever locked.
+static LOCK_MAP: Lazy<scc::HashMap<ObjectKey, HeldLock>> = Lazy::new(scc::HashMap::new);
+
+/// S1 (spec §6.7 decision 4): the SINGLE per-process fencing mint. Global
+/// monotonicity implies per-object monotonicity, and every consumer
+/// comparison is `<`, `==` or `.max()` — monotone-safe under globally
+/// unique, gap-carrying tokens. Replaces the per-object `FENCING_MAP`
+/// (RES-2: one immortal `Arc<AtomicU64>` per object ever locked, ~105 B
+/// each, no removal path) with O(1) state. S2 composes this into
+/// `(term << 40) | grant_seq` for remount monotonicity.
+static GRANT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Per-stripe RELEASED-generation floors, fetch_max'd at every mint with
+/// the granted token (keyed by the FILE identity's stripe). An UNHELD
+/// object's generation read serves from its stripe floor: never below
+/// the identity's own newest grant (the mint bumped it — the property
+/// the stale-reject `presented < current` arm and the recovery sweep
+/// need), possibly above it via a stripe-mate's later mint (a monotone
+/// over-approximation: harmless for `<` fences — the presenter re-reads
+/// and converges, the FIND-M11-A transient class — and for the `==`
+/// coherence memos, which miss and refetch). HELD objects never read the
+/// floor: their entry token is exact, so live writers cannot be
+/// spuriously fenced by stripe collisions. 1024 stripes = the existing
+/// waiter-stripe constant below (fixed structural fan-out, 8 KiB total —
+/// the whole point of S1 is O(1) fencing state).
+static LAST_GRANT_FLOOR: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| (0..1024).map(|_| AtomicU64::new(0)).collect());
+
+fn grant_floor(identity: &ObjectKey) -> &'static AtomicU64 {
+    &LAST_GRANT_FLOOR[(identity.stripe_seed() % 1024) as usize]
+}
 /// Per-stripe release notifications. A release wakes only its own stripe —
 /// never every waiter in the process (the old single global `Notify` was a
 /// thundering herd and let unrelated churn burn waiters' retry budgets).
@@ -153,19 +190,24 @@ impl LocalLockManager {
     pub fn get_fencing_token(&self, file_path: &str) -> u64 {
         match ino_of_path(file_path) {
             Some(ino) => self.get_fencing_token_ino(ino),
-            None => FENCING_MAP
-                .read_sync(&ObjectKey::Path(file_path.into()), |_, v| {
-                    v.load(Ordering::Acquire)
-                })
-                .unwrap_or(0),
+            None => Self::read_identity(&ObjectKey::Path(file_path.into())),
         }
     }
 
     /// Current fencing generation for an inode object — binary fast path.
     pub fn get_fencing_token_ino(&self, ino: u64) -> u64 {
-        FENCING_MAP
-            .read_sync(&ObjectKey::Ino(ino), |_, v| v.load(Ordering::Acquire))
-            .unwrap_or(0)
+        Self::read_identity(&ObjectKey::Ino(ino))
+    }
+
+    /// The identity's readable generation: EXACT while a whole-file lease
+    /// is held (the entry token — live writers are never fenced by stripe
+    /// collisions), the stripe floor otherwise (≥ the identity's own
+    /// newest grant; see `LAST_GRANT_FLOOR`). A never-locked identity on
+    /// a quiet stripe reads 0 — identical to the historical map miss.
+    fn read_identity(identity: &ObjectKey) -> u64 {
+        LOCK_MAP
+            .read_sync(identity, |_, h| h.token.load(Ordering::Acquire))
+            .unwrap_or_else(|| grant_floor(identity).load(Ordering::Acquire))
     }
 
     /// Acquire an exclusive lease on `file_path` (optionally a byte range),
@@ -199,20 +241,32 @@ impl LocalLockManager {
             notified.as_mut().enable();
 
             let acquired = match LOCK_MAP.entry_sync(key.clone()) {
-                scc::hash_map::Entry::Occupied(_) => false,
+                scc::hash_map::Entry::Occupied(_) => None,
                 scc::hash_map::Entry::Vacant(vac) => {
-                    let _ = vac.insert_entry(self.client_nonce);
-                    true
+                    // S1 mint: one global fetch_add — strictly monotone
+                    // in grant order, globally unique, gap-carrying.
+                    let token = GRANT_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+                    let _ = vac.insert_entry(HeldLock {
+                        owner_nonce: self.client_nonce,
+                        token: AtomicU64::new(token),
+                    });
+                    Some(token)
                 }
             };
 
-            if acquired {
-                let fencing_token = FENCING_MAP
-                    .entry_sync(key.fencing_identity())
-                    .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-                    .get()
-                    .fetch_add(1, Ordering::AcqRel)
-                    + 1;
+            if let Some(fencing_token) = acquired {
+                let identity = key.fencing_identity();
+                // Publish the grant to the identity's read surfaces: the
+                // stripe floor (unheld reads), and — for a range grant —
+                // a live whole-file entry (ranges share the file's
+                // generator; the router's stale-token checks construct
+                // `stale = range_token - 1` against the whole-file read).
+                grant_floor(&identity).fetch_max(fencing_token, Ordering::AcqRel);
+                if identity != key {
+                    LOCK_MAP.read_sync(&identity, |_, h| {
+                        h.token.fetch_max(fencing_token, Ordering::AcqRel);
+                    });
+                }
 
                 return Ok(LockLease {
                     inner: Arc::new(LockLeaseInner {
@@ -250,7 +304,7 @@ impl LockLeaseInner {
         }
         let nonce = self.client_nonce;
         let removed = LOCK_MAP
-            .remove_if_sync(&self.key, |owner| *owner == nonce)
+            .remove_if_sync(&self.key, |held| held.owner_nonce == nonce)
             .is_some();
         if removed {
             LOCK_WAITERS
@@ -274,8 +328,8 @@ pub struct LockLease {
 impl LockLease {
     pub async fn is_held(&self) -> bool {
         LOCK_MAP
-            .read_sync(&self.inner.key, |_, owner| {
-                *owner == self.inner.client_nonce
+            .read_sync(&self.inner.key, |_, held| {
+                held.owner_nonce == self.inner.client_nonce
             })
             .unwrap_or(false)
     }

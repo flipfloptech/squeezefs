@@ -649,6 +649,8 @@ pub async fn read_newest_ledger(
 /// mount-replay working-set bound). Since the 2026-08-04 derivation
 /// sweep the default derives from the machine
 /// ([`resolve_max_dirty_nodes`]); the env stays absolute-verbatim.
+/// Resolved ONCE at `open` into `KvMetaBackend::dirty_node_cap` (the
+/// backend-knob convention) — never re-derived on the cadence tick.
 pub const CHECKPOINT_MAX_DIRTY_NODES_ENV: &str = "SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES";
 
 /// The shipped dirty-node cap — the derived default's FLOOR since the
@@ -675,16 +677,6 @@ pub fn resolve_max_dirty_nodes(budget_bytes: u64, node_size: u64, env: Option<&s
         return CHECKPOINT_MAX_DIRTY_NODES_FLOOR;
     }
     (budget_bytes / 32 / node_size).max(CHECKPOINT_MAX_DIRTY_NODES_FLOOR)
-}
-
-fn max_dirty_nodes(node_size: u64) -> u64 {
-    resolve_max_dirty_nodes(
-        crate::mem_budget::MEM_BUDGET.resolve_budget_now(),
-        node_size,
-        std::env::var(CHECKPOINT_MAX_DIRTY_NODES_ENV)
-            .ok()
-            .as_deref(),
-    )
 }
 
 /// Checkpoint cadence ceiling: a cycle runs at least this often even when
@@ -959,7 +951,12 @@ async fn tick(
     });
     let due = final_cycle
         || ring_pressure
-        || dirty_nodes > max_dirty_nodes(u64::from(be.superblock().node_size))
+        // The cap is resolved ONCE at open (`KvMetaBackend::dirty_node_cap`
+        // — the backend-knob convention): this branch runs on every 50 ms
+        // cadence tick, and re-deriving here (env `CString`s + cgroup/
+        // sysinfo probes in `resolve_budget_now`) was an allocation stream
+        // that broke the op-economy allocation-free contract (2026-08-02).
+        || dirty_nodes > be.dirty_node_cap()
         || last_checkpoint.elapsed().as_millis() >= CHECKPOINT_MAX_AGE_MS;
     if due && (final_cycle || dirty_nodes > 0 || distance > 0) {
         // Immediate post-ledger barrier under pressure or at shutdown:

@@ -162,6 +162,25 @@ coordination rule).
    math (thesis filed — track negotiated max_write), the latter is a
    time-horizon, not a resource cap (R5 shed already reaps under
    pressure).
+6. **A5's first landing re-resolved per checkpoint tick — an op-economy
+   regression** (caught by the from-zero gate on the final binary:
+   `ipc_op_economy_tests::warm_fast_path_serves_are_allocation_free`
+   red at 115 allocs/5000 ops, bound 50). `checkpoint.rs` `tick()`
+   consulted `resolve_max_dirty_nodes` on every cadence pass (default
+   50 ms), and the derived form's inputs allocate per call (env
+   `CString`s, `/proc/self/cgroup` + `memory.max` reads, a fresh
+   `sysinfo::System` in `resolve_budget_now`) where the pre-sweep flat
+   default cost one env read. Attribution bracket: base `68e8474`
+   green ×5 default + ×3 at `SQUEEZEFS_META_FLUSH_INTERVAL_MS=1`
+   (the amplifier); pre-fix HEAD red 3/3 amplified (~0.2 allocs/op,
+   scaling with tick rate, warm serve window itself traced 0 allocs);
+   post-fix green ×5 both cadences. Fix: the cap resolves ONCE at
+   `KvMetaBackend::open` into the `dirty_node_cap` field (the
+   batch-cap convention — "read at open like every backend knob");
+   the tick reads the field. Derivation law, env-verbatim precedence,
+   and the `config_ops` preflight (verb-time, same resolver) are
+   unchanged. Standing lesson: a derived default must be resolved at
+   admission/open/spawn — never on a cadence or per-op path.
 
 ## 5. Verification
 

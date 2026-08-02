@@ -602,6 +602,15 @@ pub struct KvMetaBackend {
     /// always eventually succeed (a batch larger than the admissible
     /// ring would park forever — the liveness clamp).
     batch_max_bytes: u64,
+    /// `SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES` resolved ONCE at open
+    /// (`checkpoint::resolve_max_dirty_nodes` — read at `open` like every
+    /// backend knob). The checkpoint task consults this on EVERY cadence
+    /// tick (default 50 ms), so per-tick re-resolution (env `CString`s,
+    /// cgroup/`sysinfo` probes) is an allocation stream the op-economy
+    /// contract forbids — the 2026-08-02 gate red on
+    /// `ipc_op_economy_tests::warm_fast_path_serves_are_allocation_free`
+    /// was exactly this site re-deriving per tick.
+    dirty_node_cap: u64,
     /// PR M4 (design-metadata-throughput §5.1 D1.b): `SQUEEZEFS_TIMEOUT`
     /// read once at open (control-plane; default 30 s). Two consumers:
     /// the ring-admission park-escalation rung (audit row 2 — parked
@@ -1210,6 +1219,15 @@ impl KvMetaBackend {
             sb.features_incompat & super::superblock::FEATURE_INCOMPAT_KV_LAYOUT_DELTAS != 0;
         let sync = Arc::new(SyncCoalescer::new());
         let retire_seq = Arc::new(AtomicU64::new(ledger.seq + 1));
+        // Resolved once here (before `sb` moves into the struct): the
+        // checkpoint task reads this on every cadence tick.
+        let dirty_node_cap = super::checkpoint::resolve_max_dirty_nodes(
+            crate::mem_budget::MEM_BUDGET.resolve_budget_now(),
+            u64::from(sb.node_size),
+            std::env::var(super::checkpoint::CHECKPOINT_MAX_DIRTY_NODES_ENV)
+                .ok()
+                .as_deref(),
+        );
         let smo = tokio::sync::Mutex::new(SmoContext::with_journal(
             alloc.clone(),
             SmoJournal {
@@ -1257,6 +1275,7 @@ impl KvMetaBackend {
                 crate::cpu::process_parallelism(),
             ),
             batch_max_bytes,
+            dirty_node_cap,
             timeout_threshold: squeezefs_timeout_env(),
             smo,
             retire_seq,
@@ -1320,6 +1339,12 @@ impl KvMetaBackend {
     /// The mounted superblock.
     pub fn superblock(&self) -> &SuperblockV3 {
         &self.sb
+    }
+
+    /// The dirty-node checkpoint cap resolved at open (see the field
+    /// docs: per-tick re-resolution is an op-economy violation).
+    pub(crate) fn dirty_node_cap(&self) -> u64 {
+        self.dirty_node_cap
     }
 
     /// The ledger record this mount selected (newest valid).

@@ -276,6 +276,7 @@ async fn gds_ioctl_arm_is_absent_from_the_default_build() {
         uid: 1000,
         gid: 1000,
         pid: std::process::id(),
+        ..Default::default()
     };
     let e = fx
         .fs

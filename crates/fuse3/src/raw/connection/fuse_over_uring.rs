@@ -1345,6 +1345,7 @@ static TRANSPORT_REPLIES_REFUSED_STALE: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_REPLIES_DROPPED_NO_SLOT: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_ENTS_RETIRED: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_SLOTS_OVERDUE: AtomicU64 = AtomicU64::new(0);
+static TRANSPORT_REPLIES_OVERSIZE: AtomicU64 = AtomicU64::new(0);
 
 /// FUSE-2 reply-integrity counters (stats inode):
 /// `(requests_failed_synthetic, requests_abandoned, replies_refused_stale,
@@ -1365,7 +1366,10 @@ static TRANSPORT_SLOTS_OVERDUE: AtomicU64 = AtomicU64::new(0);
 ///   consecutive REGISTER failures (FUSE-3a).
 /// * `slots_overdue` — slots seen owing a reply for longer than the
 ///   watchdog window (ungated; the promoted `stale-pending` scan).
-pub fn transport_reply_integrity_stats() -> (u64, u64, u64, u64, u64, u64) {
+/// * `replies_oversize` — replies refused because they exceed the ent's
+///   payload buffer (FUSE-3d: an EIO the kernel can act on, instead of a
+///   truncated body under a header claiming the full length).
+pub fn transport_reply_integrity_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
     (
         TRANSPORT_REQUESTS_FAILED_SYNTHETIC.load(Ordering::Relaxed),
         TRANSPORT_REQUESTS_ABANDONED.load(Ordering::Relaxed),
@@ -1373,6 +1377,7 @@ pub fn transport_reply_integrity_stats() -> (u64, u64, u64, u64, u64, u64) {
         TRANSPORT_REPLIES_DROPPED_NO_SLOT.load(Ordering::Relaxed),
         TRANSPORT_ENTS_RETIRED.load(Ordering::Relaxed),
         TRANSPORT_SLOTS_OVERDUE.load(Ordering::Relaxed),
+        TRANSPORT_REPLIES_OVERSIZE.load(Ordering::Relaxed),
     )
 }
 
@@ -4011,6 +4016,25 @@ fn apply_reply(ent: &mut Ent, header: &[u8], body: &Bytes) {
         return;
     }
 
+    // FUSE-3d: a reply larger than the ent's payload buffer used to be
+    // TRUNCATED silently — `payload_sz` reported the short length while
+    // `fuse_out_header.len` still claimed the full one, so the kernel
+    // copied a header promising N bytes over a body of M < N. That is a
+    // corrupt reply, not a small one. Refuse it the way every other
+    // degenerate case is refused: header-only `-EIO`, counted, loud.
+    let want = header.len() - OUT_HDR + body.len();
+    if want > ent.payload_len {
+        error!(
+            "fuse-over-uring: reply body {want} B exceeds the ent payload buffer              ({} B) — committing EIO instead of a truncated reply whose header              would claim the full length",
+            ent.payload_len
+        );
+        TRANSPORT_REPLIES_OVERSIZE.fetch_add(1, Ordering::Relaxed);
+        ent.hdr_mut().in_out[..4].copy_from_slice(&((OUT_HDR as u32).to_le_bytes()));
+        ent.hdr_mut().in_out[4..8].copy_from_slice(&(-libc::EIO).to_le_bytes());
+        ent.hdr_mut().ring_ent_in_out.payload_sz = 0;
+        return;
+    }
+
     let mut payload_len = 0;
     if header.len() > OUT_HDR {
         let extra = &header[OUT_HDR..];
@@ -4116,6 +4140,97 @@ fn push_cmd(
             .map_err(|_| io::Error::other("submission queue full"))?;
     }
     Ok(())
+}
+
+/// FUSE-3d — `apply_reply` must never ship a truncated body under a
+/// header claiming the full length.
+#[cfg(test)]
+mod apply_reply_tests {
+    use super::*;
+
+    /// A test ent over an owned payload buffer (no ring, no kernel).
+    struct TestEnt {
+        _buf: Vec<u8>,
+        ent: Ent,
+        _header: Box<FuseUringReqHeader>,
+    }
+
+    fn test_ent(payload_len: usize) -> TestEnt {
+        let mut buf = vec![0u8; payload_len];
+        let mut header = Box::new(FuseUringReqHeader::default());
+        let header_ptr = &mut *header as *mut FuseUringReqHeader;
+        let ent = Ent {
+            header_ptr,
+            _owned_header: None,
+            payload_ptr: buf.as_mut_ptr(),
+            payload_len,
+            node: None,
+            iov: [
+                libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                },
+                libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                },
+            ],
+            last_opcode: 0,
+        };
+        TestEnt {
+            _buf: buf,
+            ent,
+            _header: header,
+        }
+    }
+
+    fn out_len_and_error(ent: &Ent) -> (u32, i32) {
+        let h = ent.hdr();
+        (
+            u32::from_le_bytes(h.in_out[0..4].try_into().unwrap()),
+            i32::from_le_bytes(h.in_out[4..8].try_into().unwrap()),
+        )
+    }
+
+    /// A reply that fits is applied verbatim, header length and
+    /// `payload_sz` agreeing.
+    #[test]
+    fn a_fitting_reply_is_applied_whole() {
+        let mut t = test_ent(4096);
+        let body = Bytes::from(vec![7u8; 1000]);
+        let mut hdr = error_out_header(5, 0).to_vec();
+        hdr[0..4].copy_from_slice(&((16 + body.len()) as u32).to_le_bytes());
+        apply_reply(&mut t.ent, &hdr, &body);
+        let (len, error) = out_len_and_error(&t.ent);
+        assert_eq!(error, 0);
+        assert_eq!(len as usize, 16 + body.len());
+        assert_eq!(
+            t.ent.hdr().ring_ent_in_out.payload_sz as usize,
+            body.len(),
+            "payload_sz must account for exactly the body the header claims"
+        );
+    }
+
+    /// FUSE-3d: an oversize reply becomes a header-only EIO — never a
+    /// short body under a header promising more (which is what the
+    /// kernel would then copy out to the application).
+    #[test]
+    fn an_oversize_reply_becomes_eio_not_a_truncated_body() {
+        let mut t = test_ent(512);
+        let body = Bytes::from(vec![9u8; 4096]);
+        let mut hdr = error_out_header(6, 0).to_vec();
+        hdr[0..4].copy_from_slice(&((16 + body.len()) as u32).to_le_bytes());
+        let before = transport_reply_integrity_stats().6;
+        apply_reply(&mut t.ent, &hdr, &body);
+        let (len, error) = out_len_and_error(&t.ent);
+        assert_eq!(error, -libc::EIO, "an unshippable reply must fail loud");
+        assert_eq!(len, 16, "the header must claim exactly what is shipped");
+        assert_eq!(t.ent.hdr().ring_ent_in_out.payload_sz, 0);
+        assert!(
+            transport_reply_integrity_stats().6 > before,
+            "the refusal must be counted (transport_replies_oversize)"
+        );
+    }
 }
 
 /// FUSE-2 — the exactly-one-reply invariant, one leg per in-process

@@ -5491,6 +5491,7 @@ impl SqueezefsFilesystem {
             t_dropped_no_slot,
             t_ents_retired,
             t_slots_overdue,
+            t_replies_oversize,
         ) = fuse3::transport_reply_integrity_stats();
         #[cfg(not(target_os = "linux"))]
         let (
@@ -5500,7 +5501,8 @@ impl SqueezefsFilesystem {
             t_dropped_no_slot,
             t_ents_retired,
             t_slots_overdue,
-        ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+            t_replies_oversize,
+        ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         // D3.a (design-metadata-throughput §5.3/§9): COMMIT_AND_FETCH SQEs
         // per queue-worker ring flush. Mean batch (commits / flushes) ≈ 1
         // under storm load means the S2 submit batching regressed to
@@ -6063,6 +6065,7 @@ impl SqueezefsFilesystem {
                 "transport_replies_dropped_no_slot": t_dropped_no_slot,
                 "transport_ents_retired": t_ents_retired,
                 "transport_slots_overdue": t_slots_overdue,
+                "transport_replies_oversize": t_replies_oversize,
                 // Shim-parity 2026-07-28 (ingest-economy board item 2):
                 // dead-TPC-lane re-dispatches — 0 on a healthy daemon;
                 // any growth = a handler lane thread died and its

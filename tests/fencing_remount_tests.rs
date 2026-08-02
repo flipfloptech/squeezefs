@@ -119,6 +119,7 @@ async fn session(meta_path: &Path, backing_path: &Path, staging: &Path) -> H {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: 1,
+        ..Default::default()
     };
     H { fs, dlm, req }
 }

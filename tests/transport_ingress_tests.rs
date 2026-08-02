@@ -66,8 +66,9 @@ use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
 use squeezefs::meta_backend::RoutedMetaBackend;
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
+use squeezefs_testkit::{mount_supported, site, skip};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -395,37 +396,6 @@ fn pin_scope_parse_and_affinity_derivation() {
 // mount, kernel FUSE-over-io_uring; skips honestly where unsupported).
 // ---------------------------------------------------------------------------
 
-fn transport_supported() -> bool {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("[SKIP] /dev/fuse not present");
-        return false;
-    }
-    match std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring") {
-        Ok(v)
-            if matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "y" | "1" | "yes" | "true" | "on"
-            ) => {}
-        Ok(_) | Err(_) => {
-            eprintln!("[SKIP] fuse.enable_uring not enabled");
-            return false;
-        }
-    }
-    if which_fusermount().is_none() {
-        eprintln!("[SKIP] fusermount3 not found");
-        return false;
-    }
-    true
-}
-
-fn which_fusermount() -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|d| d.join("fusermount3"))
-            .find(|p| p.exists())
-    })
-}
-
 struct Mount {
     child: Child,
     mnt: PathBuf,
@@ -602,15 +572,14 @@ fn mount_fs(tag: &str, envs: &[(&str, &str)]) -> Mount {
 
 #[test]
 fn default_posture_is_node_scoped_lever_restores_core_pins() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
     if cpus <= 2 {
-        eprintln!("[SKIP] needs > 2 CPUs to discriminate postures");
-        return;
+        skip!(Capability, "needs > 2 CPUs to discriminate postures");
     }
 
     // Default: node scope.
@@ -672,7 +641,7 @@ fn default_posture_is_node_scoped_lever_restores_core_pins() {
 
 #[test]
 fn write_inplace_replies_engage_and_round_trip() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let m = mount_fs("wr_inplace", &[]);

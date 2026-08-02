@@ -39,6 +39,7 @@
 //! max_background}` stats fields do not exist, INIT replies
 //! max_background=12 regardless of options, and depth defaults to 4.
 
+use squeezefs_testkit::{mount_supported_with_fusectl, site};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -92,33 +93,6 @@ fn expected_geometry(queues: u64, cap_bytes: u64, env_depth: Option<u64>) -> (u6
             }
         }
     }
-}
-
-fn transport_supported() -> bool {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("[SKIP] /dev/fuse not present");
-        return false;
-    }
-    match std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring") {
-        Ok(v)
-            if matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "y" | "1" | "yes" | "true" | "on"
-            ) => {}
-        other => {
-            eprintln!("[SKIP] kernel fuse.enable_uring not enabled ({other:?})");
-            return false;
-        }
-    }
-    if Command::new("fusermount3").arg("-V").output().is_err() {
-        eprintln!("[SKIP] fusermount3 not available");
-        return false;
-    }
-    if !Path::new("/sys/fs/fuse/connections").is_dir() {
-        eprintln!("[SKIP] fusectl not mounted at /sys/fs/fuse/connections");
-        return false;
-    }
-    true
 }
 
 /// Kernel possible CPUs — the queue count the daemon must register
@@ -348,7 +322,7 @@ fn mount_fs(tag: &str, envs: &[(&str, &str)], extra_args: &[&str]) -> Mount {
 /// the R5 memory authority as `transport_payload_buffers`.
 #[test]
 fn test_default_mount_transport_geometry_and_init_limits() {
-    if !transport_supported() {
+    if !mount_supported_with_fusectl(site!()) {
         return;
     }
     let budget = 64 * 1024 * MIB; // SQUEEZEFS_MEM_BUDGET_MB=65536
@@ -421,7 +395,7 @@ fn test_default_mount_transport_geometry_and_init_limits() {
 /// 64), and the gauge tells the truth.
 #[test]
 fn test_small_budget_mount_degrades_q_depth_gracefully() {
-    if !transport_supported() {
+    if !mount_supported_with_fusectl(site!()) {
         return;
     }
     let budget = 1024 * MIB; // SQUEEZEFS_MEM_BUDGET_MB=1024
@@ -463,7 +437,7 @@ fn test_small_budget_mount_degrades_q_depth_gracefully() {
 /// geometry.
 #[test]
 fn test_env_q_depth_override_wins_over_budget() {
-    if !transport_supported() {
+    if !mount_supported_with_fusectl(site!()) {
         return;
     }
     let mut mount = mount_fs(
@@ -500,7 +474,7 @@ fn test_env_q_depth_override_wins_over_budget() {
 /// from the kernel option string and never reaching the INIT reply).
 #[test]
 fn test_mount_option_max_background_override() {
-    if !transport_supported() {
+    if !mount_supported_with_fusectl(site!()) {
         return;
     }
     let mut mount = mount_fs(

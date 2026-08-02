@@ -21,6 +21,7 @@
 //! All tests drive the real binary + a real FUSE mount and skip cleanly
 //! where FUSE-over-io_uring is unavailable.
 
+use squeezefs_testkit::{mount_supported, site};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -40,32 +41,6 @@ fn scratch(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).expect("create scratch dir");
     base
-}
-
-/// FUSE-over-io_uring mount support gate (same shape as the other
-/// real-CLI suites): tests that need a live mount skip cleanly where they
-/// cannot run.
-fn transport_supported() -> bool {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("[SKIP] /dev/fuse not present");
-        return false;
-    }
-    match std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring") {
-        Ok(v)
-            if matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "y" | "1" | "yes" | "true" | "on"
-            ) => {}
-        other => {
-            eprintln!("[SKIP] kernel fuse.enable_uring not enabled ({other:?})");
-            return false;
-        }
-    }
-    if Command::new("fusermount3").arg("-V").output().is_err() {
-        eprintln!("[SKIP] fusermount3 not available");
-        return false;
-    }
-    true
 }
 
 fn format_volume(base: &Path, data_gib: u64) -> PathBuf {
@@ -203,7 +178,7 @@ const FAKE_PIB: u64 = 1024 * 1024 * GIB; // the old hardcoded constant
 
 #[test]
 fn test_statfs_reports_formatted_capacity_not_fake_petabyte() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let base = scratch("capacity");
@@ -247,7 +222,7 @@ fn test_statfs_reports_formatted_capacity_not_fake_petabyte() {
 
 #[test]
 fn test_statfs_free_tracks_write_then_delete_reclaim() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let base = scratch("tracks");
@@ -301,7 +276,7 @@ fn test_statfs_free_tracks_write_then_delete_reclaim() {
 
 #[test]
 fn test_statfs_respects_explicit_capacity_quota() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     // Format with --capacity 2G on an 8 GiB physical volume: statfs must

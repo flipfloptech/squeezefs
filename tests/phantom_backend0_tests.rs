@@ -791,33 +791,11 @@ async fn test_config_bare_router_default_slot_reports_device_path() {
 // ---------------------------------------------------------------------------
 
 mod cli {
+    use squeezefs_testkit::{mount_supported, site};
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
-
-    fn transport_supported() -> bool {
-        if !std::path::Path::new("/dev/fuse").exists() {
-            eprintln!("[SKIP] /dev/fuse not present");
-            return false;
-        }
-        match std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring") {
-            Ok(v)
-                if matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "y" | "1" | "yes" | "true" | "on"
-                ) => {}
-            other => {
-                eprintln!("[SKIP] kernel fuse.enable_uring not enabled ({other:?})");
-                return false;
-            }
-        }
-        if Command::new("fusermount3").arg("-V").output().is_err() {
-            eprintln!("[SKIP] fusermount3 not available");
-            return false;
-        }
-        true
-    }
 
     struct Mount {
         child: Child,
@@ -990,7 +968,7 @@ mod cli {
     /// clean daemon log throughout.
     #[test]
     fn test_cli_multi_volume_user_shape_burst_and_config() {
-        if !transport_supported() {
+        if !mount_supported(site!()) {
             return;
         }
         let mut mount = mount_volumes("multi", &["oss1", "oss2", "oss3", "oss4"]);
@@ -1083,7 +1061,7 @@ mod cli {
     /// that the fix leaves the single-volume shape working end-to-end.
     #[test]
     fn test_cli_single_volume_smoke_unchanged() {
-        if !transport_supported() {
+        if !mount_supported(site!()) {
             return;
         }
         let mut mount = mount_volumes("single", &["solo1"]);

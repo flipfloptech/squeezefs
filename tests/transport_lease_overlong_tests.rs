@@ -31,6 +31,7 @@
 //! `debug_assert` is armed) panics the handler and fsync hangs to this
 //! test's deadline.
 
+use squeezefs_testkit::{mount_supported, site};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -48,29 +49,6 @@ fn scratch(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).expect("create scratch dir");
     base
-}
-
-fn transport_supported() -> bool {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("[SKIP] /dev/fuse not present");
-        return false;
-    }
-    match std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring") {
-        Ok(v)
-            if matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "y" | "1" | "yes" | "true" | "on"
-            ) => {}
-        other => {
-            eprintln!("[SKIP] kernel fuse.enable_uring not enabled ({other:?})");
-            return false;
-        }
-    }
-    if Command::new("fusermount3").arg("-V").output().is_err() {
-        eprintln!("[SKIP] fusermount3 not available");
-        return false;
-    }
-    true
 }
 
 fn format_volume(base: &Path) -> PathBuf {
@@ -196,7 +174,7 @@ fn stats_metric(mnt: &Path, key: &str) -> Option<u64> {
 /// `transport_lease_overlong` tripwire accounts the firing.
 #[test]
 fn overlong_write_lease_is_a_tripwire_not_a_lost_reply() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let base = scratch("overlong");

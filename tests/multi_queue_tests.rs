@@ -344,35 +344,13 @@ async fn test_one_shot_complete_block_never_retains_payload() {
 // ---------------------------------------------------------------------------
 
 mod storm {
+    use squeezefs_testkit::{mount_supported, site};
     use std::io::Write;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-
-    fn transport_supported() -> bool {
-        if !Path::new("/dev/fuse").exists() {
-            eprintln!("[SKIP] /dev/fuse not present");
-            return false;
-        }
-        match std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring") {
-            Ok(v)
-                if matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "y" | "1" | "yes" | "true" | "on"
-                ) => {}
-            other => {
-                eprintln!("[SKIP] kernel fuse.enable_uring not enabled ({other:?})");
-                return false;
-            }
-        }
-        if Command::new("fusermount3").arg("-V").output().is_err() {
-            eprintln!("[SKIP] fusermount3 not available");
-            return false;
-        }
-        true
-    }
 
     /// Pin the calling thread to CPU 0 so every FUSE request it generates is
     /// delivered on uring queue 0 (the kernel routes by submitting CPU) —
@@ -615,7 +593,7 @@ mod storm {
     /// copies.
     #[test]
     fn test_single_queue_qdepth4_small_file_storm_no_starvation() {
-        if !super::storm::transport_supported() {
+        if !mount_supported(site!()) {
             return;
         }
         let mut mount = mount_fs("storm");
@@ -751,7 +729,7 @@ mod storm {
     /// `/dev/fuse` after arm), so forgets pile up unserviced.
     #[test]
     fn test_classical_sideband_serviced_and_unmount_clean() {
-        if !super::storm::transport_supported() {
+        if !mount_supported(site!()) {
             return;
         }
         let mut mount = mount_fs("sideband");

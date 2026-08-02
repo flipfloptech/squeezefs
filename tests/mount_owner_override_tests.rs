@@ -27,6 +27,7 @@
 //! The sudo legs skip cleanly when passwordless sudo is unavailable; the
 //! mount legs skip where FUSE-over-io_uring cannot run.
 
+use squeezefs_testkit::{mount_supported, site};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -69,44 +70,12 @@ fn me() -> (u32, u32) {
     (unsafe { libc::getuid() }, unsafe { libc::getgid() })
 }
 
-/// The sudo-shape contracts need a non-root invoker with passwordless sudo.
-fn sudo_available() -> bool {
-    if unsafe { libc::getuid() } == 0 {
-        eprintln!("[SKIP] running as root — the sudo-shape contracts need a non-root invoker");
-        return false;
-    }
-    match Command::new("sudo").args(["-n", "true"]).output() {
-        Ok(o) if o.status.success() => true,
-        _ => {
-            eprintln!("[SKIP] passwordless sudo unavailable");
-            false
-        }
-    }
-}
-
-/// FUSE-over-io_uring mount support gate (same shape as the other real-CLI
-/// suites): tests that need a live mount skip cleanly where they cannot run.
-fn transport_supported() -> bool {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("[SKIP] /dev/fuse not present");
-        return false;
-    }
-    match std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring") {
-        Ok(v)
-            if matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "y" | "1" | "yes" | "true" | "on"
-            ) => {}
-        other => {
-            eprintln!("[SKIP] kernel fuse.enable_uring not enabled ({other:?})");
-            return false;
-        }
-    }
-    if Command::new("fusermount3").arg("-V").output().is_err() {
-        eprintln!("[SKIP] fusermount3 not available");
-        return false;
-    }
-    true
+/// The sudo-shape contracts need a non-root invoker with passwordless
+/// sudo. Both halves are ledgered skip classes (TEST-2) so a gate run
+/// can promote either to a failure.
+fn sudo_available(site: squeezefs_testkit::Site) -> bool {
+    squeezefs_testkit::non_root(site, "the sudo-shape contracts")
+        && squeezefs_testkit::passwordless_sudo(site)
 }
 
 /// Run a CLI invocation with a hard deadline; a hang is converted into a
@@ -358,7 +327,7 @@ fn write_read_delete(mnt: &Path, name: &str, len: usize, seed: u8) {
 /// WITHOUT any chown in between (the exact user-hit recipe).
 #[test]
 fn test_sudo_format_stamps_invoking_user_then_user_mount_works_without_chown() {
-    if !sudo_available() || !transport_supported() {
+    if !sudo_available(site!()) || !mount_supported(site!()) {
         return;
     }
     let base = scratch("sudo_smoke");
@@ -444,7 +413,7 @@ fn test_sudo_format_stamps_invoking_user_then_user_mount_works_without_chown() {
 /// by root: a deliberate root deployment is never second-guessed.
 #[test]
 fn test_genuine_root_format_keeps_root_ownership() {
-    if !sudo_available() {
+    if !sudo_available(site!()) {
         return;
     }
     let base = scratch("plain_root");
@@ -488,7 +457,7 @@ fn test_genuine_root_format_keeps_root_ownership() {
 /// invoking-user ownership rule as format when run under sudo.
 #[test]
 fn test_sudo_set_cache_paths_stamps_invoking_user() {
-    if !sudo_available() {
+    if !sudo_available(site!()) {
         return;
     }
     let base = scratch("sudo_setpaths");
@@ -542,8 +511,7 @@ fn test_sudo_set_cache_paths_stamps_invoking_user() {
 #[test]
 fn test_mount_preflight_fails_loud_with_chown_remedy_on_unwritable_staging() {
     use std::os::unix::fs::PermissionsExt;
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("[SKIP] permission-simulation contract needs a non-root test identity");
+    if !squeezefs_testkit::non_root(site!(), "the permission-simulation contract") {
         return;
     }
     let base = scratch("preflight");
@@ -700,8 +668,7 @@ async fn test_stamp_staging_dir_creates_wipes_and_owns() {
 fn test_staging_write_preflight_unit() {
     use squeezefs::config_ops::staging_write_preflight;
     use std::os::unix::fs::PermissionsExt;
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("[SKIP] permission-simulation contract needs a non-root test identity");
+    if !squeezefs_testkit::non_root(site!(), "the permission-simulation contract") {
         return;
     }
     let base = scratch("preflight_unit");

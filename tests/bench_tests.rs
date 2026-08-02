@@ -17,6 +17,7 @@ use squeezefs::bench::{
     AUTO_PER_THREAD_BYTES, AUTO_TOTAL_FLOOR_BYTES, DEFAULT_BLOCK, DEFAULT_RAND_TIME_BOX_SECS,
     SUITE_RAND_BLOCK, SUITE_SEQ_BLOCK,
 };
+use squeezefs_testkit::site;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -331,7 +332,11 @@ fn test_resolve_shape_auto_defaults() {
         );
         assert_eq!(r2.size % MIB, 0, "auto size must be a 1 MiB multiple");
     } else {
-        eprintln!("[SKIP] scratch fs has < 68 GiB free; exact auto-size pin skipped");
+        let _ = squeezefs_testkit::declare(
+            site!(),
+            squeezefs_testkit::SkipClass::Capability,
+            "scratch fs has < 68 GiB free; exact auto-size pin skipped",
+        );
     }
     cleanup(&base);
 }
@@ -564,19 +569,12 @@ async fn test_suite_lifecycle_on_tiny_dataset() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_suite_lifecycle_direct_when_supported() {
     let base = scratch("suite_direct");
-    let probe = base.join("direct_probe.bin");
-    std::fs::write(&probe, vec![0u8; 4096]).expect("probe file");
-    let supported = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(&probe)
-            .is_ok()
-    };
-    let _ = std::fs::remove_file(&probe);
-    if !supported {
-        eprintln!("[SKIP] scratch filesystem does not support O_DIRECT");
+    if !squeezefs_testkit::o_direct_supported(&base) {
+        let _ = squeezefs_testkit::declare(
+            site!(),
+            squeezefs_testkit::SkipClass::Capability,
+            "scratch filesystem does not support O_DIRECT",
+        );
         cleanup(&base);
         return;
     }
@@ -1138,19 +1136,12 @@ async fn test_write_is_authoritative_over_stale_larger_files() {
 async fn test_direct_end_to_end_when_supported() {
     let base = scratch("direct");
     // Probe O_DIRECT support on the scratch filesystem first.
-    let probe = base.join("direct_probe.bin");
-    std::fs::write(&probe, vec![0u8; 4096]).expect("probe file");
-    let supported = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(&probe)
-            .is_ok()
-    };
-    let _ = std::fs::remove_file(&probe);
-    if !supported {
-        eprintln!("[SKIP] scratch filesystem does not support O_DIRECT");
+    if !squeezefs_testkit::o_direct_supported(&base) {
+        let _ = squeezefs_testkit::declare(
+            site!(),
+            squeezefs_testkit::SkipClass::Capability,
+            "scratch filesystem does not support O_DIRECT",
+        );
         cleanup(&base);
         return;
     }
@@ -1431,19 +1422,12 @@ fn test_cli_bare_invocation_runs_suite_with_explicit_tiny_shape() {
     let base = scratch("cli_suite");
     // Gate: the suite's I/O passes are O_DIRECT; skip cleanly where the
     // scratch filesystem cannot do it.
-    let probe = base.join("direct_probe.bin");
-    std::fs::write(&probe, vec![0u8; 4096]).expect("probe file");
-    let supported = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(&probe)
-            .is_ok()
-    };
-    let _ = std::fs::remove_file(&probe);
-    if !supported {
-        eprintln!("[SKIP] scratch filesystem does not support O_DIRECT");
+    if !squeezefs_testkit::o_direct_supported(&base) {
+        let _ = squeezefs_testkit::declare(
+            site!(),
+            squeezefs_testkit::SkipClass::Capability,
+            "scratch filesystem does not support O_DIRECT",
+        );
         cleanup(&base);
         return;
     }

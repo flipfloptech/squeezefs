@@ -5,6 +5,7 @@
 //! Nothing else. No LVM/VG/NQN interrogation, no path allow-lists.
 
 use squeezefs::storage::validate_backing_device;
+use squeezefs_testkit::skip;
 
 /// Find the first raw NVMe namespace block node (e.g. /dev/nvme0n1), if any.
 fn first_nvme_namespace() -> Option<String> {
@@ -82,8 +83,7 @@ fn first_zero_capacity_block_device() -> Option<String> {
 #[test]
 fn raw_nvme_namespace_block_device_is_accepted() {
     let Some(dev) = first_nvme_namespace() else {
-        eprintln!("SKIP: no NVMe namespace block device on this machine");
-        return;
+        skip!(Hardware, "no NVMe namespace block device on this machine");
     };
     validate_backing_device(&dev)
         .unwrap_or_else(|e| panic!("raw NVMe namespace '{dev}' must be accepted, got: {e}"));
@@ -92,8 +92,7 @@ fn raw_nvme_namespace_block_device_is_accepted() {
 #[test]
 fn any_block_device_is_accepted() {
     let Some(dev) = first_nonzero_block_device() else {
-        eprintln!("SKIP: no block devices visible on this machine");
-        return;
+        skip!(Hardware, "no block devices visible on this machine");
     };
     validate_backing_device(&dev)
         .unwrap_or_else(|e| panic!("block device '{dev}' must be accepted, got: {e}"));
@@ -103,8 +102,7 @@ fn any_block_device_is_accepted() {
 fn zero_capacity_block_device_is_rejected() {
     // e.g. an unattached /dev/loopN node: a block device, but 0 sectors.
     let Some(dev) = first_zero_capacity_block_device() else {
-        eprintln!("SKIP: no zero-capacity block device on this machine");
-        return;
+        skip!(Hardware, "no zero-capacity block device on this machine");
     };
     let err = validate_backing_device(&dev)
         .expect_err("zero-capacity block device must be rejected")
@@ -161,8 +159,10 @@ fn nvme_controller_char_device_is_rejected_with_namespace_hint() {
     match std::fs::metadata(ctrl) {
         Ok(m) if std::os::unix::fs::FileTypeExt::is_char_device(&m.file_type()) => {}
         _ => {
-            eprintln!("SKIP: no /dev/nvme0 controller char device on this machine");
-            return;
+            skip!(
+                Hardware,
+                "no /dev/nvme0 controller char device on this machine"
+            );
         }
     }
     let err = validate_backing_device(ctrl)

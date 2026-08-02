@@ -129,6 +129,15 @@ tasks:
       # Criterion smoke — one iteration per bench, no measurement.
       - cargo bench --benches -- --test
 
+  check:require-mount:
+    desc: >-
+      Release-gate leg (spec §11 TEST-2): the twelve live-mount suites with
+      SQUEEZEFS_TEST_REQUIRE_MOUNT=1, so a missing /dev/fuse /
+      fuse.enable_uring / fusermount3 is a FAILURE instead of a phantom-green
+      skip. Emits target/skip-ledger.jsonl.
+    cmds:
+      - tests/run_require_mount_gate.sh
+
   clean:
     desc: Remove dist/ (container caches survive; prune the named volumes to drop them)
     cmds:

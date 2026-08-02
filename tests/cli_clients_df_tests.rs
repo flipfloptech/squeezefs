@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use squeezefs::fuse_client::CLIENT_STALE_TTL_SECS;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+use squeezefs_testkit::{mount_supported, site};
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -48,32 +49,6 @@ fn scratch(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).expect("create scratch dir");
     base
-}
-
-/// FUSE-over-io_uring mount support gate (same shape as the other
-/// real-CLI suites): tests that need a live mount skip cleanly where they
-/// cannot run.
-fn transport_supported() -> bool {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("[SKIP] /dev/fuse not present");
-        return false;
-    }
-    match std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring") {
-        Ok(v)
-            if matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "y" | "1" | "yes" | "true" | "on"
-            ) => {}
-        other => {
-            eprintln!("[SKIP] kernel fuse.enable_uring not enabled ({other:?})");
-            return false;
-        }
-    }
-    if Command::new("fusermount3").arg("-V").output().is_err() {
-        eprintln!("[SKIP] fusermount3 not available");
-        return false;
-    }
-    true
 }
 
 fn run(args: &[&str]) -> Output {
@@ -408,7 +383,7 @@ async fn test_clients_classifies_forged_live_and_stale_registrations() {
 /// correct pid, live state); a clean unmount must leave zero records.
 #[test]
 fn test_clients_lists_live_mount_then_zero_after_clean_unmount() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let base = scratch("clients_live");
@@ -479,7 +454,7 @@ fn test_clients_lists_live_mount_then_zero_after_clean_unmount() {
 /// staleness law; kill -9 leaves a fresh timestamp behind).
 #[test]
 fn test_clients_kill9_daemon_classified_stale_not_active() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let base = scratch("clients_kill9");
@@ -668,7 +643,7 @@ async fn test_df_offline_empty_volume_reconciles_capacity_and_schema() {
 /// via a second mount and the space must return.
 #[test]
 fn test_df_reflects_allocator_delta_after_durable_write() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let base = scratch("df_delta");
@@ -723,7 +698,7 @@ fn test_df_reflects_allocator_delta_after_durable_write() {
 /// against a LIVE-mounted volume set too — never blocked, never refusing.
 #[test]
 fn test_df_answers_against_live_mounted_volume() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let base = scratch("df_live");

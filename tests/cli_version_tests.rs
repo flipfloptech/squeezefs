@@ -27,6 +27,7 @@
 //! convention for CLI contracts.
 
 use regex::Regex;
+use squeezefs_testkit::skip;
 use std::process::Command;
 
 fn bin() -> &'static str {
@@ -132,8 +133,10 @@ fn version_embeds_the_real_build_commit() {
     {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => {
-            eprintln!("[SKIP] no usable git in {repo}; cannot cross-check HEAD");
-            return;
+            skip!(
+                Toolchain,
+                "no usable git in {repo}; cannot cross-check HEAD"
+            );
         }
     };
     let stdout = run_version("--version");

@@ -19,35 +19,13 @@
 //!   (pre-fix: every REGISTER refused, mount failed) and whole-block
 //!   4 MiB WRITEs ride single payload leases.
 
-use std::path::{Path, PathBuf};
+use squeezefs_testkit::{mount_supported, site, skip};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const MIB: u64 = 1024 * 1024;
 const SYSCTL: &str = "/proc/sys/fs/fuse/max_pages_limit";
-
-fn transport_supported() -> bool {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("[SKIP] /dev/fuse not present");
-        return false;
-    }
-    match std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring") {
-        Ok(v)
-            if matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "y" | "1" | "yes" | "true" | "on"
-            ) => {}
-        other => {
-            eprintln!("[SKIP] kernel fuse.enable_uring not enabled ({other:?})");
-            return false;
-        }
-    }
-    if Command::new("fusermount3").arg("-V").output().is_err() {
-        eprintln!("[SKIP] fusermount3 not available");
-        return false;
-    }
-    true
-}
 
 fn page_size() -> u64 {
     let sz = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
@@ -259,7 +237,7 @@ fn mount_fs(tag: &str, envs: &[(&str, &str)], block_size: Option<&str>) -> Mount
 /// byte-identical contract, now observable.
 #[test]
 fn test_default_mount_gauges_negotiated_write_geometry() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let mut mount = mount_fs("default", &[("SQUEEZEFS_MEM_BUDGET_MB", "65536")], None);
@@ -308,7 +286,7 @@ fn test_default_mount_gauges_negotiated_write_geometry() {
 /// 4 MiB-block volume restores the pre-campaign wire shape exactly.
 #[test]
 fn test_env_max_write_override_wins_verbatim() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let mut mount = mount_fs(
@@ -339,7 +317,7 @@ fn test_env_max_write_override_wins_verbatim() {
 /// lowers the floor).
 #[test]
 fn test_small_block_size_keeps_the_1mib_floor() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let mut mount = mount_fs(
@@ -367,19 +345,20 @@ fn test_small_block_size_keeps_the_1mib_floor() {
 /// write must ride ≤ 4 payload leases (1 MiB max_write pays 8).
 #[test]
 fn test_raised_sysctl_mounts_with_4mib_ents() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let saved = std::fs::read_to_string(SYSCTL)
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     if saved.is_empty() {
-        eprintln!("[SKIP] {SYSCTL} not present on this kernel");
-        return;
+        skip!(Capability, "{SYSCTL} not present on this kernel");
     }
     if std::fs::write(SYSCTL, "1024").is_err() {
-        eprintln!("[SKIP] cannot write {SYSCTL} (need root) — run this binary under sudo");
-        return;
+        skip!(
+            Root,
+            "cannot write {SYSCTL} (need root) — run this binary under sudo"
+        );
     }
     /// Restore the sysctl even on assertion panics.
     struct Restore(String);

@@ -1,0 +1,15 @@
+[package]
+name = "squeezefs-testkit"
+# Tracks the release train (docs/operations.md §Versioning & releases).
+version = "1.1.0"
+edition = "2021"
+license-file = "../../LICENSE"
+publish = false
+description = "The ONE environment-gate + skip-ledger helper for SqueezeFS test binaries (spec §11 TEST-2)."
+
+# A LIBRARY crate on purpose (not a `tests/common/mod.rs`): each test
+# binary uses a different subset of the gates, and a private test module
+# would need a blanket `#[allow(dead_code)]` for the unused ones — which
+# AGENTS.md forbids. A library's `pub` surface is exempt by construction.
+[dependencies]
+libc = "0.2"

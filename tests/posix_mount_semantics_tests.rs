@@ -14,6 +14,7 @@
 //! Skips cleanly where FUSE-over-io_uring is unavailable, exactly like
 //! `tests/statfs_tests.rs` (whose mount scaffolding this mirrors).
 
+use squeezefs_testkit::{mount_supported, site};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -36,29 +37,6 @@ fn scratch(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).expect("create scratch dir");
     base
-}
-
-fn transport_supported() -> bool {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("[SKIP] /dev/fuse not present");
-        return false;
-    }
-    match std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring") {
-        Ok(v)
-            if matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "y" | "1" | "yes" | "true" | "on"
-            ) => {}
-        other => {
-            eprintln!("[SKIP] kernel fuse.enable_uring not enabled ({other:?})");
-            return false;
-        }
-    }
-    if Command::new("fusermount3").arg("-V").output().is_err() {
-        eprintln!("[SKIP] fusermount3 not available");
-        return false;
-    }
-    true
 }
 
 fn format_volume(base: &Path) -> PathBuf {
@@ -176,7 +154,7 @@ fn statvfs_ffree(path: &Path) -> u64 {
 /// copier consults.
 #[test]
 fn mount_exports_holes_to_lseek_and_st_blocks() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let base = scratch("sparse");
@@ -245,7 +223,7 @@ fn mount_exports_holes_to_lseek_and_st_blocks() {
 /// create/delete loop walked a fresh filesystem to "full".
 #[test]
 fn mount_statvfs_ifree_recovers_after_create_delete_loop() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let base = scratch("ifree");
@@ -288,7 +266,7 @@ fn mount_statvfs_ifree_recovers_after_create_delete_loop() {
 /// miss — they stat inside it.
 #[test]
 fn mount_symlink_size_is_correct_after_the_attr_ttl_lapses() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let base = scratch("symlink");

@@ -9,8 +9,7 @@ use std::collections::HashMap;
 #[ignore]
 async fn walk_user_meta_key_forms() {
     let Ok(paths) = std::env::var("MV_EIO_META") else {
-        eprintln!("MV_EIO_META not set; skipping");
-        return;
+        squeezefs_testkit::skip!(OptIn, "MV_EIO_META not set");
     };
     let mut per_prefix: HashMap<String, u64> = HashMap::new();
     // (be_id, offset) -> count of referencing (vol, ino, block)

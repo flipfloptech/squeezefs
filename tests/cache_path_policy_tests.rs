@@ -25,6 +25,7 @@
 //! library-level contract test pins the cache-less `TieredCache` surface
 //! that the routing layer's layout decisions depend on.
 
+use squeezefs_testkit::{mount_supported, site};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -45,31 +46,6 @@ fn scratch(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
     base
-}
-
-/// FUSE-over-io_uring mount support gate (same shape as the other real-CLI
-/// suites): tests that need a live mount skip cleanly where they cannot run.
-fn transport_supported() -> bool {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("[SKIP] /dev/fuse not present");
-        return false;
-    }
-    match std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring") {
-        Ok(v)
-            if matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "y" | "1" | "yes" | "true" | "on"
-            ) => {}
-        other => {
-            eprintln!("[SKIP] kernel fuse.enable_uring not enabled ({other:?})");
-            return false;
-        }
-    }
-    if Command::new("fusermount3").arg("-V").output().is_err() {
-        eprintln!("[SKIP] fusermount3 not available");
-        return false;
-    }
-    true
 }
 
 /// Run a CLI invocation with a hard deadline; a hang is converted into a
@@ -359,7 +335,7 @@ fn test_mount_rejects_disk_cache_paths_flag_loud_and_instant() {
 /// root), and a staged-window write must actually ride the staging tier.
 #[test]
 fn test_mount_adopts_format_declared_cache_paths() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let base = scratch("declared");
@@ -426,7 +402,7 @@ fn test_mount_adopts_format_declared_cache_paths() {
 /// small+large write/read/delete cycle is green.
 #[test]
 fn test_cacheless_mount_small_large_io_cycle() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let base = scratch("cacheless");
@@ -500,7 +476,7 @@ fn test_cacheless_mount_small_large_io_cycle() {
 /// fresh generation marker there.
 #[test]
 fn test_set_cache_paths_admin_op_end_to_end() {
-    if !transport_supported() {
+    if !mount_supported(site!()) {
         return;
     }
     let base = scratch("setpaths");

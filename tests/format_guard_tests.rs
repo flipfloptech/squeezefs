@@ -33,6 +33,7 @@ use squeezefs::meta_backend::kv::superblock::{
     FEATURE_INCOMPAT_NODE_SEQ_WATERMARK,
 };
 use squeezefs::meta_backend::{open_volume_for_mount, Metadata};
+use squeezefs_testkit::{mount_supported, site};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
@@ -527,35 +528,6 @@ fn scratch(tag: &str) -> std::path::PathBuf {
     base
 }
 
-/// FUSE-over-io_uring mount support gate (same shape as the other
-/// real-CLI suites): the mount phase skips cleanly where it cannot run.
-fn transport_supported() -> bool {
-    if !std::path::Path::new("/dev/fuse").exists() {
-        eprintln!("[SKIP] /dev/fuse not present");
-        return false;
-    }
-    match std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring") {
-        Ok(v)
-            if matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "y" | "1" | "yes" | "true" | "on"
-            ) => {}
-        other => {
-            eprintln!("[SKIP] kernel fuse.enable_uring not enabled ({other:?})");
-            return false;
-        }
-    }
-    if std::process::Command::new("fusermount3")
-        .arg("-V")
-        .output()
-        .is_err()
-    {
-        eprintln!("[SKIP] fusermount3 not available");
-        return false;
-    }
-    true
-}
-
 /// Run a CLI invocation with a hard deadline; a hang is converted into a
 /// loud failure instead of wedging the suite.
 fn run_with_deadline(
@@ -783,8 +755,10 @@ fn cli_format_force_reformats_pre_watermark_set_then_mounts() {
     );
 
     // (d) Mount + write + remount + read-back (transport-gated).
-    if !transport_supported() {
-        eprintln!("[SKIP] mount phase skipped (transport unsupported); format phases verified");
+    // `mount_supported` has already ledgered the class-`mount` record (and
+    // failed the test outright under SQUEEZEFS_TEST_REQUIRE_MOUNT=1); the
+    // format phases above ran unconditionally.
+    if !mount_supported(site!()) {
         let _ = std::fs::remove_dir_all(&base);
         return;
     }

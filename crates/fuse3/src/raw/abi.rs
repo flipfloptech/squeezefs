@@ -34,7 +34,15 @@ pub const FUSE_MIN_READ_BUFFER_SIZE: usize = 8 * 1024;
 
 pub const FUSE_KERNEL_VERSION: u32 = 7;
 
-pub const FUSE_KERNEL_MINOR_VERSION: u32 = 31;
+/// FUSE-1 (pre-rc spec §4): 36 EXACTLY — the extended-init (`FUSE_INIT_EXT`
+/// / `flags2`) protocol revision, the minimum under which mainline
+/// `process_init_reply()` honors the reply's `flags2` fold. The 31→36 audit
+/// (fix/fuse-init-ext) verified no `fc->minor`-gated kernel behavior exists
+/// in (23, 36] — everything 7.32–7.36 rides INIT flags the daemon does not
+/// echo. Raising this further requires a fresh audit of every `fc->minor`
+/// gate in the target kernels; do not chase newer minors speculatively
+/// (capabilities ride INIT flags, not the version).
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 36;
 
 pub const DEFAULT_TIME_GRAN: u32 = 1;
 

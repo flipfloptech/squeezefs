@@ -4962,11 +4962,19 @@ fn negotiate_time_limits(kernel_capabilities: u64) -> Option<(i64, i64)> {
 ///   kernels (they treat bit 30 as garbage), and a zero `flags2` has
 ///   nothing to fold.
 fn negotiate_init_ext(kernel_minor: u32, kernel_flags: u32, reply_flags2: u32) -> (u32, u32) {
-    // Skeleton — the pre-FUSE-1 posture verbatim (minor pin 31, the bit
-    // never set: the two independent reasons the kernel discards flags2);
-    // implementation follows the red tests.
-    let _ = (kernel_minor, kernel_flags, reply_flags2);
-    (FUSE_KERNEL_MINOR_VERSION, 0)
+    let reply_minor = kernel_minor.min(FUSE_KERNEL_MINOR_VERSION);
+    // The reply_minor >= 36 conjunct is the coherence guard: every real
+    // kernel that offers FUSE_INIT_EXT is >= 7.36 (the bit did not exist
+    // before), so it never fires against genuine offers — it only refuses
+    // the degenerate shape of a kernel claiming minor < 36 while waving
+    // bit 30 (a foreign-fork or garbage flags word extended-init cannot
+    // stand on).
+    let init_ext = if kernel_flags & FUSE_INIT_EXT != 0 && reply_flags2 != 0 && reply_minor >= 36 {
+        FUSE_INIT_EXT
+    } else {
+        0
+    };
+    (reply_minor, init_ext)
 }
 
 fn negotiate_reply_flags(init_in_flags: u32, mount_options: &MountOptions) -> u32 {

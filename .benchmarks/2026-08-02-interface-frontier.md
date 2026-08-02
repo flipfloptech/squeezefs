@@ -263,3 +263,11 @@ one perf capture retained on-box lives at
 `/scratch/tmp/ifr/ifril2.data`; the /tmp copies were removed with the
 incident cleanup. Journal: SESSION START/END + every row + both
 incident lines in `/scratch/tmp/agent_runs.log`.
+
+---
+
+## CORRECTION ADDENDUM (2026-08-03) — the zcrx cell was a FALSE NEGATIVE
+
+The "io_uring zcrx / HDS — driver-blocked (mlx5 reports no tcp-data-split ring attr)" verdict is **retracted**. With ethtool 7.1 staged on the client (EL8's ~5.x ethtool predates the netlink ring attr), both fabric ports report **`TCP data split: on`** — the mechanism was not merely available but ACTIVE, with HW-GRO on and HDS thresh 0. The campaign's genetlink probe (and the orchestrator's verification grep) searched the hyphenated spelling; the attr reports with spaces. Instrument-alignment class: the probe itself was the misaligned instrument. mlx5 zcrx/HDS is in-tree from 6.17 (CX-7 targeted; NO MOFED involved) — kernel 7.1.2 carries it.
+
+**Category C shrinks accordingly**: the zcrx userspace initiator lane (+3–5 GB/s class, the RX-copy kill) is OPEN on the current kernel. The user has additionally relaxed the MSS/MTU constraint (2026-08-02) and authorized the sqz custom kernel, which further reopens TCP_ZEROCOPY_RECEIVE (fallback-grade) and the FUSE zc-reply ABI (patch-and-carry). Remaining truly-closed cells: RoCE conversion (user constraint), FUSE passthrough (architectural), devmem-TCP (no dma-buf source until the sqz kernel's UDMABUF).

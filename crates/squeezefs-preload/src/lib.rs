@@ -24,6 +24,11 @@ pub mod aio_glue;
 pub mod bailout;
 pub mod dev_cache;
 pub mod fd_table;
+// The fd table's lock-free protocol core (spec §11 TEST-5): extracted per
+// the house `#[path]`-shared-core convention so `loom-models/` checks the
+// SHIPPED refcount law, PERF-7 Dekker pair, and fork-epoch predicate —
+// not a copy.
+pub mod fd_table_core;
 #[cfg(feature = "interposers")]
 pub mod interpose;
 pub mod mapped_inos;

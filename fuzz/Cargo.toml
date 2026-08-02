@@ -1,0 +1,121 @@
+# Unstructured-input fuzzing for SqueezeFS's three untrusted-input
+# surfaces (docs/pre-rc-engineering-spec.md §11 TEST-4):
+#
+#   1. on-disk metadata — a mount parses whatever the device holds, and
+#      the crash contract's whole point is that torn/garbage bytes are
+#      *detected*, never branched on;
+#   2. the remote job-wire — every byte before enrollment is
+#      attacker-chosen (the listener defaults to 0.0.0.0);
+#   3. the IPC shared memfd + bootstrap blob — the shim reads a blob and
+#      a header written by a process it must not trust unconditionally.
+#
+# `tests/ipc_host_tests.rs` and `tests/job_wire_bounds_tests.rs` cover
+# every NAMED refusal class well. What these targets add is the classes
+# nobody thought of.
+#
+# Own workspace (like loom-models): the fuzz profile carries sanitizer
+# and coverage RUSTFLAGS that must not poison the main build graph.
+[package]
+name = "squeezefs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+# Load-bearing: as its own workspace root this crate does NOT inherit the
+# root manifest's patch table, and the root crate's prepublish-style
+# `fuse3 = "1.1"` requirement can only be satisfied by the in-tree
+# first-party fork (crates.io fuse3 is 0.7.x and structurally different).
+[patch.crates-io]
+fuse3 = { path = "../crates/fuse3" }
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1.5"
+tokio = { version = "1.48", features = ["rt", "io-util", "macros", "time"] }
+serde_json = "1.0"
+
+[dependencies.squeezefs]
+path = ".."
+
+[dependencies.squeezefs-ipc]
+path = "../crates/squeezefs-ipc"
+
+# Keep the fuzz binaries debuggable: a crash report that cannot be
+# symbolicated costs more than the build time it saves.
+[profile.release]
+debug = true
+
+# --- on-disk metadata decoders (the five) ---------------------------------
+
+[[bin]]
+name = "kv_record"
+path = "fuzz_targets/kv_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kv_bset"
+path = "fuzz_targets/kv_bset.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kv_node"
+path = "fuzz_targets/kv_node.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kv_journal"
+path = "fuzz_targets/kv_journal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kv_superblock"
+path = "fuzz_targets/kv_superblock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "layout_wire"
+path = "fuzz_targets/layout_wire.rs"
+test = false
+doc = false
+bench = false
+
+# --- remote job wire -------------------------------------------------------
+
+[[bin]]
+name = "job_wire_frame"
+path = "fuzz_targets/job_wire_frame.rs"
+test = false
+doc = false
+bench = false
+
+# --- IPC shared memfd ------------------------------------------------------
+
+[[bin]]
+name = "ipc_bootstrap"
+path = "fuzz_targets/ipc_bootstrap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_ring_header"
+path = "fuzz_targets/ipc_ring_header.rs"
+test = false
+doc = false
+bench = false

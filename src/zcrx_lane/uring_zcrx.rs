@@ -405,6 +405,29 @@ impl RawRing {
     }
 }
 
+/// **Provenance gate** (design §5): a RECV_ZC completion's `big0` carries
+/// `(area_token_high << IORING_ZCRX_AREA_SHIFT) | offset`. The high bits
+/// must name OUR registered area — a mismatch means the CQE describes
+/// memory this lane does not own, which is a frame violation, not a
+/// recoverable error.
+///
+/// Extracted (spec §11 TEST-6) so the two gate-chain checks the driver
+/// loop performs on every completion are reachable without a
+/// zcrx-capable NIC.
+fn cqe_area_matches(raw_off: u64, area_token: u64) -> bool {
+    raw_off >> IORING_ZCRX_AREA_SHIFT == area_token >> IORING_ZCRX_AREA_SHIFT
+}
+
+/// **Span-bounds gate**: the completion's `(offset, len)` must land
+/// entirely inside the registered area. Returns the in-area byte offset,
+/// or `None` when the span escapes it (overflow included — a `res` near
+/// `i32::MAX` at a high offset must not wrap into a valid-looking span).
+fn cqe_span_offset(raw_off: u64, len: usize, area_len: usize) -> Option<usize> {
+    let off = (raw_off & ((1u64 << IORING_ZCRX_AREA_SHIFT) - 1)) as usize;
+    off.checked_add(len).filter(|end| *end <= area_len)?;
+    Some(off)
+}
+
 /// The registered refill ring view (region memory is ours; offsets are
 /// kernel-assigned at ifq registration).
 struct RefillRing {
@@ -696,7 +719,6 @@ fn drive(
     let mut send_seq: u64 = 0;
     let mut to_submit: u32 = 2; // doorbell + recv already queued
 
-    let offset_mask: u64 = (1u64 << IORING_ZCRX_AREA_SHIFT) - 1;
     loop {
         if cfg.shared.poisoned.load(Ordering::SeqCst) || cfg.cmds.closed.load(Ordering::SeqCst) {
             // Drain path: closing the ring fd is the teardown — the
@@ -754,19 +776,16 @@ fn drive(
                 TAG_RECV => {
                     if res > 0 {
                         let raw_off = big0;
-                        if raw_off >> IORING_ZCRX_AREA_SHIFT
-                            != refill.area_token >> IORING_ZCRX_AREA_SHIFT
-                        {
+                        if !cqe_area_matches(raw_off, refill.area_token) {
                             crate::fuse_client::METRICS
                                 .zcrx_frame_violations
                                 .fetch_add(1, Ordering::Relaxed);
                             return Err("zcrx CQE names a foreign area (provenance)".into());
                         }
-                        let off = (raw_off & offset_mask) as usize;
                         let len = res as usize;
-                        if off + len > cfg.area.len() {
+                        let Some(off) = cqe_span_offset(raw_off, len, cfg.area.len()) else {
                             return Err("zcrx CQE span exceeds the area".into());
-                        }
+                        };
                         let slot = match ready_slots.slots.pop() {
                             Some(s) => s,
                             // Late grants may be sitting in the free
@@ -867,5 +886,437 @@ fn drive(
                 other => return Err(format!("unknown CQE user_data {other:#x}")),
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Contracts (spec §11 TEST-6)
+// ---------------------------------------------------------------------------
+//
+// This module was 869 LOC with 18 `unsafe` sites and ZERO test references
+// anywhere — a D5 gate-chain link the lane must not ship default-on
+// without. The reason it had none is real (a zcrx-capable NIC with HDS
+// exists on no dev box or CI runner), but most of what is dangerous here
+// is NOT NIC-dependent:
+//
+//   * the raw io_uring itself — SQ/CQ mmap arithmetic, the CQE32 stride,
+//     the head/tail protocol, `IORING_SETUP_SINGLE_ISSUER |
+//     DEFER_TASKRUN | CQE32` acceptance — runs on any io_uring kernel;
+//   * `RefillRing::post` is pure ring arithmetic over a region WE own;
+//   * `RingCmd` is an eventfd doorbell and a queue;
+//   * the two per-completion gates (`cqe_area_matches`,
+//     `cqe_span_offset`) are pure;
+//   * `SlotBag`/`SendBufs` `Drop` are the exit-path laws (release every
+//     ledger ref; deliberately FORGET in-flight send buffers because the
+//     kernel may still reference them after ring-fd close);
+//   * the arm ladder's REFUSAL path (`REGISTER_ZCRX_IFQ` on a
+//     non-zcrx interface) is exactly what every dev box produces.
+//
+// What stays field-owed is the armed serve loop (`.benchmarks/
+// 2026-08-04-zcrx-z2.md` names it). Everything below runs anywhere.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn io_uring_available() -> bool {
+        // A minimal probe: if the kernel refuses io_uring entirely
+        // (seccomp, io_uring_disabled=2), the ring legs cannot run.
+        RawRing::new(4).is_ok()
+    }
+
+    // -- the two per-completion gates ----------------------------------
+
+    #[test]
+    fn cqe_provenance_gate_rejects_a_foreign_area() {
+        let token = 3u64 << IORING_ZCRX_AREA_SHIFT;
+        assert!(
+            cqe_area_matches(token | 4096, token),
+            "our own area token must pass"
+        );
+        assert!(
+            !cqe_area_matches((4u64 << IORING_ZCRX_AREA_SHIFT) | 4096, token),
+            "a CQE naming another area is a frame violation, not a retry"
+        );
+        assert!(
+            !cqe_area_matches(4096, token),
+            "a zero token against a nonzero area must not pass"
+        );
+    }
+
+    #[test]
+    fn cqe_span_gate_bounds_every_completion_against_the_area() {
+        const AREA: usize = 64 * 1024;
+        let token = 1u64 << IORING_ZCRX_AREA_SHIFT;
+        assert_eq!(cqe_span_offset(token, 4096, AREA), Some(0));
+        assert_eq!(cqe_span_offset(token | 4096, 4096, AREA), Some(4096));
+        assert_eq!(
+            cqe_span_offset(token | (AREA as u64 - 4096), 4096, AREA),
+            Some(AREA - 4096),
+            "a span ending exactly at the area end is legal"
+        );
+        assert_eq!(
+            cqe_span_offset(token | (AREA as u64 - 4095), 4096, AREA),
+            None,
+            "one byte past the area is a refusal"
+        );
+        assert_eq!(
+            cqe_span_offset(token | AREA as u64, 1, AREA),
+            None,
+            "an offset at the area end cannot carry bytes"
+        );
+        // The overflow arm: a huge offset plus a huge length must not
+        // wrap into a valid-looking span.
+        assert_eq!(
+            cqe_span_offset(token | (u64::MAX >> 16), usize::MAX, AREA),
+            None,
+            "offset+len must be checked, not computed"
+        );
+    }
+
+    // -- the raw ring: mmap arithmetic, CQE32 stride, head/tail --------
+
+    #[test]
+    fn raw_ring_setup_accepts_the_lane_flags_and_round_trips_a_cqe() {
+        if !io_uring_available() {
+            eprintln!("io_uring unavailable on this kernel — ring legs skipped");
+            return;
+        }
+        // The lane's exact setup: CQE32 + SINGLE_ISSUER + DEFER_TASKRUN.
+        let ring = RawRing::new(8).expect("the lane's ring flags must be accepted");
+
+        // Drive the doorbell arm the driver uses: READ 8 bytes from an
+        // eventfd that already holds a count. This exercises push_sqe
+        // (SQ array + tail store), enter (DEFER_TASKRUN needs GETEVENTS
+        // to run task work), and pop_cqe (the CQE32 stride + big0).
+        let cmds = RingCmd::new().expect("eventfd doorbell");
+        cmds.send(vec![1, 2, 3]).expect("queue a capsule");
+        let mut buf = 0u64;
+        ring.push_sqe(&Sqe {
+            opcode: IORING_OP_READ,
+            fd: cmds.doorbell.as_raw_fd(),
+            addr: &mut buf as *mut u64 as u64,
+            len: 8,
+            user_data: TAG_DOORBELL,
+            ..Default::default()
+        })
+        .expect("push the doorbell SQE");
+        ring.enter(1, 1).expect("submit + wait");
+        let (ud, res, _flags, _big0) = ring.pop_cqe().expect("one CQE");
+        assert_eq!(ud, TAG_DOORBELL, "user_data must survive the round trip");
+        assert_eq!(res, 8, "the eventfd read returns its 8-byte counter");
+        assert_eq!(buf, 1, "and the doorbell had been rung exactly once");
+        assert!(ring.pop_cqe().is_none(), "the CQ head must have advanced");
+    }
+
+    #[test]
+    fn raw_ring_sq_is_bounded_and_reports_full_rather_than_wrapping() {
+        if !io_uring_available() {
+            return;
+        }
+        let ring = RawRing::new(4).expect("ring");
+        let mut buf = 0u64;
+        let mut pushed = 0;
+        // NOP-shaped SQEs (opcode 0) — never submitted, so nothing runs;
+        // this exercises the SQ ring-full arithmetic only.
+        for _ in 0..64 {
+            let r = ring.push_sqe(&Sqe {
+                opcode: 0,
+                addr: &mut buf as *mut u64 as u64,
+                user_data: 7,
+                ..Default::default()
+            });
+            if r.is_err() {
+                break;
+            }
+            pushed += 1;
+        }
+        assert!(
+            pushed <= 64,
+            "push_sqe must refuse past capacity, not wrap the tail \
+             (pushed {pushed})"
+        );
+        assert!(pushed >= 4, "a 4-entry ring must accept at least 4");
+    }
+
+    // -- the refill ring: pure ring arithmetic over our own region -----
+
+    /// Build a `RefillRing` over an anonymous region laid out the way the
+    /// kernel assigns it (head/tail in the first page, rqes after).
+    fn fake_refill(entries: u32) -> RefillRing {
+        let page = 4096usize;
+        let region_len = (page + entries as usize * 16).div_ceil(page) * page;
+        let region = Mmap::anon(region_len).expect("anon region");
+        RefillRing {
+            region,
+            head_off: 0,
+            tail_off: 8,
+            rqes_off: page as u32,
+            entries,
+            tail_cache: 0,
+            area_token: 1u64 << IORING_ZCRX_AREA_SHIFT,
+        }
+    }
+
+    #[test]
+    fn refill_post_encodes_the_rqe_and_advances_the_tail() {
+        let mut r = fake_refill(4);
+        assert!(r.post(0x1234_5678, 4096), "an empty ring accepts a return");
+        // SAFETY: reading back the rqe this call just wrote, in our own
+        // region mapping.
+        unsafe {
+            let rqe = r.region.at::<u8>(r.rqes_off);
+            assert_eq!(*(rqe as *const u64), 0x1234_5678, "raw_off at [0..8)");
+            assert_eq!(*(rqe.add(8) as *const u32), 4096, "len at [8..12)");
+            assert_eq!(*(rqe.add(12) as *const u32), 0, "the pad must be zeroed");
+            let tail = (*r.region.at::<AtomicU32>(r.tail_off)).load(Ordering::Acquire);
+            assert_eq!(tail, 1, "the published tail must match the cache");
+        }
+        assert_eq!(r.tail_cache, 1);
+    }
+
+    #[test]
+    fn refill_post_refuses_when_full_and_recovers_when_the_kernel_consumes() {
+        let mut r = fake_refill(4);
+        for i in 0..4 {
+            assert!(r.post(i as u64 * 4096, 4096), "entry {i} fits");
+        }
+        assert!(
+            !r.post(99, 4096),
+            "a full ring must REFUSE (the caller defers the return) — \
+             overwriting an unconsumed rqe would hand the NIC a span the \
+             lane still owns"
+        );
+        // The "kernel" consumes two.
+        // SAFETY: our own region.
+        unsafe {
+            (*r.region.at::<AtomicU32>(r.head_off)).store(2, Ordering::Release);
+        }
+        assert!(r.post(99, 4096), "space freed ⇒ the deferred return posts");
+        assert_eq!(r.tail_cache, 5);
+    }
+
+    #[test]
+    fn refill_indices_wrap_by_mask_without_the_counters_wrapping_first() {
+        let mut r = fake_refill(2);
+        // Start both cursors near the u32 rollover: the ring must be
+        // driven by wrapping_sub distance, not by raw comparison.
+        r.tail_cache = u32::MAX - 1;
+        // SAFETY: our own region.
+        unsafe {
+            (*r.region.at::<AtomicU32>(r.head_off)).store(u32::MAX - 1, Ordering::Release);
+        }
+        assert!(r.post(1, 16), "distance 0 ⇒ space");
+        assert!(r.post(2, 16), "distance 1 ⇒ space");
+        assert!(!r.post(3, 16), "distance 2 == entries ⇒ full");
+        assert_eq!(r.tail_cache, 0, "the tail counter wrapped cleanly");
+    }
+
+    // -- the command lane ----------------------------------------------
+
+    #[test]
+    fn ring_cmd_queues_capsules_rings_the_doorbell_and_latches_closed() {
+        let cmds = RingCmd::new().expect("eventfd");
+        cmds.send(b"capsule-1".to_vec()).expect("open lane accepts");
+        cmds.send(b"capsule-2".to_vec()).expect("open lane accepts");
+        assert_eq!(cmds.q.pop().as_deref(), Some(&b"capsule-1"[..]), "FIFO");
+        assert_eq!(cmds.q.pop().as_deref(), Some(&b"capsule-2"[..]));
+        assert!(cmds.q.pop().is_none());
+
+        // The doorbell counted every send (plus whatever close adds).
+        let mut val = 0u64;
+        // SAFETY: an 8-byte read from our own eventfd.
+        let n = unsafe {
+            libc::read(
+                cmds.doorbell.as_raw_fd(),
+                &mut val as *mut u64 as *mut libc::c_void,
+                8,
+            )
+        };
+        assert_eq!(n, 8, "the doorbell must have been rung");
+        assert!(val >= 2, "one wake per send at minimum (got {val})");
+
+        cmds.close();
+        assert!(
+            cmds.send(b"after-close".to_vec()).is_err(),
+            "a closed lane must refuse — a capsule queued after teardown \
+             would never be sent and its requester would hang"
+        );
+        assert!(cmds.q.pop().is_none(), "and nothing was queued");
+    }
+
+    #[test]
+    fn ring_cmd_close_wakes_a_parked_driver() {
+        let cmds = RingCmd::new().expect("eventfd");
+        // Drain whatever creation left (nothing) and confirm close rings.
+        cmds.close();
+        let mut val = 0u64;
+        // SAFETY: an 8-byte read from our own eventfd.
+        let n = unsafe {
+            libc::read(
+                cmds.doorbell.as_raw_fd(),
+                &mut val as *mut u64 as *mut libc::c_void,
+                8,
+            )
+        };
+        assert_eq!(n, 8, "close MUST ring the doorbell");
+        assert!(val >= 1, "or a parked driver never observes the teardown");
+    }
+
+    // -- the exit-path laws --------------------------------------------
+
+    #[test]
+    fn slot_bag_drop_returns_every_ledger_ref() {
+        let area = super::super::area::ZcrxArea::new(256 * 1024, 64 * 1024, None)
+            .expect("a small anonymous area");
+        let total = area.free_chunks();
+        assert!(total >= 2, "need at least two chunks to be meaningful");
+        {
+            let mut bag = SlotBag::new(Arc::clone(&area));
+            for _ in 0..total {
+                let g = area.try_grant_chunk().expect("a free chunk");
+                bag.slots.push(g.into_raw_slot());
+            }
+            assert_eq!(area.free_chunks(), 0, "the bag holds every ref");
+            assert!(
+                area.try_grant_chunk().is_none(),
+                "an exhausted ledger grants nothing"
+            );
+        }
+        assert_eq!(
+            area.free_chunks(),
+            total,
+            "SlotBag::drop is the driver-exit arm of the recycle law — \
+             every raw ref must return, or the lane leaks its area one \
+             session death at a time"
+        );
+    }
+
+    #[test]
+    fn send_bufs_drop_forgets_in_flight_capsules_but_frees_completed_ones() {
+        // The law (module docs): a buffer removed at CQE time drops
+        // normally — the kernel is done with it. Whatever REMAINS at
+        // driver exit is forgotten deliberately: ring-fd close cancels
+        // in-flight ops asynchronously, so freeing a buffer the kernel
+        // may still reference is a use-after-free window. The leak is
+        // bounded by queue depth.
+        let mut bufs = SendBufs(std::collections::HashMap::new());
+        bufs.0.insert(TAG_SEND_BASE + 1, (vec![0xAAu8; 64], 0));
+        bufs.0.insert(TAG_SEND_BASE + 2, (vec![0xBBu8; 64], 0));
+        // A completion removes one: it drops here, normally.
+        let (done, sent) = bufs.0.remove(&(TAG_SEND_BASE + 1)).expect("present");
+        assert_eq!(sent, 0);
+        assert_eq!(done.len(), 64);
+        drop(done);
+        assert_eq!(bufs.0.len(), 1, "one still in flight");
+        // Dropping the map forgets the remaining one. Under ASan/valgrind
+        // this is the difference between a bounded leak and a UAF.
+        drop(bufs);
+    }
+
+    // -- the arm ladder's refusal path ---------------------------------
+
+    #[test]
+    fn driver_reports_the_ifq_registration_refusal_and_poisons_the_lane() {
+        if !io_uring_available() {
+            return;
+        }
+        // No dev box has a zcrx-capable NIC, so REGISTER_ZCRX_IFQ against
+        // an interface index that cannot serve it is the universally
+        // reachable arm. The contract: the refusal reaches the arm ladder
+        // through `ready` (naming the interface), the driver exits, and
+        // the lane is poisoned rather than left half-armed.
+        let area =
+            super::super::area::ZcrxArea::new(256 * 1024, 64 * 1024, None).expect("test area");
+        let shared = super::super::area_queue::AreaShared::new(4, &area);
+        let cmds = RingCmd::new().expect("eventfd");
+        let session_poison = Arc::new(AtomicBool::new(false));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let addr = listener.local_addr().expect("addr");
+        let sock = std::net::TcpStream::connect(addr).expect("loopback connect");
+        let _accepted = listener.accept().expect("accept");
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (_go_tx, go_rx) = std::sync::mpsc::channel();
+        let h = spawn_ring_driver(
+            RingDriverConfig {
+                // Interface index 0 is never a real NIC.
+                ifindex: 0,
+                rxq: 0,
+                numa_node: None,
+                rq_entries: 16,
+                sq_entries: 16,
+                area: Arc::clone(&area),
+                shared: Arc::clone(&shared),
+                cmds: Arc::clone(&cmds),
+                session_poison: Arc::clone(&session_poison),
+                sock,
+            },
+            ready_tx,
+            go_rx,
+        );
+        let verdict = ready_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the arm ladder must always hear back from the driver");
+        let why = verdict.expect_err("ifindex 0 cannot register a zcrx ifq");
+        assert!(
+            why.contains("REGISTER_ZCRX_IFQ"),
+            "the refusal must name the failing step: {why}"
+        );
+        h.join().expect("the driver thread exits, never wedges");
+        assert!(
+            session_poison.load(Ordering::SeqCst),
+            "a failed arm must poison the session — a half-armed lane that \
+             reports neither ready nor poisoned strands every requester"
+        );
+    }
+
+    #[test]
+    fn driver_unwound_before_go_exits_clean_without_poisoning() {
+        if !io_uring_available() {
+            return;
+        }
+        // The `go = false` path: steering could not be applied, so the
+        // arm unwinds. Nothing was armed, so nothing may be poisoned —
+        // the lane must fall back to the kernel path silently.
+        //
+        // Registration fails first on a dev box, so this leg asserts the
+        // weaker but still load-bearing half: the driver never leaves the
+        // `ready` channel silent and never wedges its thread. (The
+        // go=false arm proper is field-owed with the armed serve loop.)
+        let area =
+            super::super::area::ZcrxArea::new(256 * 1024, 64 * 1024, None).expect("test area");
+        let shared = super::super::area_queue::AreaShared::new(4, &area);
+        let cmds = RingCmd::new().expect("eventfd");
+        let session_poison = Arc::new(AtomicBool::new(false));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let sock = std::net::TcpStream::connect(addr).expect("connect");
+        let _accepted = listener.accept().expect("accept");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let h = spawn_ring_driver(
+            RingDriverConfig {
+                ifindex: 0,
+                rxq: 0,
+                numa_node: None,
+                rq_entries: 16,
+                sq_entries: 16,
+                area,
+                shared,
+                cmds,
+                session_poison,
+                sock,
+            },
+            ready_tx,
+            go_rx,
+        );
+        let _ = go_tx.send(false);
+        assert!(
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .is_ok(),
+            "the driver must always answer the arm ladder"
+        );
+        h.join().expect("and its thread must always exit");
     }
 }

@@ -703,6 +703,37 @@ pub async fn load_node(
             buf.len()
         )));
     }
+    verify_node_extent(buf, layout, node_addr, durable_tail)
+}
+
+/// The **pure** half of [`load_node`]: everything after the device read —
+/// header decode, self-address/geometry checks, the §4.5 append walk, and
+/// the torn-tail diagnosis pass. Split out so the whole on-disk node
+/// grammar is reachable without I/O: `fuzz/fuzz_targets/kv_node.rs`
+/// (spec §11 TEST-4) drives arbitrary bytes through exactly this, and it
+/// is the same code path a real mount takes.
+///
+/// `buf.len()` must equal `layout.node_size()` — the caller's read already
+/// established that.
+pub fn verify_node_extent(
+    buf: Bytes,
+    layout: &NodeLayout,
+    node_addr: u64,
+    durable_tail: u64,
+) -> Result<LoadedNode, KvError> {
+    let node_size = layout.node_size();
+    if buf.len() != node_size {
+        return Err(KvError::Corrupt(format!(
+            "node extent length {} != node_size {node_size}",
+            buf.len()
+        )));
+    }
+    if buf.len() < NODE_PAGE {
+        return Err(KvError::Corrupt(format!(
+            "node extent {} shorter than one header page",
+            buf.len()
+        )));
+    }
     let header = NodeHeader::decode_page(&buf[..NODE_PAGE])?;
     if header.node_addr != node_addr {
         return Err(KvError::Corrupt(format!(

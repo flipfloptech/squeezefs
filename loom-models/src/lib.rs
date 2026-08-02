@@ -155,6 +155,31 @@
 //!   each slot exactly once (no loss, no double). Single grant consumer
 //!   is a stated structural precondition (one driver per queue).
 //!
+//! - [`fd_table_core`] (`squeezefs-preload`, spec §11 TEST-5): the
+//!   LD_PRELOAD shim's fd-table protocol core — the 9-CAS lock-free table
+//!   that runs inside ARBITRARY host applications, across `fork`, from
+//!   async-signal-safe contexts, and had no model. Three invariants:
+//!   * **refcount law (Issue-14)**: a binding shared by N dup'd fd
+//!     entries reports its unbind EXACTLY once, on the last ref; a zero
+//!     count is terminal (a racing `dup` never resurrects a binding whose
+//!     unbind is already on the wire); and an over-release saturates
+//!     rather than wrapping (a wrapped count is a binding that can never
+//!     report again).
+//!   * **the PERF-7 offset-mirror Dekker pair**: an op's `publish` (store
+//!     the final offset → `fence(SeqCst)` → re-check the arm) against a
+//!     demoter's `disarm_if_current` (clear the arm → `fence(SeqCst)` →
+//!     capture the offset). Invariant: ¬(publish reported "mirror still
+//!     owns it" ∧ the demoter captured a STALE offset) — i.e. the final
+//!     offset always reaches either the mirror's consumer or the caller's
+//!     kernel write-through, never neither. Release/Acquire alone admits
+//!     the store-buffering outcome (both sides reading old) and a fork
+//!     child then resumes at a stale `f_pos`; removing EITHER fence fails
+//!     this model (weakening-verified).
+//!   * **fork-epoch conservatism**: a fork between "snapshot the epoch"
+//!     and "install the binding" must stale the snapshot, so the binding
+//!     never reads armed; and the fork walk's demote fires at most once
+//!     per cell (dup siblings share one).
+//!
 //! `cargo test` here compiles the cores against std atomics and runs
 //! nothing.
 
@@ -164,6 +189,8 @@ pub mod alloc_ext_core;
 pub mod conveyor_core;
 #[path = "../../src/cow_core.rs"]
 pub mod cow_core;
+#[path = "../../crates/squeezefs-preload/src/fd_table_core.rs"]
+pub mod fd_table_core;
 #[path = "../../src/gauge_core.rs"]
 pub mod gauge_core;
 #[path = "../../src/incarnation_core.rs"]
@@ -3389,6 +3416,300 @@ mod models {
                 assert!(!c.begin_claim(0, 1), "sealed assembly granted a new claim");
             }
             claimer.join().unwrap();
+        });
+    }
+}
+
+#[cfg(all(test, loom))]
+mod fd_table_models {
+    //! [`fd_table_core`] — the LD_PRELOAD shim's fd-table protocol core
+    //! (spec §11 **TEST-5**). See the crate docs for the three
+    //! invariants; the weakening evidence for the Dekker pair is in the
+    //! `mirror_dekker_*` model below.
+    //!
+    //! **Model precondition, stated because the model cannot see its
+    //! violation** (the `patch_clone_core` lesson): the cell these
+    //! protocols live in is **leaked by design** — a data-path lookup may
+    //! hold a cell pointer concurrently with the releasing close, and
+    //! `fd_table.rs` never frees. The models therefore own their cells
+    //! for the whole `loom::model` closure; a future change that
+    //! reclaims cells needs a hazard-pointer/epoch model this one does
+    //! not provide.
+    use crate::fd_table_core::{EpochCore, MirrorCore, RefCore};
+    use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use loom::sync::Arc;
+    use loom::thread;
+
+    // -- 1. the refcount law ------------------------------------------
+
+    /// `dup` racing the last `close`: the unbind is reported exactly
+    /// once, and a `dup` that lost the race must NOT hold a reference to
+    /// a binding whose unbind is already on the wire.
+    #[test]
+    fn fd_table_refs_report_unbind_exactly_once() {
+        loom::model(|| {
+            let refs = Arc::new(RefCore::new_one());
+            let terminals = Arc::new(AtomicUsize::new(0));
+            // The dup'ing thread: acquire, then (if it won) release.
+            let duper = {
+                let refs = refs.clone();
+                let terminals = terminals.clone();
+                thread::spawn(move || {
+                    if refs.acquire() {
+                        if refs.release() {
+                            terminals.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                })
+            };
+            // The closing thread: release the original entry's ref.
+            let closer = {
+                let refs = refs.clone();
+                let terminals = terminals.clone();
+                thread::spawn(move || {
+                    if refs.release() {
+                        terminals.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            };
+            duper.join().unwrap();
+            closer.join().unwrap();
+            assert_eq!(
+                terminals.load(Ordering::SeqCst),
+                1,
+                "the unbind ctl message must be sent EXACTLY once \
+                 (0 = leaked binding on the daemon; 2 = a second unbind \
+                 for an id the daemon may have reissued)"
+            );
+            assert_eq!(refs.peek(), 0, "and the count settles at zero");
+        });
+    }
+
+    /// A zero count is terminal: once the last ref is gone, no racing
+    /// `dup` may resurrect the binding.
+    #[test]
+    fn fd_table_zero_count_is_never_resurrected() {
+        loom::model(|| {
+            let refs = Arc::new(RefCore::new_one());
+            let resurrected = Arc::new(AtomicUsize::new(0));
+            let duper = {
+                let refs = refs.clone();
+                let resurrected = resurrected.clone();
+                thread::spawn(move || {
+                    if refs.acquire() {
+                        // Won: the binding was live. Give the ref back so
+                        // the count still reaches zero exactly once.
+                        if refs.release() {
+                            resurrected.fetch_add(0, Ordering::SeqCst);
+                        }
+                    }
+                })
+            };
+            let closer = {
+                let refs = refs.clone();
+                thread::spawn(move || {
+                    refs.release();
+                })
+            };
+            duper.join().unwrap();
+            closer.join().unwrap();
+            // Whatever the interleaving, the count never rises from zero
+            // and never wraps.
+            assert_eq!(refs.peek(), 0, "count settled at zero");
+            assert!(!refs.acquire(), "a settled-zero cell refuses new refs");
+            assert!(!refs.release(), "and never reports terminal again");
+            assert_eq!(refs.peek(), 0, "over-release saturates, never wraps");
+        });
+    }
+
+    // -- 2. the PERF-7 Dekker pair -------------------------------------
+
+    /// **The TEST-5 headline.** An offsetful op completing concurrently
+    /// with a demote (fork flush / unbind demote): the op's final offset
+    /// must reach the mirror's consumer OR the caller's kernel
+    /// write-through — never neither.
+    ///
+    /// Formally: ¬(`publish` returned true ∧ the demoter captured an
+    /// offset other than the op's final one).
+    ///
+    /// **Weakening evidence** (re-run by deleting the fence in
+    /// `MirrorCore::publish` or `MirrorCore::disarm_if_current`): with
+    /// Release/Acquire alone this is the textbook store-buffering
+    /// outcome — `publish`'s store and its flag load both pass the
+    /// demoter's swap unseen, so `publish` reports "still armed" (the
+    /// caller does NOT write through) while the demoter flushes the
+    /// PREVIOUS offset to the kernel. The fork child then resumes reading
+    /// at a stale `f_pos`. loom finds it.
+    #[test]
+    fn fd_table_mirror_dekker_never_loses_the_final_offset() {
+        loom::model(|| {
+            const SEED: u64 = 4096;
+            const FINAL: u64 = 8192;
+            let ep = Arc::new(EpochCore::new());
+            let m = Arc::new(MirrorCore::armed_at(SEED, ep.current()));
+            // What the demoter told its caller to write to kernel f_pos
+            // (u64::MAX = "no flush owed").
+            let flushed = Arc::new(AtomicU64::new(u64::MAX));
+            // Whether the op's caller owns the kernel write-through.
+            let op_owns_writethrough = Arc::new(AtomicUsize::new(0));
+
+            let op = {
+                let (m, ep, own) = (m.clone(), ep.clone(), op_owns_writethrough.clone());
+                thread::spawn(move || {
+                    if !m.publish(&ep, FINAL) {
+                        own.store(1, Ordering::SeqCst);
+                    }
+                })
+            };
+            let demoter = {
+                let (m, ep, flushed) = (m.clone(), ep.clone(), flushed.clone());
+                thread::spawn(move || {
+                    if let Some(off) = m.disarm_if_current(&ep) {
+                        flushed.store(off, Ordering::SeqCst);
+                    }
+                })
+            };
+            op.join().unwrap();
+            demoter.join().unwrap();
+
+            let flushed = flushed.load(Ordering::SeqCst);
+            let op_owns = op_owns_writethrough.load(Ordering::SeqCst) == 1;
+            if flushed == SEED {
+                assert!(
+                    op_owns,
+                    "the demoter flushed the STALE offset ({SEED}) while the op \
+                     believed the mirror still owned its final offset ({FINAL}): \
+                     the final position reaches neither the mirror's consumer nor \
+                     the kernel — a fork child resumes at a stale f_pos"
+                );
+            }
+            if !op_owns {
+                // The mirror kept authority: its word must hold the final
+                // offset for whoever reads it next.
+                assert_eq!(
+                    m.load(),
+                    FINAL,
+                    "publish reported ownership but the mirror does not hold the \
+                     final offset"
+                );
+            }
+        });
+    }
+
+    /// Two demoters (an unbind and the fork walk) race one cell: exactly
+    /// one owes the kernel a flush. Two flushes would issue two
+    /// `SEEK_SET`s whose adverse ordering rewinds the description.
+    #[test]
+    fn fd_table_disarm_is_once_per_cell() {
+        loom::model(|| {
+            let ep = Arc::new(EpochCore::new());
+            let m = Arc::new(MirrorCore::armed_at(4096, ep.current()));
+            let flushes = Arc::new(AtomicUsize::new(0));
+            let ts: Vec<_> = (0..2)
+                .map(|_| {
+                    let (m, ep, flushes) = (m.clone(), ep.clone(), flushes.clone());
+                    thread::spawn(move || {
+                        if m.disarm_if_current(&ep).is_some() {
+                            flushes.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                })
+                .collect();
+            for t in ts {
+                t.join().unwrap();
+            }
+            assert_eq!(
+                flushes.load(Ordering::SeqCst),
+                1,
+                "dup siblings share ONE cell — exactly one flush is owed"
+            );
+        });
+    }
+
+    // -- 3. fork-epoch conservatism ------------------------------------
+
+    /// The bind-vs-fork race: an fd whose epoch was snapshotted before
+    /// its `open`, installed concurrently with a fork bump, must never
+    /// read armed under the NEW epoch. (Conservative-correct: the fd
+    /// silently falls back to the kernel-authoritative discipline.)
+    #[test]
+    fn fd_table_fork_bump_stales_a_concurrent_bind() {
+        loom::model(|| {
+            let ep = Arc::new(EpochCore::new());
+            // The interposer's duty: snapshot BEFORE the real open.
+            let snapshot = ep.current();
+            let armed_after = Arc::new(AtomicUsize::new(0));
+
+            let binder = {
+                let (ep, armed_after) = (ep.clone(), armed_after.clone());
+                thread::spawn(move || {
+                    let m = MirrorCore::armed_at(0, snapshot);
+                    if m.armed(&ep) {
+                        armed_after.store(1, Ordering::SeqCst);
+                    }
+                })
+            };
+            let forker = {
+                let ep = ep.clone();
+                thread::spawn(move || {
+                    ep.bump();
+                })
+            };
+            binder.join().unwrap();
+            forker.join().unwrap();
+
+            // After the bump has certainly landed, a binding carrying the
+            // OLD snapshot can never be authoritative again.
+            let stale = MirrorCore::armed_at(0, snapshot);
+            assert!(
+                !stale.armed(&ep) || ep.current() == snapshot,
+                "a pre-fork snapshot must not read armed under the new epoch"
+            );
+            let _ = armed_after.load(Ordering::SeqCst);
+        });
+    }
+
+    /// The fork walk's demote and a concurrent op: whichever order, the
+    /// cell is disarmed at most once and the op's offset is not lost
+    /// (the `fork_demote` face of the Dekker pair — the production
+    /// atfork-prepare path, which bumps the epoch and then walks).
+    #[test]
+    fn fd_table_fork_walk_demote_never_loses_the_final_offset() {
+        loom::model(|| {
+            const SEED: u64 = 4096;
+            const FINAL: u64 = 8192;
+            let ep = Arc::new(EpochCore::new());
+            let m = Arc::new(MirrorCore::armed_at(SEED, ep.current()));
+            let flushed = Arc::new(AtomicU64::new(u64::MAX));
+            let op_owns = Arc::new(AtomicUsize::new(0));
+
+            let op = {
+                let (m, ep, own) = (m.clone(), ep.clone(), op_owns.clone());
+                thread::spawn(move || {
+                    if !m.publish(&ep, FINAL) {
+                        own.store(1, Ordering::SeqCst);
+                    }
+                })
+            };
+            let forker = {
+                let (m, ep, flushed) = (m.clone(), ep.clone(), flushed.clone());
+                thread::spawn(move || {
+                    let prev = ep.bump();
+                    if let Some(off) = m.fork_demote(prev) {
+                        flushed.store(off, Ordering::SeqCst);
+                    }
+                })
+            };
+            op.join().unwrap();
+            forker.join().unwrap();
+
+            if flushed.load(Ordering::SeqCst) == SEED {
+                assert!(
+                    op_owns.load(Ordering::SeqCst) == 1 || m.load() == SEED,
+                    "the fork walk flushed a stale offset while the op believed \
+                     the mirror still owned the final one"
+                );
+            }
         });
     }
 }

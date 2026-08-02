@@ -77,3 +77,8 @@ harness = false
 # (tests/run_preload_gate.sh); the root dev-dependency stays
 # feature-less and links only the cores + session client.
 interposers = []
+
+[lints.rust]
+# The loom-models crate `#[path]`-includes `fd_table_core.rs` under
+# `--cfg loom` (spec §11 TEST-5); the main build never sets it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

@@ -12,7 +12,13 @@ use std::cmp::Ordering;
 
 /// xxh3 over a bset image with the checksum field (bytes 24..32) zeroed —
 /// the repo's established primitive and convention (superblock precedent).
-fn checksum_image(buf: &[u8]) -> u64 {
+///
+/// `pub` for the TEST-4 fuzz target (`fuzz/fuzz_targets/kv_bset.rs`): a
+/// blind fuzzer never guesses a valid xxh3, so the target re-stamps its
+/// mutated images to reach the record walk — which is exactly the
+/// corrupt-but-checksum-valid input a device-level attacker or a writer
+/// bug produces (the digest is integrity, not authentication).
+pub fn checksum_image(buf: &[u8]) -> u64 {
     let mut h = xxhash_rust::xxh3::Xxh3::new();
     h.update(&buf[..24]);
     h.update(&[0u8; 8]);
@@ -144,6 +150,31 @@ impl<'a> BsetView<'a> {
         let computed = checksum_image(buf);
         if stored != computed {
             return Err(KvError::ChecksumMismatch { stored, computed });
+        }
+
+        // `record_count` is a CLAIM, never an allocation authority (§9).
+        //
+        // TEST-4 find (2026-08-02, `tests/decoder_property_tests.rs`): the
+        // metadata vector below used to be sized straight from this u32.
+        // The checksum above is integrity, NOT authentication — a corrupt
+        // device, a misdirected write, or anyone who can write the volume
+        // can present a 32-byte bset claiming `record_count = u32::MAX`
+        // with a digest that verifies. That was
+        // `Vec::with_capacity(4_294_967_295)` of a 32-byte struct — a
+        // 128 GiB request whose failure is an `abort`, i.e. one bad sector
+        // taking the daemon down, in a decoder whose entire contract is
+        // that corrupt bytes are DETECTED, not fatal.
+        //
+        // The bound is exact and free: the smallest encodable record is a
+        // header plus a one-byte key (keys are never empty — enforced by
+        // `RecordRef::decode`), so `data_len` caps the count physically.
+        let min_record_len = super::record::RECORD_HEADER_LEN + 1;
+        let max_records = data_len / min_record_len;
+        if record_count > max_records {
+            return Err(KvError::Corrupt(format!(
+                "bset header claims {record_count} records but its {data_len} data bytes \
+                 can hold at most {max_records} (min record length {min_record_len})"
+            )));
         }
 
         // The checksum verified — the walk below guards against writer bugs

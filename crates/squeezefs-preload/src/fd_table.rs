@@ -63,7 +63,8 @@
 //! reviewer must re-verify. (Same posture as the design's
 //! "old tables leaked-by-design at ~KB scale".)
 
-use std::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use crate::fd_table_core::{EpochCore, MirrorCore, RefCore};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 /// One bound fd's rights, as granted by the daemon's `BindOk` (§5.2).
@@ -81,15 +82,13 @@ pub struct Binding {
 
 /// The per-cell offset mirror (PERF-7 — module docs). Shared by every
 /// dup sibling exactly because the cell is.
+///
+/// The latch-free half is [`MirrorCore`] (arm flag, offset word, epoch
+/// snapshot, and the publish/disarm Dekker pair) — extracted so
+/// `loom-models/` checks the shipped protocol, spec §11 TEST-5. What
+/// stays here is the one thing that is NOT latch-free:
 struct MirrorState {
-    /// The mirrored file offset. Authoritative iff [`MirrorHandle::armed`].
-    off: AtomicU64,
-    /// Arm flag; cleared exactly once by the first demote (monotone —
-    /// a mirror never re-arms; the fd falls back to kernel authority).
-    flag: AtomicBool,
-    /// Fork-epoch snapshot taken BEFORE the fd existed (the caller's
-    /// duty — interpose snapshots before the real `open`). Immutable.
-    epoch: u64,
+    core: MirrorCore,
     /// Offsetful-op serialization for this description: dup siblings
     /// share it, so concurrent `read()`s through dup'd fds serialize
     /// like the kernel's own `f_pos_lock` (the pre-PERF-7 per-fd
@@ -102,9 +101,14 @@ struct MirrorState {
 impl MirrorState {
     fn unarmed() -> Self {
         Self {
-            off: AtomicU64::new(0),
-            flag: AtomicBool::new(false),
-            epoch: 0,
+            core: MirrorCore::unarmed(),
+            lock: Mutex::new(()),
+        }
+    }
+
+    fn armed_at(seed_off: u64, epoch: u64) -> Self {
+        Self {
+            core: MirrorCore::armed_at(seed_off, epoch),
             lock: Mutex::new(()),
         }
     }
@@ -114,9 +118,10 @@ impl MirrorState {
 /// binding. Leaked on release (module docs).
 struct BindingCell {
     binding: Binding,
-    /// Live fd-entry references. 0 = released (unbind reported); a zero
-    /// count is terminal — `acquire` never resurrects it.
-    refs: AtomicU32,
+    /// Live fd-entry references (the Issue-14 law lives in
+    /// [`RefCore`]): 0 = released (unbind reported); a zero count is
+    /// terminal — `acquire` never resurrects it.
+    refs: RefCore,
     /// PERF-7 offset mirror (module docs).
     mirror: MirrorState,
 }
@@ -126,25 +131,24 @@ struct BindingCell {
 /// note), so a handle held across a concurrent close stays valid.
 pub struct MirrorHandle<'a> {
     mirror: &'a MirrorState,
-    table_epoch: &'a AtomicU64,
+    table_epoch: &'a EpochCore,
 }
 
 impl<'a> MirrorHandle<'a> {
     /// The normative authority predicate (module docs): armed flag set
     /// AND the bind-time fork-epoch snapshot is still current.
     pub fn armed(&self) -> bool {
-        self.mirror.flag.load(Ordering::Acquire)
-            && self.mirror.epoch == self.table_epoch.load(Ordering::Acquire)
+        self.mirror.core.armed(self.table_epoch)
     }
 
     /// The mirrored offset. Meaningful only while [`Self::armed`].
     pub fn load(&self) -> u64 {
-        self.mirror.off.load(Ordering::Acquire)
+        self.mirror.core.load()
     }
 
     /// Plain offset store (caller holds [`Self::lock_offsets`]).
     pub fn store(&self, off: u64) {
-        self.mirror.off.store(off, Ordering::Release);
+        self.mirror.core.store(off);
     }
 
     /// Op-completion publish — the op side of the demote Dekker pair:
@@ -157,9 +161,7 @@ impl<'a> MirrorHandle<'a> {
     /// may both pass a concurrent `disarm` unseen and the final offset
     /// would reach neither the mirror's consumer nor the kernel.
     pub fn publish(&self, off: u64) -> bool {
-        self.mirror.off.store(off, Ordering::Release);
-        fence(Ordering::SeqCst);
-        self.armed()
+        self.mirror.core.publish(self.table_epoch, off)
     }
 
     /// Demote side of the Dekker pair: clear the arm exactly once and
@@ -169,14 +171,7 @@ impl<'a> MirrorHandle<'a> {
     /// kernel `f_pos` (flushing a never-armed seed would REWIND an
     /// offset the kernel has legitimately advanced).
     pub fn disarm_if_current(&self) -> Option<u64> {
-        if !self.armed() {
-            return None;
-        }
-        if !self.mirror.flag.swap(false, Ordering::AcqRel) {
-            return None; // another demoter won
-        }
-        fence(Ordering::SeqCst);
-        Some(self.mirror.off.load(Ordering::Acquire))
+        self.mirror.core.disarm_if_current(self.table_epoch)
     }
 
     /// The description's offsetful-op lock (dup siblings share it).
@@ -218,26 +213,14 @@ impl BindingCell {
     /// Take one more ref, unless the cell already hit zero (a racing
     /// last-close won; the binding's unbind may already be on the wire).
     fn acquire(&self) -> bool {
-        self.refs
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                if n == 0 {
-                    None
-                } else {
-                    Some(n + 1)
-                }
-            })
-            .is_ok()
+        self.refs.acquire()
     }
 
     /// Drop one ref; `Some(binding)` on the last one — the caller's
     /// cue to send the async unbind ctl message, exactly once (the
     /// returned copy carries the session token to route it).
     fn release(&self) -> Option<Binding> {
-        if self.refs.fetch_sub(1, Ordering::AcqRel) == 1 {
-            Some(self.binding)
-        } else {
-            None
-        }
+        self.refs.release().then_some(self.binding)
     }
 }
 
@@ -256,7 +239,7 @@ pub struct FdTable {
     /// PERF-7 fork epoch (module docs): bumped by [`Self::fork_demote_flush`]
     /// (the atfork-prepare / posix_spawn hook). Lives on the table, not
     /// a process static, so test tables cannot disarm each other.
-    fork_epoch: AtomicU64,
+    fork_epoch: EpochCore,
 }
 
 impl Default for FdTable {
@@ -283,7 +266,7 @@ impl FdTable {
             .unwrap_or_else(|_| unreachable!("built with DIR_SLOTS entries"));
         Self {
             dir,
-            fork_epoch: AtomicU64::new(0),
+            fork_epoch: EpochCore::new(),
         }
     }
 
@@ -292,7 +275,7 @@ impl FdTable {
     /// race closure: a fork between snapshot and install stales the
     /// snapshot, so the binding never arms — conservative-correct).
     pub fn fork_epoch(&self) -> u64 {
-        self.fork_epoch.load(Ordering::SeqCst)
+        self.fork_epoch.current()
     }
 
     /// The slot for `fd`, if it can exist without allocating.
@@ -402,7 +385,7 @@ impl FdTable {
     /// racing `SEEK_SET`s whose adverse ordering is the documented
     /// fork-concurrent-with-in-flight-I/O residual (module docs).
     pub fn fork_demote_flush(&self, mut f: impl FnMut(i32, u64)) {
-        let prev = self.fork_epoch.fetch_add(1, Ordering::SeqCst);
+        let prev = self.fork_epoch.bump();
         for d in 0..DIR_SLOTS {
             let seg = self.dir[d].load(Ordering::Acquire);
             if seg.is_null() {
@@ -417,17 +400,15 @@ impl FdTable {
                 }
                 // SAFETY: leaked cell — valid forever.
                 let cell = unsafe { &*cell };
-                if cell.mirror.epoch != prev {
-                    // Stale (never armed since an earlier fork) or
-                    // post-bump snapshot (its open began after this
-                    // bump ⇒ the fd cannot be in the child): both keep
-                    // their state — no flush, no clear.
+                // Stale cells (never armed since an earlier fork) and
+                // post-bump ones (their open began after this bump ⇒ the
+                // fd cannot be in the child) keep their state — no flush,
+                // no clear. The once-per-cell disarm + the SeqCst fence
+                // that orders it against a racing `publish` live in the
+                // core (spec §11 TEST-5, loom-modelled).
+                let Some(mirrored) = cell.mirror.core.fork_demote(prev) else {
                     continue;
-                }
-                if !cell.mirror.flag.swap(false, Ordering::AcqRel) {
-                    continue; // was not armed (or already demoted)
-                }
-                fence(Ordering::SeqCst);
+                };
                 let h = MirrorHandle {
                     mirror: &cell.mirror,
                     table_epoch: &self.fork_epoch,
@@ -443,7 +424,13 @@ impl FdTable {
                     guard = h.try_lock_offsets();
                 }
                 let fd = ((d << SEG_BITS) | s) as i32;
-                f(fd, cell.mirror.off.load(Ordering::Acquire));
+                // Re-load rather than reuse `mirrored`: an op that
+                // completed between the disarm and this point wrote its
+                // final offset through (its `publish` observed the
+                // cleared arm), and the freshest value is the one the
+                // child must inherit.
+                let _ = mirrored;
+                f(fd, cell.mirror.core.load());
                 drop(guard);
             }
         }
@@ -471,23 +458,14 @@ impl FdTable {
         seed_off: u64,
         epoch: u64,
     ) -> Option<Binding> {
-        self.install(
-            fd,
-            binding,
-            MirrorState {
-                off: AtomicU64::new(seed_off),
-                flag: AtomicBool::new(true),
-                epoch,
-                lock: Mutex::new(()),
-            },
-        )
+        self.install(fd, binding, MirrorState::armed_at(seed_off, epoch))
     }
 
     fn install(&self, fd: i32, binding: Binding, mirror: MirrorState) -> Option<Binding> {
         let slot = self.slot_or_grow(fd)?;
         let cell = Box::into_raw(Box::new(BindingCell {
             binding,
-            refs: AtomicU32::new(1),
+            refs: RefCore::new_one(),
             mirror,
         }));
         let old = slot.swap(cell, Ordering::AcqRel);

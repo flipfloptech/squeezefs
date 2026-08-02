@@ -897,6 +897,20 @@ pub(crate) struct JobCtl {
     terminal: Notify,
 }
 
+/// RES-7: release-on-unwind for the worker-held claim — the `PassGuard`
+/// shape the publish conveyor uses, applied to the one detached executor
+/// that never had it. `claimed` is the VL9 pin-(a) mover-serialization
+/// token, so leaking it wedges a whole volume scope permanently.
+struct ClaimGuard {
+    ctl: Arc<JobCtl>,
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        self.ctl.claimed.store(false, Ordering::SeqCst);
+    }
+}
+
 impl JobCtl {
     pub(crate) fn state(&self) -> JobState {
         *self.state.lock()
@@ -1409,12 +1423,41 @@ impl JobFabric {
             };
             ctl.set_state(JobState::Running);
             let _ = self.checkpoint(&job_id, &ctl).await;
-            self.run_job(&job_id, &ctl).await;
-            ctl.claimed.store(false, Ordering::SeqCst);
+            // RES-7 (pre-RC engineering spec §7): the claim is released
+            // on EVERY exit, unwind included — the `PassSentinel` /
+            // `PassGuard` shape the KV commit and publish conveyors
+            // already use (spec §8). Without it a panicking job left
+            // `claimed = true` forever and — by the VL9 pin-(a) mover
+            // serialization — permanently blocked every mover-class job
+            // whose volume scope intersects it.
+            let claim = ClaimGuard { ctl: ctl.clone() };
+            // ...and the unwind is CAUGHT, so the pool does not shrink by
+            // one worker per panic. `worker_loop`'s JoinHandle is stored
+            // but never observed, so a lost worker was silent — the
+            // last one dying meant no job could ever run again.
+            let panicked = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                self.run_job(&job_id, &ctl),
+            ))
+            .await
+            .is_err();
+            drop(claim);
+            if panicked {
+                METRICS.job_worker_panics.fetch_add(1, Ordering::Relaxed);
+                self.fail_job(
+                    &job_id,
+                    &ctl,
+                    "job execution PANICKED (the worker survived and released its \
+                     claim — see job_worker_panics); the panic itself is a bug",
+                )
+                .await;
+            }
         }
     }
 
     /// Execute one job until terminal/paused.
+    ///
+    /// A panic escaping here is contained by `worker_loop`'s
+    /// `catch_unwind` + [`ClaimGuard`] (RES-7).
     async fn run_job(&self, job_id: &str, ctl: &Arc<JobCtl>) {
         match ctl.job_type.clone() {
             JobType::Noop { .. } => self.run_noop(job_id, ctl).await,

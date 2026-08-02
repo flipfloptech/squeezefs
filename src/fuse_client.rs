@@ -6540,6 +6540,17 @@ impl SqueezefsFilesystem {
                     "writer_guard_pr_reacquires".into(),
                     per_volume(&|be| be.writer_guard_pr_reacquires()),
                 );
+                // DLM S2 (spec §6.7 decision 4 / §6.9): the per-volume
+                // durable writer term — the high-order component of
+                // every fencing token this mount mints. Strictly greater
+                // than every predecessor's on the same volume; 0 = the
+                // volume predates incompat bit 7 (era-less tokens, the
+                // pre-S2 posture). The spec's cluster-wide `dlm_term`
+                // gauge lands with S4's `dlm_*` family.
+                metrics.insert(
+                    "writer_guard_term".into(),
+                    per_volume(&|be| be.writer_term()),
+                );
             }
             // PR M2 (design-metadata-throughput §5.1/§9): the D1.a rig's
             // fields exist only when the rig is armed — a disabled mount's
@@ -7649,13 +7660,41 @@ impl SqueezefsFilesystem {
     /// so the sweep logs one loud stderr line — the §5.2 forward-detection
     /// arm of the below-RW4 downgrade residual. Returns the recovered
     /// count.
+    ///
+    /// **The per-ino currency rule (DLM S2, spec §6.11).** An ino's
+    /// currency at mount is the newest grant this sweep can PROVE, from
+    /// two evidence sources:
+    ///
+    /// 1. the live DLM read — but only when it exceeds
+    ///    [`crate::dlm::term_base`], i.e. a grant actually happened in
+    ///    this era. Pre-S2 the read was the whole rule and it was
+    ///    structurally 0 in a fresh process (`5 < 0` is false ⇒ every
+    ///    pre-crash record adopted). Post-S2 the fresh read is the era
+    ///    base, which proves the era moved but says NOTHING about which
+    ///    of the crashed writer's own records is current — using it
+    ///    alone would blanket-discard legitimate crash residue the W2
+    ///    recovery contract adopts;
+    /// 2. the newest surviving stamp for that ino — the crashed
+    ///    writer's own proof that it superseded its older stamps (all
+    ///    records of one write episode share the episode's lease token,
+    ///    so this only ever separates DISTINCT eras).
+    ///
+    /// `currency = max(live_if_a_grant_happened, newest_stamp_for_ino)`,
+    /// and a record is superseded iff its stamp is strictly below it. In
+    /// process (a live re-acquire) source 1 dominates by construction —
+    /// every grant `fetch_max`es the ino's floor — so the in-RAM
+    /// semantic is unchanged; at mount source 2 is what discriminates.
     pub async fn recover_extent_records(&self) -> usize {
         let keys = self.router.cache.nvme.extent_record_keys("");
         if keys.is_empty() {
             return 0;
         }
-        let mut recovered = 0usize;
-        let mut stale = 0usize;
+        // Pass 1: validate (torn/future records dispose here, exactly
+        // once) and fold the per-ino newest stamp. Only the triple is
+        // retained — record payloads are crash residue and can be large.
+        let mut valid: Vec<(String, u64, u64)> = Vec::with_capacity(keys.len());
+        let mut newest_stamp: std::collections::HashMap<u64, u64> =
+            std::collections::HashMap::new();
         for key in keys {
             let Some((ino, _b)) = Self::parse_extent_record_key(&key) else {
                 // Unparseable key shape: treat as torn (loud discard).
@@ -7668,8 +7707,22 @@ impl SqueezefsFilesystem {
             let Some(rec) = self.read_valid_extent_record(&key) else {
                 continue;
             };
-            let current = self.dlm.get_fencing_token_ino(ino);
-            if rec.fencing_token < current {
+            let e = newest_stamp.entry(ino).or_insert(rec.fencing_token);
+            *e = (*e).max(rec.fencing_token);
+            valid.push((key, ino, rec.fencing_token));
+        }
+
+        let mut recovered = 0usize;
+        let mut stale = 0usize;
+        let era_base = crate::dlm::term_base();
+        for (key, ino, stamp) in valid {
+            let live = self.dlm.get_fencing_token_ino(ino);
+            // A read at the bare era base proves only that the era
+            // moved (this mount minted nothing for the ino yet); the
+            // crash residue's own newest stamp is then the evidence.
+            let current = if live > era_base { live } else { 0 }
+                .max(newest_stamp.get(&ino).copied().unwrap_or(0));
+            if stamp < current {
                 // The remount law: a superseded writer era's staged work is
                 // discarded, loudly.
                 METRICS
@@ -7677,8 +7730,7 @@ impl SqueezefsFilesystem {
                     .fetch_add(1, Ordering::Relaxed);
                 warn!(
                     "extent record {key} stamped by superseded fencing generation \
-                     {} (current {current}): discarded (the remount law)",
-                    rec.fencing_token
+                     {stamp} (current {current}): discarded (the remount law)"
                 );
                 self.router.cache.nvme.remove_active_block(&key);
                 stale += 1;

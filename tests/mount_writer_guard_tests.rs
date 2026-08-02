@@ -391,6 +391,7 @@ async fn test_fresh_foreign_claim_refused_names_holder() {
         ts: now_secs(),
         pid: 4_000_000, // beyond pid_max: kill(pid,0) can never name a live process
         boot: "11111111-2222-3333-4444-555555555555".into(),
+        term: 0,
     };
     forge_claim(vol.path(), &foreign).await;
 
@@ -422,6 +423,7 @@ async fn test_dead_pid_proof_same_host_instant_reclaim() {
         ts: now_secs(), // FRESH: the proof, not the TTL, is what reclaims
         pid: dead_pid(),
         boot: our_boot_id(),
+        term: 0,
     };
     forge_claim(vol.path(), &crashed).await;
 
@@ -448,6 +450,7 @@ async fn test_live_pid_same_host_fresh_claim_refused() {
         ts: now_secs(),
         pid: 1, // init: always alive (kill(1,0) = EPERM, not ESRCH)
         boot: our_boot_id(),
+        term: 0,
     };
     forge_claim(vol.path(), &alive).await;
 
@@ -471,6 +474,7 @@ async fn test_stale_cross_host_claim_on_non_pr_volume_refused_names_claim_clear(
         ts: now_secs().saturating_sub(CLIENT_STALE_TTL_SECS + 120),
         pid: std::process::id(), // spoofed: OUR pid, alive — but the boot differs
         boot: "99999999-8888-7777-6666-555555555555".into(),
+        term: 0,
     };
     forge_claim(vol.path(), &stale_foreign).await;
 
@@ -548,6 +552,7 @@ async fn test_claim_clear_refuses_fresh_claim() {
         ts: now_secs(),
         pid: 4_000_001,
         boot: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+        term: 0,
     };
     forge_claim(vol.path(), &fresh).await;
 
@@ -573,6 +578,7 @@ async fn test_claim_clear_clears_stale_claim() {
         ts: now_secs().saturating_sub(CLIENT_STALE_TTL_SECS + 600),
         pid: 4_000_002,
         boot: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+        term: 0,
     };
     forge_claim(vol.path(), &stale).await;
 
@@ -686,6 +692,7 @@ async fn test_pr_acquire_conflict_fresh_claim_refused() {
         ts: now_secs(),
         pid: 4_000_003,
         boot: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+        term: 0,
     };
     forge_claim(vol.path(), &fresh).await;
 
@@ -723,6 +730,7 @@ async fn test_pr_acquire_conflict_ttl_stale_preempted() {
         ts: now_secs().saturating_sub(CLIENT_STALE_TTL_SECS + 300),
         pid: 4_000_004,
         boot: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+        term: 0,
     };
     forge_claim(vol.path(), &stale).await;
 

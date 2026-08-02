@@ -46,7 +46,7 @@ use squeezefs::meta_backend::kv::superblock::{
     classify_volume, set_durable_term_bit, write_superblock_v3, VolumeFormat,
     FEATURES_INCOMPAT_KNOWN, FEATURE_INCOMPAT_KV_DURABLE_TERM,
 };
-use squeezefs::meta_backend::Metadata;
+
 use std::sync::OnceLock;
 use std::time::Duration;
 use tempfile::NamedTempFile;
@@ -95,13 +95,17 @@ async fn unstamp_durable_term(path: &std::path::Path) {
     write_superblock_v3(path, &sb).await.unwrap();
 }
 
+/// Read an ino-1 control record through the DAEMON's entry point (the
+/// generic `Metadata::getxattr` is VAL-2-screened and renders internal
+/// records absent).
 async fn raw_ino1_xattr(be: &KvMetaBackend, name: &str) -> Option<Vec<u8>> {
-    Metadata::getxattr(be, 1, name).await.unwrap()
+    KvMetaBackend::getxattr(be, 1, name).await.unwrap()
 }
 
-/// 1. The composition (spec §6.7 decision 4): 24 bits of term over 40
-/// bits of grant_seq, decodable both ways, with the exhaustion bounds
-/// named as constants (a rollover must be a refusal, never a wrap).
+/// Contract 1 — the composition (spec §6.7 decision 4): 24 bits of term
+/// over 40 bits of grant_seq, decodable both ways, with the exhaustion
+/// bounds named as constants (a rollover must be a refusal, never a
+/// wrap).
 #[test]
 fn composed_token_layout_is_24_bit_term_over_40_bit_grant_seq() {
     assert_eq!(GRANT_SEQ_BITS, 40, "spec §6.7: (term << 40) | grant_seq");
@@ -122,7 +126,7 @@ fn composed_token_layout_is_24_bit_term_over_40_bit_grant_seq() {
     assert_eq!(token_grant_seq(0), 0);
 }
 
-/// 1b. Monotonicity — the property every census site rides: a later
+/// Contract 1b — monotonicity — the property every census site rides: a later
 /// term's FIRST grant beats a previous term's LAST grant, so `<` fences
 /// reject stale eras, `==` coherence memos can never falsely match
 /// across eras, and `.max()` folds stay order-safe.
@@ -143,7 +147,7 @@ fn composed_tokens_stay_monotone_across_terms_and_grants() {
     assert_eq!(compose_token(0, 42), 42);
 }
 
-/// 2a. The record: `term` is a durable field on `writer_claim`, and a
+/// Contract 2a — the record: `term` is a durable field on `writer_claim`, and a
 /// pre-S2 record (no `term` key) decodes as term 0 — the additive-JSON
 /// compatibility law the `job_endpoint` field already established.
 #[test]
@@ -158,7 +162,8 @@ fn writer_claim_term_round_trips_and_legacy_records_decode_as_term_zero() {
     let decoded = WriterClaim::decode(&claim.encode()).expect("round-trip");
     assert_eq!(decoded, claim, "term must survive encode/decode");
 
-    let legacy = br#"{"id":"w-0","ts":1700000000,"pid":7,"boot":"boot-abc"}"#;
+    // The record's on-disk key order (serde_json's map ordering).
+    let legacy = br#"{"boot":"boot-abc","id":"w-0","pid":7,"ts":1700000000}"#;
     let decoded = WriterClaim::decode(legacy).expect("legacy record decodes");
     assert_eq!(decoded.term, 0, "a pre-S2 claim carries term 0");
 
@@ -178,7 +183,7 @@ fn writer_claim_term_round_trips_and_legacy_records_decode_as_term_zero() {
     );
 }
 
-/// 2b. The durability contract: every successful claim acquisition bumps
+/// Contract 2b — the durability contract: every successful claim acquisition bumps
 /// the term, and the bump SURVIVES the clean unmount that deletes the
 /// claim (the `writer_term` record is never deleted — otherwise a
 /// mount/unmount cycle would reset the fencing era and re-issue tokens a
@@ -231,7 +236,7 @@ async fn durable_term_strictly_increases_on_every_claim_acquisition() {
     be.shutdown().await.unwrap();
 }
 
-/// 3. Compatibility (the Phase-8 sequencing rule: bit 7 is NEVER stamped
+/// Contract 3 — compatibility (the Phase-8 sequencing rule: bit 7 is NEVER stamped
 /// on an existing volume at mount): an un-stamped volume mounts exactly
 /// as it does today — term 0, no `writer_term` record, claim bytes
 /// unchanged, composed token ≡ the S1 token. Stamping the bit (the
@@ -295,7 +300,7 @@ async fn unstamped_volume_stays_term_zero_until_the_bit_is_stamped() {
     );
 }
 
-/// 4. Publication: the mount gate hands its durable term to the process
+/// Contract 4 — publication: the mount gate hands its durable term to the process
 /// mint AFTER the barrier, so a fresh process reads and mints in the
 /// CURRENT era. This is the §6.11 fix at the source — and the reason the
 /// offline verbs stop being vacuous (their `get_fencing_token_ino` read
@@ -344,7 +349,7 @@ async fn mount_publishes_the_term_so_every_prior_era_token_is_stale() {
     be.shutdown().await.unwrap();
 }
 
-/// 5. The offline-verb arm of §6.11: `fsck` / `defrag` / `config` build
+/// Contract 5 — the offline-verb arm of §6.11: `fsck` / `defrag` / `config` build
 /// their data plane behind `open_routed_meta_set` — the guarded open
 /// that takes the D0 claim — and then read fencing tokens from a DLM
 /// whose map is empty. Today every such read is 0 and every
@@ -385,7 +390,7 @@ async fn offline_verb_open_reads_a_nonvacuous_fencing_generation() {
     }
 }
 
-/// 6a. Bit-budget exhaustion, term half: a volume whose era ladder has
+/// Contract 6a — bit-budget exhaustion, term half: a volume whose era ladder has
 /// consumed the 24-bit space refuses the MOUNT loudly. A term rollover
 /// would alias a live era's tokens with a retired one's — never silent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -399,7 +404,7 @@ async fn term_space_exhaustion_refuses_the_mount_loudly() {
         let be = KvMetaBackend::open(vol.path()).await.expect("plant mount");
         let mut claim = be.read_writer_claim().await.expect("claim");
         claim.term = TERM_MAX;
-        Metadata::setxattr(be.as_ref(), 1, WRITER_CLAIM_XATTR, &claim.encode())
+        be.setxattr_internal(1, WRITER_CLAIM_XATTR, &claim.encode())
             .await
             .unwrap();
         be.sync_device().await.unwrap();
@@ -416,7 +421,7 @@ async fn term_space_exhaustion_refuses_the_mount_loudly() {
     );
 }
 
-/// 6b. Bit-budget exhaustion, grant half: past the 40-bit grant space
+/// Contract 6b — bit-budget exhaustion, grant half: past the 40-bit grant space
 /// the MINT refuses loudly instead of carrying into the term field
 /// (which would forge a future era). Uses the sanctioned mint seam and
 /// restores the counter — the mint is process-global.
@@ -437,11 +442,13 @@ async fn grant_seq_exhaustion_refuses_the_mint_loudly() {
     );
     last.release().await.unwrap();
 
-    let err = dlm_client
+    let refused = dlm_client
         .acquire_lock("inode_79000002", None, Duration::from_secs(5))
-        .await
-        .expect_err("past the budget the mint must refuse");
-    let msg = format!("{err}");
+        .await;
+    let msg = match refused {
+        Ok(_) => panic!("past the budget the mint must refuse, not grant"),
+        Err(e) => format!("{e}"),
+    };
     assert!(
         msg.contains("grant") && msg.to_lowercase().contains("exhaust"),
         "the refusal must name the exhausted grant space: {msg}"

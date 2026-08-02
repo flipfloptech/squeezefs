@@ -120,6 +120,7 @@ async fn set_claim(meta: &NamedTempFile, ts: u64) {
         ts,
         pid: 4_100_000,
         boot: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+        term: 0,
     };
     // VAL-2: the guard's own record — the unscreened internal writer.
     be.setxattr_internal(1, WRITER_CLAIM_XATTR, &claim.encode())

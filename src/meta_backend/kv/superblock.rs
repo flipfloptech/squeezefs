@@ -162,6 +162,27 @@ pub const FEATURE_INCOMPAT_KV_LAYOUT_DELTAS: u64 = 1 << 5;
 /// `tests/dynamic_meta_routing_tests.rs`).
 pub const FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING: u64 = 1 << 6;
 
+/// `features_incompat` bit 7: **durable writer term** (DLM stage S2 —
+/// docs/pre-rc-engineering-spec.md §6.7 decision 4, §6.9, §6.11): the
+/// volume's `writer_claim` carries a `term` field and a never-deleted
+/// [`crate::meta_backend::kv::backend::WRITER_TERM_XATTR`] record holds
+/// the durable era ladder, so the mount gate can bump the era before
+/// arming and every fencing token this mount mints
+/// (`(term << 40) | grant_seq`) dominates every token any predecessor
+/// ever issued.
+///
+/// **Presence is OPTIONAL, deliberately** (unlike bit 6): a volume
+/// WITHOUT this bit mounts exactly as it did pre-S2 — term 0, composed
+/// token ≡ the bare grant sequence, claim bytes unchanged, no term
+/// record written. The batched reformat window (execution plan Phase 8)
+/// stamps existing volumes; **mount never stamps it** — fresh formats
+/// carry it from [`SuperblockV3::new`], and
+/// [`set_durable_term_bit`] is the explicit upgrade path. Old binaries
+/// refuse a bit-7 volume loud via [`FEATURES_INCOMPAT_KNOWN`] (the bit
+/// intersects no prior mask), which is exactly right: they would mint
+/// era-less tokens onto a volume whose records name eras.
+pub const FEATURE_INCOMPAT_KV_DURABLE_TERM: u64 = 1 << 7;
+
 /// Incompat feature bits this binary understands. Any other set bit
 /// refuses the mount naming the bit (§6.1).
 pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
@@ -170,7 +191,8 @@ pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
     | FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE
     | FEATURE_INCOMPAT_KV_SLOT_MIGRATION
     | FEATURE_INCOMPAT_KV_LAYOUT_DELTAS
-    | FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING;
+    | FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING
+    | FEATURE_INCOMPAT_KV_DURABLE_TERM;
 
 /// Read-only feature bits this binary understands (none yet — §4.11
 /// reserves the mechanism for snapshots). Unknown bits mount read-only.
@@ -299,11 +321,15 @@ impl SuperblockV3 {
         Ok(Self {
             node_size: node_size as u32,
             // Every fresh format is dynamic-routing (bit 6 — presence
-            // REQUIRED at decode, the NODE_SEQ_WATERMARK pattern); the
-            // stamp bits (2/4) ride the builder's stamped image path.
+            // REQUIRED at decode, the NODE_SEQ_WATERMARK pattern) and
+            // durable-term (bit 7 — presence OPTIONAL: pre-S2 volumes
+            // keep mounting era-less until the reformat window stamps
+            // them); the stamp bits (2/4) ride the builder's stamped
+            // image path.
             features_incompat: FEATURE_INCOMPAT_KV_V3
                 | FEATURE_INCOMPAT_NODE_SEQ_WATERMARK
-                | FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING,
+                | FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING
+                | FEATURE_INCOMPAT_KV_DURABLE_TERM,
             features_ro: 0,
             root_ledger,
             journal,
@@ -788,4 +814,21 @@ pub async fn set_layout_deltas_bit(path: &Path) -> Result<bool, KvError> {
 /// ledger slot or guest-keyspace record is written.
 pub async fn set_slot_migration_bit(path: &Path) -> Result<bool, KvError> {
     set_incompat_bit(path, FEATURE_INCOMPAT_KV_SLOT_MIGRATION, "slot-migration").await
+}
+
+/// Stamp [`FEATURE_INCOMPAT_KV_DURABLE_TERM`] on `path`'s superblock —
+/// the S2 upgrade path for a volume formatted before the durable writer
+/// term existed (the batched Phase-8 reformat window; mount NEVER calls
+/// this — see the constant's doc). Returns whether the bit was newly
+/// set. The volume must be offline: the caller holds the D0 guard, and
+/// the next mount's gate starts the era ladder at 1.
+///
+/// Ordering note: unlike bits 2/4/5 this bit gates no
+/// silently-misdecoded record — a pre-S2 binary refuses the volume
+/// outright, and the term record it would not understand is only
+/// written by mounts that see the bit. Stamp-then-crash is therefore
+/// inert: the volume mounts era-less on the old binary's refusal and
+/// era-1 here.
+pub async fn set_durable_term_bit(path: &Path) -> Result<bool, KvError> {
+    set_incompat_bit(path, FEATURE_INCOMPAT_KV_DURABLE_TERM, "durable-term").await
 }

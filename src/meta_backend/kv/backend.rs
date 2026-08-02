@@ -281,9 +281,23 @@ pub fn xattr_name_allowed(name: &str) -> bool {
 
 /// The single-writer mount guard's claim record: an xattr on ino 1 beside
 /// the `client:{id}` registrations (design-metadata-throughput §5.0 B2).
-/// JSON `{"id","ts","pid","boot"}`; staleness follows the ONE staleness
-/// law ([`crate::fuse_client::CLIENT_STALE_TTL_SECS`]).
+/// JSON `{"id","ts","pid","boot"}` — plus `"term"` on volumes carrying
+/// incompat bit 7 (DLM S2); staleness follows the ONE staleness law
+/// ([`crate::fuse_client::CLIENT_STALE_TTL_SECS`]).
 pub const WRITER_CLAIM_XATTR: &str = "writer_claim";
+
+/// DLM S2 (spec §6.7 decision 4, §6.9): the volume's **durable writer
+/// term** record — JSON `{"term":N}` at local ino 1, beside the claim.
+///
+/// Separate from the claim because the claim is DELETED at clean
+/// unmount (so the volume presents as unclaimed to another host): the
+/// era ladder must outlive that deletion, or a mount/unmount cycle would
+/// reset the term and re-issue tokens a crashed predecessor already
+/// used. Written (and barriered) by the mount gate only on volumes
+/// carrying [`super::superblock::FEATURE_INCOMPAT_KV_DURABLE_TERM`];
+/// never deleted, never rewritten after the gate, and — like the claim —
+/// PER-VOLUME control state that never travels with a migrating slot.
+pub const WRITER_TERM_XATTR: &str = "writer_term";
 
 /// A decoded `writer_claim` record (design-metadata-throughput §5.0 B2):
 /// the mounted writer's identity, heartbeat timestamp, pid, and boot id —
@@ -302,24 +316,43 @@ pub struct WriterClaim {
     /// Holder boot id (`/proc/sys/kernel/random/boot_id`) — scopes the
     /// pid proof to this boot (pid-reuse mitigation).
     pub boot: String,
+    /// DLM S2 (spec §6.7 decision 4): the holder's **durable writer
+    /// term** — the high-order component of every fencing token it mints
+    /// (`(term << 40) | grant_seq`). Bumped past every predecessor's at
+    /// claim acquisition and barriered before the guard arms, so a
+    /// successor's grants dominate every token a crashed predecessor
+    /// left on staging (spec §6.11).
+    ///
+    /// `0` on volumes without incompat bit 7 and on every pre-S2 record:
+    /// term 0 composes to the bare grant sequence — the pre-S2 behavior
+    /// byte-for-byte, including this record's JSON (the `term` key is
+    /// omitted when 0).
+    pub term: u64,
 }
 
 impl WriterClaim {
-    /// Encode as the compact JSON the record stores.
+    /// Encode as the compact JSON the record stores. `term == 0` (an
+    /// un-stamped volume) omits the key: pre-S2 volumes keep
+    /// byte-identical claim records.
     pub fn encode(&self) -> Vec<u8> {
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "id": self.id,
             "ts": self.ts,
             "pid": self.pid,
             "boot": self.boot,
-        })
-        .to_string()
-        .into_bytes()
+        });
+        if self.term != 0 {
+            v["term"] = serde_json::json!(self.term);
+        }
+        v.to_string().into_bytes()
     }
 
     /// Decode a stored claim. `None` for unparseable values — callers
     /// treat those as a stale *foreign* claim (never auto-taken: a value
-    /// we cannot attribute cannot prove anything).
+    /// we cannot attribute cannot prove anything). A record without
+    /// `term` (pre-S2, or an un-stamped volume) decodes as term 0 — the
+    /// additive-field law the `client:` records' `job_endpoint` already
+    /// established.
     pub fn decode(val: &[u8]) -> Option<Self> {
         let v: serde_json::Value = serde_json::from_slice(val).ok()?;
         Some(Self {
@@ -327,6 +360,7 @@ impl WriterClaim {
             ts: v.get("ts")?.as_u64()?,
             pid: v.get("pid")?.as_u64()? as u32,
             boot: v.get("boot")?.as_str()?.to_string(),
+            term: v.get("term").and_then(|t| t.as_u64()).unwrap_or(0),
         })
     }
 
@@ -411,6 +445,18 @@ impl MountRegistration {
             "job_endpoint": self.job_endpoint,
         })
     }
+}
+
+/// Encode the durable writer-term record ([`WRITER_TERM_XATTR`]).
+fn encode_writer_term(term: u64) -> Vec<u8> {
+    serde_json::json!({ "term": term }).to_string().into_bytes()
+}
+
+/// Decode the durable writer-term record. `None` = unparseable, which
+/// the mount gate refuses loud (never a silent era reset).
+fn decode_writer_term(val: &[u8]) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(val).ok()?;
+    v.get("term")?.as_u64()
 }
 
 /// Parse the unix-seconds heartbeat timestamp from a registration value
@@ -733,6 +779,18 @@ pub struct KvMetaBackend {
     /// Whether this backend committed a `writer_claim` (clean unmount
     /// deletes it exactly once).
     claimed: AtomicBool,
+    /// DLM S2: this mount's durable writer term on THIS volume — the
+    /// value committed to [`WRITER_TERM_XATTR`] + `WriterClaim.term` by
+    /// the gate and published to the process fencing mint
+    /// ([`crate::dlm::adopt_durable_term`]). `0` = the volume does not
+    /// carry incompat bit 7 (era-less, pre-S2 behavior) or this is a
+    /// probe / read-only backend that took no claim.
+    writer_term: AtomicU64,
+    /// Whether this volume carries
+    /// [`super::superblock::FEATURE_INCOMPAT_KV_DURABLE_TERM`] (bit 7):
+    /// the gate maintains the era ladder only then (mount NEVER stamps
+    /// the bit — the batched reformat window does).
+    durable_term_enabled: bool,
     /// Layer B1: the reservation client when the volume is a PR-capable
     /// namespace (`RESCAP ≠ 0` — enforcement grade); `None` on everything
     /// else (detection grade).
@@ -1266,6 +1324,10 @@ impl KvMetaBackend {
         let read_only = sb.unknown_ro() != 0;
         let layout_deltas_stamped =
             sb.features_incompat & super::superblock::FEATURE_INCOMPAT_KV_LAYOUT_DELTAS != 0;
+        // DLM S2 (bit 7, presence OPTIONAL): un-stamped volumes keep the
+        // pre-S2 era-less behavior verbatim.
+        let durable_term_enabled =
+            sb.features_incompat & super::superblock::FEATURE_INCOMPAT_KV_DURABLE_TERM != 0;
         let sync = Arc::new(SyncCoalescer::new());
         let retire_seq = Arc::new(AtomicU64::new(ledger.seq + 1));
         // Resolved once here (before `sb` moves into the struct): the
@@ -1346,6 +1408,8 @@ impl KvMetaBackend {
             // classifies claim records with the same proof).
             boot_id: read_boot_id(),
             claimed: AtomicBool::new(false),
+            writer_term: AtomicU64::new(0),
+            durable_term_enabled,
             reservations: None,
             pr_key: 0,
             pr_identity: std::sync::OnceLock::new(),
@@ -2720,6 +2784,16 @@ impl KvMetaBackend {
             .getxattr(1, WRITER_CLAIM_XATTR)
             .await
             .map_err(KvError::Io)?;
+        // DLM S2: the predecessor's era, read from the same replayed
+        // record the classification consumes (an unparseable claim
+        // proves nothing — including nothing about the era, so it
+        // contributes 0 and the never-deleted term record carries the
+        // ladder).
+        let prior_claim_term = raw
+            .as_deref()
+            .and_then(WriterClaim::decode)
+            .map(|c| c.term)
+            .unwrap_or(0);
         let evidence = self.classify_claim(raw, now);
 
         match (&evidence, &self.reservations) {
@@ -2851,6 +2925,13 @@ impl KvMetaBackend {
         // fail-stops at their barriers — the guard ladder is unchanged.
         self.preclaim_ring_recovery().await?;
 
+        // DLM S2 (spec §6.7 decision 4 / §6.9): bump the durable writer
+        // term past every predecessor's. Resolution only — the record
+        // rides the claim's own transaction below, so the gate still
+        // makes exactly ONE pre-barrier mutation and the two records can
+        // never diverge across a crash.
+        let term = self.resolve_writer_term(prior_claim_term).await?;
+
         // Layer B2: commit our claim and make it durable — the volume's
         // first post-replay mutation, BEFORE the checkpoint task exists.
         let claim = WriterClaim {
@@ -2858,20 +2939,121 @@ impl KvMetaBackend {
             ts: unix_now_secs(),
             pid: std::process::id(),
             boot: self.boot_id.clone(),
+            term,
         };
-        self.setxattr_internal(1, WRITER_CLAIM_XATTR, &claim.encode())
-            .await?;
+        self.commit_claim_tx(&claim).await?;
         self.claimed.store(true, Ordering::Release);
         self.trace_guard_event("claim_committed");
         self.sync_device().await.map_err(KvError::Io)?;
         self.trace_guard_event("claim_barriered");
+        // Publish AFTER the barrier: the process mint may only compose
+        // tokens from an era that is on disk.
+        self.writer_term.store(term, Ordering::Release);
+        if term != 0 {
+            crate::dlm::adopt_durable_term(term);
+        }
         log::info!(
-            "meta volume {}: writer claim taken (id={}, mode={})",
+            "meta volume {}: writer claim taken (id={}, term={}, mode={})",
             self.path.display(),
             claim.id,
+            term,
             self.writer_guard_mode()
         );
         Ok(())
+    }
+
+    /// The Layer B2 claim commit: the `writer_claim` record and — on
+    /// bit-7 volumes — the DLM S2 durable term record, staged into ONE
+    /// `KvTx` so the gate keeps making exactly one pre-barrier mutation
+    /// (design §5.0 B2: "the claim tx is the volume's first post-replay
+    /// mutation, and no maintenance record can precede it") and the era
+    /// ladder can never diverge from the claim that names it — one
+    /// checksummed journal entry, whole-tx atomic, torn-immune.
+    async fn commit_claim_tx(&self, claim: &WriterClaim) -> Result<()> {
+        self.write_gate()?;
+        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(1).await]);
+        let tx0 = KvTx::new();
+        let (_existing, claim_key) = self.xattr_slot(&tx0, 1, WRITER_CLAIM_XATTR).await?;
+        let mut tx = tx0;
+        tx.stage_put(
+            TREE_XATTRS,
+            claim_key,
+            XattrValue::encode_parts(WRITER_CLAIM_XATTR.as_bytes(), &claim.encode())?,
+        );
+        if claim.term != 0 {
+            // Read-your-own-writes: the slot probe sees the staged claim
+            // (different name ⇒ different slot; the overlay keeps the
+            // collision chain honest).
+            let (_existing, term_key) = self.xattr_slot(&tx, 1, WRITER_TERM_XATTR).await?;
+            tx.stage_put(
+                TREE_XATTRS,
+                term_key,
+                XattrValue::encode_parts(
+                    WRITER_TERM_XATTR.as_bytes(),
+                    &encode_writer_term(claim.term),
+                )?,
+            );
+        }
+        tx.hold_guards(guards);
+        self.commit_tx(tx).await?;
+        Ok(())
+    }
+
+    /// DLM S2: resolve this mount's writer term. `prior_claim_term` is
+    /// the era carried by the replayed `writer_claim` the gate already
+    /// read; the resolved term is COMMITTED (and barriered) by
+    /// [`Self::commit_claim_tx`] before the guard arms.
+    ///
+    /// The successor's term is `max(claim.term, writer_term record) + 1`.
+    /// Both sources are consulted because they have different lifetimes:
+    /// the claim is DELETED at clean unmount (the volume must present as
+    /// unclaimed), while [`WRITER_TERM_XATTR`] is never deleted — so the
+    /// era ladder survives clean cycles as well as crashes.
+    ///
+    /// Returns `0` on volumes without incompat bit 7: no record is
+    /// written, the claim carries no `term` key, and every token this
+    /// mount mints is the bare grant sequence (pre-S2 behavior).
+    async fn resolve_writer_term(
+        &self,
+        prior_claim_term: u64,
+    ) -> std::result::Result<u64, KvError> {
+        if !self.durable_term_enabled {
+            return Ok(0);
+        }
+        let stored = match self
+            .getxattr(1, WRITER_TERM_XATTR)
+            .await
+            .map_err(KvError::Io)?
+        {
+            None => 0,
+            Some(val) => decode_writer_term(&val).ok_or_else(|| {
+                KvError::Corrupt(format!(
+                    "{}: the durable writer-term record ({WRITER_TERM_XATTR}) is unparseable \
+                     ({}) — refusing to mount rather than reset the fencing era, which would \
+                     re-issue tokens a predecessor already used (DLM S2, spec §6.11)",
+                    self.path.display(),
+                    String::from_utf8_lossy(&val),
+                ))
+            })?,
+        };
+        let prior = prior_claim_term.max(stored);
+        if prior >= crate::dlm::TERM_MAX {
+            return Err(KvError::Corrupt(format!(
+                "{}: writer term space exhausted (prior term {prior} of a {}-bit budget, max \
+                 {}) — refusing to mount rather than roll the era over, which would alias this \
+                 mount's fencing tokens with a retired era's; reformat required (DLM S2)",
+                self.path.display(),
+                64 - crate::dlm::GRANT_SEQ_BITS,
+                crate::dlm::TERM_MAX,
+            )));
+        }
+        Ok(prior + 1)
+    }
+
+    /// This mount's durable writer term on this volume (0 = un-stamped
+    /// volume, probe, or read-only mount — see [`WRITER_TERM_XATTR`]).
+    pub fn writer_term(&self) -> u64 {
+        self.writer_term.load(Ordering::Acquire)
     }
 
     /// The mount gate's ring-recovery preflight (see the call site in
@@ -3236,6 +3418,9 @@ impl KvMetaBackend {
                 ts: unix_now_secs(),
                 pid: std::process::id(),
                 boot: self.boot_id.clone(),
+                // The era is set once by the gate; the heartbeat carries
+                // it forward verbatim (a refresh is never a new claim).
+                term: self.writer_term(),
             };
             if let Err(e) = self
                 .setxattr_internal(1, WRITER_CLAIM_XATTR, &claim.encode())
@@ -3341,6 +3526,7 @@ impl KvMetaBackend {
             ts: 0,
             pid: 0,
             boot: String::new(),
+            term: 0,
         })))
     }
 }

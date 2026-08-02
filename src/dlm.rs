@@ -73,6 +73,15 @@ fn ino_of_path(path: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// One acquire attempt's mint outcome: granted (token), the object is
+/// held by someone else, or the era's grant space is exhausted (loud
+/// refusal — no entry is inserted, no lock is taken).
+enum Mint {
+    Granted(u64),
+    Held,
+    Exhausted(u64),
+}
+
 /// A held lock entry: the owner's process-unique nonce plus the fencing
 /// token minted at grant. The token is atomic because a byte-range grant
 /// on the same FILE identity bumps a live whole-file entry (ranges share
@@ -93,9 +102,94 @@ static LOCK_MAP: Lazy<scc::HashMap<ObjectKey, HeldLock>> = Lazy::new(scc::HashMa
 /// comparison is `<`, `==` or `.max()` — monotone-safe under globally
 /// unique, gap-carrying tokens. Replaces the per-object `FENCING_MAP`
 /// (RES-2: one immortal `Arc<AtomicU64>` per object ever locked, ~105 B
-/// each, no removal path) with O(1) state. S2 composes this into
-/// `(term << 40) | grant_seq` for remount monotonicity.
+/// each, no removal path) with O(1) state. S2 composes it into
+/// `(term << GRANT_SEQ_BITS) | grant_seq` for remount monotonicity.
 static GRANT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// S2 (spec §6.7 decision 4): width of the grant field in a composed
+/// fencing token — `token = (term << 40) | grant_seq`.
+pub const GRANT_SEQ_BITS: u32 = 40;
+
+/// The largest grant sequence a term can issue (40 bits). Past it the
+/// mint REFUSES ([`LocalLockManager::acquire_lock`] errors loud): a
+/// carry into the term field would forge a future era.
+pub const GRANT_SEQ_MAX: u64 = (1u64 << GRANT_SEQ_BITS) - 1;
+
+/// The largest writer term (24 bits). Past it the MOUNT refuses (the D0
+/// gate, `KvMetaBackend::writer_guard_gate`): a term rollover would
+/// alias a live era's tokens with a retired one's.
+pub const TERM_MAX: u64 = (1u64 << (64 - GRANT_SEQ_BITS)) - 1;
+
+/// S2: the process's adopted **durable writer term** — the high-order
+/// component of every token this process mints. Published by the D0
+/// mount gate AFTER the claim barrier (`crate::dlm::adopt_durable_term`),
+/// so no token can ever name an era that is not on disk; a multi-volume
+/// mount publishes each volume's term and the max wins (every write
+/// mount claims every volume in the set, so the max is itself
+/// remount-monotone).
+///
+/// **0 = no durable term** — an un-stamped volume (no incompat bit 7),
+/// an offline tool that holds no claim, or a pure in-RAM test. Then
+/// `(0 << 40) | grant_seq == grant_seq`: tokens are byte-identical to
+/// S1's and every behavior is the pre-S2 behavior.
+static DURABLE_TERM: AtomicU64 = AtomicU64::new(0);
+
+/// Compose a fencing token from its durable era and its grant sequence.
+pub const fn compose_token(term: u64, grant_seq: u64) -> u64 {
+    (term << GRANT_SEQ_BITS) | grant_seq
+}
+
+/// The durable era a token was minted in (0 = an un-stamped volume's
+/// era-less token).
+pub const fn token_term(token: u64) -> u64 {
+    token >> GRANT_SEQ_BITS
+}
+
+/// The grant sequence inside a token's era.
+pub const fn token_grant_seq(token: u64) -> u64 {
+    token & GRANT_SEQ_MAX
+}
+
+/// This process's adopted durable term (0 = none — see [`DURABLE_TERM`]).
+pub fn durable_term() -> u64 {
+    DURABLE_TERM.load(Ordering::Acquire)
+}
+
+/// The current era's floor: the value an object with no grant in this
+/// era reads. Consumers that must distinguish "a real grant happened"
+/// from "the era moved" compare against this (the mount-time extent
+/// sweep does exactly that — `SqueezefsFilesystem::recover_extent_records`).
+pub fn term_base() -> u64 {
+    compose_token(durable_term(), 0)
+}
+
+/// Adopt a durable term published by the D0 mount gate (monotone
+/// `fetch_max` — never regresses, so a stale/second volume cannot lower
+/// the era). Returns the process term after adoption.
+///
+/// Call only AFTER the term is durable and barriered: a token naming an
+/// era that a crash could lose would be the §6.11 inversion in reverse.
+pub fn adopt_durable_term(term: u64) -> u64 {
+    let prev = DURABLE_TERM.fetch_max(term, Ordering::AcqRel);
+    if term > prev {
+        log::info!(
+            "fencing: durable writer term {term} adopted (was {prev}); every token this \
+             process mints now dominates every earlier era's (spec §6.7 decision 4)"
+        );
+        term
+    } else {
+        prev
+    }
+}
+
+/// **Test seam** (the `test_conveyor_hold_release` precedent): swap the
+/// process mint's grant counter, returning the previous value. Exists
+/// for the 40-bit exhaustion contract, which cannot be reached by
+/// minting; production code never calls it. Callers restore the saved
+/// value — the mint is process-global.
+pub fn test_swap_grant_seq(value: u64) -> u64 {
+    GRANT_SEQ.swap(value, Ordering::AcqRel)
+}
 
 /// Per-stripe RELEASED-generation floors, fetch_max'd at every mint with
 /// the granted token (keyed by the FILE identity's stripe). An UNHELD
@@ -201,13 +295,20 @@ impl LocalLockManager {
 
     /// The identity's readable generation: EXACT while a whole-file lease
     /// is held (the entry token — live writers are never fenced by stripe
-    /// collisions), the stripe floor otherwise (≥ the identity's own
-    /// newest grant; see `LAST_GRANT_FLOOR`). A never-locked identity on
-    /// a quiet stripe reads 0 — identical to the historical map miss.
+    /// collisions), otherwise the stripe floor raised to the current
+    /// era's base (≥ the identity's own newest grant; see
+    /// `LAST_GRANT_FLOOR`). A never-locked identity reads
+    /// [`term_base`] — S1's plain 0 when no durable term is adopted, and
+    /// the CURRENT era's floor when one is (S2: that is what makes every
+    /// pre-crash stamp stale in a fresh process — spec §6.11).
     fn read_identity(identity: &ObjectKey) -> u64 {
         LOCK_MAP
             .read_sync(identity, |_, h| h.token.load(Ordering::Acquire))
-            .unwrap_or_else(|| grant_floor(identity).load(Ordering::Acquire))
+            .unwrap_or_else(|| {
+                grant_floor(identity)
+                    .load(Ordering::Acquire)
+                    .max(term_base())
+            })
     }
 
     /// Acquire an exclusive lease on `file_path` (optionally a byte range),
@@ -241,20 +342,42 @@ impl LocalLockManager {
             notified.as_mut().enable();
 
             let acquired = match LOCK_MAP.entry_sync(key.clone()) {
-                scc::hash_map::Entry::Occupied(_) => None,
+                scc::hash_map::Entry::Occupied(_) => Mint::Held,
                 scc::hash_map::Entry::Vacant(vac) => {
                     // S1 mint: one global fetch_add — strictly monotone
                     // in grant order, globally unique, gap-carrying.
-                    let token = GRANT_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
-                    let _ = vac.insert_entry(HeldLock {
-                        owner_nonce: self.client_nonce,
-                        token: AtomicU64::new(token),
-                    });
-                    Some(token)
+                    // S2: composed with the durable era, so the sequence
+                    // is monotone ACROSS processes too.
+                    let seq = GRANT_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+                    if seq > GRANT_SEQ_MAX {
+                        // Bit-budget refusal: never carry into the term
+                        // field (that would forge a future era). Nothing
+                        // is inserted — the caller holds no lock.
+                        Mint::Exhausted(seq)
+                    } else {
+                        let token = compose_token(durable_term(), seq);
+                        let _ = vac.insert_entry(HeldLock {
+                            owner_nonce: self.client_nonce,
+                            token: AtomicU64::new(token),
+                        });
+                        Mint::Granted(token)
+                    }
                 }
             };
 
-            if let Some(fencing_token) = acquired {
+            if let Mint::Exhausted(seq) = acquired {
+                let reason = format!(
+                    "fencing grant space exhausted: sequence {seq} exceeds the {}-bit budget \
+                     ({GRANT_SEQ_MAX}) of writer term {} — refusing to mint (a carry into the \
+                     term field would forge a newer era); remount to start a fresh term",
+                    GRANT_SEQ_BITS,
+                    durable_term()
+                );
+                log::error!("{reason}");
+                return Err(crate::error::SqueezefsError::LockFailed { reason });
+            }
+
+            if let Mint::Granted(fencing_token) = acquired {
                 let identity = key.fencing_identity();
                 // Publish the grant to the identity's read surfaces: the
                 // stripe floor (unheld reads), and — for a range grant —

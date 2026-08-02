@@ -260,10 +260,11 @@ fn tree_bounds(ks: &SlotKeyspace, tree_idx: usize) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Whether `(tree_idx, key, value)` is a PER-VOLUME control record that
-/// must never travel with a slot (the volume's own `writer_claim` at its
-/// keyspace root). `client:` heartbeat records DO travel — they are
-/// routed-set records on global ino 1 and the registration scanners look
-/// for them in the slot-0 keyspace.
+/// must never travel with a slot (the volume's own `writer_claim` and
+/// its DLM-S2 `writer_term` era ladder, both at its keyspace root).
+/// `client:` heartbeat records DO travel — they are routed-set records
+/// on global ino 1 and the registration scanners look for them in the
+/// slot-0 keyspace.
 fn is_pinned_control_record(ks: &SlotKeyspace, tree_idx: usize, key: &[u8], value: &[u8]) -> bool {
     if tree_idx != 2 {
         return false;
@@ -275,7 +276,10 @@ fn is_pinned_control_record(ks: &SlotKeyspace, tree_idx: usize, key: &[u8], valu
         return false;
     }
     match XattrValue::decode(value) {
-        Ok(x) => x.name == crate::meta_backend::kv::backend::WRITER_CLAIM_XATTR.as_bytes(),
+        Ok(x) => {
+            x.name == crate::meta_backend::kv::backend::WRITER_CLAIM_XATTR.as_bytes()
+                || x.name == crate::meta_backend::kv::backend::WRITER_TERM_XATTR.as_bytes()
+        }
         Err(_) => false,
     }
 }

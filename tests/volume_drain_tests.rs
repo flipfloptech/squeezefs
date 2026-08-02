@@ -1419,3 +1419,243 @@ async fn test_unthrottled_drain_overlaps_block_moves() {
     assert!(victim_blocks_of(&fx, ino, "oss2").await.is_empty());
     fx.close().await;
 }
+
+// ---------------------------------------------------------------------------
+// The claim-release reclaim law (2026-08-04 flake fix,
+// `.benchmarks/2026-08-04-volume-drain-flake.md`): a custody holder must
+// return-or-cease every queued device reclaim BEFORE its claims release.
+// The product dismount upholds it (`fuse_client` dismount drains the
+// queue); the fence-halt names the hazard class ("a zombie's discard can
+// destroy the successor writer's reallocated blocks"). The fixture's
+// close()/crash() must be mount/kill-9-faithful, or a background punch
+// outlives the fixture (the entry→allocator→valve→queue Arc cycle keeps a
+// non-empty queue immortal) and lands on offsets the NEXT custody holder
+// (the §5.8 offline coordinator's freshly-recovered gap-filled allocator)
+// has reallocated — the exactly-one-block-of-zeros read-back flake.
+// ---------------------------------------------------------------------------
+
+/// Hold the fixture's background reclaim worker deferred forever: an
+/// always-advancing foreground signal engages the manners law on every
+/// worker pass — the deterministic stand-in for the flake's schedule,
+/// where the offline drain's own device traffic (process-global METRICS)
+/// held the worker deferred until the exact post-publish quiet window.
+fn defer_reclaim_worker(fx: &Fx) {
+    let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    fx.fs
+        .router
+        .backend_router
+        .set_reclaim_foreground_signal(Arc::new(move || {
+            // +1: the worker's baseline is 0, so the FIRST probe must
+            // already read as advanced (fetch_add returns the old value).
+            ticks.fetch_add(1, Ordering::Relaxed) + 1
+        }));
+}
+
+/// Device ranges returned-or-ceased by the reclaim engine (per-block
+/// ledger: punches + discards + conscious skips + fence/halt drops).
+fn reclaims_returned_or_ceased() -> u64 {
+    METRICS.block_free_file_punches.load(Ordering::Relaxed)
+        + METRICS.block_free_discards.load(Ordering::Relaxed)
+        + METRICS.block_free_reclaim_skipped.load(Ordering::Relaxed)
+        + METRICS
+            .block_free_reclaim_fence_halts
+            .load(Ordering::Relaxed)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_close_returns_queued_reclaims_before_custody_release() {
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    let oss2 = make_file(dir.path(), "oss2", 4 << 30);
+    format_meta(&meta, &[&oss1, &oss2]).await;
+    let recs = base_format_config(&[&oss1, &oss2]).resolved_data_volumes();
+    let fx = open_fixture(&meta, &recs).await;
+    defer_reclaim_worker(&fx);
+
+    let queued0 = METRICS.block_free_reclaim_queued.load(Ordering::Relaxed);
+    let returned0 = reclaims_returned_or_ceased();
+
+    // Terminal frees: a deleted striped file queues one reclaim per
+    // block (plus the burst's own displaced overwrites).
+    let churn = create_file(&fx, "churn.bin").await;
+    striped_burst(&fx, churn, 16).await;
+    let mut con = fx
+        .fs
+        .router
+        .dlm
+        .get_connection()
+        .await
+        .expect("meta connection");
+    fx.fs
+        .router
+        .delete_file(&squeezefs::keys::inode_path(churn), &mut con)
+        .await
+        .expect("delete the churn file");
+    let queued = METRICS.block_free_reclaim_queued.load(Ordering::Relaxed) - queued0;
+    assert!(queued > 0, "engagement: the delete must queue terminal reclaims");
+
+    fx.close().await;
+
+    assert_eq!(
+        reclaims_returned_or_ceased() - returned0,
+        queued,
+        "close() must return-or-cease every queued device range before \
+         releasing the claims (the dismount law) — a straggler punch can \
+         zero offsets the next custody holder reallocates"
+    );
+}
+
+/// The flake's schedule made deterministic (the repro-port): freed gaps
+/// whose punches are still queued on the CLOSED fixture's queue, the
+/// offline coordinator's recovered allocator reallocating exactly those
+/// gaps for the republished victim blocks, then the late punch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_late_reclaim_after_close_cannot_zero_republished_blocks() {
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    let oss2 = make_file(dir.path(), "oss2", 4 << 30);
+    format_meta(&meta, &[&oss1, &oss2]).await;
+    let recs = base_format_config(&[&oss1, &oss2]).resolved_data_volumes();
+    let meta_lvs = vec![meta.display().to_string()];
+    let fx = open_fixture(&meta, &recs).await;
+    defer_reclaim_worker(&fx);
+
+    // The survivor file whose bytes the drain must preserve.
+    const NBLOCKS: usize = 16;
+    let ino = create_file(&fx, "cold.bin").await;
+    let expected = striped_burst(&fx, ino, NBLOCKS).await;
+    assert!(
+        !victim_blocks_of(&fx, ino, "oss2").await.is_empty(),
+        "precondition: the drain must have victim blocks to move"
+    );
+
+    // Churn: freed offsets on the SURVIVOR volume whose punches stay
+    // queued (worker held deferred) — the offsets the offline
+    // coordinator's recovered allocator will hand back to the mover as
+    // destinations. Allocated directly on oss1 (placement-independent,
+    // deterministic), written, published, then terminally freed.
+    let queued0 = METRICS.block_free_reclaim_queued.load(Ordering::Relaxed);
+    let survivor = fx
+        .fs
+        .router
+        .backend_router
+        .backends
+        .get("oss1")
+        .unwrap()
+        .value()
+        .clone();
+    for _ in 0..4 {
+        let off = survivor.block_allocator.allocate_block().await.unwrap();
+        survivor
+            .device
+            .write_block(off, bytes::Bytes::from(vec![0xAAu8; BLOCK]))
+            .await
+            .unwrap();
+        survivor.block_allocator.publish_block(off);
+        fx.fs
+            .router
+            .backend_router
+            .free_block(&format!("oss1://{off}"))
+            .await
+            .unwrap();
+    }
+    assert!(
+        METRICS.block_free_reclaim_queued.load(Ordering::Relaxed) - queued0 >= 4,
+        "precondition: the survivor-volume frees must queue their reclaims"
+    );
+
+    // Retain the queue handle past close — the racy actor of the flake.
+    let br = fx.fs.router.backend_router.clone();
+    fx.close().await;
+
+    squeezefs::config_ops::remove_data_volume_offline(&meta_lvs, "oss2", 100)
+        .await
+        .expect("offline remove-data drains to completion");
+
+    // The late engagement: the deterministic stand-in for the background
+    // worker's post-drain wake. After a lawful close this is a no-op.
+    br.reclaim_drain().await;
+
+    let listed = squeezefs::config_ops::resolved_volume_records(&meta_lvs)
+        .await
+        .unwrap();
+    let fx2 = open_fixture(&meta, &listed).await;
+    assert_eq!(
+        read_back(&fx2, ino, NBLOCKS).await,
+        expected,
+        "a reclaim straggler from the closed fixture must never zero \
+         blocks the offline drain republished"
+    );
+    assert!(victim_blocks_of(&fx2, ino, "oss2").await.is_empty());
+    fx2.close().await;
+}
+
+/// Kill-9 fidelity for the crash analog: a dead process can never issue
+/// another device command, so crash() must CEASE device reclaims (the
+/// fence-halt posture: backlog dropped without finish_free, successor
+/// recovery owns the accounting) — never leave a live queue whose punches
+/// land on offsets the post-crash reopen reallocates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_crash_analog_ceases_device_reclaims() {
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    let oss2 = make_file(dir.path(), "oss2", 4 << 30);
+    format_meta(&meta, &[&oss1, &oss2]).await;
+    let recs = base_format_config(&[&oss1, &oss2]).resolved_data_volumes();
+    let fx = open_fixture(&meta, &recs).await;
+    defer_reclaim_worker(&fx);
+
+    let queued0 = METRICS.block_free_reclaim_queued.load(Ordering::Relaxed);
+    let punches0 = METRICS.block_free_file_punches.load(Ordering::Relaxed)
+        + METRICS.block_free_discards.load(Ordering::Relaxed);
+    let halts0 = METRICS
+        .block_free_reclaim_fence_halts
+        .load(Ordering::Relaxed);
+
+    let churn = create_file(&fx, "churn.bin").await;
+    striped_burst(&fx, churn, 16).await;
+    let mut con = fx
+        .fs
+        .router
+        .dlm
+        .get_connection()
+        .await
+        .expect("meta connection");
+    fx.fs
+        .router
+        .delete_file(&squeezefs::keys::inode_path(churn), &mut con)
+        .await
+        .expect("delete the churn file");
+    let queued = METRICS.block_free_reclaim_queued.load(Ordering::Relaxed) - queued0;
+    assert!(queued > 0, "engagement: the delete must queue terminal reclaims");
+
+    let br = fx.fs.router.backend_router.clone();
+    fx.crash().await;
+
+    // Any straggler engagement after the crash must be command-free.
+    br.reclaim_drain().await;
+
+    assert_eq!(
+        METRICS.block_free_file_punches.load(Ordering::Relaxed)
+            + METRICS.block_free_discards.load(Ordering::Relaxed)
+            - punches0,
+        0,
+        "a crashed holder must never issue another device reclaim \
+         (kill-9 analog: the process would be dead)"
+    );
+    assert_eq!(
+        METRICS
+            .block_free_reclaim_fence_halts
+            .load(Ordering::Relaxed)
+            - halts0,
+        queued,
+        "the crashed backlog is dropped-without-finish_free (fence-halt \
+         accounting: successor recovery owns it)"
+    );
+}

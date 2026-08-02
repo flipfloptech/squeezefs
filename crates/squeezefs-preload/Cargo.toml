@@ -44,6 +44,25 @@ squeezefs-ipc = { path = "../squeezefs-ipc" }
 # (refusal-class reason formatting) and use libc errno constants.
 libc = "0.2"
 squeezefs-ipc = { path = "../squeezefs-ipc" }
+# PERF-7 microbench (offset-mirror bookkeeping vs the replaced lseek
+# syscall pair). Dev-only; never in the shipped cdylib's dependency
+# closure.
+criterion = "0.5"
+
+# PERF-7: the offset-mirror bookkeeping vs the lseek64 syscall pair it
+# replaced (docs/pre-rc-engineering-spec.md §9). The Issue-4 profile
+# discipline applies to benches exactly as to everything else — the
+# sanctioned invocation is
+#
+#     cargo bench -p squeezefs-preload --profile preload-release \
+#         --bench offset_mirror_bench
+#
+# (a plain `cargo bench` inherits the root release profile's
+# panic="abort" into the lib build and the compile_error! guard
+# refuses it, by design).
+[[bench]]
+name = "offset_mirror_bench"
+harness = false
 
 [features]
 # The #[no_mangle] libc interposer symbols. ONLY the shipped cdylib

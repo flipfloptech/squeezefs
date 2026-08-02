@@ -72,6 +72,7 @@ impl Drop for LeverGuard {
         squeezefs::fuse_client::set_test_upload_stall_ms(0);
         squeezefs::fuse_client::set_inplace_overwrite(false);
         squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
+        squeezefs::routing::set_rewrite_shadow(true);
     }
 }
 
@@ -229,6 +230,11 @@ async fn stale_inflight_upload_never_publishes_and_newest_bytes_win() {
     let _g = serial().await;
     let _l = LeverGuard;
     squeezefs::fuse_client::set_patch_max_bytes(0);
+    // Durable-publish machinery venue: the rewrite-shadow epoch (Idea 1)
+    // parks displaced keys and defers the durable rebind — pinned off
+    // here (tests/rewrite_shadow_tests.rs owns the epoch venue; the
+    // supersession law itself is layout-agnostic).
+    squeezefs::routing::set_rewrite_shadow(false);
     let h = make_harness("supersede_planted_stale").await;
     let ino = create_file(&h, "f1").await;
     let blocks = 2u64;
@@ -340,6 +346,11 @@ async fn flush_that_wins_makes_the_stalled_task_a_counted_noop() {
     let _g = serial().await;
     let _l = LeverGuard;
     squeezefs::fuse_client::set_patch_max_bytes(0);
+    // Durable-publish machinery venue: the rewrite-shadow epoch (Idea 1)
+    // parks displaced keys and defers the durable rebind — pinned off
+    // here (tests/rewrite_shadow_tests.rs owns the epoch venue; the
+    // supersession law itself is layout-agnostic).
+    squeezefs::routing::set_rewrite_shadow(false);
     let h = make_harness("supersede_flush_wins").await;
     let ino = create_file(&h, "f1").await;
 
@@ -396,6 +407,7 @@ async fn inplace_lever_keeps_the_serialized_upload() {
     let _l = LeverGuard;
     squeezefs::fuse_client::set_inplace_overwrite(true);
     squeezefs::fuse_client::set_patch_max_bytes(0);
+    squeezefs::routing::set_rewrite_shadow(false);
     let h = make_harness("supersede_inplace_serialized").await;
     let ino = create_file(&h, "f1").await;
 

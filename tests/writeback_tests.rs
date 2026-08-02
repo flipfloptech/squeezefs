@@ -824,7 +824,10 @@ async fn test_striped_flush_dma_zero_copy_aligned_no_lru_retention() {
     // slices park as extent overlays now, which FOLD durably at teardown
     // instead of staging (this suite pins the whole-image staged flush).
     let p1: Vec<u8> = (0..5120u32).map(|i| ((i % 97) + 60) as u8).collect();
-    squeezefs::nvme_dev::set_fail_next_writes(1);
+    // TWO injected failures = a PERSISTENT device error (Idea 2 — the
+    // supersession path's unlocked DMA consumes the first and the
+    // serialized fallback retries once before the staging ladder).
+    squeezefs::nvme_dev::set_fail_next_writes(2);
     harness_write(&h, ino, 0, &p1).await;
     drain_pipeline(&h).await; // the detached upload consumes the poison
     squeezefs::nvme_dev::clear_fail_next_writes();
@@ -1033,7 +1036,9 @@ async fn test_flush_write_verification_readback_runs_within_guard_hold() {
                               // W2 (RW4): >= 25 % tail slice keeps the FULL-buffer staged shape
                               // under test (sub-25 % would extent-park + fold instead).
     let p1: Vec<u8> = (0..5120u32).map(|i| ((i % 113) + 5) as u8).collect();
-    squeezefs::nvme_dev::set_fail_next_writes(1);
+    // TWO injected failures = a PERSISTENT device error (Idea 2 — see
+    // the striped-flush test above).
+    squeezefs::nvme_dev::set_fail_next_writes(2);
     harness_write(&h, ino, 0, &p1).await;
     drain_pipeline(&h).await; // the detached upload consumes the poison
     squeezefs::nvme_dev::clear_fail_next_writes();
@@ -1095,6 +1100,17 @@ async fn test_flush_write_verification_readback_runs_within_guard_hold() {
 
 #[tokio::test]
 async fn test_block_allocator_recovery() {
+    // The rewrite-shadow epoch (Idea 1) records ACK-path rewrite
+    // publishes RAM-only — this contract pins durable-publish machinery
+    // (tests/rewrite_shadow_tests.rs owns the epoch venue).
+    struct ShadowOff;
+    impl Drop for ShadowOff {
+        fn drop(&mut self) {
+            squeezefs::routing::set_rewrite_shadow(true);
+        }
+    }
+    let _so = ShadowOff;
+    squeezefs::routing::set_rewrite_shadow(false);
     let _serial = serial().await;
     let _ = env_logger::builder().is_test(true).try_init();
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");

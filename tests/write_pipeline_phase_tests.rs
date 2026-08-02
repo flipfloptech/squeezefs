@@ -225,6 +225,17 @@ impl Drop for InplaceGuard {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pipeline_write_through_records_every_residence_phase() {
+    // The rewrite-shadow epoch (Idea 1) records ACK-path rewrite
+    // publishes RAM-only — this contract pins durable-publish machinery
+    // (tests/rewrite_shadow_tests.rs owns the epoch venue).
+    struct ShadowOff;
+    impl Drop for ShadowOff {
+        fn drop(&mut self) {
+            squeezefs::routing::set_rewrite_shadow(true);
+        }
+    }
+    let _so = ShadowOff;
+    squeezefs::routing::set_rewrite_shadow(false);
     let _g = serial().await;
     // This contract pins the COW pipeline's full decomposition (all ten
     // phases incl. allocate/displaced_free); the write-wall iteration-1

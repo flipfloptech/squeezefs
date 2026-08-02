@@ -138,6 +138,17 @@ pub struct BlockAllocator {
     space_valve: std::sync::OnceLock<SpaceValve>,
     /// Reclaimable-supply predicate (paired with the valve at wiring).
     space_pending: std::sync::OnceLock<SpacePending>,
+    /// Idea 4 — discard elision (design-rewrite-program §3): unreturned
+    /// discard DEBT per elided terminal free (`offset → bytes`). Debt is
+    /// RAM-only and strictly ⊆ the free list; allocation CANCELS a
+    /// reused offset's entry ([`Self::cancel_elided_debt`] in
+    /// `claim_block_idx` — claim-cancels-debt, KD-4.3) and the trim
+    /// venues drain it (`crate::block_reclaim::drain_debt_sync`).
+    elided_debt: scc::HashMap<u64, u64>,
+    /// Local mirror of the outstanding debt bytes (the per-target
+    /// watermark input; the process-wide gauge is
+    /// `METRICS.block_free_elided_debt_bytes`).
+    elided_debt_bytes: AtomicU64,
     /// Per-offset incarnation seqlock: `gen << 1 | stable`.
     ///
     /// Block keys are plain offset strings, so when an offset is freed and
@@ -171,8 +182,112 @@ impl BlockAllocator {
             inflight: scc::HashMap::new(),
             space_valve: std::sync::OnceLock::new(),
             space_pending: std::sync::OnceLock::new(),
+            elided_debt: scc::HashMap::new(),
+            elided_debt_bytes: AtomicU64::new(0),
             incarnations: scc::HashMap::new(),
         })
+    }
+
+    // -----------------------------------------------------------------
+    // Idea 4 — discard-elision debt (design-rewrite-program §3; contracts
+    // in tests/discard_elision_tests.rs)
+    // -----------------------------------------------------------------
+
+    /// Record one elided terminal free's unreturned discard debt.
+    /// Called BEFORE `finish_free` (so a racing claim always observes the
+    /// entry it must cancel).
+    pub fn record_elided_debt(&self, offset: u64, bytes: u64) {
+        let prev = match self.elided_debt.entry_sync(offset) {
+            scc::hash_map::Entry::Occupied(mut occ) => {
+                std::mem::replace(occ.get_mut(), bytes)
+            }
+            scc::hash_map::Entry::Vacant(vac) => {
+                let _ = vac.insert_entry(bytes);
+                0
+            }
+        };
+        if prev != 0 {
+            // Replaced a lingering entry (re-free without an intervening
+            // claim — cannot happen at steady state, reconciled anyway).
+            self.elided_debt_bytes.fetch_sub(prev, Ordering::Relaxed);
+            crate::fuse_client::METRICS
+                .block_free_elided_debt_bytes
+                .fetch_sub(prev, Ordering::Relaxed);
+        }
+        self.elided_debt_bytes.fetch_add(bytes, Ordering::Relaxed);
+        crate::fuse_client::METRICS
+            .block_free_elided_debt_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Claim-cancels-debt (KD-4.3): a reused offset owes no discard.
+    /// One lock-free probe on a mostly-empty map when elision is idle.
+    pub(crate) fn cancel_elided_debt(&self, offset: u64) {
+        if let Some((_, bytes)) = self.elided_debt.remove_sync(&offset) {
+            self.elided_debt_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            crate::fuse_client::METRICS
+                .block_free_elided_debt_bytes
+                .fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Outstanding elided-debt bytes on THIS allocator (the per-target
+    /// watermark input).
+    pub fn elided_debt_bytes_local(&self) -> u64 {
+        self.elided_debt_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Take up to `max` debt entries for a trim pass (removed from the
+    /// tracker — the pop is the ownership transfer; the trim's
+    /// claim-from-free-list decides per offset whether anything issues).
+    pub fn take_debt_batch(&self, max: usize) -> Vec<(u64, u64)> {
+        let mut keys = Vec::new();
+        self.elided_debt.iter_sync(|k, _| {
+            keys.push(*k);
+            keys.len() < max
+        });
+        let mut out = Vec::new();
+        for k in keys {
+            if let Some((offset, bytes)) = self.elided_debt.remove_sync(&k) {
+                self.elided_debt_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                crate::fuse_client::METRICS
+                    .block_free_elided_debt_bytes
+                    .fetch_sub(bytes, Ordering::Relaxed);
+                out.push((offset, bytes));
+            }
+        }
+        out
+    }
+
+    /// The never-minted (virgin) tail in bytes — the KD-4.6 watermark's
+    /// derivation input. Unbounded allocators (capacity 0: offline
+    /// tools / tests) report an infinite tail: pressure never fires.
+    pub fn virgin_bytes(&self) -> u64 {
+        let cap = self.capacity_blocks.load(Ordering::Relaxed);
+        if cap == 0 {
+            return u64::MAX;
+        }
+        let cursor = self.highest_block.load(Ordering::Relaxed).min(cap);
+        (cap - cursor).saturating_mul(self.chunk_size)
+    }
+
+    /// Trim claim (KD-4.4): take `offset` OUT of the free list — the
+    /// allocation claim protocol — so no discard can ever race a new
+    /// owner's DMA. The returned in-flight registration shields the
+    /// claim window from fsck C6's limbo reconciliation (a mid-trim
+    /// offset must never be "completed" back onto the free list). `None`
+    /// = lost the claim (reused / racing trim): the offset owes nothing.
+    pub fn claim_free_for_trim(self: &Arc<Self>, offset: u64) -> Option<InflightAllocGuard> {
+        let idx = offset / self.chunk_size;
+        self.free_blocks
+            .remove(&idx)
+            .map(|_| self.inflight_register(offset))
+    }
+
+    /// Return a trim-claimed offset to the free list (the claim window
+    /// ends; the caller drops the in-flight guard after this).
+    pub fn return_from_trim(&self, offset: u64) {
+        self.free_blocks.insert(offset / self.chunk_size);
     }
 
     /// Wire the ENOSPC pressure valve (see the field doc). Set once by
@@ -612,6 +727,9 @@ impl BlockAllocator {
     /// PR VL6a fsck epoch-latch record. Returns the byte offset.
     fn claim_block_idx(&self, block_idx: u64) -> u64 {
         let offset = block_idx * self.chunk_size;
+        // Claim-cancels-debt (Idea 4, KD-4.3): the new owner's
+        // write-before-publish rewrites the range — it owes no discard.
+        self.cancel_elided_debt(offset);
         if self
             .refcounts
             .insert_sync(offset, AtomicU32::new(1))
@@ -842,6 +960,9 @@ impl BlockAllocator {
             }
         }
         let offset = block_idx * self.chunk_size;
+        // Claim-cancels-debt (Idea 4): a specifically-claimed offset is
+        // owned again — its lingering elided debt dies with the claim.
+        self.cancel_elided_debt(offset);
         let _ = self.refcounts.insert_sync(offset, AtomicU32::new(1));
         Ok(())
     }

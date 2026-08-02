@@ -579,6 +579,11 @@ pub struct BackendRouter {
     /// owns each entry's `finish_free`. Shared across router clones; the
     /// allocators' ENOSPC pressure valves drain it synchronously.
     reclaim: std::sync::Arc<crate::block_reclaim::ReclaimQueue>,
+    /// Idea 4 — the discard-elision debt drainer (design-rewrite-program
+    /// §3): elided terminal frees register their target here; the
+    /// drainer owns the idle/pressure venues and the trim core
+    /// (`trim_elided` is the fstrim/defrag face).
+    debt: std::sync::Arc<crate::block_reclaim::DebtDrainer>,
 }
 
 #[cold]
@@ -782,6 +787,7 @@ impl BackendRouter {
         block_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         let reclaim = crate::block_reclaim::ReclaimQueue::from_env();
+        let debt = crate::block_reclaim::DebtDrainer::new(reclaim.clone());
         Self::wire_space_pressure_valve(&default_allocator, &reclaim);
         let router = Self {
             default_allocator,
@@ -800,6 +806,7 @@ impl BackendRouter {
                 ahash::RandomState::new(),
             )),
             reclaim,
+            debt,
         };
         // Seed the table so bare routers place without waiting for a
         // worker tick (construction-time probe, never per-write).
@@ -1797,6 +1804,23 @@ impl BackendRouter {
                 purge(block_key);
             }
             let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
+            if crate::block_reclaim::elide_reclaim_for(&device_path) {
+                // Idea 4 — discard elision (design-rewrite-program §3):
+                // bdev-class terminal frees skip the reclaim queue
+                // entirely — debt record, then finish_free (the
+                // sanctioned zero-destructive-work window collapse:
+                // reuse is guarded by write-before-publish + the
+                // incarnation seqlock; correctness never depended on
+                // deallocation). ZERO device commands on this path —
+                // the trim venues own the space return.
+                allocator.record_elided_debt(offset, block_size);
+                allocator.finish_free(offset);
+                crate::fuse_client::METRICS
+                    .block_free_reclaim_elided
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.debt.record(&allocator, &device_path);
+                return Ok(());
+            }
             // Queue the reclaim + finish_free; the in-flight registration
             // shields the begin_free-limbo offset from fsck's C2/C3/C6
             // adjudication while the queue owns it.
@@ -1812,6 +1836,94 @@ impl BackendRouter {
                 .await;
         }
         Ok(())
+    }
+
+    /// Outstanding elided-discard debt bytes across this router's
+    /// allocators (the `block_free_elided_debt_bytes` gauge's per-router
+    /// face — tests / stats).
+    pub fn elided_debt_bytes(&self) -> u64 {
+        let mut sum = self.default_allocator.elided_debt_bytes_local();
+        for be in self.backends.iter() {
+            // The default slot aliases the first registered backend on
+            // real mounts; avoid double-charging the same allocator.
+            if !std::sync::Arc::ptr_eq(&be.value().block_allocator, &self.default_allocator) {
+                sum += be.value().block_allocator.elided_debt_bytes_local();
+            }
+        }
+        sum
+    }
+
+    /// The fstrim/defrag venue (Idea 4, KD-4.5): drain the elided-discard
+    /// debt now — `full` trims the WHOLE free list (the free list is the
+    /// durable truth; debt is only the incremental tracker, so a full
+    /// trim restores substrate hygiene even after debt was lost to a
+    /// crash/unmount). Returns `(blocks, bytes)` reclaimed. A fenced
+    /// daemon issues nothing (the reclaimer's fence-halt law).
+    pub async fn trim_elided(&self, full: bool) -> (u64, u64) {
+        if self.reclaim.fence_halted() {
+            log::error!(
+                "trim_elided refused: writer guard fenced / volume fail-stopped — a \
+                 fenced holder issues NO destructive device commands (successor \
+                 recovery owns the accounting)"
+            );
+            return (0, 0);
+        }
+        // Targets: every backend when trimming the full free list; the
+        // registered debt targets otherwise.
+        let targets: Vec<(String, std::sync::Arc<crate::block_allocator::BlockAllocator>)> =
+            if full {
+                let mut t = vec![(
+                    self.default_device.device_path.clone(),
+                    self.default_allocator.clone(),
+                )];
+                for be in self.backends.iter() {
+                    if !std::sync::Arc::ptr_eq(
+                        &be.value().block_allocator,
+                        &self.default_allocator,
+                    ) {
+                        t.push((
+                            be.value().device.device_path.clone(),
+                            be.value().block_allocator.clone(),
+                        ));
+                    }
+                }
+                t
+            } else {
+                self.debt.targets_snapshot()
+            };
+        let mut blocks = 0u64;
+        let mut bytes = 0u64;
+        for (device_path, allocator) in targets {
+            let res = tokio::task::spawn_blocking(move || {
+                let mut b = 0u64;
+                let mut by = 0u64;
+                loop {
+                    // `full` walks the whole free list in one call; debt
+                    // drains loop until the tracker empties (every pass
+                    // consumes entries — stale claims included — so the
+                    // gauge is strictly decreasing and the loop
+                    // terminates).
+                    let outstanding = allocator.elided_debt_bytes_local();
+                    let (db, dby) =
+                        crate::block_reclaim::drain_debt_sync(&allocator, &device_path, 64, full);
+                    b += db;
+                    by += dby;
+                    if full || outstanding == 0 {
+                        break;
+                    }
+                }
+                (b, by)
+            })
+            .await;
+            match res {
+                Ok((b, by)) => {
+                    blocks += b;
+                    bytes += by;
+                }
+                Err(e) => log::error!("trim_elided blocking task panicked: {e:?}"),
+            }
+        }
+        (blocks, bytes)
     }
 
     pub async fn free_blocks(&self, block_keys: &[&str]) -> Result<()> {

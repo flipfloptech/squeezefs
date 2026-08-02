@@ -138,6 +138,338 @@ fn env_u64(key: &str, default: u64, lo: u64, hi: u64) -> u64 {
         .clamp(lo, hi)
 }
 
+// ---------------------------------------------------------------------------
+// Idea 4 — discard elision until pressure (rewrite program P0,
+// docs/design-rewrite-program.md §3; contracts in
+// tests/discard_elision_tests.rs).
+//
+// For BdevDiscard-class backings a terminal free skips the reclaim queue
+// entirely: begin_free → tier purge → debt record → finish_free — the
+// offset is immediately reallocatable and ZERO device commands issue
+// during foreground rows (the charter's zero-mid-row-discards gate). The
+// discard becomes RAM-tracked DEBT (per-allocator `elided_debt`),
+// cancelled on reuse (claim-cancels-debt) and drained at the trim venues:
+// idle, the pressure watermark (debt > virgin tail — KD-4.6, no
+// constants), fstrim/defrag (`BackendRouter::trim_elided`). The trim
+// protocol claims each offset OUT of the free list before issuing
+// (KD-4.4): an offset is never simultaneously allocatable and
+// being-discarded, so a discard can never race a new owner's DMA.
+//
+// FilePunch-class backings (regular-file volumes) keep the queued
+// reclaimer verbatim — the punch is the host-FS space return whose
+// absence is a REAL ENOSPC vector on overcommitted hosts (KD-4.1).
+// ---------------------------------------------------------------------------
+
+/// `SQUEEZEFS_DISCARD_ELISION` cell (default ON; `0` = the queued-reclaim
+/// path verbatim — the A/B measurement lever AND the operational escape
+/// for substrates that need eager space return). Runtime-settable for
+/// tests via [`set_discard_elision`].
+fn elision_cell() -> &'static AtomicBool {
+    static CELL: std::sync::OnceLock<AtomicBool> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let on = std::env::var("SQUEEZEFS_DISCARD_ELISION")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true);
+        AtomicBool::new(on)
+    })
+}
+
+/// Whether bdev-class terminal frees elide their device discard into the
+/// debt tracker (default ON).
+pub fn discard_elision_enabled() -> bool {
+    elision_cell().load(Ordering::Relaxed)
+}
+
+/// Set the elision lever (tests / A-B acceptance runs).
+pub fn set_discard_elision(on: bool) {
+    elision_cell().store(on, Ordering::Relaxed);
+}
+
+/// TEST SEAM: treat every backing class as elidable (unit harnesses are
+/// file-backed and could otherwise never exercise the elision arms —
+/// contracts 1–3 of `tests/discard_elision_tests.rs`). Production keeps
+/// the bdev-only predicate; contract 5 pins the file-backing fence.
+fn elision_class_all_cell() -> &'static AtomicBool {
+    static CELL: std::sync::OnceLock<AtomicBool> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| AtomicBool::new(false))
+}
+
+/// Set the class-all test seam (see [`elision_class_all_cell`]).
+pub fn set_elision_class_all(on: bool) {
+    elision_class_all_cell().store(on, Ordering::Relaxed);
+}
+
+/// Memoized backing classification (one `stat` per device path per
+/// process — never a syscall per free on the hot path).
+fn backing_class(device_path: &str) -> FreeReclaimOp {
+    static MEMO: std::sync::OnceLock<scc::HashMap<String, FreeReclaimOp>> =
+        std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(scc::HashMap::new);
+    if let Some(op) = memo.read_sync(device_path, |_, v| *v) {
+        return op;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let op = std::fs::metadata(device_path)
+        .map(|m| free_reclaim_op(m.mode()))
+        .unwrap_or(FreeReclaimOp::Skip);
+    let _ = memo.insert_sync(device_path.to_string(), op);
+    op
+}
+
+/// The elision predicate for one terminal free (KD-4.1): lever on AND the
+/// backing is BdevDiscard-class (or the test seam forces all classes).
+pub(crate) fn elide_reclaim_for(device_path: &str) -> bool {
+    if !discard_elision_enabled() {
+        return false;
+    }
+    if elision_class_all_cell().load(Ordering::Relaxed) {
+        return true;
+    }
+    matches!(backing_class(device_path), FreeReclaimOp::BdevDiscard)
+}
+
+/// The pressure watermark (KD-4.6 — derived, no constants): elide while
+/// the device's unreturned debt does not exceed its never-minted (virgin)
+/// tail. While virgin ≥ debt, the substrate's thin exposure from elision
+/// is bounded by what fresh-minting the same workload would have consumed
+/// anyway; past it, unreturned debt is the dominant exposure and the
+/// paced drain engages even under foreground.
+pub fn debt_within_watermark(debt_bytes: u64, virgin_bytes: u64) -> bool {
+    debt_bytes <= virgin_bytes
+}
+
+/// Counter attribution for [`issue_device_ranges`]: the queued-reclaim
+/// worker and the trim venues share the issue engine but own separate
+/// engagement families (`block_free_trim_*` is the trim face; the
+/// per-block `block_free_{discards,file_punches}` ledger counts in BOTH —
+/// device-reclaimed blocks are one population regardless of venue).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IssueVenue {
+    ReclaimWorker,
+    Trim,
+}
+
+/// The per-mount debt drainer: owns the idle/pressure venues (the
+/// fstrim/defrag venue calls [`Self::drain_target_sync`] directly via
+/// `BackendRouter::trim_elided`). One detached worker per router, armed
+/// lazily on the first elided free (the `ReclaimQueue::ensure_worker`
+/// pattern, Weak-held). Venue law (KD-4.5):
+///
+/// * foreground active + debt within watermark ⇒ DEFER entirely (zero
+///   device commands during the row — the charter gate);
+/// * debt past the watermark ⇒ paced drain regardless of foreground
+///   (one batch per pass; counted `block_free_debt_pressure_drains`);
+/// * idle ⇒ drain to zero (substrate hygiene — idle target CPU is free);
+/// * fenced ⇒ cease permanently (the reclaimer's fence-halt law).
+pub struct DebtDrainer {
+    /// Targets that ever elided: device_path → allocator.
+    targets: scc::HashMap<String, Arc<BlockAllocator>>,
+    notify: Arc<tokio::sync::Notify>,
+    worker_armed: AtomicBool,
+    /// Fence + foreground probes ride the sibling reclaim queue (same
+    /// wiring sites; the drainer keeps its OWN foreground last-value so
+    /// the two workers' movement observations stay independent).
+    reclaim: Arc<ReclaimQueue>,
+    fg_last: AtomicU64,
+    batch_blocks: u64,
+}
+
+impl DebtDrainer {
+    pub fn new(reclaim: Arc<ReclaimQueue>) -> Arc<Self> {
+        let batch_blocks = reclaim.batch_blocks;
+        Arc::new(Self {
+            targets: scc::HashMap::new(),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            worker_armed: AtomicBool::new(false),
+            reclaim,
+            fg_last: AtomicU64::new(0),
+            batch_blocks,
+        })
+    }
+
+    /// Register an elided free's target and wake the venue worker.
+    pub fn record(self: &Arc<Self>, allocator: &Arc<BlockAllocator>, device_path: &str) {
+        if self.targets.read_sync(device_path, |_, _| ()).is_none() {
+            let _ = self
+                .targets
+                .insert_sync(device_path.to_string(), allocator.clone());
+        }
+        self.ensure_worker();
+        self.notify.notify_one();
+    }
+
+    /// Snapshot of the registered debt targets (trim venue).
+    pub(crate) fn targets_snapshot(&self) -> Vec<(String, Arc<BlockAllocator>)> {
+        let mut out = Vec::new();
+        self.targets.iter_sync(|k, v| {
+            out.push((k.clone(), v.clone()));
+            true
+        });
+        out
+    }
+
+    fn foreground_active(&self) -> bool {
+        let sig = self.reclaim.foreground_value();
+        let prev = self.fg_last.swap(sig, Ordering::AcqRel);
+        sig != prev
+    }
+
+    fn ensure_worker(self: &Arc<Self>) {
+        if self.worker_armed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.worker_armed.store(false, Ordering::Release);
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        let notify = self.notify.clone();
+        handle.spawn(async move {
+            loop {
+                notify.notified().await;
+                loop {
+                    let Some(d) = weak.upgrade() else { return };
+                    if d.reclaim.fence_halted() {
+                        return; // fenced: destructive commands cease permanently
+                    }
+                    let targets = d.targets_snapshot();
+                    let mut outstanding = 0u64;
+                    let mut drained_any = false;
+                    let mut deferred_any = false;
+                    let fg = d.foreground_active();
+                    for (device_path, allocator) in targets {
+                        let debt = allocator.elided_debt_bytes_local();
+                        if debt == 0 {
+                            continue;
+                        }
+                        outstanding += debt;
+                        let within = debt_within_watermark(debt, allocator.virgin_bytes());
+                        if fg && within {
+                            deferred_any = true;
+                            continue; // the row pays zero discards (KD-4.5)
+                        }
+                        if fg && !within {
+                            METRICS
+                                .block_free_debt_pressure_drains
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        // One paced batch per pass (idle passes loop back
+                        // immediately and converge to zero).
+                        let a = allocator.clone();
+                        let dev = device_path.clone();
+                        let max = d.batch_blocks as usize;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            drain_debt_sync(&a, &dev, max, false)
+                        })
+                        .await;
+                        drained_any = true;
+                    }
+                    let park = outstanding == 0;
+                    let defer_tick = deferred_any && !drained_any;
+                    // No Arc across the sleep (the health-worker sentinel
+                    // discipline).
+                    drop(d);
+                    if park {
+                        break; // park on notify
+                    }
+                    if defer_tick {
+                        // Deferred under foreground: coarse re-evaluation
+                        // tick (the reclaim worker's manners loop pattern).
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        });
+    }
+}
+
+impl Drop for DebtDrainer {
+    fn drop(&mut self) {
+        // Wake a parked worker so it observes the dead Weak and exits.
+        self.notify.notify_waiters();
+    }
+}
+
+/// Drain up to `max` debt blocks of one target synchronously (blocking
+/// ioctls — callers run this on the blocking pool). `full` trims the
+/// WHOLE free list (the fstrim face: the free list is the durable truth,
+/// debt is only the incremental tracker — KD-4.9). Returns
+/// `(blocks, bytes)` reclaimed.
+///
+/// Protocol per offset (KD-4.4): claim OUT of the free list (the
+/// allocation claim — losers skip: the offset was reused and owes
+/// nothing), register a live in-flight owner for the claim window (fsck
+/// C6 must never "complete" a mid-trim offset back onto the free list),
+/// issue, RETURN to the free list. Claim windows are bounded to one
+/// batch so the ENOSPC valve is never starved by a long trim.
+pub(crate) fn drain_debt_sync(
+    allocator: &Arc<BlockAllocator>,
+    device_path: &str,
+    max: usize,
+    full: bool,
+) -> (u64, u64) {
+    let candidates: Vec<(u64, u64)> = if full {
+        let chunk = allocator.chunk_size();
+        allocator
+            .free_block_indices()
+            .into_iter()
+            .map(|idx| (idx * chunk, chunk))
+            .collect()
+    } else {
+        allocator.take_debt_batch(max)
+    };
+    if candidates.is_empty() {
+        return (0, 0);
+    }
+
+    let mut total_blocks = 0u64;
+    let mut total_bytes = 0u64;
+    let batch = max.max(1);
+    for window in candidates.chunks(batch) {
+        // Claim phase: offsets leave the free list (and any lingering
+        // debt entry dies with the claim on the full-trim face).
+        let mut claimed: Vec<(u64, u64, InflightAllocGuard)> = Vec::new();
+        for &(offset, bytes) in window {
+            if full {
+                allocator.cancel_elided_debt(offset);
+            }
+            if let Some(guard) = allocator.claim_free_for_trim(offset) {
+                claimed.push((offset, bytes, guard));
+            }
+            // Lost claim: reused (or racing trim) — owes nothing.
+        }
+        if claimed.is_empty() {
+            continue;
+        }
+        claimed.sort_unstable_by_key(|(o, _, _)| *o);
+        let ranges: Vec<(u64, u64, u64)> = coalesce_ranges(&claimed);
+        let (blocks, bytes) = issue_device_ranges(device_path, &ranges, IssueVenue::Trim);
+        total_blocks += blocks;
+        total_bytes += bytes;
+        // Return phase: back onto the free list; guards drop here.
+        for (offset, _, _) in &claimed {
+            allocator.return_from_trim(*offset);
+        }
+    }
+    (total_blocks, total_bytes)
+}
+
+/// Coalesce sorted `(offset, bytes, guard)` claims into
+/// `(start, len, blocks)` ranges (the reclaim worker's adjacency rule).
+fn coalesce_ranges(sorted: &[(u64, u64, InflightAllocGuard)]) -> Vec<(u64, u64, u64)> {
+    let mut ranges: Vec<(u64, u64, u64)> = Vec::new();
+    for (offset, bytes, _) in sorted {
+        match ranges.last_mut() {
+            Some((start, len, k)) if *start + *len == *offset => {
+                *len += *bytes;
+                *k += 1;
+            }
+            _ => ranges.push((*offset, *bytes, 1)),
+        }
+    }
+    ranges
+}
+
 /// The production foreground device-activity signal (the manners law's
 /// input): a monotonic sum of DEVICE-plane movement — write-through /
 /// patch / staging bytes and device-read work. Deliberately NOT op
@@ -331,14 +663,22 @@ impl ReclaimQueue {
         let _ = self.fg_signal.set(sig);
     }
 
+    /// The raw foreground-signal value (injected or the METRICS
+    /// device-plane sum) — shared with the [`DebtDrainer`], which keeps
+    /// its OWN last-value so the two workers' movement observations stay
+    /// independent.
+    pub(crate) fn foreground_value(&self) -> u64 {
+        match self.fg_signal.get() {
+            Some(f) => f(),
+            None => device_activity_signal(),
+        }
+    }
+
     /// `true` ⇔ foreground device I/O moved since the worker's previous
     /// manners decision (the deferred-drain law's input). One counter
     /// sum + one swap per worker pass — never on the enqueue path.
     fn foreground_active(&self) -> bool {
-        let sig = match self.fg_signal.get() {
-            Some(f) => f(),
-            None => device_activity_signal(),
-        };
+        let sig = self.foreground_value();
         let prev = self.fg_last.swap(sig, Ordering::AcqRel);
         sig != prev
     }
@@ -662,25 +1002,6 @@ impl Drop for ReclaimQueue {
 /// incarnation seqlock).
 #[cfg(target_os = "linux")]
 fn reclaim_device_group(device_path: &str, group: &[ReclaimEntry]) {
-    use std::os::unix::fs::MetadataExt;
-    use std::os::unix::io::AsRawFd;
-
-    let Ok(file) = std::fs::OpenOptions::new().write(true).open(device_path) else {
-        METRICS
-            .block_free_reclaim_skipped
-            .fetch_add(group.len() as u64, Ordering::Relaxed);
-        return;
-    };
-    let mode = file.metadata().map(|m| m.mode()).unwrap_or(0);
-    let fd = file.as_raw_fd();
-    let op = free_reclaim_op(mode);
-    if matches!(op, FreeReclaimOp::Skip) {
-        METRICS
-            .block_free_reclaim_skipped
-            .fetch_add(group.len() as u64, Ordering::Relaxed);
-        return;
-    }
-
     // Coalesce adjacent ranges: (start, len, blocks_covered).
     let mut ranges: Vec<(u64, u64, u64)> = Vec::new();
     for e in group {
@@ -692,15 +1013,60 @@ fn reclaim_device_group(device_path: &str, group: &[ReclaimEntry]) {
             _ => ranges.push((e.offset, e.size, 1)),
         }
     }
+    issue_device_ranges(device_path, &ranges, IssueVenue::ReclaimWorker);
+}
 
-    for (start, len, k) in ranges {
+#[cfg(not(target_os = "linux"))]
+fn reclaim_device_group(_device_path: &str, group: &[ReclaimEntry]) {
+    METRICS
+        .block_free_reclaim_skipped
+        .fetch_add(group.len() as u64, Ordering::Relaxed);
+}
+
+/// The shared device-reclaim issue engine (the shim-write-amplification
+/// classification, verbatim): `PUNCH_HOLE` on regular-file backings,
+/// `BLKDISCARD` on block devices, refused/unsupported SKIPPED-and-counted
+/// — never a zeroing write. Counts the per-block device-reclaim ledger
+/// (`block_free_{discards,file_punches}` + bytes + the per-COMMAND
+/// economy counter) for every venue; the Trim venue additionally counts
+/// its own engagement family (`block_free_trim_{discards,bytes}`).
+/// Returns `(ok_blocks, ok_bytes)`.
+#[cfg(target_os = "linux")]
+fn issue_device_ranges(
+    device_path: &str,
+    ranges: &[(u64, u64, u64)],
+    venue: IssueVenue,
+) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+
+    let total_blocks: u64 = ranges.iter().map(|(_, _, k)| *k).sum();
+    let Ok(file) = std::fs::OpenOptions::new().write(true).open(device_path) else {
+        METRICS
+            .block_free_reclaim_skipped
+            .fetch_add(total_blocks, Ordering::Relaxed);
+        return (0, 0);
+    };
+    let mode = file.metadata().map(|m| m.mode()).unwrap_or(0);
+    let fd = file.as_raw_fd();
+    let op = free_reclaim_op(mode);
+    if matches!(op, FreeReclaimOp::Skip) {
+        METRICS
+            .block_free_reclaim_skipped
+            .fetch_add(total_blocks, Ordering::Relaxed);
+        return (0, 0);
+    }
+
+    let mut ok_blocks = 0u64;
+    let mut ok_bytes = 0u64;
+    for &(start, len, k) in ranges {
         // Per-COMMAND economy counter (contract 11): blocks ÷ commands is
         // the live coalesce factor; the per-block ledger stays on the
         // punch/discard/skip counters below.
         METRICS
             .block_free_reclaim_commands
             .fetch_add(1, Ordering::Relaxed);
-        match op {
+        let issued = match op {
             FreeReclaimOp::FilePunch => {
                 let r = unsafe {
                     libc::fallocate(
@@ -717,10 +1083,9 @@ fn reclaim_device_group(device_path: &str, group: &[ReclaimEntry]) {
                     METRICS
                         .block_free_punch_bytes
                         .fetch_add(len, Ordering::Relaxed);
+                    true
                 } else {
-                    METRICS
-                        .block_free_reclaim_skipped
-                        .fetch_add(k, Ordering::Relaxed);
+                    false
                 }
             }
             FreeReclaimOp::BdevDiscard => {
@@ -734,22 +1099,44 @@ fn reclaim_device_group(device_path: &str, group: &[ReclaimEntry]) {
                     METRICS
                         .block_free_discard_bytes
                         .fetch_add(len, Ordering::Relaxed);
+                    true
                 } else {
-                    // Unsupported/refused deallocate: skip loud-once in
-                    // the counter, NEVER a zeroing-write fallback.
-                    METRICS
-                        .block_free_reclaim_skipped
-                        .fetch_add(k, Ordering::Relaxed);
+                    false
                 }
             }
             FreeReclaimOp::Skip => unreachable!("filtered above"),
+        };
+        if issued {
+            ok_blocks += k;
+            ok_bytes += len;
+            if venue == IssueVenue::Trim {
+                METRICS
+                    .block_free_trim_discards
+                    .fetch_add(k, Ordering::Relaxed);
+                METRICS
+                    .block_free_trim_bytes
+                    .fetch_add(len, Ordering::Relaxed);
+            }
+        } else {
+            // Unsupported/refused reclaim: skip loud-once in the counter,
+            // NEVER a zeroing-write fallback.
+            METRICS
+                .block_free_reclaim_skipped
+                .fetch_add(k, Ordering::Relaxed);
         }
     }
+    (ok_blocks, ok_bytes)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn reclaim_device_group(_device_path: &str, group: &[ReclaimEntry]) {
+fn issue_device_ranges(
+    _device_path: &str,
+    ranges: &[(u64, u64, u64)],
+    _venue: IssueVenue,
+) -> (u64, u64) {
+    let total_blocks: u64 = ranges.iter().map(|(_, _, k)| *k).sum();
     METRICS
         .block_free_reclaim_skipped
-        .fetch_add(group.len() as u64, Ordering::Relaxed);
+        .fetch_add(total_blocks, Ordering::Relaxed);
+    (0, 0)
 }

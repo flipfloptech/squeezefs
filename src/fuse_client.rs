@@ -3220,6 +3220,29 @@ pub struct Metrics {
     /// (the field ledger), this counts per-COMMAND, so
     /// blocks ÷ commands is the live coalesce factor (contract 11).
     pub block_free_reclaim_commands: Align64<AtomicU64>,
+    // Idea 4 — discard elision until pressure (rewrite program P0,
+    // design-rewrite-program §3; tests/discard_elision_tests.rs). Ledger
+    // identity: `queued + elided ≡ terminal frees`.
+    /// Terminal frees whose device discard was ELIDED into the debt
+    /// tracker (bdev-class backings, `SQUEEZEFS_DISCARD_ELISION`
+    /// default-on): finish_free immediate, ZERO device commands — the
+    /// charter's zero-mid-row-discards vehicle.
+    pub block_free_reclaim_elided: Align64<AtomicU64>,
+    /// GAUGE: outstanding elided-discard debt bytes (unreturned thin
+    /// space). Returns toward 0 under reuse (claim-cancels-debt) and the
+    /// trim venues; RAM-only — lost debt is re-covered by the next full
+    /// trim (the free list is the durable truth).
+    pub block_free_elided_debt_bytes: Align64<AtomicU64>,
+    /// Blocks reclaimed at the TRIM venues (idle / pressure / fstrim /
+    /// defrag) — the `block_free_discards` twin for deferred space
+    /// return. Growth DURING a measured row means elision regressed.
+    pub block_free_trim_discards: Align64<AtomicU64>,
+    /// Bytes reclaimed at the trim venues.
+    pub block_free_trim_bytes: Align64<AtomicU64>,
+    /// Watermark-forced drains: the debt exceeded the device's virgin
+    /// tail (KD-4.6) and the paced drain engaged under foreground.
+    /// ≈ 0 on stores with fresh headroom.
+    pub block_free_debt_pressure_drains: Align64<AtomicU64>,
     /// Seed-time memset bytes elided by §5.3 coverage tracking: for every
     /// Fresh accumulation buffer reaching content-validity, the block size
     /// minus the complement bytes actually zeroed. Sequential fills elide
@@ -5586,6 +5609,14 @@ impl SqueezefsFilesystem {
                 "block_free_reclaim_cap_parks": METRICS.block_free_reclaim_cap_parks.load(Ordering::Relaxed),
                 "block_free_reclaim_cap_overflow": METRICS.block_free_reclaim_cap_overflow.load(Ordering::Relaxed),
                 "block_free_reclaim_commands": METRICS.block_free_reclaim_commands.load(Ordering::Relaxed),
+                // Idea 4 — discard elision (design-rewrite-program §3):
+                // queued + elided ≡ terminal frees; trim_* is the
+                // deferred-space-return face.
+                "block_free_reclaim_elided": METRICS.block_free_reclaim_elided.load(Ordering::Relaxed),
+                "block_free_elided_debt_bytes": METRICS.block_free_elided_debt_bytes.load(Ordering::Relaxed),
+                "block_free_trim_discards": METRICS.block_free_trim_discards.load(Ordering::Relaxed),
+                "block_free_trim_bytes": METRICS.block_free_trim_bytes.load(Ordering::Relaxed),
+                "block_free_debt_pressure_drains": METRICS.block_free_debt_pressure_drains.load(Ordering::Relaxed),
                 // RW1 rand-write device-byte ledger (design-random-small-
                 // writes §1.2 buckets; always-on — the G-RW2 gate's
                 // attribution source).

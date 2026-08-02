@@ -246,7 +246,8 @@ impl Fixture {
         std::fs::write(&path, b"x").expect("cred file");
         let f = std::fs::File::open(&path).expect("open cred");
         let blob = BootstrapBlob::decode(&self.host.bootstrap_blob()).expect("blob decodes");
-        Session::establish(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid()).expect("session must establish")
+        Session::establish(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid())
+            .expect("session must establish")
     }
 
     async fn create_file(&self, name: &str) -> (u64, OwnedFd) {

@@ -245,7 +245,7 @@ fn path_listen(path: &std::path::Path) -> OwnedFd {
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
     let bytes = path.as_os_str().as_bytes();
-    assert!(bytes.len() + 1 <= addr.sun_path.len(), "path fits sun_path");
+    assert!(bytes.len() < addr.sun_path.len(), "path fits sun_path");
     for (i, b) in bytes.iter().enumerate() {
         addr.sun_path[i] = *b as libc::c_char;
     }

@@ -450,9 +450,6 @@ impl Session {
         mount_uid: u32,
         op_timeout: Duration,
     ) -> Result<Session, SessionError> {
-        // VAL-4 (P0): the daemon-authentication ladder consumes this in
-        // the following commit — red-first, this is pure plumbing.
-        let _ = mount_uid;
         // Client-side KD-7 pre-check: skip the doomed round trip (the
         // daemon enforces the same law authoritatively).
         let allow_dev = std::env::var("SQUEEZEFS_IPC_ALLOW_DEV").is_ok_and(|v| v == "1");
@@ -471,13 +468,48 @@ impl Session {
         // the identical protocol; failure of both is the
         // bind_refused{socket} outcome.
         // (Last-attempt error semantics, like a connect retry chain.)
+        //
+        // VAL-4 step 1 (P0): the PATH rung is a filesystem rendezvous the
+        // blob names, so it is only followed when it resolves under a
+        // directory an accepted daemon could own ([`path_rung_trusted`]).
+        // The abstract rung needs no such screen (no filesystem residue,
+        // no permission bits) — for both rungs the peer check below is
+        // what actually authorizes.
         let sock = match connect_abstract(&blob.socket) {
             Ok(fd) => fd,
-            Err(_) if !blob.socket_path.is_empty() => connect_path(&blob.socket_path)?,
+            Err(_) if !blob.socket_path.is_empty() => {
+                path_rung_trusted(&blob.socket_path, mount_uid)?;
+                connect_path(&blob.socket_path)?
+            }
             Err(e) => return Err(e),
         };
         let sock_guard = FdGuard(sock);
         set_recv_timeout(sock, CTL_RECV_TIMEOUT);
+
+        // VAL-4 step 2 (P0) — AUTHENTICATE THE DAEMON BEFORE THE
+        // CREDENTIAL FD IS SENT. Everything about this rendezvous came
+        // from the mount (§5.2: the blob is answered by the filesystem),
+        // so the shim independently establishes that whoever accepted
+        // the connection is either root or the owner of the mount root
+        // (`mount_uid` — the `fstat` the interposer already performed on
+        // the credential fd). A daemon presenting any other uid gets
+        // nothing: no HELLO, no `SCM_RIGHTS`, and the fd stays kernel-
+        // served (§5.4.2 fallback-is-correctness).
+        //
+        // Deliberately NO third disjunct (e.g. "or our own uid"): the
+        // conservative predicate can only cost interception on mounts
+        // served by a third-party service account, and the cost is
+        // passthrough — never an app-visible error. The daemon's own
+        // SO_PEERCRED check on us (§5.2) is the mirror of this one; the
+        // possession-of-the-fd argument only holds if BOTH ends know who
+        // they are talking to.
+        let peer_uid = peer_uid(sock)?;
+        if peer_uid != 0 && peer_uid != mount_uid {
+            return Err(SessionError::PeerUntrusted {
+                peer_uid,
+                mount_uid,
+            });
+        }
 
         // SAFETY: plain getpid/getuid.
         let (pid, uid) = unsafe { (libc::getpid() as u32, libc::getuid()) };
@@ -500,6 +532,16 @@ impl Session {
         };
         let memfd = memfd.ok_or(SessionError::Protocol)?;
         let memfd_guard = FdGuard(memfd);
+
+        // VAL-4 step 3 (P0): the session memfd must carry the seals the
+        // daemon's `create_session_shm` applies. Without F_SEAL_SHRINK a
+        // hostile (or buggy) peer can `ftruncate` the file out from under
+        // this mapping AFTER we validated the header — every later slot /
+        // arena access then faults SIGBUS inside the app's own thread,
+        // which is neither a POSIX-legal outcome nor recoverable by the
+        // §5.4.1 ladder. F_SEAL_GROW + F_SEAL_SEAL keep the geometry and
+        // the seal set itself immutable for the session's life.
+        require_seals(memfd)?;
         let layout = SessionLayout::compute(&geometry).map_err(|_| SessionError::Protocol)?;
 
         // Shared mapping of the sealed memfd, full layout length —
@@ -1517,6 +1559,94 @@ fn connect_path(path: &str) -> Result<RawFd, SessionError> {
         return Err(SessionError::Socket(errno()));
     }
     Ok(guard.release())
+}
+
+/// VAL-4 step 2: the connected peer's uid (`SO_PEERCRED`). A failure to
+/// read it is a refusal, never an assumption — the kernel is the only
+/// source of the identity on the other end of this socket.
+fn peer_uid(sock: RawFd) -> Result<u32, SessionError> {
+    // SAFETY: getsockopt(SO_PEERCRED) into a correctly-sized ucred.
+    let (rc, cred) = unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = libc::getsockopt(
+            sock,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        );
+        (rc, cred)
+    };
+    if rc != 0 {
+        return Err(SessionError::Socket(errno()));
+    }
+    Ok(cred.uid)
+}
+
+/// The seal set the daemon applies to every session memfd
+/// (`create_session_shm`): geometry immutable, size immutable both ways,
+/// seal set closed.
+const REQUIRED_SEALS: libc::c_int = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
+
+/// VAL-4 step 3: every required seal must be present on the received
+/// memfd before it is mapped and trusted.
+fn require_seals(memfd: RawFd) -> Result<(), SessionError> {
+    // SAFETY: F_GET_SEALS on a received (owned) fd; no memory is touched.
+    let seals = unsafe { libc::fcntl(memfd, libc::F_GET_SEALS) };
+    if seals < 0 || seals & REQUIRED_SEALS != REQUIRED_SEALS {
+        return Err(SessionError::Unsealed { seals });
+    }
+    Ok(())
+}
+
+/// VAL-4 step 1: is the advertised path rendezvous one an accepted daemon
+/// could own?
+///
+/// The socket's PARENT directory (opened `O_DIRECTORY|O_NOFOLLOW|O_PATH`,
+/// so a swapped symlink cannot redirect the check) must be
+///
+/// * owned by uid 0 or by `mount_uid` — exactly the identities the peer
+///   ladder accepts as the daemon (the spec's "root-owned directory",
+///   widened by the one disjunct that keeps non-root mounts' own runtime
+///   dir — `$XDG_RUNTIME_DIR/squeezefs`, `/tmp/squeezefs-il-<uid>` —
+///   usable; every other owner is refused), and
+/// * not group- or world-writable (`mode & 0o022 == 0`), so nobody else
+///   can replace the socket inode with their own listener.
+///
+/// This is the same predicate the daemon applies before binding
+/// (`ipc_host::path_listen`): if either end's view of the directory is
+/// untrusted, the rung is not used. The abstract rung is unaffected.
+fn path_rung_trusted(path: &str, mount_uid: u32) -> Result<(), SessionError> {
+    let Some(dir) = std::path::Path::new(path).parent() else {
+        return Err(SessionError::UntrustedRendezvous);
+    };
+    let Ok(cdir) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) else {
+        return Err(SessionError::UntrustedRendezvous);
+    };
+    // SAFETY: open(2) with a NUL-terminated path; ownership taken below.
+    let fd = unsafe {
+        libc::open(
+            cdir.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(SessionError::UntrustedRendezvous);
+    }
+    let guard = FdGuard(fd);
+    // SAFETY: fstat into a zeroed buf on the fd just opened (O_PATH fds
+    // are valid fstat targets).
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: plain fstat(2).
+    let rc = unsafe { libc::fstat(guard.0, &mut st) };
+    if rc != 0 {
+        return Err(SessionError::UntrustedRendezvous);
+    }
+    if (st.st_uid != 0 && st.st_uid != mount_uid) || st.st_mode & 0o022 != 0 {
+        return Err(SessionError::UntrustedRendezvous);
+    }
+    Ok(())
 }
 
 fn set_recv_timeout(fd: RawFd, timeout: Duration) {

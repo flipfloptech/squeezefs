@@ -2221,17 +2221,79 @@ fn path_sockaddr(path: &std::path::Path) -> io::Result<(libc::sockaddr_un, libc:
 }
 
 /// OQ-6: bind + listen a filesystem-path `SOCK_SEQPACKET` socket.
-/// The dir is created 0755 if missing; a same-name stale file is OUR
-/// crash residue (names embed pid+random — never a live foreign
-/// daemon) and is replaced; the socket file goes 0666 (connecting is
-/// not a credential — SO_PEERCRED + the fd screen are the boundary).
+///
+/// **VAL-4 (pre-RC spec §3, P0) — the directory is screened, never
+/// conjured.** The path rung is a filesystem rendezvous any process in
+/// the namespace can see, and the default non-root location lives under
+/// world-writable `/tmp`; a directory an attacker owns lets them place
+/// their own listener at the name the mount advertises. So:
+///
+/// 1. create it 0755 if missing (`DirBuilder` + `mode` — never the
+///    umask's guess), then
+/// 2. open it `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` and `fstat` the **fd**:
+///    `st_uid == geteuid()` (we must own the rendezvous) and
+///    `st_mode & 0o022 == 0` (nobody else may create/replace entries),
+/// 3. do every subsequent operation **through that dirfd**
+///    (`unlinkat`/`bind` via `/proc/self/fd/<dirfd>/<name>`/`fchmodat`),
+///    so a directory swapped after the check cannot redirect them, and
+/// 4. **refuse** (loud `Err`) rather than fall back anywhere else — the
+///    caller degrades to abstract-only, which is a working rendezvous
+///    for every same-netns client.
+///
+/// The socket file itself stays 0666 (connecting is not a credential —
+/// SO_PEERCRED + the §5.2 fd screen are the boundary); a same-name stale
+/// file is OUR crash residue (names embed pid+random) and is replaced.
 fn path_listen(dir: &std::path::Path, path: &std::path::Path) -> io::Result<OwnedFd> {
-    std::fs::create_dir_all(dir)?;
-    match std::fs::remove_file(path) {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    match std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(dir)
+    {
         Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "socket path has no file name")
+    })?;
+    // The screened handle: everything below rides THIS inode, not the
+    // path (a swap after the check cannot redirect an open fd).
+    let dirfd = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)?;
+    {
+        use std::os::unix::fs::MetadataExt;
+        let md = dirfd.metadata()?;
+        // SAFETY: geteuid is trivially safe.
+        let euid = unsafe { libc::geteuid() };
+        if md.uid() != euid || md.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "socket directory {} is uid {} mode {:o} — refusing to bind a \
+                     rendezvous we do not exclusively own (need uid {euid}, no \
+                     group/world write)",
+                    dir.display(),
+                    md.uid(),
+                    md.mode() & 0o7777,
+                ),
+            ));
+        }
+    }
+    // dirfd-relative names for bind/chmod/unlink. AF_UNIX has no
+    // `bindat(2)`: `/proc/self/fd/<dirfd>/<name>` is the kernel-provided
+    // equivalent — it resolves through the ALREADY-OPEN, already-screened
+    // directory inode, so no ancestor rename/symlink swap can move it.
+    let cname = std::ffi::CString::new(name.as_encoded_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket name has a NUL"))?;
+    // SAFETY: unlinkat on our own dirfd with a NUL-terminated name;
+    // ENOENT is the normal (no residue) case.
+    unsafe { libc::unlinkat(dirfd.as_raw_fd(), cname.as_ptr(), 0) };
+    let dir_rel = std::path::PathBuf::from(format!("/proc/self/fd/{}", dirfd.as_raw_fd()));
+    let bind_path = dir_rel.join(name);
     // SAFETY: socket(2); ownership taken immediately.
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
@@ -2239,7 +2301,7 @@ fn path_listen(dir: &std::path::Path, path: &std::path::Path) -> io::Result<Owne
     }
     // SAFETY: fresh owned fd.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let (addr, len) = path_sockaddr(path)?;
+    let (addr, len) = path_sockaddr(&bind_path)?;
     // SAFETY: bind with a correctly-sized sockaddr_un.
     if unsafe {
         libc::bind(
@@ -2251,9 +2313,9 @@ fn path_listen(dir: &std::path::Path, path: &std::path::Path) -> io::Result<Owne
     {
         return Err(io::Error::last_os_error());
     }
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
+    // SAFETY: fchmodat on our own dirfd + NUL-terminated name.
+    if unsafe { libc::fchmodat(dirfd.as_raw_fd(), cname.as_ptr(), 0o666, 0) } != 0 {
+        return Err(io::Error::last_os_error());
     }
     // SAFETY: listen(2).
     if unsafe { libc::listen(fd.as_raw_fd(), 64) } != 0 {

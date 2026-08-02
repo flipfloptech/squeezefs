@@ -224,8 +224,8 @@ fn sink_host_geo(
         .open(&path)
         .unwrap();
     let blob = BootstrapBlob::decode(&host.bootstrap_blob()).unwrap();
-    let session =
-        Session::establish(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid()).expect("session establishes");
+    let session = Session::establish(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid())
+        .expect("session establishes");
     let bind = session.bind(f.as_raw_fd()).expect("bind succeeds");
     (host, dir, f, session, bind.binding_id)
 }
@@ -556,8 +556,9 @@ async fn stalled_serve_times_out_poisons_and_falls_through() {
         .unwrap();
 
     let blob = BootstrapBlob::decode(&host.bootstrap_blob()).unwrap();
-    let session = Session::establish_with_op_timeout_ms(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid(), 200)
-        .expect("session establishes");
+    let session =
+        Session::establish_with_op_timeout_ms(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid(), 200)
+            .expect("session establishes");
     let bind = session.bind(f.as_raw_fd()).expect("bind succeeds");
 
     let start = std::time::Instant::now();
@@ -827,8 +828,8 @@ async fn new_session_on_a_busy_thread_is_served_promptly() {
         .open(&path_b)
         .unwrap();
     let blob = BootstrapBlob::decode(&host.bootstrap_blob()).unwrap();
-    let session_b =
-        Session::establish(&blob, f_b.as_raw_fd(), TEST_COMMIT, my_uid()).expect("session B establishes");
+    let session_b = Session::establish(&blob, f_b.as_raw_fd(), TEST_COMMIT, my_uid())
+        .expect("session B establishes");
     let bind_b = session_b.bind(f_b.as_raw_fd()).expect("bind B succeeds");
 
     let start = std::time::Instant::now();
@@ -943,9 +944,17 @@ async fn establish_falls_back_to_the_path_socket_when_abstract_is_unreachable() 
     drop(session);
 
     // Both rungs dead ⇒ Socket error (the bind_refused{socket} path).
+    // The dead path must live in a TRUSTED directory (VAL-4 step 1
+    // screens the rendezvous before connecting — an untrusted dir
+    // refuses earlier, with its own class, pinned below).
     let mut dead = fx.blob();
     dead.socket = format!("sqz-il0-nowhere2-{}", std::process::id());
-    dead.socket_path = "/tmp/sqz-il0-does-not-exist.sock".to_string();
+    dead.socket_path = fx
+        ._sockdir
+        .path()
+        .join("does-not-exist.sock")
+        .to_string_lossy()
+        .into_owned();
     let err = tokio::task::block_in_place(|| {
         match Session::establish(&dead, f.as_raw_fd(), TEST_COMMIT, my_uid()) {
             Ok(_) => panic!("no rendezvous must refuse"),
@@ -955,6 +964,22 @@ async fn establish_falls_back_to_the_path_socket_when_abstract_is_unreachable() 
     assert!(
         matches!(err, SessionError::Socket(_)),
         "both-rungs-dead is a socket refusal, got {err:?}"
+    );
+
+    // VAL-4 step 1: the same shape in a world-writable directory (the
+    // pre-RC `/tmp` rendezvous) is refused WITHOUT a connect attempt —
+    // the squattable-name class, distinct from "nobody is listening".
+    let mut squat = dead.clone();
+    squat.socket_path = "/tmp/sqz-il0-does-not-exist.sock".to_string();
+    let err = tokio::task::block_in_place(|| {
+        match Session::establish(&squat, f.as_raw_fd(), TEST_COMMIT, my_uid()) {
+            Ok(_) => panic!("a squattable rendezvous must refuse"),
+            Err(e) => e,
+        }
+    });
+    assert!(
+        matches!(err, SessionError::UntrustedRendezvous),
+        "a world-writable rendezvous dir refuses at step 1, got {err:?}"
     );
     fx.host.shutdown();
 }
@@ -1114,8 +1139,9 @@ fn large_write_pipelines_all_chunks_before_waiting() {
     // Short deadline so the RED shape (serial chunk stranding) fails fast
     // instead of the 30 s default.
     let blob = BootstrapBlob::decode(&host.bootstrap_blob()).unwrap();
-    let session = Session::establish_with_op_timeout_ms(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid(), 2_000)
-        .expect("session establishes");
+    let session =
+        Session::establish_with_op_timeout_ms(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid(), 2_000)
+            .expect("session establishes");
     let bind = session.bind(f.as_raw_fd()).expect("bind succeeds");
 
     let buf = deterministic_bytes(1024 * 1024, 4);
@@ -1367,8 +1393,9 @@ fn large_read_pipelines_all_chunks_before_waiting() {
     let (host, _dir, f, _default_session, _bid) =
         sink_host_geo("wide-read-pipeline", sink.clone(), wide_geometry());
     let blob = BootstrapBlob::decode(&host.bootstrap_blob()).unwrap();
-    let session = Session::establish_with_op_timeout_ms(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid(), 2_000)
-        .expect("session establishes");
+    let session =
+        Session::establish_with_op_timeout_ms(&blob, f.as_raw_fd(), TEST_COMMIT, my_uid(), 2_000)
+            .expect("session establishes");
     let bind = session.bind(f.as_raw_fd()).expect("bind succeeds");
 
     let mut buf = vec![0u8; 1024 * 1024];

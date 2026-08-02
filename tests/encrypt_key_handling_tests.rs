@@ -150,8 +150,9 @@ fn key_file_refuses_group_or_other_permissions() {
     for mode in [0o640u32, 0o604, 0o660, 0o666, 0o644, 0o601] {
         let p = key_file(&d, &format!("k{mode:o}"), &material_a());
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
-        let err = keyfile::read_key_file(&p)
-            .expect_err(&format!("mode {mode:o} must be refused — group/other can read the key"));
+        let err = keyfile::read_key_file(&p).expect_err(&format!(
+            "mode {mode:o} must be refused — group/other can read the key"
+        ));
         assert!(
             err.contains("chmod 600") && err.contains(&format!("{mode:o}")),
             "refusal must name the observed mode and the remedy, got: {err}"
@@ -276,7 +277,11 @@ fn key_ref_carries_only_a_salt_and_an_id() {
     // The reference is the whole persisted surface: three public fields.
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
-    assert_eq!(keys.len(), 3, "unexpected fields in the key reference: {keys:?}");
+    assert_eq!(
+        keys.len(),
+        3,
+        "unexpected fields in the key reference: {keys:?}"
+    );
 }
 
 #[test]
@@ -366,7 +371,11 @@ fn an_encrypted_block_round_trips_and_a_foreign_key_cannot_read_it() {
     st.init_scratch_pool(4 * 1024 * 1024);
     let payload = bytes::Bytes::from(vec![0x5Au8; 256 * 1024]);
     let image = st.process_write(payload.clone()).expect("write transform");
-    assert_ne!(&image[..], &payload[..], "the stored image must be transformed");
+    assert_ne!(
+        &image[..],
+        &payload[..],
+        "the stored image must be transformed"
+    );
     let back = st.process_read(&image).expect("read transform");
     assert_eq!(&*back, payload.as_ref());
 
@@ -438,7 +447,9 @@ fn a_legacy_config_still_deserializes_so_the_refusal_can_name_it() {
 #[test]
 fn a_pre_kw1_encrypted_volume_refuses_with_an_exact_remedy() {
     let mut c = cfg("aes256gcm-rsa", None);
-    c.encrypt_key = Some(keyfile::RedactedSecret::new("-----BEGIN RSA PRIVATE KEY-----x".into()));
+    c.encrypt_key = Some(keyfile::RedactedSecret::new(
+        "-----BEGIN RSA PRIVATE KEY-----x".into(),
+    ));
     let msg = keyfile::legacy_encrypted_volume_refusal(&c)
         .expect("an RSA-era encrypted volume must refuse to mount");
     for needle in ["reformat", "squeezefs format", "--encrypt-key", "7d1ec2e1"] {
@@ -543,7 +554,11 @@ fn an_encrypted_volume_with_no_key_source_refuses_naming_every_source() {
     assert!(err.contains("--encrypt-key"), "{err}");
     assert!(err.contains(KEY_FILE_ENV), "{err}");
     assert!(
-        err.contains(&keyfile::default_key_path(&vk.key_id_hex()).display().to_string()),
+        err.contains(
+            &keyfile::default_key_path(&vk.key_id_hex())
+                .display()
+                .to_string()
+        ),
         "{err}"
     );
 }
@@ -722,8 +737,8 @@ fn format_refuses_an_encrypted_volume_with_no_key_and_a_key_with_no_algo() {
         .output()
         .unwrap();
     assert!(!out.status.success(), "encryption with no key must refuse");
-    let err = String::from_utf8_lossy(&out.stderr).to_string()
-        + &String::from_utf8_lossy(&out.stdout);
+    let err =
+        String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
     assert!(err.contains("--encrypt-key"), "{err}");
 
     let out = Command::new(bin())
@@ -742,10 +757,14 @@ fn fuse_available() -> bool {
 }
 
 fn which_fusermount() -> Option<PathBuf> {
-    ["/usr/bin/fusermount3", "/bin/fusermount3", "/usr/local/bin/fusermount3"]
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists())
+    [
+        "/usr/bin/fusermount3",
+        "/bin/fusermount3",
+        "/usr/local/bin/fusermount3",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|p| p.exists())
 }
 
 struct Mount {
@@ -756,7 +775,10 @@ struct Mount {
 
 impl Drop for Mount {
     fn drop(&mut self) {
-        let _ = Command::new("fusermount3").arg("-uz").arg(&self.mnt).status();
+        let _ = Command::new("fusermount3")
+            .arg("-uz")
+            .arg(&self.mnt)
+            .status();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

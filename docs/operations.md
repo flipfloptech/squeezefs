@@ -142,6 +142,8 @@ SqueezeFS moves **always forward** — no backwards compatibility. Refusals are 
 
 > **⚠️ Pre-fix compressed/encrypted volumes — refused (REFORMAT REQUIRED).** Volumes formatted with `--compression`/`--encrypt-algo` before the FIND-RW4-A incompressible-block fix cannot hold worst-case stored images; mounts refuse with *"compressed/encrypted volume geometry cannot hold incompressible blocks (FIND-RW4-A) … refusing to mount"* (full-size incompressible blocks on such volumes were never readable — the refusal names the fix). Reformat with a current binary: `format` now reserves per-chunk headroom on transformed volumes (clamping the block size loudly when needed), and compression became **best-effort per block** — incompressible blocks are stored raw (`compress_stored_raw` counts them in `.stats`).
 
+> **⚠️ Pre-KW-1 encrypted volumes — refused (REFORMAT REQUIRED).** Volumes formatted with `--encrypt-algo` before the key-handling fix wrapped their data keys with RSA-OAEP, whose implementation (`rsa 0.9.x`, RUSTSEC-2023-0071 "Marvin", no fixed release) has been removed from squeezefs. Such a volume (no key reference in its format config) refuses to mount, naming the remedy: copy the data off with a binary at or before commit `7d1ec2e1`, `squeezefs format --force --encrypt-algo aes256gcm --encrypt-key <path>`, copy back. Note the defect this replaces — `--encrypt-key` was documented as a path but consumed as PEM *content*, so volumes formatted the documented way never accepted a single write and carry no data; the usage that did work stored the key **in cleartext on the volume it encrypted**, so treat any such key as compromised. Unencrypted volumes are unaffected.
+
 > **⚠️ Staging directories are generation-bound.** Staging/cache dirs are stamped with the filesystem generation (the v3 superblock uuid set). A mount that finds staged content from a **dead generation** (e.g. after a reformat over live staging dirs) wipes it with one loud `STAGING GENERATION MISMATCH` line and counts `staging_generation_discards` in `.stats` — staged writes stamped by the old generation are gone **by design** (reformat discards data).
 
 > **⚠️ Cache/staging paths are format-declared.** `mount --disk-cache-paths` is refused loudly (never silently ignored). Change paths with the admin op `squeezefs config set-cache-paths <sqmeta-uri> <paths...>` (guarded like `format`: refused while any client has the volume mounted; the new dirs are wiped so the next mount stamps a fresh staging generation). Read them back with `config get-cache-paths`. A filesystem formatted without `--disk-cache-paths` is **permanently cache-less**.
@@ -176,7 +178,7 @@ squeezefs format sqmeta://<meta_dev> [sqmeta://...] sqdata://<data_dev> [sqdata:
 - `--capacity <bytes>`: Formatted capacity (default: the summed physical size of the data volumes). May be **lower** than physical (useful for testing); values above physical are refused — thin-provision underneath via LVM/fabric instead.
 - `--inodes <count>`: Hard quota limit for number of inodes (default: `1000000`).
 - `--disk-cache-paths <paths>`: Comma-separated paths to NVMe cache staging directories. **Declared here, at format** — recorded in the format config as the single source of truth. Omit it and the filesystem is **permanently cache-less**: mounts run with RAM tiers + direct block I/O only (no NVMe staging/read-cache tier). Change later with `squeezefs config set-cache-paths`.
-- `--compression <lz4|zstd|none>` / `--encrypt-algo <aes256gcm-rsa|chacha20-rsa|none>` / `--encrypt-key <pem>`: transparent per-volume compression / client-side encryption (see [Transparent compression & encryption](#transparent-compression--encryption)).
+- `--compression <lz4|zstd|none>` / `--encrypt-algo <aes256gcm|chacha20|none>` / `--encrypt-key <path>` (`-` = stdin): transparent per-volume compression / client-side encryption. `--encrypt-key` names a key **file** — never the key itself, which would land on `/proc/<pid>/cmdline` (see [Transparent compression & encryption](#transparent-compression--encryption)).
 - `--mem-cache-size` / `--disk-cache-size` / `--{read,write}-cache-size` / `--{read,write}-mem-cache-size`: cache budget defaults recorded in the format config (overridable per mount).
 - `-f, --force`: Force formatting even if a squeezefs volume is already detected (this is also the reformat path for refused legacy volumes — destroys old contents).
 - `--full`: Performs full block-aligned zero-wiping of the backing device capacity with a progress bar (default is quick-format).
@@ -246,7 +248,23 @@ squeezefs config get-cache-paths sqmeta://<meta_dev>
 
 ### Transparent compression & encryption
 
-Optional per-volume transforms declared at format: `--compression lz4|zstd` and `--encrypt-algo aes256gcm-rsa|chacha20-rsa` (RSA-wrapped symmetric keys via `--encrypt-key`), applied across all three write layouts. Compression is **best-effort per block**: an incompressible block is stored raw (frame-flagged, counted as `compress_stored_raw` in `.stats`) instead of expanding — and transformed volumes reserve per-chunk headroom at format so worst-case images always fit (see [Breaking changes](#breaking-changes--migration-notes)).
+Optional per-volume transforms declared at format: `--compression lz4|zstd` and `--encrypt-algo aes256gcm|chacha20`, applied across all three write layouts. Compression is **best-effort per block**: an incompressible block is stored raw (frame-flagged, counted as `compress_stored_raw` in `.stats`) instead of expanding — and transformed volumes reserve per-chunk headroom at format so worst-case images always fit (see [Breaking changes](#breaking-changes--migration-notes)).
+
+**The encryption key never touches the volume it protects, and never rides `argv`** (design: `docs/design-key-handling.md`). Generate one, then keep it somewhere the daemon can read and nobody else can:
+
+```bash
+head -c 32 /dev/urandom | base64 > /etc/squeezefs/keys/volume.key
+chmod 600 /etc/squeezefs/keys/volume.key
+
+squeezefs format sqmeta://<meta> sqdata://<data> \
+  --encrypt-algo aes256gcm --encrypt-key /etc/squeezefs/keys/volume.key
+```
+
+- The file must hold **at least 32 bytes of key material** (not a passphrase — the derivation has no work factor), be a regular file, mode `0600`, owned by the invoking user. It is opened `O_NOFOLLOW` and checked on the fd; anything else refuses loudly. `--encrypt-key -` reads the material from **stdin** instead.
+- `format` prints a **key id** and persists only that plus a derivation salt in the volume's format config. Losing the key file loses the data: nothing on the volume can reconstruct it.
+- **Mounting** resolves the key, in order, from `mount --encrypt-key <path>`, `SQUEEZEFS_ENCRYPT_KEY_FILE=<path>`, then `/etc/squeezefs/keys/<key_id>.key` — so a key file parked at the default path needs no flag at all. A missing key refuses the mount naming all three sources; a *wrong* key refuses naming the expected and observed key ids (never a mount that fails every read).
+- Data keys are wrapped with AES-256-GCM/ChaCha20-Poly1305 under an HKDF-SHA-256-derived key-encryption key (the volume's own record cipher). A process holding key material is set undumpable with core dumps disabled.
+
 
 ### Read-path tuning (mount env; design `docs/design-read-path.md`)
 

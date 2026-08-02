@@ -103,14 +103,14 @@ enum Commands {
         /// Encryption algorithm (aes256gcm, chacha20, none, default: none)
         #[arg(long, default_value = "none")]
         encrypt_algo: String,
-        /// Path to the encryption key FILE (or "-" to read it from stdin)
+        /// Path to the encryption key file (or "-" to read it from stdin)
         ///
         /// The file must hold at least 32 bytes of key material (not a
         /// passphrase) and be mode 0600, owned by you:
         /// `head -c 32 /dev/urandom | base64 > key && chmod 600 key`.
-        /// The key NEVER lands on the volume — only a KDF salt and a key
-        /// id are persisted — and it is never passed on argv. Keep the
-        /// file: mount needs it (`--encrypt-key`,
+        /// The key never lands on the volume — only a derivation salt and
+        /// a key id are persisted — and it is never passed on argv. Keep
+        /// the file: mount needs it (`--encrypt-key`,
         /// SQUEEZEFS_ENCRYPT_KEY_FILE, or /etc/squeezefs/keys/<id>.key).
         #[arg(long, value_name = "PATH")]
         encrypt_key: Option<String>,
@@ -504,7 +504,7 @@ enum Commands {
 
         // Anchor: docs/design-key-handling.md §4 (VAL-3 — the key
         // resolves at mount; the volume stores only a salt and an id).
-        /// Path to the encryption key FILE for an encrypted volume
+        /// Path to the encryption key file for an encrypted volume
         ///
         /// Required to mount a volume formatted with --encrypt-algo,
         /// unless the key is at SQUEEZEFS_ENCRYPT_KEY_FILE or
@@ -3478,9 +3478,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let encrypt_mode = squeezefs::crypto_compress::EncryptMode::parse(&encrypt_algo)
                 .map_err(|e| e.to_string())?;
             let canonical_encrypt_algo = encrypt_mode.as_str().to_string();
-            let encrypt_key_ref = if encrypt_mode
-                != squeezefs::crypto_compress::EncryptMode::None
-            {
+            let encrypt_key_ref = if encrypt_mode != squeezefs::crypto_compress::EncryptMode::None {
                 let spec = encrypt_key.as_deref().ok_or_else(|| {
                     format!(
                         "--encrypt-algo {canonical_encrypt_algo} requires --encrypt-key \

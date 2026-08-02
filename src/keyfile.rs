@@ -336,7 +336,12 @@ pub fn read_key_file(path: &Path) -> Result<KeyMaterial, String> {
         .map_err(|_| format!("encryption key path {display} contains a NUL byte"))?;
     // SAFETY: `c_path` is a valid NUL-terminated string for the duration
     // of the call; the returned fd is immediately adopted by `OwnedFd`.
-    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
     if fd < 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ELOOP) {
@@ -445,7 +450,10 @@ pub fn resolve_volume_key(key_ref: &EncryptKeyRef) -> Result<VolumeKey, String> 
         (read_key_file(&p).map_err(|e| format!("{src}: {e}"))?, src)
     } else if default_path.exists() {
         let src = default_path.display().to_string();
-        (read_key_file(&default_path).map_err(|e| format!("{src}: {e}"))?, src)
+        (
+            read_key_file(&default_path).map_err(|e| format!("{src}: {e}"))?,
+            src,
+        )
     } else {
         return Err(format!(
             "this volume is encrypted (key id {}) but no key source was found. Provide \

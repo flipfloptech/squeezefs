@@ -103,11 +103,8 @@ async fn test_set_crypto_inits_scratch_pool_from_block_size() {
     let bs: usize = 1024 * 1024; // deliberately non-default (default is 4 MiB)
     h.router.set_block_size(bs as u64);
 
-    let state = CryptoCompressState::new(
-        "lz4".to_string(),
-        "aes256gcm".to_string(),
-        Some(test_key()),
-    );
+    let state =
+        CryptoCompressState::new("lz4".to_string(), "aes256gcm".to_string(), Some(test_key()));
     h.router.set_crypto(state);
 
     let buf_len = h
@@ -126,11 +123,8 @@ async fn test_set_crypto_inits_scratch_pool_from_block_size() {
 
     // A reference state initialized directly for the same block size and
     // key agrees exactly (same §5.7 formula, same actual wrapped-key blob).
-    let reference = CryptoCompressState::new(
-        "lz4".to_string(),
-        "aes256gcm".to_string(),
-        Some(test_key()),
-    );
+    let reference =
+        CryptoCompressState::new("lz4".to_string(), "aes256gcm".to_string(), Some(test_key()));
     reference.init_scratch_pool(bs);
     assert_eq!(Some(buf_len), reference.scratch_pool_buf_len());
 

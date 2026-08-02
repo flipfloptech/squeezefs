@@ -219,12 +219,20 @@ fn bench_key_wrap(c: &mut Criterion) {
         let blob = state.wrap_session_key(&data_key).unwrap();
 
         group.bench_function(BenchmarkId::new("wrap_session_key", algo), |b| {
-            b.iter(|| state.wrap_session_key(std::hint::black_box(&data_key)).unwrap())
+            b.iter(|| {
+                state
+                    .wrap_session_key(std::hint::black_box(&data_key))
+                    .unwrap()
+            })
         });
         // Cold unwrap: what a first-touch block header costs before the
         // moka memo covers it.
         group.bench_function(BenchmarkId::new("unwrap_session_key_cold", algo), |b| {
-            b.iter(|| state.unwrap_session_key(std::hint::black_box(&blob)).unwrap())
+            b.iter(|| {
+                state
+                    .unwrap_session_key(std::hint::black_box(&blob))
+                    .unwrap()
+            })
         });
         // The transformed-volume I/O path: every block resolves the
         // session key through this (P2-3 precomputed fast path).

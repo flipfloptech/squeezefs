@@ -253,11 +253,7 @@ impl CryptoCompressState {
     /// `volume_key` is the mount-resolved [`VolumeKey`]
     /// (`docs/design-key-handling.md` §4) — NEVER a PEM string, and never
     /// anything that came off `argv` or the volume.
-    pub fn new(
-        compression: String,
-        encrypt_algo: String,
-        volume_key: Option<&VolumeKey>,
-    ) -> Self {
+    pub fn new(compression: String, encrypt_algo: String, volume_key: Option<&VolumeKey>) -> Self {
         let compression_mode =
             CompressionMode::parse(&compression).unwrap_or(CompressionMode::None);
         let encrypt_mode = EncryptMode::parse(&encrypt_algo).unwrap_or(EncryptMode::None);
@@ -1188,7 +1184,10 @@ mod tests {
             .expect("session key must prewrap with a volume key configured")
             .0
             .len();
-        assert_eq!(wrapped_len, WRAP_V2_LEN, "the KW-1 wrap is a fixed 63 bytes");
+        assert_eq!(
+            wrapped_len, WRAP_V2_LEN,
+            "the KW-1 wrap is a fixed 63 bytes"
+        );
 
         state.init_scratch_pool(bs);
         let buf_len = state
@@ -1368,11 +1367,8 @@ mod tests {
     #[test]
     fn test_scratch_pool_checkout_recycle_and_alignment() {
         let bs = 256 * 1024;
-        let state = CryptoCompressState::new(
-            "lz4".to_string(),
-            "aes256gcm".to_string(),
-            Some(&TEST_KEY),
-        );
+        let state =
+            CryptoCompressState::new("lz4".to_string(), "aes256gcm".to_string(), Some(&TEST_KEY));
         state.init_scratch_pool(bs);
         let cap0 = pool_len(&state);
         assert!(cap0 > 0);
@@ -1438,11 +1434,8 @@ mod tests {
         // Inputs past the pool's sizing basis (worst case > buffer size)
         // must bounce to today's heap `Vec` path — and only those.
         let bs = 64 * 1024;
-        let state = CryptoCompressState::new(
-            "lz4".to_string(),
-            "aes256gcm".to_string(),
-            Some(&TEST_KEY),
-        );
+        let state =
+            CryptoCompressState::new("lz4".to_string(), "aes256gcm".to_string(), Some(&TEST_KEY));
         state.init_scratch_pool(bs);
         let cap0 = pool_len(&state);
 
@@ -1485,11 +1478,8 @@ mod tests {
         // read-LRU and RYW reads; an in-place-over-input "optimization" is
         // explicitly rejected.
         let bs = 128 * 1024;
-        let state = CryptoCompressState::new(
-            "zstd".to_string(),
-            "chacha20".to_string(),
-            Some(&TEST_KEY),
-        );
+        let state =
+            CryptoCompressState::new("zstd".to_string(), "chacha20".to_string(), Some(&TEST_KEY));
         state.init_scratch_pool(bs);
         let pristine = mixed_payload(bs);
         let input = bytes::Bytes::from(pristine.clone());
@@ -1536,11 +1526,8 @@ mod tests {
         // [2B wrapped_key_len][1B nonce_len][wrapped_key][nonce] — no mode
         // byte — sealing at the header offset with a separate tag.
         let bs = 128 * 1024;
-        let state = CryptoCompressState::new(
-            "lz4".to_string(),
-            "aes256gcm".to_string(),
-            Some(&TEST_KEY),
-        );
+        let state =
+            CryptoCompressState::new("lz4".to_string(), "aes256gcm".to_string(), Some(&TEST_KEY));
         state.init_scratch_pool(bs);
         let payload = mixed_payload(64 * 1024);
 

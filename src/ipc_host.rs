@@ -2418,6 +2418,21 @@ pub fn send_ctl(sock: &UnixStream, msg: &CtlMsg, fd: Option<RawFd>) -> io::Resul
 /// Receive one ctl datagram (+ at most one attached fd). EOF surfaces as
 /// `UnexpectedEof`; undecodable bytes as `InvalidData` (the caller
 /// poisons loudly, never crashes).
+///
+/// **VAL-5a (pre-RC spec §3, P0) — the SCM_RIGHTS bound.** This runs
+/// before ANY validation, on a socket any process in the namespace can
+/// reach, so the descriptor accounting has to be exact:
+///
+/// * the fd count comes from `cmsg_len` (a single cmsg can carry many —
+///   the pre-fix loop copied exactly one per cmsg and silently left the
+///   rest installed in this process with no owner and no close);
+/// * **every** received descriptor is wrapped in an `OwnedFd` at once, so
+///   the refusal paths below close them by drop, not by remembering to;
+/// * `MSG_CTRUNC` ⇒ refuse: truncated control data means the kernel
+///   installed descriptors we cannot enumerate;
+/// * more than one descriptor ⇒ refuse: no ctl message in the protocol
+///   carries two (HELLO/BIND carry exactly one, everything else none),
+///   so a second attachment is a protocol violation by construction.
 pub fn recv_ctl(sock: &UnixStream) -> io::Result<(CtlMsg, Option<OwnedFd>)> {
     let mut buf = [0u8; CTL_MSG_MAX];
     let mut iov = libc::iovec {
@@ -2436,25 +2451,66 @@ pub fn recv_ctl(sock: &UnixStream) -> io::Result<(CtlMsg, Option<OwnedFd>)> {
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
-    let mut rx_fd = None;
-    // SAFETY: CMSG walk over the kernel-filled control buffer.
+    // Own EVERY descriptor the kernel installed, derived from `cmsg_len`
+    // (VAL-5a). `rx_fds` is the complete set: the refusals below drop it.
+    let mut rx_fds: Vec<OwnedFd> = Vec::new();
+    // SAFETY: CMSG walk over the kernel-filled control buffer; each
+    // `CMSG_DATA` span is `cmsg_len - CMSG_LEN(0)` bytes of `RawFd`s the
+    // kernel just installed in this process.
     unsafe {
+        let hdr_bytes = libc::CMSG_LEN(0) as usize;
         let mut cmsg = libc::CMSG_FIRSTHDR(&hdr);
         while !cmsg.is_null() {
             if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let mut fd: RawFd = -1;
-                std::ptr::copy_nonoverlapping(
-                    libc::CMSG_DATA(cmsg),
-                    &mut fd as *mut RawFd as *mut u8,
-                    std::mem::size_of::<RawFd>(),
-                );
-                if fd >= 0 {
-                    rx_fd = Some(OwnedFd::from_raw_fd(fd));
+                let payload = ((*cmsg).cmsg_len as usize).saturating_sub(hdr_bytes);
+                let count = payload / std::mem::size_of::<RawFd>();
+                let data = libc::CMSG_DATA(cmsg);
+                for i in 0..count {
+                    let mut fd: RawFd = -1;
+                    std::ptr::copy_nonoverlapping(
+                        data.add(i * std::mem::size_of::<RawFd>()),
+                        &mut fd as *mut RawFd as *mut u8,
+                        std::mem::size_of::<RawFd>(),
+                    );
+                    if fd >= 0 {
+                        rx_fds.push(OwnedFd::from_raw_fd(fd));
+                    }
                 }
             }
             cmsg = libc::CMSG_NXTHDR(&hdr, cmsg);
         }
     }
+    if hdr.msg_flags & libc::MSG_CTRUNC != 0 {
+        let dropped = rx_fds.len();
+        drop(rx_fds); // close what the kernel did install
+        METRICS
+            .ipc_descriptor_rejects
+            .fetch_add(1, Ordering::Relaxed);
+        log::warn!(
+            "ipc host: ctl datagram with TRUNCATED control data ({dropped} fds installed \
+             and closed) — refusing (VAL-5a)"
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ctl datagram control data truncated (MSG_CTRUNC)",
+        ));
+    }
+    if rx_fds.len() > 1 {
+        let count = rx_fds.len();
+        drop(rx_fds);
+        METRICS
+            .ipc_descriptor_rejects
+            .fetch_add(1, Ordering::Relaxed);
+        log::warn!(
+            "ipc host: ctl datagram carried {count} descriptors (protocol allows at most \
+             one) — refusing, all closed (VAL-5a)"
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ctl datagram carried more than one descriptor",
+        ));
+    }
+    let rx_fd = rx_fds.pop();
     if n == 0 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,

@@ -2,8 +2,14 @@
 
 The sqz kernel = **linux-6.19.14** (kernel.org stable, sha256
 `cde8bf6739be4a0777fedbbba5330b8188c55680c45a922a4dfa289cbec6f185`)
-+ the 26 patches in `patches/` + the client base config + `config-fragment`,
++ the 27 patches in `patches/` + the client base config + `config-fragment`,
 built `LOCALVERSION=-sqz` → `uname -r` = `6.19.14-sqz`.
+
+**v2 delta (2026-08-04):** patch **0027** (sqz-authored, see below) is
+the entire v2 kernel change — `.benchmarks/2026-08-04-sqz-kernel-v2-scoping.md`
+adjudicated every other candidate as sysctl-only, already-in-series,
+maintainer-blocked, or daemon-side work (`V2-CANDIDATES.md` is the
+ranked manifest).
 
 ## What was taken, exactly
 
@@ -87,6 +93,18 @@ applied clean.
    `io_register_kmbuf_ring()` (free internal ring struct + buffers
    region + bl; bl not yet xarray-visible so no double-free). Commit
    message carries the full rationale.
+5. **patch 27 (sqz-authored, v2 — `FUSE_TIME_LIMITS`)** — no upstream
+   original (the V2-CANDIDATES.md candidate-5 sketch, authored
+   2026-08-04): `fuse_init_out` carves `time_min`/`time_max` i64s out
+   of `unused[11]` (→ `unused[3]` placed FIRST so the i64s stay
+   naturally aligned and the struct stays 64 bytes), init flag
+   `FUSE_TIME_LIMITS (1ULL << 62)` (deliberately far above upstream's
+   bit-42 watermark), kernel advertises it in `fuse_send_init`, and
+   `process_init_reply` applies `sb->s_time_min/max` beside the
+   existing `time_gran` block when the daemon echoes the flag with a
+   nonzero `time_max`. Applies fuzz=0 on the fully-patched tree; zero
+   overlap with the series' FUSE hunks (different functions). Design
+   precedent: djwong's fuse-iomap `FUSE_IOMAP_CONFIG_TIME`.
 
 `patches/` is the `git format-patch` export of the resolved transplant;
 `build-kernel.sh` applies it with `patch -p1 --fuzz=0` (any regression

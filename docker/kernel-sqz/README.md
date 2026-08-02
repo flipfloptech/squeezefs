@@ -15,15 +15,35 @@ found closed on the field kernel:
 Result: **`6.19.14-sqz`** EL8 kernel RPMs (Rocky 8.10 installable),
 built in a pinned Rocky 8 + gcc-toolset-14 + pahole v1.30 container.
 
+**v2 (2026-08-04 prep):** the series grew sqz patch **0027**
+(`FUSE_TIME_LIMITS` INIT advertisement — V2-CANDIDATES.md rank 1, the
+only kernel delta of the v2 manifest): `fuse_init_out` gains
+`time_min`/`time_max` i64s carved from `unused[11]` (struct stays 64
+bytes, fields naturally aligned), flags2-space bit 62, and a guarded
+`sb->s_time_min/max` branch beside the `time_gran` consumption in
+`process_init_reply`. Converts the fstests generic/634 release-gate
+adjudication into expected-PASS **on sqz-kernel hosts only** (the
+adjudication stays pinned for the fleet kernel). Feature-absent ⇒
+bit-identical behavior on both sides.
+
+**Strata ruling (USER DECISION 2026-08-02): the kmod-sqzfuse stratum
+is KILLED.** There are exactly **two strata**: (1) **stock-graceful**
+— the daemon runs capability-probed on stock kernels, degrading
+gracefully (no kmbuf, no zcrx, no time limits); (2) the **full `-sqz`
+kernel** — this recipe's RPMs, carrying the whole series. No
+middle stratum of out-of-tree fuse/io_uring kmods will be built or
+maintained; do not resurrect it.
+
 ## Contents
 
 | Path | What |
 |---|---|
 | `Dockerfile` | pinned EL8 build image (gcc-toolset-14, from-source pahole v1.30 for BTF) |
 | `build.sh` | host wrapper: image build + capped (`--cpus 16`, `nice`) kernel build; artifacts → `dist/kernel-sqz/` |
-| `build-kernel.sh` | in-container: sha256-pinned tarball → 26 patches → config assembly → checklist assertion (fail loud) → `make binrpm-pkg` |
+| `build-kernel.sh` | in-container: sha256-pinned tarball → 27 patches → config assembly → checklist assertion (fail loud) → `make binrpm-pkg` |
 | `SERIES.md` | the series manifest: message-ids, base ruling, conflict resolutions |
-| `patches/` | `git format-patch` export of the resolved transplant (25 series patches + 1 sqz seam commit) |
+| `V2-CANDIDATES.md` | the v2 scoping manifest (ranked candidates; rank 1 = the authored 0027) |
+| `patches/` | `git format-patch` export of the resolved transplant (25 series patches + 2 sqz-authored commits: 0026 seam, 0027 FUSE_TIME_LIMITS) |
 | `config-base-7.1.2-1.el8.elrepo.x86_64` | the field client's running config (the base; copied read-only 2026-08-01) |
 | `config-fragment` | the ENABLE CHECKLIST — every entry asserted in the final `.config` |
 | `probes/` | capability probes (see below) |

@@ -1,0 +1,102 @@
+From 7ca12e14ccc30528a998f4e89e7e94882748d596 Mon Sep 17 00:00:00 2001
+From: sqz kernel recipe <sqz-kernel@squeezefs>
+Date: Sun, 2 Aug 2026 07:09:58 -0400
+Subject: [PATCH] sqz: FUSE_TIME_LIMITS INIT advertisement of inode-timestamp
+ range
+
+The only timestamp field FUSE_INIT carries is time_gran, so a FUSE
+server that persists a finite timestamp range (SqueezeFS: i64
+nanoseconds = +/-9223372036 s, the ext4-u34/xfs-bigtime finite-range
+class) cannot teach the kernel to clamp incore: sb->s_time_min/max
+stay at the VFS +/-TIME64 defaults, the kernel keeps huge dates incore
+while the daemon persists the clamp, and fstests generic/634 diffs
+(the standing release-gate adjudication: "incore clamping needs
+sb->s_time_max, which the FUSE protocol cannot advertise").
+
+Burn 16 of fuse_init_out.unused[11]'s 22 bytes into time_min/time_max
+(int64_t seconds, placed AFTER the shrunk unused[3] so both stay
+naturally aligned and the struct stays 64 bytes), advertise
+FUSE_TIME_LIMITS in the INIT request, and apply the limits beside the
+existing time_gran consumption when the server echoes the flag and
+supplies a nonzero time_max. VFS timestamp_truncate() then clamps
+setattr/utimes exactly where the daemon clamps durable state.
+
+Upstream-palatability precedent: djwong's fuse-iomap advertises
+s_time_min/max via FUSE_IOMAP_CONFIG (flag FUSE_IOMAP_CONFIG_TIME) --
+proof of concept upstream, but iomap-coupled and enormous; two i64s at
+INIT is the minimal vehicle. The flag deliberately sits at bit 62,
+far above upstream's watermark (bit 42 is the last allocated
+in-tree), so an upstream collision is a recompile, not an ABI trap.
+Feature-absent (stock daemon or stock kernel) => bit-identical
+behavior: the daemon gates on the offered bit, the kernel gates on
+the echoed bit + nonzero time_max.
+---
+ fs/fuse/inode.c           |  6 +++++-
+ include/uapi/linux/fuse.h | 13 ++++++++++++-
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index d7a226e..8fe498d 100644
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -1380,6 +1380,10 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
+ 				fc->handle_killpriv = 1;
+ 			if (arg->time_gran && arg->time_gran <= 1000000000)
+ 				fm->sb->s_time_gran = arg->time_gran;
++			if ((flags & FUSE_TIME_LIMITS) && arg->time_max) {
++				fm->sb->s_time_min = arg->time_min;
++				fm->sb->s_time_max = arg->time_max;
++			}
+ 			if ((flags & FUSE_POSIX_ACL)) {
+ 				fc->default_permissions = 1;
+ 				fc->posix_acl = 1;
+@@ -1506,7 +1510,7 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
+ 		FUSE_SECURITY_CTX | FUSE_CREATE_SUPP_GROUP |
+ 		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
+ 		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
+-		FUSE_REQUEST_TIMEOUT;
++		FUSE_REQUEST_TIMEOUT | FUSE_TIME_LIMITS;
+ #ifdef CONFIG_FUSE_DAX
+ 	if (fm->fc->dax)
+ 		flags |= FUSE_MAP_ALIGNMENT;
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index 2c44219..08d2af9 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -451,6 +451,8 @@ struct fuse_file_lock {
+  * FUSE_OVER_IO_URING: Indicate that client supports io-uring
+  * FUSE_REQUEST_TIMEOUT: kernel supports timing out requests.
+  *			 init_out.request_timeout contains the timeout (in secs)
++ * FUSE_TIME_LIMITS: kernel honors init_out.time_{min,max} as the superblock
++ *		     inode-timestamp range (sqz-private)
+  */
+ #define FUSE_ASYNC_READ		(1 << 0)
+ #define FUSE_POSIX_LOCKS	(1 << 1)
+@@ -498,6 +500,12 @@ struct fuse_file_lock {
+ #define FUSE_ALLOW_IDMAP	(1ULL << 40)
+ #define FUSE_OVER_IO_URING	(1ULL << 41)
+ #define FUSE_REQUEST_TIMEOUT	(1ULL << 42)
++/*
++ * sqz-private: deliberately far above the upstream watermark (bit 42 is the
++ * last allocated in-tree) so an upstream collision is a recompile, not an
++ * ABI trap.
++ */
++#define FUSE_TIME_LIMITS	(1ULL << 62)
+ 
+ /**
+  * CUSE INIT request/reply flags
+@@ -928,7 +936,10 @@ struct fuse_init_out {
+ 	uint32_t	flags2;
+ 	uint32_t	max_stack_depth;
+ 	uint16_t	request_timeout;
+-	uint16_t	unused[11];
++	uint16_t	unused[3];
++	/* sqz FUSE_TIME_LIMITS: server inode-timestamp range (seconds) */
++	int64_t	time_min;
++	int64_t	time_max;
+ };
+ 
+ #define CUSE_INIT_INFO_MAX 4096
+-- 
+2.55.0
+

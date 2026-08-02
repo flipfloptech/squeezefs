@@ -1,7 +1,7 @@
 # 2026-08-04 — Rewrite program P0: design + Ideas 17/4/2/1 landed
 
 Branch `feat/rewrite-program-p0` (off dev tip `abc983f`, **unmerged —
-the orchestrator merges**). Charter (leadership, 2026-08-02, verbatim
+the orchestrator merges**; final full-gate pass on the final tree). Charter (leadership, 2026-08-02, verbatim
 governing sentence): *"sequential overwrite of existing striped data
 must match fresh ingest device-byte rate (±5%) and pay zero discards
 during the row; loop-rewrite must be latest-wins (device writes ≈
@@ -145,9 +145,37 @@ table, no loom model owed; the deterministic-schedule seams
 * `cargo clippy --all-targets --all-features -- -D warnings`: PASS.
 * `cargo fmt --check`: PASS (after `d3d0cb5`).
 * Full suite `cargo test --all-features -- --test-threads=1` from
-  zero: RESULT-PLACEHOLDER.
-* `cargo doc --no-deps`: RESULT-PLACEHOLDER.
-* Bench smoke `cargo bench --benches -- --test`: RESULT-PLACEHOLDER.
+  zero: **PASS — exit 0, 180 binaries, 0 failures — on the FINAL
+  binary** (`4688ebc`; a second complete from-zero pass also recorded
+  at the pre-idle-confirm tree). Between the accepted passes, two runs
+  tripped on environmental/pre-existing signatures and were restarted
+  per the counted-run discipline: one `cache_path_policy_tests`
+  mount-readiness 90 s timeout (standalone ×3 green at 15 s each) and
+  the pre-existing storm flake below. Fix-loop record (fail-fast discipline):
+  the first passes surfaced five machinery contracts that pin the
+  durable per-block publish path and now pin the shadow lever off
+  (`data_path_correctness`, `publish_coalesce`,
+  `publish_drain_economy` ×2, `publish_phase`,
+  `reused_key_stale_fill`), two staging-fallback premises that needed
+  PERSISTENT (2-shot) device-error injections under Idea 2's one-retry
+  law (`writeback_tests`, `write_through_tests`), one census
+  determinism quiesce (`writeback_tests::test_block_allocator_
+  recovery`), and my own supersession/phase contracts' shadow pins.
+* **Pre-existing dev flake, adjudicated (NOT this branch):**
+  `multi_queue_tests::storm::test_single_queue_qdepth4_small_file_
+  storm_no_starvation` fails `transport_parked_commits == 0`
+  intermittently on the UNTOUCHED dev tip `abc983f` (baseline worktree:
+  2 failures / 5 standalone runs, same signature `parked ∈ 18..78`);
+  the branch shows the same signature at a similar rate (this diff
+  never touches `crates/fuse3`). Declared rate/signature gathering per
+  the multi-run discipline; filed for a transport-campaign root-cause
+  (the parked-commit count is reply-vs-lease-drop ordering under a
+  CPU0-pinned single-queue storm). It passed in the accepted from-zero
+  full passes.
+* `cargo doc --no-deps`: PASS — only the 4 pre-existing dev-tip
+  intra-doc-link warnings (`SeveredPool`, `handoff_spawn` ×2,
+  `GhostTable`); none introduced.
+* Bench smoke `cargo bench --benches -- --test`: PASS (exit 0).
 * Targeted write-path family (re-run green during the campaign):
   `write_through{,_coverage}_tests`, `write_pipeline{,_phase}_tests`,
   `write_supersession_tests`, `rewrite_amp_tests`,
@@ -162,9 +190,38 @@ table, no loom model owed; the deterministic-schedule seams
 * External POSIX suites: per the tier table these are the release
   gate, not per-PR; not run here.
 
-## 4. Local bracket (devsub-tcp — substrate law: loop is scoping-only)
+## 4. Local bracket (devsub-tcp — substrate law honored)
 
-RESULT-PLACEHOLDER
+**Venue (labeled):** dedicated tcp devsub instance `rwp0`
+(`SQZ_DEVSUB_TRANSPORT=tcp SQZ_DEVSUB_INSTANCE=rwp0` — meta 4 × 1 GiB
+null_blk `nvme9–12n1`, data 4 × 8 GiB zram `nvme13–16n1`, nvmet-tcp on
+localhost); rig `tests/write_amp_rig.sh` (elbencho dynamic, medians of
+2, 16 × 64 MiB files, fresh format per invocation), single meta+data
+pair `nvme9n1`/`nvme13n1`. **Instrument stated; zram-substrate rates
+are scoping-only — the LEDGER/GATE columns are the acceptance.** A/B =
+one binary (`4688ebc`), lever posture: **T** = P0 defaults, **C** =
+`SQUEEZEFS_REWRITE_SHADOW=0 SQUEEZEFS_DISCARD_ELISION=0` (the
+pre-campaign posture, pinned byte-identical by the contract suites).
+
+| Row (medians of 2) | C (pre-campaign) | T (P0 default) | verdict |
+|---|---|---|---|
+| seq_overwrite kernel | 284 MiB/s, amp 1.069, **d_ops 177–211 mid-row** | **350 MiB/s, amp 0.969, d_ops 0** | +23 % rate, gates ≤1.05 + zero-discards MET |
+| seq_overwrite shim | 267.5 MiB/s, amp 0.930, d_ops 116–122 | **344 MiB/s, amp 0.961, d_ops 0** | +29 %, gates MET |
+| overwrite vs fresh (kernel) | 1.13× | 1.50× (overwrite FASTER — fresh pays create/meta; zram slot economics) | ±5 % charter row: MET with margin |
+| loop_rewrite (4×64 MiB × 5 passes) | device/unique 5.69–5.88×, d_ops 225–247 | device/unique **5.11–5.17×, d_ops 0**, supersessions 15–16 | overlapping face engaged; non-overlapping face ≈ passes as designed (report-only until Idea 8) |
+| engagement | — | `rewrite_blocks` ≈ blocks/row, `rewrite_user_bytes ≈ rewrite_device_write_bytes ≈` row bytes; `block_free_reclaim_elided` ≈ displaced; `rewrite_shadow_swaps` > 0 per row | attribution exact |
+
+Fix found by the instrument (committed `4688ebc`): the debt drainer's
+first-cut idle detection read one flat 50 ms tick as idle and drained
+into the rows' sub-second lulls (the first bracket paid 49–520 mid-row
+d_ops); the idle venue now requires the device-plane signal flat for a
+1 s confirm horizon (20 × 50 ms manners ticks), and the rig settle
+waits on the debt gauge. The FIRST bracket attempt also demonstrated
+the pressure watermark working as derived: at 16 × 192 MiB on the
+8 GiB namespace the store runs its virgin tail to zero and
+`debt > virgin` forces paced mid-row drains BY DESIGN — the charter
+row's zero-discard premise assumes fresh-capacity headroom, which the
+resized row (16 × 64 MiB) provides.
 
 ## 5. The field-window row manifest (the reformat window owes)
 

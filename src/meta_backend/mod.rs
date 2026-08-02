@@ -1289,8 +1289,8 @@ impl RoutedMetaBackend {
                 .await?
                 .is_some()
             {
-                return Err(crate::error::SqueezefsError::InvalidOperation(
-                    "File already exists".to_string(),
+                return Err(crate::error::SqueezefsError::already_exists(
+                    "File already exists",
                 ));
             }
 
@@ -1698,8 +1698,8 @@ impl Metadata for RoutedMetaBackend {
             .await?
             .is_some()
         {
-            return Err(crate::error::SqueezefsError::InvalidOperation(
-                "File already exists".to_string(),
+            return Err(crate::error::SqueezefsError::already_exists(
+                "File already exists",
             ));
         }
 

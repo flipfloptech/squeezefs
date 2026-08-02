@@ -5152,8 +5152,8 @@ impl KvMetaBackend {
     ) -> Result<Inode> {
         self.write_gate()?;
         if self.find_dentry(local_parent, name).await?.is_some() {
-            return Err(crate::error::SqueezefsError::InvalidOperation(
-                "File already exists".to_string(),
+            return Err(crate::error::SqueezefsError::already_exists(
+                "File already exists",
             ));
         }
         let parent_v = self
@@ -5380,8 +5380,8 @@ impl KvMetaBackend {
             .await?
             .ok_or_else(|| Self::not_found(format!("Inode {local_child} not found")))?;
         if child.nlink >= 65000 {
-            return Err(crate::error::SqueezefsError::InvalidOperation(
-                "Too many links".to_string(),
+            return Err(crate::error::SqueezefsError::too_many_links(
+                "Too many links",
             ));
         }
         child.nlink += 1;
@@ -5431,8 +5431,8 @@ impl KvMetaBackend {
             .ok_or_else(|| Self::not_found(format!("Inode {local_child} not found")))?;
         if delta > 0 {
             if v.nlink >= 65000 {
-                return Err(crate::error::SqueezefsError::InvalidOperation(
-                    "Too many links".to_string(),
+                return Err(crate::error::SqueezefsError::too_many_links(
+                    "Too many links",
                 ));
             }
             v.nlink += delta as u32;
@@ -6433,8 +6433,8 @@ impl Metadata for KvMetaBackend {
         ]);
 
         if self.find_dentry(parent, name).await?.is_some() {
-            return Err(crate::error::SqueezefsError::InvalidOperation(
-                "File already exists".to_string(),
+            return Err(crate::error::SqueezefsError::already_exists(
+                "File already exists",
             ));
         }
         let parent_v = self
@@ -6559,8 +6559,8 @@ impl Metadata for KvMetaBackend {
         );
 
         if self.find_dentry(new_parent, new_name).await?.is_some() {
-            return Err(crate::error::SqueezefsError::InvalidOperation(
-                "File already exists".to_string(),
+            return Err(crate::error::SqueezefsError::already_exists(
+                "File already exists",
             ));
         }
         let mut child = self

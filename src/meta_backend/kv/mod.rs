@@ -562,16 +562,28 @@ pub enum KvError {
 }
 
 /// Map KV-layer errors onto the crate error surface (mount / CLI / trait
-/// callers): device I/O passes through untouched; every other variant is
-/// a typed-refusal-turned-loud-message, the `InvalidOperation` class the
-/// v2 mount gates use.
+/// callers): device I/O passes through untouched; the refusals that owe
+/// userspace a specific errno carry it **structurally** (POSIX-6 — the
+/// message is prose, never wire format); the remainder are
+/// typed-refusals-turned-loud-messages, the `InvalidOperation` class the
+/// mount gates use.
 impl From<KvError> for crate::error::SqueezefsError {
     fn from(e: KvError) -> Self {
+        use crate::error::SqueezefsError as E;
         match e {
             KvError::Io(inner) => inner,
-            other => {
-                crate::error::SqueezefsError::InvalidOperation(format!("kv metadata: {other}"))
-            }
+            // §4.7 ENOSPC. The message reads "no space: …" (lower-case
+            // n), which the retired substring rule (`contains("No
+            // space")`) MISSED — a full metadata volume returned EINVAL
+            // to `write(2)`. This is the POSIX-6 headline correction.
+            e @ KvError::NoSpace { .. } => E::no_space(format!("kv metadata: {e}")),
+            // `setxattr(2)`'s documented errno for an oversized value.
+            // Only reachable below `XATTR_SIZE_MAX` (small-node volumes);
+            // the kernel screens anything above it.
+            e @ KvError::ValueTooLarge { .. } => E::too_large(format!("kv metadata: {e}")),
+            // The D0 single-writer refusal names a holder — EBUSY.
+            e @ KvError::Busy(_) => E::busy(format!("kv metadata: {e}")),
+            other => E::InvalidOperation(format!("kv metadata: {other}")),
         }
     }
 }

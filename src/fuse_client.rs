@@ -11578,6 +11578,17 @@ impl Filesystem for SqueezefsFilesystem {
             self.refresh_client_registration().await;
         }
 
+        // Derivation sweep (2026-08-04): block-size/budget-derived
+        // write-path knob defaults — applied HERE because the volume's
+        // authoritative block size just loaded from the format config
+        // (`set_block_size` above; volumes without a config keep the
+        // process default). Explicit env always wins verbatim (the A0
+        // levers); runs before any I/O op can consult the knobs.
+        apply_derived_write_knobs(
+            crate::mem_budget::MEM_BUDGET.resolve_budget_now(),
+            self.router.block_size.load(Ordering::Relaxed),
+        );
+
         // R5 (§5.7): register the RAM consumers with the joint memory
         // authority and start its 1 Hz sampler. Registration is guarded
         // (one registry per process) — remounts in-process must not
@@ -15435,15 +15446,6 @@ pub async fn start_mount<P: AsRef<Path>>(
         "Transport payload-buffer cap: {} MiB (memory budget {} MiB)",
         transport_cap / (1024 * 1024),
         mem_budget / (1024 * 1024)
-    );
-
-    // Derivation sweep (2026-08-04): block-size/budget-derived write-path
-    // knob defaults — explicit env always wins verbatim (the A0 levers).
-    apply_derived_write_knobs(
-        mem_budget,
-        fs.router
-            .block_size
-            .load(std::sync::atomic::Ordering::Relaxed),
     );
 
     // L4 interception session host (PR L4-3): armed pre-mount so the

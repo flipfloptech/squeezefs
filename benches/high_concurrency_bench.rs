@@ -159,6 +159,57 @@ fn bench_cluster_dlm(c: &mut Criterion) {
         b.iter(|| black_box(dlm.get_fencing_token_ino(black_box(800_777_001u64))));
     });
 
+    // S2 rows (feat/dlm-s2-durable-term) — the composed-token cost
+    // against S1, measured as an in-bench A/B: every row ABOVE ran with
+    // no durable term adopted (term 0 ⇒ `(0 << 40) | seq` is bit-for-bit
+    // the S1 token and the S1 read path), and the two rows below repeat
+    // the same shapes after a mount-shaped adoption. Field shape
+    // (microbench law): a write mount publishes ONE term per volume at
+    // the D0 gate and then mints per open-for-write episode (spec §6.2),
+    // so the steady-state cost is entirely on the mint + read sides —
+    // one shift/or in the mint, one atomic load + max on the unheld
+    // read (`LAST_GRANT_FLOOR` vs the era base).
+    squeezefs::dlm::adopt_durable_term(7);
+
+    // The durable-term read itself: what every unheld fencing read now
+    // folds in (and what the mount-time sweep consults per record).
+    group.bench_function("durable_term_read", |b| {
+        b.iter(|| black_box(squeezefs::dlm::term_base()));
+    });
+
+    // Composed mint: same distinct-ino walk shape as the S1 row above.
+    group.bench_function("acquire_release_distinct_ino_walk_composed", |b| {
+        let dlm = dlm.clone();
+        let mut i = 0u64;
+        b.to_async(&rt).iter(|| {
+            i = i.wrapping_add(1);
+            let path = format!("inode_{}", 910_000_000 + (i % 65_536));
+            let dlm = dlm.clone();
+            async move {
+                let lease = dlm
+                    .acquire_lock(&path, None, std::time::Duration::from_secs(1))
+                    .await
+                    .expect("composed walk acquire");
+                lease.release().await.expect("composed walk release");
+            }
+        });
+    });
+
+    // Composed unheld read: the released-object generation under an
+    // adopted era (floor vs era-base max — the FIND-M11-A credential
+    // shape a fresh process now serves from the era, never from 0).
+    rt.block_on(async {
+        dlm.acquire_lock("inode_800777002", None, std::time::Duration::from_secs(1))
+            .await
+            .expect("composed unheld seed acquire")
+            .release()
+            .await
+            .expect("composed unheld seed release");
+    });
+    group.bench_function("get_fencing_token_ino_unheld_composed", |b| {
+        b.iter(|| black_box(dlm.get_fencing_token_ino(black_box(800_777_002u64))));
+    });
+
     // Contended handoff: 8 tasks fight over one key, each holding briefly.
     group.bench_function("acquire_release_contended_1key_8tasks", |b| {
         let dlm = dlm.clone();

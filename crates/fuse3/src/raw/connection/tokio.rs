@@ -562,7 +562,10 @@ impl FuseConnection {
         &self,
         header_buf: Vec<u8>,
         data_buf: T,
-    ) -> Option<((Vec<u8>, T, Option<Bytes>, crate::raw::ReplySlot), io::Result<usize>)> {
+    ) -> Option<(
+        (Vec<u8>, T, Option<Bytes>, crate::raw::ReplySlot),
+        io::Result<usize>,
+    )> {
         let mut unmount_fut = pin!(self.unmount_notify.notified().fuse());
         let mut read_fut = pin!(self.inner_read_vectored(header_buf, data_buf).fuse());
 
@@ -576,7 +579,10 @@ impl FuseConnection {
         &self,
         mut header_buf: Vec<u8>,
         mut data_buf: T,
-    ) -> ((Vec<u8>, T, Option<Bytes>, crate::raw::ReplySlot), io::Result<usize>) {
+    ) -> (
+        (Vec<u8>, T, Option<Bytes>, crate::raw::ReplySlot),
+        io::Result<usize>,
+    ) {
         // After arm, the request hot path is FUSE-over-io_uring. The classical
         // device is still read pre-arm (INIT — the kernel rejects REGISTER until
         // fch->initialized) and, post-arm, by the dedicated classical sideband
@@ -804,7 +810,9 @@ impl FuseConnection {
                 };
                 let body_bytes = if let Some(ref ext) = body_extend_data {
                     let slice = ext.deref();
-                    let dest_addr = pool.get_payload_buffer(slot).map(|(ptr, _)| ptr as *const u8);
+                    let dest_addr = pool
+                        .get_payload_buffer(slot)
+                        .map(|(ptr, _)| ptr as *const u8);
                     if let Some(addr) = dest_addr {
                         if slice.as_ptr() == addr {
                             bytes::Bytes::from_owner(UringBufOwner {

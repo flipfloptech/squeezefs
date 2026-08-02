@@ -47,8 +47,8 @@ use fuse3::raw::abi::{fuse_attr, fuse_attr_out, fuse_entry_out, fuse_in_header, 
 use fuse3::raw::connection::fuse_over_uring::{CommitBatchHistogram, FuseOverUring};
 use fuse3::raw::connection::kmbuf::{KmbufQueue, IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_BUFFER};
 use fuse3::raw::connection::FuseConnection;
-use fuse3::raw::{ReplySlot, Request};
 use fuse3::raw::reply::FileAttr;
+use fuse3::raw::{ReplySlot, Request};
 use fuse3::{FileType, Timestamp};
 use std::hint::black_box;
 use std::sync::Arc;
@@ -272,8 +272,11 @@ fn bench_reply_addressing(c: &mut Criterion) {
     const SHARDS: usize = 64;
     const DEPTH: usize = 32;
 
+    /// The deleted map's value: `(qid, ent_idx, commit_id)`.
+    type PendingEnt = (u16, u16, u64);
+
     struct PendingMap {
-        shards: Vec<Mutex<HashMap<u64, (u16, u16, u64)>>>,
+        shards: Vec<Mutex<HashMap<u64, PendingEnt>>>,
     }
 
     impl PendingMap {
@@ -283,16 +286,16 @@ fn bench_reply_addressing(c: &mut Criterion) {
             }
         }
         #[inline]
-        fn shard(&self, unique: u64) -> &Mutex<HashMap<u64, (u16, u16, u64)>> {
+        fn shard(&self, unique: u64) -> &Mutex<HashMap<u64, PendingEnt>> {
             &self.shards[((unique >> 1) as usize) & (SHARDS - 1)]
         }
-        fn insert(&self, unique: u64, v: (u16, u16, u64)) {
+        fn insert(&self, unique: u64, v: PendingEnt) {
             self.shard(unique).lock().unwrap().insert(unique, v);
         }
-        fn get(&self, unique: u64) -> Option<(u16, u16, u64)> {
+        fn get(&self, unique: u64) -> Option<PendingEnt> {
             self.shard(unique).lock().unwrap().get(&unique).copied()
         }
-        fn remove(&self, unique: u64) -> Option<(u16, u16, u64)> {
+        fn remove(&self, unique: u64) -> Option<PendingEnt> {
             self.shard(unique).lock().unwrap().remove(&unique)
         }
     }

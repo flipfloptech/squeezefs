@@ -39,6 +39,7 @@
 //! max_background}` stats fields do not exist, INIT replies
 //! max_background=12 regardless of options, and depth defaults to 4.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -517,5 +518,100 @@ fn test_mount_option_max_background_override() {
     assert_eq!(mount.fusectl_u64("max_background"), 96);
     assert_eq!(mount.fusectl_u64("congestion_threshold"), 80);
 
+    mount.unmount();
+}
+
+/// FUSE-2 acceptance on a LIVE mount: every request produces exactly one
+/// reply.
+///
+/// The invariant is *"for every request delivered on a ring slot, exactly
+/// one COMMIT_AND_FETCH carrying either a reply or a synthesized error is
+/// submitted before the slot leaves `Delivered`, and it leaves that state
+/// only by that submission"* — a violation parks the caller in
+/// uninterruptible sleep and makes `umount` return EBUSY.
+///
+/// This drives a real request mix (create/write/fsync/read/readdir/stat/
+/// unlink, plus a concurrent burst) over the armed transport and then
+/// reads the always-on tripwires off the stats inode. `transport_
+/// requests_abandoned` is the must-stay-0 one; the rest are named in the
+/// failure message so a regression arrives pre-diagnosed. The clean
+/// `unmount()` at the end is itself part of the assertion: a lost reply
+/// leaves `waiting >= 1` and the unmount would hang instead of returning.
+#[test]
+fn test_every_request_gets_exactly_one_reply() {
+    if !transport_supported() {
+        return;
+    }
+    let mut mount = mount_fs("fuse2", &[("SQUEEZEFS_MEM_BUDGET_MB", "65536")], &[]);
+    let root = mount.mnt.clone();
+
+    // Sequential mix: metadata ops, data ops, and a durability barrier.
+    let dir = root.join("d");
+    std::fs::create_dir(&dir).expect("mkdir");
+    for i in 0..64 {
+        let p = dir.join(format!("f{i}"));
+        let mut f = std::fs::File::create(&p).expect("create");
+        f.write_all(&vec![b'x'; 8 << 10]).expect("write");
+        f.sync_all().expect("fsync");
+        drop(f);
+        let got = std::fs::read(&p).expect("read back");
+        assert_eq!(got.len(), 8 << 10);
+        std::fs::metadata(&p).expect("stat");
+    }
+    assert_eq!(
+        std::fs::read_dir(&dir).expect("readdir").count(),
+        64,
+        "every created file must be visible"
+    );
+
+    // Concurrent burst: multiple queues in flight at once (queue
+    // selection is by requester CPU, so this spreads over ring slots).
+    let mut workers = Vec::new();
+    for t in 0..8 {
+        let dir = dir.clone();
+        workers.push(std::thread::spawn(move || {
+            for i in 0..32 {
+                let p = dir.join(format!("t{t}_{i}"));
+                std::fs::write(&p, vec![b'y'; 4 << 10]).expect("write");
+                let _ = std::fs::read(&p).expect("read");
+                std::fs::remove_file(&p).expect("unlink");
+            }
+        }));
+    }
+    for w in workers {
+        w.join().expect("worker thread");
+    }
+    for i in 0..64 {
+        std::fs::remove_file(dir.join(format!("f{i}"))).expect("unlink");
+    }
+
+    let stats = mount.stats();
+    let abandoned = mount.metric(&stats, "transport_requests_abandoned");
+    let synthetic = mount.metric(&stats, "transport_requests_failed_synthetic");
+    let refused = mount.metric(&stats, "transport_replies_refused_stale");
+    let dropped = mount.metric(&stats, "transport_replies_dropped_no_slot");
+    let retired = mount.metric(&stats, "transport_ents_retired");
+    let overdue = mount.metric(&stats, "transport_slots_overdue");
+    let requests = mount.metric(&stats, "fuse_over_uring_requests");
+    assert!(
+        requests > 0,
+        "the workload must have ridden the ring (requests={requests})"
+    );
+    assert_eq!(
+        abandoned, 0,
+        "FUSE-2 tripwire: {abandoned} request(s) left their ring slot with no commit \
+         (synthetic={synthetic} refused_stale={refused} dropped_no_slot={dropped} \
+         ents_retired={retired} slots_overdue={overdue} requests={requests})"
+    );
+    assert_eq!(
+        overdue, 0,
+        "no slot may sit unreplied past the watchdog window on a healthy mount"
+    );
+    assert_eq!(
+        retired, 0,
+        "no ring ent may retire (FUSE-3a) on a healthy mount"
+    );
+
+    // A clean unmount is the kernel's own verdict on the invariant.
     mount.unmount();
 }

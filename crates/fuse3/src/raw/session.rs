@@ -135,21 +135,92 @@ impl ReplyTx {
     /// falls back to a direct slot commit (rows 2 and 3).
     pub(crate) async fn send(&mut self, data: FuseData) -> Result<(), ()> {
         self.owed = false;
-        // PRE-FIX POLICY (rows 2/3): `let _ = …send()` discards the reply
-        // the moment the reply task is gone.
-        let _ = self.inner.unbounded_send(FuseReply {
+        let Err(rejected) = self.inner.unbounded_send(FuseReply {
             data,
             slot: self.slot,
-        });
-        Ok(())
+        }) else {
+            return Ok(());
+        };
+        // The reply task is gone (row 3) or the session is tearing down.
+        // A ring reply still has a live address: commit it directly
+        // against its slot rather than discarding it the way
+        // `let _ = …send()` did (row 2).
+        let reply = rejected.into_inner();
+        if self.commit_direct(reply.data) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    /// Last-resort delivery for a reply whose channel is gone. Returns
+    /// true when the kernel will see it.
+    fn commit_direct(&mut self, data: FuseData) -> bool {
+        #[cfg(feature = "tokio-runtime")]
+        {
+            if let Some(conn) = self.conn.as_ref() {
+                let (header, body) = match data {
+                    Either::Left(header) => (header, Bytes::new()),
+                    Either::Right((header, body, _backing)) => (header, body),
+                };
+                match conn.commit_reply_direct(self.slot, header, body) {
+                    Ok(()) => {
+                        crate::raw::connection::fuse_over_uring::note_reply_direct_commit();
+                        return true;
+                    }
+                    Err(err) => {
+                        error!(
+                            unique = self.unique,
+                            "fuse3: reply task gone and direct slot commit failed ({err}); \
+                             the request is abandoned"
+                        );
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "tokio-runtime")]
+        crate::raw::connection::fuse_over_uring::note_request_abandoned();
+        false
     }
 }
 
 impl Drop for ReplyTx {
+    /// FUSE-2 row 1: a handler task that panicked (or was dropped) before
+    /// replying leaves the kernel waiting forever — `spawn_local`'s
+    /// `JoinHandle` is dropped, so the panic is captured and discarded
+    /// and nothing else notices. The obligation dies with this handle, so
+    /// this is where the synthesized reply is produced.
     fn drop(&mut self) {
-        // PRE-FIX POLICY (row 1): a handler that panics before replying
-        // leaves the kernel waiting forever — the panic is captured by a
-        // dropped `JoinHandle` and nothing else notices.
+        if !self.owed {
+            return;
+        }
+        self.owed = false;
+        error!(
+            unique = self.unique,
+            slot = ?self.slot,
+            "fuse3: handler dropped without replying (panic or cancellation) — \
+             synthesizing EIO so the caller is not left in uninterruptible sleep"
+        );
+        let out_header = fuse_out_header {
+            len: FUSE_OUT_HEADER_SIZE as u32,
+            error: libc::EIO.wrapping_neg(),
+            unique: self.unique,
+        };
+        let data = get_bincode_config()
+            .serialize(&out_header)
+            .expect("fuse_out_header serializes");
+        #[cfg(feature = "tokio-runtime")]
+        crate::raw::connection::fuse_over_uring::note_reply_synthesized_by_guard();
+        if self
+            .inner
+            .unbounded_send(FuseReply {
+                data: Either::Left(data.clone()),
+                slot: self.slot,
+            })
+            .is_err()
+        {
+            self.commit_direct(Either::Left(data));
+        }
     }
 }
 
@@ -456,6 +527,15 @@ impl<FS> Session<FS> {
     pub fn get_payload_buffer(&self, slot: ReplySlot) -> Option<(u64, usize)> {
         let conn = self.fuse_connection.as_ref()?;
         conn.get_payload_buffer(slot)
+    }
+
+    /// A handle for traffic the FUSE protocol defines as **no-reply**
+    /// (`FUSE_NOTIFY_REPLY`; FORGET/BATCH_FORGET and INTERRUPT do not
+    /// even take one). It can still carry an error reply, but it owes
+    /// nothing, so finishing silently is correct rather than a lost
+    /// reply.
+    fn no_reply_tx(&self) -> ReplyTx {
+        ReplyTx::no_reply(self.response_sender.clone())
     }
 
     /// The one reply handle for `request` (FUSE-2): it owes the kernel
@@ -1011,7 +1091,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 Err(err) => {
                     debug!("receive unknown opcode {}", err.0);
 
-                    reply_error_in_place(libc::ENOSYS.into(), request, self.reply_tx(&request)).await;
+                    reply_error_in_place(libc::ENOSYS.into(), request, self.reply_tx(&request))
+                        .await;
 
                     continue;
                 }
@@ -2626,7 +2707,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         p.len()
                     );
 
-                    reply_error_in_place(libc::EINVAL.into(), request, self.reply_tx(&request)).await;
+                    reply_error_in_place(libc::EINVAL.into(), request, self.reply_tx(&request))
+                        .await;
 
                     return;
                 }
@@ -2639,7 +2721,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 if write_in.size as usize != data.len() {
                     error!("fuse_write_in body len is invalid");
 
-                    reply_error_in_place(libc::EINVAL.into(), request, self.reply_tx(&request)).await;
+                    reply_error_in_place(libc::EINVAL.into(), request, self.reply_tx(&request))
+                        .await;
 
                     return;
                 }
@@ -4193,7 +4276,12 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         mut data: &[u8],
         fs: &Arc<FS>,
     ) {
-        let resp_sender = self.reply_tx(&request);
+        // FUSE_NOTIFY_REPLY (opcode 41) is the kernel's answer to OUR
+        // `NOTIFY_RETRIEVE`; the protocol expects no reply, so this
+        // handle owes nothing and must not synthesize one when the
+        // handler finishes silently. (Its error arm below is today's
+        // behavior, kept verbatim.)
+        let resp_sender = self.no_reply_tx();
 
         let notify_retrieve_in =
             match get_bincode_config().deserialize::<fuse_notify_retrieve_in>(data) {
@@ -4695,21 +4783,22 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     ) {
         let mut resp_sender = self.reply_tx(&request);
 
-        let copy_file_range_in =
-            match get_bincode_config().deserialize::<fuse_copy_file_range_in>(data) {
-                Err(err) => {
-                    error!(
-                        "deserialize fuse_copy_file_range_in failed {}, request unique {}",
-                        err, request.unique
-                    );
+        let copy_file_range_in = match get_bincode_config()
+            .deserialize::<fuse_copy_file_range_in>(data)
+        {
+            Err(err) => {
+                error!(
+                    "deserialize fuse_copy_file_range_in failed {}, request unique {}",
+                    err, request.unique
+                );
 
-                    reply_error_in_place(libc::EINVAL.into(), request, self.reply_tx(&request)).await;
+                reply_error_in_place(libc::EINVAL.into(), request, self.reply_tx(&request)).await;
 
-                    return;
-                }
+                return;
+            }
 
-                Ok(copy_file_range_in) => copy_file_range_in,
-            };
+            Ok(copy_file_range_in) => copy_file_range_in,
+        };
 
         let fs = fs.clone();
 
@@ -4807,21 +4896,16 @@ async fn reply_none_in_place(request: Request, mut sender: ReplyTx) {
 /// session, so every in-flight request on that session loses its reply
 /// at once (the FUSE-2 failure mode, triggered by one short message).
 fn notify_retrieve_body(data: &[u8], size: usize) -> Option<&[u8]> {
-    // PRE-FIX POLICY (FUSE-3l): the split is unchecked — a short message
-    // panics the DISPATCH task and takes the whole session with it.
-    let rest = &data[FUSE_NOTIFY_RETRIEVE_IN_SIZE..];
-    if rest.len() < size {
-        return None;
-    }
-    Some(&rest[..size])
+    data.get(FUSE_NOTIFY_RETRIEVE_IN_SIZE..)
+        .filter(|rest| rest.len() >= size)
+        .map(|rest| &rest[..size])
 }
 
 /// FUSE-3l: the `BATCH_FORGET` body after its `fuse_batch_forget_in`
 /// header, or `None` when the request is shorter than its own header.
 /// Same dispatch-task blast radius as [`notify_retrieve_body`].
 fn batch_forget_body(data: &[u8]) -> Option<&[u8]> {
-    // PRE-FIX POLICY (FUSE-3l): unchecked split — see above.
-    Some(&data[FUSE_BATCH_FORGET_IN_SIZE..])
+    data.get(FUSE_BATCH_FORGET_IN_SIZE..)
 }
 
 /// One handler-lane future (boxed for the lane channels).
@@ -5356,7 +5440,10 @@ mod reply_guard_tests {
             Either::Left(d) => d,
             Either::Right((d, _, _)) => d,
         };
-        assert!(bytes.len() >= FUSE_OUT_HEADER_SIZE, "reply carries a header");
+        assert!(
+            bytes.len() >= FUSE_OUT_HEADER_SIZE,
+            "reply carries a header"
+        );
         (
             u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
             i32::from_le_bytes(bytes[4..8].try_into().unwrap()),
@@ -5382,8 +5469,7 @@ mod reply_guard_tests {
         assert_eq!(unique, 4242, "the synthesized reply addresses the request");
         assert_eq!(error, -libc::EIO, "an unanswered request fails EIO");
         assert_eq!(
-            reply.slot,
-            req.slot,
+            reply.slot, req.slot,
             "the synthesized reply commits against the request's own slot"
         );
     }
@@ -5420,8 +5506,12 @@ mod reply_guard_tests {
     async fn reply_error_in_place_is_the_one_reply() {
         let (tx, mut rx) = unbounded();
         let req = request(11, ring_slot(2, 6));
-        reply_error_in_place(libc::ENOSYS.into(), req, ReplyTx::owing(tx, &req, req.slot, None))
-            .await;
+        reply_error_in_place(
+            libc::ENOSYS.into(),
+            req,
+            ReplyTx::owing(tx, &req, req.slot, None),
+        )
+        .await;
         let reply = rx.next().await.expect("the error reply");
         assert_eq!(out_header(&reply).1, -libc::ENOSYS);
         assert!(rx.next().await.is_none(), "exactly one reply");

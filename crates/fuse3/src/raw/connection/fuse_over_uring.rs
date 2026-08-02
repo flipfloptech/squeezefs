@@ -342,13 +342,31 @@ impl SlotTable {
     /// A kernel delivery landed on `ent`.
     pub(crate) fn on_deliver(&mut self, ent: usize, unique: u64, commit_id: u64) -> DeliverOutcome {
         self.assert_owner();
-        // PRE-FIX POLICY (FUSE-2 rows 4/10): today's `pending.insert`
-        // silently overwrites, so a displaced request is invisible.
+        let displaced = match self.states[ent] {
+            SlotState::Delivered { unique: prev, .. } | SlotState::Parked { unique: prev, .. } => {
+                // The kernel handed us a new request on a slot whose
+                // previous request we never answered. Its commit id is
+                // gone with it, so no commit can be submitted for it —
+                // this is the tripwire's honest case.
+                TRANSPORT_REQUESTS_ABANDONED.fetch_add(1, Ordering::Relaxed);
+                Some(prev)
+            }
+            _ => None,
+        };
+        self.register_failures[ent] = 0;
+        self.retry_at[ent] = None;
         self.states[ent] = SlotState::Delivered { unique, commit_id };
-        DeliverOutcome::Accepted
+        match displaced {
+            Some(unique) => DeliverOutcome::DisplacedRequest { unique },
+            None => DeliverOutcome::Accepted,
+        }
     }
 
-    /// A delivery with `unique == 0` (the kernel filled only `commit_id`).
+    /// A delivery with `unique == 0` (the kernel filled only `commit_id`):
+    /// there is no request to serve, but the ent must still be committed
+    /// or it stays in USERSPACE forever (`waiting ≥ 1`, umount EBUSY).
+    /// Recorded as an owed slot so the forced EIO commit below is the
+    /// state machine's normal exit rather than a special case.
     pub(crate) fn on_deliver_degenerate(&mut self, ent: usize, commit_id: u64) {
         self.assert_owner();
         self.states[ent] = SlotState::Delivered {
@@ -360,84 +378,142 @@ impl SlotTable {
     /// A `CommitMsg` for `ent` arrived on the queue's commit channel.
     pub(crate) fn admit_commit(&self, ent: usize, commit_id: u64) -> CommitAdmit {
         self.assert_owner();
-        // PRE-FIX POLICY (FUSE-3e): today the worker commits whatever
-        // arrives — a second commit for one ent overwrites the first.
-        let _ = (ent, commit_id);
-        CommitAdmit::Accept
+        match self.states[ent] {
+            SlotState::Delivered {
+                commit_id: owed, ..
+            } if owed == commit_id => CommitAdmit::Accept,
+            // Everything else is a reply the slot does not owe: a second
+            // reply for one request (FUSE-3e — the release-build silent
+            // overwrite), a reply that lost the race with a teardown
+            // drain or a synthesized error, or a reply addressed at a
+            // request the slot no longer holds.
+            _ => {
+                TRANSPORT_REPLIES_REFUSED_STALE.fetch_add(1, Ordering::Relaxed);
+                CommitAdmit::RefuseStale
+            }
+        }
     }
 
     /// The admitted commit had to park behind a live payload lease.
     pub(crate) fn on_commit_parked(&mut self, ent: usize) {
         self.assert_owner();
-        // PRE-FIX POLICY: parking is not tracked in slot state today.
-        let _ = ent;
+        if let SlotState::Delivered { unique, commit_id } = self.states[ent] {
+            self.states[ent] = SlotState::Parked { unique, commit_id };
+        }
     }
 
-    /// A COMMIT_AND_FETCH SQE for `ent` was pushed onto the ring.
+    /// A COMMIT_AND_FETCH SQE for `ent` was pushed onto the ring — the
+    /// slot's ONE exit from owing a reply.
     pub(crate) fn on_commit_submitted(&mut self, ent: usize, commit_id: u64) {
         self.assert_owner();
-        // PRE-FIX POLICY: no state is kept, so a late/duplicate reply is
-        // indistinguishable from the live one.
-        let _ = (ent, commit_id);
+        self.states[ent] = SlotState::Replied { commit_id };
     }
 
-    /// Row 6: a transient COMMIT failure is about to be re-committed.
+    /// Row 6: a transient COMMIT failure is about to be re-committed
+    /// (the ent still holds its applied reply, so this is a re-push of
+    /// the SAME commit, never a re-REGISTER).
     pub(crate) fn on_commit_retry(&mut self, ent: usize) {
         self.assert_owner();
-        let _ = ent;
+        if let SlotState::Replied { commit_id } = self.states[ent] {
+            self.states[ent] = SlotState::Delivered {
+                unique: 0,
+                commit_id,
+            };
+        }
     }
 
     /// A REGISTER SQE for `ent` was pushed onto the ring.
     pub(crate) fn on_register_submitted(&mut self, ent: usize) {
         self.assert_owner();
-        // PRE-FIX POLICY (row 5): today's reclaim path re-REGISTERs
-        // without ever asking whether the slot still owed a reply.
+        // Re-REGISTERing a slot that still owes a reply IS the loss row 5
+        // describes; the caller must `fail_ent` first. Counting it here
+        // makes an omission visible instead of silent.
+        if matches!(
+            self.states[ent],
+            SlotState::Delivered { .. } | SlotState::Parked { .. }
+        ) {
+            TRANSPORT_REQUESTS_ABANDONED.fetch_add(1, Ordering::Relaxed);
+        }
+        self.retry_at[ent] = None;
         self.states[ent] = SlotState::Registered;
     }
 
     /// Every non-reply exit routes here (FUSE-2's single `fail_ent`
-    /// helper).
+    /// helper): CQE-error reclaim, a failed inbound push, a refused
+    /// delivery, teardown drain.
+    /// The caller MUST submit the returned commit (or call
+    /// [`Self::abandon`] if it cannot): the slot is moved out of
+    /// `Delivered` here so a second `fail_ent` on the same slot can
+    /// never produce a second commit.
     pub(crate) fn fail_ent(&mut self, ent: usize) -> FailOutcome {
         self.assert_owner();
-        // PRE-FIX POLICY (row 5): today the pending entry is `retain`ed
-        // away with no reply synthesized at all.
-        let _ = ent;
-        FailOutcome::Nothing
+        match self.states[ent] {
+            SlotState::Delivered { unique, commit_id }
+            | SlotState::Parked { unique, commit_id } => {
+                TRANSPORT_REQUESTS_FAILED_SYNTHETIC.fetch_add(1, Ordering::Relaxed);
+                self.states[ent] = SlotState::Replied { commit_id };
+                FailOutcome::Synthesize { unique, commit_id }
+            }
+            _ => FailOutcome::Nothing,
+        }
     }
 
-    /// The request on this slot can never be answered.
+    /// The request on this slot can never be answered (no commit id to
+    /// address, or the ring is gone): count it on the must-stay-0
+    /// tripwire.
     pub(crate) fn abandon(&mut self, ent: usize) {
         self.assert_owner();
-        // PRE-FIX POLICY: `shutdown`'s `pending.clear()` (row 8) drops
-        // requests silently and counts nothing.
-        let _ = ent;
+        if matches!(
+            self.states[ent],
+            SlotState::Delivered { .. } | SlotState::Parked { .. }
+        ) {
+            TRANSPORT_REQUESTS_ABANDONED.fetch_add(1, Ordering::Relaxed);
+        }
+        self.states[ent] = SlotState::Registered;
     }
 
     /// FUSE-3a: a REGISTER CQE for `ent` failed with a non-fatal errno.
     pub(crate) fn note_register_failure(&mut self, ent: usize, now: Instant) -> RegisterAction {
         self.assert_owner();
-        // PRE-FIX POLICY: today's loop re-REGISTERs immediately, forever,
-        // with one `warn!` per iteration and no cap.
-        let _ = (ent, now);
-        RegisterAction::Retry {
-            after: Duration::ZERO,
+        self.register_failures[ent] += 1;
+        if self.register_failures[ent] >= REGISTER_RETRY_MAX {
+            self.states[ent] = SlotState::Retired;
+            self.retry_at[ent] = None;
+            TRANSPORT_ENTS_RETIRED.fetch_add(1, Ordering::Relaxed);
+            return RegisterAction::Retire;
         }
+        let shift = self.register_failures[ent] - 1;
+        let after = REGISTER_BACKOFF_BASE
+            .checked_mul(1u32 << shift.min(16))
+            .unwrap_or(REGISTER_BACKOFF_MAX)
+            .min(REGISTER_BACKOFF_MAX);
+        self.retry_at[ent] = Some(now + after);
+        RegisterAction::Retry { after }
     }
 
     /// FUSE-3a: a REGISTER for `ent` completed successfully.
     pub(crate) fn note_register_success(&mut self, ent: usize) {
         self.assert_owner();
-        let _ = ent;
+        self.register_failures[ent] = 0;
+        self.retry_at[ent] = None;
     }
 
-    /// FUSE-3a: ents whose backoff has expired.
+    /// FUSE-3a: ents whose backoff has expired and that are due a
+    /// re-REGISTER push (consumes the deadline).
     pub(crate) fn register_retries_due(&mut self, now: Instant) -> Vec<usize> {
         self.assert_owner();
-        let _ = now;
-        Vec::new()
+        let mut due = Vec::new();
+        for ent in 0..self.retry_at.len() {
+            if matches!(self.retry_at[ent], Some(t) if t <= now) {
+                self.retry_at[ent] = None;
+                due.push(ent);
+            }
+        }
+        due
     }
 
-    /// FUSE-3a: the soonest outstanding REGISTER retry.
+    /// FUSE-3a: the soonest outstanding REGISTER retry, which bounds the
+    /// worker's ring wait (an idle queue gets no CQE to wake it).
     pub(crate) fn next_retry_deadline(&self) -> Option<Instant> {
         self.retry_at.iter().flatten().min().copied()
     }
@@ -478,14 +554,21 @@ pub(crate) enum RingOp {
 /// `user_data` reserved for the wake-fd PollAdd (unchanged).
 pub(crate) const UD_POLL: u64 = u64::MAX;
 
+/// Op-class tag in the high half of `user_data` (the low half carries
+/// the ent index; ring depth is clamped to 32 by knob, so 32 bits of
+/// index is unbounded headroom).
+const UD_TAG_SHIFT: u32 = 32;
+const UD_TAG_REGISTER: u64 = 1;
+const UD_TAG_COMMIT: u64 = 2;
+
 /// Encode `(op, ent_idx)` into an SQE `user_data` word.
 #[inline]
 pub(crate) fn encode_user_data(op: RingOp, ent_idx: usize) -> u64 {
-    // PRE-FIX POLICY (row 6): both op classes ride the bare ent index,
-    // which is exactly why an EAGAIN'd COMMIT cannot be told apart from
-    // an EAGAIN'd REGISTER.
-    let _ = op;
-    ent_idx as u64
+    let tag = match op {
+        RingOp::Register => UD_TAG_REGISTER,
+        RingOp::Commit => UD_TAG_COMMIT,
+    };
+    (tag << UD_TAG_SHIFT) | (ent_idx as u64 & 0xFFFF_FFFF)
 }
 
 /// Decode a CQE `user_data` word — `None` for the poll marker.
@@ -494,9 +577,15 @@ pub(crate) fn decode_user_data(user_data: u64) -> Option<(RingOp, usize)> {
     if user_data == UD_POLL {
         return None;
     }
-    // PRE-FIX POLICY (row 6): the class was never encoded, so every CQE
-    // reads as a REGISTER completion.
-    Some((RingOp::Register, user_data as usize))
+    let op = match user_data >> UD_TAG_SHIFT {
+        UD_TAG_REGISTER => RingOp::Register,
+        UD_TAG_COMMIT => RingOp::Commit,
+        // A word this worker never pushed (kernel echo of an unknown op
+        // class): treat as a REGISTER completion — the historical
+        // reading — rather than dropping the CQE.
+        _ => RingOp::Register,
+    };
+    Some((op, (user_data & 0xFFFF_FFFF) as usize))
 }
 
 struct QueueHandle {
@@ -2023,7 +2112,6 @@ impl FuseOverUring {
     /// addressing and watch geometry still need a stride).
     pub const SIM_DEPTH: usize = 32;
 
-
     /// In-crate sim variant keeping the per-queue commit receivers alive
     /// so `submit_reply` round-trips (the teardown pins).
     #[cfg(test)]
@@ -2141,7 +2229,7 @@ impl FuseOverUring {
     /// Commit a reply against the slot its request was delivered on.
     ///
     /// PERF-16: no map probe, no mutex — the address rode the request.
-    /// The queue worker's [`SlotTable`] is the authority on whether the
+    /// The queue worker's `SlotTable` is the authority on whether the
     /// slot still owes this reply (double / late / mis-addressed replies
     /// are refused there, loud-never-fatally, never overwriting a live
     /// commit).
@@ -3397,7 +3485,11 @@ fn queue_worker(
                     // the refs == 0 gate; header-only reply, payload untouched.
                     debug_assert!(!lease_states[ent_idx].leased());
                     slots.on_deliver_degenerate(ent_idx, cid);
-                    apply_reply(&mut ents[ent_idx], &error_out_header(0, libc::EIO), &Bytes::new());
+                    apply_reply(
+                        &mut ents[ent_idx],
+                        &error_out_header(0, libc::EIO),
+                        &Bytes::new(),
+                    );
                     submit_commit(
                         &mut ring,
                         &mut batch,
@@ -3711,7 +3803,11 @@ fn queue_worker(
             };
             // Header-only: apply_reply never touches the payload region when
             // the reply has no body beyond the 16-byte fuse_out_header.
-            apply_reply(&mut ents[idx], &error_out_header(unique, libc::EIO), &Bytes::new());
+            apply_reply(
+                &mut ents[idx],
+                &error_out_header(unique, libc::EIO),
+                &Bytes::new(),
+            );
         }
         if submit_commit(
             &mut ring,
@@ -5626,7 +5722,7 @@ mod inbound_queue_tests {
         while q.rx.try_lock().is_ok() {
             tokio::task::yield_now().await;
         }
-        q.push(req(42));
+        q.push(req(42)).expect("live receiver accepts");
         let (r, elapsed) = popper.await.expect("popper task");
         assert_eq!(r.expect("pushed request").unique, 42);
         assert!(

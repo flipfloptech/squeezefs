@@ -3251,6 +3251,13 @@ pub struct Metrics {
     /// task, so this counter is the only record its work was lost —
     /// **0 on a healthy daemon**; the log line names the site.
     pub detached_task_panics: Align64<AtomicU64>,
+    /// RES-22 (pre-RC engineering spec §7): runtime CONCURRENCY-outcome
+    /// invariant violations, reported through
+    /// [`crate::note_invariant_tripwire`] instead of a `debug_assert!`
+    /// panic inside a handler task (the class that produced a lost-reply
+    /// stall — see the `transport_lease_overlong` precedent). **0 on a
+    /// healthy daemon**; the log line names the site.
+    pub invariant_tripwires: Align64<AtomicU64>,
     /// Drains self-paused by the §5.2 checkpoint-time capacity
     /// re-verification (state `paused-capacity`) instead of running the
     /// survivors to StorageFull.
@@ -6001,6 +6008,10 @@ impl SqueezefsFilesystem {
                 // record a fire-and-forget task's work was lost
                 // (must stay 0 on a healthy daemon).
                 "detached_task_panics": METRICS.detached_task_panics.load(Ordering::Relaxed),
+                // RES-22: concurrency-outcome invariant violations,
+                // reported instead of panicking a handler task
+                // (must stay 0 on a healthy daemon).
+                "invariant_tripwires": METRICS.invariant_tripwires.load(Ordering::Relaxed),
                 "job_paused_capacity": METRICS.job_paused_capacity.load(Ordering::Relaxed),
                 "evacuate_blocks_moved": METRICS.evacuate_blocks_moved.load(Ordering::Relaxed),
                 "evacuate_bytes_moved": METRICS.evacuate_bytes_moved.load(Ordering::Relaxed),
@@ -8633,11 +8644,15 @@ impl SqueezefsFilesystem {
                 return Ok(false);
             }
             let completed = entry.value_mut().merge_extent(rel_start, data);
-            debug_assert!(
-                !completed,
-                "an extent overlay cannot complete coverage: escalation at \
-                 25% strictly precedes any full-coverage transition"
-            );
+            // RES-22: a COVERAGE-TRANSITION outcome under concurrent
+            // writers, not arithmetic — report, never panic a handler.
+            if completed {
+                crate::note_invariant_tripwire(
+                    "extent_overlay_completed_coverage",
+                    "an extent overlay completed coverage: escalation at 25% is \
+                     supposed to strictly precede any full-coverage transition",
+                );
+            }
             METRICS.extent_parks.fetch_add(1, Ordering::Relaxed);
             let count = entry.value().extent_count() as u64;
             let bytes = entry.value().extent_payload_bytes();
@@ -8701,7 +8716,13 @@ impl SqueezefsFilesystem {
             return Ok(false);
         }
         let completed = overlay.merge_extent(rel_start, data);
-        debug_assert!(!completed, "small first write cannot complete a block");
+        // RES-22: a coverage-transition outcome (see the sibling site).
+        if completed {
+            crate::note_invariant_tripwire(
+                "small_first_write_completed_block",
+                "a small first write completed a whole block's coverage",
+            );
+        }
         METRICS.extent_parks.fetch_add(1, Ordering::Relaxed);
         let count = overlay.extent_count() as u64;
         let bytes = overlay.extent_payload_bytes();
@@ -9262,12 +9283,18 @@ impl SqueezefsFilesystem {
                     .active_block_buffers
                     .get(cache_key)
                     .expect("parked entry cannot vanish under the held block lock");
-                debug_assert!(
-                    entry.value().is_content_valid() && !entry.value().seed_deferred(),
-                    "a coverage-complete buffer must be content-valid with \
-                             its deferral cleared (record_write's completion \
-                             transition owns both)"
-                );
+                // RES-22: a state-machine outcome established by another
+                // task's `record_write` completion transition — a
+                // schedule property, so report rather than panic (a panic
+                // here loses the WRITE reply).
+                if !entry.value().is_content_valid() || entry.value().seed_deferred() {
+                    crate::note_invariant_tripwire(
+                        "coverage_complete_buffer_not_content_valid",
+                        "a coverage-complete buffer was not content-valid with its \
+                         deferral cleared (record_write's completion transition owns \
+                         both)",
+                    );
+                }
                 entry.value().snapshot()
             };
             match self
@@ -10034,10 +10061,14 @@ impl SqueezefsFilesystem {
             )
             .await?;
         pipeline_phase_record(PipelinePhase::Publish, t_publish);
-        debug_assert!(
-            displaced.is_empty(),
-            "a same-key in-place merge can displace nothing"
-        );
+        // RES-22: a MERGE outcome decided under INODE_META_LOCKS against
+        // whatever the current map is — a schedule property.
+        if !displaced.is_empty() {
+            crate::note_invariant_tripwire(
+                "inplace_merge_displaced_keys",
+                "a same-key in-place merge displaced keys, which it cannot do",
+            );
+        }
         if space_pressure {
             METRICS
                 .write_through_inplace_rewrites

@@ -885,11 +885,18 @@ impl ActiveBlockBuf {
     /// unwritten gap (elided when the buffer is already content-valid).
     /// Idempotent. Callers hold this block's `BLOCK_FLUSH_LOCKS`.
     pub fn zero_complete(&mut self) {
-        debug_assert!(
-            !self.deferred_seed,
-            "zero_complete on a deferred-seed buffer: the owner must \
-             materialize the old-block seed first (item B exit contract)"
-        );
+        // RES-22: an ORDERING outcome between the owner's seed
+        // materialization and this exit — a schedule property, and a
+        // panic here would lose the caller's block. Report and proceed:
+        // the exit still establishes content-validity, which is the
+        // never-strand direction.
+        if self.deferred_seed {
+            crate::note_invariant_tripwire(
+                "zero_complete_on_deferred_seed",
+                "zero_complete on a deferred-seed buffer: the owner must \
+                 materialize the old-block seed first (item B exit contract)",
+            );
+        }
         // Whole-image exit reached with an extent overlay: escalate first
         // (correct + counted; designed routes fold instead).
         self.implicit_escalate();
@@ -921,7 +928,15 @@ impl ActiveBlockBuf {
     /// memset; a deferred seed is skipped forever (the row-4 win).
     fn complete_written_union(&mut self) {
         let len = self.block_size as usize;
-        debug_assert!(self.written_extra.is_empty());
+        // RES-22: a COALESCING outcome of the out-of-order run merge —
+        // kernel-split writes decide it, not this call's arguments.
+        if !self.written_extra.is_empty() {
+            crate::note_invariant_tripwire(
+                "complete_union_with_extra_runs",
+                "the written union completed with out-of-order runs still \
+                 uncoalesced",
+            );
+        }
         if self.deferred_seed {
             self.deferred_seed = false;
             crate::fuse_client::METRICS

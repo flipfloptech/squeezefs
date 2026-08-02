@@ -169,6 +169,51 @@ pub fn coarse_realtime_ns() -> u64 {
     t.tv_sec.wrapping_mul(1_000_000_000).wrapping_add(t.tv_nsec) as u64
 }
 
+/// RES-22 (pre-RC engineering spec §7): report a runtime
+/// **concurrency-outcome** invariant violation — loud, counted, never
+/// fatal.
+///
+/// `debug_assert!` is right for pure arithmetic (bounds, LBA alignment,
+/// range ordering): the predicate is a property of the caller's
+/// arguments and a violation is a coding error. It is wrong for a
+/// predicate whose truth depends on a concurrent schedule — those hold
+/// in every schedule the author imagined and fail in the one production
+/// finds, and in a debug build the failure is a PANIC inside a handler
+/// task. That is the class that already produced a lost-reply stall
+/// here: the §5.4 transport-lease watchdog's `debug_assert` panicked
+/// write-handler tasks whose invocations legitimately exceeded 1 s under
+/// writeback backpressure — losing the FUSE reply (fsync in D-state
+/// forever, umount joins) — and the fix was to make it the
+/// loud-never-fatal `transport_lease_overlong` tripwire.
+///
+/// Counted in `invariant_tripwires` (stats inode; **0 on a healthy
+/// daemon**). The log line is rate-limited to one per site per second so
+/// a violation that fires per-op cannot itself become the outage.
+pub fn note_invariant_tripwire(site: &'static str, detail: &str) {
+    crate::fuse_client::METRICS
+        .invariant_tripwires
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    static LAST: once_cell::sync::Lazy<scc::HashMap<&'static str, std::sync::atomic::AtomicU64>> =
+        once_cell::sync::Lazy::new(scc::HashMap::new);
+    let now = coarse_realtime_ns() / 1_000_000_000;
+    let quiet = LAST
+        .read_sync(&site, |_, last| {
+            last.swap(now, std::sync::atomic::Ordering::Relaxed) == now
+        })
+        .unwrap_or_else(|| {
+            let _ = LAST.insert_sync(site, std::sync::atomic::AtomicU64::new(now));
+            false
+        });
+    if !quiet {
+        log::error!(
+            "INVARIANT TRIPWIRE '{site}': {detail} — a concurrency outcome the \
+             design says cannot happen just happened. Counted in \
+             invariant_tripwires; the daemon proceeds (a panic here would lose \
+             a FUSE reply, which is strictly worse than a wrong-but-served op)"
+        );
+    }
+}
+
 pub fn fs_prefix() -> &'static str {
     *FS_PREFIX.read()
 }

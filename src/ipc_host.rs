@@ -3042,7 +3042,13 @@ fn futex_wait_many<'a>(waiters: impl Iterator<Item = (&'a AtomicU32, u32)>, time
         n += 1;
     }
     let Some((first_word, first_expected)) = first else {
-        debug_assert!(false, "futex_wait_many with no waiters");
+        // RES-22: whether any waiter registered is a schedule property
+        // (a racing reaper can vacate every slot between the caller's
+        // snapshot and this call) — report, never panic a service thread.
+        crate::note_invariant_tripwire(
+            "futex_wait_many_no_waiters",
+            "futex_wait_many called with no waiters",
+        );
         return;
     };
     if n == 1 {

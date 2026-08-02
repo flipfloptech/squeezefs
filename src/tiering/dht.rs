@@ -380,10 +380,7 @@ where
             value_len,
         } => {
             if has_value {
-                let mut payload = Vec::with_capacity(value_len as usize);
-                unsafe {
-                    payload.set_len(value_len as usize);
-                }
+                let mut payload = vec![0u8; value_len as usize];
                 reader.read_exact(&mut payload).await?;
                 Message::ValueResponse {
                     value: Some(Bytes::from(payload)),
@@ -393,10 +390,7 @@ where
             }
         }
         WireMessage::StoreValueHeader { key, value_len } => {
-            let mut payload = Vec::with_capacity(value_len as usize);
-            unsafe {
-                payload.set_len(value_len as usize);
-            }
+            let mut payload = vec![0u8; value_len as usize];
             reader.read_exact(&mut payload).await?;
             Message::StoreValue {
                 key,

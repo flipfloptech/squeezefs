@@ -168,28 +168,24 @@ async fn admin_roundtrip(stream: &mut TcpStream, capsule: &[u8]) -> Result<pdu::
         .write_all(capsule)
         .await
         .map_err(|e| io_err(format!("admin capsule write: {e}")))?;
-    loop {
-        let mut ch_buf = [0u8; 8];
-        stream
-            .read_exact(&mut ch_buf)
-            .await
-            .map_err(|e| io_err(format!("admin CH read: {e}")))?;
-        let ch = parse_ch(&ch_buf)?;
-        match ch.pdu_type {
-            pdu::PDU_CAPSULE_RESP => {
-                let mut rest = vec![0u8; (ch.plen as usize).saturating_sub(8)];
-                stream
-                    .read_exact(&mut rest)
-                    .await
-                    .map_err(|e| io_err(format!("admin CQE read: {e}")))?;
-                return pdu::parse_cqe(&rest).map_err(frame_err);
-            }
-            other => {
-                return Err(io_err(format!(
-                    "unexpected admin PDU type {other:#x} during bring-up"
-                )));
-            }
+    let mut ch_buf = [0u8; 8];
+    stream
+        .read_exact(&mut ch_buf)
+        .await
+        .map_err(|e| io_err(format!("admin CH read: {e}")))?;
+    let ch = parse_ch(&ch_buf)?;
+    match ch.pdu_type {
+        pdu::PDU_CAPSULE_RESP => {
+            let mut rest = vec![0u8; (ch.plen as usize).saturating_sub(8)];
+            stream
+                .read_exact(&mut rest)
+                .await
+                .map_err(|e| io_err(format!("admin CQE read: {e}")))?;
+            pdu::parse_cqe(&rest).map_err(frame_err)
         }
+        other => Err(io_err(format!(
+            "unexpected admin PDU type {other:#x} during bring-up"
+        ))),
     }
 }
 
@@ -722,7 +718,10 @@ impl LaneSession {
                 // The gather law (design §4.4): ONE pass from refcounted
                 // area chunks into the destination; dropping the fill
                 // releases the refs → chunks recycle to the refill path.
-                fill.gather_into(dest.0);
+                // SAFETY: `dest..dest+len` is the caller's exclusive
+                // destination window (read-path serve buffer); spans were
+                // bounds-validated at record time (`on_c2h_span`).
+                unsafe { fill.gather_into(dest.0) };
                 crate::fuse_client::METRICS
                     .zcrx_gather_bytes
                     .fetch_add(len as u64, Ordering::Relaxed);

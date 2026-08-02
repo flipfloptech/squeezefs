@@ -389,7 +389,9 @@ impl Drop for AlignedBufOwner {
         // Route through `recycle` so a full pool frees the buffer instead of
         // leaking it (the previous direct `queue.push` dropped over-capacity
         // buffers on the floor). Always the HOME pool (struct doc).
-        self.pool.recycle(self.ptr);
+        // SAFETY: `self.ptr` came from `self.pool.alloc_raw()` (owner
+        // invariant) and this drop is the last use of the buffer.
+        unsafe { self.pool.recycle(self.ptr) };
     }
 }
 
@@ -462,7 +464,14 @@ impl AlignedBufPool {
     }
 
     /// Return a buffer previously obtained from [`Self::alloc_raw`].
-    pub fn recycle(self: &Arc<Self>, ptr: *mut u8) {
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must have been produced by [`Self::alloc_raw`] (or [`Self::alloc`])
+    /// of **this** pool (i.e. `alloc_pooled(self.buf_size)` backing), must not
+    /// have been recycled already, and no live reference into the buffer may
+    /// outlive this call — the pointer is either re-handed out or deallocated.
+    pub unsafe fn recycle(self: &Arc<Self>, ptr: *mut u8) {
         if ptr.is_null() {
             return;
         }

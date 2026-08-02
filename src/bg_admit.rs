@@ -35,8 +35,6 @@ static STRIPED_BLOCK_CONCURRENCY_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 /// that still want a fixed historical constant (tests / docs).
 pub const STRIPED_READ_CONCURRENCY: usize = 16;
 
-/// Max concurrent block tasks inside a single prefetch job.
-
 /// Cores-based concurrency for striped block I/O (reads and writes).
 ///
 /// Policy: `clamp(cores * 2, 4, 64)` where `cores` is the PROCESS

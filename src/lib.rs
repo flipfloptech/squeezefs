@@ -1,4 +1,4 @@
-#![allow(clippy::all)]
+#![allow(clippy::style, clippy::complexity, clippy::pedantic)]
 // The stats-inode `serde_json::json!` literal exceeds the default macro
 // recursion limit (128) — compile-time only, no runtime effect.
 #![recursion_limit = "2048"]

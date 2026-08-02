@@ -1293,6 +1293,7 @@ fn blocking_fallback_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                     .read(true)
                     .write(true)
                     .create(true)
+                    .truncate(false)
                     .open(&path)
                     .and_then(|f| f.write_all_at(&data, offset))
                     .map_err(map_io);
@@ -1303,6 +1304,7 @@ fn blocking_fallback_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                     .read(true)
                     .write(true)
                     .create(true)
+                    .truncate(false)
                     .open(&path)
                     .and_then(|f| {
                         for (offset, data) in &ops {

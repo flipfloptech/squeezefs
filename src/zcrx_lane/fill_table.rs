@@ -49,10 +49,11 @@ impl ZcrxFill {
     /// payload bytes (priced in `zcrx_gather_bytes` by the caller; the Z3
     /// serve fusion folds it into `read_copy_dest_bytes`).
     ///
-    /// SAFETY contract: `dest..dest+len` is writable and exclusively the
-    /// caller's; every span was validated `datao + len ≤ command len` at
-    /// record time.
-    pub fn gather_into(&self, dest: *mut u8) {
+    /// # Safety
+    ///
+    /// `dest..dest+len` must be writable and exclusively the caller's;
+    /// every span was validated `datao + len ≤ command len` at record time.
+    pub unsafe fn gather_into(&self, dest: *mut u8) {
         for (datao, s) in &self.segs {
             let src = s.as_slice();
             // SAFETY: span bounds validated at record time (on_c2h_span);

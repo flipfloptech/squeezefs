@@ -114,7 +114,9 @@ impl AlignedBlock {
 impl Drop for AlignedBlock {
     fn drop(&mut self) {
         if self.pooled {
-            ALIGNED_BUF_POOL.recycle(self.ptr);
+            // SAFETY: `pooled` blocks were `ALIGNED_BUF_POOL.alloc_raw()`'d
+            // in `alloc_raw` and this drop is the buffer's last use.
+            unsafe { ALIGNED_BUF_POOL.recycle(self.ptr) };
         } else {
             // SAFETY: allocated in `alloc_raw` with this exact layout.
             unsafe { std::alloc::dealloc(self.ptr, Self::oversized_layout(self.len)) };

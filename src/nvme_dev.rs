@@ -72,7 +72,10 @@ fn release_write_buf(data: &WriteData) {
             }
         }
         WriteData::PooledUnaligned { ptr, .. } => {
-            crate::cache::ALIGNED_BUF_POOL.recycle(ptr.0);
+            // SAFETY: `PooledUnaligned` pointers come from
+            // `ALIGNED_BUF_POOL.alloc_raw()` (P2-4) and this release is the
+            // buffer's single terminal use.
+            unsafe { crate::cache::ALIGNED_BUF_POOL.recycle(ptr.0) };
         }
     }
 }
@@ -87,7 +90,10 @@ fn release_free_ptr(kind: FreePtrKind, p: SendPtr) {
             }
         }
         FreePtrKind::Pool => {
-            crate::cache::ALIGNED_BUF_POOL.recycle(p.0);
+            // SAFETY: `FreePtrKind::Pool` pointers come from
+            // `ALIGNED_BUF_POOL.alloc_raw()` and this release is the buffer's
+            // single terminal use.
+            unsafe { crate::cache::ALIGNED_BUF_POOL.recycle(p.0) };
         }
     }
 }
@@ -851,7 +857,9 @@ impl NvmeBlockDev {
             {
                 // Send failed; worker never took ownership. Release immediately.
                 if use_pool {
-                    pool.recycle(rp);
+                    // SAFETY: `rp` was `pool.alloc_raw()`'d above and the
+                    // worker never took ownership — this is its only release.
+                    unsafe { pool.recycle(rp) };
                 } else {
                     unsafe {
                         libc::free(rp as *mut libc::c_void);

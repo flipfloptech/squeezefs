@@ -1,4 +1,4 @@
-#![allow(clippy::all)]
+#![allow(clippy::style, clippy::complexity, clippy::pedantic)]
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;

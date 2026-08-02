@@ -241,13 +241,18 @@ fn test_aligned_buf_pool_alloc_raw_contract() {
         );
     }
 
-    pool.recycle(a);
-    pool.recycle(b);
-    pool.recycle(c); // queue full -> freed, must not poison the pool
+    // SAFETY: a/b/c came from this pool's `alloc_raw` above and are recycled
+    // exactly once, with no live references into the buffers.
+    unsafe {
+        pool.recycle(a);
+        pool.recycle(b);
+        pool.recycle(c); // queue full -> freed, must not poison the pool
+    }
 
     let again = pool.alloc_raw();
     assert!(is_aligned(again), "recycled handout must stay aligned");
-    pool.recycle(again);
+    // SAFETY: same contract as above — single recycle of this pool's handout.
+    unsafe { pool.recycle(again) };
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

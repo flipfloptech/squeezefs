@@ -8670,9 +8670,6 @@ impl DataRouter {
         Ok((block_mappings, inflight_guards))
     }
 
-    /// Register a completed stripe layout in MetaLV after durable block writes.
-    /// Block-map, refcounts, and sizes are updated atomically using the WAL-redo transaction scope.
-
     /// Striped RMW. P1-10: meta connections are phased — open for block-map
     /// reads, **dropped** before durable block I/O, re-acquired only for the
     /// atomic map/size commit and refcount cleanup (frees run after redis work).

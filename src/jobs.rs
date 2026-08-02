@@ -1942,7 +1942,7 @@ impl JobFabric {
                         }
                     }
                     (
-                        census_for(&self.meta, &ctx.router, &[volume_id.clone()])
+                        census_for(&self.meta, &ctx.router, std::slice::from_ref(volume_id))
                             .await
                             .map_err(|e| format!("census failed: {e}"))?,
                         Some(volume_id.clone()),

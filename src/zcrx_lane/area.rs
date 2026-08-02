@@ -22,14 +22,15 @@ pub const PMD_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Derived per-queue area bytes (design §8): `depth × max_xfer` rounded
 /// up to PMD, floor one PMD.
-pub fn area_bytes_per_queue(_depth: u16, _max_xfer_bytes: u32) -> u64 {
-    0 // Z2 phase A stub — contracts red
+pub fn area_bytes_per_queue(depth: u16, max_xfer_bytes: u32) -> u64 {
+    let window = (depth as u64).saturating_mul(max_xfer_bytes as u64);
+    window.div_ceil(PMD_BYTES).max(1) * PMD_BYTES
 }
 
 /// Refill-ring entries for an area of `chunks` chunks: 1:1, next pow2
 /// (design §8; the kernel requires a power of two).
-pub fn rq_entries_for(_chunks: u64) -> u32 {
-    0 // Z2 phase A stub — contracts red
+pub fn rq_entries_for(chunks: u64) -> u32 {
+    chunks.max(1).next_power_of_two().min(u32::MAX as u64) as u32
 }
 
 /// The receive-chunk grain: one page (the kernel zcrx net_iov granule).
@@ -64,13 +65,41 @@ unsafe impl Sync for ZcrxArea {}
 
 impl ZcrxArea {
     /// Map `len` bytes (PMD-aligned base, `MADV_HUGEPAGE`), optionally
-    /// NUMA-bound to `numa_node` BEFORE first touch, chunked at
-    /// `chunk_bytes`. Charges the `zcrx_area_bytes` gauge.
+    /// NUMA-bound to `numa_node` BEFORE first touch (fault-time
+    /// placement — the numa_core arena law), chunked at `chunk_bytes`.
+    /// Charges the `zcrx_area_bytes` gauge; Drop credits it.
     pub fn new(len: u64, chunk_bytes: usize, numa_node: Option<usize>) -> Result<Arc<ZcrxArea>> {
-        let _ = (len, chunk_bytes, numa_node);
-        Err(SqueezefsError::Io(std::io::Error::other(
-            "zcrx area not implemented (PR Z2 phase A)",
-        )))
+        let len = usize::try_from(len).map_err(|_| {
+            SqueezefsError::Io(std::io::Error::other("zcrx area length overflows usize"))
+        })?;
+        if len == 0 || chunk_bytes == 0 || len % chunk_bytes != 0 {
+            return Err(SqueezefsError::Io(std::io::Error::other(format!(
+                "zcrx area geometry invalid: len={len} chunk={chunk_bytes}"
+            ))));
+        }
+        let base = map_anon_pmd_aligned(len).ok_or_else(|| {
+            SqueezefsError::Io(std::io::Error::other(format!(
+                "zcrx area mmap failed ({len} bytes)"
+            )))
+        })?;
+        // SAFETY: advisory on our own fresh mapping.
+        unsafe { libc::madvise(base as *mut libc::c_void, len, libc::MADV_HUGEPAGE) };
+        // NUMA bind BEFORE first touch (refusal-tolerant: placement is an
+        // optimization, never a correctness need — numa_core contract).
+        if let Some(node) = numa_node {
+            let took = crate::numa_core::topology().bind_region_preferred(base, len, node);
+            log::debug!("zcrx-lane: area bind to node {node}: took={took} ({len} bytes)");
+        }
+        crate::fuse_client::METRICS
+            .zcrx_area_bytes
+            .fetch_add(len as u64, Ordering::Relaxed);
+        Ok(Arc::new(ZcrxArea {
+            base,
+            len,
+            chunk: chunk_bytes,
+            ledger: SpanLedger::new(len / chunk_bytes),
+            freed: tokio::sync::Notify::new(),
+        }))
     }
 
     pub fn base(&self) -> *mut u8 {
@@ -99,14 +128,27 @@ impl ZcrxArea {
     /// admission semaphore so this can only starve transiently.
     pub async fn grant_chunk(self: &Arc<Self>) -> GrantRef {
         loop {
+            // Register interest BEFORE the probe (the notify-then-check
+            // race: a release between try_grant and notified() must not
+            // strand this waiter).
+            let notified = self.freed.notified();
             if let Some(slot) = self.ledger.try_grant() {
                 return GrantRef {
                     area: Arc::clone(self),
                     slot,
                 };
             }
-            self.freed.notified().await;
+            notified.await;
         }
+    }
+
+    /// Non-blocking grant (the real backend's driver thread never awaits;
+    /// the kernel rq ring is its backpressure venue).
+    pub fn try_grant_chunk(self: &Arc<Self>) -> Option<GrantRef> {
+        self.ledger.try_grant().map(|slot| GrantRef {
+            area: Arc::clone(self),
+            slot,
+        })
     }
 
     fn release_slot(&self, slot: u32) {
@@ -127,6 +169,59 @@ impl Drop for ZcrxArea {
                 .fetch_sub(self.len as u64, Ordering::Relaxed);
         }
     }
+}
+
+/// Anonymous private RW mapping whose base is PMD-aligned — the
+/// `thp.rs map_shared_pmd_aligned` reservation trick (over-reserve
+/// PROT_NONE, MAP_FIXED the real mapping at the aligned offset, trim the
+/// slack) over MAP_ANONYMOUS instead of an fd.
+fn map_anon_pmd_aligned(len: usize) -> Option<*mut u8> {
+    let pmd = PMD_BYTES as usize;
+    let span = len.checked_add(pmd)?;
+    // SAFETY: fresh anonymous PROT_NONE reservation.
+    let reserve = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            span,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if reserve == libc::MAP_FAILED {
+        return None;
+    }
+    let addr = reserve as usize;
+    let aligned = (addr + pmd - 1) & !(pmd - 1);
+    let head = aligned - addr;
+    let tail = span - head - len;
+    // SAFETY: MAP_FIXED inside our own reservation.
+    let base = unsafe {
+        libc::mmap(
+            aligned as *mut libc::c_void,
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+            -1,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        // SAFETY: unmapping our own reservation.
+        unsafe { libc::munmap(reserve, span) };
+        return None;
+    }
+    // SAFETY: trimming the slack of our own reservation.
+    unsafe {
+        if head > 0 {
+            libc::munmap(reserve, head);
+        }
+        if tail > 0 {
+            libc::munmap((aligned + len) as *mut libc::c_void, tail);
+        }
+    }
+    Some(base as *mut u8)
 }
 
 /// A held reference on one granted chunk. Clone = add_ref; Drop =
@@ -181,8 +276,8 @@ unsafe impl Send for AreaSlice {}
 unsafe impl Sync for AreaSlice {}
 
 impl AreaSlice {
-    /// A slice over `[off, off+len)` of `grant`'s chunk-resident bytes
-    /// at `ptr` (the receive extent, not necessarily a whole chunk).
+    /// A slice over `len` chunk-resident bytes at `ptr` (the receive
+    /// extent, not necessarily a whole chunk).
     pub fn new(grant: GrantRef, ptr: *const u8, len: usize) -> Self {
         AreaSlice { grant, ptr, len }
     }
@@ -215,5 +310,20 @@ impl AreaSlice {
 /// gauge is the process-wide `zcrx_area_bytes` sum over live areas —
 /// design §7: Red blocks NEW arms and sheds nothing).
 pub fn register_r5_component() {
-    // Z2 phase A stub — contracts red.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::mem_budget::MEM_BUDGET.register(crate::mem_budget::Component::new(
+            "zcrx_area",
+            0,
+            1,
+            std::sync::Arc::new(|| {
+                crate::fuse_client::METRICS
+                    .zcrx_area_bytes
+                    .load(Ordering::Relaxed)
+            }),
+            // Non-sheddable: the area is fixed registered DMA memory —
+            // Red blocks NEW arms (`arm_admission`) instead.
+            std::sync::Arc::new(|_| {}),
+        ));
+    });
 }

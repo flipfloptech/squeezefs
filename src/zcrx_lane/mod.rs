@@ -13,8 +13,11 @@
 
 pub mod area;
 pub mod area_core;
+mod area_queue;
+pub mod fill_table;
 pub mod initiator;
 pub mod pdu;
+pub mod pdu_stream;
 pub mod probe;
 pub mod steering;
 
@@ -45,8 +48,8 @@ pub fn lane_area_sim_backend() -> bool {
 /// R5 arm gate (design §7): Red blocks NEW lane arms (the area is a fixed
 /// non-sheddable component); Green/Yellow admit. Pure — the ladder wires
 /// it to the live `mem_budget` level.
-pub fn arm_admission(_level: crate::mem_budget::Level) -> bool {
-    true // Z2 phase A stub — contracts red
+pub fn arm_admission(level: crate::mem_budget::Level) -> bool {
+    !matches!(level, crate::mem_budget::Level::Red)
 }
 
 /// Dev/test target override: `traddr,trsvcid,subnqn,nsid,lba_shift,max_xfer`

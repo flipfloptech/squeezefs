@@ -40,6 +40,18 @@ fn io_err(msg: String) -> SqueezefsError {
     SqueezefsError::Io(std::io::Error::other(msg))
 }
 
+/// The one session-poison transition (design §7 + the Z2 poison lattice):
+/// idempotent; the winning transition counts the `zcrx_lane_poisoned`
+/// tripwire and drops the `zcrx_lane_armed` gauge — the funnel routes
+/// every subsequent op to the kernel path for the mount lifetime.
+pub(crate) fn mark_session_poisoned(flag: &AtomicBool) {
+    if !flag.swap(true, Ordering::SeqCst) {
+        let m = &crate::fuse_client::METRICS;
+        m.zcrx_lane_poisoned.fetch_add(1, Ordering::Relaxed);
+        m.zcrx_lane_armed.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Raw destination pointer crossing into the reader task. SAFETY contract:
 /// the pointee outlives the op (the caller awaits the op's oneshot before
 /// releasing the buffer), and exactly one reader task writes any given
@@ -67,7 +79,7 @@ impl QueueShared {
     fn poison(&self, why: &str, session_poison: &AtomicBool) {
         if !self.poisoned.swap(true, Ordering::SeqCst) {
             log::error!("zcrx-lane: IO queue poisoned: {why} — lane disarms, kernel path serves");
-            session_poison.store(true, Ordering::SeqCst);
+            mark_session_poisoned(session_poison);
         }
         // Fail every waiter loud; their ops retry on the kernel path
         // (reads are idempotent — design §6).
@@ -91,10 +103,25 @@ struct IoQueue {
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
+/// A lane IO queue under one of the receive backends.
+enum QueueHandle {
+    Classic(IoQueue),
+    Area(super::area_queue::AreaQueue),
+}
+
+impl QueueHandle {
+    fn tasks(&self) -> &Mutex<Vec<tokio::task::JoinHandle<()>>> {
+        match self {
+            QueueHandle::Classic(q) => &q.tasks,
+            QueueHandle::Area(q) => &q.tasks,
+        }
+    }
+}
+
 /// One armed lane association to a target subsystem.
 pub struct LaneSession {
     target: LaneTarget,
-    queues: Vec<IoQueue>,
+    queues: Vec<QueueHandle>,
     next_q: AtomicUsize,
     poisoned: Arc<AtomicBool>,
     /// Keeps the admin connection (and thus the association) alive.
@@ -184,6 +211,26 @@ fn check_status(op: &str, cqe: &pdu::Cqe) -> Result<()> {
     Ok(())
 }
 
+/// The AREA-SIM chunk geometry: page-sized by default (the kernel zcrx
+/// net_iov granule); the `SQUEEZEFS_ZCRX_LANE_SIM_CHUNK` TEST lever
+/// shrinks it (rounded to pow2, clamp 64 B..PMD) so contract suites can
+/// force header splits across chunk seams.
+fn sim_chunk_bytes() -> usize {
+    let default = super::area::chunk_bytes_default();
+    match std::env::var("SQUEEZEFS_ZCRX_LANE_SIM_CHUNK") {
+        Ok(v) => v
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .map(|n| {
+                n.next_power_of_two()
+                    .clamp(64, super::area::PMD_BYTES as usize)
+            })
+            .unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
 /// Which receive backend a lane queue runs (design §5/§6/§10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneBackend {
@@ -202,19 +249,22 @@ impl LaneSession {
         target: LaneTarget,
         backend: LaneBackend,
     ) -> Result<Arc<LaneSession>> {
-        match backend {
-            LaneBackend::Classic => Self::connect(target).await,
-            LaneBackend::AreaSim => Err(io_err(
-                "zcrx area backend not implemented (PR Z2 phase A)".into(),
-            )),
-        }
+        Self::connect_inner(target, backend).await
     }
 
     /// Area-chunk diagnostics `(free, total)` summed over the session's
-    /// area queues — the refill-discipline instrument (0, 0) on classic
+    /// area queues — the refill-discipline instrument; (0, 0) on classic
     /// backends (no area exists).
     pub fn area_chunks(&self) -> (usize, usize) {
-        (0, 0) // Z2 phase A stub — contracts red
+        let mut free = 0;
+        let mut total = 0;
+        for q in &self.queues {
+            if let QueueHandle::Area(q) = q {
+                free += q.area.free_chunks();
+                total += q.area.chunk_count();
+            }
+        }
+        (free, total)
     }
 
     /// Abort AND join every queue task — the poison-drain quiescence law
@@ -222,7 +272,7 @@ impl LaneSession {
     /// pointers or area-chunk refs.
     pub async fn quiesce(&self) {
         for q in &self.queues {
-            let mut ts = q.tasks.lock().await;
+            let mut ts = q.tasks().lock().await;
             for t in ts.iter() {
                 t.abort();
             }
@@ -237,6 +287,10 @@ impl LaneSession {
     /// CSTS.RDY → per-queue IO Connect. Every failure is loud and leaves
     /// the caller on the kernel path.
     pub async fn connect(target: LaneTarget) -> Result<Arc<LaneSession>> {
+        Self::connect_inner(target, LaneBackend::Classic).await
+    }
+
+    async fn connect_inner(target: LaneTarget, backend: LaneBackend) -> Result<Arc<LaneSession>> {
         let (hostnqn, hostid) = super::probe::host_identity();
         let addr = format!("{}:{}", target.traddr, target.trsvcid);
 
@@ -313,7 +367,32 @@ impl LaneSession {
             );
             let cqe = admin_roundtrip(&mut s, &connect).await?;
             check_status("IO Connect", &cqe)?;
-            queues.push(spawn_queue(s, depth, Arc::clone(&poisoned)));
+            match backend {
+                LaneBackend::Classic => {
+                    queues.push(QueueHandle::Classic(spawn_queue(
+                        s,
+                        depth,
+                        Arc::clone(&poisoned),
+                    )));
+                }
+                LaneBackend::AreaSim => {
+                    // Registration-order law (design §5): area exists and
+                    // is bound BEFORE the queue serves (sim has no ifq/
+                    // steering steps; NUMA is the real backend's — the
+                    // sim recv is CPU-copy anyway).
+                    let area = super::area::ZcrxArea::new(
+                        super::area::area_bytes_per_queue(depth, target.max_xfer_bytes),
+                        sim_chunk_bytes(),
+                        None,
+                    )?;
+                    queues.push(QueueHandle::Area(super::area_queue::spawn_area_queue(
+                        s,
+                        depth,
+                        area,
+                        Arc::clone(&poisoned),
+                    )));
+                }
+            }
         }
 
         // Park the admin socket: any read (data or EOF) after bring-up is an
@@ -331,17 +410,21 @@ impl LaneSession {
                 }
                 Err(e) => log::error!("zcrx-lane: admin connection error: {e} — session poisoned"),
             }
-            admin_poison.store(true, Ordering::SeqCst);
+            mark_session_poisoned(&admin_poison);
         });
 
         log::info!(
-            "zcrx-lane armed: {} nsid={} lba_shift={} queues={} depth={} max_xfer={} (backend: classic-recv contract venue — PR Z1)",
+            "zcrx-lane armed: {} nsid={} lba_shift={} queues={} depth={} max_xfer={} (backend: {})",
             target.subnqn,
             target.nsid,
             target.lba_shift,
             target.io_queues,
             depth,
             target.max_xfer_bytes,
+            match backend {
+                LaneBackend::Classic => "classic-recv contract venue — PR Z1",
+                LaneBackend::AreaSim => "area-sim contract venue — PR Z2",
+            },
         );
         Ok(Arc::new(LaneSession {
             target,
@@ -423,6 +506,115 @@ impl LaneSession {
 
     async fn read_segment(&self, byte_offset: u64, dest: SendMutPtr, len: usize) -> Result<()> {
         let q = &self.queues[self.next_q.fetch_add(1, Ordering::Relaxed) % self.queues.len()];
+        match q {
+            QueueHandle::Classic(q) => self.read_segment_classic(q, byte_offset, dest, len).await,
+            QueueHandle::Area(q) => self.read_segment_area(q, byte_offset, dest, len).await,
+        }
+    }
+
+    /// The area-backend segment read (design §4.3/§4.4): admission-bound
+    /// the in-flight payload, issue the capsule, await the scatter fill,
+    /// then run the ONE priced completion gather into `dest`. The queue
+    /// driver never touches `dest` — the fill's chunk refs drop right
+    /// here, which is what feeds the refill path.
+    async fn read_segment_area(
+        &self,
+        q: &super::area_queue::AreaQueue,
+        byte_offset: u64,
+        dest: SendMutPtr,
+        len: usize,
+    ) -> Result<()> {
+        use super::area_queue::admission_units;
+        let shared = &q.shared;
+        if shared.poisoned.load(Ordering::SeqCst) {
+            return Err(io_err("lane queue poisoned".into()));
+        }
+        // Admission backpressure (design §4.3): bounded in-flight fills,
+        // never a mid-stream stall. Parking is counted honest.
+        let units = admission_units(len);
+        let _admission = match shared.admission.try_acquire_many(units) {
+            Ok(p) => p,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                crate::fuse_client::METRICS
+                    .zcrx_area_admission_waits
+                    .fetch_add(1, Ordering::Relaxed);
+                shared
+                    .admission
+                    .acquire_many(units)
+                    .await
+                    .map_err(|_| io_err("lane queue closed".into()))?
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(io_err("lane queue closed".into()));
+            }
+        };
+        let _permit = shared
+            .cid_gate
+            .acquire()
+            .await
+            .map_err(|_| io_err("lane queue closed".into()))?;
+        let cid = shared
+            .free_cids
+            .lock()
+            .await
+            .pop()
+            .ok_or_else(|| io_err("lane CID pool exhausted (permit/pool desync)".into()))?;
+        let rx = shared.table.insert(cid, len);
+
+        let slba = byte_offset >> self.target.lba_shift;
+        let nlb = (len >> self.target.lba_shift) as u32;
+        let capsule = pdu::encode_read_capsule(cid, self.target.nsid, slba, nlb, len as u32);
+        if q.to_writer.send(capsule).is_err() {
+            shared.table.cancel(cid);
+            shared.free_cids.lock().await.push(cid);
+            return Err(io_err("lane writer task gone".into()));
+        }
+
+        let res = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+            Ok(Ok(Ok(fill))) => {
+                // The gather law (design §4.4): ONE pass from refcounted
+                // area chunks into the destination; dropping the fill
+                // releases the refs → chunks recycle to the refill path.
+                fill.gather_into(dest.0);
+                crate::fuse_client::METRICS
+                    .zcrx_gather_bytes
+                    .fetch_add(len as u64, Ordering::Relaxed);
+                Ok(())
+            }
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(_)) => Err(io_err("lane completion channel dropped".into())),
+            Err(_) => {
+                // Quiescence law: abort AND join the queue tasks so no
+                // driver survives holding chunk refs, then poison loud.
+                shared.poisoned.store(true, Ordering::SeqCst);
+                mark_session_poisoned(&self.poisoned);
+                let mut ts = q.tasks.lock().await;
+                for t in ts.iter() {
+                    t.abort();
+                }
+                for t in ts.drain(..) {
+                    let _ = t.await;
+                }
+                drop(ts);
+                shared.poison("read timed out after 30 s", &self.poisoned);
+                Err(io_err(format!(
+                    "lane read timed out (offset={byte_offset}, len={len})"
+                )))
+            }
+        };
+        if !shared.poisoned.load(Ordering::SeqCst) {
+            shared.free_cids.lock().await.push(cid);
+        }
+        res
+    }
+
+    async fn read_segment_classic(
+        &self,
+        q: &IoQueue,
+        byte_offset: u64,
+        dest: SendMutPtr,
+        len: usize,
+    ) -> Result<()> {
         if q.shared.poisoned.load(Ordering::SeqCst) {
             return Err(io_err("lane queue poisoned".into()));
         }
@@ -469,7 +661,7 @@ impl LaneSession {
                 // returns — and the caller's buffer can be dropped/recycled
                 // — abort AND join the queue's tasks so no writer survives.
                 q.shared.poisoned.store(true, Ordering::SeqCst);
-                self.poisoned.store(true, Ordering::SeqCst);
+                mark_session_poisoned(&self.poisoned);
                 let mut ts = q.tasks.lock().await;
                 for t in ts.iter() {
                     t.abort();
@@ -522,7 +714,7 @@ fn spawn_queue(stream: TcpStream, depth: u16, session_poison: Arc<AtomicBool>) -
     }
 }
 
-async fn writer_loop(
+pub(crate) async fn writer_loop(
     mut w: OwnedWriteHalf,
     mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
 ) -> std::result::Result<(), String> {

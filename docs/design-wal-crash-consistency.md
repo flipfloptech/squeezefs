@@ -139,7 +139,7 @@ The WAL contributes to none of these rows. That is the crux of the decision.
 
 ### 4.2 Deleting the WAL write path
 
-**What is removed** (PR 4): `src/meta_backend/journal.rs` entirely (struct `Journal`, `write_record`, `encode_record`, `journal_worker_loop`, its tests), the `journal` field of `MetaLvBackend` (`mod.rs:82`, `:89`, `:93`), the `bincode::serialize` + `write_record` block in the commit (`mod.rs:343-351`), and the `meta_wal_batch_size` metric (`fuse_client.rs:348-350`, stats JSON `fuse_client.rs:931`). The `bincode` dependency **stays** — audit done: `routing.rs` (`:649`, `:662`, `:749`, `:795` — layout/indirect maps), `tiering/dht.rs` (`:310`, `:335`), and `block_allocator.rs` (`:290`, `:341`) still use it; only the commit-path serialize call is deleted, so `Cargo.toml` is untouched.
+**What is removed** (PR 4): `src/meta_backend/journal.rs` entirely (struct `Journal`, `write_record`, `encode_record`, `journal_worker_loop`, its tests), the `journal` field of `MetaLvBackend` (`mod.rs:82`, `:89`, `:93`), the `bincode::serialize` + `write_record` block in the commit (`mod.rs:343-351`), and the `meta_wal_batch_size` metric (`fuse_client.rs:348-350`, stats JSON `fuse_client.rs:931`). The `bincode` dependency **stays** — audit done: `routing.rs` (`:649`, `:662`, `:749`, `:795` — layout/indirect maps), `tiering/dht.rs` (`:310`, `:335`; that module was later deleted by ENG-13, 2026-08-02 — the audit's conclusion is unaffected, the other consumers keep `bincode` in the tree), and `block_allocator.rs` (`:290`, `:341`) still use it; only the commit-path serialize call is deleted, so `Cargo.toml` is untouched.
 
 **What replaces its two live side-effects:**
 

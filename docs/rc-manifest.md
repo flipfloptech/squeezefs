@@ -120,6 +120,27 @@ Every claim cites its tier. **(i) measured-real** — rows from real mounts at l
 
 ---
 
+## 3b. Deferred with a recorded rationale (not dropped)
+
+### Peer-to-peer block fetch — deferred to post-S5, revisit with evidence
+
+**Status:** the subsystem was deleted 2026-08-02 (ENG-13) because it was structurally unreachable — `P2pServer::run` was never called, `dht_node` was never set, and it carried an accept-everything peer certificate verifier. Its shared TLS core survives as `src/tiering/cluster_tls.rs`. All doc references are now marked historical.
+
+**Why it is not simply dead (user question, 2026-08-02).** Peer fetch is a *bandwidth-aggregation and target-offload* mechanism, not a latency optimization. The measured economics on the current venue argue against it, and the reason is specific: nvme-tcp read RTT is **235–280 µs** against **memory-backed null_blk targets** — so the "storage node" is already a peer's RAM, reached by the fastest available path (kernel nvmet, no userspace hop). A peer fetch would ride the same wire and add a remote userspace daemon wake plus a copy. On a flat fabric with RAM-backed targets it cannot win.
+
+**The conditions under which it does win**, all absent from the current rig:
+1. **A topology gradient** — peer on the same ToR vs. target across an oversubscribed spine. Requires multi-rack; the venue's two IPs are two ports into one fabric, not two distance classes.
+2. **Shared hot data** — N clients reading the same blocks: the target's NIC saturates at line rate while peers fan out. **This is the strongest argument and the user's ruling (2026-08-02) is that AI-training workloads do read substantially the same data** (datasets re-read every epoch across every worker; checkpoints write-once-read-many), which qualifies the D1 "rarely the same files" assumption for *block-level* reuse.
+3. **Slower target media** — real SSDs with deep queues under load, where a peer's RAM copy beats a congested device queue even paying the extra hop.
+
+**Reference class:** JuiceFS ships a peer cache, but over **object storage** (tens of ms, egress-priced), where any local peer wins trivially. Against 235 µs RAM-backed NVMe-oF the economics invert — the precedent does not transfer without re-measurement.
+
+**Blocking costs.** (a) *Coherence*: §6.3's serve proof rests on process-local incarnation words and block-key bindings; peer-served bytes add a cross-node staleness vector where none exists today, and on a passthrough volume that failure is **silent** (transformed volumes fail loudly on the AEAD tag). This wants DLM **S5**'s freed-offset grace period and revalidation cadence underneath it — building before S5 means building twice. (b) *Security*: needs real authentication, though this cost has dropped sharply — `cluster_tls.rs` plus VAL-6's storage-trust enrollment (possession of the `job:enroll` secret ⇒ membership) is now a usable foundation.
+
+**The experiment that would settle it** (hours, no product code): on a rig with a real topology gradient, measure a raw userspace TCP block-serve hop against the nvme-tcp target hop for the same block, plus an N-client shared-hot-block bandwidth row. If peer-hop ≥ target-hop on a flat fabric — the prediction — the feature is definitionally a topology-and-bandwidth play and must be justified on a multi-rack venue, never on this one.
+
+---
+
 ## 4. Declared deviations (carry into user-facing docs)
 
 | Deviation | Rationale | Reference |

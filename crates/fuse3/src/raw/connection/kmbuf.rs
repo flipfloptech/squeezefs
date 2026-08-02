@@ -491,6 +491,17 @@ impl KmbufQueue {
         self.ring_entries
     }
 
+    /// The mmap'd buffer region's `(base, span, stride, buffer_count)` —
+    /// the payload-arena view's geometry (bid-indexed).
+    pub fn region_geometry(&self) -> (usize, usize, usize, usize) {
+        (
+            self.region_base,
+            self.region_span,
+            self.buf_size,
+            self.ring_entries as usize,
+        )
+    }
+
     /// Ent `idx`'s header slot inside the fixed headers region.
     pub fn header_ptr(&self, idx: usize) -> *mut u8 {
         debug_assert!(idx < self.attached.len());

@@ -288,6 +288,18 @@ fn test_default_mount_gauges_negotiated_write_geometry() {
         "ent payload size must equal the negotiated max_write (ample budget)"
     );
 
+    // kmbuf/zc adoption gauges (2026-08-04): surfaced UNGATED. On stock
+    // kernels the capability probe is Absent ⇒ negotiated must be 0 (the
+    // byte-identical contract's observable); on kmbuf kernels it is 1.
+    // zc_replies is structurally 0 until the staged zc arm lands.
+    let kmbuf = mount.metric(&stats, "fuse3_kmbuf_negotiated");
+    assert!(kmbuf <= 1, "fuse3_kmbuf_negotiated is a 0/1 level");
+    assert_eq!(
+        mount.metric(&stats, "fuse3_zc_replies"),
+        0,
+        "fuse3_zc_replies must stay 0 until the zc serve integration lands"
+    );
+
     let p = mount.mnt.join("geom.txt");
     std::fs::write(&p, b"negotiated geometry").unwrap();
     assert_eq!(std::fs::read(&p).unwrap(), b"negotiated geometry");

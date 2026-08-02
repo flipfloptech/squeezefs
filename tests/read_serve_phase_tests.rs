@@ -96,11 +96,17 @@ const FILL_PHASES: [&str; 7] = [
     "fill_total",
 ];
 
-const TRANSPORT_PHASES: [&str; 4] = [
+const TRANSPORT_PHASES: [&str; 5] = [
     "queue_wait",
     "dispatch_lag",
     "reply_commit",
     "transport_total",
+    // 2026-08-04 kmbuf campaign: COMMIT-carrying ring-flush syscall
+    // duration — per-FLUSH sampled (saturated/wait-free flushes only),
+    // NOT per-op; the venue of the kernel's commit-side copy machinery,
+    // so the killed FR_LOCKED/GUP term shows as this phase's
+    // before/after delta on kmbuf A/Bs.
+    "commit_flush",
 ];
 
 /// Sum of one phase histogram's buckets (= spans recorded).

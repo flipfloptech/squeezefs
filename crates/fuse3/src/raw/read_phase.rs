@@ -46,14 +46,28 @@ pub enum TransportPhase {
     ReplyCommit = 2,
     /// Inbound push → reply committed (the daemon's whole visible span).
     TransportTotal = 3,
+    /// COMMIT-carrying ring-flush syscall duration (2026-08-04 kmbuf
+    /// campaign): the venue where the kernel's commit-side copy
+    /// machinery runs (`fuse_uring_copy_from_ring` — per-page
+    /// `FR_LOCKED`/GUP on user ents, kaddr short-circuit on the kmbuf
+    /// arm), so the killed term shows as a before/after delta of this
+    /// phase. **Per-FLUSH sampled, not per-op**: recorded once per
+    /// op-class present in the batch, and only on flushes whose syscall
+    /// is provably wait-free (explicit mid-pass flushes, or loop-bottom
+    /// flushes entered with the CQ already non-empty — the saturated
+    /// passes, exactly where the term is measurable without paying a
+    /// second syscall). Idle-pass flushes are deliberately unsampled
+    /// (their duration is dominated by the park).
+    CommitFlush = 4,
 }
 
-const PHASES: usize = 4;
+const PHASES: usize = 5;
 const PHASE_NAMES: [&str; PHASES] = [
     "queue_wait",
     "dispatch_lag",
     "reply_commit",
     "transport_total",
+    "commit_flush",
 ];
 
 /// Op classes carrying a transport phase table. `repr(usize)` indexes the

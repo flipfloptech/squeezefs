@@ -79,6 +79,8 @@ use lease_core::{CommitGate, EntLeaseState};
 mod wake_core;
 use wake_core::WakeCoalescer;
 
+use super::kmbuf::{self, KmbufQueue, TransportBufferMode};
+
 /// `FUSE_OVER_IO_URING` (1ULL<<41) → `flags2` bit 9.
 pub const FUSE_OVER_IO_URING_FLAGS2: u32 = 1u32 << 9;
 
@@ -119,13 +121,22 @@ impl Default for FuseUringReqHeader {
     }
 }
 
+/// `struct fuse_uring_cmd_req` (24 bytes). The carried kmbuf/zc series
+/// re-purposes 4 of the historical 6 padding bytes as the REGISTER-time
+/// `init` union (`{ u16 flags; u16 queue_depth; }` — uapi "7.46" comment,
+/// minor stays 45): zeros on COMMIT_AND_FETCH and on pre-series kernels,
+/// so the struct is wire-compatible in both directions.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct FuseUringCmdReq {
     flags: u64,
     commit_id: u64,
     qid: u16,
-    padding: [u8; 6],
+    /// REGISTER `init.flags` (`FUSE_URING_BUF_RING` / `FUSE_URING_ZERO_COPY`).
+    init_flags: u16,
+    /// REGISTER `init.queue_depth` (zc arm only).
+    init_queue_depth: u16,
+    padding: [u8; 2],
 }
 
 /// Request delivered to the session as if read from `/dev/fuse`.
@@ -231,6 +242,10 @@ struct QueueHandle {
     /// here so payload pointers handed out via `get_payload_buffer` stay
     /// valid for the pool's whole life, even after the worker exited.
     arena: std::sync::Mutex<Option<Arc<PayloadArena>>>,
+    /// kmbuf mode (2026-08-04): the queue's kernel-managed-buffer
+    /// resources — `get_payload_buffer` serves the ent's ATTACHED buffer
+    /// through this (attachments are per-delivery, not per-ent-static).
+    kmbuf: std::sync::Mutex<Option<Arc<KmbufQueue>>>,
 }
 
 /// Owns every registered payload buffer of one queue plus a dup of the
@@ -248,9 +263,17 @@ struct PayloadArena {
     /// is active) and `MADV_HUGEPAGE`d as one range, and its pages'
     /// ACTUAL nodes are queried once per buffer for the locality
     /// instrument. Stored as `usize` (stable for the arena's life).
+    ///
+    /// kmbuf mode (2026-08-04): the span is the QUEUE's mmap'd
+    /// kernel-managed buffer region instead (bid-indexed buffers) —
+    /// owned by [`KmbufQueue`] and held alive here via `kmbuf`, never
+    /// unmapped by this drop.
     base: usize,
     span: usize,
-    /// Per-ent buffer bases inside the span (stride-spaced).
+    /// Buffer stride inside the span (ent-indexed classical; bid-indexed
+    /// kmbuf).
+    stride: usize,
+    /// Per-buffer bases inside the span (stride-spaced).
     bufs: Vec<usize>,
     /// Dense node index each buffer's first page ACTUALLY landed on
     /// (queried post-placement — the instrument's memory-node source;
@@ -262,6 +285,9 @@ struct PayloadArena {
     /// The queue's wake-elision flag (shared with [`QueueHandle`]): lease
     /// drops arm it before writing `wake` (L3 lever B).
     wake_coalescer: Arc<WakeCoalescer>,
+    /// kmbuf mode: the region owner (mapping liveness for leases); also
+    /// the owns-the-mapping discriminant for `Drop`.
+    kmbuf: Option<Arc<KmbufQueue>>,
 }
 
 impl PayloadArena {
@@ -339,10 +365,47 @@ impl PayloadArena {
         Ok(Arc::new(Self {
             base,
             span,
+            stride,
             bufs,
             buf_nodes,
             wake,
             wake_coalescer,
+            kmbuf: None,
+        }))
+    }
+
+    /// kmbuf-mode arena view (2026-08-04): wraps the queue's mmap'd
+    /// kernel buffer region — bid-indexed buffers, mapping owned by the
+    /// [`KmbufQueue`] (held here so leases keep the region alive), wake
+    /// protocol identical. NUMA nodes are queried per buffer the same
+    /// way (the locality instrument stays live on the kmbuf arm).
+    fn from_kmbuf(
+        kq: Arc<KmbufQueue>,
+        wake_fd: RawFd,
+        wake_coalescer: Arc<WakeCoalescer>,
+    ) -> io::Result<Arc<Self>> {
+        let dup = unsafe { libc::dup(wake_fd) };
+        if dup < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `dup` just returned a fresh owned descriptor.
+        let wake = unsafe { OwnedFd::from_raw_fd(dup) };
+        let (base, span, stride, count) = kq.region_geometry();
+        let bufs: Vec<usize> = (0..count).map(|i| base + i * stride).collect();
+        let numa = crate::numa_core::topology();
+        let buf_nodes: Vec<Option<usize>> = bufs
+            .iter()
+            .map(|&p| numa.node_of_addr(p as *const u8))
+            .collect();
+        Ok(Arc::new(Self {
+            base,
+            span,
+            stride,
+            bufs,
+            buf_nodes,
+            wake,
+            wake_coalescer,
+            kmbuf: Some(kq),
         }))
     }
 
@@ -355,12 +418,25 @@ impl PayloadArena {
     fn node_of_buf(&self, idx: usize) -> Option<usize> {
         self.buf_nodes.get(idx).copied().flatten()
     }
+
+    /// Node lookup by pointer (kmbuf deliveries know the buffer only by
+    /// address — the attachment is bid-indexed, not ent-indexed).
+    fn node_of_ptr(&self, ptr: *const u8) -> Option<usize> {
+        let p = ptr as usize;
+        if p < self.base || self.stride == 0 {
+            return None;
+        }
+        self.node_of_buf((p - self.base) / self.stride)
+    }
 }
 
 impl Drop for PayloadArena {
     fn drop(&mut self) {
-        // SAFETY: unmapping the span mapped in `new`; dropped once.
-        unsafe { libc::munmap(self.base as *mut libc::c_void, self.span) };
+        if self.kmbuf.is_none() {
+            // SAFETY: unmapping the span mapped in `new`; dropped once.
+            // (kmbuf-mode spans are owned and unmapped by KmbufQueue.)
+            unsafe { libc::munmap(self.base as *mut libc::c_void, self.span) };
+        }
     }
 }
 
@@ -532,6 +608,11 @@ pub struct FuseOverUring {
     workers: Mutex<Vec<JoinHandle<()>>>,
     fuse_fd: RawFd,
     payload_sz: usize,
+    /// Session buffer mode (2026-08-04 kmbuf campaign): resolved ONCE at
+    /// `try_start` from the runtime capability probe + the
+    /// `SQUEEZEFS_FUSE_KMBUF` lever. `UserEnts` = today's path,
+    /// byte-identical.
+    buffer_mode: TransportBufferMode,
     /// True when qid == kernel cpu id (queue count == kernel possible
     /// CPUs — the production default). The NUMA placement/instrument
     /// derives each queue's node from its qid ONLY under this
@@ -654,19 +735,55 @@ struct SubmitBatch {
     pending: u32,
     /// COMMIT_AND_FETCH SQEs among `pending`.
     commits: u32,
+    /// `commit_flush` attribution (2026-08-04): READ / WRITE commits
+    /// present in the pending batch (per delivered opcode — see
+    /// `Ent::last_opcode`).
+    commit_reads: bool,
+    commit_writes: bool,
 }
 
 impl SubmitBatch {
+    /// Attribute a pushed commit to its op class for the `commit_flush`
+    /// phase (READ/WRITE only — the families' scope).
+    fn note_commit_opcode(&mut self, opcode: u32) {
+        const FUSE_READ_OPCODE: u32 = crate::raw::abi::fuse_opcode::FUSE_READ as u32;
+        if opcode == FUSE_READ_OPCODE {
+            self.commit_reads = true;
+        } else if opcode == FUSE_WRITE_OPCODE {
+            self.commit_writes = true;
+        }
+    }
+
     /// Note that a flush syscall is about to carry the pending SQEs:
-    /// record the commit batch size and reset the counters.
-    fn note_flush(&mut self) {
+    /// record the commit batch size, reset the counters, and hand back
+    /// the batch's `(reads, writes)` commit-class presence so the caller
+    /// can record `commit_flush` spans after the syscall returns.
+    fn note_flush(&mut self) -> (bool, bool) {
         if self.commits > 0 {
             TRANSPORT_COMMIT_BATCH.record(self.commits as usize);
             TRANSPORT_COMMIT_FLUSHES.fetch_add(1, Ordering::Relaxed);
             TRANSPORT_COMMITS_SUBMITTED.fetch_add(self.commits as u64, Ordering::Relaxed);
         }
+        let classes = (self.commit_reads, self.commit_writes);
         self.pending = 0;
         self.commits = 0;
+        self.commit_reads = false;
+        self.commit_writes = false;
+        classes
+    }
+}
+
+/// Record one `commit_flush` span per op class the flushed batch carried
+/// (see [`TransportPhase::CommitFlush`] for the sampling contract).
+fn record_commit_flush(had_reads: bool, had_writes: bool, dur: Duration) {
+    use crate::raw::read_phase::{
+        read_transport_phase_record, write_transport_phase_record, TransportPhase,
+    };
+    if had_reads {
+        read_transport_phase_record(TransportPhase::CommitFlush, dur);
+    }
+    if had_writes {
+        write_transport_phase_record(TransportPhase::CommitFlush, dur);
     }
 }
 
@@ -676,6 +793,7 @@ impl SubmitBatch {
 /// D3.a). SQ-full is absorbed by submit-and-continue: flush the queued
 /// SQEs (which records the partial commit batch) and retry the push once —
 /// only a push that fails right after a successful flush is a real error.
+#[allow(clippy::too_many_arguments)] // one wire word per SQE field; a spec struct would obscure the ABI
 fn push_cmd_batched(
     ring: &mut Ring,
     batch: &mut SubmitBatch,
@@ -684,11 +802,19 @@ fn push_cmd_batched(
     commit_id: u64,
     iov: Option<(*const libc::iovec, u32)>,
     user_data: u64,
+    init_flags: u16,
+    buf_index: u16,
 ) -> io::Result<()> {
-    if push_cmd(ring, cmd_op, qid, commit_id, iov, user_data).is_err() {
+    if push_cmd(
+        ring, cmd_op, qid, commit_id, iov, user_data, init_flags, buf_index,
+    )
+    .is_err()
+    {
         // `push` only fails on a full SQ (§5.3 D3.a SQ-full rule).
         flush_submit(ring, batch)?;
-        push_cmd(ring, cmd_op, qid, commit_id, iov, user_data)?;
+        push_cmd(
+            ring, cmd_op, qid, commit_id, iov, user_data, init_flags, buf_index,
+        )?;
     }
     batch.pending += 1;
     if cmd_op == FUSE_IO_URING_CMD_COMMIT_AND_FETCH {
@@ -720,10 +846,18 @@ fn push_poll_batched(ring: &mut Ring, batch: &mut SubmitBatch) -> io::Result<()>
 }
 
 /// Flush every pushed-but-unsubmitted SQE with ONE `ring.submit()`,
-/// recording the commit batch it carries. Returns the submitted count.
+/// recording the commit batch it carries (and, when commits ride it, the
+/// `commit_flush` span — `submit()` is wait-free, so the duration is the
+/// submission work itself, which is where the kernel's commit-side copy
+/// machinery runs). Returns the submitted count.
 fn flush_submit(ring: &mut Ring, batch: &mut SubmitBatch) -> io::Result<usize> {
-    batch.note_flush();
-    ring.submit()
+    let (had_reads, had_writes) = batch.note_flush();
+    let t0 = (had_reads || had_writes).then(Instant::now);
+    let n = ring.submit()?;
+    if let Some(t0) = t0 {
+        record_commit_flush(had_reads, had_writes, t0.elapsed());
+    }
+    Ok(n)
 }
 // §5.4 transport payload-lease observability (SqueezeFS stats inode).
 static TRANSPORT_PAYLOAD_LEASES: AtomicU64 = AtomicU64::new(0);
@@ -1223,6 +1357,13 @@ impl FuseOverUring {
             max_background,
             ..
         } = geom;
+        // kmbuf capability lattice (2026-08-04): probe + lever, once per
+        // session. Absent surfaces (stock kernels) resolve to UserEnts —
+        // today's path byte-identical; Present surfaces arm the bufring
+        // (post-probe registration refusals FAIL the mount loudly, never
+        // silently downgrade — SQUEEZEFS_FUSE_KMBUF=0 is the operator
+        // escape).
+        let buffer_mode = kmbuf::resolve_buffer_mode();
         GEOM_QUEUES.store(nqueues as u64, Ordering::Relaxed);
         GEOM_DEPTH.store(depth as u64, Ordering::Relaxed);
         GEOM_PAYLOAD_SZ.store(payload_sz as u64, Ordering::Relaxed);
@@ -1253,6 +1394,7 @@ impl FuseOverUring {
                 _wake: wake,
                 wake_coalescer: Arc::new(WakeCoalescer::new()),
                 arena: std::sync::Mutex::new(None),
+                kmbuf: std::sync::Mutex::new(None),
             });
             commit_rxs.push(commit_rx);
         }
@@ -1288,6 +1430,7 @@ impl FuseOverUring {
             workers: Mutex::new(Vec::new()),
             fuse_fd,
             payload_sz,
+            buffer_mode,
             qid_is_cpu: nqueues == kernel_possible_cpus(),
             stats_requests: AtomicU64::new(0),
             stats_replies: AtomicU64::new(0),
@@ -1356,6 +1499,10 @@ impl FuseOverUring {
             std::thread::sleep(Duration::from_millis(1));
         }
 
+        // Every queue REGISTERed under the resolved mode — the
+        // negotiation gauge is now truthful (a bufring REGISTER refusal
+        // would have failed the barrier above).
+        kmbuf::set_kmbuf_negotiated(buffer_mode == TransportBufferMode::BufRing);
         ACTIVE_SESSIONS.fetch_add(1, Ordering::Relaxed);
 
         // Watch /dev/fuse for POLLERR/POLLHUP/etc so we shut down even if a
@@ -1383,14 +1530,18 @@ impl FuseOverUring {
                 _ => "declined".to_string(),
             },
         };
+        let mode_state = match buffer_mode {
+            TransportBufferMode::UserEnts => "user-ents",
+            TransportBufferMode::BufRing => "kmbuf-bufring",
+        };
         eprintln!(
             "FUSE-over-io_uring registered: queues={nqueues} depth={depth} payload_sz={payload_sz} \
-             max_write={max_write} max_pages={max_pages} fd={fuse_fd} sqpoll={sqpoll_state}"
+             max_write={max_write} max_pages={max_pages} buffers={mode_state} fd={fuse_fd} sqpoll={sqpoll_state}"
         );
         info!(
             "FUSE-over-io_uring registered: queues={nqueues} depth={depth} \
              payload_sz={payload_sz} max_write={max_write} max_pages={max_pages} \
-             fd={fuse_fd} sqpoll={sqpoll_state}"
+             buffers={mode_state} fd={fuse_fd} sqpoll={sqpoll_state}"
         );
         Ok(pool)
     }
@@ -1481,6 +1632,15 @@ impl FuseOverUring {
     pub fn get_payload_buffer(&self, unique: u64) -> Option<(u64, usize)> {
         let (qid, ent_idx, _) = self.pending.get(unique)?;
         let q = self.queues.get(qid as usize)?;
+        // kmbuf mode: the reply target is the ent's ATTACHED kernel
+        // buffer (per-delivery, bid-indexed) — never a static per-ent
+        // slot. The attachment cannot move between delivery and our
+        // commit (the kernel re-points/recycles only at fetch, which our
+        // COMMIT_AND_FETCH triggers).
+        if let Some(kq) = q.kmbuf.lock().unwrap().clone() {
+            let (ptr, len) = kq.attached_ptr(ent_idx as usize)?;
+            return Some((ptr as u64, len));
+        }
         let arena = q.arena.lock().unwrap().clone()?;
         let ptr = arena.buf(ent_idx as usize)?;
         Some((ptr as u64, self.payload_sz))
@@ -1723,31 +1883,76 @@ fn build_queue_ring(
 }
 
 struct Ent {
-    header: Box<FuseUringReqHeader>,
-    /// Registered payload buffer — owned by the queue's [`PayloadArena`]
-    /// (kept alive past worker exit by lease/pool Arcs).
+    /// Header slot. Classical mode: points into `_owned_header` (the
+    /// per-ent Box the REGISTER iov[0] names). kmbuf mode: points into
+    /// the queue's fixed headers region (`KmbufQueue::header_ptr` —
+    /// index 0 of the ring's fixed-buffer table), which the kernel
+    /// reads/writes through the registered buffer instead of GUP.
+    header_ptr: *mut FuseUringReqHeader,
+    /// Classical-mode header storage (kmbuf mode: `None` — the region is
+    /// owned by the queue's [`KmbufQueue`], alive past the ents).
+    _owned_header: Option<Box<FuseUringReqHeader>>,
+    /// Payload buffer. Classical mode: the ent's static arena slot.
+    /// kmbuf mode: the CURRENTLY-ATTACHED kernel buffer (re-pointed at
+    /// flagged deliveries; null until the first attachment — payload
+    /// views are empty then).
     payload_ptr: *mut u8,
     payload_len: usize,
     /// The buffer's ACTUAL NUMA node (dense index; the locality
     /// instrument's memory-node source — `None` stays uncounted).
+    /// kmbuf mode: re-derived per attachment (`node_of_ptr`).
     node: Option<usize>,
     iov: [libc::iovec; 2],
+    /// Opcode of the last delivered request (commit_flush attribution;
+    /// 0 = nothing delivered yet).
+    last_opcode: u32,
 }
 
 impl Ent {
+    /// Header view. SAFETY of the deref: `header_ptr` targets either the
+    /// ent's owned Box or the queue's headers region, both alive for the
+    /// worker's life; only the worker thread and the kernel (between
+    /// re-arm and CQE — the same window discipline the payload has)
+    /// touch it, and both views here are taken outside that window.
+    fn hdr(&self) -> &FuseUringReqHeader {
+        // SAFETY: see above.
+        unsafe { &*self.header_ptr }
+    }
+
+    fn hdr_mut(&mut self) -> &mut FuseUringReqHeader {
+        // SAFETY: see `hdr`.
+        unsafe { &mut *self.header_ptr }
+    }
+
+    /// True when a payload buffer is bound (kmbuf ents are unbound until
+    /// their first flagged delivery).
+    fn has_payload_buf(&self) -> bool {
+        !self.payload_ptr.is_null()
+    }
+
     /// Immutable payload view (delivery-time copy for non-leased opcodes).
+    /// Empty when no buffer is bound.
     fn payload(&self) -> &[u8] {
-        // SAFETY: `payload_ptr..+payload_len` is one arena buffer, alive for
-        // the worker's life; the kernel only writes it between re-arm and
-        // the delivery CQE, and this view is taken after the CQE.
+        if self.payload_ptr.is_null() {
+            return &[];
+        }
+        // SAFETY: `payload_ptr..+payload_len` is one arena/kmbuf buffer,
+        // alive for the worker's life (arena Arc); the kernel only writes
+        // it between re-arm and the delivery CQE, and this view is taken
+        // after the CQE.
         unsafe { std::slice::from_raw_parts(self.payload_ptr, self.payload_len) }
     }
 
     /// Mutable payload view for reply application. Caller must hold the
     /// §5.4 gate proof: the ent's lease refs == 0 (CommitGate::Ready /
     /// try_unpark). Writing while a lease lives is the mutation-under-alias
-    /// UB class the protocol exists to eliminate.
+    /// UB class the protocol exists to eliminate. Empty when no buffer
+    /// is bound (callers must check [`Self::has_payload_buf`] before
+    /// counting on capacity).
     fn payload_mut(&mut self) -> &mut [u8] {
+        if self.payload_ptr.is_null() {
+            return &mut [];
+        }
         // SAFETY: as above, plus the caller-supplied refs == 0 proof that no
         // live `&[u8]` (lease) aliases the region.
         unsafe { std::slice::from_raw_parts_mut(self.payload_ptr, self.payload_len) }
@@ -1884,58 +2089,129 @@ fn queue_worker(
             ))
         })?;
 
+    // kmbuf mode (2026-08-04): register the queue's fixed headers buffer
+    // + kernel-managed payload bufring BEFORE any ent REGISTER (the
+    // kernel resolves both at ent-registration time). A refusal here
+    // fails the worker → the mount (the capability gate is the PROBE;
+    // post-probe refusals never silently downgrade).
+    let kmbuf_q: Option<Arc<KmbufQueue>> = match pool.buffer_mode {
+        TransportBufferMode::BufRing => {
+            Some(Arc::new(KmbufQueue::setup(&ring, depth, payload_sz)?))
+        }
+        TransportBufferMode::UserEnts => None,
+    };
+
     // Payload memory lives in an Arc'd arena (not the worker-local Ent) so
     // FUSE_WRITE leases and `get_payload_buffer` pointers stay valid past
     // worker exit (§5.4). The arena shares the queue's wake coalescer so
     // lease-drop wakes elide through the same flag as reply submissions.
+    // kmbuf mode: the arena is a bid-indexed view over the queue's mmap'd
+    // kernel buffer region (mapping owned by KmbufQueue, held alive by
+    // the arena for lease lifetimes).
     let wake_coalescer = Arc::clone(&pool.queues[qid as usize].wake_coalescer);
-    let arena = PayloadArena::new(
-        depth,
-        payload_sz,
-        wake_fd,
-        Arc::clone(&wake_coalescer),
-        queue_node,
-    )?;
+    let arena = match &kmbuf_q {
+        Some(kq) => PayloadArena::from_kmbuf(Arc::clone(kq), wake_fd, Arc::clone(&wake_coalescer))?,
+        None => PayloadArena::new(
+            depth,
+            payload_sz,
+            wake_fd,
+            Arc::clone(&wake_coalescer),
+            queue_node,
+        )?,
+    };
     // One lease state per ring ent + the worker-local parked commit slots.
     let lease_states: Vec<Arc<EntLeaseState>> =
         (0..depth).map(|_| Arc::new(EntLeaseState::new())).collect();
     let mut parked_msgs: Vec<Option<CommitMsg>> = (0..depth).map(|_| None).collect();
 
     let mut ents: Vec<Ent> = (0..depth)
-        .map(|idx| {
-            let mut header = Box::new(FuseUringReqHeader::default());
-            header.ring_ent_in_out.payload_sz = payload_sz as u32;
-            Ent {
-                header,
-                payload_ptr: arena.buf(idx).expect("arena sized to depth"),
-                payload_len: payload_sz,
-                node: arena.node_of_buf(idx),
-                iov: [
-                    libc::iovec {
-                        iov_base: std::ptr::null_mut(),
-                        iov_len: 0,
-                    },
-                    libc::iovec {
-                        iov_base: std::ptr::null_mut(),
-                        iov_len: 0,
-                    },
-                ],
+        .map(|idx| match &kmbuf_q {
+            None => {
+                let mut header = Box::new(FuseUringReqHeader::default());
+                header.ring_ent_in_out.payload_sz = payload_sz as u32;
+                let header_ptr = &mut *header as *mut FuseUringReqHeader;
+                Ent {
+                    header_ptr,
+                    _owned_header: Some(header),
+                    payload_ptr: arena.buf(idx).expect("arena sized to depth"),
+                    payload_len: payload_sz,
+                    node: arena.node_of_buf(idx),
+                    iov: [
+                        libc::iovec {
+                            iov_base: std::ptr::null_mut(),
+                            iov_len: 0,
+                        },
+                        libc::iovec {
+                            iov_base: std::ptr::null_mut(),
+                            iov_len: 0,
+                        },
+                    ],
+                    last_opcode: 0,
+                }
+            }
+            Some(kq) => {
+                let mut ent = Ent {
+                    // Header slot inside the fixed headers region (fresh
+                    // anon mapping — zeroed).
+                    header_ptr: kq.header_ptr(idx).cast(),
+                    _owned_header: None,
+                    // No payload buffer until the first flagged delivery.
+                    payload_ptr: std::ptr::null_mut(),
+                    payload_len: payload_sz,
+                    node: None,
+                    iov: [
+                        libc::iovec {
+                            iov_base: std::ptr::null_mut(),
+                            iov_len: 0,
+                        },
+                        libc::iovec {
+                            iov_base: std::ptr::null_mut(),
+                            iov_len: 0,
+                        },
+                    ],
+                    last_opcode: 0,
+                };
+                ent.hdr_mut().ring_ent_in_out.payload_sz = payload_sz as u32;
+                ent
             }
         })
         .collect();
 
-    for ent in &mut ents {
-        ent.iov[0] = libc::iovec {
-            iov_base: (&mut *ent.header as *mut FuseUringReqHeader).cast(),
-            iov_len: std::mem::size_of::<FuseUringReqHeader>(),
-        };
-        ent.iov[1] = libc::iovec {
-            iov_base: ent.payload_ptr.cast(),
-            iov_len: ent.payload_len,
-        };
+    if kmbuf_q.is_none() {
+        for ent in &mut ents {
+            ent.iov[0] = libc::iovec {
+                iov_base: ent.header_ptr.cast(),
+                iov_len: std::mem::size_of::<FuseUringReqHeader>(),
+            };
+            ent.iov[1] = libc::iovec {
+                iov_base: ent.payload_ptr.cast(),
+                iov_len: ent.payload_len,
+            };
+        }
     }
 
     *pool.queues[qid as usize].arena.lock().unwrap() = Some(arena.clone());
+    *pool.queues[qid as usize].kmbuf.lock().unwrap() = kmbuf_q.clone();
+
+    // REGISTER shape per mode: classical = 2 iovecs (header + payload);
+    // kmbuf = no iovecs, `init.flags = FUSE_URING_BUF_RING`,
+    // `sqe->buf_index = ent_idx` (the ent's fixed_buf_id).
+    let reg_init_flags: u16 = match pool.buffer_mode {
+        TransportBufferMode::BufRing => kmbuf::init_flags(true, false),
+        TransportBufferMode::UserEnts => 0,
+    };
+    let reg_iov = |ent: &Ent| -> Option<(*const libc::iovec, u32)> {
+        match pool.buffer_mode {
+            TransportBufferMode::BufRing => None,
+            TransportBufferMode::UserEnts => Some((ent.iov.as_ptr(), 2)),
+        }
+    };
+    let reg_buf_index = |idx: usize| -> u16 {
+        match pool.buffer_mode {
+            TransportBufferMode::BufRing => idx as u16,
+            TransportBufferMode::UserEnts => 0,
+        }
+    };
 
     for (idx, ent) in ents.iter().enumerate() {
         push_cmd(
@@ -1943,8 +2219,10 @@ fn queue_worker(
             FUSE_IO_URING_CMD_REGISTER,
             qid,
             0,
-            Some((ent.iov.as_ptr(), 2)),
+            reg_iov(ent),
             idx as u64,
+            reg_init_flags,
+            reg_buf_index(idx),
         )
         .map_err(|e| io::Error::other(format!("push REGISTER ent={idx}: {e}")))?;
         pool.stats_register.fetch_add(1, Ordering::Relaxed);
@@ -2027,6 +2305,7 @@ fn queue_worker(
                 CommitGate::Ready => {
                     xport_dbg!("[XPORT] commit qid={qid} ent={idx} cid={}", msg.commit_id);
                     apply_reply(&mut ents[idx], &msg.header, &msg.reply_body);
+                    batch.note_commit_opcode(ents[idx].last_opcode);
                     push_cmd_batched(
                         &mut ring,
                         &mut batch,
@@ -2035,6 +2314,8 @@ fn queue_worker(
                         msg.commit_id,
                         None,
                         idx as u64,
+                        0,
+                        0,
                     )?;
                 }
                 CommitGate::Parked => {
@@ -2065,6 +2346,7 @@ fn queue_worker(
                     msg.commit_id
                 );
                 apply_reply(&mut ents[idx], &msg.header, &msg.reply_body);
+                batch.note_commit_opcode(ents[idx].last_opcode);
                 push_cmd_batched(
                     &mut ring,
                     &mut batch,
@@ -2073,6 +2355,8 @@ fn queue_worker(
                     msg.commit_id,
                     None,
                     idx as u64,
+                    0,
+                    0,
                 )?;
             }
         }
@@ -2084,7 +2368,17 @@ fn queue_worker(
 
         // ONE syscall for everything pushed above: submit_and_wait both
         // flushes the batch (recorded here) and parks for the next event.
-        batch.note_flush();
+        // commit_flush sampling: time the syscall only when it is
+        // provably non-blocking (CQ already non-empty — the saturated
+        // passes); an idle pass's duration is park time, not submission
+        // work (see TransportPhase::CommitFlush).
+        let (cf_reads, cf_writes) = batch.note_flush();
+        let cf_t0 = ((cf_reads || cf_writes) && {
+            let mut cq = ring.completion();
+            cq.sync();
+            !cq.is_empty()
+        })
+        .then(Instant::now);
         match ring.submit_and_wait(1) {
             Ok(_) => {}
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
@@ -2095,21 +2389,24 @@ fn queue_worker(
             }
             Err(e) => return Err(e),
         }
+        if let Some(t0) = cf_t0 {
+            record_commit_flush(cf_reads, cf_writes, t0.elapsed());
+        }
 
         if !pool.active.load(Ordering::Relaxed) {
             break;
         }
 
-        let completed: Vec<(u64, i32)> = {
+        let completed: Vec<(u64, i32, u32)> = {
             let mut cq = ring.completion();
             cq.sync();
-            cq.map(|c| (c.user_data(), c.result())).collect()
+            cq.map(|c| (c.user_data(), c.result(), c.flags())).collect()
         };
 
         let mut resubmit = Vec::new();
         let mut need_repoll = false;
         let mut disconnect = false;
-        for (user_data, res) in completed {
+        for (user_data, res, cqe_flags) in completed {
             if user_data == u64::MAX {
                 // wake_fd poll completed — re-arm (or exit if inactive)
                 need_repoll = true;
@@ -2154,9 +2451,36 @@ fn queue_worker(
             if ent_idx >= ents.len() {
                 continue;
             }
+            // kmbuf attachment law (2026-08-04): a flagged CQE re-points
+            // the ent's payload buffer to the freshly-selected kernel
+            // buffer; an unflagged one keeps the current attachment (the
+            // kernel's reuse case). NUMA locality is re-derived per
+            // attachment (bid-indexed buffers).
+            if let Some(kq) = &kmbuf_q {
+                match kq.note_delivery(ent_idx, cqe_flags) {
+                    Some((p, len)) => {
+                        if ents[ent_idx].payload_ptr != p {
+                            ents[ent_idx].payload_ptr = p;
+                            ents[ent_idx].payload_len = len;
+                            ents[ent_idx].node = arena.node_of_ptr(p);
+                        }
+                    }
+                    None if cqe_flags & kmbuf::IORING_CQE_F_BUFFER != 0 => {
+                        // Flagged with an out-of-range bid: protocol
+                        // breach — fail loud, never index out of the
+                        // region.
+                        error!(
+                            "fuse-over-uring qid={qid} ent={ent_idx}: kmbuf delivery                              carried an out-of-range buffer id (cqe flags {cqe_flags:#x});                              shutting down"
+                        );
+                        pool.shutdown();
+                        return Err(io::Error::other("kmbuf buffer id out of range"));
+                    }
+                    None => {} // nothing ever attached — payload-less traffic
+                }
+            }
             // Kernel sets commit_id = unique when delivering a request.
-            let unique = u64::from_le_bytes(ents[ent_idx].header.in_out[8..16].try_into().unwrap());
-            let mut commit_id = ents[ent_idx].header.ring_ent_in_out.commit_id;
+            let unique = u64::from_le_bytes(ents[ent_idx].hdr().in_out[8..16].try_into().unwrap());
+            let mut commit_id = ents[ent_idx].hdr().ring_ent_in_out.commit_id;
             if commit_id == 0 {
                 // Fall back to unique — some paths only fill in_out.
                 commit_id = unique;
@@ -2164,7 +2488,7 @@ fn queue_worker(
             if unique == 0 {
                 // Prefer COMMIT with commit_id if the kernel filled it — re-REGISTER
                 // alone leaves USERSPACE entries and permanent waiting/EBUSY umount.
-                let cid = ents[ent_idx].header.ring_ent_in_out.commit_id;
+                let cid = ents[ent_idx].hdr().ring_ent_in_out.commit_id;
                 if cid != 0 {
                     warn!(
                         "fuse-over-uring qid={qid} ent={ent_idx}: unique=0 commit_id={cid}; force EIO COMMIT"
@@ -2186,6 +2510,8 @@ fn queue_worker(
                         cid,
                         None,
                         ent_idx as u64,
+                        0,
+                        0,
                     );
                 } else {
                     warn!(
@@ -2196,12 +2522,23 @@ fn queue_worker(
                 }
                 continue;
             }
-            let opcode = u32::from_le_bytes(ents[ent_idx].header.in_out[4..8].try_into().unwrap());
-            let payload_sz = ents[ent_idx].header.ring_ent_in_out.payload_sz as usize;
+            let opcode = u32::from_le_bytes(ents[ent_idx].hdr().in_out[4..8].try_into().unwrap());
+            let payload_sz = ents[ent_idx].hdr().ring_ent_in_out.payload_sz as usize;
+            ents[ent_idx].last_opcode = opcode;
+            if payload_sz > 0 && !ents[ent_idx].has_payload_buf() {
+                // kmbuf: request payload announced but no buffer was ever
+                // attached — the attachment law is broken; serving a
+                // fabricated payload would corrupt data. Fail loud.
+                error!(
+                    "fuse-over-uring qid={qid} ent={ent_idx}: delivery announced                      {payload_sz} payload bytes with no attached buffer                      (kmbuf attachment law violated); shutting down"
+                );
+                pool.shutdown();
+                return Err(io::Error::other("kmbuf delivery without attached buffer"));
+            }
             let mut header_and_op =
                 Vec::with_capacity(FUSE_IN_HEADER_SIZE + FUSE_URING_OP_IN_OUT_SZ);
-            header_and_op.extend_from_slice(&ents[ent_idx].header.in_out[..FUSE_IN_HEADER_SIZE]);
-            header_and_op.extend_from_slice(&ents[ent_idx].header.op_in);
+            header_and_op.extend_from_slice(&ents[ent_idx].hdr().in_out[..FUSE_IN_HEADER_SIZE]);
+            header_and_op.extend_from_slice(&ents[ent_idx].hdr().op_in);
             let capped_sz = payload_sz.min(ents[ent_idx].payload_len);
             // §5.4: FUSE_WRITE payloads ride a zero-copy lease over the
             // registered buffer (kills the 1 MiB copy + alloc per write
@@ -2219,8 +2556,10 @@ fn queue_worker(
                 TRANSPORT_LEASES_OUTSTANDING.fetch_add(1, Ordering::Relaxed);
                 // K1 crossing estimate: the kernel copied this payload
                 // from the app on ≈ CPU qid (queue selection is by
-                // requester CPU) into the ent buffer's actual node.
-                numa_classify_pass(queue_node, arena.node_of_buf(ent_idx), capped_sz);
+                // requester CPU) into the buffer's actual node
+                // (ent-static classically; per-attachment on kmbuf —
+                // `ents[..].node` tracks both).
+                numa_classify_pass(queue_node, ents[ent_idx].node, capped_sz);
                 Bytes::from_owner(EntPayloadLease {
                     arena: Arc::clone(&arena),
                     state,
@@ -2275,6 +2614,8 @@ fn queue_worker(
                     commit_id,
                     None,
                     ent_idx as u64,
+                    0,
+                    0,
                 )?;
                 pool.stats_replies.fetch_add(1, Ordering::Relaxed);
                 STATS_REPLIES.fetch_add(1, Ordering::Relaxed);
@@ -2308,15 +2649,17 @@ fn queue_worker(
         // Never re-REGISTER after a disconnect; only while still active.
         if !resubmit.is_empty() && pool.active.load(Ordering::Relaxed) {
             for ent_idx in resubmit {
-                let iov_ptr = ents[ent_idx].iov.as_ptr();
+                let iov = reg_iov(&ents[ent_idx]);
                 let _ = push_cmd_batched(
                     &mut ring,
                     &mut batch,
                     FUSE_IO_URING_CMD_REGISTER,
                     qid,
                     0,
-                    Some((iov_ptr, 2)),
+                    iov,
                     ent_idx as u64,
+                    reg_init_flags,
+                    reg_buf_index(ent_idx),
                 );
             }
         }
@@ -2381,14 +2724,17 @@ fn queue_worker(
             msg.commit_id,
             None,
             idx as u64,
+            0,
+            0,
         );
         final_commits += 1;
     }
     // A loop exit between the drain passes and the loop-bottom
     // submit_and_wait leaves applied replies pushed but unsubmitted; flush
     // them together with the final commits — teardown must not drop a reply
-    // that was already applied to its ent.
-    batch.note_flush();
+    // that was already applied to its ent. (commit_flush deliberately
+    // unsampled at teardown.)
+    let _ = batch.note_flush();
     if final_commits > 0 {
         let _ = ring.submit_and_wait(final_commits);
     } else {
@@ -2412,15 +2758,29 @@ fn queue_worker(
 fn apply_reply(ent: &mut Ent, header: &[u8], body: &Bytes) {
     const OUT_HDR: usize = 16; // sizeof(fuse_out_header)
                                // Clear header region so stale request bytes cannot leak into the reply.
-    ent.header.in_out = [0; FUSE_URING_IN_OUT_HEADER_SZ];
+    ent.hdr_mut().in_out = [0; FUSE_URING_IN_OUT_HEADER_SZ];
     if header.len() < OUT_HDR {
         // Degenerate — treat as IO error header.
-        ent.header.in_out[..4].copy_from_slice(&((OUT_HDR as u32).to_le_bytes()));
-        ent.header.in_out[4..8].copy_from_slice(&(-libc::EIO).to_le_bytes());
-        ent.header.ring_ent_in_out.payload_sz = 0;
+        ent.hdr_mut().in_out[..4].copy_from_slice(&((OUT_HDR as u32).to_le_bytes()));
+        ent.hdr_mut().in_out[4..8].copy_from_slice(&(-libc::EIO).to_le_bytes());
+        ent.hdr_mut().ring_ent_in_out.payload_sz = 0;
         return;
     }
-    ent.header.in_out[..OUT_HDR].copy_from_slice(&header[..OUT_HDR]);
+    ent.hdr_mut().in_out[..OUT_HDR].copy_from_slice(&header[..OUT_HDR]);
+
+    if (header.len() > OUT_HDR || !body.is_empty()) && !ent.has_payload_buf() {
+        // kmbuf mode: a body-carrying reply on an ent with no attached
+        // buffer is structurally unreachable (the kernel attaches a
+        // buffer to every request with out args); if it ever fires, the
+        // reply degrades to a loud header-only EIO — never an OOB write.
+        error!(
+            "fuse-over-uring: body-carrying reply on an ent with no              payload buffer (kmbuf attachment law violated) — EIO"
+        );
+        ent.hdr_mut().in_out[..4].copy_from_slice(&((OUT_HDR as u32).to_le_bytes()));
+        ent.hdr_mut().in_out[4..8].copy_from_slice(&(-libc::EIO).to_le_bytes());
+        ent.hdr_mut().ring_ent_in_out.payload_sz = 0;
+        return;
+    }
 
     let mut payload_len = 0;
     if header.len() > OUT_HDR {
@@ -2444,23 +2804,30 @@ fn apply_reply(ent: &mut Ent, header: &[u8], body: &Bytes) {
     }
     payload_len += body_len;
 
-    ent.header.ring_ent_in_out.payload_sz = payload_len as u32;
+    ent.hdr_mut().ring_ent_in_out.payload_sz = payload_len as u32;
 }
 
-fn push_cmd(
-    ring: &mut Ring,
+/// Build one FUSE uring-cmd SQE (SQE128) — extracted from [`push_cmd`] so
+/// the wire encoding is unit-testable byte-for-byte (the kmbuf REGISTER
+/// shape: `init.flags` inside the 80-byte cmd area, `sqe->buf_index` at
+/// offset 40, no iovecs).
+fn build_cmd_entry(
     cmd_op: u32,
     qid: u16,
     commit_id: u64,
     iov: Option<(*const libc::iovec, u32)>,
     user_data: u64,
-) -> io::Result<()> {
+    init_flags: u16,
+    buf_index: u16,
+) -> Entry128 {
     let mut cmd = [0u8; 80];
     let req = FuseUringCmdReq {
         flags: 0,
         commit_id,
         qid,
-        padding: [0; 6],
+        init_flags,
+        init_queue_depth: 0,
+        padding: [0; 2],
     };
     // SAFETY: FuseUringCmdReq is repr(C), 24 bytes; rest of cmd stays zero.
     unsafe {
@@ -2485,6 +2852,35 @@ fn push_cmd(
         }
     }
 
+    if buf_index != 0 {
+        // kmbuf REGISTER: `sqe->buf_index = ent->fixed_buf_id` (offset 40,
+        // u16 — the `{ buf_index | buf_group }` union slot). Ent 0 needs
+        // no write (the SQE is zeroed).
+        //
+        // SAFETY: offset 40 lies in the first 64-byte half of Entry128.
+        unsafe {
+            let base = &mut entry as *mut Entry128 as *mut u8;
+            std::ptr::write_unaligned(base.add(40) as *mut u16, buf_index);
+        }
+    }
+
+    entry
+}
+
+#[allow(clippy::too_many_arguments)] // one wire word per SQE field (see push_cmd_batched)
+fn push_cmd(
+    ring: &mut Ring,
+    cmd_op: u32,
+    qid: u16,
+    commit_id: u64,
+    iov: Option<(*const libc::iovec, u32)>,
+    user_data: u64,
+    init_flags: u16,
+    buf_index: u16,
+) -> io::Result<()> {
+    let entry = build_cmd_entry(
+        cmd_op, qid, commit_id, iov, user_data, init_flags, buf_index,
+    );
     unsafe {
         ring.submission()
             .push(&entry)
@@ -2511,6 +2907,97 @@ mod tests {
     #[test]
     fn test_write_opcode_matches_abi() {
         assert_eq!(FUSE_WRITE_OPCODE, 16, "linux/fuse.h FUSE_WRITE");
+    }
+
+    /// The kmbuf REGISTER wire shape, byte-for-byte (2026-08-04): the
+    /// 80-byte cmd area starts at SQE offset 48 (SQE128), so
+    /// `fuse_uring_cmd_req.qid` sits at 48+16, `init.flags` at 48+18,
+    /// `init.queue_depth` at 48+20; `sqe->buf_index` is the u16 at
+    /// offset 40; kmbuf REGISTERs carry NO iovecs (addr/len zero).
+    /// Classical REGISTERs keep today's encoding exactly (flags 0,
+    /// buf_index 0, iov at addr/len).
+    #[test]
+    fn test_cmd_entry_wire_encoding() {
+        let iovs = [libc::iovec {
+            iov_base: 0x1234_5000 as *mut libc::c_void,
+            iov_len: 2,
+        }];
+
+        let read_u16 = |e: &Entry128, off: usize| -> u16 {
+            // SAFETY: reading inside the 128-byte entry.
+            unsafe {
+                std::ptr::read_unaligned((e as *const Entry128 as *const u8).add(off) as *const u16)
+            }
+        };
+        let read_u32 = |e: &Entry128, off: usize| -> u32 {
+            // SAFETY: as above.
+            unsafe {
+                std::ptr::read_unaligned((e as *const Entry128 as *const u8).add(off) as *const u32)
+            }
+        };
+        let read_u64 = |e: &Entry128, off: usize| -> u64 {
+            // SAFETY: as above.
+            unsafe {
+                std::ptr::read_unaligned((e as *const Entry128 as *const u8).add(off) as *const u64)
+            }
+        };
+
+        // Classical REGISTER: iovs at addr/len, no init flags, no buf_index.
+        let e = build_cmd_entry(
+            FUSE_IO_URING_CMD_REGISTER,
+            3,
+            0,
+            Some((iovs.as_ptr(), 2)),
+            7,
+            0,
+            0,
+        );
+        assert_eq!(
+            read_u64(&e, 16),
+            iovs.as_ptr() as u64,
+            "sqe->addr = the iov ARRAY pointer (libfuse fuse_uring_register_ent)"
+        );
+        assert_eq!(read_u32(&e, 24), 2, "sqe->len = 2 iovecs");
+        assert_eq!(read_u16(&e, 40), 0, "no buf_index");
+        assert_eq!(read_u16(&e, 48 + 16), 3, "cmd_req.qid");
+        assert_eq!(read_u16(&e, 48 + 18), 0, "cmd_req.init.flags empty");
+
+        // kmbuf REGISTER: no iovecs, FUSE_URING_BUF_RING, buf_index = ent.
+        let e = build_cmd_entry(
+            FUSE_IO_URING_CMD_REGISTER,
+            5,
+            0,
+            None,
+            9,
+            super::kmbuf::init_flags(true, false),
+            11,
+        );
+        assert_eq!(read_u64(&e, 16), 0, "kmbuf REGISTER carries no iov ptr");
+        assert_eq!(read_u32(&e, 24), 0, "kmbuf REGISTER carries no iov len");
+        assert_eq!(read_u16(&e, 40), 11, "sqe->buf_index = fixed_buf_id");
+        assert_eq!(read_u16(&e, 48 + 16), 5, "cmd_req.qid");
+        assert_eq!(
+            read_u16(&e, 48 + 18),
+            super::kmbuf::FUSE_URING_BUF_RING,
+            "cmd_req.init.flags = FUSE_URING_BUF_RING"
+        );
+        assert_eq!(read_u16(&e, 48 + 20), 0, "init.queue_depth zero (no zc)");
+
+        // COMMIT_AND_FETCH is unchanged in every mode: commit_id at
+        // cmd+8, zeros in the init union (wire-compatible with
+        // pre-series kernels).
+        let e = build_cmd_entry(
+            FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+            2,
+            0xdead_beef,
+            None,
+            1,
+            0,
+            0,
+        );
+        assert_eq!(read_u64(&e, 48 + 8), 0xdead_beef, "cmd_req.commit_id");
+        assert_eq!(read_u16(&e, 48 + 18), 0, "init union zero on commits");
+        assert_eq!(read_u16(&e, 40), 0, "no buf_index on commits");
     }
 
     // -----------------------------------------------------------------
@@ -2933,6 +3420,8 @@ mod tests {
                 i + 1,
                 None,
                 i,
+                0,
+                0,
             )
             .expect("batched push");
         }
@@ -2984,6 +3473,8 @@ mod tests {
                 i + 1,
                 None,
                 i,
+                0,
+                0,
             )
             .expect("SQ-full must flush-and-continue, never error");
         }

@@ -2162,7 +2162,7 @@ pub fn write_transport_phase_json() -> serde_json::Value {
 }
 
 fn transport_phase_json(
-    snapshot: [(&'static str, [u64; crate::latency_core::LATENCY_BUCKETS]); 4],
+    snapshot: [(&'static str, [u64; crate::latency_core::LATENCY_BUCKETS]); 5],
 ) -> serde_json::Value {
     let mut phases = serde_json::Map::new();
     for (pname, buckets) in snapshot {
@@ -5511,6 +5511,12 @@ impl SqueezefsFilesystem {
                 // connection, so handle_read's in-place arm never fired;
                 // on an armed session this must account ≈ every READ).
                 "fuse3_read_inplace_replies": fuse3::read_inplace_replies(),
+                // kmbuf/zc adoption gauges (2026-08-04): negotiated = the
+                // bufring arm-proof (1 only on kmbuf kernels — the sqz
+                // custom kernel); zc_replies = the staged zc arm's
+                // engagement counter (structurally 0 until it lands).
+                "fuse3_kmbuf_negotiated": fuse3::kmbuf_negotiated(),
+                "fuse3_zc_replies": fuse3::zc_replies(),
                 // The WRITE twin (transport-ingress campaign): the gauge
                 // is what keeps the in-place arm wired.
                 "fuse3_write_inplace_replies": fuse3::write_inplace_replies(),

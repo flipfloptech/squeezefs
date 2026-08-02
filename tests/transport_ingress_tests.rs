@@ -74,11 +74,17 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tempfile::{tempdir, NamedTempFile, TempDir};
 
-const TRANSPORT_PHASES: [&str; 4] = [
+const TRANSPORT_PHASES: [&str; 5] = [
     "queue_wait",
     "dispatch_lag",
     "reply_commit",
     "transport_total",
+    // 2026-08-04 kmbuf campaign: COMMIT-carrying ring-flush syscall
+    // duration — per-FLUSH sampled (saturated/wait-free flushes only),
+    // NOT per-op; the venue of the kernel's commit-side copy machinery,
+    // so the killed FR_LOCKED/GUP term shows as this phase's
+    // before/after delta on kmbuf A/Bs.
+    "commit_flush",
 ];
 
 /// The histogram families are process-global; delta tests serialize.
@@ -698,6 +704,11 @@ fn write_inplace_replies_engage_and_round_trip() {
 
     let fam1 = m.stats()["metrics"]["write_transport_phase_ns"].clone();
     for p in TRANSPORT_PHASES {
+        if p == "commit_flush" {
+            // Per-FLUSH sampled (saturated flushes only) — presence is
+            // pinned by the shape contracts; growth is load-dependent.
+            continue;
+        }
         assert!(
             phase_count(&fam1, p) > phase_count(&fam0, p),
             "live armed-session WRITEs must record write transport phase {p}"

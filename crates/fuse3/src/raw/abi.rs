@@ -38,7 +38,11 @@ pub const FUSE_KERNEL_MINOR_VERSION: u32 = 31;
 
 pub const DEFAULT_TIME_GRAN: u32 = 1;
 
-pub const DEFAULT_MAX_PAGES: u16 = u16::MAX;
+// DEFAULT_MAX_PAGES (the blanket u16::MAX advertisement) was deleted by
+// the 2026-08-04 geometry campaign: over-uring INIT replies advertise the
+// max_pages the TransportGeometry plan stands on (a blanket u16::MAX let
+// the kernel's REGISTER bound exceed the registered ents on raised
+// fs.fuse.max_pages_limit boxes — refused REGISTERs, failed mounts).
 
 // TODO find valid value
 pub const DEFAULT_MAP_ALIGNMENT: u16 = 0;

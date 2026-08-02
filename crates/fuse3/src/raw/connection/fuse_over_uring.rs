@@ -856,6 +856,13 @@ pub const Q_DEPTH_DESIRED: usize = 32;
 /// arena is exactly yesterday's footprint (queues × 4 × payload_sz), so no
 /// box regresses below the behavior it already ran.
 pub const Q_DEPTH_FLOOR: usize = 4;
+/// The budget ladder's payload floor: the pre-4 MiB-campaign shipped ent
+/// size (max_write 1 MiB = 256 × 4 KiB pages — the shape every box ran
+/// before the sysctl-negotiated geometry). The variable-ent ladder never
+/// degrades max_write below `min(target, PAYLOAD_BASE)`, so at the floor
+/// the arena is exactly yesterday's posture (queues × 4 × 1 MiB) — the
+/// same never-regress law [`Q_DEPTH_FLOOR`] encodes for depth.
+pub const PAYLOAD_BASE: usize = 1024 * 1024;
 /// `max_background` floor: the intent of the historical (dead-letter)
 /// `max_background=64` mount-option string — never ship less delivered
 /// background concurrency than that on any geometry.
@@ -1002,19 +1009,39 @@ impl TransportGeometry {
         geom
     }
 
-    /// The pure policy core (unit-tested):
+    /// The pure policy core (unit-tested). The geometry law (2026-08-04
+    /// campaign; design-zero-copy-write-path §5.4c):
     ///
     /// - `nqueues`: env override clamped 1..512, else kernel possible CPUs.
-    /// - `payload_sz`: must be ≥ kernel `ring->max_payload_sz` =
-    ///   max(FUSE_MIN_READ_BUFFER, max_write, max_pages × PAGE_SIZE)
-    ///   (fs/fuse/dev_uring.c; `fc->max_pages` =
-    ///   min(`fs.fuse.max_pages_limit`, advertised max_pages)).
-    /// - `depth`: env override wins verbatim (clamped 1..[`Q_DEPTH_DESIRED`]
-    ///   — explicit operator intent bypasses the budget); otherwise
-    ///   clamp(cap / (nqueues × payload_sz), [`Q_DEPTH_FLOOR`],
-    ///   [`Q_DEPTH_DESIRED`]). The floor keeps the arena at the pre-L1
-    ///   footprint even when the cap is smaller — that is yesterday's
-    ///   shipped posture, never a regression.
+    /// - `max_write` (negotiated): the filesystem's desire gated by the
+    ///   kernel's advertisable ceiling —
+    ///   `clamp(desired, max(page, 4096), max_pages_limit × page)` —
+    ///   then possibly degraded by the budget ladder below. NEVER a
+    ///   hardcoded page count: the pre-fix planner pinned 256 pages while
+    ///   the INIT reply advertised `max_pages = u16::MAX`, so a raised
+    ///   `fs.fuse.max_pages_limit` made the kernel's REGISTER bound
+    ///   exceed the ents and every REGISTER refused (mount failure —
+    ///   over-uring is mandatory).
+    /// - `max_pages` (advertised): `ceil(max_write / page)` — it
+    ///   describes the negotiated max_write EXACTLY, so the kernel's
+    ///   `fc->max_pages = min(limit, advertised) = advertised` and
+    ///   `ring->max_payload_sz = max(FUSE_MIN_READ_BUFFER, max_write,
+    ///   max_pages × page) == payload_sz` by construction: REGISTER
+    ///   acceptance is structural, not coincidental.
+    /// - `payload_sz`: the kernel mirror above (== the registered ent
+    ///   payload iovec length).
+    /// - `depth` + the variable-ent budget ladder (the L1 policy
+    ///   re-derived for variable ent sizes): env override wins verbatim
+    ///   (clamped 1..[`Q_DEPTH_DESIRED`], bypasses the budget AND the
+    ///   payload leg — explicit operator intent); otherwise
+    ///   1. depth = clamp(cap / (nqueues × payload_sz), [`Q_DEPTH_FLOOR`],
+    ///      [`Q_DEPTH_DESIRED`]) — the depth leg degrades FIRST;
+    ///   2. only when the floor-4 arena still exceeds the cap does the
+    ///      payload leg engage: max_write degrades (page-aligned) to the
+    ///      largest value whose floor-4 arena fits, never below
+    ///      [`PAYLOAD_BASE`] (yesterday's shipped 1 MiB ent) — at the
+    ///      base, floor 4 pins regardless, exactly the pre-L1 posture
+    ///      (no box regresses below the behavior it already ran).
     /// - `max_background`: override (> 0) wins, else
     ///   clamp(nqueues × depth, [`MAX_BACKGROUND_FLOOR`],
     ///   [`MAX_BACKGROUND_CEILING`]) — scaled with delivered ring capacity.
@@ -1026,30 +1053,65 @@ impl TransportGeometry {
         env_queues: Option<usize>,
         env_depth: Option<usize>,
         desired_max_write: usize,
-        _max_pages_limit: usize,
+        max_pages_limit: usize,
         page_sz: usize,
         buffer_cap_bytes: u64,
         max_background_override: Option<u16>,
         congestion_threshold_override: Option<u16>,
     ) -> Self {
         const FUSE_MIN_READ_BUFFER: usize = 8192;
-        const KERNEL_MAX_PAGES_LIMIT: usize = 256;
-        let page = page_sz;
-        let payload_sz = desired_max_write
-            .max(FUSE_MIN_READ_BUFFER)
-            .max(KERNEL_MAX_PAGES_LIMIT * page);
+        let page = page_sz.max(512);
+        let limit = max_pages_limit.clamp(1, u16::MAX as usize);
+
+        // The kernel mirror, per candidate max_write: what fc->max_pages
+        // and ring->max_payload_sz become when we advertise
+        // ceil(mw / page) pages (fs/fuse/inode.c INIT processing +
+        // fs/fuse/dev_uring.c fuse_uring_create).
+        let pages_for = |mw: usize| mw.div_ceil(page).clamp(1, limit);
+        let payload_for = |mw: usize| FUSE_MIN_READ_BUFFER.max(mw).max(pages_for(mw) * page);
+
+        // Negotiate the desire against the kernel's advertisable ceiling
+        // (a raised sysctl opens it; a lowered one gates it; kernels
+        // without the sysctl ride the 256 fallback = today's shape).
+        let max_write_target = desired_max_write.clamp(page.max(4096), limit.saturating_mul(page));
 
         let nqueues = env_queues.unwrap_or(kernel_nqueues).clamp(1, 512);
 
-        let depth = match env_depth {
-            Some(d) => d.clamp(1, Q_DEPTH_DESIRED),
+        let depth_at = |mw: usize| -> usize {
+            let per_queue = nqueues as u64 * payload_for(mw) as u64;
+            usize::try_from(buffer_cap_bytes / per_queue)
+                .unwrap_or(Q_DEPTH_DESIRED)
+                .clamp(Q_DEPTH_FLOOR, Q_DEPTH_DESIRED)
+        };
+
+        let (max_write, depth) = match env_depth {
+            // Explicit operator intent bypasses the budget entirely —
+            // both legs (unchanged env semantics).
+            Some(d) => (max_write_target, d.clamp(1, Q_DEPTH_DESIRED)),
             None => {
-                let per_queue = nqueues as u64 * payload_sz as u64;
-                usize::try_from(buffer_cap_bytes / per_queue)
-                    .unwrap_or(Q_DEPTH_DESIRED)
-                    .clamp(Q_DEPTH_FLOOR, Q_DEPTH_DESIRED)
+                let depth = depth_at(max_write_target);
+                let floor_arena =
+                    nqueues as u64 * Q_DEPTH_FLOOR as u64 * payload_for(max_write_target) as u64;
+                let base = max_write_target.min(PAYLOAD_BASE);
+                if depth > Q_DEPTH_FLOOR
+                    || floor_arena <= buffer_cap_bytes
+                    || max_write_target <= base
+                {
+                    (max_write_target, depth)
+                } else {
+                    // Payload leg: the largest page-aligned max_write in
+                    // [base, target] whose floor-depth arena fits the cap.
+                    let fit = buffer_cap_bytes / (nqueues as u64 * Q_DEPTH_FLOOR as u64);
+                    let fit = usize::try_from(fit).unwrap_or(max_write_target);
+                    let mw = (fit / page * page).clamp(base, max_write_target);
+                    (mw, depth_at(mw))
+                }
             }
         };
+
+        // limit ≤ u16::MAX by the clamp above, so this never truncates.
+        let max_pages = pages_for(max_write) as u16;
+        let payload_sz = payload_for(max_write);
 
         let max_background = match max_background_override {
             Some(mb) if mb > 0 => mb,
@@ -1066,8 +1128,8 @@ impl TransportGeometry {
             nqueues,
             depth,
             payload_sz,
-            max_write: desired_max_write,
-            max_pages: u16::MAX,
+            max_write,
+            max_pages,
             max_background,
             congestion_threshold,
         }
@@ -1088,6 +1150,8 @@ static GEOM_QUEUES: AtomicU64 = AtomicU64::new(0);
 static GEOM_DEPTH: AtomicU64 = AtomicU64::new(0);
 static GEOM_PAYLOAD_SZ: AtomicU64 = AtomicU64::new(0);
 static GEOM_MAX_BACKGROUND: AtomicU64 = AtomicU64::new(0);
+static GEOM_MAX_WRITE: AtomicU64 = AtomicU64::new(0);
+static GEOM_MAX_PAGES: AtomicU64 = AtomicU64::new(0);
 
 /// Resolved transport geometry of the live session:
 /// `(queues, depth, payload_sz, total_payload_buffer_bytes,
@@ -1098,6 +1162,17 @@ pub fn over_uring_geometry() -> (u64, u64, u64, u64, u64) {
     let p = GEOM_PAYLOAD_SZ.load(Ordering::Relaxed);
     let mb = GEOM_MAX_BACKGROUND.load(Ordering::Relaxed);
     (q, d, p, q * d * p, mb)
+}
+
+/// The live session's negotiated INIT write geometry:
+/// `(max_write, max_pages)` — the values the kernel was actually told
+/// (stats inode `transport_max_write` / `transport_max_pages`; the 4 MiB
+/// max_write field row's engagement gauge). Zeros until a session arms.
+pub fn over_uring_negotiated_write() -> (u64, u64) {
+    (
+        GEOM_MAX_WRITE.load(Ordering::Relaxed),
+        GEOM_MAX_PAGES.load(Ordering::Relaxed),
+    )
 }
 
 /// Best-effort: turn on kernel `fuse.enable_uring` so REGISTER is accepted.
@@ -1143,6 +1218,8 @@ impl FuseOverUring {
             nqueues,
             depth,
             payload_sz,
+            max_write,
+            max_pages,
             max_background,
             ..
         } = geom;
@@ -1150,6 +1227,8 @@ impl FuseOverUring {
         GEOM_DEPTH.store(depth as u64, Ordering::Relaxed);
         GEOM_PAYLOAD_SZ.store(payload_sz as u64, Ordering::Relaxed);
         GEOM_MAX_BACKGROUND.store(max_background as u64, Ordering::Relaxed);
+        GEOM_MAX_WRITE.store(max_write as u64, Ordering::Relaxed);
+        GEOM_MAX_PAGES.store(max_pages as u64, Ordering::Relaxed);
 
         let mut inbound = Vec::with_capacity(nqueues);
         for _ in 0..nqueues {
@@ -1305,11 +1384,13 @@ impl FuseOverUring {
             },
         };
         eprintln!(
-            "FUSE-over-io_uring registered: queues={nqueues} depth={depth} payload_sz={payload_sz} fd={fuse_fd} sqpoll={sqpoll_state}"
+            "FUSE-over-io_uring registered: queues={nqueues} depth={depth} payload_sz={payload_sz} \
+             max_write={max_write} max_pages={max_pages} fd={fuse_fd} sqpoll={sqpoll_state}"
         );
         info!(
             "FUSE-over-io_uring registered: queues={nqueues} depth={depth} \
-             payload_sz={payload_sz} fd={fuse_fd} sqpoll={sqpoll_state}"
+             payload_sz={payload_sz} max_write={max_write} max_pages={max_pages} \
+             fd={fuse_fd} sqpoll={sqpoll_state}"
         );
         Ok(pool)
     }

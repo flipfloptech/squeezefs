@@ -1229,6 +1229,14 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         // classical DEFAULT_MAX_BACKGROUND=12 was one of the two
         // multiplicative in-flight gates (with per-queue depth 4) that held
         // rand-4k iodepth workloads to ~18 effective of 256 offered.
+        //
+        // Geometry law (2026-08-04): the INIT reply's max_write/max_pages
+        // are the NEGOTIATED values the geometry plan stands on — the
+        // filesystem's desire gated by `fs.fuse.max_pages_limit` and the
+        // payload budget ladder. Advertising anything else (the historical
+        // blanket `max_pages = u16::MAX`) lets the kernel's REGISTER bound
+        // `ring->max_payload_sz` exceed the registered ents on any
+        // raised-sysctl box: every REGISTER refuses and the mount fails.
         #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
         let transport_geom = crate::raw::connection::fuse_over_uring::TransportGeometry::resolve(
             reply.max_write.get() as usize,
@@ -1237,15 +1245,19 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             self.mount_options.congestion_threshold,
         );
         #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
-        let (max_background, congestion_threshold) = (
+        let (max_background, congestion_threshold, negotiated_max_write, advertised_max_pages) = (
             transport_geom.max_background,
             transport_geom.congestion_threshold,
+            u32::try_from(transport_geom.max_write).unwrap_or(reply.max_write.get()),
+            transport_geom.max_pages,
         );
         // Non-over-uring builds keep the classical libfuse-era defaults
-        // (max_background 12, congestion ¾ of it) — the L1 policy is an
-        // over-uring geometry statement and does not apply without rings.
+        // (max_background 12, congestion ¾ of it, blanket max_pages) — the
+        // L1/geometry policy is an over-uring statement and does not apply
+        // without rings.
         #[cfg(not(all(target_os = "linux", feature = "tokio-runtime")))]
-        let (max_background, congestion_threshold) = (12u16, 9u16);
+        let (max_background, congestion_threshold, negotiated_max_write, advertised_max_pages) =
+            (12u16, 9u16, reply.max_write.get(), u16::MAX);
 
         let init_out = fuse_init_out {
             major: FUSE_KERNEL_VERSION,
@@ -1254,9 +1266,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             flags: reply_flags,
             max_background,
             congestion_threshold,
-            max_write: reply.max_write.get(),
+            max_write: negotiated_max_write,
             time_gran: DEFAULT_TIME_GRAN,
-            max_pages: DEFAULT_MAX_PAGES,
+            max_pages: advertised_max_pages,
             map_alignment: DEFAULT_MAP_ALIGNMENT,
             flags2,
             max_stack_depth: 0,
@@ -1317,7 +1329,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         debug!("fuse init done");
 
-        Ok(reply.max_write)
+        // The dispatch buffers must size to what the kernel was TOLD, not
+        // to the filesystem's (possibly larger) desire.
+        Ok(NonZeroU32::new(negotiated_max_write).unwrap_or(reply.max_write))
     }
 
     #[instrument(skip(self, data, fs))]

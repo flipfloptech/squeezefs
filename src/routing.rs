@@ -6979,13 +6979,17 @@ impl DataRouter {
 
     /// L4-8 (§5.5.1 "the 1 M+ engine"): the SYNC serve mirror for the IPC
     /// read fast path — exactly the sync-servable striped legs of
-    /// [`Self::read_file_range_zero_copy`] (the staging mmap ring, then
-    /// the R4 hot-block tier), no awaits, no blocking locks. `None` = any
-    /// shape needing async work (W2 extent overlays, multi-block, cold
-    /// blocks, non-striped layouts) — the caller demotes to the handoff,
-    /// which runs the full handler; parity is by construction because
-    /// these legs are pointwise copies of the handler's own (same keys,
-    /// same clamps, same currency rules).
+    /// [`Self::read_file_range_zero_copy`] (the staging mmap ring, the
+    /// R4 hot-block tier, then — il hold-probe campaign 2026-08-03 —
+    /// the read-lane hold as the fourth leg, in the handler ladder's
+    /// order), no awaits, no blocking locks. `None` = any shape needing
+    /// async work (W2 extent overlays, multi-block, cold blocks,
+    /// non-striped layouts) — the caller demotes to the handoff, which
+    /// runs the full handler; parity is by construction because these
+    /// legs are pointwise copies of the handler's own (same keys, same
+    /// clamps, same currency rules). A ledger-visible hold serve
+    /// dispatches its R1b ceremony to the handler lanes (see the leg-2b
+    /// comment); the serve itself completes on the service thread.
     ///
     /// Caller contract: `offset + read_len` already clamped to the
     /// authoritative size (the fast path's guarded size check), and the
@@ -7107,7 +7111,95 @@ impl DataRouter {
             let end = rel_e.min(hot.len());
             METRICS.hot_block_hits.fetch_add(1, Ordering::Relaxed);
             out.write_at(0, &hot[start..end]);
+            // Read-lane coverage credit (il hold-probe campaign,
+            // 2026-08-03 — the handler hot arm's rule mirrored): this
+            // consumption path retires the hold's copy too (no-op when
+            // the key is not held), so `hold_evicted_unconsumed` keeps
+            // meaning starvation on il rows.
+            if self.read_lane.enabled() {
+                self.cache
+                    .read_lane_hold
+                    .credit(b_key, (end - start) as u64);
+            }
             return Some(end - start);
+        }
+
+        // Leg 2b: the read-lane hold — the sync fast path's fourth leg
+        // (il hold-probe campaign, 2026-08-03; charter
+        // `.benchmarks/2026-08-02-il-anomalies.md` §2: the kernel path
+        // serves ~294 k ops/row from hold/hot at ~µs while the il
+        // DIALED-P1.5 prelude direct-drove those misses device-true —
+        // the whole −8 %/+110 µs cold-rand-4k deficit). Probe order
+        // mirrors the handler ladder (hot strictly first, so warm hot
+        // entries keep funding the governor's payback basis); the probe
+        // itself is `serve_with_provenance` — lock-free scc, callable
+        // from the foreign service thread. Binding currency is leg 3's
+        // own argument, structural here: the caller holds this inode's
+        // read guard and `b_key` came from the CURRENT map. A miss
+        // falls through unchanged (leg 3 → demote/direct-drive —
+        // fallback-is-correctness).
+        if self.read_lane.enabled() {
+            if let Some((held, ledger_visible)) =
+                self.cache.read_lane_hold.serve_with_provenance(b_key, 0)
+            {
+                let start = rel_s.min(held.len());
+                let end = rel_e.min(held.len());
+                METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+                METRICS.read_lane_serves.fetch_add(1, Ordering::Relaxed);
+                METRICS
+                    .read_lane_serve_bytes
+                    .fetch_add((end - start) as u64, Ordering::Relaxed);
+                METRICS
+                    .ipc_hold_probe_serves
+                    .fetch_add(1, Ordering::Relaxed);
+                out.write_at(0, &held[start..end]);
+                self.cache
+                    .read_lane_hold
+                    .credit(b_key, (end - start) as u64);
+                // R1b ledger visibility (the `3cd528b` law's THIRD serve
+                // site): a demand-deposited entry served after the hot
+                // probe missed is the pre-lane device refetch in serve
+                // form — it carries the admission ceremony (ghost touch
+                // → second-touch publish → protected hot re-landing,
+                // `hold_serve_admission`) with it. The ceremony's legs
+                // await (tier publish rides spawn_blocking), so it
+                // cannot run on this foreign service thread: dispatch
+                // it to the fuse3 per-core handler lanes — `tpc_spawn`,
+                // the 2026-07-26 handoff-economy venue (NEVER
+                // `Handle::spawn` from a foreign thread: that lands on
+                // the global inject queue, the measured ~130 µs/op
+                // term). One serve ⇒ one dispatched ceremony
+                // (exactly-once; concurrent same-key serves may
+                // duplicate it — the GhostTable's racy-tolerant class,
+                // identical to the kernel serve sites). Lane-fetch
+                // deposits stay ledger-invisible end to end (the
+                // scan-resistance verdict).
+                if ledger_visible {
+                    let class = if self
+                        .stream_lanes
+                        .get(file_path)
+                        .is_some_and(|l| l.any_streaming_fresh())
+                    {
+                        FillClass::DemandStream
+                    } else {
+                        FillClass::Demand
+                    };
+                    let router = self.clone();
+                    let bk = b_key.to_string();
+                    let held_for_ceremony = held.clone();
+                    fuse3::raw::tpc_spawn(async move {
+                        router
+                            .hold_serve_admission(&bk, &held_for_ceremony, class)
+                            .await;
+                    });
+                }
+                return Some(end - start);
+            }
+            // The probe ran (lane armed, binding resolved, hot missed)
+            // and found nothing — the engagement pair's miss half.
+            METRICS
+                .ipc_hold_probe_misses
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         // Leg 3: the NVMe read-cache shard (sync mmap — the handler's

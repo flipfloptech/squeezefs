@@ -328,11 +328,7 @@ impl Fixture {
     /// a cold attr cache before it can probe anything — warm it through
     /// the FUSE getattr handler (its miss arm seeds the cache).
     async fn warm_attr(&self, ino: u64) {
-        let _ = self
-            .fs
-            .getattr(req(), ino, None, 0)
-            .await
-            .expect("getattr");
+        let _ = self.fs.getattr(req(), ino, None, 0).await.expect("getattr");
         assert!(
             self.fs.attr_cache.get(&ino).is_some(),
             "fixture: getattr must seed the attr cache"
@@ -557,7 +553,10 @@ async fn hold_probe_serves_bytes_exact_and_ceremony_lands_exactly_once() {
         fx.fs.router.cache.read_lane_hold.contains(&k0),
         "fixture: the demand fill must deposit in the hold"
     );
-    assert!(!fx.tier_has(&k0), "fixture: first touch skipped the publish");
+    assert!(
+        !fx.tier_has(&k0),
+        "fixture: first touch skipped the publish"
+    );
     // Kill the hot copy: the ring read's ONLY warm source is the hold.
     fx.fs.router.cache.hot_block.remove(&k0);
     fx.warm_attr(ino).await;
@@ -739,9 +738,7 @@ async fn hold_probe_miss_counts_and_demote_path_is_preserved() {
 
     let misses0 = METRICS.ipc_hold_probe_misses.load(Ordering::Relaxed);
     let serves0 = METRICS.ipc_hold_probe_serves.load(Ordering::Relaxed);
-    let demote0 = METRICS
-        .ipc_fast_path_miss_demotions
-        .load(Ordering::Relaxed);
+    let demote0 = METRICS.ipc_fast_path_miss_demotions.load(Ordering::Relaxed);
 
     let r = tokio::task::block_in_place(|| session.ring_pread_spin(binding, 4096, 4096));
     assert_eq!(r, 4096, "the miss must still serve through the handoff");
@@ -759,10 +756,7 @@ async fn hold_probe_miss_counts_and_demote_path_is_preserved() {
         0
     );
     assert_eq!(
-        METRICS
-            .ipc_fast_path_miss_demotions
-            .load(Ordering::Relaxed)
-            - demote0,
+        METRICS.ipc_fast_path_miss_demotions.load(Ordering::Relaxed) - demote0,
         1,
         "the miss demotes to the async handoff exactly as before the probe"
     );
@@ -875,7 +869,7 @@ async fn sync_hot_leg_serves_credit_the_hold_toward_retirement() {
 
     // Full-coverage ring read of block 0 through the HOT leg (probe
     // order: hot strictly before hold — these must be hot serves).
-    let steps = (BS / 4096) as u64;
+    let steps = BS / 4096;
     tokio::task::block_in_place(|| {
         for i in 0..steps {
             let r = session.ring_pread_spin(binding, i * 4096, 4096);

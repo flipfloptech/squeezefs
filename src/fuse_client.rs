@@ -14896,7 +14896,7 @@ impl Filesystem for SqueezefsFilesystem {
     /// any granularity ≥ the allocation unit): an index absent from the
     /// block map is a hole — that is precisely how the read path serves
     /// zeros for it — unless the block still holds parked custody
-    /// ([`Self::block_has_parked_custody`]). Inline and staged layouts
+    /// (`block_has_parked_custody`). Inline and staged layouts
     /// carry no hole map, and every layout the daemon cannot resolve
     /// falls back to the same all-data answer the kernel would have
     /// synthesized: reporting a hole where data lives would make a sparse

@@ -220,6 +220,87 @@ fn hold_store_unit_semantics() {
 }
 
 // ---------------------------------------------------------------------------
+// RES-3 (pre-RC engineering spec §7) — the FIFO must not accumulate
+// tombstones in the HEALTHY steady state.
+//
+// `insert` pushes one `(u64, String)` node per deposit and `trim_to` is
+// the only popper — gated on `bytes > target`. Coverage retirement (the
+// designed, healthy exit) removes the map entry and credits the byte
+// gauge but leaves the node, so a hold that never reaches its budget
+// grows a node per deposit FOREVER, and the R5 `read_lane_hold`
+// component — which gauges payload bytes — is structurally blind to it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hold_fifo_does_not_accumulate_retirement_tombstones() {
+    const DEPOSITS: u64 = 4096;
+    let hold = ReadLaneHold::new();
+    let blk = bytes::Bytes::from(vec![7u8; BS as usize]);
+    // Budget for 8 entries: the steady state below never trims, because
+    // every entry retires on full coverage before the next deposit.
+    let budget = 8 * BS;
+
+    for i in 0..DEPOSITS {
+        let k = format!("res3_blk{i}");
+        hold.insert(&k, blk.clone(), budget);
+        // Full coverage ⇒ retire (the healthy exit).
+        assert!(hold.serve(&k, BS).is_some(), "deposit {i} must serve");
+        assert!(!hold.contains(&k), "deposit {i} must retire on coverage");
+    }
+    assert_eq!(hold.bytes(), 0, "the byte gauge converges — it always did");
+    assert!(
+        hold.fifo_len() as u64 <= 64,
+        "RES-3: {} FIFO tombstones survive {DEPOSITS} retired deposits — \
+         the queue grows one (u64, String) node per deposit in the healthy \
+         steady state and the R5 read_lane_hold gauge cannot see any of it",
+        hold.fifo_len()
+    );
+}
+
+/// Tombstone reclamation must not break the oldest-first trim, and must
+/// not drop LIVE nodes: a long-lived entry pinned at the head while
+/// tombstones pile up behind it is the shape a head-only skim misses.
+#[test]
+fn hold_fifo_reclamation_keeps_live_nodes_and_oldest_first_trim() {
+    let hold = ReadLaneHold::new();
+    let blk = bytes::Bytes::from(vec![3u8; BS as usize]);
+    let budget = 4 * BS;
+
+    // Oldest entry: never consumed, so it stays live at the FIFO head.
+    hold.insert("pinned", blk.clone(), budget);
+
+    // Churn behind it: every deposit retires, leaving a tombstone the
+    // head-live case would never skim.
+    for i in 0..2048u64 {
+        let k = format!("churn{i}");
+        hold.insert(&k, blk.clone(), budget);
+        hold.credit(&k, BS);
+        assert!(!hold.contains(&k), "churn {i} retires on coverage");
+    }
+    assert!(
+        hold.fifo_len() <= 64,
+        "RES-3: {} nodes behind a pinned live head",
+        hold.fifo_len()
+    );
+    assert!(
+        hold.contains("pinned"),
+        "reclamation must not drop live nodes"
+    );
+    assert_eq!(hold.bytes(), BS, "gauge exact after reclamation");
+
+    // Oldest-first trim still names the pinned entry first.
+    hold.insert("newer", blk.clone(), budget);
+    hold.trim_to(BS);
+    assert!(
+        !hold.contains("pinned"),
+        "oldest-first survives reclamation"
+    );
+    assert!(hold.contains("newer"), "the newer entry is kept");
+    hold.trim_to(0);
+    assert_eq!(hold.bytes(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // Fixture (the read_stream_transient_tests shape: 512 KiB blocks;
 // `staging` selects cache-ful — the NVMe-tier-visible posture the
 // ledger-invisibility contract needs — vs cache-less, the field

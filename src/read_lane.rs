@@ -258,6 +258,14 @@ impl ReadLaneHold {
         self.bytes.load(Ordering::Relaxed)
     }
 
+    /// FIFO node count — the RES-3 tombstone-backlog probe. The R5
+    /// component gauges PAYLOAD bytes, so it cannot see the ordering
+    /// queue's `(u64, String)` nodes; this is the instrument that keeps
+    /// the reclamation invariant honest (`tests/read_lane_tests.rs`).
+    pub fn fifo_len(&self) -> usize {
+        self.fifo.len()
+    }
+
     /// Residency probe (no serve, no credit) — the consume-time
     /// evicted-unconsumed detector's hold arm and the lane task's
     /// already-resident skip.

@@ -3152,6 +3152,24 @@ pub struct Metrics {
     /// elided) — with `write_through_bytes` this prices the latest-wins
     /// coalesce on overlapping rewrite rows.
     pub write_pipeline_superseded_bytes: Align64<AtomicU64>,
+    // Idea 1 — the shadow dual-map rewrite epoch (design-rewrite-program
+    // §5; tests/rewrite_shadow_tests.rs).
+    /// Epoch closes that persisted (each = ONE whole-tx swap save).
+    pub rewrite_shadow_swaps: Align64<AtomicU64>,
+    /// B bytes swapped (recorded blocks × block size at close).
+    pub rewrite_shadow_bytes: Align64<AtomicU64>,
+    /// ENOSPC-forced early closes (the loud fallback to CoW supply —
+    /// KD-1.7). ≈ 0 except at genuine space pressure.
+    pub rewrite_shadow_fallbacks: Align64<AtomicU64>,
+    /// Fenced closes: published nothing, freed nothing (W5 — successor
+    /// accounting). **Must stay 0 on healthy mounts**; investigate
+    /// alongside `writer_guard_fenced`.
+    pub rewrite_shadow_fence_drops: Align64<AtomicU64>,
+    /// GAUGE: open rewrite epochs.
+    pub rewrite_shadow_open_epochs: Align64<AtomicU64>,
+    /// GAUGE: parked displaced-A bytes across open epochs (the VL
+    /// capacity-preflight transient — KD-1.7).
+    pub rewrite_shadow_parked_bytes: Align64<AtomicU64>,
     /// Write-commit-economy lever 1 (2026-07-30): publish-conveyor
     /// passes committed (one save each). With
     /// `layout_publish_batched_blocks` gives the live coalesce factor —
@@ -5603,6 +5621,14 @@ impl SqueezefsFilesystem {
                 // (design-rewrite-program §4).
                 "write_pipeline_supersessions": METRICS.write_pipeline_supersessions.load(Ordering::Relaxed),
                 "write_pipeline_superseded_bytes": METRICS.write_pipeline_superseded_bytes.load(Ordering::Relaxed),
+                // Idea 1 — the shadow dual-map rewrite epoch
+                // (design-rewrite-program §5).
+                "rewrite_shadow_swaps": METRICS.rewrite_shadow_swaps.load(Ordering::Relaxed),
+                "rewrite_shadow_bytes": METRICS.rewrite_shadow_bytes.load(Ordering::Relaxed),
+                "rewrite_shadow_fallbacks": METRICS.rewrite_shadow_fallbacks.load(Ordering::Relaxed),
+                "rewrite_shadow_fence_drops": METRICS.rewrite_shadow_fence_drops.load(Ordering::Relaxed),
+                "rewrite_shadow_open_epochs": METRICS.rewrite_shadow_open_epochs.load(Ordering::Relaxed),
+                "rewrite_shadow_parked_bytes": METRICS.rewrite_shadow_parked_bytes.load(Ordering::Relaxed),
                 // Residence decomposition (2026-07-31 write-wall
                 // campaign, conviction 2): ALWAYS-ON per-phase histograms
                 // — admission → detach → lock → crypto → allocate → DMA
@@ -8608,7 +8634,23 @@ impl SqueezefsFilesystem {
             pipeline_phase_record(PipelinePhase::Crypto, t_crypto);
             let dma = match self.upload_block_dma_phase(processed).await {
                 Ok(d) => d,
-                Err(_) => {
+                Err(e) => {
+                    // Idea 1 ENOSPC early-close (KD-1.7): a mid-epoch
+                    // StorageFull closes the epoch — the swap frees the
+                    // parked A supply — then this loop retries once with
+                    // fresh space. Counted as the loud CoW fallback.
+                    if matches!(&e, SqueezefsError::Io(io)
+                        if io.kind() == std::io::ErrorKind::StorageFull)
+                        && matches!(
+                            self.router.close_rewrite_epoch(ino, fencing_token).await,
+                            Ok(true)
+                        )
+                    {
+                        METRICS
+                            .rewrite_shadow_fallbacks
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     // StorageFull (the brim in-place arm is LOCKED
                     // machinery), device failure, uring backpressure:
                     // the serialized path owns the ladders.
@@ -8665,7 +8707,7 @@ impl SqueezefsFilesystem {
                 )
                 .await;
             match res {
-                Ok(()) => {
+                Ok(epoch_coverage) => {
                     write_phase_record(WritePhase::UploadMapMerge, wp_merge);
                     self.retire_parked_overlay(&cache_key);
                     METRICS.write_through_blocks.fetch_add(1, Ordering::Relaxed);
@@ -8678,6 +8720,16 @@ impl SqueezefsFilesystem {
                             "pipeline upload invalidation tail for ino {ino} block {b} \
                              failed ({e:?}); tiers converge via the purge-on-free law"
                         );
+                    }
+                    if epoch_coverage {
+                        // Idea 1 full-coverage auto-close (KD-1.6).
+                        if let Err(e) =
+                            self.router.close_rewrite_epoch(ino, fencing_token).await
+                        {
+                            warn!(
+                                "coverage-triggered epoch close for ino {ino} failed: {e:?}"
+                            );
+                        }
                     }
                     return;
                 }
@@ -9359,18 +9411,31 @@ impl SqueezefsFilesystem {
         };
         write_phase_record(WritePhase::UploadDma, wp_dma);
         let wp_merge = write_phase_start();
-        self.upload_block_publish_phase(
-            ino,
-            b,
-            dma,
-            grow_size_to_block_end,
-            fencing_token,
-            plaintext_len,
-            pipe_t0,
-        )
-        .await?;
+        let epoch_coverage = self
+            .upload_block_publish_phase(
+                ino,
+                b,
+                dma,
+                grow_size_to_block_end,
+                fencing_token,
+                plaintext_len,
+                pipe_t0,
+            )
+            .await?;
         write_phase_record(WritePhase::UploadMapMerge, wp_merge);
-        self.upload_invalidation_tail(ino, b).await
+        self.upload_invalidation_tail(ino, b).await?;
+        if epoch_coverage {
+            // Idea 1 full-coverage auto-close (KD-1.6): the natural end
+            // of a sequential overwrite — the swap runs here, outside
+            // the merge span (the meta lock is free; the block lock this
+            // caller holds is level 3, meta commits nest inside it
+            // routinely). A transient failure stays never-lossy (the
+            // epoch re-registers; fsync retries).
+            if let Err(e) = self.router.close_rewrite_epoch(ino, fencing_token).await {
+                warn!("coverage-triggered epoch close for ino {ino} failed: {e:?}");
+            }
+        }
+        Ok(())
     }
 
     /// The device phase of a write-through upload (Idea 2 factoring —
@@ -9450,6 +9515,13 @@ impl SqueezefsFilesystem {
     /// + displaced frees. Callers hold `BLOCK_FLUSH_LOCKS(ino, b)`. On a
     /// merge failure the DMA'd block is unreachable (never published to
     /// the map) and is freed here before the error surfaces.
+    ///
+    /// Idea 1 (design-rewrite-program §5.7): on the ACK path
+    /// (`grow_size_to_block_end` — the flush legs demand durability NOW
+    /// and never shadow) with the shadow lever on, the publish rides the
+    /// rewrite epoch's RAM-only record instead of the durable merge; the
+    /// returned flag is the epoch's full-coverage auto-close trigger
+    /// (`false` on every durable-merge path).
     #[allow(clippy::too_many_arguments)]
     async fn upload_block_publish_phase(
         &self,
@@ -9460,7 +9532,7 @@ impl SqueezefsFilesystem {
         fencing_token: u64,
         plaintext_len: u64,
         pipe_t0: std::time::Instant,
-    ) -> Result<(), SqueezefsError> {
+    ) -> Result<bool, SqueezefsError> {
         // Block-map merge via the shared primitive (§5.3 one merge
         // discipline) under INODE_META_LOCKS: current-map RMW, fencing
         // revalidation, RAM cache republish, displaced-key tier purge. On
@@ -9472,6 +9544,56 @@ impl SqueezefsFilesystem {
             (b as u64 + 1) * self.router.block_size.load(Ordering::Relaxed)
         } else {
             0
+        };
+        let dma = if grow_size_to_block_end && crate::routing::rewrite_shadow_enabled() {
+            let UploadDmaOut {
+                be_id,
+                allocator,
+                offset,
+                new_key,
+                processed_len,
+                _inflight,
+            } = dma;
+            let t_publish = std::time::Instant::now();
+            match self
+                .router
+                .rewrite_shadow_record(ino, b, new_key.clone(), min_size, _inflight)
+                .await
+            {
+                crate::routing::ShadowRecordOutcome::Shadowed {
+                    displaced_prev,
+                    coverage_complete,
+                } => {
+                    pipeline_phase_record(PipelinePhase::Publish, t_publish);
+                    // Idea 17 SLO attribution — vehicle-blind: a shadow
+                    // record that displaced an existing mapping is a
+                    // rewrite-class block.
+                    if displaced_prev {
+                        METRICS.rewrite_blocks.fetch_add(1, Ordering::Relaxed);
+                        METRICS
+                            .rewrite_user_bytes
+                            .fetch_add(plaintext_len, Ordering::Relaxed);
+                        METRICS
+                            .rewrite_device_write_bytes
+                            .fetch_add(processed_len, Ordering::Relaxed);
+                    }
+                    // The governor sample still covers the whole pipeline
+                    // (the record IS this publish's terminal act).
+                    self.write_pipeline
+                        .record_completion(&be_id, plaintext_len, pipe_t0.elapsed());
+                    return Ok(coverage_complete);
+                }
+                crate::routing::ShadowRecordOutcome::NotShadowed(guard) => UploadDmaOut {
+                    be_id,
+                    allocator,
+                    offset,
+                    new_key,
+                    processed_len,
+                    _inflight: guard,
+                },
+            }
+        } else {
+            dma
         };
         // Write-commit-economy lever 1 (2026-07-30): the publish rides
         // the per-ino coalescing conveyor — concurrent pipeline uploads
@@ -9527,7 +9649,7 @@ impl SqueezefsFilesystem {
             let _ = self.router.backend_router.free_block(&bk).await;
         }
         pipeline_phase_record(PipelinePhase::DisplacedFree, t_free);
-        Ok(())
+        Ok(false)
     }
 
     async fn flush_active_blocks_with_retry(
@@ -9608,6 +9730,11 @@ impl SqueezefsFilesystem {
         };
 
         let sync_meta_fut = async {
+            // Idea 1 (KD-1.6): fsync/flush is a swap trigger — the epoch
+            // closes (one whole-tx save + the parked frees) BEFORE the
+            // meta barrier below covers it. Fencing refusals propagate
+            // (a fenced fsync must fail loud — the remount law).
+            self.router.close_rewrite_epoch(ino, fencing_token).await?;
             self.router
                 .persist_dirty_layout_if_needed(&crate::keys::inode_path(ino), fencing_token)
                 .await?;

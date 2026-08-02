@@ -539,6 +539,127 @@ impl PlacementTable {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Idea 1 — the shadow dual-map rewrite epoch (rewrite program P0,
+// docs/design-rewrite-program.md §5; contracts in
+// tests/rewrite_shadow_tests.rs).
+//
+// A rewrite epoch makes a sequential overwrite structurally identical to
+// fresh ingest: ACK-path complete-block write-throughs on a striped ino
+// record their fresh (map B) bindings in the RAM-authoritative metadata
+// cache ONLY (`layout_dirty` — reads are RYW by the dirty-authority law),
+// park the displaced A keys in the epoch, and ONE whole-tx save publishes
+// the swap at the close triggers. The safety keystone (§5.2, the
+// deferred-free law): a parked A key is freed only after a durable save
+// that no longer references it — which also makes every INTERMEDIATE
+// dirty-persist a legitimate partial swap; crash recovery owns every
+// other window (W1–W6, the design's crash table).
+// ---------------------------------------------------------------------------
+
+/// `SQUEEZEFS_REWRITE_SHADOW` cell (default ON; `0` restores per-block
+/// durable publishes verbatim — the A/B lever). Runtime-settable for
+/// tests via [`set_rewrite_shadow`].
+fn rewrite_shadow_cell() -> &'static std::sync::atomic::AtomicBool {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let on = std::env::var("SQUEEZEFS_REWRITE_SHADOW")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true);
+        std::sync::atomic::AtomicBool::new(on)
+    })
+}
+
+/// Whether ACK-path rewrite publishes ride the shadow dual-map epoch.
+pub fn rewrite_shadow_enabled() -> bool {
+    rewrite_shadow_cell().load(Ordering::Relaxed)
+}
+
+/// Set the shadow lever (tests / A-B acceptance runs).
+pub fn set_rewrite_shadow(on: bool) {
+    rewrite_shadow_cell().store(on, Ordering::Relaxed);
+}
+
+/// Coarse monotonic milliseconds since process start (the epoch idle
+/// clock — the sweeper's input).
+fn epoch_coarse_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// The idle-close horizon (KD-1.6): derived as the metadata cache's
+/// time-to-idle ÷ 10 — the eviction horizon the idle close defends
+/// against (the refetch-compose hook is the correctness belt; this
+/// bounds the crash exposure of RAM-only bindings on a gone-quiet ino).
+const EPOCH_IDLE_HORIZON_MS: u64 = 300_000 / 10;
+
+/// One ino's open rewrite epoch (all mutation happens under that ino's
+/// `INODE_META_LOCKS` — records and closes serialize there; the fields
+/// are lock-free structures so no additional latch exists).
+pub(crate) struct RewriteEpoch {
+    /// The shadow bindings `b → newest B key` — the refetch-compose
+    /// source (KD-1.9: a cache eviction can never lose an epoch binding).
+    shadow: scc::HashMap<u32, String>,
+    /// Displaced A keys parked until the swap is durable (§5.2).
+    displaced: crossbeam::queue::SegQueue<String>,
+    /// Live-owner registrations for every B offset — THE fsck C2/C3
+    /// in-flight-registry exemption hook (KD-1.3): held until the swap
+    /// is durable-and-visible, dropped-without-shielding on crash.
+    guards: crossbeam::queue::SegQueue<crate::block_allocator::InflightAllocGuard>,
+    /// Bytes recorded (distinct blocks × block size) — `rewrite_shadow_bytes`.
+    recorded_bytes: std::sync::atomic::AtomicU64,
+    /// Parked displaced bytes — the `rewrite_shadow_parked_bytes` share.
+    parked_bytes: std::sync::atomic::AtomicU64,
+    /// Idle clock (coarse ms) — the sweeper's close trigger.
+    last_record_ms: std::sync::atomic::AtomicU64,
+}
+
+impl RewriteEpoch {
+    fn new() -> Self {
+        // Gauge ownership rides construction/Drop (never the close paths):
+        // an epoch dropped WITHOUT a close — the W1 crash shape, a torn
+        // fixture, process teardown — must reconcile the process gauges
+        // too.
+        METRICS
+            .rewrite_shadow_open_epochs
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            shadow: scc::HashMap::new(),
+            displaced: crossbeam::queue::SegQueue::new(),
+            guards: crossbeam::queue::SegQueue::new(),
+            recorded_bytes: std::sync::atomic::AtomicU64::new(0),
+            parked_bytes: std::sync::atomic::AtomicU64::new(0),
+            last_record_ms: std::sync::atomic::AtomicU64::new(epoch_coarse_ms()),
+        }
+    }
+}
+
+impl Drop for RewriteEpoch {
+    fn drop(&mut self) {
+        crate::gauge_core::sub_saturating(&METRICS.rewrite_shadow_open_epochs, 1);
+        crate::gauge_core::sub_saturating(
+            &METRICS.rewrite_shadow_parked_bytes,
+            self.parked_bytes.load(Ordering::Relaxed),
+        );
+    }
+}
+
+/// Outcome of [`DataRouter::rewrite_shadow_record`].
+pub(crate) enum ShadowRecordOutcome {
+    /// No epoch applies (lever off / not a displacing rewrite / fetch
+    /// failure): the caller proceeds with the durable merge — custody of
+    /// the in-flight registration returns with it.
+    NotShadowed(crate::block_allocator::InflightAllocGuard),
+    /// Recorded RAM-only. `displaced_prev` drives the caller's SLO
+    /// attribution; `coverage_complete` is the auto-close trigger.
+    Shadowed {
+        displaced_prev: bool,
+        coverage_complete: bool,
+    },
+}
+
 #[derive(Clone)]
 pub struct BackendRouter {
     pub default_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
@@ -2134,6 +2255,14 @@ pub struct DataRouterInner {
             std::sync::Arc<crate::meta_backend::kv::conveyor_core::ConveyorCore<QueuedPublish>>,
         >,
     >,
+    /// Idea 1 — open rewrite epochs per ino (design-rewrite-program §5).
+    /// Registered at the first displacing ACK-path rewrite; removed by
+    /// the close (swap). All entry mutation serializes on the ino's
+    /// `INODE_META_LOCKS`.
+    pub(crate) rewrite_epochs: std::sync::Arc<scc::HashMap<u64, std::sync::Arc<RewriteEpoch>>>,
+    /// One idle-close sweeper per router, armed lazily on the first
+    /// epoch open (the KD-1.6 idle/size-stable trigger).
+    pub(crate) epoch_sweeper_armed: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -3371,7 +3500,7 @@ impl DataRouter {
                             block_map = Some(map);
                         }
                     }
-                    return Ok(Some(CachedMetadata {
+                    let mut fetched = CachedMetadata {
                         file_type: layout.file_type.into(),
                         size: layout.size,
                         block_map_id: layout.block_map_id.map(Into::into),
@@ -3385,7 +3514,24 @@ impl DataRouter {
                         // Lever A: backend-true at fetch — coherent with
                         // the CURRENT era by definition.
                         layout_base_token: self.inner.dlm.get_fencing_token_ino(ino),
-                    }));
+                    };
+                    // Idea 1 refetch-compose (KD-1.9 — the eviction-hole
+                    // belt): an open epoch's shadow bindings overlay the
+                    // fetched (A) map, and the composed entry is DIRTY —
+                    // the dirty-authority law then shields it from later
+                    // refills until the swap persists it.
+                    if let Some(epoch) = self.inner.rewrite_epochs.read_sync(&ino, |_, e| e.clone())
+                    {
+                        let mut map_arc = fetched.block_map.take().unwrap_or_default();
+                        let map = std::sync::Arc::make_mut(&mut map_arc);
+                        epoch.shadow.iter_sync(|b, k| {
+                            map.insert(*b, k.clone());
+                            true
+                        });
+                        fetched.block_map = Some(map_arc);
+                        fetched.layout_dirty = true;
+                    }
+                    return Ok(Some(fetched));
                 }
             }
         }
@@ -3810,6 +3956,8 @@ impl DataRouter {
                 crypto: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
                 prefetcher: std::sync::Arc::new(IoUringPrefetcher::new()),
                 publish_conveyors: std::sync::Arc::new(scc::HashMap::new()),
+                rewrite_epochs: std::sync::Arc::new(scc::HashMap::new()),
+                epoch_sweeper_armed: std::sync::atomic::AtomicBool::new(false),
             }),
         };
         // Merge-worker promotion commits layout through the router (weak:
@@ -6494,6 +6642,258 @@ impl DataRouter {
     /// `INODE_META_LOCKS` sits strictly after them (P1-9 extended order,
     /// see `stripe_locks.rs`). NOTE: never call `fetch_metadata` from under
     /// this lock — it retakes it on refill and self-deadlocks.
+    /// Idea 1 — record one ACK-path block publish into the ino's rewrite
+    /// epoch (design-rewrite-program §5.1, KD-1.3): RAM-authoritative
+    /// binding + parked displaced key + epoch-held live-owner guard —
+    /// **no durable commit**. Opens the epoch on the first displacing
+    /// rewrite of a striped ino; non-qualifying shapes return
+    /// `NotShadowed` (the caller runs the durable merge verbatim). The
+    /// record mirrors the `Merge` arm's discipline exactly (dirty-RAM
+    /// RMW base, CoW map mutation, displaced-key tier purge, size floor,
+    /// striped flip) minus the save. Fencing is deferred to the swap —
+    /// the staged-family precedent (deferred persists fence at persist
+    /// time; the write handler validated the lease upstream).
+    pub(crate) async fn rewrite_shadow_record(
+        &self,
+        ino: u64,
+        b: u32,
+        new_key: String,
+        min_size: u64,
+        guard: crate::block_allocator::InflightAllocGuard,
+    ) -> ShadowRecordOutcome {
+        let _map_guard = meta_lock_acquire(ino).await;
+        // RMW base — the dirty-authority rule (the merge primitive's,
+        // verbatim). A fetch failure falls back to the durable merge,
+        // which redoes the fetch and surfaces the error on its own path.
+        let mut current = match self.metadata_cache.get(&ino) {
+            Some(m) if m.layout_dirty => m,
+            cached => match self.fetch_metadata_from_backend(ino).await {
+                Ok(Some(m)) => m,
+                Ok(None) => cached.unwrap_or_default(),
+                Err(_) => return ShadowRecordOutcome::NotShadowed(guard),
+            },
+        };
+        let prev = current
+            .block_map
+            .as_ref()
+            .and_then(|bm| bm.get(&b).cloned());
+        let epoch = match self.inner.rewrite_epochs.read_sync(&ino, |_, e| e.clone()) {
+            Some(e) => e,
+            None => {
+                // Open trigger (KD-1.1): the first COMPLETE-block publish
+                // that would displace an existing striped mapping.
+                let displacing = current.file_type == "striped"
+                    && prev.as_deref().is_some_and(|p| p != new_key);
+                if !displacing {
+                    return ShadowRecordOutcome::NotShadowed(guard);
+                }
+                let fresh = std::sync::Arc::new(RewriteEpoch::new());
+                let e = match self.inner.rewrite_epochs.entry_sync(ino) {
+                    scc::hash_map::Entry::Occupied(occ) => occ.get().clone(),
+                    scc::hash_map::Entry::Vacant(vac) => {
+                        vac.insert_entry(fresh.clone());
+                        fresh
+                    }
+                };
+                self.ensure_epoch_sweeper();
+                e
+            }
+        };
+        let bs = self.block_size.load(Ordering::Relaxed);
+        // CoW map mutation (item A — held reader snapshots keep their map).
+        let mut map_arc = current.block_map.take().unwrap_or_default();
+        let map = std::sync::Arc::make_mut(&mut map_arc);
+        let displaced_prev = match map.insert(b, new_key.clone()) {
+            Some(p) if p != new_key => {
+                // Purge the displaced key's read tiers (it left the map)
+                // and PARK it — freed only after a durable save that no
+                // longer references it (§5.2). A same-epoch re-rewrite
+                // parks the prior B key the same way: it was never
+                // durably referenced, so the close's free is legal a
+                // fortiori.
+                self.cache.purge_block_key(&p);
+                epoch.displaced.push(p);
+                epoch.parked_bytes.fetch_add(bs, Ordering::Relaxed);
+                METRICS
+                    .rewrite_shadow_parked_bytes
+                    .fetch_add(bs, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        };
+        current.block_map = Some(map_arc);
+        // Size floor — the Merge arm's discipline verbatim.
+        current.size = std::cmp::max(current.size, min_size);
+        if let Some(cached) = self.metadata_cache.get(&ino) {
+            if cached.size > current.size {
+                current.size = cached.size;
+            }
+        }
+        current.file_type = "striped".into();
+        current.layout_dirty = true;
+        current.cached_at = std::time::Instant::now();
+        let size_now = current.size;
+        self.metadata_cache.insert(ino, current);
+        // Epoch bookkeeping.
+        match epoch.shadow.entry_sync(b) {
+            scc::hash_map::Entry::Occupied(mut occ) => *occ.get_mut() = new_key,
+            scc::hash_map::Entry::Vacant(vac) => {
+                let _ = vac.insert_entry(new_key);
+                epoch.recorded_bytes.fetch_add(bs, Ordering::Relaxed);
+            }
+        }
+        epoch.guards.push(guard);
+        epoch
+            .last_record_ms
+            .store(epoch_coarse_ms(), Ordering::Relaxed);
+        // Full coverage (KD-1.6): every byte of the file rewritten in
+        // this epoch — the natural end of a sequential overwrite.
+        let coverage_complete = (epoch.shadow.len() as u64).saturating_mul(bs) >= size_now;
+        ShadowRecordOutcome::Shadowed {
+            displaced_prev,
+            coverage_complete,
+        }
+    }
+
+    /// Idea 1 — close the ino's rewrite epoch: THE SWAP (KD-1.4). One
+    /// whole-tx save of the (dirty) RAM layout under `INODE_META_LOCKS`
+    /// with fencing revalidation inside, then — strictly after the save —
+    /// the parked displaced keys free (terminal frees ride Idea 4's
+    /// elision: zero discards; clone-shared keys decrement-only) and the
+    /// B guards drop. Returns `Ok(true)` when an epoch closed.
+    ///
+    /// * **Fenced (W5)**: publish NOTHING, free NOTHING (the durable map
+    ///   may still reference parked A keys; an intermediate save may have
+    ///   published some B keys — successor accounting owns both), drop
+    ///   the ledger + guards, invalidate the RAM entry, count
+    ///   `rewrite_shadow_fence_drops`, propagate loud.
+    /// * **Transient save failure**: the epoch RE-REGISTERS (never-lossy
+    ///   — bindings stay in RAM + registry; the next close trigger
+    ///   retries).
+    pub async fn close_rewrite_epoch(&self, ino: u64, fencing_token: u64) -> Result<bool> {
+        if self.inner.rewrite_epochs.read_sync(&ino, |_, _| ()).is_none() {
+            return Ok(false);
+        }
+        let _map_guard = meta_lock_acquire(ino).await;
+        // Resolve the entry WHILE the epoch is still registered (a cache
+        // miss refetch-composes the shadow — KD-1.9).
+        let current = match self.metadata_cache.get(&ino) {
+            Some(m) => Some(m),
+            None => self.fetch_metadata_from_backend(ino).await?,
+        };
+        let Some((_, epoch)) = self.inner.rewrite_epochs.remove_sync(&ino) else {
+            return Ok(false);
+        };
+        let save_res: Result<()> = match current {
+            Some(mut cur) if cur.layout_dirty => {
+                cur.layout_dirty = false;
+                cur.cached_at = std::time::Instant::now();
+                match self.save_metadata_to_backend(ino, &cur, fencing_token).await {
+                    Ok(()) => {
+                        self.metadata_cache.insert(ino, cur);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            // Clean entry (an intermediate save — a flush-leg merge or a
+            // staged persist — already covered every recorded binding:
+            // saves persist the current-at-save RAM map under this same
+            // lock) or a vanished layout (destroyed ino): the frees below
+            // are legal by the §5.2 law.
+            _ => Ok(()),
+        };
+        match save_res {
+            Ok(()) => {
+                // Frees strictly AFTER the durable save (§5.2).
+                while let Some(k) = epoch.displaced.pop() {
+                    let _ = self.backend_router.free_block(&k).await;
+                }
+                while epoch.guards.pop().is_some() {} // deregister B owners
+                METRICS
+                    .rewrite_shadow_swaps
+                    .fetch_add(1, Ordering::Relaxed);
+                METRICS
+                    .rewrite_shadow_bytes
+                    .fetch_add(epoch.recorded_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+                Ok(true)
+            }
+            Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
+                while epoch.displaced.pop().is_some() {}
+                while epoch.guards.pop().is_some() {}
+                self.metadata_cache.remove(&ino);
+                METRICS
+                    .rewrite_shadow_fence_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                log::error!(
+                    "rewrite epoch for ino {ino} FENCED at close: publishing nothing, \
+                     freeing nothing (successor accounting — the remount law, W5); \
+                     acked un-fsynced rewrite bytes discard with the fenced era"
+                );
+                Err(e)
+            }
+            Err(e) => {
+                // Never-lossy: re-register the epoch (records take this
+                // same meta lock, so nothing raced the window; the
+                // gauges ride the object — construction/Drop — so the
+                // round trip is gauge-neutral).
+                let _ = self.inner.rewrite_epochs.insert_sync(ino, epoch);
+                log::warn!(
+                    "rewrite epoch close for ino {ino} failed transiently ({e:?}); \
+                     the epoch stays registered (never-lossy) — the next close \
+                     trigger retries"
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Arm the idle-close sweeper (KD-1.6, lazily on the first epoch —
+    /// the `ensure_worker` pattern, Weak-held).
+    fn ensure_epoch_sweeper(&self) {
+        if self
+            .inner
+            .epoch_sweeper_armed
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.inner
+                .epoch_sweeper_armed
+                .store(false, std::sync::atomic::Ordering::Release);
+            return;
+        };
+        let weak = std::sync::Arc::downgrade(&self.inner);
+        handle.spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Some(inner) = weak.upgrade() else { return };
+                let router = DataRouter { inner };
+                let now = epoch_coarse_ms();
+                let mut idle: Vec<u64> = Vec::new();
+                router.inner.rewrite_epochs.iter_sync(|ino, e| {
+                    if now.saturating_sub(e.last_record_ms.load(Ordering::Relaxed))
+                        >= EPOCH_IDLE_HORIZON_MS
+                    {
+                        idle.push(*ino);
+                    }
+                    true
+                });
+                for ino in idle {
+                    let token = router.inner.dlm.get_fencing_token_ino(ino);
+                    if let Err(e) = router.close_rewrite_epoch(ino, token).await {
+                        log::warn!("idle epoch close for ino {ino} failed: {e:?}");
+                    }
+                }
+                // No Arc across the tick sleep.
+                drop(router);
+            }
+        });
+    }
+
     pub async fn merge_block_mappings(
         &self,
         ino: u64,
@@ -10410,6 +10810,14 @@ impl DataRouter {
                 .await?;
             _dest_lease.fencing_token()
         };
+
+        // Idea 1 force-close (KD-1.6 shape-change trigger): a clone must
+        // observe a DURABLE source layout — a RAM-only epoch binding
+        // cloned into a new ino's durable map would let the clone
+        // outlive a source that crash-reverts to A (torn-but-consistent,
+        // but a semantic surprise; the swap-first rule removes it).
+        self.close_rewrite_epoch(_src_ino, _resolved_src_token)
+            .await?;
 
         let meta = self.fetch_metadata(src).await?;
 

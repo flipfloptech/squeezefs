@@ -1054,6 +1054,12 @@ async fn test_write_through_reused_key_purges_stale_read_tiers() {
     // path.
     squeezefs::fuse_client::set_patch_max_bytes(0);
     squeezefs::fuse_client::set_inplace_overwrite(false);
+    // The rewrite-shadow epoch (Idea 1) PARKS displaced keys instead of
+    // freeing them per block — this test pins the durable CoW
+    // displace+free+reuse machinery specifically, so the lever is off
+    // (the epoch's own displaced handling is pinned in
+    // tests/rewrite_shadow_tests.rs).
+    squeezefs::routing::set_rewrite_shadow(false);
     let block = 65536usize;
     let ino = create(&h, "reuse_purge").await;
     let path = format!("inode_{ino}");
@@ -1137,6 +1143,7 @@ async fn test_write_through_reused_key_purges_stale_read_tiers() {
          no-put write-through owner must purge the key's read tiers"
     );
     squeezefs::fuse_client::set_inplace_overwrite(false);
+    squeezefs::routing::set_rewrite_shadow(true);
 }
 
 // ---------------------------------------------------------------------------

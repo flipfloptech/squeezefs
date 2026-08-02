@@ -364,10 +364,16 @@ async fn rewrite_pass_coalesces_and_displaces_every_prior_binding() {
     impl Drop for InplaceOn {
         fn drop(&mut self) {
             squeezefs::fuse_client::set_inplace_overwrite(false);
+            squeezefs::routing::set_rewrite_shadow(true);
         }
     }
     let _i = InplaceOn;
     squeezefs::fuse_client::set_inplace_overwrite(false);
+    // The rewrite-shadow epoch (Idea 1) records rewrite publishes
+    // RAM-only (no conveyor, displaced keys parked) — this contract pins
+    // the durable CoW conveyor economy specifically, so the lever is off
+    // (tests/rewrite_shadow_tests.rs owns the epoch venue).
+    squeezefs::routing::set_rewrite_shadow(false);
 
     let meta = NamedTempFile::new().unwrap();
     meta.as_file().set_len(128 * 1024 * 1024).unwrap();

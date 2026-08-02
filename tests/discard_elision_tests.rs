@@ -123,9 +123,7 @@ fn elided() -> u64 {
     METRICS.block_free_reclaim_elided.load(Ordering::Relaxed)
 }
 fn debt_gauge() -> u64 {
-    METRICS
-        .block_free_elided_debt_bytes
-        .load(Ordering::Relaxed)
+    METRICS.block_free_elided_debt_bytes.load(Ordering::Relaxed)
 }
 fn queued() -> u64 {
     METRICS.block_free_reclaim_queued.load(Ordering::Relaxed)

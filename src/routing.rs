@@ -1991,27 +1991,26 @@ impl BackendRouter {
         }
         // Targets: every backend when trimming the full free list; the
         // registered debt targets otherwise.
-        let targets: Vec<(String, std::sync::Arc<crate::block_allocator::BlockAllocator>)> =
-            if full {
-                let mut t = vec![(
-                    self.default_device.device_path.clone(),
-                    self.default_allocator.clone(),
-                )];
-                for be in self.backends.iter() {
-                    if !std::sync::Arc::ptr_eq(
-                        &be.value().block_allocator,
-                        &self.default_allocator,
-                    ) {
-                        t.push((
-                            be.value().device.device_path.clone(),
-                            be.value().block_allocator.clone(),
-                        ));
-                    }
+        let targets: Vec<(
+            String,
+            std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        )> = if full {
+            let mut t = vec![(
+                self.default_device.device_path.clone(),
+                self.default_allocator.clone(),
+            )];
+            for be in self.backends.iter() {
+                if !std::sync::Arc::ptr_eq(&be.value().block_allocator, &self.default_allocator) {
+                    t.push((
+                        be.value().device.device_path.clone(),
+                        be.value().block_allocator.clone(),
+                    ));
                 }
-                t
-            } else {
-                self.debt.targets_snapshot()
-            };
+            }
+            t
+        } else {
+            self.debt.targets_snapshot()
+        };
         let mut blocks = 0u64;
         let mut bytes = 0u64;
         for (device_path, allocator) in targets {
@@ -6682,8 +6681,8 @@ impl DataRouter {
             None => {
                 // Open trigger (KD-1.1): the first COMPLETE-block publish
                 // that would displace an existing striped mapping.
-                let displacing = current.file_type == "striped"
-                    && prev.as_deref().is_some_and(|p| p != new_key);
+                let displacing =
+                    current.file_type == "striped" && prev.as_deref().is_some_and(|p| p != new_key);
                 if !displacing {
                     return ShadowRecordOutcome::NotShadowed(guard);
                 }
@@ -6771,7 +6770,12 @@ impl DataRouter {
     ///   — bindings stay in RAM + registry; the next close trigger
     ///   retries).
     pub async fn close_rewrite_epoch(&self, ino: u64, fencing_token: u64) -> Result<bool> {
-        if self.inner.rewrite_epochs.read_sync(&ino, |_, _| ()).is_none() {
+        if self
+            .inner
+            .rewrite_epochs
+            .read_sync(&ino, |_, _| ())
+            .is_none()
+        {
             return Ok(false);
         }
         let _map_guard = meta_lock_acquire(ino).await;
@@ -6788,7 +6792,10 @@ impl DataRouter {
             Some(mut cur) if cur.layout_dirty => {
                 cur.layout_dirty = false;
                 cur.cached_at = std::time::Instant::now();
-                match self.save_metadata_to_backend(ino, &cur, fencing_token).await {
+                match self
+                    .save_metadata_to_backend(ino, &cur, fencing_token)
+                    .await
+                {
                     Ok(()) => {
                         self.metadata_cache.insert(ino, cur);
                         Ok(())
@@ -6810,12 +6817,11 @@ impl DataRouter {
                     let _ = self.backend_router.free_block(&k).await;
                 }
                 while epoch.guards.pop().is_some() {} // deregister B owners
-                METRICS
-                    .rewrite_shadow_swaps
-                    .fetch_add(1, Ordering::Relaxed);
-                METRICS
-                    .rewrite_shadow_bytes
-                    .fetch_add(epoch.recorded_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+                METRICS.rewrite_shadow_swaps.fetch_add(1, Ordering::Relaxed);
+                METRICS.rewrite_shadow_bytes.fetch_add(
+                    epoch.recorded_bytes.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
                 Ok(true)
             }
             Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {

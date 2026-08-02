@@ -350,11 +350,11 @@ async fn rewrite_chain_rebases_at_the_cap() {
     set_publish_coalesce_override(None);
     set_publish_commit_group_override(None);
     set_layout_delta_chain_override(Some(4)); // C = 4: cadence visible fast
-    // The rewrite-shadow epoch (Idea 1) records rewrite publishes
-    // RAM-only — this contract pins the durable Lever A/B rewrite
-    // publish machinery specifically (base provenance / chain re-base),
-    // so the lever is off (tests/rewrite_shadow_tests.rs owns the epoch
-    // venue). Restored by ShadowOff's drop.
+                                              // The rewrite-shadow epoch (Idea 1) records rewrite publishes
+                                              // RAM-only — this contract pins the durable Lever A/B rewrite
+                                              // publish machinery specifically (base provenance / chain re-base),
+                                              // so the lever is off (tests/rewrite_shadow_tests.rs owns the epoch
+                                              // venue). Restored by ShadowOff's drop.
     struct ShadowOff;
     impl Drop for ShadowOff {
         fn drop(&mut self) {

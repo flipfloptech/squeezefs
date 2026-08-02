@@ -8696,15 +8696,7 @@ impl SqueezefsFilesystem {
             // classic ordering — merge, retire, invalidation tail).
             let wp_merge = write_phase_start();
             let res = self
-                .upload_block_publish_phase(
-                    ino,
-                    b,
-                    dma,
-                    true,
-                    fencing_token,
-                    block_size,
-                    pipe_t0,
-                )
+                .upload_block_publish_phase(ino, b, dma, true, fencing_token, block_size, pipe_t0)
                 .await;
             match res {
                 Ok(epoch_coverage) => {
@@ -8723,12 +8715,8 @@ impl SqueezefsFilesystem {
                     }
                     if epoch_coverage {
                         // Idea 1 full-coverage auto-close (KD-1.6).
-                        if let Err(e) =
-                            self.router.close_rewrite_epoch(ino, fencing_token).await
-                        {
-                            warn!(
-                                "coverage-triggered epoch close for ino {ino} failed: {e:?}"
-                            );
+                        if let Err(e) = self.router.close_rewrite_epoch(ino, fencing_token).await {
+                            warn!("coverage-triggered epoch close for ino {ino} failed: {e:?}");
                         }
                     }
                     return;

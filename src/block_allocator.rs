@@ -198,9 +198,7 @@ impl BlockAllocator {
     /// entry it must cancel).
     pub fn record_elided_debt(&self, offset: u64, bytes: u64) {
         let prev = match self.elided_debt.entry_sync(offset) {
-            scc::hash_map::Entry::Occupied(mut occ) => {
-                std::mem::replace(occ.get_mut(), bytes)
-            }
+            scc::hash_map::Entry::Occupied(mut occ) => std::mem::replace(occ.get_mut(), bytes),
             scc::hash_map::Entry::Vacant(vac) => {
                 let _ = vac.insert_entry(bytes);
                 0

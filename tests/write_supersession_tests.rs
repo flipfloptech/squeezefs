@@ -203,9 +203,7 @@ async fn await_stall_entries(base: u64, n: u64) {
 }
 
 fn supersessions() -> u64 {
-    METRICS
-        .write_pipeline_supersessions
-        .load(Ordering::Relaxed)
+    METRICS.write_pipeline_supersessions.load(Ordering::Relaxed)
 }
 fn superseded_bytes() -> u64 {
     METRICS

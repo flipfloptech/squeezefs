@@ -19,6 +19,21 @@
 #   (+ seq_read_1m kernel/shim rows via SQZ_WA_ROWS for the read-side
 #    sibling check: rareq-sz + device read bytes / user bytes)
 #
+# Rewrite-program SLO rows (Idea 17, docs/design-rewrite-program.md §2):
+#   seq_overwrite_1m — untimed fileset prep, then the timed FULL
+#       overwrite. Prints REWRITE_AMP (device write bytes / user
+#       overwrite bytes) with the mid-row discard columns; under
+#       SQZ_WA_REWRITE_GATE=1 (default) the charter gates are enforced:
+#       REWRITE_AMP ≤ 1.05 AND d_ops == 0 during the row.
+#   loop_rewrite    — SQZ_WA_LOOP_PASSES (default 5) full-overwrite
+#       passes over a hot set (SQZ_WA_LOOP_FILES × SQZ_WA_LOOP_FILE_MB,
+#       default 4 × 64 MiB) in ONE measured window. Prints the
+#       latest-wins verdict: device writes ÷ unique-block bytes and the
+#       coalesce factor (user ÷ device), plus the supersession
+#       engagement delta. Report-only on the non-overlapping face (the
+#       ≈-unique-blocks gate arms with the Idea 8 durability classes —
+#       design §2.2).
+#
 # Instrument (stated): elbencho (DYNAMIC build — the pinned static one
 # cannot load the shim), medians of SQZ_WA_REPS (default 3). Engagement
 # per row from .stats deltas: a shim row is INVALID unless ipc_ops_write
@@ -68,6 +83,12 @@ mem_budget_yellow_events mem_budget_red_events \
 write_path_seed_read_bytes patch_edge_rmw_reads \
 block_free_discards block_free_discard_bytes block_free_file_punches \
 block_free_punch_bytes block_free_reclaim_skipped \
+rewrite_blocks rewrite_user_bytes rewrite_device_write_bytes \
+block_free_reclaim_elided block_free_elided_debt_bytes \
+block_free_trim_discards block_free_debt_pressure_drains \
+write_pipeline_supersessions write_pipeline_superseded_bytes \
+rewrite_shadow_swaps rewrite_shadow_bytes rewrite_shadow_fallbacks \
+write_through_inplace_overwrites \
 ipc_descriptor_rejects ipc_sessions_poisoned"
 
 INVALID=0
@@ -182,6 +203,18 @@ EOF
     echo "--- $tag: $mibs MiB/s (${elapsed}s)  $ampline"
     diff_stats "$RESULTS/$tag.stats.before" "$RESULTS/$tag.stats.after" "$RESULTS/$tag.stats.delta"
     echo "$row,$side,$rep,$mibs,$amp" >> "$CSV"
+    # Rewrite-program SLO gate (Idea 17, design-rewrite-program §2.2):
+    # a seq-overwrite row under the target classes must pay ≤1.05 device
+    # amp AND zero mid-row discards. SQZ_WA_REWRITE_GATE=0 = measure only.
+    if [ "$row" = seq_overwrite_1m ] && [ "${SQZ_WA_REWRITE_GATE:-1}" = 1 ]; then
+        local d_ops_row; d_ops_row=$(echo "$ampline" | grep -o 'd_ops=[0-9]*' | cut -d= -f2)
+        if awk -v a="$amp" 'BEGIN{exit !(a > 1.05)}'; then
+            echo "  SLO GATE FAIL: $tag REWRITE_AMP=$amp > 1.05"; INVALID=1
+        fi
+        if [ "${d_ops_row:-0}" -ne 0 ]; then
+            echo "  SLO GATE FAIL: $tag paid $d_ops_row mid-row discard ops (charter: 0)"; INVALID=1
+        fi
+    fi
     # Engagement (charter rule 4)
     python3 - "$RESULTS/$tag.stats.delta" "$side" "$row" "$mode" <<'EOF' || INVALID=1
 import json, sys
@@ -205,18 +238,26 @@ run_row_matrix() { # <row> <sides...>
     local row="$1"; shift
     echo "$row" | grep -Eq "$ROW_FILTER" || return 0
     dataset_files
-    if [ "$row" = seq_read_1m ]; then
+    if [ "$row" = seq_read_1m ] || [ "$row" = seq_overwrite_1m ]; then
         # Cold striped dataset written through the KERNEL path (untimed),
-        # then per-rep remount for a cold read (drops RAM tiers).
+        # then per-rep remount for a cold read (drops RAM tiers) /
+        # per-rep full overwrite (every block displaces — the rewrite
+        # steady state; settle first so prep frees never land mid-row).
         rm -f "${DATA_FILES[@]}"
         "$ELBENCHO_BIN" -w -t "$THREADS" -s "${FILE_MB}m" -b 1m --direct \
             "${DATA_FILES[@]}" > "$RESULTS/prep.elbencho" 2>&1 || fail "dataset prep"
+        settle_reclaim
     fi
     for side in "$@"; do
         for rep in $(seq 1 "$REPS"); do
             case "$row" in
                 seq_write_1m)
                     rm -f "${DATA_FILES[@]}"
+                    run_one "$row" "$side" "$rep" w -- \
+                        -w -t "$THREADS" -s "${FILE_MB}m" -b 1m --direct "${DATA_FILES[@]}"
+                    ;;
+                seq_overwrite_1m)
+                    settle_reclaim
                     run_one "$row" "$side" "$rep" w -- \
                         -w -t "$THREADS" -s "${FILE_MB}m" -b 1m --direct "${DATA_FILES[@]}"
                     ;;
@@ -231,6 +272,68 @@ run_row_matrix() { # <row> <sides...>
     done
 }
 
+# Row settle hygiene (rewrite rows): no reclaim backlog may drain into a
+# measured window (the standing settle rule).
+settle_reclaim() {
+    for _ in $(seq 60); do
+        local qb
+        qb=$(python3 -c "import json;m=json.load(open('$MOUNT_DIR/.stats'))['metrics'];print(int(m.get('block_free_reclaim_queue_bytes',0)))" 2>/dev/null || echo 0)
+        [ "${qb:-0}" -eq 0 ] && return 0
+        sleep 1
+    done
+    echo "  WARN: reclaim queue did not settle before the row"
+}
+
+# Rewrite-program loop_rewrite row (Idea 17, design §2.2 face 2):
+# SQZ_WA_LOOP_PASSES full overwrites of a hot set in ONE measured window.
+# Report-only latest-wins verdict: device write bytes ÷ unique-block
+# bytes (the charter's ≈-unique-blocks target) + the coalesce factor and
+# the supersession engagement delta.
+run_loop_rewrite() { # <side>
+    echo "loop_rewrite" | grep -Eq "$ROW_FILTER" || return 0
+    local side="$1"
+    local passes="${SQZ_WA_LOOP_PASSES:-5}"
+    local files="${SQZ_WA_LOOP_FILES:-4}"
+    local fmb="${SQZ_WA_LOOP_FILE_MB:-64}"
+    local envp=()
+    case "$side" in
+        shim) envp=(env "LD_PRELOAD=$SO" "SQUEEZEFS_IPC_ALLOW_DEV=1") ;;
+    esac
+    mkdir -p "$MOUNT_DIR/waloop"
+    local lfiles=()
+    for i in $(seq 1 "$files"); do lfiles+=("$MOUNT_DIR/waloop/f$i"); done
+    rm -f "${lfiles[@]}"
+    # Untimed prep pass (fresh mint) + settle, so the measured window is
+    # pure rewrite.
+    "${envp[@]}" "$ELBENCHO_BIN" -w -t "$files" -s "${fmb}m" -b 1m --direct \
+        "${lfiles[@]}" > "$RESULTS/loop_rewrite.$side.prep" 2>&1 || fail "loop prep"
+    settle_reclaim
+    local tag="loop_rewrite.$side"
+    snap_stats "$RESULTS/$tag.stats.before"
+    local disk_b; disk_b="$(snap_disk)"
+    for p in $(seq 1 "$passes"); do
+        "${envp[@]}" "$ELBENCHO_BIN" -w -t "$files" -s "${fmb}m" -b 1m --direct \
+            "${lfiles[@]}" > "$RESULTS/$tag.pass$p.elbencho" 2>&1 || fail "loop pass $p"
+    done
+    local disk_a; disk_a="$(snap_disk)"
+    snap_stats "$RESULTS/$tag.stats.after"
+    diff_stats "$RESULTS/$tag.stats.before" "$RESULTS/$tag.stats.after" "$RESULTS/$tag.stats.delta"
+    python3 - "$disk_b" "$disk_a" "$((files * fmb * 1024 * 1024))" "$passes" "$RESULTS/$tag.stats.delta" <<'EOF'
+import json, sys
+b = [int(x) for x in sys.argv[1].split()]; a = [int(x) for x in sys.argv[2].split()]
+unique = int(sys.argv[3]); passes = int(sys.argv[4])
+d = json.load(open(sys.argv[5]))
+w_bytes = (a[3]-b[3])*512; d_ops = a[4]-b[4]
+user = unique * passes
+ratio = w_bytes/unique if unique else 0
+coal = user/w_bytes if w_bytes else 0
+sup = d.get("write_pipeline_supersessions", 0)
+print(f"=== loop_rewrite: device_w={w_bytes//1048576}MiB over {passes} passes of "
+      f"{unique//1048576}MiB unique; device/unique={ratio:.2f}x (charter target ~1), "
+      f"coalesce={coal:.2f}x, mid-window d_ops={d_ops}, supersessions={sup}")
+EOF
+}
+
 echo "write_amp_rig: data=$DATA_DEV meta=$META_DEV files=${FILES}x${FILE_MB}MiB results=$RESULTS"
 echo "row,side,rep,mibs,amp" > "$CSV"
 kill_daemon
@@ -238,7 +341,10 @@ format_fs
 mount_fs
 
 run_row_matrix seq_write_1m kernel shim shim-frag
+run_row_matrix seq_overwrite_1m kernel shim
+run_loop_rewrite kernel
+run_loop_rewrite shim
 run_row_matrix seq_read_1m kernel shim
 
-[ "$INVALID" -eq 0 ] || fail "one or more rows INVALID (engagement)"
+[ "$INVALID" -eq 0 ] || fail "one or more rows INVALID (engagement/SLO gate)"
 echo "write_amp_rig: done ($CSV)"

@@ -3064,6 +3064,22 @@ pub struct Metrics {
     /// full-rewrite row of eligible files must account ~every block
     /// here, with `block_free_reclaim_queued` flat.
     pub write_through_inplace_overwrites: Align64<AtomicU64>,
+    // Rewrite-program SLO attribution (Idea 17, design-rewrite-program
+    // §2 — the daemon-side face of the per-row `rewrite_amp` = device
+    // write bytes ÷ user overwrite bytes instrument): a measured rewrite
+    // row's stats-inode deltas must account for its traffic in this
+    // family (vehicle-blind: CoW displacement, in-place replacement and
+    // shadow-epoch records all attribute here), and a FRESH row's deltas
+    // must stay 0.
+    /// Rewrite-class blocks: block publishes that displaced an existing
+    /// different mapping or replaced one in place.
+    pub rewrite_blocks: Align64<AtomicU64>,
+    /// User write bytes attributed to rewrite-class blocks (the SLO
+    /// denominator's attribution).
+    pub rewrite_user_bytes: Align64<AtomicU64>,
+    /// Device write bytes submitted for rewrite-class blocks (stored
+    /// image length — ≡ user bytes on passthrough volumes).
+    pub rewrite_device_write_bytes: Align64<AtomicU64>,
     /// Write-pipeline uploads whose custody was DROPPED on a mid-flight
     /// fencing expiry (2026-07-27 campaign — the remount law applied to
     /// detached uploads, FIND-M11-A). **Must stay 0 on healthy mounts**
@@ -5475,6 +5491,12 @@ impl SqueezefsFilesystem {
                 "write_through_fallbacks": METRICS.write_through_fallbacks.load(Ordering::Relaxed),
                 "write_through_inplace_rewrites": METRICS.write_through_inplace_rewrites.load(Ordering::Relaxed),
                 "write_through_inplace_overwrites": METRICS.write_through_inplace_overwrites.load(Ordering::Relaxed),
+                // Rewrite-program SLO attribution (Idea 17,
+                // design-rewrite-program §2): the daemon-side face of the
+                // per-row rewrite_amp instrument.
+                "rewrite_blocks": METRICS.rewrite_blocks.load(Ordering::Relaxed),
+                "rewrite_user_bytes": METRICS.rewrite_user_bytes.load(Ordering::Relaxed),
+                "rewrite_device_write_bytes": METRICS.rewrite_device_write_bytes.load(Ordering::Relaxed),
                 // Write-pipeline depth (2026-07-27 campaign): the internal
                 // instrument — the rig's iostat aqu-sz is the external one.
                 "write_pipeline_inflight_blocks": self.write_pipeline.inflight_blocks(),
@@ -8931,6 +8953,17 @@ impl SqueezefsFilesystem {
                 .write_through_inplace_overwrites
                 .fetch_add(1, Ordering::Relaxed);
         }
+        // Idea 17 SLO attribution (design-rewrite-program §2 — vehicle-
+        // blind): an in-place replacement is a rewrite-class block; the
+        // whole block is app-written and the stored image is block-sized
+        // (the passthrough predicate above).
+        METRICS.rewrite_blocks.fetch_add(1, Ordering::Relaxed);
+        METRICS
+            .rewrite_user_bytes
+            .fetch_add(block_size, Ordering::Relaxed);
+        METRICS
+            .rewrite_device_write_bytes
+            .fetch_add(block_size, Ordering::Relaxed);
         // Feed the depth governor: one completed upload on the MAPPING's
         // lane (the in-place DMA is a genuine device write — on the
         // default arm this IS the rewrite steady state).
@@ -9044,6 +9077,7 @@ impl SqueezefsFilesystem {
         }
         let (be_id, block_allocator, nvme_writer) =
             self.router.backend_router.get_active_backend()?;
+        let processed_len = processed.len() as u64;
         crate::block_allocator::ensure_stored_block_image_fits(
             processed.len(),
             block_allocator.chunk_size(),
@@ -9164,6 +9198,20 @@ impl SqueezefsFilesystem {
             }
         };
         write_phase_record(WritePhase::UploadMapMerge, wp_merge);
+        // Idea 17 SLO attribution (design-rewrite-program §2): a publish
+        // that displaced an existing different mapping is a rewrite-class
+        // block — user bytes are the plaintext the app wrote, device
+        // bytes the stored image this upload DMA'd. Fresh publishes
+        // (nothing displaced) attribute nothing.
+        if !displaced.is_empty() {
+            METRICS.rewrite_blocks.fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .rewrite_user_bytes
+                .fetch_add(plaintext_len, Ordering::Relaxed);
+            METRICS
+                .rewrite_device_write_bytes
+                .fetch_add(processed_len, Ordering::Relaxed);
+        }
         // Feed the write-pipeline governor: one completed upload on this
         // backend lane (whole-pipeline latency — see pipe_t0 above).
         self.write_pipeline

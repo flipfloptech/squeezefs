@@ -613,6 +613,12 @@ pub struct NvmeBlockDev {
     pub device_path: String,
     worker: Arc<UringWorker>,
     node_probe: Arc<NodeProbe>,
+    /// zcrx read lane session (docs/design-zcrx-read-lane.md §6): armed
+    /// lazily on the first eligible read (`SQUEEZEFS_ZCRX_LANE=1` +
+    /// capability probes), `None` cached on any arm refusal — the kernel
+    /// path stays byte-identical. Shared across clones (one association
+    /// per device node).
+    lane: Arc<tokio::sync::OnceCell<Option<Arc<crate::zcrx_lane::LaneSession>>>>,
 }
 
 /// Capacity in bytes of a backing file OR block device (seek-to-end works
@@ -639,6 +645,50 @@ impl NvmeBlockDev {
                 at_ms: std::sync::atomic::AtomicU64::new(0),
                 seen: std::sync::atomic::AtomicBool::new(false),
             }),
+            lane: Arc::new(tokio::sync::OnceCell::new()),
+        }
+    }
+
+    /// zcrx-lane read attempt (design §6). `Some(bytes)` = the lane served
+    /// this read; `None` = ineligible / not armed / lane error — the caller
+    /// proceeds on the kernel path unchanged (reads are idempotent, so the
+    /// per-op fallback retry is safe by construction and counted in
+    /// `zcrx_fill_fallbacks`, which must stay ≈ 0).
+    async fn try_lane_read(&self, offset: u64, size: usize) -> Option<Result<bytes::Bytes>> {
+        if !crate::zcrx_lane::lane_env_armed() {
+            return None;
+        }
+        let sess = self
+            .lane
+            .get_or_init(|| crate::zcrx_lane::arm_for_device(&self.device_path))
+            .await
+            .as_ref()?;
+        if sess.poisoned() || !sess.range_eligible(offset, size) {
+            return None;
+        }
+        let (buf_ptr, bytes) = crate::cache::pool::read_bounce_pool(size).alloc();
+        match sess.read_into_ptr(offset, buf_ptr, size).await {
+            Ok(()) => {
+                let m = &crate::fuse_client::METRICS;
+                m.zcrx_fills
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                m.zcrx_fill_bytes
+                    .fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
+                Some(Ok(bytes.slice(0..size)))
+            }
+            Err(e) => {
+                // Dropping `bytes` recycles the pooled buffer; the lane's
+                // completion law guarantees no writer touches it after the
+                // op resolves (timeout paths poison the queue first).
+                crate::fuse_client::METRICS
+                    .zcrx_fill_fallbacks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log::warn!(
+                    "zcrx-lane: read fell back to the kernel path \
+                     (offset={offset}, size={size}): {e}"
+                );
+                None
+            }
         }
     }
 
@@ -895,6 +945,21 @@ impl NvmeBlockDev {
                 size,
                 crate::cache::pool::ALIGNED_BUF_POOL.buf_size()
             )));
+        }
+
+        // zcrx read lane (design §6): eligible pooled fills may be served by
+        // the userspace NVMe/TCP lane; `None` (disarmed / ineligible / lane
+        // error) falls through to the kernel-path worker unchanged.
+        if dest_addr.is_none() {
+            if let Some(res) = self.try_lane_read(offset, size).await {
+                let out = res?;
+                if count_in_get_obj {
+                    crate::fuse_client::METRICS
+                        .get_obj
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Ok(out);
+            }
         }
 
         let (buf_ptr, bytes) = if let Some(addr) = dest_addr {

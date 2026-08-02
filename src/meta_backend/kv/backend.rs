@@ -581,6 +581,11 @@ pub struct KvMetaBackend {
     /// §4.8 monotonic watermark, recovered at mount; the create path
     /// `fetch_add`s it.
     next_ino: AtomicU64,
+    /// POSIX-1: inode records this mount has DESTROYED (the `doomed`
+    /// count of every committed `destroy_inodes` transaction) — what
+    /// turns the monotonic §4.8 watermark into a live-population gauge
+    /// for `statfs`. See [`Self::live_inodes`].
+    destroyed_inodes: AtomicU64,
     replay: KvReplayStats,
 
     // ---- PR K6b: the commit pipeline + checkpoint state ----
@@ -1298,6 +1303,7 @@ impl KvMetaBackend {
             xattrs,
             alloc,
             next_ino: AtomicU64::new(next_ino),
+            destroyed_inodes: AtomicU64::new(0),
             replay,
             ring,
             dlm: DlmLockManager::new(),
@@ -1577,6 +1583,34 @@ impl KvMetaBackend {
     /// The §4.8 monotonic ino watermark as recovered by this mount.
     pub fn next_ino(&self) -> u64 {
         self.next_ino.load(Ordering::Acquire)
+    }
+
+    /// POSIX-1: LIVE inode records on this volume — the `statfs`
+    /// `f_ffree` source.
+    ///
+    /// v3 allocates inos monotonically and never reuses them (§4.8), so
+    /// the watermark counts inodes ever *allocated*, not inodes that
+    /// exist: derived straight, `IUsed` rises forever and a create/delete
+    /// loop reports a full filesystem on an empty one (tools gating on
+    /// `IUse%` then refuse to write). This subtracts the destroys this
+    /// mount has committed — `destroy_inodes` is the one place a record
+    /// leaves `TREE_INODES`, and it already knows the count.
+    ///
+    /// **Honest bound:** the subtrahend is per-mount RAM state, so a
+    /// remount re-seeds from the watermark (an over-report, never an
+    /// under-report — `statfs` may only ever be pessimistic about free
+    /// slots). A durable live count belongs in the root-ledger payload
+    /// and is deferred to the batched format window; the watermark base
+    /// also (deliberately) keeps counting inos burned by failed creates,
+    /// exactly as the §4.8 law describes them.
+    pub fn live_inodes(&self) -> u64 {
+        // Watermark progression: the reserved base is 2 (ino 1 = root,
+        // watermark starts at 2 on a fresh volume) — the root is added
+        // back ONCE by the caller across the volume set.
+        self.next_ino
+            .load(Ordering::Acquire)
+            .saturating_sub(2)
+            .saturating_sub(self.destroyed_inodes.load(Ordering::Relaxed))
     }
 
     /// Free heap extents right now (mount log / stats surface).
@@ -4840,6 +4874,11 @@ impl KvMetaBackend {
             .record(doomed);
         tx.hold_guards(guards.clone());
         self.commit_tx(tx).await?;
+        // POSIX-1: the live-inode gauge moves only on a COMMITTED destroy
+        // (a failed commit leaves the records live, and the bisect retry
+        // re-counts the halves it actually lands).
+        self.destroyed_inodes
+            .fetch_add(doomed as u64, Ordering::Relaxed);
         // PR M6: a destroyed corpse's pending times refinement is moot —
         // GC it under the exclusive locks (the drain would drop it on the
         // missing-inode read anyway; this keeps the map tight).

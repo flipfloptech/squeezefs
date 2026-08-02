@@ -14616,8 +14616,8 @@ impl Filesystem for SqueezefsFilesystem {
         //          writes in the local staging dirs; both promote into
         //          accounted blocks via writeback, so free converges on
         //          durability rather than tracking transient staging.
-        // files  = the format inode quota; ffree = quota minus the v3
-        //          monotonic (no-reuse) ino watermark progression.
+        // files  = the format inode quota; ffree = quota minus the LIVE
+        //          inode population (POSIX-1).
         let bsize: u32 = 4096;
         let used_bytes = self.router.backend_router.allocated_bytes();
         // The capacity cell is set during FUSE init (the kernel sends
@@ -14628,9 +14628,13 @@ impl Filesystem for SqueezefsFilesystem {
         let free_bytes = total_bytes.saturating_sub(used_bytes);
 
         let total_inodes = self.inodes_limit.get().copied().unwrap_or(0);
-        // §4.8 monotonic ino allocation (no reuse): allocated-ever per
-        // volume is the watermark minus the reserved base (ino 1 = root,
-        // watermark starts at 2 on a fresh volume).
+        // POSIX-1: the LIVE inode population, never the §4.8 monotonic
+        // watermark. v3 never reuses inos, so the watermark counts inodes
+        // ever allocated — derived straight it made `IUsed` rise forever
+        // and a create/delete loop report a full filesystem on an empty
+        // one. `KvMetaBackend::live_inodes` is the watermark progression
+        // minus the destroys committed on that volume (see its doc
+        // comment for the per-mount bound).
         let used_inodes: u64 = self
             .meta_backend
             .as_ref()
@@ -14638,7 +14642,7 @@ impl Filesystem for SqueezefsFilesystem {
                 backend
                     .volumes
                     .iter()
-                    .map(|v| v.next_ino().saturating_sub(2))
+                    .map(|v| v.live_inodes())
                     .sum::<u64>()
                     .saturating_add(1) // the root inode itself
             })

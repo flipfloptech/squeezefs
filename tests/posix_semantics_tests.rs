@@ -124,18 +124,25 @@ async fn make() -> H {
     }
 }
 
+/// CREATE + RELEASE (the `open(O_CREAT)`/`close` pair): reclaim refuses
+/// to destroy an ino with a live open handle, so tests that delete must
+/// close first, exactly like userspace.
 async fn create_in(h: &H, parent: u64, name: &str) -> u64 {
-    h.fs.create(
-        h.req,
-        parent,
-        OsStr::new(name),
-        libc::S_IFREG | 0o644,
-        libc::O_RDWR as u32,
-    )
-    .await
-    .unwrap()
-    .attr
-    .ino
+    let created =
+        h.fs.create(
+            h.req,
+            parent,
+            OsStr::new(name),
+            libc::S_IFREG | 0o644,
+            libc::O_RDWR as u32,
+        )
+        .await
+        .unwrap();
+    let ino = created.attr.ino;
+    h.fs.release(h.req, ino, created.fh, 0, 0, false)
+        .await
+        .unwrap();
+    ino
 }
 
 async fn mkdir_in(h: &H, parent: u64, name: &str) -> u64 {

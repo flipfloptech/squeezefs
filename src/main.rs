@@ -6106,14 +6106,17 @@ async fn run_df_report(meta_lvs: &[String], json: bool) -> Result<(), Box<dyn st
 
     // Aggregate numbers — the statfs semantics verbatim: total = the
     // formatted capacity (quota-aware), used = allocated striped-block
-    // bytes, files = the inode quota vs the monotonic watermark.
+    // bytes, files = the inode quota vs the LIVE inode population
+    // (POSIX-1: `live_inodes` counts every allocation cursor — the native
+    // watermark AND the mint-spread guest cursors — so `df -i` and
+    // `statfs` cannot disagree).
     let capacity = config.capacity;
     let used = backend_router.allocated_bytes();
     let free = capacity.saturating_sub(used);
     let inodes_total = config.inodes;
     let inodes_used: u64 = probes
         .iter()
-        .map(|(_, v)| v.next_ino().saturating_sub(2))
+        .map(|(_, v)| v.live_inodes())
         .sum::<u64>()
         .saturating_add(1); // the root inode itself
     let inodes_free = inodes_total.saturating_sub(inodes_used);

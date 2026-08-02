@@ -76,7 +76,9 @@ async fn open_v3_meta(path: &std::path::Path, len: u64) -> Arc<KvMetaBackend> {
     )
     .await
     .expect("format v3 meta volume");
-    KvMetaBackend::open(path).await.expect("open v3 meta volume")
+    KvMetaBackend::open(path)
+        .await
+        .expect("open v3 meta volume")
 }
 
 struct Fx {
@@ -241,7 +243,11 @@ async fn internal_records_read_as_absent_through_fuse() {
     }
 
     // ... and none of them is listed.
-    let reply = fx.fs.listxattr(req(), ROOT, 65536).await.expect("listxattr");
+    let reply = fx
+        .fs
+        .listxattr(req(), ROOT, 65536)
+        .await
+        .expect("listxattr");
     let names = match reply {
         ReplyXAttr::Data(d) => String::from_utf8_lossy(&d).into_owned(),
         other => panic!("expected Data, got {other:?}"),
@@ -325,7 +331,14 @@ async fn symlink_targets_still_resolve_while_the_record_is_screened() {
     // The record itself is unreachable through the xattr surface.
     let e = fx
         .fs
-        .setxattr(req(), ino, OsStr::new("system.symlink"), b"/etc/shadow", 0, 0)
+        .setxattr(
+            req(),
+            ino,
+            OsStr::new("system.symlink"),
+            b"/etc/shadow",
+            0,
+            0,
+        )
         .await
         .expect_err("retargeting a symlink through setxattr must refuse");
     assert_eq!(e, libc::EPERM.into());
@@ -388,7 +401,9 @@ async fn the_backends_metadata_entry_points_mirror_the_screen() {
     }
 
     // listxattr through the trait filters; the internal listing does not.
-    be.setxattr(ROOT, "user.seen", b"1").await.expect("plain set");
+    be.setxattr(ROOT, "user.seen", b"1")
+        .await
+        .expect("plain set");
     let listed = be.listxattr(ROOT).await.expect("trait listxattr");
     assert!(listed.iter().any(|n| n == "user.seen"));
     for name in INTERNAL_RECORDS {

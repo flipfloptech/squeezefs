@@ -31,7 +31,6 @@ use std::time::{Duration, Instant};
 
 use squeezefs::fuse_client::CLIENT_STALE_TTL_SECS;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
-use squeezefs::meta_backend::Metadata;
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -325,14 +324,17 @@ async fn test_clients_classifies_forged_live_and_stale_registrations() {
     let stale_ts = now_secs().saturating_sub(CLIENT_STALE_TTL_SECS + 120);
     {
         let be = KvMetaBackend::open(&meta).await.expect("open for forge");
-        be.setxattr(
+        // `client:{id}` is an INTERNAL record (VAL-2): the generic
+        // `Metadata` entry points refuse it, so plant it the way the
+        // daemon's own heartbeat does — the backend-internal writer.
+        be.setxattr_internal(
             1,
             "client:11111111-live",
             format!("{{\"ts\":{},\"pid\":{}}}", now_secs(), live_pid).as_bytes(),
         )
         .await
         .expect("plant live registration");
-        be.setxattr(
+        be.setxattr_internal(
             1,
             "client:22222222-stale",
             format!("{{\"ts\":{},\"pid\":4242}}", stale_ts).as_bytes(),

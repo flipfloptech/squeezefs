@@ -92,7 +92,9 @@ async fn forge_pre_watermark(path: &std::path::Path) {
 /// backend down cleanly.
 async fn register_client(meta: &NamedTempFile, id: &str, ts: u64) {
     let be = KvMetaBackend::open(meta.path()).await.unwrap();
-    be.setxattr(1, &format!("client:{id}"), &reg_value(ts))
+    // `client:{id}` is an INTERNAL record (VAL-2): the generic `Metadata`
+    // entry points refuse it — plant it through the daemon's own writer.
+    be.setxattr_internal(1, &format!("client:{id}"), &reg_value(ts))
         .await
         .unwrap();
     be.shutdown().await.unwrap();

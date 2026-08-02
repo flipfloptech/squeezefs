@@ -1,13 +1,14 @@
 //! PR VL2 — the durable job fabric, red-first
 //! (docs/design-volume-lifecycle.md §5.1, gate G-VL-7):
 //!
-//! - **Reserved-xattr namespace screen** (§5.1.2, KD-2): `job:` records
-//!   and every `user.squeezefs.*` internal record live on ino 1 behind
-//!   the FUSE layer — invisible to `listxattr`, `EPERM` on get/set/
-//!   remove through FUSE (the daemon/probe paths read them via the meta
-//!   backend directly). This also CLOSES a pre-existing hole: before
-//!   the screen, any user could `removexattr` the format config through
-//!   the mount.
+//! - **Reserved-xattr namespace screen** (§5.1.2, KD-2; generalized to a
+//!   positive ALLOWLIST by VAL-2 — see `tests/xattr_allowlist_tests.rs`):
+//!   `job:` records and every `user.squeezefs.*` internal record live on
+//!   ino 1 behind the FUSE layer — invisible to `listxattr`, `EPERM` on
+//!   set/remove and `ENODATA` on get through FUSE (the daemon/probe
+//!   paths read them via the meta backend directly). This also CLOSES a
+//!   pre-existing hole: before the screen, any user could `removexattr`
+//!   the format config through the mount.
 //! - **Durable job records** (KD-2): `job:{id}` / shard / progress
 //!   records ride v3 whole-tx xattr commits on ino 1; visible to
 //!   offline probes; re-scanned at fabric start (crash-resume by plan
@@ -143,12 +144,16 @@ async fn reserved_names_are_invisible_and_eperm_through_fuse() {
         assert_eq!(e, libc::EPERM.into(), "setxattr({name}) must be EPERM");
 
         // getxattr refused (reserved bytes never serve through FUSE).
+        // VAL-2 made the get arm answer ENODATA rather than EPERM: the
+        // name is filtered out of `listxattr`, so confirming its
+        // existence here would contradict the listing and hand a prober
+        // a census of the daemon's internal records.
         let e = fx
             .fs
             .getxattr(req(), ROOT, OsStr::new(name), 4096)
             .await
             .expect_err("reserved getxattr must refuse");
-        assert_eq!(e, libc::EPERM.into(), "getxattr({name}) must be EPERM");
+        assert_eq!(e, libc::ENODATA.into(), "getxattr({name}) must be ENODATA");
 
         // removexattr refused — the pre-existing tamper hole.
         let e = fx

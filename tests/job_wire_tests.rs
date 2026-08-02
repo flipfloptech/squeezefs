@@ -29,6 +29,15 @@
 //!   holds WERO from first enrollment to last departure and preempts an
 //!   expired worker host's registration (`job_remote_pr_preempts`).
 //!
+//! VAL-6 (P0, pre-RC) adds the host-side hardening legs: the
+//! coordinator-issued enrollment challenge (single-use nonce +
+//! freshness window — the worker used to pick its own nonce with no
+//! registry), the concurrent-connection cap, connection-handle pruning
+//! (RES-5), the pre-enrollment frame class cap + handshake deadline,
+//! and the verification-strength ladder keyed on an AUTHENTICATED
+//! channel (CA-pinned mTLS) instead of `transport == "tls"`. The
+//! decode-side bounds live in `tests/job_wire_bounds_tests.rs`.
+//!
 //! NOT here (G-VL-7 rig rows, VL3+ — the 2-node devsub mount rig; do not
 //! fake them in cargo): remote-worker **kill-9 mid-shard ⇒ TTL ⇒ reclaim
 //! ⇒ converge ×10**, the **SIGSTOP-past-TTL / reassign / SIGCONT
@@ -106,6 +115,31 @@ fn noop_spec(tasks: u64, task_ms: u64) -> JobSpec {
     JobSpec {
         job_type: JobType::Noop { tasks, task_ms },
         throttle_pct: 100,
+    }
+}
+
+/// Read the coordinator-issued enrollment challenge off a freshly
+/// accepted connection (VAL-6: the coordinator speaks first now).
+async fn challenge_nonce<S>(stream: &mut S) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match read_frame(stream)
+        .await
+        .expect("challenge readable")
+        .expect("the coordinator issues the challenge first")
+    {
+        WireFrame::Challenge {
+            wire_schema,
+            server_nonce,
+            freshness_ms,
+        } => {
+            assert_eq!(wire_schema, WIRE_SCHEMA, "challenge carries the schema");
+            assert!(freshness_ms > 0, "challenge advertises its own window");
+            assert!(!server_nonce.is_empty(), "challenge carries a nonce");
+            server_nonce
+        }
+        other => panic!("expected Challenge first, got {other:?}"),
     }
 }
 
@@ -265,16 +299,18 @@ async fn enrollment_hmac_gate_and_schema_refusal() {
     .await;
 
     // Wrong wire_schema: refused loudly even with a valid HMAC — the
-    // frame layer is schema-versioned (wire_schema: 1).
+    // frame layer is schema-versioned (the challenge handshake bumped it).
     let mut raw_conn = tokio::net::TcpStream::connect(host.endpoint())
         .await
         .expect("raw connect");
-    let hmac = squeezefs::job_wire::enroll_hmac(&secret, "w-schema", "nonce-1");
+    let server_nonce = challenge_nonce(&mut raw_conn).await;
+    let hmac = squeezefs::job_wire::enroll_hmac(&secret, "w-schema", &server_nonce, "nonce-1");
     write_frame(
         &mut raw_conn,
         &WireFrame::Enroll {
             wire_schema: WIRE_SCHEMA + 1,
             worker_id: "w-schema".into(),
+            server_nonce,
             endpoint_nonce: "nonce-1".into(),
             hmac,
             pr_key: None,
@@ -349,11 +385,15 @@ async fn tls_transport_round_trip_keeps_sampling() {
     let host = JobWireHost::start(fab.clone(), cfg, FakeShardDevice::new(0, 0))
         .await
         .expect("host start");
-    assert_eq!(host.transport_mode(), "tls");
+    assert_eq!(host.transport_mode(), "mtls");
+    assert!(
+        host.channel_authenticated(),
+        "a CA-pinned pair IS the authenticated channel"
+    );
     assert_eq!(
         host.verify_permille(),
         250,
-        "TLS keeps the configured sample"
+        "CA-pinned mTLS keeps the configured sample"
     );
 
     let secret = read_enroll_secret(&meta).await.expect("secret");
@@ -766,4 +806,368 @@ async fn wero_fence_acquires_preempts_and_releases_over_the_wire() {
 
     host.shutdown().await;
     clear_override(&data_path);
+}
+
+// ---------------------------------------------------------------------------
+// VAL-6 — the verification-strength ladder keys on an AUTHENTICATED channel
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unauthenticated_tls_is_plaintext_class_for_the_ladder() {
+    // With `ca_cert: None` the client installs an accept-everything
+    // certificate verifier via `.dangerous()` and the server uses
+    // `with_no_client_auth()` — a TLS OBJECT, not an authenticated
+    // channel. That configuration used to be permitted to sample
+    // verify-reads below 100 % because the ladder keyed on
+    // `transport == "tls"`. It is plaintext-class now.
+    let (meta, _mf) = meta_fixture().await;
+    let fab = fabric(&meta, 0).await;
+    let mut cfg = wire_cfg(30_000, 10_000);
+    cfg.security = Some(squeezefs::tiering::dht::ClusterSecurityConfig::default());
+    cfg.verify_sample_permille = 100; // ask for 10 % sampling…
+    let host = JobWireHost::start(fab, cfg, FakeShardDevice::new(0, 0))
+        .await
+        .expect("host start");
+    assert_eq!(
+        host.transport_mode(),
+        "tls-unauthenticated",
+        "a CA-less TLS object is named for what it is"
+    );
+    assert!(
+        !host.channel_authenticated(),
+        "no CA pin ⇒ no authenticated channel"
+    );
+    assert_eq!(
+        host.verify_permille(),
+        1000,
+        "the ladder refuses to sample on an unauthenticated channel \
+         (plaintext-class ⇒ mandatory-100 % verify-reads)"
+    );
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ca_cert_without_key_refuses_the_listener() {
+    // `rustls_{server,client}_config` `unwrap()` the CA key whenever a CA
+    // cert is present: a half-configured security config used to be a
+    // panic waiting for the first connection. Refuse loud at start.
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "SqueezeFS Cluster CA");
+    let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+
+    let (meta, _mf) = meta_fixture().await;
+    let fab = fabric(&meta, 0).await;
+    let mut cfg = wire_cfg(30_000, 10_000);
+    cfg.security = Some(squeezefs::tiering::dht::ClusterSecurityConfig {
+        ca_cert: Some(ca_cert.der().to_vec()),
+        ca_key: None,
+    });
+    let err = JobWireHost::start(fab, cfg, FakeShardDevice::new(0, 0))
+        .await
+        .expect_err("a CA cert with no key must refuse the listener");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("ca_key") || msg.contains("CA key"),
+        "the refusal names the missing half: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// VAL-6 — enrollment freshness: coordinator-issued nonce, single use
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enrollment_challenge_nonce_is_single_use() {
+    // The proof used to be HMAC(secret, worker_id ‖ WORKER-CHOSEN nonce ‖
+    // "hello") with no registry: one captured hello enrolled forever.
+    let (meta, _mf) = meta_fixture().await;
+    let fab = fabric(&meta, 0).await;
+    let host = JobWireHost::start(
+        fab.clone(),
+        wire_cfg(30_000, 10_000),
+        FakeShardDevice::new(0, 0),
+    )
+    .await
+    .expect("host start");
+    let secret = read_enroll_secret(&meta).await.expect("secret");
+
+    // Capture a legitimate hello…
+    let mut conn = tokio::net::TcpStream::connect(host.endpoint())
+        .await
+        .expect("connect");
+    let nonce = challenge_nonce(&mut conn).await;
+    let hello = WireFrame::Enroll {
+        wire_schema: WIRE_SCHEMA,
+        worker_id: "w-replay".into(),
+        server_nonce: nonce.clone(),
+        endpoint_nonce: "worker-entropy".into(),
+        hmac: squeezefs::job_wire::enroll_hmac(&secret, "w-replay", &nonce, "worker-entropy"),
+        pr_key: None,
+    };
+    write_frame(&mut conn, &hello).await.expect("send hello");
+    match read_frame(&mut conn).await.expect("reply").expect("frame") {
+        WireFrame::EnrollOk { .. } => {}
+        other => panic!("a fresh challenge must admit: {other:?}"),
+    }
+
+    // …and replay it verbatim on a second connection.
+    let refused0 = METRICS.job_remote_enroll_refused.load(Ordering::Relaxed);
+    let mut replay = tokio::net::TcpStream::connect(host.endpoint())
+        .await
+        .expect("connect");
+    let _fresh = challenge_nonce(&mut replay).await; // discarded on purpose
+    write_frame(&mut replay, &hello)
+        .await
+        .expect("send the replayed hello");
+    match read_frame(&mut replay)
+        .await
+        .expect("reply")
+        .expect("frame")
+    {
+        WireFrame::EnrollRefused { reason } => {
+            assert!(
+                reason.contains("nonce"),
+                "the replay refusal names the nonce: {reason}"
+            );
+        }
+        other => panic!("a replayed hello must be refused, got {other:?}"),
+    }
+    poll_until("replay counted as an enroll refusal", Duration::from_secs(5), || {
+        METRICS.job_remote_enroll_refused.load(Ordering::Relaxed) >= refused0 + 1
+    })
+    .await;
+
+    drop(conn);
+    drop(replay);
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expired_enrollment_challenge_is_refused() {
+    let (meta, _mf) = meta_fixture().await;
+    let fab = fabric(&meta, 0).await;
+    let mut cfg = wire_cfg(30_000, 10_000);
+    cfg.enroll_freshness = Duration::from_millis(120);
+    cfg.handshake_timeout = Duration::from_secs(5); // outlives the window
+    let host = JobWireHost::start(fab.clone(), cfg, FakeShardDevice::new(0, 0))
+        .await
+        .expect("host start");
+    let secret = read_enroll_secret(&meta).await.expect("secret");
+
+    let mut conn = tokio::net::TcpStream::connect(host.endpoint())
+        .await
+        .expect("connect");
+    let nonce = challenge_nonce(&mut conn).await;
+    tokio::time::sleep(Duration::from_millis(400)).await; // past the window
+    write_frame(
+        &mut conn,
+        &WireFrame::Enroll {
+            wire_schema: WIRE_SCHEMA,
+            worker_id: "w-stale".into(),
+            server_nonce: nonce.clone(),
+            endpoint_nonce: "worker-entropy".into(),
+            hmac: squeezefs::job_wire::enroll_hmac(&secret, "w-stale", &nonce, "worker-entropy"),
+            pr_key: None,
+        },
+    )
+    .await
+    .expect("send the stale hello");
+    match read_frame(&mut conn).await.expect("reply").expect("frame") {
+        WireFrame::EnrollRefused { reason } => {
+            assert!(
+                reason.contains("expired") || reason.contains("stale"),
+                "the freshness refusal says so: {reason}"
+            );
+        }
+        other => panic!("a stale challenge must be refused, got {other:?}"),
+    }
+    host.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// VAL-6 / RES-5 — connection bounds: cap, pre-enrollment deadline, pruning
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_connections_are_capped() {
+    let (meta, _mf) = meta_fixture().await;
+    let fab = fabric(&meta, 0).await;
+    let mut cfg = wire_cfg(30_000, 10_000);
+    cfg.max_connections = 2;
+    cfg.handshake_timeout = Duration::from_secs(30); // the cap, not a timeout, is under test
+    let host = JobWireHost::start(fab.clone(), cfg, FakeShardDevice::new(0, 0))
+        .await
+        .expect("host start");
+
+    // Two live connections fill the cap (each parks after its challenge).
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let mut c = tokio::net::TcpStream::connect(host.endpoint())
+            .await
+            .expect("connect");
+        let _ = challenge_nonce(&mut c).await;
+        held.push(c);
+    }
+    poll_until("both connections live", Duration::from_secs(5), || {
+        host.live_connections() == 2
+    })
+    .await;
+
+    // The third is closed immediately — no task, no challenge, no frame.
+    let mut over = tokio::net::TcpStream::connect(host.endpoint())
+        .await
+        .expect("connect past the cap");
+    assert!(
+        read_frame(&mut over).await.expect("eof is clean").is_none(),
+        "a connection past the cap is closed, not served"
+    );
+    poll_until("refusal counted", Duration::from_secs(5), || {
+        host.connections_refused() >= 1
+    })
+    .await;
+    assert_eq!(
+        host.live_connections(),
+        2,
+        "the cap holds while the refused connection is dropped"
+    );
+
+    // Freeing a slot re-admits.
+    held.pop();
+    poll_until("slot freed", Duration::from_secs(5), || {
+        host.live_connections() == 1
+    })
+    .await;
+    let mut again = tokio::net::TcpStream::connect(host.endpoint())
+        .await
+        .expect("reconnect");
+    let _ = challenge_nonce(&mut again).await;
+
+    drop(again);
+    drop(held);
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pre_enrollment_stall_is_dropped_at_the_handshake_deadline() {
+    // A peer that connects and says nothing used to hold its slot for
+    // 10 s (hello) and, once a length prefix arrived, forever (the body
+    // read had no deadline at all).
+    let (meta, _mf) = meta_fixture().await;
+    let fab = fabric(&meta, 0).await;
+    let mut cfg = wire_cfg(30_000, 10_000);
+    cfg.handshake_timeout = Duration::from_millis(250);
+    let host = JobWireHost::start(fab.clone(), cfg, FakeShardDevice::new(0, 0))
+        .await
+        .expect("host start");
+
+    // (a) silence after the challenge.
+    let mut silent = tokio::net::TcpStream::connect(host.endpoint())
+        .await
+        .expect("connect");
+    let _ = challenge_nonce(&mut silent).await;
+
+    // (b) a length prefix with a body that never comes (slowloris).
+    let mut dribble = tokio::net::TcpStream::connect(host.endpoint())
+        .await
+        .expect("connect");
+    let _ = challenge_nonce(&mut dribble).await;
+    tokio::io::AsyncWriteExt::write_all(&mut dribble, &[0u8, 0, 4, 0, b'{'])
+        .await
+        .expect("prefix + one body byte");
+
+    poll_until(
+        "both stalled connections reaped at the handshake deadline",
+        Duration::from_secs(10),
+        || host.live_connections() == 0,
+    )
+    .await;
+
+    // Both see EOF.
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        tokio::io::AsyncReadExt::read(&mut silent, &mut buf)
+            .await
+            .expect("read after reap"),
+        0,
+        "the silent peer was closed"
+    );
+    assert_eq!(
+        tokio::io::AsyncReadExt::read(&mut dribble, &mut buf)
+            .await
+            .expect("read after reap"),
+        0,
+        "the dribbling peer was closed"
+    );
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pre_enrollment_frames_ride_the_hello_class_cap() {
+    // 16 MiB is the post-enrollment cap; an unauthenticated peer gets the
+    // hello class, and its body is never committed up front.
+    let (meta, _mf) = meta_fixture().await;
+    let fab = fabric(&meta, 0).await;
+    let mut cfg = wire_cfg(30_000, 10_000);
+    cfg.handshake_timeout = Duration::from_secs(5);
+    let host = JobWireHost::start(fab.clone(), cfg, FakeShardDevice::new(0, 0))
+        .await
+        .expect("host start");
+
+    let mut conn = tokio::net::TcpStream::connect(host.endpoint())
+        .await
+        .expect("connect");
+    let _ = challenge_nonce(&mut conn).await;
+    let oversize = squeezefs::job_wire::MAX_HELLO_FRAME_BYTES + 1;
+    tokio::io::AsyncWriteExt::write_all(&mut conn, &oversize.to_be_bytes())
+        .await
+        .expect("send an over-class length prefix");
+    poll_until(
+        "over-class pre-enrollment frame closes the connection",
+        Duration::from_secs(10),
+        || host.live_connections() == 0,
+    )
+    .await;
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn finished_connection_handles_are_pruned() {
+    // RES-5: `handles` was push-only — one `JoinHandle` retained per
+    // connection ever accepted, all reachable before authentication.
+    let (meta, _mf) = meta_fixture().await;
+    let fab = fabric(&meta, 0).await;
+    let mut cfg = wire_cfg(30_000, 10_000);
+    cfg.handshake_timeout = Duration::from_millis(200);
+    let host = JobWireHost::start(fab.clone(), cfg, FakeShardDevice::new(0, 0))
+        .await
+        .expect("host start");
+
+    let base = host.retained_task_handles();
+    for _ in 0..24 {
+        let c = tokio::net::TcpStream::connect(host.endpoint())
+            .await
+            .expect("connect");
+        drop(c); // immediate departure — the serve task finishes at once
+    }
+    poll_until("finished handles pruned", Duration::from_secs(15), || {
+        host.retained_task_handles() <= base + 2
+    })
+    .await;
+    assert!(
+        host.retained_task_handles() <= base + 2,
+        "24 finished connections must not each retain a JoinHandle forever \
+         (retained {} vs base {base})",
+        host.retained_task_handles()
+    );
+    assert_eq!(
+        host.accept_backoffs(),
+        0,
+        "a healthy accept loop never backs off"
+    );
+    host.shutdown().await;
 }

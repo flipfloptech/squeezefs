@@ -417,6 +417,142 @@ Depth math after severance: a parked ent costs one ring slot on one CPU's queue 
 
 Result per 1 MiB write request: 2 MiB of memcpy and one 1 MiB heap alloc removed from the fuse-over-uring thread and session task — the transport half of the memcpy profile. While in the file, the 24 B `data.deref().to_vec()` per reply (`tokio.rs:590`) and the `header_and_op` micro-allocs (`fuse_over_uring.rs:892-895`) are left alone — measurable-first discipline; they are allocator noise, not memcpy volume.
 
+### 5.4c Transport geometry & kmbuf/zc adoption (2026-08-04 amendment)
+
+*(fuse3 transport geometry + zc adoption campaign — evidence
+`.benchmarks/2026-08-04-fuse3-zc-adoption.md`; the tree-verified kernel
+facts it stands on: `docker/kernel-sqz/V2-CANDIDATES.md` candidates 1–2
+and `.benchmarks/2026-08-04-sqz-kernel-v2-scoping.md`.)*
+
+#### The geometry law (normative — `TransportGeometry::plan`)
+
+The kernel's fuse-over-uring REGISTER acceptance bound is
+`ring->max_payload_sz = max(FUSE_MIN_READ_BUFFER, fc->max_write,
+fc->max_pages × PAGE_SIZE)` with `fc->max_pages =
+min(fs.fuse.max_pages_limit, advertised max_pages)` — ents whose payload
+is smaller are refused (`"Invalid req payload len"`), and over-uring is
+mandatory, so a refused REGISTER is a **failed mount**. The historical
+posture (blanket `max_pages = u16::MAX` in the INIT reply + a hardcoded
+256-page payload floor in the planner) made that bound
+sysctl-dependent while the ents were not: any box with
+`fs.fuse.max_pages_limit > 256` failed to mount (reproduced live,
+kernel log `fuse: Invalid req payload len 1048576`). The law that
+replaces it:
+
+1. **Negotiated `max_write`** = the filesystem's desire (SqueezeFS:
+   `max(block_size, 1 MiB)`; `SQUEEZEFS_FUSE_MAX_WRITE` overrides
+   verbatim) clamped to `[max(page, 4096), max_pages_limit × page]` —
+   the sysctl (fallback 256 where absent) gates the ceiling; kernels at
+   the default keep today's 1 MiB shape byte-identically.
+2. **Advertised `max_pages` = `ceil(max_write / page)`** — the INIT
+   reply describes the negotiated max_write EXACTLY, so
+   `fc->max_pages = advertised` and the kernel bound **equals** the
+   registered ent size by construction. REGISTER acceptance is
+   structural; the failure class is unrepresentable.
+3. **`payload_sz`** = the kernel-bound mirror
+   (`max(8192, max_write, max_pages × page)`) — the registered ent
+   payload length, the arena unit, and the R5 component unit.
+4. **The variable-ent budget ladder** (the L1 depth policy re-derived):
+   under the unchanged cap `min(mem_budget/8, 2 GiB)`, the **depth leg
+   degrades first** (desired 32 → floor 4); only when the floor-4 arena
+   still exceeds the cap does the **payload leg** engage, degrading
+   `max_write` (page-aligned) toward the 1 MiB `PAYLOAD_BASE` — never
+   below it. Env depth override bypasses both legs (unchanged operator
+   semantics).
+
+| shape (32 queues, cap 2 GiB unless noted) | max_write | max_pages | depth | arena |
+|---|---|---|---|---|
+| sysctl 256 (default / absent), desire 4 MiB | 1 MiB | 256 | 32 | 1 GiB *(today, byte-identical)* |
+| **sysctl 1024 (sqz-host posture), desire 4 MiB** | **4 MiB** | **1024** | **16** | **2 GiB** |
+| sysctl 1024, cap 819 MiB | 4 MiB | 1024 | 6 | 768 MiB |
+| sysctl 1024, cap 256 MiB (payload leg) | 2 MiB | 512 | 4 | 256 MiB |
+| sysctl 1024, cap ≤ 128 MiB (base pin) | 1 MiB | 256 | 4 | 128 MiB *(pre-L1 posture)* |
+| sysctl 64 (lowered), any desire | 256 KiB | 64 | 32 | ≤ cap |
+
+Gauges: `transport_max_write` / `transport_max_pages` (negotiated pair,
+stats inode) join the existing `transport_{queues,q_depth,
+payload_buffer_bytes,max_background}`. The 4 MiB win is
+request-count-proportional (one FUSE_WRITE / one §5.4 lease / one merge
+per whole block — per-op fixed costs quarter on ≥ block-size sequential
+shapes); the per-page `FR_LOCKED`/GUP term is NOT touched by request
+size — that is the kmbuf arm's job, below.
+
+#### kmbuf bufring adoption (how buffer selection replaces/joins the §5.4 arenas)
+
+`crates/fuse3/src/raw/connection/kmbuf.rs` is **the severable module
+boundary** for the carried v4 series' ABI (upstream dropped the kmbuf
+infra from for-7.1 on 2026-03-30; the eventual upstream FUSE-zc will be
+a different ABI — this adoption is a knowing throwaway kept re-portable
+behind one module + a runtime probe). Mode resolution happens once per
+session: `IORING_REGISTER_KMBUF_RING` probe Present + lever ⇒ BufRing;
+`EINVAL` (stock kernels) ⇒ UserEnts — **today's path byte-identical,
+contract-pinned**. Post-probe registration refusals fail the mount loud
+(`SQUEEZEFS_FUSE_KMBUF=0` is the operator escape and the A/B lever).
+
+On the BufRing arm, the §5.4 registered payload **arenas are replaced by
+the kernel's buffers and joined by the same lease machinery**:
+
+- Per queue, the daemon registers a **fixed headers buffer** (index 0;
+  ent *i*'s `fuse_uring_req_header` at `i × 288`) and a
+  **kernel-managed buffer ring** (bgid 0, `buf_size = payload_sz`, pow2
+  entries ≥ depth), then mmaps the kernel's buffer region once
+  (`IORING_OFF_KMBUF_RING`). REGISTER SQEs carry
+  `init.flags = FUSE_URING_BUF_RING` + `sqe->buf_index = ent_idx` and
+  **no iovecs**.
+- **Attachment law (daemon side of the kernel lifecycle):** the kernel
+  attaches a buffer to an ent when the request carries/expects payload,
+  REUSES it across consecutive payload-carrying requests, and recycles
+  it at a payload-less fetch. The delivery CQE carries the bid
+  (`IORING_CQE_F_BUFFER`) only on fresh selection ⇒ the daemon
+  re-points on flagged CQEs and KEEPS on unflagged ones. A stale
+  attachment can only exist across payload-less deliveries (header-only
+  replies — no body write), and every body-reply op re-selects flagged
+  if detached: **no body write can ever target a recycled buffer.**
+  Violations (out-of-range bid, announced payload without attachment)
+  are protocol breaches → loud shutdown.
+- **`PayloadArena::from_kmbuf`**: the lease/wake machinery (§5.4
+  verbatim — refs/parked, eventfd wake, coalescer) rides a bid-indexed
+  view over the mmap'd region, mapping owned by `KmbufQueue` and held
+  alive by the arena for lease lifetimes. **The lease-severance law
+  composes unchanged**: the kernel recycles an ent's buffer only at
+  fetch, fetch is triggered only by our COMMIT_AND_FETCH, and the §5.4
+  commit gate already defers that until the last lease drops — deferred
+  re-arm ≡ deferred recycle, same boundary. Reply bodies (and
+  `get_payload_buffer` in-place serves) target the ATTACHED buffer —
+  exactly where the kernel's commit copy reads from.
+- **What it deletes**: the per-4 KiB-page `unlock_request → GUP →
+  lock_request` discipline on every payload copy — counted **12.8 % +
+  2.6 % of ALL client cycles** on the kern EXA read row
+  (interface-frontier §3 Row A). `cs->is_kaddr` short-circuits
+  `fuse_copy_fill` in BOTH directions; one memcpy per folio remains
+  (K1).
+
+#### zc negotiation face (staged) & instruments
+
+The `FUSE_URING_ZERO_COPY` **negotiation face ships**: the init-flags
+composition (zc never rides without the bufring), `init.queue_depth`,
+and the sparse-table shape (request-folio slots 0..depth, headers at
+index `depth` — `zc_headers_index`). The **zc serve integration does
+not**: with zc negotiated the kernel skips the folio copy entirely
+(`skip_folio_copy`, both directions — `can_zero_copy_req` covers
+`in_pages || out_pages`), so the daemon must serve READs via
+`READ_FIXED` into (and consume WRITEs via `WRITE_FIXED` from) the
+request folios the kernel registers at `ent->fixed_buf_id` — a
+cross-crate program touching the read-serve and write-through paths,
+staged as the follow-on PR (it can only be *executed* on the sqz kernel
+anyway). `SQUEEZEFS_FUSE_ZC=1` is recognized and loudly declined until
+then — never a silent no-op.
+
+Instruments: `fuse3_kmbuf_negotiated` (0/1 — the arm proof, set only
+after the all-queues-REGISTERed barrier), `fuse3_zc_replies`
+(structurally 0 until the zc arm; ships with the face so the follow-on
+is measured by the gauge that guards it), and the `commit_flush` phase
+(5th member of `read/write_transport_phase_ns`): the COMMIT-carrying
+ring-flush syscall duration — the venue where the kernel's commit-side
+copy machinery runs — per-FLUSH sampled on provably wait-free flushes
+only, so the killed lock/GUP term is visible as this phase's
+before/after delta on kmbuf A/Bs without adding a syscall.
+
 ### 5.5 PR 3: flush/writeback zero-copy (kills audit #8)
 
 `flush_single_active_block` (`fuse_client.rs:5595-5601`) and its sibling `upload_single_active_block_data` (guard at `:5380-5388`, copy at `:5390`): replace `Bytes::copy_from_slice(&guard)` + drop with a guard-backed DMA source. `NvmeCacheReadGuard` (`tiering/nvme.rs:94-109`) already derefs to the mmap value slice, is already `unsafe impl Send + Sync`, and the value region is 4096-aligned by the segment packer (`alignment = 4096`, `tiering/nvme.rs:176-178`, `cache/nvme.rs:643-645` passes `Some(4096)`) — so the guard-backed `Bytes` takes `write_block`'s `WriteData::Aligned` DMA branch with the guard as `_keep_alive`. One caveat: the payload length must be a 4 KiB multiple for the aligned branch; active-block staging entries are whole blocks at offset 4096 (`cache/nvme.rs:688-693`), so slice `[4096 .. 4096 + block_size]` qualifies.

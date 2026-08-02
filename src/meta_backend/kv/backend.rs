@@ -1745,6 +1745,12 @@ impl KvMetaBackend {
     /// version bump (a forward-only format change) that this rare path
     /// does not justify.
     pub async fn find_parent_of_child(&self, child_global: Ino) -> Result<Option<Ino>> {
+        // POSIX-4: the scan is the instrument. `meta_parent_scans` growing
+        // per readdir means the `..` parent memo stopped serving and every
+        // ls/find/du/rsync/tar walk is paying O(total dentries) again.
+        crate::fuse_client::METRICS
+            .meta_parent_scans
+            .fetch_add(1, Ordering::Relaxed);
         let end = super::tree::KEY_SPACE_MAX;
         let mut cursor: Vec<u8> = vec![0u8];
         loop {

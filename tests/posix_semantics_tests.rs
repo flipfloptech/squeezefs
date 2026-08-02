@@ -592,3 +592,140 @@ async fn unflushed_partial_block_is_data_not_a_hole() {
         "the hole before them still resolves to the parked block"
     );
 }
+
+// ---------------------------------------------------------------------------
+// POSIX-4 — readdir's `..` must be correct AND must not scan the world.
+// ---------------------------------------------------------------------------
+
+/// The `..` entry of one `readdir` page (offset 0 takes the `.`/`..`
+/// prefix).
+async fn readdir_dotdot(h: &H, dir: u64) -> u64 {
+    use futures::StreamExt;
+    let mut stream = h.fs.readdir(h.req, dir, 0, 0).await.unwrap().entries;
+    while let Some(e) = stream.next().await {
+        let e = e.unwrap();
+        if e.name == ".." {
+            return e.inode;
+        }
+    }
+    panic!("readdir({dir}) emitted no `..` entry");
+}
+
+/// The `..` entry of one `readdirplus` page.
+async fn readdirplus_dotdot(h: &H, dir: u64) -> u64 {
+    use futures::StreamExt;
+    let mut stream = h.fs.readdirplus(h.req, dir, 0, 0, 0).await.unwrap().entries;
+    while let Some(e) = stream.next().await {
+        let e = e.unwrap();
+        if e.name == ".." {
+            return e.inode;
+        }
+    }
+    panic!("readdirplus({dir}) emitted no `..` entry");
+}
+
+fn parent_scans() -> u64 {
+    METRICS.meta_parent_scans.load(Ordering::Relaxed)
+}
+
+/// A `find`/`du`/`rsync`/`tar` walk: every directory of a deep tree is
+/// listed. `..` must be right everywhere, and the walk must NOT pay
+/// `find_parent_of_child` — an unindexed O(total dentries) range scan of
+/// the whole dentry tree — once per directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readdir_dotdot_is_correct_without_scanning_the_dentry_tree() {
+    let h = make().await;
+
+    // A deep chain plus siblings, so the dentry tree is big enough that a
+    // per-readdir scan is unmistakable.
+    let mut chain = vec![1u64];
+    for d in 0..6 {
+        let parent = *chain.last().unwrap();
+        chain.push(mkdir_in(&h, parent, &format!("deep{d}")).await);
+        for f in 0..8 {
+            create_in(&h, parent, &format!("file{d}_{f}")).await;
+        }
+    }
+
+    // The walk: LOOKUP the directory (what the kernel does to reach it),
+    // then list it — exactly the `find` shape.
+    let scans_before = parent_scans();
+    for (depth, &dir) in chain.iter().enumerate() {
+        let expect_parent = if depth == 0 { 1 } else { chain[depth - 1] };
+        assert_eq!(
+            readdir_dotdot(&h, dir).await,
+            expect_parent,
+            "readdir({dir}) at depth {depth} must report its real parent"
+        );
+        assert_eq!(
+            readdirplus_dotdot(&h, dir).await,
+            expect_parent,
+            "readdirplus({dir}) at depth {depth} must agree with readdir"
+        );
+    }
+    let scans = parent_scans() - scans_before;
+    assert_eq!(
+        scans,
+        0,
+        "a {}-directory walk paid {scans} full dentry-tree scans — every ls, \
+         find, du, rsync and tar walk is O(total dentries) PER DIRECTORY",
+        chain.len()
+    );
+}
+
+/// The memo must never outlive the truth: after a directory moves, its
+/// `..` is the NEW parent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readdir_dotdot_follows_a_renamed_directory() {
+    let h = make().await;
+    let src = mkdir_in(&h, 1, "posix4_src").await;
+    let dst = mkdir_in(&h, 1, "posix4_dst").await;
+    let sub = mkdir_in(&h, src, "sub").await;
+
+    assert_eq!(readdir_dotdot(&h, sub).await, src);
+
+    h.fs.rename(h.req, src, OsStr::new("sub"), dst, OsStr::new("sub"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        readdir_dotdot(&h, sub).await,
+        dst,
+        "`..` must follow the rename — a stale memo is a WRONG parent, \
+         which is worse than the scan it replaced"
+    );
+    assert_eq!(
+        readdirplus_dotdot(&h, sub).await,
+        dst,
+        "readdirplus must agree"
+    );
+}
+
+/// An unresolvable parent must never be FABRICATED as root: the lookup
+/// layer explicitly refuses to invent one (`no dentry names ino N —
+/// cannot resolve ".."`), and readdir quietly did exactly that with
+/// `.unwrap_or(1)`. A disconnected directory reports itself, like the
+/// root does — never someone else's inode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readdir_never_fabricates_root_as_the_parent() {
+    let h = make().await;
+    let p = mkdir_in(&h, 1, "posix4_p").await;
+    let orphan = mkdir_in(&h, p, "orph").await;
+    assert_eq!(readdir_dotdot(&h, orphan).await, p);
+
+    // Unlink the only dentry naming it: nothing can resolve its parent
+    // now (the inode record survives until FORGET-driven reclaim, and an
+    // open fd can still getdents it).
+    h.fs.rmdir(h.req, p, OsStr::new("orph")).await.unwrap();
+
+    let dotdot = readdir_dotdot(&h, orphan).await;
+    assert_ne!(
+        dotdot, 1,
+        "a disconnected directory must NOT have root fabricated as its parent"
+    );
+    assert_eq!(
+        dotdot, orphan,
+        "the honest degraded answer is the self-reference the root itself uses"
+    );
+    assert_eq!(readdirplus_dotdot(&h, orphan).await, dotdot);
+}

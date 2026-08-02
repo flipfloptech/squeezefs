@@ -3,7 +3,7 @@
 //! Critical path work (FUSE write_striped block I/O, writeback flush, DLM drivers)
 //! uses dedicated semaphores or is fully awaited. This module gates *best-effort*
 //! work that must not exhaust the runtime under load:
-//! prefetch, DHT/peer publish, and similar fire-and-forget jobs.
+//! prefetch and similar fire-and-forget jobs.
 //!
 //! When the pool is full, tasks are **dropped** (not queued) so memory stays bounded.
 //!

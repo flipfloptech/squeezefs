@@ -4126,16 +4126,7 @@ impl DataRouter {
         // dev_queue/dev_service sub-spans record at the NvmeBlockDev
         // funnel); `decode` = the transform leg (passthrough ≈ 0).
         let t_dma = std::time::Instant::now();
-        let raw = if let Some(dht) = self.cache.nvme.dht_node.get() {
-            let client = crate::p2p::P2pClient::new();
-            if let Ok(data) = client.download_block_from_peer(dht, block_key).await {
-                bytes::Bytes::from(data)
-            } else {
-                self.read_nvme_block(block_key).await?
-            }
-        } else {
-            self.read_nvme_block(block_key).await?
-        };
+        let raw = self.read_nvme_block(block_key).await?;
         read_fill_phase_record(ReadFillPhase::FetchDma, t_dma);
         // Copy ledger: device DMA into the pooled fill intermediate — the
         // nvme-tcp RX-copy pricing denominator (raw device bytes; decode

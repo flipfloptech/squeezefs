@@ -810,7 +810,6 @@ pub struct NvmeStaging {
     redis_client: std::sync::Arc<crate::dlm::MetaClient>,
     /// Bounded merge-queue sender (P1-1). Full → StorageFull / backpressure.
     write_tx: mpsc::Sender<PendingStagedWrite>,
-    pub p2p_addr: std::sync::Arc<std::sync::OnceLock<String>>,
     pub current_staged_write_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Budget ledger: staged `file_id` → (bytes counted in
     /// `current_staged_write_bytes`, stage generation). Every add to the
@@ -844,7 +843,6 @@ pub struct NvmeStaging {
     // Hypertier NVMe cache instances
     pub read_nvme_cache: std::sync::Arc<crate::tiering::nvme::NvmeCache>,
     pub staging_nvme_cache: std::sync::Arc<crate::tiering::nvme::NvmeCache>,
-    pub dht_node: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::tiering::dht::DhtNode>>>,
     pub crypto: std::sync::Arc<std::sync::OnceLock<crate::crypto_compress::CryptoCompressState>>,
 }
 
@@ -1090,7 +1088,6 @@ impl NvmeStaging {
             backend_router,
             redis_client: redis_client.clone(),
             write_tx,
-            p2p_addr: std::sync::Arc::new(std::sync::OnceLock::new()),
             current_staged_write_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 initial_write_bytes,
             )),
@@ -1104,7 +1101,6 @@ impl NvmeStaging {
             staged_drained_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             read_nvme_cache,
             staging_nvme_cache,
-            dht_node: std::sync::Arc::new(std::sync::OnceLock::new()),
             crypto: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
 
@@ -1978,7 +1974,7 @@ impl NvmeStaging {
         // R5 finding-#2 escalation (§5.7): while the authority's
         // unreclaimable arm rides the Red band, tier publishes are
         // PAUSED — this is the single funnel every producer (fill path,
-        // dehydration, p2p store) routes through, so one gate covers the
+        // dehydration) routes through, so one gate covers the
         // population by construction. Never-lossy: the tier is a read
         // cache; absence means the next reader goes to the device.
         // Measured pre-fix: 5.06 GiB of tier writes in ~10 s against a
@@ -1998,29 +1994,13 @@ impl NvmeStaging {
         // CPU in memcpy + ~6x spurious device reads on the elbencho
         // O_DIRECT sequential-read row) for bytes nothing consumes.
         self.read_nvme_cache
-            .put_discard_evicted(key_bytes.clone(), val_bytes.clone());
-
-        if let Some(dht) = self.dht_node.get() {
-            let dht_clone = dht.clone();
-            let key_hash = xxh3_64(block_key.as_bytes());
-            // P1-5: best-effort peer publish under global admission.
-            crate::bg_admit::spawn_bg(async move {
-                let owners = dht_clone.find_closest_peers(key_hash, 3);
-                if let Some(primary_owner) = owners.first() {
-                    if primary_owner != dht_clone.peer_addr() {
-                        let _ = dht_clone
-                            .store_remote_value(primary_owner, key_bytes, val_bytes)
-                            .await;
-                    }
-                }
-            });
-        }
+            .put_discard_evicted(key_bytes, val_bytes);
 
         Ok(())
     }
 
     /// INCARNATION-VALIDATED read-cache publish — the only legal route for
-    /// non-owner publishes (RAM-LRU dehydration, p2p peer stores). Their
+    /// non-owner publishes (RAM-LRU dehydration). Their
     /// payloads can be arbitrarily stale (an evicted entry parked in the
     /// dehydration channel, a peer store in flight), so an unconditional
     /// `cache_read_block` could stick a DEAD incarnation's bytes under a
@@ -2055,7 +2035,7 @@ impl NvmeStaging {
     }
 
     /// [`Self::cache_read_block_validated`] against this staging's own wired
-    /// router (dehydration worker / p2p store call sites). Unwired routers
+    /// router (dehydration worker call sites). Unwired routers
     /// (bare tooling) refuse the publish — a cache entry is never worth an
     /// unvalidated stick.
     pub fn cache_read_block_validated_self(&self, block_key: &str, data: Bytes) -> bool {

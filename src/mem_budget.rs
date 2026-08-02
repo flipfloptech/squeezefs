@@ -767,7 +767,7 @@ pub fn register_ipc_session_arena_component(
 
 /// One-atomic-load disk-tier publish gate (the finding-#2 escalation) —
 /// read by [`crate::cache::NvmeStaging::cache_read_block`], the single
-/// funnel every tier producer (fill path, dehydration, p2p store) routes
+/// funnel every tier producer (fill path, dehydration) routes
 /// through.
 #[inline]
 pub fn tier_publish_paused() -> bool {

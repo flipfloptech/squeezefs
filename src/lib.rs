@@ -50,7 +50,6 @@ pub mod job_wire;
 pub mod layout_wire;
 pub mod meta_backend;
 pub mod nvmeof;
-pub mod p2p;
 pub(crate) mod patch_clone_core;
 pub(crate) mod placed_core;
 pub(crate) mod placed_sever;

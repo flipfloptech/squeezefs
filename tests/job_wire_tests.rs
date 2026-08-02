@@ -325,7 +325,7 @@ async fn plaintext_transport_forces_mandatory_verify_reads() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tls_transport_round_trip_keeps_sampling() {
     // TLS via tokio-rustls over the ClusterSecurityConfig cert/CA/
-    // verifier machinery (NOT the quinn wrap): an mTLS-pinned worker
+    // verifier machinery (`tiering::cluster_tls`): an mTLS-pinned worker
     // enrolls and executes a Noop shard end-to-end; the configured
     // verify sample is honored (sampling is sanctioned under TLS).
     use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
@@ -336,7 +336,7 @@ async fn tls_transport_round_trip_keeps_sampling() {
         .distinguished_name
         .push(DnType::CommonName, "SqueezeFS Cluster CA");
     let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
-    let security = squeezefs::tiering::dht::ClusterSecurityConfig {
+    let security = squeezefs::tiering::cluster_tls::ClusterSecurityConfig {
         ca_cert: Some(ca_cert.der().to_vec()),
         ca_key: Some(ca_key.serialize_der()),
     };

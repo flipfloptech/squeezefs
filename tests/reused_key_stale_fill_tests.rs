@@ -615,8 +615,9 @@ async fn stress_recycled_keys_v3() {
 //      fails and undoes it). No interleaving leaves a dead incarnation's
 //      bytes readable once the key is reallocatable.
 //   2. Every read-tier publish that is not an owner's fresh-bytes put must
-//      be INCARNATION-VALIDATED (the dehydration worker and the p2p store
-//      published unconditionally): a retired/unstable key must never stick.
+//      be INCARNATION-VALIDATED (the dehydration worker — and the since-
+//      deleted p2p store — published unconditionally): a retired/unstable
+//      key must never stick.
 // ---------------------------------------------------------------------------
 
 /// Contract 1: free_block's terminal release leaves NO read-tier entry under
@@ -663,7 +664,7 @@ async fn test_terminal_free_purges_read_tiers() {
 }
 
 /// Contract 2: the validated read-cache publish refuses retired/unstable
-/// incarnations (dehydration + p2p route through it), keeps stable ones,
+/// incarnations (dehydration routes through it), keeps stable ones,
 /// and stays vacuously open for untracked legacy keys.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_validated_read_cache_publish_incarnation_gate() {
@@ -687,7 +688,7 @@ async fn test_validated_read_cache_publish_incarnation_gate() {
     assert!(h.fs.router.cache.nvme.get_cached_read_block(&k).is_some());
 
     // (b) Retired incarnation (terminal free): the publish must NOT stick —
-    // a dehydration/p2p straggler carrying the dead incarnation's bytes.
+    // a dehydration straggler carrying the dead incarnation's bytes.
     h.fs.router.backend_router.free_block(&k).await.unwrap();
     let stale = bytes::Bytes::from(vec![0x33u8; 4096]);
     assert!(

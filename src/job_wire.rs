@@ -19,8 +19,8 @@
 //!   what shared-storage access already grants.
 //! - **Transport**: length-prefixed schema-versioned frames
 //!   ([`WIRE_SCHEMA`]) over tokio TCP; TLS via **tokio-rustls** reusing
-//!   `ClusterSecurityConfig`'s cert/CA/verifier construction (never the
-//!   quinn wrap). Without a security config the listener runs
+//!   `ClusterSecurityConfig`'s cert/CA/verifier construction
+//!   (`tiering::cluster_tls`). Without a security config the listener runs
 //!   **plaintext** (OQ-A default-permissive) with ONE loud log line at
 //!   start. Network TCP/TLS is the sanctioned non-uring exception
 //!   (AGENTS "Not uring" row).
@@ -52,7 +52,9 @@ use crate::fuse_client::METRICS;
 use crate::jobs::{job_throttle_sleep, JobCtl, JobFabric, JobType};
 use crate::meta_backend::reservation::{register_ladder, resolve_for_mount, ReservationClient};
 use crate::meta_backend::{Metadata, RoutedMetaBackend};
-use crate::tiering::dht::{rustls_client_config, rustls_server_config, ClusterSecurityConfig};
+use crate::tiering::cluster_tls::{
+    rustls_client_config, rustls_server_config, ClusterSecurityConfig,
+};
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -1681,7 +1683,7 @@ impl JobWireWorker {
                 let cfg = rustls_client_config(sec)?;
                 let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
                 // The ClusterSecurityConfig node certs carry
-                // localhost/127.0.0.1 SANs (dht.rs construction).
+                // localhost/127.0.0.1 SANs (cluster_tls.rs construction).
                 let name = rustls::pki_types::ServerName::try_from("localhost")
                     .expect("literal server name")
                     .to_owned();

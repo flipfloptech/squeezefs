@@ -442,10 +442,6 @@ enum Commands {
         #[arg(long)]
         gid: Option<u32>,
 
-        /// Peer-to-peer cache server address (e.g. 127.0.0.1:9099)
-        #[arg(long)]
-        p2p_addr: Option<String>,
-
         /// Disable FUSE writeback cache (enabled by default)
         #[arg(long)]
         no_writeback: bool,
@@ -4267,7 +4263,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             supervise: _,
             uid,
             gid,
-            p2p_addr,
             no_writeback,
             interception,
             allow_other,
@@ -4550,10 +4545,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Some(&fs_generation),
             )
             .await?;
-
-            if let Some(ref addr) = p2p_addr {
-                let _ = cache.nvme.p2p_addr.set(addr.clone());
-            }
 
             let router = DataRouter::new(dlm.clone(), cache, block_alloc.clone(), nvme_dev.clone());
 

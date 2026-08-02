@@ -440,3 +440,9 @@ serializes kernel swaps anyway, and nothing in v2 blocks the daemon-side
 campaigns (bufring adoption can only be *field-verified* on a kmbuf
 kernel, but it develops against the v1 kernel the box is already
 running — v1 and v2 are ABI-identical for everything except patch 0027).
+
+---
+
+## kmod-sqzfuse stratum: KILLED (user decision 2026-08-02)
+
+The proposed DKMS/kmod stratum (minimal-diff fuse fork for stock kernels) is **killed, not shelved** — user ruling: "kill it actually and stick to the full patched kernel when we can use it." Rationale: its two major payloads evaporated under scrutiny (max_pages → the upstream sysctl + the fuse3 TransportGeometry fix; FR_LOCKED batching → covered by the carried zc series, which is io_uring-core-bound and cannot ride a module). The product ships TWO strata: **stock kernel (capability-probed graceful degradation) → full `-sqz` kernel (the performance vehicle where we control the host)**. One daemon binary serves both.

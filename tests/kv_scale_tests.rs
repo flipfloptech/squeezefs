@@ -1426,12 +1426,16 @@ async fn descend_survives_sustained_smo_churn() {
         .unwrap();
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Live reader-progress gauge (TEST-3): the storm below stops on
+    // observed work, not on a clock.
+    let reader_ops = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // 6 reader tasks hammer the traversal while 2 writers keep the hot
     // leaves churning through appends → compactions → splits.
     let mut tasks = Vec::new();
     for _ in 0..6 {
         let r = routed.clone();
         let stop = stop.clone();
+        let reader_ops = reader_ops.clone();
         tasks.push(tokio::spawn(async move {
             let mut n: u64 = 0;
             while !stop.load(Ordering::Relaxed) {
@@ -1440,6 +1444,7 @@ async fn descend_survives_sustained_smo_churn() {
                      be cooperative, not a spin)",
                 );
                 n += 1;
+                reader_ops.fetch_add(1, Ordering::Relaxed);
             }
             n
         }));
@@ -1460,7 +1465,38 @@ async fn descend_survives_sustained_smo_churn() {
             }
         }));
     }
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    // TEST-3: bound the storm by the CHURN IT ACTUALLY CAUSED, not by a
+    // wall-clock sleep. The retired `sleep(4 s)` asserted nothing about
+    // coverage — on a loaded `--test-threads=1` box it could deliver a
+    // handful of SMOs and still pass. The named coverage is "sustained
+    // compaction/split churn", so wait for exactly that (splits are the
+    // stronger event; compactions are the log-fold face of the same
+    // maintenance and are counted as a fallback so a geometry change
+    // cannot wedge the test).
+    // Calibrated on the dev box (2026-08-02): the retired 4 s window
+    // delivered ~9 SMOs and ~290 k lookups, so these floors are the same
+    // coverage made MANDATORY — the old sleep guaranteed zero.
+    const WANT_SMOS: u64 = 8;
+    const WANT_LOOKUPS: u64 = 50_000;
+    let smos = || {
+        squeezefs::meta_backend::kv::META_KV_NODE_SPLITS.load(Ordering::Relaxed)
+            + squeezefs::meta_backend::kv::META_KV_NODE_COMPACTIONS.load(Ordering::Relaxed)
+    };
+    let smo0 = smos();
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let (s, l) = (smos() - smo0, reader_ops.load(Ordering::Relaxed));
+        if s >= WANT_SMOS && l >= WANT_LOOKUPS {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "SMO churn storm never reached coverage: {s}/{WANT_SMOS} SMOs, \
+             {l}/{WANT_LOOKUPS} lookups"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let smo_total = smos() - smo0;
     stop.store(true, Ordering::Relaxed);
     for w in writers {
         w.await.unwrap();
@@ -1470,7 +1506,7 @@ async fn descend_survives_sustained_smo_churn() {
         lookups += t.await.expect("reader must not panic");
     }
     assert!(lookups > 0);
-    eprintln!("[smo-churn] {lookups} lookups survived 4 s of SMO churn");
+    eprintln!("[smo-churn] {lookups} lookups survived {smo_total} node SMOs");
     be.shutdown().await.unwrap();
 }
 

@@ -424,8 +424,18 @@ async fn dehydration_gate_drops_untouched_probation_and_dehydrates_protected() {
         let d = read_at(&h, ino, b * BS, 64 * 1024).await;
         assert!(d.iter().all(|&x| x == b as u8 + 1), "block {b}");
     }
-    // Give the dehydration worker a beat.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // TEST-3: poll for the dehydration worker's drop rather than "give it
+    // a beat" — the condition below IS the observable, so its first
+    // appearance ends the wait and a slow box no longer fails a correct
+    // implementation.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while METRICS.hot_block_probation_drops.load(Ordering::Relaxed) == drops0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dehydration worker never dropped a probation victim"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
 
     let drops = METRICS.hot_block_probation_drops.load(Ordering::Relaxed) - drops0;
     assert!(

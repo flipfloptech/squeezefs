@@ -995,6 +995,13 @@ async fn sequential_recopy_readers_never_see_foreign_bytes() {
     // The writer's ACK watermark for the CURRENT incarnation: bytes
     // [0, watermark) have completed their write_at when read.
     let acked = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // TEST-3: the soak is bounded by COMPLETED WORK, not by a wall-clock
+    // sleep. The retired `sleep(8 s)` bought whatever coverage the box
+    // happened to deliver — many incarnations on an idle machine, possibly
+    // a handful under `--test-threads=1` load — which is both slow and the
+    // exact load-dependence the house rule forbids.
+    let cycles = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Writer: rm + create + sequential 8 KiB rewrite, forever.
     let writer = {
@@ -1003,6 +1010,7 @@ async fn sequential_recopy_readers_never_see_foreign_bytes() {
         let stop = stop.clone();
         let ino_cell = ino_cell.clone();
         let acked = acked.clone();
+        let cycles = cycles.clone();
         tokio::spawn(async move {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let name = "fsv";
@@ -1018,7 +1026,8 @@ async fn sequential_recopy_readers_never_see_foreign_bytes() {
                         tokio::task::yield_now().await;
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                cycles.fetch_add(1, std::sync::atomic::Ordering::Release);
+                tokio::task::yield_now().await;
             }
         })
     };
@@ -1032,6 +1041,7 @@ async fn sequential_recopy_readers_never_see_foreign_bytes() {
         let stop = stop.clone();
         let ino_cell = ino_cell.clone();
         let acked = acked.clone();
+        let reads = reads.clone();
         readers.push(tokio::spawn(async move {
             let mut i = 0u64;
             let mut served = 0u64;
@@ -1091,6 +1101,7 @@ async fn sequential_recopy_readers_never_see_foreign_bytes() {
                     );
                 }
                 served += got.len() as u64;
+                reads.fetch_add(1, std::sync::atomic::Ordering::Release);
                 if i.is_multiple_of(64) {
                     tokio::task::yield_now().await;
                 }
@@ -1099,7 +1110,30 @@ async fn sequential_recopy_readers_never_see_foreign_bytes() {
         }));
     }
 
-    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    // Work-bounded soak (TEST-3): stop once the storm has actually
+    // delivered its coverage — WRITER_CYCLES full unlink→create→rewrite
+    // incarnations (the layout walk inline → staged → striped, once per
+    // cycle) with READER_OPS concurrent reads observed against them. The
+    // deadline is a failure bound, not the schedule: a box that cannot
+    // reach the coverage says so instead of silently testing less.
+    const WRITER_CYCLES: u64 = 12;
+    const READER_OPS: u64 = 2_000;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let (c, r) = (
+            cycles.load(std::sync::atomic::Ordering::Acquire),
+            reads.load(std::sync::atomic::Ordering::Acquire),
+        );
+        if c >= WRITER_CYCLES && r >= READER_OPS {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "generic/795 storm never reached its coverage: {c}/{WRITER_CYCLES} \
+             writer incarnations, {r}/{READER_OPS} reader ops"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     writer.await.unwrap();
     let mut total = 0u64;

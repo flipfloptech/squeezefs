@@ -219,7 +219,10 @@ fn poll_clients(
         if pred(&v) || Instant::now() > end {
             return v;
         }
-        std::thread::sleep(Duration::from_secs(2));
+        // TEST-3: 100 ms, not 2 s. `clients --json` is a cheap offline
+        // probe; a 2 s interval charged every miss two whole seconds of
+        // wall clock for nothing.
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 

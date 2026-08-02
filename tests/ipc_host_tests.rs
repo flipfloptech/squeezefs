@@ -1861,8 +1861,10 @@ fn an_established_but_idle_connection_survives_the_recv_timeout() {
         other => panic!("bind must succeed, got {other:?}"),
     };
 
-    // Sit idle well past any handshake deadline, then keep using the
-    // session: the connection, the binding and the ring must all live.
+    // KEPT sleep — TEST-3 class "product time behavior under test": the
+    // contract IS "an established session survives the handshake deadline
+    // elapsing", so the elapsing is the stimulus, not synchronization.
+    // 1.5 s is a small multiple of the handshake window.
     std::thread::sleep(Duration::from_millis(1500));
     wait_sessions_active(1, "an idle established session stays live");
     let r = session.submit_wait(&SlotDescriptor {

@@ -275,34 +275,93 @@ async fn noop_job_runs_to_completion_and_records_are_durable() {
     assert_eq!(rec["state"], "completed", "terminal state durable: {rec}");
 }
 
+/// The throttle law itself (`job_throttle_sleep`, KD-3), deterministically:
+/// after a task of measured cost `e`, the worker sleeps `e × (100-pct)/pct`,
+/// so `e / (e + sleep) == pct`. No clock, no scheduler, no flake.
+#[test]
+fn throttle_sleep_law_is_exact_at_every_duty_target() {
+    use squeezefs::jobs::job_throttle_sleep;
+    for pct in [1u32, 25, 50, 75, 99] {
+        let e = Duration::from_millis(200);
+        let sleep = job_throttle_sleep(e, pct).expect("a sub-100 throttle sleeps");
+        let duty = 100.0 * e.as_secs_f64() / (e + sleep).as_secs_f64();
+        assert!(
+            (duty - pct as f64).abs() < 0.01,
+            "the duty law must be exact: {duty} vs {pct}"
+        );
+    }
+    assert!(
+        job_throttle_sleep(Duration::from_millis(200), 100).is_none(),
+        "100 % is unthrottled"
+    );
+    assert!(
+        job_throttle_sleep(Duration::from_millis(200), 0).is_none(),
+        "0 means 'mount default', resolved before this point — never a stall"
+    );
+    assert!(
+        job_throttle_sleep(Duration::from_micros(100), 50).is_none(),
+        "sub-millisecond sleeps are not worth a timer"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn throttle_duty_cycle_adheres_within_ten_percent() {
-    // G-VL-7 leg: measured duty cycle (task-active / wall) within ±10
-    // points of target at 25/50/75 %. Noop tasks with a known active
-    // time make duty cycle = tasks×task_ms / wall directly measurable.
+    // G-VL-7 leg: measured duty cycle within ±10 points of target at
+    // 25/50/75 %.
+    //
+    // TEST-3 (2026-08-02): this test was a load-dependent flake — 2/5 on
+    // the UNTOUCHED dev tip ("duty cycle 39.3% must be within ±10 of
+    // 50%"). Cause: it derived the active time from the NOMINAL
+    // `tasks × task_ms`, while the throttle sleeps proportionally to each
+    // task's MEASURED cost. Under contention a 20 ms task costs 26 ms, the
+    // throttle correctly sleeps 3× that, and wall grows superlinearly —
+    // so a correctly-throttling fabric read as a violation.
+    //
+    // The fix is to measure the active time instead of assuming it: an
+    // unthrottled (100 %) pass of the identical job is the real active
+    // time INCLUDING whatever per-task overhead this box is imposing, and
+    // duty = wall(100 %) / wall(pct) cancels it exactly.
     let fx = fixture("fab-throttle").await;
     let fab = fabric(&fx, 1).await;
 
+    let tasks = 40u64;
+    let task_ms = 20u64;
+    let run = |pct: u32| {
+        let fab = &fab;
+        async move {
+            let started = std::time::Instant::now();
+            let job_id = fab
+                .submit(JobSpec {
+                    job_type: JobType::Noop { tasks, task_ms },
+                    throttle_pct: pct,
+                })
+                .await
+                .expect("submit");
+            fab.wait_terminal(&job_id, Duration::from_secs(60))
+                .await
+                .expect("terminal");
+            started.elapsed().as_secs_f64()
+        }
+    };
+
+    // Warm the fabric (first-job scheduling cost is not throttle cost),
+    // then take the unthrottled reference.
+    let _ = run(100).await;
+    let active = run(100).await;
+    assert!(
+        active >= (tasks * task_ms) as f64 / 1000.0 * 0.9,
+        "the unthrottled pass must at least cover its nominal task cost \
+         ({active:.2}s vs {:.2}s nominal)",
+        (tasks * task_ms) as f64 / 1000.0
+    );
+
     for pct in [25u32, 50, 75] {
-        let tasks = 40u64;
-        let task_ms = 20u64;
-        let started = std::time::Instant::now();
-        let job_id = fab
-            .submit(JobSpec {
-                job_type: JobType::Noop { tasks, task_ms },
-                throttle_pct: pct,
-            })
-            .await
-            .expect("submit");
-        fab.wait_terminal(&job_id, Duration::from_secs(60))
-            .await
-            .expect("terminal");
-        let wall = started.elapsed().as_secs_f64();
-        let active = (tasks * task_ms) as f64 / 1000.0;
+        let wall = run(pct).await;
         let duty = 100.0 * active / wall;
         assert!(
             (duty - pct as f64).abs() <= 10.0,
-            "duty cycle {duty:.1}% must be within ±10 of {pct}% (wall {wall:.2}s, active {active:.2}s)"
+            "duty cycle {duty:.1}% must be within ±10 of {pct}% \
+             (wall {wall:.2}s, measured active {active:.2}s)"
         );
     }
 }
@@ -328,6 +387,10 @@ async fn pause_resume_cancel_and_live_rethrottle() {
     fab.pause(&job_id).await.expect("pause");
     let s1 = fab.status(&job_id).await.unwrap().expect("known");
     assert_eq!(s1.state, JobState::Paused);
+    // KEPT sleep (TEST-3 classification: negative-assertion observation
+    // window). "A paused job does not advance" has no positive edge to
+    // poll for; the only honest instrument is to watch for a while. 200 ms
+    // is ~40 task slots at the fixture's 5 ms task cost.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let s2 = fab.status(&job_id).await.unwrap().expect("known");
     assert_eq!(
@@ -341,11 +404,24 @@ async fn pause_resume_cancel_and_live_rethrottle() {
     let s = fab.status(&job_id).await.unwrap().expect("known");
     assert_eq!(s.throttle_pct, 25, "rethrottle is live");
 
-    // Resume: advances again.
+    // Resume: advances again. TEST-3 — poll for the advance instead of
+    // sleeping 500 ms and hoping: the condition IS "tasks_done moved", so
+    // the first observation of it is the answer, and a box slow enough to
+    // need longer than 500 ms no longer reports a false failure.
     fab.resume(&job_id).await.expect("resume");
     let before = fab.status(&job_id).await.unwrap().unwrap().tasks_done;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let after = fab.status(&job_id).await.unwrap().unwrap().tasks_done;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let after = loop {
+        let now = fab.status(&job_id).await.unwrap().unwrap().tasks_done;
+        if now > before {
+            break now;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "resumed job must advance ({before} -> {now})"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    };
     assert!(
         after > before,
         "resumed job must advance ({before} -> {after})"
@@ -389,8 +465,27 @@ async fn crash_resume_reconstructs_from_durable_records() {
             .await
             .expect("submit");
         // Let it make some progress, then "crash" (drop the fabric —
-        // workers abort mid-task; records stay non-terminal).
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // workers abort mid-task; records stay non-terminal). TEST-3:
+        // "some progress" is an observable, so wait for the observable —
+        // a 150 ms sleep on a loaded box can crash a job that never
+        // started, which tests a different thing entirely.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let done = fab
+                .status(&job_id)
+                .await
+                .unwrap()
+                .expect("known")
+                .tasks_done;
+            if done > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the job must make progress before the simulated crash"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         fab.shutdown_abrupt().await;
     }
 

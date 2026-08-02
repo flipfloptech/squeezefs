@@ -1101,8 +1101,19 @@ async fn test_defrag_throttle_live_retune_and_pause() {
         })
         .await
         .expect("submit");
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let st = fx.fabric.status(&job_id).await.unwrap().unwrap();
+    // TEST-3: the observable is "the fabric has a status record for the
+    // submitted job"; poll for it rather than sleeping 300 ms.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let st = loop {
+        if let Some(st) = fx.fabric.status(&job_id).await.unwrap() {
+            break st;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the submitted defrag never produced a status record"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    };
     assert_eq!(st.throttle_pct, 1, "the submitted throttle is recorded");
 
     // Pause parks it durably; resume + live rethrottle to 100 converges.
@@ -1178,6 +1189,10 @@ async fn test_kill9_mid_defrag_resume_converges_manifest_intact() {
         squeezefs::jobs::set_evacuate_pre_publish_hook(Arc::new(move |_ino, _b| {
             if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 let _ = hit_tx.send(());
+                // KEPT sleep — TEST-3 class "hang simulator": the mover is
+                // deliberately parked forever-in-practice so the crash lands
+                // mid-publish. It costs no test wall clock (the test proceeds
+                // on `hit_rx`), and a poll cannot express "never proceed".
                 std::thread::sleep(std::time::Duration::from_secs(120)); // parked "mid-publish"
             }
         }));

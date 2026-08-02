@@ -235,6 +235,10 @@ fn test_ledger_read_never_blocks_executor_while_bucket_holder_waits_shard_write(
             // A's wake is a DMA completion, executor-independent). Pre-fix
             // the executor thread is about to block, so A is never polled
             // even though its wake arrived.
+            // KEPT sleep — TEST-3 class "deliberate schedule construction":
+            // this repro NEEDS A's wake to arrive while the executor thread
+            // is (pre-fix) blocked, so the delay IS the scenario. On fixed
+            // code the stage below succeeds regardless, so it cannot flake.
             let gate_thread = std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(750));
                 let _ = gate_tx.send(());

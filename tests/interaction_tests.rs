@@ -362,6 +362,24 @@ async fn victim_blocks_of(fx: &Fx, ino: u64, victim: &str) -> Vec<(u32, String)>
     out
 }
 
+/// Poll `cond` on the async runtime until it holds, or fail loud at the
+/// deadline (TEST-3: the house rule forbids sleep-as-synchronization —
+/// a fixed sleep is both wall-clock cost and the classic load-dependent
+/// flake, since a busy `--test-threads=1` box simply misses the window).
+async fn poll_until(what: &str, deadline: Duration, mut cond: impl FnMut() -> bool) {
+    let end = std::time::Instant::now() + deadline;
+    loop {
+        if cond() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < end,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
 async fn job_state(fx: &Fx, job_id: &str) -> JobState {
     fx.fabric
         .status(job_id)
@@ -452,9 +470,18 @@ async fn intersecting_scope_movers_serialize_queued_loud_then_run() {
         .await
         .expect("submit rebalance");
 
-    // Give the second worker several claim-poll cycles: without the
-    // serialization pin it would claim a whole-set mover immediately.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Wait for the PROOF that the second worker ran its claim pass and
+    // serialized — `job_serialized_waits` is incremented exactly once per
+    // deferred mover at `claim_next` (TEST-3: this replaces a 1.5 s sleep
+    // that hoped for "several claim-poll cycles"; without the
+    // serialization pin the counter never moves and the state assertions
+    // below fire on the same run).
+    poll_until(
+        "both whole-set movers to record their serialized wait",
+        Duration::from_secs(30),
+        || METRICS.job_serialized_waits.load(Ordering::Relaxed) >= waits_before + 2,
+    )
+    .await;
     assert_eq!(
         job_state(&fx, &defrag_id).await,
         JobState::Queued,
@@ -754,6 +781,10 @@ async fn red_pressure_pauses_jobs_loudly_and_operator_resume_recovers() {
         .fetch_sub(CHARGE, Ordering::Relaxed);
     mb.tick_inner(1000, 0, 0);
     assert_eq!(mb.level(), Level::Green, "pressure receded to Green");
+    // KEPT sleep — TEST-3 class "negative-assertion observation window":
+    // the contract is that the job does NOT self-resume, and a negation
+    // has no positive edge to poll for. 400 ms spans many worker claim
+    // passes at the fixture's cadence.
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(
         job_state(&fx, &job_id).await,

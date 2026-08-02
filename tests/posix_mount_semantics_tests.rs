@@ -281,8 +281,10 @@ fn mount_symlink_size_is_correct_after_the_attr_ttl_lapses() {
     let fresh = std::fs::symlink_metadata(&link).expect("lstat").len();
     assert_eq!(fresh, target.len() as u64, "in-window lstat sizes the link");
 
-    // Past the 1 s attr TTL the kernel re-asks the daemon, which answers
-    // from the durable inode record.
+    // KEPT sleep — TEST-3 class "product time behavior under test": the
+    // 1 s kernel attr TTL expiring is the stimulus (past it the kernel
+    // re-asks the daemon, which answers from the durable inode record).
+    // Minimal: 1.5 s is the TTL plus a 500 ms scheduling margin.
     std::thread::sleep(Duration::from_millis(1500));
     let aged = std::fs::symlink_metadata(&link).expect("lstat").len();
     assert_eq!(

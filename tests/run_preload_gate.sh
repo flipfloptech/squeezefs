@@ -8,15 +8,18 @@ set -euo pipefail
 #
 #   Leg 1 (always, no root): the sanctioned cdylib build
 #     (--profile preload-release --features interposers), the crate's own
-#     clippy/fmt/tests, the Issue-4 wrong-profile guard proof, and the
+#     clippy/fmt/tests, the Issue-4 wrong-profile guard proof, the
 #     plain-file LD_PRELOAD passthrough battery (cp/dd/cat/tar byte
 #     parity + exit codes — the shim on foreign filesystems must be
-#     invisible).
+#     invisible), and the direct-link (DT_NEEDED) battery (SDK Tier 1:
+#     SONAME/NODELETE, ctor-order, scope occupancy, parity — no
+#     LD_PRELOAD).
 #
 #   Leg 2 (root only): format + mount with --interception, then the
 #     bound-fd battery ON the mount: cp/dd parity, the §3 rule-4
 #     ENGAGEMENT proof (.stats ipc_ops_* must move — silent passthrough
 #     published as interception is the exact fraud the charter forbids),
+#     the linked-not-preloaded engagement + detection-line row,
 #     dup transparency, close_range-then-socket() fd reuse, the
 #     lseek-SEEK_CUR-is-FUSE-free pin, and fio/elbencho when installed.
 #
@@ -101,6 +104,101 @@ for mode in setup-first open-first mixed; do
     [ "$rc" -eq 0 ] || fail "aio lifecycle passthrough ($mode) rc=$rc"
 done
 echo "OK: libaio lifecycle passthrough (plain fs, 3 orderings)"
+
+# 1e. Direct-link (DT_NEEDED) support — SDK Tier 1 (docs/design-sdk.md
+# §4): `-lsqueezefs_il` is a supported linkage. The shim is ctor-free
+# (lazy first-call init), so a DT_NEEDED load differs from LD_PRELOAD
+# only in that OTHER objects' constructors may call interposed symbols
+# before main — the harness pins exactly that (ctor-context I/O), plus
+# the two build.rs link-arg fixes (SONAME so by-path links record a
+# clean DT_NEEDED name; -z nodelete because pthread_atfork handlers can
+# never be unregistered), DT_NEEDED presence, global-scope symbol
+# occupancy (dladdr: pread64 must resolve into the shim — the root-free
+# engagement tell; passthrough is invisible by design), and byte
+# parity. All WITHOUT LD_PRELOAD in the environment.
+readelf -d "$SO" | grep -q 'SONAME.*\[libsqueezefs_il\.so\]' \
+    || fail "cdylib lacks SONAME libsqueezefs_il.so (direct-link support)"
+readelf -d "$SO" | grep -q 'NODELETE' \
+    || fail "cdylib lacks -z nodelete (atfork handlers must never unload)"
+cat > "$T/linked_harness.c" <<'EOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static int ctor_status = -1; /* set before main by the constructor */
+
+/* Constructor-order audit pin: interposed data calls BEFORE main(),
+ * after libc init — the linked shim must lazily initialize and serve
+ * (passthrough on plain fs) with no ctor of its own. */
+__attribute__((constructor)) static void pre_main_io(void)
+{
+    char tmpl[] = "/tmp/sqz_linked_ctor.XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) { ctor_status = 1; return; }
+    unlink(tmpl);
+    static const char probe[] = "ctor-probe";
+    char back[sizeof probe] = {0};
+    if (pwrite(fd, probe, sizeof probe, 0) != (ssize_t)sizeof probe) { ctor_status = 2; close(fd); return; }
+    if (pread(fd, back, sizeof probe, 0) != (ssize_t)sizeof probe) { ctor_status = 3; close(fd); return; }
+    ctor_status = memcmp(probe, back, sizeof probe) ? 4 : 0;
+    close(fd);
+}
+
+int main(int argc, char **argv)
+{
+    if (ctor_status != 0) {
+        fprintf(stderr, "ctor-context I/O failed: %d\n", ctor_status);
+        return 10;
+    }
+    /* Scope-occupancy proof: the shim's strong symbols must sit ahead
+     * of libc's in the global lookup order (linked, not preloaded). */
+    void *sym = dlsym(RTLD_DEFAULT, "pread64");
+    Dl_info info;
+    if (!sym || !dladdr(sym, &info) || !info.dli_fname
+        || !strstr(info.dli_fname, "squeezefs_il")) {
+        fprintf(stderr, "pread64 resolves outside the shim (%s)\n",
+                (sym && dladdr(sym, &info) && info.dli_fname) ? info.dli_fname
+                                                              : "unresolved");
+        return 20;
+    }
+    if (argc < 2)
+        return 0;
+    /* Data battery on the target (leg 1: plain fs passthrough; leg
+     * 2b-linked: the armed mount — ring engagement checked outside). */
+    int fd = open(argv[1], O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { perror("open"); return 30; }
+    static char buf[65536], back[65536];
+    for (size_t i = 0; i < sizeof buf; i++)
+        buf[i] = (char)((i * 2654435761u) >> 24);
+    for (int i = 0; i < 128; i++)
+        if (pwrite(fd, buf, sizeof buf, (off_t)i * (off_t)sizeof buf)
+            != (ssize_t)sizeof buf) { perror("pwrite"); return 31; }
+    for (int i = 0; i < 128; i++) {
+        if (pread(fd, back, sizeof back, (off_t)i * (off_t)sizeof back)
+            != (ssize_t)sizeof back) { perror("pread"); return 32; }
+        if (memcmp(buf, back, sizeof back)) {
+            fprintf(stderr, "parity mismatch at block %d\n", i);
+            return 33;
+        }
+    }
+    close(fd);
+    return 0;
+}
+EOF
+cc -O2 -o "$T/linked_harness" "$T/linked_harness.c" \
+    -Wl,--no-as-needed "$SO" -Wl,--as-needed -ldl \
+    || fail "linked harness compile"
+ldd "$T/linked_harness" | grep -q 'libsqueezefs_il\.so' \
+    || fail "linked harness carries no DT_NEEDED entry for the shim"
+rc=0
+env -u LD_PRELOAD LD_LIBRARY_PATH="$(dirname "$SO")" \
+    "$T/linked_harness" "$T/linked.bin" || rc=$?
+[ "$rc" -eq 0 ] || fail "linked-not-preloaded battery (plain fs) rc=$rc"
+echo "OK: direct-link battery (SONAME/NODELETE, ctor-order, scope occupancy, parity)"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "=== Leg 2 skipped (not root) — run: sudo $0 ==="
@@ -200,6 +298,28 @@ OPS_R1=$(stats ipc_ops_read); OPS_W1=$(stats ipc_ops_write); SESS1=$(stats ipc_s
 [ "$OPS_W1" -gt "$OPS_W0" ] || fail "ipc_ops_write did not move — writes ran over kernel FUSE (engagement)"
 [ "$OPS_R1" -gt "$OPS_R0" ] || fail "ipc_ops_read did not move — reads ran over kernel FUSE (engagement)"
 echo "OK: mount parity + engagement (sessions +$((SESS1-SESS0)), reads +$((OPS_R1-OPS_R0)), writes +$((OPS_W1-OPS_W0)))"
+
+# 2b-linked. Direct-link engagement + the linked-mode detection line
+# (SDK Tier 1): the leg-1e harness again, still WITHOUT LD_PRELOAD, on
+# the armed mount — the ring must serve it (engagement, §3 rule 4) and
+# the bootstrap path must print the linked-mode line EXACTLY once per
+# process (the once-per-process announce; refusal-line discipline
+# precedent).
+LK_R0=$(stats ipc_ops_read); LK_W0=$(stats ipc_ops_write)
+LK_ERR="$T/linked_stderr.log"
+rc=0
+env -u LD_PRELOAD LD_LIBRARY_PATH="$(dirname "$SO")" SQUEEZEFS_IPC_ALLOW_DEV=1 \
+    "$T/linked_harness" "$MOUNT_DIR/linked.bin" 2>"$LK_ERR" || rc=$?
+[ "$rc" -eq 0 ] || { cat "$LK_ERR"; fail "linked harness on the mount rc=$rc"; }
+LK_R1=$(stats ipc_ops_read); LK_W1=$(stats ipc_ops_write)
+[ "$((LK_W1 - LK_W0))" -ge 64 ] \
+    || fail "linked-mode writes bypassed the ring (Δ$((LK_W1 - LK_W0)))"
+[ "$((LK_R1 - LK_R0))" -ge 64 ] \
+    || fail "linked-mode reads bypassed the ring (Δ$((LK_R1 - LK_R0)))"
+LK_LINES=$(grep -c "active via direct link (DT_NEEDED)" "$LK_ERR" || true)
+[ "$LK_LINES" -eq 1 ] \
+    || { cat "$LK_ERR"; fail "linked-mode line must print exactly once — got $LK_LINES"; }
+echo "OK: direct-link engagement (reads +$((LK_R1 - LK_R0)), writes +$((LK_W1 - LK_W0))) + detection line"
 
 # 2c. dup transparency (G-L4-4): dup, close the original, the dup keeps
 # serving over the ring.
@@ -413,7 +533,8 @@ done
 if [ "$AIO_SKIP" -eq 0 ]; then
     # Free the kill-soak ballast (the 1G backend is near-full) and let
     # the drained daemon release the D0 writer claim before remounting.
-    rm -f "$MOUNT_DIR"/kill*.bin "$MOUNT_DIR"/dd.bin "$MOUNT_DIR"/elb* 2>/dev/null || true
+    rm -f "$MOUNT_DIR"/kill*.bin "$MOUNT_DIR"/dd.bin "$MOUNT_DIR"/elb* \
+        "$MOUNT_DIR"/linked.bin 2>/dev/null || true
     sleep 1
     umount "$MOUNT_DIR" 2>/dev/null || umount -l "$MOUNT_DIR" 2>/dev/null || true
     deadline=$((SECONDS + 20))

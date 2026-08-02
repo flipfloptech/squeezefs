@@ -107,26 +107,45 @@ unit was a whole volume's load). Shipped behavior:
 
 ## 5. Gates run (this campaign, on this branch)
 
-Release-gate campaign occupied the box (one-heavy-thing rule) — all
-work ran `nice -n 15`, `CARGO_BUILD_JOBS=8`, targeted binaries only:
+The release-gate campaign occupied the box through the design + code
+phases (all work `nice -n 15`, `CARGO_BUILD_JOBS=8`, targeted binaries
+only); it freed the box before the acceptance gates, which then ran in
+full:
 
-- `cargo clippy --all-targets --all-features -- -D warnings` — clean.
-- `cargo fmt --check` — clean.
-- Targeted suites, serial where global counters demand it — ALL GREEN:
-  `dynamic_meta_routing_tests` (16 + probe), `meta_slot_tests` (17),
-  `meta_slot_migration_tests` (16), `meta_plane_distribution_tests`,
-  `interaction_tests` (16), `volume_lifecycle_tests` (19),
-  `fsck_tests` (7), `fsck_repair_tests` (9), `kv_backend_tests` (34),
-  `conveyor_tests` (10), `crash_contract_tests` (25),
-  `meta_dlm_stripe_tests` (8), `meta_entry_economy_tests` (11),
-  `job_fabric_tests` (13), `defrag_tests` (11), `placement_tests` (12),
+- **The full cargo gate — GREEN from zero** (counted-run discipline: an
+  earlier pass caught exactly one stale contract —
+  `staging_generation_tests::volume_set_generation_identity_contracts`,
+  the retired legacy ordered-join shape, re-pinned to the stronger
+  foreign-set refusal — and the gate was restarted from zero post-fix):
+  `cargo clippy --all-targets --all-features -- -D warnings` clean;
+  `cargo fmt --check` clean; `cargo test --all-features --
+  --test-threads=1` — the ENTIRE suite, zero failures; `cargo doc
+  --no-deps` (no unresolved links introduced; three pre-existing
+  private-item warnings untouched); `cargo bench --benches -- --test`
+  smoke green (incl. the new `dynamic_meta_routing` group).
+- **`tests/run_volume_lifecycle.sh` — ALL 18 LEGS PASSED** (release
+  binary, unprivileged fuse, LOOPS=3): the VL5 legs at the derived
+  width — leg 9 add-meta (manifest byte-identical, inos stable, old URI
+  refused), leg 10 remove-meta, leg 11 kill-9-during-migration ×3
+  (online cutover window 1 ms), leg 17b migrate+drain concurrent — and
+  the NEW **leg 18: a single-meta-volume default format grew to two
+  members by `add-meta --take-slots 8`** (the previously-impossible
+  shape): derived-width format banner asserted, `--meta-slots` hard
+  error asserted, manifest + st_ino intact across the grow + remount,
+  post-grow fsck findings 0.
+- Targeted suites during development (serial where process-global
+  counters demand): `dynamic_meta_routing_tests` (16 + probe),
+  `meta_slot_tests` (17), `meta_slot_migration_tests` (16),
+  `meta_plane_distribution_tests`, `interaction_tests` (16),
+  `volume_lifecycle_tests` (19), `fsck_tests`/`fsck_repair_tests`,
+  `kv_backend_tests` (34), `conveyor_tests`, `crash_contract_tests`
+  (25), `meta_dlm_stripe_tests`, `meta_entry_economy_tests`,
+  `job_fabric_tests`, `defrag_tests`, `placement_tests`,
   `write_commit_economy_tests`, `meta_write_economy_audit_tests`,
-  `mount_writer_guard_tests`.
-- **DEFERRED until the release-gate campaign frees the box:** the full
-  cargo gate (`cargo test --all-features -- --test-threads=1`, doc
-  build, bench smoke) and the root rigs (`tests/run_volume_lifecycle.sh`
-  incl. the new leg 18, `run_lifecycle_soak.sh`). Branch state:
-  **ready-pending-full-gate.**
+  `mount_writer_guard_tests` — all green.
+
+Branch state: **ready to merge** (`feat/dynamic-meta-routing`, ff-only
+onto dev after review).
 
 ## 6. Operator story (the deliverable sentence)
 

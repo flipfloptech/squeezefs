@@ -35,6 +35,96 @@ use std::hint::black_box;
 
 const BLOCK: usize = 4 * 1024 * 1024;
 
+/// DUR-2: the price of the data-device durability barrier, and what the
+/// `SyncCoalescer` takes back.
+///
+/// Field shape: `fsync`-heavy mixed workloads issue many concurrent
+/// per-inode barriers against ONE data device (the D5 group-commit
+/// conveyor's shape on the metadata side — same discipline, reused here
+/// rather than re-derived). The lever this group prices is the coalescing
+/// WIDTH: N concurrent callers must cost far fewer than N device
+/// barriers, and the counters `data_device_sync_requests` /
+/// `data_device_syncs` are the live instrument for the same ratio.
+///
+/// Substrate note (honesty): a Criterion box measures this against a
+/// file-backed volume, where `Fsync/DATASYNC` is an `fdatasync` on the
+/// host filesystem. On a real VWC-enabled NVMe device the per-barrier
+/// cost is a device flush — larger, and exactly why the width matters.
+/// Correctness is NOT gated on this number.
+fn bench_flush_coalescing(c: &mut Criterion) {
+    use squeezefs::fuse_client::METRICS;
+    use squeezefs::nvme_dev::NvmeBlockDev;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use tokio::runtime::Runtime;
+
+    let rt = Runtime::new().expect("bench runtime");
+    let backing = tempfile::NamedTempFile::new().expect("bench backing file");
+    backing
+        .as_file()
+        .set_len(64 * 1024 * 1024)
+        .expect("size backing file");
+    let dev = Arc::new(NvmeBlockDev::new(
+        backing.path().to_str().expect("backing path"),
+    ));
+    // One durable-ish write so the barrier has something to order.
+    rt.block_on(async {
+        dev.write_block(0, bytes::Bytes::from(vec![0x5Au8; 4096]))
+            .await
+            .expect("seed write");
+    });
+
+    let mut group = c.benchmark_group("data_device_barrier");
+
+    group.bench_function("flush_serial", |b| {
+        let dev = dev.clone();
+        b.to_async(&rt)
+            .iter(|| {
+                let dev = dev.clone();
+                async move { black_box(dev.flush().await.expect("barrier")) }
+            });
+    });
+
+    // N concurrent callers per iteration: the coalescing width. The
+    // reported time is per BATCH; barriers-per-batch is printed once so
+    // the width is legible next to the cost.
+    for n in [8usize, 64] {
+        group.bench_function(format!("flush_concurrent_{n}"), |b| {
+            let dev = dev.clone();
+            b.to_async(&rt).iter(|| {
+                let dev = dev.clone();
+                async move {
+                    let mut set = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let d = dev.clone();
+                        set.push(tokio::spawn(async move { d.flush().await }));
+                    }
+                    for h in set {
+                        h.await.expect("join").expect("barrier");
+                    }
+                }
+            });
+        });
+
+        // Width probe (one measured batch, outside the timing loop).
+        let syncs0 = METRICS.data_device_syncs.load(Ordering::Relaxed);
+        rt.block_on(async {
+            let mut set = Vec::with_capacity(n);
+            for _ in 0..n {
+                let d = dev.clone();
+                set.push(tokio::spawn(async move { d.flush().await }));
+            }
+            for h in set {
+                h.await.expect("join").expect("barrier");
+            }
+        });
+        let syncs = METRICS.data_device_syncs.load(Ordering::Relaxed) - syncs0;
+        println!("  [coalescing width] {n} concurrent flushes -> {syncs} device barriers");
+    }
+
+    group.finish();
+}
+
 fn bench_coverage_union(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_coverage_union");
     group.throughput(Throughput::Bytes(BLOCK as u64));
@@ -226,6 +316,7 @@ criterion_group!(
     bench_coverage_union,
     bench_extent_overlay,
     bench_supersession,
-    bench_layout_publish
+    bench_layout_publish,
+    bench_flush_coalescing
 );
 criterion_main!(benches);

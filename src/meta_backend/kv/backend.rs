@@ -1597,20 +1597,31 @@ impl KvMetaBackend {
     /// leaves `TREE_INODES`, and it already knows the count.
     ///
     /// **Honest bound:** the subtrahend is per-mount RAM state, so a
-    /// remount re-seeds from the watermark (an over-report, never an
-    /// under-report — `statfs` may only ever be pessimistic about free
-    /// slots). A durable live count belongs in the root-ledger payload
-    /// and is deferred to the batched format window; the watermark base
-    /// also (deliberately) keeps counting inos burned by failed creates,
-    /// exactly as the §4.8 law describes them.
+    /// remount re-seeds from the allocation cursors (an over-report,
+    /// never an under-report — `statfs` may only ever be pessimistic
+    /// about free slots). A durable live count belongs in the root-ledger
+    /// payload and is deferred to the batched format window; the cursor
+    /// base also (deliberately) keeps counting inos burned by failed
+    /// creates, exactly as the §4.8 law describes them.
+    ///
+    /// **Every** allocation cursor counts, not just the volume
+    /// watermark: since the dynamic-routing MINT_SPREAD (64 slots per
+    /// volume rotor, `docs/design-dynamic-meta-routing.md` §5.3) a
+    /// create mints from the picked slot's GUEST cursor unless the slot
+    /// is the volume's legacy keyspace, so a watermark-only derivation
+    /// misses ~63 of every 64 creates — `df -i` under-reported IUsed by
+    /// that factor on any real (width-2^16) mount, and the in-RAM test
+    /// constructor's `W ≤ 1` identity hid it.
     pub fn live_inodes(&self) -> u64 {
-        // Watermark progression: the reserved base is 2 (ino 1 = root,
-        // watermark starts at 2 on a fresh volume) — the root is added
-        // back ONCE by the caller across the volume set.
-        self.next_ino
-            .load(Ordering::Acquire)
-            .saturating_sub(2)
-            .saturating_sub(self.destroyed_inodes.load(Ordering::Relaxed))
+        // Cursor progression: every cursor's reserved base is 2 (ino 1 =
+        // root, a virgin cursor starts at 2) — the root is added back
+        // ONCE by the caller across the volume set.
+        let mut allocated = self.next_ino.load(Ordering::Acquire).saturating_sub(2);
+        self.guest_cursors.iter_sync(|_slot, cursor| {
+            allocated = allocated.saturating_add(cursor.snapshot().saturating_sub(2));
+            true
+        });
+        allocated.saturating_sub(self.destroyed_inodes.load(Ordering::Relaxed))
     }
 
     /// Free heap extents right now (mount log / stats surface).

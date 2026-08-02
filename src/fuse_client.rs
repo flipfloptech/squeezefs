@@ -4105,6 +4105,27 @@ const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
 /// logs the kernel's capability split.
 const FOPEN_NOFLUSH: u32 = 1 << 5;
 
+/// Kernel ABI (include/uapi/linux/fuse.h, since fuse 7.x forever):
+/// open-reply flag telling the kernel to KEEP the inode's page cache on
+/// open — PERF-6 / FUSE-4a (pre-rc spec §9/§4). Without it
+/// `fuse_finish_open` invalidates the whole page cache on EVERY open, so
+/// warm re-read workloads pay the full READ stream again despite
+/// FUSE_WRITEBACK_CACHE being negotiated.
+///
+/// Safety (the spec's FUSE-4a rationale): FUSE_AUTO_INVAL_DATA is
+/// already negotiated (pinned in the fuse3 fork's
+/// `init_reply_echoes_implemented_caps`), so the kernel invalidates
+/// cached pages itself when a GETATTR/lookup observes a size/mtime
+/// change — retention never becomes staleness. Under the D0
+/// single-writer mount guard there is no cross-mount writer to observe
+/// in the first place, and within one mount the daemon's own
+/// `notify_inval_inode` handoff (L4 W1) covers daemon-initiated
+/// invalidation. Orthogonal laws are untouched: NOFLUSH is a close-time
+/// FLUSH-elision contract, killpriv-v2 is a write-time privilege law,
+/// and the virtual .stats/.config inodes reply FOPEN_DIRECT_IO
+/// separately (never through `regular_open_reply_flags`).
+const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+
 /// Open/create reply flags for REGULAR files (the virtual .stats/.config
 /// opens reply `FOPEN_DIRECT_IO` separately — see `open`). Parallel direct
 /// writes are safe under this daemon's lock model: the write handler
@@ -4114,8 +4135,11 @@ const FOPEN_NOFLUSH: u32 = 1 << 5;
 /// writes stay kernel-exclusive regardless (fuse_dio_lock's past-EOF
 /// check), preserving size-extension ordering. NOFLUSH rides every
 /// regular open/create reply — every handle is OPENED clean (D2.a).
+/// KEEP_CACHE rides every regular open/create reply — the page cache
+/// survives open (PERF-6/FUSE-4a; AUTO_INVAL_DATA is the staleness
+/// guard, see the const doc).
 const fn regular_open_reply_flags() -> u32 {
-    FOPEN_NOFLUSH | FOPEN_PARALLEL_DIRECT_WRITES
+    FOPEN_KEEP_CACHE | FOPEN_NOFLUSH | FOPEN_PARALLEL_DIRECT_WRITES
 }
 
 #[derive(Debug, Clone)]
@@ -17059,7 +17083,7 @@ mod tests {
         );
         assert_eq!(
             regular_open_reply_flags(),
-            FOPEN_NOFLUSH | FOPEN_PARALLEL_DIRECT_WRITES | (1 << 1),
+            FOPEN_KEEP_CACHE | FOPEN_NOFLUSH | FOPEN_PARALLEL_DIRECT_WRITES,
             "regular files must advertise exactly KEEP_CACHE + NOFLUSH + \
              parallel direct writes (no FOPEN_DIRECT_IO — the page-cache \
              path stays enabled)"
@@ -17086,10 +17110,17 @@ mod tests {
     #[test]
     fn regular_open_reply_advertises_keep_cache() {
         assert_eq!(
-            regular_open_reply_flags() & (1 << 1),
+            FOPEN_KEEP_CACHE,
             1 << 1,
-            "regular files must advertise FOPEN_KEEP_CACHE (1 << 1) — \
-             without it the kernel drops the page cache on every open \
+            "kernel ABI value for FOPEN_KEEP_CACHE is 1 << 1 \
+             (include/uapi/linux/fuse.h); any other value advertises a \
+             different capability"
+        );
+        assert_eq!(
+            regular_open_reply_flags() & FOPEN_KEEP_CACHE,
+            FOPEN_KEEP_CACHE,
+            "regular files must advertise FOPEN_KEEP_CACHE — without it \
+             the kernel drops the page cache on every open \
              (PERF-6/FUSE-4a)"
         );
     }

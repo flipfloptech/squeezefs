@@ -314,11 +314,136 @@ fn bench_dynamic_meta_routing(c: &mut Criterion) {
     group.finish();
 }
 
+/// **POSIX-6 / POSIX-16 — the two hot error-path primitives.**
+///
+/// FIELD SHAPE (why these inputs): `to_errno` runs on EVERY error return
+/// the daemon makes — the dominant live shape is the ENOENT grammar of
+/// POSIX lookups (negative dentries, unlink/stat probes: thousands per
+/// `rsync`/bench run, which is why `map_squeezefs_err` logs it at debug
+/// rather than error), followed by the structured refusals the create
+/// path mints on collision. The pre-POSIX-6 mapping ran up to three
+/// `String::contains` scans over the message before answering; the
+/// structured mapping is a match arm. Both are measured here so the
+/// substring form can never come back "for convenience".
+///
+/// The POSIX-16 latch sits on EVERY `flush`/`fsync` — the close path of
+/// every file — so its healthy-mount cost (the `writeback_error_count`
+/// gate: one relaxed load, no map touch) is the number that matters;
+/// the latch/report cycle is priced beside it for the failing case.
+fn bench_error_paths(c: &mut Criterion) {
+    use squeezefs::error::SqueezefsError;
+
+    let mut group = c.benchmark_group("error_paths");
+
+    // The lookup grammar: an OS errno passes through verbatim.
+    let enoent = SqueezefsError::Io(std::io::Error::from_raw_os_error(libc::ENOENT));
+    group.bench_function("to_errno_io_raw_os", |b| {
+        b.iter(|| black_box(black_box(&enoent).to_errno()));
+    });
+
+    // An in-process io error: the kind table (no raw_os_error).
+    let kind = SqueezefsError::Io(std::io::Error::new(
+        std::io::ErrorKind::StorageFull,
+        "staging full",
+    ));
+    group.bench_function("to_errno_io_kind_table", |b| {
+        b.iter(|| black_box(black_box(&kind).to_errno()));
+    });
+
+    // The structured refusal (POSIX-6): one match arm, message untouched.
+    let refused = SqueezefsError::already_exists("File already exists");
+    group.bench_function("to_errno_structured_refusal", |b| {
+        b.iter(|| black_box(black_box(&refused).to_errno()));
+    });
+
+    // The generic refusal: the class that used to pay the substring
+    // scans (this message is the shape those rules searched).
+    let invalid = SqueezefsError::InvalidOperation(
+        "kv metadata: no space: 3 free extents with the 8-extent compaction reserve \
+         intact — allocation refused (ENOSPC)"
+            .to_string(),
+    );
+    group.bench_function("to_errno_invalid_operation_long_msg", |b| {
+        b.iter(|| black_box(black_box(&invalid).to_errno()));
+    });
+
+    group.finish();
+}
+
+/// The POSIX-16 latch, priced on the FS the whole daemon shares.
+fn bench_writeback_latch(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let fs = rt.block_on(bench_fs());
+
+    let mut group = c.benchmark_group("writeback_error_latch");
+
+    // The always-case: a healthy mount's flush/fsync probe. One relaxed
+    // load; the map is never touched.
+    group.bench_function("probe_clean_mount", |b| {
+        b.iter(|| black_box(fs.take_writeback_error(black_box(42))));
+    });
+
+    // The failing case: latch + report, the full errseq cycle.
+    group.bench_function("latch_and_report_cycle", |b| {
+        let mut ino = 100u64;
+        b.iter(|| {
+            ino = ino.wrapping_add(1).max(100);
+            fs.note_writeback_error(black_box(ino), libc::EIO);
+            black_box(fs.take_writeback_error(black_box(ino)))
+        });
+    });
+
+    // A latched mount probing an UNRELATED inode (the per-inode law's
+    // cost once the gate is open — one hash probe).
+    fs.note_writeback_error(7, libc::EIO);
+    group.bench_function("probe_other_inode_while_latched", |b| {
+        b.iter(|| black_box(fs.take_writeback_error(black_box(999_999))));
+    });
+
+    group.finish();
+}
+
+/// A minimal in-process filesystem for the latch bench (no metadata
+/// backend needed — the latch is FS-local state).
+async fn bench_fs() -> squeezefs::fuse_client::SqueezefsFilesystem {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::cache::TieredCache;
+    use squeezefs::dlm::DlmClient;
+    use squeezefs::nvme_dev::NvmeBlockDev;
+    use squeezefs::routing::DataRouter;
+
+    let dlm = DlmClient::new().unwrap();
+    let backing = tempfile::NamedTempFile::new().unwrap();
+    backing.as_file().set_len(64 * 1024 * 1024).unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
+    let ba = Arc::new(BlockAllocator::new("bench_latch").await.unwrap());
+    let staging = tempfile::tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![staging.path().to_path_buf()],
+        Some("16MB"),
+        Some("16MB"),
+        Some("32MB"),
+        Some("32MB"),
+        ba.clone(),
+        nvme.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    // The temp files outlive the bench through the closure's captures.
+    std::mem::forget(backing);
+    std::mem::forget(staging);
+    let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
+    squeezefs::fuse_client::SqueezefsFilesystem::new(router, dlm, 1000, 1000)
+}
+
 criterion_group!(
     benches,
     bench_high_concurrency,
     bench_cluster_dlm,
     bench_metadata_clone,
-    bench_dynamic_meta_routing
+    bench_dynamic_meta_routing,
+    bench_error_paths,
+    bench_writeback_latch
 );
 criterion_main!(benches);

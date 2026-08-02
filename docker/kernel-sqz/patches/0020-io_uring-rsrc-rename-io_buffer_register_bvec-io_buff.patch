@@ -1,0 +1,212 @@
+From e13c7b77e06a3c1f1c7651bf9cf31843031df317 Mon Sep 17 00:00:00 2001
+From: Joanne Koong <joannelkoong@gmail.com>
+Date: Fri, 16 Jan 2026 15:30:39 -0800
+Subject: [PATCH 20/26] io_uring/rsrc: rename
+ io_buffer_register_bvec()/io_buffer_unregister_bvec()
+
+Currently, io_buffer_register_bvec() takes in a request. In preparation
+for supporting kernel-populated buffers in fuse io-uring (which will
+need to register bvecs directly, not through a struct request), rename
+this to io_buffer_register_request().
+
+A subsequent patch will commandeer the "io_buffer_register_bvec()"
+function name to support registering bvecs directly.
+
+Rename io_buffer_unregister_bvec() to a more generic name,
+io_buffer_unregister(), as both io_buffer_register_request() and
+io_buffer_register_bvec() callers will use it for unregistration.
+
+Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
+Reviewed-by: Caleb Sander Mateos <csander@purestorage.com>
+---
+ Documentation/block/ublk.rst | 14 +++++++-------
+ drivers/block/ublk_drv.c     | 18 +++++++++---------
+ include/linux/io_uring/cmd.h | 26 ++++++++++++++++++++------
+ io_uring/rsrc.c              | 14 +++++++-------
+ 4 files changed, 43 insertions(+), 29 deletions(-)
+
+diff --git a/Documentation/block/ublk.rst b/Documentation/block/ublk.rst
+index 8c4030bca..aa6e0bf94 100644
+--- a/Documentation/block/ublk.rst
++++ b/Documentation/block/ublk.rst
+@@ -326,17 +326,17 @@ Zero copy
+ ---------
+ 
+ ublk zero copy relies on io_uring's fixed kernel buffer, which provides
+-two APIs: `io_buffer_register_bvec()` and `io_buffer_unregister_bvec`.
++two APIs: `io_buffer_register_request()` and `io_buffer_unregister`.
+ 
+ ublk adds IO command of `UBLK_IO_REGISTER_IO_BUF` to call
+-`io_buffer_register_bvec()` for ublk server to register client request
++`io_buffer_register_request()` for ublk server to register client request
+ buffer into io_uring buffer table, then ublk server can submit io_uring
+ IOs with the registered buffer index. IO command of `UBLK_IO_UNREGISTER_IO_BUF`
+-calls `io_buffer_unregister_bvec()` to unregister the buffer, which is
+-guaranteed to be live between calling `io_buffer_register_bvec()` and
+-`io_buffer_unregister_bvec()`. Any io_uring operation which supports this
+-kind of kernel buffer will grab one reference of the buffer until the
+-operation is completed.
++calls `io_buffer_unregister()` to unregister the buffer, which is guaranteed
++to be live between calling `io_buffer_register_request()` and
++`io_buffer_unregister()`. Any io_uring operation which supports this kind of
++kernel buffer will grab one reference of the buffer until the operation is
++completed.
+ 
+ ublk server implementing zero copy or user copy has to be CAP_SYS_ADMIN and
+ be trusted, because it is ublk server's responsibility to make sure IO buffer
+diff --git a/drivers/block/ublk_drv.c b/drivers/block/ublk_drv.c
+index 60053af92..22826ca7d 100644
+--- a/drivers/block/ublk_drv.c
++++ b/drivers/block/ublk_drv.c
+@@ -1227,8 +1227,8 @@ __ublk_do_auto_buf_reg(const struct ublk_queue *ubq, struct request *req,
+ {
+ 	int ret;
+ 
+-	ret = io_buffer_register_bvec(cmd, req, ublk_io_release,
+-				      io->buf.auto_reg.index, issue_flags);
++	ret = io_buffer_register_request(cmd, req, ublk_io_release,
++					 io->buf.auto_reg.index, issue_flags);
+ 	if (ret) {
+ 		if (io->buf.auto_reg.flags & UBLK_AUTO_BUF_REG_FALLBACK) {
+ 			ublk_auto_buf_reg_fallback(ubq, req->tag);
+@@ -2212,8 +2212,8 @@ static int ublk_register_io_buf(struct io_uring_cmd *cmd,
+ 	if (!req)
+ 		return -EINVAL;
+ 
+-	ret = io_buffer_register_bvec(cmd, req, ublk_io_release, index,
+-				      issue_flags);
++	ret = io_buffer_register_request(cmd, req, ublk_io_release, index,
++					 issue_flags);
+ 	if (ret) {
+ 		ublk_put_req_ref(io, req);
+ 		return ret;
+@@ -2244,8 +2244,8 @@ ublk_daemon_register_io_buf(struct io_uring_cmd *cmd,
+ 	if (!ublk_dev_support_zero_copy(ub) || !ublk_rq_has_data(req))
+ 		return -EINVAL;
+ 
+-	ret = io_buffer_register_bvec(cmd, req, ublk_io_release, index,
+-				      issue_flags);
++	ret = io_buffer_register_request(cmd, req, ublk_io_release, index,
++					 issue_flags);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2260,7 +2260,7 @@ static int ublk_unregister_io_buf(struct io_uring_cmd *cmd,
+ 	if (!(ub->dev_info.flags & UBLK_F_SUPPORT_ZERO_COPY))
+ 		return -EINVAL;
+ 
+-	return io_buffer_unregister_bvec(cmd, index, issue_flags);
++	return io_buffer_unregister(cmd, index, issue_flags);
+ }
+ 
+ static int ublk_check_fetch_buf(const struct ublk_device *ub, __u64 buf_addr)
+@@ -2396,7 +2396,7 @@ static int ublk_ch_uring_cmd_local(struct io_uring_cmd *cmd,
+ 		goto out;
+ 
+ 	/*
+-	 * io_buffer_unregister_bvec() doesn't access the ubq or io,
++	 * io_buffer_unregister() doesn't access the ubq or io,
+ 	 * so no need to validate the q_id, tag, or task
+ 	 */
+ 	if (_IOC_NR(cmd_op) == UBLK_IO_UNREGISTER_IO_BUF)
+@@ -2463,7 +2463,7 @@ static int ublk_ch_uring_cmd_local(struct io_uring_cmd *cmd,
+ 		req = ublk_fill_io_cmd(io, cmd);
+ 		ret = ublk_config_io_buf(ub, io, cmd, addr, &buf_idx);
+ 		if (buf_idx != UBLK_INVALID_BUF_IDX)
+-			io_buffer_unregister_bvec(cmd, buf_idx, issue_flags);
++			io_buffer_unregister(cmd, buf_idx, issue_flags);
+ 		compl = ublk_need_complete_req(ub, io);
+ 
+ 		/* can't touch 'ublk_io' any more */
+diff --git a/include/linux/io_uring/cmd.h b/include/linux/io_uring/cmd.h
+index 8881fb8da..73f8ff931 100644
+--- a/include/linux/io_uring/cmd.h
++++ b/include/linux/io_uring/cmd.h
+@@ -103,6 +103,12 @@ int io_uring_kmbuf_recycle(struct io_uring_cmd *cmd, unsigned int buf_group,
+ 
+ bool io_uring_is_kmbuf_ring(struct io_uring_cmd *cmd, unsigned int buf_group,
+ 			    unsigned int issue_flags);
++
++int io_buffer_register_request(struct io_uring_cmd *cmd, struct request *rq,
++			       void (*release)(void *), unsigned int index,
++			       unsigned int issue_flags);
++int io_buffer_unregister(struct io_uring_cmd *cmd, unsigned int index,
++			 unsigned int issue_flags);
+ #else
+ static inline int
+ io_uring_cmd_import_fixed(u64 ubuf, unsigned long len, int rw,
+@@ -183,6 +189,20 @@ static inline bool io_uring_is_kmbuf_ring(struct io_uring_cmd *cmd,
+ {
+ 	return false;
+ }
++static inline int io_buffer_register_request(struct io_uring_cmd *cmd,
++					     struct request *rq,
++					     void (*release)(void *),
++					     unsigned int index,
++					     unsigned int issue_flags)
++{
++	return -EOPNOTSUPP;
++}
++static inline int io_buffer_unregister(struct io_uring_cmd *cmd,
++				       unsigned int index,
++				       unsigned int issue_flags)
++{
++	return -EOPNOTSUPP;
++}
+ #endif
+ 
+ static inline struct io_uring_cmd *io_uring_cmd_from_tw(struct io_tw_req tw_req)
+@@ -232,10 +252,4 @@ static inline void io_uring_cmd_done32(struct io_uring_cmd *ioucmd, s32 ret,
+ 	return __io_uring_cmd_done(ioucmd, ret, res2, issue_flags, true);
+ }
+ 
+-int io_buffer_register_bvec(struct io_uring_cmd *cmd, struct request *rq,
+-			    void (*release)(void *), unsigned int index,
+-			    unsigned int issue_flags);
+-int io_buffer_unregister_bvec(struct io_uring_cmd *cmd, unsigned int index,
+-			      unsigned int issue_flags);
+-
+ #endif /* _LINUX_IO_URING_CMD_H */
+diff --git a/io_uring/rsrc.c b/io_uring/rsrc.c
+index 2d42061bc..bab78fd48 100644
+--- a/io_uring/rsrc.c
++++ b/io_uring/rsrc.c
+@@ -936,9 +936,9 @@ int io_sqe_buffers_register(struct io_ring_ctx *ctx, void __user *arg,
+ 	return ret;
+ }
+ 
+-int io_buffer_register_bvec(struct io_uring_cmd *cmd, struct request *rq,
+-			    void (*release)(void *), unsigned int index,
+-			    unsigned int issue_flags)
++int io_buffer_register_request(struct io_uring_cmd *cmd, struct request *rq,
++			       void (*release)(void *), unsigned int index,
++			       unsigned int issue_flags)
+ {
+ 	struct io_ring_ctx *ctx = cmd_to_io_kiocb(cmd)->ctx;
+ 	struct io_rsrc_data *data = &ctx->buf_table;
+@@ -998,10 +998,10 @@ int io_buffer_register_bvec(struct io_uring_cmd *cmd, struct request *rq,
+ 	io_ring_submit_unlock(ctx, issue_flags);
+ 	return ret;
+ }
+-EXPORT_SYMBOL_GPL(io_buffer_register_bvec);
++EXPORT_SYMBOL_GPL(io_buffer_register_request);
+ 
+-int io_buffer_unregister_bvec(struct io_uring_cmd *cmd, unsigned int index,
+-			      unsigned int issue_flags)
++int io_buffer_unregister(struct io_uring_cmd *cmd, unsigned int index,
++			 unsigned int issue_flags)
+ {
+ 	struct io_ring_ctx *ctx = cmd_to_io_kiocb(cmd)->ctx;
+ 	struct io_rsrc_data *data = &ctx->buf_table;
+@@ -1031,7 +1031,7 @@ int io_buffer_unregister_bvec(struct io_uring_cmd *cmd, unsigned int index,
+ 	io_ring_submit_unlock(ctx, issue_flags);
+ 	return ret;
+ }
+-EXPORT_SYMBOL_GPL(io_buffer_unregister_bvec);
++EXPORT_SYMBOL_GPL(io_buffer_unregister);
+ 
+ static int validate_fixed_range(u64 buf_addr, size_t len,
+ 				const struct io_mapped_ubuf *imu)
+-- 
+2.55.0
+

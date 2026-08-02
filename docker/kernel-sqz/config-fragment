@@ -1,0 +1,55 @@
+# sqz kernel config fragment — applied on top of the field client's
+# running config (/boot/config-7.1.2-1.el8.elrepo.x86_64) after
+# `make olddefconfig`. Every `=y`/`=m` line here is asserted present in
+# the final .config by build-kernel.sh (fail loud, never silent).
+#
+# The sqz tag (non-negotiable, user 2026-08-02): uname -r must carry it.
+CONFIG_LOCALVERSION="-sqz"
+CONFIG_LOCALVERSION_AUTO=n
+
+# --- interface-frontier enables -------------------------------------
+# io_uring zcrx lane (def_bool y once deps hold; asserted anyway).
+CONFIG_IO_URING=y
+CONFIG_IO_URING_ZCRX=y
+# FUSE + fuse-over-io_uring (the kmbuf/zc series rides these — the
+# series adds NO new Kconfig symbols; surface is FUSE 7.46 uapi +
+# IORING_REGISTER_KMBUF_RING).
+CONFIG_FUSE_FS=m
+CONFIG_FUSE_IO_URING=y
+# devmem-TCP cell: host-RAM dma-buf source (frontier census found it
+# absent on the ELRepo build).
+CONFIG_UDMABUF=y
+CONFIG_DMA_SHARED_BUFFER=y
+CONFIG_NET_DEVMEM=y
+# CONFIG_ULP_DDP: does NOT exist in the 6.19.14 tree (the NVIDIA
+# nvme-tcp DDP patchset was never merged upstream) — documented
+# absence, nothing to enable. Re-check on every rebase.
+
+# --- mlx5 / ConnectX-7 (tcp-data-split + queue mgmt ride these) ------
+CONFIG_MLX5_CORE=m
+CONFIG_MLX5_CORE_EN=y
+CONFIG_MLX5_EN_ARFS=y
+CONFIG_MLX5_EN_RXNFC=y
+CONFIG_MLX5_CORE_EN_DCB=y
+CONFIG_MLX5_CLS_ACT=y
+CONFIG_MLX5_SW_STEERING=y
+CONFIG_PAGE_POOL=y
+
+# --- storage / dev-substrate parity ----------------------------------
+CONFIG_NVME_CORE=m
+CONFIG_BLK_DEV_NVME=m
+CONFIG_NVME_FABRICS=m
+CONFIG_NVME_TCP=m
+CONFIG_NVME_TARGET=m
+CONFIG_NVME_TARGET_TCP=m
+CONFIG_NVME_TARGET_LOOP=m
+CONFIG_BLK_DEV_NULL_BLK=m
+CONFIG_ZRAM=m
+CONFIG_BLK_DEV_RAM=m
+
+# --- keep parity with the ELRepo posture ------------------------------
+CONFIG_DEBUG_INFO_BTF=y
+CONFIG_DEBUG_INFO_BTF_MODULES=y
+CONFIG_MODULE_SIG=y
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y

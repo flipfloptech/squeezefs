@@ -1,0 +1,48 @@
+From 75969171934c9df2b60e42c027806938b430f969 Mon Sep 17 00:00:00 2001
+From: Joanne Koong <joannelkoong@gmail.com>
+Date: Fri, 16 Jan 2026 15:30:31 -0800
+Subject: [PATCH 12/26] io_uring/cmd: set selected buffer index in
+ __io_uring_cmd_done()
+
+When uring_cmd operations select a buffer, the completion queue entry
+should indicate which buffer was selected.
+
+Set IORING_CQE_F_BUFFER on the completed entry and encode the buffer
+index if a buffer was selected.
+
+This will be needed for fuse, which needs to relay to userspace which
+selected buffer contains the data.
+
+Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
+Tested-by: syzbot@syzkaller.appspotmail.com
+---
+ io_uring/uring_cmd.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/io_uring/uring_cmd.c b/io_uring/uring_cmd.c
+index 197474911..8eaea4023 100644
+--- a/io_uring/uring_cmd.c
++++ b/io_uring/uring_cmd.c
+@@ -142,6 +142,7 @@ void __io_uring_cmd_done(struct io_uring_cmd *ioucmd, s32 ret, u64 res2,
+ 		       unsigned issue_flags, bool is_cqe32)
+ {
+ 	struct io_kiocb *req = cmd_to_io_kiocb(ioucmd);
++	u32 cflags = 0;
+ 
+ 	if (WARN_ON_ONCE(req->flags & REQ_F_APOLL_MULTISHOT))
+ 		return;
+@@ -151,7 +152,10 @@ void __io_uring_cmd_done(struct io_uring_cmd *ioucmd, s32 ret, u64 res2,
+ 	if (ret < 0)
+ 		req_set_fail(req);
+ 
+-	io_req_set_res(req, ret, 0);
++	if (req->flags & (REQ_F_BUFFER_SELECTED | REQ_F_BUFFER_RING))
++		cflags |= IORING_CQE_F_BUFFER |
++			(req->buf_index << IORING_CQE_BUFFER_SHIFT);
++	io_req_set_res(req, ret, cflags);
+ 	if (is_cqe32) {
+ 		if (req->ctx->flags & IORING_SETUP_CQE_MIXED)
+ 			req->cqe.flags |= IORING_CQE_F_32;
+-- 
+2.55.0
+

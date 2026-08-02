@@ -1,0 +1,62 @@
+From fd60a04040ee6efaef3b04350cd041f148e8ac3a Mon Sep 17 00:00:00 2001
+From: Joanne Koong <joannelkoong@gmail.com>
+Date: Fri, 16 Jan 2026 15:30:21 -0800
+Subject: [PATCH 02/26] io_uring/kbuf: rename io_unregister_pbuf_ring() to
+ io_unregister_buf_ring()
+
+Use the more generic name io_unregister_buf_ring() as this function will
+be used for unregistering both provided buffer rings and kernel-managed
+buffer rings.
+
+This is a preparatory change for upcoming kernel-managed buffer ring
+support.
+
+Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
+---
+ io_uring/kbuf.c     | 2 +-
+ io_uring/kbuf.h     | 2 +-
+ io_uring/register.c | 2 +-
+ 3 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/io_uring/kbuf.c b/io_uring/kbuf.c
+index d20c63344..4b3454b84 100644
+--- a/io_uring/kbuf.c
++++ b/io_uring/kbuf.c
+@@ -739,7 +739,7 @@ ret = io_buffer_add_list(ctx, bl, reg.bgid);
+ 	return 0;
+ }
+ 
+-int io_unregister_pbuf_ring(struct io_ring_ctx *ctx, void __user *arg)
++int io_unregister_buf_ring(struct io_ring_ctx *ctx, void __user *arg)
+ {
+ 	struct io_uring_buf_reg reg;
+ 	struct io_buffer_list *bl;
+diff --git a/io_uring/kbuf.h b/io_uring/kbuf.h
+index bf15e2652..40b44f4fd 100644
+--- a/io_uring/kbuf.h
++++ b/io_uring/kbuf.h
+@@ -74,7 +74,7 @@ int io_provide_buffers_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe
+ int io_manage_buffers_legacy(struct io_kiocb *req, unsigned int issue_flags);
+ 
+ int io_register_pbuf_ring(struct io_ring_ctx *ctx, void __user *arg);
+-int io_unregister_pbuf_ring(struct io_ring_ctx *ctx, void __user *arg);
++int io_unregister_buf_ring(struct io_ring_ctx *ctx, void __user *arg);
+ int io_register_pbuf_status(struct io_ring_ctx *ctx, void __user *arg);
+ 
+ bool io_kbuf_recycle_legacy(struct io_kiocb *req, unsigned issue_flags);
+diff --git a/io_uring/register.c b/io_uring/register.c
+index ff9d75ffb..64f61d3d9 100644
+--- a/io_uring/register.c
++++ b/io_uring/register.c
+@@ -765,7 +765,7 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
+ 		ret = -EINVAL;
+ 		if (!arg || nr_args != 1)
+ 			break;
+-		ret = io_unregister_pbuf_ring(ctx, arg);
++		ret = io_unregister_buf_ring(ctx, arg);
+ 		break;
+ 	case IORING_REGISTER_SYNC_CANCEL:
+ 		ret = -EINVAL;
+-- 
+2.55.0
+

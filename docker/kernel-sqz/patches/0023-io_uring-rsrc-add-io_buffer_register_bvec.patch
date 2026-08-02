@@ -1,0 +1,91 @@
+From 2186bc1fed9042d44b917d357b1172c4c8091275 Mon Sep 17 00:00:00 2001
+From: Joanne Koong <joannelkoong@gmail.com>
+Date: Fri, 16 Jan 2026 15:30:42 -0800
+Subject: [PATCH 23/26] io_uring/rsrc: add io_buffer_register_bvec()
+
+Add io_buffer_register_bvec() for registering a bvec array.
+
+This is a preparatory patch for fuse-over-io-uring zero-copy.
+
+Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
+Reviewed-by: Caleb Sander Mateos <csander@purestorage.com>
+---
+ include/linux/io_uring/cmd.h | 12 ++++++++++++
+ io_uring/rsrc.c              | 31 +++++++++++++++++++++++++++++++
+ 2 files changed, 43 insertions(+)
+
+diff --git a/include/linux/io_uring/cmd.h b/include/linux/io_uring/cmd.h
+index 73f8ff931..7dde6e2af 100644
+--- a/include/linux/io_uring/cmd.h
++++ b/include/linux/io_uring/cmd.h
+@@ -107,6 +107,9 @@ bool io_uring_is_kmbuf_ring(struct io_uring_cmd *cmd, unsigned int buf_group,
+ int io_buffer_register_request(struct io_uring_cmd *cmd, struct request *rq,
+ 			       void (*release)(void *), unsigned int index,
+ 			       unsigned int issue_flags);
++int io_buffer_register_bvec(struct io_uring_cmd *cmd, const struct bio_vec *bvs,
++			    unsigned int nr_bvecs, unsigned int total_bytes,
++			    u8 dir, unsigned int index, unsigned int issue_flags);
+ int io_buffer_unregister(struct io_uring_cmd *cmd, unsigned int index,
+ 			 unsigned int issue_flags);
+ #else
+@@ -197,6 +200,15 @@ static inline int io_buffer_register_request(struct io_uring_cmd *cmd,
+ {
+ 	return -EOPNOTSUPP;
+ }
++static inline int io_buffer_register_bvec(struct io_uring_cmd *cmd,
++					  const struct bio_vec *bvs,
++					  unsigned int nr_bvecs,
++					  unsigned int total_bytes, u8 dir,
++					  unsigned int index,
++					  unsigned int issue_flags)
++{
++	return -EOPNOTSUPP;
++}
+ static inline int io_buffer_unregister(struct io_uring_cmd *cmd,
+ 				       unsigned int index,
+ 				       unsigned int issue_flags)
+diff --git a/io_uring/rsrc.c b/io_uring/rsrc.c
+index 5b895256e..e480e067d 100644
+--- a/io_uring/rsrc.c
++++ b/io_uring/rsrc.c
+@@ -1019,6 +1019,37 @@ int io_buffer_register_request(struct io_uring_cmd *cmd, struct request *rq,
+ }
+ EXPORT_SYMBOL_GPL(io_buffer_register_request);
+ 
++/*
++ * This internally makes a copy of the bio_vec array. The memory bvs points to
++ * can be freed as soon as this returns.
++ */
++int io_buffer_register_bvec(struct io_uring_cmd *cmd, const struct bio_vec *bvs,
++			    unsigned int nr_bvecs, unsigned int total_bytes,
++			    u8 dir, unsigned int index,
++			    unsigned int issue_flags)
++{
++	struct io_ring_ctx *ctx = cmd_to_io_kiocb(cmd)->ctx;
++	struct io_mapped_ubuf *imu;
++	struct bio_vec *bvec;
++	unsigned int i;
++
++	io_ring_submit_lock(ctx, issue_flags);
++	imu = io_kernel_buffer_init(ctx, nr_bvecs, total_bytes, dir, NULL,
++				    NULL, index);
++	if (IS_ERR(imu)) {
++		io_ring_submit_unlock(ctx, issue_flags);
++		return PTR_ERR(imu);
++	}
++
++	bvec = imu->bvec;
++	for (i = 0; i < nr_bvecs; i++)
++		bvec[i] = bvs[i];
++
++	io_ring_submit_unlock(ctx, issue_flags);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(io_buffer_register_bvec);
++
+ int io_buffer_unregister(struct io_uring_cmd *cmd, unsigned int index,
+ 			 unsigned int issue_flags)
+ {
+-- 
+2.55.0
+

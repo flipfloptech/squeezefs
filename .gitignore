@@ -25,3 +25,6 @@ dhat-heap.json
 
 # Proprietary exa client performance scripts
 exa-client-performance-scripts/
+# sqz kernel program scratch (tarballs, extracted trees, mboxes)
+.kernel-sqz-work/
+dist/

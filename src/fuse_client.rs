@@ -6858,6 +6858,34 @@ impl SqueezefsFilesystem {
             .unwrap_or(0)
     }
 
+    /// RES-13 residency probe: whether `dir` still has a generation
+    /// ENTRY (distinct from reading generation 0, which a swept
+    /// directory also reports) — `tests/forget_sweep_tests.rs`.
+    pub fn dir_gen_holds(&self, dir: u64) -> bool {
+        self.dir_gen.contains_sync(&dir)
+    }
+
+    /// RES-13 residency probe: whether `ino` is latched killpriv-clean.
+    pub fn killpriv_clean_holds(&self, ino: u64) -> bool {
+        self.killpriv_clean.contains_sync(&ino)
+    }
+
+    /// RES-13: drop the per-inode side-map entries the kernel just told
+    /// us it no longer references.
+    ///
+    /// `dir_gen` and `killpriv_clean` grow with the set of inodes a mount
+    /// has TOUCHED, not with the set it holds; every other per-inode side
+    /// structure (`attr_cache`, `active_inode_locks`, the reclaim
+    /// enqueue) is already swept on FORGET, so these two were omissions.
+    /// Both drops are fail-safe: a swept directory reads generation 0, so
+    /// a readdir snapshot built under a nonzero generation can never
+    /// match again; a swept killpriv latch just means the next
+    /// priv-checked write re-reads the state it would have cached.
+    fn forget_side_maps(&self, ino: u64) {
+        self.dir_gen.remove_sync(&ino);
+        self.killpriv_clean.remove_sync(&ino);
+    }
+
     /// Bump a directory's readdir-snapshot generation (PR M4 D1.c) — the
     /// allocation-free replacement for the per-op
     /// `dir_entry_cache_v3.invalidate(&parent)`: an `scc` bucket read +
@@ -15909,6 +15937,8 @@ impl Filesystem for SqueezefsFilesystem {
         let _prof = OpProf::begin(FuseOpKind::Forget, ino);
         self.attr_cache.invalidate(&ino);
         self.active_inode_locks.remove(&ino);
+        // RES-13: the two per-inode side maps FORGET used to walk past.
+        self.forget_side_maps(ino);
         // Reclaim inodes that reached nlink==0 while still open (unlink/14.t).
         self.queue_reclaim_inode(ino);
     }
@@ -15927,6 +15957,10 @@ impl Filesystem for SqueezefsFilesystem {
         for &ino in inodes {
             self.attr_cache.invalidate(&ino);
             self.active_inode_locks.remove(&ino);
+            // RES-13: exactly like N FORGETs — and this IS the
+            // drop_caches / memory-pressure path, i.e. exactly when the
+            // unswept side maps matter.
+            self.forget_side_maps(ino);
             self.queue_reclaim_inode(ino);
         }
     }

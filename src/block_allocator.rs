@@ -170,6 +170,20 @@ pub struct BlockAllocator {
     /// `free_block` retires it (gen+1, stable=0). A fill may publish into the
     /// caches only if the word was stable before its device read and unchanged
     /// after — anything else returns bytes to the caller uncached.
+    ///
+    /// **RES-13 recorded ceiling** (pre-RC engineering spec §7): one
+    /// entry per distinct device OFFSET this volume has ever allocated,
+    /// so the map is bounded by the volume GEOMETRY — `capacity /
+    /// chunk_size` entries, ~40 B each (a 100 TB volume at the shipped
+    /// 4 MiB block: ~25 M offsets ≈ 1 GB at full lifetime coverage,
+    /// reached only by a volume that has written every block). It grows
+    /// with the address space, never with time or op count, and it
+    /// deliberately has NO removal path: the incarnation counter must
+    /// stay monotone per offset for the seqlock's whole point — a
+    /// reclaimed entry would restart at generation 0 and let a stale
+    /// in-flight fill pass its after-check against a reused offset (the
+    /// generic/074 stale-fill family). Bound it by shrinking the address
+    /// space (larger blocks), never by evicting entries.
     incarnations: scc::HashMap<u64, AtomicU64>,
 }
 

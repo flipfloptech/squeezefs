@@ -299,6 +299,17 @@ struct Invalidator {
     /// ino → last write-fired instant (latch-free; bounded by the set of
     /// ring-written inos — entries are two words, never reclaimed within
     /// a mount, same leak class as the shim's fd-table cells).
+    ///
+    /// **RES-13 recorded ceiling** (pre-RC engineering spec §7): one
+    /// 24-byte entry per distinct ino ever written THROUGH THE RING on
+    /// this mount — i.e. per intercepted-client write target, not per
+    /// mount inode. A 1 M-file il ingest costs ~24 MB. Deliberately kept
+    /// unreclaimed rather than swept: the only correct sweep signal is
+    /// the ino's death, the invalidation window is a rate limiter (a lost
+    /// entry costs one extra `notify_inval_inode`, never correctness),
+    /// and the map is NOT on the FUSE inode-lifetime path — the il
+    /// session host has no FORGET. If this ever needs a bound, prune by
+    /// `window` age on insert; do not tie it to FUSE forget.
     last_write: scc::HashMap<u64, std::time::Instant>,
     /// POSIX-8: ino → the highest end offset any ring write has reached
     /// (the announced-size high-water). A write past it can only be a

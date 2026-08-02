@@ -1179,10 +1179,43 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             init_flags2,
         ));
 
-        let reply_flags = negotiate_reply_flags(init_in.flags, &self.mount_options);
+        // Required: always advertise FUSE_OVER_IO_URING. No opt-out.
+        #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+        let flags2 = {
+            debug!("advertising FUSE_OVER_IO_URING in init flags2");
+            crate::raw::connection::fuse_over_uring::FUSE_OVER_IO_URING_FLAGS2
+        };
+        // Non-Linux / non-tokio builds cannot use over-uring (SqueezeFS is Linux-only).
+        #[cfg(not(all(target_os = "linux", feature = "tokio-runtime")))]
+        let flags2 = 0u32;
+
+        // sqz FUSE_TIME_LIMITS (kernel-sqz patch 0027): when the kernel
+        // offered folded capability bit 62, echo it and carry the daemon's
+        // exact-round-trip inode-timestamp range so VFS
+        // timestamp_truncate() clamps incore exactly where the daemon
+        // clamps durable state (fstests generic/634 becomes expected-PASS
+        // on sqz-kernel hosts; the fleet-kernel adjudication stays
+        // pinned). Stock kernels never offer the bit: fields stay zero and
+        // the reply is bit-identical to the pre-0027 daemon.
+        let time_limits =
+            negotiate_time_limits((init_in.flags as u64) | ((init_flags2 as u64) << 32));
+        let flags2 = if time_limits.is_some() {
+            debug!("advertising FUSE_TIME_LIMITS in init flags2 (sqz kernel offered bit 62)");
+            flags2 | ((FUSE_TIME_LIMITS >> 32) as u32)
+        } else {
+            flags2
+        };
+        let (time_min, time_max) = time_limits.unwrap_or((0, 0));
+
+        // FUSE-1: the reply minor and the FUSE_INIT_EXT header bit — what
+        // makes the kernel's process_init_reply() fold `flags2` into the
+        // capability word instead of discarding it (see negotiate_init_ext).
+        let (reply_minor, init_ext) = negotiate_init_ext(init_in.minor, init_in.flags, flags2);
+        let reply_flags = negotiate_reply_flags(init_in.flags, &self.mount_options) | init_ext;
         // Published BEFORE `fs.init` (like KERNEL_INIT above) so the
         // filesystem's init hook can gauge what was actually accepted
-        // (fuse_killpriv_negotiated et al.).
+        // (fuse_killpriv_negotiated et al.). Carries the full advertised
+        // word, FUSE_INIT_EXT included when it rides the reply.
         let _ = NEGOTIATED_REPLY_FLAGS.set(reply_flags);
 
         // TODO: pass init_in to init, so the file system will know which flags are in use.
@@ -1211,34 +1244,6 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
             Ok(reply) => reply,
         };
-
-        // Required: always advertise FUSE_OVER_IO_URING. No opt-out.
-        #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
-        let flags2 = {
-            debug!("advertising FUSE_OVER_IO_URING in init flags2");
-            crate::raw::connection::fuse_over_uring::FUSE_OVER_IO_URING_FLAGS2
-        };
-        // Non-Linux / non-tokio builds cannot use over-uring (SqueezeFS is Linux-only).
-        #[cfg(not(all(target_os = "linux", feature = "tokio-runtime")))]
-        let flags2 = 0u32;
-
-        // sqz FUSE_TIME_LIMITS (kernel-sqz patch 0027): when the kernel
-        // offered folded capability bit 62, echo it and carry the daemon's
-        // exact-round-trip inode-timestamp range so VFS
-        // timestamp_truncate() clamps incore exactly where the daemon
-        // clamps durable state (fstests generic/634 becomes expected-PASS
-        // on sqz-kernel hosts; the fleet-kernel adjudication stays
-        // pinned). Stock kernels never offer the bit: fields stay zero and
-        // the reply is bit-identical to the pre-0027 daemon.
-        let time_limits =
-            negotiate_time_limits((init_in.flags as u64) | ((init_flags2 as u64) << 32));
-        let flags2 = if time_limits.is_some() {
-            debug!("advertising FUSE_TIME_LIMITS in init flags2 (sqz kernel offered bit 62)");
-            flags2 | ((FUSE_TIME_LIMITS >> 32) as u32)
-        } else {
-            flags2
-        };
-        let (time_min, time_max) = time_limits.unwrap_or((0, 0));
 
         // L1 (IOPS-parity program): resolve the session transport geometry
         // BEFORE serializing the INIT reply, so the `max_background` /
@@ -1279,7 +1284,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         let init_out = fuse_init_out {
             major: FUSE_KERNEL_VERSION,
-            minor: FUSE_KERNEL_MINOR_VERSION,
+            minor: reply_minor,
             max_readahead: init_in.max_readahead,
             flags: reply_flags,
             max_background,
@@ -4932,6 +4937,38 @@ fn negotiate_time_limits(kernel_capabilities: u64) -> Option<(i64, i64)> {
     }
 }
 
+/// FUSE-1 (docs/pre-rc-engineering-spec.md §4, pulled forward by
+/// execution-plan ruling D6): the INIT reply's protocol minor and
+/// `FUSE_INIT_EXT` header bit. Mainline `process_init_reply()` folds the
+/// reply's `flags2` into the 64-bit capability word ONLY when the reply
+/// sets `FUSE_INIT_EXT` in `flags` (fs/fuse/inode.c — and the fold's
+/// semantics are the 7.36 extended-init contract), so a minor-31 /
+/// no-`FUSE_INIT_EXT` reply makes the kernel DISCARD the daemon's entire
+/// `flags2`: `FUSE_OVER_IO_URING` (bit 41) then engages only through the
+/// kernel's `enable_uring` module-param side door with `fc->io_uring`
+/// stuck at 0 (no `fuse_block_alloc` arm-window gating), and sqz
+/// `FUSE_TIME_LIMITS` (bit 62, kernel-sqz patch 0027) has no side door at
+/// all — the reset-v5 window's generic/634 row tests a structurally
+/// disengaged arm.
+///
+/// Contract (pinned by `init_negotiation_tests`), returns
+/// `(reply_minor, init_ext_bit)`:
+/// - reply minor = `min(kernel_minor, FUSE_KERNEL_MINOR_VERSION)` — the
+///   daemon never claims a protocol minor the kernel did not offer (the
+///   kernel stores the reply verbatim as `fc->minor` and gates compat
+///   behavior on it);
+/// - `FUSE_INIT_EXT` rides the reply iff the kernel OFFERED it AND the
+///   reply carries a nonzero `flags2` — never invented toward pre-7.36
+///   kernels (they treat bit 30 as garbage), and a zero `flags2` has
+///   nothing to fold.
+fn negotiate_init_ext(kernel_minor: u32, kernel_flags: u32, reply_flags2: u32) -> (u32, u32) {
+    // Skeleton — the pre-FUSE-1 posture verbatim (minor pin 31, the bit
+    // never set: the two independent reasons the kernel discards flags2);
+    // implementation follows the red tests.
+    let _ = (kernel_minor, kernel_flags, reply_flags2);
+    (FUSE_KERNEL_MINOR_VERSION, 0)
+}
+
 fn negotiate_reply_flags(init_in_flags: u32, mount_options: &MountOptions) -> u32 {
     let mut reply_flags = 0;
 
@@ -5376,6 +5413,120 @@ mod init_negotiation_tests {
             "FUSE_HANDLE_KILLPRIV_V2 echoed without MountOptions::handle_killpriv_v2 \
              — the kernel would stop killing privs and nothing would"
         );
+    }
+
+    /// FUSE-1 (pre-rc spec §4, D6 pulled forward): every INIT reply
+    /// carrying a nonzero `flags2` must set `FUSE_INIT_EXT` in `flags`
+    /// AND report minor ≥ 36 — mainline `process_init_reply()` folds the
+    /// reply's `flags2` into the capability word only under exactly that
+    /// shape. Without both, the kernel discards the daemon's whole
+    /// `flags2`: `FUSE_OVER_IO_URING` (bit 41) survives only via the
+    /// module-param side door (`fc->io_uring` stays 0 — no
+    /// `fuse_block_alloc` arm-window gating), and sqz `FUSE_TIME_LIMITS`
+    /// (bit 62, patch 0027) has no side door at all.
+    #[test]
+    fn init_ext_and_minor_36_ride_every_reply_with_nonzero_flags2() {
+        // The minor pin itself: 36 EXACTLY — the value the 31→36 audit
+        // covered (no fc->minor-gated kernel behavior exists in (23, 36];
+        // everything 7.32–7.36 rides INIT flags). Raising it further
+        // requires a fresh 36→N audit of every `fc->minor` gate — do not
+        // chase newer minors speculatively.
+        assert_eq!(
+            FUSE_KERNEL_MINOR_VERSION, 36,
+            "FUSE_KERNEL_MINOR_VERSION must be exactly 36 (the audited value); \
+             a different value needs its own kernel-gate audit"
+        );
+
+        // sqz-kernel shape: kernel offers INIT_EXT (all 7.36+ kernels do),
+        // reply flags2 = OVER_IO_URING + the TIME_LIMITS echo.
+        let flags2 = (1u32 << 9) | (1u32 << 30);
+        let (minor, ext) = negotiate_init_ext(45, FUSE_INIT_EXT | 0x0fff_ffff, flags2);
+        assert_eq!(
+            ext, FUSE_INIT_EXT,
+            "nonzero flags2 without FUSE_INIT_EXT in the reply is a discarded \
+             capability word (bit 41 AND bit 62)"
+        );
+        assert!(
+            minor >= 36,
+            "the kernel honors the flags2 fold under ≥ 7.36 reply semantics; \
+             got minor {minor}"
+        );
+
+        // Stock-kernel shape: OVER_IO_URING alone still needs the fold.
+        let (minor, ext) = negotiate_init_ext(40, FUSE_INIT_EXT, 1u32 << 9);
+        assert_eq!(ext, FUSE_INIT_EXT, "uring-only flags2 must still fold");
+        assert!(minor >= 36);
+    }
+
+    /// FUSE-1 guard: `FUSE_INIT_EXT` must NEVER be set toward a kernel
+    /// that did not offer it — pre-7.36 kernels never sent the bit and
+    /// treat reply bit 30 as garbage in a flags word they parse
+    /// classically. (The companion law: a capability the daemon does not
+    /// implement must never be advertised; a header-mechanics bit the
+    /// KERNEL does not speak must never be echoed either.)
+    #[test]
+    fn init_ext_never_invented_without_kernel_offer() {
+        let (_, ext) = negotiate_init_ext(35, !FUSE_INIT_EXT, 1u32 << 9);
+        assert_eq!(
+            ext, 0,
+            "FUSE_INIT_EXT invented toward a kernel that did not offer it"
+        );
+    }
+
+    /// FUSE-1 guard: a zero `flags2` has nothing to fold — the reply must
+    /// not set `FUSE_INIT_EXT` (the non-over-uring build shape; keeps the
+    /// reply bit-identical to the classical posture there).
+    #[test]
+    fn init_ext_absent_when_reply_flags2_zero() {
+        let (_, ext) = negotiate_init_ext(45, FUSE_INIT_EXT, 0);
+        assert_eq!(ext, 0, "FUSE_INIT_EXT with nothing to fold");
+    }
+
+    /// FUSE-1: the reply minor is `min(kernel_minor, ours)` — the daemon
+    /// never claims a protocol minor the kernel did not offer (the kernel
+    /// stores the reply verbatim as `fc->minor` and keys compat behavior
+    /// on it), and `FUSE_INIT_EXT` set implies ≥ 7.36 reply semantics
+    /// (structural: only ≥ 7.36 kernels offer the bit, and min() keeps 36).
+    #[test]
+    fn reply_minor_never_exceeds_kernel_offer_min_semantics() {
+        // Newer kernel than us: reply our own audited 36, never chase.
+        let (minor, _) = negotiate_init_ext(45, FUSE_INIT_EXT, 1u32 << 9);
+        assert_eq!(minor, 36, "kernel 7.45 offer must negotiate down to ours");
+        // Equal: 36.
+        let (minor, ext) = negotiate_init_ext(36, FUSE_INIT_EXT, 1u32 << 9);
+        assert_eq!(minor, 36);
+        assert_eq!(ext, FUSE_INIT_EXT);
+        // Older kernel than us: never exceed the kernel's offer.
+        for (km, kf, f2) in [
+            (31u32, 0u32, 0u32),
+            (31, !FUSE_INIT_EXT, 1 << 9),
+            (35, !FUSE_INIT_EXT, (1 << 9) | (1 << 30)),
+            (13, 0, 0),
+        ] {
+            let (minor, ext) = negotiate_init_ext(km, kf, f2);
+            assert!(
+                minor <= km,
+                "reply minor {minor} exceeds the kernel's offered {km} — the \
+                 kernel would store a minor it never spoke"
+            );
+            assert!(minor <= FUSE_KERNEL_MINOR_VERSION);
+            assert_eq!(ext, 0, "pre-7.36 offers can never carry INIT_EXT");
+        }
+        // The coherence law over the whole shape space: INIT_EXT ⇒ the
+        // kernel offered it, flags2 nonzero, and ≥ 7.36 reply semantics.
+        for km in [13u32, 27, 31, 35, 36, 40, 45, 99] {
+            for kf in [0u32, FUSE_INIT_EXT, u32::MAX, !FUSE_INIT_EXT] {
+                for f2 in [0u32, 1 << 9, (1 << 9) | (1 << 30)] {
+                    let (minor, ext) = negotiate_init_ext(km, kf, f2);
+                    assert!(minor <= km && minor <= FUSE_KERNEL_MINOR_VERSION);
+                    if ext != 0 {
+                        assert_eq!(ext, FUSE_INIT_EXT);
+                        assert!(kf & FUSE_INIT_EXT != 0 && f2 != 0);
+                        assert!(minor >= 36, "INIT_EXT under sub-7.36 reply semantics");
+                    }
+                }
+            }
+        }
     }
 }
 

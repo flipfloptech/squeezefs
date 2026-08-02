@@ -1,9 +1,59 @@
 # Design: the zcrx read lane — a userspace NVMe/TCP initiator for cold read fills
 
-Rev 1 — 2026-08-03. Branch `perf/zcrx-lane`. Status: **Phase-1 bracket GO**
-(`.benchmarks/2026-08-03-zcrx-lane.md`); PR Z1 (this branch) ships the
-initiator core + probes + gauges + opt-in wire-in; PR Z2 ships the zcrx
-recv backend; PR Z3 ships gather-serve + NUMA/steering hardening.
+Rev 2 — 2026-08-04. Branch `perf/zcrx-lane-z2` (Rev 1: `perf/zcrx-lane`,
+2026-08-03). Status: **Phase-1 bracket GO**
+(`.benchmarks/2026-08-03-zcrx-lane.md`); PR Z1 shipped the initiator
+core + probes + gauges + opt-in wire-in; **PR Z2 (this branch) ships the
+zcrx recv backend** — the area/refill/gather machinery, the steering
+state machine + live ethtool/netlink surface, and the raw
+`REGISTER_ZCRX_IFQ`/`RECV_ZC` driver (local contracts + loom;
+live-NIC execution field-owed — `.benchmarks/2026-08-04-zcrx-z2.md`);
+PR Z3 ships gather-serve fusion + default adjudication.
+
+**Rev 2 amendments (Z2 as built):**
+
+* **Completion-gather posture (Z2)**: a fill completes as a scatter list
+  of refcounted area spans (`ZcrxFill`); the funnel's destination is
+  filled by ONE gather pass at completion (`zcrx_gather_bytes` ≈
+  `zcrx_fill_bytes` in Z2). This keeps §4.4's pass count: the kernel
+  path's RX copy is replaced 1:1 by a userspace gather, which Z3 then
+  FUSES into `serve_copy_to_dest` (deleting the standalone pass — the
+  Phase-1 CPU win lands fully at Z3). Chunk-backed `Bytes` never crosses
+  the funnel in Z2: downstream tiers may retain served `Bytes`
+  indefinitely, and a pinned chunk is admission starvation — the area is
+  never a cache tier (§4.4 law, upheld by construction).
+* **Admission law**: in-flight admitted payload per queue ≤ HALF the
+  area (derived, floor one chunk) — the other half absorbs delivery
+  slack (short-recv fragmentation, headers riding payload chunks).
+  Parking counts `zcrx_area_admission_waits`; exhaustion backpressures
+  ADMISSION, never mid-stream (§4.3 pinned by the contract suite).
+* **Span-record refill (real backend)**: the recycle grain is the CQE
+  span (one rqe per span, off/len echoed); grant-ledger slots are span
+  RECORDS (count = area chunks; rqe ring 1:1 next-pow2 per §8), and the
+  ledger's free stack IS the refill feed — a freed record posts its rqe
+  before re-grant. Slot exhaustion (pathological frag) poisons loud.
+* **Ordering note**: per-queue TCP connect + IO Connect happen BEFORE
+  ifq registration (both before steering, which stays LAST — every
+  pre-steering refusal leaves the NIC byte-identical). Registration
+  runs ON the driver thread (SINGLE_ISSUER + DEFER_TASKRUN law) with a
+  ready→steer→go handshake; RECV_ZC arms only after steering.
+* **AREA_SIM contract venue**: `SQUEEZEFS_ZCRX_LANE_AREA_SIM=1` arms
+  the REAL area/parser/ledger/gather/poison machinery with socket recv
+  standing in for NIC DMA (chunk geometry shrinkable via the
+  `SQUEEZEFS_ZCRX_LANE_SIM_CHUNK` test lever to force header splits
+  across chunk seams). The io_uring syscall surface is exactly the seam
+  boundary — everything above it is contract-tested locally; never a
+  product posture.
+* **New gauges (§9 extension)**: `zcrx_area_bytes` (R5 `zcrx_area`
+  component source), `zcrx_gather_bytes` (the priced completion pass),
+  `zcrx_area_admission_waits` (honest backpressure),
+  `zcrx_lane_poisoned` (session poison transitions — must-stay-0
+  tripwire; poison also drops `zcrx_lane_armed` and the lane stays
+  kernel-path for the mount lifetime).
+* **R5**: Red blocks NEW lane arms (`arm_admission` in the ladder);
+  the `zcrx_area` component is non-sheddable (fixed registered DMA
+  memory) — in-flight converges by completion, teardown credits the
+  gauge.
 
 ## 1. Charter and the term this deletes
 
@@ -237,10 +287,16 @@ per §4.4.
   doc, Phase-1 evidence note. Bar: full cargo gate; read family +
   copy-ledger suites green; lane default-off inert (byte-identical
   paths proven by the no-arm contract test).
-* **Z2**: zcrx recv backend + steering/RSS netlink + field engagement
-  (fill provenance == area) + loaded soak in the field window. Bar:
-  engagement exact, `zcrx_frame_violations`=0, wedge tripwires 0,
-  A-B-B-A cold-read bracket vs `SQUEEZEFS_ZCRX_LANE=0`.
+* **Z2** (shipped 2026-08-04, `perf/zcrx-lane-z2` —
+  `.benchmarks/2026-08-04-zcrx-z2.md`): zcrx recv backend (area/refill/
+  gather + poison lattice + R5, contract-tested via AREA_SIM; grant
+  ledger loom-modeled, weakening-verified ×3), steering state machine
+  (mock-proven record/apply/rollback/restore/reap) + live EthtoolNic
+  (ioctl) + genetlink HDS probe, raw `REGISTER_ZCRX_IFQ`/`RECV_ZC`
+  driver. The FIELD bar carries to the reformat window (no zcrx-capable
+  NIC exists locally): engagement exact (fill provenance == area),
+  `zcrx_frame_violations`=0, wedge tripwires 0, A-B-B-A cold-read
+  bracket vs `SQUEEZEFS_ZCRX_LANE=0`, loaded soak.
 * **Z3**: gather-serve into `serve_copy_to_dest`, NUMA placement,
   Identify-verify hardening, derived-sizing retune, default-on
   adjudication. Bar: sustained-state rows both substrates + the

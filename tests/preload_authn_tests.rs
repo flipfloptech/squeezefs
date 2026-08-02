@@ -97,8 +97,16 @@ impl RogueDaemon {
     /// Spawn a rogue on an abstract name. `seal` selects whether the
     /// session memfd it hands back carries the required seals.
     fn abstract_rogue(name: &str, seal: bool) -> RogueDaemon {
+        Self::abstract_rogue_with(name, seal, 0)
+    }
+
+    /// [`Self::abstract_rogue`] whose `SessionOk` attaches `extra_fds`
+    /// EXTRA descriptors in the one `SCM_RIGHTS` cmsg (VAL-5a, client
+    /// side: the shim's own receive path must bound what a hostile
+    /// daemon can install in the APP's fd table).
+    fn abstract_rogue_with(name: &str, seal: bool, extra_fds: usize) -> RogueDaemon {
         let listener = abstract_listen(name);
-        Self::serve(listener, seal, name.to_string(), String::new())
+        Self::serve(listener, seal, extra_fds, name.to_string(), String::new())
     }
 
     /// Spawn a rogue on a filesystem-path socket (the OQ-6 rung).
@@ -107,12 +115,19 @@ impl RogueDaemon {
         Self::serve(
             listener,
             seal,
+            0,
             String::new(),
             path.to_string_lossy().into_owned(),
         )
     }
 
-    fn serve(listener: OwnedFd, seal: bool, socket: String, socket_path: String) -> RogueDaemon {
+    fn serve(
+        listener: OwnedFd,
+        seal: bool,
+        extra_fds: usize,
+        socket: String,
+        socket_path: String,
+    ) -> RogueDaemon {
         let log = Arc::new(std::sync::Mutex::new(RogueLog::default()));
         let thread_log = Arc::clone(&log);
         // SAFETY: dup of our own listener for the serving thread.
@@ -151,11 +166,21 @@ impl RogueDaemon {
                 }
                 let geometry = test_geometry();
                 let memfd = rogue_session_memfd(&geometry, seal);
-                let _ = send_ctl(
-                    &sock,
-                    &CtlMsg::SessionOk { geometry },
-                    Some(memfd.as_raw_fd()),
-                );
+                if extra_fds == 0 {
+                    let _ = send_ctl(
+                        &sock,
+                        &CtlMsg::SessionOk { geometry },
+                        Some(memfd.as_raw_fd()),
+                    );
+                } else {
+                    // One cmsg, many descriptors: the shape the daemon's
+                    // own recv_ctl now refuses (VAL-5a) — the shim must
+                    // refuse it too, or a hostile daemon fills the app's
+                    // fd table one establish at a time.
+                    let mut fds = vec![memfd.as_raw_fd(); 1 + extra_fds];
+                    fds[0] = memfd.as_raw_fd();
+                    send_session_ok_many_fds(&sock, geometry, &fds);
+                }
                 // Keep the connection alive for the client's lifetime
                 // check; the listener shutdown ends this thread.
                 std::thread::sleep(Duration::from_millis(200));
@@ -262,6 +287,36 @@ fn path_listen(path: &std::path::Path) -> OwnedFd {
     // SAFETY: listen(2).
     assert_eq!(unsafe { libc::listen(fd.as_raw_fd(), 8) }, 0, "listen");
     fd
+}
+
+/// Send a `SessionOk` with `fds` attached in ONE `SCM_RIGHTS` cmsg (the
+/// hostile multi-descriptor shape; the honest daemon always sends one).
+fn send_session_ok_many_fds(sock: &UnixStream, geometry: Geometry, fds: &[std::os::fd::RawFd]) {
+    let bytes = CtlMsg::SessionOk { geometry }.encode();
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_ptr() as *mut libc::c_void,
+        iov_len: bytes.len(),
+    };
+    let payload = std::mem::size_of_val(fds);
+    // SAFETY: CMSG_SPACE with a runtime length; the buffer is sized from it.
+    let space = unsafe { libc::CMSG_SPACE(payload as u32) } as usize;
+    let mut cmsg_buf = vec![0u8; space];
+    // SAFETY: zeroed msghdr is a valid all-default value.
+    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    hdr.msg_iov = &mut iov;
+    hdr.msg_iovlen = 1;
+    hdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    hdr.msg_controllen = space as libc::size_t;
+    // SAFETY: standard CMSG_FIRSTHDR/CMSG_DATA over the buffer sized above.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&hdr);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(payload as u32) as libc::size_t;
+        std::ptr::copy_nonoverlapping(fds.as_ptr() as *const u8, libc::CMSG_DATA(cmsg), payload);
+    }
+    // SAFETY: sendmsg with the msghdr assembled above.
+    unsafe { libc::sendmsg(sock.as_raw_fd(), &hdr, libc::MSG_NOSIGNAL) };
 }
 
 /// A session memfd shaped exactly like the daemon's — optionally WITHOUT
@@ -450,6 +505,37 @@ fn shim_accepts_a_fully_sealed_session_memfd() {
     let (datagrams, cred_fds) = rogue.log();
     assert_eq!(datagrams, 1, "one HELLO");
     assert_eq!(cred_fds, 1, "the credential fd rides the accepted HELLO");
+}
+
+/// VAL-5a, client side: the shim's `recv_ctl` mirrors the daemon's
+/// bound. A hostile daemon that attaches 12 descriptors to one
+/// `SessionOk` must not install 11 unowned fds in the APP's fd table —
+/// the shim retries establish on every eligible open by design, so a
+/// per-establish leak is process-lifetime fd exhaustion in a program
+/// that never asked for any of this.
+#[test]
+fn shim_refuses_a_session_reply_carrying_extra_descriptors() {
+    let name = format!("sqz-il0-rogue-fds-{}", std::process::id());
+    let rogue = RogueDaemon::abstract_rogue_with(&name, true, 11);
+    let (_dir, f) = cred_file("fds");
+    let before = open_fd_count();
+    let err = match Session::establish(&rogue.blob(), f.as_raw_fd(), TEST_COMMIT, my_uid()) {
+        Ok(_) => panic!("VAL-5a: the shim accepted a 12-descriptor SessionOk"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, SessionError::Protocol),
+        "extra attachments are a protocol violation, got {err:?}"
+    );
+    // Repeat: a leak shows as monotonic growth across establishes.
+    for _ in 0..16 {
+        let _ = Session::establish(&rogue.blob(), f.as_raw_fd(), TEST_COMMIT, my_uid());
+    }
+    let after = open_fd_count();
+    assert!(
+        after <= before + 4,
+        "VAL-5a: the shim installed descriptors it never closes: {before} → {after}"
+    );
 }
 
 // ---------------------------------------------------------------------------

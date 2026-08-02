@@ -182,11 +182,26 @@ impl ClassicalInflight {
 pub struct FuseConnection {
     unmount_notify: Arc<Notify>,
     mode: ConnectionMode,
-    /// Optional kernel FUSE-over-io_uring pool (Linux 6.14+). Shared across multi-queue clones.
+    /// Optional kernel FUSE-over-io_uring pool (Linux 6.14+). Shared across
+    /// multi-queue clones. Lock-free slot (PERF-2): the request path reads
+    /// it 4× per op (dispatch venue, reply venue, payload resolve, ready
+    /// gate) while it is only written twice per session (install after
+    /// INIT, teardown at disconnect/DESTROY) — the former process-global
+    /// mutex was ~4 M lock RMWs/s of pure overhead at 1 M IOPS, one cache
+    /// line shared by every connection clone. `OnceLock` makes install
+    /// atomic-once; teardown NEVER empties the slot — liveness rides the
+    /// pool's own `ready`/`active` atomics (`over_uring_slot_tests`
+    /// contract 2), so a lock-free venue read can never race a tear-out.
+    /// DELIBERATELY not arc-swap (P2 md-storm forensics, kept from the
+    /// mutex era's rationale): arc_swap loads/stores share one
+    /// process-global debt registry, so high-rate guard traffic from the
+    /// transport threads lengthened every kv node-snapshot `store()`'s
+    /// pay_all walk on the serialized conveyor path (−10 % create/del
+    /// storms). `OnceLock::get` is a plain acquire load — no registry, no
+    /// RMW.
     #[cfg(target_os = "linux")]
-    pub(crate) over_uring: std::sync::Arc<
-        std::sync::Mutex<Option<std::sync::Arc<super::fuse_over_uring::FuseOverUring>>>,
-    >,
+    over_uring:
+        std::sync::Arc<std::sync::OnceLock<std::sync::Arc<super::fuse_over_uring::FuseOverUring>>>,
     /// Uniques delivered via classical `/dev/fuse` (INIT, the REGISTER handoff,
     /// and the post-arm classical sideband). Replies for these must use
     /// classical write even after the uring pool is armed.
@@ -247,7 +262,7 @@ impl FuseConnection {
             Ok(Self {
                 unmount_notify,
                 mode: ConnectionMode::Block(connection),
-                over_uring: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                over_uring: std::sync::Arc::new(std::sync::OnceLock::new()),
                 classical_inflight: std::sync::Arc::new(ClassicalInflight::new()),
                 assigned_qid: None,
                 classical_sideband: std::sync::atomic::AtomicBool::new(false),
@@ -270,7 +285,7 @@ impl FuseConnection {
     pub(crate) fn over_uring_pool(
         &self,
     ) -> Option<std::sync::Arc<super::fuse_over_uring::FuseOverUring>> {
-        self.over_uring.lock().unwrap().clone()
+        self.over_uring.get().cloned()
     }
 
     /// Start kernel FUSE-over-io_uring workers after FUSE_INIT. Required transport.
@@ -287,7 +302,7 @@ impl FuseConnection {
     ) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         // Already enabled (e.g. race with another enable call)
-        if self.over_uring.lock().unwrap().is_some() {
+        if self.over_uring.get().is_some() {
             return Ok(());
         }
         let fd = self.as_fd().as_raw_fd();
@@ -321,12 +336,7 @@ impl FuseConnection {
         &self,
         pool: std::sync::Arc<super::fuse_over_uring::FuseOverUring>,
     ) -> Result<(), std::sync::Arc<super::fuse_over_uring::FuseOverUring>> {
-        let mut slot = self.over_uring.lock().unwrap();
-        if slot.is_some() {
-            return Err(pool);
-        }
-        *slot = Some(pool);
-        Ok(())
+        self.over_uring.set(pool)
     }
 
     /// Teardown seam (session disconnect + FUSE_DESTROY): shut the
@@ -339,21 +349,17 @@ impl FuseConnection {
     /// slot tear-out.
     #[cfg(target_os = "linux")]
     pub fn teardown_over_uring(&self) {
-        if let Some(pool) = self.over_uring.lock().unwrap().take() {
+        if let Some(pool) = self.over_uring.get() {
             pool.shutdown();
         }
     }
 
     #[cfg(target_os = "linux")]
     pub fn get_payload_buffer(&self, unique: u64) -> Option<(u64, usize)> {
-        // Plain uncontended mutex, DELIBERATELY not arc-swap (P2 md-storm
-        // forensics): arc_swap loads/stores share one process-global debt
-        // registry, so high-rate guard traffic from the transport threads
-        // lengthened every kv node-snapshot `store()`'s pay_all walk on
-        // the serialized conveyor path (−10% create/del storms). The
-        // contended per-op lock was `pending` (now sharded); this one is
-        // uncontended.
-        let pool = self.over_uring.lock().unwrap().clone()?;
+        // Lock-free slot read (PERF-2; the field doc carries the
+        // not-arc-swap rationale) — a plain acquire load + the pool's
+        // sharded pending probe, zero RMWs.
+        let pool = self.over_uring.get()?;
         pool.get_payload_buffer(unique)
     }
 
@@ -364,11 +370,7 @@ impl FuseConnection {
     /// channel hop + reply-task wake per op.
     #[cfg(target_os = "linux")]
     pub fn over_uring_ready(&self) -> bool {
-        self.over_uring
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|p| p.is_ready())
+        self.over_uring.get().is_some_and(|p| p.is_ready())
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -388,7 +390,7 @@ impl FuseConnection {
         Ok(Self {
             unmount_notify,
             mode: ConnectionMode::NonBlock(connection),
-            over_uring: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            over_uring: std::sync::Arc::new(std::sync::OnceLock::new()),
             classical_inflight: std::sync::Arc::new(ClassicalInflight::new()),
             assigned_qid: None,
             classical_sideband: std::sync::atomic::AtomicBool::new(false),
@@ -588,21 +590,22 @@ impl FuseConnection {
                 // Sideband servicer: never drain the uring inbound queues.
                 None
             } else {
-                self.over_uring.lock().unwrap().clone()
+                // Lock-free slot read; borrow — the slot never empties
+                // (teardown contract 2), so no refcount RMW per pull.
+                self.over_uring.get()
             };
             // After arm: uring-only. Before arm / when inactive: fall through.
             // - ready → drain uring inbound
             // - shut down (!active) → disconnect error
             // - not yet ready → classical (INIT only; REGISTER wait is inside enable)
             if let Some(pool) = pool.filter(|p| p.is_ready() || !p.is_active()) {
-                let pool2 = pool.clone();
                 let qid = self.assigned_qid.unwrap_or(0);
                 // Pure event-driven pull (L3 lever C): parks on the queue
                 // channel / shutdown notify — no 200 ms poll cadence, no
                 // per-pull timer registration. `None` means the pool shut
                 // down (or a structurally-unreachable qid): fail loud so the
                 // session worker exits, never poll-park.
-                let inbound = match pool2.recv_inbound(qid).await {
+                let inbound = match pool.recv_inbound(qid).await {
                     Some(r) => r,
                     None => {
                         return (
@@ -771,7 +774,9 @@ impl FuseConnection {
         // plain `umount` returns EBUSY forever.
         #[cfg(target_os = "linux")]
         {
-            let pool = self.over_uring.lock().unwrap().clone();
+            // Lock-free slot read; borrow — the slot never empties
+            // (teardown contract 2), so no refcount RMW per reply.
+            let pool = self.over_uring.get();
             if let Some(pool) = pool.filter(|p| p.is_ready()) {
                 // unique is at offset 8 in fuse_out_header (len u32, error i32, unique u64)
                 let unique = if data.deref().len() >= 16 {

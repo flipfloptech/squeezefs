@@ -219,7 +219,7 @@ impl PendingMap {
     }
 }
 
-struct CommitMsg {
+pub(crate) struct CommitMsg {
     ent_idx: u16,
     commit_id: u64,
     header: Vec<u8>,
@@ -1594,7 +1594,11 @@ impl FuseOverUring {
             inbound.push(Arc::new(InboundQueue::new()));
             let (commit_tx, commit_rx) = std::sync::mpsc::channel();
             let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-            assert!(efd >= 0, "sim_inert eventfd: {}", io::Error::last_os_error());
+            assert!(
+                efd >= 0,
+                "sim_inert eventfd: {}",
+                io::Error::last_os_error()
+            );
             // SAFETY: efd is a freshly-created, owned eventfd (checked >= 0).
             let wake = unsafe { OwnedFd::from_raw_fd(efd) };
             let wake_fd = wake.as_raw_fd();

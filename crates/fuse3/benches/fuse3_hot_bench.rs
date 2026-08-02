@@ -32,6 +32,7 @@
 //!   slot + liveness machinery, no kernel session; before/after
 //!   comparable across the PERF-2 mutex→lock-free swap.
 
+use async_notify::Notify;
 use bincode::Options;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use fuse3::get_bincode_config;
@@ -41,7 +42,6 @@ use fuse3::raw::connection::kmbuf::{KmbufQueue, IORING_CQE_BUFFER_SHIFT, IORING_
 use fuse3::raw::connection::FuseConnection;
 use fuse3::raw::reply::FileAttr;
 use fuse3::{FileType, Timestamp};
-use async_notify::Notify;
 use std::hint::black_box;
 use std::sync::Arc;
 

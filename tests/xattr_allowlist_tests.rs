@@ -63,23 +63,22 @@ fn req() -> Request {
     }
 }
 
-async fn open_v3_meta(path: &std::path::Path, len: u64) -> Arc<KvMetaBackend> {
+const META_LEN: u64 = 256 * 1024 * 1024;
+
+async fn format_v3_meta(path: &std::path::Path, config_xattr: Vec<u8>) {
     squeezefs::meta_backend::kv::builder::format_v3(
         path,
-        len,
+        META_LEN,
         &squeezefs::meta_backend::kv::builder::FormatV3Options {
             node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
             journal_len_override: None,
             force: true,
             full_wipe: false,
-            format_config_xattr: Some(b"{\"name\":\"val2\"}".to_vec()),
+            format_config_xattr: Some(config_xattr),
         },
     )
     .await
     .expect("format v3 meta volume");
-    KvMetaBackend::open(path)
-        .await
-        .expect("open v3 meta volume")
 }
 
 struct Fx {
@@ -91,6 +90,15 @@ struct Fx {
 }
 
 async fn fixture(tag: &str) -> Fx {
+    let meta_file = NamedTempFile::new().unwrap();
+    format_v3_meta(meta_file.path(), b"{\"name\":\"val2\"}".to_vec()).await;
+    fixture_on(tag, meta_file).await
+}
+
+/// The same mount-shaped fixture over an ALREADY-formatted meta volume —
+/// what the admin-verb regression needs so the FUSE surface and the
+/// administrator write to the very same record.
+async fn fixture_on(tag: &str, meta_file: NamedTempFile) -> Fx {
     let dlm = DlmClient::new().unwrap();
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())
@@ -114,8 +122,9 @@ async fn fixture(tag: &str) -> Fx {
     .unwrap();
     let router = DataRouter::new(dlm.clone(), cache, alloc, nvme);
     let mut fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
-    let meta_file = NamedTempFile::new().unwrap();
-    let kv = open_v3_meta(meta_file.path(), 256 * 1024 * 1024).await;
+    let kv = KvMetaBackend::open(meta_file.path())
+        .await
+        .expect("open v3 meta volume");
     let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
         kv.clone()
     ]));
@@ -351,6 +360,116 @@ async fn symlink_targets_still_resolve_while_the_record_is_screened() {
         b"/target/path",
         "the refusals must not have touched the record"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The daemon's own administrators are on the INSIDE of the screen
+// ---------------------------------------------------------------------------
+
+/// VAL-2 regression (caught in `tests/cache_path_policy_tests.rs`
+/// `test_set_cache_paths_admin_op_end_to_end`): mirroring the allowlist
+/// into `KvMetaBackend`'s `Metadata` impl put the daemon's OWN record
+/// administrators behind the boundary they enforce —
+/// `config set-cache-paths`, which rewrites
+/// `user.squeezefs.format_config` on the volume it administers, was
+/// refused EPERM by its own screen.
+///
+/// The contract is a PAIRING, so this test asserts both halves against
+/// the SAME record on the SAME volume:
+///
+/// 1. the administrator (an offline admin verb, no FUSE anywhere in the
+///    call) rewrites the record and it lands durably;
+/// 2. the FUSE surface writing that very name still refuses EPERM.
+///
+/// Fixing (1) by relaxing the screen would break (2); relaxing (2) is the
+/// exposure VAL-2 closed. The only way both pass is routing internal
+/// writers through the unscreened `*_internal` entry points.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_config_writers_are_unscreened_while_fuse_still_refuses() {
+    let dir = tempdir().unwrap();
+    let staging = dir.path().join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    // Junk in the NEW dir: the verb's ENG-4 wipe leg runs too, so a
+    // silent early return can never masquerade as success.
+    std::fs::write(staging.join("stale_junk.bin"), b"poison").unwrap();
+
+    let meta_file = NamedTempFile::new().unwrap();
+    format_v3_meta(
+        meta_file.path(),
+        serde_json::to_vec(&serde_json::json!({
+            "name": "squeezefs",
+            "block_size": 4096,
+            "capacity": 1u64 << 30,
+            "inodes": 1_000_000u64,
+            "compression": "none",
+            "encrypt_algo": "none",
+        }))
+        .unwrap(),
+    )
+    .await;
+    let uris = vec![meta_file.path().display().to_string()];
+
+    // 1. The administrator. `set_cache_paths` is the daemon's own writer
+    //    of `user.squeezefs.format_config` — it must never be screened.
+    squeezefs::config_ops::set_cache_paths(&uris, std::slice::from_ref(&staging), true)
+        .await
+        .expect(
+            "config set-cache-paths writes the volume's OWN format config — the VAL-2 \
+             screen is the client boundary, never a ban on the record's administrator",
+        );
+    assert!(
+        !staging.join("stale_junk.bin").exists(),
+        "the verb must have actually run (the new cache dir is wiped)"
+    );
+    assert_eq!(
+        squeezefs::config_ops::get_cache_paths(&uris)
+            .await
+            .expect("get-cache-paths"),
+        Some(vec![staging.clone()]),
+        "the rewrite must be durable on the volume"
+    );
+
+    // 2. ... and the same name through the FUSE surface still refuses.
+    let fx = fixture_on("val2-admin", meta_file).await;
+    let before = refusals();
+    let e = fx
+        .fs
+        .setxattr(
+            req(),
+            ROOT,
+            OsStr::new(squeezefs::meta_backend::kv::builder::FORMAT_CONFIG_XATTR),
+            b"forged",
+            0,
+            0,
+        )
+        .await
+        .expect_err("the FUSE surface must never write the format config");
+    assert_eq!(e, libc::EPERM.into());
+    let e = fx
+        .fs
+        .removexattr(
+            req(),
+            ROOT,
+            OsStr::new(squeezefs::meta_backend::kv::builder::FORMAT_CONFIG_XATTR),
+        )
+        .await
+        .expect_err("the FUSE surface must never destroy the format config");
+    assert_eq!(e, libc::EPERM.into());
+    assert!(refusals() >= before + 2, "both refusals are counted");
+
+    // The administrator's rewrite survived the client's attempts.
+    let raw = fx
+        .kv
+        .getxattr(
+            ROOT,
+            squeezefs::meta_backend::kv::builder::FORMAT_CONFIG_XATTR,
+        )
+        .await
+        .expect("internal read")
+        .expect("the format config is still on the volume");
+    let stored: squeezefs::FormatConfig =
+        serde_json::from_slice(&raw).expect("the stored config is the administrator's, unforged");
+    assert_eq!(stored.disk_cache_paths, Some(vec![staging]));
 }
 
 // ---------------------------------------------------------------------------

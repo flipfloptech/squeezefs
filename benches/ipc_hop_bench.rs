@@ -232,7 +232,126 @@ fn bench_job_wire_frames(c: &mut Criterion) {
             std::hint::black_box(e)
         })
     });
+}
 
+/// VAL-5c/VAL-5e (pre-RC control-plane bounds, 2026-08-02): the per-pass
+/// drain bookkeeping the fairness bound added to the HOT serve loop.
+/// Every op now pays a budget compare and an in-flight ledger pair, and
+/// every pass pays a rotation index — this group is where that price is
+/// visible (or shown to be noise).
+///
+/// FIELD-derived shapes (the program's toy-input ban):
+/// * ring/slot geometry = the shipped `Geometry::default_v1` — 1024 ring
+///   entries, 1024 slots (`layout::DEFAULT_RING_ENTRIES`), which is also
+///   the drain budget (VAL-5e's quantum = one honest in-flight window);
+/// * a drain pass of **32 published ops** — the ingest-economy field
+///   shape (a 32-CPU client's fleet keeps tens of ops in flight per
+///   session, `.benchmarks/2026-07-28-ingest-economy.md`);
+/// * **4 sessions per service thread** — sessions outnumber threads on
+///   the derived defaults (`sizing::il_sessions_default` = clamp(cpus/4,
+///   2, 16) sessions against the same ceiling of threads, with fd-sharded
+///   multi-process fleets pushing the ratio up); 4 is the shape the
+///   §5.5.1 pinning invariant makes ordinary.
+fn bench_drain_pass(c: &mut Criterion) {
+    use squeezefs_ipc::layout::DEFAULT_RING_ENTRIES;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const PUBLISHED: u32 = 32;
+    const SESSIONS: usize = 4;
+    let budget = DEFAULT_RING_ENTRIES;
+
+    let mut g = c.benchmark_group("ipc_drain");
+    g.throughput(Throughput::Elements(u64::from(PUBLISHED)));
+
+    // The pre-VAL-5e loop: pop until the ring reports empty.
+    let storage = RingStorage::with_capacity(DEFAULT_RING_ENTRIES).expect("capacity");
+    let ring = storage.view();
+    let mut consumer = RingConsumer::new();
+    g.bench_function("pop_loop_unbudgeted", |b| {
+        b.iter(|| {
+            for i in 0..PUBLISHED {
+                assert!(ring.push(i));
+            }
+            let mut served = 0u32;
+            while let Some(idx) = consumer.pop(&ring) {
+                std::hint::black_box(idx);
+                served += 1;
+            }
+            std::hint::black_box(served)
+        })
+    });
+
+    // The shipped loop: the same pops plus the per-op budget compare.
+    let storage_b = RingStorage::with_capacity(DEFAULT_RING_ENTRIES).expect("capacity");
+    let ring_b = storage_b.view();
+    let mut consumer_b = RingConsumer::new();
+    g.bench_function("pop_loop_budgeted", |b| {
+        b.iter(|| {
+            for i in 0..PUBLISHED {
+                assert!(ring_b.push(i));
+            }
+            let mut served = 0u32;
+            while let Some(idx) = consumer_b.pop(&ring_b) {
+                std::hint::black_box(idx);
+                served += 1;
+                if served >= budget {
+                    break;
+                }
+            }
+            std::hint::black_box(served)
+        })
+    });
+
+    // A whole round-robin sweep over 4 owned sessions: the rotation
+    // index + modulo per session, the budget compare per op.
+    let rings: Vec<RingStorage> = (0..SESSIONS)
+        .map(|_| RingStorage::with_capacity(DEFAULT_RING_ENTRIES).expect("capacity"))
+        .collect();
+    let mut consumers: Vec<RingConsumer> = (0..SESSIONS).map(|_| RingConsumer::new()).collect();
+    let mut rr_start = 0usize;
+    g.throughput(Throughput::Elements(u64::from(PUBLISHED) * SESSIONS as u64));
+    g.bench_function("round_robin_pass_4_sessions", |b| {
+        b.iter(|| {
+            for r in &rings {
+                let view = r.view();
+                for i in 0..PUBLISHED {
+                    assert!(view.push(i));
+                }
+            }
+            let mut served = 0u32;
+            for k in 0..SESSIONS {
+                let s = (rr_start.wrapping_add(k)) % SESSIONS;
+                let view = rings[s].view();
+                let mut per_session = 0u32;
+                while let Some(idx) = consumers[s].pop(&view) {
+                    std::hint::black_box(idx);
+                    per_session += 1;
+                    if per_session >= budget {
+                        break;
+                    }
+                }
+                served += per_session;
+            }
+            rr_start = rr_start.wrapping_add(1);
+            std::hint::black_box(served)
+        })
+    });
+
+    // The VAL-5c ledger pair, per op (mirrors `ipc_host::SessionInflight`
+    // exactly: `fetch_add` on admit, saturating `fetch_update` on
+    // release — both AcqRel, both uncontended in the single-consumer
+    // drain, contended only against completions landing off-thread).
+    let live = AtomicU32::new(0);
+    g.throughput(Throughput::Elements(1));
+    g.bench_function("inflight_ledger_pair", |b| {
+        b.iter(|| {
+            let n = live.fetch_add(1, Ordering::AcqRel) + 1;
+            std::hint::black_box(n);
+            let _ = live.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(1))
+            });
+        })
+    });
     g.finish();
 }
 
@@ -242,6 +361,7 @@ criterion_group!(
     bench_slot_cycle,
     bench_payload_moves,
     bench_cqe_doorbell,
-    bench_job_wire_frames
+    bench_job_wire_frames,
+    bench_drain_pass
 );
 criterion_main!(benches);

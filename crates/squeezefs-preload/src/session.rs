@@ -125,6 +125,47 @@ pub struct WaitEntry<'a> {
     expected: u32,
 }
 
+/// How the shim entered this process (SDK Tier 1 direct-link support,
+/// `docs/design-sdk.md` §4). Purely diagnostic: the shim is ctor-free
+/// and behaves identically under both loaders — the bootstrap path
+/// prints one line in linked mode so operators (and the preload gate's
+/// 2b-linked row) can tell the deployments apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadMode {
+    /// `LD_PRELOAD` names this shim.
+    Preload,
+    /// The dynamic linker pulled us in some other way: a DT_NEEDED
+    /// direct link (`-lsqueezefs_il`), `dlopen`, or `/etc/ld.so.preload`.
+    /// (A setuid/AT_SECURE binary whose *ignored* environment still
+    /// names the shim misreports as `Preload` — the line is diagnostic,
+    /// never a correctness input.)
+    Linked,
+}
+
+/// Pure classification: does an `LD_PRELOAD` value name this shim?
+/// glibc splits the list on colons and spaces; entries match on their
+/// BASENAME (a directory component named like the shim must not
+/// match), by prefix (packagers ship versioned `libsqueezefs_il.so.X`
+/// names behind symlink chains).
+pub fn load_mode_from(ld_preload: Option<&str>) -> LoadMode {
+    let Some(list) = ld_preload else {
+        return LoadMode::Linked;
+    };
+    for entry in list.split([':', ' ']).filter(|e| !e.is_empty()) {
+        let base = entry.rsplit('/').next().unwrap_or(entry);
+        if base.starts_with("libsqueezefs_il") {
+            return LoadMode::Preload;
+        }
+    }
+    LoadMode::Linked
+}
+
+/// Process-level detection (reads the environment on every call —
+/// callers gate the announce on a `Once`).
+pub fn load_mode() -> LoadMode {
+    load_mode_from(std::env::var("LD_PRELOAD").ok().as_deref())
+}
+
 /// A successful bind's grant (mirrors the daemon's `BindOk`).
 #[derive(Debug, Clone, Copy)]
 pub struct BindGrant {

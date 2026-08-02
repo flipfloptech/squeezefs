@@ -276,6 +276,26 @@ fn panic_poison() {
     stderr_line("squeezefs-il: PANIC in interposer — all sessions poisoned, passthrough\n");
 }
 
+/// SDK Tier-1 direct-link support (`docs/design-sdk.md` §4): one line,
+/// once per process, on the FIRST bootstrap-blob decode — the moment
+/// the shim knows it is live against an interception-armed SqueezeFS
+/// mount — naming the load mode when it is NOT the LD_PRELOAD idiom
+/// (DT_NEEDED direct link, dlopen, ld.so.preload). KD-7 is
+/// mode-independent; the line makes a linked deployment auditable (the
+/// gate's 2b-linked row pins exactly-once). Establish/bind context
+/// only — never a signal handler (the RefusalOnce precedent).
+fn announce_load_mode() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if crate::session::load_mode() == crate::session::LoadMode::Linked {
+            stderr_line(
+                "squeezefs-il: active via direct link (DT_NEEDED), not LD_PRELOAD — \
+                 same KD-7 build pairing applies\n",
+            );
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // real-function chaining
 // ---------------------------------------------------------------------------
@@ -423,6 +443,10 @@ fn classify_and_bind(fd: c_int) {
                 dev_cache().insert(st.st_dev);
                 return;
             };
+            // A decoded blob = an interception-armed SqueezeFS mount:
+            // the shim is live in this process — say how it got here
+            // (once; linked mode only).
+            announce_load_mode();
             // The HELLO credential must itself survive the screen; an
             // ineligible first fd just defers establishment (never a
             // negative-cache entry — the MOUNT is ours).

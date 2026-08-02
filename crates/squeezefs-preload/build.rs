@@ -52,4 +52,18 @@ fn main() {
 
     let suffix = if dirty { "-dirty" } else { "" };
     println!("cargo:rustc-env=SQUEEZEFS_IL_BUILD_COMMIT={commit}{suffix}");
+
+    // SDK Tier-1 direct-link support (docs/design-sdk.md §4; cdylib
+    // link args only — the rlib/tests are untouched):
+    //
+    // rustc sets no SONAME on cdylibs, so a consumer linking the shim
+    // BY PATH would embed the build-tree path as its DT_NEEDED entry.
+    // A stable SONAME makes `-lsqueezefs_il` and by-path links both
+    // record `libsqueezefs_il.so`.
+    println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,libsqueezefs_il.so");
+    // pthread_atfork handlers (interpose::atfork_init) can never be
+    // unregistered, so any load of this object must be permanent.
+    // LD_PRELOAD and DT_NEEDED never unload; `-z nodelete` closes the
+    // dlopen edge structurally (dlclose becomes a no-op).
+    println!("cargo:rustc-cdylib-link-arg=-Wl,-z,nodelete");
 }

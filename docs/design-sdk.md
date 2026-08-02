@@ -49,7 +49,7 @@ Everything hard about the app→daemon data plane is **landed, measured machiner
 | Sealed-memfd session: MPSC ring, completion-in-place slots, payload arena, futex doorbell, `WakeCoalescer` wake economy | `crates/squeezefs-ipc` | **Reused verbatim** — the SDK is a second *client* of the same protocol crate |
 | Completion doorbell (IPC_ABI 2): completion wakes paid only toward registered parked reapers | `cqe_core::CqeDoorbell` | **Exposed natively** — `sqz_reap` parks on it directly (no libaio emulation between) |
 | §5.5.1 sync fast path + §5.5.2 sever-at-dequeue custody + severed-buffer pool + placed sever | `src/ipc_service.rs`, `src/placed_sever.rs` | **Unchanged** — the daemon-side copy discipline is load-bearing (near-zero-copy census); the SDK deletes *client*-side passes only |
-| §5.3.1 daemon self-protection: snapshot-then-validate, single-read discipline, lease-refcounted unmap, bounded parks | `src/ipc_service.rs` | **Load-bearing dependency** — these rules are exactly why arena-native app buffers add zero daemon attack surface (§7.2) |
+| §5.3.1 daemon self-protection: snapshot-then-validate, single-read discipline, lease-refcounted unmap, bounded parks | `src/ipc_service.rs` | **Load-bearing dependency** — these rules are exactly why arena-native app buffers add zero daemon attack surface (§6.5) |
 | Engagement verification (charter §3 rule 4): a row is INVALID unless daemon-side `ipc_ops_*` accounts for it | `tests/run_scoreboard.sh`, gate | **Inherited** — SDK rows are il-class rows under the same labeling discipline |
 
 ### 2.2 What interposition structurally cannot delete (the SDK's reason to exist)
@@ -87,7 +87,7 @@ The alternatives ladder from L4 §10 still holds (client-side NVMe rejected for 
 * **No cross-host transport.** Same-host by construction (shm).
 * **No mmap surface, no `FILE*` surface, no O_APPEND/O_PATH/O_TMPFILE handles** (the bind screen rows are unchanged; `sqz_open` refuses what BIND would refuse — but loudly, with errno, instead of silently passing through).
 * **No language bindings beyond C in v1.** The C ABI is the binding surface; Rust is first-party. (Python/Go ride the C ABI unofficially; official bindings are a post-v1 decision.)
-* **No new durability semantics in SDK-1..3.** Acked-via-ring == acked-via-FUSE-WRITE, fsync is the durable barrier (§5.6.3 of L4 — inherited verbatim). SDK-4's per-open classes compose with rewrite-program Idea 8 (§10) and land only after Idea 8 does.
+* **No new durability semantics in SDK-1..3.** Acked-via-ring == acked-via-FUSE-WRITE, fsync is the durable barrier (§5.6.3 of L4 — inherited verbatim). SDK-4's per-open classes compose with rewrite-program Idea 8 (§8 below; Idea 8 = design-rewrite-program §9.3) and land only after Idea 8 does.
 * **No stable wire ABI beyond the stated window.** The SDK freezes a *versioned subset* (§9); the shim keeps the same-commit law; the protocol remains forward-only.
 
 ---

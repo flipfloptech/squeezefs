@@ -364,6 +364,10 @@ fn build_worker_ring(entries: u32) -> std::io::Result<(IoUring, &'static str)> {
 }
 
 fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<UringRequest>) {
+    // TEST-1 env seam (`SQUEEZEFS_TEST_POWER_CUT_DEVS`): read ONCE per
+    // worker, zero cost unset, never set in production.
+    crate::dev_power_cut::arm_from_env(&device_path);
+
     let mut open_opts = OpenOptions::new();
     open_opts.read(true).write(true);
     #[cfg(target_os = "linux")]
@@ -670,6 +674,10 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                             None,
                         ),
                     };
+                    // TEST-1 fault seam: journal the prior bytes of this
+                    // write BEFORE the SQE goes out (armed only — one
+                    // relaxed load otherwise).
+                    crate::dev_power_cut::note_write(&device_path, offset, len);
                     active[slot_idx] = Some(ActiveReq {
                         response: UringResponse::Write { tx },
                         free_ptr,

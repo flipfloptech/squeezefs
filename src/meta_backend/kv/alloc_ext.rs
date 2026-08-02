@@ -661,6 +661,13 @@ impl ExtentAllocator {
 
     fn mark_dirty(&self, extent: u64) {
         let page = extent / ALLOC_PAGE_BITS;
+        self.mark_page_dirty(page);
+    }
+
+    /// Re-arm one page's dirty bit — the DUR-4 restore half of
+    /// [`Self::write_dirty_pages`]'s snapshot-and-clear (the
+    /// `restore_dying_floors` pattern from the sibling checkpoint path).
+    fn mark_page_dirty(&self, page: u64) {
         self.dirty[(page / 64) as usize].fetch_or(1u64 << (page % 64), Ordering::AcqRel);
     }
 
@@ -674,6 +681,32 @@ impl ExtentAllocator {
     /// only (§4.6); durability rides the caller's barrier, and the caller
     /// records `generation` in its ledger record
     /// (`alloc_bitmap_generation`).
+    ///
+    /// **DUR-4 (two laws, both load-bearing).**
+    ///
+    /// 1. *Snapshot-and-clear is transactional.* Every fallible step past
+    ///    the clear restores the snapshot's bits (`fetch_or`) before
+    ///    returning, so the caller's retry still knows what to write.
+    ///    Dropping them is unrecoverable: allocator deltas create no
+    ///    dirty-node floor, so the next successful cycle advances the
+    ///    tail past the alloc/free records that were the only remaining
+    ///    copy, and remount then reads those extents FREE while live
+    ///    nodes occupy them. (The pattern is `restore_dying_floors` in
+    ///    the sibling checkpoint path.)
+    /// 2. *A written image never ties an on-disk generation.* A/B
+    ///    resolution is newest-valid-wins, so a tie makes the choice
+    ///    between the slots arbitrary and the older bits can win. The
+    ///    guard was `debug_assert!`-only — absent in release — and the
+    ///    tie is a REACHABLE steady-state shape: a cycle that wrote its
+    ///    pages and then failed (barrier or ledger write) leaves
+    ///    `checkpoint_seq` unadvanced, so the retry arrives with the same
+    ///    seq. Refusing the write would wedge that retry forever, so the
+    ///    image's generation is RAISED above the page's newest valid copy
+    ///    (`max(generation, newest + 1)`) — what the protocol actually
+    ///    requires — and the raise is logged loud. Mount resumes
+    ///    numbering above `max(page generations,
+    ///    ledger.alloc_bitmap_generation)`, so a raised page generation
+    ///    stays sound across remount.
     pub async fn write_dirty_pages(
         &self,
         path: &Path,
@@ -704,42 +737,74 @@ impl ExtentAllocator {
 
         let words = self.core.snapshot_words();
         let mut ops: Vec<(u64, bytes::Bytes)> = Vec::with_capacity(to_write.len());
-        let mut new_slots: Vec<(u32, u64)> = Vec::with_capacity(to_write.len());
+        let mut new_slots: Vec<(u32, u64, u64)> = Vec::with_capacity(to_write.len());
         for &page in &to_write {
             let state = &self.page_states[page as usize];
             let cur_gen = state.generation.load(Ordering::Acquire);
-            debug_assert!(
-                generation > cur_gen,
-                "bitmap generation {generation} must exceed page {page}'s newest {cur_gen} \
-                 (newest-valid-wins would tie)"
-            );
+            let has_copy = state.slot.load(Ordering::Acquire) != SLOT_NONE;
+            // Law 2: never emit an image whose generation ties or trails
+            // the page's newest valid copy.
+            let page_gen = if has_copy && generation <= cur_gen {
+                let raised = cur_gen + 1;
+                log::warn!(
+                    "bitmap page {page}: requested generation {generation} does not exceed \
+                     the newest on-disk copy {cur_gen} (a checkpoint retry after a failed \
+                     cycle) — writing at {raised} instead; a tie would make \
+                     newest-valid-wins pick between the A/B slots arbitrarily"
+                );
+                raised
+            } else {
+                generation
+            };
             let target = match state.slot.load(Ordering::Acquire) {
                 SLOT_NONE => 0,
                 s => 1 - s,
             };
             let bits = self.page_bits(&words, u64::from(page));
-            let image = encode_bitmap_page(page, generation, &bits)?;
+            let image = match encode_bitmap_page(page, page_gen, &bits) {
+                Ok(img) => img,
+                // Law 1: the dirty set is this write's only copy.
+                Err(e) => {
+                    self.restore_dirty_pages(&to_write);
+                    return Err(e);
+                }
+            };
             ops.push((
                 base + u64::from(page) * 2 * ALLOC_PAGE_LEN + target * ALLOC_PAGE_LEN,
                 bytes::Bytes::from(image),
             ));
-            new_slots.push((page, target));
+            new_slots.push((page, target, page_gen));
         }
 
-        if ops.len() == 1 {
+        let wrote = if ops.len() == 1 {
             let (off, data) = ops.pop().expect("one op");
-            crate::uring_fs::write_at(path, off, data).await?;
+            crate::uring_fs::write_at(path, off, data).await
         } else {
-            crate::uring_fs::write_at_batch(path, ops).await?;
+            crate::uring_fs::write_at_batch(path, ops).await
+        };
+        if let Err(e) = wrote {
+            // Law 1 again — and note a partially-landed BATCH is safe to
+            // re-dirty wholesale: rewriting a page that did land costs one
+            // extra image at a higher generation, never a lost bit.
+            self.restore_dirty_pages(&to_write);
+            return Err(KvError::Io(e));
         }
 
         // The writes landed: record the new newest-valid slot per page.
-        for (page, slot) in new_slots {
+        for (page, slot, page_gen) in new_slots {
             let state = &self.page_states[page as usize];
-            state.generation.store(generation, Ordering::Release);
+            state.generation.store(page_gen, Ordering::Release);
             state.slot.store(slot, Ordering::Release);
         }
         Ok(to_write)
+    }
+
+    /// DUR-4 law 1: fold a failed write's snapshot back into the dirty
+    /// set so the retry still carries those pages.
+    fn restore_dirty_pages(&self, pages: &[u32]) {
+        for &page in pages {
+            self.mark_page_dirty(u64::from(page));
+        }
     }
 
     /// Serialize page `page`'s bit payload out of a mirror snapshot.

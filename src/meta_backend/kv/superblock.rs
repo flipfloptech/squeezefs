@@ -176,7 +176,7 @@ pub const FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING: u64 = 1 << 6;
 /// token ≡ the bare grant sequence, claim bytes unchanged, no term
 /// record written. The batched reformat window (execution plan Phase 8)
 /// stamps existing volumes; **mount never stamps it** — fresh formats
-/// carry it from [`SuperblockV3::new`], and
+/// carry it from [`SuperblockV3::plan`], and
 /// [`set_durable_term_bit`] is the explicit upgrade path. Old binaries
 /// refuse a bit-7 volume loud via [`FEATURES_INCOMPAT_KNOWN`] (the bit
 /// intersects no prior mask), which is exactly right: they would mint

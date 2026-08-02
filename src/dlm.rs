@@ -150,7 +150,7 @@ pub const fn token_grant_seq(token: u64) -> u64 {
     token & GRANT_SEQ_MAX
 }
 
-/// This process's adopted durable term (0 = none — see [`DURABLE_TERM`]).
+/// This process's adopted durable term (0 = none: an un-stamped volume, an offline tool holding no claim, or a pure in-RAM test).
 pub fn durable_term() -> u64 {
     DURABLE_TERM.load(Ordering::Acquire)
 }

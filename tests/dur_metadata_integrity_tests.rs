@@ -405,3 +405,253 @@ async fn dur5_concurrent_incompat_bit_setters_never_lose_a_bit() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// DUR-8 · additional metadata-integrity rows (P1).
+// ---------------------------------------------------------------------------
+
+/// **DUR-8a** — the extent record's digest must cover its HEADER. v1
+/// checksummed `bytes[40..]` only, so a corrupted `block_idx`,
+/// `fencing_token`, `flags` or `count` passed verification and silently
+/// misattributed staged extents to another block — contradicting the
+/// type's own "checksummed as a unit" doc.
+#[test]
+fn dur8a_extent_record_checksum_covers_the_header() {
+    use squeezefs::cache::nvme::{ExtentRecord, EXTENT_RECORD_VERSION};
+
+    let rec = ExtentRecord {
+        version: EXTENT_RECORD_VERSION,
+        fencing_token: 0x1122_3344_5566_7788,
+        block_idx: 7,
+        base_deferred: true,
+        extents: vec![(4096, vec![0xAB; 512]), (65536, vec![0xCD; 256])],
+    };
+    let img = rec.serialize();
+    let back = ExtentRecord::deserialize(&img).expect("clean record decodes");
+    assert_eq!(back.fencing_token, rec.fencing_token);
+    assert_eq!(back.block_idx, rec.block_idx);
+    assert_eq!(back.base_deferred, rec.base_deferred);
+    assert_eq!(back.extents, rec.extents);
+
+    // Every header field must be inside the digest's coverage.
+    for (off, what) in [
+        (12usize, "fencing_token"),
+        (20, "block_idx"),
+        (24, "flags"),
+        (28, "count"),
+    ] {
+        let mut bad = img.clone();
+        bad[off] ^= 0x01;
+        assert!(
+            ExtentRecord::deserialize(&bad).is_err(),
+            "a corrupted {what} passed verification — the record's digest does not cover \
+             its header (spec DUR-8a: silent staged-extent misattribution)"
+        );
+    }
+}
+
+/// **DUR-8c** — `next_ino` must not fall back over an ino the replay
+/// window only MENTIONS. `max_replayed_ino` folded `TREE_INODES` keys
+/// only, so a torn-dropped create whose dentry (child ino in the VALUE)
+/// or xattr (ino in the KEY) survived left the watermark low and the
+/// allocator RE-MINTED that ino on top of the survivor.
+///
+/// Forged directly in the ring — that is the shape a torn entry leaves
+/// behind (the create's whole-tx entry dropped, a later same-ino entry
+/// surviving), and the fold is what must be right.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dur8c_replay_watermark_folds_dentry_and_xattr_inos() {
+    use squeezefs::meta_backend::kv::journal::{entry_len_for, JournalRing};
+    use squeezefs::meta_backend::kv::journal_core::AdmissionClass;
+    use squeezefs::meta_backend::kv::record::{
+        dentry_key, dentry_name_hash54, xattr_key, xattr_name_hash56, DentryValue, Record,
+        XattrValue, TREE_DENTRIES, TREE_XATTRS,
+    };
+
+    let _g = FaultGuard;
+    let (kv, file) = sandbox(VOL_LEN).await;
+    let path = file.path().to_path_buf();
+    let sb_journal = kv.superblock().journal;
+    let hash_seed = 0u64;
+    let dentry_ino: u64 = 4_000;
+    let xattr_ino: u64 = 9_000;
+    kv.shutdown().await.expect("shutdown");
+    drop(kv);
+    // The tail the next mount will replay from.
+    let tail_seq = {
+        let probe = KvMetaBackend::open_probe(&path).await.expect("probe");
+        probe.mounted_ledger().journal_tail_seq
+    };
+
+    // One entry mentioning two inos that own no inode record — exactly
+    // what survives when the creates' entries are torn away.
+    {
+        // Continue the volume's OWN ring — recovery walks a position/seq
+        // identity, so a fresh ring at position 0 would be invisible.
+        let (ring, _rec) =
+            JournalRing::recover(&path, sb_journal.start, sb_journal.len / 4096, 0, tail_seq)
+                .await
+                .expect("recover the ring at the shutdown tail");
+        let records: Vec<(u8, Record)> = vec![
+            (
+                TREE_DENTRIES,
+                Record::put(
+                    dentry_key(1, dentry_name_hash54(b"orphan", hash_seed), 0).to_vec(),
+                    1,
+                    DentryValue::encode_parts(dentry_ino, 8, b"orphan").expect("dentry"),
+                ),
+            ),
+            (
+                TREE_XATTRS,
+                Record::put(
+                    xattr_key(xattr_ino, xattr_name_hash56(b"user.k", hash_seed), 0).to_vec(),
+                    1,
+                    XattrValue::encode_parts(b"user.k", b"v").expect("xattr"),
+                ),
+            ),
+        ];
+        let need = entry_len_for(&records).expect("entry under cap");
+        let adm = ring
+            .core()
+            .try_admit(need, AdmissionClass::User)
+            .expect("fresh ring has room");
+        let res = ring.core().reserve(adm);
+        let records: Vec<(u8, Record)> = records
+            .into_iter()
+            .map(|(t, mut r)| {
+                r.seq = res.seq();
+                (t, r)
+            })
+            .collect();
+        ring.write_entry(&res, &records).await.expect("entry write");
+        squeezefs::uring_fs::fdatasync(path.clone())
+            .await
+            .expect("barrier");
+    }
+
+    let kv = KvMetaBackend::open(&path).await.expect("remount");
+    let next = kv.next_ino();
+    assert!(
+        next > dentry_ino && next > xattr_ino,
+        "next_ino ({next}) fell back below an ino the replay window mentions \
+         (dentry child {dentry_ino}, xattr key {xattr_ino}) — the allocator will \
+         RE-MINT it over the survivor (spec DUR-8c)"
+    );
+    let fresh = kv.allocate_ino();
+    assert!(
+        fresh > dentry_ino && fresh > xattr_ino,
+        "the allocator minted ino {fresh}, at or below a mentioned ino"
+    );
+    kv.shutdown().await.expect("shutdown");
+}
+
+/// **DUR-8e** — a declared plaintext length must be bounded by the block
+/// size BEFORE anything allocates from it. On a compression-only volume
+/// nothing authenticates the on-disk length field.
+#[test]
+fn dur8e_declared_plaintext_length_is_bounded_by_the_block_size() {
+    use squeezefs::crypto_compress::CryptoCompressState;
+
+    let state = CryptoCompressState::new("lz4".to_string(), "none".to_string(), None);
+    state.init_scratch_pool(64 * 1024);
+
+    // A legitimate image round-trips.
+    let payload = vec![0x5Au8; 4096];
+    let img = state.compress(&payload).expect("compress");
+    assert_eq!(
+        state.decompress(&img).expect("decompress").as_ref(),
+        &payload[..]
+    );
+
+    // A hostile length prefix (4 GiB) must be refused, not allocated.
+    let mut hostile = img.to_vec();
+    hostile[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    let err = state
+        .decompress(&hostile)
+        .expect_err("a 4 GiB declared plaintext must be refused before allocating");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("block bound") || msg.contains("plaintext"),
+        "the refusal must name the bound it enforced, got: {msg}"
+    );
+}
+
+/// **DUR-8b** — the layout-delta chain cap must bound the DURABLE chain.
+/// The caller's `layout_delta_chain` is a RAM counter that every
+/// metadata-cache refill resets to 0, so a publish stream that refills
+/// (eviction, invalidate, remount) stacked deltas without limit and the
+/// knob that claims to bound them bounded nothing — only node compaction
+/// did. The backend half must refuse a delta once the on-disk chain is at
+/// the cap, forcing a full re-base.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dur8b_the_chain_cap_bounds_the_durable_delta_chain() {
+    use squeezefs::layout_wire::{LayoutDelta, LayoutMetadata};
+
+    let _g = FaultGuard;
+    let (kv, _file) = sandbox(VOL_LEN).await;
+
+    const CAP: u32 = 4;
+    squeezefs::routing::set_layout_delta_chain_override(Some(CAP));
+
+    let ino = kv
+        .create(1, "chained.bin", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("create")
+        .ino;
+    let mut layout = LayoutMetadata {
+        file_type: "striped".into(),
+        size: 0,
+        block_map_id: Some(format!("block_map_{ino}")),
+        block_prefix: None,
+        file_id: None,
+        data_key: None,
+        block_map: Some(std::collections::HashMap::new()),
+    };
+    // The persisted base every delta folds onto.
+    let full = bincode::serialize(&layout).expect("serialize base");
+    kv.set_layout_and_size(ino, &full, 0)
+        .await
+        .expect("persist base");
+
+    // A publish stream that NEVER re-bases from the caller side — i.e.
+    // every save arrives with a freshly-refilled (zero) RAM chain.
+    let mut deltas = 0u32;
+    let mut refusals = 0u32;
+    for b in 0..(CAP * 4) {
+        let key = format!("oss0://{}", u64::from(b) * 65536);
+        layout.block_map.as_mut().unwrap().insert(b, key.clone());
+        layout.size = u64::from(b + 1) * 65536;
+        let full = bincode::serialize(&layout).expect("serialize");
+        let delta = LayoutDelta::from_final_state(
+            &layout.file_type,
+            layout.size,
+            layout.block_map_id.as_deref(),
+            None,
+            None,
+            None,
+            vec![(b, key)],
+        );
+        let used = kv
+            .merge_layout_and_size(ino, &delta, bytes::Bytes::from(full), layout.size)
+            .await
+            .expect("publish");
+        if used {
+            deltas += 1;
+        } else {
+            refusals += 1;
+            deltas = 0; // a full Put re-bases the chain
+        }
+        assert!(
+            deltas <= CAP,
+            "the DURABLE delta chain reached {deltas} with the cap at {CAP} — the cap \
+             is a RAM-only counter that a cache refill resets (spec DUR-8b)"
+        );
+    }
+    assert!(
+        refusals > 0,
+        "the backend never re-based: the leg proved nothing"
+    );
+
+    squeezefs::routing::set_layout_delta_chain_override(None);
+    kv.shutdown().await.expect("shutdown");
+}

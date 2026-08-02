@@ -747,6 +747,35 @@ impl NodeSnapshot {
         Ok(look)
     }
 
+    /// **DUR-8b** — how many `Delta` records are stacked above the key's
+    /// newest base (`Put`/`Delete`) in THIS snapshot, i.e. the DURABLE
+    /// chain depth a fold would have to apply. The publish path's chain
+    /// cap was a RAM-only counter that a metadata-cache refill reset to
+    /// zero, so the durable chain was bounded only by node compaction —
+    /// not by the knob that claims to bound it.
+    ///
+    /// Same gather as [`Self::lookup`], newest-first, counting only
+    /// (never decoding): the deltas above the base are exactly the chain.
+    pub fn delta_depth(&self, key: &[u8]) -> u32 {
+        let tg = Self::run_group(&self.tail, key);
+        let sg = Self::run_group(&self.stable, key);
+        let bg = self.base.group_bounds(key);
+        let gather = tg
+            .clone()
+            .rev()
+            .map(|i| self.tail[i].record_ref())
+            .chain(sg.clone().rev().map(|i| self.stable[i].record_ref()))
+            .chain(bg.map(|i| self.base.record_ref(i)));
+        let mut depth = 0u32;
+        for r in gather {
+            match r.kind {
+                super::record::RecordKind::Delta => depth += 1,
+                _ => break,
+            }
+        }
+        depth
+    }
+
     /// Map a fold's borrowed value back to its provider for a zero-copy
     /// `Bytes` (the borrow is always one gathered record's value slice;
     /// the groups are re-walked by pointer — bounded by the chain length).

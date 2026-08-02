@@ -8669,6 +8669,16 @@ impl DataRouter {
                     // PR VL6a: in-flight until `save_metadata_to_backend`
                     // below publishes the spill layout (scope-held).
                     let _inflight = block_allocator.inflight_register(be_offset);
+                    // **DUR-8f**: the two `?` exits below — the device
+                    // write and the layout commit — used to abandon this
+                    // offset with refcount 1 and no map naming it (a leak
+                    // only fsck could find). The mint guard frees it on
+                    // any exit before custody transfers, exactly as the
+                    // `write_striped` arm two functions away already did.
+                    let mut minted = crate::assembly_tasks::MintedBlockGuard::new(
+                        block_allocator.clone(),
+                        be_offset,
+                    );
                     // Size-carrying mapping (`bk:0:packed_len` — see
                     // `parse_block_mapping`).
                     let stored_block_key = format!(
@@ -8702,6 +8712,9 @@ impl DataRouter {
                     updated_meta.layout_dirty = false;
                     self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
                         .await?;
+                    // DUR-8f: the layout names the block — custody
+                    // transferred; from here the ordinary free paths own it.
+                    minted.disarm();
                     self.metadata_cache.insert(ino, updated_meta);
                     // Release the superseded stale ring entry (returns its
                     // budget) and any older durable copy it had.

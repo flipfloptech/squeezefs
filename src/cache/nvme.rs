@@ -544,7 +544,32 @@ pub const EXTENT_RECORD_MAGIC: [u8; 8] = *b"SQZEXT01";
 /// Record-level format version of [`ExtentRecord`] (belt-and-braces under
 /// the dir-level [`STAGING_FORMAT_VERSION`] fence: a record naming a newer
 /// version than this binary understands is refused loudly, never parsed).
-pub const EXTENT_RECORD_VERSION: u32 = 1;
+///
+/// **DUR-8a**: v1's digest covered `bytes[40..]` only — the body — so
+/// `fencing_token`, `block_idx`, `flags` and `count` were UNCOVERED,
+/// contradicting the type's own "checksummed as a unit" doc: a corrupted
+/// `block_idx` silently misattributed staged extents to another block.
+/// v2 covers the header too (its own digest field zeroed). v1 records are
+/// still accepted with the v1 rule — an unclean shutdown under an older
+/// binary is exactly when they exist, and refusing them would discard
+/// acked custody — but nothing writes v1 again.
+pub const EXTENT_RECORD_VERSION_V1: u32 = 1;
+pub const EXTENT_RECORD_VERSION: u32 = 2;
+/// Header length and digest offset shared by v1 and v2.
+const EXTENT_RECORD_HDR_LEN: usize = 40;
+const EXTENT_RECORD_SUM_OFF: usize = 32;
+
+/// The DUR-8a v2 digest: the header with its own checksum field zeroed,
+/// then the body.
+fn extent_record_checksum(header: &[u8], body: &[u8]) -> u64 {
+    let mut hdr = [0u8; EXTENT_RECORD_HDR_LEN];
+    hdr.copy_from_slice(&header[..EXTENT_RECORD_HDR_LEN]);
+    hdr[EXTENT_RECORD_SUM_OFF..EXTENT_RECORD_SUM_OFF + 8].fill(0);
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    h.update(&hdr);
+    h.update(body);
+    h.digest()
+}
 
 /// Why an extent-record parse refused (both are LOUD at the consumer).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -603,15 +628,23 @@ impl ExtentRecord {
         for (_, data) in &self.extents {
             body.extend_from_slice(data);
         }
-        let checksum = xxh3_64(&body);
-        let mut out = Vec::with_capacity(40 + body.len());
+        let mut out = Vec::with_capacity(EXTENT_RECORD_HDR_LEN + body.len());
         out.extend_from_slice(&EXTENT_RECORD_MAGIC);
         out.extend_from_slice(&self.version.to_le_bytes());
         out.extend_from_slice(&self.fencing_token.to_le_bytes());
         out.extend_from_slice(&self.block_idx.to_le_bytes());
         out.extend_from_slice(&u32::from(self.base_deferred).to_le_bytes());
         out.extend_from_slice(&(self.extents.len() as u32).to_le_bytes());
-        out.extend_from_slice(&checksum.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes()); // digest placeholder
+                                                    // DUR-8a: the digest covers the HEADER (its own field zeroed) and
+                                                    // the body — the record really is checksummed as a unit now.
+        let checksum = if self.version >= EXTENT_RECORD_VERSION {
+            extent_record_checksum(&out, &body)
+        } else {
+            xxh3_64(&body)
+        };
+        out[EXTENT_RECORD_SUM_OFF..EXTENT_RECORD_SUM_OFF + 8]
+            .copy_from_slice(&checksum.to_le_bytes());
         out.extend_from_slice(&body);
         out
     }
@@ -639,7 +672,17 @@ impl ExtentRecord {
         if bytes.len() < table_end {
             return Err(torn("short table"));
         }
-        if xxh3_64(&bytes[40..]) != checksum {
+        // DUR-8a: v2 covers the header, v1 only the body (still read so
+        // an older binary's crash residue keeps its acked custody).
+        let ok = if version >= EXTENT_RECORD_VERSION {
+            extent_record_checksum(
+                &bytes[..EXTENT_RECORD_HDR_LEN],
+                &bytes[EXTENT_RECORD_HDR_LEN..],
+            ) == checksum
+        } else {
+            xxh3_64(&bytes[EXTENT_RECORD_HDR_LEN..]) == checksum
+        };
+        if !ok {
             return Err(torn("checksum mismatch"));
         }
         let mut extents = Vec::with_capacity(count);

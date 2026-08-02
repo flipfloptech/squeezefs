@@ -182,6 +182,11 @@ pub struct CryptoCompressState {
     /// (`DataRouter::set_crypto` initializes it from the configured block
     /// size); uninitialized states stay on the heap `Vec` path.
     scratch_pool: Arc<once_cell::sync::OnceCell<Arc<BufferPool>>>,
+    /// **DUR-8e**: the configured block size — the bound every declared
+    /// plaintext length must respect before anything allocates from it.
+    /// `0` until [`Self::init_scratch_pool`] records it (then
+    /// `crate::default_block_size()` answers).
+    max_plaintext: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// The key-encryption key: the AEAD built over the KDF-derived KEK plus
@@ -321,6 +326,7 @@ impl CryptoCompressState {
             nonce_counter,
             salt,
             scratch_pool: Arc::new(once_cell::sync::OnceCell::new()),
+            max_plaintext: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -419,6 +425,10 @@ impl CryptoCompressState {
     /// worst-case transform output). Idempotent (first init wins); no-op for
     /// passthrough states, which never transform.
     pub fn init_scratch_pool(&self, block_size: usize) {
+        // DUR-8e: record the plaintext bound even for passthrough states
+        // (harmless there, and one less thing to get wrong later).
+        self.max_plaintext
+            .store(block_size, std::sync::atomic::Ordering::Relaxed);
         if self.is_passthrough() {
             return;
         }
@@ -472,22 +482,76 @@ impl CryptoCompressState {
         }
     }
 
+    /// **DUR-8e** — the largest plaintext a stored image may declare.
+    /// One block is the product's maximum unit of stored plaintext (the
+    /// inline/staged forms are strictly smaller), so anything above it is
+    /// a corrupt or hostile length field, never a legitimate payload.
+    /// Sourced from the configured block size, which
+    /// [`Self::init_scratch_pool`] records at mount.
+    fn max_plaintext_len(&self) -> usize {
+        match self
+            .max_plaintext
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => crate::routing::default_block_size() as usize,
+            n => n,
+        }
+    }
+
     pub fn decompress<'a>(
         &self,
         data: &'a [u8],
     ) -> Result<std::borrow::Cow<'a, [u8]>, SqueezefsError> {
+        let cap = self.max_plaintext_len();
         match self.compression_mode {
             CompressionMode::Lz4 => {
+                // DUR-8e: `decompress_size_prepended` ALLOCATES from the
+                // on-disk 4-byte length prefix. On a compression-only
+                // volume nothing authenticates that field, so bound it
+                // before the allocation, not after.
+                if data.len() < 4 {
+                    return Err(SqueezefsError::InvalidOperation(
+                        "LZ4 image shorter than its size prefix".to_string(),
+                    ));
+                }
+                let declared = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                if declared > cap {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "LZ4 image declares a {declared} B plaintext, above the {cap} B \
+                         block bound — corrupt or hostile length field"
+                    )));
+                }
                 let decompressed = lz4_flex::decompress_size_prepended(data).map_err(|e| {
                     SqueezefsError::InvalidOperation(format!("LZ4 decompression failed: {:?}", e))
                 })?;
                 Ok(std::borrow::Cow::Owned(decompressed))
             }
             CompressionMode::Zstd => {
-                let decompressed = zstd::decode_all(std::io::Cursor::new(data)).map_err(|e| {
-                    SqueezefsError::InvalidOperation(format!("ZSTD decompression failed: {:?}", e))
-                })?;
-                Ok(std::borrow::Cow::Owned(decompressed))
+                // DUR-8e: zstd streams, so the bound rides the READER —
+                // one byte past the cap and the image is refused, with
+                // allocation bounded by construction.
+                use std::io::Read;
+                let mut dec = zstd::stream::read::Decoder::new(std::io::Cursor::new(data))
+                    .map_err(|e| {
+                        SqueezefsError::InvalidOperation(format!("ZSTD decoder init failed: {e:?}"))
+                    })?;
+                let mut out = Vec::new();
+                let read = dec
+                    .by_ref()
+                    .take(cap as u64 + 1)
+                    .read_to_end(&mut out)
+                    .map_err(|e| {
+                        SqueezefsError::InvalidOperation(format!(
+                            "ZSTD decompression failed: {e:?}"
+                        ))
+                    })?;
+                if read > cap {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "ZSTD image expands past the {cap} B block bound — corrupt or \
+                         hostile payload"
+                    )));
+                }
+                Ok(std::borrow::Cow::Owned(out))
             }
             CompressionMode::None => Ok(std::borrow::Cow::Borrowed(data)),
         }

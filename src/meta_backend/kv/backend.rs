@@ -1301,15 +1301,29 @@ impl KvMetaBackend {
                     TREE_ALLOC_RESERVED => continue,
                     _ => continue,
                 };
-                if tree_id == TREE_INODES {
-                    if let Ok(ino) = decode_inode_key(&rec.key) {
-                        match crate::meta_backend::split_guest_local(ino) {
-                            Some((slot, raw)) => {
-                                let e = max_replayed_guest.entry(slot).or_insert(0);
-                                *e = (*e).max(raw);
-                            }
-                            None => max_replayed_ino = max_replayed_ino.max(ino),
+                // §4.8 recovery fold — **DUR-8c**: every ino the replay
+                // window MENTIONS raises the watermark, not just the ones
+                // with a surviving inode record. A torn-dropped create
+                // whose dentry (child ino in the VALUE) or xattr (ino in
+                // the KEY) survived would otherwise let `next_ino` fall
+                // back and RE-MINT that ino over the survivor.
+                let mentioned: Option<u64> = match tree_id {
+                    TREE_INODES => decode_inode_key(&rec.key).ok(),
+                    TREE_DENTRIES => super::record::DentryValue::decode(&rec.value)
+                        .ok()
+                        .map(|d| d.child_ino),
+                    TREE_XATTRS => super::record::decode_xattr_key(&rec.key)
+                        .ok()
+                        .map(|(ino, _, _)| ino),
+                    _ => None,
+                };
+                if let Some(ino) = mentioned {
+                    match crate::meta_backend::split_guest_local(ino) {
+                        Some((slot, raw)) => {
+                            let e = max_replayed_guest.entry(slot).or_insert(0);
+                            *e = (*e).max(raw);
                         }
+                        None => max_replayed_ino = max_replayed_ino.max(ino),
                     }
                 }
                 tree.apply_replayed(
@@ -6118,7 +6132,19 @@ impl KvMetaBackend {
                         let base_ok = XattrValue::decode(&cur)
                             .map(|x| !x.value.starts_with(b"{"))
                             .unwrap_or(false);
-                        if base_ok {
+                        // DUR-8b (aggregated twin of the direct path):
+                        // the cap must bound the DURABLE chain, not the
+                        // caller's RAM counter, which a metadata-cache
+                        // refill resets to 0.
+                        let max_chain = crate::routing::layout_delta_max_chain();
+                        let depth = match self.xattrs.delta_depth(&key).await {
+                            Ok(d) => d,
+                            Err(e) => {
+                                failed.push((op.done, e.into()));
+                                continue;
+                            }
+                        };
+                        if base_ok && max_chain > 0 && depth < max_chain {
                             use_delta = self.layout_deltas_ready().await;
                         }
                     }
@@ -6223,7 +6249,15 @@ impl KvMetaBackend {
                 let base_ok = XattrValue::decode(&cur)
                     .map(|x| !x.value.starts_with(b"{"))
                     .unwrap_or(false);
-                if base_ok {
+                // DUR-8b: the cap must bound the DURABLE chain. The
+                // caller's `layout_delta_chain` is a RAM counter that a
+                // metadata-cache refill resets to 0, so before this probe
+                // the on-disk chain was bounded only by node compaction —
+                // not by `SQUEEZEFS_LAYOUT_DELTA_MAX_CHAIN`. One extra
+                // leaf resolve on the publish path, no record decodes.
+                let max_chain = crate::routing::layout_delta_max_chain();
+                let under_cap = max_chain > 0 && self.xattrs.delta_depth(&key).await? < max_chain;
+                if base_ok && under_cap {
                     use_delta = self.layout_deltas_ready().await;
                 }
             }

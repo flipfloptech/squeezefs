@@ -166,12 +166,36 @@ async fn merge_layout_and_size_delta_economy_and_equivalence() {
     // meta-plane audit did.
     let mut windows: Vec<(u32, u64, u64)> = Vec::new(); // (end, entries, bytes)
     let mut prev = (ring.written_entries(), ring.written_bytes());
+    // DUR-8b: the chain cap now bounds the DURABLE chain (the backend
+    // probes the on-disk delta depth instead of trusting the caller's RAM
+    // counter, which a metadata-cache refill resets). A streamed publish
+    // therefore re-bases with a full Put every `max_chain` deltas — the
+    // restored re-base cadence `publish_full_save_chain_cap` counts. This
+    // loop drives the BACKEND directly, so before DUR-8b it stacked an
+    // unbounded on-disk chain and every publish came back `used = true`.
+    let max_chain = squeezefs::routing::layout_delta_max_chain() as u64;
+    assert!(max_chain > 0, "the cap knob must be armed for this leg");
+    let mut expect_depth = 0u64;
+    let mut expect_rebases = 0u64;
     for b in 1..K {
         let used = publish_block(&routed, ino, &mut layout, b).await;
-        assert!(
+        let want_delta = expect_depth < max_chain;
+        if want_delta {
+            expect_depth += 1;
+        } else {
+            expect_depth = 0;
+            expect_rebases += 1;
+        }
+        assert_eq!(
             used,
-            "publish of block {b} onto a live inline base must stage the \
-             O(batch) delta record (lever 2 engagement) — full-Put fallback taken instead"
+            want_delta,
+            "publish of block {b}: expected {} (durable chain depth {expect_depth}, cap \
+             {max_chain}) — lever 2 engagement / DUR-8b re-base cadence",
+            if want_delta {
+                "the O(batch) delta record"
+            } else {
+                "a full-Put re-base"
+            }
         );
         if (b + 1) % 64 == 0 {
             let now = (ring.written_entries(), ring.written_bytes());
@@ -184,10 +208,15 @@ async fn merge_layout_and_size_delta_economy_and_equivalence() {
     let full_commits = META_KV_LAYOUT_FULL_COMMITS.load(Ordering::Relaxed) - full_commits_before;
     assert_eq!(
         delta_commits,
-        (K - 1) as u64,
-        "every post-base publish must engage the delta path"
+        (K - 1) as u64 - expect_rebases,
+        "every post-base publish must engage the delta path except the DUR-8b \
+         chain-cap re-bases"
     );
-    assert_eq!(full_commits, 1, "exactly the first publish goes full");
+    assert_eq!(
+        full_commits,
+        1 + expect_rebases,
+        "exactly the first publish plus the chain-cap re-bases go full"
+    );
 
     println!("== delta-publish journal economy (K={K}) ==");
     println!("window        entries  bytes      bytes/publish");

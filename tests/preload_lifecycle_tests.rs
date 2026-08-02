@@ -15,13 +15,22 @@
 //!   — rate-limited, reads never fire. Tested against an injected
 //!   invalidator hook (production wraps the fuse3 `Notify` handle; the
 //!   kernel-delivery leg is the gate script's no-settle parity row).
+//! - **POSIX-8** (spec §5): the rate limiter is a DATA-cache economy,
+//!   never a size-coherence policy. A ring write that grows the file
+//!   must refresh the kernel's `i_size` immediately or `lseek(SEEK_END)`
+//!   — including the shim's own SEEK_END, which PERF-7 deliberately
+//!   routes to the kernel — lands an append at a stale offset. Every
+//!   size-changing ring write therefore fires an ATTRS-ONLY
+//!   invalidation (`off < 0`: no page-cache work, exempt from the
+//!   window), and the last unbind of an inode fires one whole-inode
+//!   shootdown so nothing the window suppressed outlives the session.
 //! - **In-flight teardown**: a session torn down (EOF) while a handoff
 //!   is parked completes harmlessly (the completion's mapping Arc is
 //!   the §5.3.1 rule-4 ordering) — no panic, no poison, zero residue.
 
 use squeezefs::fuse_client::METRICS;
 use squeezefs::ipc_host::{DataOp, IpcHost, IpcHostConfig, SessionSink, SlotCompletion};
-use squeezefs::ipc_service::DataPlaneSink;
+use squeezefs::ipc_service::{DataPlaneSink, InvalScope};
 use squeezefs_il::session::{RingOutcome, Session};
 use squeezefs_ipc::wire::BootstrapBlob;
 
@@ -137,6 +146,10 @@ impl SessionSink for InoMapSink {
         self.inner.on_bind(self.translate(ino));
     }
 
+    fn on_last_unbind(&self, ino: u64) {
+        self.inner.on_last_unbind(self.translate(ino));
+    }
+
     fn flush(&self) {
         // Forward the end-of-sweep hook (SessionSink::flush liveness
         // rule): direct-drive SQEs published during serve_data must
@@ -145,10 +158,10 @@ impl SessionSink for InoMapSink {
     }
 }
 
-/// Recorded invalidations (the injected W1 hook).
+/// Recorded invalidations (the injected W1 hook): `(ino, scope)`.
 #[derive(Default)]
 struct InvalLog {
-    events: Mutex<Vec<u64>>,
+    events: Mutex<Vec<(u64, InvalScope)>>,
 }
 
 impl InvalLog {
@@ -157,7 +170,19 @@ impl InvalLog {
             .lock()
             .expect("inval log mutex never poisons")
             .iter()
-            .filter(|i| **i == ino)
+            .filter(|(i, _)| *i == ino)
+            .count()
+    }
+
+    /// POSIX-8: counts by scope — an attrs-only refresh is NOT a
+    /// page-cache shootdown, and the distinction is the whole point of
+    /// exempting it from the rate limiter.
+    fn count_scope(&self, ino: u64, scope: InvalScope) -> usize {
+        self.events
+            .lock()
+            .expect("inval log mutex never poisons")
+            .iter()
+            .filter(|(i, s)| *i == ino && *s == scope)
             .count()
     }
 }
@@ -191,12 +216,12 @@ impl Fixture {
         let inval = Arc::new(InvalLog::default());
         let hook = {
             let inval = Arc::clone(&inval);
-            Arc::new(move |ino: u64| {
+            Arc::new(move |ino: u64, scope: InvalScope| {
                 inval
                     .events
                     .lock()
                     .expect("inval log mutex never poisons")
-                    .push(ino);
+                    .push((ino, scope));
             })
         };
         let sink = Arc::new(InoMapSink {
@@ -534,5 +559,96 @@ async fn lifecycle_stats_fields_export() {
     ] {
         assert!(m.get(key).is_some(), "stats inode must export {key}");
     }
+    fx.host.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// POSIX-8 (spec §5): size coherence is not subject to the data-cache
+// rate limiter, and nothing the limiter suppressed outlives the binding.
+// ---------------------------------------------------------------------------
+
+/// The headline: with a window far longer than the test, a ring write
+/// that GROWS the file still refreshes the kernel's attributes — else
+/// `lseek(SEEK_END)` (the shim routes it to the kernel by design —
+/// PERF-7) reads a stale `i_size` and an append lands on top of live
+/// data. In-window writes that do NOT change the size stay suppressed:
+/// the economy is preserved, only the size law is exempted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn size_changing_ring_writes_fire_attrs_only_invalidations_inside_the_window() {
+    // 60 s window: every whole-inode shootdown after the first write is
+    // suppressed for the whole test, so anything that fires is the
+    // POSIX-8 exemption and nothing else.
+    let fx = Fixture::new("posix8-size", 0, 60_000).await;
+    let session = fx.establish();
+    let (ino, fd) = fx.create_file("posix8.bin").await;
+
+    let grant = session.bind(fd.as_raw_fd()).expect("bind");
+    wait_until("bind invalidation", Duration::from_secs(5), || {
+        fx.inval.count_for(ino) >= 1
+    });
+    // BIND + the first write per window are whole-inode shootdowns.
+    let w = vec![7u8; 4096];
+    tokio::task::block_in_place(|| ring_write_ok(&session, grant.binding_id, &w, 0));
+    wait_until("first-write shootdown", Duration::from_secs(5), || {
+        fx.inval.count_scope(ino, InvalScope::Whole) >= 2
+    });
+    let attrs_before = fx.inval.count_scope(ino, InvalScope::AttrsOnly);
+
+    // An APPEND inside the window: the file grows, so the kernel's size
+    // must be refreshed — attrs-only, no page-cache shootdown.
+    tokio::task::block_in_place(|| ring_write_ok(&session, grant.binding_id, &w, 4096));
+    wait_until("size-change attrs refresh", Duration::from_secs(5), || {
+        fx.inval.count_scope(ino, InvalScope::AttrsOnly) > attrs_before
+    });
+    assert_eq!(
+        fx.inval.count_scope(ino, InvalScope::Whole),
+        2,
+        "the size refresh must NOT be a page-cache shootdown (that is what \
+         the 1 s window is protecting)"
+    );
+
+    // A rewrite of already-written bytes changes no size: still suppressed.
+    let attrs_after_append = fx.inval.count_scope(ino, InvalScope::AttrsOnly);
+    tokio::task::block_in_place(|| ring_write_ok(&session, grant.binding_id, &w, 0));
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        fx.inval.count_scope(ino, InvalScope::AttrsOnly),
+        attrs_after_append,
+        "an in-place rewrite changes no size — the window still applies"
+    );
+    fx.host.shutdown();
+}
+
+/// The second half of POSIX-8: the LAST unbind of an inode fires one
+/// whole-inode invalidation, so whatever the window suppressed during
+/// the session cannot outlive it (the next opener — kernel-served —
+/// must not read a cached page that a ring write superseded).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_last_unbind_of_an_inode_fires_a_whole_inode_invalidation() {
+    let fx = Fixture::new("posix8-unbind", 0, 60_000).await;
+    let session = fx.establish();
+    let (ino, fd) = fx.create_file("posix8-unbind.bin").await;
+
+    let first = session.bind(fd.as_raw_fd()).expect("bind");
+    let second = session.bind(fd.as_raw_fd()).expect("second bind on the ino");
+    wait_until("bind invalidations", Duration::from_secs(5), || {
+        fx.inval.count_scope(ino, InvalScope::Whole) >= 2
+    });
+    let before = fx.inval.count_scope(ino, InvalScope::Whole);
+
+    // Not the last: no shootdown.
+    session.unbind(first.binding_id);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        fx.inval.count_scope(ino, InvalScope::Whole),
+        before,
+        "an inode still bound elsewhere must not be shot down"
+    );
+
+    // The last one is.
+    session.unbind(second.binding_id);
+    wait_until("last-unbind shootdown", Duration::from_secs(5), || {
+        fx.inval.count_scope(ino, InvalScope::Whole) > before
+    });
     fx.host.shutdown();
 }

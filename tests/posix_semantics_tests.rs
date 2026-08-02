@@ -366,3 +366,229 @@ async fn symlink_size_survives_attr_cache_expiry() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// POSIX-2 — sparse files must be visible: lseek(SEEK_DATA/SEEK_HOLE) and
+// an st_blocks derived from actual allocation.
+// ---------------------------------------------------------------------------
+
+const SEEK_DATA: u32 = libc::SEEK_DATA as u32;
+const SEEK_HOLE: u32 = libc::SEEK_HOLE as u32;
+
+async fn write_at(h: &H, ino: u64, off: u64, data: &[u8]) {
+    let w =
+        h.fs.write(
+            h.req,
+            ino,
+            0,
+            off,
+            bytes::Bytes::copy_from_slice(data),
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(w.written as usize, data.len(), "short write at off {off}");
+}
+
+async fn seek(h: &H, ino: u64, off: u64, whence: u32) -> Result<u64, i32> {
+    match h.fs.lseek(h.req, ino, 0, off, whence).await {
+        Ok(r) => Ok(r.offset),
+        Err(e) => Err(-libc::c_int::from(e)),
+    }
+}
+
+/// `st_blocks` in 512-byte units, as `stat(2)` reports it.
+async fn st_blocks(h: &H, ino: u64) -> u64 {
+    h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr.blocks
+}
+
+async fn fsync_ino(h: &H, ino: u64) {
+    h.fs.fsync(h.req, ino, 0, false).await.unwrap();
+}
+
+/// A striped file with two written blocks separated by two never-written
+/// ones: the canonical `dd seek=` sparse shape. `SEEK_HOLE`/`SEEK_DATA`
+/// must land on the block boundaries — with no lseek handler the kernel
+/// falls back to "the whole file is data", and `cp --sparse`, `tar -S`,
+/// `rsync -S`, and `qemu-img` all expand the holes to full-size copies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lseek_finds_holes_and_data_in_a_striped_file() {
+    let h = make().await;
+    let ino = create_in(&h, 1, "posix2_striped").await;
+
+    // Blocks 0 and 3 written; blocks 1 and 2 never touched. Size 4 blocks.
+    write_at(&h, ino, 0, &vec![0x11u8; BS as usize]).await;
+    write_at(&h, ino, 3 * BS, &vec![0x33u8; BS as usize]).await;
+    fsync_ino(&h, ino).await;
+    let size = h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr.size;
+    assert_eq!(size, 4 * BS, "sparse write must extend the size");
+
+    assert_eq!(
+        seek(&h, ino, 0, SEEK_DATA).await,
+        Ok(0),
+        "block 0 holds data"
+    );
+    assert_eq!(
+        seek(&h, ino, 0, SEEK_HOLE).await,
+        Ok(BS),
+        "the hole starts where block 1 does"
+    );
+    assert_eq!(
+        seek(&h, ino, BS, SEEK_HOLE).await,
+        Ok(BS),
+        "an offset already inside a hole returns itself"
+    );
+    assert_eq!(
+        seek(&h, ino, BS, SEEK_DATA).await,
+        Ok(3 * BS),
+        "the next data after the hole is block 3"
+    );
+    assert_eq!(
+        seek(&h, ino, 2 * BS + 17, SEEK_DATA).await,
+        Ok(3 * BS),
+        "an unaligned offset inside the hole still finds block 3"
+    );
+    assert_eq!(
+        seek(&h, ino, 3 * BS, SEEK_HOLE).await,
+        Ok(4 * BS),
+        "the implicit hole at EOF terminates the last data run"
+    );
+
+    // Past EOF is ENXIO for both whences (POSIX).
+    assert_eq!(seek(&h, ino, 4 * BS, SEEK_DATA).await, Err(libc::ENXIO));
+    assert_eq!(seek(&h, ino, 4 * BS, SEEK_HOLE).await, Err(libc::ENXIO));
+}
+
+/// `st_blocks` must reflect ALLOCATION, not size: two of four blocks are
+/// mapped, so `du` must report half the apparent size. Synthesizing it
+/// from size is what makes `cp --sparse=auto` (whose heuristic is
+/// `st_blocks * 512 < st_size`) never even look for holes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn st_blocks_reflects_allocation_for_a_sparse_striped_file() {
+    let h = make().await;
+    let ino = create_in(&h, 1, "posix2_blocks").await;
+
+    write_at(&h, ino, 0, &vec![0x11u8; BS as usize]).await;
+    write_at(&h, ino, 3 * BS, &vec![0x33u8; BS as usize]).await;
+    fsync_ino(&h, ino).await;
+
+    let blocks = st_blocks(&h, ino).await;
+    let dense = (4 * BS) / 512;
+    let sparse = (2 * BS) / 512;
+    assert_eq!(
+        blocks, sparse,
+        "st_blocks must count the 2 allocated blocks ({sparse} × 512-B units), \
+         not the {dense} a size-derived synthesis reports"
+    );
+}
+
+/// `fallocate(PUNCH_HOLE)` must become visible to both instruments: the
+/// punched block is a hole for lseek and stops counting toward st_blocks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn punched_hole_is_visible_to_lseek_and_st_blocks() {
+    let h = make().await;
+    let ino = create_in(&h, 1, "posix2_punch").await;
+
+    write_at(&h, ino, 0, &vec![0x55u8; 4 * BS as usize]).await;
+    fsync_ino(&h, ino).await;
+    let dense_blocks = st_blocks(&h, ino).await;
+    assert_eq!(
+        dense_blocks,
+        (4 * BS) / 512,
+        "a dense file counts every block"
+    );
+    assert_eq!(
+        seek(&h, ino, 0, SEEK_HOLE).await,
+        Ok(4 * BS),
+        "a dense file has no hole before EOF"
+    );
+
+    h.fs.fallocate(
+        h.req,
+        ino,
+        0,
+        BS,
+        BS,
+        (libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE) as u32,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        seek(&h, ino, 0, SEEK_HOLE).await,
+        Ok(BS),
+        "the punched block must read as a hole"
+    );
+    assert_eq!(
+        seek(&h, ino, BS, SEEK_DATA).await,
+        Ok(2 * BS),
+        "data resumes at the block after the punch"
+    );
+    assert_eq!(
+        st_blocks(&h, ino).await,
+        dense_blocks - BS / 512,
+        "the punched block must stop counting toward st_blocks"
+    );
+}
+
+/// Inline and staged layouts hold no hole information — the honest (and
+/// the only POSIX-safe) answer there is "all data": SEEK_DATA returns the
+/// offset, SEEK_HOLE returns EOF. Reporting a hole where data lives would
+/// make `cp --sparse` silently drop bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lseek_reports_inline_and_staged_files_as_fully_populated() {
+    let h = make().await;
+    for (size, name) in [(2048usize, "posix2_inline"), (40_000usize, "posix2_staged")] {
+        let ino = create_in(&h, 1, name).await;
+        write_at(&h, ino, 0, &vec![0x7Eu8; size]).await;
+        let size = size as u64;
+
+        assert_eq!(
+            seek(&h, ino, 0, SEEK_DATA).await,
+            Ok(0),
+            "{name}: data at 0"
+        );
+        assert_eq!(
+            seek(&h, ino, 0, SEEK_HOLE).await,
+            Ok(size),
+            "{name}: the only hole is the implicit one at EOF"
+        );
+        assert_eq!(
+            seek(&h, ino, size / 2, SEEK_DATA).await,
+            Ok(size / 2),
+            "{name}: an interior offset is data"
+        );
+        assert_eq!(
+            seek(&h, ino, size, SEEK_DATA).await,
+            Err(libc::ENXIO),
+            "{name}: EOF is ENXIO"
+        );
+    }
+}
+
+/// Dirty custody is DATA: a block whose bytes are still parked in the RAM
+/// overlay / staging ring (never yet published into the block map) must
+/// never be reported as a hole — a `cp --sparse` racing writeback would
+/// otherwise skip acked bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unflushed_partial_block_is_data_not_a_hole() {
+    let h = make().await;
+    let ino = create_in(&h, 1, "posix2_dirty").await;
+
+    // Block 0 complete (write-through), block 3 only PARTIALLY written —
+    // its bytes are parked, not mapped.
+    write_at(&h, ino, 0, &vec![0x11u8; BS as usize]).await;
+    write_at(&h, ino, 3 * BS, &vec![0x33u8; 4096]).await;
+
+    assert_eq!(
+        seek(&h, ino, 3 * BS, SEEK_DATA).await,
+        Ok(3 * BS),
+        "parked (unflushed) bytes are DATA"
+    );
+    assert_eq!(
+        seek(&h, ino, 2 * BS, SEEK_DATA).await,
+        Ok(3 * BS),
+        "the hole before them still resolves to the parked block"
+    );
+}

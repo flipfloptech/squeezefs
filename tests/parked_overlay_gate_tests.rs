@@ -85,7 +85,7 @@ fn reset_knobs(patch_max: u64) {
 /// so small striped overwrites park instead).
 async fn make(uuid: [u8; 16], alloc_ns: &str, compressed: bool, patch_max: u64) -> H {
     reset_knobs(patch_max);
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
@@ -94,11 +94,7 @@ async fn make(uuid: [u8; 16], alloc_ns: &str, compressed: bool, patch_max: u64) 
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         b.path().to_str().unwrap(),
     ));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), alloc_ns)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(alloc_ns).await.unwrap());
     let s = tempdir().unwrap();
     let cache = TieredCache::new(
         Vec::new(), // cache-less: beyond-inline writes route STRIPED
@@ -106,7 +102,6 @@ async fn make(uuid: [u8; 16], alloc_ns: &str, compressed: bool, patch_max: u64) 
         Some("64MB"),
         Some("16MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

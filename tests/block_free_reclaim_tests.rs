@@ -111,7 +111,7 @@ async fn make_router() -> (
     NamedTempFile,
     tempfile::TempDir,
 ) {
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
@@ -121,7 +121,7 @@ async fn make_router() -> (
         b.path().to_str().unwrap(),
     ));
     let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "block_free_reclaim_test")
+        BlockAllocator::new("block_free_reclaim_test")
             .await
             .unwrap(),
     );
@@ -132,7 +132,6 @@ async fn make_router() -> (
         Some("64MB"),
         Some("16MB"),
         Some("32MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

@@ -77,7 +77,7 @@ struct H {
 /// writes route striped) — both promotion branches must be sparse-bounded.
 async fn make(staging: bool) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
@@ -85,11 +85,7 @@ async fn make(staging: bool) -> H {
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "sparse_bound_test")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("sparse_bound_test").await.unwrap());
     let (s, staging_paths) = if staging {
         let s = tempdir().unwrap();
         let p = vec![s.path().to_path_buf()];
@@ -103,7 +99,6 @@ async fn make(staging: bool) -> H {
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,
@@ -554,9 +549,8 @@ async fn delete_of_huge_sparse_file_is_omap() {
 
     let hwm_before = vm_hwm_kb();
     let t0 = std::time::Instant::now();
-    let mut con = h.fs.router.dlm.get_connection().await.unwrap();
     h.fs.router
-        .delete_file(&format!("inode_{ino}"), &mut con)
+        .delete_file(&format!("inode_{ino}"))
         .await
         .expect("delete_file");
     let took = t0.elapsed();

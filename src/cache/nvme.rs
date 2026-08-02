@@ -807,7 +807,6 @@ pub struct NvmeStaging {
     /// conviction, pre-existing on dev).
     pub backend_router:
         std::sync::Arc<once_cell::sync::OnceCell<std::sync::Weak<crate::routing::BackendRouter>>>,
-    redis_client: std::sync::Arc<crate::dlm::MetaClient>,
     /// Bounded merge-queue sender (P1-1). Full → StorageFull / backpressure.
     write_tx: mpsc::Sender<PendingStagedWrite>,
     pub current_staged_write_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -913,7 +912,6 @@ impl NvmeStaging {
         max_read_bytes: u64,
         block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
         nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
-        redis_client: std::sync::Arc<crate::dlm::MetaClient>,
         fs_generation: Option<&str>,
     ) -> Result<Self> {
         // Cache-less filesystem (format declared NO --disk-cache-paths):
@@ -1086,7 +1084,6 @@ impl NvmeStaging {
             block_allocator: block_allocator.clone(),
             nvme_writer: nvme_writer.clone(),
             backend_router,
-            redis_client: redis_client.clone(),
             write_tx,
             current_staged_write_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 initial_write_bytes,
@@ -1117,10 +1114,6 @@ impl NvmeStaging {
     /// Late-bind the owning `DataRouter` (weak) for merge-worker promotion.
     pub(crate) fn set_data_router(&self, router: std::sync::Weak<crate::routing::DataRouterInner>) {
         let _ = self.data_router.set(router);
-    }
-
-    pub fn redis_client(&self) -> &std::sync::Arc<crate::dlm::MetaClient> {
-        &self.redis_client
     }
 
     pub fn get_staged_path(&self, _file_id: &str) -> PathBuf {

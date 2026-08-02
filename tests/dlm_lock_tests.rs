@@ -24,7 +24,7 @@ use squeezefs::dlm::DlmClient;
 use std::time::Duration;
 
 fn dlm() -> DlmClient {
-    DlmClient::new("local").expect("local dlm")
+    DlmClient::new().expect("local dlm")
 }
 
 /// Contract 1: churn on unrelated keys must not fail a legitimate waiter.

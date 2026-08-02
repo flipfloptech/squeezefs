@@ -73,7 +73,7 @@ struct H {
 
 async fn make_with_write_cap(write_disk_cap: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BLOCK_SIZE.to_string());
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
@@ -81,11 +81,7 @@ async fn make_with_write_cap(write_disk_cap: &str) -> H {
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let nvme_dev = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "staging_budget_test")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("staging_budget_test").await.unwrap());
     let s = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -93,7 +89,6 @@ async fn make_with_write_cap(write_disk_cap: &str) -> H {
         Some("64MB"),
         Some("16MB"),
         Some(write_disk_cap),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme_dev.clone(),
         None,
@@ -398,18 +393,13 @@ async fn test_spilled_write_reads_back_new_data_and_returns_budget() {
 /// error, not a silent success-with-drop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_stage_write_shard_full_is_loud_never_lossy() {
-    let dlm = DlmClient::new("local").unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
         .set_len(64 * 1024 * 1024)
         .unwrap();
     let nvme_dev = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "staging_shard_full")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("staging_shard_full").await.unwrap());
     let dir = tempdir().unwrap();
     // < 10 MiB write cap => exactly one shard of exactly this capacity.
     let cache = TieredCache::new(
@@ -418,7 +408,6 @@ async fn test_stage_write_shard_full_is_loud_never_lossy() {
         Some("64MB"),
         Some("16MB"),
         Some("1MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme_dev.clone(),
         None,
@@ -578,18 +567,13 @@ async fn test_flush_guard_holds_do_not_stall_staging_churn() {
 /// staged entries must still be creditable (ledger survives recovery).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_remount_budget_counts_staged_entries_only() {
-    let dlm = DlmClient::new("local").unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
         .set_len(64 * 1024 * 1024)
         .unwrap();
     let nvme_dev = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "staging_budget_remount")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("staging_budget_remount").await.unwrap());
     let dir = tempdir().unwrap();
 
     // Both sessions carry the SAME filesystem generation: the remount
@@ -602,7 +586,6 @@ async fn test_remount_budget_counts_staged_entries_only() {
             Some("64MB"),
             Some("16MB"),
             Some("8MB"),
-            dlm.meta_client().clone(),
             ba.clone(),
             nvme_dev.clone(),
             Some("staging-budget-remount-generation"),

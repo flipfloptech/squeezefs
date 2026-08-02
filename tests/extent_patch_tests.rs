@@ -94,22 +94,17 @@ async fn open_fs(
     backing_path: &std::path::Path,
     staging: &std::path::Path,
 ) -> SqueezefsFilesystem {
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         backing_path.to_str().unwrap(),
     ));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), tag)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(tag).await.unwrap());
     let cache = TieredCache::new(
         vec![staging.to_path_buf()],
         Some("64MB"),
         Some("64MB"),
         Some("16MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

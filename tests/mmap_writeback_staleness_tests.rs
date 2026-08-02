@@ -64,7 +64,7 @@ struct H {
 
 async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BS.to_string());
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
@@ -73,11 +73,7 @@ async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         b.path().to_str().unwrap(),
     ));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), alloc_ns)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(alloc_ns).await.unwrap());
     let s = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -85,7 +81,6 @@ async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
         Some("64MB"),
         Some("16MB"),
         Some("64MB"), // roomy enough that spill refusals stay rare (loud EIO is FIND-RW5-A, not this hunt)
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

@@ -162,14 +162,10 @@ fn test_ledger_read_never_blocks_executor_while_bucket_holder_waits_shard_write(
             .expect("rt");
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
-            let dlm = squeezefs::dlm::DlmClient::new("local").expect("dlm");
             let ba = Arc::new(
-                squeezefs::block_allocator::BlockAllocator::new(
-                    dlm.meta_client().clone(),
-                    "ledger_wedge_test",
-                )
-                .await
-                .expect("allocator"),
+                squeezefs::block_allocator::BlockAllocator::new("ledger_wedge_test")
+                    .await
+                    .expect("allocator"),
             );
             let nvme_dev = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
                 backing_path.to_str().expect("utf8 path"),
@@ -180,7 +176,6 @@ fn test_ledger_read_never_blocks_executor_while_bucket_holder_waits_shard_write(
                 8 * 1024 * 1024,
                 ba,
                 nvme_dev,
-                dlm.meta_client().clone(),
                 None,
             )
             .await

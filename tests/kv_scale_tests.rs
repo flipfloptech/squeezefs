@@ -254,15 +254,11 @@ struct FuseHarness {
 }
 
 async fn fuse_fs(routed: Arc<RoutedMetaBackend>, test_id: &str) -> FuseHarness {
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let backing = NamedTempFile::new().unwrap();
     backing.as_file().set_len(16 * 1024 * 1024).unwrap();
     let nvme_dev = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
-    let block_alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), test_id)
-            .await
-            .expect("BlockAllocator"),
-    );
+    let block_alloc = Arc::new(BlockAllocator::new(test_id).await.expect("BlockAllocator"));
     let staging = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![staging.path().to_path_buf()],
@@ -270,7 +266,6 @@ async fn fuse_fs(routed: Arc<RoutedMetaBackend>, test_id: &str) -> FuseHarness {
         Some("16MB"),
         Some("64MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
         None,

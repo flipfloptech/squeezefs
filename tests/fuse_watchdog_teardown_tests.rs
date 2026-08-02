@@ -98,7 +98,7 @@ struct FsSandbox {
 }
 
 async fn fs_sandbox() -> FsSandbox {
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let backing = NamedTempFile::new().unwrap();
     backing.as_file().set_len(64 * 1024 * 1024).unwrap();
@@ -107,7 +107,7 @@ async fn fs_sandbox() -> FsSandbox {
     ));
 
     let block_alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "m4_watchdog_tests")
+        BlockAllocator::new("m4_watchdog_tests")
             .await
             .expect("BlockAllocator init"),
     );
@@ -119,7 +119,6 @@ async fn fs_sandbox() -> FsSandbox {
         Some("16MB"),
         Some("64MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
         None,

@@ -63,7 +63,7 @@ async fn make_with(uuid: [u8; 16], alloc_ns: &str) -> H {
     // including its ghost-convergence interplay with admission — live in
     // tests/ranged_read_tests.rs.
     std::env::set_var("SQUEEZEFS_READ_RANGED_THRESHOLD", "0");
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
@@ -71,11 +71,7 @@ async fn make_with(uuid: [u8; 16], alloc_ns: &str) -> H {
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), alloc_ns)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(alloc_ns).await.unwrap());
     let s = Some(tempdir().unwrap());
     let staging_dirs = s
         .as_ref()
@@ -87,7 +83,6 @@ async fn make_with(uuid: [u8; 16], alloc_ns: &str) -> H {
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

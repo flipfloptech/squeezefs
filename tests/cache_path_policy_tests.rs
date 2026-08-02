@@ -645,12 +645,11 @@ async fn test_cacheless_tiered_cache_library_contract() {
         .unwrap()
         .set_len(64 * 1024 * 1024)
         .unwrap();
-    let dlm = squeezefs::dlm::DlmClient::new("local").unwrap();
     let nvme_dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         data.path().to_str().unwrap(),
     ));
     let ba = std::sync::Arc::new(
-        squeezefs::block_allocator::BlockAllocator::new(dlm.meta_client().clone(), "cacheless_lib")
+        squeezefs::block_allocator::BlockAllocator::new("cacheless_lib")
             .await
             .unwrap(),
     );
@@ -660,7 +659,6 @@ async fn test_cacheless_tiered_cache_library_contract() {
         Some("64MB"),
         Some("16MB"),
         Some("8MB"),
-        dlm.meta_client().clone(),
         ba,
         nvme_dev,
         Some("v3:cacheless-test-generation"),

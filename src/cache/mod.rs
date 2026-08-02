@@ -56,7 +56,6 @@ impl TieredCache {
         read_disk_cache_size: Option<&str>,
         write_disk_cache_size: Option<&str>,
 
-        redis_client: std::sync::Arc<crate::dlm::MetaClient>,
         block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
         nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
         fs_generation: Option<&str>,
@@ -177,7 +176,6 @@ impl TieredCache {
             read_disk_limit,
             block_allocator.clone(),
             nvme_writer.clone(),
-            redis_client,
             fs_generation,
         )
         .await?;

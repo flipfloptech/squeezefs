@@ -44,18 +44,14 @@ struct H {
 async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
     // Default 4 MiB blocks: a 2 MiB file stays STAGED (the flood shape).
     std::env::remove_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE");
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), alloc_ns)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(alloc_ns).await.unwrap());
     let s = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -63,7 +59,6 @@ async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

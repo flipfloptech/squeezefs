@@ -220,7 +220,7 @@ async fn make_router() -> (
     NamedTempFile,
     tempfile::TempDir,
 ) {
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
@@ -228,7 +228,7 @@ async fn make_router() -> (
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
     let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "async_block_reclaim_test")
+        BlockAllocator::new("async_block_reclaim_test")
             .await
             .unwrap(),
     );
@@ -239,7 +239,6 @@ async fn make_router() -> (
         Some("64MB"),
         Some("16MB"),
         Some("32MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,
@@ -529,7 +528,7 @@ async fn clean_unmount_drains_queued_reclaims() {
     // Park the worker: only the dismount teardown can complete the queue.
     let _e = EnvGuard::set("SQUEEZEFS_RECLAIM_BATCH_MS", "600000");
     let (router, ba, _backing, s) = make_router().await;
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
 
     let mut freed = 0u64;
@@ -872,13 +871,8 @@ fn reclaim_crash_child_entry() {
         .build()
         .unwrap();
     rt.block_on(async move {
-        let dlm = DlmClient::new("local").unwrap();
         let nvme = Arc::new(NvmeBlockDev::new(backing.to_str().unwrap()));
-        let ba = Arc::new(
-            BlockAllocator::new(dlm.meta_client().clone(), "reclaim_crash_child")
-                .await
-                .unwrap(),
-        );
+        let ba = Arc::new(BlockAllocator::new("reclaim_crash_child").await.unwrap());
         let br = BackendRouter::new(
             ba.clone(),
             nvme.clone(),
@@ -1016,13 +1010,8 @@ async fn kill9_with_queued_discards_leaves_recoverable_volume() {
                 .block_untracked_free_refusals
                 .load(Ordering::Relaxed),
         );
-        let dlm = DlmClient::new("local").unwrap();
         let nvme = Arc::new(NvmeBlockDev::new(backing.to_str().unwrap()));
-        let ba = Arc::new(
-            BlockAllocator::new(dlm.meta_client().clone(), "reclaim_crash_recovery")
-                .await
-                .unwrap(),
-        );
+        let ba = Arc::new(BlockAllocator::new("reclaim_crash_recovery").await.unwrap());
         let br = BackendRouter::new(
             ba.clone(),
             nvme.clone(),
@@ -1132,18 +1121,14 @@ impl Drop for InplaceOff {
 
 async fn make_field_harness(test_id: &str) -> FieldH {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", FBS.to_string());
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), test_id)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(test_id).await.unwrap());
     let s = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -1151,7 +1136,6 @@ async fn make_field_harness(test_id: &str) -> FieldH {
         Some("32MB"),
         Some("64MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

@@ -44,7 +44,6 @@ async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
 
 struct H {
     fs: SqueezefsFilesystem,
-    dlm: DlmClient,
     req: Request,
     _meta: NamedTempFile,
     _backing: NamedTempFile,
@@ -72,22 +71,17 @@ async fn make(ns: &str, uuid: [u8; 16]) -> H {
     .await
     .unwrap();
 
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         backing.path().to_str().unwrap(),
     ));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), ns)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(ns).await.unwrap());
     let cache = TieredCache::new(
         vec![staging.path().to_path_buf()],
         Some("64MB"),
         Some("64MB"),
         Some("16MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,
@@ -113,7 +107,6 @@ async fn make(ns: &str, uuid: [u8; 16]) -> H {
     };
     H {
         fs,
-        dlm,
         req,
         _meta: meta,
         _backing: backing,
@@ -183,7 +176,7 @@ async fn blocked_acquire_counts_fail() {
 
     // A second client holds the ino's whole-file lock; the write path's
     // 5 s wait budget then fails the acquisition loudly.
-    let contender = DlmClient::new("local").unwrap();
+    let contender = DlmClient::new().unwrap();
     let path = squeezefs::keys::inode_path(ino);
     let held = contender
         .acquire_lock(&path, None, std::time::Duration::from_secs(5))

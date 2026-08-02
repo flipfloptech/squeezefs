@@ -416,25 +416,20 @@ struct RouterH {
 
 async fn router_h(tag: &str, meta_path: &std::path::Path, staging: &std::path::Path) -> RouterH {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BLOCK.to_string());
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), tag)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(tag).await.unwrap());
     let cache = TieredCache::new(
         vec![staging.to_path_buf()],
         Some("64MB"),
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         Some(GEN),

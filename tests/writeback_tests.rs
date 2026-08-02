@@ -48,7 +48,7 @@ async fn test_writeback_queue_full_deadlock() {
     std::env::set_var("SQUEEZEFS_WRITEBACK_QUEUE_CAP", "5");
 
     let test_id = "writeback_deadlock_test";
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let backing_temp = NamedTempFile::new().unwrap();
     let backing_path = backing_temp.path().to_path_buf();
@@ -58,11 +58,7 @@ async fn test_writeback_queue_full_deadlock() {
     }
     let nvme_dev = Arc::new(NvmeBlockDev::new(backing_path.to_str().unwrap()));
 
-    let block_alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), test_id)
-            .await
-            .unwrap(),
-    );
+    let block_alloc = Arc::new(BlockAllocator::new(test_id).await.unwrap());
 
     let temp_staging = tempdir().unwrap();
     let cache = TieredCache::new(
@@ -71,7 +67,6 @@ async fn test_writeback_queue_full_deadlock() {
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
         None,
@@ -172,7 +167,7 @@ async fn test_inline_file_layout_overflow() {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
 
     let test_id = "inline_overflow_test";
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let backing_temp = NamedTempFile::new().unwrap();
     let backing_path = backing_temp.path().to_path_buf();
@@ -182,11 +177,7 @@ async fn test_inline_file_layout_overflow() {
     }
     let nvme_dev = Arc::new(NvmeBlockDev::new(backing_path.to_str().unwrap()));
 
-    let block_alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), test_id)
-            .await
-            .unwrap(),
-    );
+    let block_alloc = Arc::new(BlockAllocator::new(test_id).await.unwrap());
 
     let temp_staging = tempdir().unwrap();
     let cache = TieredCache::new(
@@ -195,7 +186,6 @@ async fn test_inline_file_layout_overflow() {
         Some("16MB"),
         Some("32MB"),
         Some("32MB"),
-        dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
         None,
@@ -259,7 +249,7 @@ async fn test_small_block_map_stays_inline() {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
 
     let test_id = "indirect_map_test";
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let backing_temp = NamedTempFile::new().unwrap();
     let backing_path = backing_temp.path().to_path_buf();
@@ -269,11 +259,7 @@ async fn test_small_block_map_stays_inline() {
     }
     let nvme_dev = Arc::new(NvmeBlockDev::new(backing_path.to_str().unwrap()));
 
-    let block_alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), test_id)
-            .await
-            .unwrap(),
-    );
+    let block_alloc = Arc::new(BlockAllocator::new(test_id).await.unwrap());
 
     let temp_staging = tempdir().unwrap();
     let cache = TieredCache::new(
@@ -282,7 +268,6 @@ async fn test_small_block_map_stays_inline() {
         Some("16MB"),
         Some("32MB"),
         Some("32MB"),
-        dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
         None,
@@ -412,11 +397,7 @@ async fn test_small_block_map_stays_inline() {
     fs.unlink(req, 1, OsStr::new("indirect.bin")).await.unwrap();
 
     // Reclaim/delete file blocks explicitly to trigger cleanup
-    let mut meta_connection = dlm.meta_client().get_connection().await.unwrap();
-    fs.router
-        .delete_file(&file_path, &mut meta_connection)
-        .await
-        .unwrap();
+    fs.router.delete_file(&file_path).await.unwrap();
     // Async block-reclaim: delete's frees finish on the background queue.
     fs.router.backend_router.reclaim_drain().await;
 
@@ -484,18 +465,13 @@ struct StagingSandbox {
 }
 
 async fn make_staging_sandbox(test_id: &str) -> StagingSandbox {
-    let dlm = DlmClient::new("local").unwrap();
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())
         .unwrap()
         .set_len(32 * 1024 * 1024)
         .unwrap();
     let dev = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), test_id)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(test_id).await.unwrap());
     let staging = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![staging.path().to_path_buf()],
@@ -503,7 +479,6 @@ async fn make_staging_sandbox(test_id: &str) -> StagingSandbox {
         Some("16MB"),
         Some("16MB"),
         Some("16MB"),
-        dlm.meta_client().clone(),
         ba,
         dev.clone(),
         None,
@@ -694,7 +669,7 @@ struct FlushHarness {
 
 async fn make_flush_fs(test_id: &str) -> FlushHarness {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())
@@ -702,11 +677,7 @@ async fn make_flush_fs(test_id: &str) -> FlushHarness {
         .set_len(64 * 1024 * 1024)
         .unwrap();
     let nvme_dev = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
-    let block_alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), test_id)
-            .await
-            .unwrap(),
-    );
+    let block_alloc = Arc::new(BlockAllocator::new(test_id).await.unwrap());
     let staging = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![staging.path().to_path_buf()],
@@ -714,7 +685,6 @@ async fn make_flush_fs(test_id: &str) -> FlushHarness {
         Some("32MB"),
         Some("64MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
         None,
@@ -1115,13 +1085,9 @@ async fn test_block_allocator_recovery() {
     let _ = env_logger::builder().is_test(true).try_init();
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
 
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let volume_id = "backend_0";
-    let block_alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), volume_id)
-            .await
-            .unwrap(),
-    );
+    let block_alloc = Arc::new(BlockAllocator::new(volume_id).await.unwrap());
     let nvme_temp = NamedTempFile::new().unwrap();
     let nvme_dev = Arc::new(NvmeBlockDev::new(nvme_temp.path().to_str().unwrap()));
 
@@ -1132,7 +1098,6 @@ async fn test_block_allocator_recovery() {
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
         None,
@@ -1222,9 +1187,7 @@ async fn test_block_allocator_recovery() {
     assert_eq!(block_alloc.get_used_blocks(), 5);
 
     // Create a brand new BlockAllocator simulating mount restart
-    let new_allocator = BlockAllocator::new(dlm.meta_client().clone(), volume_id)
-        .await
-        .unwrap();
+    let new_allocator = BlockAllocator::new(volume_id).await.unwrap();
     assert_eq!(new_allocator.get_used_blocks(), 0);
 
     // Run recovery (the live-inode-tree walk).
@@ -1262,18 +1225,14 @@ async fn test_stale_token_writeback_adopts_current_epoch_no_leak() {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
     std::env::remove_var("SQUEEZEFS_WRITEBACK_QUEUE_CAP");
 
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "stale_token_wb")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("stale_token_wb").await.unwrap());
     let staging = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![staging.path().to_path_buf()],
@@ -1281,7 +1240,6 @@ async fn test_stale_token_writeback_adopts_current_epoch_no_leak() {
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

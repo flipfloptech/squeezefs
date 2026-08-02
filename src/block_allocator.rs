@@ -1,4 +1,3 @@
-use crate::dlm::MetaClient;
 use crate::error::Result;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -82,7 +81,6 @@ pub enum PinOutcome {
 }
 
 pub struct BlockAllocator {
-    _client: Arc<MetaClient>,
     _volume_id: Box<str>,
     chunk_size: u64,
     free_blocks: dashmap::DashSet<u64>,
@@ -167,9 +165,8 @@ pub struct BlockAllocator {
 }
 
 impl BlockAllocator {
-    pub async fn new(client: Arc<MetaClient>, volume_id: &str) -> Result<Self> {
+    pub async fn new(volume_id: &str) -> Result<Self> {
         Ok(Self {
-            _client: client,
             _volume_id: volume_id.to_string().into_boxed_str(),
             chunk_size: CHUNK_SIZE,
             free_blocks: dashmap::DashSet::new(),
@@ -1257,10 +1254,7 @@ mod tests {
     /// stays unbounded for offline tools.
     #[tokio::test]
     async fn allocate_block_respects_device_capacity() {
-        let dlm = crate::dlm::DlmClient::new("local").unwrap();
-        let a = BlockAllocator::new(dlm.meta_client().clone(), "cap_test")
-            .await
-            .unwrap();
+        let a = BlockAllocator::new("cap_test").await.unwrap();
         a.set_capacity_bytes(3 * a.chunk_size());
 
         let o0 = a.allocate_block().await.expect("block 0");

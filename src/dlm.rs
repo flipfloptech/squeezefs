@@ -86,85 +86,66 @@ static LOCK_WAITERS: Lazy<StripeLocks<tokio::sync::Notify, 1024>> = Lazy::new(St
 
 static CLIENT_NONCE: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone)]
-pub struct BoundConnection {}
-
-#[derive(Clone)]
-pub struct MetaConnection {}
-
-#[derive(Clone)]
-pub enum MetaClient {
-    Local,
+/// The cluster lock-manager surface (DLM stage S0 —
+/// docs/pre-rc-engineering-spec.md §6.9): exactly the operations the
+/// production call sites use (§6.2 census: three `acquire_lock` sites,
+/// one lease site, ~24 fencing reads). `LocalLockManager` is the
+/// process-local backend; later stages add remote implementations
+/// (S4 slot lock manager) behind this same trait. Deliberately NOT
+/// dyn-compatible (RPITIT futures): stage consumers select statically.
+pub trait LockManager: Clone + Send + Sync + 'static {
+    /// Acquire an exclusive lease on `file_path` (optionally a byte
+    /// range), waiting up to `ttl` for the current holder to release.
+    fn acquire_lock(
+        &self,
+        file_path: &str,
+        range: Option<(u64, u64)>,
+        ttl: Duration,
+    ) -> impl std::future::Future<Output = Result<LockLease>> + Send;
+    /// Current fencing generation for a path-form object key.
+    fn get_fencing_token(&self, file_path: &str) -> u64;
+    /// Current fencing generation for an inode object.
+    fn get_fencing_token_ino(&self, ino: u64) -> u64;
 }
 
-impl MetaClient {
-    pub fn new(_redis_url: &str) -> Result<Self> {
-        Ok(Self::Local)
-    }
-    pub async fn get_connection(&self) -> Result<MetaConnection> {
-        Ok(MetaConnection {})
-    }
-    pub async fn get_connection_for_inode(&self, _ino: u64) -> Result<MetaConnection> {
-        Ok(MetaConnection {})
-    }
-    pub async fn get_connection_for_key(&self, _key: &str) -> Result<MetaConnection> {
-        Ok(MetaConnection {})
-    }
-    pub fn shard_count(&self) -> usize {
-        1
-    }
-}
-
+/// Process-local lock manager: the S0 extraction of the historical
+/// `DlmClient` body, byte-identical semantics (same maps, same wait
+/// protocol, same fencing mint/read). The vestigial redis/meta mock
+/// family (`MetaClient`, `MetaConnection`, `BoundConnection`,
+/// `MockPubSub`, `MockMessageStream`, `MockMessage`, `redis_url`) was
+/// deleted with it — spec §6.1, zero callers.
 #[derive(Clone)]
-pub struct DlmClient {
-    client_id: String,
+pub struct LocalLockManager {
     client_nonce: u64,
-    redis_url: String,
-    meta_client: Arc<MetaClient>,
 }
 
-impl DlmClient {
-    pub fn new(redis_url: &str) -> Result<Self> {
+/// The product-facing handle name. `LocalLockManager` is the sole
+/// implementation until the S4 slot lock manager lands; call sites keep
+/// the historical name and S4 swaps this alias for its mode dispatch.
+pub type DlmClient = LocalLockManager;
+
+impl LockManager for LocalLockManager {
+    fn acquire_lock(
+        &self,
+        file_path: &str,
+        range: Option<(u64, u64)>,
+        ttl: Duration,
+    ) -> impl std::future::Future<Output = Result<LockLease>> + Send {
+        // Inherent method (resolution prefers it over the trait).
+        LocalLockManager::acquire_lock(self, file_path, range, ttl)
+    }
+    fn get_fencing_token(&self, file_path: &str) -> u64 {
+        LocalLockManager::get_fencing_token(self, file_path)
+    }
+    fn get_fencing_token_ino(&self, ino: u64) -> u64 {
+        LocalLockManager::get_fencing_token_ino(self, ino)
+    }
+}
+
+impl LocalLockManager {
+    pub fn new() -> Result<Self> {
         let client_nonce = CLIENT_NONCE.fetch_add(1, Ordering::Relaxed);
-        let client_id = format!("local_dlm_client_{}", uuid::Uuid::new_v4());
-        Ok(Self {
-            client_id,
-            client_nonce,
-            redis_url: redis_url.to_string(),
-            meta_client: Arc::new(MetaClient::Local),
-        })
-    }
-
-    pub fn client_id(&self) -> &str {
-        &self.client_id
-    }
-
-    pub fn redis_url(&self) -> &str {
-        &self.redis_url
-    }
-
-    pub fn meta_client(&self) -> Arc<MetaClient> {
-        self.meta_client.clone()
-    }
-
-    pub fn connection_count(&self) -> usize {
-        1
-    }
-
-    pub fn shard_count(&self) -> usize {
-        1
-    }
-
-    pub async fn get_connection(&self) -> Result<MetaConnection> {
-        Ok(MetaConnection {})
-    }
-
-    pub async fn get_connection_for_inode(&self, _ino: u64) -> Result<MetaConnection> {
-        Ok(MetaConnection {})
-    }
-
-    pub async fn get_connection_for_key(&self, _key: &str) -> Result<MetaConnection> {
-        Ok(MetaConnection {})
+        Ok(Self { client_nonce })
     }
 
     /// Current fencing generation for a path-form object key (zero-alloc for
@@ -185,10 +166,6 @@ impl DlmClient {
         FENCING_MAP
             .read_sync(&ObjectKey::Ino(ino), |_, v| v.load(Ordering::Acquire))
             .unwrap_or(0)
-    }
-
-    pub async fn get_pubsub_connection(&self) -> Result<MockPubSub> {
-        Ok(MockPubSub {})
     }
 
     /// Acquire an exclusive lease on `file_path` (optionally a byte range),
@@ -311,35 +288,5 @@ impl LockLease {
     pub async fn release(self) -> Result<()> {
         self.inner.unlock();
         Ok(())
-    }
-}
-
-#[derive(Clone)]
-pub struct MockPubSub {}
-
-impl MockPubSub {
-    pub async fn subscribe(&mut self, _channel: &str) -> Result<()> {
-        Ok(())
-    }
-
-    pub fn on_message(self) -> MockMessageStream {
-        MockMessageStream {}
-    }
-}
-
-pub struct MockMessageStream {}
-
-impl MockMessageStream {
-    pub async fn next(&mut self) -> Option<MockMessage> {
-        tokio::time::sleep(std::time::Duration::from_secs(999999)).await;
-        None
-    }
-}
-
-pub struct MockMessage {}
-
-impl MockMessage {
-    pub fn get_payload(&self) -> std::result::Result<String, crate::error::SqueezefsError> {
-        Ok(String::new())
     }
 }

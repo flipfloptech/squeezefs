@@ -81,7 +81,7 @@ fn bench_cluster_dlm(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("cluster_dlm");
 
-    let dlm = squeezefs::dlm::DlmClient::new("local").unwrap();
+    let dlm = squeezefs::dlm::DlmClient::new().unwrap();
 
     // Uncontended acquire+release on rotating inode keys (the
     // get_or_acquire_lease shape).

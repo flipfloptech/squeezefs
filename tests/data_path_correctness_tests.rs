@@ -55,7 +55,7 @@ async fn make() -> H {
     // have pinned the CoW machinery with the knob at 0 — reset so knob
     // state never leaks across tests).
     squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
@@ -63,11 +63,7 @@ async fn make() -> H {
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "dp_test")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("dp_test").await.unwrap());
     let s = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -75,7 +71,6 @@ async fn make() -> H {
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,
@@ -1378,18 +1373,14 @@ async fn v3_spill_router(
     TempDir,
 ) {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", K8_BLOCK_SIZE.to_string());
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), tag)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(tag).await.unwrap());
     let staging = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![staging.path().to_path_buf()],
@@ -1397,7 +1388,6 @@ async fn v3_spill_router(
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,
@@ -1605,18 +1595,14 @@ async fn test_v3_spill_boundary_roundtrips_both_directions() {
 #[tokio::test]
 async fn test_mixed_node_size_volumes_spill_per_volume() {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", K8_BLOCK_SIZE.to_string());
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "k8_mixed")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("k8_mixed").await.unwrap());
     let staging = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![staging.path().to_path_buf()],
@@ -1624,7 +1610,6 @@ async fn test_mixed_node_size_volumes_spill_per_volume() {
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

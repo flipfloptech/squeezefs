@@ -183,15 +183,11 @@ async fn fixture_with_meta(
     records: &[DataVolumeRecord],
 ) -> Fx {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BLOCK.to_string());
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let first = &records[0];
     let first_dev = Arc::new(NvmeBlockDev::new(&first.backing_dev));
-    let first_alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), &first.id)
-            .await
-            .unwrap(),
-    );
+    let first_alloc = Arc::new(BlockAllocator::new(&first.id).await.unwrap());
     if let Ok(cap) = squeezefs::nvme_dev::device_capacity_bytes(&first.backing_dev) {
         first_alloc.set_capacity_bytes(cap);
     }
@@ -204,7 +200,6 @@ async fn fixture_with_meta(
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         first_alloc.clone(),
         first_dev.clone(),
         None,
@@ -219,7 +214,7 @@ async fn fixture_with_meta(
         }
         router
             .backend_router
-            .register_backend(rec, dlm.meta_client().clone())
+            .register_backend(rec)
             .await
             .unwrap_or_else(|e| panic!("register_backend({}) failed: {e:?}", rec.id));
     }

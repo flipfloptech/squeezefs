@@ -53,7 +53,7 @@ struct Harness {
 
 async fn make_fs(test_id: &str) -> Harness {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let backing_temp = NamedTempFile::new().unwrap();
     {
@@ -62,11 +62,7 @@ async fn make_fs(test_id: &str) -> Harness {
     }
     let nvme_dev = Arc::new(NvmeBlockDev::new(backing_temp.path().to_str().unwrap()));
 
-    let block_alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), test_id)
-            .await
-            .unwrap(),
-    );
+    let block_alloc = Arc::new(BlockAllocator::new(test_id).await.unwrap());
 
     let temp_staging = tempdir().unwrap();
     let cache = TieredCache::new(
@@ -75,7 +71,6 @@ async fn make_fs(test_id: &str) -> Harness {
         Some("32MB"),
         Some("64MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
         None,

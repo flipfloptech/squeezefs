@@ -98,18 +98,14 @@ async fn sandbox_fs(uuid: [u8; 16], read_lane_off: bool) -> (SqueezefsFilesystem
     if read_lane_off {
         std::env::set_var("SQUEEZEFS_READ_LANE", "0");
     }
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "ipc_hold_probe_tests")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("ipc_hold_probe_tests").await.unwrap());
     let staging = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![staging.path().to_path_buf()],
@@ -117,7 +113,6 @@ async fn sandbox_fs(uuid: [u8; 16], read_lane_off: bool) -> (SqueezefsFilesystem
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

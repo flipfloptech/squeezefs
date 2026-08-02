@@ -50,7 +50,7 @@ struct H {
 }
 
 async fn make() -> H {
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
@@ -58,11 +58,7 @@ async fn make() -> H {
         .set_len(64 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "attrref_test")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("attrref_test").await.unwrap());
     let s = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -70,7 +66,6 @@ async fn make() -> H {
         Some("64MB"),
         Some("64MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

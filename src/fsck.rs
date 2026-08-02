@@ -3251,7 +3251,7 @@ async fn run_offline_body(
 ) -> Result<FsckReport> {
     let cfg = crate::config_ops::read_volume_format_config(meta_lvs).await?;
     let records = cfg.resolved_data_volumes();
-    let dlm = crate::dlm::DlmClient::new("local")?;
+    let dlm = crate::dlm::DlmClient::new()?;
     let live: Vec<&crate::DataVolumeRecord> = records
         .iter()
         .filter(|r| r.state != crate::VOL_STATE_RETIRED)
@@ -3259,9 +3259,7 @@ async fn run_offline_body(
     let first = live.first().ok_or_else(|| {
         SqueezefsError::InvalidOperation("no live data volumes to fsck".to_string())
     })?;
-    let first_alloc = Arc::new(
-        crate::block_allocator::BlockAllocator::new(dlm.meta_client().clone(), &first.id).await?,
-    );
+    let first_alloc = Arc::new(crate::block_allocator::BlockAllocator::new(&first.id).await?);
     if let Ok(cap) = crate::nvme_dev::device_capacity_bytes(&first.backing_dev) {
         first_alloc.set_capacity_bytes(cap);
     }
@@ -3275,7 +3273,6 @@ async fn run_offline_body(
         Some("64MB"),
         None,
         None,
-        dlm.meta_client().clone(),
         first_alloc.clone(),
         first_dev.clone(),
         None,
@@ -3284,10 +3281,7 @@ async fn run_offline_body(
     let router = crate::routing::DataRouter::new(dlm.clone(), cache, first_alloc, first_dev);
     router.set_block_size(cfg.block_size);
     for rec in &live {
-        router
-            .backend_router
-            .register_backend(rec, dlm.meta_client().clone())
-            .await?;
+        router.backend_router.register_backend(rec).await?;
     }
     router.backend_router.set_volume_records(records.clone());
     router.set_meta_backend(routed.clone());

@@ -138,20 +138,14 @@ async fn bare_cache(
     alloc_name: &str,
     fs_generation: Option<&str>,
 ) -> TieredCache {
-    let dlm = DlmClient::new("local").unwrap();
     let nvme_dev = Arc::new(NvmeBlockDev::new(data.to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), alloc_name)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(alloc_name).await.unwrap());
     TieredCache::new(
         vec![staging.to_path_buf()],
         Some("64MB"),
         Some("64MB"),
         Some("16MB"),
         Some("8MB"),
-        dlm.meta_client().clone(),
         ba,
         nvme_dev,
         fs_generation,
@@ -174,20 +168,15 @@ async fn mount_stack(meta: &Path, staging: &Path, data: &Path, alloc_name: &str)
     let fs_generation = volume_set_generation(&[meta.to_string_lossy().into_owned()])
         .await
         .expect("volume_set_generation failed");
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let nvme_dev = Arc::new(NvmeBlockDev::new(data.to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), alloc_name)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(alloc_name).await.unwrap());
     let cache = TieredCache::new(
         vec![staging.to_path_buf()],
         Some("64MB"),
         Some("64MB"),
         Some("16MB"),
         Some("8MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme_dev.clone(),
         Some(&fs_generation),

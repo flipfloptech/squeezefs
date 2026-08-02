@@ -161,15 +161,11 @@ struct Fx {
 
 async fn open_fixture(meta: &Path, records: &[DataVolumeRecord]) -> Fx {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BLOCK.to_string());
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let first = &records[0];
     let first_dev = Arc::new(NvmeBlockDev::new(&first.backing_dev));
-    let first_alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), &first.id)
-            .await
-            .unwrap(),
-    );
+    let first_alloc = Arc::new(BlockAllocator::new(&first.id).await.unwrap());
     if let Ok(cap) = squeezefs::nvme_dev::device_capacity_bytes(&first.backing_dev) {
         first_alloc.set_capacity_bytes(cap);
     }
@@ -182,7 +178,6 @@ async fn open_fixture(meta: &Path, records: &[DataVolumeRecord]) -> Fx {
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         first_alloc.clone(),
         first_dev.clone(),
         None,
@@ -197,7 +192,7 @@ async fn open_fixture(meta: &Path, records: &[DataVolumeRecord]) -> Fx {
         }
         router
             .backend_router
-            .register_backend(rec, dlm.meta_client().clone())
+            .register_backend(rec)
             .await
             .unwrap_or_else(|e| panic!("register_backend({}) failed: {e:?}", rec.id));
     }
@@ -565,14 +560,10 @@ async fn test_c1_bitflip_node_detected() {
 /// node must land as a C1 finding, not a fixture panic).
 async fn open_fixture_probe(meta: &Path, records: &[DataVolumeRecord]) -> Fx {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BLOCK.to_string());
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let first = &records[0];
     let first_dev = Arc::new(NvmeBlockDev::new(&first.backing_dev));
-    let first_alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), &first.id)
-            .await
-            .unwrap(),
-    );
+    let first_alloc = Arc::new(BlockAllocator::new(&first.id).await.unwrap());
     let staging = tempfile::tempdir().unwrap();
     let staging_path = staging.path().to_path_buf();
     let cache = TieredCache::new(
@@ -581,7 +572,6 @@ async fn open_fixture_probe(meta: &Path, records: &[DataVolumeRecord]) -> Fx {
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         first_alloc.clone(),
         first_dev.clone(),
         None,
@@ -590,11 +580,7 @@ async fn open_fixture_probe(meta: &Path, records: &[DataVolumeRecord]) -> Fx {
     .unwrap();
     let router = DataRouter::new(dlm.clone(), cache, first_alloc, first_dev);
     for rec in records {
-        router
-            .backend_router
-            .register_backend(rec, dlm.meta_client().clone())
-            .await
-            .unwrap();
+        router.backend_router.register_backend(rec).await.unwrap();
     }
     router.backend_router.set_volume_records(records.to_vec());
     let kv = squeezefs::meta_backend::kv::backend::KvMetaBackend::open_probe(meta)

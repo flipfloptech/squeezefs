@@ -174,15 +174,10 @@ fn make_dev_file(dir: &Path, name: &str, len: u64) -> PathBuf {
 async fn router_with(vols: &[(&str, u64, u64)]) -> RouterFx {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BS.to_string());
     let dir = tempfile::tempdir().unwrap();
-    let dlm = DlmClient::new("local").unwrap();
 
     let default_path = make_dev_file(dir.path(), "default.img", 16 * 1024 * 1024);
     let default_dev = Arc::new(NvmeBlockDev::new(default_path.to_str().unwrap()));
-    let default_alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "placement_default")
-            .await
-            .unwrap(),
-    );
+    let default_alloc = Arc::new(BlockAllocator::new("placement_default").await.unwrap());
     let router = Arc::new(BackendRouter::new(
         default_alloc,
         default_dev,
@@ -192,11 +187,7 @@ async fn router_with(vols: &[(&str, u64, u64)]) -> RouterFx {
     for &(id, cap_blocks, seed_used) in vols {
         let dev_path = make_dev_file(dir.path(), &format!("{id}.img"), 16 * 1024 * 1024);
         let dev = Arc::new(NvmeBlockDev::new(dev_path.to_str().unwrap()));
-        let alloc = Arc::new(
-            BlockAllocator::new(dlm.meta_client().clone(), id)
-                .await
-                .unwrap(),
-        );
+        let alloc = Arc::new(BlockAllocator::new(id).await.unwrap());
         alloc.set_capacity_bytes(cap_blocks * alloc.chunk_size());
         for _ in 0..seed_used {
             alloc.allocate_block().await.unwrap();
@@ -631,15 +622,11 @@ struct FsFx {
 async fn open_fs_fixture(meta: &Path, records: &[DataVolumeRecord]) -> FsFx {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BS.to_string());
     set_patch_max_bytes(512 * 1024);
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let first = &records[0];
     let first_dev = Arc::new(NvmeBlockDev::new(&first.backing_dev));
-    let first_alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), &first.id)
-            .await
-            .unwrap(),
-    );
+    let first_alloc = Arc::new(BlockAllocator::new(&first.id).await.unwrap());
     if let Ok(cap) = squeezefs::nvme_dev::device_capacity_bytes(&first.backing_dev) {
         first_alloc.set_capacity_bytes(cap);
     }
@@ -651,7 +638,6 @@ async fn open_fs_fixture(meta: &Path, records: &[DataVolumeRecord]) -> FsFx {
         Some("64MB"),
         Some("16MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         first_alloc.clone(),
         first_dev.clone(),
         None,
@@ -663,7 +649,7 @@ async fn open_fs_fixture(meta: &Path, records: &[DataVolumeRecord]) -> FsFx {
     for rec in records {
         router
             .backend_router
-            .register_backend(rec, dlm.meta_client().clone())
+            .register_backend(rec)
             .await
             .unwrap_or_else(|e| panic!("register_backend({}) failed: {e:?}", rec.id));
     }

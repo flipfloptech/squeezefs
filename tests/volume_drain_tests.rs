@@ -142,15 +142,11 @@ struct Fx {
 
 async fn open_fixture(meta: &Path, records: &[DataVolumeRecord]) -> Fx {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BLOCK.to_string());
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let first = &records[0];
     let first_dev = Arc::new(NvmeBlockDev::new(&first.backing_dev));
-    let first_alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), &first.id)
-            .await
-            .unwrap(),
-    );
+    let first_alloc = Arc::new(BlockAllocator::new(&first.id).await.unwrap());
     if let Ok(cap) = squeezefs::nvme_dev::device_capacity_bytes(&first.backing_dev) {
         first_alloc.set_capacity_bytes(cap);
     }
@@ -162,7 +158,6 @@ async fn open_fixture(meta: &Path, records: &[DataVolumeRecord]) -> Fx {
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         first_alloc.clone(),
         first_dev.clone(),
         None,
@@ -177,7 +172,7 @@ async fn open_fixture(meta: &Path, records: &[DataVolumeRecord]) -> Fx {
         }
         router
             .backend_router
-            .register_backend(rec, dlm.meta_client().clone())
+            .register_backend(rec)
             .await
             .unwrap_or_else(|e| panic!("register_backend({}) failed: {e:?}", rec.id));
     }
@@ -653,16 +648,9 @@ async fn test_clone_shared_blocks_move_once_both_clones_intact() {
     // Both referencers now share the SAME new key per block (refcount
     // transferred, not duplicated): freeing one clone must not disturb
     // the other.
-    let mut con = fx
-        .fs
-        .router
-        .dlm
-        .get_connection()
-        .await
-        .expect("meta connection");
     fx.fs
         .router
-        .delete_file(&squeezefs::keys::inode_path(dst_ino), &mut con)
+        .delete_file(&squeezefs::keys::inode_path(dst_ino))
         .await
         .expect("delete the clone");
     assert_eq!(
@@ -1495,16 +1483,9 @@ async fn test_close_returns_queued_reclaims_before_custody_release() {
     // block (plus the burst's own displaced overwrites).
     let churn = create_file(&fx, "churn.bin").await;
     striped_burst(&fx, churn, 16).await;
-    let mut con = fx
-        .fs
-        .router
-        .dlm
-        .get_connection()
-        .await
-        .expect("meta connection");
     fx.fs
         .router
-        .delete_file(&squeezefs::keys::inode_path(churn), &mut con)
+        .delete_file(&squeezefs::keys::inode_path(churn))
         .await
         .expect("delete the churn file");
     let queued = METRICS.block_free_reclaim_queued.load(Ordering::Relaxed) - queued0;
@@ -1637,16 +1618,9 @@ async fn test_crash_analog_ceases_device_reclaims() {
 
     let churn = create_file(&fx, "churn.bin").await;
     striped_burst(&fx, churn, 16).await;
-    let mut con = fx
-        .fs
-        .router
-        .dlm
-        .get_connection()
-        .await
-        .expect("meta connection");
     fx.fs
         .router
-        .delete_file(&squeezefs::keys::inode_path(churn), &mut con)
+        .delete_file(&squeezefs::keys::inode_path(churn))
         .await
         .expect("delete the churn file");
     let queued = METRICS.block_free_reclaim_queued.load(Ordering::Relaxed) - queued0;

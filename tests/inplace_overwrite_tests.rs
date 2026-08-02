@@ -95,7 +95,7 @@ struct H {
 
 async fn make_harness(test_id: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", FBS.to_string());
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())
         .unwrap()
@@ -104,11 +104,7 @@ async fn make_harness(test_id: &str) -> H {
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         backing.path().to_str().unwrap(),
     ));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), test_id)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(test_id).await.unwrap());
     let s = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -116,7 +112,6 @@ async fn make_harness(test_id: &str) -> H {
         Some("32MB"),
         Some("64MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

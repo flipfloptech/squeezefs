@@ -127,7 +127,7 @@ struct H {
 /// The read_serve_phase suite's harness shape: real v3 meta backend, real
 /// router stack — enough to read the stats inode.
 async fn make(test_id: &str, uuid: [u8; 16]) -> H {
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
@@ -135,11 +135,7 @@ async fn make(test_id: &str, uuid: [u8; 16]) -> H {
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), test_id)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(test_id).await.unwrap());
     let s = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -147,7 +143,6 @@ async fn make(test_id: &str, uuid: [u8; 16]) -> H {
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

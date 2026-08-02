@@ -37,7 +37,7 @@ async fn open_v3_meta(
 async fn test_metalv_fuse_integration() {
     let test_id = "metalv_fuse_test";
 
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let backing_temp = NamedTempFile::new().unwrap();
     let backing_path = backing_temp.path().to_path_buf();
@@ -48,7 +48,7 @@ async fn test_metalv_fuse_integration() {
     let nvme_dev = Arc::new(NvmeBlockDev::new(backing_path.to_str().unwrap()));
 
     let block_alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), test_id)
+        BlockAllocator::new(test_id)
             .await
             .expect("BlockAllocator initialization failed"),
     );
@@ -60,7 +60,6 @@ async fn test_metalv_fuse_integration() {
         Some("16MB"),
         Some("64MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
         None,

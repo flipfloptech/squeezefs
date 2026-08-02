@@ -81,22 +81,17 @@ struct H {
 /// second session — the real remount shape §6.11 describes.
 async fn session(meta_path: &Path, backing_path: &Path, staging: &Path) -> H {
     reset_knobs();
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         backing_path.to_str().unwrap(),
     ));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "fencing_remount_ns")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("fencing_remount_ns").await.unwrap());
     let cache = TieredCache::new(
         vec![staging.to_path_buf()],
         Some("64MB"),
         Some("64MB"),
         Some("16MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

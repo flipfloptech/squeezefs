@@ -136,16 +136,12 @@ struct H {
 /// is formatted fresh or reopened (cold remount).
 async fn mount_h(specs: &[VolSpec], meta_path: &std::path::Path, format: bool) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BLOCK.to_string());
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let mut volumes = Vec::new();
     for spec in specs {
         let device = Arc::new(NvmeBlockDev::new(spec.backing.path().to_str().unwrap()));
-        let allocator = Arc::new(
-            BlockAllocator::new(dlm.meta_client().clone(), &spec.name)
-                .await
-                .unwrap(),
-        );
+        let allocator = Arc::new(BlockAllocator::new(&spec.name).await.unwrap());
         volumes.push(NamedVolume {
             name: spec.name.clone(),
             device,
@@ -163,7 +159,6 @@ async fn mount_h(specs: &[VolSpec], meta_path: &std::path::Path, format: bool) -
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         first_alloc.clone(),
         first_dev.clone(),
         None,
@@ -436,16 +431,12 @@ async fn test_spill_roundtrip_preserves_prefixed_keys_and_versioned_header() {
     let _ = env_logger::builder().is_test(true).try_init();
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BLOCK.to_string());
 
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let specs = make_vol_specs(&["rt_ossa", "rt_ossb"], 256 * 1024 * 1024);
     let mut devs = Vec::new();
     for spec in &specs {
         let device = Arc::new(NvmeBlockDev::new(spec.backing.path().to_str().unwrap()));
-        let allocator = Arc::new(
-            BlockAllocator::new(dlm.meta_client().clone(), &spec.name)
-                .await
-                .unwrap(),
-        );
+        let allocator = Arc::new(BlockAllocator::new(&spec.name).await.unwrap());
         devs.push((spec.name.clone(), device, allocator));
     }
 
@@ -456,7 +447,6 @@ async fn test_spill_roundtrip_preserves_prefixed_keys_and_versioned_header() {
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         devs[0].2.clone(),
         devs[0].1.clone(),
         None,
@@ -680,11 +670,7 @@ async fn test_delete_spilled_file_frees_blocks_on_owning_volumes() {
     h.fs.router.metadata_cache.invalidate(&ino);
     purge_read_tiers(&h);
 
-    let mut con = h.fs.router.dlm.get_connection().await.unwrap();
-    h.fs.router
-        .delete_file(&path, &mut con)
-        .await
-        .expect("delete_file");
+    h.fs.router.delete_file(&path).await.expect("delete_file");
     // Async block-reclaim: delete's frees finish on the background queue.
     h.fs.router.backend_router.reclaim_drain().await;
 
@@ -746,11 +732,7 @@ async fn test_single_volume_spilled_map_keys_stay_bare_and_roundtrip() {
     }
 
     h.fs.router.metadata_cache.invalidate(&ino);
-    let mut con = h.fs.router.dlm.get_connection().await.unwrap();
-    h.fs.router
-        .delete_file(&path, &mut con)
-        .await
-        .expect("delete_file");
+    h.fs.router.delete_file(&path).await.expect("delete_file");
     // Async block-reclaim: delete's frees finish on the background queue.
     h.fs.router.backend_router.reclaim_drain().await;
     assert_eq!(
@@ -779,18 +761,14 @@ async fn crafted_blob_harness(
     TempDir,
 ) {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BLOCK.to_string());
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), tag)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(tag).await.unwrap());
     let staging = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![staging.path().to_path_buf()],
@@ -798,7 +776,6 @@ async fn crafted_blob_harness(
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

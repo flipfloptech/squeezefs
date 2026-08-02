@@ -8,14 +8,12 @@
 //! `unhealthy_backends` mark stays authoritative and instant.
 
 use squeezefs::block_allocator::BlockAllocator;
-use squeezefs::dlm::DlmClient;
 use squeezefs::nvme_dev::{NvmeBlockDev, NODE_PROBE_TTL_MS};
 use squeezefs::routing::BackendRouter;
 use std::sync::Arc;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backend_node_probe_is_ttl_cached_not_per_call() {
-    let dlm = DlmClient::new("local").unwrap();
     let dir = tempfile::tempdir().unwrap();
     let dev_path = dir.path().join("dev.img");
     std::fs::File::create(&dev_path)
@@ -23,11 +21,7 @@ async fn backend_node_probe_is_ttl_cached_not_per_call() {
         .set_len(16 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(dev_path.to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "health_probe_test")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("health_probe_test").await.unwrap());
     let router = BackendRouter::new(
         ba,
         nvme,

@@ -63,7 +63,7 @@ struct H {
 async fn make_with(uuid: [u8; 16], alloc_ns: &str) -> H {
     squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "524288");
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
@@ -71,18 +71,13 @@ async fn make_with(uuid: [u8; 16], alloc_ns: &str) -> H {
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), alloc_ns)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(alloc_ns).await.unwrap());
     let cache = TieredCache::new(
         Vec::new(), // cache-less
         Some("64MB"),
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

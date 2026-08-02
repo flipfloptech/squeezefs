@@ -772,18 +772,14 @@ async fn unlink_teardown_delete_file_lands_zero_journal_entries() {
     use squeezefs::nvme_dev::NvmeBlockDev;
     use squeezefs::routing::DataRouter;
 
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
         .set_len(64 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "entry_economy_teardown")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("entry_economy_teardown").await.unwrap());
     let s = tempfile::tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -791,7 +787,6 @@ async fn unlink_teardown_delete_file_lands_zero_journal_entries() {
         Some("64MB"),
         Some("16MB"),
         Some("32MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,
@@ -813,10 +808,9 @@ async fn unlink_teardown_delete_file_lands_zero_journal_entries() {
         .expect("create corpse");
     routed.unlink(1, "corpse").await.expect("unlink corpse");
 
-    let mut con = dlm.get_connection().await.expect("dlm connection");
     let e0 = entries_now();
     router
-        .delete_file(&squeezefs::keys::inode_path(f.ino), &mut con)
+        .delete_file(&squeezefs::keys::inode_path(f.ino))
         .await
         .expect("reclaim data-path teardown");
     assert_eq!(

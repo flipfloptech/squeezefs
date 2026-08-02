@@ -87,22 +87,17 @@ async fn session(
     staging: &std::path::Path,
 ) -> H {
     reset_knobs();
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         backing_path.to_str().unwrap(),
     ));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), alloc_ns)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(alloc_ns).await.unwrap());
     let cache = TieredCache::new(
         vec![staging.to_path_buf()],
         Some("64MB"),
         Some("64MB"),
         Some("16MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,
@@ -554,7 +549,6 @@ async fn future_version_record_refused_loudly_and_left() {
 async fn staging_format_version_gate_per_direction() {
     let _g = serial().await;
     reset_knobs();
-    let dlm = DlmClient::new("local").unwrap();
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())
         .unwrap()
@@ -563,14 +557,9 @@ async fn staging_format_version_gate_per_direction() {
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         backing.path().to_str().unwrap(),
     ));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "rw4r_ns_e1")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("rw4r_ns_e1").await.unwrap());
 
     let make_cache = |dir: std::path::PathBuf| {
-        let dlm = dlm.clone();
         let ba = ba.clone();
         let nvme = nvme.clone();
         async move {
@@ -580,7 +569,6 @@ async fn staging_format_version_gate_per_direction() {
                 Some("64MB"),
                 Some("16MB"),
                 Some("64MB"),
-                dlm.meta_client().clone(),
                 ba,
                 nvme,
                 Some("rw4-format-gate-gen"),

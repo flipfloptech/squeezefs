@@ -21,12 +21,10 @@
 
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
-use squeezefs::dlm::DlmClient;
 use std::sync::Arc;
 use tempfile::tempdir;
 
 async fn staging_fixture(ns: &str) -> (TieredCache, tempfile::TempDir, tempfile::NamedTempFile) {
-    let dlm = DlmClient::new("local").unwrap();
     let b = tempfile::NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
@@ -35,11 +33,7 @@ async fn staging_fixture(ns: &str) -> (TieredCache, tempfile::TempDir, tempfile:
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         b.path().to_str().unwrap(),
     ));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), ns)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(ns).await.unwrap());
     let s = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -47,7 +41,6 @@ async fn staging_fixture(ns: &str) -> (TieredCache, tempfile::TempDir, tempfile:
         Some("32MB"),
         Some("16MB"),
         Some("32MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme,
         None,

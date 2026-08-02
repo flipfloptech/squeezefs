@@ -4764,11 +4764,7 @@ impl SqueezefsFilesystem {
         let backend = self
             .router
             .backend_router
-            .build_backend(
-                &record.id,
-                &record.backing_dev,
-                self.router.dlm.meta_client().clone(),
-            )
+            .build_backend(&record.id, &record.backing_dev)
             .await
             .map_err(|e| format!("backend construction failed: {e}"))?;
 
@@ -7054,10 +7050,24 @@ impl SqueezefsFilesystem {
 
         let file_path = crate::keys::inode_path(ino);
         let start_dlm = std::time::Instant::now();
-        let lease = self
+        // S0: lease_acquire_{ok,fail} gauge REAL acquisitions — exactly
+        // this slow path (the cached-lease hot path above acquires
+        // nothing and stays counter-silent). Spec §6.1 last row: both
+        // counters were rendered but never incremented (permanently 0).
+        let lease = match self
             .dlm
             .acquire_lock(&file_path, None, Duration::from_secs(5))
-            .await?;
+            .await
+        {
+            Ok(lease) => {
+                METRICS.lease_acquire_ok.fetch_add(1, Ordering::Relaxed);
+                lease
+            }
+            Err(e) => {
+                METRICS.lease_acquire_fail.fetch_add(1, Ordering::Relaxed);
+                return Err(e);
+            }
+        };
         METRICS.dlm_acquire_time.record(start_dlm.elapsed());
         let token = lease.fencing_token();
         self.active_leases.insert(ino, lease);
@@ -11265,18 +11275,11 @@ impl SqueezefsFilesystem {
         // Data-path teardown per ino, before admission — log-and-proceed.
         for &ino in &admitted {
             let file_path = crate::keys::inode_path(ino);
-            match self.dlm.get_connection().await {
-                Ok(mut con) => {
-                    if let Err(e) = self.router.delete_file(&file_path, &mut con).await {
-                        debug!(
-                            "RECLAIM: delete_file({}) failed (proceeding to destroy): {:?}",
-                            ino, e
-                        );
-                    }
-                }
-                Err(e) => {
-                    debug!("RECLAIM: no DLM connection for delete_file({ino}): {e:?}");
-                }
+            if let Err(e) = self.router.delete_file(&file_path).await {
+                debug!(
+                    "RECLAIM: delete_file({}) failed (proceeding to destroy): {:?}",
+                    ino, e
+                );
             }
         }
 

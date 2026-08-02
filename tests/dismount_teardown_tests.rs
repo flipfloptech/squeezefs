@@ -51,18 +51,14 @@ async fn open_v3_meta(
 }
 
 async fn make() -> (SqueezefsFilesystem, Request, NamedTempFile, NamedTempFile) {
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
         .set_len(64 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "dismount_test")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("dismount_test").await.unwrap());
     let s = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -70,7 +66,6 @@ async fn make() -> (SqueezefsFilesystem, Request, NamedTempFile, NamedTempFile) 
         Some("64MB"),
         Some("16MB"),
         Some("32MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

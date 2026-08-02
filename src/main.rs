@@ -4508,14 +4508,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let first_record = &mount_records[0];
             let first_data_path = &first_record.backing_dev;
 
-            let dlm = DlmClient::new("local")?;
+            let dlm = DlmClient::new()?;
 
             let block_alloc = std::sync::Arc::new(
-                squeezefs::block_allocator::BlockAllocator::new(
-                    dlm.meta_client().clone(),
-                    &first_record.id,
-                )
-                .await?,
+                squeezefs::block_allocator::BlockAllocator::new(&first_record.id).await?,
             );
             match squeezefs::nvme_dev::device_capacity_bytes(first_data_path) {
                 Ok(cap) => block_alloc.set_capacity_bytes(cap),
@@ -4539,7 +4535,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Some(&resolved_write_mem_cache_size),
                 Some(&resolved_read_cache_size),
                 Some(&resolved_write_cache_size),
-                dlm.meta_client().clone(),
                 block_alloc.clone(),
                 nvme_dev.clone(),
                 Some(&fs_generation),
@@ -4561,10 +4556,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     rec.backing_dev,
                     rec.state
                 );
-                router
-                    .backend_router
-                    .register_backend(rec, dlm.meta_client().clone())
-                    .await?;
+                router.backend_router.register_backend(rec).await?;
             }
             // The record SNAPSHOT keeps the retired tombstones (KD-5:
             // `volume list` shows them; their ids can never be reused).
@@ -4806,7 +4798,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             src,
             dest,
         } => {
-            let redis_url = "dummy";
             let fs_name = "squeezefs".to_string();
             squeezefs::set_fs_prefix(&fs_name);
             let staging_dirs = vec![get_default_staging_dir()];
@@ -4838,15 +4829,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let dlm = DlmClient::new(redis_url)?;
+            let dlm = DlmClient::new()?;
 
             // Reconstruct block allocator and nvme block dev for clone operation
             let block_alloc = std::sync::Arc::new(
-                squeezefs::block_allocator::BlockAllocator::new(
-                    dlm.meta_client().clone(),
-                    &fs_name,
-                )
-                .await?,
+                squeezefs::block_allocator::BlockAllocator::new(&fs_name).await?,
             );
 
             let nvme_path = format!("{}/.squeezefs_nvme", staging_dirs[0].display());
@@ -4858,7 +4845,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 None,
                 None,
-                dlm.meta_client().clone(),
                 block_alloc.clone(),
                 nvme_dev.clone(),
                 // Offline tool without a metadata volume set: no filesystem
@@ -6079,14 +6065,9 @@ async fn run_df_report(meta_lvs: &[String], json: bool) -> Result<(), Box<dyn st
     // source behind statfs. Reads only; nothing is written. Registration
     // rides the durable ids (KD-5): a set with `vol-` members resolves
     // its `vol-…://offset` keys correctly here too.
-    let dlm = DlmClient::new("local")?;
     let first_record = &volume_records[0];
     let default_alloc = std::sync::Arc::new(
-        squeezefs::block_allocator::BlockAllocator::new(
-            dlm.meta_client().clone(),
-            &first_record.id,
-        )
-        .await?,
+        squeezefs::block_allocator::BlockAllocator::new(&first_record.id).await?,
     );
     let default_dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         &first_record.backing_dev,
@@ -6101,9 +6082,7 @@ async fn run_df_report(meta_lvs: &[String], json: bool) -> Result<(), Box<dyn st
     for rec in &volume_records {
         let size = squeezefs::nvme_dev::device_capacity_bytes(&rec.backing_dev)
             .map_err(|e| format!("cannot size data volume '{}': {e}", rec.backing_dev))?;
-        let backend = backend_router
-            .register_backend(rec, dlm.meta_client().clone())
-            .await?;
+        let backend = backend_router.register_backend(rec).await?;
         backend.block_allocator.set_capacity_bytes(size);
         volume_rows.push((rec.id.clone(), rec.backing_dev.clone(), size));
     }

@@ -1249,7 +1249,6 @@ impl BackendRouter {
         &self,
         id: &str,
         backing_dev: &str,
-        meta_client: std::sync::Arc<crate::dlm::MetaClient>,
     ) -> Result<std::sync::Arc<StorageBackend>> {
         if backing_dev == self.default_device.device_path {
             return Ok(std::sync::Arc::new(StorageBackend {
@@ -1258,9 +1257,7 @@ impl BackendRouter {
             }));
         }
         let device = std::sync::Arc::new(crate::nvme_dev::NvmeBlockDev::new(backing_dev));
-        let allocator = std::sync::Arc::new(
-            crate::block_allocator::BlockAllocator::new(meta_client, id).await?,
-        );
+        let allocator = std::sync::Arc::new(crate::block_allocator::BlockAllocator::new(id).await?);
         Self::wire_space_pressure_valve(&allocator, &self.reclaim);
         match crate::nvme_dev::device_capacity_bytes(backing_dev) {
             Ok(cap) => allocator.set_capacity_bytes(cap),
@@ -1303,11 +1300,8 @@ impl BackendRouter {
     pub async fn register_backend(
         &self,
         record: &crate::DataVolumeRecord,
-        meta_client: std::sync::Arc<crate::dlm::MetaClient>,
     ) -> Result<std::sync::Arc<StorageBackend>> {
-        let backend = self
-            .build_backend(&record.id, &record.backing_dev, meta_client)
-            .await?;
+        let backend = self.build_backend(&record.id, &record.backing_dev).await?;
         self.publish_backend(&record.id, backend.clone())?;
         if record.state == crate::VOL_STATE_DISABLED {
             self.unhealthy_backends.insert(record.id.clone(), true);
@@ -2095,11 +2089,7 @@ impl BackendRouter {
         Ok(())
     }
 
-    pub fn start_health_check_worker(
-        self: &std::sync::Arc<Self>,
-        _redis_url: String,
-        _fs_name: String,
-    ) {
+    pub fn start_health_check_worker(self: &std::sync::Arc<Self>, _fs_name: String) {
         // `Weak`, deliberately (the checkpoint-task sentinel discipline —
         // AGENTS "no leaked tasks"): a strong Arc here kept the router —
         // and this 5 s probe loop — alive FOREVER after every caller
@@ -3898,8 +3888,7 @@ impl DataRouter {
         cache.set_backend_router(backend_router.clone());
 
         let fs_name = crate::fs_prefix();
-        let redis_url = dlm.redis_url().to_string();
-        backend_router.start_health_check_worker(redis_url, fs_name.to_string());
+        backend_router.start_health_check_worker(fs_name.to_string());
 
         // R1b admission mode (§5.3): env-resolved once; unrecognized values
         // refuse loud at mount (forward-only — no silent fallback). A zero
@@ -11493,11 +11482,7 @@ impl DataRouter {
     }
 
     /// Safely delete all underlying storage files/blocks associated with the file.
-    pub async fn delete_file(
-        &self,
-        file_path: &str,
-        _con: &mut crate::dlm::MetaConnection,
-    ) -> Result<()> {
+    pub async fn delete_file(&self, file_path: &str) -> Result<()> {
         let meta = self.fetch_metadata(file_path).await?;
 
         let mut blocks_to_free: Vec<String> = Vec::new();

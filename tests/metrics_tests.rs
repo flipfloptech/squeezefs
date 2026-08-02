@@ -101,18 +101,14 @@ async fn stats_snapshot_getattr_size_matches_served_bytes_under_churn() {
             .expect("open v3 meta volume")
     }
 
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
         .set_len(64 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "stats_coherence_test")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("stats_coherence_test").await.unwrap());
     let s = tempfile::tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -120,7 +116,6 @@ async fn stats_snapshot_getattr_size_matches_served_bytes_under_churn() {
         Some("64MB"),
         Some("16MB"),
         Some("32MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,
@@ -226,7 +221,7 @@ async fn transport_commit_batch_stats_surface() {
     use std::sync::Arc;
     use tempfile::NamedTempFile;
 
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
@@ -234,7 +229,7 @@ async fn transport_commit_batch_stats_surface() {
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
     let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "commit_batch_stats_test")
+        BlockAllocator::new("commit_batch_stats_test")
             .await
             .unwrap(),
     );
@@ -245,7 +240,6 @@ async fn transport_commit_batch_stats_surface() {
         Some("64MB"),
         Some("16MB"),
         Some("32MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,
@@ -308,18 +302,14 @@ async fn transport_wake_stats_surface() {
     use std::sync::Arc;
     use tempfile::NamedTempFile;
 
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
         .set_len(64 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "wake_stats_test")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("wake_stats_test").await.unwrap());
     let s = tempfile::tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -327,7 +317,6 @@ async fn transport_wake_stats_surface() {
         Some("64MB"),
         Some("16MB"),
         Some("32MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,
@@ -373,7 +362,7 @@ async fn fabric_family_stats_surface_exports_zero_valued_without_fabric() {
     use std::sync::Arc;
     use tempfile::NamedTempFile;
 
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
@@ -381,7 +370,7 @@ async fn fabric_family_stats_surface_exports_zero_valued_without_fabric() {
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
     let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "fabric_family_stats_test")
+        BlockAllocator::new("fabric_family_stats_test")
             .await
             .unwrap(),
     );
@@ -392,7 +381,6 @@ async fn fabric_family_stats_surface_exports_zero_valued_without_fabric() {
         Some("64MB"),
         Some("16MB"),
         Some("32MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

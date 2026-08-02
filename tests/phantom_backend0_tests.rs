@@ -94,7 +94,7 @@ struct H {
 /// including the first — is registered in `backends` under its real name.
 async fn harness(volume_names: &[&str]) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let mut volumes = Vec::new();
     for name in volume_names {
@@ -106,11 +106,7 @@ async fn harness(volume_names: &[&str]) -> H {
             .set_len(256 * 1024 * 1024)
             .unwrap();
         let device = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
-        let allocator = Arc::new(
-            BlockAllocator::new(dlm.meta_client().clone(), name)
-                .await
-                .unwrap(),
-        );
+        let allocator = Arc::new(BlockAllocator::new(name).await.unwrap());
         volumes.push(NamedVolume {
             name: name.to_string(),
             _backing: backing,
@@ -129,7 +125,6 @@ async fn harness(volume_names: &[&str]) -> H {
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         first_alloc.clone(),
         first_dev.clone(),
         None,

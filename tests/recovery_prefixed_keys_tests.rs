@@ -127,16 +127,12 @@ struct H {
 /// is formatted fresh or reopened (cold remount).
 async fn mount_h(specs: &[VolSpec], meta_path: &std::path::Path, format: bool) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BLOCK.to_string());
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let mut volumes = Vec::new();
     for spec in specs {
         let device = Arc::new(NvmeBlockDev::new(spec.backing.path().to_str().unwrap()));
-        let allocator = Arc::new(
-            BlockAllocator::new(dlm.meta_client().clone(), &spec.name)
-                .await
-                .unwrap(),
-        );
+        let allocator = Arc::new(BlockAllocator::new(&spec.name).await.unwrap());
         volumes.push(NamedVolume {
             name: spec.name.clone(),
             device,
@@ -154,7 +150,6 @@ async fn mount_h(specs: &[VolSpec], meta_path: &std::path::Path, format: bool) -
         Some("64MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         first_alloc.clone(),
         first_dev.clone(),
         None,
@@ -555,10 +550,9 @@ async fn test_multi_volume_inline_map_remount_recovery_smoke() {
     ] {
         let path = squeezefs::keys::inode_path(target).to_string();
         h2.fs.router.metadata_cache.invalidate(&target);
-        let mut con = h2.fs.router.dlm.get_connection().await.unwrap();
         h2.fs
             .router
-            .delete_file(&path, &mut con)
+            .delete_file(&path)
             .await
             .unwrap_or_else(|e| panic!("delete of {name} failed: {e:?}"));
     }

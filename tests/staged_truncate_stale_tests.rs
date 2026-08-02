@@ -52,7 +52,7 @@ struct H {
 /// sizes the ring so tests can construct refusal/promotion deterministically.
 async fn make(uuid: [u8; 16], alloc_ns: &str, staging_write_budget: &str) -> H {
     std::env::remove_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE");
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
@@ -61,11 +61,7 @@ async fn make(uuid: [u8; 16], alloc_ns: &str, staging_write_budget: &str) -> H {
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         b.path().to_str().unwrap(),
     ));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), alloc_ns)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(alloc_ns).await.unwrap());
     let s = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -73,7 +69,6 @@ async fn make(uuid: [u8; 16], alloc_ns: &str, staging_write_budget: &str) -> H {
         Some("64MB"),
         Some("16MB"),
         Some(staging_write_budget),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

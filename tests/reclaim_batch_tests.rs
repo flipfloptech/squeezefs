@@ -274,18 +274,14 @@ async fn test_batch_forget_queues_reclaim_like_forget() {
     use squeezefs::nvme_dev::NvmeBlockDev;
     use squeezefs::routing::DataRouter;
 
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
         .set_len(64 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "batch_forget_test")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("batch_forget_test").await.unwrap());
     let s = tempfile::tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -293,7 +289,6 @@ async fn test_batch_forget_queues_reclaim_like_forget() {
         Some("64MB"),
         Some("16MB"),
         Some("32MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

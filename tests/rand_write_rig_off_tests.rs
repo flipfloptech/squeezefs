@@ -73,7 +73,7 @@ async fn make(test_id: &str) -> H {
     // OFF for this binary (extent_patch_tests owns patch-on coverage).
     squeezefs::fuse_client::set_patch_max_bytes(0);
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BS.to_string());
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
 
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
@@ -81,11 +81,7 @@ async fn make(test_id: &str) -> H {
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), test_id)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(test_id).await.unwrap());
     let s = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -93,7 +89,6 @@ async fn make(test_id: &str) -> H {
         Some("32MB"),
         Some("64MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

@@ -88,7 +88,7 @@ fn reset_knobs() {
 /// population); `staging` = with/without disk staging dirs.
 async fn make_ext(uuid: [u8; 16], alloc_ns: &str, compressed: bool, staging: bool) -> H {
     reset_knobs();
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
@@ -97,11 +97,7 @@ async fn make_ext(uuid: [u8; 16], alloc_ns: &str, compressed: bool, staging: boo
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         b.path().to_str().unwrap(),
     ));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), alloc_ns)
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new(alloc_ns).await.unwrap());
     let s = tempdir().unwrap();
     let staging_dirs = if staging {
         vec![s.path().to_path_buf()]
@@ -114,7 +110,6 @@ async fn make_ext(uuid: [u8; 16], alloc_ns: &str, compressed: bool, staging: boo
         Some("64MB"),
         Some("16MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,

@@ -72,7 +72,7 @@ async fn make_router() -> (
     NamedTempFile,
     tempfile::TempDir,
 ) {
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
@@ -81,11 +81,7 @@ async fn make_router() -> (
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         b.path().to_str().unwrap(),
     ));
-    let ba = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "discard_elision_test")
-            .await
-            .unwrap(),
-    );
+    let ba = Arc::new(BlockAllocator::new("discard_elision_test").await.unwrap());
     let s = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![s.path().to_path_buf()],
@@ -93,7 +89,6 @@ async fn make_router() -> (
         Some("64MB"),
         Some("16MB"),
         Some("32MB"),
-        dlm.meta_client().clone(),
         ba.clone(),
         nvme.clone(),
         None,
@@ -389,10 +384,7 @@ async fn watermark_is_debt_versus_virgin_tail() {
     assert!(!squeezefs::block_reclaim::debt_within_watermark(101, 100));
 
     // virgin_bytes arithmetic: never-minted tail × chunk.
-    let dlm = DlmClient::new("local").unwrap();
-    let ba = BlockAllocator::new(dlm.meta_client().clone(), "wm_test")
-        .await
-        .unwrap();
+    let ba = BlockAllocator::new("wm_test").await.unwrap();
     let chunk = ba.chunk_size();
     ba.set_capacity_bytes(8 * chunk);
     assert_eq!(ba.virgin_bytes(), 8 * chunk, "untouched store: all virgin");
@@ -405,9 +397,7 @@ async fn watermark_is_debt_versus_virgin_tail() {
     );
     // Unbounded (capacity 0) allocators have an infinite virgin tail:
     // pressure never fires (idle/trim venues still drain).
-    let ba2 = BlockAllocator::new(dlm.meta_client().clone(), "wm_test2")
-        .await
-        .unwrap();
+    let ba2 = BlockAllocator::new("wm_test2").await.unwrap();
     assert_eq!(ba2.virgin_bytes(), u64::MAX, "unbounded ⇒ infinite virgin");
 }
 

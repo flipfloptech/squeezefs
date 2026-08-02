@@ -45,7 +45,7 @@ async fn sandbox_fs() -> (
     use squeezefs::nvme_dev::NvmeBlockDev;
     use squeezefs::routing::DataRouter;
 
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let backing_temp = tempfile::NamedTempFile::new().unwrap();
     {
         let f = std::fs::File::create(backing_temp.path()).unwrap();
@@ -53,7 +53,7 @@ async fn sandbox_fs() -> (
     }
     let nvme_dev = Arc::new(NvmeBlockDev::new(backing_temp.path().to_str().unwrap()));
     let block_alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), "preload_session_tests")
+        BlockAllocator::new("preload_session_tests")
             .await
             .expect("block allocator"),
     );
@@ -64,7 +64,6 @@ async fn sandbox_fs() -> (
         Some("32MB"),
         Some("128MB"),
         Some("128MB"),
-        dlm.meta_client().clone(),
         block_alloc.clone(),
         nvme_dev.clone(),
         None,

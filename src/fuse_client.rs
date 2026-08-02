@@ -5166,8 +5166,15 @@ impl SqueezefsFilesystem {
         #[cfg(target_os = "linux")]
         let (t_queues, t_depth, _t_payload_sz, t_buffer_bytes, t_max_background) =
             fuse3::over_uring_geometry();
+        // The negotiated INIT write geometry (2026-08-04 campaign): what
+        // the kernel was actually told — the block-size desire gated by
+        // `fs.fuse.max_pages_limit` + the payload budget ladder. The
+        // 4 MiB field row's engagement instrument.
+        #[cfg(target_os = "linux")]
+        let (t_max_write, t_max_pages) = fuse3::over_uring_negotiated_write();
         #[cfg(not(target_os = "linux"))]
-        let (t_queues, t_depth, t_buffer_bytes, t_max_background) = (0u64, 0u64, 0u64, 0u64);
+        let (t_queues, t_depth, t_buffer_bytes, t_max_background, t_max_write, t_max_pages) =
+            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
 
         // PR K7 (design §10): the `meta_kv_*` family is emitted only when
         // a metadata volume is mounted (v3 is the only metadata format).
@@ -5638,6 +5645,8 @@ impl SqueezefsFilesystem {
                 "transport_q_depth": t_depth,
                 "transport_payload_buffer_bytes": t_buffer_bytes,
                 "transport_max_background": t_max_background,
+                "transport_max_write": t_max_write,
+                "transport_max_pages": t_max_pages,
                 "transport_commit_batch": serde_json::Value::Object(t_cb_hist),
                 "transport_commit_batch_flushes": t_cb_flushes,
                 "transport_commit_batch_commits": t_cb_commits,
@@ -11299,8 +11308,28 @@ impl Filesystem for SqueezefsFilesystem {
             });
         }
 
+        // Desired INIT max_write = the volume BLOCK SIZE, floored at the
+        // 1 MiB pre-campaign shape (2026-08-04 geometry campaign,
+        // V2-CANDIDATES candidate 1): a whole 4 MiB block then arrives as
+        // ONE FUSE_WRITE / one payload lease / one merge instead of 4
+        // kernel-split segments — per-op fixed costs quarter on
+        // ≥ block-size sequential shapes. This is a DESIRE: the fuse3
+        // transport negotiates it down against the kernel's
+        // `fs.fuse.max_pages_limit` sysctl (default 256 ⇒ 1 MiB — fleet
+        // kernels keep today's shape gracefully; the sqz-host posture
+        // raises it to 1024, docs/operations.md) and the payload budget
+        // ladder. `SQUEEZEFS_FUSE_MAX_WRITE` overrides the desire
+        // verbatim (the field bracket's A/B lever, still sysctl-gated).
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        let desired_max_write = std::env::var("SQUEEZEFS_FUSE_MAX_WRITE")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or_else(|| block_size.max(1024 * 1024))
+            .clamp(4096, u32::MAX as u64) as u32;
         Ok(ReplyInit {
-            max_write: std::num::NonZeroU32::new(1048576).unwrap(), // 1MB absolute maximum write buffer size
+            max_write: std::num::NonZeroU32::new(desired_max_write)
+                .expect("clamped ≥ 4096, never zero"),
         })
     }
 

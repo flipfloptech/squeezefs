@@ -162,7 +162,13 @@ for h in "${HOSTS[@]}"; do
   # port: that releases the listeners), then namespaces -> subsystems.
   # Expectation-named teardown ("unshare $BASE-dN for N in 0..15") left
   # orphan exports+listeners on oss2 and poisoned the client reconnect.
-  "${SSH[@]}" "root@$ip1" NQN_PREFIX="$NQN_PREFIX" IPS="$ip1 $ip2" 'bash -s' <<'EOS'
+  # NOTE: the env prefix must be quoted AS ONE REMOTE WORD-SEQUENCE: ssh
+  # concatenates its argv with spaces and the REMOTE shell re-parses it, so
+  # an unquoted-remotely IPS="$ip1 $ip2" splits — the remote runs
+  # `IPS=ip1` and then tries to EXECUTE ip2 ("command not found", first-run
+  # 2026-08-02). The single-word assignments below (NQN=..., NAME=...)
+  # survive that re-parse; only multi-word values hit it.
+  "${SSH[@]}" "root@$ip1" "NQN_PREFIX='$NQN_PREFIX' IPS='$ip1 $ip2' bash -s" <<'EOS'
 set -u
 cfg=/sys/kernel/config/nvmet
 [ -d "$cfg" ] || exit 0   # nvmet not loaded => nothing exported

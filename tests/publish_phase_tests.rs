@@ -433,6 +433,18 @@ async fn coalesced_stream_records_phases_with_closed_ledger() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rewrite_on_clean_persisted_base_is_ledger_attributed() {
     let _g = serial().await;
+    // The rewrite-shadow epoch (Idea 1) records rewrite publishes
+    // RAM-only — this contract pins the durable publish-pass
+    // base-provenance ledger specifically, so the lever is off
+    // (tests/rewrite_shadow_tests.rs owns the epoch venue).
+    struct ShadowOff;
+    impl Drop for ShadowOff {
+        fn drop(&mut self) {
+            squeezefs::routing::set_rewrite_shadow(true);
+        }
+    }
+    let _so = ShadowOff;
+    squeezefs::routing::set_rewrite_shadow(false);
     let h = make([0xA3; 16], "pub_phase_rewrite").await;
     let ino = create(&h, "rw").await;
 

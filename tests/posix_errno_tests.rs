@@ -55,6 +55,11 @@ fn pinned_errno(e: &SqueezefsError) -> libc::c_int {
         SqueezefsError::FencingTokenExpired { .. } => libc::EIO,
         SqueezefsError::InvalidOperation(_) => libc::EINVAL,
         SqueezefsError::Refused { errno, .. } => *errno,
+        // RES-6: the D0 writer claim was fenced, so the data plane is
+        // closed for this mount's lifetime. EIO is the honest report —
+        // the operation cannot be retried into success here, and a
+        // successor mount owns the accounting.
+        SqueezefsError::WriterGuardFenced => libc::EIO,
         SqueezefsError::IndirectMapFormat { .. } => libc::EIO,
         SqueezefsError::GdsError(_) => libc::EIO,
         SqueezefsError::CacheOverflow => libc::ENOMEM,

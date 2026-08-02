@@ -1421,6 +1421,13 @@ mod models {
                     // Gate still closed (or drain not yet run): correct.
                     false
                 }
+                // RES-14: the bounded-rescan refusal. It must be
+                // UNREACHABLE here — the protocol's whole claim is that
+                // budget and bitmap never disagree, so any interleaving
+                // that produces it is a real defect the model must name.
+                Err(alloc_ext_core::ClaimError::InvariantDrift) => {
+                    panic!("claim reported budget/bitmap drift under a legal interleaving")
+                }
             };
             t.join().unwrap();
 
@@ -1540,6 +1547,10 @@ mod models {
                         raced += 1;
                     }
                     Err(alloc_ext_core::ClaimError::NoSpace) => {}
+                    // RES-14: must be unreachable (see the sibling model).
+                    Err(alloc_ext_core::ClaimError::InvariantDrift) => {
+                        panic!("claim reported budget/bitmap drift under a legal interleaving")
+                    }
                 }
             }
             t.join().unwrap();

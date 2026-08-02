@@ -4323,6 +4323,25 @@ pub struct SqueezefsFilesystem {
     /// age out by TTL/capacity.
     pub dir_entry_cache_v3:
         moka::sync::Cache<(u64, u64), std::sync::Arc<[(std::boxed::Box<str>, u64, u64, u32)]>>,
+    /// POSIX-4: the `child directory → parent` memo backing `readdir`'s
+    /// `..` synthesis.
+    ///
+    /// v3 stores no parent pointer in the inode record and cannot gain
+    /// one without bumping `INODE_VALUE_VERSION` (whose decoder rejects
+    /// unknown versions — an on-disk format break), so the parent is
+    /// memoized from the edges the daemon ALREADY observes: the LOOKUP
+    /// that reached the directory, its MKDIR, the RENAME that moved it,
+    /// and every directory entry a `readdir`/`readdirplus` page emits
+    /// (which is what makes a top-down `find`/`du`/`rsync`/`tar` walk
+    /// hit on every child it descends into). A miss falls back to
+    /// `LOOKUP(dir, "..")` — `find_parent_of_child`, the unindexed
+    /// O(total dentries) scan — and memoizes its answer.
+    ///
+    /// Bounded and TTL'd like the other caches; correctness rests on
+    /// directories having exactly ONE parent (no directory hard links)
+    /// and inos never being reused (§4.8), so the only staleness source
+    /// is a rename, which maintains this map in the same handler.
+    parent_memo: moka::sync::Cache<u64, u64, ahash::RandomState>,
     /// PR M4 (D1.c): per-directory readdir-snapshot generation counters —
     /// latch-free (`scc` bucket read + one relaxed `fetch_add`), O(1),
     /// allocation-free on the mutate path for already-seen parents (one
@@ -4511,6 +4530,7 @@ impl Clone for SqueezefsFilesystem {
             active_inode_locks: self.active_inode_locks.clone(),
             attr_cache: self.attr_cache.clone(),
             dir_entry_cache_v3: self.dir_entry_cache_v3.clone(),
+            parent_memo: self.parent_memo.clone(),
             dir_gen: self.dir_gen.clone(),
             dismount_wait: self.dismount_wait,
             writeback_tx: self.writeback_tx.clone(),
@@ -4595,6 +4615,13 @@ impl SqueezefsFilesystem {
             .max_capacity(dir_entry_capacity)
             .time_to_live(Duration::from_secs(300))
             .build();
+        // POSIX-4: the `..` parent memo — one u64 per hot directory, so
+        // it rides the dentry-cache sizing derivation (never a fixed
+        // constant) and ages out on the same horizon.
+        let parent_memo = moka::sync::Cache::builder()
+            .max_capacity(dir_entry_capacity)
+            .time_to_live(Duration::from_secs(300))
+            .build_with_hasher(ahash::RandomState::new());
         // P1-4: bound attr cache growth (was unbounded DashMap).
         let attr_capacity = std::cmp::max(10_000, total_memory / 100_000);
         let attr_cache = moka::sync::Cache::builder()
@@ -4614,6 +4641,7 @@ impl SqueezefsFilesystem {
             active_inode_locks: std::sync::Arc::new(StripeLocks::new()),
             attr_cache,
             dir_entry_cache_v3,
+            parent_memo,
             dir_gen: std::sync::Arc::new(scc::HashMap::new()),
             dismount_wait: 10,
             writeback_tx,
@@ -6531,6 +6559,63 @@ impl SqueezefsFilesystem {
                 scc::hash_map::Entry::Vacant(v) => {
                     v.insert_entry(std::sync::atomic::AtomicU64::new(1));
                 }
+            }
+        }
+    }
+
+    /// POSIX-4: record the `child directory → parent` edge the caller
+    /// just observed (LOOKUP / MKDIR / RENAME / a `readdir` page's own
+    /// directory entries). Non-directories are never memoized: only a
+    /// directory can be `readdir`'d, and only directories have exactly
+    /// one parent.
+    fn memoize_parent(&self, child: u64, parent: u64) {
+        // Root's parent is itself, by definition — never memoized, never
+        // resolved.
+        if child > 1 && child != parent {
+            self.parent_memo.insert(child, parent);
+        }
+    }
+
+    /// POSIX-4: the ino `readdir` reports for `..`.
+    ///
+    /// Memo first (the `find`/`du`/`ls -R` walk populates it from the
+    /// page that named the child, and every LOOKUP that reached this
+    /// directory did too); on a miss, the authoritative
+    /// `LOOKUP(dir, "..")` — which pays `find_parent_of_child`'s
+    /// unindexed O(total dentries) dentry-tree scan — and its answer is
+    /// memoized so the walk pays it at most once per directory.
+    ///
+    /// **Never fabricates root.** A directory whose parent no dentry
+    /// names (unlinked-but-open, an orphan awaiting reclaim) reports
+    /// ITSELF, exactly as the root does — the previous `.unwrap_or(1)`
+    /// claimed root as the parent, which the lookup layer explicitly
+    /// refuses to do (it returns a loud NotFound instead) and which
+    /// grafts a false edge into any tree an application reconstructs
+    /// from `d_ino`.
+    async fn resolve_dotdot_ino(&self, dir: u64) -> u64 {
+        if dir <= 1 {
+            return 1;
+        }
+        if let Some(parent) = self.parent_memo.get(&dir) {
+            METRICS
+                .readdir_parent_memo_hits
+                .fetch_add(1, Ordering::Relaxed);
+            return parent;
+        }
+        let Some(backend) = self.meta_backend.as_ref() else {
+            return dir;
+        };
+        match backend.lookup(dir, "..").await {
+            Ok(inode) => {
+                self.memoize_parent(dir, inode.ino);
+                inode.ino
+            }
+            Err(e) => {
+                warn!(
+                    "readdir: ino {dir} has no dentry naming it — reporting a \
+                     self-referential `..` (never a fabricated root): {e:?}"
+                );
+                dir
             }
         }
     }
@@ -12345,6 +12430,11 @@ impl Filesystem for SqueezefsFilesystem {
             let attr = self.inode_to_file_attr(&inode);
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
+            // POSIX-4: this LOOKUP is how the kernel reached the child —
+            // if it is a directory, its `..` is now known without a scan.
+            if attr.kind == FileType::Directory {
+                self.memoize_parent(inode.ino, parent);
+            }
             Ok(ReplyEntry {
                 ttl: self.entry_ttl_for(attr.kind),
                 attr,
@@ -13532,6 +13622,8 @@ impl Filesystem for SqueezefsFilesystem {
             let attr = self.inode_to_file_attr(&inode);
             self.attr_cache
                 .insert(inode.ino, (attr, std::time::Instant::now()));
+            // POSIX-4: the new directory's parent is known by construction.
+            self.memoize_parent(inode.ino, parent);
             self.bump_dir_generation(parent);
             self.attr_cache.invalidate(&parent);
             Ok(ReplyEntry {
@@ -13581,6 +13673,11 @@ impl Filesystem for SqueezefsFilesystem {
             self.bump_dir_generation(current_inode.ino);
             self.attr_cache.invalidate(&parent);
             self.attr_cache.invalidate(&current_inode.ino);
+            // POSIX-4: the edge is gone. An unlinked-but-open directory
+            // can still be getdents'd, and its `..` degrades to the
+            // self-reference rather than naming a parent that no longer
+            // claims it.
+            self.parent_memo.invalidate(&current_inode.ino);
             // Reclaim only after FUSE forget (or last release if unlinked-open).
             // Destroying before forget reuses ino numbers while the kernel still
             // holds the nodeid (generation always 1) → ESTALE under load.
@@ -14053,11 +14150,28 @@ impl Filesystem for SqueezefsFilesystem {
             } else {
                 None
             };
+            // POSIX-4: only a CROSS-directory move can change a
+            // directory's `..`, so a same-directory rename (the hot
+            // temp-file-to-final shape) pays nothing extra here.
+            let moved_dir = if new_parent != parent {
+                backend
+                    .lookup(parent, &name_str)
+                    .await
+                    .ok()
+                    .filter(|i| i.mode & libc::S_IFMT == libc::S_IFDIR)
+                    .map(|i| i.ino)
+            } else {
+                None
+            };
             let backend_res = backend
                 .rename(parent, &name_str, new_parent, &new_name_str, 0)
                 .await;
             prof.mark_backend_done();
             backend_res.map_err(map_squeezefs_err)?;
+            // POSIX-4: the memo must never outlive the truth.
+            if let Some(m) = moved_dir {
+                self.memoize_parent(m, new_parent);
+            }
             self.bump_dir_generation(parent);
             self.bump_dir_generation(new_parent);
             // D2.c: refresh (not invalidate) — post-M6 renames really move
@@ -14069,6 +14183,9 @@ impl Filesystem for SqueezefsFilesystem {
             }
             if let Some(d_ino) = dest_ino {
                 self.refresh_attr_cache(d_ino).await;
+                // POSIX-4: an overwritten target is unlinked — drop any
+                // parent edge it held.
+                self.parent_memo.invalidate(&d_ino);
                 // Reclaim overwritten target via forget, not here.
             }
             Ok(())
@@ -14125,15 +14242,16 @@ impl Filesystem for SqueezefsFilesystem {
                 .expect("meta_backend must be configured");
 
             prof.mark_backend_start();
-            let src_ino = if let Ok(inode) = backend.lookup(parent, &name_str).await {
-                Some(inode.ino)
-            } else {
-                None
+            // POSIX-4: the S_IFMT bits ride along (both lookups already
+            // happen) — a moved DIRECTORY's `..` edge is maintained below.
+            let is_dir = |i: &crate::meta_backend::Inode| i.mode & libc::S_IFMT == libc::S_IFDIR;
+            let (src_ino, src_is_dir) = match backend.lookup(parent, &name_str).await {
+                Ok(inode) => (Some(inode.ino), is_dir(&inode)),
+                Err(_) => (None, false),
             };
-            let dest_ino = if let Ok(inode) = backend.lookup(new_parent, &new_name_str).await {
-                Some(inode.ino)
-            } else {
-                None
+            let (dest_ino, dest_is_dir) = match backend.lookup(new_parent, &new_name_str).await {
+                Ok(inode) => (Some(inode.ino), is_dir(&inode)),
+                Err(_) => (None, false),
             };
 
             let backend_res = backend
@@ -14142,6 +14260,22 @@ impl Filesystem for SqueezefsFilesystem {
             prof.mark_backend_done();
             backend_res.map_err(map_squeezefs_err)?;
 
+            // POSIX-4: maintain the `..` edges this rename moved — the
+            // source lands under `new_parent`; under RENAME_EXCHANGE the
+            // destination lands under `parent`; an overwritten target is
+            // unlinked and keeps no edge at all.
+            if let (Some(s_ino), true) = (src_ino, src_is_dir) {
+                self.memoize_parent(s_ino, new_parent);
+            }
+            if let Some(d_ino) = dest_ino {
+                if flags & libc::RENAME_EXCHANGE != 0 {
+                    if dest_is_dir {
+                        self.memoize_parent(d_ino, parent);
+                    }
+                } else {
+                    self.parent_memo.invalidate(&d_ino);
+                }
+            }
             self.bump_dir_generation(parent);
             self.bump_dir_generation(new_parent);
             // D2.c: refresh (not invalidate) — see `rename`.
@@ -14196,17 +14330,10 @@ impl Filesystem for SqueezefsFilesystem {
                 });
             }
             if off_u < 2 {
-                let parent_parent = if parent == 1 {
-                    1
-                } else if let Some(ref backend) = self.meta_backend {
-                    backend
-                        .lookup(parent, "..")
-                        .await
-                        .map(|inode| inode.ino)
-                        .unwrap_or(1)
-                } else {
-                    1
-                };
+                // POSIX-4: memo-first `..` — never the unindexed
+                // dentry-tree scan per readdir, and never a fabricated
+                // root (see `resolve_dotdot_ino`).
+                let parent_parent = self.resolve_dotdot_ino(parent).await;
                 entries.push(DirectoryEntry {
                     name: "..".into(),
                     kind: FileType::Directory,
@@ -14215,9 +14342,17 @@ impl Filesystem for SqueezefsFilesystem {
                 });
             }
             for (cookie, d) in page {
+                let kind = self.mode_to_file_type(d.file_type);
+                // POSIX-4: this page IS the parent edge for every
+                // subdirectory it names — a top-down walk (find, du,
+                // rsync, tar) descends into exactly these, so their
+                // `..` resolves from the memo.
+                if kind == FileType::Directory {
+                    self.memoize_parent(d.ino, parent);
+                }
                 entries.push(DirectoryEntry {
                     name: d.name.into(),
-                    kind: self.mode_to_file_type(d.file_type),
+                    kind,
                     inode: d.ino,
                     offset: cookie as i64,
                 });
@@ -14277,17 +14412,8 @@ impl Filesystem for SqueezefsFilesystem {
                     });
                 }
                 if offset < 2 {
-                    let parent_parent = if parent == 1 {
-                        1
-                    } else if let Some(ref backend) = self.meta_backend {
-                        backend
-                            .lookup(parent, "..")
-                            .await
-                            .map(|inode| inode.ino)
-                            .unwrap_or(1)
-                    } else {
-                        1
-                    };
+                    // POSIX-4: memo-first `..` (see the readdir twin).
+                    let parent_parent = self.resolve_dotdot_ino(parent).await;
                     let attr = self
                         .get_attr_internal(parent_parent)
                         .await
@@ -14314,6 +14440,11 @@ impl Filesystem for SqueezefsFilesystem {
                             continue;
                         }
                     };
+                    // POSIX-4: memoize the parent edge of every
+                    // subdirectory this page names (the readdir twin).
+                    if attr.kind == FileType::Directory {
+                        self.memoize_parent(d.ino, parent);
+                    }
                     entries.push(DirectoryEntryPlus {
                         name: d.name.into(),
                         kind: attr.kind,

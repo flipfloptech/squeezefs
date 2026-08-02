@@ -184,7 +184,54 @@ fn check_status(op: &str, cqe: &pdu::Cqe) -> Result<()> {
     Ok(())
 }
 
+/// Which receive backend a lane queue runs (design §5/§6/§10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneBackend {
+    /// Classic in-process recv into the destination (copy-parity with the
+    /// kernel path — the PR Z1 contract venue; `FORCE_COPY` seam).
+    Classic,
+    /// The PR Z2 area backend with socket recv simulating NIC DMA into
+    /// area chunks (`AREA_SIM` seam — the chunk-parser/refill/gather
+    /// contract venue; never a product posture).
+    AreaSim,
+}
+
 impl LaneSession {
+    /// [`Self::connect`] with an explicit receive backend.
+    pub async fn connect_with(
+        target: LaneTarget,
+        backend: LaneBackend,
+    ) -> Result<Arc<LaneSession>> {
+        match backend {
+            LaneBackend::Classic => Self::connect(target).await,
+            LaneBackend::AreaSim => Err(io_err(
+                "zcrx area backend not implemented (PR Z2 phase A)".into(),
+            )),
+        }
+    }
+
+    /// Area-chunk diagnostics `(free, total)` summed over the session's
+    /// area queues — the refill-discipline instrument (0, 0) on classic
+    /// backends (no area exists).
+    pub fn area_chunks(&self) -> (usize, usize) {
+        (0, 0) // Z2 phase A stub — contracts red
+    }
+
+    /// Abort AND join every queue task — the poison-drain quiescence law
+    /// (design §7): after this returns no lane task holds destination
+    /// pointers or area-chunk refs.
+    pub async fn quiesce(&self) {
+        for q in &self.queues {
+            let mut ts = q.tasks.lock().await;
+            for t in ts.iter() {
+                t.abort();
+            }
+            for t in ts.drain(..) {
+                let _ = t.await;
+            }
+        }
+    }
+
     /// Bring up the association (design §4.2): ICReq/ICResp (digests-off
     /// law) → admin Connect (cntlid 0xFFFF, KATO 0) → CAP → CC.EN →
     /// CSTS.RDY → per-queue IO Connect. Every failure is loud and leaves

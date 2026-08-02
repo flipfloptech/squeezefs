@@ -2770,6 +2770,20 @@ pub struct Metrics {
     pub zcrx_frame_violations: Align64<AtomicU64>,
     pub zcrx_conn_errors: Align64<AtomicU64>,
     pub zcrx_hdr_copy_bytes: Align64<AtomicU64>,
+    /// PR Z2 (area backend): `zcrx_area_bytes` = live mapped receive-area
+    /// bytes (the non-sheddable R5 `zcrx_area` component's gauge);
+    /// `zcrx_gather_bytes` prices the ONE completion gather pass from area
+    /// chunks into the pooled fill (≈ `zcrx_fill_bytes` in Z2; the Z3
+    /// serve fusion collapses it into `read_copy_dest_bytes`);
+    /// `zcrx_area_admission_waits` = commands parked on area headroom
+    /// (honest backpressure, never a mid-stream stall);
+    /// `zcrx_lane_poisoned` = session poison transitions (mid-flight
+    /// NIC/queue/framing death → drained + kernel path) — a must-stay-0
+    /// tripwire on healthy fabrics.
+    pub zcrx_area_bytes: Align64<AtomicU64>,
+    pub zcrx_gather_bytes: Align64<AtomicU64>,
+    pub zcrx_area_admission_waits: Align64<AtomicU64>,
+    pub zcrx_lane_poisoned: Align64<AtomicU64>,
     /// Layout mix (write path outcomes).
     pub layout_inline_writes: Align64<AtomicU64>,
     pub layout_staged_writes: Align64<AtomicU64>,
@@ -5336,6 +5350,10 @@ impl SqueezefsFilesystem {
                 "zcrx_frame_violations": METRICS.zcrx_frame_violations.load(Ordering::Relaxed),
                 "zcrx_conn_errors": METRICS.zcrx_conn_errors.load(Ordering::Relaxed),
                 "zcrx_hdr_copy_bytes": METRICS.zcrx_hdr_copy_bytes.load(Ordering::Relaxed),
+                "zcrx_area_bytes": METRICS.zcrx_area_bytes.load(Ordering::Relaxed),
+                "zcrx_gather_bytes": METRICS.zcrx_gather_bytes.load(Ordering::Relaxed),
+                "zcrx_area_admission_waits": METRICS.zcrx_area_admission_waits.load(Ordering::Relaxed),
+                "zcrx_lane_poisoned": METRICS.zcrx_lane_poisoned.load(Ordering::Relaxed),
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),
                 "staged_spill_escalations": METRICS.staged_spill_escalations.load(Ordering::Relaxed),

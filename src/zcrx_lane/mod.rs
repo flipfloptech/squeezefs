@@ -11,11 +11,14 @@
 //! lands a plain `SQUEEZEFS_ZCRX_LANE=1` mount logs the refusal loud and
 //! stays on the kernel path.
 
+pub mod area;
+pub mod area_core;
 pub mod initiator;
 pub mod pdu;
 pub mod probe;
+pub mod steering;
 
-pub use initiator::{LaneSession, LaneTarget};
+pub use initiator::{LaneBackend, LaneSession, LaneTarget};
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -29,6 +32,21 @@ pub fn lane_env_armed() -> bool {
 /// with the kernel path — the PR Z1 contract venue; counted, never a win).
 pub fn lane_force_copy_backend() -> bool {
     std::env::var("SQUEEZEFS_ZCRX_LANE_FORCE_COPY").is_ok_and(|v| v == "1")
+}
+
+/// Test seam (PR Z2 contract venue): arm the AREA backend with the socket
+/// recv simulating NIC DMA into area chunks — the full chunk-parser /
+/// refill / gather machinery over classic delivery. Never a product
+/// posture (the real backend's delivery is RECV_ZC).
+pub fn lane_area_sim_backend() -> bool {
+    std::env::var("SQUEEZEFS_ZCRX_LANE_AREA_SIM").is_ok_and(|v| v == "1")
+}
+
+/// R5 arm gate (design §7): Red blocks NEW lane arms (the area is a fixed
+/// non-sheddable component); Green/Yellow admit. Pure — the ladder wires
+/// it to the live `mem_budget` level.
+pub fn arm_admission(_level: crate::mem_budget::Level) -> bool {
+    true // Z2 phase A stub — contracts red
 }
 
 /// Dev/test target override: `traddr,trsvcid,subnqn,nsid,lba_shift,max_xfer`
@@ -60,10 +78,44 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
     if !lane_env_armed() {
         return None;
     }
+    // R5 gate (design §7): Red blocks NEW lane arms — loud, kernel path
+    // serves byte-identical; a later remount (or re-arm attempt on the
+    // next eligible read after pressure clears… the OnceCell caches the
+    // refusal for this mount, matching the session-death posture).
+    if !arm_admission(crate::mem_budget::MEM_BUDGET.level()) {
+        log::warn!(
+            "zcrx-lane: R5 Red blocks a NEW lane arm for {device_path} — \
+             kernel path serves (byte-identical)"
+        );
+        return None;
+    }
     let target = match lane_target_override() {
         Some(t) => t,
         None => probe::nvme_tcp_target_for(device_path)?,
     };
+    if lane_area_sim_backend() {
+        // PR Z2 contract venue: the area/chunk/refill machinery over a
+        // classic socket recv standing in for NIC DMA.
+        area::register_r5_component();
+        return match LaneSession::connect_with(target, LaneBackend::AreaSim).await {
+            Ok(sess) => {
+                crate::fuse_client::METRICS
+                    .zcrx_lane_armed
+                    .store(1, Ordering::Relaxed);
+                Some(sess)
+            }
+            Err(e) => {
+                crate::fuse_client::METRICS
+                    .zcrx_conn_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                log::error!(
+                    "zcrx-lane: area-sim arm failed for {device_path}: {e} — kernel \
+                     path serves (byte-identical)"
+                );
+                None
+            }
+        };
+    }
     if !lane_force_copy_backend() {
         // PR Z1: the zero-copy recv backend is not shipped yet. Refuse to
         // arm rather than silently adding a copy lane (design §6).

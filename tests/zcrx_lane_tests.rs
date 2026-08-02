@@ -5,7 +5,7 @@
 //! gauges. The gate runs `--test-threads=1`, so env mutation per test is
 //! safe; every test restores the env it touches.
 
-use squeezefs::zcrx_lane::{initiator::LaneTarget, pdu, probe, LaneSession};
+use squeezefs::zcrx_lane::{area, initiator::LaneTarget, pdu, probe, LaneBackend, LaneSession};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,6 +29,9 @@ struct MockCfg {
     corrupt_datao: bool,
     /// PDO padding to insert between C2HData header and payload.
     c2h_pdo_pad: usize,
+    /// Drop the connection mid-C2HData payload (mid-flight death
+    /// injection — the PR Z2 poison-lattice venue).
+    die_mid_c2h: bool,
 }
 
 impl Default for MockCfg {
@@ -40,6 +43,7 @@ impl Default for MockCfg {
             fail_status: None,
             corrupt_datao: false,
             c2h_pdo_pad: 0,
+            die_mid_c2h: false,
         }
     }
 }
@@ -174,6 +178,23 @@ async fn mock_conn(mut s: TcpStream, device: Arc<Vec<u8>>, cfg: MockCfg) -> Opti
                 }
                 let start = (slba as usize) << MOCK_LBA_SHIFT;
                 let payload = &device[start..start + xfer];
+                if cfg.die_mid_c2h {
+                    // Half a C2HData header + payload, then vanish: the
+                    // mid-flight NIC/target death the poison lattice must
+                    // drain from.
+                    let span = cfg.c2h_span.min(xfer);
+                    let mut hdr = vec![0u8; 24];
+                    hdr[0] = 0x07;
+                    hdr[2] = 24;
+                    hdr[3] = 24;
+                    hdr[4..8].copy_from_slice(&((24 + span) as u32).to_le_bytes());
+                    hdr[8..10].copy_from_slice(&cid.to_le_bytes());
+                    hdr[16..20].copy_from_slice(&(span as u32).to_le_bytes());
+                    s.write_all(&hdr).await.ok()?;
+                    s.write_all(&payload[..span / 2]).await.ok()?;
+                    s.flush().await.ok()?;
+                    return None; // drops the connection
+                }
                 let mut off = 0usize;
                 while off < xfer {
                     let span = cfg.c2h_span.min(xfer - off);
@@ -257,7 +278,40 @@ fn zcrx_metric(name: &str) -> u64 {
         "frame_violations" => m.zcrx_frame_violations.load(Ordering::Relaxed),
         "conn_errors" => m.zcrx_conn_errors.load(Ordering::Relaxed),
         "hdr_copy_bytes" => m.zcrx_hdr_copy_bytes.load(Ordering::Relaxed),
+        "area_bytes" => m.zcrx_area_bytes.load(Ordering::Relaxed),
+        "gather_bytes" => m.zcrx_gather_bytes.load(Ordering::Relaxed),
+        "admission_waits" => m.zcrx_area_admission_waits.load(Ordering::Relaxed),
+        "poisoned" => m.zcrx_lane_poisoned.load(Ordering::Relaxed),
         _ => panic!("unknown metric {name}"),
+    }
+}
+
+/// Env guard: sets the lane env for one test and restores on drop (the
+/// suite runs `--test-threads=1`, so per-test mutation is safe; the guard
+/// makes restoration panic-proof).
+struct LaneEnv;
+
+impl LaneEnv {
+    fn area_sim(mock: &MockTarget, io_queues: u16, depth: u16) -> LaneEnv {
+        std::env::set_var("SQUEEZEFS_ZCRX_LANE", "1");
+        std::env::set_var("SQUEEZEFS_ZCRX_LANE_AREA_SIM", "1");
+        std::env::set_var(
+            "SQUEEZEFS_ZCRX_LANE_TARGET",
+            format!(
+                "127.0.0.1,{},{},1,{},262144,{},{}",
+                mock.port, MOCK_SUBNQN, MOCK_LBA_SHIFT, io_queues, depth
+            ),
+        );
+        LaneEnv
+    }
+}
+
+impl Drop for LaneEnv {
+    fn drop(&mut self) {
+        std::env::remove_var("SQUEEZEFS_ZCRX_LANE");
+        std::env::remove_var("SQUEEZEFS_ZCRX_LANE_AREA_SIM");
+        std::env::remove_var("SQUEEZEFS_ZCRX_LANE_TARGET");
+        std::env::remove_var("SQUEEZEFS_ZCRX_LANE_SIM_CHUNK");
     }
 }
 
@@ -777,4 +831,324 @@ async fn test_funnel_arm_refusal_without_force_copy_stays_kernel_path() {
         before_fills,
         "refused arm must not serve through the lane"
     );
+}
+
+// ================================================================ PR Z2 laws
+// The zcrx recv backend behind the funnel (design §5/§7/§8): area + refill
+// discipline, the gather law, the poison lattice, R5 area budgeting. The
+// AREA-SIM seam runs the REAL chunk-parser / ledger / gather machinery with
+// socket recv standing in for NIC DMA — the io_uring surface itself is the
+// field window's (no zcrx-capable NIC exists locally, stated in the Z2
+// evidence note).
+
+#[test]
+fn test_z2_area_sizing_derivation_laws() {
+    // Design §8: per-queue area = depth × max_xfer rounded up to PMD,
+    // floor one PMD — DERIVED, no fixed constants.
+    let pmd = area::PMD_BYTES;
+    assert_eq!(area::area_bytes_per_queue(8, 262_144), 2 * 1024 * 1024);
+    assert_eq!(
+        area::area_bytes_per_queue(4, 4_096),
+        pmd,
+        "tiny windows floor at one PMD"
+    );
+    assert_eq!(
+        area::area_bytes_per_queue(64, 1 << 20),
+        64 * 1024 * 1024,
+        "already PMD-aligned windows pass through"
+    );
+    assert_eq!(
+        area::area_bytes_per_queue(9, 262_144),
+        4 * 1024 * 1024,
+        "non-multiple rounds UP to the next PMD"
+    );
+    let mut last = 0;
+    for depth in [4u16, 8, 16, 32, 64] {
+        let a = area::area_bytes_per_queue(depth, 262_144);
+        assert!(a >= last, "monotonic in depth");
+        assert_eq!(a % pmd, 0, "always PMD-granular");
+        last = a;
+    }
+
+    // Refill ring: 1:1 with area chunks, next pow2 (§8).
+    assert_eq!(area::rq_entries_for(512), 512);
+    assert_eq!(area::rq_entries_for(513), 1024);
+    for chunks in [512u64, 640, 1024, 4096] {
+        let e = area::rq_entries_for(chunks);
+        assert!(e.is_power_of_two(), "kernel requires pow2");
+        assert!(e as u64 >= chunks, "never fewer entries than chunks");
+    }
+}
+
+#[test]
+fn test_z2_arm_admission_red_blocks_new_arms() {
+    use squeezefs::mem_budget::Level;
+    assert!(squeezefs::zcrx_lane::arm_admission(Level::Green));
+    assert!(squeezefs::zcrx_lane::arm_admission(Level::Yellow));
+    assert!(
+        !squeezefs::zcrx_lane::arm_admission(Level::Red),
+        "R5 Red must block NEW lane arms (design §7)"
+    );
+}
+
+#[test]
+fn test_z2_r5_component_registration_idempotent_and_gauged() {
+    area::register_r5_component();
+    area::register_r5_component(); // idempotent — never a duplicate entry
+    let comps = squeezefs::mem_budget::MEM_BUDGET.stats_components();
+    let mine: Vec<_> = comps.iter().filter(|c| c.0 == "zcrx_area").collect();
+    assert_eq!(mine.len(), 1, "exactly one zcrx_area component: {comps:?}");
+    let (_, current, _floor, _weight, sheds) = *mine[0];
+    assert_eq!(
+        current,
+        zcrx_metric("area_bytes"),
+        "the component's gauge IS the zcrx_area_bytes metric"
+    );
+    assert_eq!(sheds, 0, "non-sheddable: the shed hook must be a no-op");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_z2_area_sim_multi_pdu_content_and_full_recycle() {
+    // The gather law's contract venue: multi-PDU + PDO pad + sub-command
+    // split, headers split across TINY chunks (256 B — far below any PDU),
+    // content byte-exact, and EVERY chunk recycled once the ops complete
+    // (refill discipline: chunk return on last ref drop).
+    std::env::set_var("SQUEEZEFS_ZCRX_LANE_SIM_CHUNK", "256");
+    let cfg = MockCfg {
+        c2h_span: 8192,
+        c2h_pdo_pad: 8,
+        ..Default::default()
+    };
+    let mock = MockTarget::start(cfg, 2 << 20).await;
+    let before_hdr = zcrx_metric("hdr_copy_bytes");
+    let before_gather = zcrx_metric("gather_bytes");
+    let sess = LaneSession::connect_with(mock.target(2, 8), LaneBackend::AreaSim)
+        .await
+        .expect("area-sim arm");
+    let (_, total) = sess.area_chunks();
+    assert!(total > 0, "area backend must own chunks");
+
+    let mut buf = vec![0u8; 512 * 1024];
+    sess.read_into_slice(4096, &mut buf).await.expect("read");
+    assert_eq!(
+        &buf[..],
+        &mock.device[4096..4096 + 512 * 1024],
+        "reassembled bytes must match the namespace across chunk seams"
+    );
+    assert!(
+        zcrx_metric("hdr_copy_bytes") > before_hdr,
+        "header edge copy must be priced"
+    );
+    assert_eq!(
+        zcrx_metric("gather_bytes") - before_gather,
+        512 * 1024,
+        "the ONE completion gather pass is priced byte-exactly"
+    );
+
+    // Refill discipline: with ops complete and fills dropped, every chunk
+    // is back in the free set (the sim reader grants only when readable).
+    sess.quiesce().await;
+    let (free, total) = sess.area_chunks();
+    assert_eq!(free, total, "all chunks recycled after ops complete");
+    std::env::remove_var("SQUEEZEFS_ZCRX_LANE_SIM_CHUNK");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_z2_area_sim_funnel_engagement_and_gather_closure() {
+    // Funnel-level engagement (the field bracket's instrument): AREA_SIM
+    // env arms through `arm_for_device`; lane serves MOCK namespace bytes
+    // (≠ file bytes — structural engagement); gauges close byte-exact.
+    let mock = MockTarget::start(MockCfg::default(), 8 << 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blockfile");
+    std::fs::write(&path, vec![0xEEu8; 8 << 20]).unwrap();
+
+    let env = LaneEnv::area_sim(&mock, 2, 8);
+    let before_fills = zcrx_metric("fills");
+    let before_bytes = zcrx_metric("fill_bytes");
+    let before_gather = zcrx_metric("gather_bytes");
+    let before_fallbacks = zcrx_metric("fallbacks");
+    let dev = squeezefs::nvme_dev::NvmeBlockDev::new(path.to_str().unwrap());
+    let sizes = [4096usize, 512 * 1024, 1 << 20, 65536];
+    let mut expect = 0u64;
+    for (i, sz) in sizes.iter().enumerate() {
+        let off = (i as u64) * (2 << 20);
+        let got = dev.read_block(off, *sz).await.expect("lane read");
+        assert_eq!(
+            &got[..],
+            &mock.device[off as usize..off as usize + sz],
+            "the lane must have served the read (namespace bytes, not file bytes)"
+        );
+        expect += *sz as u64;
+    }
+    assert!(
+        zcrx_metric("area_bytes") > 0,
+        "armed area must be gauge-visible (the R5 component's source)"
+    );
+    drop(env);
+
+    assert_eq!(
+        zcrx_metric("fill_bytes") - before_bytes,
+        expect,
+        "fill_bytes closes byte-exact against served fills"
+    );
+    assert_eq!(
+        zcrx_metric("gather_bytes") - before_gather,
+        expect,
+        "Z2 gather closure: every fill byte pays exactly one gather pass"
+    );
+    assert_eq!(
+        zcrx_metric("fills") - before_fills,
+        sizes.len() as u64,
+        "one fill per funnel read regardless of sub-command split"
+    );
+    assert_eq!(zcrx_metric("fallbacks"), before_fallbacks, "clean run");
+    assert_eq!(zcrx_metric("armed"), 1, "armed gauge");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_z2_area_exhaustion_backpressures_admission_never_deadlocks() {
+    // Design §4.3/§5: area exhaustion applies backpressure at COMMAND
+    // admission — bounded in-flight fills — never a mid-stream stall.
+    // 16 × 512 KiB concurrent reads (each split into two 256 KiB
+    // sub-commands) against a 4 MiB single-queue area
+    // must all complete, with the parking visible in the gauge.
+    let mock = MockTarget::start(MockCfg::default(), 8 << 20).await;
+    let sess = LaneSession::connect_with(mock.target(1, 16), LaneBackend::AreaSim)
+        .await
+        .expect("area-sim arm");
+    let before_waits = zcrx_metric("admission_waits");
+    let mut handles = Vec::new();
+    for i in 0..16u64 {
+        let sess = Arc::clone(&sess);
+        let dev = Arc::clone(&mock.device);
+        handles.push(tokio::spawn(async move {
+            let off = i * 512 * 1024;
+            let mut buf = vec![0u8; 512 * 1024];
+            sess.read_into_slice(off, &mut buf).await.expect("read");
+            assert_eq!(&buf[..], &dev[off as usize..off as usize + 512 * 1024]);
+        }));
+    }
+    for h in handles {
+        h.await
+            .expect("no wedged/panicked read under area pressure");
+    }
+    assert!(
+        zcrx_metric("admission_waits") > before_waits,
+        "16 × 512 KiB in flight against a 2 MiB area must park admissions"
+    );
+    sess.quiesce().await;
+    let (free, total) = sess.area_chunks();
+    assert_eq!(free, total, "quiesced area fully recycled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_z2_mid_flight_death_poisons_drains_and_falls_back() {
+    // Poison lattice (design §7 + task law): mid-flight connection death →
+    // session poisons LOUD, in-flight drains, the op retries on the kernel
+    // path (file bytes served), `zcrx_lane_poisoned` counts, armed drops,
+    // and subsequent reads never touch the lane again this mount.
+    let cfg = MockCfg {
+        die_mid_c2h: true,
+        ..Default::default()
+    };
+    let mock = MockTarget::start(cfg, 1 << 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blockfile");
+    let content: Vec<u8> = (0..1 << 20).map(|i| (i % 239) as u8).collect();
+    std::fs::write(&path, &content).unwrap();
+
+    let env = LaneEnv::area_sim(&mock, 1, 4);
+    let before_poisoned = zcrx_metric("poisoned");
+    let before_fallbacks = zcrx_metric("fallbacks");
+    let before_fills = zcrx_metric("fills");
+    let dev = squeezefs::nvme_dev::NvmeBlockDev::new(path.to_str().unwrap());
+    let got = dev
+        .read_block(4096, 65536)
+        .await
+        .expect("the op must succeed via the kernel path");
+    assert_eq!(
+        &got[..],
+        &content[4096..4096 + 65536],
+        "kernel path must serve the FILE bytes after the lane died"
+    );
+    assert_eq!(
+        zcrx_metric("poisoned") - before_poisoned,
+        1,
+        "exactly one poison transition per session death"
+    );
+    assert!(
+        zcrx_metric("fallbacks") > before_fallbacks,
+        "the fallback retry is counted"
+    );
+    assert_eq!(zcrx_metric("armed"), 0, "poison disarms the armed gauge");
+
+    // Second read: lane is dead for the mount lifetime — kernel path only,
+    // no new lane activity, no second poison.
+    let got2 = dev.read_block(0, 4096).await.expect("kernel path");
+    assert_eq!(&got2[..], &content[..4096]);
+    assert_eq!(zcrx_metric("fills"), before_fills, "no lane fills ever");
+    assert_eq!(
+        zcrx_metric("poisoned") - before_poisoned,
+        1,
+        "poison transition counted exactly once"
+    );
+    drop(env);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_z2_frame_violation_in_area_mode_poisons_and_recycles() {
+    // The Z1 framing law re-pinned on the AREA path: corrupt datao →
+    // violation tripwire + session poison + poisoned counter; quiescence
+    // releases every chunk ref (no zombie holds into recycled memory).
+    let cfg = MockCfg {
+        corrupt_datao: true,
+        ..Default::default()
+    };
+    let mock = MockTarget::start(cfg, 1 << 20).await;
+    let before_viol = zcrx_metric("frame_violations");
+    let before_poisoned = zcrx_metric("poisoned");
+    let sess = LaneSession::connect_with(mock.target(1, 4), LaneBackend::AreaSim)
+        .await
+        .expect("area-sim arm");
+    let mut buf = vec![0u8; 8192];
+    let err = sess
+        .read_into_slice(0, &mut buf)
+        .await
+        .expect_err("frame violation must fail the op");
+    assert!(!err.to_string().is_empty());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !sess.poisoned() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("session must poison after a framing violation");
+    assert!(zcrx_metric("frame_violations") > before_viol, "tripwire");
+    assert!(zcrx_metric("poisoned") > before_poisoned, "poison counted");
+
+    sess.quiesce().await;
+    let (free, total) = sess.area_chunks();
+    assert_eq!(
+        free, total,
+        "poison quiescence must release every chunk ref"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_z2_classic_backend_leaves_area_gauges_silent() {
+    // Backend distinction law: the classic (Z1 contract) backend owns no
+    // area — its rows must never move the Z2 area/gather gauges.
+    let mock = MockTarget::start(MockCfg::default(), 1 << 20).await;
+    let before_gather = zcrx_metric("gather_bytes");
+    let before_area = zcrx_metric("area_bytes");
+    let before_waits = zcrx_metric("admission_waits");
+    let sess = LaneSession::connect(mock.target(1, 4)).await.expect("arm");
+    let mut buf = vec![0u8; 64 * 1024];
+    sess.read_into_slice(0, &mut buf).await.expect("read");
+    assert_eq!(&buf[..], &mock.device[..64 * 1024]);
+    assert_eq!((sess.area_chunks()), (0, 0), "classic backend has no area");
+    assert_eq!(zcrx_metric("gather_bytes"), before_gather);
+    assert_eq!(zcrx_metric("area_bytes"), before_area);
+    assert_eq!(zcrx_metric("admission_waits"), before_waits);
 }

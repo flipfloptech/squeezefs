@@ -579,6 +579,19 @@ impl KmbufQueue {
             .then(|| (self.region_base + bid as usize * self.buf_size) as *mut u8)
     }
 
+    /// MEM-1 dest-claim reverse lookup: the ent currently attached to
+    /// `bid` (`None` = no ent holds it). Sound at claim time because the
+    /// claiming request's handler has not replied yet, so its ent's
+    /// attachment cannot be re-pointed (the kernel re-points/recycles
+    /// only at fetch, which our COMMIT_AND_FETCH triggers — and that
+    /// commit is exactly what the claimed lease parks). `NO_BUF` is
+    /// `u64::MAX`, unreachable by a geometry-derived bid.
+    pub fn ent_of_bid(&self, bid: u64) -> Option<usize> {
+        self.attached
+            .iter()
+            .position(|a| a.load(Ordering::Acquire) == bid)
+    }
+
     /// Apply the delivery-CQE attachment law for ent `idx` (see the
     /// module doc): a flagged CQE re-points the attachment; an unflagged
     /// one keeps it (buffer reuse across consecutive payload-carrying

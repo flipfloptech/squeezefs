@@ -821,6 +821,76 @@ mod models {
         });
     }
 
+    /// Transport payload-lease invariant #3 — MEM-1 dest-DMA tokens, the
+    /// multi-ref face: two worker-held destination tokens against one ent
+    /// (a kernel-split multi-block read: one token per in-flight SQE) drop
+    /// concurrently while the queue worker's commit gate races them. The
+    /// COMMIT_AND_FETCH executes exactly once and never while ANY token is
+    /// live (refs > 0 ⇒ device DMA can still land in the payload buffer),
+    /// a non-final drop never wakes, and a parked commit is never lost to
+    /// a missed wake — the LAST drop must observe `parked` or the worker's
+    /// publish-then-recheck must observe refs == 0 (the same SeqCst-fence
+    /// Dekker pairing as invariant #1, now explored at refs ∈ {2, 1, 0}).
+    #[test]
+    fn ent_lease_dest_tokens_multi_ref_commit_exactly_once() {
+        loom::model(|| {
+            let st = Arc::new(lease_core::EntLeaseState::new());
+            // Claims happen strictly before the request's reply can exist
+            // (mint → claim → submit → await), so both refs precede the
+            // racing gate below — exactly the shipped order.
+            st.acquire_dest();
+            st.acquire_dest();
+
+            let wakes = Arc::new(AtomicU64::new(0));
+
+            // Two device-worker CQE completions dropping their tokens.
+            let droppers: Vec<_> = (0..2)
+                .map(|_| {
+                    let st = Arc::clone(&st);
+                    let wakes = Arc::clone(&wakes);
+                    thread::spawn(move || {
+                        if st.release() {
+                            wakes.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                })
+                .collect();
+
+            // Queue worker: the abandoned read's error reply commits.
+            let mut commits = 0u32;
+            let parked = match st.try_commit() {
+                lease_core::CommitGate::Ready => {
+                    assert!(
+                        !st.leased(),
+                        "commit fired while a dest token was live — the ent \
+                         could re-arm into an in-flight DMA"
+                    );
+                    commits += 1;
+                    false
+                }
+                lease_core::CommitGate::Parked => true,
+            };
+
+            for d in droppers {
+                d.join().unwrap();
+            }
+
+            if parked {
+                assert!(
+                    wakes.load(Ordering::SeqCst) >= 1,
+                    "missed wake: commit parked but no token drop saw parked == true"
+                );
+                assert!(
+                    st.try_unpark(),
+                    "parked commit not releasable after every token dropped"
+                );
+                assert!(!st.leased(), "unparked commit with a live token");
+                commits += 1;
+            }
+            assert_eq!(commits, 1, "the commit must execute exactly once");
+        });
+    }
+
     /// Wake-coalescer invariant #1 (L3 transport-economy lever B): a
     /// producer publication is NEVER stranded. Producers publish state
     /// (Release store — the mpsc-send stand-in) then `arm()`, writing the

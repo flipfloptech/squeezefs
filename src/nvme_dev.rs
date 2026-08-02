@@ -232,6 +232,15 @@ enum UringRequest {
         /// Enqueue stamp — feeds `read_fill_phase_ns.dev_queue`
         /// (channel + slot wait before the SQE submits).
         enq: std::time::Instant,
+        /// MEM-1: owner token for a zero-copy destination (`dest_addr`
+        /// reads). The WORKER holds it for exactly the SQE's lifetime and
+        /// drops it at CQE completion (before the caller oneshot fires),
+        /// so an abandoned caller future (timeout / drop) cannot let the
+        /// destination's owner — the transport ent re-arm path — hand the
+        /// buffer to a new request while device DMA can still land in it.
+        /// `None` for pooled reads (ownership already moves with the
+        /// pooled `Bytes`) and for dests with no registered owner.
+        dest_token: Option<DestToken>,
     },
     Write {
         offset: u64,
@@ -392,6 +401,49 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
         response: UringResponse,
         free_ptr: Option<(FreePtrKind, SendPtr)>,
         _keep_alive: Option<bytes::Bytes>,
+        /// MEM-1: dest owner token — held while the SQE is in flight,
+        /// dropped at CQE completion BEFORE the caller oneshot fires (so
+        /// the happy path never pays a spurious commit park) and on every
+        /// teardown path (drop = release; the owner's re-arm gate unparks).
+        dest_token: Option<DestToken>,
+    }
+
+    /// Complete one in-flight request at CQE time. MEM-1 ordering: the
+    /// dest owner token drops FIRST — the DMA is over, so the
+    /// destination's owner (the transport ent re-arm gate) is released
+    /// before the caller oneshot can possibly produce a reply; the happy
+    /// path therefore never pays a spurious commit park.
+    fn complete_one(act: ActiveReq, io_res: std::io::Result<usize>) {
+        let ActiveReq {
+            response,
+            free_ptr,
+            _keep_alive: keep_alive,
+            dest_token,
+        } = act;
+        drop(dest_token);
+        match response {
+            UringResponse::Read {
+                bytes,
+                size,
+                offset,
+                tx,
+                submitted,
+            } => {
+                crate::fuse_client::read_fill_phase_record(
+                    crate::fuse_client::ReadFillPhase::DevService,
+                    submitted,
+                );
+                let _ = tx.send(finish_read(io_res, bytes, size, offset));
+            }
+            UringResponse::Write { tx } => {
+                let mapped = io_res.map(|_| ()).map_err(crate::error::SqueezefsError::Io);
+                let _ = tx.send(mapped);
+            }
+        }
+        if let Some((kind, p)) = free_ptr {
+            release_free_ptr(kind, p);
+        }
+        drop(keep_alive);
     }
 
     let mut active: Vec<Option<ActiveReq>> = Vec::with_capacity(1024);
@@ -446,6 +498,7 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                     bytes,
                     tx,
                     enq,
+                    dest_token,
                 } => {
                     // Test seam: deterministic device-order stall (MEM-1
                     // repro) — the request already owns its dest token, so
@@ -489,6 +542,7 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                         },
                         free_ptr: None,
                         _keep_alive: None,
+                        dest_token,
                     });
                     if use_fixed {
                         opcode::Read::new(types::Fixed(0), buf_ptr.0, size as _)
@@ -524,6 +578,7 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                         response: UringResponse::Write { tx },
                         free_ptr,
                         _keep_alive: keep_alive,
+                        dest_token: None,
                     });
                     if use_fixed {
                         opcode::Write::new(types::Fixed(0), ptr, len as _)
@@ -563,31 +618,7 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                         } else {
                             Ok(res as usize)
                         };
-
-                        match act.response {
-                            UringResponse::Read {
-                                bytes,
-                                size,
-                                offset,
-                                tx,
-                                submitted,
-                            } => {
-                                crate::fuse_client::read_fill_phase_record(
-                                    crate::fuse_client::ReadFillPhase::DevService,
-                                    submitted,
-                                );
-                                let _ = tx.send(finish_read(io_res, bytes, size, offset));
-                            }
-                            UringResponse::Write { tx } => {
-                                let mapped =
-                                    io_res.map(|_| ()).map_err(crate::error::SqueezefsError::Io);
-                                let _ = tx.send(mapped);
-                            }
-                        }
-
-                        if let Some((kind, p)) = act.free_ptr {
-                            release_free_ptr(kind, p);
-                        }
+                        complete_one(act, io_res);
                     }
                     completed_slots.push(slot_idx);
                 }
@@ -665,31 +696,7 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                     } else {
                         Ok(res as usize)
                     };
-
-                    match act.response {
-                        UringResponse::Read {
-                            bytes,
-                            size,
-                            offset,
-                            tx,
-                            submitted,
-                        } => {
-                            crate::fuse_client::read_fill_phase_record(
-                                crate::fuse_client::ReadFillPhase::DevService,
-                                submitted,
-                            );
-                            let _ = tx.send(finish_read(io_res, bytes, size, offset));
-                        }
-                        UringResponse::Write { tx } => {
-                            let mapped =
-                                io_res.map(|_| ()).map_err(crate::error::SqueezefsError::Io);
-                            let _ = tx.send(mapped);
-                        }
-                    }
-
-                    if let Some((kind, p)) = act.free_ptr {
-                        release_free_ptr(kind, p);
-                    }
+                    complete_one(act, io_res);
                 }
 
                 completed_slots.push(slot_idx);
@@ -727,6 +734,11 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
 
     for slot in active.iter_mut() {
         if let Some(act) = slot.take() {
+            // MEM-1: `act.dest_token` drops with `act` at scope end —
+            // worker teardown releases every held destination (the
+            // owner's re-arm gate unparks; a genuinely-wedged SQE never
+            // reaches here because the loop drains active_count to 0
+            // before exiting).
             let free_ptr = act.free_ptr;
             match act.response {
                 UringResponse::Read { tx, .. } => {
@@ -1180,19 +1192,32 @@ impl NvmeBlockDev {
             return Ok(out);
         }
 
-        let (buf_ptr, bytes) = if let Some(addr) = dest_addr {
-            // SAFETY: destination address is pre-registered and pinned memory
+        let (buf_ptr, bytes, dest_token) = if let Some(addr) = dest_addr {
+            // MEM-1: claim the destination's owner token BEFORE the
+            // request exists — the worker holds it for the SQE's lifetime,
+            // so the owner's re-arm path (the transport §5.4 commit gate)
+            // waits out any DMA that can still land here even if this
+            // future times out or is dropped. `None` = no registered
+            // owner (IPC-arena dests carry session-lifetime ownership of
+            // their own) — proceed as before.
+            let token = claim_dest_token(addr, size);
+            // SAFETY: the destination is registered, pinned memory whose
+            // mapping outlives the pool (transport payload arenas are
+            // pool-lifetime — fuse_over_uring::QueueHandle::arena), and
+            // the token above parks the owner's re-arm while the worker
+            // can still DMA into it (MEM-1).
             let b = unsafe {
                 bytes::Bytes::from_static(std::slice::from_raw_parts(addr as *const u8, size))
             };
-            (addr as *mut u8, b)
+            (addr as *mut u8, b, token)
         } else {
             // Size-classed bounce (2026-07-25 ipc-miss-path fix): sub-block
             // windows ride the 64 KiB RANGED_BUF_POOL — a 4 KiB ranged read
             // checking out a 4 MiB whole-block backing exhausted that pool
             // at miss-path concurrency and paid a THP-zeroing fault + TLB
             // storm per excess op (see pool.rs::RANGED_BUF_POOL).
-            crate::cache::pool::read_bounce_pool(size).alloc()
+            let (p, b) = crate::cache::pool::read_bounce_pool(size).alloc();
+            (p, b, None)
         };
 
         let (tx, rx_oneshot) = oneshot::channel();
@@ -1205,6 +1230,7 @@ impl NvmeBlockDev {
                 bytes,
                 tx,
                 enq: std::time::Instant::now(),
+                dest_token,
             })
             .map_err(|e| {
                 crate::fuse_client::METRICS

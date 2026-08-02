@@ -363,6 +363,24 @@ impl FuseConnection {
         pool.get_payload_buffer(unique)
     }
 
+    /// MEM-1: claim a DMA-destination owner token over `[addr, addr+len)`
+    /// (see [`super::fuse_over_uring::FuseOverUring::lease_dest_window`]).
+    /// The daemon's mount arm path wraps this into the `nvme_dev`
+    /// dest-resolver registry; the token is held by the DEVICE WORKER for
+    /// the SQE's lifetime, parking the ent's re-arm until the DMA cannot
+    /// land anymore.
+    #[cfg(target_os = "linux")]
+    pub fn lease_dest_window(
+        &self,
+        addr: u64,
+        len: usize,
+    ) -> Option<super::fuse_over_uring::DestDmaLease> {
+        // Same uncontended-mutex posture as `get_payload_buffer` above
+        // (deliberately not arc-swap — the P2 md-storm forensics note).
+        let pool = self.over_uring.lock().unwrap().clone()?;
+        pool.lease_dest_window(addr, len)
+    }
+
     /// True once the FUSE-over-io_uring pool is armed and ready — the
     /// gate for in-place replies (P2 per-op economy): an armed session's
     /// reply is a synchronous COMMIT enqueue (`submit_reply`), safe to

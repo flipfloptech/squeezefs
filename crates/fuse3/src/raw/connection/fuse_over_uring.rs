@@ -248,6 +248,51 @@ struct QueueHandle {
     /// resources — `get_payload_buffer` serves the ent's ATTACHED buffer
     /// through this (attachments are per-delivery, not per-ent-static).
     kmbuf: std::sync::Mutex<Option<Arc<KmbufQueue>>>,
+    /// Per-ent §5.4 lease states — pool-level (not worker-local) so
+    /// [`FuseOverUring::lease_dest_window`] can acquire DMA-destination
+    /// leases (MEM-1) against the very words the worker's commit gate
+    /// checks. The worker clones this Vec once at startup.
+    lease_states: Vec<Arc<EntLeaseState>>,
+    /// The queue's dest-claim geometry (MEM-1 address-containment
+    /// resolution), set once by the worker right after its arena exists.
+    dest_window: std::sync::OnceLock<DestWindow>,
+}
+
+/// One queue's dest-claim geometry (MEM-1): the arena span, its buffer
+/// stride, and the keep-alives a claim token needs.
+struct DestWindow {
+    base: usize,
+    span: usize,
+    stride: usize,
+    arena: Arc<PayloadArena>,
+    /// kmbuf mode: window buffer indices are BIDs — the ent currently
+    /// attached to the bid owns the lease word. Attachment is stable
+    /// across the claim window: the kernel re-points/recycles only at
+    /// fetch (triggered by our COMMIT_AND_FETCH), and a claim happens
+    /// strictly before the claiming request's reply can exist.
+    kmbuf: Option<Arc<KmbufQueue>>,
+}
+
+impl DestWindow {
+    /// True when `[addr, addr + len)` lies inside this arena span.
+    fn contains(&self, addr: usize, len: usize) -> bool {
+        self.stride != 0
+            && addr >= self.base
+            && addr
+                .checked_add(len)
+                .is_some_and(|end| end <= self.base + self.span)
+    }
+}
+
+/// Pure MEM-1 window math: the buffer index `[addr, addr + len)` occupies
+/// inside a `(base, stride)` arena, or `None` when the window straddles
+/// two buffers (never a valid single-request dest — refused rather than
+/// mis-leased). Caller has already proven containment.
+fn dest_window_index(base: usize, stride: usize, addr: usize, len: usize) -> Option<usize> {
+    debug_assert!(stride > 0 && len > 0 && addr >= base);
+    let off = addr - base;
+    let idx = off / stride;
+    ((off + len - 1) / stride == idx).then_some(idx)
 }
 
 /// Owns every registered payload buffer of one queue plus a dup of the
@@ -501,28 +546,7 @@ impl Drop for EntPayloadLease {
                  transport_lease_overlong / transport_parked_commits"
             );
         }
-        if self.state.release() {
-            // Last lease gone with a commit parked: wake the queue worker.
-            // L3 lever B — publish (the release above) happened first, so
-            // the coalescer may elide the write when a wake is already
-            // armed (wake_core protocol; loom-verified with this site's
-            // exact release→arm→write order).
-            if self.arena.wake_coalescer.arm() {
-                let one: u64 = 1;
-                // SAFETY: writing 8 bytes to an eventfd we keep alive via
-                // `self.arena.wake`.
-                unsafe {
-                    libc::write(
-                        self.arena.wake.as_raw_fd(),
-                        &one as *const u64 as *const _,
-                        8,
-                    )
-                };
-                TRANSPORT_WAKE_WRITES.fetch_add(1, Ordering::Relaxed);
-            } else {
-                TRANSPORT_WAKES_ELIDED.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        lease_release_and_wake(&self.state, &self.arena);
     }
 }
 
@@ -531,6 +555,55 @@ impl Drop for EntPayloadLease {
 // on any thread (tokio workers) and only touch atomics + an eventfd write.
 unsafe impl Send for EntPayloadLease {}
 unsafe impl Sync for EntPayloadLease {}
+
+/// Release one §5.4 lease ref on `state`; when this was the last ref with
+/// a commit parked, wake the queue worker through the arena's coalescer.
+/// L3 lever B — the publish (`release`'s `fetch_sub`) happened first, so
+/// the coalescer may elide the eventfd write when a wake is already armed
+/// (wake_core protocol; loom-verified with this exact release→arm→write
+/// order). Shared by [`EntPayloadLease`] (FUSE_WRITE payload leases) and
+/// [`DestDmaLease`] (MEM-1 read-destination tokens) — one wake law.
+fn lease_release_and_wake(state: &EntLeaseState, arena: &PayloadArena) {
+    if state.release() {
+        if arena.wake_coalescer.arm() {
+            let one: u64 = 1;
+            // SAFETY: writing 8 bytes to an eventfd the arena keeps alive
+            // (`arena.wake` is a dup owned by the arena itself).
+            unsafe { libc::write(arena.wake.as_raw_fd(), &one as *const u64 as *const _, 8) };
+            TRANSPORT_WAKE_WRITES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            TRANSPORT_WAKES_ELIDED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// MEM-1 (pre-rc engineering spec §2, P0): owner token for one zero-copy
+/// READ-destination DMA — the §5.4 lease protocol applied to the
+/// completion direction. Claimed by the NVMe read path at device-request
+/// build ([`FuseOverUring::lease_dest_window`], reached through the
+/// SqueezeFS `nvme_dev` dest-resolver registry) and held by the DEVICE
+/// WORKER for exactly the SQE's lifetime: while any token is live the
+/// ent's COMMIT_AND_FETCH parks (the same gate FUSE_WRITE payload leases
+/// ride), so an abandoned read future (timeout / drop) can no longer let
+/// the transport re-arm the payload buffer while device DMA can still
+/// land in it. The arena Arc keeps the destination memory and wake fd
+/// alive even past worker/pool teardown — a wedged device degrades to a
+/// parked ring slot, never a dangling pointer.
+///
+/// LAW: the reply body served from the destination must NEVER hold this
+/// token — `apply_reply` runs only after the gate proves refs == 0, so a
+/// token owned by the reply would park its own commit forever. The token
+/// belongs to the worker's in-flight request, nothing else.
+pub struct DestDmaLease {
+    arena: Arc<PayloadArena>,
+    state: Arc<EntLeaseState>,
+}
+
+impl Drop for DestDmaLease {
+    fn drop(&mut self) {
+        lease_release_and_wake(&self.state, &self.arena);
+    }
+}
 
 /// Shared work queue for all session workers (primary + multi-queue clones).
 struct InboundQueue {
@@ -872,6 +945,10 @@ fn flush_submit(ring: &mut Ring, batch: &mut SubmitBatch) -> io::Result<usize> {
 }
 // §5.4 transport payload-lease observability (SqueezeFS stats inode).
 static TRANSPORT_PAYLOAD_LEASES: AtomicU64 = AtomicU64::new(0);
+// MEM-1 dest-DMA lease claims (read-destination owner tokens) — the
+// engagement instrument: ≈ every dest-bearing device read on an armed
+// session claims exactly one per SQE.
+static TRANSPORT_DEST_DMA_LEASES: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_PARKED_COMMITS: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_LEASES_OUTSTANDING: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_LEASE_MAX_AGE_MS: AtomicU64 = AtomicU64::new(0);
@@ -962,20 +1039,24 @@ pub fn over_uring_stats() -> (u64, u64, u64, u64) {
 }
 
 /// Transport payload-lease counters (§5.4): `(payload_leases,
-/// parked_commits, leases_outstanding, lease_max_age_ms, lease_overlong)`.
+/// parked_commits, leases_outstanding, lease_max_age_ms, lease_overlong,
+/// dest_dma_leases)`.
 /// `payload_leases` proves adoption (FUSE_WRITE rides leases, not copies);
 /// `parked_commits` ≫ 0 means handlers hold payloads past their reply or
 /// Q_DEPTH is too small; `leases_outstanding` returns to 0 at quiesce;
 /// `lease_max_age_ms` is the severance-boundary high-water mark (bounded by
 /// one handler invocation); `lease_overlong` counts ≥ 1 s lifetimes — the
-/// loud-never-fatal §5.4 tripwire (see `EntPayloadLease::drop`).
-pub fn transport_lease_stats() -> (u64, u64, u64, u64, u64) {
+/// loud-never-fatal §5.4 tripwire (see `EntPayloadLease::drop`);
+/// `dest_dma_leases` counts MEM-1 read-destination owner-token claims
+/// (≈ one per dest-bearing device-read SQE on an armed session).
+pub fn transport_lease_stats() -> (u64, u64, u64, u64, u64, u64) {
     (
         TRANSPORT_PAYLOAD_LEASES.load(Ordering::Relaxed),
         TRANSPORT_PARKED_COMMITS.load(Ordering::Relaxed),
         TRANSPORT_LEASES_OUTSTANDING.load(Ordering::Relaxed),
         TRANSPORT_LEASE_MAX_AGE_MS.load(Ordering::Relaxed),
         TRANSPORT_LEASE_OVERLONG.load(Ordering::Relaxed),
+        TRANSPORT_DEST_DMA_LEASES.load(Ordering::Relaxed),
     )
 }
 
@@ -1412,6 +1493,10 @@ impl FuseOverUring {
                 wake_coalescer: Arc::new(WakeCoalescer::new()),
                 arena: std::sync::Mutex::new(None),
                 kmbuf: std::sync::Mutex::new(None),
+                // One §5.4 lease word per ring ent — pool-level so MEM-1
+                // dest claims and the worker's commit gate share them.
+                lease_states: (0..depth).map(|_| Arc::new(EntLeaseState::new())).collect(),
+                dest_window: std::sync::OnceLock::new(),
             });
             commit_rxs.push(commit_rx);
         }
@@ -1746,6 +1831,47 @@ impl FuseOverUring {
         let arena = q.arena.lock().unwrap().clone()?;
         let ptr = arena.buf(ent_idx as usize)?;
         Some((ptr as u64, self.payload_sz))
+    }
+
+    /// MEM-1: claim a DMA-destination owner token over the payload window
+    /// `[addr, addr + len)`. `None` when the window lies in no queue's
+    /// arena (not a transport dest — e.g. an IPC-arena override), when it
+    /// straddles two ent buffers (never a valid single-request dest), or
+    /// when the owning ent cannot be resolved (kmbuf bid unattached).
+    ///
+    /// Soundness rides program order: every claim happens strictly before
+    /// the claiming request's reply can exist (mint → claim → submit →
+    /// await on the handler task), so a commit that passes the refs == 0
+    /// gate proves no claimed SQE can still write this buffer, and a
+    /// claim can never target an already-re-armed ent from a live path
+    /// (the detached-assembly face is MEM-2's join-before-release law).
+    pub fn lease_dest_window(&self, addr: u64, len: usize) -> Option<DestDmaLease> {
+        if len == 0 {
+            return None;
+        }
+        let addr = usize::try_from(addr).ok()?;
+        for q in &self.queues {
+            let Some(win) = q.dest_window.get() else {
+                continue;
+            };
+            if !win.contains(addr, len) {
+                continue;
+            }
+            // Straddling two buffers is never a valid single-request dest.
+            let idx = dest_window_index(win.base, win.stride, addr, len)?;
+            let ent = match &win.kmbuf {
+                Some(kq) => kq.ent_of_bid(idx as u64)?,
+                None => idx,
+            };
+            let state = Arc::clone(q.lease_states.get(ent)?);
+            state.acquire_dest();
+            TRANSPORT_DEST_DMA_LEASES.fetch_add(1, Ordering::Relaxed);
+            return Some(DestDmaLease {
+                arena: Arc::clone(&win.arena),
+                state,
+            });
+        }
+        None
     }
 
     /// True once workers are live (may still be registering). Prefer [`is_ready`] for the
@@ -2316,9 +2442,11 @@ fn queue_worker(
             queue_node,
         )?,
     };
-    // One lease state per ring ent + the worker-local parked commit slots.
-    let lease_states: Vec<Arc<EntLeaseState>> =
-        (0..depth).map(|_| Arc::new(EntLeaseState::new())).collect();
+    // One lease state per ring ent (pool-level since MEM-1 — dest claims
+    // acquire against the same words) + the worker-local parked commit
+    // slots.
+    let lease_states: Vec<Arc<EntLeaseState>> = pool.queues[qid as usize].lease_states.clone();
+    debug_assert_eq!(lease_states.len(), depth, "lease states sized to depth");
     let mut parked_msgs: Vec<Option<CommitMsg>> = (0..depth).map(|_| None).collect();
 
     let mut ents: Vec<Ent> = (0..depth)
@@ -2389,6 +2517,16 @@ fn queue_worker(
 
     *pool.queues[qid as usize].arena.lock().unwrap() = Some(arena.clone());
     *pool.queues[qid as usize].kmbuf.lock().unwrap() = kmbuf_q.clone();
+    // MEM-1: publish the queue's dest-claim geometry (set exactly once —
+    // workers run once per qid; `lease_dest_window` resolves claims by
+    // address containment against this window).
+    let _ = pool.queues[qid as usize].dest_window.set(DestWindow {
+        base: arena.base,
+        span: arena.span,
+        stride: arena.stride,
+        arena: Arc::clone(&arena),
+        kmbuf: kmbuf_q.clone(),
+    });
 
     // REGISTER shape per mode: classical = 2 iovecs (header + payload);
     // kmbuf = no iovecs, `init.flags = FUSE_URING_BUF_RING`,
@@ -3829,6 +3967,81 @@ mod tests {
             "lease drop with a parked commit must fire the eventfd"
         );
         assert!(state.try_unpark(), "commit releasable after the drop");
+    }
+
+    /// MEM-1: dest-DMA leases park the commit gate exactly like payload
+    /// leases, and multi-SQE reads compose — the gate stays parked until
+    /// the LAST token drops, and only that drop fires the wake.
+    #[test]
+    fn test_dest_dma_lease_multi_token_parks_until_last_drop() {
+        let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(efd >= 0);
+        let efd_owned = unsafe { OwnedFd::from_raw_fd(efd) };
+        let arena = PayloadArena::new(
+            2,
+            8192,
+            efd_owned.as_raw_fd(),
+            Arc::new(WakeCoalescer::new()),
+            None,
+        )
+        .unwrap();
+        let state = Arc::new(EntLeaseState::new());
+
+        // Two in-flight SQEs against one ent (kernel-split multi-block
+        // read): one token each.
+        state.acquire_dest();
+        let t1 = DestDmaLease {
+            arena: Arc::clone(&arena),
+            state: Arc::clone(&state),
+        };
+        state.acquire_dest();
+        let t2 = DestDmaLease {
+            arena: Arc::clone(&arena),
+            state: Arc::clone(&state),
+        };
+
+        // Reply arrives while both SQEs fly: gate parks (no re-arm).
+        assert_eq!(state.try_commit(), CommitGate::Parked);
+
+        // First CQE: still one SQE in flight — no unpark, no wake.
+        drop(t1);
+        assert!(state.leased(), "one token must keep the ent leased");
+        assert!(!state.try_unpark(), "must not unpark with a live token");
+        let mut buf = [0u8; 8];
+        let r = unsafe { libc::read(efd_owned.as_raw_fd(), buf.as_mut_ptr().cast(), 8) };
+        assert!(
+            r < 0,
+            "non-final token drop must not fire the wake (read must EAGAIN)"
+        );
+
+        // Last CQE: token drop releases the gate and fires the wake.
+        drop(t2);
+        assert!(!state.leased());
+        let r = unsafe { libc::read(efd_owned.as_raw_fd(), buf.as_mut_ptr().cast(), 8) };
+        assert_eq!(
+            r, 8,
+            "final token drop with a parked commit must fire the eventfd"
+        );
+        assert!(state.try_unpark(), "commit releasable after the last drop");
+    }
+
+    /// MEM-1 window math: in-buffer windows resolve to their buffer index;
+    /// straddling windows are refused (never mis-leased).
+    #[test]
+    fn test_dest_window_index_resolution_and_straddle_refusal() {
+        let stride = 4096usize;
+        let base = 1 << 20;
+        assert_eq!(dest_window_index(base, stride, base, 4096), Some(0));
+        assert_eq!(dest_window_index(base, stride, base + 4096, 1), Some(1));
+        assert_eq!(
+            dest_window_index(base, stride, base + 2 * 4096 + 512, 512),
+            Some(2)
+        );
+        // Last byte of buffer 0 — still buffer 0.
+        assert_eq!(dest_window_index(base, stride, base + 4095, 1), Some(0));
+        // Straddle: starts in buffer 0, ends in buffer 1 — refused.
+        assert_eq!(dest_window_index(base, stride, base + 4095, 2), None);
+        assert_eq!(dest_window_index(base, stride, base, 4097), None);
     }
 
     // ---- §5.3 D3.b (S3): SQPOLL on the over-uring queue rings ----

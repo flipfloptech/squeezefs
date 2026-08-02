@@ -5343,11 +5343,11 @@ impl SqueezefsFilesystem {
         // (outstanding hovers at in-flight write count and returns to 0 at
         // quiesce; max age is bounded by one handler invocation).
         #[cfg(target_os = "linux")]
-        let (t_leases, t_parked, t_outstanding, t_max_age, t_overlong) =
+        let (t_leases, t_parked, t_outstanding, t_max_age, t_overlong, t_dest_dma) =
             fuse3::transport_lease_stats();
         #[cfg(not(target_os = "linux"))]
-        let (t_leases, t_parked, t_outstanding, t_max_age, t_overlong) =
-            (0u64, 0u64, 0u64, 0u64, 0u64);
+        let (t_leases, t_parked, t_outstanding, t_max_age, t_overlong, t_dest_dma) =
+            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         // Post-arm classical sideband deliveries (kernel-mandated FORGET/
         // INTERRUPT/resend traffic + fiq->ops switchover stragglers). Must
         // move under unlink storms; a permanent zero here while forgets flow
@@ -5901,6 +5901,10 @@ impl SqueezefsFilesystem {
                 "transport_leases_outstanding": t_outstanding,
                 "transport_lease_max_age_ms": t_max_age,
                 "transport_lease_overlong": t_overlong,
+                // MEM-1 engagement: read-destination owner-token claims —
+                // ≈ one per dest-bearing device-read SQE on an armed
+                // session (0 pre-arm / warm-tier serves).
+                "transport_dest_dma_leases": t_dest_dma,
                 "transport_classical_sideband": t_classical_sideband,
                 "transport_queues": t_queues,
                 "transport_q_depth": t_depth,
@@ -16003,6 +16007,29 @@ pub async fn start_mount<P: AsRef<Path>>(
     let mut handle = session.mount(fs.clone(), mount_path.clone()).await?;
 
     if let Some(conn) = handle.connection() {
+        // MEM-1 (pre-rc spec §2): register the transport's zero-copy
+        // READ-destination resolver. Every dest-bearing device read claims
+        // an owner token (a §5.4 `DestDmaLease` on the ent's lease word)
+        // that the NVMe worker holds for the SQE's lifetime — the ent's
+        // COMMIT_AND_FETCH re-arm parks until no in-flight DMA can still
+        // land in the payload buffer. Anchor = the connection allocation:
+        // claims stop resolving the moment the last connection Arc drops,
+        // and the registry prunes dead entries on the next mount's
+        // registration — no explicit unregister needed.
+        #[cfg(target_os = "linux")]
+        {
+            let anchor: std::sync::Arc<dyn std::any::Any + Send + Sync> = conn.clone();
+            let weak_conn = std::sync::Arc::downgrade(&conn);
+            crate::nvme_dev::register_dest_resolver(
+                std::sync::Arc::downgrade(&anchor),
+                std::sync::Arc::new(move |addr, len| {
+                    weak_conn
+                        .upgrade()?
+                        .lease_dest_window(addr, len)
+                        .map(|l| Box::new(l) as crate::nvme_dev::DestToken)
+                }),
+            );
+        }
         fs.session_connection.store(std::sync::Arc::new(Some(conn)));
     }
 

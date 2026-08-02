@@ -93,6 +93,20 @@ impl EntLeaseState {
         self.refs.fetch_add(1, Ordering::AcqRel)
     }
 
+    /// DMA-destination lease acquisition (MEM-1 — any thread, from the
+    /// read path at device-request build). Unlike [`Self::acquire`], refs
+    /// may already be nonzero: a multi-SQE read claims one token per
+    /// in-flight SQE against the same ent. Protocol soundness is by
+    /// program order — every claim happens strictly before its request's
+    /// reply can exist (mint → claim → submit → await), so a commit that
+    /// observed refs == 0 proves no claimed SQE can still write the
+    /// buffer. The commit gate needs no changes: it parks on refs > 0
+    /// whatever the refs' provenance, and [`Self::release`] wakes on the
+    /// LAST drop.
+    pub fn acquire_dest(&self) {
+        self.refs.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Lease drop (any thread). Returns `true` when this drop released the
     /// last lease **and** a commit is parked — the caller must then fire the
     /// queue eventfd so the worker re-scans its parked messages. A spurious

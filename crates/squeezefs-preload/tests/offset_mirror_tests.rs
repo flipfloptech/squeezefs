@@ -304,7 +304,11 @@ fn mirror_seek_matches_the_kernel_arithmetic() {
     assert_eq!(mirror_seek(9999, 0, libc::SEEK_SET), Ok(0));
     assert_eq!(mirror_seek(4096, 4096, libc::SEEK_CUR), Ok(8192));
     assert_eq!(mirror_seek(4096, -4096, libc::SEEK_CUR), Ok(0));
-    assert_eq!(mirror_seek(4096, 0, libc::SEEK_CUR), Ok(4096), "ftell idiom");
+    assert_eq!(
+        mirror_seek(4096, 0, libc::SEEK_CUR),
+        Ok(4096),
+        "ftell idiom"
+    );
 
     // Negative results and signed wraps answer EINVAL — the 64-bit
     // kernel's vfs_setpos verdict for both.

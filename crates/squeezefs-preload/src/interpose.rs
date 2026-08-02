@@ -23,10 +23,24 @@
 //!   served ring op is *literally the real call*. Wrong-direction ops on
 //!   bound fds also passthrough — the kernel's own EBADF/EINVAL on the
 //!   real fd is the correct, identical answer.
-//! - **Offsetful ops (§5.4.3)**: the kernel's `f_pos` stays
-//!   authoritative — `lseek(SEEK_CUR)` → ring op → `lseek(SEEK_SET)`,
-//!   serialized per fd by a stripe mutex (cold path by definition;
-//!   positional ops never touch it).
+//! - **Offsetful ops (§5.4.3 as amended by PERF-7)**: bound fds whose
+//!   binding the shim can prove unshared carry an **armed offset
+//!   mirror** in the shared `BindingCell` (`fd_table.rs` module docs —
+//!   the normative predicate lives there): `read`/`write`/`readv`/
+//!   `writev` consume and advance the mirror with **zero syscalls**,
+//!   and `lseek`/`lseek64` `SEEK_SET`/`SEEK_CUR` are pure arithmetic.
+//!   Everything outside the predicate — unarmed bindings, post-fork
+//!   descriptions, demoted fds — runs the original kernel-authoritative
+//!   discipline: `lseek(SEEK_CUR)` → ring op → `lseek(SEEK_SET)`,
+//!   serialized per description by the cell's offset lock (cold path
+//!   by definition; positional ops never touch any of it). Every
+//!   transition OUT of mirror authority flushes the mirror to kernel
+//!   `f_pos` first (raw `SYS_lseek` — never the interposed symbol).
+//!   Out-of-model f_pos consumers the shim cannot see (raw syscalls,
+//!   io_uring, glibc-internal stdio/spawn paths, `SCM_RIGHTS`-passed
+//!   fds) are the same residual class §5.4.3 already documented; the
+//!   libc-visible ones (`sendfile`, `copy_file_range`, `splice`,
+//!   `posix_spawn`) are interposed below as demote triggers.
 
 use crate::bailout::{classify_fd, rwf_passthrough};
 use crate::dev_cache::NegativeDevCache;
@@ -38,7 +52,7 @@ use libc::{c_char, c_int, c_long, c_uint, c_void, mode_t, off_t, size_t, ssize_t
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Once, OnceLock};
 
 /// Linux `statfs.f_type` for FUSE filesystems ("FUSE" LE).
 const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
@@ -241,12 +255,42 @@ impl Drop for Guard {
     }
 }
 
-/// Offsetful-op serialization (§5.4.3): stripe of tiny mutexes keyed by
-/// fd. Cold path by definition — positional ops never touch it.
-fn offset_lock(fd: c_int) -> &'static Mutex<()> {
-    static LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
-    let locks = LOCKS.get_or_init(|| (0..64).map(|_| Mutex::new(())).collect());
-    &locks[(fd as usize) & 63]
+/// Raw `SYS_lseek` — **never** the `lseek` symbol (which is now our
+/// own interposer: an internal flush routed through it would be
+/// swallowed by the mirror arm instead of reaching the kernel) and
+/// never a `dlsym` resolve (the atfork-prepare flush runs in contexts
+/// where `dlsym`'s allocator is off-limits). AS-safe by construction.
+fn raw_lseek(fd: c_int, off: i64, whence: c_int) -> i64 {
+    // SAFETY: raw syscall; the libc wrapper sets errno on failure.
+    unsafe { libc::syscall(libc::SYS_lseek, fd, off, whence) as i64 }
+}
+
+/// Demote one fd's offset mirror to kernel authority (PERF-7): under
+/// the description's offset lock, disarm-once and flush the captured
+/// offset to kernel `f_pos`. Idempotent; a no-op for unarmed/unbound
+/// fds. Callers: the unbind-class fcntl arms, the poison arms, and the
+/// f_pos-consuming passthrough interposers (`sendfile`/`copy_file_range`/
+/// `splice`). Never called while the same cell's offset lock is held
+/// (those sites inline the disarm instead — std mutexes do not relock).
+fn demote_and_flush(fd: c_int) {
+    let Some((_b, m)) = table().lookup_with_mirror(fd) else {
+        return;
+    };
+    let _g = m.lock_offsets();
+    if let Some(off) = m.disarm_if_current() {
+        raw_lseek(fd, off as i64, libc::SEEK_SET);
+    }
+}
+
+/// The fork/spawn flush (PERF-7): epoch bump + one kernel `SEEK_SET`
+/// per armed cell, so the child inherits — and the demoted parent
+/// resyncs from — the true offsets. Wired to `pthread_atfork` PREPARE
+/// (runs in the parent, pre-fork) and the `posix_spawn` interposers
+/// (glibc spawns via clone, which never runs atfork handlers).
+fn fork_flush_all() {
+    table().fork_demote_flush(|fd, off| {
+        raw_lseek(fd, off as i64, libc::SEEK_SET);
+    });
 }
 
 /// One loud, allocation-free stderr line (panic/pathology paths).
@@ -393,7 +437,12 @@ fn route_release(released: Option<Binding>) {
 /// Post-`open` classification (§5.4): negative-cache probe → FUSE magic →
 /// bootstrap xattr → establish (once per mount) → screen → BIND. Called
 /// with the guard held; every failure path leaves the fd passthrough.
-fn classify_and_bind(fd: c_int) {
+///
+/// `epoch` is the fork-epoch snapshot taken BEFORE the real `open`
+/// syscall (PERF-7 bind-vs-fork race closure — `fd_table.rs` module
+/// docs): a fork between snapshot and bind stales it, and the mirror
+/// installs permanently unarmed (kernel-authoritative, conservative).
+fn classify_and_bind(fd: c_int, epoch: u64) {
     if fd < 0 {
         return;
     }
@@ -490,7 +539,19 @@ fn classify_and_bind(fd: c_int) {
         return; // §5.4.1 bind-time passthrough rows
     }
     match session.bind(fd) {
-        Ok(grant) => route_release(table().bind(fd, grant.to_binding(token))),
+        Ok(grant) => {
+            // PERF-7: arm the offset mirror with the fd's live kernel
+            // offset (a fresh open is 0, but read it — one cold
+            // syscall keeps any future bind site honest). A failed
+            // read installs unarmed (kernel stays authoritative).
+            let seed = raw_lseek(fd, 0, libc::SEEK_CUR);
+            let displaced = if seed >= 0 {
+                table().bind_with_mirror(fd, grant.to_binding(token), seed as u64, epoch)
+            } else {
+                table().bind(fd, grant.to_binding(token))
+            };
+            route_release(displaced);
+        }
         Err(SessionError::Refused(class)) => {
             // Daemon BIND refusal: the fd stays kernel-served (KD-6
             // silence for the OP; the REASON prints once per
@@ -514,23 +575,39 @@ fn classify_and_bind(fd: c_int) {
 // ring data ops (shared shapes)
 // ---------------------------------------------------------------------------
 
-/// `Some(result)` = the ring served it (or a real daemon errno);
-/// `None` = take the real call.
-fn ring_positional(
+/// Inner ring verdict shared by the positional and offsetful shapes.
+enum RingServe {
+    /// Ring served `n ≥ 0` bytes (short/0 is POSIX-legal).
+    Served(ssize_t),
+    /// Daemon errno — kernel-identical for this op; caller sets errno.
+    Errno(i32),
+    /// Take the real call. `poisoned` = the session died (§5.4.1
+    /// error-class row: the caller demotes the mirror and unbinds);
+    /// `false` covers every clean fallthrough incl. transient ring
+    /// backpressure (the binding stays).
+    Real { poisoned: bool },
+}
+
+fn ring_positional_core(
     fd: c_int,
     buf: *mut u8,
     count: usize,
     offset: off_t,
     write: bool,
-) -> Option<ssize_t> {
+) -> RingServe {
+    const REAL: RingServe = RingServe::Real { poisoned: false };
     if offset < 0 || count == 0 || buf.is_null() {
-        return None; // the real call's errno/0 is the identical answer
+        return REAL; // the real call's errno/0 is the identical answer
     }
-    let b = table().lookup(fd)?;
+    let Some(b) = table().lookup(fd) else {
+        return REAL;
+    };
     if (write && !b.write_ok) || (!write && !b.read_ok) {
-        return None; // kernel EBADF on the real fd is the correct answer
+        return REAL; // kernel EBADF on the real fd is the correct answer
     }
-    let session = registry().by_token(b.session)?;
+    let Some(session) = registry().by_token(b.session) else {
+        return REAL;
+    };
     let out = if write {
         // SAFETY: the app's own (buf, count) contract, same as libc.
         let data = unsafe { std::slice::from_raw_parts(buf as *const u8, count) };
@@ -541,15 +618,35 @@ fn ring_positional(
         session.ring_pread(b.binding_id, data, offset as u64)
     };
     match out {
-        RingOutcome::Served(n) => Some(n as ssize_t),
-        RingOutcome::Errno(e) => {
+        RingOutcome::Served(n) => RingServe::Served(n as ssize_t),
+        RingOutcome::Errno(e) => RingServe::Errno(e),
+        RingOutcome::Fallthrough => RingServe::Real {
+            poisoned: session.poisoned(),
+        },
+    }
+}
+
+/// `Some(result)` = the ring served it (or a real daemon errno);
+/// `None` = take the real call. Positional shape — no offset state.
+fn ring_positional(
+    fd: c_int,
+    buf: *mut u8,
+    count: usize,
+    offset: off_t,
+    write: bool,
+) -> Option<ssize_t> {
+    match ring_positional_core(fd, buf, count, offset, write) {
+        RingServe::Served(n) => Some(n),
+        RingServe::Errno(e) => {
             set_errno(e);
             Some(-1)
         }
-        RingOutcome::Fallthrough => {
-            if session.poisoned() {
-                // §5.4.1 error-class row: unbind (ctl already silent on a
-                // poisoned session) and let the real fd serve.
+        RingServe::Real { poisoned } => {
+            if poisoned {
+                // §5.4.1 error-class row: the fd lives on kernel-served —
+                // flush any armed mirror to kernel f_pos, then unbind
+                // (ctl already silent on a poisoned session).
+                demote_and_flush(fd);
                 route_release(table().on_close(fd));
             }
             None
@@ -557,22 +654,67 @@ fn ring_positional(
     }
 }
 
-/// §5.4.3 offsetful shape: kernel `f_pos` stays authoritative.
+/// Offsetful completion (PERF-7): armed mirrors publish (the Dekker
+/// pair — a lost arm means a concurrent demote raced this op, and the
+/// op owns the kernel write-through of its final offset); unarmed fds
+/// restore kernel `f_pos` exactly as before PERF-7.
+fn finish_offsetful(fd: c_int, m: &crate::fd_table::MirrorHandle<'_>, armed: bool, new_off: i64) {
+    if armed {
+        if !m.publish(new_off as u64) {
+            raw_lseek(fd, new_off, libc::SEEK_SET);
+        }
+    } else {
+        raw_lseek(fd, new_off, libc::SEEK_SET);
+    }
+}
+
+/// §5.4.3 offsetful shape (PERF-7): the armed mirror is the offset
+/// authority — **zero syscalls** per served op; unarmed bindings keep
+/// the kernel-authoritative resync discipline (`SEEK_CUR` → ring op →
+/// `SEEK_SET`). Any fallthrough to the real call flushes an armed
+/// mirror to kernel `f_pos` first and demotes the fd (the mirror never
+/// re-arms — transient backpressure simply prices that fd back at the
+/// pre-PERF-7 two-syscall discipline).
 fn ring_offsetful(fd: c_int, buf: *mut u8, count: usize, write: bool) -> Option<ssize_t> {
-    table().lookup(fd)?; // cheap pre-check before taking the stripe lock
-    let _l = offset_lock(fd).lock().ok()?;
-    // SAFETY: plain lseek64(2) — SEEK_CUR touches only f_pos (no FUSE
-    // request; pinned by the gate script's lseek row).
-    let off = unsafe { libc::lseek64(fd, 0, libc::SEEK_CUR) };
-    if off < 0 {
-        return None; // unseekable: the real call is the answer
+    let (_b, m) = table().lookup_with_mirror(fd)?; // cheap pre-check
+    let _l = m.lock_offsets()?;
+    let armed = m.armed();
+    let off = if armed {
+        m.load() as i64
+    } else {
+        // SEEK_CUR touches only f_pos (no FUSE request; pinned by the
+        // gate script's lseek row).
+        let off = raw_lseek(fd, 0, libc::SEEK_CUR);
+        if off < 0 {
+            return None; // unseekable: the real call is the answer
+        }
+        off
+    };
+    match ring_positional_core(fd, buf, count, off as off_t, write) {
+        RingServe::Served(n) => {
+            if n > 0 {
+                finish_offsetful(fd, &m, armed, off + n as i64);
+            }
+            Some(n)
+        }
+        RingServe::Errno(e) => {
+            set_errno(e);
+            Some(-1) // no bytes consumed: neither offset moves
+        }
+        RingServe::Real { poisoned } => {
+            if armed {
+                // The real call consumes kernel f_pos next: single-
+                // issuer flush under the held lock (disarm-once).
+                if let Some(cur) = m.disarm_if_current() {
+                    raw_lseek(fd, cur as i64, libc::SEEK_SET);
+                }
+            }
+            if poisoned {
+                route_release(table().on_close(fd));
+            }
+            None
+        }
     }
-    let n = ring_positional(fd, buf, count, off as off_t, write)?;
-    if n > 0 {
-        // SAFETY: restore the kernel offset to cover the served bytes.
-        unsafe { libc::lseek64(fd, off + n as i64, libc::SEEK_SET) };
-    }
-    Some(n)
 }
 
 /// iovec chain: serve segment-by-segment; stop on a short segment.
@@ -587,60 +729,100 @@ fn ring_iovec(
     if iov.is_null() || iovcnt <= 0 {
         return None;
     }
-    let b = table().lookup(fd)?;
+    let (b, m) = table().lookup_with_mirror(fd)?;
     if (write && !b.write_ok) || (!write && !b.read_ok) {
         return None;
     }
-    // Hold the stripe lock across the whole chain for the offsetful
-    // shape (one atomic f_pos advance for the vector op).
-    let (_l, mut off) = if offset < 0 {
-        let l = offset_lock(fd).lock().ok()?;
-        // SAFETY: lseek64 as in ring_offsetful.
-        let cur = unsafe { libc::lseek64(fd, 0, libc::SEEK_CUR) };
-        if cur < 0 {
-            return None;
-        }
-        (Some(l), cur)
+    // Hold the description's offset lock across the whole chain for the
+    // offsetful shape (one atomic f_pos advance for the vector op).
+    let (guard, armed, mut off) = if offset < 0 {
+        let l = m.lock_offsets()?;
+        let armed = m.armed();
+        let cur = if armed {
+            m.load() as i64
+        } else {
+            let cur = raw_lseek(fd, 0, libc::SEEK_CUR);
+            if cur < 0 {
+                return None;
+            }
+            cur
+        };
+        (Some(l), armed, cur)
     } else {
-        (None, offset)
+        (None, false, offset)
     };
     let start = off;
     let mut total: ssize_t = 0;
+    let mut poisoned = false;
+    let mut fell_through = false;
     for i in 0..iovcnt {
         // SAFETY: the app's iovec array contract, same as libc.
         let e = unsafe { &*iov.add(i as usize) };
         if e.iov_len == 0 {
             continue;
         }
-        match ring_positional(fd, e.iov_base as *mut u8, e.iov_len, off as off_t, write) {
-            Some(n) if n >= 0 => {
+        match ring_positional_core(fd, e.iov_base as *mut u8, e.iov_len, off as off_t, write) {
+            RingServe::Served(n) => {
                 total += n;
                 off += n as i64;
                 if (n as usize) < e.iov_len {
-                    break; // short segment ends the vector op
+                    break; // short segment (incl. EOF 0) ends the vector op
                 }
             }
-            Some(_) => {
+            RingServe::Errno(e) => {
                 // Daemon errno mid-chain: partial progress returns short
-                // (POSIX-legal); zero progress surfaces the errno.
+                // (POSIX-legal); zero progress surfaces the errno (no
+                // bytes consumed — neither offset moves).
                 if total == 0 {
-                    return Some(-1); // errno already set
+                    set_errno(e);
+                    return Some(-1);
                 }
                 break;
             }
-            None => {
-                if total == 0 {
-                    return None; // clean fallthrough, nothing served
-                }
-                break; // partial: return short, the app continues
+            RingServe::Real { poisoned: p } => {
+                poisoned = p;
+                fell_through = total == 0; // partial returns short instead
+                break;
             }
         }
     }
-    if _l.is_some() && total > 0 {
-        // SAFETY: restore the kernel offset over the served span.
-        unsafe { libc::lseek64(fd, start + total as i64, libc::SEEK_SET) };
+    if guard.is_some() {
+        if total > 0 {
+            if poisoned {
+                // Short-served AND dying: park the final offset in the
+                // kernel (disarm under the held lock — the fd unbinds
+                // below and lives on kernel-served).
+                if armed {
+                    if let Some(_cur) = m.disarm_if_current() {
+                        raw_lseek(fd, start + total as i64, libc::SEEK_SET);
+                    }
+                } else {
+                    raw_lseek(fd, start + total as i64, libc::SEEK_SET);
+                }
+            } else {
+                finish_offsetful(fd, &m, armed, start + total as i64);
+            }
+        } else if fell_through && armed {
+            // Clean zero-progress fallthrough: the real vector call
+            // consumes kernel f_pos next — flush + demote first
+            // (single-issuer under the held lock).
+            if let Some(cur) = m.disarm_if_current() {
+                raw_lseek(fd, cur as i64, libc::SEEK_SET);
+            }
+        }
+        // total == 0 without fallthrough (EOF Served(0) / all-empty
+        // segments): a legitimate served 0 — no offset moves, no demote.
     }
-    Some(total)
+    drop(guard);
+    if poisoned {
+        demote_and_flush(fd); // no-op for the offsetful shape (already demoted)
+        route_release(table().on_close(fd));
+    }
+    if fell_through {
+        None // real call serves (offsetful: kernel f_pos just restored)
+    } else {
+        Some(total)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -834,6 +1016,13 @@ macro_rules! pvec2_like {
                 },
                 |f| unsafe { f(fd, iov, iovcnt, offset, flags) },
                 if rwf_passthrough(flags) {
+                    if offset < 0 {
+                        // The real vector call consumes kernel f_pos:
+                        // an armed mirror must flush + demote first
+                        // (PERF-7 demote law; the binding itself stays —
+                        // only offset authority returns to the kernel).
+                        demote_and_flush(fd);
+                    }
                     None
                 } else {
                     ring_iovec(fd, iov, iovcnt, offset, $write)
@@ -849,6 +1038,217 @@ pvec2_like!(pwritev2, "pwritev2", true);
 pvec2_like!(pwritev64v2, "pwritev64v2", true);
 
 // ---------------------------------------------------------------------------
+// lseek / lseek64 (PERF-7): the mirror's query/steer surface
+// ---------------------------------------------------------------------------
+
+type LseekFn = unsafe extern "C" fn(c_int, off_t, c_int) -> off_t;
+
+/// Served-`lseek` arm (guard held): `Some(result)` = answered from the
+/// armed mirror (or a kernel-identical errno); `None` = the real call
+/// (unbound, unarmed, or a poisoned lock — fallback-is-correctness).
+fn lseek_served(fd: c_int, offset: off_t, whence: c_int) -> Option<off_t> {
+    let (_b, m) = table().lookup_with_mirror(fd)?;
+    let _l = m.lock_offsets()?;
+    if !m.armed() {
+        return None; // kernel-authoritative (resync mode): real call
+    }
+    match whence {
+        libc::SEEK_SET | libc::SEEK_CUR => {
+            // Pure arithmetic over the mirror — zero syscalls (the
+            // ftell/`lseek(fd, 0, SEEK_CUR)` idiom lands here).
+            match crate::fd_table::mirror_seek(m.load(), offset, whence) {
+                Ok(new) => {
+                    m.store(new);
+                    Some(new as off_t)
+                }
+                Err(e) => {
+                    set_errno(e);
+                    Some(-1)
+                }
+            }
+        }
+        _ => {
+            // SEEK_END / SEEK_DATA / SEEK_HOLE / unknown: the kernel
+            // owns the size/extent authority — the SAME source the
+            // pre-PERF-7 path trusted, so the POSIX-8 i_size-staleness
+            // scope is unchanged (not widened). None of these read
+            // f_pos (they compute from arguments/i_size), so the stale
+            // kernel offset cannot skew the result; on success the
+            // kernel f_pos now equals the result and the mirror
+            // re-seeds to the same value — both sides coherent, the
+            // arm survives. Unknown whence: kernel EINVAL, verbatim.
+            let r = raw_lseek(fd, offset, whence);
+            if r >= 0 {
+                m.store(r as u64);
+            }
+            Some(r as off_t)
+        }
+    }
+}
+
+macro_rules! lseek_like {
+    ($name:ident, $sym:literal) => {
+        /// PERF-7 offset row (both LFS spellings — the standing LFS-64
+        /// alias discipline; glibc has no further `llseek` alias in the
+        /// families this table covers on 64-bit targets).
+        ///
+        /// # Safety
+        /// C ABI interposer; argument contracts are libc's own.
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(fd: c_int, offset: off_t, whence: c_int) -> off_t {
+            interposed!(
+                real!($sym, LseekFn),
+                {
+                    // No RTLD_NEXT symbol: synthesize via the raw
+                    // syscall (kernel answer, errno set by the wrapper).
+                    raw_lseek(fd, offset, whence) as off_t
+                },
+                |f| unsafe { f(fd, offset, whence) },
+                lseek_served(fd, offset, whence)
+            )
+        }
+    };
+}
+
+lseek_like!(lseek, "lseek");
+lseek_like!(lseek64, "lseek64");
+
+// ---------------------------------------------------------------------------
+// f_pos-consuming passthrough ops (PERF-7 demote triggers)
+// ---------------------------------------------------------------------------
+//
+// `sendfile`/`copy_file_range`/`splice` stay kernel-served (§5.1
+// "not intercepted") and consume a description's f_pos whenever the
+// respective offset pointer is NULL. Pre-PERF-7 that was coherent for
+// free (kernel authority); with an armed mirror it must demote first —
+// flush + disarm, then the real call proceeds against a current
+// kernel offset, and that fd prices at the resync discipline
+// thereafter. Non-NULL offset pointers never touch f_pos: no demote.
+
+macro_rules! fpos_consumer {
+    ($name:ident, $sym:literal, $sysno:expr,
+     ($($arg:ident: $ty:ty),*), |$a:ident| $demote:block) => {
+        /// # Safety
+        /// C ABI interposer; argument contracts are libc's own.
+        #[no_mangle]
+        pub unsafe extern "C" fn $name($($arg: $ty),*) -> ssize_t {
+            type F = unsafe extern "C" fn($($ty),*) -> ssize_t;
+            let real = real!($sym, F);
+            if let Some(_g) = Guard::enter() {
+                let $a = ($($arg,)*);
+                if catch_unwind(AssertUnwindSafe(|| $demote)).is_err() {
+                    panic_poison();
+                }
+            }
+            match real {
+                // SAFETY: chaining the real call verbatim.
+                Some(f) => unsafe { f($($arg),*) },
+                // SAFETY: raw syscall fallback, same argument contract.
+                None => unsafe { libc::syscall($sysno, $($arg),*) as ssize_t },
+            }
+        }
+    };
+}
+
+fpos_consumer!(sendfile, "sendfile", libc::SYS_sendfile,
+(out_fd: c_int, in_fd: c_int, offset: *mut off_t, count: size_t),
+|a| {
+    let (out_fd, in_fd, offset, _count) = a;
+    // out_fd's f_pos is ALWAYS consumed (sendfile has no out
+    // offset); in_fd's only when `offset` is NULL.
+    demote_and_flush(out_fd);
+    if offset.is_null() {
+        demote_and_flush(in_fd);
+    }
+});
+fpos_consumer!(sendfile64, "sendfile64", libc::SYS_sendfile,
+(out_fd: c_int, in_fd: c_int, offset: *mut off_t, count: size_t),
+|a| {
+    let (out_fd, in_fd, offset, _count) = a;
+    demote_and_flush(out_fd);
+    if offset.is_null() {
+        demote_and_flush(in_fd);
+    }
+});
+fpos_consumer!(copy_file_range, "copy_file_range", libc::SYS_copy_file_range,
+(fd_in: c_int, off_in: *mut libc::off64_t, fd_out: c_int,
+ off_out: *mut libc::off64_t, len: size_t, flags: c_uint),
+|a| {
+    let (fd_in, off_in, fd_out, off_out, _len, _flags) = a;
+    if off_in.is_null() {
+        demote_and_flush(fd_in);
+    }
+    if off_out.is_null() {
+        demote_and_flush(fd_out);
+    }
+});
+fpos_consumer!(splice, "splice", libc::SYS_splice,
+(fd_in: c_int, off_in: *mut libc::off64_t, fd_out: c_int,
+ off_out: *mut libc::off64_t, len: size_t, flags: c_uint),
+|a| {
+    let (fd_in, off_in, fd_out, off_out, _len, _flags) = a;
+    // Only the non-pipe side can be bound; a pipe fd never
+    // resolves in the table, so the demote is a no-op there.
+    if off_in.is_null() {
+        demote_and_flush(fd_in);
+    }
+    if off_out.is_null() {
+        demote_and_flush(fd_out);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// posix_spawn (PERF-7): the fork flush for the no-atfork spawn path
+// ---------------------------------------------------------------------------
+//
+// glibc's posix_spawn clones without running pthread_atfork handlers,
+// so the prepare-side mirror flush never fires — yet the child inherits
+// every live description. Same law as fork: bump + flush BEFORE the
+// spawn, so the child starts on true kernel offsets and the parent's
+// bindings demote to the resync discipline. (glibc-internal spawners —
+// `system`/`popen` on spawn-based ports, the `execl*` variadic family —
+// bypass libc interposition entirely and stay in the documented
+// out-of-model residual class; fork-based ports run the atfork flush.)
+
+macro_rules! spawn_like {
+    ($name:ident, $sym:literal) => {
+        /// # Safety
+        /// C ABI interposer; argument contracts are libc's own.
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(
+            pid: *mut libc::pid_t,
+            path: *const c_char,
+            file_actions: *const c_void,
+            attrp: *const c_void,
+            argv: *const *mut c_char,
+            envp: *const *mut c_char,
+        ) -> c_int {
+            type F = unsafe extern "C" fn(
+                *mut libc::pid_t,
+                *const c_char,
+                *const c_void,
+                *const c_void,
+                *const *mut c_char,
+                *const *mut c_char,
+            ) -> c_int;
+            let Some(f) = real!($sym, F) else {
+                return libc::ENOSYS; // posix_spawn returns errno directly
+            };
+            if let Some(_g) = Guard::enter() {
+                if catch_unwind(AssertUnwindSafe(fork_flush_all)).is_err() {
+                    panic_poison();
+                }
+            }
+            // SAFETY: chaining the real spawn verbatim.
+            unsafe { f(pid, path, file_actions, attrp, argv, envp) }
+        }
+    };
+}
+
+spawn_like!(posix_spawn, "posix_spawn");
+spawn_like!(posix_spawnp, "posix_spawnp");
+
+// ---------------------------------------------------------------------------
 // detection / lifecycle symbols
 // ---------------------------------------------------------------------------
 
@@ -859,22 +1259,43 @@ type CreatFn = unsafe extern "C" fn(*const c_char, mode_t) -> c_int;
 fn atfork_init() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
+        extern "C" fn prepare() {
+            // PERF-7 fork flush — runs in the PARENT, pre-fork: bump
+            // the fork epoch and write every armed mirror through to
+            // kernel f_pos, so the child (poisoned → passthrough) and
+            // the demoted parent (lseek-resync mode) both resume on
+            // one authoritative kernel offset. AS-safe: table atomics,
+            // bounded try_lock spins, raw SYS_lseek — no dlsym, no
+            // parking (fd_table.rs `fork_demote_flush` docs).
+            fork_flush_all();
+        }
         extern "C" fn child() {
             // AS-safe by contract (§5.4.1 fork row) — the CHILD variant:
             // close(2) of the inherited copies, never shutdown (see
-            // poison_all_in_child).
+            // poison_all_in_child). Mirrors were already demoted by the
+            // inherited (pre-fork) prepare flush.
             registry().poison_all_in_child();
         }
-        // SAFETY: registering an AS-safe child handler.
-        unsafe { libc::pthread_atfork(None, None, Some(child)) };
+        // SAFETY: registering AS-safe prepare/child handlers.
+        unsafe { libc::pthread_atfork(Some(prepare), None, Some(child)) };
     });
 }
 
+/// The fork-epoch snapshot for a bind-to-be (PERF-7): taken BEFORE the
+/// real `open` syscall so a fork landing anywhere between snapshot and
+/// bind stales it (the binding then never arms). Insurance-wrapped —
+/// a first-touch table-init panic must not escape an `extern "C"`
+/// frame; `u64::MAX` never matches a live epoch, so failure = unarmed.
+fn epoch_snapshot() -> u64 {
+    catch_unwind(|| table().fork_epoch()).unwrap_or(u64::MAX)
+}
+
 /// Shared open-family tail: real call already made; classify + maybe
-/// bind the fresh fd (guard held by the macro body).
-fn after_open(fd: c_int) -> Option<c_int> {
+/// bind the fresh fd (guard held by the macro body). `epoch` per
+/// [`epoch_snapshot`].
+fn after_open(fd: c_int, epoch: u64) -> Option<c_int> {
     atfork_init();
-    classify_and_bind(fd);
+    classify_and_bind(fd, epoch);
     Some(fd)
 }
 
@@ -894,10 +1315,12 @@ macro_rules! open_like {
                 set_errno(libc::ENOSYS);
                 return -1;
             };
+            // PERF-7: the fork-epoch snapshot precedes the fd's birth.
+            let ep = epoch_snapshot();
             // SAFETY: chaining the real open.
             let fd = unsafe { f(path, oflag, mode) };
             let Some(_g) = Guard::enter() else { return fd };
-            match catch_unwind(AssertUnwindSafe(|| after_open(fd))) {
+            match catch_unwind(AssertUnwindSafe(|| after_open(fd, ep))) {
                 Ok(_) => fd,
                 Err(_) => {
                     panic_poison();
@@ -934,10 +1357,12 @@ macro_rules! openat_like {
                 set_errno(libc::ENOSYS);
                 return -1;
             };
+            // PERF-7: the fork-epoch snapshot precedes the fd's birth.
+            let ep = epoch_snapshot();
             // SAFETY: chaining the real openat.
             let fd = unsafe { f(dirfd, path, oflag, mode) };
             let Some(_g) = Guard::enter() else { return fd };
-            match catch_unwind(AssertUnwindSafe(|| after_open(fd))) {
+            match catch_unwind(AssertUnwindSafe(|| after_open(fd, ep))) {
                 Ok(_) => fd,
                 Err(_) => {
                     panic_poison();
@@ -961,10 +1386,12 @@ macro_rules! creat_like {
                 set_errno(libc::ENOSYS);
                 return -1;
             };
+            // PERF-7: the fork-epoch snapshot precedes the fd's birth.
+            let ep = epoch_snapshot();
             // SAFETY: chaining the real creat.
             let fd = unsafe { f(path, mode) };
             let Some(_g) = Guard::enter() else { return fd };
-            match catch_unwind(AssertUnwindSafe(|| after_open(fd))) {
+            match catch_unwind(AssertUnwindSafe(|| after_open(fd, ep))) {
                 Ok(_) => fd,
                 Err(_) => {
                     panic_poison();
@@ -1146,12 +1573,16 @@ unsafe fn fcntl_body(real: Option<FcntlFn>, fd: c_int, cmd: c_int, arg: *mut c_v
             match cmd {
                 libc::F_SETLK | libc::F_SETLKW | libc::F_OFD_SETLK | libc::F_OFD_SETLKW => {
                     // Unbind BEFORE the real call: the lock must be taken
-                    // with the kernel as the only data transport.
+                    // with the kernel as the only data transport. The fd
+                    // lives on kernel-served — flush any armed mirror to
+                    // kernel f_pos first (PERF-7 demote law).
+                    demote_and_flush(fd);
                     route_release(table().on_close(fd));
                 }
                 libc::F_SETFL => {
                     let new_flags = arg as usize as c_int;
                     if new_flags & libc::O_APPEND != 0 {
+                        demote_and_flush(fd);
                         route_release(table().on_close(fd));
                     } else if table().lookup(fd).is_some() {
                         // O_DIRECT toggle = read-CLASS change (the daemon
@@ -1165,6 +1596,7 @@ unsafe fn fcntl_body(real: Option<FcntlFn>, fd: c_int, cmd: c_int, arg: *mut c_v
                         // one extra syscall.)
                         let cur = unsafe { f(fd, libc::F_GETFL, std::ptr::null_mut()) };
                         if cur >= 0 && (cur ^ new_flags) & libc::O_DIRECT != 0 {
+                            demote_and_flush(fd);
                             route_release(table().on_close(fd));
                         }
                     }
@@ -1215,7 +1647,14 @@ pub unsafe extern "C" fn mmap(
             let walk = catch_unwind(AssertUnwindSafe(|| {
                 if let Some(b) = table().lookup(fd) {
                     let mut released = Vec::new();
-                    table().unbind_ino(b.ino, &mut released);
+                    let mut flushes = Vec::new();
+                    table().unbind_ino(b.ino, &mut released, &mut flushes);
+                    // PERF-7: the unbound siblings live on kernel-served —
+                    // restore kernel f_pos from each armed mirror before
+                    // any real call consumes it (once per cell).
+                    for (ffd, off) in flushes {
+                        raw_lseek(ffd, off as i64, libc::SEEK_SET);
+                    }
                     for rb in released {
                         route_release(Some(rb));
                     }

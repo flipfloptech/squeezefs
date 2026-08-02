@@ -273,7 +273,12 @@ fn unbind_ino_walk_releases_every_sibling_in_process() {
     t.on_dup(3, 30); // sharer of binding 1
 
     let mut released = Vec::new();
-    t.unbind_ino(101, &mut released);
+    let mut flushes = Vec::new();
+    t.unbind_ino(101, &mut released, &mut flushes);
+    assert!(
+        flushes.is_empty(),
+        "plain (never-armed) binds must not surface offset flushes"
+    );
     let mut released: Vec<u64> = released.iter().map(|b| b.binding_id).collect();
     released.sort_unstable();
     assert_eq!(

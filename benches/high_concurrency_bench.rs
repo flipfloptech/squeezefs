@@ -117,6 +117,48 @@ fn bench_cluster_dlm(c: &mut Criterion) {
     });
     drop(seeded);
 
+    // S1 rows (feat/dlm-s0-s1) — before/after-comparable across the
+    // FENCING_MAP → grant_seq swap. Field shapes (microbench law):
+    // leases are per-open on DISTINCT inos (spec §6.2 — one lease per
+    // ino per open-for-write episode; the RES-2 growth shape the S1 RSS
+    // gate in tests/dlm_grant_seq_tests.rs measures), and the unheld
+    // read is the post-release writeback-credential shape (FIND-M11-A:
+    // flush units re-read the ino's current generation per attempt,
+    // which can outlive the last close).
+
+    // Token mint + lock-table churn across distinct objects (64 Ki
+    // rotating window bounds the pre-S1 map footprint in-bench).
+    group.bench_function("acquire_release_distinct_ino_walk", |b| {
+        let dlm = dlm.clone();
+        let mut i = 0u64;
+        b.to_async(&rt).iter(|| {
+            i = i.wrapping_add(1);
+            let path = format!("inode_{}", 900_000_000 + (i % 65_536));
+            let dlm = dlm.clone();
+            async move {
+                let lease = dlm
+                    .acquire_lock(&path, None, std::time::Duration::from_secs(1))
+                    .await
+                    .expect("walk acquire");
+                lease.release().await.expect("walk release");
+            }
+        });
+    });
+
+    // Unheld fencing read: released-object generation (stripe-floor arm
+    // post-S1; generator-map hit pre-S1).
+    rt.block_on(async {
+        dlm.acquire_lock("inode_800777001", None, std::time::Duration::from_secs(1))
+            .await
+            .expect("unheld seed acquire")
+            .release()
+            .await
+            .expect("unheld seed release");
+    });
+    group.bench_function("get_fencing_token_ino_unheld", |b| {
+        b.iter(|| black_box(dlm.get_fencing_token_ino(black_box(800_777_001u64))));
+    });
+
     // Contended handoff: 8 tasks fight over one key, each holding briefly.
     group.bench_function("acquire_release_contended_1key_8tasks", |b| {
         let dlm = dlm.clone();

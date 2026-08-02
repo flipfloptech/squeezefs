@@ -174,18 +174,14 @@ struct Fx {
 }
 
 async fn fixture(tag: &str) -> Fx {
-    let dlm = DlmClient::new("local").unwrap();
+    let dlm = DlmClient::new().unwrap();
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())
         .unwrap()
         .set_len(16 * 1024 * 1024)
         .unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
-    let alloc = Arc::new(
-        BlockAllocator::new(dlm.meta_client().clone(), tag)
-            .await
-            .expect("allocator"),
-    );
+    let alloc = Arc::new(BlockAllocator::new(tag).await.expect("allocator"));
     let staging = tempdir().unwrap();
     let cache = TieredCache::new(
         vec![staging.path().to_path_buf()],
@@ -193,7 +189,6 @@ async fn fixture(tag: &str) -> Fx {
         Some("16MB"),
         Some("64MB"),
         Some("64MB"),
-        dlm.meta_client().clone(),
         alloc.clone(),
         nvme.clone(),
         None,

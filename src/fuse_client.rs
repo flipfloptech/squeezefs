@@ -3426,6 +3426,18 @@ pub struct Metrics {
     /// group commit `meta_sync_requests - meta_device_syncs` is the work saved by
     /// coalescing concurrent fsyncs into shared barriers.
     pub meta_sync_requests: Align64<AtomicU64>,
+    /// DUR-2: **data**-device durability barriers actually issued (real
+    /// io_uring `Fsync`/DATASYNC ops on a data volume). Before DUR-2 this
+    /// was structurally 0 — there was no flush primitive at all, so
+    /// striped write-through named blocks in durable metadata whose
+    /// contents were still in the device's volatile cache.
+    pub data_device_syncs: Align64<AtomicU64>,
+    /// Data-device barrier *requests* (callers of
+    /// `NvmeBlockDev::flush`). `data_device_sync_requests -
+    /// data_device_syncs` is the work the `SyncCoalescer` saved; a ratio
+    /// that collapses to 1.0 under concurrent fsync load means the
+    /// coalescer stopped coalescing.
+    pub data_device_sync_requests: Align64<AtomicU64>,
     /// Histograms for lock wait times and queue depths.
     pub write_lock_wait: Align64<LatencyHistogram>,
     pub block_lock_wait: Align64<LatencyHistogram>,
@@ -6052,6 +6064,14 @@ impl SqueezefsFilesystem {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default(),
+                // DUR-2: the DATA plane's hardware durability face, kept
+                // beside the metadata one. `<backing_dev>=<class>` per
+                // distinct data device; `write-back` means acknowledged
+                // writes are volatile until `NvmeBlockDev::flush`
+                // completes (the barrier the fsync path now issues).
+                "data_volume_write_cache": self.router.backend_router.data_volume_write_caches(),
+                "data_device_syncs": METRICS.data_device_syncs.load(Ordering::Relaxed),
+                "data_device_sync_requests": METRICS.data_device_sync_requests.load(Ordering::Relaxed),
                 // Constant "3" per volume (v3 is the only metadata
                 // format); kept as a field because operators key on it.
                 "meta_format_version": self

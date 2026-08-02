@@ -81,6 +81,9 @@ pub mod stripe_locks;
 pub mod supervisor;
 pub mod uring_fs;
 pub mod version;
+/// DUR-2: the data-volume volatile-write-cache probe
+/// (`data_volume_write_cache`).
+pub mod write_cache;
 pub mod write_pipeline;
 pub(crate) mod write_pipeline_core;
 pub mod zcrx_lane;

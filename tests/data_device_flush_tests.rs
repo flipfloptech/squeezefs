@@ -168,9 +168,10 @@ fn test_device_reports_its_write_cache_class() {
 fn test_open_checked_refuses_a_device_without_o_direct() {
     // A directory can never be opened read-write, let alone O_DIRECT.
     let dir = tempfile::tempdir().unwrap();
-    let err = NvmeBlockDev::open_checked(dir.path().to_str().unwrap())
-        .expect_err("a non-openable data volume must fail loud, never degrade");
-    let msg = err.to_string();
+    let msg = match NvmeBlockDev::open_checked(dir.path().to_str().unwrap()) {
+        Ok(_) => panic!("a non-openable data volume must fail loud, never degrade"),
+        Err(e) => e.to_string(),
+    };
     assert!(
         msg.contains("O_DIRECT"),
         "the refusal must name the O_DIRECT requirement: {msg}"

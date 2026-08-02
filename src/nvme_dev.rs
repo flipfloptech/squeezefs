@@ -247,6 +247,17 @@ enum UringRequest {
         data: WriteData,
         tx: oneshot::Sender<Result<()>>,
     },
+    /// DUR-2: the data-device durability barrier (io_uring `Fsync`,
+    /// `FSYNC_DATASYNC` when `datasync`). `O_DIRECT` bypasses the page
+    /// cache, NOT the device's volatile write cache — without this op
+    /// the striped write-through sequence (DMA → map merge → meta
+    /// journal → meta fdatasync) ordered nothing at all on the data
+    /// device. Issued only through
+    /// [`NvmeBlockDev::flush`], which coalesces callers.
+    Fsync {
+        datasync: bool,
+        tx: oneshot::Sender<Result<()>>,
+    },
 }
 
 enum UringResponse {
@@ -378,25 +389,23 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
 
     let file = match open_opts.open(&device_path) {
         Ok(f) => f,
-        Err(_) => {
-            // ENG-3 re-triage: error, not warn — in buffered mode nothing
-            // ever flushes these writes (no fsync path on the data device
-            // today), so acknowledged data can be lost on power failure.
+        Err(e) => {
+            // DUR-2 decision (a) — FAIL LOUD, never degrade. The old
+            // buffered fallback ran the data plane in a mode where the
+            // kernel owns dirty pages nobody ever flushed, so
+            // acknowledged data was lost on power failure with a single
+            // `warn!` as the only trace. The worker exits: every request
+            // on this device fails loudly, and mounts that took the
+            // checked open ([`NvmeBlockDev::open_checked`]) refused
+            // before reaching here.
             log::error!(
-                "Failed to open NVMe device {:?} with O_DIRECT; falling back to buffered \
-                 I/O — buffered device writes have no flush path, so acknowledged data \
-                 may be lost on power failure",
-                device_path
+                "REFUSING data volume {:?}: O_DIRECT open failed ({:?}). Buffered device \
+                 I/O is not a supported data-plane mode (DUR-2: acknowledged writes would \
+                 have no barrier). Fix the substrate — do not degrade.",
+                device_path,
+                e
             );
-            let mut open_opts = OpenOptions::new();
-            open_opts.read(true).write(true);
-            match open_opts.open(&device_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    log::error!("Failed to open NVMe device {:?}: {:?}", device_path, e);
-                    return;
-                }
-            }
+            return;
         }
     };
 
@@ -696,6 +705,35 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                             .user_data(slot_idx as u64)
                     }
                 }
+                // DUR-2 barrier. Its completion is a plain unit result,
+                // so it rides `UringResponse::Write` (no third response
+                // variant to fan out through every drain site); the
+                // TEST-1 coverage accounting rides the caller
+                // (`NvmeBlockDev::flush`), which knows when the barrier
+                // started.
+                UringRequest::Fsync { datasync, tx } => {
+                    active[slot_idx] = Some(ActiveReq {
+                        response: UringResponse::Write { tx },
+                        free_ptr: None,
+                        _keep_alive: None,
+                    });
+                    let flags = if datasync {
+                        types::FsyncFlags::DATASYNC
+                    } else {
+                        types::FsyncFlags::empty()
+                    };
+                    if use_fixed {
+                        opcode::Fsync::new(types::Fixed(0))
+                            .flags(flags)
+                            .build()
+                            .user_data(slot_idx as u64)
+                    } else {
+                        opcode::Fsync::new(Fd(fd))
+                            .flags(flags)
+                            .build()
+                            .user_data(slot_idx as u64)
+                    }
+                }
             };
 
             let mut pushed_sqe = false;
@@ -832,6 +870,11 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                     "NvmeBlockDev worker shutting down".to_string(),
                 )));
             }
+            UringRequest::Fsync { tx, .. } => {
+                let _ = tx.send(Err(crate::error::SqueezefsError::InvalidOperation(
+                    "NvmeBlockDev worker shutting down".to_string(),
+                )));
+            }
         }
     }
 
@@ -882,6 +925,16 @@ pub struct NvmeBlockDev {
     pub device_path: String,
     worker: Arc<UringWorker>,
     node_probe: Arc<NodeProbe>,
+    /// DUR-2: per-device barrier coalescer — many concurrent `fsync`s on
+    /// one device need one device flush each in principle, and one
+    /// `Fsync` op satisfies every caller whose write completed before it
+    /// started. Reuses the metadata plane's `SyncCoalescer` discipline
+    /// verbatim (registration atomic with the flushing flag; no lost
+    /// wakeup). Shared across clones — they describe the same device.
+    sync: Arc<crate::meta_backend::sync_coalescer::SyncCoalescer>,
+    /// Volatile-write-cache classification probed once at construction
+    /// (`data_volume_write_cache` on the stats inode).
+    write_cache: crate::write_cache::WriteCacheClass,
     /// zcrx read lane session (docs/design-zcrx-read-lane.md §6): armed
     /// lazily on the first eligible read (`SQUEEZEFS_ZCRX_LANE=1` +
     /// capability probes), `None` cached on any arm refusal — the kernel
@@ -896,6 +949,27 @@ pub fn device_capacity_bytes(path: &str) -> std::io::Result<u64> {
     use std::io::Seek;
     let mut f = std::fs::File::open(path)?;
     f.seek(std::io::SeekFrom::End(0))
+}
+
+/// DUR-2 decision (a): prove the substrate serves `O_DIRECT` before a
+/// mount commits to it. Buffered device I/O is not a supported
+/// data-plane mode — the kernel would own dirty pages the daemon never
+/// flushes — so this refusal is loud and terminal, never a degrade.
+pub fn probe_direct_io(device_path: &str) -> Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_DIRECT);
+    }
+    opts.open(device_path).map(|_| ()).map_err(|e| {
+        crate::error::SqueezefsError::InvalidOperation(format!(
+            "data volume {device_path} cannot be opened with O_DIRECT ({e}); buffered \
+             device I/O is not a supported data-plane mode (DUR-2: acknowledged writes \
+             would carry no durability barrier). Use a substrate that supports direct I/O."
+        ))
+    })
 }
 
 /// Coarse monotonic milliseconds since process start (probe-TTL clock).
@@ -914,8 +988,85 @@ impl NvmeBlockDev {
                 at_ms: std::sync::atomic::AtomicU64::new(0),
                 seen: std::sync::atomic::AtomicBool::new(false),
             }),
+            sync: Arc::new(crate::meta_backend::sync_coalescer::SyncCoalescer::new()),
+            // One-shot sysfs read at construction (never on a cadence or
+            // a per-op path — the derived-defaults law).
+            write_cache: crate::write_cache::probe_data_volume(std::path::Path::new(device_path)),
             lane: Arc::new(tokio::sync::OnceCell::new()),
         }
+    }
+
+    /// Mount-path constructor (DUR-2 decision (a)): probe `O_DIRECT`
+    /// FIRST and refuse loudly if the substrate cannot serve it, then
+    /// log the volatile-write-cache classification. The worker refuses
+    /// buffered mode too, but a mount must fail at setup with a
+    /// diagnosable error rather than at its first I/O.
+    pub fn open_checked(device_path: &str) -> Result<Self> {
+        probe_direct_io(device_path)?;
+        let dev = Self::new(device_path);
+        log::info!(
+            "data volume {}: write_cache={} (durability barrier: io_uring \
+             Fsync/DATASYNC per device, coalesced)",
+            device_path,
+            dev.write_cache.as_str()
+        );
+        Ok(dev)
+    }
+
+    /// The device's probed volatile-write-cache class
+    /// (`data_volume_write_cache`).
+    pub fn write_cache(&self) -> crate::write_cache::WriteCacheClass {
+        self.write_cache
+    }
+
+    /// **DUR-2 — the data-device durability barrier.** Completes only
+    /// once the device reports its volatile write cache flushed for
+    /// everything written before the barrier started, so a caller that
+    /// awaited its DMAs can name those blocks in durable metadata.
+    ///
+    /// Concurrent callers coalesce through the metadata plane's
+    /// [`crate::meta_backend::sync_coalescer::SyncCoalescer`] — reused,
+    /// not re-derived: a caller is released only by an op that STARTED
+    /// after it registered, which is exactly the group-commit safety
+    /// property this path needs.
+    pub async fn flush(&self) -> Result<()> {
+        crate::fuse_client::METRICS
+            .data_device_sync_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.sync
+            .barrier(|| async {
+                crate::fuse_client::METRICS
+                    .data_device_syncs
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // TEST-1 coverage frontier: everything journaled before
+                // this op started is durable when it completes.
+                let covered = crate::dev_power_cut::mark_barrier_start(&self.device_path);
+                let (tx, rx) = oneshot::channel();
+                self.worker
+                    .sender()
+                    .try_send(UringRequest::Fsync {
+                        datasync: true,
+                        tx,
+                    })
+                    .map_err(|e| {
+                        crate::fuse_client::METRICS
+                            .uring_queue_full
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::error::SqueezefsError::InvalidOperation(format!(
+                            "Uring request queue full or closed (data-device barrier): {:?}",
+                            e
+                        ))
+                    })?;
+                rx.await.map_err(|e| {
+                    crate::error::SqueezefsError::InvalidOperation(format!(
+                        "Worker thread closed receiver during data-device barrier: {:?}",
+                        e
+                    ))
+                })??;
+                crate::dev_power_cut::complete_barrier(&self.device_path, covered);
+                Ok(())
+            })
+            .await
     }
 
     /// zcrx-lane read attempt (design §6). `Some(bytes)` = the lane served

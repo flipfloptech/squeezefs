@@ -1256,7 +1256,11 @@ impl BackendRouter {
                 block_allocator: self.default_allocator.clone(),
             }));
         }
-        let device = std::sync::Arc::new(crate::nvme_dev::NvmeBlockDev::new(backing_dev));
+        // DUR-2 decision (a): refuse a data volume that cannot serve
+        // O_DIRECT loudly here, instead of degrading into a buffered
+        // mode with no barrier (`open_checked` also logs the volume's
+        // probed write-cache class).
+        let device = std::sync::Arc::new(crate::nvme_dev::NvmeBlockDev::open_checked(backing_dev)?);
         let allocator = std::sync::Arc::new(crate::block_allocator::BlockAllocator::new(id).await?);
         Self::wire_space_pressure_valve(&allocator, &self.reclaim);
         match crate::nvme_dev::device_capacity_bytes(backing_dev) {
@@ -1269,6 +1273,42 @@ impl BackendRouter {
             device,
             block_allocator: allocator,
         }))
+    }
+
+    /// Every distinct data device this router can write to (the default
+    /// device plus every registered backend, deduped by device path).
+    /// The DUR-2 barrier fan-out and the write-cache gauge share it.
+    fn distinct_data_devices(&self) -> Vec<std::sync::Arc<crate::nvme_dev::NvmeBlockDev>> {
+        let mut out = vec![self.default_device.clone()];
+        for entry in self.backends.iter() {
+            let dev = &entry.value().device;
+            if !out.iter().any(|d| d.device_path == dev.device_path) {
+                out.push(dev.clone());
+            }
+        }
+        out
+    }
+
+    /// `data_volume_write_cache` (stats inode, DUR-2): the probed
+    /// volatile-write-cache class of every data device, as
+    /// `<backing_dev>=<class>`.
+    pub fn data_volume_write_caches(&self) -> Vec<String> {
+        self.distinct_data_devices()
+            .into_iter()
+            .map(|d| format!("{}={}", d.device_path, d.write_cache().as_str()))
+            .collect()
+    }
+
+    /// **DUR-2 — the data-plane durability barrier.** Flush every data
+    /// device this router writes to; returns once each has completed its
+    /// barrier, so a caller that awaited its DMAs may then commit
+    /// metadata naming those blocks. Per-device flushes coalesce with
+    /// concurrent callers inside each `NvmeBlockDev`.
+    pub async fn flush_data_devices(&self) -> Result<()> {
+        for dev in self.distinct_data_devices() {
+            dev.flush().await?;
+        }
+        Ok(())
     }
 
     /// Insert a built backend into the routing set under its durable id:

@@ -4520,8 +4520,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ),
             }
 
-            let nvme_dev =
-                std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(first_data_path));
+            // DUR-2 decision (a): the mount refuses a data volume that
+            // cannot serve O_DIRECT (buffered device I/O has no barrier),
+            // and logs the volume's probed volatile-write-cache class.
+            let nvme_dev = std::sync::Arc::new(squeezefs::nvme_dev::NvmeBlockDev::open_checked(
+                first_data_path,
+            )?);
 
             // Filesystem generation of the mounted volume set (v3 superblock
             // uuids / v2 config identity, ordered): local staging is bound

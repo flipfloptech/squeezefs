@@ -1415,21 +1415,58 @@ impl IpcHost {
             }
             // SAFETY: fresh owned fd from accept4.
             let sock = unsafe { UnixStream::from_raw_fd(fd) };
+            // VAL-5d: admission BEFORE the thread exists. The bound is
+            // derived from the session budget (`ctl_conn_cap_from`), and
+            // a refused peer hears why (class Budget) instead of being
+            // parked or silently dropped.
+            if self.ctl_live.load(Ordering::Relaxed) >= self.ctl_cap {
+                METRICS
+                    .ipc_admission_refusals
+                    .fetch_add(1, Ordering::Relaxed);
+                if !self.ctl_cap_logged.swap(true, Ordering::Relaxed) {
+                    log::warn!(
+                        "ipc host: {} concurrent ctl connections — at the derived cap; \
+                         refusing new connections until it drains (VAL-5d)",
+                        self.ctl_cap
+                    );
+                }
+                let _ = send_ctl(
+                    &sock,
+                    &CtlMsg::Refuse {
+                        class: RefuseClass::Budget,
+                    },
+                    None,
+                );
+                drop(sock);
+                continue;
+            }
             self.ctl_live.fetch_add(1, Ordering::Relaxed);
             let host = Arc::clone(&self);
             let handle = std::thread::Builder::new()
                 .name("sqz-ipc-ctl".into())
                 .spawn(move || host.connection_loop(sock));
             match handle {
-                Ok(h) => self
-                    .threads
-                    .lock()
-                    .expect("thread registry mutex never poisons")
-                    .push(h),
+                Ok(h) => {
+                    let mut threads = self
+                        .threads
+                        .lock()
+                        .expect("thread registry mutex never poisons");
+                    // VAL-5d: prune finished handles on every accept —
+                    // the registry tracks LIVE threads, not history (the
+                    // `admin_conns` retain pattern, applied where the
+                    // unbounded growth actually was).
+                    threads.retain(|h| !h.is_finished());
+                    threads.push(h);
+                }
                 Err(e) => {
                     self.ctl_live.fetch_sub(1, Ordering::Relaxed);
                     log::error!("ipc host: ctl thread spawn failed: {e}");
                 }
+            }
+            // Re-arm the cap log once the population has genuinely
+            // drained (one line per episode, never per refusal).
+            if self.ctl_live.load(Ordering::Relaxed) < self.ctl_cap / 2 {
+                self.ctl_cap_logged.store(false, Ordering::Relaxed);
             }
         }
     }

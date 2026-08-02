@@ -292,7 +292,7 @@ impl MemoryCacheShard {
 
     fn remove(&self, key: &[u8]) -> Option<Bytes> {
         let entry = self.map.entry_sync(Bytes::copy_from_slice(key));
-        match entry {
+        let out = match entry {
             scc::hash_map::Entry::Occupied(entry) => {
                 let (val, _) = entry.remove();
                 let len = val.len();
@@ -300,9 +300,56 @@ impl MemoryCacheShard {
                 Some(val)
             }
             scc::hash_map::Entry::Vacant(_) => None,
+        };
+        // RES-10: the removal left its ordering node behind. Nothing pops
+        // it but an eviction pass, and a cache under budget never runs
+        // one — so an invalidation-heavy tier accumulates one dead node
+        // per removal for the life of the mount.
+        self.reclaim_eviction_queue();
+        out
+    }
+
+    /// RES-10: drop eviction-queue nodes whose key is no longer mapped.
+    ///
+    /// A `SegQueue` has no interior removal, so this is a drain-and-refill
+    /// pass gated on the node count exceeding `2 × live + slack` —
+    /// amortized O(1) per removal, and it bounds the queue at a multiple
+    /// of the LIVE set instead of at "every invalidation this mount ever
+    /// did". Skipping when the eviction lock is held keeps it off the
+    /// evictor's back (that pass is already draining the queue).
+    ///
+    /// Ordering: kept nodes are re-pushed in their original relative
+    /// order. Nodes pushed CONCURRENTLY with a pass land ahead of them,
+    /// so a clock scan in that window can pick a slightly-out-of-order
+    /// victim — an LRU-hint imprecision over the handful of inserts made
+    /// during one pass, whose cost is one refill, never correctness.
+    fn reclaim_eviction_queue(&self) {
+        let nodes = self.eviction_queue.len();
+        if nodes <= self.map.len() * 2 + EVICTION_QUEUE_RECLAIM_SLACK {
+            return;
+        }
+        let Some(_guard) = self.eviction_lock.try_lock() else {
+            return;
+        };
+        let mut keep: Vec<Bytes> = Vec::new();
+        for _ in 0..nodes {
+            let Some(key) = self.eviction_queue.pop() else {
+                break;
+            };
+            if self.map.contains_sync(&key) {
+                keep.push(key);
+            }
+        }
+        for key in keep {
+            self.eviction_queue.push(key);
         }
     }
 }
+
+/// RES-10 hysteresis floor: below this many nodes a backlog is not worth
+/// a drain pass (an amortization floor, not a resource cap — the bound
+/// that matters is the `2 × live` term, which scales with the shard).
+const EVICTION_QUEUE_RECLAIM_SLACK: usize = 64;
 
 /// A highly concurrent, sharded in-memory cache using the Clock (second-chance) eviction policy.
 pub struct MemoryCache {

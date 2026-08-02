@@ -88,30 +88,44 @@ fn r5_red_clamp_empties_the_cache_despite_tombstones() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn removed_keys_do_not_leave_permanent_eviction_nodes() {
-    const REMOVALS: usize = 20_000;
-    // Comfortably over budget for the handful of live entries, so no
-    // eviction pass ever runs on its own — the healthy steady state of an
-    // invalidation-heavy tier.
+fn eviction_nodes_are_bounded_by_the_live_set_not_by_lifetime_removals() {
+    // Comfortably under budget for the churn, so no eviction pass ever
+    // runs on its own — the healthy steady state of an
+    // invalidation-heavy tier. The shard count (and therefore the
+    // per-shard hysteresis floor) is a property of the box, so the
+    // contract is stated as a GROWTH bound: doubling the removals must
+    // not grow the backlog.
     let cache = LruCache::with_capacity((256 * VAL) as u64);
     let payload = Bytes::from(vec![5u8; VAL]);
-    for i in 0..REMOVALS {
-        let k = format!("churn{i}");
-        cache.put(&k, payload.clone());
-        cache.remove(&k);
-    }
+    let churn = |from: usize, to: usize| {
+        for i in from..to {
+            let k = format!("churn{i}");
+            cache.put(&k, payload.clone());
+            cache.remove(&k);
+        }
+    };
+
+    churn(0, 20_000);
     assert_eq!(
         cache.current_bytes(),
         0,
         "payload gauge converges — it always did"
     );
-    let nodes = cache.eviction_queue_len();
+    let after_20k = cache.eviction_queue_len();
+    churn(20_000, 60_000);
+    let after_60k = cache.eviction_queue_len();
+
     assert!(
-        nodes <= 1024,
-        "RES-10: {nodes} eviction-queue nodes survive {REMOVALS} removals — \
-         one dead key per invalidation, forever, invisible to the R5 \
-         payload-byte gauge and paid for by the next over-budget put \
-         (a pass is O(queue length))"
+        after_60k <= after_20k,
+        "RES-10: the eviction backlog grew {after_20k} → {after_60k} across \
+         40,000 further removals — one dead key per invalidation, forever, \
+         invisible to the R5 payload-byte gauge and paid for by the next \
+         over-budget put (a pass is O(queue length))"
+    );
+    assert!(
+        after_60k < 20_000 / 4,
+        "RES-10: {after_60k} nodes is still per-removal accumulation, not a \
+         live-set bound"
     );
 }
 

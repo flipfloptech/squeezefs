@@ -209,7 +209,13 @@ fn bench_gather_fusion(c: &mut Criterion) {
         group.bench_function(format!("z2_two_pass_{label}"), |b| {
             b.iter(|| {
                 // Pass 1: the Z2 completion gather into the pooled bounce.
-                fill.gather_into(bounce.as_mut_ptr());
+                // SAFETY: `bounce` is a bench-owned Vec of exactly `len`
+                // bytes, uniquely borrowed for this call, and `fill`'s spans
+                // total `len` — the gather writes within the allocation and
+                // nothing aliases it.
+                unsafe {
+                    fill.gather_into(bounce.as_mut_ptr());
+                }
                 // Pass 2: the upstream serve copy (routing R-S) the Z2
                 // shape still pays on the dest leg.
                 // SAFETY: bench-owned non-overlapping buffers of `len`.
@@ -223,7 +229,13 @@ fn bench_gather_fusion(c: &mut Criterion) {
         group.bench_function(format!("z3_fused_{label}"), |b| {
             b.iter(|| {
                 // The ONE fused gather (Z3): area spans → dest, done.
-                fill.gather_into(dest.as_mut_ptr());
+                // SAFETY: `dest` is a bench-owned Vec of exactly `len` bytes,
+                // uniquely borrowed for this call, and `fill`'s spans total
+                // `len` — the gather writes within the allocation and nothing
+                // aliases it.
+                unsafe {
+                    fill.gather_into(dest.as_mut_ptr());
+                }
                 black_box(dest[len - 1]);
             });
         });

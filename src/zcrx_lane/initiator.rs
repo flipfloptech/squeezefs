@@ -734,6 +734,56 @@ impl LaneSession {
         self.read_into_wrapped(byte_offset, dest, len, Some(keepalive))
     }
 
+    /// Whether this session may serve REGISTERED-destination reads (the
+    /// PR Z3 fused gather — design §4.4/§10): area-class backends only.
+    /// The classic backend's reader task writes destinations from a
+    /// FOREIGN task, which for registered uring ent / arena memory is the
+    /// MEM-1 hazard class under cancellation; area backends gather on the
+    /// REQUESTER — a dropped future gathers nothing, so a registered dest
+    /// is never written after its op resolves, by construction.
+    pub fn dest_serve_eligible(&self) -> bool {
+        !self.queues.is_empty()
+            && self
+                .queues
+                .iter()
+                .all(|q| matches!(q, QueueHandle::Area(_)))
+    }
+
+    /// Registered-destination read — the PR Z3 GATHER FUSION arm: each
+    /// sub-command's ONE completion gather (design §4.4) lands DIRECTLY
+    /// in `dest`, deleting the Z2 intermediate (gather → pooled bounce →
+    /// serve copy) on dest-carrying funnel shapes. Counted in
+    /// `zcrx_dest_gather_bytes` (subset of `zcrx_gather_bytes` — the
+    /// fused-serve engagement gauge); refuses on non-area backends
+    /// ([`Self::dest_serve_eligible`]).
+    ///
+    /// SAFETY: `dest..dest+len` is pre-registered pinned memory writable
+    /// for the duration of the call (the `read_block_with_dest` dest
+    /// contract). Only THIS future writes it (requester-side gather), so
+    /// cancellation ends all lane writes to it immediately.
+    pub fn read_into_dest(
+        &self,
+        byte_offset: u64,
+        dest: *mut u8,
+        len: usize,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
+        let dest = SendMutPtr(dest);
+        async move {
+            if !self.dest_serve_eligible() {
+                return Err(io_err(
+                    "lane dest-serve requires an area backend (classic reader \
+                     writes from a foreign task — refused by law)"
+                        .into(),
+                ));
+            }
+            self.read_into_wrapped(byte_offset, dest, len, None).await?;
+            crate::fuse_client::METRICS
+                .zcrx_dest_gather_bytes
+                .fetch_add(len as u64, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
     async fn read_into_wrapped(
         &self,
         byte_offset: u64,

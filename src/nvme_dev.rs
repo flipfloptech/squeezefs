@@ -665,7 +665,21 @@ impl NvmeBlockDev {
     /// proceeds on the kernel path unchanged (reads are idempotent, so the
     /// per-op fallback retry is safe by construction and counted in
     /// `zcrx_fill_fallbacks`, which must stay ≈ 0).
-    async fn try_lane_read(&self, offset: u64, size: usize) -> Option<Result<bytes::Bytes>> {
+    ///
+    /// Two serve shapes (PR Z3 — design §4.4/§10 gather fusion):
+    /// * `dest_addr = Some`: the lane's ONE completion gather lands
+    ///   DIRECTLY in the caller's registered destination (area-class
+    ///   backends only — [`crate::zcrx_lane::LaneSession::read_into_dest`]),
+    ///   deleting the Z2 intermediate copy on the raw full-block and R3
+    ///   ranged zero-copy legs. Engagement gauge: `zcrx_dest_gather_bytes`.
+    /// * `dest_addr = None`: pooled fill (the Z2 shape — memory that must
+    ///   outlive the serve for tiers/holds pays the pooled gather).
+    async fn try_lane_read(
+        &self,
+        offset: u64,
+        size: usize,
+        dest_addr: Option<u64>,
+    ) -> Option<Result<bytes::Bytes>> {
         if !crate::zcrx_lane::lane_env_armed() {
             return None;
         }
@@ -676,6 +690,46 @@ impl NvmeBlockDev {
             .as_ref()?;
         if sess.poisoned() || !sess.range_eligible(offset, size) {
             return None;
+        }
+        if let Some(addr) = dest_addr {
+            // Fused dest serve: area-class backends only (the classic
+            // reader writes from a foreign task — the MEM-1 hazard class
+            // for registered memory). Ineligibility is NOT a fallback:
+            // the kernel path is simply the serve, uncounted.
+            if !sess.dest_serve_eligible() {
+                return None;
+            }
+            return match sess.read_into_dest(offset, addr as *mut u8, size).await {
+                Ok(()) => {
+                    let m = &crate::fuse_client::METRICS;
+                    m.zcrx_fills
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    m.zcrx_fill_bytes
+                        .fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
+                    // Same shape as the kernel dest arm: the caller owns
+                    // the pre-registered pinned destination.
+                    // SAFETY: dest contract of read_block_with_dest.
+                    let b = unsafe {
+                        bytes::Bytes::from_static(std::slice::from_raw_parts(
+                            addr as *const u8,
+                            size,
+                        ))
+                    };
+                    Some(Ok(b))
+                }
+                Err(e) => {
+                    // Partial gathers are harmless: the kernel-path retry
+                    // overwrites the whole destination (idempotent reads).
+                    crate::fuse_client::METRICS
+                        .zcrx_fill_fallbacks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    log::warn!(
+                        "zcrx-lane: dest read fell back to the kernel path \
+                         (offset={offset}, size={size}): {e}"
+                    );
+                    None
+                }
+            };
         }
         let (buf_ptr, bytes) = crate::cache::pool::read_bounce_pool(size).alloc();
         // MEM-3 custody: the lane holds a clone of the pooled `Bytes`
@@ -696,8 +750,9 @@ impl NvmeBlockDev {
             }
             Err(e) => {
                 // Dropping `bytes` recycles the pooled buffer; the lane's
-                // completion law guarantees no writer touches it after the
-                // op resolves (timeout paths poison the queue first).
+                // custody law guarantees no writer touches it after the
+                // op resolves (entries hold the keep-alive until the
+                // driver is done; timeout paths abort+join first).
                 crate::fuse_client::METRICS
                     .zcrx_fill_fallbacks
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -967,19 +1022,19 @@ impl NvmeBlockDev {
             )));
         }
 
-        // zcrx read lane (design §6): eligible pooled fills may be served by
-        // the userspace NVMe/TCP lane; `None` (disarmed / ineligible / lane
-        // error) falls through to the kernel-path worker unchanged.
-        if dest_addr.is_none() {
-            if let Some(res) = self.try_lane_read(offset, size).await {
-                let out = res?;
-                if count_in_get_obj {
-                    crate::fuse_client::METRICS
-                        .get_obj
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                return Ok(out);
+        // zcrx read lane (design §6): eligible fills may be served by the
+        // userspace NVMe/TCP lane — pooled (Z2 shape) AND, since PR Z3,
+        // registered-destination reads (fused gather straight into the
+        // dest); `None` (disarmed / ineligible / lane error) falls through
+        // to the kernel-path worker unchanged.
+        if let Some(res) = self.try_lane_read(offset, size, dest_addr).await {
+            let out = res?;
+            if count_in_get_obj {
+                crate::fuse_client::METRICS
+                    .get_obj
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            return Ok(out);
         }
 
         let (buf_ptr, bytes) = if let Some(addr) = dest_addr {

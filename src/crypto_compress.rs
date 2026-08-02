@@ -69,7 +69,7 @@ const AEAD_TAG_LEN_MAX: usize = 16;
 /// so that a full `block_size` payload stored RAW (the incompressible-
 /// block escape) still fits: frame word + worst-case AEAD envelope
 /// (`[2B wrapped_key_len][1B nonce_len]` + the conservative
-/// [`WRAPPED_KEY_LEN_FALLBACK`] wrap + nonce + tag = 547 B), rounded up to
+/// `WRAPPED_KEY_LEN_FALLBACK` wrap + nonce + tag = 547 B), rounded up to
 /// one 4 KiB LBA so chunk-interior windows stay
 /// O_DIRECT-aligned. `format` clamps `block_size` to
 /// `CHUNK_SIZE - TRANSFORM_BLOCK_HEADROOM` on transformed volumes; mounts
@@ -364,7 +364,7 @@ impl CryptoCompressState {
     /// `payload_len`-byte payload. With the store-raw escape the
     /// compression term never exceeds the raw payload, so the bound is
     /// `frame + worst-case AEAD envelope + payload`. Deliberately
-    /// CONSERVATIVE on the wrapped-key term ([`WRAPPED_KEY_LEN_FALLBACK`],
+    /// CONSERVATIVE on the wrapped-key term (`WRAPPED_KEY_LEN_FALLBACK`,
     /// never the blob actually present in THIS process): readers size their
     /// device windows with it, and a window must cover any writer's
     /// output regardless of which process wrote the block. Passthrough

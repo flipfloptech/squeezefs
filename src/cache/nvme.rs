@@ -638,7 +638,7 @@ impl ExtentRecord {
         out.extend_from_slice(&0u64.to_le_bytes()); // digest placeholder
                                                     // DUR-8a: the digest covers the HEADER (its own field zeroed) and
                                                     // the body — the record really is checksummed as a unit now.
-        let checksum = if self.version >= EXTENT_RECORD_VERSION {
+        let checksum = if self.version > EXTENT_RECORD_VERSION_V1 {
             extent_record_checksum(&out, &body)
         } else {
             xxh3_64(&body)
@@ -674,7 +674,7 @@ impl ExtentRecord {
         }
         // DUR-8a: v2 covers the header, v1 only the body (still read so
         // an older binary's crash residue keeps its acked custody).
-        let ok = if version >= EXTENT_RECORD_VERSION {
+        let ok = if version > EXTENT_RECORD_VERSION_V1 {
             extent_record_checksum(
                 &bytes[..EXTENT_RECORD_HDR_LEN],
                 &bytes[EXTENT_RECORD_HDR_LEN..],

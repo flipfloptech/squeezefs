@@ -6369,3 +6369,38 @@ mod tpc_dispatch_tests {
         );
     }
 }
+
+/// FUSE-4d — `max_readahead` is echoed VERBATIM and deliberately never
+/// consulted, and the value the kernel was told is published so operators
+/// can see both numbers.
+///
+/// The limit bounds the KERNEL's per-file readahead requests to the daemon.
+/// The daemon's own R2 prefetch window is a device-side pipeline depth
+/// (bandwidth × latency, clamped by the R5 memory budget): different
+/// resource, different unit. Clamping one by the other would let a
+/// page-cache limit throttle a device pipeline (or the reverse), which is
+/// why the independence is a decision rather than an omission — and why the
+/// echo must stay exact: negotiating a SMALLER value silently caps the
+/// kernel's readahead on every mount.
+#[cfg(test)]
+mod readahead_negotiation_tests {
+    use super::*;
+
+    #[test]
+    fn the_kernels_readahead_limit_is_echoed_verbatim_and_published() {
+        for want in [0u32, 4096, 131_072, 4 * 1024 * 1024, u32::MAX] {
+            let echoed = negotiate_max_readahead(want);
+            assert_eq!(
+                echoed, want,
+                "max_readahead must be echoed verbatim — a clamped echo caps \
+                 the kernel's readahead for the mount's life"
+            );
+            assert_eq!(
+                crate::raw::connection::fuse_over_uring::negotiated_max_readahead(),
+                u64::from(want),
+                "the negotiated limit must be published for the stats inode \
+                 (the operator's half of the documented independence)"
+            );
+        }
+    }
+}

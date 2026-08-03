@@ -173,8 +173,19 @@ fn opts() -> squeezefs::meta_backend::kv::builder::FormatV3Options {
     }
 }
 
-/// One "node's" formatted + opened metadata volume set.
+/// One "node's" formatted + opened metadata volume set. `stamp` runs
+/// between format and open, because a mount reads the superblock ONCE (at
+/// open) — which is also why the Phase-8 reformat window is an offline act.
 async fn sandbox(dir: &Path, tag: &str, volumes: usize) -> (Arc<RoutedMetaBackend>, Vec<PathBuf>) {
+    sandbox_stamped(dir, tag, volumes, false).await
+}
+
+async fn sandbox_stamped(
+    dir: &Path,
+    tag: &str,
+    volumes: usize,
+    stamp: bool,
+) -> (Arc<RoutedMetaBackend>, Vec<PathBuf>) {
     let plan = plan_meta_slot_set(volumes).expect("derived plan");
     let mut uris = Vec::new();
     let mut paths = Vec::new();
@@ -188,6 +199,9 @@ async fn sandbox(dir: &Path, tag: &str, volumes: usize) -> (Arc<RoutedMetaBacken
         )
         .await
         .expect("format stamped meta volume");
+        if stamp {
+            stamp_capabilities(&p).await;
+        }
         uris.push(p.display().to_string());
         paths.push(p);
     }
@@ -218,9 +232,16 @@ fn clocks() -> (LeaseClocks, Arc<AtomicU64>, LeaseClock) {
 
 /// A quarantine sink over one real `BlockAllocator` — the shape the mount
 /// arm builds over the backend router.
-#[derive(Debug)]
 struct AllocQuarantine {
     alloc: Arc<BlockAllocator>,
+}
+
+impl std::fmt::Debug for AllocQuarantine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AllocQuarantine")
+            .field("quarantined", &self.alloc.quarantined_count())
+            .finish()
+    }
 }
 
 impl CustodyQuarantine for AllocQuarantine {
@@ -275,6 +296,7 @@ async fn owner_with_quarantine(
     });
     let owner = WriteCustodyOwner::arm(
         "owner-a",
+        squeezefs::dlm::durable_term() + 1,
         squeezefs::dlm::durable_term(),
         c,
         clock,
@@ -308,6 +330,7 @@ async fn two_nodes_writing_disjoint_files_hold_custody_concurrently() {
     let (owner, _ms) = owner_with_quarantine(None).await;
     let auth = start_authority(Arc::clone(&owner), None);
 
+    let ledger_before = data_grant::stats();
     let a = client_for(&auth.endpoint, "node-a").await;
     let b = client_for(&auth.endpoint, "node-b").await;
 
@@ -338,9 +361,10 @@ async fn two_nodes_writing_disjoint_files_hold_custody_concurrently() {
     assert_eq!(stats.granted, 2, "two grants served");
     assert_eq!(stats.conflicts, 0, "disjoint files never conflict");
     assert_eq!(
-        data_grant::stats().grants,
+        data_grant::stats().grants - ledger_before.grants,
         2,
-        "the client-side ledger closes against the authority's"
+        "the client-side ledger closes against the authority's (deltas: the counters are \
+         process-global, like every house family)"
     );
 
     drop(lease_a);
@@ -580,14 +604,27 @@ async fn revoked_custody_quarantines_its_offsets_until_a_drain_proof() {
         "the deferred free-list publish happens at release, and only there"
     );
 
-    // The revoked client's lease is no longer custody, and its renewal
-    // says so rather than pretending.
-    assert!(!lease.is_held().await, "a revoked grant is not held");
+    // **Revocation is PULL-based, and that is a contract, not an accident.**
+    // Until the client's next renewal it still BELIEVES it holds custody —
+    // the window is bounded by its own `T_self`, at which point it
+    // self-fences, and by the DEVICE, which rejects a preempted host's DMA.
+    // What must never happen is the belief outliving the renewal.
+    assert!(
+        lease.is_held().await,
+        "before its renewal the client has not yet learned — the pull-based window"
+    );
     let err = a
         .renew_all()
         .await
         .expect_err("a revoked client's renewal must fail loud");
     assert!(err.to_string().to_lowercase().contains("custody"));
+    assert!(
+        !lease.is_held().await,
+        "once the renewal answered, the belief is gone"
+    );
+    // And the epoch MOVED rather than the mount being poisoned: losing
+    // custody costs the work authorized under it, never the process.
+    assert!(!data_custody::poisoned());
     drop(lease);
 }
 
@@ -609,7 +646,18 @@ async fn a_client_that_misses_t_self_fences_before_the_owner_may_regrant() {
     let _restore = restore();
     let (owner, ms) = owner_with_quarantine(None).await;
     let auth = start_authority(Arc::clone(&owner), None);
-    let a = client_for(&auth.endpoint, "node-a").await;
+    // The co-writer runs on the SAME manual clock as the authority, so the
+    // two deadlines are comparable and provable without a sleep (the S6
+    // seam discipline: seams, never sleeps).
+    let a = WriteCustodyClient::connect_with_clock(
+        &auth.endpoint,
+        SECRET,
+        "node-a",
+        LeaseClock::manual(Arc::clone(&ms)),
+        0,
+    )
+    .await
+    .expect("a co-writer joins on the manual clock");
     let lease = a
         .acquire(9100, None, LockMode::Exclusive, Duration::from_millis(500))
         .await
@@ -670,23 +718,25 @@ async fn owner_failover_admits_reclaim_and_refuses_fresh_acquires() {
     let term = squeezefs::dlm::durable_term();
 
     // An equal era is refused: the successor's grants would be
-    // indistinguishable from the dead authority's.
+    // indistinguishable from the dead authority's, so a zombie's token would
+    // still dominate.
     assert!(
-        WriteCustodyOwner::arm("owner-b", term, c.clone(), clock.clone(), None).is_err()
-            || term == 0,
+        WriteCustodyOwner::arm(
+            "owner-b",
+            term + 1,
+            term + 1,
+            c.clone(),
+            clock.clone(),
+            None
+        )
+        .is_err(),
         "a successor must bump the durable term before arming"
     );
 
     let successor_term = term + 1;
     squeezefs::dlm::adopt_durable_term(successor_term);
-    let successor = WriteCustodyOwner::arm(
-        "owner-b",
-        successor_term,
-        c,
-        clock,
-        None,
-    )
-    .expect("the successor arms in a strictly greater era");
+    let successor = WriteCustodyOwner::arm("owner-b", successor_term, term, c, clock, None)
+        .expect("the successor arms in a strictly greater era");
     successor.open_grace(vec!["node-a".to_string()]);
     let auth = start_authority(Arc::clone(&successor), None);
     let a = client_for(&auth.endpoint, "node-a").await;
@@ -744,12 +794,12 @@ async fn the_mount_arm_refuses_a_non_pr_substrate() {
     let _serial = serial();
     let _restore = restore();
     let dir = TempDir::new().unwrap();
-    let (routed, paths) = sandbox(dir.path(), "nonpr", 1).await;
-    for p in &paths {
-        stamp_capabilities(p).await;
-    }
+    let (routed, _paths) = sandbox_stamped(dir.path(), "nonpr", 1, true).await;
     let data = dir.path().join("nonpr-data");
-    std::fs::File::create(&data).unwrap().set_len(1 << 20).unwrap();
+    std::fs::File::create(&data)
+        .unwrap()
+        .set_len(1 << 20)
+        .unwrap();
     let ns = FakeNvmeNamespace::without_pr_support();
     install_override(
         &data,
@@ -758,7 +808,7 @@ async fn the_mount_arm_refuses_a_non_pr_substrate() {
 
     let err = squeezefs::multi_writer::arm_multi_writer(
         &routed,
-        &[data.clone()],
+        std::slice::from_ref(&data),
         false,
         tokio::runtime::Handle::current(),
         None,
@@ -796,7 +846,10 @@ async fn the_mount_arm_refuses_an_unstamped_format_naming_the_bit() {
     // multi-writer bits (D9).
     let (routed, _paths) = sandbox(dir.path(), "nobit", 1).await;
     let data = dir.path().join("nobit-data");
-    std::fs::File::create(&data).unwrap().set_len(1 << 20).unwrap();
+    std::fs::File::create(&data)
+        .unwrap()
+        .set_len(1 << 20)
+        .unwrap();
     let ns = FakeNvmeNamespace::new();
     install_override(
         &data,
@@ -805,7 +858,7 @@ async fn the_mount_arm_refuses_an_unstamped_format_naming_the_bit() {
 
     let err = squeezefs::multi_writer::arm_multi_writer(
         &routed,
-        &[data.clone()],
+        std::slice::from_ref(&data),
         false,
         tokio::runtime::Handle::current(),
         None,
@@ -961,11 +1014,10 @@ async fn the_daemon_publish_surface_ships_to_the_owner() {
     let (owner_be, _p1) = sandbox(dir.path(), "own", 1).await;
     let (client_be, _p2) = sandbox(dir.path(), "cli", 1).await;
 
+    let publish_before = publish::stats();
     let (custody, _ms) = owner_with_quarantine(None).await;
     let auth = start_authority(Arc::clone(&custody), Some(Arc::clone(&owner_be)));
-    publish::install_client(
-        publish::PublishClient::new("node-a", SECRET.to_vec()),
-    );
+    publish::install_client(publish::PublishClient::new("node-a", SECRET.to_vec()));
 
     // Every volume of the client's set is owned by the peer.
     let foreign: Vec<(usize, PeerOwner)> = (0..client_be.volumes.len())
@@ -975,18 +1027,10 @@ async fn the_daemon_publish_surface_ships_to_the_owner() {
 
     // create_with_rdev_size: minted on the OWNER, and its ino is what the
     // client uses from here on.
-    let inode = publish::create_with_rdev_size(
-        &client_be,
-        1,
-        "shipped",
-        libc::S_IFREG | 0o644,
-        0,
-        0,
-        0,
-        0,
-    )
-    .await
-    .expect("the create ships");
+    let inode =
+        publish::create_with_rdev_size(&client_be, 1, "shipped", libc::S_IFREG | 0o644, 0, 0, 0, 0)
+            .await
+            .expect("the create ships");
     assert!(inode.ino >= 2);
 
     // xattr_value_cap is a routed READ of the owner's geometry (the
@@ -1050,9 +1094,16 @@ async fn the_daemon_publish_surface_ships_to_the_owner() {
         .expect("destroy_inodes ships");
 
     let s = publish::stats();
-    assert!(s.shipped >= 8, "every publish verb took the wire: {s:?}");
-    assert_eq!(s.local, 0, "a foreign-home ino never publishes locally");
-    assert_eq!(s.refusals, 0);
+    assert!(
+        s.shipped - publish_before.shipped >= 8,
+        "every publish verb took the wire: {s:?}"
+    );
+    assert_eq!(
+        s.local, publish_before.local,
+        "a foreign-home ino never publishes locally"
+    );
+    assert_eq!(s.refusals, publish_before.refusals);
+    assert_eq!(s.panics, 0, "an owner-side publish must never unwind");
 
     // Disarmed, the SAME calls take today's path with no session at all.
     ship::disarm_ownership();
@@ -1168,6 +1219,7 @@ async fn concurrent_custody_never_grants_overlapping_spans() {
     let _restore = restore();
     let (owner, _ms) = owner_with_quarantine(None).await;
     let auth = start_authority(Arc::clone(&owner), None);
+    let quarantined_before = quarantined();
     const INO: u64 = 31337;
     const LANES: u64 = 8;
 
@@ -1227,12 +1279,12 @@ async fn concurrent_custody_never_grants_overlapping_spans() {
         "every grant this storm took was retired"
     );
     let s = auth.owner.stats();
+    assert_eq!(s.granted - s.released, 0, "the grant ledger closes: {s:?}");
     assert_eq!(
-        s.granted as u64 - s.released as u64,
-        0,
-        "the grant ledger closes: {s:?}"
+        quarantined(),
+        quarantined_before,
+        "a clean storm quarantines nothing"
     );
-    assert_eq!(quarantined(), 0, "a clean storm quarantines nothing");
 }
 
 /// Contract: the whole stack composes under load — two co-writers, one
@@ -1269,10 +1321,16 @@ async fn a_revoke_under_load_stops_one_writer_and_not_the_other() {
     assert!(alloc.is_quarantined(off));
 
     // node-b is untouched: its renewal still succeeds and its custody is
-    // still live.
+    // still live. node-a learns at ITS renewal (the pull-based window) —
+    // per-client custody loss, never a cluster-wide stop.
     b.renew_all().await.expect("the survivor renews");
     assert!(lb.is_held().await, "the survivor's custody is live");
+    assert!(
+        a.renew_all().await.is_err(),
+        "the revoked client's renewal must fail"
+    );
     assert!(!la.is_held().await, "the revoked client's custody is gone");
+    assert!(lb.is_held().await, "and the survivor is STILL live");
 
     let proof = DrainProof::proven_dead("test: attested proof of death");
     assert_eq!(auth.owner.release_dead(&dead[0], proof), 1);

@@ -5140,6 +5140,39 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| format!("membership plane refused to arm: {e}"))?;
 
+            // DLM S9 (spec §6.9 S9): arm the multi-writer planes.
+            //
+            // AFTER membership, deliberately: a co-writer that cannot be
+            // SEEN cannot be EVICTED, and S6's eviction is what mints the
+            // dead epoch whose offsets enter S7's do-not-reallocate
+            // quarantine. The arm refuses loudly and specifically when
+            // anything it needs is absent — a non-PR substrate (§6.9's S9
+            // guarantee is "refused on non-PR"), a format missing one of the
+            // capability bits (nothing stamps them: ruling D9), a membership
+            // plane that is off, or no durable era — and `Ok(None)` when
+            // `SQUEEZEFS_MULTI_WRITER` is off, which is the shipped posture.
+            //
+            // The quarantine sink is this mount's own data volumes, so a
+            // dead co-writer's declared destinations stop being allocatable
+            // here until a drain proof (the WERO preempt of its registrant
+            // key) arrives.
+            let mw_quarantine: std::sync::Arc<dyn squeezefs::data_grant::CustodyQuarantine> =
+                squeezefs::multi_writer::RouterQuarantine::new(
+                    fs_engine.router.backend_router.clone(),
+                );
+            let multi_writer_arm = squeezefs::multi_writer::arm_mount_multi_writer(
+                &routed_meta_backend,
+                &resolved_data_lvs
+                    .iter()
+                    .map(std::path::PathBuf::from)
+                    .collect::<Vec<_>>(),
+                reader_mount,
+                tokio::runtime::Handle::current(),
+                Some(mw_quarantine),
+            )
+            .await
+            .map_err(|e| format!("multi-writer refused to arm: {e}"))?;
+
             let opt_idle = if resolved_fuse_io_uring_sqpoll_idle_ms > 0 {
                 Some(resolved_fuse_io_uring_sqpoll_idle_ms)
             } else {
@@ -5192,6 +5225,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // record, so the volume set presents as un-served instead of
             // naming an endpoint nobody answers. A crash skips this, which
             // is exactly the case a member's failed renewal already covers.
+            // DLM S9: disarm the multi-writer planes FIRST — before
+            // membership, because a peer that can still reach this
+            // authority's custody verbs must find them gone before this
+            // mount stops answering liveness (the reverse of the arm's
+            // order, so no window exists where custody is granted by a
+            // mount that is no longer a member).
+            if let Some(mw) = multi_writer_arm {
+                mw.disarm().await;
+            }
             if let Some(membership) = membership_arm {
                 membership.disarm().await;
             }

@@ -836,7 +836,9 @@ Two properties worth knowing:
   and it is why `fsck_findings` stays 0 on a busy healthy filesystem.
 - **The `nlink == 0` unreferenced shape is deliberately NOT claimed.**
   That is the POSIX unlinked-but-open state (and the rename-overwrite
-  crash orphan below): telling it apart from a corpse nobody will ever
+  crash orphan of
+  [POSIX-15](#rename-overwrite-leaves-a-crash-window-orphan-posix-15)):
+  telling it apart from a corpse nobody will ever
   FORGET needs the live open-handle registries, so claiming it could
   destroy an open file's data. It remains an accounting leak, not lost
   data.

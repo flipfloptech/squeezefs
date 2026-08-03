@@ -1549,8 +1549,32 @@ async fn evaluate_c9_unreferenced(
     counters: &mut FsckCounters,
     suspects: &mut Vec<Suspect>,
 ) {
+    // The candidate list is O(damage), like every other class's suspect
+    // list — but unlike theirs its worst case is not bounded by real
+    // allocator state: a volume whose dentry tree is structurally lost
+    // would make EVERY inode a candidate. So the difference collects at
+    // most as many inos as ONE ino set represents (`budget / 8` entries,
+    // the same memory scale the sets already ride) and says loudly how
+    // many it left. Batching is convergent: repair the reported ones and
+    // re-run for the next batch — strictly better than either refusing a
+    // verdict on a genuinely damaged volume or materializing a report
+    // with a hundred million entries.
+    let ceiling = (ino_set_byte_budget() / 8) as usize;
     let mut candidates: Vec<u64> = Vec::new();
-    live.each_absent_from(refs, |ino| candidates.push(ino));
+    let mut deferred = 0u64;
+    live.each_absent_from(refs, |ino| {
+        if candidates.len() >= ceiling {
+            deferred += 1;
+            return;
+        }
+        candidates.push(ino);
+    });
+    if deferred > 0 {
+        log::warn!(
+            "fsck C9: {} unreferenced-inode candidates examined this run, {deferred}              deferred to the next run (this volume's damage exceeds one batch — repair              what is reported and re-run; the class converges)",
+            candidates.len()
+        );
+    }
     for ino in candidates {
         let (vol_idx, local) = ctx.meta.route_ino(ino);
         let Some(kv) = ctx.meta.volumes.get(vol_idx) else {

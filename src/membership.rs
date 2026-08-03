@@ -1856,6 +1856,12 @@ async fn arm_owner(
     // (which stamps every freed offset). Two clocks would make labels and
     // acknowledgements incomparable.
     let clock = LeaseClock::monotonic();
+    // Spec §6.8 item 3: arm the freed-offset grace period FIRST — an unsafe
+    // grace bound must refuse before this mount writes a rendezvous record
+    // or claims anything. Armed with no members it is inert (the bound is
+    // `u64::MAX` and the gate's armed word is false), so the ordering costs
+    // nothing and the refusal leaves no residue.
+    crate::free_grace::arm_owner_plane(clock.clone(), &clocks)?;
     let term = crate::dlm::durable_term();
     // The predecessor's era, from its own durable evidence: the rendezvous
     // record it left behind (a crash) and the claim set (§6.2 item 7).
@@ -1933,11 +1939,10 @@ async fn arm_owner(
         owner.open_grace(expected);
     }
     install_owner(Arc::clone(&owner));
-    // Spec §6.8 item 3: arm the freed-offset grace period on the SAME
-    // clock, then publish the (empty) bound so the gate's armed word agrees
-    // with the census from the first instant. An unsafe grace bound refuses
-    // here, before a single offset is freed under it.
-    crate::free_grace::arm_owner_plane(clock, &clocks)?;
+    // The gate's armed word agrees with the census from the first instant
+    // (the plane itself was armed above, on the SAME clock the authority
+    // stamps its grants with — labels and acknowledgements must be readings
+    // of one clock).
     owner.refresh_free_grace_bound();
     let stop = Arc::new(AtomicBool::new(false));
     let sweep = {

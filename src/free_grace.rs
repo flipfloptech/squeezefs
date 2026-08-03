@@ -427,6 +427,28 @@ impl Default for GraceRing {
     }
 }
 
+impl Drop for GraceRing {
+    /// Reconcile the PROCESS gauges for anything still held: a volume
+    /// retired mid-flight (`volume remove-data`, an offline tool's
+    /// short-lived allocator) must not leave `free_grace_offsets` claiming
+    /// space that no allocator owns any more. The offsets themselves need
+    /// nothing — the volume they belonged to is gone.
+    fn drop(&mut self) {
+        let held = self.len.swap(0, Ordering::AcqRel) as u64;
+        let bytes = self.bytes.swap(0, Ordering::AcqRel);
+        if held != 0 {
+            HELD_OFFSETS.fetch_sub(held, Ordering::Relaxed);
+            HELD_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+            log::warn!(
+                "freed-offset grace ring dropped with {held} offset(s) ({bytes} B) still held: \
+                 the volume was retired before its readers acknowledged. The offsets are gone \
+                 with the volume, so nothing is stranded — but the readers' cached bindings to \
+                 them are only void because the volume is (spec §6.8 item 3)"
+            );
+        }
+    }
+}
+
 impl GraceRing {
     /// A ring with an explicit cap (the test seam).
     pub fn new(cap: usize) -> Self {

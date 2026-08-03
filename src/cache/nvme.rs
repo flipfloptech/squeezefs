@@ -30,6 +30,13 @@ pub const STAGING_FORMAT_MARKER: &str = ".squeezefs_staging_format";
 ///   `active_block:` whole-image records; no marker file existed).
 /// * **2** — RW4: adds `active_block_ext:` extent records
 ///   ([`ExtentRecord`]).
+/// * **3** — §6.2 item 8: records may be keyed with a WRITER-SCOPE
+///   component (`…:w_{16 hex}`). Written only by a mount whose volume set
+///   carries incompat bit 10 ([`staging_format_write_version`]), so an
+///   un-stamped set keeps stamping v2 and stays adoptable by every shipped
+///   binary. A pre-item-8 binary (max v2) refuses a v3 root loud, which is
+///   exactly the forward-only downgrade fence: it would mint unscoped keys
+///   beside scoped records and could not classify either.
 ///
 /// The RW4 binary is the FIRST that validates this marker: a dir whose
 /// marker names a version **greater** than this constant belongs to a
@@ -40,13 +47,33 @@ pub const STAGING_FORMAT_MARKER: &str = ".squeezefs_staging_format";
 /// silently skip unknown keys — the §5.2 kill-9-then-downgrade residual,
 /// forward-detected by the next RW4+ mount's orphan-record sweep
 /// (`SqueezefsFilesystem::recover_extent_records`).
-pub const STAGING_FORMAT_VERSION: u32 = 2;
+pub const STAGING_FORMAT_VERSION: u32 = 3;
+
+/// Staging content-format version to STAMP: v3 only when the mount is
+/// writer-scoped (§6.2 items 8/10 — its records may carry scope
+/// components), else v2, byte-identical to every shipped release. Keeping
+/// the read ceiling ([`STAGING_FORMAT_VERSION`]) above the write version
+/// is what makes an un-stamped volume set's staging root still adoptable
+/// by an older binary (ruling D9's compatibility requirement).
+pub fn staging_format_write_version(scoped: bool) -> u32 {
+    if scoped {
+        3
+    } else {
+        2
+    }
+}
 
 /// Full marker file image for `fs_generation`.
 /// `(ino, block)` of an `active_block:inode_{i}:block_{b}` or
 /// `active_block_ext:inode_{i}:block_{b}` staging key; `None` for plain
 /// file_id keys (whole-file staged blobs have no per-block custody word).
+///
+/// Tolerates the §6.2-item-8 writer-scope component (`…:w_{16 hex}`):
+/// the identity a scoped key names is the same `(ino, block)`, and every
+/// parse site must see it — a foreign record has to be PARSEABLE before
+/// it can be classified.
 fn parse_block_custody_key(key: &str) -> Option<(u64, u32)> {
+    let key = crate::writer_scope::strip_key_scope(key);
     let rest = key
         .strip_prefix("active_block:inode_")
         .or_else(|| key.strip_prefix("active_block_ext:inode_"))?;
@@ -121,6 +148,19 @@ pub async fn write_staging_generation_prepare_marker(
     .await?;
     crate::uring_fs::fdatasync(marker_path).await?;
     Ok(())
+}
+
+/// EVERY generation `dir`'s marker binds, in file order (a KD-8 dual
+/// rebind marker binds two: `old`, then `new`). Empty = absent /
+/// unreadable / foreign image. The KD-8 finalize step needs the whole set,
+/// not just the first: after phase 1 the FIRST entry is the OLD generation,
+/// so a first-entry-only test can never recognize its own dual marker.
+pub async fn read_staging_generation_bindings(dir: &std::path::Path) -> Vec<String> {
+    let marker_path = dir.join(STAGING_GENERATION_MARKER);
+    match crate::uring_fs::read_all(&marker_path).await {
+        Ok(bytes) => marker_generations(&bytes),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Read `dir`'s generation-marker binding: `Ok(Some(generation))` for a
@@ -251,9 +291,29 @@ fn wipe_gds_cache_files(dir: &std::path::Path) -> std::io::Result<(usize, u64)> 
 ///   `staging_segment/` plus `*.gds_cache` materializations — with ONE
 ///   loud log line, bump `staging_generation_discards`, then stamp.
 ///
+/// `fs_generation` is the **staging generation** — the volume-set
+/// generation, node-scoped when the set carries incompat bit 10
+/// ([`crate::writer_scope::staging_generation`]). That adds two arms to
+/// the table above (spec §6.2 **item 10**), both decided by
+/// [`crate::writer_scope::classify_generation`] so the gate and the KD-8
+/// barrier cannot drift:
+///
+/// - same set, marker carries NO node scope while we do ⇒ the Phase-8
+///   **upgrade**: adopt the content (it is ours — the D0 single-writer
+///   guard governed the mount that wrote it) and re-stamp node-scoped.
+///   This is also what makes a KD-8 rebind written by an unscoped binary
+///   adoptable, i.e. belt and braces on the data-loss path;
+/// - same set, marker carries a node scope we cannot claim ⇒ a PEER's
+///   staging root. If it holds LIVE staged write custody the mount is
+///   **refused loud** — wiping it would destroy another writer's acked
+///   staged payloads, and its bytes are not ours to flush either. With no
+///   live custody the content is dead and discarding it is lossless.
+///
 /// Marker I/O is io_uring (`crate::uring_fs`); the stamp is fdatasync'd so
 /// a fresh generation is never adopted volatile.
 async fn bind_staging_generation(dir: &std::path::Path, fs_generation: &str) -> Result<()> {
+    use crate::writer_scope::GenerationBinding;
+
     let marker_path = dir.join(STAGING_GENERATION_MARKER);
     let expected = generation_marker_content(fs_generation);
 
@@ -265,12 +325,85 @@ async fn bind_staging_generation(dir: &std::path::Path, fs_generation: &str) -> 
     // generations — adopt when ours is listed and canonicalize to the
     // single marker (the crash-window adoption rule; module docs on
     // `generation_marker_content_dual`).
-    if let Some(bytes) = &found {
-        if marker_generations(bytes).iter().any(|g| g == fs_generation) {
-            crate::uring_fs::write_all(&marker_path, expected).await?;
-            crate::uring_fs::fdatasync(&marker_path).await?;
-            return Ok(());
+    let (_, want_scope) = crate::writer_scope::split_staging_generation(fs_generation);
+    let bindings: Vec<GenerationBinding> = found
+        .as_deref()
+        .map(marker_generations)
+        .unwrap_or_default()
+        .iter()
+        .map(|g| crate::writer_scope::classify_generation(g, fs_generation, want_scope))
+        .collect();
+
+    if bindings.contains(&GenerationBinding::Match) {
+        crate::uring_fs::write_all(&marker_path, expected).await?;
+        crate::uring_fs::fdatasync(&marker_path).await?;
+        return Ok(());
+    }
+
+    // §6.2 item 10, the upgrade arm: our set, no node scope on the marker.
+    if bindings.contains(&GenerationBinding::ScopeUpgrade) {
+        crate::fuse_client::METRICS
+            .staging_scope_upgrades
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let msg = format!(
+            "STAGING SCOPE UPGRADE at {}: staging root was bound to the un-scoped \
+             filesystem generation and this set is now writer-scoped — adopting the \
+             content (single-writer guard owned the mount that wrote it) and re-stamping \
+             node-scoped \"{fs_generation}\"; nothing discarded",
+            dir.display(),
+        );
+        log::info!("{msg}");
+        crate::uring_fs::write_all(&marker_path, expected).await?;
+        crate::uring_fs::fdatasync(&marker_path).await?;
+        return Ok(());
+    }
+
+    // §6.2 item 10, the foreign-node arm: never wipe a peer's live custody.
+    if let Some(GenerationBinding::ForeignScope(other)) = bindings
+        .iter()
+        .find(|b| matches!(b, GenerationBinding::ForeignScope(_)))
+        .copied()
+    {
+        let live = scan_live_staged_custody(dir, 8).await.unwrap_or_default();
+        if !live.is_empty() {
+            crate::fuse_client::METRICS
+                .staging_foreign_scope_refusals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let msg = format!(
+                "STAGING WRITER-SCOPE REFUSAL at {}: this staging root is bound to \
+                 filesystem generation \"{fs_generation}\"'s set but to node scope \
+                 w_{other:016x} (ours: {}), and it holds LIVE staged write custody \
+                 ({} unit(s), e.g. {:?}) — refusing the staging root as a unit. Those \
+                 bytes are another writer's acked custody: this node cannot flush them \
+                 (their payload ring is that node's) and must not wipe them. Remedy: \
+                 mount on the node that owns them and let writeback drain, or give this \
+                 mount a node-private staging path (`squeezefs config set-cache-paths`)",
+                dir.display(),
+                match want_scope {
+                    Some(t) => format!("w_{t:016x}"),
+                    None => "none (this volume set is not writer-scoped)".to_string(),
+                },
+                live.len(),
+                live,
+            );
+            eprintln!("{msg}");
+            log::error!("{msg}");
+            return Err(SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                msg,
+            )));
         }
+        crate::fuse_client::METRICS
+            .staging_foreign_scope_discards
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let msg = format!(
+            "staging root {} was bound to node scope w_{other:016x} but carries no live \
+             staged write custody — discarding its dead content (lossless) and stamping \
+             \"{fs_generation}\"",
+            dir.display(),
+        );
+        eprintln!("{msg}");
+        log::warn!("{msg}");
     }
 
     let cache_dir = dir.join("cache_segment");
@@ -341,8 +474,15 @@ fn parse_staging_format_marker(bytes: &[u8]) -> Option<u32> {
 /// - marker names a FUTURE version ⇒ **refuse the segment as a unit,
 ///   loudly** (mount construction fails; the content is acked custody of
 ///   a newer binary and is never wiped or guessed at).
-async fn validate_staging_format(dir: &std::path::Path) -> Result<()> {
+///
+/// `scoped` selects the version this mount STAMPS
+/// ([`staging_format_write_version`]); a marker naming a version this
+/// binary reads but does not write (v3 under an unscoped mount) is left
+/// ALONE rather than downgraded — a marker rewrite would destroy the only
+/// record that scoped content may be present.
+async fn validate_staging_format(dir: &std::path::Path, scoped: bool) -> Result<()> {
     let marker_path = dir.join(STAGING_FORMAT_MARKER);
+    let write_version = staging_format_write_version(scoped);
     let found = crate::uring_fs::read_all(&marker_path)
         .await
         .ok()
@@ -364,13 +504,10 @@ async fn validate_staging_format(dir: &std::path::Path) -> Result<()> {
                 msg,
             )))
         }
-        Some(v) if v == STAGING_FORMAT_VERSION => Ok(()),
+        Some(v) if v >= write_version => Ok(()),
         _ => {
-            crate::uring_fs::write_all(
-                &marker_path,
-                staging_format_marker_content(STAGING_FORMAT_VERSION),
-            )
-            .await?;
+            crate::uring_fs::write_all(&marker_path, staging_format_marker_content(write_version))
+                .await?;
             crate::uring_fs::fdatasync(&marker_path).await?;
             Ok(())
         }
@@ -976,13 +1113,18 @@ impl NvmeStaging {
         // marker and discard dead-generation content BEFORE any segment is
         // scanned, mapped, or recovered.
         if let Some(fs_generation) = fs_generation {
+            // §6.2 item 10: the generation may carry this node's scope, in
+            // which case the root's content format may too (v3).
+            let scoped = crate::writer_scope::split_staging_generation(fs_generation)
+                .1
+                .is_some();
             for dir in &staging_dirs {
                 // VAL-7b: owner-only staging root.
                 crate::config_ops::create_private_dir_all(dir)?;
                 bind_staging_generation(dir, fs_generation).await?;
                 // W2 §5.2: the staging content-format fence (future
                 // versions refuse the segment as a unit — mount fails).
-                validate_staging_format(dir).await?;
+                validate_staging_format(dir, scoped).await?;
             }
         }
 
@@ -1098,7 +1240,22 @@ impl NvmeStaging {
         let active_block_index: std::sync::Arc<scc::HashMap<String, ()>> =
             std::sync::Arc::new(scc::HashMap::new());
         let mut initial_write_bytes = 0u64;
+        let mut foreign_scope_records = 0usize;
         for key in staging_nvme_cache.list_keys() {
+            // §6.2 item 8 — the record-level classification, applied
+            // BEFORE any adoption: a record scoped to another node (or
+            // scoped at all while we are unscoped) is never indexed as our
+            // active-block custody, never budget-counted, and never
+            // flushed or freed. It is left in place, counted, and logged
+            // loud once: its payload belongs to that node's ring.
+            // Unscoped (legacy) records are ours by grandfathering — the
+            // D0 single-writer guard governed the mount that wrote them.
+            if let Ok(k) = std::str::from_utf8(&key) {
+                if !crate::writer_scope::key_is_mine(k) {
+                    foreign_scope_records += 1;
+                    continue;
+                }
+            }
             if std::str::from_utf8(&key).is_ok_and(key_is_block_family) {
                 // Whole-image `active_block:` records AND `active_block_ext:`
                 // extent records: occupancy-indexed (the lock-free probes),
@@ -1116,6 +1273,26 @@ impl NvmeStaging {
                 initial_write_bytes += cost;
                 let _ = staged_ledger.insert_sync(file_id.to_string(), (cost, 0));
             }
+        }
+        if foreign_scope_records > 0 {
+            // The forward-detection loud line for §6.2 item 8, same class
+            // as the extent-record sweep's: a record we cannot claim is
+            // left intact and untouched, and something is wrong with the
+            // staging-root layout (a peer's ring reachable from here).
+            crate::fuse_client::METRICS
+                .staging_foreign_scope_records
+                .fetch_add(
+                    foreign_scope_records as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            let msg = format!(
+                "STAGING RECORDS OF ANOTHER WRITER: {foreign_scope_records} recovered \
+                 staging record(s) carry a writer scope this mount cannot claim — NOT \
+                 adopted, NOT budget-counted, left intact (their payload rings belong to \
+                 the writing node). Counted in staging_foreign_scope_records"
+            );
+            eprintln!("{msg}");
+            log::warn!("{msg}");
         }
 
         // P1-1: bound the merge worker queue to avoid unbounded RAM growth under write storms.

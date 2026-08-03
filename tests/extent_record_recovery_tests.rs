@@ -633,9 +633,20 @@ async fn staging_format_version_gate_per_direction() {
     );
     let stamped = std::fs::read_to_string(dir2.path().join(STAGING_FORMAT_MARKER))
         .expect("the mount must STAMP the format marker");
+    // The stamped version is the one THIS mount WRITES, which since §6.2
+    // items 8/10 is below the read ceiling on an un-scoped set: the ceiling
+    // covers writer-scoped content (v3), and an un-scoped mount keeps
+    // stamping v2 precisely so its root stays adoptable by a binary that
+    // predates the scope. `STAGING_FORMAT_VERSION` remains the REFUSAL
+    // threshold, exercised by direction 1 above.
+    let written = squeezefs::cache::nvme::staging_format_write_version(false);
     assert!(
-        stamped.contains(&format!("\n{STAGING_FORMAT_VERSION}\n")),
-        "the stamp names the current version (got: {stamped:?})"
+        written <= STAGING_FORMAT_VERSION,
+        "the write version never exceeds the read ceiling"
+    );
+    assert!(
+        stamped.contains(&format!("\n{written}\n")),
+        "the stamp names the version this mount writes (got: {stamped:?})"
     );
 
     // Direction 3 — current version: passes.

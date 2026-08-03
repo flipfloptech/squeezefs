@@ -1535,6 +1535,37 @@ pub enum TakeSlots {
     List(Vec<u16>),
 }
 
+/// The staging generation of the set `meta_lvs` describes: the volume-set
+/// generation, decorated with THIS node's writer scope when every member
+/// carries incompat bit 10 (§6.2 item 10,
+/// [`crate::writer_scope::staging_generation`]).
+///
+/// Both halves of a KD-8 rebind resolve their OWN set's scope — the old
+/// set's and the new set's engagement can differ (adding an un-stamped
+/// member makes the new set un-scoped, since engagement needs unanimity),
+/// and stamping a root with the wrong side's decoration is exactly the
+/// mismatch that would make the next mount discard durable staged
+/// payloads.
+///
+/// A scope-resolution failure degrades to UNSCOPED, loudly, rather than
+/// wedging a membership verb: the resulting root is bound to the
+/// un-scoped generation, which the mount's `ScopeUpgrade` arm adopts and
+/// re-stamps — never discards.
+async fn staging_generation_for_set(meta_lvs: &[String], set_generation: &str) -> String {
+    let scope = match crate::writer_scope::resolve_scope_for_set(meta_lvs).await {
+        Ok(scope) => scope,
+        Err(e) => {
+            log::warn!(
+                "writer-scope resolution failed for the metadata set ({e}); staging \
+                 generation stays UN-scoped for this operation — the next mount's scope \
+                 upgrade arm adopts and re-stamps the roots (nothing is discarded)"
+            );
+            None
+        }
+    };
+    crate::writer_scope::staging_generation(set_generation, scope)
+}
+
 /// The KD-8 staging drain barrier over ISOLATED staging roots (the
 /// per-mount dirs carrying a generation marker + `staging_segment/`):
 /// verify every root carries NO live staged write custody (per-unit
@@ -1552,7 +1583,15 @@ pub async fn staging_drain_barrier(
     // Phase 2: restamp the roots bound to the OLD generation.
     for dir in dirs {
         match crate::cache::read_staging_generation_marker(dir).await? {
-            Some(g) if g == old_generation || g == new_generation => {
+            // §6.2 item 10: the membership test is scope-aware — a root
+            // still bound to the UN-scoped generation is rebindable (the
+            // upgrade arm), because leaving it behind would strand it on
+            // the dead set generation and the next mount would discard its
+            // durable staged payloads.
+            Some(g)
+                if crate::writer_scope::marker_is_rebindable(&g, old_generation)
+                    || crate::writer_scope::marker_is_rebindable(&g, new_generation) =>
+            {
                 crate::cache::write_staging_generation_marker(dir, new_generation).await?;
             }
             _ => {
@@ -1587,7 +1626,11 @@ pub async fn staging_rebind_prepare(
     for dir in dirs {
         for key in crate::cache::scan_live_staged_custody(dir, 64).await? {
             // Durable staged-layout payloads (uuid file ids) rebind;
-            // pending block custody refuses.
+            // pending block custody refuses. §6.2 item 8: a FOREIGN-scoped
+            // record refuses too (it is listed with its scope in the
+            // refusal) — this process cannot drain custody whose payload
+            // ring belongs to another node, and rebinding the root around
+            // it would bind a generation to content we cannot classify.
             if key.starts_with("active_block:") || key.starts_with("active_block_ext:") {
                 custody.push(format!("{}: {key}", dir.display()));
             }
@@ -1604,7 +1647,11 @@ pub async fn staging_rebind_prepare(
     }
     for dir in dirs {
         match crate::cache::read_staging_generation_marker(dir).await? {
-            Some(g) if g == old_generation || g == new_generation => {
+            // Scope-aware membership (see `staging_drain_barrier`).
+            Some(g)
+                if crate::writer_scope::marker_is_rebindable(&g, old_generation)
+                    || crate::writer_scope::marker_is_rebindable(&g, new_generation) =>
+            {
                 crate::cache::write_staging_generation_prepare_marker(
                     dir,
                     old_generation,
@@ -1622,12 +1669,18 @@ pub async fn staging_rebind_prepare(
 /// every dual-marked root to the single new-generation marker.
 pub async fn staging_rebind_finalize(dirs: &[PathBuf], new_generation: &str) -> Result<()> {
     for dir in dirs {
-        // read_staging_generation_marker reports the FIRST bound
-        // generation; the dual marker's membership check is inside the
-        // writer path — finalize unconditionally on dual/old bindings.
-        if crate::cache::read_staging_generation_marker(dir)
-            .await?
-            .is_some()
+        // Finalize only roots this process may rebind (§6.2 item 10): ANY
+        // bound generation that is Match-or-ScopeUpgrade against the new
+        // staging generation qualifies — after phase 1 the dual marker's
+        // SECOND entry is the new generation, which is why the whole
+        // binding set is read rather than only the first. A root bound to
+        // a PEER's node scope is left untouched: the pre-item-10 code
+        // finalized any marker at all, which would have re-stamped
+        // another node's staging root to this node's generation.
+        let bindings = crate::cache::read_staging_generation_bindings(dir).await;
+        if bindings
+            .iter()
+            .any(|g| crate::writer_scope::marker_is_rebindable(g, new_generation))
         {
             crate::cache::write_staging_generation_marker(dir, new_generation).await?;
         }
@@ -1856,6 +1909,9 @@ pub async fn add_meta_volume_with(
             )
         }
     };
+    // §6.2 item 10: the marker binds the NODE-SCOPED staging generation on
+    // a stamped set (byte-identical to `old_gen` on every other set).
+    let old_gen = staging_generation_for_set(meta_lvs, &old_gen).await;
 
     let (epoch, new_position, resume) = match &dev_stamp {
         Some(st) => (st.set_epoch, st.member_position, true),
@@ -2001,9 +2057,14 @@ pub async fn add_meta_volume_with(
     let new_gen = {
         let mut uris: Vec<String> = meta_lvs.to_vec();
         uris.push(device.to_string());
-        crate::meta_backend::volume_set_generation(&uris)
-            .await
-            .unwrap_or_else(|_| old_gen.clone())
+        match crate::meta_backend::volume_set_generation(&uris).await {
+            // The NEW set resolves its OWN scope (see
+            // `staging_generation_for_set`): a fresh member without the bit
+            // makes the extended set un-scoped, and the roots must be
+            // stamped the way the next mount will compute them.
+            Ok(g) => staging_generation_for_set(&uris, &g).await,
+            Err(_) => old_gen.clone(),
+        }
     };
     staging_rebind_prepare(&staging_dirs, &old_gen, &new_gen).await?;
 
@@ -2132,6 +2193,7 @@ pub async fn add_meta_volume_with(
     let mut new_uris: Vec<String> = meta_lvs.to_vec();
     new_uris.push(device.to_string());
     let new_gen = crate::meta_backend::volume_set_generation(&new_uris).await?;
+    let new_gen = staging_generation_for_set(&new_uris, &new_gen).await;
     staging_rebind_finalize(&staging_dirs, &new_gen).await?;
     update_meta_config_mirror(&new_uris).await?;
     Ok(taken)
@@ -2172,6 +2234,8 @@ pub async fn remove_meta_volume(meta_lvs: &[String], victim: &str) -> Result<()>
     let cfg = read_volume_format_config(meta_lvs).await.ok();
     let staging_dirs = staging_isolated_roots(cfg.as_ref());
     let old_gen = crate::meta_backend::volume_set_generation(meta_lvs).await?;
+    // §6.2 item 10 (see `staging_generation_for_set`).
+    let old_gen = staging_generation_for_set(meta_lvs, &old_gen).await;
     let survivors_paths: Vec<String> = members
         .iter()
         .enumerate()
@@ -2225,9 +2289,12 @@ pub async fn remove_meta_volume(meta_lvs: &[String], victim: &str) -> Result<()>
 
     // KD-8 phase 1: refuse pending write custody + dual-mark the roots
     // (durable staged payloads rebind across the change).
-    let new_gen_planned = crate::meta_backend::volume_set_generation(&survivors_paths)
-        .await
-        .unwrap_or_else(|_| old_gen.clone());
+    let new_gen_planned = match crate::meta_backend::volume_set_generation(&survivors_paths).await {
+        // The SURVIVOR set resolves its own scope (see
+        // `staging_generation_for_set`).
+        Ok(g) => staging_generation_for_set(&survivors_paths, &g).await,
+        Err(_) => old_gen.clone(),
+    };
     staging_rebind_prepare(&staging_dirs, &old_gen, &new_gen_planned).await?;
 
     // Bit 4 everywhere (extended stamps + guest records ahead).
@@ -2328,6 +2395,7 @@ pub async fn remove_meta_volume(meta_lvs: &[String], victim: &str) -> Result<()>
 
     // KD-8 phase 2 + mirror on the survivor set.
     let new_gen = crate::meta_backend::volume_set_generation(&survivors_paths).await?;
+    let new_gen = staging_generation_for_set(&survivors_paths, &new_gen).await;
     staging_rebind_finalize(&staging_dirs, &new_gen).await?;
     update_meta_config_mirror(&survivors_paths).await?;
     Ok(())

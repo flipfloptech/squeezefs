@@ -255,6 +255,58 @@ pub const FEATURE_INCOMPAT_KV_PARTITIONED_APPEND: u64 = 1 << 8;
 /// append landed first, so durable block references took the next one.
 pub const FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS: u64 = 1 << 9;
 
+/// Bit index of [`FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING`] — named so
+/// refusal messages can print it without re-deriving a shift.
+pub const WRITER_SCOPED_STAGING_BIT: u32 = 10;
+
+/// `features_incompat` bit 10: **writer-scoped staging** (pre-RC
+/// engineering spec §6.2 **items 8 and 10**; ruling **D9**). The set's
+/// node-private staged payloads are LABELLED with the writing node, in
+/// both places where the label is needed:
+///
+/// * **item 8, the record level** — `active_block:`,
+///   `active_block_ext:` and `mapping:` keys carry a trailing
+///   `:w_{16 hex}` writer-scope component
+///   ([`crate::writer_scope::scoped_key_suffix`]), appended AFTER the
+///   existing identity components so every historical scan prefix
+///   (`active_block:inode_{ino}:`) keeps its meaning — the same
+///   reservation `TREE_BLOCK_REFS` made for a writer id after
+///   `block_index` (docs/design-durable-block-refcounts.md §3.2);
+/// * **item 10, the root level** — the staging generation marker binds
+///   `{volume-set generation}@node:{16 hex}` instead of the set
+///   generation alone, so a peer's staging root can no longer pass this
+///   node's generation gate.
+///
+/// The two engage from ONE bit because a half-engaged state is unsound in
+/// both directions: labelled records under a node-blind root gate still
+/// let a peer's whole root be adopted, and a node-scoped root whose
+/// records are unlabelled cannot classify the records inside it.
+///
+/// **Presence is OPTIONAL and this binary NEVER STAMPS IT** (ruling D9,
+/// the bit-7/8/9 posture): [`SuperblockV3::plan`] does not set it, mount
+/// does not set it, and no runtime path sets it —
+/// [`set_writer_scoped_staging_bit`] is the sole stamping path, for the
+/// Phase-8 batched reformat window. A volume without the bit behaves
+/// EXACTLY as today: byte-identical keys, byte-identical marker bytes,
+/// and pre-change staged work recovers unchanged (pinned by
+/// `tests/writer_scoped_staging_tests.rs`).
+///
+/// Old binaries refuse a bit-10 volume loud via their own
+/// [`FEATURES_INCOMPAT_KNOWN`] gate (the bit intersects no prior mask),
+/// which is exactly right: they would mint UNSCOPED keys onto a set whose
+/// peers' records are scoped, and their generation gate would adopt or
+/// wipe any staging root of the set regardless of which node populated
+/// it.
+///
+/// **Bit 10, not 8 or 9** — bit 8 is
+/// [`FEATURE_INCOMPAT_KV_PARTITIONED_APPEND`] and bit 9 is
+/// [`FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS`]; both were once claimed in
+/// parallel against the same free bit, which is silent on-disk aliasing.
+/// Disjointness of the whole set is pinned as a test
+/// (`incompat_bits_are_single_bit_and_pairwise_disjoint`), so a repeat is
+/// a red gate rather than a field mystery.
+pub const FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING: u64 = 1 << WRITER_SCOPED_STAGING_BIT;
+
 /// Incompat feature bits this binary understands. Any other set bit
 /// refuses the mount naming the bit (§6.1).
 pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
@@ -266,7 +318,8 @@ pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
     | FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING
     | FEATURE_INCOMPAT_KV_DURABLE_TERM
     | FEATURE_INCOMPAT_KV_PARTITIONED_APPEND
-    | FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS;
+    | FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS
+    | FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING;
 
 /// Read-only feature bits this binary understands (none yet — §4.11
 /// reserves the mechanism for snapshots). Unknown bits mount read-only.
@@ -1168,6 +1221,32 @@ pub async fn set_block_refcounts_bit(path: &Path) -> Result<bool, KvError> {
         path,
         FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS,
         "durable-block-refcounts",
+    )
+    .await
+}
+
+/// Stamp [`FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING`] on `path`'s
+/// superblock — the §6.2 items-8/10 upgrade path (the batched Phase-8
+/// reformat window; **mount NEVER calls this**). Returns whether the bit
+/// was newly set. The volume must be offline (the caller holds the D0
+/// guard) AND every member of the set must be stamped before the next
+/// mount, because scope engagement requires unanimity
+/// ([`crate::writer_scope::resolve_scope_for_set`]) — a half-stamped set
+/// simply mounts unscoped, which is safe but pointless.
+///
+/// Ordering note, same class as bits 7 and 9: the bit gates no
+/// silently-misdecoded record. A pre-items-8/10 binary refuses a stamped
+/// volume outright, and scoped keys / node-scoped markers only ever come
+/// from a mount that saw the bit — so stamp-then-crash is inert. The
+/// first mount after the stamp finds its staging roots bound to the
+/// UN-scoped generation, adopts them (the `ScopeUpgrade` arm — durable
+/// acked staged payloads are never discarded by the upgrade) and
+/// re-stamps them node-scoped.
+pub async fn set_writer_scoped_staging_bit(path: &Path) -> Result<bool, KvError> {
+    set_incompat_bit(
+        path,
+        FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING,
+        "writer-scoped-staging",
     )
     .await
 }

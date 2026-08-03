@@ -8771,9 +8771,10 @@ impl DataRouter {
         // handler's "check active block staging first" leg (short serves
         // included: a shorter staged image returns short, exactly as the
         // handler would).
-        let cache_key = crate::keys::StackKey::format(format_args!(
-            "active_block:{file_path}:block_{start_block}"
-        ));
+        // Scoped stack mint (§6.2 item 8): the same key the heap helper
+        // produces, scope component included — an unscoped probe against
+        // scoped records would miss our own staged bytes.
+        let cache_key = crate::keys::active_block_path_stack(file_path, start_block);
         let heap_key;
         let cache_key: &str = match &cache_key {
             Some(k) => k,
@@ -12096,8 +12097,8 @@ impl DataRouter {
     /// clean block, so the demotion costs nothing on the warm path).
     /// One latch-free occupancy-index probe, stack-formatted key.
     pub(crate) fn has_staged_extent_runs(&self, file_path: &str, b: u32) -> bool {
-        match crate::keys::StackKey::format(format_args!("active_block_ext:{file_path}:block_{b}"))
-        {
+        // Scoped stack mint (§6.2 item 8) — see `active_block_path_stack`.
+        match crate::keys::active_block_ext_path_stack(file_path, b) {
             Some(key) => self.cache.nvme.has_staged_extent_record(&key),
             None => {
                 // Pathological path length: heap key, same probe.
@@ -12895,6 +12896,13 @@ impl DataRouter {
         }
         keys.sort_unstable();
         keys.dedup();
+        // §6.2 item 8: the prefix scans above match EVERY writer's records
+        // for this path (the scope is a trailing component, deliberately —
+        // classification needs visibility). Retire only records we own: a
+        // foreign writer's staged payload lives in ITS staging ring, and
+        // removing its record here would destroy custody we cannot even
+        // read. Unscoped (legacy) keys are ours by grandfathering.
+        keys.retain(|k| crate::writer_scope::key_is_mine(k));
         let _ = self.cache.nvme.remove_active_blocks_async(keys).await;
 
         self.cache.write_lru.remove(file_path);

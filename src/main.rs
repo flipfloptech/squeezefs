@@ -4695,7 +4695,35 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // `generation`. Every entry reply used to hardcode `1`, so a
             // handle minted before a `format` resolved against the same ino
             // in the NEW filesystem instead of returning ESTALE.
+            //
+            // Deliberately the UN-scoped set generation: an NFS handle
+            // names a filesystem, not a node (§6.2 item 10) — folding node
+            // identity in would ESTALE every handle when the set is served
+            // from a different host.
             squeezefs::fuse_client::set_entry_generation(&fs_generation);
+
+            // §6.2 items 8/10 (incompat bit 10, ruling D9 — nothing stamps
+            // it today, so this resolves to `None` on every shipped
+            // volume): a writer-scoped set labels its staging keys and its
+            // staging-generation stamp with this NODE's identity, so a
+            // peer's records and a peer's staging root can be classified
+            // instead of silently adopted.
+            let writer_scope = squeezefs::writer_scope::resolve_scope_for_set(&meta_lvs).await?;
+            squeezefs::writer_scope::engage(writer_scope);
+            let staging_generation =
+                squeezefs::writer_scope::staging_generation(&fs_generation, writer_scope);
+            match writer_scope {
+                Some(token) => log::info!(
+                    "writer-scoped staging ENGAGED: node scope w_{token:016x} \
+                     (staging generation \"{staging_generation}\") — staging keys carry \
+                     the scope and this node's staging roots are bound to it"
+                ),
+                None => log::debug!(
+                    "writer-scoped staging disengaged (volume set does not carry incompat \
+                     bit {}) — keys and staging stamps are byte-identical to prior releases",
+                    squeezefs::meta_backend::kv::superblock::WRITER_SCOPED_STAGING_BIT
+                ),
+            }
 
             let cache = TieredCache::new(
                 active_staging_dirs.clone(),
@@ -4705,7 +4733,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Some(&resolved_write_cache_size),
                 block_alloc.clone(),
                 nvme_dev.clone(),
-                Some(&fs_generation),
+                Some(&staging_generation),
             )
             .await?;
 

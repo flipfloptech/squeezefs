@@ -459,6 +459,16 @@ impl ImageBuilder {
             sb.features_incompat |= super::superblock::FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS;
         }
 
+        // **Test seam** (`SQUEEZEFS_TEST_STAMP_WRITER_SCOPE=1`): stamp
+        // incompat bit 10 (§6.2 items 8/10 — writer-scoped staging) at
+        // format, the same posture and for the same reason as the block-refs
+        // seam above: production formats never carry it (ruling D9), so this
+        // is the only way to point the staging/extent/recovery suites at the
+        // scoped key + node-scoped stamp path end to end.
+        if crate::env_knobs::bool_knob("SQUEEZEFS_TEST_STAMP_WRITER_SCOPE", false) {
+            sb.features_incompat |= super::superblock::FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING;
+        }
+
         // §9 quick-format hygiene: zero SB + ledger + ring + bitmap.
         zero_range(path, 0, sb.heap.start).await?;
 

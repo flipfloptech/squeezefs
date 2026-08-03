@@ -253,6 +253,8 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_TEST_NVME_READ_TIMEOUT_MS", int(1, MS_MAX), "30000", "Test seam: NVMe read timeout, ms."),
     k("SQUEEZEFS_TEST_POWER_CUT_DEVS", Kind::Str, "none", "Test seam: comma list of device paths armed for the power-cut simulator."),
     k("SQUEEZEFS_TEST_STAMP_BLOCK_REFS", Kind::Bool, "0", "Test seam: stamp incompat bit 8 (durable block refcounts) at format, so a suite can point the write-path fixtures at the durable ledger and let the §6.2-item-1 oracle grade them. Never set in production — `format` never stamps bit 8 (ruling D9)."),
+    k("SQUEEZEFS_TEST_STAMP_WRITER_SCOPE", Kind::Bool, "0", "Test seam: stamp incompat bit 10 (writer-scoped staging — §6.2 items 8/10) at format, so a suite can drive the scoped-key + node-scoped-stamp path end to end. Never set in production — `format` never stamps bit 10 (ruling D9)."),
+    k("SQUEEZEFS_NODE_ID_FILE", Kind::Str, "none", "Node-identity source file, ahead of /etc/machine-id, /var/lib/dbus/machine-id and /etc/squeezefs/node-id (writer-scoped staging, §6.2 item 10). Also the suites' two-node seam; the file's bytes must be host-stable and reboot-stable."),
     // -- Harness-only variables (suites, rigs, re-exec children) ---------
     k("SQUEEZEFS_TEST_REQUIRE_MOUNT", Kind::Harness, "-", "Turn mount-class skips into failures (TEST-2)."),
     k("SQUEEZEFS_TEST_REQUIRE_ALL", Kind::Harness, "-", "Promote every skip class to a failure."),

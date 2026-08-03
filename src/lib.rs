@@ -112,6 +112,10 @@ pub mod version;
 pub mod write_cache;
 pub mod write_pipeline;
 pub(crate) mod write_pipeline_core;
+/// Spec §6.2 items 8/10: the node-scoped writer identity that labels
+/// staging keys and staging-generation stamps (incompat bit 10 — built,
+/// never stamped, ruling D9).
+pub mod writer_scope;
 pub mod zcrx_lane;
 
 use parking_lot::RwLock;
@@ -412,6 +416,25 @@ pub mod keys {
     use compact_str::CompactString;
     use std::fmt::Write;
 
+    /// Append this process's writer-scope component (spec §6.2 item 8) —
+    /// a no-op, byte-for-byte, on every un-stamped volume set (ruling D9:
+    /// nothing stamps incompat bit 10 today, so this is the shipped path).
+    ///
+    /// The scope goes LAST, after the identity components, which is what
+    /// keeps every historical scan prefix (`active_block:inode_{ino}:`,
+    /// `active_block_ext:{file_path}:`) matching its own records — the
+    /// same reservation the durable-block-refcount key layout made for a
+    /// writer id after `block_index`
+    /// (docs/design-durable-block-refcounts.md §3.2). Recovery classifies
+    /// with [`crate::writer_scope::classify_key`]; the visibility is
+    /// deliberate — a foreign record must be SEEN to be classified.
+    #[inline]
+    fn push_writer_scope(s: &mut CompactString) {
+        if let Some(suffix) = crate::writer_scope::scoped_key_suffix() {
+            s.push_str(suffix.as_str());
+        }
+    }
+
     /// Fixed-capacity **stack** key: zero-heap formatting for the sync
     /// serve prelude (the 2026-07-28 op-economy campaign — every heap key
     /// on the warm §5.5.1 fast path was a convicted allocation site).
@@ -450,6 +473,26 @@ pub mod keys {
             Some(k)
         }
 
+        /// [`Self::format`] plus this process's writer-scope component
+        /// (§6.2 item 8) — the scoped mint for the zero-heap staging-key
+        /// paths. `None` on capacity overflow, INCLUDING the overflow the
+        /// suffix itself would cause: a stack key that cannot hold its
+        /// scope must fall back to the heap helper, never emit an
+        /// unscoped key that a peer could collide with.
+        #[inline]
+        pub fn format_scoped(args: std::fmt::Arguments<'_>) -> Option<Self> {
+            let mut k = Self::format(args)?;
+            if let Some(suffix) = crate::writer_scope::scoped_key_suffix() {
+                let end = k.len.checked_add(suffix.len())?;
+                if end > k.buf.len() {
+                    return None;
+                }
+                k.buf[k.len..end].copy_from_slice(suffix.as_bytes());
+                k.len = end;
+            }
+            Some(k)
+        }
+
         #[inline]
         pub fn as_str(&self) -> &str {
             // SAFETY-free: only whole `&str`s were copied in, at valid
@@ -471,11 +514,28 @@ pub mod keys {
         StackKey::format(format_args!("inode_{ino}")).expect("inode path fits StackKey capacity")
     }
 
-    /// Zero-heap `active_block:inode_{ino}:block_{block}` (fits always).
+    /// Zero-heap `active_block:inode_{ino}:block_{block}` plus the
+    /// writer scope when engaged (fits always: 66 + 19 ≤ 192).
     #[inline]
     pub fn active_block_stack(ino: u64, block: u64) -> StackKey {
-        StackKey::format(format_args!("active_block:inode_{ino}:block_{block}"))
+        StackKey::format_scoped(format_args!("active_block:inode_{ino}:block_{block}"))
             .expect("active_block key fits StackKey capacity")
+    }
+
+    /// Zero-heap scoped `active_block:{file_path}:block_{block}` — the
+    /// path-form twin of [`active_block_stack`]. `None` on capacity
+    /// overflow (pathological path length): the caller falls back to
+    /// [`active_block_for_path`], which is scoped too.
+    #[inline]
+    pub fn active_block_path_stack(file_path: &str, block: u32) -> Option<StackKey> {
+        StackKey::format_scoped(format_args!("active_block:{file_path}:block_{block}"))
+    }
+
+    /// Zero-heap scoped `active_block_ext:{file_path}:block_{block}` (the
+    /// W2 existence-probe key; see [`active_block_path_stack`]).
+    #[inline]
+    pub fn active_block_ext_path_stack(file_path: &str, block: u32) -> Option<StackKey> {
+        StackKey::format_scoped(format_args!("active_block_ext:{file_path}:block_{block}"))
     }
 
     /// Logical file path used as the in-process cache / layout identity: `inode_{ino}`.
@@ -523,33 +583,45 @@ pub mod keys {
         FsKey(s)
     }
 
-    /// Staged-file mapping hash key: `mapping:{file_id}`.
+    /// Staged-file mapping hash key: `mapping:{file_id}` (+ the writer
+    /// scope when engaged — §6.2 item 8).
     #[inline]
     pub fn mapping(file_id: &str) -> FsKey {
         let mut s = CompactString::with_capacity(8 + file_id.len());
         s.push_str("mapping:");
         s.push_str(file_id);
+        push_writer_scope(&mut s);
         FsKey(s)
     }
 
-    /// Active-block buffer / staging key: `active_block:inode_{ino}:block_{block}`.
+    /// Active-block buffer / staging key: `active_block:inode_{ino}:block_{block}`
+    /// (+ the writer scope when engaged — §6.2 item 8).
     #[inline]
     pub fn active_block(ino: u64, block: u64) -> FsKey {
         let mut s = CompactString::with_capacity(40);
         let _ = write!(s, "active_block:inode_{ino}:block_{block}");
+        push_writer_scope(&mut s);
         FsKey(s)
     }
 
     /// Active-block key when `file_path` is already `inode_N`:
-    /// `active_block:{file_path}:block_{block}`.
+    /// `active_block:{file_path}:block_{block}` (+ the writer scope).
     #[inline]
     pub fn active_block_for_path(file_path: &str, block: u32) -> FsKey {
         let mut s = CompactString::with_capacity(24 + file_path.len());
         let _ = write!(s, "active_block:{file_path}:block_{block}");
+        push_writer_scope(&mut s);
         FsKey(s)
     }
 
     /// Scan prefix for an inode's active blocks: `active_block:inode_{ino}:`.
+    ///
+    /// Deliberately **unscoped**: the writer scope is a trailing key
+    /// component, so this prefix still matches every writer's records for
+    /// the ino — which is what lets recovery SEE a foreign record in order
+    /// to classify it ([`crate::writer_scope::classify_key`]). Sites that
+    /// mean "mine only" filter with
+    /// [`crate::writer_scope::key_is_mine`].
     #[inline]
     pub fn active_block_ino_prefix(ino: u64) -> CompactString {
         let mut s = CompactString::with_capacity(28);
@@ -557,7 +629,9 @@ pub mod keys {
         s
     }
 
-    /// Scan prefix when `file_path` is already `inode_N`: `active_block:{file_path}:`.
+    /// Scan prefix when `file_path` is already `inode_N`:
+    /// `active_block:{file_path}:` (unscoped — see
+    /// [`active_block_ino_prefix`]).
     #[inline]
     pub fn active_block_path_prefix(file_path: &str) -> CompactString {
         let mut s = CompactString::with_capacity(14 + file_path.len());
@@ -578,20 +652,23 @@ pub mod keys {
     pub fn active_block_ext(ino: u64, block: u64) -> FsKey {
         let mut s = CompactString::with_capacity(44);
         let _ = write!(s, "active_block_ext:inode_{ino}:block_{block}");
+        push_writer_scope(&mut s);
         FsKey(s)
     }
 
     /// Extent-record key when `file_path` is already `inode_N`:
-    /// `active_block_ext:{file_path}:block_{block}`.
+    /// `active_block_ext:{file_path}:block_{block}` (+ the writer scope).
     #[inline]
     pub fn active_block_ext_for_path(file_path: &str, block: u32) -> FsKey {
         let mut s = CompactString::with_capacity(28 + file_path.len());
         let _ = write!(s, "active_block_ext:{file_path}:block_{block}");
+        push_writer_scope(&mut s);
         FsKey(s)
     }
 
     /// Scan prefix for an inode's staged extent records:
-    /// `active_block_ext:inode_{ino}:`.
+    /// `active_block_ext:inode_{ino}:` (unscoped — see
+    /// [`active_block_ino_prefix`]).
     #[inline]
     pub fn active_block_ext_ino_prefix(ino: u64) -> CompactString {
         let mut s = CompactString::with_capacity(32);

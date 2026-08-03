@@ -298,9 +298,13 @@ pub struct FsckCtx {
     pub expected_generation: Option<String>,
 }
 
-/// The volume-set generation of an OPEN set (the
+/// The STAGING generation of an OPEN set (the
 /// [`crate::meta_backend::volume_set_generation`] string computed from
-/// the live superblocks, volume order preserved).
+/// the live superblocks, volume order preserved) — decorated with this
+/// node's writer scope when every member carries incompat bit 10 (§6.2
+/// item 10), because that is what the staging markers this value is
+/// compared against actually hold. Byte-identical to the bare set
+/// generation on every un-stamped set.
 pub fn volume_generation(meta: &RoutedMetaBackend) -> String {
     use std::fmt::Write as _;
     let mut parts = Vec::with_capacity(meta.volumes.len());
@@ -312,7 +316,13 @@ pub fn volume_generation(meta: &RoutedMetaBackend) -> String {
         }
         parts.push(s);
     }
-    parts.join("|")
+    let set = parts.join("|");
+    let scope = crate::writer_scope::scope_for_features(
+        meta.volumes
+            .iter()
+            .map(|kv| kv.superblock().features_incompat),
+    );
+    crate::writer_scope::staging_generation(&set, scope)
 }
 
 // ---------------------------------------------------------------------------
@@ -1259,7 +1269,11 @@ async fn scan_staging(
         // C5: generation validity.
         if let Some(expected) = &expected_generation {
             match crate::cache::nvme::read_staging_generation_marker(dir).await {
-                Ok(Some(found)) if &found == expected => {}
+                // §6.2 item 10: a root still bound to the UN-scoped
+                // generation of a now-scoped set is the pre-upgrade shape
+                // the next mount adopts, not a finding
+                // (`marker_is_rebindable` = Match | ScopeUpgrade).
+                Ok(Some(found)) if crate::writer_scope::marker_is_rebindable(&found, expected) => {}
                 Ok(Some(found)) => suspects.push(Suspect {
                     kind: SuspectKind::C5Generation {
                         dir: dir.clone(),
@@ -1683,7 +1697,11 @@ async fn recheck_suspects(
                 // Re-read the marker (a live restamp clears).
                 let expected = ctx.expected_generation.as_deref().unwrap_or("");
                 match crate::cache::nvme::read_staging_generation_marker(dir).await {
-                    Ok(Some(found)) if found == expected => None,
+                    Ok(Some(found))
+                        if crate::writer_scope::marker_is_rebindable(&found, expected) =>
+                    {
+                        None
+                    }
                     _ => Some(FsckFinding {
                         class: "C5".to_string(),
                         object: dir.display().to_string(),
@@ -3083,7 +3101,7 @@ pub async fn repair(
                     continue;
                 };
                 let stale = match crate::cache::nvme::read_staging_generation_marker(dir).await {
-                    Ok(Some(found)) => found != expected,
+                    Ok(Some(found)) => !crate::writer_scope::marker_is_rebindable(&found, expected),
                     Ok(None) => {
                         crate::cache::nvme::dir_has_segment_data(&dir.join("staging_segment"))
                     }

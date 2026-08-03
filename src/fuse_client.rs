@@ -685,6 +685,9 @@ pub fn set_parked_cap_buffers(v: u64) {
 /// Path-form keys (`active_block:{file_path}:block_{b}` with a non-`inode_`
 /// path) return `None`: they never name striped fold custody.
 fn parse_block_family_key(key: &str) -> Option<(u64, u32)> {
+    // Tolerates the §6.2-item-8 writer-scope component (see
+    // `writer_scope::strip_key_scope`).
+    let key = crate::writer_scope::strip_key_scope(key);
     let rest = key
         .strip_prefix("active_block_ext:")
         .or_else(|| key.strip_prefix("active_block:"))?;
@@ -3796,6 +3799,30 @@ pub struct Metrics {
     /// bind_staging_generation`). One increment per discarded dir; exactly
     /// once per dir after a reformat, 0 on every warm restart.
     pub staging_generation_discards: Align64<AtomicU64>,
+    /// §6.2 item 10: staging roots adopted through the Phase-8 writer-scope
+    /// UPGRADE arm — bound to the un-scoped set generation, re-stamped
+    /// node-scoped with their content kept (`cache::nvme::
+    /// bind_staging_generation`). Exactly once per root after the bit is
+    /// stamped, 0 forever after, and 0 on every un-stamped volume set.
+    pub staging_scope_upgrades: Align64<AtomicU64>,
+    /// §6.2 item 10 **tripwire**: mounts refused because a staging root is
+    /// bound to ANOTHER node's writer scope while holding live staged write
+    /// custody. Never wiped, never flushed — a peer's acked custody. Must
+    /// stay 0; nonzero means two nodes' mounts share a staging path.
+    pub staging_foreign_scope_refusals: Align64<AtomicU64>,
+    /// §6.2 item 10: foreign-scoped staging roots whose content was DEAD
+    /// (no live staged custody) and therefore discarded losslessly.
+    pub staging_foreign_scope_discards: Align64<AtomicU64>,
+    /// §6.2 item 8 **tripwire**: recovered staging records whose writer
+    /// scope this mount cannot claim — never adopted, never budget-counted,
+    /// never flushed or freed, left intact. Must stay 0 on a node-private
+    /// staging root.
+    pub staging_foreign_scope_records: Align64<AtomicU64>,
+    /// §6.2 item 8: staged extent records skipped by the W2 mount sweep
+    /// because they carry a foreign writer scope (the sweep's own
+    /// classification arm — counted apart from torn/stale/future so the
+    /// recovery classes stay clean).
+    pub extent_records_foreign_scope: Align64<AtomicU64>,
     /// PR VL5b (§5.5.2a): mutating routed-meta ops parked at a CLOSED
     /// per-slot cutover gate (before any 4a lock — planned, bounded
     /// parks; NEVER escalated to `disabled_volumes`). One increment per
@@ -5887,7 +5914,13 @@ impl SqueezefsFilesystem {
 
         for key in self.router.cache.nvme.list_staged_files() {
             if key.starts_with("active_block:") {
-                let parts: Vec<&str> = key.split(':').collect();
+                // Writer-scope-tolerant (§6.2 item 8): the scope is a
+                // trailing component, and `active_write_block_count` is
+                // what `squeezefs umount` reads to decide whether staged
+                // custody is unflushed — losing scoped keys from it would
+                // report a dirty ring as clean.
+                let unscoped = crate::writer_scope::strip_key_scope(&key);
+                let parts: Vec<&str> = unscoped.split(':').collect();
                 if parts.len() == 3 {
                     active_write_block_count += 1;
                     if !key_census {
@@ -6259,6 +6292,15 @@ impl SqueezefsFilesystem {
                 "bg_spawn_rejected": METRICS.bg_spawn_rejected.load(Ordering::Relaxed),
                 "uring_queue_full": METRICS.uring_queue_full.load(Ordering::Relaxed),
                 "staging_generation_discards": METRICS.staging_generation_discards.load(Ordering::Relaxed),
+                "staging_writer_scope": match crate::writer_scope::engaged_scope() {
+                    Some(t) => format!("w_{t:016x}"),
+                    None => "none".to_string(),
+                },
+                "staging_scope_upgrades": METRICS.staging_scope_upgrades.load(Ordering::Relaxed),
+                "staging_foreign_scope_refusals": METRICS.staging_foreign_scope_refusals.load(Ordering::Relaxed),
+                "staging_foreign_scope_discards": METRICS.staging_foreign_scope_discards.load(Ordering::Relaxed),
+                "staging_foreign_scope_records": METRICS.staging_foreign_scope_records.load(Ordering::Relaxed),
+                "extent_records_foreign_scope": METRICS.extent_records_foreign_scope.load(Ordering::Relaxed),
                 "meta_slot_gate_parked_commits": METRICS.meta_slot_gate_parked_commits.load(Ordering::Relaxed),
                 "meta_slot_migrations": METRICS.meta_slot_migrations.load(Ordering::Relaxed),
                 "meta_slot_records_copied": METRICS.meta_slot_records_copied.load(Ordering::Relaxed),
@@ -8413,7 +8455,20 @@ impl SqueezefsFilesystem {
         let mut valid: Vec<(String, u64, u64)> = Vec::with_capacity(keys.len());
         let mut newest_stamp: std::collections::HashMap<u64, u64> =
             std::collections::HashMap::new();
+        let mut foreign = 0usize;
         for key in keys {
+            // §6.2 item 8, BEFORE any other classification: a record whose
+            // writer scope we cannot claim is not ours to validate, fold,
+            // discard or stamp-judge. Its payload lives in the writing
+            // node's staging ring; the fencing rules below are about OUR
+            // eras. Left intact, counted, and reported in the loud line.
+            if !crate::writer_scope::key_is_mine(&key) {
+                METRICS
+                    .extent_records_foreign_scope
+                    .fetch_add(1, Ordering::Relaxed);
+                foreign += 1;
+                continue;
+            }
             let Some((ino, _b)) = Self::parse_extent_record_key(&key) else {
                 // Unparseable key shape: treat as torn (loud discard).
                 self.dispose_bad_extent_record(
@@ -8459,15 +8514,16 @@ impl SqueezefsFilesystem {
                 .fetch_add(1, Ordering::Relaxed);
             recovered += 1;
         }
-        if recovered > 0 || stale > 0 {
+        if recovered > 0 || stale > 0 || foreign > 0 {
             // The forward-detection loud line (the bind_staging_generation
             // loudness class): a clean shutdown drains every record, so
             // this population is kill-9-class residue — and the named
             // detection surface for the below-RW4 downgrade residual.
             let msg = format!(
                 "EXTENT RECORDS AT MOUNT: {recovered} recovered, {stale} discarded \
-                 (stale fencing) — staging was not cleanly drained (crash residue); \
-                 recovered records remain readable and fold on fsync/writeback"
+                 (stale fencing), {foreign} left to another writer (foreign scope) — \
+                 staging was not cleanly drained (crash residue); recovered records \
+                 remain readable and fold on fsync/writeback"
             );
             eprintln!("{msg}");
             warn!("{msg}");
@@ -8475,8 +8531,10 @@ impl SqueezefsFilesystem {
         recovered
     }
 
-    /// `(ino, block)` of an `active_block_ext:inode_{ino}:block_{b}` key.
+    /// `(ino, block)` of an `active_block_ext:inode_{ino}:block_{b}` key
+    /// (writer-scope-tolerant — §6.2 item 8).
     fn parse_extent_record_key(key: &str) -> Option<(u64, u32)> {
+        let key = crate::writer_scope::strip_key_scope(key);
         let rest = key.strip_prefix("active_block_ext:inode_")?;
         let (ino_str, block_str) = rest.split_once(":block_")?;
         Some((ino_str.parse().ok()?, block_str.parse().ok()?))
@@ -11214,7 +11272,10 @@ impl SqueezefsFilesystem {
         removed
     }
 
+    /// `(ino, block)` of an `active_block:inode_{ino}:block_{b}` key
+    /// (writer-scope-tolerant — §6.2 item 8).
     fn parse_active_block_key(key: &str) -> Option<(u64, u32)> {
+        let key = crate::writer_scope::strip_key_scope(key);
         let rest = key.strip_prefix("active_block:inode_")?;
         let (ino_str, block_str) = rest.split_once(":block_")?;
         Some((ino_str.parse().ok()?, block_str.parse().ok()?))
@@ -11926,6 +11987,12 @@ impl SqueezefsFilesystem {
         // FIRST — fold consumes any staged-full sibling as its seed base,
         // so the ordinary sweep below never flushes a superseded image.
         for key in self.router.cache.nvme.extent_record_keys("") {
+            // §6.2 item 8: never fold another writer's record — the clean
+            // unmount mandate ("a clean staging dir carries none") is about
+            // OUR records; a foreign one has no inode custody here.
+            if !crate::writer_scope::key_is_mine(&key) {
+                continue;
+            }
             let Some((ino, b)) = Self::parse_extent_record_key(&key) else {
                 continue;
             };
@@ -11941,7 +12008,10 @@ impl SqueezefsFilesystem {
 
         let mut active_keys = Vec::new();
         for key in keys {
-            if key.starts_with("active_block:") {
+            // §6.2 item 8: `key_is_mine` keeps a peer's whole-image record
+            // out of OUR teardown flush — we hold neither its payload nor
+            // its inode custody (unscoped keys are ours by grandfathering).
+            if key.starts_with("active_block:") && crate::writer_scope::key_is_mine(&key) {
                 active_keys.push(key);
             }
         }

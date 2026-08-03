@@ -1030,7 +1030,7 @@ plane — the shipped default), `idle` (armed, no members) or `armed`:
 | `free_grace_laggard_fences` | readers evicted for not acknowledging. Investigate alongside `membership_renewals` — a reader renewing but not acknowledging is a revalidation problem, not a network one |
 | `free_grace_alloc_stalls` | allocations that refused ENOSPC with offsets held. Expected only on a genuinely full store; sustained growth means the readers are too slow for the write rate (raise capacity, or shorten the cycle with `SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS` / `SQUEEZEFS_META_REVALIDATE_MS`) |
 | `free_grace_bound` | the label the writer may reallocate up to; `free_grace_fence_bound_ms` / `free_grace_pressure_bound_ms` / `free_grace_ring_cap` publish the derived numbers in force so this page cannot drift from them |
-| `free_grace_reader_acks` (reader side) | acknowledgements this reader has emitted. **Flat while the writer churns is the failure to look for** — it means this reader is holding the writer's free list |
+| `free_grace_reader_acks` (reader side — a reader's `.stats` reads `free_grace_mode: "reader"`, beside `free_grace_{learned,acked,reader_pending}_label`) | acknowledgements this reader has emitted. **Flat while the writer churns is the failure to look for** — it means this reader is holding the writer's free list. `learned` moving with `acked` flat says the revalidation pass is not advancing (check `meta_kv_revalidate_epochs`); a standing `reader_pending_label` says an acknowledgement is waiting out its drain window, which is normal |
 
 ## Observability
 

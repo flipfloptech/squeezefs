@@ -894,6 +894,21 @@ pub fn reader_acks() -> u64 {
 /// broken plane.
 pub fn stats_snapshot() -> serde_json::Value {
     if PLANE.load().is_none() {
+        // A READER holds no plane and no ring — its item-3 face is what it
+        // has acknowledged. Exported under its own posture word so an
+        // operator can tell "this mount is answering for the writer's free
+        // list" from "no plane here at all", which are opposite
+        // conditions that would otherwise both read `off`.
+        if let Some(session) = crate::membership::installed_member() {
+            let (label, _) = session.learned_label();
+            return serde_json::json!({
+                "free_grace_mode": "reader",
+                "free_grace_reader_acks": reader_acks(),
+                "free_grace_acked_label": session.acked_free_epoch(),
+                "free_grace_learned_label": label,
+                "free_grace_reader_pending_label": LADDER.pending(),
+            });
+        }
         return serde_json::json!({ "free_grace_mode": "off" });
     }
     let bound = bound();

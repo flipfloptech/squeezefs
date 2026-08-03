@@ -723,6 +723,21 @@ fn the_reader_ack_rides_the_renewal_and_advances_the_writers_bound() {
     ));
     owner.refresh_free_grace_bound();
     assert_eq!(free_grace::bound(), label);
+
+    // A READER's own stats face. This one process is standing in for two
+    // mounts, so the writer's plane has to go before the reader's posture
+    // can be read — in production a mount is an owner or a member, never
+    // both, and the snapshot deliberately answers the writer's question
+    // first when (only in a test) both exist.
+    free_grace::disarm_owner_plane();
+    let reader_stats = free_grace::stats_snapshot();
+    assert_eq!(reader_stats["free_grace_mode"], "reader");
+    assert_eq!(reader_stats["free_grace_acked_label"], label);
+    assert_eq!(reader_stats["free_grace_learned_label"], label);
+    assert_eq!(
+        reader_stats["free_grace_reader_pending_label"], 0,
+        "nothing is pending once the acknowledgement has been emitted"
+    );
 }
 
 // ---------------------------------------------------------------------------

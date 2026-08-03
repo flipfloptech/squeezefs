@@ -1106,18 +1106,35 @@ impl NvmeBlockDev {
         self.fence.halted(&self.device_path)
     }
 
-    /// RES-6 submit gate: refuse loudly and count. Reads are deliberately
-    /// NOT gated — a fenced holder reading its own device corrupts
-    /// nothing, and refusing would turn a fail-stop into a hang.
+    /// RES-6 + DLM **S7** submit gate: the D0 latch probe (which poisons
+    /// process custody on its first observation) followed by THE
+    /// authorization point, [`crate::data_custody::authorize_dma`] — which
+    /// owns the refusal, the classification and the counting so there is
+    /// exactly one place that decides whether a DMA may be submitted.
+    ///
+    /// `carried` is the epoch the submission was authorized under
+    /// ([`Self::write_block_authorized`]); `None` = authorize at submit
+    /// (every pre-S7 call site).
+    ///
+    /// Reads are deliberately NOT gated — a fenced holder reading its own
+    /// device corrupts nothing, and refusing would turn a fail-stop into a
+    /// hang.
     #[inline]
-    fn fence_gate(&self) -> Result<()> {
+    fn fence_gate(&self, carried: Option<crate::data_custody::CustodyEpoch>) -> Result<()> {
+        // One relaxed load once latched; the cheap probe otherwise. A
+        // latched device retires the process's data-plane custody: the D0
+        // fail-stop lattice is MOUNT-wide (the reclaim queue already
+        // ceases EVERY device's reclaims on the first observation), so a
+        // sibling volume must not have to evaluate the same probe before
+        // it stops writing, and every authorization minted before this
+        // instant is void. Idempotent — poisoning is a one-way latch.
         if self.fence.halted(&self.device_path) {
-            crate::fuse_client::METRICS
-                .data_dma_fence_refusals
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Err(crate::error::SqueezefsError::WriterGuardFenced);
+            crate::data_custody::poison(&format!(
+                "data volume {} writer guard fenced",
+                self.device_path
+            ));
         }
-        Ok(())
+        crate::data_custody::authorize_dma(carried).map(|_| ())
     }
 
     /// Mount-path constructor (DUR-2 decision (a)): probe `O_DIRECT`
@@ -1325,9 +1342,39 @@ impl NvmeBlockDev {
         seen
     }
 
+    /// Submit a block write under an epoch-bearing authorization (DLM
+    /// **S7**): `auth` is the custody epoch the caller was authorized
+    /// under when its custody was ESTABLISHED — write-pipeline admission
+    /// today, S9's remote grants next — and a submission whose epoch is no
+    /// longer current is refused at the authorization point
+    /// ([`crate::data_custody::authorize_dma`]) before any device work.
+    ///
+    /// This is the form every write that outlives its authorization must
+    /// use. [`Self::write_block`] is the authorize-at-submit form: correct
+    /// under the D0 single-writer guard, where the only thing that can
+    /// happen between capture and submit is the fence the same gate
+    /// observes.
+    pub async fn write_block_authorized(
+        &self,
+        offset: u64,
+        data: bytes::Bytes,
+        auth: crate::data_custody::CustodyEpoch,
+    ) -> Result<()> {
+        self.fence_gate(Some(auth))?;
+        self.write_block_gated(offset, data).await
+    }
+
     pub async fn write_block(&self, offset: u64, data: bytes::Bytes) -> Result<()> {
-        // RES-6: the D0 writer-guard gate — one relaxed load per submit.
-        self.fence_gate()?;
+        // RES-6 + S7: the D0 writer-guard gate + the authorization point —
+        // one relaxed load plus one comparison per submit.
+        self.fence_gate(None)?;
+        self.write_block_gated(offset, data).await
+    }
+
+    /// The submission body — reachable ONLY through [`Self::fence_gate`]
+    /// (the S7 "one authorization point" discipline: `write_block` and
+    /// `write_block_authorized` are the two doors, and both gate first).
+    async fn write_block_gated(&self, offset: u64, data: bytes::Bytes) -> Result<()> {
         // Fault injection for atomicity / durability tests (no-op when counter is 0).
         loop {
             let cur = FAIL_NEXT_WRITES.load(std::sync::atomic::Ordering::SeqCst);

@@ -4888,6 +4888,23 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .router
                 .set_meta_backend(routed_meta_backend.clone());
 
+            // DLM S7 (pre-RC spec §6.9 / §6.7 / RES-6): arm the data
+            // plane's custody posture. Single-writer (the default) states
+            // the class and takes no reservation — the D0 guard arbitrates
+            // and the custody epoch fences the data plane locally.
+            // `SQUEEZEFS_MULTI_WRITER=1` demands the DEVICE-enforced class
+            // and REFUSES the mount loud when the substrate or the format
+            // cannot provide it. The hold lives as long as the mount.
+            let _data_plane_fence = squeezefs::data_custody::arm_mount_data_plane(
+                &routed_meta_backend,
+                resolved_data_lvs
+                    .iter()
+                    .map(std::path::PathBuf::from)
+                    .collect(),
+            )
+            .await
+            .map_err(|e| format!("{e}"))?;
+
             // Block-allocator ownership recovery before serving FUSE.
             //
             // Pre-RC engineering spec §6.2 item 1: on a volume set carrying

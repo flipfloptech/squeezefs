@@ -307,6 +307,37 @@ pub const WRITER_SCOPED_STAGING_BIT: u32 = 10;
 /// a red gate rather than a field mystery.
 pub const FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING: u64 = 1 << WRITER_SCOPED_STAGING_BIT;
 
+/// `features_incompat` bit 11: **multi-writer data plane** (DLM stage
+/// **S7** — pre-RC engineering spec §6.9 S7/S9 rows, §6.7 "On external
+/// consensus"): the volume set's format is expressed for more than one
+/// concurrent data-plane writer — per-writer `active_block:` key scoping,
+/// durable shared block accounting, and the custody records S8/S9 add.
+///
+/// The bit is a **capability gate, not a structure**: `data_custody`'s
+/// multi-writer arming refuses a set that does not carry it, so a mount
+/// can never arm a device-enforced multi-writer data plane over a format
+/// whose recovery paths assume one writer.
+///
+/// **Presence is OPTIONAL and nothing stamps it** (ruling **D9**, the
+/// bit-7/8/9 posture): [`SuperblockV3::plan`] does not set it, mount does
+/// not set it, and no runtime path sets it — [`set_multi_writer_data_bit`]
+/// is the sole stamping path, for the Phase-8 window that lands the §6.2
+/// format changes together. A volume without it behaves exactly as today
+/// and `SQUEEZEFS_MULTI_WRITER=1` refuses the mount loud, naming the bit.
+///
+/// Old binaries refuse a bit-11 volume loud via their own
+/// [`FEATURES_INCOMPAT_KNOWN`] gate — exactly right: they would recover a
+/// multi-writer set's node-private staging and block accounting as if
+/// every record were their own.
+/// **Bit 11, not 10** — S7 was built in parallel with §6.2 items 8/10 and
+/// both branches independently claimed bit 10, the second such collision
+/// in this program (bits 8/9 were the first). Bit 10 belongs to
+/// [`FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING`], which merged first;
+/// this bit renumbered at integration. The disjointness pin
+/// (`incompat_bits_are_single_bit_and_pairwise_disjoint`) is what makes
+/// the next one a red gate instead of silent on-disk aliasing.
+pub const FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA: u64 = 1 << 11;
+
 /// Incompat feature bits this binary understands. Any other set bit
 /// refuses the mount naming the bit (§6.1).
 pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
@@ -319,7 +350,8 @@ pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
     | FEATURE_INCOMPAT_KV_DURABLE_TERM
     | FEATURE_INCOMPAT_KV_PARTITIONED_APPEND
     | FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS
-    | FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING;
+    | FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING
+    | FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA;
 
 /// Read-only feature bits this binary understands (none yet — §4.11
 /// reserves the mechanism for snapshots). Unknown bits mount read-only.
@@ -1247,6 +1279,24 @@ pub async fn set_writer_scoped_staging_bit(path: &Path) -> Result<bool, KvError>
         path,
         FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING,
         "writer-scoped-staging",
+    )
+    .await
+}
+
+/// Stamp [`FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA`] on `path`'s superblock
+/// — the DLM **S7** capability gate (the Phase-8 batched reformat window;
+/// **mount NEVER calls this**, ruling D9). Returns whether the bit was
+/// newly set. The volume must be offline (the caller holds the D0 guard).
+///
+/// Ordering: the bit gates a MOUNT-TIME arming decision, not a record
+/// decode, so stamp-then-crash is inert — the next mount either arms
+/// multi-writer (if asked) or does not, and either way every structure is
+/// byte-identical.
+pub async fn set_multi_writer_data_bit(path: &Path) -> Result<bool, KvError> {
+    set_incompat_bit(
+        path,
+        FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA,
+        "multi-writer-data",
     )
     .await
 }

@@ -471,6 +471,13 @@ impl WritePipeline {
                     return Some(PipelinePermit {
                         pipe: self.clone(),
                         bytes: block_bytes,
+                        // DLM S7: custody is established HERE (admission
+                        // is the honest-backpressure gate the WRITE
+                        // handler awaits before the ACK), and the DMA
+                        // happens later on a detached task — so the
+                        // permit is the epoch CARRIER, and the device
+                        // gate refuses it if custody moved in between.
+                        auth: crate::data_custody::current_epoch(),
                     });
                 }
                 crate::write_pipeline_core::AdmitAttempt::Raced => continue,
@@ -603,6 +610,21 @@ impl WritePipeline {
 pub struct PipelinePermit {
     pipe: Arc<WritePipeline>,
     bytes: u64,
+    /// DLM **S7**: the data-plane custody epoch this upload was authorized
+    /// under (captured at admission — see [`PipelinePermit::auth`]).
+    auth: crate::data_custody::CustodyEpoch,
+}
+
+impl PipelinePermit {
+    /// The custody epoch this admission was authorized under. The upload
+    /// task presents it at every DMA submission
+    /// ([`crate::nvme_dev::NvmeBlockDev::write_block_authorized`]), so an
+    /// upload that outlived its mount's custody is refused at the
+    /// authorization point instead of landing on offsets the successor
+    /// writer has already reallocated.
+    pub fn auth(&self) -> crate::data_custody::CustodyEpoch {
+        self.auth
+    }
 }
 
 impl Drop for PipelinePermit {

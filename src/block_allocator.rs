@@ -275,6 +275,12 @@ pub struct BlockAllocator {
     /// generic/074 stale-fill family). Bound it by shrinking the address
     /// space (larger blocks), never by evicting entries.
     incarnations: scc::HashMap<u64, AtomicU64>,
+    /// DLM **S7** (pre-RC engineering spec §6.7 "Recovery"): this volume's
+    /// dead-epoch **do-not-reallocate** quarantine —
+    /// [`crate::data_custody::BlockQuarantine`]. Empty on every
+    /// single-writer mount; the algorithm lives in `data_custody` so the
+    /// law has one home.
+    quarantine: crate::data_custody::BlockQuarantine,
 }
 
 impl BlockAllocator {
@@ -295,6 +301,7 @@ impl BlockAllocator {
             elided_debt: scc::HashMap::new(),
             elided_debt_bytes: AtomicU64::new(0),
             incarnations: scc::HashMap::new(),
+            quarantine: crate::data_custody::BlockQuarantine::new(),
         })
     }
 
@@ -326,6 +333,82 @@ impl BlockAllocator {
             return Err(e);
         }
         Ok(())
+    }
+
+    // DLM S7 — the dead-epoch allocation quarantine (pre-RC engineering
+    // spec §6.7 "Recovery"; contracts in tests/dlm_data_fence_tests.rs).
+    // The job wire's expired-lease destination quarantine applied
+    // verbatim, ENFORCED here instead of asserted after the allocator has
+    // already answered.
+    // -----------------------------------------------------------------
+
+    /// Admit `offset` to `epoch`'s do-not-reallocate cohort. `true` ⇔
+    /// newly admitted.
+    ///
+    /// Admission **claims the offset out of the free list** (the
+    /// [`Self::claim_free_for_trim`] protocol), so no allocation path —
+    /// free-list claim, contiguity pick, ascending pick — can hand it out
+    /// while the epoch is unproven. An offset a LIVE owner still holds is
+    /// admitted too and stays with its owner: the entry then only gates
+    /// the future free ([`Self::finish_free`] defers the publish), which is
+    /// the shape the job wire's pre-allocated shard destinations take.
+    ///
+    /// Releasing needs a **drain proof** — [`Self::release_quarantine`].
+    pub fn quarantine_offset(&self, offset: u64, epoch: crate::data_custody::DeadEpoch) -> bool {
+        let admitted = self.quarantine.admit(offset, epoch);
+        if admitted {
+            // Out of the free list if it was in it: a quarantined offset
+            // must be unreachable from every allocation path, not merely
+            // filtered by one of them.
+            if self
+                .free_blocks
+                .remove(&(offset / self.chunk_size))
+                .is_some()
+            {
+                // It was free, so its free-list publish is what release
+                // owes back (the terminal free already completed).
+                self.quarantine.defer_free(offset);
+            }
+            log::warn!(
+                "block {offset} quarantined under {epoch} (do-not-reallocate until the epoch \
+                 is proven drained; dlm_quarantined_offsets)"
+            );
+        }
+        admitted
+    }
+
+    /// `true` ⇔ `offset` is in the dead-epoch quarantine.
+    pub fn is_quarantined(&self, offset: u64) -> bool {
+        self.quarantine.contains(offset)
+    }
+
+    /// Live quarantined offsets on this volume.
+    pub fn quarantined_count(&self) -> usize {
+        self.quarantine.len()
+    }
+
+    /// **The drain proof**: release `epoch`'s whole cohort — the caller
+    /// states the dead epoch can no longer submit DMA (the job wire's PR
+    /// preempt of the victim host is exactly such a proof; on a
+    /// detection-grade substrate it is recovery's proof of death). Offsets
+    /// whose terminal free completed while quarantined are published to
+    /// the free list HERE and only here. Returns the count released.
+    pub fn release_quarantine(&self, epoch: crate::data_custody::DeadEpoch) -> usize {
+        let released = self.quarantine.release(epoch);
+        for (offset, free_pending) in &released {
+            if *free_pending {
+                self.free_blocks.insert(offset / self.chunk_size);
+            }
+        }
+        if !released.is_empty() {
+            log::info!(
+                "{epoch} proven drained: {} quarantined offset(s) released ({} returned to the \
+                 free list)",
+                released.len(),
+                released.iter().filter(|(_, pending)| *pending).count()
+            );
+        }
+        released.len()
     }
 
     // -----------------------------------------------------------------
@@ -1098,6 +1181,21 @@ impl BlockAllocator {
     /// this can `allocate_block` hand the offset to a new owner.
     pub fn finish_free(&self, offset: u64) {
         let block_idx = offset / self.chunk_size;
+        // DLM S7: a dead epoch's block must not become reallocatable when
+        // its free completes — recovery, an fsck C2 repair or the
+        // reclaimer finishing a queued free would otherwise hand it to a
+        // new owner while the (possibly live) zombie can still DMA into
+        // it. The publish is OWED to the drain proof
+        // ([`Self::release_quarantine`]). One lock-free probe on an empty
+        // map when nothing is quarantined, which is every single-writer
+        // mount.
+        if !self.quarantine.is_empty() && self.quarantine.defer_free(offset) {
+            log::warn!(
+                "finish_free of quarantined block {offset}: free-list publish DEFERRED until \
+                 the dead epoch is proven drained (DLM S7; dlm_quarantined_offsets)"
+            );
+            return;
+        }
         // FIND-RW5-A forensics (env-gated, diagnostic-only): record every
         // free's capture so a DOUBLE FREE names BOTH call sites.
         if free_forensics_enabled() {

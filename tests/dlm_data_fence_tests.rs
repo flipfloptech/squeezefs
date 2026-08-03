@@ -103,18 +103,40 @@ use squeezefs::meta_backend::kv::superblock::{
     FEATURE_INCOMPAT_NODE_SEQ_WATERMARK,
 };
 use squeezefs::meta_backend::reservation::{
-    clear_override, install_override, FakeNvmeNamespace, FakeReservationClient, ReservationClient,
+    clear_override, install_override, FakeNvmeNamespace, FakeReservationClient,
 };
 use squeezefs::nvme_dev::NvmeBlockDev;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tempfile::NamedTempFile;
 
-/// Tests that mutate PROCESS-GLOBAL custody state (the poison latch, the
-/// durable term, the WERO registry) serialize on this — libtest runs a
-/// file's tests on threads, and the gate's `--test-threads=1` bounds
-/// files, not tests within one.
-static SERIAL: Mutex<()> = Mutex::new(());
+/// Tests that touch PROCESS-GLOBAL custody state (the poison latch, the
+/// durable term, the WERO registry, the quarantine gauges) serialize on
+/// this — libtest runs a file's tests on threads, and the gate's
+/// `--test-threads=1` bounds files, not tests within one.
+///
+/// An atomic latch rather than a `Mutex`: these are async tests, the guard
+/// is deliberately held across `.await` points (that is the whole point of
+/// serializing them), and unwinding releases it.
+static SERIAL_HELD: AtomicBool = AtomicBool::new(false);
+
+struct Serial;
+
+fn serial() -> Serial {
+    while SERIAL_HELD
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        std::thread::yield_now();
+    }
+    Serial
+}
+
+impl Drop for Serial {
+    fn drop(&mut self) {
+        SERIAL_HELD.store(false, Ordering::Release);
+    }
+}
 
 /// Clears the sticky poison latch when a test that fenced the process
 /// finishes (production has no clear path — a fenced holder is dead until
@@ -178,7 +200,7 @@ fn advance_custody_epoch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn epoch_stale_dma_is_refused_at_the_authorization_point() {
-    let _serial = SERIAL.lock().unwrap();
+    let _serial = serial();
     let (_f, dev) = backing(16 * 1024 * 1024);
     let payload = bytes::Bytes::from(vec![0x5Au8; 4096]);
 
@@ -236,7 +258,7 @@ async fn epoch_stale_dma_is_refused_at_the_authorization_point() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_healthy_mount_never_refuses_dma() {
-    let _serial = SERIAL.lock().unwrap();
+    let _serial = serial();
     let (_f, dev) = backing(16 * 1024 * 1024);
     let before = refusals();
     let before_epoch = epoch_refusals();
@@ -262,7 +284,7 @@ async fn a_healthy_mount_never_refuses_dma() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fence_poison_is_process_wide_and_sticky() {
-    let _serial = SERIAL.lock().unwrap();
+    let _serial = serial();
     let _poison = PoisonGuard;
     let (_fa, dev_a) = backing(8 * 1024 * 1024);
     let (_fb, dev_b) = backing(8 * 1024 * 1024);
@@ -322,6 +344,9 @@ async fn fence_poison_is_process_wide_and_sticky() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quarantine_admission_and_release_need_a_drain_proof() {
+    // The `dlm_quarantined_offsets` / `dlm_quarantine_releases` gauges are
+    // process-global: their DELTAS are only readable serialized.
+    let _serial = serial();
     let ba = allocator("s7-quarantine-admit").await;
     // Four blocks allocated then freed: all four are reallocatable.
     let mut offs = Vec::new();
@@ -498,8 +523,10 @@ async fn quarantine_composes_with_the_reclaim_fence_halt() {
         size: ba.chunk_size(),
     })
     .await;
-    let drained = q.drain_off_thread().await;
-    assert_eq!(drained, 0, "a fenced queue reclaims nothing");
+    // A fenced batch is POPPED and DROPPED (the entry count is what the
+    // drain reports), but no device command is issued and no `finish_free`
+    // runs — the successor's recovery owns the accounting.
+    assert_eq!(q.drain_off_thread().await, 1, "the entry was consumed");
     assert!(fence_halts() > halts0, "the halt is counted");
     assert!(
         !ba.free_block_indices()
@@ -541,7 +568,7 @@ async fn quarantine_composes_with_the_reclaim_fence_halt() {
 
 #[test]
 fn multi_writer_refuses_to_arm_on_a_non_pr_substrate() {
-    let _serial = SERIAL.lock().unwrap();
+    let _serial = serial();
     let path = std::path::PathBuf::from(format!(
         "/tmp/squeezefs-s7-nonpr-{}-{}",
         std::process::id(),
@@ -556,8 +583,12 @@ fn multi_writer_refuses_to_arm_on_a_non_pr_substrate() {
     // Multi-writer: REFUSED, loudly, naming the substrate (§6.7 "On
     // external consensus" — the repo's own loop substrate is exactly this
     // shape).
-    let err = data_custody::arm_data_plane(CustodyPosture::MultiWriter, &[path.clone()], true)
-        .expect_err("multi-writer must refuse a detection-grade substrate");
+    let err = data_custody::arm_data_plane(
+        CustodyPosture::MultiWriter,
+        std::slice::from_ref(&path),
+        true,
+    )
+    .expect_err("multi-writer must refuse a detection-grade substrate");
     let msg = err.to_string();
     assert!(
         msg.contains(&path.display().to_string()),
@@ -570,8 +601,12 @@ fn multi_writer_refuses_to_arm_on_a_non_pr_substrate() {
 
     // Single-writer on the same substrate: no refusal — the D0 guard
     // already governs and the documented class is detection grade.
-    let hold = data_custody::arm_data_plane(CustodyPosture::SingleWriter, &[path.clone()], false)
-        .expect("single-writer never refuses on a non-PR substrate");
+    let hold = data_custody::arm_data_plane(
+        CustodyPosture::SingleWriter,
+        std::slice::from_ref(&path),
+        false,
+    )
+    .expect("single-writer never refuses on a non-PR substrate");
     assert!(
         hold.is_none(),
         "no WERO hold on a detection-grade substrate"
@@ -582,7 +617,7 @@ fn multi_writer_refuses_to_arm_on_a_non_pr_substrate() {
 
 #[test]
 fn multi_writer_refuses_a_format_without_the_s7_incompat_bit() {
-    let _serial = SERIAL.lock().unwrap();
+    let _serial = serial();
     let path = std::path::PathBuf::from(format!(
         "/tmp/squeezefs-s7-nobit-{}-{}",
         std::process::id(),
@@ -595,8 +630,12 @@ fn multi_writer_refuses_a_format_without_the_s7_incompat_bit() {
     );
     // PR-capable, but the format does not carry bit 10 — which is EVERY
     // volume today (ruling D9: the bit is built, never stamped).
-    let err = data_custody::arm_data_plane(CustodyPosture::MultiWriter, &[path.clone()], false)
-        .expect_err("multi-writer must refuse an unstamped format");
+    let err = data_custody::arm_data_plane(
+        CustodyPosture::MultiWriter,
+        std::slice::from_ref(&path),
+        false,
+    )
+    .expect_err("multi-writer must refuse an unstamped format");
     let msg = err.to_string();
     assert!(
         msg.contains("multi-writer") && msg.contains("format"),
@@ -608,7 +647,7 @@ fn multi_writer_refuses_a_format_without_the_s7_incompat_bit() {
 
 #[test]
 fn the_data_plane_wero_hold_is_shared_not_forked() {
-    let _serial = SERIAL.lock().unwrap();
+    let _serial = serial();
     let path = std::path::PathBuf::from(format!(
         "/tmp/squeezefs-s7-wero-{}-{}",
         std::process::id(),
@@ -703,29 +742,49 @@ fn incompat_bit_10_is_disjoint_from_every_other_feature_bit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_authorization_and_quarantine_never_leak_an_offset() {
-    let _serial = SERIAL.lock().unwrap();
+    let _serial = serial();
     let ba = allocator("s7-concurrent").await;
-    let (_f, dev) = backing(64 * 1024 * 1024);
-    // Seed a free list, then quarantine half of it under a dead epoch
-    // while writers keep authorizing and submitting.
-    let mut offs = Vec::new();
-    for _ in 0..16 {
-        offs.push(ba.allocate_block().await.expect("allocate"));
-    }
-    for o in &offs {
-        ba.free_block(*o).await.expect("free");
-    }
-    let dead = declare_dead_epoch("s7 test: concurrent quarantine");
+    let (_f, dev) = backing(256 * 1024 * 1024);
     let doubles0 = METRICS.block_double_frees.load(Ordering::Relaxed);
 
-    let quarantiner = {
+    // The recovery task runs the whole quarantine lifecycle — declare a
+    // dead epoch, admit blocks IT owns (allocation is exclusive, so it can
+    // never name a live writer's block), free them under quarantine, prove
+    // the drain, release — while four writers authorize, allocate and
+    // submit against the same allocator and device.
+    let recovery = {
         let ba = ba.clone();
-        let victims: Vec<u64> = offs.iter().copied().take(8).collect();
         tokio::spawn(async move {
-            for o in victims {
-                ba.quarantine_offset(o, dead);
+            let mut cycles = 0usize;
+            for round in 0..8 {
+                let dead = declare_dead_epoch(&format!("s7 test: concurrent round {round}"));
+                let mut cohort = Vec::new();
+                for _ in 0..4 {
+                    let Ok(o) = ba.allocate_block().await else {
+                        break;
+                    };
+                    cohort.push(o);
+                }
+                for o in &cohort {
+                    assert!(ba.quarantine_offset(*o, dead), "admission");
+                }
+                // Freed WHILE quarantined: the publish is owed to the proof.
+                for o in &cohort {
+                    ba.free_block(*o).await.expect("free");
+                    assert!(
+                        !ba.free_block_indices().contains(&(*o / ba.chunk_size())),
+                        "a quarantined offset entered the free list"
+                    );
+                }
                 tokio::task::yield_now().await;
+                assert_eq!(
+                    ba.release_quarantine(dead),
+                    cohort.len(),
+                    "the drain proof releases the whole cohort"
+                );
+                cycles += cohort.len();
             }
+            cycles
         })
     };
 
@@ -736,13 +795,13 @@ async fn concurrent_authorization_and_quarantine_never_leak_an_offset() {
         writers.push(tokio::spawn(async move {
             let mut mine = Vec::new();
             for i in 0..8u64 {
-                let auth = match data_custody::authorize_dma(None) {
-                    Ok(a) => a,
-                    Err(e) => panic!("a healthy mount must authorize: {e:?}"),
-                };
+                let auth = data_custody::authorize_dma(None)
+                    .unwrap_or_else(|e| panic!("a healthy mount must authorize: {e:?}"));
                 let Ok(off) = ba.allocate_block().await else {
                     continue;
                 };
+                // Allocation is exclusive, so a block handed to this
+                // writer can never be in a dead epoch's cohort.
                 assert!(
                     !ba.is_quarantined(off),
                     "allocator handed out quarantined offset {off}"
@@ -760,30 +819,26 @@ async fn concurrent_authorization_and_quarantine_never_leak_an_offset() {
         }));
     }
 
-    quarantiner.await.expect("quarantiner");
+    let cycles = recovery.await.expect("recovery task");
+    assert!(cycles > 0, "the quarantine lifecycle ran");
     let mut all = Vec::new();
     for w in writers {
         all.extend(w.await.expect("writer"));
     }
-    // Exactly-once: no offset was handed to two writers.
+    // Exactly-once: no offset was handed to two live writers.
     let mut sorted = all.clone();
     sorted.sort_unstable();
     let before = sorted.len();
     sorted.dedup();
     assert_eq!(before, sorted.len(), "one offset, two owners");
-    for o in &all {
-        assert!(
-            !ba.is_quarantined(*o),
-            "a quarantined offset was handed out"
-        );
-    }
     assert_eq!(
         METRICS.block_double_frees.load(Ordering::Relaxed),
         doubles0,
         "no double frees under concurrency"
     );
-    // The quarantine closes exactly.
-    let released = ba.release_quarantine(dead);
-    assert!(released <= 8, "released {released} of at most 8 admissions");
-    assert_eq!(ba.quarantined_count(), 0, "the epoch's cohort is empty");
+    assert_eq!(
+        ba.quarantined_count(),
+        0,
+        "every cohort closed at its drain proof"
+    );
 }

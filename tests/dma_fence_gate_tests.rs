@@ -36,6 +36,13 @@
 //!
 //! RED against dev 7d1ec2e1: `NvmeBlockDev::set_fence_signal` does not
 //! exist and `write_block` has no fence predicate.
+//!
+//! DLM **S7** amendment: the submit gate now RETIRES process-wide
+//! data-plane custody on the first latch observation
+//! (`data_custody::poison` — the D0 fail-stop lattice is mount-wide, so a
+//! sibling volume must not have to evaluate the same probe before it stops
+//! writing). Poison is sticky, so the fencing tests here serialize and
+//! clear it on the way out; the contracts themselves are unchanged.
 
 use squeezefs::error::SqueezefsError;
 use squeezefs::fuse_client::METRICS;
@@ -43,6 +50,36 @@ use squeezefs::nvme_dev::NvmeBlockDev;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
+
+/// S7: the poison latch is process-global and sticky — a test that fences
+/// must not fence its neighbours. Serialize (an atomic latch: the guard is
+/// held across `.await` points by design), and clear on the way out.
+static SERIAL_HELD: AtomicBool = AtomicBool::new(false);
+
+struct Serial;
+
+fn serial() -> Serial {
+    while SERIAL_HELD
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        std::thread::yield_now();
+    }
+    Serial
+}
+
+impl Drop for Serial {
+    fn drop(&mut self) {
+        SERIAL_HELD.store(false, Ordering::Release);
+    }
+}
+
+struct PoisonGuard;
+impl Drop for PoisonGuard {
+    fn drop(&mut self) {
+        squeezefs::data_custody::test_clear_poison();
+    }
+}
 
 fn refusals() -> u64 {
     METRICS.data_dma_fence_refusals.load(Ordering::Relaxed)
@@ -60,6 +97,8 @@ fn backing() -> (NamedTempFile, NvmeBlockDev) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fenced_writer_guard_refuses_data_plane_dma() {
+    let _serial = serial();
+    let _poison = PoisonGuard;
     let (_f, dev) = backing();
     let fenced = Arc::new(AtomicBool::new(false));
     let probe = fenced.clone();
@@ -123,6 +162,8 @@ fn fenced_dma_refusal_is_a_fence_drop_not_a_retry() {
 /// however many handles the router holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fence_latch_is_shared_across_device_clones() {
+    let _serial = serial();
+    let _poison = PoisonGuard;
     let (_f, dev) = backing();
     let fenced = Arc::new(AtomicBool::new(true));
     let probe = fenced.clone();

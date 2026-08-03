@@ -3706,6 +3706,35 @@ pub struct Metrics {
     /// any growth means a fenced zombie tried to write and was stopped —
     /// investigate alongside `writer_guard_fenced`.
     pub data_dma_fence_refusals: Align64<AtomicU64>,
+    /// DLM **S7** (pre-RC spec §6.9 / §6.7): the CLASS SPLIT of
+    /// `data_dma_fence_refusals` — submissions refused because the custody
+    /// epoch they were authorized under is no longer current (a successor
+    /// bumped the durable writer term, or an S9 grant was revoked), as
+    /// opposed to this mount's own D0 latch having fired. Always ⊆
+    /// `data_dma_fence_refusals`; **0 on healthy mounts** (a single-writer
+    /// mount's epoch never moves after arming), and growth means custody
+    /// moved under in-flight authorizations — read it beside
+    /// `writer_guard_fenced` and `dlm_quarantined_offsets`.
+    pub data_dma_epoch_refusals: Align64<AtomicU64>,
+    /// DLM **S7**: device offsets currently in the dead-epoch
+    /// **do-not-reallocate** quarantine across every volume (a live
+    /// gauge — admissions minus releases). 0 on every single-writer mount.
+    /// A value that never falls means a dead epoch was never proven
+    /// drained: the space stays honestly unavailable (allocation refuses
+    /// `StorageFull` rather than handing a possibly-live zombie's offset to
+    /// a new owner) until recovery produces the proof.
+    pub dlm_quarantined_offsets: Align64<AtomicU64>,
+    /// DLM **S7**: quarantined offsets RELEASED by a drain proof (the job
+    /// wire's PR preempt of the victim host, or recovery's proof of death)
+    /// — the flow instrument paired with the gauge above.
+    pub dlm_quarantine_releases: Align64<AtomicU64>,
+    /// DLM **S7**: the DATA plane's guarantee class — `1` = a WERO
+    /// (rtype 2) reservation is held on every configured data namespace
+    /// (a fenced writer's DMA is rejected by the DEVICE), `0` = detection
+    /// grade (the local custody-epoch fence only). The data-plane twin of
+    /// `writer_guard_mode`; see docs/operations.md §Single-writer mount
+    /// guard.
+    pub data_plane_fence_mode: Align64<AtomicU64>,
     // Idea 2 — latest-wins supersession (design-rewrite-program §4;
     // tests/write_supersession_tests.rs): the overlapping-face
     // loop-rewrite engagement instrument.
@@ -6643,6 +6672,13 @@ impl SqueezefsFilesystem {
                 // healthy mounts — read alongside writer_guard_fenced and
                 // block_free_reclaim_fence_halts).
                 "data_dma_fence_refusals": METRICS.data_dma_fence_refusals.load(Ordering::Relaxed),
+                // DLM S7: the custody-epoch class split of the tripwire
+                // above, the dead-epoch quarantine ledger, and the data
+                // plane's guarantee class (1 = device-enforced WERO).
+                "data_dma_epoch_refusals": METRICS.data_dma_epoch_refusals.load(Ordering::Relaxed),
+                "dlm_quarantined_offsets": METRICS.dlm_quarantined_offsets.load(Ordering::Relaxed),
+                "dlm_quarantine_releases": METRICS.dlm_quarantine_releases.load(Ordering::Relaxed),
+                "data_plane_fence_mode": METRICS.data_plane_fence_mode.load(Ordering::Relaxed),
                 // Idea 2 — latest-wins supersession
                 // (design-rewrite-program §4).
                 "write_pipeline_supersessions": METRICS.write_pipeline_supersessions.load(Ordering::Relaxed),
@@ -10138,7 +10174,11 @@ impl SqueezefsFilesystem {
                 }
             };
             pipeline_phase_record(PipelinePhase::Crypto, t_crypto);
-            let dma = match self.upload_block_dma_phase(processed).await {
+            // DLM S7: the epoch captured at ADMISSION (the permit is the
+            // carrier — see `PipelinePermit::auth`), not one minted here:
+            // the whole point is that this task's custody was authorized
+            // before the WRITE ACKed and may have died since.
+            let dma = match self.upload_block_dma_phase(processed, _permit.auth()).await {
                 Ok(d) => d,
                 Err(e) => {
                     // Idea 1 ENOSPC early-close (KD-1.7): a mid-epoch
@@ -10887,7 +10927,11 @@ impl SqueezefsFilesystem {
             write_phase_record(WritePhase::UploadDma, wp_dma);
             return self.upload_invalidation_tail(ino, b).await;
         }
-        let dma = match self.upload_block_dma_phase(processed.clone()).await {
+        // DLM S7: the flush/serialized legs authorize at entry to their
+        // device phase (no earlier custody to carry — they run under the
+        // caller's held block lock), through the SAME authorization point.
+        let auth = crate::data_custody::authorize_dma(None)?;
+        let dma = match self.upload_block_dma_phase(processed.clone(), auth).await {
             Ok(d) => d,
             Err(e)
                 if matches!(&e, SqueezefsError::Io(io)
@@ -10963,6 +11007,7 @@ impl SqueezefsFilesystem {
     async fn upload_block_dma_phase(
         &self,
         processed: bytes::Bytes,
+        auth: crate::data_custody::CustodyEpoch,
     ) -> Result<UploadDmaOut, SqueezefsError> {
         let (be_id, block_allocator, nvme_writer) =
             self.router.backend_router.get_active_backend()?;
@@ -10986,7 +11031,14 @@ impl SqueezefsFilesystem {
         // visible — or with the caller's orphan free).
         let inflight = block_allocator.inflight_register(offset);
         let t_dma = std::time::Instant::now();
-        let dma_res = nvme_writer.write_block(offset, processed).await;
+        // DLM S7: the submission presents the epoch its custody was
+        // authorized under — admission for a pipelined upload, entry for
+        // the flush legs — so an upload that outlived this mount's custody
+        // is refused at the authorization point instead of landing on
+        // offsets the successor writer has already reallocated.
+        let dma_res = nvme_writer
+            .write_block_authorized(offset, processed, auth)
+            .await;
         pipeline_phase_record(PipelinePhase::Dma, t_dma);
         if let Err(e) = dma_res {
             let _ = block_allocator.free_block(offset).await;

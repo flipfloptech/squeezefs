@@ -50,6 +50,11 @@ pub mod config_ops;
 pub(crate) mod cow_core;
 pub mod cpu;
 pub mod crypto_compress;
+/// DLM **stage S7** (pre-RC spec §6.9 / §6.7 / RES-6): the data plane's
+/// custody-epoch fence — ONE authorization point for every DMA
+/// submission — the dead-epoch allocation quarantine, and the shared WERO
+/// hold on data namespaces.
+pub mod data_custody;
 pub mod defrag;
 /// RES-8 (pre-RC spec §7): unwind containment + counting for detached
 /// (fire-and-forget) data-path tasks.

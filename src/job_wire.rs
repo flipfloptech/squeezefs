@@ -123,10 +123,10 @@ use crate::cluster_wire::{
     self, session_framers, AuthnConfig, AuthnGate, ChannelClass, ClusterStream, ConnGate,
     FrameClass, FrameTx, ProofClaim, SessionAuthn, SessionKey, Verdict,
 };
+use crate::data_custody::WeroHold;
 use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::METRICS;
 use crate::jobs::{job_throttle_sleep, JobCtl, JobFabric, JobType};
-use crate::meta_backend::reservation::{register_ladder, resolve_for_mount, ReservationClient};
 use crate::meta_backend::{Metadata, RoutedMetaBackend};
 use crate::tiering::cluster_tls::ClusterSecurityConfig;
 
@@ -385,6 +385,25 @@ pub trait ShardDeviceSeam: Send + Sync {
     fn write_block(&self, dest: &DestTuple, data: &[u8]) -> std::io::Result<()>;
     /// Coordinator-side verify-read before publish.
     fn read_block(&self, dest: &DestTuple) -> std::io::Result<Vec<u8>>;
+    /// DLM **S7** (pre-RC spec §6.7 "Recovery"): admit an expired lease's
+    /// destinations to the ALLOCATOR's dead-epoch quarantine, so the
+    /// fresh-destination law is enforced by the allocator instead of
+    /// asserted after it has already answered — including for the offsets
+    /// a later free (seam teardown, fsck repair, recovery) would otherwise
+    /// return to the free list while the zombie worker can still DMA into
+    /// them. Returns the newly admitted count.
+    ///
+    /// Default: a no-op. A device-less seam owns no allocator, and the
+    /// in-memory fake's monotonic offsets are fresh by construction.
+    fn quarantine(&self, _dests: &[DestTuple], _epoch: crate::data_custody::DeadEpoch) -> usize {
+        0
+    }
+    /// DLM **S7**: release a dead epoch's cohort — the caller has a **drain
+    /// proof** (the WERO preempt of the victim host landed, so its resumed
+    /// DMA is device-rejected). Returns the count released.
+    fn release_quarantine(&self, _epoch: crate::data_custody::DeadEpoch) -> usize {
+        0
+    }
 }
 
 /// Device-less seam for fabric-only wiring (unit tests, bare hosts):
@@ -547,6 +566,28 @@ impl ShardDeviceSeam for RouterShardDevice {
         self.block_on(dev.read_block(dest.offset, self.block_len))
             .map(|b| b.to_vec())
             .map_err(std::io::Error::other)
+    }
+    fn quarantine(&self, dests: &[DestTuple], epoch: crate::data_custody::DeadEpoch) -> usize {
+        let mut admitted = 0;
+        for dest in dests {
+            let Ok(be_id) = self.id_of(dest).map(str::to_string) else {
+                continue;
+            };
+            let Ok((alloc, _dev)) = self.router.get_backend(&be_id) else {
+                continue;
+            };
+            admitted += crate::data_custody::quarantine_offsets(&alloc, [dest.offset], epoch);
+        }
+        admitted
+    }
+    fn release_quarantine(&self, epoch: crate::data_custody::DeadEpoch) -> usize {
+        let mut released = 0;
+        for be_id in &self.backend_ids {
+            if let Ok((alloc, _dev)) = self.router.get_backend(be_id) {
+                released += alloc.release_quarantine(epoch);
+            }
+        }
+        released
     }
 }
 
@@ -1035,12 +1076,6 @@ struct ShardState {
     done: AtomicBool,
 }
 
-/// The coordinator's WERO hold on the shared data namespaces.
-struct WeroFence {
-    key: u64,
-    holds: Vec<Arc<dyn ReservationClient>>,
-}
-
 /// The authenticated write half of a session: the stream half plus its
 /// [`FrameTx`] sequence. One object, so no call site can accidentally
 /// write a session frame WITHOUT its MAC.
@@ -1089,7 +1124,7 @@ pub struct JobWireHost {
     quarantine: parking_lot::Mutex<BTreeSet<DestTuple>>,
     /// WERO fence, held first-enrollment → last-departure. The tokio
     /// mutex serializes acquire/release transitions.
-    fence: tokio::sync::Mutex<Option<WeroFence>>,
+    fence: tokio::sync::Mutex<Option<WeroHold>>,
     /// Guarantee class: true = `pr` (WERO held on EVERY configured data
     /// namespace).
     pr_mode: AtomicBool,
@@ -1715,13 +1750,17 @@ impl JobWireHost {
             return;
         }
         let paths = self.cfg.data_device_paths.clone();
-        let acquired = tokio::task::spawn_blocking(move || acquire_wero(&paths)).await;
+        let acquired =
+            tokio::task::spawn_blocking(move || crate::data_custody::acquire_wero(&paths)).await;
         match acquired {
             Ok(Some(f)) => {
                 log::info!(
-                    "job wire: WERO (rtype 2) acquired on {} data namespace(s) — guarantee \
-                     class pr (expired worker hosts will be PR-preempted)",
-                    f.holds.len()
+                    "job wire: WERO (rtype 2) held on the data namespaces (key {:#x}) — \
+                     guarantee class pr (expired worker hosts will be PR-preempted). The \
+                     hold is the process's ONE data-plane reservation (DLM S7,
+                     `data_custody::acquire_wero`): an S7-armed mount and this fence share \
+                     it rather than conflicting at the device",
+                    f.key()
                 );
                 *fence = Some(f);
                 self.pr_mode.store(true, Ordering::SeqCst);
@@ -1758,14 +1797,10 @@ impl JobWireHost {
     async fn release_fence(&self) {
         let mut fence = self.fence.lock().await;
         if let Some(f) = fence.take() {
-            let _ = tokio::task::spawn_blocking(move || {
-                for client in &f.holds {
-                    if let Err(e) = client.release_registrants_only(f.key) {
-                        log::warn!("job wire: WERO release failed: {e}");
-                    }
-                }
-            })
-            .await;
+            // Dropping the last hold releases the reservation AND its
+            // registration (zero residue) — off the runtime, because the
+            // release is one ioctl per namespace.
+            crate::data_custody::release_hold(f).await;
             self.pr_mode.store(false, Ordering::SeqCst);
             METRICS.job_remote_fence_mode.store(0, Ordering::Relaxed);
             log::info!("job wire: WERO released (last remote worker departed)");
@@ -1962,8 +1997,20 @@ impl JobWireHost {
 
         // Quarantine the expired lease's destinations (never reused
         // within the job; reclaimed at job end / next mount tree-walk).
+        // DLM S7: the same law, pushed down into the ALLOCATOR — the
+        // do-not-publish set above stops the coordinator from publishing
+        // them, the allocator quarantine stops ANY path (a later free,
+        // recovery, an fsck repair) from handing them to a new owner while
+        // this dead worker can still DMA into them (spec §6.7 "Recovery").
         let old_dests = std::mem::take(&mut *shard.destinations.lock());
-        if !old_dests.is_empty() {
+        let dead_epoch = if old_dests.is_empty() {
+            None
+        } else {
+            let epoch = crate::data_custody::declare_dead_epoch(&format!(
+                "job wire: worker {} lease expired ({why})",
+                holder.worker_id
+            ));
+            self.seam.quarantine(&old_dests, epoch);
             let mut q = self.quarantine.lock();
             for d in old_dests {
                 if q.insert(d) {
@@ -1972,7 +2019,8 @@ impl JobWireHost {
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
-        }
+            Some(epoch)
+        };
 
         // The holder session is never assignable again; its connection
         // stays open so the late ResultSubmit is REFUSED, not dropped.
@@ -1990,30 +2038,20 @@ impl JobWireHost {
         // registration under the standing WERO — its resumed DMA is
         // device-rejected while every other registrant keeps writing.
         if let Some(victim) = victim_pr_key {
-            // RES-16: take the fence's {key, holds} snapshot and RELEASE
-            // the mutex before the blocking ioctl fan-out — the guard
-            // used to be held across it, so one slow namespace stalled
-            // every other fence transition (acquire at first enrollment,
-            // release at last departure).
-            let snapshot = {
+            // RES-16: CLONE the hold and RELEASE the mutex before the
+            // blocking ioctl fan-out — the guard used to be held across
+            // it, so one slow namespace stalled every other fence
+            // transition (acquire at first enrollment, release at last
+            // departure). The preempt law itself lives in `data_custody`
+            // (DLM S7 — one place issues rung 2).
+            let hold = {
                 let fence = self.fence.lock().await;
-                fence.as_ref().map(|f| (f.key, f.holds.clone()))
+                fence.clone()
             };
-            if let Some((key, holds)) = snapshot {
-                let preempted = tokio::task::spawn_blocking(move || {
-                    let mut n = 0u64;
-                    for client in &holds {
-                        match client.preempt_registrants_only(key, victim) {
-                            Ok(()) => n += 1,
-                            Err(e) => {
-                                log::warn!("job wire: WERO preempt of key {victim:#x} failed: {e}")
-                            }
-                        }
-                    }
-                    n
-                })
-                .await
-                .unwrap_or(0);
+            if let Some(hold) = hold {
+                let preempted = tokio::task::spawn_blocking(move || hold.preempt(victim))
+                    .await
+                    .unwrap_or(0);
                 if preempted > 0 {
                     METRICS
                         .job_remote_pr_preempts
@@ -2023,6 +2061,16 @@ impl JobWireHost {
                          {victim:#x} on {preempted} namespace(s) — its resumed DMA is \
                          device-rejected"
                     );
+                    // DLM S7: the landed preempt IS the drain proof — the
+                    // victim host cannot submit another command, so the
+                    // allocator quarantine may release this epoch's
+                    // cohort. On a detection-grade substrate no proof
+                    // exists and the cohort stays quarantined (the
+                    // documented deferred-reclaim class: the space
+                    // returns at the next mount's recovery walk).
+                    if let Some(epoch) = dead_epoch {
+                        self.seam.release_quarantine(epoch);
+                    }
                 }
             }
         }
@@ -2209,57 +2257,6 @@ async fn refuse_submit(session: &Arc<Session>, job_id: &str, shard: u32, reason:
             reason,
         })
         .await;
-}
-
-/// Acquire WERO (rtype 2) on every path. `Some` only when EVERY
-/// namespace is PR-capable and every acquire succeeded (`pr` class);
-/// anything partial releases what it took and returns `None`
-/// (deferred-reclaim). Blocking (one-shot ioctls) — call via
-/// `spawn_blocking`.
-fn acquire_wero(paths: &[PathBuf]) -> Option<WeroFence> {
-    let key = loop {
-        let k = rand::Rng::gen::<u64>(&mut rand::thread_rng());
-        if k != 0 {
-            break k;
-        }
-    };
-    let mut holds: Vec<Arc<dyn ReservationClient>> = Vec::new();
-    for path in paths {
-        let Some(client) = resolve_for_mount(path) else {
-            log::warn!(
-                "job wire: data namespace {} advertises no reservation support — \
-                 WERO fence unavailable",
-                path.display()
-            );
-            release_partial(&holds, key);
-            return None;
-        };
-        let step = register_ladder(client.as_ref(), key)
-            .and_then(|_| client.acquire_write_exclusive_registrants_only(key));
-        match step {
-            Ok(()) => holds.push(client),
-            Err(e) => {
-                log::warn!(
-                    "job wire: WERO acquire on {} failed: {e} — fence unavailable",
-                    path.display()
-                );
-                release_partial(&holds, key);
-                return None;
-            }
-        }
-    }
-    if holds.is_empty() {
-        return None;
-    }
-    Some(WeroFence { key, holds })
-}
-
-fn release_partial(holds: &[Arc<dyn ReservationClient>], key: u64) {
-    for client in holds {
-        if let Err(e) = client.release_registrants_only(key) {
-            log::warn!("job wire: partial WERO release failed: {e}");
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

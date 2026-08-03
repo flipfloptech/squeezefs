@@ -231,6 +231,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQZ_CLW_RTT_SAMPLES", Kind::Harness, "2000", "RTT instrument: counted samples after the discarded warm-up."),
     k("SQZ_CLW_RTT_PAYLOAD", Kind::Harness, "0", "RTT instrument: payload bytes per direction."),
     k("SQUEEZEFS_CLUSTER_WIRE_SVC_THREADS", int(1, 1 << 12), "derived clamp(cpus/8, 1, 8)", "Owner-side RPC lanes (pinned service threads — §6.7's venue rule: never the conveyor's task). Absolute override; still clamped to the core count so it cannot oversubscribe the box."),
+    k("SQUEEZEFS_MULTI_WRITER", Kind::Bool, "off", "DLM S7: demand a DEVICE-ENFORCED multi-writer data plane — a WERO (rtype 2) reservation on every data namespace held for the mount lifetime. Refuses the mount loud on a substrate without NVMe reservation support (every loop device, including tests/dev_substrate.sh's default) and on a format without incompat bit 10 (nothing stamps it — ruling D9, the capability lands with S8/S9). Off = the shipped single-writer posture: the D0 guard arbitrates and the data plane is fenced locally by the custody epoch."),
     // -- fsck / jobs ------------------------------------------------------
     k("SQUEEZEFS_FSCK_SETTLE_MS", int(0, MS_MAX), "2000", "fsck suspect-settle window, ms (the zero-FP ladder)."),
     k("SQUEEZEFS_JOB_WIRE_BIND", Kind::Str, "off", "Job-shard execution wire listen address (VAL-6: the posture switch)."),

@@ -179,7 +179,10 @@ async fn batch_forget_sweeps_exactly_like_n_forgets() {
     let (d1, f1) = touched_pair(&h, "d1", "f1").await;
     let (d2, f2) = touched_pair(&h, "d2", "f2").await;
 
-    h.fs.batch_forget(h.req, &[f1, f2, d1, d2]).await;
+    // FUSE-3k: each entry carries the count the kernel is returning; the
+    // fixture's `create` took exactly one lookup reference per ino.
+    h.fs.batch_forget(h.req, &[(f1, 1), (f2, 1), (d1, 1), (d2, 1)])
+        .await;
 
     for ino in [f1, f2] {
         assert!(

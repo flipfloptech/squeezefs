@@ -4451,9 +4451,13 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_batch_forget"), async move {
+            // FUSE-3k: carry the PER-ENTRY nlookup. `fuse_forget_one` is
+            // `{ nodeid, nlookup }` and the second word used to be dropped
+            // here, so a filesystem keeping lookup references could not
+            // honor them on the one path that returns them in bulk.
             let inodes = forgets
                 .into_iter()
-                .map(|forget_one| forget_one.nodeid)
+                .map(|forget_one| (forget_one.nodeid, forget_one.nlookup))
                 .collect::<Vec<_>>();
 
             debug!("batch_forget unique {} inodes {:?}", request.unique, inodes);

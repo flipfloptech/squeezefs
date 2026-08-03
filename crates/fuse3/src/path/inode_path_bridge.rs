@@ -1023,15 +1023,18 @@ where
             .await
     }
 
-    async fn batch_forget(&self, req: Request, inodes: &[u64]) {
+    async fn batch_forget(&self, req: Request, inodes: &[(u64, u64)]) {
         // TODO if kernel forget a dir which has children, it may break
 
         let mut inode_name_manager = self.inode_name_manager.write().await;
 
+        // The path layer maps inodes to names and keeps no lookup
+        // references of its own, so it drops the FUSE-3k counts here: an
+        // inode's name mapping is retired when the kernel returns ANY
+        // reference to it (the pre-3k behavior for this layer, unchanged).
         let paths = inodes
             .iter()
-            .copied()
-            .filter_map(|inode| inode_name_manager.get_absolute_path(inode))
+            .filter_map(|(inode, _nlookup)| inode_name_manager.get_absolute_path(*inode))
             .collect::<Vec<_>>();
         let paths = paths.iter().map(|path| path.as_ref()).collect::<Vec<_>>();
 
@@ -1039,8 +1042,7 @@ where
 
         inodes
             .iter()
-            .copied()
-            .for_each(|inode| inode_name_manager.remove_inode(inode));
+            .for_each(|(inode, _nlookup)| inode_name_manager.remove_inode(*inode));
     }
 
     async fn fallocate(

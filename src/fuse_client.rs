@@ -3100,6 +3100,14 @@ pub struct Metrics {
     /// ONE lawful serve copy on the kernel path (hot/hold/tier/cold
     /// slice-out arms).
     pub read_copy_dest_bytes: Align64<AtomicU64>,
+    /// POSIX-14: inodes that reached their FINAL forget (the kernel
+    /// certifying it holds no reference, which requires every handle
+    /// closed) with a nonzero daemon open count — i.e. a lost RELEASE.
+    /// **Must stay 0.** A stranded count vetoes `queue_reclaim_inode`
+    /// forever, so an unlinked-open file's space is not reclaimed until the
+    /// next mount; the count is deliberately NOT zeroed here (see
+    /// `return_lookups`).
+    pub open_count_stranded: Align64<AtomicU64>,
     /// FUSE-4e: zero-copy read destinations REFUSED because the serve
     /// would not fit the transport's registered window (`ReadDest::cap`,
     /// threaded from `get_payload_buffer`'s length / the il arena
@@ -4407,6 +4415,16 @@ fn timestamp_to_ns_word(t: Timestamp) -> u64 {
 pub struct OpenEntry {
     count: usize,
     dirty: std::sync::atomic::AtomicBool,
+    /// FUSE-3k: kernel LOOKUP references outstanding for this inode — one
+    /// per entry reply the daemon sent (LOOKUP / CREATE / MKNOD / MKDIR /
+    /// SYMLINK / LINK / each READDIRPLUS entry), returned in bulk by
+    /// FORGET's `nlookup`. Eviction of the daemon's per-inode state happens
+    /// at zero, which is also the point the kernel has certified it holds
+    /// nothing (see POSIX-14 in `return_lookups`). `0` on an inode the
+    /// daemon never counted means "untracked": the pre-3k unconditional
+    /// eviction remains the fallback, so a miscount can only ever cost
+    /// cache retention, never correctness.
+    lookups: u64,
 }
 
 /// Max automatic retries for a single background writeback unit (P0-3).
@@ -5054,6 +5072,81 @@ impl SqueezefsFilesystem {
         } else {
             false
         }
+    }
+
+    /// FUSE-3k: record ONE kernel lookup reference — called by every entry
+    /// reply the daemon sends (LOOKUP, CREATE, MKNOD, MKDIR, SYMLINK, LINK,
+    /// and each READDIRPLUS entry, since the kernel instantiates those too
+    /// and force-forgets the ones it cannot link). The kernel's own
+    /// bookkeeping is exactly this, and FORGET returns the references in
+    /// bulk.
+    pub fn note_lookup(&self, ino: u64) {
+        if ino <= 1 {
+            // Root's reference is never returned (the kernel holds it for
+            // the mount's life), so counting it would only pin an entry.
+            return;
+        }
+        let mut entry = self.open_inodes.entry(ino).or_default();
+        entry.lookups = entry.lookups.saturating_add(1);
+    }
+
+    /// FUSE-3k: return `nlookup` kernel references. `true` ⇒ the kernel now
+    /// holds NONE of this inode's references and the daemon may evict its
+    /// per-inode state (attr cache, inode lock, side maps, reclaim
+    /// enqueue) — exactly what every forget used to do unconditionally.
+    ///
+    /// POSIX-14: reaching zero is also the kernel CERTIFYING that no
+    /// `struct file` on this inode is open — it cannot evict an inode whose
+    /// `i_count` a file still holds. A nonzero `open_count` here is
+    /// therefore a lost RELEASE (a panicked handler task: FUSE-2
+    /// synthesizes the reply the kernel is waiting for, but the handler's
+    /// own `remove_open` never ran), which strands the reclaim veto in
+    /// `queue_reclaim_inode` for the mount's life. It is reported loud and
+    /// counted (`open_count_stranded`, must stay 0) and NOT zeroed: an
+    /// unlinked-open file's live data must never be destroyed on the
+    /// strength of an accounting we already know is wrong (the generic/795
+    /// lesson). Reclaiming a genuinely stranded orphan belongs to a
+    /// mount/dismount sweep (POSIX-15), not to a guess made here.
+    fn return_lookups(&self, ino: u64, nlookup: u64) -> bool {
+        // The kernel never sends 0; treat it as one so a malformed forget
+        // can never make an inode unevictable.
+        let n = nlookup.max(1);
+        let mut evict = true;
+        if let Some(mut entry) = self.open_inodes.get_mut(&ino) {
+            if entry.lookups > 0 {
+                entry.lookups = entry.lookups.saturating_sub(n);
+                evict = entry.lookups == 0;
+            }
+            if evict && entry.count > 0 {
+                METRICS.open_count_stranded.fetch_add(1, Ordering::Relaxed);
+                error!(
+                    "POSIX-14: ino {ino} reached its final FORGET with {} open                      handle(s) still counted — a RELEASE was lost, so the                      reclaim veto on this inode is stale (open_count_stranded)",
+                    entry.count
+                );
+            }
+        }
+        if evict {
+            // Do not leave an entry behind for an inode the kernel no longer
+            // references (the RES-13 law: FORGET is what bounds every
+            // per-inode side structure). A stranded open count keeps its
+            // entry — dropping it would silently rewrite the veto the
+            // paragraph above deliberately preserves.
+            self.open_inodes
+                .remove_if(&ino, |_, e| e.lookups == 0 && e.count == 0);
+        }
+        evict
+    }
+
+    /// FUSE-3k observability (tests + the forget path): kernel lookup
+    /// references currently outstanding for `ino`.
+    pub fn lookup_refs(&self, ino: u64) -> u64 {
+        self.open_inodes.get(&ino).map(|e| e.lookups).unwrap_or(0)
+    }
+
+    /// Whether the daemon still holds a cached attr for `ino` (the
+    /// forget-eviction observation point).
+    pub fn attr_cache_holds(&self, ino: u64) -> bool {
+        self.attr_cache.get(&ino).is_some()
     }
 
     /// D1.d: mark this inode's open generation dirty (a data-mutating op
@@ -6057,6 +6150,8 @@ impl SqueezefsFilesystem {
                 "read_copy_dest_bytes": METRICS.read_copy_dest_bytes.load(Ordering::Relaxed),
                 // FUSE-4e tripwire: must stay 0 (see the field doc).
                 "read_dest_overruns": METRICS.read_dest_overruns.load(Ordering::Relaxed),
+                // POSIX-14 tripwire: must stay 0 (lost RELEASE detector).
+                "open_count_stranded": METRICS.open_count_stranded.load(Ordering::Relaxed),
                 "read_copy_bounce_bytes": METRICS.read_copy_bounce_bytes.load(Ordering::Relaxed),
                 "read_dest_dma_bytes": METRICS.read_dest_dma_bytes.load(Ordering::Relaxed),
                 "read_fill_dma_bytes": METRICS.read_fill_dma_bytes.load(Ordering::Relaxed),
@@ -13117,6 +13212,8 @@ impl Filesystem for SqueezefsFilesystem {
                 .get_attr_internal(target)
                 .await
                 .map_err(map_squeezefs_err)?;
+            // FUSE-3k: an entry reply is one kernel lookup reference.
+            self.note_lookup(target);
             return Ok(ReplyEntry {
                 ttl: self.entry_ttl_for(attr.kind),
                 attr,
@@ -13178,6 +13275,8 @@ impl Filesystem for SqueezefsFilesystem {
             if attr.kind == FileType::Directory {
                 self.memoize_parent(inode.ino, parent);
             }
+            // FUSE-3k: this LOOKUP reply is one kernel lookup reference.
+            self.note_lookup(inode.ino);
             Ok(ReplyEntry {
                 ttl: self.entry_ttl_for(attr.kind),
                 attr,
@@ -13328,6 +13427,8 @@ impl Filesystem for SqueezefsFilesystem {
                 .insert(inode.ino, (attr, std::time::Instant::now()));
             self.bump_dir_generation(parent);
             self.attr_cache.invalidate(&parent);
+            // FUSE-3k: the kernel instantiates the new inode from this reply.
+            self.note_lookup(inode.ino);
             Ok(ReplyEntry {
                 ttl: self.entry_ttl_for(attr.kind),
                 attr,
@@ -13402,6 +13503,10 @@ impl Filesystem for SqueezefsFilesystem {
             // tests/attr_refresh_tests.rs).
             self.refresh_attr_cache(parent).await;
             self.add_open(inode.ino);
+            // FUSE-3k: CREATE returns an entry AND a handle — one lookup
+            // reference (the kernel forgets it like any other) plus the open
+            // count `release` returns.
+            self.note_lookup(inode.ino);
             Ok(ReplyCreated {
                 ttl: self.entry_ttl_for(attr.kind),
                 attr,
@@ -14380,6 +14485,8 @@ impl Filesystem for SqueezefsFilesystem {
             self.memoize_parent(inode.ino, parent);
             self.bump_dir_generation(parent);
             self.attr_cache.invalidate(&parent);
+            // FUSE-3k: one kernel lookup reference for the new directory.
+            self.note_lookup(inode.ino);
             Ok(ReplyEntry {
                 ttl: self.entry_ttl_for(attr.kind),
                 attr,
@@ -14755,6 +14862,8 @@ impl Filesystem for SqueezefsFilesystem {
                 .insert(inode.ino, (attr, std::time::Instant::now()));
             self.bump_dir_generation(parent);
             self.attr_cache.invalidate(&parent);
+            // FUSE-3k: one kernel lookup reference for the new symlink.
+            self.note_lookup(inode.ino);
             Ok(ReplyEntry {
                 ttl: self.entry_ttl_for(attr.kind),
                 attr,
@@ -14827,6 +14936,9 @@ impl Filesystem for SqueezefsFilesystem {
                 .insert(ino, (attr, std::time::Instant::now()));
             self.attr_cache.invalidate(&new_parent);
             self.bump_dir_generation(new_parent);
+            // FUSE-3k: LINK returns an entry for the EXISTING ino — another
+            // kernel lookup reference on it.
+            self.note_lookup(ino);
             return Ok(ReplyEntry {
                 ttl: self.entry_ttl_for(attr.kind),
                 attr,
@@ -15178,6 +15290,10 @@ impl Filesystem for SqueezefsFilesystem {
                         .get_attr_internal(parent)
                         .await
                         .map_err(map_squeezefs_err)?;
+                    // FUSE-3k: the kernel instantiates every readdirplus
+                    // entry it can link (and `fuse_force_forget`s the rest),
+                    // so each one is a lookup reference.
+                    self.note_lookup(parent);
                     entries.push(DirectoryEntryPlus {
                         name: ".".into(),
                         kind: FileType::Directory,
@@ -15196,6 +15312,7 @@ impl Filesystem for SqueezefsFilesystem {
                         .get_attr_internal(parent_parent)
                         .await
                         .map_err(map_squeezefs_err)?;
+                    self.note_lookup(parent_parent);
                     entries.push(DirectoryEntryPlus {
                         name: "..".into(),
                         kind: FileType::Directory,
@@ -15239,6 +15356,7 @@ impl Filesystem for SqueezefsFilesystem {
                     } else {
                         (Duration::ZERO, Duration::ZERO)
                     };
+                    self.note_lookup(d.ino);
                     entries.push(DirectoryEntryPlus {
                         name: d.name.into(),
                         kind: attr.kind,
@@ -16150,6 +16268,14 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Forget: ino = {}, count = {}", ino, count);
         let _prof = OpProf::begin(FuseOpKind::Forget, ino);
+        // FUSE-3k: `count` is the number of LOOKUP references the kernel is
+        // returning, not a signal that it dropped the inode. Evict only when
+        // the last one comes back — `fuse_force_forget(1)` (a readdirplus
+        // entry the kernel could not link, a revalidate that dropped its
+        // ref) returns one reference while the kernel keeps the rest.
+        if !self.return_lookups(ino, count) {
+            return;
+        }
         self.attr_cache.invalidate(&ino);
         self.active_inode_locks.remove(&ino);
         // RES-13: the two per-inode side maps FORGET used to walk past.
@@ -16165,11 +16291,19 @@ impl Filesystem for SqueezefsFilesystem {
     /// (POSIX-15, corrected 2026-08: there is no mount-time
     /// reconciliation sweep to fall back on — the FORGET path is the
     /// only reclaimer, which is exactly why losing one matters.)
-    async fn batch_forget(&self, _req: Request, inodes: &[u64]) {
+    async fn batch_forget(&self, _req: Request, inodes: &[(u64, u64)]) {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE BatchForget: {} inodes", inodes.len());
-        let _prof = OpProf::begin(FuseOpKind::Forget, inodes.first().copied().unwrap_or(0));
-        for &ino in inodes {
+        let _prof = OpProf::begin(
+            FuseOpKind::Forget,
+            inodes.first().map(|(ino, _)| *ino).unwrap_or(0),
+        );
+        for &(ino, nlookup) in inodes {
+            // FUSE-3k: the per-entry `nlookup` the wire always carried and
+            // this handler used to discard.
+            if !self.return_lookups(ino, nlookup) {
+                continue;
+            }
             self.attr_cache.invalidate(&ino);
             self.active_inode_locks.remove(&ino);
             // RES-13: exactly like N FORGETs — and this IS the

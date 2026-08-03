@@ -183,7 +183,11 @@ async fn batch_forget_carries_per_entry_nlookup() {
 
     // One batch, honest per-entry counts: `a` keeps 1, `b` reaches 0.
     h.fs.batch_forget(h.req, &[(a, 2), (b, 1)]).await;
-    assert_eq!(h.fs.lookup_refs(a), 1, "BATCH_FORGET must subtract 2 from a");
+    assert_eq!(
+        h.fs.lookup_refs(a),
+        1,
+        "BATCH_FORGET must subtract 2 from a"
+    );
     assert!(
         h.fs.attr_cache_holds(a),
         "FUSE-3k: BATCH_FORGET discarded nlookup, so a partially-returned \
@@ -222,7 +226,7 @@ async fn a_lost_release_leaves_a_stranded_open_count_that_is_detected() {
     // An OPEN whose RELEASE never arrives (a panicked handler task: FUSE-2
     // synthesizes the reply so the kernel is not left waiting, but the
     // daemon's `remove_open` never ran).
-    h.fs.open(h.req, ino, libc::O_RDWR as u32)
+    h.fs.open(h.req, ino, libc::O_RDWR as u32, 0)
         .await
         .expect("open");
     assert!(h.fs.is_open(ino), "fixture premise: the count is up");

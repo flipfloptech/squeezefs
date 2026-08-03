@@ -475,8 +475,15 @@ pub trait Filesystem {
         Err(libc::ENOSYS.into())
     }
 
-    /// forget more than one inode. This is a batch version [`forget`][Filesystem::forget]
-    async fn batch_forget(&self, req: Request, inodes: &[Inode]) {}
+    /// forget more than one inode. This is a batch version
+    /// [`forget`][Filesystem::forget].
+    ///
+    /// FUSE-3k: each entry is `(inode, nlookup)` — the kernel's
+    /// `fuse_forget_one` carries a PER-INODE lookup count, and dropping it
+    /// (the historical `&[Inode]`) turned every batched forget into an
+    /// unconditional eviction. `BATCH_FORGET` is the drop_caches /
+    /// memory-pressure path, so it is exactly where the counts matter.
+    async fn batch_forget(&self, req: Request, inodes: &[(Inode, u64)]) {}
 
     /// allocate space for an open file. This function ensures that required space is allocated for
     /// specified file.

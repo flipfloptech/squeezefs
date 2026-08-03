@@ -553,7 +553,10 @@ pub const FUSE_FORGET_ONE_SIZE: usize = mem::size_of::<fuse_forget_one>();
 #[allow(non_camel_case_types)]
 pub struct fuse_forget_one {
     pub nodeid: u64,
-    pub(crate) _nlookup: u64,
+    /// FUSE-3k: the per-entry lookup count. It was parsed and thrown away
+    /// (`_nlookup`), which is what made `BATCH_FORGET` an unconditional
+    /// eviction per entry.
+    pub nlookup: u64,
 }
 
 pub const FUSE_BATCH_FORGET_IN_SIZE: usize = mem::size_of::<fuse_batch_forget_in>();

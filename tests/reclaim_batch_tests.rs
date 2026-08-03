@@ -348,7 +348,12 @@ async fn test_batch_forget_queues_reclaim_like_forget() {
         pid: 1,
         ..Default::default()
     };
-    fs.batch_forget(req, &inos).await;
+    // FUSE-3k: the wire's per-entry nlookup. These inos were injected
+    // straight into the attr cache (no entry replies were ever sent), so
+    // they are UNTRACKED and evict on their first forget — the pre-3k
+    // fallback.
+    let forgets: Vec<(u64, u64)> = inos.iter().map(|&ino| (ino, 1)).collect();
+    fs.batch_forget(req, &forgets).await;
 
     for &ino in &inos {
         assert!(

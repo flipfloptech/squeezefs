@@ -344,6 +344,42 @@ fn bench_cluster_dlm(c: &mut Criterion) {
         });
     });
 
+    // S4 rows (feat/dlm-s4-slot-locks) — the slot-homed lock authority's
+    // ADDED cost, in solo mode. FIELD SHAPE (microbench law): `DlmClient`
+    // above IS `SlotLockManager` since S4, so every acquire row in this
+    // group already runs through homing + ownership; these two rows
+    // decompose what that added, at the shape the field runs it —
+    // `crate::keys::inode_path`'s `inode_{N}` path form (the ONE product
+    // key form, `get_or_acquire_lease`, once per open-for-write episode,
+    // spec §6.2) homed over the DERIVED width `W = 65536` that every
+    // stamped set freezes, and the ownership probe on the solo answer
+    // (no owner table installed — the only production posture).
+    //
+    // PREDICTION (to be tested when the D11 bench freeze lifts; NOT
+    // measured on this branch): homing is one `strip_prefix` + digit scan
+    // + `u64` parse + one modulo, and the ownership probe is one
+    // `ArcSwapOption` load with a null fast path — together predicted
+    // ≲ 20 ns, i.e. under ~2 % of the ~1 µs `acquire_release_uncontended_
+    // ino` row above, which is the row the S4 gate's "within noise"
+    // verdict actually rests on (its ID is deliberately unchanged so the
+    // S0/S1/S2/S4 series stays comparable in the baseline reference).
+    // Falsification: if `s4_lock_home_slot_ino_path` alone lands anywhere
+    // near the acquire row, homing belongs in the lease object (computed
+    // once per episode) rather than at the entry point.
+    squeezefs::dlm_slot::publish_routing_width(u64::from(
+        squeezefs::meta_backend::DERIVED_ROUTING_WIDTH,
+    ));
+    group.bench_function("s4_lock_home_slot_ino_path", |b| {
+        b.iter(|| {
+            black_box(squeezefs::dlm_slot::lock_home_slot(black_box(
+                "inode_900123456",
+            )))
+        });
+    });
+    group.bench_function("s4_is_local_slot_solo", |b| {
+        b.iter(|| black_box(squeezefs::dlm_slot::is_local_slot(black_box(42u64))));
+    });
+
     // Contended handoff: 8 tasks fight over one key, each holding briefly.
     group.bench_function("acquire_release_contended_1key_8tasks", |b| {
         let dlm = dlm.clone();

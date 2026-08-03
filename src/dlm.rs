@@ -313,6 +313,18 @@ impl FileCustody {
         }
     }
 
+    /// Is a grant carrying `token` live on this file?
+    ///
+    /// A token is globally unique per mint, so an affirmative answer names
+    /// exactly ONE grant — which is what lets DLM S9's adoption recognise
+    /// "this is the grant I was just issued, seen from the grantee's side".
+    fn holds_token(&self, token: u64) -> bool {
+        self.wholes
+            .iter()
+            .chain(self.ranges.iter())
+            .any(|g| g.token == token)
+    }
+
     /// Does this client still hold the grant a lease names?
     fn holds(&self, token: u64, owner_nonce: u64) -> bool {
         self.wholes
@@ -430,6 +442,110 @@ pub fn test_bump_fencing_generation(file_path: &str) -> u64 {
     token
 }
 
+/// DLM **S9**: adopt a grant an OWNER issued to this client into the local
+/// custody table, and hand back the ordinary [`LockLease`] every call site
+/// already understands.
+///
+/// Three things happen here, in this order, and each one is load-bearing:
+///
+/// 1. **The era is adopted** ([`adopt_durable_term`] on the token's term).
+///    A grant is minted by the authority in ITS durable era, and a client
+///    that had not learned that era would compose lower tokens and read
+///    lower floors — the §6.11 inversion. Monotone, so a stale grant can
+///    never lower the era.
+/// 2. **The stripe floor is raised** before the grant becomes visible —
+///    the same publication order [`LocalLockManager::acquire_lock_mode`]
+///    uses, so no reader can observe a grant the floor does not cover.
+/// 3. **The grant is admitted with the OWNER's token**, not a locally
+///    minted one. That is what makes every local consumer — the fencing
+///    census's `read_identity`, W1's [`span_range_shared`], the lease's own
+///    `is_held` — answer from the authority's decision. Nothing on the
+///    client mints custody, which is precisely the property S4's
+///    foreign-home refusal protected until this stage existed.
+///
+/// A conflicting local adoption is impossible by construction *if the
+/// owner arbitrates correctly*, and if it does not, the local table says
+/// so: adoption REFUSES a span the local table already holds
+/// incompatibly rather than recording two live grants for the same bytes.
+pub fn adopt_remote_grant(
+    ino: u64,
+    span: Option<(u64, u64)>,
+    token: u64,
+    mode: LockMode,
+    handle: Arc<dyn RemoteGrant>,
+) -> Result<LockLease> {
+    if let Some((start, end)) = span {
+        if start >= end {
+            return Err(crate::error::SqueezefsError::LockFailed {
+                reason: format!(
+                    "S9: refusing to adopt a malformed span [{start},{end}) on inode_{ino} — \
+                     spans are [start,end) with end EXCLUSIVE and must be non-empty"
+                ),
+            });
+        }
+    }
+    adopt_durable_term(token_term(token));
+    let key = ObjectKey::Ino(ino);
+    let client_nonce = CLIENT_NONCE.fetch_add(1, Ordering::Relaxed);
+    let grant = Grant {
+        start: span.map(|(s, _)| s).unwrap_or(0),
+        end: span.map(|(_, e)| e).unwrap_or(u64::MAX),
+        owner_nonce: client_nonce,
+        token,
+        mode,
+    };
+    grant_floor(&key).fetch_max(token, Ordering::AcqRel);
+    let mut conflicted = false;
+    match LOCK_MAP.entry_sync(key.clone()) {
+        scc::hash_map::Entry::Occupied(mut occ) => {
+            let custody = occ.get_mut();
+            if custody.holds_token(token) {
+                // **The same grant, seen from the grantee's side.** A token
+                // is globally unique per authority mint, so an identical
+                // live token cannot be a different custody: this is the
+                // authority's own record, and the authority shares this
+                // process (a single-host deployment, and the suite's
+                // two-nodes-in-one-process shape). ATTACHING rather than
+                // duplicating is the only correct answer — a second record
+                // for one grant would make the authority's release and the
+                // grantee's release each look partial.
+            } else if custody.conflicts(span, mode) {
+                conflicted = true;
+            } else {
+                custody.admit(span, grant);
+            }
+        }
+        scc::hash_map::Entry::Vacant(vac) => {
+            let _ = vac.insert_entry(FileCustody::opened(span, grant));
+        }
+    }
+    if conflicted {
+        // The owner granted bytes this client believes are already held.
+        // Refusing (and releasing the owner's grant) is the only answer
+        // that cannot produce two live records for one span.
+        handle.release();
+        let reason = format!(
+            "S9: the owner granted {span:?} on inode_{ino} but this client's own custody \
+             table already holds an incompatible grant on those bytes — refusing the \
+             adoption and releasing the grant rather than recording two live custodies \
+             (the owner's arbitration and this client's view disagree, which is a bug worth \
+             a loud failure)"
+        );
+        log::error!("{reason}");
+        return Err(crate::error::SqueezefsError::LockFailed { reason });
+    }
+    Ok(LockLease {
+        inner: Arc::new(LockLeaseInner {
+            key,
+            span,
+            client_nonce,
+            fencing_token: token,
+            released: AtomicBool::new(false),
+            remote: Some(handle),
+        }),
+    })
+}
+
 /// W1 **clause 7**'s custody source (spec §6.7: *"the W1 patch predicate
 /// requires whole-inode exclusive custody, so range-shared custody needs a
 /// seventh clause in the existing decision ledger"*; §6.3's W1 paragraph
@@ -444,6 +560,18 @@ pub fn test_bump_fencing_generation(file_path: &str) -> u64 {
 /// `false` for the shipped shapes: no custody at all, or a live
 /// whole-file lease (which IS whole-inode custody — the write path's own
 /// `get_or_acquire_lease`), or a range grant that does not overlap.
+/// The generation of an object with **live local custody**, or `None` when
+/// nothing is held on it.
+///
+/// DLM **S9** needs the distinction the general fencing read deliberately
+/// hides: with an adopted remote grant the entry's `max_token` is the
+/// OWNER's own answer (exact), while with no entry the read is the stripe
+/// floor (a monotone over-approximation) — and on a foreign-home object the
+/// sound fallback is not the floor but S8's cached grant.
+pub fn live_custody_generation(ino: u64) -> Option<u64> {
+    LOCK_MAP.read_sync(&ObjectKey::Ino(ino), |_, custody| custody.max_token)
+}
+
 pub fn span_range_shared(ino: u64, start: u64, end: u64, holder_token: u64) -> bool {
     if start >= end {
         return false;
@@ -836,6 +964,7 @@ impl LocalLockManager {
                         client_nonce: self.client_nonce,
                         fencing_token,
                         released: AtomicBool::new(false),
+                        remote: None,
                     }),
                 });
             }
@@ -866,6 +995,23 @@ impl LocalLockManager {
     }
 }
 
+/// DLM **S9**: the client side of a grant an OWNER holds on our behalf.
+///
+/// A remote grant is adopted into this process's custody table
+/// ([`adopt_remote_grant`]) so that every local consumer — the ~24 fencing
+/// reads, W1's seventh clause ([`span_range_shared`]), the lease's own
+/// `is_held` — answers from the owner's arbitrated decision instead of a
+/// locally invented one. What the client cannot do is *retire* the grant by
+/// itself: the authority's lease is the custody, so release must travel.
+pub trait RemoteGrant: Send + Sync {
+    /// Tell the owner this grant is released (must be non-blocking: it is
+    /// called from `Drop`).
+    fn release(&self);
+    /// `false` once the owner has revoked/expired the grant — what makes
+    /// `LockLease::is_held` honest on a client.
+    fn live(&self) -> bool;
+}
+
 struct LockLeaseInner {
     key: ObjectKey,
     /// The span this lease holds — `None` = whole-inode custody. It is the
@@ -874,6 +1020,9 @@ struct LockLeaseInner {
     client_nonce: u64,
     fencing_token: u64,
     released: AtomicBool,
+    /// `Some` ⇔ the grant is an owner's (DLM S9): release travels, and
+    /// liveness is the owner's answer.
+    remote: Option<Arc<dyn RemoteGrant>>,
 }
 
 impl LockLeaseInner {
@@ -890,6 +1039,12 @@ impl LockLeaseInner {
     fn unlock(&self) {
         if self.released.swap(true, Ordering::AcqRel) {
             return;
+        }
+        // S9: the owner's grant is the custody, so the owner is told first
+        // — before the local entry disappears, so no local waiter can be
+        // woken into an acquire the owner has not yet freed.
+        if let Some(remote) = &self.remote {
+            remote.release();
         }
         let mut retired = false;
         let _ = LOCK_MAP.remove_if_sync(&self.key, |custody| {
@@ -915,9 +1070,36 @@ pub struct LockLease {
     inner: Arc<LockLeaseInner>,
 }
 
+impl std::fmt::Debug for LockLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockLease")
+            .field("object", &self.inner.key)
+            .field("span", &self.inner.span)
+            .field("token", &format_args!("{:#x}", self.inner.fencing_token))
+            .field("released", &self.inner.released.load(Ordering::Relaxed))
+            // S9: whether the custody is an owner's grant, adopted here.
+            .field("remote", &self.inner.remote.is_some())
+            .finish()
+    }
+}
+
 impl LockLease {
     /// Is THIS grant still live in the file's custody table?
+    ///
+    /// For a **remote** grant (DLM S9) the local entry is a repeat of the
+    /// owner's decision, so both must hold: the owner's liveness is
+    /// authoritative and a revoked grant reads `false` here the moment the
+    /// client learns of it (at its renewal, bounded by `T_self`).
     pub async fn is_held(&self) -> bool {
+        // A REMOTE grant's liveness is the OWNER's decision, full stop: the
+        // local record is a repeat of it (and, when the authority shares
+        // this process, it IS the authority's own record, attached to
+        // rather than duplicated — see `adopt_remote_grant`). Consulting the
+        // local table too would answer "not held" for a grant that is held,
+        // which is the one wrong answer available here.
+        if let Some(remote) = &self.inner.remote {
+            return remote.live();
+        }
         LOCK_MAP
             .read_sync(&self.inner.key, |_, custody| {
                 custody.holds(self.inner.fencing_token, self.inner.client_nonce)

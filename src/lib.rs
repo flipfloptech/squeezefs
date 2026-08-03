@@ -57,6 +57,12 @@ pub mod crypto_compress;
 // would merge into the crate root's link scope and break its intra-doc
 // links.)
 pub mod data_custody;
+// DLM stage S9 (pre-RC spec §6.9 S9): remote WRITE CUSTODY — grant, renew,
+// revoke, expire over the S3 cluster wire, with the co-writer's bytes going
+// straight to the device (only custody travels). Plain comments, not doc
+// comments: an outer doc comment here merges into the crate root's link
+// scope (see the `data_custody` note above).
+pub mod data_grant;
 pub mod defrag;
 /// RES-8 (pre-RC spec §7): unwind containment + counting for detached
 /// (fire-and-forget) data-path tasks.
@@ -109,6 +115,11 @@ pub mod meta_backend;
 // token cache. Solo mounts are unarmed: one relaxed load, then today's
 // path. A plain comment, not a doc comment (the `env_knobs` note above).
 pub mod meta_ship;
+// DLM stage S9 (pre-RC spec §6.9 S9): the multi-writer MOUNT ARM — the one
+// opt-in path that arms ownership (S8), the data-plane custody fence and its
+// WERO hold (S7) and the remote write-custody plane together, or refuses
+// loudly naming the missing piece.
+pub mod multi_writer;
 pub mod nvmeof;
 pub(crate) mod patch_clone_core;
 pub(crate) mod placed_core;

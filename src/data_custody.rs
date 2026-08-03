@@ -20,7 +20,15 @@
 //! * an S9 remote client's DMA carries custody the LOCAL latch knows
 //!   nothing about.
 //!
-//! S7 makes the fence **epoch-bearing**. [`authorize_dma`] is THE
+//! S7 makes the fence **epoch-bearing**, and **S9 gives the epoch its
+//! per-client half**: the low [`crate::dlm::GRANT_SEQ_BITS`] carry this
+//! process's [`custody_generation`], which advances when one of its remote
+//! grants dies ([`advance_custody_generation`]) and NEVER poisons — losing
+//! custody costs the work authorized under it, not the mount. The
+//! generation is 0 on every single-writer mount, so the epoch there is
+//! exactly the era's base and every shipped behaviour is byte-identical.
+//!
+//! [`authorize_dma`] is THE
 //! authorization point — the W1 predicate's "the predicate lives in ONE
 //! place" discipline applied to DMA submission: every data-plane write
 //! passes through it (the device submit gate calls it; every carrier of an
@@ -141,12 +149,98 @@ impl std::fmt::Display for CustodyEpoch {
 /// is dead until remount); [`test_clear_poison`] is the suite seam.
 static POISONED: AtomicBool = AtomicBool::new(false);
 
+/// DLM **S9**: this process's **custody generation** — the low
+/// [`crate::dlm::GRANT_SEQ_BITS`] of the epoch, and the per-client
+/// granularity S7 reserved for this stage (*"the low 40 bits are free if
+/// you need per-client granularity; extend `current_epoch()`'s
+/// composition — never make the check ambient"*).
+///
+/// **0 on every mount that does not hold remote write custody**, so
+/// [`current_epoch`] is then exactly S7's `term_base()` and every shipped
+/// behaviour is byte-identical.
+static CUSTODY_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// This process's custody generation (`0` = the shipped posture: the epoch
+/// IS the durable era's base).
+pub fn custody_generation() -> u64 {
+    CUSTODY_GEN.load(Ordering::Acquire)
+}
+
 /// This mount's live data-plane custody epoch.
 pub fn current_epoch() -> CustodyEpoch {
     // `term_base()` = `(durable_term << GRANT_SEQ_BITS)` — the era's floor,
-    // which is exactly the identity an authorization needs: it changes iff
-    // the durable writer term changes, and never within an era.
-    CustodyEpoch(crate::dlm::term_base())
+    // which changes iff the durable writer term changes and never within
+    // an era. S9 composes the per-client CUSTODY GENERATION into the free
+    // low bits, so a client that loses one grant retires its own
+    // in-flight authorizations without touching the era (which belongs to
+    // the whole set) and without poisoning (which is terminal).
+    CustodyEpoch(crate::dlm::term_base() | (CUSTODY_GEN.load(Ordering::Acquire) & GEN_MASK))
+}
+
+/// The generation field's width — the grant field of a composed token, so
+/// an epoch and a fencing token are the same shape and a carry into the
+/// term field is impossible by construction.
+const GEN_MASK: u64 = crate::dlm::GRANT_SEQ_MAX;
+
+/// DLM **S9**: adopt a custody generation an owner minted for us
+/// (monotone — a reordered or replayed grant can never lower it).
+///
+/// The value is the grant field of the owner's fencing token, so
+/// generations are unique and increasing per authority by construction:
+/// the authority's single mint is what orders them.
+pub fn adopt_custody_generation(generation: u64) -> CustodyEpoch {
+    let generation = generation & GEN_MASK;
+    let prev = CUSTODY_GEN.fetch_max(generation, Ordering::AcqRel);
+    if generation > prev {
+        log::debug!(
+            "data-plane custody generation {generation} adopted (was {prev}): authorizations \
+             minted under the earlier generation are void (DLM S9)"
+        );
+    }
+    current_epoch()
+}
+
+/// DLM **S9**: **advance** the custody generation — the non-fatal custody
+/// change S7 specified for this stage (*"anything needing a non-fatal
+/// custody change must advance the epoch, not poison it"*).
+///
+/// Every authorization minted under the previous generation is refused at
+/// [`authorize_dma`] (counted in `data_dma_epoch_refusals`), while the
+/// mount stays alive and may acquire fresh custody immediately: losing one
+/// grant costs the work authorized under it, never the process.
+///
+/// Saturation is a **poison**, not a wrap: `GRANT_SEQ_MAX` advances in one
+/// era is 10¹² revocations, and a carry into the term field would forge a
+/// newer era — the same refusal the fencing mint makes.
+pub fn advance_custody_generation(reason: &str) -> CustodyEpoch {
+    let prev = CUSTODY_GEN.fetch_add(1, Ordering::AcqRel);
+    if prev >= GEN_MASK {
+        CUSTODY_GEN.store(GEN_MASK, Ordering::Release);
+        poison(&format!(
+            "custody generation space exhausted after {prev} advances in writer term {} \
+             (a carry into the term field would forge a newer era) — last change: {reason}",
+            crate::dlm::durable_term()
+        ));
+        return current_epoch();
+    }
+    crate::fuse_client::METRICS
+        .dlm_custody_epoch_advances
+        .fetch_add(1, Ordering::Relaxed);
+    let now = current_epoch();
+    log::warn!(
+        "data-plane custody generation advanced {prev} → {} ({reason}): every DMA authorized \
+         under the previous generation is now refused at the authorization point, and this \
+         mount may acquire fresh custody immediately (DLM S9; dlm_custody_epoch_advances)",
+        prev + 1
+    );
+    now
+}
+
+/// **Test seam** (the [`test_clear_poison`] precedent): reset the custody
+/// generation to the shipped 0. Production has no reset path — the
+/// generation is monotone for the life of the process.
+pub fn test_reset_custody_generation() {
+    CUSTODY_GEN.store(0, Ordering::Release);
 }
 
 /// `true` ⇔ this process's data-plane custody is poisoned (fenced /

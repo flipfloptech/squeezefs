@@ -580,8 +580,9 @@ async fn foreign_home_slot_refuses_loud_and_counts_the_rpc_site() {
     let err = d
         .acquire_lock(&foreign_path, None, Duration::from_secs(5))
         .await
-        .err()
-        .expect("a foreign home must never be granted locally");
+        // `expect_err` since S9 gave `LockLease` a `Debug` impl (the lease is
+        // the audit surface a custody refusal is read beside).
+        .expect_err("a foreign home must never be granted locally");
     let msg = format!("{err}");
     assert!(
         msg.contains("slot"),

@@ -48,16 +48,22 @@
 //!   the absence of an installed owner table, which nothing in production
 //!   can install yet.
 //!
-//! **The refusal, and why it is not dead code.** If ownership ever says
-//! "not mine", the acquire is REFUSED LOUD — never granted locally. A
-//! local grant on a foreign home is precisely the silent-divergence bug
-//! this stage exists to make impossible (two nodes each believing they
-//! hold exclusive custody), so the refusal is the only correct answer
-//! until the remote arm ships. Production cannot reach it today (solo
-//! owns every slot); [`test_set_local_slots`] is the documented seam that
-//! makes it reachable, tested, and keeps [`dlm_rpcs`] a live counter
-//! rather than the permanently-0 decoration spec §6.1 called out. Same
-//! shape as [`crate::dlm::test_arm_cw_mode`]'s ships-disabled mode.
+//! **The refusal became a round trip — DLM S9 (2026-08-06).** S4 said the
+//! only correct answer to "not mine" was a LOUD REFUSAL *"until the remote
+//! arm ships"*, because a local grant on a foreign home is exactly the
+//! silent-divergence bug (two nodes each believing they hold exclusive
+//! custody). The remote arm has shipped: a foreign home now travels to its
+//! owner through [`crate::data_grant::acquire_remote`], and what comes back
+//! is custody that authority ISSUED — adopted into this process's custody
+//! table with the owner's own token
+//! ([`crate::dlm::adopt_remote_grant`]), never minted here.
+//!
+//! The refusal survives, unweakened, in the two shapes where no owner can
+//! answer: **no custody client armed** (a single-writer mount, which is
+//! every shipped mount) and a **non-inode object**, which has no routed home
+//! and no shipped custody verb. [`dlm_rpcs`] keeps exactly the meaning S4
+//! gave it — LOCK round trips — so the counter did not move when the site
+//! under it stopped refusing and started travelling.
 
 use crate::dlm::{LocalLockManager, LockLease, LockManager, LockMode};
 use crate::error::{Result, SqueezefsError};
@@ -271,20 +277,31 @@ impl SlotLockManager {
     ) -> Result<LockLease> {
         let slot = lock_home_slot(file_path);
         if !is_local_slot(slot) {
-            // The RPC site. Count it — this is exactly the round trip a
-            // non-solo owner map costs — then refuse loud: granting a
-            // foreign home locally would be two nodes each believing
-            // they hold exclusive custody.
+            // The RPC site — and since **S9** it is a real round trip.
+            // `dlm_rpcs` keeps exactly the meaning S4 gave it (LOCK round
+            // trips), which is why the increment did not move: it counted
+            // the trip a non-solo owner map costs, and now it counts the
+            // trip itself.
             DLM_RPCS.fetch_add(1, Ordering::Relaxed);
-            let reason = format!(
-                "lock object {file_path} homes on slot {slot} (routing width {}), which this \
-                 node's lock authority does not own: remote lock acquisition ships with DLM \
-                 stages S6/S8 (spec §6.9) — refusing {range:?} {mode:?} rather than granting \
-                 custody the owner never issued",
-                routing_width()
-            );
-            log::error!("{reason}");
-            return Err(SqueezefsError::LockFailed { reason });
+            let Some(ino) = crate::dlm::ino_of_path(file_path) else {
+                // A non-inode object has no routed home (it pins to slot
+                // 0) and no verb names one, so reaching here means the
+                // owner table excludes slot 0 — refuse rather than invent
+                // a custody protocol for an object nobody ships.
+                let reason = format!(
+                    "S9: lock object {file_path} is not an inode object and homes on slot \
+                     {slot}, which this node does not own — there is no remote custody verb \
+                     for a non-inode object, so this refuses rather than granting custody the \
+                     owner never issued"
+                );
+                log::error!("{reason}");
+                return Err(SqueezefsError::LockFailed { reason });
+            };
+            // S9: ship the acquire to the home's owner. Without an armed
+            // custody client this is S4's refusal, verbatim in meaning: a
+            // local grant on a foreign home would be two nodes each
+            // believing they hold exclusive custody.
+            return crate::data_grant::acquire_remote(ino, range, mode, ttl, slot).await;
         }
         self.local
             .acquire_lock_mode(file_path, range, mode, ttl)
@@ -327,6 +344,16 @@ impl SlotLockManager {
     pub fn get_fencing_token_ino(&self, ino: u64) -> u64 {
         if crate::meta_ship::ownership_armed() && !is_local_slot(slot_of_ino(ino, routing_width()))
         {
+            // **S9**: an ADOPTED remote grant is the owner's own answer,
+            // recorded in this process's custody table at adoption — exact,
+            // and strictly better than a cached grant (it is the same
+            // number, from the same authority, without an aging window).
+            // The S8 cache remains the answer for a foreign object this
+            // node holds no custody on, which is what keeps its miss
+            // tripwire meaningful.
+            if let Some(generation) = crate::dlm::live_custody_generation(ino) {
+                return generation;
+            }
             return crate::meta_ship::foreign_fencing_token(ino);
         }
         self.local.get_fencing_token_ino(ino)

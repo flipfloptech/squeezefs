@@ -3732,6 +3732,15 @@ pub struct Metrics {
     /// `writer_guard_mode`; see docs/operations.md §Single-writer mount
     /// guard.
     pub data_plane_fence_mode: Align64<AtomicU64>,
+    /// DLM **S9**: advances of this process's **custody generation** — the
+    /// per-client low bits of the custody epoch
+    /// (`data_custody::advance_custody_generation`). Each advance retires
+    /// every DMA authorization minted under the previous generation, which
+    /// is the non-fatal custody change S7 specified for this stage
+    /// (*"advance the epoch, not poison it"*): read it beside
+    /// `data_dma_epoch_refusals`, whose growth it explains. **0 on every
+    /// single-writer mount** — nothing revokes custody there.
+    pub dlm_custody_epoch_advances: Align64<AtomicU64>,
     // DLM **S6** (pre-RC spec §6.5 item 3, §6.9 S6): the membership plane.
     // Liveness is RAM state renewed over `cluster_wire`, so these are the
     // instruments that say so — the gauges (`membership_mode`,
@@ -6726,6 +6735,13 @@ impl SqueezefsFilesystem {
                 "dlm_quarantined_offsets": METRICS.dlm_quarantined_offsets.load(Ordering::Relaxed),
                 "dlm_quarantine_releases": METRICS.dlm_quarantine_releases.load(Ordering::Relaxed),
                 "data_plane_fence_mode": METRICS.data_plane_fence_mode.load(Ordering::Relaxed),
+                // DLM S9: the per-client custody generation and its
+                // advances — the epoch's low bits (0 on every
+                // single-writer mount, where nothing revokes custody).
+                // `dlm_custody_generation` is what a stale
+                // `data_dma_epoch_refusals` growth is measured against.
+                "dlm_custody_generation": crate::data_custody::custody_generation(),
+                "dlm_custody_epoch_advances": METRICS.dlm_custody_epoch_advances.load(Ordering::Relaxed),
                 // DLM S6 (spec §6.5 item 3): the membership plane's
                 // counters. `membership_renewals` is the beat that used to
                 // be a journal transaction — it grows while
@@ -7087,6 +7103,21 @@ impl SqueezefsFilesystem {
                 "meta_ship": crate::meta_ship::stats_json(),
                 "meta_ship_phase_ns": crate::meta_ship::phase_json(),
                 "meta_ship_owner_phase_ns": crate::meta_ship::owner_phase_json(),
+                // DLM S9 (spec §6.9 S9): the remote write-custody plane and
+                // the daemon's publish path on the wire. `dlm_custody.mode`
+                // is `off` on every single-writer mount and every other
+                // field is then 0 BY CONSTRUCTION — nothing is armed, so
+                // nothing grants, ships or quarantines. The two
+                // must-stay-0-when-armed tripwires are
+                // `meta_ship_publish.refusals` (an ownership plane armed
+                // without its publish half) and
+                // `meta_ship_publish.owner_panics`;
+                // `dlm_custody.dlm_custody_grace_conflicts` is the S8/S6
+                // `dlm_grace_conflicts` law for this plane. The phase table
+                // is the deferred S9 fan-out row's attribution (D11).
+                "dlm_custody": crate::data_grant::stats_json(),
+                "dlm_custody_phase_ns": crate::data_grant::phase_json(),
+                "meta_ship_publish": crate::meta_ship::publish::stats_json(),
                 "writeback_queue_depth": METRICS.writeback_queue_depth.to_json(),
                 "meta_flush_deferred": METRICS.meta_flush_deferred.load(Ordering::Relaxed),
                 "meta_reclaim_batch_size": METRICS.meta_reclaim_batch_size.to_json(),
@@ -12804,7 +12835,9 @@ impl SqueezefsFilesystem {
         if offset >= READDIR_VIRTUAL_CONFIG_COOKIE {
             return Ok(Vec::new());
         }
-        backend.readdir_stream(parent, offset, max).await
+        // S9: routed (`meta_ship::publish::readdir_stream`) — a
+        // foreign-home directory's pages come from its owner's node cache.
+        crate::meta_ship::publish::readdir_stream(backend, parent, offset, max).await
     }
 
     /// [`Self::readdir_v3_page`] behind the §4.5 small-directory cache:
@@ -13079,7 +13112,9 @@ impl SqueezefsFilesystem {
         if inos.is_empty() {
             return;
         }
-        match backend.destroy_inodes(inos).await {
+        // S9: routed and grouped by owner (destroy is per-ino by
+        // construction, so a set spanning two authorities is two commits).
+        match crate::meta_ship::publish::destroy_inodes(backend, inos).await {
             Ok(()) => {
                 for &ino in inos {
                     self.reclaim_teardown(ino).await;
@@ -15153,9 +15188,13 @@ impl Filesystem for SqueezefsFilesystem {
             // like the drain (µs-grade time polish — never worth failing
             // an acked write over).
             if let Some(backend) = self.meta_backend.as_ref() {
-                if let Err(e) = backend
-                    .park_write_times(ino, now_ns as u64, now_ns as u64)
-                    .await
+                if let Err(e) = crate::meta_ship::publish::park_write_times(
+                    backend,
+                    ino,
+                    now_ns as u64,
+                    now_ns as u64,
+                )
+                .await
                 {
                     debug!("FUSE Write: ino {ino} times refinement park skipped: {e}");
                 }
@@ -15562,18 +15601,22 @@ impl Filesystem for SqueezefsFilesystem {
             // `get_attr_internal` size-coherency repair is
             // regular-files-only), and tools that size a `readlink()`
             // buffer from `st_size` then recorded EMPTY targets.
-            let inode = backend
-                .create_with_rdev_size(
-                    parent,
-                    &name_str,
-                    final_mode,
-                    req.uid,
-                    req.gid,
-                    0,
-                    link_str.len() as u64,
-                )
-                .await
-                .map_err(map_squeezefs_err)?;
+            // S9: routed on the PARENT (`meta_ship::publish`) — a create
+            // under a foreign-home parent mints on that parent's owner, which
+            // is the same one-appender-per-volume law the S8 mint constraint
+            // enforces.
+            let inode = crate::meta_ship::publish::create_with_rdev_size(
+                backend,
+                parent,
+                &name_str,
+                final_mode,
+                req.uid,
+                req.gid,
+                0,
+                link_str.len() as u64,
+            )
+            .await
+            .map_err(map_squeezefs_err)?;
             backend
                 .setxattr(inode.ino, "system.symlink", link_str.as_bytes())
                 .await

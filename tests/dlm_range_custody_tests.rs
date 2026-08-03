@@ -702,8 +702,9 @@ async fn cw_mode_is_refused_until_armed() {
             Duration::from_secs(1),
         )
         .await
-        .err()
-        .expect("CW must be refused while it ships disabled");
+        // `expect_err` since S9 gave `LockLease` a `Debug` impl (the lease is
+        // the audit surface a custody refusal is read beside).
+        .expect_err("CW must be refused while it ships disabled");
     let msg = format!("{err}");
     assert!(
         msg.contains("CW") || msg.contains("concurrent-write"),

@@ -4758,7 +4758,9 @@ impl DataRouter {
         let Some(backend) = self.inner.meta_backend.get() else {
             return Ok(());
         };
-        backend.commit_block_refs(ino, ops).await
+        // S9: routed — a foreign-home ino's ledger teardown belongs to the
+        // volume's owner (the record lives in ITS `TREE_BLOCK_REFS`).
+        crate::meta_ship::publish::commit_block_refs(backend, ino, ops).await
     }
 
     /// The exact durable-reference delta between an ino's PREVIOUS block
@@ -4948,10 +4950,13 @@ impl DataRouter {
                 format!("Failed to size binary layout: {e}"),
             ))
         })? as usize;
+        // S9: the cap is the OWNER's geometry — sizing this record against
+        // the local volume's cap would size it for a volume that will never
+        // store it (`meta_ship::publish::xattr_value_cap`).
         let needs_indirect = m.block_map.is_some()
             && inline_len
-                > backend
-                    .xattr_value_cap(ino)
+                > crate::meta_ship::publish::xattr_value_cap(backend, ino)
+                    .await?
                     .saturating_sub(LAYOUT_INLINE_HEADROOM);
         // Only the arm that persists the inline value encodes it.
         let inline_bytes = if needs_indirect {
@@ -5166,9 +5171,15 @@ impl DataRouter {
             // save that did not commit must not consume the accounting its
             // map change still owes — the next persist owns it.
             let refill = refs.clone();
-            match backend
-                .merge_layout_and_size(ino, &delta, bytes::Bytes::from(bytes), m.size, refs)
-                .await
+            match crate::meta_ship::publish::merge_layout_and_size(
+                backend,
+                ino,
+                &delta,
+                bytes::Bytes::from(bytes),
+                m.size,
+                refs,
+            )
+            .await
             {
                 Ok(used) => used,
                 Err(e) => {
@@ -5177,9 +5188,9 @@ impl DataRouter {
                 }
             }
         } else {
-            if let Err(e) = backend
-                .set_layout_and_size(ino, &bytes, m.size, &refs)
-                .await
+            if let Err(e) =
+                crate::meta_ship::publish::set_layout_and_size(backend, ino, &bytes, m.size, &refs)
+                    .await
             {
                 self.note_block_ref_ops(ino, refs);
                 return Err(e);

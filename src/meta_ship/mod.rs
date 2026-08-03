@@ -31,25 +31,26 @@
 //!   non-atomic across *owners*, with no compensation record and no single
 //!   D0 guard covering both halves. Refusing is the honest answer; the
 //!   refusal names the machinery so the seam is discoverable.
-//! * **No remote CUSTODY transfer.** The grant that rides a reply is the
-//!   object's *generation* (what a fencing read needs), not a lease held
-//!   on the client's behalf. Remote custody with TTL, renewal, revocation
-//!   and dead-epoch quarantine is S9; until it lands the data plane
-//!   refuses a foreign-home lease loud (S4's own refusal), which is
-//!   correct and is exactly the gap S9 closes.
-//! * **No production arm.** [`arm_ownership`] has no caller in `main`,
-//!   `mount`, or any knob: the multi-writer mount belongs to S9, because a
-//!   mount that ships metadata but cannot ship data custody is not a
-//!   product. The arm is public and tested so the shipped and refused
-//!   behaviours are real rather than commentary (the
-//!   `dlm_slot::test_set_local_slots` precedent).
-//! * **The FUSE daemon is not switched onto the router.** It holds
-//!   `Arc<RoutedMetaBackend>` and uses the *non-trait* capability surface
-//!   (`create_with_rdev_size`, `readdir_stream`, `xattr_value_cap`,
-//!   `set_layout_and_size`, `merge_layout_and_size`, `commit_block_refs`,
-//!   `park_write_times`, `destroy_inodes`) that S8 deliberately does not
-//!   ship — those are the data plane's publish path. Wiring the daemon is
-//!   therefore an S9 deliverable, not a missing S8 line.
+//! * **No remote CUSTODY transfer — landed as S9's [`crate::data_grant`].**
+//!   The grant that rides a reply here is still only the object's
+//!   *generation* (what a fencing read needs); remote custody with TTL,
+//!   renewal, revocation and dead-epoch quarantine is a lease the OWNER
+//!   holds on the client's behalf, and it lives in that module.
+//! * **No production arm — closed by S9 (2026-08-06).** [`arm_ownership`]
+//!   had no caller in `main`, `mount` or any knob, because *"a mount that
+//!   ships metadata but cannot ship data custody is not a product"*. Its
+//!   caller is now [`crate::multi_writer::arm_multi_writer`], which arms
+//!   ownership, the S7 data-plane fence and S9's remote write-custody plane
+//!   together or refuses naming the missing piece.
+//! * **The FUSE daemon is not switched onto the router**, and it still is
+//!   not: it holds `Arc<RoutedMetaBackend>` and uses the *non-trait*
+//!   capability surface (`create_with_rdev_size`, `readdir_stream`,
+//!   `xattr_value_cap`, `set_layout_and_size`, `merge_layout_and_size`,
+//!   `commit_block_refs`, `park_write_times`, `destroy_inodes`) that S8
+//!   deliberately does not ship. **S9 shipped THAT surface instead** — as
+//!   its own additive vocabulary in [`publish`], on its own verb block, so
+//!   this module's pinned schema did not have to grow for verbs no S8 peer
+//!   sends. The daemon's eight call sites now route through it.
 //! * **No incompat bit.** Function shipping changes no on-disk structure,
 //!   and ownership needs no new durable record: each volume's D0
 //!   `writer_claim` already names its holder and (since S2) its durable
@@ -102,6 +103,11 @@
 //! instead of being a single mystery number.
 
 pub mod owners;
+/// DLM stage **S9**: the daemon's *non-trait* publish surface on the wire —
+/// the deliberate gap this module's docs name above, closed as its own
+/// additive vocabulary on its own verb block rather than by growing S8's
+/// pinned schema.
+pub mod publish;
 pub mod router;
 pub mod service;
 pub mod tokens;

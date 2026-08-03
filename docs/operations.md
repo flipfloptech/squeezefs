@@ -10,6 +10,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
   - [Single-writer mount guard (guarantee classes)](#single-writer-mount-guard-guarantee-classes)
   - [Read-only coherent mounts (`-o ro`)](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers)
   - [Format v3 (CoW KV metadata)](#format-v3-cow-kv-metadata)
+  - [Read-only coherent mounts — the stated consistency model](#read-only-coherent-mounts--the-stated-consistency-model-metadata)
 - [POSIX semantics — declared deviations](#posix-semantics--declared-deviations)
   - [`fallocate(mode = 0)` does not reserve space](#fallocatemode--0--posix_fallocate-does-not-reserve-space-posix-12)
   - [`noatime` is the only atime policy](#noatime-is-the-only-atime-policy--the-tool-classes-that-notice-posix-17)
@@ -172,6 +173,33 @@ Capacity/scale: ≥ 100 M inodes per volume, 1 M+ entries per directory, unlimit
 - `SQUEEZEFS_META_FLUSH_INTERVAL_MS` (mount env): the journal/checkpoint cadence — `0` = strict per-commit durability.
 
 > **Legacy format v2**: support was removed entirely (always forward — no backwards compatibility). A v2 superblock refuses to mount with a precise "no longer supported; reformat required" error; `squeezefs format --force` reformats such a volume to v3 (destroying the old contents). The offline `squeezefs migrate` v2→v3 converter was deleted along with v2 support.
+
+### Read-only coherent mounts — the stated consistency model (metadata)
+
+**Not a shipped mount mode yet.** The shipped product is one mount per volume set (the guard above). This section states the consistency model the *machinery* now provides, because the model is the deliverable an operator has to be able to read before the mode ships: the metadata revalidation path (pre-RC engineering spec §6.8 item 2) is built, the mount option that arms it (`-o ro`) is not. A mount either declares itself a coherent reader — after which it **may not write**, enforced, not documented — or is a normal write mount, for which every mechanism below is inert.
+
+**What a coherent reader sees: the state of the most recent checkpoint it has polled.**
+
+| Property | Statement |
+|---|---|
+| **Bounded staleness** | A reader re-reads the writer's A/B root ledger (one 128 KiB read) every `SQUEEZEFS_META_REVALIDATE_MS`. A write mount publishes a ledger record at the end of every checkpoint cycle that had work — at most 1 s apart under load (the §4.6 pt 2 ceiling), and **never** while idle. Worst case a record lands just after a poll and is seen at the next one, so the bound is **poll interval + 1 s** (≈ 2 s with defaults). |
+| **Monotone** | Epochs only advance. A reader never moves backwards and never loses a record it has already served. |
+| **Per-operation atomicity** | Every node a reader resolves belongs to exactly one checkpoint epoch, and an operation that *starts* after a poll sees only that epoch's nodes. A single multi-key operation that spans a poll (a long `readdir`) may mix two adjacent checkpoints; a caller that needs one epoch across several steps reads the live epoch before and after (seqlock-style) and retries on a change. |
+| **Not durability, not linearizability** | A reader observes only what the writer has **checkpointed**. Committed-but-not-yet-checkpointed transactions (up to the flush cadence) are invisible by design — that is what makes the model cheap: no journal replay on the read side. |
+| **Metadata only** | Metadata coherence does **not** make data-block bindings coherent. An epoch step fires the unified block-key purge for keys the reader's data path registered as suspect; bounding that set exactly needs the freed-offset grace period (spec §6.8 item 3), which is **not built**. Until it is, a reader of a volume whose writer frees and reallocates blocks can serve another file's bytes for a block whose binding it cached — loudly on a transformed (AEAD) volume, silently on a passthrough one. |
+| **Cost** | A poll that finds nothing new costs one ledger read plus ~6 ns of bookkeeping. A poll that finds a newer record drops the reader's cached nodes and re-demand-pages the working set: ≈ 575 ns per cached node (≈ 1.2 ms for a 2,048-node working set), i.e. ≈ 0.1 % of one core at the 1 s cadence. Measured: `.benchmarks/2026-08-05-mw-node-cache-coherence.md`. |
+
+`SQUEEZEFS_META_REVALIDATE_MS` (mount env, reader only): poll cadence in ms. Explicit wins verbatim. Default **derived** = `max(flush cadence, 1000)` — polling faster than the writer mints records cannot reduce staleness and pays a drop pass for nothing; a larger value trades staleness (bound above) for fewer drop passes and a warmer cache.
+
+Live signals on the `.stats` inode — all eight are **0 for the whole life of a write mount**, so a nonzero value is itself the statement "this mount is a coherent reader":
+
+- `meta_kv_revalidate_polls` / `_epochs` — polls performed vs polls that found a newer record. `polls` growing with `epochs` flat is the designed idle-writer steady state.
+- `meta_kv_revalidate_nodes_dropped` — the reader's reload bill; `nodes_dropped / epochs` is the live working-set size. Approaching the whole cache every poll means the cadence is finer than this workload wants.
+- `meta_kv_revalidate_stale_serves` — hit-path rejections of a node stamped in a superseded epoch (normal under a busy writer).
+- `meta_kv_revalidate_dirty_skips` — **must stay 0**: a drop pass met un-durable RAM records, i.e. revalidation was armed on a mount that writes.
+- `meta_kv_revalidate_keys_purged` — block keys the epoch step purged. 0 while `epochs` grows means the data-plane trigger is not wired (honest and visible, not a silent hole).
+- `meta_kv_reader_load_retries` — extent reads a reader re-tried because they raced the writer's in-flight append (bounded per load; normal on a hot volume).
+- `meta_kv_node_partition_refusals` — **must stay 0**: an appender reached for a node population it does not own (a non-authority structural mutation, an armed reader's write attempt, or an append whose destination page already held a peer's frame). Every one of these is silent divergence prevented.
 
 ## POSIX semantics — declared deviations
 

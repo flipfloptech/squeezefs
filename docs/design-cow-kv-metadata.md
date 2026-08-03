@@ -288,6 +288,30 @@ The v2 allocator is an in-RAM bitmap seeded by scanning the whole inode table (`
   - Levels 1–3.5 (`active_inode_locks` → `lease_locks` → `BLOCK_FLUSH_LOCKS` → `INODE_META_LOCKS`) are untouched; `stripe_locks.rs:10-37` doc updated in the PR that lands the commit pipeline.
 - **Volume routing**: `RoutedMetaBackend` gains `enum VolumeBackend { V2(Arc<MetaLvBackend>), V3(Arc<KvMetaBackend>) }` — static dispatch, no `dyn`, mixed-version volume sets legal (migrate one volume at a time). Directory-placement health scoring (`mod.rs:1192-1222`) switches from the hardcoded `max_inodes = 20000` to **estimated remaining-capacity bytes** — free extents × node fill for v3, free inos × per-object footprint for v2 — the common unit that makes mixed v2/v3 volume sets comparable (resolved OQ 5).
 
+### 4.9a Node-cache coherence: a lagging reader, and partitioned appenders (2026-08-05)
+
+The §4.5 node cache is **load-once RAM-authoritative**, which pre-RC engineering spec §6.2 names the runtime item *"arguably harder than any of the ten"* durable-format single-writer assumptions, with the verdict: *"the tractable answer is to ensure two writers never cache the same node — **partitioning, not cache coherence**."* This subsection is the normative statement of both halves as built (`src/meta_backend/kv/epoch_core.rs`, `node_cache.rs`, `revalidate.rs`; evidence `.benchmarks/2026-08-05-mw-node-cache-coherence.md`). **There is no cross-node coherence protocol, deliberately.**
+
+**A. The reader half (spec §6.8 item 2).** A mount may declare itself a *coherent reader* as of one A/B root-ledger record; thereafter it polls the ledger on a derived cadence and drops every cached node not covered by the new record. Three rules make it sound:
+
+1. **What "covered" means is nearly empty, and that is the point.** A ledger record proves currency only for identities it names, and even a byte-identical root identity is **not** a currency proof: a leaf (or root-leaf) bset append grows the extent's log while leaving `(node_addr, node_seq)` untouched. So the only provably-current nodes after an advance are those **loaded under the new epoch**; everything else is dropped and demand-paged again. (Pinning is about *eviction*, not staleness — interior nodes and roots are dropped like any other.)
+2. **The epoch stamp is the invalidation, checked lazily on the hit path and eagerly by the sweep.** Both drop exactly `stamp ≠ current`, and the epoch is published *before* the sweep walks, so an operation that begins after a poll can never adopt a stale node even mid-pass. The hit-path cost is two relaxed loads and a compare — measured free.
+3. **The epoch and the durable tail are ONE ordered publication** (the loom-modelled two-word law): the tail is stored before the epoch that vouches for it and read after it. The inversion — an epoch-new stamp with a tail-old classification — would let the §4.5 torn-tail classifier silently drop bsets the claimed checkpoint covers, which is precisely the silent-divergence class the item exists to prevent.
+
+A reader's load path also **retries a §4.5 loud verdict** a bounded number of times: the writer's node writes are single `write_at`s, so a reader's whole-extent read can legitimately observe a torn frame followed by a complete one — corruption on a crashed writer, a plain read/append race here. Retries are counted; a verdict that survives them is returned unchanged.
+
+Consistency model (operator-facing wording in `docs/operations.md` § *Read-only coherent mounts*): **the state of the most recent checkpoint the reader polled**, staleness ≤ poll interval + the 1 s checkpoint ceiling, monotone, per-operation atomic, with committed-but-uncheckpointed work invisible by design.
+
+**B. The writer half: which nodes an appender may cache.** With appenders partitioned per §6.2 item 4 (per-writer journal sub-rings, bitmap pages, ledger slot ranges), the *cacher* populations are:
+
+| Population | Cacher/mutator | Why disjoint | Enforcement |
+|---|---|---|---|
+| interior nodes (`level > 0`), tree roots | the **root authority** alone | lock order **4b** already gives interior-node mutation exclusively to the serialized per-volume checkpoint/SMO task, and `read_partitioned_ledger` refuses a non-authority record that names tree roots — so a peer cannot even publish structural state | `apply_locked` refuses a non-authority structural mutation **loud** (`meta_kv_node_partition_refusals`) |
+| leaves | the appender the **slot map** assigns (§6.2 items 4/8 — not yet built) | not structural: the cache deliberately does **not** arbitrate leaves, because pretending to would be mistaken for cross-writer custody | a peer's append into a node whose log tail we cache is **detected** at `append_frozen` (destination-page probe, partitioned volumes only) instead of silently overwriting its acked records |
+| any node, on a coherent reader | nobody | a cache that is a projection of another process's tree cannot also be authoritative | the reader arm of the same gate |
+
+The residual hole, stated rather than hidden: **a leaf a peer wrote in an earlier window, which the authority cached before that window closed.** The append probe sees it only if the authority appends to that node again, and replay's `PartitionViolation::Key` sees it only while both writers' records are still inside the replay window. Nothing detects it afterwards. What closes it is arming the reader path on *every* non-authority appender — with respect to structure a peer **is** a reader, so it must drop its cached interior nodes and its cached leaves on each authority epoch step — plus the S8 admission rule that a peer only ever writes keys the slot map assigned it. Neither is this subsection's to build.
+
 ### 4.10 Crash contract: strictly stronger, and how the harness proves it
 
 | Level | Failure | v2 guarantee (design-wal-crash-consistency §3) | **v3 guarantee** |

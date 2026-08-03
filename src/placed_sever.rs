@@ -89,10 +89,18 @@ impl PlacedSeverRegistry {
     /// back to the pooled sever.
     ///
     /// # Safety
-    /// `src` must be valid for `len` byte reads for the duration of the
-    /// call (the arena window is alive across the synchronous dequeue —
-    /// torn content from racing client writes is the client's own
-    /// POSIX-legal race, exactly like the pooled sever).
+    ///
+    /// * `src` must be valid for `len` byte reads for the duration of the
+    ///   call (the arena window is alive across the synchronous dequeue —
+    ///   torn content from racing client writes is the client's own
+    ///   POSIX-legal race, exactly like the pooled sever).
+    /// * `rel` and `len` must be [`CLAIM_PAGE`] multiples with
+    ///   `rel + len <= block_size`. This is the only bound on the
+    ///   `write_at` copy below (MEM-7a) — the claim bitmap indexes by page,
+    ///   so a misaligned range grants a claim that does not cover what it
+    ///   writes. The screen below now REFUSES such a range in every build
+    ///   (it used to be a `debug_assert!` plus a screen inside the single
+    ///   caller, i.e. nothing in a shipped binary).
     pub(crate) unsafe fn sever(
         self: &Arc<Self>,
         ino: u64,
@@ -102,7 +110,27 @@ impl PlacedSeverRegistry {
         block_size: usize,
         src: *const u8,
     ) -> Option<bytes::Bytes> {
-        debug_assert!(rel % CLAIM_PAGE == 0 && len % CLAIM_PAGE == 0 && rel + len <= block_size);
+        // MEM-7a: enforced, not merely asserted — three integer tests on a
+        // path that then copies up to a megabyte through a raw pointer.
+        // Refusal is the pooled-sever fallback, exactly like a claim
+        // overlap.
+        if rel % CLAIM_PAGE != 0
+            || len % CLAIM_PAGE != 0
+            || len == 0
+            || rel.saturating_add(len) > block_size
+        {
+            // Loud-never-fatal (the RES-22 law: a contract violation is a
+            // counted tripwire, never a panic on a data path).
+            log::error!(
+                "placed sever refused: range must be CLAIM_PAGE-aligned and \
+                 in-bounds (ino {ino} block {block} rel {rel} len {len} \
+                 block_size {block_size}) — pooled sever fallback"
+            );
+            METRICS
+                .ipc_placed_sever_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         let key = (ino, block);
         // Get-or-create + claim + outstanding++ under the entry guard
         // (serializes against the payload-drop reap of the same key).

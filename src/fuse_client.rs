@@ -4282,6 +4282,13 @@ pub struct Metrics {
     /// The prelude decision ledger (the W1 `patch_ineligible_*` pattern):
     /// growth on a shape that should direct-drive = prelude rot.
     /// `shape` = len outside 4–64 KiB / multi-block / EOF-crossing.
+    /// MEM-7c: reaper `io_uring_enter` failures observed with ops still in
+    /// flight — the reaper REFUSES to exit there (every pending op pins its
+    /// session mapping, so exiting would release memory kernel DMA can
+    /// still land in) and retries on a 1 ms cadence instead. **Must stay
+    /// 0**: nonzero means the direct-drive ring is failing its enter,
+    /// which also stalls the shutdown join it protects.
+    pub ipc_direct_reap_stalls: Align64<AtomicU64>,
     pub ipc_direct_ineligible_shape: Align64<AtomicU64>,
     /// `meta` = no RAM-resident metadata / non-striped layout / block map
     /// not RAM-resident (the honest map-resident-majority split).
@@ -6681,6 +6688,8 @@ impl SqueezefsFilesystem {
                 "ipc_direct_drive_serves": METRICS.ipc_direct_drive_serves.load(Ordering::Relaxed),
                 "ipc_direct_drive_bounces": METRICS.ipc_direct_drive_bounces.load(Ordering::Relaxed),
                 "ipc_direct_drive_fallbacks_post": METRICS.ipc_direct_drive_fallbacks_post.load(Ordering::Relaxed),
+                // MEM-7c tripwire: must stay 0 (see the field doc).
+                "ipc_direct_reap_stalls": METRICS.ipc_direct_reap_stalls.load(Ordering::Relaxed),
                 "ipc_direct_ineligible_shape": METRICS.ipc_direct_ineligible_shape.load(Ordering::Relaxed),
                 "ipc_direct_ineligible_meta": METRICS.ipc_direct_ineligible_meta.load(Ordering::Relaxed),
                 "ipc_direct_ineligible_layout": METRICS.ipc_direct_ineligible_layout.load(Ordering::Relaxed),

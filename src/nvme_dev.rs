@@ -184,6 +184,9 @@ fn release_write_buf(data: &WriteData) {
         WriteData::Aligned { .. } => {}
         WriteData::Unaligned { ptr, .. } => {
             if !ptr.0.is_null() {
+                // SAFETY: `WriteData::Unaligned` pointers come from this module's
+                // `posix_memalign` below (never a pool slot), and this release is the
+                // buffer's single terminal use — the request is complete.
                 unsafe {
                     libc::free(ptr.0 as *mut libc::c_void);
                 }
@@ -202,6 +205,8 @@ fn release_free_ptr(kind: FreePtrKind, p: SendPtr) {
     match kind {
         FreePtrKind::Libc => {
             if !p.0.is_null() {
+                // SAFETY: `FreePtrKind::Libc` pointers come from `posix_memalign`
+                // (never a pool slot), and this release is their single terminal use.
                 unsafe {
                     libc::free(p.0 as *mut libc::c_void);
                 }
@@ -769,6 +774,9 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
 
             let mut pushed_sqe = false;
             for _retry in 0..3 {
+                // SAFETY: this worker owns its ring exclusively (one submitter per
+                // `NvmeBlockDev` worker thread), so SQ access is unaliased; the SQE
+                // borrows only buffers whose owner tokens outlive the CQE (MEM-1).
                 unsafe {
                     if let Ok(()) = ring.submission().push(&sqe) {
                         pushed_sqe = true;
@@ -1384,6 +1392,10 @@ impl NvmeBlockDev {
 
             let (rp, data_type) = if use_pool {
                 let rp = pool.alloc_raw();
+                // SAFETY: `rp` is a fresh `alloc_raw()` slot of `pool.buf_size()`
+                // bytes and `aligned_len <= buf_size` was just checked, so both the
+                // copy of `data_len` bytes and the tail zero-fill stay in bounds;
+                // `data` is a live slice of at least `data_len` bytes.
                 unsafe {
                     libc::memcpy(
                         rp as *mut libc::c_void,
@@ -1406,6 +1418,10 @@ impl NvmeBlockDev {
                     },
                 )
             } else {
+                // SAFETY: `posix_memalign` either returns 0 with a live
+                // `aligned_len`-byte allocation or we bail out; the copy writes
+                // `data_len <= aligned_len` bytes from a live slice and the memset
+                // covers exactly the remaining tail.
                 let rp = unsafe {
                     let mut buf_ptr: *mut libc::c_void = std::ptr::null_mut();
                     if libc::posix_memalign(&mut buf_ptr, alignment, aligned_len) != 0 {

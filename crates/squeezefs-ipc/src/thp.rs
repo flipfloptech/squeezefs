@@ -71,6 +71,19 @@ const MADV_COLLAPSE: libc::c_int = 25;
 /// PMD size on the supported fleets (x86_64 huge page).
 const PMD_SIZE: usize = 2 * 1024 * 1024;
 
+/// Runtime page size (never a constant — the mapping/`munmap` granularity
+/// the kernel actually enforces; MEM-7b's slack math lives in it).
+fn page_size() -> usize {
+    // SAFETY: `sysconf` with a valid name; a nonpositive answer degrades to
+    // the 4 KiB floor rather than poisoning the arithmetic.
+    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if v > 0 {
+        v as usize
+    } else {
+        4096
+    }
+}
+
 /// `mmap` a shared RW mapping of `fd` (offset 0, `len` bytes) whose base
 /// is **PMD-aligned** — the precondition for huge shmem folios to map
 /// through PMDs (a huge folio only maps huge when
@@ -83,8 +96,21 @@ const PMD_SIZE: usize = 2 * 1024 * 1024;
 ///
 /// Returns `None` on any mmap failure (caller falls back to a plain
 /// `mmap` — alignment is an optimization, not a correctness need).
+///
+/// MEM-7b: `len` need NOT be page-aligned. The mapping the kernel creates
+/// always covers `round_up(len, page)`, and every address this function
+/// hands to `munmap` is derived from that rounded length — a raw
+/// `aligned + len` slack address would be refused by the kernel (leaking
+/// the whole tail reservation for the process's life), and rounding it DOWN
+/// instead would unmap the live tail page of the mapping just created.
+/// The returned pointer is valid for `len` bytes (and, as always with mmap,
+/// up to the page-rounded length); the CALLER unmaps `round_up(len, page)`.
 pub fn map_shared_pmd_aligned(fd: std::os::raw::c_int, len: usize) -> Option<*mut u8> {
-    let span = len.checked_add(PMD_SIZE)?;
+    // The kernel's own granularity — do the slack math in it, never in the
+    // caller's arbitrary length.
+    let page = page_size();
+    let map_len = len.checked_next_multiple_of(page)?;
+    let span = map_len.checked_add(PMD_SIZE)?;
     // SAFETY: fresh anonymous PROT_NONE reservation.
     let reserve = unsafe {
         libc::mmap(
@@ -102,13 +128,13 @@ pub fn map_shared_pmd_aligned(fd: std::os::raw::c_int, len: usize) -> Option<*mu
     let addr = reserve as usize;
     let aligned = (addr + PMD_SIZE - 1) & !(PMD_SIZE - 1);
     let head = aligned - addr;
-    let tail = span - head - len;
+    let tail = span - head - map_len;
     // SAFETY: MAP_FIXED inside our own reservation; the fd mapping
     // replaces the PROT_NONE pages atomically.
     let base = unsafe {
         libc::mmap(
             aligned as *mut libc::c_void,
-            len,
+            map_len,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_SHARED | libc::MAP_FIXED,
             fd,
@@ -126,7 +152,7 @@ pub fn map_shared_pmd_aligned(fd: std::os::raw::c_int, len: usize) -> Option<*mu
             libc::munmap(reserve, head);
         }
         if tail > 0 {
-            libc::munmap((aligned + len) as *mut libc::c_void, tail);
+            libc::munmap((aligned + map_len) as *mut libc::c_void, tail);
         }
     }
     Some(base as *mut u8)

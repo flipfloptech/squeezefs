@@ -478,6 +478,14 @@ impl DirectDriveEngine {
     /// when shutdown is flagged AND the in-flight set is drained (every
     /// pending op pins its session mapping until here — §5.3.1 rule 4).
     fn reap_loop(self: Arc<Self>) {
+        // MEM-7c escalation bound: consecutive failed enters while ops are
+        // in flight. A permanently broken ring must neither unmap under DMA
+        // nor hang `shutdown`'s join forever, so past this many 1 ms
+        // retries the pending ops are LEAKED deliberately (their DMA
+        // destinations stay mapped for the process's life) and the reaper
+        // exits loud.
+        const REAP_STALL_LIMIT: u32 = 5_000;
+        let mut consecutive_stalls = 0u32;
         loop {
             {
                 let st = self
@@ -492,13 +500,67 @@ impl DirectDriveEngine {
                 Ok(_) => {}
                 Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
                 Err(e) => {
-                    if self.shutting_down.load(Ordering::SeqCst) {
+                    // MEM-7c: this arm used to `return` on ANY enter error
+                    // while shutting down — including with ops still in
+                    // flight. Every pending op PINS its session mapping
+                    // (§5.3.1 rule 4), so returning here lets `shutdown`
+                    // join, the drive drop, and the mapping release while
+                    // kernel DMA can still land in it. The loop's own exit
+                    // condition (shutdown AND `inflight_count == 0`) is the
+                    // only legal one: keep retrying, loudly, and count the
+                    // stall. A permanently broken ring degrades to a
+                    // deliberately LEAKED mapping (below), never to an
+                    // unmap under DMA.
+                    let inflight = {
+                        let st = self
+                            .state
+                            .lock()
+                            .expect("direct-drive state mutex never poisons");
+                        st.inflight_count
+                    };
+                    if self.shutting_down.load(Ordering::SeqCst) && inflight == 0 {
                         return;
                     }
-                    log::error!("ipc direct-drive: reaper enter failed: {e}");
+                    METRICS
+                        .ipc_direct_reap_stalls
+                        .fetch_add(1, Ordering::Relaxed);
+                    consecutive_stalls += 1;
+                    log::error!(
+                        "ipc direct-drive: reaper enter failed: {e} ({inflight} op(s) \
+                         still in flight — their DMA destinations stay pinned, \
+                         stall {consecutive_stalls}/{REAP_STALL_LIMIT})"
+                    );
+                    if consecutive_stalls >= REAP_STALL_LIMIT {
+                        // Leak the pins rather than unmap under DMA, and
+                        // rather than hang the shutdown join forever.
+                        let leaked = {
+                            let mut st = self
+                                .state
+                                .lock()
+                                .expect("direct-drive state mutex never poisons");
+                            let mut n = 0usize;
+                            for slot in st.inflight.iter_mut() {
+                                if let Some(p) = slot.take() {
+                                    std::mem::forget(p);
+                                    n += 1;
+                                }
+                            }
+                            st.inflight_count = 0;
+                            n
+                        };
+                        log::error!(
+                            "ipc direct-drive: ring unrecoverable after \
+                             {REAP_STALL_LIMIT} failed enters — LEAKING {leaked} \
+                             in-flight destination(s) (their pages stay mapped \
+                             for the process's life; unmapping under kernel DMA \
+                             is not an option) and exiting the reaper"
+                        );
+                        return;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
+            consecutive_stalls = 0;
             // SAFETY: this thread is the ONLY CQ accessor (construction
             // invariant; §module docs).
             let mut cq = unsafe { self.ring.completion_shared() };

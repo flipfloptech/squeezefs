@@ -6434,6 +6434,10 @@ impl DataRouter {
                         // fully DMA-covered — nothing to zero (the
                         // reused-payload replay rule is satisfied by full
                         // coverage).
+                        // SAFETY: the destination window this serve was bounded against at
+                        // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                        // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                        // custody (il path) makes this request its only writer.
                         crate::cache::pool::ReadBlockValue::Bytes(unsafe {
                             dest_bytes(d.ptr, req_len)
                         })
@@ -6487,6 +6491,10 @@ impl DataRouter {
         match dest {
             Some(d) => {
                 let len = end - start;
+                // SAFETY: the destination window this serve was bounded against at
+                // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                // custody (il path) makes this request its only writer.
                 unsafe {
                     std::ptr::copy_nonoverlapping(val[start..end].as_ptr(), d.ptr, len);
                     if len < req_len {
@@ -6498,6 +6506,10 @@ impl DataRouter {
                 crate::fuse_client::METRICS
                     .read_copy_dest_bytes
                     .fetch_add(len as u64, Ordering::Relaxed);
+                // SAFETY: the destination window this serve was bounded against at
+                // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                // custody (il path) makes this request its only writer.
                 crate::cache::pool::ReadBlockValue::Bytes(unsafe { dest_bytes(d.ptr, req_len) })
             }
             None => {
@@ -9147,6 +9159,10 @@ impl DataRouter {
             let rel_start = (overlap_start - block_start_file_offset) as usize;
             let rel_end = (overlap_end - block_start_file_offset) as usize;
 
+            // SAFETY: `overlap_start..overlap_end` was clamped to
+            // `offset..end_pos` two lines above, so the sub-slice is in bounds of
+            // `data`, and `slice_ref` requires exactly that (it re-derives the
+            // offset from the parent buffer).
             let data_slice = unsafe {
                 let sub = data.get_unchecked(
                     (overlap_start - offset) as usize..(overlap_end - offset) as usize,
@@ -9235,6 +9251,10 @@ impl DataRouter {
                         block_data.resize(rel_end, 0);
                     }
 
+                    // SAFETY: `block_data` was just resized to at least `rel_end`, and
+                    // `rel_start <= rel_end` by construction (both derive from the same
+                    // clamped overlap), so the range is in bounds; `data_slice` has
+                    // exactly `rel_end - rel_start` bytes.
                     unsafe {
                         block_data
                             .get_unchecked_mut(rel_start..rel_end)
@@ -9521,6 +9541,10 @@ impl DataRouter {
                             }
                             let (data, backing) = if let Some(dest) = dest_addr {
                                 let dest_ptr = dest as *mut u8;
+                                // SAFETY: the destination window this serve was bounded against at
+                                // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                // custody (il path) makes this request its only writer.
                                 unsafe {
                                     std::ptr::copy_nonoverlapping(
                                         out.as_ptr(),
@@ -9537,6 +9561,10 @@ impl DataRouter {
                         }
                         let (data, backing) = if let Some(dest) = dest_addr {
                             let dest_ptr = dest as *mut u8;
+                            // SAFETY: the destination window this serve was bounded against at
+                            // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                            // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                            // custody (il path) makes this request its only writer.
                             unsafe {
                                 std::ptr::copy_nonoverlapping(
                                     guard[start..end].as_ptr(),
@@ -9758,6 +9786,10 @@ impl DataRouter {
                                 }
                                 let (data, backing) = if let Some(dest) = dest_addr {
                                     let dest_ptr = dest as *mut u8;
+                                    // SAFETY: the destination window this serve was bounded against at
+                                    // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                    // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                    // custody (il path) makes this request its only writer.
                                     unsafe {
                                         std::ptr::copy_nonoverlapping(
                                             out.as_ptr(),
@@ -9782,6 +9814,10 @@ impl DataRouter {
                             let len = end - start;
                             let (data, backing) = if let Some(dest) = dest_addr {
                                 let dest_ptr = dest as *mut u8;
+                                // SAFETY: the destination window this serve was bounded against at
+                                // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                // custody (il path) makes this request its only writer.
                                 unsafe {
                                     std::ptr::copy_nonoverlapping(
                                         guard[start..end].as_ptr(),
@@ -9902,6 +9938,10 @@ impl DataRouter {
                                         METRICS
                                             .read_copy_dest_bytes
                                             .fetch_add(len as u64, Ordering::Relaxed);
+                                        // SAFETY: the destination window this serve was bounded against at
+                                        // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                        // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                        // custody (il path) makes this request its only writer.
                                         unsafe { dest_bytes(dest_ptr, len) }
                                     } else {
                                         hot.slice(start..end)
@@ -9994,6 +10034,10 @@ impl DataRouter {
                                             METRICS
                                                 .read_copy_dest_bytes
                                                 .fetch_add(len as u64, Ordering::Relaxed);
+                                            // SAFETY: the destination window this serve was bounded against at
+                                            // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                            // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                            // custody (il path) makes this request its only writer.
                                             unsafe { dest_bytes(dest_ptr, len) }
                                         } else {
                                             held.slice(start..end)
@@ -10232,6 +10276,10 @@ impl DataRouter {
                                                 // slice_len), nothing to zero.
                                                 let len = val.len();
                                                 let dest_ptr = dest as *mut u8;
+                                                // SAFETY: the destination window this serve was bounded against at
+                                                // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                                // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                                // custody (il path) makes this request its only writer.
                                                 unsafe {
                                                     std::ptr::copy_nonoverlapping(
                                                         val.as_ptr(),
@@ -10251,6 +10299,10 @@ impl DataRouter {
                                                 METRICS
                                                     .read_copy_dest_bytes
                                                     .fetch_add(len as u64, Ordering::Relaxed);
+                                                // SAFETY: the destination window this serve was bounded against at
+                                                // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                                // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                                // custody (il path) makes this request its only writer.
                                                 unsafe { dest_bytes(dest_ptr, slice_len as usize) }
                                             }
                                             None => match val {
@@ -10275,6 +10327,10 @@ impl DataRouter {
                                         let len = slice_len as usize;
                                         let data = if let Some(dest) = dest_addr {
                                             let dest_ptr = dest as *mut u8;
+                                            // SAFETY: the destination window this serve was bounded against at
+                                            // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                            // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                            // custody (il path) makes this request its only writer.
                                             unsafe {
                                                 std::ptr::write_bytes(dest_ptr, 0, len);
                                                 dest_bytes(dest_ptr, len)
@@ -10367,6 +10423,10 @@ impl DataRouter {
                                                 {
                                                     let len = block_size as usize;
                                                     let dest_ptr = dest as *mut u8;
+                                                    // SAFETY: the destination window this serve was bounded against at
+                                                    // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                                    // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                                    // custody (il path) makes this request its only writer.
                                                     let b = unsafe { dest_bytes(dest_ptr, len) };
                                                     resolved = Some(
                                                         crate::cache::pool::ReadBlockValue::Bytes(
@@ -10425,6 +10485,10 @@ impl DataRouter {
                                                         );
                                                         let len = end - start;
                                                         let dest_ptr = dest as *mut u8;
+                                                        // SAFETY: the destination window this serve was bounded against at
+                                                        // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                                        // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                                        // custody (il path) makes this request its only writer.
                                                         unsafe {
                                                             // Copy ledger +
                                                             // NT lever (see
@@ -10464,6 +10528,10 @@ impl DataRouter {
                                                             slice_t0,
                                                         );
                                                         let b =
+                                                            // SAFETY: the destination window this serve was bounded against at
+                                                            // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                                            // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                                            // custody (il path) makes this request its only writer.
                                                             unsafe { dest_bytes(dest_ptr, len) };
                                                         Some(crate::cache::pool::ReadBlockValue::Bytes(b))
                                                     }
@@ -10507,6 +10575,10 @@ impl DataRouter {
                                                 );
                                                 let len = end - start;
                                                 let dest_ptr = dest as *mut u8;
+                                                // SAFETY: the destination window this serve was bounded against at
+                                                // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                                // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                                // custody (il path) makes this request its only writer.
                                                 unsafe {
                                                     // Copy ledger + NT lever
                                                     // (see the hot arm).
@@ -10536,6 +10608,10 @@ impl DataRouter {
                                                     ReadServePhase::SliceOut,
                                                     slice_t0,
                                                 );
+                                                // SAFETY: the destination window this serve was bounded against at
+                                                // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                                // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                                // custody (il path) makes this request its only writer.
                                                 let b = unsafe { dest_bytes(dest_ptr, len) };
                                                 Some(crate::cache::pool::ReadBlockValue::Bytes(b))
                                             }
@@ -10565,6 +10641,10 @@ impl DataRouter {
                                     }
                                     if let Some(dest) = dest_addr {
                                         let len = (end_offset - offset) as usize;
+                                        // SAFETY: the destination window this serve was bounded against at
+                                        // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                        // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                        // custody (il path) makes this request its only writer.
                                         let data = unsafe { dest_bytes(dest as *mut u8, len) };
                                         return Ok((data, Some(std::sync::Arc::new(downloaded))));
                                     } else {
@@ -10609,6 +10689,10 @@ impl DataRouter {
                                     let len = slice_len as usize;
                                     let data = if let Some(dest) = dest_addr {
                                         let dest_ptr = dest as *mut u8;
+                                        // SAFETY: the destination window this serve was bounded against at
+                                        // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
+                                        // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
+                                        // custody (il path) makes this request its only writer.
                                         unsafe {
                                             std::ptr::write_bytes(dest_ptr, 0, len);
                                             dest_bytes(dest_ptr, len)
@@ -10691,6 +10775,10 @@ impl DataRouter {
                         // owned task set below (no detached writers); the
                         // ent re-arm window itself is MEM-1's owner-token
                         // territory.
+                        // SAFETY: the assembled length was proven to fit the destination
+                        // window above (`checked_ptr(final_len)`, FUSE-4e); every writer is
+                        // an owned task holding its own `Arc<AssemblyDest>` (MEM-2), and all
+                        // of them join before the bytes are handed out.
                         unsafe {
                             crate::assembly_tasks::AssemblyDest::payload(dest as *mut u8, final_len)
                         }
@@ -12004,6 +12092,9 @@ impl IoUringPrefetcher {
                         )
                         .build()
                         .user_data(0x99);
+                        // SAFETY: `ring` is this thread's own io_uring (never shared), so SQ
+                        // access is exclusive, and the MADV_WILLNEED SQE borrows nothing —
+                        // its address/length are plain integers the kernel validates.
                         unsafe {
                             if let Err(e) = ring.submission().push(&prefetch_e) {
                                 log::debug!("Prefetcher: Failed to push to io_uring: {:?}", e);

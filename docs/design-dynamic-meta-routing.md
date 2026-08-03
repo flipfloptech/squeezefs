@@ -500,7 +500,8 @@ plane, and any change to it moves both.
   installed per-slot bitset — a lookup, not a re-plumbing.
 * **Slot migration and lock homing.** A slot's move re-homes its locks
   along with its metadata, which is correct and free today (one owner) and
-  is precisely why the per-slot cutover gate (§5.5.2b, checked *before* 4a
+  is precisely why the per-slot cutover gate
+  (`docs/design-volume-lifecycle.md` §5.5.2a, checked *before* 4a
   acquisition) is the right remastering primitive later: the gate already
   parks operations while a slot changes hands. Nothing about migration
   changes at S4 because there is only ever one owner to hand to.

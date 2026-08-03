@@ -380,6 +380,76 @@ fn bench_cluster_dlm(c: &mut Criterion) {
         b.iter(|| black_box(squeezefs::dlm_slot::is_local_slot(black_box(42u64))));
     });
 
+    // S7 rows (feat/dlm-s7-data-fence) — the data-plane custody-epoch
+    // fence and the dead-epoch quarantine.
+    //
+    // FIELD-DERIVED SHAPES (the microbench law):
+    //
+    // * `authorize_dma` runs ONCE PER DMA SUBMISSION — the per-op cost the
+    //   whole mechanism has to justify. The field rate that sets its
+    //   budget is the W1 random-write plateau, 61–67 k IOPS
+    //   (`.benchmarks/2026-07-17-rand-write-program-closing.md`), plus the
+    //   streaming block rate (~1,650 blocks/s displaced at 6.3–6.8 GB/s,
+    //   `.benchmarks/2026-07-31-write-wall.md`). At 67 k submissions/s a
+    //   100 ns gate would be 0.67 % of one core; the implementation is one
+    //   relaxed `AtomicBool` load, one `AtomicU64` load and one compare,
+    //   so the PREDICTION is single-digit nanoseconds, indistinguishable
+    //   from the pre-S7 `data_dma_fence_refusals` latch load. Both arms are
+    //   priced: `None` (authorize-at-submit — every pre-S7 call site) and
+    //   `Some(current)` (the write-pipeline permit's carried epoch, the
+    //   only arm that adds a comparison).
+    // * The refused arm is priced too, because a fenced mount's cost
+    //   matters for how fast it fail-stops, not for throughput: it adds a
+    //   `fetch_add` on two counters and one `log::error!`.
+    // * The quarantine probe rides `finish_free` — one lock-free lookup on
+    //   an EMPTY `scc::HashMap` on every single-writer mount (the shipped
+    //   posture), at the terminal-free rate (≈ the displaced-block rate
+    //   above). The populated row uses 256 entries: a dead epoch's cohort
+    //   is a recovery-window population — the job wire's shard is ≤ its
+    //   `plan_blocks` count — never a per-op one.
+    group.bench_function("authorize_dma_uncarried", |b| {
+        b.iter(|| black_box(squeezefs::data_custody::authorize_dma(black_box(None))));
+    });
+    group.bench_function("authorize_dma_carried_current", |b| {
+        let auth = squeezefs::data_custody::current_epoch();
+        b.iter(|| {
+            black_box(squeezefs::data_custody::authorize_dma(black_box(Some(
+                auth,
+            ))))
+        });
+    });
+    group.bench_function("authorize_dma_carried_stale_refused", |b| {
+        // An era that cannot be current (the durable term is 7 above, and
+        // `term_base` composes it into the high bits).
+        let stale = squeezefs::data_custody::CustodyEpoch::from_raw(1);
+        b.iter(|| {
+            black_box(squeezefs::data_custody::authorize_dma(black_box(Some(
+                stale,
+            ))))
+        });
+    });
+
+    // The quarantine probe at the two populations that matter.
+    {
+        let quarantine = squeezefs::data_custody::BlockQuarantine::new();
+        group.bench_function("quarantine_probe_empty", |b| {
+            b.iter(|| black_box(quarantine.contains(black_box(4 << 20))));
+        });
+        let epoch = squeezefs::data_custody::declare_dead_epoch("bench: cohort population");
+        for i in 0..256u64 {
+            quarantine.admit(i * (4 << 20), epoch);
+        }
+        group.bench_function("quarantine_probe_pop256_miss", |b| {
+            b.iter(|| black_box(quarantine.contains(black_box(1_000_000 * (4 << 20)))));
+        });
+        group.bench_function("quarantine_probe_pop256_hit", |b| {
+            b.iter(|| black_box(quarantine.contains(black_box(128 * (4 << 20)))));
+        });
+        // Release restores the gauge (the bench must not leave
+        // `dlm_quarantined_offsets` inflated for a stats-reading rig).
+        quarantine.release(epoch);
+    }
+
     // Contended handoff: 8 tasks fight over one key, each holding briefly.
     group.bench_function("acquire_release_contended_1key_8tasks", |b| {
         let dlm = dlm.clone();

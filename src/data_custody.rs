@@ -119,6 +119,15 @@ impl CustodyEpoch {
     pub fn raw(self) -> u64 {
         self.0
     }
+
+    /// Reconstruct an epoch from its raw value — the inverse of
+    /// [`Self::raw`]: an epoch that travelled (S9's grant on the cluster
+    /// wire) or a deliberately foreign one (the bench's refused arm).
+    /// Never a way to MINT one: only [`current_epoch`] does that, and
+    /// [`authorize_dma`] compares against it.
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
 }
 
 impl std::fmt::Display for CustodyEpoch {

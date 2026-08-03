@@ -1869,7 +1869,8 @@ impl WriteCustodyClient {
     /// blocker #3): the residue class this mount, and only this mount, may
     /// mint fresh block indices from.
     ///
-    /// [`AppendPartition::SOLO`] when the authority runs no partition, and
+    /// [`AppendPartition::SOLO`](crate::meta_backend::kv::journal::AppendPartition::SOLO)
+    /// when the authority runs no partition, and
     /// then nothing engages — a co-writer's allocation stays refused exactly
     /// as it was before this seam closed, which is the honest answer for a
     /// single-writer authority that has enrolled nobody.

@@ -628,15 +628,18 @@ pub async fn lane_open_floor(
             return Err(SqueezefsError::InvalidOperation(msg));
         }
     };
+    // Its own record FIRST, and cheapest: when it exists at this width it
+    // dominates every index this lane could have minted, so nothing below
+    // runs — which is exactly what keeps the ledger scan off the per-grain
+    // path (it costs one RAM-authoritative `getxattr` per raise, and the scan
+    // only on the OPEN).
     let name = lane_record_name(vol_tag, lane);
-    let records = load_lane_reservations_for_tag(meta, vol_tag).await?;
     if let Some(raw) = crate::meta_backend::Metadata::getxattr(meta, 1, &name).await? {
         if LaneReservation::decode(&raw)?.writers == writers {
-            // Its own record dominates every index this lane could have
-            // minted, so nothing cheaper or more conservative exists.
             return Ok(None);
         }
     }
+    let records = load_lane_reservations_for_tag(meta, vol_tag).await?;
     let dense = durable_dense_frontier(meta, vol_tag)
         .await?
         .max(local_dense);

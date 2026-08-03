@@ -114,7 +114,7 @@ metadata write. The two candidates:
 which is why it is worth stating precisely):
 
 * an **epoch** the reader already observes — the checkpoint/ledger seq is it
-  (`ReaderEpoch::ledger_seq`, shipped here);
+  (the reader's live epoch, `KvMetaBackend::reader_epoch`);
 * a **quarantine** between `begin_free` and `finish_free`: today a terminal
   free's offset becomes reallocatable when `finish_free` runs (after the
   background reclaim). Item 3 adds "…and no registered reader is still below
@@ -137,44 +137,56 @@ acknowledgement-channel blocker.
 condition + counters ≈ days; the reader ack half is S3/S6-shaped ≈ weeks, which
 matches the spec's own "2 and 3 are weeks" classification.
 
-## 4b. The item-2 merge, pre-worked
+## 4b. The item-2 wiring — **EXECUTED** (`feat/dlm-s5-item2-wiring`, off dev @ `35a9b990`)
 
-Item 2 landed in parallel (`feat/mw-node-cache-coherence` @ `1c52244f`:
-`src/meta_backend/kv/revalidate.rs` + `node_cache.rs`). Its API and this
-branch's seam were designed against each other and compose without redesign —
-its poller **owns no task** ("the RO mount's own loop calls `poll_at`"), which
-is precisely this branch's `spawn_reader_revalidation` loop, and its
-`EpochPurgeSink` is precisely this branch's item-5 trigger. The wiring, which
-belongs to whoever merges second:
+Both halves merged, and the pre-worked table was executed exactly as written.
+The two APIs composed without redesign, by construction: the landed poller
+**owns no task** ("the RO mount's own loop calls `poll_at`"), which is this
+branch's `spawn_reader_revalidation` loop, and its `EpochPurgeSink` is this
+branch's item-5 trigger.
 
-| This branch | Replacement | Action |
-|---|---|---|
-| `install_node_cache_revalidator` / `NodeCacheRevalidate` / `node_cache_revalidation_available` | `KvMetaBackend::arm_reader_revalidation(Some(sink))` | call it per volume beside `arm_reader_data_plane`; **delete the placeholder trait and its cell** (no dead code) |
-| `revalidate_volume` (the 4 KiB ledger poll) | `RevalidationPoller::derived()` + `poll_at(&vol, Instant::now())` | swap inside the existing loop; keep the loop, the stop discipline and the detached-panic containment |
-| `purge_reader_block_keys` | `EpochPurgeSink` implementation | pass it as the sink. Its `TieredEpochPurge` purges only keys a data-path site *registered* as suspect (its own note says that registration site is unbuilt); the census pass here is the complete-but-unscoped answer, so the merged sink should fall back to it — otherwise `meta_kv_revalidate_keys_purged` reads 0 while epochs grow |
-| `fuse_client::reader_revalidate_interval` | `revalidate::resolve_revalidate_interval_ms` | theirs is strictly better (`max(writer cadence, CHECKPOINT_MAX_AGE_MS)`; strict mode reads as the checkpoint tick). **TTL consequence:** this branch derives the kernel/dentry TTLs from the raw flush cadence, which is **≤** that bound — so the shipped TTLs are conservative (shorter than the staleness they cover, never longer). Re-base them on `poller.staleness_bound()` at merge |
+| Pre-work row | What shipped |
+|---|---|
+| `install_node_cache_revalidator` / `NodeCacheRevalidate` / `node_cache_revalidation_available` / the `NODE_CACHE_REVALIDATOR` cell | **DELETED**, all four. Arming is `ro_coherence::arm_reader_coherence` → `KvMetaBackend::arm_reader_revalidation(Some(sink))`, once per volume, immediately after `arm_reader_data_plane` and **before** the cadence task (the poll is illegal on an un-armed mount, by the landed contract) |
+| `revalidate_volume` + `ReaderEpoch` (the local ledger poll) | **DELETED.** The loop now calls `RevalidationPoller::poll_at(&vol, Instant::now())`; the poller owns "is a poll due", the cache owns the epoch step (roots adopted *before* the `Release` epoch publication), and the task owns only *when to ask*. The stop discipline and `detached::contain` are unchanged |
+| `purge_reader_block_keys` as the sink | Wired as `ro_coherence::ReaderEpochPurge` (holds the `DataRouter`, because the mount's `TieredCache` lives inside the router and cannot be handed out as its own `Arc`). It runs the **census** pass, deliberately: `TieredEpochPurge` purges only *registered* suspects and no registration site exists, so installing it on a mount would leave `keys_purged` at 0 while `epochs` climbed — a promise silently not kept. Its doc now says which sink a mount installs and why |
+| `fuse_client::reader_revalidate_interval` | **DELETED.** `ro_coherence::{reader_revalidate_interval, reader_staleness_bound}` read the landed machinery directly (`RevalidationPoller::derived()`), and the TTLs are re-based on `staleness_bound()` — with the shipped defaults that is **2 s** (1 s poll + the ≤ 1 s checkpoint ceiling), replacing the conservative 50 ms this branch shipped. A tie test (`the_reader_horizon_matches_the_landed_revalidation_machinery`) makes any future drift between the advertised bound and the machinery's bound a RED test |
 
-Nothing in the tables above changes a guarantee this branch documents; the
-merge only makes the METADATA row of §Consistency in `docs/operations.md`
-upgrade from "snapshot at mount" to "lags by one interval", which is the
-sentence that section is already written to accept.
+Counter consolidation: the four `ro_*` counters this branch added are
+**deleted** — one mechanism, one family, and the landed
+`meta_kv_revalidate_*` family is authoritative and already on the stats inode.
+What replaced them is the posture plus the two DERIVED numbers
+(`read_only_mount`, `reader_revalidate_interval_ms`,
+`reader_staleness_bound_ms`), published so the guarantee in
+`docs/operations.md` cannot drift from the one in force.
+
+**The tripwire inverted, and that is the operationally important part.** Before
+the wiring, `nodes_dropped == 0` / `keys_purged == 0` meant "the arm is not
+installed" — honest, expected, benign. After it, an armed reader that observes
+an epoch advance **must** drop nodes, and (on a mount that has cached blocks)
+**must** purge keys. So both now read the other way: epochs advancing with
+either counter flat is a coherence promise silently not kept. `docs/operations.md`
+carries the table, `AGENTS.md` the clause, and the stats-block comment in
+`fuse_client.rs` says it beside the emit.
 
 ## 5. What remains before N readers can be demonstrated on a real cluster
 
 In dependency order — nothing below is a change of plan, all of it is stated in
 §6.8/§6.9:
 
-1. **Item 2, node-cache revalidation** — landed in parallel; needs the §4b
-   merge wiring. Until its arm is installed, a reader's METADATA view is a
-   mount-time snapshot. A cluster demo of "N readers see the writer's new
-   files" is impossible without it; a demo of "N readers stream existing files
-   while a writer works" is possible today. The mount logs the difference
-   loudly and `ro_node_cache_nodes_dropped == 0` is its signature.
+1. ~~**Item 2, node-cache revalidation**~~ — **DONE** (landed + wired, §4b).
+   A reader now serves the newest checkpoint it has polled, so "N readers see
+   the writer's new files" is expressible; what is left is running it on real
+   hosts (item 2 below).
 2. **A capability row** — §6.9's S5 gate is "N readers × cached stat/s". It
    needs the tcp substrate (`SQZ_DEVSUB_TRANSPORT=tcp`, the two-substrate rule)
    or a real fabric, one writer host and N reader hosts sharing the namespaces,
-   and a sustained ≥ 60 s row per the sustained-state rule. Not runnable from
-   this branch: the cluster venue is held by a live mount.
+   and a sustained ≥ 60 s row per the sustained-state rule. **Not runnable
+   here and deliberately not attempted:** the cluster venue is held by a live
+   mount, and user ruling **D11** (2026-08-03) parks every bench, full suite
+   and release gate until the DLM can demonstrate N readers *and* writers. The
+   row is the demonstration, not a precondition for it — everything it needs
+   from the daemon side is now in the tree.
 3. **Item 3** for the silent-window elimination (above), which is also the
    multi-writer prerequisite §6.3 names.
 4. **Reader visibility** (`squeezefs clients` lists no readers today) — S6.
@@ -186,7 +198,12 @@ In dependency order — nothing below is a change of plan, all of it is stated i
   throughput claim.
 * No cluster, mount-level or fabric row is claimed by this note. No scoreboard
   row was run. No `.benchmarks` sustained row exists for the reader path yet —
-  item 2 gates the honest version of it.
+  and none was attempted for the item-2 wiring: under D11 that work re-used the
+  numbers already priced here (`cargo check` / clippy / fmt / the two targeted
+  suites only, no bench of any form, including `-- --test` smoke). The gate's
+  cost did not change — the wiring moved *where* the poll and the purge are
+  called from, not what they do per call — but that is reasoning, not a
+  re-measurement, and it is labelled as such.
 * The one measured *product* claim made here is negative and it is the
   important one: **the reader gate costs the writer 391 ps per gated site**,
   which is inside the noise of the site it rides.

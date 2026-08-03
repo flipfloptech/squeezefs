@@ -804,6 +804,35 @@ async fn advisory_integration_phases() {
     h.fs.router.cache.read_lane_hold.purge(map.get(&0).unwrap());
     let d = read_at(&h, ino, 128 * 1024, 65536).await;
     assert!(d.iter().all(|&x| x == 1));
+    // PERF-11 (558e26ef): the ghost-admitted fill's tier publish is
+    // DEFERRED off the serve path (the publish task owns the single-flight
+    // guard; the reader's bytes no longer wait on the mmap write). Wait
+    // for that fetch-time publish to become tier-visible BEFORE removing
+    // it — otherwise the removal races the deferred task, the publish
+    // lands after it, and the Yellow assert below misattributes the
+    // fetch-time copy (admitted at Green, legitimate per §5.7 — Yellow
+    // pauses DEHYDRATION, and the tier-publish pause is the RED
+    // unreclaimable arm's) to the dehydration worker. This was the §3c
+    // known-red: the pre-PERF-11 fixture assumed the publish was awaited.
+    let mut published = false;
+    for _ in 0..500 {
+        if h.fs
+            .router
+            .cache
+            .nvme
+            .get_cached_read_block(map.get(&0).unwrap())
+            .is_some()
+        {
+            published = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        published,
+        "the ghost-admitted second miss must tier-publish (deferred, \
+         guard-owned — the PERF-11 ordering property)"
+    );
     h.fs.router
         .cache
         .nvme
@@ -1037,24 +1066,43 @@ async fn advisory_integration_phases() {
     let paused0 = METRICS.read_tier_publishes_paused.load(Ordering::Relaxed);
     let d = read_at(&h3, ino_e, 0, 4096).await;
     assert!(d.iter().all(|&x| x == 70), "paused fill still serves");
+    // PERF-11: the ghost-admitted publish is deferred off the serve path,
+    // so the funnel's pause verdict (skip + count) lands asynchronously —
+    // wait for the COUNT first; once counted, the funnel already returned
+    // without a put, so the is_none below is stable, not a lucky-early
+    // read (same deferral class as the phase-A sync point above).
+    let mut pause_counted = false;
+    for _ in 0..500 {
+        if METRICS.read_tier_publishes_paused.load(Ordering::Relaxed) > paused0 {
+            pause_counted = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        pause_counted,
+        "paused publishes are counted (observability)"
+    );
     assert!(
         h3.fs.router.cache.nvme.get_cached_read_block(&k0).is_none(),
         "a ghost-admitted fill must NOT reach the tier while paused"
     );
-    assert!(
-        METRICS.read_tier_publishes_paused.load(Ordering::Relaxed) > paused0,
-        "paused publishes are counted (observability)"
-    );
 
-    // Unpause: the next ghost-admitted fill publishes again.
+    // Unpause: the next ghost-admitted fill publishes again (deferred —
+    // poll for tier visibility, the PERF-11 ordering property).
     mem_budget::MEM_BUDGET.force_tier_publish_paused_for_test(false);
     h3.fs.router.cache.purge_block_key(&k0);
     let d = read_at(&h3, ino_e, 0, 4096).await;
     assert!(d.iter().all(|&x| x == 70));
-    assert!(
-        h3.fs.router.cache.nvme.get_cached_read_block(&k0).is_some(),
-        "publishes resume after the pause releases"
-    );
+    let mut republished = false;
+    for _ in 0..500 {
+        if h3.fs.router.cache.nvme.get_cached_read_block(&k0).is_some() {
+            republished = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(republished, "publishes resume after the pause releases");
     drop(h3);
 
     // ---- Phase F: Red parked-buffer admission BLOCKS (awaited drain

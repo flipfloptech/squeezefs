@@ -1228,6 +1228,8 @@ fn bench_free_grace_gate(c: &mut Criterion) {
     group.finish();
     free_grace::reset_for_test();
     squeezefs::membership::uninstall();
+}
+
 /// DLM **S9** blocker #3 — the **data-plane allocation partition**
 /// (`src/data_alloc_lane.rs`, `docs/design-mw-data-alloc-partition.md`).
 ///

@@ -584,8 +584,25 @@ fn bench_layout_publish(c: &mut Criterion) {
 /// one shared extraction path). The `_bare` rows are the shipped
 /// (un-stamped) forms and are the numbers the `offset ‖ incarnation` key
 /// must not move; ruling D9 keeps the bit un-stamped, so bare IS the
-/// shipped path. Evidence note:
-/// `.benchmarks/2026-08-05-mw-cursors-and-incarnation.md`.
+/// shipped path.
+///
+/// **No numbers yet — ruling D11** ("no cargo test, benches or release gate
+/// yet until we are done implementing the DLM and can have N Readers and
+/// Writers"): this group is coverage that must EXIST, and its measurement
+/// is deferred to the first post-DLM window. Stated so the deferred run has
+/// something to refute:
+///
+/// * **prediction** — every `*_bare*` row lands within the harness's own
+///   group threshold of its pre-item-6 value (the added work on those rows
+///   is one relaxed load in `persist_block_key` and no added branch in the
+///   parse's success path), and each `*_stamped*` row costs strictly more
+///   than its bare twin but by a constant (one map read; one ≤ 13-char
+///   base-36 render; one `@` split on the parse);
+/// * **falsification** — a `*_bare*` row past the threshold (the item-6
+///   gate leaked onto the shipped path — hoist the gate to the publish
+///   batch, never drop the lifetime), or a `*_stamped*` row scaling with
+///   key length rather than sitting at a constant delta (the codec is
+///   allocating or re-scanning per digit).
 ///
 /// FIELD shapes: the default-slot bare offset (`4194304` — what
 /// `persist_block_key` emits for every single-volume filesystem), the
@@ -594,8 +611,11 @@ fn bench_layout_publish(c: &mut Criterion) {
 /// clip publishes, the W1-ineligible population).
 fn bench_block_key_codec(c: &mut Criterion) {
     use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::meta_backend::kv::journal::AppendPartition;
     use squeezefs::nvme_dev::NvmeBlockDev;
-    use squeezefs::routing::{clean_block_key, is_whole_block_mapping, BackendRouter};
+    use squeezefs::routing::{
+        block_key_with_incarnation, clean_block_key, is_whole_block_mapping, BackendRouter,
+    };
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
     use tokio::runtime::Runtime;
@@ -612,7 +632,7 @@ fn bench_block_key_codec(c: &mut Criterion) {
         let router = BackendRouter::new(alloc.clone(), dev, Arc::new(AtomicU64::new(BLOCK as u64)));
         (alloc, router)
     });
-    let _ = &alloc;
+    alloc.set_capacity_bytes(64 * 1024 * 1024 * 1024);
 
     let mut group = c.benchmark_group("write_block_key");
     group.throughput(Throughput::Elements(1));
@@ -642,6 +662,65 @@ fn bench_block_key_codec(c: &mut Criterion) {
     group.bench_function("whole_block_predicate_bare", |b| {
         b.iter(|| black_box(is_whole_block_mapping(black_box("vol-00aa11bb://4194304"))))
     });
+
+    // ---- The ENGAGED (incompat bit 13) forms: what a Phase-8-stamped
+    // volume pays. Nothing stamps the bit today, so these are the cost of
+    // the upgrade, not of the shipped path.
+    router
+        .engage_incarnation_keys(7, AppendPartition::SOLO)
+        .expect("engage era 7");
+    let stamped_offset = rt.block_on(async { alloc.allocate_block().await.expect("allocate") });
+    let stamped_key = router.persist_block_key("backend_0", stamped_offset);
+    let stamped_named = block_key_with_incarnation(
+        "vol-00aa11bb://4194304",
+        squeezefs::routing::compose_incarnation(7, 4_242).expect("stamp"),
+    );
+    group.bench_function("persist_stamped_default_slot", |b| {
+        b.iter(|| {
+            black_box(router.persist_block_key(black_box("backend_0"), black_box(stamped_offset)))
+        })
+    });
+    group.bench_function("parse_stamped_default_slot", |b| {
+        b.iter(|| {
+            black_box(
+                router
+                    .parse_block_key_parts(black_box(&stamped_key))
+                    .expect("parse"),
+            )
+        })
+    });
+    group.bench_function("parse_stamped_named_volume", |b| {
+        b.iter(|| {
+            black_box(
+                router
+                    .parse_block_key_parts(black_box(&stamped_named))
+                    .expect("parse"),
+            )
+        })
+    });
+    // The read/free path's validation: the offset's live lifetime matches
+    // the key's (the only outcome a healthy mount ever produces).
+    group.bench_function("validate_stamped_hit", |b| {
+        b.iter(|| black_box(router.block_key_incarnation_ok(black_box(&stamped_key))))
+    });
+    let stamped_decorated = format!("{stamped_named}:0:4194304");
+    group.bench_function("clean_stamped_decorated", |b| {
+        b.iter(|| black_box(clean_block_key(black_box(&stamped_decorated))))
+    });
+    // The key-BYTE delta — STRUCTURAL, not timed: it is what a layout
+    // publish pays per map entry (the journal-byte term the
+    // write-commit-economy campaign collapsed), and it is deterministic, so
+    // it is reportable under ruling D11 while the ns/op rows are not.
+    let stamped_inc = squeezefs::routing::block_key_incarnation(&stamped_key)
+        .expect("a stamped key names a lifetime");
+    println!(
+        "  [key bytes] bare {} -> stamped {} ({:+} B/entry, era {} seq {})",
+        stamped_offset.to_string().len(),
+        stamped_key.len(),
+        stamped_key.len() as i64 - stamped_offset.to_string().len() as i64,
+        squeezefs::routing::incarnation_era(stamped_inc),
+        stamped_inc & squeezefs::routing::INCARNATION_SEQ_MAX,
+    );
 
     group.finish();
 }

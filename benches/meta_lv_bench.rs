@@ -1120,8 +1120,21 @@ fn bench_append_partition(c: &mut Criterion) {
 ///
 /// This group prices the **solo** forms FIRST: they are the numbers the
 /// per-writer lane partitioning must not move (ruling D9 keeps the format
-/// un-stamped, so solo IS the shipped path). Evidence note:
-/// `.benchmarks/2026-08-05-mw-cursors-and-incarnation.md`.
+/// un-stamped, so solo IS the shipped path).
+///
+/// **No numbers yet — ruling D11** (benches and brackets are deferred until
+/// the DLM admits N readers and writers); the coverage must exist, so the
+/// claim it will be measured against is stated instead:
+///
+/// * **prediction** — `mint_native` stays a bare `fetch_add` and holds its
+///   pre-item-5 value; `mint_guest` holds its VL5b value; and
+///   `live_inodes_64_cursors` stays linear in the cursor count with no
+///   per-lane term (lane cursors are empty on an un-stamped volume, which
+///   is every volume — the read side is one relaxed latch load);
+/// * **falsification** — any of the three moving past its group threshold
+///   with the format un-stamped, which would mean the lane machinery is
+///   being consulted on the solo path (it must not be) rather than gated
+///   behind the `lanes_live` latch.
 ///
 /// FIELD shapes (never toys):
 /// * `mint_native` — one `allocate_ino()`: the §4.8 `fetch_add` every

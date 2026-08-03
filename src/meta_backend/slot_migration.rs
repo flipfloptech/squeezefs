@@ -260,8 +260,15 @@ fn tree_bounds(ks: &SlotKeyspace, tree_idx: usize) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Whether `(tree_idx, key, value)` is a PER-VOLUME control record that
-/// must never travel with a slot (the volume's own `writer_claim` and
-/// its DLM-S2 `writer_term` era ladder, both at its keyspace root).
+/// must never travel with a slot: the volume's own `writer_claim`, its
+/// DLM-S2 `writer_term` era ladder, and — since DLM **S6** — its
+/// `membership_owner` rendezvous record and the §6.2 item-7 `claim_set`,
+/// all at its keyspace root. The S6 pair belongs to the VOLUME, not to
+/// the routed set: the rendezvous record names the process serving THIS
+/// volume's membership authority and both are read at LOCAL ino 1, so a
+/// copy in another volume's guest keyspace would be unreadable residue
+/// while the source's own record would have been carried away from the
+/// only place anything looks for it.
 /// `client:` heartbeat records DO travel — they are routed-set records
 /// on global ino 1 and the registration scanners look for them in the
 /// slot-0 keyspace.
@@ -279,6 +286,8 @@ fn is_pinned_control_record(ks: &SlotKeyspace, tree_idx: usize, key: &[u8], valu
         Ok(x) => {
             x.name == crate::meta_backend::kv::backend::WRITER_CLAIM_XATTR.as_bytes()
                 || x.name == crate::meta_backend::kv::backend::WRITER_TERM_XATTR.as_bytes()
+                || x.name == crate::membership::MEMBERSHIP_OWNER_XATTR.as_bytes()
+                || x.name == crate::membership::CLAIM_SET_XATTR.as_bytes()
         }
         Err(_) => false,
     }

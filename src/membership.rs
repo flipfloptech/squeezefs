@@ -1548,13 +1548,16 @@ impl MembershipArm {
     }
 
     /// Stop the plane: end the cadence tasks, remove the rendezvous record
-    /// (an owner) so the volume presents as un-served, and uninstall.
+    /// (an OWNER only — a member must never touch the owner's record, and a
+    /// read-only member could not write it anyway) so the volume presents
+    /// as un-served, and uninstall.
     pub async fn disarm(mut self) {
         self.stop.store(true, Ordering::Release);
+        let owner = self.plane.is_some();
         if let Some(plane) = self.plane.take() {
             plane.shutdown();
         }
-        for be in &self.volumes {
+        for be in self.volumes.iter().filter(|_| owner) {
             if let Err(e) = clear_owner_record(be).await {
                 log::warn!(
                     "membership: could not remove the rendezvous record from {}: {e} (a stale \
@@ -1612,7 +1615,7 @@ pub async fn arm_mount_membership(
     };
 
     if read_only {
-        return arm_member(meta, &volumes, secret, on_purge).await;
+        return arm_member(&volumes, secret, on_purge).await;
     }
     let bind_addr = match bind {
         MembershipBind::Off => {
@@ -1752,7 +1755,6 @@ async fn arm_owner(
 }
 
 async fn arm_member(
-    meta: &Arc<crate::meta_backend::RoutedMetaBackend>,
     volumes: &[Arc<KvMetaBackend>],
     secret: Vec<u8>,
     on_purge: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -1825,7 +1827,9 @@ async fn arm_member(
     );
     Ok(Some(MembershipArm {
         plane: None,
-        volumes: meta.volumes.clone(),
+        // A member owns no durable record, so it has nothing to clear at
+        // disarm — and must never remove the OWNER's.
+        volumes: Vec::new(),
         stop,
         tasks: vec![task],
         mode: "member",

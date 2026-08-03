@@ -195,12 +195,18 @@ extraction would only ever test the re-implementation.
 
 * At **mount**: `SQUEEZEFS_BLOCK_REFS_VERIFY=1`. Off by default, because
   running it pays the very walk the records exist to delete.
-* In **fsck**: unconditional, as class **C8** (`C8DurableRefDrift`), with the
-  §5.6 verify-before-report re-check. `meta_kv_block_refs_drift` is a
+* In **fsck**: class **C8** (`C8DurableRefDrift`), with the §5.6
+  verify-before-report re-check. `meta_kv_block_refs_drift` is a
   **must-stay-0** tripwire. C8 repair is deliberately **refused**: restating
   the ledger from the walk would erase the evidence of *why* the invariant
   broke, and the layouts remain authoritative either way (they are the
   justification; the ledger is its index).
+
+  **C8 detection is gated on the same `SQUEEZEFS_BLOCK_REFS_VERIFY=1` knob
+  until the write-path wiring is complete — see §11.** Everything else about
+  the class (verification, planning, the repair refusal, the counter) is
+  wired; only the *unconditional* detection waits, so a true finding does not
+  arrive as noise on healthy volumes.
 
 ---
 
@@ -353,3 +359,59 @@ not in this work:
    range-shared, the patch predicate needs `patch_ineligible_range_shared` so
    predicate rot stays visible. The durable refcount is the input that makes
    the clause decidable across nodes.
+
+---
+
+## 11. Known incomplete: the write-path wiring, and how to finish it
+
+**The oracle works, and it says the wiring is not finished.** Turning
+`SQUEEZEFS_BLOCK_REFS_VERIFY=1` on across `tests/fsck_tests.rs`'s healthy
+populations reports drift of two shapes:
+
+| Shape | Meaning |
+|---|---|
+| `0 durable vs N derived` | a **take** was missed: some site published a layout naming a block without staging its reference |
+| `N durable vs 0 derived` | a **release** was missed: some site displaced or pruned a mapping without staging the release |
+
+Wired so far (and green under the router-level acceptance suite):
+
+* `merge_block_mappings_if_epoch` — all four `BlockMapOp` arms (write-through
+  merge, mover `MergeExpected`, `TruncateFrom`, `RemoveBlocks`);
+* `publish_pass` — the coalescing publish conveyor, per **applied** op;
+* `clone_file` — the dest's whole reference set;
+* `save_metadata_to_backend_ext` — the indirect-map blob's own reference and
+  its DUR-6 CoW predecessor's release;
+* the four whole-map-swap sites: staged→striped promotion, the StorageFull
+  durable spill, the staged whole-image promotion, the staged truncate prune;
+* `delete_file` — the reclaim teardown.
+
+Not yet wired: the remaining layout-publishing paths the FUSE write path
+reaches (`persist_dirty_layout_if_needed`'s republish class and the
+staged-family flip sites that save a map they did not themselves diff). The
+finishing procedure is mechanical and self-checking:
+
+1. run the fsck suite with `SQUEEZEFS_BLOCK_REFS_VERIFY=1`;
+2. take one drifting block, and identify the save site that published its
+   mapping (`publish_phase_ns` / the `SQUEEZEFS_FREE_FORENSICS` merge tape
+   both name it);
+3. give that site its delta — `block_ref_ops` where the site knows the
+   changed entries, `block_ref_ops_for_map_swap` where it replaces a whole
+   map;
+4. repeat until the suite is drift-free, then **delete the env gate on the
+   C8 detection block** (the removal condition is written at the gate).
+
+Two related items that belong with that work:
+
+* **Backfill on engage.** A volume stamped by the Phase-8 window has existing
+  layouts and an EMPTY ledger. `recover_durable_block_refs` must not treat an
+  empty ledger as "no references" on such a volume — it would hand live
+  blocks to the next writer. The safe rule, and the one to implement: **an
+  empty durable population is never authoritative** — fall back to the
+  derived walk (cheap when the ledger is empty because the volume is empty)
+  and *persist* what it finds. Until that lands, stamping an existing
+  **non-empty** volume is unsafe; stamping an empty one is fine, which is what
+  `stamping_the_bit_engages_accounting_on_the_next_mount` covers.
+* **The whole-reference oracle.** `verify_durable_block_refs` compares
+  per-block *counts*. Comparing full `(owner_ino, block_index)` tuples would
+  localize a drift to its owning inode instead of its block, which is what
+  step 2 above currently does by hand.

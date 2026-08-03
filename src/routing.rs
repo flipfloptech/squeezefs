@@ -4085,6 +4085,44 @@ impl DataRouter {
         backend.commit_block_refs(ino, ops).await
     }
 
+    /// The exact durable-reference delta between an ino's PREVIOUS block
+    /// map and its NEW one (spec §6.2 item 1) — for the layout-REPLACING
+    /// save sites that do not go through the merge primitive: the
+    /// staged→striped promotion, the StorageFull durable spill, the staged
+    /// whole-image promotion, and the staged truncate's prune.
+    ///
+    /// Those sites build a whole map and save it, so they are already
+    /// O(map); diffing per index adds no order of growth. The merge
+    /// primitive's O(batch) path (`block_ref_ops`) stays the hot one.
+    pub(crate) fn block_ref_ops_for_map_swap(
+        &self,
+        ino: u64,
+        old: Option<&std::collections::HashMap<u32, String>>,
+        new: Option<&std::collections::HashMap<u32, String>>,
+    ) -> Vec<crate::meta_backend::kv::block_refs::BlockRefOp> {
+        let empty = std::collections::HashMap::new();
+        let old = old.unwrap_or(&empty);
+        let new = new.unwrap_or(&empty);
+        let mut changes: Vec<(u32, String, bool)> = Vec::new();
+        for (idx, key) in new {
+            match old.get(idx) {
+                // Unchanged binding: no reference changes hands.
+                Some(prev) if prev == key => {}
+                Some(prev) => {
+                    changes.push((*idx, prev.clone(), false));
+                    changes.push((*idx, key.clone(), true));
+                }
+                None => changes.push((*idx, key.clone(), true)),
+            }
+        }
+        for (idx, key) in old {
+            if !new.contains_key(idx) {
+                changes.push((*idx, key.clone(), false));
+            }
+        }
+        self.block_ref_ops(ino, &changes)
+    }
+
     /// Translate a merge's `(map index, block key, taken?)` changes into
     /// durable [`crate::meta_backend::kv::block_refs::BlockRefOp`]s (spec
     /// §6.2 item 1).
@@ -8980,7 +9018,13 @@ impl DataRouter {
                 updated_meta.size = new_size as u64;
                 updated_meta.block_map = Some(std::sync::Arc::new(block_map));
                 updated_meta.file_id = None;
-                self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
+                // Spec §6.2 item 1: the promotion's whole-map swap, exactly.
+                let refs = self.block_ref_ops_for_map_swap(
+                    ino,
+                    meta.block_map.as_deref(),
+                    updated_meta.block_map.as_deref(),
+                );
+                self.save_metadata_to_backend_refs(ino, &updated_meta, fencing_token, &refs)
                     .await?;
 
                 self.cache.write_lru.remove(file_path);
@@ -9261,7 +9305,13 @@ impl DataRouter {
                     updated_meta.block_map = Some(std::sync::Arc::new(block_map));
                     // Durable backend write already happened — commit layout now.
                     updated_meta.layout_dirty = false;
-                    self.save_metadata_to_backend(ino, &updated_meta, fencing_token)
+                    // Spec §6.2 item 1: the spill's whole-map swap.
+                    let refs = self.block_ref_ops_for_map_swap(
+                        ino,
+                        meta.block_map.as_deref(),
+                        updated_meta.block_map.as_deref(),
+                    );
+                    self.save_metadata_to_backend_refs(ino, &updated_meta, fencing_token, &refs)
                         .await?;
                     // DUR-8f: the layout names the block — custody
                     // transferred; from here the ordinary free paths own it.
@@ -11481,7 +11531,13 @@ impl DataRouter {
                 // FIND-M11-A: the merge presents the ino's CURRENT
                 // generation, read at the last responsible moment.
                 let merge_token = self.dlm.get_fencing_token_ino(ino);
-                self.save_metadata_to_backend(ino, &updated_meta, merge_token)
+                // Spec §6.2 item 1: the promotion's whole-map swap.
+                let refs = self.block_ref_ops_for_map_swap(
+                    ino,
+                    meta.block_map.as_deref(),
+                    updated_meta.block_map.as_deref(),
+                );
+                self.save_metadata_to_backend_refs(ino, &updated_meta, merge_token, &refs)
                     .await?;
                 self.metadata_cache.insert(ino, updated_meta);
                 self.cache.write_lru.remove(&file_path);
@@ -12130,6 +12186,11 @@ impl DataRouter {
                 None => self.fetch_metadata_from_backend(ino).await?,
             };
             let mut updated = current.unwrap_or(meta);
+            // Spec §6.2 item 1: the PRE-prune map (the accounting base) —
+            // captured before the retain below mutates it, off the same
+            // authority the prune is applied to.
+            let pre_prune_map: Option<std::collections::HashMap<u32, String>> =
+                updated.block_map.as_deref().cloned();
             let mut blocks_to_free: Vec<String> = Vec::new();
             // Published = our clipped block took `block_map[0]`. A racing
             // promotion that re-published the mapping since our snapshot
@@ -12164,7 +12225,15 @@ impl DataRouter {
             }
             updated.size = new_size;
             updated.cached_at = std::time::Instant::now();
-            self.save_metadata_to_backend(ino, &updated, fencing_token)
+            // Spec §6.2 item 1: the prune's whole-map swap (the pruned
+            // `block_map[0]` loses its durable reference in the same
+            // transaction that stops naming it).
+            let refs = self.block_ref_ops_for_map_swap(
+                ino,
+                pre_prune_map.as_ref(),
+                updated.block_map.as_deref(),
+            );
+            self.save_metadata_to_backend_refs(ino, &updated, fencing_token, &refs)
                 .await?;
             self.metadata_cache.insert(ino, updated);
 

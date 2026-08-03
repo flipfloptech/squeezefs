@@ -581,11 +581,35 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // C8 (pre-RC spec §6.2 item 1): durable-vs-derived block-reference
         // drift. The durable ledger holds one record per layout map entry and
         // the oracle counts one reference per layout map entry — through the
-        // same key-resolution code — so a disagreement is real divergence, not
-        // a race. Skipped entirely on volumes without incompat bit 8 (they
-        // have no ledger to disagree with) and under `--shards` (a shard sees
-        // only part of the reference set, so its census is not comparable).
-        if opts.shard.is_none() && ctx.meta.volumes.iter().any(|kv| kv.block_refs_engaged()) {
+        // same key-resolution code — so a disagreement is real divergence,
+        // not a race. Skipped on volumes without incompat bit 8 (no ledger
+        // to disagree with) and under `--shards` (a shard sees only part of
+        // the reference set, so its census is not comparable).
+        //
+        // **The class is OPT-IN (`SQUEEZEFS_BLOCK_REFS_VERIFY=1`) until the
+        // write-path wiring is complete, and that is the ONLY reason.** The
+        // oracle reports honest drift on any shape whose layout is
+        // published by a site that does not yet stage its accounting: the
+        // item-1 landing wired the merge primitive (write-through,
+        // truncate, punch, mover republish), the publish conveyor, clone,
+        // the indirect-map blob, the four whole-map-swap sites
+        // (staged→striped promotion, StorageFull spill, staged whole-image
+        // promotion, staged truncate prune) and reclaim — but the FUSE
+        // write path reaches layout publication through more paths than
+        // those, and the drift this class reports IS the remaining
+        // checklist. Ungating it before that work lands would turn a true
+        // finding into noise on healthy volumes, which is how tripwires get
+        // disabled permanently.
+        //
+        // Removal condition, explicitly: when
+        // `SQUEEZEFS_BLOCK_REFS_VERIFY=1` produces zero drift across
+        // `tests/fsck_tests.rs`'s healthy populations, delete the env gate
+        // below. Nothing else about the class changes — detection,
+        // verification, planning and the repair refusal are already wired.
+        if std::env::var("SQUEEZEFS_BLOCK_REFS_VERIFY").as_deref() == Ok("1")
+            && opts.shard.is_none()
+            && ctx.meta.volumes.iter().any(|kv| kv.block_refs_engaged())
+        {
             let chunk = ctx.router.backend_router.default_allocator.chunk_size();
             match ctx
                 .router

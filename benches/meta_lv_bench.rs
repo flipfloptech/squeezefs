@@ -5,7 +5,7 @@ use squeezefs::meta_backend::kv::bset::{build_bset, lookup, merge, BsetView};
 use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
 use squeezefs::meta_backend::kv::node::{NodeLayout, DEFAULT_NODE_SIZE};
 use squeezefs::meta_backend::kv::node_cache::{
-    NodeCache, NodeCacheConfig, DEFAULT_WRITEBACK_DELTA_BYTES,
+    NodeCache, NodeCacheConfig, RootEpoch, DEFAULT_WRITEBACK_DELTA_BYTES,
 };
 use squeezefs::meta_backend::kv::record::{
     dentry_key, dentry_name_hash54, inode_key, DentryValue, InodeDelta, InodeValue, Record,
@@ -494,6 +494,14 @@ fn bench_kv_tree(c: &mut Criterion) {
 ///   multi-directory walk (`find`) actually presents.
 /// * `try_get_absent` — the unmapped-address probe (the demand-page
 ///   entry), so the miss classification cost is on the record too.
+/// * `try_get_hit_armed` — the same probe on a cache that armed reader
+///   revalidation, so the epoch compare is a real one (nonzero vs nonzero)
+///   rather than `0 == 0`.
+/// * `revalidate_inert_poll` — what the derived cadence costs when the
+///   writer minted no record: the common case, and the one that must be
+///   ~nothing.
+/// * `revalidate_drop_pass/64` — a root flip releasing 64 mapped nodes:
+///   the drop pass, the clock-ring drain, and the budget credits.
 fn bench_kv_node_cache(c: &mut Criterion) {
     use squeezefs::meta_backend::kv::node::{write_node, NodeWriteParams, MIN_NODE_SIZE};
 
@@ -554,6 +562,67 @@ fn bench_kv_node_cache(c: &mut Criterion) {
     let absent = cache.extent_addr(NODES); // written by nobody, never mapped
     group.bench_function("try_get_absent", |b| {
         b.iter(|| black_box(cache.try_get(black_box(absent))).is_none());
+    });
+
+    // ---- The spec §6.8 item-2 reader rows (this cache is ARMED from here
+    // on, so the rows above must be measured first — the hit-path rows are
+    // the un-armed, shipped posture by construction).
+    let armed = NodeCache::new(NodeCacheConfig {
+        path: file.path().to_path_buf(),
+        layout,
+        heap_base: 0,
+        budget_bytes: (NODES + 1) * node_size as u64,
+        writeback_delta_bytes: DEFAULT_WRITEBACK_DELTA_BYTES,
+    });
+    armed
+        .arm_revalidation(&RootEpoch::synthetic(1, 0, &[]), None)
+        .expect("arm");
+    rt.block_on(async {
+        for addr in &addrs {
+            armed.load(*addr).await.expect("load").expect("mapped");
+        }
+    });
+
+    // The armed hit path: the same probe with a NONZERO epoch in force, so
+    // the compare is a real one instead of 0 == 0.
+    group.bench_function("try_get_hit_armed", |b| {
+        b.iter(|| black_box(armed.try_get(black_box(hot))).is_some());
+    });
+
+    // An inert poll — the cadence's cost when the writer minted nothing.
+    // This is what a reader pays per interval in the common case.
+    let same = RootEpoch::synthetic(1, 0, &[]);
+    group.bench_function("revalidate_inert_poll", |b| {
+        b.iter(|| black_box(armed.revalidate(black_box(&same))).advanced);
+    });
+
+    // The drop pass on a root flip: `NODES` mapped nodes released, the clock
+    // ring drained and re-seeded, the budget credited.
+    //
+    // `iter_custom`, not `iter_batched`: criterion runs a batch's setups
+    // BEFORE its timed routines, so with batching only the first pass of each
+    // batch would find a populated map and the row would report the cost of
+    // sweeping an empty cache (measured: ~1 ns/node — the tell). Here the
+    // reload is re-run per iteration and explicitly excluded from the clock.
+    let mut epoch = 1u64;
+    group.bench_function(BenchmarkId::new("revalidate_drop_pass", NODES), |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                rt.block_on(async {
+                    for addr in &addrs {
+                        armed.load(*addr).await.expect("load").expect("mapped");
+                    }
+                });
+                epoch += 1;
+                let ep = RootEpoch::synthetic(epoch, 0, &[]);
+                let t0 = std::time::Instant::now();
+                let dropped = black_box(armed.revalidate(black_box(&ep))).dropped;
+                total += t0.elapsed();
+                assert_eq!(dropped, NODES, "the pass must sweep a populated cache");
+            }
+            total
+        });
     });
 
     group.finish();

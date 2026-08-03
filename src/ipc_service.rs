@@ -430,13 +430,30 @@ impl Drop for DataPlaneSink {
         // Engine teardown is the sink's job (the reaper thread holds an
         // Arc of the engine, so Drop-on-Arc alone would never fire):
         // flag + NOP wake + join, draining in-flight CQEs first.
-        if let Some(Some(engine)) = self.direct.get() {
-            engine.shutdown();
-        }
+        //
+        // RES-12: this join is the BACKSTOP. The daemon's teardown calls
+        // `IpcHost::shutdown` inside `spawn_blocking`, which invokes
+        // `shutdown_threads` below, so the reaper is normally already
+        // joined by the time the last sink Arc drops (wherever that lands).
+        // `DirectDriveEngine::shutdown` is idempotent — its
+        // `shutting_down.swap(true)` gate returns immediately on the second
+        // call and the reaper handle is already taken — so keeping the join
+        // here costs nothing and preserves the drain contract for paths
+        // that never run a host shutdown (tests, error unwinds).
+        self.shutdown_engine();
     }
 }
 
 impl DataPlaneSink {
+    /// RES-12: the idempotent engine teardown shared by
+    /// [`SessionSink::shutdown_threads`] (the ordered, blocking-pool path)
+    /// and `Drop` (the backstop).
+    fn shutdown_engine(&self) {
+        if let Some(Some(engine)) = self.direct.get() {
+            engine.shutdown();
+        }
+    }
+
     pub fn new(fs: SqueezefsFilesystem) -> Self {
         Self {
             fs: Arc::new(fs),
@@ -926,6 +943,13 @@ impl SessionSink for DataPlaneSink {
         if let Some(Some(engine)) = self.direct.get() {
             engine.flush();
         }
+    }
+
+    /// RES-12: join the direct-drive reaper from the host's shutdown hop
+    /// (which the daemon runs inside `spawn_blocking`), not from whichever
+    /// tokio worker drops the last sink Arc.
+    fn shutdown_threads(&self) {
+        self.shutdown_engine();
     }
 }
 

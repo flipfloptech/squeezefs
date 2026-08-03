@@ -116,6 +116,96 @@ pub static FS_PREFIX: RwLock<&'static str> = RwLock::new("squeezefs");
 pub static WRITE_VERIFICATION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// VAL-7h (pre-RC spec §3): open the `--log-file` target for append —
+/// mode `0600`, `O_NOFOLLOW`, never truncating.
+///
+/// The pre-fix opens (three of them: the parent preflight, the post-fork
+/// stdio redirect, and the `env_logger` pipe) were plain
+/// `create(true).append(true)` — mode `0644` with symlink following. The
+/// daemon log carries backing-device paths, staging directories, object
+/// key names and refusal detail, so a world-readable log is a disclosure
+/// channel; and a symlink planted at a predictable log path (e.g. under a
+/// shared `/var/log` or `/tmp`) made a root daemon append through it to
+/// any file on the box. `O_NOFOLLOW` refuses that with `ELOOP` — loudly,
+/// which ENG-3's "the daemon must be audible" law then turns into a failed
+/// mount rather than a silent redirect.
+///
+/// Existing regular files keep their bytes (append) and their mode is left
+/// alone — an operator who deliberately widened a log target is not
+/// second-guessed; only files this daemon CREATES are 0600.
+pub fn open_log_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+/// The standard system search path — the fallback when nothing in the
+/// inherited `PATH` survives [`sanitized_root_path`].
+const DEFAULT_ROOT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// VAL-7h/VAL-7i (pre-RC spec §3): filter an inherited `PATH` down to
+/// entries safe to resolve **root** subprocesses through.
+///
+/// SqueezeFS runs ~63 argv-only root subprocesses (`nvme`, `modprobe`,
+/// `gcc`, `git`, `fusermount3`, …). Argv-only is the correct discipline
+/// (no shell), but the *resolution* still walked whatever `PATH` the
+/// caller supplied: a relative entry, an empty entry (which means the
+/// CWD), or a group/world-writable directory ahead of `/usr/bin` lets any
+/// local user choose the binary a root subprocess executes.
+///
+/// Dropped: empty entries, relative entries, non-directories, and
+/// directories writable by group or other. Kept in the caller's order
+/// (operators legitimately front-load `/usr/local/bin` for SPDK tooling).
+/// An input with no survivors yields [`DEFAULT_ROOT_PATH`] rather than an
+/// empty `PATH` — an empty `PATH` resolves nothing and would break every
+/// verb with a confusing error instead of a hardened one.
+pub fn sanitized_root_path(input: &str) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let mut kept: Vec<&str> = Vec::new();
+    for entry in input.split(':') {
+        if entry.is_empty() || !entry.starts_with('/') {
+            continue;
+        }
+        let Ok(md) = std::fs::metadata(entry) else {
+            continue;
+        };
+        if !md.is_dir() || md.mode() & 0o022 != 0 {
+            continue;
+        }
+        if !kept.contains(&entry) {
+            kept.push(entry);
+        }
+    }
+    if kept.is_empty() {
+        return DEFAULT_ROOT_PATH.to_string();
+    }
+    kept.join(":")
+}
+
+/// Apply [`sanitized_root_path`] to this process's `PATH` when running
+/// with euid 0 — one call at startup covers every root subprocess site.
+/// A no-op for unprivileged runs (there the caller's `PATH` is the
+/// caller's own risk, and rewriting it would break user tooling).
+pub fn harden_root_subprocess_path() {
+    // SAFETY: geteuid is trivially safe.
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let before = std::env::var("PATH").unwrap_or_default();
+    let after = sanitized_root_path(&before);
+    if after != before {
+        log::info!(
+            "root subprocess PATH sanitized (VAL-7i): dropped relative/empty/\
+             group-or-world-writable entries; using '{after}'"
+        );
+        std::env::set_var("PATH", &after);
+    }
+}
+
 /// When write verification is enabled, check every N-th write (P2-9).
 /// `1` = verify every write (historical default).
 static WRITE_VERIFICATION_SAMPLE_N: std::sync::atomic::AtomicU64 =

@@ -2,15 +2,87 @@ use crate::error::Result;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// RES-19 (pre-RC spec §7): retention of the free-forensics tape.
+///
+/// The tape held one FULL `Backtrace` string (kilobytes) per distinct
+/// offset ever freed, forever, in an insert-only global map — and the
+/// insert runs on the write path whenever the env knob is set. A
+/// double-release investigation only ever needs the recent frees, so the
+/// tape is a bounded ring: N entries, oldest evicted.
+pub const FREE_FORENSICS_TAPE_CAP: usize = 4096;
+
 /// FIND-RW5-A double-release forensics tape (env-gated by
 /// `SQUEEZEFS_FREE_FORENSICS`, diagnostic-only): the last recorded free
 /// backtrace per offset, shared by `finish_free` (records + pairs a
 /// DOUBLE FREE) and `begin_free`'s refusal arm (pairs a REFUSED release
 /// with the first free that emptied the refcount).
-fn free_forensics_tape() -> &'static std::sync::Mutex<std::collections::HashMap<u64, String>> {
-    static TAPE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, String>>> =
+///
+/// RES-19: a bounded ring — the map holds at most
+/// [`FREE_FORENSICS_TAPE_CAP`] entries and `order` is the FIFO that names
+/// the eviction victim.
+struct FreeForensicsTape {
+    by_offset: std::collections::HashMap<u64, String>,
+    order: std::collections::VecDeque<u64>,
+}
+
+fn free_forensics_tape() -> &'static std::sync::Mutex<FreeForensicsTape> {
+    static TAPE: std::sync::OnceLock<std::sync::Mutex<FreeForensicsTape>> =
         std::sync::OnceLock::new();
-    TAPE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    TAPE.get_or_init(|| {
+        std::sync::Mutex::new(FreeForensicsTape {
+            by_offset: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        })
+    })
+}
+
+/// Record `offset`'s free capture, evicting the oldest entry once the ring
+/// is full (RES-19). Returns the PREVIOUS capture for this offset, which
+/// is the double-free pairing `finish_free` reports.
+fn record_free_forensics(offset: u64, capture: String) -> Option<String> {
+    let mut tape = free_forensics_tape()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let prior = tape.by_offset.insert(offset, capture);
+    if prior.is_none() {
+        tape.order.push_back(offset);
+        while tape.order.len() > FREE_FORENSICS_TAPE_CAP {
+            if let Some(evict) = tape.order.pop_front() {
+                tape.by_offset.remove(&evict);
+            }
+        }
+    }
+    prior
+}
+
+/// The recorded capture for `offset`, if it is still in the ring.
+fn lookup_free_forensics(offset: u64) -> Option<String> {
+    free_forensics_tape()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .by_offset
+        .get(&offset)
+        .cloned()
+}
+
+/// RES-19 test seam: record a capture without a live allocator (the ring's
+/// bound is the contract — `tests/res_tail_tests.rs`).
+pub fn record_free_forensics_for_test(offset: u64, capture: &str) {
+    record_free_forensics(offset, capture.to_string());
+}
+
+/// RES-19 test seam: the ring's current occupancy.
+pub fn free_forensics_tape_len_for_test() -> usize {
+    free_forensics_tape()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .by_offset
+        .len()
+}
+
+/// RES-19 test seam: whether `offset` is still retained.
+pub fn lookup_free_forensics_for_test(offset: u64) -> Option<String> {
+    lookup_free_forensics(offset)
 }
 
 /// Physical allocation stride of every data-volume allocator: block
@@ -889,12 +961,9 @@ impl BlockAllocator {
             // reaches finish_free's tape.
             if crate::env_knobs::bool_knob("SQUEEZEFS_FREE_FORENSICS", false) {
                 let bt = std::backtrace::Backtrace::force_capture().to_string();
-                let first = free_forensics_tape()
-                    .lock()
-                    .unwrap()
-                    .get(&offset)
-                    .cloned()
-                    .unwrap_or_else(|| "<no recorded first free>".to_string());
+                let first = lookup_free_forensics(offset).unwrap_or_else(|| {
+                    "<no recorded first free (or aged out of the ring)>".to_string()
+                });
                 log::error!(
                     "REFUSED FREE FORENSICS offset {offset}:\n--- first free ---\n{first}\n--- refused release ---\n{bt}"
                 );
@@ -922,15 +991,17 @@ impl BlockAllocator {
         // free's capture so a DOUBLE FREE names BOTH call sites.
         if crate::env_knobs::bool_knob("SQUEEZEFS_FREE_FORENSICS", false) {
             let bt = std::backtrace::Backtrace::force_capture().to_string();
-            let mut tape = free_forensics_tape().lock().unwrap();
-            if let Some(first) = tape.get(&offset) {
+            // RES-19: one bounded-ring insert (which also HANDS BACK the
+            // prior capture for this offset), instead of holding the global
+            // mutex across a probe + an unbounded insert.
+            let prior = record_free_forensics(offset, bt.clone());
+            if let Some(first) = prior {
                 if self.free_blocks.contains(&block_idx) {
                     log::error!(
                         "DOUBLE FREE FORENSICS offset {offset}:\n--- free #1 ---\n{first}\n--- free #2 ---\n{bt}"
                     );
                 }
             }
-            tape.insert(offset, bt);
         }
         if !self.free_blocks.insert(block_idx) {
             // FIND-RW5-A forensics tripwire: a second release of an offset

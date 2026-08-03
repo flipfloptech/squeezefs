@@ -393,6 +393,36 @@ pub fn op_profile_enabled() -> bool {
     *ON.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_OP_PROFILE", false))
 }
 
+/// VAL-7a (pre-RC spec §3): the mode of the `.stats` / `.config` virtual
+/// inodes — **owner-only**, owned by the mount identity (`uid`/`gid` in
+/// [`SqueezefsFilesystem::get_stats_attr`]).
+///
+/// They were `0444`. Their payload names every cached block key, the
+/// read-cache census, `active_writes` keyed by inode, every backing
+/// device path and every staging directory — a complete map of the
+/// daemon's private state and of every co-tenant's I/O, readable by any
+/// local user on an `allow_other` mount. With `-o default_permissions`
+/// (always set — spec §8 invariant) the kernel enforces this mode, so
+/// `0400` + the mount uid is the actual access boundary; root still
+/// reads them, which is the operator path.
+pub const VIRTUAL_INODE_MODE: u16 = 0o400;
+
+/// VAL-7a: is the `.stats` **key census** armed
+/// (`SQUEEZEFS_STATS_KEY_CENSUS=1`)?
+///
+/// The census fields (`read_lru_keys`, `write_lru_keys`,
+/// `nvme_staged_write_file_ids`, `nvme_read_cache_block_keys`,
+/// `active_writes`) enumerate live object keys and per-inode write
+/// custody — a debugging surface, not an operational one. They are now
+/// opt-in; the COUNTS that replace them (`*_count`, which is all
+/// `squeezefs umount` ever consumed) stay unconditional.
+///
+/// Read live, never memoized: this is the cold `.stats` open path, and a
+/// live-flip is exactly how an operator uses it.
+pub fn stats_key_census_enabled() -> bool {
+    std::env::var("SQUEEZEFS_STATS_KEY_CENSUS").is_ok_and(|v| v == "1")
+}
+
 /// `SQUEEZEFS_PATCH_MAX_BYTES` cell (design-random-small-writes §6): max
 /// length of a W1 sole-owner in-place patch. Default = **block_size/8**
 /// ([`derived_patch_max_bytes`], applied at mount by
@@ -4720,7 +4750,8 @@ pub struct SqueezefsFilesystem {
     /// (and tests do not proceed) before heartbeat records deregister.
     dismount_complete: std::sync::Arc<std::sync::atomic::AtomicBool>,
     dismount_done: std::sync::Arc<tokio::sync::Notify>,
-    reclaim_tx: tokio::sync::mpsc::Sender<u64>,
+    /// RES-20: the task-free FORGET enqueue (see [`ReclaimEnqueue`]).
+    reclaim_enqueue: std::sync::Arc<ReclaimEnqueue>,
     reclaim_rx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<u64>>>>,
     /// FIND-RW5-A face 4: per-ino single-drive reclaim guard. RELEASE and
     /// FORGET both enqueue reclaims and concurrent batches both passed
@@ -4835,7 +4866,7 @@ impl Clone for SqueezefsFilesystem {
             dismount_once: self.dismount_once.clone(),
             dismount_complete: self.dismount_complete.clone(),
             dismount_done: self.dismount_done.clone(),
-            reclaim_tx: self.reclaim_tx.clone(),
+            reclaim_enqueue: self.reclaim_enqueue.clone(),
             reclaim_rx: self.reclaim_rx.clone(),
             next_dir_fh: self.next_dir_fh.clone(),
             // Share the one cell (session_connection precedent): the
@@ -4960,7 +4991,7 @@ impl SqueezefsFilesystem {
             dismount_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dismount_complete: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dismount_done: std::sync::Arc::new(tokio::sync::Notify::new()),
-            reclaim_tx,
+            reclaim_enqueue: ReclaimEnqueue::new(reclaim_tx),
             reclaim_rx: std::sync::Arc::new(std::sync::Mutex::new(Some(reclaim_rx))),
             next_dir_fh: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 0x2000_0000_0000_0000,
@@ -5040,10 +5071,7 @@ impl SqueezefsFilesystem {
         if self.is_open(ino) {
             return;
         }
-        let tx = self.reclaim_tx.clone();
-        tokio::spawn(async move {
-            let _ = tx.send(ino).await;
-        });
+        self.reclaim_enqueue.enqueue(ino);
     }
 
     pub fn disable_background_writeback(&self) {
@@ -5621,7 +5649,9 @@ impl SqueezefsFilesystem {
         finish_virtual_payload(serde_json::to_string_pretty(&config_obj).unwrap_or_default())
     }
 
-    fn get_stats_attr(&self, size: u64) -> FileAttr {
+    /// VAL-7a: `pub` so the mode/ownership contract is testable without a
+    /// live mount (`tests/val7_access_control_tests.rs`).
+    pub fn get_stats_attr(&self, size: u64) -> FileAttr {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or(Duration::ZERO);
@@ -5636,7 +5666,9 @@ impl SqueezefsFilesystem {
             mtime: Timestamp::new(sec, nsec),
             ctime: Timestamp::new(sec, nsec),
             kind: FileType::RegularFile,
-            perm: 0o444, // read-only by all
+            // VAL-7a: owner-only. This payload is a map of the daemon's
+            // private state (see `VIRTUAL_INODE_MODE`).
+            perm: VIRTUAL_INODE_MODE,
             nlink: 1,
             uid: self.uid,
             gid: self.gid,
@@ -5646,17 +5678,38 @@ impl SqueezefsFilesystem {
     }
 
     pub async fn generate_stats_json(&self) -> String {
-        let read_lru_keys = self.router.cache.read_lru.keys();
-        let write_lru_keys = self.router.cache.write_lru.keys();
-        let nvme_read_cache_block_keys = self.router.cache.nvme.list_cached_blocks();
+        // VAL-7a: the key census is OPT-IN
+        // (`SQUEEZEFS_STATS_KEY_CENSUS=1`). Its fields enumerate live
+        // object keys, the read-cache contents and per-inode write
+        // custody — a debugging surface. The COUNTS below always export:
+        // they are what `squeezefs umount` reads to decide whether
+        // unflushed staged writes exist, and they leak nothing.
+        let key_census = stats_key_census_enabled();
+        let (read_lru_keys, write_lru_keys, nvme_read_cache_block_keys) = if key_census {
+            (
+                self.router.cache.read_lru.keys(),
+                self.router.cache.write_lru.keys(),
+                self.router.cache.nvme.list_cached_blocks(),
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        let read_lru_key_count = self.router.cache.read_lru.len();
+        let write_lru_key_count = self.router.cache.write_lru.len();
 
         let mut nvme_staged_write_file_ids = Vec::new();
         let mut active_writes = serde_json::Map::new();
+        let mut nvme_staged_write_file_count = 0usize;
+        let mut active_write_block_count = 0usize;
 
         for key in self.router.cache.nvme.list_staged_files() {
             if key.starts_with("active_block:") {
                 let parts: Vec<&str> = key.split(':').collect();
                 if parts.len() == 3 {
+                    active_write_block_count += 1;
+                    if !key_census {
+                        continue;
+                    }
                     let inode_name = parts[1].to_string();
                     let block_name = parts[2].to_string();
                     active_writes
@@ -5667,9 +5720,17 @@ impl SqueezefsFilesystem {
                         .push(serde_json::Value::String(block_name));
                 }
             } else {
-                nvme_staged_write_file_ids.push(key);
+                nvme_staged_write_file_count += 1;
+                if key_census {
+                    nvme_staged_write_file_ids.push(key);
+                }
             }
         }
+        let nvme_read_cache_block_count = if key_census {
+            nvme_read_cache_block_keys.len()
+        } else {
+            self.router.cache.nvme.cached_block_count()
+        };
 
         let hits = METRICS.cache_hits.load(Ordering::Relaxed);
         let misses = METRICS.cache_misses.load(Ordering::Relaxed);
@@ -5837,6 +5898,18 @@ impl SqueezefsFilesystem {
             // not a `stable-*`/`lts-*` release.
             "build_commit": crate::version::build_commit(),
             "build_tag": crate::version::build_tag(),
+            // VAL-7a: the CENSUS-FREE gauges — always exported. These are
+            // what `squeezefs umount` reads to decide whether unflushed
+            // staged writes exist; they name nothing.
+            "read_lru_key_count": read_lru_key_count,
+            "write_lru_key_count": write_lru_key_count,
+            "nvme_staged_write_file_count": nvme_staged_write_file_count,
+            "nvme_read_cache_block_count": nvme_read_cache_block_count,
+            "active_write_block_count": active_write_block_count,
+            // VAL-7a: the KEY census — empty unless
+            // `SQUEEZEFS_STATS_KEY_CENSUS=1`. Fields stay present (with
+            // empty values) so an operator can always key on them.
+            "stats_key_census": key_census,
             "read_lru_keys": read_lru_keys,
             "write_lru_keys": write_lru_keys,
             "nvme_staged_write_file_ids": nvme_staged_write_file_ids,
@@ -6848,7 +6921,8 @@ impl SqueezefsFilesystem {
         finish_virtual_payload(serde_json::to_string_pretty(&stats_obj).unwrap_or_default())
     }
 
-    fn get_config_attr(&self, size: u64) -> FileAttr {
+    /// VAL-7a: `pub` for the same reason as [`Self::get_stats_attr`].
+    pub fn get_config_attr(&self, size: u64) -> FileAttr {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or(Duration::ZERO);
@@ -6863,7 +6937,9 @@ impl SqueezefsFilesystem {
             mtime: Timestamp::new(sec, nsec),
             ctime: Timestamp::new(sec, nsec),
             kind: FileType::RegularFile,
-            perm: 0o444, // read-only by all
+            // VAL-7a: owner-only — `.config` lists every backing device
+            // path and every staging directory.
+            perm: VIRTUAL_INODE_MODE,
             nlink: 1,
             uid: self.uid,
             gid: self.gid,
@@ -15167,8 +15243,17 @@ impl Filesystem for SqueezefsFilesystem {
                     break;
                 }
                 let blocks = meta.size.div_ceil(bs) as u32;
-                let mut missing: Vec<u32> = Vec::new();
-                for b in 0..blocks {
+                // VAL-7e: scan ONLY the copied extent. The pre-fix loop
+                // walked every block of the source file on every pass
+                // (four passes/call) and accumulated an unbounded vector —
+                // O(file size) for a 4 KiB copy. Blocks outside the read
+                // range cannot affect this copy's bytes, and a whole-file
+                // copy still gets full coverage (see
+                // `copy_probe_block_range`).
+                let (probe_lo, probe_hi) = copy_probe_block_range(off_in, length, blocks, bs);
+                let mut missing: Vec<u32> =
+                    Vec::with_capacity((probe_hi - probe_lo).min(1024) as usize);
+                for b in probe_lo..probe_hi {
                     // Bound OR unbound: any staged sibling is undrained
                     // acked custody (a sibling on a BOUND block supersedes
                     // the bound image — the durable copy is stale).
@@ -16047,36 +16132,26 @@ impl Filesystem for SqueezefsFilesystem {
             // catch-all arm below.
             #[cfg(feature = "gds")]
             SQUEEZEFS_IOC_GDS_READ => {
-                // 1. Read GdsReadArgs from client process memory
+                // 1. Read GdsReadArgs from client process memory.
+                //    VAL-7f: liveness-checked, pid-namespace-checked and
+                //    dirfd-pinned — see `read_caller_struct`.
                 let pid = _req.pid;
                 let arg = _arg;
                 let args_res = tokio::task::spawn_blocking(move || {
-                    let mut bytes = [0u8; std::mem::size_of::<GdsReadArgs>()];
-                    use std::os::unix::fs::FileExt;
-                    let mem_file =
-                        std::fs::File::open(format!("/proc/{}/mem", pid)).map_err(|e| {
-                            error!(
-                                "GDS ioctl: failed to open client memory file for pid {}: {:?}",
-                                pid, e
-                            );
-                            Errno::from(libc::EFAULT)
-                        })?;
-                    mem_file.read_exact_at(&mut bytes, arg).map_err(|e| {
-                        error!(
-                            "GDS ioctl: failed to read client memory at 0x{:X}: {:?}",
-                            arg, e
-                        );
-                        Errno::from(libc::EFAULT)
-                    })?;
-                    let args: GdsReadArgs =
-                        unsafe { std::ptr::read(bytes.as_ptr() as *const GdsReadArgs) };
-                    Ok::<GdsReadArgs, Errno>(args)
+                    read_caller_struct(pid, arg, std::mem::size_of::<GdsReadArgs>())
                 })
                 .await;
 
                 let args = match args_res {
-                    Ok(Ok(a)) => a,
-                    Ok(Err(e)) => return Err(e),
+                    Ok(Ok(bytes)) => {
+                        // SAFETY: `bytes` is exactly size_of::<GdsReadArgs>()
+                        // bytes (read_caller_struct refuses a short read) and
+                        // `GdsReadArgs` is a plain `#[repr(C)]` triple of u64s
+                        // with no invalid bit patterns. Every field is
+                        // range-checked afterwards (VAL-1).
+                        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const GdsReadArgs) }
+                    }
+                    Ok(Err(errno)) => return Err(Errno::from(errno)),
                     Err(_) => return Err(Errno::from(libc::EIO)),
                 };
                 debug!("GDS ioctl args: {:?}", args);
@@ -16578,6 +16653,292 @@ fn mount_st_dev(mount_path: &Path) -> Option<u64> {
 /// `MS_NOEXEC`), not FUSE data options — the pre-fix plumbing dropped
 /// them entirely, so `mount -o nosuid` produced a suid-honoring mount
 /// (fstests generic/128; pinned in tests/mount_preflight_tests.rs).
+/// RES-20 (pre-RC spec §7): the FORGET → reclaim-queue enqueue.
+///
+/// `queue_reclaim_inode` used to do `tokio::spawn(async move { tx.send(ino)
+/// .await })` — **one task per FORGET**, dispatched onto the current
+/// fuse3 handler lane's `LocalSet`. A `drop_caches` storm (or any
+/// unlink-heavy workload) delivers FORGETs in bulk, so the lane thread
+/// accumulated thousands of tasks whose only work was a channel send that
+/// would have succeeded immediately: the queue is 100 000 deep.
+///
+/// The enqueue is now synchronous `try_send`. Genuine backpressure (a full
+/// queue — a reclaim worker that has fallen far behind) parks the ino on a
+/// bounded overflow list drained by **one** shared task, so a storm can
+/// never cost more than a single outstanding drainer. Nothing is dropped:
+/// an orphan ino that never reaches the queue is a durable slot leak.
+pub struct ReclaimEnqueue {
+    tx: tokio::sync::mpsc::Sender<u64>,
+    /// Inos that hit a full queue, awaiting the drainer.
+    overflow: std::sync::Mutex<std::collections::VecDeque<u64>>,
+    /// Set while a drainer task is live: the "at most one" latch.
+    draining: std::sync::atomic::AtomicBool,
+    /// Drainer tasks ever spawned — the RES-20 engagement gauge (0 on a
+    /// healthy mount; growth means the reclaim workers are behind).
+    spawned: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ReclaimEnqueue {
+    pub fn new(tx: tokio::sync::mpsc::Sender<u64>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            tx,
+            overflow: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            draining: std::sync::atomic::AtomicBool::new(false),
+            spawned: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        })
+    }
+
+    /// Drainer tasks spawned since mount (RES-20 gauge).
+    pub fn spawned_drainers(&self) -> u64 {
+        self.spawned.load(Ordering::Relaxed)
+    }
+
+    /// Enqueue `ino`. Task-free while the queue has room.
+    pub fn enqueue(self: &std::sync::Arc<Self>, ino: u64) {
+        match self.tx.try_send(ino) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(ino)) => {
+                self.overflow
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(ino);
+                self.ensure_drainer();
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                // Teardown: the reclaim worker pool is gone. Mount-time
+                // recovery owns any orphan left behind.
+            }
+        }
+    }
+
+    /// Spawn the single drainer if one is not already running. Called only
+    /// on the backpressure path, so the runtime-handle probe is cold.
+    fn ensure_drainer(self: &std::sync::Arc<Self>) {
+        if self
+            .draining
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return; // a drainer is already live and will see our push
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // No runtime (offline tools / tests): drain is impossible, and
+            // the latch must not stay armed.
+            self.draining
+                .store(false, std::sync::atomic::Ordering::Release);
+            return;
+        };
+        self.spawned.fetch_add(1, Ordering::Relaxed);
+        let me = std::sync::Arc::clone(self);
+        handle.spawn(async move {
+            loop {
+                let next = me
+                    .overflow
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pop_front();
+                let Some(ino) = next else {
+                    // Clear the latch, then re-check: a push racing the
+                    // empty observation must not leave an ino stranded
+                    // (publish-then-recheck, the standard shape).
+                    me.draining
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    let still = !me
+                        .overflow
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_empty();
+                    if still && !me.draining.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        continue;
+                    }
+                    return;
+                };
+                if me.tx.send(ino).await.is_err() {
+                    me.draining
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    return; // channel closed: teardown
+                }
+            }
+        });
+    }
+}
+
+/// VAL-7f (pre-RC spec §3): is `pid` numbered in **our** PID namespace?
+///
+/// `Request::pid` is the caller's pid **as numbered in the caller's pid
+/// namespace**. For a containerized client that number names a different
+/// process in the daemon's namespace — or none — so `/proc/<pid>/…` is
+/// not the caller. The check is a readlink comparison of
+/// `/proc/<pid>/ns/pid` against `/proc/self/ns/pid`; an unresolvable pid
+/// is never treated as same-namespace.
+pub fn caller_in_our_pid_namespace(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let Ok(theirs) = std::fs::read_link(format!("/proc/{pid}/ns/pid")) else {
+        return false;
+    };
+    let Ok(ours) = std::fs::read_link("/proc/self/ns/pid") else {
+        return false;
+    };
+    theirs == ours
+}
+
+/// VAL-7f: read `len` bytes at `addr` out of caller process `pid`'s
+/// address space — the ONE place the GDS ioctl's argument struct crosses
+/// the process boundary.
+///
+/// The pre-fix arm did `File::open(format!("/proc/{pid}/mem"))` with **no
+/// liveness check and no namespace translation**, then `read_exact_at`.
+/// Two failures: (a) between the FUSE request and the open the caller can
+/// exit and its pid be reused, so the daemon reads (and then DMAs from) an
+/// unrelated process's memory; (b) a containerized caller's pid number
+/// resolves to some *other* local process entirely.
+///
+/// The replacement, in order:
+/// 1. refuse `pid == 0` / a zero-length struct outright;
+/// 2. **liveness + reuse pinning**: open `/proc/<pid>` as a DIRFD. A proc
+///    dirfd is bound to that exact task — if the task exits, `openat` on
+///    it returns `ESRCH`, so a pid recycled after this point can never be
+///    reached through it. This is strictly stronger than
+///    `process_vm_readv(pid, …)`, which re-resolves the raw pid on every
+///    call and so keeps the race the spec item names;
+/// 3. **namespace check** against the pinned dirfd;
+/// 4. `openat(dirfd, "mem")` + one `read_exact_at`, refusing a short read.
+///
+/// `Err(errno)`: `ESRCH` (gone / not ours / not our namespace), `EINVAL`
+/// (bad length), `EFAULT` (unreadable range).
+pub fn read_caller_struct(pid: u32, addr: u64, len: usize) -> std::result::Result<Vec<u8>, i32> {
+    use std::os::unix::fs::FileExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if len == 0 {
+        return Err(libc::EINVAL);
+    }
+    if pid == 0 {
+        return Err(libc::ESRCH);
+    }
+    // (2) Pin the task with a proc dirfd — liveness AND reuse safety.
+    let proc_dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(format!("/proc/{pid}"))
+        .map_err(|_| libc::ESRCH)?;
+    // (3) The pid number must mean the same thing here as it did to the
+    // caller.
+    if !caller_in_our_pid_namespace(pid) {
+        log::error!(
+            "GDS ioctl: caller pid {pid} is not numbered in this daemon's PID namespace — \
+             refusing to read an unrelated process's address space"
+        );
+        return Err(libc::ESRCH);
+    }
+    // (4) openat(dirfd, "mem") — never a fresh /proc/<pid>/mem path.
+    let mem = openat_read(&proc_dir, c"mem").map_err(|e| {
+        if e == libc::ENOENT || e == libc::ESRCH {
+            libc::ESRCH
+        } else {
+            libc::EFAULT
+        }
+    })?;
+    let mut buf = vec![0u8; len];
+    mem.read_exact_at(&mut buf, addr).map_err(|e| {
+        log::error!("GDS ioctl: reading {len} B at 0x{addr:X} from pid {pid} failed: {e:?}");
+        libc::EFAULT
+    })?;
+    Ok(buf)
+}
+
+/// `openat(dirfd, name, O_RDONLY | O_CLOEXEC)` as an owned `File`.
+fn openat_read(
+    dir: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::result::Result<std::fs::File, i32> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    // SAFETY: `dir` is a live owned dirfd and `name` is a valid
+    // NUL-terminated C string for the duration of the call; the returned
+    // fd is immediately adopted by `File`.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO));
+    }
+    // SAFETY: fresh owned fd from openat.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// VAL-7e (pre-RC spec §3): the block range `copy_file_range`'s
+/// staged-sibling probe must scan — `[lo, hi)`, bounded to the **copied
+/// extent**, clamped to the file's block count.
+///
+/// The probe ran `for b in 0..blocks` over the whole SOURCE FILE, four
+/// times per call, pushing into an unbounded `Vec<u32>`: a 4 KiB
+/// `copy_file_range` against a 1 TiB source walked 262 144 blocks × 4 and
+/// issued a staged-key lookup for each — O(file size) work for O(1) of
+/// requested I/O, and the vector is proportional to the file, not the
+/// request. Only blocks the copy actually READS can hold custody the copy
+/// must see, so the range is the honest bound; a whole-file copy (the
+/// clone fast path's precondition) still covers every block, which is why
+/// bounding here changes no outcome.
+///
+/// `lo >= hi` = nothing to probe (zero length, or a source offset at/past
+/// the last block).
+pub fn copy_probe_block_range(
+    off_in: u64,
+    length: u64,
+    blocks: u32,
+    block_size: u64,
+) -> (u32, u32) {
+    if block_size == 0 || length == 0 || blocks == 0 {
+        return (0, 0);
+    }
+    let lo = (off_in / block_size).min(blocks as u64) as u32;
+    // Saturating: `off_in + length` is caller-supplied (the kernel's, but
+    // the release profile carries no overflow checks — VAL-1's law).
+    let end = off_in.saturating_add(length);
+    let hi = end.div_ceil(block_size).min(blocks as u64) as u32;
+    (lo, hi.max(lo))
+}
+
+/// VAL-7c: the ADMIN-lane identity from `-o admin_uid=<uid>`, falling back
+/// to `fallback` (the invoking owner) when the option is absent or
+/// unparseable.
+///
+/// The admin lane admits uid 0 and this uid, and its verbs mutate durable
+/// job/volume state. Before this the identity came from
+/// [`crate::config_ops::invoking_owner`] alone — i.e. from `SUDO_UID`,
+/// caller-controlled environment with no way for the operator to state
+/// the administering identity. An unparseable value falls back rather
+/// than defaulting to 0: silently widening to root is the one outcome
+/// this must never produce. Daemon-level, like the TTL keys — stripped
+/// from the kernel option string by [`filter_kernel_mount_options`].
+pub fn admin_uid_from_options(opts: Option<&str>, fallback: u32) -> u32 {
+    let Some(opts) = opts else {
+        return fallback;
+    };
+    for opt in opts.split(',') {
+        if let Some(v) = opt.trim().strip_prefix("admin_uid=") {
+            return match v.trim().parse::<u32>() {
+                Ok(uid) => uid,
+                Err(_) => {
+                    log::warn!(
+                        "-o admin_uid={v} is not a uid — keeping the invoking owner \
+                         ({fallback}) as the ADMIN-lane identity (never widening to root)"
+                    );
+                    fallback
+                }
+            };
+        }
+    }
+    fallback
+}
+
 pub fn mount_security_flags(opts: &str) -> (bool, bool, bool) {
     let (mut nosuid, mut nodev, mut noexec) = (false, false, false);
     for opt in opts.split(',') {
@@ -16906,10 +17267,15 @@ pub async fn start_mount<P: AsRef<Path>>(
             // VL2: data plane only with `-o interception` (KD-11 posture
             // unchanged); the ADMIN lane serves either way.
             data_plane: posture.interception,
-            owner_uid: {
+            // VAL-7c: the ADMIN-lane identity is EXPLICIT when the
+            // operator says so (`-o admin_uid=N`). The fallback is the
+            // invoking owner — which derives from `SUDO_UID`, i.e.
+            // caller-controlled environment, and is exactly why an
+            // explicit surface had to exist.
+            owner_uid: admin_uid_from_options(custom_opts.as_deref(), {
                 let (uid, _gid) = crate::config_ops::invoking_owner();
                 uid
-            },
+            }),
         };
         // PR L4-4: the real data plane — fast path + async handoff over
         // THIS filesystem instance (the same daemon state kernel requests

@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use memmap2::MmapMut;
 use parking_lot::{RwLock, RwLockReadGuard};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -177,7 +177,6 @@ struct BlockMeta {
 pub struct NvmeShardInner {
     pub mmap: MmapMut,
     map: HashMap<Bytes, BlockMeta>,
-    active_keys: VecDeque<Bytes>,
     write_offset: usize,
     capacity: usize,
     /// IN-FLIGHT placements: extents whose payload copy runs OUTSIDE the
@@ -234,7 +233,6 @@ impl NvmeShardInner {
             let Some(meta) = self.map.remove(&key) else {
                 continue;
             };
-            self.active_keys.retain(|k| k != &key);
 
             let Some(evicted) = collect.as_deref_mut() else {
                 continue;
@@ -394,12 +392,28 @@ impl NvmeShard {
     }
 
     fn new(path: &Path, capacity: usize) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
+            // VAL-7b: a segment ring is plaintext user file data on a
+            // passthrough volume (and every staged object key in its
+            // headers regardless) — never group/other readable. `mode`
+            // applies only on create; existing segments are re-asserted
+            // below so an upgraded staging root tightens too.
+            .mode(crate::config_ops::STAGING_FILE_MODE)
             .open(path)?;
+        // SAFETY: `file` is a live owned fd; fchmod touches no
+        // Rust-managed memory.
+        unsafe {
+            use std::os::unix::io::AsRawFd;
+            libc::fchmod(
+                file.as_raw_fd(),
+                crate::config_ops::STAGING_FILE_MODE as libc::mode_t,
+            );
+        }
 
         // NEVER shrink an existing segment file (FIND-VS-A teardown
         // SIGBUS): another process — or an earlier cache instance — may
@@ -422,7 +436,6 @@ impl NvmeShard {
             inner: RwLock::new(NvmeShardInner {
                 mmap,
                 map: HashMap::new(),
-                active_keys: VecDeque::new(),
                 write_offset: 0,
                 capacity,
                 pending: Vec::new(),
@@ -439,7 +452,6 @@ impl NvmeShard {
             inner: RwLock::new(NvmeShardInner {
                 mmap,
                 map: HashMap::new(),
-                active_keys: VecDeque::new(),
                 write_offset: 0,
                 capacity,
                 pending: Vec::new(),
@@ -574,9 +586,6 @@ impl NvmeShard {
 
             // Invalidate/remove key from map if it already existed
             let old_meta = inner.map.remove(&key);
-            if old_meta.is_some() {
-                inner.active_keys.retain(|k| k != &key);
-            }
 
             // Reserve the in-flight extent against concurrent placements.
             inner
@@ -647,8 +656,7 @@ impl NvmeShard {
                 len: block_size,
             };
             inner.pending.retain(|&(s, _)| s != target_offset);
-            inner.map.insert(key.clone(), meta);
-            inner.active_keys.push_back(key);
+            inner.map.insert(key, meta);
         }
 
         evicted
@@ -833,10 +841,7 @@ impl NvmeShard {
                 len: block_size,
             };
             inner.pending.retain(|&(s, _)| s != target_offset);
-            if inner.map.insert(key.clone(), meta).is_some() {
-                inner.active_keys.retain(|k| k != &key);
-            }
-            inner.active_keys.push_back(key);
+            inner.map.insert(key, meta);
             if let Some(old) = old_meta {
                 self.reclaim_extent(&mut inner, old.offset, old.len);
             }
@@ -984,7 +989,6 @@ impl NvmeShard {
     pub fn remove(&self, key: &Bytes) -> Option<Bytes> {
         let mut inner = self.inner.write();
         if let Some(meta) = inner.map.remove(key) {
-            inner.active_keys.retain(|k| k != key);
             // Read value before invalidating
             let key_len = u32::from_le_bytes(
                 inner.mmap[meta.offset + 4..meta.offset + 8]
@@ -1014,13 +1018,34 @@ impl NvmeShard {
         }
     }
 
+    /// The shard's LIVE key set.
+    ///
+    /// RES-17 (pre-RC spec §7): this used to read a `VecDeque<Bytes>`
+    /// maintained beside `map` — every removal, eviction victim and
+    /// same-key replace paid `retain` (an O(n) equality scan plus an O(n)
+    /// element shift) **under the shard WRITE lock**, i.e. on the staging
+    /// hot path. The queue is gone.
+    ///
+    /// Nothing needed its order. The historical front-run eviction walk
+    /// that did was deleted by the geometry-complete eviction fix (see
+    /// [`NvmeShardInner::evict_overlapping`] — "the map is the authority;
+    /// the queue is bookkeeping"), and no `pop_front` ever existed after
+    /// it. The three consumers are all order-independent: the
+    /// [`NvmeCache::offline_device`] drain (moves everything),
+    /// [`NvmeCache::online_device`]'s `i % share_fraction` rebalance
+    /// sample (any 1/N subset), and [`NvmeCache::list_keys`] (the
+    /// `.stats` census, whose only consumer takes `.len()`). So the
+    /// duplicate state was pure cost — and its own bug class: keeping two
+    /// containers agreeing across replace/evict/recover is exactly what
+    /// the stale-fill corruption came out of.
     pub fn active_keys(&self) -> Vec<Bytes> {
-        self.inner
-            .read_recursive()
-            .active_keys
-            .iter()
-            .cloned()
-            .collect()
+        self.inner.read_recursive().map.keys().cloned().collect()
+    }
+
+    /// Live entry count without materializing the key set (VAL-7a's
+    /// census-free `.stats` gauge).
+    pub fn entry_count(&self) -> usize {
+        self.inner.read_recursive().map.len()
     }
 
     pub fn current_bytes(&self) -> usize {
@@ -1059,7 +1084,6 @@ impl NvmeShard {
         let alignment = if capacity >= 4096 { 4096 } else { 1 };
 
         inner.map.clear();
-        inner.active_keys.clear();
 
         let mut recovered = 0u64;
         let mut duplicates = 0u64;
@@ -1107,9 +1131,7 @@ impl NvmeShard {
                 // historical index behavior); the value-shape parse at read
                 // time arbitrates a torn survivor.
                 duplicates += 1;
-                inner.active_keys.retain(|k| k != &key);
             }
-            inner.active_keys.push_back(key);
             recovered += 1;
             max_end = max_end.max(offset + block_size);
             // Skip the WHOLE footprint (aligned): value interiors are never
@@ -1179,7 +1201,8 @@ impl NvmeCache {
             }));
         } else {
             for (i, (&dir, &capacity)) in dirs.iter().zip(capacities.iter()).enumerate() {
-                std::fs::create_dir_all(dir)?;
+                // VAL-7b: owner-only segment directory.
+                crate::config_ops::create_private_dir_all(dir)?;
                 let shard_capacity = capacity / num_shards_per_device;
                 let mut shards = Vec::with_capacity(num_shards_per_device);
                 for j in 0..num_shards_per_device {
@@ -1501,7 +1524,8 @@ impl NvmeCache {
             dev.online.store(true, Ordering::Relaxed);
             dev
         } else {
-            std::fs::create_dir_all(dir)?;
+            // VAL-7b: owner-only segment directory.
+            crate::config_ops::create_private_dir_all(dir)?;
             let shard_capacity = capacity / self.num_shards_per_device;
             let mut shards = Vec::with_capacity(self.num_shards_per_device);
             for j in 0..self.num_shards_per_device {
@@ -1574,6 +1598,19 @@ impl NvmeCache {
             }
         }
         keys
+    }
+
+    /// VAL-7a: live entry count across online devices — the `.stats`
+    /// gauge that stays unconditional now that [`Self::list_keys`] rides
+    /// the opt-in key census.
+    pub fn entry_count(&self) -> usize {
+        let devices = self.devices.read();
+        devices
+            .iter()
+            .filter(|d| d.online.load(Ordering::Relaxed))
+            .flat_map(|d| d.shards.iter())
+            .map(|s| s.entry_count())
+            .sum()
     }
 
     pub fn recover_index(&self) {

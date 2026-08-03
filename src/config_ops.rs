@@ -108,6 +108,69 @@ pub const STAGING_WIPE_DENYLIST: &[&str] =
 /// [`staging_wipe_precheck`].
 const STAGING_ISOLATION_CONTAINER: &str = "squeezefs";
 
+/// VAL-7b (pre-RC spec §3): the mode of every staging / read-cache
+/// **directory**. Owner-only.
+///
+/// These trees hold the segment rings — on a passthrough (untransformed)
+/// volume that is literal **plaintext user file data**, plus the staged
+/// object key names in every segment header. They were created with the
+/// process umask (0755 in practice), so any local user could enumerate
+/// and — with the 0644 segment files — read every staged byte of every
+/// tenant.
+pub const STAGING_DIR_MODE: u32 = 0o700;
+
+/// VAL-7b: the mode of every staging / read-cache **segment file**.
+pub const STAGING_FILE_MODE: u32 = 0o600;
+
+/// Create `dir` (and any missing parents) and assert
+/// [`STAGING_DIR_MODE`] on the leaf — the ONE policy point for staging
+/// and read-cache directory creation (VAL-7b).
+///
+/// The leaf mode is set with an explicit `fchmod` rather than
+/// `DirBuilder::mode`, for two reasons: `create_dir_all` applies the mode
+/// to every intermediate it creates (an operator-supplied
+/// `/mnt/nvme/staging` must not silently turn `/mnt/nvme` into a 0700
+/// dir), and an ALREADY-EXISTING permissive dir — the common upgrade
+/// case — has to be tightened too. The `fchmod` rides an
+/// `O_DIRECTORY | O_NOFOLLOW` fd so it can never be redirected through a
+/// symlink swapped in after the create.
+pub fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let d = open_dir_nofollow(dir)?;
+    fchmod(&d, STAGING_DIR_MODE)
+}
+
+/// `open(dir, O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)` — the anchor for
+/// every `fchmod`/`fchown` on a staging root (VAL-7b: the historical
+/// path-based `chown` followed a symlink planted between the create and
+/// the chown).
+fn open_dir_nofollow(dir: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)
+}
+
+fn fchmod(f: &std::fs::File, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `f` is a live owned fd for the duration of the call;
+    // fchmod touches no Rust-managed memory.
+    if unsafe { libc::fchmod(f.as_raw_fd(), mode as libc::mode_t) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn fchown(f: &std::fs::File, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: as `fchmod` above.
+    if unsafe { libc::fchown(f.as_raw_fd(), uid, gid) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Absolute, lexically normalized form of `dir` (trailing slashes and
 /// `.` segments dropped; relative paths anchored at the cwd). No symlink
 /// resolution — [`denylist_refusal`] additionally checks the
@@ -321,10 +384,19 @@ async fn stamp_precleared_staging_dir(dir: &Path, plan: Option<&StagingWipePlan>
     tokio::fs::create_dir_all(dir)
         .await
         .map_err(|e| ctx("create", &e))?;
+    // VAL-7b: mode + ownership are both applied through ONE
+    // `O_DIRECTORY | O_NOFOLLOW` fd. The historical
+    // `std::os::unix::fs::chown(dir, …)` was a PATH call: a symlink
+    // planted at `dir` between the `create_dir_all` above and the chown
+    // re-targeted it at any file on the box — as root, on a path the
+    // operator supplied. `fchown` on a fd cannot be redirected, and the
+    // same fd asserts the 0700 mode (the root holds plaintext staged
+    // payloads on passthrough volumes).
+    let d = open_dir_nofollow(dir).map_err(|e| ctx("open (O_NOFOLLOW)", &e))?;
+    fchmod(&d, STAGING_DIR_MODE).map_err(|e| ctx("set mode 0700 on", &e))?;
     let (uid, gid) = invoking_owner();
     if unsafe { libc::geteuid() } == 0 {
-        std::os::unix::fs::chown(dir, Some(uid), Some(gid))
-            .map_err(|e| ctx(&format!("stamp ownership {uid}:{gid} on"), &e))?;
+        fchown(&d, uid, gid).map_err(|e| ctx(&format!("stamp ownership {uid}:{gid} on"), &e))?;
     }
     Ok(())
 }
@@ -582,20 +654,36 @@ pub async fn probe_data_volume_rw(device: &str) -> Result<()> {
             "scratch-block {what} probe failed on '{device}': {e}"
         ))
     };
-    dev.write_block(0, bytes::Bytes::copy_from_slice(&pattern))
-        .await
-        .map_err(|e| ctx("write", &e))?;
-    let back = dev.read_block(0, 4096).await.map_err(|e| ctx("read", &e))?;
-    if back[..] != pattern[..] {
-        return Err(SqueezefsError::InvalidOperation(format!(
-            "scratch-block readback mismatch on '{device}' — the device does not persist \
-             writes (wrong path? overlapping volume?)"
-        )));
+    // RES-12: the probe's `NvmeBlockDev` is short-lived and its `Drop`
+    // JOINS the io_uring worker thread. This function runs on a tokio
+    // worker in the LIVE daemon (the admin-lane `volume-add-data` verb,
+    // `SqueezefsFilesystem::admin_add_data_volume`) as well as in the
+    // offline CLI, so the drop is handed to the blocking pool on EVERY
+    // exit path — including the error paths, which is why the result is
+    // captured first and the device dropped after.
+    let outcome = async {
+        dev.write_block(0, bytes::Bytes::copy_from_slice(&pattern))
+            .await
+            .map_err(|e| ctx("write", &e))?;
+        let back = dev.read_block(0, 4096).await.map_err(|e| ctx("read", &e))?;
+        if back[..] != pattern[..] {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "scratch-block readback mismatch on '{device}' — the device does not persist \
+                 writes (wrong path? overlapping volume?)"
+            )));
+        }
+        dev.write_block(0, bytes::Bytes::from(vec![0u8; 4096]))
+            .await
+            .map_err(|e| ctx("blank-restore", &e))?;
+        Ok(())
     }
-    dev.write_block(0, bytes::Bytes::from(vec![0u8; 4096]))
-        .await
-        .map_err(|e| ctx("blank-restore", &e))?;
-    Ok(())
+    .await;
+    if let Some(h) = crate::detached::drop_off_runtime(dev) {
+        // Ordered: the probe must be fully torn down before the caller
+        // publishes a durable record naming the device.
+        let _ = h.await;
+    }
+    outcome
 }
 
 /// `squeezefs volume add-data` — the OFFLINE guarded path

@@ -513,6 +513,12 @@ impl MemoryCache {
         self.shards.iter().map(|s| s.eviction_queue.len()).sum()
     }
 
+    /// Live entry count (VAL-7a): the `.stats` census gauge that replaces
+    /// the unconditional key ENUMERATION — a count leaks no key names.
+    pub fn entry_count(&self) -> usize {
+        self.shards.iter().map(|s| s.map.len()).sum()
+    }
+
     /// Get all keys in the cache.
     pub fn keys(&self) -> Vec<Bytes> {
         let mut keys = Vec::new();

@@ -292,12 +292,37 @@ pub struct ShareOptions {
     pub accept_version_drift: bool,
 }
 
-fn validate_nqn_component(what: &str, value: &str) -> Result<(), NvmeofError> {
-    if value.is_empty() || value.contains('/') || value.chars().any(char::is_whitespace) {
-        return Err(NvmeofError::Refused(format!(
-            "{what} '{value}' is not a valid NQN (must be non-empty, no '/' or whitespace — it \
-             names a configfs object)"
-        )));
+/// VAL-7g (pre-RC spec §3): validate one NQN-shaped **configfs path
+/// component**.
+///
+/// The value is joined onto a configfs root to name an object directory,
+/// and the object-removal helper's `ENOTEMPTY` fallback is
+/// `remove_dir_all` on that path (`nvmet::remove_configfs_object`). The
+/// pre-fix predicate rejected `/` and whitespace but NOT `.` or `..`, so
+/// `..` addressed the configfs PARENT — the subsystems/ports collection —
+/// and a single bad argument became a recursive delete of live kernel
+/// target state. Dot-only and leading-dot components now refuse loud.
+///
+/// Dots INSIDE a component stay legal: that is the NQN grammar itself
+/// (`nqn.2026-07.io.squeezefs:share-x`).
+pub fn validate_nqn_component(what: &str, value: &str) -> Result<(), NvmeofError> {
+    let refuse = |why: &str| {
+        Err(NvmeofError::Refused(format!(
+            "{what} '{value}' is not a valid NQN ({why} — it names a configfs object \
+             directory, and the removal path's ENOTEMPTY fallback is a recursive delete \
+             of it)"
+        )))
+    };
+    if value.is_empty() {
+        return refuse("must be non-empty");
+    }
+    if value.contains('/') || value.chars().any(char::is_whitespace) {
+        return refuse("no '/' or whitespace");
+    }
+    // Path traversal: `.` is the directory itself, `..` is its PARENT, and
+    // a leading dot is the hidden-name class that no legitimate NQN uses.
+    if value.starts_with('.') {
+        return refuse("must not start with '.' (no path-traversal or hidden components)");
     }
     Ok(())
 }

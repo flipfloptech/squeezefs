@@ -182,7 +182,10 @@ async fn blocking_drop_hops_to_the_blocking_pool_inside_a_runtime() {
     let handle = squeezefs::detached::drop_off_runtime(JoinsOnDrop { done: done.clone() });
     let handle = handle.expect("inside a runtime the drop must be handed off");
     handle.await.expect("the blocking drop completes");
-    assert!(done.load(Ordering::SeqCst), "the value was actually dropped");
+    assert!(
+        done.load(Ordering::SeqCst),
+        "the value was actually dropped"
+    );
 }
 
 /// RES-12: outside a runtime the same helper drops inline — offline verbs
@@ -204,5 +207,8 @@ fn blocking_drop_is_inline_without_a_runtime() {
         none.is_none(),
         "no runtime ⇒ no handoff (the value dropped inline)"
     );
-    assert!(flag.load(Ordering::SeqCst), "the value dropped synchronously");
+    assert!(
+        flag.load(Ordering::SeqCst),
+        "the value dropped synchronously"
+    );
 }

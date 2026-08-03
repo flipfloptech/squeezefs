@@ -34,7 +34,8 @@ fn mode_of(p: &Path) -> u32 {
 #[test]
 fn stats_and_config_inodes_are_owner_only() {
     assert_eq!(
-        squeezefs::fuse_client::VIRTUAL_INODE_MODE, 0o400,
+        squeezefs::fuse_client::VIRTUAL_INODE_MODE,
+        0o400,
         "the .stats/.config payload names every cached block key, device \
          path and staging dir — it must never be world-readable"
     );
@@ -201,7 +202,11 @@ fn copy_probe_range_is_bounded_to_the_copied_extent() {
 
     // Length beyond EOF clamps to the block count (never a huge empty loop).
     let (lo, hi) = copy_probe_block_range(0, u64::MAX, 3, bs);
-    assert_eq!((lo, hi), (0, 3), "the scan clamps to the file's block count");
+    assert_eq!(
+        (lo, hi),
+        (0, 3),
+        "the scan clamps to the file's block count"
+    );
 
     // A copy starting past the last block probes nothing.
     let (lo, hi) = copy_probe_block_range(10 * bs, 4096, 3, bs);

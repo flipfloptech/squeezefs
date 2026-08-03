@@ -36,7 +36,16 @@ fn nqn_components_refuse_path_traversal() {
     }
 
     for bad in [
-        "", "..", ".", "../x", "x/..", "a/b", ".hidden", "..leading", "x y", "\tx",
+        "",
+        "..",
+        ".",
+        "../x",
+        "x/..",
+        "a/b",
+        ".hidden",
+        "..leading",
+        "x y",
+        "\tx",
     ] {
         assert!(
             validate_nqn_component("subnqn", bad).is_err(),

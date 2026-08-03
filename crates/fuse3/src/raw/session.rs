@@ -4911,6 +4911,43 @@ fn batch_forget_body(data: &[u8]) -> Option<&[u8]> {
 /// One handler-lane future (boxed for the lane channels).
 type LaneFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
+/// The per-core handler-lane venue: one OS thread per usable CPU, each
+/// running a current-thread runtime + `LocalSet`, fed by one
+/// `unbounded_channel` per lane.
+///
+/// **RES-18 (pre-RC engineering spec §7) — why the lane channels stay
+/// unbounded** (recorded per the item's "a geometry-derived bound, or one
+/// sentence of recorded reasoning" disposition):
+///
+/// The observation is correct — dispatch is an `unbounded_channel` and each
+/// lane `spawn_local`s with no cap, so resident task population is bounded
+/// only incidentally. But for the hot path that incidental bound IS a
+/// transport-geometry bound: a request delivered over the ring holds its
+/// ent slot from delivery until its reply commits, and the handler future's
+/// lifetime is contained in that window, so concurrently resident
+/// over-uring handler futures cannot exceed `queues × q_depth` — the
+/// transport's own registered slot count (the same number the INIT reply's
+/// `max_background` derives from). That is not a foreign subsystem's
+/// number; it is the delivery capacity that produced the work, and
+/// backpressure is applied where it belongs: the kernel stops delivering
+/// when every slot is out, so nothing queues here.
+///
+/// The classical sideband is genuinely not slot-bounded, and bounding it
+/// would be actively harmful: it carries FORGET/BATCH_FORGET **and
+/// INTERRUPT** on ONE serialized reader, so a full bounded channel would
+/// block the dispatch loop, stall the reader, and delay exactly the
+/// INTERRUPT deliveries that exist to unstick requests — turning a
+/// memory-pressure event into a liveness failure. Its real bound is the
+/// reader: one request in flight per `Readv`, the kernel coalescing forgets
+/// into BATCH_FORGET (one future for many inos), and — since RES-20 — a
+/// daemon-side reclaim enqueue that spawns nothing per FORGET.
+///
+/// What must not regress: [`TpcScheduler::dispatch`]'s dead-lane
+/// re-dispatch, and the `transport_requests_abandoned` must-stay-0
+/// tripwire — the instrument that would actually observe a lane backlog
+/// becoming stranded requests. If a measurement ever shows lane residency
+/// mattering, the bound to add is `queues × q_depth` on the SIDEBAND
+/// dispatch alone, never on the ring lanes.
 struct TpcScheduler {
     senders: Vec<
         tokio::sync::mpsc::UnboundedSender<

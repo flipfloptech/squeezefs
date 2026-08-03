@@ -475,6 +475,16 @@ pub trait SessionSink: Send + Sync + 'static {
     /// `serve_data` MUST become kernel-visible here — the service
     /// thread may park for up to its bounded window right after.
     fn flush(&self) {}
+
+    /// RES-12 (pre-RC spec §7): tear down whatever OS threads this sink
+    /// owns. Called from [`IpcHost::shutdown`], which the daemon already
+    /// runs inside `spawn_blocking` — so a sink whose teardown JOINS a
+    /// thread (`DataPlaneSink`'s direct-drive reaper) blocks a blocking-pool
+    /// thread instead of a tokio worker. Must be idempotent: the sink's own
+    /// `Drop` still calls the same teardown as the last-resort backstop
+    /// (nothing guarantees the host is shut down before it is dropped).
+    /// Default: nothing.
+    fn shutdown_threads(&self) {}
 }
 
 /// The no-data-plane sink: every correctly-directed READ/WRITE completes
@@ -1412,6 +1422,12 @@ impl IpcHost {
         for t in threads {
             let _ = t.join();
         }
+        // RES-12: the sink's own OS threads (the direct-drive reaper) are
+        // joined HERE — inside the caller's `spawn_blocking` hop — instead
+        // of waiting for `Drop for DataPlaneSink` to fire on whichever
+        // tokio worker happens to drop the last filesystem clone.
+        // Idempotent, so the `Drop` backstop stays intact.
+        self.sink.shutdown_threads();
     }
 
     /// POSIX-8: is `ino` still bound by ANY live session? Answered from
@@ -1601,8 +1617,18 @@ impl IpcHost {
             Some(v) => v,
             None => return,
         };
-        if let (CtlMsg::AdminHello { pid, uid }, _) = &first {
-            self.admin_loop(&sock, *pid, *uid);
+        if let (
+            CtlMsg::AdminHello {
+                abi,
+                pid,
+                uid,
+                build_commit,
+                nonce,
+            },
+            _,
+        ) = &first
+        {
+            self.admin_loop(&sock, *abi, *pid, *uid, build_commit, nonce);
             return;
         }
         if let (CtlMsg::AdminReq { .. } | CtlMsg::AdminReply { .. } | CtlMsg::AdminOk, _) = &first {
@@ -1715,17 +1741,58 @@ impl IpcHost {
     /// peercred → fd screen → budget admission. Any refusal is counted +
     /// replied; success establishes the session and replies `SessionOk`
     /// with the sealed memfd.
-    /// The ADMIN lane (VL2 §5.1.4): peercred-gated (uid 0 or the mount
-    /// owner; claimed pid/uid must match the kernel's), then a
-    /// request/reply verb loop against the wired [`AdminSink`]. No fd
-    /// screen, no session, no shm — strictly more restrictive than the
-    /// data plane.
-    fn admin_loop(self: &Arc<Self>, sock: &Arc<UnixStream>, pid: u32, uid: u32) {
+    /// The ADMIN lane (VL2 §5.1.4): the SAME screening ladder the data
+    /// plane runs — version (KD-7 ABI + build-commit equality, degenerate
+    /// identities refused unless the counted dev override) → nonce
+    /// freshness (anti-replay) → peercred (uid 0 or the mount owner;
+    /// claimed pid/uid must match the kernel's) — then a request/reply
+    /// verb loop against the wired [`AdminSink`]. No fd screen, no
+    /// session, no shm: strictly more restrictive than the data plane.
+    ///
+    /// VAL-7c (pre-RC spec §3): the peercred half was always correct, but
+    /// the version and nonce rungs were MISSING while this lane serves
+    /// mutating verbs (`job-cancel`, `volume-add-data`, `volume-disable`)
+    /// against durable state whose encodings are version-locked to the
+    /// build. Kept in the same order as [`Self::handle_hello_msg`] so the
+    /// two ladders cannot drift.
+    fn admin_loop(
+        self: &Arc<Self>,
+        sock: &Arc<UnixStream>,
+        abi: u32,
+        pid: u32,
+        uid: u32,
+        build_commit: &str,
+        nonce: &[u8; squeezefs_ipc::wire::NONCE_LEN],
+    ) {
         let refuse = |class: RefuseClass| {
             count_refusal(class);
             log::warn!("ipc host: AdminHello refused ({class:?}) from pid {pid} uid {uid}");
             let _ = send_ctl(sock, &CtlMsg::Refuse { class }, None);
         };
+        // Rung 1 — KD-7 version lock (identical to the data lane's).
+        if abi != squeezefs_ipc::layout::IPC_ABI || build_commit != self.cfg.build_commit {
+            return refuse(RefuseClass::Version);
+        }
+        if build_commit_degenerate(build_commit) || build_commit_degenerate(&self.cfg.build_commit)
+        {
+            if !self.cfg.allow_dev {
+                return refuse(RefuseClass::Version);
+            }
+            log::warn!(
+                "ipc host: ADMIN lane admitted a degenerate build identity via the dev \
+                 override (SQUEEZEFS_IPC_ALLOW_DEV) — fleet-hygiene alarm outside dev boxes"
+            );
+        }
+        // Rung 2 — nonce freshness (current + immediately-previous).
+        {
+            let mut n = self.nonce.lock().expect("nonce mutex never poisons");
+            n.rotate_if_stale();
+            if !n.accepts(nonce) {
+                drop(n);
+                return refuse(RefuseClass::Nonce);
+            }
+        }
+        // Rung 3 — peercred (the lane's authorizer; unchanged).
         let Some(cred) = peer_cred(sock) else {
             return refuse(RefuseClass::Peercred);
         };

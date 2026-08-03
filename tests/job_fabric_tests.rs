@@ -590,10 +590,30 @@ impl squeezefs::ipc_host::SessionSink for NoDataPlane {
     }
 }
 
-fn admin_hello(sock: &std::os::unix::net::UnixStream) -> CtlMsg {
+/// VAL-7c: the ADMIN lane now runs the data plane's full screening ladder
+/// (version → nonce → peercred), so the hello carries the ABI, the
+/// build-commit and a fresh nonce — the same three fields the bootstrap
+/// blob hands a real client. `tests/val7_admin_lane_tests.rs` pins the
+/// refusal legs; this helper is the positive path the fabric tests need.
+fn admin_hello(
+    sock: &std::os::unix::net::UnixStream,
+    host: &IpcHost,
+    build_commit: &str,
+) -> CtlMsg {
     // SAFETY: getpid/getuid are trivially safe.
     let (pid, uid) = unsafe { (libc::getpid() as u32, libc::getuid()) };
-    send_ctl(sock, &CtlMsg::AdminHello { pid, uid }, None).expect("send AdminHello");
+    send_ctl(
+        sock,
+        &CtlMsg::AdminHello {
+            abi: squeezefs_ipc::layout::IPC_ABI,
+            pid,
+            uid,
+            build_commit: build_commit.to_string(),
+            nonce: host.current_nonce(),
+        },
+        None,
+    )
+    .expect("send AdminHello");
     let (reply, fd) = recv_ctl(sock).expect("recv AdminHello reply");
     assert!(fd.is_none(), "admin replies carry no fd");
     reply
@@ -656,7 +676,7 @@ async fn admin_lane_controls_the_fabric_over_the_ctl_socket() {
 
     // ADMIN session: hello → ok → job verbs round-trip.
     let sock = abstract_connect(&cfg.socket_name).expect("connect");
-    let reply = admin_hello(&sock);
+    let reply = admin_hello(&sock, &host, &cfg.build_commit);
     assert!(
         matches!(reply, CtlMsg::AdminOk),
         "owner-uid AdminHello must be admitted, got {reply:?}"
@@ -722,7 +742,7 @@ async fn admin_lane_refuses_foreign_uids() {
     host.set_admin_sink(Arc::new(FabricAdminSink::new(fab)));
 
     let sock = abstract_connect(&cfg.socket_name).expect("connect");
-    let reply = admin_hello(&sock);
+    let reply = admin_hello(&sock, &host, &cfg.build_commit);
     assert!(
         matches!(reply, CtlMsg::Refuse { .. }),
         "foreign-uid AdminHello must refuse, got {reply:?}"

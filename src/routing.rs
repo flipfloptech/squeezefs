@@ -1558,13 +1558,21 @@ impl BackendRouter {
     /// key now fail loud (`err_backend_not_found`). The record itself is
     /// kept forever (KD-5); callers flip it to `retired` first.
     pub fn retire_backend(&self, id: &str) -> Result<()> {
-        if self.backends.remove(id).is_none() {
+        let Some((_, backend)) = self.backends.remove(id) else {
             return Err(SqueezefsError::InvalidOperation(format!(
                 "unknown data volume '{id}' — nothing to retire"
             )));
-        }
+        };
         self.unhealthy_backends.remove(id);
         self.refresh_placement_table();
+        // RES-12: dropping the last `Arc<StorageBackend>` drops its
+        // `NvmeBlockDev`, whose `Drop` JOINS the io_uring worker thread
+        // (bounded by in-flight device latency). This runs on a LIVE mount
+        // — the VL4 retire is an admin-lane verb — so the join must not
+        // park a tokio worker that is still serving FUSE traffic. Not
+        // awaited: retirement is complete once the routing table no longer
+        // names the volume; the worker's own exit cleanup is private.
+        drop(crate::detached::drop_off_runtime(backend));
         Ok(())
     }
 

@@ -81,3 +81,36 @@ where
         _ => tpc_spawn_guarded(site, fut),
     }
 }
+
+/// RES-12 (pre-RC spec §7): drop a value whose `Drop` **joins an OS
+/// thread** without blocking a tokio worker.
+///
+/// Two such values exist: [`crate::nvme_dev::NvmeBlockDev`]'s
+/// `UringWorker` (closes the request channel, then joins the io_uring
+/// worker so its exit cleanup — freeing unaligned bounce buffers, the P0-1
+/// contract — completes) and `ipc_service::DataPlaneSink` (flags the
+/// direct-drive engine down, NOP-wakes its reaper and joins it after the
+/// in-flight CQEs drain). Both joins are correct and must stay
+/// synchronous: the drain contract (`tests/dismount_teardown_tests.rs`,
+/// `tests/run_preload_gate.sh` leg 2) depends on the work being finished
+/// when `Drop` returns. What is wrong is *where* the block happens — a
+/// tokio worker thread parked for a device-latency-bounded drain while the
+/// daemon is still serving.
+///
+/// So the fix is at the SITES, not in the `Drop` impls: hand the value to
+/// the blocking pool and let it block there.
+///
+/// * Inside a runtime: returns the `JoinHandle` of the blocking task that
+///   performs the drop. Await it where the teardown must be ordered
+///   (dismount), ignore it where it must not (a live-mount volume retire).
+/// * Outside a runtime (offline CLI verbs, `Drop` backstops): drops
+///   inline and returns `None` — identical to today's behavior.
+pub fn drop_off_runtime<T: Send + 'static>(value: T) -> Option<tokio::task::JoinHandle<()>> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => Some(handle.spawn_blocking(move || drop(value))),
+        Err(_) => {
+            drop(value);
+            None
+        }
+    }
+}

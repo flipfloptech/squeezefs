@@ -41,7 +41,10 @@ use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 /// build-commit equality check at bind (design §5.2 screen rule 4).
 /// v2: the completion doorbell ([`crate::cqe_core::CqeDoorbell`]) took
 /// the header's reserved line 2 (op-economy campaign, 2026-07-28).
-pub const IPC_ABI: u32 = 2;
+/// v3: `AdminHello` gained the ABI / build-commit / nonce fields so the
+/// control lane runs the same screening ladder as the data plane (VAL-7c,
+/// pre-RC spec §3) — a ctl-wire layout change, hence the coarse bump.
+pub const IPC_ABI: u32 = 3;
 
 /// Session mapping magic: `SQZIPC01` little-endian.
 pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"SQZIPC01");

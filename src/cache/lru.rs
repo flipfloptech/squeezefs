@@ -396,6 +396,17 @@ impl LruCache {
             .collect()
     }
 
+    /// VAL-7a: live entry count — the `.stats` gauge that stays
+    /// unconditional now that [`Self::keys`] rides the opt-in census.
+    pub fn len(&self) -> usize {
+        self.inner.entry_count()
+    }
+
+    /// Clippy's `len_without_is_empty` companion.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn run_pending_tasks(&self) {
         // MemoryCache operations are immediate, so this is a no-op kept for API compatibility.
     }

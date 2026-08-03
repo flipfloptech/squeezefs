@@ -467,6 +467,17 @@ enum Commands {
         #[arg(long)]
         interception: bool,
 
+        /// UID admitted on the ADMIN control lane (VAL-7c)
+        ///
+        /// The admin lane serves the mutating maintenance verbs
+        /// (`job …`, `volume …`, health overrides) and admits uid 0 plus
+        /// exactly this uid. Default: the invoking owner (which under
+        /// sudo derives from `SUDO_UID` — caller-controlled environment,
+        /// hence this explicit surface). Equivalent to
+        /// `-o admin_uid=<uid>`.
+        #[arg(long)]
+        admin_uid: Option<u32>,
+
         /// Allow other users to access the mount
         #[arg(long, alias = "allow-others")]
         allow_other: bool,
@@ -1742,12 +1753,30 @@ fn admin_roundtrip(mountpoint: &str, verb: &str, arg: &str) -> Result<String, St
     use squeezefs_ipc::wire::CtlMsg;
     // SAFETY: getpid/getuid are trivially safe.
     let (pid, uid) = unsafe { (libc::getpid() as u32, libc::getuid()) };
-    send_ctl(&sock, &CtlMsg::AdminHello { pid, uid }, None).map_err(|e| e.to_string())?;
+    // VAL-7c: the ADMIN lane now runs the data plane's full ladder
+    // (version → nonce → peercred). Every field comes out of the bootstrap
+    // blob already read above — no extra round trip, and a CLI from a
+    // different build refuses instead of driving mutating verbs against
+    // durable state it may encode differently.
+    send_ctl(
+        &sock,
+        &CtlMsg::AdminHello {
+            abi: squeezefs_ipc::layout::IPC_ABI,
+            pid,
+            uid,
+            build_commit: squeezefs::version::build_commit(),
+            nonce: blob.nonce,
+        },
+        None,
+    )
+    .map_err(|e| e.to_string())?;
     match recv_ctl(&sock).map_err(|e| e.to_string())?.0 {
         CtlMsg::AdminOk => {}
         CtlMsg::Refuse { class } => {
             return Err(format!(
-                "admin session refused ({class:?}) — the lane admits root or the mount-owning uid"
+                "admin session refused ({class:?}) — the lane admits root or the \
+                 mount-owning uid (`-o admin_uid=N` states it explicitly), and requires \
+                 an ABI/build-commit match plus a fresh bootstrap nonce"
             ))
         }
         other => return Err(format!("unexpected reply {other:?}")),
@@ -2347,12 +2376,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // running with ALL logging discarded. Checked here in the parent,
     // pre-fork: the refusal is loud on the caller's console for
     // foreground and --daemon alike, and nothing is mounted.
+    // VAL-7h: 0600 + O_NOFOLLOW (`squeezefs::open_log_file`) — the log
+    // names device paths, staging dirs and object keys, and a symlink
+    // planted at the target had a root daemon appending through it.
     if let Some(ref log_path) = cli.log_file {
-        if let Err(e) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-        {
+        if let Err(e) = squeezefs::open_log_file(log_path) {
             eprintln!("Error: cannot open --log-file {}: {e}", log_path.display());
             std::process::exit(1);
         }
@@ -2654,11 +2682,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 libc::dup2(null_file.as_raw_fd(), 0);
             }
             let output_file = if let Some(ref path) = cli.log_file {
-                match std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                {
+                match squeezefs::open_log_file(path) {
                     Ok(f) => Some(f),
                     Err(e) => {
                         // ENG-3: the parent preflighted this open; a
@@ -2938,11 +2962,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut builder =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
     if let Some(ref log_path) = cli.log_file {
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-        {
+        match squeezefs::open_log_file(log_path) {
             Ok(file) => {
                 builder.target(env_logger::Target::Pipe(Box::new(file)));
             }
@@ -2967,6 +2987,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         log::warn!("{warning}");
     }
+
+    // VAL-7i: every root subprocess in this process resolves through the
+    // sanitized PATH from here on (argv-only was already the discipline;
+    // this closes the RESOLUTION half). Runs right after logging is armed
+    // so the one-line notice is audible.
+    squeezefs::harden_root_subprocess_path();
 
     // NOW start the Tokio runtime in the surviving process
     let mut core_ids = core_affinity::get_core_ids().unwrap_or_default();
@@ -4391,6 +4417,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             gid,
             no_writeback,
             interception,
+            admin_uid,
             allow_other,
             check_storage: _check_storage,
             options,
@@ -4569,11 +4596,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let isolated_dir = dir.join(&fs_name).join(sanitized_mount_clean);
                 let shared_cache_dir = dir.join(&fs_name).join("cache_segment");
 
-                fs::create_dir_all(&isolated_dir)
-                    .await
+                // VAL-7b: the per-mount isolation container and the shared
+                // read-cache dir are owner-only (0700) — they hold the
+                // segment rings, i.e. plaintext user data on passthrough
+                // volumes.
+                squeezefs::config_ops::create_private_dir_all(&isolated_dir)
                     .map_err(|e| staging_remedy(&isolated_dir, e))?;
-                fs::create_dir_all(&shared_cache_dir)
-                    .await
+                squeezefs::config_ops::create_private_dir_all(&shared_cache_dir)
                     .map_err(|e| staging_remedy(&shared_cache_dir, e))?;
 
                 let symlink_path = isolated_dir.join("cache_segment");
@@ -4883,6 +4912,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 })
             } else {
                 options
+            };
+
+            // VAL-7c: `--admin-uid` rides the same option-string path as
+            // `--interception` (start_mount's `admin_uid_from_options`
+            // resolves it; the key is daemon-level and stripped from the
+            // kernel option strings).
+            let options = match admin_uid {
+                Some(u) => Some(match options {
+                    Some(o) => format!("{o},admin_uid={u}"),
+                    None => format!("admin_uid={u}"),
+                }),
+                None => options,
             };
 
             start_mount(
@@ -5364,21 +5405,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // staged payload bytes (FIND-VS-A, the vs-JuiceFS scoreboard's
             // teardown-SIGBUS class; evidence in
             // `.benchmarks/2026-07-16-find-vs-a-fix.md`).
+            //
+            // VAL-7a: this reads the census-FREE COUNT gauges. The key
+            // arrays (`nvme_staged_write_file_ids`, `active_writes`) are
+            // now behind `SQUEEZEFS_STATS_KEY_CENSUS=1` — they named every
+            // staged object key and per-inode write custody in a
+            // world-readable file, and this CLI only ever needed the
+            // counts.
             fn read_mount_staging_stats(mountpoint: &Path) -> Option<(usize, usize, u64)> {
                 let stats_str = std::fs::read_to_string(mountpoint.join(".stats")).ok()?;
                 let v: serde_json::Value = serde_json::from_str(&stats_str).ok()?;
-                let staged = v["nvme_staged_write_file_ids"]
-                    .as_array()
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                let active = v["active_writes"]
-                    .as_object()
-                    .map(|m| {
-                        m.values()
-                            .map(|blocks| blocks.as_array().map(|a| a.len()).unwrap_or(0))
-                            .sum()
-                    })
-                    .unwrap_or(0);
+                let staged = v["nvme_staged_write_file_count"].as_u64().unwrap_or(0) as usize;
+                let active = v["active_write_block_count"].as_u64().unwrap_or(0) as usize;
                 let bytes = v["metrics"]["nvme_staging_current_bytes"]
                     .as_u64()
                     .unwrap_or(0);

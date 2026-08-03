@@ -316,9 +316,21 @@ pub enum CtlMsg {
     /// client-side — last close sends this).
     Unbind { binding_id: u64 },
     /// Client → daemon: open an ADMIN control session (VL2 §5.1.4).
-    /// No fd credential — `SO_PEERCRED` is the check (uid 0 or the
-    /// mount-owning uid; claimed pid/uid must match the kernel's).
-    AdminHello { pid: u32, uid: u32 },
+    ///
+    /// No fd credential — the lane's authorizer is `SO_PEERCRED` (uid 0 or
+    /// the mount-owning uid; claimed pid/uid must match the kernel's).
+    /// VAL-7c (pre-RC spec §3) added `abi`/`build_commit`/`nonce`: the
+    /// admin verbs MUTATE durable job and volume state, so the lane runs
+    /// the same version → nonce → peercred ladder [`Self::Hello`] does.
+    /// Every field is already in the bootstrap blob the CLI reads, so an
+    /// honest client pays no extra round trip.
+    AdminHello {
+        abi: u32,
+        pid: u32,
+        uid: u32,
+        build_commit: String,
+        nonce: [u8; NONCE_LEN],
+    },
     /// Daemon → client: admin session admitted.
     AdminOk,
     /// Client → daemon: one admin verb (`job-list`, `job-pause`, …)
@@ -379,10 +391,19 @@ impl CtlMsg {
                 put_u32(&mut out, TAG_UNBIND);
                 put_u64(&mut out, *binding_id);
             }
-            Self::AdminHello { pid, uid } => {
+            Self::AdminHello {
+                abi,
+                pid,
+                uid,
+                build_commit,
+                nonce,
+            } => {
                 put_u32(&mut out, TAG_ADMIN_HELLO);
+                put_u32(&mut out, *abi);
                 put_u32(&mut out, *pid);
                 put_u32(&mut out, *uid);
+                put_str::<BUILD_COMMIT_LEN>(&mut out, build_commit);
+                out.extend_from_slice(nonce);
             }
             Self::AdminOk => put_u32(&mut out, TAG_ADMIN_OK),
             Self::AdminReq { verb, arg } => {
@@ -436,8 +457,11 @@ impl CtlMsg {
                 binding_id: r.u64()?,
             },
             TAG_ADMIN_HELLO => Self::AdminHello {
+                abi: r.u32()?,
                 pid: r.u32()?,
                 uid: r.u32()?,
+                build_commit: r.str_fixed(BUILD_COMMIT_LEN)?,
+                nonce: r.nonce()?,
             },
             TAG_ADMIN_OK => Self::AdminOk,
             TAG_ADMIN_REQ => Self::AdminReq {

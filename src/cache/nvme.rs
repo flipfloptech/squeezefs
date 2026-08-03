@@ -92,7 +92,9 @@ pub async fn write_staging_generation_marker(
     dir: &std::path::Path,
     fs_generation: &str,
 ) -> Result<()> {
-    tokio::fs::create_dir_all(dir).await.map_err(|e| {
+    // VAL-7b: owner-only (0700) — the tree holds plaintext staged payloads
+    // on passthrough volumes.
+    crate::config_ops::create_private_dir_all(dir).map_err(|e| {
         SqueezefsError::Io(std::io::Error::new(
             e.kind(),
             format!("creating staging dir {}: {e}", dir.display()),
@@ -172,7 +174,7 @@ pub async fn extract_and_kill_staged_custody(
 /// barrier's refusal path is exercisable without a mount.
 pub async fn seed_staged_custody_for_test(dir: &std::path::Path, key: &str) -> Result<()> {
     let seg_dir = dir.join("staging_segment");
-    tokio::fs::create_dir_all(&seg_dir).await.map_err(|e| {
+    crate::config_ops::create_private_dir_all(&seg_dir).map_err(|e| {
         SqueezefsError::Io(std::io::Error::new(
             e.kind(),
             format!("creating {}: {e}", seg_dir.display()),
@@ -975,7 +977,8 @@ impl NvmeStaging {
         // scanned, mapped, or recovered.
         if let Some(fs_generation) = fs_generation {
             for dir in &staging_dirs {
-                fs::create_dir_all(dir)?;
+                // VAL-7b: owner-only staging root.
+                crate::config_ops::create_private_dir_all(dir)?;
                 bind_staging_generation(dir, fs_generation).await?;
                 // W2 §5.2: the staging content-format fence (future
                 // versions refuse the segment as a unit — mount fails).
@@ -1011,8 +1014,9 @@ impl NvmeStaging {
                      (block-key offsets are not incarnation-stable across mounts)"
                 );
             }
-            fs::create_dir_all(&rc_dir)?;
-            fs::create_dir_all(&ss_dir)?;
+            // VAL-7b: both segment trees are owner-only.
+            crate::config_ops::create_private_dir_all(&rc_dir)?;
+            crate::config_ops::create_private_dir_all(&ss_dir)?;
             read_cache_dirs.push(rc_dir);
             staging_segment_dirs.push(ss_dir);
             staging_segment_dirs_have_data.push(ss_has_data);
@@ -2158,6 +2162,13 @@ impl NvmeStaging {
             .into_iter()
             .filter_map(|k| String::from_utf8(k.to_vec()).ok())
             .collect()
+    }
+
+    /// VAL-7a: live read-cache entry count — the census-free gauge that
+    /// replaces [`Self::list_cached_blocks`] in the default `.stats`
+    /// payload (a count names no blocks).
+    pub fn cached_block_count(&self) -> usize {
+        self.read_nvme_cache.entry_count()
     }
 
     pub fn list_cached_blocks(&self) -> Vec<String> {

@@ -128,6 +128,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_META_COMMIT_BATCH_BYTES", int(1, BYTES_MAX), "derived", "M7 commit-conveyor batch cap, bytes (clamped to the ring's admissible capacity)."),
     k("SQUEEZEFS_META_FLUSH_INTERVAL_MS", int(0, DAY_MS), "50", "Journal/checkpoint cadence, ms; 0 = strict per-commit. A very large value is the 'park the timer' idiom two suites use, hence the day-long ceiling."),
     k("SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS", int(0, DAY_MS), "unset", "Legacy alias for SQUEEZEFS_META_FLUSH_INTERVAL_MS (the new spelling wins)."),
+    k("SQUEEZEFS_BLOCK_REFS_VERIFY", Kind::Bool, "off", "Run the durable-vs-derived block-reference oracle at MOUNT (spec §6.2 item 1). Off by default because it pays the inode-tree walk the durable records exist to delete; fsck runs the same comparison unconditionally as class C8."),
     // -- Layout / publish economy ---------------------------------------
     k("SQUEEZEFS_DEFAULT_BLOCK_SIZE", int(4096, BYTES_MAX), "4194304", "Default striped block size, bytes, when format did not record one."),
     k("SQUEEZEFS_PUBLISH_COALESCE_MAX", int(0, 1 << 20), "64", "Per-ino publish-coalescing window; 1 = the pre-campaign serialized posture (A/B lever)."),
@@ -222,6 +223,7 @@ pub static KNOBS: &[Knob] = &[
     // -- Diagnostics / forensics -----------------------------------------
     k("SQUEEZEFS_OP_PROFILE", Kind::Bool, "off", "Per-op phase histograms + the under-i_rwsem estimator (zero cost off)."),
     k("SQUEEZEFS_FREE_FORENSICS", Kind::Bool, "off", "Capture a backtrace per block free to attribute double frees (expensive)."),
+    k("SQUEEZEFS_STATS_KEY_CENSUS", Kind::Bool, "off", "VAL-7a: arm the `.stats` key census (live object keys + per-inode write custody — a debugging surface). The `*_count` replacements stay unconditional."),
     // -- fsck / jobs ------------------------------------------------------
     k("SQUEEZEFS_FSCK_SETTLE_MS", int(0, MS_MAX), "2000", "fsck suspect-settle window, ms (the zero-FP ladder)."),
     k("SQUEEZEFS_JOB_WIRE_BIND", Kind::Str, "off", "Job-shard execution wire listen address (VAL-6: the posture switch)."),
@@ -244,6 +246,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_TEST_RECLAIM_STALL_MS", int(0, MS_MAX), "0", "Test seam: stall each reclaim batch, ms."),
     k("SQUEEZEFS_TEST_NVME_READ_TIMEOUT_MS", int(1, MS_MAX), "30000", "Test seam: NVMe read timeout, ms."),
     k("SQUEEZEFS_TEST_POWER_CUT_DEVS", Kind::Str, "none", "Test seam: comma list of device paths armed for the power-cut simulator."),
+    k("SQUEEZEFS_TEST_STAMP_BLOCK_REFS", Kind::Bool, "0", "Test seam: stamp incompat bit 8 (durable block refcounts) at format, so a suite can point the write-path fixtures at the durable ledger and let the §6.2-item-1 oracle grade them. Never set in production — `format` never stamps bit 8 (ruling D9)."),
     // -- Harness-only variables (suites, rigs, re-exec children) ---------
     k("SQUEEZEFS_TEST_REQUIRE_MOUNT", Kind::Harness, "-", "Turn mount-class skips into failures (TEST-2)."),
     k("SQUEEZEFS_TEST_REQUIRE_ALL", Kind::Harness, "-", "Promote every skip class to a failure."),

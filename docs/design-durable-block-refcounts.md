@@ -400,57 +400,128 @@ not in this work:
    and the node cache is load-once RAM-authoritative. A second writer reading
    this tree needs the revalidation path (or, per §6.2's own conclusion,
    partitioning so two writers never cache the same node).
-6. **W1's seventh ineligibility clause (§6.7).** Once custody can be
-   range-shared, the patch predicate needs `patch_ineligible_range_shared` so
-   predicate rot stays visible. The durable refcount is the input that makes
-   the clause decidable across nodes.
+6. ~~**W1's seventh ineligibility clause (§6.7).**~~ **LANDED** by DLM S11
+   (`feat/mw-range-custody`) — and the framing this document originally gave
+   it was **wrong**, so it is corrected here rather than quietly dropped.
+
+   The clause's input is the **range-grant table**
+   (`dlm::span_range_shared`), not the refcount. The two predicates answer
+   different questions and neither subsumes the other:
+
+   | Clause | Question | Source |
+   |---|---|---|
+   | 4 (`begin_patch_sole_owner`) | do OTHER FILES reference this block? (clone/CoW) | the refcount — this document's subject |
+   | 7 (`patch_range_shared`) | does another WRITER hold a byte-range grant overlapping this block? | the S11 grant table |
+
+   So S11 did not need the durable refcount, and the durable refcount does
+   not make clause 7 decidable. What remains true is a sharpening of item 3
+   rather than a closure of item 6:
+
+   * **Clause 7 closes the two-writers-one-inode-disjoint-ranges hazard;
+     clause 4 still owns the two-files-one-block hazard**, and clause 4's
+     read is still the PROCESS-LOCAL `scc::HashMap`. Making the ledger
+     durable makes that answer survive a remount; it does not make it
+     coherent across live writers. Under S9, clause 4's read must be
+     re-sourced from the durable ledger (or invalidated by a custody
+     protocol) or the §6.3 W1 hazard returns unchanged — a second writer's
+     clone reference is invisible to the first writer's map no matter how
+     durable it is at rest.
+   * **The composition is already correct on the write path.** When clause 7
+     refuses, the write falls back to CoW, which routes through the merge
+     primitive (accounted); when the in-place-rewrite arm runs instead, it
+     routes through `rewrite_shadow_record` (accounted via the deferred-op
+     accumulator, §11). And when a range-custody writer displaces a block a
+     clone still references, the durable refcount is what makes that free
+     NON-terminal — pinned by the mixed-workload leg's
+     displacement-then-free step.
 
 ---
 
-## 11. Known incomplete: the write-path wiring, and how to finish it
+## 11. The write-path wiring: how it was finished
 
-**The oracle works, and it says the wiring is not finished.** Turning
-`SQUEEZEFS_BLOCK_REFS_VERIFY=1` on across `tests/fsck_tests.rs`'s healthy
-populations reports drift of two shapes:
+**The oracle was the checklist, and it is now clean.** Turning the ledger on
+across the layout-publishing suites (via the `SQUEEZEFS_TEST_STAMP_BLOCK_REFS`
+format seam, since a fresh format deliberately does not stamp — §7) reported
+drift of two shapes:
 
 | Shape | Meaning |
 |---|---|
-| `0 durable vs N derived` | a **take** was missed: some site published a layout naming a block without staging its reference |
-| `N durable vs 0 derived` | a **release** was missed: some site displaced or pruned a mapping without staging the release |
+| `0 durable vs N derived` | a **take** was missed: a site published a layout naming a block without staging its reference |
+| `N durable vs 0 derived` | a **release** was missed: a site displaced or pruned a mapping without staging the release |
 
-Wired so far (and green under the router-level acceptance suite):
+### The sites, and what each was missing
 
-* `merge_block_mappings_if_epoch` — all four `BlockMapOp` arms (write-through
-  merge, mover `MergeExpected`, `TruncateFrom`, `RemoveBlocks`);
-* `publish_pass` — the coalescing publish conveyor, per **applied** op;
-* `clone_file` — the dest's whole reference set;
-* `save_metadata_to_backend_ext` — the indirect-map blob's own reference and
-  its DUR-6 CoW predecessor's release;
-* the four whole-map-swap sites: staged→striped promotion, the StorageFull
-  durable spill, the staged whole-image promotion, the staged truncate prune;
-* `delete_file` — the reclaim teardown.
+| Site | Missing | Fix |
+|---|---|---|
+| `merge_block_mappings_if_epoch` (all four `BlockMapOp` arms) | takes + releases | exact O(batch) delta from the insert/prune loop |
+| `publish_pass` (the coalescing publish conveyor) | takes + releases, per APPLIED op | same, with fenced ops contributing nothing |
+| `clone_file` | the dest's whole reference set | staged into the dest's layout commit |
+| `save_metadata_to_backend_ext` | the indirect-map blob and its DUR-6 CoW predecessor | `BLOCK_INDEX_MAP_BLOB` take/release in the same tx |
+| staged→striped promotion; StorageFull spill; staged whole-image promotion; staged truncate prune | whole-map swaps | `block_ref_ops_for_map_swap` (per-index diff; those sites are already O(map)) |
+| `delete_file` (unlink → reclaim) | releases | its own tx, ordering per §6 |
+| **`rewrite_shadow_record`** (the last one, and a CLASS) | **everything** — it mutates the RAM map, marks the layout dirty, and does not persist | the deferred-op accumulator, below |
 
-Not yet wired: the remaining layout-publishing paths the FUSE write path
-reaches (`persist_dirty_layout_if_needed`'s republish class and the
-staged-family flip sites that save a map they did not themselves diff). The
-finishing procedure is mechanical and self-checking:
+### The last gap was a class, not a site
 
-1. run the fsck suite with `SQUEEZEFS_BLOCK_REFS_VERIFY=1`;
-2. take one drifting block, and identify the save site that published its
-   mapping (`publish_phase_ns` / the `SQUEEZEFS_FREE_FORENSICS` merge tape
-   both name it);
-3. give that site its delta — `block_ref_ops` where the site knows the
-   changed entries, `block_ref_ops_for_map_swap` where it replaces a whole
-   map;
-4. repeat until the suite is drift-free, then **delete the env gate on the
-   C8 detection block** (the removal condition is written at the gate).
+Accounting rides the layout COMMIT, but a site that mutates the map and leaves
+the layout **dirty** defers persistence to a later publish — and that save
+cannot know which references changed hands, because the map it is handed
+already contains them. The rewrite-shadow ACK path does exactly this. On the
+plain 3-block healthy population the oracle read:
 
-Two related items that belong with that work:
+```
+oss1:4194304  durable=1 [ino 2 idx 1]  derived=0   <- stale: release missed
+oss1:8388608  durable=0 []             derived=1   <- take missed
+oss1:12582912 durable=0 []             derived=1   <- take missed
+```
 
-* ~~**Backfill on engage.**~~ **DONE** — see §6.1 below. The rule is
-  implemented and pinned:
-  `stamping_a_non_empty_volume_backfills_instead_of_freeing_live_blocks`.
-* **The whole-reference oracle.** `verify_durable_block_refs` compares
-  per-block *counts*. Comparing full `(owner_ino, block_index)` tuples would
-  localize a drift to its owning inode instead of its block, which is what
-  step 2 above currently does by hand.
+— index 0 correct, index 1 recorded against its FIRST binding and never
+re-pointed, later indices never recorded: one publish's worth of staging then
+silence, the signature of a map mutated *between* saves. (Localizing it needed
+the drift log to name each block's OWNERS — ino + map index — because the
+owner is what names the publishing site.)
+
+The fix is **structural**: a per-ino deferred-op accumulator
+(`DataRouterInner::pending_block_refs`). A site that mutates the map without
+persisting NOTES its delta inside the same `INODE_META_LOCKS` section, and
+whichever save persists that map DRAINS it into the same transaction. Deferred
+deltas drain first (they are older than the persisting call's own), so a
+take-then-release sequence on one index keeps its order; a failed commit
+re-notes them, the dirty-layout refill discipline. **Any future deferring site
+is correct by construction rather than by remembering.**
+
+### Completion criterion, met
+
+`fsck` class **C8 is ungated** — `meta_kv_block_refs_drift` is a live
+must-stay-0 tripwire — and the oracle runs clean with the ledger engaged
+across: fsck, fsck-repair, write-through (+coverage), write-commit-economy,
+publish-drain-economy, write-supersession, reclaim (block-free, async, batch,
+discard-elision), truncate/hole/sparse, staged (crash-recovery, dirty-layout
+refill, rmw-alloc), data-path-correctness, striped-overwrite-lazy-seed,
+rewrite (amp, shadow), in-place overwrite, extent (overlay, patch,
+record-recovery), and clone (refcount, cli, copy_file_range).
+
+The permanent pin is
+`durable_block_refs_tests::fsck_reports_no_durable_reference_drift_on_a_healthy_volume`:
+it drives publishes, a displacement, a clone, a punch and a truncate on a
+stamped volume, runs fsck, and asserts C8 is empty. It lives in that suite
+rather than `fsck_tests` because a fresh format does not stamp bit 8, so
+`fsck_tests`' own C8 arm does not run and the pin would evaporate.
+
+**Detection cost when nothing drifts** (why C8 can be unconditional in fsck
+but not at mount): fsck already walks every inode for C1/C2/C3 and the census
+reuses that same extraction, so detection adds no walk fsck did not owe —
+only one paged range scan of the reference tree per data volume (~2.9
+ns/reference to decode) plus a `BTreeMap` fold and diff (~90 ns/reference).
+At MOUNT the walk IS the whole cost the durable records exist to delete, so
+there it stays behind `SQUEEZEFS_BLOCK_REFS_VERIFY=1`.
+
+### Still open
+
+* **The bit is still not stamped at format** (§7). That is deliberate and
+  independent of this section: the stamp belongs to the Phase-8 reformat
+  window, and the D9 posture is also what keeps a future wiring regression
+  from being able to hand out live blocks.
+* **The whole-reference oracle.** The comparison is per-block counts; the
+  drift log now names owners, but a tuple-level compare would localize
+  without the log.

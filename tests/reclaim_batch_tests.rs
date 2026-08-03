@@ -221,8 +221,13 @@ async fn test_destroy_inodes_kills_xattrs_in_the_same_transaction() {
             .create(1, &format!("x{i}"), libc::S_IFREG | 0o644, 0, 0)
             .await
             .unwrap();
+        // `layout` is an INTERNAL record: since VAL-7/VAL-2's positive
+        // allowlist (`xattr_name_allowed`) the public `Metadata::setxattr`
+        // refuses it EPERM — which is the product's intent, and the reason
+        // this test had been silently failing rather than verifying the
+        // contract in its name. Write it the way the product does.
         backend
-            .setxattr(f.ino, "layout", b"striped-blockmap")
+            .setxattr_internal(f.ino, "layout", b"striped-blockmap")
             .await
             .unwrap();
         inos.push(f.ino);

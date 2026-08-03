@@ -4826,7 +4826,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     log::info!(
                         "block ownership recovered from DURABLE records: {seeded}                          reference(s), no inode-tree walk (incompat bit 8)"
                     );
-                    if std::env::var("SQUEEZEFS_BLOCK_REFS_VERIFY").as_deref() == Ok("1") {
+                    if squeezefs::env_knobs::bool_knob("SQUEEZEFS_BLOCK_REFS_VERIFY", false) {
                         match fs_engine
                             .router
                             .backend_router

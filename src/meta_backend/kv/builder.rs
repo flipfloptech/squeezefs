@@ -449,11 +449,13 @@ impl ImageBuilder {
         // §6.2-item-1 oracle grade the wiring — which is exactly how the
         // remaining drift was found and closed.
         //
-        // Read once per format, never set in production (the
+        // Read through the ONE env-knob convention (ENG-10 — registered in
+        // `env_knobs::KNOBS`, so a malformed value refuses at startup rather
+        // than silently mis-stamping), never set in production (the
         // `SQUEEZEFS_TEST_POWER_CUT_DEVS` / `SQUEEZEFS_TEST_WRITE_STALL_MS`
         // precedent). It only ever ADDS the bit, so a volume it creates is
         // indistinguishable from one the Phase-8 window stamped.
-        if std::env::var("SQUEEZEFS_TEST_STAMP_BLOCK_REFS").as_deref() == Ok("1") {
+        if crate::env_knobs::bool_knob("SQUEEZEFS_TEST_STAMP_BLOCK_REFS", false) {
             sb.features_incompat |= super::superblock::FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS;
         }
 

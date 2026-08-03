@@ -420,7 +420,7 @@ pub const VIRTUAL_INODE_MODE: u16 = 0o400;
 /// Read live, never memoized: this is the cold `.stats` open path, and a
 /// live-flip is exactly how an operator uses it.
 pub fn stats_key_census_enabled() -> bool {
-    std::env::var("SQUEEZEFS_STATS_KEY_CENSUS").is_ok_and(|v| v == "1")
+    crate::env_knobs::bool_knob("SQUEEZEFS_STATS_KEY_CENSUS", false)
 }
 
 /// `SQUEEZEFS_PATCH_MAX_BYTES` cell (design-random-small-writes §6): max

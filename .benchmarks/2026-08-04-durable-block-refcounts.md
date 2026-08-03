@@ -138,6 +138,37 @@ merge — and this path is not hot.
 | the stamp engages on the next mount (root minted) | `stamping_the_bit_engages_accounting_on_the_next_mount` |
 | stamping a NON-EMPTY volume backfills instead of freeing live blocks | `stamping_a_non_empty_volume_backfills_instead_of_freeing_live_blocks` |
 
+### The write-path wiring, closed (step 2 of the finishing procedure)
+
+The oracle was the checklist and is now clean. Drift census, with the ledger
+engaged via the `SQUEEZEFS_TEST_STAMP_BLOCK_REFS` format seam and fsck class
+**C8 ungated**:
+
+| | Before | After |
+|---|---|---|
+| `fsck_tests` | **7 tests RED**, drift on every healthy population (write-through, clone-shared, encrypted, compressed, sparse-huge, stalled-flush, the 32 k-inode baseline) | **19/19 green, zero C8 findings** |
+| the other 27 layout-publishing suites | not gradeable (the ledger was not engaged) | **all green** |
+
+The single remaining gap was a **class**, not a site: a path that mutates the
+RAM block map and leaves the layout DIRTY defers persistence to a later save,
+which is then handed a map already containing the change and stages nothing.
+`rewrite_shadow_record` is that path. Closed structurally by the per-ino
+deferred-op accumulator (`pending_block_refs`), so any future deferring site
+is correct by construction. Localizing it needed the drift log to name each
+block's OWNERS (ino + map index) — the owner is what names the publishing
+site. Full site table: `docs/design-durable-block-refcounts.md` §11.
+
+Suites the oracle ran clean across, with the ledger engaged: fsck,
+fsck-repair, write-through (+coverage), write-commit-economy,
+publish-drain-economy, write-supersession, block-free-reclaim,
+async-block-reclaim, reclaim-batch, discard-elision, staged-truncate-stale,
+hole-read-zeros, sparse-write-bounded, staged-crash-recovery,
+staged-dirty-layout-refill, staged-rmw-alloc, data-path-correctness,
+striped-overwrite-lazy-seed, rewrite-amp, rewrite-shadow, in-place-overwrite,
+extent-overlay, extent-patch, extent-record-recovery, refcount-clone,
+cli-clone, copy-file-range — plus durable-block-refs 12/12 with the seam ON
+and OFF.
+
 **Open rows this note does NOT claim** (stated so nobody cites it for them):
 
 1. **An end-to-end mount-level publish bracket.** These are microbench terms.
@@ -153,6 +184,11 @@ merge — and this path is not hot.
 3. **Bench baseline reference refresh.** `block_refs` is a NEW group, so it
    has no entry in `.benchmarks/criterion-baselines/reference.json`. Refresh
    (`tests/run_bench_baseline.sh save`) as part of the intentional landing.
+4. **The stamp itself.** Fresh formats still do NOT carry incompat bit 8
+   (ruling D9 — the Phase-8 reformat window owns the stamp), so every row
+   above that engages the ledger does so through the test seam. The
+   *production* default remains derived accounting, which is also what keeps
+   a future wiring regression from being able to hand out live blocks.
 
 ---
 

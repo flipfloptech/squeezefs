@@ -886,11 +886,43 @@ impl CryptoCompressState {
         };
         let word = image_len as u32 | if raw_flag { FRAME_RAW_FLAG } else { 0 };
         scratch.backing_mut()[..F].copy_from_slice(&word.to_le_bytes());
-        scratch.set_written_len(F + image_len);
+        let stored_len = F + image_len;
         debug_assert!(
-            F + image_len <= self.max_stored_image_len(data.len()),
+            stored_len <= self.max_stored_image_len(data.len()),
             "stored image exceeded its FIND-RW4-A bound"
         );
+        // PERF-10 — **zero-pad the stored image to the 4 KiB DMA grain.**
+        //
+        // A transformed image's length is a compression/AEAD artifact, so it
+        // is essentially never a 4 KiB multiple: `NvmeBlockDev::write_block`
+        // then took its bounce branch and paid a THIRD copy (pooled scratch →
+        // aligned bounce buffer) on every compressed or encrypted block, on
+        // top of the merge copy and the DMA. The device writes whole 4 KiB
+        // LBAs either way — the bounce buffer's own padding proves it — so
+        // padding here costs zero device bytes and buys the aligned
+        // (zero-copy) DMA branch. Instrument: `nvme_unaligned_write_fallbacks`
+        // → ~0 on transformed volumes.
+        //
+        // The frame is self-delimiting (the length word carries `image_len`),
+        // so readers ignore the pad; `device_block_window` already reads the
+        // 4 KiB-rounded worst case. Two EXPLICIT re-checks gate the round-up
+        // — the padded image must fit both the scratch backing (growing it
+        // would allocate, defeating the point) and the allocator CHUNK (the
+        // FIND-RW4-A neighbor-corruption bound). Either refusal keeps the
+        // exact length and the pre-fix bounce; correctness never depends on
+        // the padding.
+        let padded = stored_len.next_multiple_of(crate::cache::pool::POOLED_BUF_ALIGN);
+        let fits =
+            padded <= scratch.capacity() && padded as u64 <= crate::block_allocator::CHUNK_SIZE;
+        if fits && padded > stored_len {
+            // Zero the pad: `backing_mut` bytes past the logical length may
+            // hold a previous user's recycled content, which must never
+            // reach the device (the `set_written_len` hygiene contract).
+            scratch.backing_mut()[stored_len..padded].fill(0);
+            scratch.set_written_len(padded);
+        } else {
+            scratch.set_written_len(stored_len);
+        }
         Ok(scratch.into_bytes())
     }
 

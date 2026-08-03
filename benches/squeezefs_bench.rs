@@ -251,8 +251,81 @@ fn bench_key_wrap(c: &mut Criterion) {
     group.finish();
 }
 
+/// **PERF-10 · the transformed stored image's DMA grain.**
+///
+/// A compressed/encrypted image's length is a transform artifact, so it was
+/// essentially never a 4 KiB multiple and `NvmeBlockDev::write_block` took
+/// its bounce branch for EVERY transformed block: a third copy (pooled
+/// scratch -> aligned bounce buffer, plus the tail memset) on top of the
+/// merge copy and the DMA. The stored image is now zero-padded to the grain
+/// inside the pooled scratch, so the aligned (zero-copy) branch applies.
+///
+/// The two arms price the trade directly:
+/// * `pad_fill_write_4m` - the shipped cost: `process_write` including the
+///   <= 4 KiB pad memset (the existing `crypto_compress_throughput` group
+///   covers the transform itself; this isolates the 4 MiB field shape).
+/// * `bounce_copy_4m` - the removed cost: exactly what the unaligned branch
+///   did (pooled-aligned alloc + memcpy of the stored image + tail memset).
+fn bench_stored_image_grain(c: &mut Criterion) {
+    use squeezefs::cache::pool::POOLED_BUF_ALIGN;
+    use std::hint::black_box;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let key = bench_volume_key();
+    let block_size = 4 * 1024 * 1024;
+    let state = CryptoCompressState::new("lz4".to_string(), "aes256gcm".to_string(), Some(&key));
+    state.init_scratch_pool(block_size);
+
+    // Incompressible payload: the store-raw escape's long image, i.e. the
+    // worst (and most common on real data) stored length.
+    let mut seed: u64 = 0x5EED_F00D;
+    let payload: Vec<u8> = (0..block_size)
+        .map(|_| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u8
+        })
+        .collect();
+    let payload = bytes::Bytes::from(payload);
+    let stored_len = rt
+        .block_on(state.process_write_async(payload.clone()))
+        .expect("transform")
+        .len();
+
+    let mut group = c.benchmark_group("crypto_stored_image_grain");
+    group.throughput(criterion::Throughput::Bytes(stored_len as u64));
+    group.bench_function("pad_fill_write_4m", |b| {
+        b.to_async(&rt).iter(|| {
+            let state = &state;
+            let data = payload.clone();
+            async move { state.process_write_async(data).await.unwrap() }
+        });
+    });
+    group.bench_function("bounce_copy_4m", |b| {
+        let src = vec![0xA5u8; stored_len];
+        let aligned = stored_len.next_multiple_of(POOLED_BUF_ALIGN);
+        b.iter(|| {
+            let mut dst: Vec<u8> = Vec::with_capacity(aligned);
+            // SAFETY: capacity reserved above; every byte written below.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    black_box(src.as_ptr()),
+                    dst.as_mut_ptr(),
+                    stored_len,
+                );
+                std::ptr::write_bytes(dst.as_mut_ptr().add(stored_len), 0, aligned - stored_len);
+                dst.set_len(aligned);
+            }
+            black_box(dst)
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_stored_image_grain,
     bench_crypto_compress,
     bench_key_wrap,
     bench_bench_engine_helpers

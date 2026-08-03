@@ -45,6 +45,7 @@ use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::block_refs::{self, BLOCK_INDEX_MAP_BLOB};
 use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
 use squeezefs::meta_backend::kv::record::TREE_BLOCK_REFS;
+use squeezefs::meta_backend::kv::superblock::FEATURE_INCOMPAT_KV_PARTITIONED_APPEND;
 use squeezefs::meta_backend::kv::superblock::{
     classify_volume, set_block_refcounts_bit, write_superblock_v3, VolumeFormat,
     FEATURES_INCOMPAT_KNOWN, FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS,
@@ -256,14 +257,23 @@ async fn a_fresh_format_does_not_carry_bit8_and_mounts_derived() {
     assert_eq!(
         sb.features_incompat & FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS,
         0,
-        "format must not stamp bit 8 — the batched Phase-8 reformat window owns \
-         that act (ruling D9), and a fresh format mounting derived is what keeps a \
-         partially-wired ledger from ever being trusted"
+        "format must not stamp the block-refcount bit — the batched Phase-8 \
+         reformat window owns that act (ruling D9), and a fresh format mounting \
+         derived is what keeps a partially-wired ledger from ever being trusted"
     );
+    // Bit 9, not 8: §6.2 items 1 and 2/3/4 were authored in parallel against
+    // the same free bit, and partitioned append (bit 8) landed first. Pinned
+    // so the two can never collide again — a second definition of one bit is
+    // a silent on-disk aliasing bug, not a merge inconvenience.
     assert_eq!(
         FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS,
-        1 << 8,
-        "the execution plan's §6.2 item-1 bit is 8"
+        1 << 9,
+        "the §6.2 item-1 bit is 9 (bit 8 is partitioned append)"
+    );
+    assert_eq!(
+        FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS & FEATURE_INCOMPAT_KV_PARTITIONED_APPEND,
+        0,
+        "the two multi-writer format bits must be disjoint"
     );
     assert_ne!(
         FEATURES_INCOMPAT_KNOWN & FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS,

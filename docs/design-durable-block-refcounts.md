@@ -516,12 +516,34 @@ ns/reference to decode) plus a `BTreeMap` fold and diff (~90 ns/reference).
 At MOUNT the walk IS the whole cost the durable records exist to delete, so
 there it stays behind `SQUEEZEFS_BLOCK_REFS_VERIFY=1`.
 
+### The stamp: an argued decision NOT to take it now
+
+Finishing the wiring and ungating C8 **permits** re-adding bit 8 to
+`SuperblockV3::plan`. It is deliberately **not** taken, and the reasoning
+belongs on the record rather than as an omission:
+
+* **The upside today is nil.** Nothing consumes the durable ledger except the
+  mount-time seed, and the derived walk it replaces is correct. The stamp's
+  value arrives with S9 — and with it the Phase-8 window that ruling D9
+  reserves for exactly this class of bit.
+* **The downside is not symmetric.** If a shape this census does not cover is
+  unwired, an unstamped volume loses *nothing* (derived accounting is used),
+  while a stamped one can silently reallocate a live block: a
+  partially-populated ledger is NON-empty, so §6.1's never-trust-an-empty-
+  ledger rule does not fire.
+* **The census, though broad, is not exhaustive.** 51 suites run clean with
+  the ledger engaged (§11), but the release-gate tier does not run here —
+  fstests / LTP / pjdfstests and any real-mount venue are outside it, as is
+  GDS. "Clean across the suites" is strong evidence of completeness, not a
+  proof of it, and the asymmetry above says to spend that uncertainty on the
+  safe side.
+
+So the shipped default stays derived accounting, and the stamp is one
+`set_block_refcounts_bit` call in the Phase-8 window whose prerequisite
+evidence is this document plus `.benchmarks/2026-08-04-durable-block-refcounts.md`.
+
 ### Still open
 
-* **The bit is still not stamped at format** (§7). That is deliberate and
-  independent of this section: the stamp belongs to the Phase-8 reformat
-  window, and the D9 posture is also what keeps a future wiring regression
-  from being able to hand out live blocks.
 * **The whole-reference oracle.** The comparison is per-block counts; the
   drift log now names owners, but a tuple-level compare would localize
-  without the log.
+  without needing the log.

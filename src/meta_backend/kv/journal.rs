@@ -135,9 +135,7 @@
 //! corruption alert (§10) instead of a tear census.
 
 use super::journal_core::{AdmissionClass, CoreGeometry, JournalCore, Reservation};
-use super::record::{
-    Record, RecordRef, TREE_ALLOC_RESERVED, TREE_ID_MAX, TREE_INODES,
-};
+use super::record::{Record, RecordRef, TREE_ALLOC_RESERVED, TREE_ID_MAX, TREE_INODES};
 use super::KvError;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

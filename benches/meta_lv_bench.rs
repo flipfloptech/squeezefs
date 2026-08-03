@@ -959,9 +959,10 @@ fn bench_append_partition(c: &mut Criterion) {
     group.bench_function("ledger_slot_index", |b| {
         b.iter(|| black_box(black_box(&rec).slot_index()))
     });
+}
 
 /// **Durable block-reference accounting** (pre-RC engineering spec §6.2
-/// item 1, incompat bit 8) — the publish path's added cost, priced.
+/// item 1, incompat bit 9) — the publish path's added cost, priced.
 ///
 /// Input shapes are FIELD-derived, not toys:
 ///

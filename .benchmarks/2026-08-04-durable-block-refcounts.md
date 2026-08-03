@@ -158,6 +158,16 @@ is correct by construction. Localizing it needed the drift log to name each
 block's OWNERS (ino + map index) — the owner is what names the publishing
 site. Full site table: `docs/design-durable-block-refcounts.md` §11.
 
+Beyond the 28 layout-publishing suites, the census was broadened to another
+23 with the ledger engaged, all green: volume-drain 17, volume-lifecycle 9,
+defrag 11, job-fabric 14, interaction 7, rw5a-never-lossy 10,
+write-visibility 19, small-write-zero-copy 3, staged-identity-visibility 8,
+staged-multifile-ring-pressure 6, crash-contract 25, ipc-host 33,
+ipc-direct-drive 11, ipc-op-economy 3, shim-parity 3, ingest-economy 4,
+assembly-ownership 7, dma-fence-gate 3, durability-matrix 12,
+dur-metadata-integrity 10, data-device-power-cut 7 — i.e. the mover/defrag,
+job-fabric, IPC/shim write and durability paths as well.
+
 Suites the oracle ran clean across, with the ledger engaged: fsck,
 fsck-repair, write-through (+coverage), write-commit-economy,
 publish-drain-economy, write-supersession, block-free-reclaim,
@@ -188,7 +198,24 @@ and OFF.
    (ruling D9 — the Phase-8 reformat window owns the stamp), so every row
    above that engages the ledger does so through the test seam. The
    *production* default remains derived accounting, which is also what keeps
-   a future wiring regression from being able to hand out live blocks.
+   a future wiring regression from being able to hand out live blocks. The
+   argued disposition — why the permission to stamp was not exercised — is
+   `docs/design-durable-block-refcounts.md` §11.
+
+### Pre-existing failures met while broadening the census (neither is ours)
+
+* `writeback_tests::test_write_block_from_staging_transform_leg_drops_guard_before_dma`
+  — an intra-suite order dependency: PASSES in isolation, FAILS in the full
+  `--test-threads=1` run, identically with and without the ledger, and
+  **verified at dev tip `4f219082` in a scratch worktree**.
+* `reclaim_batch_tests::test_destroy_inodes_kills_xattrs_in_the_same_transaction`
+  — wrote the internal `layout` record through the PUBLIC `Metadata::setxattr`,
+  which VAL-2/VAL-7's positive allowlist refuses EPERM by design, so the test
+  had been failing rather than verifying the contract in its name. **Fixed on
+  this branch** (it now writes the way the product does).
+* `env_knob_convention_tests::every_knob_in_the_tree_is_registered` — RED at
+  dev tip: VAL-7 landed `SQUEEZEFS_STATS_KEY_CENSUS` after the ENG-10 registry
+  and did not register it. **Fixed on this branch.**
 
 ---
 

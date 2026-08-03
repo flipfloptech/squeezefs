@@ -192,8 +192,29 @@ Every claim cites its tier. **(i) measured-real** — rows from real mounts at l
 | 5 | `KV_LAYOUT_DELTAS` | first delta-class save | Write-commit economy |
 | 6 | `KV_DYNAMIC_ROUTING` | at format, presence-REQUIRED | Field validation still owed — reset-v5 window. Verified in the field 2026-08-02: pre-bit-6 binaries refuse loud, as designed |
 | 7 | `WriterClaim.term` | — | DLM **S2**, batched into the one reformat window |
+| 8 | `KV_PARTITIONED_APPEND` | — | Multi-writer §6.2 items 2/3/4; built, never stamped (ruling D9) |
+| 9 | `KV_BLOCK_REFCOUNTS` | — | Multi-writer §6.2 item 1; built, never stamped (D9). Renumbered from 8 after a same-wave collision — two definitions of one bit is silent aliasing, so every claim now carries a disjointness assertion |
+| 10 | `KV_WRITER_SCOPED_STAGING` | — | Multi-writer §6.2 items 8/10 (keys **and** the node-scoped generation stamp share one bit: a half-engaged state is unsound in both directions); built, never stamped (D9) |
 | — | Post-RSA key wrap (KW-1) | — | Ruling D3; same window |
 | — | Sharded indirect map (DUR-6 ⊕ PERF-9) | — | Same window |
+
+Stamping is unanimous per volume SET for bit 10 (a half-stamped set stays
+unscoped) and requires the Phase-8 window for all four unstamped bits.
+
+---
+
+## 3c. Known-red at dev during the DLM push (D11 bookkeeping)
+
+Ruling D11 parks suite runs until N readers + N writers work, so failures found
+incidentally by agents are recorded here rather than fixed on sight — with one
+exception class: a red caused by our own landing gets fixed immediately, since
+it is merge debt, not pre-existing debt.
+
+| Test | Cause | Disposition |
+|---|---|---|
+| `kv_backend_tests::v3_unknown_incompat_bit_refuses_naming_it_and_unknown_ro_does_not` | The case hardcoded `1 << 9` as "a bit this binary does not know"; bit 9 became `KV_BLOCK_REFCOUNTS` | **FIXED** (`9268d961`) — the probe bit now derives from `FEATURES_INCOMPAT_KNOWN`, so it pins the property and cannot rot as later stages claim bits |
+| `mem_budget_tests::advisory_integration_phases` | "the paused victim must NOT reach the tier" — reported identical at base by two independent agents | Open; triage in the deferred stack. Suspect the R5 shed-channel semantics landed with the eviction-channel components, not a DLM regression |
+| `writeback_tests::test_write_block_from_staging_transform_leg_drops_guard_before_dma` | An LZ4 image declares 65,536 B against a 4,096 B block bound — a process-global block-size ordering effect inside that suite | Open; triage in the deferred stack. If the global is genuinely order-dependent it is a test-isolation bug, and the fix belongs with TEST-3's `poll_until` sweep |
 
 ---
 

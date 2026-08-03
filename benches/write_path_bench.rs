@@ -726,8 +726,110 @@ fn bench_copy_probe_range(c: &mut Criterion) {
     group.finish();
 }
 
+/// Writer-scoped staging keys — spec §6.2 items 8/10.
+///
+/// Field shape: staging key mint is on the small-write path (the W1/W2
+/// predicates and the §5.5.1 warm serve prelude mint one per op — the
+/// op-economy campaign's zero-heap `StackKey` exists for exactly that),
+/// and record classification is on the MOUNT path (one pass over every
+/// recovered staging key: the field's kill-9 residue population, sized
+/// here at 4,096 records ≈ a 16 GiB dirty ring at 4 MiB blocks).
+///
+/// The rows that matter: `disengaged_*` is the SOLO case — every shipped
+/// volume, since ruling D9 stamps nothing — and must be at par with the
+/// pre-change mint (one relaxed-load gate + a predicted branch);
+/// `engaged_*` prices what a writer-scoped set pays.
+fn bench_writer_scope(c: &mut Criterion) {
+    use squeezefs::writer_scope as ws;
+
+    let mut group = c.benchmark_group("writer_scope");
+    // The A/B control for "the solo case must not regress": the PRE-change
+    // mint, byte-for-byte (the historical body, no scope hook), against
+    // `disengaged_mint_heap` (the shipped path — ruling D9 stamps nothing).
+    group.bench_function("prechange_mint_heap", |b| {
+        b.iter(|| {
+            use std::fmt::Write as _;
+            let (ino, block): (u64, u64) = (black_box(4242), black_box(7));
+            let mut s = compact_str::CompactString::with_capacity(40);
+            let _ = write!(s, "active_block:inode_{ino}:block_{block}");
+            black_box(s)
+        });
+    });
+    for (label, scope) in [
+        ("disengaged", None),
+        ("engaged", Some(0x0123_4567_89ab_cdefu64)),
+    ] {
+        ws::engage(scope);
+        // Mint: heap (the layout/flush paths) and zero-heap stack (the
+        // warm serve prelude / W1 predicate probes).
+        group.bench_function(format!("{label}_mint_heap"), |b| {
+            b.iter(|| black_box(squeezefs::keys::active_block(black_box(4242), black_box(7))));
+        });
+        group.bench_function(format!("{label}_mint_stack"), |b| {
+            b.iter(|| {
+                black_box(squeezefs::keys::active_block_stack(
+                    black_box(4242),
+                    black_box(7),
+                ))
+            });
+        });
+        group.bench_function(format!("{label}_mint_ext_heap"), |b| {
+            b.iter(|| {
+                black_box(squeezefs::keys::active_block_ext(
+                    black_box(4242),
+                    black_box(7),
+                ))
+            });
+        });
+        // Parse: every historical `(ino, block)` parser now strips the
+        // scope first (`strip_key_scope`), on the fold/flush/reclaim paths.
+        let key = squeezefs::keys::active_block(4242, 7).to_string();
+        group.bench_function(format!("{label}_strip_scope"), |b| {
+            b.iter(|| black_box(ws::strip_key_scope(black_box(&key))));
+        });
+        group.bench_function(format!("{label}_classify"), |b| {
+            b.iter(|| black_box(ws::classify_key(black_box(&key))));
+        });
+
+        // Mount-path classification sweep: the recovery pass's per-record
+        // decision over a dirty-ring-sized key population.
+        const RECORDS: usize = 4096;
+        let keys: Vec<String> = (0..RECORDS)
+            .map(|i| squeezefs::keys::active_block(4242, i as u64).to_string())
+            .collect();
+        group.throughput(Throughput::Elements(RECORDS as u64));
+        group.bench_function(format!("{label}_recovery_scan_4096"), |b| {
+            b.iter(|| {
+                let mut mine = 0usize;
+                for k in &keys {
+                    if ws::key_is_mine(k) {
+                        mine += 1;
+                    }
+                }
+                black_box(mine)
+            });
+        });
+    }
+    ws::engage(None);
+
+    // The item-10 root-level decision (once per staging root per mount).
+    let set = "v3:00112233445566778899aabbccddeeff|v3:ffeeddccbbaa99887766554433221100";
+    let scoped = ws::staging_generation(set, Some(0x0123_4567_89ab_cdef));
+    group.bench_function("classify_generation_match", |b| {
+        b.iter(|| {
+            black_box(ws::classify_generation(
+                black_box(&scoped),
+                black_box(&scoped),
+                black_box(Some(0x0123_4567_89ab_cdef)),
+            ))
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_writer_scope,
     bench_staging_shard_removal,
     bench_copy_probe_range,
     bench_coverage_union,

@@ -4245,11 +4245,26 @@ unsafe fn dest_bytes(ptr: *mut u8, len: usize) -> bytes::Bytes {
 ///   stream admission arbitration, but never feeds the foreground basis
 ///   (no self-funding), and its non-admitted hot put carries the
 ///   one-lap clock grace.
+/// * `Escalation` — the hybrid second-touch ghost escalation's whole-block
+///   fetch (`get_block_range_for_index` dispatch; user directive
+///   2026-07-15). `Demand` admission semantics verbatim (non-streaming,
+///   never self-funds — the governor already priced this fetch at the
+///   dispatch site via `allow_escalation`), with ONE difference: the
+///   fill's decided disk-tier publish is AWAITED, not deferred. The
+///   escalated fetch IS the admission — a 4 KiB ranged request that
+///   voluntarily paid a whole-block fetch FOR the tier copy, at most once
+///   per key per cooldown window — so its product (the validated NVMe
+///   publish) is part of the serve contract at the caller's boundary
+///   (pinned by `hybrid_io_tests`). PERF-11's publish deferral targets
+///   the ordinary cold-fill hot path, whose product is the reader's
+///   bytes; it must not make the admission's product invisible at the
+///   serve that bought it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FillClass {
     Demand,
     DemandStream,
     Prefetch,
+    Escalation,
 }
 
 impl FillClass {
@@ -6333,8 +6348,19 @@ impl DataRouter {
                     // publish; the caller's bytes do not wait for it.
                     // Readers arriving during the window find the entry,
                     // re-check, and hit the RAM deposit above.
+                    //
+                    // `Escalation`-class exception (hybrid second-touch
+                    // admission — see the FillClass doc): the publish is
+                    // AWAITED. The escalated caller paid a whole-block
+                    // fetch FOR the tier copy (at most once per key per
+                    // cooldown window), so the admission's product must be
+                    // tier-visible at that caller's serve boundary (pinned
+                    // by hybrid_io_tests). The cohort send above already
+                    // happened — waiters never wait on the publish; the
+                    // closure (and the guard-ordering law) is identical on
+                    // both arms.
                     if let Some((nvme_clone, backend_router, bk, dl, before)) = deferred_publish {
-                        tokio::task::spawn_blocking(move || {
+                        let publish = tokio::task::spawn_blocking(move || {
                             // Guard rides along: its Drop removes the
                             // registry entry AFTER the publish is visible.
                             let _guard = guard;
@@ -6356,6 +6382,9 @@ impl DataRouter {
                                 nvme_clone.remove_cached_read_block(&bk);
                             }
                         });
+                        if class == FillClass::Escalation {
+                            let _ = publish.await;
+                        }
                     }
                     return Ok((
                         crate::cache::pool::ReadBlockValue::Bytes(downloaded_bytes),
@@ -7499,6 +7528,32 @@ impl DataRouter {
         device_true: bool,
         escalate_contended: bool,
     ) -> Result<Option<crate::cache::pool::ReadBlockValue>> {
+        self.get_block_for_index_class(
+            file_path,
+            b,
+            resolved_key,
+            device_true,
+            escalate_contended,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::get_block_for_index`] with an explicit fill-provenance
+    /// override (`None` = derive from the file's §5.3 classification as
+    /// before). The one caller that overrides is the hybrid second-touch
+    /// ghost escalation (`FillClass::Escalation` — see the class doc):
+    /// its fill must await the tier publish it escalated FOR. Crate-only
+    /// because [`FillClass`] is crate-only.
+    pub(crate) async fn get_block_for_index_class(
+        &self,
+        file_path: &str,
+        b: u32,
+        resolved_key: Option<&str>,
+        device_true: bool,
+        escalate_contended: bool,
+        fill_class_override: Option<FillClass>,
+    ) -> Result<Option<crate::cache::pool::ReadBlockValue>> {
         // Each retry re-resolves against the freshest map. Exhaustion
         // fails loud rather than serving unproven bytes — but only after
         // the FIND-RW5-A liveness ladder (the generic/464 dominant EIO
@@ -7526,8 +7581,13 @@ impl DataRouter {
         // computed ONCE per call — a file holding a fresh §5.3 streaming
         // classification fills as DemandStream (its ghost hits are
         // governor-arbitrated and its device fetches fund the trickle).
-        // One moka get per FILL, never per warm op.
-        let fill_class = if !device_true
+        // One moka get per FILL, never per warm op. An explicit override
+        // (the ghost escalation) wins: the escalation dispatch is only
+        // reachable on non-streaming files (`ranged_eligible`), and its
+        // provenance is the admission itself, not the classifier.
+        let fill_class = if let Some(class) = fill_class_override {
+            class
+        } else if !device_true
             && self
                 .stream_lanes
                 .get(file_path)
@@ -7767,8 +7827,19 @@ impl DataRouter {
                             .read_odirect_ghost_admits
                             .fetch_add(1, Ordering::Relaxed);
                     }
+                    // `Escalation` provenance: the fill AWAITS its decided
+                    // tier publish — the admission's product is part of
+                    // THIS serve's contract (see the FillClass doc; pinned
+                    // by hybrid_io_tests "validated NVMe publish").
                     let whole = self
-                        .get_block_for_index(file_path, b, resolved_key, false, true)
+                        .get_block_for_index_class(
+                            file_path,
+                            b,
+                            resolved_key,
+                            false,
+                            true,
+                            Some(FillClass::Escalation),
+                        )
                         .await?;
                     return Ok(whole
                         .map(|val| Self::slice_whole_for_ranged(val, &rel_range, dest.as_ref())));

@@ -1354,6 +1354,132 @@ async fn test_sharded_scan_reports_exactly_one_c10_finding_across_the_merge() {
 }
 
 // ---------------------------------------------------------------------------
+// §10 gauges: the counting extension, the per-direction triage split, the
+// guard's engagement, and the repair class
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_c10_counters_and_repair_class_gauge_move() {
+    use std::sync::atomic::Ordering;
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    format_meta(&meta, &[&oss1]).await;
+    let recs = base_format_config(&[&oss1]).resolved_data_volumes();
+
+    let fx = open_fixture(&meta, &recs).await;
+    // A healthy hardlink so the counting extension has something to count,
+    // and one of each direction so the triage gauges can be told apart.
+    let pair = create_file(&fx, "pair.bin").await;
+    hardlink(&fx, pair, "pair.link").await;
+    let high = create_file(&fx, "high.bin").await;
+    hardlink(&fx, high, "high.link").await;
+    drop_one_name(&fx, high).await;
+    let low = create_file(&fx, "low.bin").await;
+    hardlink(&fx, low, "low.link").await;
+    force_nlink(&fx, low, 1).await;
+    let zero = create_file(&fx, "zero.bin").await;
+    force_nlink(&fx, zero, 0).await;
+    let ghost = create_file(&fx, "ghost.bin").await;
+    destroy_record_keep_name(&fx, ghost).await;
+
+    let report = run_fsck(&fx.ctx(), &online_opts()).await.expect("fsck");
+    let c = &report.counters;
+    assert!(
+        c.nlink_names_counted >= 2,
+        "the counting extension must account the multi-named population \
+         (the healthy hardlink included): {c:?}"
+    );
+    assert_eq!(
+        (
+            c.nlink_mismatch_high,
+            c.nlink_mismatch_low,
+            c.nlink_zero_named,
+            c.dangling_dentries
+        ),
+        (1, 1, 1, 1),
+        "each direction is counted on its own gauge — the last three are the \
+         DATA-LOSS direction an operator triages on: {c:?}"
+    );
+    assert_eq!(c.findings, 4, "{:?}", report.findings);
+
+    let before = squeezefs::fuse_client::METRICS.fsck_repair_class[9].load(Ordering::Relaxed);
+    let rep = run_repair(&fx.ctx(), &report, &apply())
+        .await
+        .expect("apply");
+    assert_eq!(
+        rep.counters.per_class.get("C10").copied(),
+        Some(4),
+        "per-class repair accounting: {:?}",
+        rep.counters
+    );
+    assert!(
+        squeezefs::fuse_client::METRICS.fsck_repair_class[9].load(Ordering::Relaxed) >= before + 4,
+        "fsck_repair_classC10 moved"
+    );
+    fx.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_the_guard_gauge_moves_when_a_guard_clears_a_suspect() {
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    format_meta(&meta, &[&oss1]).await;
+    let recs = base_format_config(&[&oss1]).resolved_data_volumes();
+
+    let fx = open_fixture(&meta, &recs).await;
+    let inflight = create_file(&fx, "inflight.bin").await;
+    force_nlink(&fx, inflight, 2).await;
+    plant_open_intent(&fx, inflight, 0x0000_0077_dead_beef).await;
+
+    let report = run_fsck(&fx.ctx(), &online_opts()).await.expect("fsck");
+    assert!(c10(&report).is_empty(), "{:?}", report.findings);
+    assert!(
+        report.counters.nlink_transient_cleared >= 1,
+        "a cleared suspect must be ATTRIBUTED to the guard that cleared it — a shield \
+         with no engagement gauge cannot be shown to be non-vacuous: {:?}",
+        report.counters
+    );
+    assert!(
+        report.counters.suspects >= 1 && report.counters.suspects_cleared >= 1,
+        "the suspect was formed and then cleared (not never nominated): {:?}",
+        report.counters
+    );
+    fx.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// The derivation's tie test (drift is red)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_c10_count_entry_budget_is_derived_not_tuned() {
+    let entries = squeezefs::fsck::c10_count_entry_budget();
+    let ino_set = squeezefs::fsck::ino_set_byte_budget();
+
+    // The count maps ride the SAME byte budget as ONE C9 ino set: the only
+    // constant is the charged bytes per entry (a `(parent, name)` pair or an
+    // `(ino, nlink)` pair with its table overhead), which is an accounting
+    // factor, not a tuning knob.
+    const CHARGED_BYTES_PER_ENTRY: u64 = 64;
+    assert_eq!(
+        entries,
+        ino_set / CHARGED_BYTES_PER_ENTRY,
+        "the C10 count budget must stay derived from the ino-set byte budget; a \
+         free-floating entry constant here is a program violation"
+    );
+    // And it must be able to hold a real hardlink population: at the design
+    // cap's own floor (16 MiB of bits) that is a quarter-million names.
+    assert!(
+        entries >= 250_000,
+        "the budget must hold a field-scale multi-named population, got {entries}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Links and unlinks racing a scan (the shapes the guards exist for)
 // ---------------------------------------------------------------------------
 

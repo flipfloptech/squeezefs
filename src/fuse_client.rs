@@ -520,8 +520,15 @@ fn inplace_overwrite_cell() -> &'static std::sync::atomic::AtomicBool {
 ///
 /// **DLM S5**: a read-only mount never overwrites anything, in place or
 /// otherwise — the latch wins over the knob (spec §6.8 item 6).
+///
+/// **DLM S9**: neither does a co-writer. In-place eligibility is a
+/// sole-ownership predicate over a PROCESS-LOCAL refcount map (W1's
+/// six-clause ledger), and a co-writer's map is a cache of an authority's
+/// ledger — it can prove nothing about a block the authority may have
+/// cloned. The CoW path is the correct answer there, and it is the one a
+/// co-writer takes.
 pub fn inplace_overwrite_enabled() -> bool {
-    !read_only_mount() && inplace_overwrite_cell().load(Ordering::Relaxed)
+    !read_only_mount() && !co_writer_mount() && inplace_overwrite_cell().load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -549,18 +556,87 @@ pub fn inplace_overwrite_enabled() -> bool {
 /// item 1's list).
 static READ_ONLY_MOUNT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// DLM **S9**: the CO-WRITER latch, deliberately a SECOND word rather than
+/// a third state of `READ_ONLY_MOUNT`.
+///
+/// `read_only_mount()` means exactly one thing across eleven call sites —
+/// *this mount is an S5 reader* (EROFS at the FUSE door, reader TTLs,
+/// no writer engines, no `client:` beat) — and a co-writer is none of
+/// those: it writes data. Folding the postures into one word would have
+/// changed every one of those sites' meaning at once, which is the
+/// opposite of what a safety-critical split wants. So the reader latch is
+/// untouched and this one is additive: `false` on every reader and every
+/// writer, so both keep their exact shape.
+static CO_WRITER_MOUNT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Which posture this mount took — the `mount_posture` stats gauge and the
+/// one word the data-plane gates classify against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountPosture {
+    /// The shipped posture: local authority over metadata and data.
+    Writer,
+    /// DLM S5: a coherent reader. No authority over any plane.
+    Reader,
+    /// DLM S9: a co-writer. No metadata authority (mutations ship), data
+    /// authority under a granted custody lease, and NO ownership-accounting
+    /// authority (the authority's ledger owns every device offset).
+    CoWriter,
+}
+
+impl MountPosture {
+    /// The operator-facing word.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MountPosture::Writer => "writer",
+            MountPosture::Reader => "reader",
+            MountPosture::CoWriter => "co-writer",
+        }
+    }
+}
+
 /// Whether this mount is read-only (a **reader**: no leases, no claim, no
 /// mutation of any plane). Library code calls this rather than re-reading
 /// CLI/mount options — the `write_verification_enabled()` convention.
+///
+/// **Unchanged by S9**: a co-writer answers `false` here, because every one
+/// of this predicate's consumers asks "is this an S5 reader?" and a
+/// co-writer is not one.
 #[inline]
 pub fn read_only_mount() -> bool {
     READ_ONLY_MOUNT.load(Ordering::Relaxed)
+}
+
+/// DLM **S9**: whether this mount is a CO-WRITER (metadata read-only
+/// locally with mutations shipped, data read-write under custody).
+#[inline]
+pub fn co_writer_mount() -> bool {
+    CO_WRITER_MOUNT.load(Ordering::Relaxed)
+}
+
+/// This mount's posture.
+#[inline]
+pub fn mount_posture() -> MountPosture {
+    if read_only_mount() {
+        MountPosture::Reader
+    } else if co_writer_mount() {
+        MountPosture::CoWriter
+    } else {
+        MountPosture::Writer
+    }
 }
 
 /// Arm/disarm the read-only mount posture. Called ONCE from the mount
 /// path before any volume is opened (and by tests, which restore it).
 pub fn set_read_only_mount(on: bool) {
     READ_ONLY_MOUNT.store(on, Ordering::Relaxed);
+}
+
+/// Latch this mount's posture. Called ONCE from the mount path before any
+/// volume is opened (and by tests, which restore it). The two latches are
+/// set together so no window exists in which a mount is both.
+pub fn set_mount_posture(posture: MountPosture) {
+    READ_ONLY_MOUNT.store(posture == MountPosture::Reader, Ordering::Relaxed);
+    CO_WRITER_MOUNT.store(posture == MountPosture::CoWriter, Ordering::Relaxed);
 }
 
 /// The standard refusal for a data-plane mutation attempted on a reader.
@@ -571,6 +647,35 @@ pub(crate) fn read_only_refusal(what: &str) -> crate::error::SqueezefsError {
          one writer plus N coherent readers). A reader mutates no plane: no metadata, no \
          block allocation, no frees, no device reclaim, no in-place patch. Mount without \
          `-o ro` to write."
+    ))
+}
+
+/// DLM **S9** — the standard refusal for **ownership accounting** attempted
+/// on a co-writer (block allocation, terminal frees, the W1 incarnation
+/// retire, the ownership recovery walk).
+///
+/// Deliberately NOT the reader text: a co-writer is not read-only, and
+/// telling an operator to "mount without -o ro" would be a lie. What it has
+/// is data authority without accounting authority — the durable truth of
+/// which offsets are owned lives in the authority's `TREE_BLOCK_REFS`, so
+/// mutating a LOCAL refcount map, free list or allocation cursor here would
+/// be one node inventing an answer about shared hardware. One text, so
+/// every plane's refusal names the same cause and the same open work.
+pub(crate) fn co_writer_refusal(what: &str) -> crate::error::SqueezefsError {
+    METRICS
+        .cowriter_accounting_refusals
+        .fetch_add(1, Ordering::Relaxed);
+    crate::error::SqueezefsError::InvalidOperation(format!(
+        "{what} refused: this mount is a CO-WRITER (DLM S9 — metadata read-only locally with \
+         mutations shipped to the authority, data read-write under a granted custody lease). A \
+         co-writer holds DATA authority, not ownership-ACCOUNTING authority: which device \
+         offsets are owned is durable metadata (TREE_BLOCK_REFS) on volumes this mount cannot \
+         commit to, so allocating, freeing or retiring an incarnation here would be this node \
+         inventing an answer about shared hardware. Fresh allocation for a co-writer is the \
+         data-plane allocation partition's work (spec §6.2 item 8 / §6.8 — the allocator must \
+         hand disjoint ranges to each writer before this can be admitted); until it lands, a \
+         co-writer writes only into destinations its custody grant declares. Mount this node as \
+         the authority (unset SQUEEZEFS_MW_ROLE) to allocate here."
     ))
 }
 
@@ -3793,6 +3898,33 @@ pub struct Metrics {
     /// each volume engages). This is the number capacity planning uses;
     /// adopting a lane lowers it.
     pub alloc_lane_stranded_bytes: Align64<AtomicU64>,
+    // DLM **S9** (spec §6.2 item 7's consumer half): the CO-WRITER mount
+    // posture. All four are 0 on every shipped mount — the posture is
+    // opt-in twice over (`SQUEEZEFS_MULTI_WRITER=1` +
+    // `SQUEEZEFS_MW_ROLE=co-writer`) and nothing stamps the capability
+    // bits it requires (ruling D9).
+    /// Co-writer admissions GRANTED by the five-rung ladder
+    /// (`cowriter::classify_admission`). One per admitted mount, so on a
+    /// healthy co-writer this reads 1 and never grows again.
+    pub cowriter_admissions: Align64<AtomicU64>,
+    /// Co-writer admissions REFUSED, whatever the rung. Growth on a node
+    /// that should be admitted is the operator's signal to read the log:
+    /// every refusal names its rung, what is missing, and the remedy.
+    pub cowriter_admission_refusals: Align64<AtomicU64>,
+    /// Ownership-ACCOUNTING mutations refused on a co-writer (block
+    /// allocation, terminal free, the W1 incarnation retire, the ownership
+    /// recovery walk). Growth is expected and honest until the data-plane
+    /// allocation partition lands: it is the count of writes a co-writer
+    /// could not place itself, and it is what makes that gap visible
+    /// instead of silent.
+    pub cowriter_accounting_refusals: Align64<AtomicU64>,
+    /// LOCAL metadata commits refused on a co-writer — the mutations that
+    /// reached the backend's write gate instead of the shipped publish
+    /// path. **Should stay 0 on a healthy co-writer**: a nonzero value
+    /// means a daemon surface still commits directly rather than routing
+    /// through `meta_ship`, i.e. S8's "the daemon is not switched onto the
+    /// router" gap reaching a real workload.
+    pub cowriter_local_commit_refusals: Align64<AtomicU64>,
     // DLM **S6** (pre-RC spec §6.5 item 3, §6.9 S6): the membership plane.
     // Liveness is RAM state renewed over `cluster_wire`, so these are the
     // instruments that say so — the gauges (`membership_mode`,
@@ -6813,6 +6945,15 @@ impl SqueezefsFilesystem {
                 "alloc_lane_adoptions": METRICS.alloc_lane_adoptions.load(Ordering::Relaxed),
                 "alloc_lane_enospc_refusals": METRICS.alloc_lane_enospc_refusals.load(Ordering::Relaxed),
                 "alloc_lane_stranded_bytes": METRICS.alloc_lane_stranded_bytes.load(Ordering::Relaxed),
+                // DLM S9 (spec §6.2 item 7's consumer half): the mount
+                // POSTURE and the co-writer ledger. `mount_posture` is the
+                // one word that says which of the three shapes this daemon
+                // is; the `cowriter` object's counters are all 0 on every
+                // shipped mount, and `local_commit_refusals` is the one to
+                // watch — nonzero means a daemon surface still commits
+                // metadata directly instead of shipping it.
+                "mount_posture": mount_posture().as_str(),
+                "cowriter": crate::cowriter::stats_json(),
                 // DLM S6 (spec §6.5 item 3): the membership plane's
                 // counters. `membership_renewals` is the beat that used to
                 // be a journal transaction — it grows while
@@ -13870,17 +14011,28 @@ impl Filesystem for SqueezefsFilesystem {
         // worse — run a mount-time sweep that MUTATES: the extent-record
         // recovery pass adopts/discards `active_block_ext:` records, and
         // the reclaim pool issues device discards.
+        //
+        // DLM S9: a CO-WRITER skips the same engines, for the adjacent
+        // reason — each of them mutates ownership ACCOUNTING it has no
+        // authority over (the extent-record sweep adopts/discards staged
+        // records, the reclaim pool deallocates offsets, the writeback
+        // flusher publishes layouts and frees displaced blocks). Its
+        // metadata mutations ship instead, and its allocator arms refuse
+        // loudly (`fuse_client::co_writer_refusal`), so an armed engine
+        // here would only produce refusals on a channel it cannot serve.
         let reader_mount = read_only_mount();
-        if reader_mount {
+        let co_writer = co_writer_mount();
+        if reader_mount || co_writer {
             info!(
-                "Read-only mount: writeback flusher, extent-record recovery, fold worker \
-                 and reclaim pool are NOT armed (nothing on a reader can be dirty, staged \
-                 or freed)"
+                "{} mount: writeback flusher, extent-record recovery, fold worker \
+                 and reclaim pool are NOT armed (nothing here can be dirty, staged \
+                 or freed by this mount)",
+                mount_posture().as_str()
             );
         }
 
         // Start background active writes flusher task
-        if !reader_mount {
+        if !reader_mount && !co_writer {
             let mut rx_guard = self.writeback_rx.lock().unwrap();
             if let Some(writeback_rx) = rx_guard.take() {
                 let router = self.router.clone();
@@ -13908,7 +14060,15 @@ impl Filesystem for SqueezefsFilesystem {
         // and the R-6 purge sink is installed; the poll is illegal before
         // it), then the cadence task that drives the landed poller. These
         // replace the writer engines skipped above.
-        if reader_mount {
+        //
+        // DLM S9: a CO-WRITER arms the SAME three, and that is the point of
+        // requirement 6 — its metadata view is a snapshot of the
+        // authority's checkpoints exactly as a reader's is, so it needs the
+        // §6.8 item-2 revalidation cadence and the item-5 purge or it would
+        // serve bytes for offsets the authority has since reallocated. The
+        // data-plane lockdown arm is right for it too: a co-writer frees
+        // nothing and deallocates nothing (its accounting ships).
+        if reader_mount || co_writer {
             crate::ro_coherence::arm_reader_data_plane(&self.router);
             if let Some(routed) = self.meta_backend.as_ref() {
                 crate::ro_coherence::arm_reader_coherence(&routed.volumes, &self.router);
@@ -13923,13 +14083,13 @@ impl Filesystem for SqueezefsFilesystem {
         // W2 (§5.2): mount-time extent-record sweep — validate + loudly
         // report kill-9 residue (clean shutdowns drain every record), and
         // arm the background fold worker.
-        if !reader_mount {
+        if !reader_mount && !co_writer {
             self.recover_extent_records().await;
             self.ensure_fold_worker();
         }
 
         // Start background GC/reclaim worker pool
-        if !reader_mount {
+        if !reader_mount && !co_writer {
             let mut reclaim_rx_guard = self.reclaim_rx.lock().unwrap();
             if let Some(reclaim_rx) = reclaim_rx_guard.take() {
                 let self_clone = self.clone();

@@ -1674,6 +1674,24 @@ pub fn installed_member() -> Option<Arc<MemberSession>> {
     }
 }
 
+/// The installed MEMBER session, when this process is a member (a reader,
+/// or — since DLM S9 — a co-writer). `None` for an owner and for an
+/// unarmed mount.
+///
+/// Delegates: the §6.8 item-3 reader half and the S9 co-writer admission
+/// arrived at this accessor independently, under two names. One
+/// implementation, so the two halves of one posture cannot disagree about
+/// what "this process is a member" means.
+pub fn installed_member_session() -> Option<Arc<MemberSession>> {
+    installed_member()
+}
+
+/// The member epoch this process holds (`0` when it is not a member) — the
+/// S9 co-writer admission's rung-4 evidence field.
+pub fn installed_member_epoch() -> u64 {
+    installed_member_session().map(|s| s.epoch()).unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // Arming at mount
 // ---------------------------------------------------------------------------
@@ -1821,7 +1839,7 @@ pub async fn arm_mount_membership(
     };
 
     if read_only {
-        return arm_member(&volumes, secret, on_purge).await;
+        return arm_member(&volumes, secret, MemberRole::Reader, 0, on_purge).await;
     }
     let bind_addr = match bind {
         MembershipBind::Off => {
@@ -2008,6 +2026,8 @@ async fn arm_owner(
 async fn arm_member(
     volumes: &[Arc<KvMetaBackend>],
     secret: Vec<u8>,
+    role: MemberRole,
+    pr_key: u64,
     on_purge: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<Option<MembershipArm>> {
     let mut best: Option<OwnerRecord> = None;
@@ -2027,15 +2047,57 @@ async fn arm_member(
         );
         return Ok(None);
     };
-    let id = uuid::Uuid::new_v4().to_string();
+    join_member_on(
+        &rec,
+        secret,
+        &uuid::Uuid::new_v4().to_string(),
+        role,
+        pr_key,
+        on_purge,
+    )
+    .await
+}
+
+/// **DLM S9** — join the membership plane as a **WRITER member** (a
+/// co-writer), against a rendezvous record the caller already read.
+///
+/// Why it exists beside [`arm_mount_membership`]: a co-writer's admission
+/// rung 4 needs the join to have SUCCEEDED before the metadata set is
+/// opened at all (the join IS the liveness proof), and at that point no
+/// opened set exists — the record came from a probe. The member id is the
+/// co-writer's DURABLE node id rather than a fresh uuid, so the census, the
+/// claim-set enrollment and the custody client all name the same node.
+///
+/// A writer member's self-fence poisons process data custody (S6's role
+/// asymmetry, unchanged), which is exactly the fail-stop a co-writer needs:
+/// nothing can land after the authority may have re-granted those bytes.
+pub async fn join_as_writer_member(
+    rec: &OwnerRecord,
+    secret: Vec<u8>,
+    node_id: &str,
+    pr_key: u64,
+    on_purge: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> Result<Option<MembershipArm>> {
+    join_member_on(rec, secret, node_id, MemberRole::Writer, pr_key, on_purge).await
+}
+
+async fn join_member_on(
+    rec: &OwnerRecord,
+    secret: Vec<u8>,
+    id: &str,
+    role: MemberRole,
+    pr_key: u64,
+    on_purge: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> Result<Option<MembershipArm>> {
+    let id = id.to_string();
     let req = JoinRequest {
         id: id.clone(),
-        role: MemberRole::Reader,
+        role,
         endpoint: None,
         pid: std::process::id(),
         boot: crate::meta_backend::kv::backend::read_boot_id(),
         prior_epoch: None,
-        pr_key: 0,
+        pr_key,
     };
     let clock = LeaseClock::monotonic();
     let client = match crate::membership_wire::MemberClient::join(
@@ -2049,8 +2111,11 @@ async fn arm_member(
         Ok(c) => c,
         Err(e) => {
             log::warn!(
-                "membership: reader '{id}' could not join the plane owner '{}' at {} ({e}) — \
-                 this mount serves reads normally and stays invisible to `squeezefs clients`",
+                "membership: {} '{id}' could not join the plane owner '{}' at {} ({e}) — this \
+                 mount stays invisible to `squeezefs clients` (a READER then serves reads \
+                 normally; a CO-WRITER's admission rung 4 refuses, because an unseeable \
+                 co-writer is an unevictable one)",
+                role.as_str(),
                 rec.id,
                 rec.endpoint
             );
@@ -2070,9 +2135,10 @@ async fn arm_member(
         on_purge,
     );
     log::info!(
-        "membership MEMBER armed: reader '{id}' holds a lease from owner '{}' at {} — \
-         visible in `squeezefs clients` with ZERO metadata writes, and the same channel \
-         §6.8 item 3's freed-offset acknowledgements ride (DLM S6)",
+        "membership MEMBER armed: {} '{id}' holds a lease from owner '{}' at {} — visible in \
+         `squeezefs clients` with ZERO metadata writes, and the same channel §6.8 item 3's \
+         freed-offset acknowledgements ride (DLM S6)",
+        role.as_str(),
         rec.id,
         rec.endpoint
     );

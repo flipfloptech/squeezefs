@@ -682,29 +682,51 @@ impl BlockAllocator {
     }
 
     // -----------------------------------------------------------------
-    // DLM S5 — the reader gate (pre-RC engineering spec §6.8 item 1: "the
-    // write gate extended past metadata to cover the block allocator, the
-    // reclaim queue, W1 and in-place overwrite, and
-    // `recover_active_blocks_v3`'s free-completing arm")
+    // DLM S5 + S9 — the OWNERSHIP-ACCOUNTING gate (pre-RC engineering spec
+    // §6.8 item 1: "the write gate extended past metadata to cover the
+    // block allocator, the reclaim queue, W1 and in-place overwrite, and
+    // `recover_active_blocks_v3`'s free-completing arm"; §6.2 item 7's
+    // co-writer consumer half)
     // -----------------------------------------------------------------
 
-    /// Refuse a data-plane mutation on a read-only mount.
+    /// Refuse a mutation of this mount's **ownership accounting** for a
+    /// device offset when the mount holds no authority over it.
     ///
     /// Every arm of this allocator that changes ownership of a device
     /// offset — mint, terminal free, specific claim, the recovery walk's
     /// free completion, the W1 patch's incarnation retire — routes through
-    /// here. On a WRITE mount this is one relaxed atomic load feeding a
+    /// here. On a WRITE mount this is two relaxed atomic loads feeding a
     /// never-taken branch (`benches/write_path_bench.rs`, group
-    /// `ro_gate`); the whole point of the latch's shape is that a reader
-    /// feature costs writers nothing measurable.
+    /// `ro_gate`); the whole point of the latches' shape is that neither a
+    /// reader nor a co-writer feature costs writers anything measurable.
+    ///
+    /// **Two refusal CLASSES, not one condition** (DLM S9 — the split the
+    /// co-writer posture needs, and the reason this is no longer called
+    /// `reader_gate`):
+    ///
+    /// | Posture | Data (DMA) authority | Accounting authority | This gate |
+    /// |---|---|---|---|
+    /// | writer | local | local | passes |
+    /// | reader (S5) | none — EROFS at the FUSE door | none | refuses, `read_only_refusal` (unchanged text, unchanged sites) |
+    /// | co-writer (S9) | **yes**, under a granted custody lease — authorized at [`crate::data_custody::authorize_dma`], NOT here | none: the durable answer is the authority's `TREE_BLOCK_REFS` | refuses, `co_writer_refusal` — naming the data-plane allocation partition |
+    ///
+    /// The distinction that makes this coherent: a device offset's
+    /// OWNERSHIP is metadata, and metadata authority is what a co-writer
+    /// lacks. Writing bytes into an offset it was granted is a different
+    /// question, asked at a different door.
     ///
     /// Associated (not `&self`) deliberately: the posture is the MOUNT's,
     /// never one allocator's, so no per-volume state can drift out of
     /// agreement with it.
     #[inline]
-    fn reader_gate(what: &str) -> Result<()> {
+    fn plane_gate(what: &str) -> Result<()> {
         if crate::fuse_client::read_only_mount() {
             let e = crate::fuse_client::read_only_refusal(what);
+            log::error!("{e}");
+            return Err(e);
+        }
+        if crate::fuse_client::co_writer_mount() {
+            let e = crate::fuse_client::co_writer_refusal(what);
             log::error!("{e}");
             return Err(e);
         }
@@ -1354,7 +1376,7 @@ impl BlockAllocator {
         // unreachable in production — a counter that can only ever read 0
         // is exactly the dead weight the ledger's rot-detection value
         // depends on not having.
-        if Self::reader_gate("W1 in-place sub-block patch").is_err() {
+        if Self::plane_gate("W1 in-place sub-block patch").is_err() {
             return false;
         }
         self.mark_incarnation_unstable(offset);
@@ -1570,7 +1592,7 @@ impl BlockAllocator {
     }
 
     async fn allocate_block_inner(&self) -> Result<u64> {
-        if let Err(e) = Self::reader_gate("block allocation") {
+        if let Err(e) = Self::plane_gate("block allocation") {
             return Err(e);
         }
         let first = self.try_allocate_block();
@@ -1779,7 +1801,7 @@ impl BlockAllocator {
     /// blocks is `W`-strided rather than dense, which is why the partition
     /// width is a capacity/fragmentation trade and not free.
     pub fn allocate_block_below(&self, below_idx: u64) -> Option<u64> {
-        Self::reader_gate("block allocation (contiguity pick)").ok()?;
+        Self::plane_gate("block allocation (contiguity pick)").ok()?;
         // Spec §6.8 item 3: acknowledged offsets re-enter the free list
         // before the pick reads it, so a mover never defers for space that
         // is actually available (one relaxed load when nothing is held).
@@ -1806,7 +1828,7 @@ impl BlockAllocator {
     /// rewrite's convergence invariant). Full `allocate_block`
     /// discipline; `StorageFull` propagates from the fresh-mint path.
     pub fn allocate_block_at_or_above(&self, min_idx: u64) -> Result<u64> {
-        Self::reader_gate("block allocation (ascending pick)")?;
+        Self::plane_gate("block allocation (ascending pick)")?;
         // Spec §6.8 item 3, as in the contiguity pick above.
         self.harvest_grace();
         let mut cands: Vec<u64> = self
@@ -1866,7 +1888,7 @@ impl BlockAllocator {
     /// remaining legitimate caller (fsck's C2Leaked apply refuses untracked
     /// offsets itself before freeing).
     pub fn begin_free(&self, offset: u64) -> bool {
-        if Self::reader_gate("terminal block free").is_err() {
+        if Self::plane_gate("terminal block free").is_err() {
             return false;
         }
         let should_free = if let Some(terminal) = self
@@ -2059,7 +2081,7 @@ impl BlockAllocator {
         // `false`, because a `false` here is indistinguishable from a
         // legitimate NON-TERMINAL release — and a reader reaching this path
         // at all is a bug worth a loud error, not a silent `Ok`.
-        Self::reader_gate("block free")?;
+        Self::plane_gate("block free")?;
         if self.begin_free(offset) {
             self.finish_free(offset);
         }
@@ -2086,7 +2108,7 @@ impl BlockAllocator {
     }
 
     pub async fn allocate_specific_block(&self, block_idx: u64) -> Result<()> {
-        Self::reader_gate("specific block allocation")?;
+        Self::plane_gate("specific block allocation")?;
         let cur_highest = self.highest_block.load(Ordering::Relaxed);
         if block_idx >= cur_highest {
             for idx in cur_highest..block_idx {
@@ -2212,7 +2234,7 @@ impl BlockAllocator {
         // writer allocated after it would be free-listed here. A reader
         // allocates nothing and frees nothing, so the whole pass is
         // refused rather than made "harmless".
-        Self::reader_gate("block-ownership recovery walk")?;
+        Self::plane_gate("block-ownership recovery walk")?;
         // Two passes' worth of work in one: collect the owned indices
         // under the walk (which borrows `self` immutably), then seed.
         // `recover_block` is `async`, so it cannot run inside the

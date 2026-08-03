@@ -4498,7 +4498,33 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         return Err(e.into());
                     }
                 };
-            squeezefs::fuse_client::set_read_only_mount(reader_mount);
+            // DLM S9 — the CO-WRITER posture, resolved in the same breath and
+            // for the same reason: it decides which open runs
+            // (`open_routed_meta_set_co_writer` takes no Layer-A lock, writes
+            // no writer_claim and registers no metadata-namespace PR key) and
+            // every data-plane gate downstream reads the latch. Declared, never
+            // inferred: `SQUEEZEFS_MW_ROLE=co-writer` without
+            // `SQUEEZEFS_MULTI_WRITER=1` refuses rather than mounting as a
+            // second authority.
+            let co_writer_mount = match squeezefs::cowriter::co_writer_requested() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("\x1b[91mERROR\x1b[0m mount refused: {e}");
+                    return Err(e.into());
+                }
+            };
+            if co_writer_mount && reader_mount {
+                let msg = "mount refused: -o ro / --read-only with                            SQUEEZEFS_MW_ROLE=co-writer. A reader takes no lease and mutates no                            plane (DLM S5); a co-writer holds write custody. They are different                            postures, not a spectrum — pick one.";
+                eprintln!("\x1b[91mERROR\x1b[0m {msg}");
+                return Err(msg.into());
+            }
+            squeezefs::fuse_client::set_mount_posture(if reader_mount {
+                squeezefs::fuse_client::MountPosture::Reader
+            } else if co_writer_mount {
+                squeezefs::fuse_client::MountPosture::CoWriter
+            } else {
+                squeezefs::fuse_client::MountPosture::Writer
+            });
             if reader_mount {
                 println!(
                     "Mounting READ-ONLY (DLM stage S5): this mount takes no write lease, \
@@ -4506,6 +4532,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                      readers is the supported shape; see docs/operations.md \
                      §Read-only coherent mounts for the guarantee class and the \
                      staleness bound."
+                );
+            }
+            if co_writer_mount {
+                println!(
+                    "Mounting as a CO-WRITER (DLM stage S9): this mount holds NO metadata \
+                     authority — every metadata mutation ships to the authority that holds the \
+                     D0 claim — and writes data only under custody that authority grants. \
+                     Admission runs a five-rung ladder and refuses loudly naming the rung; see \
+                     docs/operations.md §Multi-writer co-writer mounts."
                 );
             }
 
@@ -4830,8 +4865,55 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // which is where the §6.4 `LOCK_EX`-before-classification and
             // the Layer-B2 `FreshForeign` refusal are bypassed. The write
             // path below is byte-identical to what it always was.
+            // DLM S9: a CO-WRITER runs the five-rung admission ladder BEFORE
+            // it opens anything for real. The preflight reads its evidence
+            // through probe opens (never blocked by the authority's flock,
+            // never writing), joins the membership plane as a writer member
+            // (the liveness proof), and registers this node's key under the
+            // data namespaces' standing WERO hold (the fenceability proof) —
+            // in that order, so nothing mutates before every declarative rung
+            // has passed. A refusal names its rung and its remedy.
+            //
+            // The D0 gate itself is UNTOUCHED: an authority mount below still
+            // takes Layer A, still classifies the claim, and still refuses a
+            // fresh foreign holder on every substrate.
+            let co_writer_preflight = if co_writer_mount {
+                let purge: std::sync::Arc<dyn Fn() + Send + Sync> = {
+                    let router = router.clone();
+                    std::sync::Arc::new(move || {
+                        let purged =
+                            squeezefs::ro_coherence::purge_reader_block_keys(&router.cache);
+                        log::warn!(
+                            "co-writer self-fence: dropped {purged} cached block key(s) before \
+                             the authority's TTL could re-grant them"
+                        );
+                    })
+                };
+                match squeezefs::cowriter::gather_admission(
+                    &meta_lvs,
+                    &resolved_data_lvs
+                        .iter()
+                        .map(std::path::PathBuf::from)
+                        .collect::<Vec<_>>(),
+                    Some(purge),
+                )
+                .await
+                {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        eprintln!("\x1b[91mERROR\x1b[0m mount refused: {e}");
+                        return Err(e.into());
+                    }
+                }
+            } else {
+                None
+            };
+
             let routed_meta_backend = match if reader_mount {
                 squeezefs::meta_backend::open_routed_meta_set_read_only(&meta_lvs).await
+            } else if let Some(pre) = co_writer_preflight.as_ref() {
+                squeezefs::meta_backend::open_routed_meta_set_co_writer(&meta_lvs, &pre.admission)
+                    .await
             } else {
                 squeezefs::meta_backend::open_routed_meta_set(&meta_lvs).await
             } {
@@ -4895,15 +4977,25 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // `SQUEEZEFS_MULTI_WRITER=1` demands the DEVICE-enforced class
             // and REFUSES the mount loud when the substrate or the format
             // cannot provide it. The hold lives as long as the mount.
-            let _data_plane_fence = squeezefs::data_custody::arm_mount_data_plane(
-                &routed_meta_backend,
-                resolved_data_lvs
-                    .iter()
-                    .map(std::path::PathBuf::from)
-                    .collect(),
-            )
-            .await
-            .map_err(|e| format!("{e}"))?;
+            //
+            // DLM S9: a CO-WRITER does NOT arm this — its device presence is a
+            // REGISTRATION under the authority's standing WERO hold, taken in
+            // the admission preflight (rung 5) and held for the mount's life.
+            // Calling the authority's arm here would try to ACQUIRE a second
+            // reservation on namespaces the authority already holds.
+            let _data_plane_fence = if co_writer_mount {
+                None
+            } else {
+                squeezefs::data_custody::arm_mount_data_plane(
+                    &routed_meta_backend,
+                    resolved_data_lvs
+                        .iter()
+                        .map(std::path::PathBuf::from)
+                        .collect(),
+                )
+                .await
+                .map_err(|e| format!("{e}"))?
+            };
 
             // Block-allocator ownership recovery before serving FUSE.
             //
@@ -4929,11 +5021,19 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // reader anyway (`BlockAllocator::reader_gate`) — this skip
             // keeps the mount from paying a full inode-tree walk to
             // populate state it may not use.
-            if reader_mount {
+            //
+            // DLM S9: a CO-WRITER skips it for the adjacent reason — the walk
+            // manufactures a free list from the tree it happened to see, and a
+            // co-writer's view is a snapshot of the AUTHORITY's checkpoints
+            // whose gaps are offsets the authority owns. It allocates nothing
+            // and frees nothing locally (its accounting ships), so the pass
+            // would only fabricate state it may not use.
+            if reader_mount || co_writer_mount {
                 log::info!(
-                    "Read-only mount: block-ownership recovery skipped entirely (a reader \
+                    "{} mount: block-ownership recovery skipped entirely (this mount \
                      allocates nothing and frees nothing; the walk's free-completing arm \
-                     must never run on a snapshot view)"
+                     must never run on a snapshot view)",
+                    squeezefs::fuse_client::mount_posture().as_str()
                 );
             } else {
                 match fs_engine
@@ -5132,13 +5232,26 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     );
                 })
             };
-            let membership_arm = squeezefs::membership::arm_mount_membership(
-                &routed_meta_backend,
-                reader_mount,
-                Some(membership_purge),
-            )
-            .await
-            .map_err(|e| format!("membership plane refused to arm: {e}"))?;
+            //
+            // DLM S9: a CO-WRITER already joined, in its admission preflight —
+            // the join IS rung 4's liveness proof, so it had to happen before
+            // the metadata set was opened. Re-arming here would mint a SECOND
+            // member session for one mount (two leases, two self-fence
+            // deadlines, one of them un-renewed), so the preflight's arm is
+            // carried forward instead.
+            let membership_arm = if co_writer_mount {
+                co_writer_preflight
+                    .as_ref()
+                    .and_then(|_| None::<squeezefs::membership::MembershipArm>)
+            } else {
+                squeezefs::membership::arm_mount_membership(
+                    &routed_meta_backend,
+                    reader_mount,
+                    Some(membership_purge),
+                )
+                .await
+                .map_err(|e| format!("membership plane refused to arm: {e}"))?
+            };
 
             // DLM S9 (spec §6.9 S9): arm the multi-writer planes.
             //
@@ -5172,6 +5285,23 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
             .map_err(|e| format!("multi-writer refused to arm: {e}"))?;
+
+            // DLM S9: the CO-WRITER's own arm — the client halves of the same
+            // three planes the authority serves. It installs the ownership map
+            // (the authority owns EVERY volume, so every metadata verb ships),
+            // the publish client, the custody client, and the renewal cadence
+            // whose failure self-fences this node BEFORE the authority may
+            // re-grant. Deliberately AFTER the authority arm's `Ok(None)`
+            // above: the two are mutually exclusive postures, and the ladder
+            // that decided this one already ran.
+            let co_writer_arm = match co_writer_preflight {
+                Some(pre) => Some(
+                    squeezefs::cowriter::arm(&routed_meta_backend, &fs_engine.router, pre)
+                        .await
+                        .map_err(|e| format!("co-writer refused to arm: {e}"))?,
+                ),
+                None => None,
+            };
 
             let opt_idle = if resolved_fuse_io_uring_sqpoll_idle_ms > 0 {
                 Some(resolved_fuse_io_uring_sqpoll_idle_ms)
@@ -5233,6 +5363,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // mount that is no longer a member).
             if let Some(mw) = multi_writer_arm {
                 mw.disarm().await;
+            }
+            // DLM S9: the CO-WRITER's teardown, in the same
+            // outside-in order and for the same reason — stop holding
+            // custody and stop shipping BEFORE this node stops being a
+            // member, so no window exists where an authority believes it
+            // holds custody granted to a mount that has already gone. Its
+            // disarm also unregisters this node's key from the data
+            // namespaces' WERO hold (zero device residue; the authority's
+            // reservation is untouched) and leaves the membership plane it
+            // joined in the admission preflight.
+            if let Some(co) = co_writer_arm {
+                co.disarm().await;
             }
             if let Some(membership) = membership_arm {
                 membership.disarm().await;

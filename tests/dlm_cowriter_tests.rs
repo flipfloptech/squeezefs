@@ -80,7 +80,9 @@ use squeezefs::membership::{
 use squeezefs::meta_backend::kv::backend::{ClaimClearOutcome, KvMetaBackend, WriterClaim};
 use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
 use squeezefs::meta_backend::kv::superblock as sb;
-use squeezefs::meta_backend::reservation::{self, FakeNvmeNamespace, FakeReservationClient};
+use squeezefs::meta_backend::reservation::{
+    self, FakeNvmeNamespace, FakeReservationClient, ReservationClient,
+};
 use squeezefs::meta_ship::{self as ship, publish, OwnerMap, PeerOwner};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -349,7 +351,7 @@ async fn the_full_five_rung_ladder_admits_a_co_writer() {
     let dir = TempDir::new().unwrap();
     let vol = fresh_volume(dir.path(), "meta0", true).await;
 
-    let req = full_request(&[vol.clone()]);
+    let req = full_request(std::slice::from_ref(&vol));
     let admission = cowriter::classify_admission(&req).expect("the full ladder admits");
 
     assert_eq!(admission.node_id(), "node_00000000deadbeef");
@@ -380,7 +382,7 @@ async fn rung_1_refuses_without_the_declared_co_writer_posture() {
     let dir = TempDir::new().unwrap();
     let vol = fresh_volume(dir.path(), "meta0", true).await;
 
-    let mut req = full_request(&[vol.clone()]);
+    let mut req = full_request(std::slice::from_ref(&vol));
     req.multi_writer = false;
     let err = cowriter::classify_admission(&req)
         .expect_err("no opt-in, no co-writer")
@@ -390,7 +392,7 @@ async fn rung_1_refuses_without_the_declared_co_writer_posture() {
         "the refusal names the opt-in: {err}"
     );
 
-    let mut req = full_request(&[vol.clone()]);
+    let mut req = full_request(std::slice::from_ref(&vol));
     req.role_co_writer = false;
     let err = cowriter::classify_admission(&req)
         .expect_err("an authority-role mount is never admitted as a co-writer")
@@ -401,7 +403,7 @@ async fn rung_1_refuses_without_the_declared_co_writer_posture() {
     );
 
     // A reader is a CATEGORY error, not a degradation (S9's rung 1).
-    let mut req = full_request(&[vol.clone()]);
+    let mut req = full_request(std::slice::from_ref(&vol));
     req.read_only = true;
     let err = cowriter::classify_admission(&req)
         .expect_err("a reader cannot be a co-writer")
@@ -475,7 +477,7 @@ async fn rung_3_refuses_a_set_that_does_not_name_this_node() {
     let dir = TempDir::new().unwrap();
     let vol = fresh_volume(dir.path(), "meta0", true).await;
 
-    let mut req = full_request(&[vol.clone()]);
+    let mut req = full_request(std::slice::from_ref(&vol));
     req.volumes[0].claim_set = Some({
         let mut set = ClaimSet::empty(7);
         set.durable = true;
@@ -530,7 +532,7 @@ async fn rung_4_refuses_without_a_live_membership_authority() {
     let dir = TempDir::new().unwrap();
     let vol = fresh_volume(dir.path(), "meta0", true).await;
 
-    let mut req = full_request(&[vol.clone()]);
+    let mut req = full_request(std::slice::from_ref(&vol));
     req.authority = None;
     let err = cowriter::classify_admission(&req)
         .expect_err("an unarmed membership plane refuses the posture")
@@ -540,7 +542,7 @@ async fn rung_4_refuses_without_a_live_membership_authority() {
         "the refusal names what the AUTHORITY must arm: {err}"
     );
 
-    let mut req = full_request(&[vol.clone()]);
+    let mut req = full_request(std::slice::from_ref(&vol));
     req.authority = Some(AuthorityLeaseEvidence {
         live: false,
         ..authority_evidence("authority-membership-owner")
@@ -579,7 +581,7 @@ async fn rung_5_refuses_without_a_device_registrant_under_a_standing_wero() {
     let dir = TempDir::new().unwrap();
     let vol = fresh_volume(dir.path(), "meta0", true).await;
 
-    let mut req = full_request(&[vol.clone()]);
+    let mut req = full_request(std::slice::from_ref(&vol));
     req.registrant = None;
     let err = cowriter::classify_admission(&req)
         .expect_err("no registrant evidence, no admission")
@@ -619,7 +621,7 @@ async fn rung_5_refuses_without_a_device_registrant_under_a_standing_wero() {
             },
         ),
     ] {
-        let mut req = full_request(&[vol.clone()]);
+        let mut req = full_request(std::slice::from_ref(&vol));
         req.registrant = Some(ev);
         let err = cowriter::classify_admission(&req)
             .unwrap_err()
@@ -669,8 +671,8 @@ async fn the_d0_fresh_foreign_refusal_survives_every_rung_being_satisfied() {
 
     // The co-writer ENTRY POINT admits the same volume with the same
     // evidence, which is the whole point: two doors, one refusal each.
-    let admission =
-        cowriter::classify_admission(&full_request(&[vol.clone()])).expect("the ladder admits");
+    let admission = cowriter::classify_admission(&full_request(std::slice::from_ref(&vol)))
+        .expect("the ladder admits");
     let be = KvMetaBackend::open_co_writer(&vol, &admission)
         .await
         .expect("a co-writer opens a volume the write mount is refused");
@@ -694,8 +696,8 @@ async fn a_co_writer_open_leaves_the_metadata_volume_byte_identical() {
     let claim = forge_foreign_claim(&vol, "the-authority").await;
 
     let before = digest(&vol);
-    let admission =
-        cowriter::classify_admission(&full_request(&[vol.clone()])).expect("the ladder admits");
+    let admission = cowriter::classify_admission(&full_request(std::slice::from_ref(&vol)))
+        .expect("the ladder admits");
     let be = KvMetaBackend::open_co_writer(&vol, &admission)
         .await
         .expect("co-writer open");
@@ -761,8 +763,8 @@ async fn a_co_writer_denies_the_authority_nothing_in_both_mount_orders() {
 
     // Order A: co-writer attaches first, the authority mounts after.
     let a = fresh_volume(dir.path(), "order-a", true).await;
-    let admission =
-        cowriter::classify_admission(&full_request(&[a.clone()])).expect("the ladder admits");
+    let admission = cowriter::classify_admission(&full_request(std::slice::from_ref(&a)))
+        .expect("the ladder admits");
     let cw1 = KvMetaBackend::open_co_writer(&a, &admission)
         .await
         .expect("co-writer first");
@@ -784,8 +786,8 @@ async fn a_co_writer_denies_the_authority_nothing_in_both_mount_orders() {
     // Order B: the authority mounts first, the co-writer attaches after.
     let b = fresh_volume(dir.path(), "order-b", true).await;
     let authority = KvMetaBackend::open(&b).await.expect("authority first");
-    let admission =
-        cowriter::classify_admission(&full_request(&[b.clone()])).expect("the ladder admits");
+    let admission = cowriter::classify_admission(&full_request(std::slice::from_ref(&b)))
+        .expect("the ladder admits");
     let cw = KvMetaBackend::open_co_writer(&b, &admission)
         .await
         .expect("a co-writer attaches to a live authority's volume");
@@ -817,8 +819,8 @@ async fn the_recovery_ladder_still_classifies_with_a_co_writer_attached() {
     //     refuses, naming the live holder.
     let vol = fresh_volume(dir.path(), "fresh", true).await;
     forge_foreign_claim(&vol, "the-authority").await;
-    let admission =
-        cowriter::classify_admission(&full_request(&[vol.clone()])).expect("the ladder admits");
+    let admission = cowriter::classify_admission(&full_request(std::slice::from_ref(&vol)))
+        .expect("the ladder admits");
     let cw = KvMetaBackend::open_co_writer(&vol, &admission)
         .await
         .expect("co-writer attaches");
@@ -933,8 +935,8 @@ async fn a_co_writer_ships_metadata_mutations_instead_of_committing_them() {
         .ino;
 
     // The co-writer: a local commit refuses, naming the shipped path.
-    let admission =
-        cowriter::classify_admission(&full_request(&[vol.clone()])).expect("the ladder admits");
+    let admission = cowriter::classify_admission(&full_request(std::slice::from_ref(&vol)))
+        .expect("the ladder admits");
     let co = KvMetaBackend::open_co_writer(&vol, &admission)
         .await
         .expect("co-writer open");
@@ -1031,9 +1033,10 @@ async fn a_co_writer_writes_data_under_a_grant_and_never_accounts_locally() {
     );
     assert!(fuse_client::co_writer_mount());
 
-    let client = WriteCustodyClient::connect(listener.endpoint(), SECRET, "co-writer-1")
-        .await
-        .expect("the co-writer dials the authority");
+    let client =
+        WriteCustodyClient::connect(&listener.endpoint().to_string(), SECRET, "co-writer-1")
+            .await
+            .expect("the co-writer dials the authority");
     let lease = client
         .acquire(9001, None, LockMode::Exclusive, Duration::from_millis(500))
         .await
@@ -1177,8 +1180,8 @@ async fn the_claim_set_member_entry_is_written_only_by_the_authority() {
     );
 
     // The co-writer's side: it cannot commit the record it depends on.
-    let admission =
-        cowriter::classify_admission(&full_request(&[vol.clone()])).expect("the ladder admits");
+    let admission = cowriter::classify_admission(&full_request(std::slice::from_ref(&vol)))
+        .expect("the ladder admits");
     let co = KvMetaBackend::open_co_writer(&vol, &admission)
         .await
         .expect("co-writer open");
@@ -1247,7 +1250,7 @@ async fn an_authority_and_two_co_writers() {
     let set = ClaimSet::load(&authority).await.expect("the durable set");
     let mut opened = Vec::new();
     for node in &roster {
-        let mut req = full_request(&[vol.clone()]);
+        let mut req = full_request(std::slice::from_ref(&vol));
         req.node_id = node.clone();
         req.volumes[0].claim_set = Some(set.clone());
         req.volumes[0]
@@ -1275,10 +1278,10 @@ async fn an_authority_and_two_co_writers() {
     }
 
     // Concurrent custody on disjoint files, one grant each.
-    let a = WriteCustodyClient::connect(listener.endpoint(), SECRET, &roster[0])
+    let a = WriteCustodyClient::connect(&listener.endpoint().to_string(), SECRET, &roster[0])
         .await
         .expect("co-writer a dials");
-    let b = WriteCustodyClient::connect(listener.endpoint(), SECRET, &roster[1])
+    let b = WriteCustodyClient::connect(&listener.endpoint().to_string(), SECRET, &roster[1])
         .await
         .expect("co-writer b dials");
     let la = a
@@ -1326,17 +1329,21 @@ async fn the_registrant_join_never_takes_a_second_reservation() {
         .unwrap();
 
     let ns = FakeNvmeNamespace::new();
-    reservation::install_override(&data, FakeReservationClient::new(Arc::clone(&ns)));
+    reservation::install_override(
+        &data,
+        FakeReservationClient::new(Arc::clone(&ns), "nqn.co-writer", "cowriter-hostid"),
+    );
 
     // The AUTHORITY's standing WERO hold on the data namespace.
-    let authority_client = FakeReservationClient::new(Arc::clone(&ns));
+    let authority_client =
+        FakeReservationClient::new(Arc::clone(&ns), "nqn.authority", "authority-hostid");
     reservation::register_ladder(authority_client.as_ref(), 0xA0A0).expect("authority registers");
     authority_client
         .acquire_write_exclusive_registrants_only(0xA0A0)
         .expect("the authority holds WERO");
     assert_eq!(ns.holder(), Some(0xA0A0));
 
-    let join = data_custody::join_wero_as_registrant(&[data.clone()])
+    let join = data_custody::join_wero_as_registrant(std::slice::from_ref(&data))
         .expect("a co-writer registers under the standing hold");
     let ev = join.evidence();
     assert!(ev.pr_capable && ev.wero && ev.reservation_held && ev.registered);

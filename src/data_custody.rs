@@ -470,6 +470,26 @@ pub enum CustodyPosture {
     MultiWriter,
 }
 
+/// Which half of a WERO (rtype 2) hold this process owns.
+///
+/// The distinction is the whole of DLM S9's co-writer admission rung 5:
+/// under Write Exclusive – Registrants Only **every registrant writes**,
+/// so the AUTHORITY acquires the reservation exactly once and every
+/// co-writer merely REGISTERS under it. A second acquire would conflict at
+/// the device and silently downgrade the guarantee class (the
+/// join-never-fork law), and a co-writer that released the reservation on
+/// its way out would drop the fence for the whole set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum HoldRole {
+    /// This process ACQUIRED the reservation (the authority / the job-wire
+    /// coordinator). Teardown releases it.
+    Holder,
+    /// This process is a REGISTRANT under somebody else's standing
+    /// reservation (a co-writer). Teardown unregisters only — never
+    /// releases, because the reservation is not ours to end.
+    Registrant,
+}
+
 /// The process's live WERO hold on one data-namespace set. Dropping the
 /// last [`WeroHold`] releases the reservation and its registration (zero
 /// residue). Release issues one-shot ioctls per namespace: drop it from a
@@ -478,19 +498,31 @@ struct WeroInner {
     key: u64,
     paths: Vec<PathBuf>,
     clients: Vec<Arc<dyn ReservationClient>>,
+    role: HoldRole,
 }
 
 impl Drop for WeroInner {
     fn drop(&mut self) {
         for client in &self.clients {
-            if let Err(e) = client.release_registrants_only(self.key) {
-                log::warn!("data-plane WERO release failed: {e}");
+            let outcome = match self.role {
+                HoldRole::Holder => client.release_registrants_only(self.key),
+                // A registrant ends its OWN registration and nothing else:
+                // the reservation belongs to the authority, and
+                // `unregister` is same-host-scoped by the device.
+                HoldRole::Registrant => client.unregister(self.key),
+            };
+            if let Err(e) = outcome {
+                log::warn!("data-plane WERO {:?} teardown failed: {e}", self.role);
             }
         }
-        registry().lock().unwrap().remove(&self.paths);
+        registry()
+            .lock()
+            .unwrap()
+            .remove(&(self.paths.clone(), self.role));
         METRICS.data_plane_fence_mode.store(0, Ordering::Relaxed);
         log::info!(
-            "data-plane WERO released on {} namespace(s) (last holder departed)",
+            "data-plane WERO {:?} released on {} namespace(s) (last reference departed)",
+            self.role,
             self.paths.len()
         );
     }
@@ -537,7 +569,11 @@ impl WeroHold {
     }
 }
 
-type WeroRegistry = Mutex<HashMap<Vec<PathBuf>, Weak<WeroInner>>>;
+/// The per-process WERO registry, keyed by the namespace set AND the role
+/// held over it: one process is either the reservation's holder or a
+/// registrant under somebody else's, and conflating the two would hand a
+/// co-writer's join the authority's release-on-drop.
+type WeroRegistry = Mutex<HashMap<(Vec<PathBuf>, HoldRole), Weak<WeroInner>>>;
 
 fn registry() -> &'static WeroRegistry {
     static REG: OnceLock<WeroRegistry> = OnceLock::new();
@@ -599,7 +635,10 @@ pub fn acquire_wero(paths: &[PathBuf]) -> Option<WeroHold> {
     }
     let key_set = canonical(paths);
     let mut reg = registry().lock().unwrap();
-    if let Some(existing) = reg.get(&key_set).and_then(Weak::upgrade) {
+    if let Some(existing) = reg
+        .get(&(key_set.clone(), HoldRole::Holder))
+        .and_then(Weak::upgrade)
+    {
         log::info!(
             "data-plane WERO: joining the standing hold on {} namespace(s) (key {:#x}) — \
              a second reservation would conflict at the device",
@@ -643,8 +682,9 @@ pub fn acquire_wero(paths: &[PathBuf]) -> Option<WeroHold> {
         key,
         paths: key_set.clone(),
         clients,
+        role: HoldRole::Holder,
     });
-    reg.insert(key_set, Arc::downgrade(&inner));
+    reg.insert((key_set, HoldRole::Holder), Arc::downgrade(&inner));
     METRICS.data_plane_fence_mode.store(1, Ordering::Relaxed);
     log::info!(
         "data-plane WERO (rtype 2) acquired on {} namespace(s), key {key:#x} — guarantee \
@@ -660,6 +700,197 @@ fn release_partial(clients: &[Arc<dyn ReservationClient>], key: u64) {
             log::warn!("data-plane WERO: partial release failed: {e}");
         }
     }
+}
+
+fn unregister_partial(clients: &[Arc<dyn ReservationClient>], key: u64) {
+    for client in clients {
+        if let Err(e) = client.unregister(key) {
+            log::warn!("data-plane WERO: partial unregister failed: {e}");
+        }
+    }
+}
+
+/// A CO-WRITER's registration under the authority's standing WERO hold,
+/// plus the device-side evidence its admission rung 5 consumes. Dropping
+/// it unregisters this process's key on every namespace and leaves the
+/// authority's reservation standing (zero residue, no fence loss).
+pub struct WeroRegistrantJoin {
+    hold: WeroHold,
+    evidence: crate::cowriter::RegistrantEvidence,
+}
+
+impl std::fmt::Debug for WeroRegistrantJoin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeroRegistrantJoin")
+            .field("hold", &self.hold)
+            .field("evidence", &self.evidence)
+            .finish()
+    }
+}
+
+impl WeroRegistrantJoin {
+    /// The device-side evidence: PR capability, the standing hold's type,
+    /// whether a reservation is held at all, and whether OUR key is a
+    /// registrant.
+    pub fn evidence(&self) -> crate::cowriter::RegistrantEvidence {
+        self.evidence
+    }
+
+    /// The underlying hold reference (its `preempt` is the drain proof a
+    /// dead peer's quarantine release needs).
+    pub fn hold(&self) -> &WeroHold {
+        &self.hold
+    }
+}
+
+/// **DLM S9 — the co-writer's device half**: REGISTER this process's key
+/// under the authority's *standing* WERO (rtype 2) reservation on every
+/// data namespace, and report what the device says.
+///
+/// This is deliberately not [`acquire_wero`]: a co-writer must never
+/// acquire. Under Write Exclusive – Registrants Only every registrant
+/// writes, so the authority acquires once and each co-writer registers —
+/// a second acquire would conflict at the device (and, on a target that
+/// answered it, would silently take the fence away from the authority).
+/// Registration is also what makes a co-writer *fenceable*: the
+/// authority's `preempt_registrants_only` of this key is what turns a dead
+/// co-writer's death into a drain proof.
+///
+/// Refuses (never degrades — the admission ladder's rung 5 is a
+/// guarantee-class demand):
+///   1. a namespace advertising no reservation support, naming it;
+///   2. a register that did not land, naming the namespace;
+///   3. a namespace where NO reservation is held (nobody is fencing this
+///      data plane, so a co-writer would be writing beside an
+///      unauthenticated peer);
+///   4. a namespace whose held reservation is not registrants-only —
+///      under rtype 1 our registration grants no write access at all, so
+///      admitting would produce a mount whose every DMA is rejected.
+///
+/// Blocking (reservation ioctls) — call via `spawn_blocking` from async
+/// paths.
+pub fn join_wero_as_registrant(data_paths: &[PathBuf]) -> Result<WeroRegistrantJoin> {
+    if data_paths.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(
+            "co-writer WERO join refuses: the mount names no data namespace, so there is \
+             nothing to be a registrant of"
+                .to_string(),
+        ));
+    }
+    let key_set = canonical(data_paths);
+    let mut reg = registry().lock().unwrap();
+    if let Some(existing) = reg
+        .get(&(key_set.clone(), HoldRole::Registrant))
+        .and_then(Weak::upgrade)
+    {
+        let key = existing.key;
+        let namespaces = existing.paths.len();
+        log::info!(
+            "data-plane WERO: joining this process's standing REGISTRATION on {namespaces} \
+             namespace(s) (key {key:#x})"
+        );
+        return Ok(WeroRegistrantJoin {
+            hold: WeroHold { inner: existing },
+            evidence: crate::cowriter::RegistrantEvidence {
+                pr_capable: true,
+                wero: true,
+                reservation_held: true,
+                registered: true,
+                key,
+                namespaces,
+            },
+        });
+    }
+    let key = loop {
+        let k = rand::Rng::gen::<u64>(&mut rand::thread_rng());
+        if k != 0 {
+            break k;
+        }
+    };
+    let mut clients: Vec<Arc<dyn ReservationClient>> = Vec::new();
+    for path in &key_set {
+        let Some(client) = resolve_for_mount(path) else {
+            unregister_partial(&clients, key);
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "co-writer WERO join refuses: data namespace {} advertises no NVMe reservation \
+                 support (RESCAP=0), so a fenced co-writer's DMA could only be DETECTED, never \
+                 rejected — spec §6.7 requires enforcement for multi-writer, and that applies \
+                 to the ADMISSION decision, not only to the data plane",
+                path.display()
+            )));
+        };
+        if let Err(e) = register_ladder(client.as_ref(), key) {
+            unregister_partial(&clients, key);
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "co-writer WERO join refuses: reservation REGISTER on {} failed: {e} — without \
+                 a registrant key this node can neither write under the standing hold nor be \
+                 preempted out of it (no preempt, no drain proof)",
+                path.display()
+            )));
+        }
+        // Ours from here on: every refusal below unregisters the whole
+        // prefix, this namespace included.
+        clients.push(Arc::clone(&client));
+        let report = match client.report() {
+            Ok(r) => r,
+            Err(e) => {
+                unregister_partial(&clients, key);
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "co-writer WERO join refuses: Reservation Report on {} failed: {e} — the \
+                     admission cannot verify the standing hold blind",
+                    path.display()
+                )));
+            }
+        };
+        if !report.is_wero() {
+            let held = report.holder_key;
+            unregister_partial(&clients, key);
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "co-writer WERO join refuses: data namespace {} holds no Write Exclusive – \
+                 Registrants Only (rtype 2) reservation (holder {held:?}, rtype {}). Either no \
+                 authority is fencing this data plane, or it holds an rtype under which OUR \
+                 registration grants no write access — admitting would produce a mount whose \
+                 every DMA the device rejects. Arm the authority's multi-writer plane first",
+                path.display(),
+                report.rtype
+            )));
+        }
+        if !report.registered(key) {
+            unregister_partial(&clients, key);
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "co-writer WERO join refuses: our key {key:#x} does not appear among {}'s \
+                 registrants after a successful register — the device does not attribute this \
+                 host's registration to us, so neither its write admission nor its preempt \
+                 would name us",
+                path.display()
+            )));
+        }
+    }
+    let namespaces = key_set.len();
+    let inner = Arc::new(WeroInner {
+        key,
+        paths: key_set.clone(),
+        clients,
+        role: HoldRole::Registrant,
+    });
+    reg.insert((key_set, HoldRole::Registrant), Arc::downgrade(&inner));
+    METRICS.data_plane_fence_mode.store(1, Ordering::Relaxed);
+    log::warn!(
+        "data-plane WERO: REGISTERED as a co-writer under the standing hold on {namespaces} \
+         namespace(s), key {key:#x} — this node may write, and the authority's preempt of this \
+         key is what fences it (DLM S9 admission rung 5)"
+    );
+    Ok(WeroRegistrantJoin {
+        hold: WeroHold { inner },
+        evidence: crate::cowriter::RegistrantEvidence {
+            pr_capable: true,
+            wero: true,
+            reservation_held: true,
+            registered: true,
+            key,
+            namespaces,
+        },
+    })
 }
 
 /// `true` ⇔ this mount was asked to arm the multi-writer data plane

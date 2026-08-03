@@ -666,12 +666,28 @@ impl ReclaimQueue {
         // latched halted at arm (`ro_coherence::arm_reader_data_plane`) so
         // a straggler entry from a racing teardown cannot issue either.
         //
+        // DLM S9: a CO-WRITER is refused here for the same physical
+        // reason and a different authority reason — the offsets it would
+        // deallocate belong to the AUTHORITY's ledger (terminal frees ride
+        // the shipped publish, and the authority's own reclaimer discards
+        // them), so a co-writer issuing `BLKDISCARD` would destroy blocks
+        // whose liveness only the authority can answer.
+        //
         // Deliberately BEFORE the `queued` counter: the ledger identity is
-        // "queued ≡ displaced blocks", and a reader displaces none.
+        // "queued ≡ displaced blocks", and neither posture displaces any.
         if crate::fuse_client::read_only_mount() {
             log::error!(
                 "{}",
                 crate::fuse_client::read_only_refusal("device reclaim (discard/punch)")
+            );
+            self.halt_device_reclaims();
+            drop(entry);
+            return;
+        }
+        if crate::fuse_client::co_writer_mount() {
+            log::error!(
+                "{}",
+                crate::fuse_client::co_writer_refusal("device reclaim (discard/punch)")
             );
             self.halt_device_reclaims();
             drop(entry);

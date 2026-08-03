@@ -315,6 +315,21 @@ pub async fn arm_mount_multi_writer(
         );
         return Ok(None);
     }
+    // DLM S9: this is the AUTHORITY's arm. A mount that declared
+    // `SQUEEZEFS_MW_ROLE=co-writer` owns the other half of the posture —
+    // `cowriter::arm`, whose ladder already decided it is admissible — and
+    // running this one there would try to ACQUIRE a reservation the
+    // authority holds and to serve custody this mount has no claim to
+    // grant.
+    if crate::cowriter::requested_role() == crate::cowriter::MwRole::CoWriter {
+        log::info!(
+            "multi-writer: this mount is a CO-WRITER (SQUEEZEFS_MW_ROLE=co-writer), so the \
+             AUTHORITY arm is not run — the co-writer arm installs the client halves of the \
+             same three planes (ownership + publish + custody) after its admission ladder \
+             passes"
+        );
+        return Ok(None);
+    }
     arm_multi_writer(meta, data_paths, read_only, runtime, quarantine).await
 }
 
@@ -387,6 +402,39 @@ pub async fn arm_multi_writer(
              a volume carrying incompat bit 7 — arm after it."
                 .to_string(),
         ));
+    }
+
+    // Rung 5b (DLM S9's co-writer half — §6.2 item 7's PRODUCER side): commit
+    // the operator-declared co-writer roster into every volume's durable
+    // claim set. This is the ONLY place a co-writer's member entry is
+    // written, and it must be the authority: the record is a metadata commit
+    // on ino 1, and a co-writer holds no metadata authority over these
+    // volumes — which is exactly why it cannot enroll itself and why its
+    // admission rung 3 refuses an unenrolled node naming this knob.
+    //
+    // Deliberately BEFORE the listener starts: a co-writer that dials before
+    // its enrollment is durable would be refused at rung 3, and an operator
+    // reading the two logs would see the refusal without its cause.
+    let roster = crate::cowriter::rostered_members();
+    if !roster.is_empty() {
+        match crate::cowriter::enroll_members(&meta.volumes, &roster, term).await {
+            Ok(0) => log::warn!(
+                "multi-writer: the co-writer roster {roster:?} committed NO claim-set entries — \
+                 every volume of this set must carry incompat bit 14 for the record to exist \
+                 (rung 2 refuses a half-engaged set, so those nodes will be refused with their \
+                 own ids named)"
+            ),
+            Ok(n) => log::warn!(
+                "multi-writer: {n} durable co-writer enrollment(s) committed for {roster:?} in \
+                 era {term} — each named node may now pass admission rung 3"
+            ),
+            Err(e) => {
+                if let Some(hold) = wero {
+                    data_custody::release_hold(hold).await;
+                }
+                return Err(e);
+            }
+        }
     }
 
     // Rung 6: where the authority serves.

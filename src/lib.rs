@@ -48,6 +48,12 @@ pub mod cache;
 pub mod cluster_wire;
 pub mod config_ops;
 pub(crate) mod cow_core;
+// DLM stage S9 (pre-RC spec §6.2 item 7's consumer half, §6.9 S9): the
+// CO-WRITER mount posture — metadata read-only locally with mutations
+// shipped to the authority, data read-write under a granted custody lease —
+// and the five-rung admission ladder that is the only way to reach it.
+// Plain comments, not doc comments (see the `data_custody` note below).
+pub mod cowriter;
 pub mod cpu;
 pub mod crypto_compress;
 // DLM stage S7 (pre-RC spec §6.9 / §6.7 / RES-6): the data plane's

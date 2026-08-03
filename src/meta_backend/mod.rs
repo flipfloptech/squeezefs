@@ -367,6 +367,47 @@ pub async fn open_routed_meta_set_read_only(
     ))
 }
 
+/// **DLM S9** — [`open_routed_meta_set`]'s **co-writer** twin
+/// (`SQUEEZEFS_MW_ROLE=co-writer`, past the five-rung admission ladder):
+/// the same §5.5.1a stamp discovery, the same canonical member ordering and
+/// slot-map validation, opened through [`KvMetaBackend::open_co_writer`] per
+/// volume.
+///
+/// No guard is taken on any member, so — exactly as for a reader — the
+/// whole rollback ladder [`open_meta_volume_set`] needs is structurally
+/// absent.
+///
+/// `crossvol_tx::recover_open_intents` is deliberately NOT run: rolling an
+/// open cross-volume intent forward is a WRITE, and it belongs to the
+/// authority's own open (which already ran it, or will). A co-writer that
+/// recovered intents would append to trees it has no authority over.
+pub async fn open_routed_meta_set_co_writer(
+    paths: &[String],
+    admission: &crate::cowriter::CoWriterAdmission,
+) -> Result<std::sync::Arc<RoutedMetaBackend>> {
+    let disc = discover_meta_set(paths).await?;
+    validate_slot_map(
+        disc.ordered_paths.len(),
+        disc.routing_width,
+        &disc.slot_to_volume,
+    )?;
+    let mut vols = Vec::with_capacity(disc.ordered_paths.len());
+    for path in &disc.ordered_paths {
+        vols.push(
+            kv::backend::KvMetaBackend::open_co_writer(std::path::Path::new(path), admission)
+                .await?,
+        );
+    }
+    Ok(std::sync::Arc::new(
+        RoutedMetaBackend::with_slot_map_and_natives(
+            vols,
+            disc.routing_width,
+            disc.slot_to_volume,
+            disc.native_slots,
+        )?,
+    ))
+}
+
 /// [`open_routed_meta_set`]'s **read-only probe** twin (the clients/df/
 /// job-record access pattern — no D0 claims, no checkpoint tasks,
 /// nothing written): same §5.5.1a discovery + canonical ordering, probe

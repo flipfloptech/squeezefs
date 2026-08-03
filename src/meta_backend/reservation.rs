@@ -74,12 +74,26 @@ pub struct ReservationRegistrant {
 pub struct ReservationReport {
     pub holder_key: Option<u64>,
     pub registrants: Vec<ReservationRegistrant>,
+    /// The held reservation's TYPE (0 = none held). DLM S9 needs it: a
+    /// co-writer's admission rung 5 must prove the standing hold is
+    /// **Write Exclusive – Registrants Only** (rtype 2), because a
+    /// registration under an rtype-1 Write Exclusive grants no write
+    /// access at all — admitting such a co-writer would be a mount whose
+    /// every DMA the device rejects.
+    pub rtype: u8,
 }
 
 impl ReservationReport {
     /// Whether `key` appears among the registrants.
     pub fn registered(&self, key: u64) -> bool {
         self.registrants.iter().any(|r| r.rkey == key)
+    }
+
+    /// `true` ⇔ a **Write Exclusive – Registrants Only** reservation
+    /// (rtype 2 — the shared-data-namespace fence) is held: every
+    /// registrant writes, unregistered hosts are rejected by the device.
+    pub fn is_wero(&self) -> bool {
+        self.holder_key.is_some() && u32::from(self.rtype) == RTYPE_WRITE_EXCLUSIVE_REGISTRANTS_ONLY
     }
 }
 
@@ -551,6 +565,7 @@ impl NvmeReservationClient {
         Ok(ReservationReport {
             holder_key,
             registrants,
+            rtype,
         })
     }
 
@@ -1118,6 +1133,11 @@ impl ReservationClient for FakeReservationClient {
                     holds_reservation: st.holder == Some(r.key),
                 })
                 .collect(),
+            rtype: if st.holder.is_some() {
+                st.rtype as u8
+            } else {
+                0
+            },
         })
     }
 }

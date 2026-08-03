@@ -1214,6 +1214,89 @@ impl KvMetaBackend {
         Ok(be)
     }
 
+    /// **DLM stage S9 — open one volume as a CO-WRITER**
+    /// (`SQUEEZEFS_MW_ROLE=co-writer`; spec §6.2 item 7's consumer half,
+    /// §6.9 S9; the ladder is [`crate::cowriter::classify_admission`]).
+    ///
+    /// This is the entry point S9 said was missing: *"the co-writer posture
+    /// is unreachable from `main` until that gate admits a co-member of an
+    /// ENGAGED claim set."* It is a **second door**, not a hole in the
+    /// first: [`Self::open`]'s Layer-A flock, its `FreshForeign` refusal
+    /// and its whole B1/B2 ladder are **byte-identical** to what they were,
+    /// and a mount that has not passed the five-rung ladder cannot reach
+    /// this function at all (a [`CoWriterAdmission`] is unforgeable —
+    /// `classify_admission` is its only constructor).
+    ///
+    /// | Step of [`Self::open`] | Co-writer |
+    /// |---|---|
+    /// | Layer A `flock(LOCK_EX)` | **not taken.** `flock(LOCK_SH)` runs as a released probe (classification only) — a retained lock would deny the authority its `LOCK_EX` on a shared host, and two co-writer mounts on one host are legitimate |
+    /// | DUR-5 primary-superblock repair | **skipped** — it WRITES sector 0, which is the authority's business |
+    /// | Bootstrap replay (SB → ledger → bitmap → RAM journal replay) | same, verbatim (read-only by construction) |
+    /// | Layer B2 claim classification | **not evaluated.** The authority's claim is EXPECTED to be there and live; the co-writer's own gate (rungs 2–4) is what decided that, off the durable claim SET and a live membership lease |
+    /// | Layer B1 PR register + Write Exclusive acquire | **not performed** on the metadata namespace. The co-writer's device presence is a *registrant* under the DATA namespaces' standing WERO hold (rung 5) — never a metadata-namespace reservation, which would preempt the authority |
+    /// | `writer_claim` commit + barrier | **never written** |
+    /// | checkpoint + times-drain tasks | **not spawned** (both write) |
+    ///
+    /// What the mount path must still do (and does — `cowriter::arm`): arm
+    /// the §6.8 item-2 revalidation cadence so this snapshot tracks the
+    /// authority's checkpoints, install the ownership + publish + custody
+    /// clients so mutations ship, and latch the accounting plane closed.
+    ///
+    /// A co-writer's staleness bound is a READER's bound
+    /// (`reader_staleness_bound_ms`) for exactly the same reason: it serves
+    /// the state of the most recent checkpoint it has polled. What it adds
+    /// is that its own mutations are never stale, because they execute on
+    /// the authority.
+    pub async fn open_co_writer(
+        path: &Path,
+        admission: &crate::cowriter::CoWriterAdmission,
+    ) -> std::result::Result<Arc<Self>, KvError> {
+        if !admission.covers(path) {
+            return Err(KvError::Corrupt(format!(
+                "{}: refusing a co-writer open under an admission decided over a DIFFERENT \
+                 volume set ({:?}). The ladder's evidence is per-set — bit 14 on every volume, \
+                 one durable claim set naming this node, one authority — so an admission may \
+                 never be carried across sets",
+                path.display(),
+                admission.volumes()
+            )));
+        }
+        match Self::probe_shared_lock(path) {
+            SharedProbe::LocalExclusiveHolder => log::info!(
+                "meta volume {}: co-writer mount — a LOCAL exclusive holder (the authority's \
+                 write mount, or a guarded offline verb) holds this volume on this host; the \
+                 co-writer takes no lock and refuses nothing",
+                path.display()
+            ),
+            SharedProbe::NoLocalExclusiveHolder => log::info!(
+                "meta volume {}: co-writer mount — no local exclusive holder (the authority is \
+                 on another host)",
+                path.display()
+            ),
+            SharedProbe::Unknown => {}
+        }
+        let mut inner = Self::open_inner(path).await?;
+        inner.read_only = true;
+        inner.ro_cause = ReadOnlyCause::CoWriterMount;
+        let be = Arc::new(inner);
+        // PR M7: no local commit can ever run here, but the conveyor
+        // identity is part of construction (a commit without it fails loud,
+        // never UB).
+        let _ = be.conveyor_self.set(Arc::downgrade(&be));
+        be.trace_guard_event("co_writer_admitted");
+        log::warn!(
+            "meta volume {}: mounted CO-WRITER (DLM S9) under authority claim '{}' (era {}). No \
+             writer_claim, no metadata-namespace reservation, no checkpoint task — this mount \
+             appends to none of this volume's single-appender structures and ships every \
+             metadata mutation. Guarantee class: {}",
+            path.display(),
+            admission.authority_claim_id(),
+            admission.authority_term(),
+            be.writer_guard_mode()
+        );
+        Ok(be)
+    }
+
     /// Whether this volume withholds mutations, and why.
     pub fn read_only_cause(&self) -> ReadOnlyCause {
         self.ro_cause
@@ -3213,6 +3296,15 @@ pub enum ReadOnlyCause {
     /// registers no PR key, spawns no checkpoint task — and therefore
     /// neither weakens nor blocks the single-writer guard.
     ReaderMount,
+    /// DLM S9: a **co-writer mount** (`SQUEEZEFS_MW_ROLE=co-writer`, past
+    /// the five-rung admission ladder). The metadata plane is read-only
+    /// *locally* — every mutation ships to the volume's authority — while
+    /// the DATA plane is read-write under a granted custody lease. Like a
+    /// reader it takes no Layer-A lock, writes no `writer_claim`, registers
+    /// no PR key on the metadata namespace and spawns no checkpoint task;
+    /// unlike a reader its refusal points at the shipped publish path
+    /// rather than at a mount option.
+    CoWriterMount,
 }
 
 /// The reader's Layer-A classification (DLM S5). `flock(LOCK_SH)` is taken
@@ -3856,6 +3948,16 @@ impl KvMetaBackend {
         // means "not a mount at all".
         if self.ro_cause == ReadOnlyCause::ReaderMount {
             return "reader";
+        }
+        // DLM S9: same reasoning as the reader row — decided by CAUSE, not
+        // by lock state. A co-writer is a live, FUSE-serving, DATA-WRITING
+        // mount that holds no lock and no claim on this volume, so it is
+        // its own guarantee class in docs/operations.md: exclusion of a
+        // second *appender* is still the authority's `LOCK_EX` + claim +
+        // PR, and this mount's write access is the authority's custody
+        // grant plus the data namespaces' WERO registration.
+        if self.ro_cause == ReadOnlyCause::CoWriterMount {
+            return "co-writer";
         }
         let guarded = self.guard_fd.lock().unwrap().is_some();
         match (guarded, &self.reservations) {
@@ -4572,6 +4674,29 @@ impl KvMetaBackend {
                     "metadata mutation on meta volume {}",
                     self.path.display()
                 )),
+                // DLM S9: a co-writer's metadata mutations are not
+                // FORBIDDEN, they are ROUTED — so the refusal names the
+                // path that carries them instead of a mount option. It is
+                // also counted: a nonzero `cowriter_local_commit_refusals`
+                // means a daemon surface still commits directly rather than
+                // going through `meta_ship`, which is S8's stated
+                // "the daemon is not switched onto the router" gap meeting
+                // a real workload.
+                ReadOnlyCause::CoWriterMount => {
+                    crate::fuse_client::METRICS
+                        .cowriter_local_commit_refusals
+                        .fetch_add(1, Ordering::Relaxed);
+                    crate::error::SqueezefsError::InvalidOperation(format!(
+                        "metadata mutation on meta volume {} refused: this mount is a CO-WRITER \
+                         (DLM S9) and holds NO metadata authority over it — the volume's \
+                         journal ring, extent bitmap and root ledger have exactly one appender, \
+                         and it is the authority that holds the D0 claim. Mutations must SHIP \
+                         (`meta_ship::publish` / the S8 metadata verbs) rather than commit \
+                         here; a surface that reached this gate is one the daemon has not yet \
+                         routed (cowriter_local_commit_refusals)",
+                        self.path.display()
+                    ))
+                }
                 _ => crate::error::SqueezefsError::InvalidOperation(format!(
                     "meta volume {} carries unknown read-only feature bits {:#x}: mounted \
                      read-only (§4.11); mutations withheld",

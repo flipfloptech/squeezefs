@@ -322,6 +322,37 @@ pub struct BlockAllocator {
     /// them. Untouched (one relaxed load) on every mount without a reader
     /// plane, which is every mount by default.
     grace: crate::free_grace::GraceRing,
+    /// DLM **S9** blocker #3: this volume's **allocation partition**
+    /// ([`crate::data_alloc_lane`]) — `None` on every mount today AND on
+    /// every solo mount forever, which is what makes single-writer
+    /// allocation not merely equivalent to the shipped path but literally
+    /// it ([`Self::engage_alloc_lanes`] installs nothing at `writers == 1`).
+    lanes: std::sync::OnceLock<LanePartition>,
+}
+
+/// One mount's data-plane allocation partition (see
+/// [`BlockAllocator::engage_alloc_lanes`]).
+struct LanePartition {
+    /// The appender descriptor — the SAME identity incompat bit 8's
+    /// partitioned journal/bitmap/ledger and §6.2 item 5's ino lanes carry,
+    /// so a volume never holds two disagreeing notions of "who is writer 2".
+    part: crate::meta_backend::kv::journal::AppendPartition,
+    /// Lane bitmask this mount may mint in: its own lane always, plus any
+    /// lane [`BlockAllocator::adopt_lane`] has adopted under a drain proof.
+    owned: AtomicU64,
+    /// The durable reservation frontier (exclusive block index) of the
+    /// **own** lane — raised through [`Self::sink`] before any mint reaches
+    /// it, so a successor's [`crate::data_alloc_lane::recover_lane_floor`]
+    /// starts above every index this mount could have minted.
+    reserved_upto: AtomicU64,
+    /// Fresh blocks one raise covers
+    /// ([`crate::data_alloc_lane::reserve_grain_blocks`], resolved once at
+    /// engagement — never per allocation).
+    grain: u64,
+    /// The durable sink. Absent on offline tools and unit fixtures: the
+    /// reservation is then RAM-only and recovery falls back to the derived
+    /// floor, which is exactly the pre-partition posture.
+    sink: std::sync::OnceLock<crate::data_alloc_lane::LaneReserveSink>,
 }
 
 /// One offset's incarnation state: the loom-verified seqlock word plus,
@@ -372,7 +403,260 @@ impl BlockAllocator {
             incarnation_minter: std::sync::OnceLock::new(),
             quarantine: crate::data_custody::BlockQuarantine::new(),
             grace: crate::free_grace::GraceRing::derived(),
+            lanes: std::sync::OnceLock::new(),
         })
+    }
+
+    // -----------------------------------------------------------------
+    // DLM S9 blocker #3 — the data-plane allocation partition
+    // (`crate::data_alloc_lane`; contracts in
+    // tests/mw_data_alloc_lane_tests.rs). Fresh allocation is a residue
+    // class per writer; FREES ARE UNTOUCHED — the owning lane is derivable
+    // from the offset, so a writer frees a peer's block with no ownership
+    // lookup, no message and no record.
+    // -----------------------------------------------------------------
+
+    /// Engage the allocation partition: this mount mints only lane
+    /// `part.writer_id()` of `part.writers()`.
+    ///
+    /// **A solo partition installs nothing** and returns `Ok(())`: lane 0
+    /// of 1 owns every index at stride 1, so installing state would only
+    /// create a way for the shipped path to differ from itself. That is the
+    /// single-writer byte-identity proof, made structural rather than
+    /// argued.
+    ///
+    /// Idempotent — the first non-solo call wins, so a re-registration can
+    /// never move a live mount's lane out from under offsets it has minted.
+    pub fn engage_alloc_lanes(
+        &self,
+        part: crate::meta_backend::kv::journal::AppendPartition,
+    ) -> Result<()> {
+        if part.is_solo() {
+            return Ok(());
+        }
+        if u32::from(part.writers()) > u64::BITS {
+            return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "allocation partition width {} exceeds the {} lanes a lane mask can hold",
+                part.writers(),
+                u64::BITS
+            )));
+        }
+        let cap = self.capacity_blocks.load(Ordering::Relaxed);
+        let installed = LanePartition {
+            part,
+            owned: AtomicU64::new(1u64 << part.writer_id()),
+            // The frontier a fresh engagement starts from is the derived
+            // one: `install_lane_floor` raises it from the durable records
+            // when recovery has read them.
+            reserved_upto: AtomicU64::new(self.highest_block.load(Ordering::Relaxed)),
+            grain: crate::data_alloc_lane::reserve_grain_blocks(cap, part.writers()),
+            sink: std::sync::OnceLock::new(),
+        };
+        let grain = installed.grain;
+        if self.lanes.set(installed).is_err() {
+            return Ok(());
+        }
+        let metrics = &crate::fuse_client::METRICS;
+        metrics
+            .alloc_lane_writers
+            .store(u64::from(part.writers()), Ordering::Relaxed);
+        metrics
+            .alloc_lane_id
+            .store(u64::from(part.writer_id()), Ordering::Relaxed);
+        metrics.alloc_lanes_owned.store(1, Ordering::Relaxed);
+        // Summed across this mount's data volumes (each engages once);
+        // `adopt_lane` subtracts the lane share it reclaims.
+        metrics.alloc_lane_stranded_bytes.fetch_add(
+            crate::data_alloc_lane::stranded_blocks_bound(
+                cap,
+                part.writers(),
+                1u64 << part.writer_id(),
+            )
+            .saturating_mul(self.chunk_size),
+            Ordering::Relaxed,
+        );
+        log::info!(
+            "data-plane allocation partition engaged on volume '{}': lane {} of {}, reservation \
+             grain {grain} blocks, {} block(s) of this device belong to other lanes \
+             (alloc_lane_stranded_bytes)",
+            self._volume_id,
+            part.writer_id(),
+            part.writers(),
+            crate::data_alloc_lane::stranded_blocks_bound(
+                cap,
+                part.writers(),
+                1u64 << part.writer_id()
+            ),
+        );
+        Ok(())
+    }
+
+    /// Wire the durable reservation sink (set once by the owning
+    /// `BackendRouter`, exactly like [`Self::set_space_pressure_valve`]).
+    /// Without it the reservation is RAM-only — the offline-tool posture.
+    pub fn set_lane_reserve_sink(&self, sink: crate::data_alloc_lane::LaneReserveSink) {
+        if let Some(lanes) = self.lanes.get() {
+            let _ = lanes.sink.set(sink);
+        }
+    }
+
+    /// This mount's partition, `None` ⇔ unpartitioned (every mount today).
+    pub fn lane_partition(&self) -> Option<crate::meta_backend::kv::journal::AppendPartition> {
+        self.lanes.get().map(|l| l.part)
+    }
+
+    /// The lane mask this mount may mint in (own + adopted). `None` ⇔
+    /// unpartitioned.
+    pub fn owned_lane_mask(&self) -> Option<u64> {
+        self.lanes.get().map(|l| l.owned.load(Ordering::Acquire))
+    }
+
+    /// The own lane's durable reservation frontier (exclusive block index).
+    pub fn lane_reserved_upto(&self) -> Option<u64> {
+        self.lanes
+            .get()
+            .map(|l| l.reserved_upto.load(Ordering::Acquire))
+    }
+
+    /// Raise the mint floor from recovery's answer
+    /// ([`crate::data_alloc_lane::recover_lane_floor`]): monotone
+    /// (`fetch_max`, so a stale floor can never regress a fresher mint) and
+    /// idempotent under re-seeding.
+    ///
+    /// Both halves move together — the dense cursor (so no index below the
+    /// floor is minted) and the reservation frontier (so the floor a
+    /// predecessor durably claimed is not re-reserved).
+    pub fn install_lane_floor(&self, floor: u64) {
+        let Some(lanes) = self.lanes.get() else {
+            return;
+        };
+        self.highest_block.fetch_max(floor, Ordering::AcqRel);
+        lanes.reserved_upto.fetch_max(floor, Ordering::AcqRel);
+    }
+
+    /// **Adopt a lane whose holder is proven dead** — the ENOSPC/fairness
+    /// answer (see the module docs and `docs/operations.md`): the adopted
+    /// lane's free blocks and virgin share become allocatable here.
+    ///
+    /// The witness is S7's [`crate::data_custody::DeadEpoch`], i.e. the
+    /// SAME drain proof [`Self::release_quarantine`] demands — a landed
+    /// WERO preempt of the dead lane's host on a PR substrate, recovery's
+    /// proof of death otherwise. Adoption needs **no durable record**
+    /// because the reservation watermark is keyed on the LANE, not the
+    /// holder: minting in an adopted lane raises that lane's own watermark,
+    /// so any future holder of it recovers above us.
+    ///
+    /// `false` ⇔ nothing changed (unpartitioned, own lane, out of range, or
+    /// already adopted).
+    pub fn adopt_lane(&self, lane: u16, proof: crate::data_custody::DeadEpoch) -> bool {
+        let Some(lanes) = self.lanes.get() else {
+            log::error!(
+                "refusing to adopt lane {lane} on volume '{}': no allocation partition is \
+                 engaged, so there are no lanes to adopt",
+                self._volume_id
+            );
+            return false;
+        };
+        if lane >= lanes.part.writers() || lane == lanes.part.writer_id() {
+            return false;
+        }
+        let bit = 1u64 << lane;
+        let prev = lanes.owned.fetch_or(bit, Ordering::AcqRel);
+        if prev & bit != 0 {
+            return false;
+        }
+        let owned = prev | bit;
+        let metrics = &crate::fuse_client::METRICS;
+        metrics
+            .alloc_lanes_owned
+            .store(u64::from(owned.count_ones()), Ordering::Relaxed);
+        metrics.alloc_lane_adoptions.fetch_add(1, Ordering::Relaxed);
+        // The adopted lane's share stops being stranded (exact, so the
+        // gauge stays closed across volumes and adoptions).
+        metrics.alloc_lane_stranded_bytes.fetch_sub(
+            crate::data_alloc_lane::lane_capacity_blocks(
+                self.capacity_blocks.load(Ordering::Relaxed),
+                lanes.part.writers(),
+                lane,
+            )
+            .saturating_mul(self.chunk_size),
+            Ordering::Relaxed,
+        );
+        log::warn!(
+            "lane {lane} ADOPTED on volume '{}' under {proof} (its holder is proven dead): its \
+             free blocks and virgin share are now allocatable here — alloc_lanes_owned={}",
+            self._volume_id,
+            owned.count_ones()
+        );
+        true
+    }
+
+    /// Free blocks this mount can never hand out because they belong to
+    /// lanes it does not own — the number the ENOSPC refusal prints, and
+    /// what an operator reads when "the device has space but writes fail".
+    /// `0` when unpartitioned.
+    pub fn foreign_lane_free_blocks(&self) -> u64 {
+        let Some(lanes) = self.lanes.get() else {
+            return 0;
+        };
+        let owned = lanes.owned.load(Ordering::Acquire);
+        let writers = lanes.part.writers();
+        self.free_blocks
+            .iter()
+            .filter(|idx| {
+                owned & (1u64 << crate::data_alloc_lane::block_lane_of(**idx, writers)) == 0
+            })
+            .count() as u64
+    }
+
+    /// `true` ⇔ `block_idx` is in a lane this mount may mint in (always
+    /// `true` when unpartitioned — the shipped answer).
+    fn lane_is_ours(&self, block_idx: u64) -> bool {
+        match self.lanes.get() {
+            None => true,
+            Some(lanes) => {
+                let lane = crate::data_alloc_lane::block_lane_of(block_idx, lanes.part.writers());
+                lanes.owned.load(Ordering::Acquire) & (1u64 << lane) != 0
+            }
+        }
+    }
+
+    /// Raise the own lane's durable reservation so it covers `block_idx`,
+    /// **before that offset is handed to a caller**. One `await`ed commit
+    /// per [`crate::data_alloc_lane::reserve_grain_blocks`] fresh blocks;
+    /// free-list reuse never reaches here (a freed index is dominated by the
+    /// derived floor, so it needs no new watermark) — which is what keeps
+    /// the rewrite hot path at zero reservation work.
+    async fn reserve_lane_frontier(&self, block_idx: u64) -> Result<()> {
+        let Some(lanes) = self.lanes.get() else {
+            return Ok(());
+        };
+        if block_idx < lanes.reserved_upto.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let want = block_idx.saturating_add(lanes.grain).saturating_add(1);
+        match lanes.sink.get() {
+            Some(sink) => {
+                sink(lanes.part.writer_id(), want).await?;
+                crate::fuse_client::METRICS
+                    .alloc_lane_reservations
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                // No durable sink (offline tools, unit fixtures): the
+                // frontier is RAM-only and recovery falls back to the
+                // derived floor — the pre-partition posture, stated rather
+                // than pretended.
+                log::debug!(
+                    "lane reservation for volume '{}' lane {} raised to {want} in RAM only (no \
+                     durable sink wired)",
+                    self._volume_id,
+                    lanes.part.writer_id()
+                );
+            }
+        }
+        lanes.reserved_upto.fetch_max(want, Ordering::AcqRel);
+        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -571,13 +855,28 @@ impl BlockAllocator {
     /// The never-minted (virgin) tail in bytes — the KD-4.6 watermark's
     /// derivation input. Unbounded allocators (capacity 0: offline
     /// tools / tests) report an infinite tail: pressure never fires.
+    ///
+    /// DLM S9: under an engaged partition only the OWNED lanes' share of
+    /// that tail is this mount's to mint, so the answer is scaled by the
+    /// owned-lane count. Reporting the dense tail would tell the discard
+    /// watermark there is `W`× more virgin supply than this writer can
+    /// reach — the same class of lie the stranded-capacity gauge exists to
+    /// prevent.
     pub fn virgin_bytes(&self) -> u64 {
         let cap = self.capacity_blocks.load(Ordering::Relaxed);
         if cap == 0 {
             return u64::MAX;
         }
         let cursor = self.highest_block.load(Ordering::Relaxed).min(cap);
-        (cap - cursor).saturating_mul(self.chunk_size)
+        let tail = cap - cursor;
+        let tail = match self.lanes.get() {
+            None => tail,
+            Some(lanes) => {
+                let owned = lanes.owned.load(Ordering::Acquire).count_ones() as u64;
+                tail / u64::from(lanes.part.writers()) * owned
+            }
+        };
+        tail.saturating_mul(self.chunk_size)
     }
 
     /// Trim claim (KD-4.4): take `offset` OUT of the free list — the
@@ -731,6 +1030,14 @@ impl BlockAllocator {
         let mut frees_completed = 0u64;
         let mut free_list_evictions = 0u64;
         for idx in 0..highest {
+            // DLM S9: a foreign lane's index is not this writer's to
+            // reconcile. Under a partition the dense cursor spans peers'
+            // indices, and "untracked and not free-listed" is the NORMAL
+            // state of a peer's live block here — completing its free would
+            // publish another writer's block into this one's free list.
+            if !self.lane_is_ours(idx) {
+                continue;
+            }
             let offset = idx * self.chunk_size;
             let tracked = self.refcounts.read_sync(&offset, |_, _| ()).is_some();
             let free_listed = self.free_blocks.contains(&idx);
@@ -1131,27 +1438,97 @@ impl BlockAllocator {
     /// Advance the fresh-block cursor by one, refusing to mint an offset at
     /// or past the device capacity (when bounded). CAS loop: a refused
     /// racer must not bump the cursor.
+    ///
+    /// **Under an engaged partition** the step is to the next index in a
+    /// lane this mount owns (`cur` itself whenever `cur`'s lane is ours),
+    /// and the cursor still publishes the DENSE frontier — the skipped
+    /// indices belong to peers and are neither minted nor free-listed here.
+    /// At `writers == 1` (and on every mount today, where `lanes` is `None`)
+    /// the lane step is `cur` and this is the shipped loop, instruction for
+    /// instruction.
     fn next_fresh_block(&self) -> Result<u64> {
         let cap = self.capacity_blocks.load(Ordering::Relaxed);
         loop {
             let cur = self.highest_block.load(Ordering::Relaxed);
-            if cap != 0 && cur >= cap {
+            let idx = match self.lanes.get() {
+                None => cur,
+                Some(lanes) => crate::data_alloc_lane::next_owned_index_at_or_above(
+                    cur,
+                    lanes.owned.load(Ordering::Acquire),
+                    lanes.part.writers(),
+                )
+                .unwrap_or(cur),
+            };
+            if cap != 0 && idx >= cap {
                 return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
                     std::io::ErrorKind::StorageFull,
                     format!(
-                        "data volume '{}' full: {} of {} blocks allocated",
-                        self._volume_id, cur, cap
+                        "data volume '{}' full: {} of {} blocks allocated{}",
+                        self._volume_id,
+                        cur,
+                        cap,
+                        self.lane_full_context()
                     ),
                 )));
             }
             if self
                 .highest_block
-                .compare_exchange(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange(cur, idx + 1, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
-                return Ok(cur);
+                return Ok(idx);
             }
         }
+    }
+
+    /// The lane clause of a `StorageFull` message: empty when
+    /// unpartitioned, and otherwise the honest statement an operator needs
+    /// — *this lane is out of blocks, N free blocks belong to other lanes,
+    /// and the way to reach them is a proven-dead lane adoption*
+    /// (`docs/operations.md` §Multi-writer capacity planning).
+    fn lane_full_context(&self) -> String {
+        let Some(lanes) = self.lanes.get() else {
+            return String::new();
+        };
+        let foreign = self.foreign_lane_free_blocks();
+        crate::fuse_client::METRICS
+            .alloc_lane_enospc_refusals
+            .fetch_add(1, Ordering::Relaxed);
+        format!(
+            " — lane {} of {} is exhausted while {foreign} free block(s) belong to lanes this \
+             mount does not own (alloc_lane_enospc_refusals; reach them by adopting a lane whose \
+             holder is proven dead, or grow the volume set)",
+            lanes.part.writer_id(),
+            lanes.part.writers()
+        )
+    }
+
+    /// The reservation gate between a claimed index and its caller (DLM S9
+    /// blocker #3): an offset is handed out only once the own lane's durable
+    /// watermark covers it, so no successor of this lane can re-mint it.
+    ///
+    /// `None` partition (every mount today) ⇒ one `OnceLock` probe and the
+    /// value straight through. A failed reservation **gives the offset
+    /// back** rather than handing out an un-covered one: nothing durable and
+    /// no device byte has touched it yet, which is exactly the
+    /// begin+finish-with-nothing-between contract [`Self::free_block`]
+    /// states.
+    async fn hand_out_reserved(&self, claimed: Result<u64>) -> Result<u64> {
+        let Ok(offset) = claimed else { return claimed };
+        if self.lanes.get().is_none() {
+            return Ok(offset);
+        }
+        if let Err(e) = self.reserve_lane_frontier(offset / self.chunk_size).await {
+            log::error!(
+                "returning freshly claimed offset {offset} on volume '{}': its lane reservation \
+                 could not be made durable ({e}) — handing out an unreserved offset would let a \
+                 successor of this lane mint it again (DLM S9)",
+                self._volume_id
+            );
+            let _ = self.free_block(offset).await;
+            return Err(e);
+        }
+        Ok(offset)
     }
 
     pub async fn allocate_block(&self) -> Result<u64> {
@@ -1159,6 +1536,9 @@ impl BlockAllocator {
             return Err(e);
         }
         let first = self.try_allocate_block();
+        if first.is_ok() {
+            return self.hand_out_reserved(first).await;
+        }
         let Err(e) = first else { return first };
         // Spec §6.8 item 3's pressure arm, BEFORE the reclaim valve's early
         // exits: a store whose free list is entirely in the grace period is
@@ -1206,7 +1586,7 @@ impl BlockAllocator {
         // liveness floor: past it the verdict stands, loudly.
         for attempt in 0..ENOSPC_VALVE_MAX_ATTEMPTS {
             if let ok @ Ok(_) = self.try_allocate_block() {
-                return ok;
+                return self.hand_out_reserved(ok).await;
             }
             let pending = self.space_pending.get().map(|p| p()).unwrap_or(false);
             if let Some(valve) = self.space_valve.get() {
@@ -1215,7 +1595,8 @@ impl BlockAllocator {
             if !pending {
                 // Nothing was owed before the final drain: the verdict
                 // stands (genuine fullness refuses StorageFull).
-                return self.try_allocate_block();
+                let last = self.try_allocate_block();
+                return self.hand_out_reserved(last).await;
             }
             let _ = attempt;
         }
@@ -1226,7 +1607,8 @@ impl BlockAllocator {
              and the reclaimer is not gaining on it; check \
              block_free_reclaim_queue_bytes and block_free_reclaim_fence_halts)"
         );
-        self.try_allocate_block()
+        let last = self.try_allocate_block();
+        self.hand_out_reserved(last).await
     }
 
     /// One allocation attempt (free list, then fresh mint) — the body
@@ -1252,7 +1634,17 @@ impl BlockAllocator {
         // released offset late. One relaxed load when nothing is held.
         self.harvest_grace();
         loop {
-            let Some(idx) = self.free_blocks.iter().next().map(|item| *item) else {
+            // DLM S9: reuse obeys the same residue class as a fresh mint —
+            // a free block in a peer's lane is that peer's to reuse, which
+            // is what makes reuse arbitration-free (and is the source of
+            // the stranding bound). Unpartitioned mounts take the first
+            // candidate, unchanged.
+            let Some(idx) = self
+                .free_blocks
+                .iter()
+                .map(|item| *item)
+                .find(|idx| self.lane_is_ours(*idx))
+            else {
                 break;
             };
             if self.free_blocks.remove(&idx).is_some() {
@@ -1340,6 +1732,14 @@ impl BlockAllocator {
     /// that would grow the very tail it is reclaiming). Lock-free: the
     /// `DashSet::remove` is the atomic claim; a lost race falls through to
     /// the next candidate.
+    ///
+    /// DLM S9: under an engaged partition the candidates are filtered to
+    /// lanes this mount owns, so **contiguity picks keep working WITHIN a
+    /// lane** — a lane's indices are `w, w+W, …`, so "the lowest free block
+    /// below the bound" still converges the mover, one stride coarser. The
+    /// cost is stated in the design record: physical contiguity of a run of
+    /// blocks is `W`-strided rather than dense, which is why the partition
+    /// width is a capacity/fragmentation trade and not free.
     pub fn allocate_block_below(&self, below_idx: u64) -> Option<u64> {
         Self::reader_gate("block allocation (contiguity pick)").ok()?;
         // Spec §6.8 item 3: acknowledged offsets re-enter the free list
@@ -1350,7 +1750,7 @@ impl BlockAllocator {
             .free_blocks
             .iter()
             .map(|i| *i)
-            .filter(|i| *i < below_idx)
+            .filter(|i| *i < below_idx && self.lane_is_ours(*i))
             .collect();
         cands.sort_unstable();
         for idx in cands {
@@ -1375,7 +1775,7 @@ impl BlockAllocator {
             .free_blocks
             .iter()
             .map(|i| *i)
-            .filter(|i| *i >= min_idx)
+            .filter(|i| *i >= min_idx && self.lane_is_ours(*i))
             .collect();
         cands.sort_unstable();
         for idx in cands {
@@ -1384,6 +1784,24 @@ impl BlockAllocator {
             }
         }
         let idx = self.next_fresh_block()?;
+        // DLM S9: this pick is SYNCHRONOUS, so it cannot await a
+        // reservation raise. A fresh mint past the durable frontier is
+        // therefore refused loud rather than handed out uncovered — the
+        // caller (a VL4/VL7 mover) defers, and the async write path's next
+        // allocation raises the frontier. Unpartitioned mounts never reach
+        // the branch.
+        if let Some(lanes) = self.lanes.get() {
+            if idx >= lanes.reserved_upto.load(Ordering::Acquire) {
+                return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                    "volume '{}': the ascending pick would mint fresh block {idx}, past this \
+                     lane's durable reservation frontier {} — refusing (a synchronous pick \
+                     cannot raise the frontier; the write path's next allocation will, and this \
+                     mover should defer)",
+                    self._volume_id,
+                    lanes.reserved_upto.load(Ordering::Acquire)
+                )));
+            }
+        }
         Ok(self.claim_block_idx(idx))
     }
 

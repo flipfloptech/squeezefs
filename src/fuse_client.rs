@@ -3755,6 +3755,44 @@ pub struct Metrics {
     /// `data_dma_epoch_refusals`, whose growth it explains. **0 on every
     /// single-writer mount** — nothing revokes custody there.
     pub dlm_custody_epoch_advances: Align64<AtomicU64>,
+    // DLM **S9** blocker #3 — the data-plane allocation partition
+    // (`crate::data_alloc_lane`, docs/design-mw-data-alloc-partition.md).
+    // Every field is 0 on a single-writer mount BY CONSTRUCTION: a solo
+    // partition installs nothing at all.
+    /// Lanes the block-index space is partitioned into (`W`). **0 = no
+    /// partition**, which is every mount today — the whole machinery is
+    /// then structurally inert (one `OnceLock` probe on the allocation
+    /// path, none on the free path).
+    pub alloc_lane_writers: Align64<AtomicU64>,
+    /// This mount's own lane id (`w` of `W`); 0 when unpartitioned.
+    pub alloc_lane_id: Align64<AtomicU64>,
+    /// Lanes this mount may mint in — its own plus every lane ADOPTED
+    /// under a drain proof. `1` on an engaged partition that has adopted
+    /// nothing; 0 when unpartitioned.
+    pub alloc_lanes_owned: Align64<AtomicU64>,
+    /// Durable reservation raises: one metadata commit per
+    /// `data_alloc_lane::reserve_grain_blocks` FRESH blocks per lane
+    /// (free-list reuse never reserves). Raises ÷ fresh blocks is the live
+    /// amortization factor; growth proportional to allocations means the
+    /// grain collapsed.
+    pub alloc_lane_reservations: Align64<AtomicU64>,
+    /// Lanes adopted after their holder was proven dead (the ENOSPC/fairness
+    /// answer — the witness is S7's `DeadEpoch`, the same drain proof
+    /// `release_quarantine` demands). 0 on a healthy set.
+    pub alloc_lane_adoptions: Align64<AtomicU64>,
+    /// Allocations refused `StorageFull` **because this lane is exhausted**
+    /// — the refusal names how many free blocks belong to lanes this mount
+    /// does not own. **Must stay 0**: growth means a writer is starving
+    /// while the set has space, i.e. the partition width or the load skew
+    /// needs the operator's attention (`docs/operations.md` §Multi-writer
+    /// capacity planning).
+    pub alloc_lane_enospc_refusals: Align64<AtomicU64>,
+    /// The **published stranding bound**: bytes of this mount's data
+    /// volumes that belong to lanes it does not own
+    /// (`data_alloc_lane::stranded_blocks_bound × chunk_size`, summed as
+    /// each volume engages). This is the number capacity planning uses;
+    /// adopting a lane lowers it.
+    pub alloc_lane_stranded_bytes: Align64<AtomicU64>,
     // DLM **S6** (pre-RC spec §6.5 item 3, §6.9 S6): the membership plane.
     // Liveness is RAM state renewed over `cluster_wire`, so these are the
     // instruments that say so — the gauges (`membership_mode`,
@@ -6761,6 +6799,20 @@ impl SqueezefsFilesystem {
                 // `data_dma_epoch_refusals` growth is measured against.
                 "dlm_custody_generation": crate::data_custody::custody_generation(),
                 "dlm_custody_epoch_advances": METRICS.dlm_custody_epoch_advances.load(Ordering::Relaxed),
+                // DLM S9 blocker #3: the data-plane allocation partition.
+                // `alloc_lane_writers == 0` IS the statement "this mount is
+                // unpartitioned" (every mount today), and then every field
+                // below is 0 by construction. `alloc_lane_enospc_refusals`
+                // is a must-stay-0 tripwire — a writer starving while the
+                // set has free space — and `alloc_lane_stranded_bytes` is
+                // the published capacity-planning bound.
+                "alloc_lane_writers": METRICS.alloc_lane_writers.load(Ordering::Relaxed),
+                "alloc_lane_id": METRICS.alloc_lane_id.load(Ordering::Relaxed),
+                "alloc_lanes_owned": METRICS.alloc_lanes_owned.load(Ordering::Relaxed),
+                "alloc_lane_reservations": METRICS.alloc_lane_reservations.load(Ordering::Relaxed),
+                "alloc_lane_adoptions": METRICS.alloc_lane_adoptions.load(Ordering::Relaxed),
+                "alloc_lane_enospc_refusals": METRICS.alloc_lane_enospc_refusals.load(Ordering::Relaxed),
+                "alloc_lane_stranded_bytes": METRICS.alloc_lane_stranded_bytes.load(Ordering::Relaxed),
                 // DLM S6 (spec §6.5 item 3): the membership plane's
                 // counters. `membership_renewals` is the beat that used to
                 // be a journal transaction — it grows while

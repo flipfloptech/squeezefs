@@ -2484,7 +2484,85 @@ impl BackendRouter {
         for (alloc, indices) in per_volume {
             alloc.seed_from_durable_refs(&indices).await;
         }
+        // DLM S9 blocker #3: the derived cursor is now seeded, so the lane
+        // floors can be raised past every index a predecessor of this lane
+        // durably RESERVED (not merely published). Structurally inert while
+        // no allocator is partitioned — one `OnceLock` probe per volume.
+        self.recover_alloc_lane_floors(routed).await?;
         Ok(Some(total))
+    }
+
+    /// DLM **S9** blocker #3: engage the data-plane allocation partition on
+    /// every allocator this router owns and wire each one's durable
+    /// reservation sink (`crate::data_alloc_lane`).
+    ///
+    /// A **solo** partition engages nothing (that is the single-writer
+    /// byte-identity property, made structural), so this is a no-op on every
+    /// mount today — exactly like `engage_incarnation_keys`, whose gate it
+    /// sits beside.
+    pub fn engage_data_alloc_lanes(
+        &self,
+        part: crate::meta_backend::kv::journal::AppendPartition,
+        meta: std::sync::Arc<crate::meta_backend::RoutedMetaBackend>,
+    ) -> Result<()> {
+        let engage =
+            |alloc: &std::sync::Arc<crate::block_allocator::BlockAllocator>| -> Result<()> {
+                alloc.engage_alloc_lanes(part)?;
+                if alloc.lane_partition().is_some() {
+                    alloc.set_lane_reserve_sink(crate::data_alloc_lane::kv_reserve_sink(
+                        std::sync::Arc::clone(&meta),
+                        alloc.volume_id(),
+                        part.writers(),
+                    ));
+                }
+                Ok(())
+            };
+        engage(&self.default_allocator)?;
+        for be in self.backends.iter() {
+            engage(&be.value().block_allocator)?;
+        }
+        Ok(())
+    }
+
+    /// DLM **S9** blocker #3: raise every partitioned allocator's mint floor
+    /// from its volume's durable lane reservations
+    /// ([`crate::data_alloc_lane::recover_lane_floor`]).
+    ///
+    /// Runs AFTER the durable-reference seed, because the rule is
+    /// `max(reservation, derived dense floor)` and the derived half is what
+    /// that seed produces. Nothing to do (and no metadata read) when no
+    /// allocator is partitioned, which is every mount today.
+    pub async fn recover_alloc_lane_floors(
+        &self,
+        routed: &crate::meta_backend::RoutedMetaBackend,
+    ) -> Result<()> {
+        let mut allocs: Vec<std::sync::Arc<crate::block_allocator::BlockAllocator>> =
+            vec![std::sync::Arc::clone(&self.default_allocator)];
+        for be in self.backends.iter() {
+            allocs.push(std::sync::Arc::clone(&be.value().block_allocator));
+        }
+        for alloc in allocs {
+            let Some(part) = alloc.lane_partition() else {
+                continue;
+            };
+            let records =
+                crate::data_alloc_lane::load_lane_reservations(routed, alloc.volume_id()).await?;
+            let floor = crate::data_alloc_lane::recover_lane_floor(
+                &records,
+                alloc.highest_block_index(),
+                part,
+            );
+            alloc.install_lane_floor(floor);
+            log::info!(
+                "allocation lane {} of {} on volume '{}' resumes at block {floor} \
+                 ({} durable reservation record(s) read)",
+                part.writer_id(),
+                part.writers(),
+                alloc.volume_id(),
+                records.len()
+            );
+        }
+        Ok(())
     }
 
     /// **Backfill** the durable reference ledger from the layout walk (spec
@@ -4567,6 +4645,44 @@ impl DataRouter {
                 Err(e) => log::error!(
                     "block-key incarnations NOT engaged: {e} — keys stay unstamped (stale \
                      bindings remain undetectable, spec §6.3)"
+                ),
+            }
+        }
+        // DLM S9 blocker #3 (docs/design-mw-data-alloc-partition.md): engage
+        // the DATA-plane allocation partition on the same gate shape —
+        // EVERY mounted meta volume must express a multi-writer data plane
+        // (incompat bit 11, which S9's arm already requires), because a
+        // lane-unaware mount of a partitioned set mints DENSE offsets across
+        // every peer's lane and ignores the reservation frontier a live peer
+        // published ahead of the durable references.
+        //
+        // The lane itself comes from `data_alloc_lane::mount_partition()`,
+        // which is `SOLO` until an admission installs one (§6.9 S9's custody
+        // lease — the named residual in the design record's §7). A solo
+        // partition engages NOTHING, so this is inert on every mount today
+        // twice over: no volume carries bit 11, and no mount is a co-writer.
+        let part = crate::data_alloc_lane::mount_partition();
+        if !part.is_solo()
+            && !meta_backend.volumes.is_empty()
+            && meta_backend.volumes.iter().all(|v| {
+                v.superblock().features_incompat
+                    & crate::meta_backend::kv::superblock::FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA
+                    != 0
+            })
+        {
+            match self
+                .backend_router
+                .engage_data_alloc_lanes(part, std::sync::Arc::clone(&meta_backend))
+            {
+                Ok(()) => log::info!(
+                    "data-plane allocation partition engaged: lane {} of {} — fresh block \
+                     allocation is this writer's residue class, frees stay lane-blind",
+                    part.writer_id(),
+                    part.writers()
+                ),
+                Err(e) => log::error!(
+                    "data-plane allocation partition NOT engaged: {e} — this mount would mint \
+                     offsets across every peer's lane, so the multi-writer arm must refuse"
                 ),
             }
         }

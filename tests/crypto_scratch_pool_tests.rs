@@ -174,3 +174,78 @@ async fn test_pooled_transform_dma_read_back_parity() {
         "read path must recover the plaintext from the pooled image"
     );
 }
+
+/// **PERF-10 — a pooled transformed image is 4 KiB-grained, so the DMA
+/// takes its ALIGNED (zero-copy) branch.**
+///
+/// A compressed/encrypted image's length is a transform artifact and is
+/// essentially never a 4 KiB multiple, so `NvmeBlockDev::write_block` used
+/// to take its bounce branch for EVERY transformed block — a third copy
+/// (pooled scratch → aligned bounce buffer) on top of the merge copy and
+/// the DMA. The stored image is now zero-padded to the 4 KiB grain (the
+/// frame is self-delimiting, so readers ignore the pad) whenever the
+/// padded length fits both the scratch backing and the allocator chunk.
+///
+/// Instrument: `nvme_unaligned_write_fallbacks` must not move across a
+/// transformed write cycle. RED pre-fix: the counter moves by 1 per block
+/// and the image length is not a 4 KiB multiple.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_pooled_transform_is_dma_aligned_no_bounce() {
+    use squeezefs::fuse_client::METRICS;
+    use std::sync::atomic::Ordering;
+
+    let h = make("scratch_dma_aligned").await;
+    let bs: usize = 256 * 1024;
+    h.router.set_block_size(bs as u64);
+    h.router.set_crypto(CryptoCompressState::new(
+        "lz4".to_string(),
+        "aes256gcm".to_string(),
+        Some(test_key()),
+    ));
+    let crypto = h.router.get_crypto();
+    assert!(crypto.scratch_pool_buf_len().is_some(), "pooled path armed");
+
+    // Two shapes: compressible (short image) and incompressible (the
+    // store-raw escape's long image). Both must land on the grain.
+    for (tag, payload) in [
+        ("compressible", vec![0xA7u8; bs]),
+        ("incompressible", mixed_payload(bs)),
+    ] {
+        let payload = bytes::Bytes::from(payload);
+        let stored = crypto.process_write_async(payload.clone()).await.unwrap();
+        assert_eq!(
+            stored.len() % 4096,
+            0,
+            "{tag}: stored image length {} is not a 4 KiB multiple — the DMA \
+             will bounce (PERF-10)",
+            stored.len()
+        );
+        assert_eq!(
+            stored.as_ptr() as usize % 4096,
+            0,
+            "{tag}: pooled image must stay 4 KiB-aligned"
+        );
+
+        // The instrument: a real DMA of this image must not bounce.
+        let before = METRICS
+            .nvme_unaligned_write_fallbacks
+            .load(Ordering::Relaxed);
+        h.dev.write_block(0, stored.clone()).await.unwrap();
+        assert_eq!(
+            METRICS
+                .nvme_unaligned_write_fallbacks
+                .load(Ordering::Relaxed),
+            before,
+            "{tag}: transformed write took the unaligned bounce path (PERF-10)"
+        );
+
+        // Round-trip through the untouched read path: the pad is invisible.
+        let raw = h.dev.read_block(0, stored.len()).await.unwrap();
+        let plain = crypto.process_read_async(raw).await.unwrap();
+        assert_eq!(
+            plain.as_ref(),
+            payload.as_ref(),
+            "{tag}: padding must not disturb the plaintext round-trip"
+        );
+    }
+}

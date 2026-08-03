@@ -222,7 +222,10 @@ async fn a_heartbeat_costs_zero_journal_transactions() {
     let before = META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed);
     for beat in 0..500u64 {
         // Advance by the renewal cadence — the plane's actual beat.
-        ticks.store(1_000 + beat * clocks.renew_interval.as_millis() as u64, Ordering::SeqCst);
+        ticks.store(
+            1_000 + beat * clocks.renew_interval.as_millis() as u64,
+            Ordering::SeqCst,
+        );
         match owner.renew("m-beat", grant.epoch, 0) {
             RenewOutcome::Renewed(_) => {}
             RenewOutcome::UnknownLease { reason } => panic!("live lease refused: {reason}"),
@@ -230,7 +233,8 @@ async fn a_heartbeat_costs_zero_journal_transactions() {
     }
     let after = META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed);
     assert_eq!(
-        after, before,
+        after,
+        before,
         "500 lease renewals committed {} journal transaction(s): the S6 heartbeat MUST NOT \
          touch the journal (spec §6.5 item 3)",
         after - before
@@ -238,11 +242,7 @@ async fn a_heartbeat_costs_zero_journal_transactions() {
 
     // CONTRAST: the legacy beat shape on the same volume. Without this arm
     // the assertion above would also pass against a dead counter.
-    let legacy = format!(
-        "{{\"ts\":{},\"pid\":{}}}",
-        now_secs(),
-        std::process::id()
-    );
+    let legacy = format!("{{\"ts\":{},\"pid\":{}}}", now_secs(), std::process::id());
     be.setxattr_internal(1, "client:legacy-beat", legacy.as_bytes())
         .await
         .expect("legacy registration write");
@@ -364,7 +364,10 @@ async fn read_side_cost_is_independent_of_member_count() {
         assert!(pages <= 8, "paging must terminate");
     }
     assert_eq!(seen, 500, "every member must appear exactly once");
-    assert_eq!(pages, 4, "500 members at limit 128 is ceil(500/128) = 4 pages");
+    assert_eq!(
+        pages, 4,
+        "500 members at limit 128 is ceil(500/128) = 4 pages"
+    );
     be.shutdown().await.expect("clean shutdown");
 }
 
@@ -514,7 +517,10 @@ fn the_client_fail_stops_before_the_owner_can_regrant() {
     // One tick before its own deadline the member is still healthy.
     ticks.store(self_deadline - 1, Ordering::SeqCst);
     assert!(!session.self_fence_due());
-    assert!(owner.expire_due().is_empty(), "the owner expires nothing yet");
+    assert!(
+        owner.expire_due().is_empty(),
+        "the owner expires nothing yet"
+    );
 
     // At its own deadline the member fail-stops ITSELF — before the owner
     // has expired anything, so no other holder can have been granted.
@@ -821,7 +827,10 @@ fn owner_failover_opens_a_grace_window_admitting_only_reclaim() {
     let mut r1 = join_req("m-1", MemberRole::Writer, None);
     r1.prior_epoch = Some(41);
     granted(owner.join(r1));
-    assert!(owner.grace_active(), "one of two reclaims does not close it");
+    assert!(
+        owner.grace_active(),
+        "one of two reclaims does not close it"
+    );
     let mut r2 = join_req("m-2", MemberRole::Reader, None);
     r2.prior_epoch = Some(42);
     granted(owner.join(r2));
@@ -861,8 +870,16 @@ fn disc1_discovery_rides_the_membership_census() {
     let (clock, ticks) = manual_clock();
     let clocks = shipped_clocks();
     let owner = owner_with(clocks.clone(), clock.clone(), 4);
-    granted(owner.join(join_req("b-peer", MemberRole::Writer, Some("10.0.0.2:7100"))));
-    granted(owner.join(join_req("a-peer", MemberRole::Writer, Some("10.0.0.1:7100"))));
+    granted(owner.join(join_req(
+        "b-peer",
+        MemberRole::Writer,
+        Some("10.0.0.2:7100"),
+    )));
+    granted(owner.join(join_req(
+        "a-peer",
+        MemberRole::Writer,
+        Some("10.0.0.1:7100"),
+    )));
     granted(owner.join(join_req("self", MemberRole::Writer, Some("10.0.0.3:7100"))));
     granted(owner.join(join_req("no-endpoint", MemberRole::Reader, None)));
     let stale = granted(owner.join(join_req("stale", MemberRole::Writer, Some("10.0.0.4:7100"))));
@@ -1031,16 +1048,24 @@ async fn many_clients_renew_while_one_is_evicted() {
 
     let victim = members[13].clone();
     let barrier = Arc::new(tokio::sync::Barrier::new(9));
+    // The renewal loops run until the evictor has been OBSERVED, so the
+    // contract is deterministic rather than a race between task schedules
+    // (the first shape of this test finished its rounds before the evictor
+    // ran, which proved nothing).
+    let stop = Arc::new(AtomicBool::new(false));
+    let refusals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut tasks = Vec::new();
     for chunk in members.chunks(32) {
         let chunk: Vec<(String, u64)> = chunk.to_vec();
         let owner = Arc::clone(&owner);
         let barrier = Arc::clone(&barrier);
+        let stop = Arc::clone(&stop);
+        let refusals = Arc::clone(&refusals);
         let victim_id = victim.0.clone();
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
             let mut refused = 0usize;
-            for _ in 0..20 {
+            while !stop.load(Ordering::Acquire) {
                 for (id, epoch) in &chunk {
                     match owner.renew(id, *epoch, 1) {
                         RenewOutcome::Renewed(_) => {}
@@ -1050,12 +1075,14 @@ async fn many_clients_renew_while_one_is_evicted() {
                                 "only the evicted member may be refused ({id})"
                             );
                             refused += 1;
+                            refusals.fetch_add(1, Ordering::AcqRel);
                         }
                     }
                 }
                 // The census must never observe a torn member.
                 let (rows, _) = owner.census(0, 512);
                 assert!(rows.iter().all(|r| !r.id.is_empty()));
+                tokio::task::yield_now().await;
             }
             refused
         }));
@@ -1063,11 +1090,21 @@ async fn many_clients_renew_while_one_is_evicted() {
     let evictor = {
         let owner = Arc::clone(&owner);
         let barrier = Arc::clone(&barrier);
+        let stop = Arc::clone(&stop);
+        let refusals = Arc::clone(&refusals);
         let victim_id = victim.0.clone();
         tokio::spawn(async move {
             barrier.wait().await;
-            tokio::task::yield_now().await;
-            owner.evict(&victim_id, "concurrency contract").is_some()
+            let landed = owner.evict(&victim_id, "concurrency contract").is_some();
+            // Bounded wait for the renewers to observe it — then stop them.
+            for _ in 0..100_000 {
+                if refusals.load(Ordering::Acquire) > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            stop.store(true, Ordering::Release);
+            landed
         })
     };
     let mut total_refused = 0usize;

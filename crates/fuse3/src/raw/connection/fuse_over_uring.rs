@@ -1323,6 +1323,16 @@ static TRANSPORT_PAYLOAD_LEASES: AtomicU64 = AtomicU64::new(0);
 // session claims exactly one per SQE.
 static TRANSPORT_DEST_DMA_LEASES: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_PARKED_COMMITS: AtomicU64 = AtomicU64::new(0);
+// The park LEDGER's other half: parked commits that later passed the gate
+// (`try_unpark` re-proved refs == 0) and had their full reply applied +
+// committed. `parked ≡ unparked` at quiesce is the §5.4 re-arm gate's
+// closure law — a stranded park (a lease drop that owed a wake, or a
+// parked scan that never ran) leaves the reply undelivered forever and
+// can never be counted here, so the gap IS the wedge count. The
+// shutdown drain's header-only fallback (lease still live at teardown)
+// deliberately does NOT count: that is the genuine §5.4 escape, and it
+// must remain visible as an unclosed ledger.
+static TRANSPORT_UNPARKED_COMMITS: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_LEASES_OUTSTANDING: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_LEASE_MAX_AGE_MS: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_LEASE_OVERLONG: AtomicU64 = AtomicU64::new(0);
@@ -1487,20 +1497,24 @@ pub fn over_uring_stats() -> (u64, u64, u64, u64) {
 }
 
 /// Transport payload-lease counters (§5.4): `(payload_leases,
-/// parked_commits, leases_outstanding, lease_max_age_ms, lease_overlong,
-/// dest_dma_leases)`.
+/// parked_commits, unparked_commits, leases_outstanding,
+/// lease_max_age_ms, lease_overlong, dest_dma_leases)`.
 /// `payload_leases` proves adoption (FUSE_WRITE rides leases, not copies);
 /// `parked_commits` ≫ 0 means handlers hold payloads past their reply or
-/// Q_DEPTH is too small; `leases_outstanding` returns to 0 at quiesce;
+/// Q_DEPTH is too small, and `parked_commits − unparked_commits` at
+/// quiesce is the re-arm gate's WEDGE count (parks that never resolved —
+/// the invariant is closure, not absence: parking is the gate working);
+/// `leases_outstanding` returns to 0 at quiesce;
 /// `lease_max_age_ms` is the severance-boundary high-water mark (bounded by
 /// one handler invocation); `lease_overlong` counts ≥ 1 s lifetimes — the
 /// loud-never-fatal §5.4 tripwire (see `EntPayloadLease::drop`);
 /// `dest_dma_leases` counts MEM-1 read-destination owner-token claims
 /// (≈ one per dest-bearing device-read SQE on an armed session).
-pub fn transport_lease_stats() -> (u64, u64, u64, u64, u64, u64) {
+pub fn transport_lease_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
     (
         TRANSPORT_PAYLOAD_LEASES.load(Ordering::Relaxed),
         TRANSPORT_PARKED_COMMITS.load(Ordering::Relaxed),
+        TRANSPORT_UNPARKED_COMMITS.load(Ordering::Relaxed),
         TRANSPORT_LEASES_OUTSTANDING.load(Ordering::Relaxed),
         TRANSPORT_LEASE_MAX_AGE_MS.load(Ordering::Relaxed),
         TRANSPORT_LEASE_OVERLONG.load(Ordering::Relaxed),
@@ -3225,6 +3239,7 @@ fn queue_worker(
                     "[XPORT] commit-unparked qid={qid} ent={idx} cid={}",
                     msg.commit_id
                 );
+                TRANSPORT_UNPARKED_COMMITS.fetch_add(1, Ordering::Relaxed);
                 apply_reply(&mut ents[idx], &msg.header, &msg.reply_body);
                 batch.note_commit_opcode(ents[idx].last_opcode);
                 submit_commit(
@@ -3773,9 +3788,16 @@ fn queue_worker(
     // shutdown degrades to a leaked buffer and a dropped reply body — never
     // a dangling pointer, and never a write into memory a live &[u8]
     // aliases.
-    let mut final_msgs: Vec<CommitMsg> = parked_msgs.iter_mut().filter_map(|s| s.take()).collect();
+    // `was_parked` carries the ledger provenance into the drain: only a
+    // message that PARKED can close its park here (a message pulled off
+    // `commit_rx` was never parked, and the header-only fallback below is
+    // the unresolved case by construction).
+    let mut final_msgs: Vec<(CommitMsg, bool)> = parked_msgs
+        .iter_mut()
+        .filter_map(|s| s.take().map(|m| (m, true)))
+        .collect();
     while let Ok(msg) = commit_rx.try_recv() {
-        final_msgs.push(msg);
+        final_msgs.push((msg, false));
     }
     xport_dbg!(
         "[XPORT] worker-exit qid={qid} final_msgs={} active={}",
@@ -3783,7 +3805,7 @@ fn queue_worker(
         pool.active.load(Ordering::Relaxed)
     );
     let mut final_commits = 0;
-    for msg in final_msgs {
+    for (msg, was_parked) in final_msgs {
         let idx = msg.ent_idx as usize;
         if idx >= ents.len() {
             continue;
@@ -3795,6 +3817,9 @@ fn queue_worker(
             free = lease_states[idx].try_unpark();
         }
         if free {
+            if was_parked {
+                TRANSPORT_UNPARKED_COMMITS.fetch_add(1, Ordering::Relaxed);
+            }
             apply_reply(&mut ents[idx], &msg.header, &msg.reply_body);
         } else {
             warn!(

@@ -5686,11 +5686,11 @@ impl SqueezefsFilesystem {
         // (outstanding hovers at in-flight write count and returns to 0 at
         // quiesce; max age is bounded by one handler invocation).
         #[cfg(target_os = "linux")]
-        let (t_leases, t_parked, t_outstanding, t_max_age, t_overlong, t_dest_dma) =
+        let (t_leases, t_parked, t_unparked, t_outstanding, t_max_age, t_overlong, t_dest_dma) =
             fuse3::transport_lease_stats();
         #[cfg(not(target_os = "linux"))]
-        let (t_leases, t_parked, t_outstanding, t_max_age, t_overlong, t_dest_dma) =
-            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let (t_leases, t_parked, t_unparked, t_outstanding, t_max_age, t_overlong, t_dest_dma) =
+            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         // Post-arm classical sideband deliveries (kernel-mandated FORGET/
         // INTERRUPT/resend traffic + fiq->ops switchover stragglers). Must
         // move under unlink storms; a permanent zero here while forgets flow
@@ -6290,6 +6290,13 @@ impl SqueezefsFilesystem {
                 "fuse_over_uring_registers": fou_reg,
                 "transport_payload_leases": t_leases,
                 "transport_parked_commits": t_parked,
+                // The park ledger's closure half (§5.4 re-arm gate):
+                // `parked − unparked` at quiesce is the WEDGE count —
+                // parking itself is the gate working (a COMMIT that
+                // arrived while the payload lease still held a
+                // reference), so absence is not the invariant, closure
+                // is. Pinned by `tests/multi_queue_tests.rs` storm leg.
+                "transport_unparked_commits": t_unparked,
                 "transport_leases_outstanding": t_outstanding,
                 "transport_lease_max_age_ms": t_max_age,
                 "transport_lease_overlong": t_overlong,

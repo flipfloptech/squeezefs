@@ -710,8 +710,15 @@ mod storm {
         // benign race is won. The storm is quiesced at this point: every
         // write's reply reached the kernel (that is what let `write(2)`
         // return), so a park still open here is one that never resolved.
+        // Engagement, on the record: the next flake hunt should see how
+        // often the race parked rather than re-derive it.
+        eprintln!(
+            "[storm] payload leases={leases} parked={parked} unparked={unparked} \
+             max_age_ms={max_age}"
+        );
         assert_eq!(
-            parked, unparked,
+            parked,
+            unparked,
             "{} parked commit(s) never un-parked: the §5.4 re-arm gate wedged \
              (a lease drop that owes a wake, or a parked scan that never ran) — \
              leases={leases}, outstanding={outstanding}",

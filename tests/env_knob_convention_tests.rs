@@ -177,6 +177,27 @@ fn no_value_bearing_knob_is_a_prefix_of_another() {
     }
 }
 
+/// **Every registry name appears exactly once.** This is a merge-hygiene pin,
+/// not a style rule: two `k(...)` rows for one name compile, pass every other
+/// assertion in this file, and then disagree — the tree carried a duplicate
+/// `SQUEEZEFS_MULTI_WRITER` whose second row still documented "incompat bit 10"
+/// after that bit had been renumbered to 11, so `--help`-grade documentation
+/// and the refusal text depended on which row a reader reached first. It came
+/// from a hand-resolved conflict during the parallel DLM merges, which is
+/// exactly the situation this assertion exists to make loud.
+#[test]
+fn every_registry_name_is_unique() {
+    let mut seen: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for k in env_knobs::KNOBS.iter() {
+        *seen.entry(k.key).or_insert(0) += 1;
+    }
+    let dupes: Vec<(&&str, &usize)> = seen.iter().filter(|(_, n)| **n > 1).collect();
+    assert!(
+        dupes.is_empty(),
+        "these knob names are registered more than once — one name, one row: {dupes:?}"
+    );
+}
+
 /// The retired spellings refuse loudly and name their successor — the
 /// `format --meta-slots` precedent, never a silent alias.
 #[test]

@@ -5665,6 +5665,99 @@ mod dispatch_bounds_tests {
     }
 }
 
+/// FUSE-3g — a delivery's body is bounded by the bytes the transport
+/// actually FILLED, never by what `in_header.len` claims. Two distinct
+/// defects live in the historical `in_header.len as usize -
+/// FUSE_IN_HEADER_SIZE`:
+///
+/// 1. `len < 40` UNDERFLOWS (release build), producing a ~2^64 length and
+///    an immediate slice panic on the DISPATCH task — every in-flight
+///    request on the session loses its reply (the FUSE-2 blast radius).
+/// 2. `len > 40 + filled` hands the handler a slice whose tail is the
+///    PREVIOUS request's bytes: the session data buffer is reused across
+///    the whole dispatch loop, so the "body" of a clamped delivery is
+///    stale data presented as this request's own.
+#[cfg(test)]
+mod delivery_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn a_header_shorter_than_the_in_header_never_underflows() {
+        for len in 0..FUSE_IN_HEADER_SIZE as u32 {
+            assert_eq!(
+                validated_body(len, 4096, 0, 4096),
+                BodyBounds::ShortHeader,
+                "in_header.len {len} is below the header itself: refuse, never subtract"
+            );
+        }
+        assert_eq!(
+            validated_body(FUSE_IN_HEADER_SIZE as u32, 4096, 0, 4096),
+            BodyBounds::Valid(0),
+            "a header-only request has an EMPTY body, not a refusal"
+        );
+    }
+
+    #[test]
+    fn an_overdeclared_body_is_refused_not_clamped_over_stale_bytes() {
+        // The clamped-delivery shape: the kernel/transport filled 8 body
+        // bytes, the header claims 100. The historical code sliced 100.
+        assert_eq!(
+            validated_body(FUSE_IN_HEADER_SIZE as u32 + 100, 8, 0, 4096),
+            BodyBounds::Overdeclared {
+                declared: 100,
+                available: 8,
+            },
+            "a header claiming more body than was filled must be refused"
+        );
+        // Exactly-filled is the ordinary case.
+        assert_eq!(
+            validated_body(FUSE_IN_HEADER_SIZE as u32 + 100, 100, 0, 4096),
+            BodyBounds::Valid(100)
+        );
+    }
+
+    #[test]
+    fn the_write_lease_body_rides_the_payload_and_bounds_the_data_slice() {
+        // §5.4 zero-copy FUSE_WRITE: `in_header.len` counts the whole 1 MiB
+        // payload, the data buffer holds ONLY the fuse_write_in arg, and the
+        // body itself rides the payload lease. Available must count the
+        // payload (else every large write is refused) while the returned
+        // SLICE stays bounded by what was filled (else the handler reads
+        // past it).
+        const MIB: usize = 1024 * 1024;
+        assert_eq!(
+            validated_body(
+                (FUSE_IN_HEADER_SIZE + FUSE_WRITE_IN_SIZE + MIB) as u32,
+                FUSE_WRITE_IN_SIZE,
+                MIB,
+                4096,
+            ),
+            BodyBounds::Valid(FUSE_WRITE_IN_SIZE),
+            "the write arg is the whole data-buffer body; the payload is separate"
+        );
+        // A write whose payload is SHORTER than the header claims is still
+        // a refusal (handle_write's own size check is the second gate).
+        assert!(matches!(
+            validated_body(
+                (FUSE_IN_HEADER_SIZE + FUSE_WRITE_IN_SIZE + MIB) as u32,
+                FUSE_WRITE_IN_SIZE,
+                MIB - 1,
+                4096,
+            ),
+            BodyBounds::Overdeclared { .. }
+        ));
+    }
+
+    #[test]
+    fn the_data_buffer_capacity_is_the_last_bound() {
+        assert_eq!(
+            validated_body(FUSE_IN_HEADER_SIZE as u32 + 4096, 4096, 0, 512),
+            BodyBounds::Valid(512),
+            "the slice can never exceed the buffer it comes from"
+        );
+    }
+}
+
 #[cfg(test)]
 mod init_negotiation_tests {
     use super::*;

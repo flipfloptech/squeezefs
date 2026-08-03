@@ -562,6 +562,45 @@ fn bench_layout_publish(c: &mut Criterion) {
         b.iter(|| black_box(LayoutDelta::decode(black_box(&delta_bytes)).expect("decode")));
     });
 
+    // **Spec §6.2 item 9 — the versioned wire's encode-path delta**
+    // (written UNDER ruling D11: authored with prediction +
+    // falsification, NOT run — no number below is measured).
+    //
+    // Field shape: the same 64-insert publish-batch delta as above (the
+    // `SQUEEZEFS_PUBLISH_COALESCE_MAX` default window, the
+    // write-commit-economy shape), stamped with an era-composed
+    // `(base_version, version)` pair exactly as the routing publish
+    // pass mints it on a `KV_LAYOUT_VERSIONS` volume.
+    //
+    // PREDICTION: `delta_encode_64_entries_versioned` runs within noise
+    // of `delta_encode_64_entries` (+16 B of payload, two
+    // `extend_from_slice` of u64s and one flag OR against a ~4.3 KiB
+    // encode — sub-1 % of the walk); `delta_version_peek` is O(1)
+    // fixed-offset loads, orders of magnitude under
+    // `delta_decode_64_entries` (it must NOT scale with the record).
+    //
+    // FALSIFICATION: a >5 % regression on the UNVERSIONED encode (the
+    // un-stamped-volume wire must be untouched — it is the shipped hot
+    // path), a versioned encode past ~+10 ns/op over unversioned, or a
+    // peek within an order of magnitude of the full decode — any of
+    // those means the wire grew a hidden cost and the item-9 encode
+    // needs re-work before a perf-PR merge (the bench-baseline tier is
+    // where the numbers get measured, never here).
+    let mut versioned = delta.clone();
+    versioned.set_versions(0x0000_0100_0000_2A01, 0x0000_0100_0000_2A02);
+    let versioned_bytes = versioned.encode();
+    group.throughput(Throughput::Bytes(versioned_bytes.len() as u64));
+    group.bench_function("delta_encode_64_entries_versioned", |b| {
+        b.iter(|| black_box(versioned.encode()));
+    });
+    group.bench_function("delta_version_peek", |b| {
+        b.iter(|| {
+            black_box(squeezefs::layout_wire::layout_delta_versions(black_box(
+                &versioned_bytes,
+            )))
+        });
+    });
+
     // The fold side: delta onto the 1,024-block base (decode base +
     // 64 inserts + canonical re-encode) — replay / read-fold price.
     group.throughput(Throughput::Bytes(base_bytes.len() as u64));

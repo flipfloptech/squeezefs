@@ -706,6 +706,13 @@ fn mint_tx_id(coordinator: &KvMetaBackend) -> u64 {
 }
 
 /// Localise `step` for the volume that homes it.
+///
+/// Routing here (rather than at plan time) is deliberate twice over: the
+/// live path's routes are pinned for the operation's duration by the
+/// §5.5.2a cutover gate the operation entered before it took a lock, so
+/// re-deriving them is free and cannot disagree; and the RECOVERY path
+/// gets slot-migration tolerance for nothing — an intent written before a
+/// slot moved resolves to the slot's new home.
 fn localise(routed: &RoutedMetaBackend, step: &XvStep) -> (usize, XvLocalStep) {
     match step {
         XvStep::RemoveDentry {
@@ -883,19 +890,29 @@ pub async fn execute(
         if i == 0 {
             // Cross-DEVICE ordering: the intent must be durable before any
             // later participant's entry is submitted, or a power cut could
-            // keep a later effect and lose the intent that explains it.
-            barrier(routed, *v_idx).await?;
+            // keep a later effect and lose the intent that explains it. A
+            // barrier that FAILS leaves exactly the durable-but-incomplete
+            // shape a mid-plan step failure leaves, so it escalates the
+            // same way.
+            if let Err(e) = barrier(routed, *v_idx).await {
+                escalate_midplan(routed, &localised, tx_id, i, &e);
+                return Err(e);
+            }
         }
     }
 
     // Every participant durable BEFORE the retirement: otherwise a power
     // cut could keep the retirement and lose a step.
-    let mut retired_after: Vec<usize> = localised.iter().skip(1).map(|(v, _)| *v).collect();
-    retired_after.sort_unstable();
-    retired_after.dedup();
-    for v in retired_after {
-        if v != coord {
-            barrier(routed, v).await?;
+    let mut participants: Vec<usize> = localised.iter().skip(1).map(|(v, _)| *v).collect();
+    participants.sort_unstable();
+    participants.dedup();
+    for v in participants {
+        if v == coord {
+            continue;
+        }
+        if let Err(e) = barrier(routed, v).await {
+            escalate_midplan(routed, &localised, tx_id, localised.len(), &e);
+            return Err(e);
         }
     }
     if allowed <= localised.len() {
@@ -905,18 +922,11 @@ pub async fn execute(
     // intent that outlived its transaction could meet a later, legitimate
     // mutation of the same objects, and recovery's witnesses assume no
     // such interleaving exists (§4.10a).
-    let out = routed.volumes[coord].xv_retire_intent(tx_id, guards).await;
-    if out.is_err() {
+    if let Err(e) = routed.volumes[coord].xv_retire_intent(tx_id, guards).await {
         routed.mirror_volume_failure(coord);
-        escalate_midplan(
-            routed,
-            &localised,
-            tx_id,
-            localised.len(),
-            out.as_ref().err().unwrap(),
-        );
+        escalate_midplan(routed, &localised, tx_id, localised.len(), &e);
+        return Err(e);
     }
-    out?;
     XV_TX_COMPLETED.fetch_add(1, Ordering::Relaxed);
     Ok(XvExecution { tx_id, outcomes })
 }

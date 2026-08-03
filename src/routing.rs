@@ -2509,7 +2509,7 @@ impl BackendRouter {
             |alloc: &std::sync::Arc<crate::block_allocator::BlockAllocator>| -> Result<()> {
                 alloc.engage_alloc_lanes(part)?;
                 if alloc.lane_partition().is_some() {
-                    alloc.set_lane_reserve_sink(crate::data_alloc_lane::kv_reserve_sink(
+                    alloc.set_lane_reserve_sink(crate::data_alloc_lane::routed_reserve_sink(
                         std::sync::Arc::clone(&meta),
                         alloc.volume_id(),
                         part.writers(),
@@ -2524,6 +2524,19 @@ impl BackendRouter {
         Ok(())
     }
 
+    /// Every allocator this router owns — the default one plus one per data
+    /// volume. The list the allocation-partition paths iterate
+    /// ([`Self::recover_alloc_lane_floors`],
+    /// [`crate::alloc_lane_grant::engage_co_writer_lanes`] and its authority
+    /// twin, and the dense-frontier source a served lane OPEN reads).
+    pub fn lane_allocators(&self) -> Vec<std::sync::Arc<crate::block_allocator::BlockAllocator>> {
+        let mut allocs = vec![std::sync::Arc::clone(&self.default_allocator)];
+        for be in self.backends.iter() {
+            allocs.push(std::sync::Arc::clone(&be.value().block_allocator));
+        }
+        allocs
+    }
+
     /// DLM **S9** blocker #3: raise every partitioned allocator's mint floor
     /// from its volume's durable lane reservations
     /// ([`crate::data_alloc_lane::recover_lane_floor`]).
@@ -2536,12 +2549,7 @@ impl BackendRouter {
         &self,
         routed: &crate::meta_backend::RoutedMetaBackend,
     ) -> Result<()> {
-        let mut allocs: Vec<std::sync::Arc<crate::block_allocator::BlockAllocator>> =
-            vec![std::sync::Arc::clone(&self.default_allocator)];
-        for be in self.backends.iter() {
-            allocs.push(std::sync::Arc::clone(&be.value().block_allocator));
-        }
-        for alloc in allocs {
+        for alloc in self.lane_allocators() {
             let Some(part) = alloc.lane_partition() else {
                 continue;
             };

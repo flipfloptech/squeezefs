@@ -812,6 +812,11 @@ async fn the_mount_arm_refuses_a_non_pr_substrate() {
         false,
         tokio::runtime::Handle::current(),
         None,
+        // DLM S9 blocker #3's admission: no data-plane router, which is
+        // admissible only because this arm refuses before it would need one
+        // (and refuses LOUDLY if a claim set ever enrolls co-writers without
+        // one — `tests/mw_cowriter_lane_tests.rs`).
+        None,
     )
     .await
     .expect_err("multi-writer must refuse a detection-grade substrate");
@@ -861,6 +866,7 @@ async fn the_mount_arm_refuses_an_unstamped_format_naming_the_bit() {
         std::slice::from_ref(&data),
         false,
         tokio::runtime::Handle::current(),
+        None,
         None,
     )
     .await

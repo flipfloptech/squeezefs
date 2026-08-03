@@ -5282,6 +5282,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 reader_mount,
                 tokio::runtime::Handle::current(),
                 Some(mw_quarantine),
+                // DLM S9 blocker #3's admission: the authority engages its OWN
+                // allocation lane (lane 0 of the era's width) on these
+                // allocators, and serves every co-writer's lane OPEN from
+                // their live cursors. An arm that enrolls co-writers without
+                // it refuses, rather than minting dense offsets across their
+                // residue classes.
+                Some(&fs_engine.router.backend_router),
             )
             .await
             .map_err(|e| format!("multi-writer refused to arm: {e}"))?;

@@ -105,7 +105,13 @@ use std::time::{Duration, Instant};
 /// The custody vocabulary's schema. Independent of the transport's
 /// (`CLUSTER_WIRE_SCHEMA`) and of S8's metadata vocabulary: a mismatch is
 /// refused loud, because a custody-bearing protocol has no safe guess.
-pub const CUSTODY_SCHEMA: u32 = 1;
+///
+/// **2 since the lease began carrying the co-writer's allocation lane**
+/// ([`LeaseFrame::writer_lane`]). A peer that speaks 1 would adopt a lease
+/// with no lane and then either refuse every allocation or — far worse —
+/// mint DENSE offsets across every peer's residue class, so the mismatch
+/// must be a loud refusal at the join rather than a field with a default.
+pub const CUSTODY_SCHEMA: u32 = 2;
 
 /// First verb of S9's block. S3 reserved 0 for its ping, S8's metadata
 /// vocabulary took 16/17, S6's membership owns `0x0100..=0x01FF`; custody
@@ -174,6 +180,23 @@ pub struct LeaseFrame {
     /// The authority's monotonic instant of the grant — diagnostics only.
     /// A member NEVER anchors on a foreign clock (S6's law).
     pub granted_at_owner_ms: u64,
+    /// **This member's data-plane allocation lane** (DLM S9 blocker #3's
+    /// admission — `docs/design-mw-data-alloc-partition.md` §9 item 1): the
+    /// residue class `writer_lane` of [`Self::writers`] that this mount, and
+    /// only this mount, may mint fresh block indices from.
+    ///
+    /// Minted by the AUTHORITY from the durable claim set
+    /// ([`crate::alloc_lane_grant::LaneAssignment`]) — never chosen, guessed
+    /// or configured by the joining node, because two co-writers choosing
+    /// their own lanes is exactly the collision the partition exists to
+    /// prevent. `(0, 1)` means SOLO, i.e. *no partition at all*, which is
+    /// what every authority with no enrolled co-writer answers and what
+    /// keeps single-writer allocation byte-identical.
+    pub writer_lane: u16,
+    /// The partition width every member of this era agrees on. It changes
+    /// only when the authority re-arms (a new era), because a live writer's
+    /// residue class cannot be redefined under offsets it has already minted.
+    pub writers: u16,
 }
 
 impl LeaseFrame {
@@ -656,6 +679,12 @@ pub struct WriteCustodyOwner {
     /// homing gate would bounce it off the client path it is serving (the
     /// `meta_ship::owner_authority_token` precedent).
     arbiter: LocalLockManager,
+    /// DLM **S9** blocker #3's admission: the data-plane allocation lane map
+    /// this era runs under ([`crate::alloc_lane_grant::LaneAssignment`],
+    /// derived from the durable claim set by the multi-writer arm). `None`
+    /// on an authority with no enrolled co-writer — and then every lease
+    /// says SOLO, which installs no partition anywhere.
+    lanes: ArcSwapOption<crate::alloc_lane_grant::LaneAssignment>,
     clients: scc::HashMap<String, ClientLease>,
     grants: scc::HashMap<u64, GrantState>,
     next_epoch: AtomicU64,
@@ -751,6 +780,7 @@ impl WriteCustodyOwner {
             clocks,
             clock,
             arbiter: LocalLockManager::new()?,
+            lanes: ArcSwapOption::empty(),
             clients: scc::HashMap::new(),
             grants: scc::HashMap::new(),
             next_epoch: AtomicU64::new(1),
@@ -826,7 +856,50 @@ impl WriteCustodyOwner {
         }
     }
 
-    fn lease_frame(&self, epoch: u64, now: u64) -> LeaseFrame {
+    // -----------------------------------------------------------------
+    // DLM S9 blocker #3 — the allocation-lane assignment this era runs
+    // under (docs/design-mw-data-alloc-partition.md §3; the map itself is
+    // `crate::alloc_lane_grant::LaneAssignment`).
+    // -----------------------------------------------------------------
+
+    /// Install the era's lane map — the multi-writer arm's act, from the
+    /// DURABLE claim set, before the listener admits its first join.
+    ///
+    /// A store rather than a once-cell on purpose: an authority installs one
+    /// map per era, and a *changed* map is a fault its clients must observe
+    /// (they self-fence at their next renewal rather than adopting a lane
+    /// their already-minted offsets do not belong to).
+    pub fn install_lane_assignment(&self, map: Arc<crate::alloc_lane_grant::LaneAssignment>) {
+        log::warn!(
+            "S9: custody authority '{}' runs era {} with a {}-way data-plane allocation \
+             partition ({} enrolled co-writer lane(s); this node is lane 0). Every member's lane \
+             travels on its lease — no knob can put two writers in one residue class",
+            self.id,
+            self.term,
+            map.writers(),
+            map.writers().saturating_sub(1),
+        );
+        self.lanes.store(Some(map));
+    }
+
+    /// The era's lane map (`None` = solo: no partition anywhere).
+    pub fn lane_assignment(&self) -> Option<Arc<crate::alloc_lane_grant::LaneAssignment>> {
+        self.lanes.load_full()
+    }
+
+    /// The `(lane, writers)` pair `client` was assigned — `(0, 1)` (SOLO)
+    /// when this authority runs no partition, and `None` when it runs one
+    /// that does not name this client (the roster-growth rule: a member
+    /// enrolled after the arm has no lane in this era).
+    fn lane_for(&self, client: &str) -> Option<(u16, u16)> {
+        match self.lane_assignment() {
+            None => Some((0, 1)),
+            Some(map) => map.lane_of(client).map(|lane| (lane, map.writers())),
+        }
+    }
+
+    fn lease_frame(&self, client: &str, epoch: u64, now: u64) -> LeaseFrame {
+        let (writer_lane, writers) = self.lane_for(client).unwrap_or((0, 1));
         LeaseFrame {
             schema: CUSTODY_SCHEMA,
             epoch,
@@ -837,6 +910,54 @@ impl WriteCustodyOwner {
             d_purge_ms: self.clocks.d_purge.as_millis() as u64,
             renew_ms: self.clocks.renew_interval.as_millis() as u64,
             granted_at_owner_ms: now,
+            writer_lane,
+            writers,
+        }
+    }
+
+    /// **Validate a reservation raise** a peer shipped (S9's allocation-lane
+    /// seam, served in [`crate::meta_ship::publish`]): the presented lease
+    /// must be this client's current custody, and the lane it names must be
+    /// the lane THIS authority assigned it, at this era's width.
+    ///
+    /// That is what makes a co-writer's lane unforgeable in the only way that
+    /// matters here: the durable record is written by the authority, its
+    /// content is checked against a map derived from a record only the
+    /// authority can write, and the client's claim on a lane is backed by a
+    /// lease epoch the authority minted and handed to nobody else.
+    ///
+    /// `Err(reason)` is the operator-facing refusal text.
+    pub fn check_lane_raise(
+        &self,
+        client: &str,
+        lease_epoch: u64,
+        lane: u16,
+        writers: u16,
+    ) -> std::result::Result<(), String> {
+        if !self.lease_current(client, lease_epoch) {
+            return Err(format!(
+                "S9: refusing an allocation-lane raise from '{client}': lease epoch \
+                 {lease_epoch} is not custody on authority '{}' (revoked, swept past its TTL, or \
+                 minted by a previous authority). It must self-fence and re-join — a raise under \
+                 a dead lease would durably move a frontier for a lane this node may no longer \
+                 hold",
+                self.id
+            ));
+        }
+        match self.lane_for(client) {
+            Some((assigned, width)) if assigned == lane && width == writers => Ok(()),
+            Some((assigned, width)) => Err(format!(
+                "S9: refusing an allocation-lane raise from '{client}' for lane {lane} of \
+                 {writers}: this authority assigned it lane {assigned} of {width}. A writer may \
+                 only ever declare a frontier for its OWN residue class — declaring a peer's \
+                 would let two mounts hand out one device offset, which is the collision the \
+                 partition exists to prevent"
+            )),
+            None => Err(format!(
+                "S9: refusing an allocation-lane raise from '{client}': this era's allocation \
+                 partition does not name it, so it holds no lane. Enrollment after an arm does \
+                 not widen a live partition — re-arm the authority (a new era) to admit it"
+            )),
         }
     }
 
@@ -846,6 +967,27 @@ impl WriteCustodyOwner {
             return Err(SqueezefsError::InvalidOperation(
                 "S9: a co-writer must present a non-empty identity".into(),
             ));
+        }
+        // DLM S9 blocker #3: a member this era's allocation partition does not
+        // name has no lane, and a co-writer with no lane can place no fresh
+        // block. Refusing at the JOIN is what makes the roster-growth rule
+        // honest: enrollment after an arm does not widen a live partition,
+        // because every live writer's residue class is fixed for the era —
+        // widening it under them would put two mounts in overlapping classes
+        // (at `W = 2` lane 1 mints `b % 2 == 1`; a node that later read
+        // `W = 3` would mint `b % 3 == 2`, and index 5 is in both).
+        if self.lane_for(&req.client).is_none() {
+            let map = self.lane_assignment();
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "S9: authority '{}' refuses the join of '{}': this era's {}-way data-plane \
+                 allocation partition does not name it, so there is no allocation LANE to grant \
+                 — and a co-writer without a lane cannot place a fresh block anywhere. A \
+                 partition width changes only at an authority RE-ARM (a new era), never under \
+                 live writers: add this node to SQUEEZEFS_MW_MEMBERS and re-arm the authority",
+                self.id,
+                req.client,
+                map.map(|m| m.writers()).unwrap_or(1),
+            )));
         }
         let now = self.clock.now_ms();
         let epoch = self.next_epoch.fetch_add(1, Ordering::AcqRel);
@@ -883,7 +1025,7 @@ impl WriteCustodyOwner {
             crate::dlm::compose_token(self.term, epoch),
             req.pr_key
         );
-        Ok(self.lease_frame(epoch, now))
+        Ok(self.lease_frame(&req.client, epoch, now))
     }
 
     /// Is `client`'s presented lease epoch its current custody?
@@ -1024,7 +1166,7 @@ impl WriteCustodyOwner {
         self.renewals.fetch_add(1, Ordering::Relaxed);
         Ok(RenewReplyFrame {
             schema: CUSTODY_SCHEMA,
-            lease: self.lease_frame(lease_epoch, now),
+            lease: self.lease_frame(client, lease_epoch, now),
             dead_grants,
         })
     }
@@ -1621,6 +1763,11 @@ pub struct WriteCustodyClient {
     /// process data custody) have exactly one implementation.
     lease: arc_swap::ArcSwap<MemberSession>,
     lease_epoch: AtomicU64,
+    /// DLM **S9** blocker #3: the data-plane allocation lane the authority
+    /// granted on the lease, packed `writers << 16 | lane`. `0` is SOLO —
+    /// i.e. no partition, which is what an authority with no enrolled
+    /// co-writer answers.
+    lane: std::sync::atomic::AtomicU32,
     grants: scc::HashMap<u64, Arc<ClientGrant>>,
     pending_releases: Arc<parking_lot::Mutex<Vec<u64>>>,
     inflight: parking_lot::Mutex<Vec<u64>>,
@@ -1685,6 +1832,7 @@ impl WriteCustodyClient {
             session: tokio::sync::Mutex::new(Some(session)),
             lease: arc_swap::ArcSwap::from_pointee(member),
             lease_epoch: AtomicU64::new(lease.epoch),
+            lane: std::sync::atomic::AtomicU32::new(pack_lane(lease.writer_lane, lease.writers)),
             grants: scc::HashMap::new(),
             pending_releases: Arc::new(parking_lot::Mutex::new(Vec::new())),
             inflight: parking_lot::Mutex::new(Vec::new()),
@@ -1709,6 +1857,24 @@ impl WriteCustodyClient {
     /// This co-writer's identity.
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// The lease epoch this client holds — its proof, on every verb that
+    /// needs one, that the authority granted it what it is presenting.
+    pub fn lease_epoch(&self) -> u64 {
+        self.lease_epoch.load(Ordering::Acquire)
+    }
+
+    /// **The data-plane allocation lane the authority granted** (DLM S9
+    /// blocker #3): the residue class this mount, and only this mount, may
+    /// mint fresh block indices from.
+    ///
+    /// [`AppendPartition::SOLO`] when the authority runs no partition, and
+    /// then nothing engages — a co-writer's allocation stays refused exactly
+    /// as it was before this seam closed, which is the honest answer for a
+    /// single-writer authority that has enrolled nobody.
+    pub fn lane_partition(&self) -> crate::meta_backend::kv::journal::AppendPartition {
+        unpack_lane(self.lane.load(Ordering::Acquire))
     }
 
     /// The authority it holds custody from.
@@ -1854,6 +2020,31 @@ impl WriteCustodyClient {
             });
         }
         let r: RenewReplyFrame = decode(&reply.body, "renew reply")?;
+        // DLM S9 blocker #3 — **the lane is stable across a renewal, or this
+        // mount fail-stops.** A renewal is a heartbeat, not a re-assignment:
+        // the offsets we have already minted belong to the lane we were
+        // granted, so adopting a different residue class would start handing
+        // out indices a PEER owns. There is no safe way to continue, and the
+        // house answer to "custody may have moved" is the stricter client
+        // clock's — poison our own custody first, before anything can land.
+        let held = self.lane.load(Ordering::Acquire);
+        let answered = pack_lane(r.lease.writer_lane, r.lease.writers);
+        if answered != held {
+            let detail = format!(
+                "the authority at {} answered a renewal naming allocation lane {} of {}, but \
+                 this mount holds lane {} of {} and has minted in it — a live writer's residue \
+                 class cannot be redefined under it (a width change is a new authority ERA, \
+                 which this mount must re-join to observe)",
+                self.endpoint,
+                r.lease.writer_lane,
+                r.lease.writers,
+                held & 0xffff,
+                held >> 16,
+            );
+            log::error!("S9: {detail}");
+            self.self_fence(&detail);
+            return Err(SqueezefsError::LockFailed { reason: detail });
+        }
         self.lease
             .load()
             .renewed(&r.lease.to_membership_grant(), anchor);
@@ -2010,6 +2201,28 @@ impl WriteCustodyClient {
 }
 
 // ---------------------------------------------------------------------------
+// The allocation-lane pair on the wire (DLM S9 blocker #3): packed
+// `writers << 16 | lane`, with `0` reading as SOLO so an unassigned lease and
+// a solo authority are the same, single, no-partition answer.
+// ---------------------------------------------------------------------------
+
+fn pack_lane(lane: u16, writers: u16) -> u32 {
+    if writers <= 1 {
+        return 0;
+    }
+    (u32::from(writers) << 16) | u32::from(lane)
+}
+
+fn unpack_lane(packed: u32) -> crate::meta_backend::kv::journal::AppendPartition {
+    use crate::meta_backend::kv::journal::AppendPartition;
+    if packed == 0 {
+        return AppendPartition::SOLO;
+    }
+    AppendPartition::new((packed >> 16) as u16, (packed & 0xffff) as u16)
+        .unwrap_or(AppendPartition::SOLO)
+}
+
+// ---------------------------------------------------------------------------
 // The process registry, and S4's foreign-home seam
 // ---------------------------------------------------------------------------
 
@@ -2046,6 +2259,34 @@ pub fn custody_owner() -> Option<Arc<WriteCustodyOwner>> {
 /// The installed co-writer client, if any.
 pub fn custody_client() -> Option<Arc<WriteCustodyClient>> {
     CLIENT.load_full()
+}
+
+/// **Validate a peer's allocation-lane raise** against the installed
+/// authority's assignment — the check S9's publish owner runs before a remote
+/// value reaches a durable record
+/// ([`WriteCustodyOwner::check_lane_raise`]).
+///
+/// With **no authority installed** the raise is refused: a node serving the
+/// publish vocabulary without a custody authority has made no lane
+/// assignment, so it has nothing to check a lane claim against — and
+/// committing an unchecked frontier for an unknown lane is precisely the act
+/// that could let two mounts hand out one device offset.
+pub fn validate_lane_raise(
+    client: &str,
+    lease_epoch: u64,
+    lane: u16,
+    writers: u16,
+) -> std::result::Result<(), String> {
+    let Some(owner) = custody_owner() else {
+        return Err(format!(
+            "S9: refusing an allocation-lane raise from '{client}' for lane {lane} of {writers}: \
+             this node serves the publish vocabulary but has no custody authority armed, so it \
+             made no lane assignment and has nothing to check the claim against. Arm the \
+             multi-writer authority (SQUEEZEFS_MULTI_WRITER=1 + SQUEEZEFS_MW_BIND) — a frontier \
+             committed for an unverified lane could put two mounts in one residue class"
+        ));
+    };
+    owner.check_lane_raise(client, lease_epoch, lane, writers)
 }
 
 /// **S4's foreign-home seam, resolved.**

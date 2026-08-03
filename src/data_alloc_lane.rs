@@ -79,13 +79,17 @@
 //! offset is dominated by the derived floor), which keeps the rewrite hot
 //! path at exactly zero reservation work.
 //!
-//! ## What this module does NOT do
+//! ## Where the lane comes from
 //!
 //! Who may write, and which writer is lane `w` of `W`, is **§6.9 S4/S8/S9's
 //! admission problem** — exactly as `kv::ino_lane` says for inos. This
-//! module makes the partition *expressible and safe*; the lane assignment
-//! arrives from the custody plane (a named residual in the design record's
-//! §7). Nothing in the shipped mount path installs a non-solo partition.
+//! module makes the partition *expressible and safe*; the assignment itself
+//! is [`crate::alloc_lane_grant`]: the authority derives one lane per
+//! enrolled writer from the **durable claim set**, keeps lane 0, and hands
+//! each co-writer its `(lane, writers)` pair on the S9 **custody lease** —
+//! which is why no knob can put two co-writers in one residue class.
+//! Nothing in a single-writer mount path installs a non-solo partition (a
+//! solo assignment IS `SOLO`, and a solo engagement installs nothing).
 
 use crate::error::{Result, SqueezefsError};
 use crate::lane_core;
@@ -120,12 +124,13 @@ static MOUNT_PARTITION: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 
 /// This mount's data-plane allocation partition —
 /// [`AppendPartition::SOLO`] until an admission installs one, which is
-/// **every mount today**.
+/// **every single-writer mount**.
 ///
 /// The installing authority is §6.9 **S9's custody plane**: the lease a
-/// co-writer holds is what says *which* writer of *how many* it is, and
-/// carrying that pair on the lease frame is the named residual in
-/// `docs/design-mw-data-alloc-partition.md` §7. Deliberately a process-wide
+/// co-writer holds is what says *which* writer of *how many* it is
+/// (`LeaseFrame::writer_lane` / `writers`, minted by the authority from the
+/// durable claim set — [`crate::alloc_lane_grant::LaneAssignment`]), and the
+/// installer is [`crate::alloc_lane_grant`]'s engagement. Deliberately a process-wide
 /// word rather than a per-volume one: a mount is one writer of the SET, and
 /// two volumes disagreeing about which lane this mount owns is precisely the
 /// state where two allocators would mint into a peer's residue class.
@@ -488,10 +493,30 @@ pub type LaneReserveSink = Arc<
         + Sync,
 >;
 
-/// The production sink: one `setxattr` on ino 1 per raise, which is one
-/// whole-tx-atomic, checksummed, torn-immune commit through the M7
-/// conveyor (KD-2's plane — the `job:` record precedent).
-pub fn kv_reserve_sink(
+/// The production sink: one **routed** raise per grain, which on a mount
+/// that holds metadata authority is one `setxattr` on ino 1 — a
+/// whole-tx-atomic, checksummed, torn-immune commit through the M7 conveyor
+/// (KD-2's plane, the `job:` record precedent) — and on a **co-writer** is
+/// the same commit performed BY THE AUTHORITY, shipped over S9's publish
+/// vocabulary ([`crate::meta_ship::publish::raise_alloc_lane`]).
+///
+/// One sink for both postures, because the routing decision already exists:
+/// a raise names ino 1, and `owner_of(ino 1)` is either nobody (we hold the
+/// authority — today's local commit, unchanged) or the peer that does. A
+/// co-writer cannot commit this record itself by construction (its write
+/// gate refuses every local commit), and it must not be able to: the record
+/// is what stops a successor of its lane from re-minting its unpublished
+/// tail, so its *monotonicity* and its *lane ownership* have to be enforced
+/// by the node that owns the metadata (see `raise_alloc_lane`).
+///
+/// The reply — the durable frontier now in force — is deliberately
+/// **discarded here**: the frontier this mount may mint below is established
+/// once, by the lane OPEN in
+/// [`crate::alloc_lane_grant::engage_allocator_lane`], which is the same
+/// function that wires this sink and runs the open before any mint. Every
+/// later raise asks for a bound strictly above the one it already holds, so
+/// the authority's `max` is our own value and there is nothing to adopt.
+pub fn routed_reserve_sink(
     meta: Arc<crate::meta_backend::RoutedMetaBackend>,
     volume_id: &str,
     writers: u16,
@@ -500,15 +525,156 @@ pub fn kv_reserve_sink(
     Arc::new(move |lane: u16, upto: u64| {
         let meta = Arc::clone(&meta);
         Box::pin(async move {
-            let rec = LaneReservation {
-                writers,
-                lane,
-                reserved_upto: upto,
-            };
-            let name = lane_record_name(vol_tag, lane);
-            crate::meta_backend::Metadata::setxattr(meta.as_ref(), 1, &name, &rec.encode()).await
+            crate::meta_ship::publish::raise_alloc_lane(&meta, vol_tag, lane, writers, upto)
+                .await
+                .map(|_frontier| ())
         })
     })
+}
+
+/// **Commit one lane's reservation raise, monotonically** — the durable half
+/// of the record, and the ONE place it is ever written.
+///
+/// * `requested_upto == 0` is the **OPEN**: a pure query that commits
+///   nothing and answers the frontier this lane must resume at. It is what a
+///   mount that runs no ownership-recovery walk of its own (a co-writer) uses
+///   to learn where the set's live data ends;
+/// * any greater value RAISES the record, and the answer is the frontier now
+///   in force.
+///
+/// `floor` is the minimum a lane with **no record of its own at this width**
+/// may resume at — the recovery rule's answer computed by the node that can
+/// compute it (see [`durable_dense_frontier`] and
+/// [`crate::alloc_lane_grant`]). It is deliberately not consulted when a
+/// same-width record exists: that record already dominates every index its
+/// lane could have minted, and re-flooring against a peer's progress would
+/// drag this lane's frontier forward for nothing.
+///
+/// **The frontier only ever rises.** A caller asking for a lower bound is a
+/// no-op, not an error: lowering a durable frontier is exactly how a
+/// successor would re-mint a live peer's offsets, so no caller — least of
+/// all a remote one — may ask for it.
+pub async fn commit_lane_raise(
+    meta: &crate::meta_backend::RoutedMetaBackend,
+    vol_tag: u64,
+    lane: u16,
+    writers: u16,
+    requested_upto: u64,
+    floor: Option<u64>,
+) -> Result<u64> {
+    if writers == 0 || lane >= writers {
+        let msg = format!(
+            "refusing a lane reservation raise naming lane {lane} of {writers} writers, which is \
+             not a lane"
+        );
+        log::error!("{msg}");
+        return Err(SqueezefsError::InvalidOperation(msg));
+    }
+    let name = lane_record_name(vol_tag, lane);
+    let existing = match crate::meta_backend::Metadata::getxattr(meta, 1, &name).await? {
+        // An undecodable record refuses the raise rather than being
+        // overwritten: a watermark we cannot read is a floor we cannot
+        // honour, and writing over it would erase the evidence.
+        Some(raw) => Some(LaneReservation::decode(&raw)?),
+        None => None,
+    };
+    let base = match &existing {
+        Some(rec) if rec.writers == writers => rec.reserved_upto,
+        // A record at a DIFFERENT width floors every lane (the recovery
+        // rule's clause 3 — under another `W` these indices belonged to
+        // another lane), and the open floor still applies.
+        Some(rec) => rec.reserved_upto.max(floor.unwrap_or(0)),
+        None => floor.unwrap_or(0),
+    };
+    let new = base.max(requested_upto);
+    let already_covered =
+        matches!(&existing, Some(rec) if rec.writers == writers && rec.reserved_upto >= new);
+    if requested_upto == 0 || already_covered || new == 0 {
+        return Ok(new);
+    }
+    let rec = LaneReservation {
+        writers,
+        lane,
+        reserved_upto: new,
+    };
+    crate::meta_backend::Metadata::setxattr(meta, 1, &name, &rec.encode()).await?;
+    Ok(new)
+}
+
+/// The `floor` argument [`commit_lane_raise`] wants, computed by a node that
+/// holds the metadata authority — and **`None` whenever this lane already
+/// carries a same-width record**, which is what keeps the ledger scan below
+/// off the per-grain path (it runs once per lane per era, on the OPEN).
+///
+/// `local_dense` is the caller's own live cursor for the volume (0 when it
+/// has none): the derived dense frontier is the referenced-set complement,
+/// and a mount that has been WRITING knows a fresher one than the ledger
+/// does — an offset it minted and has not published yet is in neither.
+pub async fn lane_open_floor(
+    meta: &crate::meta_backend::RoutedMetaBackend,
+    vol_tag: u64,
+    lane: u16,
+    writers: u16,
+    local_dense: u64,
+) -> Result<Option<u64>> {
+    let part = match AppendPartition::new(writers, lane) {
+        Ok(p) => p,
+        Err(_) => {
+            let msg = format!(
+                "refusing to compute an allocation-lane floor for lane {lane} of {writers} \
+                 writers, which is not a lane"
+            );
+            log::error!("{msg}");
+            return Err(SqueezefsError::InvalidOperation(msg));
+        }
+    };
+    let name = lane_record_name(vol_tag, lane);
+    let records = load_lane_reservations_for_tag(meta, vol_tag).await?;
+    if let Some(raw) = crate::meta_backend::Metadata::getxattr(meta, 1, &name).await? {
+        if LaneReservation::decode(&raw)?.writers == writers {
+            // Its own record dominates every index this lane could have
+            // minted, so nothing cheaper or more conservative exists.
+            return Ok(None);
+        }
+    }
+    let dense = durable_dense_frontier(meta, vol_tag)
+        .await?
+        .max(local_dense);
+    Ok(Some(recover_lane_floor(&records, dense, part)))
+}
+
+/// The **derived dense frontier** for one data volume, from durable state
+/// only: one past the highest block index the set's durable reference ledger
+/// names (`TREE_BLOCK_REFS`, incompat bit 9 — the recovery rule's clause 1).
+///
+/// This is the number a mount that never walks the inode tree cannot compute
+/// for itself, and it is why a co-writer's lane is OPENED by its authority:
+/// with a cursor of 0 a lane alone would have it minting `w, w + W, …` from
+/// the bottom of a device whose low blocks are live.
+///
+/// An **empty** ledger answers `0` rather than refusing, and the reason is
+/// the §6.2 item 1 rule read carefully: an empty population is never
+/// *authoritative*, so the caller composes this with everything else it
+/// knows (the live cursor of the mount that walked, and every `alloc_lane:`
+/// record — [`recover_lane_floor`]). On a genuinely empty volume set 0 is
+/// the true answer.
+pub async fn durable_dense_frontier(
+    meta: &crate::meta_backend::RoutedMetaBackend,
+    vol_tag: u64,
+) -> Result<u64> {
+    let mut frontier = 0u64;
+    for kv in &meta.volumes {
+        let refs = kv.block_ref_scan(vol_tag).await.map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "durable block-reference scan failed on {} while opening an allocation lane: {e}",
+                kv.device_path().display()
+            ))
+        })?;
+        for r in refs {
+            frontier = frontier.max(r.block_idx.saturating_add(1));
+        }
+    }
+    Ok(frontier)
 }
 
 /// Every reservation record this volume carries — the mount-time recovery
@@ -521,7 +687,20 @@ pub async fn load_lane_reservations(
     meta: &crate::meta_backend::RoutedMetaBackend,
     volume_id: &str,
 ) -> Result<Vec<LaneReservation>> {
-    let vol_tag = crate::meta_backend::kv::block_refs::volume_tag(volume_id);
+    load_lane_reservations_for_tag(
+        meta,
+        crate::meta_backend::kv::block_refs::volume_tag(volume_id),
+    )
+    .await
+}
+
+/// [`load_lane_reservations`] by durable volume TAG — the form a node serving
+/// a PEER's raise holds (the wire carries the tag, never a volume id string,
+/// because the tag is the durable identity `TREE_BLOCK_REFS` keys on).
+pub async fn load_lane_reservations_for_tag(
+    meta: &crate::meta_backend::RoutedMetaBackend,
+    vol_tag: u64,
+) -> Result<Vec<LaneReservation>> {
     let mut out = Vec::new();
     for name in crate::meta_backend::Metadata::listxattr(meta, 1).await? {
         let Some((tag, _lane)) = parse_lane_record_name(&name) else {

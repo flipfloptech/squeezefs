@@ -66,7 +66,14 @@ use std::sync::Arc;
 
 /// The publish vocabulary's schema — independent of S8's
 /// (`META_SHIP_SCHEMA`) and of the transport's.
-pub const PUBLISH_SCHEMA: u32 = 1;
+///
+/// **2 since the co-writer allocation lane landed** (`RaiseAllocLane` joined
+/// the call enum). The bump is deliberate rather than a silent additive
+/// variant: a peer that speaks 1 cannot serve a reservation raise, and the
+/// honest answer is `PUBLISH_SCHEMA_MISMATCH` naming both numbers at the
+/// first frame — not an undecodable body refused as malformed halfway
+/// through a mount's first allocation.
+pub const PUBLISH_SCHEMA: u32 = 2;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
 /// are 16/17, S6's membership owns `0x0100..=0x01FF`, S9's custody
@@ -88,6 +95,10 @@ pub const PUBLISH_MALFORMED: u16 = 0x52;
 pub const PUBLISH_NOT_OWNER: u16 = 0x53;
 /// Status: the owner-side execution PANICKED (must stay 0).
 pub const PUBLISH_PANIC: u16 = 0x54;
+/// Status: a reservation raise named a lane this client was not assigned, a
+/// width the authority does not run, or a lease that is not custody — the
+/// **must-stay-0** class (`alloc_lane_raise_refusals`).
+pub const PUBLISH_LANE_REFUSED: u16 = 0x55;
 
 /// One durable block-reference operation on the wire — a mirror of
 /// [`BlockRefOp`] on purpose: the internal struct may gain fields without
@@ -178,6 +189,33 @@ pub enum PublishCall {
         offset: u64,
         max: u32,
     },
+    /// **Raise (or OPEN) a data-plane allocation lane's durable reservation**
+    /// — DLM S9's co-writer allocation seam
+    /// (`docs/design-mw-data-alloc-partition.md` §3).
+    ///
+    /// The client names a **lane**, never a record: the owner derives the
+    /// record's name from `(vol_tag, lane)` itself
+    /// ([`crate::data_alloc_lane::lane_record_name`]), so this verb cannot
+    /// address `writer_claim`, `claim_set`, `job:` or any other internal
+    /// name — and it validates the lane against the assignment IT made
+    /// before committing anything.
+    ///
+    /// `upto == 0` is the OPEN: commit nothing, answer the frontier this
+    /// lane must resume at (the reply's [`PublishReply::LaneFrontier`]).
+    RaiseAllocLane {
+        /// The durable data-volume identity (KD-5's `vol-{hex}` as
+        /// `block_refs::volume_tag` decodes it) — never a path, an ordinal
+        /// or a set position.
+        vol_tag: u64,
+        lane: u16,
+        writers: u16,
+        upto: u64,
+        /// The custody lease epoch the caller holds — minted by this
+        /// authority, monotone, never reused, and handed only to the member
+        /// it names. It is what makes the lane claim checkable rather than
+        /// self-asserted.
+        lease_epoch: u64,
+    },
 }
 
 impl PublishCall {
@@ -192,6 +230,7 @@ impl PublishCall {
             Self::CreateWithRdevSize { .. } => "create_with_rdev_size",
             Self::XattrValueCap { .. } => "xattr_value_cap",
             Self::ReaddirStream { .. } => "readdir_stream",
+            Self::RaiseAllocLane { .. } => "raise_alloc_lane",
         }
     }
 
@@ -206,6 +245,11 @@ impl PublishCall {
             Self::DestroyInodes { inos } => inos.clone(),
             Self::CreateWithRdevSize { parent, .. } => vec![*parent],
             Self::ReaddirStream { dir, .. } => vec![*dir],
+            // The reservation record lives on ino 1 (KD-2's plane), so the
+            // authority check is the same check every other verb gets: the
+            // node serving it must hold authority over the volume ino 1
+            // routes to.
+            Self::RaiseAllocLane { .. } => vec![1],
         }
     }
 }
@@ -222,6 +266,9 @@ pub enum PublishReply {
     Cap(u64),
     /// `readdir_stream`: `(resume cookie, entry)` pairs.
     Page(Vec<(u64, WireDirEntry)>),
+    /// `raise_alloc_lane`: the durable reservation frontier now in force for
+    /// that lane — an exclusive block-index bound this lane may mint below.
+    LaneFrontier(u64),
 }
 
 /// A publish request frame.
@@ -713,6 +760,88 @@ pub async fn xattr_value_cap(be: &Arc<RoutedMetaBackend>, ino: Ino) -> Result<us
     }
 }
 
+// ---------------------------------------------------------------------------
+// DLM S9 — the co-writer's allocation lane (docs/design-mw-data-alloc-partition.md
+// §3; contracts tests/mw_cowriter_lane_tests.rs). Kept in its own block: the
+// verb is the ONLY metadata commit a co-writer's DATA path performs, and it
+// is the one place a remote caller's value reaches a durable record.
+// ---------------------------------------------------------------------------
+
+/// **Raise (or OPEN) one allocation lane's durable reservation** — routed.
+///
+/// * **we hold the authority** (every mount that ships): the local commit,
+///   monotone, exactly as [`crate::data_alloc_lane::commit_lane_raise`]
+///   defines it, with no open floor (this mount's own recovery established
+///   its floor);
+/// * **a peer holds it** (a co-writer): the raise SHIPS, and the peer commits
+///   it after checking that the lane is the one it assigned to us. That is
+///   the whole answer to *"a lane reservation is a metadata commit and a
+///   co-writer has no metadata authority"*: the co-writer does not write the
+///   record — it asks the node that can, and the offset the record covers is
+///   handed out only after the reply lands
+///   (`BlockAllocator::hand_out_reserved`).
+///
+/// Returns the frontier now in force. `upto == 0` is the OPEN: it commits
+/// nothing and answers where this lane must resume — the number a mount that
+/// runs no ownership-recovery walk cannot compute for itself.
+pub async fn raise_alloc_lane(
+    be: &Arc<RoutedMetaBackend>,
+    vol_tag: u64,
+    lane: u16,
+    writers: u16,
+    upto: u64,
+) -> Result<u64> {
+    match owner_of(be, 1) {
+        None => {
+            note_local();
+            crate::data_alloc_lane::commit_lane_raise(be, vol_tag, lane, writers, upto, None).await
+        }
+        Some(peer) => {
+            // The lease epoch is this node's proof that the lane it names is
+            // the lane it was granted: the authority minted it, it is
+            // monotone and never reused, and it was handed only to us.
+            let lease_epoch = crate::data_grant::custody_client()
+                .map(|c| c.lease_epoch())
+                .unwrap_or(0);
+            let call = PublishCall::RaiseAllocLane {
+                vol_tag,
+                lane,
+                writers,
+                upto,
+                lease_epoch,
+            };
+            let out = ship(&peer, call).await;
+            match out {
+                Ok(PublishReply::LaneFrontier(f)) => {
+                    crate::fuse_client::METRICS
+                        .alloc_lane_shipped_reservations
+                        .fetch_add(1, Ordering::Relaxed);
+                    Ok(f)
+                }
+                Ok(other) => Err(protocol_error(
+                    "raise_alloc_lane",
+                    &format!("{other:?}"),
+                    "a lane frontier",
+                )),
+                Err(e) => {
+                    crate::fuse_client::METRICS
+                        .alloc_lane_raise_refusals
+                        .fetch_add(1, Ordering::Relaxed);
+                    log::error!(
+                        "S9: the authority at {} refused this mount's allocation-lane raise \
+                         (lane {lane} of {writers}, vol_tag {vol_tag:#016x}, upto {upto}): {e} — \
+                         no offset is handed out, because an offset whose reservation is not \
+                         durable is an offset a successor of this lane may mint again \
+                         (alloc_lane_raise_refusals)",
+                        peer.endpoint
+                    );
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
 /// Routed [`RoutedMetaBackend::readdir_stream`].
 pub async fn readdir_stream(
     be: &Arc<RoutedMetaBackend>,
@@ -865,6 +994,27 @@ impl PublishService {
                 ),
             );
         }
+        // DLM S9's allocation-lane seam: the ONE verb whose argument reaches a
+        // durable record from a REMOTE caller, so it is validated here —
+        // against the assignment this authority itself made — before anything
+        // is dispatched. The client names a lane; only the authority decides
+        // whose lane it is.
+        if let PublishCall::RaiseAllocLane {
+            lane,
+            writers,
+            lease_epoch,
+            ..
+        } = &frame.call
+        {
+            if let Err(reason) =
+                crate::data_grant::validate_lane_raise(&frame.client, *lease_epoch, *lane, *writers)
+            {
+                crate::fuse_client::METRICS
+                    .alloc_lane_raise_refusals
+                    .fetch_add(1, Ordering::Relaxed);
+                return Self::refuse(req.id, PUBLISH_LANE_REFUSED, reason);
+            }
+        }
         let Some(me) = self.owned() else {
             return Self::refuse(
                 req.id,
@@ -990,6 +1140,43 @@ impl PublishService {
                         .map(|(cookie, e)| (*cookie, WireDirEntry::from(e)))
                         .collect(),
                 ))
+            }
+            PublishCall::RaiseAllocLane {
+                vol_tag,
+                lane,
+                writers,
+                upto,
+                lease_epoch: _,
+            } => {
+                // The lane was validated in `serve`. The floor is the
+                // recovery rule's answer computed HERE, from state only a
+                // node with metadata authority (and a live cursor) has: the
+                // durable reference ledger's dense frontier, this mount's own
+                // cursor for that data volume, and every `alloc_lane:` record
+                // the volume carries. A peer that never walks the tree cannot
+                // compute it, which is why the OPEN exists.
+                let floor = crate::data_alloc_lane::lane_open_floor(
+                    &self.inner,
+                    vol_tag,
+                    lane,
+                    writers,
+                    crate::alloc_lane_grant::local_dense_frontier(vol_tag).unwrap_or(0),
+                )
+                .await?;
+                let frontier = crate::data_alloc_lane::commit_lane_raise(
+                    &self.inner,
+                    vol_tag,
+                    lane,
+                    writers,
+                    upto,
+                    floor,
+                )
+                .await?;
+                log::debug!(
+                    "S9: served an allocation-lane raise for lane {lane} of {writers} on \
+                     vol_tag {vol_tag:#016x} (asked {upto}, frontier now {frontier})"
+                );
+                Ok(PublishReply::LaneFrontier(frontier))
             }
         }
     }

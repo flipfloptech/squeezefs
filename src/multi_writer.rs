@@ -281,6 +281,12 @@ impl MultiWriterArm {
         data_grant::uninstall_custody_owner();
         publish::uninstall_client();
         crate::meta_ship::disarm_ownership();
+        // The lane map dies with the authority (it is era-scoped), and so does
+        // the frontier source a served OPEN read. The allocators keep their
+        // engaged lanes: a mount's own residue class is fixed for its life
+        // (`install_mount_partition` refuses a swap), and the offsets it has
+        // minted are in it.
+        crate::alloc_lane_grant::uninstall_frontier_source();
         if let Some(hold) = self.wero.take() {
             data_custody::release_hold(hold).await;
         }
@@ -307,6 +313,7 @@ pub async fn arm_mount_multi_writer(
     read_only: bool,
     runtime: tokio::runtime::Handle,
     quarantine: Option<Arc<dyn CustodyQuarantine>>,
+    backend: Option<&Arc<crate::routing::BackendRouter>>,
 ) -> Result<Option<MultiWriterArm>> {
     if !requested() {
         log::debug!(
@@ -330,7 +337,7 @@ pub async fn arm_mount_multi_writer(
         );
         return Ok(None);
     }
-    arm_multi_writer(meta, data_paths, read_only, runtime, quarantine).await
+    arm_multi_writer(meta, data_paths, read_only, runtime, quarantine, backend).await
 }
 
 /// **Arm the multi-writer planes, or refuse naming what is missing.**
@@ -344,6 +351,7 @@ pub async fn arm_multi_writer(
     read_only: bool,
     runtime: tokio::runtime::Handle,
     quarantine: Option<Arc<dyn CustodyQuarantine>>,
+    backend: Option<&Arc<crate::routing::BackendRouter>>,
 ) -> Result<Option<MultiWriterArm>> {
     // Rung 1: a reader.
     if read_only {
@@ -488,6 +496,62 @@ pub async fn arm_multi_writer(
         LeaseClock::monotonic(),
         quarantine,
     )?;
+
+    // DLM S9 blocker #3's ADMISSION (`crate::alloc_lane_grant`,
+    // docs/design-mw-data-alloc-partition.md §9 item 1): this era's data-plane
+    // allocation lane map, derived from the DURABLE claim set — the record
+    // this arm just wrote the roster into, and the only source that can make
+    // two nodes agree without a message. The authority keeps lane 0; each
+    // enrolled writer member gets the next lane; the width is fixed for the
+    // era, and it reaches every member on its custody lease.
+    //
+    // With NO enrolled co-writer this is lane 0 of 1 = SOLO, which installs
+    // nothing at all: the authority's own allocation is then not "equivalent
+    // to" the shipped path, it IS the shipped path.
+    let assignment = match derive_lane_assignment(meta).await {
+        Ok(a) => a,
+        Err(e) => {
+            if let Some(hold) = wero {
+                data_custody::release_hold(hold).await;
+            }
+            return Err(e);
+        }
+    };
+    owner.install_lane_assignment(Arc::clone(&assignment));
+    let authority_lane = assignment.authority_partition();
+    if !authority_lane.is_solo() {
+        let Some(backend) = backend else {
+            if let Some(hold) = wero {
+                data_custody::release_hold(hold).await;
+            }
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "multi-writer refuses to arm: this era's claim set enrolls {} co-writer(s), so \
+                 the data plane must be partitioned into {} allocation lanes — but this arm was \
+                 given no data-plane router to engage them on. An authority that granted lanes \
+                 to peers while minting DENSE offsets itself would hand one device offset to two \
+                 owners, silently on a passthrough volume",
+                assignment.writers().saturating_sub(1),
+                assignment.writers(),
+            )));
+        };
+        // The dense-frontier source a served lane OPEN reads: a co-writer
+        // never walks the tree, so the authority answers where the live data
+        // ends from its own recovered cursor (composed with the durable
+        // ledger).
+        crate::alloc_lane_grant::install_frontier_source(
+            crate::alloc_lane_grant::router_frontier_source(Arc::clone(backend)),
+        );
+        if let Err(e) =
+            crate::alloc_lane_grant::engage_authority_lanes(authority_lane, backend, meta).await
+        {
+            crate::alloc_lane_grant::uninstall_frontier_source();
+            if let Some(hold) = wero {
+                data_custody::release_hold(hold).await;
+            }
+            return Err(e);
+        }
+    }
+
     let router = AsyncVerbRouter::new()
         .with_custody(Arc::clone(&owner))
         .with_publish(publish::PublishService::new(Arc::clone(meta), runtime));
@@ -543,6 +607,44 @@ pub async fn arm_multi_writer(
         tasks: vec![cadence],
         endpoint,
     }))
+}
+
+/// Derive this era's allocation lane map from the volume set's **durable**
+/// claim sets (DLM S9 blocker #3's admission).
+///
+/// The authority's own identity in that record is the **membership owner's**
+/// id — the entry `membership::arm_mount_membership` writes for itself — not
+/// the custody authority's `mw-{uuid}`: the claim set is §6.2 item 7's
+/// membership record, and the roster this arm enrolled sits beside that one
+/// entry. Without an armed membership owner there is no such identity, and
+/// then this authority runs SOLO rather than guessing which entry is itself
+/// (guessing wrong would hand a co-writer the authority's own lane).
+async fn derive_lane_assignment(
+    meta: &Arc<RoutedMetaBackend>,
+) -> Result<Arc<crate::alloc_lane_grant::LaneAssignment>> {
+    let me = match crate::membership::installed_owner() {
+        Some(owner) => owner.id().to_string(),
+        None => {
+            log::warn!(
+                "multi-writer: no membership OWNER is installed on this mount, so its own \
+                 claim-set identity is unknown — running SOLO (no data-plane allocation \
+                 partition) rather than risking handing a co-writer this node's own lane"
+            );
+            return crate::alloc_lane_grant::LaneAssignment::derive("", &[]);
+        }
+    };
+    let mut sets = Vec::new();
+    for vol in &meta.volumes {
+        if let Some(set) = crate::membership::ClaimSet::load(vol).await {
+            // Only the DURABLE record is a roster: the projection of a
+            // singular `writer_claim` expresses EXCLUSION and cannot name a
+            // second member (the co-writer ladder's rung 2, same reason).
+            if set.durable {
+                sets.push(set);
+            }
+        }
+    }
+    crate::alloc_lane_grant::LaneAssignment::derive(&me, &sets)
 }
 
 /// Every meta volume must carry every required bit. The refusal names the

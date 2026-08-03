@@ -75,6 +75,14 @@ pub mod data_grant;
 // comments: an outer doc comment here merges into the crate root's link
 // scope — see the `data_custody` note above.)
 pub mod data_alloc_lane;
+// DLM stage S9: the allocation-lane GRANT — the admission the partition above
+// was left waiting for. One lane per enrolled writer, derived by the authority
+// from the DURABLE claim set and carried to each co-writer on its custody
+// lease; the durable reservation a co-writer cannot commit itself is shipped
+// and committed BY the authority ahead of every hand-out. (Plain comments,
+// not doc comments: an outer doc comment here merges into the crate root's
+// link scope — see the `data_custody` note above.)
+pub mod alloc_lane_grant;
 pub mod defrag;
 /// RES-8 (pre-RC spec §7): unwind containment + counting for detached
 /// (fire-and-forget) data-path tasks.

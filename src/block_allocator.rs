@@ -733,6 +733,46 @@ impl BlockAllocator {
         Ok(())
     }
 
+    /// [`Self::plane_gate`] for the **ALLOCATION** arms only (DLM S9 blocker
+    /// #3's admission — `docs/design-mw-data-alloc-partition.md`,
+    /// `crate::alloc_lane_grant`).
+    ///
+    /// A reader is refused exactly as before, with its own text and at every
+    /// site. A **co-writer with an engaged lane** now PASSES, and nothing else
+    /// about its posture moved:
+    ///
+    /// | Arm | Co-writer | Why |
+    /// |---|---|---|
+    /// | fresh allocation / free-list reuse / the two picks | **allowed with a lane** | its lane is a residue class no other writer mints in, and the durable reservation covering the offset is committed by the authority BEFORE the hand-out ([`Self::hand_out_reserved`]) |
+    /// | the same, with NO lane | refused, unchanged | without a lane there is no disjointness: this mount's cursor and free list are a private opinion about shared hardware |
+    /// | terminal free / `free_block` | refused, unchanged | a free's durable effect is the authority's `TREE_BLOCK_REFS` delete, and the device reclaim that follows is ceased on this posture |
+    /// | `allocate_specific_block` | refused, unchanged | deliberately lane-BLIND (a clone/recovery path naming an index it already owns durably), which on a co-writer means claiming an offset in a lane it may not hold |
+    /// | the W1 incarnation retire | refused, unchanged | it retires a LIFETIME, which is durable ownership state (§6.2 item 6) |
+    /// | the ownership recovery walk | refused, unchanged | it declares gaps free from the tree it happened to see |
+    ///
+    /// Keyed on the ALLOCATOR's lane rather than on a mount-wide word, and
+    /// that is not a drift from `plane_gate`'s "the posture is the MOUNT's"
+    /// discipline: the mount-wide partition
+    /// ([`crate::data_alloc_lane::mount_partition`]) is what a lane is
+    /// engaged FROM, and this asks the narrower question the allocation arm
+    /// actually needs — *is THIS volume's index space partitioned for me* —
+    /// which is per-volume state by construction (each volume engages its
+    /// own).
+    #[inline]
+    fn alloc_plane_gate(&self, what: &str) -> Result<()> {
+        if crate::fuse_client::read_only_mount() {
+            let e = crate::fuse_client::read_only_refusal(what);
+            log::error!("{e}");
+            return Err(e);
+        }
+        if crate::fuse_client::co_writer_mount() && self.lanes.get().is_none() {
+            let e = crate::fuse_client::co_writer_refusal(what);
+            log::error!("{e}");
+            return Err(e);
+        }
+        Ok(())
+    }
+
     // DLM S7 — the dead-epoch allocation quarantine (pre-RC engineering
     // spec §6.7 "Recovery"; contracts in tests/dlm_data_fence_tests.rs).
     // The job wire's expired-lease destination quarantine applied
@@ -1592,7 +1632,7 @@ impl BlockAllocator {
     }
 
     async fn allocate_block_inner(&self) -> Result<u64> {
-        if let Err(e) = Self::plane_gate("block allocation") {
+        if let Err(e) = self.alloc_plane_gate("block allocation") {
             return Err(e);
         }
         let first = self.try_allocate_block();
@@ -1801,7 +1841,8 @@ impl BlockAllocator {
     /// blocks is `W`-strided rather than dense, which is why the partition
     /// width is a capacity/fragmentation trade and not free.
     pub fn allocate_block_below(&self, below_idx: u64) -> Option<u64> {
-        Self::plane_gate("block allocation (contiguity pick)").ok()?;
+        self.alloc_plane_gate("block allocation (contiguity pick)")
+            .ok()?;
         // Spec §6.8 item 3: acknowledged offsets re-enter the free list
         // before the pick reads it, so a mover never defers for space that
         // is actually available (one relaxed load when nothing is held).
@@ -1828,7 +1869,7 @@ impl BlockAllocator {
     /// rewrite's convergence invariant). Full `allocate_block`
     /// discipline; `StorageFull` propagates from the fresh-mint path.
     pub fn allocate_block_at_or_above(&self, min_idx: u64) -> Result<u64> {
-        Self::plane_gate("block allocation (ascending pick)")?;
+        self.alloc_plane_gate("block allocation (ascending pick)")?;
         // Spec §6.8 item 3, as in the contiguity pick above.
         self.harvest_grace();
         let mut cands: Vec<u64> = self

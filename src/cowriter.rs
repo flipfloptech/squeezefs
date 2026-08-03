@@ -20,12 +20,14 @@
 //! |---|---|---|
 //! | metadata | **none locally.** Every mutation is SHIPPED to the volume's authority (S8 ownership + S9's publish vocabulary) | [`crate::meta_backend::kv::backend::KvMetaBackend::open_co_writer`] latches the volume read-only with cause `CoWriterMount`, so `write_gate` refuses a local commit naming the shipped path |
 //! | data (DMA) | **yes, under a granted custody lease.** The bytes never funnel through the authority — only the custody travels | [`crate::data_custody::authorize_dma`], the ONE authorization point, under the epoch the grant established |
-//! | ownership accounting (allocate / terminal free / W1 incarnation retire) | **none.** The durable truth of "who owns this offset" is metadata (`TREE_BLOCK_REFS`), and metadata authority is the authority's | `BlockAllocator`'s gate, whose co-writer class names the data-plane allocation partition that owns it |
+//! | fresh block ALLOCATION | **yes, from the lane the authority granted** (DLM S9's allocation-lane grant): a residue class no peer mints in, whose durable reservation the authority commits ahead of every hand-out | [`crate::alloc_lane_grant`] + `BlockAllocator`'s `alloc_plane_gate` |
+//! | ownership accounting (terminal free / specific claim / W1 incarnation retire / device reclaim) | **none.** The durable truth of "who owns this offset" is metadata (`TREE_BLOCK_REFS`), and metadata authority is the authority's | `BlockAllocator`'s gate, whose co-writer class names what it may not do |
 //!
 //! That split is the honest reading of the blocker: *"a co-writer holding a
 //! valid S9 grant has authority for the data plane while having none for
-//! the metadata plane"* — and block ownership accounting is metadata, not
-//! data.
+//! the metadata plane"* — and block ownership *accounting* is metadata, not
+//! data. Placing a block in a lane nobody else can mint in is a data act;
+//! deciding that an offset is now unowned is not.
 //!
 //! # The admission ladder, in evaluation order
 //!
@@ -90,17 +92,33 @@
 //! entry — both deliberately, because those are what make it fenceable and
 //! visible.
 //!
-//! # What a co-writer does about allocation today
+//! # What a co-writer does about allocation
 //!
-//! It **refuses fresh allocation**, loudly, naming the data-plane
-//! allocation partition that owns the problem. The alternative — taking
-//! pre-allocated destinations the way the job wire's remote workers do —
-//! is expressible (the S9 grant already carries a declared-destination
-//! cohort) but is not a write PATH: the layout publish, the displaced-block
-//! free and the refcount delta of every write would each have to ride the
-//! authority, and only the publish half is landed. Refusing at the
-//! allocation point keeps the seam in ONE place and keeps the failure loud
-//! instead of half-wired.
+//! It **allocates from the lane its authority granted** — the seam this
+//! posture originally left open, closed by [`crate::alloc_lane_grant`]:
+//!
+//! * the lane `(w, W)` arrives on the **custody lease**, derived by the
+//!   authority from the durable claim set. A co-writer never chooses, derives
+//!   or configures it, because two co-writers choosing lanes is the collision
+//!   the partition exists to prevent;
+//! * fresh allocation is then a **residue class** (`b % W == w`) no other
+//!   writer mints in, so no arbitration and no message is needed per block;
+//! * the durable reservation that covers each grain is a metadata commit, so
+//!   it **ships**: the AUTHORITY writes the `alloc_lane:` record, validates
+//!   the lane against its own assignment, holds the monotonicity, and the
+//!   offset is handed out only after that commit lands;
+//! * the lane's **floor** is OPENED by the authority, because a co-writer
+//!   runs no ownership-recovery walk and would otherwise mint from block 0 of
+//!   a device whose low blocks are live.
+//!
+//! What stays refused is everything whose durable home is metadata this mount
+//! cannot commit: the **terminal free** and `free_block` (a free's durable
+//! effect is the authority's `TREE_BLOCK_REFS` delete, and its device reclaim
+//! is ceased here), `allocate_specific_block` (lane-BLIND by design — a
+//! clone/recovery path naming an index it already owns durably), the **W1
+//! incarnation retire**, and the **ownership recovery walk**. Those are what
+//! `cowriter.accounting_refusals` keeps counting; allocation no longer
+//! appears there.
 
 use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::METRICS;
@@ -1022,14 +1040,54 @@ pub async fn arm(
     // offsets belong to the authority's ledger).
     router.backend_router.reclaim_cease();
 
+    // DLM S9 blocker #3's ADMISSION (`crate::alloc_lane_grant`): the lease we
+    // just adopted names this mount's data-plane allocation lane, so engage
+    // it — the residue class this mount alone mints in, the routed
+    // reservation sink (a co-writer's raises SHIP: the record is a metadata
+    // commit and the authority is the only node that may write it), and a
+    // floor OPENED by the authority (this mount runs no ownership-recovery
+    // walk, so it must be told where the set's live data ends).
+    //
+    // Deliberately AFTER the publish client is installed — the raise routes
+    // through it — and after the custody client, whose lease is the only
+    // source of the lane. A SOLO lease (an authority that has enrolled
+    // nobody) engages nothing, and then allocation stays refused exactly as
+    // it was before this seam closed.
+    let lane = client.lane_partition();
+    if lane.is_solo() {
+        log::warn!(
+            "CO-WRITER: the authority granted no allocation lane (its era runs no data-plane \
+             partition), so this mount can place NO fresh block — every ownership-accounting arm \
+             stays refused (cowriter.accounting_refusals). Enroll this node in \
+             SQUEEZEFS_MW_MEMBERS on the authority and re-arm it"
+        );
+    } else if let Err(e) =
+        crate::alloc_lane_grant::engage_co_writer_lanes(lane, &router.backend_router, meta).await
+    {
+        crate::data_grant::uninstall_custody_client();
+        crate::meta_ship::publish::uninstall_client();
+        crate::meta_ship::disarm_ownership();
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "co-writer arm failed: the allocation lane {} of {} the authority granted could not \
+             be engaged ({e}). Refusing the mount rather than serving one that would either \
+             place no block at all or place one over another writer's",
+            lane.writer_id(),
+            lane.writers()
+        )));
+    }
+
     let stop = Arc::new(AtomicBool::new(false));
     let renew = spawn_custody_renewal(Arc::clone(&client), Arc::clone(&stop));
     log::warn!(
         "CO-WRITER ARMED (DLM S9): metadata verbs ship to '{}' at {}, write custody is acquired \
-         there, and this mount's own allocator/reclaim accounting is closed. Data DMA is \
-         authorized locally under the custody epoch — only custody travels, never data",
+         there, fresh blocks are placed in allocation lane {} of {} (durable reservations \
+         committed by the authority ahead of every hand-out), and this mount's own \
+         free/reclaim accounting stays closed. Data DMA is authorized locally under the custody \
+         epoch — only custody travels, never data",
         admission.authority_claim_id,
         admission.custody_endpoint,
+        lane.writer_id(),
+        lane.writers(),
     );
     Ok(CoWriterArm {
         admission,

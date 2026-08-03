@@ -658,9 +658,17 @@ pub(crate) fn read_only_refusal(what: &str) -> crate::error::SqueezefsError {
 /// telling an operator to "mount without -o ro" would be a lie. What it has
 /// is data authority without accounting authority — the durable truth of
 /// which offsets are owned lives in the authority's `TREE_BLOCK_REFS`, so
-/// mutating a LOCAL refcount map, free list or allocation cursor here would
-/// be one node inventing an answer about shared hardware. One text, so
-/// every plane's refusal names the same cause and the same open work.
+/// mutating a LOCAL refcount map here would be one node inventing an answer
+/// about shared hardware. One text, so every plane's refusal names the same
+/// cause and the same remedy.
+///
+/// **Fresh allocation is no longer on this list** (DLM S9's allocation-lane
+/// grant — `crate::alloc_lane_grant`): a co-writer allocates from the residue
+/// class its authority granted on the custody lease, with the covering
+/// reservation committed BY that authority before the offset is handed out.
+/// So an allocation arm reaching this text means this mount holds **no lane**
+/// on that volume, which is exactly what an authority that has enrolled no
+/// co-writer grants.
 pub(crate) fn co_writer_refusal(what: &str) -> crate::error::SqueezefsError {
     METRICS
         .cowriter_accounting_refusals
@@ -669,13 +677,15 @@ pub(crate) fn co_writer_refusal(what: &str) -> crate::error::SqueezefsError {
         "{what} refused: this mount is a CO-WRITER (DLM S9 — metadata read-only locally with \
          mutations shipped to the authority, data read-write under a granted custody lease). A \
          co-writer holds DATA authority, not ownership-ACCOUNTING authority: which device \
-         offsets are owned is durable metadata (TREE_BLOCK_REFS) on volumes this mount cannot \
-         commit to, so allocating, freeing or retiring an incarnation here would be this node \
-         inventing an answer about shared hardware. Fresh allocation for a co-writer is the \
-         data-plane allocation partition's work (spec §6.2 item 8 / §6.8 — the allocator must \
-         hand disjoint ranges to each writer before this can be admitted); until it lands, a \
-         co-writer writes only into destinations its custody grant declares. Mount this node as \
-         the authority (unset SQUEEZEFS_MW_ROLE) to allocate here."
+         offsets are OWNED is durable metadata (TREE_BLOCK_REFS) on volumes this mount cannot \
+         commit to, so freeing an offset, retiring an incarnation or claiming a named block here \
+         would be this node inventing an answer about shared hardware. Fresh ALLOCATION is the \
+         one exception, and it is admitted from the data-plane allocation LANE the authority \
+         grants on the custody lease (docs/design-mw-data-alloc-partition.md) — so if this was \
+         an allocation, this mount holds no lane on this volume: an authority that has enrolled \
+         no co-writer (SQUEEZEFS_MW_MEMBERS) grants none, and a member enrolled after the \
+         authority armed gets one only in a new era. Mount this node as the authority (unset \
+         SQUEEZEFS_MW_ROLE) to own the accounting here."
     ))
 }
 
@@ -3901,6 +3911,22 @@ pub struct Metrics {
     /// amortization factor; growth proportional to allocations means the
     /// grain collapsed.
     pub alloc_lane_reservations: Align64<AtomicU64>,
+    /// Reservation raises that **travelled** to the authority instead of
+    /// committing locally (DLM S9's co-writer allocation lane —
+    /// `crate::alloc_lane_grant`). This is the CO-WRITER engagement
+    /// instrument: a co-writer's raises are all shipped (it holds no metadata
+    /// authority), so on an admitted co-writer this tracks
+    /// `alloc_lane_reservations`, and **0 with a nonzero `alloc_lane_id`
+    /// means the mount is committing its own frontier** — which only an
+    /// authority may do. 0 on every authority and every single-writer mount.
+    pub alloc_lane_shipped_reservations: Align64<AtomicU64>,
+    /// Reservation raises **refused** — by the authority (the lane is not the
+    /// one it assigned, the width is not this era's, or the presented lease is
+    /// not custody) or by the transport. **Must stay 0**: a refused raise
+    /// means an offset was NOT handed out (a co-writer's write stalls loudly
+    /// rather than using an uncovered offset), and a lane/width refusal means
+    /// two mounts disagree about who owns a residue class.
+    pub alloc_lane_raise_refusals: Align64<AtomicU64>,
     /// Lanes adopted after their holder was proven dead (the ENOSPC/fairness
     /// answer — the witness is S7's `DeadEpoch`, the same drain proof
     /// `release_quarantine` demands). 0 on a healthy set.
@@ -6973,6 +6999,12 @@ impl SqueezefsFilesystem {
                 "alloc_lane_id": METRICS.alloc_lane_id.load(Ordering::Relaxed),
                 "alloc_lanes_owned": METRICS.alloc_lanes_owned.load(Ordering::Relaxed),
                 "alloc_lane_reservations": METRICS.alloc_lane_reservations.load(Ordering::Relaxed),
+                "alloc_lane_shipped_reservations": METRICS
+                    .alloc_lane_shipped_reservations
+                    .load(Ordering::Relaxed),
+                "alloc_lane_raise_refusals": METRICS
+                    .alloc_lane_raise_refusals
+                    .load(Ordering::Relaxed),
                 "alloc_lane_adoptions": METRICS.alloc_lane_adoptions.load(Ordering::Relaxed),
                 "alloc_lane_enospc_refusals": METRICS.alloc_lane_enospc_refusals.load(Ordering::Relaxed),
                 "alloc_lane_stranded_bytes": METRICS.alloc_lane_stranded_bytes.load(Ordering::Relaxed),

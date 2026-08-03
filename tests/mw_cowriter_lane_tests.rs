@@ -275,10 +275,7 @@ fn full_request(paths: &[PathBuf], node_id: &str) -> AdmissionRequest {
         read_only: false,
         node_id: node_id.to_string(),
         custody_endpoint: Some("127.0.0.1:7100".to_string()),
-        volumes: paths
-            .iter()
-            .map(|p| volume_evidence(p, node_id))
-            .collect(),
+        volumes: paths.iter().map(|p| volume_evidence(p, node_id)).collect(),
         authority: Some(AuthorityLeaseEvidence {
             owner_id: AUTHORITY_ID.to_string(),
             endpoint: "127.0.0.1:7000".to_string(),
@@ -334,6 +331,11 @@ impl Authority {
         let assignment = LaneAssignment::derive(AUTHORITY_ID, std::slice::from_ref(&set))
             .expect("the roster fits the lane space");
         owner.install_lane_assignment(Arc::clone(&assignment));
+        // The publish owner side validates a peer's lane raise against the
+        // assignment THIS authority made, and it reaches the authority through
+        // the process registry — exactly as `multi_writer::arm_multi_writer`
+        // installs it.
+        data_grant::install_custody_owner(Arc::clone(&owner));
         let router = data_grant::AsyncVerbRouter::new()
             .with_custody(Arc::clone(&owner))
             .with_publish(publish::PublishService::new(
@@ -368,10 +370,7 @@ impl Authority {
     }
 
     async fn record_for(&self, lane_id: u16) -> Option<lane::LaneReservation> {
-        self.records()
-            .await
-            .into_iter()
-            .find(|r| r.lane == lane_id)
+        self.records().await.into_iter().find(|r| r.lane == lane_id)
     }
 
     async fn stop(self) {
@@ -459,7 +458,9 @@ async fn a_co_writer_with_an_engaged_lane_is_no_longer_refused_allocation() {
     let _restore = restore();
     let alloc = allocator("vol-00000000000000c1", 0).await;
     let p = part(4, 2);
-    alloc.engage_alloc_lanes(p).expect("engage the granted lane");
+    alloc
+        .engage_alloc_lanes(p)
+        .expect("engage the granted lane");
     fuse_client::set_mount_posture(MountPosture::CoWriter);
 
     let chunk = alloc.chunk_size();
@@ -497,7 +498,12 @@ fn the_assignment_gives_one_lane_per_enrolled_writer_and_is_injective() {
     let set = claim_set_with(&[NODE_A, NODE_B]);
     let map = LaneAssignment::derive(AUTHORITY_ID, std::slice::from_ref(&set)).expect("derive");
 
-    assert_eq!(map.writers(), 3, "the authority plus two enrolled writers");
+    assert_eq!(
+        map.writers(),
+        4,
+        "three writers round UP to a power-of-two width — what AppendPartition admits — so lane \
+         3 belongs to nobody (honest, published, unreachable capacity)"
+    );
     assert_eq!(
         map.lane_of(AUTHORITY_ID),
         Some(0),
@@ -505,6 +511,11 @@ fn the_assignment_gives_one_lane_per_enrolled_writer_and_is_injective() {
     );
     assert_eq!(map.lane_of(NODE_A), Some(1));
     assert_eq!(map.lane_of(NODE_B), Some(2));
+    assert_eq!(
+        map.co_writers(),
+        [NODE_A.to_string(), NODE_B.to_string()],
+        "lane order is the record's own sorted order, not the reader's"
+    );
     assert_eq!(
         map.lane_of("node_never_enrolled"),
         None,
@@ -520,9 +531,16 @@ fn the_assignment_gives_one_lane_per_enrolled_writer_and_is_injective() {
 
     // The partition each member runs under.
     assert_eq!(map.partition_for(NODE_A).expect("named").writer_id(), 1);
-    assert_eq!(map.partition_for(NODE_A).expect("named").writers(), 3);
+    assert_eq!(map.partition_for(NODE_A).expect("named").writers(), 4);
     assert_eq!(map.authority_partition().writer_id(), 0);
-    assert_eq!(map.authority_partition().writers(), 3);
+    assert_eq!(map.authority_partition().writers(), 4);
+    // Two writers need no rounding at all: the common shape is exact.
+    let pair = LaneAssignment::derive(
+        AUTHORITY_ID,
+        std::slice::from_ref(&claim_set_with(&[NODE_A])),
+    )
+    .expect("derive");
+    assert_eq!(pair.writers(), 2, "one authority + one co-writer is exactly 2");
 
     // Deterministic: the same record derives the same map, always (which is
     // what makes two nodes' views agree without a message).
@@ -550,8 +568,8 @@ fn an_authority_with_no_co_writers_is_solo_and_installs_nothing() {
     with_reader
         .members
         .push(member("node_reader", MemberRole::Reader));
-    let map = LaneAssignment::derive(AUTHORITY_ID, std::slice::from_ref(&with_reader))
-        .expect("derive");
+    let map =
+        LaneAssignment::derive(AUTHORITY_ID, std::slice::from_ref(&with_reader)).expect("derive");
     assert_eq!(
         map.writers(),
         1,
@@ -566,6 +584,12 @@ fn an_authority_with_no_co_writers_is_solo_and_installs_nothing() {
 /// lane the allocator could not hold.
 #[test]
 fn a_roster_past_the_lane_ceiling_refuses_loud() {
+    assert_eq!(
+        grant::MAX_LANES,
+        squeezefs::meta_backend::kv::journal::MAX_APPENDERS,
+        "the ceiling DERIVES from the append-partition descriptor every partitioned structure \
+         already runs on — it is not a second constant"
+    );
     let ids: Vec<String> = (0..grant::MAX_LANES as usize)
         .map(|i| format!("node_{i:016x}"))
         .collect();
@@ -579,11 +603,14 @@ fn a_roster_past_the_lane_ceiling_refuses_loud() {
         "the refusal names the ceiling: {msg}"
     );
 
-    // One under the ceiling is admissible.
+    // Exactly at the ceiling is admissible, and every member has a lane.
     let ok: Vec<&str> = over[..grant::MAX_LANES as usize - 1].to_vec();
     let set = claim_set_with(&ok);
     let map = LaneAssignment::derive(AUTHORITY_ID, std::slice::from_ref(&set)).expect("derive");
     assert_eq!(map.writers(), grant::MAX_LANES);
+    for id in &ok {
+        assert!(map.lane_of(id).is_some(), "{id} holds a lane");
+    }
 }
 
 // ===========================================================================
@@ -609,9 +636,9 @@ async fn the_custody_lease_carries_the_lane_the_authority_assigned() {
         .await
         .expect("node B joins");
 
-    assert_eq!(a.lane_partition().writers(), 3);
-    assert_eq!(a.lane_partition().writer_id(), 1, "node A is lane 1 of 3");
-    assert_eq!(b.lane_partition().writer_id(), 2, "node B is lane 2 of 3");
+    assert_eq!(a.lane_partition().writers(), 4);
+    assert_eq!(a.lane_partition().writer_id(), 1, "node A is lane 1 of 4");
+    assert_eq!(b.lane_partition().writer_id(), 2, "node B is lane 2 of 4");
     assert_ne!(
         a.lane_partition().writer_id(),
         b.lane_partition().writer_id(),
@@ -758,11 +785,13 @@ async fn a_co_writer_allocates_from_its_own_lane_after_admission() {
         );
     }
     let unique: std::collections::BTreeSet<u64> = offsets.iter().copied().collect();
-    assert_eq!(unique.len(), offsets.len(), "a lane never repeats an offset");
     assert_eq!(
-        METRICS
-            .cowriter_accounting_refusals
-            .load(Ordering::Relaxed),
+        unique.len(),
+        offsets.len(),
+        "a lane never repeats an offset"
+    );
+    assert_eq!(
+        METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed),
         refusals_before,
         "allocation stopped counting as an accounting refusal — it is no longer refused"
     );
@@ -852,15 +881,10 @@ async fn a_raise_naming_a_lane_the_client_was_not_assigned_is_refused() {
 
     // Engage the allocator with a lane that is NOT ours (node B's) — the
     // shape a forged or drifted partition would produce.
-    let foreign = part(3, 2);
+    let foreign = part(4, 3);
     let refusals_before = METRICS.alloc_lane_raise_refusals.load(Ordering::Relaxed);
-    let engaged = grant::engage_allocator_lane(
-        &cw.alloc,
-        foreign,
-        &cw.meta,
-        LaneFloor::Authority,
-    )
-    .await;
+    let engaged =
+        grant::engage_allocator_lane(&cw.alloc, foreign, &cw.meta, LaneFloor::Authority).await;
     let err = match engaged {
         Err(e) => e.to_string(),
         Ok(()) => cw
@@ -879,7 +903,7 @@ async fn a_raise_naming_a_lane_the_client_was_not_assigned_is_refused() {
         "and it lands on the must-stay-0 tripwire"
     );
     assert!(
-        auth.record_for(2).await.is_none(),
+        auth.record_for(3).await.is_none(),
         "no record was written for a lane the client does not hold"
     );
 
@@ -1048,10 +1072,25 @@ async fn the_authority_opens_a_co_writers_lane_above_the_durable_dense_frontier(
         "the dense frontier is the referenced-set complement"
     );
 
+    // The other half of the open floor: the authority's LIVE cursor. The
+    // ledger only knows what has been published, and a mount that is writing
+    // knows a fresher frontier — an offset it minted and has not published is
+    // in neither the ledger nor its layouts. `arm_multi_writer` installs this
+    // source from its data-plane router; here it is the same contract as a
+    // closure.
+    grant::install_frontier_source(Arc::new(move |asked: u64| {
+        (asked == tag).then_some(5_000)
+    }));
+
     let cw = CoWriter::join(&auth, &vol, NODE_A, 0).await;
     let p = cw.part();
     cw.engage().await;
     let idx = cw.alloc.allocate_block().await.expect("mint") / cw.alloc.chunk_size();
+    assert!(
+        idx >= 5_000,
+        "the open must also dominate the authority's LIVE cursor ({idx} < 5000): an offset it \
+         minted and has not published yet is in no durable record at all"
+    );
     assert!(
         idx > 902,
         "a co-writer's first mint {idx} must be above the set's live blocks — it never walks the \
@@ -1264,9 +1303,7 @@ async fn the_other_accounting_arms_still_refuse_on_a_laned_co_writer() {
     cw.engage().await;
 
     let off = cw.alloc.allocate_block().await.expect("allocation passes");
-    let refusals_before = METRICS
-        .cowriter_accounting_refusals
-        .load(Ordering::Relaxed);
+    let refusals_before = METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed);
 
     let free_err = cw
         .alloc
@@ -1288,10 +1325,7 @@ async fn the_other_accounting_arms_still_refuse_on_a_laned_co_writer() {
         "W1's incarnation retire refuses"
     );
     assert!(
-        METRICS
-            .cowriter_accounting_refusals
-            .load(Ordering::Relaxed)
-            > refusals_before,
+        METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed) > refusals_before,
         "accounting_refusals keeps counting exactly the arms that remain refused"
     );
 
@@ -1335,7 +1369,12 @@ async fn an_authority_and_two_co_writers_allocate_and_the_authority_frees_their_
 
     let mut authority_offsets = Vec::new();
     for _ in 0..8 {
-        authority_offsets.push(authority_alloc.allocate_block().await.expect("authority mint"));
+        authority_offsets.push(
+            authority_alloc
+                .allocate_block()
+                .await
+                .expect("authority mint"),
+        );
     }
 
     // The two co-writers, in turn (one process holds one posture latch and
@@ -1359,6 +1398,15 @@ async fn an_authority_and_two_co_writers_allocate_and_the_authority_frees_their_
         drop(cw);
     }
 
+    // Back to the AUTHORITY's own posture. One process holds ONE ownership
+    // plane and ONE publish client, so a rig that plays three nodes must put
+    // them back before exercising the authority's allocator again — otherwise
+    // the authority's own lane raise routes to itself as if it were a peer and
+    // is (correctly) refused for naming lane 0 under node B's identity. In the
+    // field these are three processes on three hosts.
+    ship::disarm_ownership();
+    publish::uninstall_client();
+    data_grant::uninstall_custody_client();
     // Global disjointness: three writers, no offset twice.
     fuse_client::set_mount_posture(MountPosture::Writer);
     let mut all: Vec<u64> = authority_offsets.clone();
@@ -1403,17 +1451,24 @@ async fn an_authority_and_two_co_writers_allocate_and_the_authority_frees_their_
         doubles_before,
         "no double free under a partition"
     );
-    assert_eq!(
-        authority_alloc.foreign_lane_free_blocks(),
-        16,
+    let freed: std::collections::BTreeSet<u64> = cw_offsets
+        .iter()
+        .flat_map(|(_, offs)| offs.iter().copied())
+        .collect();
+    assert!(
+        authority_alloc.foreign_lane_free_blocks() >= freed.len() as u64,
         "the freed co-writer blocks are free supply the authority cannot reach"
     );
-    for _ in 0..4 {
+    for _ in 0..16 {
         let off = authority_alloc.allocate_block().await.expect("mint");
         assert_eq!(
             lane::offset_lane_of(off, chunk, map.writers()),
             0,
             "reuse obeys the same residue class as a fresh mint"
+        );
+        assert!(
+            !freed.contains(&off),
+            "the authority re-allocated offset {off}, which belongs to a co-writer's lane"
         );
     }
 

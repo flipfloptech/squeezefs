@@ -1573,6 +1573,145 @@ fn bench_fsck_c9_refset(c: &mut Criterion) {
     group.finish();
 }
 
+/// **fsck class C10 — the price of the counting extension** on top of
+/// C9's referenced-ino pass (`src/fsck.rs`, `RefPass`): C9 asks "is this
+/// inode named", C10 asks "how many names", and the whole design claim is
+/// that the second question is nearly free because
+/// [`squeezefs::fsck::InoBitmap::mark`] already *returns* whether the bit
+/// was newly set — so only a record whose ino was ALREADY named pays
+/// anything.
+///
+/// **What this prices, honestly.** `RefPass` is private, so the rows below
+/// MIRROR its loop body over the public [`squeezefs::fsck::InoBitmap`]:
+/// mark, and on `false` one `contains` plus a `HashMap` probe/insert. That
+/// makes this a bench of the REPRESENTATION, not of the function — if the
+/// loop body changes, this bench must change with it, which is exactly the
+/// falsification criterion's first clause.
+///
+/// **Field-derived shape.** Same population and access order as
+/// `fsck_c9_refset` (1 M dentry targets over the `MINT_SPREAD = 64` slots
+/// at the derived routing width 65536, marked in hash — i.e. random —
+/// order, because dentry keys are `(parent, hash54(name))`-ordered), so
+/// the rows are directly comparable to C9's. The hardlink fraction is the
+/// variable: **0 %** is the field norm (hardlinks are the exception in
+/// every real tree — the case the "costs nothing" claim rests on) and
+/// **5 %** is a deliberately pessimistic ceiling for a tree that really
+/// does use them (source checkouts, package trees, Maildir).
+///
+/// The reverse difference is priced at the same population with 8 damaged
+/// entries — C10's DANGEROUS arms (`nlink == 0` with a live name, a name
+/// whose inode does not exist) are exactly `referenced \ live`, so a
+/// healthy volume's entire loss-direction verdict is one word-parallel
+/// `AND NOT` scan in the other direction from C9's.
+///
+/// **Prediction** (dev box, release, single thread — RECORD, do not
+/// assert; anchored on `fsck_c9_refset`'s own predicted basis of
+/// `mark/random` ≤ ~40 ns/ino):
+///
+/// * `mark_with_counts/random/hardlinks_0pct` ≤ ~44 ns/ino — within ~10 %
+///   of C9's `mark/random`, because every record takes the `first_name`
+///   branch and nothing else runs.
+/// * `mark_with_counts/random/hardlinks_5pct` ≤ ~60 ns/ino — 5 % of
+///   records add one `contains` (a per-slot map lookup + one word read)
+///   and one `HashMap` probe.
+/// * `reverse_difference/8_damaged` ≤ ~1 ns per REFERENCED ino, matching
+///   C9's difference row: the dangerous arms cost the scan, not per-inode
+///   work.
+///
+/// **Falsification.** If `hardlinks_0pct` exceeds C9's `mark/random` by
+/// more than ~15 %, the extension is NOT free on the field norm and the
+/// second-name branch must leave the hot path (count only the inos the
+/// census already flagged, in a second cheap pass). If `hardlinks_5pct`
+/// exceeds ~150 ns/ino, the `HashMap` probe dominates and the multi-name
+/// map must become a different structure (a sorted vector built from the
+/// flagged set). If `reverse_difference` scales with the number of DAMAGED
+/// inos rather than the population, the word-parallel `AND NOT` regressed
+/// to a per-bit `contains` — the same regression C9's row exists to catch.
+///
+/// NOT RUN (ruling D11: no benches until the DLM can serve N readers and
+/// writers). Numbers get measured on the sanctioned venue
+/// (`tests/run_bench_baseline.sh`), never here.
+fn bench_fsck_c10_name_counts(c: &mut Criterion) {
+    use squeezefs::fsck::InoBitmap;
+    use std::collections::HashMap;
+
+    const WIDTH: u64 = 65536;
+    const SLOTS: u64 = 64;
+    const POPULATION: u64 = 1_000_000;
+    let ceiling = 2 + POPULATION / SLOTS + 1;
+    let budget = 16 * 1024 * 1024u64;
+    let ino_of = |raw: u64, slot: u64| (raw - 2) * WIDTH + slot + 2;
+    let inos: Vec<u64> = (0..POPULATION)
+        .map(|i| ino_of(2 + i / SLOTS, i % SLOTS))
+        .collect();
+    // A fixed xorshift permutation: hash order == random order for this
+    // purpose, and determinism keeps the bench comparable run to run.
+    let shuffle = |v: &mut Vec<u64>| {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for i in (1..v.len()).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let j = (state % (i as u64 + 1)) as usize;
+            v.swap(i, j);
+        }
+    };
+
+    // The dentry-record streams: every ino once, plus a second record for
+    // the hardlinked fraction (the shape the pass actually walks).
+    let mut group = c.benchmark_group("fsck_c10_name_counts");
+    for pct in [0u64, 5] {
+        let mut records: Vec<u64> = inos.clone();
+        // The hardlinked fraction contributes a SECOND dentry record for
+        // every `100/pct`-th ino; `0 %` contributes none.
+        if let Some(stride) = (100u64).checked_div(pct) {
+            records.extend(inos.iter().step_by(stride as usize));
+        }
+        shuffle(&mut records);
+        let count = records.len() as u64;
+        group.throughput(criterion::Throughput::Elements(count));
+        group.bench_with_input(
+            BenchmarkId::new("mark_with_counts/random", format!("hardlinks_{pct}pct")),
+            &records,
+            |b, records| {
+                b.iter(|| {
+                    let mut refs = InoBitmap::new(WIDTH, ceiling, budget);
+                    let mut multi: HashMap<u64, u32> = HashMap::new();
+                    for &ino in records.iter() {
+                        let first = refs.mark(black_box(ino));
+                        if !first && refs.contains(ino) {
+                            *multi.entry(ino).or_insert(1) += 1;
+                        }
+                    }
+                    black_box((refs.marked(), multi.len()))
+                });
+            },
+        );
+    }
+
+    // The dangerous arms: `referenced \ live` with 8 damaged entries.
+    let mut referenced = InoBitmap::new(WIDTH, ceiling, budget);
+    for &ino in &inos {
+        referenced.mark(ino);
+    }
+    let mut live = InoBitmap::new(WIDTH, ceiling, budget);
+    for (i, &ino) in inos.iter().enumerate() {
+        // 8 named inos whose record is missing or `nlink == 0`.
+        if i % 125_000 != 0 {
+            live.mark(ino);
+        }
+    }
+    group.throughput(criterion::Throughput::Elements(POPULATION));
+    group.bench_function("reverse_difference/8_damaged", |b| {
+        b.iter(|| {
+            let mut found = 0u64;
+            referenced.each_absent_from(&live, |ino| found += black_box(ino) & 1);
+            black_box(found)
+        });
+    });
+    group.finish();
+}
+
 fn bench_crossvol_tx(c: &mut Criterion) {
     use squeezefs::meta_backend::crossvol_tx::{intent_key, IntentRecord, XvOp, XvStep};
 
@@ -1693,6 +1832,7 @@ criterion_group!(
     bench_ino_cursors,
     bench_block_refs,
     bench_fsck_c9_refset,
+    bench_fsck_c10_name_counts,
     bench_crossvol_tx,
     bench_xattr_name_screen,
     bench_superblock_cycle,

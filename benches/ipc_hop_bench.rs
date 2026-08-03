@@ -120,13 +120,27 @@ fn bench_cqe_doorbell(c: &mut Criterion) {
     g.finish();
 }
 
-/// The **job-wire frame decode floor** — the other protocol surface in
-/// this tree, and the only one whose input is UNTRUSTED: every write
-/// mount opens the §5.1.6 listener on `0.0.0.0` (execution-plan ruling
-/// D2), so `read_frame` is attacker-reachable before any
-/// authentication. VAL-6 rebuilt it (chunk-bounded body commit,
-/// per-class caps and deadlines); this group prices what it costs on
-/// the honest shapes AND what a hostile prefix costs the coordinator.
+/// The **cluster-wire frame floor** — the other protocol surface in this
+/// tree, and the only one whose input is UNTRUSTED: every write mount
+/// opens the listener on `0.0.0.0` (execution-plan ruling D2), so the
+/// reader is attacker-reachable before any authentication. VAL-6 rebuilt
+/// its bounds (chunk-bounded body commit, per-class caps and deadlines);
+/// **DLM S3 moved them onto `cluster_wire` and replaced the codec**, and
+/// this group is where that change is a measured delta rather than a
+/// hope.
+///
+/// The A/B is in the group: `*_json_control` rows run the RETIRED
+/// `serde_json` codec over the identical frames, so the ratio is
+/// reproducible on any box from one `cargo bench` invocation instead of
+/// resting on a remembered number. The row that motivated the change is
+/// `decode_result_submit_64`: VAL-6 measured **32.6 µs** for it under
+/// `serde_json` against §6.5's **10 µs** custody budget — a lock-acquire
+/// path cannot spend its whole latency budget parsing text.
+///
+/// `mac_roundtrip_result_submit_64` prices what S3 ADDED: the per-frame
+/// session MAC (HMAC-SHA256 over direction ‖ sequence ‖ length ‖ body,
+/// both directions) that makes authentication survive past enrollment.
+/// A regression there is a regression on every custody frame.
 ///
 /// Field-derived input shapes (`docs/design-volume-lifecycle.md`
 /// §5.1.6; anchors in `src/job_wire.rs`):
@@ -194,6 +208,75 @@ fn bench_job_wire_frames(c: &mut Criterion) {
 
     let mut g = c.benchmark_group("job_wire_frame");
     g.throughput(Throughput::Elements(1));
+
+    // --- the S3 codec, encode side --------------------------------------
+    g.bench_function("encode_result_submit_64", |b| {
+        b.to_async(&rt).iter(|| async {
+            let mut buf: Vec<u8> = Vec::new();
+            write_frame(&mut buf, &submit).await.expect("encode");
+            std::hint::black_box(buf)
+        })
+    });
+
+    // --- the retired codec, same frames (the A/B control) ---------------
+    g.bench_function("encode_result_submit_64_json_control", |b| {
+        b.iter(|| {
+            let body = serde_json::to_vec(&submit).expect("json encode");
+            std::hint::black_box(body)
+        })
+    });
+    let submit_json = serde_json::to_vec(&submit).expect("json encode");
+    g.bench_function("decode_result_submit_64_json_control", |b| {
+        b.iter(|| {
+            let f: WireFrame = serde_json::from_slice(&submit_json).expect("json decode");
+            std::hint::black_box(f)
+        })
+    });
+    let enroll_json = serde_json::to_vec(&enroll).expect("json encode");
+    g.bench_function("decode_enroll_json_control", |b| {
+        b.iter(|| {
+            let f: WireFrame = serde_json::from_slice(&enroll_json).expect("json decode");
+            std::hint::black_box(f)
+        })
+    });
+
+    // --- what S3 added: the per-frame session MAC, both directions ------
+    let key = squeezefs::cluster_wire::session_key(
+        b"storage-trust-enrollment-secret",
+        "sqz-worker-a3f1c2",
+        "0f1c2d3e-4a5b-6c7d-8e9f-a0b1c2d3e4f5",
+        "9e8d7c6b-5a49-3827-1605-f4e3d2c1b0a9",
+        None,
+    );
+    g.bench_function("mac_roundtrip_result_submit_64", |b| {
+        b.to_async(&rt).iter(|| async {
+            let (mut tx, _) =
+                squeezefs::cluster_wire::session_framers(&key, squeezefs::cluster_wire::Role::Peer);
+            let (_, mut rx) = squeezefs::cluster_wire::session_framers(
+                &key,
+                squeezefs::cluster_wire::Role::Coordinator,
+            );
+            let mut wire: Vec<u8> = Vec::new();
+            tx.send(
+                &mut wire,
+                squeezefs::cluster_wire::FrameClass::Bulk,
+                &submit,
+            )
+            .await
+            .expect("authenticated send");
+            let mut cur = std::io::Cursor::new(wire);
+            let f: WireFrame = rx
+                .recv(
+                    &mut cur,
+                    squeezefs::cluster_wire::FrameClass::Bulk.cap(),
+                    None,
+                )
+                .await
+                .expect("authenticated recv")
+                .expect("one frame");
+            std::hint::black_box(f)
+        })
+    });
 
     g.bench_function("decode_enroll", |b| {
         b.to_async(&rt).iter(|| async {
@@ -507,6 +590,82 @@ fn bench_wake_pair_lines(c: &mut Criterion) {
     g.finish();
 }
 
+/// **The S8 price, measured** (spec §6.10 risk **R1**, accepted as ruling
+/// **D10**): one authenticated request/response round trip on the S3 wire
+/// — the irreducible cost of a function-shipped metadata operation before
+/// the owner does any work at all.
+///
+/// §6.5 item 1 is the arithmetic this row feeds: an uncontended acquire
+/// sits inside a 64 µs under-lock span, and one 250 µs fabric RTT takes
+/// creates from 9,090/s to 2,778/s. Whether S8 is viable is therefore a
+/// question about a measured number, and this is the instrument that
+/// produces it.
+///
+/// **Label discipline (the standing instrument rule):** this venue is
+/// **loopback** — TCP over `127.0.0.1`, no NIC, no fabric, no softirq
+/// path worth the name. It measures framing + MAC + wake + scheduler and
+/// is a **FLOOR**, never a fabric row. The fabric row's requirements
+/// (venue, substrate, A-B-B-A, sustained ≥ 60 s) are stated in
+/// `.benchmarks/2026-08-05-dlm-s3-cluster-wire.md`.
+fn bench_cluster_wire_rtt(c: &mut Criterion) {
+    use squeezefs::cluster_wire::{
+        PingService, RpcClient, RpcListener, RpcListenerConfig, VERB_PING,
+    };
+    use std::sync::Arc;
+    use tokio::runtime::Runtime;
+
+    let rt = Runtime::new().expect("bench runtime");
+    let host = RpcListener::start(
+        RpcListenerConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("literal addr"),
+            service_threads: 1,
+            ..RpcListenerConfig::default()
+        },
+        b"storage-trust-enrollment-secret".to_vec(),
+        Arc::new(PingService),
+    )
+    .expect("listener starts");
+    let endpoint = host.endpoint().to_string();
+    let client = Arc::new(tokio::sync::Mutex::new(
+        rt.block_on(RpcClient::connect(
+            &endpoint,
+            b"storage-trust-enrollment-secret",
+            "bench-peer",
+            None,
+        ))
+        .expect("enrollment"),
+    ));
+
+    let mut g = c.benchmark_group("cluster_wire_rtt");
+    g.throughput(Throughput::Elements(1));
+    // qd1, 0-byte payload: the pure round-trip term an S8 metadata verb
+    // pays on top of the owner's own work.
+    g.bench_function("authenticated_ping_qd1", |b| {
+        let client = Arc::clone(&client);
+        b.to_async(&rt).iter(|| {
+            let client = Arc::clone(&client);
+            async move {
+                let mut c = client.lock().await;
+                std::hint::black_box(c.call(VERB_PING, Vec::new()).await.expect("ping"))
+            }
+        })
+    });
+    // 4 KiB: the shape a batched grant/reclaim frame is closer to.
+    g.bench_function("authenticated_ping_4k", |b| {
+        let client = Arc::clone(&client);
+        b.to_async(&rt).iter(|| {
+            let client = Arc::clone(&client);
+            async move {
+                let mut c = client.lock().await;
+                std::hint::black_box(c.call(VERB_PING, vec![0xa5; 4096]).await.expect("ping"))
+            }
+        })
+    });
+    g.finish();
+    drop(client);
+    host.shutdown();
+}
+
 criterion_group!(
     benches,
     bench_ring_push_pop,
@@ -515,6 +674,7 @@ criterion_group!(
     bench_cqe_doorbell,
     bench_wake_pair_lines,
     bench_job_wire_frames,
+    bench_cluster_wire_rtt,
     bench_drain_pass
 );
 criterion_main!(benches);

@@ -225,6 +225,10 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_FREE_FORENSICS", Kind::Bool, "off", "Capture a backtrace per block free to attribute double frees (expensive)."),
     k("SQUEEZEFS_STATS_KEY_CENSUS", Kind::Bool, "off", "VAL-7a: arm the `.stats` key census (live object keys + per-inode write custody — a debugging surface). The `*_count` replacements stay unconditional."),
     // -- Cluster wire (DLM S3 — the ONE cluster transport) ---------------
+    k("SQZ_CLW_RTT_ENDPOINT", Kind::Harness, "loopback", "RTT instrument: dial a REAL coordinator instead of a local loopback listener (tests/cluster_wire_tests.rs `rtt_row`)."),
+    k("SQZ_CLW_RTT_SECRET_HEX", Kind::Harness, "none", "RTT instrument: the target volume set's job:enroll secret, hex (required for a remote row)."),
+    k("SQZ_CLW_RTT_SAMPLES", Kind::Harness, "2000", "RTT instrument: counted samples after the discarded warm-up."),
+    k("SQZ_CLW_RTT_PAYLOAD", Kind::Harness, "0", "RTT instrument: payload bytes per direction."),
     k("SQUEEZEFS_CLUSTER_WIRE_SVC_THREADS", int(1, 1 << 12), "derived clamp(cpus/8, 1, 8)", "Owner-side RPC lanes (pinned service threads — §6.7's venue rule: never the conveyor's task). Absolute override; still clamped to the core count so it cannot oversubscribe the box."),
     // -- fsck / jobs ------------------------------------------------------
     k("SQUEEZEFS_FSCK_SETTLE_MS", int(0, MS_MAX), "2000", "fsck suspect-settle window, ms (the zero-FP ladder)."),

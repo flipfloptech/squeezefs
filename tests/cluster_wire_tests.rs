@@ -182,6 +182,13 @@ fn framing_is_binary_and_smaller_than_the_json_it_replaces() {
         binary.len(),
         json.len()
     );
+    // The row the evidence note cites (`--nocapture`).
+    eprintln!(
+        "cluster_wire frame bytes (64-checksum mover shard): binary {} B vs json {} B ({:.2}×)",
+        binary.len(),
+        json.len(),
+        json.len() as f64 / binary.len() as f64
+    );
 }
 
 #[test]
@@ -1124,4 +1131,72 @@ async fn rpc_service_calls_execute_on_the_pinned_pool() {
         "an owner-side RPC must never run on the conveyor's runtime"
     );
     host.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// The RTT row instrument, on demand
+// ---------------------------------------------------------------------------
+
+/// The counted RTT row, run by name (never in the normal suite — a
+/// measurement is not a gate):
+///
+/// ```text
+/// # loopback FLOOR (framing + authn + wake; fabric term ~0)
+/// cargo test --release --test cluster_wire_tests -- --ignored --nocapture rtt_row
+///
+/// # a REAL peer: point it at a live coordinator's cluster_wire endpoint
+/// SQZ_CLW_RTT_ENDPOINT=10.0.0.2:7100 SQZ_CLW_RTT_SECRET_HEX=<job:enroll secret> \
+/// SQZ_CLW_RTT_SAMPLES=5000 cargo test --release --test cluster_wire_tests -- \
+///   --ignored --nocapture rtt_row
+/// ```
+///
+/// The secret is the shared volume's `job:enroll` record — i.e. the probe
+/// authenticates exactly like any other peer (`squeezefs job worker` reads
+/// the same record), which is the point of storage trust.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement, not a gate: run by name (see the doc comment)"]
+async fn rtt_row() {
+    let samples: usize = std::env::var("SQZ_CLW_RTT_SAMPLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2_000);
+    let payload: usize = std::env::var("SQZ_CLW_RTT_PAYLOAD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    match std::env::var("SQZ_CLW_RTT_ENDPOINT").ok() {
+        Some(endpoint) => {
+            let hex = std::env::var("SQZ_CLW_RTT_SECRET_HEX")
+                .expect("a remote row needs SQZ_CLW_RTT_SECRET_HEX (the job:enroll secret)");
+            let secret = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex secret"))
+                .collect::<Vec<u8>>();
+            let report = cw::measure_rtt(&endpoint, &secret, "rtt-probe", samples, payload)
+                .await
+                .expect("the remote coordinator answered");
+            eprintln!("cluster_wire RTT [REMOTE {endpoint}] {report:?}");
+        }
+        None => {
+            let host =
+                cw::RpcListener::start(listener_cfg(), SECRET.to_vec(), Arc::new(cw::PingService))
+                    .expect("listener starts");
+            let report = cw::measure_rtt(
+                &host.endpoint().to_string(),
+                SECRET,
+                "rtt-probe",
+                samples,
+                payload,
+            )
+            .await
+            .expect("the instrument runs");
+            eprintln!(
+                "cluster_wire RTT [LOOPBACK FLOOR — not a fabric row] {report:?} \
+                 (served {})",
+                host.stats().requests_served
+            );
+            host.shutdown();
+        }
+    }
 }

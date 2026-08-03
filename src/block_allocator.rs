@@ -656,6 +656,45 @@ impl BlockAllocator {
         self.refcount(offset) == Some(1)
     }
 
+    /// W1 **clause 7** — whole-inode exclusive custody (DLM stage S11;
+    /// pre-rc spec §6.7 lock modes, §6.3's W1 paragraph).
+    ///
+    /// [`Self::begin_patch_sole_owner`] proves the block is not
+    /// CLONE-shared (refcount == 1). It proves nothing about a second
+    /// writer holding custody of some of the block's BYTES — under
+    /// byte-range custody that writer exists, and an in-place mutation of
+    /// the block would touch bytes it owns (and race its CoW republish of
+    /// the same block). This is the seventh clause of the §5.4 decision
+    /// ledger, and the counter is its rot instrument.
+    ///
+    /// Callers pass the **whole block's** logical span, not the written
+    /// sub-range: the patch retires the block's incarnation word, purges
+    /// every tier under the block key, and (the in-place-rewrite arm)
+    /// rewrites the whole block, so the custody the predicate demands is
+    /// custody of the block. v1 is deliberately conservative there —
+    /// refining to sub-block custody is S11's remote half, and this
+    /// counter is what will show it is needed.
+    ///
+    /// `true` ⇒ ineligible (counted); `false` ⇒ the shipped shapes: no
+    /// live custody, or a whole-file lease (whole-inode custody — what the
+    /// write path's `get_or_acquire_lease` takes, so the clause is inert
+    /// on every shipped mount), or a range grant this writer solely owns
+    /// that covers the block.
+    pub fn patch_range_shared(
+        ino: u64,
+        block_start: u64,
+        block_end: u64,
+        holder_token: u64,
+    ) -> bool {
+        if !crate::dlm::span_range_shared(ino, block_start, block_end, holder_token) {
+            return false;
+        }
+        crate::fuse_client::METRICS
+            .patch_ineligible_range_shared
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
     /// §5.1 clone amendment (a): pin + **validate-after-pin**. Takes one
     /// reference exactly like [`Self::increment_refcount`]; on success it
     /// interposes the cross-word `SeqCst` fence and snapshots the offset's

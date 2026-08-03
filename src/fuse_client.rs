@@ -3947,6 +3947,17 @@ pub struct Metrics {
     pub patch_ineligible_overlay: Align64<AtomicU64>,
     /// Predicate 4 failures: block refcount != 1 (clone-shared — CoW).
     pub patch_ineligible_shared: Align64<AtomicU64>,
+    /// **Clause 7** failures (DLM stage S11 — pre-rc spec §6.7/§6.3): the
+    /// block's bytes are under BYTE-RANGE custody this writer does not
+    /// solely own (a foreign live range overlaps the block, or the
+    /// writer's own range does not cover it), so whole-inode exclusive
+    /// custody — which the in-place patch requires — does not hold.
+    /// Refcount==1 only proves the block is not CLONE-shared; it says
+    /// nothing about a second writer holding some of its bytes.
+    /// **0 on every shipped mount** (the write path takes a whole-file
+    /// lease, which IS whole-inode custody): growth means either a verb
+    /// started issuing range leases or the predicate rotted.
+    pub patch_ineligible_range_shared: Align64<AtomicU64>,
     /// Predicate 3 failures: compressed/encrypted volume (a transform
     /// image cannot be patched in place).
     pub patch_ineligible_transform: Align64<AtomicU64>,
@@ -6331,6 +6342,7 @@ impl SqueezefsFilesystem {
                 "patch_ineligible_unaligned": METRICS.patch_ineligible_unaligned.load(Ordering::Relaxed),
                 "patch_ineligible_overlay": METRICS.patch_ineligible_overlay.load(Ordering::Relaxed),
                 "patch_ineligible_shared": METRICS.patch_ineligible_shared.load(Ordering::Relaxed),
+                "patch_ineligible_range_shared": METRICS.patch_ineligible_range_shared.load(Ordering::Relaxed),
                 "patch_ineligible_transform": METRICS.patch_ineligible_transform.load(Ordering::Relaxed),
                 "patch_ineligible_adjacent": METRICS.patch_ineligible_adjacent.load(Ordering::Relaxed),
                 "patch_ineligible_oversize": METRICS.patch_ineligible_oversize.load(Ordering::Relaxed),
@@ -8521,11 +8533,16 @@ impl SqueezefsFilesystem {
     /// striped blocks). Called with the block's [`BLOCK_FLUSH_LOCKS`]
     /// guard HELD and the request-shape predicates (5: aligned / sized /
     /// non-extending / single-block; 6: not stream-adjacent) already
-    /// passed. Runs the remaining predicates (2: no RAM/staged overlay —
-    /// lock-free probes; 3: passthrough; 1: undecorated whole-block
-    /// mapping, resolved from the authoritative cached map under the held
-    /// lock; 4: refcount == 1 re-checked AFTER the unstable-mark, per the
-    /// §5.1 clone/patch fence) and, when they hold, performs the patch:
+    /// passed. Runs the remaining predicates in this order — **7: the
+    /// block's bytes are not under foreign byte-range custody** (DLM S11
+    /// clause 7, checked first because custody is the precondition for
+    /// considering an in-place mutation at all; inert on every shipped
+    /// mount, where the write path holds a whole-file lease); 2: no
+    /// RAM/staged overlay — lock-free probes; 3: passthrough; 1:
+    /// undecorated whole-block mapping, resolved from the authoritative
+    /// cached map under the held lock; 4: refcount == 1 re-checked AFTER
+    /// the unstable-mark, per the §5.1 clone/patch fence — and, when they
+    /// hold, performs the patch:
     ///
     /// 1. `mark_incarnation_unstable` → `fence(SeqCst)` → refcount re-check
     ///    ([`crate::block_allocator::BlockAllocator::begin_patch_sole_owner`]);
@@ -8556,7 +8573,24 @@ impl SqueezefsFilesystem {
         payload: &[u8],
         cache_key: &str,
         file_path: &str,
+        fencing_token: u64,
     ) -> Result<bool, SqueezefsError> {
+        // Clause 7 (DLM S11 — spec §6.7): the patch requires whole-inode
+        // exclusive custody. Under byte-range custody the writer must own
+        // the whole block's bytes; a foreign overlapping range (or its own
+        // partial one) refuses here and counts
+        // `patch_ineligible_range_shared`. Inert on the shipped write path
+        // (a whole-file lease IS whole-inode custody).
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        let block_start = b as u64 * block_size;
+        if crate::block_allocator::BlockAllocator::patch_range_shared(
+            ino,
+            block_start,
+            block_start + block_size,
+            fencing_token,
+        ) {
+            return Ok(false);
+        }
         // Predicate 2 — no accumulation overlay owns the block. Lock-free:
         // dashmap probe + the staged occupancy index (review Issue 10 —
         // never the spawn_blocking/shard-write-lock hop on this path).
@@ -8960,6 +8994,7 @@ impl SqueezefsFilesystem {
                             file_data_slice,
                             &cache_key,
                             &file_path,
+                            fencing_token,
                         )
                         .await
                     {
@@ -10051,6 +10086,20 @@ impl SqueezefsFilesystem {
         }
         let block_size = self.router.block_size.load(Ordering::Relaxed);
         if processed.len() as u64 != block_size {
+            return Ok(false);
+        }
+        // Clause 7 (DLM S11 — spec §6.7), whole-block face: an in-place
+        // WHOLE-BLOCK rewrite under byte-range custody would clobber every
+        // byte of the block, so it demands custody of the block. Inert on
+        // the shipped write path (a whole-file lease IS whole-inode
+        // custody); counted in `patch_ineligible_range_shared`.
+        let block_start = b as u64 * block_size;
+        if crate::block_allocator::BlockAllocator::patch_range_shared(
+            ino,
+            block_start,
+            block_start + block_size,
+            fencing_token,
+        ) {
             return Ok(false);
         }
         // The block's authoritative mapping under the caller's held block

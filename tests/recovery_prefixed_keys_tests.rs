@@ -362,7 +362,7 @@ async fn test_inline_map_recovery_recovers_prefixed_keys_on_owning_volume() {
     };
     let bytes = bincode::serialize(&layout).expect("serialize layout");
     h.routed
-        .set_layout_and_size(ino, &bytes, layout.size)
+        .set_layout_and_size(ino, &bytes, layout.size, &[])
         .await
         .expect("plant layout");
 
@@ -634,7 +634,7 @@ async fn test_staged_layout_block_map_recovery_seeds_refcounts() {
         };
         let bytes = bincode::serialize(&layout).expect("serialize layout");
         h.routed
-            .set_layout_and_size(ino, &bytes, layout.size)
+            .set_layout_and_size(ino, &bytes, layout.size, &[])
             .await
             .expect("plant staged layout");
         owned_offsets.push((vol_idx, ino, off));

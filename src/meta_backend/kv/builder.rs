@@ -40,8 +40,7 @@ use super::checkpoint::{write_ledger_slot, LedgerRecord, TreeRoot};
 use super::node::{key_successor, write_node, NodeLayout, NodeWriteParams, NODE_PAGE};
 use super::record::{
     dentry_key, dentry_name_hash54, inode_key, xattr_key, xattr_name_hash56, DentryValue,
-    InodeValue, Record, XattrValue, TREE_BLOCK_REFS, TREE_DENTRIES, TREE_INODES,
-    TREE_XATTRS,
+    InodeValue, Record, XattrValue, TREE_BLOCK_REFS, TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
 };
 use super::superblock::{write_superblock_v3, SuperblockV3};
 use super::tree::{encode_interior_value, KvTree, KEY_SPACE_MAX};
@@ -738,6 +737,14 @@ pub async fn digest_walk(trees: &[&KvTree]) -> Result<u64, KvError> {
                     && XattrValue::decode(v)
                         .map(|x| {
                             x.name == super::backend::WRITER_CLAIM_XATTR.as_bytes()
+                                // DLM S2 (incompat bit 7): the durable
+                                // writer TERM is the same class as the
+                                // claim — mount-guard state, not
+                                // filesystem content — and it is
+                                // MONOTONE PER MOUNT by design, so
+                                // including it made every
+                                // digest-across-remount comparison
+                                // structurally false (era N vs era N+1).
                                 || x.name == super::backend::WRITER_TERM_XATTR.as_bytes()
                         })
                         .unwrap_or(false)

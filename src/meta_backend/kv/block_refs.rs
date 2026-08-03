@@ -53,7 +53,7 @@
 //!   mutual exclusion beyond the per-ino guard they already hold.
 //! * **The delta rides the layout transaction.** A publish that gains
 //!   block *b* stages one `Put`; a publish that displaces *b'* stages one
-//!   `Delete` — into the **same** [`super::backend::KvTx`] as the layout
+//!   `Delete` — into the **same** `KvTx` as the layout
 //!   record and the inode record. One tx = one checksummed journal entry
 //!   (§4.10) still holds: the accounting can never disagree with the
 //!   layout that justifies it, not even across a torn write, and the

@@ -91,7 +91,13 @@ async fn publish_block(
         vec![(b, key)],
     );
     routed
-        .merge_layout_and_size(ino, &delta, bytes::Bytes::from(full.clone()), layout.size)
+        .merge_layout_and_size(
+            ino,
+            &delta,
+            bytes::Bytes::from(full.clone()),
+            layout.size,
+            Vec::new(),
+        )
         .await
         .expect("publish")
 }
@@ -328,7 +334,7 @@ async fn no_delta_no_incompat_bit() {
     };
     let bytes = bincode::serialize(&layout).unwrap();
     routed
-        .set_layout_and_size(inode.ino, &bytes, BLOCK)
+        .set_layout_and_size(inode.ino, &bytes, BLOCK, &[])
         .await
         .expect("full save");
     for vol in &routed.volumes {

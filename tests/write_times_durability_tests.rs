@@ -149,7 +149,7 @@ async fn set_layout_and_size_never_authors_inode_times() {
     // Force the persist onto a LATER coarse tick — pre-fix this makes
     // the fabricated ctime observably diverge every run.
     spin_next_coarse_tick();
-    be.set_layout_and_size(ino, b"layout-bytes", 4096)
+    be.set_layout_and_size(ino, b"layout-bytes", 4096, &[])
         .await
         .unwrap();
 

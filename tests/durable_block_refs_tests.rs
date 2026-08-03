@@ -90,7 +90,9 @@ async fn format_meta(path: &std::path::Path) {
 }
 
 async fn mount(meta: &std::path::Path, data: &std::path::Path) -> Rig {
-    let kv = KvMetaBackend::open(meta).await.expect("open v3 meta volume");
+    let kv = KvMetaBackend::open(meta)
+        .await
+        .expect("open v3 meta volume");
     let routed = Arc::new(RoutedMetaBackend::new(vec![kv]));
     let dlm = DlmClient::new().unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(data.to_str().unwrap()));
@@ -783,7 +785,8 @@ async fn accounting_rides_the_publish_transaction_and_adds_no_commit() {
         "one durable reference staged per published block (the engagement instrument)"
     );
     assert_eq!(
-        accounted_entries, plain_entries,
+        accounted_entries,
+        plain_entries,
         "durable accounting must ride the layout commit — it added {} journal \
          entr(ies) over the un-accounted leg, which would re-split the \
          write-commit-economy collapse",

@@ -989,14 +989,23 @@ async fn offline_drain_body(
     router.backend_router.set_volume_records(records.clone());
     router.set_meta_backend(routed.clone());
 
-    // Allocator refcount recovery — the census ground truth (§5.2).
-    for kv in &routed.volumes {
-        for entry in router.backend_router.backends.iter() {
-            entry
-                .value()
-                .block_allocator
-                .recover_active_blocks_v3(kv, &router.backend_router)
-                .await?;
+    // Block-ownership recovery — the census ground truth (§5.2). Pre-RC
+    // spec §6.2 item 1: durable reference records where incompat bit 8 is
+    // stamped (no inode-tree walk), the derived walk otherwise.
+    if router
+        .backend_router
+        .recover_durable_block_refs(&routed)
+        .await?
+        .is_none()
+    {
+        for kv in &routed.volumes {
+            for entry in router.backend_router.backends.iter() {
+                entry
+                    .value()
+                    .block_allocator
+                    .recover_active_blocks_v3(kv, &router.backend_router)
+                    .await?;
+            }
         }
     }
 

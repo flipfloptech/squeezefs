@@ -395,7 +395,7 @@ async fn audit_block_publish_meta_economy() {
     for k in 1..=K {
         let bytes = layout_bytes(k);
         routed
-            .set_layout_and_size(inode.ino, &bytes, (k as u64) * 4 * 1024 * 1024)
+            .set_layout_and_size(inode.ino, &bytes, (k as u64) * 4 * 1024 * 1024, &[])
             .await
             .expect("publish");
         if k == WINDOWS[window] {
@@ -416,7 +416,7 @@ async fn audit_block_publish_meta_economy() {
     let rw_before = (ring.written_entries(), ring.written_bytes());
     for _ in 0..K {
         routed
-            .set_layout_and_size(inode.ino, &full, (K as u64) * 4 * 1024 * 1024)
+            .set_layout_and_size(inode.ino, &full, (K as u64) * 4 * 1024 * 1024, &[])
             .await
             .expect("republish");
     }

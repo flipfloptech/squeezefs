@@ -609,7 +609,7 @@ async fn dur8b_the_chain_cap_bounds_the_durable_delta_chain() {
     };
     // The persisted base every delta folds onto.
     let full = bincode::serialize(&layout).expect("serialize base");
-    kv.set_layout_and_size(ino, &full, 0)
+    kv.set_layout_and_size(ino, &full, 0, &[])
         .await
         .expect("persist base");
 
@@ -632,7 +632,13 @@ async fn dur8b_the_chain_cap_bounds_the_durable_delta_chain() {
             vec![(b, key)],
         );
         let used = kv
-            .merge_layout_and_size(ino, &delta, bytes::Bytes::from(full), layout.size)
+            .merge_layout_and_size(
+                ino,
+                &delta,
+                bytes::Bytes::from(full),
+                layout.size,
+                Vec::new(),
+            )
             .await
             .expect("publish");
         if used {

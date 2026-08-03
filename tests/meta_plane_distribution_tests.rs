@@ -227,7 +227,7 @@ async fn test_single_dir_workload_journal_distribution_balanced() {
         for b in 1..=PUBLISHES_PER_FILE {
             let bytes = layout_bytes(b);
             routed
-                .set_layout_and_size(ino, &bytes, (b as u64) * 4 * 1024 * 1024)
+                .set_layout_and_size(ino, &bytes, (b as u64) * 4 * 1024 * 1024, &[])
                 .await
                 .unwrap_or_else(|e| panic!("publish {b} on file {i}: {e}"));
         }

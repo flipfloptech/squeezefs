@@ -108,7 +108,7 @@ fn wce_crash_child_entry() {
             if b > 0 && b.is_multiple_of(64) {
                 // The routing chain cap's re-base shape: a full save.
                 backend
-                    .set_layout_and_size(ino, &full, layout.size)
+                    .set_layout_and_size(ino, &full, layout.size, &[])
                     .await
                     .unwrap();
             } else {
@@ -127,6 +127,7 @@ fn wce_crash_child_entry() {
                         &delta,
                         bytes::Bytes::from(full.clone()),
                         layout.size,
+                        Vec::new(),
                     )
                     .await
                     .unwrap();

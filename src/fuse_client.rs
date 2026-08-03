@@ -6925,6 +6925,36 @@ impl SqueezefsFilesystem {
                     "meta_kv_pending_free_overflow".into(),
                     load(&meta_kv::META_KV_PENDING_FREE_OVERFLOW),
                 );
+                // Pre-RC spec §6.2 item 1 (incompat bit 8): durable
+                // block-reference accounting. `staged`/`released` are the
+                // engagement instruments — a striped write storm that does
+                // not move `staged` has regressed to derived-only
+                // accounting; `recovered` is the reference count that
+                // REPLACED the mount-time inode-tree walk; `drift` is the
+                // must-stay-0 tripwire (nonzero = an fsck C8 finding: the
+                // ledger and the layouts that justify it diverged);
+                // `unresolved` counts accounting ops dropped for want of a
+                // resolvable block key (0 on a healthy mount).
+                metrics.insert(
+                    "meta_kv_block_refs_staged".into(),
+                    load(&meta_kv::META_KV_BLOCK_REFS_STAGED),
+                );
+                metrics.insert(
+                    "meta_kv_block_refs_released".into(),
+                    load(&meta_kv::META_KV_BLOCK_REFS_RELEASED),
+                );
+                metrics.insert(
+                    "meta_kv_block_refs_recovered".into(),
+                    load(&meta_kv::META_KV_BLOCK_REFS_RECOVERED),
+                );
+                metrics.insert(
+                    "meta_kv_block_refs_drift".into(),
+                    load(&meta_kv::META_KV_BLOCK_REFS_DRIFT),
+                );
+                metrics.insert(
+                    "meta_kv_block_refs_unresolved".into(),
+                    load(&meta_kv::META_KV_BLOCK_REFS_UNRESOLVED),
+                );
                 metrics.insert(
                     "meta_kv_commit_smo_retries".into(),
                     load(&meta_kv::META_KV_COMMIT_SMO_RETRIES),

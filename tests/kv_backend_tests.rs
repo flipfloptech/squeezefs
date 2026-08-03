@@ -1781,7 +1781,7 @@ async fn mutating_destroy_and_layout_conformance() {
 
     // The fsync/release writeback shape (§5.3): layout xattr + size in
     // one call; on v3 this is ONE two-record transaction.
-    b.set_layout_and_size(f.ino, b"layout-bytes-0123", 8192)
+    b.set_layout_and_size(f.ino, b"layout-bytes-0123", 8192, &[])
         .await
         .expect("set_layout_and_size");
     assert_eq!(

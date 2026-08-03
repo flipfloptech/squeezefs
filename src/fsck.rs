@@ -214,6 +214,12 @@ pub enum FindingId {
     C5Staging { dir: PathBuf },
     /// C6: capacity-accounting drift.
     C6Drift { vol: String },
+    /// C8: **durable-vs-derived block-reference drift** (pre-RC spec §6.2
+    /// item 1): the durable reference population for a block disagrees
+    /// with the layout walk's census. Must never fire on a healthy
+    /// volume — the ledger and the layouts that justify it ride ONE
+    /// checksummed journal entry.
+    C8DurableRefDrift { vol: String, offset: u64 },
     /// C7: scrub-failed block.
     C7Scrub {
         ino: u64,
@@ -428,6 +434,13 @@ enum SuspectKind {
         expected: u32,
         actual: u32,
     },
+    /// C8: durable-vs-derived block-reference drift (spec §6.2 item 1).
+    C8DurableRefDrift {
+        vol: String,
+        offset: u64,
+        durable: u32,
+        derived: u32,
+    },
     /// C4: staged custody without live ino meta.
     C4Orphan { dir: PathBuf, key: String, ino: u64 },
     /// C5: staging generation invalid.
@@ -565,6 +578,39 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
 
         // C2/C3/C6 evaluation against the live allocator state.
         evaluate_allocator_classes(&vols, &census, opts, &mut counters, &mut suspects);
+        // C8 (pre-RC spec §6.2 item 1): durable-vs-derived block-reference
+        // drift. The durable ledger holds one record per layout map entry and
+        // the oracle counts one reference per layout map entry — through the
+        // same key-resolution code — so a disagreement is real divergence, not
+        // a race. Skipped entirely on volumes without incompat bit 8 (they
+        // have no ledger to disagree with) and under `--shards` (a shard sees
+        // only part of the reference set, so its census is not comparable).
+        if opts.shard.is_none() && ctx.meta.volumes.iter().any(|kv| kv.block_refs_engaged()) {
+            let chunk = ctx.router.backend_router.default_allocator.chunk_size();
+            match ctx
+                .router
+                .backend_router
+                .verify_durable_block_refs(&ctx.meta)
+                .await
+            {
+                Ok(drift) => {
+                    for (vol, idx, durable, derived) in drift {
+                        suspects.push(Suspect {
+                            kind: SuspectKind::C8DurableRefDrift {
+                                vol,
+                                offset: idx.saturating_mul(chunk),
+                                durable,
+                                derived,
+                            },
+                        });
+                    }
+                }
+                Err(e) => log::warn!(
+                    "fsck C8: durable block-reference comparison failed: {e} (no verdict \
+                 recorded — the class is skipped for this run, never guessed)"
+                ),
+            }
+        }
 
         counters.suspects = suspects.len() as u64;
 
@@ -1327,6 +1373,7 @@ async fn recheck_suspects(
                 | SuspectKind::C2Lost { .. }
                 | SuspectKind::C3Refcount { .. }
                 | SuspectKind::C6Drift { .. }
+                | SuspectKind::C8DurableRefDrift { .. }
         )
     });
     let fresh = if needs_fresh {
@@ -1438,6 +1485,41 @@ async fn recheck_suspects(
                     }),
                     _ => None, // untracked/unreferenced shapes are C2's business
                 }
+            }
+            SuspectKind::C8DurableRefDrift {
+                vol,
+                offset,
+                durable,
+                derived,
+            } => {
+                // Verify-before-report (KD-9): re-run the comparison and
+                // keep the finding only if THIS block still disagrees. The
+                // ledger and the layout ride one journal entry, so a
+                // transient disagreement is not a shape this can produce —
+                // the re-check is the zero-FP discipline, not a settle
+                // window.
+                let fresh = ctx
+                    .router
+                    .backend_router
+                    .verify_durable_block_refs(&ctx.meta)
+                    .await
+                    .unwrap_or_default();
+                let chunk = ctx.router.backend_router.default_allocator.chunk_size();
+                let idx = offset / chunk.max(1);
+                fresh
+                    .iter()
+                    .any(|(v, i, _, _)| v == vol && *i == idx)
+                    .then(|| FsckFinding {
+                        class: "C8".to_string(),
+                        object: format!("{vol}:{offset}"),
+                        evidence: format!(
+                            "durable block-reference drift: {durable} durable record(s)                              vs {derived} counted layout reference(s), stable across                              both scan epochs — the durable ledger and the layouts that                              justify it diverged"
+                        ),
+                        identity: Some(FindingId::C8DurableRefDrift {
+                            vol: vol.clone(),
+                            offset: *offset,
+                        }),
+                    })
             }
             SuspectKind::C6Drift { vol, .. } => {
                 let Some(alloc) = alloc_of(vol) else {
@@ -2213,6 +2295,12 @@ fn planned_action(id: &FindingId) -> (&'static str, String) {
             "recompute-accounting",
             format!("recompute {vol}'s derived used/free accounting from the tracked census"),
         ),
+        FindingId::C8DurableRefDrift { vol, offset } => (
+            "restate-durable-refs",
+            format!(
+                "restate {vol}:{offset}'s durable reference records from the layout                  walk's verified census (the layouts are the justification; the ledger                  is the index)"
+            ),
+        ),
         FindingId::C7Scrub { mapping, .. } => (
             "quarantine-mapping",
             format!(
@@ -2431,6 +2519,33 @@ pub async fn repair(
     for (f, id) in actionable {
         let what = format!("{}:{}", f.class, f.object);
         match id {
+            // ------------------------------------ C8 durable-ref drift
+            //
+            // Repair is REFUSED, deliberately, and the refusal is the
+            // honest answer rather than a gap (§5.6a "no fabrication where
+            // redundancy does not exist"). Restating the ledger from the
+            // layout walk is a whole-volume mutation whose safe form needs
+            // every referencing ino's lease held across the restate, and a
+            // C8 finding means the accounting invariant ALREADY broke — the
+            // operator must see the divergence and its cause before a tool
+            // overwrites the evidence with the walk's opinion. The layouts
+            // are intact either way (they are the justification; the ledger
+            // is only its index), and mounting with
+            // `SQUEEZEFS_BLOCK_REFS_VERIFY=1` re-proves the state after any
+            // manual remedy.
+            FindingId::C8DurableRefDrift { vol, offset } => {
+                refuse(
+                    &mut out,
+                    f,
+                    format!(
+                        "durable block-reference drift at {vol}:{offset} is reported, \
+                         never auto-repaired: the ledger and the layouts diverged, and \
+                         restating one from the other would erase the evidence of why. \
+                         The layouts remain authoritative"
+                    ),
+                );
+                continue;
+            }
             // -------------------------------------------------- C1 torn
             FindingId::C1Torn {
                 vol,

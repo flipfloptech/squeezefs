@@ -1164,7 +1164,7 @@ impl BlockAllocator {
     /// multiset by construction — one durable record per layout map
     /// entry.
     ///
-    /// Deliberately shares [`Self::layout_owned_blocks`] with the
+    /// Deliberately shares `layout_owned_blocks` with the
     /// recovery path: an oracle that re-implemented the extraction would
     /// only ever test the re-implementation.
     pub async fn derived_block_census(
@@ -1421,8 +1421,7 @@ impl BlockAllocator {
         for idx in sorted {
             let _ = self.recover_block(idx).await;
         }
-        crate::meta_backend::kv::META_KV_BLOCK_REFS_RECOVERED
-            .fetch_add(seeded, Ordering::Relaxed);
+        crate::meta_backend::kv::META_KV_BLOCK_REFS_RECOVERED.fetch_add(seeded, Ordering::Relaxed);
         seeded
     }
 }

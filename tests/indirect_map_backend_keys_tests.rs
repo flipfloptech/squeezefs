@@ -879,7 +879,7 @@ async fn fetch_with_planted_blob(
     };
     let bytes = bincode::serialize(&layout).expect("serialize layout");
     routed
-        .set_layout_and_size(ino, &bytes, layout.size)
+        .set_layout_and_size(ino, &bytes, layout.size, &[])
         .await
         .expect("plant layout");
 

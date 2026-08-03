@@ -3892,8 +3892,7 @@ impl KvTx {
         let took = ops.iter().filter(|o| o.take).count() as u64;
         let dropped = ops.len() as u64 - took;
         if took > 0 {
-            super::META_KV_BLOCK_REFS_STAGED
-                .fetch_add(took, std::sync::atomic::Ordering::Relaxed);
+            super::META_KV_BLOCK_REFS_STAGED.fetch_add(took, std::sync::atomic::Ordering::Relaxed);
         }
         if dropped > 0 {
             super::META_KV_BLOCK_REFS_RELEASED

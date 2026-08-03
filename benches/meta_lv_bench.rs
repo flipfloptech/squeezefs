@@ -960,6 +960,228 @@ fn bench_append_partition(c: &mut Criterion) {
         b.iter(|| black_box(black_box(&rec).slot_index()))
     });
 
+/// **Durable block-reference accounting** (pre-RC engineering spec §6.2
+/// item 1, incompat bit 8) — the publish path's added cost, priced.
+///
+/// Input shapes are FIELD-derived, not toys:
+///
+/// * **`delta_apply_*`** — the accounting work one block publish adds:
+///   translate the merge's `(map index, block key, taken?)` changes into
+///   records and stage them. Widths 1 (a streaming append: one block
+///   gained) and 2 (an overwrite: one gained, one displaced) are the two
+///   shapes the field's rewrite row runs (`.benchmarks/2026-08-01-
+///   rewrite-publish-drain.md` §3: ~2,600 block-publishes/s, publish
+///   coalescing at 1–3 blocks per batch), and 64 is the
+///   `SQUEEZEFS_PUBLISH_COALESCE_MAX` default window — the worst case a
+///   single aggregated transaction carries.
+/// * **`entry_encode_publish_with_refs`** — the journal-byte cost of the
+///   same records inside the entry the publish was already writing,
+///   measured against the accounting-free entry so the delta is the
+///   answer (no second entry exists to measure: the records ride the
+///   layout tx by construction).
+/// * **`recovery_scan_decode`** — the mount path that REPLACES the
+///   inode-tree walk: decode + validate every scanned reference. 4,096
+///   references ≈ a 16 GiB file set at the shipped 4 MiB block.
+/// * **`census_fold`/`census_compare`** — the oracle's arithmetic: fold
+///   the durable population into a per-block census and diff it against
+///   the derived one (the fsck C8 / `SQUEEZEFS_BLOCK_REFS_VERIFY` pass,
+///   sized at the same 4,096 references, half of them shared by a clone).
+fn bench_block_refs(c: &mut Criterion) {
+    use squeezefs::meta_backend::kv::block_refs::{
+        block_ref_key, decode_block_ref_key, decode_block_ref_value, volume_range, volume_tag,
+        BlockRef, BlockRefOp,
+    };
+    use squeezefs::meta_backend::kv::journal::{encode_entry_payload, entry_len_for};
+    use squeezefs::meta_backend::kv::record::{
+        xattr_key, xattr_name_hash56, XattrValue, TREE_BLOCK_REFS, TREE_XATTRS,
+    };
+
+    let mut group = c.benchmark_group("block_refs");
+    const HASH_SEED: u64 = 0x5EED_F00D;
+    let vol_tag = volume_tag("vol-00000000000000a1");
+
+    // --- The staging cost, per publish width. ---------------------------
+    for width in [1usize, 2, 64] {
+        let ops: Vec<BlockRefOp> = (0..width)
+            .map(|i| {
+                let r = BlockRef {
+                    vol_tag,
+                    block_idx: 4096 + i as u64,
+                    owner_ino: 900_001,
+                    block_index: i as u32,
+                };
+                if i % 2 == 0 {
+                    BlockRefOp::taken(r)
+                } else {
+                    BlockRefOp::released(r)
+                }
+            })
+            .collect();
+        group.throughput(criterion::Throughput::Elements(width as u64));
+        group.bench_with_input(BenchmarkId::new("delta_apply", width), &ops, |b, ops| {
+            b.iter(|| {
+                // Exactly what `KvTx::stage_block_refs` does: one key
+                // + (for a take) one value per changed reference.
+                let mut staged: Vec<(u8, Record)> = Vec::with_capacity(ops.len());
+                for op in ops {
+                    let key = op.reference.key().to_vec();
+                    staged.push((
+                        TREE_BLOCK_REFS,
+                        if op.take {
+                            Record::put(key, 0, op.reference.value().to_vec())
+                        } else {
+                            Record::delete(key, 0)
+                        },
+                    ));
+                }
+                black_box(staged)
+            });
+        });
+    }
+
+    // --- The journal-byte cost, in situ. --------------------------------
+    // A 64-ino publish group's layout deltas, with and without the two
+    // accounting records each publish adds (take + release = the overwrite
+    // shape).
+    let delta_value = vec![0x4C; 128];
+    let mut plain: Vec<(u8, Record)> = (0..64u64)
+        .map(|i| {
+            (
+                TREE_XATTRS,
+                Record::put(
+                    xattr_key(1000 + i, xattr_name_hash56(b"layout", HASH_SEED), 0).to_vec(),
+                    2000 + i,
+                    XattrValue::encode_parts(b"layout", &delta_value).expect("xattr encode"),
+                ),
+            )
+        })
+        .collect();
+    let mut accounted = plain.clone();
+    for i in 0..64u64 {
+        let gained = BlockRef {
+            vol_tag,
+            block_idx: 8192 + i,
+            owner_ino: 1000 + i,
+            block_index: 0,
+        };
+        let lost = BlockRef {
+            block_idx: 4096 + i,
+            ..gained
+        };
+        accounted.push((
+            TREE_BLOCK_REFS,
+            Record::put(gained.key().to_vec(), 3000 + i, gained.value().to_vec()),
+        ));
+        accounted.push((
+            TREE_BLOCK_REFS,
+            Record::delete(lost.key().to_vec(), 3100 + i),
+        ));
+    }
+    let plain_len = entry_len_for(&plain).expect("fits");
+    let accounted_len = entry_len_for(&accounted).expect("fits");
+    // Printed once so the evidence note can cite the byte delta directly.
+    println!(
+        "block_refs: publish-batch-64 entry {plain_len} B without accounting, \
+         {accounted_len} B with it (+{} B, +{:.2} %)",
+        accounted_len - plain_len,
+        100.0 * (accounted_len - plain_len) as f64 / plain_len as f64
+    );
+    group.throughput(criterion::Throughput::Bytes(accounted_len));
+    group.bench_function("entry_encode_publish_batch64_plain", |b| {
+        b.iter(|| {
+            let payload = encode_entry_payload(black_box(&plain));
+            black_box(xxhash_rust::xxh3::xxh3_64(&payload))
+        });
+    });
+    group.bench_function("entry_encode_publish_batch64_with_refs", |b| {
+        b.iter(|| {
+            let payload = encode_entry_payload(black_box(&accounted));
+            black_box(xxhash_rust::xxh3::xxh3_64(&payload))
+        });
+    });
+    plain.clear();
+    accounted.clear();
+
+    // --- The recovery + verify pass. ------------------------------------
+    const REFS: u64 = 4096;
+    // Half the blocks carry a second (clone) reference — the shared shape
+    // the durable ledger exists to preserve.
+    let scanned: Vec<(Vec<u8>, Vec<u8>)> = (0..REFS)
+        .map(|i| {
+            let r = BlockRef {
+                vol_tag,
+                block_idx: i / 2,
+                owner_ino: 500_000 + (i % 2),
+                block_index: (i / 2) as u32,
+            };
+            (r.key().to_vec(), r.value().to_vec())
+        })
+        .collect();
+    group.throughput(criterion::Throughput::Elements(REFS));
+    group.bench_function("recovery_scan_decode", |b| {
+        b.iter(|| {
+            // The `block_ref_scan` inner loop: decode + validate both
+            // halves of every record (a malformed accounting record is
+            // loud corruption, never a silently skipped reference).
+            let mut out: Vec<u64> = Vec::with_capacity(scanned.len());
+            for (k, v) in black_box(&scanned) {
+                let r = decode_block_ref_key(k).expect("key");
+                decode_block_ref_value(v).expect("value");
+                out.push(r.block_idx);
+            }
+            out.sort_unstable();
+            black_box(out)
+        });
+    });
+
+    let refs: Vec<BlockRef> = scanned
+        .iter()
+        .map(|(k, _)| decode_block_ref_key(k).expect("key"))
+        .collect();
+    group.bench_function("census_fold", |b| {
+        b.iter(|| {
+            let mut census: std::collections::BTreeMap<u64, u32> =
+                std::collections::BTreeMap::new();
+            for r in black_box(&refs) {
+                *census.entry(r.block_idx).or_insert(0) += 1;
+            }
+            black_box(census)
+        });
+    });
+
+    let durable: std::collections::BTreeMap<u64, u32> =
+        refs.iter()
+            .fold(std::collections::BTreeMap::new(), |mut m, r| {
+                *m.entry(r.block_idx).or_insert(0) += 1;
+                m
+            });
+    let derived = durable.clone();
+    group.bench_function("census_compare", |b| {
+        b.iter(|| {
+            let (durable, derived) = (black_box(&durable), black_box(&derived));
+            let mut blocks: Vec<u64> = durable.keys().chain(derived.keys()).copied().collect();
+            blocks.sort_unstable();
+            blocks.dedup();
+            let mut drift = 0usize;
+            for idx in blocks {
+                if durable.get(&idx).copied().unwrap_or(0)
+                    != derived.get(&idx).copied().unwrap_or(0)
+                {
+                    drift += 1;
+                }
+            }
+            black_box(drift)
+        });
+    });
+
+    // The scan's range bounds (one allocation pair per volume scan).
+    group.throughput(criterion::Throughput::Elements(1));
+    group.bench_function("scan_range_bounds", |b| {
+        b.iter(|| black_box(volume_range(black_box(vol_tag))));
+    });
+    group.bench_function("key_build", |b| {
+        b.iter(|| black_box(block_ref_key(black_box(vol_tag), 4096, 900_001, 7)));
+    });
     group.finish();
 }
 
@@ -971,6 +1193,7 @@ criterion_group!(
     bench_kv_tree,
     bench_kv_fold,
     bench_kv_journal,
+    bench_block_refs,
     bench_xattr_name_screen,
     bench_superblock_cycle,
     bench_append_partition

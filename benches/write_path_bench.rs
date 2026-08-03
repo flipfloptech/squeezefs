@@ -1045,7 +1045,153 @@ fn bench_ro_gate(c: &mut Criterion) {
         b.iter(|| black_box(ba.begin_patch_sole_owner(black_box(off))));
         set_read_only_mount(false);
     });
+    // DLM S9 — the CO-WRITER class of the same gate. Written, NOT run
+    // (ruling D11: the measured half is frozen until N readers and writers
+    // are demonstrable).
+    //
+    // Field shape: `plane_gate` is now TWO relaxed loads instead of one, on
+    // the hottest gated site in the tree (one call per patched 4 KiB write
+    // at the W1 ceiling of 61–67 k IOPS —
+    // `.benchmarks/2026-07-17-rand-write-program-closing.md`). Both latches
+    // are `false` on a write mount, so both branches are
+    // perfectly-predicted and the two words sit in the same cache line by
+    // construction (adjacent statics in one module).
+    //
+    // PREDICTION: `latch_probe_posture` is within noise of `latch_probe`
+    // (both sub-ns, dominated by the black_box), and
+    // `w1_patch_predicate_write_mount` does not regress beyond the group's
+    // 25 % contention threshold against the committed reference — the added
+    // load is the same cache line and the same predicted branch.
+    //
+    // FALSIFICATION: if `w1_patch_predicate_write_mount` regresses beyond
+    // that threshold while `latch_probe_posture` stays flat, the cost is NOT
+    // the second load — it is the branch structure of `plane_gate` (two
+    // sequential early-exits instead of one), and the answer is to fold the
+    // two latches into ONE word read (a posture byte compared against
+    // `Writer`) rather than to remove the co-writer class. That fold was
+    // deliberately not taken first, because `read_only_mount()` means "an S5
+    // reader" at eleven call sites and changing all eleven at once is the
+    // opposite of what a safety-critical split wants.
+    group.bench_function("latch_probe_posture", |b| {
+        b.iter(|| black_box(squeezefs::fuse_client::mount_posture()));
+    });
+    group.bench_function("w1_patch_predicate_co_writer", |b| {
+        squeezefs::fuse_client::set_mount_posture(squeezefs::fuse_client::MountPosture::CoWriter);
+        b.iter(|| black_box(ba.begin_patch_sole_owner(black_box(off))));
+        squeezefs::fuse_client::set_mount_posture(squeezefs::fuse_client::MountPosture::Writer);
+    });
     group.finish();
+
+    // DLM S9 — the ADMISSION ladder itself. Written, NOT run (ruling D11).
+    //
+    // Field shape: this runs ONCE per co-writer mount, over the volume count
+    // of a real set — §6.10 R4's modeled load is ~46 metadata volumes, so
+    // the 1/8/46-volume rows bracket a fleet set. Rungs 2 and 3 are O(volumes
+    // x members): the member scan is per volume because a half-engaged or
+    // half-enrolled set must refuse, and the roster of a 15 k-node fleet is
+    // dominated by its co-writer count, not its volume count — hence the
+    // 2/16-member rows.
+    //
+    // PREDICTION: microseconds at the 46-volume x 16-member shape, i.e.
+    // invisible beside the mount it gates (a probe open per volume is
+    // milliseconds of device I/O, and the membership join is one RTT at the
+    // measured 0.05-0.25 ms — `.benchmarks/2026-08-05-dlm-s3-cluster-wire.md`).
+    // It exists as a bench because a ladder that scanned the CLAIM SET per
+    // volume per member would be O(V x M x M) and that shape is invisible at
+    // V=1, which is every test.
+    //
+    // FALSIFICATION: if the 46x16 row is not within ~46x16/(1x2) of the 1x2
+    // row, the ladder has a hidden super-linear term (the likely culprit
+    // being a per-volume clone of the member vector) and the fix is to hoist
+    // the enrollment lookup out of the volume loop — never to weaken a rung.
+    {
+        use squeezefs::cowriter::{
+            self, AdmissionRequest, AuthorityLeaseEvidence, RegistrantEvidence,
+            VolumeAdmissionEvidence,
+        };
+        use squeezefs::membership::{ClaimSet, ClaimSetMember, MemberIdentity, MemberRole};
+
+        fn evidence(volumes: usize, members: usize) -> AdmissionRequest {
+            let node_id = "node_00000000deadbeef".to_string();
+            let owner_id = "bench-authority".to_string();
+            let mut set = ClaimSet::empty(9);
+            set.durable = true;
+            for i in 0..members {
+                let id = if i == 0 {
+                    node_id.clone()
+                } else if i == 1 {
+                    owner_id.clone()
+                } else {
+                    format!("node_{i:016x}")
+                };
+                set.members.push(ClaimSetMember {
+                    identity: MemberIdentity {
+                        id,
+                        role: MemberRole::Writer,
+                        pid: 0,
+                        boot: String::new(),
+                        endpoint: None,
+                        pr_key: 0,
+                    },
+                    ts: 0,
+                });
+            }
+            let claim = squeezefs::meta_backend::kv::backend::WriterClaim {
+                id: "bench-claim".to_string(),
+                ts: 0,
+                pid: 1,
+                boot: "bench-boot".to_string(),
+                term: 9,
+            };
+            AdmissionRequest {
+                multi_writer: true,
+                role_co_writer: true,
+                read_only: false,
+                node_id,
+                custody_endpoint: Some("127.0.0.1:7100".to_string()),
+                volumes: (0..volumes)
+                    .map(|v| VolumeAdmissionEvidence {
+                        path: std::path::PathBuf::from(format!("/dev/nvme0n{}", v + 1)),
+                        features_incompat: cowriter::REQUIRED_INCOMPAT,
+                        claim: Some(claim.clone()),
+                        claim_set: Some(set.clone()),
+                    })
+                    .collect(),
+                authority: Some(AuthorityLeaseEvidence {
+                    owner_id,
+                    endpoint: "127.0.0.1:7000".to_string(),
+                    term: 9,
+                    live: true,
+                    member_epoch: 1,
+                }),
+                registrant: Some(RegistrantEvidence {
+                    pr_capable: true,
+                    wero: true,
+                    reservation_held: true,
+                    registered: true,
+                    key: 0xB0B0,
+                    namespaces: 2,
+                }),
+            }
+        }
+
+        let mut group = c.benchmark_group("cowriter_admission");
+        for (volumes, members) in [(1usize, 2usize), (8, 4), (46, 16)] {
+            let req = evidence(volumes, members);
+            group.bench_function(format!("classify_v{volumes}_m{members}"), |b| {
+                b.iter(|| black_box(cowriter::classify_admission(black_box(&req)).is_ok()));
+            });
+        }
+        // The refusal path at the same shape: an unenrolled node scans every
+        // volume's member list and finds nothing, which is the worst case of
+        // rung 3 (and the row an operator's first attempt actually hits).
+        let mut refused = evidence(46, 16);
+        refused.node_id = "node_ffffffffffffffff".to_string();
+        group.bench_function("classify_refused_rung3_v46_m16", |b| {
+            b.iter(|| black_box(cowriter::classify_admission(black_box(&refused)).is_err()));
+        });
+        group.finish();
+    }
 
     // Item 5: the purge-on-revalidation pass over a warm census.
     let backing = tempfile::NamedTempFile::new().expect("bench backing file");

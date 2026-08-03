@@ -1556,13 +1556,26 @@ async fn test_v3_spill_boundary_roundtrips_both_directions() {
         .await
         .expect("read indirect block");
     assert_eq!(&raw[..8], b"SQFSIMAP", "versioned indirect blob magic");
+    // DUR-6 (2026-08-02): the writer emits v2 — `magic|version|payload_len|
+    // xxh3_64` — because v1 carried NO digest, and old and new images shared
+    // an identical header while entry offsets stayed stable across appends,
+    // so a torn write could deserialize cleanly into a plausible map with
+    // WRONG block keys (the metadata plane's only silent-corruption path).
+    // v1 is still DECODED so a fleet migrates by rewriting; only the writer
+    // moved. This assertion pinned the pre-DUR-6 writer.
     assert_eq!(
         u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
-        1,
+        2,
         "indirect blob header version"
     );
+    let payload_len = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]) as usize;
+    let digest = u64::from_le_bytes(raw[16..24].try_into().unwrap());
+    assert_ne!(
+        digest, 0,
+        "v2 must carry a real xxh3 digest, not the placeholder"
+    );
     let entries: Vec<(u32, String)> =
-        bincode::deserialize(&raw[12..]).expect("deserialize indirect map");
+        bincode::deserialize(&raw[24..24 + payload_len]).expect("deserialize indirect map");
     assert_eq!(
         entries.len(),
         big_map.len(),

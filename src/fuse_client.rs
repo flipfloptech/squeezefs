@@ -7417,6 +7417,34 @@ impl SqueezefsFilesystem {
                     "meta_kv_delta_orphans".into(),
                     load(&meta_kv::META_KV_DELTA_ORPHANS),
                 );
+                // DLM S3.5 (design-cow-kv-metadata §4.11, DUR-7): the
+                // cross-volume transaction ledger. `started == completed`
+                // in steady state; `recovered > 0` says a crash
+                // interrupted a cross-volume namespace op and the next
+                // mount finished it. `steps_foreign` and
+                // `midplan_escalations` are must-stay-0 tripwires.
+                {
+                    use crate::meta_backend::crossvol_tx as xv;
+                    metrics.insert("crossvol_tx_started".into(), load(&xv::XV_TX_STARTED));
+                    metrics.insert("crossvol_tx_completed".into(), load(&xv::XV_TX_COMPLETED));
+                    metrics.insert("crossvol_tx_recovered".into(), load(&xv::XV_TX_RECOVERED));
+                    metrics.insert(
+                        "crossvol_tx_steps_applied".into(),
+                        load(&xv::XV_STEPS_APPLIED),
+                    );
+                    metrics.insert(
+                        "crossvol_tx_steps_already_applied".into(),
+                        load(&xv::XV_STEPS_ALREADY_APPLIED),
+                    );
+                    metrics.insert(
+                        "crossvol_tx_steps_foreign".into(),
+                        load(&xv::XV_STEPS_FOREIGN_SKIPPED),
+                    );
+                    metrics.insert(
+                        "crossvol_tx_midplan_escalations".into(),
+                        load(&xv::XV_MIDPLAN_ESCALATIONS),
+                    );
+                }
                 // PR M9 (design-metadata-throughput §5.7 D7 / §9):
                 // record-fold slimming — overlay-head serves (D7.a),
                 // snapshot fold-memo hit rate (D7.b; the create-storm hit

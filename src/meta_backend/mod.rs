@@ -1,4 +1,5 @@
 pub mod atomicity;
+pub mod crossvol_tx;
 pub mod dlm;
 pub mod kv;
 pub mod reservation;
@@ -319,14 +320,20 @@ pub async fn open_routed_meta_set(paths: &[String]) -> Result<std::sync::Arc<Rou
         &disc.slot_to_volume,
     )?;
     let backends = open_meta_volume_set(&disc.ordered_paths).await?;
-    Ok(std::sync::Arc::new(
-        RoutedMetaBackend::with_slot_map_and_natives(
-            backends,
-            disc.routing_width,
-            disc.slot_to_volume,
-            disc.native_slots,
-        )?,
-    ))
+    let routed = std::sync::Arc::new(RoutedMetaBackend::with_slot_map_and_natives(
+        backends,
+        disc.routing_width,
+        disc.slot_to_volume,
+        disc.native_slots,
+    )?);
+    // **DLM S3.5 (design-cow-kv-metadata §4.11)**: roll every open
+    // cross-volume intent forward BEFORE this set serves anything. Each
+    // volume's journal replay already ran inside its open, so the intents
+    // are RAM-authoritative here; the scan is one bounded range per volume
+    // and finds nothing on a healthy set. A failure to recover refuses the
+    // open loud rather than serving a half-applied transaction (DUR-7).
+    crossvol_tx::recover_open_intents(&routed).await?;
+    Ok(routed)
 }
 
 /// **DLM S5** — [`open_routed_meta_set`]'s **reader** twin (`-o ro` /
@@ -704,61 +711,6 @@ impl RoutedMetaBackend {
         }
     }
 
-    /// Rename fragment: pure dentry removal on one volume (the caller
-    /// holds the D-guard; `guards` is its Arc'd set — PR M7 Issue 13:
-    /// multi-commit ops clone one set per sequential commit).
-    async fn remove_dentry_routed(
-        &self,
-        idx: usize,
-        local_parent: Ino,
-        name: &str,
-        guards: std::sync::Arc<[dlm::DlmGuard]>,
-    ) -> Result<()> {
-        let out = self.volumes[idx]
-            // PR M6 D4.b: cross-volume rename fragments carry the POSIX
-            // parent-time update (rename holds both parents EXCLUSIVE).
-            .routed_remove_dentry(
-                local_parent,
-                name,
-                kv::backend::RoutedParentUpdate::ExclusiveTimes,
-                guards,
-            )
-            .await;
-        if out.is_err() {
-            self.mirror_volume_failure(idx);
-        }
-        out
-    }
-
-    /// Rename fragment: dentry insertion + parent times on one volume
-    /// (`ft_bits` = `mode & S_IFMT`).
-    async fn insert_dentry_routed(
-        &self,
-        idx: usize,
-        local_parent: Ino,
-        global_child: Ino,
-        name: &str,
-        ft_bits: u32,
-        guards: std::sync::Arc<[dlm::DlmGuard]>,
-    ) -> Result<()> {
-        let out = self.volumes[idx]
-            .routed_add_dentry(
-                local_parent,
-                name,
-                global_child,
-                ft_bits,
-                // PR M6 D4.b: parent times ride the fragment (exclusive
-                // parent I-guard held by the rename).
-                kv::backend::RoutedParentUpdate::ExclusiveTimes,
-                guards,
-            )
-            .await;
-        if out.is_err() {
-            self.mirror_volume_failure(idx);
-        }
-        out
-    }
-
     /// Rename fragment (PR M6 D4.b): stamp the moved/exchanged inode's
     /// ctime when it lives on a DIFFERENT volume than the dentry surgery
     /// (the same-volume path stages it inside the rename tx).
@@ -771,23 +723,6 @@ impl RoutedMetaBackend {
         self.check_volume_enabled(idx)?;
         let out = self.volumes[idx]
             .routed_touch_ctime(local_ino, guards)
-            .await;
-        if out.is_err() {
-            self.mirror_volume_failure(idx);
-        }
-        out
-    }
-
-    /// Rename fragment: directory-move parent nlink shift, best-effort.
-    async fn parent_nlink_delta_routed(
-        &self,
-        idx: usize,
-        local_parent: Ino,
-        delta: i64,
-        guards: std::sync::Arc<[dlm::DlmGuard]>,
-    ) -> Result<()> {
-        let out = self.volumes[idx]
-            .routed_parent_nlink_delta(local_parent, delta, guards)
             .await;
         if out.is_err() {
             self.mirror_volume_failure(idx);
@@ -1695,7 +1630,14 @@ impl Metadata for RoutedMetaBackend {
             out?;
             Ok(global_child_ino)
         } else {
-            // Parent side: dentry removal + parent update.
+            // **Cross-volume unlink is ONE cross-volume transaction**
+            // (DUR-7, design-cow-kv-metadata §4.11). The effect order is
+            // unchanged — the name goes first, because that is the half
+            // the caller is told about — but the parent-side commit now
+            // carries the intent record, so a crash between the halves is
+            // rolled forward at the next mount instead of leaving
+            // `nlink = 1` with zero dentries: invisible, and skipped
+            // forever by `reclaim_orphaned_batch`'s `nlink > 0` rule.
             let update = if parent_shared {
                 kv::backend::RoutedParentUpdate::SharedTimes
             } else if is_dir {
@@ -1703,22 +1645,44 @@ impl Metadata for RoutedMetaBackend {
             } else {
                 kv::backend::RoutedParentUpdate::ExclusiveTimes
             };
-            let out = self.volumes[parent_v_idx]
-                .routed_remove_dentry(local_parent, name, update, guards.clone())
-                .await;
-            if out.is_err() {
-                self.mirror_volume_failure(parent_v_idx);
-            }
-            out?;
-
-            // Child side: nlink discipline (dir ⇒ 0) + ctime.
-            let out = self.volumes[child_v_idx]
-                .routed_nlink_adjust(local_child, -1, is_dir, guards.clone())
-                .await;
-            if out.is_err() {
-                self.mirror_volume_failure(child_v_idx);
-            }
-            out?;
+            // Validation + the count step's (pre, post) witness, under the
+            // guards this op already holds.
+            let child_v = self.volumes[child_v_idx]
+                .read_inode_value_routed(local_child)
+                .await?
+                .ok_or_else(|| {
+                    crate::error::SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Inode {local_child} not found"),
+                    ))
+                })?;
+            let post = if is_dir {
+                0
+            } else {
+                child_v.nlink.saturating_sub(1)
+            };
+            let plan = crossvol_tx::XvPlan {
+                op: if is_dir {
+                    crossvol_tx::XvOp::Rmdir
+                } else {
+                    crossvol_tx::XvOp::Unlink
+                },
+                steps: vec![
+                    crossvol_tx::XvStep::RemoveDentry {
+                        parent,
+                        name: name.to_string(),
+                        expect_child: global_child_ino,
+                        parent_update: crossvol_tx::parent_update_code(update),
+                    },
+                    crossvol_tx::XvStep::SetNlink {
+                        ino: global_child_ino,
+                        pre: child_v.nlink,
+                        post,
+                        ctime: Some(kv::backend::KvMetaBackend::now_ns_pub()),
+                    },
+                ],
+            };
+            crossvol_tx::execute(self, &plan, guards).await?;
             Ok(global_child_ino)
         }
     }
@@ -1810,15 +1774,54 @@ impl Metadata for RoutedMetaBackend {
             }
             out
         } else {
-            // Child side: nlink+1 + ctime.
-            let out = self.volumes[child_v_idx]
-                .routed_nlink_adjust(local_child, 1, false, guards.clone())
-                .await;
-            if out.is_err() {
-                self.mirror_volume_failure(child_v_idx);
+            // **Cross-volume link is ONE cross-volume transaction**
+            // (DUR-7, design-cow-kv-metadata §4.11). The count half stays
+            // FIRST — it is the half that can refuse (EMLINK), and its
+            // crash residue (`nlink` up, no second name) is a leak rather
+            // than a dentry naming an under-counted inode — and it now
+            // carries the intent record, so the next mount rolls the
+            // second name forward instead of leaking the inode and every
+            // block it names forever.
+            let pre = self.volumes[child_v_idx]
+                .read_inode_value_routed(local_child)
+                .await?
+                .ok_or_else(|| {
+                    crate::error::SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Inode {local_child} not found"),
+                    ))
+                })?;
+            if pre.nlink >= 65000 {
+                return Err(crate::error::SqueezefsError::too_many_links(
+                    "Too many links",
+                ));
             }
-            let v = out?;
-            let child_inode = Inode {
+            let plan = crossvol_tx::XvPlan {
+                op: crossvol_tx::XvOp::Link,
+                steps: vec![
+                    crossvol_tx::XvStep::SetNlink {
+                        ino,
+                        pre: pre.nlink,
+                        post: pre.nlink + 1,
+                        ctime: Some(kv::backend::KvMetaBackend::now_ns_pub()),
+                    },
+                    crossvol_tx::XvStep::InsertDentry {
+                        parent: new_parent,
+                        name: new_name.to_string(),
+                        child: ino,
+                        ft_bits: pre.mode & libc::S_IFMT,
+                        parent_update: crossvol_tx::parent_update_code(
+                            kv::backend::RoutedParentUpdate::ExclusiveTimes,
+                        ),
+                    },
+                ],
+            };
+            let done = crossvol_tx::execute(self, &plan, guards).await?;
+            // The reply is served from the count step's post-image (the
+            // applier folds the pending-times refinement into it — the
+            // generic/423 monotone-ctime discipline).
+            let v = done.inode(0).cloned().unwrap_or(pre);
+            Ok(Inode {
                 ino,
                 mode: v.mode,
                 uid: v.uid,
@@ -1830,25 +1833,7 @@ impl Metadata for RoutedMetaBackend {
                 ctime: v.ctime,
                 flags: v.flags,
                 rdev: v.rdev,
-            };
-
-            // Parent side: dentry + best-effort parent times.
-            let out = self.volumes[parent_v_idx]
-                .routed_add_dentry(
-                    local_parent,
-                    new_name,
-                    ino,
-                    child_inode.mode & libc::S_IFMT,
-                    kv::backend::RoutedParentUpdate::ExclusiveTimes,
-                    guards.clone(),
-                )
-                .await;
-            if out.is_err() {
-                self.mirror_volume_failure(parent_v_idx);
-            }
-            out?;
-
-            Ok(child_inode)
+            })
         }
     }
 
@@ -2060,37 +2045,54 @@ impl Metadata for RoutedMetaBackend {
                 crate::error::SqueezefsError::Io(std::io::Error::from_raw_os_error(libc::ENOENT))
             })?;
 
-            // Remove both, insert swapped — per-volume fragments (cross-
-            // volume renames were never transactional across volumes).
-            // PR M6 D4.b: each fragment carries its parent's time update;
-            // the swapped inodes' ctimes follow as their own fragments.
-            self.remove_dentry_routed(old_parent_v_idx, local_old_parent, old_name, guards.clone())
-                .await?;
-            self.remove_dentry_routed(new_parent_v_idx, local_new_parent, new_name, guards.clone())
-                .await?;
-            self.insert_dentry_routed(
-                new_parent_v_idx,
-                local_new_parent,
-                old_child,
-                new_name,
-                old_ft,
-                guards.clone(),
-            )
-            .await?;
-            self.insert_dentry_routed(
-                old_parent_v_idx,
-                local_old_parent,
-                new_child,
-                old_name,
-                new_ft,
-                guards.clone(),
-            )
-            .await?;
-            for child in [old_child, new_child] {
-                let (v, l) = self.route_ino(child);
-                self.touch_ctime_routed(v, l, guards.clone()).await?;
-            }
-
+            // Remove both, insert swapped — ONE cross-volume transaction
+            // (DUR-7, §4.11; the fragment sequence this replaces could
+            // lose BOTH names to a crash between its first two commits).
+            // PR M6 D4.b: each dentry step carries its parent's time
+            // update; the swapped inodes' ctimes are their own steps.
+            let now = kv::backend::KvMetaBackend::now_ns_pub();
+            let exclusive =
+                crossvol_tx::parent_update_code(kv::backend::RoutedParentUpdate::ExclusiveTimes);
+            let plan = crossvol_tx::XvPlan {
+                op: crossvol_tx::XvOp::Exchange,
+                steps: vec![
+                    crossvol_tx::XvStep::RemoveDentry {
+                        parent: old_parent,
+                        name: old_name.to_string(),
+                        expect_child: old_child,
+                        parent_update: exclusive,
+                    },
+                    crossvol_tx::XvStep::RemoveDentry {
+                        parent: new_parent,
+                        name: new_name.to_string(),
+                        expect_child: new_child,
+                        parent_update: exclusive,
+                    },
+                    crossvol_tx::XvStep::InsertDentry {
+                        parent: new_parent,
+                        name: new_name.to_string(),
+                        child: old_child,
+                        ft_bits: old_ft,
+                        parent_update: exclusive,
+                    },
+                    crossvol_tx::XvStep::InsertDentry {
+                        parent: old_parent,
+                        name: old_name.to_string(),
+                        child: new_child,
+                        ft_bits: new_ft,
+                        parent_update: exclusive,
+                    },
+                    crossvol_tx::XvStep::TouchCtime {
+                        ino: old_child,
+                        ctime: now,
+                    },
+                    crossvol_tx::XvStep::TouchCtime {
+                        ino: new_child,
+                        ctime: now,
+                    },
+                ],
+            };
+            crossvol_tx::execute(self, &plan, guards).await?;
             Ok(())
         } else {
             if flags & libc::RENAME_NOREPLACE != 0 && new_dentry_opt.is_some() {
@@ -2101,87 +2103,151 @@ impl Metadata for RoutedMetaBackend {
 
             if let Some((old_child, old_ft)) = old_dentry_opt {
                 let is_dir = old_ft == libc::S_IFDIR;
+                // **Cross-parent rename is ONE cross-volume transaction**
+                // (DUR-7, design-cow-kv-metadata §4.11). The step order is
+                // the fragment order this replaces, verbatim — parent
+                // `nlink` shifts, destination settlement, source removal,
+                // destination insert, the moved inode's ctime, then the
+                // whiteout — so no user-visible sequencing moves; what
+                // changes is that a crash no longer drifts a parent's link
+                // count permanently (`rmdir` then either succeeded with
+                // children present or refused forever).
+                let now = kv::backend::KvMetaBackend::now_ns_pub();
+                let exclusive = crossvol_tx::parent_update_code(
+                    kv::backend::RoutedParentUpdate::ExclusiveTimes,
+                );
+                let mut steps: Vec<crossvol_tx::XvStep> = Vec::new();
 
                 if is_dir {
-                    // Directory move across parents: nlink shift on each
-                    // side (best-effort).
-                    self.parent_nlink_delta_routed(
-                        old_parent_v_idx,
-                        local_old_parent,
-                        -1,
-                        guards.clone(),
-                    )
-                    .await?;
-                    self.parent_nlink_delta_routed(
-                        new_parent_v_idx,
-                        local_new_parent,
-                        1,
-                        guards.clone(),
-                    )
-                    .await?;
+                    // Directory move across parents: the nlink shift on
+                    // each side, with the POSIX-11 underflow guard applied
+                    // HERE (planning) exactly as `routed_parent_nlink_delta`
+                    // applied it at commit — a suppressed decrement is a
+                    // counted bug signal and simply produces no step.
+                    for (target, local, delta) in [
+                        (old_parent, local_old_parent, -1i64),
+                        (new_parent, local_new_parent, 1i64),
+                    ] {
+                        let (v_idx, _) = self.route_ino(target);
+                        let Some(pv) = self.volumes[v_idx].read_inode_value_routed(local).await?
+                        else {
+                            // The v2/routed arms tolerated an unreadable
+                            // parent here (best-effort); no step.
+                            continue;
+                        };
+                        let post = if delta > 0 {
+                            pv.nlink + 1
+                        } else if pv.nlink > 2 {
+                            pv.nlink - 1
+                        } else {
+                            crate::fuse_client::METRICS
+                                .dir_nlink_underflows
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            log::warn!(
+                                "directory nlink underflow guard fired on parent {local}: \
+                                 nlink {} cannot absorb a {delta} decrement — the deficit \
+                                 is permanent (POSIX-11; run `squeezefs fsck`)",
+                                pv.nlink
+                            );
+                            continue;
+                        };
+                        steps.push(crossvol_tx::XvStep::SetNlink {
+                            ino: target,
+                            pre: pv.nlink,
+                            post,
+                            ctime: None,
+                        });
+                    }
                 }
 
-                // Destination replacement: settle its inode, then remove
-                // its dentry.
+                // Destination replacement: settle its inode (the
+                // ENOTEMPTY probe is validation and happens HERE, before
+                // any step is durable — check-then-mutate, unchanged),
+                // then remove its dentry.
                 if let Some((dest_ino, _dest_ft)) = new_dentry_opt {
                     let (dest_v_idx, local_dest) = self.route_ino(dest_ino);
-                    self.dest_replace_routed(dest_v_idx, local_dest, guards.clone())
-                        .await?;
-                    self.remove_dentry_routed(
-                        new_parent_v_idx,
-                        local_new_parent,
-                        new_name,
-                        guards.clone(),
-                    )
-                    .await?;
+                    if let Some(dv) = self.volumes[dest_v_idx]
+                        .read_inode_value_routed(local_dest)
+                        .await?
+                    {
+                        let dest_is_dir = (dv.mode & libc::S_IFMT) == libc::S_IFDIR;
+                        if dest_is_dir
+                            && self.volumes[dest_v_idx].dir_has_entries(local_dest).await?
+                        {
+                            return Err(crate::error::SqueezefsError::Io(
+                                std::io::Error::from_raw_os_error(libc::ENOTEMPTY),
+                            ));
+                        }
+                        // Replaced directory ⇒ nlink 0 (the rmdir rule —
+                        // generic/035); otherwise one link fewer.
+                        let post = if dest_is_dir {
+                            0
+                        } else {
+                            dv.nlink.saturating_sub(1)
+                        };
+                        steps.push(crossvol_tx::XvStep::SetNlink {
+                            ino: dest_ino,
+                            pre: dv.nlink,
+                            post,
+                            ctime: Some(now),
+                        });
+                    }
+                    steps.push(crossvol_tx::XvStep::RemoveDentry {
+                        parent: new_parent,
+                        name: new_name.to_string(),
+                        expect_child: dest_ino,
+                        parent_update: exclusive,
+                    });
                 }
 
-                self.remove_dentry_routed(
-                    old_parent_v_idx,
-                    local_old_parent,
-                    old_name,
-                    guards.clone(),
-                )
-                .await?;
-                self.insert_dentry_routed(
-                    new_parent_v_idx,
-                    local_new_parent,
-                    old_child,
-                    new_name,
-                    old_ft,
-                    guards.clone(),
-                )
-                .await?;
-                // PR M6 D4.b: the moved inode's ctime fragment.
-                let (v, l) = self.route_ino(old_child);
-                self.touch_ctime_routed(v, l, guards.clone()).await?;
-                // RENAME_WHITEOUT, cross-volume shape: mint the char-0:0
-                // whiteout + its dentry at the OLD name as per-volume
-                // fragments AFTER the move (cross-volume renames were
-                // never transactional across volumes — the documented
-                // posture; the crash window leaves the rename done
-                // without its whiteout, exactly like the other
-                // cross-volume fragments).
+                steps.push(crossvol_tx::XvStep::RemoveDentry {
+                    parent: old_parent,
+                    name: old_name.to_string(),
+                    expect_child: old_child,
+                    parent_update: exclusive,
+                });
+                steps.push(crossvol_tx::XvStep::InsertDentry {
+                    parent: new_parent,
+                    name: new_name.to_string(),
+                    child: old_child,
+                    ft_bits: old_ft,
+                    parent_update: exclusive,
+                });
+                // PR M6 D4.b: the moved inode's ctime.
+                steps.push(crossvol_tx::XvStep::TouchCtime {
+                    ino: old_child,
+                    ctime: now,
+                });
+                // RENAME_WHITEOUT: the char-0:0 whiteout + its dentry at
+                // the OLD name, inside the SAME transaction (the crash
+                // window that left the rename done without its whiteout —
+                // an overlayfs upper layer losing a deletion marker — is
+                // gone; the ino is still burned on failure, the standing
+                // §4.8 monotonic-allocation law).
                 if let Some(mint) = whiteout_mint_slot {
-                    let (w_local, w_global) =
+                    let (_w_local, w_global) =
                         self.allocate_local_ino_in_slot(old_parent_v_idx, mint)?;
-                    let minted = self.volumes[old_parent_v_idx]
-                        .routed_mint_inode(w_local, libc::S_IFCHR, 0, 0, 0, 0, guards.clone())
-                        .await;
-                    if minted.is_err() {
-                        self.mirror_volume_failure(old_parent_v_idx);
-                    }
-                    minted?;
-                    self.insert_dentry_routed(
-                        old_parent_v_idx,
-                        local_old_parent,
-                        w_global,
-                        old_name,
-                        libc::S_IFCHR,
-                        guards.clone(),
-                    )
-                    .await?;
+                    steps.push(crossvol_tx::XvStep::MintInode {
+                        ino: w_global,
+                        mode: libc::S_IFCHR,
+                        uid: 0,
+                        gid: 0,
+                        rdev: 0,
+                    });
+                    steps.push(crossvol_tx::XvStep::InsertDentry {
+                        parent: old_parent,
+                        name: old_name.to_string(),
+                        child: w_global,
+                        ft_bits: libc::S_IFCHR,
+                        parent_update: exclusive,
+                    });
                 }
+
+                let plan = crossvol_tx::XvPlan {
+                    op: crossvol_tx::XvOp::Rename,
+                    steps,
+                };
+                crossvol_tx::execute(self, &plan, guards).await?;
                 Ok(())
             } else {
                 Err(crate::error::SqueezefsError::Io(std::io::Error::new(

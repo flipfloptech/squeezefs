@@ -57,6 +57,9 @@ use super::tree::{decode_interior_value, KvTree, RootPtr, SmoContext, SmoJournal
 use super::KvError;
 use crate::error::Result;
 use crate::meta_backend::atomicity::META_VOLUME_ATOMICITY_COW;
+// DLM S3.5 (design-cow-kv-metadata §4.11): the cross-volume plan
+// vocabulary this file's applier consumes.
+use crate::meta_backend::crossvol_tx::{self, XvLocalStep, XvRider, XvStepOutcome, XvStepStatus};
 use crate::meta_backend::dlm::{DlmGuard, DlmLockManager, LockMode};
 use crate::meta_backend::sync_coalescer::SyncCoalescer;
 use crate::meta_backend::{DirEntry, Ino, Inode, Metadata};
@@ -6027,45 +6030,6 @@ impl KvMetaBackend {
         Ok(())
     }
 
-    /// Parent-side dentry removal (cross-volume unlink / rename source):
-    /// dentry Delete + the routed parent update.
-    pub async fn routed_remove_dentry(
-        &self,
-        local_parent: Ino,
-        name: &str,
-        parent_update: RoutedParentUpdate,
-        guards: Arc<[DlmGuard]>,
-    ) -> Result<()> {
-        self.write_gate()?;
-        let Some((dkey, _d)) = self.find_dentry_pos(local_parent, name).await? else {
-            return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Dentry not found",
-            )));
-        };
-        let now = Self::now_ns();
-        let mut tx = KvTx::new();
-        tx.stage_delete(TREE_DENTRIES, dkey);
-        match parent_update {
-            RoutedParentUpdate::None => {}
-            RoutedParentUpdate::SharedTimes => {
-                self.stage_parent_update(&mut tx, local_parent, true, 0, now)
-                    .await?
-            }
-            RoutedParentUpdate::ExclusiveTimes => {
-                self.stage_parent_update(&mut tx, local_parent, false, 0, now)
-                    .await?
-            }
-            RoutedParentUpdate::ExclusiveTimesBump => {
-                self.stage_parent_update(&mut tx, local_parent, false, -1, now)
-                    .await?
-            }
-        }
-        tx.hold_guards(guards);
-        self.commit_tx(tx).await?;
-        Ok(())
-    }
-
     /// Routed same-volume link — ONE whole-tx entry: nlink+1 + ctime,
     /// dentry Put (global child ino), best-effort parent times (the
     /// routed v2 arm's shape). EEXIST is the caller's check (it holds
@@ -6161,47 +6125,6 @@ impl KvMetaBackend {
         // by the routed caller: race-free).
         self.retire_pending_times(local_child);
         Ok(v)
-    }
-
-    /// Parent-side directory nlink delta (routed rename of a directory
-    /// across parents), best-effort like the v2 arm (`if let Ok`) —
-    /// times untouched, exactly the v2 rename's nlink shift.
-    pub async fn routed_parent_nlink_delta(
-        &self,
-        local_parent: Ino,
-        delta: i64,
-        guards: Arc<[DlmGuard]>,
-    ) -> Result<()> {
-        self.write_gate()?;
-        let Some(mut pv) = self.read_inode_value(local_parent).await? else {
-            return Ok(());
-        };
-        match delta.cmp(&0) {
-            std::cmp::Ordering::Greater => pv.nlink += delta as u32,
-            std::cmp::Ordering::Less => {
-                if pv.nlink > 2 {
-                    pv.nlink -= (-delta) as u32;
-                } else {
-                    // POSIX-11 (the cross-volume face — same law as
-                    // `stage_parent_update`'s guard).
-                    crate::fuse_client::METRICS
-                        .dir_nlink_underflows
-                        .fetch_add(1, Ordering::Relaxed);
-                    log::warn!(
-                        "directory nlink underflow guard fired on parent {local_parent}: \
-                         nlink {} cannot absorb a {delta} decrement — the deficit is \
-                         permanent (POSIX-11; run `squeezefs fsck` on this volume)",
-                        pv.nlink
-                    );
-                }
-            }
-            std::cmp::Ordering::Equal => return Ok(()),
-        }
-        let mut tx = KvTx::new();
-        tx.stage_put(TREE_INODES, inode_key(local_parent), pv.encode());
-        tx.hold_guards(guards);
-        self.commit_tx(tx).await?;
-        Ok(())
     }
 
     /// Routed same-volume rename — ONE whole-tx entry covering the v2
@@ -7178,6 +7101,290 @@ impl KvMetaBackend {
         self.write_gate()?;
         let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
         self.removexattr_locked(ino, name, guards).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DLM S3.5 — the cross-volume transaction applier (design-cow-kv-metadata
+// §4.11; the machinery and its protocol live in
+// `crate::meta_backend::crossvol_tx`). This is the ONE place a plan step
+// becomes records: the live path and mount recovery call the SAME function,
+// so "every step is idempotent" is a property of one code path rather than
+// a claim about two.
+// ---------------------------------------------------------------------------
+
+impl KvMetaBackend {
+    /// Whether this volume barriers inside every commit (§4.6 pt 4). The
+    /// cross-volume protocol's explicit ordering barriers are redundant
+    /// then, and skipping them keeps a strict mount exactly as fast as it
+    /// was.
+    pub fn xv_strict_barriers(&self) -> bool {
+        self.strict
+    }
+
+    /// The routed layer's read of one local inode record — what a
+    /// cross-volume plan's count steps take their `(pre, post)` witness
+    /// from, under the op's held I-guard.
+    pub async fn read_inode_value_routed(&self, local_ino: Ino) -> Result<Option<InodeValue>> {
+        Ok(self.read_inode_value(local_ino).await?)
+    }
+
+    /// The backend's metadata clock (§ the `now_ns` note above), for plan
+    /// builders that must record the timestamp a step will apply.
+    pub fn now_ns_pub() -> u64 {
+        Self::now_ns()
+    }
+
+    /// Stage the intent rider (§4.11): the `Put` rides step 0's
+    /// transaction, so intent and first effect are ONE checksummed journal
+    /// entry; the `Delete` is the retirement. Both keys derive entirely
+    /// from the tx id, so neither needs the collision-chain probe an
+    /// ordinary xattr write needs — which is what lets the rider join a
+    /// transaction without adding a lock.
+    fn stage_intent_rider(tx: &mut KvTx, rider: Option<&XvRider>) -> Result<()> {
+        match rider {
+            None => {}
+            Some(XvRider::Put { tx_id, image }) => tx.stage_put(
+                TREE_XATTRS,
+                crossvol_tx::intent_key(*tx_id),
+                XattrValue::encode_parts(crossvol_tx::intent_name(*tx_id).as_bytes(), image)?,
+            ),
+            Some(XvRider::Delete { tx_id }) => {
+                tx.stage_delete(TREE_XATTRS, crossvol_tx::intent_key(*tx_id))
+            }
+        }
+        Ok(())
+    }
+
+    /// Retire an intent: a `Delete` of an EXACT key, so it needs no probe
+    /// and cannot disturb another ino-1-class record.
+    pub async fn xv_retire_intent(&self, tx_id: u64, guards: Arc<[DlmGuard]>) -> Result<()> {
+        self.write_gate()?;
+        let mut tx = KvTx::new();
+        Self::stage_intent_rider(&mut tx, Some(&XvRider::Delete { tx_id }))?;
+        tx.hold_guards(guards);
+        self.commit_tx(tx).await?;
+        Ok(())
+    }
+
+    /// This volume's OPEN cross-volume intents as `(tx_id, image)` — a
+    /// bounded range scan over the reserved intent ino, empty on a healthy
+    /// volume. The mount-recovery driver's only input.
+    pub async fn xv_scan_intents(&self) -> Result<Vec<(u64, Vec<u8>)>> {
+        let end = xattr_key(crossvol_tx::XV_INTENT_INO, HASH56_MAX, u8::MAX);
+        let mut cursor: Vec<u8> = xattr_key(crossvol_tx::XV_INTENT_INO, 0, 0).to_vec();
+        let mut out = Vec::new();
+        loop {
+            let page = self.xattrs.range(&cursor, &end, SCAN_PAGE).await?;
+            let Some((last_key, _)) = page.last() else {
+                break;
+            };
+            cursor = key_successor(last_key);
+            for (k, v) in &page {
+                let (_ino, hash, coll) = decode_xattr_key(k)?;
+                let tx_id = (u64::from(coll) << 56) | hash;
+                out.push((tx_id, XattrValue::decode(v)?.value));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Apply ONE localised plan step in ONE whole-tx entry, optionally
+    /// carrying the transaction's intent rider, after checking the step's
+    /// witness. Never applies an effect twice, and never overwrites an
+    /// object that moved under the plan (`ForeignSkipped`, counted loud by
+    /// the caller). The rider is committed even when the witness declines
+    /// the effect: an intent that named nothing to do is retired by the
+    /// same protocol as one that did.
+    pub async fn xv_apply_step(
+        &self,
+        step: &XvLocalStep,
+        rider: Option<&XvRider>,
+        guards: Arc<[DlmGuard]>,
+    ) -> Result<XvStepOutcome> {
+        self.write_gate()?;
+        let mut tx = KvTx::new();
+        Self::stage_intent_rider(&mut tx, rider)?;
+        let mut status = XvStepStatus::Applied;
+        let mut inode = None;
+        let mut retire_times_for: Option<Ino> = None;
+
+        match step {
+            XvLocalStep::RemoveDentry {
+                local_parent,
+                name,
+                expect_child,
+                parent_update,
+            } => match self.find_dentry_pos(*local_parent, name).await? {
+                // Absent ⇒ this step already ran (the only other producer
+                // of that state is a foreign removal, which is the same
+                // no-op for us).
+                None => status = XvStepStatus::AlreadyApplied,
+                Some((_, d)) if d.child_ino != *expect_child => {
+                    status = XvStepStatus::ForeignSkipped
+                }
+                Some((dkey, _)) => {
+                    tx.stage_delete(TREE_DENTRIES, dkey);
+                    self.stage_routed_parent_update(&mut tx, *local_parent, *parent_update, -1)
+                        .await?;
+                }
+            },
+            XvLocalStep::InsertDentry {
+                local_parent,
+                name,
+                child,
+                ft_bits,
+                parent_update,
+            } => match self.find_dentry_pos(*local_parent, name).await? {
+                Some((_, d)) if d.child_ino == *child => status = XvStepStatus::AlreadyApplied,
+                Some(_) => status = XvStepStatus::ForeignSkipped,
+                None => {
+                    let dkey = self.dentry_insert_key(&tx, *local_parent, name).await?;
+                    tx.stage_put(
+                        TREE_DENTRIES,
+                        dkey,
+                        DentryValue::encode_parts(
+                            *child,
+                            Self::ft_byte(*ft_bits),
+                            name.as_bytes(),
+                        )?,
+                    );
+                    self.stage_routed_parent_update(&mut tx, *local_parent, *parent_update, 1)
+                        .await?;
+                }
+            },
+            XvLocalStep::SetNlink {
+                local_ino,
+                pre,
+                post,
+                ctime,
+            } => match self.read_inode_value(*local_ino).await? {
+                // A destroyed object cannot be accounted; the routed
+                // fragments this replaces were best-effort on a missing
+                // inode too (the retired `routed_parent_nlink_delta`
+                // fragment this step replaces).
+                None => status = XvStepStatus::ForeignSkipped,
+                Some(mut v) if v.nlink == *post && *pre != *post => {
+                    status = XvStepStatus::AlreadyApplied;
+                    // The post-image the caller replies from is still the
+                    // stored one (an already-applied step is not an error).
+                    if ctime.is_some() {
+                        self.fold_pending_times(*local_ino, &mut v);
+                    }
+                    inode = Some(v);
+                }
+                Some(mut v) if v.nlink == *pre => {
+                    v.nlink = *post;
+                    if let Some(ct) = ctime {
+                        // Monotone over the FOLDED view (the generic/423
+                        // inversion discipline the routed arms established:
+                        // the reply is served from this value, so it must
+                        // never regress below a served base+refinement).
+                        self.fold_pending_times(*local_ino, &mut v);
+                        let bump = (*ct).max(Self::now_ns());
+                        if (bump as i64) > (v.ctime as i64) {
+                            v.ctime = bump;
+                        }
+                        retire_times_for = Some(*local_ino);
+                    }
+                    tx.stage_put(TREE_INODES, inode_key(*local_ino), v.encode());
+                    inode = Some(v);
+                }
+                Some(v) => {
+                    // Neither the witness nor the post-image: the count
+                    // moved under the plan.
+                    log::error!(
+                        "meta volume {}: cross-volume step wanted ino {local_ino} nlink \
+                         {pre} → {post} but found {} — skipping rather than clobbering",
+                        self.path.display(),
+                        v.nlink
+                    );
+                    status = XvStepStatus::ForeignSkipped;
+                }
+            },
+            XvLocalStep::TouchCtime { local_ino, ctime } => {
+                if self.read_inode_value(*local_ino).await?.is_none() {
+                    status = XvStepStatus::ForeignSkipped;
+                } else {
+                    // Idempotent by construction: a Δctime merge record
+                    // whose value only ever moves forward.
+                    tx.stage_delta(
+                        TREE_INODES,
+                        inode_key(*local_ino),
+                        &InodeDelta::ctime((*ctime).max(Self::now_ns())),
+                    );
+                }
+            }
+            XvLocalStep::MintInode {
+                local_ino,
+                mode,
+                uid,
+                gid,
+                rdev,
+            } => {
+                if self.read_inode_value(*local_ino).await?.is_some() {
+                    status = XvStepStatus::AlreadyApplied;
+                } else {
+                    let now = Self::now_ns();
+                    let v = InodeValue {
+                        mode: *mode,
+                        uid: *uid,
+                        gid: *gid,
+                        nlink: if (*mode & libc::S_IFMT) == libc::S_IFDIR {
+                            2
+                        } else {
+                            1
+                        },
+                        flags: 0,
+                        rdev: *rdev,
+                        size: 0,
+                        atime: now,
+                        mtime: now,
+                        ctime: now,
+                    };
+                    tx.stage_put(TREE_INODES, inode_key(*local_ino), v.encode());
+                    inode = Some(v);
+                }
+            }
+        }
+
+        tx.hold_guards(guards);
+        self.commit_tx(tx).await?;
+        if let Some(ino) = retire_times_for {
+            // The committed Put carries the folded refinement (the step's
+            // I-guard is held by the transaction's caller: race-free).
+            self.retire_pending_times(ino);
+        }
+        Ok(XvStepOutcome { status, inode })
+    }
+
+    /// The routed parent update by wire code, with the insert/remove sign
+    /// applied to the `Bump` shape — the exact
+    /// [`RoutedParentUpdate`] semantics the fragments this applier
+    /// replaces used.
+    async fn stage_routed_parent_update(
+        &self,
+        tx: &mut KvTx,
+        local_parent: Ino,
+        update: RoutedParentUpdate,
+        sign: i64,
+    ) -> std::result::Result<(), KvError> {
+        let now = Self::now_ns();
+        match update {
+            RoutedParentUpdate::None => Ok(()),
+            RoutedParentUpdate::SharedTimes => {
+                self.stage_parent_update(tx, local_parent, true, 0, now)
+                    .await
+            }
+            RoutedParentUpdate::ExclusiveTimes => {
+                self.stage_parent_update(tx, local_parent, false, 0, now)
+                    .await
+            }
+            RoutedParentUpdate::ExclusiveTimesBump => {
+                self.stage_parent_update(tx, local_parent, false, sign, now)
+                    .await
+            }
+        }
     }
 }
 

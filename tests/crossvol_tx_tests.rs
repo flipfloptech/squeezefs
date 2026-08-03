@@ -372,9 +372,7 @@ async fn crossvol_dir_rename_every_window_recovers_pre_or_post() {
 
         {
             let _seam = arm_seam(window);
-            let _ = routed
-                .rename(old_parent, "sub", new_parent, "sub", 0)
-                .await;
+            let _ = routed.rename(old_parent, "sub", new_parent, "sub", 0).await;
         }
 
         let routed = crash_and_reopen(routed, &paths).await;
@@ -382,7 +380,8 @@ async fn crossvol_dir_rename_every_window_recovers_pre_or_post() {
         let at_new = lookup_opt(&routed, new_parent, "sub").await;
         let now_old = nlink_of(&routed, old_parent).await.unwrap();
         let now_new = nlink_of(&routed, new_parent).await.unwrap();
-        let pre = at_old == Some(moved) && at_new.is_none() && now_old == pre_old && now_new == pre_new;
+        let pre =
+            at_old == Some(moved) && at_new.is_none() && now_old == pre_old && now_new == pre_new;
         let post = at_old.is_none()
             && at_new == Some(moved)
             && now_old == pre_old - 1
@@ -516,8 +515,16 @@ async fn single_volume_ops_write_no_intents_and_no_extra_entries() {
     let e3 = vol.journal_ring().written_entries();
 
     assert_eq!(e1 - e0, 1, "single-volume link must stay ONE journal entry");
-    assert_eq!(e2 - e1, 1, "single-volume rename must stay ONE journal entry");
-    assert_eq!(e3 - e2, 1, "single-volume unlink must stay ONE journal entry");
+    assert_eq!(
+        e2 - e1,
+        1,
+        "single-volume rename must stay ONE journal entry"
+    );
+    assert_eq!(
+        e3 - e2,
+        1,
+        "single-volume unlink must stay ONE journal entry"
+    );
     assert_eq!(
         open_intents(&routed).await,
         0,
@@ -551,7 +558,10 @@ async fn successful_crossvol_ops_leave_no_open_intent() {
         .await
         .expect("cross-volume unlink");
     assert_eq!(open_intents(&routed).await, 0, "unlink retired its intent");
-    routed.unlink(parent, &name).await.expect("cross-volume unlink");
+    routed
+        .unlink(parent, &name)
+        .await
+        .expect("cross-volume unlink");
     assert_eq!(open_intents(&routed).await, 0);
     shutdown(&routed).await;
 }
@@ -643,7 +653,11 @@ async fn recovery_skips_a_foreign_occupant_instead_of_clobbering() {
         Some(squatter.ino),
         "recovery must never overwrite a dentry it does not own"
     );
-    assert_eq!(open_intents(&routed).await, 0, "the intent is still retired");
+    assert_eq!(
+        open_intents(&routed).await,
+        0,
+        "the intent is still retired"
+    );
     shutdown(&routed).await;
 }
 

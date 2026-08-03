@@ -32,7 +32,7 @@
 //!   stay in [`crate::dlm`], and [`SlotLockManager`] delegates to
 //!   [`LocalLockManager`] the instant ownership says "local". Solo mode
 //!   is therefore byte-identical to S0–S2 behaviour, not merely similar.
-//! * It does not home the **fencing reads**
+//! * It did not home the **fencing reads**
 //!   ([`SlotLockManager::get_fencing_token_ino`] and its path form).
 //!   Those are ~24 call sites on hot paths and in solo mode the local
 //!   view IS the authority, so paying a parse + a modulo + an ownership
@@ -40,7 +40,10 @@
 //!   foreign home becomes possible, a fencing read on a foreign-home
 //!   object must become an owner read (or a leased/cached-token read) —
 //!   it must NOT keep serving the local view, which would then be a
-//!   stale-generation answer.
+//!   stale-generation answer. **Discharged by S8** (2026-08-05): the read
+//!   is homed behind one relaxed load and a foreign home serves the
+//!   client token cache the owners' own grants feed
+//!   ([`crate::meta_ship::foreign_fencing_token`]).
 //! * It does not carry a mode knob. Solo is not a configuration; it is
 //!   the absence of an installed owner table, which nothing in production
 //!   can install yet.
@@ -198,19 +201,28 @@ pub fn dlm_rpcs() -> u64 {
     DLM_RPCS.load(Ordering::Relaxed)
 }
 
-/// **Test seam** (the [`crate::dlm::test_arm_cw_mode`] precedent):
-/// install a per-slot owner table where exactly `slots` are local, or
-/// `None` to restore solo mode.
+/// Install the per-slot lock-ownership table where exactly `slots` are
+/// local, or `None` to restore solo mode.
 ///
-/// The foreign-home refusal is a real product behaviour with no
-/// production issuer until S6/S8 ship the remote arm; this seam is what
-/// makes it reachable and tested rather than a comment. Production never
-/// calls it.
-pub fn test_set_local_slots(slots: Option<&[u16]>) {
+/// **Since S8 this has a real issuer**: `meta_ship::arm_ownership`
+/// publishes the local slot set derived from the metadata ownership plane
+/// here, in the same call, because spec §6.7 decision 2's whole point is
+/// that the lock master and the metadata authority are the same process.
+/// A foreign volume's slots therefore leave the lock plane's local set at
+/// the same instant they leave the metadata plane's — no window exists in
+/// which one plane would grant what the other ships away.
+pub(crate) fn install_local_slots(slots: Option<&[u16]>) {
     match slots {
         None => SLOT_OWNERS.store(None),
         Some(slots) => SLOT_OWNERS.store(Some(Arc::new(SlotOwners::from_slots(slots)))),
     }
+}
+
+/// **Test seam** (the [`crate::dlm::test_arm_cw_mode`] precedent):
+/// [`install_local_slots`] without the metadata plane, so the S4 suite can
+/// reach the foreign-home refusal on its own.
+pub fn test_set_local_slots(slots: Option<&[u16]>) {
+    install_local_slots(slots);
 }
 
 /// The slot-homed lock authority (spec §6.9 stage **S4**) — and the
@@ -279,15 +291,44 @@ impl SlotLockManager {
             .await
     }
 
-    /// Current fencing generation for a path-form object key. Deliberately
-    /// NOT homed — see the module docs' fencing-read contract for S6/S8.
+    /// Current fencing generation for a path-form object key — homed since
+    /// **S8** (see [`Self::get_fencing_token_ino`]).
     pub fn get_fencing_token(&self, file_path: &str) -> u64 {
-        self.local.get_fencing_token(file_path)
+        match crate::dlm::ino_of_path(file_path) {
+            Some(ino) => self.get_fencing_token_ino(ino),
+            // A non-inode object has no routed home (it pins to slot 0,
+            // whose owner is a member of every set) and no shipped verb
+            // names one, so the local view is the authority for it.
+            None => self.local.get_fencing_token(file_path),
+        }
     }
 
     /// Current fencing generation for an inode object (binary fast path).
-    /// Deliberately NOT homed — see the module docs.
+    ///
+    /// **The S4 fencing-read contract, resolved by S8.** S4 deliberately
+    /// left these ~24 hot sites unhomed, correct only while solo owns
+    /// every slot, and stated the obligation: *"when a foreign home
+    /// becomes possible, a fencing read on a foreign-home object must
+    /// become an owner read (or a leased/cached-token read) — it must NOT
+    /// keep serving the local view, which would then be a
+    /// stale-generation answer."*
+    ///
+    /// The resolution is the **cached-token read**, because §6.5 item 1
+    /// forbids the alternative outright (*"≥ 99.5 % of lock operations
+    /// must be served from a locally cached or delegated token"* — a
+    /// round trip at 24 sites per write is not a candidate), and because
+    /// every reference client converged on it. The cache is fed ONLY by
+    /// owners' answers riding the metadata RPCs the operations issue
+    /// anyway (§6.7 decision 3's intent locks), so it repeats an
+    /// authority rather than becoming a second generator.
+    ///
+    /// Cost on the shipped (unarmed) path: **one relaxed load**. Nothing
+    /// else about this read changed.
     pub fn get_fencing_token_ino(&self, ino: u64) -> u64 {
+        if crate::meta_ship::ownership_armed() && !is_local_slot(slot_of_ino(ino, routing_width()))
+        {
+            return crate::meta_ship::foreign_fencing_token(ino);
+        }
         self.local.get_fencing_token_ino(ino)
     }
 }

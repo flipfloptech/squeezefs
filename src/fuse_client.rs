@@ -7012,6 +7012,19 @@ impl SqueezefsFilesystem {
                 "dlm_mode": crate::dlm_slot::dlm_mode(),
                 "dlm_rpcs": crate::dlm_slot::dlm_rpcs(),
                 "dlm_term": crate::dlm::durable_term(),
+                // DLM S8 (spec §6.7 decision 1, §6.9 S8): function-shipped
+                // metadata. `meta_ship` carries the shipped-vs-local
+                // ledger, the pipelining factor (batched_verbs/batches),
+                // the idempotency window, `dlm_rpcs_meta`, the
+                // `dlm_grace_*` failover ledger and the `dlm_token_cache_*`
+                // family; the two phase tables are the deferred `tar -x`
+                // A/B's attribution (ruling D10/D11). Every field is 0 on a
+                // solo mount BY CONSTRUCTION — nothing is armed — so a
+                // nonzero shipped/refusal count on a single-node mount is a
+                // bug, not load.
+                "meta_ship": crate::meta_ship::stats_json(),
+                "meta_ship_phase_ns": crate::meta_ship::phase_json(),
+                "meta_ship_owner_phase_ns": crate::meta_ship::owner_phase_json(),
                 "writeback_queue_depth": METRICS.writeback_queue_depth.to_json(),
                 "meta_flush_deferred": METRICS.meta_flush_deferred.load(Ordering::Relaxed),
                 "meta_reclaim_batch_size": METRICS.meta_reclaim_batch_size.to_json(),

@@ -1216,6 +1216,29 @@ impl RoutedMetaBackend {
         self.volumes[v_idx].xattr_value_cap()
     }
 
+    /// **DLM S8**: the dentry half of [`Metadata::lookup`] —
+    /// `(child global ino, S_IFMT bits)` with **no child `getattr`**.
+    ///
+    /// A *non-trait* capability (the `xattr_value_cap` precedent). It
+    /// exists because a shipped `lookup`'s two participants can home on
+    /// different owners: the parent's dentry belongs to the parent's
+    /// volume, while the child's inode record may live on a volume another
+    /// node owns and this one may not read (one node cache per volume). So
+    /// the router composes `lookup` from this call plus a separately
+    /// routed `getattr` — which is exactly the two steps the trait's
+    /// `lookup` already performs internally, and it was never atomic
+    /// (see [`Metadata::lookup`]'s implementation note on dropping the
+    /// D-guard before the I-lock).
+    pub async fn lookup_dentry(&self, parent: Ino, name: &str) -> Result<Option<(Ino, u32)>> {
+        let (v_idx, local_parent) = self.route_ino(parent);
+        self.check_volume_enabled(v_idx)?;
+        let _guard = self.volumes[v_idx]
+            .dlm()
+            .lock_dentry_shared(local_parent, name)
+            .await;
+        self.find_dentry_routed(v_idx, local_parent, name).await
+    }
+
     /// One cookie-paged readdir step against `dir`'s volume (design
     /// §5.1): pages of at most `max` `(resume_cookie, entry)` pairs, each
     /// entry paired with its resume cookie
@@ -1266,7 +1289,16 @@ impl RoutedMetaBackend {
         let (parent_v_idx, local_parent) = self.route_ino(parent);
         self.check_volume_enabled(parent_v_idx)?;
         let is_dir = (mode & libc::S_IFMT) == libc::S_IFDIR;
-        let target_v_idx = self.pick_mint_volume(parent_v_idx).await;
+        // DLM S8 (spec §6.10 R4 + §6.2 items 2/3/4): the placement engine
+        // picks by health and balance; ownership then constrains the pick
+        // to a volume THIS node owns, because a volume's journal ring,
+        // extent bitmap and root ledger have exactly one appender. Unarmed
+        // — every mount that ships today — this is one relaxed load and
+        // the pick verbatim.
+        let target_v_idx = crate::meta_ship::constrain_mint_volume(
+            self.pick_mint_volume(parent_v_idx).await,
+            parent_v_idx,
+        );
         self.check_volume_enabled(target_v_idx)?;
         // The mint slot is a touched slot too (the new inode record
         // lands in its keyspace) — still before any 4a lock. The rotor

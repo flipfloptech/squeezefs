@@ -203,10 +203,10 @@ fn the_wire_vocabulary_covers_every_shipped_trait_member() {
         );
         assert!(!verb.name().is_empty());
     }
-    assert!(
-        ship::VERB_META_BATCH != cw::VERB_PING && ship::VERB_RECLAIM != cw::VERB_PING,
-        "S8's RPC verbs must not collide with S3's ping"
-    );
+    // S8's RPC verbs must not collide with S3's ping (a const-evaluable
+    // fact, so it is asserted in a const block — the compiler is the gate).
+    const _: () = assert!(ship::VERB_META_BATCH != cw::VERB_PING);
+    const _: () = assert!(ship::VERB_RECLAIM != cw::VERB_PING);
     assert_eq!(ship::META_SHIP_SCHEMA, 1, "the vocabulary's schema");
 
     // The dedup window and the grace gate both key on this classification.
@@ -618,7 +618,7 @@ async fn a_fencing_read_on_a_foreign_home_never_serves_the_local_view() {
     let warm = locks.get_fencing_token_ino(f.ino);
     assert_eq!(
         warm,
-        owner_be_token(&owner_be, f.ino),
+        ship::owner_authority_token(f.ino),
         "the read must serve the OWNER's generation for the object"
     );
     assert!(
@@ -639,14 +639,6 @@ async fn a_fencing_read_on_a_foreign_home_never_serves_the_local_view() {
     listener.shutdown();
     shutdown(&client_be).await;
     shutdown(&owner_be).await;
-}
-
-/// The owner's own answer for an object's generation (what the client's
-/// cache must agree with).
-fn owner_be_token(_owner: &Arc<RoutedMetaBackend>, ino: u64) -> u64 {
-    // The owner and the client share this process's lock table, so the
-    // owner's answer is the local read taken through the OWNED path.
-    ship::test_owner_side_token(ino)
 }
 
 // ---------------------------------------------------------------------------
@@ -691,7 +683,7 @@ async fn concurrent_submissions_coalesce_into_one_batch() {
     let batches = after.batches - before.batches;
     assert_eq!(verbs, FAN, "every verb must be accounted to a batch");
     assert!(
-        batches >= 1 && batches < FAN,
+        (1..FAN).contains(&batches),
         "the pipelining unit is the BATCH: {verbs} verbs in {batches} batches"
     );
 
@@ -937,7 +929,12 @@ async fn a_stale_term_request_is_refused_and_the_client_relearns() {
     assert_eq!(
         ship::stats().stale_term_refusals - before.stale_term_refusals,
         1,
-        "the refusal is counted"
+        "the refusal is counted on the side that ISSUED it"
+    );
+    assert_eq!(
+        ship::stats().era_relearns - before.era_relearns,
+        1,
+        "and the client's observation is its own counter, never a double count"
     );
     assert!(
         owner_be.lookup(1, "stale-era").await.is_err(),

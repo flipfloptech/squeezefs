@@ -59,6 +59,11 @@ pub mod detached;
 /// `NvmeBlockDev` worker. Test-only; inert until armed.
 pub mod dev_power_cut;
 pub mod dlm;
+// DLM stage S4 (pre-rc spec §6.7 decisions 2/3, §6.9 S4): the slot-homed lock
+// authority — lock homing over the durable meta slot map plus the lock-free
+// ownership query, in solo mode (this node owns every slot, `dlm_rpcs == 0` by
+// construction). `dlm::DlmClient` resolves to its manager.
+pub mod dlm_slot;
 // ENG-10: the env-knob registry + the startup refusal gate. The parsing
 // convention itself lives in the `#[path]`-shared `env_knob_core`. A plain
 // comment, not a doc comment: an outer doc here is concatenated ahead of the

@@ -6959,6 +6959,16 @@ impl SqueezefsFilesystem {
                 "block_lock_wait": METRICS.block_lock_wait.to_json(),
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),
                 "dlm_acquire_time": METRICS.dlm_acquire_time.to_json(),
+                // DLM S4 (spec §6.9): the slot-homed lock authority's
+                // mode + its network ledger. `solo` = this node owns
+                // every slot, so `dlm_rpcs` is **0 by construction** (the
+                // S4 gate) — nonzero on a single-node mount is a bug, not
+                // load. `dlm_term` is the process-wide durable writer era
+                // every fencing token this mount mints carries (the
+                // per-volume face is `writer_guard_term`).
+                "dlm_mode": crate::dlm_slot::dlm_mode(),
+                "dlm_rpcs": crate::dlm_slot::dlm_rpcs(),
+                "dlm_term": crate::dlm::durable_term(),
                 "writeback_queue_depth": METRICS.writeback_queue_depth.to_json(),
                 "meta_flush_deferred": METRICS.meta_flush_deferred.load(Ordering::Relaxed),
                 "meta_reclaim_batch_size": METRICS.meta_reclaim_batch_size.to_json(),
@@ -7407,8 +7417,9 @@ impl SqueezefsFilesystem {
                 // every fencing token this mount mints. Strictly greater
                 // than every predecessor's on the same volume; 0 = the
                 // volume predates incompat bit 7 (era-less tokens, the
-                // pre-S2 posture). The spec's cluster-wide `dlm_term`
-                // gauge lands with S4's `dlm_*` family.
+                // pre-S2 posture). The process-wide face is S4's
+                // `dlm_term` (the era this mount mints in — the max over
+                // the set's volumes).
                 metrics.insert(
                     "writer_guard_term".into(),
                     per_volume(&|be| be.writer_term()),

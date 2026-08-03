@@ -347,7 +347,11 @@ impl FileCustody {
 /// `inode_{N}` → `N` without allocating. Strict: the entire suffix must be
 /// ASCII digits that parse into a `u64`, otherwise the path is treated as an
 /// opaque string key (never a lossy alias of some inode).
-fn ino_of_path(path: &str) -> Option<u64> {
+///
+/// `pub(crate)` for S4's [`crate::dlm_slot::lock_home_slot`]: lock homing must
+/// derive an object's ino by EXACTLY this law, or a key this module treats as
+/// opaque could home as some inode (and vice versa).
+pub(crate) fn ino_of_path(path: &str) -> Option<u64> {
     let digits = path.strip_prefix("inode_")?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -642,10 +646,13 @@ pub struct LocalLockManager {
     client_nonce: u64,
 }
 
-/// The product-facing handle name. `LocalLockManager` is the sole
-/// implementation until the S4 slot lock manager lands; call sites keep
-/// the historical name and S4 swaps this alias for its mode dispatch.
-pub type DlmClient = LocalLockManager;
+/// The product-facing handle name — since **S4** the slot-homed lock
+/// authority ([`crate::dlm_slot::SlotLockManager`]), which homes every
+/// acquire on the durable meta slot map, asks the ownership plane whether
+/// this node owns that home, and — in solo mode, always — runs the
+/// unchanged [`LocalLockManager`] acquire. Call sites keep the historical
+/// name, so homing + ownership are universal without a call-site edit.
+pub type DlmClient = crate::dlm_slot::SlotLockManager;
 
 impl LockManager for LocalLockManager {
     fn acquire_lock(

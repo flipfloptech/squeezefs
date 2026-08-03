@@ -460,8 +460,9 @@ async fn concurrent_acquires_across_same_and_distinct_slots() {
             "the same-slot family must share one home"
         );
     }
-    let spread: std::collections::HashSet<u64> =
-        (0..FAMILY).map(|k| slot_of_ino(base_spread + k, w)).collect();
+    let spread: std::collections::HashSet<u64> = (0..FAMILY)
+        .map(|k| slot_of_ino(base_spread + k, w))
+        .collect();
     assert_eq!(
         spread.len(),
         FAMILY as usize,

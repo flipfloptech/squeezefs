@@ -9,8 +9,13 @@
 //! 1. acquire → token snapshot ≡ generator read; release makes the key
 //!    immediately reacquirable with a strictly greater token;
 //! 2. conflicting acquisition fails BOUNDED (time budget, not wakeups);
-//! 3. the `DlmClient` handle alias IS the local implementation (call
-//!    sites and the trait see one object).
+//! 3. the `DlmClient` handle alias satisfies the same contract as the
+//!    local implementation (call sites and the trait see one object).
+//!    S0–S3 the alias WAS `LocalLockManager`; since **S4** it is the
+//!    slot-homed manager, which in solo mode delegates every acquire to
+//!    it — so this contract holding through the alias is what pins "solo
+//!    mode is indistinguishable from S0" (`tests/dlm_slot_lock_tests.rs`
+//!    owns the homing/ownership half).
 
 use squeezefs::dlm::{DlmClient, LocalLockManager, LockManager};
 use std::time::Duration;
@@ -76,11 +81,13 @@ async fn local_lock_manager_satisfies_the_trait_contract() {
     bounded_conflict_contract(&a, &b, "inode_960002").await;
 }
 
-/// The product-facing handle name resolves to the local implementation:
-/// one object, both surfaces (inherent methods for the ~200 historical
-/// call sites, the trait for stage consumers).
+/// The product-facing handle name resolves to a manager satisfying this
+/// contract — `LocalLockManager` through S3, the S4 slot-homed manager
+/// (delegating to it in solo mode) since: one object, both surfaces
+/// (inherent methods for the ~200 historical call sites, the trait for
+/// stage consumers).
 #[tokio::test]
-async fn dlm_client_is_the_local_lock_manager() {
+async fn dlm_client_satisfies_the_lock_manager_contract() {
     fn is_lock_manager<M: LockManager>(_: &M) {}
     let dlm = DlmClient::new().expect("dlm");
     is_lock_manager(&dlm);

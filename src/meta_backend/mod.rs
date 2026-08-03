@@ -571,6 +571,9 @@ impl RoutedMetaBackend {
     /// [`Self::with_slot_map`] via [`open_routed_meta_set`]).
     pub fn new(volumes: Vec<std::sync::Arc<kv::backend::KvMetaBackend>>) -> Self {
         let n = volumes.len();
+        // DLM S4: lock homing routes over the SAME width the metadata
+        // plane does (spec §6.7 decision 2).
+        crate::dlm_slot::publish_routing_width(n as u64);
         Self {
             volumes,
             disabled_volumes: std::sync::Arc::new(dashmap::DashMap::with_hasher(
@@ -626,6 +629,9 @@ impl RoutedMetaBackend {
         }
         let n = volumes.len();
         let mint_slots = derive_mint_slots(n, &slot_to_volume);
+        // DLM S4: lock homing routes over the SAME frozen width the
+        // metadata plane does (spec §6.7 decision 2).
+        crate::dlm_slot::publish_routing_width(routing_width);
         Ok(Self {
             volumes,
             disabled_volumes: std::sync::Arc::new(dashmap::DashMap::with_hasher(

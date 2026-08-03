@@ -6,8 +6,9 @@ DLM **stage S9**, blocker **#3**, in S9's own words:
 > on fresh offsets — the DATA analogue of §6.2 item 3. This is the largest
 > remaining gap for a real two-host write row.*
 
-Landed in `src/data_alloc_lane.rs` + `src/block_allocator.rs`; contracts
-`tests/mw_data_alloc_lane_tests.rs`; operator surface `docs/operations.md`
+Landed in `src/data_alloc_lane.rs` + `src/block_allocator.rs` (the partition)
+and `src/alloc_lane_grant.rs` (the admission — §9a); contracts
+`tests/mw_data_alloc_lane_tests.rs` + `tests/mw_cowriter_lane_tests.rs`; operator surface `docs/operations.md`
 §Multi-writer capacity planning. Siblings this composes with:
 `docs/design-mw-cursors-and-incarnation.md` (§6.2 items 5/6 — the ino lanes
 whose arithmetic this reuses, and the lifetime stamps whose funnel it must
@@ -28,6 +29,14 @@ S4/S8/S9's problem — exactly as `kv/ino_lane.rs` says for inos. The line
 this work had to reach is: *two writers' allocators cannot hand the same
 device offset to two owners, a crash cannot make them, and a single writer
 pays nothing for the property.*
+
+**The admission landed separately, and it is §9a of this record**
+(`src/alloc_lane_grant.rs`; contracts `tests/mw_cowriter_lane_tests.rs`): the
+authority derives one lane per enrolled writer from the durable claim set,
+carries it to each co-writer on the S9 custody lease, and — because the
+reservation record of §3 is a *metadata commit* a co-writer cannot perform —
+**commits that record on the co-writer's behalf**, ahead of every hand-out.
+Read §9a together with §3.
 
 ---
 
@@ -284,6 +293,18 @@ Pinned by `the_stranded_capacity_bound_is_the_published_formula` across five
 widths and six capacities, including the tiling identity and the ≤ 1-block
 share spread.
 
+**The width rounds up to a power of two, and that is the third cost.**
+`AppendPartition` — the ONE appender descriptor the partitioned journal,
+extent bitmap, root ledger and ino lanes all run on — admits only power-of-two
+widths (an uneven split would leave some appender fewer than the two root-ledger
+slots the fallback property needs). So three writers run at `W = 4` and a
+quarter of every data volume belongs to a lane nobody holds: unreachable
+exactly like a live peer's lane, counted in `alloc_lane_stranded_bytes`, and
+recovered in full the moment a fourth writer is enrolled in a new era. Plan
+capacity on the ROUNDED width, not the writer count. Sharing the descriptor is
+deliberate: a volume must never hold two disagreeing notions of "who is
+writer 2".
+
 **Fragmentation is the second cost, and it is not free.** Contiguity-aware
 allocation keeps working **within** a lane (the VL4 `move_one` mover, VL7's
 D1/D2 axes, and the W1 in-place patch predicate are all unchanged in kind),
@@ -362,20 +383,169 @@ record per (volume, lane).
 
 ---
 
+## 9a. The admission: the lane grant (landed — `src/alloc_lane_grant.rs`)
+
+§9 item 1 below is **closed**. This section is the assignment story; contracts
+`tests/mw_cowriter_lane_tests.rs`, operator surface `docs/operations.md`
+§Multi-writer co-writer mounts.
+
+### 9a.1 Who assigns, from what
+
+The **authority**, from the §6.2 item 7 durable `claim_set` record — the same
+record a co-writer's admission rung 3 already stands on, and a record only an
+authority can write:
+
+* it keeps **lane 0**;
+* each enrolled WRITER member takes the next lane, in the record's own
+  sorted-by-id order (`upsert_writer_member` keeps it sorted, so the order is a
+  property of the record and not of who read it). Readers take no lane — they
+  mint nothing;
+* `writers` = (1 + enrolled writer members) **rounded up to a power of two**,
+  because that is what `AppendPartition` admits (`MAX_APPENDERS` = 16 and the
+  32-slot root ledger must split evenly). The rounding is an honest capacity
+  cost: with three writers the width is 4, so a quarter of every data volume
+  belongs to a lane nobody holds — unreachable exactly like a live peer's lane,
+  published as `alloc_lane_stranded_bytes`, and stated in §5's terms.
+
+The map is **injective** by construction (an index into a deduplicated sorted
+list), which is the whole point: a knob would let two co-writers claim one
+lane.
+
+### 9a.2 Why the LEASE carries it, and the co-writer does not derive it
+
+A co-writer can read the same record. It must not derive from it, and the
+reason is a race rather than trust: **the roster grows.** With `W = 2` a live
+co-writer mints `b % 2 == 1`; a node that read the record after a later
+enrollment would derive `W = 3` and mint `b % 3 == 2` — and index 5 is in both
+classes. So the authority's **arm-time snapshot** is the single source,
+distributed on `LeaseFrame.{writer_lane, writers}`, and:
+
+* a member the snapshot does not name is **refused at the custody join**,
+  naming the remedy;
+* **a width change is an act of a new authority ERA**, never of a live set —
+  which is exactly the width-change case §3.3's clause 3 already handles
+  across mounts (a record at a foreign width floors every lane, so no lane
+  can mint an index a differently-laned predecessor used);
+* a **renewal** that ever answered a different lane is a FAULT: the mount
+  self-fences (§6.7's stricter client clock) rather than adopting a residue
+  class its already-minted offsets do not belong to.
+
+`(0, 1)` on the lease means SOLO — no partition at all — which is what an
+authority with no enrolled co-writer answers, and it engages nothing.
+
+### 9a.3 The durable reservation a co-writer cannot commit
+
+§3's record is an xattr commit on ino 1 — **metadata** — and a co-writer holds
+no metadata authority; that is its definition. The record is also not optional:
+it is the only thing that stops a successor of a lane from re-minting the
+unpublished tail of a crashed predecessor (§3.1).
+
+So the raise **ships**, over S9's landed publish vocabulary
+(`PublishCall::RaiseAllocLane`), and the AUTHORITY commits it. Three
+properties make that safe, and all three live on the authority:
+
+1. **the client names a LANE, never a record.** The owner derives the record
+   name from `(vol_tag, lane)` itself, so the verb cannot address
+   `writer_claim`, `claim_set`, `job:` or any other internal name;
+2. **the lane is checked against the assignment the owner made**
+   (`WriteCustodyOwner::check_lane_raise`), under the lease epoch the owner
+   minted for that member — monotone, never reused, handed to nobody else;
+3. **the frontier only ever rises.** Monotonicity is the owner's, so no caller
+   can ask for a LOWER frontier — the one shape that would let a successor
+   re-mint a live peer's offsets.
+
+The offset is handed out only after that commit lands, because the raise runs
+inside the landed `hand_out_reserved` (§3.2's last bullet, unchanged).
+
+**Why authority pre-reservation loses.** Raising each member's frontier as part
+of granting or renewing custody needs no new verb, and was rejected on three
+counts: it puts a durable metadata commit on the **heartbeat** — the exact
+plane §6.5 item 3 measured at 455 journal beats/s and S6 exists to keep off the
+journal; it makes reservations proportional to **time** rather than to fresh
+blocks, discarding §3.4's amortization (the property that keeps the rewrite hot
+path at zero commits); and it must either over-reserve blindly on N volumes × M
+members or **stall** a streaming writer at a renewal boundary. Shipping the
+raise keeps the grain exactly as §3.4 defines it: one round trip per grain of
+fresh blocks, none for reuse.
+
+**Why not S8's generic `setxattr` verb.** It would let a co-writer write ANY
+value to the record (a lower frontier, i.e. §3.1's failure) and any internal
+name on ino 1. The record's monotonicity and its lane ownership have to be
+enforced by the node that owns the metadata, which is what a purpose-built verb
+does and a generic write cannot.
+
+### 9a.4 The OPEN: the floor a mount that never walks cannot compute
+
+A co-writer runs **no** ownership-recovery walk and **no** durable-reference
+seed (the walk's free-completing arm must never run on a snapshot view), so its
+cursor starts at 0 — and a lane alone would have it minting `w, w + W, …` from
+the bottom of a device whose low blocks are LIVE. The frontier record is a
+*ceiling* on its own minting, not a floor on history, so it does not answer
+this.
+
+The lane is therefore **opened** before any mint: a raise with `upto == 0`
+commits nothing and answers §3.3's floor, computed on the authority from state
+only it has — the durable reference ledger's dense frontier
+(`durable_dense_frontier`), its own live cursor for that data volume (the
+installed `DenseFrontierSource`), and every `alloc_lane:` record the volume
+carries, composed through the SAME `recover_lane_floor`. `engage_allocator_lane`
+wires the sink and runs the open in that order, so *"a laned mount opened its
+lane"* is structural rather than a convention.
+
+### 9a.5 What the co-writer's allocation shape is, exactly
+
+* it allocates **fresh** blocks from its lane's virgin share. Its free list is
+  empty by construction (no seed, no walk, and it frees nothing), so
+  `try_allocate_block` always falls to the fresh mint;
+* every **free** stays the authority's: `begin_free`, `free_block`,
+  `allocate_specific_block`, the W1 incarnation retire and the recovery walk
+  all still refuse on a co-writer (`cowriter.accounting_refusals` counts
+  exactly those), so a co-writer today **appends**; a rewrite that displaces a
+  block refuses at the displaced free;
+* a raise that cannot be made durable **gives the offset back** — and on a
+  co-writer that give-back is itself refused (a free), so the index is skipped
+  rather than returned. Bounded by raise failures, which are loud
+  (`alloc_lane_raise_refusals`) and covered by our own frontier, so the index
+  is never handed to a peer.
+
+### 9a.6 What 9a does NOT close
+
+* **lane-scoped lifetime stamps.** `set_meta_backend` still engages §6.2 item
+  6's incarnation minter with `AppendPartition::SOLO` (it runs before the lease
+  exists), so two writers mint stamp values from one sequence space. Harmless
+  while lanes are disjoint (a stamp only ever pairs with an offset in its own
+  lane), and the exposure is a lane **ADOPTION**: an adopter could re-mint a
+  stamp value the dead holder used for the same offset. Nothing in the grant
+  adopts a lane, and stamps only become durable under incompat bit 13, which
+  nothing stamps (D9). The fix is to pass the granted lane to
+  `engage_incarnations`, which needs the lane before `set_meta_backend` — i.e.
+  the same ordering the OPEN sidesteps;
+* **the in-flight declaration.** A co-writer does not yet call
+  `declare_inflight` with its freshly minted offsets, so S7's quarantine covers
+  only what it declares. The reservation record is the stronger protection for
+  unpublished mints (it stops re-mints outright), which is why this is a gap in
+  hygiene rather than in safety;
+* **two hosts.** See §9 items 2–5 and the operator page: nothing stamps the
+  capability bits, and the D0/PR halves need real hardware.
+
+---
+
 ## 9. What this does NOT do — the residuals S9+ owes
 
-1. **The lane assignment.** `mount_partition()` is `SOLO` until an admission
-   installs one, and nothing in the shipped mount path does. The natural
-   source is S9's **custody lease** — the authority already mints monotone
-   lease epochs, and carrying `(writer_id, writers)` on `LeaseFrame` is the
-   wire addition. Deliberately not built here: it belongs with the co-writer
-   mount posture and the D0 gate change that admits a co-member of an
-   engaged claim set (§6.2 item 7's consumer half).
+1. ~~**The lane assignment.**~~ **Closed** by §9a
+   (`src/alloc_lane_grant.rs`): the authority derives one lane per enrolled
+   writer from the durable claim set and carries `(writer_lane, writers)` on
+   `LeaseFrame`, exactly as this item predicted — plus the two things it did
+   not anticipate, which §9a.3 and §9a.4 are: a co-writer cannot commit its own
+   reservation record (it ships, and the authority commits it), and a mount
+   that never walks the tree cannot compute its own floor (the authority opens
+   it).
 2. **A width change while writers are live.** The recovery rule handles a
    width change **across mounts** (clause 3). Changing `W` on a live set
    would need every writer to stop minting, publish, and re-derive — a
    coordinated act the membership plane could carry, and which nothing here
-   attempts.
+   attempts. §9a.2's rule is the shipped answer: a width change is a new
+   authority ERA, and a member enrolled mid-era is refused at the join.
 3. **Per-lane free lists.** The candidate filter is a scan over the shared
    free list, predicted at ≈ `W`× a dense scan. If measurement shows that
    matters at field occupancy, the answer is a per-lane index, not a change

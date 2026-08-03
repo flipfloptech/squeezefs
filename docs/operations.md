@@ -250,6 +250,13 @@ reachability bound = capacity_blocks − Σ(owned lane shares)
                    ≤ capacity_blocks × (W − 1) / W  +  (W − 1)
 ```
 
+**The width is rounded up to a power of two** (1, 2, 4, 8, 16 — what the
+append-partition descriptor every partitioned structure runs on admits, with 16
+writers the ceiling). Three writers therefore run at `W = 4`: plan on the
+ROUNDED width, because the unassigned lane is unreachable in exactly the way a
+live peer's is, and it comes back in full when the next writer is enrolled in a
+new authority era.
+
 Read both rows:
 
 * **if every writer stays inside its share, partitioning costs `W − 1`
@@ -306,7 +313,8 @@ metadata authority:
 |---|---|
 | metadata | **none locally.** Every mutation is SHIPPED to the authority (the D0 claim holder). A local commit is refused, naming the shipped path (`cowriter.local_commit_refusals`) |
 | data (DMA) | **yes, under a granted custody lease** — the bytes go straight to the shared namespace, authorized locally under the custody epoch. Only custody travels |
-| ownership accounting (allocate / terminal free / W1 incarnation retire / device reclaim) | **none.** Which device offsets are owned is durable metadata on volumes it cannot commit to, so these are refused (`cowriter.accounting_refusals`) — see *What a co-writer cannot do yet* below |
+| fresh block **allocation** | **yes, from the lane its authority granted** — a residue class no peer mints in, whose durable reservation the authority commits ahead of every hand-out. See *What a co-writer can and cannot do* below |
+| ownership accounting (terminal free / specific claim / W1 incarnation retire / device reclaim) | **none.** Which device offsets are OWNED is durable metadata on volumes it cannot commit to, so these are refused (`cowriter.accounting_refusals`) |
 
 **The admission ladder, in evaluation order.** Every refusal names its rung,
 what is missing and the remedy; nothing that mutates state (rung 5's device
@@ -351,16 +359,38 @@ identity that scopes this node's staged payloads), rendered `node_{16 hex}`.
    the device registrant key; `.stats` reads `mount_posture: "co-writer"` and
    each volume's `writer_guard_mode` reads `co-writer`.
 
-**What a co-writer cannot do yet, and what that costs.** Fresh **allocation** is
-refused, naming the data-plane allocation partition that owns it: a co-writer
-allocating offsets from its own local map would collide with the authority's
-allocator, and the alternative (taking pre-allocated destinations, the job
-wire's model) is not yet a write *path* — the layout publish, the displaced-block
-free and the refcount delta of every write would each have to ride the
-authority, and only the publish half is landed. The practical consequence is
-that a co-writer today serves reads coherently, ships metadata, and can write
-only into destinations its custody grant declares. `cowriter.accounting_refusals`
-counting up is that gap being honest rather than silent.
+**What a co-writer can and cannot do (allocation).** Fresh **allocation
+works**, from a lane the authority grants — the design record is
+[`docs/design-mw-data-alloc-partition.md`](design-mw-data-alloc-partition.md)
+§9a. What an operator needs to know:
+
+* **the lane comes from the authority, on the custody lease.** There is no knob
+  and there never will be one: two co-writers choosing their own lanes is the
+  collision the partition exists to prevent. `alloc_lane_id` / `alloc_lane_writers`
+  on `.stats` are what each mount was granted;
+* **the width is the writer count rounded up to a power of two**, and it is
+  fixed for the authority's era. Plan capacity on the rounded width — with an
+  authority plus two co-writers, `W = 4` and a quarter of each data volume is
+  unreachable until a fourth writer is enrolled (published live as
+  `alloc_lane_stranded_bytes`);
+* **enrolling a co-writer after the authority armed does not widen a live
+  partition.** That node is refused at the custody join, naming the remedy: add
+  it to `SQUEEZEFS_MW_MEMBERS` and **re-arm the authority** (a new era). A live
+  writer's residue class cannot be redefined under offsets it has already
+  minted;
+* **every reservation a co-writer needs is committed by the authority.** The
+  `alloc_lane:` record is a metadata commit and a co-writer holds none, so the
+  raise ships and the authority writes it, validating that the lane is the one
+  it assigned and that the frontier only rises. `alloc_lane_shipped_reservations`
+  is that path's engagement gauge; `alloc_lane_raise_refusals` **must stay 0**
+  (a refused raise means a write stalled loudly rather than using an offset no
+  durable record covers);
+* **a co-writer APPENDS.** Its every FREE is still the authority's
+  (`begin_free`, `free_block`, `allocate_specific_block`, the W1 incarnation
+  retire and the ownership recovery walk all refuse — that is what
+  `cowriter.accounting_refusals` counts now), so a rewrite that displaces a
+  block refuses at the displaced free. Reads and metadata are unchanged: served
+  coherently, shipped respectively.
 
 **A co-writer takes no lock, and denies the authority nothing.** It runs the S5
 reader's *released* `flock(LOCK_SH)` probe — classification for the mount log
@@ -384,18 +414,38 @@ DATA staleness (§6.8 item 3, not built) applies verbatim.
 **Live signals on `.stats`:** `mount_posture` (`writer` | `reader` |
 `co-writer`) and the `cowriter` object — `mw_role`, `admissions`,
 `admission_refusals`, `accounting_refusals`, `local_commit_refusals`,
-`custody_endpoint`. **`local_commit_refusals` should stay 0** on a healthy
+`custody_endpoint` — read `accounting_refusals` beside the `alloc_lane_*`
+family, because since the allocation-lane grant it counts FREES and specific
+claims (which are still the authority's), never allocations. **`local_commit_refusals` should stay 0** on a healthy
 co-writer: nonzero means a daemon surface still commits metadata directly
 instead of shipping it (S8's "the daemon is not switched onto the router" gap
 meeting a real workload). Read them beside the custody ledger
 (`dlm_custody.*`), the publish ledger (`meta_ship_publish.*`, whose `refusals`
 must stay 0) and `data_plane_fence_mode` = 1.
 
-**What still cannot be demonstrated without two hosts on a PR fabric with
-stamped bits:** two independent node caches diverging (one process shares one
-cache), the device's rejection of a preempted co-writer's DMA (a fake namespace
-pins the decision, never the silicon), and the same-host PR host-identity
-residual noted in the guarantee-class table.
+**What an end-to-end two-host write still needs, plainly.** The machinery is
+complete and it is *unreachable in the field* until two things land that no code
+change can substitute for:
+
+1. **the capability bits are stamped.** Nothing stamps bits 7/9/10/11/13/14
+   (ruling D9), so every volume in existence fails the co-writer ladder's rung 2
+   and the authority's own arm. The Phase-8 offline reformat window is what
+   stamps them (`superblock::set_*_bit`), and until then a co-writer mount
+   refuses before it opens anything;
+2. **real PR hardware.** Rung 5 demands a standing WERO (rtype 2) reservation
+   whose registrants include this node, on namespaces that actually advertise
+   `RESCAP` — which the repo's loop substrate does not. Without the device half
+   a co-writer can be detected but not rejected, and its death can never produce
+   the drain proof that releases its quarantined offsets.
+
+And these remain undemonstrable in one process regardless: two independent node
+caches diverging (one process shares one cache), the device's rejection of a
+preempted co-writer's DMA (a fake namespace pins the decision, never the
+silicon), the same-host PR host-identity residual noted in the guarantee-class
+table, and the allocation residuals in
+[`docs/design-mw-data-alloc-partition.md`](design-mw-data-alloc-partition.md)
+§9a.6 (lane-scoped lifetime stamps, and a co-writer declaring its in-flight
+destinations so S7's quarantine covers them).
 
 ### Read-only coherent mounts (`-o ro`) — one writer plus N readers
 
@@ -1361,7 +1411,7 @@ A mounted filesystem exposes live daemon metrics as JSON on the virtual **`.stat
 
 **Lock-manager fields (`dlm_*`).** `dlm_mode` is the lock authority's mode: **`solo`** means this daemon is the lock master for every metadata slot, which is the only mode that ships — so `dlm_rpcs` (lock operations needing a remote slot owner) is **0 by construction and must stay 0**. `dlm_rpcs` keeps that meaning exactly: it counts **lock** round trips, never metadata ones — the metadata face is `meta_ship.dlm_rpcs_meta` (see [Metadata function shipping](#metadata-function-shipping-dlm-s8)). Nonzero on a single-node mount is a bug, never load: the lock refused rather than granting custody its owner never issued, and the daemon logged one loud line per event naming the object and its home slot. `dlm_term` is the durable writer era every fencing token this mount mints carries (the process-wide maximum; the per-volume face is `writer_guard_term`) — it must be strictly greater than any predecessor's on the same volume set, and `0` means the volumes predate incompat bit 7. Cross-**mount** write exclusion is not this subsystem's job in `solo` mode — it is the single-writer mount guard's (see [Single-writer mount guard](#single-writer-mount-guard-guarantee-classes)). Since **DLM S9** `dlm_rpcs` counts a *travelling* acquire wherever a custody client is armed, and the remote-custody ledger lives in the `dlm_custody` object beside it (`mode`, `dlm_custody_held`, the grant/renew/revoke counters, `dlm_custody_generation`) — all `0`/`off` on every mount that ships; the field guide is [Multi-writer data plane](#multi-writer-data-plane-dlm-stage-s9).
 
-**Allocation-partition fields (`alloc_lane_*`, DLM S9).** `alloc_lane_writers` is the number of lanes a data volume's block space is partitioned into — **`0` means unpartitioned**, which is every mount that ships, and then every other field in the family is `0` by construction (a single writer installs no partition at all). On a partitioned mount: `alloc_lane_id` is this mount's own lane, `alloc_lanes_owned` is what it may mint in (its own plus every lane adopted after its holder was proven dead — `alloc_lane_adoptions` counts those acts), `alloc_lane_reservations` is the durable watermark commits (one per grain of **fresh** blocks per lane; reuse pays none, so raises ÷ fresh blocks is the live amortization factor and growth proportional to allocations means the grain collapsed), `alloc_lane_stranded_bytes` is the **published capacity bound** — bytes belonging to lanes this mount cannot reach — and `alloc_lane_enospc_refusals` **must stay 0**: it counts allocations refused because this lane was exhausted while the set still had free space. The planning rules are in [Multi-writer capacity planning](#multi-writer-capacity-planning--the-data-plane-allocation-partition).
+**Allocation-partition fields (`alloc_lane_*`, DLM S9).** `alloc_lane_writers` is the number of lanes a data volume's block space is partitioned into — **`0` means unpartitioned**, which is every mount that ships, and then every other field in the family is `0` by construction (a single writer installs no partition at all). On a partitioned mount: `alloc_lane_id` is this mount's own lane, `alloc_lanes_owned` is what it may mint in (its own plus every lane adopted after its holder was proven dead — `alloc_lane_adoptions` counts those acts), `alloc_lane_reservations` is the durable watermark commits (one per grain of **fresh** blocks per lane; reuse pays none, so raises ÷ fresh blocks is the live amortization factor and growth proportional to allocations means the grain collapsed), `alloc_lane_shipped_reservations` is the CO-WRITER engagement gauge (a co-writer holds no metadata authority, so every one of its raises travels to the authority and is committed there — 0 with a nonzero `alloc_lane_id` means the mount is committing its own frontier, which only an authority may do), `alloc_lane_raise_refusals` **must stay 0** (a raise refused for naming a lane the authority did not assign, a width that is not the era's, or a lease that is not custody — and any refusal means an offset was NOT handed out, so the write stalled loudly instead of using an uncovered one), `alloc_lane_stranded_bytes` is the **published capacity bound** — bytes belonging to lanes this mount cannot reach, including the unassigned lanes the power-of-two rounding leaves — and `alloc_lane_enospc_refusals` **must stay 0**: it counts allocations refused because this lane was exhausted while the set still had free space. The planning rules are in [Multi-writer capacity planning](#multi-writer-capacity-planning--the-data-plane-allocation-partition).
 
 **Membership fields (`membership_*`, DLM S6).** `membership_mode` is `off` (no plane armed — the default), `owner` (this mount is the lease authority) or `member`. On an owner, `membership_members` / `membership_readers` / `membership_writers` are the live census, `membership_lease_ttl_ms` and `membership_self_deadline_ms` are the two clocks as armed, `membership_grace_remaining_ms` is a failover window in progress, and `membership_min_acked_free_epoch` is the freed-offset epoch every live member has acknowledged passing. The counters: `membership_renewals` is the heartbeat itself — it is the counter that used to be one journal transaction per client per 10 s, so it grows while `meta_kv_journal_entries` does not, which is the whole point; `membership_registration_commits` is bounded by mounts and membership changes, so growth proportional to renewals is a regression, not load; `membership_self_fences` **should stay 0** — nonzero means members are fencing their own objects because renewals are not completing (availability lost, divergence prevented); `membership_renew_refusals`, `membership_evictions`, `membership_grace_refusals`, `membership_grace_reclaims` and `membership_census_serves` are the refusal, revoke, failover and read-side ledgers.
 

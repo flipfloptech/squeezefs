@@ -129,10 +129,60 @@ fn bench_serve_prelude(c: &mut Criterion) {
     group.finish();
 }
 
+/// **PERF-12 · the single-block key resolve.**
+///
+/// The kernel read path resolves one block's key twice per tier-hit serve
+/// (the serve itself, then the binding recheck) and once per prefetch /
+/// read-lane fetch task. Both used `load_striped_block_keys`, whose contract
+/// is a SPAN: it allocates a `Vec`, clones the key `String` into it, sorts
+/// the one-element result and pops it. The shipped path resolves against the
+/// live map by reference (`Cow::Borrowed`) and, for the recheck, compares in
+/// place without materializing anything.
+///
+/// The two arms are the exact algorithms over the exact data structure — a
+/// 1,024-entry inline block map (a 4 GiB file at the shipped 4 MiB block).
+/// The allocs/op face lives in `tests/kernel_op_economy_tests.rs` (14.05 ->
+/// 8.05 per warm READ).
+fn bench_single_block_resolve(c: &mut Criterion) {
+    use std::collections::HashMap;
+
+    let map: HashMap<u32, String> = (0..1024u32)
+        .map(|b| (b, format!("sqz:vol-00aa11bb:blk_{b:012x}_0000")))
+        .collect();
+    let probe = "sqz:vol-00aa11bb:blk_0000000001ff_0000";
+    let mut n = 0u32;
+
+    let mut group = c.benchmark_group("read_single_block_resolve");
+    group.bench_function("borrowed_compare", |b| {
+        b.iter(|| {
+            n = n.wrapping_add(1);
+            let idx = black_box(n % 1024);
+            let hit = match map.get(&idx) {
+                Some(k) => std::borrow::Cow::Borrowed(k.as_str()),
+                None => std::borrow::Cow::Owned(String::new()),
+            };
+            black_box(hit == probe)
+        });
+    });
+    group.bench_function("vec_clone_sort_pop_compare", |b| {
+        b.iter(|| {
+            n = n.wrapping_add(1);
+            let idx = black_box(n % 1024);
+            let mut keys: Vec<(u32, Option<String>)> = Vec::new();
+            keys.push((idx, map.get(&idx).cloned()));
+            keys.sort_by_key(|(b, _)| *b);
+            let hit = keys.pop().and_then(|(_, k)| k);
+            black_box(hit.as_deref() == Some(probe))
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_nt_copy,
     bench_severed_pool,
-    bench_serve_prelude
+    bench_serve_prelude,
+    bench_single_block_resolve
 );
 criterion_main!(benches);

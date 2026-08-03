@@ -4357,6 +4357,22 @@ fn finish_virtual_payload(mut s: String) -> String {
     s
 }
 
+/// Layout class of a stored `file_type`, as a `&'static str` (PERF-12).
+///
+/// The WRITE handler's path selection compares the layout type against the
+/// three known classes; cloning the stored string into a per-op `String`
+/// bought nothing. Anything unrecognized maps to a sentinel that compares
+/// unequal to all three — the same outcome an unknown owned string had.
+#[inline]
+fn layout_class(file_type: &str) -> &'static str {
+    match file_type {
+        "striped" => "striped",
+        "staged" => "staged",
+        "inline" => "inline",
+        _ => "unknown",
+    }
+}
+
 #[cold]
 #[inline(never)]
 fn map_squeezefs_err(e: SqueezefsError) -> Errno {
@@ -13863,7 +13879,10 @@ impl Filesystem for SqueezefsFilesystem {
         // fingerprint work. Error exits deliberately record nothing (they
         // are loud on their own).
         let serve_t0 = std::time::Instant::now();
-        let file_path = crate::keys::inode_path(ino);
+        // PERF-12: stack key (`inode_{ino}` always fits) — one heap
+        // allocation per READ removed; every consumer takes `&str`.
+        let file_path = crate::keys::inode_path_stack(ino);
+        let file_path: &str = &file_path;
         let lock = self.get_inode_lock_ref(ino);
 
         // Short critical section only: size bound + active-buffer hit.
@@ -13931,8 +13950,12 @@ impl Filesystem for SqueezefsFilesystem {
             let end_block = (offset + read_len as u64 - 1) / block_size;
 
             if start_block == end_block {
-                let cache_key = crate::keys::active_block(ino, start_block).to_string();
-                if let Some(buf) = self.active_block_buffers.get(&cache_key) {
+                // PERF-12: stack key — the heap `CompactString` + `String`
+                // this minted were two allocations per READ for a value used
+                // only as a map probe.
+                let cache_key = crate::keys::active_block_stack(ino, start_block);
+                let cache_key: &str = &cache_key;
+                if let Some(buf) = self.active_block_buffers.get(cache_key) {
                     let block_start = start_block * block_size;
                     let rel_offset = (offset - block_start) as usize;
                     let rel_end = rel_offset + read_len;
@@ -14039,7 +14062,7 @@ impl Filesystem for SqueezefsFilesystem {
                                 .await;
                         let still_deferred = self
                             .active_block_buffers
-                            .get(&cache_key)
+                            .get(cache_key)
                             .map(|e| e.value().seed_deferred());
                         match still_deferred {
                             Some(true) => {
@@ -14048,7 +14071,7 @@ impl Filesystem for SqueezefsFilesystem {
                                     .await
                                     .map_err(map_squeezefs_err)?;
                                 if let Some(mut entry) =
-                                    self.active_block_buffers.get_mut(&cache_key)
+                                    self.active_block_buffers.get_mut(cache_key)
                                 {
                                     entry
                                         .value_mut()
@@ -14068,7 +14091,7 @@ impl Filesystem for SqueezefsFilesystem {
                             Some(false) => {
                                 // A racing flush/write materialized it first:
                                 // serve the now content-valid snapshot.
-                                if let Some(entry) = self.active_block_buffers.get(&cache_key) {
+                                if let Some(entry) = self.active_block_buffers.get(cache_key) {
                                     let snap = entry.value().snapshot();
                                     drop(entry);
                                     return Ok(ReplyData {
@@ -14344,37 +14367,48 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_squeezefs_err)?;
             write_phase_record(WritePhase::LeaseAcquire, wp_lease);
 
-            let file_path = crate::keys::inode_path(ino);
+            // PERF-12: the layout identity is a STACK key (`inode_{ino}`
+            // always fits) — the heap `String` this used to mint was one
+            // allocation per WRITE for a value every consumer takes as
+            // `&str`.
+            let file_path = crate::keys::inode_path_stack(ino);
+            let file_path: &str = &file_path;
             let block_size = self.router.block_size.load(Ordering::Relaxed);
             // Prefer hot caches for path selection (avoids meta RTT on every small write).
             // write_file still loads authoritative layout when it mutates data.
+            //
+            // PERF-12: the layout class is resolved to a `&'static str`
+            // instead of a per-write `String` clone. Every use below is a
+            // comparison against one of the three known classes, so an
+            // unrecognized type maps to a sentinel that compares unequal to
+            // all of them — byte-identical behavior, zero allocation.
             let (old_size, file_type) = if let Some(m) = self.router.metadata_cache.get(&ino) {
-                (m.size, m.file_type.to_string())
+                (m.size, layout_class(&m.file_type))
             } else if let Some((attr, cached_at)) = self.attr_cache.get(&ino) {
                 if cached_at.elapsed() < Duration::from_secs(1) {
                     let ft = if attr.size > block_size {
-                        "striped".to_string()
+                        "striped"
                     } else if attr.size > MAX_INLINE_SIZE {
-                        "staged".to_string()
+                        "staged"
                     } else {
-                        "inline".to_string()
+                        "inline"
                     };
                     (attr.size, ft)
                 } else {
                     let meta = self
                         .router
-                        .fetch_metadata(&file_path)
+                        .fetch_metadata(file_path)
                         .await
                         .map_err(map_squeezefs_err)?;
-                    (meta.size, meta.file_type.to_string())
+                    (meta.size, layout_class(&meta.file_type))
                 }
             } else {
                 let meta = self
                     .router
-                    .fetch_metadata(&file_path)
+                    .fetch_metadata(file_path)
                     .await
                     .map_err(map_squeezefs_err)?;
-                (meta.size, meta.file_type.to_string())
+                (meta.size, layout_class(&meta.file_type))
             };
             let is_striped = file_type == "striped";
 
@@ -14437,7 +14471,7 @@ impl Filesystem for SqueezefsFilesystem {
                 loop {
                     match self
                         .router
-                        .write_file(&file_path, offset, data_bytes.clone(), token)
+                        .write_file(file_path, offset, data_bytes.clone(), token)
                         .await
                     {
                         Ok(()) => break,
@@ -14515,7 +14549,7 @@ impl Filesystem for SqueezefsFilesystem {
             // cannot back yet composes zeros for the gap.
             if !use_router_write && expected_new_size > old_size {
                 self.router
-                    .update_metadata_cache_size(&file_path, expected_new_size)
+                    .update_metadata_cache_size(file_path, expected_new_size)
                     .await;
             }
             if let Some((mut attr, _)) = self.attr_cache.get(&ino) {

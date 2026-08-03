@@ -582,8 +582,19 @@ async fn hot_budget_zero_short_circuits() {
         h.fs.router.cache.hot_block.get(&k0).is_none(),
         "budget 0: the hot tier must hold nothing"
     );
-    // NVMe tier still works (publish untouched in PR 3).
-    assert!(h.fs.router.cache.nvme.get_cached_read_block(&k0).is_some());
+    // NVMe tier still works (publish untouched in PR 3). Since PERF-11 the
+    // publish is DEFERRED (it rides the single-flight guard on the blocking
+    // pool instead of blocking the serve), so this is an eventually — the
+    // ordering that used to be provided by awaiting it is now pinned by
+    // read_tier_refetch_churn_tests::tier_publish_is_detached_*.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while h.fs.router.cache.nvme.get_cached_read_block(&k0).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "budget 0: the deferred NVMe-tier publish never landed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -675,9 +686,9 @@ fn purge_census_grep_guard() {
         if f.ends_with("cache/nvme.rs") {
             return true;
         }
-        // routing.rs publisher-local undo inside the awaited publish
-        // closure: undoes only the put it just made (no other tier has the
-        // fill yet at that point).
+        // routing.rs publisher-local undo inside the tier-publish closure
+        // (deferred since PERF-11, guard aboard): undoes only the put it
+        // just made (no other tier has the fill yet at that point).
         if f.ends_with("routing.rs") && line.contains("nvme_clone.remove_cached_read_block") {
             return true;
         }

@@ -186,6 +186,35 @@ fn tier_has(h: &H, key: &str) -> bool {
     h.fs.router.cache.nvme.get_cached_read_block(key).is_some()
 }
 
+/// PERF-11: the disk-tier publish is DEFERRED (it rides the single-flight
+/// guard on the blocking pool instead of blocking the serve), so
+/// publish-PRESENCE assertions are bounded eventuallys. The ordering the
+/// await used to provide — publish visible before the flight's registry
+/// entry clears — is pinned by
+/// `read_tier_refetch_churn_tests::tier_publish_is_detached_*`.
+async fn tier_has_eventually(h: &H, key: &str) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !tier_has(h, key) {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    true
+}
+
+/// The absence twin: a publish that was SKIPPED must stay absent — settle
+/// first so a merely-in-flight deferred publish cannot pass as a skip.
+async fn tier_stays_absent(h: &H, key: &str) -> bool {
+    for _ in 0..10 {
+        if tier_has(h, key) {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    true
+}
+
 fn hot_has(h: &H, key: &str) -> bool {
     h.fs.router.cache.hot_block.get(key).is_some()
 }
@@ -213,7 +242,7 @@ async fn second_touch_admission_first_skip_then_publish() {
     let d = read_at(&h, ino, 0, 64 * 1024).await;
     assert!(d.iter().all(|&x| x == 0xA1));
     assert!(
-        !tier_has(&h, &k0),
+        tier_stays_absent(&h, &k0).await,
         "FIRST touch of a >256 KiB fill must skip the disk-tier publish — \
          this is the 16.5 GiB-per-16 GiB tax being killed"
     );
@@ -234,7 +263,7 @@ async fn second_touch_admission_first_skip_then_publish() {
     let d = read_at(&h, ino, 0, 64 * 1024).await;
     assert!(d.iter().all(|&x| x == 0xA1));
     assert!(
-        tier_has(&h, &k0),
+        tier_has_eventually(&h, &k0).await,
         "the SECOND miss within the ghost window must publish — re-read \
          heat converges to the disk tier (second-touch admission)"
     );
@@ -267,7 +296,7 @@ async fn small_block_volume_keeps_first_touch_publish() {
     let d = read_at(&h, ino, 0, 64 * 1024).await;
     assert!(d.iter().all(|&x| x == 0xB1));
     assert!(
-        tier_has(&h, &k0),
+        tier_has_eventually(&h, &k0).await,
         "≤256 KiB fills keep today's unconditional publish — the admission \
          policy governs only the population that pays 4 MiB publishes"
     );
@@ -295,7 +324,10 @@ async fn o_direct_flag_reaches_the_classifier() {
         "fuse_read_in.flags must be visible per-request (the vendored \
          crate previously discarded them)"
     );
-    assert!(!tier_has(&h, &k0), "O_DIRECT first touch skips the publish");
+    assert!(
+        tier_stays_absent(&h, &k0).await,
+        "O_DIRECT first touch skips the publish"
+    );
     assert!(hot_has(&h, &k0));
 }
 
@@ -347,7 +379,7 @@ async fn admission_always_restores_first_touch_publish() {
     let d = read_at(&h, ino, 0, 64 * 1024).await;
     assert!(d.iter().all(|&x| x == 0xD1));
     assert!(
-        tier_has(&h, &k0),
+        tier_has_eventually(&h, &k0).await,
         "admission=always is the operator escape hatch: first-touch publish"
     );
 }
@@ -371,8 +403,14 @@ async fn hot_budget_zero_auto_degrades_to_always() {
 
     let d = read_at(&h, ino, 0, 64 * 1024).await;
     assert!(d.iter().all(|&x| x == 0xE1));
+    // Eventually: the publish is DEFERRED since PERF-11 (it rides the
+    // single-flight guard on the blocking pool rather than blocking the
+    // serve). The pinned interaction is that admission DEGRADES to
+    // always-publish — not that the put is synchronous with the read; the
+    // anti-churn ordering that the await used to provide is pinned by
+    // read_tier_refetch_churn_tests::tier_publish_is_detached_*.
     assert!(
-        tier_has(&h, &k0),
+        tier_has_eventually(&h, &k0).await,
         "hot budget 0 must auto-degrade admission to always-publish so \
          sub-reads stay cheap (the doc's pinned knob interaction)"
     );
@@ -494,7 +532,7 @@ async fn dehydration_skips_tier_resident_protected_victims() {
     let d = read_at(&h, ino, 128 * 1024, 64 * 1024).await; // touch 2: admit+publish
     assert!(d.iter().all(|&x| x == 1));
     assert!(
-        tier_has(&h, map.get(&0).unwrap()),
+        tier_has_eventually(&h, map.get(&0).unwrap()).await,
         "fixture: the admitted fill must be tier-resident"
     );
 
@@ -519,7 +557,7 @@ async fn dehydration_skips_tier_resident_protected_victims() {
          the tier already holds is duplicate-write churn"
     );
     assert!(
-        tier_has(&h, map.get(&0).unwrap()),
+        tier_has_eventually(&h, map.get(&0).unwrap()).await,
         "the tier copy survives untouched"
     );
 }
@@ -555,7 +593,7 @@ async fn hold_serve_counts_as_ghost_touch_through_the_fetch_loop() {
         "fixture: the demand fill must deposit in the hold"
     );
     assert!(
-        !tier_has(&h, &k0),
+        tier_stays_absent(&h, &k0).await,
         "fixture: first touch skipped the publish"
     );
 
@@ -583,7 +621,7 @@ async fn hold_serve_counts_as_ghost_touch_through_the_fetch_loop() {
          touch — ledger visibility is serve-side, not retention-side"
     );
     assert!(
-        tier_has(&h, &k0),
+        tier_has_eventually(&h, &k0).await,
         "the ghost-hit hold serve must publish (second-touch admission \
          through the hold arm)"
     );

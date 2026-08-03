@@ -2824,10 +2824,12 @@ pub(crate) struct FillResult {
 
 /// Test seam (§5.2, the `FAIL_NEXT_WRITES` / `SIMULATE_CORRUPTION` shim
 /// precedent): artificial delay, in milliseconds, injected inside the
-/// awaited ≥ 64 KiB tier-publish closure — one relaxed load per publish,
+/// ≥ 64 KiB tier-publish closure — one relaxed load per publish,
 /// zero-cost when unset; no `#[cfg(test)]` fork of the production path.
 /// Lets the churn suite hold a single-flight cohort open long enough to
-/// prove waiters are served from the carried result, not the tier.
+/// prove waiters are served from the carried result, not the tier. Since
+/// PERF-11 the closure also OWNS the single-flight guard, so this delay
+/// holds the registry entry open too (that is the anti-churn ordering).
 pub static TEST_TIER_PUBLISH_DELAY_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -2839,6 +2841,19 @@ pub static TEST_TIER_PUBLISH_DELAY_MS: std::sync::atomic::AtomicU64 =
 /// displacement — one relaxed load per fetch, zero-cost when unset; no
 /// `#[cfg(test)]` fork of the production path.
 pub static TEST_BINDING_RECHECK_DELAY_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test seam (same contract as [`TEST_TIER_PUBLISH_DELAY_MS`]): artificial
+/// delay, in milliseconds, injected in the single-flight PRIMARY between
+/// its completed device fetch and its cache deposits — the window where the
+/// guard is still un-completed and NOTHING is cached yet, so dropping the
+/// primary's future must notify waiters with `None` and leave them to
+/// recover by refetching. Pre-PERF-11 the awaited tier publish sat exactly
+/// here and `TEST_TIER_PUBLISH_DELAY_MS` opened this window as a
+/// side effect; now that the publish rides the guard on the blocking pool,
+/// this is the seam that opens it explicitly (churn suite phase H). One
+/// relaxed load per publishable fill, zero-cost when unset.
+pub static TEST_FILL_PRE_DEPOSIT_STALL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// R1b disk-tier admission mode (docs/design-read-path.md §5.3), resolved
@@ -3966,6 +3981,54 @@ impl Drop for InflightBlockReadGuard {
         if !self.completed.get() {
             let _ = self.tx.send(None);
         }
+    }
+}
+
+/// Outcome of a single-block key resolve against a RAM metadata entry
+/// ([`block_key_in`] — the PERF-12 allocation-free face of
+/// `load_striped_block_keys`).
+enum BlockKeyResolve<'m> {
+    /// The block's current key: borrowed from the live inline map (the
+    /// striped default — zero allocation), or freshly formatted on the
+    /// legacy `block_prefix` shape.
+    Key(std::borrow::Cow<'m, str>),
+    /// The block is a hole in the current map.
+    Hole,
+    /// This entry cannot answer (the anomalous `block_map_id`-without-inline
+    /// -map shape, or no striped layout at all): the caller must go through
+    /// the authoritative async resolve, which re-fetches from the backend and
+    /// refuses loud rather than fabricating a hole.
+    NeedsAuthority,
+}
+
+/// Single-block key resolve straight out of a RAM metadata entry — no `Vec`,
+/// no sort, no key clone (PERF-12).
+///
+/// `load_striped_block_keys` materializes one owned `(u32, Option<String>)`
+/// per block and sorts the result; for the one-block callers on the read hot
+/// path (binding rechecks, prefetch/read-lane fetch tasks) that was a `Vec`
+/// allocation plus a `String` clone plus a one-element sort per call, twice
+/// per serve on the tier-hit path. The span-resolving function keeps its
+/// VAL-1 ceiling and its authoritative re-fetch arm; this one answers the
+/// common shape by reference.
+fn block_key_in(meta: &CachedMetadata, b: u32) -> BlockKeyResolve<'_> {
+    if let Some(map) = meta.block_map.as_deref() {
+        return match map.get(&b) {
+            Some(k) => BlockKeyResolve::Key(std::borrow::Cow::Borrowed(k.as_str())),
+            None => BlockKeyResolve::Hole,
+        };
+    }
+    if meta.block_map_id.is_some() {
+        // A map-id WITHOUT an inline map is anomalous — the authority path
+        // owns it (re-resolve from the backend, or fail loud; never a
+        // fabricated hole).
+        return BlockKeyResolve::NeedsAuthority;
+    }
+    match meta.block_prefix.as_deref() {
+        Some(prefix) => {
+            BlockKeyResolve::Key(std::borrow::Cow::Owned(format!("{}/part_{}", prefix, b)))
+        }
+        None => BlockKeyResolve::NeedsAuthority,
     }
 }
 
@@ -5264,6 +5327,18 @@ impl DataRouter {
                     // read_fill_phase_ns `fill_total`: primary claim →
                     // fill complete — what a whole cohort waits on.
                     let fill_t0 = std::time::Instant::now();
+                    // PERF-11: the disk-tier publish this fill decides on,
+                    // dispatched (with the single-flight guard) after the
+                    // cohort send instead of awaited inline. `None` = no
+                    // publish (skipped, small-fill inline put, or outside
+                    // the publishable window).
+                    let mut deferred_publish: Option<(
+                        crate::cache::nvme::NvmeStaging,
+                        std::sync::Arc<BackendRouter>,
+                        String,
+                        bytes::Bytes,
+                        u64,
+                    )> = None;
                     let guard = InflightBlockReadGuard {
                         key: block_key.to_string(),
                         inflight_block_reads: self.inflight_block_reads.clone(),
@@ -5375,56 +5450,51 @@ impl DataRouter {
                                 .nvme
                                 .cache_read_block(block_key, downloaded_bytes.clone());
                         } else {
-                            let nvme_clone = self.cache.nvme.clone();
-                            let backend_router = self.backend_router.clone();
-                            let bk_clone = block_key.to_string();
-                            let dl_clone = downloaded_bytes.clone();
-                            // AWAITED publish — the fill is tier-visible
-                            // BEFORE the single-flight guard drops (the
-                            // read-tier refetch-churn fix): a detached
-                            // publish could run arbitrarily late behind the
-                            // blocking-pool backlog, and since >256 KiB
-                            // blocks never enter the RAM LRU, the next
-                            // sub-block read of this block missed every
-                            // tier, found no in-flight entry, and refetched
-                            // the whole block from the device — queueing
-                            // yet another publish (the elbencho row-2 6.3×
-                            // get_obj multiplier; see
-                            // tests/read_tier_refetch_churn_tests.rs).
-                            // Waiters woken by this guard's drop now
-                            // re-check the tier and HIT instead of becoming
-                            // fresh primaries. Still on the blocking pool:
-                            // the put takes the tier-shard parking_lot
-                            // write lock and moves megabytes (never on an
-                            // async worker); awaiting the JoinHandle parks
-                            // only this task, which holds no locks here.
-                            // Incarnation discipline unchanged: re-check
-                            // before AND after the put — the residual
-                            // exposure stays a put→check instruction window
-                            // that a whole free→allocate→DMA→publish cycle
-                            // cannot fit inside. A JoinError (panic/
-                            // shutdown) just loses the publish: the next
-                            // read refetches — the pre-fix behavior, never
-                            // a correctness loss.
-                            let _ = tokio::task::spawn_blocking(move || {
-                                // §5.2 test seam: one relaxed load per
-                                // publish, zero-cost when unset — lets the
-                                // churn suite hold a cohort open to prove
-                                // waiter serves are publish-independent.
-                                let delay_ms = TEST_TIER_PUBLISH_DELAY_MS
-                                    .load(std::sync::atomic::Ordering::Relaxed);
-                                if delay_ms > 0 {
-                                    std::thread::sleep(Duration::from_millis(delay_ms));
-                                }
-                                if !backend_router.fill_incarnation_still(&bk_clone, before) {
-                                    return;
-                                }
-                                let _ = nvme_clone.cache_read_block(&bk_clone, dl_clone);
-                                if !backend_router.fill_incarnation_still(&bk_clone, before) {
-                                    nvme_clone.remove_cached_read_block(&bk_clone);
-                                }
-                            })
-                            .await;
+                            // **PERF-11 — the tier publish is DEFERRED, not
+                            // awaited.** The publish must be tier-visible
+                            // before the in-flight registry entry
+                            // disappears (the read-tier refetch-churn fix:
+                            // >256 KiB blocks never enter the RAM LRU, so a
+                            // late publish let the next sub-block read miss
+                            // every tier, find no in-flight entry, become a
+                            // fresh primary and refetch the whole block —
+                            // the elbencho row-2 6.3× get_obj multiplier;
+                            // see tests/read_tier_refetch_churn_tests.rs).
+                            // That ordering is a property of the GUARD, not
+                            // of this caller's return: the publish task now
+                            // OWNS the single-flight guard, so the entry
+                            // (and therefore the ordering) outlives the
+                            // publish, while the reader's bytes — and the
+                            // cohort's carried FillResult — no longer wait
+                            // on a multi-MiB mmap write behind a
+                            // blocking-pool backlog.
+                            //
+                            // Still on the blocking pool (tier-shard
+                            // parking_lot write lock + megabytes moved,
+                            // never on an async worker). Incarnation
+                            // discipline unchanged: re-check before AND
+                            // after the put, undo on movement — the
+                            // closure is self-contained, which is what
+                            // makes deferring it safe. A lost publish
+                            // (panic/shutdown) just means the next read
+                            // refetches.
+                            deferred_publish = Some((
+                                self.cache.nvme.clone(),
+                                self.backend_router.clone(),
+                                block_key.to_string(),
+                                downloaded_bytes.clone(),
+                                before,
+                            ));
+                        }
+                        // PERF-11 test seam: the primary's CANCELLATION
+                        // window — un-completed guard, nothing cached yet
+                        // (exactly where the awaited publish used to sit).
+                        // One relaxed load, zero cost when unset; never set
+                        // in production.
+                        let stall = TEST_FILL_PRE_DEPOSIT_STALL_MS
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if stall > 0 {
+                            tokio::time::sleep(Duration::from_millis(stall)).await;
                         }
                         read_fill_phase_record(ReadFillPhase::Admission, adm_t0);
                         // read_fill_phase_ns `deposit`: the cache landing
@@ -5549,12 +5619,14 @@ impl DataRouter {
                             // sibling) could have published to — the
                             // unified purge (R4 §5.4).
                             self.cache.purge_block_key(block_key);
+                            // Nothing to publish for a fill whose key moved.
+                            deferred_publish = None;
                         }
                         read_fill_phase_record(ReadFillPhase::Deposit, dep_t0);
                     }
-                    // R1a (§5.2): hand the cohort its fill — after the
-                    // publishes and the final still-check, so waiters
-                    // receive exactly the primary's serve-validity verdict.
+                    // R1a (§5.2): hand the cohort its fill — after the RAM
+                    // deposits and the final still-check, so waiters receive
+                    // exactly the primary's serve-validity verdict.
                     // `Bytes` clone = refcount bump. Then flip the guard to
                     // close-only: the success drop must never send a second
                     // value (a late subscriber that raced the send sees
@@ -5565,6 +5637,36 @@ impl DataRouter {
                     }));
                     guard.completed.set(true);
                     read_fill_phase_record(ReadFillPhase::FillTotal, fill_t0);
+                    // PERF-11: dispatch the deferred disk-tier publish with
+                    // the single-flight guard aboard. The registry entry —
+                    // and therefore the anti-churn ordering — outlives the
+                    // publish; the caller's bytes do not wait for it.
+                    // Readers arriving during the window find the entry,
+                    // re-check, and hit the RAM deposit above.
+                    if let Some((nvme_clone, backend_router, bk, dl, before)) = deferred_publish {
+                        tokio::task::spawn_blocking(move || {
+                            // Guard rides along: its Drop removes the
+                            // registry entry AFTER the publish is visible.
+                            let _guard = guard;
+                            // §5.2 test seam: one relaxed load per publish,
+                            // zero-cost when unset — lets the churn suite
+                            // hold the publish (and now the registry entry)
+                            // open to prove waiter serves are
+                            // publish-independent.
+                            let delay_ms = TEST_TIER_PUBLISH_DELAY_MS
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            if delay_ms > 0 {
+                                std::thread::sleep(Duration::from_millis(delay_ms));
+                            }
+                            if !backend_router.fill_incarnation_still(&bk, before) {
+                                return;
+                            }
+                            let _ = nvme_clone.cache_read_block(&bk, dl);
+                            if !backend_router.fill_incarnation_still(&bk, before) {
+                                nvme_clone.remove_cached_read_block(&bk);
+                            }
+                        });
+                    }
                     return Ok((
                         crate::cache::pool::ReadBlockValue::Bytes(downloaded_bytes),
                         serve_valid,
@@ -6020,23 +6122,31 @@ impl DataRouter {
                 settle(false);
                 return;
             }
-            let key = match router
-                .load_striped_block_keys(&file_path, &meta, block, block)
-                .await
-            {
-                Ok(mut keys) => match keys.pop().and_then(|(_, k)| k) {
-                    Some(k) => k,
-                    None => {
-                        // Hole in the current map: nothing to warm.
-                        settle(true);
+            // PERF-12: single-block resolve — no Vec/sort/clone per fetch.
+            let key = match block_key_in(&meta, block) {
+                BlockKeyResolve::Key(k) => k.into_owned(),
+                BlockKeyResolve::Hole => {
+                    // Hole in the current map: nothing to warm.
+                    settle(true);
+                    return;
+                }
+                BlockKeyResolve::NeedsAuthority => match router
+                    .load_striped_block_keys(&file_path, &meta, block, block)
+                    .await
+                {
+                    Ok(mut keys) => match keys.pop().and_then(|(_, k)| k) {
+                        Some(k) => k,
+                        None => {
+                            settle(true);
+                            return;
+                        }
+                    },
+                    Err(err) => {
+                        debug!("Prefetch: failed to resolve block key: {err:?}");
+                        settle(false);
                         return;
                     }
                 },
-                Err(err) => {
-                    debug!("Prefetch: failed to resolve block key: {err:?}");
-                    settle(false);
-                    return;
-                }
             };
 
             if router.cache.gds.is_available() {
@@ -6412,23 +6522,31 @@ impl DataRouter {
                 settle(false);
                 return;
             }
-            let key = match router
-                .load_striped_block_keys(&file_path, &meta, block, block)
-                .await
-            {
-                Ok(mut keys) => match keys.pop().and_then(|(_, k)| k) {
-                    Some(k) => k,
-                    None => {
-                        // Hole in the current map: nothing to fetch.
-                        settle(true);
+            // PERF-12: single-block resolve — no Vec/sort/clone per fetch.
+            let key = match block_key_in(&meta, block) {
+                BlockKeyResolve::Key(k) => k.into_owned(),
+                BlockKeyResolve::Hole => {
+                    // Hole in the current map: nothing to fetch.
+                    settle(true);
+                    return;
+                }
+                BlockKeyResolve::NeedsAuthority => match router
+                    .load_striped_block_keys(&file_path, &meta, block, block)
+                    .await
+                {
+                    Ok(mut keys) => match keys.pop().and_then(|(_, k)| k) {
+                        Some(k) => k,
+                        None => {
+                            settle(true);
+                            return;
+                        }
+                    },
+                    Err(err) => {
+                        debug!("read-lane: failed to resolve block key: {err:?}");
+                        settle(false);
                         return;
                     }
                 },
-                Err(err) => {
-                    debug!("read-lane: failed to resolve block key: {err:?}");
-                    settle(false);
-                    return;
-                }
             };
             // Already resident or in flight: the reader will find it.
             if router.cache.read_lane_hold.contains(&key)
@@ -6538,6 +6656,17 @@ impl DataRouter {
     /// least as fresh as every merge whose displaced key could have been
     /// reallocated by the time this runs. On a miss, `fetch_metadata`'s
     /// refill reads the backend under the same lock (serialized ≥ merges).
+    /// Whether a single-flight fill for `block_key` is registered right now
+    /// — the observability face of the anti-churn ordering (PERF-11: the
+    /// deferred tier publish OWNS the flight's guard, so the registry entry
+    /// outlives the publish even though the reader's bytes do not).
+    /// Read-only; used by `tests/read_tier_refetch_churn_tests.rs`.
+    pub fn block_fill_inflight(&self, block_key: &str) -> bool {
+        self.inflight_block_reads
+            .read_sync(block_key, |_, _| ())
+            .is_some()
+    }
+
     async fn current_block_binding(&self, file_path: &str, b: u32) -> Result<Option<String>> {
         let ino = parse_inode_from_path(file_path);
         let meta = match self.metadata_cache.get(&ino) {
@@ -6549,8 +6678,46 @@ impl DataRouter {
             // truncate/delete/layout flip): every striped binding is gone.
             return Ok(None);
         }
-        let mut keys = self.load_striped_block_keys(file_path, &meta, b, b).await?;
-        Ok(keys.pop().and_then(|(_, k)| k))
+        // PERF-12: the single-block resolve borrows from the live map — no
+        // Vec, no sort, and the one allocation left is the caller's owned
+        // return value.
+        match block_key_in(&meta, b) {
+            BlockKeyResolve::Key(k) => Ok(Some(k.into_owned())),
+            BlockKeyResolve::Hole => Ok(None),
+            BlockKeyResolve::NeedsAuthority => {
+                let mut keys = self.load_striped_block_keys(file_path, &meta, b, b).await?;
+                Ok(keys.pop().and_then(|(_, k)| k))
+            }
+        }
+    }
+
+    /// Is block `b` of `file_path` STILL bound to `expected`? — the
+    /// allocation-free face of [`Self::current_block_binding`] (PERF-12).
+    ///
+    /// Every tier-serve binding recheck asks exactly this question and threw
+    /// away the materialized key immediately: the old path built a `Vec`,
+    /// cloned the key `String` into it, sorted the one-element vector, popped
+    /// it, and compared. This resolves against the live map by reference and
+    /// compares in place — same currency argument, same freshness source (see
+    /// [`Self::current_block_binding`]), zero allocations on the striped
+    /// inline-map shape.
+    async fn block_binding_is(&self, file_path: &str, b: u32, expected: &str) -> Result<bool> {
+        let ino = parse_inode_from_path(file_path);
+        let meta = match self.metadata_cache.get(&ino) {
+            Some(m) => m,
+            None => self.fetch_metadata(file_path).await?,
+        };
+        if meta.block_map.is_none() && meta.block_map_id.is_none() && meta.block_prefix.is_none() {
+            return Ok(false);
+        }
+        match block_key_in(&meta, b) {
+            BlockKeyResolve::Key(k) => Ok(k == expected),
+            BlockKeyResolve::Hole => Ok(false),
+            BlockKeyResolve::NeedsAuthority => {
+                let mut keys = self.load_striped_block_keys(file_path, &meta, b, b).await?;
+                Ok(keys.pop().and_then(|(_, k)| k).as_deref() == Some(expected))
+            }
+        }
     }
 
     /// Hybrid-I/O diagnostic fetch (the `direct_device_true` escape): one
@@ -8769,6 +8936,8 @@ impl DataRouter {
     }
 
     /// Resolve `[start_block, end_block]` (inclusive) into per-block keys.
+    /// Multi-block callers only — single-block resolves take the
+    /// allocation-free [`block_key_in`] (PERF-12).
     ///
     /// **VAL-1 bound (pre-RC engineering spec §3):** the span is capped by
     /// [`max_block_keys_per_call`] before a single entry is pushed. This
@@ -10382,8 +10551,16 @@ impl DataRouter {
                         let b_start_offset = b_idx as u64 * block_size;
                         let slice_start = offset - b_start_offset;
                         let slice_len = (end_offset - offset) as u32;
-                        let cache_key =
-                            crate::keys::active_block_for_path(file_path, b_idx).to_string();
+                        // PERF-12: stack key — `active_block_for_path(..)
+                        // .to_string()` was two allocations per READ (the
+                        // `CompactString` and the `String`) for a value used
+                        // only as a staging probe. Identical bytes:
+                        // `file_path` IS `inode_{ino}` here.
+                        let cache_key = crate::keys::active_block_stack(
+                            parse_inode_from_path(file_path),
+                            b_idx as u64,
+                        );
+                        let cache_key: &str = &cache_key;
 
                         // W2 (§5.2 "overlay never invisible"): a staged
                         // extent record's runs are NEWER than every base
@@ -10410,7 +10587,7 @@ impl DataRouter {
                                 let mut out = vec![0u8; rel_e - rel_s];
                                 if fully_covered {
                                     // runs overlay below fills everything
-                                } else if let Some(img) = self.cache.nvme.read_staged(&cache_key) {
+                                } else if let Some(img) = self.cache.nvme.read_staged(cache_key) {
                                     let start = rel_s.min(img.len());
                                     let end = rel_e.min(img.len());
                                     out[..end - start].copy_from_slice(&img[start..end]);
@@ -10461,7 +10638,7 @@ impl DataRouter {
                         }
 
                         // Check active block staging first
-                        if let Some(guard) = self.cache.nvme.read_staged_zero_copy(&cache_key) {
+                        if let Some(guard) = self.cache.nvme.read_staged_zero_copy(cache_key) {
                             let start = std::cmp::min(slice_start as usize, guard.len);
                             let end =
                                 std::cmp::min((slice_start + slice_len as u64) as usize, guard.len);
@@ -10603,10 +10780,8 @@ impl DataRouter {
                                     read_serve_phase_record(ReadServePhase::SliceOut, slice_t0);
                                     let bind_t0 = std::time::Instant::now();
                                     let still_bound = self
-                                        .current_block_binding(file_path, start_block)
-                                        .await?
-                                        .as_deref()
-                                        == Some(b_key.as_str());
+                                        .block_binding_is(file_path, start_block, b_key)
+                                        .await?;
                                     read_serve_phase_record(ReadServePhase::BindingCheck, bind_t0);
                                     if still_bound {
                                         METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -10699,10 +10874,8 @@ impl DataRouter {
                                         read_serve_phase_record(ReadServePhase::SliceOut, slice_t0);
                                         let bind_t0 = std::time::Instant::now();
                                         let still_bound = self
-                                            .current_block_binding(file_path, start_block)
-                                            .await?
-                                            .as_deref()
-                                            == Some(b_key.as_str());
+                                            .block_binding_is(file_path, start_block, b_key)
+                                            .await?;
                                         read_serve_phase_record(
                                             ReadServePhase::BindingCheck,
                                             bind_t0,
@@ -10820,10 +10993,8 @@ impl DataRouter {
                                     read_serve_phase_record(ReadServePhase::SliceOut, slice_t0);
                                     let bind_t0 = std::time::Instant::now();
                                     let still_bound = self
-                                        .current_block_binding(file_path, start_block)
-                                        .await?
-                                        .as_deref()
-                                        == Some(b_key.as_str());
+                                        .block_binding_is(file_path, start_block, b_key)
+                                        .await?;
                                     read_serve_phase_record(ReadServePhase::BindingCheck, bind_t0);
                                     if still_bound {
                                         if hint.odirect {
@@ -11067,13 +11238,12 @@ impl DataRouter {
                                                     });
                                                 if incarnation_ok
                                                     && self
-                                                        .current_block_binding(
+                                                        .block_binding_is(
                                                             file_path,
                                                             start_block,
+                                                            b_key,
                                                         )
                                                         .await?
-                                                        .as_deref()
-                                                        == Some(b_key.as_str())
                                                 {
                                                     let len = block_size as usize;
                                                     let dest_ptr = dest as *mut u8;

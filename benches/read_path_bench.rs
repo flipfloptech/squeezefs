@@ -373,13 +373,72 @@ fn bench_read_dest_bound(c: &mut Criterion) {
     group.finish();
 }
 
+/// **PERF-11 · the tier publish's place on the read serve path.**
+///
+/// Every cold demand fill above 64 KiB decides on a disk-tier publish, and
+/// that publish is a multi-MiB mmap write under the tier shard's write lock
+/// — correctly on the blocking pool. What PERF-11 changes is whether the
+/// READER waits for it: the publish now carries the single-flight guard, so
+/// the anti-churn ordering (publish visible before the flight's registry
+/// entry clears) survives while the caller's bytes do not wait.
+///
+/// The arms price the removed critical-path term at the field's 4 MiB block
+/// size — a `spawn_blocking` round trip plus the payload move:
+/// * `awaited_hop_4m` — the pre-fix shape (dispatch + await).
+/// * `detached_hop_4m` — the shipped shape (dispatch only).
+///
+/// Note the awaited arm is measured on an IDLE blocking pool; in the field
+/// it also inherits the pool's backlog, which is what made the term visible
+/// in `read_fill_phase_ns[admission]`.
+fn bench_tier_publish_hop(c: &mut Criterion) {
+    use std::sync::Arc;
+    use tokio::runtime::Runtime;
+
+    const BLOCK: usize = 4 * 1024 * 1024;
+    let rt = Runtime::new().expect("bench runtime");
+    let payload = Bytes::from(vec![0x5Au8; BLOCK]);
+    let sink: Arc<parking_lot::Mutex<Vec<u8>>> =
+        Arc::new(parking_lot::Mutex::new(vec![0u8; BLOCK]));
+
+    let mut group = c.benchmark_group("read_tier_publish_hop");
+    group.throughput(Throughput::Bytes(BLOCK as u64));
+
+    group.bench_function("awaited_hop_4m", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let dl = payload.clone();
+                let sink = Arc::clone(&sink);
+                let _ = tokio::task::spawn_blocking(move || {
+                    sink.lock().copy_from_slice(&dl);
+                })
+                .await;
+            })
+        });
+    });
+
+    group.bench_function("detached_hop_4m", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let dl = payload.clone();
+                let sink = Arc::clone(&sink);
+                tokio::task::spawn_blocking(move || {
+                    sink.lock().copy_from_slice(&dl);
+                });
+            })
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_read_dest_bound,
     bench_hold,
     bench_classifier,
     bench_assembly_join,
-    bench_sparse_lseek
+    bench_sparse_lseek,
+    bench_tier_publish_hop
 );
 
 criterion_main!(benches);

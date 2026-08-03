@@ -357,15 +357,17 @@ async fn fetched_blocks_are_tier_visible_and_never_refetched() {
 ///   sends `None` before closing — waiters fail fast into the re-check
 ///   loop, never park out the 60 s deadline); no device-read counter
 ///   movement (failed reads never count).
-/// - H (primary cancelled mid-publish): aborting the primary's future while
-///   it awaits the delayed publish drops the un-completed guard ⇒ `None` ⇒
-///   live waiters re-check, ONE becomes the new primary and refetches
-///   (device fetches == 2 total), the rest are served from the second
-///   cohort's result (`singleflight_waiter_result_serves == cohort-1`) —
-///   no fill leak, no hang, correct bytes.
+/// - H (primary cancelled before its deposits): aborting the primary's
+///   future inside the pre-deposit window (`TEST_FILL_PRE_DEPOSIT_STALL_MS`
+///   — where the awaited publish used to sit before PERF-11 detached it)
+///   drops the un-completed guard ⇒ `None` ⇒ live waiters re-check, ONE
+///   becomes the new primary and refetches (device fetches == 2 total), the
+///   rest are served from the second cohort's result
+///   (`singleflight_waiter_result_serves == cohort-1`) — no fill leak, no
+///   hang, correct bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn result_carrying_single_flight_decouples_waiters_from_publish() {
-    use squeezefs::routing::TEST_TIER_PUBLISH_DELAY_MS;
+    use squeezefs::routing::{TEST_FILL_PRE_DEPOSIT_STALL_MS, TEST_TIER_PUBLISH_DELAY_MS};
 
     let h = make().await;
 
@@ -458,16 +460,17 @@ async fn result_carrying_single_flight_decouples_waiters_from_publish() {
         "phase G: failed fetches never count device reads"
     );
 
-    // ---- Phase H: primary aborted mid-publish — waiters recover through
-    // a second cohort; exactly one refetch; no leak, no hang.
+    // ---- Phase H: primary aborted before its cache deposits — waiters
+    // recover through a second cohort; exactly one refetch; no leak, no
+    // hang.
     //
-    // R1b prerequisite: abort-MID-PUBLISH requires a publish to exist, and
-    // under second-touch admission a first-touch fill skips it. Prime the
-    // ghost with one fetch of block 1, then purge every tier so the phase
-    // fill is a genuine ghost-admitted (publishing) miss.
+    // R1b prerequisite: the pre-deposit window only opens on a PUBLISHABLE
+    // fill, and under second-touch admission a first-touch fill skips the
+    // whole arm. Prime the ghost with one fetch of block 1, then purge every
+    // tier so the phase fill is a genuine ghost-admitted miss.
     let _ = read_at(&h, ino, BS, 64 * 1024).await;
     h.fs.router.cache.purge_block_key(&k1);
-    TEST_TIER_PUBLISH_DELAY_MS.store(800, Ordering::Relaxed);
+    TEST_FILL_PRE_DEPOSIT_STALL_MS.store(800, Ordering::Relaxed);
     let g_h0 = METRICS.get_obj.load(Ordering::Relaxed);
     let w_h0 = METRICS
         .singleflight_waiter_result_serves
@@ -500,7 +503,7 @@ async fn result_carrying_single_flight_decouples_waiters_from_publish() {
             "phase H waiter {i} content — recovery must serve block 1's real bytes"
         );
     }
-    TEST_TIER_PUBLISH_DELAY_MS.store(0, Ordering::Relaxed);
+    TEST_FILL_PRE_DEPOSIT_STALL_MS.store(0, Ordering::Relaxed);
     let g_h = METRICS.get_obj.load(Ordering::Relaxed);
     let w_h = METRICS
         .singleflight_waiter_result_serves
@@ -513,19 +516,114 @@ async fn result_carrying_single_flight_decouples_waiters_from_publish() {
          cancelled cohort's missing result (hang)"
     );
     // Serve SOURCE for the second cohort's non-primaries is legitimately
-    // nondeterministic: the aborted primary's publish closure keeps running
-    // on the blocking pool (spawn_blocking is not cancelled by task abort —
-    // §5.2's future-drop case cancels the AWAIT, not the closure) and its
-    // incarnation-checked put may land first, so waiters can be served by
-    // the cache re-check (tier hit) instead of the second cohort's carried
-    // result. Both routes are refetch-free — the get_obj == 2 assert above
-    // is the leak detector; phases E–G already pin the result-serve path
-    // when the tier cannot serve. Never MORE result-serves than
-    // non-primaries exist:
+    // nondeterministic: the second cohort's own deposits (and, on the
+    // pre-PERF-11 shape, a straggling publish closure) can land before a
+    // waiter's re-check, so waiters may be served by the cache re-check
+    // (tier hit) instead of the second cohort's carried result. Both routes
+    // are refetch-free — the get_obj == 2 assert above is the leak
+    // detector; phases E–G already pin the result-serve path when the tier
+    // cannot serve. Never MORE result-serves than non-primaries exist:
     assert!(
         w_h - w_h0 <= 2,
         "phase H: at most the two non-primaries can be result-served \
          (got {})",
         w_h - w_h0
     );
+}
+
+/// **PERF-11 — the disk-tier publish is off the read serve's critical path.**
+///
+/// Both admission arms used to AWAIT the multi-MiB tier put (a
+/// `spawn_blocking` hop behind whatever backlog the blocking pool has)
+/// before returning the caller's bytes. The anti-churn law that justified
+/// it only requires the publish to precede the GUARD DROP — the moment the
+/// in-flight registry entry disappears and a new reader can become a fresh
+/// primary. The publish now carries the guard instead, so:
+///
+/// 1. the read returns without waiting for the publish (latency), and
+/// 2. the registry entry — the churn boundary — still outlives it
+///    (ordering), so a reader arriving in the window is a waiter that
+///    re-checks and hits the RAM deposit, never a fresh primary.
+///
+/// Instrument: `TEST_TIER_PUBLISH_DELAY_MS` holds the publish open for a
+/// known interval, so both properties are exact rather than statistical.
+/// (Same process-global-seam serialization requirement as the two phase
+/// tests above: run with `--test-threads=1`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tier_publish_is_detached_from_the_serve_but_still_precedes_the_guard_drop() {
+    use squeezefs::routing::TEST_TIER_PUBLISH_DELAY_MS;
+
+    const PUBLISH_MS: u64 = 600;
+
+    let h = make().await;
+    let ino = create(&h, "perf11_probe").await;
+    // Three full blocks (the sibling fixtures' shape — a single-block file
+    // can stay staged and never mint a block map).
+    for b in 0..3u64 {
+        write_at(&h, ino, b * BS, &vec![0x7Bu8; BS as usize]).await;
+    }
+    let map = make_cold(&h, ino).await;
+    let k0 = map.get(&0).expect("block 0 mapped").clone();
+
+    // Ghost-prime: under second-touch admission a first-touch fill skips the
+    // publish entirely, so warm the ghost and purge every tier to make the
+    // measured fill a genuine publishing miss.
+    let _ = read_at(&h, ino, 0, 64 * 1024).await;
+    h.fs.router.cache.purge_block_key(&k0);
+    assert!(!hot_or_tier_has(&h, &k0), "fixture must be cold again");
+
+    TEST_TIER_PUBLISH_DELAY_MS.store(PUBLISH_MS, Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
+    let d = read_at(&h, ino, 0, 128 * 1024).await;
+    let serve = t0.elapsed();
+    assert!(d.iter().all(|&x| x == 0x7B), "content");
+
+    // (1) Latency: the serve must not have waited on the publish. Pre-fix
+    // this is >= PUBLISH_MS by construction.
+    assert!(
+        serve < std::time::Duration::from_millis(PUBLISH_MS / 2),
+        "the read serve waited on the tier publish: {serve:?} against a \
+         {PUBLISH_MS} ms publish (PERF-11)"
+    );
+
+    // (2) Ordering: the flight's registry entry is still live — the publish
+    // holds the guard — so a reader arriving now is a waiter, not a fresh
+    // primary (the anti-churn boundary).
+    assert!(
+        h.fs.router.block_fill_inflight(&k0),
+        "the single-flight entry must outlive the deferred publish — that \
+         ordering IS the refetch-churn fix"
+    );
+    // The reader-visible tier already has the bytes (the RAM deposit is
+    // synchronous); the disk tier is still being written.
+    assert!(
+        h.fs.router.cache.hot_block.get(&k0).is_some(),
+        "the RAM deposit stays synchronous with the serve"
+    );
+
+    // A reader in the publish window must not refetch.
+    let g0 = METRICS.get_obj.load(Ordering::Relaxed);
+    let d = read_at(&h, ino, 128 * 1024, 128 * 1024).await;
+    assert!(d.iter().all(|&x| x == 0x7B), "in-window content");
+    assert_eq!(
+        METRICS.get_obj.load(Ordering::Relaxed) - g0,
+        0,
+        "a reader arriving during the deferred publish must be served from \
+         the tiers, never refetch"
+    );
+
+    // …and the publish lands (and only then does the entry clear).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let published = h.fs.router.cache.nvme.get_cached_read_block(&k0).is_some();
+        if published && !h.fs.router.block_fill_inflight(&k0) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "deferred publish never completed (published={published})"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    TEST_TIER_PUBLISH_DELAY_MS.store(0, Ordering::Relaxed);
 }

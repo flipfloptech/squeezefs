@@ -681,7 +681,10 @@ fn ino_bitmap(meta: &RoutedMetaBackend) -> InoBitmap {
 /// (`docs/design-cow-kv-metadata.md` §4.2) needs 100 M/8 = 12.5 MB of
 /// bits, and 16 MiB is that with headroom for the sparse tail. A set that
 /// hits the budget marks itself truncated and C9 records no verdict.
-fn ino_set_byte_budget() -> u64 {
+///
+/// `pub` so the derivation carries a drift-is-red tie test (the house law
+/// for every derived default) — see `tests/fsck_c9_tests.rs`.
+pub fn ino_set_byte_budget() -> u64 {
     const DESIGN_CAP_FLOOR: u64 = 16 * 1024 * 1024;
     (crate::mem_budget::MEM_BUDGET.budget_bytes() / 64).max(DESIGN_CAP_FLOOR)
 }

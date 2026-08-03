@@ -1026,3 +1026,32 @@ async fn test_c9_counters_and_repair_class_gauge_move() {
     );
     fx.close().await;
 }
+
+// ---------------------------------------------------------------------------
+// The derivation's tie test (drift is red)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_ino_set_byte_budget_is_derived_not_tuned() {
+    let budget = squeezefs::fsck::ino_set_byte_budget();
+    let r5 = squeezefs::mem_budget::MEM_BUDGET.budget_bytes();
+
+    // The percentage half: 1/64th of the R5 memory budget (a scan holds
+    // two sets ⇒ ≈ 3 % transiently).
+    // The floor half: the ≥ 100 M-inode DESIGN CAP's own requirement —
+    // 100 M bits = 12.5 MB — with headroom for the sparse tail. A floor
+    // is legitimate here precisely because it is that format-derived
+    // minimum, not a tuning constant.
+    const DESIGN_CAP_FLOOR: u64 = 16 * 1024 * 1024;
+    assert_eq!(
+        budget,
+        (r5 / 64).max(DESIGN_CAP_FLOOR),
+        "the C9 ino-set budget must stay derived (R5/64, floored at the design cap's \
+         12.5 MB of bits + tail); a free-floating constant here is a program violation"
+    );
+    assert!(
+        budget >= 100_000_000 / 8,
+        "the budget must be able to hold the ≥ 100 M-inode cap's bits ({} B)",
+        budget
+    );
+}

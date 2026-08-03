@@ -5239,10 +5239,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // member session for one mount (two leases, two self-fence
             // deadlines, one of them un-renewed), so the preflight's arm is
             // carried forward instead.
-            let membership_arm = if co_writer_mount {
-                co_writer_preflight
-                    .as_ref()
-                    .and_then(|_| None::<squeezefs::membership::MembershipArm>)
+            let membership_arm: Option<squeezefs::membership::MembershipArm> = if co_writer_mount {
+                // The preflight's arm is carried inside `co_writer_preflight`
+                // and handed to `cowriter::arm`, whose disarm leaves the plane.
+                None
             } else {
                 squeezefs::membership::arm_mount_membership(
                     &routed_meta_backend,

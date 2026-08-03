@@ -370,7 +370,7 @@ pub async fn open_routed_meta_set_read_only(
 /// **DLM S9** — [`open_routed_meta_set`]'s **co-writer** twin
 /// (`SQUEEZEFS_MW_ROLE=co-writer`, past the five-rung admission ladder):
 /// the same §5.5.1a stamp discovery, the same canonical member ordering and
-/// slot-map validation, opened through [`KvMetaBackend::open_co_writer`] per
+/// slot-map validation, opened through [`kv::backend::KvMetaBackend::open_co_writer`] per
 /// volume.
 ///
 /// No guard is taken on any member, so — exactly as for a reader — the

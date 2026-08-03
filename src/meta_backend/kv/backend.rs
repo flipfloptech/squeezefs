@@ -1224,7 +1224,7 @@ impl KvMetaBackend {
     /// first: [`Self::open`]'s Layer-A flock, its `FreshForeign` refusal
     /// and its whole B1/B2 ladder are **byte-identical** to what they were,
     /// and a mount that has not passed the five-rung ladder cannot reach
-    /// this function at all (a [`CoWriterAdmission`] is unforgeable —
+    /// this function at all (a [`crate::cowriter::CoWriterAdmission`] is unforgeable —
     /// `classify_admission` is its only constructor).
     ///
     /// | Step of [`Self::open`] | Co-writer |

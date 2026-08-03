@@ -1415,6 +1415,153 @@ fn bench_block_refs(c: &mut Criterion) {
     group.finish();
 }
 
+/// **DLM S3.5 — the cross-volume intent-record path** (design-cow-kv-
+/// metadata §4.11; DUR-7). The transaction's per-op CPU cost that is NOT
+/// already a journal entry is exactly this: mint the id, encode the plan,
+/// checksum it, and (at recovery) decode + verify it. Everything else the
+/// protocol adds is device work — one extra small entry and up to two
+/// coalesced barriers — which no microbench can honestly price.
+///
+/// Input shapes are FIELD-derived, not toys:
+///
+/// * **`intent_encode_unlink`** — the 2-step plan every cross-volume
+///   `unlink`/`link` builds, at the field's name length. Cross-volume
+///   unlink is the HOT shape: since the 2026-07-30 meta-plane
+///   distribution fix, regular-file inodes stripe across the set, so a
+///   `rm -rf` storm's unlinks are mostly cross-volume. The rate to beat
+///   is the D4 journal-economy row's unlink throughput
+///   (`.benchmarks/2026-07-15-metadata-throughput-closing.md`).
+/// * **`intent_encode_rename5`** — the 5-step cross-parent directory
+///   rename (both parents' `nlink`, source removal, destination insert,
+///   moved-inode ctime), and **`intent_encode_rename9`** the worst plan
+///   the converted ops build (destination replacement + `RENAME_WHITEOUT`).
+/// * **`intent_decode_verify_*`** — the mount-recovery path, per open
+///   intent. A healthy set decodes ZERO of these; the crash path decodes
+///   one per interrupted transaction.
+/// * **`intent_key`** — the probe-free key derivation that is the reason
+///   the machinery needs no new lock (an ordinary xattr write would pay a
+///   collision-chain scan here).
+///
+/// **Prediction:** encode + checksum ≲ 300 ns and key derivation ≲ 10 ns
+/// for every shape, i.e. under 1 % of the ~30–60 µs a cross-volume
+/// namespace op costs at the D4 rates — so the protocol's cost is its
+/// device work, not its record.
+///
+/// **Falsification:** any row above 1 µs, or `intent_key` above 50 ns,
+/// falsifies "the record is free" and moves the plan encoding off the
+/// critical path (encode once per plan SHAPE, or shrink the wire).
+///
+/// NOT RUN (ruling D11: no benches until the DLM can serve N readers and
+/// writers). Numbers get measured on the sanctioned venue
+/// (`tests/run_bench_baseline.sh`), never here.
+fn bench_crossvol_tx(c: &mut Criterion) {
+    use squeezefs::meta_backend::crossvol_tx::{intent_key, IntentRecord, XvOp, XvStep};
+
+    let exclusive = 2u8; // RoutedParentUpdate::ExclusiveTimes
+    let now = 1_760_000_000_000_000_000u64;
+    let unlink = IntentRecord {
+        tx_id: 0x0000_0007_dead_beef,
+        op: XvOp::Unlink,
+        steps: vec![
+            XvStep::RemoveDentry {
+                parent: 4_000_002,
+                name: "checkpoint_00042.safetensors".to_string(),
+                expect_child: 9_000_003,
+                parent_update: 1,
+            },
+            XvStep::SetNlink {
+                ino: 9_000_003,
+                pre: 1,
+                post: 0,
+                ctime: Some(now),
+            },
+        ],
+    };
+    let rename5 = IntentRecord {
+        tx_id: 0x0000_0007_dead_bef0,
+        op: XvOp::Rename,
+        steps: vec![
+            XvStep::SetNlink {
+                ino: 4_000_002,
+                pre: 9,
+                post: 8,
+                ctime: None,
+            },
+            XvStep::SetNlink {
+                ino: 4_000_003,
+                pre: 3,
+                post: 4,
+                ctime: None,
+            },
+            XvStep::RemoveDentry {
+                parent: 4_000_002,
+                name: "epoch_0042".to_string(),
+                expect_child: 9_000_007,
+                parent_update: exclusive,
+            },
+            XvStep::InsertDentry {
+                parent: 4_000_003,
+                name: "epoch_0042".to_string(),
+                child: 9_000_007,
+                ft_bits: libc::S_IFDIR,
+                parent_update: exclusive,
+            },
+            XvStep::TouchCtime {
+                ino: 9_000_007,
+                ctime: now,
+            },
+        ],
+    };
+    let mut rename9 = rename5.clone();
+    rename9.steps.extend([
+        XvStep::SetNlink {
+            ino: 9_000_011,
+            pre: 2,
+            post: 0,
+            ctime: Some(now),
+        },
+        XvStep::RemoveDentry {
+            parent: 4_000_003,
+            name: "epoch_0042".to_string(),
+            expect_child: 9_000_011,
+            parent_update: exclusive,
+        },
+        XvStep::MintInode {
+            ino: 4_000_015,
+            mode: libc::S_IFCHR,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+        },
+        XvStep::InsertDentry {
+            parent: 4_000_002,
+            name: "epoch_0042".to_string(),
+            child: 4_000_015,
+            ft_bits: libc::S_IFCHR,
+            parent_update: exclusive,
+        },
+    ]);
+
+    let mut group = c.benchmark_group("crossvol_tx");
+    for (label, rec) in [
+        ("unlink", &unlink),
+        ("rename5", &rename5),
+        ("rename9", &rename9),
+    ] {
+        group.bench_function(format!("intent_encode_{label}"), |b| {
+            b.iter(|| black_box(black_box(rec).encode().expect("encode")));
+        });
+        let image = rec.encode().expect("encode");
+        group.bench_function(format!("intent_decode_verify_{label}"), |b| {
+            b.iter(|| black_box(IntentRecord::decode(black_box(&image)).expect("decode")));
+        });
+    }
+    group.bench_function("intent_key", |b| {
+        b.iter(|| black_box(intent_key(black_box(0x0000_0007_dead_beef))));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_kv_meta_metadata,
@@ -1426,6 +1573,7 @@ criterion_group!(
     bench_kv_journal,
     bench_ino_cursors,
     bench_block_refs,
+    bench_crossvol_tx,
     bench_xattr_name_screen,
     bench_superblock_cycle,
     bench_append_partition

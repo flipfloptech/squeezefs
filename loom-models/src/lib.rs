@@ -147,6 +147,15 @@
 //!   published snapshot covers every mint whose record-apply
 //!   happened-before it (the latch-free reader vs publisher edge the
 //!   PR-plan loom clause names).
+//! - [`lane_core`]: the pre-RC spec §6.2 items 5/6 per-writer LANE cursor
+//!   (per-writer ino cursors + block-key incarnation stamps) — invariants:
+//!   two appenders' concurrent mints are never equal and never leave their
+//!   own lane (the duplicate-ino / aliased-lifetime failure both items
+//!   exist to prevent); a snapshot taken after synchronizing with an
+//!   applied record strictly covers that record's value (the durable
+//!   watermark can never under-declare a covered mint); a concurrent
+//!   `install_floor` never regresses a fresher mint and never inflates the
+//!   mint COUNT (the POSIX-1 statfs derivation rides it).
 //! - [`write_pipeline_core`]: the 2026-07-27 depth campaign's admission
 //!   accounting (`AdmissionCore` — the CAS heart of
 //!   `WritePipeline::admit` / `PipelinePermit::drop`) — invariants:
@@ -223,6 +232,8 @@ pub mod ipc_ring_core;
 pub mod ipc_slot_core;
 #[path = "../../src/meta_backend/kv/journal_core.rs"]
 pub mod journal_core;
+#[path = "../../src/lane_core.rs"]
+pub mod lane_core;
 #[path = "../../crates/fuse3/src/raw/connection/lease_core.rs"]
 pub mod lease_core;
 #[path = "../../src/meta_backend/kv/node_state_core.rs"]
@@ -362,8 +373,9 @@ mod zcrx_area_models {
 #[cfg(all(test, loom))]
 mod models {
     use crate::{
-        alloc_ext_core, conveyor_core, epoch_core, gauge_core, incarnation_core, ipc_cqe_core,
-        ipc_ring_core, ipc_slot_core, journal_core, lease_core, node_state_core, patch_clone_core,
+       alloc_ext_core, conveyor_core, epoch_core, gauge_core, incarnation_core, ipc_cqe_core,
+        ipc_ring_core, ipc_slot_core, journal_core, lane_core, lease_core, node_state_core,
+        patch_clone_core,
         placed_core, refcount_core, slot_cursor_core, slot_gate_core, wake_core,
         write_pipeline_core,
     };
@@ -3377,6 +3389,101 @@ mod models {
             assert_eq!((g.writers, g.writer_id), (4, 3));
             assert!(!g.is_authority(), "appender 3 is not the root authority");
             assert!(!g.is_solo());
+
+    // lane_core (pre-RC spec §6.2 items 5/6 — per-writer lanes)
+    // =====================================================================
+
+    /// Two appenders minting concurrently from ONE volume's value space:
+    /// their values are never equal, each stays in its own lane, and a
+    /// publisher that observed an applied record snapshots a value strictly
+    /// above it (the durable watermark's covering property, per lane).
+    ///
+    /// This is the model for the failure both §6.2 items name: a duplicate
+    /// ino aliases files immediately (item 5), and a repeated incarnation
+    /// stamp makes a stale block key MATCH a reissued offset's lifetime
+    /// (item 6). Weakening evidence: replacing `mint`'s `fetch_add` with a
+    /// load-then-store fails the `assert_ne!` below.
+    #[test]
+    fn lane_mints_are_disjoint_and_snapshot_covers_applied() {
+        loom::model(|| {
+            const BASE: u64 = 2;
+            const WRITERS: u64 = 2;
+            let a = Arc::new(lane_core::LaneCursor::new(BASE, WRITERS, 0, BASE));
+            let b = Arc::new(lane_core::LaneCursor::new(BASE, WRITERS, 1, BASE));
+            let record = Arc::new(AtomicU64::new(0)); // 0 = nothing applied
+
+            let w0 = {
+                let a = a.clone();
+                let record = record.clone();
+                thread::spawn(move || {
+                    let v = a.mint();
+                    // "Apply": the commit's Release edge (the flush pass's
+                    // node-lock synchronization, modeled).
+                    record.store(v, Ordering::Release);
+                    v
+                })
+            };
+            let w1 = {
+                let b = b.clone();
+                thread::spawn(move || b.mint())
+            };
+
+            // The checkpoint publisher: observe the applied record, then
+            // snapshot the lane that produced it.
+            let seen = record.load(Ordering::Acquire);
+            let snap = a.snapshot();
+            if seen != 0 {
+                assert!(
+                    snap > seen,
+                    "published snapshot {snap} does not cover applied value {seen}"
+                );
+            }
+
+            let v0 = w0.join().unwrap();
+            let v1 = w1.join().unwrap();
+            assert_ne!(
+                v0, v1,
+                "two appenders minted the SAME value — duplicate inos alias files \
+                 (item 5) and repeated lifetimes make a stale key match (item 6)"
+            );
+            assert_eq!(lane_core::lane_of(v0, BASE, WRITERS), 0, "value left lane 0");
+            assert_eq!(lane_core::lane_of(v1, BASE, WRITERS), 1, "value left lane 1");
+        });
+    }
+
+    /// A recovery/migration `install_floor` racing a mint: the cursor never
+    /// regresses below a value already handed out, and the mint COUNT never
+    /// exceeds the mints actually performed (an inflated count is the
+    /// POSIX-1 `statfs` over-report, one level down).
+    #[test]
+    fn lane_install_floor_never_regresses_or_inflates() {
+        loom::model(|| {
+            const BASE: u64 = 2;
+            const WRITERS: u64 = 2;
+            let cur = Arc::new(lane_core::LaneCursor::new(BASE, WRITERS, 1, BASE));
+
+            let minter = {
+                let cur = cur.clone();
+                thread::spawn(move || cur.mint())
+            };
+            let installer = {
+                let cur = cur.clone();
+                thread::spawn(move || cur.install_floor(BASE + 4))
+            };
+
+            let minted = minter.join().unwrap();
+            installer.join().unwrap();
+            assert!(
+                cur.snapshot() > minted,
+                "cursor {} regressed onto an already-minted value {minted}",
+                cur.snapshot()
+            );
+            assert!(
+                cur.minted() <= 1,
+                "mint count {} counts values this cursor never minted (the installed \
+                 gap must be re-based, not charged)",
+                cur.minted()
+            );
         });
     }
 

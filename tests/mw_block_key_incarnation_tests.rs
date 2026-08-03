@@ -101,8 +101,9 @@ fn data_file() -> NamedTempFile {
 
 /// A bare router over one file-backed data volume — no metadata plane, for
 /// the codec/allocator contracts.
-async fn bare_router(data: &std::path::Path) -> (Arc<BlockAllocator>, Arc<NvmeBlockDev>, BackendRouter)
-{
+async fn bare_router(
+    data: &std::path::Path,
+) -> (Arc<BlockAllocator>, Arc<NvmeBlockDev>, BackendRouter) {
     let alloc = Arc::new(BlockAllocator::new(DATA_VOL_ID).await.unwrap());
     alloc.set_capacity_bytes(DATA_LEN);
     let dev = Arc::new(NvmeBlockDev::new(data.to_str().unwrap()));
@@ -122,7 +123,9 @@ struct Rig {
 }
 
 async fn mount(meta: &std::path::Path, data: &std::path::Path) -> Rig {
-    let kv = KvMetaBackend::open(meta).await.expect("open v3 meta volume");
+    let kv = KvMetaBackend::open(meta)
+        .await
+        .expect("open v3 meta volume");
     let routed = Arc::new(RoutedMetaBackend::new(vec![kv]));
     let dlm = DlmClient::new().unwrap();
     let nvme = Arc::new(NvmeBlockDev::new(data.to_str().unwrap()));
@@ -238,7 +241,17 @@ fn the_incarnation_codec_is_canonical_and_refuses_junk() {
         );
         assert!(text.len() <= 13, "a u64 fits 13 base-36 digits: '{text}'");
     }
-    for junk in ["", "0", "01", "0a", "-1", "AB", "a b", "zzzzzzzzzzzzzz", "1@2"] {
+    for junk in [
+        "",
+        "0",
+        "01",
+        "0a",
+        "-1",
+        "AB",
+        "a b",
+        "zzzzzzzzzzzzzz",
+        "1@2",
+    ] {
         assert_eq!(
             decode_incarnation(junk),
             None,
@@ -254,12 +267,16 @@ fn the_incarnation_codec_is_canonical_and_refuses_junk() {
         "an era past the term budget would overflow into a foreign era"
     );
     assert_eq!(
-        compose_incarnation(1, (1 << INCARNATION_SEQ_BITS)),
+        compose_incarnation(1, 1 << INCARNATION_SEQ_BITS),
         None,
         "a sequence past the budget would alias the next era"
     );
     let stamp = compose_incarnation(9, 42).expect("legal stamp");
-    assert_eq!(incarnation_era(stamp), 9, "the era is recoverable — forensics");
+    assert_eq!(
+        incarnation_era(stamp),
+        9,
+        "the era is recoverable — forensics"
+    );
 }
 
 /// The key's wire form composes with EVERY existing key rule: the
@@ -386,7 +403,10 @@ async fn engagement_is_what_stamps_a_key() {
     let fresh = alloc.allocate_block().await.expect("allocate");
     let key = router.persist_block_key("backend_0", fresh);
     let parts = router.parse_block_key_parts(&key).unwrap();
-    assert_ne!(parts.incarnation, INCARNATION_NONE, "'{key}' must be stamped");
+    assert_ne!(
+        parts.incarnation, INCARNATION_NONE,
+        "'{key}' must be stamped"
+    );
     assert_eq!(incarnation_era(parts.incarnation), 11, "era 11 composed in");
     assert_eq!(
         router.persist_block_key("backend_0", fresh),
@@ -395,7 +415,9 @@ async fn engagement_is_what_stamps_a_key() {
          (a second minting site would make the live map disagree with the live lifetime)"
     );
     assert!(
-        router.engage_incarnation_keys(0, AppendPartition::SOLO).is_err(),
+        router
+            .engage_incarnation_keys(0, AppendPartition::SOLO)
+            .is_err(),
         "era 0 must be refused — the era IS the durable writer term"
     );
 }
@@ -505,7 +527,10 @@ async fn a_stale_binding_is_refused_instead_of_serving_another_files_bytes() {
     assert!(alloc.begin_free(off), "terminal free");
     alloc.finish_free(off);
     let reissued = alloc.allocate_block().await.expect("reallocate");
-    assert_eq!(reissued, off, "the offset is reused — the §6.3 precondition");
+    assert_eq!(
+        reissued, off,
+        "the offset is reused — the §6.3 precondition"
+    );
     let key_b = router.persist_block_key("backend_0", off);
     dev.write_block(off, bytes::Bytes::from(vec![0xBBu8; BLOCK as usize]))
         .await
@@ -528,7 +553,10 @@ async fn a_stale_binding_is_refused_instead_of_serving_another_files_bytes() {
     );
     // A ranged read takes the same path.
     assert!(
-        router.read_block_range(&key_a, 0, 4096, None).await.is_err(),
+        router
+            .read_block_range(&key_a, 0, 4096, None)
+            .await
+            .is_err(),
         "the ranged device leg must refuse the dead lifetime too"
     );
     // The destructive face: freeing under the dead key would release B's
@@ -601,10 +629,8 @@ async fn an_offset_with_no_recorded_lifetime_serves_and_is_counted() {
         "a walked key's era must be recoverable after seeding"
     );
     assert!(router.block_key_incarnation_ok(&foreign_key));
-    let stale = block_key_with_incarnation(
-        &foreign_off.to_string(),
-        compose_incarnation(1, 5).unwrap(),
-    );
+    let stale =
+        block_key_with_incarnation(&foreign_off.to_string(), compose_incarnation(1, 5).unwrap());
     assert!(
         !router.block_key_incarnation_ok(&stale),
         "a key from an OLDER era of a seeded offset is now detectable"

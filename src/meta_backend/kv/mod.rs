@@ -54,6 +54,7 @@ pub mod builder;
 pub mod checkpoint;
 pub mod conveyor_core;
 pub mod epoch_core;
+pub mod ino_lane;
 pub mod journal;
 pub mod journal_core;
 pub mod node;

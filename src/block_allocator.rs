@@ -274,13 +274,55 @@ pub struct BlockAllocator {
     /// in-flight fill pass its after-check against a reused offset (the
     /// generic/074 stale-fill family). Bound it by shrinking the address
     /// space (larger blocks), never by evicting entries.
-    incarnations: scc::HashMap<u64, AtomicU64>,
+    ///
+    /// Since spec §6.2 item 6 each cell also carries the offset's **live
+    /// lifetime stamp** — the durable-era-composed word a persisted key
+    /// names (`IncarnationCell::stamp`, +8 B on the same recorded
+    /// ceiling). Deliberately a second word beside the seqlock and never
+    /// packed INTO it: the seqlock word is loom-verified
+    /// ([`crate::incarnation_core`]) and its bit layout is load-bearing,
+    /// the same reason PR VL6a kept the fsck allocation epoch in a
+    /// separate side map.
+    incarnations: scc::HashMap<u64, IncarnationCell>,
+    /// Spec §6.2 item 6 (incompat bit 11): the mount's lifetime-stamp
+    /// minter — `Some` only when incarnation keys are engaged, which
+    /// requires every mounted meta volume to carry bit 11 and a durable
+    /// writer term (bit 7). `None` on every volume today (ruling D9:
+    /// build the bit, do not stamp it), and then every minted key is the
+    /// bare offset form, byte-identical to the shipped one.
+    incarnation_minter: std::sync::OnceLock<IncarnationMinter>,
     /// DLM **S7** (pre-RC engineering spec §6.7 "Recovery"): this volume's
     /// dead-epoch **do-not-reallocate** quarantine —
     /// [`crate::data_custody::BlockQuarantine`]. Empty on every
     /// single-writer mount; the algorithm lives in `data_custody` so the
     /// law has one home.
     quarantine: crate::data_custody::BlockQuarantine,
+}
+
+/// One offset's incarnation state: the loom-verified seqlock word plus,
+/// since spec §6.2 item 6, its live lifetime stamp (0 = none recorded).
+#[derive(Debug)]
+struct IncarnationCell {
+    word: AtomicU64,
+    stamp: AtomicU64,
+}
+
+impl IncarnationCell {
+    fn new(word: u64, stamp: u64) -> Self {
+        Self {
+            word: AtomicU64::new(word),
+            stamp: AtomicU64::new(stamp),
+        }
+    }
+}
+
+/// Spec §6.2 item 6: the per-mount lifetime-stamp minter — the durable
+/// era (writer term) plus this appender's lane cursor over the sequence
+/// space. Composition and its rationale: [`crate::routing::compose_incarnation`].
+#[derive(Debug)]
+struct IncarnationMinter {
+    era: u64,
+    seq: crate::lane_core::LaneCursor,
 }
 
 impl BlockAllocator {
@@ -301,6 +343,7 @@ impl BlockAllocator {
             elided_debt: scc::HashMap::new(),
             elided_debt_bytes: AtomicU64::new(0),
             incarnations: scc::HashMap::new(),
+            incarnation_minter: std::sync::OnceLock::new(),
             quarantine: crate::data_custody::BlockQuarantine::new(),
         })
     }
@@ -669,10 +712,13 @@ impl BlockAllocator {
     fn mark_incarnation_unstable(&self, offset: u64) {
         match self.incarnations.entry_sync(offset) {
             scc::hash_map::Entry::Occupied(occ) => {
-                crate::incarnation_core::retire(occ.get());
+                crate::incarnation_core::retire(&occ.get().word);
             }
             scc::hash_map::Entry::Vacant(vac) => {
-                let _ = vac.insert_entry(AtomicU64::new(crate::incarnation_core::UNSTABLE_FIRST));
+                let _ = vac.insert_entry(IncarnationCell::new(
+                    crate::incarnation_core::UNSTABLE_FIRST,
+                    crate::routing::INCARNATION_NONE,
+                ));
             }
         }
     }
@@ -682,10 +728,129 @@ impl BlockAllocator {
     pub fn publish_block(&self, offset: u64) {
         match self.incarnations.entry_sync(offset) {
             scc::hash_map::Entry::Occupied(occ) => {
-                crate::incarnation_core::publish(occ.get());
+                crate::incarnation_core::publish(&occ.get().word);
             }
             scc::hash_map::Entry::Vacant(vac) => {
-                let _ = vac.insert_entry(AtomicU64::new(crate::incarnation_core::STABLE_FIRST));
+                let _ = vac.insert_entry(IncarnationCell::new(
+                    crate::incarnation_core::STABLE_FIRST,
+                    crate::routing::INCARNATION_NONE,
+                ));
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Spec §6.2 item 6 — `offset ‖ incarnation` block keys (incompat bit
+    // 11, ruling D9: built, NOT stamped). Design:
+    // `docs/design-mw-cursors-and-incarnation.md`.
+    // -----------------------------------------------------------------
+
+    /// Engage lifetime stamping on this allocator: `era` is the mount's
+    /// durable writer term (incompat bit 7) and `part` its appender lane.
+    /// Idempotent — the first call wins, so a re-registration cannot
+    /// restart the sequence space mid-mount.
+    pub fn engage_incarnations(
+        &self,
+        era: u64,
+        part: crate::meta_backend::kv::journal::AppendPartition,
+    ) {
+        let _ = self.incarnation_minter.set(IncarnationMinter {
+            era,
+            // Base 1: stamp sequence 0 is reserved for
+            // `INCARNATION_NONE` ("this key names no lifetime").
+            seq: crate::lane_core::LaneCursor::new(
+                1,
+                u64::from(part.writers()),
+                u64::from(part.writer_id()),
+                1,
+            ),
+        });
+    }
+
+    /// `true` ⇔ this allocator stamps lifetimes into the keys of the
+    /// blocks it hands out (the item-6 engagement gauge; `false` on every
+    /// volume today).
+    pub fn incarnations_engaged(&self) -> bool {
+        self.incarnation_minter.get().is_some()
+    }
+
+    /// Mint the next lifetime stamp, or [`crate::routing::INCARNATION_NONE`]
+    /// when stamping is disengaged (the shipped path) or the per-mount
+    /// sequence space is exhausted.
+    ///
+    /// Exhaustion degrades to NONE — loudly and counted — never to a
+    /// wrapped stamp: losing detection is recoverable by a remount (the
+    /// era advances), while a wrapped stamp would ALIAS a live lifetime,
+    /// which is the exact failure this structure exists to prevent. The
+    /// space is 2^40 allocations per mount; at the shipped 4 MiB block
+    /// that is 4 EiB of fresh blocks in one mount.
+    fn mint_incarnation(&self) -> u64 {
+        let Some(minter) = self.incarnation_minter.get() else {
+            return crate::routing::INCARNATION_NONE;
+        };
+        let seq = minter.seq.mint();
+        match crate::routing::compose_incarnation(minter.era, seq) {
+            Some(stamp) => stamp,
+            None => {
+                log::error!(
+                    "block-key incarnation space exhausted on volume '{}' (era {}, seq {}) — \
+                     degrading to unstamped keys: stale-binding DETECTION is lost until \
+                     remount (which advances the durable era), but no lifetime is ever \
+                     aliased (spec §6.2 item 6)",
+                    self._volume_id,
+                    minter.era,
+                    seq
+                );
+                crate::fuse_client::METRICS
+                    .block_key_incarnation_exhausted
+                    .fetch_add(1, Ordering::Relaxed);
+                crate::routing::INCARNATION_NONE
+            }
+        }
+    }
+
+    /// The offset's live lifetime stamp — what
+    /// [`crate::routing::BackendRouter::persist_block_key`] writes into a
+    /// key and what the read/free paths validate against.
+    /// [`crate::routing::INCARNATION_NONE`] = no lifetime recorded for this
+    /// offset (never allocated by this mount, or stamping disengaged),
+    /// which the validators treat exactly as pre-item-6 behavior.
+    pub fn live_incarnation(&self, offset: u64) -> u64 {
+        self.incarnations
+            .read_sync(&offset, |_, v| v.stamp.load(Ordering::Acquire))
+            .unwrap_or(crate::routing::INCARNATION_NONE)
+    }
+
+    /// Record the lifetime a persisted key names for `offset` **without**
+    /// minting one — first-touch seeding from the keys mount recovery
+    /// walks ([`Self::owned_offset`]), so an offset laid down by a previous
+    /// mount presents its real era instead of "unknown".
+    ///
+    /// Never overwrites a stamp: an allocation ([`Self::claim_block_idx`])
+    /// is the only event that changes an offset's lifetime, and a walked
+    /// key must not be able to talk this mount out of the lifetime it just
+    /// minted.
+    pub fn seed_incarnation(&self, offset: u64, inc: u64) {
+        if inc == crate::routing::INCARNATION_NONE {
+            return;
+        }
+        match self.incarnations.entry_sync(offset) {
+            scc::hash_map::Entry::Occupied(occ) => {
+                let _ = occ.get().stamp.compare_exchange(
+                    crate::routing::INCARNATION_NONE,
+                    inc,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            scc::hash_map::Entry::Vacant(vac) => {
+                // No seqlock history for this offset yet: a walked key
+                // names a durably-written block, so the word starts
+                // STABLE exactly as `publish_block` would leave it.
+                let _ = vac.insert_entry(IncarnationCell::new(
+                    crate::incarnation_core::STABLE_FIRST,
+                    inc,
+                ));
             }
         }
     }
@@ -697,7 +862,7 @@ impl BlockAllocator {
     pub fn fill_incarnation(&self, offset: u64) -> Option<u64> {
         match self
             .incarnations
-            .read_sync(&offset, |_, v| crate::incarnation_core::snapshot(v))
+            .read_sync(&offset, |_, v| crate::incarnation_core::snapshot(&v.word))
         {
             Some(snap) => snap,
             None => Some(crate::incarnation_core::UNKNOWN_STABLE),
@@ -708,10 +873,9 @@ impl BlockAllocator {
     /// (no allocate/publish/free transitioned the offset during the fill's
     /// device read).
     pub fn fill_incarnation_still(&self, offset: u64, before: u64) -> bool {
-        match self
-            .incarnations
-            .read_sync(&offset, |_, v| crate::incarnation_core::still(v, before))
-        {
+        match self.incarnations.read_sync(&offset, |_, v| {
+            crate::incarnation_core::still(&v.word, before)
+        }) {
             Some(unchanged) => unchanged,
             None => before == crate::incarnation_core::UNKNOWN_STABLE,
         }
@@ -865,7 +1029,7 @@ impl BlockAllocator {
         let stable = self
             .incarnations
             .read_sync(&offset, |_, v| {
-                crate::incarnation_core::snapshot(v).is_some()
+                crate::incarnation_core::snapshot(&v.word).is_some()
             })
             .unwrap_or(true);
         if stable {
@@ -1043,6 +1207,27 @@ impl BlockAllocator {
         // New incarnation, not yet durable: cache fills must not publish until
         // the owner calls `publish_block` after its device write.
         self.mark_incarnation_unstable(offset);
+        // Spec §6.2 item 6: an allocation is the ONLY event that starts a
+        // new lifetime of an offset, so this is the one place a lifetime
+        // stamp is minted. Every other site (`persist_block_key`, fsck's
+        // reconciliation, the movers' census) READS the live stamp — a
+        // second minting site would let a key disagree with the offset's
+        // recorded lifetime and turn honest reads into refusals.
+        // Disengaged (every mount today): one relaxed `OnceLock` probe.
+        let stamp = self.mint_incarnation();
+        if stamp != crate::routing::INCARNATION_NONE {
+            match self.incarnations.entry_sync(offset) {
+                scc::hash_map::Entry::Occupied(occ) => {
+                    occ.get().stamp.store(stamp, Ordering::Release)
+                }
+                scc::hash_map::Entry::Vacant(vac) => {
+                    let _ = vac.insert_entry(IncarnationCell::new(
+                        crate::incarnation_core::UNSTABLE_FIRST,
+                        stamp,
+                    ));
+                }
+            }
+        }
         // PR VL6a (§5.6): while an fsck scan is latched, record the
         // minting epoch in the side map — one relaxed load when idle.
         if self.fsck_scan_active.load(Ordering::Relaxed) {
@@ -1532,12 +1717,22 @@ impl BlockAllocator {
         block_key: &str,
     ) -> Option<u64> {
         let cleaned = crate::routing::clean_block_key(block_key);
-        let (be_id, offset) = backend_router.parse_block_key(&cleaned).ok()?;
+        let parts = backend_router.parse_block_key_parts(&cleaned).ok()?;
+        let (be_id, offset) = (parts.be_id.as_str(), parts.offset);
         let default_id = backend_router.default_allocator.volume_id();
         let mine = self._volume_id.as_ref();
         let owned = be_id == mine
             || ((be_id == "backend_0" || be_id == "squeezefs")
                 && (mine == "squeezefs" || mine == default_id));
+        // Spec §6.2 item 6: the walk already parsed the key, so seeding the
+        // offset's lifetime here is free — and it is what lets a block laid
+        // down by a PREVIOUS mount present its real era instead of reading
+        // as "unknown". Not a correctness dependency: the dangerous case is
+        // a REALLOCATION, and every reallocation mints through
+        // `claim_block_idx` in this process.
+        if owned {
+            self.seed_incarnation(offset, parts.incarnation);
+        }
         owned.then_some(offset)
     }
 

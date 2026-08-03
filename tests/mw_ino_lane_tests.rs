@@ -25,8 +25,7 @@ use squeezefs::lane_core::LaneCursor;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
 use squeezefs::meta_backend::kv::ino_lane::{
-    first_ino_in_lane, ino_lane_of, minted_in_ino_lane, recover_ino_floor, InoSpace,
-    LOCAL_INO_BASE,
+    first_ino_in_lane, ino_lane_of, minted_in_ino_lane, recover_ino_floor, InoSpace, LOCAL_INO_BASE,
 };
 use squeezefs::meta_backend::kv::journal::AppendPartition;
 use squeezefs::meta_backend::kv::slot_cursor_core::SlotCursor;
@@ -123,10 +122,11 @@ fn lanes_are_disjoint_monotone_and_attributable() {
             "lane {writer}'s first ino is base + writer"
         );
         assert_eq!(
-            minted_in_ino_lane(cursor.snapshot(), p),
+            minted_in_ino_lane(cursor.snapshot(), cursor.start(), p),
             N,
             "the lane's exact mint count is what statfs needs"
         );
+        assert_eq!(cursor.minted(), N, "the cursor counts its own mints");
     }
     assert_eq!(seen.len() as u64, N * u64::from(W), "no ino minted twice");
 }
@@ -142,16 +142,17 @@ fn solo_lane_cursor_ties_the_shipped_cursor() {
     for floor in [2u64, 3, 17, 4096, 1 << 20] {
         let lane = LaneCursor::new(LOCAL_INO_BASE, 1, 0, floor);
         let slot = SlotCursor::new(floor);
-        let mut dense = floor.max(2);
-        for _ in 0..64 {
+        for dense in (floor.max(2)..).take(64) {
             let l = lane.mint();
             let s = slot.mint();
-            assert_eq!(l, s, "solo lane must tie the VL5b SlotCursor at floor {floor}");
+            assert_eq!(
+                l, s,
+                "solo lane must tie the VL5b SlotCursor at floor {floor}"
+            );
             assert_eq!(l, dense, "solo lane must tie a dense fetch_add(1)");
-            dense += 1;
         }
         assert_eq!(
-            minted_in_ino_lane(lane.snapshot(), AppendPartition::SOLO),
+            minted_in_ino_lane(lane.snapshot(), LOCAL_INO_BASE, AppendPartition::SOLO),
             lane.snapshot() - LOCAL_INO_BASE,
             "solo's mint count collapses to today's `cursor − 2` arithmetic"
         );

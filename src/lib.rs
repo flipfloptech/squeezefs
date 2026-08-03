@@ -90,6 +90,10 @@ pub mod job_wire;
 /// Encryption key input, derivation, and mount-time resolution
 /// (VAL-3 + KW-1 — `docs/design-key-handling.md`).
 pub mod keyfile;
+/// Per-writer lane cursors — the shared core of pre-RC engineering spec
+/// §6.2 items 5 (ino lanes) and 6 (block-key incarnation stamps);
+/// `docs/design-mw-cursors-and-incarnation.md`.
+pub mod lane_core;
 pub mod layout_wire;
 pub mod meta_backend;
 pub mod nvmeof;

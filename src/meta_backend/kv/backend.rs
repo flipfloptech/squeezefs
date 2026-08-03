@@ -645,6 +645,23 @@ pub struct KvMetaBackend {
     /// §4.8 monotonic watermark, recovered at mount; the create path
     /// `fetch_add`s it.
     next_ino: AtomicU64,
+    /// Pre-RC spec §6.2 item 5 (incompat bit 10): **per-writer ino lane
+    /// cursors**, keyed `(writer id, space)` where the space is the
+    /// volume's native watermark or a hosted guest slot
+    /// ([`super::ino_lane::InoSpace`]). One cell per lane the mount
+    /// actually mints in.
+    ///
+    /// EMPTY on every mount today and on every un-stamped volume — solo
+    /// minting keeps using `next_ino` / `guest_cursors` verbatim, so the
+    /// shipped hot path is untouched (ruling D9: nothing stamps bit 10).
+    /// The `lanes_live` latch below is what keeps the read side
+    /// ([`Self::next_ino`], [`Self::live_inodes`]) at one relaxed load
+    /// instead of an `scc` walk when no lane exists.
+    lane_cursors: scc::HashMap<(u16, super::ino_lane::InoSpace), Arc<crate::lane_core::LaneCursor>>,
+    /// `true` once any lane cursor exists (see [`Self::lane_cursors`]) —
+    /// a relaxed latch, never cleared: a lane's watermark must keep
+    /// counting toward the durable one for the rest of the mount.
+    lanes_live: AtomicBool,
     /// POSIX-1: inode records this mount has DESTROYED (the `doomed`
     /// count of every committed `destroy_inodes` transaction) — what
     /// turns the monotonic §4.8 watermark into a live-population gauge
@@ -1609,6 +1626,8 @@ impl KvMetaBackend {
             block_refs,
             alloc,
             next_ino: AtomicU64::new(next_ino),
+            lane_cursors: scc::HashMap::new(),
+            lanes_live: AtomicBool::new(false),
             destroyed_inodes: AtomicU64::new(0),
             replay,
             ring,
@@ -1892,8 +1911,157 @@ impl KvMetaBackend {
     }
 
     /// The §4.8 monotonic ino watermark as recovered by this mount.
+    ///
+    /// With spec §6.2 item-5 lanes live, this is the watermark that
+    /// DOMINATES every lane: the dense watermark folded with each native
+    /// lane cursor's snapshot. That is what a ledger record must carry —
+    /// a successor recovering from it rounds up into its own lane, so a
+    /// dominating watermark can never let a lane re-mint. Solo mounts
+    /// (every mount today) pay one relaxed load for the latch and return
+    /// the atomic verbatim.
     pub fn next_ino(&self) -> u64 {
-        self.next_ino.load(Ordering::Acquire)
+        let dense = self.next_ino.load(Ordering::Acquire);
+        if !self.lanes_live.load(Ordering::Relaxed) {
+            return dense;
+        }
+        let mut hi = dense;
+        self.lane_cursors.iter_sync(|(_, space), cursor| {
+            if *space == super::ino_lane::InoSpace::Native {
+                hi = hi.max(cursor.snapshot());
+            }
+            true
+        });
+        hi
+    }
+
+    /// `true` ⇔ this volume's format expresses `offset ‖ incarnation`
+    /// block keys (incompat bit 11 — spec §6.2 item 6) AND this mount has a
+    /// durable writer era to compose stamps from (incompat bit 7's term,
+    /// which the stamping path requires and a read-only/probe mount does
+    /// not have). Nothing stamps bit 11 today (ruling D9), so this is
+    /// `false` on every production volume and every key stays bare.
+    pub fn block_key_incarnation_engaged(&self) -> bool {
+        self.sb.features_incompat & super::superblock::FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION
+            != 0
+            && self.writer_term() > 0
+    }
+
+    /// `true` ⇔ this volume's format expresses per-writer ino lanes
+    /// (incompat bit 10 — spec §6.2 item 5). Nothing stamps it today
+    /// (ruling D9), so this is `false` on every production volume and a
+    /// non-solo lane is refused.
+    pub fn ino_lanes_stamped(&self) -> bool {
+        self.sb.features_incompat & super::superblock::FEATURE_INCOMPAT_KV_INO_LANES != 0
+    }
+
+    /// Spec §6.2 item 5: mint one **native** local ino in appender
+    /// `part`'s lane.
+    ///
+    /// `part == AppendPartition::SOLO` is exactly [`Self::allocate_ino`]
+    /// (the shipped path, one `fetch_add`); any other partition requires
+    /// incompat bit 10 and mints from the lane cursor, whose floor is the
+    /// smallest lane value at or above the recovered dense watermark.
+    pub fn allocate_ino_in(
+        &self,
+        part: super::journal::AppendPartition,
+    ) -> std::result::Result<Ino, KvError> {
+        if part.is_solo() {
+            return Ok(self.allocate_ino());
+        }
+        Ok(self
+            .lane_cursor_for(super::ino_lane::InoSpace::Native, part)?
+            .mint())
+    }
+
+    /// Spec §6.2 item 5: mint one **guest** local ino for hosted slot
+    /// `slot` in appender `part`'s lane (raw — the caller namespaces it
+    /// with `guest_local_ino`, exactly as [`Self::allocate_guest_ino`]).
+    pub fn allocate_guest_ino_in(
+        &self,
+        slot: u16,
+        part: super::journal::AppendPartition,
+    ) -> std::result::Result<Ino, KvError> {
+        if part.is_solo() {
+            return self.allocate_guest_ino(slot).map_err(KvError::Io);
+        }
+        Ok(self
+            .lane_cursor_for(super::ino_lane::InoSpace::Guest(slot), part)?
+            .mint())
+    }
+
+    /// Raise appender `part`'s lane cursor for `space` to at least the
+    /// smallest lane value at or above `dense_floor` — mount recovery
+    /// ([`super::ino_lane::recover_ino_floor`]) and the slot-migration
+    /// flip's target side. Monotone and idempotent.
+    pub fn install_ino_lane_floor(
+        &self,
+        space: super::ino_lane::InoSpace,
+        part: super::journal::AppendPartition,
+        dense_floor: u64,
+    ) -> std::result::Result<(), KvError> {
+        self.lane_cursor_for(space, part)?
+            .install_floor(dense_floor);
+        Ok(())
+    }
+
+    /// Appender `part`'s current lane-cursor snapshot for `space` —
+    /// `None` when this mount has never minted in that lane.
+    pub fn ino_lane_snapshot(
+        &self,
+        space: super::ino_lane::InoSpace,
+        part: super::journal::AppendPartition,
+    ) -> Option<u64> {
+        self.lane_cursors
+            .read_sync(&(part.writer_id(), space), |_, v| v.snapshot())
+    }
+
+    /// The lane cursor for `(part, space)`, created on first use from the
+    /// space's recovered dense watermark. Refuses loud on a volume whose
+    /// format does not express lanes (ruling D9's boundary) — the caller
+    /// is asking this mount to mint into a partition the volume's ino
+    /// namespace is not partitioned for, which is how duplicate inos
+    /// arrive.
+    fn lane_cursor_for(
+        &self,
+        space: super::ino_lane::InoSpace,
+        part: super::journal::AppendPartition,
+    ) -> std::result::Result<Arc<crate::lane_core::LaneCursor>, KvError> {
+        if !part.is_solo() && !self.ino_lanes_stamped() {
+            return Err(KvError::Corrupt(format!(
+                "{}: refusing to mint inos as appender {} of {} — this volume's format does \
+                 not express per-writer ino lanes (incompat bit 10 absent, spec §6.2 item 5). \
+                 A lane-unaware peer mints DENSE inos across every lane, and duplicate inos \
+                 alias files immediately.",
+                self.path.display(),
+                part.writer_id(),
+                part.writers(),
+            )));
+        }
+        let key = (part.writer_id(), space);
+        if let Some(c) = self.lane_cursors.read_sync(&key, |_, v| v.clone()) {
+            return Ok(c);
+        }
+        // First mint in this lane: seed from the space's recovered dense
+        // watermark (native = the §4.8 watermark, guest = the VL5b
+        // per-slot cursor, 2 for a virgin slot), rounded up into the lane.
+        let dense = match space {
+            super::ino_lane::InoSpace::Native => self.next_ino.load(Ordering::Acquire),
+            super::ino_lane::InoSpace::Guest(slot) => self
+                .guest_cursor_snapshot(slot)
+                .unwrap_or(super::ino_lane::LOCAL_INO_BASE),
+        };
+        let fresh = Arc::new(super::ino_lane::lane_cursor(part, dense));
+        let cursor = match self.lane_cursors.insert_sync(key, fresh.clone()) {
+            Ok(()) => fresh,
+            Err(_) => self
+                .lane_cursors
+                .read_sync(&key, |_, v| v.clone())
+                .ok_or_else(|| KvError::Corrupt("ino lane cursor raced out".to_string()))?,
+        };
+        // Publish AFTER the cell exists: a reader that observes the latch
+        // must find the cursor (`next_ino`'s dominance fold).
+        self.lanes_live.store(true, Ordering::Release);
+        Ok(cursor)
     }
 
     /// POSIX-1: LIVE inode records on this volume — the `statfs`
@@ -1932,6 +2100,17 @@ impl KvMetaBackend {
             allocated = allocated.saturating_add(cursor.snapshot().saturating_sub(2));
             true
         });
+        // Spec §6.2 item 5: a LANE cursor strides by `writers`, so its
+        // progression is NOT `cursor − 2` — counting it densely would
+        // over-report `IUsed` by that factor (the POSIX-1 failure mode,
+        // one level down). `minted_in_ino_lane` is the exact count.
+        // Structurally skipped on every mount today (no lane exists).
+        if self.lanes_live.load(Ordering::Relaxed) {
+            self.lane_cursors.iter_sync(|_key, cursor| {
+                allocated = allocated.saturating_add(cursor.minted());
+                true
+            });
+        }
         allocated.saturating_sub(self.destroyed_inodes.load(Ordering::Relaxed))
     }
 

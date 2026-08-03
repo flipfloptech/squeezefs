@@ -338,6 +338,84 @@ pub const FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING: u64 = 1 << WRITER_SCOPED_ST
 /// the next one a red gate instead of silent on-disk aliasing.
 pub const FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA: u64 = 1 << 11;
 
+/// `features_incompat` bit 10: **per-writer ino lanes** — the volume's ino
+/// namespace is partitioned into one monotone LANE per appender, so two
+/// writers can mint concurrently without ever producing the same ino
+/// (pre-RC engineering spec §6.2 **item 5**, "cheapest of the five";
+/// rulings **D8**/**D9**; design `docs/design-mw-cursors-and-incarnation.md`).
+///
+/// The law: with `writers = W`, a local ino `i` belongs to lane
+/// `(i − 2) % W`, and appender `w` mints only lane-`w` locals (stride `W`
+/// from a lane-aligned floor). Solo (`W = 1`) is lane 0 = every ino, i.e.
+/// today's dense `fetch_add(1)` watermark **arithmetically unchanged**.
+/// Nothing else moves: global inos still route through the frozen
+/// `routing_width` (`route_ino_width`), so st_ino stability is untouched,
+/// and the durable per-writer watermark is each appender's OWN root-ledger
+/// record (`next_ino` in its own slot range, which incompat bit 8's
+/// partitioned ledger already provides) — this bit adds **no new durable
+/// field**.
+///
+/// **Presence is OPTIONAL and this binary NEVER STAMPS IT** (ruling D9,
+/// the bit-8/9 posture): [`SuperblockV3::plan`] does not set it, mount does
+/// not set it, and no runtime path sets it — the Phase-8 batched reformat
+/// window owns that act ([`set_ino_lanes_bit`] is the sole stamping path).
+/// A volume without the bit mints dense inos exactly as today, and a
+/// non-solo lane is REFUSED loud on it (pinned by
+/// `tests/mw_ino_lane_tests.rs`).
+///
+/// Old binaries refuse a bit-10 volume loud via their own
+/// [`FEATURES_INCOMPAT_KNOWN`] gate — exactly right: a lane-unaware writer
+/// mints DENSE inos over every peer's lane, and a peer resuming from its
+/// own durable watermark would then re-mint an ino that writer already
+/// used. Duplicate inos alias files immediately, and the daemon's IPC
+/// binding table rests on the monotonic never-reused ino law, so the alias
+/// reaches fd bindings too.
+pub const FEATURE_INCOMPAT_KV_INO_LANES: u64 = 1 << 10;
+
+/// `features_incompat` bit 11: **`offset ‖ incarnation` block keys** — a
+/// persisted block key names not just WHERE a block lives but WHICH
+/// lifetime of that device offset it is (pre-RC engineering spec §6.2
+/// **item 6**, rationale §6.3 "block-key binding"; design
+/// `docs/design-mw-cursors-and-incarnation.md`).
+///
+/// Today a block key is a bare, reusable device offset, and the read
+/// path's serve proof — *bytes for key K serve for block b iff the fetch
+/// was incarnation-valid AND the current map still binds b → K* — rests on
+/// two PROCESS-LOCAL premises. So when node A overwrites a block, frees
+/// the offset, and the allocator reissues it to another file, node B —
+/// whose cached map still binds b → K and whose incarnation word is
+/// untouched — serves the other file's bytes with **no error and no
+/// counter** (silent on a passthrough volume; on a transformed volume the
+/// AEAD tag fails, the one honest degradation). Carrying the incarnation
+/// IN the key makes that stale binding structurally detectable: the key
+/// itself disagrees with the offset's live lifetime.
+///
+/// Wire form: `[be://]offset@<base36 incarnation>` — the incarnation is a
+/// suffix on the OFFSET component, so it survives
+/// [`crate::routing::clean_block_key`] unchanged, the `:rel:len`
+/// decoration still parses after it, and the W1 whole-block predicate is
+/// unaffected. `incarnation == 0` is the absent/legacy form, which is
+/// exactly today's bare key — so an un-stamped volume's keys are
+/// **byte-identical**.
+///
+/// The lifetime stamp is `(writer_term << 40) | lane_seq`: the SAME
+/// composition the DLM's S2 fencing token uses (spec §6.7 decision 4), so
+/// it needs no new durable record — the durable, barriered-before-arm
+/// [`super::backend::WRITER_TERM_XATTR`] era is what makes an incarnation
+/// unrepeatable across a remount, and the lane component is what makes it
+/// unrepeatable across appenders. This bit therefore REQUIRES
+/// [`FEATURE_INCOMPAT_KV_DURABLE_TERM`] (bit 7): without the durable era
+/// the stamp would restart at every mount and the detection would be a
+/// lie. Engaging it on a term-less volume is refused loud.
+///
+/// **Presence is OPTIONAL and this binary NEVER STAMPS IT** (ruling D9):
+/// [`SuperblockV3::plan`] does not set it, mount does not set it,
+/// [`set_block_key_incarnation_bit`] is the Phase-8 path. Old binaries
+/// refuse a bit-11 volume loud — exactly right: they would mint bare keys
+/// onto a volume whose keys name lifetimes, and free/patch offsets whose
+/// stale-binding refusals they cannot perform.
+pub const FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION: u64 = 1 << 11;
+
 /// Incompat feature bits this binary understands. Any other set bit
 /// refuses the mount naming the bit (§6.1).
 pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
@@ -351,7 +429,9 @@ pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
     | FEATURE_INCOMPAT_KV_PARTITIONED_APPEND
     | FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS
     | FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING
-    | FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA;
+    | FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA
+    | FEATURE_INCOMPAT_KV_INO_LANES
+    | FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION;
 
 /// Read-only feature bits this binary understands (none yet — §4.11
 /// reserves the mechanism for snapshots). Unknown bits mount read-only.
@@ -1297,6 +1377,62 @@ pub async fn set_multi_writer_data_bit(path: &Path) -> Result<bool, KvError> {
         path,
         FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA,
         "multi-writer-data",
+    )
+    .await
+}
+
+/// Stamp [`FEATURE_INCOMPAT_KV_INO_LANES`] on `path`'s superblock — the
+/// **Phase-8** upgrade path for spec §6.2 item 5 (per-writer ino lanes).
+/// `Ok(false)` = already present. Caller holds the volume OFFLINE (the D0
+/// guard); ruling D9 forbids mount and `plan` from doing this.
+///
+/// Stamp-then-crash is inert: the bit gates ino MINTING only, an older
+/// binary refuses the volume outright, and a stamped volume whose next
+/// mount is solo mints lane-0 inos — a subset of the dense space it would
+/// have minted anyway, so no ino is ever reused either way.
+pub async fn set_ino_lanes_bit(path: &Path) -> Result<bool, KvError> {
+    set_incompat_bit(path, FEATURE_INCOMPAT_KV_INO_LANES, "ino-lanes").await
+}
+
+/// Stamp [`FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION`] on `path`'s
+/// superblock — the **Phase-8** upgrade path for spec §6.2 item 6
+/// (`offset ‖ incarnation` block keys). `Ok(false)` = already present.
+/// Caller holds the volume OFFLINE (the D0 guard); ruling D9 forbids mount
+/// and `plan` from doing this.
+///
+/// **Refuses loud on a volume without [`FEATURE_INCOMPAT_KV_DURABLE_TERM`]**
+/// (bit 7): the incarnation's unrepeatability across a remount IS the
+/// durable writer term, so stamping this onto a term-less volume would
+/// restart the lifetime stamps at every mount — a detection that lies is
+/// worse than no detection, because the read path would then serve a
+/// matching stale key.
+///
+/// Mixed keys are expected and safe: blocks published before the stamp
+/// carry bare keys (incarnation 0 = "no lifetime named"), and they only
+/// ever become refusable once their offset is genuinely reallocated under
+/// a stamped lifetime — which is exactly the dangerous case.
+pub async fn set_block_key_incarnation_bit(path: &Path) -> Result<bool, KvError> {
+    let VolumeFormat::V3(sb) = classify_volume(path).await? else {
+        return Err(KvError::Corrupt(format!(
+            "{}: not a v3 volume — cannot stamp block-key incarnations",
+            path.display()
+        )));
+    };
+    if sb.features_incompat & FEATURE_INCOMPAT_KV_DURABLE_TERM == 0 {
+        return Err(KvError::Corrupt(format!(
+            "{}: refusing to stamp block-key incarnations (bit 11) on a volume without the \
+             durable writer term (bit 7) — the incarnation stamp is \
+             `(writer_term << {}) | lane_seq`, so without a durable era it would restart at \
+             every mount and a stale key would MATCH the offset's new lifetime (spec §6.2 \
+             item 6 / §6.3). Stamp bit 7 first.",
+            path.display(),
+            crate::dlm::GRANT_SEQ_BITS,
+        )));
+    }
+    set_incompat_bit(
+        path,
+        FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION,
+        "block-key-incarnation",
     )
     .await
 }

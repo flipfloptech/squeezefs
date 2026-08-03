@@ -3351,6 +3351,27 @@ pub struct Metrics {
     /// evidence of a double-release lineage upstream (leak-safe: the block
     /// leaks until fsck C6, it is never handed to two owners).
     pub block_untracked_free_refusals: Align64<AtomicU64>,
+    /// Pre-RC engineering spec §6.2 item 6 / §6.3: reads and frees REFUSED
+    /// because the block key named a **dead incarnation** of its device
+    /// offset — the offset was freed and reissued to a different file, and
+    /// the stale binding would have served (or freed) that file's block.
+    /// MUST STAY 0: on a single-writer mount every republish precedes its
+    /// free, so a live map can never name a dead lifetime. Growth means a
+    /// binding outlived its block (and, before incompat bit 11, was silent
+    /// on a passthrough volume).
+    pub block_key_incarnation_refusals: Align64<AtomicU64>,
+    /// Spec §6.2 item 6: keys served whose incarnation could not be
+    /// checked because the offset has **no recorded lifetime** on this node
+    /// — §6.3's honest degradation ("`UNKNOWN_STABLE` for any offset this
+    /// node did not itself allocate"). This is the SIZE of the gap a shared
+    /// custody authority (§6.9 S9) has to close; 0 on volumes without
+    /// incompat bit 11, since their keys name no lifetime at all.
+    pub block_key_incarnation_unknown: Align64<AtomicU64>,
+    /// Spec §6.2 item 6: the per-mount lifetime-stamp sequence space
+    /// (2^40 allocations) ran out, so keys degraded to unstamped —
+    /// detection lost until remount, never an aliased lifetime. MUST STAY
+    /// 0; reachable only by a mount that allocates 4 EiB of fresh blocks.
+    pub block_key_incarnation_exhausted: Align64<AtomicU64>,
     /// FIND-RW4-A store-raw escape: block images whose compressed form
     /// would not shrink (incompressible payloads) stored RAW behind the
     /// frame's raw marker — compression is best-effort per block, never a
@@ -6479,6 +6500,9 @@ impl SqueezefsFilesystem {
                 "staged_spill_escalations": METRICS.staged_spill_escalations.load(Ordering::Relaxed),
                 "block_double_frees": METRICS.block_double_frees.load(Ordering::Relaxed),
                 "block_untracked_free_refusals": METRICS.block_untracked_free_refusals.load(Ordering::Relaxed),
+                "block_key_incarnation_refusals": METRICS.block_key_incarnation_refusals.load(Ordering::Relaxed),
+                "block_key_incarnation_unknown": METRICS.block_key_incarnation_unknown.load(Ordering::Relaxed),
+                "block_key_incarnation_exhausted": METRICS.block_key_incarnation_exhausted.load(Ordering::Relaxed),
                 "layout_striped_writes": METRICS.layout_striped_writes.load(Ordering::Relaxed),
                 "compress_stored_raw": METRICS.compress_stored_raw.load(Ordering::Relaxed),
                 "bg_spawn_admitted": METRICS.bg_spawn_admitted.load(Ordering::Relaxed),

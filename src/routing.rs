@@ -856,6 +856,157 @@ pub fn clean_block_key(bk: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `offset ‖ incarnation` block keys — pre-RC engineering spec §6.2 item 6
+// (rationale §6.3 "block-key binding"), incompat bit 11, ruling D9.
+// ---------------------------------------------------------------------------
+
+/// Separator between a block key's device offset and its **incarnation**
+/// (lifetime) stamp: `[be://]offset@<base36>`.
+///
+/// `@` and not `:` because `:` is already the per-block decoration
+/// separator (`bk:rel:len`): putting the lifetime after the offset with a
+/// distinct separator is what makes the incarnation part of the key's
+/// IDENTITY — it survives [`clean_block_key`] (so the map binding check and
+/// all five block-key cache stores compare lifetimes, not just offsets),
+/// while the decoration keeps parsing after it and the W1 whole-block
+/// predicate ([`is_whole_block_mapping`], `!rest.contains(':')`) is
+/// untouched.
+pub const BLOCK_KEY_INCARNATION_SEP: char = '@';
+
+/// "This key names no lifetime" — every key written before incompat bit 11,
+/// and every key on an un-stamped volume (i.e. every key in the field
+/// today). Read-path validation treats it exactly as it treats an offset
+/// with no recorded lifetime: serve, as before.
+pub const INCARNATION_NONE: u64 = 0;
+
+/// Bits of per-mount sequence space under the durable-era component of an
+/// incarnation stamp: `(writer_term << INCARNATION_SEQ_BITS) | lane_seq` —
+/// the SAME split the DLM's S2 fencing token uses (`dlm::GRANT_SEQ_BITS`,
+/// spec §6.7 decision 4), deliberately, because it is the same problem:
+/// make a per-mount counter unrepeatable across remounts by riding the one
+/// durable, barriered-before-arm era word the volume already carries.
+pub const INCARNATION_SEQ_BITS: u32 = crate::dlm::GRANT_SEQ_BITS;
+
+/// Largest per-mount sequence an incarnation stamp can carry.
+pub const INCARNATION_SEQ_MAX: u64 = (1u64 << INCARNATION_SEQ_BITS) - 1;
+
+/// Compose an incarnation stamp from a durable writer term and a per-mount
+/// lane sequence. `None` = the sequence space is exhausted (see
+/// [`INCARNATION_SEQ_MAX`]) or the era is out of the term budget: callers
+/// degrade to [`INCARNATION_NONE`] loudly, which loses DETECTION but never
+/// fabricates a wrong lifetime.
+pub fn compose_incarnation(era: u64, lane_seq: u64) -> Option<u64> {
+    if era == 0 || era > crate::dlm::TERM_MAX || lane_seq == 0 || lane_seq > INCARNATION_SEQ_MAX {
+        return None;
+    }
+    Some((era << INCARNATION_SEQ_BITS) | lane_seq)
+}
+
+/// The durable-era component of an incarnation stamp (0 for
+/// [`INCARNATION_NONE`]) — the forensic half: an era ordering tells an
+/// operator WHICH mount minted a lifetime.
+pub fn incarnation_era(inc: u64) -> u64 {
+    inc >> INCARNATION_SEQ_BITS
+}
+
+/// Render an incarnation as the canonical lowercase base-36 the key wire
+/// form carries. Base-36 (not decimal) because the stamp is a composed
+/// 64-bit word whose decimal form is ~13 characters, and a block key's
+/// bytes are paid per map entry in EVERY layout publish — the journal-byte
+/// term the write-commit-economy campaign collapsed
+/// (`.benchmarks/2026-07-30-write-commit-economy.md`). Canonical = no
+/// leading zeros, so one lifetime has exactly one key string (two spellings
+/// would break the map-binding equality this design rests on).
+pub fn encode_incarnation(inc: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if inc == 0 {
+        return "0".to_string();
+    }
+    let mut buf = [0u8; 13];
+    let mut n = inc;
+    let mut i = buf.len();
+    while n > 0 {
+        i -= 1;
+        buf[i] = DIGITS[(n % 36) as usize];
+        n /= 36;
+    }
+    // SAFETY-free: every byte written is ASCII from DIGITS.
+    String::from_utf8(buf[i..].to_vec()).expect("base36 digits are ASCII")
+}
+
+/// Parse a canonical base-36 incarnation. `None` = not canonical (empty,
+/// leading zero, non-digit, or overflowing 64 bits) — a corrupt key
+/// component, which callers refuse rather than round to a lifetime.
+pub fn decode_incarnation(text: &str) -> Option<u64> {
+    if text.is_empty() || text.len() > 13 || text.starts_with('0') {
+        return None;
+    }
+    let mut acc: u64 = 0;
+    for b in text.bytes() {
+        let d = match b {
+            b'0'..=b'9' => u64::from(b - b'0'),
+            b'a'..=b'z' => u64::from(b - b'a') + 10,
+            _ => return None,
+        };
+        acc = acc.checked_mul(36)?.checked_add(d)?;
+    }
+    (acc != 0).then_some(acc)
+}
+
+/// Split a key's offset component into `(offset text, incarnation)`.
+/// `Err(())` = an incarnation suffix that is present but unparseable.
+///
+/// Hot-path shape: the shipped (bare) form contains no separator, so the
+/// only cost on it is the scan the offset parse performs anyway.
+fn split_incarnation(offset_part: &str) -> std::result::Result<(&str, u64), ()> {
+    match offset_part.split_once(BLOCK_KEY_INCARNATION_SEP) {
+        None => Ok((offset_part, INCARNATION_NONE)),
+        Some((off, inc)) => match decode_incarnation(inc) {
+            Some(v) => Ok((off, v)),
+            None => Err(()),
+        },
+    }
+}
+
+/// Attach an incarnation to a persisted key body (`offset` or
+/// `be://offset`). [`INCARNATION_NONE`] returns the body unchanged — which
+/// is what keeps an un-stamped volume's keys byte-identical.
+pub fn block_key_with_incarnation(body: &str, inc: u64) -> String {
+    if inc == INCARNATION_NONE {
+        return body.to_string();
+    }
+    format!(
+        "{body}{BLOCK_KEY_INCARNATION_SEP}{}",
+        encode_incarnation(inc)
+    )
+}
+
+/// A resolved block key: which backend, which device offset, and — since
+/// spec §6.2 item 6 — which **lifetime** of that offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockKeyParts {
+    /// Backend id (`backend_0` for the default-slot alias forms).
+    pub be_id: String,
+    /// Device offset in bytes.
+    pub offset: u64,
+    /// The offset's lifetime this key names, or [`INCARNATION_NONE`].
+    pub incarnation: u64,
+}
+
+/// The incarnation a (possibly decorated, possibly `damaged:`-marked) block
+/// key names — [`INCARNATION_NONE`] for every legacy/bare key, `None` for a
+/// malformed suffix.
+pub fn block_key_incarnation(bk: &str) -> Option<u64> {
+    let bk = bk.strip_prefix(DAMAGED_MAPPING_PREFIX).unwrap_or(bk);
+    let rest = match bk.find("://") {
+        Some(pos) => &bk[pos + 3..],
+        None => bk,
+    };
+    let offset_part = rest.split(':').next().unwrap_or(rest);
+    split_incarnation(offset_part).ok().map(|(_, inc)| inc)
+}
+
 /// Byte length of the zeros served for a range read of a staged file whose
 /// payload was lost by a crash (the D0 degrade contract): the requested
 /// range clamped to the inode's size — identical bounds to a hole read.
@@ -1823,16 +1974,48 @@ impl BackendRouter {
     }
 
     pub fn parse_block_key(&self, block_key: &str) -> Result<(String, u64)> {
+        let p = self.parse_block_key_parts(block_key)?;
+        Ok((p.be_id, p.offset))
+    }
+
+    /// [`Self::parse_block_key`] plus the key's **incarnation** (spec §6.2
+    /// item 6) — the ONE extraction path, not a fork: `parse_block_key`
+    /// delegates here and drops the lifetime, so every existing consumer
+    /// (free, refcount, durable block references, fsck, the movers) keeps
+    /// resolving the same `(backend, offset)` it always did.
+    ///
+    /// Cost discipline: the shipped bare form (`4194304`,
+    /// `vol-x://4194304`) parses through the SAME `u64::parse` it always
+    /// did — the `@` split runs only when that parse fails, so an
+    /// un-stamped volume pays nothing (`.benchmarks/2026-08-05-mw-cursors-
+    /// and-incarnation.md`).
+    pub fn parse_block_key_parts(&self, block_key: &str) -> Result<BlockKeyParts> {
         let parts: Vec<&str> = block_key.split("://").collect();
         let (be_id, offset_str) = if parts.len() > 1 {
             (parts[0], parts[1])
         } else {
             ("backend_0", block_key)
         };
-        let offset = offset_str
-            .parse::<u64>()
-            .map_err(|_| err_invalid_offset())?;
-        Ok((be_id.to_string(), offset))
+        // Fast path FIRST: the bare offset every field key carries.
+        if let Ok(offset) = offset_str.parse::<u64>() {
+            return Ok(BlockKeyParts {
+                be_id: be_id.to_string(),
+                offset,
+                incarnation: INCARNATION_NONE,
+            });
+        }
+        let (off_text, incarnation) = split_incarnation(offset_str).map_err(|()| {
+            crate::error::SqueezefsError::InvalidOperation(format!(
+                "block key '{block_key}' carries a malformed incarnation suffix (spec §6.2 \
+                 item 6: `offset@<base36>`) — refusing to resolve it to an offset"
+            ))
+        })?;
+        let offset = off_text.parse::<u64>().map_err(|_| err_invalid_offset())?;
+        Ok(BlockKeyParts {
+            be_id: be_id.to_string(),
+            offset,
+            incarnation,
+        })
     }
 
     /// The key string to PERSIST for a block just written at `offset` on the
@@ -1850,7 +2033,36 @@ impl BackendRouter {
     /// identical with their historical unprefixed keys. Every other named
     /// backend gets an explicit `name://offset` key; persisting a bare key
     /// for those was the multi-volume wrong-device read/free bug.
+    /// Spec §6.2 item 6: the offset's **live lifetime stamp** on the
+    /// allocator that owns it, or [`INCARNATION_NONE`] when incarnation
+    /// keys are not engaged (every volume today — ruling D9).
+    ///
+    /// The stamp is READ here, never minted: `claim_block_idx` mints one
+    /// per allocation, so a caller that builds a key for an offset it did
+    /// not just allocate (fsck's reconciliation, the movers' census)
+    /// reproduces the offset's CURRENT lifetime instead of inventing a new
+    /// one — inventing one would make the live map disagree with the live
+    /// stamp and turn every subsequent read into a refusal.
+    fn live_incarnation_for(&self, be_id: &str, offset: u64) -> u64 {
+        if be_id == "backend_0" {
+            return self.default_allocator.live_incarnation(offset);
+        }
+        match self.backends.get(be_id) {
+            Some(be) => be.block_allocator.live_incarnation(offset),
+            None => INCARNATION_NONE,
+        }
+    }
+
     pub fn persist_block_key(&self, be_id: &str, offset: u64) -> String {
+        let body = self.persist_block_key_body(be_id, offset);
+        let inc = self.live_incarnation_for(be_id, offset);
+        block_key_with_incarnation(&body, inc)
+    }
+
+    /// The pre-item-6 key body (`offset` / `name://offset`) — the naming
+    /// law and its aliases, unchanged; [`Self::persist_block_key`] appends
+    /// the lifetime when one exists.
+    fn persist_block_key_body(&self, be_id: &str, offset: u64) -> String {
         if be_id == "backend_0" {
             return offset.to_string();
         }
@@ -1862,6 +2074,101 @@ impl BackendRouter {
             }
         }
         format!("{}://{}", be_id, offset)
+    }
+
+    /// Spec §6.2 item 6 / §6.3: is this key's lifetime still the offset's
+    /// live one?
+    ///
+    /// The three verdicts, and why each is what it is:
+    ///
+    /// * the key names **no** lifetime ([`INCARNATION_NONE`] — every key on
+    ///   an un-stamped volume, i.e. every key in the field today) ⇒ **OK**,
+    ///   pre-item-6 behavior verbatim;
+    /// * the offset has no recorded live lifetime ⇒ **OK**, counted as
+    ///   `block_key_incarnation_unknown`. This is the honest degradation
+    ///   §6.3 names: an offset this node never allocated has no local
+    ///   answer, and inventing one would be a lie. The shared authority
+    ///   that closes it is §6.9 S9's;
+    /// * they DISAGREE ⇒ **refused** and counted as
+    ///   `block_key_incarnation_refusals` (a must-stay-0 tripwire). This is
+    ///   the case that is silent today: the offset was freed and reissued
+    ///   to a different file, and the stale binding would serve — or free —
+    ///   another file's block with no error and no counter.
+    pub fn block_key_incarnation_ok(&self, block_key: &str) -> bool {
+        let Ok(parts) = self.parse_block_key_parts(&clean_block_key(block_key)) else {
+            return true; // unparseable keys are refused by the resolver itself
+        };
+        self.incarnation_ok(&parts, block_key)
+    }
+
+    fn incarnation_ok(&self, parts: &BlockKeyParts, block_key: &str) -> bool {
+        if parts.incarnation == INCARNATION_NONE {
+            return true;
+        }
+        let live = self.live_incarnation_for(&parts.be_id, parts.offset);
+        if live == INCARNATION_NONE {
+            crate::fuse_client::METRICS
+                .block_key_incarnation_unknown
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        if live == parts.incarnation {
+            return true;
+        }
+        crate::fuse_client::METRICS
+            .block_key_incarnation_refusals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log::error!(
+            "STALE BLOCK-KEY BINDING refused: key '{block_key}' names incarnation {} (era {}) \
+             of offset {} on '{}', whose live incarnation is {} (era {}) — the offset was freed \
+             and reissued, so serving/freeing under this key would touch another file's block \
+             (spec §6.2 item 6 / §6.3; see block_key_incarnation_refusals)",
+            parts.incarnation,
+            incarnation_era(parts.incarnation),
+            parts.offset,
+            parts.be_id,
+            live,
+            incarnation_era(live),
+        );
+        false
+    }
+
+    fn err_stale_incarnation(block_key: &str) -> crate::error::SqueezefsError {
+        crate::error::SqueezefsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "block key '{block_key}' names a dead incarnation of its device offset \
+                 (spec §6.2 item 6) — refusing rather than serving another file's bytes"
+            ),
+        ))
+    }
+
+    /// Engage spec §6.2 item-6 incarnation keys on every allocator this
+    /// router owns: `era` is the mount's durable writer term (incompat bit
+    /// 7) and `part` its appender lane. Refuses loud on an era outside the
+    /// term budget — a bad era composes stamps that alias a real one.
+    ///
+    /// Nothing calls this in production today: `DataRouter::set_meta_backend`
+    /// engages only when EVERY mounted meta volume carries incompat bit 11,
+    /// and nothing stamps bit 11 (ruling D9).
+    pub fn engage_incarnation_keys(
+        &self,
+        era: u64,
+        part: crate::meta_backend::kv::journal::AppendPartition,
+    ) -> Result<()> {
+        if era == 0 || era > crate::dlm::TERM_MAX {
+            return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "refusing to engage block-key incarnations with era {era}: the era is the \
+                 volume's durable writer term (incompat bit 7) and must be in 1..={} — \
+                 without it the lifetime stamps restart at every mount (spec §6.2 item 6)",
+                crate::dlm::TERM_MAX
+            )));
+        }
+        self.default_allocator.engage_incarnations(era, part);
+        for be in self.backends.iter() {
+            be.value().block_allocator.engage_incarnations(era, part);
+        }
+        Ok(())
     }
 
     pub fn parse_block_offset(&self, block_key: &str) -> Result<u64> {
@@ -1900,7 +2207,14 @@ impl BackendRouter {
             dest_addr.is_none_or(|d| d % 4096 == 0),
             "ranged O_DIRECT dest must be 4 KiB-aligned"
         );
-        let (be_id, offset) = self.parse_block_key(block_key)?;
+        let parts = self.parse_block_key_parts(block_key)?;
+        // Spec §6.2 item 6: a key whose lifetime is dead names a device
+        // offset that has been reissued to a different file — the §6.3
+        // silent cross-file serve. Refuse before the DMA.
+        if !self.incarnation_ok(&parts, block_key) {
+            return Err(Self::err_stale_incarnation(block_key));
+        }
+        let (be_id, offset) = (parts.be_id, parts.offset);
 
         if !self.is_backend_healthy(&be_id) {
             return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
@@ -1931,7 +2245,14 @@ impl BackendRouter {
         size: usize,
         dest_addr: Option<u64>,
     ) -> Result<bytes::Bytes> {
-        let (be_id, offset) = self.parse_block_key(block_key)?;
+        let parts = self.parse_block_key_parts(block_key)?;
+        // Spec §6.2 item 6 / §6.3: the serve proof's second premise made
+        // structural — a stale binding is refused instead of serving
+        // another file's bytes with no error and no counter.
+        if !self.incarnation_ok(&parts, block_key) {
+            return Err(Self::err_stale_incarnation(block_key));
+        }
+        let (be_id, offset) = (parts.be_id, parts.offset);
 
         if !self.is_backend_healthy(&be_id) {
             return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
@@ -2407,7 +2728,16 @@ impl BackendRouter {
         // `parse_block_mapping`) free their BASE block; a raw parse of the
         // decorated string would err and silently leak the block.
         let cleaned = clean_block_key(block_key);
-        let (be_id, offset) = self.parse_block_key(&cleaned)?;
+        let parts = self.parse_block_key_parts(&cleaned)?;
+        // Spec §6.2 item 6: a free under a DEAD lifetime is the §6.3
+        // hazard's destructive face — it would release (and queue a
+        // discard for) an offset the allocator has already reissued to
+        // another file. Refuse, loudly and counted; the leak-safe
+        // direction, exactly like the untracked-free refusal below it.
+        if !self.incarnation_ok(&parts, block_key) {
+            return Err(Self::err_stale_incarnation(block_key));
+        }
+        let (be_id, offset) = (parts.be_id, parts.offset);
 
         let (allocator, device_path) = if be_id == "backend_0" {
             (
@@ -4134,6 +4464,42 @@ impl DataRouter {
         // data-namespace reservation held for the mount lifetime — is
         // DLM stage S7; this is the local face.)
         self.backend_router.set_dma_fence_signal(probe);
+        // Spec §6.2 item 6 (incompat bit 11, ruling D9): engage
+        // `offset ‖ incarnation` keys only when EVERY mounted meta volume's
+        // format expresses them — a mixed set would have one volume's
+        // layouts naming lifetimes while another's do not, and the era must
+        // dominate every volume's durable term so no stamp a predecessor
+        // minted can be reissued. Nothing stamps the bit today, so this is
+        // structurally inert: `all()` over a non-empty set is false and
+        // every key stays byte-identical to the shipped bare form.
+        if !meta_backend.volumes.is_empty()
+            && meta_backend
+                .volumes
+                .iter()
+                .all(|v| v.block_key_incarnation_engaged())
+        {
+            let era = meta_backend
+                .volumes
+                .iter()
+                .map(|v| v.writer_term())
+                .max()
+                .unwrap_or(0);
+            // Solo lane: who the appenders are is §6.9 S4/S8's admission
+            // problem, not this wiring's — a solo mount is appender 0 of 1.
+            match self.backend_router.engage_incarnation_keys(
+                era,
+                crate::meta_backend::kv::journal::AppendPartition::SOLO,
+            ) {
+                Ok(()) => log::info!(
+                    "block-key incarnations engaged (spec §6.2 item 6): era {era}, appender 0/1 \
+                     — persisted block keys now name the lifetime of their device offset"
+                ),
+                Err(e) => log::error!(
+                    "block-key incarnations NOT engaged: {e} — keys stay unstamped (stale \
+                     bindings remain undetectable, spec §6.3)"
+                ),
+            }
+        }
         let _ = self.inner.meta_backend.set(meta_backend);
     }
 

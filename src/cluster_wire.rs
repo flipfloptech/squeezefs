@@ -82,7 +82,10 @@
 //! running a current-thread runtime with a `LocalSet`. [`RpcService::call`]
 //! is **synchronous by contract**, because §6.7's lock arbitration is
 //! RAM-only (an `scc` probe plus one atomic); anything that must await
-//! belongs on an explicit handoff, exactly as `ipc_service` does.
+//! belongs on an explicit handoff, exactly as `ipc_service` does — and
+//! since **S8** that handoff is a type, [`RpcAsyncService`], whose future
+//! is polled on the same pinned lane (S8's own service hops to the
+//! runtime that owns the metadata backend's tasks itself, visibly).
 //!
 //! Deliberately **not** io_uring: TLS peers and network TCP/TLS stacks are
 //! the sanctioned non-uring exception (AGENTS "Not uring" row).
@@ -113,7 +116,9 @@
 //! **This is not a networked DLM.** There are no lock verbs on this wire:
 //! S4 owns those and plugs into [`RpcService`] with its own verb numbers.
 //! S3 ships framing, authentication, discovery, the pinned RPC venue, and
-//! the `job_wire` port.
+//! the `job_wire` port. **S8**'s metadata verbs are the same discipline:
+//! the vocabulary lives in [`crate::meta_ship`] and plugs in through
+//! [`RpcAsyncService`]; this module never learns what a verb means.
 
 use crate::error::{Result, SqueezefsError};
 use crate::meta_backend::RoutedMetaBackend;
@@ -1380,6 +1385,46 @@ pub trait RpcService: Send + Sync + 'static {
     fn call(&self, req: RpcRequest) -> RpcResponse;
 }
 
+/// An owner-side RPC implementation whose verbs must **await** — DLM
+/// stage **S8**'s function-shipped metadata being the first one (spec
+/// §6.7 decision 1: a shipped verb runs the owner's ordinary `Metadata`
+/// call, which commits through the M7 conveyor and therefore parks on a
+/// oneshot).
+///
+/// This is the *explicit handoff* [`RpcService`]'s contract names, made a
+/// type instead of a convention. The venue rule is unchanged and is what
+/// the split protects: the future is polled on the pinned lane that
+/// received the frame (never on the conveyor's task), and an
+/// implementation that needs a different runtime for its work — S8's
+/// service hands the batch to the runtime that owns the backend's tasks —
+/// performs that hop itself, visibly, rather than having the transport
+/// guess.
+pub trait RpcAsyncService: Send + Sync + 'static {
+    /// Serve one request, asynchronously.
+    fn call<'a>(
+        &'a self,
+        req: RpcRequest,
+    ) -> Pin<Box<dyn Future<Output = RpcResponse> + Send + 'a>>;
+}
+
+/// Which arm a listener serves: the synchronous lock-verb shape or the
+/// awaiting metadata shape. One enum rather than two listeners, so the
+/// accept loop, the authn gate, the bounds and the counters have exactly
+/// one implementation.
+enum ServiceArm {
+    Sync(Arc<dyn RpcService>),
+    Async(Arc<dyn RpcAsyncService>),
+}
+
+impl ServiceArm {
+    async fn call(&self, req: RpcRequest) -> RpcResponse {
+        match self {
+            ServiceArm::Sync(svc) => svc.call(req),
+            ServiceArm::Async(svc) => svc.call(req).await,
+        }
+    }
+}
+
 /// The built-in ping service: the RTT instrument's server half, and the
 /// reference shape for S4's implementations (the listener owns the
 /// `requests_served` gauge, so the service itself counts nothing).
@@ -1575,7 +1620,7 @@ pub struct RpcListener {
     cfg: RpcListenerConfig,
     endpoint: SocketAddr,
     gate: Arc<AuthnGate>,
-    service: Arc<dyn RpcService>,
+    service: ServiceArm,
     pool: Arc<ServicePool>,
     counters: Arc<ListenerCounters>,
     channel: ChannelClass,
@@ -1603,6 +1648,25 @@ impl RpcListener {
         cfg: RpcListenerConfig,
         secret: Vec<u8>,
         service: Arc<dyn RpcService>,
+    ) -> Result<Arc<Self>> {
+        Self::start_arm(cfg, secret, ServiceArm::Sync(service))
+    }
+
+    /// [`Self::start`] serving an **awaiting** service (DLM S8's
+    /// function-shipped metadata). Same accept loop, same authn gate,
+    /// same bounds and same counters — only the call shape differs.
+    pub fn start_async(
+        cfg: RpcListenerConfig,
+        secret: Vec<u8>,
+        service: Arc<dyn RpcAsyncService>,
+    ) -> Result<Arc<Self>> {
+        Self::start_arm(cfg, secret, ServiceArm::Async(service))
+    }
+
+    fn start_arm(
+        cfg: RpcListenerConfig,
+        secret: Vec<u8>,
+        service: ServiceArm,
     ) -> Result<Arc<Self>> {
         let (tls, channel) = match cfg.security.as_ref() {
             Some(sec) => (Some(tls_acceptor(sec)?), ChannelClass::MutualTls),
@@ -1947,8 +2011,12 @@ impl RpcListener {
                 continue;
             };
             // The service runs HERE — on this pinned lane, which is the
-            // whole point of §6.7's venue rule.
-            let reply = self.service.call(RpcRequest { id, verb, body });
+            // whole point of §6.7's venue rule. An awaiting arm (S8's
+            // metadata verbs) yields on this lane's `LocalSet`, so the
+            // lane keeps serving its other sessions while one verb's
+            // commit is in flight; it never migrates the work onto the
+            // conveyor's task.
+            let reply = self.service.call(RpcRequest { id, verb, body }).await;
             self.counters.served.fetch_add(1, Ordering::SeqCst);
             if tx
                 .send(

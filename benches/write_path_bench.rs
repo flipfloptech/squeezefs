@@ -465,8 +465,135 @@ fn bench_indirect_map_codec(c: &mut Criterion) {
     group.finish();
 }
 
+/// **RES-17** (pre-RC spec §7): staging-shard removal under the shard
+/// WRITE lock.
+///
+/// Field shape: the staging segment ring holds one live entry per staged
+/// object / active block. Removal happens on every flush-promotion,
+/// same-key replace and eviction victim — i.e. on the write path — and the
+/// pre-fix implementation maintained a `VecDeque<Bytes>` beside the
+/// authoritative map, so each removal paid `retain` = an O(n) equality
+/// scan over `Bytes` keys plus an O(n) element shift, holding the shard's
+/// write lock throughout. Occupancy is what makes that quadratic: the
+/// shard sizes come from the R5 staging budget, so a 128 MiB shard holding
+/// 4 KiB-class staged extents carries thousands of live keys.
+///
+/// This group **drains** an `occupancy`-key shard and reports per-key cost.
+/// That is the honest shape for the claim: with the queue, draining N keys
+/// from an N-occupancy shard was O(N²) (each `retain` scans and shifts the
+/// remaining queue); map-only it is O(N), so the **per-key** figure must be
+/// flat across occupancies.
+///
+/// Measurement notes (both learned the hard way on this row): the shard is
+/// RETURNED from the routine, because `iter_batched` drops outputs outside
+/// the measured region and dropping it inline times the shard's
+/// occupancy-sized mmap teardown instead of the removals; and the drain is
+/// per-batch rather than one-key-per-iteration, because a per-iteration
+/// batch holds many live mappings at once and charges their page-fault cost
+/// to the removal.
+fn bench_staging_shard_removal(c: &mut Criterion) {
+    use bytes::Bytes;
+    use squeezefs::tiering::nvme::NvmeCache;
+
+    let mut group = c.benchmark_group("staging_shard_removal");
+    // Value size = the W2 parked-extent class (4 KiB), the shape that
+    // actually produces high key counts per shard.
+    const VAL: usize = 4096;
+    for occupancy in [64usize, 1024, 4096] {
+        let cap = (occupancy * (VAL + 4096)) * 2;
+        let keys: Vec<Bytes> = (0..occupancy)
+            .map(|i| Bytes::from(format!("active_block:{i:08}:0")))
+            .collect();
+        group.throughput(Throughput::Elements(occupancy as u64));
+        group.bench_function(format!("drain_{occupancy}_live_keys"), |b| {
+            b.iter_batched(
+                || {
+                    let cache = NvmeCache::new(&[], &[cap], 1).expect("anon shard");
+                    for k in &keys {
+                        cache.put(k.clone(), Bytes::from(vec![0xa5u8; VAL]));
+                    }
+                    cache
+                },
+                |cache| {
+                    let mut n = 0usize;
+                    for k in &keys {
+                        if cache.remove(black_box(k)).is_some() {
+                            n += 1;
+                        }
+                    }
+                    (cache, black_box(n))
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+/// **VAL-7e** (pre-RC spec §3): the `copy_file_range` staged-sibling probe
+/// range.
+///
+/// Field shape: `cp`/`rsync`-class copies issue `copy_file_range` in
+/// chunks against files whose size is unrelated to the chunk. The pre-fix
+/// probe looped `0..blocks` over the whole SOURCE FILE — four times per
+/// call — and pushed matches into an unbounded `Vec<u32>`; at the shipped
+/// 4 MiB block a 1 TiB source is 262 144 iterations × 4 per call, each one
+/// a formatted `active_block:` key plus a staged-key lookup. The bound is
+/// the copied extent.
+///
+/// The two rows are the same CALL against the same 1 TiB file: the
+/// per-chunk range (what the fix scans) and the whole-file range (what the
+/// clone fast path legitimately needs, and what the pre-fix code did for
+/// EVERY call).
+fn bench_copy_probe_range(c: &mut Criterion) {
+    use squeezefs::fuse_client::copy_probe_block_range;
+
+    let bs = BLOCK as u64;
+    let file = 1u64 << 40; // 1 TiB source
+    let blocks = file.div_ceil(bs) as u32;
+
+    let mut group = c.benchmark_group("copy_probe_range");
+    // The arithmetic itself (must be free).
+    group.bench_function("range_1mib_chunk", |b| {
+        b.iter(|| {
+            black_box(copy_probe_block_range(
+                black_box(512 * bs),
+                black_box(1024 * 1024),
+                black_box(blocks),
+                black_box(bs),
+            ))
+        });
+    });
+    // The probe LOOP the range governs: key formatting per block is the
+    // real per-iteration cost, so the row prices the work the bound
+    // removes. `chunk` = the fix's scan, `whole_file` = the pre-fix scan
+    // for the same request.
+    for (label, (lo, hi)) in [
+        (
+            "loop_chunk",
+            copy_probe_block_range(512 * bs, 1024 * 1024, blocks, bs),
+        ),
+        ("loop_whole_file", (0u32, 4096u32)),
+    ] {
+        group.throughput(Throughput::Elements((hi - lo).max(1) as u64));
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                let mut n = 0usize;
+                for blk in lo..hi {
+                    let key = squeezefs::keys::active_block(42, blk as u64).to_string();
+                    n += key.len();
+                }
+                black_box(n)
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_staging_shard_removal,
+    bench_copy_probe_range,
     bench_coverage_union,
     bench_extent_overlay,
     bench_supersession,

@@ -131,24 +131,39 @@ pub const STAGING_FILE_MODE: u32 = 0o600;
 /// to every intermediate it creates (an operator-supplied
 /// `/mnt/nvme/staging` must not silently turn `/mnt/nvme` into a 0700
 /// dir), and an ALREADY-EXISTING permissive dir — the common upgrade
-/// case — has to be tightened too. The `fchmod` rides an
-/// `O_DIRECTORY | O_NOFOLLOW` fd so it can never be redirected through a
-/// symlink swapped in after the create.
+/// case — has to be tightened too.
+///
+/// **`O_NOFOLLOW` is deliberately NOT used here.** The mount-side staging
+/// layout makes `<isolated-dir>/cache_segment` a **symlink** to
+/// `../cache_segment` on purpose — the read cache is shared across mounts
+/// of one staging root (`src/main.rs`'s isolation container) — and
+/// `O_DIRECTORY | O_NOFOLLOW` on a symlink is `ENOTDIR`, which would fail
+/// every mount that has a staging root (caught by
+/// `tests/cache_path_policy_tests.rs`, pinned by
+/// `tests/val7_access_control_tests.rs`). These paths are
+/// daemon-constructed inside a root the daemon already owns; the
+/// symlink-swap surface that genuinely needs `O_NOFOLLOW` is the
+/// operator-supplied root the format-grade stamp chowns as root
+/// (`stamp_precleared_staging_dir`, which does use it).
 pub fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let d = open_dir_nofollow(dir)?;
+    let d = open_dir(dir, false)?;
     fchmod(&d, STAGING_DIR_MODE)
 }
 
-/// `open(dir, O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)` — the anchor for
+/// `open(dir, O_DIRECTORY | O_CLOEXEC [| O_NOFOLLOW])` — the anchor for
 /// every `fchmod`/`fchown` on a staging root (VAL-7b: the historical
 /// path-based `chown` followed a symlink planted between the create and
 /// the chown).
-fn open_dir_nofollow(dir: &Path) -> std::io::Result<std::fs::File> {
+fn open_dir(dir: &Path, nofollow: bool) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
+    let mut flags = libc::O_DIRECTORY | libc::O_CLOEXEC;
+    if nofollow {
+        flags |= libc::O_NOFOLLOW;
+    }
     std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(flags)
         .open(dir)
 }
 
@@ -392,7 +407,7 @@ async fn stamp_precleared_staging_dir(dir: &Path, plan: Option<&StagingWipePlan>
     // operator supplied. `fchown` on a fd cannot be redirected, and the
     // same fd asserts the 0700 mode (the root holds plaintext staged
     // payloads on passthrough volumes).
-    let d = open_dir_nofollow(dir).map_err(|e| ctx("open (O_NOFOLLOW)", &e))?;
+    let d = open_dir(dir, true).map_err(|e| ctx("open (O_NOFOLLOW)", &e))?;
     fchmod(&d, STAGING_DIR_MODE).map_err(|e| ctx("set mode 0700 on", &e))?;
     let (uid, gid) = invoking_owner();
     if unsafe { libc::geteuid() } == 0 {

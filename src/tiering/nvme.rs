@@ -1028,7 +1028,7 @@ impl NvmeShard {
     ///
     /// Nothing needed its order. The historical front-run eviction walk
     /// that did was deleted by the geometry-complete eviction fix (see
-    /// [`NvmeShardInner::evict_overlapping`] — "the map is the authority;
+    /// `NvmeShardInner::evict_overlapping` — "the map is the authority;
     /// the queue is bookkeeping"), and no `pop_front` ever existed after
     /// it. The three consumers are all order-independent: the
     /// [`NvmeCache::offline_device`] drain (moves everything),

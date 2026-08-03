@@ -437,8 +437,70 @@ async fn bench_fs() -> squeezefs::fuse_client::SqueezefsFilesystem {
     squeezefs::fuse_client::SqueezefsFilesystem::new(router, dlm, 1000, 1000)
 }
 
+/// **RES-20** (pre-RC spec §7): the FORGET → reclaim-queue enqueue.
+///
+/// Field shape: a `drop_caches` storm — or any unlink/`find`-heavy
+/// workload — delivers FORGET/BATCH_FORGET in bulk on the classical
+/// sideband, and each forgotten `nlink == 0` ino must reach the reclaim
+/// queue. The pre-fix enqueue did `tokio::spawn(async move { tx.send(ino)
+/// .await })`: **one task per ino**, dispatched onto the current fuse3
+/// handler lane's `LocalSet`, whose only work was a channel send that
+/// would have succeeded immediately (the queue is 100 000 deep). This
+/// group prices the enqueue itself at the storm's cadence — 1 024 inos,
+/// the batch-forget-class burst.
+///
+/// The `try_send` shape must be flat and allocation-free; the spawning
+/// shape pays a task allocation + a lane hop + a wake per ino.
+fn bench_reclaim_enqueue(c: &mut Criterion) {
+    use squeezefs::fuse_client::ReclaimEnqueue;
+
+    const BURST: u64 = 1024;
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("reclaim_enqueue");
+    group.throughput(criterion::Throughput::Elements(BURST));
+
+    // The shipped path: room in the queue ⇒ zero tasks. Measured INSIDE a
+    // runtime (the daemon's venue) so the comparison is honest.
+    group.bench_function("try_send_burst_1024", |b| {
+        b.iter_batched(
+            || {
+                let (tx, rx) = tokio::sync::mpsc::channel::<u64>(200_000);
+                (ReclaimEnqueue::new(tx), rx)
+            },
+            |(q, rx)| {
+                let _g = rt.enter();
+                for ino in 2..(BURST + 2) {
+                    q.enqueue(black_box(ino));
+                }
+                black_box(rx)
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+
+    // The pre-fix shape, kept as the A0 control: one spawned task per ino.
+    group.bench_function("spawn_per_ino_burst_1024", |b| {
+        b.iter_batched(
+            || tokio::sync::mpsc::channel::<u64>(200_000),
+            |(tx, rx)| {
+                let _g = rt.enter();
+                for ino in 2..(BURST + 2) {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(ino).await;
+                    });
+                }
+                black_box(rx)
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_reclaim_enqueue,
     bench_high_concurrency,
     bench_cluster_dlm,
     bench_metadata_clone,

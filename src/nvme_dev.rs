@@ -331,6 +331,34 @@ impl UringWorker {
 }
 
 impl Drop for UringWorker {
+    /// RES-12 (pre-RC spec §7): this join stays **synchronous** on purpose.
+    ///
+    /// The spec item is that dropping this from an async context blocks a
+    /// tokio worker for the whole drain. That is true, and the fix is at
+    /// the DROP SITES, not here: deferring the join would make teardown
+    /// ordering non-deterministic, and P0-1's contract is precisely that
+    /// the worker's exit cleanup has run when `Drop` returns.
+    ///
+    /// The traced sites, and what each does now:
+    /// * `config_ops::probe_data_volume_rw` — constructs and drops a device
+    ///   inside one async fn, reachable from the LIVE daemon via the
+    ///   admin-lane `volume-add-data` verb
+    ///   (`SqueezefsFilesystem::admin_add_data_volume`) as well as from the
+    ///   offline CLI. Hops through `detached::drop_off_runtime` and awaits.
+    /// * `routing::BackendRouter::retire_backend` — the VL4 retire drops
+    ///   the last `Arc<StorageBackend>` (hence this worker) on a live
+    ///   mount. Hops through `drop_off_runtime`, not awaited.
+    /// * the daemon's own `default_device` + per-volume backends, and the
+    ///   offline verbs (`fsck`, `defrag`, `volume add-data`, `main.rs`'s
+    ///   one-shot device) — these drop when the whole object graph does, at
+    ///   the end of the process. Blocking a worker there has no victim
+    ///   (nothing else needs that thread), so they are deliberately left
+    ///   inline.
+    ///
+    /// Worst case for the join: idle workers park in `rx.recv()` and wake
+    /// on disconnect immediately; a worker with in-flight SQEs finishes
+    /// them first, bounded by device latency (the same bound MEM-1's 30 s
+    /// timeout guards).
     fn drop(&mut self) {
         // Close the channel first so the worker stops accepting work and exits
         // its loop, then join so exit cleanup (free unaligned bufs) runs before

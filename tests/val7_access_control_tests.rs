@@ -106,6 +106,44 @@ fn private_dir_helper_is_umask_independent_and_idempotent() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// VAL-7b regression: the mount layout makes `<isolated>/cache_segment` a
+/// **symlink** to `../cache_segment` on purpose (the read cache is shared
+/// across mounts of one staging root). A first cut of
+/// `create_private_dir_all` opened with `O_DIRECTORY | O_NOFOLLOW`, which
+/// is `ENOTDIR` on a symlink — every mount with a staging root failed
+/// ("Not a directory", caught by `tests/cache_path_policy_tests.rs`). The
+/// helper must traverse the symlink and tighten its TARGET.
+#[test]
+fn private_dir_helper_traverses_the_shared_cache_segment_symlink() {
+    let base = std::env::temp_dir().join(format!("sqz-val7b-link-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    // Mirror the mount layout: <root>/squeezefs/{cache_segment, <mount>/}
+    let container = base.join("squeezefs");
+    let shared = container.join("cache_segment");
+    let isolated = container.join("mnt_x");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::create_dir_all(&isolated).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let link = isolated.join("cache_segment");
+    std::os::unix::fs::symlink("../cache_segment", &link).unwrap();
+
+    squeezefs::config_ops::create_private_dir_all(&link)
+        .expect("the shared-read-cache symlink must be traversed, not refused (ENOTDIR)");
+    assert_eq!(
+        mode_of(&shared),
+        0o700,
+        "the symlink's TARGET is what must end up owner-only"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the symlink itself must survive — the shared read cache depends on it"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// VAL-7b: segment files (the mmapped staging/read-cache rings — literal
 /// plaintext user data on passthrough volumes) are created `0600`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

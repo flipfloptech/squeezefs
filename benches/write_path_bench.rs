@@ -1087,10 +1087,154 @@ fn bench_ro_gate(c: &mut Criterion) {
     group.finish();
 }
 
+/// **Spec §6.8 item 3 — the freed-offset grace period's per-operation
+/// cost** (`src/free_grace.rs`; contracts
+/// `tests/reader_free_grace_tests.rs`).
+///
+/// This group exists because the gate is **per allocation and per terminal
+/// free**, i.e. on the same ownership-transition path the `ro_gate` group
+/// above prices, and the mount that must not pay for it is the shipped
+/// default one (`SQUEEZEFS_MEMBERSHIP_BIND=off`, so no reader plane, so
+/// `free_grace::armed()` is false forever).
+///
+/// **Field shape.** Two rows per arm, both derived from measured field
+/// numbers rather than invented:
+///
+/// * the *unarmed* arm is the whole population of shipped mounts. Its
+///   frequency is one call per 4 MiB block allocated and one per block
+///   freed — at the write-wall campaign's 12.7 GB/s saturated ingest
+///   (`.benchmarks/2026-07-28-ingest-economy.md`) that is ≈ 3,100
+///   allocations + 3,100 frees per second per volume, and at the rewrite
+///   shape every overwritten block pays both.
+/// * the *armed* arm's ring depth is the field's own churn over one
+///   acknowledgement cycle: 12.7 GB/s ÷ 4 MiB × ≈ 38 s ≈ 120 k entries,
+///   which is exactly why `RING_CAP_FLOOR` is 131,072. The rows below
+///   walk 1 k → 128 k so the FIFO's claim (O(1) defer, O(released)
+///   harvest — *not* O(held), which is what a quarantine-shaped release
+///   would have cost) is visible as a flat line rather than asserted.
+///
+/// **Prediction** (written, not measured — ruling D11 defers every number;
+/// this is the falsifiable claim the bench exists to test):
+///
+/// 1. `defer_unarmed` and `harvest_unarmed` are **≤ 2 ns** and
+///    indistinguishable from `ro_gate/latch_probe` — one relaxed load of
+///    `ARMED` / of the ring's published length, feeding a not-taken branch.
+/// 2. `defer_armed` is **≤ 60 ns** (an uncontended `parking_lot` lock, one
+///    `VecDeque` push, one clock read, four relaxed counter adds) and
+///    **flat across ring depth**.
+/// 3. `harvest_armed_none_eligible` is **flat in ring depth** and within
+///    2 ns of the unarmed row plus one lock+peek (≈ 25 ns): the front peek
+///    decides, never a scan.
+/// 4. `harvest_armed_all_eligible` is **linear in the number RELEASED**
+///    with a per-offset cost ≈ that of one `DashSet::insert`, capped at
+///    `HARVEST_BATCH` (64) per call regardless of depth.
+///
+/// **Falsification.** Any of these instead scaling with the number of HELD
+/// entries falsifies the FIFO design and sends the ring back to a
+/// different structure; `defer_armed` past ~60 ns would say the lock is
+/// wrong for the free path (the next candidate being a per-CPU sharded
+/// ring, at the cost of the exact label ordering the peek relies on); and
+/// an unarmed row measurably above `latch_probe` falsifies the
+/// "zero cost when unarmed" claim that the whole feature's default-mount
+/// acceptability rests on.
+fn bench_free_grace_gate(c: &mut Criterion) {
+    use squeezefs::free_grace::{self, GraceRing};
+    use squeezefs::membership::{
+        JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MembershipOwner,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const CHUNK: u64 = BLOCK as u64;
+
+    // --- unarmed: the shipped default mount ---------------------------
+    free_grace::reset_for_test();
+    let ring = GraceRing::new(131_072);
+    let mut group = c.benchmark_group("free_grace_unarmed");
+    group.bench_function("defer_unarmed", |b| {
+        b.iter(|| black_box(ring.defer(black_box(0), CHUNK)));
+    });
+    group.bench_function("harvest_unarmed", |b| {
+        b.iter(|| black_box(ring.harvest(64).len()));
+    });
+    group.finish();
+
+    // --- armed: an owner with one reader that has acknowledged nothing -
+    let clock = LeaseClock::monotonic();
+    let clocks = LeaseClocks::derive(Duration::from_micros(250)).expect("shipped clocks");
+    let owner = MembershipOwner::arm("free-grace-bench", 2, 1, clocks.clone(), clock.clone())
+        .expect("arm the authority");
+    squeezefs::membership::install_owner(Arc::clone(&owner));
+    // A grace bound long enough that no bench iteration can trip the
+    // fence: this group prices the STEADY state, never the eviction path.
+    free_grace::arm_owner_plane_with(
+        clock,
+        Duration::from_secs(3_600),
+        Duration::from_secs(3_600),
+    );
+    match owner.join(JoinRequest {
+        id: "bench-reader".to_string(),
+        role: MemberRole::Reader,
+        endpoint: None,
+        pid: std::process::id(),
+        boot: "bench".to_string(),
+        prior_epoch: None,
+        pr_key: 0,
+    }) {
+        JoinOutcome::Granted(_) => {}
+        JoinOutcome::Refused { reason, .. } => panic!("bench join refused: {reason}"),
+    }
+    owner.refresh_free_grace_bound();
+    assert!(free_grace::armed(), "the armed arm needs the gate live");
+
+    let mut group = c.benchmark_group("free_grace_armed");
+    for depth in [1_024usize, 16_384, 131_072] {
+        let ring = GraceRing::new(1 << 20);
+        for i in 0..depth as u64 {
+            ring.defer(i * CHUNK, CHUNK);
+        }
+        group.bench_function(format!("defer_armed_depth_{depth}"), |b| {
+            b.iter(|| black_box(ring.defer(black_box(u64::MAX - CHUNK), CHUNK)));
+        });
+        // Nothing is acknowledged (the reader's bound is 0), so this is
+        // the "front peek says no" path — the one every free pays.
+        group.bench_function(format!("harvest_none_eligible_depth_{depth}"), |b| {
+            b.iter(|| black_box(ring.harvest(64).len()));
+        });
+    }
+    group.finish();
+
+    // Everything acknowledged: the release path, batched at HARVEST_BATCH.
+    let mut group = c.benchmark_group("free_grace_release");
+    group.throughput(Throughput::Elements(
+        squeezefs::free_grace::HARVEST_BATCH as u64,
+    ));
+    group.bench_function("harvest_all_eligible_batch", |b| {
+        b.iter_batched(
+            || {
+                let ring = GraceRing::new(1 << 20);
+                for i in 0..4_096u64 {
+                    ring.defer(i * CHUNK, CHUNK);
+                }
+                // Acknowledge past every label: `u64::MAX` is what the
+                // plane publishes when no reader can hold a binding.
+                free_grace::publish_bound(u64::MAX, 1);
+                ring
+            },
+            |ring| black_box(ring.harvest(squeezefs::free_grace::HARVEST_BATCH).len()),
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+    free_grace::reset_for_test();
+    squeezefs::membership::uninstall();
+}
+
 criterion_group!(
     benches,
     bench_writer_scope,
     bench_ro_gate,
+    bench_free_grace_gate,
     bench_staging_shard_removal,
     bench_copy_probe_range,
     bench_coverage_union,

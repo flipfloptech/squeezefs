@@ -29,7 +29,7 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use squeezefs::cache::active_block::ActiveBlockBuf;
 use squeezefs::fuse_client::BLOCK_FLUSH_LOCKS;
-use squeezefs::layout_wire::{encode_layout, LayoutDelta, LayoutMetadata};
+use squeezefs::layout_wire::{encode_layout, LayoutDelta, LayoutMetadata, LayoutMetadataRef};
 use std::collections::HashMap;
 use std::hint::black_box;
 
@@ -380,6 +380,82 @@ fn bench_detached_guard(c: &mut Criterion) {
     group.finish();
 }
 
+/// **PERF-13 · the write-pipeline admission gate.**
+///
+/// Every coverage-complete block passes `WritePipeline::admit` before its
+/// WRITE ACKs, so this gate is on the write path at the block rate (the
+/// field's rewrite rows displace ~1,650 blocks/s per
+/// `.benchmarks/2026-07-31-write-wall.md`, and a saturated ingest fleet
+/// parks here by design — `write_pipeline_admission_waits`).
+///
+/// Two shapes, because PERF-13 moves cost between them:
+/// * `admit_release_open_pipe` — the pipe below target (the common case).
+///   The registration is deliberately AFTER this attempt, so this arm must
+///   show no regression from the fix (no `Notify` wait-list traffic).
+/// * `park_wake_cycle_8_writers` — 8 concurrent writers against a 2-block
+///   target, i.e. the saturated shape where admissions actually park. This
+///   is the arm the fix is for: pre-fix, a completion landing between a
+///   Full re-check and the park's first poll was lost and the writer
+///   resumed only on the 5 ms liveness tick.
+fn bench_admission_gate(c: &mut Criterion) {
+    use squeezefs::write_pipeline::{set_depth_override, WritePipeline};
+    use std::sync::Arc;
+    use tokio::runtime::Runtime;
+
+    const BS: u64 = 4 * 1024 * 1024;
+    let rt = Runtime::new().expect("bench runtime");
+    let mut group = c.benchmark_group("write_admission_gate");
+    group.throughput(Throughput::Elements(1));
+
+    // Open pipe: admit + release, no park.
+    set_depth_override(Some(64));
+    let pipe = WritePipeline::with_caps(Arc::new(|| false), Some(1 << 40));
+    group.bench_function("admit_release_open_pipe", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let p = pipe.admit(black_box(BS)).await;
+                black_box(&p);
+                drop(p);
+            })
+        });
+    });
+
+    // Saturated: 8 writers, 2-block target — every writer parks and is
+    // resumed by a completion wake.
+    const WRITERS: usize = 8;
+    const PER_WRITER: usize = 16;
+    set_depth_override(Some(2));
+    let saturated = WritePipeline::with_caps(Arc::new(|| false), Some(1 << 40));
+    group.throughput(Throughput::Elements((WRITERS * PER_WRITER) as u64));
+    group.bench_function("park_wake_cycle_8_writers", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let mut set = tokio::task::JoinSet::new();
+                for _ in 0..WRITERS {
+                    let pipe = saturated.clone();
+                    set.spawn(async move {
+                        for _ in 0..PER_WRITER {
+                            let p = pipe.admit(BS).await;
+                            // Hold custody across scheduler turns so the
+                            // pipe stays AT target (the parking shape).
+                            for _ in 0..4 {
+                                tokio::task::yield_now().await;
+                            }
+                            drop(p);
+                        }
+                    });
+                }
+                while let Some(r) = set.join_next().await {
+                    r.expect("writer task");
+                }
+            })
+        });
+    });
+    set_depth_override(None);
+
+    group.finish();
+}
+
 fn bench_layout_publish(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_layout_publish");
 
@@ -402,6 +478,66 @@ fn bench_layout_publish(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(base_bytes.len() as u64));
     group.bench_function("full_save_encode_1024_blocks", |b| {
         b.iter(|| black_box(encode_layout(black_box(&base_layout)).expect("encode")));
+    });
+
+    // **PERF-8 · the save path's O(file-size) passes.**
+    //
+    // Every layout save (publish-class or not) used to build an OWNED
+    // `LayoutMetadata` first, which clones the whole block map — one heap
+    // allocation PER BLOCK — purely to hand bincode something to walk, and
+    // then serialized it whole even on the indirect arm that throws those
+    // bytes away. The three arms below price the two removed passes against
+    // the one that remains:
+    //
+    // * `owned_clone_then_encode_1024` — the pre-fix shape (map clone +
+    //   encode).
+    // * `borrowed_view_encode_1024` — the shipped shape (encode only, from
+    //   the live map).
+    // * `borrowed_view_size_probe_1024` — the `needs_indirect` decision
+    //   input alone: what the indirect arm now pays instead of a full
+    //   encode it discards.
+    let live_map = base_layout.block_map.as_ref().expect("map").clone();
+    group.bench_function("owned_clone_then_encode_1024", |b| {
+        b.iter(|| {
+            let owned = LayoutMetadata {
+                file_type: "striped".to_string(),
+                size: 4 << 30,
+                block_map_id: Some("bm-00aa11bb".to_string()),
+                block_prefix: Some("sqz:vol-00aa11bb".to_string()),
+                file_id: None,
+                data_key: None,
+                block_map: Some(black_box(&live_map).clone()),
+            };
+            black_box(encode_layout(&owned).expect("encode"))
+        });
+    });
+    group.bench_function("borrowed_view_encode_1024", |b| {
+        b.iter(|| {
+            let view = LayoutMetadataRef {
+                file_type: "striped",
+                size: 4 << 30,
+                block_map_id: Some("bm-00aa11bb"),
+                block_prefix: Some("sqz:vol-00aa11bb"),
+                file_id: None,
+                data_key: None,
+                block_map: Some(black_box(&live_map)),
+            };
+            black_box(view.encode().expect("encode"))
+        });
+    });
+    group.bench_function("borrowed_view_size_probe_1024", |b| {
+        b.iter(|| {
+            let view = LayoutMetadataRef {
+                file_type: "striped",
+                size: 4 << 30,
+                block_map_id: Some("bm-00aa11bb"),
+                block_prefix: Some("sqz:vol-00aa11bb"),
+                file_id: None,
+                data_key: None,
+                block_map: Some(black_box(&live_map)),
+            };
+            black_box(view.encoded_len().expect("size"))
+        });
     });
 
     // The shipped O(batch) delta: 64 map inserts (the
@@ -599,6 +735,7 @@ criterion_group!(
     bench_supersession,
     bench_deferred_free_collect,
     bench_detached_guard,
+    bench_admission_gate,
     bench_layout_publish,
     bench_indirect_map_codec,
     bench_flush_coalescing

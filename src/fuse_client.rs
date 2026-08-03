@@ -6379,6 +6379,13 @@ impl SqueezefsFilesystem {
                 "write_pipeline_depth_probe_ups": self.write_pipeline.depth_probe_ups(),
                 "write_pipeline_depth_probe_backoffs": self.write_pipeline.depth_probe_backoffs(),
                 "write_pipeline_admission_waits": self.write_pipeline.admission_waits(),
+                // PERF-13 tripwire: parks resumed by the 5 ms liveness tick
+                // instead of a completion wake. The tick exists only for
+                // target changes that carry no completion (Red clearing,
+                // probe growth) — growth here while completions flow means
+                // an admission wake was LOST (the pre-fix ~5 ms admit_wait
+                // p99 signature).
+                "write_pipeline_admission_tick_wakes": self.write_pipeline.admission_tick_wakes(),
                 "write_pipeline_fence_drops": METRICS.write_pipeline_fence_drops.load(Ordering::Relaxed),
                 // RES-6: the D0 latch's write-path face (must stay 0 on
                 // healthy mounts — read alongside writer_guard_fenced and

@@ -112,6 +112,24 @@ pub const BUDGET_CAP_DIVISOR: u64 = 4;
 /// scale so windowed rates are meaningful, small enough to re-learn fast.
 pub const WINDOW_MS: u64 = 250;
 
+/// Admission-park liveness tick: the backstop for target changes that
+/// carry NO completion (R5 Red clearing, governor/probe growth) — never
+/// the wake path itself (PERF-13: completions are captured by the
+/// enrolled `Notified`, and a tick that resumes a park while completions
+/// flow counts in `write_pipeline_admission_tick_wakes`).
+const ADMIT_TICK: Duration = Duration::from_millis(5);
+
+/// PERF-13 test seam — microseconds to stall between the admission
+/// re-check and the park (0 = off, the production value). Set only by
+/// `tests/write_pipeline_tests.rs` to place a completion deterministically
+/// inside the window the registration order closes.
+static TEST_PREPARK_STALL_US: AtomicU64 = AtomicU64::new(0);
+
+/// Set the [`TEST_PREPARK_STALL_US`] seam (tests only).
+pub fn set_test_prepark_stall_us(us: u64) {
+    TEST_PREPARK_STALL_US.store(us, Ordering::Relaxed);
+}
+
 /// Coarse monotonic milliseconds since process start (window clock).
 fn coarse_ms() -> u64 {
     static START: once_cell::sync::Lazy<std::time::Instant> =
@@ -284,6 +302,15 @@ impl Lane {
 pub struct WritePipeline {
     core: crate::write_pipeline_core::AdmissionCore,
     admission_waits: AtomicU64,
+    /// Parks resumed by the liveness TICK instead of a completion wake
+    /// (`write_pipeline_admission_tick_wakes`) — the PERF-13 tripwire.
+    ///
+    /// After the registration-order fix the tick exists only for target
+    /// changes that carry no completion (R5 Red clearing, governor/probe
+    /// growth) and for genuinely stalled devices, so growth of this
+    /// counter while completions are flowing means a wake was LOST — the
+    /// exact defect that pinned p99 `admit_wait` at the 5 ms tick.
+    admission_tick_wakes: AtomicU64,
     lanes: scc::HashMap<String, Arc<Lane>>,
     /// Probe-up layer over the BDP target (2026-07-29 campaign — see
     /// module docs §"The probe-up governor").
@@ -317,6 +344,7 @@ impl WritePipeline {
         Arc::new(Self {
             core: crate::write_pipeline_core::AdmissionCore::new(),
             admission_waits: AtomicU64::new(0),
+            admission_tick_wakes: AtomicU64::new(0),
             lanes: scc::HashMap::new(),
             probe: ProbeCore::new(),
             probe_waits_snap: AtomicU64::new(0),
@@ -432,6 +460,25 @@ impl WritePipeline {
             .max(bs)
     }
 
+    /// One admission attempt against the CURRENT depth target. `None` =
+    /// the pipe is at target (park). A CAS race means "the counters moved
+    /// under us", never "no room", so it retries in place.
+    fn try_admit_step(self: &Arc<Self>, block_bytes: u64) -> Option<PipelinePermit> {
+        loop {
+            let target = self.depth_target_bytes(block_bytes.max(1));
+            match self.core.try_admit_once(block_bytes, target) {
+                crate::write_pipeline_core::AdmitAttempt::Admitted => {
+                    return Some(PipelinePermit {
+                        pipe: self.clone(),
+                        bytes: block_bytes,
+                    });
+                }
+                crate::write_pipeline_core::AdmitAttempt::Raced => continue,
+                crate::write_pipeline_core::AdmitAttempt::Full => return None,
+            }
+        }
+    }
+
     /// Admit `block_bytes` of upload custody into the pipeline — **the
     /// honest-backpressure gate**, awaited by the WRITE handler before the
     /// completing write ACKs. Parks while the pipe is at target (woken by
@@ -440,30 +487,50 @@ impl WritePipeline {
     pub async fn admit(self: &Arc<Self>, block_bytes: u64) -> PipelinePermit {
         let mut waited = false;
         loop {
-            let target = self.depth_target_bytes(block_bytes.max(1));
-            match self.core.try_admit_once(block_bytes, target) {
-                crate::write_pipeline_core::AdmitAttempt::Admitted => {
-                    return PipelinePermit {
-                        pipe: self.clone(),
-                        bytes: block_bytes,
-                    };
-                }
-                crate::write_pipeline_core::AdmitAttempt::Raced => {
-                    continue; // CAS raced a completion/admission — re-evaluate.
-                }
-                crate::write_pipeline_core::AdmitAttempt::Full => {}
+            // Fast attempt: an admitting pipe pays NO wait-list traffic
+            // (the registration below is a `Notify` wait-list push/pop
+            // pair — free on the park path, pure cost on the common one).
+            if let Some(permit) = self.try_admit_step(block_bytes) {
+                return permit;
+            }
+            // PERF-13 — **register the wake BEFORE the admission
+            // re-check.** `notify_waiters` stores no permit, so a
+            // completion landing between a Full re-check and the park's
+            // first poll used to be lost outright, leaving the 5 ms
+            // liveness tick as the ONLY thing that resumed the writer
+            // (p99 `admit_wait` pinned at the tick under a saturated
+            // pipe). `Notified::enable` enrolls this waiter in the wait
+            // list synchronously — before the re-check reads the
+            // counters — so any completion from here on either admits us
+            // on the re-check or is captured by the enrolled waiter.
+            // The tick stays as the liveness backstop for target changes
+            // that are NOT paired with a completion (R5 Red clearing,
+            // governor/probe growth), which is all it was ever needed
+            // for.
+            let park = self.completions.notified();
+            let mut park = std::pin::pin!(park);
+            park.as_mut().enable();
+
+            if let Some(permit) = self.try_admit_step(block_bytes) {
+                return permit;
             }
             if !waited {
                 waited = true;
                 self.admission_waits.fetch_add(1, Ordering::Relaxed);
             }
-            // Park: `notify_waiters` stores no permit, so a wake can be
-            // lost to a not-yet-parked waiter — the 5 ms tick is the
-            // liveness backstop BY DESIGN (also how Red/target changes
-            // are observed). See write_pipeline_core.rs module docs.
+            // PERF-13 test seam: one relaxed load per park, zero cost when
+            // unset. Lets a test place a completion exactly inside the
+            // window between the re-check and the park — the window the
+            // registration order above closes. Never set in production.
+            let stall_us = TEST_PREPARK_STALL_US.load(Ordering::Relaxed);
+            if stall_us > 0 {
+                tokio::time::sleep(Duration::from_micros(stall_us)).await;
+            }
             tokio::select! {
-                _ = self.completions.notified() => {}
-                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                _ = park => {}
+                _ = tokio::time::sleep(ADMIT_TICK) => {
+                    self.admission_tick_wakes.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -473,16 +540,23 @@ impl WritePipeline {
     /// flight.
     pub async fn quiesce(&self, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
-        while self.core.inflight_blocks() != 0 {
+        loop {
+            // Same PERF-13 registration order as `admit`: enroll first,
+            // then read the gauge, so a completion cannot slip between.
+            let park = self.completions.notified();
+            let mut park = std::pin::pin!(park);
+            park.as_mut().enable();
+            if self.core.inflight_blocks() == 0 {
+                return true;
+            }
             if tokio::time::Instant::now() >= deadline {
                 return false;
             }
             tokio::select! {
-                _ = self.completions.notified() => {}
-                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                _ = park => {}
+                _ = tokio::time::sleep(ADMIT_TICK) => {}
             }
         }
-        true
     }
 
     /// In-flight admitted upload custody, bytes (the
@@ -501,6 +575,13 @@ impl WritePipeline {
     /// — the writer-backpressure gauge).
     pub fn admission_waits(&self) -> u64 {
         self.admission_waits.load(Ordering::Relaxed)
+    }
+
+    /// Parks resumed by the liveness tick rather than a completion wake
+    /// (`write_pipeline_admission_tick_wakes` — the PERF-13 tripwire; see
+    /// the field docs on [`WritePipeline::admission_tick_wakes`]).
+    pub fn admission_tick_wakes(&self) -> u64 {
+        self.admission_tick_wakes.load(Ordering::Relaxed)
     }
 
     /// Probes launched (`write_pipeline_depth_probe_ups` — the probe

@@ -491,6 +491,89 @@ fn bench_kv_tree(c: &mut Criterion) {
 ///   algebra every time — the pre-M9 per-read price, kept as the in-tip
 ///   comparator (and the shape `InodeDelta::decode` charged 7.9 % of
 ///   daemon CPU for in the baseline profile).
+/// **The node-cache hit path** — the hottest metadata path in the tree:
+/// every traversal step of every lookup/create/unlink resolves its node
+/// through [`NodeCache::try_get`], so anything added here is paid per
+/// level per operation. It is also the venue for the spec §6.8 item-2
+/// reader-revalidation epoch gate, whose acceptance bar is "~free when
+/// nothing changed": the gate is one relaxed load of the cache's epoch
+/// word plus one relaxed load of the node's stamp and a compare.
+///
+/// Field-derived shapes (`.benchmarks/2026-08-01-rewrite-publish-drain.md`
+/// §3 — the conveyor's per-pass node population; `kv_tree`'s 100 K-key
+/// tree is 3 levels deep):
+/// * `try_get_hit` — one hot node, the repeat-resolve case (a create
+///   storm hammering one parent's leaf).
+/// * `try_get_hit_rotating16` — 16 distinct addresses in rotation, which
+///   defeats the single-line locality of the first row and is the shape a
+///   multi-directory walk (`find`) actually presents.
+/// * `try_get_absent` — the unmapped-address probe (the demand-page
+///   entry), so the miss classification cost is on the record too.
+fn bench_kv_node_cache(c: &mut Criterion) {
+    use squeezefs::meta_backend::kv::node::{write_node, NodeWriteParams, MIN_NODE_SIZE};
+
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("kv_node_cache");
+    // 64 KiB nodes keep the fixture's device reads small; the hit path
+    // never touches node bytes, so node size is irrelevant to the rows.
+    const NODES: u64 = 64;
+    let node_size = MIN_NODE_SIZE;
+    let file = NamedTempFile::new().expect("temp volume");
+    file.as_file()
+        .set_len((NODES + 1) * node_size as u64)
+        .expect("size volume");
+    let layout = NodeLayout::new(node_size).expect("layout");
+    let cache = NodeCache::new(NodeCacheConfig {
+        path: file.path().to_path_buf(),
+        layout,
+        heap_base: 0,
+        budget_bytes: (NODES + 1) * node_size as u64,
+        writeback_delta_bytes: DEFAULT_WRITEBACK_DELTA_BYTES,
+    });
+    let addrs: Vec<u64> = (0..NODES).map(|e| cache.extent_addr(e)).collect();
+    rt.block_on(async {
+        for (i, addr) in addrs.iter().enumerate() {
+            write_node(
+                cache.config().path.clone(),
+                &cache.config().layout,
+                &NodeWriteParams {
+                    node_addr: *addr,
+                    node_seq: i as u64 + 1,
+                    tree_id: TREE_INODES,
+                    level: 0,
+                    min_key: b"",
+                    max_key: &[0xff; 8],
+                },
+                &[],
+                0,
+            )
+            .await
+            .expect("write node image");
+            cache.load(*addr).await.expect("load").expect("mapped");
+        }
+    });
+
+    let hot = addrs[0];
+    group.bench_function("try_get_hit", |b| {
+        b.iter(|| black_box(cache.try_get(black_box(hot))).is_some());
+    });
+
+    group.bench_function("try_get_hit_rotating16", |b| {
+        let mut i = 0usize;
+        b.iter(|| {
+            i = (i + 1) & 15;
+            black_box(cache.try_get(black_box(addrs[i]))).is_some()
+        });
+    });
+
+    let absent = cache.extent_addr(NODES); // written by nobody, never mapped
+    group.bench_function("try_get_absent", |b| {
+        b.iter(|| black_box(cache.try_get(black_box(absent))).is_none());
+    });
+
+    group.finish();
+}
+
 fn bench_kv_fold(c: &mut Criterion) {
     use squeezefs::meta_backend::kv::record::{fold_newest_first, RecordKind};
 
@@ -1192,6 +1275,7 @@ criterion_group!(
     bench_readdir_parent,
     bench_kv_bset,
     bench_kv_tree,
+    bench_kv_node_cache,
     bench_kv_fold,
     bench_kv_journal,
     bench_block_refs,

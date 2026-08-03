@@ -42,9 +42,9 @@ use squeezefs::meta_backend::RoutedMetaBackend;
 use squeezefs::routing::DataRouter;
 use squeezefs::write_pipeline::{
     depth_override, lane_target_bytes, pipeline_disposition, rolled_bw_peak, rolled_lat_floor,
-    set_depth_override, sync_inline, PipelineDisposition, ProbeCore, WritePipeline,
-    BUDGET_CAP_DIVISOR, FLOOR_BLOCKS_PER_LANE, HEADROOM, PROBE_COOLDOWN_EPOCHS, PROBE_EPOCH_MS,
-    PROBE_MUL_MAX, PROBE_MUL_ONE,
+    set_depth_override, set_test_prepark_stall_us, sync_inline, PipelineDisposition, ProbeCore,
+    WritePipeline, BUDGET_CAP_DIVISOR, FLOOR_BLOCKS_PER_LANE, HEADROOM, PROBE_COOLDOWN_EPOCHS,
+    PROBE_EPOCH_MS, PROBE_MUL_MAX, PROBE_MUL_ONE,
 };
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1090,4 +1090,74 @@ async fn t4_teardown_drains_pipeline_custody() {
     }
     let got = read_at(&h, ino, 0, data.len()).await;
     assert_eq!(got, data, "read-back after teardown flush");
+}
+
+// =========================================================================
+// 3b. PERF-13 — the admission park must not lose the completion wake.
+//
+// `notify_waiters` stores no permit: pre-fix, `admit` re-checked
+// admission and THEN created/polled the `Notified`, so every completion
+// that landed inside that window was lost and the parked writer resumed
+// only on the 5 ms liveness tick (p99 `admit_wait` pinned at ~5 ms under
+// a saturated pipe). The fix enables the `Notified` BEFORE the re-check.
+//
+// Instrument: N raced admit→complete cycles where the completion is fired
+// concurrently with the parker's re-check. Each cycle that hits the
+// window costs a 5 ms tick pre-fix, so the aggregate wall time separates
+// the two implementations by an order of magnitude. Measured on this box
+// (24-core, dev profile): pre-fix 1.03 s / 200 cycles (mean 5.2 ms —
+// EVERY raced cycle paid the tick), post-fix 8 ms / 200 cycles
+// (mean 0.04 ms). Bar set at 20× margin below the pre-fix mean.
+// =========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_wake_is_not_lost_to_the_park_window() {
+    let _s = serial().await;
+    let _g = OverrideGuard;
+    struct StallGuard;
+    impl Drop for StallGuard {
+        fn drop(&mut self) {
+            set_test_prepark_stall_us(0);
+        }
+    }
+    let _stall = StallGuard;
+
+    set_depth_override(Some(1)); // one block in flight: the next admit parks
+    let pipe = WritePipeline::with_caps(never_red(), Some(1 << 40));
+
+    // The seam holds the parker in the window between its admission
+    // re-check and its park, so the completion below lands EXACTLY where
+    // `notify_waiters` used to have no waiter to wake.
+    set_test_prepark_stall_us(150_000);
+
+    let p1 = pipe.admit(BS).await;
+    let ticks0 = pipe.admission_tick_wakes();
+    let pipe2 = pipe.clone();
+    let parked = tokio::spawn(async move { pipe2.admit(BS).await });
+
+    // Let the parker reach the seam, then complete.
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(
+        pipe.admission_waits() >= 1,
+        "the second admission must have parked before the completion"
+    );
+    drop(p1);
+
+    let p2 = tokio::time::timeout(Duration::from_secs(5), parked)
+        .await
+        .expect("a completion must always wake a parked admission")
+        .expect("admit task");
+    drop(p2);
+
+    // The park must have resumed on the COMPLETION, not on the 5 ms
+    // liveness tick. Pre-fix (`Notified` created after the re-check) the
+    // wake had no registered waiter and the tick was the only thing that
+    // resumed the writer — exactly one tick, deterministically.
+    assert_eq!(
+        pipe.admission_tick_wakes() - ticks0,
+        0,
+        "the admission park resumed on the 5 ms liveness tick, not on the \
+         completion wake — the `Notified` must be enabled BEFORE the \
+         admission re-check (PERF-13)"
+    );
 }

@@ -632,9 +632,80 @@ fn bench_reclaim_enqueue(c: &mut Criterion) {
     group.finish();
 }
 
+/// **PERF-3 · sharded vs process-global per-op counting.**
+///
+/// The transport phase histograms record ~5 spans per request and a latency
+/// distribution is tight by construction, so nearly every op of a class hits
+/// the SAME bucket word: the counting cost is a cache line ping-ponging
+/// between every queue worker and handler lane. `Align64` prevents false
+/// sharing but not TRUE sharing.
+///
+/// This is the primitive both arms reduce to, at the field's concurrency
+/// (one recording thread per core): N threads × M increments against ONE
+/// atomic vs against per-thread shards (the shipped shape in
+/// `crates/fuse3/src/raw/read_phase.rs`, where a shard is a whole
+/// `PhaseTable` so shards never share a line). Correctness is unaffected —
+/// snapshots sum the shards.
+fn bench_sharded_counters(c: &mut Criterion) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 4_096;
+
+    let mut group = c.benchmark_group("perop_counter_sharding");
+    group.throughput(criterion::Throughput::Elements(
+        (THREADS * PER_THREAD) as u64,
+    ));
+
+    group.bench_function("global_one_line", |b| {
+        let ctr = Arc::new(AtomicU64::new(0));
+        b.iter(|| {
+            let mut hs = Vec::with_capacity(THREADS);
+            for _ in 0..THREADS {
+                let ctr = Arc::clone(&ctr);
+                hs.push(std::thread::spawn(move || {
+                    for _ in 0..PER_THREAD {
+                        black_box(ctr.fetch_add(1, Ordering::Relaxed));
+                    }
+                }));
+            }
+            for h in hs {
+                h.join().unwrap();
+            }
+        });
+    });
+
+    group.bench_function("sharded_per_thread", |b| {
+        // One cache-line-isolated shard per thread (the read_phase layout:
+        // a shard is a whole table, so no two shards share a line).
+        #[repr(align(64))]
+        struct Shard(AtomicU64);
+        let shards: Arc<Vec<Shard>> =
+            Arc::new((0..THREADS).map(|_| Shard(AtomicU64::new(0))).collect());
+        b.iter(|| {
+            let mut hs = Vec::with_capacity(THREADS);
+            for t in 0..THREADS {
+                let shards = Arc::clone(&shards);
+                hs.push(std::thread::spawn(move || {
+                    for _ in 0..PER_THREAD {
+                        black_box(shards[t].0.fetch_add(1, Ordering::Relaxed));
+                    }
+                }));
+            }
+            for h in hs {
+                h.join().unwrap();
+            }
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_reclaim_enqueue,
+    bench_sharded_counters,
     bench_high_concurrency,
     bench_cluster_dlm,
     bench_metadata_clone,

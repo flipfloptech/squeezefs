@@ -21,8 +21,10 @@
 //!   residue (request formation/queueing before ring delivery +
 //!   completion wake), statable by subtraction — for BOTH walls.
 //!
-//! Always-on, READ+WRITE-opcode-only (≤ 4 `Instant` reads per op —
-//! invisible at any credible op rate); histograms bucket through the
+//! Always-on, READ+WRITE-opcode-only (≤ 4 `Instant` reads per op — the
+//! "invisible at any credible op rate" claim is asserted, not bracketed;
+//! see PERF-23); histograms are SHARDED per recording thread (PERF-3) and
+//! bucket through the
 //! SHARED `latency_core` (the same function the root `LatencyHistogram`
 //! uses), so the daemon-side serve tables and these families compose
 //! bucket-for-bucket. Error replies deliberately record nothing.
@@ -82,25 +84,84 @@ const OP_CLASSES: usize = 2;
 
 type PhaseTable = [[AtomicU64; LATENCY_BUCKETS]; PHASES];
 
-fn tables() -> &'static [PhaseTable; OP_CLASSES] {
-    static TABLES: OnceLock<[PhaseTable; OP_CLASSES]> = OnceLock::new();
+/// **PERF-3 — the tables are SHARDED per recording thread.**
+///
+/// A latency distribution is tight by construction, so nearly every op of a
+/// class lands in the SAME bucket word: the phase histograms were ~5
+/// process-global atomic RMWs per request on ~5 cache lines shared by every
+/// queue worker and handler lane. `Align64` prevents false sharing but not
+/// TRUE sharing — the line ping-pongs between cores regardless. Each thread
+/// now owns a shard (one whole `PhaseTable`, so shards never share a line),
+/// and `snapshot` sums across them: the counting cost becomes an
+/// uncontended RMW on a core-local line, and the reported histogram is
+/// unchanged (addition commutes; a snapshot taken mid-op can miss a
+/// just-recorded sample exactly as before).
+///
+/// Shard count derives from the machine (the standing derivation law — no
+/// free-floating constant): `available_parallelism` rounded up to a power of
+/// two, railed to [1, 64] so a 256-core host does not spend 3 MiB on
+/// histograms.
+fn shard_count() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .next_power_of_two()
+            .clamp(1, 64)
+    })
+}
+
+/// `shards[shard][op_class]`.
+fn tables() -> &'static [[PhaseTable; OP_CLASSES]] {
+    static TABLES: OnceLock<Vec<[PhaseTable; OP_CLASSES]>> = OnceLock::new();
     TABLES.get_or_init(|| {
-        std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))))
+        (0..shard_count())
+            .map(|_| {
+                std::array::from_fn(|_| {
+                    std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0)))
+                })
+            })
+            .collect()
+    })
+}
+
+/// This thread's shard index — assigned once per thread, round-robin over
+/// the shard set (the `wake_core`/pool-index precedent: no `sched_getcpu`
+/// per op, and a migrating thread keeps counting into a line it owns).
+fn shard_index() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    }
+    MINE.with(|c| {
+        let mut v = c.get();
+        if v == usize::MAX {
+            v = NEXT.fetch_add(1, Ordering::Relaxed) % shard_count();
+            c.set(v);
+        }
+        v
     })
 }
 
 #[inline]
 fn record(op: OpClass, phase: TransportPhase, dur: Duration) {
     let idx = latency_bucket_index(dur.as_micros() as u64);
-    tables()[op as usize][phase as usize][idx].fetch_add(1, Ordering::Relaxed);
+    tables()[shard_index()][op as usize][phase as usize][idx].fetch_add(1, Ordering::Relaxed);
 }
 
 fn snapshot(op: OpClass) -> [(&'static str, [u64; LATENCY_BUCKETS]); PHASES] {
-    let t = &tables()[op as usize];
+    let shards = tables();
+    let oc = op as usize;
     std::array::from_fn(|pi| {
         (
             PHASE_NAMES[pi],
-            std::array::from_fn(|bi| t[pi][bi].load(Ordering::Relaxed)),
+            std::array::from_fn(|bi| {
+                shards
+                    .iter()
+                    .map(|s| s[oc][pi][bi].load(Ordering::Relaxed))
+                    .sum()
+            }),
         )
     })
 }

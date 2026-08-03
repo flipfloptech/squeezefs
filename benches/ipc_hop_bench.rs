@@ -666,6 +666,152 @@ fn bench_cluster_wire_rtt(c: &mut Criterion) {
     host.shutdown();
 }
 
+/// **DLM S8 — the function-shipped metadata verb's own cost**
+/// (`src/meta_ship/`, spec §6.7 decision 1, §6.9 S8, risk **R1** accepted
+/// as ruling **D10**).
+///
+/// The group above prices the round trip; this one prices everything S8
+/// adds *around* it, because R1's published `tar -x` A/B has to be
+/// decomposable into terms rather than being one mystery number. Three
+/// questions, each a row:
+///
+/// 1. **Is the codec a visible term next to the RTT?** The loopback RTT
+///    floor is 9.33 µs at qd1 (`.benchmarks/2026-08-05-dlm-s3-cluster-wire.md`)
+///    and a fabric RTT is 50–150 µs (§6.10 R1). An encode+decode pair
+///    costing tens of nanoseconds is invisible; one costing microseconds
+///    would have to enter R1's arithmetic.
+/// 2. **Does batching amortize the frame, or the ops?** The batch is S8's
+///    pipelining unit, so per-verb encode cost at batch 64 versus batch 1
+///    is what says whether a concurrent stream's win is real.
+/// 3. **Is the fencing read still free?** §6.5 item 1 requires ≥ 99.5 % of
+///    lock operations served locally, and the census is ~24 fencing reads
+///    per write. The token cache replaces a local `scc` read with a local
+///    `scc` read, so the answer should be "unchanged" — and a row is how
+///    that stops being a hope.
+///
+/// **Field-derived input shapes** (`docs/pre-rc-engineering-spec.md` §6.5
+/// item 1 for the create wall; the M7 metadata-throughput program for the
+/// storm shape):
+///
+/// * `encode/decode_batch_64_create` — the **create-storm** shape: 64
+///   `CreateWithRdev` ops (the derived `SQUEEZEFS_META_SHIP_BATCH_MAX`
+///   default on an 8-core box, and the M7 conveyor's own batch floor),
+///   16-byte names, mode/uid/gid as a real mdstorm create carries. 64 is
+///   also what one owner-side conveyor pass drains, which is why the caps
+///   derive from each other.
+/// * `encode/decode_batch_1_getattr` — the **serial `tar -x`** shape: one
+///   verb per frame, which is exactly what R1 says a serial stream
+///   degenerates to. This row is the codec's contribution to that
+///   regression.
+/// * `refuse_lying_frame` — the hostile shape: a body whose in-frame
+///   length claims far more than it carries. Every write mount's listener
+///   is reachable before authentication (ruling D2), so a decode's cost
+///   must not scale with a *claim*.
+/// * `token_cache_hit` / `token_cache_record` — the S4-contract read and
+///   the grant absorption that feeds it.
+/// * `ownership_probe_unarmed` — requirement 1's price: what a SOLO mount
+///   (every shipped mount today) pays for S8 existing.
+///
+/// **Predictions, and what falsifies them** (written under ruling D11,
+/// which defers running this):
+///
+/// | Row | Prediction | Falsified if |
+/// |---|---|---|
+/// | `ownership_probe_unarmed` | ≤ 2 ns (one relaxed load) | > 20 ns — then "locality is free" is false and solo mounts pay for an unused feature |
+/// | `token_cache_hit` | ≤ 40 ns, i.e. within noise of the S1 local read | > 200 ns — 24 sites × that ≈ a whole metadata op, breaking §6.5 item 1's economics |
+/// | `encode_batch_64_create` | ≤ 150 ns/verb (≈ 10 µs/frame at 64) | > 1 µs/verb — the codec becomes a visible term beside the 9.33 µs RTT floor |
+/// | `decode_batch_64_create` | same order as encode | > 10 µs/frame — §6.5's custody budget is blown and the batch cap must shrink |
+/// | `*_batch_1_getattr` | ≤ 300 ns | > 2 µs — the codec, not the fabric, would dominate R1's serial row at 50 µs RTT, and R1's arithmetic needs a codec term |
+/// | `refuse_lying_frame` | flat in the CLAIMED length | any scaling with the claim — the decode bound is not being enforced |
+///
+/// Not run here (D11: no measured benches until the DLM serves N readers
+/// and N writers). The armed ownership probe's extra terms (one
+/// `ArcSwapOption::load` + a `Vec` index) are priced by proxy today —
+/// `high_concurrency_bench`'s `s4_is_local_slot_solo` and
+/// `route_ino_width` rows — and get their own row when the S9 mount
+/// wiring makes an owner map cheap to build outside a mount.
+fn bench_meta_ship_verbs(c: &mut Criterion) {
+    use squeezefs::meta_ship::{
+        decode_request, encode_request, foreign_fencing_token, ownership_armed, record_grant,
+        MetaCall, MetaOp, MetaRequestFrame, META_SHIP_SCHEMA,
+    };
+
+    let batch = |ops: Vec<MetaOp>| MetaRequestFrame {
+        schema: META_SHIP_SCHEMA,
+        client_epoch: 0x5eed_1234_dead_beef,
+        owner_term: 7,
+        ops,
+    };
+    let creates = batch(
+        (0..64u64)
+            .map(|i| MetaOp {
+                id: 1_000_000 + i,
+                call: MetaCall::CreateWithRdev {
+                    parent: 2 + i % 8,
+                    // 16-byte names: an mdstorm/`tar -x` file name.
+                    name: format!("file-{i:010}"),
+                    mode: libc::S_IFREG | 0o644,
+                    uid: 1000,
+                    gid: 1000,
+                    rdev: 0,
+                },
+            })
+            .collect(),
+    );
+    let single = batch(vec![MetaOp {
+        id: 42,
+        call: MetaCall::Getattr { ino: 2 },
+    }]);
+    let creates_bytes = encode_request(&creates).expect("encode");
+    let single_bytes = encode_request(&single).expect("encode");
+
+    let mut g = c.benchmark_group("meta_ship_verbs");
+
+    g.bench_function("ownership_probe_unarmed", |b| {
+        b.iter(|| std::hint::black_box(ownership_armed()))
+    });
+
+    // The S4-contract read: one `scc` read plus two relaxed atomics, i.e.
+    // the same shape the local read it replaces has.
+    let grant = squeezefs::meta_ship::TokenGrant {
+        ino: 8_675_309,
+        token: 0x0000_0100_0000_002a,
+        term: 1,
+    };
+    record_grant(&grant);
+    g.bench_function("token_cache_hit", |b| {
+        b.iter(|| std::hint::black_box(foreign_fencing_token(grant.ino)))
+    });
+    g.bench_function("token_cache_record", |b| {
+        b.iter(|| record_grant(std::hint::black_box(&grant)))
+    });
+
+    g.throughput(Throughput::Elements(64));
+    g.bench_function("encode_batch_64_create", |b| {
+        b.iter(|| std::hint::black_box(encode_request(&creates).expect("encode")))
+    });
+    g.bench_function("decode_batch_64_create", |b| {
+        b.iter(|| std::hint::black_box(decode_request(&creates_bytes).expect("decode")))
+    });
+
+    g.throughput(Throughput::Elements(1));
+    g.bench_function("encode_batch_1_getattr", |b| {
+        b.iter(|| std::hint::black_box(encode_request(&single).expect("encode")))
+    });
+    g.bench_function("decode_batch_1_getattr", |b| {
+        b.iter(|| std::hint::black_box(decode_request(&single_bytes).expect("decode")))
+    });
+
+    // Hostile: a truncated body behind a full-size claim. Must refuse
+    // without allocating on the claim.
+    let lying = &creates_bytes[..creates_bytes.len() / 8];
+    g.bench_function("refuse_lying_frame", |b| {
+        b.iter(|| std::hint::black_box(decode_request(lying).is_err()))
+    });
+
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_ring_push_pop,
@@ -675,6 +821,7 @@ criterion_group!(
     bench_wake_pair_lines,
     bench_job_wire_frames,
     bench_cluster_wire_rtt,
+    bench_meta_ship_verbs,
     bench_drain_pass
 );
 criterion_main!(benches);

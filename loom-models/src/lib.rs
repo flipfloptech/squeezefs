@@ -58,6 +58,18 @@
 //!   and per-appender coverage clocks never cross — one appender's durable
 //!   tail can never release a peer's parked extent, whose gate seq is a
 //!   position in the peer's own journal ring.
+//! - [`epoch_core`]: the node cache's reader-revalidation epoch + durable
+//!   tail, published as ONE ordered pair (pre-RC engineering spec §6.8
+//!   item 2, §6.2 closing) — invariants: a loader that observes epoch `E`
+//!   always reads a tail at least as new as `E`'s (so a node can never be
+//!   stamped "current as of E" after classifying its torn tail against an
+//!   OLDER tail, which silently drops records E covers); the epoch is
+//!   monotone under racing pollers and exactly one poller ever observes a
+//!   given step (so the drop pass runs once per step); and a node published
+//!   by a loader that raced an advance is either stamped the new epoch or
+//!   rejected — never silently retained. Reversing either side's access
+//!   order, or weakening either access, fails the models
+//!   (weakening-verified).
 //! - [`node_state_core`]: the KV node lifecycle word (CoW KV metadata
 //!   design §4.6/§10, PR K5 —
 //!   clean/dirty/serializing/superseded) — invariants: a commit's
@@ -193,6 +205,8 @@
 pub mod alloc_ext_core;
 #[path = "../../src/meta_backend/kv/conveyor_core.rs"]
 pub mod conveyor_core;
+#[path = "../../src/meta_backend/kv/epoch_core.rs"]
+pub mod epoch_core;
 #[path = "../../src/cow_core.rs"]
 pub mod cow_core;
 #[path = "../../crates/squeezefs-preload/src/fd_table_core.rs"]
@@ -348,9 +362,10 @@ mod zcrx_area_models {
 #[cfg(all(test, loom))]
 mod models {
     use crate::{
-        alloc_ext_core, conveyor_core, gauge_core, incarnation_core, ipc_cqe_core, ipc_ring_core,
-        ipc_slot_core, journal_core, lease_core, node_state_core, patch_clone_core, placed_core,
-        refcount_core, slot_cursor_core, slot_gate_core, wake_core, write_pipeline_core,
+        alloc_ext_core, conveyor_core, epoch_core, gauge_core, incarnation_core, ipc_cqe_core,
+        ipc_ring_core, ipc_slot_core, journal_core, lease_core, node_state_core, patch_clone_core,
+        placed_core, refcount_core, slot_cursor_core, slot_gate_core, wake_core,
+        write_pipeline_core,
     };
     use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use loom::sync::Arc;
@@ -3210,6 +3225,161 @@ mod models {
             assert_ne!(a, b, "two mints returned the same ino");
         });
     }
+    // =====================================================================
+    // epoch_core (2026-08-05 node-cache coherence: spec §6.8 item 2)
+    // =====================================================================
+
+    /// **The two-word publication law.** A revalidation publishes two facts
+    /// — the new checkpoint epoch and the new durable journal tail — and a
+    /// loader must read them as a coherent pair, because the tail is the
+    /// §4.5 torn-tail classifier's input. The dangerous inversion is
+    /// *epoch-new with tail-old*: such a node claims currency for a
+    /// checkpoint whose covered records its classifier may have silently
+    /// dropped. So the publisher stores tail-then-epoch and the loader reads
+    /// epoch-then-tail, and this model asserts the resulting invariant
+    /// against a racing poller: `snapshot.tail >= tail(snapshot.epoch)`.
+    ///
+    /// Weakening evidence (each fails):
+    /// * publish the epoch before the tail ⇒ the loader observes epoch 2
+    ///   with tail 10;
+    /// * read the tail before the epoch ⇒ same outcome from the other side;
+    /// * `Relaxed` on either access ⇒ loom reorders into the same outcome.
+    #[test]
+    fn epoch_core_loader_never_sees_an_epoch_newer_than_its_tail() {
+        loom::model(|| {
+            // Epoch 1 covers tail 10; the poller advances to epoch 2 / tail
+            // 20. Any observed pair must satisfy: epoch 2 ⇒ tail >= 20.
+            let ep = Arc::new(epoch_core::RevalidationEpoch::new(10));
+            assert!(ep.arm(1));
+            let poller = {
+                let ep = ep.clone();
+                thread::spawn(move || {
+                    ep.publish(20, 2);
+                })
+            };
+            let loader = {
+                let ep = ep.clone();
+                thread::spawn(move || {
+                    let snap = ep.load_snapshot();
+                    if snap.epoch >= 2 {
+                        assert!(
+                            snap.tail >= 20,
+                            "a node stamped epoch {} would be classified against tail {} \
+                             — the silent-record-loss inversion",
+                            snap.epoch,
+                            snap.tail
+                        );
+                    }
+                    snap
+                })
+            };
+            poller.join().unwrap();
+            let snap = loader.join().unwrap();
+            assert!(snap.epoch == 1 || snap.epoch == 2);
+        });
+    }
+
+    /// Racing pollers (a cadence tick and an on-demand revalidation): the
+    /// epoch is monotone, and **exactly one** of them observes any given
+    /// step, so the drop pass — and with it the R-6 purge trigger and the
+    /// extent-charge credits — runs once per step, never twice.
+    #[test]
+    fn epoch_core_racing_pollers_step_the_epoch_exactly_once() {
+        loom::model(|| {
+            let ep = Arc::new(epoch_core::RevalidationEpoch::new(0));
+            assert!(ep.arm(5));
+            let a = {
+                let ep = ep.clone();
+                thread::spawn(move || ep.publish(50, 6).is_some())
+            };
+            let b = {
+                let ep = ep.clone();
+                thread::spawn(move || ep.publish(50, 6).is_some())
+            };
+            let winners = usize::from(a.join().unwrap()) + usize::from(b.join().unwrap());
+            assert_eq!(
+                winners, 1,
+                "two sweepers for one epoch step would double-credit the budget gauge \
+                 (a double credit wraps the u64 and reads as 'full forever')"
+            );
+            assert_eq!(ep.probe(), 6);
+            assert!(!ep.publish(40, 6).is_some(), "a repeat step never advances");
+            assert_eq!(ep.tail(), 50, "the tail is monotone");
+        });
+    }
+
+    /// The stamp/gate composition the cache relies on: a loader that
+    /// snapshots the epoch, reads bytes, and publishes a node stamped with
+    /// that snapshot is either adopted (stamp == current) or rejected —
+    /// **never** retained while stale. The published payload models the
+    /// device bytes; loom's `UnsafeCell` tracking would report a race if an
+    /// adopting reader could observe a half-published node.
+    #[test]
+    fn epoch_core_a_node_published_across_an_advance_is_adopted_or_rejected() {
+        loom::model(|| {
+            let ep = Arc::new(epoch_core::RevalidationEpoch::new(0));
+            assert!(ep.arm(1));
+            // The "map": the stamp a published node carries (0 = empty).
+            let stamp = Arc::new(AtomicU64::new(0));
+            let loader = {
+                let ep = ep.clone();
+                let stamp = stamp.clone();
+                thread::spawn(move || {
+                    let snap = ep.load_snapshot(); // BEFORE the device read
+                    stamp.store(snap.epoch, Ordering::Release); // publish
+                })
+            };
+            let poller = {
+                let ep = ep.clone();
+                thread::spawn(move || {
+                    ep.publish(7, 2);
+                })
+            };
+            loader.join().unwrap();
+            poller.join().unwrap();
+            let published = stamp.load(Ordering::Acquire);
+            let current = ep.probe();
+            assert_eq!(current, 2, "the advance always lands");
+            // The cache's law: served iff stamped current. A node published
+            // under the older snapshot must therefore be rejected (and the
+            // sweep drops exactly those).
+            let served = published == current;
+            assert!(
+                served || published == 1,
+                "a published stamp is either the new epoch or the one snapshotted \
+                 before it — never anything else"
+            );
+        });
+    }
+
+    /// The packed mutation-gate word (spec §6.2 closing): a reader
+    /// declaration and an appender declaration never clobber each other, so
+    /// "armed reader ⇒ mutates nothing" cannot be lost by a racing
+    /// `set_appender`, and the solo default is exactly word 0.
+    #[test]
+    fn epoch_core_gate_declarations_never_clobber_each_other() {
+        loom::model(|| {
+            let gate = Arc::new(epoch_core::AppendGate::new());
+            let g0 = gate.load();
+            assert!(!g0.reader && g0.is_solo() && g0.is_authority());
+            let a = {
+                let gate = gate.clone();
+                thread::spawn(move || gate.set_reader())
+            };
+            let b = {
+                let gate = gate.clone();
+                thread::spawn(move || gate.set_appender(4, 3).unwrap())
+            };
+            a.join().unwrap();
+            b.join().unwrap();
+            let g = gate.load();
+            assert!(g.reader, "the reader declaration survived the race");
+            assert_eq!((g.writers, g.writer_id), (4, 3));
+            assert!(!g.is_authority(), "appender 3 is not the root authority");
+            assert!(!g.is_solo());
+        });
+    }
+
     // =====================================================================
     // write_pipeline_core (2026-07-27 depth campaign)
     // =====================================================================

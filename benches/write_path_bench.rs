@@ -1708,6 +1708,122 @@ fn bench_alloc_lane_grant(c: &mut Criterion) {
     group.finish();
 }
 
+/// DLM **S9** — the co-writer **FREE path** (`crate::cowriter`,
+/// `PublishCall::FreeBlocks`): what shipping a displaced block's terminal
+/// free adds, priced at the cadence it actually runs at.
+///
+/// **WRITTEN AND NOT RUN — ruling D11.** Every claim is a PREDICTION with a
+/// falsification criterion, to be adjudicated by the first measured pass
+/// once the D11 window opens.
+///
+/// ## The field shape (no toy inputs — program rule)
+///
+/// The free is **per displaced 4 MiB block**: the write-wall campaign
+/// (`.benchmarks/2026-07-31-write-wall.md`) measured ~**1,650 blocks/s
+/// displaced at 6.3–6.8 GB/s**, so a saturated rewriting co-writer ships on
+/// the order of 10³ free verbs/s — and each verb's wire cost rides BESIDE a
+/// layout publish that already travelled for the same rewrite. Batch shape
+/// 64 is the truncate/`free_blocks` face (the publish coalescer's own
+/// `SQUEEZEFS_PUBLISH_COALESCE_MAX` default).
+///
+/// ## Predictions, and what refutes each
+///
+/// | Claim | Structural reason | Falsified by |
+/// |---|---|---|
+/// | the WRITER's free path is unchanged | the ship branch is two relaxed loads (`co_writer_mount()` first — false on every write mount), and the scope probe hides INSIDE that false branch | the `alloc_lane::free_*` rows moving vs the committed reference once measurement opens |
+/// | the scope probe is tens of ns and never ambient | one tokio task-local `try_with` on a key set only by the executor | `scope_probe_inactive` at µs scale (⇒ the task-local is walking something), or ANY writer-path row paying it |
+/// | the verb's codec is O(batch) and sub-µs at 64 | one bincode pass over `8 B × batch` + a constant header | `free_frame_encode_64` ≉ 64 × the marginal cost of `free_frame_encode_1`'s payload, or either row at µs scale |
+/// | the owner's untracked arm ≈ the tracked free | `seed_shipped_free_reference` is ONE scc insert ahead of the same `begin_free`/`finish_free` the local ladder runs | `seed_and_terminal_free_ram` separating from `alloc_lane::free_unpartitioned` beyond the group threshold (⇒ the seed is more than an insert) |
+/// | the co-writer's local hygiene is O(1) | one map remove + one incarnation-word retire | `retire_local_tracking` scaling with anything |
+/// | the RTT dominates and stays OFF the write path's critical section | the free ships after the publish, from the same fire-and-forget venue the local reclaim enqueue used | a co-writer's `write_pipeline_phase_ns::displaced_free` carrying control-RTT residence at the BLOCK rate once the D11 window opens (⇒ the ship is being awaited where the enqueue used to return — the fix is batching through `free_blocks`, never un-awaiting the verb) |
+/// | exactly-once costs a map probe, not a round trip | the dedup window is S8's `DedupWindow` verbatim (same type, same FIFO cap), whose cost the S8 owner path already carries per mutating verb | the replay path showing anywhere but on genuine retries (`free_replays` moving without transport failures) |
+fn bench_cowriter_free(c: &mut Criterion) {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::meta_ship::publish::{PublishCall, PublishRequestFrame, PUBLISH_SCHEMA};
+    use tokio::runtime::Runtime;
+
+    let rt = Runtime::new().expect("bench runtime");
+    let alloc = rt.block_on(async { BlockAllocator::new("cowriter_free_bench").await.unwrap() });
+    let chunk = alloc.chunk_size();
+
+    let mut group = c.benchmark_group("cowriter_free");
+
+    // The scope probe — the ONLY instruction the gates gained, and it hides
+    // behind the co-writer latch (a write mount never executes it).
+    group.bench_function("scope_probe_inactive", |b| {
+        b.iter(|| black_box(squeezefs::cowriter::authority_accounting_scope_active()))
+    });
+
+    // The verb's wire codec at the two field shapes: one displaced block
+    // (the write path's per-key call) and the 64-block batch face.
+    let frame_of = |blocks: Vec<u64>| PublishRequestFrame {
+        schema: PUBLISH_SCHEMA,
+        client: "node_00000000deadbeef".to_string(),
+        call: PublishCall::FreeBlocks {
+            vol_tag: 0x00aa_11bb_00aa_11bb,
+            blocks,
+            lease_epoch: 42,
+            request_id: 7,
+        },
+    };
+    let one = frame_of(vec![1_650]);
+    let batch = frame_of((0..64u64).map(|i| 1_650 + i * 4).collect());
+    group.bench_function("free_frame_encode_1", |b| {
+        b.iter(|| black_box(bincode::serialize(&one).expect("encode")))
+    });
+    group.throughput(Throughput::Elements(64));
+    group.bench_function("free_frame_encode_64", |b| {
+        b.iter(|| black_box(bincode::serialize(&batch).expect("encode")))
+    });
+    let raw = bincode::serialize(&batch).expect("encode");
+    group.bench_function("free_frame_decode_64", |b| {
+        b.iter(|| black_box(bincode::deserialize::<PublishRequestFrame>(black_box(&raw)).unwrap()))
+    });
+    group.throughput(Throughput::Elements(1));
+
+    // The owner's UNTRACKED arm (a peer-minted block this authority never
+    // tracked): seed one reference, then the same RAM terminal ladder a
+    // local free runs — the row that must sit beside
+    // `alloc_lane::free_unpartitioned`.
+    let mut seed_idx = 1u64 << 20;
+    group.bench_function("seed_and_terminal_free_ram", |b| {
+        b.iter_batched(
+            || {
+                seed_idx += 1;
+                seed_idx * chunk
+            },
+            |off| {
+                alloc.seed_shipped_free_reference(off);
+                if alloc.begin_free(off) {
+                    alloc.finish_free(off);
+                }
+                black_box(off)
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    // The co-writer's local hygiene per shipped block: drop the tracking
+    // entry + retire the incarnation word (never the free list).
+    let mut retire_idx = 1u64 << 21;
+    group.bench_function("retire_local_tracking", |b| {
+        b.iter_batched(
+            || {
+                retire_idx += 1;
+                let off = retire_idx * chunk;
+                alloc.seed_shipped_free_reference(off);
+                off
+            },
+            |off| {
+                alloc.retire_shipped_free_tracking(off);
+                black_box(off)
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_writer_scope,
@@ -1715,6 +1831,7 @@ criterion_group!(
     bench_free_grace_gate,
     bench_alloc_lane,
     bench_alloc_lane_grant,
+    bench_cowriter_free,
     bench_staging_shard_removal,
     bench_copy_probe_range,
     bench_coverage_union,

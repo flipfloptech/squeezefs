@@ -208,6 +208,13 @@ harness = false
 name = "nvme_issue_bench"
 harness = false
 
+# DLM S6: the membership plane's renewal path and read-side enumeration.
+# WRITTEN, NOT RUN per ruling D11 — every group states its field shape, a
+# prediction and a falsification criterion in-file.
+[[bench]]
+name = "membership_bench"
+harness = false
+
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

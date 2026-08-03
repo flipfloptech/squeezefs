@@ -1,6 +1,7 @@
 # Design: Dynamic Meta Routing — the derived virtual width
 
-**Status:** Rev 2 — 2026-08-02, IMPLEMENTED (campaign `feat/dynamic-meta-routing`).
+**Status:** Rev 3 — 2026-08-03, IMPLEMENTED (campaign `feat/dynamic-meta-routing`;
+§9 records DLM stage S4 as the slot map's second consumer).
 **Charter:** direct user ruling (2026-08-02, verbatim): the frozen, user-chosen
 routing width is "a horrible / restrictive design decision... it needs to be
 dynamic." The no-fixed-constants law and the forward-only law (no backwards
@@ -458,9 +459,56 @@ the successor story; `docs/design-volume-lifecycle.md` gains a banner note
 at §5.5.1 + a revision row pointing here (history preserved, not
 rewritten).
 
-## 9. Revision history
+## 9. Second consumer: DLM lock homing (stage S4, landed 2026-08-03)
+
+The slot map now homes **locks** as well as metadata
+(`pre-rc-engineering-spec.md` §6.7 decision 2, §6.9 stage S4;
+`src/dlm_slot.rs`, contracts `tests/dlm_slot_lock_tests.rs`). Recorded
+here because the routing law above is now load-bearing for a second
+plane, and any change to it moves both.
+
+* **Homing = `route_ino_width(ino, W).0`, verbatim.** `lock_home_slot`
+  parses the lock object's **global** ino out of its `inode_{N}` key form
+  (through `dlm::ino_of_path`, the one place that law lives) and routes it
+  over the set's frozen `W`. No hash ring exists anywhere in the lock
+  path: the whole point is that the lock master and the metadata
+  authority are the SAME process by construction, which is what lets a
+  metadata RPC and its lock be one round trip when S8 ships function
+  shipping. A test pins `slot_of_ino ≡ route_ino_width(..).0` across
+  widths {0, 1, 2, 3, 64, 65536, 131072} and the ino-1/ino-2/`ino + k·W`
+  edges — divergence between the two planes is a red test, not a
+  debugging session.
+* **`W ≤ 1` is the identity arm here too** — every object homes to slot 0,
+  which is exactly the in-RAM/test constructor's and the legacy
+  single-volume shape (§5.1, contract 8 above).
+* **A non-inode lock object pins to slot 0.** It has no ino and therefore
+  no routed home; slot 0 is the root ino's slot, whose owner is a member
+  of every set by construction. Not a scaling concern (no product verb
+  locks a non-inode object), but it IS the answer S6/S8 inherit.
+* **The width reaches the lock plane by publication, not by plumbing** —
+  `RoutedMetaBackend::new` / `with_slot_map_and_natives` call
+  `dlm_slot::publish_routing_width` when a routed set is opened, so
+  mounts and offline verbs agree and `DlmClient::new()` (which has no
+  backend handle) needs no new argument. One process serves one set, so
+  one word is honest; **a process that can ever serve two sets at once
+  must bind the width to the set handle instead** — the S6/S8 contract,
+  also stated on the static.
+* **Ownership is a separate, lock-free question** (`is_local_slot`): solo
+  mode has no owner table installed and answers "local" for every slot,
+  so acquisition is bit-for-bit the S0–S2 `scc` probe and `dlm_rpcs` is
+  0 by construction. A remote owner map is later the same call over an
+  installed per-slot bitset — a lookup, not a re-plumbing.
+* **Slot migration and lock homing.** A slot's move re-homes its locks
+  along with its metadata, which is correct and free today (one owner) and
+  is precisely why the per-slot cutover gate (§5.5.2b, checked *before* 4a
+  acquisition) is the right remastering primitive later: the gate already
+  parks operations while a slot changes hands. Nothing about migration
+  changes at S4 because there is only ever one owner to hand to.
+
+## 10. Revision history
 
 | Rev | Date | Change |
 |---|---|---|
+| 3 | 2026-08-03 | §9 records the slot map's second consumer: DLM stage S4 homes lock objects on `route_ino_width` (solo mode — `dlm_rpcs == 0` by construction), publishes the frozen width to the lock plane at routed-set open, and pins the two planes' routing equivalence as a test |
 | 2 | 2026-08-02 | Implementation record: `native_slot_plus1` widened to u32 on the wire (u16 plus1 overflows at slot 65535); §5.9 gains the measured end-to-end probe numbers (7–8 ms format / 21–28 ms open / 48 B at-rest stamps on the file-backed sandbox); the idle-cost probe and the `dynamic_meta_routing` Criterion group named as standing instruments |
 | 1 | 2026-08-02 | Initial design: constraints verified against code (ino-pin arithmetic, ledger/xattr/census cost sites, the mint-slot cosmetic-W trap); A vs B priced with B's key-encoding rewrite named as the disqualifier; A adjudicated on measured idle costs (µs/KiB-scale at W = 65536); derived W = 2^16 (slot-id namespace), stride-run stamp wire under incompat bit 6, encoding-budget caps replacing the 64-slot cap, MINT_SPREAD = 64 minting rotation, census + mirror economy, forward-only refusal matrix |

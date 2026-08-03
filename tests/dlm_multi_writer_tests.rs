@@ -945,13 +945,19 @@ fn the_arms_capability_set_is_the_six_bits_and_says_why() {
         "the arm can never require a bit this binary does not understand"
     );
     // S9 needs NO new incompat bit: every capability it gates on was
-    // already built by the §6.2 format work (this program has had four
-    // parallel bit collisions — not taking one is the safest possible
-    // answer).
+    // already built by the §6.2 format work. The original pin here froze
+    // the whole mask above bit 14 ("bit 15 and above stay free"), which
+    // went red the day item 9 legitimately claimed bit 15 — the same
+    // brittleness S8's census pin had, and the same fix: assert what S9
+    // actually claims. S9's REQUIRED set must be a subset of the bits
+    // that existed when S9 landed (0..=14), so a later stage's new bit
+    // can never silently become an S9 arming requirement — and that is
+    // the property worth pinning, not the global bit population.
     assert_eq!(
-        sb::FEATURES_INCOMPAT_KNOWN & !((1 << 15) - 1),
+        required & !((1u64 << 15) - 1),
         0,
-        "bit 15 and above stay free: S9 takes no bit"
+        "S9's required capability set must stay within bits 0..=14 — a later \
+         stage's bit cannot silently join the arm's requirements"
     );
 }
 

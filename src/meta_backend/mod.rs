@@ -1645,42 +1645,46 @@ impl Metadata for RoutedMetaBackend {
             } else {
                 kv::backend::RoutedParentUpdate::ExclusiveTimes
             };
-            // Validation + the count step's (pre, post) witness, under the
-            // guards this op already holds.
-            let child_v = self.volumes[child_v_idx]
+            // The name always goes; the count step exists only if there is
+            // an inode record to count. A dentry naming a destroyed inode
+            // must stay REMOVABLE (the pre-S3.5 fragment order removed the
+            // name and then errored, which at least made `rm` work; a plan
+            // that refused up front would strand the name forever).
+            let mut steps = vec![crossvol_tx::XvStep::RemoveDentry {
+                parent,
+                name: name.to_string(),
+                expect_child: global_child_ino,
+                parent_update: crossvol_tx::parent_update_code(update),
+            }];
+            match self.volumes[child_v_idx]
                 .read_inode_value_routed(local_child)
                 .await?
-                .ok_or_else(|| {
-                    crate::error::SqueezefsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("Inode {local_child} not found"),
-                    ))
-                })?;
-            let post = if is_dir {
-                0
-            } else {
-                child_v.nlink.saturating_sub(1)
-            };
+            {
+                // Validation + the count step's (pre, post) witness, read
+                // under the guards this op already holds.
+                Some(child_v) => steps.push(crossvol_tx::XvStep::SetNlink {
+                    ino: global_child_ino,
+                    pre: child_v.nlink,
+                    post: if is_dir {
+                        0
+                    } else {
+                        child_v.nlink.saturating_sub(1)
+                    },
+                    ctime: Some(kv::backend::KvMetaBackend::now_ns_pub()),
+                }),
+                None => log::warn!(
+                    "cross-volume unlink of {name:?} in parent {parent}: child ino \
+                     {global_child_ino} has no inode record — removing the dangling name \
+                     and accounting nothing (run `squeezefs fsck`)"
+                ),
+            }
             let plan = crossvol_tx::XvPlan {
                 op: if is_dir {
                     crossvol_tx::XvOp::Rmdir
                 } else {
                     crossvol_tx::XvOp::Unlink
                 },
-                steps: vec![
-                    crossvol_tx::XvStep::RemoveDentry {
-                        parent,
-                        name: name.to_string(),
-                        expect_child: global_child_ino,
-                        parent_update: crossvol_tx::parent_update_code(update),
-                    },
-                    crossvol_tx::XvStep::SetNlink {
-                        ino: global_child_ino,
-                        pre: child_v.nlink,
-                        post,
-                        ctime: Some(kv::backend::KvMetaBackend::now_ns_pub()),
-                    },
-                ],
+                steps,
             };
             crossvol_tx::execute(self, &plan, guards).await?;
             Ok(global_child_ino)

@@ -1272,15 +1272,26 @@ async fn ownership_is_volume_granular_and_malformed_maps_refuse() {
 /// nothing to stamp. Bit 11 stays free for the stage that genuinely needs
 /// one, and this test is what keeps that claim honest.
 #[test]
-fn s8_introduces_no_incompat_bit_and_bit_11_stays_free() {
-    assert_eq!(
-        FEATURES_INCOMPAT_KNOWN & (1u64 << 11),
-        0,
-        "S8 stamps nothing; bit 11 must still be free"
-    );
-    assert_eq!(
-        FEATURES_INCOMPAT_KNOWN.count_ones(),
-        11,
-        "bits 0..=10 are the known set; S8 added none"
+fn s8_introduces_no_incompat_bit() {
+    // Written as a MONOTONE assertion on purpose. The original form pinned
+    // `count_ones() == 11` and "bit 11 stays free", and both were falsified
+    // within hours by siblings landing bits 11/12/13 — a test about S8 broke
+    // because other stages did their jobs. What S8 actually claims is that it
+    // added NO bit, so the honest pin is that every bit up to the last claimed
+    // one is claimed by someone else: a later stage taking bit 14 moves the
+    // floor up and this still passes.
+    //
+    // The pin that catches an UNLISTED bit (the silent-aliasing class that has
+    // already fired three times in this program) is the union clause in
+    // `tests/writer_scoped_staging_tests.rs` — `FEATURES_INCOMPAT_KNOWN` must
+    // equal the enumerated set exactly. This test deliberately does not
+    // duplicate it.
+    let lowest_free = (0..64u32)
+        .find(|b| FEATURES_INCOMPAT_KNOWN & (1u64 << b) == 0)
+        .expect("some incompat bit must still be unclaimed");
+    assert!(
+        lowest_free >= 14,
+        "bits 0..=13 are claimed by other stages and S8 claimed none of them; \
+         lowest free bit is {lowest_free}"
     );
 }

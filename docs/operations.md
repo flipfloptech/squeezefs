@@ -8,6 +8,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
 - [Durability & crash contract](#durability--crash-contract)
   - [Metadata Durability (crash contract)](#metadata-durability-crash-contract)
   - [Single-writer mount guard (guarantee classes)](#single-writer-mount-guard-guarantee-classes)
+  - [Multi-writer data plane (DLM S9)](#multi-writer-data-plane-dlm-stage-s9)
   - [Read-only coherent mounts (`-o ro`)](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers)
   - [Format v3 (CoW KV metadata)](#format-v3-cow-kv-metadata)
   - [Read-only coherent mounts — the stated consistency model](#read-only-coherent-mounts--the-stated-consistency-model-metadata)
@@ -44,7 +45,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
   - [Defragmentation](#defragmentation)
   - [Jobs & distributed execution](#jobs--distributed-execution)
   - [Cluster wire (the one cluster transport)](#cluster-wire-the-one-cluster-transport)
-  - [Metadata function shipping (DLM S8)](#metadata-function-shipping-dlm-s8--built-not-yet-armable)
+  - [Metadata function shipping (DLM S8)](#metadata-function-shipping-dlm-s8)
   - [Membership plane — lease-based liveness (DLM S6)](#membership-plane--lease-based-liveness-dlm-s6)
 - [Observability](#observability)
   - [`df` / statfs semantics](#df--statfs-semantics)
@@ -114,6 +115,12 @@ The v3 metadata engine is single-writer by construction, and the mount enforces 
 | File-backed volume shared cross-host (NFS et al.), or containers with private `/dev` nodes | **Unsupported for concurrent-mount protection** — single-host operation of such volumes remains fully guarded by flock (former) / PR-if-available (latter) |
 | **Read-only mount** (`-o ro` / `--read-only`, any substrate) | **Not a writer, and not an obstacle to one** — guarantee class `reader`. A read-only mount takes NO `flock`, writes NO `writer_claim` and registers NO PR key, so (a) it is admitted while a writer holds the volume — including a *fresh foreign* claim, which refuses a write mount — (b) it never refuses a write mount, in either mount order, and (c) it changes nothing about the rows above: a second WRITER is still refused by exactly the same ladder. It mutates no plane (metadata, block allocation, frees, device reclaim, in-place patch/overwrite are all refused) and the kernel mounts it `MS_RDONLY`. Its *consistency* guarantee — which is a separate question from exclusion — is in [Read-only coherent mounts](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers) |
 
+**DLM S9 changes none of the rows above, deliberately.** The multi-writer data
+plane grants *data* custody to peers; it does not make a second **write mount**
+of one metadata volume admissible, because a co-writer holds no `writer_claim`
+and the guard's fresh-foreign refusal fires first. See
+[Multi-writer data plane](#multi-writer-data-plane-dlm-stage-s9).
+
 #### The DATA plane (DLM stage S7)
 
 The rows above are the **metadata** plane: the guard claims meta volumes, and its reservations cover meta namespaces only. The data plane is fenced separately, and what it *enforces* versus what it only *detects* also depends on the substrate. Design: `docs/pre-rc-engineering-spec.md` §6.7/§7 RES-6; contracts: `tests/dlm_data_fence_tests.rs`.
@@ -121,8 +128,8 @@ The rows above are the **metadata** plane: the guard claims meta volumes, and it
 | Data-plane posture | Substrate | Enforced | Detected |
 |---|---|---|---|
 | **Single-writer** (the default; no `SQUEEZEFS_MULTI_WRITER`) | any | **DMA submission** — every data-plane write passes one authorization point that refuses when this mount's D0 guard is fenced *or* when the submission's **custody epoch** (the durable writer term) is no longer current, so an upload admitted before a custody change can never land after it. Refusals are `EIO` and counted (`data_dma_fence_refusals`, class split `data_dma_epoch_refusals`). Device reclaims (discard/punch) cease permanently on the same latch (`block_free_reclaim_fence_halts`) | A **remote** host's writes to the same data namespace. Nothing device-side stops them; the D0 guard is what keeps a second write mount from existing, and its own guarantee class (the table above) is therefore the real bound |
-| **Multi-writer opt-in** (`SQUEEZEFS_MULTI_WRITER=1`) — PR-capable data namespaces **and** a format carrying incompat bit 11 | NVMe/NVMe-oF with `RESCAP` support | Everything above **plus the device**: a **WERO (Write Exclusive – Registrants Only, rtype 2)** reservation is held on every data namespace for the mount lifetime, so an unregistered — i.e. fenced/preempted — host's writes are rejected **by the namespace**, while every legitimate registrant (the coordinator, enrolled remote job workers) keeps writing. A dead epoch's PR preempt is the **drain proof** that releases its quarantined blocks. Gauge: `data_plane_fence_mode` = 1 | — |
-| **Multi-writer opt-in** on anything else | loop devices (incl. `tests/dev_substrate.sh`'s default), file-backed volumes, any `RESCAP=0` namespace, or a format without bit 11 | **The mount is REFUSED, loudly, naming the namespace or the missing format capability.** Multi-writer over a substrate that can only detect a rogue writer is not a supported configuration (spec §6.7 "On external consensus"). Nothing stamps bit 11 today (ruling D9 — the capability lands with DLM S8/S9), so this row is where every volume currently falls | — |
+| **Multi-writer opt-in** (`SQUEEZEFS_MULTI_WRITER=1`) — PR-capable data namespaces, a format carrying **all six** capability bits, and an armed membership plane | NVMe/NVMe-oF with `RESCAP` support | Everything above **plus the device**: a **WERO (Write Exclusive – Registrants Only, rtype 2)** reservation is held on every data namespace for the mount lifetime, so an unregistered — i.e. fenced/preempted — host's writes are rejected **by the namespace**, while every legitimate registrant (the coordinator, enrolled remote job workers, co-writers) keeps writing. A dead epoch's PR preempt is the **drain proof** that releases its quarantined blocks. Gauge: `data_plane_fence_mode` = 1. Since **DLM S9** this row also carries remote write custody — see [Multi-writer data plane](#multi-writer-data-plane-dlm-stage-s9) | — |
+| **Multi-writer opt-in** on anything else | loop devices (incl. `tests/dev_substrate.sh`'s default), file-backed volumes, any `RESCAP=0` namespace, a format missing one of the six bits, a membership plane that is off, or `SQUEEZEFS_MW_BIND=off` | **The mount is REFUSED, loudly, naming the namespace, the missing bit (and its offline stamping path), or the absent plane.** Multi-writer over a substrate that can only detect a rogue writer is not a supported configuration (spec §6.7 "On external consensus"). Nothing stamps the capability bits today (ruling D9), so this row is where **every** volume currently falls | — |
 
 **Dead-epoch blocks are quarantined, not reused.** When a custody epoch dies (a remote worker's lease TTL fires, a client is proven dead), its blocks enter a **do-not-reallocate quarantine**: they are taken out of the free list, a terminal free of one *defers* its free-list publish, and only a **drain proof** releases them (the landed WERO preempt on a PR substrate; recovery's proof of death otherwise). Live gauge `dlm_quarantined_offsets`, flow `dlm_quarantine_releases`. Operational consequence, by design: **quarantined space is unavailable until the proof arrives** — a store with no free space outside the quarantine refuses `ENOSPC` rather than handing a possibly-live zombie's offset to a new owner. On a detection-grade substrate the cohort waits for the next mount's recovery walk (the job wire's documented `deferred-reclaim` class), so `dlm_quarantined_offsets` staying high there is expected, not a leak.
 
@@ -141,6 +148,68 @@ The rows above are the **metadata** plane: the guard claims meta volumes, and it
 **Fabric host identity (normative).** `/etc/nvme/hostnqn` and `/etc/nvme/hostid` are the **connect-time identity inputs**: created-if-missing by the `nvmeof connect` path, passed to nvme-cli and the `/dev/nvme-fabrics` fallback string, and read by the guard's `host_identity()`. They are **never the match authority**: when the register ladder must decide whether an existing PR registration is its own dead incarnation's, it matches on **`wire_host_id()`** — the host identifier the device itself reports for the live association (Get-Features FID 0x81) — because the wire identity was **measured diverging from the `/etc/nvme` files** on a real box (S1 session, 2026-07-17). Practical consequences: editing `/etc/nvme/hostid` changes what future connects present, not what the guard matches against; and only same-host stale keys (proven via the wire identity) are ever unregistered — foreign registrations always stay preempt/TTL/`claim clear` territory.
 
 Live signals on the `.stats` inode: `writer_guard_mode` per volume (`flock+pr` = enforcement-grade | `flock+claim` = detection-grade | `flock` = a WRITE mount degraded read-only by unknown-ro feature bits | `reader` = an `-o ro` mount, which holds no lock and claims nothing) — alert on fleet drift; `writer_guard_fenced` (a fenced/usurped holder fail-stopped — working as designed, always investigate); `writer_guard_pr_reacquires` (the target dropped reservations, e.g. a PTPL-less power cycle — audit the fabric). Data-plane twins (DLM S7): `data_plane_fence_mode` (1 = device-enforced WERO held on every data namespace | 0 = detection grade), `data_dma_fence_refusals` and its `data_dma_epoch_refusals` split (**both must stay 0** — growth means a fenced or custody-stale writer tried to submit and was stopped; read beside `writer_guard_fenced`), and `dlm_quarantined_offsets` / `dlm_quarantine_releases` (dead-epoch blocks awaiting, and released by, a drain proof).
+
+#### Multi-writer data plane (DLM stage S9)
+
+**Status: the mechanism ships and the AUTHORITY half is production-shaped. It
+cannot be armed on a field volume yet, and the two reasons are named below —
+do not plan a deployment around this section.** Design:
+`docs/pre-rc-engineering-spec.md` §6.9 S9 / §6.7; contracts
+`tests/dlm_multi_writer_tests.rs`.
+
+What it is: `SQUEEZEFS_MULTI_WRITER=1` arms three planes together —
+metadata ownership (S8), the data-plane custody fence and its WERO hold (S7),
+and **remote write custody**. A co-writer asks this mount's authority for
+custody of a file (or one byte range), receives a **fencing token and a
+custody epoch**, and then writes the bytes **itself, straight to the shared
+namespace**. Only custody travels the wire; data never does.
+
+| Question | Answer |
+|---|---|
+| What is granted | A lease the AUTHORITY holds on the co-writer's behalf — whole-file, or one `[start,end)` span. Two co-writers may hold **disjoint ranges of one file** at the same time; an overlapping exclusive span is **refused**, named, inside the caller's own wait budget |
+| What authorizes a co-writer's DMA | Its **custody epoch** = `(durable writer term << 40) | custody generation`. Losing a grant **advances the generation**, so every submission authorized under the old one is refused at the single authorization point (`data_dma_epoch_refusals`) while the mount stays alive |
+| How a revocation reaches the co-writer | **At its next renewal — this plane has no push backchannel.** The window is bounded twice: by the co-writer's own `T_self` (strictly earlier than the authority's TTL, at which point it fail-stops its own data custody), and by the **device**, which rejects a preempted host's writes. A revoked co-writer's *belief* can outlive the revoke by up to one renewal cadence; its *writes* cannot |
+| What happens to a dead co-writer's blocks | The offsets it **declared in-flight on its last renewal** enter the S7 do-not-reallocate quarantine under one dead epoch. Release requires a **drain proof**: the landed WERO preempt of its registrant key, or an attested proof of death. A co-writer that published no registrant key can only be released by attestation — its space stays honestly unavailable (`dlm_quarantined_offsets`) |
+| What the authority does on failover | A successor **bumps the durable term before arming** (an equal era is refused), opens a **grace window** that admits reclaim and refuses conflicting fresh acquires (`dlm_custody_grace_conflicts` must stay 0 on a healthy failover), and every pre-failover token is stale by construction |
+
+**The format must say it can take a second writer.** The arm requires **six**
+`features_incompat` bits, each one a §6.2 single-writer assumption whose
+absence makes a second writer *unsound* — 7 (durable writer term), 9 (durable
+block refcounts), 10 (writer-scoped staging), 11 (multi-writer data), 13
+(`offset ‖ incarnation` block keys), 14 (the claim-set record). Bits 8 and 12
+are deliberately **not** required: they express two appenders on ONE volume,
+and ownership granularity is the volume. **S9 introduces no new bit.**
+
+**The two things standing between this and a live cluster** (stated here
+because an operator will otherwise discover them as a refusal):
+
+1. **Nothing stamps the capability bits** (ruling D9). Every field volume
+   fails the format rung. The Phase-8 batched reformat window is where they
+   land.
+2. **The D0 guard still refuses a second write mount on every substrate.** The
+   metadata guarantee-class table above is **unchanged by S9** — deliberately.
+   A co-writer holds no `writer_claim`, and the guard's fresh-foreign refusal
+   fires before the mount can open the volumes, so the co-writer posture is
+   unreachable until that gate admits a co-member of an engaged claim set
+   (§6.2 item 7's consumer half). What ships today is the half that can be
+   shipped safely: a mount that **serves** custody and the publish path to
+   peers.
+
+Operator surface: `SQUEEZEFS_MULTI_WRITER=1` (arm; refuses loudly, naming the
+missing piece), `SQUEEZEFS_MW_BIND` (`auto` — the default — / `addr:port` /
+`off`, where `off` refuses rather than arming an inert mount). Live signals on
+`.stats`: `dlm_custody.mode` (`off` | `authority` | `co-writer` | `both`),
+`dlm_custody_held`, `dlm_custody_grants` / `_renewals` / `_releases` /
+`_conflicts`, `dlm_revokes_issued` / `_expired`, `dlm_custody_unknown_leases`
+(the pull-based revocation channel firing), `dlm_custody_self_fences`,
+`dlm_custody_quarantined_offsets` / `_drain_proofs`,
+`dlm_custody_generation` / `dlm_custody_epoch_advances`,
+`dlm_custody_phase_ns` (rtt / arbitrate / adopt / renew), and
+`meta_ship_publish.{shipped,local,served,refusals,owner_panics}` — where
+**`refusals` and `owner_panics` must stay 0** on an armed mount (a refusal
+means the ownership plane was armed without its publish half, which is
+refused rather than executed locally). Every one of these is 0 with
+`mode = off`, which is every mount that ships.
 
 ### Read-only coherent mounts (`-o ro`) — one writer plus N readers
 
@@ -772,12 +841,16 @@ the same exchange across a real network costs tens to hundreds — and the
 metadata-op cost of a synchronous cross-mount hop scales with that number, not
 with framing. Plan cluster topology around round-trip latency first.
 
-### Metadata function shipping (DLM S8) — built, not yet armable
+### Metadata function shipping (DLM S8)
 
-**Status: the mechanism ships; nothing arms it, and no mount option exposes
-it.** There is no operator action here yet. This section exists so the
-`.stats` fields, the knobs and the refusal texts are documented where an
-operator meets them, not so a deployment can turn it on.
+**Status: the mechanism ships, and since DLM S9 it has an arm —
+`SQUEEZEFS_MULTI_WRITER=1` (see
+[Multi-writer data plane](#multi-writer-data-plane-dlm-stage-s9)), which arms
+ownership, the data-plane fence and remote write custody together or refuses
+naming the missing piece. On a field volume that arm still refuses (nothing
+stamps the capability bits — ruling D9), so there is no operator action here
+yet.** This section documents the `.stats` fields, the knobs and the refusal
+texts where an operator meets them.
 
 What it is: when a metadata volume is owned by **another node**, a metadata
 operation on that volume's inodes **travels to the owner and executes there**
@@ -910,7 +983,7 @@ A mounted filesystem exposes live daemon metrics as JSON on the virtual **`.stat
 
 **`.stats` / `.config` access (VAL-7a).** Both virtual inodes are **mode `0400` owned by the mount uid** (with `-o default_permissions` always set, the kernel enforces that): their payload is a map of the daemon's private state — every backing-device path, every staging directory, the read-cache census and per-inode write custody — so on an `--allow-other` mount they must not be readable by co-tenants. Read them as the mount owner or as root.
 
-**Lock-manager fields (`dlm_*`).** `dlm_mode` is the lock authority's mode: **`solo`** means this daemon is the lock master for every metadata slot, which is the only mode that ships — so `dlm_rpcs` (lock operations needing a remote slot owner) is **0 by construction and must stay 0**. `dlm_rpcs` keeps that meaning exactly: it counts **lock** round trips, never metadata ones — the metadata face is `meta_ship.dlm_rpcs_meta` (see [Metadata function shipping](#metadata-function-shipping-dlm-s8--built-not-yet-armable)). Nonzero on a single-node mount is a bug, never load: the lock refused rather than granting custody its owner never issued, and the daemon logged one loud line per event naming the object and its home slot. `dlm_term` is the durable writer era every fencing token this mount mints carries (the process-wide maximum; the per-volume face is `writer_guard_term`) — it must be strictly greater than any predecessor's on the same volume set, and `0` means the volumes predate incompat bit 7. Cross-**mount** write exclusion is not this subsystem's job in `solo` mode — it is the single-writer mount guard's (see [Single-writer mount guard](#single-writer-mount-guard-guarantee-classes)).
+**Lock-manager fields (`dlm_*`).** `dlm_mode` is the lock authority's mode: **`solo`** means this daemon is the lock master for every metadata slot, which is the only mode that ships — so `dlm_rpcs` (lock operations needing a remote slot owner) is **0 by construction and must stay 0**. `dlm_rpcs` keeps that meaning exactly: it counts **lock** round trips, never metadata ones — the metadata face is `meta_ship.dlm_rpcs_meta` (see [Metadata function shipping](#metadata-function-shipping-dlm-s8)). Nonzero on a single-node mount is a bug, never load: the lock refused rather than granting custody its owner never issued, and the daemon logged one loud line per event naming the object and its home slot. `dlm_term` is the durable writer era every fencing token this mount mints carries (the process-wide maximum; the per-volume face is `writer_guard_term`) — it must be strictly greater than any predecessor's on the same volume set, and `0` means the volumes predate incompat bit 7. Cross-**mount** write exclusion is not this subsystem's job in `solo` mode — it is the single-writer mount guard's (see [Single-writer mount guard](#single-writer-mount-guard-guarantee-classes)). Since **DLM S9** `dlm_rpcs` counts a *travelling* acquire wherever a custody client is armed, and the remote-custody ledger lives in the `dlm_custody` object beside it (`mode`, `dlm_custody_held`, the grant/renew/revoke counters, `dlm_custody_generation`) — all `0`/`off` on every mount that ships; the field guide is [Multi-writer data plane](#multi-writer-data-plane-dlm-stage-s9).
 
 **Membership fields (`membership_*`, DLM S6).** `membership_mode` is `off` (no plane armed — the default), `owner` (this mount is the lease authority) or `member`. On an owner, `membership_members` / `membership_readers` / `membership_writers` are the live census, `membership_lease_ttl_ms` and `membership_self_deadline_ms` are the two clocks as armed, `membership_grace_remaining_ms` is a failover window in progress, and `membership_min_acked_free_epoch` is the freed-offset epoch every live member has acknowledged passing. The counters: `membership_renewals` is the heartbeat itself — it is the counter that used to be one journal transaction per client per 10 s, so it grows while `meta_kv_journal_entries` does not, which is the whole point; `membership_registration_commits` is bounded by mounts and membership changes, so growth proportional to renewals is a regression, not load; `membership_self_fences` **should stay 0** — nonzero means members are fencing their own objects because renewals are not completing (availability lost, divergence prevented); `membership_renew_refusals`, `membership_evictions`, `membership_grace_refusals`, `membership_grace_reclaims` and `membership_census_serves` are the refusal, revoke, failover and read-side ledgers.
 

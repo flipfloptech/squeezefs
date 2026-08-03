@@ -454,10 +454,19 @@ pub fn parse_proc_stat_cpu(stat: &str) -> Option<usize> {
     tail.split_whitespace().nth(36)?.parse().ok()
 }
 
-/// Pure env-lever form (`SQUEEZEFS_NUMA`): default ON; only an explicit
-/// `0` disables. Unparsable values keep the default.
+/// Pure env-lever form (`SQUEEZEFS_NUMA`): default ON; any explicit false
+/// spelling disables. Unparsable values keep the default (the placement
+/// machinery must never refuse a mount over a typo — the daemon's startup
+/// gate does that, loudly, before this is ever consulted).
+///
+/// ENG-10: the spelling set is the shared one (`0/false/no/off` — not just
+/// the historical literal `"0"`), so this lever obeys the same convention
+/// as every other knob.
 pub fn env_enabled_from(v: Option<&str>) -> bool {
-    !matches!(v.map(str::trim), Some("0"))
+    crate::env_knob_core::parse_bool("SQUEEZEFS_NUMA", v)
+        .ok()
+        .flatten()
+        .unwrap_or(true)
 }
 
 /// Process-wide cached topology + env lever (read once — placement

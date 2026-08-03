@@ -25,6 +25,11 @@
 //! commit (design KD-7) — explicitly **not** a stable ABI.
 
 pub mod cqe_core;
+/// The ONE env-knob parsing convention (ENG-10) — pure, dependency-free,
+/// and `#[path]`-shared into the root crate, the fuse3 fork and the
+/// preload shim (the `numa_core`/`thp` production-sharing precedent), so
+/// all three agree on what a knob VALUE means.
+pub mod env_knob_core;
 pub mod layout;
 pub mod ring_core;
 pub mod sizing;

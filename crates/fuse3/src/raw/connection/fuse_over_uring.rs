@@ -1079,9 +1079,13 @@ pub struct FuseOverUring {
 pub fn transport_debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("SQUEEZEFS_TRANSPORT_DEBUG")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+        crate::env_knob_core::parse_bool(
+            "SQUEEZEFS_TRANSPORT_DEBUG",
+            std::env::var("SQUEEZEFS_TRANSPORT_DEBUG").ok().as_deref(),
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(false)
     })
 }
 

@@ -21,6 +21,15 @@ pub mod numa_core;
 // phase histograms bucket identically by construction.
 #[path = "../crates/squeezefs-ipc/src/latency_core.rs"]
 pub mod latency_core;
+// The ONE env-knob parsing convention (ENG-10) — canonical file in the
+// squeezefs-ipc tree, `#[path]`-included here, by the fuse3 fork and by
+// the preload shim (the `numa_core`/`thp` production-sharing precedent, and
+// required because the shared `numa_core` itself parses a knob: one
+// `crate::env_knob_core` path must resolve in every including crate).
+// Pure functions, no state — the duplicate type identities are inert.
+// `src/env_knobs.rs` is the registry + startup refusal gate over it.
+#[path = "../crates/squeezefs-ipc/src/env_knob_core.rs"]
+pub mod env_knob_core;
 pub mod nvme_dev;
 #[path = "../crates/squeezefs-ipc/src/thp.rs"]
 pub mod thp;
@@ -45,6 +54,9 @@ pub mod detached;
 /// `NvmeBlockDev` worker. Test-only; inert until armed.
 pub mod dev_power_cut;
 pub mod dlm;
+/// ENG-10: the env-knob registry + the startup refusal gate. The parsing
+/// convention itself lives in the `#[path]`-shared `env_knob_core`.
+pub mod env_knobs;
 pub mod error;
 pub mod fsck;
 pub mod fuse_client;

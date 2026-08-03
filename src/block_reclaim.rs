@@ -167,9 +167,7 @@ fn env_u64(key: &str, default: u64, lo: u64, hi: u64) -> u64 {
 fn elision_cell() -> &'static AtomicBool {
     static CELL: std::sync::OnceLock<AtomicBool> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {
-        let on = std::env::var("SQUEEZEFS_DISCARD_ELISION")
-            .map(|v| v.trim() != "0")
-            .unwrap_or(true);
+        let on = crate::env_knobs::bool_knob("SQUEEZEFS_DISCARD_ELISION", true);
         AtomicBool::new(on)
     })
 }

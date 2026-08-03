@@ -70,6 +70,14 @@ pub mod numa_core;
 // histograms bucket identically by construction.
 #[path = "../../squeezefs-ipc/src/latency_core.rs"]
 pub mod latency_core;
+// The ONE env-knob parsing convention (ENG-10) — canonical file in the
+// squeezefs-ipc tree, `#[path]`-included here (this fork cannot depend on
+// that crate: it is its own excluded workspace root) and by the root crate
+// and the preload shim. Transport knobs obey the same value law as daemon
+// knobs, and the shared `numa_core` above resolves `crate::env_knob_core`
+// through this include.
+#[path = "../../squeezefs-ipc/src/env_knob_core.rs"]
+pub mod env_knob_core;
 pub mod path;
 pub mod raw;
 

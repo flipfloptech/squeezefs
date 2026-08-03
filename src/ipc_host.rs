@@ -120,6 +120,35 @@ fn service_spin_window() -> Duration {
     service_spin_window_from(std::env::var("SQUEEZEFS_IPC_SPIN_US").ok().as_deref())
 }
 
+/// The message the daemon logs exactly once when the KD-7 skew gate has
+/// been relaxed (ENG-11). Pure so the contract test can assert the text
+/// without arming the lever.
+pub fn allow_dev_notice() -> &'static str {
+    "SQUEEZEFS_IPC_ALLOW_DEV is set — the KD-7 build-commit skew gate is \
+     RELAXED for this mount (degenerate `unknown`/`-dirty` identities will be \
+     admitted, counted in ipc_binds_dev_override). Dev boxes only: a \
+     mismatched daemon/shim pair is undefined behavior."
+}
+
+/// `SQUEEZEFS_IPC_ALLOW_DEV` under the shared ENG-10 convention, announced
+/// ONCE per process on engagement.
+///
+/// ENG-11: this knob relaxed the skew gate **silently on both sides** — the
+/// only trace was a per-admission warning that never fires until a
+/// degenerate pair actually binds, so a production mount could carry the
+/// relaxed posture invisibly. `SQUEEZEFS_FUSE_NO_KILLPRIV` was the good
+/// precedent (it logs when it disables the negotiation); this matches it,
+/// and the shim half does the same on its side
+/// (`squeezefs_preload::session::allow_dev_lever`).
+pub fn allow_dev_lever() -> bool {
+    let on = crate::env_knobs::bool_knob("SQUEEZEFS_IPC_ALLOW_DEV", false);
+    if on {
+        static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+        ANNOUNCED.call_once(|| log::warn!("{}", allow_dev_notice()));
+    }
+    on
+}
+
 /// Pure sizing form (unit-pinned): the 2026-07-26 reap-economy A/B
 /// adjudicated the DEFAULT as 0 (`1508ea9` — every nonzero ambient
 /// window taxed the protected sync lane), but the landed code kept the
@@ -2380,12 +2409,7 @@ fn count_refusal(class: RefuseClass) {
 /// huge-page A/B lever, read once per process.
 fn arena_thp_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !matches!(
-            std::env::var("SQUEEZEFS_IPC_ARENA_THP").ok().as_deref(),
-            Some("0")
-        )
-    })
+    *ENABLED.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_IPC_ARENA_THP", true))
 }
 
 /// Create + seed + seal one session memfd, and map it daemon-side.

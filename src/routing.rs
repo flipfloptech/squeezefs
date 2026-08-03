@@ -593,9 +593,7 @@ impl PlacementTable {
 fn rewrite_shadow_cell() -> &'static std::sync::atomic::AtomicBool {
     static CELL: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {
-        let on = std::env::var("SQUEEZEFS_REWRITE_SHADOW")
-            .map(|v| v.trim() != "0")
-            .unwrap_or(true);
+        let on = crate::env_knobs::bool_knob("SQUEEZEFS_REWRITE_SHADOW", true);
         std::sync::atomic::AtomicBool::new(on)
     })
 }
@@ -4067,17 +4065,17 @@ impl DataRouter {
         // accounting + contention-scaled windows + AIMD collapse (pinned in
         // tests/read_prefetch_pipeline_tests.rs phase C/D — the spiral
         // shape stays bounded < 2x unique fetches by construction).
-        let tier_admission = match std::env::var("SQUEEZEFS_READ_TIER_ADMISSION")
-            .as_deref()
-            .unwrap_or("second-touch")
-        {
+        // ENG-10: the startup gate refuses an out-of-set value before the
+        // daemon gets here; an in-process bad value is announced and the
+        // documented default stands (never a mount-killing panic).
+        let tier_admission = match crate::env_knobs::enum_knob(
+            "SQUEEZEFS_READ_TIER_ADMISSION",
+            &["always", "second-touch", "never"],
+            "second-touch",
+        ) {
             "always" => TierAdmission::Always,
-            "second-touch" => TierAdmission::SecondTouch,
             "never" => TierAdmission::Never,
-            other => panic!(
-                "SQUEEZEFS_READ_TIER_ADMISSION must be one of \
-                 always|second-touch|never (got {other:?})"
-            ),
+            _ => TierAdmission::SecondTouch,
         };
         let tier_admission =
             if tier_admission == TierAdmission::SecondTouch && cache.hot_block.max_bytes() == 0 {
@@ -4090,41 +4088,25 @@ impl DataRouter {
                 tier_admission
             };
 
-        // §5.5 pipeline knobs (env-resolved once; unrecognized values
-        // refuse loud, forward-only).
-        let prefetch_window_override = match std::env::var("SQUEEZEFS_READ_PREFETCH_WINDOW") {
-            Ok(v) => Some(
-                v.trim()
-                    .parse::<u32>()
-                    .unwrap_or_else(|e| {
-                        panic!("SQUEEZEFS_READ_PREFETCH_WINDOW must be an integer: {e}")
-                    })
-                    .min(4096),
-            ),
-            Err(_) => None,
-        };
-        let prefetch_share_pct = match std::env::var("SQUEEZEFS_READ_PREFETCH_SHARE_PCT") {
-            Ok(v) => v.trim().parse::<u64>().unwrap_or_else(|e| {
-                panic!("SQUEEZEFS_READ_PREFETCH_SHARE_PCT must be an integer percent: {e}")
-            }),
-            Err(_) => 50,
-        }
-        .clamp(1, 100);
+        // §5.5 pipeline knobs (env-resolved once). ENG-10: a malformed
+        // value is refused by the startup gate (`src/env_knobs.rs`) before
+        // the daemon reaches this constructor — these readers no longer
+        // `panic!` (a panic inside a mount-time constructor is `abort` under
+        // the release profile's panic="abort", and killed the mount over a
+        // typo); an in-process malformed value is announced and the
+        // documented default stands.
+        let prefetch_window_override =
+            crate::env_knobs::opt_int_knob::<u32>("SQUEEZEFS_READ_PREFETCH_WINDOW")
+                .map(|v| v.min(4096));
+        let prefetch_share_pct =
+            crate::env_knobs::int_knob::<u64>("SQUEEZEFS_READ_PREFETCH_SHARE_PCT", 50)
+                .clamp(1, 100);
         // §5.6 ranged-read threshold (0 disables — the kill switch).
-        let ranged_threshold = match std::env::var("SQUEEZEFS_READ_RANGED_THRESHOLD") {
-            Ok(v) => v.trim().parse::<u64>().unwrap_or_else(|e| {
-                panic!("SQUEEZEFS_READ_RANGED_THRESHOLD must be an integer byte count: {e}")
-            }),
-            Err(_) => 262_144,
-        };
+        let ranged_threshold =
+            crate::env_knobs::int_knob::<u64>("SQUEEZEFS_READ_RANGED_THRESHOLD", 262_144);
         // Hybrid I/O diagnostic escape (env half; `-o direct_device_true`
         // sets it post-construction from `start_mount`). "1"/"true" arms.
-        let direct_device_true = std::env::var("SQUEEZEFS_DIRECT_DEVICE_TRUE")
-            .map(|v| {
-                let v = v.trim();
-                v == "1" || v.eq_ignore_ascii_case("true")
-            })
-            .unwrap_or(false);
+        let direct_device_true = crate::env_knobs::bool_knob("SQUEEZEFS_DIRECT_DEVICE_TRUE", false);
         if direct_device_true {
             log::info!(
                 "Hybrid I/O escape armed (SQUEEZEFS_DIRECT_DEVICE_TRUE): O_DIRECT reads \
@@ -7234,16 +7216,17 @@ impl DataRouter {
         } else {
             "backend/cached"
         };
-        let forensics_op: Option<String> = if std::env::var("SQUEEZEFS_FREE_FORENSICS").is_ok() {
-            Some(match &op {
-                BlockMapOp::Merge(e) => format!("Merge({e:?})"),
-                BlockMapOp::MergeExpected(e) => format!("MergeExpected({e:?})"),
-                BlockMapOp::TruncateFrom { new_size } => format!("TruncateFrom({new_size})"),
-                BlockMapOp::RemoveBlocks(idxs) => format!("RemoveBlocks({idxs:?})"),
-            })
-        } else {
-            None
-        };
+        let forensics_op: Option<String> =
+            if crate::env_knobs::bool_knob("SQUEEZEFS_FREE_FORENSICS", false) {
+                Some(match &op {
+                    BlockMapOp::Merge(e) => format!("Merge({e:?})"),
+                    BlockMapOp::MergeExpected(e) => format!("MergeExpected({e:?})"),
+                    BlockMapOp::TruncateFrom { new_size } => format!("TruncateFrom({new_size})"),
+                    BlockMapOp::RemoveBlocks(idxs) => format!("RemoveBlocks({idxs:?})"),
+                })
+            } else {
+                None
+            };
 
         // CoW publish (item A): take the Arc, mutate a uniquely-owned copy
         // via `make_mut` — held reader snapshots keep the exact map they

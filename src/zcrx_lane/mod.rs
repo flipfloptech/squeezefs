@@ -31,13 +31,13 @@ use std::sync::Arc;
 
 /// Opt-in master switch (design §6).
 pub fn lane_env_armed() -> bool {
-    std::env::var("SQUEEZEFS_ZCRX_LANE").is_ok_and(|v| v == "1")
+    crate::env_knobs::bool_knob("SQUEEZEFS_ZCRX_LANE", false)
 }
 
 /// Test/measurement seam: allow the classic-recv backend to arm (copy-parity
 /// with the kernel path — the PR Z1 contract venue; counted, never a win).
 pub fn lane_force_copy_backend() -> bool {
-    std::env::var("SQUEEZEFS_ZCRX_LANE_FORCE_COPY").is_ok_and(|v| v == "1")
+    crate::env_knobs::bool_knob("SQUEEZEFS_ZCRX_LANE_FORCE_COPY", false)
 }
 
 /// Test seam (PR Z2 contract venue): arm the AREA backend with the socket
@@ -45,7 +45,7 @@ pub fn lane_force_copy_backend() -> bool {
 /// refill / gather machinery over classic delivery. Never a product
 /// posture (the real backend's delivery is RECV_ZC).
 pub fn lane_area_sim_backend() -> bool {
-    std::env::var("SQUEEZEFS_ZCRX_LANE_AREA_SIM").is_ok_and(|v| v == "1")
+    crate::env_knobs::bool_knob("SQUEEZEFS_ZCRX_LANE_AREA_SIM", false)
 }
 
 /// R5 arm gate (design §7): Red blocks NEW lane arms (the area is a fixed

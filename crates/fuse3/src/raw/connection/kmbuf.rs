@@ -249,19 +249,28 @@ pub enum TransportBufferMode {
     BufRing,
 }
 
+/// One boolean knob read under the shared ENG-10 convention: any of
+/// `1/true/yes/on` / `0/false/no/off` (case-insensitive), absent or
+/// malformed keeps `default` — a transport lever must never abort a mount
+/// over a typo, and the daemon's startup gate has already refused one.
+fn env_bool(key: &str, default: bool) -> bool {
+    crate::env_knob_core::parse_bool(key, std::env::var(key).ok().as_deref())
+        .ok()
+        .flatten()
+        .unwrap_or(default)
+}
+
 /// Resolve the mode once per session: the capability probe gated by the
 /// `SQUEEZEFS_FUSE_KMBUF` lever (`0` ⇒ UserEnts — the A/B lever; the
 /// probe and gauges stay alive on both sides). `SQUEEZEFS_FUSE_ZC=1` is
 /// recognized and loudly declined (negotiation face present; the zc
 /// serve integration is the staged follow-on).
 pub fn resolve_buffer_mode() -> TransportBufferMode {
-    let lever_off = std::env::var("SQUEEZEFS_FUSE_KMBUF")
-        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
-        .unwrap_or(false);
-    if std::env::var("SQUEEZEFS_FUSE_ZC")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    // ENG-10: one boolean convention — `0/false/no/off` all disable, and a
+    // malformed value keeps the documented default (announced by the
+    // daemon's startup gate, which refuses it outright).
+    let lever_off = !env_bool("SQUEEZEFS_FUSE_KMBUF", true);
+    if env_bool("SQUEEZEFS_FUSE_ZC", false) {
         warn!(
             "SQUEEZEFS_FUSE_ZC=1: the FUSE_URING_ZERO_COPY negotiation face is \
              present but the zc serve integration is the staged follow-on \

@@ -515,8 +515,11 @@ SQUEEZEFS_META_NODE_CACHE_MB=1024 \
 SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES=8192 \
   ./target/release/squeezefs mount …
 
-# Inode-reclaim group-commit batch size (default 64):
-SQUEEZEFS_RECLAIM_BATCH=128 ./target/release/squeezefs mount …
+# Inode-reclaim group-commit batch size (default 64). The family was
+# renamed out of the block-reclaim prefix (ENG-10): the old
+# SQUEEZEFS_RECLAIM_BATCH / _BATCH_WINDOW_MS / SQUEEZEFS_RECLAIM_CONCURRENCY
+# spellings now refuse the mount loudly, naming these:
+SQUEEZEFS_INODE_RECLAIM_BATCH=128 ./target/release/squeezefs mount …
 
 # Read-path knobs (defaults are the measured sweet spot — see docs/operations.md
 # -> "Read-path tuning" and docs/design-read-path.md). Examples:

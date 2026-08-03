@@ -17,6 +17,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
 - [Breaking changes & migration notes](#breaking-changes--migration-notes)
 - [Removed verbs & flags](#removed-verbs--flags)
 - [Configuration reference](#configuration-reference)
+  - [Environment knobs — the parsing convention](#environment-knobs--the-parsing-convention)
   - [SqueezeFS URI scheme](#squeezefs-uri-scheme)
   - [Format (`squeezefs format`)](#format-squeezefs-format)
   - [Mount (`squeezefs mount`)](#mount-squeezefs-mount)
@@ -88,7 +89,7 @@ SqueezeFS metadata is **format v3** (CoW KV) — the only supported metadata for
 **Acked durability** (`fsync`/`fsyncdir` returning success) is carried solely by post-apply coalesced `fdatasync` barriers — exactly one physical barrier per fsync.
 
 - `SQUEEZEFS_META_FLUSH_INTERVAL_MS`: deferred metadata durability window in ms (default `50`); `0` = strict sync-on-commit — every metadata commit returns only after a post-apply device barrier. Legacy alias `SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS` is honored; the new name wins if both are set.
-- `SQUEEZEFS_RECLAIM_BATCH`: inode-reclaim group-commit batch size (default `64`, clamp 1–1024).
+- `SQUEEZEFS_INODE_RECLAIM_BATCH`: inode-reclaim group-commit batch size (default `64`, clamp 1–1024), with `SQUEEZEFS_INODE_RECLAIM_WINDOW_MS` (default `20`) and `SQUEEZEFS_INODE_RECLAIM_CONCURRENCY` (default `max(4, cpus)`). Renamed out of the unrelated **block**-reclaim prefix (ENG-10 — `SQUEEZEFS_RECLAIM_BATCH` was a strict prefix of `SQUEEZEFS_RECLAIM_BATCH_BLOCKS`); the three old spellings refuse the process loudly, naming these successors.
 - `SQUEEZEFS_META_COMMIT_BATCH_TXS` / `SQUEEZEFS_META_COMMIT_BATCH_BYTES`: per-volume commit-conveyor batch caps (defaults derived since 2026-08-04: `max(64, cpus × 2)` transactions / `max(256 KiB, ring/16)` — floors are the shipped M7 posture; explicit env wins verbatim and bytes are clamped to the journal ring's admissible capacity). Group commit batches admission, locking, the journal write, and the barrier across concurrent transactions — **never the atomicity unit**: one transaction stays one checksummed journal entry (design `docs/design-metadata-throughput.md` §5.5). Watch `meta_commit_group_size` on the `.stats` inode; a strict-mode median ≈ 1 under concurrent writers means batching regressed.
 - `SQUEEZEFS_OP_PROFILE=1`: per-op FUSE phase histograms (`fuse_op_phase_ns`, `fuse_create_under_lock_ns`) on the `.stats` inode — diagnostics for metadata-latency attribution. Off by default; zero per-op cost when off.
 
@@ -244,6 +245,73 @@ Kept here so stale scripts fail comprehensibly:
 > **NVMe-oF verb migration (2026-07-17, target-management program PR 2/N2** — `docs/design-nvmeof-target-management.md` §API): the whole `squeezefs storage nvmeof <verb>` surface **moved to the top-level `squeezefs nvmeof <verb>`**, and within it: `share --spdk`/`unshare --spdk` → `--target-stack {spdk|nvmet}` (default spdk; `unshare` now resolves the stack from the share ledger, never a flag); `restore-shares` → `restore` (and it works — the old registry truncated itself to `[]` on every root invocation, so share persistence had **never** worked; a pre-existing `/etc/squeezefs/nvmeof_shares.json` is retired to `.retired-by-rebuild` on the first mutating verb, and pre-rebuild live shares surface in `list` as foreign/unmanaged — as of milestone **N4b** the managed exit is **`squeezefs nvmeof adopt <subnqn>`**, which absorbs the live share into the ledger with `adopted_from: pre-rebuild` provenance and zero serving interruption; manual removal-first + re-share remains the documented fallback for shapes adopt refuses); `spdk-install`/`spdk-setup`/`spdk-start` → `nvmeof target install/setup/start` (live as of milestone N3, joined by the new `target stop`/`status`/`systemd-unit`; SPDK *sharing* went live with milestone **N4** — the default stack shares for real, and the interim loud-fail message is gone); `spdk-bind`/`spdk-unbind` **deleted** (PCIe vfio passthrough backing is a future program — v1 serves kernel block nodes and files, `bdev_aio` on the SPDK stack); share's silent 1 GiB sparse auto-create on a missing path **deleted** (refuse loud; `--create-size <sz>` is the explicit opt-in).
 
 ## Configuration reference
+
+### Environment knobs — the parsing convention
+
+Every `SQUEEZEFS_*` environment knob obeys **one** convention (ENG-10). The
+authoritative list — name, accepted values, admissible range, default, and one
+line of purpose for each — is the registry in **`src/env_knobs.rs`**, which a
+gate test ties to the code: a knob that exists in the source but not in the
+registry fails the build, so a new knob cannot ship undocumented. The
+subsystem sections below cover the knobs an operator normally touches; the
+registry covers all of them, including the test seams.
+
+The laws:
+
+1. **Unset, empty, or whitespace-only means absent.** `SQUEEZEFS_X=` is "not
+   set", never "set to garbage".
+2. **Explicit values win verbatim**, then percentage forms, then the derived
+   default (`SQUEEZEFS_*_MAX` > `SQUEEZEFS_*_PCT` > derivation).
+3. **Booleans have one spelling set**: `1`/`true`/`yes`/`on` enable,
+   `0`/`false`/`no`/`off` disable, case-insensitive. This applies to the knobs
+   whose default is ON as well — `SQUEEZEFS_NUMA=off` and `SQUEEZEFS_NUMA=0`
+   are the same thing. (Before ENG-10, 19 flags were *presence*-based:
+   `SQUEEZEFS_FREE_FORENSICS=0` **enabled** forensics.)
+4. **A malformed, out-of-range, or retired knob refuses the process at
+   startup**, naming every offender at once, before any volume is opened or
+   anything is mounted:
+
+   ```console
+   $ SQUEEZEFS_READ_LANE=yess SQUEEZEFS_IPC_IDLE_SECS=abc squeezefs mount …
+   Error: refusing to start: invalid SqueezeFS environment knob(s)
+     - SQUEEZEFS_IPC_IDLE_SECS='abc' is invalid: expected an integer in 0..=86400
+     - SQUEEZEFS_READ_LANE='yess' is invalid: expected a boolean — 1/true/yes/on or 0/false/no/off
+     (a malformed knob is never silently defaulted — fix or unset it; empty means unset)
+   ```
+
+   Out of range is a refusal, not a clamp: a knob set past its admissible
+   range is a mistake worth naming, and silently clamping it is how "I set it
+   and nothing happened" happens.
+5. **An unrecognized `SQUEEZEFS_*` / `SQZ_*` name is announced, not refused** —
+   the typo detector for knob NAMES (`Warning: SQUEEZEFS_RECLAIM_BACH is not a
+   SqueezeFS knob …`). It cannot refuse: a mixed-version fleet legitimately
+   carries the next release's knobs, and the interception shim's client-side
+   knobs live in the same environment as the daemon's.
+6. **Retired spellings refuse loudly, naming the successor.** Current retirees
+   (the ENG-10 namespace-collision rename — the inode-reclaim family shared a
+   prefix with the unrelated *block*-reclaim family):
+
+   | Retired | Use instead |
+   |---|---|
+   | `SQUEEZEFS_RECLAIM_BATCH` | `SQUEEZEFS_INODE_RECLAIM_BATCH` |
+   | `SQUEEZEFS_RECLAIM_BATCH_WINDOW_MS` | `SQUEEZEFS_INODE_RECLAIM_WINDOW_MS` |
+   | `SQUEEZEFS_RECLAIM_CONCURRENCY` | `SQUEEZEFS_INODE_RECLAIM_CONCURRENCY` |
+
+   (`SQUEEZEFS_RECLAIM_BATCH_BLOCKS`, `..._BATCH_MS`, `..._QUEUE_MAX_BLOCKS`,
+   `..._LANES_PER_DEV` and `..._CAP_PARK_MS` are unchanged — they are the
+   *block*-reclaim family and always were.)
+
+**The client shim is the one deliberate asymmetry**: `libsqueezefs_il.so`
+never kills its host application over an environment typo. It announces the
+bad value on stderr and keeps the documented default. Everything else about
+the value law is identical, because both sides parse through the same shared
+file (`crates/squeezefs-ipc/src/env_knob_core.rs`).
+
+Knobs that are **measurement levers, not operational settings** say so in the
+registry (`SQUEEZEFS_WRITE_PIPELINE_DEPTH_BLOCKS`, `SQUEEZEFS_PATCH_MAX_BYTES=0`,
+`SQUEEZEFS_PUBLISH_COALESCE_MAX=1`, `SQUEEZEFS_NUMA=0`, `SQUEEZEFS_READ_LANE=0`,
+`SQUEEZEFS_NT_COPY=0`, …). They exist so an A/B can be counted; a fleet running
+one of them is running an experiment.
 
 ### SqueezeFS URI scheme
 

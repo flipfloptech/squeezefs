@@ -887,7 +887,7 @@ impl BlockAllocator {
             // the recorded FIRST free of this offset — names both halves of
             // the double-release lineage even though the refusal never
             // reaches finish_free's tape.
-            if std::env::var("SQUEEZEFS_FREE_FORENSICS").is_ok() {
+            if crate::env_knobs::bool_knob("SQUEEZEFS_FREE_FORENSICS", false) {
                 let bt = std::backtrace::Backtrace::force_capture().to_string();
                 let first = free_forensics_tape()
                     .lock()
@@ -920,7 +920,7 @@ impl BlockAllocator {
         let block_idx = offset / self.chunk_size;
         // FIND-RW5-A forensics (env-gated, diagnostic-only): record every
         // free's capture so a DOUBLE FREE names BOTH call sites.
-        if std::env::var("SQUEEZEFS_FREE_FORENSICS").is_ok() {
+        if crate::env_knobs::bool_knob("SQUEEZEFS_FREE_FORENSICS", false) {
             let bt = std::backtrace::Backtrace::force_capture().to_string();
             let mut tape = free_forensics_tape().lock().unwrap();
             if let Some(first) = tape.get(&offset) {

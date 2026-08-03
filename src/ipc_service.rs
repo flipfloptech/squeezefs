@@ -116,12 +116,7 @@ pub(crate) fn ipc_read_dest_override(size: u32) -> Option<u64> {
 /// heap Bytes, `payload.write` copies into the arena).
 fn il_read_dest_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            std::env::var("SQUEEZEFS_IL_READ_DEST").ok().as_deref(),
-            Some("0")
-        )
-    })
+    *ON.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_IL_READ_DEST", true))
 }
 
 thread_local! {

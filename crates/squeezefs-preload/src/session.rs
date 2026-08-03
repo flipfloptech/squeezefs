@@ -33,7 +33,7 @@ use squeezefs_ipc::wire::{build_commit_degenerate, BootstrapBlob, CtlMsg, CTL_MS
 
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 /// Default per-op completion deadline (overridable via
@@ -316,6 +316,42 @@ pub fn refuse_reason(class: u32) -> String {
     }
 }
 
+/// The message a shim announces exactly once when the KD-7 skew gate has
+/// been relaxed (ENG-11). Pure so the gate's contract test can assert the
+/// text without arming the lever.
+pub fn allow_dev_notice() -> &'static str {
+    "squeezefs-il: SQUEEZEFS_IPC_ALLOW_DEV is set — the KD-7 build-commit \
+     skew gate is RELAXED (degenerate `unknown`/`-dirty` identities admitted). \
+     Dev boxes only: a mismatched daemon/shim pair is undefined behavior.\n"
+}
+
+/// `SQUEEZEFS_IPC_ALLOW_DEV` under the shared convention, announced ONCE
+/// per process on engagement (ENG-11 — it used to relax the skew gate
+/// silently on both ends; `SQUEEZEFS_FUSE_NO_KILLPRIV` was the precedent
+/// for saying so out loud). A malformed value keeps the safe default (off):
+/// a shim never kills its host application over an env typo.
+pub fn allow_dev_lever() -> bool {
+    let on = crate::env_knob_core::parse_bool(
+        "SQUEEZEFS_IPC_ALLOW_DEV",
+        std::env::var("SQUEEZEFS_IPC_ALLOW_DEV").ok().as_deref(),
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+    if on {
+        static ANNOUNCED: Once = Once::new();
+        ANNOUNCED.call_once(|| {
+            let msg = allow_dev_notice();
+            // SAFETY: plain write(2) to stderr; best-effort, establish
+            // context only (never a signal handler).
+            unsafe {
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
+        });
+    }
+    on
+}
+
 /// Once-per-(mount, reason) print gate for the refusal lines: the
 /// establish ladder retries on every eligible open BY DESIGN (the mount
 /// stays ours — never negative-cached), so without this gate a
@@ -452,7 +488,7 @@ impl Session {
     ) -> Result<Session, SessionError> {
         // Client-side KD-7 pre-check: skip the doomed round trip (the
         // daemon enforces the same law authoritatively).
-        let allow_dev = std::env::var("SQUEEZEFS_IPC_ALLOW_DEV").is_ok_and(|v| v == "1");
+        let allow_dev = allow_dev_lever();
         if blob.abi != squeezefs_ipc::layout::IPC_ABI
             || blob.build_commit != my_commit
             || ((build_commit_degenerate(&blob.build_commit) || build_commit_degenerate(my_commit))
@@ -578,10 +614,14 @@ impl Session {
         // Best-effort inside an arbitrary app: refusals are invisible.
         // `SQUEEZEFS_IPC_ARENA_THP=0` disables (the daemon's lever's
         // client half).
-        if !matches!(
+        if crate::env_knob_core::parse_bool(
+            "SQUEEZEFS_IPC_ARENA_THP",
             std::env::var("SQUEEZEFS_IPC_ARENA_THP").ok().as_deref(),
-            Some("0")
-        ) {
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(true)
+        {
             let _ = crate::thp::advise_hugepages(
                 base as *mut u8,
                 layout.total_bytes as usize,

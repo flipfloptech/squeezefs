@@ -529,15 +529,11 @@ impl ReadLaneGovernor {
     /// `SQUEEZEFS_READ_LANE_DEPTH`); unrecognized values refuse loud,
     /// forward-only.
     pub fn from_env() -> Self {
-        let enabled = std::env::var("SQUEEZEFS_READ_LANE")
-            .map(|v| v.trim() != "0")
-            .unwrap_or(true);
-        let depth_override = match std::env::var("SQUEEZEFS_READ_LANE_DEPTH") {
-            Ok(v) => Some(v.trim().parse::<u32>().unwrap_or_else(|e| {
-                panic!("SQUEEZEFS_READ_LANE_DEPTH must be an integer block count: {e}")
-            })),
-            Err(_) => None,
-        };
+        let enabled = crate::env_knobs::bool_knob("SQUEEZEFS_READ_LANE", true);
+        // ENG-10: malformed values are refused by the startup gate, not by
+        // a panic inside this constructor (which the release profile's
+        // panic="abort" turns into an aborted mount over a typo).
+        let depth_override = crate::env_knobs::opt_int_knob::<u32>("SQUEEZEFS_READ_LANE_DEPTH");
         Self {
             enabled,
             depth_override,

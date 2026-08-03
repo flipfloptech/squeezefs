@@ -390,7 +390,7 @@ impl KernelCacheTtls {
 /// `op_profile_gate_is_memoized_and_default_off`.
 pub fn op_profile_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SQUEEZEFS_OP_PROFILE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_OP_PROFILE", false))
 }
 
 /// `SQUEEZEFS_PATCH_MAX_BYTES` cell (design-random-small-writes §6): max
@@ -445,9 +445,7 @@ pub fn set_patch_max_bytes(v: u64) {
 fn inplace_overwrite_cell() -> &'static std::sync::atomic::AtomicBool {
     static CELL: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {
-        let on = std::env::var("SQUEEZEFS_INPLACE_OVERWRITE")
-            .map(|v| v.trim() == "1")
-            .unwrap_or(false);
+        let on = crate::env_knobs::bool_knob("SQUEEZEFS_INPLACE_OVERWRITE", false);
         std::sync::atomic::AtomicBool::new(on)
     })
 }
@@ -3722,7 +3720,8 @@ pub struct Metrics {
     /// strict/fsync barriers which land in `meta_device_syncs` directly.
     pub meta_flush_deferred: Align64<AtomicU64>,
     /// Reclaim group-commit fill: doomed inos per batched `destroy_inodes`
-    /// transaction (design §4.5) — headroom before `SQUEEZEFS_RECLAIM_BATCH`
+    /// transaction (design §4.5) — headroom before
+    /// `SQUEEZEFS_INODE_RECLAIM_BATCH`
     /// needs raising.
     pub meta_reclaim_batch_size: Align64<QueueDepthHistogram>,
     /// D4.a fill-vs-window attribution (design-metadata-throughput §5.4):
@@ -3732,10 +3731,10 @@ pub struct Metrics {
     /// gather window degenerates to singletons" from "admission thins the
     /// batch".
     pub meta_reclaim_gather_fill: Align64<QueueDepthHistogram>,
-    /// Gather batches closed by hitting `SQUEEZEFS_RECLAIM_BATCH` (cap) —
+    /// Gather batches closed by hitting `SQUEEZEFS_INODE_RECLAIM_BATCH` (cap) —
     /// the healthy storm outcome (fill == cap).
     pub meta_reclaim_gather_cap_closes: Align64<AtomicU64>,
-    /// Gather batches closed by `SQUEEZEFS_RECLAIM_BATCH_WINDOW_MS` expiry
+    /// Gather batches closed by `SQUEEZEFS_INODE_RECLAIM_WINDOW_MS` expiry
     /// with the channel still open — the trickle outcome. A FORGET storm
     /// landing here with tiny fills is the batch-fill degeneration D4.c
     /// hunts (per-FORGET spawn jitter / window-vs-arrival cadence).
@@ -4856,7 +4855,14 @@ impl SqueezefsFilesystem {
             .ok()
             .and_then(|val| val.parse::<usize>().ok())
             .unwrap_or(4096);
-        let reclaim_concurrency = std::env::var("SQUEEZEFS_RECLAIM_CONCURRENCY")
+        // ENG-10 rename: this is the INODE-reclaim family. Its old spelling
+        // (`SQUEEZEFS_RECLAIM_CONCURRENCY`, alongside `SQUEEZEFS_RECLAIM_BATCH`
+        // and `..._BATCH_WINDOW_MS`) shared a prefix with the unrelated
+        // BLOCK-reclaim family (`SQUEEZEFS_RECLAIM_BATCH_BLOCKS` et al) —
+        // `SQUEEZEFS_RECLAIM_BATCH` was a strict prefix of a different
+        // subsystem's knob. The retired spellings refuse loudly at startup
+        // naming these successors (`src/env_knobs.rs`).
+        let reclaim_concurrency = std::env::var("SQUEEZEFS_INODE_RECLAIM_CONCURRENCY")
             .ok()
             .and_then(|val| val.parse::<usize>().ok())
             .unwrap_or_else(|| {
@@ -16695,7 +16701,7 @@ pub async fn start_mount<P: AsRef<Path>>(
     // write-through; explicit writeback + interception refuses loud.
     // (The CLI `--interception` flag arrives merged into the option
     // string by `main.rs`.)
-    let env_ipc = std::env::var("SQUEEZEFS_IPC").is_ok_and(|v| v == "1");
+    let env_ipc = crate::env_knobs::bool_knob("SQUEEZEFS_IPC", false);
     let posture = resolve_interception_posture(custom_opts.as_deref(), false, env_ipc, writeback)
         .map_err(|e| -> Box<dyn std::error::Error> {
         error!("{e}");
@@ -16725,7 +16731,7 @@ pub async fn start_mount<P: AsRef<Path>>(
     // requests). SQUEEZEFS_FUSE_NO_KILLPRIV=1 is the TESTING-ONLY A/B
     // escape (restores the kernel-side probe posture); never an
     // operational recommendation.
-    let killpriv_v2 = !std::env::var("SQUEEZEFS_FUSE_NO_KILLPRIV").is_ok_and(|v| v == "1");
+    let killpriv_v2 = !crate::env_knobs::bool_knob("SQUEEZEFS_FUSE_NO_KILLPRIV", false);
     options.handle_killpriv_v2(killpriv_v2);
     if !killpriv_v2 {
         info!(
@@ -16888,7 +16894,7 @@ pub async fn start_mount<P: AsRef<Path>>(
             socket_name: format!("sqz-il0-{}-{:08x}", std::process::id(), fastrand::u32(..)),
             socket_dir,
             build_commit: crate::version::build_commit(),
-            allow_dev: std::env::var("SQUEEZEFS_IPC_ALLOW_DEV").is_ok_and(|v| v == "1"),
+            allow_dev: crate::ipc_host::allow_dev_lever(),
             geometry,
             arena_cap_bytes,
             per_uid_session_cap: 64,
@@ -18275,16 +18281,18 @@ async fn run_reclaim_worker_pool(
     fs: SqueezefsFilesystem,
     concurrency: usize,
 ) {
-    // Group-commit batching (design §4.5): drain up to SQUEEZEFS_RECLAIM_BATCH
-    // inos per unit of work — sequential allocation clusters doomed inos in
-    // the same inode-table sectors, so a batch's slot zeroes merge into
-    // shared sector images and one apply write.
-    let batch_cap = std::env::var("SQUEEZEFS_RECLAIM_BATCH")
+    // Group-commit batching (design §4.5): drain up to
+    // SQUEEZEFS_INODE_RECLAIM_BATCH inos per unit of work — sequential
+    // allocation clusters doomed inos in the same inode-table sectors, so a
+    // batch's slot zeroes merge into shared sector images and one apply
+    // write. (ENG-10 rename out of the block-reclaim prefix; the old
+    // spellings refuse loudly at startup naming these.)
+    let batch_cap = std::env::var("SQUEEZEFS_INODE_RECLAIM_BATCH")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .map(|v| v.clamp(1, 1024))
         .unwrap_or(64);
-    let window_ms = std::env::var("SQUEEZEFS_RECLAIM_BATCH_WINDOW_MS")
+    let window_ms = std::env::var("SQUEEZEFS_INODE_RECLAIM_WINDOW_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(|v| v.min(1000))

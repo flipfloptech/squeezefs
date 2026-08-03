@@ -374,7 +374,7 @@ async fn mount_shaped_rename_meets_g4_one_entry_per_op() {
 async fn unlink_entry_economy_meets_g4_via_echo_absorption() {
     let (_t, backend) = routed_sandbox().await;
     const N: u64 = 320;
-    const FILL: usize = 64; // SQUEEZEFS_RECLAIM_BATCH default
+    const FILL: usize = 64; // SQUEEZEFS_INODE_RECLAIM_BATCH default
 
     let mut inos = Vec::new();
     for i in 0..N {

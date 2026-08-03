@@ -39,6 +39,14 @@ pub mod session;
 // both consumers link libc). Instances never cross the crate boundary.
 #[path = "../../squeezefs-ipc/src/thp.rs"]
 pub mod thp;
+// The ONE env-knob parsing convention (ENG-10) — canonical file in the
+// squeezefs-ipc tree, `#[path]`-included here, by the root crate and by the
+// fuse3 fork, so the shim's client-side knobs mean exactly what the
+// daemon's mean (`SQUEEZEFS_IPC_ALLOW_DEV=0` disables on BOTH ends). The
+// shim never refuses its host application over a bad value — it announces
+// and keeps the documented default (§ENG-10's documented asymmetry).
+#[path = "../../squeezefs-ipc/src/env_knob_core.rs"]
+pub mod env_knob_core;
 
 /// This shim's build identity (`<full-hash>[-dirty]`, `src/version.rs`
 /// form) — the KD-7 skew-gate key, compared against the daemon's

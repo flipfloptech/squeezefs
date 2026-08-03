@@ -2325,6 +2325,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "dhat-on")]
     let _profiler = dhat::Profiler::new_heap();
 
+    // ENG-10: the ONE env-knob convention's enforcement point. Before any
+    // argument is interpreted, any volume opened or anything mounted: every
+    // SQUEEZEFS_*/SQZ_* variable present is validated against the registry
+    // (`src/env_knobs.rs`). A malformed value, an out-of-range value or a
+    // retired spelling refuses the process here, naming EVERY offender at
+    // once — the 56 silent-default sites downstream can no longer turn a
+    // typo into "the knob did nothing". Unregistered names are announced as
+    // probable typos (never refused: a mixed-version fleet and the shim's
+    // client-side knobs share this environment).
+    if let Some(report) = squeezefs::env_knobs::refusal_report() {
+        eprintln!("Error: {report}");
+        std::process::exit(1);
+    }
+
     let mut cli = Cli::parse();
 
     // ENG-3 (the daemon must be audible): the --log-file target must be

@@ -33,10 +33,71 @@
 //! The lifecycle bits behind eviction/supersede/freeze races are the
 //! loom-modeled [`super::node_state_core`]; the tree logic (traversal,
 //! writer revalidation, the §4.6 SMO protocol) is [`super::tree`].
+//!
+//! ## Multi-process coherence: partitioning, and a lagging reader
+//!
+//! Everything above is **load-once RAM-authoritative**: a node is read from
+//! the device exactly once and thereafter served from immutable arc-swapped
+//! snapshots. Pre-RC engineering spec §6.2 names that the runtime item
+//! *"arguably harder than any of the ten"* durable-format single-writer
+//! assumptions, and gives the verdict: *"the tractable answer is to ensure
+//! two writers never cache the same node — **partitioning, not cache
+//! coherence**."* Two mechanisms implement that verdict here, and there is
+//! deliberately **no cross-node coherence protocol**:
+//!
+//! ### 1. A coherent READER lags by one polled checkpoint (§6.8 item 2)
+//!
+//! [`NodeCache::arm_revalidation`] declares this cache a reader as of one
+//! A/B root-ledger record; [`NodeCache::revalidate`] adopts a newer record
+//! and drops every cached node not covered by it. The consistency model an
+//! operator reads is in `docs/operations.md` § *Read-only coherent mounts*;
+//! the mechanism's three load-bearing pieces are:
+//!
+//! * the **epoch stamp** on every node ([`CachedNode::epoch_stamp`]) versus
+//!   the cache's epoch word — one relaxed compare on the hit path, which is
+//!   the lazy half of the drop pass and makes "an operation that starts
+//!   after a poll sees only that epoch's nodes" true even mid-sweep;
+//! * the **two-word publication law** in [`super::epoch_core`]: the durable
+//!   tail is published before the epoch that vouches for it, and read after
+//!   it, so a node can never claim currency for a checkpoint whose tail it
+//!   was not classified against (the silent-record-loss direction);
+//! * the **R-6 purge trigger** ([`EpochPurgeSink`]): a metadata epoch step
+//!   is a reader's only evidence that the writer may have recycled data
+//!   block keys, and §6.8 item 5's observation is that the invalidation
+//!   primitive (`TieredCache::purge_block_key`) is already complete — only
+//!   this trigger was missing.
+//!
+//! An un-armed cache — every write mount today — holds epoch
+//! [`UNARMED_EPOCH`], stamps every node with it, and is structurally inert:
+//! `revalidate` refuses to advance, so no mapping a local mount owns can be
+//! dropped by machinery it never opted into.
+//!
+//! ### 2. The WRITER populations are partitioned, and violations are loud
+//!
+//! Which nodes may one appender cache, with the enforcement point for each:
+//!
+//! | Population | Who may cache/mutate it | Enforced |
+//! |---|---|---|
+//! | interior nodes (`level > 0`), tree roots | the **root authority** alone — the RAM face of lock order 4b (interior locks belong exclusively to the serialized per-volume checkpoint/SMO task) and of `read_partitioned_ledger`'s refusal of a non-authority record naming roots | [`CachedNode::apply_locked`] refuses a non-authority structural mutation loud (`meta_kv_node_partition_refusals`) |
+//! | leaves | the appender the **slot map** assigns (spec §6.2 items 4/8) — deliberately NOT arbitrated here, so this gate is never mistaken for cross-writer custody | a peer's append into a node's log is detected at [`NodeCache::append_frozen`] instead of being silently overwritten |
+//! | any node, on a reader | nobody | the reader arm of the same gate |
+//!
+//! Disjointness of the two *cacher* populations is therefore structural for
+//! interior nodes and *detected* for leaves — at runtime by the append
+//! probe, and at replay by `journal::detect_partition_violations`'
+//! `PartitionViolation::Key`. The residual hole is stated where it belongs:
+//! a leaf a peer wrote in an **earlier** window, which the authority cached
+//! before that window closed, leaves no evidence in either place. What
+//! closes it is arming revalidation on the peer as well (a non-authority
+//! appender is, with respect to structure, a reader) — see the argument and
+//! its limits in `.benchmarks/2026-08-05-mw-node-cache-coherence.md` §4.
 
 use super::bset::BsetView;
+use super::checkpoint::{LedgerRecord, TreeRoot};
+use super::epoch_core::{NodeEnv, UNARMED_EPOCH};
 use super::node::{
-    encode_bset_frame, load_node, AppendDest, LoadedNode, NodeLayout, BSET_FRAME_LEN,
+    encode_bset_frame, load_node, page_holds_live_frame, AppendDest, LoadedNode, NodeLayout,
+    BSET_FRAME_LEN, NODE_PAGE,
 };
 use super::node_state_core::NodeState;
 use super::record::{
@@ -1026,6 +1087,18 @@ impl Drop for NodeDirty {
 /// One cached node: immutable identity + lifecycle word + arc-swap'd
 /// snapshot + the lock-guarded dirty half (§4.5).
 pub struct CachedNode {
+    /// The owning cache's shared environment (`epoch_core`): the
+    /// revalidation pair and the mutation gates. The node needs it to
+    /// answer "may I be mutated?" at the ONE choke point
+    /// ([`Self::apply_locked`]) — one relaxed load, and on the leaf commit
+    /// path the level test short-circuits before even that.
+    env: Arc<NodeEnv>,
+    /// The revalidation epoch this object was **loaded under** (spec §6.8
+    /// item 2). Stamped by [`NodeCache::publish_stamped`] from the
+    /// pre-device-read snapshot, so a node can never claim currency for a
+    /// checkpoint it was not classified against. [`UNARMED_EPOCH`] on
+    /// every write mount, which is what makes the hit-path compare free.
+    epoch_stamp: AtomicU64,
     addr: u64,
     node_seq: u64,
     tree_id: u8,
@@ -1076,11 +1149,14 @@ impl CachedNode {
         loaded: LoadedNode,
         pinned: bool,
         charge: Arc<AtomicU64>,
+        env: Arc<NodeEnv>,
     ) -> Result<Arc<Self>, KvError> {
         let (header, buf, bset_ranges, tail_offset) = loaded.into_parts();
         let sources: Vec<Bytes> = bset_ranges.iter().map(|r| buf.slice(r.clone())).collect();
         let base = Arc::new(RecordIndex::build(sources)?);
         Ok(Arc::new(Self {
+            env,
+            epoch_stamp: AtomicU64::new(UNARMED_EPOCH),
             addr: header.node_addr,
             node_seq: header.node_seq,
             tree_id: header.tree_id,
@@ -1116,6 +1192,22 @@ impl CachedNode {
     /// Extent byte address (the cache key).
     pub fn addr(&self) -> u64 {
         self.addr
+    }
+
+    /// The revalidation epoch this object was loaded under (spec §6.8
+    /// item 2). One relaxed load — the hit path's whole share of the
+    /// reader machinery.
+    #[inline]
+    pub fn epoch_stamp(&self) -> u64 {
+        self.epoch_stamp.load(Ordering::Relaxed)
+    }
+
+    /// Stamp the load epoch. Called exactly once, by
+    /// [`NodeCache::publish_stamped`], before the object is reachable
+    /// through the map.
+    #[inline]
+    fn stamp_epoch(&self, epoch: u64) {
+        self.epoch_stamp.store(epoch, Ordering::Relaxed);
     }
 
     /// Node incarnation (§4.2 `child_node_seq` stale-pointer detection).
@@ -1212,6 +1304,46 @@ impl CachedNode {
         records: Vec<OwnedRec>,
         floor: u64,
     ) -> Result<(), KvError> {
+        // ---- The partitioning gate (pre-RC engineering spec §6.2 closing,
+        // §6.3; ruling D8's S8 prerequisite). This is the ONE place every
+        // RAM mutation of every node passes, so it is where "which nodes may
+        // this appender cache and mutate" stops being an argument and
+        // becomes enforcement:
+        //
+        //  * an armed READER (§6.8 item 2) mutates nothing — its cache is a
+        //    projection of somebody else's tree, and a local mutation would
+        //    diverge from the volume it is reading with no way back;
+        //  * interior nodes have ONE cacher and ONE mutator, the root
+        //    authority. That is the RAM face of lock order 4b ("interior-node
+        //    locks belong exclusively to the serialized per-volume
+        //    checkpoint/SMO task") and of `read_partitioned_ledger`'s refusal
+        //    of a non-authority record carrying tree roots. A peer appender
+        //    that mutated structure would produce two divergent trees whose
+        //    checkpoints destroy each other — spec §6.2 item 4's hazard.
+        //
+        // Leaves are deliberately NOT arbitrated here: which appender owns
+        // which key range is the slot map's job (§6.2 items 4/8), and a gate
+        // that pretended otherwise would be mistaken for cross-writer
+        // custody. Cost: `level > 0` short-circuits the leaf commit path
+        // before the word is even read, and on a solo volume the word is 0.
+        let gate = self.env.gate.load();
+        if gate.reader {
+            super::META_KV_NODE_PARTITION_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            return Err(KvError::Corrupt(format!(
+                "mutation of node {:#x} refused: this mount armed reader revalidation \
+                 (spec §6.8 item 2) and may not write the volume it is reading",
+                self.addr
+            )));
+        }
+        if self.level > 0 && !gate.is_authority() {
+            super::META_KV_NODE_PARTITION_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            return Err(KvError::Corrupt(format!(
+                "structural mutation of interior node {:#x} (level {}) refused: appender {} \
+                 of {} is not the volume's root authority — interior nodes have ONE cacher \
+                 (spec §6.2 closing: partitioning, not cache coherence; lock order 4b)",
+                self.addr, self.level, gate.writer_id, gate.writers
+            )));
+        }
         if self.state.mark_dirty().is_err() {
             return Err(KvError::Corrupt(format!(
                 "apply on superseded node {:#x} (revalidation bypassed?)",
@@ -1598,6 +1730,176 @@ impl CachedNode {
 }
 
 // ---------------------------------------------------------------------------
+// Reader-side revalidation (pre-RC engineering spec §6.8 item 2).
+// ---------------------------------------------------------------------------
+
+/// One durable checkpoint, as a reader observes it: the projection of an
+/// A/B root-ledger record ([`LedgerRecord`]) that a node cache needs.
+///
+/// **Reading one is the whole poll**: a single 128 KiB `read_at` of the
+/// ledger extent (`checkpoint::read_newest_ledger`), no tree traversal, no
+/// journal replay, no locks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootEpoch {
+    /// Checkpoint sequence — the epoch identity. Strictly monotonic per
+    /// volume, and (crucially for the cadence being free) written only by a
+    /// cycle that had work: `checkpoint.rs::tick` runs a cycle only when
+    /// `final_cycle || dirty_nodes > 0 || distance > 0`, so an idle writer
+    /// mints no records and a reader's polls stay inert.
+    pub ledger_seq: u64,
+    /// The record's replay tail — the §4.5 torn-tail classifier's input for
+    /// every node this reader loads from now on.
+    pub journal_tail_seq: u64,
+    /// §4.8 monotonic ino watermark (informational for a reader; the ino
+    /// minting half is spec §6.2 item 5, a sibling's).
+    pub next_ino: u64,
+    /// §4.5 node-seq mint watermark: **a peer's structural mint counter.**
+    /// A non-authority appender can compare it against its own mints to
+    /// learn that structure moved under it — see the partitioning argument
+    /// in the module docs.
+    pub node_seq_watermark: u64,
+    /// §4.7 allocator bitmap generation (informational for a reader).
+    pub alloc_bitmap_generation: u64,
+    /// Per-tree roots the record names.
+    pub roots: Vec<TreeRoot>,
+}
+
+impl RootEpoch {
+    /// Project a ledger record. On a partitioned volume the record to
+    /// project is the **root authority's**
+    /// (`PartitionedLedger::authority`), because tree roots live only on
+    /// its records (spec §6.2 item 4).
+    pub fn from_ledger(rec: &LedgerRecord) -> Self {
+        Self {
+            ledger_seq: rec.seq,
+            journal_tail_seq: rec.journal_tail_seq,
+            next_ino: rec.next_ino,
+            node_seq_watermark: rec.node_seq_watermark,
+            alloc_bitmap_generation: rec.alloc_bitmap_generation,
+            roots: rec.tree_roots.clone(),
+        }
+    }
+
+    /// An epoch built without a ledger record: `(ledger_seq, tail, roots)`.
+    /// For callers that have the facts but not the record — the cache-level
+    /// contracts, and the S4 wiring's `writers == 1` seed.
+    pub fn synthetic(ledger_seq: u64, journal_tail_seq: u64, roots: &[TreeRoot]) -> Self {
+        Self {
+            ledger_seq,
+            journal_tail_seq,
+            next_ino: 0,
+            node_seq_watermark: 0,
+            alloc_bitmap_generation: 0,
+            roots: roots.to_vec(),
+        }
+    }
+
+    /// The root this record names for `tree_id`.
+    pub fn root_of(&self, tree_id: u8) -> Option<TreeRoot> {
+        self.roots.iter().copied().find(|r| r.tree_id == tree_id)
+    }
+}
+
+/// The **remote trigger** for the R-6 unified block-key purge (spec §6.8
+/// item 5: *"the invalidation primitive already exists and is complete;
+/// only the remote trigger is missing"*).
+///
+/// A metadata epoch advance is the reader's only evidence that the writer
+/// may have freed, reallocated, or rewritten data blocks whose bytes the
+/// reader's block-key-addressed tiers still hold (§6.3's block-key binding
+/// hazard). The cache fires this once per advance; **scope selection
+/// belongs to the implementation**, because bounding it exactly is the
+/// §6.8 item-3 freed-offset grace period — a separate, weeks-scale item.
+/// The shipped implementation is
+/// [`super::revalidate::TieredEpochPurge`], which routes every suspect key
+/// through `TieredCache::purge_block_key` and nothing else.
+pub trait EpochPurgeSink: Send + Sync + std::fmt::Debug {
+    /// Purge whatever the epoch step invalidated; return the number of
+    /// block keys purged (surfaced as `meta_kv_revalidate_keys_purged`).
+    fn on_epoch_advance(&self, from_epoch: u64, to_epoch: u64) -> u64;
+}
+
+/// What one revalidation poll did — the RO mount's per-poll ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RevalidateOutcome {
+    /// Whether the polled record was newer (an epoch step). `false` = an
+    /// inert poll: nothing was dropped, nothing purged, no `Arc` replaced.
+    pub advanced: bool,
+    /// The epoch before this poll.
+    pub from_epoch: u64,
+    /// The epoch now in force (unchanged when `!advanced`).
+    pub epoch: u64,
+    /// Durable tail now in force.
+    pub tail: u64,
+    /// Mappings the drop pass released.
+    pub dropped: u64,
+    /// Extent bytes credited back to the budget gauge — exactly
+    /// `dropped × node_size`, which is the charge-conservation law.
+    pub bytes_credited: u64,
+    /// Mappings kept because they were already stamped with the new epoch
+    /// (a loader that raced the advance).
+    pub retained: u64,
+    /// **Must stay 0**: dirty nodes the pass refused to drop.
+    pub skipped_dirty: u64,
+    /// Block keys the R-6 purge sink dropped for this step.
+    pub keys_purged: u64,
+}
+
+/// Bounded re-reads for a reader whose extent read raced the writer's
+/// in-flight append. The writer's node writes are single `write_at`s, so a
+/// reader's whole-extent read can legitimately observe a torn frame
+/// followed by a complete one — the shape §4.5 calls corruption on a
+/// crashed writer. Three re-reads with a yield between them close the
+/// window (the write is already submitted); a verdict that survives them is
+/// evidence, not a race, and is returned unchanged.
+const READER_LOAD_RETRIES: u32 = 3;
+
+/// Whether a load verdict can be a live-writer artifact rather than
+/// corruption: the §4.5 loud tear classification and a header/bset checksum
+/// mismatch (a half-landed `write_node` image). Everything else — geometry,
+/// self-address, short reads — is structural and never retried.
+fn verdict_may_be_a_write_race(e: &KvError) -> bool {
+    matches!(
+        e,
+        KvError::CheckpointCoveredBsetAfterTear { .. } | KvError::ChecksumMismatch { .. }
+    )
+}
+
+/// Run `load` and, in reader mode only, retry a verdict that a racing
+/// append could have produced (see [`READER_LOAD_RETRIES`]).
+async fn retry_racing_reader_load<T, F, Fut>(
+    reader_mode: bool,
+    addr: u64,
+    mut load: F,
+) -> Result<T, KvError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, KvError>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match load().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if !reader_mode
+                    || attempt >= READER_LOAD_RETRIES
+                    || !verdict_may_be_a_write_race(&e)
+                {
+                    return Err(e);
+                }
+                attempt += 1;
+                super::META_KV_READER_LOAD_RETRIES.fetch_add(1, Ordering::Relaxed);
+                log::debug!(
+                    "reader load of node {addr:#x} hit {e} on attempt {attempt} — \
+                     re-reading (a writer's in-flight append looks exactly like this)"
+                );
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The cache.
 // ---------------------------------------------------------------------------
 
@@ -1637,10 +1939,16 @@ pub struct NodeCache {
     /// a dying snapshot's memo bytes leave when its readers do). Arc'd so
     /// nodes charge without a back-reference cycle.
     cached_bytes: Arc<AtomicU64>,
-    /// The durable journal tail (§4.5 torn-tail classifier input, §4.2
-    /// tombstone elision floor). K6b's checkpoint advances it; tests drive
-    /// it directly.
-    durable_tail: AtomicU64,
+    /// The shared per-cache environment (`epoch_core`): the **durable
+    /// journal tail** (§4.5 torn-tail classifier input, §4.2 tombstone
+    /// elision floor — K6b's checkpoint advances it, tests drive it
+    /// directly) published as one ordered pair with the §6.8 item-2
+    /// **revalidation epoch**, plus the §6.2-closing append gates. Every
+    /// node holds a clone.
+    env: Arc<NodeEnv>,
+    /// The R-6 purge trigger a reader installs at arm time (spec §6.8
+    /// item 5). `None` on every write mount — set once, never replaced.
+    purge_sink: OnceLock<Arc<dyn EpochPurgeSink>>,
     /// Extents an SMO retired whose **disk image lags the RAM-authoritative
     /// state that superseded it** (the open delta moved into successor
     /// nodes' RAM, never onto this extent). A traversal holding a pre-SMO
@@ -1684,7 +1992,8 @@ impl NodeCache {
             inflight: scc::HashMap::default(),
             clock: scc::Queue::default(),
             cached_bytes: Arc::new(AtomicU64::new(0)),
-            durable_tail: AtomicU64::new(0),
+            env: Arc::new(NodeEnv::new(0)),
+            purge_sink: OnceLock::new(),
             retired: scc::HashSet::default(),
             dying_floors: AtomicU64::new(u64::MAX),
         })
@@ -1744,12 +2053,230 @@ impl NodeCache {
     /// Current durable journal tail (§4.6 pt 2's checkpoint output; a test
     /// / K6b input here).
     pub fn durable_tail(&self) -> u64 {
-        self.durable_tail.load(Ordering::Acquire)
+        self.env.epoch.tail()
     }
 
     /// Advance the durable tail (monotonic).
     pub fn set_durable_tail(&self, tail: u64) {
-        self.durable_tail.fetch_max(tail, Ordering::AcqRel);
+        self.env.epoch.advance_tail(tail);
+    }
+
+    /// The shared node environment — what [`CachedNode::from_loaded`] takes
+    /// so a node can answer the §6.2-closing mutation gates (the tree layer
+    /// builds SMO successors and fresh roots itself).
+    pub(crate) fn node_env(&self) -> Arc<NodeEnv> {
+        self.env.clone()
+    }
+
+    // -----------------------------------------------------------------
+    // Reader-side revalidation (spec §6.8 item 2). The API an RO mount
+    // consumes: `arm_revalidation` once at open, then `revalidate` on the
+    // derived cadence (`super::revalidate::RevalidationPoller`).
+    // -----------------------------------------------------------------
+
+    /// Declare this cache a **coherent reader** as of `epoch`, installing
+    /// the optional R-6 purge trigger. Seeds the epoch and the durable tail
+    /// and drops nothing — the caller's cache is current as of the record
+    /// it opened.
+    ///
+    /// Arming is a **once-per-mount declaration with teeth**: from here on
+    /// every node mutation is refused loud
+    /// ([`CachedNode::apply_locked`]), because a cache that is a projection
+    /// of another process's tree cannot also be authoritative. `Err` if the
+    /// cache is already armed or `epoch.ledger_seq` is 0 (a volume whose
+    /// ledger has no record cannot be read coherently).
+    pub fn arm_revalidation(
+        &self,
+        epoch: &RootEpoch,
+        purge: Option<Arc<dyn EpochPurgeSink>>,
+    ) -> Result<(), KvError> {
+        if !self.env.epoch.arm(epoch.ledger_seq) {
+            return Err(KvError::Corrupt(format!(
+                "node cache already armed at epoch {} (or asked to arm at 0): reader \
+                 revalidation is a once-per-mount declaration",
+                self.env.epoch.probe()
+            )));
+        }
+        self.env.gate.set_reader();
+        self.env.epoch.advance_tail(epoch.journal_tail_seq);
+        // Nodes mapped BEFORE the arm (the roots `KvTree::open` had to load
+        // to open the trees at all) carry the un-armed stamp; re-stamp them
+        // into the armed epoch instead of making the reader re-read its own
+        // roots on its first traversal. Sound because the open protocol
+        // reads the ledger record FIRST — those nodes were loaded from a
+        // device state at-or-after the record they are now stamped with,
+        // which is the same "content may be a hair newer than the epoch"
+        // posture every in-cycle load already has (staleness is a bound,
+        // not a snapshot).
+        self.for_each_node(|n| n.stamp_epoch(epoch.ledger_seq));
+        if let Some(sink) = purge {
+            let _ = self.purge_sink.set(sink);
+        }
+        log::info!(
+            "node cache armed for coherent reads at checkpoint epoch {} (tail {}): cached \
+             nodes are dropped on every epoch step, and this mount may not write",
+            epoch.ledger_seq,
+            epoch.journal_tail_seq
+        );
+        Ok(())
+    }
+
+    /// Declare this mount appender `writer_id` of `writers` on a
+    /// partitioned volume (spec §6.2 item 4). Solo mounts never call it and
+    /// keep word 0 — the shipped posture.
+    pub fn set_appender(&self, writers: u16, writer_id: u16) -> Result<(), KvError> {
+        self.env
+            .gate
+            .set_appender(writers, writer_id)
+            .map_err(|()| {
+                KvError::Corrupt(format!(
+                    "illegal append partition: appender {writer_id} of {writers}"
+                ))
+            })
+    }
+
+    /// The epoch in force (0 = un-armed; the shipped write-mount posture).
+    pub fn revalidation_epoch(&self) -> u64 {
+        self.env.epoch.probe()
+    }
+
+    /// Whether a reader armed revalidation on this cache.
+    pub fn is_revalidating(&self) -> bool {
+        self.env.epoch.is_armed()
+    }
+
+    /// **One revalidation poll** (spec §6.8 item 2): adopt `epoch` and drop
+    /// every cached node not covered by it.
+    ///
+    /// What "covered" means, precisely — and why it is so nearly empty:
+    /// a ledger record proves currency only for the identities it names,
+    /// and even a byte-identical root identity is **not** a currency proof,
+    /// because a leaf (or root-leaf) append grows the extent's log while
+    /// leaving `(node_addr, node_seq)` untouched. The only nodes provably
+    /// current after an advance are therefore the ones **loaded under the
+    /// new epoch** (a loader that raced the advance) — counted as
+    /// `retained`. Everything else is dropped and demand-paged again. That
+    /// is the honest cost of the cheapest credible design, and it is
+    /// bounded by the poll cadence, not by the writer's checkpoint rate.
+    ///
+    /// Sound by construction on three edges:
+    /// * **un-armed caches are inert** — `publish` refuses to advance an
+    ///   un-armed epoch, so a stray call on a write mount can never drop a
+    ///   mapping it owns;
+    /// * **dirty nodes are never dropped** — they hold RAM records no disk
+    ///   image has (`skipped_dirty` is the must-stay-0 tripwire saying
+    ///   revalidation was armed on a mount that writes);
+    /// * **the eager pass and the lazy hit-path gate agree by
+    ///   construction** — both drop exactly "stamped ≠ current", and the
+    ///   epoch is published *before* the sweep walks, so an operation that
+    ///   starts after this call can never adopt a stale node even while the
+    ///   pass is still walking.
+    ///
+    /// Charge accounting: every released mapping credits exactly one extent
+    /// through the same `remove_if_sync(ptr_eq)`-gated `fetch_sub` that
+    /// eviction and retire use, so racing sweepers cannot double-credit
+    /// (a double credit wraps the `u64` and reads as "full forever").
+    pub fn revalidate(&self, epoch: &RootEpoch) -> RevalidateOutcome {
+        super::META_KV_REVALIDATE_POLLS.fetch_add(1, Ordering::Relaxed);
+        let Some((from, to)) = self
+            .env
+            .epoch
+            .publish(epoch.journal_tail_seq, epoch.ledger_seq)
+        else {
+            // Inert: the same (or an older) record, or an un-armed cache.
+            let cur = self.env.epoch.probe();
+            return RevalidateOutcome {
+                advanced: false,
+                from_epoch: cur,
+                epoch: cur,
+                tail: self.env.epoch.tail(),
+                ..Default::default()
+            };
+        };
+        super::META_KV_REVALIDATE_EPOCHS.fetch_add(1, Ordering::Relaxed);
+
+        // The drop pass. Collected first so the map is not mutated under its
+        // own iterator; `for_each_node` is explicitly not a consistent
+        // snapshot, which is fine — anything published after the epoch
+        // advance is stamped `to` and belongs to the new epoch.
+        let mut stale: Vec<Arc<CachedNode>> = Vec::new();
+        let mut retained = 0u64;
+        self.for_each_node(|n| {
+            if n.epoch_stamp() == to {
+                retained += 1;
+            } else {
+                stale.push(n.clone());
+            }
+        });
+        let node_size = self.cfg.layout.node_size() as u64;
+        let mut out = RevalidateOutcome {
+            advanced: true,
+            from_epoch: from,
+            epoch: to,
+            tail: self.env.epoch.tail(),
+            retained,
+            ..Default::default()
+        };
+        for node in stale {
+            if node.dirty_floor() != u64::MAX || node.lock().try_read().is_err() {
+                // Unflushed RAM records, or a mutation in flight: keep it.
+                // A reader has neither, so this is the tripwire.
+                out.skipped_dirty += 1;
+                super::META_KV_REVALIDATE_DIRTY_SKIPS.fetch_add(1, Ordering::Relaxed);
+                log::warn!(
+                    "revalidation kept node {:#x}: it still holds un-durable records \
+                     (dirty floor {}). Reader revalidation on a mount that WRITES is a \
+                     bug — the pass will never drop such a node",
+                    node.addr(),
+                    node.dirty_floor()
+                );
+                continue;
+            }
+            if self
+                .map
+                .remove_if_sync(&node.addr(), |v| Arc::ptr_eq(v, &node))
+                .is_some()
+            {
+                self.cached_bytes.fetch_sub(node_size, Ordering::AcqRel);
+                out.dropped += 1;
+                out.bytes_credited += node_size;
+            }
+        }
+        super::META_KV_REVALIDATE_NODES_DROPPED.fetch_add(out.dropped, Ordering::Relaxed);
+
+        // The clock holds one entry per publish; a reader re-publishes its
+        // working set every epoch, so without this drain the ring would
+        // grow one entry per reload forever (evictions only pop while over
+        // budget). Re-push exactly the survivors.
+        let mut survivors: Vec<u64> = Vec::new();
+        while let Some(entry) = self.clock.pop() {
+            let addr = **entry;
+            if self.map.contains_sync(&addr) {
+                survivors.push(addr);
+            }
+        }
+        for addr in survivors {
+            self.clock.push(addr);
+        }
+
+        // The R-6 remote trigger (§6.8 item 5): the metadata step is the
+        // reader's only evidence that block keys may have been reused.
+        if let Some(sink) = self.purge_sink.get() {
+            out.keys_purged = sink.on_epoch_advance(from, to);
+            super::META_KV_REVALIDATE_KEYS_PURGED.fetch_add(out.keys_purged, Ordering::Relaxed);
+        }
+        log::debug!(
+            "revalidated node cache {} → {} (tail {}): dropped {}, retained {}, \
+             skipped-dirty {}, purged {} block keys",
+            from,
+            to,
+            out.tail,
+            out.dropped,
+            out.retained,
+            out.skipped_dirty,
+            out.keys_purged
+        );
+        out
     }
 
     /// Bytes currently charged against the budget.
@@ -1776,8 +2303,20 @@ impl NodeCache {
     /// Latch-free map read: `Some` is a cache hit (counted). The returned
     /// `Arc` stays valid across eviction — readers keep their snapshots by
     /// refcount.
+    ///
+    /// Carries the §6.8 item-2 **lazy staleness gate**: a node stamped under
+    /// a superseded epoch is a MISS, so an operation that begins after a
+    /// revalidation can never adopt a stale node even while the drop pass is
+    /// still walking. The cost is one relaxed load of the cache's epoch word
+    /// and one of the node's stamp, both already in cache; on every write
+    /// mount both read [`UNARMED_EPOCH`] and the compare always agrees
+    /// (priced in `benches/meta_lv_bench.rs::kv_node_cache`).
     pub fn try_get(&self, addr: u64) -> Option<Arc<CachedNode>> {
         let node = self.map.read_sync(&addr, |_, v| v.clone())?;
+        if node.epoch_stamp() != self.env.epoch.probe() {
+            super::META_KV_REVALIDATE_STALE_SERVES.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         node.touch();
         super::META_KV_NODE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
         Some(node)
@@ -1796,6 +2335,23 @@ impl NodeCache {
     pub async fn load(&self, addr: u64) -> Result<Option<Arc<CachedNode>>, KvError> {
         loop {
             if let Some(node) = self.map.read_async(&addr, |_, v| v.clone()).await {
+                // The same lazy staleness gate as `try_get`: a stale-stamped
+                // mapping must be re-read from the device, not served.
+                if node.epoch_stamp() != self.env.epoch.probe() {
+                    super::META_KV_REVALIDATE_STALE_SERVES.fetch_add(1, Ordering::Relaxed);
+                    // Release the mapping so the demand page below re-reads
+                    // it; whoever holds an Arc keeps its snapshot (§4.6).
+                    if self
+                        .map
+                        .remove_if_sync(&addr, |v| Arc::ptr_eq(v, &node))
+                        .is_some()
+                    {
+                        self.cached_bytes
+                            .fetch_sub(self.cfg.layout.node_size() as u64, Ordering::AcqRel);
+                        super::META_KV_REVALIDATE_NODES_DROPPED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
                 node.touch();
                 super::META_KV_NODE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
                 return Ok(Some(node));
@@ -1825,8 +2381,18 @@ impl NodeCache {
                     }
                 }
             };
-            let loaded =
-                load_node(&self.cfg.path, &self.cfg.layout, addr, self.durable_tail()).await?;
+            // The §6.8 item-2 coherent pair, read ONCE and BEFORE the device
+            // read (`epoch_core`'s two-word law): the epoch a node loaded now
+            // may claim, and the tail its torn-tail classification uses.
+            // Reading it first keeps the stamp conservative — a node can
+            // never claim currency for a checkpoint whose tail it was not
+            // classified against.
+            let snap = self.env.epoch.load_snapshot();
+            let reader_mode = snap.epoch != UNARMED_EPOCH;
+            let loaded = retry_racing_reader_load(reader_mode, addr, || {
+                load_node(&self.cfg.path, &self.cfg.layout, addr, snap.tail)
+            })
+            .await?;
             // Re-check after the read: a retire during our load means the
             // bytes we hold are the lagging image (a mapping existed until
             // [`Self::retire`] ran, and retire marks the set BEFORE
@@ -1835,11 +2401,16 @@ impl NodeCache {
             if self.retired.contains_sync(&addr) {
                 return Ok(None);
             }
-            let node = CachedNode::from_loaded(loaded, false, self.cached_bytes.clone())?;
+            let node = CachedNode::from_loaded(
+                loaded,
+                false,
+                self.cached_bytes.clone(),
+                self.env.clone(),
+            )?;
             if node.level() > 0 {
                 node.pin(); // §4.5: interior nodes always pinned.
             }
-            self.publish(node.clone());
+            self.publish_stamped(node.clone(), snap.epoch);
             super::META_KV_NODE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
             drop(guard);
             return Ok(Some(node));
@@ -1866,6 +2437,20 @@ impl NodeCache {
     /// previous life are caught by the §4.2 `node_seq` check), charge the
     /// budget, enter the clock, evict down to budget if needed.
     pub fn publish(&self, node: Arc<CachedNode>) {
+        // A caller-built node (SMO successor, fresh root) is by definition
+        // this mount's own current state, so it belongs to the epoch in
+        // force. Only the demand-page path has an older, conservative
+        // answer, and it passes it explicitly.
+        self.publish_stamped(node, self.env.epoch.probe())
+    }
+
+    /// [`Self::publish`] with the **load epoch** stamped explicitly — the
+    /// demand-page path's entry (spec §6.8 item 2): the stamp is the epoch
+    /// snapshotted *before* the device read, never the (possibly newer) one
+    /// in force at publish time, so a node published across a racing
+    /// revalidation reads as stale and is re-read rather than trusted.
+    pub(crate) fn publish_stamped(&self, node: Arc<CachedNode>, epoch: u64) {
+        node.stamp_epoch(epoch);
         let addr = node.addr();
         let evictable = !node.is_pinned();
         match self.map.entry_sync(addr) {
@@ -2017,6 +2602,34 @@ impl NodeCache {
         };
         if tail + frozen.frame_len > self.cfg.layout.node_size() {
             return Ok(false);
+        }
+        // ---- The foreign-append probe (spec §6.2 closing / §6.3), on a
+        // PARTITIONED volume only. `append_bset` writes at the tail offset we
+        // remember and validates only the node incarnation, so a peer that
+        // appended into this node's log while we held it cached would be
+        // silently overwritten — its acked records lost with no counter, the
+        // exact shape the partitioned-append formats detect at *replay* and
+        // could not prevent at *runtime*. One 4 KiB read of the destination
+        // page turns it into a loud refusal.
+        //
+        // Solo volumes have no peers by construction and pay nothing: the
+        // probe is behind `is_solo()`, which is word 0 on every shipped
+        // mount.
+        if !self.env.gate.load().is_solo() {
+            let page =
+                crate::uring_fs::read_at(&self.cfg.path, node.addr() + tail as u64, NODE_PAGE)
+                    .await
+                    .map_err(KvError::Io)?;
+            if page_holds_live_frame(&page, node.node_seq()) {
+                super::META_KV_NODE_PARTITION_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                return Err(KvError::Corrupt(format!(
+                    "foreign append detected at node {:#x} offset {tail}: the destination page \
+                     already holds a verified frame of this incarnation, so a peer appender \
+                     wrote into a node we cache — appending here would overwrite its acked \
+                     records (spec §6.2 closing: two writers must never cache the same node)",
+                    node.addr()
+                )));
+            }
         }
         let dest = AppendDest {
             node_addr: node.addr(),
@@ -2338,36 +2951,50 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_dropped_snapshot_memo_leaves_the_global_gauge_at_its_baseline() {
+    /// Deliberately NOT a `#[tokio::test]`: the process-global gauge guard
+    /// has to be held across the WHOLE body (a concurrent memo's `Drop` is
+    /// exactly what perturbs the assertion), and a std `MutexGuard` held
+    /// across an `await` is both a clippy error and the wrong shape. The
+    /// async work runs inside one `block_on` instead.
+    #[test]
+    fn a_dropped_snapshot_memo_leaves_the_global_gauge_at_its_baseline() {
         let _serialized = global_gauge_guard();
         let global0 = baseline();
-        let (_f, cache, addrs) = populated_cache(2).await;
-        // Populate a memo cell on each node's live snapshot, then let the
-        // drop pass take the snapshot with it.
-        for a in &addrs {
-            let node = cache.try_get(*a).expect("mapped");
-            node.snapshot().memo.populate(
-                Bytes::from_static(b"memo-key"),
-                LiveLookup::Live(Bytes::from_static(b"0123456789")),
-                1,
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let (_f, cache, addrs) = populated_cache(2).await;
+            // Populate a memo cell on each node's live snapshot, then let the
+            // drop pass take the snapshot with it.
+            for a in &addrs {
+                let node = cache.try_get(*a).expect("mapped");
+                node.snapshot().memo.populate(
+                    Bytes::from_static(b"memo-key"),
+                    LiveLookup::Live(Bytes::from_static(b"0123456789")),
+                    1,
+                );
+            }
+            assert!(
+                baseline() > global0,
+                "fixture: the memos charged the global gauge"
             );
-        }
-        assert!(
-            baseline() > global0,
-            "fixture: the memos charged the global gauge"
-        );
-        cache
-            .arm_revalidation(&RootEpoch::synthetic(1, 0, &[]), None)
-            .expect("arm");
-        assert_eq!(cache.revalidate(&RootEpoch::synthetic(2, 0, &[])).dropped, 2);
-        assert_eq!(
-            baseline(),
-            global0,
-            "the memo charge is Drop-owned: it leaves with the snapshot the \
-             drop pass released"
-        );
-        assert_eq!(cache.cached_bytes(), 0, "and so does the extent charge");
+            cache
+                .arm_revalidation(&RootEpoch::synthetic(1, 0, &[]), None)
+                .expect("arm");
+            assert_eq!(
+                cache.revalidate(&RootEpoch::synthetic(2, 0, &[])).dropped,
+                2
+            );
+            assert_eq!(
+                baseline(),
+                global0,
+                "the memo charge is Drop-owned: it leaves with the snapshot the \
+                 drop pass released"
+            );
+            assert_eq!(cache.cached_bytes(), 0, "and so does the extent charge");
+        });
     }
 
     #[tokio::test]

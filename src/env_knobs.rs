@@ -128,6 +128,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_META_COMMIT_BATCH_BYTES", int(1, BYTES_MAX), "derived", "M7 commit-conveyor batch cap, bytes (clamped to the ring's admissible capacity)."),
     k("SQUEEZEFS_META_FLUSH_INTERVAL_MS", int(0, DAY_MS), "50", "Journal/checkpoint cadence, ms; 0 = strict per-commit. A very large value is the 'park the timer' idiom two suites use, hence the day-long ceiling."),
     k("SQUEEZEFS_JOURNAL_FLUSH_INTERVAL_MS", int(0, DAY_MS), "unset", "Legacy alias for SQUEEZEFS_META_FLUSH_INTERVAL_MS (the new spelling wins)."),
+    k("SQUEEZEFS_META_REVALIDATE_MS", int(1, DAY_MS), "derived", "Coherent-READER node-cache revalidation cadence, ms (spec §6.8 item 2). Derived default = max(flush cadence, the 1 s checkpoint ceiling) — polling faster than the writer mints ledger records buys no freshness and pays a drop pass. Trades staleness (interval + 1 s) against reload cost; inert on write mounts."),
     k("SQUEEZEFS_BLOCK_REFS_VERIFY", Kind::Bool, "off", "Run the durable-vs-derived block-reference oracle at MOUNT (spec §6.2 item 1). Off by default because it pays the inode-tree walk the durable records exist to delete; fsck runs the same comparison unconditionally as class C8."),
     // -- Layout / publish economy ---------------------------------------
     k("SQUEEZEFS_DEFAULT_BLOCK_SIZE", int(4096, BYTES_MAX), "4194304", "Default striped block size, bytes, when format did not record one."),

@@ -576,6 +576,26 @@ fn probe_frame(buf: &[u8], pos: usize, node_seq: u64) -> FrameProbe {
     })
 }
 
+/// Whether `page` (≥ [`BSET_FRAME_LEN`] bytes of a node's log area at a
+/// 4 KiB boundary) already holds a **checksum-verified frame of this node
+/// incarnation** — the multi-appender foreign-append probe (pre-RC
+/// engineering spec §6.2 closing / §6.3): a peer that appended into a node
+/// whose log tail we remember would otherwise be silently overwritten by
+/// our next append, which writes at that remembered offset and only checks
+/// the node incarnation. Branches only on verified bytes, exactly like the
+/// §4.5 classifier: garbage, a clean end, and a previous incarnation's
+/// residue are all "not a peer's frame".
+///
+/// Only [`super::node_cache::NodeCache::append_frozen`] calls it, and only
+/// on a partitioned volume — a solo volume has no peers by construction and
+/// pays no extra device read.
+pub fn page_holds_live_frame(page: &[u8], node_seq: u64) -> bool {
+    if page.len() < BSET_FRAME_LEN {
+        return false;
+    }
+    matches!(probe_frame(page, 0, node_seq), FrameProbe::Frame(_))
+}
+
 /// Validate a same-incarnation frame's geometry against its container
 /// (§9 bounds rule): 4 KiB-multiple `padded_len` within the extent, a bset
 /// no smaller than its header and no larger than the frame.

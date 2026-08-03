@@ -305,7 +305,7 @@ impl KvTree {
             cache.durable_tail(),
         )
         .await?;
-        let node = CachedNode::from_loaded(loaded, true, cache.charge_gauge())?;
+        let node = CachedNode::from_loaded(loaded, true, cache.charge_gauge(), cache.node_env())?;
         cache.publish(node);
         Ok(Self {
             tree_id,
@@ -358,6 +358,29 @@ impl KvTree {
     /// ledger record).
     pub fn root(&self) -> RootPtr {
         **self.root.load()
+    }
+
+    /// **Reader-side root adoption** (pre-RC engineering spec §6.8 item 2):
+    /// install the root a freshly-polled ledger record names, so the next
+    /// traversal descends the writer's current tree instead of spinning its
+    /// restart budget on a root pointer whose extent has been recycled.
+    ///
+    /// Legal **only** on a cache that armed reader revalidation — refused
+    /// otherwise, because on a write mount the live root is authoritative
+    /// and the ledger's is one checkpoint behind: adopting it would be time
+    /// travel across every SMO since. The write path's own root swap stays
+    /// where it belongs, inside `smo_replace`'s lock window.
+    pub fn adopt_root(&self, root: RootPtr) -> Result<(), KvError> {
+        if !self.cache.is_revalidating() {
+            return Err(KvError::Corrupt(format!(
+                "root adoption refused on tree {}: this mount has not armed reader \
+                 revalidation, and its live root is authoritative over the ledger's \
+                 (spec §6.8 item 2)",
+                self.tree_id
+            )));
+        }
+        self.root.store(Arc::new(root));
+        Ok(())
     }
 
     /// The tree id (§4.2).
@@ -1212,6 +1235,7 @@ impl KvTree {
                     loaded,
                     pinned,
                     self.cache.charge_gauge(),
+                    self.cache.node_env(),
                 )?);
             }
 
@@ -1287,6 +1311,7 @@ impl KvTree {
                     loaded,
                     true,
                     self.cache.charge_gauge(),
+                    self.cache.node_env(),
                 )?)
             } else {
                 None

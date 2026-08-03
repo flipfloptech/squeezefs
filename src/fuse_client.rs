@@ -7094,6 +7094,42 @@ impl SqueezefsFilesystem {
                     "meta_kv_node_cache_evictions".into(),
                     load(&meta_kv::META_KV_NODE_CACHE_EVICTIONS),
                 );
+                // Reader-side revalidation (spec §6.8 item 2) + the
+                // §6.2-closing partitioning tripwire. All eight are 0 for
+                // the life of a write mount — nonzero values ARE the
+                // statement "this mount is a coherent reader" — and two are
+                // must-stay-0 under every posture: `dirty_skips` (a drop
+                // pass met un-durable RAM records, i.e. revalidation was
+                // armed on a mount that writes) and `partition_refusals`
+                // (an appender reached for a node population it does not
+                // own). `keys_purged` at 0 with `epochs` growing is the
+                // honest "the R-6 data-plane trigger is not wired yet".
+                {
+                    let r = meta_kv::revalidate::revalidation_stats();
+                    metrics.insert("meta_kv_revalidate_polls".into(), r.polls.into());
+                    metrics.insert("meta_kv_revalidate_epochs".into(), r.epochs.into());
+                    metrics.insert(
+                        "meta_kv_revalidate_nodes_dropped".into(),
+                        r.nodes_dropped.into(),
+                    );
+                    metrics.insert(
+                        "meta_kv_revalidate_stale_serves".into(),
+                        r.stale_serves.into(),
+                    );
+                    metrics.insert(
+                        "meta_kv_revalidate_dirty_skips".into(),
+                        r.dirty_skips.into(),
+                    );
+                    metrics.insert(
+                        "meta_kv_revalidate_keys_purged".into(),
+                        r.keys_purged.into(),
+                    );
+                    metrics.insert("meta_kv_reader_load_retries".into(), r.load_retries.into());
+                    metrics.insert(
+                        "meta_kv_node_partition_refusals".into(),
+                        r.partition_refusals.into(),
+                    );
+                }
                 metrics.insert(
                     "meta_kv_node_appends".into(),
                     load(&meta_kv::META_KV_NODE_APPENDS),

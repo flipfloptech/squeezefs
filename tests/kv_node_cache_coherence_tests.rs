@@ -32,14 +32,14 @@ use squeezefs::meta_backend::kv::node_cache::{
     EpochPurgeSink, NodeCache, NodeCacheConfig, RootEpoch, DEFAULT_WRITEBACK_DELTA_BYTES,
 };
 use squeezefs::meta_backend::kv::record::{inode_key, InodeValue, Record, TREE_INODES};
-use squeezefs::meta_backend::kv::superblock::{classify_volume, VolumeFormat};
-use squeezefs::meta_backend::kv::{
-    META_KV_NODE_PARTITION_REFUSALS, META_KV_REVALIDATE_DIRTY_SKIPS,
-};
 use squeezefs::meta_backend::kv::revalidate::{
     resolve_revalidate_interval_ms, revalidate_trees, RevalidationPoller, REVALIDATE_INTERVAL_ENV,
 };
+use squeezefs::meta_backend::kv::superblock::{classify_volume, VolumeFormat};
 use squeezefs::meta_backend::kv::tree::{KvTree, RootPtr, SmoContext};
+use squeezefs::meta_backend::kv::{
+    META_KV_NODE_PARTITION_REFUSALS, META_KV_REVALIDATE_DIRTY_SKIPS,
+};
 use squeezefs::meta_backend::Metadata;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -131,7 +131,7 @@ async fn poll_epoch(path: &std::path::Path) -> RootEpoch {
     RootEpoch::from_ledger(&rec)
 }
 
-fn tree_of<'a>(trees: &'a [KvTree], tree_id: u8) -> &'a KvTree {
+fn tree_of(trees: &[KvTree], tree_id: u8) -> &KvTree {
     trees
         .iter()
         .find(|t| t.tree_id() == tree_id)
@@ -369,32 +369,33 @@ async fn a_root_named_identically_by_the_new_record_is_still_dropped() {
 async fn the_reader_lags_by_exactly_one_polled_checkpoint() {
     let (_f, be) = writer().await;
     let path = be.device_path().to_path_buf();
-    be.create(1, "before", 0o644, 0, 0).await.expect("create");
+    let before = be
+        .create(1, "before", 0o644, 0, 0)
+        .await
+        .expect("create")
+        .ino;
     be.checkpoint_now().await.expect("checkpoint");
     let (cache, trees, _) = reader(&path).await;
     let refs: Vec<&KvTree> = trees.iter().collect();
-    let dentries = tree_of(&trees, squeezefs::meta_backend::kv::record::TREE_DENTRIES);
-    let name_key = |n: &str| {
-        squeezefs::meta_backend::kv::record::dentry_key(
-            1,
-            squeezefs::meta_backend::kv::record::dentry_name_hash54(n),
-            0,
-        )
-    };
+    let inodes = tree_of(&trees, TREE_INODES);
     assert!(
-        dentries
-            .lookup(&name_key("before"))
+        inodes
+            .lookup(&inode_key(before))
             .await
             .expect("lookup")
             .is_some(),
-        "the polled checkpoint's dentry is visible"
+        "the polled checkpoint's inode is visible"
     );
 
-    be.create(1, "after", 0o644, 0, 0).await.expect("create");
+    let after = be
+        .create(1, "after", 0o644, 0, 0)
+        .await
+        .expect("create")
+        .ino;
     be.checkpoint_now().await.expect("checkpoint");
     assert!(
-        dentries
-            .lookup(&name_key("after"))
+        inodes
+            .lookup(&inode_key(after))
             .await
             .expect("lookup")
             .is_none(),
@@ -405,16 +406,16 @@ async fn the_reader_lags_by_exactly_one_polled_checkpoint() {
     let fresh = poll_epoch(&path).await;
     assert!(revalidate_trees(&cache, &refs, &fresh).advanced);
     assert!(
-        dentries
-            .lookup(&name_key("after"))
+        inodes
+            .lookup(&inode_key(after))
             .await
             .expect("lookup")
             .is_some(),
         "after the poll the reader serves the newer checkpoint"
     );
     assert!(
-        dentries
-            .lookup(&name_key("before"))
+        inodes
+            .lookup(&inode_key(before))
             .await
             .expect("lookup")
             .is_some(),
@@ -430,9 +431,8 @@ async fn the_reader_lags_by_exactly_one_polled_checkpoint() {
 #[tokio::test]
 async fn revalidation_never_drops_a_dirty_node_and_counts_the_tripwire() {
     let (_f, cache, addrs) = cache_with_nodes(2, 0).await;
-    let alloc = Arc::new(
-        squeezefs::meta_backend::kv::alloc_ext::ExtentAllocator::format(8, 0, 4096),
-    );
+    let alloc =
+        Arc::new(squeezefs::meta_backend::kv::alloc_ext::ExtentAllocator::format(8, 0, 4096));
     let mut ctx = SmoContext::new(alloc);
     let seq = Arc::new(AtomicU64::new(1));
     // A tree over the same cache gives us a legitimate dirty node.
@@ -461,9 +461,14 @@ async fn revalidation_never_drops_a_dirty_node_and_counts_the_tripwire() {
         cache.contains(leaf.addr()),
         "a dirty node keeps its mapping — dropping it would lose RAM records"
     );
-    // The clean hand-written nodes went.
-    for a in &addrs {
-        assert!(!cache.contains(*a));
+    // Every CLEAN node went (the tree's own root leaf is the dirty one, and
+    // a single-leaf tree resolves to it, so it may occupy one of the
+    // hand-written extents).
+    for a in addrs.iter().filter(|a| **a != leaf.addr()) {
+        assert!(
+            !cache.contains(*a),
+            "clean node {a:#x} must still be dropped alongside the skip"
+        );
     }
 }
 
@@ -498,7 +503,11 @@ async fn the_purge_trigger_fires_once_per_advance_and_never_on_an_inert_poll() {
 
     let inert = cache.revalidate(&RootEpoch::synthetic(5, 0, &[]));
     assert!(!inert.advanced);
-    assert_eq!(sink.calls.load(Ordering::Acquire), 0, "no advance, no purge");
+    assert_eq!(
+        sink.calls.load(Ordering::Acquire),
+        0,
+        "no advance, no purge"
+    );
 
     let out = cache.revalidate(&RootEpoch::synthetic(6, 0, &[]));
     assert!(out.advanced);
@@ -542,7 +551,10 @@ async fn the_tiered_purge_sink_routes_suspects_through_the_unified_purge() {
     );
     let key = "vol-0:4194304";
     tiers.read_lru.put(key, bytes::Bytes::from_static(b"stale"));
-    assert!(tiers.read_lru.get(key).is_some(), "fixture: the tier holds it");
+    assert!(
+        tiers.read_lru.get(key).is_some(),
+        "fixture: the tier holds it"
+    );
 
     let sink = TieredEpochPurge::new(tiers.clone());
     sink.note_suspect(key);
@@ -561,7 +573,12 @@ async fn the_tiered_purge_sink_routes_suspects_through_the_unified_purge() {
     assert_eq!(sink.pending(), 0, "the suspect set drains exactly once");
 
     // A second advance with nothing registered purges nothing.
-    assert_eq!(cache.revalidate(&RootEpoch::synthetic(3, 0, &[])).keys_purged, 0);
+    assert_eq!(
+        cache
+            .revalidate(&RootEpoch::synthetic(3, 0, &[]))
+            .keys_purged,
+        0
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -584,7 +601,10 @@ fn the_revalidation_cadence_derives_from_the_checkpoint_guarantee() {
     assert_eq!(resolve_revalidate_interval_ms(5000, None), 5000);
     // Explicit wins verbatim, in both directions.
     assert_eq!(resolve_revalidate_interval_ms(50, Some("250")), 250);
-    assert_eq!(resolve_revalidate_interval_ms(5000, Some("100000")), 100_000);
+    assert_eq!(
+        resolve_revalidate_interval_ms(5000, Some("100000")),
+        100_000
+    );
     // Malformed keeps the derived value.
     assert_eq!(resolve_revalidate_interval_ms(50, Some("soon")), 1000);
     assert_eq!(
@@ -657,14 +677,23 @@ async fn a_declared_reader_revalidates_through_the_real_ledger() {
     be.checkpoint_now().await.expect("checkpoint");
 
     be.arm_reader_revalidation(None).expect("declare reader");
+    // The mount armed at the record it OPENED with; the checkpoint above
+    // wrote a newer one, so the first poll is a real epoch step through the
+    // real ledger — roots adopted, stale nodes dropped, budget credited.
     let out = be.revalidate_reader().await.expect("revalidate");
-    assert!(
-        !out.advanced,
-        "the mount's own newest record is the epoch it armed at"
+    assert!(out.advanced, "a newer ledger record was polled");
+    assert_eq!(
+        out.bytes_credited,
+        out.dropped * be.superblock().node_size as u64,
+        "the drop pass credits exactly one extent per released mapping"
+    );
+    assert_eq!(
+        out.skipped_dirty, 0,
+        "a checkpointed mount has no dirt left"
     );
     for i in 0..8 {
         assert!(
-            be.lookup(1, &format!("f{i}")).await.expect("lookup").is_some(),
+            be.lookup(1, &format!("f{i}")).await.is_ok(),
             "reads survive a revalidation pass"
         );
     }
@@ -811,7 +840,11 @@ async fn a_foreign_append_into_our_log_is_refused_instead_of_overwritten() {
     let frame = squeezefs::meta_backend::kv::node::encode_bset_frame(
         &cache.config().layout,
         node.node_seq(),
-        &[Record::put(inode_key(9).to_vec(), 9, inode_value(9).encode())],
+        &[Record::put(
+            inode_key(9).to_vec(),
+            9,
+            inode_value(9).encode(),
+        )],
         9,
     )
     .expect("encode a peer frame");
@@ -866,7 +899,11 @@ async fn the_foreign_append_probe_is_inert_on_a_solo_volume() {
     let frame = squeezefs::meta_backend::kv::node::encode_bset_frame(
         &cache.config().layout,
         node.node_seq(),
-        &[Record::put(inode_key(9).to_vec(), 9, inode_value(9).encode())],
+        &[Record::put(
+            inode_key(9).to_vec(),
+            9,
+            inode_value(9).encode(),
+        )],
         9,
     )
     .expect("encode frame");

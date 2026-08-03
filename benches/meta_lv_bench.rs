@@ -476,21 +476,6 @@ fn bench_kv_tree(c: &mut Criterion) {
 
     group.finish();
 }
-
-/// PR M9 micro-benches (design-metadata-throughput §5.7 D7): the **hot
-/// parent-key probe** — the create storm's dominant fold shape (a parent
-/// inode `Put` accumulating one Δtime per create until compaction), in its
-/// three read regimes:
-///
-/// - `overlay_head`: the chain is in the open delta — D7.a serves the
-///   materialized folded head (zero decodes);
-/// - `bset_resident_memo`: the chain froze into the node's bset log —
-///   D7.b's snapshot memo serves repeat folds (zero decodes after the
-///   first);
-/// - `from_scratch_fold`: the same records folded through the raw §4.2
-///   algebra every time — the pre-M9 per-read price, kept as the in-tip
-///   comparator (and the shape `InodeDelta::decode` charged 7.9 % of
-///   daemon CPU for in the baseline profile).
 /// **The node-cache hit path** — the hottest metadata path in the tree:
 /// every traversal step of every lookup/create/unlink resolves its node
 /// through [`NodeCache::try_get`], so anything added here is paid per
@@ -574,6 +559,20 @@ fn bench_kv_node_cache(c: &mut Criterion) {
     group.finish();
 }
 
+/// PR M9 micro-benches (design-metadata-throughput §5.7 D7): the **hot
+/// parent-key probe** — the create storm's dominant fold shape (a parent
+/// inode `Put` accumulating one Δtime per create until compaction), in its
+/// three read regimes:
+///
+/// - `overlay_head`: the chain is in the open delta — D7.a serves the
+///   materialized folded head (zero decodes);
+/// - `bset_resident_memo`: the chain froze into the node's bset log —
+///   D7.b's snapshot memo serves repeat folds (zero decodes after the
+///   first);
+/// - `from_scratch_fold`: the same records folded through the raw §4.2
+///   algebra every time — the pre-M9 per-read price, kept as the in-tip
+///   comparator (and the shape `InodeDelta::decode` charged 7.9 % of
+///   daemon CPU for in the baseline profile).
 fn bench_kv_fold(c: &mut Criterion) {
     use squeezefs::meta_backend::kv::record::{fold_newest_first, RecordKind};
 

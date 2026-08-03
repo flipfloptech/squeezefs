@@ -53,12 +53,14 @@ pub mod bset;
 pub mod builder;
 pub mod checkpoint;
 pub mod conveyor_core;
+pub mod epoch_core;
 pub mod journal;
 pub mod journal_core;
 pub mod node;
 pub mod node_cache;
 pub mod node_state_core;
 pub mod record;
+pub mod revalidate;
 pub mod slot_cursor_core;
 pub mod slot_set;
 pub mod superblock;
@@ -104,6 +106,61 @@ pub static META_KV_NODE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 /// pinned until writeback; interior nodes and roots pinned uncondition-
 /// ally). Surfaced as `meta_kv_node_cache_evictions` in K6a/K7.
 pub static META_KV_NODE_CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+// -- Reader-side node-cache revalidation (spec §6.8 item 2) ---------------
+//
+// All six are 0 for the whole life of a write mount — nothing arms
+// revalidation there — so nonzero values are themselves the statement
+// "this mount is a coherent reader".
+
+/// Ledger polls a reader performed (one 128 KiB A/B root-ledger read
+/// each). `polls` growing with `meta_kv_revalidate_epochs` flat is the
+/// designed idle-writer steady state: a checkpoint cycle only writes a
+/// record when it had work (`checkpoint.rs::tick`), so the cadence is
+/// inert until the writer commits something.
+pub static META_KV_REVALIDATE_POLLS: AtomicU64 = AtomicU64::new(0);
+
+/// Epoch advances (polls that found a newer ledger record). Each one is
+/// exactly one staleness step of the documented consistency model.
+pub static META_KV_REVALIDATE_EPOCHS: AtomicU64 = AtomicU64::new(0);
+
+/// Nodes dropped by revalidation drop passes — the reader's reload bill.
+/// `nodes_dropped / epochs` is the live working-set size; if it approaches
+/// the whole cache every poll, the operator's cadence is finer than the
+/// workload wants (see docs/operations.md § Read-only coherent mounts).
+pub static META_KV_REVALIDATE_NODES_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Hit-path rejections of a stale-stamped node (the lazy half of the drop
+/// pass: a node published under a superseded epoch is a miss, even before
+/// the sweep reaches it). Nonzero is normal under a busy writer.
+pub static META_KV_REVALIDATE_STALE_SERVES: AtomicU64 = AtomicU64::new(0);
+
+/// **Must stay 0**: dirty nodes a drop pass refused to drop. A reader has
+/// no dirty nodes by construction, so any growth means revalidation was
+/// armed on a mount that writes — the pass keeps the node (dropping it
+/// would lose RAM records no disk image holds) and this counter is the
+/// evidence.
+pub static META_KV_REVALIDATE_DIRTY_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+/// Block keys an epoch advance purged through the R-6 unified purge
+/// (`TieredCache::purge_block_key`) — the §6.8 item-5 remote trigger's
+/// engagement gauge. 0 with `epochs` growing means the data-plane half is
+/// not wired (honest, and visible, rather than silently absent).
+pub static META_KV_REVALIDATE_KEYS_PURGED: AtomicU64 = AtomicU64::new(0);
+
+/// Extent loads a reader retried because the read raced the writer's
+/// in-flight append (a torn frame followed by a complete one — §4.5's loud
+/// verdict on a crashed writer, a plain race here). Bounded per load;
+/// growth is normal on a reader of a hot volume, and a load that fails
+/// past the budget still surfaces the verdict.
+pub static META_KV_READER_LOAD_RETRIES: AtomicU64 = AtomicU64::new(0);
+
+/// **Must stay 0**: partitioning violations refused at the node layer
+/// (spec §6.2 closing / §6.3) — a non-authority appender attempting to
+/// mutate interior state, an armed reader attempting to mutate anything,
+/// or an append whose destination page already holds a peer's frame.
+/// Every one of these is silent divergence prevented.
+pub static META_KV_NODE_PARTITION_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
 /// Node splits executed by the serialized SMO task (design §4.6/§10).
 /// Surfaced as `meta_kv_node_splits` in K6a/K7.

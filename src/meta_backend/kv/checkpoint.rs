@@ -926,8 +926,11 @@ pub fn resolve_max_dirty_nodes(budget_bytes: u64, node_size: u64, env: Option<&s
 }
 
 /// Checkpoint cadence ceiling: a cycle runs at least this often even when
-/// no other trigger fires (§4.6 pt 2 "every ≤ 1 s").
-const CHECKPOINT_MAX_AGE_MS: u128 = 1000;
+/// no other trigger fires (§4.6 pt 2 "every ≤ 1 s"). Public because it is
+/// also the **reader's** guarantee: a coherent reader cannot see records
+/// faster than the writer mints them, so the §6.8 item-2 poll cadence
+/// derives from this ceiling (`super::revalidate`).
+pub const CHECKPOINT_MAX_AGE_MS: u128 = 1000;
 
 /// §4.7 wedged-tail audit bound (design-smo-replay-currency PR 4
 /// clause b; the [`KvMetaBackend::checkpoint_past`] precedent's shape):

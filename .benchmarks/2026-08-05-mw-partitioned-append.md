@@ -1,9 +1,14 @@
 # 2026-08-05 — Partitioning the per-volume single-appender append structures
 
-Branch `feat/mw-partitioned-append` (off dev `e7ce625f`). Closes **spec
-§6.2 items 2, 3 and 4** — the three durable-format assumptions that make
-the metadata plane a one-appender machine — behind incompat bit 8,
-**built but NOT stamped** (execution-plan ruling **D9**).
+Branch `feat/mw-partitioned-append`, developed off dev `e7ce625f` and
+**rebased onto dev `4f219082`** (30 commits later: byte-range custody /
+S11, FUSE-3/4 + MEM-4/7 + POSIX-14, VAL-7 + the RES tail, ENG process/CI
+with the new `src/env_knobs.rs` registry — this branch adds **no env
+knobs**, so it has no registry entry to make; the rebase was clean, dev
+touched only `kv/node_cache.rs` inside the KV layer). Closes **spec §6.2
+items 2, 3 and 4** — the three durable-format assumptions that make the
+metadata plane a one-appender machine — behind incompat bit 8, **built but
+NOT stamped** (execution-plan ruling **D9**).
 
 Scope discipline (stated first, because it is the easiest thing to get
 wrong): this lands **formats**, not arbitration. Who may append, and the
@@ -12,12 +17,12 @@ this work had to reach is: *the on-disk structures no longer assume
 exactly one appender, and a second appender's transactions are either
 correctly merged or loudly refused — never silently dropped.*
 
-| Commit | What |
+| Commit (post-rebase) | What |
 |---|---|
-| `d7dbec0e` | `bench(meta)` — price the solo journal/ledger/allocator hot paths FIRST (the baseline the partitioned forms must not move) |
-| `7a1666e2` | `test(meta)` — 27 partitioned-append contracts, all red |
-| `ecf410fd` | `feat(meta)` — the three partitioned forms + the not-stamped bit |
-| (this note) | loom models ×2 with weakening evidence, the ragged-page case, evidence |
+| `99b291a3` | `bench(meta)` — price the solo journal/ledger/allocator hot paths FIRST (the baseline the partitioned forms must not move) |
+| `732f2327` | `test(meta)` — 27 partitioned-append contracts, all red |
+| `2e7b5a69` | `feat(meta)` — the three partitioned forms + the not-stamped bit |
+| `d7c596e8` | `perf(meta)` — the bracket's measured fix (`part()` indexes instead of dividing), 2 loom models with weakening evidence, the ragged-page case, this note |
 
 ## 1. The three assumptions, and what replaced them
 
@@ -221,30 +226,44 @@ core with a writer dimension), which the existing
 
 ## 4. Verification
 
+All on the rebased tree (base `4f219082`), `--test-threads=1`:
+
 | Gate | Result |
 |---|---|
-| `tests/kv_partitioned_append_tests.rs` (27 cases, `--test-threads=1`) | green |
-| `kv_journal_tests`, `kv_alloc_tests`, `kv_node_tests`, `kv_tree_tests`, `kv_smo_crash_completeness_tests` | green |
-| `crash_contract_tests`, `kv_backend_tests` | green **except three pre-existing reds on the base commit** (below) |
+| `tests/kv_partitioned_append_tests.rs` (27 cases) | **green** |
+| `kv_journal_tests` (21), `kv_alloc_tests` (14), `kv_node_tests`, `kv_tree_tests` (12) | green |
+| `kv_smo_crash_completeness_tests` | 11 green, 1 **pre-existing** red (below) |
+| `crash_contract_tests` | 24 green, 1 **pre-existing** red |
+| `kv_backend_tests` | 32 green, 2 **pre-existing** reds |
 | `cargo clippy --all-targets --all-features -- -D warnings` | clean |
 | `cargo fmt --check` | clean |
 | `cargo doc --no-deps` | no new warnings (14 pre-existing, none in the touched files) |
 | `cargo bench --benches -- --test` (smoke) | green |
 | `tests/run_loom.sh` | **63/63** (61 pre-existing + 2 new) |
+| `src/env_knobs.rs` registry | n/a — this branch adds no env knob |
 
-### Pre-existing reds on the base commit (NOT this branch's)
+### Pre-existing reds on the base commit (NOT this branch's) — **four, one family**
 
-Verified by stashing this branch's `src` and re-running on pristine
-`e7ce625f`:
+Verified twice, before and after the rebase, by checking out the base
+commit's `src` (and, where the test file itself changed, the base test
+file) and re-running:
 
-* `crash_contract_tests::test_kv_v3_torn_newest_ledger_mount_serves_predecessor` — post-fold digest mismatch after the torn-newest-slot fallback;
-* `kv_backend_tests::v3_mutations_survive_clean_shutdown_remount` — post-fold digest mismatch across shutdown/remount;
-* `kv_backend_tests::v3_ring_full_liveness_storm_drains`.
+| Test | Shape |
+|---|---|
+| `kv_smo_crash_completeness_tests::replay_twice_digest_stable_across_smo_windows` | replay-twice digests diverge |
+| `crash_contract_tests::test_kv_v3_torn_newest_ledger_mount_serves_predecessor` | post-fold digest mismatch after the torn-newest-slot fallback |
+| `kv_backend_tests::v3_mutations_survive_clean_shutdown_remount` | post-fold digest mismatch across shutdown/remount |
+| `kv_backend_tests::v3_ring_full_liveness_storm_drains` | ring-full liveness storm |
 
-All three fail identically without this branch's changes. Flagged for the
-orchestrator: two of them are the same shape (a remount serving different
-post-fold state), which smells like one defect in the current dev tip's
-replay/flush path rather than three.
+All four fail **byte-identically** with this branch's `src` reverted to
+base `4f219082` (counts match exactly: crash_contract 24 passed/1 failed;
+kv_backend 32 passed/2 failed). Flagged for the orchestrator: three of the
+four are the same shape — a replay or remount serving *different post-fold
+state* — which smells like ONE defect in the current dev tip's
+replay/flush path rather than three, and it is squarely in the area this
+branch's formats sit on top of. Worth a red-first repro before S4 wires
+the partitioned forms into mount, because a mount-side divergence would be
+indistinguishable from a partitioning bug once N appenders exist.
 
 ### Loom, with weakening evidence
 

@@ -47,8 +47,8 @@ use squeezefs::meta_backend::kv::record::{
 };
 use squeezefs::meta_backend::kv::superblock::{
     classify_volume, journal_ring_len, validate_node_kib, write_superblock_v3, SuperblockV3,
-    VolumeFormat, FEATURE_INCOMPAT_KV_V3, JOURNAL_RING_MAX, JOURNAL_RING_MIN,
-    SUPERBLOCK_V3_VERSION,
+    VolumeFormat, FEATURES_INCOMPAT_KNOWN, FEATURE_INCOMPAT_KV_V3, JOURNAL_RING_MAX,
+    JOURNAL_RING_MIN, SUPERBLOCK_V3_VERSION,
 };
 use squeezefs::meta_backend::kv::KvError;
 use squeezefs::meta_backend::{open_volume_for_mount, Metadata};
@@ -500,16 +500,27 @@ async fn v3_unknown_incompat_bit_refuses_naming_it_and_unknown_ro_does_not() {
     };
 
     // Unknown incompat bit ⇒ refuse mount naming the bit (§6.1).
+    //
+    // The probe bit is DERIVED as the lowest bit this binary does not know,
+    // because a hardcoded one rots the moment a stage claims it: this test
+    // pinned bit 9, which became `KV_BLOCK_REFCOUNTS`, and bit 10 went to the
+    // writer scope in the same wave. Deriving it keeps the assertion about the
+    // property (an unknown bit refuses, and the message names it) instead of
+    // about a bit number that legitimately changes.
+    let probe_bit = (1..64u32)
+        .find(|b| FEATURES_INCOMPAT_KNOWN & (1u64 << b) == 0)
+        .expect("some incompat bit must still be unclaimed");
     let mut incompat = sb.clone();
-    incompat.features_incompat |= 1 << 9;
+    incompat.features_incompat |= 1u64 << probe_bit;
     write_superblock_v3(file.path(), &incompat).await.unwrap();
     let err = classify_volume(file.path())
         .await
         .expect_err("unknown incompat bits must refuse the mount")
         .to_string();
     assert!(
-        err.contains("bit 9") || err.contains("0x200"),
-        "the refusal must name the unknown bit, got: {err}"
+        err.contains(&format!("bit {probe_bit}"))
+            || err.contains(&format!("{:#x}", 1u64 << probe_bit)),
+        "the refusal must name the unknown bit {probe_bit}, got: {err}"
     );
 
     // Pre-watermark v3 (incompat bit 1 absent) ⇒ refuse loud, naming the

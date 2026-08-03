@@ -1454,6 +1454,118 @@ fn bench_block_refs(c: &mut Criterion) {
 /// NOT RUN (ruling D11: no benches until the DLM can serve N readers and
 /// writers). Numbers get measured on the sanctioned venue
 /// (`tests/run_bench_baseline.sh`), never here.
+/// **fsck class C9 — the referenced-ino set** (`src/fsck.rs`
+/// [`squeezefs::fsck::InoBitmap`]): the price of asking "which inodes are
+/// NAMED" once, instead of "who names me" per inode (POSIX-4's unindexed
+/// reverse-dentry scan, which is O(total dentries) PER INODE).
+///
+/// **Field-derived shape.** The design cap is >= 100 M inodes
+/// (`docs/design-cow-kv-metadata.md` §4.2 caps) and minting rotates over
+/// `MINT_SPREAD = 64` slots per metadata volume
+/// (`docs/design-dynamic-meta-routing.md` §5.4), so a volume's inos are
+/// spread across 64 dense keyspaces — the shape here is **1 M dentry
+/// targets over 64 slots** at the DERIVED routing width (65536), scaled
+/// down from the cap only because a Criterion sample must fit a
+/// measurement window; the per-reference cost is what extrapolates.
+/// Access order is deliberately RANDOM: dentry keys are
+/// `(parent, hash54(name))`-ordered, so a sequential dentry walk delivers
+/// child inos in hash order — i.e. random word touches across each slot's
+/// bit vector. Sequential-order marking is included only as the
+/// cache-friendly bound, never as the claim.
+///
+/// The difference pass is priced at the same population with 8 unnamed
+/// inodes (the damaged-volume shape: a handful of orphans in a healthy
+/// tree), because that is the case that must be nearly free — a healthy
+/// volume's whole C9 verdict is one word-parallel `AND NOT` scan.
+///
+/// **Prediction** (dev box, release, single thread — RECORD, do not
+/// assert; the fsck-scan anchor is `tests/fsck_tests.rs`'s measured
+/// 117,518 inodes/s C1-C6 scan and 1,142,885 inodes/s census walk):
+///
+/// * `mark/random` <= ~40 ns/ino (one per-slot map lookup + one word
+///   read-modify-write; a 1 M-ino slot set is ~125 KB of bits, so random
+///   touches miss L2 and hit L3), i.e. >= 25 M marks/s. At the 100 M cap
+///   that is <= ~4 s of CPU for the whole referenced pass, against the
+///   ~14 min the same volume's inode walk already costs at the measured
+///   scan rate — under 1 %.
+/// * `mark/sequential` <= ~5 ns/ino (same work, cache-resident).
+/// * `difference/8_unnamed` <= ~1 ns per LIVE ino (population/64 word
+///   AND-NOTs plus 8 emits) — the healthy-volume verdict is a linear
+///   scan, not per-inode work.
+///
+/// **Falsification.** If `mark/random` exceeds ~100 ns/ino, or
+/// `difference` exceeds ~4 ns per live ino, the per-slot `HashMap` lookup
+/// (not the bit math) dominates and the representation must change — a
+/// slot-indexed `Vec` keyed by slot id, or a single flat bit vector per
+/// volume — and `src/fsck.rs`'s cost claim ("a healthy volume pays only
+/// the bitmap scan") must be restated with the measured numbers. If
+/// `difference` instead scales with the number of MARKED inos rather than
+/// the population, the word-parallel AND-NOT regressed to a per-bit
+/// `contains` (the shape this group exists to prevent).
+fn bench_fsck_c9_refset(c: &mut Criterion) {
+    use squeezefs::fsck::InoBitmap;
+
+    const WIDTH: u64 = 65536;
+    const SLOTS: u64 = 64;
+    const POPULATION: u64 = 1_000_000;
+
+    // Global inos as the mint rotor produces them: raw local `r` in slot
+    // `s` encodes to `(r - 2) * W + s + 2`.
+    let ino_of = |raw: u64, slot: u64| (raw - 2) * WIDTH + slot + 2;
+    let sequential: Vec<u64> = (0..POPULATION)
+        .map(|i| ino_of(2 + i / SLOTS, i % SLOTS))
+        .collect();
+    // Hash order == random order for this purpose (xxh3 of the name is
+    // what orders the dentry tree); a fixed permutation keeps the bench
+    // deterministic.
+    let random: Vec<u64> = {
+        let mut v = sequential.clone();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for i in (1..v.len()).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let j = (state % (i as u64 + 1)) as usize;
+            v.swap(i, j);
+        }
+        v
+    };
+
+    let mut group = c.benchmark_group("fsck_c9_refset");
+    group.throughput(criterion::Throughput::Elements(POPULATION));
+    for (name, order) in [("sequential", &sequential), ("random", &random)] {
+        group.bench_with_input(BenchmarkId::new("mark", name), order, |b, inos| {
+            b.iter(|| {
+                let mut refs = InoBitmap::new(WIDTH);
+                for &ino in inos.iter() {
+                    refs.mark(black_box(ino));
+                }
+                black_box(refs.marked())
+            });
+        });
+    }
+
+    // The difference: a healthy tree with 8 unnamed inodes.
+    let mut live = InoBitmap::new(WIDTH);
+    for &ino in &sequential {
+        live.mark(ino);
+    }
+    let mut referenced = InoBitmap::new(WIDTH);
+    for (i, &ino) in sequential.iter().enumerate() {
+        if i % 125_000 != 0 {
+            referenced.mark(ino);
+        }
+    }
+    group.bench_function("difference/8_unnamed", |b| {
+        b.iter(|| {
+            let mut found = 0u64;
+            live.each_absent_from(&referenced, |ino| found += black_box(ino) & 1);
+            black_box(found)
+        });
+    });
+    group.finish();
+}
+
 fn bench_crossvol_tx(c: &mut Criterion) {
     use squeezefs::meta_backend::crossvol_tx::{intent_key, IntentRecord, XvOp, XvStep};
 
@@ -1573,6 +1685,7 @@ criterion_group!(
     bench_kv_journal,
     bench_ino_cursors,
     bench_block_refs,
+    bench_fsck_c9_refset,
     bench_crossvol_tx,
     bench_xattr_name_screen,
     bench_superblock_cycle,

@@ -435,21 +435,29 @@ impl InoBitmap {
     /// Every ino in `self` whose bit is clear in `other` — the C9
     /// difference (live inodes that no dentry names). Visits in
     /// unspecified order; allocates nothing.
+    ///
+    /// Word-parallel: one `AND NOT` per 64 inodes and one per-slot lookup
+    /// per word vector, so a healthy volume's whole difference is a linear
+    /// scan of `population / 64` words with NO per-inode work — the
+    /// per-inode cost is paid only for inodes that really are unnamed.
+    /// Both sets must come from the same routing width (they do: the
+    /// width is the volume set's durable one).
     pub fn each_absent_from(&self, other: &Self, mut f: impl FnMut(u64)) {
+        debug_assert_eq!(
+            self.width, other.width,
+            "difference across different routing widths would compare unrelated bits"
+        );
         for (&slot, words) in &self.slots {
+            let theirs = other.slots.get(&slot);
             for (w, &word) in words.iter().enumerate() {
-                if word == 0 {
-                    continue;
-                }
-                for b in 0..64u64 {
-                    if word & (1u64 << b) == 0 {
-                        continue;
-                    }
+                let mut absent = word & !theirs.and_then(|t| t.get(w)).copied().unwrap_or(0);
+                while absent != 0 {
+                    let b = absent.trailing_zeros() as u64;
+                    absent &= absent - 1;
                     let raw = (w as u64) * 64 + b + 2;
-                    let ino = crate::meta_backend::make_global_ino_width(raw, slot, self.width);
-                    if !other.contains(ino) {
-                        f(ino);
-                    }
+                    f(crate::meta_backend::make_global_ino_width(
+                        raw, slot, self.width,
+                    ));
                 }
             }
         }

@@ -4413,17 +4413,22 @@ impl DataRouter {
         // Spec §6.2 item 1: the fresh CoW indirect-map blob this save
         // names (if any) — its durable reference is taken in the same tx.
         let mut new_indirect_key: Option<String> = None;
-        // The layout as it would be persisted INLINE (block map retained under
-        // the inline sentinel). The indirect branch below overwrites the map /
-        // id only if the serialized value spills past the per-volume cap.
-        let mut layout = LayoutMetadata {
-            file_type: m.file_type.to_string(),
+        // PERF-8 — **the layout is serialized from a BORROWING view.** The
+        // owned `LayoutMetadata` this used to build cloned the whole block
+        // map (one heap allocation per block) purely to feed bincode, on top
+        // of the two passes bincode already makes: three O(file-size) passes
+        // per publish batch. `LayoutMetadataRef` borrows the live map and
+        // encodes byte-identically (contract pinned in
+        // `tests/layout_wire_tests.rs`).
+        let inline_block_map_id = m.block_map.as_ref().map(|_| format!("block_map_{}", ino));
+        let inline_view = crate::layout_wire::LayoutMetadataRef {
+            file_type: &m.file_type,
             size: m.size,
-            block_map_id: m.block_map.as_ref().map(|_| format!("block_map_{}", ino)),
-            block_prefix: m.block_prefix.as_deref().map(str::to_string),
-            file_id: m.file_id.as_deref().map(str::to_string),
-            data_key: m.data_key.as_ref().map(|b| b.to_vec()),
-            block_map: m.block_map.as_deref().cloned(),
+            block_map_id: inline_block_map_id.as_deref(),
+            block_prefix: m.block_prefix.as_deref(),
+            file_id: m.file_id.as_deref(),
+            data_key: m.data_key.as_deref(),
+            block_map: m.block_map.as_deref(),
         };
 
         // §5.3: spill the inline block map to an indirect block only when the
@@ -4433,17 +4438,47 @@ impl DataRouter {
         // file whose block map serializes within ~60 KiB (≈ 6 GiB at 4 MiB
         // blocks) keeps an inline map. Beyond the cap the indirect mechanism
         // is used unchanged.
-        let inline_bytes = bincode::serialize(&layout).map_err(|e| {
+        //
+        // PERF-8: the decision reads the serialized SIZE (no buffer), so the
+        // spill arm no longer throws away a whole encode of the inline value
+        // it never persists. bincode's `serialize` computes the same size to
+        // presize its `Vec`, so the inline arm pays nothing for the split.
+        let inline_len = inline_view.encoded_len().map_err(|e| {
             SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Failed to serialize binary layout: {:?}", e),
+                format!("Failed to size binary layout: {e}"),
             ))
-        })?;
+        })? as usize;
         let needs_indirect = m.block_map.is_some()
-            && inline_bytes.len()
+            && inline_len
                 > backend
                     .xattr_value_cap(ino)
                     .saturating_sub(LAYOUT_INLINE_HEADROOM);
+        // Only the arm that persists the inline value encodes it.
+        let inline_bytes = if needs_indirect {
+            Vec::new()
+        } else {
+            inline_view.encode().map_err(|e| {
+                SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Failed to serialize binary layout: {e}"),
+                ))
+            })?
+        };
+        // The non-map fields as the delta/indirect arms need them (the map
+        // itself is either persisted inline above or spilled below).
+        let mut layout = LayoutMetadata {
+            file_type: m.file_type.to_string(),
+            size: m.size,
+            block_map_id: inline_block_map_id,
+            block_prefix: m.block_prefix.as_deref().map(str::to_string),
+            file_id: m.file_id.as_deref().map(str::to_string),
+            data_key: m.data_key.as_ref().map(|b| b.to_vec()),
+            // PERF-8: never a map clone — the inline value is already
+            // encoded, and the indirect arm serializes the map separately
+            // (`encode_indirect_block_map`) from the live borrow.
+            block_map: None,
+        };
         if is_publish {
             publish_phase_record(PublishPhase::SaveEncode, t_encode);
         }
@@ -4522,7 +4557,8 @@ impl DataRouter {
             // can vanish on power loss.
             nvme_writer.flush().await?;
 
-            layout.block_map = None;
+            // (`layout.block_map` is already None — PERF-8: the inline
+            // value was encoded from the borrowing view, never cloned here.)
             layout.block_map_id = Some(format!("indirect:{}", block_key));
             new_indirect_key = Some(block_key.clone());
 

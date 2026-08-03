@@ -328,3 +328,65 @@ fn layout_delta_onto_indirect_base_fails_loud() {
         "the refusal must name the indirect base, got: {msg}"
     );
 }
+
+// =========================================================================
+// PERF-8 — the borrowing serialize view is byte-identical.
+//
+// The publish path serializes the layout through `LayoutMetadataRef`
+// (borrowed fields) instead of building an owned `LayoutMetadata`, whose
+// construction cloned the whole block map — one heap allocation PER BLOCK
+// — purely to feed bincode. That is only sound if the encoding is
+// IDENTICAL, since the bytes are the persisted on-disk value and the
+// delta fold's base.
+// =========================================================================
+
+#[test]
+fn borrowed_view_encodes_byte_identically() {
+    use squeezefs::layout_wire::{encode_layout, LayoutMetadataRef};
+
+    // Every field populated, a 1,024-block map (the 4 GiB-file shape the
+    // publish path pays this on), and the all-None shape.
+    let mut full = base_layout(1024, 4 << 30);
+    full.block_map_id = Some("block_map_7".to_string());
+    full.block_prefix = Some("sqz:vol-00aa11bb".to_string());
+    full.file_id = Some("stage-0007".to_string());
+    full.data_key = Some(vec![0xA5u8; 64]);
+
+    let bare = LayoutMetadata {
+        file_type: "inline".into(),
+        size: 0,
+        block_map_id: None,
+        block_prefix: None,
+        file_id: None,
+        data_key: None,
+        block_map: None,
+    };
+
+    let empty_map = LayoutMetadata {
+        file_type: "striped".into(),
+        size: 1,
+        block_map: Some(HashMap::new()),
+        ..bare.clone()
+    };
+
+    for (tag, owned) in [("full", &full), ("bare", &bare), ("empty_map", &empty_map)] {
+        let want = encode_layout(owned).expect("owned encode");
+        let view = LayoutMetadataRef::of(owned);
+        let got = view.encode().expect("borrowed encode");
+        assert_eq!(
+            got, want,
+            "{tag}: borrowed serialize view must be byte-identical to the owned value"
+        );
+        // The `needs_indirect` decision input must agree with the bytes it
+        // stands in for (PERF-8 decides on the size, encodes only when the
+        // inline arm wins).
+        assert_eq!(
+            view.encoded_len().expect("size probe") as usize,
+            want.len(),
+            "{tag}: encoded_len must equal the encoded length"
+        );
+        // And the bytes still decode to the same logical value.
+        let back: LayoutMetadata = bincode::deserialize(&got).expect("decode");
+        assert_layout_eq(&back, owned);
+    }
+}

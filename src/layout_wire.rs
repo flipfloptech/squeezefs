@@ -93,6 +93,88 @@ fn serialize_block_map_sorted<S: Serializer>(
     }
 }
 
+/// The **borrowing** serialize view of [`LayoutMetadata`] (PERF-8).
+///
+/// The publish path used to build an owned `LayoutMetadata` just to
+/// serialize it — which cloned the whole `HashMap<u32, String>` (one heap
+/// allocation PER BLOCK: ~200 KB of alloc + hash traffic per publish batch
+/// on a 4 GiB file) on top of the two passes bincode already makes. This
+/// view borrows every field instead, so the encode walks the live map in
+/// place.
+///
+/// **Byte-identity is a contract**, pinned by
+/// `tests/layout_wire_tests.rs::borrowed_view_encodes_byte_identically`:
+/// field order, types and the canonical sorted map serializer are the same
+/// as [`LayoutMetadata`]'s, and bincode encodes `&str`/`&[u8]`/`&HashMap`
+/// exactly as their owned counterparts. Decoding is unchanged — this is a
+/// serialize-only mirror.
+#[derive(serde::Serialize)]
+pub struct LayoutMetadataRef<'a> {
+    pub file_type: &'a str,
+    pub size: u64,
+    pub block_map_id: Option<&'a str>,
+    pub block_prefix: Option<&'a str>,
+    pub file_id: Option<&'a str>,
+    pub data_key: Option<&'a [u8]>,
+    #[serde(serialize_with = "serialize_block_map_sorted_ref")]
+    pub block_map: Option<&'a HashMap<u32, String>>,
+}
+
+/// [`serialize_block_map_sorted`] over a borrowed map — same canonical
+/// ascending-block-index encoding, byte for byte.
+fn serialize_block_map_sorted_ref<S: Serializer>(
+    map: &Option<&HashMap<u32, String>>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    struct Sorted<'a>(&'a HashMap<u32, String>);
+    impl serde::Serialize for Sorted<'_> {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            let mut entries: Vec<(&u32, &String)> = self.0.iter().collect();
+            entries.sort_unstable_by_key(|(b, _)| **b);
+            let mut m = s.serialize_map(Some(entries.len()))?;
+            for (b, k) in entries {
+                m.serialize_entry(b, k)?;
+            }
+            m.end()
+        }
+    }
+    match map {
+        None => s.serialize_none(),
+        Some(m) => s.serialize_some(&Sorted(m)),
+    }
+}
+
+impl<'a> LayoutMetadataRef<'a> {
+    /// Borrow an owned layout (tests / callers that already hold one).
+    pub fn of(l: &'a LayoutMetadata) -> Self {
+        Self {
+            file_type: &l.file_type,
+            size: l.size,
+            block_map_id: l.block_map_id.as_deref(),
+            block_prefix: l.block_prefix.as_deref(),
+            file_id: l.file_id.as_deref(),
+            data_key: l.data_key.as_deref(),
+            block_map: l.block_map.as_ref(),
+        }
+    }
+
+    /// Serialized length WITHOUT building the buffer — the `needs_indirect`
+    /// decision input. bincode's `serialize` computes this same size first
+    /// to presize its `Vec`, so deciding on it costs nothing extra and
+    /// saves the whole wasted encode on the indirect (spill) arm.
+    pub fn encoded_len(&self) -> Result<u64, LayoutWireError> {
+        bincode::serialized_size(self)
+            .map_err(|e| LayoutWireError::Malformed(format!("layout size probe failed: {e}")))
+    }
+
+    /// Encode this view (byte-identical to `encode_layout` of the same
+    /// logical value).
+    pub fn encode(&self) -> Result<Vec<u8>, LayoutWireError> {
+        bincode::serialize(self)
+            .map_err(|e| LayoutWireError::Malformed(format!("layout encode failed: {e}")))
+    }
+}
+
 /// Leading `u16` (LE) of a layout delta payload. Deliberately outside
 /// `InodeDelta`'s valid mask space (`mask & !DELTA_MASK_ALL != 0`), so
 /// the shared fold can branch on the payload alone and a pre-campaign

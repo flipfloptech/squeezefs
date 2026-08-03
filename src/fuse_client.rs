@@ -3797,7 +3797,9 @@ pub struct Metrics {
     /// stamped by a DEAD filesystem generation (or predated generation
     /// stamping) — the reformat-over-stale-staging guard (`cache::nvme::
     /// bind_staging_generation`). One increment per discarded dir; exactly
-    /// once per dir after a reformat, 0 on every warm restart.
+    /// once per dir after a reformat, 0 on every warm restart. Also fires
+    /// for a dead FOREIGN-node root (§6.2 item 10) — the reason is
+    /// attributed by `staging_foreign_scope_discards`.
     pub staging_generation_discards: Align64<AtomicU64>,
     /// §6.2 item 10: staging roots adopted through the Phase-8 writer-scope
     /// UPGRADE arm — bound to the un-scoped set generation, re-stamped

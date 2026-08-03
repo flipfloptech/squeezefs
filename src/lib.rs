@@ -411,6 +411,17 @@ macro_rules! fs_key {
 ///
 /// Prefer these helpers over ad-hoc `format!(…)` so key shape stays consistent and
 /// we avoid redundant intermediate `String`s on the FUSE write/read path.
+///
+/// # Writer scope (spec §6.2 item 8)
+///
+/// The staging families (`active_block:`, `active_block_ext:`, `mapping:`)
+/// name node-PRIVATE payloads, so on a writer-scoped volume set (incompat
+/// bit 10 — never stamped today, ruling D9) they carry a trailing
+/// `:w_{16 hex}` scope component. It is appended by these helpers only:
+/// an ad-hoc `format!` of a full key would mint an UNSCOPED key that
+/// probes the wrong record. Scan PREFIXES stay unscoped by design (a
+/// foreign record must be visible to be classified) — see
+/// [`crate::writer_scope`].
 pub mod keys {
     use super::FsKey;
     use compact_str::CompactString;

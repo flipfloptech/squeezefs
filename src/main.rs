@@ -467,13 +467,13 @@ enum Commands {
         #[arg(long)]
         interception: bool,
 
-        /// UID admitted on the ADMIN control lane (VAL-7c)
+        /// Uid admitted on the admin control lane
         ///
         /// The admin lane serves the mutating maintenance verbs
         /// (`job …`, `volume …`, health overrides) and admits uid 0 plus
-        /// exactly this uid. Default: the invoking owner (which under
+        /// exactly this uid. Default: the invoking owner, which under
         /// sudo derives from `SUDO_UID` — caller-controlled environment,
-        /// hence this explicit surface). Equivalent to
+        /// which is why this explicit surface exists. Equivalent to
         /// `-o admin_uid=<uid>`.
         #[arg(long)]
         admin_uid: Option<u32>,

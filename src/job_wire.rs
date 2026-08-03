@@ -95,6 +95,20 @@
 //!   listener's own warning recommended a configuration the binary
 //!   could not express.
 //!
+//! **Why this module's tasks are NOT on cluster_wire's pinned service
+//! pool.** §6.7's venue rule ("owner-side RPC handling runs on pinned
+//! service threads, never on the conveyor's task") is about *lock/metadata
+//! RPC* — work that would otherwise be dispatched onto a serialized
+//! ~0.78 ms server at ρ ≈ 0.92. Job-shard traffic is not that: a shard
+//! assignment is a coarse, second-scale unit whose device work rides
+//! `RouterShardDevice`, which bridges the sync seam onto the mount runtime
+//! with `block_in_place` — an operation that PANICS on a current-thread
+//! runtime, i.e. on a pool lane. Moving this module's accept/dispatcher/
+//! sweeper tasks onto the pool would therefore trade a real invariant for
+//! a venue it does not need, and would rewrite the VAL-6 legs
+//! (`retained_task_handles`, the accept-backoff gauge) that pin its
+//! bounds. The pool is where **S4's** verbs land, on the same listener.
+//!
 //! **What S3 closed that VAL-6 deliberately left open**: per-frame
 //! authentication after enrollment (the session MAC), a session key
 //! derived from the storage secret and bound to the TLS exporter where

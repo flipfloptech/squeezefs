@@ -195,6 +195,8 @@ Every claim cites its tier. **(i) measured-real** — rows from real mounts at l
 | 8 | `KV_PARTITIONED_APPEND` | — | Multi-writer §6.2 items 2/3/4; built, never stamped (ruling D9) |
 | 9 | `KV_BLOCK_REFCOUNTS` | — | Multi-writer §6.2 item 1; built, never stamped (D9). Renumbered from 8 after a same-wave collision — two definitions of one bit is silent aliasing, so every claim now carries a disjointness assertion |
 | 10 | `KV_WRITER_SCOPED_STAGING` | — | Multi-writer §6.2 items 8/10 (keys **and** the node-scoped generation stamp share one bit: a half-engaged state is unsound in both directions); built, never stamped (D9) |
+| 12 | `KV_INO_LANES` | — | Multi-writer §6.2 item 5 — per-writer ino lanes; built, never stamped (D9) |
+| 13 | `KV_BLOCK_KEY_INCARNATION` | — | Multi-writer §6.2 item 6 — `offset ‖ incarnation` block keys; built, never stamped (D9). Both authored themselves at 10/11 and renumbered at integration: the **third** parallel claim, and the second the union pin caught on contact |
 | 11 | `KV_MULTI_WRITER_DATA` | — | DLM **S7**'s capability gate — `SQUEEZEFS_MULTI_WRITER=1` refuses a format without it. Renumbered from 10 at integration (the second parallel claim; this one was caught by the disjointness pin's union clause going red, not by reading a diff). Built, never stamped (D9), so the knob currently refuses on every real volume — the honest posture |
 | — | Post-RSA key wrap (KW-1) | — | Ruling D3; same window |
 | — | Sharded indirect map (DUR-6 ⊕ PERF-9) | — | Same window |
@@ -243,16 +245,26 @@ item nobody claims is indistinguishable from an item nobody needs):
 | 2 | One journal ring head per volume | **LANDED** | Per-appender sub-rings, appender id in two of the four zero pad bytes §4.1 already reserved (inside the existing checksum), bit 8 |
 | 3 | One A/B extent bitmap + one `advance_durable` tail | **LANDED** | Page-partitioned interleaved bitmap with per-partition durable clocks, bit 8 |
 | 4 | One A/B root ledger, `slot = seq % 32` | **LANDED** | Per-writer slot ranges (≥ 2 slots each ⇒ appenders cap at 16), bit 8 |
-| 5 | `next_ino` is a per-mount atomic over a shared namespace | in flight | Per-writer cursor ranges on the VL5b `slot_cursors` precedent |
-| 6 | Block keys are bare reusable device offsets | in flight | `offset ‖ incarnation` — makes a stale process-local binding structurally detectable |
+| 5 | `next_ino` is a per-mount atomic over a shared namespace | **LANDED** | Per-writer ino lanes (bit 12) on the VL5b `slot_cursors` precedent; `next_ino()` is now the lane-dominating accessor and the raw atomic is private, so no path can under-declare a lane |
+| 6 | Block keys are bare reusable device offsets | **LANDED** | `offset ‖ incarnation` (bit 13) — a stale process-local binding is now structurally detectable. The lifetime is minted at exactly ONE site (`claim_block_idx`, because an allocation is the only event that starts a new lifetime) and the stamp is deliberately NOT cleared on free, so a freed-but-unreclaimed offset still validates its own key |
 | 7 | `writer_claim` is singular (expresses exclusion, not membership) | **OPEN** | Claim-set record + NVMe registrants. Pairs with S6 (membership) and must not collide with S7's WERO work on `reservation.rs` |
 | 8 | `active_block:`/`active_block_ext:`/`mapping:` keys have no writer scope | **LANDED** | Trailing `:w_{16 hex}` component *after* every identity component, so historical scan prefixes keep their exact meaning — a foreign record must be SEEN to be classified. Keys carry identity, values carry currency (the fencing token stays in the value) |
 | 9 | Layout-delta chains name their base with a process-local token | **OPEN** | Durable per-ino layout version. Touches the `routing.rs` publish path, so it waits for item 5/6 to land |
 | 10 | Staging generation is the volume-set uuids only | **LANDED** | `{set}@node:{16 hex}` from a host-stable identity (machine-id, app-specific-hashed so the raw id never lands on disk). The D0 claim id was rejected: a successor mount would classify its own predecessor's crash residue as foreign, inverting staged-crash recovery into data loss |
 | — | KV node cache is load-once RAM-authoritative | **LANDED** | *Partitioning, not cache coherence*: `apply_locked` is the one choke point, non-authority structural mutation refuses loud, and a peer's append into a cached tail is detected at `append_frozen` rather than silently overwriting acked records. Named residual: a leaf a peer wrote in an *earlier* window that the authority cached before that window closed leaves evidence nowhere — closing it needs a third gate state ("reader for structure, appender for my own leaves") |
 
-Two items remain (**7** and **9**), and neither gates a reader: item 7 is the
-membership primitive S6 needs, item 9 is a writer-side publish concern.
+One item remains — **9**, a writer-side publish concern (durable per-ino layout
+version). Item 7 (the claim-set record) is being built inside S6, where the
+membership primitive belongs. Neither gates a reader.
+
+Two consequences of items 5/6 that later stages must honour: a **reader mount
+never engages minting** (it requires `writer_term() > 0`), so an S5 reader grows
+`block_key_incarnation_unknown` by construction — that counter is the measured
+size of the S9 gap, **not** a fault, and must be exempted from any alarm, while
+`refusals`/`exhausted` stay genuine must-stay-0 tripwires. And the writer scope
+(a meta key NAME component) must never ride a block-key VALUE, nor the lifetime
+a key name: the W1 predicate classifies by counting `:`-components after `://`,
+so a stray scope suffix on a value silently flips whole-block eligibility off.
 
 ---
 

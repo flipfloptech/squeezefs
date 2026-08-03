@@ -18,7 +18,7 @@ Every section of `docs/pre-rc-engineering-spec.md` has been worked, and every it
 
 **Closed by written adjudication** (a fix would have been wrong): FUSE-3c (unimplementable as specified — a REGISTER's CQE fires on request *delivery*, impossible before arm; submission-counting is structurally necessary) · RES-13's two maps (`block_allocator.incarnations` **must not** have a removal path — a reclaimed entry restarts at generation 0 and lets a stale in-flight fill pass its after-check) · RES-18 (bounding the sideband would be actively harmful: it carries INTERRUPT, so a full channel stalls the reader and delays the very INTERRUPTs that unstick requests) · RES-10's second clause (does not reproduce — both budgets scale with the queue that holds the tombstones) · VAL-7d (single-tenant posture stated explicitly rather than building speculative per-uid accounting) · POSIX-12, POSIX-17 (declared deviations).
 
-**Deferred to the batched Phase-8 reformat window** (ruling D9 — bits built, not stamped): the sharded indirect map (DUR-6 ⊕ PERF-9), AEAD AAD binding (DUR-8d — would fail every existing encrypted open), KW-1's incompat bit, DLM S2's bit 7, partitioned append's bit 8, durable block refs' bit 9, PERF-15's sub-block framing, and bit 6's field validation.
+**Deferred to the batched Phase-8 reformat window** (ruling D9 — bits built, not stamped): the sharded indirect map (DUR-6 ⊕ PERF-9), AEAD AAD binding (DUR-8d — would fail every existing encrypted open), KW-1's incompat bit, DLM S2's bit 7, partitioned append's bit 8, durable block refs' bit 9, writer-scoped staging's bit 10 (which must be stamped on EVERY member of a set — engagement requires unanimity), S7's multi-writer-data bit 11, PERF-15's sub-block framing, and bit 6's field validation.
 
 **Deferred to a named stage:** DUR-7 → S3.5 (design note delivered: crash windows enumerated, the `SQZXTX01` intent-record wire specified, and the finding that its two-volume seam gate needs *no new harness*) · RES-16's remaining half → S3 · POSIX-14's handle allocation → assessed and argued sound under FUSE-2 + 3k.
 
@@ -195,6 +195,7 @@ Every claim cites its tier. **(i) measured-real** — rows from real mounts at l
 | 8 | `KV_PARTITIONED_APPEND` | — | Multi-writer §6.2 items 2/3/4; built, never stamped (ruling D9) |
 | 9 | `KV_BLOCK_REFCOUNTS` | — | Multi-writer §6.2 item 1; built, never stamped (D9). Renumbered from 8 after a same-wave collision — two definitions of one bit is silent aliasing, so every claim now carries a disjointness assertion |
 | 10 | `KV_WRITER_SCOPED_STAGING` | — | Multi-writer §6.2 items 8/10 (keys **and** the node-scoped generation stamp share one bit: a half-engaged state is unsound in both directions); built, never stamped (D9) |
+| 11 | `KV_MULTI_WRITER_DATA` | — | DLM **S7**'s capability gate — `SQUEEZEFS_MULTI_WRITER=1` refuses a format without it. Renumbered from 10 at integration (the second parallel claim; this one was caught by the disjointness pin's union clause going red, not by reading a diff). Built, never stamped (D9), so the knob currently refuses on every real volume — the honest posture |
 | — | Post-RSA key wrap (KW-1) | — | Ruling D3; same window |
 | — | Sharded indirect map (DUR-6 ⊕ PERF-9) | — | Same window |
 

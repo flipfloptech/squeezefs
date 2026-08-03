@@ -32,7 +32,7 @@
 //!   the member count is.
 //! * [`ClaimSet`] — §6.2 item 7's durable **partition membership** for
 //!   WRITERS, rewritten on membership CHANGE only (never on a beat), behind
-//!   incompat bit 12. Un-engaged it is a *projection* of `writer_claim`, so
+//!   incompat bit 14. Un-engaged it is a *projection* of `writer_claim`, so
 //!   single-writer volumes keep byte-identical records.
 //!
 //! **Why (b), a dedicated non-journaled checksummed membership slab, loses.**
@@ -125,7 +125,7 @@ pub const MEMBERSHIP_OWNER_XATTR: &str = "membership_owner";
 
 /// §6.2 **item 7**: the durable claim-SET record — the writers that are
 /// members of this volume set, each with its identity, endpoint and NVMe
-/// registrant key. Present only on volumes carrying incompat bit 12
+/// registrant key. Present only on volumes carrying incompat bit 14
 /// ([`FEATURE_INCOMPAT_KV_CLAIM_SET`]); un-engaged volumes read the
 /// singleton projection of `writer_claim` instead, so their bytes are
 /// untouched.
@@ -204,7 +204,7 @@ pub struct ClaimSetMember {
 /// volume set, with their identities durable".
 ///
 /// Read through [`ClaimSet::load`], which answers ONE shape whether or not
-/// the volume carries bit 12: engaged volumes decode the durable record,
+/// the volume carries bit 14: engaged volumes decode the durable record,
 /// un-engaged volumes get the singleton projection of `writer_claim`
 /// ([`ClaimSet::from_writer_claim`], `durable == false`). That projection is
 /// what keeps single-writer byte-identical: nothing is written, nothing is
@@ -350,13 +350,13 @@ impl ClaimSet {
     }
 
     /// Store the durable record. **Refuses** on a volume that does not
-    /// carry bit 12: that refusal is what makes single-writer
+    /// carry bit 14: that refusal is what makes single-writer
     /// byte-identity a law rather than an intention.
     pub async fn store(be: &KvMetaBackend, set: &Self) -> Result<()> {
         if !claim_set_engaged(be.superblock().features_incompat) {
             return Err(SqueezefsError::InvalidOperation(format!(
                 "refusing to write a claim_set record on {}: the format does not carry the \
-                 claim-set capability (incompat bit 12). Nothing stamps it today (ruling D9: \
+                 claim-set capability (incompat bit 14). Nothing stamps it today (ruling D9: \
                  the bit is built, not stamped) — an un-engaged volume's membership IS the \
                  singular writer_claim, read through its projection, and writing this record \
                  would change what an un-stamped volume's records look like",
@@ -385,7 +385,7 @@ impl ClaimSet {
 /// CHANGE, never per beat.
 ///
 /// Returns `false` (and writes NOTHING) on a volume that does not carry
-/// incompat bit 12, which is every volume today (ruling D9). That is the
+/// incompat bit 14, which is every volume today (ruling D9). That is the
 /// single-writer byte-identity law in the one place a mount would otherwise
 /// have created a new record: the projection of `writer_claim` stays the
 /// whole truth, and `listxattr(1)` gains nothing.
@@ -447,7 +447,7 @@ pub async fn withdraw_writer_member(be: &KvMetaBackend, id: &str) -> Result<bool
     Ok(true)
 }
 
-/// `true` ⇔ this volume's format expresses a claim SET (incompat bit 12).
+/// `true` ⇔ this volume's format expresses a claim SET (incompat bit 14).
 /// Every volume today answers `false` — ruling **D9**: the bit is built,
 /// nothing stamps it.
 pub fn claim_set_engaged(features_incompat: u64) -> bool {
@@ -677,7 +677,14 @@ impl LeaseClocks {
                 Some(ms) => Duration::from_millis(ms),
                 None => drift.max(observed_rtt),
             };
-        let purge_default = (crate::ro_coherence::checkpoint_cadence() * 2).max(observed_rtt);
+        // `ro_coherence::checkpoint_cadence()` was deleted when the S5 reader
+        // was wired to the landed revalidation machinery; its successor is the
+        // poller's own interval, which is the SAME derivation
+        // (`max(effective writer cadence, CHECKPOINT_MAX_AGE_MS)`) read through
+        // the one place that owns it. Doubling it is unchanged: observe, then
+        // finish — the S5 purge pass is the vehicle.
+        let cadence = crate::meta_backend::kv::revalidate::RevalidationPoller::derived().interval();
+        let purge_default = (cadence * 2).max(observed_rtt);
         let d_purge = match crate::env_knobs::opt_int_knob::<u64>("SQUEEZEFS_MEMBERSHIP_PURGE_MS") {
             Some(ms) => Duration::from_millis(ms),
             None => purge_default,
@@ -1774,7 +1781,7 @@ async fn arm_owner(
     // its DEVICE-side registrant key read from S7's STANDING hold — joined,
     // never a second acquire (a second reservation would conflict at the
     // device and silently downgrade the guarantee class). A no-op on every
-    // volume without incompat bit 12, which is all of them today (D9).
+    // volume without incompat bit 14, which is all of them today (D9).
     let identity = MemberIdentity {
         id: id.clone(),
         role: MemberRole::Writer,

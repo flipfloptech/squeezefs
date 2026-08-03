@@ -1493,8 +1493,6 @@ pub async fn set_block_key_incarnation_bit(path: &Path) -> Result<bool, KvError>
         "block-key-incarnation",
     )
     .await
-    )
-    .await
 }
 
 /// Stamp [`FEATURE_INCOMPAT_KV_CLAIM_SET`] on `path`'s superblock — the

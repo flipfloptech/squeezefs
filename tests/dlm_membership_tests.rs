@@ -63,13 +63,13 @@
 //! 9. **Concurrency**: many simulated clients renewing on a multi-thread
 //!    runtime while one is evicted — no live member loses its lease, the
 //!    evicted one is refused, and the census stays consistent.
-//! 10. **Incompat bit 12** (`KV_CLAIM_SET`) is single-bit, disjoint from
+//! 10. **Incompat bit 14** (`KV_CLAIM_SET`) is single-bit, disjoint from
 //!     every other feature bit, and **never stamped** by a production
 //!     format (ruling D9).
 //!
 //! RED against `dev` @ `1af8799c`: `squeezefs::membership`,
 //! `squeezefs::membership_wire` and `squeezefs::membership_sim` do not
-//! exist, and there is no incompat bit 12.
+//! exist, and there is no incompat bit 14.
 //!
 //! ## What is NOT pinned here (and cannot be)
 //!
@@ -653,7 +653,7 @@ async fn claim_set_membership_keeps_single_writer_byte_identical() {
 
     assert!(
         !membership::claim_set_engaged(be.superblock().features_incompat),
-        "a production format never stamps bit 12"
+        "a production format never stamps bit 14"
     );
     let set = ClaimSet::load(&be)
         .await
@@ -669,8 +669,8 @@ async fn claim_set_membership_keeps_single_writer_byte_identical() {
     // enforced, not merely intended.
     let refused = ClaimSet::store(&be, &set)
         .await
-        .expect_err("storing without bit 12 must refuse");
-    assert!(refused.to_string().contains("bit 12"));
+        .expect_err("storing without bit 14 must refuse");
+    assert!(refused.to_string().contains("bit 14"));
 
     let keys = be.listxattr(1).await.expect("listxattr");
     assert!(
@@ -698,7 +698,7 @@ async fn an_engaged_claim_set_records_every_writer_and_its_registrant_key() {
     assert!(
         sb::set_claim_set_bit(meta.path())
             .await
-            .expect("stamp bit 12 offline"),
+            .expect("stamp bit 14 offline"),
         "the bit must be newly set"
     );
     let be = KvMetaBackend::open(meta.path()).await.expect("open volume");
@@ -791,7 +791,7 @@ async fn claim_set_membership_upserts_and_withdraws_one_member_at_a_time() {
     let meta = formatted_volume().await;
     sb::set_claim_set_bit(meta.path())
         .await
-        .expect("stamp bit 12");
+        .expect("stamp bit 14");
     let be = KvMetaBackend::open(meta.path()).await.expect("open volume");
     assert!(
         membership::upsert_writer_member(&be, &ident("w-a", 0xaa), 5)
@@ -856,21 +856,38 @@ async fn claim_set_membership_upserts_and_withdraws_one_member_at_a_time() {
     be.shutdown().await.expect("clean shutdown");
 }
 
-/// Bit 12 is single-bit, disjoint, and never stamped by a production
+/// Bit 14 is single-bit, disjoint, and never stamped by a production
 /// format (ruling D9). The union clause lives in the two existing pins;
 /// this one is the local sanity face.
+///
+/// **Bit 14, not 12**: this stage authored itself at 12 in parallel with the
+/// §6.2 items-5/6 branch, which took 12 and 13 — the fourth parallel claim in
+/// this program, renumbered at integration.
 #[test]
-fn incompat_bit_12_is_disjoint_and_never_stamped_by_format() {
+fn incompat_bit_14_is_disjoint_and_never_stamped_by_format() {
     assert_eq!(sb::FEATURE_INCOMPAT_KV_CLAIM_SET.count_ones(), 1);
-    assert_eq!(sb::FEATURE_INCOMPAT_KV_CLAIM_SET, 1 << 12);
-    assert_eq!(
-        sb::FEATURE_INCOMPAT_KV_CLAIM_SET & sb::FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA,
-        0
-    );
+    assert_eq!(sb::FEATURE_INCOMPAT_KV_CLAIM_SET, 1 << 14);
+    for (name, bit) in [
+        (
+            "KV_MULTI_WRITER_DATA",
+            sb::FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA,
+        ),
+        ("KV_INO_LANES", sb::FEATURE_INCOMPAT_KV_INO_LANES),
+        (
+            "KV_BLOCK_KEY_INCARNATION",
+            sb::FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION,
+        ),
+    ] {
+        assert_eq!(
+            sb::FEATURE_INCOMPAT_KV_CLAIM_SET & bit,
+            0,
+            "the claim-set bit collides with {name}"
+        );
+    }
     assert_ne!(
         sb::FEATURES_INCOMPAT_KNOWN & sb::FEATURE_INCOMPAT_KV_CLAIM_SET,
         0,
-        "this binary must UNDERSTAND bit 12"
+        "this binary must UNDERSTAND bit 14"
     );
     let plan = sb::SuperblockV3::plan(1 << 30, 262_144, None, [3u8; 16], 0x99).expect("plan");
     assert_eq!(

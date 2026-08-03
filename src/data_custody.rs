@@ -606,7 +606,7 @@ pub fn arm_data_plane(
     if !multi_writer_stamped {
         return Err(SqueezefsError::InvalidOperation(
             "multi-writer data plane refuses to arm: the metadata format does not carry the \
-             multi-writer data capability (incompat bit 10). Nothing stamps it today (ruling \
+             multi-writer data capability (incompat bit 11). Nothing stamps it today (ruling \
              D9: the bit is built, not stamped) — the capability lands with DLM S8/S9. Unset \
              SQUEEZEFS_MULTI_WRITER."
                 .to_string(),

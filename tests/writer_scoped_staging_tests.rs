@@ -1159,6 +1159,15 @@ fn incompat_bits_are_single_bit_and_pairwise_disjoint() {
             "KV_WRITER_SCOPED_STAGING",
             sb::FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING,
         ),
+        // DLM S7's capability gate. It claimed bit 10 in parallel with this
+        // branch and renumbered to 11 at integration — the second parallel
+        // claim in this program, and the reason THIS assertion exists: the
+        // union clause is what turned a silent on-disk aliasing into a red
+        // test the moment both landed.
+        (
+            "KV_MULTI_WRITER_DATA",
+            sb::FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA,
+        ),
     ];
     let mut seen = 0u64;
     for (name, bit) in bits {

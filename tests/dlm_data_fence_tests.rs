@@ -73,11 +73,11 @@
 //!    acquire would otherwise conflict at the device and silently
 //!    downgrade the job wire's guarantee class), and the last release
 //!    leaves zero residue.
-//! 10. **Incompat bit 10 is disjoint** from every other feature bit.
+//! 10. **Incompat bit 11 is disjoint** from every other feature bit.
 //!
 //! RED against dev 2961ab53: `squeezefs::data_custody` does not exist,
 //! `NvmeBlockDev::write_block_authorized` does not exist, the allocator
-//! has no quarantine, and there is no incompat bit 10.
+//! has no quarantine, and there is no incompat bit 11.
 //!
 //! ## What is NOT pinned here (and cannot be)
 //!
@@ -100,7 +100,7 @@ use squeezefs::meta_backend::kv::superblock::{
     FEATURE_INCOMPAT_KV_LAYOUT_DELTAS, FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA,
     FEATURE_INCOMPAT_KV_PARTITIONED_APPEND, FEATURE_INCOMPAT_KV_SLOT_MIGRATION,
     FEATURE_INCOMPAT_KV_V3, FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE,
-    FEATURE_INCOMPAT_NODE_SEQ_WATERMARK,
+    FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING, FEATURE_INCOMPAT_NODE_SEQ_WATERMARK,
 };
 use squeezefs::meta_backend::reservation::{
     clear_override, install_override, FakeNvmeNamespace, FakeReservationClient,
@@ -628,7 +628,7 @@ fn multi_writer_refuses_a_format_without_the_s7_incompat_bit() {
         &path,
         FakeReservationClient::new(ns.clone(), "nqn-s7b", "host-s7b"),
     );
-    // PR-capable, but the format does not carry bit 10 — which is EVERY
+    // PR-capable, but the format does not carry bit 11 — which is EVERY
     // volume today (ruling D9: the bit is built, never stamped).
     let err = data_custody::arm_data_plane(
         CustodyPosture::MultiWriter,
@@ -702,11 +702,11 @@ fn the_data_plane_wero_hold_is_shared_not_forked() {
 }
 
 #[test]
-fn incompat_bit_10_is_disjoint_from_every_other_feature_bit() {
+fn incompat_bit_11_is_disjoint_from_every_other_feature_bit() {
     assert_eq!(
         FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA,
-        1 << 10,
-        "S7 takes bit 10 (0,1,2,3,4,5,6,7,8,9 are taken)"
+        1 << 11,
+        "S7 takes bit 11 (0..=10 are taken; bit 10 is writer-scoped staging, which merged first)"
     );
     for (name, bit) in [
         ("KV_V3", FEATURE_INCOMPAT_KV_V3),
@@ -722,17 +722,21 @@ fn incompat_bit_10_is_disjoint_from_every_other_feature_bit() {
             FEATURE_INCOMPAT_KV_PARTITIONED_APPEND,
         ),
         ("KV_BLOCK_REFCOUNTS", FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS),
+        (
+            "KV_WRITER_SCOPED_STAGING",
+            FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING,
+        ),
     ] {
         assert_eq!(
             FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA & bit,
             0,
-            "bit 10 collides with {name}"
+            "bit 11 collides with {name}"
         );
     }
     assert_ne!(
         FEATURES_INCOMPAT_KNOWN & FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA,
         0,
-        "this binary must UNDERSTAND bit 10 (old binaries refuse it loud)"
+        "this binary must UNDERSTAND bit 11 (old binaries refuse it loud)"
     );
 }
 

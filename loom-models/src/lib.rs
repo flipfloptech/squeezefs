@@ -3533,6 +3533,141 @@ mod models {
             claimer.join().unwrap();
         });
     }
+
+    // -----------------------------------------------------------------
+    // placed_sever — the assembly's `outstanding` REFCOUNT + reap
+    // protocol (PERF-21). The three edges were `SeqCst`; they are now the
+    // canonical `Arc` discipline: `Relaxed` acquire (published under the
+    // registry's per-key entry guard, which the reap re-reads under),
+    // `Release` decrement, one `Acquire` fence on the last-out path, and
+    // an `Acquire` load in the reap. The model below stands the entry
+    // guard up as a loom mutex (scc's per-key latch is not loom-visible)
+    // and checks the two properties the orderings owe:
+    //
+    //   1. the entry is reaped ONLY at zero outstanding — a racing new
+    //      claim published under the same guard keeps it alive; and
+    //   2. everything every payload wrote before dropping is VISIBLE to
+    //      whoever reaps (the Release/Acquire pair) — weakening the
+    //      decrement to `Relaxed` fails this.
+    // -----------------------------------------------------------------
+
+    /// Two payload drops race a fresh claim: the entry may be reaped only
+    /// with zero outstanding, and the reaper sees both payloads' writes.
+    #[test]
+    fn placed_assembly_refcount_reaps_only_at_zero_and_publishes_writes() {
+        loom::model(|| {
+            // The registry entry: `present` stands for the map slot, and
+            // the mutex is the per-key entry guard every mutation takes.
+            struct Entry {
+                outstanding: loom::sync::atomic::AtomicUsize,
+                /// Payload-visible state: what each dropper wrote before
+                /// releasing (the reaper must observe all of it).
+                wrote: loom::sync::atomic::AtomicUsize,
+                present: loom::sync::atomic::AtomicBool,
+            }
+            let guard = Arc::new(loom::sync::Mutex::new(()));
+            let e = Arc::new(Entry {
+                outstanding: loom::sync::atomic::AtomicUsize::new(2), // two live payloads
+                wrote: loom::sync::atomic::AtomicUsize::new(0),
+                present: loom::sync::atomic::AtomicBool::new(true),
+            });
+
+            let droppers: Vec<_> = (0..2)
+                .map(|_| {
+                    let e = e.clone();
+                    let guard = guard.clone();
+                    thread::spawn(move || {
+                        // The payload's own writes, before the release.
+                        e.wrote.fetch_add(1, Ordering::Relaxed);
+                        // The shipped edge: Release decrement + Acquire
+                        // fence on the last handle out.
+                        if e.outstanding.fetch_sub(1, Ordering::Release) == 1 {
+                            loom::sync::atomic::fence(Ordering::Acquire);
+                            // reap(): under the entry guard, remove iff
+                            // still zero.
+                            let _g = guard.lock().unwrap();
+                            if e.outstanding.load(Ordering::Acquire) == 0 {
+                                // Property 2: every dropper's writes are
+                                // visible to the reaper.
+                                assert_eq!(
+                                    e.wrote.load(Ordering::Relaxed),
+                                    2,
+                                    "reaper observed a stale payload-write count — the \
+                                     Release/Acquire pair is load-bearing"
+                                );
+                                e.present.store(false, Ordering::Relaxed);
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for t in droppers {
+                t.join().unwrap();
+            }
+            // Property 1: the entry is gone exactly because it hit zero.
+            assert_eq!(e.outstanding.load(Ordering::SeqCst), 0);
+            assert!(
+                !e.present.load(Ordering::SeqCst),
+                "the last handle out must reap the entry"
+            );
+        });
+    }
+
+    /// A fresh claim published under the entry guard while the last
+    /// payload drops: the reap must NOT remove a re-claimed assembly
+    /// (`Relaxed` increment is safe precisely because it happens under
+    /// the guard the reap re-reads under).
+    #[test]
+    fn placed_assembly_reclaim_under_the_guard_survives_the_reap() {
+        loom::model(|| {
+            let guard = Arc::new(loom::sync::Mutex::new(()));
+            let outstanding = Arc::new(loom::sync::atomic::AtomicUsize::new(1));
+            let present = Arc::new(loom::sync::atomic::AtomicBool::new(true));
+
+            let dropper = {
+                let guard = guard.clone();
+                let outstanding = outstanding.clone();
+                let present = present.clone();
+                thread::spawn(move || {
+                    if outstanding.fetch_sub(1, Ordering::Release) == 1 {
+                        loom::sync::atomic::fence(Ordering::Acquire);
+                        let _g = guard.lock().unwrap();
+                        if outstanding.load(Ordering::Acquire) == 0 {
+                            present.store(false, Ordering::Relaxed);
+                        }
+                    }
+                })
+            };
+
+            let claimer = {
+                let guard = guard.clone();
+                let outstanding = outstanding.clone();
+                let present = present.clone();
+                thread::spawn(move || {
+                    // `sever`: get-or-create + claim + outstanding++ all
+                    // under the entry guard.
+                    let _g = guard.lock().unwrap();
+                    if present.load(Ordering::Relaxed) {
+                        outstanding.fetch_add(1, Ordering::Relaxed);
+                        // The claim now owns a live entry: it must still
+                        // be present when this guard drops.
+                        assert!(present.load(Ordering::Relaxed));
+                        true
+                    } else {
+                        false
+                    }
+                })
+            };
+            dropper.join().unwrap();
+            let claimed = claimer.join().unwrap();
+            if claimed {
+                assert!(
+                    outstanding.load(Ordering::SeqCst) >= 1,
+                    "a claim published under the guard was reaped out from under itself"
+                );
+            }
+        });
+    }
 }
 
 #[cfg(all(test, loom))]

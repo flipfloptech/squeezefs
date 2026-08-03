@@ -8124,17 +8124,16 @@ impl DataRouter {
         } else {
             "backend/cached"
         };
-        let forensics_op: Option<String> =
-            if crate::block_allocator::free_forensics_enabled() {
-                Some(match &op {
-                    BlockMapOp::Merge(e) => format!("Merge({e:?})"),
-                    BlockMapOp::MergeExpected(e) => format!("MergeExpected({e:?})"),
-                    BlockMapOp::TruncateFrom { new_size } => format!("TruncateFrom({new_size})"),
-                    BlockMapOp::RemoveBlocks(idxs) => format!("RemoveBlocks({idxs:?})"),
-                })
-            } else {
-                None
-            };
+        let forensics_op: Option<String> = if crate::block_allocator::free_forensics_enabled() {
+            Some(match &op {
+                BlockMapOp::Merge(e) => format!("Merge({e:?})"),
+                BlockMapOp::MergeExpected(e) => format!("MergeExpected({e:?})"),
+                BlockMapOp::TruncateFrom { new_size } => format!("TruncateFrom({new_size})"),
+                BlockMapOp::RemoveBlocks(idxs) => format!("RemoveBlocks({idxs:?})"),
+            })
+        } else {
+            None
+        };
 
         // CoW publish (item A): take the Arc, mutate a uniquely-owned copy
         // via `make_mut` — held reader snapshots keep the exact map they

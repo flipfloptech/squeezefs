@@ -360,6 +360,100 @@ async fn admission_park_past_threshold_escalates_to_disabled_volume() {
     }
 }
 
+/// The wedge fixture's premise, pinned STRUCTURALLY (2026-08 DLM
+/// merge-wave regression): a fresh write mount must SERVE with zero
+/// reclaimable journal residue — `reusable_upto == head` when `open`
+/// returns. The mount gate's bring-up commits (the D0 `writer_claim`
+/// tx; since DLM S2 also the `writer_term` record riding it) used to be
+/// left committed-but-uncovered, and the first checkpoint tick then
+/// covered them MID-WEDGE, releasing a one-shot budget crumb exactly the
+/// residue's size. S2 grew that crumb (186 B → 249 B) past a create
+/// entry (195 B), and the sibling test's parked committer slipped
+/// through the D1.b escalation and silently succeeded. Zero residue at
+/// serve-start makes the wedge law hold for EVERY committer class and
+/// entry size — and mirrors the shutdown law (`tail == head` ⇒ an empty
+/// replay window), now symmetric at both ends of a mount's life.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_write_mount_serves_with_zero_reclaimable_journal_residue() {
+    arm_short_timeout();
+    let meta = NamedTempFile::new().unwrap();
+    let kv = open_v3_meta(meta.path(), 64 * 1024 * 1024).await;
+    let core = kv.journal_ring().core();
+    assert_eq!(
+        core.head(),
+        core.reusable_upto(),
+        "a write mount's bring-up commits (writer_claim/writer_term) must be \
+         checkpoint-covered before the mount serves — un-covered residue is a \
+         one-shot admission crumb that lets a parked committer slip through the \
+         D1.b wedge escalation when the checkpoint tick covers it mid-park"
+    );
+}
+
+/// The escalation law must hold for the SMALLEST committer class too.
+/// The sibling test drives a create (a 195 B entry) — which pre-S2 was
+/// LARGER than the mount-residue crumb only by accident (a 9 B margin).
+/// Any tx class small enough to fit the crumb (a single tiny xattr Put
+/// here) silently succeeded the same way. Red against the crumb, green
+/// once bring-up residue is covered at serve-start: the wedge now holds
+/// with zero relief for every entry size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_park_escalation_holds_for_the_smallest_committer_class() {
+    arm_short_timeout(); // read at open: the escalation threshold (1 s)
+    let meta = NamedTempFile::new().unwrap();
+    let kv = open_v3_meta_with_ring(meta.path(), 64 * 1024 * 1024, Some(512 * 1024)).await;
+    let routed = Arc::new(RoutedMetaBackend::new(vec![kv.clone()]));
+
+    // Saturate and HOLD the user admission budget (the sibling's wedge).
+    let mut held = Vec::new();
+    for chunk in [4096u64, 64] {
+        while let Some(adm) = kv
+            .journal_ring()
+            .core()
+            .try_admit(chunk, AdmissionClass::User)
+        {
+            held.push(adm);
+            assert!(held.len() < 1_000_000, "admission accounting runaway");
+        }
+    }
+    assert!(!held.is_empty(), "the tiny ring must saturate");
+
+    // One tiny xattr Put — the smallest whole-tx committer class.
+    let setxattr_res = tokio::time::timeout(
+        Duration::from_secs(20),
+        routed.setxattr(ROOT_INO, "user.pin", b"1"),
+    )
+    .await;
+
+    assert!(
+        setxattr_res.is_ok(),
+        "a parked smallest-class committer must ESCALATE within the \
+         SQUEEZEFS_TIMEOUT lattice, never park forever"
+    );
+    assert!(
+        setxattr_res.unwrap().is_err(),
+        "the escalated smallest-class committer must fail loud, not slip \
+         through a mount-residue admission crumb and silently succeed"
+    );
+    assert!(
+        kv.is_failed(),
+        "parked-past-threshold must trip note_journal_failure until the volume \
+         fail-stops — for every committer class, not only entries larger than \
+         the historical bring-up residue"
+    );
+    assert!(
+        routed.check_volume_enabled(0).is_err(),
+        "the routed layer must mirror the failed volume into disabled_volumes"
+    );
+    assert!(
+        kv.journal_full_stalls() > 0,
+        "the park itself must be counted (meta_kv_journal_full_stalls)"
+    );
+
+    for adm in held {
+        kv.journal_ring().core().release(adm);
+    }
+}
+
 // ===========================================================================
 // (4) Bounded FLUSH/FSYNC barrier waits (audit row 1) — inside the
 //     coalescer, leader and follower, with no post-timeout wedge.

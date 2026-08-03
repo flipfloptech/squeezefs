@@ -483,6 +483,47 @@ async fn recovered_crossvol_link_keeps_nlink_and_names_in_step() {
     shutdown(&routed).await;
 }
 
+/// The recovery hook is BRING-UP too (the 2026-08 merge-wave crumb class,
+/// pinned for the mount-gate claim tx in `fuse_watchdog_teardown_tests`):
+/// a reopen that rolled open intents forward commits roll-forward steps
+/// and the intent retirement DURING mount — and every one of those
+/// entries, left committed-but-uncovered, is a one-shot admission crumb
+/// the checkpoint tick frees mid-wedge, letting a parked committer slip
+/// through the D1.b escalation silently. The set must SERVE with zero
+/// reclaimable journal residue on every volume (`reusable_upto == head`),
+/// recovery or no recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovered_reopen_serves_with_zero_journal_residue() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = stamped_set(dir.path(), 2, 2).await;
+    let routed = open_set(&paths).await;
+    let parent = mkdir_on(&routed, 1, 0, "residue").await;
+    let (child, name) = mkfile_on(&routed, parent, 1, "residue").await;
+    let second = format!("{name}_two");
+
+    {
+        let _seam = arm_seam(2); // nlink bumped, second name not committed
+        let _ = routed.link(child, parent, &second).await;
+    }
+    let recovered_before = XV_TX_RECOVERED.load(Ordering::Relaxed);
+    let routed = crash_and_reopen(routed, &paths).await;
+    assert!(
+        XV_TX_RECOVERED.load(Ordering::Relaxed) > recovered_before,
+        "fixture: the reopen must actually have rolled an intent forward"
+    );
+
+    for (v_idx, vol) in routed.volumes.iter().enumerate() {
+        let core = vol.journal_ring().core();
+        assert_eq!(
+            core.head(),
+            core.reusable_upto(),
+            "volume {v_idx} serves with un-covered bring-up residue after intent \
+             recovery — a one-shot admission crumb for the wedge-escalation law"
+        );
+    }
+    shutdown(&routed).await;
+}
+
 // ---------------------------------------------------------------------------
 // 5. No single-volume regression
 // ---------------------------------------------------------------------------

@@ -439,6 +439,37 @@ Loopback **floor**, qd1, engagement exact: **9.33 µs** median at 0 B (2,000 sam
 
 ---
 
+## 3d0. The wedge-crumb finding (the from-zero suite's best catch)
+
+`admission_park_past_threshold_escalates_to_disabled_volume` — the pin on the
+D1.b fail-stop law — turned out to have been green **by a 9-byte accident**
+since the day it landed. The mount gate's bring-up transaction (the writer
+claim) sat committed-but-uncovered in the journal ring; when the test wedged
+the ring, the checkpoint cadence covered that entry mid-test and released its
+bytes as a one-shot crumb of admission budget. Pre-wave the crumb was 186 B
+and the test's create entry 195 B — it didn't fit, so the law *appeared* to
+hold. DLM S2's durable `writer_term` grew the crumb to 249 B, the create fit,
+the parked committer silently succeeded, and the success path reset the
+escalation crossings already tripped. Every committer class smaller than the
+crumb had ALWAYS been able to slip through; the pinned law held only for
+entries that happened to be bigger.
+
+The fix is structural, not a size adjustment: `cover_bring_up_residue()` —
+a write mount now serves with **zero reclaimable journal tail** (symmetric
+with shutdown's `tail == head` law), applied at `open` and after S3.5's
+recovery hook (whose residue measured 1003 B per recovering volume). Three
+red-first pins close the class: zero-residue at serve-start, the
+smallest-committer escalation, and the S3.5 recovery face. A bonus that fell
+out: a crash-remount's replay window is now covered at mount, so remount IS
+recovery for the wedged pinned-floor shapes.
+
+Why targeted suites could never see it: the coupling is mount-gate record
+size ↔ wedge-escalation fixture — two subsystems no single branch owns. S2's
+suites test term semantics; none of them wedge a ring. This is the standing
+argument for the from-zero tier, in one finding.
+
+---
+
 ## 3d. Latent same-class flags from the known-red fixes (report-only, tracked)
 
 The §3c fixes flagged three populations of the same classes, green today by

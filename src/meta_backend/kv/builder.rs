@@ -440,6 +440,23 @@ impl ImageBuilder {
                 | super::superblock::FEATURE_INCOMPAT_KV_SLOT_MIGRATION;
         }
 
+        // **Test seam** (`SQUEEZEFS_TEST_STAMP_BLOCK_REFS=1`): stamp
+        // incompat bit 8 at format so a suite can exercise the DURABLE
+        // block-accounting path end to end. Production formats never carry
+        // it (ruling D9 — `SuperblockV3::plan` omits it, and the reason is a
+        // safety property: see the constant's doc), so this is the only way
+        // to point the existing write-path suites at the ledger and let the
+        // §6.2-item-1 oracle grade the wiring — which is exactly how the
+        // remaining drift was found and closed.
+        //
+        // Read once per format, never set in production (the
+        // `SQUEEZEFS_TEST_POWER_CUT_DEVS` / `SQUEEZEFS_TEST_WRITE_STALL_MS`
+        // precedent). It only ever ADDS the bit, so a volume it creates is
+        // indistinguishable from one the Phase-8 window stamped.
+        if std::env::var("SQUEEZEFS_TEST_STAMP_BLOCK_REFS").as_deref() == Ok("1") {
+            sb.features_incompat |= super::superblock::FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS;
+        }
+
         // §9 quick-format hygiene: zero SB + ledger + ring + bitmap.
         zero_range(path, 0, sb.heap.start).await?;
 

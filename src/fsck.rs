@@ -586,30 +586,27 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // to disagree with) and under `--shards` (a shard sees only part of
         // the reference set, so its census is not comparable).
         //
-        // **The class is OPT-IN (`SQUEEZEFS_BLOCK_REFS_VERIFY=1`) until the
-        // write-path wiring is complete, and that is the ONLY reason.** The
-        // oracle reports honest drift on any shape whose layout is
-        // published by a site that does not yet stage its accounting: the
-        // item-1 landing wired the merge primitive (write-through,
-        // truncate, punch, mover republish), the publish conveyor, clone,
-        // the indirect-map blob, the four whole-map-swap sites
-        // (staged→striped promotion, StorageFull spill, staged whole-image
-        // promotion, staged truncate prune) and reclaim — but the FUSE
-        // write path reaches layout publication through more paths than
-        // those, and the drift this class reports IS the remaining
-        // checklist. Ungating it before that work lands would turn a true
-        // finding into noise on healthy volumes, which is how tripwires get
-        // disabled permanently.
+        // **Detection is UNGATED** (the env gate the item-1 landing carried
+        // is gone): the write-path wiring is complete, so
+        // `meta_kv_block_refs_drift` is a live must-stay-0 tripwire. It
+        // reached that state by using this very class as the checklist — the
+        // last gap was the *deferred-accounting* class (a site that mutates
+        // the RAM map and leaves the layout dirty, so the save that
+        // eventually persists it is handed a map already containing the
+        // change and stages nothing), closed structurally by the per-ino
+        // deferred-op accumulator rather than site by site.
         //
-        // Removal condition, explicitly: when
-        // `SQUEEZEFS_BLOCK_REFS_VERIFY=1` produces zero drift across
-        // `tests/fsck_tests.rs`'s healthy populations, delete the env gate
-        // below. Nothing else about the class changes — detection,
-        // verification, planning and the repair refusal are already wired.
-        if std::env::var("SQUEEZEFS_BLOCK_REFS_VERIFY").as_deref() == Ok("1")
-            && opts.shard.is_none()
-            && ctx.meta.volumes.iter().any(|kv| kv.block_refs_engaged())
-        {
+        // **Cost when nothing drifts.** The comparison runs the layout walk
+        // — but this is fsck, which walks every inode anyway for C1/C2/C3,
+        // and the census reuses that same extraction. The added work is one
+        // paged range scan of the reference tree per data volume (≈ 2.9 ns
+        // per reference to decode) plus a `BTreeMap` fold and diff
+        // (≈ 90 ns/reference) — `.benchmarks/2026-08-04-durable-block-refcounts.md`
+        // §3–4. Detection therefore adds no walk that fsck did not already
+        // owe, which is exactly why it can be unconditional HERE while
+        // MOUNT keeps it behind `SQUEEZEFS_BLOCK_REFS_VERIFY=1` (there the
+        // walk is the whole cost the durable records exist to delete).
+        if opts.shard.is_none() && ctx.meta.volumes.iter().any(|kv| kv.block_refs_engaged()) {
             let chunk = ctx.router.backend_router.default_allocator.chunk_size();
             match ctx
                 .router

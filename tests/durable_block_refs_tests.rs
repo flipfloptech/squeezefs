@@ -90,6 +90,17 @@ async fn format_meta(path: &std::path::Path) {
     format_v3(path, META_LEN, &opts())
         .await
         .expect("format v3 meta volume");
+    // This suite owns its own stamping (it tests BOTH sides of the D9
+    // boundary), so it must be immune to the `SQUEEZEFS_TEST_STAMP_BLOCK_REFS`
+    // seam that points OTHER suites at the durable path: strip the bit if the
+    // seam set it, leaving the shape production `format` actually writes.
+    let VolumeFormat::V3(mut sb) = classify_volume(path).await.unwrap() else {
+        panic!("expected v3");
+    };
+    if sb.features_incompat & FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS != 0 {
+        sb.features_incompat &= !FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS;
+        write_superblock_v3(path, &sb).await.unwrap();
+    }
 }
 
 /// [`format_meta`] plus the Phase-8 stamp — the on-disk state every leg
@@ -1052,5 +1063,100 @@ async fn stamping_a_non_empty_volume_backfills_instead_of_freeing_live_blocks() 
         "allocator handed out live block {fresh} after the stamp — the hazard"
     );
     assert!(rig.drift().await.is_empty());
+    rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 9. The oracle inside fsck — the permanent C8 pin.
+// ---------------------------------------------------------------------------
+
+/// **fsck class C8 must report ZERO findings on a healthy stamped volume.**
+///
+/// This is the pin for the *deferred-accounting* class, and it lives here
+/// rather than in `fsck_tests` because a fresh format no longer carries bit
+/// 8 (ruling D9), so those fixtures' volumes are not engaged and their C8
+/// arm never runs.
+///
+/// The class it pins, which the oracle caught: a site that mutates the RAM
+/// block map and leaves the layout DIRTY defers its accounting to whichever
+/// save persists the map — and that save is handed a map which already
+/// contains the change, so it stages nothing. The rewrite-shadow ACK path
+/// does exactly that. The fix is structural (a per-ino deferred-op
+/// accumulator drained by the persisting save), so it covers every future
+/// deferring site too; this leg is what keeps it honest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fsck_reports_no_durable_reference_drift_on_a_healthy_volume() {
+    use squeezefs::fsck::{FsckCtx, FsckOptions};
+
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_stamped(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    assert!(rig.routed.volumes[0].block_refs_engaged());
+
+    // A population that touches the accounting from several directions:
+    // fresh publishes, a displacement, a clone's sharing, a truncate and a
+    // punch — the shapes whose sites stage at different places.
+    let a = rig.mk_file("fsck_a").await;
+    let b = rig.mk_file("fsck_b").await;
+    for i in 0..4u32 {
+        rig.publish_block(a, i).await;
+    }
+    let replacement = rig.alloc.allocate_block().await.unwrap();
+    rig.alloc.publish_block(replacement);
+    rig.router
+        .merge_block_mappings(
+            a,
+            BlockMapOp::Merge(&[(1, replacement.to_string())]),
+            4 * 4 * 1024 * 1024,
+            LayoutFlip::KeepLayout,
+            rig.token(a),
+        )
+        .await
+        .expect("displacement");
+    rig.router
+        .clone_file(
+            &squeezefs::keys::inode_path(a),
+            &squeezefs::keys::inode_path(b),
+            Some(rig.token(a)),
+            Some(rig.token(b)),
+        )
+        .await
+        .expect("clone");
+    rig.router
+        .punch_striped_blocks(b, &[2], 4 * 4 * 1024 * 1024, rig.token(b))
+        .await
+        .expect("punch");
+    rig.router
+        .truncate_layout(a, 2 * 4 * 1024 * 1024, rig.token(a))
+        .await
+        .expect("truncate");
+
+    let report = squeezefs::fsck::run(
+        &FsckCtx {
+            meta: rig.routed.clone(),
+            router: rig.router.clone(),
+            staging_dirs: Vec::new(),
+            expected_generation: None,
+        },
+        &FsckOptions {
+            settle: std::time::Duration::from_millis(0),
+            ..FsckOptions::online()
+        },
+    )
+    .await
+    .expect("fsck run");
+
+    let c8: Vec<_> = report.findings.iter().filter(|f| f.class == "C8").collect();
+    assert!(
+        c8.is_empty(),
+        "fsck C8 (durable-vs-derived block-reference drift) must be EMPTY on a \
+         healthy volume — the ledger and the layouts that justify it diverged: {c8:?}"
+    );
+    // And the process tripwire agrees (the class increments it).
+    assert!(
+        rig.drift().await.is_empty(),
+        "the comparison itself must be exact"
+    );
     rig.shutdown().await;
 }

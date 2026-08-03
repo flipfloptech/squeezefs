@@ -2237,6 +2237,7 @@ impl BackendRouter {
                 std::collections::BTreeMap::new();
             let mut derived: std::collections::BTreeMap<u64, u32> =
                 std::collections::BTreeMap::new();
+            let mut refs: Vec<crate::meta_backend::kv::block_refs::BlockRef> = Vec::new();
             for kv in &routed.volumes {
                 for r in kv.block_ref_scan(vol_tag).await.map_err(|e| {
                     SqueezefsError::InvalidOperation(format!(
@@ -2245,6 +2246,7 @@ impl BackendRouter {
                     ))
                 })? {
                     *durable.entry(r.block_idx).or_insert(0) += 1;
+                    refs.push(r);
                 }
                 for (idx, n) in alloc.derived_block_census(kv, self).await? {
                     *derived.entry(idx).or_insert(0) += n;
@@ -2253,10 +2255,30 @@ impl BackendRouter {
             let mut blocks: Vec<u64> = durable.keys().chain(derived.keys()).copied().collect();
             blocks.sort_unstable();
             blocks.dedup();
+            let mut first_offenders = 0usize;
             for idx in blocks {
                 let d = durable.get(&idx).copied().unwrap_or(0);
                 let v = derived.get(&idx).copied().unwrap_or(0);
                 if d != v {
+                    // Localize the drift to its OWNERS, not just its block:
+                    // the owner ino + map index is what names the publishing
+                    // site, which is what a wiring gap needs (design §11
+                    // step 2). Bounded — the first few are enough to name a
+                    // site, and a whole-volume dump helps nobody.
+                    if first_offenders < 8 {
+                        first_offenders += 1;
+                        let owners: Vec<String> = refs
+                            .iter()
+                            .filter(|r| r.block_idx == idx)
+                            .map(|r| format!("ino {} idx {}", r.owner_ino, r.block_index))
+                            .collect();
+                        log::warn!(
+                            "block-ref drift {}:{} — durable {d} [{}] vs derived {v}",
+                            alloc.volume_id(),
+                            idx * alloc.chunk_size(),
+                            owners.join(", ")
+                        );
+                    }
                     drift.push((alloc.volume_id().to_string(), idx, d, v));
                 }
             }
@@ -2746,6 +2768,25 @@ pub struct DataRouterInner {
             std::sync::Arc<crate::meta_backend::kv::conveyor_core::ConveyorCore<QueuedPublish>>,
         >,
     >,
+    /// **Deferred durable block-reference ops per ino** (pre-RC spec §6.2
+    /// item 1). Accounting rides the layout COMMIT, but not every site
+    /// that mutates a block map commits it: the rewrite-shadow ACK path
+    /// merges into the RAM authority, marks the layout dirty, and lets a
+    /// LATER publish (or `persist_dirty_layout_if_needed`) persist the
+    /// accumulated map — at which point that save cannot know which
+    /// references changed hands, because the map it is handed already
+    /// contains them.
+    ///
+    /// So a deferring site NOTES its delta here
+    /// ([`DataRouter::note_block_ref_ops`], under the same
+    /// `INODE_META_LOCKS` section that mutated the map) and whichever save
+    /// persists that map DRAINS it into the same transaction. A failed
+    /// commit re-notes them, exactly like the dirty-layout refill.
+    ///
+    /// Bounded by inos with unsaved map changes × entries changed; drained
+    /// by the persist that follows, and the drain removes the key.
+    pub(crate) pending_block_refs:
+        std::sync::Arc<scc::HashMap<u64, Vec<crate::meta_backend::kv::block_refs::BlockRefOp>>>,
     /// Idea 1 — open rewrite epochs per ino (design-rewrite-program §5).
     /// Registered at the first displacing ACK-path rewrite; removed by
     /// the close (swap). All entry mutation serializes on the ino's
@@ -4292,6 +4333,36 @@ impl DataRouter {
         out
     }
 
+    /// Note a map mutation's durable-reference delta for a save that has
+    /// not happened yet (see the `pending_block_refs` field): the caller is
+    /// inside the `INODE_META_LOCKS` section that mutated the RAM map and
+    /// is NOT persisting it in this call.
+    pub(crate) fn note_block_ref_ops(
+        &self,
+        ino: u64,
+        ops: Vec<crate::meta_backend::kv::block_refs::BlockRefOp>,
+    ) {
+        if ops.is_empty() {
+            return;
+        }
+        match self.pending_block_refs.entry_sync(ino) {
+            scc::hash_map::Entry::Occupied(mut occ) => occ.get_mut().extend(ops),
+            scc::hash_map::Entry::Vacant(vac) => {
+                let _ = vac.insert_entry(ops);
+            }
+        }
+    }
+
+    /// Drain the ino's deferred ops — the save that persists its map owns
+    /// them. Order is preserved (take-then-release sequences from the same
+    /// index must not be reordered against each other).
+    fn take_block_ref_ops(&self, ino: u64) -> Vec<crate::meta_backend::kv::block_refs::BlockRefOp> {
+        self.pending_block_refs
+            .remove_sync(&ino)
+            .map(|(_, v)| v)
+            .unwrap_or_default()
+    }
+
     pub(crate) async fn save_metadata_to_backend_refs(
         &self,
         ino: u64,
@@ -4494,8 +4565,15 @@ impl DataRouter {
         // Both ride the layout commit, so the blob's accounting flips in
         // the same checksummed journal entry that re-points the layout at
         // it — the DUR-6 CoW ordering extended to the ledger.
+        //
+        // Deferred deltas drain FIRST (they are older than this call's own:
+        // a site that mutated the map and left it dirty happened before the
+        // save that persists it), so a take-then-release sequence on one
+        // index keeps its order.
+        let deferred = self.take_block_ref_ops(ino);
         let mut refs: Vec<crate::meta_backend::kv::block_refs::BlockRefOp> =
-            Vec::with_capacity(block_refs.len() + 2);
+            Vec::with_capacity(deferred.len() + block_refs.len() + 2);
+        refs.extend(deferred);
         refs.extend_from_slice(block_refs);
         if let Some(ref new_blob) = new_indirect_key {
             match self.backend_router.block_ref_for(
@@ -4549,13 +4627,28 @@ impl DataRouter {
             // The full layout moves as `Bytes` (Lever B: the aggregated
             // conveyor parks it as the always-correct fallback — a move,
             // never a per-save copy).
-            backend
+            // Refill on failure (the dirty-layout refill discipline): a
+            // save that did not commit must not consume the accounting its
+            // map change still owes — the next persist owns it.
+            let refill = refs.clone();
+            match backend
                 .merge_layout_and_size(ino, &delta, bytes::Bytes::from(bytes), m.size, refs)
-                .await?
+                .await
+            {
+                Ok(used) => used,
+                Err(e) => {
+                    self.note_block_ref_ops(ino, refill);
+                    return Err(e);
+                }
+            }
         } else {
-            backend
+            if let Err(e) = backend
                 .set_layout_and_size(ino, &bytes, m.size, &refs)
-                .await?;
+                .await
+            {
+                self.note_block_ref_ops(ino, refs);
+                return Err(e);
+            }
             false
         };
         // DUR-6: the commit named the fresh blob — custody transferred.
@@ -4741,6 +4834,7 @@ impl DataRouter {
                 crypto: std::sync::Arc::new(once_cell::sync::OnceCell::new()),
                 prefetcher: std::sync::Arc::new(IoUringPrefetcher::new()),
                 publish_conveyors: std::sync::Arc::new(scc::HashMap::new()),
+                pending_block_refs: std::sync::Arc::new(scc::HashMap::new()),
                 rewrite_epochs: std::sync::Arc::new(scc::HashMap::new()),
                 epoch_sweeper_armed: std::sync::atomic::AtomicBool::new(false),
             }),
@@ -7515,11 +7609,16 @@ impl DataRouter {
             }
         };
         let bs = self.block_size.load(Ordering::Relaxed);
+        // §6.2 item 1: the key this merge binds, kept for the deferred
+        // accounting note below (`new_key` moves into the epoch shadow).
+        let new_key_for_refs = new_key.clone();
         // CoW map mutation (item A — held reader snapshots keep their map).
         let mut map_arc = current.block_map.take().unwrap_or_default();
         let map = std::sync::Arc::make_mut(&mut map_arc);
+        let mut displaced_key: Option<String> = None;
         let displaced_prev = match map.insert(b, new_key.clone()) {
             Some(p) if p != new_key => {
+                displaced_key = Some(p.clone());
                 // Purge the displaced key's read tiers (it left the map)
                 // and PARK it — freed only after a durable save that no
                 // longer references it (§5.2). A same-epoch re-rewrite
@@ -7547,6 +7646,24 @@ impl DataRouter {
         current.file_type = "striped".into();
         current.layout_dirty = true;
         current.cached_at = std::time::Instant::now();
+        // Spec §6.2 item 1: this merge does NOT persist — the layout is left
+        // dirty for a later publish / `persist_dirty_layout_if_needed`. So
+        // NOTE the reference delta (still inside this ino's meta-lock
+        // section) and let whichever save persists the map drain it into the
+        // same transaction. Without this the shadow rewrite's displacement
+        // was invisible to the accounting: the save it eventually rode was
+        // handed a map that already contained the change, so it staged
+        // nothing — the drift the oracle reported on every healthy
+        // write-through population.
+        {
+            let mut changes: Vec<(u32, String, bool)> = Vec::new();
+            if let Some(prev) = displaced_key.as_deref() {
+                changes.push((b, prev.to_string(), false));
+            }
+            changes.push((b, new_key_for_refs.clone(), true));
+            let ops = self.block_ref_ops(ino, &changes);
+            self.note_block_ref_ops(ino, ops);
+        }
         let size_now = current.size;
         self.metadata_cache.insert(ino, current);
         // Epoch bookkeeping.

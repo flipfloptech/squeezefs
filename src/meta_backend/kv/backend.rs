@@ -3171,7 +3171,11 @@ fn holder_suffix(holder: &Option<(WriterClaim, u64)>) -> String {
 }
 
 /// This boot's id, empty when unreadable (non-Linux dev shells).
-fn read_boot_id() -> String {
+///
+/// `pub` since DLM S6: the membership plane's records carry the SAME boot
+/// scoping as `writer_claim` (pid proofs are only meaningful inside one
+/// boot), and two definitions of "this boot" would be two answers.
+pub fn read_boot_id() -> String {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|s| s.trim().to_string())
         .unwrap_or_default()

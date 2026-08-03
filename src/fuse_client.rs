@@ -3732,6 +3732,46 @@ pub struct Metrics {
     /// `writer_guard_mode`; see docs/operations.md §Single-writer mount
     /// guard.
     pub data_plane_fence_mode: Align64<AtomicU64>,
+    // DLM **S6** (pre-RC spec §6.5 item 3, §6.9 S6): the membership plane.
+    // Liveness is RAM state renewed over `cluster_wire`, so these are the
+    // instruments that say so — the gauges (`membership_mode`,
+    // `membership_members`, …) come from `membership::stats_snapshot`.
+    /// Members admitted (fresh joins plus grace-window reclaims).
+    pub membership_joins: Align64<AtomicU64>,
+    /// Lease renewals served — the heartbeat itself. This is the counter
+    /// that used to be a journal transaction per beat: at 15 k members it
+    /// grows at ~1,500/s while `meta_kv_journal_entries` does not move.
+    pub membership_renewals: Align64<AtomicU64>,
+    /// Renewals REFUSED because the presented lease is not custody
+    /// (evicted, swept, or minted by a previous owner). Steady growth
+    /// means members are losing leases they think they hold — read beside
+    /// `membership_self_fences`.
+    pub membership_renew_refusals: Align64<AtomicU64>,
+    /// Members evicted by the owner (TTL fired, no freed-offset
+    /// acknowledgement, or operator). Each mints an S7 dead epoch whose
+    /// offsets stay non-reallocatable until proven drained.
+    pub membership_evictions: Align64<AtomicU64>,
+    /// **Client-side fail-stops** (§6.7's stricter clock): a member that
+    /// could not renew by `T_self` fenced its own objects BEFORE the owner
+    /// could grant them elsewhere. Nonzero means renewals are not
+    /// completing — availability lost, divergence prevented.
+    pub membership_self_fences: Align64<AtomicU64>,
+    /// Census pages served (the read side's cost, in round trips — it does
+    /// not scale with member count the way `listxattr(1)` plus one
+    /// `getxattr` per client did).
+    pub membership_census_serves: Align64<AtomicU64>,
+    /// Conflicting FRESH acquires REFUSED inside a failover grace window
+    /// (§6.7: the window admits reclaim only — refusing reclaims instead
+    /// is what triggers a cluster-wide forced-flush storm).
+    pub membership_grace_refusals: Align64<AtomicU64>,
+    /// Reclaims ADMITTED inside a failover grace window — recovery by
+    /// re-assertion, NFSv4 style.
+    pub membership_grace_reclaims: Align64<AtomicU64>,
+    /// DURABLE membership commits — the rendezvous record at arm and the
+    /// §6.2 item-7 claim set on membership CHANGE. **Bounded by mounts and
+    /// membership changes, never by beats**: growth proportional to
+    /// `membership_renewals` is the regression S6 exists to prevent.
+    pub membership_registration_commits: Align64<AtomicU64>,
     // Idea 2 — latest-wins supersession (design-rewrite-program §4;
     // tests/write_supersession_tests.rs): the overlapping-face
     // loop-rewrite engagement instrument.
@@ -6686,6 +6726,28 @@ impl SqueezefsFilesystem {
                 "dlm_quarantined_offsets": METRICS.dlm_quarantined_offsets.load(Ordering::Relaxed),
                 "dlm_quarantine_releases": METRICS.dlm_quarantine_releases.load(Ordering::Relaxed),
                 "data_plane_fence_mode": METRICS.data_plane_fence_mode.load(Ordering::Relaxed),
+                // DLM S6 (spec §6.5 item 3): the membership plane's
+                // counters. `membership_renewals` is the beat that used to
+                // be a journal transaction — it grows while
+                // `meta_kv_journal_entries` does not, which IS the S6
+                // gate; `membership_registration_commits` is bounded by
+                // mounts and membership changes, so growth proportional to
+                // renewals is the regression. `membership_self_fences`
+                // nonzero = members are fencing their own objects because
+                // renewals are not completing (availability lost,
+                // divergence prevented — §6.7's stricter client clock).
+                // The live gauges (mode, member/reader/writer counts,
+                // grace remaining, the §6.8 item-3 acknowledgement bound)
+                // ride `membership::stats_snapshot()` below.
+                "membership_joins": METRICS.membership_joins.load(Ordering::Relaxed),
+                "membership_renewals": METRICS.membership_renewals.load(Ordering::Relaxed),
+                "membership_renew_refusals": METRICS.membership_renew_refusals.load(Ordering::Relaxed),
+                "membership_evictions": METRICS.membership_evictions.load(Ordering::Relaxed),
+                "membership_self_fences": METRICS.membership_self_fences.load(Ordering::Relaxed),
+                "membership_census_serves": METRICS.membership_census_serves.load(Ordering::Relaxed),
+                "membership_grace_refusals": METRICS.membership_grace_refusals.load(Ordering::Relaxed),
+                "membership_grace_reclaims": METRICS.membership_grace_reclaims.load(Ordering::Relaxed),
+                "membership_registration_commits": METRICS.membership_registration_commits.load(Ordering::Relaxed),
                 // Idea 2 — latest-wins supersession
                 // (design-rewrite-program §4).
                 "write_pipeline_supersessions": METRICS.write_pipeline_supersessions.load(Ordering::Relaxed),
@@ -7134,6 +7196,22 @@ impl SqueezefsFilesystem {
                 "metadata_cache_size": self.router.metadata_cache.entry_count(),
             }
         });
+
+        // DLM S6 (spec §6.5 item 3 / §6.9 S6): the membership plane's live
+        // GAUGES — mode (`off`/`owner`/`member`), member/reader/writer
+        // counts, the lease clock parameters, grace remaining, and the
+        // §6.8 item-3 acknowledgement bound. Inserted post-macro because
+        // only the installed role can answer them, and an un-armed mount
+        // (the shipped default until SQUEEZEFS_MEMBERSHIP_BIND is set)
+        // exports `membership_mode: "off"` alone rather than a block of
+        // zeroes that would look like a broken plane.
+        if let Some(metrics) = stats_obj.get_mut("metrics").and_then(|m| m.as_object_mut()) {
+            if let Some(gauges) = crate::membership::stats_snapshot().as_object() {
+                for (k, v) in gauges {
+                    metrics.insert(k.clone(), v.clone());
+                }
+            }
+        }
 
         // PR K7 (design §10): format-scoped metric families (see has_v2 /
         // has_v3 above). Inserted post-macro so each family exists only

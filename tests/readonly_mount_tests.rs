@@ -50,8 +50,8 @@ use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::block_reclaim::{ReclaimEntry, ReclaimQueue};
 use squeezefs::cache::TieredCache;
 use squeezefs::fuse_client::{
-    read_only_from_options, read_only_mount, reader_daemon_cache_ttl, reader_revalidate_interval,
-    set_read_only_mount, KernelCacheTtls,
+    read_only_from_options, read_only_mount, reader_daemon_cache_ttl, set_read_only_mount,
+    KernelCacheTtls,
 };
 use squeezefs::meta_backend::kv::backend::{KvMetaBackend, WriterClaim, WRITER_CLAIM_XATTR};
 use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
@@ -530,78 +530,94 @@ fn ro_is_daemon_level_in_the_kernel_option_filter() {
 }
 
 // ===========================================================================
-// Item 4 — TTL alignment to the checkpoint cadence
+// Item 4 — TTL alignment to the reader's staleness bound
 // ===========================================================================
 
-/// The reader's coherence horizon IS the checkpoint cadence, so every
-/// kernel TTL derives from it — no hardcoded 1 s, no hardcoded 300 s.
+/// The reader's coherence horizon is its **staleness bound** (the poll
+/// interval plus the writer's ≤ 1 s checkpoint ceiling), so every kernel TTL
+/// derives from that — no hardcoded 1 s, no hardcoded 300 s. A cache may not
+/// hold an entry longer than the interval over which freshness can be
+/// proven.
 #[test]
-fn read_only_kernel_ttls_derive_from_the_checkpoint_cadence() {
-    let cadence = Duration::from_millis(250);
-    let t = KernelCacheTtls::read_only_defaults(cadence);
-    assert_eq!(t.attr, cadence);
-    assert_eq!(t.entry, cadence);
-    assert_eq!(t.dir_entry, cadence);
-    assert_eq!(t.negative, cadence);
+fn read_only_kernel_ttls_derive_from_the_staleness_bound() {
+    let bound = Duration::from_millis(2500);
+    let t = KernelCacheTtls::read_only_defaults(bound);
+    assert_eq!(t.attr, bound);
+    assert_eq!(t.entry, bound);
+    assert_eq!(t.dir_entry, bound);
+    assert_eq!(t.negative, bound);
 
     // The write-mount default is untouched (readers must not retune
     // writers).
     let rw = KernelCacheTtls::default();
     assert_eq!(rw.attr, Duration::from_secs(1));
+}
 
-    // Strict mode (cadence 0 — checkpoint per commit) means the kernel
-    // may cache nothing: honest, not clamped to a constant.
+/// The wiring tie (drift-is-red): the TTL derivation source and the poll
+/// cadence both come from the LANDED machinery, and the bound is exactly
+/// the interval plus the writer's checkpoint ceiling. If the metadata
+/// plane's cadence law changes, this test fails instead of the reader
+/// silently advertising a window it no longer honours.
+#[test]
+fn the_reader_horizon_matches_the_landed_revalidation_machinery() {
+    use squeezefs::meta_backend::kv::revalidate::RevalidationPoller;
+
+    let poller = RevalidationPoller::derived();
     assert_eq!(
-        KernelCacheTtls::read_only_defaults(Duration::ZERO).attr,
-        Duration::ZERO
+        squeezefs::ro_coherence::reader_revalidate_interval(),
+        poller.interval(),
+        "the reader's cadence IS the landed derived cadence"
+    );
+    assert_eq!(
+        squeezefs::ro_coherence::reader_staleness_bound(),
+        poller.staleness_bound(),
+        "the advertised bound IS the machinery's bound"
+    );
+    assert_eq!(
+        squeezefs::ro_coherence::reader_staleness_bound(),
+        poller.interval() + Duration::from_secs(1),
+        "bound = poll interval + the writer's <=1s checkpoint ceiling"
+    );
+    // And the TTLs a reader mounts with are that bound, not a constant.
+    assert_eq!(
+        KernelCacheTtls::read_only_defaults(squeezefs::ro_coherence::reader_staleness_bound()).attr,
+        poller.staleness_bound()
     );
 }
 
-/// Precedence is unchanged (the env-knob law): the cadence-derived value
-/// is a DEFAULT, and an explicit `-o` value still wins verbatim.
+/// Precedence is unchanged (the env-knob law): the bound-derived value is a
+/// DEFAULT, and an explicit `-o` value still wins verbatim — which is
+/// exactly why the docs must say that setting one LENGTHENS the staleness
+/// window by the amount it exceeds the bound.
 #[test]
 fn explicit_ttl_options_still_win_over_the_derived_reader_default() {
-    let t = KernelCacheTtls::read_only_defaults(Duration::from_millis(50))
+    let bound = Duration::from_millis(2000);
+    let t = KernelCacheTtls::read_only_defaults(bound)
         .with_mount_options("attr_timeout=5,negative_timeout=0");
     assert_eq!(t.attr, Duration::from_secs(5), "explicit wins verbatim");
+    assert!(t.attr > bound, "and it lengthens the window past the bound");
     assert_eq!(t.negative, Duration::ZERO);
     assert_eq!(
-        t.entry,
-        Duration::from_millis(50),
+        t.entry, bound,
         "unspecified classes keep the derived reader default"
     );
 }
 
-/// `dir_entry_cache_v3`'s 300 s TTL is cut to the cadence for readers
-/// (§6.8 item 4) and left alone for writers — and the reader's cut can
-/// never EXCEED the shipped 300 s (a huge `--meta-flush-interval` must not
-/// lengthen a cache).
+/// `dir_entry_cache_v3`'s 300 s TTL is cut to the staleness bound for
+/// readers (§6.8 item 4) and left alone for writers — and the reader's cut
+/// can never EXCEED the shipped 300 s (a huge `--meta-flush-interval`
+/// lengthens the bound and must not lengthen a cache past what a write
+/// mount ships with).
 #[test]
-fn reader_daemon_cache_ttl_is_the_cadence_capped_by_the_shipped_horizon() {
+fn reader_daemon_cache_ttl_is_the_bound_capped_by_the_shipped_horizon() {
     assert_eq!(
-        reader_daemon_cache_ttl(Duration::from_millis(50)),
-        Duration::from_millis(50)
+        reader_daemon_cache_ttl(Duration::from_millis(2000)),
+        Duration::from_millis(2000)
     );
     assert_eq!(
         reader_daemon_cache_ttl(Duration::from_secs(86_400)),
         Duration::from_secs(300),
         "never longer than the shipped dentry-cache horizon"
-    );
-}
-
-/// The revalidation cadence is the checkpoint cadence, floored by a
-/// PHYSICAL minimum (one 4 KiB ledger read per volume per pass) so strict
-/// mode cannot spin the poll.
-#[test]
-fn reader_revalidate_interval_derives_from_the_cadence_with_a_physical_floor() {
-    assert_eq!(
-        reader_revalidate_interval(Duration::from_millis(200)),
-        Duration::from_millis(200)
-    );
-    let floored = reader_revalidate_interval(Duration::ZERO);
-    assert!(
-        floored >= Duration::from_millis(1) && floored <= Duration::from_millis(50),
-        "strict mode floors to a physical minimum, got {floored:?}"
     );
 }
 
@@ -646,27 +662,64 @@ async fn revalidation_epoch_purges_the_block_key_stores() {
     );
 }
 
-/// The reader's revalidation pass polls the A/B root ledger (one 4 KiB
-/// read) and reports whether the roots ADVANCED past the snapshot this
-/// mount is serving. That boolean is the trigger for items 4 and 5, and
-/// the input the node-cache revalidation arm (item 2, `feat/mw-node-cache-
-/// coherence`) consumes.
+/// **The item-2 wiring, end to end.** An ARMED reader observes the writer's
+/// checkpoint, adopts the new roots, drops the nodes the new roots do not
+/// cover, and — through the installed sink — fires the R-6 purge over its
+/// block-key census, all in one poll.
+///
+/// This is the test whose intent used to be "the poll reports a boolean the
+/// item-2 arm will consume": the arm has landed, so the same intent is now
+/// stated against the real epoch step rather than against a placeholder's
+/// input. `poll_at` is driven with an explicit `Instant` — the landed
+/// poller's own test seam — so the cadence never becomes a sleep here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn revalidation_pass_observes_the_writer_advancing_the_roots() {
+async fn an_armed_reader_observes_the_writer_advancing_and_purges_its_tiers() {
+    use squeezefs::meta_backend::kv::revalidate::RevalidationPoller;
+
     let vol = fresh_volume().await;
-    // Settle a checkpoint so the reader mounts on a known ledger seq.
+    // Settle a checkpoint so the reader arms at a known ledger record.
     let writer = KvMetaBackend::open(vol.path()).await.expect("write mount");
     writer.checkpoint_now().await.expect("initial checkpoint");
 
     let reader = KvMetaBackend::open_read_only(vol.path())
         .await
         .expect("read-only mount");
-    let first = squeezefs::ro_coherence::revalidate_volume(reader.as_ref())
+    let (router, _b) = data_router("ro_wiring_test").await;
+
+    // A warm block key: the reader's data-plane state that an epoch step
+    // must invalidate (§6.3's binding hazard — the offset may have been
+    // freed and reallocated by the writer since we cached it).
+    let key = "ro_wiring_test://4194304";
+    router
+        .cache
+        .read_lru
+        .put(key, bytes::Bytes::from_static(&[7u8; 4096]));
+
+    // The item-2 DECLARATION + the item-5 sink, exactly as the mount does.
+    assert_eq!(
+        squeezefs::ro_coherence::arm_reader_coherence(std::slice::from_ref(&reader), &router),
+        1,
+        "the volume must arm as a coherent reader"
+    );
+    assert_eq!(
+        reader.reader_epoch(),
+        reader.mounted_ledger().seq,
+        "arming adopts the record the mount opened — nothing is dropped by it"
+    );
+
+    // A poll with nothing committed is INERT: no epoch step, no drop, no
+    // purge (an idle writer costs a reader nothing).
+    let poller = RevalidationPoller::new(1);
+    let inert = poller
+        .poll_at(&reader, std::time::Instant::now())
         .await
-        .expect("the ledger poll must succeed");
+        .expect("the poll must succeed")
+        .expect("the poll was due");
+    assert!(!inert.advanced, "nothing was committed");
+    assert_eq!(inert.keys_purged, 0, "an inert poll purges nothing");
     assert!(
-        !first.roots_advanced,
-        "nothing was committed: the roots cannot have advanced"
+        router.cache.read_lru.get(key).is_some(),
+        "and it leaves the reader's warm tiers alone"
     );
 
     // The writer commits and checkpoints: the roots move.
@@ -675,18 +728,88 @@ async fn revalidation_pass_observes_the_writer_advancing_the_roots() {
         .unwrap();
     writer.checkpoint_now().await.expect("checkpoint");
 
-    let second = squeezefs::ro_coherence::revalidate_volume(reader.as_ref())
+    let advanced = poller
+        .poll_at(&reader, std::time::Instant::now())
         .await
-        .expect("the ledger poll must succeed");
+        .expect("the poll must succeed")
+        .expect("the poll was due");
     assert!(
-        second.roots_advanced,
-        "the reader must observe the writer's new checkpoint (epoch {} vs mounted {})",
-        second.ledger_seq,
-        reader.mounted_ledger().seq
+        advanced.advanced,
+        "the reader must observe the writer's new checkpoint (epoch {} → {})",
+        advanced.from_epoch, advanced.epoch
     );
-    assert!(second.ledger_seq > first.ledger_seq);
+    assert!(advanced.epoch > inert.epoch, "epochs only advance");
+    assert_eq!(
+        reader.reader_epoch(),
+        advanced.epoch,
+        "the live epoch IS the adopted record"
+    );
+    // Item 5: the sink fired, through the ONE unified purge.
+    assert!(
+        advanced.keys_purged >= 1,
+        "the epoch step must fire the R-6 purge — `keys_purged` at 0 while epochs \
+         advance is a coherence promise that is silently not kept"
+    );
+    assert!(
+        router.cache.read_lru.get(key).is_none(),
+        "the reader's cached block bytes must be gone after the epoch step"
+    );
 
     writer.shutdown().await.unwrap();
+}
+
+/// Arming is a once-per-mount DECLARATION: a second attempt on the same
+/// volume is refused (the landed contract) and the mount path reports it as
+/// "not armed" rather than double-installing a sink. The refusal is loud but
+/// never fatal — that volume keeps serving its current epoch, which is stale
+/// but never wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arming_a_reader_twice_is_refused_not_double_installed() {
+    let vol = fresh_volume().await;
+    let reader = KvMetaBackend::open_read_only(vol.path())
+        .await
+        .expect("read-only mount");
+    let (router, _b) = data_router("ro_rearm_test").await;
+    let vols = std::slice::from_ref(&reader);
+
+    assert_eq!(
+        squeezefs::ro_coherence::arm_reader_coherence(vols, &router),
+        1,
+        "first arm declares the reader"
+    );
+    assert_eq!(
+        squeezefs::ro_coherence::arm_reader_coherence(vols, &router),
+        0,
+        "a second arm is refused — one declaration per mount"
+    );
+    // And the volume is still a working reader on its first declaration.
+    assert_eq!(reader.reader_epoch(), reader.mounted_ledger().seq);
+}
+
+/// The mount's sink is the CENSUS pass, not the registered-suspect drain —
+/// deliberately, because no registration site exists yet, and a sink that
+/// purges only registrations would leave `meta_kv_revalidate_keys_purged`
+/// at 0 while epochs advanced (a silently broken promise). Pinned directly
+/// on the sink so the choice cannot be reverted by accident.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_mount_sink_purges_the_census_without_any_registration() {
+    use squeezefs::meta_backend::kv::node_cache::EpochPurgeSink;
+
+    let (router, _b) = data_router("ro_sink_test").await;
+    for i in 0..3u64 {
+        router.cache.read_lru.put(
+            &format!("ro_sink_test://{}", i * 4_194_304),
+            bytes::Bytes::from_static(&[1u8; 4096]),
+        );
+    }
+    let sink = squeezefs::ro_coherence::ReaderEpochPurge::new(router.clone());
+    // No `note_suspect`-style registration happened, and it still purges.
+    assert_eq!(
+        sink.on_epoch_advance(7, 8),
+        3,
+        "the census sink purges what the reader actually cached"
+    );
+    assert!(router.cache.read_lru.get("ro_sink_test://0").is_none());
 }
 
 /// The revalidation task must EXIT at dismount (no leaked tasks — and the
@@ -700,12 +823,10 @@ async fn reader_revalidation_task_exits_at_dismount() {
     let reader = KvMetaBackend::open_read_only(vol.path())
         .await
         .expect("read-only mount");
-    let (router, _b) = data_router("ro_stop_test").await;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let wake = Arc::new(tokio::sync::Notify::new());
     let handle = squeezefs::ro_coherence::spawn_reader_revalidation(
         vec![reader],
-        router,
         stop.clone(),
         wake.clone(),
     );

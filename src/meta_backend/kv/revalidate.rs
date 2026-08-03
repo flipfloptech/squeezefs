@@ -22,8 +22,14 @@
 //! ```
 //!
 //! Or, for a caller that owns a bare [`NodeCache`] and [`KvTree`] set rather
-//! than a backend (the shape the S5 mount wiring may prefer):
-//! [`revalidate_trees`] takes exactly those.
+//! than a backend: [`revalidate_trees`] takes exactly those.
+//!
+//! The S5 mount is that consumer, and its driver is
+//! [`crate::ro_coherence`]: `arm_reader_coherence` performs the arming (once
+//! per volume, installing `ReaderEpochPurge` as the sink),
+//! `spawn_reader_revalidation` is the task this module's deliberately
+//! task-less [`RevalidationPoller`] expects, and the reader's TTLs are
+//! derived from [`RevalidationPoller::staleness_bound`].
 //!
 //! ## The consistency model (the operator-facing statement)
 //!
@@ -223,10 +229,19 @@ pub fn revalidate_trees(
 /// can answer — §6.3's block-key binding hazard is a device-offset reuse
 /// problem, and bounding it exactly is spec §6.8 item **3** (the
 /// freed-offset grace period), which is not built. So this sink purges what
-/// the reader's data path **registered** through [`Self::note_suspect`], and
-/// `meta_kv_revalidate_keys_purged` staying 0 while
-/// `meta_kv_revalidate_epochs` grows is the visible, honest statement that
-/// the data-plane half is not wired yet — never a silent hole.
+/// the reader's data path **registered** through [`Self::note_suspect`].
+///
+/// **Which sink an S5 mount installs, and why not this one.** No
+/// registration site exists yet, so on a mount this sink would purge
+/// nothing and leave `meta_kv_revalidate_keys_purged` at 0 while
+/// `meta_kv_revalidate_epochs` climbed — a coherence promise silently not
+/// kept. The mount therefore installs `ro_coherence::ReaderEpochPurge`,
+/// which purges the reader's whole block-key census: complete and never
+/// silent, at the cost of being unscoped. This sink is the scoped form for
+/// callers that own an `Arc<TieredCache>` **and** a registration site; when
+/// one lands it becomes the fast path with the census as its fallback. The
+/// live consequence: on a reader, `keys_purged` flat while `epochs` grows is
+/// now a BROKEN trigger, not an unwired one.
 pub struct TieredEpochPurge {
     tiers: Arc<TieredCache>,
     suspects: scc::HashSet<String>,

@@ -1130,14 +1130,18 @@ impl KvMetaBackend {
     /// writer. Its guarantee class is its own row —
     /// [`Self::writer_guard_mode`] returns `"reader"`.
     ///
-    /// **Consistency model** (stated, never implied — §6.12): this mount
-    /// serves the metadata snapshot its bootstrap read, and
-    /// [`crate::ro_coherence`] polls the A/B root ledger at the checkpoint
-    /// cadence to detect the writer advancing. Readers therefore lag by at
-    /// most one checkpoint interval **once the node-cache revalidation arm
-    /// lands** (§6.8 item 2, `feat/mw-node-cache-coherence`); until then
-    /// the metadata view is frozen at mount time and the mount says so
-    /// loudly. See `docs/operations.md` §Read-only coherent mounts.
+    /// **Consistency model** (stated, never implied — §6.12): this open
+    /// arms nothing by itself — it bootstraps the mount's snapshot. The
+    /// mount path then DECLARES the volume a coherent reader
+    /// (`ro_coherence::arm_reader_coherence` →
+    /// [`Self::arm_reader_revalidation`], installing the R-6 purge sink) and
+    /// drives the derived cadence, after which the mount serves the state of
+    /// the most recent checkpoint it has polled: bounded, monotone staleness
+    /// with the bound published as `reader_staleness_bound_ms`. A consumer
+    /// that opens read-only WITHOUT arming (an offline probe-shaped caller)
+    /// keeps a frozen mount-time view, and its polls refuse loudly rather
+    /// than pretending — [`Self::revalidate_reader`] requires the
+    /// declaration. See `docs/operations.md` §Read-only coherent mounts.
     pub async fn open_read_only(path: &Path) -> std::result::Result<Arc<Self>, KvError> {
         match Self::probe_shared_lock(path) {
             SharedProbe::LocalExclusiveHolder => log::info!(

@@ -250,24 +250,30 @@ impl Default for KernelCacheTtls {
 }
 
 impl KernelCacheTtls {
-    /// **DLM S5 item 4 — TTL alignment.** A reader's coherence horizon IS
-    /// the writer's checkpoint cadence (the reader revalidates against the
-    /// A/B root ledger, so it lags by at most one checkpoint interval), so
-    /// every kernel TTL class DERIVES from that cadence instead of the
-    /// write-mount 1 s default. Nothing is hardcoded and nothing is
-    /// clamped: strict mode (cadence 0 — checkpoint per commit) means the
-    /// kernel may cache nothing, which is the honest answer, and a long
-    /// cadence honestly lengthens the horizon it already has.
+    /// **DLM S5 item 4 — TTL alignment.** A reader's coherence horizon is
+    /// its **staleness bound** — the revalidation poll interval plus the
+    /// writer's ≤ 1 s checkpoint ceiling
+    /// (`crate::ro_coherence::reader_staleness_bound`, straight from the
+    /// machinery in force) — so every kernel TTL class derives from that
+    /// bound instead of the write-mount 1 s default. A cache may not hold
+    /// an entry longer than the interval over which the reader can prove
+    /// freshness; holding it for *exactly* that interval is free, because a
+    /// shorter TTL cannot buy coherence the poll has not delivered yet.
+    ///
+    /// Nothing is hardcoded and nothing is clamped: the bound is a function
+    /// of the cadence knob and the checkpoint ceiling, both of which are
+    /// derived themselves.
     ///
     /// These are DEFAULTS. Precedence is unchanged (the env-knob law):
     /// derived default → `SQUEEZEFS_FUSE_*_TTL_MS` → `-o *_timeout=`, later
-    /// wins verbatim.
-    pub fn read_only_defaults(checkpoint_cadence: Duration) -> Self {
+    /// wins verbatim — so an explicit value LENGTHENS the staleness window
+    /// by exactly the amount it exceeds this bound.
+    pub fn read_only_defaults(staleness_bound: Duration) -> Self {
         Self {
-            attr: checkpoint_cadence,
-            entry: checkpoint_cadence,
-            dir_entry: checkpoint_cadence,
-            negative: checkpoint_cadence,
+            attr: staleness_bound,
+            entry: staleness_bound,
+            dir_entry: staleness_bound,
+            negative: staleness_bound,
         }
     }
 
@@ -574,28 +580,16 @@ pub(crate) fn read_only_refusal(what: &str) -> crate::error::SqueezefsError {
 pub const DAEMON_CACHE_TTL_SECS: u64 = 300;
 
 /// **DLM S5 item 4.** The daemon-side cache horizon for a READER:
-/// `dir_entry_cache_v3`'s 300 s TTL cut to the checkpoint cadence —
+/// `dir_entry_cache_v3`'s 300 s TTL cut to the reader's staleness bound —
 /// "keyed on a process-local generation" is exactly the §6.3 obligation a
-/// second writer breaks, and the cadence is the interval the reader can
-/// actually prove freshness over.
+/// second writer breaks, and the bound is the interval over which the
+/// reader can actually prove freshness.
 ///
-/// Capped by the shipped horizon: a very large `--meta-flush-interval`
-/// (the "park the timer" idiom) must never LENGTHEN a cache beyond what a
-/// write mount ships with.
-pub fn reader_daemon_cache_ttl(checkpoint_cadence: Duration) -> Duration {
-    checkpoint_cadence.min(Duration::from_secs(DAEMON_CACHE_TTL_SECS))
-}
-
-/// **DLM S5 item 2's cadence** (the driver is [`crate::ro_coherence`]):
-/// how often a reader polls each volume's A/B root ledger. Derived from
-/// the writer's checkpoint cadence — the roots cannot advance faster than
-/// they are written — with a PHYSICAL floor: one 4 KiB device read per
-/// volume per pass, so strict mode (cadence 0) polls at the floor instead
-/// of spinning.
-pub fn reader_revalidate_interval(checkpoint_cadence: Duration) -> Duration {
-    /// Physical minimum: one 4 KiB ledger read per volume per pass.
-    const FLOOR: Duration = Duration::from_millis(10);
-    checkpoint_cadence.max(FLOOR)
+/// Capped by the shipped horizon: a very large `--meta-flush-interval` (the
+/// "park the timer" idiom) lengthens the bound, and must never LENGTHEN a
+/// cache beyond what a write mount ships with.
+pub fn reader_daemon_cache_ttl(staleness_bound: Duration) -> Duration {
+    staleness_bound.min(Duration::from_secs(DAEMON_CACHE_TTL_SECS))
 }
 
 /// Resolve the read-only posture for one mount from the CLI flag and the
@@ -3626,24 +3620,6 @@ pub struct Metrics {
     /// discards orphan active blocks", applied live instead of the
     /// NotFound retry spin (FIND-M11-A's second face).
     pub writeback_orphan_discards: Align64<AtomicU64>,
-    // ---- DLM S5: read-only coherent mounts (spec §6.8, `ro_coherence`) ----
-    /// Reader revalidation passes run (one 4 KiB root-ledger read per
-    /// volume per pass). Structurally 0 on a write mount.
-    pub ro_revalidate_passes: Align64<AtomicU64>,
-    /// Passes that observed the writer's roots ADVANCED past the snapshot
-    /// this reader serves — the staleness instrument. `epochs == 0` across
-    /// a window in which the writer is known to be committing means the
-    /// reader's poll is not seeing checkpoints (investigate before trusting
-    /// the one-interval lag claim).
-    pub ro_revalidate_epochs: Align64<AtomicU64>,
-    /// Block keys dropped by the §6.8 item-5 purge-on-revalidation pass —
-    /// the trigger's engagement gauge (`purge_block_key`, all five stores).
-    pub ro_purged_block_keys: Align64<AtomicU64>,
-    /// Nodes dropped by the §6.8 item-2 node-cache revalidation arm.
-    /// **0 while that arm is not installed** (`feat/mw-node-cache-
-    /// coherence`), which is exactly the signal that a reader's METADATA
-    /// view is frozen at mount time rather than lagging by one interval.
-    pub ro_node_cache_nodes_dropped: Align64<AtomicU64>,
     /// Copy-on-write duplications of an active-block accumulation buffer
     /// forced by a live reader snapshot (zero-copy write-path design §5.2).
     /// Sequential streams never pay this; spikes mean read/write contention
@@ -5251,7 +5227,7 @@ impl SqueezefsFilesystem {
         // checkpoint cadence — the interval the reader can actually prove
         // freshness over — and a write mount keeps the shipped 300 s.
         let daemon_cache_ttl = if read_only_mount() {
-            reader_daemon_cache_ttl(crate::ro_coherence::checkpoint_cadence())
+            reader_daemon_cache_ttl(crate::ro_coherence::reader_staleness_bound())
         } else {
             Duration::from_secs(DAEMON_CACHE_TTL_SECS)
         };
@@ -5330,7 +5306,7 @@ impl SqueezefsFilesystem {
             // env-knob precedence law).
             kernel_ttls: if read_only_mount() {
                 KernelCacheTtls::from_env_over(KernelCacheTtls::read_only_defaults(
-                    crate::ro_coherence::checkpoint_cadence(),
+                    crate::ro_coherence::reader_staleness_bound(),
                 ))
             } else {
                 KernelCacheTtls::from_env()
@@ -6632,10 +6608,17 @@ impl SqueezefsFilesystem {
                 "writeback_orphan_discards": METRICS.writeback_orphan_discards.load(Ordering::Relaxed),
                 // DLM S5 — the reader-coherence family (0 on write mounts).
                 "read_only_mount": read_only_mount(),
-                "ro_revalidate_passes": METRICS.ro_revalidate_passes.load(Ordering::Relaxed),
-                "ro_revalidate_epochs": METRICS.ro_revalidate_epochs.load(Ordering::Relaxed),
-                "ro_purged_block_keys": METRICS.ro_purged_block_keys.load(Ordering::Relaxed),
-                "ro_node_cache_nodes_dropped": METRICS.ro_node_cache_nodes_dropped.load(Ordering::Relaxed),
+                // The reader's two DERIVED numbers, machine-readable so the
+                // guarantee in docs/operations.md cannot drift from the one
+                // in force. Both 0 on a write mount. The reader's activity
+                // counters are the meta_kv_revalidate_* family (below) —
+                // one mechanism, one family.
+                "reader_revalidate_interval_ms": if read_only_mount() {
+                    crate::ro_coherence::reader_revalidate_interval().as_millis() as u64
+                } else { 0 },
+                "reader_staleness_bound_ms": if read_only_mount() {
+                    crate::ro_coherence::reader_staleness_bound().as_millis() as u64
+                } else { 0 },
                 "active_block_cow_copies": METRICS.active_block_cow_copies.load(Ordering::Relaxed),
                 "write_through_blocks": METRICS.write_through_blocks.load(Ordering::Relaxed),
                 "write_through_bytes": METRICS.write_through_bytes.load(Ordering::Relaxed),
@@ -7148,8 +7131,15 @@ impl SqueezefsFilesystem {
                 // pass met un-durable RAM records, i.e. revalidation was
                 // armed on a mount that writes) and `partition_refusals`
                 // (an appender reached for a node population it does not
-                // own). `keys_purged` at 0 with `epochs` growing is the
-                // honest "the R-6 data-plane trigger is not wired yet".
+                // own). Since the S5 mount installs the census purge sink
+                // (`ro_coherence::ReaderEpochPurge`), `keys_purged` is no
+                // longer allowed to sit at 0 while `epochs` grows on a
+                // mount that has cached anything — that combination now
+                // means the R-6 trigger is NOT reaching the tiers, which is
+                // a broken coherence promise rather than an unwired one.
+                // The inverted tripwire for the METADATA half is the same
+                // shape: `epochs` growing with `nodes_dropped` flat means
+                // the drop pass is finding nothing to drop.
                 {
                     let r = meta_kv::revalidate::revalidation_stats();
                     metrics.insert("meta_kv_revalidate_polls".into(), r.polls.into());
@@ -13654,17 +13644,18 @@ impl Filesystem for SqueezefsFilesystem {
             }
         }
 
-        // DLM S5 items 2/5/6: the reader's own machinery — the data-plane
-        // lockdown latch on the reclaim queue, then the revalidation
-        // cadence (root-ledger poll → purge-on-revalidation → the
-        // node-cache revalidation seam). Both replace the writer engines
-        // skipped above; the task stops on the dismount notify.
+        // DLM S5 items 2/5/6: the reader's own machinery, in dependency
+        // order — the data-plane lockdown latch on the reclaim queue, then
+        // the item-2 DECLARATION (every volume becomes a coherent reader
+        // and the R-6 purge sink is installed; the poll is illegal before
+        // it), then the cadence task that drives the landed poller. These
+        // replace the writer engines skipped above.
         if reader_mount {
             crate::ro_coherence::arm_reader_data_plane(&self.router);
             if let Some(routed) = self.meta_backend.as_ref() {
+                crate::ro_coherence::arm_reader_coherence(&routed.volumes, &self.router);
                 crate::ro_coherence::spawn_reader_revalidation(
                     routed.volumes.clone(),
-                    self.router.clone(),
                     self.dismount_once.clone(),
                     self.dismount_done.clone(),
                 );
@@ -17867,9 +17858,10 @@ pub async fn start_mount<P: AsRef<Path>>(
     let read_only = read_only_mount();
     if read_only {
         info!(
-            "Read-only mount (DLM S5): kernel cache TTLs derive from the writer's \
-             checkpoint cadence ({:?}) — attr {:?}, entry {:?}, dir-entry {:?}, negative {:?}",
-            crate::ro_coherence::checkpoint_cadence(),
+            "Read-only mount (DLM S5): kernel cache TTLs derive from the reader's \
+             staleness bound ({:?} = poll interval + the writer's ≤1 s checkpoint \
+             ceiling) — attr {:?}, entry {:?}, dir-entry {:?}, negative {:?}",
+            crate::ro_coherence::reader_staleness_bound(),
             fs.kernel_ttls.attr,
             fs.kernel_ttls.entry,
             fs.kernel_ttls.dir_entry,

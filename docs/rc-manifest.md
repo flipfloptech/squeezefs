@@ -198,6 +198,7 @@ Every claim cites its tier. **(i) measured-real** — rows from real mounts at l
 | 12 | `KV_INO_LANES` | — | Multi-writer §6.2 item 5 — per-writer ino lanes; built, never stamped (D9) |
 | 13 | `KV_BLOCK_KEY_INCARNATION` | — | Multi-writer §6.2 item 6 — `offset ‖ incarnation` block keys; built, never stamped (D9). Both authored themselves at 10/11 and renumbered at integration: the **third** parallel claim, and the second the union pin caught on contact |
 | 14 | `KV_CLAIM_SET` | — | Multi-writer §6.2 **item 7** — the claim-set record (membership, not exclusion), DLM S6's capability gate; built, never stamped (D9). Renumbered from 12 at integration: the **fourth** parallel claim |
+| 15 | `KV_LAYOUT_VERSIONS` | — | Multi-writer §6.2 **item 9** — era-composed layout-delta base versions; built, never stamped (D9). The first parallel-safe claim: all four pins updated by its own author |
 | 11 | `KV_MULTI_WRITER_DATA` | — | DLM **S7**'s capability gate — `SQUEEZEFS_MULTI_WRITER=1` refuses a format without it. Renumbered from 10 at integration (the second parallel claim; this one was caught by the disjointness pin's union clause going red, not by reading a diff). Built, never stamped (D9), so the knob currently refuses on every real volume — the honest posture |
 | — | Post-RSA key wrap (KW-1) | — | Ruling D3; same window |
 | — | Sharded indirect map (DUR-6 ⊕ PERF-9) | — | Same window |

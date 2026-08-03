@@ -136,6 +136,7 @@ merge — and this path is not hot.
 | the indirect-map blob's own reference + its DUR-6 CoW replacement | `the_indirect_map_blob_carries_its_own_durable_reference` |
 | ruling D9: un-stamped sector 0 byte-identical after a real mount+publish | `unstamped_volume_is_unchanged_by_mount_and_stays_derived` |
 | the stamp engages on the next mount (root minted) | `stamping_the_bit_engages_accounting_on_the_next_mount` |
+| stamping a NON-EMPTY volume backfills instead of freeing live blocks | `stamping_a_non_empty_volume_backfills_instead_of_freeing_live_blocks` |
 
 **Open rows this note does NOT claim** (stated so nobody cites it for them):
 

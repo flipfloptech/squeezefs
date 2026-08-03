@@ -2057,6 +2057,17 @@ impl BackendRouter {
         if !routed.volumes.iter().any(|kv| kv.block_refs_engaged()) {
             return Ok(None);
         }
+        // Scan first, seed second: an EMPTY durable population is never
+        // authoritative (§6.2 item 1). Either the volume set genuinely holds
+        // no data — in which case the derived walk is free, it finds no
+        // layouts — or the ledger has not been backfilled yet (a volume the
+        // Phase-8 window stamped). Trusting an empty ledger on the second
+        // shape would read every live block as free and hand it to the next
+        // writer, so the empty case DECLINES and the caller walks + backfills.
+        let mut per_volume: Vec<(
+            std::sync::Arc<crate::block_allocator::BlockAllocator>,
+            Vec<u64>,
+        )> = Vec::new();
         let mut total = 0u64;
         for (vol_tag, alloc) in self.durable_ref_volumes() {
             let mut indices: Vec<u64> = Vec::new();
@@ -2070,9 +2081,134 @@ impl BackendRouter {
                     indices.push(r.block_idx);
                 }
             }
-            total += alloc.seed_from_durable_refs(&indices).await;
+            total += indices.len() as u64;
+            per_volume.push((alloc, indices));
+        }
+        if total == 0 {
+            log::info!(
+                "durable block-reference ledger is EMPTY — declining to treat it as                  authoritative (an un-backfilled stamp reads every live block as free):                  falling back to the layout walk, which then backfills"
+            );
+            return Ok(None);
+        }
+        for (alloc, indices) in per_volume {
+            alloc.seed_from_durable_refs(&indices).await;
         }
         Ok(Some(total))
+    }
+
+    /// **Backfill** the durable reference ledger from the layout walk (spec
+    /// §6.2 item 1) — what makes stamping incompat bit 8 on an EXISTING,
+    /// non-empty volume safe.
+    ///
+    /// The hazard without it: a stamped volume's ledger is empty while its
+    /// layouts reference blocks, so a mount that trusted the ledger would
+    /// read every live block as free and hand it to the next writer. The
+    /// rule that closes it, and the one [`Self::recover_durable_block_refs`]
+    /// enforces: **an empty durable population is never authoritative.**
+    /// The empty case falls back to the derived walk (cheap exactly when the
+    /// ledger is empty because the volume is) and then persists what the
+    /// walk found — after which the ledger IS authoritative and every later
+    /// mount skips the walk.
+    ///
+    /// Idempotent: every record is an idempotent `Put` at a key derived from
+    /// `(volume, block, owner ino, map index)`, so a backfill interrupted by
+    /// a crash simply resumes — re-writing a record that already exists
+    /// changes nothing. One transaction per inode (this is a one-time
+    /// upgrade pass, not the publish path).
+    pub async fn backfill_durable_block_refs(
+        &self,
+        routed: &crate::meta_backend::RoutedMetaBackend,
+    ) -> Result<u64> {
+        let mut written = 0u64;
+        for kv in &routed.volumes {
+            if !kv.block_refs_engaged() {
+                continue;
+            }
+            // Collect per-ino reference sets under the walk (its visitor is
+            // synchronous), then commit them — and resolve indirect blobs'
+            // entries in the async pass, never by blocking on a device read.
+            let mut inline: Vec<(u64, Vec<(u32, String)>)> = Vec::new();
+            let mut indirect: Vec<(u64, String)> = Vec::new();
+            crate::block_allocator::walk_live_layouts(kv, |ino, layout| {
+                if layout.file_type != "striped" && layout.file_type != "staged" {
+                    return;
+                }
+                let mut entries: Vec<(u32, String)> = layout
+                    .block_map
+                    .as_ref()
+                    .map(|m| m.iter().map(|(b, k)| (*b, k.clone())).collect())
+                    .unwrap_or_default();
+                if let Some(blob) = layout
+                    .block_map_id
+                    .as_deref()
+                    .and_then(|id| id.strip_prefix("indirect:"))
+                {
+                    // The blob block itself is a reference the walk counts.
+                    entries.push((
+                        crate::meta_backend::kv::block_refs::BLOCK_INDEX_MAP_BLOB,
+                        blob.to_string(),
+                    ));
+                    indirect.push((ino, blob.to_string()));
+                }
+                if !entries.is_empty() {
+                    inline.push((ino, entries));
+                }
+            })
+            .await?;
+
+            // The blobs' entries (a spilled map's references live in the
+            // blob, not in the layout value).
+            let block_size = self.block_size.load(Ordering::Relaxed) as usize;
+            for (ino, blob) in indirect {
+                match self.read_block(&blob, block_size).await {
+                    Ok(raw) => match decode_indirect_block_map(&raw) {
+                        Ok(entries) => inline.push((ino, entries)),
+                        Err(e) => log::warn!(
+                            "block-reference backfill: undecodable indirect map at \
+                             '{blob}' for ino {ino}: {e} (its entries stay unaccounted \
+                             — fsck C8 names them)"
+                        ),
+                    },
+                    Err(e) => log::warn!(
+                        "block-reference backfill: unreadable indirect map at '{blob}' \
+                         for ino {ino}: {e}"
+                    ),
+                }
+            }
+
+            for (ino, entries) in inline {
+                let changes: Vec<(u32, String, bool)> =
+                    entries.into_iter().map(|(b, k)| (b, k, true)).collect();
+                // The same resolver the merge sites use (`block_ref_for`
+                // → `clean_block_key` + `parse_block_key` alias rules), so
+                // the backfilled multiset is what the oracle will count.
+                let mut ops = Vec::with_capacity(changes.len());
+                for (block_index, key, _) in &changes {
+                    match self.block_ref_for(key, ino, *block_index) {
+                        Some(r) => {
+                            ops.push(crate::meta_backend::kv::block_refs::BlockRefOp::taken(r))
+                        }
+                        None => {
+                            crate::meta_backend::kv::META_KV_BLOCK_REFS_UNRESOLVED
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                if ops.is_empty() {
+                    continue;
+                }
+                routed.commit_block_refs(ino, &ops).await?;
+                written += ops.len() as u64;
+            }
+        }
+        if written > 0 {
+            log::info!(
+                "durable block-reference ledger BACKFILLED from the layout walk: \
+                 {written} reference(s) persisted — subsequent mounts seed from records \
+                 and skip the walk"
+            );
+        }
+        Ok(written)
     }
 
     /// **The durable-vs-derived comparison** (spec §6.2 item 1): run the

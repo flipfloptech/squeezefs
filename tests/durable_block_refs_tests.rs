@@ -934,3 +934,103 @@ async fn the_indirect_map_blob_carries_its_own_durable_reference() {
     assert!(rig.drift().await.is_empty(), "durable == derived");
     rig.shutdown().await;
 }
+
+/// **Stamping an EXISTING, non-empty volume must be safe.**
+///
+/// The hazard this pins (found while writing the design record, and the
+/// reason `recover_durable_block_refs` refuses to trust an empty ledger):
+/// a volume the Phase-8 window stamps has layouts that reference blocks
+/// and a ledger with nothing in it. A mount that treated that ledger as
+/// authoritative would read every live block as FREE and hand it straight
+/// to the next writer — one device offset, two owners, which is the exact
+/// failure class the whole structure exists to prevent.
+///
+/// Contract: the empty ledger DECLINES (so the caller walks), the backfill
+/// persists what the walk found, and the mount after that seeds from
+/// records alone and still agrees with the derived answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stamping_a_non_empty_volume_backfills_instead_of_freeing_live_blocks() {
+    let meta = NamedTempFile::new().unwrap();
+    format_meta(meta.path()).await;
+    // Un-stamp, so the data below is written with NO accounting at all —
+    // exactly the pre-item-1 on-disk state the reformat window meets.
+    let VolumeFormat::V3(mut sb) = classify_volume(meta.path()).await.unwrap() else {
+        panic!("expected v3");
+    };
+    sb.features_incompat &= !FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS;
+    write_superblock_v3(meta.path(), &sb).await.unwrap();
+
+    let data = data_file();
+    let live = {
+        let rig = mount(meta.path(), data.path()).await;
+        let ino = rig.mk_file("legacy").await;
+        let mut live = Vec::new();
+        for b in 0..3u32 {
+            live.push(rig.publish_block(ino, b).await);
+        }
+        assert_eq!(
+            rig.durable().await.len(),
+            0,
+            "an un-stamped volume records nothing (that IS the legacy state)"
+        );
+        rig.shutdown().await;
+        live
+    };
+
+    // The Phase-8 stamp.
+    assert!(set_block_refcounts_bit(meta.path()).await.unwrap());
+
+    // First mount after the stamp: the ledger is engaged but EMPTY.
+    let rig = mount(meta.path(), data.path()).await;
+    assert!(rig.routed.volumes[0].block_refs_engaged());
+    assert!(
+        rig.router
+            .backend_router
+            .recover_durable_block_refs(&rig.routed)
+            .await
+            .unwrap()
+            .is_none(),
+        "an EMPTY ledger must never be treated as authoritative — trusting it here \
+         would read every live block as free"
+    );
+    // The caller's fallback: the derived walk, then the backfill.
+    rig.alloc
+        .recover_active_blocks_v3(&rig.routed.volumes[0], &rig.router.backend_router)
+        .await
+        .expect("derived walk");
+    let written = rig
+        .router
+        .backend_router
+        .backfill_durable_block_refs(&rig.routed)
+        .await
+        .expect("backfill");
+    assert_eq!(written, 3, "one record per live reference");
+    assert!(rig.drift().await.is_empty(), "the backfill is exact");
+    rig.shutdown().await;
+
+    // Every later mount seeds from records alone — and still must not hand
+    // out a live offset.
+    let rig = mount(meta.path(), data.path()).await;
+    let seeded = rig
+        .router
+        .backend_router
+        .recover_durable_block_refs(&rig.routed)
+        .await
+        .unwrap()
+        .expect("the backfilled ledger IS authoritative");
+    assert_eq!(seeded, 3);
+    for off in &live {
+        assert_eq!(
+            rig.alloc.refcount(*off),
+            Some(1),
+            "block {off} must be tracked after a backfilled-ledger mount"
+        );
+    }
+    let fresh = rig.alloc.allocate_block().await.expect("fresh");
+    assert!(
+        !live.contains(&fresh),
+        "allocator handed out live block {fresh} after the stamp — the hazard"
+    );
+    assert!(rig.drift().await.is_empty());
+    rig.shutdown().await;
+}

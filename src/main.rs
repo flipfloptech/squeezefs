@@ -4858,6 +4858,20 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                    // Spec §6.2 item 1: the walk just established the truth
+                    // on a volume whose ledger is engaged but empty (a
+                    // Phase-8 stamp that has not been backfilled). Persist
+                    // it, so this is the LAST mount that pays the walk.
+                    if let Err(e) = fs_engine
+                        .router
+                        .backend_router
+                        .backfill_durable_block_refs(&routed_meta_backend)
+                        .await
+                    {
+                        log::error!(
+                            "durable block-reference backfill failed: {e:?} (accounting                              stays derived; the next mount walks again)"
+                        );
+                    }
                 }
                 Err(e) => log::error!("durable block-reference recovery failed: {e:?}"),
             }

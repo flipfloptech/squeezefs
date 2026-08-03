@@ -1237,10 +1237,8 @@ impl BlockAllocator {
         Ok(())
     }
 
-    /// Walk every LIVE inode's decoded `"layout"` xattr on one metadata
-    /// volume (paged range scans, `nlink == 0` corpses skipped — the
-    /// reclaim contract), handing each to `visit`. The shared engine of
-    /// the recovery seed and its oracle.
+    /// [`walk_live_layouts`] bound to this allocator (the visitor sees only
+    /// the layout — the seed and the oracle key on blocks, not inodes).
     async fn walk_live_layouts<F>(
         &self,
         kv: &crate::meta_backend::kv::backend::KvMetaBackend,
@@ -1249,48 +1247,7 @@ impl BlockAllocator {
     where
         F: FnMut(&crate::routing::LayoutMetadata),
     {
-        use crate::meta_backend::kv::record::{decode_inode_key, inode_key, InodeValue};
-        let inodes = kv.trees()[0];
-        let mut summary = LayoutWalkSummary::default();
-        let mut cursor: Vec<u8> = inode_key(1).to_vec();
-        let end = inode_key(u64::MAX - 1);
-        loop {
-            let page = inodes.range(&cursor, &end, 512).await.map_err(|e| {
-                crate::error::SqueezefsError::InvalidOperation(format!(
-                    "v3 recovery inode walk failed: {e}"
-                ))
-            })?;
-            let Some((last_key, _)) = page.last() else {
-                break;
-            };
-            cursor = crate::meta_backend::kv::node::key_successor(last_key);
-            for (k, v) in &page {
-                let Ok(ino) = decode_inode_key(k) else {
-                    continue;
-                };
-                let Ok(val) = InodeValue::decode(v) else {
-                    continue;
-                };
-                summary.checked += 1;
-                if val.nlink == 0 {
-                    continue;
-                }
-                summary.valid_inodes += 1;
-                if let Ok(Some(bytes)) = kv.getxattr(ino, "layout").await {
-                    summary.layouts_found += 1;
-                    let layout_opt: Option<crate::routing::LayoutMetadata> =
-                        if bytes.starts_with(b"{") {
-                            serde_json::from_slice(&bytes).ok()
-                        } else {
-                            bincode::deserialize(&bytes).ok()
-                        };
-                    if let Some(layout) = layout_opt {
-                        visit(&layout);
-                    }
-                }
-            }
-        }
-        Ok(summary)
+        walk_live_layouts(kv, |_ino, layout| visit(layout)).await
     }
 
     /// Every block index on THIS volume that `layout` durably references
@@ -1426,12 +1383,72 @@ impl BlockAllocator {
     }
 }
 
+/// Walk every LIVE inode's decoded `"layout"` xattr on one metadata volume
+/// (paged range scans, `nlink == 0` corpses skipped — the reclaim
+/// contract), handing each `(ino, layout)` to `visit`.
+///
+/// The shared engine of three things that must never disagree: the
+/// mount-time refcount seed, its durable-vs-derived **oracle**, and the
+/// §6.2-item-1 **backfill**. A free function precisely because it touches
+/// no allocator state — an allocator-bound copy would invite one of the
+/// three to drift.
+pub(crate) async fn walk_live_layouts<F>(
+    kv: &crate::meta_backend::kv::backend::KvMetaBackend,
+    mut visit: F,
+) -> Result<LayoutWalkSummary>
+where
+    F: FnMut(u64, &crate::routing::LayoutMetadata),
+{
+    use crate::meta_backend::kv::record::{decode_inode_key, inode_key, InodeValue};
+    let inodes = kv.trees()[0];
+    let mut summary = LayoutWalkSummary::default();
+    let mut cursor: Vec<u8> = inode_key(1).to_vec();
+    let end = inode_key(u64::MAX - 1);
+    loop {
+        let page = inodes.range(&cursor, &end, 512).await.map_err(|e| {
+            crate::error::SqueezefsError::InvalidOperation(format!(
+                "v3 recovery inode walk failed: {e}"
+            ))
+        })?;
+        let Some((last_key, _)) = page.last() else {
+            break;
+        };
+        cursor = crate::meta_backend::kv::node::key_successor(last_key);
+        for (k, v) in &page {
+            let Ok(ino) = decode_inode_key(k) else {
+                continue;
+            };
+            let Ok(val) = InodeValue::decode(v) else {
+                continue;
+            };
+            summary.checked += 1;
+            if val.nlink == 0 {
+                continue;
+            }
+            summary.valid_inodes += 1;
+            if let Ok(Some(bytes)) = kv.getxattr(ino, "layout").await {
+                summary.layouts_found += 1;
+                let layout_opt: Option<crate::routing::LayoutMetadata> = if bytes.starts_with(b"{")
+                {
+                    serde_json::from_slice(&bytes).ok()
+                } else {
+                    bincode::deserialize(&bytes).ok()
+                };
+                if let Some(layout) = layout_opt {
+                    visit(ino, &layout);
+                }
+            }
+        }
+    }
+    Ok(summary)
+}
+
 /// Counters from one live-layout walk (the log line's inputs).
 #[derive(Default)]
-struct LayoutWalkSummary {
-    checked: u64,
-    valid_inodes: u64,
-    layouts_found: u64,
+pub(crate) struct LayoutWalkSummary {
+    pub(crate) checked: u64,
+    pub(crate) valid_inodes: u64,
+    pub(crate) layouts_found: u64,
 }
 
 /// RAII registration in the [`BlockAllocator::inflight_register`]

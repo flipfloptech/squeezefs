@@ -245,6 +245,35 @@ path (the no-second-commit rule is about the block publish), and
 `destroy_inodes` is a batched multi-ino commit that does not — and should
 not — decode layouts to learn block keys.
 
+### 6.1 Stamping a non-empty volume: never trust an empty ledger
+
+A volume the Phase-8 window stamps has layouts that reference blocks and a
+ledger with **nothing in it**. A mount that treated that ledger as
+authoritative would read every live block as free and hand it to the next
+writer — one device offset, two owners, the exact failure this whole
+structure exists to prevent.
+
+The rule that closes it: **an empty durable population is never
+authoritative.** `recover_durable_block_refs` scans first and seeds second;
+a total population of zero DECLINES (returns `None`), so the caller runs the
+derived walk. That fallback is free exactly when it is legitimate — a ledger
+is empty either because the volume holds no data (the walk finds no layouts)
+or because it has not been backfilled (the walk is needed anyway).
+
+`backfill_durable_block_refs` then persists what the walk found: one
+idempotent `Put` per reference (map entries, plus a spilled map's blob and
+every entry the blob names), one transaction per inode. It is a one-time
+upgrade pass, not the publish path, and it resumes cleanly after a crash
+because every record is an idempotent `Put` at a content-derived key. After
+it, the ledger IS authoritative and every later mount skips the walk.
+
+Pinned end to end by
+`stamping_a_non_empty_volume_backfills_instead_of_freeing_live_blocks`:
+write three blocks with the bit OFF (zero records — the genuine legacy
+state), stamp, assert the empty ledger declines, walk, backfill, assert
+exactness; then remount seeding from records alone and assert a fresh
+allocation does **not** collide with a live block.
+
 ---
 
 ## 7. Compatibility matrix (ruling D9)
@@ -256,7 +285,7 @@ bit-7 (`KV_DURABLE_TERM`) pattern, not bit 6's presence-required one.
 |---|---|---|
 | **fresh format** (bit 8 set by `SuperblockV3::plan`, empty root minted by the builder) | durable accounting engaged; no mount walk | **refuses loud** — the bit intersects no prior `FEATURES_INCOMPAT_KNOWN` mask |
 | **un-stamped** (formatted before the bit existed) | derived walk, byte-identical to pre-item-1 behavior; no tree; no record ever staged; **sector 0 untouched by mount** | mounts exactly as before |
-| **stamped later** (`set_block_refcounts_bit`, Phase 8) | first *writable* mount mints the missing root, then accounts | refuses loud |
+| **stamped later** (`set_block_refcounts_bit`, Phase 8) | first *writable* mount mints the missing root; the empty ledger declines, the derived walk runs once, and the backfill persists it (§6.1) — after which the walk is never paid again | refuses loud |
 | **read-only mount** (unknown-ro bits) | never mints, never accounts — degrades to the derived walk | unchanged |
 
 Mount **never** stamps. `set_block_refcounts_bit` is the explicit upgrade
@@ -402,15 +431,9 @@ finishing procedure is mechanical and self-checking:
 
 Two related items that belong with that work:
 
-* **Backfill on engage.** A volume stamped by the Phase-8 window has existing
-  layouts and an EMPTY ledger. `recover_durable_block_refs` must not treat an
-  empty ledger as "no references" on such a volume — it would hand live
-  blocks to the next writer. The safe rule, and the one to implement: **an
-  empty durable population is never authoritative** — fall back to the
-  derived walk (cheap when the ledger is empty because the volume is empty)
-  and *persist* what it finds. Until that lands, stamping an existing
-  **non-empty** volume is unsafe; stamping an empty one is fine, which is what
-  `stamping_the_bit_engages_accounting_on_the_next_mount` covers.
+* ~~**Backfill on engage.**~~ **DONE** — see §6.1 below. The rule is
+  implemented and pinned:
+  `stamping_a_non_empty_volume_backfills_instead_of_freeing_live_blocks`.
 * **The whole-reference oracle.** `verify_durable_block_refs` compares
   per-block *counts*. Comparing full `(owner_ino, block_index)` tuples would
   localize a drift to its owning inode instead of its block, which is what

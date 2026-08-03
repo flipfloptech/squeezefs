@@ -1228,6 +1228,155 @@ fn bench_free_grace_gate(c: &mut Criterion) {
     group.finish();
     free_grace::reset_for_test();
     squeezefs::membership::uninstall();
+/// DLM **S9** blocker #3 — the **data-plane allocation partition**
+/// (`src/data_alloc_lane.rs`, `docs/design-mw-data-alloc-partition.md`).
+///
+/// **WRITTEN AND NOT RUN — ruling D11.** *"No cargo test, benches or
+/// release gate yet until we are done implementing the DLM and can have N
+/// Readers and Writers."* Every claim below is a PREDICTION with a
+/// falsification criterion, to be adjudicated by the first measured pass
+/// once the D11 window opens. No baseline may be refreshed from it before
+/// then.
+///
+/// ## Field-derived input shapes (no toy inputs — program rule)
+///
+/// * **fresh-mint rate**: the write-wall campaign
+///   (`.benchmarks/2026-07-31-write-wall.md`) measured ~**1,650
+///   blocks/s displaced at 6.3–6.8 GB/s** on the shipped 4 MiB block, so a
+///   saturated streaming writer mints on the order of 10³ blocks/s per
+///   volume — allocation is **once per 4 MiB**, never per op. That is why
+///   the mint rows are priced in ns/op but judged as a fraction of a
+///   block's pipeline lifetime, not as an IOPS term.
+/// * **reuse rate**: the rewrite regime allocates at the same block rate
+///   from a free list that a displaced-block workload keeps thousands of
+///   entries deep (the same campaign's `block_free_reclaim_queue_bytes`
+///   shape) — priced here at **1,024 free entries**, of which only 1/W
+///   belong to this lane.
+/// * **the free path**: W1's in-place patch runs at **61–67 k IOPS**
+///   (`.benchmarks/2026-07-17-rand-write-program-closing.md`) and
+///   **allocates nothing**; a CoW rewrite's terminal free runs at the
+///   block rate. So the free rows exist to prove a NEGATIVE — that the
+///   partition put no probe on the free path — which is the design's
+///   central claim (the owning lane is derivable from the offset, so a
+///   free needs no lookup).
+///
+/// ## Predictions, and what refutes each
+///
+/// | Claim | Structural reason | Falsified by |
+/// |---|---|---|
+/// | the **unpartitioned** mint is unchanged | one `OnceLock` probe before the shipped CAS loop; `lanes` is `None` on every mount today | `mint_fresh_unpartitioned` past the group threshold vs the committed reference |
+/// | the **laned** mint costs a CONSTANT more | the lane step tests at most `W − 1` mask bits (`W ≤ 16`), then runs the same CAS | `mint_fresh_lane_of_4` scaling with anything but `W` (⇒ the step is scanning, not stepping) |
+/// | the **free** path is byte-identical | `begin_free`/`finish_free` contain no lane probe at all | ANY separation between `free_unpartitioned` and `free_lane_of_4` ⇒ a probe leaked onto the free path, and the design's premise is broken |
+/// | **reuse** under a partition costs ≈ `W`× the scan | only 1/W of the free list qualifies, and the scan is a filter over the same iterator | worse than ≈ `W`× (⇒ the filter re-scans per candidate) or no different (⇒ the filter is not running); a genuine `W`× at field occupancy is what would justify a per-lane free list, which this design deliberately did NOT build |
+/// | the reservation is **amortized** | one commit per `reserve_grain_blocks` fresh blocks, none for reuse | `alloc_lane_reservations` ÷ fresh blocks exceeding 1/grain — deterministic, so reportable even under D11 |
+fn bench_alloc_lane(c: &mut Criterion) {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::data_alloc_lane as lane;
+    use squeezefs::meta_backend::kv::journal::AppendPartition;
+    use tokio::runtime::Runtime;
+
+    const FREE_LIST: u64 = 1024;
+    const W: u16 = 4;
+
+    let rt = Runtime::new().expect("bench runtime");
+    let plain = rt.block_on(async { BlockAllocator::new("alloc_lane_plain").await.unwrap() });
+    let laned = rt.block_on(async { BlockAllocator::new("alloc_lane_laned").await.unwrap() });
+    laned
+        .engage_alloc_lanes(AppendPartition::new(W, 1).expect("partition"))
+        .expect("engage");
+    // No durable sink is wired: this group prices the ALLOCATOR, and the
+    // reservation's cost is one metadata commit whose price belongs to
+    // `meta_lv_bench::kv_journal` (the same entry encode + barrier every
+    // record pays). Amortization is the claim here, not the commit.
+
+    let mut group = c.benchmark_group("alloc_lane");
+
+    // The arithmetic core: attribution (what a free would need if the lane
+    // were NOT derivable) and the mint step.
+    group.bench_function("lane_of", |b| {
+        b.iter(|| black_box(lane::block_lane_of(black_box(1_234_567), W)))
+    });
+    group.bench_function("owned_step_lane_of_4", |b| {
+        b.iter(|| black_box(lane::next_owned_index_at_or_above(black_box(97), 0b0010, W)))
+    });
+
+    // Fresh mint: the A/B that says whether the partition is free when off
+    // and constant when on.
+    group.bench_function("mint_fresh_unpartitioned", |b| {
+        b.iter(|| black_box(rt.block_on(plain.allocate_block())))
+    });
+    group.bench_function("mint_fresh_lane_of_4", |b| {
+        b.iter(|| black_box(rt.block_on(laned.allocate_block())))
+    });
+
+    // The free path — the negative both rows must prove.
+    let chunk = plain.chunk_size();
+    group.bench_function("free_unpartitioned", |b| {
+        b.iter_batched(
+            || rt.block_on(plain.allocate_block()).expect("seed"),
+            |off| black_box(rt.block_on(plain.free_block(off))),
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("free_lane_of_4", |b| {
+        b.iter_batched(
+            || rt.block_on(laned.allocate_block()).expect("seed"),
+            |off| black_box(rt.block_on(laned.free_block(off))),
+            BatchSize::SmallInput,
+        )
+    });
+
+    // Reuse at field free-list occupancy: 1,024 entries, 1/W of them ours.
+    let reuse_plain =
+        rt.block_on(async { BlockAllocator::new("alloc_lane_reuse_p").await.unwrap() });
+    let reuse_laned =
+        rt.block_on(async { BlockAllocator::new("alloc_lane_reuse_l").await.unwrap() });
+    reuse_laned
+        .engage_alloc_lanes(AppendPartition::new(W, 1).expect("partition"))
+        .expect("engage");
+    for i in 0..FREE_LIST {
+        reuse_plain.return_from_trim(i * chunk);
+        reuse_laned.return_from_trim(i * chunk);
+    }
+    group.throughput(Throughput::Elements(FREE_LIST));
+    group.bench_function("reuse_freelist_unpartitioned", |b| {
+        b.iter_batched(
+            || (),
+            |_| {
+                let off = rt.block_on(reuse_plain.allocate_block()).expect("reuse");
+                reuse_plain.return_from_trim(off);
+                black_box(off)
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("reuse_freelist_lane_of_4", |b| {
+        b.iter_batched(
+            || (),
+            |_| {
+                let off = rt.block_on(reuse_laned.allocate_block()).expect("reuse");
+                reuse_laned.return_from_trim(off);
+                black_box(off)
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+
+    // The durable half's CPU (the record itself; the commit is priced in
+    // `meta_lv_bench::kv_journal`).
+    let mut group = c.benchmark_group("alloc_lane_record");
+    let rec = lane::LaneReservation {
+        writers: W,
+        lane: 1,
+        reserved_upto: 1 << 30,
+    };
+    group.bench_function("encode", |b| b.iter(|| black_box(rec.encode())));
+    let raw = rec.encode();
+    group.bench_function("decode", |b| {
+        b.iter(|| black_box(lane::LaneReservation::decode(black_box(&raw))))
+    });
+    group.finish();
 }
 
 criterion_group!(
@@ -1235,6 +1384,7 @@ criterion_group!(
     bench_writer_scope,
     bench_ro_gate,
     bench_free_grace_gate,
+    bench_alloc_lane,
     bench_staging_shard_removal,
     bench_copy_probe_range,
     bench_coverage_union,

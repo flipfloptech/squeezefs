@@ -9,6 +9,16 @@
 //!   1 MiB sub-reads — insert → 4 credited serves → coverage
 //!   retirement), the credit-0 anti-refetch probe, and the miss probe
 //!   every armed read pays.
+//! * `ReadDest` — FUSE-4e (pre-rc spec §4): the zero-copy READ
+//!   destination's window bound, evaluated on EVERY dest-bearing serve
+//!   (and, on the multi-block path, once more for the assembly fan-out).
+//!   The shapes are the registered-payload window a kernel READ serves
+//!   into — the negotiated 1 MiB `max_write` geometry — in its three
+//!   arms: the exact-fit serve (window == request, the O_DIRECT/EXA
+//!   shape), a partial serve inside a full-size window (the sub-read
+//!   shape), and the REFUSAL a cross-ABI breach would take. The refusal
+//!   must not be more expensive than the admit: it is the arm a
+//!   misbehaving kernel would drive.
 //! * `StreamLanes::observe` — the §5.3 classifier (docs/design-read-path)
 //!   in its three arms: the exact-contiguity match (steady classified
 //!   stream), the CLASSIFIED-MEMBERSHIP ±64×len tolerance (the read-lane
@@ -19,7 +29,7 @@
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use squeezefs::read_lane::ReadLaneHold;
-use squeezefs::routing::StreamLanes;
+use squeezefs::routing::{ReadDest, StreamLanes};
 use std::hint::black_box;
 
 const BLOCK: usize = 4 * 1024 * 1024; // production block size
@@ -323,8 +333,49 @@ fn bench_sparse_lseek(c: &mut Criterion) {
     group.finish();
 }
 
+/// FUSE-4e: the per-serve destination-window bound.
+fn bench_read_dest_bound(c: &mut Criterion) {
+    const WINDOW: usize = 1024 * 1024; // the negotiated max_write geometry
+    let mut backing = vec![0u8; WINDOW];
+    // SAFETY (bench): `backing` outlives every use below and nothing else
+    // touches it — the ReadDest window contract.
+    let dest = unsafe { ReadDest::new(backing.as_mut_ptr() as u64, WINDOW) };
+
+    let mut group = c.benchmark_group("read_dest_bound");
+
+    // Exact fit: window == request (the kernel READ / EXA whole-window
+    // shape). This is the arm every dest-bearing serve pays.
+    group.bench_function("checked_ptr_exact_fit_1m", |b| {
+        b.iter(|| black_box(dest.checked_ptr(black_box(WINDOW))))
+    });
+
+    // A 4 KiB sub-read inside the full-size window (the rand-4k shape).
+    group.bench_function("checked_ptr_sub_read_4k", |b| {
+        b.iter(|| black_box(dest.checked_ptr(black_box(4096))))
+    });
+
+    // The refusal arm: a serve one byte past the window. Must be as cheap
+    // as the admits (a malformed-geometry storm would otherwise pay twice).
+    group.bench_function("checked_ptr_refuse_over_window", |b| {
+        b.iter(|| black_box(dest.checked_ptr(black_box(WINDOW + 1))))
+    });
+
+    // The §5.6 ranged offer: bound + `RangedDest` mint, the whole decision
+    // the ranged dispatch makes per eligible request.
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("ranged_offer_4k", |b| {
+        b.iter(|| {
+            // SAFETY (bench): as above — `backing` is live and unaliased.
+            black_box(unsafe { dest.ranged(black_box(4096)) }.map(|r| r.cap()))
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_read_dest_bound,
     bench_hold,
     bench_classifier,
     bench_assembly_join,

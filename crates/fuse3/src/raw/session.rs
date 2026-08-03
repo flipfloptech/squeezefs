@@ -5002,6 +5002,23 @@ pub(crate) enum BodyBounds {
 ///   are NOT part of the returned slice, which is why the WRITE handler
 ///   reads its body from the payload `Bytes` and not from `data_ref`.
 /// * `buf_len` — the data buffer's own capacity (the last bound).
+/// Bench seam (microbench program 2026-08-04 — the `get_bincode_config`
+/// precedent): the FUSE-3g per-request delivery-bounds decision, so
+/// `benches/fuse3_hot_bench.rs` measures the SHIPPING function rather than
+/// a lookalike. `Some(body_len)` = admitted, `None` = refused (EINVAL).
+#[doc(hidden)]
+pub fn delivery_body_bounds(
+    header_len: u32,
+    filled: usize,
+    payload_len: usize,
+    buf_len: usize,
+) -> Option<usize> {
+    match validated_body(header_len, filled, payload_len, buf_len) {
+        BodyBounds::Valid(n) => Some(n),
+        _ => None,
+    }
+}
+
 fn validated_body(
     header_len: u32,
     filled: usize,

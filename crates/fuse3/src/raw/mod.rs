@@ -27,6 +27,9 @@ pub use read_phase::{
 };
 pub use request::{ReplySlot, Request};
 #[cfg(feature = "tokio-runtime")]
+// Bench seam (FUSE-3g): the per-request delivery-bounds decision.
+#[doc(hidden)]
+pub use session::delivery_body_bounds;
 pub use session::{
     kernel_init_info, negotiated_reply_flags, tpc_lane_redispatches, tpc_spawn, tpc_spawn_on_node,
     tpc_thread_count, KernelInit, MountHandle, Session,

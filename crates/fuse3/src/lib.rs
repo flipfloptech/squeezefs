@@ -55,6 +55,10 @@ mod helper;
 // fuse3_hot_bench.rs` must measure the shipping codec, not a lookalike.
 #[doc(hidden)]
 pub use helper::get_bincode_config;
+// Bench seam (FUSE-3g): the per-request delivery-bounds decision every
+// dispatch pass runs before a handler sees its body.
+#[doc(hidden)]
+pub use raw::delivery_body_bounds;
 mod mount_options;
 pub mod notify;
 // N-topology-general NUMA nearest-resource map — canonical file in the

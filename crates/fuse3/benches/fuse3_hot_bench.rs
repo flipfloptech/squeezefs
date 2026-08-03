@@ -29,6 +29,16 @@
 //!   the win stays measurable once the map is out of the tree; the
 //!   `carried_slot_*` arms are the shipped path, where the address rides
 //!   the request.
+//! * `delivery_bounds` — FUSE-3g: the per-request body-bounds decision the
+//!   dispatch pass runs before ANY handler sees its slice (pre-rc spec §4
+//!   FUSE-3g). It is on the ingress path of every single request, so its
+//!   cost is a per-op tax and the shapes are the real traffic mix: a
+//!   metadata request whose body is fully in the session buffer (LOOKUP
+//!   name), the §5.4 zero-copy WRITE where a 1 MiB body rides the payload
+//!   lease and only the 16 B `fuse_write_in` was filled, and the two
+//!   refusals (a sub-40-byte header, an over-declared length) — the
+//!   refusals must be as cheap as the admits or a malformed-header storm
+//!   becomes a cost channel.
 //! * `conn_prelude` — the session pool-slot probes the request path pays
 //!   4× per READ (pre-rc spec PERF-2: dispatch venue, reply venue,
 //!   payload-buffer resolve, ready gate — ~4 M slot reads/s at 1 M
@@ -389,8 +399,72 @@ fn resolve_ring_slot(slot: ReplySlot) -> Option<(u16, u16, u64)> {
     }
 }
 
+/// FUSE-3g: the delivery-bounds decision, per request.
+fn bench_delivery_bounds(c: &mut Criterion) {
+    const HDR: usize = 40;
+    const WRITE_IN: usize = 40; // fuse_write_in
+    const MIB: usize = 1024 * 1024;
+    const BUF: usize = MIB + WRITE_IN; // the session data buffer
+
+    let mut group = c.benchmark_group("delivery_bounds");
+
+    // A metadata request (LOOKUP "somefile"): body entirely in the session
+    // buffer, header honest.
+    group.bench_function("admit_metadata_body", |b| {
+        b.iter(|| {
+            black_box(fuse3::delivery_body_bounds(
+                black_box((HDR + 9) as u32),
+                black_box(9),
+                black_box(0),
+                black_box(BUF),
+            ))
+        })
+    });
+
+    // The §5.4 zero-copy WRITE: `in_header.len` counts the 1 MiB payload
+    // lease, the data buffer holds only the 40 B `fuse_write_in`.
+    group.bench_function("admit_write_lease_1m", |b| {
+        b.iter(|| {
+            black_box(fuse3::delivery_body_bounds(
+                black_box((HDR + WRITE_IN + MIB) as u32),
+                black_box(WRITE_IN),
+                black_box(MIB),
+                black_box(BUF),
+            ))
+        })
+    });
+
+    // Refusal 1: a header shorter than `fuse_in_header` (the underflow).
+    group.bench_function("refuse_short_header", |b| {
+        b.iter(|| {
+            black_box(fuse3::delivery_body_bounds(
+                black_box(24),
+                black_box(0),
+                black_box(0),
+                black_box(BUF),
+            ))
+        })
+    });
+
+    // Refusal 2: a header claiming more body than was delivered (the
+    // stale-tail shape).
+    group.bench_function("refuse_overdeclared", |b| {
+        b.iter(|| {
+            black_box(fuse3::delivery_body_bounds(
+                black_box((HDR + 4096) as u32),
+                black_box(8),
+                black_box(0),
+                black_box(BUF),
+            ))
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_delivery_bounds,
     bench_ent_codec,
     bench_commit_batch,
     bench_kmbuf_attach,

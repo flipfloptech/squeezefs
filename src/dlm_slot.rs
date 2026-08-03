@@ -103,20 +103,24 @@ const MODE_SLOT_HOMED: &str = "slot-homed";
 
 /// Which slots this node's lock authority homes — a bitset, so the
 /// ownership question is a shift and a mask at any width.
+///
+/// Slot ids are the **u16 namespace** (`DERIVED_ROUTING_WIDTH = 2^16`,
+/// the same typing `kv::slot_set::SlotSet` uses), so the table is at most
+/// 1024 words = 8 KiB whatever an owner map says.
 struct SlotOwners {
     local: Box<[u64]>,
 }
 
 impl SlotOwners {
-    fn from_slots(slots: &[u64]) -> Self {
+    fn from_slots(slots: &[u16]) -> Self {
         let words = slots
             .iter()
-            .map(|s| (s / 64) as usize + 1)
+            .map(|s| usize::from(*s) / 64 + 1)
             .max()
             .unwrap_or(0);
         let mut local = vec![0u64; words];
         for slot in slots {
-            local[(slot / 64) as usize] |= 1u64 << (slot % 64);
+            local[usize::from(*slot) / 64] |= 1u64 << (slot % 64);
         }
         Self {
             local: local.into_boxed_slice(),
@@ -202,7 +206,7 @@ pub fn dlm_rpcs() -> u64 {
 /// production issuer until S6/S8 ship the remote arm; this seam is what
 /// makes it reachable and tested rather than a comment. Production never
 /// calls it.
-pub fn test_set_local_slots(slots: Option<&[u64]>) {
+pub fn test_set_local_slots(slots: Option<&[u16]>) {
     match slots {
         None => SLOT_OWNERS.store(None),
         Some(slots) => SLOT_OWNERS.store(Some(Arc::new(SlotOwners::from_slots(slots)))),

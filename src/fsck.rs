@@ -460,10 +460,9 @@ pub struct FsckCounters {
     /// concurrent creates, and its growth is the proof the shield is
     /// doing work rather than sitting vacuous.
     pub current_era_exempted: u64,
-    /// C10: distinct `(parent, name)` pairs held for inos named MORE THAN
-    /// ONCE — the counting extension's engagement gauge (0 on a tree with
-    /// no hardlinks and no damage, which is why the class costs nothing
-    /// there).
+    /// C10: inos named MORE THAN ONCE that the name counting tracked — the
+    /// counting extension's engagement gauge (0 on a tree with no hardlinks
+    /// and no damage, which is why the class costs nothing there).
     pub nlink_names_counted: u64,
     /// C10: verified findings per direction. `high` is the LEAK direction;
     /// `low` and `zero_named` are the DATA-LOSS direction (an operator

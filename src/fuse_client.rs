@@ -3652,10 +3652,9 @@ pub struct Metrics {
     /// the inode plane); growth under concurrent creates is the proof it
     /// is doing work.
     pub fsck_current_era_exempted: Align64<AtomicU64>,
-    /// C10: distinct-name identities held for inos named MORE THAN ONCE —
-    /// the counting extension's engagement gauge (0 on a tree with no
-    /// hardlinks and no damage, which is why the class costs nothing
-    /// there).
+    /// C10: inos named MORE THAN ONCE that the name counting tracked — the
+    /// counting extension's engagement gauge (0 on a tree with no hardlinks
+    /// and no damage, which is why the class costs nothing there).
     pub fsck_nlink_names_counted: Align64<AtomicU64>,
     /// C10 verified findings by direction. `high` is the LEAK direction (an
     /// inode and its blocks that can never be reclaimed); `low`,

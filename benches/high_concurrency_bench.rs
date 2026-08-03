@@ -510,6 +510,196 @@ fn bench_metadata_clone(c: &mut Criterion) {
 /// Dynamic meta routing (docs/design-dynamic-meta-routing.md §5.9): the
 /// derived-width hot-path arithmetic and the SlotSet control-plane ops —
 /// the idle-cost claims' standing regression instrument.
+/// DLM **S9** — the multi-writer data plane's two hot decisions
+/// (`docs/pre-rc-engineering-spec.md` §6.9 S9; execution-plan ruling
+/// **D11**: WRITTEN AND NOT RUN — no number about S9 exists yet).
+///
+/// # Field-derived shapes (the microbench law: toy inputs are violations)
+///
+/// * **The custody probe on the DMA path.** `data_custody::authorize_dma`
+///   runs on EVERY data-plane submission — the same census as
+///   `NvmeBlockDev::write_block`'s gate, which the field capture puts at
+///   ~2,600 block publishes/s against a 21–25 k device-writes/s namespace
+///   ceiling (`.benchmarks/2026-08-01-rewrite-publish-drain.md` §3). Both
+///   arms are measured: `carried = None` (every pre-S7 site) and
+///   `carried = Some(current)` (the write-pipeline permit and S9's remote
+///   grants), plus the STALE arm, because a refusal's cost is what a
+///   revocation storm pays.
+/// * **The grant/renew path, minus the fabric.** A grant is one authority
+///   arbitration (`LocalLockManager::acquire_lock_mode`) plus one adoption
+///   (`dlm::adopt_remote_grant`: era adopt, floor raise, custody record);
+///   a renewal is one `scc` probe and two stores. The RTT is deliberately
+///   NOT in these rows — S3 measured the wire (0.05–0.25 ms loopback,
+///   235 µs on the fabric-latency venue) and §6.5 item 1's arithmetic is
+///   about that term, so mixing it in would hide the CPU cost these rows
+///   exist to bound. The shape is one grant per open-for-write episode on
+///   DISTINCT inos (spec §6.2's lease census), and the shared-file row is
+///   ruling D8's: disjoint 4 MiB block ranges of ONE large file, which is
+///   the MPI-IO shape S11's gate names.
+///
+/// # Predictions, and what falsifies them
+///
+/// 1. **`authorize_dma` costs ≲ 15 ns** in both healthy arms — one relaxed
+///    load of the poison latch, one `term_base()` load, one generation
+///    load, one compare. FALSIFIED if either healthy arm exceeds ~25 ns or
+///    if the `Some(current)` arm is more than ~3 ns above `None` (that
+///    would mean the carried comparison is not the free branch it looks
+///    like, and the write-pipeline permit is paying for the epoch it
+///    carries).
+/// 2. **The S9 composition is free for single-writer mounts**:
+///    `authorize_dma` at generation 0 must be indistinguishable from
+///    S7's (which was `term_base()` alone). FALSIFIED by any measurable
+///    separation between `authorize_none` here and the S7-era row — that
+///    would mean the `| (gen & MASK)` composition is not folded away, and
+///    the "byte-identical on single-writer mounts" claim is wrong.
+/// 3. **A grant's CPU is ≲ 2 µs** (arbitration + adoption), i.e. under 1 %
+///    of the 235 µs fabric RTT it rides — so the fabric, not this code, is
+///    what a shared-file custody row measures. FALSIFIED if the grant row
+///    exceeds ~10 µs, which would make custody CPU a visible term at
+///    15 k-shaped fan-out and would move the S10 delegation argument onto
+///    the data plane too.
+/// 4. **A renewal is ≲ 200 ns** and does not grow with the number of live
+///    grants (it touches the client lease's row, never the grant table).
+///    FALSIFIED by any slope against the seeded grant population — that
+///    would mean the heartbeat is O(grants) and 15 k co-writers × their
+///    grants would serialize on it, which is exactly the shape §6.5 item 3
+///    measured and S6 deleted.
+/// 5. **Disjoint-range adoption does not degrade with the live span
+///    count** beyond the S11 stab-window bound (O(log n + c)). FALSIFIED
+///    by super-logarithmic growth from 1 → 64 live spans on one ino, which
+///    would mean the sorted interval list is being scanned rather than
+///    stabbed.
+fn bench_s9_custody(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("s9_custody");
+
+    // ---------------------------------------------------------------
+    // The DMA-path probe. Every data-plane submission pays exactly this.
+    // ---------------------------------------------------------------
+    group.bench_function("authorize_dma_none", |b| {
+        b.iter(|| black_box(squeezefs::data_custody::authorize_dma(black_box(None)).is_ok()));
+    });
+    let current = squeezefs::data_custody::current_epoch();
+    group.bench_function("authorize_dma_carried_current", |b| {
+        b.iter(|| {
+            black_box(squeezefs::data_custody::authorize_dma(black_box(Some(current))).is_ok())
+        });
+    });
+    // The refusal arm: what a revocation storm pays per in-flight
+    // authorization it kills. Deliberately a FOREIGN epoch rather than an
+    // advanced generation — advancing is monotone and would poison the
+    // other rows' baseline.
+    let stale = squeezefs::data_custody::CustodyEpoch::from_raw(squeezefs::dlm::compose_token(
+        squeezefs::dlm::durable_term(),
+        1,
+    ));
+    group.bench_function("authorize_dma_carried_stale_refusal", |b| {
+        b.iter(|| {
+            black_box(squeezefs::data_custody::authorize_dma(black_box(Some(stale))).is_err())
+        });
+    });
+    group.bench_function("current_epoch", |b| {
+        b.iter(|| black_box(squeezefs::data_custody::current_epoch().raw()));
+    });
+
+    // ---------------------------------------------------------------
+    // The authority's grant/renew path, fabric excluded (see the header).
+    // ---------------------------------------------------------------
+    let clocks = squeezefs::membership::LeaseClocks::with_params(
+        std::time::Duration::from_secs(45),
+        std::time::Duration::from_millis(23),
+        std::time::Duration::from_millis(2_000),
+    )
+    .expect("the shipped clock shape");
+    let owner = squeezefs::data_grant::WriteCustodyOwner::arm(
+        "bench-authority",
+        squeezefs::dlm::durable_term() + 1,
+        squeezefs::dlm::durable_term(),
+        clocks,
+        squeezefs::membership::LeaseClock::monotonic(),
+        None,
+    )
+    .expect("the authority arms");
+    let lease = owner
+        .join(&squeezefs::data_grant::JoinFrame {
+            schema: squeezefs::data_grant::CUSTODY_SCHEMA,
+            client: "bench-co-writer".to_string(),
+            pr_key: 0xbeef,
+            prior_epoch: None,
+        })
+        .expect("join");
+
+    // One grant per open-for-write episode on DISTINCT inos (§6.2's lease
+    // census) — arbitration + insert, with the release retiring the
+    // authority's own lease so the table stays at its live population.
+    group.bench_function("grant_release_whole_file_distinct_ino", |b| {
+        let mut i = 0u64;
+        b.to_async(&rt).iter(|| {
+            i = i.wrapping_add(1);
+            let req = squeezefs::data_grant::AcquireFrame {
+                schema: squeezefs::data_grant::CUSTODY_SCHEMA,
+                client: "bench-co-writer".to_string(),
+                lease_epoch: lease.epoch,
+                ino: 700_000_000 + (i % 65_536),
+                span: None,
+                concurrent_write: false,
+                wait_ms: 0,
+            };
+            let owner = &owner;
+            async move {
+                let grant = owner.grant(&req).await.expect("uncontended grant");
+                black_box(owner.release("bench-co-writer", &[grant.grant_id]));
+            }
+        });
+    });
+
+    // Ruling D8's shape: disjoint 4 MiB block ranges of ONE large file
+    // (the MPI-IO row S11's gate names). The stab window is what this
+    // measures — prediction 5.
+    group.bench_function("grant_release_disjoint_range_one_file", |b| {
+        let mut i = 0u64;
+        b.to_async(&rt).iter(|| {
+            i = i.wrapping_add(1);
+            let block = i % 64;
+            let req = squeezefs::data_grant::AcquireFrame {
+                schema: squeezefs::data_grant::CUSTODY_SCHEMA,
+                client: "bench-co-writer".to_string(),
+                lease_epoch: lease.epoch,
+                ino: 700_999_999,
+                span: Some((block * (4 << 20), (block + 1) * (4 << 20))),
+                concurrent_write: false,
+                wait_ms: 0,
+            };
+            let owner = &owner;
+            async move {
+                let grant = owner.grant(&req).await.expect("disjoint span granted");
+                black_box(owner.release("bench-co-writer", &[grant.grant_id]));
+            }
+        });
+    });
+
+    // The heartbeat: one `scc` probe and two stores, carrying the
+    // in-flight destination set the write pipeline's depth bounds (the
+    // field's converged depth is tens of blocks — `write_pipeline_
+    // depth_target`), so 32 offsets is the field shape, not a toy.
+    let inflight: Vec<u64> = (0..32).map(|i| i * (4 << 20)).collect();
+    group.bench_function("renew_lease_32_inflight", |b| {
+        b.iter(|| {
+            black_box(
+                owner
+                    .renew(
+                        black_box("bench-co-writer"),
+                        lease.epoch,
+                        black_box(&inflight),
+                    )
+                    .is_ok(),
+            )
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_dynamic_meta_routing(c: &mut Criterion) {
     use squeezefs::meta_backend::kv::slot_set::SlotSet;
     use squeezefs::meta_backend::{
@@ -814,6 +1004,7 @@ criterion_group!(
     bench_sharded_counters,
     bench_high_concurrency,
     bench_cluster_dlm,
+    bench_s9_custody,
     bench_metadata_clone,
     bench_dynamic_meta_routing,
     bench_error_paths,

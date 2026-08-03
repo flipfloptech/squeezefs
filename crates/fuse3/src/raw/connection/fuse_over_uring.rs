@@ -3306,6 +3306,19 @@ fn queue_worker(
     }
     ring.submit()
         .map_err(|e| io::Error::other(format!("submit REGISTER batch: {e}")))?;
+    // FUSE-3c (adjudicated UNIMPLEMENTABLE AS WRITTEN — do not "fix" this to
+    // count completions): the barrier counts SUBMISSIONS by necessity. A
+    // REGISTER's CQE is not a registration ack — the kernel parks the ent
+    // and posts its completion only when it DELIVERS a request on it (see
+    // the delivery handling below, which reads the inbound header straight
+    // out of a successful `RingOp::Register` CQE), and it only routes
+    // requests to the ring once `is_ring_ready()` observes every queue
+    // armed. Waiting for `depth` completions here would therefore deadlock
+    // the arm: no readiness ⇒ no delivery ⇒ no CQE ⇒ no readiness. The real
+    // concern — a REFUSED REGISTER going unnoticed — is covered by FUSE-3a:
+    // a refusal arrives as a negative-result CQE, backs off, retires the ent
+    // after `REGISTER_RETRY_MAX` (`transport_ents_retired`), and fails the
+    // session when every ent has retired.
     pool.queues_registered.fetch_add(1, Ordering::AcqRel);
 
     // §5.3 D3.a (S2) submit economy: the passes below PUSH their SQEs

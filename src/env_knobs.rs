@@ -12,7 +12,7 @@
 //! * **Absent** = unset, empty, or whitespace-only.
 //! * **A malformed or out-of-range value refuses the process at startup**,
 //!   naming every offending knob at once (not the first one, then the next
-//!   one on the next attempt). [`refuse_on_invalid_environment`] runs
+//!   one on the next attempt). [`refusal_report`] runs
 //!   before any volume is opened or mounted, so a typo costs an exit code,
 //!   never a half-mounted filesystem or a silently different tuning than
 //!   the operator asked for.

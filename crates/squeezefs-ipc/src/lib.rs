@@ -25,10 +25,12 @@
 //! commit (design KD-7) — explicitly **not** a stable ABI.
 
 pub mod cqe_core;
-/// The ONE env-knob parsing convention (ENG-10) — pure, dependency-free,
-/// and `#[path]`-shared into the root crate, the fuse3 fork and the
-/// preload shim (the `numa_core`/`thp` production-sharing precedent), so
-/// all three agree on what a knob VALUE means.
+// The ONE env-knob parsing convention (ENG-10) — pure, dependency-free, and
+// `#[path]`-shared into the root crate, the fuse3 fork and the preload shim
+// (the `numa_core`/`thp` production-sharing precedent), so all three agree on
+// what a knob VALUE means. A plain comment, not a doc comment: an outer doc
+// here would be concatenated ahead of the file's own `//!` docs and resolve
+// their intra-doc links in the CRATE scope, breaking them.
 pub mod env_knob_core;
 pub mod layout;
 pub mod ring_core;

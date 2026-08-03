@@ -2070,8 +2070,25 @@ mod tests {
         super::super::META_KV_FOLD_MEMO_BYTES.load(Ordering::Acquire)
     }
 
+    /// `META_KV_FOLD_MEMO_BYTES` is a PROCESS-GLOBAL gauge, and the five
+    /// tests below assert a delta against it — which is an exclusivity
+    /// claim libtest does not grant: it runs tests in parallel by default.
+    /// Serialized here rather than by `--test-threads=1`, because the
+    /// criterion bench smoke (`cargo bench --benches -- --test`, part of
+    /// the required gate) runs this lib test target with libtest's default
+    /// thread count and reproduced the interference 5/5 with just the two
+    /// racing tests selected (`racing_distinct_key_…` failing its
+    /// "both gauges must agree" assertion on another test's live memo).
+    /// The lock is held for the whole test body, including drop-credit
+    /// checks — a concurrent memo's Drop is exactly what perturbs it.
+    fn global_gauge_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GAUGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        GAUGE.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn memo_populate_charges_both_gauges_and_drop_credits_exactly() {
+        let _serialized = global_gauge_guard();
         let charge = Arc::new(AtomicU64::new(0));
         let global0 = baseline();
         {
@@ -2116,6 +2133,7 @@ mod tests {
 
     #[test]
     fn a_full_memo_drops_entries_rather_than_growing_its_charge() {
+        let _serialized = global_gauge_guard();
         let charge = Arc::new(AtomicU64::new(0));
         let global0 = baseline();
         {
@@ -2147,6 +2165,7 @@ mod tests {
 
     #[test]
     fn racing_same_key_populates_charge_at_most_once() {
+        let _serialized = global_gauge_guard();
         // The populate-once claim: a same-key racer's duplicate is
         // prevented by the post-loss re-check. Double-charging one key
         // would inflate the budget with no memory behind it.
@@ -2187,6 +2206,7 @@ mod tests {
 
     #[test]
     fn racing_distinct_key_populates_conserve_the_charge_across_drop() {
+        let _serialized = global_gauge_guard();
         // The conservation law under full contention: whatever N racing
         // distinct-key claims charge, Drop credits back to zero. A gauge
         // that over-credits WRAPS a u64 through zero and then reads as
@@ -2227,6 +2247,7 @@ mod tests {
 
     #[test]
     fn an_empty_memo_charges_nothing_and_credits_nothing() {
+        let _serialized = global_gauge_guard();
         let charge = Arc::new(AtomicU64::new(0));
         let global0 = baseline();
         {

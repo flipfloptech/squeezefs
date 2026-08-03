@@ -54,8 +54,11 @@ pub mod detached;
 /// `NvmeBlockDev` worker. Test-only; inert until armed.
 pub mod dev_power_cut;
 pub mod dlm;
-/// ENG-10: the env-knob registry + the startup refusal gate. The parsing
-/// convention itself lives in the `#[path]`-shared `env_knob_core`.
+// ENG-10: the env-knob registry + the startup refusal gate. The parsing
+// convention itself lives in the `#[path]`-shared `env_knob_core`. A plain
+// comment, not a doc comment: an outer doc here is concatenated ahead of the
+// module's own `//!` docs and resolves their intra-doc links in the CRATE
+// scope, which silently breaks them.
 pub mod env_knobs;
 pub mod error;
 pub mod fsck;

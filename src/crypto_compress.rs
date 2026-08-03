@@ -1342,6 +1342,28 @@ mod tests {
         assert_eq!(state.scratch_pool_buf_len(), Some(first));
     }
 
+    /// PERF-10: a POOLED stored image is `frame + image` **zero-padded to
+    /// the 4 KiB DMA grain** (so `write_block` takes its aligned zero-copy
+    /// branch instead of bouncing). Assert the frame content is
+    /// byte-identical to the reference image, the pad is ZEROS (recycled
+    /// scratch content must never reach the device), and the length is
+    /// exactly the grain-rounded one.
+    fn assert_pooled_image(got: &[u8], expected: &[u8]) {
+        let padded = expected
+            .len()
+            .next_multiple_of(crate::cache::pool::POOLED_BUF_ALIGN);
+        assert_eq!(got.len(), padded, "pooled image is padded to the DMA grain");
+        assert_eq!(
+            &got[..expected.len()],
+            expected,
+            "pooled stored-image content must stay byte-identical"
+        );
+        assert!(
+            got[expected.len()..].iter().all(|&b| b == 0),
+            "PERF-10 pad bytes must be zeros"
+        );
+    }
+
     #[test]
     fn test_lz4_scratch_framing_byte_identical_to_prepend_size() {
         // On-disk compatibility pin: raw `compress_into` emits no framing,
@@ -1362,7 +1384,7 @@ mod tests {
             .process_write(bytes::Bytes::from(deep.clone()))
             .unwrap();
         assert_eq!(pool_len(&state), cap0 - 1, "deep write must be pooled");
-        assert_eq!(deep_out.as_ref(), framed_raw(&deep).as_slice());
+        assert_pooled_image(deep_out.as_ref(), framed_raw(&deep).as_slice());
         assert_eq!(
             state.process_read(&deep_out).unwrap().as_ref(),
             deep.as_slice()
@@ -1379,11 +1401,7 @@ mod tests {
                 .process_write(bytes::Bytes::from(short.clone()))
                 .unwrap();
             assert_eq!(pool_len(&state), cap0 - 1, "short write must be pooled");
-            assert_eq!(
-                out.as_ref(),
-                expected.as_slice(),
-                "pooled lz4 image must be the framed compress_prepend_size image"
-            );
+            assert_pooled_image(out.as_ref(), expected.as_slice());
             assert_eq!(state.process_read(&out).unwrap().as_ref(), short.as_slice());
         }
 
@@ -1391,7 +1409,7 @@ mod tests {
         // so the escape stores it raw — a lone RAW-flagged zero-length
         // frame word.
         let empty_out = state.process_write(bytes::Bytes::new()).unwrap();
-        assert_eq!(empty_out.as_ref(), framed_raw(&[]).as_slice());
+        assert_pooled_image(empty_out.as_ref(), framed_raw(&[]).as_slice());
         assert!(state.process_read(&empty_out).unwrap().is_empty());
     }
 
@@ -1456,7 +1474,19 @@ mod tests {
             "device-window padding must be ignored by the frame parse"
         );
         if enc == "none" && comp == "lz4" {
-            assert_eq!(new_blob[FRAME_LEN_BYTES..], old_blob[..]);
+            // PERF-10: the pooled image carries a 4 KiB-grain zero pad after
+            // the frame; the FRAMED CONTENT is what must stay identical to
+            // the pre-scratch heap image.
+            assert_eq!(
+                new_blob[FRAME_LEN_BYTES..FRAME_LEN_BYTES + old_blob.len()],
+                old_blob[..]
+            );
+            assert!(
+                new_blob[FRAME_LEN_BYTES + old_blob.len()..]
+                    .iter()
+                    .all(|&b| b == 0),
+                "the grain pad must be zeros"
+            );
         }
     }
 
@@ -1508,14 +1538,21 @@ mod tests {
         let out = state
             .process_write(bytes::Bytes::from(payload.clone()))
             .unwrap();
+        // PERF-10: the stored image is the frame + raw payload, zero-padded
+        // to the 4 KiB DMA grain (the frame is self-delimiting, so the pad
+        // is invisible to every reader).
         assert_eq!(
             out.len(),
-            FRAME_LEN_BYTES + payload.len(),
-            "raw escape bounds the stored image at frame + raw payload"
+            (FRAME_LEN_BYTES + payload.len())
+                .next_multiple_of(crate::cache::pool::POOLED_BUF_ALIGN),
+            "raw escape bounds the stored image at frame + raw payload \
+             (grain-padded)"
         );
         assert_eq!(
             out.len(),
-            state.max_stored_image_len(payload.len()),
+            state
+                .max_stored_image_len(payload.len())
+                .next_multiple_of(crate::cache::pool::POOLED_BUF_ALIGN),
             "compression-only worst case is exactly the raw-escape image"
         );
         assert_eq!(pool_len(&state), cap0 - 1, "raw escape stays pooled");
@@ -1645,8 +1682,24 @@ mod tests {
         let compressed = state.compress(&payload).unwrap();
         let heap = state.encrypt(&compressed).unwrap();
         // The AEAD IMAGE sits inside the frame; `encrypt` emits the raw
-        // (unframed) image — compare the layouts at the image level.
-        let pooled = &framed_pooled[FRAME_LEN_BYTES..];
+        // (unframed) image — compare the layouts at the image level. The
+        // frame's length word bounds the image: PERF-10 zero-pads the
+        // pooled buffer out to the 4 KiB DMA grain, and the pad is not part
+        // of the image (pinned below).
+        let frame_word = u32::from_le_bytes([
+            framed_pooled[0],
+            framed_pooled[1],
+            framed_pooled[2],
+            framed_pooled[3],
+        ]);
+        let image_len = (frame_word & !FRAME_RAW_FLAG) as usize;
+        let pooled = &framed_pooled[FRAME_LEN_BYTES..FRAME_LEN_BYTES + image_len];
+        assert!(
+            framed_pooled[FRAME_LEN_BYTES + image_len..]
+                .iter()
+                .all(|&b| b == 0),
+            "PERF-10 pad bytes must be zeros"
+        );
 
         // Identical header framing and (session) wrapped-key bytes.
         let wkl = ((pooled[0] as usize) << 8) + (pooled[1] as usize);

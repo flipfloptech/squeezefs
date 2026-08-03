@@ -284,25 +284,26 @@ async fn hammering_both_lanes_with_interleaved_frees_never_double_mints() {
     let live: Arc<Mutex<std::collections::BTreeMap<u64, &'static str>>> =
         Arc::new(Mutex::new(std::collections::BTreeMap::new()));
 
-    let worker = |alloc: Arc<BlockAllocator>,
-                  who: &'static str,
-                  live: Arc<Mutex<std::collections::BTreeMap<u64, &'static str>>>| async move {
-        for round in 0..128u64 {
-            let off = alloc.allocate_block().await.expect("mint");
-            {
-                let mut map = live.lock().unwrap();
-                assert!(
-                    map.insert(off, who).is_none(),
-                    "offset {off} handed to {who} while another owner held it"
-                );
+    let worker =
+        |alloc: Arc<BlockAllocator>,
+         who: &'static str,
+         live: Arc<Mutex<std::collections::BTreeMap<u64, &'static str>>>| async move {
+            for round in 0..128u64 {
+                let off = alloc.allocate_block().await.expect("mint");
+                {
+                    let mut map = live.lock().unwrap();
+                    assert!(
+                        map.insert(off, who).is_none(),
+                        "offset {off} handed to {who} while another owner held it"
+                    );
+                }
+                tokio::task::yield_now().await;
+                if round % 2 == 0 {
+                    live.lock().unwrap().remove(&off);
+                    alloc.free_block(off).await.expect("free own");
+                }
             }
-            tokio::task::yield_now().await;
-            if round % 2 == 0 {
-                live.lock().unwrap().remove(&off);
-                alloc.free_block(off).await.expect("free own");
-            }
-        }
-    };
+        };
 
     tokio::join!(
         worker(Arc::clone(&a), "writer0", Arc::clone(&live)),
@@ -340,13 +341,20 @@ async fn either_writer_frees_the_others_block_with_no_ownership_lookup() {
         .block_untracked_free_refusals
         .load(Ordering::Relaxed);
 
+    // Mint our own lane first so the cursor is past the indices below
+    // (`recover_block`'s gap fill is then not involved: this test is about
+    // the free path, not about recovery's free-list seeding).
+    let chunk = a.chunk_size();
+    for _ in 0..4 {
+        a.allocate_block().await.expect("own lane");
+    }
+
     // A reference to a block minted by EVERY other lane (what recovery
     // seeds from the set-wide durable ledger — clone-shared ownership).
-    for foreign_idx in [0u64, 2, 3, 8] {
+    for foreign_idx in [0u64, 2, 3] {
         a.recover_block(foreign_idx).await.expect("seed reference");
     }
-    let chunk = a.chunk_size();
-    for foreign_idx in [0u64, 2, 3, 8] {
+    for foreign_idx in [0u64, 2, 3] {
         a.free_block(foreign_idx * chunk)
             .await
             .expect("a free never consults a lane");
@@ -361,7 +369,7 @@ async fn either_writer_frees_the_others_block_with_no_ownership_lookup() {
     assert_eq!(
         a.foreign_lane_free_blocks(),
         3,
-        "the freed lane-0/2/3 blocks are free supply this writer cannot reach (8 is lane 0 too)"
+        "the freed lane-0/2/3 blocks are free supply this writer cannot reach"
     );
 
     // ... and reuse obeys the same residue class: the next allocation is a
@@ -440,7 +448,8 @@ async fn a_crash_and_remount_never_re_mints_a_reserved_lane_block() {
     );
     for off in &minted {
         assert_ne!(
-            *off / chunk, first,
+            *off / chunk,
+            first,
             "the successor re-minted an offset its predecessor may still be writing"
         );
     }
@@ -466,7 +475,10 @@ fn the_reservation_record_round_trips_and_refuses_tampering() {
     };
     let raw = rec.encode();
     assert_eq!(raw.len(), lane::LANE_RESERVATION_LEN);
-    assert_eq!(lane::LaneReservation::decode(&raw).expect("round trip"), rec);
+    assert_eq!(
+        lane::LaneReservation::decode(&raw).expect("round trip"),
+        rec
+    );
 
     let mut short = raw.clone();
     short.pop();
@@ -536,7 +548,10 @@ fn the_recovery_floor_uses_own_lane_and_every_foreign_width_record() {
     };
 
     let floor = lane::recover_lane_floor(&[own], 0, p);
-    assert!(floor >= 100 && floor % 4 == 1, "own-lane record floors, in-lane");
+    assert!(
+        floor >= 100 && floor % 4 == 1,
+        "own-lane record floors, in-lane"
+    );
 
     assert_eq!(
         lane::recover_lane_floor(&[foreign_same_width], 8, p),
@@ -704,7 +719,9 @@ async fn lane_exhaustion_refuses_storage_full_naming_the_unreachable_free_space(
     // Make a peer's block free supply, then prove it is unreachable AND
     // that the refusal says so.
     a.recover_block(3).await.expect("seed a lane-1 reference");
-    a.free_block(3 * chunk).await.expect("free the peer's block");
+    a.free_block(3 * chunk)
+        .await
+        .expect("free the peer's block");
     assert_eq!(a.foreign_lane_free_blocks(), 1);
 
     let err = a
@@ -740,13 +757,21 @@ async fn adopting_a_proven_dead_lane_reclaims_its_space_and_shrinks_the_bound() 
     let stranded0 = METRICS.alloc_lane_stranded_bytes.load(Ordering::Relaxed);
     let adoptions0 = METRICS.alloc_lane_adoptions.load(Ordering::Relaxed);
 
+    // Exhaust this lane's own share (0, 2, 4, 6 of an 8-block device), then
+    // make a peer's block free supply.
+    for _ in 0..4 {
+        a.allocate_block().await.expect("own share");
+    }
     a.recover_block(3).await.expect("seed");
     a.free_block(3 * chunk).await.expect("free");
     assert_eq!(a.foreign_lane_free_blocks(), 1);
 
     let proof = declare_dead_epoch("test: lane 1's holder is proven dead");
     assert!(!a.adopt_lane(0, proof), "the own lane is not adoptable");
-    assert!(!a.adopt_lane(7, proof), "a lane outside the width is not one");
+    assert!(
+        !a.adopt_lane(7, proof),
+        "a lane outside the width is not one"
+    );
     assert!(a.adopt_lane(1, proof), "lane 1 is adopted under the proof");
     assert!(!a.adopt_lane(1, proof), "adoption is idempotent");
 
@@ -794,7 +819,11 @@ fn the_stranded_capacity_bound_is_the_published_formula() {
             let shares: Vec<u64> = (0..writers)
                 .map(|l| lane::lane_capacity_blocks(cap, writers, l))
                 .collect();
-            assert_eq!(shares.iter().sum::<u64>(), cap, "lane shares tile the device");
+            assert_eq!(
+                shares.iter().sum::<u64>(),
+                cap,
+                "lane shares tile the device"
+            );
             let (lo, hi) = (
                 shares.iter().copied().min().unwrap(),
                 shares.iter().copied().max().unwrap(),
@@ -849,7 +878,10 @@ async fn every_laned_allocation_carries_a_lifetime_stamp() {
     let chunk = a.chunk_size();
     a.free_block(2 * chunk).await.expect("free");
     let off = a.allocate_block_below(16).expect("contiguity pick");
-    assert_ne!(a.live_incarnation(off), squeezefs::routing::INCARNATION_NONE);
+    assert_ne!(
+        a.live_incarnation(off),
+        squeezefs::routing::INCARNATION_NONE
+    );
 }
 
 /// Contract: S7's dead-epoch quarantine still gates every allocation path
@@ -967,7 +999,10 @@ async fn the_ascending_pick_refuses_to_mint_past_the_reservation_frontier() {
         off,
         "reuse needs no reservation"
     );
-    assert!(a.allocate_block_at_or_above(1).is_ok(), "fresh, but covered");
+    assert!(
+        a.allocate_block_at_or_above(1).is_ok(),
+        "fresh, but covered"
+    );
     let _ = chunk;
 }
 

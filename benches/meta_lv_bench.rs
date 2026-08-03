@@ -1508,6 +1508,13 @@ fn bench_fsck_c9_refset(c: &mut Criterion) {
     const WIDTH: u64 = 65536;
     const SLOTS: u64 = 64;
     const POPULATION: u64 = 1_000_000;
+    // The set's two bounds, as a mount supplies them: the raw-local ino
+    // ceiling (nothing can exist at or above the volume's watermark, so a
+    // dentry value is never an allocation authority) and the derived byte
+    // budget. Sized for this shape: `POPULATION / SLOTS` raw locals per
+    // slot, and bits for the whole population.
+    let ceiling = 2 + POPULATION / SLOTS + 1;
+    let budget = 16 * 1024 * 1024u64;
 
     // Global inos as the mint rotor produces them: raw local `r` in slot
     // `s` encodes to `(r - 2) * W + s + 2`.
@@ -1536,7 +1543,7 @@ fn bench_fsck_c9_refset(c: &mut Criterion) {
     for (name, order) in [("sequential", &sequential), ("random", &random)] {
         group.bench_with_input(BenchmarkId::new("mark", name), order, |b, inos| {
             b.iter(|| {
-                let mut refs = InoBitmap::new(WIDTH);
+                let mut refs = InoBitmap::new(WIDTH, ceiling, budget);
                 for &ino in inos.iter() {
                     refs.mark(black_box(ino));
                 }
@@ -1546,11 +1553,11 @@ fn bench_fsck_c9_refset(c: &mut Criterion) {
     }
 
     // The difference: a healthy tree with 8 unnamed inodes.
-    let mut live = InoBitmap::new(WIDTH);
+    let mut live = InoBitmap::new(WIDTH, ceiling, budget);
     for &ino in &sequential {
         live.mark(ino);
     }
-    let mut referenced = InoBitmap::new(WIDTH);
+    let mut referenced = InoBitmap::new(WIDTH, ceiling, budget);
     for (i, &ino) in sequential.iter().enumerate() {
         if i % 125_000 != 0 {
             referenced.mark(ino);

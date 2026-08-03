@@ -366,15 +366,33 @@ pub struct FsckCounters {
 #[derive(Debug)]
 pub struct InoBitmap {
     width: u64,
+    raw_ceiling: u64,
+    byte_budget: u64,
+    bytes: u64,
+    truncated: bool,
     slots: HashMap<u64, Vec<u64>>,
     marked: u64,
 }
 
 impl InoBitmap {
-    /// Empty set over the volume set's durable routing width.
-    pub fn new(width: u64) -> Self {
+    /// Empty set over the volume set's durable routing `width`.
+    ///
+    /// `raw_ceiling` is the exclusive raw-local ino ceiling
+    /// ([`crate::meta_backend::kv::backend::KvMetaBackend::max_local_ino_watermark`]
+    /// folded over the set): no inode record can exist at or above it, so
+    /// an ino there is ignored — **a dentry record's `child_ino` is never
+    /// an allocation authority** (a corrupt value naming `u64::MAX` would
+    /// otherwise size a bit vector from it: the `kv_bset` `record_count`
+    /// lesson). `byte_budget` bounds the bit vectors in total; exceeding
+    /// it sets [`Self::truncated`], and a truncated set makes C9 record
+    /// **no verdict** rather than report from a partial one.
+    pub fn new(width: u64, raw_ceiling: u64, byte_budget: u64) -> Self {
         Self {
             width,
+            raw_ceiling,
+            byte_budget,
+            bytes: 0,
+            truncated: false,
             slots: HashMap::new(),
             marked: 0,
         }
@@ -389,7 +407,7 @@ impl InoBitmap {
             return None;
         }
         let (slot, raw) = crate::meta_backend::route_ino_width(global_ino, self.width);
-        (raw >= 2).then(|| (slot, raw - 2))
+        (raw >= 2 && raw < self.raw_ceiling).then(|| (slot, raw - 2))
     }
 
     /// Set `global_ino`'s bit; `true` when it was not already set.
@@ -397,11 +415,18 @@ impl InoBitmap {
         let Some((slot, bit)) = self.index_of(global_ino) else {
             return false;
         };
-        let words = self.slots.entry(slot).or_default();
         let w = (bit / 64) as usize;
-        if words.len() <= w {
-            words.resize(w + 1, 0);
+        let have = self.slots.get(&slot).map(|v| v.len()).unwrap_or(0);
+        if have <= w {
+            let grow = ((w + 1 - have) * 8) as u64;
+            if self.bytes + grow > self.byte_budget {
+                self.truncated = true;
+                return false;
+            }
+            self.bytes += grow;
+            self.slots.entry(slot).or_default().resize(w + 1, 0);
         }
+        let words = self.slots.get_mut(&slot).expect("resized above");
         let mask = 1u64 << (bit % 64);
         if words[w] & mask != 0 {
             return false;
@@ -409,6 +434,13 @@ impl InoBitmap {
         words[w] |= mask;
         self.marked += 1;
         true
+    }
+
+    /// `true` ⇔ a mark was refused because the bit vectors reached their
+    /// budget. The set is INCOMPLETE and C9 must record no verdict from
+    /// it (the same posture as a dentry pass that could not finish).
+    pub fn truncated(&self) -> bool {
+        self.truncated
     }
 
     pub fn contains(&self, global_ino: u64) -> bool {
@@ -429,7 +461,7 @@ impl InoBitmap {
     /// Bit-vector bytes held (the RAM-cost gauge the ≥ 100 M-inode cap is
     /// stated against; excludes the per-slot map overhead).
     pub fn bytes(&self) -> u64 {
-        self.slots.values().map(|w| (w.len() * 8) as u64).sum()
+        self.bytes
     }
 
     /// Every ino in `self` whose bit is clear in `other` — the C9
@@ -616,16 +648,42 @@ struct CensusOut {
     inodes_scanned: u64,
 }
 
-/// An empty census over `ctx`'s routing width — the single-layout probe
-/// shape (`census_layout` into a scratch [`CensusOut`]).
-fn probe_census(ctx: &FsckCtx) -> CensusOut {
+/// An empty census — the single-layout probe shape (`census_layout` into a
+/// scratch [`CensusOut`]). Its `live` set is inert by construction:
+/// probes never mark inodes, so they pay nothing for the C9 machinery.
+fn probe_census() -> CensusOut {
     CensusOut {
         refs: HashMap::new(),
         mappings: Vec::new(),
         unresolvable: Vec::new(),
-        live: InoBitmap::new(ctx.meta.routing_width()),
+        live: InoBitmap::new(1, 0, 0),
         inodes_scanned: 0,
     }
+}
+
+/// A C9 ino set sized for this volume set: the routing width, the ino
+/// ceiling nothing can exist at or above (so no record's or dentry's ino
+/// is an allocation authority), and the byte budget below.
+fn ino_bitmap(meta: &RoutedMetaBackend) -> InoBitmap {
+    let ceiling = meta
+        .volumes
+        .iter()
+        .map(|kv| kv.max_local_ino_watermark())
+        .max()
+        .unwrap_or(crate::meta_backend::kv::ino_lane::LOCAL_INO_BASE);
+    InoBitmap::new(meta.routing_width(), ceiling, ino_set_byte_budget())
+}
+
+/// Per-set bit-vector budget for the C9 ino sets — **derived**, never a
+/// tuning constant: 1/64th of the R5 memory budget (a scan holds two such
+/// sets, so ≈ 3 % of the budget transiently), floored at the design cap's
+/// own requirement — the ≥ 100 M-inode cap
+/// (`docs/design-cow-kv-metadata.md` §4.2) needs 100 M/8 = 12.5 MB of
+/// bits, and 16 MiB is that with headroom for the sparse tail. A set that
+/// hits the budget marks itself truncated and C9 records no verdict.
+fn ino_set_byte_budget() -> u64 {
+    const DESIGN_CAP_FLOOR: u64 = 16 * 1024 * 1024;
+    (crate::mem_budget::MEM_BUDGET.budget_bytes() / 64).max(DESIGN_CAP_FLOOR)
 }
 
 /// One volume's allocator handle under its canonical id (device access
@@ -912,8 +970,17 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // inodes that no dentry names. Two independent bitmaps, one
         // difference — the era floor is applied per candidate inside, so
         // a healthy volume pays only the bitmap scan.
-        if let Some(refs) = referenced.as_ref() {
-            evaluate_c9_unreferenced(ctx, &census.live, refs, &mut counters, &mut suspects).await;
+        match (referenced.as_ref(), census.live.truncated()) {
+            (Some(refs), false) => {
+                evaluate_c9_unreferenced(ctx, &census.live, refs, &mut counters, &mut suspects)
+                    .await;
+            }
+            (Some(_), true) => log::warn!(
+                "fsck C9: the live-inode set reached its derived byte budget ({} B) — the \
+                 unreferenced-inode class records no verdict for this run",
+                ino_set_byte_budget()
+            ),
+            (None, _) => {}
         }
 
         counters.suspects = suspects.len() as u64;
@@ -1216,7 +1283,10 @@ async fn walk_census(
         .router
         .block_size
         .load(std::sync::atomic::Ordering::Relaxed) as usize;
-    let mut out = probe_census(ctx);
+    let mut out = CensusOut {
+        live: ino_bitmap(&ctx.meta),
+        ..probe_census()
+    };
     for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
         let inodes = kv.trees()[0];
         let mut cursor: Vec<u8> = inode_key(1).to_vec();
@@ -1411,7 +1481,7 @@ async fn build_referenced_inos(
     cancel: Arc<AtomicBool>,
 ) -> (Option<InoBitmap>, u64) {
     use crate::meta_backend::kv::record::DentryValue;
-    let mut refs = InoBitmap::new(meta.routing_width());
+    let mut refs = ino_bitmap(&meta);
     let mut indexed = 0u64;
     for (vol_idx, kv) in meta.volumes.iter().enumerate() {
         let dentries = kv.trees()[1];
@@ -1454,6 +1524,15 @@ async fn build_referenced_inos(
                 indexed += 1;
             }
             throttle_sleep(throttle_pct, t0.elapsed()).await;
+            if refs.truncated() {
+                log::warn!(
+                    "fsck C9: the referenced-ino set reached its derived byte budget \
+                     ({} B) — the unreferenced-inode class records no verdict for this \
+                     run (a partial set would report named inodes as unreferenced)",
+                    ino_set_byte_budget()
+                );
+                return (None, indexed);
+            }
         }
     }
     (Some(refs), indexed)
@@ -1526,7 +1605,7 @@ async fn layout_mappings_of(ctx: &FsckCtx, ino: u64) -> Vec<MappingRef> {
         .router
         .block_size
         .load(std::sync::atomic::Ordering::Relaxed) as usize;
-    let mut probe = probe_census(ctx);
+    let mut probe = probe_census();
     census_layout(ctx, ino, &layout, block_size, &mut probe).await;
     probe.mappings
 }
@@ -2472,7 +2551,7 @@ async fn reverify_scrub_failure(
     if !still_mapped {
         // Indirect maps / blob references: re-read through the census
         // decoder for this single layout.
-        let mut probe = probe_census(ctx);
+        let mut probe = probe_census();
         census_layout(ctx, m.ino, &layout, block_size, &mut probe).await;
         still_mapped = probe.mappings.iter().any(|p| p.mapping == m.mapping);
     }
@@ -2883,7 +2962,7 @@ async fn current_mapping_present(ctx: &FsckCtx, ino: u64, block_idx: u32, mappin
         .router
         .block_size
         .load(std::sync::atomic::Ordering::Relaxed) as usize;
-    let mut probe = probe_census(ctx);
+    let mut probe = probe_census();
     census_layout(ctx, ino, &layout, block_size, &mut probe).await;
     probe
         .mappings
@@ -3653,7 +3732,7 @@ pub async fn repair(
                         bincode::deserialize(&bytes).ok()
                     };
                     let Some(layout) = layout else { continue };
-                    let mut probe = probe_census(ctx);
+                    let mut probe = probe_census();
                     census_layout(ctx, r_ino, &layout, block_size, &mut probe).await;
                     counted += probe
                         .refs

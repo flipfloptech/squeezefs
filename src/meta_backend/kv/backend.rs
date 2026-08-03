@@ -1965,6 +1965,25 @@ impl KvMetaBackend {
         hi
     }
 
+    /// The exclusive ceiling on raw local inos this volume could have
+    /// minted: the §4.8 native watermark folded with every hosted guest
+    /// keyspace's cursor. Every existing record's raw local is strictly
+    /// below it.
+    ///
+    /// fsck class C9 indexes its ino bitmaps against this, so a dentry
+    /// record's `child_ino` can never become an allocation authority — a
+    /// corrupt value naming ino `u64::MAX` would otherwise size a bit
+    /// vector from it (the `kv_bset` `record_count` lesson, spec §11
+    /// TEST-4).
+    pub fn max_local_ino_watermark(&self) -> u64 {
+        let mut hi = self.next_ino();
+        self.guest_cursors.iter_sync(|_slot, cursor| {
+            hi = hi.max(cursor.snapshot());
+            true
+        });
+        hi
+    }
+
     /// `true` ⇔ the record at EFFECTIVE local `local_ino` was minted
     /// **before this mount's writer era began** — fsck class C9's
     /// candidate filter (`src/fsck.rs`).

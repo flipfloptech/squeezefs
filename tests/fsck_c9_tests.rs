@@ -399,8 +399,14 @@ fn assert_zero_findings(report: &FsckReport, what: &str) {
 fn test_ino_bitmap_is_one_bit_per_inode_and_indexes_no_root() {
     use squeezefs::fsck::InoBitmap;
 
+    // A mount supplies two bounds: the raw-local ino CEILING (its
+    // watermark — nothing can exist at or above it) and the derived byte
+    // BUDGET for the bit vectors.
+    const CEILING: u64 = 200_000_000;
+    const BUDGET: u64 = 32 * 1024 * 1024;
+
     // Identity width (the in-RAM single-volume shape).
-    let mut refs = InoBitmap::new(1);
+    let mut refs = InoBitmap::new(1, CEILING, BUDGET);
     assert!(refs.mark(2));
     assert!(!refs.mark(2), "marking twice sets one bit");
     assert!(refs.mark(1_000_000));
@@ -419,7 +425,7 @@ fn test_ino_bitmap_is_one_bit_per_inode_and_indexes_no_root() {
     // identically whichever side named it (a dentry's target, or the
     // inode record's own ino).
     const W: u64 = 65536;
-    let mut wide = InoBitmap::new(W);
+    let mut wide = InoBitmap::new(W, CEILING, BUDGET);
     let named: Vec<u64> = vec![2, 3, 65_537, 65_538, 131_074, 9_999_999];
     for ino in &named {
         assert!(wide.mark(*ino), "ino {ino} marks once");
@@ -430,7 +436,7 @@ fn test_ino_bitmap_is_one_bit_per_inode_and_indexes_no_root() {
     assert!(!wide.contains(4));
 
     // The difference: live inodes with no dentry, and nothing else.
-    let mut live = InoBitmap::new(W);
+    let mut live = InoBitmap::new(W, CEILING, BUDGET);
     for ino in named.iter().chain([4u64, 65_539].iter()) {
         live.mark(*ino);
     }
@@ -446,7 +452,7 @@ fn test_ino_bitmap_is_one_bit_per_inode_and_indexes_no_root() {
     // The RAM cost the >= 100 M-inode cap is stated against: 1 bit per
     // ino ever allocated in a keyspace. A single mark at the cap sizes
     // the whole vector, which is the worst case for one set.
-    let mut cap = InoBitmap::new(1);
+    let mut cap = InoBitmap::new(1, CEILING, BUDGET);
     cap.mark(100_000_001);
     let bytes = cap.bytes();
     assert!(
@@ -455,7 +461,7 @@ fn test_ino_bitmap_is_one_bit_per_inode_and_indexes_no_root() {
     );
     // Dense population: bytes ≈ population / 8 (a HashSet<u64> of the
     // same population is ~48-64 B per entry).
-    let mut dense = InoBitmap::new(1);
+    let mut dense = InoBitmap::new(1, CEILING, BUDGET);
     for ino in 2..100_002u64 {
         dense.mark(ino);
     }
@@ -464,6 +470,47 @@ fn test_ino_bitmap_is_one_bit_per_inode_and_indexes_no_root() {
         dense.bytes() <= 100_000 / 8 + 64,
         "dense marks must not overshoot one bit each: {} B",
         dense.bytes()
+    );
+
+    // **A dentry value is never an allocation authority.** A corrupt
+    // record naming an impossible ino is ignored (no inode can exist at
+    // or above the volume's ino watermark), so it can neither size a bit
+    // vector nor panic — the `kv_bset` `record_count` lesson applied to
+    // this decoder's output.
+    let mut hostile = InoBitmap::new(1, 1_000, BUDGET);
+    assert!(
+        !hostile.mark(u64::MAX),
+        "an ino past the ceiling is ignored"
+    );
+    assert!(!hostile.mark(u64::MAX - 1));
+    assert!(!hostile.mark(1_000), "the ceiling is exclusive");
+    assert!(hostile.mark(999));
+    assert_eq!(hostile.marked(), 1);
+    assert!(
+        hostile.bytes() <= 8 * 16,
+        "a hostile ino must not size the vector: {} B",
+        hostile.bytes()
+    );
+    assert!(
+        !hostile.truncated(),
+        "ignoring an impossible ino is not truncation"
+    );
+
+    // Reaching the byte budget marks the set INCOMPLETE — the state that
+    // makes C9 record no verdict instead of reporting named inodes as
+    // unreferenced.
+    let mut tight = InoBitmap::new(1, CEILING, 64);
+    for ino in 2..2_000u64 {
+        tight.mark(ino);
+    }
+    assert!(
+        tight.truncated(),
+        "a set that could not represent its population must say so"
+    );
+    assert!(
+        tight.bytes() <= 64,
+        "the budget is honored: {} B",
+        tight.bytes()
     );
 }
 

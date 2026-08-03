@@ -81,11 +81,14 @@
 //!   registry) inside a **freshness window**
 //!   (`JobWireConfig::enroll_freshness`).
 //! - **The verification-strength ladder keys on an AUTHENTICATED
-//!   channel** — CA-pinned mTLS ([`channel_authenticated`]), never on
-//!   the presence of a TLS object. A `ClusterSecurityConfig` with no CA
-//!   installs an accept-everything verifier client-side and
-//!   `with_no_client_auth()` server-side: it is refused for the ladder
-//!   and pinned to the plaintext class (mandatory-100 % verify-reads).
+//!   channel** — never on the presence of a TLS object. VAL-6 keyed it on
+//!   a CA pin ([`channel_authenticated`]) and pinned the CA-less TLS
+//!   object to the plaintext class; **S3 refuses that configuration
+//!   outright**, and the ladder's predicate is now
+//!   `SessionAuthn::verify_sampling_admissible()`: authenticated (storage
+//!   proof + session MAC, which plaintext now also is) **and**
+//!   confidential (mTLS). Plaintext therefore keeps mandatory-100 %
+//!   verify-reads exactly as before.
 //! - **A configuration surface that exists**: [`JobWireConfig::from_env`]
 //!   (`SQUEEZEFS_JOB_WIRE_*`) — `security` used to be hardwired `None`
 //!   with no flag, env var, or config field able to populate it, so the
@@ -705,7 +708,9 @@ impl std::fmt::Debug for JobWireConfig {
         let channel = match self.security.as_ref() {
             None => "plaintext",
             Some(sec) if channel_authenticated(sec) => "mtls(ca-pinned)",
-            Some(_) => "tls-unauthenticated",
+            // Not a class the listener will start (S3 refuses it) — named
+            // so a Debug print of a bad config says WHY it will refuse.
+            Some(_) => "incomplete-ca(refused at start)",
         };
         f.debug_struct("JobWireConfig")
             .field("bind_addr", &self.bind_addr)
@@ -744,18 +749,20 @@ impl Default for JobWireConfig {
     }
 }
 
-/// Is this security configuration an **authenticated** channel?
+/// Is this security configuration a **confidential, peer-authenticated**
+/// channel — i.e. a complete CA pin?
 ///
 /// CA-pinned mTLS only: the server installs a `WebPkiClientVerifier`
-/// rooted at the CA and the client validates against the same root.
-/// Without a CA the client installs an accept-everything verifier via
-/// `.dangerous()` and the server takes `with_no_client_auth()` — a TLS
-/// object, not authentication. The verification-strength ladder keys on
-/// THIS, never on the presence of a TLS object (VAL-6).
+/// rooted at the CA and the client validates against the same root and
+/// presents its own CA-signed cert. Anything less used to mean an
+/// accept-everything verifier; since S3 it means the listener refuses
+/// (`cluster_wire::tls_acceptor`), so this predicate now separates the two
+/// postures that EXIST rather than ranking three.
 ///
 /// The key half is load-bearing, not decorative: the node cert the
 /// cluster machinery presents is signed by the CA key, so a CA cert
-/// without its key cannot produce an authenticated channel at all.
+/// without its key cannot produce an authenticated channel at all — which
+/// is why `ClusterSecurityConfig::ca_pair` is the check.
 pub fn channel_authenticated(security: &ClusterSecurityConfig) -> bool {
     security.ca_pair().is_some()
 }
@@ -1247,9 +1254,11 @@ impl JobWireHost {
         self.endpoint
     }
 
-    /// `"plaintext"`, `"tls-unauthenticated"` (a TLS object with no CA
-    /// pin — accept-everything verifier, no client auth), or `"mtls"`
-    /// (CA-pinned, the only authenticated class).
+    /// `"plaintext"` or `"mtls"` — the only two classes that exist since
+    /// S3. `"tls-unauthenticated"` (a TLS object with no CA pin, which
+    /// VAL-6 had to carve out of the ladder) is gone: that configuration
+    /// refuses the listener, because the verifier it depended on no longer
+    /// exists in the tree.
     pub fn transport_mode(&self) -> &'static str {
         self.transport
     }

@@ -284,9 +284,28 @@ pub struct BlockAllocator {
     /// the same reason PR VL6a kept the fsck allocation epoch in a
     /// separate side map.
     incarnations: scc::HashMap<u64, IncarnationCell>,
-    /// Spec §6.2 item 6 (incompat bit 11): the mount's lifetime-stamp
+    /// Spec §6.2 item 6: `true` once ANY lifetime stamp exists on this
+    /// allocator (minted at engagement, or seeded from a walked key).
+    ///
+    /// Without it [`Self::live_incarnation`] would run a hashed `scc` probe
+    /// for every key mint on a mount that can hold no lifetime at all —
+    /// which ruling D9 makes the ONLY mount that exists today. One relaxed
+    /// load of an owned word replaces the probe whenever no lifetime can
+    /// exist. **Predicted, not measured** (ruling D11 defers benches and
+    /// brackets): the `write_block_key/persist_bare_default_slot` row holds
+    /// its pre-item-6 value with this latch and regresses without it;
+    /// falsification is that row moving either way past the bench group
+    /// threshold once measurement is allowed.
+    ///
+    /// The latch is set BEFORE the stamp it covers becomes visible (both at
+    /// engagement and at seeding), so the only reordering a relaxed reader
+    /// can observe is `false` while a stamp already exists — which reads as
+    /// [`crate::routing::INCARNATION_NONE`], i.e. §6.3's honest "unknown"
+    /// degradation (serve, counted). It can never manufacture a refusal.
+    stamps_present: std::sync::atomic::AtomicBool,
+    /// Spec §6.2 item 6 (incompat bit 13): the mount's lifetime-stamp
     /// minter — `Some` only when incarnation keys are engaged, which
-    /// requires every mounted meta volume to carry bit 11 and a durable
+    /// requires every mounted meta volume to carry bit 13 and a durable
     /// writer term (bit 7). `None` on every volume today (ruling D9:
     /// build the bit, do not stamp it), and then every minted key is the
     /// bare offset form, byte-identical to the shipped one.
@@ -343,6 +362,7 @@ impl BlockAllocator {
             elided_debt: scc::HashMap::new(),
             elided_debt_bytes: AtomicU64::new(0),
             incarnations: scc::HashMap::new(),
+            stamps_present: std::sync::atomic::AtomicBool::new(false),
             incarnation_minter: std::sync::OnceLock::new(),
             quarantine: crate::data_custody::BlockQuarantine::new(),
         })
@@ -754,6 +774,7 @@ impl BlockAllocator {
         era: u64,
         part: crate::meta_backend::kv::journal::AppendPartition,
     ) {
+        self.stamps_present.store(true, Ordering::Release);
         let _ = self.incarnation_minter.set(IncarnationMinter {
             era,
             // Base 1: stamp sequence 0 is reserved for
@@ -816,6 +837,12 @@ impl BlockAllocator {
     /// offset (never allocated by this mount, or stamping disengaged),
     /// which the validators treat exactly as pre-item-6 behavior.
     pub fn live_incarnation(&self, offset: u64) -> u64 {
+        // The shipped path: no lifetime can exist on this allocator, so the
+        // answer is NONE without touching the map (see `stamps_present`,
+        // whose cost claim is a D11-deferred prediction, not a measurement).
+        if !self.stamps_present.load(Ordering::Relaxed) {
+            return crate::routing::INCARNATION_NONE;
+        }
         self.incarnations
             .read_sync(&offset, |_, v| v.stamp.load(Ordering::Acquire))
             .unwrap_or(crate::routing::INCARNATION_NONE)
@@ -834,6 +861,10 @@ impl BlockAllocator {
         if inc == crate::routing::INCARNATION_NONE {
             return;
         }
+        // A seeded stamp is a live lifetime even on a mount that mints none
+        // (a read-only mount of a stamped volume), so the fast-path latch
+        // must cover it.
+        self.stamps_present.store(true, Ordering::Release);
         match self.incarnations.entry_sync(offset) {
             scc::hash_map::Entry::Occupied(occ) => {
                 let _ = occ.get().stamp.compare_exchange(

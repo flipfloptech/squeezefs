@@ -739,6 +739,26 @@ pub struct BackendRouter {
     /// drainer owns the idle/pressure venues and the trim core
     /// (`trim_elided` is the fstrim/defrag face).
     debt: std::sync::Arc<crate::block_reclaim::DebtDrainer>,
+    /// Spec §6.2 item 6 (incompat bit 13): this mount's block-key
+    /// **incarnation era** — the durable writer term stamps ride, or `0`
+    /// when incarnation keys are not engaged (every volume today, ruling
+    /// D9). Read as ONE relaxed load at the head of
+    /// [`BackendRouter::persist_block_key`], which is what keeps the
+    /// shipped un-stamped mint byte-for-byte and structurally identical to
+    /// what it was: the gate is a load of a word this struct owns, so a
+    /// disengaged mint never reaches the owning allocator's `Arc` (a cold
+    /// field read) nor its per-offset `scc` map (a hashed probe), which
+    /// were the two arrangements this layout exists to avoid.
+    ///
+    /// **Cost claim status: PREDICTED, not measured** (ruling D11 defers
+    /// every bench/bracket until the DLM admits N readers and writers).
+    /// Prediction: `write_block_key/persist_bare_default_slot` is within
+    /// noise of its pre-item-6 value, because the added work on that row is
+    /// one relaxed load of an already-hot cache line. Falsification: that
+    /// row moving beyond the bench harness's own group threshold once the
+    /// D11 window opens — in which case the gate belongs in the caller
+    /// (hoisted per publish batch), not on the per-key path.
+    incarnation_era: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[cold]
@@ -858,7 +878,7 @@ pub fn clean_block_key(bk: &str) -> String {
 
 // ---------------------------------------------------------------------------
 // `offset ‖ incarnation` block keys — pre-RC engineering spec §6.2 item 6
-// (rationale §6.3 "block-key binding"), incompat bit 11, ruling D9.
+// (rationale §6.3 "block-key binding"), incompat bit 13, ruling D9.
 // ---------------------------------------------------------------------------
 
 /// Separator between a block key's device offset and its **incarnation**
@@ -874,7 +894,7 @@ pub fn clean_block_key(bk: &str) -> String {
 /// untouched.
 pub const BLOCK_KEY_INCARNATION_SEP: char = '@';
 
-/// "This key names no lifetime" — every key written before incompat bit 11,
+/// "This key names no lifetime" — every key written before incompat bit 13,
 /// and every key on an un-stamped volume (i.e. every key in the field
 /// today). Read-path validation treats it exactly as it treats an offset
 /// with no recorded lifetime: serve, as before.
@@ -973,8 +993,15 @@ fn split_incarnation(offset_part: &str) -> std::result::Result<(&str, u64), ()> 
 /// `be://offset`). [`INCARNATION_NONE`] returns the body unchanged — which
 /// is what keeps an un-stamped volume's keys byte-identical.
 pub fn block_key_with_incarnation(body: &str, inc: u64) -> String {
+    attach_incarnation(body.to_string(), inc)
+}
+
+/// [`block_key_with_incarnation`] over an OWNED body — the mint path's
+/// form: the un-stamped case MOVES the body out instead of copying it, so a
+/// persisted key costs exactly the one allocation it did before item 6.
+fn attach_incarnation(body: String, inc: u64) -> String {
     if inc == INCARNATION_NONE {
-        return body.to_string();
+        return body;
     }
     format!(
         "{body}{BLOCK_KEY_INCARNATION_SEP}{}",
@@ -1194,6 +1221,7 @@ impl BackendRouter {
             )),
             reclaim,
             debt,
+            incarnation_era: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         // Seed the table so bare routers place without waiting for a
         // worker tick (construction-time probe, never per-write).
@@ -1974,35 +2002,53 @@ impl BackendRouter {
     }
 
     pub fn parse_block_key(&self, block_key: &str) -> Result<(String, u64)> {
-        let p = self.parse_block_key_parts(block_key)?;
-        Ok((p.be_id, p.offset))
+        let (be_id, offset, _) = Self::split_key(block_key)?;
+        Ok((be_id.to_string(), offset))
     }
 
     /// [`Self::parse_block_key`] plus the key's **incarnation** (spec §6.2
-    /// item 6) — the ONE extraction path, not a fork: `parse_block_key`
-    /// delegates here and drops the lifetime, so every existing consumer
-    /// (free, refcount, durable block references, fsck, the movers) keeps
-    /// resolving the same `(backend, offset)` it always did.
+    /// item 6) — not a fork: both parses run the SAME extraction core
+    /// ([`Self::split_key`]) and this one keeps the lifetime the other
+    /// drops, so every existing consumer (free, refcount, durable block
+    /// references, fsck, the movers) resolves the same `(backend, offset)`
+    /// it always did.
     ///
     /// Cost discipline: the shipped bare form (`4194304`,
     /// `vol-x://4194304`) parses through the SAME `u64::parse` it always
     /// did — the `@` split runs only when that parse fails, so an
-    /// un-stamped volume pays nothing (`.benchmarks/2026-08-05-mw-cursors-
-    /// and-incarnation.md`).
+    /// un-stamped volume executes no added instruction on the success path.
+    /// **Predicted, not measured** (ruling D11): the `parse_bare_*` rows
+    /// hold their pre-item-6 values; falsification is either of them moving
+    /// past the bench group threshold once measurement is allowed.
     pub fn parse_block_key_parts(&self, block_key: &str) -> Result<BlockKeyParts> {
-        let parts: Vec<&str> = block_key.split("://").collect();
-        let (be_id, offset_str) = if parts.len() > 1 {
-            (parts[0], parts[1])
-        } else {
-            ("backend_0", block_key)
+        let (be_id, offset, incarnation) = Self::split_key(block_key)?;
+        Ok(BlockKeyParts {
+            be_id: be_id.to_string(),
+            offset,
+            incarnation,
+        })
+    }
+
+    /// The shared extraction core both parses use: borrowed backend id,
+    /// offset, and lifetime. Owning the id (the one allocation) is left to
+    /// the callers so the shipped `parse_block_key` costs exactly what it
+    /// always did.
+    #[inline]
+    fn split_key(block_key: &str) -> Result<(&str, u64, u64)> {
+        // `split_once`, not `split(…).collect()`: the historical form
+        // allocated a `Vec<&str>` on EVERY parse — i.e. one heap allocation
+        // per publish and per read serve — for a split that has at most one
+        // interesting boundary. Same resolution for every legal key shape
+        // (a second `://` was, and still is, an unparseable offset).
+        let (be_id, offset_str) = match block_key.split_once("://") {
+            Some((be, rest)) => (be, rest),
+            None => ("backend_0", block_key),
         };
-        // Fast path FIRST: the bare offset every field key carries.
+        // Fast path FIRST: the bare offset every field key carries. The
+        // lifetime split below is reached only when this parse FAILS, so an
+        // un-stamped volume pays nothing for item 6.
         if let Ok(offset) = offset_str.parse::<u64>() {
-            return Ok(BlockKeyParts {
-                be_id: be_id.to_string(),
-                offset,
-                incarnation: INCARNATION_NONE,
-            });
+            return Ok((be_id, offset, INCARNATION_NONE));
         }
         let (off_text, incarnation) = split_incarnation(offset_str).map_err(|()| {
             crate::error::SqueezefsError::InvalidOperation(format!(
@@ -2011,11 +2057,7 @@ impl BackendRouter {
             ))
         })?;
         let offset = off_text.parse::<u64>().map_err(|_| err_invalid_offset())?;
-        Ok(BlockKeyParts {
-            be_id: be_id.to_string(),
-            offset,
-            incarnation,
-        })
+        Ok((be_id, offset, incarnation))
     }
 
     /// The key string to PERSIST for a block just written at `offset` on the
@@ -2053,15 +2095,38 @@ impl BackendRouter {
         }
     }
 
+    /// The key string to PERSIST for a block just written at `offset`.
+    ///
+    /// One backend lookup, one `String` allocation on the shipped
+    /// (un-stamped) path: the era gate below short-circuits to the
+    /// pre-item-6 body, so a disengaged mount never probes the owning
+    /// allocator's per-offset map
+    /// ([`crate::block_allocator::BlockAllocator::live_incarnation`]), and
+    /// when it IS engaged the body is built ONCE and moved into the key
+    /// rather than copied ([`attach_incarnation`]).
+    ///
+    /// **Predicted, not measured** (ruling D11 defers benches): the
+    /// un-stamped mint holds its pre-item-6 cost and the stamped mint costs
+    /// one map read plus the base-36 render. Falsification: the
+    /// `write_block_key/persist_bare_*` rows moving once measurement is
+    /// allowed — the fix would then be to hoist the gate to the publish
+    /// batch, never to drop the lifetime.
     pub fn persist_block_key(&self, be_id: &str, offset: u64) -> String {
-        let body = self.persist_block_key_body(be_id, offset);
+        // The shipped path (ruling D9: nothing stamps bit 13) — one relaxed
+        // load, then the pre-item-6 function verbatim.
+        if self
+            .incarnation_era
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            return self.persist_block_key_body(be_id, offset);
+        }
         let inc = self.live_incarnation_for(be_id, offset);
-        block_key_with_incarnation(&body, inc)
+        attach_incarnation(self.persist_block_key_body(be_id, offset), inc)
     }
 
-    /// The pre-item-6 key body (`offset` / `name://offset`) — the naming
-    /// law and its aliases, unchanged; [`Self::persist_block_key`] appends
-    /// the lifetime when one exists.
+    /// The pre-item-6 key body (`offset` / `name://offset`): the naming law
+    /// and its default-slot aliases, unchanged.
     fn persist_block_key_body(&self, be_id: &str, offset: u64) -> String {
         if be_id == "backend_0" {
             return offset.to_string();
@@ -2149,8 +2214,8 @@ impl BackendRouter {
     /// term budget — a bad era composes stamps that alias a real one.
     ///
     /// Nothing calls this in production today: `DataRouter::set_meta_backend`
-    /// engages only when EVERY mounted meta volume carries incompat bit 11,
-    /// and nothing stamps bit 11 (ruling D9).
+    /// engages only when EVERY mounted meta volume carries incompat bit 13,
+    /// and nothing stamps bit 13 (ruling D9).
     pub fn engage_incarnation_keys(
         &self,
         era: u64,
@@ -2168,6 +2233,11 @@ impl BackendRouter {
         for be in self.backends.iter() {
             be.value().block_allocator.engage_incarnations(era, part);
         }
+        // Published LAST: `persist_block_key`'s gate reads this, and a key
+        // must never be stamped before the minter that produced its
+        // lifetime exists.
+        self.incarnation_era
+            .store(era, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -4464,7 +4534,7 @@ impl DataRouter {
         // data-namespace reservation held for the mount lifetime — is
         // DLM stage S7; this is the local face.)
         self.backend_router.set_dma_fence_signal(probe);
-        // Spec §6.2 item 6 (incompat bit 11, ruling D9): engage
+        // Spec §6.2 item 6 (incompat bit 13, ruling D9): engage
         // `offset ‖ incarnation` keys only when EVERY mounted meta volume's
         // format expresses them — a mixed set would have one volume's
         // layouts naming lifetimes while another's do not, and the era must

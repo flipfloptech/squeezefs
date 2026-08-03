@@ -307,9 +307,28 @@ pub fn covering_epoch(device_path: impl AsRef<Path>, seq: u64) -> Option<u64> {
 
 /// Disarm every path and drop every journal (suite hygiene — the state
 /// is process-global, like the `uring_fs` shim's).
+///
+/// **Whole-registry**: safe for an integration test (one process, one
+/// harness), but NOT for a test running beside another that holds a
+/// journal — it deletes that journal and the arm flag it depends on. Use
+/// [`clear_faults_for`] wherever siblings may share the process (the
+/// lib harness runs its unit tests in parallel).
 pub fn clear_faults() {
     STATE.lock().unwrap().clear();
     ARMED.store(false, Ordering::Relaxed);
+}
+
+/// Path-scoped teardown: drop ONE device's journal and disarm the seam
+/// only once nothing is tracked any more (an empty registry cannot be
+/// journaling, so the zero-cost-when-off flag is restored without
+/// stealing a sibling's arm — the decision is taken under the same lock
+/// as the removal). The parallel-safe form of [`clear_faults`].
+pub fn clear_faults_for(device_path: impl AsRef<Path>) {
+    let mut st = STATE.lock().unwrap();
+    st.remove(device_path.as_ref());
+    if st.is_empty() {
+        ARMED.store(false, Ordering::Relaxed);
+    }
 }
 
 /// Capture the device's CURRENT bytes at `[offset, offset + len)` — what
@@ -361,7 +380,6 @@ mod tests {
     /// whatever journal a concurrent test was holding).
     fn disarmed_seam_body() {
         let never_armed = "/nonexistent/device/disarmed-seam-probe";
-        clear_faults();
         note_write(never_armed, 0, 4096);
         assert_eq!(
             volatile_writes(never_armed),
@@ -399,7 +417,9 @@ mod tests {
         assert_eq!(covering_epoch(&path, s1), None, "post-barrier push");
         assert_eq!(volatile_writes(&path), 1);
 
-        clear_faults();
+        // Path-scoped teardown: the whole-registry `clear_faults()` here
+        // used to delete a concurrent test's journal (and its arm flag).
+        clear_faults_for(&path);
         assert_eq!(volatile_writes(&path), 0);
     }
 
@@ -437,7 +457,8 @@ mod tests {
             "a sibling seam probe wiped this device's live journal"
         );
         assert_eq!(
-            covering_epoch(&path, seq), None,
+            covering_epoch(&path, seq),
+            None,
             "the volatile write must stay uncovered (a sibling probe cannot barrier it)"
         );
         let covered = mark_barrier_start(&path);
@@ -447,8 +468,12 @@ mod tests {
             "mark_barrier_start returns 0 when the arm flag was cleared underneath us"
         );
         complete_barrier(&path, covered);
-        assert_eq!(covering_epoch(&path, seq), Some(1), "own barrier still covers");
+        assert_eq!(
+            covering_epoch(&path, seq),
+            Some(1),
+            "own barrier still covers"
+        );
 
-        clear_faults();
+        clear_faults_for(&path);
     }
 }

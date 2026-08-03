@@ -594,6 +594,12 @@ impl MemberClient {
 /// peer), `self_id` excluded, deduplicated, ordered by id so discovery is
 /// deterministic. Pure and total, so the law is testable without a volume
 /// or a listener.
+///
+/// Public API surface with no in-tree dial-side caller yet BY DESIGN: the
+/// projection lands and is pinned here, while swapping
+/// `cluster_wire::discover_peers` onto it is one line in a file S8 is
+/// concurrently rewriting (the coordination rule — a rewrite collision in
+/// the shared dispatch costs more than the one-line deferral).
 pub fn peers_from_census(rows: &[MemberSnapshot], self_id: Option<&str>) -> Vec<ClusterPeer> {
     let mut by_id: std::collections::BTreeMap<String, ClusterPeer> =
         std::collections::BTreeMap::new();

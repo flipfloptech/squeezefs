@@ -1810,6 +1810,7 @@ async fn arm_owner(
         let owner = Arc::clone(&owner);
         let stop = Arc::clone(&stop);
         let meta = Arc::clone(meta);
+        let plane_stats = Arc::clone(&plane);
         let cadence = clocks.renew_interval;
         tokio::spawn(crate::detached::contain("membership_sweep", async move {
             loop {
@@ -1825,6 +1826,19 @@ async fn arm_owner(
                         ev.reason,
                         ev.dead,
                         meta.volumes.len()
+                    );
+                }
+                // S3's must-stay-0 transport tripwires, surfaced on the
+                // plane's own cadence: a frame that failed authentication
+                // or a lane that refused a connection is a security or a
+                // capacity event, and nothing else on this listener would
+                // ever say so.
+                let t = plane_stats.transport_stats();
+                if t.mac_failures != 0 || t.service_refusals != 0 {
+                    log::error!(
+                        "membership transport tripwire: {} frame MAC failure(s), {} service                          refusal(s) on the membership listener (cluster_wire's must-stay-0                          pair — tamper/reorder/replay, or lanes at capacity)",
+                        t.mac_failures,
+                        t.service_refusals
                     );
                 }
             }

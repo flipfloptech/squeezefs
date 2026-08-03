@@ -197,6 +197,32 @@ Every claim cites its tier. **(i) measured-real** — rows from real mounts at l
 
 ---
 
+## 3a. VAL-6 closed structurally by DLM S3 (2026-08-05)
+
+VAL-6's interim hardening was, by its own framing, bounds on a transport that should not have existed. **S3 `cluster_wire` replaced it and `job_wire` was ported onto the new wire**, so the item is now closed by construction rather than by patching:
+
+- **The codec** — `serde_json` → bincode. The 64-checksum mover-shard decode VAL-6 measured at 32.6 µs against §6.5's 10 µs custody budget is now **771 ns (21.6×)**, 7.7 % of budget. Frame bytes 4,043 → 1,542. The A/B lives *inside* the bench group (`*_json_control` rows run the retired codec over identical frames in the same process), so the ratio reproduces from one `cargo bench` rather than resting on a remembered number.
+- **Authentication now survives the handshake** — VAL-6 explicitly left per-frame authentication to S3. Every session frame carries `HMAC-SHA256(session_key, direction ‖ sequence ‖ length ‖ body)`; tamper, reorder, replay and reflection are each refused mid-session and each pinned. Under mTLS the key mixes in the RFC 5705 exporter, so it is channel-bound. The nonce is consumed **after** the MAC check, so a peer that cannot produce a valid proof can never spend an honest connection's challenge.
+- **The accept-everything verifier is now UNREPRESENTABLE**, not merely deleted: `cluster_tls` constructs rustls configs only from a complete CA, so "TLS that authenticates nobody" cannot be built. **This is why exactly one VAL-6 leg changed outcome** — `unauthenticated_tls_is_plaintext_class_for_the_ladder` *described the verifier existing*, so keeping it green would have required keeping the verifier. It became `ca_less_tls_is_refused_not_admitted_as_a_lesser_class`. The other 26 legs kept their original assertions; 27/27 green.
+- **Honest cost accounting:** S3 also *added* work, and reporting only the win would misrepresent it. The full authenticated custody frame (encode → MAC → verify → decode, both directions) is **2.97 µs** — where the retired JSON *decode alone* cost 16.6–32.6 µs.
+- **DISC-1 landed** (ruling D2): peers auto-discovered from `client:{uuid}` records — the shared volume is the rendezvous, no multicast and no seed list. The interim form's cost is stated: `listxattr(1)` + one `getxattr` per record per volume, against an ino-1 hotspot §6.5 item 3 measures as saturating at ~4,550 clients; **S6** moves it onto lease-based liveness.
+- **Knob:** `SQUEEZEFS_CLUSTER_WIRE_SVC_THREADS` (registered per ENG-10, derived `clamp(cpus/8, 1, 8)`, clamped to the core count). The listener family deliberately keeps its `SQUEEZEFS_JOB_WIRE_*` spelling — same listener, and docs/evidence key on it.
+
+### The RTT row — the number that prices S8 (ruling D10's input)
+
+Loopback **floor**, qd1, engagement exact: **9.33 µs** median at 0 B (2,000 samples), 12.58 µs at 5,000, **31.94 µs** at 4 KiB. Substituted into §6.5 item 1's own formula:
+
+| Added RTT | Create throughput | Cost |
+|---|---|---|
+| 11 µs (this floor) | 9,090 → 8,264/s | **~9 %** |
+| 50 µs | — | 31 % |
+| 150 µs | — | 58 % |
+| 250 µs (§6.5's figure) | 9,090 → 2,778/s | 69 % |
+
+**Verdict: the wire's own overhead is not what decides S8 — the fabric is.** R1's fallback statement ("remote clients are throughput-oriented; latency-sensitive metadata work runs on the owner") becomes correct somewhere between the 50 and 150 µs rows. No fabric number is fabricated: the instrument ships in-tree (`cluster_wire::measure_rtt`, plus an `--ignored` harness that authenticates as any peer does), and the evidence note enumerates what the real row needs — two real hosts on the production NIC, both channel classes, medians of 3, A-B-B-A, a sustained ≥ 60 s row, exact counter closure with `mac_failures == 0`, and a pipelined row for S10 to beat.
+
+---
+
 ## 3b. Deferred with a recorded rationale (not dropped)
 
 ### Peer-to-peer block fetch — deferred to post-S5, revisit with evidence

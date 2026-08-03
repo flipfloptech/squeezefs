@@ -599,6 +599,32 @@ Any client with storage access can enroll as a **remote worker** (`job worker`):
 
 Side effect to know about: while a WERO reservation stands (remote workers enrolled on a PR-capable data namespace), **hosts that are not registered participants are write-blocked by the device** until the job ends. On plaintext (non-TLS) wires the coordinator verify-reads 100 % of remote-written bytes before publishing (≈ 2× read cost on remote-moved data); TLS deployments sample instead.
 
+### Cluster wire (the one cluster transport)
+
+Cluster-internal RPC — the job-shard execution wire today, and the DLM's
+cross-mount traffic as those stages land — rides a single framed transport
+(`src/cluster_wire.rs`). It is deliberately **not** io_uring: it is a TLS/TCP
+network path, the documented exception in the io_uring policy. Every frame is
+length-prefixed, size-classed, and authenticated per frame
+(`HMAC-SHA256(session_key, direction ‖ sequence ‖ length ‖ body)`), so tamper,
+reorder, replay, and reflection are refused at the frame boundary rather than
+by the handler; enrollment proves storage membership against the volume set's
+`job:enroll` secret before a session key exists.
+
+Owner-side requests execute on **pinned service lanes** (`sqz-cluster-svc{n}`),
+never on the metadata commit conveyor's task — a remote peer must not be able
+to occupy the local commit path. One knob:
+
+| Knob | Default | Purpose |
+|---|---|---|
+| `SQUEEZEFS_CLUSTER_WIRE_SVC_THREADS` | derived `clamp(cpus/8, 1, 8)` | Owner-side RPC lane count. Absolute override (measurement lever); still clamped to the core count, so it cannot oversubscribe the box. |
+
+What decides cluster performance is the **fabric**, not this wire: on loopback
+at qd1 the authenticated round trip measures single-digit microseconds, while
+the same exchange across a real network costs tens to hundreds — and the
+metadata-op cost of a synchronous cross-mount hop scales with that number, not
+with framing. Plan cluster topology around round-trip latency first.
+
 ## Observability
 
 A mounted filesystem exposes live daemon metrics as JSON on the virtual **`.stats`** inode at the mount root (`cat <mountpoint>/.stats`) — the preferred live regression signal (layout mix, cache/tier counters, `meta_kv_*`, `writer_guard_*`, transport geometry, patch/fold ledgers, memory-budget level).

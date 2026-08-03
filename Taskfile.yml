@@ -141,10 +141,19 @@ tasks:
       # test/bench targets). Its own suite and its `file-lock` cfg sites
       # need their own leg.
       - task: check:fuse3
+      - task: check:docs
       # ENG-2: supply chain. Last so a dependency advisory does not mask a
       # code failure, but inside the same gate — the AGENTS.md Phase-5
       # "no known vulnerabilities" claim had no enforcement point before.
       - task: audit
+
+  check:docs:
+    desc: >-
+      The docs-class gate (AGENTS.md verification table): markdown
+      link/anchor check, no cargo. Seconds, offline — the whole gate for a
+      docs-only commit, and a cheap leg of the code-class gate.
+    cmds:
+      - tests/check_markdown_links.sh
 
   check:fuse3:
     desc: 'ENG-17: the excluded fuse3 fork''s own gate (its workspace, its lock)'

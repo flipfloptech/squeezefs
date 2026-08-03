@@ -1,0 +1,83 @@
+# Nightly tiers that are not per-PR work (ENG-7 + AGENTS.md test tiering).
+#
+# `audit` is the reason this file exists on a schedule: a new RUSTSEC
+# advisory lands without anyone touching the repo, so a supply-chain gate
+# that only runs on PRs goes stale the moment commits stop. The full gate
+# re-runs on `dev` for the same reason (a merge is green against the tree it
+# was tested on, not against a moved toolchain or advisory DB).
+#
+# What is deliberately NOT scheduled here: the bench baseline
+# (`tests/run_bench_baseline.sh` — SAME-BOX relative tripwire; it refuses
+# cross-box compares, hot CPUs and foreign cargo work, so a shared cloud
+# runner cannot produce a valid row), the external POSIX suites, the
+# NVMe-oF fidelity tier, and the scoreboard. Those are pinned-box tiers;
+# scheduling them on hosted runners would manufacture evidence.
+name: nightly
+
+on:
+  schedule:
+    # 04:17 UTC — off the hour, so it does not queue behind the fleet.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: cargo audit (both lockfiles)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show
+      - name: cargo-audit
+        run: command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
+      - name: go-task
+        run: |
+          command -v task go-task >/dev/null || \
+            sh -c "$(curl -fsSL https://taskfile.dev/install.sh)" -- -d -b ./bin
+          echo "$PWD/bin" >>"$GITHUB_PATH"
+      # `unmaintained` stays a warning by design (docs/rc-manifest.md §5
+      # adjudicates the current two); vulnerabilities, unsound and yanked
+      # fail the job.
+      - name: task audit
+        run: task audit
+
+  gate:
+    name: task check on dev
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      SQUEEZEFS_TEST_SKIP_LEDGER: ${{ github.workspace }}/target/skip-ledger.jsonl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libfuse3-dev fuse3 clang libclang-dev
+      - name: Toolchain
+        run: rustup show
+      - name: cargo-audit
+        run: command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
+      - name: go-task
+        run: |
+          command -v task go-task >/dev/null || \
+            sh -c "$(curl -fsSL https://taskfile.dev/install.sh)" -- -d -b ./bin
+          echo "$PWD/bin" >>"$GITHUB_PATH"
+      - name: task check
+        run: task check
+      - name: Upload skip ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skip-ledger-nightly
+          path: ${{ env.SQUEEZEFS_TEST_SKIP_LEDGER }}
+          if-no-files-found: ignore

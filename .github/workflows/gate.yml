@@ -1,0 +1,193 @@
+# The code-class gate (ENG-7, pre-RC engineering spec §10).
+#
+# Before this file existed the repo had NO CI configuration and the entire
+# gate regime — AGENTS.md's "Required verification gate" table, the tiering
+# rules, the audit mandate — was honor-system. This workflow runs exactly
+# the per-commit tier for code-class changes: `task check`, which is the
+# authoritative gate (clippy under BOTH feature configurations, fmt, the
+# full cargo suite at --test-threads=1, doc, criterion bench smoke, the
+# excluded fuse3 fork's own suite, and cargo audit).
+#
+# Deliberately NOT here, and why (AGENTS.md test tiering):
+#   * pjdfstests / LTP / fstests — the RELEASE gate, hours, root + a real
+#     mount. A per-PR run would re-confirm known failures for hours (user
+#     ruling 2026-07-20).
+#   * `tests/run_bench_baseline.sh` and every scoreboard/bracket rig —
+#     measurement, and a shared cloud runner cannot produce a valid row:
+#     the script itself refuses cross-box compares, hot CPUs and foreign
+#     cargo work. Those stay on the pinned box. Per-commit gets bench
+#     SMOKE only, which `task check` already runs.
+#   * The nightly fuzz tier — `.github/workflows/nightly.yml`.
+#
+# Note on features: `task check` runs `--all-features`, which compiles
+# `dhat-on` (jemalloc replaced — ENG-8). That is correct for a CORRECTNESS
+# gate and is exactly why no measurement runs here.
+name: gate
+
+on:
+  pull_request:
+    # Docs-only changes get the docs-class gate instead (docs.yml) — the
+    # AGENTS.md tier table, enforced rather than trusted.
+    paths-ignore:
+      - '**/*.md'
+  push:
+    branches: [dev, main]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+
+# A new push to a PR supersedes the previous run — the gate is minutes of
+# compute per run.
+concurrency:
+  group: gate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Every skip in the tree routes through squeezefs-testkit (spec §11
+  # TEST-2), which appends a JSON record here. On a runner without
+  # `fuse.enable_uring` the live-mount suites self-skip; this makes that
+  # visible in the job summary instead of a phantom green.
+  SQUEEZEFS_TEST_SKIP_LEDGER: ${{ github.workspace }}/target/skip-ledger.jsonl
+
+jobs:
+  check:
+    name: task check (cargo gate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # build.rs embeds the git commit identity; a shallow clone still
+          # carries HEAD, which is all it reads.
+          fetch-depth: 1
+
+      # AGENTS.md §Build: build-essential pkg-config libfuse3-dev fuse3
+      # clang libclang-dev. The build links FUSE 3 and will not compile
+      # without them.
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libfuse3-dev fuse3 clang libclang-dev
+
+      # rust-toolchain.toml (ENG-16) pins the channel and the components the
+      # gate needs; `rustup show` materializes it.
+      - name: Toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+          cargo clippy --version
+          cargo fmt --version
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/advisory-db
+            target
+            crates/fuse3/target
+          key: gate-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'crates/fuse3/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            gate-${{ runner.os }}-
+
+      # The documented bootstrap (README §Packaged builds with go-task) —
+      # never sudo system-wide, lands in ./bin.
+      - name: go-task
+        run: |
+          command -v task go-task >/dev/null || \
+            sh -c "$(curl -fsSL https://taskfile.dev/install.sh)" -- -d -b ./bin
+          echo "$PWD/bin" >>"$GITHUB_PATH"
+
+      # ENG-2: the gate's own audit line needs the binary present.
+      - name: cargo-audit
+        run: |
+          command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
+
+      # Recorded, not asserted: a hosted runner has /dev/fuse but no
+      # `fuse.enable_uring` (needs a 6.14+ kernel with the parameter), so
+      # the live-mount surface CANNOT execute here. The require-mount job
+      # below is where that surface is proved, on a runner that has it.
+      - name: Mount-surface posture (recorded)
+        run: |
+          {
+            echo '### Mount-surface posture'
+            echo
+            echo "| probe | value |"
+            echo "|---|---|"
+            echo "| /dev/fuse | $([ -e /dev/fuse ] && echo present || echo MISSING) |"
+            echo "| fuse.enable_uring | $(cat /sys/module/fuse/parameters/enable_uring 2>/dev/null || echo MISSING) |"
+            echo "| fusermount3 | $(command -v fusermount3 || echo MISSING) |"
+            echo "| fusectl | $([ -d /sys/fs/fuse/connections ] && echo mounted || echo MISSING) |"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: task check
+        run: task check
+
+      # The honest-degradation half of TEST-2: whatever declined to run is
+      # named in the summary and uploaded, so "gate green" is never read as
+      # "everything executed".
+      - name: Skip ledger
+        if: always()
+        run: |
+          ledger="$SQUEEZEFS_TEST_SKIP_LEDGER"
+          {
+            echo '### Skip ledger'
+            echo
+            if [ ! -s "$ledger" ]; then
+              echo 'EMPTY — no test declined to run.'
+            else
+              echo '```'
+              sed -n 's/.*"class":"\([^"]*\)".*/\1/p' "$ledger" | sort | uniq -c | sort -rn
+              echo '```'
+              if grep -q '"class":"mount"' "$ledger"; then
+                echo
+                echo '**This run carries NO live-mount evidence** — mount-class'
+                echo 'skips are present (expected on a hosted runner without'
+                echo '`fuse.enable_uring`). The live-mount surface is proved by the'
+                echo '`require-mount` job / `task check:require-mount` on a capable box.'
+              fi
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload skip ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skip-ledger
+          path: ${{ env.SQUEEZEFS_TEST_SKIP_LEDGER }}
+          if-no-files-found: ignore
+
+  require-mount:
+    name: task check:require-mount (live-mount surface)
+    # Runs ONLY where the mechanism exists. Set the repository variable
+    # SQZ_MOUNT_RUNNER to a self-hosted runner label with /dev/fuse,
+    # `fuse.enable_uring=Y` and fusermount3; without it this job is skipped
+    # and the check job's summary says the live-mount surface did not run —
+    # never a silent pass.
+    if: vars.SQZ_MOUNT_RUNNER != ''
+    needs: check
+    runs-on: ${{ vars.SQZ_MOUNT_RUNNER }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: task check:require-mount
+        run: |
+          command -v task go-task >/dev/null || \
+            sh -c "$(curl -fsSL https://taskfile.dev/install.sh)" -- -d -b ./bin
+          PATH="$PWD/bin:$PATH" task check:require-mount
+      - name: Upload skip ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skip-ledger-require-mount
+          path: target/skip-ledger.jsonl
+          if-no-files-found: ignore

@@ -1,0 +1,29 @@
+# The docs-class gate (ENG-7 + the AGENTS.md verification table).
+#
+# "Docs/markdown only ⇒ markdown link/anchor check only — no cargo gate"
+# has been the rule since 2026-07-18 (user directive: stop running full
+# test suites on doc-only changes). This is the enforcement point: seconds,
+# no toolchain, no network.
+name: docs
+
+on:
+  pull_request:
+    paths:
+      - '**/*.md'
+  push:
+    branches: [dev, main]
+    paths:
+      - '**/*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  links:
+    name: markdown link/anchor check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: tests/check_markdown_links.sh

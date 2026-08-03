@@ -748,6 +748,114 @@ async fn an_engaged_claim_set_records_every_writer_and_its_registrant_key() {
     be.shutdown().await.expect("clean shutdown");
 }
 
+/// The live membership half of item 7: a writer joins the SET at arm and
+/// withdraws at disarm, its **NVMe registrant key** travels with its entry
+/// (the device-side face of set membership), and every sibling's entry
+/// survives the change. On an un-engaged volume both calls write NOTHING —
+/// the byte-identity law enforced at the one place a mount would otherwise
+/// have created a record.
+#[tokio::test]
+async fn claim_set_membership_upserts_and_withdraws_one_member_at_a_time() {
+    let _serial = serial();
+    // Un-engaged first: both operations are silent no-ops.
+    let plain = formatted_volume().await;
+    let be = KvMetaBackend::open(plain.path())
+        .await
+        .expect("open volume");
+    let ident = |id: &str, key: u64| membership::MemberIdentity {
+        id: id.to_string(),
+        role: MemberRole::Writer,
+        pid: 7,
+        boot: "boot-test".into(),
+        endpoint: Some("10.0.0.7:7100".into()),
+        pr_key: key,
+    };
+    assert!(
+        !membership::upsert_writer_member(&be, &ident("w-1", 1), 4)
+            .await
+            .expect("un-engaged upsert must not error"),
+        "an un-stamped volume must record NOTHING (ruling D9 + byte identity)"
+    );
+    assert!(!membership::withdraw_writer_member(&be, "w-1")
+        .await
+        .expect("un-engaged withdraw"));
+    assert!(!be
+        .listxattr(1)
+        .await
+        .expect("listxattr")
+        .iter()
+        .any(|k| k == CLAIM_SET_XATTR));
+    be.shutdown().await.expect("clean shutdown");
+
+    // Engaged: two writers, each with its own registrant key.
+    let meta = formatted_volume().await;
+    sb::set_claim_set_bit(meta.path())
+        .await
+        .expect("stamp bit 12");
+    let be = KvMetaBackend::open(meta.path()).await.expect("open volume");
+    assert!(
+        membership::upsert_writer_member(&be, &ident("w-a", 0xaa), 5)
+            .await
+            .expect("engaged upsert")
+    );
+    assert!(
+        membership::upsert_writer_member(&be, &ident("w-b", 0xbb), 6)
+            .await
+            .expect("engaged upsert")
+    );
+    let set = ClaimSet::load(&be).await.expect("durable set");
+    assert!(set.durable);
+    assert_eq!(set.term, 6, "the set's era climbs with its members'");
+    assert_eq!(set.members.len(), 2, "the sibling entry survived");
+    let mut keys = set.registrant_keys();
+    keys.sort_unstable();
+    assert_eq!(keys, vec![0xaa, 0xbb]);
+
+    // An upsert of an EXISTING member replaces its entry, never duplicates.
+    assert!(
+        membership::upsert_writer_member(&be, &ident("w-a", 0xcc), 6)
+            .await
+            .expect("re-upsert")
+    );
+    let set = ClaimSet::load(&be).await.expect("durable set");
+    assert_eq!(set.members.len(), 2);
+    assert_eq!(
+        set.members
+            .iter()
+            .find(|m| m.identity.id == "w-a")
+            .expect("w-a")
+            .identity
+            .pr_key,
+        0xcc
+    );
+
+    // Withdrawal removes one member; the record disappears when the last
+    // one leaves, so a departed set presents as unclaimed.
+    assert!(membership::withdraw_writer_member(&be, "w-a")
+        .await
+        .expect("withdraw"));
+    assert!(!membership::withdraw_writer_member(&be, "w-a")
+        .await
+        .expect("second withdraw is a no-op"));
+    assert_eq!(
+        ClaimSet::load(&be).await.expect("set").members.len(),
+        1,
+        "w-b is still a member"
+    );
+    assert!(membership::withdraw_writer_member(&be, "w-b")
+        .await
+        .expect("withdraw the last member"));
+    assert!(
+        !be.listxattr(1)
+            .await
+            .expect("listxattr")
+            .iter()
+            .any(|k| k == CLAIM_SET_XATTR),
+        "the record is deleted when the set empties"
+    );
+    be.shutdown().await.expect("clean shutdown");
+}
+
 /// Bit 12 is single-bit, disjoint, and never stamped by a production
 /// format (ruling D9). The union clause lives in the two existing pins;
 /// this one is the local sanity face.

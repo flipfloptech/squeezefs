@@ -450,6 +450,22 @@ fn registry() -> &'static WeroRegistry {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The reservation key of the process's live WERO hold, when it has one
+/// (`None` = detection grade). DLM **S6** records it in the §6.2 item-7
+/// claim set, which is how a set's membership names its DEVICE-side
+/// registrants; it is deliberately a READ of the standing hold, never a
+/// second acquire (a second reservation would conflict at the device and
+/// silently downgrade the guarantee class — the join-never-fork law).
+pub fn live_wero_key() -> Option<u64> {
+    registry()
+        .lock()
+        .unwrap()
+        .values()
+        .filter_map(Weak::upgrade)
+        .map(|inner| inner.key)
+        .next()
+}
+
 /// The process's guarantee class for the data plane: `pr` while a WERO
 /// hold stands on a data-namespace set, else `detection` (the local
 /// custody-epoch fence only). The `data_plane_fence_mode` gauge's word

@@ -380,6 +380,73 @@ impl ClaimSet {
     }
 }
 
+/// Record `identity` as a member of `be`'s claim set (§6.2 **item 7**),
+/// preserving every other member's entry — ONE commit per membership
+/// CHANGE, never per beat.
+///
+/// Returns `false` (and writes NOTHING) on a volume that does not carry
+/// incompat bit 12, which is every volume today (ruling D9). That is the
+/// single-writer byte-identity law in the one place a mount would otherwise
+/// have created a new record: the projection of `writer_claim` stays the
+/// whole truth, and `listxattr(1)` gains nothing.
+pub async fn upsert_writer_member(
+    be: &KvMetaBackend,
+    identity: &MemberIdentity,
+    term: u64,
+) -> Result<bool> {
+    if !claim_set_engaged(be.superblock().features_incompat) {
+        return Ok(false);
+    }
+    let mut set = match be.getxattr(1, CLAIM_SET_XATTR).await {
+        Ok(Some(raw)) => ClaimSet::decode(&raw).unwrap_or_else(|| ClaimSet::empty(term)),
+        _ => ClaimSet::empty(term),
+    };
+    set.term = set.term.max(term);
+    set.members.retain(|m| m.identity.id != identity.id);
+    set.members.push(ClaimSetMember {
+        identity: identity.clone(),
+        ts: unix_now_secs(),
+    });
+    set.members
+        .sort_by(|a, b| a.identity.id.cmp(&b.identity.id));
+    ClaimSet::store(be, &set).await?;
+    log::info!(
+        "claim set on {}: writer '{}' is a durable member in term {} ({} member(s),          registrant key {:#x}) — §6.2 item 7",
+        be.device_path().display(),
+        identity.id,
+        set.term,
+        set.members.len(),
+        identity.pr_key
+    );
+    Ok(true)
+}
+
+/// Remove a writer from `be`'s claim set (clean departure), deleting the
+/// record once it empties so a departed set presents as unclaimed. `false`
+/// = nothing to do (un-engaged volume, or not a member).
+pub async fn withdraw_writer_member(be: &KvMetaBackend, id: &str) -> Result<bool> {
+    if !claim_set_engaged(be.superblock().features_incompat) {
+        return Ok(false);
+    }
+    let Ok(Some(raw)) = be.getxattr(1, CLAIM_SET_XATTR).await else {
+        return Ok(false);
+    };
+    let Some(mut set) = ClaimSet::decode(&raw) else {
+        return Ok(false);
+    };
+    let before = set.members.len();
+    set.members.retain(|m| m.identity.id != id);
+    if set.members.len() == before {
+        return Ok(false);
+    }
+    if set.members.is_empty() {
+        ClaimSet::clear(be).await?;
+    } else {
+        ClaimSet::store(be, &set).await?;
+    }
+    Ok(true)
+}
+
 /// `true` ⇔ this volume's format expresses a claim SET (incompat bit 12).
 /// Every volume today answers `false` — ruling **D9**: the bit is built,
 /// nothing stamps it.
@@ -1527,6 +1594,8 @@ pub fn resolve_bind() -> Result<MembershipBind> {
 pub struct MembershipArm {
     plane: Option<Arc<crate::membership_wire::MembershipPlane>>,
     volumes: Vec<Arc<KvMetaBackend>>,
+    /// The OWNER's identity — the claim-set entry to withdraw at disarm.
+    owner_id: Option<String>,
     stop: Arc<AtomicBool>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     mode: &'static str,
@@ -1558,6 +1627,14 @@ impl MembershipArm {
             plane.shutdown();
         }
         for be in self.volumes.iter().filter(|_| owner) {
+            if let Some(id) = self.owner_id.as_deref() {
+                if let Err(e) = withdraw_writer_member(be, id).await {
+                    log::warn!(
+                        "membership: could not withdraw writer '{id}' from the claim set on                          {}: {e} (a stale member entry classifies by its own liveness, so                          this is honest residue rather than a lie)",
+                        be.device_path().display()
+                    );
+                }
+            }
             if let Err(e) = clear_owner_record(be).await {
                 log::warn!(
                     "membership: could not remove the rendezvous record from {}: {e} (a stale \
@@ -1693,6 +1770,19 @@ async fn arm_owner(
         pid: std::process::id(),
         boot: crate::meta_backend::kv::backend::read_boot_id(),
     };
+    // §6.2 item 7's identity half: this writer joins the claim SET, with
+    // its DEVICE-side registrant key read from S7's STANDING hold — joined,
+    // never a second acquire (a second reservation would conflict at the
+    // device and silently downgrade the guarantee class). A no-op on every
+    // volume without incompat bit 12, which is all of them today (D9).
+    let identity = MemberIdentity {
+        id: id.clone(),
+        role: MemberRole::Writer,
+        pid: std::process::id(),
+        boot: rec.boot.clone(),
+        endpoint: Some(endpoint.clone()),
+        pr_key: crate::data_custody::live_wero_key().unwrap_or(0),
+    };
     let mut expected: Vec<String> = Vec::new();
     for be in &volumes {
         publish_owner_record(be, &rec).await?;
@@ -1703,6 +1793,7 @@ async fn arm_owner(
                 }
             }
         }
+        upsert_writer_member(be, &identity, term).await?;
     }
     expected.sort();
     expected.dedup();
@@ -1748,6 +1839,7 @@ async fn arm_owner(
     Ok(Some(MembershipArm {
         plane: Some(plane),
         volumes,
+        owner_id: Some(id),
         stop,
         tasks: vec![sweep],
         mode: "owner",
@@ -1830,6 +1922,7 @@ async fn arm_member(
         // A member owns no durable record, so it has nothing to clear at
         // disarm — and must never remove the OWNER's.
         volumes: Vec::new(),
+        owner_id: None,
         stop,
         tasks: vec![task],
         mode: "member",

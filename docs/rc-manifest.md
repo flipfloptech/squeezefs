@@ -439,6 +439,31 @@ Loopback **floor**, qd1, engagement exact: **9.33 µs** median at 0 B (2,000 sam
 
 ---
 
+## 3d. Latent same-class flags from the known-red fixes (report-only, tracked)
+
+The §3c fixes flagged three populations of the same classes, green today by
+luck rather than design — recorded so they are chosen work, not surprises:
+
+1. **Env-leak into the DUR-8e fallback**: `crypto_incompressible_tests.rs:720`
+   and `crypto_block_framing_tests.rs:260,292` decode through directly-built,
+   never-installed `CryptoCompressState`s in binaries whose siblings set
+   `SQUEEZEFS_DEFAULT_BLOCK_SIZE` per fixture. A new sub-96 KiB fixture landing
+   earlier in either file reintroduces the exact writeback red. The one-line
+   `init_scratch_pool` fix applies.
+2. **A product-side process-global wearing a config costume**: `config_ops.rs:971`,
+   `defrag.rs:598`, `fsck.rs:5532` use `std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", …)`
+   as a runtime channel. Latent, not live (the shipped CLI is one-verb-one-process
+   and every mount pins its crypto bound via `set_crypto`) — but two
+   different-block-size volume sets in ONE process would fight over it.
+   Registry-style cleanup owed.
+3. **Immediate-assert-after-read sites racing PERF-11's deferred publish**:
+   `reused_key_stale_fill_tests.rs:643,684`, `hot_block_tier_tests.rs:443` —
+   latent flakes of the exact mem_budget class if their fills ride the >64 KiB
+   deferred path. The poll-first pattern (`hot_block_tier_tests.rs:591`) is the
+   fix template.
+
+---
+
 ## 4. Declared deviations (carry into user-facing docs)
 
 | Deviation | Rationale | Reference |

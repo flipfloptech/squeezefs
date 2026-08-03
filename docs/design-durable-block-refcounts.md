@@ -283,13 +283,27 @@ bit-7 (`KV_DURABLE_TERM`) pattern, not bit 6's presence-required one.
 
 | Volume | This binary | An older binary |
 |---|---|---|
-| **fresh format** (bit 8 set by `SuperblockV3::plan`, empty root minted by the builder) | durable accounting engaged; no mount walk | **refuses loud** — the bit intersects no prior `FEATURES_INCOMPAT_KNOWN` mask |
-| **un-stamped** (formatted before the bit existed) | derived walk, byte-identical to pre-item-1 behavior; no tree; no record ever staged; **sector 0 untouched by mount** | mounts exactly as before |
+| **fresh format** (bit 8 **NOT** set — `SuperblockV3::plan` deliberately omits it, ruling D9) | derived walk, byte-identical to pre-item-1 behavior; no tree; no record ever staged | mounts exactly as before |
+| **un-stamped** (formatted before the bit existed — the same on-disk shape as a fresh format) | as above; **sector 0 untouched by mount** | mounts exactly as before |
 | **stamped later** (`set_block_refcounts_bit`, Phase 8) | first *writable* mount mints the missing root; the empty ledger declines, the derived walk runs once, and the backfill persists it (§6.1) — after which the walk is never paid again | refuses loud |
 | **read-only mount** (unknown-ro bits) | never mints, never accounts — degrades to the derived walk | unchanged |
 
-Mount **never** stamps. `set_block_refcounts_bit` is the explicit upgrade
-path and requires the volume offline (the caller holds the D0 guard).
+**Nothing stamps it today** — not mount, and not `plan` either.
+`set_block_refcounts_bit` is the sole stamping path and requires the volume
+offline (the caller holds the D0 guard).
+
+**Why `plan` omits it, which is a safety property and not only D9
+discipline.** The durable ledger is only as complete as the set of write-path
+sites that stage into it (§11). While that wiring is incomplete, a
+partially-populated ledger is the *dangerous* state — not the empty one: it
+is NON-empty, so §6.1's "an empty population is never authoritative" rule
+does not fire, and every reference an unwired site failed to stage reads back
+as a free block, which `recover_block` then hands to the next writer. That is
+the one-offset-two-owners failure this structure exists to prevent, arriving
+through the upgrade path instead of the multi-writer path. Derived accounting
+has no such mode: it re-reads the layouts, which are always complete.
+Re-adding the bit to `plan` is gated on the oracle running clean across the
+write-path suites.
 Stamp-then-crash is inert: the bit gates no silently-misdecoded record — an
 older binary refuses the volume outright, and the tree root and records only
 ever come from a mount that saw the bit. Root minting is itself idempotent
@@ -297,9 +311,11 @@ across a crash, because the claimed extent's bitmap bit only becomes durable
 at a checkpoint, and the mint happens **before** journal replay so any
 in-window accounting record folds into the fresh root by key.
 
-Pinned by `unstamped_volume_is_unchanged_by_mount_and_stays_derived` (sector-0
-byte comparison across a real mount + publish) and
-`stamping_the_bit_engages_accounting_on_the_next_mount`.
+Pinned by `a_fresh_format_does_not_carry_bit8_and_mounts_derived` (the format
+boundary), `unstamped_volume_is_unchanged_by_mount_and_stays_derived`
+(sector-0 byte comparison across a real mount + publish),
+`stamping_the_bit_engages_accounting_on_the_next_mount`, and
+`stamping_a_non_empty_volume_backfills_instead_of_freeing_live_blocks`.
 
 ---
 

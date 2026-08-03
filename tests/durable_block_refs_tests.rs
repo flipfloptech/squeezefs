@@ -83,10 +83,27 @@ struct Rig {
     _staging: TempDir,
 }
 
+/// Format a v3 meta volume the way `squeezefs format` does today —
+/// **without** incompat bit 8 (ruling D9: build the bit, do not stamp it).
+/// A volume formatted this way mounts with DERIVED block accounting.
 async fn format_meta(path: &std::path::Path) {
     format_v3(path, META_LEN, &opts())
         .await
         .expect("format v3 meta volume");
+}
+
+/// [`format_meta`] plus the Phase-8 stamp — the on-disk state every leg
+/// that exercises the DURABLE machinery needs. Stamping an empty volume is
+/// the trivially safe case (the backfill hazard is
+/// `stamping_a_non_empty_volume_backfills_instead_of_freeing_live_blocks`);
+/// the first mount mints the missing root.
+async fn format_meta_stamped(path: &std::path::Path) {
+    format_meta(path).await;
+    assert!(
+        set_block_refcounts_bit(path).await.expect("stamp bit 8"),
+        "a fresh format must NOT already carry bit 8 — the stamp is the \
+         Phase-8 window's act, not format's"
+    );
 }
 
 async fn mount(meta: &std::path::Path, data: &std::path::Path) -> Rig {
@@ -206,21 +223,31 @@ impl Rig {
 // 1. The compatibility matrix (ruling D9: built, NOT stamped).
 // ---------------------------------------------------------------------------
 
-/// A fresh format carries bit 8 and an (empty) block-reference tree root,
-/// so no mount ever has to structurally mutate a volume to start
-/// accounting.
+/// **Ruling D9, at the format boundary**: a fresh format must NOT carry
+/// bit 8, and must mount with DERIVED accounting.
+///
+/// This is a safety property, not only discipline. The durable ledger is
+/// only as complete as the set of write-path sites that stage into it, and
+/// while that wiring is incomplete a partially-populated ledger is the
+/// DANGEROUS state — it is non-empty, so the "an empty population is never
+/// authoritative" rule does not fire, and every reference an unwired site
+/// failed to stage reads back as a free block, which `recover_block` then
+/// hands to the next writer. Derived accounting cannot fail that way: it
+/// re-reads the layouts, which are always complete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fresh_format_carries_bit8_and_a_block_ref_root() {
+async fn a_fresh_format_does_not_carry_bit8_and_mounts_derived() {
     let meta = NamedTempFile::new().unwrap();
     format_meta(meta.path()).await;
 
     let VolumeFormat::V3(sb) = classify_volume(meta.path()).await.unwrap() else {
         panic!("expected v3");
     };
-    assert_ne!(
+    assert_eq!(
         sb.features_incompat & FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS,
         0,
-        "a fresh format must carry incompat bit 8"
+        "format must not stamp bit 8 — the batched Phase-8 reformat window owns \
+         that act (ruling D9), and a fresh format mounting derived is what keeps a \
+         partially-wired ledger from ever being trusted"
     );
     assert_eq!(
         FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS,
@@ -236,16 +263,25 @@ async fn fresh_format_carries_bit8_and_a_block_ref_root() {
 
     let kv = KvMetaBackend::open(meta.path()).await.expect("mount");
     assert!(
-        kv.block_refs_engaged(),
-        "a bit-8 volume mounts with durable accounting engaged"
+        !kv.block_refs_engaged(),
+        "a fresh format mounts with DERIVED accounting — no tree, no records"
     );
+    kv.shutdown().await.unwrap();
+
+    // …and the stamp is what engages it, on an EMPTY volume (the trivially
+    // safe case; the non-empty one is the backfill leg below).
+    format_meta_stamped(meta.path()).await;
+    let kv = KvMetaBackend::open(meta.path())
+        .await
+        .expect("mount post-stamp");
+    assert!(kv.block_refs_engaged(), "the stamp engages the machinery");
     assert_eq!(
         kv.block_ref_scan(block_refs::volume_tag(DATA_VOL_ID))
             .await
             .unwrap()
             .len(),
         0,
-        "a fresh volume references no blocks"
+        "an empty volume references no blocks"
     );
     kv.shutdown().await.unwrap();
 }
@@ -257,14 +293,8 @@ async fn fresh_format_carries_bit8_and_a_block_ref_root() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unstamped_volume_is_unchanged_by_mount_and_stays_derived() {
     let meta = NamedTempFile::new().unwrap();
+    // No stripping needed: today's `format` IS the un-stamped shape (D9).
     format_meta(meta.path()).await;
-
-    // Strip bit 8 — the on-disk shape of a pre-item-1 volume.
-    let VolumeFormat::V3(mut sb) = classify_volume(meta.path()).await.unwrap() else {
-        panic!("expected v3");
-    };
-    sb.features_incompat &= !FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS;
-    write_superblock_v3(meta.path(), &sb).await.unwrap();
 
     let before = std::fs::read(meta.path()).unwrap()[..4096].to_vec();
 
@@ -315,12 +345,6 @@ async fn unstamped_volume_is_unchanged_by_mount_and_stays_derived() {
 async fn stamping_the_bit_engages_accounting_on_the_next_mount() {
     let meta = NamedTempFile::new().unwrap();
     format_meta(meta.path()).await;
-    let VolumeFormat::V3(mut sb) = classify_volume(meta.path()).await.unwrap() else {
-        panic!("expected v3");
-    };
-    sb.features_incompat &= !FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS;
-    write_superblock_v3(meta.path(), &sb).await.unwrap();
-
     assert!(
         set_block_refcounts_bit(meta.path()).await.unwrap(),
         "stamping a fresh bit reports the write"
@@ -359,7 +383,7 @@ async fn stamping_the_bit_engages_accounting_on_the_next_mount() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_refs_survive_a_crash_and_equal_the_derived_answer() {
     let meta = NamedTempFile::new().unwrap();
-    format_meta(meta.path()).await;
+    format_meta_stamped(meta.path()).await;
     let data = data_file();
 
     let (ino, offsets) = {
@@ -433,7 +457,7 @@ async fn durable_refs_survive_a_crash_and_equal_the_derived_answer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_clone_records_durable_refcount_two_and_survives_remount() {
     let meta = NamedTempFile::new().unwrap();
-    format_meta(meta.path()).await;
+    format_meta_stamped(meta.path()).await;
     let data = data_file();
 
     let offset = {
@@ -510,7 +534,7 @@ async fn a_clone_records_durable_refcount_two_and_survives_remount() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crash_in_the_free_window_neither_leaks_nor_double_frees() {
     let meta = NamedTempFile::new().unwrap();
-    format_meta(meta.path()).await;
+    format_meta_stamped(meta.path()).await;
     let data = data_file();
 
     // --- Half 1: the durable Delete landed. -----------------------------
@@ -581,7 +605,7 @@ async fn a_crash_in_the_free_window_neither_leaks_nor_double_frees() {
 
     // --- Half 2: the crash preceded the release commit. -----------------
     let meta2 = NamedTempFile::new().unwrap();
-    format_meta(meta2.path()).await;
+    format_meta_stamped(meta2.path()).await;
     let data2 = data_file();
     let pinned = {
         let rig = mount(meta2.path(), data2.path()).await;
@@ -632,7 +656,7 @@ async fn a_crash_in_the_free_window_neither_leaks_nor_double_frees() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_matches_derived_across_a_mixed_workload() {
     let meta = NamedTempFile::new().unwrap();
-    format_meta(meta.path()).await;
+    format_meta_stamped(meta.path()).await;
     let data = data_file();
     let rig = mount(meta.path(), data.path()).await;
 
@@ -748,14 +772,10 @@ async fn accounting_rides_the_publish_transaction_and_adds_no_commit() {
 
     const PUBLISHES: u32 = 8;
 
-    // Leg A: an UN-stamped volume — the pre-item-1 entry cost.
+    // Leg A: an UN-stamped volume (today's `format` default) — the
+    // pre-item-1 entry cost.
     let meta_a = NamedTempFile::new().unwrap();
     format_meta(meta_a.path()).await;
-    let VolumeFormat::V3(mut sb) = classify_volume(meta_a.path()).await.unwrap() else {
-        panic!("expected v3");
-    };
-    sb.features_incompat &= !FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS;
-    write_superblock_v3(meta_a.path(), &sb).await.unwrap();
     let data_a = data_file();
     let rig = mount(meta_a.path(), data_a.path()).await;
     let ino = rig.mk_file("entries_plain").await;
@@ -768,7 +788,7 @@ async fn accounting_rides_the_publish_transaction_and_adds_no_commit() {
 
     // Leg B: the same op sequence WITH durable accounting engaged.
     let meta_b = NamedTempFile::new().unwrap();
-    format_meta(meta_b.path()).await;
+    format_meta_stamped(meta_b.path()).await;
     let data_b = data_file();
     let rig = mount(meta_b.path(), data_b.path()).await;
     let ino = rig.mk_file("entries_accounted").await;
@@ -807,7 +827,7 @@ async fn accounting_rides_the_publish_transaction_and_adds_no_commit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_data_device_power_cut_leaves_ledger_and_layout_agreeing() {
     let meta = NamedTempFile::new().unwrap();
-    format_meta(meta.path()).await;
+    format_meta_stamped(meta.path()).await;
     let data = data_file();
     let data_path = data.path().to_str().unwrap().to_string();
 
@@ -858,7 +878,7 @@ async fn a_data_device_power_cut_leaves_ledger_and_layout_agreeing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_indirect_map_blob_carries_its_own_durable_reference() {
     let meta = NamedTempFile::new().unwrap();
-    format_meta(meta.path()).await;
+    format_meta_stamped(meta.path()).await;
     let data = data_file();
     let rig = mount(meta.path(), data.path()).await;
     let ino = rig.mk_file("blobbed").await;

@@ -233,14 +233,23 @@ pub const FEATURE_INCOMPAT_KV_PARTITIONED_APPEND: u64 = 1 << 8;
 /// as it did before the bit existed — the mount-time layout walk
 /// (`recover_active_blocks_v3`) rebuilds the RAM refcount map and free
 /// list, no fourth tree root is minted, no accounting record is ever
-/// staged, and the superblock is not rewritten. **Mount never stamps
-/// it**; fresh formats carry it from [`SuperblockV3::plan`], and
-/// [`set_block_refcounts_bit`] is the explicit upgrade path (the batched
-/// reformat window, execution plan Phase 8). Old binaries refuse a bit-8
-/// volume loud via [`FEATURES_INCOMPAT_KNOWN`] — exactly right: they
-/// would free blocks and run W1 sole-owner patches against accounting
-/// they never maintain, silently diverging the durable ledger from the
-/// layouts.
+/// staged, and the superblock is not rewritten.
+///
+/// **Nothing stamps it today** — not mount, and not
+/// [`SuperblockV3::plan`] either (ruling D9: build the bit, do not stamp
+/// it). [`set_block_refcounts_bit`] is the sole stamping path, for the
+/// batched Phase-8 reformat window. A fresh format therefore mounts
+/// DERIVED, which is the safe default while the write-path wiring is
+/// incomplete: a partially-populated ledger is NON-empty, so the
+/// "an empty population is never authoritative" rule does not fire, and
+/// every reference an unwired site failed to stage would read back as a
+/// free block. Derived accounting cannot fail that way — it re-reads the
+/// layouts, which are always complete.
+///
+/// Old binaries refuse a bit-9 volume loud via
+/// [`FEATURES_INCOMPAT_KNOWN`] — exactly right: they would free blocks
+/// and run W1 sole-owner patches against accounting they never maintain,
+/// silently diverging the durable ledger from the layouts.
 /// **Bit 9, not 8** — bit 8 is [`FEATURE_INCOMPAT_KV_PARTITIONED_APPEND`].
 /// Both were authored in parallel against the same free bit; partitioned
 /// append landed first, so durable block references took the next one.
@@ -392,17 +401,34 @@ impl SuperblockV3 {
         Ok(Self {
             node_size: node_size as u32,
             // Every fresh format is dynamic-routing (bit 6 — presence
-            // REQUIRED at decode, the NODE_SEQ_WATERMARK pattern),
-            // durable-term (bit 7) and durable-block-refcounts (bit 8) —
-            // both presence-OPTIONAL: pre-S2 / pre-item-1 volumes keep
-            // mounting era-less and derived-accounting until the batched
-            // reformat window stamps them (ruling D9); the stamp bits
-            // (2/4) ride the builder's stamped image path.
+            // REQUIRED at decode, the NODE_SEQ_WATERMARK pattern) and
+            // durable-term (bit 7 — presence OPTIONAL: pre-S2 volumes keep
+            // mounting era-less until the batched reformat window stamps
+            // them); the stamp bits (2/4) ride the builder's stamped image
+            // path.
+            //
+            // **Bit 8 (durable block refcounts) is deliberately NOT here**
+            // — ruling D9: build the bit, do not stamp it. A fresh format
+            // mounts with DERIVED block accounting, exactly like a bit-2/4
+            // volume, and [`set_block_refcounts_bit`] is the Phase-8
+            // upgrade path.
+            //
+            // This is a SAFETY property, not just discipline. The durable
+            // ledger is only as complete as the set of write-path sites
+            // that stage into it, and while that wiring is unfinished a
+            // partially-populated ledger is the dangerous state: it is
+            // NON-empty, so the "an empty population is never
+            // authoritative" rule does not fire, and every reference an
+            // unwired site failed to stage reads back as a FREE block —
+            // `recover_block` then hands live data to the next writer.
+            // Derived accounting has no such failure mode: it re-reads the
+            // layouts, which are always complete. Re-adding the bit here is
+            // gated on the oracle running clean across the write-path
+            // suites (docs/design-durable-block-refcounts.md §11).
             features_incompat: FEATURE_INCOMPAT_KV_V3
                 | FEATURE_INCOMPAT_NODE_SEQ_WATERMARK
                 | FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING
-                | FEATURE_INCOMPAT_KV_DURABLE_TERM
-                | FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS,
+                | FEATURE_INCOMPAT_KV_DURABLE_TERM,
             features_ro: 0,
             root_ledger,
             journal,

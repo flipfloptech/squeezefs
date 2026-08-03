@@ -461,12 +461,18 @@ impl ImageBuilder {
             next_node_seq: node_seq_base(self.cfg.uuid),
             nodes_written: 0,
         };
-        // Spec §6.2 item 1 (incompat bit 8): a fresh format carries the
-        // durable block-reference tree from birth — an EMPTY root, one
-        // node, minted here so no mount ever has to structurally mutate
-        // a volume just to start accounting. A volume without the bit
-        // gets no root and no tree (the un-stamped path stays
-        // byte-identical to pre-item-1 behavior).
+        // Spec §6.2 item 1 (incompat bit 8): the FORMAT-TIME half of the
+        // durable block-reference tree — an EMPTY root, one node, so a
+        // bit-8 image needs no structural mutation at first mount.
+        //
+        // Keyed on the decoded on-disk bit, and per ruling D9 nothing sets
+        // that bit at format today (`SuperblockV3::plan` deliberately
+        // omits it), so the branch is inert on every image this binary
+        // writes and the MOUNT-side mint is what runs. It stays because it
+        // is the correct format-time behavior for the bit — the Phase-8
+        // reformat window and the eventual `plan` re-add both land on it —
+        // and because a builder that silently produced a bit-8 image with
+        // no root would be a mount refusal, not a degradation.
         let block_refs =
             sb.features_incompat & super::superblock::FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS != 0;
         let mut planned: Vec<(u8, Vec<Record>)> = vec![

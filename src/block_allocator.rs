@@ -316,6 +316,12 @@ pub struct BlockAllocator {
     /// single-writer mount; the algorithm lives in `data_custody` so the
     /// law has one home.
     quarantine: crate::data_custody::BlockQuarantine,
+    /// Spec **§6.8 item 3** (`crate::free_grace`): this volume's
+    /// freed-offset **grace ring** — terminally-freed offsets held out of
+    /// the free list until every live reader has acknowledged passing
+    /// them. Untouched (one relaxed load) on every mount without a reader
+    /// plane, which is every mount by default.
+    grace: crate::free_grace::GraceRing,
 }
 
 /// One offset's incarnation state: the loom-verified seqlock word plus,
@@ -365,6 +371,7 @@ impl BlockAllocator {
             stamps_present: std::sync::atomic::AtomicBool::new(false),
             incarnation_minter: std::sync::OnceLock::new(),
             quarantine: crate::data_custody::BlockQuarantine::new(),
+            grace: crate::free_grace::GraceRing::derived(),
         })
     }
 
@@ -460,7 +467,16 @@ impl BlockAllocator {
         let released = self.quarantine.release(epoch);
         for (offset, free_pending) in &released {
             if *free_pending {
-                self.free_blocks.insert(offset / self.chunk_size);
+                // The drain proof clears the CUSTODY gate; the reader
+                // coherence gate (spec §6.8 item 3) is separate and still
+                // applies, so the publish routes through the grace period
+                // exactly as a fresh terminal free's does. Unarmed, this is
+                // the same free-list insert it always was.
+                if self.grace.defer(*offset, self.chunk_size) {
+                    self.harvest_grace();
+                } else {
+                    self.publish_free_list(*offset);
+                }
             }
         }
         if !released.is_empty() {
@@ -526,8 +542,17 @@ impl BlockAllocator {
     /// claim-from-free-list decides per offset whether anything issues).
     pub fn take_debt_batch(&self, max: usize) -> Vec<(u64, u64)> {
         let mut keys = Vec::new();
+        // Spec §6.8 item 3: an offset held in the grace period is not on
+        // the free list, so the trim's claim would LOSE and the taken debt
+        // entry would evaporate with a discard still owed. Leaving it in the
+        // tracker costs nothing (the trim venue is idle/pressure-driven and
+        // comes back) and keeps the debt ledger honest. One relaxed load
+        // when nothing is held.
+        let graced = !self.grace.is_empty();
         self.elided_debt.iter_sync(|k, _| {
-            keys.push(*k);
+            if !graced || !self.grace.holds(*k) {
+                keys.push(*k);
+            }
             keys.len() < max
         });
         let mut out = Vec::new();
@@ -709,7 +734,17 @@ impl BlockAllocator {
             let offset = idx * self.chunk_size;
             let tracked = self.refcounts.read_sync(&offset, |_, _| ()).is_some();
             let free_listed = self.free_blocks.contains(&idx);
-            if !tracked && !free_listed && !self.inflight_contains(offset) {
+            // Spec §6.8 item 3: an offset held in the grace period is
+            // untracked and deliberately not free-listed — its publish is
+            // OWED to the readers' acknowledgement. "Completing" its free
+            // here would both break the coherence promise and double-publish
+            // it at the next harvest, so the ring is an exemption exactly
+            // like the in-flight registry is.
+            if !tracked
+                && !free_listed
+                && !self.inflight_contains(offset)
+                && !self.grace.holds(offset)
+            {
                 self.free_blocks.insert(idx);
                 frees_completed += 1;
             } else if tracked && free_listed {
@@ -1125,6 +1160,25 @@ impl BlockAllocator {
         }
         let first = self.try_allocate_block();
         let Err(e) = first else { return first };
+        // Spec §6.8 item 3's pressure arm, BEFORE the reclaim valve's early
+        // exits: a store whose free list is entirely in the grace period is
+        // full only in the sense that its space is owed to readers. The
+        // pressure deadline (one honest acknowledgement cycle) is evaluated
+        // here — and if it has not expired the verdict STANDS: reallocating
+        // an offset a reader may still resolve serves another file's bytes,
+        // silently on a passthrough volume. ENOSPC is a bounded
+        // availability cost; this wait always ends by itself, because past
+        // the deadline the laggard is fenced.
+        if is_storage_full(&e) && !self.grace.is_empty() {
+            if self.harvest_grace_pressure() > 0 {
+                if let ok @ Ok(_) = self.try_allocate_block() {
+                    return ok;
+                }
+            }
+            if !self.grace.is_empty() {
+                crate::free_grace::note_alloc_stall(self.grace.len(), self.grace.bytes());
+            }
+        }
         if !is_storage_full(&e) || self.space_valve.get().is_none() {
             return Err(e);
         }
@@ -1192,6 +1246,11 @@ impl BlockAllocator {
     /// progress — so the loop is livelock-free and terminates when the
     /// list empties.
     fn try_allocate_block(&self) -> Result<u64> {
+        // Spec §6.8 item 3: acknowledged offsets re-enter the free list
+        // HERE, at the head of the funnel, so the existing free-list-first
+        // preference is unchanged and no allocation path can observe a
+        // released offset late. One relaxed load when nothing is held.
+        self.harvest_grace();
         loop {
             let Some(idx) = self.free_blocks.iter().next().map(|item| *item) else {
                 break;
@@ -1396,7 +1455,6 @@ impl BlockAllocator {
     /// Publish a [`Self::begin_free`]-retired offset for reuse. Only after
     /// this can `allocate_block` hand the offset to a new owner.
     pub fn finish_free(&self, offset: u64) {
-        let block_idx = offset / self.chunk_size;
         // DLM S7: a dead epoch's block must not become reallocatable when
         // its free completes — recovery, an fsck C2 repair or the
         // reclaimer finishing a queued free would otherwise hand it to a
@@ -1412,6 +1470,35 @@ impl BlockAllocator {
             );
             return;
         }
+        // Spec §6.8 item 3 — the freed-offset grace period. The two gates
+        // compose in ONE order: custody proof (S7, above) first, reader
+        // coherence second, because an offset the dead epoch may still DMA
+        // into must not become a reader's problem, and an offset a reader
+        // may still resolve must not become a new owner's. Unarmed (no
+        // reader plane — the shipped default) this is one relaxed load.
+        if self.grace.defer(offset, self.chunk_size) {
+            // The free COMPLETED — only its free-LIST publish waits on the
+            // acknowledgements, so the delete is counted here exactly as it
+            // would have been.
+            crate::fuse_client::METRICS
+                .del_obj
+                .fetch_add(1, Ordering::Relaxed);
+            self.harvest_grace();
+            return;
+        }
+        self.publish_free_list(offset);
+        log::debug!("finish_free: offset {offset}");
+        crate::fuse_client::METRICS
+            .del_obj
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The free list's ONE publish — the tail `finish_free` used to inline,
+    /// now shared with the two deferred paths (the §6.8 item-3 harvest and
+    /// S7's drain-proof release), so the double-free tripwire and the
+    /// free-forensics tape cover every arm identically.
+    fn publish_free_list(&self, offset: u64) {
+        let block_idx = offset / self.chunk_size;
         // FIND-RW5-A forensics (env-gated, diagnostic-only): record every
         // free's capture so a DOUBLE FREE names BOTH call sites.
         if free_forensics_enabled() {
@@ -1441,10 +1528,66 @@ impl BlockAllocator {
                 .block_double_frees
                 .fetch_add(1, Ordering::Relaxed);
         }
-        log::debug!("finish_free: offset {offset}");
-        crate::fuse_client::METRICS
-            .del_obj
-            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    // -----------------------------------------------------------------
+    // Spec §6.8 item 3 — the freed-offset grace period's allocator half
+    // (`crate::free_grace`; contracts in tests/reader_free_grace_tests.rs)
+    // -----------------------------------------------------------------
+
+    /// Release every acknowledged offset back to the free list — the
+    /// ROUTINE harvest, run at every terminal free and at the head of the
+    /// allocation funnel.
+    ///
+    /// Cost on a mount with no reader plane: one relaxed load
+    /// (`GraceRing::harvest` returns on an empty ring's published length).
+    #[inline]
+    fn harvest_grace(&self) {
+        for offset in self.grace.harvest(crate::free_grace::HARVEST_BATCH) {
+            self.publish_free_list(offset);
+        }
+    }
+
+    /// The PRESSURE harvest: what allocation runs when it is about to
+    /// refuse `StorageFull`. Same act, earlier deadline (one honest
+    /// acknowledgement cycle instead of the routine bound) — it never
+    /// releases an unacknowledged offset without evicting the member
+    /// responsible. Returns the number published.
+    fn harvest_grace_pressure(&self) -> usize {
+        let released = self
+            .grace
+            .harvest_pressure(crate::free_grace::HARVEST_BATCH);
+        let n = released.len();
+        for offset in released {
+            self.publish_free_list(offset);
+        }
+        n
+    }
+
+    /// Offsets this volume holds in the grace period (the stats/df face:
+    /// they are genuinely unavailable, so [`Self::get_used_blocks`] counts
+    /// them as used).
+    pub fn grace_len(&self) -> usize {
+        self.grace.len()
+    }
+
+    /// Device bytes this volume holds in the grace period.
+    pub fn grace_bytes(&self) -> u64 {
+        self.grace.bytes()
+    }
+
+    /// `true` ⇔ `offset` is held in this volume's grace period — the
+    /// exemption probe for every path that reconciles "untracked and not
+    /// free-listed" state (fsck C6, the elided-debt trim), and the
+    /// contract tests' invariant.
+    pub fn grace_holds(&self, offset: u64) -> bool {
+        self.grace.holds(offset)
+    }
+
+    /// The oldest held label (`None` = nothing held) — the deadline
+    /// instrument, and what an acknowledgement is measured against.
+    pub fn grace_oldest_label(&self) -> Option<u64> {
+        self.grace.oldest_label()
     }
 
     /// Release one reference and, when terminal, immediately publish the

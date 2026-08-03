@@ -7242,6 +7242,15 @@ impl SqueezefsFilesystem {
                     metrics.insert(k.clone(), v.clone());
                 }
             }
+            // Spec §6.8 item 3 (the freed-offset grace period): the same
+            // posture-first discipline — an un-armed mount exports
+            // `free_grace_mode: "off"` alone rather than a block of zeroes
+            // that would read like a plane that is armed and idle.
+            if let Some(gauges) = crate::free_grace::stats_snapshot().as_object() {
+                for (k, v) in gauges {
+                    metrics.insert(k.clone(), v.clone());
+                }
+            }
         }
 
         // PR K7 (design §10): format-scoped metric families (see has_v2 /

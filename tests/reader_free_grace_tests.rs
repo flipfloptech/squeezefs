@@ -177,7 +177,8 @@ async fn allocator(id: &str) -> Arc<BlockAllocator> {
 }
 
 fn free_listed(ba: &BlockAllocator, offset: u64) -> bool {
-    ba.free_block_indices().contains(&(offset / ba.chunk_size()))
+    ba.free_block_indices()
+        .contains(&(offset / ba.chunk_size()))
 }
 
 /// Acknowledge `label` for `id` on its renewal — the production channel
@@ -212,7 +213,10 @@ async fn an_unarmed_mount_publishes_frees_immediately_and_moves_no_gauge() {
     );
     assert_eq!(ba.grace_len(), 0, "nothing is held");
     let again = ba.allocate_block().await.expect("reallocate");
-    assert_eq!(again, first, "the free list serves the offset straight back");
+    assert_eq!(
+        again, first,
+        "the free list serves the offset straight back"
+    );
 
     assert_eq!(free_grace::deferrals(), 0);
     assert_eq!(free_grace::held_offsets(), 0);
@@ -265,10 +269,15 @@ async fn a_freed_offset_refuses_reallocation_until_the_reader_acknowledges() {
     }
     assert!(ba.allocate_block_below(1024).is_none());
     let above = ba.allocate_block_at_or_above(0).expect("ascending pick");
-    assert_ne!(above, victim, "the ascending pick handed out a graced offset");
+    assert_ne!(
+        above, victim,
+        "the ascending pick handed out a graced offset"
+    );
 
     // The acknowledgement — carried by the reader's renewal — releases it.
-    let label = ba.grace_oldest_label().expect("the held entry carries a label");
+    let label = ba
+        .grace_oldest_label()
+        .expect("the held entry carries a label");
     ack(&owner, "r-1", reader.epoch, label);
     assert!(free_grace::bound() >= label);
     let reused = ba.allocate_block().await.expect("allocate");
@@ -429,7 +438,11 @@ async fn space_pressure_refuses_enospc_and_never_releases_unacknowledged() {
         free_grace::alloc_stalls() > stalls0,
         "the stall is counted, not silent"
     );
-    assert_eq!(ba.grace_len(), 4, "pressure released nothing unacknowledged");
+    assert_eq!(
+        ba.grace_len(),
+        4,
+        "pressure released nothing unacknowledged"
+    );
     assert_eq!(free_grace::forced_releases(), 0);
 
     // Past the PRESSURE deadline — one ack cycle, well inside the routine
@@ -482,7 +495,10 @@ async fn grace_composes_with_the_reclaim_queue() {
         .await;
     assert_eq!(halted.drain_off_thread().await, 1, "the entry was consumed");
     assert_eq!(ba.grace_len(), 0, "no finish_free ⇒ no grace entry");
-    assert!(!free_listed(&ba, fenced_off), "no finish_free without reclaim");
+    assert!(
+        !free_listed(&ba, fenced_off),
+        "no finish_free without reclaim"
+    );
 
     // (b) A COMPLETED reclaim's finish_free defers into grace.
     let q = ReclaimQueue::from_env();
@@ -576,8 +592,9 @@ async fn the_ring_cap_forces_progress_through_the_fence() {
     let _reader = join(&owner, "r-cap", MemberRole::Reader);
     owner.refresh_free_grace_bound();
 
-    // A two-entry ring: the third deferral is at cap.
-    let ring = GraceRing::new(2);
+    // A three-entry ring, two entries in: below the cap and far inside
+    // both deadlines, so a routine harvest must release nothing.
+    let ring = GraceRing::new(3);
     assert!(ring.defer(0, 4096));
     assert!(ring.defer(4096, 4096));
     assert_eq!(ring.len(), 2);
@@ -587,15 +604,19 @@ async fn the_ring_cap_forces_progress_through_the_fence() {
     );
 
     assert!(ring.defer(8192, 4096));
-    // At cap, and far INSIDE both deadlines: the only honest way forward
-    // is the fence, so the fence happens and the oldest entries release.
+    // AT cap, still far inside both deadlines: the only honest way forward
+    // is the fence, so the fence happens and the entries release.
     let released = ring.harvest(64);
     assert!(
         !released.is_empty(),
         "an at-cap ring must force progress, not grow"
     );
-    assert!(ring.len() <= 2, "the cap holds: {} entries", ring.len());
-    assert_eq!(free_grace::laggard_fences(), 1, "progress came from a fence");
+    assert!(ring.len() < 3, "the cap holds: {} entries", ring.len());
+    assert_eq!(
+        free_grace::laggard_fences(),
+        1,
+        "progress came from a fence"
+    );
     assert!(free_grace::forced_releases() >= released.len() as u64);
 }
 
@@ -729,11 +750,12 @@ fn the_grace_bound_is_derived_and_an_unsafe_override_refuses() {
         free_grace::resolve_fence_bound_from(None, &clocks).expect("the derived default is safe"),
         cycle * 2
     );
-    // Explicit wins verbatim at or above one cycle...
-    let ok = cycle + Duration::from_millis(1);
+    // Explicit wins verbatim at or above one cycle (in whole ms — the
+    // knob's own unit).
+    let ok_ms = cycle.as_millis() as u64 + 1;
     assert_eq!(
-        free_grace::resolve_fence_bound_from(Some(ok.as_millis() as u64), &clocks).expect("safe"),
-        ok
+        free_grace::resolve_fence_bound_from(Some(ok_ms), &clocks).expect("safe"),
+        Duration::from_millis(ok_ms)
     );
     // ...and REFUSES below it, naming the numbers.
     let err = free_grace::resolve_fence_bound_from(Some(cycle.as_millis() as u64 / 2), &clocks)

@@ -95,9 +95,14 @@
 //! | name the laggards | [`MembershipOwner::members_behind_free_epoch`] |
 //! | "a reader that fails to acknowledge is fenced, not waited on" | [`MembershipOwner::evict`] |
 //!
-//! **This module does not implement item 3** — no allocator gate is wired
-//! to `min_acked_free_epoch` here. It makes item 3 expressible, and the
-//! table above is the contract it will consume.
+//! **Item 3 is BUILT and consumes exactly that table** — the gate itself
+//! lives in [`crate::free_grace`] (the ring, the bound, the fence and the
+//! reader's acknowledgement ladder) and is enforced at
+//! `BlockAllocator::finish_free` / the allocation funnel. This module owns
+//! only the channel: [`MembershipOwner::refresh_free_grace_bound`]
+//! publishes the reallocation bound on the owner's cadence, and
+//! [`MemberSession::learned_label`] hands the reader the causal label its
+//! acknowledgement echoes.
 
 use crate::cluster_wire::hex_decode;
 use crate::error::{Result, SqueezefsError};
@@ -1034,6 +1039,12 @@ impl MembershipOwner {
         let _ = self.members.remove_sync(&req.id);
         let _ = self.members.insert_sync(req.id.clone(), state);
         METRICS.membership_joins.fetch_add(1, Ordering::Relaxed);
+        // A fresh member acknowledges nothing yet, so the §6.8 item-3 bound
+        // must drop to 0 BEFORE it can serve a byte — publishing at the
+        // join (not at the next sweep) is what closes the window in which a
+        // brand-new reader's first cached bindings could be reallocated
+        // under it.
+        self.refresh_free_grace_bound();
         if reclaim {
             METRICS
                 .membership_grace_reclaims
@@ -1096,6 +1107,9 @@ impl MembershipOwner {
                 "membership: member '{id}' left cleanly (owner '{}')",
                 self.id
             );
+            // A departed reader holds nothing: its acknowledgement no
+            // longer bounds the writer's reallocation (§6.8 item 3).
+            self.refresh_free_grace_bound();
         }
         left
     }
@@ -1210,6 +1224,21 @@ impl MembershipOwner {
         }
     }
 
+    /// Publish [`Self::min_acked_free_epoch`] and the live member count to
+    /// the §6.8 item-3 gate ([`crate::free_grace`]) — the writer-side half
+    /// of the acknowledgement channel.
+    ///
+    /// Called at every membership CHANGE (join, clean leave, eviction) and
+    /// on the owner's sweep cadence, deliberately **not** per renewal: the
+    /// minimum is O(members), and at 15,000 members × 1,500 beats/s that
+    /// would be 22.5 M scans/s to learn something only a renewal can
+    /// change. The cadence's cost is that a released offset's residence
+    /// includes up to one renewal interval, which `free_grace::ack_cycle`
+    /// accounts for.
+    pub fn refresh_free_grace_bound(&self) {
+        crate::free_grace::publish_bound(self.min_acked_free_epoch(), self.len());
+    }
+
     /// The members that have NOT acknowledged `epoch` — item 3's laggard
     /// list, ordered so an operator sees a stable answer. "A reader that
     /// fails to acknowledge is fenced, not waited on": the fencing act is
@@ -1243,6 +1272,12 @@ impl MembershipOwner {
             self.id,
             st.epoch
         );
+        // An evicted member's acknowledgement stops bounding the writer —
+        // which is precisely what "fenced, not waited on" means for §6.8
+        // item 3. (A READER's dead epoch names no offsets: it allocated
+        // none. The cohort id is minted anyway so the two planes keep one
+        // vocabulary.)
+        self.refresh_free_grace_bound();
         Some(Eviction {
             id: id.to_string(),
             role: st.role,
@@ -1390,6 +1425,21 @@ pub struct MemberSession {
     t_self_deadline_ms: AtomicU64,
     renew_at_ms: AtomicU64,
     acked_free_epoch: AtomicU64,
+    /// §6.8 item 3: the causal LABEL the last grant carried — the owner's
+    /// own monotonic instant of that grant. A member never reads a foreign
+    /// clock as a deadline (§6.7's law, unchanged); it echoes this value
+    /// back once it has finished with everything freed at or before it, so
+    /// the comparison the writer performs is between two readings of ONE
+    /// clock.
+    learned_label: AtomicU64,
+    /// The member-clock instant at which that label was learned — the
+    /// anchor the acknowledgement ladder's qualification wait measures
+    /// from (its own clock, for its own durations).
+    learned_at_ms: AtomicU64,
+    /// The grant's `skew_max` / `D_purge`, kept so the ladder's two waits
+    /// are the plane's own numbers rather than a second derivation.
+    skew_max_ms: AtomicU64,
+    d_purge_ms: AtomicU64,
     fenced: AtomicBool,
     clock: LeaseClock,
 }
@@ -1411,6 +1461,10 @@ impl MemberSession {
             t_self_deadline_ms: AtomicU64::new(anchor_ms + grant.t_self_ms()),
             renew_at_ms: AtomicU64::new(anchor_ms + grant.renew_ms),
             acked_free_epoch: AtomicU64::new(0),
+            learned_label: AtomicU64::new(grant.granted_at_owner_ms),
+            learned_at_ms: AtomicU64::new(anchor_ms),
+            skew_max_ms: AtomicU64::new(grant.skew_max_ms),
+            d_purge_ms: AtomicU64::new(grant.d_purge_ms),
             fenced: AtomicBool::new(false),
             clock,
         };
@@ -1428,13 +1482,48 @@ impl MemberSession {
         s
     }
 
-    /// Re-anchor on a successful renewal.
+    /// Re-anchor on a successful renewal — including the §6.8 item-3 label
+    /// this grant carried (monotone: a label is never un-learned).
     pub fn renewed(&self, grant: &Grant, anchor_ms: u64) {
         self.epoch.store(grant.epoch, Ordering::Release);
         self.t_self_deadline_ms
             .store(anchor_ms + grant.t_self_ms(), Ordering::Release);
         self.renew_at_ms
             .store(anchor_ms + grant.renew_ms, Ordering::Release);
+        self.skew_max_ms.store(grant.skew_max_ms, Ordering::Release);
+        self.d_purge_ms.store(grant.d_purge_ms, Ordering::Release);
+        if grant.granted_at_owner_ms > self.learned_label.load(Ordering::Acquire) {
+            // Order matters: the anchor is published FIRST, so a ladder
+            // that observes the new label can never pair it with the old
+            // (earlier) anchor and qualify too soon.
+            self.learned_at_ms.store(anchor_ms, Ordering::Release);
+            self.learned_label
+                .store(grant.granted_at_owner_ms, Ordering::Release);
+        }
+    }
+
+    /// §6.8 item 3: the label last learned from the owner and the
+    /// member-clock instant it arrived — the acknowledgement ladder's two
+    /// inputs ([`crate::free_grace::ReaderAckLadder`]).
+    pub fn learned_label(&self) -> (u64, u64) {
+        let label = self.learned_label.load(Ordering::Acquire);
+        (label, self.learned_at_ms.load(Ordering::Acquire))
+    }
+
+    /// The grant's clock-skew bound, ms (the ladder's qualification term).
+    pub fn skew_max_ms(&self) -> u64 {
+        self.skew_max_ms.load(Ordering::Acquire)
+    }
+
+    /// The grant's `D_purge`, ms (the ladder's drain term).
+    pub fn d_purge_ms(&self) -> u64 {
+        self.d_purge_ms.load(Ordering::Acquire)
+    }
+
+    /// This member's own clock, in ms — the frame every wait above is
+    /// measured in.
+    pub fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
     }
 
     /// The member's identity.
@@ -1558,6 +1647,29 @@ pub fn uninstall() {
     INSTALLED.store(None);
 }
 
+/// The installed lease AUTHORITY, when this process is one — the §6.8
+/// item-3 gate's handle onto the plane (it asks for the bound and, past the
+/// grace bound, performs the eviction). `None` on a member and on an
+/// un-armed mount, which is what makes the gate structurally inert there.
+pub fn installed_owner() -> Option<Arc<MembershipOwner>> {
+    let guard = INSTALLED.load();
+    match guard.as_deref()? {
+        Installed::Owner(o) => Some(Arc::clone(o)),
+        Installed::Member(_) => None,
+    }
+}
+
+/// The installed member SESSION, when this process is one — the reader
+/// half of §6.8 item 3 (the label it echoes, and where the acknowledgement
+/// is deposited to ride the next renewal).
+pub fn installed_member() -> Option<Arc<MemberSession>> {
+    let guard = INSTALLED.load();
+    match guard.as_deref()? {
+        Installed::Member(s) => Some(Arc::clone(s)),
+        Installed::Owner(_) => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Arming at mount
 // ---------------------------------------------------------------------------
@@ -1630,6 +1742,12 @@ impl MembershipArm {
     pub async fn disarm(mut self) {
         self.stop.store(true, Ordering::Release);
         let owner = self.plane.is_some();
+        if owner {
+            // Spec §6.8 item 3: with no plane the bound is `u64::MAX`, so
+            // every offset still held in a grace ring is released by the
+            // next harvest — teardown strands nothing.
+            crate::free_grace::disarm_owner_plane();
+        }
         if let Some(plane) = self.plane.take() {
             plane.shutdown();
         }
@@ -1729,6 +1847,11 @@ async fn arm_owner(
     // than 22.5 ms per round trip must say so through
     // SQUEEZEFS_MEMBERSHIP_SKEW_MAX_MS.
     let clocks = LeaseClocks::derive(Duration::ZERO)?;
+    // The label clock: ONE instance, shared by the lease authority (which
+    // stamps every grant's `granted_at_owner_ms`) and the §6.8 item-3 gate
+    // (which stamps every freed offset). Two clocks would make labels and
+    // acknowledgements incomparable.
+    let clock = LeaseClock::monotonic();
     let term = crate::dlm::durable_term();
     // The predecessor's era, from its own durable evidence: the rendezvous
     // record it left behind (a crash) and the claim set (§6.2 item 7).
@@ -1744,13 +1867,7 @@ async fn arm_owner(
         }
     }
     let id = uuid::Uuid::new_v4().to_string();
-    let owner = MembershipOwner::arm(
-        &id,
-        term,
-        prior_term,
-        clocks.clone(),
-        LeaseClock::monotonic(),
-    )?;
+    let owner = MembershipOwner::arm(&id, term, prior_term, clocks.clone(), clock.clone())?;
     let plane = crate::membership_wire::MembershipPlane::start(
         crate::membership_wire::MembershipPlaneConfig::for_mount(
             bind_addr,
@@ -1812,6 +1929,12 @@ async fn arm_owner(
         owner.open_grace(expected);
     }
     install_owner(Arc::clone(&owner));
+    // Spec §6.8 item 3: arm the freed-offset grace period on the SAME
+    // clock, then publish the (empty) bound so the gate's armed word agrees
+    // with the census from the first instant. An unsafe grace bound refuses
+    // here, before a single offset is freed under it.
+    crate::free_grace::arm_owner_plane(clock, &clocks)?;
+    owner.refresh_free_grace_bound();
     let stop = Arc::new(AtomicBool::new(false));
     let sweep = {
         let owner = Arc::clone(&owner);
@@ -1835,6 +1958,12 @@ async fn arm_owner(
                         meta.volumes.len()
                     );
                 }
+                // Spec §6.8 item 3: republish the reallocation bound on the
+                // owner's cadence. This is the ONLY periodic recomputation
+                // of the minimum — renewals deliberately do not pay it (see
+                // `refresh_free_grace_bound`), which is why a released
+                // offset's residence includes one cadence.
+                owner.refresh_free_grace_bound();
                 // S3's must-stay-0 transport tripwires, surfaced on the
                 // plane's own cadence: a frame that failed authentication
                 // or a lane that refused a connection is a security or a

@@ -15,7 +15,7 @@
 //! |---|---|
 //! | 1 — the read-only mount mode | `KvMetaBackend::open_read_only`, `fuse_client::read_only_mount`, the allocator/reclaim gates |
 //! | **2 — node-cache revalidation** | [`crate::meta_backend::kv::revalidate`] (the epoch protocol, root adoption, the drop pass, the derived cadence) — **this module is its driver**: [`crate::ro_coherence::arm_reader_coherence`] declares each volume a reader, [`crate::ro_coherence::spawn_reader_revalidation`] is the task its deliberately task-less `RevalidationPoller` expects |
-//! | 3 — the freed-offset grace period | **not built** — see §Bounded-vs-eliminated below |
+//! | **3 — the freed-offset grace period** | [`crate::free_grace`] — the ring, the bound, the fence; this module drives the READER half ([`crate::ro_coherence::spawn_reader_revalidation`] emits the acknowledgement at the end of every purging pass) |
 //! | 4 — TTL alignment | [`crate::ro_coherence::reader_staleness_bound`] feeds `fuse_client::{KernelCacheTtls::read_only_defaults, reader_daemon_cache_ttl}` |
 //! | **5 — purge on revalidation** | [`crate::ro_coherence::ReaderEpochPurge`] — the `EpochPurgeSink` the mount installs; body [`crate::ro_coherence::purge_reader_block_keys`] |
 //! | 6 — reader-side data-plane lockdown | [`crate::ro_coherence::arm_reader_data_plane`] + the latch gates |
@@ -35,27 +35,36 @@
 //! # Bounded vs eliminated staleness (the honest statement — §6.12)
 //!
 //! The purge converts §6.3's *unbounded* cross-file staleness into
-//! staleness bounded by one poll interval: a reader can serve bytes it
-//! fetched at most one interval ago for an offset the writer has since
-//! freed and reallocated to a different file. It does not **eliminate**
-//! that window — eliminating it is §6.8 item 3, the freed-offset grace
-//! period, which is **NOT implemented**. Full assessment:
-//! `.benchmarks/2026-08-05-dlm-s5-readonly-mount.md` §4. The short version,
-//! because it is a structural finding rather than a scheduling choice: the
-//! spec's mechanism rides the `client:` heartbeat, and a reader **cannot
-//! write that record** — it is an xattr commit on ino 1 under an exclusive
-//! `I{1}` guard, i.e. a metadata write, which item 1 refuses by contract
-//! (and §6.5 pt 3 already measures that plane saturating at ~4,550
-//! clients). Item 3 therefore needs a reader→writer acknowledgement channel
-//! that is not a metadata write (S6 membership) plus a writer-side
-//! epoch-keyed quarantine between `begin_free` and `finish_free`. Its
-//! release condition did get cheaper this wave: durable block refcounts
-//! (§6.2 item 1) answer "is this block still referenced?" as a prefix
-//! population count instead of an inode-tree walk. On a transformed (AEAD)
-//! volume the window is loud (tag failure); on a passthrough volume — the
-//! default — it is silent. `docs/operations.md` states this to operators in
-//! those terms, and the RC guarantee table carries the row. Do not describe
-//! an S5 reader as "coherent" without the bound.
+//! staleness bounded by one poll interval. **Eliminating** that window is
+//! §6.8 item 3, the freed-offset grace period, and it is now BUILT
+//! ([`crate::free_grace`]): a terminally-freed offset does not re-enter the
+//! free list until every live registered reader has acknowledged passing
+//! it, so there is no instant at which a reader can resolve — or serve
+//! cached bytes for — an offset a different file already owns.
+//!
+//! **Two statements coexist, and both must be told correctly**, because the
+//! plane that carries the acknowledgements is opt-in
+//! (`SQUEEZEFS_MEMBERSHIP_BIND`, default `off` — ruling D11 defers the
+//! measurement that would justify a new default):
+//!
+//! * **Plane armed** (the writer serves membership and the reader joined):
+//!   the data window is **eliminated**, not merely bounded. Live proof is
+//!   `free_grace_mode == "armed"` on the writer's stats inode with
+//!   `free_grace_forced_releases == 0` — a forced release is the one arm
+//!   that trades a reader's coherence for the writer's progress, and it
+//!   only ever happens together with that reader's eviction.
+//! * **Plane off** (the shipped default): unchanged from S5 — the window is
+//!   bounded by one revalidation interval, loud on a transformed volume
+//!   (AEAD tag failure) and **silent on a passthrough volume**.
+//!
+//! Why the channel had to be S6 and not the spec's `client:` heartbeat: a
+//! reader **cannot write that record** — it is an xattr commit on ino 1
+//! under an exclusive `I{1}` guard, i.e. a metadata write, which item 1
+//! refuses by contract (and §6.5 pt 3 measures that plane saturating at
+//! ~4,550 clients anyway). Full pre-item-3 assessment:
+//! `.benchmarks/2026-08-05-dlm-s5-readonly-mount.md` §4. `docs/operations.md`
+//! states both postures to operators in these terms. Do not describe an S5
+//! reader as "coherent" without saying which of the two it is.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -279,20 +288,29 @@ pub fn spawn_reader_revalidation(
                     log::info!("reader revalidation stopping (dismount)");
                     return;
                 }
+                // Spec §6.8 item 3: the pass's START is what qualifies an
+                // acknowledgement (the ledger read must post-date the label
+                // by the staleness bound), so it is captured BEFORE the
+                // first volume is polled.
+                let pass_start = Instant::now();
+                let mut advanced_any = false;
                 for vol in &volumes {
-                    match poller.poll_at(vol, Instant::now()).await {
+                    match poller.poll_at(vol, pass_start).await {
                         // Not due yet (a wake arrived early) — nothing to do.
                         Ok(None) => {}
-                        Ok(Some(out)) if out.advanced => log::debug!(
-                            "reader revalidation: {} epoch {} → {} ({} node(s) dropped, {} \
-                         retained, {} block key(s) purged)",
-                            vol.device_path().display(),
-                            out.from_epoch,
-                            out.epoch,
-                            out.dropped,
-                            out.retained,
-                            out.keys_purged,
-                        ),
+                        Ok(Some(out)) if out.advanced => {
+                            advanced_any = true;
+                            log::debug!(
+                                "reader revalidation: {} epoch {} → {} ({} node(s) dropped, {} \
+                                 retained, {} block key(s) purged)",
+                                vol.device_path().display(),
+                                out.from_epoch,
+                                out.epoch,
+                                out.dropped,
+                                out.retained,
+                                out.keys_purged,
+                            );
+                        }
                         // The inert poll — the common case under an idle
                         // writer, and deliberately free (no drop, no purge).
                         Ok(Some(_)) => {}
@@ -303,7 +321,42 @@ pub fn spawn_reader_revalidation(
                         ),
                     }
                 }
+                // **Spec §6.8 item 3 — where the acknowledgement is
+                // emitted.** Right here, at the END of a pass, and only
+                // when that pass ran the R-6 purge (`advanced_any`): the
+                // ack means "I have FINISHED using anything freed at or
+                // before this label", so it may not be emitted before the
+                // purge that makes it true, nor before the drain window
+                // that lets pre-purge serves and daemon-cached layouts
+                // expire. `free_grace::reader_pass_completed` owns that
+                // ladder; the value then rides the next lease renewal, so
+                // the reader still writes nothing, anywhere. Inert on a
+                // mount that is not a plane member.
+                if let Some(label) = crate::free_grace::reader_pass_completed(
+                    reader_clock_ms(&pass_start),
+                    advanced_any,
+                ) {
+                    log::debug!(
+                        "reader acknowledged freed-offset label {label}: the writer may \
+                         reallocate everything it freed at or before it (spec §6.8 item 3)"
+                    );
+                }
             }
         },
     ))
+}
+
+/// The pass-start instant in the MEMBER's clock frame, in ms.
+///
+/// The ladder compares `pass_start` against `learned_at`, both of which are
+/// member-clock readings, so the conversion has to go through the session's
+/// own clock rather than a fresh `Instant` origin. A member-less mount has
+/// no frame to convert into and the answer is unused.
+fn reader_clock_ms(pass_start: &Instant) -> u64 {
+    match crate::membership::installed_member() {
+        Some(session) => session
+            .now_ms()
+            .saturating_sub(pass_start.elapsed().as_millis() as u64),
+        None => 0,
+    }
 }

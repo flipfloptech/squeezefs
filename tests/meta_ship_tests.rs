@@ -488,8 +488,21 @@ async fn every_shipped_verb_round_trips_against_an_in_process_owner() {
     assert_eq!(on_owner.ino, f.ino, "the create landed on the OWNER");
     assert_eq!((on_owner.uid, on_owner.gid), (5, 6));
 
-    // lookup (LookupDentry ⊕ Getattr) / getattr
+    // lookup (LookupDentry ⊕ Getattr) / getattr.
+    //
+    // Contract: when ONE owner holds both participants — the whole-set
+    // shape, and every single-volume set — a shipped `lookup` costs
+    // **one** round trip, not two. The decomposition exists for the
+    // cross-owner case; paying it always would double the latency of the
+    // hottest metadata verb (`make`, `ls -l`, every path walk) for a
+    // shape that cannot occur on the set it is executing against.
+    let rtt_before = ship::stats().dlm_rpcs_meta;
     assert_eq!(r.lookup(1, "shipped").await.expect("lookup").ino, f.ino);
+    assert_eq!(
+        ship::stats().dlm_rpcs_meta - rtt_before,
+        1,
+        "a same-owner lookup must resolve in ONE round trip"
+    );
     assert_eq!(r.getattr(f.ino).await.expect("getattr").mode, FILE);
     assert!(
         r.lookup(1, "absent").await.is_err(),
@@ -749,10 +762,19 @@ async fn a_batch_executes_in_submission_order() {
         Ok(MetaReply::Inode(i)) => i.ino,
         other => panic!("create returned {other:?}"),
     };
-    assert!(
-        matches!(&results[1].outcome, Ok(MetaReply::Ino(ino)) if *ino == created),
-        "the in-batch lookup must observe the earlier create: {:?}",
-        results[1].outcome
+    // `LookupDentry` answers with the resolved INODE when the owner also
+    // holds the child (the one-round-trip case) and with the child's ino
+    // when it does not (the client routes the getattr). Either shape must
+    // name the ino the earlier op in this batch created — that is the
+    // causality contract; which shape it is, is the routing contract.
+    let looked_up = match &results[1].outcome {
+        Ok(MetaReply::Inode(i)) => i.ino,
+        Ok(MetaReply::Ino(ino)) => *ino,
+        other => panic!("lookup_dentry returned {other:?}"),
+    };
+    assert_eq!(
+        looked_up, created,
+        "the in-batch lookup must observe the earlier create"
     );
     assert!(
         matches!(&results[2].outcome, Ok(MetaReply::Ino(ino)) if *ino == created),

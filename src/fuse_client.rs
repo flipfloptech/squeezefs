@@ -5814,6 +5814,16 @@ impl SqueezefsFilesystem {
             t_slots_overdue,
             t_replies_oversize,
         ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        // FUSE-3f: completion-queue loss. `transport_cq_overflows` is a
+        // must-stay-0 tripwire — a dropped CQE is a REGISTER or
+        // COMMIT_AND_FETCH completion that never arrives (a stalled ent,
+        // and for a COMMIT a request the kernel keeps in `waiting`).
+        // `transport_cq_nodrop` is the probed kernel capability (0 = a full
+        // CQ drops on the floor).
+        #[cfg(target_os = "linux")]
+        let (t_cq_overflows, t_cq_nodrop) = fuse3::transport_cq_overflow_stats();
+        #[cfg(not(target_os = "linux"))]
+        let (t_cq_overflows, t_cq_nodrop) = (0u64, 0u64);
         // D3.a (design-metadata-throughput §5.3/§9): COMMIT_AND_FETCH SQEs
         // per queue-worker ring flush. Mean batch (commits / flushes) ≈ 1
         // under storm load means the S2 submit batching regressed to
@@ -6416,6 +6426,10 @@ impl SqueezefsFilesystem {
                 "transport_ents_retired": t_ents_retired,
                 "transport_slots_overdue": t_slots_overdue,
                 "transport_replies_oversize": t_replies_oversize,
+                // FUSE-3f: see the gather site above.
+                // `transport_cq_overflows` must stay 0.
+                "transport_cq_overflows": t_cq_overflows,
+                "transport_cq_nodrop": t_cq_nodrop,
                 // Shim-parity 2026-07-28 (ingest-economy board item 2):
                 // dead-TPC-lane re-dispatches — 0 on a healthy daemon;
                 // any growth = a handler lane thread died and its

@@ -1361,6 +1361,78 @@ static TRANSPORT_ENTS_RETIRED: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_SLOTS_OVERDUE: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_REPLIES_OVERSIZE: AtomicU64 = AtomicU64::new(0);
 
+// FUSE-3f: completion-queue loss. `transport_cq_overflows` is a
+// must-stay-0 tripwire — a dropped CQE is a REGISTER or COMMIT_AND_FETCH
+// completion that never arrives, i.e. an ent stalled for the session's
+// life (and, for a COMMIT, a request the kernel keeps in `waiting`).
+// `transport_cq_nodrop` is the per-session capability probe (1 = this
+// kernel keeps overflowing completions in its internal list first).
+static TRANSPORT_CQ_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+static TRANSPORT_CQ_NODROP: AtomicU64 = AtomicU64::new(0);
+
+/// FUSE-3f gauges (stats inode): `(cq_overflows, cq_nodrop)`.
+///
+/// * `cq_overflows` — **must stay 0**: ring completions the kernel could
+///   not queue and dropped. The ring geometry (`cqsize = sq * 2` against a
+///   worst pass of `depth` commits + `depth` re-REGISTERs + 1 poll re-arm)
+///   is what makes this unreachable; this counter is what proves it,
+///   rather than assuming it.
+/// * `cq_nodrop` — `IORING_FEAT_NODROP` as probed on the queue rings
+///   (0 = a full CQ drops immediately; 1 = the kernel stores overflowing
+///   completions internally and the counter only moves when even that
+///   fails).
+pub fn transport_cq_overflow_stats() -> (u64, u64) {
+    (
+        TRANSPORT_CQ_OVERFLOWS.load(Ordering::Relaxed),
+        TRANSPORT_CQ_NODROP.load(Ordering::Relaxed),
+    )
+}
+
+/// FUSE-3f: publish the queue rings' `IORING_FEAT_NODROP` probe (called
+/// once per queue-ring build — the capability is a property of the kernel,
+/// so every queue agrees).
+fn note_cq_nodrop(nodrop: bool) {
+    TRANSPORT_CQ_NODROP.store(u64::from(nodrop), Ordering::Relaxed);
+}
+
+/// FUSE-3f: per-queue-worker watch over the ring's cumulative CQ-overflow
+/// counter, read after every `cq.sync()`.
+///
+/// The kernel's `cq_overflow` field counts completions it DROPPED (on a
+/// NODROP kernel it is only incremented when the internal overflow entry
+/// could not even be allocated — see `io_account_cq_overflow`), and it is
+/// written with plain stores, so the watch tracks a wrapping delta rather
+/// than an absolute.
+struct CqDropWatch {
+    last: u32,
+    nodrop: bool,
+}
+
+impl CqDropWatch {
+    fn new(nodrop: bool) -> Self {
+        note_cq_nodrop(nodrop);
+        Self { last: 0, nodrop }
+    }
+
+    /// Observe the ring's counter; returns the newly dropped completions
+    /// (0 in the healthy case) and charges them to the tripwire.
+    fn observe(&mut self, overflow: u32) -> u32 {
+        let new = overflow.wrapping_sub(self.last);
+        if new == 0 {
+            return 0;
+        }
+        self.last = overflow;
+        TRANSPORT_CQ_OVERFLOWS.fetch_add(u64::from(new), Ordering::Relaxed);
+        new
+    }
+
+    /// Whether this kernel keeps overflowing completions internally — the
+    /// interpretation half of a nonzero [`Self::observe`].
+    fn nodrop(&self) -> bool {
+        self.nodrop
+    }
+}
+
 /// FUSE-2 reply-integrity counters (stats inode):
 /// `(requests_failed_synthetic, requests_abandoned, replies_refused_stale,
 /// replies_dropped_no_slot, ents_retired, slots_overdue)`.
@@ -1393,6 +1465,86 @@ pub fn transport_reply_integrity_stats() -> (u64, u64, u64, u64, u64, u64, u64) 
         TRANSPORT_SLOTS_OVERDUE.load(Ordering::Relaxed),
         TRANSPORT_REPLIES_OVERSIZE.load(Ordering::Relaxed),
     )
+}
+
+/// Consume the queue eventfd's counter (nonblocking; the worker loop's
+/// own prelude uses the same drain). Shared by the loop and the FUSE-3j
+/// shutdown drain so both keep the drain→disarm→scan order the wake
+/// protocol is loom-verified under.
+fn drain_wake_eventfd(wake_fd: RawFd) {
+    let mut buf = [0u8; 8];
+    loop {
+        // SAFETY: an 8-byte read into a local buffer from the queue's
+        // eventfd (owned by the pool/arena for the worker's lifetime).
+        let n = unsafe { libc::read(wake_fd, buf.as_mut_ptr().cast(), 8) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+        if n == 0 {
+            break;
+        }
+    }
+}
+
+/// Block until the queue eventfd is readable or `timeout` expires.
+fn wait_wake_fd(wake_fd: RawFd, timeout: Duration) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: wake_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    // SAFETY: one valid pollfd; the fd outlives the call (pool/arena-owned).
+    let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+    rc > 0 && pfd.revents & libc::POLLIN != 0
+}
+
+/// FUSE-3j: the shutdown drain's TOTAL lease-wait budget for one queue
+/// (was `100 ms` per parked ent, serially — 3.2 s at depth 32). One
+/// bounded wait for the whole queue; expiry degrades to the header-only
+/// error reply, never to writing a leased payload region.
+const DRAIN_LEASE_BUDGET: Duration = Duration::from_millis(100);
+
+/// FUSE-3j: wait for the still-live payload leases of `waiting` (ent
+/// indices) to drop, **event-driven and on ONE shared budget**.
+///
+/// The retired shape slept `1 ms` up to `100 ms` PER ENT, in series: at
+/// depth 32 that is 3.2 s of teardown per queue, paid on every umount, for
+/// a signal the lease drop already delivers (`lease_release_and_wake`
+/// fires this exact eventfd whenever the last ref of a PARKED ent drops).
+///
+/// Order per pass is the loop's own drain→disarm→scan (wake_core protocol):
+/// consuming the eventfd and disarming the coalescer BEFORE the scan is
+/// what makes a release that races the scan either arm+write a wake this
+/// `poll` still sees, or become visible to the scan itself. `waiting`
+/// keeps exactly the ents that are still leased when the budget runs out —
+/// those get the header-only error reply (§5.4 forbids writing a leased
+/// payload region, at shutdown as much as anywhere else).
+fn drain_await_leases(
+    wake_fd: RawFd,
+    coalescer: &WakeCoalescer,
+    lease_states: &[Arc<EntLeaseState>],
+    waiting: &mut Vec<usize>,
+    budget: Duration,
+) {
+    let deadline = Instant::now() + budget;
+    loop {
+        drain_wake_eventfd(wake_fd);
+        coalescer.disarm();
+        waiting.retain(|&idx| !lease_states[idx].try_unpark());
+        if waiting.is_empty() {
+            return;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        wait_wake_fd(wake_fd, left);
+    }
 }
 
 /// FUSE-2 rows 2/3: a reply the session's reply task could no longer
@@ -2947,6 +3099,18 @@ fn queue_worker(
     // §5.3 D3.b: plain SQE128 ring by default; SQPOLL leader/attach
     // topology when the session knobs opted in (see `build_queue_ring`).
     let mut ring: Ring = build_queue_ring(sq_entries, qid, pool.sqpoll.as_ref(), &pool.active)?;
+    // FUSE-3f: probe the feature word ONCE per ring (portable-by-default:
+    // probe, never a kernel-version check) and watch the overflow counter
+    // after every `cq.sync()` below. A dropped completion is a REGISTER or
+    // COMMIT_AND_FETCH that never lands.
+    let mut cq_drops = CqDropWatch::new(ring.params().is_feature_nodrop());
+    if !cq_drops.nodrop() {
+        debug!(
+            "fuse-over-uring qid={qid}: kernel lacks IORING_FEAT_NODROP — a full              CQ drops completions (cqsize={}, worst pass {}); watching              transport_cq_overflows",
+            sq_entries * 2,
+            depth * 2 + 1
+        );
+    }
 
     ring.submitter()
         .register_files(&[pool.fuse_fd, wake_fd])
@@ -3150,23 +3314,7 @@ fn queue_worker(
         // already visible to the drains below — and any wake arriving AFTER
         // this drain leaves the counter nonzero, which completes the
         // (level-triggered) PollAdd the moment submit_and_wait arms it.
-        let mut buf = [0u8; 8];
-        loop {
-            let n = unsafe { libc::read(wake_fd, buf.as_mut_ptr().cast(), 8) };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::WouldBlock {
-                    break;
-                }
-                if e.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                break;
-            }
-            if n == 0 {
-                break;
-            }
-        }
+        drain_wake_eventfd(wake_fd);
         // L3 lever B — disarm the wake coalescer AT THIS POINT: after the
         // eventfd drain, before any producer-state scan below. Disarming
         // before the drain leaves the flag armed after the pass while the
@@ -3317,6 +3465,16 @@ fn queue_worker(
         let completed: Vec<(u64, i32, u32)> = {
             let mut cq = ring.completion();
             cq.sync();
+            // FUSE-3f: read the overflow counter with the same sync that
+            // publishes the tail — a dropped completion is invisible in the
+            // CQEs by definition, so this is the only place it can be seen.
+            let dropped = cq_drops.observe(cq.overflow());
+            if dropped > 0 {
+                error!(
+                    "fuse-over-uring qid={qid}: kernel DROPPED {dropped} completion(s)                      (CQ overflow, nodrop={}) — the ents they belonged to are stalled;                      transport_cq_overflows",
+                    cq_drops.nodrop()
+                );
+            }
             cq.map(|c| (c.user_data(), c.result(), c.flags())).collect()
         };
 
@@ -3809,17 +3967,35 @@ fn queue_worker(
         pool.active.load(Ordering::Relaxed)
     );
     let mut final_commits = 0;
-    for (msg, was_parked) in final_msgs {
+    // FUSE-3j: ONE bounded, event-driven wait for the whole queue. Publish
+    // `parked` for every message whose ent is still leased (that is what
+    // makes the lease drop fire this queue's eventfd — a message pulled
+    // straight off `commit_rx` was never parked), then wait for all of them
+    // together instead of sleep-polling each in series.
+    let mut final_msgs: Vec<(CommitMsg, bool)> = final_msgs;
+    let mut waiting: Vec<usize> = Vec::new();
+    for (msg, _) in final_msgs.iter() {
+        let idx = msg.ent_idx as usize;
+        if idx < ents.len() && lease_states[idx].try_commit() == CommitGate::Parked {
+            waiting.push(idx);
+        }
+    }
+    if !waiting.is_empty() {
+        drain_await_leases(
+            wake_fd,
+            &wake_coalescer,
+            &lease_states,
+            &mut waiting,
+            DRAIN_LEASE_BUDGET,
+        );
+    }
+    for (msg, was_parked) in final_msgs.drain(..) {
         let idx = msg.ent_idx as usize;
         if idx >= ents.len() {
             continue;
         }
-        let deadline = Instant::now() + Duration::from_millis(100);
-        let mut free = lease_states[idx].try_unpark();
-        while !free && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-            free = lease_states[idx].try_unpark();
-        }
+        // Still in `waiting` ⇒ the budget expired with the lease live.
+        let free = !waiting.contains(&idx);
         if free {
             if was_parked {
                 TRANSPORT_UNPARKED_COMMITS.fetch_add(1, Ordering::Relaxed);

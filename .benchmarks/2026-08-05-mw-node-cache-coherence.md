@@ -20,7 +20,7 @@ the case the partitioned-append formats could only catch at replay.
 | Commit | What |
 |---|---|
 | `02f1aa03` | `bench(meta)` — price the node-cache hit path FIRST (the baseline this work must not move) |
-| `28aa33c2` | `test(meta)` — 31 contracts (20 integration + 11 in-module), all red |
+| `28aa33c2` | `test(meta)` — 31 contracts (20 integration + 11 in-module), all red; a 21st added with the API-liveness pin |
 | `a1f6a72a` | `feat(meta)` — `epoch_core.rs`, the cache machinery, `revalidate.rs`, the partition gates |
 | `1c52244f` | `test(loom)` — 4 models against the shipped core, with weakening evidence |
 | `6837041f` | `bench(meta)` — the epoch gate, the inert poll, the drop pass |
@@ -276,7 +276,7 @@ TEST-9's five original charge-conservation contracts are unchanged and green.
 
 | Gate | Result |
 |---|---|
-| `tests/kv_node_cache_coherence_tests.rs` (20 cases) | **green** |
+| `tests/kv_node_cache_coherence_tests.rs` (21 cases) | **green** |
 | `node_cache.rs` in-module (11: TEST-9's 5 + 6 new) | **green** |
 | `kv_node_tests` (14), `kv_tree_tests` (12), `kv_journal_tests` (21), `kv_alloc_tests` (14) | green |
 | `kv_partitioned_append_tests` (27), `kv_finding_a_tests` (10), `kv_fold_slimming_tests` (3) | green |

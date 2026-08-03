@@ -33,7 +33,8 @@ use squeezefs::meta_backend::kv::node_cache::{
 };
 use squeezefs::meta_backend::kv::record::{inode_key, InodeValue, Record, TREE_INODES};
 use squeezefs::meta_backend::kv::revalidate::{
-    resolve_revalidate_interval_ms, revalidate_trees, RevalidationPoller, REVALIDATE_INTERVAL_ENV,
+    resolve_revalidate_interval_ms, revalidate_trees, revalidation_stats, RevalidationPoller,
+    REVALIDATE_INTERVAL_ENV,
 };
 use squeezefs::meta_backend::kv::superblock::{classify_volume, VolumeFormat};
 use squeezefs::meta_backend::kv::tree::{KvTree, RootPtr, SmoContext};
@@ -627,6 +628,39 @@ fn the_poller_states_its_staleness_bound() {
     );
     let slow = RevalidationPoller::new(5000);
     assert_eq!(slow.staleness_bound(), Duration::from_millis(6000));
+}
+
+/// The production entry points the RO-mount wiring calls, exercised so the
+/// API surface this branch exists to hand over is never dead: the derived
+/// poller, the seqlock-style epoch handle, and the counter snapshot.
+#[tokio::test]
+async fn the_reader_api_surface_is_live() {
+    let derived = RevalidationPoller::derived();
+    assert!(
+        derived.interval() >= Duration::from_millis(1000),
+        "the derived cadence can never poll faster than the writer's checkpoint \
+         guarantee, got {:?}",
+        derived.interval()
+    );
+    assert_eq!(
+        derived.staleness_bound(),
+        derived.interval() + Duration::from_secs(1)
+    );
+
+    let (_f, be) = writer().await;
+    assert_eq!(be.reader_epoch(), 0, "a write mount is not a reader");
+    let before = revalidation_stats();
+    be.arm_reader_revalidation(None).expect("declare reader");
+    assert_eq!(
+        be.reader_epoch(),
+        be.mounted_ledger().seq,
+        "a declared reader reports the epoch it armed at"
+    );
+    be.revalidate_reader().await.expect("poll");
+    assert!(
+        revalidation_stats().polls > before.polls,
+        "the counter snapshot moves with the polls"
+    );
 }
 
 /// Due-ness is decided against an injected clock — no sleeps anywhere in

@@ -286,6 +286,51 @@ so a stray scope suffix on a value silently flips whole-block eligibility off.
 
 ---
 
+## 3b3. Field-damage detection: what C9 closed, and what it found open
+
+**fsck C9 — unreferenced inodes — LANDED** (`src/fsck.rs`). An inode record no
+dentry names. Its highest-value job is not the cross-volume-create window S3.5
+deliberately left unwrapped; it is the **cleanup path for pre-S3.5 field
+damage**, where the spec's own words were "the inode and all its blocks leak
+permanently." Design notes worth keeping:
+
+- **The live-create false positive is structurally impossible, not
+  timing-filtered.** The guard is the **writer era's ino floor** captured at
+  open, after replay and before this mount can mint. Inos are monotone and
+  never reused, so every ino this mount can mint is at or above the floor and
+  only prior-mount records fall below it. No settle window, no registry, no
+  timing. Honest consequence: residue created by the *current* mount is
+  reported by the *next* mount's scan — which costs no coverage, because the
+  residue is by definition from a prior mount.
+- **`InoBitmap`, keyed by the `(slot, raw local)` decomposition of the global
+  ino** — ≈12.5 MiB per set at the ≥100 M-inode cap, against 4.8–6.4 GB for a
+  `HashSet<u64>` of the same population, and independent of the live slot→volume
+  map so a migration mid-scan cannot shift a bit. A dentry's `child_ino` is
+  bounded by the raw-local watermark: **a dentry value is never an allocation
+  authority.**
+- **Sharding divides the bitmap and the inode pass, not the dentry walk** —
+  shards filter by the child ino the dentry's *value* carries, never by the
+  dentry key (whose parent ino says nothing about which inode is named).
+- **Repair order is enforced**: C9 runs first, because a C9 destroy deletes a
+  referencer and any block-class finding about its blocks then verifies as
+  healed and refuses — instead of quarantining mappings, or *re-allocating*
+  blocks, on an inode about to be destroyed.
+
+**What C9 found open, and why it matters more than what it closed.** Enumerating
+real pre-S3.5 damage shapes, C9 named two with **no detector at all** — now
+class C10, in flight:
+
+| Shape | Effect | Why C9 is silent |
+|---|---|---|
+| `nlink` too high (a `link` that counted but never inserted the name) | the inode and its blocks can never be reclaimed — a permanent leak that looks healthy | a name exists, so C9 is correctly silent |
+| `nlink` too low, or `nlink == 0` with a live name (an `unlink` that counted but left the name) | **data loss, not a leak**: ordinary reclaim is entitled to destroy an inode a live path can still resolve. Reachable on field volumes today | same — a name exists |
+
+S3.5's `24ef223c` made a dangling dentry *removable*; nothing **finds** one. That
+is C10's job, and the second row is the reason it is a safety item rather than
+hygiene.
+
+---
+
 ## 3c. Known-red at dev during the DLM push (D11 bookkeeping)
 
 Ruling D11 parks suite runs until N readers + N writers work, so failures found

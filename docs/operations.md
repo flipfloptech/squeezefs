@@ -11,6 +11,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
   - [Read-only coherent mounts (`-o ro`)](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers)
   - [Format v3 (CoW KV metadata)](#format-v3-cow-kv-metadata)
   - [Read-only coherent mounts — the stated consistency model](#read-only-coherent-mounts--the-stated-consistency-model-metadata)
+  - [Cross-volume namespace operations](#cross-volume-namespace-operations-multi-volume-metadata-sets)
 - [POSIX semantics — declared deviations](#posix-semantics--declared-deviations)
   - [`fallocate(mode = 0)` does not reserve space](#fallocatemode--0--posix_fallocate-does-not-reserve-space-posix-12)
   - [`noatime` is the only atime policy](#noatime-is-the-only-atime-policy--the-tool-classes-that-notice-posix-17)
@@ -226,6 +227,62 @@ Live signals on the `.stats` inode — all eight are **0 for the whole life of a
 - `meta_kv_revalidate_keys_purged` — block keys the epoch step purged. 0 while `epochs` grows means the data-plane trigger is not wired (honest and visible, not a silent hole).
 - `meta_kv_reader_load_retries` — extent reads a reader re-tried because they raced the writer's in-flight append (bounded per load; normal on a hot volume).
 - `meta_kv_node_partition_refusals` — **must stay 0**: an appender reached for a node population it does not own (a non-authority structural mutation, an armed reader's write attempt, or an append whose destination page already held a peer's frame). Every one of these is silent divergence prevented.
+
+### Cross-volume namespace operations (multi-volume metadata sets)
+
+On a metadata set with **more than one volume**, `link`, `unlink`/`rmdir`
+and a `rename` across parents can touch two (or more) volumes: the child's
+link count lives on the volume its inode routes to, the directory entry on
+its parent's. "One transaction = one checksummed journal entry" is a
+**per-volume** guarantee, so these ops are a small **distributed
+transaction** (DLM stage S3.5; design `docs/design-cow-kv-metadata.md`
+§4.10a). Single-volume sets never enter this path and behave exactly as
+before.
+
+What an operator needs to know:
+
+- **A crash mid-operation is completed at the next mount, not left behind.**
+  The first commit carries a durable *intent record*; the next write mount
+  rolls the transaction forward before it serves anything, so a `stat`
+  after a crash shows the state before the operation or the state after it —
+  never a half-state. Before S3.5 the half-states were permanent: a link
+  count of 1 with no directory entry (invisible AND unreclaimable — space
+  that `df` never gets back), or a directory's link count drifting so
+  `rmdir` either succeeded with children present or refused forever.
+- **The mount says so, loud.** Recovery logs
+  `cross-volume transaction recovery: N open intent(s) found at mount` and
+  one line per completed transaction. `N` is normally 0.
+- **A mount refuses rather than serve a half-applied transaction it cannot
+  read**: an intent whose record does not decode (real corruption — a torn
+  one cannot exist) fails the open naming the transaction id and pointing at
+  `squeezefs fsck`. An intent written by a NEWER binary refuses the same
+  way rather than guessing its plan.
+- **Cost**: one extra small journal entry, and up to two coalesced device
+  flushes, per *cross-volume* op. On a strict-durability mount
+  (`SQUEEZEFS_META_FLUSH_INTERVAL_MS=0`) the flushes are already paid per
+  commit and are skipped. There is **no knob**: the ordering is what makes
+  the guarantee true.
+- **A device error part-way through** returns the error to the application
+  AND fail-stops the volumes the transaction touched (mutations refuse
+  until remount), because the alternative is letting later operations move
+  objects the interrupted transaction still has to finish. The next mount
+  completes it.
+- **No format change**: no new incompat bit, no reformat. An older binary
+  reads such a volume byte-identically — it simply would not run the
+  recovery.
+
+Live signals on the `.stats` inode:
+
+- `crossvol_tx_started` / `crossvol_tx_completed` — equal in steady state.
+- `crossvol_tx_recovered` — transactions a mount rolled forward. Nonzero
+  means a crash interrupted one; it is the machinery working.
+- `crossvol_tx_steps_applied` / `crossvol_tx_steps_already_applied` — the
+  recovery ledger; "already applied" is what makes a re-run safe.
+- `crossvol_tx_steps_foreign` — **must stay 0**: recovery met an object that
+  moved under an interrupted transaction and skipped it rather than
+  overwriting it (loudly logged; run `squeezefs fsck`).
+- `crossvol_tx_midplan_escalations` — **must stay 0**: the fail-stop above
+  fired.
 
 ## POSIX semantics — declared deviations
 

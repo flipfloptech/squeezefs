@@ -1,7 +1,7 @@
 //! **DLM stage S3.5 — cross-volume transaction machinery** (execution-plan
 //! ruling **D4**, spec item **TX-1**), and the fix for the P0 durability
 //! bug **DUR-7**. Normative description: `docs/design-cow-kv-metadata.md`
-//! §4.11.
+//! §4.10a.
 //!
 //! # The problem
 //!
@@ -141,7 +141,7 @@ pub static TEST_XV_SEAM_AFTER_STEPS: AtomicU64 = AtomicU64::new(0);
 /// intents live in `TREE_XATTRS` at `(0, tx_id)` — a key derived ENTIRELY
 /// from the tx id, so writing one needs **no collision-chain probe** and
 /// therefore **no new lock**, which is what keeps the machinery free of
-/// new lock-order edges (see the acquisition-order rule in §4.11).
+/// new lock-order edges (see the acquisition-order rule in §4.10a).
 pub const XV_INTENT_INO: Ino = 0;
 
 /// Intent-record magic.
@@ -816,7 +816,7 @@ async fn apply_step(
 }
 
 /// Execute a cross-volume transaction under the op's ALREADY-HELD 4a
-/// guard set (see §4.11's acquisition-order rule: this machinery acquires
+/// guard set (see §4.10a's acquisition-order rule: this machinery acquires
 /// nothing, which is exactly why it adds no wait-for edge).
 pub async fn execute(
     routed: &RoutedMetaBackend,
@@ -858,11 +858,17 @@ pub async fn execute(
             tx_id,
             image: image.clone(),
         });
-        if i == 0 {
-            XV_TX_STARTED.fetch_add(1, Ordering::Relaxed);
-        }
         match apply_step(routed, *v_idx, step, rider.as_ref(), guards.clone()).await {
-            Ok(o) => outcomes.push(o),
+            Ok(o) => {
+                if i == 0 {
+                    // Counted only once the intent record is DURABLE (it
+                    // rode this commit): `started` therefore means "an
+                    // intent exists", which is what makes
+                    // `started == completed` the steady-state law.
+                    XV_TX_STARTED.fetch_add(1, Ordering::Relaxed);
+                }
+                outcomes.push(o)
+            }
             Err(e) => {
                 if i == 0 {
                     // Step 0 and the intent are ONE entry: a failure here
@@ -898,7 +904,7 @@ pub async fn execute(
     // Retirement is SYNCHRONOUS — before the op releases its guards. An
     // intent that outlived its transaction could meet a later, legitimate
     // mutation of the same objects, and recovery's witnesses assume no
-    // such interleaving exists (§4.11).
+    // such interleaving exists (§4.10a).
     let out = routed.volumes[coord].xv_retire_intent(tx_id, guards).await;
     if out.is_err() {
         routed.mirror_volume_failure(coord);

@@ -326,7 +326,7 @@ pub async fn open_routed_meta_set(paths: &[String]) -> Result<std::sync::Arc<Rou
         disc.slot_to_volume,
         disc.native_slots,
     )?);
-    // **DLM S3.5 (design-cow-kv-metadata §4.11)**: roll every open
+    // **DLM S3.5 (design-cow-kv-metadata §4.10a)**: roll every open
     // cross-volume intent forward BEFORE this set serves anything. Each
     // volume's journal replay already ran inside its open, so the intents
     // are RAM-authoritative here; the scan is one bounded range per volume
@@ -1631,7 +1631,7 @@ impl Metadata for RoutedMetaBackend {
             Ok(global_child_ino)
         } else {
             // **Cross-volume unlink is ONE cross-volume transaction**
-            // (DUR-7, design-cow-kv-metadata §4.11). The effect order is
+            // (DUR-7, design-cow-kv-metadata §4.10a). The effect order is
             // unchanged — the name goes first, because that is the half
             // the caller is told about — but the parent-side commit now
             // carries the intent record, so a crash between the halves is
@@ -1775,7 +1775,7 @@ impl Metadata for RoutedMetaBackend {
             out
         } else {
             // **Cross-volume link is ONE cross-volume transaction**
-            // (DUR-7, design-cow-kv-metadata §4.11). The count half stays
+            // (DUR-7, design-cow-kv-metadata §4.10a). The count half stays
             // FIRST — it is the half that can refuse (EMLINK), and its
             // crash residue (`nlink` up, no second name) is a leak rather
             // than a dentry naming an under-counted inode — and it now
@@ -2046,7 +2046,7 @@ impl Metadata for RoutedMetaBackend {
             })?;
 
             // Remove both, insert swapped — ONE cross-volume transaction
-            // (DUR-7, §4.11; the fragment sequence this replaces could
+            // (DUR-7, §4.10a; the fragment sequence this replaces could
             // lose BOTH names to a crash between its first two commits).
             // PR M6 D4.b: each dentry step carries its parent's time
             // update; the swapped inodes' ctimes are their own steps.
@@ -2104,7 +2104,7 @@ impl Metadata for RoutedMetaBackend {
             if let Some((old_child, old_ft)) = old_dentry_opt {
                 let is_dir = old_ft == libc::S_IFDIR;
                 // **Cross-parent rename is ONE cross-volume transaction**
-                // (DUR-7, design-cow-kv-metadata §4.11). The step order is
+                // (DUR-7, design-cow-kv-metadata §4.10a). The step order is
                 // the fragment order this replaces, verbatim — parent
                 // `nlink` shifts, destination settlement, source removal,
                 // destination insert, the moved inode's ctime, then the

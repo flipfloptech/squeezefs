@@ -326,6 +326,156 @@ Two honest caveats, stated so the contract is precise: (a) under power loss, *un
 
 **Harness extension** (the existing infrastructure is reused, not rebuilt): `TORN_WRITE_FAULT` (`uring_fs`) already tears arbitrary offsets — new `tests/crash_contract_tests.rs` cases arm it against journal pages (torn entry mid-page; **torn page header ⇒ entries starting in that page die, chain-continuations through it still read, scanner resyncs at the next checksum-verified header — asserted to recover, never to fail the mount loud** (§4.1); entry-then-gap-then-entry with resync; garbage-`len` probe ⇒ drop-and-resync, not corruption; **torn middle page of a multi-page entry ⇒ the whole entry drops, entries in later intact pages recovered** — §4.1 framing), node appends (torn tail bset ⇒ node loads with the bset dropped, prior bsets intact; **valid-bset-after-tear with horizon ≤ tail ⇒ loud corruption failure** — §4.5 classifier), node rewrites (torn new node ⇒ unreferenced, old node serves), root-ledger slots (torn newest ⇒ predecessor + longer replay), bitmap slots (torn A ⇒ B), **journal ring reuse ordering** (compaction-heavy churn to near-wrap, tear the newest ledger slot, force wrap pressure ⇒ mount from the predecessor must find its whole replay window intact — the §4.6 pt 3 `reusable_upto` invariant; this is the one new cross-unit interaction with no other test), and the **rollback race** (fail tx A's journal write after tx B committed a same-key Δtime ⇒ RAM == replay digest; §4.4 pt 4). `tests/crash_kill_tests.rs` kill-9 soak runs unchanged against v3 volumes with two strengthened assertions: every ledger-acked op present **and whole** (no partial tx effects — assertable now, impossible to promise under v2), and replay idempotence (remount twice ⇒ identical tree state, compared via the full-tree **post-fold** digest walk of §4.2). The `arm_power_cut` path gains a "torn + reordered pages" mode (write-back order shuffling within the un-synced window) to exercise the hole semantics above.
 
+### 4.10a Cross-volume transactions (DLM S3.5; DUR-7) — normative
+
+§4.10's contract is **per volume**. A metadata set with more than one
+volume therefore had a hole the contract's wording did not cover: `link`,
+`unlink`/`rmdir`, cross-parent `rename` (incl. `RENAME_EXCHANGE` and
+`RENAME_WHITEOUT`) mutate `nlink` on the child's volume and the dentry on
+the parent's, and those were **two independent whole-tx commits** with no
+intent record, no compensation and no crash recovery (pre-RC engineering
+spec **DUR-7**, P0; ruling **D4**: distributed transaction, not refusal).
+The survivor state is *self-consistent per volume* — a positive `nlink`
+with no dentry is exactly what a hard link looks like from the child
+volume's side — so no fsck class flagged it, and `reclaim_orphaned_batch`
+skips `nlink > 0` by contract, making the residue permanently
+unreclaimable. Implementation: `src/meta_backend/crossvol_tx.rs` (the
+machinery) + `KvMetaBackend::xv_apply_step` (the applier); contracts
+`tests/crossvol_tx_tests.rs`.
+
+**Scope.** Two-phase commit with a deterministic **same-process
+coordinator** (the D0 claim holder) over volumes it already exclusively
+owns — not distributed consensus, and not a networked DLM. It becomes
+remote-capable at S8 by reusing the record, not by redesign.
+
+**The plan.** A transaction is an ordered list of typed steps over
+**global** inos (`XvStep`): `RemoveDentry`, `InsertDentry`, `SetNlink`,
+`TouchCtime`, `MintInode`. Each step is *homed* on the volume that owns its
+object, resolved by `route_ino` **at apply time** — so a slot migration
+between crash and recovery is handled for free, and no volume identity
+appears in the record. Step order is the pre-S3.5 fragment order verbatim:
+no user-visible sequencing moved.
+
+**The intent record (`SQZXTX01`).** One typed KV record: `TREE_XATTRS`,
+key `xattr_key(0, tx_id)`, value `XattrValue { name: "xtx:{tx_id:016x}",
+value: image }`; header `magic(8) | version(2) | op(1) | flags(1) |
+tx_id(8) | step_count(2) | reserved(2) | xxh3(8)`, then the steps. Two
+properties are load-bearing:
+
+* **Ino 0 is a reserved keyspace** (inodes mint from 2; 1 is the root), and
+  the key derives *entirely* from `tx_id` — so writing an intent needs **no
+  collision-chain probe**, hence **no `I{1}` lock**, hence no new lock and
+  no new lock-order edge. (`tx_id = (writer_term << 40) | seq`, the fencing
+  token shape: unique across mounts by term, unique within a mount by a
+  clock-seeded monotone counter, so a key collision is unrepresentable
+  rather than improbable.)
+* **No incompat bit.** The record is an ordinary typed record in an
+  ordinary whole-tx entry: an older binary reads such a volume
+  byte-identically and its fsck C1 schema check accepts it. It simply would
+  not *recover* — today's behaviour, not worse. No reformat window, no
+  Phase-8 stamping entry.
+
+**Protocol.**
+
+1. Build the plan under the op's **already-held** 4a guards. All validation
+   happens here (EEXIST, EMLINK, ENOTEMPTY, the POSIX-11 `nlink` floor),
+   and every count step records its `(pre, post)` witness read under the
+   guard.
+2. Commit step 0 **with the intent as a rider** — ONE checksummed entry, so
+   the intent can never disagree with the first effect, and it costs no
+   extra entry.
+3. **Barrier the coordinator volume.** Different volumes are different
+   devices with no mutual write ordering: without this, a power cut could
+   keep a later participant's effect and lose the intent that explains it.
+4. Commit steps 1..k, each its own whole-tx entry on its own volume.
+5. **Barrier every participant volume** — otherwise a power cut could keep
+   the retirement and lose a step.
+6. Retire the intent (a `Delete` of an exact key). **Synchronously, before
+   the op releases its guards**: an intent that outlived its transaction
+   could meet a later legitimate mutation of the same objects, and the
+   witnesses below assume no such interleaving exists.
+
+Both barriers are skipped on a **strict** volume (`flush_interval_ms = 0`),
+which barriers inside every commit already. Cost on a cross-volume op:
+**+1 journal entry** (the retirement) and ≤ 2 coalesced barriers.
+Single-volume sets never enter this path — their ops are unchanged,
+byte-for-byte, at one journal entry each (the D4 economy law).
+
+**Recovery: roll forward, always.** `crossvol_tx::recover_open_intents`
+runs from `open_routed_meta_set` — write opens only (a reader never mints
+and never recovers, DLM S5), after each volume's journal replay has made
+its records RAM-authoritative, and before the mount serves. It scans one
+bounded reserved-ino range per volume (empty on a healthy set), decodes
+each intent, and re-executes its steps through the **same applier the live
+path uses**. There is no second durability or replay mechanism: an intent's
+survival IS §4.10's.
+
+Roll-forward is right because the first commit is the half the caller was
+told about, and it is *sound* because every step is idempotent under its
+witness:
+
+| Step | Applies iff | Already applied | Foreign (skip loud) |
+|---|---|---|---|
+| `RemoveDentry` | the dentry names `expect_child` | absent | names another child |
+| `InsertDentry` | the name is free | present ⇒ `child` | present ⇒ another child |
+| `SetNlink` | `nlink == pre` | `nlink == post` | neither value |
+| `TouchCtime` | always (monotone Δctime) | — | inode gone |
+| `MintInode` | the record is absent | present | — |
+
+Count steps are therefore **absolute post-images with a CAS witness**, not
+deltas — which is exactly what makes them re-runnable, and what removes the
+ambiguity a delta has (`nlink = 1` cannot say whether the decrement ran).
+
+**Compensation.** None is needed at recovery, by construction: every
+deterministic refusal was consumed at plan time, so no step can decline for
+a reason a retry would not fix. The one asymmetry lives on the **live**
+path: if a later participant fails (device error), the op returns the error,
+the intent stays, and the plan's volumes are latched into the
+`disabled_volumes` fail-stop lattice so nothing can mutate the
+transaction's objects before the next mount completes it. Foreign skips are
+consequently unreachable in production — they are the defensive answer to
+"the object moved", and the answer is *announce and leave it*
+(`crossvol_tx_steps_foreign`), never restate a stranger's dentry from a
+stale plan.
+
+**Acquisition order (the deadlock argument).** The machinery **acquires no
+lock**. Every live step commits under the guard set its operation already
+took, up front, in the DLM's canonical order (ascending volume index; inside
+each volume `lock_many`'s I-before-D, stripe-deduped, ascending-index
+order — `meta_backend/dlm.rs`). Recovery, the one caller with no ambient
+op, takes the whole plan's guard set the same way before its first step.
+Since every cross-volume transaction thus holds a prefix of ONE total order
+over `(volume index, class, stripe)` and never acquires while holding out of
+order, no wait-for cycle is constructible — the composition rule §4.9 states
+for cross-volume operations, unchanged. Node locks (4b) are untouched: the
+applier stages records and commits through the same conveyor as every other
+tx, so no node lock is held across the protocol's device barriers.
+
+**Enumerated crash windows** (all recover to the pre- or the post-state,
+never an intermediate one; `w` = the seam window in
+`tests/crossvol_tx_tests.rs`):
+
+| Op | Steps | Windows and what each recovers to |
+|---|---|---|
+| `unlink`/`rmdir` | RemoveDentry(parent) ‖ SetNlink(child, `pre`→`pre-1`/0) | before step 0 ⇒ **pre**; after step 0 ⇒ roll forward (**post**: the name gone, `nlink` decremented, inode reclaimable); after both, retirement lost ⇒ retire only (**post**) |
+| `link` | SetNlink(child, `pre`→`pre+1`) ‖ InsertDentry(parent) | before step 0 ⇒ **pre**; after step 0 ⇒ insert the name (**post**); retirement lost ⇒ retire only. Count-first is deliberate: it is the half that can refuse (EMLINK), and its residue is a leak rather than a dentry naming an under-counted inode |
+| dir `rename` across parents | SetNlink(old parent −1) ‖ SetNlink(new parent +1) ‖ [SetNlink(dest) ‖ RemoveDentry(dest name)] ‖ RemoveDentry(old) ‖ InsertDentry(new) ‖ TouchCtime(moved) ‖ [MintInode(whiteout) ‖ InsertDentry(whiteout)] | before step 0 ⇒ **pre**; after any prefix ⇒ the remaining suffix is re-applied and the applied prefix recognised ⇒ **post** (both parents' counts and both names move together); retirement lost ⇒ retire only. The `..` entry needs no step: v3 stores no parent pointer — `..` is synthesised from the reverse-dentry/parent memo (POSIX-4), so the dentry move IS the `..` move |
+| `RENAME_EXCHANGE` | RemoveDentry ×2 ‖ InsertDentry ×2 (swapped) ‖ TouchCtime ×2 | any prefix ⇒ **post**. The old fragment sequence could lose BOTH names to a crash after its first two commits |
+
+**Deliberately NOT converted**, stated rather than hidden:
+
+* **Cross-volume `create`** (mint on the target volume, dentry on the
+  parent's). Its crash residue is an inode record with no name for an op
+  the caller was never told succeeded — a bounded metadata leak, not a
+  contradiction — and create is the hottest cross-volume shape now that
+  regular-file inodes stripe (`.benchmarks/2026-07-30-meta-plane-writes.md`),
+  so wrapping it would tax the hot path for no correctness claim anybody
+  can observe. Owed instead: an fsck class for unreferenced inodes (none of
+  C1–C8 covers one today).
+* The **same-volume** rename's remote-inode ctime fragments
+  (`touch_ctime_routed`): losing a ctime stamp is cosmetic, and buying it a
+  transaction would cost an entry and a barrier per rename.
+
 ### 4.11 Designed-for snapshots (not built)
 
 CoW roots make snapshots a root-copy: the reserved hooks are (a) versioned root-ledger records already carrying `(tree roots, seq)` tuples — a snapshot is a retained old record; (b) `TREE_ALLOC_RESERVED` for per-extent refcounts (pending-free generalizes to refcount-decrement); (c) record values carry a leading version varint so a snapshot-id key dimension can be added behind a `features_incompat` bit without rewriting v3 nodes; (d) `features_ro` lets pre-snapshot binaries mount snapshot-bearing volumes read-only instead of refusing. No snapshot code ships in this design (no dead code).

@@ -20,7 +20,7 @@
 //! this is purely the cross-volume composition, and it was **untested**
 //! because every in-tree suite runs single-volume.
 //!
-//! What this suite pins (design: `docs/design-cow-kv-metadata.md` §4.11):
+//! What this suite pins (design: `docs/design-cow-kv-metadata.md` §4.10a):
 //!
 //! 1. **The commit-boundary seam** (the spec's own acceptance): for every
 //!    enumerated crash window of every converted op, a crash-equivalent

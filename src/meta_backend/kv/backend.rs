@@ -57,7 +57,7 @@ use super::tree::{decode_interior_value, KvTree, RootPtr, SmoContext, SmoJournal
 use super::KvError;
 use crate::error::Result;
 use crate::meta_backend::atomicity::META_VOLUME_ATOMICITY_COW;
-// DLM S3.5 (design-cow-kv-metadata §4.11): the cross-volume plan
+// DLM S3.5 (design-cow-kv-metadata §4.10a): the cross-volume plan
 // vocabulary this file's applier consumes.
 use crate::meta_backend::crossvol_tx::{self, XvLocalStep, XvRider, XvStepOutcome, XvStepStatus};
 use crate::meta_backend::dlm::{DlmGuard, DlmLockManager, LockMode};
@@ -7106,7 +7106,7 @@ impl KvMetaBackend {
 
 // ---------------------------------------------------------------------------
 // DLM S3.5 — the cross-volume transaction applier (design-cow-kv-metadata
-// §4.11; the machinery and its protocol live in
+// §4.10a; the machinery and its protocol live in
 // `crate::meta_backend::crossvol_tx`). This is the ONE place a plan step
 // becomes records: the live path and mount recovery call the SAME function,
 // so "every step is idempotent" is a property of one code path rather than

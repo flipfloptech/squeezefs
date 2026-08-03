@@ -96,6 +96,12 @@ pub mod keyfile;
 pub mod lane_core;
 pub mod layout_wire;
 pub mod meta_backend;
+// DLM stage S8 (pre-rc spec §6.7 decision 1, §6.9 S8): metadata function
+// shipping — the ownership plane, the verb vocabulary on the S3 cluster
+// wire, the pipelined client router, the owner-side service and the client
+// token cache. Solo mounts are unarmed: one relaxed load, then today's
+// path. A plain comment, not a doc comment (the `env_knobs` note above).
+pub mod meta_ship;
 pub mod nvmeof;
 pub(crate) mod patch_clone_core;
 pub(crate) mod placed_core;

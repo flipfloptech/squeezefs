@@ -110,13 +110,26 @@ fn striped_meta(block_map: &[(u32, String)], size: u64, dirty: bool) -> CachedMe
     }
 }
 
+/// The ino's CURRENT fencing token — never a hardcoded `1`. Since DLM S2
+/// (`feat(dlm): S2 — durable WriterClaim.term + composed tokens`) a token
+/// is `term << 40 | grant_seq`, so every era's floor dominates the
+/// literal every layout-writing test used to pass: this harness opens a
+/// guarded meta volume, which adopts a durable term, and `1` is then a
+/// stale token that fails every save with `FencingTokenExpired`.
+fn live_token(router: &DataRouter, path: &str) -> u64 {
+    router
+        .dlm
+        .get_fencing_token_ino(squeezefs::routing::parse_inode_from_path(path))
+}
+
 /// Seed a layout into cache AND backend through the public writeback flow.
 async fn seed_meta(router: &DataRouter, path: &str, meta: CachedMetadata) {
     router
         .metadata_cache
         .insert(squeezefs::routing::parse_inode_from_path(path), meta);
+    let token = live_token(router, path);
     router
-        .persist_dirty_layout_if_needed(path, 1)
+        .persist_dirty_layout_if_needed(path, token)
         .await
         .expect("persist seeded layout");
 }
@@ -165,7 +178,14 @@ async fn test_clone_fails_loud_when_blocks_unpinnable() {
     )
     .await;
 
-    let res = router.clone_file(&src, &dest, Some(1), Some(1)).await;
+    let res = router
+        .clone_file(
+            &src,
+            &dest,
+            Some(live_token(&router, &src)),
+            Some(live_token(&router, &dest)),
+        )
+        .await;
     assert!(
         res.is_err(),
         "clone must fail when its source blocks cannot be pinned \
@@ -198,7 +218,12 @@ async fn test_clone_retries_via_authoritative_map() {
         .insert(squeezefs::routing::parse_inode_from_path(&src), stale);
 
     router
-        .clone_file(&src, &dest, Some(1), Some(1))
+        .clone_file(
+            &src,
+            &dest,
+            Some(live_token(&router, &src)),
+            Some(live_token(&router, &dest)),
+        )
         .await
         .expect("clone must heal via the authoritative map");
 
@@ -429,7 +454,12 @@ async fn test_clone_of_large_inline_v3_file_pins_every_block() {
 
     // Clone must pin every block (all-or-nothing).
     router
-        .clone_file(&src, &dest, Some(1), Some(1))
+        .clone_file(
+            &src,
+            &dest,
+            Some(live_token(&router, &src)),
+            Some(live_token(&router, &dest)),
+        )
         .await
         .expect("clone of an inline-mapped large v3 file must succeed");
 

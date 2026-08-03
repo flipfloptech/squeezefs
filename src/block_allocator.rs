@@ -85,6 +85,24 @@ pub fn lookup_free_forensics_for_test(offset: u64) -> Option<String> {
     lookup_free_forensics(offset)
 }
 
+/// Whether the forensics tape is armed — **memoized** (PERF-14).
+///
+/// `std::env::var` is an allocation plus the process-global environ lock
+/// on EVERY call, and this gate sits on the terminal-free path
+/// (`finish_free`, hundreds of thousands of calls per benchmark row) and
+/// on the publish path (`DataRouter::merge_block_mappings`). Derived
+/// defaults resolve once at first use — never on a per-op path (the
+/// standing derivation law).
+pub fn free_forensics_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // The ENG-10 registry accessor owns the CONVENTION (1/true/yes/on vs
+    // 0/false/no/off, loud refusal at startup); the `OnceLock` owns the
+    // COST — `bool_knob` reads the environment on every call, which is an
+    // allocation plus the process-global environ lock, and this gate sits on
+    // the terminal-free and publish paths.
+    *ON.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_FREE_FORENSICS", false))
+}
+
 /// Physical allocation stride of every data-volume allocator: block
 /// offsets are minted as `block_idx * CHUNK_SIZE`, so a stored block
 /// image longer than this tramples the NEXT chunk's bytes on the device
@@ -998,7 +1016,7 @@ impl BlockAllocator {
             // the recorded FIRST free of this offset — names both halves of
             // the double-release lineage even though the refusal never
             // reaches finish_free's tape.
-            if crate::env_knobs::bool_knob("SQUEEZEFS_FREE_FORENSICS", false) {
+            if free_forensics_enabled() {
                 let bt = std::backtrace::Backtrace::force_capture().to_string();
                 let first = lookup_free_forensics(offset).unwrap_or_else(|| {
                     "<no recorded first free (or aged out of the ring)>".to_string()
@@ -1028,7 +1046,7 @@ impl BlockAllocator {
         let block_idx = offset / self.chunk_size;
         // FIND-RW5-A forensics (env-gated, diagnostic-only): record every
         // free's capture so a DOUBLE FREE names BOTH call sites.
-        if crate::env_knobs::bool_knob("SQUEEZEFS_FREE_FORENSICS", false) {
+        if free_forensics_enabled() {
             let bt = std::backtrace::Backtrace::force_capture().to_string();
             // RES-19: one bounded-ring insert (which also HANDS BACK the
             // prior capture for this offset), instead of holding the global

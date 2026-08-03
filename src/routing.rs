@@ -7958,7 +7958,7 @@ impl DataRouter {
             "backend/cached"
         };
         let forensics_op: Option<String> =
-            if crate::env_knobs::bool_knob("SQUEEZEFS_FREE_FORENSICS", false) {
+            if crate::block_allocator::free_forensics_enabled() {
                 Some(match &op {
                     BlockMapOp::Merge(e) => format!("Merge({e:?})"),
                     BlockMapOp::MergeExpected(e) => format!("MergeExpected({e:?})"),

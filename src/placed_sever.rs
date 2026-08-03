@@ -61,6 +61,18 @@ pub(crate) struct BlockAssembly {
     claims: PlacedClaims,
     /// Live placed payload handles (claims not yet released) — the
     /// registry-reap gate.
+    ///
+    /// Ordering (PERF-21): the canonical `Arc`-class refcount discipline —
+    /// the acquire increment is `Relaxed` (it happens under the registry's
+    /// per-key entry guard, which already orders it against the reap that
+    /// re-reads it), the release decrement is `Release`, and the
+    /// last-out-the-door path pays one `Acquire` fence so the reaper
+    /// observes every sibling payload's writes before it drops the
+    /// backing. `SeqCst` was over-strong: nothing here needs a total
+    /// order across unrelated locations (no Dekker pair — the
+    /// sever-vs-adoption race is fenced inside
+    /// [`crate::placed_core::PlacedClaims`], which keeps its documented
+    /// `SeqCst` pair).
     outstanding: AtomicUsize,
 }
 
@@ -175,7 +187,9 @@ impl PlacedSeverRegistry {
                     .fetch_add(1, Ordering::Relaxed);
                 return None;
             }
-            assembly.outstanding.fetch_add(1, Ordering::SeqCst);
+            // Relaxed: published under the entry guard held here, which is
+            // the same latch the reap's `remove_if_sync` takes (PERF-21).
+            assembly.outstanding.fetch_add(1, Ordering::Relaxed);
             assembly
         };
         // The ONE arena read — outside the entry guard (a 1 MiB memcpy
@@ -234,7 +248,10 @@ impl PlacedSeverRegistry {
     /// once no placed payload references the (never-adopted) assembly.
     fn reap(&self, key: (u64, u64), assembly: &Arc<BlockAssembly>) {
         self.map.remove_if_sync(&key, |a| {
-            Arc::ptr_eq(a, assembly) && a.outstanding.load(Ordering::SeqCst) == 0
+            // Acquire: pairs with every payload drop's `Release` decrement
+            // (a racing successor claim re-published under this same entry
+            // guard reads back nonzero and keeps the assembly alive).
+            Arc::ptr_eq(a, assembly) && a.outstanding.load(Ordering::Acquire) == 0
         });
     }
 
@@ -266,7 +283,10 @@ impl Drop for PlacedSevered {
         self.assembly
             .claims
             .release(self.rel / CLAIM_PAGE, self.len / CLAIM_PAGE);
-        if self.assembly.outstanding.fetch_sub(1, Ordering::SeqCst) == 1 {
+        if self.assembly.outstanding.fetch_sub(1, Ordering::Release) == 1 {
+            // The last handle out: acquire everything the siblings released
+            // before this thread decides the assembly is reapable.
+            std::sync::atomic::fence(Ordering::Acquire);
             // Last payload out: reap the entry if it was never adopted
             // (adoption already removed it; ptr_eq keeps a racing
             // successor assembly safe).

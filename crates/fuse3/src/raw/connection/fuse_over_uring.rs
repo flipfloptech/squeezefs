@@ -4284,7 +4284,9 @@ fn apply_reply(ent: &mut Ent, header: &[u8], body: &Bytes) {
         // zero-copy serve-into-payload path above elides it and is
         // deliberately NOT counted — no CPU pass happened here).
         numa_classify_pass(
-            crate::numa_core::topology().current_node(),
+            // PERF-19: no per-reply `sched_getcpu` when the map cannot
+            // express a choice (single-node boxes).
+            crate::numa_core::topology().current_node_for_instrument(),
             ent.node,
             body_len,
         );

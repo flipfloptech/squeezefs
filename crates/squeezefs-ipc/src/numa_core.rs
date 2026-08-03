@@ -60,6 +60,12 @@ pub struct NumaTopology {
     /// (distance from `a`, index). Precomputed so hot-path nearest
     /// lookups are table walks.
     ranked: Vec<Vec<usize>>,
+    /// `min_distance[a]` = `min(distance[a][*])` — the minimal-distance
+    /// choice from `a`. Precomputed (PERF-22): [`Self::is_local_choice`]
+    /// runs on EVERY classified copy pass, and computing this by an
+    /// O(nodes) row scan per pass made the instrument's cost scale with
+    /// the node count on exactly the fat topologies it exists to measure.
+    min_distance: Vec<u32>,
 }
 
 impl NumaTopology {
@@ -89,18 +95,24 @@ impl NumaTopology {
                 cpu_node[c] = Some(idx);
             }
         }
-        let ranked = (0..nodes.len())
+        let ranked: Vec<Vec<usize>> = (0..nodes.len())
             .map(|a| {
                 let mut order: Vec<usize> = (0..nodes.len()).collect();
                 order.sort_by_key(|&b| (distance[a][b], b));
                 order
             })
             .collect();
+        // PERF-22: the nearest node is `ranked[a][0]` by construction, so
+        // the per-row minimum is a table read, not a scan.
+        let min_distance: Vec<u32> = (0..nodes.len())
+            .map(|a| distance[a][ranked[a][0]])
+            .collect();
         Some(Self {
             nodes,
             cpu_node,
             distance,
             ranked,
+            min_distance,
         })
     }
 
@@ -185,6 +197,23 @@ impl NumaTopology {
         current_cpu().and_then(|c| self.node_of_cpu(c))
     }
 
+    /// [`Self::current_node`] for the LOCALITY INSTRUMENT's exec side, with
+    /// the single-node no-op short-circuited (PERF-19).
+    ///
+    /// When the map cannot express a placement choice there is exactly one
+    /// node, so every classified pass is a minimal-distance choice by
+    /// construction and `sched_getcpu` buys the instrument nothing — it is
+    /// pure per-op syscall cost on the majority shape (`numa_nodes == 1` on
+    /// the stats inode is the proof that no information is lost: the
+    /// local/remote split carries no bits on a one-node map). Multi-node
+    /// maps read the CPU exactly as before.
+    pub fn current_node_for_instrument(&self) -> Option<usize> {
+        if self.is_single() {
+            return Some(0);
+        }
+        self.current_node()
+    }
+
     /// SLIT distance between two dense node indices.
     pub fn distance(&self, a: usize, b: usize) -> u32 {
         self.distance[a][b]
@@ -223,12 +252,10 @@ impl NumaTopology {
     /// choice from the executing node — i.e. no other node could have
     /// been strictly nearer. Reduces to `exec == mem` on ordinary shapes
     /// without ever encoding that as the rule.
+    /// (PERF-22: the row minimum is precomputed at construction — this is
+    /// a two-table-read comparison, not an O(nodes) scan per pass.)
     pub fn is_local_choice(&self, exec_node: usize, mem_node: usize) -> bool {
-        let min = (0..self.nodes.len())
-            .map(|n| self.distance[exec_node][n])
-            .min()
-            .unwrap_or(0);
-        self.distance[exec_node][mem_node] == min
+        self.distance[exec_node][mem_node] == self.min_distance[exec_node]
     }
 
     /// Sibling rotation for same-origin placements (fd-sharded sessions

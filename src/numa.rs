@@ -50,13 +50,14 @@ pub fn classify_and_count(
 }
 
 /// [`classify_and_count`] with exec = the CURRENT thread's node and the
-/// process-wide cached map — the hot-path form (one vDSO `sched_getcpu`
-/// + two table lookups; single-node maps classify everything local,
-/// which is the honest reading).
+/// process-wide cached map — the hot-path form (two table lookups plus,
+/// on multi-node maps only, one `sched_getcpu`; single-node maps classify
+/// everything local, which is the honest reading, and skip the syscall
+/// entirely — PERF-19, [`numa_core::NumaTopology::current_node_for_instrument`]).
 #[inline]
 pub fn count_current_pass(mem_node: Option<usize>, bytes: usize) {
     let t = numa_core::topology();
-    classify_and_count(t, t.current_node(), mem_node, bytes);
+    classify_and_count(t, t.current_node_for_instrument(), mem_node, bytes);
 }
 
 /// The session→node inference at HELLO (daemon-side only — no wire/ABI

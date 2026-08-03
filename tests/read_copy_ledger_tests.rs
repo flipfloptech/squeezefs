@@ -203,8 +203,12 @@ impl AlignedDest {
         assert!(!ptr.is_null());
         Self { ptr, layout }
     }
-    fn addr(&self) -> u64 {
-        self.ptr as u64
+    /// The FUSE-4e destination WINDOW for this allocation (the registered
+    /// payload window's stand-in — cap == the whole allocation).
+    fn dest(&self) -> squeezefs::routing::ReadDest {
+        // SAFETY: the allocation outlives every read it is handed to and is
+        // exclusively this test's.
+        unsafe { squeezefs::routing::ReadDest::new(self.ptr as u64, self.layout.size()) }
     }
     fn slice(&self, len: usize) -> &[u8] {
         assert!(len <= self.layout.size());
@@ -323,7 +327,7 @@ async fn ledger_closes_and_cold_none_dest_slice_is_zero_copy() {
                 &path,
                 BS,
                 part as u32,
-                Some(dest.addr()),
+                Some(dest.dest()),
                 ReadClassHint::default(),
                 None,
             )
@@ -373,7 +377,7 @@ async fn ledger_closes_and_cold_none_dest_slice_is_zero_copy() {
                 &path,
                 2 * BS,
                 BS as u32,
-                Some(dest.addr()),
+                Some(dest.dest()),
                 ReadClassHint::default(),
                 None,
             )
@@ -406,7 +410,7 @@ async fn ledger_closes_and_cold_none_dest_slice_is_zero_copy() {
                 &path,
                 3 * BS,
                 part as u32,
-                Some(dest.addr()),
+                Some(dest.dest()),
                 ReadClassHint::default(),
                 None,
             )
@@ -443,7 +447,7 @@ async fn ledger_closes_and_cold_none_dest_slice_is_zero_copy() {
                 &path,
                 0,
                 4096,
-                Some(dest.addr()),
+                Some(dest.dest()),
                 ReadClassHint::default(),
                 None,
             )

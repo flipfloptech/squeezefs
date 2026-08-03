@@ -314,7 +314,17 @@ unsafe impl Sync for AreaSlice {}
 impl AreaSlice {
     /// A slice over `len` chunk-resident bytes at `ptr` (the receive
     /// extent, not necessarily a whole chunk).
-    pub fn new(grant: GrantRef, ptr: *const u8, len: usize) -> Self {
+    ///
+    /// MEM-4: `unsafe` because [`Self::as_slice`] dereferences `ptr` for
+    /// `len` bytes with no further check — a safe constructor let safe code
+    /// publish a slice over an arbitrary address.
+    ///
+    /// # Safety
+    ///
+    /// `ptr..ptr + len` must lie inside the chunk `grant` holds (the grant
+    /// is what keeps it from recycling and keeps the area mapped), and the
+    /// bytes must be initialized receive data.
+    pub unsafe fn new(grant: GrantRef, ptr: *const u8, len: usize) -> Self {
         AreaSlice { grant, ptr, len }
     }
     pub fn len(&self) -> usize {

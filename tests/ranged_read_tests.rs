@@ -41,7 +41,7 @@ use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
 use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
 use squeezefs::meta_backend::RoutedMetaBackend;
 use squeezefs::nvme_dev::NvmeBlockDev;
-use squeezefs::routing::{DataRouter, RangedDest, ReadClassHint};
+use squeezefs::routing::{DataRouter, RangedDest, ReadClassHint, ReadDest};
 use std::ffi::OsStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -363,10 +363,9 @@ async fn ranged_phases() {
             1,
             8192..8192 + 8192,
             Some(&k1),
-            Some(RangedDest {
-                ptr: dest_ptr,
-                cap: 16384,
-            }),
+            // SAFETY: `dest_ptr` is a live 16 KiB 4 KiB-aligned allocation
+            // owned exclusively by this test (MEM-4 ctor contract).
+            Some(unsafe { RangedDest::new(dest_ptr, 16384) }),
             ReadClassHint::default(),
         )
         .await
@@ -532,7 +531,9 @@ async fn raw_dest_leg_refuses_transform_configs() {
                 &path,
                 2 * block,
                 block as u32,
-                Some(dest_ptr as u64),
+                // SAFETY: a live block-sized 4 KiB-aligned allocation the
+                // test owns exclusively (the FUSE-4e window contract).
+                Some(unsafe { ReadDest::new(dest_ptr as u64, block as usize) }),
                 ReadClassHint::default(),
             )
             .await

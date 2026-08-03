@@ -813,7 +813,10 @@ fn drive(
                         let grant = unsafe { cfg.area.adopt_grant(slot) };
                         // SAFETY: span bounds checked against the area.
                         let ptr = unsafe { cfg.area.base().add(off) as *const u8 };
-                        let slice = AreaSlice::new(grant, ptr, len);
+                        // SAFETY (MEM-4): `grant` (adopted just above) pins
+                        // the chunk for the slice's life and `ptr..ptr+len`
+                        // was bounds-checked against the area two lines up.
+                        let slice = unsafe { AreaSlice::new(grant, ptr, len) };
                         events.clear();
                         if let Err(why) = parser.push(&slice, &mut events) {
                             crate::fuse_client::METRICS

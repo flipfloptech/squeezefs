@@ -211,7 +211,11 @@ async fn sim_reader_loop(
                 return Err("connection closed mid-operation".into());
             }
             Ok(n) => {
-                let slice = AreaSlice::new(grant, ptr as *const u8, n);
+                // SAFETY (MEM-4): `ptr` is the base of the chunk `grant`
+                // holds (so the region cannot recycle and the area stays
+                // mapped) and `n` bytes of it were just filled by the
+                // read — `n <= chunk_bytes` because `buf` is that chunk.
+                let slice = unsafe { AreaSlice::new(grant, ptr as *const u8, n) };
                 events.clear();
                 if let Err(why) = parser.push(&slice, &mut events) {
                     metrics

@@ -119,7 +119,9 @@ fn stream_into_chunks(area: &Arc<ZcrxArea>, stream: &[u8]) -> Vec<AreaSlice> {
             unsafe {
                 std::ptr::copy_nonoverlapping(part.as_ptr(), ptr, part.len());
             }
-            AreaSlice::new(grant, ptr as *const u8, part.len())
+            // SAFETY (MEM-4): `ptr` is the grant's own chunk base and
+            // `part.len() <= chunk` by construction; the grant pins it.
+            unsafe { AreaSlice::new(grant, ptr as *const u8, part.len()) }
         })
         .collect()
 }
@@ -197,7 +199,9 @@ fn bench_gather_fusion(c: &mut Criterion) {
                 unsafe { std::ptr::write_bytes(ptr, 0xC3, chunk) };
                 (
                     (i * chunk) as u32,
-                    AreaSlice::new(grant, ptr as *const u8, chunk),
+                    // SAFETY (MEM-4): the fresh grant's own chunk, exactly
+                    // `chunk` bytes, written just above.
+                    unsafe { AreaSlice::new(grant, ptr as *const u8, chunk) },
                 )
             })
             .collect();

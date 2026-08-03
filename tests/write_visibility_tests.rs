@@ -454,17 +454,20 @@ async fn multiblock_read_zeroes_hole_into_reused_dest() {
     let read_off = BS / 2;
     let read_len = (2 * BS) as usize; // spans blocks 0(tail), 1(hole), 2(head)
     let mut dest = vec![0xAAu8; read_len];
-    let (data, _backing) =
-        h.fs.router
-            .read_file_range_zero_copy(
-                &file_path,
-                read_off,
-                read_len as u32,
-                Some(dest.as_mut_ptr() as u64),
-                squeezefs::routing::ReadClassHint::default(),
-            )
-            .await
-            .unwrap();
+    let (data, _backing) = h
+        .fs
+        .router
+        .read_file_range_zero_copy(
+            &file_path,
+            read_off,
+            read_len as u32,
+            // SAFETY: `dest` outlives the read and the window is
+            // exclusively this test's (the FUSE-4e dest contract).
+            Some(unsafe { squeezefs::routing::ReadDest::new(dest.as_mut_ptr() as u64, read_len) }),
+            squeezefs::routing::ReadClassHint::default(),
+        )
+        .await
+        .unwrap();
     assert_eq!(data.len(), read_len, "[{tag}] short multi-block read");
 
     let expect_at = |off: u64| -> u8 {

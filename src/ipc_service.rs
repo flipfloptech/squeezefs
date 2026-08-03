@@ -98,11 +98,15 @@ tokio::task_local! {
 /// visibility (and the 795 retry loop's overwrites) are the client's own
 /// concurrent-buffer POSIX hazard, exactly `ArenaWindow::write`'s
 /// standing contract.
-pub(crate) fn ipc_read_dest_override(size: u32) -> Option<u64> {
+/// FUSE-4e: the WINDOW, not just its base — the read path bounds every
+/// serve against `len` (the same law the kernel path's registered payload
+/// window rides), so a window that stopped describing its buffer refuses
+/// the destination instead of overrunning it.
+pub(crate) fn ipc_read_dest_override(size: u32) -> Option<(u64, usize)> {
     IPC_READ_DEST
         .try_with(|&(ptr, len)| {
             if len >= size as usize {
-                Some(ptr)
+                Some((ptr, len))
             } else {
                 None
             }

@@ -3100,6 +3100,16 @@ pub struct Metrics {
     /// ONE lawful serve copy on the kernel path (hot/hold/tier/cold
     /// slice-out arms).
     pub read_copy_dest_bytes: Align64<AtomicU64>,
+    /// FUSE-4e: zero-copy read destinations REFUSED because the serve
+    /// would not fit the transport's registered window (`ReadDest::cap`,
+    /// threaded from `get_payload_buffer`'s length / the il arena
+    /// override's length). **Must stay 0**: the negotiated geometry law
+    /// (`max_pages` describes `max_write` exactly, payload_sz ==
+    /// max_payload_sz) makes an over-window serve unrepresentable, so any
+    /// growth is a cross-ABI breach — a kernel that ignored the INIT
+    /// reply, or a dest length that stopped describing its buffer. The
+    /// refusal itself is safe: the read is served through the copy leg.
+    pub read_dest_overruns: Align64<AtomicU64>,
     /// Serve copies into intermediate heap memory (None-dest arms; tier
     /// mmap-guard copy-outs). After the zero-copy cold slice, a
     /// `Bytes`-backed cold fill served without a dest contributes 0 here
@@ -6045,6 +6055,8 @@ impl SqueezefsFilesystem {
                 "read_lane_hold_bytes": self.router.cache.read_lane_hold.bytes(),
                 "read_lane_inflight_bytes": self.router.read_lane_inflight_bytes(),
                 "read_copy_dest_bytes": METRICS.read_copy_dest_bytes.load(Ordering::Relaxed),
+                // FUSE-4e tripwire: must stay 0 (see the field doc).
+                "read_dest_overruns": METRICS.read_dest_overruns.load(Ordering::Relaxed),
                 "read_copy_bounce_bytes": METRICS.read_copy_bounce_bytes.load(Ordering::Relaxed),
                 "read_dest_dma_bytes": METRICS.read_dest_dma_bytes.load(Ordering::Relaxed),
                 "read_fill_dma_bytes": METRICS.read_fill_dma_bytes.load(Ordering::Relaxed),
@@ -13893,14 +13905,25 @@ impl Filesystem for SqueezefsFilesystem {
         // exposure argument at `ipc_service::ipc_read_dest_override`);
         // kernel requests derive the registered ent payload from the
         // connection as before.
+        // FUSE-4e: the transport's LENGTH rides along as the window's cap.
+        // `get_payload_buffer` always returned `(ptr, len)` and this site
+        // used to drop the length (`.map(|(ptr, _sz)| ptr)`), leaving the
+        // kernel's honoring of the negotiated `max_pages` as the only bound
+        // on every serve that writes into the payload region.
         let conn_guard = self.session_connection.load();
-        let dest_addr = arena_dest.or_else(|| {
-            conn_guard
-                .as_ref()
-                .as_ref()
-                .and_then(|conn| conn.get_payload_buffer(_req.slot))
-                .map(|(ptr, _sz)| ptr)
-        });
+        let dest = arena_dest
+            .or_else(|| {
+                conn_guard
+                    .as_ref()
+                    .as_ref()
+                    .and_then(|conn| conn.get_payload_buffer(_req.slot))
+            })
+            // SAFETY: both windows are this request's own for the handler
+            // invocation — the registered ent payload under the §5.4 lease
+            // protocol (its re-arm is gated on the lease), and the il arena
+            // window under the descriptor-validated session custody
+            // (`ipc_read_dest_override`).
+            .map(|(ptr, cap)| unsafe { crate::routing::ReadDest::new(ptr, cap) });
 
         // OVERLAY NEVER INVISIBLE — the moving-custody read protocol
         // (fstests generic/795, VL10 release gate). A block's acked bytes
@@ -13943,7 +13966,7 @@ impl Filesystem for SqueezefsFilesystem {
                 &file_path,
                 offset,
                 read_len as u32,
-                dest_addr,
+                dest,
                 read_hint,
                 meta_hint.take(),
             );

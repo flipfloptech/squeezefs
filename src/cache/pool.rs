@@ -386,9 +386,31 @@ pub struct AlignedBufOwner {
 unsafe impl Send for AlignedBufOwner {}
 unsafe impl Sync for AlignedBufOwner {}
 
+/// A non-owning `Bytes` view over memory somebody ELSE owns — the
+/// registered uring payload window a read was served into, or an
+/// assembly/arena region. `Drop` is deliberately empty: the transport (or
+/// the assembly) owns the bytes.
+///
+/// MEM-4: the fields are private and the constructor is `unsafe` because
+/// `AsRef<[u8]>` builds a slice from them and `Bytes::from_owner` keeps
+/// that view alive well past the constructor — a safe struct literal let
+/// safe code publish a slice over any address at all.
 pub struct UringBufOwner {
-    pub ptr: *mut u8,
-    pub len: usize,
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl UringBufOwner {
+    /// # Safety
+    ///
+    /// `ptr..ptr + len` must remain valid, initialized, and unwritten by
+    /// anyone else for as long as this owner (and every `Bytes` cloned from
+    /// it) lives. The two sanctioned provenances are the request's
+    /// registered payload window (§5.4 lease protocol — the transport's
+    /// re-arm is gated on the lease) and a live block assembly.
+    pub unsafe fn new(ptr: *mut u8, len: usize) -> Self {
+        UringBufOwner { ptr, len }
+    }
 }
 
 unsafe impl Send for UringBufOwner {}

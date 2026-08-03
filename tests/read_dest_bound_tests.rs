@@ -221,12 +221,11 @@ async fn a_serve_longer_than_the_dest_window_is_refused_not_overrun() {
     let before = METRICS.read_dest_overruns.load(Ordering::Relaxed);
     // SAFETY: `dest` outlives the read; the window is exclusively ours.
     let rd = unsafe { ReadDest::new(dest.addr(), WINDOW) };
-    let (data, _backing) = h
-        .fs
-        .router
-        .read_file_range_zero_copy(&path, BS, REQ as u32, Some(rd), ReadClassHint::default())
-        .await
-        .expect("a bounded destination must never fail the read");
+    let (data, _backing) =
+        h.fs.router
+            .read_file_range_zero_copy(&path, BS, REQ as u32, Some(rd), ReadClassHint::default())
+            .await
+            .expect("a bounded destination must never fail the read");
 
     assert_eq!(data.len(), REQ, "the read is served in full");
     assert!(
@@ -260,12 +259,17 @@ async fn a_covering_window_still_serves_into_the_destination() {
     let before = METRICS.read_dest_overruns.load(Ordering::Relaxed);
     // SAFETY: `dest` outlives the read; the window is exclusively ours.
     let rd = unsafe { ReadDest::new(dest.addr(), REQ) };
-    let (data, _backing) = h
-        .fs
-        .router
-        .read_file_range_zero_copy(&path, 2 * BS, REQ as u32, Some(rd), ReadClassHint::default())
-        .await
-        .expect("read");
+    let (data, _backing) =
+        h.fs.router
+            .read_file_range_zero_copy(
+                &path,
+                2 * BS,
+                REQ as u32,
+                Some(rd),
+                ReadClassHint::default(),
+            )
+            .await
+            .expect("read");
     assert_eq!(data.len(), REQ);
     assert!(
         data.iter()

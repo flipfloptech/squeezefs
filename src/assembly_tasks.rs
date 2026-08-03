@@ -158,10 +158,14 @@ impl AssemblyDest {
         if self.pooled.is_some() {
             bytes::Bytes::from_owner(ArcDestOwner(self))
         } else {
-            bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner {
-                ptr: self.ptr,
-                len: self.len,
-            })
+            // SAFETY (MEM-4 ctor contract): the payload arm's `ptr`/`len`
+            // came from `AssemblyDest::payload`, whose own contract is that
+            // the region stays valid and exclusively this request's for the
+            // handler invocation (§5.4 lease exclusivity), and every writer
+            // has joined before this handout.
+            unsafe {
+                bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner::new(self.ptr, self.len))
+            }
         }
     }
 }

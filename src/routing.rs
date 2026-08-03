@@ -3163,8 +3163,35 @@ pub struct StreamLanes {
 /// 0 and zeroes `served..requested` (the reused-payload replay rule); the
 /// bounce leg never sees it.
 pub struct RangedDest {
-    pub ptr: *mut u8,
-    pub cap: usize,
+    ptr: *mut u8,
+    cap: usize,
+}
+
+impl RangedDest {
+    /// MEM-4: the destination's validity contract lives HERE, not in a
+    /// struct literal any safe caller could write.
+    ///
+    /// # Safety
+    ///
+    /// `ptr..ptr + cap` must be writable, 4 KiB-aligned (the O_DIRECT DMA
+    /// contract this leg is offered under), and exclusively the calling
+    /// request's for the whole serve — the §5.4 payload-lease protocol
+    /// (kernel path) or the validated arena window (E-IL2 il path) is what
+    /// establishes that exclusivity.
+    pub unsafe fn new(ptr: *mut u8, cap: usize) -> Self {
+        RangedDest { ptr, cap }
+    }
+
+    /// The destination base (the callee DMAs the served length at offset 0).
+    pub fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    /// Writable bytes at [`Self::ptr`] — FUSE-4e's bound, threaded from the
+    /// transport's own `get_payload_buffer` length.
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
 }
 
 // SAFETY: `ptr` addresses registered uring payload memory (or a test's
@@ -3174,6 +3201,105 @@ pub struct RangedDest {
 // writer. Sending the pointer across the executor's threads moves that
 // exclusive access, never shares it.
 unsafe impl Send for RangedDest {}
+
+/// FUSE-4e: the zero-copy READ destination as a **window**, not a bare
+/// address — the whole read path's single dest type.
+///
+/// The transport has always known the size of the destination it hands
+/// out (`get_payload_buffer` returns `(ptr, len)`; the il arena override
+/// returns `(ptr, len)`), and the read path used to keep only the pointer.
+/// Every serve leg then wrote `served.len()` bytes there, so the only
+/// bound on the write was the kernel honoring the `max_pages` the INIT
+/// reply advertised — an unchecked cross-ABI invariant. `cap` is that
+/// bound, carried to the sites that write.
+///
+/// [`Self::checked_ptr`] is the ONLY way to obtain the writable pointer:
+/// a serve that does not fit is refused there (loud + counted on
+/// `read_dest_overruns`), and the caller falls back to the ordinary copy
+/// leg — a refused destination must never become a lost read.
+#[derive(Clone, Copy)]
+pub struct ReadDest {
+    addr: u64,
+    cap: usize,
+}
+
+// SAFETY: same argument as `RangedDest` — the window is exclusively this
+// request's for the serve's duration (payload lease / validated arena
+// window), so moving the handle across executor threads moves exclusive
+// access rather than sharing it.
+unsafe impl Send for ReadDest {}
+unsafe impl Sync for ReadDest {}
+
+impl ReadDest {
+    /// # Safety
+    ///
+    /// `addr..addr + cap` must be writable and exclusively the calling
+    /// request's for the whole serve (the §5.4 payload lease for kernel
+    /// requests; the descriptor-validated arena window for il requests).
+    pub unsafe fn new(addr: u64, cap: usize) -> Self {
+        ReadDest { addr, cap }
+    }
+
+    /// The window's base address (never dereferenced without a length —
+    /// see [`Self::checked_ptr`]).
+    pub fn addr(&self) -> u64 {
+        self.addr
+    }
+
+    /// Writable bytes at [`Self::addr`].
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// FUSE-4e: the bound. `Some(ptr)` iff writing `len` bytes at the base
+    /// stays inside the window; otherwise the destination is REFUSED —
+    /// logged loud, counted on the must-stay-0 `read_dest_overruns`
+    /// tripwire, and the caller serves through its copy leg instead.
+    pub fn checked_ptr(&self, len: usize) -> Option<*mut u8> {
+        if len <= self.cap {
+            return Some(self.addr as *mut u8);
+        }
+        METRICS.read_dest_overruns.fetch_add(1, Ordering::Relaxed);
+        log::error!(
+            "read destination refused: serve of {len} B exceeds the {} B \
+             registered window (FUSE-4e; read_dest_overruns) — serving through \
+             the copy leg",
+            self.cap
+        );
+        None
+    }
+
+    /// `checked_ptr` for a whole-window DMA offer (`RangedDest` / the
+    /// assembly dest): `None` when `len` does not fit, so the leg that
+    /// would have offered the destination takes its bounce path.
+    ///
+    /// # Safety
+    ///
+    /// Inherits [`Self::new`]'s contract; `len` must be the exact byte
+    /// count the callee will write.
+    pub unsafe fn ranged(&self, len: usize) -> Option<RangedDest> {
+        self.checked_ptr(len).map(|p| RangedDest::new(p, len))
+    }
+}
+
+/// FUSE-4e ⊕ MEM-4: the read path's ONE zero-copy dest view — a
+/// non-owning `Bytes` over `len` bytes of THIS request's destination
+/// window (registered uring ent payload, or the validated il arena
+/// window). Every serve leg that hands the caller its own memory back
+/// goes through here.
+///
+/// # Safety
+///
+/// `ptr..ptr + len` must lie inside the destination window this serve was
+/// bounded against ([`ReadDest::checked_ptr`], applied once at the entry of
+/// `read_file_range_zero_copy_with_meta` and again at the two legs that
+/// hand the window to a DMA/task writer), and the window must stay valid
+/// and unwritten by anyone else while the returned `Bytes` lives — the
+/// §5.4 payload-lease protocol (kernel path) or the session's arena
+/// custody (il path) is what guarantees that.
+unsafe fn dest_bytes(ptr: *mut u8, len: usize) -> bytes::Bytes {
+    bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner::new(ptr, len))
+}
 
 /// A block fill's provenance at the validated fill site
 /// (`get_cached_or_fetch_block_traced`) — the transient stream window's
@@ -6308,12 +6434,9 @@ impl DataRouter {
                         // fully DMA-covered — nothing to zero (the
                         // reused-payload replay rule is satisfied by full
                         // coverage).
-                        crate::cache::pool::ReadBlockValue::Bytes(bytes::Bytes::from_owner(
-                            crate::cache::pool::UringBufOwner {
-                                ptr: d.ptr,
-                                len: req_len,
-                            },
-                        ))
+                        crate::cache::pool::ReadBlockValue::Bytes(unsafe {
+                            dest_bytes(d.ptr, req_len)
+                        })
                     }
                     None => {
                         let from = (rel_range.start - aligned_start) as usize;
@@ -6375,12 +6498,7 @@ impl DataRouter {
                 crate::fuse_client::METRICS
                     .read_copy_dest_bytes
                     .fetch_add(len as u64, Ordering::Relaxed);
-                crate::cache::pool::ReadBlockValue::Bytes(bytes::Bytes::from_owner(
-                    crate::cache::pool::UringBufOwner {
-                        ptr: d.ptr,
-                        len: req_len,
-                    },
-                ))
+                crate::cache::pool::ReadBlockValue::Bytes(unsafe { dest_bytes(d.ptr, req_len) })
             }
             None => {
                 // Zero-copy slice for `Bytes`-backed whole values (the
@@ -9236,13 +9354,13 @@ impl DataRouter {
         file_path: &str,
         offset: u64,
         size: u32,
-        dest_addr: Option<u64>,
+        dest: Option<ReadDest>,
         hint: ReadClassHint,
     ) -> Result<(
         bytes::Bytes,
         Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     )> {
-        self.read_file_range_zero_copy_with_meta(file_path, offset, size, dest_addr, hint, None)
+        self.read_file_range_zero_copy_with_meta(file_path, offset, size, dest, hint, None)
             .await
     }
 
@@ -9259,7 +9377,7 @@ impl DataRouter {
         file_path: &str,
         offset: u64,
         size: u32,
-        dest_addr: Option<u64>,
+        dest: Option<ReadDest>,
         hint: ReadClassHint,
         meta_hint: Option<CachedMetadata>,
     ) -> Result<(
@@ -9281,6 +9399,21 @@ impl DataRouter {
         // `warm_read_loop_yields_to_peer_tasks_on_one_worker` and the
         // OQ-5 storm-squeeze acceptance (.benchmarks/2026-07-30-oq5-*).
         tokio::task::coop::consume_budget().await;
+
+        // FUSE-4e: the destination's WINDOW bounds this serve. `size` is the
+        // upper bound of every dest write below — each leg writes its own
+        // request-clamped length (`want` / `out.len()` / `slice_len` /
+        // `final_len`, all ≤ `size`), and the two legs that hand the
+        // destination to a DMA/task writer (the §5.6 `RangedDest` offer and
+        // the MEM-2 `AssemblyDest::payload`) re-check their exact length
+        // against the same window. A serve that does not fit is REFUSED
+        // here: `dest_addr` becomes `None`, every leg takes its ordinary
+        // copy path, and `read_dest_overruns` records the cross-ABI breach
+        // (a bound must never turn into a lost read).
+        let dest_addr: Option<u64> = dest
+            .as_ref()
+            .and_then(|d| d.checked_ptr(size as usize))
+            .map(|p| p as u64);
 
         // Fetch metadata first. The whole-file RAM snapshot (read_lru /
         // write_lru keyed by file_path) is deliberately NOT consulted on the
@@ -9394,12 +9527,7 @@ impl DataRouter {
                                         dest_ptr,
                                         out.len(),
                                     );
-                                    let d = bytes::Bytes::from_owner(
-                                        crate::cache::pool::UringBufOwner {
-                                            ptr: dest_ptr,
-                                            len: out.len(),
-                                        },
-                                    );
+                                    let d = dest_bytes(dest_ptr, out.len());
                                     (d, None)
                                 }
                             } else {
@@ -9418,11 +9546,7 @@ impl DataRouter {
                                 if want > phys {
                                     std::ptr::write_bytes(dest_ptr.add(phys), 0, want - phys);
                                 }
-                                let d =
-                                    bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner {
-                                        ptr: dest_ptr,
-                                        len: want,
-                                    });
+                                let d = dest_bytes(dest_ptr, want);
                                 (d, None)
                             }
                         } else if phys == want {
@@ -9640,12 +9764,7 @@ impl DataRouter {
                                             dest_ptr,
                                             out.len(),
                                         );
-                                        let d = bytes::Bytes::from_owner(
-                                            crate::cache::pool::UringBufOwner {
-                                                ptr: dest_ptr,
-                                                len: out.len(),
-                                            },
-                                        );
+                                        let d = dest_bytes(dest_ptr, out.len());
                                         (d, None)
                                     }
                                 } else {
@@ -9669,9 +9788,7 @@ impl DataRouter {
                                         dest_ptr,
                                         len,
                                     );
-                                    let d = bytes::Bytes::from_owner(
-                                        crate::cache::pool::UringBufOwner { ptr: dest_ptr, len },
-                                    );
+                                    let d = dest_bytes(dest_ptr, len);
                                     (d, None)
                                 }
                             } else {
@@ -9785,12 +9902,7 @@ impl DataRouter {
                                         METRICS
                                             .read_copy_dest_bytes
                                             .fetch_add(len as u64, Ordering::Relaxed);
-                                        bytes::Bytes::from_owner(
-                                            crate::cache::pool::UringBufOwner {
-                                                ptr: dest_ptr,
-                                                len,
-                                            },
-                                        )
+                                        unsafe { dest_bytes(dest_ptr, len) }
                                     } else {
                                         hot.slice(start..end)
                                     };
@@ -9882,12 +9994,7 @@ impl DataRouter {
                                             METRICS
                                                 .read_copy_dest_bytes
                                                 .fetch_add(len as u64, Ordering::Relaxed);
-                                            bytes::Bytes::from_owner(
-                                                crate::cache::pool::UringBufOwner {
-                                                    ptr: dest_ptr,
-                                                    len,
-                                                },
-                                            )
+                                            unsafe { dest_bytes(dest_ptr, len) }
                                         } else {
                                             held.slice(start..end)
                                         };
@@ -9999,12 +10106,7 @@ impl DataRouter {
                                             METRICS
                                                 .read_copy_dest_bytes
                                                 .fetch_add(len as u64, Ordering::Relaxed);
-                                            bytes::Bytes::from_owner(
-                                                crate::cache::pool::UringBufOwner {
-                                                    ptr: dest_ptr,
-                                                    len,
-                                                },
-                                            )
+                                            dest_bytes(dest_ptr, len)
                                         }
                                     } else {
                                         // Copy ledger: the mmap guard
@@ -10081,10 +10183,21 @@ impl DataRouter {
                                     // serves (E-IL2) hand arbitrary window
                                     // pointers — unaligned dests take the
                                     // bounce leg.
-                                    Some(d) if aligned && d % 4096 == 0 => Some(RangedDest {
-                                        ptr: d as *mut u8,
-                                        cap: slice_len as usize,
-                                    }),
+                                    //
+                                    // FUSE-4e: `cap` is the DESTINATION's
+                                    // window (re-checked here for the exact
+                                    // length the callee will DMA), never the
+                                    // requested slice length — the historical
+                                    // `cap: slice_len` made the bound a copy
+                                    // of the thing it was supposed to bound.
+                                    Some(d) if aligned && d % 4096 == 0 => dest
+                                        .as_ref()
+                                        // SAFETY: the window is this request's
+                                        // registered payload / validated arena
+                                        // region (ReadDest::new's contract) and
+                                        // `slice_len` bytes of it are proven to
+                                        // fit by `ranged`.
+                                        .and_then(|w| unsafe { w.ranged(slice_len as usize) }),
                                     _ => None,
                                 };
                                 read_serve_phase_record(ReadServePhase::ClassifyProbe, probe_t0);
@@ -10138,12 +10251,7 @@ impl DataRouter {
                                                 METRICS
                                                     .read_copy_dest_bytes
                                                     .fetch_add(len as u64, Ordering::Relaxed);
-                                                bytes::Bytes::from_owner(
-                                                    crate::cache::pool::UringBufOwner {
-                                                        ptr: dest_ptr,
-                                                        len: slice_len as usize,
-                                                    },
-                                                )
+                                                unsafe { dest_bytes(dest_ptr, slice_len as usize) }
                                             }
                                             None => match val {
                                                 crate::cache::pool::ReadBlockValue::Bytes(b) => b,
@@ -10169,12 +10277,7 @@ impl DataRouter {
                                             let dest_ptr = dest as *mut u8;
                                             unsafe {
                                                 std::ptr::write_bytes(dest_ptr, 0, len);
-                                                bytes::Bytes::from_owner(
-                                                    crate::cache::pool::UringBufOwner {
-                                                        ptr: dest_ptr,
-                                                        len,
-                                                    },
-                                                )
+                                                dest_bytes(dest_ptr, len)
                                             }
                                         } else {
                                             bytes::Bytes::from(vec![0u8; len])
@@ -10264,12 +10367,7 @@ impl DataRouter {
                                                 {
                                                     let len = block_size as usize;
                                                     let dest_ptr = dest as *mut u8;
-                                                    let b = bytes::Bytes::from_owner(
-                                                        crate::cache::pool::UringBufOwner {
-                                                            ptr: dest_ptr,
-                                                            len,
-                                                        },
-                                                    );
+                                                    let b = unsafe { dest_bytes(dest_ptr, len) };
                                                     resolved = Some(
                                                         crate::cache::pool::ReadBlockValue::Bytes(
                                                             b,
@@ -10365,12 +10463,8 @@ impl DataRouter {
                                                             ReadServePhase::SliceOut,
                                                             slice_t0,
                                                         );
-                                                        let b = bytes::Bytes::from_owner(
-                                                            crate::cache::pool::UringBufOwner {
-                                                                ptr: dest_ptr,
-                                                                len,
-                                                            },
-                                                        );
+                                                        let b =
+                                                            unsafe { dest_bytes(dest_ptr, len) };
                                                         Some(crate::cache::pool::ReadBlockValue::Bytes(b))
                                                     }
                                                     (Some(val), None) => Some(val),
@@ -10442,12 +10536,7 @@ impl DataRouter {
                                                     ReadServePhase::SliceOut,
                                                     slice_t0,
                                                 );
-                                                let b = bytes::Bytes::from_owner(
-                                                    crate::cache::pool::UringBufOwner {
-                                                        ptr: dest_ptr,
-                                                        len,
-                                                    },
-                                                );
+                                                let b = unsafe { dest_bytes(dest_ptr, len) };
                                                 Some(crate::cache::pool::ReadBlockValue::Bytes(b))
                                             }
                                             (Some(val), None) => Some(val),
@@ -10476,12 +10565,7 @@ impl DataRouter {
                                     }
                                     if let Some(dest) = dest_addr {
                                         let len = (end_offset - offset) as usize;
-                                        let data = bytes::Bytes::from_owner(
-                                            crate::cache::pool::UringBufOwner {
-                                                ptr: dest as *mut u8,
-                                                len,
-                                            },
-                                        );
+                                        let data = unsafe { dest_bytes(dest as *mut u8, len) };
                                         return Ok((data, Some(std::sync::Arc::new(downloaded))));
                                     } else {
                                         let slice_t0 = std::time::Instant::now();
@@ -10527,12 +10611,7 @@ impl DataRouter {
                                         let dest_ptr = dest as *mut u8;
                                         unsafe {
                                             std::ptr::write_bytes(dest_ptr, 0, len);
-                                            bytes::Bytes::from_owner(
-                                                crate::cache::pool::UringBufOwner {
-                                                    ptr: dest_ptr,
-                                                    len,
-                                                },
-                                            )
+                                            dest_bytes(dest_ptr, len)
                                         }
                                     } else {
                                         let mut hole_pooled = BUFFER_POOL.alloc();
@@ -10592,8 +10671,18 @@ impl DataRouter {
                     // through its own Arc into memory that is still owned,
                     // and the pooled backing recycles only when the LAST
                     // owner drops (`assembly_tasks` module).
-                    let assembly_into_dest = dest_addr.is_some();
-                    let dest = std::sync::Arc::new(if let Some(dest) = dest_addr {
+                    // FUSE-4e: the assembly writers get the destination only
+                    // when the whole assembled length provably fits its window.
+                    // Kept as a `u64` (never a live `*mut u8` local): this
+                    // scope awaits, and a raw pointer held across an await
+                    // makes the whole read future non-`Send`.
+                    let assembly_dest: Option<u64> = dest
+                        .as_ref()
+                        .filter(|_| dest_addr.is_some())
+                        .and_then(|w| w.checked_ptr(final_len))
+                        .map(|p| p as u64);
+                    let assembly_into_dest = assembly_dest.is_some();
+                    let dest = std::sync::Arc::new(if let Some(dest) = assembly_dest {
                         // SAFETY: `dest` addresses this request's registered
                         // uring payload region and is valid for `final_len`
                         // bytes of writes — §5.4 payload-lease exclusivity

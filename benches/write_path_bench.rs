@@ -1527,12 +1527,155 @@ fn bench_alloc_lane(c: &mut Criterion) {
     group.finish();
 }
 
+/// DLM **S9** — the allocation-lane **GRANT** (`src/alloc_lane_grant.rs`):
+/// what the co-writer admission adds to the allocation path, priced at the
+/// two cadences it actually runs at.
+///
+/// **WRITTEN AND NOT RUN — ruling D11.** Every claim is a PREDICTION with a
+/// falsification criterion.
+///
+/// ## Which cadence each row belongs to (the whole point of the group)
+///
+/// | Row | Cadence | Field rate |
+/// |---|---|---|
+/// | `alloc_gate_*` | **per 4 MiB block** — one call per allocation, never per op | ~1,650 fresh blocks/s at the write wall's 6.3–6.8 GB/s (`.benchmarks/2026-07-31-write-wall.md`); a rewrite regime allocates at the same block rate from the free list |
+/// | `lane_of_*` | **per GRAIN** (the owner-side raise validation) plus per join/renew | one raise per `reserve_grain_blocks` FRESH blocks per lane — the derived grain is thousands of blocks, so ≪ 1/s per co-writer at the field's mint rate; reuse pays none |
+/// | `raise_frame_*` | **per GRAIN** (the wire codec of the shipped raise) | same |
+/// | `assignment_derive_*` | **per authority ERA** — once, at the multi-writer arm | once per mount |
+///
+/// The cadence table is the argument: the only NEW work on the per-block path
+/// is one `OnceLock` probe inside the gate (the same word `next_fresh_block`
+/// and the free-list filter already read in the same allocation), and
+/// everything else is per grain or per era.
+///
+/// ## Predictions, and what refutes each
+///
+/// | Claim | Structural reason | Falsified by |
+/// |---|---|---|
+/// | the gate on a WRITER is unchanged | `alloc_plane_gate` reads the same reader latch first and short-circuits; the co-writer latch and the lane probe are never reached on a writer | `alloc_gate_writer` separating from `ro_gate::latch_probe` beyond the group threshold |
+/// | the gate on a laned CO-WRITER is a CONSTANT more | two adjacent latches (same cache line) plus one `OnceLock::get` | `alloc_gate_laned_co_writer` scaling with the free-list depth or the lane count (⇒ it is not the probe, it is the arm behind it) |
+/// | lane validation is `O(W)` on ≤ 15 short ids and per GRAIN | a linear scan of the sorted co-writer vec | `lane_of_hit_15` growing superlinearly in `W`, or appearing at all in a mint profile (⇒ something calls it per block) |
+/// | the shipped raise costs ONE control-class RTT per grain | `hand_out_reserved` awaits the raise on the allocating task, and the frontier covers `grain` fresh blocks | `alloc_lane_shipped_reservations` ÷ fresh blocks exceeding 1/grain (deterministic, reportable under D11), or a co-writer's `write_pipeline_phase_ns::admit_wait` carrying raise latency at the BLOCK rate ⇒ the grain collapsed or the OPEN is being re-run per allocation |
+/// | the era's derivation is free | once per arm, over ≤ 15 members | `assignment_derive_16` in milliseconds (⇒ the claim-set read leaked into the derivation, which must be the caller's) |
+fn bench_alloc_lane_grant(c: &mut Criterion) {
+    use squeezefs::alloc_lane_grant::LaneAssignment;
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::fuse_client::{self, MountPosture};
+    use squeezefs::membership::{ClaimSet, ClaimSetMember, MemberIdentity, MemberRole};
+    use squeezefs::meta_backend::kv::journal::AppendPartition;
+    use tokio::runtime::Runtime;
+
+    // The ceiling shape: one authority + 15 enrolled co-writers is the widest
+    // partition `AppendPartition` admits (MAX_APPENDERS = 16), so it is the
+    // worst case of every per-grain lookup below. The field's expected shape
+    // is 2–4 writers; the ceiling is what bounds the claim.
+    const AT_CEILING: usize = 15;
+
+    let rt = Runtime::new().expect("bench runtime");
+    let mut set = ClaimSet::empty(7);
+    set.durable = true;
+    let member = |id: String| ClaimSetMember {
+        identity: MemberIdentity {
+            id,
+            role: MemberRole::Writer,
+            pid: 0,
+            boot: String::new(),
+            endpoint: None,
+            pr_key: 0,
+        },
+        ts: 0,
+    };
+    set.members.push(member("authority".to_string()));
+    for i in 0..AT_CEILING {
+        set.members.push(member(format!("node_{i:016x}")));
+    }
+    set.members
+        .sort_by(|a, b| a.identity.id.cmp(&b.identity.id));
+    let map = LaneAssignment::derive("authority", std::slice::from_ref(&set)).expect("derive");
+    let last = format!("node_{:016x}", AT_CEILING - 1);
+
+    let mut group = c.benchmark_group("alloc_lane_grant");
+
+    // Per ERA: the whole map, from the durable roster.
+    group.bench_function("assignment_derive_16", |b| {
+        b.iter(|| {
+            black_box(
+                LaneAssignment::derive(black_box("authority"), std::slice::from_ref(&set)).unwrap(),
+            )
+        })
+    });
+
+    // Per GRAIN: the owner-side validation's lookup, hit and miss. The MISS is
+    // the roster-growth refusal (a member enrolled after the arm), so it is
+    // the full scan by construction.
+    group.bench_function("lane_of_hit_15", |b| {
+        b.iter(|| black_box(map.lane_of(black_box(last.as_str()))))
+    });
+    group.bench_function("lane_of_miss_15", |b| {
+        b.iter(|| black_box(map.lane_of(black_box("node_never_enrolled"))))
+    });
+
+    // Per GRAIN: the shipped raise's wire codec (the fabric RTT itself is not
+    // benchable in-process — see the prediction table; its amortization is a
+    // deterministic counter ratio, which is why that claim is stated as one).
+    let call = squeezefs::meta_ship::publish::PublishCall::RaiseAllocLane {
+        vol_tag: 0x00aa_11bb_00aa_11bb,
+        lane: 1,
+        writers: 4,
+        upto: 1 << 20,
+        lease_epoch: 42,
+    };
+    let frame = squeezefs::meta_ship::publish::PublishRequestFrame {
+        schema: squeezefs::meta_ship::publish::PUBLISH_SCHEMA,
+        client: "node_00000000deadbeef".to_string(),
+        call: call.clone(),
+    };
+    group.bench_function("raise_frame_named_inos", |b| {
+        b.iter(|| black_box(call.named_inos()))
+    });
+    group.bench_function("raise_frame_clone", |b| {
+        b.iter(|| black_box(frame.call.clone()))
+    });
+
+    // Per 4 MiB BLOCK: the gate. Three postures — the shipped writer (the row
+    // that must not move), a laned co-writer (allowed: the new arm), and a
+    // laneless co-writer (refused: the unchanged arm). The allocator is
+    // driven through `allocate_block` because the gate is private by design
+    // (the posture is the mount's), so these rows price the gate IN SITU
+    // against `alloc_lane::mint_fresh_*` — the difference between the two
+    // groups is the gate.
+    let laned = rt.block_on(async { BlockAllocator::new("lane_grant_laned").await.unwrap() });
+    laned
+        .engage_alloc_lanes(AppendPartition::new(4, 1).expect("partition"))
+        .expect("engage");
+    let plain = rt.block_on(async { BlockAllocator::new("lane_grant_plain").await.unwrap() });
+    group.bench_function("alloc_gate_writer", |b| {
+        assert!(
+            !fuse_client::co_writer_mount(),
+            "the writer row needs both latches off"
+        );
+        b.iter(|| black_box(rt.block_on(plain.allocate_block())))
+    });
+    group.bench_function("alloc_gate_laned_co_writer", |b| {
+        fuse_client::set_mount_posture(MountPosture::CoWriter);
+        b.iter(|| black_box(rt.block_on(laned.allocate_block())));
+        fuse_client::set_mount_posture(MountPosture::Writer);
+    });
+    group.bench_function("alloc_gate_laneless_co_writer_refusal", |b| {
+        fuse_client::set_mount_posture(MountPosture::CoWriter);
+        b.iter(|| black_box(rt.block_on(plain.allocate_block()).is_err()));
+        fuse_client::set_mount_posture(MountPosture::Writer);
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_writer_scope,
     bench_ro_gate,
     bench_free_grace_gate,
     bench_alloc_lane,
+    bench_alloc_lane_grant,
     bench_staging_shard_removal,
     bench_copy_probe_range,
     bench_coverage_union,

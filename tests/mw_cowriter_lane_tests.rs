@@ -540,7 +540,11 @@ fn the_assignment_gives_one_lane_per_enrolled_writer_and_is_injective() {
         std::slice::from_ref(&claim_set_with(&[NODE_A])),
     )
     .expect("derive");
-    assert_eq!(pair.writers(), 2, "one authority + one co-writer is exactly 2");
+    assert_eq!(
+        pair.writers(),
+        2,
+        "one authority + one co-writer is exactly 2"
+    );
 
     // Deterministic: the same record derives the same map, always (which is
     // what makes two nodes' views agree without a message).
@@ -1078,9 +1082,7 @@ async fn the_authority_opens_a_co_writers_lane_above_the_durable_dense_frontier(
     // in neither the ledger nor its layouts. `arm_multi_writer` installs this
     // source from its data-plane router; here it is the same contract as a
     // closure.
-    grant::install_frontier_source(Arc::new(move |asked: u64| {
-        (asked == tag).then_some(5_000)
-    }));
+    grant::install_frontier_source(Arc::new(move |asked: u64| (asked == tag).then_some(5_000)));
 
     let cw = CoWriter::join(&auth, &vol, NODE_A, 0).await;
     let p = cw.part();

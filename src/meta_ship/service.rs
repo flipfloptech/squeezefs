@@ -593,6 +593,17 @@ impl MetaShipService {
         match call {
             MetaCall::LookupDentry { parent, name } => {
                 match self.inner.lookup_dentry(*parent, name).await? {
+                    // Resolve the child HERE when this node also holds
+                    // its volume — the whole-set shape, and every
+                    // single-volume set. That makes a shipped `lookup`
+                    // ONE round trip in the common case; the ino-only
+                    // answer below is the cross-owner fallback the client
+                    // routes itself. Both are correct because
+                    // `lookup → getattr` was never atomic.
+                    Some((child, _ft)) if self.has_authority(child) => {
+                        let inode = self.inner.getattr(child).await?;
+                        Ok(MetaReply::Inode(WireInode::from(&inode)))
+                    }
                     Some((child, _ft)) => Ok(MetaReply::Ino(child)),
                     None => Err(SqueezefsError::Io(std::io::Error::new(
                         std::io::ErrorKind::NotFound,

@@ -688,9 +688,22 @@ impl Metadata for MetaShipRouter {
                     }
                 }
             }
-            VerbRoute::Ship(peer) => {
-                expect_ino(self.ship_one(&peer, call).await?, MetaVerb::LookupDentry)?
-            }
+            // The owner resolves the child itself when it holds the
+            // child's volume too — the common shape, and the reason a
+            // shipped lookup is ONE round trip rather than two. An
+            // ino-only answer means the child is owned elsewhere, so the
+            // getattr routes on its own below.
+            VerbRoute::Ship(peer) => match self.ship_one(&peer, call).await? {
+                MetaReply::Inode(inode) => return Ok(Inode::from(inode)),
+                MetaReply::Ino(child) => child,
+                other => {
+                    return Err(super::protocol_error(
+                        MetaVerb::LookupDentry,
+                        &format!("{other:?}"),
+                        "an inode or a child ino",
+                    ))
+                }
+            },
         };
         self.getattr(child).await
     }

@@ -39,6 +39,14 @@
 //! implementation performs exactly those two steps, and the code says in
 //! so many words that "lookup→getattr was never atomic".
 //!
+//! The decomposition is **not paid when it is not needed**: an owner that
+//! holds the child's volume too resolves it inline and answers with the
+//! inode, so the common shape (every single-volume set, every set whose
+//! volumes share an owner) costs ONE round trip. Paying two
+//! unconditionally would double the latency of the hottest metadata verb
+//! — every path walk — for a shape that cannot occur on the set it runs
+//! against.
+//!
 //! # Frame shape, and why each field is on it
 //!
 //! * `schema` — the vocabulary's own version, independent of the
@@ -103,7 +111,11 @@ pub const STATUS_PANIC: u16 = 37;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum MetaVerb {
-    /// The dentry half of `lookup`: `(child global ino, S_IFMT)`.
+    /// The dentry half of `lookup`. Answers with the resolved **inode**
+    /// when the owner also holds the child's volume (the common shape —
+    /// so a shipped `lookup` is ONE round trip), and with the child's
+    /// **ino** when the child is owned elsewhere, for the client to route
+    /// the `getattr` itself.
     LookupDentry = 1,
     /// `create_with_rdev` (and therefore the provided `create`).
     CreateWithRdev = 2,
@@ -418,9 +430,12 @@ impl From<WireDirEntry> for DirEntry {
 /// One call's successful payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetaReply {
-    /// `create_with_rdev`, `link`, `getattr`, `setattr`.
+    /// `create_with_rdev`, `link`, `getattr`, `setattr`, and
+    /// `lookup_dentry` when the owner resolved the child itself.
     Inode(WireInode),
-    /// `lookup_dentry` (the child's global ino) and `unlink`.
+    /// `lookup_dentry` when the child is owned ELSEWHERE (its global
+    /// ino, for the client to route), and `unlink` (the child it
+    /// removed).
     Ino(u64),
     /// `rename`, `setxattr`, `removexattr`, `destroy_inode`.
     Unit,

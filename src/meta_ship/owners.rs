@@ -35,7 +35,7 @@
 //!
 //! # The fast path
 //!
-//! [`armed`] is one **relaxed load** of a generation word. An unarmed
+//! [`ownership_armed`] is one **relaxed load** of a flag word. An unarmed
 //! mount — every mount that ships today — never touches the arc-swapped
 //! table at all, so the routing decision on the local path costs that one
 //! load and nothing else. An armed mount pays one `ArcSwapOption::load`

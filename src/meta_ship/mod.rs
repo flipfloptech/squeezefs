@@ -58,6 +58,38 @@
 //!   appender. Bit 11 stays free for a stage that genuinely needs one
 //!   (pinned by `tests/meta_ship_tests.rs`).
 //!
+//! # The intent-lock premise, verified against the three call sites
+//!
+//! §6.7 decision 3 asserts: *"There is no operation that needs a token but
+//! performs no metadata RPC on the object first."* That claim is what
+//! licenses the grant piggyback, so it was checked against the census's
+//! **three** production `acquire_lock` sites rather than assumed:
+//!
+//! 1. **`fuse_client::get_or_acquire_lease`** (reached from WRITE, FLUSH,
+//!    fsync, truncate/SETATTR and the release ladder through
+//!    `acquire_write_lease`). The premise holds at **session** granularity
+//!    and **not** per operation: an ino can only be named by the kernel
+//!    because a LOOKUP or a CREATE resolved it, and both perform a
+//!    metadata verb on the child (lookup's own `getattr`, create's mint) —
+//!    but kernel entry/attr caching means a later open of a cached dentry
+//!    can reach WRITE with no metadata RPC *in that operation*. This is
+//!    precisely why the token cache exists, why a cold entry is re-earned
+//!    by [`MetaShipRouter::refresh_token`] — a shipped `getattr`, i.e. a
+//!    metadata RPC, never a second lock protocol — and why a miss is a
+//!    loud must-stay-0 tripwire instead of a silent guess.
+//! 2. **`routing::clone_file`**, source and destination (the other two
+//!    sites). Here the premise holds per operation: the offline `clone`
+//!    verb resolves both paths through metadata lookups before it locks,
+//!    and it holds the D0 guard while doing so.
+//!
+//! One consequence worth stating because it bounds this stage: with an
+//! armed plane, all three sites on a **foreign** ino refuse loud at the S4
+//! gate — no node grants custody its owner never issued. So today the
+//! token cache's foreign-object consumers are the fencing **reads**, not
+//! the lease acquisitions; remote acquisition itself waits for S9's
+//! custody protocol, and pretending otherwise here would be inventing a
+//! custody transfer with no revocation path.
+//!
 //! # The measured half is deferred (ruling D11)
 //!
 //! §6.9's S8 gate is *"serial `tar -x` A/B, published even if it

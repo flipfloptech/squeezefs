@@ -95,14 +95,12 @@ pub mod keyfile;
 /// `docs/design-mw-cursors-and-incarnation.md`.
 pub mod lane_core;
 pub mod layout_wire;
-/// DLM stage S6 — membership off the journal: the claim-set record
-/// (§6.2 item 7), the two lease clocks, and the RAM lease authority.
+// DLM stage S6 — membership off the journal (each module's own `//!` docs
+// are the documentation; an outer `///` here would re-root their intra-doc
+// links in `crate` and break every one of them, which is the shape
+// `ro_coherence`'s unresolved-link warnings already have).
 pub mod membership;
-/// DLM stage S6 — the D1 simulated-client harness for the membership,
-/// heartbeat, revoke and failover planes.
 pub mod membership_sim;
-/// DLM stage S6 — the membership plane's verbs on `cluster_wire`, the
-/// additive verb router, and DISC-1's projection off the census.
 pub mod membership_wire;
 pub mod meta_backend;
 // DLM stage S8 (pre-rc spec §6.7 decision 1, §6.9 S8): metadata function

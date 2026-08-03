@@ -47,6 +47,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
   - [Cluster wire (the one cluster transport)](#cluster-wire-the-one-cluster-transport)
   - [Metadata function shipping (DLM S8)](#metadata-function-shipping-dlm-s8)
   - [Membership plane — lease-based liveness (DLM S6)](#membership-plane--lease-based-liveness-dlm-s6)
+  - [Freed-offset grace period (spec §6.8 item 3)](#freed-offset-grace-period-spec-68-item-3)
 - [Observability](#observability)
   - [`df` / statfs semantics](#df--statfs-semantics)
   - [Fabric observability](#fabric-observability)
@@ -213,7 +214,7 @@ refused rather than executed locally). Every one of these is 0 with
 
 ### Read-only coherent mounts (`-o ro`) — one writer plus N readers
 
-**Status: the mount mode and its metadata coherence both ship. The DATA-block half is bounded, not eliminated — read the guarantee below before you rely on it.**
+**Status: the mount mode and its metadata coherence both ship. The DATA-block half now has two postures, and which one you get depends on one knob — read the guarantee below before you rely on it: with the membership plane armed the stale-serve window is *eliminated*; with it off (the default) it is *bounded*, exactly as before.**
 
 A read-only mount is a *reader*: `squeezefs mount --read-only …` or `-o ro`. It takes no write lease, writes no `writer_claim`, registers no NVMe reservation and spawns no checkpoint task, so **one writer plus N readers of the same volume set is a supported shape** — and, symmetrically, a reader is never an obstacle to the writer (see the `reader` row in the guarantee-class table above). Design: `docs/pre-rc-engineering-spec.md` §6.8, DLM stage S5.
 
@@ -233,7 +234,7 @@ squeezefs mount --read-only sqmeta://<meta_dev> /mnt/sqz-ro --data-lv <data_dev>
 
 | Plane | What a reader sees |
 |---|---|
-| **Data blocks** | Consistent as of a revalidation epoch. Every epoch that observes the writer's roots advance drops the reader's whole block-key census (all five block-key stores + the read-lane hold), so a stale serve is bounded by **one revalidation interval**. It is *bounded*, not eliminated: within that interval a block the writer freed and reallocated to a different file can serve the other file's bytes — loudly on a transformed (compressed/encrypted) volume, because the AEAD tag fails; **silently on a passthrough volume, which is the default**. Eliminating the window is the freed-offset grace period (spec §6.8 item 3), which is not implemented — it needs a reader→writer acknowledgement channel that is not a metadata write (S6 membership), because a reader writes nothing |
+| **Data blocks** | Consistent as of a revalidation epoch. Every epoch that observes the writer's roots advance drops the reader's whole block-key census (all five block-key stores + the read-lane hold). What that alone gives you is a stale serve **bounded by one revalidation interval**; the **freed-offset grace period** (spec §6.8 item 3) closes the window outright, and it is armed with the membership plane. **Plane armed** (`SQUEEZEFS_MEMBERSHIP_BIND` set on the writer, and this reader joined — check `free_grace_mode == "armed"` on the writer's `.stats` and `membership_mode == "member"` on the reader's): a block the writer frees is **not reallocatable until every live reader has acknowledged passing it**, so no interval exists in which a reused offset can serve another file's bytes; the residual risk is a reader that stops acknowledging, which is **fenced** (evicted) rather than waited on and counted in `free_grace_forced_releases` / `free_grace_laggard_fences`. **Plane off (the default)**: the pre-item-3 statement stands verbatim — within one revalidation interval a block the writer freed and reallocated to a different file can serve the other file's bytes, loudly on a transformed (compressed/encrypted) volume because the AEAD tag fails, **silently on a passthrough volume, which is the default**. See [Freed-offset grace period](#freed-offset-grace-period-spec-68-item-3) |
 | **Metadata** | The state of **the most recent checkpoint the reader has polled** — bounded staleness, not a frozen snapshot. Each poll reads the volume's newest A/B root-ledger record; a newer record is adopted, the cached nodes the new roots do not cover are dropped, and the reader serves the new epoch. The bound is `reader_staleness_bound_ms` on the `.stats` inode (the poll interval plus the writer's ≤ 1 s checkpoint ceiling — 2 s with the shipped defaults), and it is machine-readable precisely so this paragraph cannot drift from the number in force. Epochs are **monotone** (a reader never moves backwards). Two things are deliberately *not* promised: a reader observes only what the writer has **checkpointed**, so committed-but-not-yet-checkpointed transactions are invisible (that is what makes the model cheap — no journal replay on the read side); and a single multi-key operation is not atomic across a poll, so a `readdir` spanning one may mix two adjacent checkpoints (read `meta_kv_revalidate_epochs` before and after, seqlock-style, if you need one epoch for a whole operation) |
 | **Membership** | A reader does **not** appear in `squeezefs clients` — the `client:` registration is a metadata write, and a reader performs none. Reader visibility is the S6 membership plane's job |
 
@@ -282,7 +283,7 @@ Capacity/scale: ≥ 100 M inodes per volume, 1 M+ entries per directory, unlimit
 | **Monotone** | Epochs only advance. A reader never moves backwards and never loses a record it has already served. |
 | **Per-operation atomicity** | Every node a reader resolves belongs to exactly one checkpoint epoch, and an operation that *starts* after a poll sees only that epoch's nodes. A single multi-key operation that spans a poll (a long `readdir`) may mix two adjacent checkpoints; a caller that needs one epoch across several steps reads the live epoch before and after (seqlock-style) and retries on a change. |
 | **Not durability, not linearizability** | A reader observes only what the writer has **checkpointed**. Committed-but-not-yet-checkpointed transactions (up to the flush cadence) are invisible by design — that is what makes the model cheap: no journal replay on the read side. |
-| **Metadata only** | Metadata coherence does **not** make data-block bindings coherent. An epoch step fires the unified block-key purge for keys the reader's data path registered as suspect; bounding that set exactly needs the freed-offset grace period (spec §6.8 item 3), which is **not built**. Until it is, a reader of a volume whose writer frees and reallocates blocks can serve another file's bytes for a block whose binding it cached — loudly on a transformed (AEAD) volume, silently on a passthrough one. |
+| **Metadata only** | Metadata coherence does **not** by itself make data-block bindings coherent: an epoch step fires the unified block-key purge, which bounds the window to one interval. Closing it is the freed-offset grace period (spec §6.8 item 3), which **is built** and arms with the membership plane — see the Data-blocks row of [Read-only coherent mounts](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers) for both postures. With the plane **off** (the default) the older statement still holds: a reader of a volume whose writer frees and reallocates blocks can serve another file's bytes for a block whose binding it cached — loudly on a transformed (AEAD) volume, silently on a passthrough one. |
 | **Cost** | A poll that finds nothing new costs one ledger read plus ~6 ns of bookkeeping. A poll that finds a newer record drops the reader's cached nodes and re-demand-pages the working set: ≈ 575 ns per cached node (≈ 1.2 ms for a 2,048-node working set), i.e. ≈ 0.1 % of one core at the 1 s cadence. Measured: `.benchmarks/2026-08-05-mw-node-cache-coherence.md`. |
 
 `SQUEEZEFS_META_REVALIDATE_MS` (mount env, reader only): poll cadence in ms. Explicit wins verbatim. Default **derived** = `max(flush cadence, 1000)` — polling faster than the writer mints records cannot reduce staleness and pays a drop pass for nothing; a larger value trades staleness (bound above) for fewer drop passes and a warmer cache.
@@ -976,6 +977,60 @@ the `flock`, the Write-Exclusive reservation and the `writer_claim`
 heartbeat are untouched, and the membership plane grants no write custody
 whatsoever. It answers *who is here*, not *who may write*. With the plane
 off — the default — nothing about liveness, staleness or the guard changes.
+
+### Freed-offset grace period (spec §6.8 item 3)
+
+**What it fixes.** A reader resolves a file's block to a device offset and
+caches the bytes under that offset. Block keys *are* bare device offsets, so
+once the writer frees an offset and hands it to a different file, a reader
+can serve the wrong file's bytes — loudly on a transformed volume (the AEAD
+tag fails), **silently on a passthrough volume**. Dropping the reader's
+whole block-key census at every revalidation epoch bounds that window to one
+interval; it cannot close it, because nothing stops the writer from reusing
+an offset *inside* the interval.
+
+**What it does.** With the membership plane armed, a terminally-freed offset
+is held out of the free list until **every live registered reader has
+acknowledged passing it**. The acknowledgement rides the lease renewal a
+reader already sends, so it costs no metadata write and no extra round trip,
+and it means *"I have finished using anything freed at or before this"* —
+emitted only after a revalidation pass that actually ran the block-key purge,
+and only after the drain window in which pre-purge serves finish and the
+reader's own layout/attr caches expire.
+
+**A laggard is fenced, not waited on.** A reader that keeps renewing but
+stops acknowledging would otherwise turn into the writer's ENOSPC, so past
+the grace bound the writer names it, **evicts it from the plane** and
+proceeds. Eviction costs that reader availability (it must re-join, and it
+self-fences its own caches on its stricter deadline); it never costs anyone
+correctness.
+
+| Knob | Default | Purpose |
+|---|---|---|
+| `SQUEEZEFS_FREE_GRACE_MAX_MS` | derived (2 × one acknowledgement cycle ≈ 76 s with the shipped clocks) | How long a freed offset waits on a reader before that reader is fenced. One *cycle* is `3 × renewal interval + 3 × reader staleness bound + skew_max + D_purge` — every term a published number. A value **below one cycle refuses** rather than fencing readers that are answering as designed. |
+| `SQUEEZEFS_FREE_GRACE_MAX_OFFSETS` | derived `max(budget/1024/24 B, 131072)` | Per-volume cap on held offsets. The floor is field-derived: 12.7 GB/s of saturated ingest over one cycle displaces ≈ 120 k 4 MiB blocks. At the cap the writer forces progress through the same fence act — never by quietly releasing something unacknowledged. |
+
+**Space pressure: ENOSPC, not corruption.** If the free list is entirely in
+grace, allocation refuses `ENOSPC` — promptly, loudly, counted in
+`free_grace_alloc_stalls`. Reallocating an offset a reader may still resolve
+would serve another file's bytes, silently, on a passthrough volume; a
+bounded availability loss is the lesser failure, and this wait always ends
+by itself because allocation evaluates a **shorter** pressure deadline (one
+cycle, floored) and fences past it. `df` counts held offsets as **used**,
+which is honest: they are genuinely unavailable until acknowledged.
+
+**Live signals** (`.stats`, writer side). `free_grace_mode` is `off` (no
+plane — the shipped default), `idle` (armed, no members) or `armed`:
+
+| Signal | Healthy reading |
+|---|---|
+| `free_grace_deferrals` / `free_grace_releases` / `free_grace_offsets` | the ledger: `deferrals = releases + offsets`. `offsets` should oscillate with churn and fall back toward 0, not climb monotonically |
+| `free_grace_bytes` | device bytes held — the space the readers currently owe you back |
+| `free_grace_forced_releases` | **the tripwire:** offsets released *without* an acknowledgement, i.e. past the bound or at the ring cap. 0 on a healthy fleet; nonzero means at least one reader was fenced, and only that reader's coherence was ever at stake |
+| `free_grace_laggard_fences` | readers evicted for not acknowledging. Investigate alongside `membership_renewals` — a reader renewing but not acknowledging is a revalidation problem, not a network one |
+| `free_grace_alloc_stalls` | allocations that refused ENOSPC with offsets held. Expected only on a genuinely full store; sustained growth means the readers are too slow for the write rate (raise capacity, or shorten the cycle with `SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS` / `SQUEEZEFS_META_REVALIDATE_MS`) |
+| `free_grace_bound` | the label the writer may reallocate up to; `free_grace_fence_bound_ms` / `free_grace_pressure_bound_ms` / `free_grace_ring_cap` publish the derived numbers in force so this page cannot drift from them |
+| `free_grace_reader_acks` (reader side) | acknowledgements this reader has emitted. **Flat while the writer churns is the failure to look for** — it means this reader is holding the writer's free list |
 
 ## Observability
 

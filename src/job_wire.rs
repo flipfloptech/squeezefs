@@ -1757,8 +1757,8 @@ impl JobWireHost {
                 log::info!(
                     "job wire: WERO (rtype 2) held on the data namespaces (key {:#x}) — \
                      guarantee class pr (expired worker hosts will be PR-preempted). The \
-                     hold is the process's ONE data-plane reservation (DLM S7,
-                     `data_custody::acquire_wero`): an S7-armed mount and this fence share \
+                     hold is the process's ONE data-plane reservation (DLM S7, \
+                     data_custody::acquire_wero): an S7-armed mount and this fence share \
                      it rather than conflicting at the device",
                     f.key()
                 );

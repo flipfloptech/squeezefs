@@ -68,8 +68,8 @@ use std::path::Path;
 #[cfg(debug_assertions)]
 pub(crate) fn debug_audit_records(tree_id: u8, level: u8, records: &[Record]) {
     use super::record::{
-        DentryValue, InodeDelta, InodeValue, RecordKind, XattrValue, TREE_DENTRIES, TREE_INODES,
-        TREE_XATTRS,
+        DentryValue, InodeDelta, InodeValue, RecordKind, XattrValue, TREE_BLOCK_REFS,
+        TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
     };
     for r in records {
         let ok = match (level, r.kind) {
@@ -80,6 +80,14 @@ pub(crate) fn debug_audit_records(tree_id: u8, level: u8, records: &[Record]) {
                 TREE_INODES => InodeValue::decode(&r.value).is_ok(),
                 TREE_DENTRIES => DentryValue::decode(&r.value).is_ok(),
                 TREE_XATTRS => XattrValue::decode(&r.value).is_ok(),
+                // Spec §6.2 item 1: an accounting record whose key or
+                // value does not decode under its own type would
+                // mis-count shared ownership at recovery — audited here,
+                // write-side, before a byte is persisted.
+                TREE_BLOCK_REFS => {
+                    super::block_refs::decode_block_ref_key(&r.key).is_ok()
+                        && super::block_refs::decode_block_ref_value(&r.value).is_ok()
+                }
                 _ => true, // foreign trees (test harnesses) are not audited
             },
             (_, RecordKind::Delta) => {

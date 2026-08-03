@@ -219,6 +219,32 @@ pub const FEATURE_INCOMPAT_KV_DURABLE_TERM: u64 = 1 << 7;
 /// while believing it is the whole ring, and their `slot = seq % 32`
 /// checkpoints would overwrite every peer's ledger range.
 pub const FEATURE_INCOMPAT_KV_PARTITIONED_APPEND: u64 = 1 << 8;
+/// `features_incompat` bit 8: **durable data-block reference accounting**
+/// (pre-RC engineering spec §6.2 **item 1**, "the largest item"; ruling
+/// **D9**): the volume carries the
+/// [`crate::meta_backend::kv::record::TREE_BLOCK_REFS`] tree — one
+/// checksummed, CoW, journaled record per `(data volume, block, owner
+/// ino, map index)` reference — so block refcounts and the free list are
+/// **durable shared ownership accounting** instead of state re-derived by
+/// a full inode-tree walk at every mount.
+///
+/// **Presence is OPTIONAL, deliberately** (the bit-7 pattern, not bit
+/// 6's presence-required one): a volume WITHOUT this bit mounts exactly
+/// as it did before the bit existed — the mount-time layout walk
+/// (`recover_active_blocks_v3`) rebuilds the RAM refcount map and free
+/// list, no fourth tree root is minted, no accounting record is ever
+/// staged, and the superblock is not rewritten. **Mount never stamps
+/// it**; fresh formats carry it from [`SuperblockV3::plan`], and
+/// [`set_block_refcounts_bit`] is the explicit upgrade path (the batched
+/// reformat window, execution plan Phase 8). Old binaries refuse a bit-8
+/// volume loud via [`FEATURES_INCOMPAT_KNOWN`] — exactly right: they
+/// would free blocks and run W1 sole-owner patches against accounting
+/// they never maintain, silently diverging the durable ledger from the
+/// layouts.
+/// **Bit 9, not 8** — bit 8 is [`FEATURE_INCOMPAT_KV_PARTITIONED_APPEND`].
+/// Both were authored in parallel against the same free bit; partitioned
+/// append landed first, so durable block references took the next one.
+pub const FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS: u64 = 1 << 9;
 
 /// Incompat feature bits this binary understands. Any other set bit
 /// refuses the mount naming the bit (§6.1).
@@ -230,7 +256,8 @@ pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
     | FEATURE_INCOMPAT_KV_LAYOUT_DELTAS
     | FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING
     | FEATURE_INCOMPAT_KV_DURABLE_TERM
-    | FEATURE_INCOMPAT_KV_PARTITIONED_APPEND;
+    | FEATURE_INCOMPAT_KV_PARTITIONED_APPEND
+    | FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS;
 
 /// Read-only feature bits this binary understands (none yet — §4.11
 /// reserves the mechanism for snapshots). Unknown bits mount read-only.
@@ -365,15 +392,17 @@ impl SuperblockV3 {
         Ok(Self {
             node_size: node_size as u32,
             // Every fresh format is dynamic-routing (bit 6 — presence
-            // REQUIRED at decode, the NODE_SEQ_WATERMARK pattern) and
-            // durable-term (bit 7 — presence OPTIONAL: pre-S2 volumes
-            // keep mounting era-less until the reformat window stamps
-            // them); the stamp bits (2/4) ride the builder's stamped
-            // image path.
+            // REQUIRED at decode, the NODE_SEQ_WATERMARK pattern),
+            // durable-term (bit 7) and durable-block-refcounts (bit 8) —
+            // both presence-OPTIONAL: pre-S2 / pre-item-1 volumes keep
+            // mounting era-less and derived-accounting until the batched
+            // reformat window stamps them (ruling D9); the stamp bits
+            // (2/4) ride the builder's stamped image path.
             features_incompat: FEATURE_INCOMPAT_KV_V3
                 | FEATURE_INCOMPAT_NODE_SEQ_WATERMARK
                 | FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING
-                | FEATURE_INCOMPAT_KV_DURABLE_TERM,
+                | FEATURE_INCOMPAT_KV_DURABLE_TERM
+                | FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS,
             features_ro: 0,
             root_ledger,
             journal,
@@ -1092,4 +1121,27 @@ pub async fn set_slot_migration_bit(path: &Path) -> Result<bool, KvError> {
 /// era-1 here.
 pub async fn set_durable_term_bit(path: &Path) -> Result<bool, KvError> {
     set_incompat_bit(path, FEATURE_INCOMPAT_KV_DURABLE_TERM, "durable-term").await
+}
+
+/// Stamp [`FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS`] on `path`'s superblock —
+/// the §6.2 item-1 upgrade path for a volume formatted before durable
+/// block-reference accounting existed (the batched Phase-8 reformat
+/// window; **mount NEVER calls this**). Returns whether the bit was newly
+/// set. The volume must be offline (the caller holds the D0 guard).
+///
+/// Ordering note, same class as bit 7: the bit gates no
+/// silently-misdecoded record. A pre-item-1 binary refuses a stamped
+/// volume outright (the bit intersects no prior mask), and the
+/// `TREE_BLOCK_REFS` root + records only ever come from a mount that saw
+/// the bit — so stamp-then-crash is inert. The first mount after the
+/// stamp mints the (empty) tree root and starts accounting from the
+/// derived census, which is exactly the state the pre-stamp mount
+/// rebuilt anyway.
+pub async fn set_block_refcounts_bit(path: &Path) -> Result<bool, KvError> {
+    set_incompat_bit(
+        path,
+        FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS,
+        "durable-block-refcounts",
+    )
+    .await
 }

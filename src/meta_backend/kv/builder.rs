@@ -40,7 +40,8 @@ use super::checkpoint::{write_ledger_slot, LedgerRecord, TreeRoot};
 use super::node::{key_successor, write_node, NodeLayout, NodeWriteParams, NODE_PAGE};
 use super::record::{
     dentry_key, dentry_name_hash54, inode_key, xattr_key, xattr_name_hash56, DentryValue,
-    InodeValue, Record, XattrValue, TREE_DENTRIES, TREE_INODES, TREE_XATTRS,
+    InodeValue, Record, XattrValue, TREE_BLOCK_REFS, TREE_DENTRIES, TREE_INODES,
+    TREE_XATTRS,
 };
 use super::superblock::{write_superblock_v3, SuperblockV3};
 use super::tree::{encode_interior_value, KvTree, KEY_SPACE_MAX};
@@ -461,12 +462,24 @@ impl ImageBuilder {
             next_node_seq: node_seq_base(self.cfg.uuid),
             nodes_written: 0,
         };
-        let mut tree_roots = Vec::with_capacity(3);
-        for (tree_id, records) in [
+        // Spec §6.2 item 1 (incompat bit 8): a fresh format carries the
+        // durable block-reference tree from birth — an EMPTY root, one
+        // node, minted here so no mount ever has to structurally mutate
+        // a volume just to start accounting. A volume without the bit
+        // gets no root and no tree (the un-stamped path stays
+        // byte-identical to pre-item-1 behavior).
+        let block_refs =
+            sb.features_incompat & super::superblock::FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS != 0;
+        let mut planned: Vec<(u8, Vec<Record>)> = vec![
             (TREE_INODES, self.inode_records()),
             (TREE_DENTRIES, self.dentry_records()?),
             (TREE_XATTRS, self.xattr_records()?),
-        ] {
+        ];
+        if block_refs {
+            planned.push((TREE_BLOCK_REFS, Vec::new()));
+        }
+        let mut tree_roots = Vec::with_capacity(planned.len());
+        for (tree_id, records) in planned {
             let (addr, seq) = writer.write_tree(tree_id, records).await?;
             tree_roots.push(TreeRoot {
                 tree_id,

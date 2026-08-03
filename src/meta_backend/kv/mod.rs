@@ -48,6 +48,7 @@
 pub mod alloc_ext;
 pub mod alloc_ext_core;
 pub mod backend;
+pub mod block_refs;
 pub mod bset;
 pub mod builder;
 pub mod checkpoint;
@@ -184,6 +185,45 @@ pub static META_KV_PENDING_FREE_RELEASED: AtomicU64 = AtomicU64::new(0);
 /// volume lives at the cap — durable-tail coverage is lagging SMO
 /// pressure. Surfaced as `meta_kv_pending_free_overflow`.
 pub static META_KV_PENDING_FREE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+/// Pre-RC spec §6.2 item 1 (incompat bit 8): durable block-reference
+/// records **staged** into layout transactions — one `Put` per reference
+/// taken. Rides the publish tx, so `staged/publish` is the accounting's
+/// per-op cost and a flat counter on a striped write storm means the
+/// wiring regressed to derived-only. Surfaced as
+/// `meta_kv_block_refs_staged`.
+pub static META_KV_BLOCK_REFS_STAGED: AtomicU64 = AtomicU64::new(0);
+
+/// §6.2 item 1: durable block-reference records **released** (one
+/// `Delete` per reference dropped — displacement, truncate/punch prune,
+/// unlink destroy, clone teardown). `staged − released` tracks the live
+/// durable population; a released count that never moves under overwrite
+/// churn means displaced blocks are leaking their accounting.
+/// Surfaced as `meta_kv_block_refs_released`.
+pub static META_KV_BLOCK_REFS_RELEASED: AtomicU64 = AtomicU64::new(0);
+
+/// §6.2 item 1: references seeded into the RAM allocator **from durable
+/// records** at mount — the count that replaces the inode-tree walk.
+/// Nonzero on a bit-8 volume with data; structurally 0 on an un-stamped
+/// volume (which still walks). Surfaced as
+/// `meta_kv_block_refs_recovered`.
+pub static META_KV_BLOCK_REFS_RECOVERED: AtomicU64 = AtomicU64::new(0);
+
+/// §6.2 item 1: **durable-vs-derived drift** — blocks whose durable
+/// reference population disagreed with the layout walk's census. The
+/// oracle's verdict, and a **must-stay-0 tripwire**: any nonzero value is
+/// an fsck finding (`FindingId::C8DurableRefDrift`) and means the durable
+/// ledger and the layouts that justify it diverged. Surfaced as
+/// `meta_kv_block_refs_drift`.
+pub static META_KV_BLOCK_REFS_DRIFT: AtomicU64 = AtomicU64::new(0);
+
+/// §6.2 item 1: accounting operations **dropped because no resolver /
+/// no engaged tree** was available (offline tools and unit fixtures that
+/// build a router without a bit-8 meta backend). Honest instead of
+/// silent: a mount that grows this is running derived-only accounting
+/// while believing otherwise. Surfaced as
+/// `meta_kv_block_refs_unresolved`.
+pub static META_KV_BLOCK_REFS_UNRESOLVED: AtomicU64 = AtomicU64::new(0);
 
 /// PR M6 (design-metadata-throughput §5.4 D4): kernel post-op ctime
 /// writeback echoes (`fuse_update_ctime` → `fuse_flush_times` →

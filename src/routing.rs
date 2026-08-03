@@ -1978,6 +1978,167 @@ impl BackendRouter {
         }
     }
 
+    /// Resolve a (possibly decorated) block key into the **durable block
+    /// reference** naming it (pre-RC engineering spec §6.2 item 1): the
+    /// owning data volume's stable tag plus the block index inside it.
+    ///
+    /// Decoration-tolerant like every sibling here (`bk:off:len` size-
+    /// carrying mappings account against their BASE block — the same rule
+    /// `free_block` and `increment_refcount` apply, and the same one the
+    /// mount-time layout walk applies, which is what keeps the durable
+    /// census and the derived census the same multiset).
+    ///
+    /// `None` = the key names no allocator-managed offset (legacy
+    /// `block_prefix` parts, unknown backends, unparsable keys). Those can
+    /// never be freed-and-reallocated under one key string, so they are
+    /// exactly the keys the derived walk also skips.
+    pub fn block_ref_for(
+        &self,
+        block_key: &str,
+        owner_ino: u64,
+        block_index: u32,
+    ) -> Option<crate::meta_backend::kv::block_refs::BlockRef> {
+        let (alloc, offset) = self.allocator_for_key(block_key)?;
+        Some(crate::meta_backend::kv::block_refs::BlockRef {
+            vol_tag: crate::meta_backend::kv::block_refs::volume_tag(alloc.volume_id()),
+            block_idx: offset / alloc.chunk_size(),
+            owner_ino,
+            block_index,
+        })
+    }
+
+    /// The durable-reference tag of every data volume this router owns,
+    /// paired with its allocator — the mount-recovery scan's key set and
+    /// the durable-vs-derived census's index. Deduped by allocator
+    /// identity (the default slot aliases the first registered backend on
+    /// real mounts).
+    pub fn durable_ref_volumes(
+        &self,
+    ) -> Vec<(u64, std::sync::Arc<crate::block_allocator::BlockAllocator>)> {
+        let mut out: Vec<(u64, std::sync::Arc<crate::block_allocator::BlockAllocator>)> = vec![(
+            crate::meta_backend::kv::block_refs::volume_tag(self.default_allocator.volume_id()),
+            self.default_allocator.clone(),
+        )];
+        for be in self.backends.iter() {
+            let alloc = &be.value().block_allocator;
+            if out.iter().any(|(_, a)| std::sync::Arc::ptr_eq(a, alloc)) {
+                continue;
+            }
+            out.push((
+                crate::meta_backend::kv::block_refs::volume_tag(alloc.volume_id()),
+                alloc.clone(),
+            ));
+        }
+        out
+    }
+
+    /// **Durable block-reference recovery** (pre-RC engineering spec §6.2
+    /// item 1) — seed every data volume's RAM refcount map, free list and
+    /// allocation cursor from the DURABLE records, with **no inode-tree
+    /// walk**. Returns `Some(references_seeded)` when the durable path ran,
+    /// `None` when no mounted meta volume carries incompat bit 8 (the
+    /// caller then falls back to the derived walk, which is pre-item-1
+    /// behavior verbatim).
+    ///
+    /// Set-additivity is the whole reason this composes: records live on
+    /// the meta volume that hosts the referencing inode (which is what
+    /// lets a reference ride that inode's layout transaction), so a
+    /// block's set-wide refcount is the SUM of its per-volume record
+    /// populations. Summing here is that sum.
+    ///
+    /// Conservative by design: a reference is honoured even when its owner
+    /// inode is gone (the crash-between-unlink-and-reclaim window), so
+    /// recovery can leak a corpse's blocks but can never mint one offset
+    /// to two owners. fsck C2 + the C8 drift ledger reclaim the residue.
+    pub async fn recover_durable_block_refs(
+        &self,
+        routed: &crate::meta_backend::RoutedMetaBackend,
+    ) -> Result<Option<u64>> {
+        if !routed.volumes.iter().any(|kv| kv.block_refs_engaged()) {
+            return Ok(None);
+        }
+        let mut total = 0u64;
+        for (vol_tag, alloc) in self.durable_ref_volumes() {
+            let mut indices: Vec<u64> = Vec::new();
+            for kv in &routed.volumes {
+                for r in kv.block_ref_scan(vol_tag).await.map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!(
+                        "durable block-reference scan failed on {}: {e}",
+                        kv.device_path().display()
+                    ))
+                })? {
+                    indices.push(r.block_idx);
+                }
+            }
+            total += alloc.seed_from_durable_refs(&indices).await;
+        }
+        Ok(Some(total))
+    }
+
+    /// **The durable-vs-derived comparison** (spec §6.2 item 1): run the
+    /// oracle — the mount-time layout walk, folded into a census instead
+    /// of into the allocator — and diff it against the durable record
+    /// population, per data volume.
+    ///
+    /// Returns one entry per DISAGREEING block:
+    /// `(volume id, block index, durable count, derived count)`. An empty
+    /// vector is the accounting's correctness statement; anything else is
+    /// an fsck finding (`C8DurableRefDrift`) and increments the
+    /// must-stay-0 `meta_kv_block_refs_drift` tripwire.
+    ///
+    /// Exactness is structural, not hopeful: the durable ledger holds one
+    /// record per layout map entry and the oracle counts one reference per
+    /// layout map entry, through the SAME key-resolution code
+    /// (`layout_owned_blocks` / `block_ref_for` both funnel through
+    /// `clean_block_key` + `parse_block_key` with the same alias rules).
+    pub async fn verify_durable_block_refs(
+        &self,
+        routed: &crate::meta_backend::RoutedMetaBackend,
+    ) -> Result<Vec<(String, u64, u32, u32)>> {
+        let mut drift = Vec::new();
+        for (vol_tag, alloc) in self.durable_ref_volumes() {
+            let mut durable: std::collections::BTreeMap<u64, u32> =
+                std::collections::BTreeMap::new();
+            let mut derived: std::collections::BTreeMap<u64, u32> =
+                std::collections::BTreeMap::new();
+            for kv in &routed.volumes {
+                for r in kv.block_ref_scan(vol_tag).await.map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!(
+                        "durable block-reference scan failed on {}: {e}",
+                        kv.device_path().display()
+                    ))
+                })? {
+                    *durable.entry(r.block_idx).or_insert(0) += 1;
+                }
+                for (idx, n) in alloc.derived_block_census(kv, self).await? {
+                    *derived.entry(idx).or_insert(0) += n;
+                }
+            }
+            let mut blocks: Vec<u64> = durable.keys().chain(derived.keys()).copied().collect();
+            blocks.sort_unstable();
+            blocks.dedup();
+            for idx in blocks {
+                let d = durable.get(&idx).copied().unwrap_or(0);
+                let v = derived.get(&idx).copied().unwrap_or(0);
+                if d != v {
+                    drift.push((alloc.volume_id().to_string(), idx, d, v));
+                }
+            }
+        }
+        if !drift.is_empty() {
+            crate::meta_backend::kv::META_KV_BLOCK_REFS_DRIFT
+                .fetch_add(drift.len() as u64, Ordering::Relaxed);
+            log::error!(
+                "DURABLE BLOCK-REFERENCE DRIFT: {} block(s) whose durable reference \
+                 population disagrees with the layout walk — the ledger and the layouts \
+                 that justify it diverged (fsck class C8). First offenders: {:?}",
+                drift.len(),
+                &drift[..drift.len().min(8)]
+            );
+        }
+        Ok(drift)
+    }
+
     /// The allocator refcount behind a (possibly decorated) block key —
     /// `None` = the offset is not allocator-tracked (freed, or a mapping
     /// class the recovery walk does not account). The VL4 mover uses it
@@ -3896,7 +4057,75 @@ impl DataRouter {
         m: &CachedMetadata,
         fencing_token: u64,
     ) -> Result<()> {
-        self.save_metadata_to_backend_ext(ino, m, fencing_token, None)
+        self.save_metadata_to_backend_ext(ino, m, fencing_token, None, &[])
+            .await
+    }
+
+    /// [`Self::save_metadata_to_backend`] carrying the transaction's
+    /// **durable block-reference operations** (pre-RC engineering spec
+    /// §6.2 item 1): every reference this save's layout gains or loses,
+    /// staged into the SAME commit as the layout record. Sites that mutate
+    /// a block map compute them at O(batch) — they already know the
+    /// inserted and displaced keys — and every other save passes `&[]`.
+    ///
+    /// A missed op is not silent: the durable-vs-derived census
+    /// ([`Self::verify_durable_block_refs`]) is the oracle, and its drift
+    /// is an fsck finding.
+    /// Commit a standalone durable block-reference release for `ino` (spec
+    /// §6.2 item 1) — the reclaim path's ledger teardown. See the ordering
+    /// note at the call site in [`Self::delete_file`].
+    pub(crate) async fn release_block_refs(
+        &self,
+        ino: u64,
+        ops: &[crate::meta_backend::kv::block_refs::BlockRefOp],
+    ) -> Result<()> {
+        let Some(backend) = self.inner.meta_backend.get() else {
+            return Ok(());
+        };
+        backend.commit_block_refs(ino, ops).await
+    }
+
+    /// Translate a merge's `(map index, block key, taken?)` changes into
+    /// durable [`crate::meta_backend::kv::block_refs::BlockRefOp`]s (spec
+    /// §6.2 item 1).
+    ///
+    /// Keys that resolve to no allocator-managed offset are counted, not
+    /// silently dropped: `meta_kv_block_refs_unresolved` growing on a real
+    /// mount means the accounting is running blind on some mapping class.
+    /// (Those are the same keys the mount-time layout walk skips — legacy
+    /// `block_prefix` parts and unknown backends — so the census stays
+    /// exact.)
+    pub(crate) fn block_ref_ops(
+        &self,
+        ino: u64,
+        changes: &[(u32, String, bool)],
+    ) -> Vec<crate::meta_backend::kv::block_refs::BlockRefOp> {
+        use crate::meta_backend::kv::block_refs::BlockRefOp;
+        let mut out = Vec::with_capacity(changes.len());
+        for (block_index, key, take) in changes {
+            match self.backend_router.block_ref_for(key, ino, *block_index) {
+                Some(r) => out.push(if *take {
+                    BlockRefOp::taken(r)
+                } else {
+                    BlockRefOp::released(r)
+                }),
+                None => {
+                    crate::meta_backend::kv::META_KV_BLOCK_REFS_UNRESOLVED
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) async fn save_metadata_to_backend_refs(
+        &self,
+        ino: u64,
+        m: &CachedMetadata,
+        fencing_token: u64,
+        block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
+    ) -> Result<()> {
+        self.save_metadata_to_backend_ext(ino, m, fencing_token, None, block_refs)
             .await
     }
 
@@ -3915,6 +4144,7 @@ impl DataRouter {
         m: &CachedMetadata,
         fencing_token: u64,
         publish_entries: Option<&[(u32, String)]>,
+        block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
     ) -> Result<()> {
         let backend = self.inner.meta_backend.get().ok_or_else(|| {
             SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
@@ -3935,6 +4165,9 @@ impl DataRouter {
         let is_publish = publish_entries.is_some();
         let t_encode = std::time::Instant::now();
         let mut old_indirect_to_free = None;
+        // Spec §6.2 item 1: the fresh CoW indirect-map blob this save
+        // names (if any) — its durable reference is taken in the same tx.
+        let mut new_indirect_key: Option<String> = None;
         // The layout as it would be persisted INLINE (block map retained under
         // the inline sentinel). The indirect branch below overwrites the map /
         // id only if the serialized value spills past the per-volume cap.
@@ -4046,6 +4279,7 @@ impl DataRouter {
 
             layout.block_map = None;
             layout.block_map_id = Some(format!("indirect:{}", block_key));
+            new_indirect_key = Some(block_key.clone());
 
             let out = bincode::serialize(&layout).map_err(|e| {
                 SqueezefsError::Io(std::io::Error::new(
@@ -4076,6 +4310,46 @@ impl DataRouter {
         // as an O(batch) delta when the whole eligibility ladder holds —
         // the backend's half (live non-JSON base + incompat ratchet)
         // decides the rest and returns what it staged.
+        // Spec §6.2 item 1: the transaction's durable accounting — the
+        // caller's map deltas plus THIS save's indirect-map-blob custody
+        // transfer. The blob is a real data block the layout record
+        // references (the mount-time walk `recover_block`s it), so it
+        // carries its own reference under the
+        // `BLOCK_INDEX_MAP_BLOB` sentinel: taken when this save names a
+        // fresh CoW blob, released when it stops naming the predecessor.
+        // Both ride the layout commit, so the blob's accounting flips in
+        // the same checksummed journal entry that re-points the layout at
+        // it — the DUR-6 CoW ordering extended to the ledger.
+        let mut refs: Vec<crate::meta_backend::kv::block_refs::BlockRefOp> =
+            Vec::with_capacity(block_refs.len() + 2);
+        refs.extend_from_slice(block_refs);
+        if let Some(ref new_blob) = new_indirect_key {
+            match self.backend_router.block_ref_for(
+                new_blob,
+                ino,
+                crate::meta_backend::kv::block_refs::BLOCK_INDEX_MAP_BLOB,
+            ) {
+                Some(r) => refs.push(crate::meta_backend::kv::block_refs::BlockRefOp::taken(r)),
+                None => {
+                    crate::meta_backend::kv::META_KV_BLOCK_REFS_UNRESOLVED
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        if let Some(ref old_blob) = old_indirect_to_free {
+            match self.backend_router.block_ref_for(
+                old_blob,
+                ino,
+                crate::meta_backend::kv::block_refs::BLOCK_INDEX_MAP_BLOB,
+            ) {
+                Some(r) => refs.push(crate::meta_backend::kv::block_refs::BlockRefOp::released(r)),
+                None => {
+                    crate::meta_backend::kv::META_KV_BLOCK_REFS_UNRESOLVED
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
         let max_chain = layout_delta_max_chain();
         let delta_eligible = publish_entries.is_some()
             && !needs_indirect
@@ -4102,10 +4376,12 @@ impl DataRouter {
             // conveyor parks it as the always-correct fallback — a move,
             // never a per-save copy).
             backend
-                .merge_layout_and_size(ino, &delta, bytes::Bytes::from(bytes), m.size)
+                .merge_layout_and_size(ino, &delta, bytes::Bytes::from(bytes), m.size, refs)
                 .await?
         } else {
-            backend.set_layout_and_size(ino, &bytes, m.size).await?;
+            backend
+                .set_layout_and_size(ino, &bytes, m.size, &refs)
+                .await?;
             false
         };
         // DUR-6: the commit named the fresh blob — custody transferred.
@@ -7372,6 +7648,16 @@ impl DataRouter {
         let mut block_map_arc = current.block_map.take().unwrap_or_default();
         let block_map = std::sync::Arc::make_mut(&mut block_map_arc);
         let mut displaced: Vec<String> = Vec::new();
+        // Spec §6.2 item 1: the EXACT durable-reference delta this merge
+        // produces — `(map index, block key, taken?)`. O(batch): the
+        // merge already knows every key it inserts and every key it
+        // displaces or prunes, so the durable accounting costs one vector
+        // push per changed entry and rides this merge's own commit. This
+        // is the one place a striped/staged block map changes (§5.3 "one
+        // merge discipline"), which is what makes a single delta
+        // computation cover write-through, promotion, mover republish,
+        // truncate and punch alike.
+        let mut ref_changes: Vec<(u32, String, bool)> = Vec::new();
         let purge = |bk: &str| {
             // Purge every cache tier for a displaced/removed key: its offset
             // will be reallocated under the SAME key string once freed, and
@@ -7381,11 +7667,17 @@ impl DataRouter {
         match op {
             BlockMapOp::Merge(entries) => {
                 for (b, new_key) in entries {
-                    if let Some(prev) = block_map.insert(*b, new_key.clone()) {
-                        if prev != *new_key {
+                    match block_map.insert(*b, new_key.clone()) {
+                        Some(prev) if prev != *new_key => {
                             purge(&prev);
+                            ref_changes.push((*b, prev.clone(), false));
+                            ref_changes.push((*b, new_key.clone(), true));
                             displaced.push(prev);
                         }
+                        // Re-binding an index to the key it already holds
+                        // changes no reference (idempotent merge).
+                        Some(_) => {}
+                        None => ref_changes.push((*b, new_key.clone(), true)),
                     }
                 }
                 // Size floor: never below the caller's bound nor the freshest
@@ -7410,6 +7702,8 @@ impl DataRouter {
                                 .insert(*b, new_key.clone())
                                 .expect("get() just observed the entry");
                             purge(&prev);
+                            ref_changes.push((*b, prev.clone(), false));
+                            ref_changes.push((*b, new_key.clone(), true));
                             displaced.push(prev);
                         }
                         _ => {}
@@ -7428,6 +7722,7 @@ impl DataRouter {
                 block_map.retain(|&b, bk| {
                     if (b as u64) * block_size >= new_size {
                         purge(bk);
+                        ref_changes.push((b, bk.clone(), false));
                         displaced.push(bk.clone());
                         false
                     } else {
@@ -7440,6 +7735,7 @@ impl DataRouter {
                 for &b in idxs {
                     if let Some(bk) = block_map.remove(&b) {
                         purge(&bk);
+                        ref_changes.push((b, bk.clone(), false));
                         displaced.push(bk);
                     }
                 }
@@ -7483,8 +7779,11 @@ impl DataRouter {
 
         // Fencing revalidation happens inside; the save also republishes the
         // RAM metadata_cache entry, keeping RAM + backend coherent under the
-        // same guard.
-        self.save_metadata_to_backend(ino, &current, fencing_token)
+        // same guard. Spec §6.2 item 1: the durable accounting delta rides
+        // that same commit (one tx = one checksummed journal entry), so a
+        // crash can never leave the ledger and the map disagreeing.
+        let refs = self.block_ref_ops(ino, &ref_changes);
+        self.save_metadata_to_backend_refs(ino, &current, fencing_token, &refs)
             .await?;
         Ok(Some(displaced))
     }
@@ -7744,6 +8043,12 @@ impl DataRouter {
         let mut applied: Vec<Outcome<Vec<String>>> = Vec::new();
         let mut fenced: Vec<Outcome<u64>> = Vec::new();
         let mut batch_entries: Vec<(u32, String)> = Vec::new();
+        // Spec §6.2 item 1: the batch's EXACT durable-reference delta,
+        // accumulated per applied op (a FENCED op contributes nothing —
+        // its entries never enter the map, so they must never enter the
+        // ledger either). Rides the batch's ONE save, so the aggregated
+        // publish stays one journal entry, accounting included.
+        let mut ref_changes: Vec<(u32, String, bool)> = Vec::new();
         let mut save_token = 0u64;
         for op in batch {
             // Per-op fencing: a stale op fails ALONE (the supersession
@@ -7758,14 +8063,18 @@ impl DataRouter {
             }
             let mut displaced: Vec<String> = Vec::new();
             for (b, new_key) in &op.entries {
-                if let Some(prev) = block_map.insert(*b, new_key.clone()) {
-                    if prev != *new_key {
+                match block_map.insert(*b, new_key.clone()) {
+                    Some(prev) if prev != *new_key => {
                         // Purge every tier for a displaced key — its
                         // offset will be reallocated under the SAME key
                         // string once freed (the primitive's rule).
                         self.cache.purge_block_key(&prev);
+                        ref_changes.push((*b, prev.clone(), false));
+                        ref_changes.push((*b, new_key.clone(), true));
                         displaced.push(prev);
                     }
+                    Some(_) => {}
+                    None => ref_changes.push((*b, new_key.clone(), true)),
                 }
             }
             // Size floor: never below the op's bound (the freshest RAM
@@ -7817,7 +8126,13 @@ impl DataRouter {
             .layout_publish_batches
             .fetch_add(1, Ordering::Relaxed);
         match self
-            .save_metadata_to_backend_ext(ino, &current, save_token, Some(&batch_entries))
+            .save_metadata_to_backend_ext(
+                ino,
+                &current,
+                save_token,
+                Some(&batch_entries),
+                &self.block_ref_ops(ino, &ref_changes),
+            )
             .await
         {
             Ok(()) => {
@@ -11536,8 +11851,33 @@ impl DataRouter {
             }
         }
 
-        self.save_metadata_to_backend(dest_ino, &updated_meta, resolved_dest_token)
-            .await?;
+        // Spec §6.2 item 1: the clone's DURABLE shared ownership. The RAM
+        // refcount was raised by `pin_block_validated` above (one
+        // reference per source block); this stages the matching durable
+        // record — one per dest map entry — into the dest's layout commit,
+        // so a remount reads refcount 2 for a shared block instead of
+        // re-deriving it from a tree walk. Without this the §6.3 W1 hazard
+        // is exactly reproducible across a remount: the surviving mount
+        // would read 1 and patch a block the clone still references.
+        //
+        // Every layout class contributes: a staged clone's promoted whole
+        // image (`block_map[0]`) and a striped clone's whole map alike —
+        // `updated_meta.block_map` is the dest's complete reference set at
+        // this point, which is also exactly what the derived walk reads
+        // back.
+        let clone_changes: Vec<(u32, String, bool)> = updated_meta
+            .block_map
+            .as_deref()
+            .map(|m| m.iter().map(|(b, k)| (*b, k.clone(), true)).collect())
+            .unwrap_or_default();
+        let clone_refs = self.block_ref_ops(dest_ino, &clone_changes);
+        self.save_metadata_to_backend_refs(
+            dest_ino,
+            &updated_meta,
+            resolved_dest_token,
+            &clone_refs,
+        )
+        .await?;
 
         let mut cached_opt = self.cache.write_lru.get(src);
         if cached_opt.is_none() {
@@ -11915,10 +12255,16 @@ impl DataRouter {
         let meta = self.fetch_metadata(file_path).await?;
 
         let mut blocks_to_free: Vec<String> = Vec::new();
+        // Spec §6.2 item 1: the corpse's durable references, released
+        // before its blocks are. See the release ordering note at the
+        // `release_block_refs` call below.
+        let ino = parse_inode_from_path(file_path);
+        let mut ref_changes: Vec<(u32, String, bool)> = Vec::new();
 
         if let Some(ref block_map) = meta.block_map {
-            for bk in block_map.values() {
+            for (b, bk) in block_map.iter() {
                 self.cache.purge_block_key(bk);
+                ref_changes.push((*b, bk.clone(), false));
                 blocks_to_free.push(clean_block_key(bk));
             }
         }
@@ -11937,7 +12283,46 @@ impl DataRouter {
         if let Some(ref map_id) = meta.block_map_id {
             if map_id.starts_with("indirect:") {
                 let block_key = map_id.strip_prefix("indirect:").unwrap();
+                ref_changes.push((
+                    crate::meta_backend::kv::block_refs::BLOCK_INDEX_MAP_BLOB,
+                    block_key.to_string(),
+                    false,
+                ));
                 blocks_to_free.push(block_key.to_string());
+            }
+        }
+
+        // Spec §6.2 item 1 — release the corpse's durable references
+        // BEFORE the blocks themselves, and in their own commit.
+        //
+        // Ordering rationale (the two crash windows, both safe):
+        //
+        // * **release → crash → no destroy.** The inode is already
+        //   `nlink == 0` here (this runs from reclaim, after unlink
+        //   committed), and the derived oracle SKIPS `nlink == 0` inodes
+        //   by construction — so "no durable references for a corpse" is
+        //   exactly what the oracle says too. The blocks read free on both
+        //   sides; no drift, no corruption.
+        // * **crash → no release.** The corpse's references survive, so
+        //   recovery keeps its blocks ALLOCATED — conservative in the safe
+        //   direction (a leak, never a double-owner mint). Existing
+        //   machinery reclaims it: fsck C2 (`allocated with zero
+        //   referencers`, whose referencer walk also skips corpses) and the
+        //   C8 drift ledger name it.
+        //
+        // Its own transaction, deliberately: unlink/reclaim is not the
+        // publish path (the no-second-commit rule is about the block
+        // publish), and `destroy_inodes` is a batched multi-ino commit that
+        // does not — and should not — decode layouts to learn block keys.
+        if !ref_changes.is_empty() {
+            let refs = self.block_ref_ops(ino, &ref_changes);
+            if let Err(e) = self.release_block_refs(ino, &refs).await {
+                // Never block the reclaim on the ledger: a failed release
+                // is the conservative window above (blocks stay accounted
+                // and fsck reclaims them), so log loud and continue.
+                log::warn!(
+                    "durable block-reference release failed for reclaimed ino {ino}: {e}                      (the corpse's references survive — fsck C2/C8 reclaim them; the                      blocks themselves are freed below)"
+                );
             }
         }
 

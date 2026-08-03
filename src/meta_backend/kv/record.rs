@@ -26,6 +26,21 @@ pub const TREE_XATTRS: u8 = 3;
 pub const TREE_ALLOC_RESERVED: u8 = 4;
 /// Reserved: future data-block backpointer tree (roadmap step 2 remainder).
 pub const TREE_BACKPTR_RESERVED: u8 = 5;
+/// **Durable data-block reference tree** (pre-RC engineering spec §6.2
+/// item 1; incompat bit 8): key/value per
+/// [`crate::meta_backend::kv::block_refs`], one record per
+/// `(volume, block, owner ino, map index)` reference. Present only on
+/// volumes carrying
+/// [`super::superblock::FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS`]; every
+/// other volume has no such root and behaves exactly as it did before
+/// the bit existed.
+pub const TREE_BLOCK_REFS: u8 = 6;
+
+/// Highest tree id this binary writes or accepts on the wire. The
+/// journal's tag nibble ([`super::journal::tag_for`]) bounds it at 15;
+/// anything outside `TREE_INODES..=TREE_ID_MAX` is structural
+/// corruption.
+pub const TREE_ID_MAX: u8 = TREE_BLOCK_REFS;
 
 // ---------------------------------------------------------------------------
 // Key builders — memcmp-ordered big-endian composites (design §4.2).
@@ -1220,6 +1235,8 @@ mod tests {
         assert_eq!(TREE_XATTRS, 3);
         assert_eq!(TREE_ALLOC_RESERVED, 4);
         assert_eq!(TREE_BACKPTR_RESERVED, 5);
+        assert_eq!(TREE_BLOCK_REFS, 6);
+        assert_eq!(TREE_ID_MAX, TREE_BLOCK_REFS);
     }
 
     #[test]

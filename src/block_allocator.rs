@@ -1152,19 +1152,106 @@ impl BlockAllocator {
         Ok(())
     }
 
+    /// **The derived census — the verification oracle** (pre-RC
+    /// engineering spec §6.2 item 1).
+    ///
+    /// The same walk [`Self::recover_active_blocks_v3`] runs, but folded
+    /// into a `block_idx → reference count` map instead of mutated into
+    /// the allocator. Once block ownership is DURABLE, this walk stops
+    /// being the source of truth and becomes the check: a mount (or fsck)
+    /// that compares the durable census against this one is the strongest
+    /// available test of the accounting, because the two are the same
+    /// multiset by construction — one durable record per layout map
+    /// entry.
+    ///
+    /// Deliberately shares [`Self::layout_owned_blocks`] with the
+    /// recovery path: an oracle that re-implemented the extraction would
+    /// only ever test the re-implementation.
+    pub async fn derived_block_census(
+        &self,
+        kv: &crate::meta_backend::kv::backend::KvMetaBackend,
+        backend_router: &crate::routing::BackendRouter,
+    ) -> Result<std::collections::BTreeMap<u64, u32>> {
+        let mut census: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
+        let mut indirect: Vec<String> = Vec::new();
+        self.walk_live_layouts(kv, |layout| {
+            let (mut owned, mut blobs) = self.layout_owned_blocks(backend_router, layout);
+            for idx in owned.drain(..) {
+                *census.entry(idx).or_insert(0) += 1;
+            }
+            indirect.append(&mut blobs);
+        })
+        .await?;
+        // The indirect blobs' ENTRIES need device reads, which cannot run
+        // inside the synchronous visitor (never `block_on` a device read
+        // from an async context — the write-funnel conviction).
+        for key in indirect {
+            for idx in self.indirect_owned_blocks(backend_router, &key).await {
+                *census.entry(idx).or_insert(0) += 1;
+            }
+        }
+        Ok(census)
+    }
+
     /// Block refcount recovery over a metadata volume — walk the live
-    /// inode tree (paged range scans) and feed each live ino's `"layout"`
-    /// xattr through the shared per-layout recovery body.
+    /// inode tree (paged range scans) and seed the RAM refcount map + free
+    /// list from each live ino's `"layout"` xattr.
+    ///
+    /// On a volume carrying incompat bit 8 this is no longer the mount
+    /// path (see [`crate::routing::BackendRouter::recover_durable_block_refs`]
+    /// — durable records replace the walk); it remains the oracle's engine
+    /// (via [`Self::derived_block_census`]) and the un-stamped volume's
+    /// only accounting, byte-identical to its pre-item-1 behavior.
     pub async fn recover_active_blocks_v3(
         &self,
         kv: &crate::meta_backend::kv::backend::KvMetaBackend,
         backend_router: &crate::routing::BackendRouter,
     ) -> Result<()> {
+        // Two passes' worth of work in one: collect the owned indices
+        // under the walk (which borrows `self` immutably), then seed.
+        // `recover_block` is `async`, so it cannot run inside the
+        // synchronous visitor.
+        let mut indices: Vec<u64> = Vec::new();
+        let mut indirect: Vec<String> = Vec::new();
+        let summary = self
+            .walk_live_layouts(kv, |layout| {
+                let (owned, mut blobs) = self.layout_owned_blocks(backend_router, layout);
+                indices.extend(owned);
+                indirect.append(&mut blobs);
+            })
+            .await?;
+        for key in indirect {
+            indices.extend(self.indirect_owned_blocks(backend_router, &key).await);
+        }
+        for idx in indices {
+            let _ = self.recover_block(idx).await;
+        }
+        // log, not stdout: this walk also runs under `squeezefs df`, whose
+        // `--json` output must stay machine-parseable.
+        log::info!(
+            "Recovery scan summary (v3): checked={}, valid_inodes={}, layouts_found={}",
+            summary.checked,
+            summary.valid_inodes,
+            summary.layouts_found
+        );
+        Ok(())
+    }
+
+    /// Walk every LIVE inode's decoded `"layout"` xattr on one metadata
+    /// volume (paged range scans, `nlink == 0` corpses skipped — the
+    /// reclaim contract), handing each to `visit`. The shared engine of
+    /// the recovery seed and its oracle.
+    async fn walk_live_layouts<F>(
+        &self,
+        kv: &crate::meta_backend::kv::backend::KvMetaBackend,
+        mut visit: F,
+    ) -> Result<LayoutWalkSummary>
+    where
+        F: FnMut(&crate::routing::LayoutMetadata),
+    {
         use crate::meta_backend::kv::record::{decode_inode_key, inode_key, InodeValue};
         let inodes = kv.trees()[0];
-        let mut checked = 0u64;
-        let mut valid_inodes = 0u64;
-        let mut layouts_found = 0u64;
+        let mut summary = LayoutWalkSummary::default();
         let mut cursor: Vec<u8> = inode_key(1).to_vec();
         let end = inode_key(u64::MAX - 1);
         loop {
@@ -1184,185 +1271,168 @@ impl BlockAllocator {
                 let Ok(val) = InodeValue::decode(v) else {
                     continue;
                 };
-                checked += 1;
+                summary.checked += 1;
                 if val.nlink == 0 {
                     continue;
                 }
-                valid_inodes += 1;
+                summary.valid_inodes += 1;
                 if let Ok(Some(bytes)) = kv.getxattr(ino, "layout").await {
-                    layouts_found += 1;
+                    summary.layouts_found += 1;
                     let layout_opt: Option<crate::routing::LayoutMetadata> =
                         if bytes.starts_with(b"{") {
                             serde_json::from_slice(&bytes).ok()
                         } else {
                             bincode::deserialize(&bytes).ok()
                         };
-                    self.recover_from_layout(backend_router, layout_opt).await;
-                }
-            }
-        }
-        // log, not stdout: this walk also runs under `squeezefs df`, whose
-        // `--json` output must stay machine-parseable.
-        log::info!(
-            "Recovery scan summary (v3): checked={}, valid_inodes={}, layouts_found={}",
-            checked,
-            valid_inodes,
-            layouts_found
-        );
-        Ok(())
-    }
-
-    /// The shared per-layout refcount recovery body (extracted verbatim
-    /// from the v2 scan; both format walks feed it).
-    async fn recover_from_layout(
-        &self,
-        backend_router: &crate::routing::BackendRouter,
-        layout_opt: Option<crate::routing::LayoutMetadata>,
-    ) {
-        {
-            {
-                {
-                    {
-                        if let Some(layout) = layout_opt {
-                            // FIND-RW5-A remount face: STAGED files carry
-                            // durable block_map entries too — the staged
-                            // truncate-clip (`bk:0:len`) and the StorageFull
-                            // durable spills. Gating this walk on "striped"
-                            // left those live offsets untracked AND
-                            // free-listed on a fresh allocator (the gap-fill
-                            // claims nothing for them), so `allocate_block`
-                            // minted the SAME offset to a second owner while
-                            // the staged file's map still bound it — the
-                            // generic/464 post-remount never-settles EIO +
-                            // refused-untracked-free storm. Seed refcounts
-                            // for EVERY layout that carries durable block
-                            // references, regardless of file_type.
-                            if layout.file_type == "striped" || layout.file_type == "staged" {
-                                // 1. Check for indirect block map
-                                if let Some(ref map_id) = layout.block_map_id {
-                                    if map_id.starts_with("indirect:") {
-                                        let indirect_key =
-                                            map_id.strip_prefix("indirect:").unwrap();
-                                        let mut matches = false;
-                                        let mut block_offset = 0;
-                                        if let Ok((be_id, offset)) =
-                                            backend_router.parse_block_key(indirect_key)
-                                        {
-                                            if be_id == self._volume_id.as_ref()
-                                                || ((be_id == "backend_0" || be_id == "squeezefs")
-                                                    && (self._volume_id.as_ref() == "squeezefs"
-                                                        || self._volume_id.as_ref()
-                                                            == backend_router
-                                                                .default_allocator
-                                                                .volume_id()))
-                                            {
-                                                matches = true;
-                                                block_offset = offset;
-                                            }
-                                        } else if let Ok(offset) = indirect_key.parse::<u64>() {
-                                            if self._volume_id.as_ref() == "squeezefs"
-                                                || self._volume_id.as_ref()
-                                                    == backend_router.default_allocator.volume_id()
-                                            {
-                                                matches = true;
-                                                block_offset = offset;
-                                            }
-                                        }
-                                        if matches {
-                                            let indirect_idx = block_offset / self.chunk_size;
-                                            let _ = self.recover_block(indirect_idx).await;
-                                        }
-                                        // Read the indirect block to recover its entries.
-                                        // Entries carry backend-true key strings (versioned
-                                        // v1 blob): recover ONLY the offsets THIS volume
-                                        // owns — the same alias-aware matching the inline
-                                        // branch below applies.
-                                        let block_size =
-                                            backend_router.block_size.load(Ordering::Relaxed)
-                                                as usize;
-                                        if let Ok(raw_bytes) = backend_router
-                                            .read_block(indirect_key, block_size)
-                                            .await
-                                        {
-                                            match crate::routing::decode_indirect_block_map(
-                                                &raw_bytes,
-                                            ) {
-                                                Ok(entries) => {
-                                                    for (_b, key) in entries {
-                                                        let key =
-                                                            crate::routing::clean_block_key(&key);
-                                                        let Ok((be_id, offset)) =
-                                                            backend_router.parse_block_key(&key)
-                                                        else {
-                                                            continue;
-                                                        };
-                                                        let owned = be_id
-                                                            == self._volume_id.as_ref()
-                                                            || ((be_id == "backend_0"
-                                                                || be_id == "squeezefs")
-                                                                && (self._volume_id.as_ref()
-                                                                    == "squeezefs"
-                                                                    || self._volume_id.as_ref()
-                                                                        == backend_router
-                                                                            .default_allocator
-                                                                            .volume_id()));
-                                                        if owned {
-                                                            let block_idx =
-                                                                offset / self.chunk_size;
-                                                            let _ =
-                                                                self.recover_block(block_idx).await;
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    log::warn!(
-                                                        "refcount recovery: undecodable indirect \
-                                                         block map at '{}': {}",
-                                                        indirect_key,
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                // 2. Check for inline block map. Stored
-                                // values are backend-true key strings with an
-                                // optional `:extra` trailer after the offset —
-                                // strip the trailer with `clean_block_key`
-                                // (NEVER a bare `split(':')`, which mangles
-                                // prefixed keys: `oss2://123` → `oss2`) and
-                                // recover ONLY the offsets THIS volume owns —
-                                // the same alias-aware matching as the
-                                // indirect branch above.
-                                if let Some(ref bm) = layout.block_map {
-                                    for offset_str in bm.values() {
-                                        let block_key = crate::routing::clean_block_key(offset_str);
-                                        let Ok((be_id, offset)) =
-                                            backend_router.parse_block_key(&block_key)
-                                        else {
-                                            continue;
-                                        };
-                                        let owned = be_id == self._volume_id.as_ref()
-                                            || ((be_id == "backend_0" || be_id == "squeezefs")
-                                                && (self._volume_id.as_ref() == "squeezefs"
-                                                    || self._volume_id.as_ref()
-                                                        == backend_router
-                                                            .default_allocator
-                                                            .volume_id()));
-                                        if owned {
-                                            let block_idx = offset / self.chunk_size;
-                                            let _ = self.recover_block(block_idx).await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    if let Some(layout) = layout_opt {
+                        visit(&layout);
                     }
                 }
             }
         }
+        Ok(summary)
     }
+
+    /// Every block index on THIS volume that `layout` durably references
+    /// — the map entries plus, for an indirect map, the blob block itself
+    /// and every entry the blob names.
+    ///
+    /// FIND-RW5-A remount face: STAGED files carry durable `block_map`
+    /// entries too — the staged truncate-clip (`bk:0:len`) and the
+    /// StorageFull durable spills. Gating this on `"striped"` left those
+    /// live offsets untracked AND free-listed on a fresh allocator (the
+    /// gap-fill claims nothing for them), so `allocate_block` minted the
+    /// SAME offset to a second owner while the staged file's map still
+    /// bound it — the generic/464 post-remount never-settles EIO +
+    /// refused-untracked-free storm. Every layout that carries durable
+    /// block references counts, regardless of `file_type`.
+    ///
+    /// Stored values are backend-true key strings with an optional
+    /// `:extra` trailer after the offset — stripped with
+    /// [`crate::routing::clean_block_key`] (NEVER a bare `split(':')`,
+    /// which mangles prefixed keys: `oss2://123` → `oss2`).
+    fn layout_owned_blocks(
+        &self,
+        backend_router: &crate::routing::BackendRouter,
+        layout: &crate::routing::LayoutMetadata,
+    ) -> (Vec<u64>, Vec<String>) {
+        let mut out = Vec::new();
+        let mut indirect = Vec::new();
+        if layout.file_type != "striped" && layout.file_type != "staged" {
+            return (out, indirect);
+        }
+        // 1. Indirect block map: the blob block itself now; its ENTRIES
+        //    need a device read, so the key is handed back for the
+        //    caller's async pass ([`Self::indirect_owned_blocks`]).
+        if let Some(indirect_key) = layout
+            .block_map_id
+            .as_deref()
+            .and_then(|id| id.strip_prefix("indirect:"))
+        {
+            if let Some(offset) = self.owned_offset(backend_router, indirect_key) {
+                out.push(offset / self.chunk_size);
+            }
+            indirect.push(indirect_key.to_string());
+        }
+        // 2. Inline block map.
+        if let Some(bm) = layout.block_map.as_ref() {
+            for offset_str in bm.values() {
+                if let Some(offset) = self.owned_offset(backend_router, offset_str) {
+                    out.push(offset / self.chunk_size);
+                }
+            }
+        }
+        (out, indirect)
+    }
+
+    /// The block indices THIS volume owns among an indirect block map's
+    /// entries. The blob carries backend-true key strings (versioned v1
+    /// blob): reducing them to bare offsets — the retired pre-versioned
+    /// shape — lost the owning volume, so every rehydrated non-first-volume
+    /// block was read/freed from the wrong device.
+    async fn indirect_owned_blocks(
+        &self,
+        backend_router: &crate::routing::BackendRouter,
+        indirect_key: &str,
+    ) -> Vec<u64> {
+        let mut out = Vec::new();
+        let block_size = backend_router.block_size.load(Ordering::Relaxed) as usize;
+        match backend_router.read_block(indirect_key, block_size).await {
+            Ok(raw_bytes) => match crate::routing::decode_indirect_block_map(&raw_bytes) {
+                Ok(entries) => {
+                    for (_b, key) in entries {
+                        if let Some(offset) = self.owned_offset(backend_router, &key) {
+                            out.push(offset / self.chunk_size);
+                        }
+                    }
+                }
+                Err(e) => log::warn!(
+                    "refcount recovery: undecodable indirect block map at \
+                     '{indirect_key}': {e}"
+                ),
+            },
+            Err(e) => log::warn!(
+                "refcount recovery: unreadable indirect block map at '{indirect_key}': {e}"
+            ),
+        }
+        out
+    }
+
+    /// `Some(offset)` ⇔ `block_key` names an offset on THIS volume.
+    ///
+    /// Alias-aware exactly as the historical walk was: the unprefixed
+    /// first-volume forms (`123`) and the `backend_0` / `squeezefs`
+    /// aliases all resolve to the router's default allocator, which is
+    /// what keeps pre-VL3 layouts accountable.
+    fn owned_offset(
+        &self,
+        backend_router: &crate::routing::BackendRouter,
+        block_key: &str,
+    ) -> Option<u64> {
+        let cleaned = crate::routing::clean_block_key(block_key);
+        let (be_id, offset) = backend_router.parse_block_key(&cleaned).ok()?;
+        let default_id = backend_router.default_allocator.volume_id();
+        let mine = self._volume_id.as_ref();
+        let owned = be_id == mine
+            || ((be_id == "backend_0" || be_id == "squeezefs")
+                && (mine == "squeezefs" || mine == default_id));
+        owned.then_some(offset)
+    }
+
+    /// Seed the RAM refcount map + free list + allocation cursor from
+    /// **durable** block-reference records (pre-RC engineering spec §6.2
+    /// item 1) — the mount path that replaces the inode-tree walk.
+    ///
+    /// `refs` is this volume's whole durable reference set
+    /// ([`crate::meta_backend::kv::backend::KvMetaBackend::block_ref_scan`],
+    /// summed across the mounted meta volumes). Seeding runs the SAME
+    /// [`Self::recover_block`] protocol the derived walk runs — once per
+    /// reference — so the resulting refcounts, gap-filled free list, and
+    /// `highest_block` cursor are identical to the derived answer by
+    /// construction, and the free list stays what it has always been: the
+    /// complement of the referenced set below the cursor.
+    ///
+    /// Ordering: references are seeded in ascending block order so the
+    /// cursor advances monotonically and the gap fill runs once per gap.
+    pub async fn seed_from_durable_refs(&self, refs: &[u64]) -> u64 {
+        let mut sorted: Vec<u64> = refs.to_vec();
+        sorted.sort_unstable();
+        let seeded = sorted.len() as u64;
+        for idx in sorted {
+            let _ = self.recover_block(idx).await;
+        }
+        crate::meta_backend::kv::META_KV_BLOCK_REFS_RECOVERED
+            .fetch_add(seeded, Ordering::Relaxed);
+        seeded
+    }
+}
+
+/// Counters from one live-layout walk (the log line's inputs).
+#[derive(Default)]
+struct LayoutWalkSummary {
+    checked: u64,
+    valid_inodes: u64,
+    layouts_found: u64,
 }
 
 /// RAII registration in the [`BlockAllocator::inflight_register`]

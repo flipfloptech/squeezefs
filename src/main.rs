@@ -4803,21 +4803,63 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .router
                 .set_meta_backend(routed_meta_backend.clone());
 
-            // Block-allocator refcount recovery before serving FUSE: walk
-            // each volume's live inode tree (no allocator seed / bitmap
-            // reconcile — monotonic inos §4.8; A/B bitmap loaded at open).
-            for kv in &routed_meta_backend.volumes {
-                for entry in fs_engine.router.backend_router.backends.iter() {
-                    let backend = entry.value();
-                    log::info!("Running block allocator recovery for data volume...");
-                    if let Err(e) = backend
-                        .block_allocator
-                        .recover_active_blocks_v3(kv, &fs_engine.router.backend_router)
-                        .await
-                    {
-                        log::error!("Failed to recover block allocator: {:?}", e);
+            // Block-allocator ownership recovery before serving FUSE.
+            //
+            // Pre-RC engineering spec §6.2 item 1: on a volume set carrying
+            // incompat bit 8 the DURABLE reference records seed the
+            // refcount map, free list and allocation cursor — **no inode
+            // tree walk**. Without the bit (every volume formatted before
+            // the bit existed) the walk runs exactly as it always has.
+            //
+            // `SQUEEZEFS_BLOCK_REFS_VERIFY=1` additionally runs the derived
+            // walk as an ORACLE and compares: the strongest available test
+            // of the accounting, off by default because running it would
+            // pay the very walk the durable records exist to delete. fsck
+            // runs it unconditionally (class C8).
+            match fs_engine
+                .router
+                .backend_router
+                .recover_durable_block_refs(&routed_meta_backend)
+                .await
+            {
+                Ok(Some(seeded)) => {
+                    log::info!(
+                        "block ownership recovered from DURABLE records: {seeded}                          reference(s), no inode-tree walk (incompat bit 8)"
+                    );
+                    if std::env::var("SQUEEZEFS_BLOCK_REFS_VERIFY").as_deref() == Ok("1") {
+                        match fs_engine
+                            .router
+                            .backend_router
+                            .verify_durable_block_refs(&routed_meta_backend)
+                            .await
+                        {
+                            Ok(drift) if drift.is_empty() => log::info!(
+                                "durable-vs-derived block-reference verification: EXACT"
+                            ),
+                            Ok(drift) => log::error!(
+                                "durable-vs-derived block-reference verification found {}                                  drifting block(s) — run `squeezefs fsck` (class C8)",
+                                drift.len()
+                            ),
+                            Err(e) => log::error!("block-reference verification failed: {e}"),
+                        }
                     }
                 }
+                Ok(None) => {
+                    for kv in &routed_meta_backend.volumes {
+                        for entry in fs_engine.router.backend_router.backends.iter() {
+                            let backend = entry.value();
+                            log::info!("Running block allocator recovery for data volume...");
+                            if let Err(e) = backend
+                                .block_allocator
+                                .recover_active_blocks_v3(kv, &fs_engine.router.backend_router)
+                                .await
+                            {
+                                log::error!("Failed to recover block allocator: {:?}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => log::error!("durable block-reference recovery failed: {e:?}"),
             }
             fs_engine.meta_backend = Some(routed_meta_backend.clone());
             fs_engine.dismount_wait = resolved_dismount_wait;

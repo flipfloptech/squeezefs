@@ -135,7 +135,9 @@
 //! corruption alert (§10) instead of a tear census.
 
 use super::journal_core::{AdmissionClass, CoreGeometry, JournalCore, Reservation};
-use super::record::{Record, RecordRef, TREE_ALLOC_RESERVED, TREE_BACKPTR_RESERVED, TREE_INODES};
+use super::record::{
+    Record, RecordRef, TREE_ALLOC_RESERVED, TREE_ID_MAX, TREE_INODES,
+};
 use super::KvError;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -335,7 +337,7 @@ pub fn encode_entry_payload(records: &[(u8, Record)]) -> Vec<u8> {
 /// (§4.6: "interior mutations are journaled records"). Replay routes a
 /// level-`L` record to the level-`L` node covering its key.
 pub fn tag_for(tree_id: u8, level: u8) -> u8 {
-    debug_assert!((TREE_INODES..=TREE_BACKPTR_RESERVED).contains(&tree_id));
+    debug_assert!((TREE_INODES..=TREE_ID_MAX).contains(&tree_id));
     debug_assert!(
         level <= 0x0F,
         "interior level {level} exceeds the tag nibble"
@@ -360,7 +362,7 @@ pub fn decode_entry_payload(buf: &[u8]) -> Result<Vec<(u8, Record)>, KvError> {
         let tag = buf[pos];
         pos += 1;
         let (tree_id, _level) = untag(tag);
-        if !(TREE_INODES..=TREE_BACKPTR_RESERVED).contains(&tree_id) {
+        if !(TREE_INODES..=TREE_ID_MAX).contains(&tree_id) {
             return Err(KvError::Corrupt(format!(
                 "journal record carries tree id {tree_id} outside the §4.2 table"
             )));

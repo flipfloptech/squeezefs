@@ -2248,15 +2248,39 @@ impl RoutedMetaBackend {
     /// Persist layout xattr + size with fine locks. Used on fsync/release
     /// writeback; ONE two-record transaction (design §5.3, its own
     /// I-guard).
-    pub async fn set_layout_and_size(&self, ino: Ino, layout: &[u8], size: u64) -> Result<()> {
+    pub async fn set_layout_and_size(
+        &self,
+        ino: Ino,
+        layout: &[u8],
+        size: u64,
+        block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
+    ) -> Result<()> {
         // §5.5.2a cutover gate — before the backend's own I-guard and
         // before route derivation.
         let _gate = self.slot_gate_enter(&[ino]).await;
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
         let out = self.volumes[v_idx]
-            .set_layout_and_size(local_ino, layout, size)
+            .set_layout_and_size(local_ino, layout, size, block_refs)
             .await;
+        if out.is_err() {
+            self.mirror_volume_failure(v_idx);
+        }
+        out
+    }
+
+    /// Spec §6.2 item 1: commit a standalone durable block-reference
+    /// operation set for `ino` (the reclaim release / fsck repair seam) on
+    /// the volume that hosts it.
+    pub async fn commit_block_refs(
+        &self,
+        ino: Ino,
+        ops: &[crate::meta_backend::kv::block_refs::BlockRefOp],
+    ) -> Result<()> {
+        let _gate = self.slot_gate_enter(&[ino]).await;
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let out = self.volumes[v_idx].commit_block_refs(local_ino, ops).await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);
         }
@@ -2273,6 +2297,7 @@ impl RoutedMetaBackend {
         delta: &crate::layout_wire::LayoutDelta,
         full_layout: bytes::Bytes,
         size: u64,
+        block_refs: Vec<crate::meta_backend::kv::block_refs::BlockRefOp>,
     ) -> Result<bool> {
         // §5.5.2a cutover gate — before the backend's own I-guard and
         // before route derivation (the `set_layout_and_size` discipline).
@@ -2280,7 +2305,7 @@ impl RoutedMetaBackend {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
         let out = self.volumes[v_idx]
-            .merge_layout_and_size(local_ino, delta, full_layout, size)
+            .merge_layout_and_size(local_ino, delta, full_layout, size, block_refs)
             .await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);

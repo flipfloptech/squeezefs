@@ -1095,7 +1095,7 @@ async fn checkpoint_task(
             // Work arrived while draining (or a reserve drain deferred
             // it): re-arm and return to the select so the ticker still
             // gets its turn — never spin the cadence out.
-            if be.trees().into_iter().any(|t| t.maintenance_pending()) {
+            if be.all_trees().into_iter().any(|t| t.maintenance_pending()) {
                 wake.notify_one();
             }
         }
@@ -1113,7 +1113,7 @@ async fn checkpoint_task(
 /// `checkpoint_cycle`) bounds a genuinely wedged tail loud.
 async fn maintenance_pass(be: &Arc<KvMetaBackend>) -> Result<(), KvError> {
     let mut smo = be.smo.lock().await;
-    for tree in be.trees() {
+    for tree in be.all_trees() {
         loop {
             match tree.run_maintenance(&mut smo).await {
                 Ok(_) => break,
@@ -1165,7 +1165,7 @@ async fn tick(
     //    currency PR 4 clause a) forces the same cycle — its flush pass
     //    discharges the pinning floor (the §4.7 cycle-break) and its
     //    centralized progress audit (clause b) bounds genuine wedges.
-    for tree in be.trees() {
+    for tree in be.all_trees() {
         loop {
             match tree.run_maintenance(&mut smo).await {
                 Ok(_) => break,
@@ -1281,7 +1281,7 @@ impl KvMetaBackend {
         });
         for (tree_id, addr) in dirty {
             let tree = self
-                .trees()
+                .all_trees()
                 .into_iter()
                 .find(|t| t.tree_id() == tree_id)
                 .expect("dirty node belongs to a mounted tree");
@@ -1365,24 +1365,21 @@ impl KvMetaBackend {
         });
 
         // ---- The ledger record naming the synced roots + that tail.
-        let [inodes, dentries, xattrs] = self.trees();
-        let tree_roots = vec![
-            TreeRoot {
-                tree_id: inodes.tree_id(),
-                node_addr: inodes.root().addr,
-                node_seq: inodes.root().seq,
-            },
-            TreeRoot {
-                tree_id: dentries.tree_id(),
-                node_addr: dentries.root().addr,
-                node_seq: dentries.root().seq,
-            },
-            TreeRoot {
-                tree_id: xattrs.tree_id(),
-                node_addr: xattrs.root().addr,
-                node_seq: xattrs.root().seq,
-            },
-        ];
+        // Every mounted tree names a root — the three §4.2 user trees
+        // plus, on a bit-8 volume, the §6.2 item-1 block-reference tree
+        // (the ledger payload's `n_roots` has been variable-length since
+        // PR K3, with ~19 roots of headroom inside the 4 KiB slot, so
+        // this is a payload the pre-item-1 DECODER still parses — old
+        // binaries refuse the volume at the superblock gate instead).
+        let tree_roots: Vec<TreeRoot> = self
+            .all_trees()
+            .into_iter()
+            .map(|t| TreeRoot {
+                tree_id: t.tree_id(),
+                node_addr: t.root().addr,
+                node_seq: t.root().seq,
+            })
+            .collect();
         let rec = LedgerRecord {
             seq: ckpt_seq,
             tree_roots,
@@ -1395,7 +1392,10 @@ impl KvMetaBackend {
             // by replay floors (journaled SMO pointers) until the NEXT
             // record's watermark — see the extent-reuse chain argument
             // on [`LedgerRecord::node_seq_watermark`].
-            node_seq_watermark: inodes.node_seq_snapshot(),
+            // (Every tree shares ONE mint counter — `KvTree::open`/`create`
+            // clone the same `Arc<AtomicU64>` — so any tree's snapshot is
+            // the volume's watermark.)
+            node_seq_watermark: self.trees()[0].node_seq_snapshot(),
             // PR VL5a (§5.5.1a): the membership stamp rides EVERY ledger
             // record of a slot-mapped volume (seeded from the mounted
             // record at open; installed by format/repair-set). Legacy

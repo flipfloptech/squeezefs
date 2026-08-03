@@ -537,7 +537,13 @@ impl MigrationTee {
     /// Pass-task hook: tee the keys of one committed tx's records.
     fn note_committed(&self, recs: &[(u8, Record)]) {
         for (tree_id, r) in recs {
-            if *tree_id == TREE_ALLOC_RESERVED {
+            // Neither of these trees is ino-keyed, so `key_owner` would
+            // read a foreign field as an ino: the allocator's extent
+            // index, or (spec §6.2 item 1) a block-reference record's
+            // data-volume TAG — a random u64 that can fall inside any
+            // migrating keyspace and would tee the record to a volume it
+            // does not belong to.
+            if *tree_id == TREE_ALLOC_RESERVED || *tree_id == super::record::TREE_BLOCK_REFS {
                 continue;
             }
             let Some(ino) = Self::key_owner(&r.key) else {
@@ -623,6 +629,18 @@ pub struct KvMetaBackend {
     inodes: KvTree,
     dentries: KvTree,
     xattrs: KvTree,
+    /// Pre-RC spec §6.2 item 1 (incompat bit 8): the **durable
+    /// block-reference tree** — `Some` exactly when this volume carries
+    /// [`super::superblock::FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS`] and the
+    /// mount may write (a read-only mount never mints a root). `None`
+    /// means derived accounting, i.e. pre-item-1 behavior verbatim.
+    ///
+    /// Deliberately NOT part of [`Self::trees`]: that array is the three
+    /// §4.2 user trees, and the §4.10 digest walk / slot-migration
+    /// keyspace / fsck tree walk are all defined over it. Structural
+    /// consumers (checkpoint flush, ledger roots, maintenance) use
+    /// [`Self::all_trees`], which includes this one.
+    block_refs: Option<KvTree>,
     alloc: Arc<ExtentAllocator>,
     /// §4.8 monotonic watermark, recovered at mount; the create path
     /// `fetch_add`s it.
@@ -1204,6 +1222,70 @@ impl KvMetaBackend {
             opened.next().expect("three trees"),
         );
 
+        // 5a′. Spec §6.2 item 1 (incompat bit 8): the durable
+        // block-reference tree. Fresh formats carry its (empty) root from
+        // the builder; a volume STAMPED later (the Phase-8 reformat
+        // window) has the bit and no root, so the first writable mount
+        // mints one. Minting is idempotent across a crash: the claimed
+        // extent's bitmap bit only becomes durable at a checkpoint, so a
+        // mount that dies before its first checkpoint leaves nothing
+        // behind and the next one mints again. The mint happens BEFORE
+        // replay, so any accounting record still in the journal window
+        // folds into the fresh root by key, exactly like every other
+        // content record.
+        //
+        // A read-only mount (unknown-ro feature bits) never mints and
+        // never accounts — it degrades to the derived walk, which is the
+        // honest behavior for a mount that may not write.
+        let block_refs = if sb.features_incompat
+            & super::superblock::FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS
+            != 0
+            // The `read_only` latch (unknown-ro feature bits) is resolved
+            // further down; its input is the superblock, so read it here.
+            && sb.unknown_ro() == 0
+        {
+            match ledger
+                .tree_roots
+                .iter()
+                .find(|r| r.tree_id == super::record::TREE_BLOCK_REFS)
+            {
+                Some(root) => {
+                    let tree = KvTree::open(
+                        cache.clone(),
+                        super::record::TREE_BLOCK_REFS,
+                        RootPtr {
+                            addr: root.node_addr,
+                            seq: root.node_seq,
+                        },
+                        seq.clone(),
+                    )
+                    .await?;
+                    seq.fetch_max(root.node_seq, Ordering::AcqRel);
+                    Some(tree)
+                }
+                None => {
+                    log::info!(
+                        "meta volume {}: incompat bit 8 (durable block refcounts) is \
+                         stamped but the ledger names no block-reference root — minting \
+                         an empty one (the post-stamp first mount)",
+                        path.display()
+                    );
+                    let mut mint_ctx = SmoContext::new(alloc.clone());
+                    Some(
+                        KvTree::create(
+                            cache.clone(),
+                            &mut mint_ctx,
+                            super::record::TREE_BLOCK_REFS,
+                            seq.clone(),
+                        )
+                        .await?,
+                    )
+                }
+            }
+        } else {
+            None
+        };
+
         // 5b. Read-only replay into the cache, TWO-PHASE (Option C′,
         // docs/design-smo-replay-currency.md §2/§4): routing must not
         // evolve UNDER the content walk. Single-pass seq-order replay
@@ -1253,7 +1335,9 @@ impl KvMetaBackend {
         for entry in &recovery.entries {
             for (tag, rec) in &entry.records {
                 let (tree_id, level) = untag(*tag);
-                if level > 0 && matches!(tree_id, TREE_INODES | TREE_DENTRIES | TREE_XATTRS) {
+                let mounted = matches!(tree_id, TREE_INODES | TREE_DENTRIES | TREE_XATTRS)
+                    || (tree_id == super::record::TREE_BLOCK_REFS && block_refs.is_some());
+                if level > 0 && mounted {
                     interior.push((tree_id, level, entry.seq, rec));
                 }
             }
@@ -1264,7 +1348,10 @@ impl KvMetaBackend {
                 TREE_INODES => &inodes,
                 TREE_DENTRIES => &dentries,
                 TREE_XATTRS => &xattrs,
-                _ => unreachable!("phase 1 collects only the three mounted trees"),
+                super::record::TREE_BLOCK_REFS => block_refs
+                    .as_ref()
+                    .expect("phase 1 collects the block-ref tree only when it is mounted"),
+                _ => unreachable!("phase 1 collects only the mounted trees"),
             };
             // Keep post-mount node-seq mints above every child
             // incarnation a replayed pointer names.
@@ -1298,6 +1385,16 @@ impl KvMetaBackend {
                     TREE_INODES => &inodes,
                     TREE_DENTRIES => &dentries,
                     TREE_XATTRS => &xattrs,
+                    // Spec §6.2 item 1: accounting records replay like
+                    // any other content record — routed by key into the
+                    // (possibly freshly minted) block-ref root. An
+                    // un-engaged volume cannot have them; a stamped
+                    // volume whose mint raced a crash folds them into the
+                    // new root by key.
+                    super::record::TREE_BLOCK_REFS => match block_refs.as_ref() {
+                        Some(t) => t,
+                        None => continue,
+                    },
                     TREE_ALLOC_RESERVED => continue,
                     _ => continue,
                 };
@@ -1407,6 +1504,7 @@ impl KvMetaBackend {
             inodes,
             dentries,
             xattrs,
+            block_refs,
             alloc,
             next_ino: AtomicU64::new(next_ino),
             destroyed_inodes: AtomicU64::new(0),
@@ -1762,8 +1860,71 @@ impl KvMetaBackend {
 
     /// The three logical trees, tree-id order (inodes, dentries, xattrs)
     /// — the digest walk's input ([`super::builder::digest_walk`]).
+    ///
+    /// Deliberately excludes the §6.2 item-1 block-reference tree: the
+    /// §4.10 digest walk, the VL5 slot-migration keyspace, and fsck's
+    /// C1 tree walk are all defined over the three USER trees, and
+    /// widening this array would silently redefine all three. Structural
+    /// consumers use [`Self::all_trees`].
     pub fn trees(&self) -> [&KvTree; 3] {
         [&self.inodes, &self.dentries, &self.xattrs]
+    }
+
+    /// Every tree this volume must checkpoint, flush, and name a root
+    /// for: the three §4.2 user trees plus the durable block-reference
+    /// tree when incompat bit 8 engaged it (spec §6.2 item 1).
+    pub fn all_trees(&self) -> Vec<&KvTree> {
+        let mut v: Vec<&KvTree> = self.trees().to_vec();
+        if let Some(t) = self.block_refs.as_ref() {
+            v.push(t);
+        }
+        v
+    }
+
+    /// `true` ⇔ durable block-reference accounting is engaged on this
+    /// volume (incompat bit 8 present and the mount may write). `false`
+    /// means every block-ownership answer is derived state, exactly as it
+    /// was before the bit existed.
+    pub fn block_refs_engaged(&self) -> bool {
+        self.block_refs.is_some()
+    }
+
+    /// Every durable block reference recorded on this volume for the data
+    /// volume tagged `vol_tag` (spec §6.2 item 1) — the mount-recovery
+    /// scan that REPLACES the inode-tree walk, and the census the
+    /// durable-vs-derived oracle compares.
+    ///
+    /// Paged range scans (the `recover_active_blocks_v3` walk shape), so
+    /// the peak footprint is one page, not one volume. Returns `Ok(vec![])`
+    /// on a volume with no engaged tree — a caller that must distinguish
+    /// "no accounting" from "no references" asks
+    /// [`Self::block_refs_engaged`].
+    pub async fn block_ref_scan(
+        &self,
+        vol_tag: u64,
+    ) -> std::result::Result<Vec<super::block_refs::BlockRef>, KvError> {
+        let Some(tree) = self.block_refs.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let (mut cursor, end) = super::block_refs::volume_range(vol_tag);
+        let mut out = Vec::new();
+        loop {
+            let page = tree.range(&cursor, &end, 512).await?;
+            let Some((last_key, _)) = page.last() else {
+                break;
+            };
+            cursor = key_successor(last_key);
+            for (k, v) in &page {
+                // Decode both halves: a malformed accounting record is
+                // loud corruption, never a silently skipped reference
+                // (an under-count is the exact failure this structure
+                // exists to prevent).
+                let r = super::block_refs::decode_block_ref_key(k)?;
+                let _ = super::block_refs::decode_block_ref_value(v)?;
+                out.push(r);
+            }
+        }
+        Ok(out)
     }
 
     /// The resolved OQ 2 contract class for every v3 volume:
@@ -3708,6 +3869,38 @@ impl KvTx {
             .push((tree_id, key.into(), RecordKind::Delete, Bytes::new()));
     }
 
+    /// Spec §6.2 item 1: stage the transaction's durable block-reference
+    /// operations — one `Put` per reference taken, one `Delete` per
+    /// reference dropped, into the **same** tx as the layout record and
+    /// the inode record. One tx = one checksummed journal entry (§4.10),
+    /// so the accounting can never disagree with the layout that
+    /// justifies it, not even across a torn write; and the publish stays
+    /// ONE commit (the write-commit-economy collapse is not re-split).
+    fn stage_block_refs(&mut self, ops: &[super::block_refs::BlockRefOp]) {
+        for op in ops {
+            let key = op.reference.key().to_vec();
+            if op.take {
+                self.stage_put(
+                    super::record::TREE_BLOCK_REFS,
+                    key,
+                    op.reference.value().to_vec(),
+                );
+            } else {
+                self.stage_delete(super::record::TREE_BLOCK_REFS, key);
+            }
+        }
+        let took = ops.iter().filter(|o| o.take).count() as u64;
+        let dropped = ops.len() as u64 - took;
+        if took > 0 {
+            super::META_KV_BLOCK_REFS_STAGED
+                .fetch_add(took, std::sync::atomic::Ordering::Relaxed);
+        }
+        if dropped > 0 {
+            super::META_KV_BLOCK_REFS_RELEASED
+                .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.staged.is_empty()
     }
@@ -3735,6 +3928,10 @@ struct QueuedLayoutMerge {
     /// where the backend eligibility half refuses the delta.
     full_layout: Bytes,
     size: u64,
+    /// Spec §6.2 item 1: this member's durable block-reference ops, staged
+    /// into the batch's ONE aggregated transaction alongside its layout
+    /// record — the accounting aggregates exactly as the saves do.
+    block_refs: Vec<super::block_refs::BlockRefOp>,
     done: tokio::sync::oneshot::Sender<crate::error::Result<bool>>,
 }
 
@@ -3877,7 +4074,15 @@ impl KvMetaBackend {
             TREE_INODES => &self.inodes,
             TREE_DENTRIES => &self.dentries,
             TREE_XATTRS => &self.xattrs,
-            _ => unreachable!("kv commits stage only the three §4.2 trees"),
+            // Spec §6.2 item 1: staged only by the layout-commit paths,
+            // and only when the tree is engaged (`block_refs_engaged`
+            // gates every staging site) — an absent tree here means a
+            // caller staged accounting onto a volume that has none.
+            super::record::TREE_BLOCK_REFS => self
+                .block_refs
+                .as_ref()
+                .expect("block-reference records staged on a volume without incompat bit 8"),
+            _ => unreachable!("kv commits stage only the §4.2 trees"),
         }
     }
 
@@ -5867,7 +6072,13 @@ impl KvMetaBackend {
     /// §5.3: layout xattr + size as ONE two-record transaction (v2's
     /// non-transactional two-write path, made atomic on v3) — the
     /// fsync/release writeback shape.
-    pub async fn set_layout_and_size(&self, ino: Ino, layout: &[u8], size: u64) -> Result<()> {
+    pub async fn set_layout_and_size(
+        &self,
+        ino: Ino,
+        layout: &[u8],
+        size: u64,
+        block_refs: &[super::block_refs::BlockRefOp],
+    ) -> Result<()> {
         self.write_gate()?;
         let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
         let mut v = self
@@ -5898,6 +6109,42 @@ impl KvMetaBackend {
             .encode()?,
         );
         tx.stage_put(TREE_INODES, inode_key(ino), v.encode());
+        // Spec §6.2 item 1: the accounting rides THIS tx (no second
+        // commit). Silently skipped on a volume without incompat bit 8 —
+        // that volume's ownership answers stay derived state.
+        if self.block_refs.is_some() {
+            tx.stage_block_refs(block_refs);
+        }
+        tx.hold_guards(guards);
+        self.commit_tx(tx).await?;
+        Ok(())
+    }
+
+    /// Spec §6.2 item 1: commit a standalone set of durable
+    /// block-reference operations — the reclaim path's release (a corpse
+    /// carries no layout save to ride) and the fsck repair seam.
+    ///
+    /// Deliberately NOT on the publish path: block publishes stage their
+    /// accounting into the layout transaction ([`Self::set_layout_and_size`]
+    /// / [`Self::merge_layout_and_size`]) so the no-second-commit property
+    /// the write-commit-economy campaign bought is preserved. A no-op — not
+    /// an error — on a volume without incompat bit 8.
+    pub async fn commit_block_refs(
+        &self,
+        ino: Ino,
+        ops: &[super::block_refs::BlockRefOp],
+    ) -> Result<()> {
+        if self.block_refs.is_none() || ops.is_empty() {
+            return Ok(());
+        }
+        self.write_gate()?;
+        // The ino's I-guard: the records belong to this ino's ownership
+        // set, so the same 4a lock that serializes its layout commits
+        // serializes their release (lock order unchanged — 4a before 4b,
+        // which `commit_tx` takes).
+        let guards: Arc<[DlmGuard]> = Arc::from(vec![self.dlm.lock_inode_exclusive(ino).await]);
+        let mut tx = KvTx::new();
+        tx.stage_block_refs(ops);
         tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(())
@@ -5927,6 +6174,7 @@ impl KvMetaBackend {
         delta: &crate::layout_wire::LayoutDelta,
         full_layout: Bytes,
         size: u64,
+        block_refs: Vec<super::block_refs::BlockRefOp>,
     ) -> Result<bool> {
         // Rewrite-publish-drain Lever B (2026-08-01): delta-class layout
         // saves aggregate on the per-volume layout-merge conveyor — one
@@ -5941,7 +6189,7 @@ impl KvMetaBackend {
         self.write_gate()?;
         if crate::routing::publish_commit_group_max() == Some(1) {
             return self
-                .merge_layout_and_size_direct(ino, delta, &full_layout, size)
+                .merge_layout_and_size_direct(ino, delta, &full_layout, size, &block_refs)
                 .await;
         }
         let (done, rx) = tokio::sync::oneshot::channel();
@@ -5955,6 +6203,7 @@ impl KvMetaBackend {
                 delta_wire,
                 full_layout,
                 size,
+                block_refs,
                 done,
             },
             weight,
@@ -6173,6 +6422,15 @@ impl KvMetaBackend {
                 tx.stage_put(TREE_XATTRS, key, full);
             }
             tx.stage_put(TREE_INODES, inode_key(op.ino), v.encode());
+            // Spec §6.2 item 1: this member's accounting joins the SAME
+            // aggregated tx as its layout record — one journal entry for
+            // the whole window, accounting included. A member that failed
+            // its inode read / slot probe above `continue`d before this
+            // point, so no orphan accounting can be staged for a save
+            // that never happens.
+            if self.block_refs.is_some() {
+                tx.stage_block_refs(&op.block_refs);
+            }
             staged.push((op.done, use_delta));
         }
         for (done, e) in failed {
@@ -6216,6 +6474,7 @@ impl KvMetaBackend {
         delta: &crate::layout_wire::LayoutDelta,
         full_layout: &[u8],
         size: u64,
+        block_refs: &[super::block_refs::BlockRefOp],
     ) -> Result<bool> {
         use crate::fuse_client::{publish_phase_record, PublishPhase};
         self.write_gate()?;
@@ -6277,6 +6536,10 @@ impl KvMetaBackend {
             );
         }
         tx.stage_put(TREE_INODES, inode_key(ino), v.encode());
+        // Spec §6.2 item 1: accounting rides THIS tx (no second commit).
+        if self.block_refs.is_some() {
+            tx.stage_block_refs(block_refs);
+        }
         tx.hold_guards(guards);
         let t_tx = std::time::Instant::now();
         self.commit_tx(tx).await?;

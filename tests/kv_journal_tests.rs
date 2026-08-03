@@ -355,7 +355,9 @@ fn test_entry_payload_roundtrip_and_bounds() {
     zero_id[0] = 0;
     assert!(decode_entry_payload(&zero_id).is_err());
     let mut big_id = payload;
-    big_id[0] = 6;
+    // Tree id 7 — one past `TREE_ID_MAX` (6 = the durable block-ref tree,
+    // spec §6.2 item 1 / incompat bit 8; the §4.2 table grew).
+    big_id[0] = 7;
     assert!(decode_entry_payload(&big_id).is_err());
 }
 

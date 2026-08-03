@@ -204,6 +204,32 @@ unscoped) and requires the Phase-8 window for all four unstamped bits.
 
 ---
 
+## 3b1. DLM stage board (spec §6.9)
+
+| Stage | Ships | State | Note |
+|---|---|---|---|
+| S0 | `LockManager` trait; mock family deleted | **LANDED** | Closed most of ENG-14 |
+| S1 | Global `grant_seq` replaces `FENCING_MAP` | **LANDED** | Closed the unbounded-growth item |
+| S2 | Durable `WriterClaim.term`, composed tokens (bit 7) | **LANDED** | Fencing is remount-monotone |
+| S3 | `cluster_wire`; `job_wire` ported onto it | **LANDED** | Closed VAL-6 structurally (§3a). Mover-shard decode 32.6 µs → 771 ns; the measured RTT floor is what prices S8 |
+| S3.5 | Cross-volume transaction machinery (ruling D4) | **OPEN** | DUR-7 is its first consumer; S8's cross-volume verbs wait on it |
+| S4 | Slot lock manager, solo mode | **LANDED** | `is_local_slot` is the ownership extension point; `dlm_rpcs == 0` by construction in solo. **Measured half of the gate deferred per D11** |
+| S5 | Read-only coherent client mounts | **LANDED** (metadata half complete) | `-o ro`; three layered write gates; metadata is **bounded staleness** (≤ poll interval + the writer's ≤1 s checkpoint ceiling, published as `reader_staleness_bound_ms`), not a snapshot. **The DATA half is bounded, not eliminated** — within one interval a freed-and-reallocated block can serve another file's bytes, loud under AEAD but **silent on passthrough, the default**. That window is §6.8 item 3 |
+| S6 | Membership off the journal (lease-based liveness) | in flight | Also carries §6.2 item 7 and the non-write reader→writer channel item 3 needs |
+| S7 | Data-plane custody-epoch fence + dead-epoch quarantine + WERO | **LANDED** (in-process half) | One authorization point; quarantine release needs a drain proof; pressure answer is ENOSPC. **Device-rejection gate DEFERRED** and specified as an executable leg in `docs/design-nvmeof-target-management.md` §6.8.1 — a counter alone does not meet it |
+| S8 | Metadata function shipping | in flight | Must resolve S4's contract #2 (fencing reads are not homed today) |
+| S9 | Multi-writer data plane | **OPEN** | Builds on S7's `authorize_dma` epoch contract |
+| S10 | Subtree delegation + client-owned-slot placement | **OPEN** | Ruling D10's recovery for S8's serial latency |
+| S11 | Byte-range custody + the W1 seventh clause | **LANDED** | `patch_ineligible_range_shared` keeps the W1 ledger honest |
+
+Reader status, stated honestly: **one writer plus N readers is shipped for
+metadata**; the remaining reader work is the data-plane grace period (item 3,
+blocked on S6), reader visibility in `squeezefs clients` (S6), and the measured
+capability row (deferred per D11 — it needs the tcp substrate or a real fabric
+and a sustained ≥ 60 s window).
+
+---
+
 ## 3b2. Multi-writer §6.2 item board — 8 of 10, plus the runtime item
 
 Spec §6.2 ranks ten durable single-writer assumptions, plus one runtime item it

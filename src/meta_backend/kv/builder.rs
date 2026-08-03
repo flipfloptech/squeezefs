@@ -493,6 +493,10 @@ impl ImageBuilder {
             alloc_bitmap_generation: 1,
             node_seq_watermark,
             membership_stamp: self.membership_stamp.clone(),
+            // Ruling D9: format never stamps the partitioned-append bit,
+            // so a fresh volume's bootstrap record is the pre-partition
+            // (suffix-less) form — byte-identical to the shipped image.
+            append_partition: None,
         };
         write_ledger_slot(path, sb.root_ledger.start, &ledger).await?;
 

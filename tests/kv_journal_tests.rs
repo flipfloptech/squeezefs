@@ -140,6 +140,7 @@ fn ledger_rec(seq: u64) -> LedgerRecord {
         alloc_bitmap_generation: seq,
         node_seq_watermark: 100 + seq,
         membership_stamp: None,
+        append_partition: None,
     }
 }
 

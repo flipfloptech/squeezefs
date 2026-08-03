@@ -84,12 +84,42 @@
 //! error path exactly like today's "Inode table full" analog
 //! (`alloc.rs` → `ENOSPC`).
 //!
+//! ## Append partitioning (pre-RC engineering spec §6.2 item 3)
+//!
+//! The A/B pages above are a **whole-volume single-appender** structure:
+//! one dirty set, one page-state array, and one `advance_durable` tail.
+//! [`ExtentAllocator::format_partitioned`] / [`ExtentAllocator::load_partitioned`]
+//! give an appender its own view — the core's per-partition budgets,
+//! reserves, pending-free FIFOs, and coverage clocks
+//! ([`super::alloc_ext_core::PartitionMap`]) plus:
+//!
+//! * a *page-granular* ownership rule, because the page is the A/B write
+//!   unit: two appenders writing one page would put a peer's newest copy in
+//!   the slot this write replaces, which is exactly the clobber §6.2
+//!   describes. A fresh partitioned appender starts only its OWN pages
+//!   dirty, and [`ExtentAllocator::write_dirty_pages`] counts any foreign
+//!   page it persists ([`ExtentAllocator::foreign_page_writes`]) — a
+//!   tripwire, not a silent clobber;
+//! * ownership enforcement on **replayed** deltas: a delta naming an
+//!   extent outside its emitter's partition refuses the mount LOUD (the
+//!   `PartitionViolation::Extent` arm's second line of defence);
+//! * per-appender mounted tails, since a gate seq is a position in the
+//!   freeing appender's own journal ring and a peer's tail says nothing
+//!   about it.
+//!
+//! Everything an un-stamped (solo) volume does is unchanged: one partition
+//! owning the whole bitmap, the shipped flat claim scan, the whole-volume
+//! reserve, one clock.
+//!
 //! Like all K1–K5 modules, nothing here is mount-wired yet: the module is
 //! kept alive by `tests/kv_alloc_tests.rs`, the PR K4 crash cases, and the
-//! loom models (design PR-plan liveness convention).
+//! loom models (design PR-plan liveness convention). The partitioned
+//! entry points are kept alive the same way — by
+//! `tests/kv_partitioned_append_tests.rs` — until spec §6.9 S4 wires an
+//! appender set into `KvMetaBackend::open`.
 
-use super::alloc_ext_core::{AllocClass, ClaimError, ExtCore};
-use super::journal::ReplayedEntry;
+use super::alloc_ext_core::{AllocClass, ClaimError, ExtCore, PartitionMap};
+use super::journal::{AppendPartition, MergedEntry, ReplayedEntry};
 use super::record::{Record, TREE_ALLOC_RESERVED};
 use super::KvError;
 use std::path::Path;
@@ -119,6 +149,21 @@ pub const EXTENT_KEY_LEN: usize = 8;
 /// mount) pass this, tests pass explicit values sized to their heaps.
 pub fn compaction_reserve_extents(total: u64) -> u64 {
     (total / 50).max(8)
+}
+
+/// The bitmap partition map an [`AppendPartition`] implies (spec §6.2
+/// item 3): pages are the partition unit, so the map is
+/// `writers`-way over [`ALLOC_PAGE_BITS`]-extent pages. Solo collapses to
+/// one partition owning every page — the shipped structure.
+fn partition_map_for(part: AppendPartition) -> PartitionMap {
+    if part.is_solo() {
+        // `extents_per_page = u64::MAX` would overflow the page division;
+        // ALLOC_PAGE_BITS keeps the geometry honest and the single
+        // partition owns every page either way (`page % 1 == 0`).
+        PartitionMap::solo(ALLOC_PAGE_BITS)
+    } else {
+        PartitionMap::new(u64::from(part.writers()), ALLOC_PAGE_BITS)
+    }
 }
 
 /// Number of bitmap pages covering `total_extents`.
@@ -294,6 +339,18 @@ pub struct ExtentAllocator {
     /// Dirty-page bits (one per page): pages whose in-RAM bits diverged
     /// from the newest on-disk copy since the last [`Self::write_dirty_pages`].
     dirty: Box<[AtomicU64]>,
+    /// Which appender this allocator instance IS (spec §6.2 item 3):
+    /// `claim_user`/`claim_internal`/`advance_durable` act on this
+    /// partition, and [`Self::write_dirty_pages`] expects to write only
+    /// pages this appender owns. [`AppendPartition::SOLO`] is the shipped
+    /// posture — one appender owning the whole bitmap.
+    partition: AppendPartition,
+    /// Pages this appender persisted that it does NOT own — the ownership
+    /// tripwire. Zero in steady partitioned operation (a writer only
+    /// dirties its own pages, because it only claims and frees its own
+    /// extents); legitimately nonzero exactly once, on the recovery mount
+    /// that replays a peer's window while holding the volume alone.
+    foreign_page_writes: AtomicU64,
 }
 
 impl std::fmt::Debug for ExtentAllocator {
@@ -317,6 +374,21 @@ impl ExtentAllocator {
     /// `pending_cap` entries. Every page starts dirty (a fresh volume's
     /// first checkpoint persists the whole bitmap).
     pub fn format(total_extents: u64, reserve: u64, pending_cap: usize) -> Self {
+        Self::format_partitioned(total_extents, reserve, pending_cap, AppendPartition::SOLO)
+    }
+
+    /// [`Self::format`] for appender `part` of a partitioned bitmap (spec
+    /// §6.2 item 3): a fresh all-free bitmap of which this appender owns
+    /// its own pages. Solo starts every page dirty (the shipped
+    /// whole-bitmap first checkpoint); a partitioned appender starts only
+    /// its OWN pages dirty, because writing a page it does not own is
+    /// exactly the A/B clobber the partitioning exists to prevent.
+    pub fn format_partitioned(
+        total_extents: u64,
+        reserve: u64,
+        pending_cap: usize,
+        part: AppendPartition,
+    ) -> Self {
         let pages = bitmap_pages_for(total_extents);
         let page_states: Vec<PageState> = (0..pages)
             .map(|_| PageState {
@@ -324,14 +396,34 @@ impl ExtentAllocator {
                 slot: AtomicU64::new(SLOT_NONE),
             })
             .collect();
+        let map = partition_map_for(part);
         let dirty: Vec<AtomicU64> = (0..pages.div_ceil(64))
-            .map(|_| AtomicU64::new(u64::MAX))
+            .map(|w| {
+                if part.is_solo() {
+                    return AtomicU64::new(u64::MAX);
+                }
+                let mut bits = 0u64;
+                for b in 0..64u64 {
+                    let page = w as u64 * 64 + b;
+                    if page < pages && map.owner_of_page(page) == u64::from(part.writer_id()) {
+                        bits |= 1 << b;
+                    }
+                }
+                AtomicU64::new(bits)
+            })
             .collect();
         Self {
-            core: ExtCore::new(total_extents, reserve, pending_cap),
+            core: ExtCore::new_partitioned(
+                total_extents,
+                reserve,
+                pending_cap,
+                partition_map_for(part),
+            ),
             pages,
             page_states: page_states.into_boxed_slice(),
             dirty: dirty.into_boxed_slice(),
+            partition: part,
+            foreign_page_writes: AtomicU64::new(0),
         }
     }
 
@@ -366,6 +458,76 @@ impl ExtentAllocator {
         mounted_tail: u64,
         replay: &[ReplayedEntry],
     ) -> Result<Self, KvError> {
+        Self::load_inner(
+            path,
+            base,
+            total_extents,
+            reserve,
+            pending_cap,
+            AppendPartition::SOLO,
+            &[mounted_tail],
+            replay
+                .iter()
+                .map(|e| (0u16, e.seq, e.records.as_slice()))
+                .collect(),
+        )
+        .await
+    }
+
+    /// [`Self::load`] for appender `part` of a **partitioned** bitmap
+    /// (spec §6.2 item 3), taking the merged multi-appender replay window
+    /// ([`super::journal::replay_merge`]) and one mounted tail per
+    /// appender — coverage gates are per-appender clocks, so each
+    /// partition's watermark seeds from ITS OWN ledger record's tail
+    /// (index = writer id; a missing/absent record contributes 0, i.e. the
+    /// most conservative seed: nothing is covered).
+    ///
+    /// Refuses LOUD on an allocator delta whose extent lies outside the
+    /// emitting appender's partition — defense in depth behind the merge's
+    /// own [`super::journal::PartitionViolation::Extent`] detector, so a
+    /// foreign bit can never be applied silently even if a caller skipped
+    /// the merge's policy step.
+    pub async fn load_partitioned(
+        path: &Path,
+        base: u64,
+        total_extents: u64,
+        reserve: u64,
+        pending_cap: usize,
+        part: AppendPartition,
+        mounted_tails: &[u64],
+        replay: &[MergedEntry],
+    ) -> Result<Self, KvError> {
+        Self::load_inner(
+            path,
+            base,
+            total_extents,
+            reserve,
+            pending_cap,
+            part,
+            mounted_tails,
+            replay
+                .iter()
+                .map(|e| (e.writer_id, e.seq, e.records.as_slice()))
+                .collect(),
+        )
+        .await
+    }
+
+    /// The shared mount body. `replay` is `(writer_id, entry seq, records)`
+    /// in canonical order — for a solo mount every writer id is 0, which
+    /// makes every partition/ownership branch below a no-op and the path
+    /// byte-for-byte the shipped one.
+    #[allow(clippy::too_many_arguments)]
+    async fn load_inner(
+        path: &Path,
+        base: u64,
+        total_extents: u64,
+        reserve: u64,
+        pending_cap: usize,
+        part: AppendPartition,
+        mounted_tails: &[u64],
+        replay: Vec<(u16, u64, &[(u8, Record)])>,
+    ) -> Result<Self, KvError> {
         let pages = bitmap_pages_for(total_extents);
         let region_len = bitmap_region_len(total_extents) as usize;
         let got = crate::uring_fs::read_at(path, base, region_len).await?;
@@ -379,7 +541,8 @@ impl ExtentAllocator {
             std::borrow::Cow::Owned(full)
         };
 
-        let mut core = ExtCore::new(total_extents, reserve, pending_cap);
+        let map = partition_map_for(part);
+        let mut core = ExtCore::new_partitioned(total_extents, reserve, pending_cap, map);
         let mut page_states = Vec::with_capacity(pages as usize);
         for page in 0..pages {
             let page_base = (page * 2 * ALLOC_PAGE_LEN) as usize;
@@ -419,8 +582,13 @@ impl ExtentAllocator {
         // The coverage-gate watermark seeds at the mounted tail: nothing
         // at-or-past it is durably covered, so no replayed free can drain
         // before a POST-mount checkpoint's tail passes it (design-smo-
-        // replay-currency §2-A mount gate).
-        core.advance_durable(mounted_tail);
+        // replay-currency §2-A mount gate). One seed per appender: gate
+        // seqs are positions in the freeing appender's own ring, so a
+        // peer's tail can neither cover nor release them.
+        for writer in 0..u64::from(part.writers()) {
+            let tail = mounted_tails.get(writer as usize).copied().unwrap_or(0);
+            core.advance_durable_in(writer, tail);
+        }
 
         // Fold the window's allocator deltas per-key LWW FIRST (the K1
         // fold shape: newest record per extent wins — the records are
@@ -432,25 +600,40 @@ impl ExtentAllocator {
         // would leave a FIFO entry whose post-mount drain clears a LIVE
         // extent's bit. Deltas dirty their pages so the next checkpoint
         // persists what only the journal held.
-        let mut folded: std::collections::BTreeMap<u64, (u64, AllocDelta)> =
+        let mut folded: std::collections::BTreeMap<u64, (u16, u64, AllocDelta)> =
             std::collections::BTreeMap::new();
-        for entry in replay {
-            for (tree_id, rec) in &entry.records {
+        for (writer, entry_seq, records) in &replay {
+            for (tree_id, rec) in *records {
                 if *tree_id != TREE_ALLOC_RESERVED {
                     continue;
                 }
                 let delta = decode_alloc_record(rec)?;
                 let extent = decode_extent_key(&rec.key)?;
-                // Entries arrive seq-sorted; per-key newest-wins is a
-                // plain overwrite (record seqs are strictly monotonic).
-                folded.insert(extent, (rec.seq, delta));
+                // Ownership (spec §6.2 item 3): an appender may only name
+                // extents in its own bitmap partition. Loud — a foreign
+                // bit applied silently is precisely the cross-appender
+                // corruption the partition exists to prevent. Vacuous on a
+                // solo mount (one partition owns everything).
+                let owner = map.owner_of_extent(extent) as u16;
+                if owner != *writer {
+                    return Err(KvError::Corrupt(format!(
+                        "replayed allocator delta for extent {extent} came from writer \
+                         {writer} at seq {entry_seq}, but that extent belongs to writer \
+                         {owner}'s bitmap partition (spec §6.2 item 3 — the appenders were \
+                         not disjoint)"
+                    )));
+                }
+                // Entries arrive in canonical merge order; per-key
+                // newest-wins is a plain overwrite (an extent's records
+                // all come from its owner, whose seqs are monotonic).
+                folded.insert(extent, (*writer, rec.seq, delta));
             }
         }
-        // Apply survivors; parked finals push in seq order (the FIFO's
-        // non-decreasing-gate contract), not extent order.
+        // Apply survivors; parked finals push per partition in seq order
+        // (the FIFO's non-decreasing-gate contract), not extent order.
         let mut replay_dirty: Vec<u64> = Vec::with_capacity(folded.len());
-        let mut parked: Vec<(u64, u64)> = Vec::new(); // (rec seq, extent)
-        for (extent, (seq, delta)) in &folded {
+        let mut parked: Vec<(u16, u64, u64)> = Vec::new(); // (writer, rec seq, extent)
+        for (extent, (writer, seq, delta)) in &folded {
             match delta {
                 AllocDelta::Allocated { .. } => core.mark_allocated(*extent),
                 AllocDelta::Freed { retire_seq: 0, .. } => {
@@ -459,13 +642,13 @@ impl ExtentAllocator {
                     // reusable, as always.
                     core.release(*extent);
                 }
-                AllocDelta::Freed { .. } => parked.push((*seq, *extent)),
+                AllocDelta::Freed { .. } => parked.push((*writer, *seq, *extent)),
             }
             replay_dirty.push(*extent);
         }
         parked.sort_unstable();
         let mut overflowed = 0u64;
-        for (seq, extent) in parked {
+        for (_writer, seq, extent) in parked {
             // In-window by construction ⇒ the freeing swap/flips are not
             // durably covered (the mounted record itself may be page-
             // cache-only after a kill): park gated on the record's own
@@ -484,7 +667,9 @@ impl ExtentAllocator {
             // exactly that image UNMOUNTABLE (the §4.7 pinned-floor
             // wedge's remount face, P2 2026-07-26 §9). Beyond-cap
             // entries park in the overflow and drain at the first
-            // post-mount durable checkpoint like every other.
+            // post-mount durable checkpoint like every other. The park
+            // routes to the extent's OWNER partition, whose clock is the
+            // only one that can cover this gate seq.
             core.mark_allocated(extent);
             if core.free_pending_forced(extent, seq) {
                 overflowed += 1;
@@ -507,6 +692,8 @@ impl ExtentAllocator {
             pages,
             page_states: page_states.into_boxed_slice(),
             dirty: dirty.into_boxed_slice(),
+            partition: part,
+            foreign_page_writes: AtomicU64::new(0),
         };
         for extent in replay_dirty {
             alloc.mark_dirty(extent);
@@ -517,6 +704,24 @@ impl ExtentAllocator {
     /// Total heap extents.
     pub fn total_extents(&self) -> u64 {
         self.core.total()
+    }
+
+    /// Which appender this allocator instance is (spec §6.2 item 3);
+    /// [`AppendPartition::SOLO`] on every un-stamped volume.
+    pub fn partition(&self) -> AppendPartition {
+        self.partition
+    }
+
+    /// Whether `extent` lies in this appender's bitmap partition.
+    pub fn owns_extent(&self, extent: u64) -> bool {
+        self.core.map().owner_of_extent(extent) == u64::from(self.partition.writer_id())
+    }
+
+    /// Bitmap pages this appender persisted that it does not own — the
+    /// ownership tripwire (see the field docs). 0 in steady partitioned
+    /// operation and structurally 0 on a solo volume.
+    pub fn foreign_page_writes(&self) -> u64 {
+        self.foreign_page_writes.load(Ordering::Relaxed)
     }
 
     /// The compaction reserve in extents.
@@ -563,6 +768,15 @@ impl ExtentAllocator {
         self.claim(AllocClass::User)
     }
 
+    /// [`Self::claim_user`] on **another** appender's partition — the S4
+    /// hook (a mount that owns the volume alone can allocate on behalf of
+    /// a partition whose appender is absent) and what lets one test
+    /// exercise two partitions of one bitmap. Steady-state appenders use
+    /// [`Self::claim_user`], which is their own partition.
+    pub fn claim_user_in(&self, writer: u16) -> Result<u64, KvError> {
+        self.claim_in(u64::from(writer), AllocClass::User)
+    }
+
     /// Claim an extent for compaction/checkpoint/SMO internals: may
     /// consume the reserve (§4.7 — the tree can always fold appends and
     /// free space even at user-visible ENOSPC). [`KvError::NoSpace`] here
@@ -572,13 +786,22 @@ impl ExtentAllocator {
     }
 
     fn claim(&self, class: AllocClass) -> Result<u64, KvError> {
-        match self.core.claim(class) {
+        self.claim_in(u64::from(self.partition.writer_id()), class)
+    }
+
+    fn claim_in(&self, writer: u64, class: AllocClass) -> Result<u64, KvError> {
+        match self.core.claim_in(writer, class) {
             Ok(extent) => {
                 self.mark_dirty(extent);
                 Ok(extent)
             }
+            // The refusal reports THIS partition's budget (identical to
+            // the whole-volume budget on a solo volume): an appender at
+            // ENOSPC in its own partition is the §4.7 condition, and
+            // naming the aggregate would make the message a lie under
+            // partitioning.
             Err(ClaimError::NoSpace) => Err(KvError::NoSpace {
-                free: self.core.free_extents(),
+                free: self.core.free_extents_in(writer),
                 reserve: self.core.reserve(),
             }),
             // RES-14: the core's budget and bitmap disagree. Pre-fix this
@@ -592,12 +815,12 @@ impl ExtentAllocator {
                      (free={}, reserve={}, total={}). Refusing the claim instead of \
                      spinning; the volume needs an fsck (class C2/C3)",
                     64,
-                    self.core.free_extents(),
+                    self.core.free_extents_in(writer),
                     self.core.reserve(),
                     self.core.total(),
                 );
                 Err(KvError::NoSpace {
-                    free: self.core.free_extents(),
+                    free: self.core.free_extents_in(writer),
                     reserve: self.core.reserve(),
                 })
             }
@@ -646,7 +869,8 @@ impl ExtentAllocator {
     /// producer; drains only vacate). The valve applies to threshold
     /// SMOs only — see [`Self::free_pending_forced`].
     pub fn pending_has_room(&self) -> bool {
-        self.core.pending_has_room()
+        self.core
+            .pending_has_room_in(u64::from(self.partition.writer_id()))
     }
 
     /// The §4.7 coverage gate: a root-ledger record whose
@@ -659,7 +883,17 @@ impl ExtentAllocator {
     /// many extents were released (their pages are marked dirty for the
     /// next checkpoint).
     pub fn advance_durable(&self, tail: u64) -> u64 {
-        let released = self.core.advance_durable(tail);
+        self.advance_durable_in(self.partition.writer_id(), tail)
+    }
+
+    /// [`Self::advance_durable`] for **another** appender's coverage clock
+    /// (spec §6.2 item 3): gate seqs are positions in the freeing
+    /// appender's own journal ring, so each partition drains on the tail of
+    /// ITS OWN durable ledger record. A mount that recovers a peer's
+    /// window while holding the volume alone advances that peer's clock
+    /// this way; steady-state appenders use [`Self::advance_durable`].
+    pub fn advance_durable_in(&self, writer: u16, tail: u64) -> u64 {
+        let released = self.core.advance_durable_in(u64::from(writer), tail);
         for extent in &released {
             self.mark_dirty(*extent);
         }
@@ -727,6 +961,16 @@ impl ExtentAllocator {
     ///    numbering above `max(page generations,
     ///    ledger.alloc_bitmap_generation)`, so a raised page generation
     ///    stays sound across remount.
+    ///
+    /// **Append partitioning (spec §6.2 item 3).** One page must have one
+    /// appender, or the A/B alternation stops being single-appender and a
+    /// peer's newest copy can be the slot this write replaces. That is a
+    /// property of *ownership*, not of this function: an appender only
+    /// dirties pages it claims and frees extents in. Pages this appender
+    /// does not own are still written (mount recovery legitimately replays
+    /// a peer's window while holding the volume alone) but counted in
+    /// [`Self::foreign_page_writes`] and logged — the tripwire that says
+    /// the partition leaked, rather than a silent clobber.
     pub async fn write_dirty_pages(
         &self,
         path: &Path,
@@ -753,6 +997,28 @@ impl ExtentAllocator {
         }
         if to_write.is_empty() {
             return Ok(to_write);
+        }
+
+        if !self.partition.is_solo() {
+            let mine = u64::from(self.partition.writer_id());
+            let map = self.core.map();
+            let foreign: Vec<u32> = to_write
+                .iter()
+                .copied()
+                .filter(|p| map.owner_of_page(u64::from(*p)) != mine)
+                .collect();
+            if !foreign.is_empty() {
+                self.foreign_page_writes
+                    .fetch_add(foreign.len() as u64, Ordering::Relaxed);
+                log::warn!(
+                    "bitmap: appender {mine} is persisting {} page(s) it does not own \
+                     ({:?}…) — legitimate only for a recovery mount holding the volume \
+                     alone; in steady multi-appender operation this is a partition leak \
+                     (spec §6.2 item 3)",
+                    foreign.len(),
+                    &foreign[..foreign.len().min(4)]
+                );
+            }
         }
 
         let words = self.core.snapshot_words();

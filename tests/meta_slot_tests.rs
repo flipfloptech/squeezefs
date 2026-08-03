@@ -175,6 +175,7 @@ fn rec(seq: u64, n_roots: usize, stamp: Option<MembershipStamp>) -> LedgerRecord
         alloc_bitmap_generation: seq,
         node_seq_watermark: 99,
         membership_stamp: stamp,
+        append_partition: None,
     }
 }
 

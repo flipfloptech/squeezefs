@@ -25,7 +25,7 @@
 //! case at the end).
 
 use squeezefs::meta_backend::kv::alloc_ext::{
-    alloc_record, compaction_reserve_extents, free_record, ExtentAllocator, ALLOC_PAGE_BITS,
+    alloc_record, free_record, ExtentAllocator, ALLOC_PAGE_BITS,
 };
 use squeezefs::meta_backend::kv::alloc_ext_core::{AllocClass, ExtCore, PartitionMap};
 use squeezefs::meta_backend::kv::checkpoint::{
@@ -37,14 +37,12 @@ use squeezefs::meta_backend::kv::journal::{
     detect_partition_violations, entry_len_for, merge_replay_windows, page_header_image,
     partition_ring_base, partition_ring_pages, partitioned_ring_geometry_ok, replay_merge, tag_for,
     AppendPartition, JournalRecovery, JournalRing, MergedEntry, PartitionViolation,
-    JOURNAL_PAGE_DATA_LEN, JOURNAL_PAGE_HDR_LEN, JOURNAL_PAGE_LEN, JOURNAL_PAGE_MAGIC,
-    MAX_ENTRY_LEN,
+    JOURNAL_PAGE_HDR_LEN, JOURNAL_PAGE_LEN, JOURNAL_PAGE_MAGIC, MAX_ENTRY_LEN,
 };
 use squeezefs::meta_backend::kv::journal_core::AdmissionClass;
 use squeezefs::meta_backend::kv::record::{
-    inode_key, InodeValue, Record, TREE_ALLOC_RESERVED, TREE_DENTRIES, TREE_INODES,
+    inode_key, InodeValue, Record, TREE_DENTRIES, TREE_INODES,
 };
-use squeezefs::meta_backend::kv::KvError;
 use squeezefs::uring_fs;
 use tempfile::NamedTempFile;
 
@@ -195,11 +193,13 @@ fn test_partitioned_ring_geometry_preflight() {
         partitioned_ring_geometry_ok(FLOOR_PAGES, writers)
             .unwrap_or_else(|e| panic!("8 MiB ring must serve {writers} appenders: {e}"));
     }
-    // A 128 KiB-class ring cannot serve two appenders: each sub-ring
-    // would be 16 pages ≈ 65 KiB < the 128 KiB entry cap.
-    let tiny = 32;
-    assert!(partitioned_ring_geometry_ok(tiny, 1).is_ok());
-    let err = partitioned_ring_geometry_ok(tiny, 2).expect_err("must refuse loud");
+    // The smallest legal SOLO ring (the `SuperblockV3::plan` override
+    // floor: one checkpoint reserve + one max entry ≈ 384 KiB) cannot
+    // serve two appenders — each sub-ring would be half of a ring that was
+    // already at the floor.
+    let floor_ring = 97; // 97 × 4,072 B ≥ 256 KiB + 128 KiB
+    assert!(partitioned_ring_geometry_ok(floor_ring, 1).is_ok());
+    let err = partitioned_ring_geometry_ok(floor_ring, 2).expect_err("must refuse loud");
     let msg = format!("{err}");
     assert!(
         msg.contains("128") || msg.contains(&MAX_ENTRY_LEN.to_string()),
@@ -288,7 +288,7 @@ async fn test_two_appenders_both_survive_replay() {
             .filter(|e| e.writer_id == writer)
             .map(|e| e.seq)
             .collect();
-        assert_eq!(&got, &seqs.iter().copied().collect::<Vec<_>>());
+        assert_eq!(&got, &seqs.to_vec());
     }
 }
 
@@ -1190,7 +1190,9 @@ async fn test_unstamped_volume_mount_leaves_the_superblock_unchanged() {
     .await
     .expect("format");
 
-    let before = uring_fs::read_at(f.path(), 0, 512).await.expect("sector 0");
+    let before = uring_fs::read_at(f.path(), 0, 4096)
+        .await
+        .expect("sector 0");
 
     let be = KvMetaBackend::open(f.path()).await.expect("mount");
     let created = be
@@ -1201,7 +1203,9 @@ async fn test_unstamped_volume_mount_leaves_the_superblock_unchanged() {
     be.shutdown().await.expect("clean unmount");
     drop(be);
 
-    let after = uring_fs::read_at(f.path(), 0, 512).await.expect("sector 0");
+    let after = uring_fs::read_at(f.path(), 0, 4096)
+        .await
+        .expect("sector 0");
     // Feature word at the superblock's `OFF_FEAT_INCOMPAT` (16).
     let feat_before = u64::from_le_bytes(before[16..24].try_into().unwrap());
     let feat_after = u64::from_le_bytes(after[16..24].try_into().unwrap());

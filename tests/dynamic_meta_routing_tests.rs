@@ -110,6 +110,7 @@ fn rec(stamp: Option<MembershipStamp>) -> LedgerRecord {
         alloc_bitmap_generation: 3,
         node_seq_watermark: 99,
         membership_stamp: stamp,
+        append_partition: None,
     }
 }
 

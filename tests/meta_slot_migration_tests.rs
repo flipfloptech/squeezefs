@@ -298,6 +298,7 @@ fn test_stamp_round_trip_with_and_without_cursors() {
         alloc_bitmap_generation: 9,
         node_seq_watermark: 2,
         membership_stamp: Some(st),
+        append_partition: None,
     };
     // One stamp wire (stride runs, dynamic meta routing): a cursor-free
     // stamp round-trips byte-faithfully.

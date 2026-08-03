@@ -190,6 +190,36 @@ pub const FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING: u64 = 1 << 6;
 /// era-less tokens onto a volume whose records name eras.
 pub const FEATURE_INCOMPAT_KV_DURABLE_TERM: u64 = 1 << 7;
 
+/// `features_incompat` bit 8: **partitioned append** — the volume's
+/// single-appender durable structures are expressed for N appenders
+/// (docs/pre-rc-engineering-spec.md §6.2 items 2/3/4; execution-plan
+/// rulings D8/D9):
+///
+/// * the journal ring is split into per-appender sub-rings whose page
+///   headers carry an appender id, and replay merges the windows
+///   ([`super::journal::replay_merge`]);
+/// * the A/B extent bitmap is partitioned by page, with per-appender free
+///   budgets, compaction reserves, pending-free FIFOs, and durable-coverage
+///   clocks;
+/// * the 32-slot root ledger is split into per-appender slot ranges, and
+///   its records carry an append-partition suffix.
+///
+/// **Presence is OPTIONAL and this binary NEVER STAMPS IT** (ruling D9,
+/// the bit-7 posture taken one step further): [`SuperblockV3::plan`] does
+/// not set it, mount does not set it, and no runtime path sets it — it is
+/// stamped by the Phase-8 batched reformat window alongside the other §6.2
+/// format changes. A volume without the bit behaves EXACTLY as today: solo
+/// rings, one bitmap, `slot = seq % 32`, suffix-less ledger records — every
+/// structure byte-identical (pinned by
+/// `tests/kv_partitioned_append_tests.rs`).
+///
+/// Old binaries refuse a bit-8 volume loud via their own
+/// [`FEATURES_INCOMPAT_KNOWN`] gate (the bit intersects no prior mask),
+/// which is exactly right: they would append into writer 0's sub-ring
+/// while believing it is the whole ring, and their `slot = seq % 32`
+/// checkpoints would overwrite every peer's ledger range.
+pub const FEATURE_INCOMPAT_KV_PARTITIONED_APPEND: u64 = 1 << 8;
+
 /// Incompat feature bits this binary understands. Any other set bit
 /// refuses the mount naming the bit (§6.1).
 pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
@@ -199,7 +229,8 @@ pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
     | FEATURE_INCOMPAT_KV_SLOT_MIGRATION
     | FEATURE_INCOMPAT_KV_LAYOUT_DELTAS
     | FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING
-    | FEATURE_INCOMPAT_KV_DURABLE_TERM;
+    | FEATURE_INCOMPAT_KV_DURABLE_TERM
+    | FEATURE_INCOMPAT_KV_PARTITIONED_APPEND;
 
 /// Read-only feature bits this binary understands (none yet — §4.11
 /// reserves the mechanism for snapshots). Unknown bits mount read-only.

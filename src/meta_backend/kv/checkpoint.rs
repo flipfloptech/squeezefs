@@ -98,6 +98,36 @@
 //! rule (§4.7) and its ring twin (§4.6 pt 3): nothing either record
 //! references has been overwritten.
 //!
+//! ## Append partitioning (pre-RC engineering spec §6.2 item 4)
+//!
+//! `slot = seq % 32` is a **single-checkpointer** placement: two
+//! checkpointers overwrite each other's tree state, and newest-valid-wins
+//! then picks between two divergent views of one volume. The partitioned
+//! form gives every appender a contiguous **slot range** of
+//! [`ledger_slots_per_writer`] slots and round-robins inside it
+//! ([`ledger_slot_for`]), which preserves the property the fallback rests
+//! on *per appender*: a torn newest slot still has ITS OWN predecessor
+//! behind it. That is why the appender count is capped at
+//! [`super::journal::MAX_APPENDERS`] — 16 appenders is 2 slots each, and
+//! one slot each would leave a torn checkpoint with no fallback at all.
+//!
+//! Attribution rides an optional 4-byte payload suffix
+//! ([`AppendPartition`]); a record without it is a **pre-partition**
+//! record, byte-identical to today's, and every un-stamped volume writes
+//! only those. Selection becomes per-appender
+//! ([`read_partitioned_ledger`]) with three loud refusals — a record in a
+//! slot range it does not own, a record from a differently-partitioned era,
+//! and a non-authority record carrying tree roots (two structural
+//! authorities being the §6.2 item 4 hazard itself).
+//!
+//! Per-appender selection also means the **checkpoint seq space is
+//! per-appender**: seqs are only ever compared within one appender's
+//! range, and the fields that must stay volume-global (`next_ino`,
+//! `node_seq_watermark`, the tree roots) live only on the authority's
+//! records. `alloc_bitmap_generation` is per-appender for the same reason
+//! the bitmap pages are: A/B resolution is per page, and a page has one
+//! owner.
+//!
 //! ## Slot format (little-endian; §4.1's field list)
 //!
 //! ```text
@@ -125,6 +155,10 @@
 //!                               a u16 plus1 overflows at slot 65535)
 //!     n_cursors: u16           (≤ STAMP_MAX_CURSORS)
 //!     n_cursors × { slot: u16, next_local_ino: u64 }  per-slot cursors
+//!   [append partition — OPTIONAL suffix; multi-writer partitioned append
+//!    (pre-RC engineering spec §6.2 item 4), behind incompat bit 8]:
+//!     writer_id: u16
+//!     writer_count: u16
 //! ```
 //!
 //! Every length is bounds-checked against its container before use (§9);
@@ -143,6 +177,7 @@
 //! which either side silently misparses the other's stamps.
 
 use super::backend::KvMetaBackend;
+use super::journal::AppendPartition;
 use super::tree::SmoContext;
 use super::KvError;
 use std::path::Path;
@@ -305,6 +340,12 @@ pub struct LedgerRecord {
     /// volumes — whose slots stay byte-identical to the pre-VL5a
     /// encoding.
     pub membership_stamp: Option<MembershipStamp>,
+    /// Which appender wrote this record, and how many the volume's
+    /// structures are partitioned for (spec §6.2 item 4). `None` on every
+    /// un-stamped volume — such a record encodes byte-identically to the
+    /// pre-partitioning image and places itself with `slot = seq % 32`
+    /// (ruling D9: built, not stamped).
+    pub append_partition: Option<AppendPartition>,
 }
 
 /// xxh3 over a slot image with the checksum field (bytes 16..24) zeroed —
@@ -317,10 +358,40 @@ fn slot_checksum(image: &[u8], payload_len: usize) -> u64 {
     h.digest()
 }
 
+/// Encoded size of the append-partition suffix (`writer_id ‖
+/// writer_count`) — 4 bytes against the §5.3 encoding budget's 331 spare
+/// (the worst-case stamped record is 3,765 of 4,096).
+const APPEND_PARTITION_ENC_LEN: usize = 4;
+
+/// Ledger slots each appender owns under a `writers`-way partition. The
+/// floor of 2 is normative, not cosmetic: newest-valid-wins with a torn
+/// newest slot must fall back to a predecessor **of the same appender**
+/// (§4.1), which one slot cannot provide. [`super::journal::MAX_APPENDERS`]
+/// is derived from exactly this.
+pub fn ledger_slots_per_writer(writers: u16) -> u64 {
+    ROOT_LEDGER_SLOTS / u64::from(writers)
+}
+
+/// The slot a record with checkpoint seq `seq` occupies under `part`:
+/// solo is `seq % 32` verbatim; a partitioned appender round-robins inside
+/// its own contiguous range (spec §6.2 item 4).
+pub fn ledger_slot_for(seq: u64, part: AppendPartition) -> u64 {
+    if part.is_solo() {
+        return seq % ROOT_LEDGER_SLOTS;
+    }
+    let per = ledger_slots_per_writer(part.writers());
+    u64::from(part.writer_id()) * per + seq % per
+}
+
 impl LedgerRecord {
-    /// The slot index this record occupies (`seq % 32`).
+    /// The slot index this record occupies: `seq % 32` for an
+    /// un-partitioned record (every un-stamped volume), its appender's
+    /// round-robin range otherwise ([`ledger_slot_for`]).
     pub fn slot_index(&self) -> u64 {
-        self.seq % ROOT_LEDGER_SLOTS
+        match self.append_partition {
+            None => self.seq % ROOT_LEDGER_SLOTS,
+            Some(part) => ledger_slot_for(self.seq, part),
+        }
     }
 
     /// Encode into a full zero-padded 4 KiB slot image. Errors when the
@@ -352,7 +423,13 @@ impl LedgerRecord {
             .membership_stamp
             .as_ref()
             .map_or(0, MembershipStamp::encoded_len);
-        let payload_len = PAYLOAD_FIXED_LEN + self.tree_roots.len() * ROOT_ENC_LEN + stamp_len;
+        let part_len = if self.append_partition.is_some() {
+            APPEND_PARTITION_ENC_LEN
+        } else {
+            0
+        };
+        let payload_len =
+            PAYLOAD_FIXED_LEN + self.tree_roots.len() * ROOT_ENC_LEN + stamp_len + part_len;
         if ROOT_LEDGER_HDR_LEN + payload_len > ROOT_LEDGER_SLOT_LEN as usize
             || self.tree_roots.len() > usize::from(u16::MAX)
         {
@@ -420,6 +497,15 @@ impl LedgerRecord {
                 pos += 8;
             }
         }
+        // The append-partition suffix rides AFTER the membership stamp:
+        // the stamp's own length equation closes exactly, so the decoder
+        // can tell "no suffix" (payload ends) from "one suffix" (exactly
+        // four more bytes) without ambiguity, and an un-partitioned record
+        // adds nothing at all (ruling D9).
+        if let Some(part) = self.append_partition {
+            image[pos..pos + 2].copy_from_slice(&part.writer_id().to_le_bytes());
+            image[pos + 2..pos + 4].copy_from_slice(&part.writers().to_le_bytes());
+        }
         let sum = slot_checksum(&image, payload_len);
         image[16..24].copy_from_slice(&sum.to_le_bytes());
         Ok(image)
@@ -462,11 +548,16 @@ impl LedgerRecord {
         let node_seq_watermark = u64::from_le_bytes(payload[24..32].try_into().unwrap());
         let n_roots = usize::from(u16::from_le_bytes(payload[32..34].try_into().unwrap()));
         // §9: the roots region must fit BEFORE it is walked; what follows
-        // it is either nothing (the historical pre-VL5a encoding) or one
-        // §5.5.1a membership stamp whose own length equation must close
-        // the payload exactly. (The pre-VL5a decoder required equality
-        // here — which is why stamped slots decode as absent to old
-        // binaries; see the module-docs format note.)
+        // it is one of exactly four shapes — nothing (the historical
+        // pre-VL5a encoding), one §5.5.1a membership stamp, one 4-byte
+        // append-partition suffix, or a stamp followed by that suffix.
+        // The shapes are unambiguous by length: the fixed stamp prefix is
+        // 34 bytes, so a 4-byte tail can only be a partition suffix, and a
+        // stamp's own length equation must close to within 0 or exactly 4
+        // bytes of the payload end. (The pre-VL5a decoder required exact
+        // equality — which is why stamped slots decode as absent to old
+        // binaries; see the module-docs format note. Partitioned records
+        // ride incompat bit 8, so the same one-way gate applies to them.)
         let roots_end = PAYLOAD_FIXED_LEN + n_roots * ROOT_ENC_LEN;
         if roots_end > payload_len {
             return Err(KvError::Corrupt(format!(
@@ -483,7 +574,12 @@ impl LedgerRecord {
             });
             pos += ROOT_ENC_LEN;
         }
+        let mut append_partition: Option<AppendPartition> = None;
         let membership_stamp = if pos == payload_len {
+            None
+        } else if payload_len - pos == APPEND_PARTITION_ENC_LEN {
+            // An append-partition suffix with no membership stamp.
+            append_partition = Some(decode_append_partition(&payload[pos..])?);
             None
         } else {
             if pos + STAMP_FIXED_LEN > payload_len {
@@ -551,10 +647,12 @@ impl LedgerRecord {
                      {STAMP_MAX_CURSORS})"
                 )));
             }
-            if pos + n_cursors * 10 != payload_len {
+            let cursors_end = pos + n_cursors * 10;
+            if cursors_end != payload_len && cursors_end + APPEND_PARTITION_ENC_LEN != payload_len {
                 return Err(KvError::Corrupt(format!(
                     "membership stamp n_cursors {n_cursors} inconsistent with payload \
-                     length {payload_len}"
+                     length {payload_len} (the only legal tail past the cursors is one \
+                     {APPEND_PARTITION_ENC_LEN}-byte append-partition suffix)"
                 )));
             }
             let mut cursors = Vec::with_capacity(n_cursors);
@@ -574,6 +672,9 @@ impl LedgerRecord {
                     ))
                 })?),
             };
+            if pos < payload_len {
+                append_partition = Some(decode_append_partition(&payload[pos..])?);
+            }
             let slot_cursors = cursors;
             Some(MembershipStamp {
                 set_uuid,
@@ -594,8 +695,24 @@ impl LedgerRecord {
             alloc_bitmap_generation,
             node_seq_watermark,
             membership_stamp,
+            append_partition,
         })
     }
+}
+
+/// Decode the 4-byte append-partition suffix, validating it through
+/// [`AppendPartition::new`] (an illegal appender count or id is structural
+/// corruption — the checksum already verified, so this is a writer-bug
+/// screen, and it must never reach placement arithmetic).
+fn decode_append_partition(tail: &[u8]) -> Result<AppendPartition, KvError> {
+    debug_assert!(tail.len() >= APPEND_PARTITION_ENC_LEN);
+    let writer_id = u16::from_le_bytes(tail[0..2].try_into().unwrap());
+    let writers = u16::from_le_bytes(tail[2..4].try_into().unwrap());
+    AppendPartition::new(writers, writer_id).map_err(|e| {
+        KvError::Corrupt(format!(
+            "ledger record carries an illegal append partition: {e}"
+        ))
+    })
 }
 
 /// Write `rec` to its round-robin slot at `ledger_base` in `path` via
@@ -639,6 +756,135 @@ pub async fn read_newest_ledger(
         }
     }
     Ok(newest)
+}
+
+/// Every appender's newest valid ledger record on a partitioned volume
+/// (spec §6.2 item 4) — the multi-appender face of
+/// [`read_newest_ledger`].
+#[derive(Debug)]
+pub struct PartitionedLedger {
+    /// Appenders the volume's structures are partitioned for.
+    pub writers: u16,
+    /// Newest valid record per appender, indexed by writer id (`None` =
+    /// that appender has never checkpointed).
+    pub per_writer: Vec<Option<LedgerRecord>>,
+    /// Each appender's durable journal tail — index = writer id, absent
+    /// records contributing 0 (the conservative seed: replay that ring
+    /// from its start; the fold is idempotent).
+    pub tails: Vec<u64>,
+    /// Pre-partition (suffix-less) records found — the Phase-8 transition
+    /// signal. Such a record was written under the solo placement law and
+    /// belongs to the root authority wherever it sits.
+    pub pre_partition_records: u64,
+}
+
+impl PartitionedLedger {
+    /// The root-authority appender's newest record: tree roots, `next_ino`,
+    /// and `node_seq_watermark` come from here and nowhere else.
+    pub fn authority(&self) -> Option<&LedgerRecord> {
+        self.per_writer
+            .get(usize::from(super::journal::ROOT_AUTHORITY_WRITER))
+            .and_then(|r| r.as_ref())
+    }
+}
+
+/// Read all 32 slots and resolve **per appender**: newest valid record in
+/// each appender's own slot range (spec §6.2 item 4). `writers` is the
+/// mount's appender count.
+///
+/// Three classes refuse the mount LOUD, because each one means the
+/// partition is not what this mount believes:
+///
+/// 1. a partitioned record sitting in a slot range it does not own (a
+///    misdirected write, or an appender using the wrong placement);
+/// 2. a record whose `writer_count` disagrees with `writers` (a
+///    differently-partitioned era — its slot arithmetic is not this
+///    mount's);
+/// 3. a **non-authority** record carrying tree roots — two structural
+///    authorities is §6.2 item 4's hazard itself, so it is refused at the
+///    format level rather than resolved by guessing.
+///
+/// Pre-partition records (no suffix) are the Phase-8 transition and are
+/// accepted as the authority's **wherever they sit**: they were placed by
+/// `slot = seq % 32`, and ignoring a newer valid record would fall back an
+/// unbounded distance — only the immediately-preceding record's replay
+/// window is protected (§4.6 pt 3).
+///
+/// `Err` on I/O is real device failure; slot *contents* that merely fail
+/// to verify read as absent, exactly like [`read_newest_ledger`].
+pub async fn read_partitioned_ledger(
+    path: &Path,
+    ledger_base: u64,
+    writers: u16,
+) -> Result<PartitionedLedger, KvError> {
+    let per = ledger_slots_per_writer(writers);
+    let got = crate::uring_fs::read_at(path, ledger_base, ROOT_LEDGER_LEN as usize).await?;
+    let mut per_writer: Vec<Option<LedgerRecord>> = vec![None; usize::from(writers)];
+    let mut pre_partition_records = 0u64;
+    for slot in 0..ROOT_LEDGER_SLOTS as usize {
+        let start = slot * ROOT_LEDGER_SLOT_LEN as usize;
+        if start >= got.len() {
+            break; // short extent: the rest reads as absent
+        }
+        let end = (start + ROOT_LEDGER_SLOT_LEN as usize).min(got.len());
+        let Ok(rec) = LedgerRecord::decode_slot(&got[start..end]) else {
+            continue; // unverifiable slot: absent, never loud
+        };
+        let writer = match rec.append_partition {
+            None => {
+                // A pre-partition record: the authority's, by the solo
+                // placement law it was written under.
+                pre_partition_records += 1;
+                super::journal::ROOT_AUTHORITY_WRITER
+            }
+            Some(part) => {
+                if part.writers() != writers {
+                    return Err(KvError::Corrupt(format!(
+                        "root-ledger slot {slot} carries writer_count {} but this mount is \
+                         partitioned for {writers} appenders — the volume was last written \
+                         by a differently-partitioned era, whose slot arithmetic is not \
+                         this one's (spec §6.2 item 4)",
+                        part.writers()
+                    )));
+                }
+                let lo = u64::from(part.writer_id()) * per;
+                if !(lo..lo + per).contains(&(slot as u64)) {
+                    return Err(KvError::Corrupt(format!(
+                        "root-ledger slot {slot} holds a record from writer {} whose slot \
+                         range is [{lo}, {}) — a misdirected write or an appender using \
+                         foreign placement (spec §6.2 item 4)",
+                        part.writer_id(),
+                        lo + per
+                    )));
+                }
+                part.writer_id()
+            }
+        };
+        if writer != super::journal::ROOT_AUTHORITY_WRITER && !rec.tree_roots.is_empty() {
+            return Err(KvError::Corrupt(format!(
+                "root-ledger slot {slot}: writer {writer} published {} tree roots, but only \
+                 writer {} owns the volume's structural state — two checkpointers naming \
+                 roots is exactly the overwrite this partitioning prevents (spec §6.2 \
+                 item 4)",
+                rec.tree_roots.len(),
+                super::journal::ROOT_AUTHORITY_WRITER
+            )));
+        }
+        let cell = &mut per_writer[usize::from(writer)];
+        if cell.as_ref().is_none_or(|cur| rec.seq > cur.seq) {
+            *cell = Some(rec);
+        }
+    }
+    let tails = per_writer
+        .iter()
+        .map(|r| r.as_ref().map_or(0, |r| r.journal_tail_seq))
+        .collect();
+    Ok(PartitionedLedger {
+        writers,
+        per_writer,
+        tails,
+        pre_partition_records,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,6 +1405,12 @@ impl KvMetaBackend {
             // checkpoint publishes the current mint watermarks (the
             // loom-modeled slot_cursor_core publication edge).
             membership_stamp: self.membership_stamp_for_ledger(),
+            // Ruling D9 — BUILT, NOT STAMPED: this mount is the volume's
+            // only appender (the D0 writer guard enforces it), so its
+            // records stay in the pre-partition form and place themselves
+            // with `slot = seq % 32`. The partitioned placement engages
+            // when spec §6.9 S4 hands the backend an appender set.
+            append_partition: None,
         };
         if let Err(e) = write_ledger_slot(
             self.device_path(),

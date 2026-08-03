@@ -945,6 +945,9 @@ fn bench_append_partition(c: &mut Criterion) {
         alloc_bitmap_generation: 4_242,
         node_seq_watermark: 7_100,
         membership_stamp: Some(stamp),
+        // The solo (un-stamped) shape — the shipped record. The
+        // partitioned shape is priced separately below.
+        append_partition: None,
     };
     group.bench_function("ledger_encode_slot", |b| {
         b.iter(|| black_box(black_box(&rec).encode_slot().expect("fits a slot")))

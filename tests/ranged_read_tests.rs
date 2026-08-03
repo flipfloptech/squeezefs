@@ -193,6 +193,23 @@ fn tier_has(h: &H, key: &str) -> bool {
     h.fs.router.cache.nvme.get_cached_read_block(key).is_some()
 }
 
+/// PERF-11 convention (read_tier_admission_tests precedent): an ordinary
+/// Demand-class fill's disk-tier publish is DEFERRED (it rides the
+/// single-flight guard on the blocking pool), so publish-PRESENCE
+/// assertions on that population are bounded eventuallys. (The hybrid
+/// ESCALATION fill is the exception — its publish is awaited at the serve
+/// boundary; hybrid_io_tests pins that with the immediate probe.)
+async fn tier_has_eventually(h: &H, key: &str) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !tier_has(h, key) {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    true
+}
+
 /// ALL counter-asserting phases in one fn (process-global counters).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ranged_phases() {
@@ -266,7 +283,7 @@ async fn ranged_phases() {
         "the whole-block fetch after ranged heat must ghost-admit (§5.3)"
     );
     assert!(
-        tier_has(&h, &k2),
+        tier_has_eventually(&h, &k2).await,
         "converged block is tier-resident (published whole block)"
     );
 

@@ -5036,7 +5036,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .with_fold(fs_engine.defrag_fold_hook());
                 squeezefs::defrag::spawn_gauge_worker(fs_engine.router.clone());
                 let fabric = squeezefs::jobs::JobFabric::start(
-                    routed_meta_backend,
+                    // Cloned since DLM S6: the membership plane arms after
+                    // this block and needs the same routed set.
+                    routed_meta_backend.clone(),
                     fabric_workers,
                     job_cpu_limit,
                     Some(mover_ctx),
@@ -5099,6 +5101,45 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // DLM S6 (spec §6.5 item 3, §6.9 S6): arm the membership plane.
+            //
+            // AFTER the job wire, deliberately: `job:enroll` is this
+            // plane's root of trust (possession of volume access IS cluster
+            // membership — ruling D2) and the wire's start is what writes
+            // it, so arming earlier would authenticate against a secret
+            // about to be replaced.
+            //
+            // A WRITE mount with `SQUEEZEFS_MEMBERSHIP_BIND` set becomes
+            // the lease authority: members' liveness then costs ZERO
+            // journal transactions instead of one `client:{uuid}`
+            // transaction per client per 10 s on the single volume ino 1
+            // routes to. A READ-ONLY mount joins whenever it finds a fresh
+            // rendezvous record — which is what finally makes readers
+            // visible in `squeezefs clients`, at the cost of no metadata
+            // write at all (the S5 gap). Both are `Ok(None)` when nothing
+            // is armed, which is the shipped default.
+            //
+            // The reader's fail-stop action is the S5 purge pass: if it
+            // ever misses its OWN deadline (T_self, strictly earlier than
+            // the owner's TTL) it drops every cached block before the owner
+            // can grant those objects elsewhere.
+            let membership_purge: std::sync::Arc<dyn Fn() + Send + Sync> = {
+                let router = fs_engine.router.clone();
+                std::sync::Arc::new(move || {
+                    let purged = squeezefs::ro_coherence::purge_reader_block_keys(&router.cache);
+                    log::warn!(
+                        "membership self-fence: dropped {purged} cached block key(s) before                          the owner's TTL could re-grant them"
+                    );
+                })
+            };
+            let membership_arm = squeezefs::membership::arm_mount_membership(
+                &routed_meta_backend,
+                reader_mount,
+                Some(membership_purge),
+            )
+            .await
+            .map_err(|e| format!("membership plane refused to arm: {e}"))?;
+
             let opt_idle = if resolved_fuse_io_uring_sqpoll_idle_ms > 0 {
                 Some(resolved_fuse_io_uring_sqpoll_idle_ms)
             } else {
@@ -5135,7 +5176,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None => options,
             };
 
-            start_mount(
+            let mount_result = start_mount(
                 mountpoint,
                 fs_engine,
                 resolved_uid,
@@ -5144,7 +5185,17 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 allow_other,
                 options,
             )
-            .await?;
+            .await;
+
+            // DLM S6: disarm the membership plane on the way out — end the
+            // cadence tasks, and (as an owner) REMOVE the rendezvous
+            // record, so the volume set presents as un-served instead of
+            // naming an endpoint nobody answers. A crash skips this, which
+            // is exactly the case a member's failed renewal already covers.
+            if let Some(membership) = membership_arm {
+                membership.disarm().await;
+            }
+            mount_result?;
         }
         Commands::Bench {
             mountpoint,
@@ -6300,6 +6351,25 @@ async fn run_clients_report(
         .map_err(|e| format!("cannot probe metadata volume '{path}': {e}"))?;
         for reg in be.mount_registrations().await {
             rows.push((path.clone(), reg));
+        }
+        // DLM S6 (spec §6.5 item 3 — "the read side is worse"): when this
+        // volume publishes a membership plane, its LIVE members come from
+        // ONE rendezvous-record read plus a paged RAM census, not from
+        // `listxattr(1)` and one `getxattr` per client under a shared
+        // `I{1}` lock. That is also the only way READERS appear at all: a
+        // reader performs no metadata write, by contract (§6.8 item 1), so
+        // it has no record to enumerate. `None` = no plane armed (the
+        // shipped default) or the owner it names does not answer, and the
+        // records above are then the whole answer, exactly as before.
+        if let Some(members) = squeezefs::membership_wire::census_as_registrations(
+            &be,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        {
+            for reg in members {
+                rows.push((path.clone(), reg));
+            }
         }
     }
 

@@ -426,8 +426,21 @@ impl ExtCore {
         self.map
     }
 
+    /// The appender's state. **Index, never modulo**: `writer %
+    /// parts.len()` on a runtime length emits a 64-bit division, and this
+    /// sits on the claim / release / free_pending path — the solo bracket
+    /// measured it at ~7 ns/claim, i.e. ~11 % of a claim, paid by a volume
+    /// with exactly one partition to choose from
+    /// (`.benchmarks/2026-08-05-mw-partitioned-append.md` §3). An
+    /// out-of-range writer id is a caller bug, not a case to be folded.
     fn part(&self, writer: u64) -> &Partition {
-        &self.parts[(writer % self.parts.len() as u64) as usize]
+        match self.parts.get(writer as usize) {
+            Some(p) => p,
+            None => {
+                debug_assert!(false, "writer {writer} outside the partition set");
+                &self.parts[0]
+            }
+        }
     }
 
     /// Claimable extents right now, across every partition (excludes

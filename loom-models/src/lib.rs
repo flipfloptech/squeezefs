@@ -52,6 +52,12 @@
 //!   single-producer headroom probe (`pending_has_room`, the PR 4 at-cap
 //!   admission check) is sound against racing drains — headroom observed
 //!   at SMO admission can never be invalidated before the post-swap push.
+//!   Since the multi-writer append partitioning (pre-RC engineering spec
+//!   §6.2 item 3) two more: concurrent claims from two appenders never
+//!   cross partitions (page-granular ownership + per-partition budgets),
+//!   and per-appender coverage clocks never cross — one appender's durable
+//!   tail can never release a peer's parked extent, whose gate seq is a
+//!   position in the peer's own journal ring.
 //! - [`node_state_core`]: the KV node lifecycle word (CoW KV metadata
 //!   design §4.6/§10, PR K5 —
 //!   clean/dirty/serializing/superseded) — invariants: a commit's
@@ -1656,6 +1662,115 @@ mod models {
             live.dedup();
             assert_eq!(live.len(), 3, "three unique live claims");
             assert_eq!(core.free_extents(), 0);
+        });
+    }
+
+    /// Extent-allocator invariant #6 (**append partitioning** — pre-RC
+    /// engineering spec §6.2 item 3): two appenders claiming concurrently
+    /// from one bitmap can never be handed the same extent, and neither
+    /// can be handed an extent from the other's partition. Under a shared
+    /// budget the two claims are one entitlement pool; the per-partition
+    /// budgets plus page-granular ownership are what make disjointness
+    /// structural rather than statistical.
+    #[test]
+    fn alloc_ext_partitioned_claims_never_cross() {
+        loom::model(|| {
+            // 4 extents, 2 per page, 2 appenders ⇒ writer 0 owns page 0
+            // (extents 0,1), writer 1 owns page 1 (extents 2,3).
+            let core = Arc::new(alloc_ext_core::ExtCore::new_partitioned(
+                4,
+                0,
+                2,
+                alloc_ext_core::PartitionMap::new(2, 2),
+            ));
+            let peer = {
+                let core = Arc::clone(&core);
+                thread::spawn(move || {
+                    (
+                        core.claim_in(1, alloc_ext_core::AllocClass::User).ok(),
+                        core.claim_in(1, alloc_ext_core::AllocClass::User).ok(),
+                    )
+                })
+            };
+            let a = core.claim_in(0, alloc_ext_core::AllocClass::User).ok();
+            let b = core.claim_in(0, alloc_ext_core::AllocClass::User).ok();
+            let (c, d) = peer.join().unwrap();
+
+            let mine: Vec<u64> = [a, b].into_iter().flatten().collect();
+            let theirs: Vec<u64> = [c, d].into_iter().flatten().collect();
+            assert_eq!(mine.len(), 2, "writer 0's partition holds exactly 2 extents");
+            assert_eq!(theirs.len(), 2, "writer 1's partition holds exactly 2");
+            for e in &mine {
+                assert!(
+                    *e < 2,
+                    "writer 0 claimed extent {e} from writer 1's bitmap page"
+                );
+            }
+            for e in &theirs {
+                assert!(
+                    *e >= 2,
+                    "writer 1 claimed extent {e} from writer 0's bitmap page"
+                );
+            }
+            let mut all: Vec<u64> = mine.into_iter().chain(theirs).collect();
+            all.sort_unstable();
+            all.dedup();
+            assert_eq!(all.len(), 4, "an extent was handed to two appenders");
+            assert_eq!(core.free_extents(), 0, "budgets settle exactly");
+            assert_eq!(core.claim_in(0, alloc_ext_core::AllocClass::User), Err(alloc_ext_core::ClaimError::NoSpace));
+            assert_eq!(core.claim_in(1, alloc_ext_core::AllocClass::User), Err(alloc_ext_core::ClaimError::NoSpace));
+        });
+    }
+
+    /// Extent-allocator invariant #7 (**per-appender coverage clocks** —
+    /// spec §6.2 item 3, the §4.7 reuse rule under partitioning): a gate
+    /// seq is a position in the FREEING appender's own journal ring, so
+    /// one appender's durable tail says nothing about a peer's parked
+    /// extent. Racing advances must release only their own partition's
+    /// entries — a shared clock would hand back an extent the peer's
+    /// replay window still routes into (risk R3, cross-appender edition).
+    #[test]
+    fn alloc_ext_partitioned_coverage_gates_never_cross() {
+        loom::model(|| {
+            let core = Arc::new(alloc_ext_core::ExtCore::new_partitioned(
+                4,
+                0,
+                2,
+                alloc_ext_core::PartitionMap::new(2, 2),
+            ));
+            let mine = core.claim_in(0, alloc_ext_core::AllocClass::Internal).expect("mine");
+            let theirs = core.claim_in(1, alloc_ext_core::AllocClass::Internal).expect("theirs");
+            // Both park at gate 100 — the same NUMBER in two different
+            // ring spaces, which is exactly the confusion a shared clock
+            // cannot tell apart.
+            core.free_pending(mine, 100).expect("park mine");
+            core.free_pending(theirs, 100).expect("park theirs");
+
+            // Writer 0's tail passes 100 while writer 1's stays at 0.
+            let peer = {
+                let core = Arc::clone(&core);
+                thread::spawn(move || core.claim_in(1, alloc_ext_core::AllocClass::Internal).ok())
+            };
+            let released = core.advance_durable_in(0, 100);
+            let raced = peer.join().unwrap();
+
+            assert_eq!(released, vec![mine], "only the advancing appender's entry may release");
+            assert!(
+                core.is_allocated(theirs),
+                "writer 1's parked extent was released by writer 0's tail — the coverage \
+                 gate crossed clock domains"
+            );
+            assert!(
+                raced.is_none_or(|e| e != theirs),
+                "a racing peer claim won its own parked extent before its own tail \
+                 covered the gate"
+            );
+            assert_eq!(core.pending_count_in(1), 1);
+            assert_eq!(core.durable_seq_in(1), 0, "a peer's advance must not move my clock");
+
+            // The peer's own tail is the only thing that frees it.
+            assert!(core.advance_durable_in(1, 99).is_empty());
+            assert_eq!(core.advance_durable_in(1, 100), vec![theirs]);
         });
     }
 

@@ -907,6 +907,42 @@ fn test_partitioned_claims_stay_inside_their_pages() {
     assert!((4..8).contains(&theirs) || (12..16).contains(&theirs));
 }
 
+/// A heap whose last page is PARTIAL (the ordinary case — extents rarely
+/// tile pages exactly): budgets and scans must both stop at `total`, and
+/// an appender owning a partial page must still be able to claim inside
+/// it.
+#[test]
+fn test_partitioned_claims_over_a_ragged_last_page() {
+    // 10 extents, 4 per page ⇒ pages 0,1 full and page 2 holding {8,9}.
+    // Writer 0 owns pages 0 and 2 (6 extents), writer 1 owns page 1 (4).
+    let core = ExtCore::new_partitioned(10, 0, 2, PartitionMap::new(2, 4));
+    assert_eq!(
+        core.free_extents_in(0),
+        6,
+        "writer 0: page 0 + the ragged page 2"
+    );
+    assert_eq!(core.free_extents_in(1), 4);
+    assert_eq!(
+        core.free_extents(),
+        10,
+        "the partitions tile the heap exactly"
+    );
+
+    let mut mine = Vec::new();
+    while let Ok(e) = core.claim_in(0, AllocClass::User) {
+        mine.push(e);
+    }
+    mine.sort_unstable();
+    assert_eq!(mine, vec![0, 1, 2, 3, 8, 9]);
+    let mut theirs = Vec::new();
+    while let Ok(e) = core.claim_in(1, AllocClass::User) {
+        theirs.push(e);
+    }
+    theirs.sort_unstable();
+    assert_eq!(theirs, vec![4, 5, 6, 7]);
+    assert_eq!(core.free_extents(), 0);
+}
+
 /// Reserve isolation is per partition (§4.7 ENOSPC semantics): each
 /// appender must keep its OWN compaction reserve, or a peer at ENOSPC
 /// could not fold appends and free space.

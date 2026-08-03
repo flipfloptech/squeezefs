@@ -74,6 +74,15 @@
 //! — that is spec §6.9 S4/S8. This module makes the format expressible
 //! for N appenders and makes a violation of the partition loud.
 //!
+//! One consequence worth stating: **re-partitioning is not an in-place
+//! operation.** Changing the appender count moves every sub-ring boundary,
+//! so a pre-existing page lands in a different appender's region and reads
+//! as a foreign page. A count change therefore requires the same shape as
+//! a clean unmount — every ring drained to `tail == head` — before the new
+//! count is adopted; the ledger's `writer_count` refusal
+//! ([`super::checkpoint::read_partitioned_ledger`]) is what makes an
+//! attempt to skip that step loud instead of silent.
+//!
 //! ## Entry framing (20 B header + payload, little-endian)
 //!
 //! ```text

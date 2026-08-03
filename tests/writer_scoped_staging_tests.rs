@@ -1177,6 +1177,7 @@ fn incompat_bits_are_single_bit_and_pairwise_disjoint() {
             "KV_BLOCK_KEY_INCARNATION",
             sb::FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION,
         ),
+        ("KV_CLAIM_SET", sb::FEATURE_INCOMPAT_KV_CLAIM_SET),
     ];
     let mut seen = 0u64;
     for (name, bit) in bits {

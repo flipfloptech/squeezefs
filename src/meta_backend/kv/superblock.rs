@@ -429,6 +429,50 @@ pub const FEATURE_INCOMPAT_KV_INO_LANES: u64 = 1 << 12;
 /// branches (writer-scoped staging, the S7 data-plane fence).
 pub const FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION: u64 = 1 << 13;
 
+/// `features_incompat` bit 14: **the claim-set record** (pre-RC
+/// engineering spec §6.2 **item 7**; DLM stage **S6**; ruling **D9**).
+///
+/// `writer_claim` is *singular* — Write-Exclusive, one holder — so it
+/// expresses **exclusion, not partition membership**. On a bit-12 volume
+/// the set's writer identities live in one `claim_set` record at local
+/// ino 1 beside the claim: the durable half of "multiple writers are
+/// members of one volume set", each entry carrying its identity, its
+/// endpoint and its NVMe **registrant key** (the PR half — the registrant
+/// list under a shared WERO hold, never a second reservation).
+///
+/// It is a **capability gate over one record**, not a structural change to
+/// anything else: `membership::ClaimSet::store` refuses an un-stamped
+/// volume, and on an un-stamped volume every consumer reads the same shape
+/// through a *projection* of `writer_claim`
+/// ([`crate::membership::ClaimSet::from_writer_claim`]). Single-writer
+/// behaviour is therefore byte-identical — no new key, no changed claim
+/// bytes — which `tests/dlm_membership_tests.rs` pins.
+///
+/// **Presence is OPTIONAL and nothing stamps it** (ruling D9, the
+/// bit-7/8/9/10/11 posture): [`SuperblockV3::plan`] does not set it, mount
+/// does not set it, and no runtime path sets it — [`set_claim_set_bit`] is
+/// the sole stamping path, for the Phase-8 batched reformat window.
+///
+/// Old binaries refuse a bit-12 volume loud via their own
+/// [`FEATURES_INCOMPAT_KNOWN`] gate — exactly right: they would read a set
+/// whose write custody is shared as if the single `writer_claim` they
+/// understand were the whole truth, and their mount gate would treat a
+/// legitimate co-member's claim as a foreign holder.
+///
+/// **Bit 12, not 10 or 11** — this program has already had TWO parallel
+/// bit collisions (8/9, then 10/11); the disjointness pins
+/// (`incompat_bits_are_single_bit_and_pairwise_disjoint` in
+/// `tests/writer_scoped_staging_tests.rs`, whose union clause asserts
+/// [`FEATURES_INCOMPAT_KNOWN`] is exactly the enumerated set, and the
+/// sibling pin in `tests/dlm_data_fence_tests.rs`) are what make the next
+/// one a red gate instead of silent on-disk aliasing.
+/// **Bit 14, not 12** — S6 authored this at 12 in parallel with the §6.2
+/// items-5/6 branch, which took 12 and 13. That is the FOURTH parallel
+/// claim in this program; renumbered at integration. The union clause in
+/// `tests/writer_scoped_staging_tests.rs` is what makes such a claim a red
+/// test instead of silent on-disk aliasing.
+pub const FEATURE_INCOMPAT_KV_CLAIM_SET: u64 = 1 << 14;
+
 /// Incompat feature bits this binary understands. Any other set bit
 /// refuses the mount naming the bit (§6.1).
 pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
@@ -444,7 +488,8 @@ pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
     | FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING
     | FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA
     | FEATURE_INCOMPAT_KV_INO_LANES
-    | FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION;
+    | FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION
+    | FEATURE_INCOMPAT_KV_CLAIM_SET;
 
 /// Read-only feature bits this binary understands (none yet — §4.11
 /// reserves the mechanism for snapshots). Unknown bits mount read-only.
@@ -1448,4 +1493,20 @@ pub async fn set_block_key_incarnation_bit(path: &Path) -> Result<bool, KvError>
         "block-key-incarnation",
     )
     .await
+    )
+    .await
+}
+
+/// Stamp [`FEATURE_INCOMPAT_KV_CLAIM_SET`] on `path`'s superblock — the
+/// §6.2 **item 7** upgrade path (the Phase-8 batched reformat window;
+/// **mount NEVER calls this**, ruling D9). Returns whether the bit was
+/// newly set. The volume must be offline (the caller holds the D0 guard).
+///
+/// Ordering, same class as bits 7/9/10/11: the bit gates ONE record whose
+/// only writer is a mount that already saw the bit, so stamp-then-crash is
+/// inert — the next mount finds no `claim_set` record and reads the
+/// singleton projection of `writer_claim`, which is exactly the state the
+/// pre-stamp mount was in.
+pub async fn set_claim_set_bit(path: &Path) -> Result<bool, KvError> {
+    set_incompat_bit(path, FEATURE_INCOMPAT_KV_CLAIM_SET, "claim-set").await
 }

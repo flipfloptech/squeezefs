@@ -95,7 +95,8 @@ use squeezefs::data_custody::{self, declare_dead_epoch, CustodyPosture, DeadEpoc
 use squeezefs::error::SqueezefsError;
 use squeezefs::fuse_client::METRICS;
 use squeezefs::meta_backend::kv::superblock::{
-    FEATURES_INCOMPAT_KNOWN, FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS, FEATURE_INCOMPAT_KV_DURABLE_TERM,
+    FEATURES_INCOMPAT_KNOWN, FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS, FEATURE_INCOMPAT_KV_CLAIM_SET,
+    FEATURE_INCOMPAT_KV_DURABLE_TERM,
     FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING, FEATURE_INCOMPAT_KV_GUEST_SLOTS,
     FEATURE_INCOMPAT_KV_LAYOUT_DELTAS, FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA,
     FEATURE_INCOMPAT_KV_PARTITIONED_APPEND, FEATURE_INCOMPAT_KV_SLOT_MIGRATION,
@@ -726,6 +727,10 @@ fn incompat_bit_11_is_disjoint_from_every_other_feature_bit() {
             "KV_WRITER_SCOPED_STAGING",
             FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING,
         ),
+        // DLM S6 / §6.2 item 7 (the claim-set record) took bit 12 after
+        // this pin: it is listed here so a future renumber of EITHER bit
+        // turns this assertion red instead of aliasing on disk.
+        ("KV_CLAIM_SET", FEATURE_INCOMPAT_KV_CLAIM_SET),
     ] {
         assert_eq!(
             FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA & bit,

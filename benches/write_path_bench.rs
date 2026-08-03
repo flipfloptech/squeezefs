@@ -827,9 +827,117 @@ fn bench_writer_scope(c: &mut Criterion) {
     group.finish();
 }
 
+/// **DLM S5 — the price a READER feature charges WRITERS** (pre-RC
+/// engineering spec §6.8 items 1/6; contracts in
+/// `tests/readonly_mount_tests.rs`).
+///
+/// The number that matters here is the one on the LEFT of the A/B: the
+/// read-only gate is a single relaxed atomic load feeding a never-taken,
+/// perfectly-predicted branch on every write-path ownership transition
+/// (allocation, terminal free, the W1 sole-owner patch). A reader mount
+/// must not tax the writer it reads behind, so this group prices the gate
+/// on a WRITE mount (latch off — the shipped posture) against the same
+/// call with the latch armed (the reader's refusal path, which short-
+/// circuits before any map work and is therefore *faster*, not slower —
+/// the honest shape of a gate that refuses early).
+///
+/// Field shape: `begin_patch_sole_owner` is the hottest gated site by two
+/// orders of magnitude — W1 is the primary random-write path at 61–67 k
+/// IOPS (`.benchmarks/2026-07-17-rand-write-program-closing.md`), i.e. one
+/// gated call per patched 4 KiB write. `allocate_block` is once per 4 MiB
+/// block. So W1 is the row that decides whether the latch is free.
+///
+/// The second group prices the item-5 purge-on-revalidation pass at the
+/// census size a reader accumulates between two checkpoints: with a 50 ms
+/// cadence and the measured 622 k–1.0 M IOPS il read ceiling
+/// (`.benchmarks/2026-07-19-l4-interception-closing.md`), a reader's warm
+/// block-key census is thousands of keys, and the pass runs at most once
+/// per epoch that observed the writer advance.
+fn bench_ro_gate(c: &mut Criterion) {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::cache::TieredCache;
+    use squeezefs::fuse_client::{read_only_mount, set_read_only_mount};
+    use squeezefs::nvme_dev::NvmeBlockDev;
+    use std::sync::Arc;
+    use tokio::runtime::Runtime;
+
+    let rt = Runtime::new().expect("bench runtime");
+    let ba = rt.block_on(async { BlockAllocator::new("ro_gate_bench").await.unwrap() });
+    ba.set_capacity_bytes(64 * 1024 * 1024 * 1024);
+    let off = rt.block_on(async { ba.allocate_block().await.expect("seed allocation") });
+
+    let mut group = c.benchmark_group("ro_gate");
+    // The gate ITSELF, isolated: one relaxed load + the not-taken branch.
+    // This is the number the "a reader feature must not tax writers"
+    // claim rests on — it is what every gated write-path site added.
+    group.bench_function("latch_probe", |b| {
+        b.iter(|| black_box(read_only_mount()));
+    });
+    // THE row: the gated W1 predicate on a write mount (latch off).
+    group.bench_function("w1_patch_predicate_write_mount", |b| {
+        assert!(
+            !read_only_mount(),
+            "the write-mount row needs the latch off"
+        );
+        b.iter(|| {
+            let ok = ba.begin_patch_sole_owner(black_box(off));
+            ba.publish_block(off);
+            black_box(ok)
+        });
+    });
+    // The refusal path (a reader) — short-circuits before the incarnation
+    // word is touched.
+    group.bench_function("w1_patch_predicate_reader", |b| {
+        set_read_only_mount(true);
+        b.iter(|| black_box(ba.begin_patch_sole_owner(black_box(off))));
+        set_read_only_mount(false);
+    });
+    group.finish();
+
+    // Item 5: the purge-on-revalidation pass over a warm census.
+    let backing = tempfile::NamedTempFile::new().expect("bench backing file");
+    backing.as_file().set_len(64 * 1024 * 1024).expect("size");
+    let dev = Arc::new(NvmeBlockDev::new(backing.path().to_str().expect("path")));
+    let pba = Arc::new(rt.block_on(async { BlockAllocator::new("ro_purge_bench").await.unwrap() }));
+    let cache = rt.block_on(async {
+        TieredCache::new(
+            Vec::new(),
+            Some("256MB"),
+            Some("64MB"),
+            Some("64MB"),
+            Some("64MB"),
+            pba,
+            dev,
+            None,
+        )
+        .await
+        .unwrap()
+    });
+    let payload = bytes::Bytes::from(vec![0u8; 4096]);
+    let mut group = c.benchmark_group("ro_revalidate_purge");
+    for keys in [1024usize, 8192] {
+        group.throughput(Throughput::Elements(keys as u64));
+        group.bench_function(format!("purge_census_{keys}"), |b| {
+            b.iter_batched(
+                || {
+                    for i in 0..keys {
+                        cache
+                            .read_lru
+                            .put(&format!("ro_purge_bench://{}", i * BLOCK), payload.clone());
+                    }
+                },
+                |_| black_box(squeezefs::ro_coherence::purge_reader_block_keys(&cache)),
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_writer_scope,
+    bench_ro_gate,
     bench_staging_shard_removal,
     bench_copy_probe_range,
     bench_coverage_union,

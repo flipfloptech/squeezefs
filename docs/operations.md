@@ -8,6 +8,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
 - [Durability & crash contract](#durability--crash-contract)
   - [Metadata Durability (crash contract)](#metadata-durability-crash-contract)
   - [Single-writer mount guard (guarantee classes)](#single-writer-mount-guard-guarantee-classes)
+  - [Read-only coherent mounts (`-o ro`)](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers)
   - [Format v3 (CoW KV metadata)](#format-v3-cow-kv-metadata)
 - [POSIX semantics — declared deviations](#posix-semantics--declared-deviations)
   - [`fallocate(mode = 0)` does not reserve space](#fallocatemode--0--posix_fallocate-does-not-reserve-space-posix-12)
@@ -96,7 +97,7 @@ SqueezeFS metadata is **format v3** (CoW KV) — the only supported metadata for
 
 ### Single-writer mount guard (guarantee classes)
 
-The v3 metadata engine is single-writer by construction, and the mount enforces it: every **write** mount claims each metadata volume with (a) a dedicated daemon-lifetime `flock` (same-host exclusivity; the kernel releases it instantly on process death), (b) an **NVMe Persistent Reservation** (Write Exclusive) where the namespace advertises reservation support — cross-host *enforcement*: the device itself rejects a fenced or stale holder's writes — and (c) a `writer_claim` heartbeat record (identity + detection on every substrate). A second concurrent mount is **refused loudly, naming the holder**. There is **no bypass flag**; read-only probes (`status`, format preflight) are never blocked. Design: `docs/design-metadata-throughput.md` §5.0. What the guard guarantees depends on the substrate:
+The v3 metadata engine is single-writer by construction, and the mount enforces it: every **write** mount claims each metadata volume with (a) a dedicated daemon-lifetime `flock` (same-host exclusivity; the kernel releases it instantly on process death), (b) an **NVMe Persistent Reservation** (Write Exclusive) where the namespace advertises reservation support — cross-host *enforcement*: the device itself rejects a fenced or stale holder's writes — and (c) a `writer_claim` heartbeat record (identity + detection on every substrate). A second concurrent **write** mount is **refused loudly, naming the holder**. There is **no bypass flag**; read-only probes (`status`, format preflight) are never blocked, and a **read-only mount** (`-o ro`) is admitted alongside the writer without taking or granting any exclusion — see [Read-only coherent mounts](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers). Design: `docs/design-metadata-throughput.md` §5.0. What the guard guarantees depends on the substrate:
 
 | Substrate | Guarantee |
 |---|---|
@@ -106,6 +107,7 @@ The v3 metadata engine is single-writer by construction, and the mount enforces 
 | — loop-device-backed nvmet namespace (the repo's own file-backed share path, `losetup` wrap) | loop devices expose no PR ⇒ lands in the **"block without PR"** row below — named explicitly because the repo's own tooling creates this shape |
 | Block volume **without** PR support | **Detection-grade**: mounts separated by > ~1 heartbeat are refused; near-simultaneous mounts can both arm; a paused holder cannot detect usurpation — therefore automatic cross-host takeover is disabled (operator-attested `claim clear` only) |
 | File-backed volume shared cross-host (NFS et al.), or containers with private `/dev` nodes | **Unsupported for concurrent-mount protection** — single-host operation of such volumes remains fully guarded by flock (former) / PR-if-available (latter) |
+| **Read-only mount** (`-o ro` / `--read-only`, any substrate) | **Not a writer, and not an obstacle to one** — guarantee class `reader`. A read-only mount takes NO `flock`, writes NO `writer_claim` and registers NO PR key, so (a) it is admitted while a writer holds the volume — including a *fresh foreign* claim, which refuses a write mount — (b) it never refuses a write mount, in either mount order, and (c) it changes nothing about the rows above: a second WRITER is still refused by exactly the same ladder. It mutates no plane (metadata, block allocation, frees, device reclaim, in-place patch/overwrite are all refused) and the kernel mounts it `MS_RDONLY`. Its *consistency* guarantee — which is a separate question from exclusion — is in [Read-only coherent mounts](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers) |
 
 **Recovery runbook**, in order of automation — the refusal message always names the holder (`{id, pid, boot, age}`) and the exact remedy:
 
@@ -121,7 +123,39 @@ The v3 metadata engine is single-writer by construction, and the mount enforces 
 
 **Fabric host identity (normative).** `/etc/nvme/hostnqn` and `/etc/nvme/hostid` are the **connect-time identity inputs**: created-if-missing by the `nvmeof connect` path, passed to nvme-cli and the `/dev/nvme-fabrics` fallback string, and read by the guard's `host_identity()`. They are **never the match authority**: when the register ladder must decide whether an existing PR registration is its own dead incarnation's, it matches on **`wire_host_id()`** — the host identifier the device itself reports for the live association (Get-Features FID 0x81) — because the wire identity was **measured diverging from the `/etc/nvme` files** on a real box (S1 session, 2026-07-17). Practical consequences: editing `/etc/nvme/hostid` changes what future connects present, not what the guard matches against; and only same-host stale keys (proven via the wire identity) are ever unregistered — foreign registrations always stay preempt/TTL/`claim clear` territory.
 
-Live signals on the `.stats` inode: `writer_guard_mode` per volume (`flock+pr` = enforcement-grade | `flock+claim` = detection-grade | `flock` = read-only mount) — alert on fleet drift; `writer_guard_fenced` (a fenced/usurped holder fail-stopped — working as designed, always investigate); `writer_guard_pr_reacquires` (the target dropped reservations, e.g. a PTPL-less power cycle — audit the fabric).
+Live signals on the `.stats` inode: `writer_guard_mode` per volume (`flock+pr` = enforcement-grade | `flock+claim` = detection-grade | `flock` = a WRITE mount degraded read-only by unknown-ro feature bits | `reader` = an `-o ro` mount, which holds no lock and claims nothing) — alert on fleet drift; `writer_guard_fenced` (a fenced/usurped holder fail-stopped — working as designed, always investigate); `writer_guard_pr_reacquires` (the target dropped reservations, e.g. a PTPL-less power cycle — audit the fabric).
+
+### Read-only coherent mounts (`-o ro`) — one writer plus N readers
+
+**Status: the mount mode ships; the coherence half is partial. Read the guarantee below before you rely on it.**
+
+A read-only mount is a *reader*: `squeezefs mount --read-only …` or `-o ro`. It takes no write lease, writes no `writer_claim`, registers no NVMe reservation and spawns no checkpoint task, so **one writer plus N readers of the same volume set is a supported shape** — and, symmetrically, a reader is never an obstacle to the writer (see the `reader` row in the guarantee-class table above). Design: `docs/pre-rc-engineering-spec.md` §6.8, DLM stage S5.
+
+```bash
+# on the writer host (unchanged)
+squeezefs mount sqmeta://<meta_dev> /mnt/sqz --data-lv <data_dev>
+
+# on any number of reader hosts sharing the same namespaces
+squeezefs mount --read-only sqmeta://<meta_dev> /mnt/sqz-ro --data-lv <data_dev>
+#   equivalently:  -o ro
+#   `-o ro` together with an explicit `-o rw` is refused loudly
+```
+
+**What a reader refuses.** Every plane, at three independent gates: the kernel (the filesystem is mounted `MS_RDONLY`, so the VFS returns `EROFS` before the daemon is involved), the FUSE handler surface (`EROFS` — this is the gate that also covers `LD_PRELOAD`/SDK ring writes, which never traverse the VFS), and the data plane (block allocation, terminal frees, device reclaim/discard, the W1 in-place patch and the in-place-overwrite lever all refuse). The writeback cache is off, and the writer-side background engines (writeback flusher, extent-record recovery, fold worker, reclaim pool, job fabric, job wire, defrag gauges, block-ownership recovery) are not armed.
+
+**Consistency guarantee — stated, not implied.**
+
+| Plane | What a reader sees |
+|---|---|
+| **Data blocks** | Consistent as of a revalidation epoch. Every epoch that observes the writer's roots advance drops the reader's whole block-key census (all five block-key stores + the read-lane hold), so a stale serve is bounded by **one revalidation interval**. It is *bounded*, not eliminated: within that interval a block the writer freed and reallocated to a different file can serve the other file's bytes — loudly on a transformed (compressed/encrypted) volume, because the AEAD tag fails; **silently on a passthrough volume, which is the default**. Eliminating the window is the freed-offset grace period (spec §6.8 item 3), which is not implemented |
+| **Metadata** | **A point-in-time snapshot taken at mount**, until the node-cache revalidation arm (spec §6.8 item 2) lands. New files, renames, unlinks and size changes made by the writer after the reader mounted are NOT visible to it. The mount logs this LOUDLY at arm, and `ro_node_cache_nodes_dropped == 0` on the `.stats` inode is its live signature. Remount the reader to advance its snapshot |
+| **Membership** | A reader does **not** appear in `squeezefs clients` — the `client:` registration is a metadata write, and a reader performs none. Reader visibility is the S6 membership plane's job |
+
+**Revalidation cadence and TTLs are derived, not configured.** The reader polls each metadata volume's A/B root ledger (one 4 KiB read per volume per pass) at the writer's checkpoint cadence (`SQUEEZEFS_META_FLUSH_INTERVAL_MS`, default 50 ms; floored at 10 ms so strict mode cannot spin the poll), because the roots cannot advance faster than they are written. The same cadence becomes the DEFAULT for every kernel cache TTL (`attr`/`entry`/`dir_entry`/`negative`) and for the daemon dentry, attr and parent-memo caches, whose shipped 300 s horizon is cut to it (never lengthened past 300 s). Explicit `SQUEEZEFS_FUSE_*_TTL_MS` and `-o *_timeout=` values still win verbatim — the standard precedence — which also means **overriding them lengthens the staleness window by exactly what you set**.
+
+**Live signals** (`.stats`): `read_only_mount` (the posture), `ro_revalidate_passes` (polls run), `ro_revalidate_epochs` (passes that saw the writer advance — zero across a window where the writer is known to be committing means the poll is not seeing checkpoints), `ro_purged_block_keys` (the purge trigger's engagement), `ro_node_cache_nodes_dropped` (0 ⇒ the metadata snapshot is frozen, per the table above). Plus `writer_guard_mode == "reader"` per volume.
+
+**What a reader does not weaken.** Nothing about the single-writer guard: the writer's `flock(LOCK_EX)` acquisition, its fresh-foreign-claim refusal, its PR arbitration and its recovery runbook are byte-identical with readers attached, and a second writer is refused exactly as before. The reader's own `flock(LOCK_SH)` is a *released probe* used only to log whether a local exclusive holder exists — a retained shared lock would conflict with the writer's exclusive one and let a reader deny a legitimate write mount, which is the opposite of the intent.
 
 ### Format v3 (CoW KV metadata)
 
@@ -360,6 +394,7 @@ Cache/staging paths come from the format config; passing `--disk-cache-paths` at
 - `--uid <uid>` / `--gid <gid>`: presented owner of files in the mount (presentation-only; staging I/O runs as the mounting user).
 - `-o <opts>`: FUSE options, including the per-class kernel TTLs (`attr_timeout`, `entry_timeout`, `dir_entry_timeout`, `negative_timeout`), `max_background` / `congestion_threshold` INIT overrides, and `direct_device_true` — each documented in its section below.
 - `--no-writeback`: disable the FUSE writeback cache (enabled by default).
+- `--read-only` (= `-o ro`): mount as a coherent **reader** (DLM S5) — no write lease, no `writer_claim`, no NVMe reservation, every plane refused, kernel `MS_RDONLY`, writeback cache off, and kernel/dentry TTLs derived from the writer's checkpoint cadence. Combining it with an explicit `-o rw` refuses loudly. Read the exact consistency guarantee first: [Read-only coherent mounts](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers).
 - `--interception` (= `-o interception` = `SQUEEZEFS_IPC=1`): arm the L4 LD_PRELOAD interception session host for this mount — see [LD_PRELOAD interception](#ld_preload-interception--o-interception--security-posture--unsupported-mixes).
 - `--write-verification` (+ `--write-verification-sample <N>`): opt-in read-after-write checksum verification.
 - `--dismount-wait <secs>` / `--upload-delay <dur>`: staging drain window on dismount / background upload cadence.
@@ -491,7 +526,7 @@ The INIT `max_write`/`max_pages` pair is **negotiated per mount** (2026-08-04 ge
 
 ### Kernel cache TTLs (mount options / env; per-class)
 
-Four kernel-cache TTL classes, each defaulting to the historical 1 s (the DAOS per-class split: directory dentries invalidate whole subtrees, so they get their own knob). Mount options are libfuse-style float seconds (`-o attr_timeout=2.5`) and win over the env knobs (milliseconds); both are per-mount. Longer TTLs widen the staleness window a single mount can observe of its own metadata — safe under the single-writer mount guard; revisit before any multi-writer future.
+Four kernel-cache TTL classes, each defaulting to the historical 1 s (the DAOS per-class split: directory dentries invalidate whole subtrees, so they get their own knob). Mount options are libfuse-style float seconds (`-o attr_timeout=2.5`) and win over the env knobs (milliseconds); both are per-mount. Longer TTLs widen the staleness window a single mount can observe of its own metadata — safe under the single-writer mount guard; revisit before any multi-writer future. On a **read-only mount** the four defaults are not 1 s: they derive from the writer's checkpoint cadence, because that is the interval a reader can prove freshness over ([Read-only coherent mounts](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers)). Explicit values still win verbatim there, which means setting one lengthens a reader's staleness window by exactly that much.
 
 - `-o attr_timeout=<s>` / `SQUEEZEFS_FUSE_ATTR_TTL_MS`: GETATTR/SETATTR reply TTL + the daemon attr-cache freshness window.
 - `-o entry_timeout=<s>` / `SQUEEZEFS_FUSE_ENTRY_TTL_MS`: dentry TTL for non-directory lookup/create results.

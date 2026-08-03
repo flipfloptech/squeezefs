@@ -87,7 +87,7 @@ Hardening: pool not marked ready until all queues submit REGISTER; per-qid commi
 ## High-Performance Distributed Filesystem Architecture
 
 ### Target Scale & Layout
-* **Scale:** 15,000+ Concurrent Nodes — the **design target**, meaning (user ruling D1, 2026-08-02) 15 k nodes all reading AND writing but rarely the same files (at-scale AI-training mixed workloads). **Shipped today: one write mount per volume set** (D0 guard, enforced). The gap is spec §6's program; scale claims must cite their evidence tier (measured-real / measured-simulated / arithmetic-on-measured-constants) per `docs/rc-manifest.md`.
+* **Scale:** 15,000+ Concurrent Nodes — the **design target**, meaning (user ruling D1, 2026-08-02) 15 k nodes all reading AND writing but rarely the same files (at-scale AI-training mixed workloads). **Shipped today: one write mount per volume set** (D0 guard, enforced) **plus N read-only mounts** (`-o ro` / `--read-only` — DLM S5's mount half: no lease, no claim, no PR key, so orthogonal to the guard; data staleness bounded by one revalidation interval, metadata a mount-time snapshot until §6.8 item 2 lands — `docs/operations.md` §Read-only coherent mounts). The gap is spec §6's program; scale claims must cite their evidence tier (measured-real / measured-simulated / arithmetic-on-measured-constants) per `docs/rc-manifest.md`.
 * **Architecture Type:** Decoupled metadata (MetaLV) + **block data** (local NVMe / NVMe-oF), exposed via POSIX FUSE.
 
 ### Technology Stack

@@ -1116,7 +1116,7 @@ impl KvMetaBackend {
     ///
     /// | Step of [`Self::open`] | Reader |
     /// |---|---|
-    /// | Layer A `flock(LOCK_EX)` | **not taken.** `flock(LOCK_SH)` runs as a released probe (classification only — [`Self::probe_shared_lock`]) |
+    /// | Layer A `flock(LOCK_EX)` | **not taken.** `flock(LOCK_SH)` runs as a released probe (classification only — `probe_shared_lock`) |
     /// | DUR-5 primary-superblock repair | **skipped** — it WRITES sector 0 |
     /// | Bootstrap replay (SB → ledger → bitmap → RAM journal replay) | same, verbatim (torn-tolerant, read-only by construction) |
     /// | Layer B2 claim classification (`FreshForeign` refusal) | **bypassed** — a reader cannot conflict with a writer it never writes against |
@@ -2957,7 +2957,7 @@ pub enum ReadOnlyCause {
 
 /// The reader's Layer-A classification (DLM S5). `flock(LOCK_SH)` is taken
 /// as a PROBE and released immediately — see
-/// [`KvMetaBackend::probe_shared_lock`].
+/// `KvMetaBackend::probe_shared_lock`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharedProbe {
     /// No exclusive holder on this host: no local write mount, no offline

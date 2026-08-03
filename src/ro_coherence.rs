@@ -13,7 +13,7 @@
 //! | §6.8 item | Where |
 //! |---|---|
 //! | 1 — the read-only mount mode | `KvMetaBackend::open_read_only`, `fuse_client::read_only_mount`, the allocator/reclaim gates |
-//! | **2 — node-cache revalidation** | **NOT here.** The hard, weeks-scale item (`feat/mw-node-cache-coherence`). This module owns the *driver* and calls it through [`NodeCacheRevalidate`] |
+//! | **2 — node-cache revalidation** | **NOT here.** The hard, weeks-scale item (`feat/mw-node-cache-coherence`). This module owns the *driver* and calls it through [`crate::ro_coherence::NodeCacheRevalidate`] |
 //! | 3 — the freed-offset grace period | **not taken** — see the §Bounded-vs-eliminated note below |
 //! | 4 — TTL alignment | `fuse_client::{KernelCacheTtls::read_only_defaults, reader_daemon_cache_ttl}`, driven by [`checkpoint_cadence`] |
 //! | **5 — purge on revalidation** | [`purge_reader_block_keys`], triggered by [`revalidate_volume`] |
@@ -39,10 +39,21 @@
 //! bytes it fetched at most one interval ago for an offset the writer has
 //! since freed and reallocated to a different file. It does not
 //! **eliminate** that window — eliminating it is §6.8 item 3, the
-//! freed-offset grace period (refuse to reallocate an offset until every
-//! registered reader has acknowledged passing that epoch), which needs
-//! epoch-acknowledgement machinery on the `client:` heartbeat and a
-//! writer-side allocation quarantine. On a transformed (AEAD) volume the
+//! freed-offset grace period, which is **NOT implemented**. Full
+//! assessment: `.benchmarks/2026-08-05-dlm-s5-readonly-mount.md` §4. The
+//! short version, because it is a structural finding rather than a
+//! scheduling choice: the spec's mechanism rides the `client:` heartbeat,
+//! and a reader **cannot write that record** — it is an xattr commit on
+//! ino 1 under an exclusive `I{1}` guard, i.e. a metadata write, which
+//! item 1 refuses by contract (and §6.5 pt 3 already measures that plane
+//! saturating at ~4,550 clients). Item 3 therefore needs a reader→writer
+//! acknowledgement channel that is not a metadata write (S3
+//! `cluster_wire` / S6 membership) plus a writer-side epoch-keyed
+//! quarantine between `begin_free` and `finish_free`. Its release
+//! condition did get cheaper this wave: durable block refcounts (§6.2
+//! item 1) answer "is this block still referenced?" as a prefix
+//! population count instead of an inode-tree walk. On a transformed
+//! (AEAD) volume the
 //! window is loud (tag failure); on a passthrough volume — the default —
 //! it is silent. `docs/operations.md` §Read-only coherent mounts states
 //! this to operators in those terms, and the RC guarantee table carries
@@ -196,9 +207,7 @@ pub fn purge_reader_block_keys(cache: &TieredCache) -> u64 {
     // pass exists to prevent.
     cache.read_lane_hold.trim_to(0);
     let n = keys.len() as u64;
-    METRICS
-        .ro_purged_block_keys
-        .fetch_add(n, Ordering::Relaxed);
+    METRICS.ro_purged_block_keys.fetch_add(n, Ordering::Relaxed);
     n
 }
 
@@ -238,11 +247,21 @@ pub fn arm_reader_data_plane(router: &crate::routing::DataRouter) {
 /// can never run faster than the roots can advance.
 ///
 /// The task holds the volumes it polls (a reader's whole point is to keep
-/// serving), and exits when `stop` fires — the dismount path.
+/// serving), and exits at dismount.
+///
+/// Stop discipline: `stop_flag` is the AUTHORITY (the mount's
+/// `dismount_once` latch, checked once per pass) and `wake` is only a
+/// promptness hint. A `Notify::notify_waiters()` reaches only tasks
+/// already parked on it, so a notify that fires between two of this
+/// loop's `notified()` registrations is LOST — using it as the authority
+/// would strand the task for the process's life. Detached-panic
+/// accounting rides `detached::contain` (RES-8: nothing joins this task,
+/// so `detached_task_panics` is the only record if it unwinds).
 pub fn spawn_reader_revalidation(
     volumes: Vec<Arc<KvMetaBackend>>,
     router: crate::routing::DataRouter,
-    stop: Arc<tokio::sync::Notify>,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
 ) -> tokio::task::JoinHandle<()> {
     let interval = crate::fuse_client::reader_revalidate_interval(checkpoint_cadence());
     log::info!(
@@ -251,38 +270,42 @@ pub fn spawn_reader_revalidation(
         volumes.len(),
         interval
     );
-    tokio::spawn(async move {
-        let mut last_seen: Vec<u64> = volumes.iter().map(|v| v.mounted_ledger().seq).collect();
-        loop {
-            tokio::select! {
-                _ = stop.notified() => {
+    tokio::spawn(crate::detached::contain(
+        "reader_revalidation",
+        async move {
+            let mut last_seen: Vec<u64> = volumes.iter().map(|v| v.mounted_ledger().seq).collect();
+            loop {
+                tokio::select! {
+                    _ = wake.notified() => {}
+                    _ = tokio::time::sleep(interval) => {}
+                }
+                if stop_flag.load(Ordering::Acquire) {
                     log::info!("reader revalidation stopping (dismount)");
                     return;
                 }
-                _ = tokio::time::sleep(interval) => {}
-            }
-            let mut moved = false;
-            for (i, vol) in volumes.iter().enumerate() {
-                match revalidate_volume(vol.as_ref()).await {
-                    Ok(epoch) => {
-                        if epoch.ledger_seq != last_seen[i] {
-                            last_seen[i] = epoch.ledger_seq;
-                            moved = true;
+                let mut moved = false;
+                for (i, vol) in volumes.iter().enumerate() {
+                    match revalidate_volume(vol.as_ref()).await {
+                        Ok(epoch) => {
+                            if epoch.ledger_seq != last_seen[i] {
+                                last_seen[i] = epoch.ledger_seq;
+                                moved = true;
+                            }
                         }
+                        Err(e) => log::warn!("reader revalidation pass failed: {e}"),
                     }
-                    Err(e) => log::warn!("reader revalidation pass failed: {e}"),
+                }
+                if moved {
+                    // One purge per pass, not per volume: the stores are
+                    // mount-wide and the keys are not volume-attributable
+                    // without the layout walk this design exists to avoid.
+                    let purged = purge_reader_block_keys(&router.cache);
+                    log::debug!(
+                        "reader revalidation epoch: roots moved, {purged} cached block key(s) \
+                     dropped"
+                    );
                 }
             }
-            if moved {
-                // One purge per pass, not per volume: the stores are
-                // mount-wide and the keys are not volume-attributable
-                // without the layout walk this design exists to avoid.
-                let purged = purge_reader_block_keys(&router.cache);
-                log::debug!(
-                    "reader revalidation epoch: roots moved, {purged} cached block key(s) \
-                     dropped"
-                );
-            }
-        }
-    })
+        },
+    ))
 }

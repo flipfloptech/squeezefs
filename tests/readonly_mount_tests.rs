@@ -124,10 +124,7 @@ async fn data_router(vol_id: &str) -> (squeezefs::routing::DataRouter, NamedTemp
     .await
     .unwrap();
     let dlm = squeezefs::dlm::DlmClient::new().unwrap();
-    (
-        squeezefs::routing::DataRouter::new(dlm, cache, ba, dev),
-        b,
-    )
+    (squeezefs::routing::DataRouter::new(dlm, cache, ba, dev), b)
 }
 
 // ===========================================================================
@@ -167,9 +164,9 @@ async fn a_reader_never_refuses_a_writer_mount() {
         .await
         .expect("read-only mount");
 
-    let writer = KvMetaBackend::open(vol.path())
-        .await
-        .expect("a write mount must NOT be refused because a reader is attached (D0 orthogonality)");
+    let writer = KvMetaBackend::open(vol.path()).await.expect(
+        "a write mount must NOT be refused because a reader is attached (D0 orthogonality)",
+    );
     Metadata::create(writer.as_ref(), 1, "w", libc::S_IFREG | 0o644, 0, 0)
         .await
         .expect("the writer serves normally");
@@ -194,8 +191,7 @@ async fn second_writer_still_refused_with_readers_attached() {
 
     let err = KvMetaBackend::open(vol.path())
         .await
-        .err()
-        .expect("a second WRITER must still be refused (D0)")
+        .expect_err("a second WRITER must still be refused (D0)")
         .to_string();
     assert!(
         err.contains("single-writer") || err.contains("writer lock"),
@@ -248,8 +244,7 @@ async fn read_only_mount_refuses_metadata_mutations_loud() {
 
     let err = Metadata::create(reader.as_ref(), 1, "x", libc::S_IFREG | 0o644, 0, 0)
         .await
-        .err()
-        .expect("create must refuse on a read-only mount")
+        .expect_err("create must refuse on a read-only mount")
         .to_string();
     assert!(
         err.contains("read-only"),
@@ -313,8 +308,7 @@ async fn read_only_mount_leaves_a_foreign_writer_claim_untouched() {
     // The write mount refuses (D0 unchanged) …
     let werr = KvMetaBackend::open(vol.path())
         .await
-        .err()
-        .expect("a fresh foreign claim still refuses a WRITE mount")
+        .expect_err("a fresh foreign claim still refuses a WRITE mount")
         .to_string();
     assert!(werr.contains("claimed by a live writer") || werr.contains("single-writer"));
 
@@ -350,14 +344,16 @@ async fn read_only_latch_refuses_block_allocation() {
     let err = ba
         .allocate_block()
         .await
-        .err()
-        .expect("allocation must refuse on a read-only mount")
+        .expect_err("allocation must refuse on a read-only mount")
         .to_string();
     assert!(
         err.contains("read-only"),
         "the refusal must name the read-only mount: {err}"
     );
-    assert!(ba.allocate_block_below(64).is_none(), "contiguity picks too");
+    assert!(
+        ba.allocate_block_below(64).is_none(),
+        "contiguity picks too"
+    );
     assert!(
         ba.allocate_block_at_or_above(0).is_err(),
         "the at-or-above pick too"
@@ -475,8 +471,7 @@ async fn read_only_latch_refuses_the_recovery_walk() {
         .default_allocator
         .recover_active_blocks_v3(reader.as_ref(), &router.backend_router)
         .await
-        .err()
-        .expect("the recovery walk must refuse on a read-only mount")
+        .expect_err("the recovery walk must refuse on a read-only mount")
         .to_string();
     assert!(err.contains("read-only"), "loud and named: {err}");
     assert_eq!(
@@ -513,12 +508,10 @@ fn read_only_option_resolution_and_conflict_refusal() {
         "-o rw is the default posture"
     );
     let err = read_only_from_options(Some("rw"), true)
-        .err()
-        .expect("--read-only with an explicit -o rw is a contradiction");
+        .expect_err("--read-only with an explicit -o rw is a contradiction");
     assert!(err.contains("read-only") && err.contains("rw"), "{err}");
-    let err = read_only_from_options(Some("ro,rw"), false)
-        .err()
-        .expect("-o ro,rw is a contradiction");
+    let err =
+        read_only_from_options(Some("ro,rw"), false).expect_err("-o ro,rw is a contradiction");
     assert!(err.contains("read-only") && err.contains("rw"), "{err}");
 }
 
@@ -527,7 +520,8 @@ fn read_only_option_resolution_and_conflict_refusal() {
 /// custom kernel option string — the daemon-level keys are stripped there.
 #[test]
 fn ro_is_daemon_level_in_the_kernel_option_filter() {
-    let kernel = squeezefs::fuse_client::filter_kernel_mount_options("ro,allow_other,max_read=4096");
+    let kernel =
+        squeezefs::fuse_client::filter_kernel_mount_options("ro,allow_other,max_read=4096");
     assert!(
         !kernel.split(',').any(|o| o.trim() == "ro"),
         "`ro` must not ride the custom kernel option string: {kernel}"
@@ -631,7 +625,10 @@ async fn revalidation_epoch_purges_the_block_key_stores() {
     cache
         .hot_block
         .put(key, bytes::Bytes::from_static(&[7u8; 4096]));
-    assert!(cache.read_lru.get(key).is_some(), "control: the key is warm");
+    assert!(
+        cache.read_lru.get(key).is_some(),
+        "control: the key is warm"
+    );
 
     let purged = squeezefs::ro_coherence::purge_reader_block_keys(cache);
     assert!(
@@ -690,6 +687,150 @@ async fn revalidation_pass_observes_the_writer_advancing_the_roots() {
     assert!(second.ledger_seq > first.ledger_seq);
 
     writer.shutdown().await.unwrap();
+}
+
+/// The revalidation task must EXIT at dismount (no leaked tasks — and the
+/// stop authority is the `dismount_once` FLAG, not the notify: a
+/// `notify_waiters()` that fires between two of the loop's registrations
+/// is lost, so using the notify as the authority would strand the task for
+/// the process's life).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reader_revalidation_task_exits_at_dismount() {
+    let vol = fresh_volume().await;
+    let reader = KvMetaBackend::open_read_only(vol.path())
+        .await
+        .expect("read-only mount");
+    let (router, _b) = data_router("ro_stop_test").await;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let handle = squeezefs::ro_coherence::spawn_reader_revalidation(
+        vec![reader],
+        router,
+        stop.clone(),
+        wake.clone(),
+    );
+
+    // Dismount: latch first, then wake — the same order the mount path
+    // uses (`dismount_once.swap(true)` precedes `notify_waiters`).
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    wake.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("the revalidation task must exit at dismount, not leak")
+        .expect("and it must not panic");
+}
+
+/// **Item 6 at the FUSE door.** The kernel refuses mutations on an
+/// `MS_RDONLY` mount, but an interception client's ring writes never
+/// traverse the VFS — so the daemon-side handler gate is what actually
+/// holds, and it must answer `EROFS` (what applications and every POSIX
+/// suite expect from a read-only filesystem).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fuse_mutating_handlers_answer_erofs_on_a_reader() {
+    use fuse3::raw::prelude::Filesystem;
+
+    let vol = fresh_volume().await;
+    let (router, _b) = data_router("ro_erofs_test").await;
+    let dlm = squeezefs::dlm::DlmClient::new().unwrap();
+    let mut fs = squeezefs::fuse_client::SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+    let routed = {
+        let be = KvMetaBackend::open(vol.path()).await.unwrap();
+        Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![be]))
+    };
+    fs.router.set_meta_backend(routed.clone());
+    fs.meta_backend = Some(routed);
+    let req = fuse3::raw::Request {
+        unique: 1,
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
+        pid: 1,
+        ..Default::default()
+    };
+
+    // Control: writable.
+    let created = fs
+        .create(
+            req,
+            1,
+            std::ffi::OsStr::new("writable"),
+            libc::S_IFREG | 0o644,
+            0,
+        )
+        .await
+        .expect("control: a write mount creates");
+
+    let _latch = RoLatch::arm();
+    let erofs = fuse3::Errno::from(libc::EROFS);
+    assert_eq!(
+        fs.create(
+            req,
+            1,
+            std::ffi::OsStr::new("nope"),
+            libc::S_IFREG | 0o644,
+            0
+        )
+        .await
+        .err(),
+        Some(erofs),
+        "create must answer EROFS"
+    );
+    assert_eq!(
+        fs.mkdir(req, 1, std::ffi::OsStr::new("d"), 0o755, 0)
+            .await
+            .err(),
+        Some(erofs),
+        "mkdir must answer EROFS"
+    );
+    assert_eq!(
+        fs.unlink(req, 1, std::ffi::OsStr::new("writable"))
+            .await
+            .err(),
+        Some(erofs),
+        "unlink must answer EROFS"
+    );
+    assert_eq!(
+        fs.write(
+            req,
+            created.attr.ino,
+            0,
+            0,
+            bytes::Bytes::from_static(b"x"),
+            0,
+            0
+        )
+        .await
+        .err(),
+        Some(erofs),
+        "write must answer EROFS — the gate an interception ring write hits"
+    );
+    assert_eq!(
+        fs.setxattr(
+            req,
+            created.attr.ino,
+            std::ffi::OsStr::new("user.x"),
+            b"1",
+            0,
+            0
+        )
+        .await
+        .err(),
+        Some(erofs),
+        "setxattr must answer EROFS"
+    );
+    assert_eq!(
+        fs.open(req, created.attr.ino, libc::O_WRONLY as u32, 0)
+            .await
+            .err(),
+        Some(erofs),
+        "write INTENT must be refused at open, where POSIX programs check"
+    );
+    // Reads keep working — that is the entire point of a reader.
+    fs.open(req, created.attr.ino, libc::O_RDONLY as u32, 0)
+        .await
+        .expect("O_RDONLY still opens on a reader");
+    fs.lookup(req, 1, std::ffi::OsStr::new("writable"))
+        .await
+        .expect("lookup still serves on a reader");
 }
 
 /// The latch is a single relaxed load and defaults OFF — a write mount

@@ -13566,6 +13566,7 @@ impl Filesystem for SqueezefsFilesystem {
                 crate::ro_coherence::spawn_reader_revalidation(
                     routed.volumes.clone(),
                     self.router.clone(),
+                    self.dismount_once.clone(),
                     self.dismount_done.clone(),
                 );
             }

@@ -4919,18 +4919,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                      must never run on a snapshot view)"
                 );
             } else {
-            match fs_engine
-                .router
-                .backend_router
-                .recover_durable_block_refs(&routed_meta_backend)
-                .await
-            {
-                Ok(Some(seeded)) => {
-                    log::info!(
+                match fs_engine
+                    .router
+                    .backend_router
+                    .recover_durable_block_refs(&routed_meta_backend)
+                    .await
+                {
+                    Ok(Some(seeded)) => {
+                        log::info!(
                         "block ownership recovered from DURABLE records: {seeded}                          reference(s), no inode-tree walk (incompat bit 8)"
                     );
-                    if squeezefs::env_knobs::bool_knob("SQUEEZEFS_BLOCK_REFS_VERIFY", false) {
-                        match fs_engine
+                        if squeezefs::env_knobs::bool_knob("SQUEEZEFS_BLOCK_REFS_VERIFY", false) {
+                            match fs_engine
                             .router
                             .backend_router
                             .verify_durable_block_refs(&routed_meta_backend)
@@ -4945,39 +4945,39 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             ),
                             Err(e) => log::error!("block-reference verification failed: {e}"),
                         }
-                    }
-                }
-                Ok(None) => {
-                    for kv in &routed_meta_backend.volumes {
-                        for entry in fs_engine.router.backend_router.backends.iter() {
-                            let backend = entry.value();
-                            log::info!("Running block allocator recovery for data volume...");
-                            if let Err(e) = backend
-                                .block_allocator
-                                .recover_active_blocks_v3(kv, &fs_engine.router.backend_router)
-                                .await
-                            {
-                                log::error!("Failed to recover block allocator: {:?}", e);
-                            }
                         }
                     }
-                    // Spec §6.2 item 1: the walk just established the truth
-                    // on a volume whose ledger is engaged but empty (a
-                    // Phase-8 stamp that has not been backfilled). Persist
-                    // it, so this is the LAST mount that pays the walk.
-                    if let Err(e) = fs_engine
-                        .router
-                        .backend_router
-                        .backfill_durable_block_refs(&routed_meta_backend)
-                        .await
-                    {
-                        log::error!(
+                    Ok(None) => {
+                        for kv in &routed_meta_backend.volumes {
+                            for entry in fs_engine.router.backend_router.backends.iter() {
+                                let backend = entry.value();
+                                log::info!("Running block allocator recovery for data volume...");
+                                if let Err(e) = backend
+                                    .block_allocator
+                                    .recover_active_blocks_v3(kv, &fs_engine.router.backend_router)
+                                    .await
+                                {
+                                    log::error!("Failed to recover block allocator: {:?}", e);
+                                }
+                            }
+                        }
+                        // Spec §6.2 item 1: the walk just established the truth
+                        // on a volume whose ledger is engaged but empty (a
+                        // Phase-8 stamp that has not been backfilled). Persist
+                        // it, so this is the LAST mount that pays the walk.
+                        if let Err(e) = fs_engine
+                            .router
+                            .backend_router
+                            .backfill_durable_block_refs(&routed_meta_backend)
+                            .await
+                        {
+                            log::error!(
                             "durable block-reference backfill failed: {e:?} (accounting                              stays derived; the next mount walks again)"
                         );
+                        }
                     }
+                    Err(e) => log::error!("durable block-reference recovery failed: {e:?}"),
                 }
-                Err(e) => log::error!("durable block-reference recovery failed: {e:?}"),
-            }
             }
             fs_engine.meta_backend = Some(routed_meta_backend.clone());
             fs_engine.dismount_wait = resolved_dismount_wait;
@@ -5001,85 +5001,85 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                      cannot write their durable records)"
                 );
             } else {
-            let fabric_workers = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(8)
-                .div_euclid(4)
-                .clamp(2, 8);
-            // VL4: the mover context — the data router + this mount's
-            // quiescence probe (RAM active buffers + staging records) —
-            // arms the evacuate/rebalance job types on the fabric.
-            // VL7: plus the D3 fold hook (defrag drives the W2 fold
-            // machinery through it) and the continuous frag_* gauge
-            // worker (§5.7 — D1/D3 on cadence; D2/D4 on measure).
-            let mover_ctx = squeezefs::jobs::MoverCtx::new(
-                fs_engine.router.clone(),
-                fs_engine.mover_quiesce_probe(),
-            )
-            .with_fold(fs_engine.defrag_fold_hook());
-            squeezefs::defrag::spawn_gauge_worker(fs_engine.router.clone());
-            let fabric = squeezefs::jobs::JobFabric::start(
-                routed_meta_backend,
-                fabric_workers,
-                job_cpu_limit,
-                Some(mover_ctx),
-            )
-            .await
-            .map_err(|e| format!("job fabric start failed: {e}"))?;
-            fs_engine
-                .job_fabric
-                .store(std::sync::Arc::new(Some(fabric.clone())));
-
-            // PR VL2b: the §5.1.6 job-shard execution wire — the
-            // coordinator's TCP listener, the WERO fence over the data
-            // namespaces, and the endpoint published through the
-            // mount-registration heartbeat for worker discovery. PR VL4:
-            // the PRODUCTION RouterShardDevice seam (allocation + block
-            // I/O over the registered backends' io_uring workers); mover
-            // job types themselves stay local-pool
-            // (`JobType::wire_executable`).
-            //
-            // VAL-6: the posture is now OPERATOR-EXPRESSIBLE
-            // (`SQUEEZEFS_JOB_WIRE_*` — bind/disable, CA-pinned mTLS,
-            // verify sampling, connection cap, challenge freshness).
-            // Unset ⇒ ruling D2's default verbatim: bind `0.0.0.0:0`,
-            // plaintext, mandatory-100 % verify-reads.
-            //
-            // DLM **S3**: this listener now rides `cluster_wire` — the ONE
-            // cluster transport (binary framing, storage-trust mutual
-            // authn with a per-frame session MAC, one bounds
-            // implementation, DISC-1 discovery). The knob family keeps its
-            // `SQUEEZEFS_JOB_WIRE_*` spelling deliberately: it is the same
-            // listener on the same port, the operator docs and the VAL-6
-            // evidence key on these names, and a rename would be a
-            // retired-spelling migration with no behavior behind it. S4's
-            // lock verbs arrive as an `RpcService` on this same transport,
-            // not as a second port.
-            let wire_cfg = squeezefs::job_wire::JobWireConfig::from_env(
-                resolved_data_lvs
-                    .iter()
-                    .map(std::path::PathBuf::from)
-                    .collect(),
-            )
-            .map_err(|e| format!("job wire configuration refused: {e}"))?;
-            let wire_seam = squeezefs::job_wire::RouterShardDevice::new(
-                fs_engine.router.backend_router.clone(),
-                format_config.block_size as usize,
-            );
-            let wire = squeezefs::job_wire::JobWireHost::start(fabric, wire_cfg, wire_seam)
+                let fabric_workers = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(8)
+                    .div_euclid(4)
+                    .clamp(2, 8);
+                // VL4: the mover context — the data router + this mount's
+                // quiescence probe (RAM active buffers + staging records) —
+                // arms the evacuate/rebalance job types on the fabric.
+                // VL7: plus the D3 fold hook (defrag drives the W2 fold
+                // machinery through it) and the continuous frag_* gauge
+                // worker (§5.7 — D1/D3 on cadence; D2/D4 on measure).
+                let mover_ctx = squeezefs::jobs::MoverCtx::new(
+                    fs_engine.router.clone(),
+                    fs_engine.mover_quiesce_probe(),
+                )
+                .with_fold(fs_engine.defrag_fold_hook());
+                squeezefs::defrag::spawn_gauge_worker(fs_engine.router.clone());
+                let fabric = squeezefs::jobs::JobFabric::start(
+                    routed_meta_backend,
+                    fabric_workers,
+                    job_cpu_limit,
+                    Some(mover_ctx),
+                )
                 .await
-                .map_err(|e| format!("job wire start failed: {e}"))?;
-            if wire.listening() {
-                let advertised = format!(
-                    "{}:{}",
-                    squeezefs::cluster_wire::local_advertise_ip(),
-                    wire.endpoint().port()
+                .map_err(|e| format!("job fabric start failed: {e}"))?;
+                fs_engine
+                    .job_fabric
+                    .store(std::sync::Arc::new(Some(fabric.clone())));
+
+                // PR VL2b: the §5.1.6 job-shard execution wire — the
+                // coordinator's TCP listener, the WERO fence over the data
+                // namespaces, and the endpoint published through the
+                // mount-registration heartbeat for worker discovery. PR VL4:
+                // the PRODUCTION RouterShardDevice seam (allocation + block
+                // I/O over the registered backends' io_uring workers); mover
+                // job types themselves stay local-pool
+                // (`JobType::wire_executable`).
+                //
+                // VAL-6: the posture is now OPERATOR-EXPRESSIBLE
+                // (`SQUEEZEFS_JOB_WIRE_*` — bind/disable, CA-pinned mTLS,
+                // verify sampling, connection cap, challenge freshness).
+                // Unset ⇒ ruling D2's default verbatim: bind `0.0.0.0:0`,
+                // plaintext, mandatory-100 % verify-reads.
+                //
+                // DLM **S3**: this listener now rides `cluster_wire` — the ONE
+                // cluster transport (binary framing, storage-trust mutual
+                // authn with a per-frame session MAC, one bounds
+                // implementation, DISC-1 discovery). The knob family keeps its
+                // `SQUEEZEFS_JOB_WIRE_*` spelling deliberately: it is the same
+                // listener on the same port, the operator docs and the VAL-6
+                // evidence key on these names, and a rename would be a
+                // retired-spelling migration with no behavior behind it. S4's
+                // lock verbs arrive as an `RpcService` on this same transport,
+                // not as a second port.
+                let wire_cfg = squeezefs::job_wire::JobWireConfig::from_env(
+                    resolved_data_lvs
+                        .iter()
+                        .map(std::path::PathBuf::from)
+                        .collect(),
+                )
+                .map_err(|e| format!("job wire configuration refused: {e}"))?;
+                let wire_seam = squeezefs::job_wire::RouterShardDevice::new(
+                    fs_engine.router.backend_router.clone(),
+                    format_config.block_size as usize,
                 );
-                let _ = fs_engine.job_wire_endpoint.set(advertised.clone());
-                log::info!(
-                    "job wire: endpoint {advertised} (published via the mount registration)"
-                );
-            }
+                let wire = squeezefs::job_wire::JobWireHost::start(fabric, wire_cfg, wire_seam)
+                    .await
+                    .map_err(|e| format!("job wire start failed: {e}"))?;
+                if wire.listening() {
+                    let advertised = format!(
+                        "{}:{}",
+                        squeezefs::cluster_wire::local_advertise_ip(),
+                        wire.endpoint().port()
+                    );
+                    let _ = fs_engine.job_wire_endpoint.set(advertised.clone());
+                    log::info!(
+                        "job wire: endpoint {advertised} (published via the mount registration)"
+                    );
+                }
             }
 
             let opt_idle = if resolved_fuse_io_uring_sqpoll_idle_ms > 0 {

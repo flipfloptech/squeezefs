@@ -42,6 +42,8 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
   - [fsck / scrub](#fsck--scrub)
   - [Defragmentation](#defragmentation)
   - [Jobs & distributed execution](#jobs--distributed-execution)
+  - [Cluster wire (the one cluster transport)](#cluster-wire-the-one-cluster-transport)
+  - [Metadata function shipping (DLM S8)](#metadata-function-shipping-dlm-s8--built-not-yet-armable)
 - [Observability](#observability)
   - [`df` / statfs semantics](#df--statfs-semantics)
   - [Fabric observability](#fabric-observability)
@@ -712,13 +714,72 @@ the same exchange across a real network costs tens to hundreds — and the
 metadata-op cost of a synchronous cross-mount hop scales with that number, not
 with framing. Plan cluster topology around round-trip latency first.
 
+### Metadata function shipping (DLM S8) — built, not yet armable
+
+**Status: the mechanism ships; nothing arms it, and no mount option exposes
+it.** There is no operator action here yet. This section exists so the
+`.stats` fields, the knobs and the refusal texts are documented where an
+operator meets them, not so a deployment can turn it on.
+
+What it is: when a metadata volume is owned by **another node**, a metadata
+operation on that volume's inodes **travels to the owner and executes there**
+(`src/meta_ship/`, spec §6.7 decision 1) instead of a lock travelling to the
+caller. The KV engine is RAM-authoritative and single-writer by construction,
+so there is nothing for a remote node to serialize into.
+
+* **Granularity is the volume.** A metadata volume has exactly one owner, and
+  the owner is the node holding its D0 `writer_claim` — the record that already
+  names its holder and its durable era. Nothing new is written on disk for
+  ownership, and **no incompat bit is involved.**
+* **Locally-owned volumes are untouched.** A mount that owns every volume of
+  its set (every mount that ships today) pays one relaxed load per operation
+  and then takes exactly today's path: no session, no frame, no round trip.
+  `meta_ship.shipped_verbs == 0` is its signature and must stay 0.
+* **Cross-owner `rename`/`link` refuse loudly with `EXDEV`**, naming the
+  machinery they need (the S3.5 cross-volume transaction: intent record +
+  compensation + crash recovery). A cross-*volume* operation whose volumes
+  share ONE owner is not affected — it is today's path, executed on the owner.
+* **Serial workloads are the known cost** (`tar -x`, `make`, `rsync`): a serial
+  stream pays one fabric round trip per operation, which spec §6.10 R1 prices
+  at 9,100/s → 6.7–20 k/s at 50–150 µs RTT. That regression is accepted
+  (ruling D10) and will be **published** with its own measured A/B; the
+  recovery is S10's subtree delegation. Concurrent streams amortize: verbs to
+  one owner coalesce into one frame, and `meta_ship.batched_verbs /
+  meta_ship.batches` is the live coalesce factor.
+* **Failover** (when an owner dies and a successor takes its volumes): the
+  successor bumps its durable era before arming, which makes every request and
+  every token from the old era stale by construction, then opens a **grace
+  window** that admits only *reclaim* requests and refuses fresh mutations by
+  name. Reads keep serving throughout, and a client relearns the new era from
+  any reply.
+
+| Knob | Default | Purpose |
+|---|---|---|
+| `SQUEEZEFS_META_SHIP_BATCH_MAX` | derived `clamp(cpus × 2, 64, 4096)` | Verbs per shipped frame — the pipelining unit. Derived like the M7 commit-conveyor batch cap, because a frame's ops become that many transactions on the owner's conveyor. |
+| `SQUEEZEFS_META_SHIP_DEDUP_MAX` | derived `max(batch_max × 128, 8192)` | Owner-side idempotency window entries: how far back a client's retry may reach and still be answered from its ORIGINAL outcome instead of re-applying. |
+| `SQUEEZEFS_DLM_TOKEN_CACHE_MAX` | derived `max(R5 budget/8192/32 B, 4096)` | Client fencing-token cache entries. Every eviction costs one loud miss line and one shipped `getattr` refresh — never a wrong answer. |
+
+**Live signals** (`.stats`, under `meta_ship`): `armed` (false on every shipped
+mount), `local_verbs` vs `shipped_verbs` (the routing ledger), `served_verbs`
+(what this node executed for peers — it must equal what its clients shipped),
+`batches` / `batched_verbs` (the coalesce factor), `dedup_hits` (replays
+answered from the window), `retries`, `stale_term_refusals` (refusals this node
+issued as an owner) vs `era_relearns` (times it learned a successor's era as a
+client), `cross_owner_refusals`, `not_owner_refusals` (a client's ownership map
+is stale), `dlm_grace_reclaims` / `dlm_grace_conflicts`, `mint_redirects`, and
+the `dlm_token_cache_*` family — of which **`dlm_token_cache_misses` and
+`owner_panics` must stay 0**. `meta_ship_phase_ns` and
+`meta_ship_owner_phase_ns` decompose the added latency (route / queue wait /
+encode / RTT / decode, and admit / dispatch / execute / reply encode) so a
+regression can be attributed to a term instead of to "the network".
+
 ## Observability
 
 A mounted filesystem exposes live daemon metrics as JSON on the virtual **`.stats`** inode at the mount root (`cat <mountpoint>/.stats`) — the preferred live regression signal (layout mix, cache/tier counters, `meta_kv_*`, `writer_guard_*`, transport geometry, patch/fold ledgers, memory-budget level).
 
 **`.stats` / `.config` access (VAL-7a).** Both virtual inodes are **mode `0400` owned by the mount uid** (with `-o default_permissions` always set, the kernel enforces that): their payload is a map of the daemon's private state — every backing-device path, every staging directory, the read-cache census and per-inode write custody — so on an `--allow-other` mount they must not be readable by co-tenants. Read them as the mount owner or as root.
 
-**Lock-manager fields (`dlm_*`).** `dlm_mode` is the lock authority's mode: **`solo`** means this daemon is the lock master for every metadata slot, which is the only mode that ships — so `dlm_rpcs` (lock operations needing a remote slot owner) is **0 by construction and must stay 0**. Nonzero on a single-node mount is a bug, never load: the lock refused rather than granting custody its owner never issued, and the daemon logged one loud line per event naming the object and its home slot. `dlm_term` is the durable writer era every fencing token this mount mints carries (the process-wide maximum; the per-volume face is `writer_guard_term`) — it must be strictly greater than any predecessor's on the same volume set, and `0` means the volumes predate incompat bit 7. Cross-**mount** write exclusion is not this subsystem's job in `solo` mode — it is the single-writer mount guard's (see [Single-writer mount guard](#single-writer-mount-guard-guarantee-classes)).
+**Lock-manager fields (`dlm_*`).** `dlm_mode` is the lock authority's mode: **`solo`** means this daemon is the lock master for every metadata slot, which is the only mode that ships — so `dlm_rpcs` (lock operations needing a remote slot owner) is **0 by construction and must stay 0**. `dlm_rpcs` keeps that meaning exactly: it counts **lock** round trips, never metadata ones — the metadata face is `meta_ship.dlm_rpcs_meta` (see [Metadata function shipping](#metadata-function-shipping-dlm-s8--built-not-yet-armable)). Nonzero on a single-node mount is a bug, never load: the lock refused rather than granting custody its owner never issued, and the daemon logged one loud line per event naming the object and its home slot. `dlm_term` is the durable writer era every fencing token this mount mints carries (the process-wide maximum; the per-volume face is `writer_guard_term`) — it must be strictly greater than any predecessor's on the same volume set, and `0` means the volumes predate incompat bit 7. Cross-**mount** write exclusion is not this subsystem's job in `solo` mode — it is the single-writer mount guard's (see [Single-writer mount guard](#single-writer-mount-guard-guarantee-classes)).
 
 The **key census** fields (`read_lru_keys`, `write_lru_keys`, `nvme_staged_write_file_ids`, `nvme_read_cache_block_keys`, `active_writes`) are **opt-in**: set `SQUEEZEFS_STATS_KEY_CENSUS=1` on the daemon to populate them (read live, no remount needed — the flag also reports itself as `stats_key_census`). The census-free count gauges always export and are what tooling should key on: `read_lru_key_count`, `write_lru_key_count`, `nvme_staged_write_file_count`, `nvme_read_cache_block_count`, `active_write_block_count` (`squeezefs umount`'s unflushed-staged-write check reads the last two).
 

@@ -214,10 +214,10 @@
 pub mod alloc_ext_core;
 #[path = "../../src/meta_backend/kv/conveyor_core.rs"]
 pub mod conveyor_core;
-#[path = "../../src/meta_backend/kv/epoch_core.rs"]
-pub mod epoch_core;
 #[path = "../../src/cow_core.rs"]
 pub mod cow_core;
+#[path = "../../src/meta_backend/kv/epoch_core.rs"]
+pub mod epoch_core;
 #[path = "../../crates/squeezefs-preload/src/fd_table_core.rs"]
 pub mod fd_table_core;
 #[path = "../../src/gauge_core.rs"]
@@ -373,10 +373,9 @@ mod zcrx_area_models {
 #[cfg(all(test, loom))]
 mod models {
     use crate::{
-       alloc_ext_core, conveyor_core, epoch_core, gauge_core, incarnation_core, ipc_cqe_core,
+        alloc_ext_core, conveyor_core, epoch_core, gauge_core, incarnation_core, ipc_cqe_core,
         ipc_ring_core, ipc_slot_core, journal_core, lane_core, lease_core, node_state_core,
-        patch_clone_core,
-        placed_core, refcount_core, slot_cursor_core, slot_gate_core, wake_core,
+        patch_clone_core, placed_core, refcount_core, slot_cursor_core, slot_gate_core, wake_core,
         write_pipeline_core,
     };
     use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1725,7 +1724,11 @@ mod models {
 
             let mine: Vec<u64> = [a, b].into_iter().flatten().collect();
             let theirs: Vec<u64> = [c, d].into_iter().flatten().collect();
-            assert_eq!(mine.len(), 2, "writer 0's partition holds exactly 2 extents");
+            assert_eq!(
+                mine.len(),
+                2,
+                "writer 0's partition holds exactly 2 extents"
+            );
             assert_eq!(theirs.len(), 2, "writer 1's partition holds exactly 2");
             for e in &mine {
                 assert!(
@@ -1744,8 +1747,14 @@ mod models {
             all.dedup();
             assert_eq!(all.len(), 4, "an extent was handed to two appenders");
             assert_eq!(core.free_extents(), 0, "budgets settle exactly");
-            assert_eq!(core.claim_in(0, alloc_ext_core::AllocClass::User), Err(alloc_ext_core::ClaimError::NoSpace));
-            assert_eq!(core.claim_in(1, alloc_ext_core::AllocClass::User), Err(alloc_ext_core::ClaimError::NoSpace));
+            assert_eq!(
+                core.claim_in(0, alloc_ext_core::AllocClass::User),
+                Err(alloc_ext_core::ClaimError::NoSpace)
+            );
+            assert_eq!(
+                core.claim_in(1, alloc_ext_core::AllocClass::User),
+                Err(alloc_ext_core::ClaimError::NoSpace)
+            );
         });
     }
 
@@ -1765,8 +1774,12 @@ mod models {
                 2,
                 alloc_ext_core::PartitionMap::new(2, 2),
             ));
-            let mine = core.claim_in(0, alloc_ext_core::AllocClass::Internal).expect("mine");
-            let theirs = core.claim_in(1, alloc_ext_core::AllocClass::Internal).expect("theirs");
+            let mine = core
+                .claim_in(0, alloc_ext_core::AllocClass::Internal)
+                .expect("mine");
+            let theirs = core
+                .claim_in(1, alloc_ext_core::AllocClass::Internal)
+                .expect("theirs");
             // Both park at gate 100 — the same NUMBER in two different
             // ring spaces, which is exactly the confusion a shared clock
             // cannot tell apart.
@@ -1781,7 +1794,11 @@ mod models {
             let released = core.advance_durable_in(0, 100);
             let raced = peer.join().unwrap();
 
-            assert_eq!(released, vec![mine], "only the advancing appender's entry may release");
+            assert_eq!(
+                released,
+                vec![mine],
+                "only the advancing appender's entry may release"
+            );
             assert!(
                 core.is_allocated(theirs),
                 "writer 1's parked extent was released by writer 0's tail — the coverage \
@@ -1793,7 +1810,11 @@ mod models {
                  covered the gate"
             );
             assert_eq!(core.pending_count_in(1), 1);
-            assert_eq!(core.durable_seq_in(1), 0, "a peer's advance must not move my clock");
+            assert_eq!(
+                core.durable_seq_in(1),
+                0,
+                "a peer's advance must not move my clock"
+            );
 
             // The peer's own tail is the only thing that frees it.
             assert!(core.advance_durable_in(1, 99).is_empty());
@@ -3389,7 +3410,10 @@ mod models {
             assert_eq!((g.writers, g.writer_id), (4, 3));
             assert!(!g.is_authority(), "appender 3 is not the root authority");
             assert!(!g.is_solo());
+        });
+    }
 
+    // =====================================================================
     // lane_core (pre-RC spec §6.2 items 5/6 — per-writer lanes)
     // =====================================================================
 
@@ -3463,7 +3487,11 @@ mod models {
                 );
                 assert_eq!(lane_core::lane_of(v, BASE, WRITERS), 0, "value left lane 0");
             }
-            assert_eq!(lane_core::lane_of(v1, BASE, WRITERS), 1, "value left lane 1");
+            assert_eq!(
+                lane_core::lane_of(v1, BASE, WRITERS),
+                1,
+                "value left lane 1"
+            );
         });
     }
 

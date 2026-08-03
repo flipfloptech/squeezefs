@@ -454,6 +454,25 @@ const _: () = {
     assert!(std::mem::size_of::<crate::ring_core::RingCell>() == RING_CELL_BYTES as usize);
     // Wake words start at line 1, ring-tail pad at line 2 (cacheline
     // separation of identity / wake / producer-contended words).
+    //
+    // **PERF-18 was FALSIFIED here — do not "fix" this by splitting the
+    // pairs.** The spec proposed giving `doorbell` (client RMW) and
+    // `daemon_parked` (daemon store) their own lines, and likewise
+    // `CqeDoorbell.seq`/`.parked`, on the theory that an opposite-side
+    // producer/consumer pair must not share a line. Counted A/B
+    // (`benches/ipc_hop_bench.rs` group `ipc_wake_pair_lines`, this box,
+    // 2 threads × 20 k RMW+load pairs, medians of 100 samples):
+    //   * field shape (one HOT writer, one writing 1-in-1000 — what the
+    //     wake coalescer, the parked gate and `REAP_EVENT_PARK_MAX = 2`
+    //     exist to produce): same line 113.1 µs vs split 112.3 µs — 0.8 %,
+    //     i.e. NOTHING, and it would have cost an IPC_ABI bump;
+    //   * symmetric shape (both sides hot): same line 407.1 µs vs split
+    //     999.6 µs — splitting is **2.46× WORSE**, because each side's
+    //     per-op READ of the other's word then pulls a remotely-dirtied
+    //     line instead of finding it in the line it already owns.
+    // Co-locating a hot writer's word with the word it must read every op
+    // is the right call; the protocol's job is keeping the OTHER writer
+    // sparse, which it does.
     assert!(std::mem::offset_of!(SessionHeader, doorbell) == 64);
     assert!(std::mem::offset_of!(SessionHeader, cqe) == 128);
     assert!(std::mem::size_of::<CqeDoorbell>() == 8);

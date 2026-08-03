@@ -355,12 +355,165 @@ fn bench_drain_pass(c: &mut Criterion) {
     g.finish();
 }
 
+/// **PERF-18 · the header's opposite-side wake pairs.**
+///
+/// Two pairs in the session header were opposite-side producer/consumer
+/// words sharing ONE cache line: `doorbell` (client RMW per submit) with
+/// `daemon_parked` (daemon store per park), and `CqeDoorbell.seq` (daemon
+/// RMW per completion) with `.parked` (client RMW per park). Each side's
+/// write invalidated the line the other side was about to read — on every
+/// submit and every completion.
+///
+/// The arms are the exact traffic shape of one such pair, run
+/// concurrently: writer A RMWs its word and reads B's; writer B RMWs its
+/// word and reads A's. `same_line` is the pre-PERF-18 placement,
+/// `split_lines` the shipped one (the words are now 64 B apart — the
+/// layout pins in `squeezefs_ipc::layout` assert exactly that).
+fn bench_wake_pair_lines(c: &mut Criterion) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    const OPS: usize = 20_000;
+
+    #[repr(C, align(64))]
+    struct SameLine {
+        a: AtomicU32,
+        b: AtomicU32,
+        _pad: [u8; 56],
+    }
+    #[repr(C, align(64))]
+    struct SplitLines {
+        a: AtomicU32,
+        _pad_a: [u8; 60],
+        b: AtomicU32,
+        _pad_b: [u8; 60],
+    }
+
+    let mut g = c.benchmark_group("ipc_wake_pair_lines");
+    g.throughput(Throughput::Elements((2 * OPS) as u64));
+
+    g.bench_function("same_line", |bch| {
+        let w = Arc::new(SameLine {
+            a: AtomicU32::new(0),
+            b: AtomicU32::new(0),
+            _pad: [0; 56],
+        });
+        bch.iter(|| {
+            let (x, y) = (Arc::clone(&w), Arc::clone(&w));
+            let ta = std::thread::spawn(move || {
+                for _ in 0..OPS {
+                    x.a.fetch_add(1, Ordering::Release);
+                    std::hint::black_box(x.b.load(Ordering::Acquire));
+                }
+            });
+            let tb = std::thread::spawn(move || {
+                for _ in 0..OPS {
+                    y.b.fetch_add(1, Ordering::Release);
+                    std::hint::black_box(y.a.load(Ordering::Acquire));
+                }
+            });
+            ta.join().unwrap();
+            tb.join().unwrap();
+        });
+    });
+
+    g.bench_function("split_lines", |bch| {
+        let w = Arc::new(SplitLines {
+            a: AtomicU32::new(0),
+            _pad_a: [0; 60],
+            b: AtomicU32::new(0),
+            _pad_b: [0; 60],
+        });
+        bch.iter(|| {
+            let (x, y) = (Arc::clone(&w), Arc::clone(&w));
+            let ta = std::thread::spawn(move || {
+                for _ in 0..OPS {
+                    x.a.fetch_add(1, Ordering::Release);
+                    std::hint::black_box(x.b.load(Ordering::Acquire));
+                }
+            });
+            let tb = std::thread::spawn(move || {
+                for _ in 0..OPS {
+                    y.b.fetch_add(1, Ordering::Release);
+                    std::hint::black_box(y.a.load(Ordering::Acquire));
+                }
+            });
+            ta.join().unwrap();
+            tb.join().unwrap();
+        });
+    });
+
+    // The FIELD shape, which the symmetric arms above are not: one side is
+    // HOT (the client bumps `doorbell` on every submit / the daemon bumps
+    // `cqe.seq` on every completion) and the other is COLD (the daemon
+    // stores `daemon_parked` only when it actually parks; a saturated
+    // reaper does not park at all — `REAP_EVENT_PARK_MAX` = 2). Both sides
+    // still READ the other's word on their own cadence.
+    const COLD_EVERY: usize = 1_000;
+    g.bench_function("same_line_hot_cold", |bch| {
+        let w = Arc::new(SameLine {
+            a: AtomicU32::new(0),
+            b: AtomicU32::new(0),
+            _pad: [0; 56],
+        });
+        bch.iter(|| {
+            let (x, y) = (Arc::clone(&w), Arc::clone(&w));
+            let ta = std::thread::spawn(move || {
+                for _ in 0..OPS {
+                    x.a.fetch_add(1, Ordering::Release);
+                    std::hint::black_box(x.b.load(Ordering::Acquire));
+                }
+            });
+            let tb = std::thread::spawn(move || {
+                for i in 0..OPS {
+                    if i % COLD_EVERY == 0 {
+                        y.b.fetch_add(1, Ordering::Release);
+                        std::hint::black_box(y.a.load(Ordering::Acquire));
+                    }
+                }
+            });
+            ta.join().unwrap();
+            tb.join().unwrap();
+        });
+    });
+    g.bench_function("split_lines_hot_cold", |bch| {
+        let w = Arc::new(SplitLines {
+            a: AtomicU32::new(0),
+            _pad_a: [0; 60],
+            b: AtomicU32::new(0),
+            _pad_b: [0; 60],
+        });
+        bch.iter(|| {
+            let (x, y) = (Arc::clone(&w), Arc::clone(&w));
+            let ta = std::thread::spawn(move || {
+                for _ in 0..OPS {
+                    x.a.fetch_add(1, Ordering::Release);
+                    std::hint::black_box(x.b.load(Ordering::Acquire));
+                }
+            });
+            let tb = std::thread::spawn(move || {
+                for i in 0..OPS {
+                    if i % COLD_EVERY == 0 {
+                        y.b.fetch_add(1, Ordering::Release);
+                        std::hint::black_box(y.a.load(Ordering::Acquire));
+                    }
+                }
+            });
+            ta.join().unwrap();
+            tb.join().unwrap();
+        });
+    });
+
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_ring_push_pop,
     bench_slot_cycle,
     bench_payload_moves,
     bench_cqe_doorbell,
+    bench_wake_pair_lines,
     bench_job_wire_frames,
     bench_drain_pass
 );

@@ -8,6 +8,26 @@
 
 ---
 
+## 0a. Status: the document is fully dispositioned — 220 commits
+
+Every section of `docs/pre-rc-engineering-spec.md` has been worked, and every item has a disposition: landed, adjudicated in writing, falsified by measurement, or deferred to a named stage with its rationale. No item is silently open.
+
+**Closed with code:** all 4 memory-safety P0s · all 6 security/validation P0s · the durability spine + DUR-3/4/5/6 · FUSE-1, FUSE-2 (all eleven lost-reply rows) + FUSE-3a/b/d/e/f/g/h/i/j/k/l + FUSE-4a/b/c/d/e · POSIX-1..13, 15..18 · RES-1..15, 17..22 · ENG-1..17 · TEST-1..7, 9 · PERF-1..14, 16, 19, 21, 22 (PERF-3 partial) · DLM S0, S1, S2 · the three multi-writer format foundations.
+
+**Closed by counted falsification** (plan E11 — a measured "no" closes an item): **PERF-18**. Built in full, kept green, then measured: 0.8 % in the field shape and **2.46× WORSE** in the symmetric shape. The spec counted the writes and ignored the reads — same-line keeps the hot side's RMW *and* its per-op read of the partner word inside one exclusively-held line. Reverted, `IPC_ABI` stays 3, recorded with a standing `ipc_wake_pair_lines` bench group so nobody re-derives it.
+
+**Closed by written adjudication** (a fix would have been wrong): FUSE-3c (unimplementable as specified — a REGISTER's CQE fires on request *delivery*, impossible before arm; submission-counting is structurally necessary) · RES-13's two maps (`block_allocator.incarnations` **must not** have a removal path — a reclaimed entry restarts at generation 0 and lets a stale in-flight fill pass its after-check) · RES-18 (bounding the sideband would be actively harmful: it carries INTERRUPT, so a full channel stalls the reader and delays the very INTERRUPTs that unstick requests) · RES-10's second clause (does not reproduce — both budgets scale with the queue that holds the tombstones) · VAL-7d (single-tenant posture stated explicitly rather than building speculative per-uid accounting) · POSIX-12, POSIX-17 (declared deviations).
+
+**Deferred to the batched Phase-8 reformat window** (ruling D9 — bits built, not stamped): the sharded indirect map (DUR-6 ⊕ PERF-9), AEAD AAD binding (DUR-8d — would fail every existing encrypted open), KW-1's incompat bit, DLM S2's bit 7, partitioned append's bit 8, durable block refs' bit 9, PERF-15's sub-block framing, and bit 6's field validation.
+
+**Deferred to a named stage:** DUR-7 → S3.5 (design note delivered: crash windows enumerated, the `SQZXTX01` intent-record wire specified, and the finding that its two-volume seam gate needs *no new harness*) · RES-16's remaining half → S3 · POSIX-14's handle allocation → assessed and argued sound under FUSE-2 + 3k.
+
+**Owed to a venue we do not have:** PERF-24 (depth × max_background sweep — and `Q_DEPTH_DESIRED` is not a free constant: it bounds the registered pinned arena, so a sweep must report the R5 component alongside IOPS or it will read memory pressure as a depth effect) · PERF-25 (its re-derivation trigger never fired, since PERF-18 was falsified) · TEST-8 (the three-suite release gate) · the multi-writer field rows.
+
+**One actionable finding not yet acted on:** PERF-23 established that the spec's "invisible at any credible op rate" claim for phase instrumentation is **false** — `Instant::now()` 19.25 ns, one recorded span 45 ns, so **~135 ns/transport op and ~225 ns/read serve = 13.5 %/22.5 % of a warm 1 µs op**. A free, semantics-preserving fix exists (adjacent phases each mint a fresh `Instant` where one read could end A and start B — 19 sites in `routing.rs`, 31 in `fuse_over_uring.rs`, ~2× reduction with identical numbers). Worth a follow-up branch.
+
+---
+
 ## 0. Program summary (live)
 
 **Dev has taken 162 commits since the program began** (`402ca77` → present). Every composed tip was gated: `cargo check`, `cargo clippy --all-targets --all-features -- -D warnings` (a gate that inspected *nothing* before ENG-1), `cargo fmt`, targeted suites, and bench smoke. The full `cargo test` and the three external POSIX suites are deliberately **not yet run** — deferred by ruling D7, and they are the remaining step before "RC-ready" is a true statement.

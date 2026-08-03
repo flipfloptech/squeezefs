@@ -84,7 +84,7 @@
 //! called in-process, so a step homed on a volume this node does not own
 //! is not expressible today. That is S8's wire, not this stage's: when
 //! `cluster_wire` can carry `Metadata` verbs, the remote leg replaces the
-//! per-volume call inside [`apply_step`] and the record format does not
+//! per-volume call inside `apply_step` and the record format does not
 //! change (steps carry global inos, so the participant is resolved by
 //! routing at apply time — a slot migration between crash and recovery is
 //! handled for free).

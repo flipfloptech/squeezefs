@@ -44,6 +44,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
   - [Jobs & distributed execution](#jobs--distributed-execution)
   - [Cluster wire (the one cluster transport)](#cluster-wire-the-one-cluster-transport)
   - [Metadata function shipping (DLM S8)](#metadata-function-shipping-dlm-s8--built-not-yet-armable)
+  - [Membership plane — lease-based liveness (DLM S6)](#membership-plane--lease-based-liveness-dlm-s6)
 - [Observability](#observability)
   - [`df` / statfs semantics](#df--statfs-semantics)
   - [Fabric observability](#fabric-observability)
@@ -772,6 +773,79 @@ the `dlm_token_cache_*` family — of which **`dlm_token_cache_misses` and
 `meta_ship_owner_phase_ns` decompose the added latency (route / queue wait /
 encode / RTT / decode, and admit / dispatch / execute / reply encode) so a
 regression can be attributed to a term instead of to "the network".
+### Membership plane — lease-based liveness (DLM S6)
+
+**What it replaces.** Every mounted client used to prove it was alive by
+rewriting a `client:{uuid}` xattr on the root inode every 10 s — a full
+metadata transaction, on the single metadata volume ino 1 routes to. That
+plane serializes about **455 beats/s** at the measured saturated commit
+wait, against the **1,500/s** a 15,000-client fleet needs; past saturation
+records age out of the 45 s TTL and *live* mounts start reading as *stale*.
+The read side was worse: listing clients meant one directory-style xattr
+listing plus one attribute read **per client**, under a shared lock on that
+same inode — paid by `squeezefs clients`, by `squeezefs status`, and by the
+`format` preflight.
+
+**What it is now.** Liveness is a **lease renewed over the cluster wire**,
+held in the owner's RAM. The durable footprint is one `membership_owner`
+record per volume, written when the owner arms and removed when it disarms —
+never per beat. A heartbeat therefore costs **zero metadata transactions**,
+and enumerating members costs one attribute read plus a paged census RPC
+whatever the member count.
+
+**Arming it (off by default).**
+
+| Knob | Default | Purpose |
+|---|---|---|
+| `SQUEEZEFS_MEMBERSHIP_BIND` | `off` | Where a **write** mount serves the plane: `off`, `auto` (`0.0.0.0:0`, the discovery posture), or an explicit `addr:port`. A malformed value refuses the mount rather than serving somewhere you did not ask for. |
+| `SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS` | `45000` | The **owner's** lease TTL. Defaults to the same 45 s the `client:`/`writer_claim` records use, so `live`/`stale` means one thing everywhere. |
+| `SQUEEZEFS_MEMBERSHIP_SKEW_MAX_MS` | derived `max(TTL × 500 ppm, observed RTT)` | Clock-skew bound between owner and member. The default comes from a physical bound — two independent oscillators drift by at most ~500 ppm, i.e. 22.5 ms over a 45 s lease — not from a preference. |
+| `SQUEEZEFS_MEMBERSHIP_PURGE_MS` | derived `max(2 × checkpoint cadence, observed RTT)` | How long a member may take to *stop* once it decides to (drop cached blocks, halt in-flight DMA). It is subtracted from the member's own deadline, so an honest value is a safety input. |
+| `SQUEEZEFS_MEMBERSHIP_GRACE_MS` | derived (= the lease TTL) | A successor owner's failover grace window: reclaim admitted, conflicting fresh acquisitions refused, closing early once every prior member has re-asserted. |
+
+A **read-only** mount needs no knob: it joins whenever it finds a fresh
+`membership_owner` record, which is the first time a reader becomes visible
+in `squeezefs clients` at all (a reader performs no metadata write, by
+contract, so it has no record to enumerate). Arming requires the volume
+set's `job:enroll` secret to exist — possession of volume access *is*
+cluster membership — so enable the cluster listener
+(`SQUEEZEFS_JOB_WIRE_BIND`) on the same mount.
+
+**Two clocks, and the member's is stricter.** The owner expires a lease at
+`T_owner`; the member fences its own objects at
+`T_self = T_owner − 2·skew_max − D_purge`, measured from the instant it
+*sent* the renewal, so the round trip counts against the member too. A
+member that cannot renew in time therefore stops — a writer halts its DMA,
+a reader drops every cached block — **before** the owner can hand those
+objects to anyone else. A false-positive eviction costs availability, never
+divergence. A configuration where that inequality collapses (skew plus purge
+budget ≥ the TTL) **refuses to arm** and names the knobs; it is never
+silently clamped.
+
+**Owner failure.** Lease state is RAM-only by design and is rebuilt by
+**re-assertion**: the successor bumps its durable writer era before arming
+(an equal era is refused), then opens the grace window above, admitting
+members that present the lease they already held and refusing conflicting
+new acquisitions. Without that window a failover turns into a cluster-wide
+forced-flush storm at the worst possible moment.
+
+**Membership records (`claim_set`).** `writer_claim` expresses *exclusion* —
+one holder. A volume carrying the claim-set capability additionally records
+the **set of writer members**, each with its identity, endpoint and NVMe
+registrant key, in one `claim_set` record rewritten only when membership
+changes. Nothing stamps that capability today, so every shipped volume reads
+the singleton *projection* of `writer_claim` instead: no new record, no
+changed claim bytes, and single-writer behaviour byte-for-byte as before.
+The registrant keys are the device-side face of set membership — several
+registrants under **one** shared reservation, never a second reservation.
+
+**Guarantee rows this does NOT change.** Write exclusion is still the
+single-writer mount guard's (see
+[Single-writer mount guard](#single-writer-mount-guard-guarantee-classes)):
+the `flock`, the Write-Exclusive reservation and the `writer_claim`
+heartbeat are untouched, and the membership plane grants no write custody
+whatsoever. It answers *who is here*, not *who may write*. With the plane
+off — the default — nothing about liveness, staleness or the guard changes.
 
 ## Observability
 
@@ -780,6 +854,8 @@ A mounted filesystem exposes live daemon metrics as JSON on the virtual **`.stat
 **`.stats` / `.config` access (VAL-7a).** Both virtual inodes are **mode `0400` owned by the mount uid** (with `-o default_permissions` always set, the kernel enforces that): their payload is a map of the daemon's private state — every backing-device path, every staging directory, the read-cache census and per-inode write custody — so on an `--allow-other` mount they must not be readable by co-tenants. Read them as the mount owner or as root.
 
 **Lock-manager fields (`dlm_*`).** `dlm_mode` is the lock authority's mode: **`solo`** means this daemon is the lock master for every metadata slot, which is the only mode that ships — so `dlm_rpcs` (lock operations needing a remote slot owner) is **0 by construction and must stay 0**. `dlm_rpcs` keeps that meaning exactly: it counts **lock** round trips, never metadata ones — the metadata face is `meta_ship.dlm_rpcs_meta` (see [Metadata function shipping](#metadata-function-shipping-dlm-s8--built-not-yet-armable)). Nonzero on a single-node mount is a bug, never load: the lock refused rather than granting custody its owner never issued, and the daemon logged one loud line per event naming the object and its home slot. `dlm_term` is the durable writer era every fencing token this mount mints carries (the process-wide maximum; the per-volume face is `writer_guard_term`) — it must be strictly greater than any predecessor's on the same volume set, and `0` means the volumes predate incompat bit 7. Cross-**mount** write exclusion is not this subsystem's job in `solo` mode — it is the single-writer mount guard's (see [Single-writer mount guard](#single-writer-mount-guard-guarantee-classes)).
+
+**Membership fields (`membership_*`, DLM S6).** `membership_mode` is `off` (no plane armed — the default), `owner` (this mount is the lease authority) or `member`. On an owner, `membership_members` / `membership_readers` / `membership_writers` are the live census, `membership_lease_ttl_ms` and `membership_self_deadline_ms` are the two clocks as armed, `membership_grace_remaining_ms` is a failover window in progress, and `membership_min_acked_free_epoch` is the freed-offset epoch every live member has acknowledged passing. The counters: `membership_renewals` is the heartbeat itself — it is the counter that used to be one journal transaction per client per 10 s, so it grows while `meta_kv_journal_entries` does not, which is the whole point; `membership_registration_commits` is bounded by mounts and membership changes, so growth proportional to renewals is a regression, not load; `membership_self_fences` **should stay 0** — nonzero means members are fencing their own objects because renewals are not completing (availability lost, divergence prevented); `membership_renew_refusals`, `membership_evictions`, `membership_grace_refusals`, `membership_grace_reclaims` and `membership_census_serves` are the refusal, revoke, failover and read-side ledgers.
 
 The **key census** fields (`read_lru_keys`, `write_lru_keys`, `nvme_staged_write_file_ids`, `nvme_read_cache_block_keys`, `active_writes`) are **opt-in**: set `SQUEEZEFS_STATS_KEY_CENSUS=1` on the daemon to populate them (read live, no remount needed — the flag also reports itself as `stats_key_census`). The census-free count gauges always export and are what tooling should key on: `read_lru_key_count`, `write_lru_key_count`, `nvme_staged_write_file_count`, `nvme_read_cache_block_count`, `active_write_block_count` (`squeezefs umount`'s unflushed-staged-write check reads the last two).
 
@@ -791,6 +867,8 @@ The **key census** fields (`read_lru_keys`, `write_lru_keys`, `nvme_staged_write
 
 * **List client mount registrations:**
   Serves the `client:{id}` heartbeat records and the single-writer `writer_claim` recorded on the volume set's root inos — the same records the format preflight and the mount guard consume, under the same staleness law. Read-only probe: works beside a live mount and never perturbs it. States: `live` (fresh heartbeat), `stale` (heartbeat older than the 45 s TTL — crashed or partitioned holder), `dead` (writer claim whose same-host pid is provably gone — reclaimable immediately, no TTL wait).
+
+  When a mount serves the [membership plane](#membership-plane--lease-based-liveness-dlm-s6), the report additionally carries its **live members** — kinds `member-writer` and `member-reader` — read from the owner's RAM census (one attribute read plus a paged RPC, independent of member count) rather than from per-client records. Read-only **coherent readers appear only this way**: a reader writes nothing, anywhere, so it has no record to list. Their `live`/`stale` classification is the same 45 s law as the records', measured against the lease instead of a heartbeat timestamp.
   ```bash
   squeezefs clients sqmeta://<meta_dev> [--json]
   ```

@@ -495,13 +495,19 @@ lane"* is structural rather than a convention.
 ### 9a.5 What the co-writer's allocation shape is, exactly
 
 * it allocates **fresh** blocks from its lane's virgin share. Its free list is
-  empty by construction (no seed, no walk, and it frees nothing), so
-  `try_allocate_block` always falls to the fresh mint;
-* every **free** stays the authority's: `begin_free`, `free_block`,
-  `allocate_specific_block`, the W1 incarnation retire and the recovery walk
-  all still refuse on a co-writer (`cowriter.accounting_refusals` counts
-  exactly those), so a co-writer today **appends**; a rewrite that displaces a
-  block refuses at the displaced free;
+  empty by construction (no seed, no walk, and its frees execute on the
+  authority), so `try_allocate_block` always falls to the fresh mint;
+* every **free**'s ladder is EXECUTED by the authority — since the S9
+  co-writer free path (`tests/mw_cowriter_free_tests.rs`) the router-level
+  displaced free SHIPS as `PublishCall::FreeBlocks` and the authority runs
+  `begin_free → reclaim → finish_free` itself, with the freed offset entering
+  ITS free list in whatever lane `b % W` names (frees stay lane-blind, this
+  design's own law — the shipped free just runs the arithmetic on the node
+  whose ledger and reclaimer are live). The allocator-level arms
+  (`begin_free`, `free_block`, `allocate_specific_block`, the W1 incarnation
+  retire, the recovery walk) still refuse locally on a co-writer
+  (`cowriter.accounting_refusals` counts exactly those), so a rewrite
+  displaces through the router and never through them;
 * a raise that cannot be made durable **gives the offset back** — and on a
   co-writer that give-back is itself refused (a free), so the index is skipped
   rather than returned. Bounded by raise failures, which are loud

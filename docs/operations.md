@@ -385,12 +385,35 @@ works**, from a lane the authority grants — the design record is
   is that path's engagement gauge; `alloc_lane_raise_refusals` **must stay 0**
   (a refused raise means a write stalled loudly rather than using an offset no
   durable record covers);
-* **a co-writer APPENDS.** Its every FREE is still the authority's
-  (`begin_free`, `free_block`, `allocate_specific_block`, the W1 incarnation
-  retire and the ownership recovery walk all refuse — that is what
-  `cowriter.accounting_refusals` counts now), so a rewrite that displaces a
-  block refuses at the displaced free. Reads and metadata are unchanged: served
-  coherently, shipped respectively.
+* **a co-writer REWRITES, and its displaced frees SHIP.** A rewrite's new
+  block comes from its lane; the layout publish (carrying the durable
+  `TREE_BLOCK_REFS` delete for the displaced block) ships as before; and the
+  displaced block's terminal free now travels as its own publish verb
+  (`free_blocks`) that the **authority executes end to end** — RAM release,
+  read-tier purge, reclaim queue, `finish_free` with the freed-offset grace
+  period and the dead-epoch quarantine composing inside — exactly as if it
+  had freed locally. The freed offset re-enters the free supply of whichever
+  lane the arithmetic (`b % W`) names, reusable by that lane's owner. Retries
+  are safe (`(lease_epoch, request_id)` is answered exactly-once from the
+  authority's dedup window), a fenced mount's in-flight frees are refused by
+  era, and a free that never lands is the **leak-safe** direction: the block
+  is already durably unreferenced, so the authority's next derivation (mount
+  recovery / fsck C6) returns it — counted loud on
+  `meta_ship_publish.free_ship_failures`, which should read ≈ 0;
+* **the W1 in-place patch stays the authority's — by decision, not by gap.**
+  The patch retires a block's *lifetime* (durable ownership state, spec §6.2
+  item 6), and its clone/patch fence is a two-word process-local protocol no
+  wire can compose; shipping the retire would also put a control-class round
+  trip inside the one path whose entire win is "one DMA, zero metadata". A
+  co-writer's small overwrite therefore rides **CoW-rewrite + shipped free**,
+  and the local W1 arm keeps refusing (counted in
+  `cowriter.accounting_refusals`). What that counter still covers, complete:
+  the specific block claim (`allocate_specific_block` — lane-blind by
+  design), the W1 incarnation retire, the ownership recovery walk, direct
+  device reclaim, and any allocator-level free reached without the router
+  (no product surface does). **Steady growth on a rewriting co-writer is
+  therefore a bug**, not the honest gap it used to be. Reads and metadata are
+  unchanged: served coherently, shipped respectively.
 
 **A co-writer takes no lock, and denies the authority nothing.** It runs the S5
 reader's *released* `flock(LOCK_SH)` probe — classification for the mount log
@@ -415,16 +438,30 @@ DATA staleness (§6.8 item 3, not built) applies verbatim.
 `co-writer`) and the `cowriter` object — `mw_role`, `admissions`,
 `admission_refusals`, `accounting_refusals`, `local_commit_refusals`,
 `custody_endpoint` — read `accounting_refusals` beside the `alloc_lane_*`
-family, because since the allocation-lane grant it counts FREES and specific
-claims (which are still the authority's), never allocations. **`local_commit_refusals` should stay 0** on a healthy
+family: since the allocation-lane grant AND the shipped free path it counts
+only the arms that stay local by decision (the specific claim, the W1
+retire, the recovery walk, direct reclaim), so on a rewriting co-writer it
+should be FLAT. **`local_commit_refusals` should stay 0** on a healthy
 co-writer: nonzero means a daemon surface still commits metadata directly
 instead of shipping it (S8's "the daemon is not switched onto the router" gap
-meeting a real workload). Read them beside the custody ledger
-(`dlm_custody.*`), the publish ledger (`meta_ship_publish.*`, whose `refusals`
-must stay 0) and `data_plane_fence_mode` = 1.
+meeting a real workload). The free path's own rows ride the publish ledger
+(`meta_ship_publish.*`): `free_shipped_blocks` is the rewrite-engagement
+instrument (its delta must account for a rewrite workload's displaced
+blocks), `free_served_blocks` the authority's executed half, `free_replays`
+the exactly-once witness engaging (a lost-reply retry landing here is the
+mechanism working), `free_stale_refusals` the era fence firing around a
+revocation, and `free_ship_failures` ≈ 0 (each is a leak-safe
+unreturned-until-recovery offset). Read them beside the custody ledger
+(`dlm_custody.*`), the rest of the publish ledger (whose `refusals` must
+stay 0) and `data_plane_fence_mode` = 1.
 
 **What an end-to-end two-host write still needs, plainly.** The machinery is
-complete and it is *unreachable in the field* until two things land that no code
+complete — since the shipped free path that includes the **rewrite** shape,
+end to end: lane-granted allocation, custody-authorized DMA, shipped
+publishes, and the displaced block freed through the authority's full ladder
+with the offset reusable by its lane's owner (the former "a co-writer
+appends" caveat is retired; ruling D8's mixed rewrite workload is expressible)
+— and it is *unreachable in the field* until two things land that no code
 change can substitute for:
 
 1. **the capability bits are stamped.** Nothing stamps bits 7/9/10/11/13/14

@@ -392,6 +392,82 @@ fn assert_zero_findings(report: &FsckReport, what: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// The set representation: one bit per inode, dense, slot-decomposed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_ino_bitmap_is_one_bit_per_inode_and_indexes_no_root() {
+    use squeezefs::fsck::InoBitmap;
+
+    // Identity width (the in-RAM single-volume shape).
+    let mut refs = InoBitmap::new(1);
+    assert!(refs.mark(2));
+    assert!(!refs.mark(2), "marking twice sets one bit");
+    assert!(refs.mark(1_000_000));
+    assert!(refs.contains(2) && refs.contains(1_000_000));
+    assert!(!refs.contains(3));
+    assert_eq!(refs.marked(), 2);
+    // Ino 1 is the root pin and ino 0 is not an ino at all (a corrupt
+    // dentry value can carry it): neither indexes, and neither panics —
+    // the root exemption falls out of the encoding.
+    assert!(!refs.mark(1) && !refs.contains(1));
+    assert!(!refs.mark(0) && !refs.contains(0));
+    assert_eq!(refs.marked(), 2, "neither 0 nor 1 consumed a bit");
+
+    // The DERIVED production width: a global ino decomposes to
+    // (slot, raw local) and round-trips, so the same inode indexes
+    // identically whichever side named it (a dentry's target, or the
+    // inode record's own ino).
+    const W: u64 = 65536;
+    let mut wide = InoBitmap::new(W);
+    let named: Vec<u64> = vec![2, 3, 65_537, 65_538, 131_074, 9_999_999];
+    for ino in &named {
+        assert!(wide.mark(*ino), "ino {ino} marks once");
+    }
+    for ino in &named {
+        assert!(wide.contains(*ino), "ino {ino} reads back");
+    }
+    assert!(!wide.contains(4));
+
+    // The difference: live inodes with no dentry, and nothing else.
+    let mut live = InoBitmap::new(W);
+    for ino in named.iter().chain([4u64, 65_539].iter()) {
+        live.mark(*ino);
+    }
+    let mut unnamed = Vec::new();
+    live.each_absent_from(&wide, |ino| unnamed.push(ino));
+    unnamed.sort_unstable();
+    assert_eq!(
+        unnamed,
+        vec![4, 65_539],
+        "the difference is exactly the live inodes no dentry named"
+    );
+
+    // The RAM cost the >= 100 M-inode cap is stated against: 1 bit per
+    // ino ever allocated in a keyspace. A single mark at the cap sizes
+    // the whole vector, which is the worst case for one set.
+    let mut cap = InoBitmap::new(1);
+    cap.mark(100_000_001);
+    let bytes = cap.bytes();
+    assert!(
+        bytes <= 13 * 1024 * 1024,
+        "one bit per inode at the 100 M cap must cost ~12.5 MiB, got {bytes} B"
+    );
+    // Dense population: bytes ≈ population / 8 (a HashSet<u64> of the
+    // same population is ~48-64 B per entry).
+    let mut dense = InoBitmap::new(1);
+    for ino in 2..100_002u64 {
+        dense.mark(ino);
+    }
+    assert_eq!(dense.marked(), 100_000);
+    assert!(
+        dense.bytes() <= 100_000 / 8 + 64,
+        "dense marks must not overshoot one bit each: {} B",
+        dense.bytes()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Shape 2: a prior-era unreferenced inode that OWNS BLOCKS
 // ---------------------------------------------------------------------------
 
@@ -839,6 +915,67 @@ async fn test_creates_racing_a_scan_produce_no_c9_findings() {
         c9_findings(&report).is_empty(),
         "creates racing the scan produced C9 findings: {:?}",
         report.findings
+    );
+    fx.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// §10 gauges: the cheap-direction pass, the era shield, the repair class
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_c9_counters_and_repair_class_gauge_move() {
+    use std::sync::atomic::Ordering;
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    format_meta(&meta, &[&oss1]).await;
+    let recs = base_format_config(&[&oss1]).resolved_data_volumes();
+
+    let fx = open_fixture(&meta, &recs).await;
+    for i in 0..6 {
+        create_file(&fx, &format!("f{i}")).await;
+    }
+    let prior = create_file(&fx, "prior.bin").await;
+    orphan_inode(&fx, prior).await;
+    fx.close().await;
+
+    let fx = open_fixture(&meta, &recs).await;
+    // A current-era orphan too, so the shield's gauge has something to
+    // count (it must be the number the report ATTRIBUTES to the era
+    // floor, not a side effect of scanning).
+    let current = create_file(&fx, "in-flight.bin").await;
+    orphan_inode(&fx, current).await;
+
+    let report = run_fsck(&fx.ctx(), &online_opts()).await.expect("fsck");
+    assert!(
+        report.counters.dentry_refs_indexed >= 6,
+        "the referenced-ino pass indexed the named population: {:?}",
+        report.counters
+    );
+    assert!(
+        report.counters.current_era_exempted >= 1,
+        "the writer-era floor exempted the current-era orphan (the shield is engaged, \
+         not vacuous): {:?}",
+        report.counters
+    );
+    assert_eq!(c9_findings(&report).len(), 1, "{:?}", report.findings);
+
+    let before = squeezefs::fuse_client::METRICS.fsck_repair_class[8].load(Ordering::Relaxed);
+    let rep = run_repair(&fx.ctx(), &report, &apply())
+        .await
+        .expect("apply");
+    assert_eq!(rep.counters.applied, 1, "{:?}", rep);
+    assert_eq!(
+        rep.counters.per_class.get("C9").copied(),
+        Some(1),
+        "per-class repair accounting: {:?}",
+        rep.counters
+    );
+    assert!(
+        squeezefs::fuse_client::METRICS.fsck_repair_class[8].load(Ordering::Relaxed) > before,
+        "fsck_repair_classC9 moved"
     );
     fx.close().await;
 }

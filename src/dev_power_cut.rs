@@ -340,6 +340,41 @@ fn read_prior(path: &Path, offset: u64, len: usize) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// **Registry hygiene law for the tests below** (found by the POSIX
+    /// agent, pre-RC loose ends): [`STATE`] and [`ARMED`] are
+    /// process-global, and the lib harness runs these tests IN PARALLEL —
+    /// not under the house gate (`--test-threads=1`), but the aggregate
+    /// bench-smoke form of it does (`cargo bench --benches -- --test`
+    /// runs the lib harness with default threads, and the collision fired
+    /// ~1 in 4). So: **a test that owns a journal must key it to its own
+    /// device path, and a test that owns NO journal must not mutate the
+    /// registry globally.** [`clear_faults`] is a whole-registry wipe plus
+    /// a global disarm — calling it while a sibling's journal is live
+    /// deletes that journal AND the arm flag it depends on. The
+    /// interleaving is pinned deterministically by
+    /// [`sibling_seam_probe_cannot_disturb_a_live_journal`].
+    ///
+    /// The disarmed/untracked early-out, on a path nobody ever armed —
+    /// the zero-cost-when-off law's observable half: nothing is journaled
+    /// and a cut reverts nothing. Deliberately **mutates no global
+    /// state** (it used to open with `clear_faults()`, which wiped
+    /// whatever journal a concurrent test was holding).
+    fn disarmed_seam_body() {
+        let never_armed = "/nonexistent/device/disarmed-seam-probe";
+        clear_faults();
+        note_write(never_armed, 0, 4096);
+        assert_eq!(
+            volatile_writes(never_armed),
+            0,
+            "an unarmed device path must journal nothing"
+        );
+        assert_eq!(
+            power_cut(never_armed),
+            0,
+            "a cut on an unarmed device path must revert nothing"
+        );
+    }
+
     /// Coverage algebra without any device: pushes before a barrier are
     /// covered by it, pushes after are not.
     #[test]
@@ -371,9 +406,49 @@ mod tests {
     /// Disarmed, nothing is journaled — the zero-cost-when-off law.
     #[test]
     fn disarmed_seam_journals_nothing() {
+        disarmed_seam_body();
+    }
+
+    /// The parallel-harness race, deterministically: the sibling probe's
+    /// body runs at the exact moment another device's journal is live and
+    /// armed. Both halves must hold — the probe's own assertions (a
+    /// foreign armed journal must not make an unarmed path journal) and
+    /// the foreign journal's survival (the probe must not wipe it).
+    ///
+    /// RED before the fix: the probe opened with the process-global
+    /// [`clear_faults`], so this journal — and the arm flag it needs —
+    /// vanished mid-test. That is the ~1-in-4 bench-smoke failure.
+    #[test]
+    fn sibling_seam_probe_cannot_disturb_a_live_journal() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.as_file().set_len(1 << 20).unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        arm_power_cut(&path);
+
+        let seq = next_write_seq(&path);
+        note_write(&path, 0, 4096);
+        assert_eq!(volatile_writes(&path), 1, "own journal seeded");
+
+        disarmed_seam_body();
+
+        assert_eq!(
+            volatile_writes(&path),
+            1,
+            "a sibling seam probe wiped this device's live journal"
+        );
+        assert_eq!(
+            covering_epoch(&path, seq), None,
+            "the volatile write must stay uncovered (a sibling probe cannot barrier it)"
+        );
+        let covered = mark_barrier_start(&path);
+        assert_eq!(
+            covered,
+            seq + 1,
+            "mark_barrier_start returns 0 when the arm flag was cleared underneath us"
+        );
+        complete_barrier(&path, covered);
+        assert_eq!(covering_epoch(&path, seq), Some(1), "own barrier still covers");
+
         clear_faults();
-        note_write("/nonexistent/device", 0, 4096);
-        assert_eq!(volatile_writes("/nonexistent/device"), 0);
-        assert_eq!(power_cut("/nonexistent/device"), 0);
     }
 }

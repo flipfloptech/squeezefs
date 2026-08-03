@@ -5916,3 +5916,189 @@ mod inbound_queue_tests {
         );
     }
 }
+
+/// FUSE-3f — completion-queue overflow is DETECTED, not assumed away.
+///
+/// The queue rings are built `cqsize = sq * 2` and one drain pass can push
+/// `depth` commits + `depth` re-REGISTERs + one poll re-arm, so the
+/// geometry is meant to make overflow unreachable. "Meant to" was the
+/// whole finding: `IORING_FEAT_NODROP` was never probed and
+/// `cq.overflow()` was never read, so a dropped completion — a REGISTER or
+/// COMMIT_AND_FETCH that never lands — was indistinguishable from an idle
+/// ring. On a kernel without NODROP a full CQ drops the event on the floor;
+/// with NODROP the counter still moves when the kernel cannot even
+/// allocate its internal overflow entry. Either way it is a lost ring
+/// completion and it must be counted, loudly.
+#[cfg(test)]
+mod cq_overflow_tests {
+    use super::*;
+
+    #[test]
+    fn a_quiet_ring_reports_no_drops() {
+        let mut w = CqDropWatch::new(true);
+        for _ in 0..8 {
+            assert_eq!(w.observe(0), 0, "an un-overflowed CQ must report nothing");
+        }
+    }
+
+    #[test]
+    fn newly_dropped_completions_are_reported_once_each() {
+        let mut w = CqDropWatch::new(false);
+        assert_eq!(w.observe(3), 3, "the first observation reports the backlog");
+        assert_eq!(w.observe(3), 0, "an unchanged counter is not re-reported");
+        assert_eq!(w.observe(5), 2, "only the DELTA is new loss");
+    }
+
+    /// The kernel counter is a `u32` written with plain stores; a wrapped
+    /// counter must not report ~4 G phantom drops (nor go silent).
+    #[test]
+    fn the_counter_is_read_as_a_wrapping_delta() {
+        let mut w = CqDropWatch::new(false);
+        assert_eq!(w.observe(u32::MAX - 1), u32::MAX - 1);
+        assert_eq!(w.observe(1), 3, "wraparound is a delta of 3, not 4 billion");
+    }
+
+    /// The always-on tripwire moves with the observation (must stay 0 on a
+    /// healthy mount — the stats inode carries it next to the FUSE-2
+    /// integrity counters).
+    #[test]
+    fn observations_land_on_the_stats_tripwire() {
+        let before = transport_cq_overflow_stats().0;
+        let mut w = CqDropWatch::new(false);
+        w.observe(7);
+        assert_eq!(
+            transport_cq_overflow_stats().0,
+            before + 7,
+            "dropped completions must reach transport_cq_overflows"
+        );
+    }
+
+    /// The NODROP probe is recorded per session so the stats inode can say
+    /// whether this kernel can drop at all.
+    #[test]
+    fn the_nodrop_probe_is_published() {
+        note_cq_nodrop(true);
+        assert_eq!(transport_cq_overflow_stats().1, 1);
+        note_cq_nodrop(false);
+        assert_eq!(transport_cq_overflow_stats().1, 0);
+    }
+}
+
+/// FUSE-3j — the shutdown lease drain waits ONCE for the whole queue, on
+/// the eventfd the lease drop already fires.
+///
+/// The retired shape slept `1 ms` up to 100 ms **per parked ent, in
+/// series**: at depth 32 a queue could spend 3.2 s of teardown polling a
+/// word that a lease drop already signals, and `umount`/remount paid it
+/// per queue.
+#[cfg(test)]
+mod drain_wait_tests {
+    use super::*;
+
+    fn eventfd() -> OwnedFd {
+        // SAFETY: eventfd(2) with a valid flag set; the fd is adopted by
+        // OwnedFd, which closes it exactly once.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(fd >= 0, "eventfd: {}", io::Error::last_os_error());
+        // SAFETY: `fd` is a fresh, owned, valid descriptor.
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    }
+
+    /// ONE budget for the whole queue: 8 ents leased forever must cost the
+    /// budget once, not eight times (the retired per-ent serial poll).
+    #[test]
+    fn the_budget_is_shared_by_the_whole_queue_not_paid_per_ent() {
+        let coalescer = WakeCoalescer::new();
+        let wake = eventfd();
+        let states: Vec<Arc<EntLeaseState>> =
+            (0..8).map(|_| Arc::new(EntLeaseState::new())).collect();
+        for s in &states {
+            s.acquire();
+        }
+        let budget = Duration::from_millis(60);
+        let t0 = Instant::now();
+        let mut waiting: Vec<usize> = (0..states.len()).collect();
+        drain_await_leases(wake.as_raw_fd(), &coalescer, &states, &mut waiting, budget);
+        let elapsed = t0.elapsed();
+        assert_eq!(waiting.len(), 8, "no lease dropped: all still waiting");
+        assert!(
+            elapsed < budget * 3,
+            "the drain spent {elapsed:?} on a {budget:?} budget — the wait is \
+             still per-ent instead of one shared deadline"
+        );
+    }
+
+    /// Event-driven: a lease dropped from another thread resolves the drain
+    /// through the eventfd wake, far inside the budget.
+    #[test]
+    fn a_dropped_lease_wakes_the_drain_through_the_eventfd() {
+        let coalescer = Arc::new(WakeCoalescer::new());
+        let wake = eventfd();
+        let states: Vec<Arc<EntLeaseState>> =
+            (0..4).map(|_| Arc::new(EntLeaseState::new())).collect();
+        for s in &states {
+            s.acquire();
+        }
+        // The drain publishes `parked` for every waiting ent (that is what
+        // makes the releaser fire the eventfd), so park them first.
+        for s in &states {
+            assert_eq!(s.try_commit(), CommitGate::Parked);
+        }
+        let releaser = {
+            let states: Vec<Arc<EntLeaseState>> = states.iter().map(Arc::clone).collect();
+            let fd = wake.as_raw_fd();
+            let coalescer = Arc::clone(&coalescer);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                for s in &states {
+                    if s.release() && coalescer.arm() {
+                        let one: u64 = 1;
+                        // SAFETY: 8-byte write to a live eventfd owned by
+                        // the test for the thread's lifetime.
+                        unsafe { libc::write(fd, &one as *const u64 as *const _, 8) };
+                    }
+                }
+            })
+        };
+        let budget = Duration::from_millis(2_000);
+        let t0 = Instant::now();
+        let mut waiting: Vec<usize> = (0..states.len()).collect();
+        drain_await_leases(wake.as_raw_fd(), &coalescer, &states, &mut waiting, budget);
+        let elapsed = t0.elapsed();
+        releaser.join().expect("releaser thread");
+        assert!(
+            waiting.is_empty(),
+            "every dropped lease must be resolved by the drain, {} left",
+            waiting.len()
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "the drain took {elapsed:?} for a lease dropped at 10 ms — it is \
+             not waking on the eventfd"
+        );
+    }
+
+    /// A lease that drops BEFORE the drain looks (the common case) costs no
+    /// wait at all.
+    #[test]
+    fn an_already_free_ent_costs_no_wait() {
+        let coalescer = WakeCoalescer::new();
+        let wake = eventfd();
+        let states: Vec<Arc<EntLeaseState>> =
+            (0..4).map(|_| Arc::new(EntLeaseState::new())).collect();
+        let t0 = Instant::now();
+        let mut waiting: Vec<usize> = (0..states.len()).collect();
+        drain_await_leases(
+            wake.as_raw_fd(),
+            &coalescer,
+            &states,
+            &mut waiting,
+            Duration::from_millis(500),
+        );
+        assert!(waiting.is_empty());
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "an unleased queue must not wait at all"
+        );
+    }
+}

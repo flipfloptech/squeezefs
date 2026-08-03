@@ -1112,6 +1112,71 @@ fn bench_append_partition(c: &mut Criterion) {
     });
 }
 
+/// **Ino minting** — the create path's allocation cursor (pre-RC
+/// engineering spec §6.2 **item 5**: `next_ino` is a per-mount atomic over
+/// a shared namespace, so two writers mint duplicate inos, which alias
+/// files immediately and — because the daemon's IPC binding table rests on
+/// the monotonic never-reused ino law — alias fd bindings too).
+///
+/// This group prices the **solo** forms FIRST: they are the numbers the
+/// per-writer lane partitioning must not move (ruling D9 keeps the format
+/// un-stamped, so solo IS the shipped path). Evidence note:
+/// `.benchmarks/2026-08-05-mw-cursors-and-incarnation.md`.
+///
+/// FIELD shapes (never toys):
+/// * `mint_native` — one `allocate_ino()`: the §4.8 `fetch_add` every
+///   create pays on the volume's legacy keyspace.
+/// * `mint_guest` — one `allocate_guest_ino(slot)`: what a create pays on
+///   any of the other ~63 slots of the dynamic-routing `MINT_SPREAD` rotor
+///   (`docs/design-dynamic-meta-routing.md` §5.4) — i.e. ~63 of every 64
+///   real creates.
+/// * `live_inodes_64_cursors` — the POSIX-1 `statfs` `f_ffree` derivation
+///   over a fully spread volume's cursor set (`MINT_SPREAD` = 64 live
+///   guest cursors plus the native watermark), which every `df -i` and
+///   every capacity-gating tool pays.
+fn bench_ino_cursors(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let file = NamedTempFile::new().unwrap();
+    file.as_file().set_len(256 * 1024 * 1024).unwrap();
+    let backend = rt.block_on(async {
+        format_v3(
+            file.path(),
+            256 * 1024 * 1024,
+            &FormatV3Options {
+                node_size: DEFAULT_NODE_SIZE,
+                journal_len_override: None,
+                force: false,
+                full_wipe: false,
+                format_config_xattr: None,
+            },
+        )
+        .await
+        .expect("format v3");
+        KvMetaBackend::open(file.path()).await.expect("mount v3")
+    });
+
+    let mut group = c.benchmark_group("kv_ino_cursors");
+    group.throughput(criterion::Throughput::Elements(1));
+
+    group.bench_function("mint_native", |b| {
+        b.iter(|| black_box(backend.allocate_ino()))
+    });
+    group.bench_function("mint_guest", |b| {
+        b.iter(|| black_box(backend.allocate_guest_ino(black_box(7)).expect("mint")))
+    });
+
+    // The spread volume's cursor set: MINT_SPREAD slots ever minted into.
+    for slot in 0..squeezefs::meta_backend::MINT_SPREAD as u16 {
+        backend.allocate_guest_ino(slot).expect("mint");
+    }
+    group.bench_function("live_inodes_64_cursors", |b| {
+        b.iter(|| black_box(backend.live_inodes()))
+    });
+
+    group.finish();
+    rt.block_on(async { backend.shutdown().await.expect("shutdown") });
+}
+
 /// **Durable block-reference accounting** (pre-RC engineering spec §6.2
 /// item 1, incompat bit 9) — the publish path's added cost, priced.
 ///
@@ -1346,6 +1411,7 @@ criterion_group!(
     bench_kv_node_cache,
     bench_kv_fold,
     bench_kv_journal,
+    bench_ino_cursors,
     bench_block_refs,
     bench_xattr_name_screen,
     bench_superblock_cycle,

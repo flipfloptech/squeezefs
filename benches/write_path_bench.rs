@@ -572,6 +572,80 @@ fn bench_layout_publish(c: &mut Criterion) {
     group.finish();
 }
 
+/// **Block-key mint and parse** — pre-RC engineering spec §6.2 **item 6**
+/// (block keys are bare reusable device offsets, which makes a stale map
+/// binding structurally UNDETECTABLE — §6.3's serve proof rests on two
+/// process-local premises).
+///
+/// Every one of these is on a hot path: the mint runs once per published
+/// block, and the parse runs on **every publish and every read serve**
+/// (`BackendRouter::read_block_with_dest` / `read_block_range` /
+/// `free_block` / `increment_refcount` / the durable-refcount resolution —
+/// one shared extraction path). The `_bare` rows are the shipped
+/// (un-stamped) forms and are the numbers the `offset ‖ incarnation` key
+/// must not move; ruling D9 keeps the bit un-stamped, so bare IS the
+/// shipped path. Evidence note:
+/// `.benchmarks/2026-08-05-mw-cursors-and-incarnation.md`.
+///
+/// FIELD shapes: the default-slot bare offset (`4194304` — what
+/// `persist_block_key` emits for every single-volume filesystem), the
+/// named-volume form (`vol-00aa11bb://4194304` — every multi-volume set),
+/// and the decorated 3-part form (`…:0:4194304`, promoted staged / spill /
+/// clip publishes, the W1-ineligible population).
+fn bench_block_key_codec(c: &mut Criterion) {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::nvme_dev::NvmeBlockDev;
+    use squeezefs::routing::{clean_block_key, is_whole_block_mapping, BackendRouter};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use tokio::runtime::Runtime;
+
+    let rt = Runtime::new().unwrap();
+    let backing = tempfile::NamedTempFile::new().expect("backing");
+    let (alloc, router) = rt.block_on(async {
+        let alloc = Arc::new(
+            BlockAllocator::new("bench_block_key")
+                .await
+                .expect("allocator"),
+        );
+        let dev = Arc::new(NvmeBlockDev::new(backing.path().to_str().unwrap()));
+        let router = BackendRouter::new(alloc.clone(), dev, Arc::new(AtomicU64::new(BLOCK as u64)));
+        (alloc, router)
+    });
+    let _ = &alloc;
+
+    let mut group = c.benchmark_group("write_block_key");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("persist_bare_default_slot", |b| {
+        b.iter(|| black_box(router.persist_block_key(black_box("backend_0"), black_box(4 << 20))))
+    });
+    group.bench_function("parse_bare_default_slot", |b| {
+        b.iter(|| black_box(router.parse_block_key(black_box("4194304")).expect("parse")))
+    });
+    group.bench_function("parse_bare_named_volume", |b| {
+        b.iter(|| {
+            black_box(
+                router
+                    .parse_block_key(black_box("vol-00aa11bb://4194304"))
+                    .expect("parse"),
+            )
+        })
+    });
+    group.bench_function("clean_bare_decorated", |b| {
+        b.iter(|| {
+            black_box(clean_block_key(black_box(
+                "vol-00aa11bb://4194304:0:4194304",
+            )))
+        })
+    });
+    group.bench_function("whole_block_predicate_bare", |b| {
+        b.iter(|| black_box(is_whole_block_mapping(black_box("vol-00aa11bb://4194304"))))
+    });
+
+    group.finish();
+}
+
 /// **DUR-6 · the indirect block-map blob's encode + digest.** The spill
 /// path re-serializes the WHOLE map per publish and now checksums it, and
 /// since the same campaign made the publish copy-on-write, that cost is
@@ -947,6 +1021,7 @@ criterion_group!(
     bench_detached_guard,
     bench_admission_gate,
     bench_layout_publish,
+    bench_block_key_codec,
     bench_indirect_map_codec,
     bench_flush_coalescing
 );

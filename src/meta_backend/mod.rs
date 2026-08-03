@@ -876,6 +876,28 @@ impl RoutedMetaBackend {
         Ok(())
     }
 
+    /// [`Self::destroy_inodes`] for records that no dentry names — fsck
+    /// class C9's repair verb (see
+    /// [`kv::backend::KvMetaBackend::destroy_unreferenced_inodes`] for why
+    /// the live-`nlink` skip is deliberately not taken and why the destroy
+    /// stays one transaction).
+    pub async fn destroy_unreferenced_inodes(&self, inos: &[Ino]) -> Result<()> {
+        let _gate = self.slot_gate_enter(inos).await;
+        let mut per_volume: std::collections::HashMap<usize, Vec<Ino>> =
+            std::collections::HashMap::new();
+        for &ino in inos {
+            let (v_idx, local_ino) = self.route_ino(ino);
+            per_volume.entry(v_idx).or_default().push(local_ino);
+        }
+        for (v_idx, locals) in per_volume {
+            self.check_volume_enabled(v_idx)?;
+            self.volumes[v_idx]
+                .destroy_unreferenced_inodes(&locals)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Global ino → `(volumes index, EFFECTIVE local ino)`:
     /// [`route_ino_width`] over the FROZEN W (never `volumes.len()` —
     /// PR VL5a, KD-7), then the slot→volume table, then the keyspace

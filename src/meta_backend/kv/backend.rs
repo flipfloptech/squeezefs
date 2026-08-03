@@ -648,6 +648,22 @@ pub struct KvMetaBackend {
     /// §4.8 monotonic watermark, recovered at mount; the create path
     /// `fetch_add`s it.
     next_ino: AtomicU64,
+    /// **The writer era's ino floor** for this volume's NATIVE keyspace:
+    /// the §4.8 watermark as recovered at open, before this mount minted
+    /// anything. Inos are monotonic and never reused (§4.8), so
+    /// `raw < floor` ⇔ "the record existed when this mount adopted its
+    /// writer era" ⇔ minted under an EARLIER durable term (DLM S2). That
+    /// is what makes fsck class C9 (unreferenced inodes) false-positive
+    /// free: a live create legitimately holds an inode record before its
+    /// dentry, and every ino this mount can mint is at or above this
+    /// floor. See [`Self::minted_in_prior_era`].
+    era_ino_floor_native: u64,
+    /// [`Self::era_ino_floor_native`] per hosted GUEST keyspace, snapshotted
+    /// once after the cursors are seeded at open. A keyspace with no entry
+    /// (virgin, or a cursor that arrived mid-mount with a migrated slot)
+    /// has no era floor and its records are never C9 candidates —
+    /// fail-closed, the fsck posture (no verdict rather than a guess).
+    era_ino_floor_guest: std::sync::OnceLock<std::collections::HashMap<u16, u64>>,
     /// Pre-RC spec §6.2 item 5 (incompat bit 12): **per-writer ino lane
     /// cursors**, keyed `(writer id, space)` where the space is the
     /// volume's native watermark or a hosted guest slot
@@ -1629,6 +1645,8 @@ impl KvMetaBackend {
             block_refs,
             alloc,
             next_ino: AtomicU64::new(next_ino),
+            era_ino_floor_native: next_ino,
+            era_ino_floor_guest: std::sync::OnceLock::new(),
             lane_cursors: scc::HashMap::new(),
             lanes_live: AtomicBool::new(false),
             destroyed_inodes: AtomicU64::new(0),
@@ -1716,6 +1734,16 @@ impl KvMetaBackend {
                 }
             }
         }
+        // The writer era's per-guest-keyspace ino floors — captured HERE,
+        // after seeding and before this mount can mint, so every record
+        // that already exists is strictly below its keyspace's floor (see
+        // the field docs + [`Self::minted_in_prior_era`]).
+        let mut guest_floors = std::collections::HashMap::new();
+        be.guest_cursors.iter_sync(|slot, cursor| {
+            guest_floors.insert(*slot, cursor.snapshot());
+            true
+        });
+        let _ = be.era_ino_floor_guest.set(guest_floors);
         Ok(be)
     }
 
@@ -1935,6 +1963,33 @@ impl KvMetaBackend {
             true
         });
         hi
+    }
+
+    /// `true` ⇔ the record at EFFECTIVE local `local_ino` was minted
+    /// **before this mount's writer era began** — fsck class C9's
+    /// candidate filter (`src/fsck.rs`).
+    ///
+    /// Inos are monotonic per keyspace and never reused (§4.8), and the
+    /// era's floor is the watermark recovered at open, so this is an exact
+    /// statement about provenance and not a heuristic: `true` ⇒ the record
+    /// survived a prior mount, `false` ⇒ this mount minted it (or its
+    /// keyspace's provenance is unknown — see below). It is what makes an
+    /// "inode with no dentry" verdict safe against live work: a create
+    /// legitimately commits the inode record before the dentry, and every
+    /// ino this mount can mint is at or above the floor.
+    ///
+    /// **Fail-closed** for a guest keyspace this mount had no cursor for at
+    /// open (a virgin slot, or one whose cursor arrived mid-mount with a
+    /// migrated slot): `false` — no verdict rather than a guess.
+    pub fn minted_in_prior_era(&self, local_ino: Ino) -> bool {
+        match crate::meta_backend::split_guest_local(local_ino) {
+            Some((slot, raw)) => self
+                .era_ino_floor_guest
+                .get()
+                .and_then(|m| m.get(&slot).copied())
+                .is_some_and(|floor| raw < floor),
+            None => local_ino < self.era_ino_floor_native,
+        }
     }
 
     /// `true` ⇔ this volume's format expresses `offset ‖ incarnation`
@@ -5742,6 +5797,31 @@ impl KvMetaBackend {
     /// free: v3 never reuses (§4.8), which deletes the v2
     /// free-strictly-after-durable ordering rule whole.
     pub async fn destroy_inodes(&self, inos: &[Ino]) -> Result<()> {
+        self.destroy_inode_records(inos, true).await
+    }
+
+    /// [`Self::destroy_inodes`] **without** the live-`nlink` skip — fsck
+    /// class C9's repair verb, and its only caller.
+    ///
+    /// The skip exists to protect a LIVE inode from a racing reclaim
+    /// (nlink > 0 means a name still points here). A C9 finding is the
+    /// verified statement that no name does: the inode was minted in a
+    /// prior writer era (so no in-flight create can own it) and a full
+    /// dentry-tree pass, re-run after the settle window under this ino's
+    /// exclusive 4a lease, found nothing naming it. That is a strictly
+    /// stronger proof than the nlink counter — which is exactly what the
+    /// residue lies about (a crashed cross-volume create leaves
+    /// `nlink == 1` and no name).
+    ///
+    /// Destroying the record and its xattrs in ONE journaled transaction
+    /// is also what keeps repair crash-safe: there is no window where the
+    /// filesystem holds an `nlink == 0` unreferenced inode, which no class
+    /// claims and nothing would ever reclaim.
+    pub async fn destroy_unreferenced_inodes(&self, inos: &[Ino]) -> Result<()> {
+        self.destroy_inode_records(inos, false).await
+    }
+
+    async fn destroy_inode_records(&self, inos: &[Ino], skip_live: bool) -> Result<()> {
         self.write_gate()?;
         if inos.is_empty() {
             return Ok(());
@@ -5754,7 +5834,7 @@ impl KvMetaBackend {
         let mut doomed = 0usize;
         for &ino in inos {
             match self.read_inode_value(ino).await? {
-                Some(v) if v.nlink > 0 => {
+                Some(v) if skip_live && v.nlink > 0 => {
                     log::debug!("destroy_inodes: ino {ino} has nlink {}, skipping", v.nlink);
                 }
                 Some(_) => {

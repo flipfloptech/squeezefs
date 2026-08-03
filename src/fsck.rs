@@ -2,7 +2,7 @@
 //! KD-9/KD-17; repair is VL6b and consumes the findings this module
 //! verifies).
 //!
-//! Seven check classes:
+//! Check classes (C1–C9; C8 and C9 postdate the VL6a seven):
 //!
 //! | Class | What | Source of truth |
 //! |---|---|---|
@@ -25,6 +25,72 @@
 //! encrypted volumes, frame decode on compressed (incl. the bit-31 raw
 //! escape), readability-only on plain (`scrub_readability_only` is the
 //! honesty gauge) | stored AEAD tags / frame structure / read status |
+//! | C9 | **unreferenced inodes**: an inode record in `TREE_INODES` that
+//! no dentry in `TREE_DENTRIES` names | one dentry-tree pass (the
+//! referenced set) differenced against the census's live-inode set |
+//!
+//! ## C9 — unreferenced inodes (the class S3.5 left owed)
+//!
+//! `docs/design-cow-kv-metadata.md` §4.10a keeps cross-volume `create`
+//! deliberately un-wrapped: its crash residue is an inode record with no
+//! name for an op the caller was never told succeeded, and wrapping the
+//! hottest cross-volume shape would tax every create for a claim nobody
+//! can observe. "Owed instead: an fsck class for unreferenced inodes."
+//! Three shapes reach it — (1) that crashed cross-volume create
+//! (`nlink == 1`, no dentry, no blocks); (2) **pre-S3.5 field damage**,
+//! where a filesystem that ran the old code and crashed mid cross-volume
+//! `link`/`unlink` carries the same shape *plus every block the inode
+//! owned* — S3.5 stops new occurrences and does nothing about existing
+//! ones, so this class is the only way an operator learns a volume
+//! carries such damage and its repair is the only cleanup path; (3)
+//! future S9 causes (a dead writer's in-flight create; a recovered
+//! cross-volume plan whose `MintInode` applied while its `InsertDentry`
+//! volume was fenced).
+//!
+//! Nothing else sees them: `reclaim_orphaned_batch` admits only
+//! `nlink == 0` **FORGET'd** inos and the kernel never learned this ino
+//! exists, so nothing will ever FORGET it; C2/C3 ask "referenced by
+//! nobody" about BLOCKS, and an unreferenced inode's layout still names
+//! its blocks, so the allocator census agrees with the tree and every
+//! block class stays (correctly) silent.
+//!
+//! **Walk direction.** A per-inode "does any dentry name me?" probe is
+//! the unindexed reverse-dentry scan (POSIX-4's `meta_parent_scans`,
+//! O(total dentries), legitimate only on the `open_by_handle_at`
+//! reconnect path). C9 instead runs ONE sequential pass over
+//! `TREE_DENTRIES` marking every dentry's TARGET ino into an
+//! [`InoBitmap`], and differences it against the live-inode bitmap the
+//! census pass marks as it already walks `TREE_INODES` — two bits per
+//! inode (≈ 25 MiB at the ≥ 100 M-inode cap), no per-inode I/O, and the
+//! per-suspect reads are bounded by real damage.
+//!
+//! **Zero false positives.** A live create legitimately holds an inode
+//! record before its dentry, so a settle window alone would fire on
+//! every in-flight create on a busy filesystem. The candidate filter is
+//! therefore the **writer era's ino floor** (DLM S2's era; the §4.8
+//! watermark captured per keyspace at open —
+//! [`crate::meta_backend::kv::backend::KvMetaBackend::minted_in_prior_era`]):
+//! inos are monotonic and never reused, so only records that survived a
+//! PRIOR mount are candidates, and nothing this mount can mint is one.
+//! The residue is by definition from a prior mount, so the filter costs
+//! no coverage — with the honest consequence that residue created during
+//! THIS mount is reported by the NEXT mount's scan, never this one.
+//! Composed with the existing ladder: suspect → settle → a FRESH dentry
+//! pass, re-checked under the ino's exclusive 4a lease (which is what
+//! catches the one live way a name can appear for an unreachable inode —
+//! an `open_by_handle_at` reconnect, or an S9 plan's late `InsertDentry`
+//! — and clears it). The block-plane exemptions (allocation epoch,
+//! in-flight allocation registry, mover ledger) do not apply: C9's
+//! object is an inode, and the era floor is its structural equivalent.
+//!
+//! **Deliberately out of scope: the `nlink == 0` unreferenced shape.**
+//! That is the POSIX unlinked-but-open state (and POSIX-15's
+//! rename-overwrite crash orphan). Separating "prior-era inode unlinked
+//! while still open in THIS mount" from "corpse nobody will ever FORGET"
+//! needs the live open-count/reclaim registries, which this context does
+//! not carry; the era floor alone cannot do it. Claiming it would trade
+//! a leak for destroying an open file's data, so C9 does not claim it —
+//! stated here rather than hidden.
 //!
 //! **Verify-before-report (KD-9)** — detection never mutates, and a
 //! violation becomes a finding only after it survives the class's full
@@ -57,7 +123,15 @@
 //! suspects — nothing is in flight by definition. **Offline sharding**
 //! (`--shards k/N`) walks only the k-th ino-residue shard with zero
 //! coordination; `merge-reports` unions the JSON outputs (repeated
-//! per-shard classes dedupe by identity; census counters sum). Honesty
+//! per-shard classes dedupe by identity; census counters sum). **C9's
+//! shard rule**: a shard covering a subset of INODES still needs the
+//! full referenced set for those inodes, so it filters dentries by the
+//! child ino their VALUE carries (`child_ino % N == k`) — never by the
+//! dentry key, whose parent ino says nothing about which inode is
+//! named. Every shard therefore walks the whole dentry tree but marks
+//! only its own residue: sharding divides the bitmap and the inode
+//! pass, not the dentry walk, and each inode is judged by exactly one
+//! shard (no double counting, nothing missed). Honesty
 //! notes: offline C2-*leaked* and C3 have no durable allocator ground
 //! truth (data-volume allocator state is mount-session RAM, rebuilt from
 //! the same walk), so offline detects the *lost*/out-of-range arm plus
@@ -160,7 +234,7 @@ impl FsckOptions {
 /// the input VL6b's repair planner consumes.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FsckFinding {
-    /// `"C1"`..`"C7"`.
+    /// `"C1"`..`"C9"`.
     pub class: String,
     /// The object's identity (ino / key / volume+offset / path).
     pub object: String,
@@ -226,6 +300,12 @@ pub enum FindingId {
         block_idx: u32,
         mapping: String,
     },
+    /// C9: **unreferenced inode** — an inode record no dentry names (the
+    /// class `docs/design-cow-kv-metadata.md` §4.10a owed, and the only
+    /// detector of pre-S3.5 cross-volume damage). The global ino IS the
+    /// identity; everything else repair needs it re-derives under the
+    /// ino's lease at verify time.
+    C9Unreferenced { ino: u64 },
 }
 
 /// The §10 `fsck_*` / `scrub_*` counter families, per run (the process
@@ -236,6 +316,17 @@ pub struct FsckCounters {
     pub inodes_scanned: u64,
     /// Tree pages walked (one per leaf-range fetch — the C1 walk unit).
     pub nodes_walked: u64,
+    /// C9: dentry records whose target ino the referenced-set pass
+    /// indexed (the cheap-direction pass's engagement gauge — 0 on a run
+    /// that never built the set).
+    pub dentry_refs_indexed: u64,
+    /// C9: live inodes with no dentry that the **writer-era ino floor**
+    /// exempted — i.e. records THIS mount minted, the in-flight-create
+    /// shape. The live-create false-positive shield's engagement gauge
+    /// (the block plane's `epoch_exempted` analogue); nonzero under
+    /// concurrent creates, and its growth is the proof the shield is
+    /// doing work rather than sitting vacuous.
+    pub current_era_exempted: u64,
     pub blocks_checked: u64,
     pub refcounts_checked: u64,
     pub suspects: u64,
@@ -251,6 +342,118 @@ pub struct FsckCounters {
     pub scrub_frame_verified: u64,
     pub scrub_readability_only: u64,
     pub scrub_failures: u64,
+}
+
+/// **C9's ino set**: one bit per inode, dense in the space inos are
+/// actually allocated in.
+///
+/// A global ino decomposes to `(slot, raw local)` through
+/// [`crate::meta_backend::route_ino_width`] over the durable routing
+/// width — the SAME decomposition on both sides (a dentry's target ino
+/// and an inode record's own ino), derived from the global ino alone, so
+/// the index is independent of the live slot→volume map and a slot
+/// migration mid-scan cannot shift a bit. Raw locals are monotonic from
+/// 2 per keyspace (§4.8) and never reused, so each keyspace's bits are
+/// dense: **1 bit per inode ever allocated** — ≈ 12.5 MiB per set at the
+/// ≥ 100 M-inode cap, against 4.8–6.4 GB for a `HashSet<u64>` of the same
+/// population. Only populated slots allocate a word vector (a 65536-slot
+/// width costs nothing for the slots a volume never minted in). The
+/// house precedent is the allocator's A/B extent bitmap.
+///
+/// `raw < 2` never indexes: raw local 1 is the root pin / a per-keyspace
+/// control record, which no dentry names by construction — the root
+/// exemption falls out of the encoding instead of being a special case.
+#[derive(Debug)]
+pub struct InoBitmap {
+    width: u64,
+    slots: HashMap<u64, Vec<u64>>,
+    marked: u64,
+}
+
+impl InoBitmap {
+    /// Empty set over the volume set's durable routing width.
+    pub fn new(width: u64) -> Self {
+        Self {
+            width,
+            slots: HashMap::new(),
+            marked: 0,
+        }
+    }
+
+    fn index_of(&self, global_ino: u64) -> Option<(u64, u64)> {
+        // `route_ino_width` is defined from ino 1 up (its `ino - 2`
+        // arithmetic underflows below that), and inos 0/1 index nothing
+        // here anyway: 0 is not an ino at all (a corrupt dentry value can
+        // carry it) and 1 is the root pin, which no dentry names.
+        if global_ino < 2 {
+            return None;
+        }
+        let (slot, raw) = crate::meta_backend::route_ino_width(global_ino, self.width);
+        (raw >= 2).then(|| (slot, raw - 2))
+    }
+
+    /// Set `global_ino`'s bit; `true` when it was not already set.
+    pub fn mark(&mut self, global_ino: u64) -> bool {
+        let Some((slot, bit)) = self.index_of(global_ino) else {
+            return false;
+        };
+        let words = self.slots.entry(slot).or_default();
+        let w = (bit / 64) as usize;
+        if words.len() <= w {
+            words.resize(w + 1, 0);
+        }
+        let mask = 1u64 << (bit % 64);
+        if words[w] & mask != 0 {
+            return false;
+        }
+        words[w] |= mask;
+        self.marked += 1;
+        true
+    }
+
+    pub fn contains(&self, global_ino: u64) -> bool {
+        let Some((slot, bit)) = self.index_of(global_ino) else {
+            return false;
+        };
+        self.slots
+            .get(&slot)
+            .and_then(|w| w.get((bit / 64) as usize))
+            .is_some_and(|word| word & (1u64 << (bit % 64)) != 0)
+    }
+
+    /// Distinct inos marked.
+    pub fn marked(&self) -> u64 {
+        self.marked
+    }
+
+    /// Bit-vector bytes held (the RAM-cost gauge the ≥ 100 M-inode cap is
+    /// stated against; excludes the per-slot map overhead).
+    pub fn bytes(&self) -> u64 {
+        self.slots.values().map(|w| (w.len() * 8) as u64).sum()
+    }
+
+    /// Every ino in `self` whose bit is clear in `other` — the C9
+    /// difference (live inodes that no dentry names). Visits in
+    /// unspecified order; allocates nothing.
+    pub fn each_absent_from(&self, other: &Self, mut f: impl FnMut(u64)) {
+        for (&slot, words) in &self.slots {
+            for (w, &word) in words.iter().enumerate() {
+                if word == 0 {
+                    continue;
+                }
+                for b in 0..64u64 {
+                    if word & (1u64 << b) == 0 {
+                        continue;
+                    }
+                    let raw = (w as u64) * 64 + b + 2;
+                    let ino = crate::meta_backend::make_global_ino_width(raw, slot, self.width);
+                    if !other.contains(ino) {
+                        f(ino);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Per-shard partial census (cross-shard classes finalize at merge).
@@ -398,7 +601,23 @@ struct CensusOut {
     mappings: Vec<MappingRef>,
     /// Mappings that do not resolve to any known backend (C2 lost).
     unresolvable: Vec<MappingRef>,
+    /// C9: every LIVE inode (`nlink > 0`) the walk visited, as bits — the
+    /// set the referenced-ino set is differenced against. Free to carry:
+    /// the census already walks `TREE_INODES`.
+    live: InoBitmap,
     inodes_scanned: u64,
+}
+
+/// An empty census over `ctx`'s routing width — the single-layout probe
+/// shape (`census_layout` into a scratch [`CensusOut`]).
+fn probe_census(ctx: &FsckCtx) -> CensusOut {
+    CensusOut {
+        refs: HashMap::new(),
+        mappings: Vec::new(),
+        unresolvable: Vec::new(),
+        live: InoBitmap::new(ctx.meta.routing_width()),
+        inodes_scanned: 0,
+    }
 }
 
 /// One volume's allocator handle under its canonical id (device access
@@ -461,6 +680,17 @@ enum SuspectKind {
         used: u64,
         tracked: u64,
     },
+    /// C9: a live inode record, minted in a PRIOR writer era, that the
+    /// dentry pass found no name for. The counted evidence rides along so
+    /// the report states what was observed (a `blocks > 0` shape is the
+    /// pre-S3.5 damage signature; `blocks == 0` is the crashed
+    /// cross-volume create).
+    C9Unreferenced {
+        ino: u64,
+        nlink: u32,
+        size: u64,
+        blocks: usize,
+    },
 }
 
 struct Suspect {
@@ -519,8 +749,11 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // by the slowest single walk. Throttled runs keep the serial
         // shape: KD-3's duty cycle is per WORKER — concurrent walks
         // would consume a multiple of the granted duty budget.
+        // `referenced` is C9's referenced-ino set — `None` when the dentry
+        // pass could not complete, which SKIPS the class (a partial set is
+        // never guessed from).
         let unthrottled = opts.throttle_pct == 0 || opts.throttle_pct >= 100;
-        let census = if unthrottled {
+        let (census, referenced) = if unthrottled {
             let mut walks = tokio::task::JoinSet::new();
             for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
                 for tree_idx in 0..kv.trees().len() {
@@ -540,6 +773,16 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
                 ctx.expected_generation.clone(),
                 opts.shard,
             ));
+            // C9's referenced-ino pass: one dentry-tree walk, disjoint
+            // from the census (which walks `TREE_INODES`), so it overlaps
+            // too — the difference is taken after both land, and neither
+            // side depends on the other's order.
+            let refs_pass = tokio::spawn(build_referenced_inos(
+                ctx.meta.clone(),
+                opts.shard,
+                opts.throttle_pct,
+                opts.cancel.clone(),
+            ));
             let census = walk_census(ctx, opts, &mut counters).await?;
             while let Some(joined) = walks.join_next().await {
                 let (nodes_walked, walk_suspects) = joined.map_err(|e| {
@@ -555,13 +798,19 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
                     "fsck staging scan task failed: {e}"
                 ))
             })?);
+            let (refs, indexed) = refs_pass.await.map_err(|e| {
+                crate::error::SqueezefsError::InvalidOperation(format!(
+                    "fsck C9 referenced-ino pass failed: {e}"
+                ))
+            })?;
+            counters.dentry_refs_indexed += indexed;
             counters.inodes_scanned = census.inodes_scanned;
             if opts.shard.is_some() {
                 shard_refs = Some(PartialCensus {
                     refs: census.refs.clone(),
                 });
             }
-            census
+            (census, refs)
         } else {
             let mut c1 = Vec::new();
             walk_trees_c1(ctx, opts, &mut counters, &mut c1).await;
@@ -583,7 +832,15 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
             )
             .await;
             suspects.extend(staging);
-            census
+            let (refs, indexed) = build_referenced_inos(
+                ctx.meta.clone(),
+                opts.shard,
+                opts.throttle_pct,
+                opts.cancel.clone(),
+            )
+            .await;
+            counters.dentry_refs_indexed += indexed;
+            (census, refs)
         };
 
         // C2/C3/C6 evaluation against the live allocator state.
@@ -641,6 +898,14 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
                  recorded — the class is skipped for this run, never guessed)"
                 ),
             }
+        }
+
+        // C9 (the class design-cow-kv-metadata §4.10a owed): live
+        // inodes that no dentry names. Two independent bitmaps, one
+        // difference — the era floor is applied per candidate inside, so
+        // a healthy volume pays only the bitmap scan.
+        if let Some(refs) = referenced.as_ref() {
+            evaluate_c9_unreferenced(ctx, &census.live, refs, &mut counters, &mut suspects).await;
         }
 
         counters.suspects = suspects.len() as u64;
@@ -705,6 +970,10 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         findings.extend(r.findings.iter().cloned());
         mode.clone_from(&r.mode);
         counters.inodes_scanned += r.counters.inodes_scanned;
+        // C9: every shard walks the WHOLE dentry tree but indexes only
+        // its own residue, so both of these sum (disjoint by residue).
+        counters.dentry_refs_indexed += r.counters.dentry_refs_indexed;
+        counters.current_era_exempted += r.counters.current_era_exempted;
         counters.blocks_checked += r.counters.blocks_checked;
         counters.refcounts_checked += r.counters.refcounts_checked;
         counters.suspects += r.counters.suspects;
@@ -939,12 +1208,7 @@ async fn walk_census(
         .router
         .block_size
         .load(std::sync::atomic::Ordering::Relaxed) as usize;
-    let mut out = CensusOut {
-        refs: HashMap::new(),
-        mappings: Vec::new(),
-        unresolvable: Vec::new(),
-        inodes_scanned: 0,
-    };
+    let mut out = probe_census(ctx);
     for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
         let inodes = kv.trees()[0];
         let mut cursor: Vec<u8> = inode_key(1).to_vec();
@@ -985,6 +1249,11 @@ async fn walk_census(
                     }
                 }
                 out.inodes_scanned += 1;
+                // C9: this live inode's bit. One bit per visited inode,
+                // on a walk that already reads every inode record — the
+                // set difference happens after the (independent) dentry
+                // pass, so nothing here depends on scan order.
+                out.live.mark(global_ino);
                 let Ok(Some(bytes)) = kv.getxattr(local_ino, "layout").await else {
                     continue;
                 };
@@ -1105,6 +1374,153 @@ fn clean_key(mapping: &str) -> String {
     } else {
         mapping.split(':').next().unwrap_or(mapping).to_string()
     }
+}
+
+// ---------------------------------------------------------------------------
+// C9: the referenced-ino pass + the set difference
+// ---------------------------------------------------------------------------
+
+/// ONE sequential pass over `TREE_DENTRIES` on every volume, marking the
+/// TARGET ino of every dentry record — `DentryValue::child_ino`, which is
+/// the GLOBAL ino (a dentry lives on its PARENT's volume and may name a
+/// child on another, so the union across volumes is the referenced set).
+/// Spawnable: it touches only the dentry trees, disjoint from the census
+/// and the C1 walks.
+///
+/// Sharded runs mark only `child_ino % n == k` (the module header's shard
+/// rule: the dentry's VALUE says which inode is named; its key's parent
+/// ino says nothing).
+///
+/// Returns `None` when the pass could not complete (an unreadable node —
+/// C1's business to report — or cancellation). A TRUNCATED referenced set
+/// would make every inode named beyond the tear look unreferenced, so C9
+/// records **no verdict** for that run rather than guessing; the same
+/// posture C8 takes when its comparison fails.
+async fn build_referenced_inos(
+    meta: Arc<RoutedMetaBackend>,
+    shard: Option<(u32, u32)>,
+    throttle_pct: u32,
+    cancel: Arc<AtomicBool>,
+) -> (Option<InoBitmap>, u64) {
+    use crate::meta_backend::kv::record::DentryValue;
+    let mut refs = InoBitmap::new(meta.routing_width());
+    let mut indexed = 0u64;
+    for (vol_idx, kv) in meta.volumes.iter().enumerate() {
+        let dentries = kv.trees()[1];
+        let mut cursor: Vec<u8> = vec![0u8];
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return (None, indexed);
+            }
+            let t0 = std::time::Instant::now();
+            let page = match dentries
+                .range(
+                    &cursor,
+                    &crate::meta_backend::kv::tree::KEY_SPACE_MAX,
+                    SCAN_PAGE,
+                )
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!(
+                        "fsck C9: dentry walk of volume {vol_idx} failed ({e}) — the \
+                         referenced-ino set is incomplete, so the unreferenced-inode class \
+                         records no verdict for this run (C1 owns the unreadable node)"
+                    );
+                    return (None, indexed);
+                }
+            };
+            let Some((last, _)) = page.last() else { break };
+            cursor = crate::meta_backend::kv::node::key_successor(last);
+            for (_, v) in &page {
+                let Ok(d) = DentryValue::decode(v) else {
+                    continue; // C1's business
+                };
+                if let Some((k, n)) = shard {
+                    if d.child_ino % n as u64 != k as u64 {
+                        continue;
+                    }
+                }
+                refs.mark(d.child_ino);
+                indexed += 1;
+            }
+            throttle_sleep(throttle_pct, t0.elapsed()).await;
+        }
+    }
+    (Some(refs), indexed)
+}
+
+/// The C9 difference: live inodes with no dentry, filtered to those
+/// minted in a PRIOR writer era (the live-create shield — module header),
+/// with the counted evidence read per candidate. Per-candidate I/O only,
+/// so a healthy volume pays exactly the bitmap scan.
+async fn evaluate_c9_unreferenced(
+    ctx: &FsckCtx,
+    live: &InoBitmap,
+    refs: &InoBitmap,
+    counters: &mut FsckCounters,
+    suspects: &mut Vec<Suspect>,
+) {
+    let mut candidates: Vec<u64> = Vec::new();
+    live.each_absent_from(refs, |ino| candidates.push(ino));
+    for ino in candidates {
+        let (vol_idx, local) = ctx.meta.route_ino(ino);
+        let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
+            continue;
+        };
+        // THE guard: an inode this mount minted is never a candidate,
+        // because a create legitimately holds its record before its name.
+        if !kv.minted_in_prior_era(local) {
+            counters.current_era_exempted += 1;
+            continue;
+        }
+        let Ok(Some(val)) = kv.read_inode_value_routed(local).await else {
+            continue; // vanished between the walk and here: no verdict
+        };
+        // `nlink == 0` is the unlinked-but-open / POSIX-15 shape and is
+        // deliberately out of scope (module header).
+        if val.nlink == 0 {
+            continue;
+        }
+        let blocks = layout_mappings_of(ctx, ino).await.len();
+        suspects.push(Suspect {
+            kind: SuspectKind::C9Unreferenced {
+                ino,
+                nlink: val.nlink,
+                size: val.size,
+                blocks,
+            },
+        });
+    }
+}
+
+/// One ino's CURRENT block mappings through the census extraction path
+/// (inline or indirect map, the blob block included) — C9's evidence and
+/// repair input.
+async fn layout_mappings_of(ctx: &FsckCtx, ino: u64) -> Vec<MappingRef> {
+    let (vol_idx, local) = ctx.meta.route_ino(ino);
+    let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
+        return Vec::new();
+    };
+    let Ok(Some(bytes)) = kv.getxattr(local, "layout").await else {
+        return Vec::new();
+    };
+    let layout: Option<crate::routing::LayoutMetadata> = if bytes.starts_with(b"{") {
+        serde_json::from_slice(&bytes).ok()
+    } else {
+        bincode::deserialize(&bytes).ok()
+    };
+    let Some(layout) = layout else {
+        return Vec::new();
+    };
+    let block_size = ctx
+        .router
+        .block_size
+        .load(std::sync::atomic::Ordering::Relaxed) as usize;
+    let mut probe = probe_census(ctx);
+    census_layout(ctx, ino, &layout, block_size, &mut probe).await;
+    probe.mappings
 }
 
 // ---------------------------------------------------------------------------
@@ -1427,6 +1843,30 @@ async fn recheck_suspects(
     } else {
         None
     };
+    // Phase B for C9: ONE fresh referenced-ino pass after the settle
+    // window. This is the arm that catches the only live way a name can
+    // appear for an inode nothing could reach — an `open_by_handle_at`
+    // reconnect, or an S9 plan's late `InsertDentry` — and clears the
+    // suspect. Offline needs it not (nothing is in flight by definition),
+    // and an INCOMPLETE fresh pass clears every C9 suspect rather than
+    // confirming one from a partial set.
+    let fresh_refs = if online
+        && pending
+            .iter()
+            .any(|s| matches!(s.kind, SuspectKind::C9Unreferenced { .. }))
+    {
+        let (refs, indexed) = build_referenced_inos(
+            ctx.meta.clone(),
+            opts.shard,
+            opts.throttle_pct,
+            opts.cancel.clone(),
+        )
+        .await;
+        counters.dentry_refs_indexed += indexed;
+        Some(refs)
+    } else {
+        None
+    };
 
     // Phase C: per-suspect final verification.
     static EMPTY: once_cell::sync::Lazy<HashMap<u64, u32>> =
@@ -1702,6 +2142,48 @@ async fn recheck_suspects(
                         key: key.clone(),
                         ino: *ino,
                     }),
+                })
+            }
+            SuspectKind::C9Unreferenced {
+                ino,
+                nlink,
+                size,
+                blocks,
+            } => {
+                // Verify under the ino's exclusive 4a lease (online):
+                // the record is still live, still prior-era, and the
+                // FRESH dentry pass still found no name for it. The raw
+                // per-volume read is deliberate — the routed `getattr`
+                // takes its own shared 4a lease and would self-deadlock
+                // against the exclusive one held here (the C4 lesson).
+                let (vol_idx, local) = ctx.meta.route_ino(*ino);
+                let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
+                    continue;
+                };
+                let _lease = if online {
+                    Some(kv.dlm().lock_inode_exclusive(local).await)
+                } else {
+                    None
+                };
+                let still_live = matches!(
+                    kv.read_inode_value_routed(local).await,
+                    Ok(Some(v)) if v.nlink > 0
+                );
+                let still_prior_era = kv.minted_in_prior_era(local);
+                let still_unnamed = match &fresh_refs {
+                    Some(Some(refs)) => !refs.contains(*ino),
+                    // Incomplete fresh pass ⇒ no verdict (clears).
+                    Some(None) => false,
+                    // Offline: nothing is in flight by definition.
+                    None => true,
+                };
+                (still_live && still_prior_era && still_unnamed).then(|| FsckFinding {
+                    class: "C9".to_string(),
+                    object: format!("ino {ino}"),
+                    evidence: format!(
+                        "unreferenced inode: no dentry names ino {ino} (nlink {nlink},                          size {size} B, {blocks} block reference(s)); the record was                          minted in a PRIOR writer era and stayed unnamed across both                          dentry passes — a crashed cross-volume create leaves this shape                          with 0 blocks, pre-S3.5 cross-volume link/unlink damage with its                          blocks still attached"
+                    ),
+                    identity: Some(FindingId::C9Unreferenced { ino: *ino }),
                 })
             }
             SuspectKind::C5Generation { dir, why } => {
@@ -1982,12 +2464,7 @@ async fn reverify_scrub_failure(
     if !still_mapped {
         // Indirect maps / blob references: re-read through the census
         // decoder for this single layout.
-        let mut probe = CensusOut {
-            refs: HashMap::new(),
-            mappings: Vec::new(),
-            unresolvable: Vec::new(),
-            inodes_scanned: 0,
-        };
+        let mut probe = probe_census(ctx);
         census_layout(ctx, m.ino, &layout, block_size, &mut probe).await;
         still_mapped = probe.mappings.iter().any(|p| p.mapping == m.mapping);
     }
@@ -2032,6 +2509,10 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.inodes_scanned, Ordering::Relaxed);
     m.fsck_nodes_walked
         .fetch_add(c.nodes_walked, Ordering::Relaxed);
+    m.fsck_dentry_refs_indexed
+        .fetch_add(c.dentry_refs_indexed, Ordering::Relaxed);
+    m.fsck_current_era_exempted
+        .fetch_add(c.current_era_exempted, Ordering::Relaxed);
     m.fsck_blocks_checked
         .fetch_add(c.blocks_checked, Ordering::Relaxed);
     m.fsck_refcounts_checked
@@ -2107,7 +2588,7 @@ pub struct RepairCounters {
     pub quarantined_records: u64,
     pub quarantined_blocks: u64,
     pub quarantined_bytes: u64,
-    /// Applied repairs per class (`"C1"`..`"C7"`).
+    /// Applied repairs per class (`"C1"`..`"C9"`).
     pub per_class: std::collections::BTreeMap<String, u64>,
 }
 
@@ -2351,6 +2832,18 @@ fn planned_action(id: &FindingId) -> (&'static str, String) {
                 "restate {vol}:{offset}'s durable reference records from the layout                  walk's verified census (the layouts are the justification; the ledger                  is the index)"
             ),
         ),
+        FindingId::C9Unreferenced { ino } => (
+            "destroy-unreferenced-inode",
+            format!(
+                "quarantine ino {ino}'s inode record + every xattr record (the layout that \
+                 names its blocks) and enumerate the block keys in the manifest, then free \
+                 those blocks through the ordinary terminal-free law (durable references \
+                 released, discards queued on the reclaimer) and destroy the record in ONE \
+                 journaled transaction. Block CONTENTS are not copied — an inode's data is \
+                 unbounded, so the manifest states which blocks were reclaimed rather than \
+                 pretending to keep them"
+            ),
+        ),
         FindingId::C7Scrub { mapping, .. } => (
             "quarantine-mapping",
             format!(
@@ -2382,12 +2875,7 @@ async fn current_mapping_present(ctx: &FsckCtx, ino: u64, block_idx: u32, mappin
         .router
         .block_size
         .load(std::sync::atomic::Ordering::Relaxed) as usize;
-    let mut probe = CensusOut {
-        refs: HashMap::new(),
-        mappings: Vec::new(),
-        unresolvable: Vec::new(),
-        inodes_scanned: 0,
-    };
+    let mut probe = probe_census(ctx);
     census_layout(ctx, ino, &layout, block_size, &mut probe).await;
     probe
         .mappings
@@ -2534,6 +3022,31 @@ pub async fn repair(
     } else {
         None
     };
+    // C9's repair-time ground truth: ONE dentry pass (repair is refused
+    // under `--shards`, so this is always the whole set). `None` = the
+    // pass could not complete, which REFUSES every C9 action — destroying
+    // an inode whose name might exist is exactly what must not happen.
+    let repair_refs = if actionable
+        .iter()
+        .any(|(_, id)| matches!(id, FindingId::C9Unreferenced { .. }))
+    {
+        build_referenced_inos(
+            ctx.meta.clone(),
+            None,
+            100,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .0
+    } else {
+        None
+    };
+    // **C9 first.** A C9 destroy deletes a REFERENCER: every block-class
+    // finding naming its blocks becomes stale and resolves as a refused
+    // (verified-healed) repair, instead of paying quarantine work — or
+    // re-allocating blocks — on an inode that is about to be destroyed.
+    // Stable, so every other class keeps its report order.
+    actionable.sort_by_key(|(_, id)| u8::from(!matches!(id, FindingId::C9Unreferenced { .. })));
 
     let refuse = |out: &mut RepairReport, f: &FsckFinding, why: String| {
         out.refused.push(RepairAction {
@@ -2548,7 +3061,7 @@ pub async fn repair(
         class
             .strip_prefix('C')
             .and_then(|n| n.parse::<usize>().ok())
-            .filter(|n| (1..=7).contains(n))
+            .filter(|n| (1..=9).contains(n))
             .map(|n| n - 1)
     };
     let apply_ok = |out: &mut RepairReport, f: &FsckFinding, verb: &str, detail: String| {
@@ -2595,6 +3108,187 @@ pub async fn repair(
                     ),
                 );
                 continue;
+            }
+            // ------------------------------------ C9 unreferenced inode
+            //
+            // The one repair that DESTROYS an inode, so its verification
+            // is the strictest: still live, still prior-era, and still
+            // named by nothing in a freshly walked referenced set.
+            //
+            // Step order is chosen for its crash windows (each leaves a
+            // state the next run converges from, and none leaves a state
+            // no class names):
+            //
+            // 1. quarantine the record + every xattr (the layout IS the
+            //    map to the blocks) and enumerate the block keys;
+            // 2. `delete_file` — durable references released, blocks
+            //    freed through the ordinary terminal-free law (reclaim
+            //    queue, non-reallocatable until reclaimed, fence latch
+            //    observed), staged custody purged, tiers coherent;
+            // 3. destroy the record + its xattrs in ONE transaction.
+            //
+            // Interrupted between 2 and 3 the inode is still `nlink >= 1`
+            // and unnamed, so the next run re-detects it as C9 and both
+            // remaining steps are idempotent (an already-free key frees
+            // as a no-op; a ref release is a `Delete`). While interrupted,
+            // the block classes may ALSO name its blocks (C2-lost, and on
+            // a bit-8 volume C8 drift) — which is why C9 runs first: after
+            // its destroy those findings verify as healed and refuse.
+            FindingId::C9Unreferenced { ino } => {
+                let (vol_idx, local) = ctx.meta.route_ino(*ino);
+                let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
+                    refuse(&mut out, f, "volume index no longer exists".to_string());
+                    continue;
+                };
+                // Verify under the ino's exclusive 4a lease; the raw
+                // per-volume read (the routed `getattr` would self-deadlock
+                // against it — the C4 lesson).
+                let verified = {
+                    let _lease = if online {
+                        Some(kv.dlm().lock_inode_exclusive(local).await)
+                    } else {
+                        None
+                    };
+                    match kv.read_inode_value_routed(local).await {
+                        Ok(Some(v)) if v.nlink > 0 => Ok(v),
+                        Ok(Some(_)) => Err("the inode is nlink 0 now (an ordinary reclaim \
+                                            owns it — C9 never claims that shape)"
+                            .to_string()),
+                        Ok(None) => Err("the inode record is gone (already reclaimed)".to_string()),
+                        Err(e) => Err(format!("inode record unreadable at verify: {e}")),
+                    }
+                };
+                let value = match verified {
+                    Ok(v) => v,
+                    Err(why) => {
+                        refuse(&mut out, f, why);
+                        continue;
+                    }
+                };
+                if !kv.minted_in_prior_era(local) {
+                    refuse(
+                        &mut out,
+                        f,
+                        "the ino belongs to THIS mount's writer era now (it cannot be \
+                         prior-era residue) — nothing is destroyed on a re-used report"
+                            .to_string(),
+                    );
+                    continue;
+                }
+                match &repair_refs {
+                    Some(refs) if refs.contains(*ino) => {
+                        refuse(
+                            &mut out,
+                            f,
+                            "a dentry names this inode now (reconnected since the scan)"
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                    Some(_) => {}
+                    None => {
+                        refuse(
+                            &mut out,
+                            f,
+                            "the referenced-ino pass could not complete: repair refuses \
+                             rather than destroy an inode whose name may exist"
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                }
+                // Quarantine: the inode record verbatim + every xattr
+                // record (key AND value — `layout` is the only map to the
+                // blocks this repair reclaims).
+                use crate::meta_backend::kv::record::{inode_key, xattr_key, HASH56_MAX};
+                let ikey = inode_key(local);
+                let Ok(Some(record)) = kv.trees()[0].lookup(&ikey).await else {
+                    refuse(
+                        &mut out,
+                        f,
+                        "the inode record vanished between verify and quarantine".to_string(),
+                    );
+                    continue;
+                };
+                let mut parts_owned: Vec<(String, Vec<u8>)> =
+                    vec![("inode_record".to_string(), record.to_vec())];
+                let mut xattr_records = 0u64;
+                {
+                    let xattrs = kv.trees()[2];
+                    let end = xattr_key(local, HASH56_MAX, u8::MAX);
+                    let mut cursor: Vec<u8> = xattr_key(local, 0, 0).to_vec();
+                    while let Ok(page) = xattrs.range(&cursor, &end, SCAN_PAGE).await {
+                        let Some((last, _)) = page.last() else { break };
+                        cursor = crate::meta_backend::kv::node::key_successor(last);
+                        for (k, v) in &page {
+                            parts_owned.push((format!("xattr_{xattr_records}_key"), k.to_vec()));
+                            parts_owned.push((format!("xattr_{xattr_records}_value"), v.to_vec()));
+                            xattr_records += 1;
+                        }
+                    }
+                }
+                let mappings = layout_mappings_of(ctx, *ino).await;
+                let keys: Vec<String> = mappings.iter().map(|m| m.mapping.clone()).collect();
+                let note = format!(
+                    "unreferenced inode {ino}: record + {xattr_records} xattr record(s), \
+                     nlink {} size {} B; blocks reclaimed by this repair: [{}] — block \
+                     CONTENTS are deliberately NOT copied (an inode's data is unbounded), \
+                     so this manifest states what was reclaimed instead of pretending to \
+                     keep it",
+                    value.nlink,
+                    value.size,
+                    keys.join(", ")
+                );
+                let parts: Vec<(&str, &[u8])> = parts_owned
+                    .iter()
+                    .map(|(n, b)| (n.as_str(), b.as_slice()))
+                    .collect();
+                let bytes = quarantine
+                    .put(
+                        &f.class,
+                        &f.object,
+                        "destroy-unreferenced-inode",
+                        &note,
+                        &parts,
+                    )
+                    .await?;
+                out.counters.quarantined_records += 1 + xattr_records;
+                out.counters.quarantined_bytes += bytes;
+                fire_repair_abort_hook(&what)?;
+                // Free the data FIRST: the layout is the only map to these
+                // blocks, and the destroy reaps it. A failure here LEAVES
+                // the record (the finding survives, the next run retries) —
+                // never a silently stranded block population.
+                match ctx.router.delete_file(&crate::keys::inode_path(*ino)).await {
+                    Ok(()) => {}
+                    // No layout at all: the crashed-cross-volume-create
+                    // shape (an inode that never got a byte written).
+                    Err(e) if is_not_found(&e) => {}
+                    Err(e) => {
+                        refuse(
+                            &mut out,
+                            f,
+                            format!(
+                                "data teardown failed ({e}) — the inode record is \
+                                 deliberately LEFT so the next run retries; nothing was \
+                                 destroyed"
+                            ),
+                        );
+                        continue;
+                    }
+                }
+                ctx.meta.destroy_unreferenced_inodes(&[*ino]).await?;
+                apply_ok(
+                    &mut out,
+                    f,
+                    "destroy-unreferenced-inode",
+                    format!(
+                        "ino {ino} destroyed with its {xattr_records} xattr record(s) in one \
+                         journaled transaction; {} block(s) reclaimed through the terminal-free \
+                         law (record + xattrs quarantined first)",
+                        keys.len()
+                    ),
+                );
             }
             // -------------------------------------------------- C1 torn
             FindingId::C1Torn {
@@ -2951,12 +3645,7 @@ pub async fn repair(
                         bincode::deserialize(&bytes).ok()
                     };
                     let Some(layout) = layout else { continue };
-                    let mut probe = CensusOut {
-                        refs: HashMap::new(),
-                        mappings: Vec::new(),
-                        unresolvable: Vec::new(),
-                        inodes_scanned: 0,
-                    };
+                    let mut probe = probe_census(ctx);
                     census_layout(ctx, r_ino, &layout, block_size, &mut probe).await;
                     counted += probe
                         .refs

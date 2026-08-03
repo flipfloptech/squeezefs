@@ -3536,7 +3536,18 @@ pub struct Metrics {
     pub fsck_inflight_exempted: Align64<AtomicU64>,
     /// C3 suspects exempted by the §5.4-step-2 mover pre-publish ledger.
     pub fsck_mover_ledger_exempted: Align64<AtomicU64>,
-    /// Verified findings (class-labeled C1–C7 in the report). MUST stay
+    /// C9: dentry records whose TARGET ino the referenced-ino pass
+    /// indexed — the cheap-direction pass's engagement gauge (C9 asks
+    /// "which inodes are named" once, never "who names me" per inode).
+    pub fsck_dentry_refs_indexed: Align64<AtomicU64>,
+    /// C9: unnamed live inodes exempted by the **writer-era ino floor** —
+    /// records THIS mount minted, i.e. the in-flight-create shape a naive
+    /// settle window would report. The live-create false-positive
+    /// shield's engagement gauge (`fsck_epoch_exempted`'s analogue for
+    /// the inode plane); growth under concurrent creates is the proof it
+    /// is doing work.
+    pub fsck_current_era_exempted: Align64<AtomicU64>,
+    /// Verified findings (class-labeled C1–C9 in the report). MUST stay
     /// 0 on healthy volumes.
     pub fsck_findings: Align64<AtomicU64>,
     /// Wall seconds of the most recent run (gauge).
@@ -3565,9 +3576,12 @@ pub struct Metrics {
     pub fsck_quarantined_records: Align64<AtomicU64>,
     pub fsck_quarantined_blocks: Align64<AtomicU64>,
     pub fsck_quarantined_bytes: Align64<AtomicU64>,
-    /// Applied repairs per class — index 0..6 ⇔ C1..C7
-    /// (`fsck_repair_classC{1..7}` on the stats inode).
-    pub fsck_repair_class: Align64<[AtomicU64; 7]>,
+    /// Applied repairs per class — index 0..8 ⇔ C1..C9
+    /// (`fsck_repair_classC{1..9}` on the stats inode). Index 7 (C8) is
+    /// never incremented by design: durable-block-reference drift is
+    /// reported and never auto-repaired (restating the ledger from the
+    /// walk would erase the evidence of why it broke).
+    pub fsck_repair_class: Align64<[AtomicU64; 9]>,
     /// PR VL7 defrag family (design-volume-lifecycle §5.7/§10, KD-11).
     /// Distinct blocks moved by the D1/D2 defrag objective (the same
     /// `move_one` engine as `evacuate_*` — a defrag move counts BOTH
@@ -6627,6 +6641,8 @@ impl SqueezefsFilesystem {
                 "fsck_epoch_exempted": METRICS.fsck_epoch_exempted.load(Ordering::Relaxed),
                 "fsck_inflight_exempted": METRICS.fsck_inflight_exempted.load(Ordering::Relaxed),
                 "fsck_mover_ledger_exempted": METRICS.fsck_mover_ledger_exempted.load(Ordering::Relaxed),
+                "fsck_dentry_refs_indexed": METRICS.fsck_dentry_refs_indexed.load(Ordering::Relaxed),
+                "fsck_current_era_exempted": METRICS.fsck_current_era_exempted.load(Ordering::Relaxed),
                 "fsck_findings": METRICS.fsck_findings.load(Ordering::Relaxed),
                 "fsck_scan_secs": METRICS.fsck_scan_secs.load(Ordering::Relaxed),
                 "scrub_blocks_scanned": METRICS.scrub_blocks_scanned.load(Ordering::Relaxed),
@@ -6649,6 +6665,9 @@ impl SqueezefsFilesystem {
                 "fsck_repair_classC5": METRICS.fsck_repair_class[4].load(Ordering::Relaxed),
                 "fsck_repair_classC6": METRICS.fsck_repair_class[5].load(Ordering::Relaxed),
                 "fsck_repair_classC7": METRICS.fsck_repair_class[6].load(Ordering::Relaxed),
+                // C8 is structurally 0 (reported, never auto-repaired).
+                "fsck_repair_classC8": METRICS.fsck_repair_class[7].load(Ordering::Relaxed),
+                "fsck_repair_classC9": METRICS.fsck_repair_class[8].load(Ordering::Relaxed),
                 // PR VL7 defrag family (§5.7 / §10, KD-11). Ratio gauges
                 // decode permille+1 (null = never measured); worst-volume
                 // semantics — per-volume rows ride `defrag --report-only`.

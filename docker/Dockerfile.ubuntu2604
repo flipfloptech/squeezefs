@@ -13,7 +13,9 @@ RUN apt-get update \
       fuse3 libfuse3-dev clang libclang-dev \
  && rm -rf /var/lib/apt/lists/*
 
-# rustup: the repo carries no rust-toolchain.toml, so track stable. The
+# rustup: rust-toolchain.toml pins the CHANNEL (stable) plus the gate
+# components, so this install matches it without pulling a second
+# separately-named toolchain into the image (ENG-16). The
 # cargo registry (/usr/local/cargo/registry) is volume-mounted per target
 # by the Taskfile for incremental rebuilds.
 ENV RUSTUP_HOME=/usr/local/rustup \

@@ -41,10 +41,13 @@ tasks:
   build:
     desc: 'Host dev build → dist/host/{squeezefs, libsqueezefs_il.so}'
     cmds:
-      - cargo build --release
+      # `--locked` matches the container path (docker/build-in-container.sh):
+      # a host dev build must not silently re-resolve Cargo.lock, or the
+      # audited dependency set (rc-manifest §5) stops being the built one.
+      - cargo build --release --locked
       # The only sanctioned shim build (§5.4 Issue-4: the root release
       # profile's panic="abort" is refused by the shim's compile guard).
-      - cargo build -p squeezefs-preload --profile preload-release --features interposers
+      - cargo build -p squeezefs-preload --profile preload-release --features interposers --locked
       - mkdir -p dist/host
       - install -m 0755 target/release/squeezefs dist/host/squeezefs
       - install -m 0755 target/preload-release/libsqueezefs_il.so dist/host/libsqueezefs_il.so
@@ -123,11 +126,46 @@ tasks:
     desc: The authoritative full cargo gate (AGENTS.md — code-class changes)
     cmds:
       - cargo clippy --all-targets --all-features -- -D warnings
+      # ENG-8: the SHIPPED configuration. `--all-features` above compiles
+      # `gds`/`dhat-on`/`coz-on` and therefore NEVER compiles the default
+      # cfg the release binary is built from — 3 optional features' worth of
+      # `#[cfg]` divergence went unlinted until this line existed.
+      - cargo clippy --all-targets -- -D warnings
       - cargo fmt --check
       - cargo test --all-features -- --test-threads=1
       - cargo doc --no-deps
       # Criterion smoke — one iteration per bench, no measurement.
       - cargo bench --benches -- --test
+      # ENG-17: the first-party fuse3 fork is workspace.exclude'd, so every
+      # line above compiles it only as a DEPENDENCY (default features, no
+      # test/bench targets). Its own suite and its `file-lock` cfg sites
+      # need their own leg.
+      - task: check:fuse3
+      # ENG-2: supply chain. Last so a dependency advisory does not mask a
+      # code failure, but inside the same gate — the AGENTS.md Phase-5
+      # "no known vulnerabilities" claim had no enforcement point before.
+      - task: audit
+
+  check:fuse3:
+    desc: 'ENG-17: the excluded fuse3 fork''s own gate (its workspace, its lock)'
+    dir: crates/fuse3
+    cmds:
+      - cargo clippy --all-targets --all-features -- -D warnings
+      - cargo fmt --check
+      - cargo test --all-features -- --test-threads=1
+      - cargo bench --benches -- --test
+
+  audit:
+    desc: >-
+      ENG-2: cargo-audit over BOTH lockfiles (the root workspace and the
+      excluded fuse3 fork). Vulnerabilities always fail; `unsound` and
+      `yanked` fail too (both are real supply-chain risk). `unmaintained`
+      stays a warning — the current two (bincode, number_prefix) are
+      adjudicated in docs/rc-manifest.md §5, and neither has a drop-in
+      replacement inside the RC scope (bincode is an on-disk/wire codec).
+    cmds:
+      - cargo audit --deny unsound --deny yanked
+      - cargo audit --deny unsound --deny yanked --file crates/fuse3/Cargo.lock
 
   check:require-mount:
     desc: >-

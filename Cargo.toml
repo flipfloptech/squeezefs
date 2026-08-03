@@ -8,6 +8,12 @@ name = "squeezefs"
 version = "1.1.0"
 edition = "2021"
 license-file = "LICENSE"
+# ENG-16: `cargo publish` is unrepresentable here — the crate depends on
+# `fuse3 = "1.1"`, satisfied ONLY by the `[patch.crates-io]` path entry
+# below (crates.io has no fuse3 1.1), and patch entries do not travel in a
+# published package. `publish = false` makes the footgun a hard refusal
+# instead of a broken artifact on crates.io.
+publish = false
 
 # L4 workspace (design-preload-interception §5.4 / KD-8, OQ-2 primary path):
 # root + the IPC protocol crate. `crates/squeezefs-preload` joins `members`
@@ -98,7 +104,12 @@ ahash = "0.8"
 bytes = { version = "1.5", features = ["serde"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crossbeam = "0.8"
-scc = "3.8.3"
+# ENG-2 floor, not a preference: 3.8.4 is the patched release for
+# RUSTSEC-2026-0205 (`Array::insert` was not exception-safe — a panicking
+# `K::compare` could double-free). `scc::HashMap` is load-bearing across the
+# latch-free hot paths, so the requirement pins the patched floor rather than
+# leaning on the lockfile; a `cargo update` can never regress below it.
+scc = "3.8.4"
 arc-swap = "1.7"
 compact_str = "0.8"
 squeezefs-ipc = { path = "crates/squeezefs-ipc" }

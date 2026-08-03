@@ -1,0 +1,21 @@
+# ENG-16 (pre-RC engineering spec §10): declare the toolchain the gate
+# regime assumes, instead of leaving it to whatever each box happens to
+# have installed.
+#
+# WHY the channel and not an exact version: the four distro build images
+# (docker/Dockerfile.*) install `--default-toolchain stable`, and every
+# `task build:<distro>` would otherwise download a second, separately-named
+# toolchain into each per-target image. Pinning an exact version is a
+# RELEASE ACT — do it in the same commit that cuts a `stable-*`/`lts-*` tag
+# (docs/operations.md §Versioning & releases), together with a from-zero
+# gate run on the pinned version, and refresh the Dockerfile comments.
+#
+# `components` is the load-bearing part today: `task check` runs clippy and
+# `cargo fmt --check`, and a checkout without those components fails the
+# gate for a reason that has nothing to do with the code. `cargo +nightly
+# fuzz run …` (the nightly fuzz tier) is unaffected — an explicit
+# `+toolchain` overrides this file.
+[toolchain]
+channel = "stable"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

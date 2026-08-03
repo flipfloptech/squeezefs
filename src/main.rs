@@ -2942,6 +2942,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     builder.init();
 
+    // ENG-8: a profiling build must announce itself the moment logging is
+    // live. `--all-features` compiles `dhat-on`, which replaces jemalloc
+    // (and drops the load-bearing `dirty_decay_ms:1000`) — anyone who
+    // mounts or benchmarks that binary is measuring a different allocator.
+    // The `--version` line carries the same notice for evidence notes that
+    // capture it.
+    if let Some(warning) =
+        squeezefs::version::profiling_build_warning(squeezefs::version::measurement_disqualifiers())
+    {
+        log::warn!("{warning}");
+    }
+
     // NOW start the Tokio runtime in the surviving process
     let mut core_ids = core_affinity::get_core_ids().unwrap_or_default();
     if !core_ids.is_empty() {
@@ -4885,6 +4897,16 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             time,
             iterations,
         } => {
+            // ENG-8: `squeezefs bench` is the in-binary measurement path —
+            // the one place a profiling build turns directly into a number.
+            // Loud on stderr as well as the log: a bench row is captured
+            // from the console far more often than from the daemon log.
+            if let Some(warning) = squeezefs::version::profiling_build_warning(
+                squeezefs::version::measurement_disqualifiers(),
+            ) {
+                eprintln!("WARNING: {warning}");
+                log::warn!("{warning}");
+            }
             let inv = squeezefs::bench::BenchInvocation {
                 write,
                 read,

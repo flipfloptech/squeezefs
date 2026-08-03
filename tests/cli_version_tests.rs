@@ -22,6 +22,13 @@
 //!   when applicable) and `build_tag` (always present, empty string when
 //!   untagged — the always-export stats convention): the fleet mixed-version
 //!   detector.
+//! * **ENG-8**: a build carrying a profiling feature (`dhat-on` replaces
+//!   jemalloc, `coz-on` arms instrumentation) says so in its own version
+//!   line, and a build without one is byte-identical to the shipped shape.
+//!   The gate exercises BOTH sides: `cargo test --all-features` compiles
+//!   `dhat-on` (suffix required), the default-features run does not (suffix
+//!   forbidden) — `cfg!(feature = …)` here matches the binary because
+//!   `CARGO_BIN_EXE_squeezefs` is built by the same cargo invocation.
 //!
 //! CLI tests drive the real binary (`CARGO_BIN_EXE_squeezefs`), the house
 //! convention for CLI contracts.
@@ -43,9 +50,23 @@ fn version_line_regex() -> Regex {
         r"(?x)^squeezefs\ \d+\.\d+\.\d+\ \(
             [0-9a-f]{12}(?:-dirty)?\ /\ [0-9a-f]{40}(?:-dirty)?
             (?:,\ tag\ \S+)?
-          \)\ built\ \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
+          \)\ built\ \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z
+          (?:\ \[PROFILING\ BUILD:\ [a-z0-9+-]+\ —\ NOT\ measurement-valid\])?$",
     )
     .expect("version-line regex compiles")
+}
+
+/// The profiling features this test binary was compiled with — identical to
+/// the binary's, since both come from one cargo invocation (ENG-8).
+fn expected_disqualifiers() -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if cfg!(feature = "dhat-on") {
+        v.push("dhat-on");
+    }
+    if cfg!(feature = "coz-on") {
+        v.push("coz-on");
+    }
+    v
 }
 
 fn run_version(flag: &str) -> String {
@@ -276,6 +297,86 @@ fn embedded_identity_is_internally_consistent() {
             "tagged builds carry `, tag <tag>` (line: {line:?}, tag: {tag:?})"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// ENG-8: the shipped configuration vs a profiling build.
+// ---------------------------------------------------------------------------
+
+/// `measurement_disqualifiers()` reports exactly the profiling features this
+/// build compiled — nothing on the shipped (default-features) build, and
+/// `dhat-on` on the `--all-features` gate run, which is the whole point:
+/// that build has no jemalloc and no `dirty_decay_ms:1000`.
+#[test]
+fn measurement_disqualifiers_match_the_compiled_features() {
+    assert_eq!(
+        squeezefs::version::measurement_disqualifiers(),
+        expected_disqualifiers().as_slice(),
+        "the disqualifier list must be exactly the compiled profiling features"
+    );
+    assert_eq!(
+        squeezefs::version::measurement_valid(),
+        expected_disqualifiers().is_empty(),
+        "measurement_valid() is the empty-disqualifier predicate"
+    );
+}
+
+/// The notice and the warning are BOTH `None` on a measurement-valid build
+/// (the shipped `--version` shape stays byte-identical) and both name every
+/// engaged feature otherwise.
+#[test]
+fn profiling_notice_and_warning_are_absent_only_when_valid() {
+    assert_eq!(
+        squeezefs::version::format_profiling_notice(&[]),
+        None,
+        "a clean build appends nothing to the version line"
+    );
+    assert_eq!(
+        squeezefs::version::profiling_build_warning(&[]),
+        None,
+        "a clean build logs no profiling warning"
+    );
+    let notice = squeezefs::version::format_profiling_notice(&["dhat-on", "coz-on"])
+        .expect("a disqualified build must produce a notice");
+    assert_eq!(
+        notice, " [PROFILING BUILD: dhat-on+coz-on — NOT measurement-valid]",
+        "the notice names every engaged feature"
+    );
+    let warning = squeezefs::version::profiling_build_warning(&["dhat-on"])
+        .expect("a disqualified build must produce a warning");
+    assert!(
+        warning.contains("dhat-on") && warning.contains("NOT measurement-valid"),
+        "the warning names the feature and the consequence: {warning:?}"
+    );
+}
+
+/// The live `--version` output agrees with the compiled feature set: the
+/// suffix is present exactly when a profiling feature is compiled, and the
+/// regex (which allows the optional suffix) still matches either way.
+#[test]
+fn version_line_declares_a_profiling_build_and_only_then() {
+    let stdout = run_version("--version");
+    let line = stdout.trim_end_matches('\n');
+    let disqualifiers = expected_disqualifiers();
+    if disqualifiers.is_empty() {
+        assert!(
+            !line.contains("PROFILING BUILD"),
+            "the shipped configuration must not claim to be a profiling build: {line:?}"
+        );
+    } else {
+        let expected = format!(
+            " [PROFILING BUILD: {} — NOT measurement-valid]",
+            disqualifiers.join("+")
+        );
+        assert!(
+            line.ends_with(&expected),
+            "a {disqualifiers:?} build must end its version line with {expected:?}, got: {line:?}"
+        );
+    }
+    assert!(
+        version_line_regex().is_match(line),
+        "both shapes must match the pinned version-line regex: {line:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

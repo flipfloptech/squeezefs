@@ -72,15 +72,76 @@ pub fn format_build_commit(full: &str, dirty: bool) -> String {
     format!("{full}{d}")
 }
 
+/// ENG-8 (pre-RC spec §10): the build features that make THIS binary unfit
+/// for measurement, in the order they are reported.
+///
+/// * `dhat-on` replaces the global allocator with `dhat::Alloc`, which
+///   removes jemalloc **and** the `dirty_decay_ms:1000` tuning `main.rs`
+///   documents as load-bearing for R1b liveness. Every throughput, IOPS,
+///   latency and RSS figure from such a build describes a different
+///   allocator than the shipped one.
+/// * `coz-on` arms the `coz_progress!` instrumentation points.
+///
+/// Neither is compiled by `cargo build --release` (the shipped and
+/// rig-built configuration); both are compiled by `--all-features`, which
+/// is why the gate now lints the default configuration separately and why
+/// this binary says so about itself.
+pub fn measurement_disqualifiers() -> &'static [&'static str] {
+    &[
+        #[cfg(feature = "dhat-on")]
+        "dhat-on",
+        #[cfg(feature = "coz-on")]
+        "coz-on",
+    ]
+}
+
+/// Whether this build may carry a performance number at all (ENG-8).
+pub fn measurement_valid() -> bool {
+    measurement_disqualifiers().is_empty()
+}
+
+/// The profiling notice appended to the version line, `None` for a
+/// measurement-valid build (so the shipped `--version` shape is unchanged,
+/// byte for byte — `tests/cli_version_tests.rs`).
+pub fn format_profiling_notice(disqualifiers: &[&str]) -> Option<String> {
+    if disqualifiers.is_empty() {
+        return None;
+    }
+    Some(format!(
+        " [PROFILING BUILD: {} — NOT measurement-valid]",
+        disqualifiers.join("+")
+    ))
+}
+
+/// The one-line loud warning the daemon and `squeezefs bench` emit when a
+/// profiling build is used for anything that produces a number (ENG-8).
+pub fn profiling_build_warning(disqualifiers: &[&str]) -> Option<String> {
+    if disqualifiers.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "PROFILING BUILD ({}): this binary is built with a profiling feature — \
+         dhat-on replaces jemalloc (and its load-bearing dirty_decay_ms:1000 \
+         tuning), coz-on arms instrumentation points. Numbers from this build \
+         are NOT measurement-valid; rebuild with `cargo build --release` \
+         (default features) before recording any performance evidence.",
+        disqualifiers.join("+")
+    ))
+}
+
 static VERSION_LINE: LazyLock<String> = LazyLock::new(|| {
-    format_version_line(
+    let base = format_version_line(
         RELEASE_TRAIN,
         BUILD_COMMIT_SHORT,
         BUILD_COMMIT,
         build_dirty(),
         BUILD_TAG,
         BUILD_TIMESTAMP,
-    )
+    );
+    match format_profiling_notice(measurement_disqualifiers()) {
+        Some(notice) => format!("{base}{notice}"),
+        None => base,
+    }
 });
 
 /// The embedded version line for THIS build — the single source of truth

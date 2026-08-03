@@ -139,9 +139,17 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 // Schema + framing constants
 // ---------------------------------------------------------------------------
 
-/// The cluster-wire framing/handshake schema this build speaks. A peer
-/// presenting any other value is refused loud, naming the field — never
-/// interpreted, because a custody-bearing protocol has no safe guess.
+/// The cluster-wire **RPC vocabulary** schema this build speaks (the verb
+/// surface S4 extends). A peer presenting any other value is refused loud,
+/// naming the field — never interpreted, because a custody-bearing
+/// protocol has no safe guess.
+///
+/// Two-level versioning, deliberately: the FRAMING (length prefix, class
+/// caps, MAC layout) is this module's byte layout and changes only with a
+/// transport change, while each protocol riding the wire versions its own
+/// vocabulary — `job_wire::WIRE_SCHEMA` is at 3 for exactly that reason.
+/// One shared number would force an unrelated protocol's peers to
+/// re-enroll whenever the other one added a field.
 pub const CLUSTER_WIRE_SCHEMA: u32 = 1;
 
 /// The **pre-authentication** frame class cap: a challenge/proof pair is a

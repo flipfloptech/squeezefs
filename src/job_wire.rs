@@ -720,17 +720,10 @@ impl std::fmt::Debug for JobWireConfig {
     }
 }
 
-/// Default concurrent-connection cap: derived from the core count (the
-/// AGENTS "resource caps derive from system resources" law), floored so
-/// a small box still admits a real worker population and ceilinged so a
-/// large one still has a bound.
-pub fn default_max_connections() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8)
-        .saturating_mul(16)
-        .clamp(64, 1024)
-}
+/// The cluster-wide connection-cap derivation
+/// ([`cluster_wire::default_max_connections`]) — one function, so a
+/// listener's bound cannot depend on which protocol opened it.
+pub use crate::cluster_wire::default_max_connections;
 
 impl Default for JobWireConfig {
     fn default() -> Self {

@@ -267,13 +267,15 @@ item nobody claims is indistinguishable from an item nobody needs):
 | 6 | Block keys are bare reusable device offsets | **LANDED** | `offset ‖ incarnation` (bit 13) — a stale process-local binding is now structurally detectable. The lifetime is minted at exactly ONE site (`claim_block_idx`, because an allocation is the only event that starts a new lifetime) and the stamp is deliberately NOT cleared on free, so a freed-but-unreclaimed offset still validates its own key |
 | 7 | `writer_claim` is singular (expresses exclusion, not membership) | **LANDED** | Claim-set record + registrant keys (bit 14), inside S6. Registrant keys are READ from S7's standing WERO hold (`live_wero_key()`) — join-never-fork is enforced by there being no second acquire path |
 | 8 | `active_block:`/`active_block_ext:`/`mapping:` keys have no writer scope | **LANDED** | Trailing `:w_{16 hex}` component *after* every identity component, so historical scan prefixes keep their exact meaning — a foreign record must be SEEN to be classified. Keys carry identity, values carry currency (the fencing token stays in the value) |
-| 9 | Layout-delta chains name their base with a process-local token | **OPEN** | Durable per-ino layout version. Touches the `routing.rs` publish path, so it waits for item 5/6 to land |
+| 9 | Layout-delta chains name their base with a process-local token | **LANDED** | Durable per-ino layout version (bit 15, `KV_LAYOUT_VERSIONS` — D9: built, never stamped): delta records carry an era-composed `(base_version, version)` pair, `version = (term << 40) \| seq` from the SAME sequencer as the S1 fencing mint, so a chain names its base across process death and writer eras. The commit gate stages a link only when its claim IS the durable head — a nonzero mismatch is REFUSED loud (never staged, never a silent full-Put clobber), while claim-0 / bare-Put-head shapes re-base with the full Put (the compaction-collapse and Phase-8 first-touch tolerance), and the from-scratch fold refuses non-joining or mixed chains. Un-stamped volumes strip the pair at encode — byte-identical shipped wire, zero extra journal entries (D4 pinned). `docs/design-mw-layout-versions.md` |
 | 10 | Staging generation is the volume-set uuids only | **LANDED** | `{set}@node:{16 hex}` from a host-stable identity (machine-id, app-specific-hashed so the raw id never lands on disk). The D0 claim id was rejected: a successor mount would classify its own predecessor's crash residue as foreign, inverting staged-crash recovery into data loss |
 | — | KV node cache is load-once RAM-authoritative | **LANDED** | *Partitioning, not cache coherence*: `apply_locked` is the one choke point, non-authority structural mutation refuses loud, and a peer's append into a cached tail is detected at `append_frozen` rather than silently overwriting acked records. Named residual: a leaf a peer wrote in an *earlier* window that the authority cached before that window closed leaves evidence nowhere — closing it needs a third gate state ("reader for structure, appender for my own leaves") |
 
-One item remains — **9**, a writer-side publish concern (durable per-ino layout
-version). Item 7 landed inside S6, where the membership primitive belongs.
-Item 9 does not gate a reader.
+With item 9 landed (2026-08-03, `docs/design-mw-layout-versions.md`) the §6.2
+board is closed — all ten items plus the runtime item, each with its named
+residual. Item 7 landed inside S6, where the membership primitive belongs;
+item 9's named residuals are S9's (shipped-strictness for claim-0 co-writer
+deltas and the versioned publish reply — design note §6).
 
 Two consequences of items 5/6 that later stages must honour: a **reader mount
 never engages minting** (it requires `writer_term() > 0`), so an S5 reader grows

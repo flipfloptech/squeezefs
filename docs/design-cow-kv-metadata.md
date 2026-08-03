@@ -470,8 +470,13 @@ never an intermediate one; `w` = the seam window in
   contradiction — and create is the hottest cross-volume shape now that
   regular-file inodes stripe (`.benchmarks/2026-07-30-meta-plane-writes.md`),
   so wrapping it would tax the hot path for no correctness claim anybody
-  can observe. Owed instead: an fsck class for unreferenced inodes (none of
-  C1–C8 covers one today).
+  can observe. Owed instead: an fsck class for unreferenced inodes — **landed
+  as C9** (`src/fsck.rs`, `tests/fsck_c9_tests.rs`), which also gave the
+  operator the only detector for the pre-S3.5 DUR-7 damage this section's
+  predecessor left in the field: one dentry pass builds the referenced-ino
+  set, the census's inode walk supplies the live set, and the candidate
+  filter is the writer era's ino floor, so a live create (inode record
+  before dentry) can never be a false positive.
 * The **same-volume** rename's remote-inode ctime fragments
   (`touch_ctime_routed`): losing a ctime stamp is cosmetic, and buying it a
   transaction would cost an entry and a barrier per rename.

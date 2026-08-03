@@ -418,12 +418,15 @@ teardown is deferred to the kernel's FORGET (a still-open replaced file
 must survive to its last close, exactly like `unlink`). A daemon exit
 INSIDE that window — between the rename commit and the FORGET —
 leaves the replaced inode's record and its blocks allocated with no name
-pointing at them, and **there is no mount-time reconciliation sweep**:
-`fsck`'s classes cover node integrity, block/refcount cross-checks,
-staged custody, accounting, and the data scrub, but nothing walks the
-inode tree for unreferenced records. The space is not lost data — it is
-leaked capacity, bounded by how many rename-overwrites were in flight at
-the crash.
+pointing at them, and **there is no mount-time reconciliation sweep**.
+`fsck` class [C9](#c9--unreferenced-inodes-also-the-cleanup-path-for-pre-s35-damage)
+now walks the inode tree for unreferenced records — but it claims only
+the `nlink >= 1` shape, and a rename-overwrite orphan is `nlink == 0`
+(the destination was unlinked), which C9 deliberately does not claim
+because that shape is indistinguishable from a legitimately
+unlinked-but-open file without the live open-handle registries. So this
+one stays uncovered: the space is not lost data — it is leaked capacity,
+bounded by how many rename-overwrites were in flight at the crash.
 
 ### Writable shared `mmap` and interception (POSIX-7)
 
@@ -777,7 +780,7 @@ squeezefs volume repair-set <sqmeta-uri>                # reconcile membership s
 ### fsck / scrub
 
 ```bash
-squeezefs fsck <target> [--json] [--throttle N]        # detect: 7 classes, verified findings only, exit != 0 on findings
+squeezefs fsck <target> [--json] [--throttle N]        # detect: 9 classes, verified findings only, exit != 0 on findings
 squeezefs fsck <target> --scrub                        # add the C7 data scrub (AEAD/frame/readability per stored form)
 squeezefs fsck <sqmeta-uri> --shards k/N ...           # offline zero-coordination sharding; union with `fsck merge-reports`
 squeezefs fsck <target> --repair                       # plan per-class repairs (DRY RUN)
@@ -785,6 +788,63 @@ squeezefs fsck <target> --repair --apply               # execute: quarantine-fir
 ```
 
 Online fsck runs against the live daemon with **zero false positives by design** (every suspect is verified before it is reported — concurrent writes, drains, and parked work are exempted through the live registries, never guessed at). Repair is dry-run by default, quarantines before every discard (per-run quarantine dir + JSON manifest), and is honest where no redundancy exists: torn nodes and scrub-failed blocks are quarantined and reported, never fabricated. On plain (uncompressed, unencrypted) data the scrub can only verify readability — the report says so (`scrub_readability_only`).
+
+#### C9 — unreferenced inodes (also the cleanup path for pre-S3.5 damage)
+
+**Detects** an inode record that exists in the metadata tree and that
+**no directory entry names**. Nothing else finds one: the kernel never
+learned the inode exists, so it never sends a FORGET and the ordinary
+orphan reclaim (which only admits already-unlinked inodes) will never see
+it; the block classes ask "is this BLOCK referenced by nobody", and an
+unreferenced inode's layout still names its blocks, so they stay
+correctly silent. Three shapes reach it:
+
+- a cross-volume `create` interrupted between its two commits — one
+  inode, no name, no data (a bounded metadata leak for an operation the
+  caller was never told succeeded);
+- **damage that predates the cross-volume transaction machinery** (DLM
+  S3.5): a filesystem that ran the older code and crashed during a
+  cross-volume `link`/`unlink` carries the same shape **plus every block
+  that inode owned**, invisible and unreclaimable. S3.5 prevents new
+  occurrences and does nothing about existing ones — **this class is the
+  only way to learn whether a volume carries such damage, and its repair
+  is the only cleanup path.** Run it once after upgrading a filesystem
+  that has been through a crash;
+- a dead writer's in-flight create, or a recovered cross-volume plan
+  whose inode landed while its directory-entry volume was fenced.
+
+**Repairs** by destroying the inode and reclaiming its blocks: the inode
+record and **every** one of its xattr records (including `layout`, the
+only map to its blocks) are copied into the per-run quarantine with the
+block keys enumerated in the manifest; the blocks are then freed through
+the ordinary terminal-free path (durable references released, discards
+queued on the background reclaimer, tiers purged); finally the record and
+its xattrs are destroyed in one transaction. Block **contents** are not
+copied — an inode's data is unbounded, so the manifest states what was
+reclaimed rather than pretending to keep it. Dry run (`--repair` without
+`--apply`) reports the inode, its size and its block count first, which
+is the moment to decide. An interrupted repair converges: the next run
+re-detects the same inode and both remaining steps are idempotent.
+
+Two properties worth knowing:
+
+- **Residue created by the CURRENT mount is reported by the NEXT one.**
+  A live `create` legitimately holds an inode record before its directory
+  entry, so the only false-positive-free candidate filter is "minted
+  under an earlier writer term" — which is exactly what crash residue is.
+  This costs no coverage (the damage is by definition from a prior mount)
+  and it is why `fsck_findings` stays 0 on a busy healthy filesystem.
+- **The `nlink == 0` unreferenced shape is deliberately NOT claimed.**
+  That is the POSIX unlinked-but-open state (and the rename-overwrite
+  crash orphan below): telling it apart from a corpse nobody will ever
+  FORGET needs the live open-handle registries, so claiming it could
+  destroy an open file's data. It remains an accounting leak, not lost
+  data.
+
+Gauges: `fsck_dentry_refs_indexed` (the single dentry pass that answers
+"which inodes are named" — C9 never runs the per-inode reverse scan),
+`fsck_current_era_exempted` (unnamed inodes this mount minted, i.e. the
+in-flight creates the writer-term filter protected), `fsck_repair_classC9`.
 
 ### Defragmentation
 

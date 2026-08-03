@@ -484,21 +484,25 @@ enum Commands {
 
         // Anchors: docs/pre-rc-engineering-spec.md §6.8 (the S5
         // increment), docs/operations.md §Read-only coherent mounts.
-        /// Mount read-only — a coherent READER (DLM stage S5)
+        // (Operator help below stays in the user register — the
+        // cli_help_hygiene suite refuses shouts and repo paths here.)
+        /// Mount read-only — a coherent reader
         ///
-        /// Equivalent to `-o ro`. A reader takes no write lease, no
-        /// `writer_claim` and no NVMe reservation, so it neither weakens
-        /// nor blocks the single-writer guard: one writer plus N readers
-        /// of the same volume set is the supported shape, and a second
-        /// WRITER is still refused. Every plane refuses mutations
-        /// (metadata, block allocation, frees, device reclaim, in-place
-        /// patch/overwrite) and the kernel mounts the filesystem
-        /// `MS_RDONLY`.
+        /// Equivalent to `-o ro`. A reader takes no write lease, writes
+        /// no claim and holds no NVMe reservation, so it neither weakens
+        /// nor blocks the single-writer guard: one writer plus any number
+        /// of readers of the same volume set is the supported shape, and
+        /// a second writer is still refused. Every plane refuses
+        /// mutations (metadata, block allocation, frees, device reclaim,
+        /// in-place patch/overwrite) and the kernel mounts the
+        /// filesystem read-only.
         ///
-        /// Consistency: a reader revalidates against the writer's A/B
-        /// root ledger on the checkpoint cadence and its kernel/dentry
-        /// TTLs derive from that cadence — see docs/operations.md for the
-        /// guarantee class and the exact staleness bound.
+        /// Consistency: a reader follows the writer's checkpoints on a
+        /// derived cadence, and its kernel cache lifetimes derive from
+        /// the same cadence. The operations guide documents the
+        /// guarantee class and the exact staleness bound, which is also
+        /// published live as `reader_staleness_bound_ms` on the mount's
+        /// `.stats` file.
         #[arg(long)]
         read_only: bool,
 

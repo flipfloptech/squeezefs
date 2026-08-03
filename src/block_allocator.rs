@@ -1342,6 +1342,10 @@ impl BlockAllocator {
     /// the next candidate.
     pub fn allocate_block_below(&self, below_idx: u64) -> Option<u64> {
         Self::reader_gate("block allocation (contiguity pick)").ok()?;
+        // Spec §6.8 item 3: acknowledged offsets re-enter the free list
+        // before the pick reads it, so a mover never defers for space that
+        // is actually available (one relaxed load when nothing is held).
+        self.harvest_grace();
         let mut cands: Vec<u64> = self
             .free_blocks
             .iter()
@@ -1365,6 +1369,8 @@ impl BlockAllocator {
     /// discipline; `StorageFull` propagates from the fresh-mint path.
     pub fn allocate_block_at_or_above(&self, min_idx: u64) -> Result<u64> {
         Self::reader_gate("block allocation (ascending pick)")?;
+        // Spec §6.8 item 3, as in the contiguity pick above.
+        self.harvest_grace();
         let mut cands: Vec<u64> = self
             .free_blocks
             .iter()

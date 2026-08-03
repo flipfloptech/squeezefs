@@ -1207,11 +1207,22 @@ fn evaluate_allocator_classes(
                 .into_iter()
                 .filter(|off| !tracked.contains_key(off))
                 .count() as u64;
+            // Spec §6.8 item 3: offsets held in the freed-offset grace
+            // period are untracked AND deliberately not free-listed — their
+            // free completed, only the free-list publish waits on the
+            // readers' acknowledgements. They are "used" to the arithmetic
+            // and tracked by nothing, exactly like the begin_free→reclaim
+            // limbo the in-flight term above exempts, so they get the same
+            // exemption. Without it every reader-armed mount reports C6
+            // drift for as long as it is churning, and `fsck_findings` must
+            // stay 0 on a healthy volume.
+            let graced = v.alloc.grace_len() as u64;
             let used = v
                 .alloc
                 .highest_block_index()
                 .saturating_sub(v.alloc.free_blocks_count())
-                .saturating_sub(inflight);
+                .saturating_sub(inflight)
+                .saturating_sub(graced);
             let tracked_count = tracked.len() as u64;
             if used != tracked_count {
                 suspects.push(Suspect {

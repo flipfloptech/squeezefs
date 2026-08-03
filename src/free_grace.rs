@@ -39,7 +39,7 @@
 //! | the gate | [`GraceRing`], one per [`crate::block_allocator::BlockAllocator`]: a terminally-freed offset enters the ring INSTEAD of the free list, and only a satisfied bound (or a fence) publishes it |
 //! | the enforcement point | `BlockAllocator::finish_free` (the ONE free-list publish) and the allocation funnel's harvest — structural, never asserted after the allocator has answered |
 //! | the reader's side | [`ReaderAckLadder`], driven by the S5 revalidation task ([`crate::ro_coherence::spawn_reader_revalidation`]) |
-//! | "fenced, not waited on" | [`MembershipOwner::evict`](crate::membership::MembershipOwner::evict) via [`force_progress`] |
+//! | "fenced, not waited on" | [`MembershipOwner::evict`](crate::membership::MembershipOwner::evict) via `force_progress` |
 //!
 //! # Epoch identity: an owner-minted causal label
 //!
@@ -111,7 +111,7 @@
 //! # Cost when unarmed (the shipped default)
 //!
 //! `SQUEEZEFS_MEMBERSHIP_BIND=off` is the default, so the common mount must
-//! pay nothing: every entry point is one relaxed load of [`ARMED`] feeding
+//! pay nothing: every entry point is one relaxed load of the armed word feeding
 //! a never-taken branch, and no ring memory is ever touched
 //! (`tests/reader_free_grace_tests.rs` contract 1 pins the behaviour, and
 //! `benches/write_path_bench.rs`'s `free_grace` group prices the load).
@@ -312,7 +312,7 @@ pub const HARVEST_BATCH: usize = 64;
 /// The ring cap in entries, from an R5 budget — the pure form (tie-tested).
 ///
 /// `budget/1024 / GRACE_ENTRY_BYTES` keeps the ring below 0.1 % of the
-/// memory budget, floored at [`RING_CAP_FLOOR`]. Deliberately NOT an R5
+/// memory budget, floored at `RING_CAP_FLOOR`. Deliberately NOT an R5
 /// component: R5 components must be able to SHED, and the only shed
 /// available here would be releasing unacknowledged offsets — the one thing
 /// this mechanism exists to forbid. It is bounded instead, and the bound is
@@ -640,8 +640,16 @@ fn force_progress(oldest: u64, why: &str) {
 
 /// Count an allocation that refused `StorageFull` while the ring still held
 /// offsets — the pressure ruling's instrument (never a silent stall).
+///
+/// The COUNTER is the authority and is unconditional; the log line is
+/// rate-limited to the first stall and every 1,024th after it, because a
+/// genuinely full store retries at write-path frequency and a per-refusal
+/// error line would bury the one that explains the condition.
 pub fn note_alloc_stall(held: usize, held_bytes: u64) {
-    ALLOC_STALLS.fetch_add(1, Ordering::Relaxed);
+    let n = ALLOC_STALLS.fetch_add(1, Ordering::Relaxed);
+    if n % 1024 != 0 {
+        return;
+    }
     log::error!(
         "allocation refused StorageFull with {held} offset(s) ({held_bytes} B) held in the \
          freed-offset grace period: the readers have not acknowledged past label {:?} and the \

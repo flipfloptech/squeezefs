@@ -1043,8 +1043,12 @@ impl MembershipOwner {
         // must drop to 0 BEFORE it can serve a byte — publishing at the
         // join (not at the next sweep) is what closes the window in which a
         // brand-new reader's first cached bindings could be reallocated
-        // under it.
-        self.refresh_free_grace_bound();
+        // under it. Published DIRECTLY rather than through
+        // `refresh_free_grace_bound`: the minimum over a set containing a
+        // member that has acknowledged nothing is 0 by construction, so the
+        // O(members) scan would be paid at every join of a 15 k-mount storm
+        // to compute a constant.
+        crate::free_grace::publish_bound(0, self.members.len());
         if reclaim {
             METRICS
                 .membership_grace_reclaims

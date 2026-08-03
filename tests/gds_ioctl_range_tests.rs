@@ -298,3 +298,72 @@ async fn gds_ioctl_arm_is_absent_from_the_default_build() {
         "the GDS ioctl must answer ENOTTY in a build without the feature"
     );
 }
+
+// ---------------------------------------------------------------------------
+// VAL-7f: the caller-memory read itself
+// ---------------------------------------------------------------------------
+
+/// VAL-7f (pre-RC spec §3): the arm read `/proc/<req.pid>/mem` with **no
+/// pid-liveness check and no PID-namespace translation**. `req.pid` is the
+/// pid as numbered in the CALLER's pid namespace: on a containerized
+/// client it names a different process here (or none), and between the
+/// FUSE request and the open the caller can exit and its pid be reused —
+/// the daemon then reads an unrelated process's address space and DMAs
+/// from it. Every leg of the replacement is pinned here.
+#[test]
+fn caller_memory_read_is_liveness_and_namespace_checked() {
+    use squeezefs::fuse_client::read_caller_struct;
+
+    // Self-read: the honest case works, byte-exact.
+    let probe: [u8; 24] = [0xa5; 24];
+    let addr = probe.as_ptr() as u64;
+    let got = read_caller_struct(std::process::id(), addr, 24)
+        .expect("reading our own address space must work");
+    assert_eq!(got, probe.to_vec(), "the read must be byte-exact");
+
+    // A pid that does not exist refuses ESRCH — never EFAULT-after-open
+    // of some other process's `mem`, and never a partial read.
+    let dead = 0x7FFF_FFFEu32; // above every plausible pid_max
+    let e = read_caller_struct(dead, addr, 24)
+        .expect_err("a nonexistent pid must refuse before any read");
+    assert_eq!(
+        e,
+        libc::ESRCH,
+        "a dead/absent caller must be ESRCH (liveness is checked FIRST)"
+    );
+
+    // pid 0 is never a caller.
+    assert_eq!(
+        read_caller_struct(0, addr, 24).expect_err("pid 0 is not a process"),
+        libc::ESRCH
+    );
+
+    // A zero-length read is refused rather than silently succeeding with
+    // an empty struct.
+    assert_eq!(
+        read_caller_struct(std::process::id(), addr, 0)
+            .expect_err("a zero-length struct read is a caller bug"),
+        libc::EINVAL
+    );
+
+    // An unmapped address fails EFAULT (not a panic, not a short read).
+    let e = read_caller_struct(std::process::id(), 0x10, 24)
+        .expect_err("an unmapped address must fail");
+    assert_eq!(e, libc::EFAULT, "an unreadable range must be EFAULT");
+}
+
+/// VAL-7f, the namespace half: the daemon's own pid namespace is the only
+/// one `/proc/<pid>` numbers are meaningful in. Self is always same-ns; a
+/// pid that cannot be resolved is never treated as same-ns.
+#[test]
+fn caller_pid_namespace_is_verified() {
+    use squeezefs::fuse_client::caller_in_our_pid_namespace;
+    assert!(
+        caller_in_our_pid_namespace(std::process::id()),
+        "our own pid must resolve in our own pid namespace"
+    );
+    assert!(
+        !caller_in_our_pid_namespace(0x7FFF_FFFE),
+        "an unresolvable pid must never pass the namespace check"
+    );
+}

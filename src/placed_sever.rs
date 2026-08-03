@@ -287,6 +287,40 @@ mod tests {
         drop(pc);
     }
 
+    /// MEM-7a: the page-alignment / in-bounds precondition is the ONLY
+    /// release-build bound on `write_at`'s copy, and it lived in a
+    /// `debug_assert!` plus a screen in the single caller — nothing at all
+    /// in a shipped binary, and nothing for a second caller.
+    #[test]
+    fn a_misaligned_or_out_of_bounds_sever_is_refused_in_every_build() {
+        let reg = Arc::new(PlacedSeverRegistry::new());
+        let src = vec![0xEEu8; 8192];
+        const BS: usize = 64 * 1024;
+        // SAFETY (all four): `src` is a live slice for each call's duration.
+        unsafe {
+            assert!(
+                reg.sever(7, 0, 1, 4096, BS, src.as_ptr()).is_none(),
+                "a `rel` that is not CLAIM_PAGE-aligned must be refused — the \
+                 claim bitmap indexes by page, so the copy is otherwise \
+                 unbounded by anything"
+            );
+            assert!(
+                reg.sever(7, 0, 0, 4095, BS, src.as_ptr()).is_none(),
+                "a non-page-multiple `len` must be refused"
+            );
+            assert!(
+                reg.sever(7, 0, BS - 4096, 8192, BS, src.as_ptr()).is_none(),
+                "`rel + len > block_size` must be refused — the assembly is \
+                 exactly one block"
+            );
+            // The screen is a BOUND, not a ban: the well-formed shape works.
+            let ok = reg
+                .sever(7, 0, 0, 8192, BS, src.as_ptr())
+                .expect("an aligned, in-bounds sever still succeeds");
+            assert_eq!(&ok[..], &src[..]);
+        }
+    }
+
     #[test]
     fn adoption_takes_the_backing_and_seals_new_claims_out() {
         let reg = Arc::new(PlacedSeverRegistry::new());

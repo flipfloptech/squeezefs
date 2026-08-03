@@ -2258,4 +2258,225 @@ mod tests {
         assert_eq!(charge.load(Ordering::Acquire), 0, "no spurious credit");
         assert_eq!(baseline(), global0);
     }
+
+    // -----------------------------------------------------------------
+    // The revalidation path's share of the same laws (spec §6.8 item 2).
+    //
+    // A drop pass is a MASS credit — the one shape most likely to lose or
+    // duplicate one — so the charge conservation above is re-asserted
+    // across it, and the lazy hit-path gate (which the eager sweep must
+    // agree with by construction) is pinned where it can be driven
+    // directly.
+    // -----------------------------------------------------------------
+
+    /// Build `n` empty single-page node images in a scratch file and load
+    /// them: the cheapest real cache population (no tree, no allocator).
+    async fn populated_cache(n: u64) -> (tempfile::NamedTempFile, Arc<NodeCache>, Vec<u64>) {
+        use super::super::node::{write_node, NodeWriteParams, MIN_NODE_SIZE};
+        let file = tempfile::NamedTempFile::new().expect("temp volume");
+        let node_size = MIN_NODE_SIZE;
+        file.as_file()
+            .set_len((n + 2) * node_size as u64)
+            .expect("size volume");
+        let cache = NodeCache::new(NodeCacheConfig {
+            path: file.path().to_path_buf(),
+            layout: NodeLayout::new(node_size).expect("layout"),
+            heap_base: 0,
+            budget_bytes: (n + 2) * node_size as u64,
+            writeback_delta_bytes: DEFAULT_WRITEBACK_DELTA_BYTES,
+        });
+        let mut addrs = Vec::new();
+        for e in 0..n {
+            let addr = cache.extent_addr(e);
+            write_node(
+                cache.config().path.clone(),
+                &cache.config().layout,
+                &NodeWriteParams {
+                    node_addr: addr,
+                    node_seq: e + 1,
+                    tree_id: super::super::record::TREE_INODES,
+                    level: 0,
+                    min_key: b"",
+                    max_key: &[0xff; 8],
+                },
+                &[],
+                0,
+            )
+            .await
+            .expect("write node image");
+            cache.load(addr).await.expect("load").expect("mapped");
+            addrs.push(addr);
+        }
+        (file, cache, addrs)
+    }
+
+    #[tokio::test]
+    async fn a_node_dropped_on_revalidation_credits_its_extent_exactly_once() {
+        let (_f, cache, addrs) = populated_cache(4).await;
+        let node_size = cache.config().layout.node_size() as u64;
+        assert_eq!(cache.cached_bytes(), 4 * node_size);
+        cache
+            .arm_revalidation(&RootEpoch::synthetic(1, 0, &[]), None)
+            .expect("arm");
+
+        let out = cache.revalidate(&RootEpoch::synthetic(2, 0, &[]));
+        assert_eq!(out.dropped, 4);
+        assert_eq!(out.bytes_credited, 4 * node_size);
+        assert_eq!(
+            cache.cached_bytes(),
+            0,
+            "a lost credit reads as 'fuller than it is' and evicts forever; \
+             an over-credit WRAPS the u64 and reads as 'full forever'"
+        );
+        // A second pass over an empty map credits nothing (the wrap guard).
+        let again = cache.revalidate(&RootEpoch::synthetic(3, 0, &[]));
+        assert_eq!(again.dropped, 0);
+        assert_eq!(again.bytes_credited, 0);
+        assert_eq!(cache.cached_bytes(), 0);
+        for a in &addrs {
+            assert!(!cache.contains(*a));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_snapshot_memo_leaves_the_global_gauge_at_its_baseline() {
+        let _serialized = global_gauge_guard();
+        let global0 = baseline();
+        let (_f, cache, addrs) = populated_cache(2).await;
+        // Populate a memo cell on each node's live snapshot, then let the
+        // drop pass take the snapshot with it.
+        for a in &addrs {
+            let node = cache.try_get(*a).expect("mapped");
+            node.snapshot().memo.populate(
+                Bytes::from_static(b"memo-key"),
+                LiveLookup::Live(Bytes::from_static(b"0123456789")),
+                1,
+            );
+        }
+        assert!(
+            baseline() > global0,
+            "fixture: the memos charged the global gauge"
+        );
+        cache
+            .arm_revalidation(&RootEpoch::synthetic(1, 0, &[]), None)
+            .expect("arm");
+        assert_eq!(cache.revalidate(&RootEpoch::synthetic(2, 0, &[])).dropped, 2);
+        assert_eq!(
+            baseline(),
+            global0,
+            "the memo charge is Drop-owned: it leaves with the snapshot the \
+             drop pass released"
+        );
+        assert_eq!(cache.cached_bytes(), 0, "and so does the extent charge");
+    }
+
+    #[tokio::test]
+    async fn racing_revalidations_credit_each_mapping_exactly_once() {
+        let (_f, cache, _addrs) = populated_cache(8).await;
+        let node_size = cache.config().layout.node_size() as u64;
+        cache
+            .arm_revalidation(&RootEpoch::synthetic(1, 0, &[]), None)
+            .expect("arm");
+        // Two threads sweep the SAME advance; scc's removal arbitration
+        // must make the credit exactly-once, or the gauge wraps.
+        let a = Arc::clone(&cache);
+        let b = Arc::clone(&cache);
+        let ta = std::thread::spawn(move || a.revalidate(&RootEpoch::synthetic(2, 0, &[])).dropped);
+        let tb = std::thread::spawn(move || b.revalidate(&RootEpoch::synthetic(2, 0, &[])).dropped);
+        let dropped = ta.join().expect("no panic") + tb.join().expect("no panic");
+        assert_eq!(dropped, 8, "each mapping is dropped by exactly one sweeper");
+        assert_eq!(cache.cached_bytes(), 0);
+        assert!(
+            cache.cached_bytes() < node_size,
+            "and the gauge never wrapped through zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_stamped_node_is_never_served_by_the_hit_path() {
+        let (_f, cache, addrs) = populated_cache(1).await;
+        cache
+            .arm_revalidation(&RootEpoch::synthetic(1, 0, &[]), None)
+            .expect("arm");
+        let node = cache.try_get(addrs[0]).expect("armed at the load epoch");
+        // Re-publish the SAME object stamped in the previous epoch — what a
+        // loader that snapshotted before the advance produces.
+        cache.publish_stamped(node.clone(), 0);
+        assert!(
+            cache.try_get(addrs[0]).is_none(),
+            "the lazy gate refuses a stale-stamped node even before the sweep \
+             reaches it — the eager pass and the gate agree by construction"
+        );
+        // And the sweep then removes exactly that mapping, once.
+        let out = cache.revalidate(&RootEpoch::synthetic(2, 0, &[]));
+        assert_eq!(out.dropped, 1);
+        assert_eq!(cache.cached_bytes(), 0);
+    }
+
+    #[test]
+    fn the_epoch_publication_order_is_tail_then_epoch() {
+        // The §6.8 item-2 two-word law (epoch_core): a loader that
+        // observes epoch E must observe a tail at least as new as E's, so
+        // it can never stamp a node "current as of E" after classifying
+        // its torn tail against an OLDER tail (which silently drops
+        // records E covers).
+        let env = NodeEnv::new(10);
+        assert_eq!(env.epoch.probe(), 0, "unarmed");
+        assert!(env.epoch.arm(4));
+        assert!(!env.epoch.arm(5), "arming is once");
+        let moved = env.epoch.publish(40, 7).expect("advance");
+        assert_eq!(moved, (4, 7));
+        let snap = env.epoch.load_snapshot();
+        assert_eq!((snap.epoch, snap.tail), (7, 40));
+        assert!(
+            env.epoch.publish(30, 7).is_none(),
+            "a repeat epoch never advances"
+        );
+        assert_eq!(env.epoch.tail(), 40, "and the tail is monotone");
+    }
+
+    #[tokio::test]
+    async fn a_reader_retries_a_load_that_raced_the_writers_append() {
+        // A reader's 256 KiB extent read can catch a writer's single
+        // `write_at` mid-flight: a torn frame followed by a complete one is
+        // §4.5's loud corruption verdict on a crashed writer and a plain
+        // read/append race here. Bounded re-reads turn the race into a
+        // retry; a verdict that survives them is evidence.
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let out: Result<u32, KvError> = retry_racing_reader_load(true, 0x1000, || {
+            let n = attempts.fetch_add(1, Ordering::AcqRel);
+            async move {
+                if n == 0 {
+                    Err(KvError::CheckpointCoveredBsetAfterTear {
+                        node_addr: 0x1000,
+                        bset_offset: 4096,
+                        horizon: 1,
+                        durable_tail: 2,
+                    })
+                } else {
+                    Ok(42u32)
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.expect("the retry succeeded"), 42);
+        assert_eq!(attempts.load(Ordering::Acquire), 2, "exactly one retry");
+
+        // A writer never retries — for it the verdict IS the contract.
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let err: Result<u32, KvError> = retry_racing_reader_load(false, 0x1000, || {
+            calls.fetch_add(1, Ordering::AcqRel);
+            async move {
+                Err(KvError::CheckpointCoveredBsetAfterTear {
+                    node_addr: 0x1000,
+                    bset_offset: 4096,
+                    horizon: 1,
+                    durable_tail: 2,
+                })
+            }
+        })
+        .await;
+        assert!(err.is_err());
+        assert_eq!(calls.load(Ordering::Acquire), 1, "no writer-side retry");
+    }
 }

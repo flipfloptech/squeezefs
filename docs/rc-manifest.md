@@ -183,7 +183,7 @@ Populated as campaigns close. Current: `.benchmarks/2026-08-02-fuse1-init-ext.md
 
 | Flake | Rate | Shape | Owner |
 |---|---|---|---|
-| `multi_queue_tests::storm::…_no_starvation` | 2/5 on untouched tip, 5/6 under load | spec TEST-7 #1 | Expected to ride the FUSE-2 redesign (same code) |
+| `multi_queue_tests::storm::…_no_starvation` | was 2/5 on untouched tip, 5/6 under load | spec TEST-7 #1 — **TEST BUG, not a product bug**: it asserted `transport_parked_commits == 0`, but a parked commit is the §5.4 payload-lease re-arm gate WORKING (the COMMIT arrived while the request's lease still held a reference); engagement is a benign race the FUSE-2 reply-path work made MORE likely (cheaper reply ⇒ COMMITs win it) | **FIXED** 2026-08-04 (pre-RC loose ends): the assertion is now the park LEDGER's closure — `transport_parked_commits ≡ transport_unparked_commits` (new counter, stats inode), which stays red under a genuinely wedged gate and is immune to the race. Evidence: ×10 quiet-box green (engagement 0) + ×4 under 24-way CPU load green with engagement 23/25/32/35 parks, all closed — every one of those four would have FAILED the old assertion |
 | `volume_drain_tests::test_offline_remove_data_drains_to_retired` | was 6/10 | **FIXED** 2026-08-02 (claim-release law); ×10 acceptance owed on the merged binary | — |
 | `test_sqpoll_one_shared_poller_across_queue_rings` | 2/15 on clean base AND on branch (identical) | `/proc/self/task` comm scan racing async `iou-sqp` thread-spawn visibility; spikes under CPU load | Found by PERF-A 2026-08-02; assigned to the FUSE-2 agent (wait-for-count with deadline) |
 

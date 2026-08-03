@@ -3423,6 +3423,14 @@ mod models {
                     v
                 })
             };
+            // A SECOND minter on the SAME cursor: one appender mints from
+            // many tasks concurrently (every FUSE create path does), so the
+            // read-modify-write must be atomic — weakening `mint` to
+            // load-then-store fails exactly here.
+            let w0b = {
+                let a = a.clone();
+                thread::spawn(move || a.mint())
+            };
             let w1 = {
                 let b = b.clone();
                 thread::spawn(move || b.mint())
@@ -3440,13 +3448,21 @@ mod models {
             }
 
             let v0 = w0.join().unwrap();
+            let v0b = w0b.join().unwrap();
             let v1 = w1.join().unwrap();
             assert_ne!(
-                v0, v1,
-                "two appenders minted the SAME value — duplicate inos alias files \
-                 (item 5) and repeated lifetimes make a stale key match (item 6)"
+                v0, v0b,
+                "two tasks of ONE appender minted the same value — the lane cursor's \
+                 read-modify-write must be atomic"
             );
-            assert_eq!(lane_core::lane_of(v0, BASE, WRITERS), 0, "value left lane 0");
+            for v in [v0, v0b] {
+                assert_ne!(
+                    v, v1,
+                    "two appenders minted the SAME value — duplicate inos alias files \
+                     (item 5) and repeated lifetimes make a stale key match (item 6)"
+                );
+                assert_eq!(lane_core::lane_of(v, BASE, WRITERS), 0, "value left lane 0");
+            }
             assert_eq!(lane_core::lane_of(v1, BASE, WRITERS), 1, "value left lane 1");
         });
     }

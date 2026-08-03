@@ -203,6 +203,32 @@ unscoped) and requires the Phase-8 window for all four unstamped bits.
 
 ---
 
+## 3b2. Multi-writer §6.2 item board — 8 of 10, plus the runtime item
+
+Spec §6.2 ranks ten durable single-writer assumptions, plus one runtime item it
+calls "arguably harder than any of the ten". Status after the 2026-08-03/05
+wave (this board exists because the work is partitioned across agents, and an
+item nobody claims is indistinguishable from an item nobody needs):
+
+| # | Assumption | Status | Landed as |
+|---|---|---|---|
+| 1 | Block refcounts/free list have no on-disk representation | **LANDED** | Per-reference backpointer records (`TREE_BLOCK_REFS`), bit 9. Chosen over a count (RMW race — two inodes cloning one block share no lock) and over a delta (cannot express the first reference); fsck class **C8** ungated as a must-stay-0 tripwire |
+| 2 | One journal ring head per volume | **LANDED** | Per-appender sub-rings, appender id in two of the four zero pad bytes §4.1 already reserved (inside the existing checksum), bit 8 |
+| 3 | One A/B extent bitmap + one `advance_durable` tail | **LANDED** | Page-partitioned interleaved bitmap with per-partition durable clocks, bit 8 |
+| 4 | One A/B root ledger, `slot = seq % 32` | **LANDED** | Per-writer slot ranges (≥ 2 slots each ⇒ appenders cap at 16), bit 8 |
+| 5 | `next_ino` is a per-mount atomic over a shared namespace | in flight | Per-writer cursor ranges on the VL5b `slot_cursors` precedent |
+| 6 | Block keys are bare reusable device offsets | in flight | `offset ‖ incarnation` — makes a stale process-local binding structurally detectable |
+| 7 | `writer_claim` is singular (expresses exclusion, not membership) | **OPEN** | Claim-set record + NVMe registrants. Pairs with S6 (membership) and must not collide with S7's WERO work on `reservation.rs` |
+| 8 | `active_block:`/`active_block_ext:`/`mapping:` keys have no writer scope | **LANDED** | Trailing `:w_{16 hex}` component *after* every identity component, so historical scan prefixes keep their exact meaning — a foreign record must be SEEN to be classified. Keys carry identity, values carry currency (the fencing token stays in the value) |
+| 9 | Layout-delta chains name their base with a process-local token | **OPEN** | Durable per-ino layout version. Touches the `routing.rs` publish path, so it waits for item 5/6 to land |
+| 10 | Staging generation is the volume-set uuids only | **LANDED** | `{set}@node:{16 hex}` from a host-stable identity (machine-id, app-specific-hashed so the raw id never lands on disk). The D0 claim id was rejected: a successor mount would classify its own predecessor's crash residue as foreign, inverting staged-crash recovery into data loss |
+| — | KV node cache is load-once RAM-authoritative | **LANDED** | *Partitioning, not cache coherence*: `apply_locked` is the one choke point, non-authority structural mutation refuses loud, and a peer's append into a cached tail is detected at `append_frozen` rather than silently overwriting acked records. Named residual: a leaf a peer wrote in an *earlier* window that the authority cached before that window closed leaves evidence nowhere — closing it needs a third gate state ("reader for structure, appender for my own leaves") |
+
+Two items remain (**7** and **9**), and neither gates a reader: item 7 is the
+membership primitive S6 needs, item 9 is a writer-side publish concern.
+
+---
+
 ## 3c. Known-red at dev during the DLM push (D11 bookkeeping)
 
 Ruling D11 parks suite runs until N readers + N writers work, so failures found

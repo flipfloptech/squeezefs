@@ -609,9 +609,13 @@ now walks the inode tree for unreferenced records — but it claims only
 the `nlink >= 1` shape, and a rename-overwrite orphan is `nlink == 0`
 (the destination was unlinked), which C9 deliberately does not claim
 because that shape is indistinguishable from a legitimately
-unlinked-but-open file without the live open-handle registries. So this
-one stays uncovered: the space is not lost data — it is leaked capacity,
-bounded by how many rename-overwrites were in flight at the crash.
+unlinked-but-open file without the live open-handle registries. Class
+[C10](#c10--inode-plane-reference-consistency-which-direction-means-stop-and-read)
+claims the other half of `nlink == 0` — the half **with** a name still
+pointing at it, which no legitimate state produces — and stops at the same
+line, for the same reason. So this one stays uncovered: the space is not
+lost data — it is leaked capacity, bounded by how many rename-overwrites
+were in flight at the crash.
 
 ### Writable shared `mmap` and interception (POSIX-7)
 
@@ -965,7 +969,7 @@ squeezefs volume repair-set <sqmeta-uri>                # reconcile membership s
 ### fsck / scrub
 
 ```bash
-squeezefs fsck <target> [--json] [--throttle N]        # detect: 9 classes, verified findings only, exit != 0 on findings
+squeezefs fsck <target> [--json] [--throttle N]        # detect: 10 classes, verified findings only, exit != 0 on findings
 squeezefs fsck <target> --scrub                        # add the C7 data scrub (AEAD/frame/readability per stored form)
 squeezefs fsck <sqmeta-uri> --shards k/N ...           # offline zero-coordination sharding; union with `fsck merge-reports`
 squeezefs fsck <target> --repair                       # plan per-class repairs (DRY RUN)
@@ -1032,6 +1036,76 @@ Gauges: `fsck_dentry_refs_indexed` (the single dentry pass that answers
 "which inodes are named" — C9 never runs the per-inode reverse scan),
 `fsck_current_era_exempted` (unnamed inodes this mount minted, i.e. the
 in-flight creates the writer-term filter protected), `fsck_repair_classC9`.
+
+#### C10 — inode-plane reference consistency (which direction means stop-and-read)
+
+C9 asks whether an inode is named at all. C10 asks whether its **link
+count matches the names**, and whether every name **resolves**. Both
+questions come from the same single dentry pass, and the two directions are
+not equally serious:
+
+| Finding | What it means | Urgency |
+|---|---|---|
+| `nlink` **exceeds** the names | The inode and every block it owns can never be reclaimed. Leaked capacity that reads as healthy. | Repair at convenience. |
+| `nlink` is **below** the names | The count no longer covers a live path. Once ordinary `rm`s drive it to 0, **the filesystem is entitled to destroy an inode a path still resolves.** | **Stop and read.** |
+| `nlink 0` with a live name | The same thing, already at 0. Nothing legitimate has this shape. | **Stop and read.** |
+| A **dangling** name | The name resolves to nothing: `ls` shows it, every `stat` of it fails. | **Stop and read** (then remove it). |
+
+The first row is a leak; the other three are the loss direction — an
+`rm` of an unrelated name can turn one of them into missing data, so
+repair those before resuming write traffic on the affected paths. The
+shapes come from the same place C9's do: a cross-volume `link` or `unlink`
+that committed one of its two steps and not the other (pre-S3.5 damage, or
+a plan whose participant volume was fenced). The `nlink`-below and dangling
+shapes were **removable but undetectable** before this class existed.
+
+**Repairs**, per direction, and deliberately asymmetric:
+
+- **Raising** a count to the names that exist is safe (an over-count only
+  delays reclaim) and is what both `nlink`-below and `nlink 0` get. Names
+  are never dropped to match a low count — that would be the data loss the
+  finding warns about.
+- **Lowering** a count is the one C10 action that could make a named inode
+  reclaimable if the count of names were wrong, so it runs only when a
+  third independent dentry pass agrees with the two the detection used, the
+  record has not changed, and no cross-volume plan is open.
+- A **dangling name can only be removed** (there is nothing to re-point it
+  at). The dentry record's key AND value are quarantined first, so the name
+  can be reconstructed exactly.
+- **Refusals are loud and expected**: a directory (its `nlink` counts `.`
+  and every child's `..`, which are synthesized — this class does not
+  compute that number, so it reports and never guesses), a name whose child
+  inode came back, a count that healed since the scan, a direction that
+  reversed, and any inode an open cross-volume plan names.
+
+Three properties worth knowing:
+
+- **Directories are not counted.** A directory's `nlink` is
+  `2 + subdirectories`; comparing it to "names in the metadata tree" would
+  fire on every directory in the filesystem. A directory that is genuinely
+  named twice is therefore also not claimed — stated rather than hidden.
+- **`nlink == 0` WITHOUT a name is still not claimed** — that is POSIX
+  unlinked-but-open and the rename-overwrite orphan of
+  [POSIX-15](#rename-overwrite-leaves-a-crash-window-orphan-posix-15), the
+  same line [C9](#c9--unreferenced-inodes-also-the-cleanup-path-for-pre-s35-damage)
+  draws. `nlink == 0` **with** a name is unambiguous, which is why C10
+  claims that half.
+- **A continuously rewritten file may be reported by the NEXT run.** The
+  false-positive guard is that the inode's record must not change while the
+  verifying dentry pass runs (every operation that moves a name count also
+  mutates that inode's record), so a file being written throughout the scan
+  keeps clearing. Like C9's writer-era filter, that costs coverage, never
+  safety.
+
+Gauges: `fsck_nlink_mismatch_high` (the leak direction),
+`fsck_nlink_mismatch_low` / `fsck_nlink_zero_named` /
+`fsck_dangling_dentries` (**the loss direction — nonzero here is the
+stop-and-read signal**), `fsck_nlink_names_counted` (the multi-named
+population the counting rides — 0 on a tree with no hardlinks),
+`fsck_nlink_transient_cleared` (suspects the guards cleared: concurrent
+link/unlink/rename traffic and open cross-volume plans — expected to grow
+on a busy mount, and its growth is what shows the guard is live),
+`fsck_repair_classC10`.
 
 ### Defragmentation
 

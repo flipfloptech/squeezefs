@@ -346,6 +346,36 @@ destroyed inode's leftover records.
 
 ---
 
+## 3b4. The D11 milestone: N readers + N writers — implementation COMPLETE (2026-08-03)
+
+The condition ruling D11 named — *"done implementing the DLM and can have N
+Readers and Writers"* — is met in-process at dev 365. The last piece was the
+**co-writer free path**: a rewrite's displaced block now ships as
+`PublishCall::FreeBlocks` (publish schema 3) and the authority runs its own
+full ladder — tier purge, reclaim queue, grace ring, quarantine — so nothing
+was re-implemented. Exactly-once rides S8's `DedupWindow`, genericized rather
+than forked, keyed on the authority-minted lease epoch **never the client's
+self-asserted string** (the storm test caught that first cut), with retries
+never re-keying — which structurally closes the freed-then-reallocated ABA a
+cross-epoch resend would open. A fenced co-writer's in-flight frees refuse by
+era and its displaced blocks are owned by the durable ledger (recovery derives
+them straight back to free — pinned). **W1 stays authority-only, decided**: the
+patch retires a lifetime, the clone/patch fence is a process-local two-word
+SeqCst protocol no wire composes, and a control-RTT inside the one path whose
+win is "one DMA, zero metadata" is self-defeating — a co-writer's small
+overwrite rides CoW-rewrite + shipped free.
+
+What remains and why it does not gate the milestone: S10 (subtree delegation —
+ruling D10's recovery, explicitly non-gating), the Phase-8 stamping window
+(bits 7/8/9/10/11/13/14/15 — ruling D9), real PR hardware for the device-
+enforcement legs, and the §9a.6 residuals (lane-scoped lifetime stamps,
+`declare_inflight`, co-writer error-path undos). The deferred verification
+stack (D11's own list) is now unblocked: the from-zero full suite, loom, the
+bench baseline, the require-mount leg, the three external suites, and the
+scoreboard.
+
+---
+
 ## 3c. Known-red at dev during the DLM push (D11 bookkeeping)
 
 Ruling D11 parks suite runs until N readers + N writers work, so failures found

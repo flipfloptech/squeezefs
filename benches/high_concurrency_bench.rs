@@ -210,6 +210,140 @@ fn bench_cluster_dlm(c: &mut Criterion) {
         b.iter(|| black_box(dlm.get_fencing_token_ino(black_box(800_777_002u64))));
     });
 
+    // S11 rows (feat/mw-range-custody) — byte-range custody. Field shape
+    // (microbench law): acquisition is per open-for-write EPISODE, not per
+    // op (`get_or_acquire_lease` caches in `active_leases` — spec §6.2), so
+    // what these rows price is the arbitration itself at the live-range
+    // POPULATION a hot shared file accumulates: one grant per writing
+    // application/rank (execution-plan ruling D8's MPI-IO shape), which is
+    // tens, not millions. `_pop{N}` = N foreign live ranges already held on
+    // the same file while the measured span is acquired and released.
+    //
+    // The row that matters for regressions is the whole-file
+    // `acquire_release_uncontended_ino` ABOVE (every production verb takes
+    // it): its ID is unchanged so the S0/S1/S2 series stays comparable.
+    for pop in [1u64, 16, 256] {
+        let ino_base = 920_000_000 + pop * 1_000_000;
+        let path = format!("inode_{ino_base}");
+        // Seed the population: `pop` disjoint 1 MiB spans, held for the row.
+        let held: Vec<_> = rt.block_on(async {
+            let mut v = Vec::new();
+            for i in 0..pop {
+                v.push(
+                    dlm.acquire_lock(
+                        &path,
+                        Some((i << 20, (i + 1) << 20)),
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await
+                    .expect("population seed acquire"),
+                );
+            }
+            v
+        });
+
+        // Disjoint-span acquire+release above the live population (the
+        // sorted-interval insert + stab-window probe).
+        group.bench_function(format!("acquire_release_range_disjoint_pop{pop}"), |b| {
+            let dlm = dlm.clone();
+            let path = path.clone();
+            let mut i = 0u64;
+            b.to_async(&rt).iter(|| {
+                i = i.wrapping_add(1);
+                let start = (pop + (i % 64)) << 20;
+                let dlm = dlm.clone();
+                let path = path.clone();
+                async move {
+                    let lease = dlm
+                        .acquire_lock(
+                            &path,
+                            Some((start, start + (1 << 20))),
+                            std::time::Duration::from_secs(1),
+                        )
+                        .await
+                        .expect("disjoint range acquire");
+                    lease.release().await.expect("release");
+                }
+            });
+        });
+
+        // The CONFLICT DECISION itself is priced by the
+        // `span_range_shared_probe_pop{N}` row below: it runs the same
+        // stab-window scan over the same population. A refused *acquire*
+        // is deliberately NOT a row — measured at every population it
+        // costs ~1.08 ms whatever the population is, i.e. it prices the
+        // tokio timer registration behind the wait budget, not the
+        // arbitration. The handoff cost of contended spans is the
+        // `acquire_release_contended_1span_8tasks` row.
+
+        // The W1 seventh clause's probe (`patch_range_shared` → the DLM
+        // custody read) at the same population — this one IS on the patch
+        // hot path (61–67 k IOPS), once per candidate block.
+        group.bench_function(format!("span_range_shared_probe_pop{pop}"), |b| {
+            b.iter(|| {
+                black_box(squeezefs::dlm::span_range_shared(
+                    black_box(ino_base),
+                    black_box(4 << 20),
+                    black_box(8 << 20),
+                    black_box(0),
+                ))
+            });
+        });
+
+        rt.block_on(async {
+            for lease in held {
+                lease.release().await.expect("population release");
+            }
+        });
+    }
+
+    // The clause-7 probe on the SHIPPED shape: a live whole-file lease
+    // (whole-inode custody, zero live ranges) — the cost every W1 patch
+    // pays on a production mount.
+    let whole_held = rt.block_on(async {
+        dlm.acquire_lock("inode_921000001", None, std::time::Duration::from_secs(5))
+            .await
+            .expect("whole-file seed acquire")
+    });
+    group.bench_function("span_range_shared_probe_whole_file_custody", |b| {
+        b.iter(|| {
+            black_box(squeezefs::dlm::span_range_shared(
+                black_box(921_000_001u64),
+                black_box(0),
+                black_box(4 << 20),
+                black_box(0),
+            ))
+        });
+    });
+    rt.block_on(async { whole_held.release().await.expect("release") });
+
+    // Serialized handoff over ONE overlapping span: 8 tasks contend for the
+    // same bytes (the range analogue of the contended whole-file row).
+    group.bench_function("acquire_release_contended_1span_8tasks", |b| {
+        let dlm = dlm.clone();
+        b.to_async(&rt).iter(|| {
+            let dlm = dlm.clone();
+            async move {
+                let futures = (0..8).map(|_| {
+                    let dlm = dlm.clone();
+                    async move {
+                        let lease = dlm
+                            .acquire_lock(
+                                "inode_922000001",
+                                Some((0, 1 << 20)),
+                                std::time::Duration::from_secs(5),
+                            )
+                            .await
+                            .expect("contended span acquire");
+                        tokio::task::yield_now().await;
+                        lease.release().await.expect("release");
+                    }
+                });
+                futures::future::join_all(futures).await;
+            }
+        });
+    });
+
     // Contended handoff: 8 tasks fight over one key, each holding briefly.
     group.bench_function("acquire_release_contended_1key_8tasks", |b| {
         let dlm = dlm.clone();

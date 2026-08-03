@@ -63,7 +63,6 @@ use squeezefs::fuse_client::SqueezefsFilesystem;
 use squeezefs::meta_backend::kv::record::{
     inode_key, DentryValue, InodeValue, XattrValue, TREE_INODES, TREE_XATTRS,
 };
-use squeezefs::meta_backend::Metadata;
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
 use squeezefs::{DataVolumeRecord, FormatConfig, VOL_STATE_RETIRED};
@@ -456,6 +455,36 @@ async fn plant_open_intent(fx: &Fx, ino: u64, tx_id: u64) {
         !kv.xv_scan_intents().await.expect("scan intents").is_empty(),
         "the fixture must leave a discoverable open intent"
     );
+}
+
+/// How many dentry RECORDS carry `name`. The precise probe these tests
+/// need: a dangling name can never be `lookup`ed (the lookup resolves the
+/// child ino and then fails to read its record — that IS the damage), so
+/// "is the name still there" has to be asked of the dentry tree itself.
+async fn name_records(fx: &Fx, name: &str) -> usize {
+    use squeezefs::meta_backend::kv::node::key_successor;
+    use squeezefs::meta_backend::kv::tree::KEY_SPACE_MAX;
+    let mut found = 0;
+    for kv in &fx.meta.volumes {
+        let dentries = kv.trees()[1];
+        let mut cursor: Vec<u8> = vec![0u8];
+        loop {
+            let page = dentries
+                .range(&cursor, &KEY_SPACE_MAX, 512)
+                .await
+                .expect("dentry walk");
+            let Some((last, _)) = page.last() else { break };
+            cursor = key_successor(last);
+            for (_, v) in &page {
+                if let Ok(d) = DentryValue::decode(v) {
+                    if d.name == name.as_bytes() {
+                        found += 1;
+                    }
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Retire the planted intent (the plan completed) — what makes the
@@ -1156,9 +1185,10 @@ async fn test_c10_repair_applied_sets_nlink_to_the_counted_names() {
         Some(1),
         "an nlink-0 inode with a name is made live again, never unnamed"
     );
-    assert!(
-        fx.meta.lookup(1, "ghost.bin").await.is_err(),
-        "the name that resolved to nothing is gone"
+    assert_eq!(
+        name_records(&fx, "ghost.bin").await,
+        0,
+        "the name that resolved to nothing is gone from the dentry tree"
     );
     // The blocks of the repaired inode are untouched: this class never
     // moves the block plane.
@@ -1247,9 +1277,11 @@ async fn test_c10_repair_refuses_ambiguous_evidence() {
         rep.refused
     );
     // Nothing was destroyed: the ghost directory name is still there for
-    // an operator to act on.
-    assert!(
-        fx.meta.lookup(1, "ghostdir").await.is_ok(),
+    // an operator to act on. (Asked of the dentry tree, not of `lookup` —
+    // a dangling name never resolves, which is the damage itself.)
+    assert_eq!(
+        name_records(&fx, "ghostdir").await,
+        1,
         "a refused repair must not have removed the name"
     );
     fx.close().await;

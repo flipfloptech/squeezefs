@@ -3652,7 +3652,28 @@ pub struct Metrics {
     /// the inode plane); growth under concurrent creates is the proof it
     /// is doing work.
     pub fsck_current_era_exempted: Align64<AtomicU64>,
-    /// Verified findings (class-labeled C1–C9 in the report). MUST stay
+    /// C10: distinct-name identities held for inos named MORE THAN ONCE —
+    /// the counting extension's engagement gauge (0 on a tree with no
+    /// hardlinks and no damage, which is why the class costs nothing
+    /// there).
+    pub fsck_nlink_names_counted: Align64<AtomicU64>,
+    /// C10 verified findings by direction. `high` is the LEAK direction (an
+    /// inode and its blocks that can never be reclaimed); `low`,
+    /// `zero_named` and `dangling` are the DATA-LOSS direction — a count
+    /// that no longer covers a live path, and a name that resolves to
+    /// nothing. Nonzero on the last three is the stop-and-read signal.
+    pub fsck_nlink_mismatch_high: Align64<AtomicU64>,
+    pub fsck_nlink_mismatch_low: Align64<AtomicU64>,
+    pub fsck_nlink_zero_named: Align64<AtomicU64>,
+    pub fsck_dangling_dentries: Align64<AtomicU64>,
+    /// C10 suspects cleared by the class's own guards — the record witness
+    /// `(nlink, ctime)` bracketing the fresh dentry pass, the open
+    /// cross-volume intent exemption, the distinct-name dedupe, and the
+    /// census/pass concurrency re-read. The inode plane's
+    /// `fsck_inflight_exempted`: growth under concurrent
+    /// link/unlink/rename traffic is the proof the shield is not vacuous.
+    pub fsck_nlink_transient_cleared: Align64<AtomicU64>,
+    /// Verified findings (class-labeled C1–C10 in the report). MUST stay
     /// 0 on healthy volumes.
     pub fsck_findings: Align64<AtomicU64>,
     /// Wall seconds of the most recent run (gauge).
@@ -3681,12 +3702,12 @@ pub struct Metrics {
     pub fsck_quarantined_records: Align64<AtomicU64>,
     pub fsck_quarantined_blocks: Align64<AtomicU64>,
     pub fsck_quarantined_bytes: Align64<AtomicU64>,
-    /// Applied repairs per class — index 0..8 ⇔ C1..C9
-    /// (`fsck_repair_classC{1..9}` on the stats inode). Index 7 (C8) is
+    /// Applied repairs per class — index 0..9 ⇔ C1..C10
+    /// (`fsck_repair_classC{1..10}` on the stats inode). Index 7 (C8) is
     /// never incremented by design: durable-block-reference drift is
     /// reported and never auto-repaired (restating the ledger from the
     /// walk would erase the evidence of why it broke).
-    pub fsck_repair_class: Align64<[AtomicU64; 9]>,
+    pub fsck_repair_class: Align64<[AtomicU64; 10]>,
     /// PR VL7 defrag family (design-volume-lifecycle §5.7/§10, KD-11).
     /// Distinct blocks moved by the D1/D2 defrag objective (the same
     /// `move_one` engine as `evacuate_*` — a defrag move counts BOTH
@@ -6813,6 +6834,16 @@ impl SqueezefsFilesystem {
                 "fsck_mover_ledger_exempted": METRICS.fsck_mover_ledger_exempted.load(Ordering::Relaxed),
                 "fsck_dentry_refs_indexed": METRICS.fsck_dentry_refs_indexed.load(Ordering::Relaxed),
                 "fsck_current_era_exempted": METRICS.fsck_current_era_exempted.load(Ordering::Relaxed),
+                // C10 (inode-plane reference consistency). The last three
+                // findings gauges are the DATA-LOSS direction; `high` is
+                // the leak direction, and `transient_cleared` is the
+                // zero-FP shield's engagement.
+                "fsck_nlink_names_counted": METRICS.fsck_nlink_names_counted.load(Ordering::Relaxed),
+                "fsck_nlink_mismatch_high": METRICS.fsck_nlink_mismatch_high.load(Ordering::Relaxed),
+                "fsck_nlink_mismatch_low": METRICS.fsck_nlink_mismatch_low.load(Ordering::Relaxed),
+                "fsck_nlink_zero_named": METRICS.fsck_nlink_zero_named.load(Ordering::Relaxed),
+                "fsck_dangling_dentries": METRICS.fsck_dangling_dentries.load(Ordering::Relaxed),
+                "fsck_nlink_transient_cleared": METRICS.fsck_nlink_transient_cleared.load(Ordering::Relaxed),
                 "fsck_findings": METRICS.fsck_findings.load(Ordering::Relaxed),
                 "fsck_scan_secs": METRICS.fsck_scan_secs.load(Ordering::Relaxed),
                 "scrub_blocks_scanned": METRICS.scrub_blocks_scanned.load(Ordering::Relaxed),
@@ -6838,6 +6869,7 @@ impl SqueezefsFilesystem {
                 // C8 is structurally 0 (reported, never auto-repaired).
                 "fsck_repair_classC8": METRICS.fsck_repair_class[7].load(Ordering::Relaxed),
                 "fsck_repair_classC9": METRICS.fsck_repair_class[8].load(Ordering::Relaxed),
+                "fsck_repair_classC10": METRICS.fsck_repair_class[9].load(Ordering::Relaxed),
                 // PR VL7 defrag family (§5.7 / §10, KD-11). Ratio gauges
                 // decode permille+1 (null = never measured); worst-volume
                 // semantics — per-volume rows ride `defrag --report-only`.

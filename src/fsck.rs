@@ -2,7 +2,7 @@
 //! KD-9/KD-17; repair is VL6b and consumes the findings this module
 //! verifies).
 //!
-//! Check classes (C1–C9; C8 and C9 postdate the VL6a seven):
+//! Check classes (C1–C10; C8, C9 and C10 postdate the VL6a seven):
 //!
 //! | Class | What | Source of truth |
 //! |---|---|---|
@@ -28,6 +28,11 @@
 //! | C9 | **unreferenced inodes**: an inode record in `TREE_INODES` that
 //! no dentry in `TREE_DENTRIES` names | one dentry-tree pass (the
 //! referenced set) differenced against the census's live-inode set |
+//! | C10 | **inode-plane reference consistency**: `nlink` vs the number
+//! of distinct names referencing the inode (both directions), and
+//! dentries naming an inode that does not exist | the SAME dentry pass's
+//! name counts vs the census's `nlink`, and the reverse difference of the
+//! same two sets |
 //!
 //! ## C9 — unreferenced inodes (the class S3.5 left owed)
 //!
@@ -91,6 +96,115 @@
 //! not carry; the era floor alone cannot do it. Claiming it would trade
 //! a leak for destroying an open file's data, so C9 does not claim it —
 //! stated here rather than hidden.
+//!
+//! ## C10 — inode-plane reference consistency (C9's safety half)
+//!
+//! C9 answers *presence* ("is this inode named at all?"). Enumerating
+//! what pre-S3.5 crash damage can also contain left two shapes with no
+//! detector, and only one of them is a leak:
+//!
+//! 1. **`nlink` above the name count.** A cross-volume `link` whose count
+//!    step committed and whose dentry step did not leaves `nlink == 2`
+//!    with ONE name. C9 is correctly silent (a name exists), and nothing
+//!    else looks: the inode and every block it owns can never be
+//!    reclaimed — a permanent leak that reads as healthy.
+//! 2. **`nlink` below the name count, `nlink == 0` with a live name, or a
+//!    name resolving to nothing.** A cross-volume `unlink` whose count
+//!    step committed and whose name step did not leaves a dentry
+//!    resolving to an inode whose count no longer covers it. Once
+//!    ordinary unlinks drive such a count to 0, **`destroy_inodes`'
+//!    live-`nlink` skip stops protecting an inode a live path still
+//!    resolves** — that direction is DATA LOSS, not a leak, and it is
+//!    reachable on field volumes today. S3.5 (`24ef223c`) made such a
+//!    dentry *removable*; nothing ever **found** one. This is the
+//!    priority half of the class.
+//!
+//! **One walk, not two.** C9's dentry pass already visits every dentry;
+//! C10's counts ride it. The set representation stays C9's — the cheap
+//! shape is the existing "named at all" [`InoBitmap`] plus a **small map
+//! for the inos named MORE THAN ONCE**, because `nlink > 1` is rare
+//! (hardlinks are the exception in every real tree) and
+//! [`InoBitmap::mark`] already *returns* whether the bit was newly set.
+//! An ino absent from that map is named exactly once iff its bit is set,
+//! so no per-ino counter is ever materialized. The census side is the
+//! mirror: it already decodes every `InodeValue`, so it records the
+//! **non-directory live inodes whose `nlink != 1`** — the hardlink
+//! population plus damage, never the whole tree. Both sides therefore
+//! cost ≈ 0 on a healthy volume and the candidate set is
+//! `{nlink != 1} ∪ {named more than once}`, which is empty on a tree
+//! without hardlinks.
+//!
+//! Names are counted as **distinct `(global parent, name)` pairs**, not
+//! as records: a VL5b slot migration legitimately has a dentry record on
+//! the source AND the target volume mid-copy, and global inos are stable
+//! across it (the VL5a law), so the pair dedupes what raw records would
+//! double-count.
+//!
+//! **The dangerous shapes need no counting at all.** `nlink == 0` with a
+//! live name, and a dentry whose ino has no record, are both the
+//! **reverse** difference of the two sets C9 already builds (`referenced`
+//! minus `live` — the census skips `nlink == 0` records, so both shapes
+//! land there), split by one fresh per-candidate record read. They are
+//! therefore immune to the count map's budget: the class degrades only in
+//! its leak direction, never in its loss direction.
+//!
+//! **Zero false positives — and NOT by C9's era floor.** C9's shield is
+//! the writer era's ino floor; it cannot serve here, because a prior-era
+//! inode can be legitimately hardlinked one microsecond ago. What holds
+//! instead, composed with the settle window and the FRESH dentry pass:
+//!
+//! * **The record witness.** Every same-volume op that changes an inode's
+//!   name count mutates that inode's record in the SAME transaction —
+//!   `link`/`unlink` move `nlink`, `rename` stamps the moved inode's
+//!   Δctime — so `(nlink, ctime)` read under the ino's exclusive 4a lease
+//!   **before and after** the fresh pass is a witness: any change clears
+//!   the suspect. This is what kills the pass's own read-over-time skew
+//!   (two dentry pages read either side of one atomic rename look like 0
+//!   or 2 names), because the skew can only come from a commit that
+//!   landed *during* the pass, i.e. inside the bracket.
+//! * **The open cross-volume intent exemption.** A multi-commit plan is
+//!   exactly the window where the count and the names legitimately
+//!   disagree, and every such plan leaves a durable `SQZXTX01` intent
+//!   until it retires (`xv_scan_intents`, one bounded range per volume,
+//!   empty on a healthy set). Every ino a plan's steps name is exempt —
+//!   the in-flight-registry role the block plane fills with
+//!   `inflight_contains`.
+//! * **Directories are never a count finding.** A directory's `nlink` is
+//!   `2 + subdirectories` because it counts `.` and every child's `..`,
+//!   which are synthesized and never records. Comparing it to "names in
+//!   the dentry tree" would fire on every directory in the filesystem.
+//!   (A directory named TWICE — an illegal shape — is consequently not
+//!   claimed either; stated rather than hidden.)
+//! * **Completeness gates.** An incomplete dentry pass ⇒ no verdict (C9's
+//!   law); a census walk that could not finish ⇒ no verdict for the
+//!   reverse arms (a missing live inode would make its names look
+//!   dangling); a count map at its budget ⇒ no verdict for the count arms
+//!   (a dropped entry would invert a comparison).
+//!
+//! The residual is stated rather than hidden: a *cross-volume* rename
+//! stamps its moved inode's ctime as a separate per-volume fragment, so a
+//! rename whose fragment lands after the post-witness could survive one
+//! bracket. It must then survive a SECOND independent full pass with the
+//! same skew, and — for the only repair that lowers a count — a THIRD at
+//! repair time. A continuously rewritten file bumps its own ctime and so
+//! keeps clearing: like C9's era floor, that costs coverage (the next run
+//! reports it), never safety.
+//!
+//! **Interaction with the block plane.** A wrong `nlink` does not corrupt
+//! block accounting — an inode with `nlink >= 1` is walked by the census
+//! either way, so C2/C3/C8 stay silent alongside a count finding. The one
+//! exception is structural and drives the repair order: the census
+//! **skips `nlink == 0` records**, so a zero-count-with-a-name inode's
+//! blocks read as allocated-unreferenced (C2-leaked). Raising the count
+//! re-attaches them, so C10 runs BEFORE the block classes and the
+//! repair's census is re-walked after an inode-plane raise — otherwise
+//! the leaked-block free would destroy the data the raise just restored.
+//!
+//! **The POSIX-15 line.** C10 claims `nlink == 0` **with** a name (no
+//! legitimate state has it). It does not claim `nlink == 0` **without**
+//! one: that is POSIX unlinked-but-open and POSIX-15's rename-overwrite
+//! orphan, which needs the live open-count/reclaim registries this
+//! context does not carry — the same line C9 draws, from the other side.
 //!
 //! **Verify-before-report (KD-9)** — detection never mutates, and a
 //! violation becomes a finding only after it survives the class's full
@@ -306,6 +420,25 @@ pub enum FindingId {
     /// identity; everything else repair needs it re-derives under the
     /// ino's lease at verify time.
     C9Unreferenced { ino: u64 },
+    /// C10: `nlink` **above** the number of distinct names — the LEAK
+    /// direction (the inode and its blocks can never be reclaimed).
+    C10NlinkTooHigh { ino: u64 },
+    /// C10: `nlink` **below** the number of distinct names — the
+    /// DANGEROUS direction (the count no longer covers a live path, so
+    /// ordinary unlinks can make a reachable inode reclaimable).
+    C10NlinkTooLow { ino: u64 },
+    /// C10: `nlink == 0` while dentries still name the inode —
+    /// unambiguous damage (no legitimate state has it) and the shape
+    /// `destroy_inodes`' live-`nlink` skip no longer protects.
+    C10ZeroNlinkNamed { ino: u64 },
+    /// C10: a dentry whose child ino has **no inode record** — the name
+    /// resolves to nothing. Identity is the RECORD (volume + exact key),
+    /// not the name: a collision chain holds several keys for one name.
+    C10DanglingDentry {
+        vol: usize,
+        key_hex: String,
+        child_ino: u64,
+    },
 }
 
 /// The §10 `fsck_*` / `scrub_*` counter families, per run (the process
@@ -327,6 +460,26 @@ pub struct FsckCounters {
     /// concurrent creates, and its growth is the proof the shield is
     /// doing work rather than sitting vacuous.
     pub current_era_exempted: u64,
+    /// C10: distinct `(parent, name)` pairs held for inos named MORE THAN
+    /// ONCE — the counting extension's engagement gauge (0 on a tree with
+    /// no hardlinks and no damage, which is why the class costs nothing
+    /// there).
+    pub nlink_names_counted: u64,
+    /// C10: verified findings per direction. `high` is the LEAK direction;
+    /// `low` and `zero_named` are the DATA-LOSS direction (an operator
+    /// stops and reads on those two), and `dangling` counts names that
+    /// resolve to nothing.
+    pub nlink_mismatch_high: u64,
+    pub nlink_mismatch_low: u64,
+    pub nlink_zero_named: u64,
+    pub dangling_dentries: u64,
+    /// C10 suspects cleared by the class's own guards — the record witness
+    /// `(nlink, ctime)` bracketing the fresh dentry pass, the open
+    /// cross-volume intent exemption, and the census/pass concurrency
+    /// re-read. The zero-FP shield's engagement gauge (the inode plane's
+    /// `inflight_exempted`): nonzero under concurrent link/unlink/rename
+    /// traffic, and its growth is the proof the shield is not vacuous.
+    pub nlink_transient_cleared: u64,
     pub blocks_checked: u64,
     pub refcounts_checked: u64,
     pub suspects: u64,
@@ -645,6 +798,24 @@ struct CensusOut {
     /// set the referenced-ino set is differenced against. Free to carry:
     /// the census already walks `TREE_INODES`.
     live: InoBitmap,
+    /// C10: global ino → `nlink`, for **non-directory** live inodes whose
+    /// `nlink != 1`. The count arms' small side: the hardlink population
+    /// plus damage, never the whole tree (directories are excluded because
+    /// their `nlink` counts `.` and every child's `..`, which are
+    /// synthesized and never records — module header). Free to carry: the
+    /// census already decodes every `InodeValue`.
+    odd_nlink: HashMap<u64, u32>,
+    /// `false` ⇔ [`Self::odd_nlink`] hit its derived entry budget, so a
+    /// missing entry would read as `nlink == 1` and invert a comparison:
+    /// the C10 count arms then record NO verdict.
+    odd_nlink_complete: bool,
+    /// `false` ⇔ the inode walk could not finish (unreadable node —
+    /// C1's business to report — or cancellation). A partial live set
+    /// makes named inodes look like they have no record, so the C10
+    /// REVERSE arms (dangling names, `nlink == 0` with a name) record no
+    /// verdict. C9's direction is unaffected: a missing live inode is
+    /// simply one fewer candidate.
+    complete: bool,
     inodes_scanned: u64,
 }
 
@@ -657,6 +828,9 @@ fn probe_census() -> CensusOut {
         mappings: Vec::new(),
         unresolvable: Vec::new(),
         live: InoBitmap::new(1, 0, 0),
+        odd_nlink: HashMap::new(),
+        odd_nlink_complete: true,
+        complete: true,
         inodes_scanned: 0,
     }
 }
@@ -687,6 +861,28 @@ fn ino_bitmap(meta: &RoutedMetaBackend) -> InoBitmap {
 pub fn ino_set_byte_budget() -> u64 {
     const DESIGN_CAP_FLOOR: u64 = 16 * 1024 * 1024;
     (crate::mem_budget::MEM_BUDGET.budget_bytes() / 64).max(DESIGN_CAP_FLOOR)
+}
+
+/// Charged bytes per C10 count-map entry — a `(parent, name)` pair or an
+/// `(ino, nlink)` pair with its hash-table overhead. Not a tuning knob:
+/// it is the accounting factor that converts [`ino_set_byte_budget`] into
+/// an entry count, so the count maps ride the SAME byte budget as ONE C9
+/// ino set (short names round down, a 255-byte name rounds up — the
+/// budget is a bound, not a promise).
+const C10_COUNT_ENTRY_BYTES: u64 = 64;
+
+/// Entry budget for C10's count maps — **derived** from the ino-set byte
+/// budget, never a tuning constant: the multi-name identities and the
+/// `nlink != 1` map together may hold as many entries as one ino set holds
+/// bytes worth. Exceeding it is not a failure — it makes the count arms
+/// record **no verdict** (a dropped entry would invert a comparison),
+/// while C10's DANGEROUS arms keep working because they read only the
+/// bitmaps.
+///
+/// `pub` so the derivation carries a drift-is-red tie test (the house law
+/// for every derived default) — see `tests/fsck_c10_tests.rs`.
+pub fn c10_count_entry_budget() -> u64 {
+    ino_set_byte_budget() / C10_COUNT_ENTRY_BYTES
 }
 
 /// One volume's allocator handle under its canonical id (device access
@@ -759,6 +955,29 @@ enum SuspectKind {
         nlink: u32,
         size: u64,
         blocks: usize,
+    },
+    /// C10: `nlink` disagrees with the number of distinct names. ONE
+    /// suspect kind for both directions — the direction is a property of
+    /// the verified numbers, decided at verdict time, so neither arm can
+    /// drift from the other's ladder. `names >= 1` always (a named-by-
+    /// nobody inode is C9's object); `nlink >= 1` (the `nlink == 0` shape
+    /// is its own kind below).
+    C10NlinkMismatch { ino: u64, nlink: u32, names: u32 },
+    /// C10: `nlink == 0` while `names >= 1` dentries still name the ino.
+    C10ZeroNlinkNamed { ino: u64, names: u32 },
+    /// C10: a dentry record naming an ino with no inode record.
+    C10Dangling {
+        vol: usize,
+        key: Vec<u8>,
+        /// Global parent ino (display only — `key` is the identity).
+        parent: u64,
+        name: String,
+        child_ino: u64,
+        /// `DT_*` from the dentry value: a `DT_DIR` dangling name cannot
+        /// be removed without also deciding the parent's directory
+        /// `nlink`, which this class does not verify — so repair refuses
+        /// it rather than guessing.
+        file_type: u8,
     },
 }
 
@@ -846,12 +1065,13 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
             // from the census (which walks `TREE_INODES`), so it overlaps
             // too — the difference is taken after both land, and neither
             // side depends on the other's order.
-            let refs_pass = tokio::spawn(build_referenced_inos(
-                ctx.meta.clone(),
-                opts.shard,
-                opts.throttle_pct,
-                opts.cancel.clone(),
-            ));
+            let refs_pass = tokio::spawn({
+                let meta = ctx.meta.clone();
+                let shard = opts.shard;
+                let pct = opts.throttle_pct;
+                let cancel = opts.cancel.clone();
+                async move { build_referenced_inos(meta, shard, pct, cancel, None).await }
+            });
             let census = walk_census(ctx, opts, &mut counters).await?;
             while let Some(joined) = walks.join_next().await {
                 let (nodes_walked, walk_suspects) = joined.map_err(|e| {
@@ -906,6 +1126,7 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
                 opts.shard,
                 opts.throttle_pct,
                 opts.cancel.clone(),
+                None,
             )
             .await;
             counters.dentry_refs_indexed += indexed;
@@ -973,14 +1194,26 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // inodes that no dentry names. Two independent bitmaps, one
         // difference — the era floor is applied per candidate inside, so
         // a healthy volume pays only the bitmap scan.
+        //
+        // C10 rides the SAME two sets in the other direction (plus the
+        // name counts the same pass carried): nlink vs the names, and
+        // everything the referenced set names that the live set does not.
         match (referenced.as_ref(), census.live.truncated()) {
             (Some(refs), false) => {
-                evaluate_c9_unreferenced(ctx, &census.live, refs, &mut counters, &mut suspects)
+                evaluate_c9_unreferenced(
+                    ctx,
+                    &census.live,
+                    &refs.refs,
+                    &mut counters,
+                    &mut suspects,
+                )
+                .await;
+                evaluate_c10_inode_plane(ctx, opts, &census, refs, &mut counters, &mut suspects)
                     .await;
             }
             (Some(_), true) => log::warn!(
-                "fsck C9: the live-inode set reached its derived byte budget ({} B) — the \
-                 unreferenced-inode class records no verdict for this run",
+                "fsck C9/C10: the live-inode set reached its derived byte budget ({} B) — \
+                 the inode-plane classes record no verdict for this run",
                 ino_set_byte_budget()
             ),
             (None, _) => {}
@@ -1052,6 +1285,13 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         // its own residue, so both of these sum (disjoint by residue).
         counters.dentry_refs_indexed += r.counters.dentry_refs_indexed;
         counters.current_era_exempted += r.counters.current_era_exempted;
+        // C10: every shard judges its own ino residue, so these sum too.
+        counters.nlink_names_counted += r.counters.nlink_names_counted;
+        counters.nlink_mismatch_high += r.counters.nlink_mismatch_high;
+        counters.nlink_mismatch_low += r.counters.nlink_mismatch_low;
+        counters.nlink_zero_named += r.counters.nlink_zero_named;
+        counters.dangling_dentries += r.counters.dangling_dentries;
+        counters.nlink_transient_cleared += r.counters.nlink_transient_cleared;
         counters.blocks_checked += r.counters.blocks_checked;
         counters.refcounts_checked += r.counters.refcounts_checked;
         counters.suspects += r.counters.suspects;
@@ -1290,20 +1530,26 @@ async fn walk_census(
         live: ino_bitmap(&ctx.meta),
         ..probe_census()
     };
+    let odd_budget = c10_count_entry_budget();
     for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
         let inodes = kv.trees()[0];
         let mut cursor: Vec<u8> = inode_key(1).to_vec();
         let end = inode_key(u64::MAX - 1);
         loop {
             if opts.cancel.load(Ordering::Relaxed) {
+                out.complete = false;
                 break;
             }
             let t0 = std::time::Instant::now();
             let page = match inodes.range(&cursor, &end, SCAN_PAGE).await {
                 Ok(p) => p,
                 // The C1 walk owns reporting unreadable nodes; the census
-                // takes what it can reach.
-                Err(_) => break,
+                // takes what it can reach — and says so, because C10's
+                // reverse arms would read the gap as missing records.
+                Err(_) => {
+                    out.complete = false;
+                    break;
+                }
             };
             let Some((last_key, _)) = page.last() else {
                 break;
@@ -1335,6 +1581,19 @@ async fn walk_census(
                 // set difference happens after the (independent) dentry
                 // pass, so nothing here depends on scan order.
                 out.live.mark(global_ino);
+                // C10: the count arms' small side — non-directory live
+                // inodes whose nlink is not 1. Directories are excluded
+                // BY CONSTRUCTION (their nlink counts `.` and every
+                // child's `..`, which are synthesized and never records),
+                // which is also what keeps this map the hardlink
+                // population instead of the whole tree.
+                if val.nlink != 1 && val.mode & libc::S_IFMT != libc::S_IFDIR {
+                    if out.odd_nlink.len() as u64 >= odd_budget {
+                        out.odd_nlink_complete = false;
+                    } else {
+                        out.odd_nlink.insert(global_ino, val.nlink);
+                    }
+                }
                 let Ok(Some(bytes)) = kv.getxattr(local_ino, "layout").await else {
                     continue;
                 };
@@ -1458,8 +1717,60 @@ fn clean_key(mapping: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// C9: the referenced-ino pass + the set difference
+// C9 / C10: the referenced-ino pass + the set differences
 // ---------------------------------------------------------------------------
+
+/// One dentry record naming a C10 candidate — the exact-count unit and the
+/// dangling arm's repair identity.
+#[derive(Clone, Debug)]
+struct NameRef {
+    vol: usize,
+    /// The dentry record's EXACT key (a collision chain holds several keys
+    /// for one name, so the key is the identity and the name is display).
+    key: Vec<u8>,
+    /// GLOBAL parent ino — what makes the distinct-name count stable
+    /// across a VL5b slot migration (local parents differ per keyspace,
+    /// global inos are eternal).
+    parent: u64,
+    name: Vec<u8>,
+    file_type: u8,
+}
+
+/// What ONE dentry pass yields: C9's referenced-ino set, plus C10's record
+/// counts for the inos named more than once, plus (when the caller already
+/// knows which inos it is judging) those inos' deduped name identities.
+struct RefPass {
+    refs: InoBitmap,
+    /// Global ino → dentry RECORDS naming it, for inos with more than one.
+    /// Records, NOT distinct paths: the exact distinct count comes from
+    /// [`Self::names`], so this may only nominate candidates.
+    multi: HashMap<u64, u32>,
+    /// `false` ⇔ [`Self::multi`] hit [`c10_count_entry_budget`]: the C10
+    /// COUNT arms then record no verdict (a dropped entry would read as one
+    /// name and invert a comparison). C9 and C10's DANGEROUS arms are
+    /// unaffected — they read only `refs`.
+    multi_complete: bool,
+    /// Global ino → its distinct names, for the inos in the caller's
+    /// collect set. Empty when nothing was collected.
+    names: HashMap<u64, Vec<NameRef>>,
+}
+
+impl RefPass {
+    /// Names referencing `ino` as the RECORD count (≥ the distinct count):
+    /// the map when it has more than one, else 1 iff the bit is set, else 0
+    /// (C9's object). Nomination input only.
+    fn record_names_of(&self, ino: u64) -> u32 {
+        match self.multi.get(&ino) {
+            Some(n) => *n,
+            None => u32::from(self.refs.contains(ino)),
+        }
+    }
+
+    /// The DISTINCT names collected for `ino` — every C10 verdict's input.
+    fn collected(&self, ino: u64) -> &[NameRef] {
+        self.names.get(&ino).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+}
 
 /// ONE sequential pass over `TREE_DENTRIES` on every volume, marking the
 /// TARGET ino of every dentry record — `DentryValue::child_ino`, which is
@@ -1477,14 +1788,31 @@ fn clean_key(mapping: &str) -> String {
 /// would make every inode named beyond the tear look unreferenced, so C9
 /// records **no verdict** for that run rather than guessing; the same
 /// posture C8 takes when its comparison fails.
+///
+/// **C10 rides the same walk.** `multi` counts the dentry RECORDS naming
+/// each ino that has more than one ([`InoBitmap::mark`]'s return value is
+/// what separates the first name from the rest, so the single-name majority
+/// costs nothing), and `collect` — when the caller already knows which inos
+/// it is judging — gathers those inos' name identities in the SAME pass.
+/// A record count is deliberately an over-estimate of the DISTINCT name
+/// count (a VL5b slot migration mid-copy has one dentry on two volumes), so
+/// it may only NOMINATE a candidate; every C10 verdict is taken from the
+/// deduped `(global parent, name)` identities `collect` returns.
 async fn build_referenced_inos(
     meta: Arc<RoutedMetaBackend>,
     shard: Option<(u32, u32)>,
     throttle_pct: u32,
     cancel: Arc<AtomicBool>,
-) -> (Option<InoBitmap>, u64) {
-    use crate::meta_backend::kv::record::DentryValue;
-    let mut refs = ino_bitmap(&meta);
+    collect: Option<&std::collections::HashSet<u64>>,
+) -> (Option<RefPass>, u64) {
+    use crate::meta_backend::kv::record::{decode_dentry_key, DentryValue};
+    let mut pass = RefPass {
+        refs: ino_bitmap(&meta),
+        multi: HashMap::new(),
+        multi_complete: true,
+        names: HashMap::new(),
+    };
+    let budget = c10_count_entry_budget();
     let mut indexed = 0u64;
     for (vol_idx, kv) in meta.volumes.iter().enumerate() {
         let dentries = kv.trees()[1];
@@ -1505,16 +1833,16 @@ async fn build_referenced_inos(
                 Ok(p) => p,
                 Err(e) => {
                     log::warn!(
-                        "fsck C9: dentry walk of volume {vol_idx} failed ({e}) — the \
-                         referenced-ino set is incomplete, so the unreferenced-inode class \
-                         records no verdict for this run (C1 owns the unreadable node)"
+                        "fsck C9/C10: dentry walk of volume {vol_idx} failed ({e}) — the \
+                         referenced-ino set is incomplete, so the inode-plane classes \
+                         record no verdict for this run (C1 owns the unreadable node)"
                     );
                     return (None, indexed);
                 }
             };
             let Some((last, _)) = page.last() else { break };
             cursor = crate::meta_backend::kv::node::key_successor(last);
-            for (_, v) in &page {
+            for (k, v) in &page {
                 let Ok(d) = DentryValue::decode(v) else {
                     continue; // C1's business
                 };
@@ -1523,22 +1851,59 @@ async fn build_referenced_inos(
                         continue;
                     }
                 }
-                refs.mark(d.child_ino);
+                let first_name = pass.refs.mark(d.child_ino);
                 indexed += 1;
+                // C10: the second-and-later names, counted only for inos
+                // whose FIRST name marked a bit — an out-of-range/hostile
+                // child ino marks nothing and is never counted (C9's "a
+                // dentry value is never an allocation authority" law).
+                if !first_name && pass.refs.contains(d.child_ino) {
+                    let at_budget = pass.multi.len() as u64 >= budget;
+                    match pass.multi.get_mut(&d.child_ino) {
+                        Some(n) => *n += 1,
+                        None if at_budget => pass.multi_complete = false,
+                        None => {
+                            pass.multi.insert(d.child_ino, 2);
+                        }
+                    }
+                }
+                // C10's verdict input: the identities of the names of the
+                // inos this run is judging, deduped by (global parent,
+                // name) as the pass sees them.
+                if collect.is_some_and(|want| want.contains(&d.child_ino)) {
+                    let parent = decode_dentry_key(k)
+                        .ok()
+                        .and_then(|(local_parent, _, _)| {
+                            meta.try_make_global_ino(local_parent, vol_idx)
+                        })
+                        .unwrap_or(0);
+                    let entry = pass.names.entry(d.child_ino).or_default();
+                    if !entry.iter().any(|n| n.parent == parent && n.name == d.name)
+                        && (entry.len() as u64) < budget
+                    {
+                        entry.push(NameRef {
+                            vol: vol_idx,
+                            key: k.to_vec(),
+                            parent,
+                            name: d.name.clone(),
+                            file_type: d.file_type,
+                        });
+                    }
+                }
             }
             throttle_sleep(throttle_pct, t0.elapsed()).await;
-            if refs.truncated() {
+            if pass.refs.truncated() {
                 log::warn!(
-                    "fsck C9: the referenced-ino set reached its derived byte budget \
-                     ({} B) — the unreferenced-inode class records no verdict for this \
-                     run (a partial set would report named inodes as unreferenced)",
+                    "fsck C9/C10: the referenced-ino set reached its derived byte budget \
+                     ({} B) — the inode-plane classes record no verdict for this run (a \
+                     partial set would report named inodes as unreferenced)",
                     ino_set_byte_budget()
                 );
                 return (None, indexed);
             }
         }
     }
-    (Some(refs), indexed)
+    (Some(pass), indexed)
 }
 
 /// The C9 difference: live inodes with no dentry, filtered to those
@@ -1606,6 +1971,181 @@ async fn evaluate_c9_unreferenced(
                 blocks,
             },
         });
+    }
+}
+
+/// C10's **nomination** pass: it forms suspects and no verdicts. Every
+/// number here is either an over-estimate (dentry RECORDS, which a VL5b
+/// migration mid-copy inflates) or a snapshot the fresh pass will re-take,
+/// so `recheck_suspects` re-derives each verdict from deduped name
+/// identities under the ino's exclusive 4a lease.
+///
+/// Costs on a healthy volume: the count arms iterate two maps that are
+/// EMPTY on a tree without hardlinks, and the reverse difference is one
+/// word-parallel `AND NOT` scan (C9's, in the other direction). Per-inode
+/// reads happen only for inos the cheap comparison already disagrees about.
+async fn evaluate_c10_inode_plane(
+    ctx: &FsckCtx,
+    opts: &FsckOptions,
+    census: &CensusOut,
+    pass: &RefPass,
+    counters: &mut FsckCounters,
+    suspects: &mut Vec<Suspect>,
+) {
+    counters.nlink_names_counted += pass.multi.len() as u64;
+
+    // ---- the count arms: nlink vs the names, non-directories ----
+    if pass.multi_complete && census.odd_nlink_complete {
+        let mut nominated: Vec<(u64, u32, u32)> = Vec::new();
+        // Side A — live non-directory inodes whose nlink is not 1.
+        for (&ino, &nlink) in &census.odd_nlink {
+            let records = pass.record_names_of(ino);
+            // No name at all is C9's object, never C10's (reporting both
+            // would double-claim one inode).
+            if records > 0 && records != nlink {
+                nominated.push((ino, nlink, records));
+            }
+        }
+        // Side B — inos with more than one dentry record that side A did
+        // not already judge: live, so either `nlink == 1` (a genuine
+        // below-count nomination) or a directory (never a count finding).
+        // One read settles which; this list is the hardlink-and-damage
+        // population, not the tree.
+        for (&ino, &records) in &pass.multi {
+            if census.odd_nlink.contains_key(&ino) || !census.live.contains(ino) {
+                continue;
+            }
+            let (vol_idx, local) = ctx.meta.route_ino(ino);
+            let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
+                continue;
+            };
+            let Ok(Some(val)) = kv.read_inode_value_routed(local).await else {
+                continue;
+            };
+            if val.mode & libc::S_IFMT == libc::S_IFDIR || val.nlink == 0 {
+                continue;
+            }
+            if records != val.nlink {
+                nominated.push((ino, val.nlink, records));
+            }
+        }
+        nominated.sort_unstable();
+        for (ino, nlink, names) in nominated {
+            suspects.push(Suspect {
+                kind: SuspectKind::C10NlinkMismatch { ino, nlink, names },
+            });
+        }
+    } else {
+        log::warn!(
+            "fsck C10: the name-count maps reached their derived entry budget ({} \
+             entries) — the nlink-vs-names arms record no verdict for this run (a \
+             dropped entry would invert a comparison). The DANGEROUS arms (a live name \
+             with nlink 0, a name resolving to nothing) are unaffected: they read only \
+             the bitmaps",
+            c10_count_entry_budget()
+        );
+    }
+
+    // ---- the dangerous arms: the REVERSE difference (named, not live) ----
+    //
+    // The census skips `nlink == 0` records, so `referenced \ live` is
+    // exactly {an inode whose count is 0 while a path still resolves} ∪ {a
+    // name whose inode does not exist} ∪ {the census/pass concurrency
+    // window}, and one fresh record read per candidate splits them. A
+    // census that could not finish would put healthy inodes in that
+    // difference, so an incomplete walk records NO verdict.
+    if !census.complete {
+        log::warn!(
+            "fsck C10: the inode walk did not complete, so a named inode's record may \
+             be missing from the live set — the zero-count and dangling-name arms \
+             record no verdict for this run (C1 owns the unreadable node)"
+        );
+        return;
+    }
+    let ceiling = (ino_set_byte_budget() / 8) as usize;
+    let mut candidates: Vec<u64> = Vec::new();
+    let mut deferred = 0u64;
+    pass.refs.each_absent_from(&census.live, |ino| {
+        if candidates.len() >= ceiling {
+            deferred += 1;
+            return;
+        }
+        candidates.push(ino);
+    });
+    if deferred > 0 {
+        log::warn!(
+            "fsck C10: {} named-but-not-live candidates examined this run, {deferred} \
+             deferred to the next run (this volume's damage exceeds one batch — repair \
+             what is reported and re-run; the class converges, like C9's)",
+            candidates.len()
+        );
+    }
+    candidates.sort_unstable();
+    let mut dangling: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for ino in candidates {
+        let (vol_idx, local) = ctx.meta.route_ino(ino);
+        let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
+            continue;
+        };
+        match kv.read_inode_value_routed(local).await {
+            // No record: the name resolves to nothing.
+            Ok(None) => {
+                dangling.insert(ino);
+            }
+            // A record whose count is 0 while names exist — unambiguous
+            // damage (no legitimate state has it) and the shape
+            // `destroy_inodes`' live-nlink skip no longer protects.
+            Ok(Some(val)) if val.nlink == 0 => suspects.push(Suspect {
+                kind: SuspectKind::C10ZeroNlinkNamed {
+                    ino,
+                    names: pass.record_names_of(ino),
+                },
+            }),
+            // Live after all: the census visited this ino's key range
+            // before the (concurrent) dentry pass reached its name, i.e.
+            // the create window. Cleared, and counted as the guard working.
+            Ok(Some(_)) => counters.nlink_transient_cleared += 1,
+            Err(_) => {}
+        }
+    }
+    if dangling.is_empty() {
+        return;
+    }
+    // One extra dentry walk, paid only when a name really does resolve to
+    // nothing: the dangling arm's object is the dentry RECORD (a collision
+    // chain holds several keys for one name), so repair needs its identity.
+    let (identities, _) = build_referenced_inos(
+        ctx.meta.clone(),
+        opts.shard,
+        opts.throttle_pct,
+        opts.cancel.clone(),
+        Some(&dangling),
+    )
+    .await;
+    let Some(identities) = identities else {
+        log::warn!(
+            "fsck C10: the dangling-name identity pass could not complete — those \
+             candidates record no verdict for this run"
+        );
+        return;
+    };
+    for ino in {
+        let mut v: Vec<u64> = dangling.into_iter().collect();
+        v.sort_unstable();
+        v
+    } {
+        for name in identities.collected(ino) {
+            suspects.push(Suspect {
+                kind: SuspectKind::C10Dangling {
+                    vol: name.vol,
+                    key: name.key.clone(),
+                    parent: name.parent,
+                    name: String::from_utf8_lossy(&name.name).to_string(),
+                    child_ino: ino,
+                    file_type: name.file_type,
+                },
+            });
+        }
     }
 }
 
@@ -1957,29 +2497,86 @@ async fn recheck_suspects(
     } else {
         None
     };
-    // Phase B for C9: ONE fresh referenced-ino pass after the settle
-    // window. This is the arm that catches the only live way a name can
+    // Phase B for the inode plane: ONE fresh referenced-ino pass after the
+    // settle window, carrying C10's name identities for the inos it is
+    // judging.
+    //
+    // For C9 this is the arm that catches the only live way a name can
     // appear for an inode nothing could reach — an `open_by_handle_at`
     // reconnect, or an S9 plan's late `InsertDentry` — and clears the
     // suspect. Offline needs it not (nothing is in flight by definition),
     // and an INCOMPLETE fresh pass clears every C9 suspect rather than
     // confirming one from a partial set.
-    let fresh_refs = if online
-        && pending
-            .iter()
-            .any(|s| matches!(s.kind, SuspectKind::C9Unreferenced { .. }))
-    {
+    //
+    // For C10 the same pass supplies every verdict's numerator: the
+    // DEDUPED `(global parent, name)` identities of the nominated inos.
+    // C10 needs it in BOTH modes (the nomination counted records, which
+    // over-count during a slot migration), so the pass runs whenever
+    // either class has work — and the C9 arm keeps its own online-only
+    // gate below, unchanged.
+    let c10_judged: std::collections::HashSet<u64> = pending
+        .iter()
+        .filter_map(|s| match &s.kind {
+            SuspectKind::C10NlinkMismatch { ino, .. }
+            | SuspectKind::C10ZeroNlinkNamed { ino, .. } => Some(*ino),
+            _ => None,
+        })
+        .collect();
+    let c9_pending = pending
+        .iter()
+        .any(|s| matches!(s.kind, SuspectKind::C9Unreferenced { .. }));
+    // The C10 record witness, half one: `(nlink, ctime)` under the ino's
+    // exclusive 4a lease, read BEFORE the fresh pass. Every same-volume op
+    // that moves an inode's name count mutates its record in the same
+    // transaction, so a witness that survives the whole pass is what makes
+    // the pass's read-over-time skew (two dentry pages either side of one
+    // atomic rename) unable to produce a finding. Acquired and released one
+    // ino at a time: fsck never holds a lease set across a walk.
+    let mut c10_witness: HashMap<u64, (u32, u64)> = HashMap::new();
+    if online {
+        let mut inos: Vec<u64> = c10_judged.iter().copied().collect();
+        inos.sort_unstable();
+        for ino in inos {
+            let (vol_idx, local) = ctx.meta.route_ino(ino);
+            let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
+                continue;
+            };
+            let _lease = kv.dlm().lock_inode_exclusive(local).await;
+            if let Ok(Some(v)) = kv.read_inode_value_routed(local).await {
+                c10_witness.insert(ino, (v.nlink, v.ctime));
+            }
+        }
+    }
+    let fresh_pass = if (online && c9_pending) || !c10_judged.is_empty() {
         let (refs, indexed) = build_referenced_inos(
             ctx.meta.clone(),
             opts.shard,
             opts.throttle_pct,
             opts.cancel.clone(),
+            Some(&c10_judged),
         )
         .await;
         counters.dentry_refs_indexed += indexed;
         Some(refs)
     } else {
         None
+    };
+    // C9's three-way gate, byte-for-byte as before: `Some(None)` = an
+    // incomplete pass (clears), `None` = offline (nothing in flight).
+    let fresh_refs = if online && c9_pending {
+        Some(fresh_pass.as_ref().and_then(|p| p.as_ref()))
+    } else {
+        None
+    };
+    // The inos an OPEN cross-volume plan names — the block plane's
+    // in-flight-registry role for the inode plane. A multi-commit plan is
+    // exactly the window where a count and a name legitimately disagree,
+    // and the plan's durable intent is what says one is in flight. One
+    // bounded range per volume, empty on a healthy set.
+    let intent_inos = if c10_judged.is_empty() && !pending.iter().any(is_c10_dangling) {
+        std::collections::HashSet::new()
+    } else {
+        open_intent_inos(ctx).await
     };
 
     // Phase C: per-suspect final verification.
@@ -2285,7 +2882,7 @@ async fn recheck_suspects(
                 );
                 let still_prior_era = kv.minted_in_prior_era(local);
                 let still_unnamed = match &fresh_refs {
-                    Some(Some(refs)) => !refs.contains(*ino),
+                    Some(Some(pass)) => !pass.refs.contains(*ino),
                     // Incomplete fresh pass ⇒ no verdict (clears).
                     Some(None) => false,
                     // Offline: nothing is in flight by definition.
@@ -2298,6 +2895,196 @@ async fn recheck_suspects(
                         "unreferenced inode: no dentry names ino {ino} (nlink {nlink},                          size {size} B, {blocks} block reference(s)); the record was                          minted in a PRIOR writer era and stayed unnamed across both                          dentry passes — a crashed cross-volume create leaves this shape                          with 0 blocks, pre-S3.5 cross-volume link/unlink damage with its                          blocks still attached"
                     ),
                     identity: Some(FindingId::C9Unreferenced { ino: *ino }),
+                })
+            }
+            // C10's count + zero-count arms share ONE ladder, and the
+            // DIRECTION is a property of the verified numbers rather than
+            // of the nomination — so neither arm can drift from the
+            // other's guards.
+            SuspectKind::C10NlinkMismatch { ino, .. }
+            | SuspectKind::C10ZeroNlinkNamed { ino, .. } => {
+                // Guard: an ino an OPEN cross-volume plan names is in
+                // flight by definition — a multi-commit plan is exactly
+                // the window where the count and the names disagree.
+                if intent_inos.contains(ino) {
+                    counters.nlink_transient_cleared += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                let (vol_idx, local) = ctx.meta.route_ino(*ino);
+                let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
+                    continue;
+                };
+                // The raw per-volume read under the exclusive 4a lease —
+                // the routed `getattr` would self-deadlock against it (the
+                // C4 lesson), and the fold-free value is what the census
+                // compared.
+                let _lease = if online {
+                    Some(kv.dlm().lock_inode_exclusive(local).await)
+                } else {
+                    None
+                };
+                let Ok(Some(val)) = kv.read_inode_value_routed(local).await else {
+                    // The record is gone: whatever this was, it is now the
+                    // dangling-name shape and the NEXT run owns it.
+                    counters.nlink_transient_cleared += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                };
+                // The witness's second half. Any change to the record
+                // across the fresh pass means an op that could move this
+                // ino's name count committed inside the pass, which is the
+                // only way the pass's read-over-time skew can produce a
+                // number — so the suspect clears.
+                if online && c10_witness.get(ino) != Some(&(val.nlink, val.ctime)) {
+                    counters.nlink_transient_cleared += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                // Every verdict's numerator: the DEDUPED distinct names
+                // the fresh pass collected. An incomplete pass records no
+                // verdict.
+                let names = match &fresh_pass {
+                    Some(Some(pass)) => pass.collected(*ino).len() as u32,
+                    _ => {
+                        counters.suspects_cleared += 1;
+                        continue;
+                    }
+                };
+                let is_dir = val.mode & libc::S_IFMT == libc::S_IFDIR;
+                if names == 0 {
+                    // Named by nobody is C9's object, never C10's.
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                if val.nlink == names || (is_dir && val.nlink > 0) {
+                    // Healed, or the record-count nomination was a slot
+                    // migration's duplicate that the distinct-name dedupe
+                    // resolved — and a live directory's nlink is never its
+                    // name count (`.` and every child's `..`).
+                    counters.nlink_transient_cleared += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                let object = format!("ino {ino}");
+                if val.nlink == 0 {
+                    counters.nlink_zero_named += 1;
+                    Some(FsckFinding {
+                        class: "C10".to_string(),
+                        object,
+                        evidence: format!(
+                            "nlink 0 while {names} dentry name(s) still reference ino \
+                             {ino}: DATA-LOSS RISK — the live-nlink skip that keeps \
+                             reclaim off a reachable inode no longer applies, so an \
+                             ordinary reclaim may destroy an inode a path still \
+                             resolves. A cross-volume unlink whose count step committed \
+                             and whose name step did not leaves exactly this shape{}",
+                            if is_dir {
+                                " (this inode is a DIRECTORY: its count is 2 + \
+                                 subdirectories, which this class does not compute, so \
+                                 repair refuses it)"
+                            } else {
+                                ""
+                            }
+                        ),
+                        identity: Some(FindingId::C10ZeroNlinkNamed { ino: *ino }),
+                    })
+                } else if val.nlink > names {
+                    counters.nlink_mismatch_high += 1;
+                    Some(FsckFinding {
+                        class: "C10".to_string(),
+                        object,
+                        evidence: format!(
+                            "nlink {} exceeds the {names} dentry name(s) that reference \
+                             ino {ino}: the inode and every block it owns can never be \
+                             reclaimed — a leak that reads as healthy. A cross-volume \
+                             link whose count step committed and whose name step did \
+                             not leaves exactly this shape",
+                            val.nlink
+                        ),
+                        identity: Some(FindingId::C10NlinkTooHigh { ino: *ino }),
+                    })
+                } else {
+                    counters.nlink_mismatch_low += 1;
+                    Some(FsckFinding {
+                        class: "C10".to_string(),
+                        object,
+                        evidence: format!(
+                            "nlink {} is below the {names} dentry name(s) that reference \
+                             ino {ino}: DATA-LOSS RISK — once ordinary unlinks drive \
+                             this count to 0, reclaim is entitled to destroy an inode a \
+                             live path still resolves",
+                            val.nlink
+                        ),
+                        identity: Some(FindingId::C10NlinkTooLow { ino: *ino }),
+                    })
+                }
+            }
+            SuspectKind::C10Dangling {
+                vol,
+                key,
+                parent,
+                name,
+                child_ino,
+                ..
+            } => {
+                // Same in-flight guard (a plan's `MintInode` may not have
+                // landed yet), then: the dentry record must still exist
+                // VERBATIM and still name this ino, and the ino must still
+                // have no record. The dentry lock class is the PARENT's
+                // (`owning_ino`'s rule for `TREE_DENTRIES`).
+                if intent_inos.contains(child_ino) || intent_inos.contains(parent) {
+                    counters.nlink_transient_cleared += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                let Some(kv) = ctx.meta.volumes.get(*vol) else {
+                    continue;
+                };
+                let local_parent =
+                    crate::meta_backend::kv::record::decode_dentry_key(key).map(|(p, _, _)| p);
+                let _lease = match (online, local_parent) {
+                    (true, Ok(p)) => Some(kv.dlm().lock_inode_exclusive(p).await),
+                    _ => None,
+                };
+                let still_named = match kv.trees()[1].lookup(key).await {
+                    Ok(Some(v)) => crate::meta_backend::kv::record::DentryValue::decode(&v)
+                        .map(|d| d.child_ino == *child_ino)
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                let (child_vol, child_local) = ctx.meta.route_ino(*child_ino);
+                let still_missing = match ctx.meta.volumes.get(child_vol) {
+                    Some(child_kv) => {
+                        matches!(
+                            child_kv.read_inode_value_routed(child_local).await,
+                            Ok(None)
+                        )
+                    }
+                    None => false,
+                };
+                if !(still_named && still_missing) {
+                    counters.nlink_transient_cleared += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                counters.dangling_dentries += 1;
+                Some(FsckFinding {
+                    class: "C10".to_string(),
+                    object: format!("dentry {parent}/{name}"),
+                    evidence: format!(
+                        "dangling dentry: '{name}' in parent {parent} names ino \
+                         {child_ino}, which has no inode record — the name resolves to \
+                         nothing (a lookup finds it and every stat of it fails). A \
+                         cross-volume unlink whose count step committed and whose name \
+                         step did not leaves exactly this shape; S3.5 made such a name \
+                         removable, and this class is what finds one"
+                    ),
+                    identity: Some(FindingId::C10DanglingDentry {
+                        vol: *vol,
+                        key_hex: hex(key),
+                        child_ino: *child_ino,
+                    }),
                 })
             }
             SuspectKind::C5Generation { dir, why } => {
@@ -2324,6 +3111,61 @@ async fn recheck_suspects(
         }
     }
     Ok(())
+}
+
+fn is_c10_dangling(s: &Suspect) -> bool {
+    matches!(s.kind, SuspectKind::C10Dangling { .. })
+}
+
+/// Every ino an **open** cross-volume intent's steps name — C10's
+/// in-flight exemption (the block plane's `inflight_contains` role for the
+/// inode plane).
+///
+/// A multi-commit plan is precisely the window where an inode's count and
+/// its names legitimately disagree, and `execute` retires the intent
+/// SYNCHRONOUSLY before releasing its guards (§4.10a), so an intent that
+/// still exists means a plan is in flight or a crash left one for the next
+/// mount to roll forward. Both parents and children are exempted: a plan's
+/// dentry steps move the parent's names and the child's count. One bounded
+/// range scan per volume, empty on a healthy set — and a decode failure
+/// exempts nothing while a SCAN failure exempts nothing either, which is
+/// safe here only because every other C10 guard still applies.
+async fn open_intent_inos(ctx: &FsckCtx) -> std::collections::HashSet<u64> {
+    use crate::meta_backend::crossvol_tx::{IntentRecord, XvStep};
+    let mut out = std::collections::HashSet::new();
+    for kv in &ctx.meta.volumes {
+        let Ok(intents) = kv.xv_scan_intents().await else {
+            continue;
+        };
+        for (_tx_id, image) in intents {
+            let Ok(record) = IntentRecord::decode(&image) else {
+                continue; // an unreadable intent refuses the next MOUNT; not ours to judge
+            };
+            for step in &record.steps {
+                out.insert(step.home_ino());
+                match step {
+                    XvStep::RemoveDentry {
+                        parent,
+                        expect_child,
+                        ..
+                    } => {
+                        out.insert(*parent);
+                        out.insert(*expect_child);
+                    }
+                    XvStep::InsertDentry { parent, child, .. } => {
+                        out.insert(*parent);
+                        out.insert(*child);
+                    }
+                    XvStep::SetNlink { ino, .. }
+                    | XvStep::TouchCtime { ino, .. }
+                    | XvStep::MintInode { ino, .. } => {
+                        out.insert(*ino);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The local ino a record key belongs to (per tree schema).
@@ -2627,6 +3469,18 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.dentry_refs_indexed, Ordering::Relaxed);
     m.fsck_current_era_exempted
         .fetch_add(c.current_era_exempted, Ordering::Relaxed);
+    m.fsck_nlink_names_counted
+        .fetch_add(c.nlink_names_counted, Ordering::Relaxed);
+    m.fsck_nlink_mismatch_high
+        .fetch_add(c.nlink_mismatch_high, Ordering::Relaxed);
+    m.fsck_nlink_mismatch_low
+        .fetch_add(c.nlink_mismatch_low, Ordering::Relaxed);
+    m.fsck_nlink_zero_named
+        .fetch_add(c.nlink_zero_named, Ordering::Relaxed);
+    m.fsck_dangling_dentries
+        .fetch_add(c.dangling_dentries, Ordering::Relaxed);
+    m.fsck_nlink_transient_cleared
+        .fetch_add(c.nlink_transient_cleared, Ordering::Relaxed);
     m.fsck_blocks_checked
         .fetch_add(c.blocks_checked, Ordering::Relaxed);
     m.fsck_refcounts_checked
@@ -2702,7 +3556,7 @@ pub struct RepairCounters {
     pub quarantined_records: u64,
     pub quarantined_blocks: u64,
     pub quarantined_bytes: u64,
-    /// Applied repairs per class (`"C1"`..`"C9"`).
+    /// Applied repairs per class (`"C1"`..`"C10"`).
     pub per_class: std::collections::BTreeMap<String, u64>,
 }
 
@@ -2958,6 +3812,47 @@ fn planned_action(id: &FindingId) -> (&'static str, String) {
                  pretending to keep them"
             ),
         ),
+        FindingId::C10NlinkTooHigh { ino } => (
+            "lower-nlink-to-counted-names",
+            format!(
+                "quarantine ino {ino}'s inode record, then set nlink to the DEDUPED \
+                 distinct names counted under its exclusive lease. Lowering a count is \
+                 the one C10 repair that could make a named inode reclaimable if the \
+                 count were wrong, so it runs only when a third independent dentry pass \
+                 agrees, the record is unchanged, no cross-volume plan is open, and the \
+                 counted names are ≥ 1 (0 names is C9's object, never this one)"
+            ),
+        ),
+        FindingId::C10NlinkTooLow { ino } => (
+            "raise-nlink-to-counted-names",
+            format!(
+                "quarantine ino {ino}'s inode record, then RAISE nlink to the deduped \
+                 distinct names counted under its exclusive lease. Raising is the safe \
+                 direction: an over-count delays reclaim (a leak), while dropping a name \
+                 to match a low count would be data loss and is never the repair"
+            ),
+        ),
+        FindingId::C10ZeroNlinkNamed { ino } => (
+            "raise-nlink-to-counted-names",
+            format!(
+                "quarantine ino {ino}'s inode record, then raise nlink from 0 to the \
+                 deduped distinct names that resolve to it — making the inode live again \
+                 is what the names already say, and it re-arms the live-nlink skip that \
+                 keeps reclaim off it. Refused for a directory (its count is 2 + \
+                 subdirectories, which this class does not compute)"
+            ),
+        ),
+        FindingId::C10DanglingDentry { child_ino, .. } => (
+            "remove-dangling-dentry",
+            format!(
+                "quarantine the dentry record (key AND value) and then delete it: the \
+                 name resolves to nothing because ino {child_ino} has no inode record, so \
+                 removal is the only possible repair (there is nothing to re-point it \
+                 at). Refused when the named child was a DIRECTORY — that removal must \
+                 also decide the parent's directory nlink, which this class does not \
+                 verify"
+            ),
+        ),
         FindingId::C7Scrub { mapping, .. } => (
             "quarantine-mapping",
             format!(
@@ -3130,37 +4025,85 @@ pub async fn repair(
             FindingId::C2Leaked { .. } | FindingId::C2Lost { .. } | FindingId::C3Refcount { .. }
         )
     });
-    let fresh = if needs_census {
+    let mut fresh = if needs_census {
         let mut scratch = FsckCounters::default();
         Some(walk_census(ctx, &FsckOptions::offline(), &mut scratch).await?)
     } else {
         None
     };
-    // C9's repair-time ground truth: ONE dentry pass (repair is refused
-    // under `--shards`, so this is always the whole set). `None` = the
-    // pass could not complete, which REFUSES every C9 action — destroying
-    // an inode whose name might exist is exactly what must not happen.
-    let repair_refs = if actionable
+    // The inode plane's repair-time ground truth: ONE dentry pass (repair
+    // is refused under `--shards`, so this is always the whole set) —
+    // C9's "is it named" and C10's deduped name identities from the same
+    // walk. `None` = the pass could not complete, which REFUSES every
+    // inode-plane action: destroying an inode whose name might exist, or
+    // lowering a count against a partial name set, is exactly what must
+    // not happen.
+    let inode_plane_inos: std::collections::HashSet<u64> = actionable
         .iter()
-        .any(|(_, id)| matches!(id, FindingId::C9Unreferenced { .. }))
+        .filter_map(|(_, id)| match id {
+            FindingId::C10NlinkTooHigh { ino }
+            | FindingId::C10NlinkTooLow { ino }
+            | FindingId::C10ZeroNlinkNamed { ino } => Some(*ino),
+            _ => None,
+        })
+        .collect();
+    let repair_refs = if !inode_plane_inos.is_empty()
+        || actionable
+            .iter()
+            .any(|(_, id)| matches!(id, FindingId::C9Unreferenced { .. }))
     {
         build_referenced_inos(
             ctx.meta.clone(),
             None,
             100,
             Arc::new(AtomicBool::new(false)),
+            Some(&inode_plane_inos),
         )
         .await
         .0
     } else {
         None
     };
-    // **C9 first.** A C9 destroy deletes a REFERENCER: every block-class
-    // finding naming its blocks becomes stale and resolves as a refused
-    // (verified-healed) repair, instead of paying quarantine work — or
-    // re-allocating blocks — on an inode that is about to be destroyed.
+    // C10's in-flight exemption at repair time too: a plan in flight is
+    // never repaired around.
+    let repair_intents = if inode_plane_inos.is_empty()
+        && !actionable
+            .iter()
+            .any(|(_, id)| matches!(id, FindingId::C10DanglingDentry { .. }))
+    {
+        std::collections::HashSet::new()
+    } else {
+        open_intent_inos(ctx).await
+    };
+    // **The inode plane first, C9 before C10, then everything else.**
+    //
+    // A C9 destroy deletes a REFERENCER: every block-class finding naming
+    // its blocks becomes stale and resolves as a refused (verified-healed)
+    // repair, instead of paying quarantine work — or re-allocating blocks —
+    // on an inode that is about to be destroyed.
+    //
+    // C10 follows for the mirror-image reason: the census SKIPS
+    // `nlink == 0` records, so a zero-count-with-a-name inode's blocks were
+    // walked as allocated-unreferenced (C2-leaked). Raising the count
+    // re-attaches them, and freeing them first would destroy the data the
+    // raise restores — so the raise must precede the block plane, and the
+    // block plane's census is re-walked once the inode plane has moved
+    // (`census_stale` below). C9 and C10 never claim the same inode (C9's
+    // object is named by nobody, every C10 count object is named by
+    // somebody), so their relative order costs neither of them anything.
     // Stable, so every other class keeps its report order.
-    actionable.sort_by_key(|(_, id)| u8::from(!matches!(id, FindingId::C9Unreferenced { .. })));
+    actionable.sort_by_key(|(_, id)| match id {
+        FindingId::C9Unreferenced { .. } => 0u8,
+        FindingId::C10NlinkTooHigh { .. }
+        | FindingId::C10NlinkTooLow { .. }
+        | FindingId::C10ZeroNlinkNamed { .. }
+        | FindingId::C10DanglingDentry { .. } => 1,
+        _ => 2,
+    });
+    // Set by an applied inode-plane raise: the next block-class
+    // verification re-walks the census rather than trusting one taken
+    // before the inode plane moved.
+    let mut census_stale = false;
 
     let refuse = |out: &mut RepairReport, f: &FsckFinding, why: String| {
         out.refused.push(RepairAction {
@@ -3175,7 +4118,7 @@ pub async fn repair(
         class
             .strip_prefix('C')
             .and_then(|n| n.parse::<usize>().ok())
-            .filter(|n| (1..=9).contains(n))
+            .filter(|n| (1..=10).contains(n))
             .map(|n| n - 1)
     };
     let apply_ok = |out: &mut RepairReport, f: &FsckFinding, verb: &str, detail: String| {
@@ -3195,6 +4138,22 @@ pub async fn repair(
 
     for (f, id) in actionable {
         let what = format!("{}:{}", f.class, f.object);
+        // An applied inode-plane raise re-attached blocks the census walked
+        // as unreferenced, so the block classes must not verify against it:
+        // re-walk ONCE, here, where the ordering above guarantees the inode
+        // plane is already done.
+        if census_stale
+            && matches!(
+                id,
+                FindingId::C2Leaked { .. }
+                    | FindingId::C2Lost { .. }
+                    | FindingId::C3Refcount { .. }
+            )
+        {
+            let mut scratch = FsckCounters::default();
+            fresh = Some(walk_census(ctx, &FsckOptions::offline(), &mut scratch).await?);
+            census_stale = false;
+        }
         match id {
             // ------------------------------------ C8 durable-ref drift
             //
@@ -3290,7 +4249,7 @@ pub async fn repair(
                     continue;
                 }
                 match &repair_refs {
-                    Some(refs) if refs.contains(*ino) => {
+                    Some(pass) if pass.refs.contains(*ino) => {
                         refuse(
                             &mut out,
                             f,
@@ -3403,6 +4362,350 @@ pub async fn repair(
                         keys.len()
                     ),
                 );
+            }
+            // ------------------------------ C10 nlink vs counted names
+            //
+            // ONE verification ladder for all three inode-plane arms; the
+            // DIRECTION only chooses the delta's sign, so a future arm
+            // cannot acquire a weaker check by accident. Order:
+            //
+            // 1. no OPEN cross-volume plan names this ino (a plan in flight
+            //    is exactly the window where a count and its names
+            //    legitimately disagree);
+            // 2. under the ino's exclusive 4a lease: the record still
+            //    exists, and it is not a directory (a directory's count is
+            //    2 + subdirectories — this class does not compute that, so
+            //    it refuses rather than writing a number it cannot verify);
+            // 3. the repair-time dentry pass — a THIRD independent count,
+            //    deduped by `(global parent, name)` — still disagrees with
+            //    the record, in the direction the finding claims;
+            // 4. quarantine the record bytes, then ONE journaled
+            //    `routed_nlink_adjust` under the SAME lease.
+            //
+            // A crash anywhere leaves either the old count (re-detected) or
+            // the new one (healed): both converge, and the quarantine copy
+            // exists either way.
+            FindingId::C10NlinkTooHigh { ino }
+            | FindingId::C10NlinkTooLow { ino }
+            | FindingId::C10ZeroNlinkNamed { ino } => {
+                if repair_intents.contains(ino) {
+                    refuse(
+                        &mut out,
+                        f,
+                        "an open cross-volume plan names this inode: its count and its \
+                         names are allowed to disagree until the plan retires"
+                            .to_string(),
+                    );
+                    continue;
+                }
+                let Some(pass) = repair_refs.as_ref() else {
+                    refuse(
+                        &mut out,
+                        f,
+                        "the dentry pass could not complete: repair refuses rather than \
+                         write a link count derived from a partial name set"
+                            .to_string(),
+                    );
+                    continue;
+                };
+                let names = pass.collected(*ino).len() as u32;
+                let (vol_idx, local) = ctx.meta.route_ino(*ino);
+                let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
+                    refuse(&mut out, f, "volume index no longer exists".to_string());
+                    continue;
+                };
+                // ONE lease across verify AND mutate: the adjust holds it
+                // (never re-acquires it — that would self-deadlock the
+                // non-reentrant stripe lock), so nothing can move the count
+                // between the two.
+                let lease: Arc<[crate::meta_backend::dlm::DlmGuard]> = if online {
+                    Arc::from(vec![kv.dlm().lock_inode_exclusive(local).await])
+                } else {
+                    Arc::from(Vec::new())
+                };
+                let value = match kv.read_inode_value_routed(local).await {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        refuse(
+                            &mut out,
+                            f,
+                            "the inode record is gone (already reclaimed) — the name, if \
+                             one remains, is the dangling-dentry arm's object"
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        refuse(&mut out, f, format!("inode record unreadable: {e}"));
+                        continue;
+                    }
+                };
+                if value.mode & libc::S_IFMT == libc::S_IFDIR {
+                    refuse(
+                        &mut out,
+                        f,
+                        "this inode is a DIRECTORY: its nlink counts `.` and every \
+                         child's `..`, so the number of dentry names is not the count to \
+                         write. Reported, never guessed at (parent/subdirectory \
+                         accounting is outside this class)"
+                            .to_string(),
+                    );
+                    continue;
+                }
+                if names == 0 {
+                    refuse(
+                        &mut out,
+                        f,
+                        "no dentry names this inode now: an unreferenced inode is class \
+                         C9's object (destroy + reclaim), and lowering a count to 0 here \
+                         would strand it instead"
+                            .to_string(),
+                    );
+                    continue;
+                }
+                if value.nlink == names {
+                    refuse(
+                        &mut out,
+                        f,
+                        format!(
+                            "nlink {names} already matches the {names} deduped name(s) \
+                             (healed since the scan, or the scan's record count included \
+                             a slot migration's in-flight duplicate)"
+                        ),
+                    );
+                    continue;
+                }
+                let lowering = value.nlink > names;
+                if lowering != matches!(id, FindingId::C10NlinkTooHigh { .. }) {
+                    refuse(
+                        &mut out,
+                        f,
+                        format!(
+                            "the disagreement reversed direction since the scan (nlink \
+                             {} vs {names} name(s)): re-run detection rather than apply \
+                             a stale verdict",
+                            value.nlink
+                        ),
+                    );
+                    continue;
+                }
+                let ikey = crate::meta_backend::kv::record::inode_key(local);
+                let Ok(Some(record)) = kv.trees()[0].lookup(&ikey).await else {
+                    refuse(
+                        &mut out,
+                        f,
+                        "the inode record vanished between verify and quarantine".to_string(),
+                    );
+                    continue;
+                };
+                let note = format!(
+                    "ino {ino} inode record before the link-count repair: nlink {} → \
+                     {names} (the deduped distinct names: {})",
+                    value.nlink,
+                    pass.collected(*ino)
+                        .iter()
+                        .map(|n| format!("{}/{}", n.parent, String::from_utf8_lossy(&n.name)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let bytes = quarantine
+                    .put(
+                        &f.class,
+                        &f.object,
+                        if lowering {
+                            "lower-nlink-to-counted-names"
+                        } else {
+                            "raise-nlink-to-counted-names"
+                        },
+                        &note,
+                        &[("inode_record", &record)],
+                    )
+                    .await?;
+                out.counters.quarantined_records += 1;
+                out.counters.quarantined_bytes += bytes;
+                fire_repair_abort_hook(&what)?;
+                let delta = i64::from(names) - i64::from(value.nlink);
+                match kv.routed_nlink_adjust(local, delta, false, lease).await {
+                    Ok(post) => {
+                        // A raise re-attaches this inode's blocks to the
+                        // live census the block classes verify against.
+                        if !lowering {
+                            census_stale = true;
+                        }
+                        apply_ok(
+                            &mut out,
+                            f,
+                            if lowering {
+                                "lower-nlink-to-counted-names"
+                            } else {
+                                "raise-nlink-to-counted-names"
+                            },
+                            format!(
+                                "ino {ino} nlink {} → {} to match its {names} deduped \
+                                 name(s), in one journaled transaction under the ino's \
+                                 exclusive lease (record quarantined first)",
+                                value.nlink, post.nlink
+                            ),
+                        );
+                    }
+                    Err(e) => refuse(
+                        &mut out,
+                        f,
+                        format!(
+                            "the link-count commit failed ({e}) — nothing was changed and \
+                             the finding survives for the next run"
+                        ),
+                    ),
+                }
+            }
+            // ------------------------------------ C10 dangling dentry
+            //
+            // The name resolves to nothing, so removal is the ONLY
+            // possible repair — there is nothing to re-point it at and
+            // nothing to fabricate. Verified under the PARENT's exclusive
+            // 4a lease (the dentry lock class): the record still exists
+            // VERBATIM at its exact key, still names this ino, and the ino
+            // still has no record.
+            FindingId::C10DanglingDentry {
+                vol,
+                key_hex,
+                child_ino,
+            } => {
+                if repair_intents.contains(child_ino) {
+                    refuse(
+                        &mut out,
+                        f,
+                        "an open cross-volume plan names this inode: its record may still \
+                         be minted by the plan's roll-forward"
+                            .to_string(),
+                    );
+                    continue;
+                }
+                let Some(kv) = ctx.meta.volumes.get(*vol) else {
+                    refuse(&mut out, f, "volume index no longer exists".to_string());
+                    continue;
+                };
+                let Some(key) = unhex(key_hex) else {
+                    refuse(&mut out, f, "undecodable dentry key identity".to_string());
+                    continue;
+                };
+                let Ok((local_parent, _, _)) =
+                    crate::meta_backend::kv::record::decode_dentry_key(&key)
+                else {
+                    refuse(&mut out, f, "undecodable dentry key identity".to_string());
+                    continue;
+                };
+                let _lease = if online {
+                    Some(kv.dlm().lock_inode_exclusive(local_parent).await)
+                } else {
+                    None
+                };
+                let record = match kv.trees()[1].lookup(&key).await {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        refuse(
+                            &mut out,
+                            f,
+                            "the dentry record is already gone (removed since the scan)"
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        refuse(&mut out, f, format!("dentry record unreadable: {e}"));
+                        continue;
+                    }
+                };
+                let Ok(dentry) = crate::meta_backend::kv::record::DentryValue::decode(&record)
+                else {
+                    refuse(
+                        &mut out,
+                        f,
+                        "the dentry value no longer decodes (class C1's object)".to_string(),
+                    );
+                    continue;
+                };
+                if dentry.child_ino != *child_ino {
+                    refuse(
+                        &mut out,
+                        f,
+                        format!(
+                            "the name now points at ino {} instead of {child_ino} \
+                             (reused since the scan)",
+                            dentry.child_ino
+                        ),
+                    );
+                    continue;
+                }
+                if dentry.file_type == libc::DT_DIR {
+                    refuse(
+                        &mut out,
+                        f,
+                        "the name referenced a DIRECTORY: removing it must also decrement \
+                         the parent's directory nlink, and this class does not verify a \
+                         directory's count — reported for an operator, never guessed at"
+                            .to_string(),
+                    );
+                    continue;
+                }
+                let (child_vol, child_local) = ctx.meta.route_ino(*child_ino);
+                let child_present = match ctx.meta.volumes.get(child_vol) {
+                    Some(child_kv) => !matches!(
+                        child_kv.read_inode_value_routed(child_local).await,
+                        Ok(None)
+                    ),
+                    None => true,
+                };
+                if child_present {
+                    refuse(
+                        &mut out,
+                        f,
+                        format!(
+                            "ino {child_ino} has an inode record again: the name resolves, \
+                             so there is nothing dangling to remove"
+                        ),
+                    );
+                    continue;
+                }
+                let note = format!(
+                    "dangling dentry record before removal: '{}' in local parent \
+                     {local_parent} on volume {vol}, naming ino {child_ino} (no inode \
+                     record); key and value are both copied, so the name can be \
+                     reconstructed exactly",
+                    String::from_utf8_lossy(&dentry.name)
+                );
+                let bytes = quarantine
+                    .put(
+                        &f.class,
+                        &f.object,
+                        "remove-dangling-dentry",
+                        &note,
+                        &[("dentry_key", &key), ("dentry_value", &record)],
+                    )
+                    .await?;
+                out.counters.quarantined_records += 1;
+                out.counters.quarantined_bytes += bytes;
+                fire_repair_abort_hook(&what)?;
+                match kv.trees()[1].delete(&key).await {
+                    Ok(()) => apply_ok(
+                        &mut out,
+                        f,
+                        "remove-dangling-dentry",
+                        format!(
+                            "the name resolving to ino {child_ino} was removed (key and \
+                             value quarantined first); the inode it named does not exist, \
+                             so no link count changes"
+                        ),
+                    ),
+                    Err(e) => refuse(
+                        &mut out,
+                        f,
+                        format!(
+                            "the dentry removal failed ({e}) — the name survives for the \
+                             next run"
+                        ),
+                    ),
+                }
             }
             // -------------------------------------------------- C1 torn
             FindingId::C1Torn {

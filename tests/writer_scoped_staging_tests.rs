@@ -1168,6 +1168,15 @@ fn incompat_bits_are_single_bit_and_pairwise_disjoint() {
             "KV_MULTI_WRITER_DATA",
             sb::FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA,
         ),
+        // §6.2 items 5/6. These two also authored themselves at 10/11 and
+        // renumbered to 12/13 at integration — the THIRD parallel claim. The
+        // union clause below is what makes that a red test rather than an
+        // on-disk aliasing bug discovered in the field.
+        ("KV_INO_LANES", sb::FEATURE_INCOMPAT_KV_INO_LANES),
+        (
+            "KV_BLOCK_KEY_INCARNATION",
+            sb::FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION,
+        ),
     ];
     let mut seen = 0u64;
     for (name, bit) in bits {

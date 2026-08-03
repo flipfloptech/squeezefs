@@ -10,6 +10,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
   - [Single-writer mount guard (guarantee classes)](#single-writer-mount-guard-guarantee-classes)
   - [Multi-writer data plane (DLM S9)](#multi-writer-data-plane-dlm-stage-s9)
   - [Multi-writer capacity planning — the allocation partition](#multi-writer-capacity-planning--the-data-plane-allocation-partition)
+  - [Multi-writer co-writer mounts (DLM S9)](#multi-writer-co-writer-mounts-dlm-stage-s9)
   - [Read-only coherent mounts (`-o ro`)](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers)
   - [Format v3 (CoW KV metadata)](#format-v3-cow-kv-metadata)
   - [Read-only coherent mounts — the stated consistency model](#read-only-coherent-mounts--the-stated-consistency-model-metadata)
@@ -115,13 +116,25 @@ The v3 metadata engine is single-writer by construction, and the mount enforces 
 | — loop-device-backed nvmet namespace (the repo's own file-backed share path, `losetup` wrap) | loop devices expose no PR ⇒ lands in the **"block without PR"** row below — named explicitly because the repo's own tooling creates this shape |
 | Block volume **without** PR support | **Detection-grade**: mounts separated by > ~1 heartbeat are refused; near-simultaneous mounts can both arm; a paused holder cannot detect usurpation — therefore automatic cross-host takeover is disabled (operator-attested `claim clear` only) |
 | File-backed volume shared cross-host (NFS et al.), or containers with private `/dev` nodes | **Unsupported for concurrent-mount protection** — single-host operation of such volumes remains fully guarded by flock (former) / PR-if-available (latter) |
+| **Co-writer mount** (`SQUEEZEFS_MULTI_WRITER=1` + `SQUEEZEFS_MW_ROLE=co-writer`, admitted by the five-rung ladder) | **A second write-capable mount, admitted — and the first row in this table that is** (DLM S9; guarantee class `co-writer`). It is NOT a second *appender*: it takes no `flock`, writes no `writer_claim`, registers no key on the metadata namespaces and spawns no checkpoint task, and its metadata write gate refuses every LOCAL commit — every metadata mutation is **shipped** to the authority, whose ladder above runs unchanged. Its DATA writes are its own, admitted only under a custody lease that authority granted. **What ENFORCES it:** on a PR substrate the authority's rtype-1 Write Exclusive on the metadata namespaces means a co-writer *on another host* is device-blocked from writing metadata at all, and the rtype-2 WERO hold on the data namespaces means a preempted co-writer's DMA is rejected by the namespace; which bytes each co-writer may write is the authority's custody arbitration. **What only DETECTS:** the durable claim-set enrollment and the membership census (they answer *who is attached* and mint the dead epoch a failure is quarantined under — they stop nothing by themselves), and — the honest residual — a co-writer sharing a HOST with its authority is inside the same PR host identity, so nothing device-side distinguishes them: on that shape the metadata read-only half is enforced by this mount's own code, not by the device. **What an operator must have configured:** every rung of the ladder, listed in [Multi-writer co-writer mounts](#multi-writer-co-writer-mounts-dlm-stage-s9) — and note that today no volume passes rung 2, because nothing stamps the capability bits (ruling D9) |
 | **Read-only mount** (`-o ro` / `--read-only`, any substrate) | **Not a writer, and not an obstacle to one** — guarantee class `reader`. A read-only mount takes NO `flock`, writes NO `writer_claim` and registers NO PR key, so (a) it is admitted while a writer holds the volume — including a *fresh foreign* claim, which refuses a write mount — (b) it never refuses a write mount, in either mount order, and (c) it changes nothing about the rows above: a second WRITER is still refused by exactly the same ladder. It mutates no plane (metadata, block allocation, frees, device reclaim, in-place patch/overwrite are all refused) and the kernel mounts it `MS_RDONLY`. Its *consistency* guarantee — which is a separate question from exclusion — is in [Read-only coherent mounts](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers) |
 
-**DLM S9 changes none of the rows above, deliberately.** The multi-writer data
-plane grants *data* custody to peers; it does not make a second **write mount**
-of one metadata volume admissible, because a co-writer holds no `writer_claim`
-and the guard's fresh-foreign refusal fires first. See
-[Multi-writer data plane](#multi-writer-data-plane-dlm-stage-s9).
+**What DLM S9 changed, and what it did not.** Every row above except the
+co-writer one is **byte-for-byte what it was**: the `flock`, the claim
+classification (including the fresh-foreign refusal), the PR arbitration and
+the `claim clear` attestation all behave identically, and a plain `mount` of a
+claimed volume set is refused exactly as before — including when the volumes
+carry every capability bit and this node is enrolled. The co-writer row is
+reached through a **different entry point**, not through the gate: a caller
+needs an admission decision (five rungs, all of them) to open a volume that
+way, and the only thing that produces one is the ladder. So the sentence
+"a second write mount of one metadata volume is refused" is still true in the
+sense the guard means it — a second *appender* to a volume's journal ring,
+extent bitmap and root ledger is impossible — and is now false in the looser
+sense of "a second mount that can write user data", which is exactly the
+capability S9 exists to add. The custody half of it is
+[Multi-writer data plane](#multi-writer-data-plane-dlm-stage-s9); the mount
+half is [Multi-writer co-writer mounts](#multi-writer-co-writer-mounts-dlm-stage-s9).
 
 #### The DATA plane (DLM stage S7)
 
@@ -188,14 +201,13 @@ because an operator will otherwise discover them as a refusal):
 1. **Nothing stamps the capability bits** (ruling D9). Every field volume
    fails the format rung. The Phase-8 batched reformat window is where they
    land.
-2. **The D0 guard still refuses a second write mount on every substrate.** The
-   metadata guarantee-class table above is **unchanged by S9** — deliberately.
-   A co-writer holds no `writer_claim`, and the guard's fresh-foreign refusal
-   fires before the mount can open the volumes, so the co-writer posture is
-   unreachable until that gate admits a co-member of an engaged claim set
-   (§6.2 item 7's consumer half). What ships today is the half that can be
-   shipped safely: a mount that **serves** custody and the publish path to
-   peers.
+2. ~~The D0 guard still refuses a second write mount on every substrate.~~
+   **Closed**: the co-writer posture and its admission gate now exist —
+   [Multi-writer co-writer mounts](#multi-writer-co-writer-mounts-dlm-stage-s9).
+   The D0 gate itself was not weakened to do it (a co-writer enters through a
+   second door that requires a five-rung admission decision), so blocker 1
+   still gates the field: with no volume carrying bit 14, no node can be
+   enrolled and rung 2 refuses every set.
 
 Operator surface: `SQUEEZEFS_MULTI_WRITER=1` (arm; refuses loudly, naming the
 missing piece), `SQUEEZEFS_MW_BIND` (`auto` — the default — / `addr:port` /
@@ -279,6 +291,111 @@ stride coarser: a run of blocks a writer owns is `W`-strided rather than dense.
 `frag_d1_contiguity` therefore reads lower on a partitioned volume by
 construction — compare it against other partitioned mounts, not against a
 single-writer baseline.
+#### Multi-writer co-writer mounts (DLM stage S9)
+
+**Status: the posture and its admission gate ship; no field volume can pass
+rung 2, because nothing stamps the capability bits (ruling D9). Do not plan a
+deployment around this section — plan a reformat window first.** Design:
+`docs/pre-rc-engineering-spec.md` §6.2 item 7 (consumer half) / §6.9 S9;
+contracts `tests/dlm_cowriter_tests.rs`.
+
+A **co-writer** is a second write-capable mount of one volume set that holds no
+metadata authority:
+
+| Plane | A co-writer's authority |
+|---|---|
+| metadata | **none locally.** Every mutation is SHIPPED to the authority (the D0 claim holder). A local commit is refused, naming the shipped path (`cowriter.local_commit_refusals`) |
+| data (DMA) | **yes, under a granted custody lease** — the bytes go straight to the shared namespace, authorized locally under the custody epoch. Only custody travels |
+| ownership accounting (allocate / terminal free / W1 incarnation retire / device reclaim) | **none.** Which device offsets are owned is durable metadata on volumes it cannot commit to, so these are refused (`cowriter.accounting_refusals`) — see *What a co-writer cannot do yet* below |
+
+**The admission ladder, in evaluation order.** Every refusal names its rung,
+what is missing and the remedy; nothing that mutates state (rung 5's device
+registration) runs before every declarative rung has passed, and a later
+refusal undoes it.
+
+| Rung | Requirement | Why it is a rung and not a nicety |
+|---|---|---|
+| **1** | `SQUEEZEFS_MULTI_WRITER=1`, `SQUEEZEFS_MW_ROLE=co-writer`, `SQUEEZEFS_MW_AUTHORITY=addr:port`, and **not** `-o ro` | the posture is **declared, never inferred**. A plain `mount` of a claimed set still refuses `FreshForeign`, so no operator can acquire a second write-capable mount by accident |
+| **2** | every metadata volume of the set carries all six capability bits — **14 (`KV_CLAIM_SET`) included** — and answers a **durable** `claim_set` record | a half-engaged set is not a claim set. Un-engaged, membership *is* the singular `writer_claim` read through a projection: a record that expresses exclusion and cannot represent a second member |
+| **3** | that durable set names **this node** as a `writer` member | admission is by durable **enrollment**, written by the authority — never by a claim the joining node makes about itself |
+| **4** | the membership plane is armed and this mount holds a **live** lease from the authority, whose era is not older than the set's `writer_claim` | a co-writer with no live authority has no custody source and, worse, **no evictor**: S6's eviction is what mints the dead epoch its in-flight offsets are quarantined under |
+| **5** | the data namespaces hold a standing **WERO (rtype 2)** reservation and this node's key is among the device's **registrants** | §6.7's "refused on non-PR" governs the *admission* decision too. A co-writer the device cannot reject is a co-writer nothing can fence, and its death could never produce a drain proof — the proof *is* the preempt of this registrant key |
+
+**Who writes the enrollment record (and why a co-writer cannot).** The
+`claim_set` record is a metadata commit on ino 1, and a co-writer holds no
+metadata authority — so it cannot enroll itself, and rung 3 is not a formality
+it can satisfy by asserting. Enrollment is an act of the **authority** over its
+operator-declared roster: `SQUEEZEFS_MW_MEMBERS=node_…,node_…` on the authority
+mount, committed once per membership change at its multi-writer arm. That forces
+the enrollment identity to be a **node** identity rather than a per-mount uuid,
+because the entry must exist *before* the mount that would mint a uuid: it is
+the writer-scope node token (`/etc/machine-id` and its ladder — the same
+identity that scopes this node's staged payloads), rendered `node_{16 hex}`.
+
+**Bringing one up.**
+
+1. On the AUTHORITY: a normal write mount with `SQUEEZEFS_MULTI_WRITER=1`,
+   `SQUEEZEFS_MW_BIND=<addr:port>` (or `auto`), `SQUEEZEFS_MEMBERSHIP_BIND`
+   armed, and `SQUEEZEFS_JOB_WIRE_BIND` armed (it writes `job:enroll`, the
+   cluster's root of trust). It refuses loudly if the substrate, the format or
+   the plane is not ready.
+2. On the CO-WRITER: mount with `SQUEEZEFS_MULTI_WRITER=1`,
+   `SQUEEZEFS_MW_ROLE=co-writer`, `SQUEEZEFS_MW_AUTHORITY=<the authority's
+   MW_BIND endpoint>`. It will be **refused at rung 3**, and the refusal prints
+   this node's `node_{16 hex}` id.
+3. Back on the AUTHORITY: add that id to `SQUEEZEFS_MW_MEMBERS` and re-arm, so
+   the entry is committed durably. `squeezefs clients` and the census then show
+   the node once it joins.
+4. Remount the co-writer. On success its log says `CO-WRITER ADMITTED`, naming
+   the authority claim, the era, the membership owner, the custody endpoint and
+   the device registrant key; `.stats` reads `mount_posture: "co-writer"` and
+   each volume's `writer_guard_mode` reads `co-writer`.
+
+**What a co-writer cannot do yet, and what that costs.** Fresh **allocation** is
+refused, naming the data-plane allocation partition that owns it: a co-writer
+allocating offsets from its own local map would collide with the authority's
+allocator, and the alternative (taking pre-allocated destinations, the job
+wire's model) is not yet a write *path* — the layout publish, the displaced-block
+free and the refcount delta of every write would each have to ride the
+authority, and only the publish half is landed. The practical consequence is
+that a co-writer today serves reads coherently, ships metadata, and can write
+only into destinations its custody grant declares. `cowriter.accounting_refusals`
+counting up is that gap being honest rather than silent.
+
+**A co-writer takes no lock, and denies the authority nothing.** It runs the S5
+reader's *released* `flock(LOCK_SH)` probe — classification for the mount log
+only — and retains nothing, so both mount orders work and **two co-writer mounts
+on one host are legitimate** (their mutual exclusion is the authority's custody,
+not a local lock). It is also invisible to the recovery ladder as an owner:
+`squeezefs clients`' live/stale/dead classification, the dead-pid proof, the PR
+preempt arbitration and `squeezefs claim clear` all read evidence a co-writer
+never writes (no `writer_claim`, no retained flock, no metadata-namespace
+registrant). What it *does* leave — a data-namespace registrant key and a
+claim-set member entry — is deliberate: those are what make it fenceable and
+visible.
+
+**Coherence.** A co-writer's metadata view is a **reader's** view: the state of
+the most recent checkpoint it has polled, with the same derived cadence and the
+same `reader_staleness_bound_ms` (§6.8 item 2's revalidation and item 5's purge
+are both armed for it). Its own mutations are never stale, because they execute
+on the authority. Everything the reader section says about bounded-not-eliminated
+DATA staleness (§6.8 item 3, not built) applies verbatim.
+
+**Live signals on `.stats`:** `mount_posture` (`writer` | `reader` |
+`co-writer`) and the `cowriter` object — `mw_role`, `admissions`,
+`admission_refusals`, `accounting_refusals`, `local_commit_refusals`,
+`custody_endpoint`. **`local_commit_refusals` should stay 0** on a healthy
+co-writer: nonzero means a daemon surface still commits metadata directly
+instead of shipping it (S8's "the daemon is not switched onto the router" gap
+meeting a real workload). Read them beside the custody ledger
+(`dlm_custody.*`), the publish ledger (`meta_ship_publish.*`, whose `refusals`
+must stay 0) and `data_plane_fence_mode` = 1.
+
+**What still cannot be demonstrated without two hosts on a PR fabric with
+stamped bits:** two independent node caches diverging (one process shares one
+cache), the device's rejection of a preempted co-writer's DMA (a fake namespace
+pins the decision, never the silicon), and the same-host PR host-identity
+residual noted in the guarantee-class table.
 
 ### Read-only coherent mounts (`-o ro`) — one writer plus N readers
 

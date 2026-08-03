@@ -119,7 +119,7 @@ Stages land in §6.9 order, each behind its stated gate. Additions from D1/D2/D4
 | S4 | Slot lock manager, solo mode — **LANDED 2026-08-03** (`src/dlm_slot.rs`; `tests/dlm_slot_lock_tests.rs`; design note `docs/design-dynamic-meta-routing.md` §9) | **mdstorm + rand-4k + scoreboard within noise** — DEFERRED by D11 (bench/rig freeze); `dlm_rpcs == 0` asserted in-suite across every acquire shape and exported on `.stats` | The go/no-go gate for everything after |
 | S5 | Read-only coherent client mounts (§6.8: RO mount mode, root-ledger revalidation cadence, freed-offset grace period, TTL alignment, purge-on-revalidation, reader lockdown) | N readers × cached stat/s capability row | The freed-offset grace period is also the multi-writer prerequisite (§6.3) |
 | S6 | Membership off the journal (lease-based liveness) | volume-0 journal tx/s → ~0 at 15 k **simulated** clients | The D1 validation harness lands here: 15 k simulated clients driving membership/heartbeat/lease planes |
-| S7 | Data-plane custody-epoch fence + dead-epoch quarantine + WERO on data namespaces (closes RES-6's cross-host face) | stop/resume-past-TTL leg shows **device rejection**, both stacks | Multi-writer refuses to arm on non-PR substrates; confirm PR on `SQZ_DEVSUB_TRANSPORT=tcp` (risk R7) |
+| S7 | Data-plane custody-epoch fence + dead-epoch quarantine + WERO on data namespaces (closes RES-6's cross-host face) | stop/resume-past-TTL leg shows **device rejection**, both stacks | Multi-writer refuses to arm on non-PR substrates; confirm PR on `SQZ_DEVSUB_TRANSPORT=tcp` (risk R7). **In-process half LANDED** (`src/data_custody.rs`, `tests/dlm_data_fence_tests.rs`): one authorization point, quarantine lifecycle, both refusals. The capability gate is **incompat bit 10** — built, never stamped (D9), so it joins the Phase-8 reformat window beside bit 7. The device-rejection gate is DEFERRED and specified verbatim in `docs/design-nvmeof-target-management.md` §6.8.1 |
 | S8 | Function-shipped metadata (12 verbs on the wire, pipelined) | serial `tar -x` A/B **published even if it regresses** (risk R1) | Uses S3.5 tx machinery for cross-volume ops |
 | S9 | Multi-writer data plane (custody tokens, direct DMA) | 15 k-**shaped** write fan-out row with write-amplification columns, at achievable real scale + simulated fan-out per D1 | The D1 workload shape (disjoint file sets) is the primary row; shared-file is a correctness row, not a perf row |
 | S10 | Subtree delegation + client-owned-slot placement | `tar -x` recovered to the S0 baseline | The D1 low-overlap workload makes delegation the steady-state path |
@@ -192,7 +192,7 @@ MEM-3 → TEST-6 → Z3 → zcrx default-on (D5)
 §6.11(red) → S2(green) ; S1 closes RES-2 ; S3 closes VAL-6 + carries DISC-1 ; S3 RTT number prices S8
 S3.5(cross-volume tx) → DUR-7 ; S3.5 → S8
 S4 gate → S5..S11 ; S5 grace period → S9 ; S7 → S9 ; S9 → S10 → S11
-D3 key-wrap + DUR-6 map + S2 bit7 + bit6 field validation → ONE reformat window (Phase 8)
+D3 key-wrap + DUR-6 map + S2 bit7 + S7 bit10 + bit6 field validation → ONE reformat window (Phase 8)
 TEST-7 → TEST-8 → manifest → tag
 ```
 

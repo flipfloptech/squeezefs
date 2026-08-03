@@ -153,3 +153,48 @@ merge — and this path is not hot.
 3. **Bench baseline reference refresh.** `block_refs` is a NEW group, so it
    has no entry in `.benchmarks/criterion-baselines/reference.json`. Refresh
    (`tests/run_bench_baseline.sh save`) as part of the intentional landing.
+
+---
+
+## 6. Gate status on this branch
+
+| Gate | Result |
+|---|---|
+| `cargo clippy --all-targets --all-features -- -D warnings` | **clean** |
+| `cargo fmt --check` | **clean** |
+| `cargo doc --no-deps` | no new warnings (the pre-existing private-link set is unchanged) |
+| `cargo test --all-features --lib -- --test-threads=1` | **213 passed** |
+| `durable_block_refs_tests` | **11 passed** |
+| kv suites (`kv_alloc`, `kv_backend`, `kv_journal`, `kv_node`, `kv_tree`, `kv_fold_slimming`, `kv_finding_a`, `kv_smo_crash_completeness`) | **all green** (kv_backend needed the pre-existing S2 digest fix — see below) |
+| clone / refcount (`refcount_clone`, `cli_clone`, `copy_file_range`) | all green |
+| reclaim (`block_free_reclaim`, `async_block_reclaim`, `discard_elision`) | all green |
+| fsck (`fsck_tests` 19, `fsck_repair_tests` 16) | all green |
+| layout/publish (`write_commit_economy`, `write_commit_crash`, `layout_delta_fold`, `recovery_prefixed_keys`, `indirect_map_backend_keys`) | all green |
+| `cargo bench --benches -- --test` (smoke) | criterion benches all green; the lib-harness leg trips a **pre-existing** flake (below) |
+
+### Pre-existing failures encountered, and their attribution
+
+1. **`kv_backend_tests::v3_mutations_survive_clean_shutdown_remount` and
+   `::v3_ring_full_liveness_storm_drains`** — failing since DLM S2
+   (`107f7bf9`) put the durable `writer_term` record inside `digest_walk`'s
+   scope. The term is monotone per mount by design, so a
+   digest-before-vs-after-remount comparison was structurally false (era N
+   vs era N+1). **Fixed on this branch** (`4afeb838`): one-line exclusion
+   beside `writer_claim`, same predicate, same justification — "mount-guard
+   state, not filesystem content".
+2. **`reclaim_batch_tests::test_destroy_inodes_kills_xattrs_in_the_same_transaction`**
+   — `setxattr(ino, "layout", …)` through the public `Metadata` surface now
+   returns EPERM under the VAL-2 positive allowlist (`80da757d`);
+   `xattr_name_allowed("layout")` is `false` by design. Not touched here:
+   the fix belongs with VAL-2 (the test should use the internal writer).
+3. **`node_cache::tests::{an_empty_memo_charges_nothing_and_credits_nothing,
+   racing_same_key_populates_charge_at_most_once,
+   racing_distinct_key_populates_conserve_the_charge_across_drop}`** — a
+   parallel-harness flake in the memo-gauge tests: all three read the
+   process-global `META_KV_FOLD_MEMO_BYTES` as their baseline, and the
+   default-threaded lib harness (which is what `cargo bench --benches --
+   --test` runs) lets siblings pollute it. **Verified pre-existing**: a
+   scratch worktree at the base commit `e7ce625f` fails 3/3 runs the same
+   way, while `--test-threads=1` (the house gate form) passes 213/213 on
+   both. Same class as the `dev_power_cut` registry collision the tree
+   already documents; belongs on the TEST-7 flake board.

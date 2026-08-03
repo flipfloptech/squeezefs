@@ -843,6 +843,123 @@ fn bench_superblock_cycle(c: &mut Criterion) {
     group.finish();
 }
 
+/// **The single-appender structures' hot paths** — the three §6.2
+/// assumptions the multi-writer append partitioning breaks (pre-RC
+/// engineering spec §6.2 items 2/3/4, ruling D9): the journal ring's
+/// per-page header stamp, the A/B extent bitmap's claim/park/release
+/// protocol, and the root ledger's slot encode + round-robin placement.
+///
+/// This group exists to price **solo mode** — the shipped
+/// single-appender path — before and after the partitioned forms land:
+/// spec §6.9's S4 gate ("solo mode is indistinguishable from today")
+/// arriving early for the format layer. Evidence note:
+/// `.benchmarks/2026-08-05-mw-partitioned-append.md`.
+///
+/// FIELD shapes (never toys):
+/// * allocator — a 64 GiB metadata volume at the shipped 256 KiB extent
+///   (the `dev_substrate.sh` mds namespace size, the same shape
+///   `kv_superblock` prices): 262,144 extents, 9 bitmap pages, the §4.7
+///   `max(8, 2 %)` compaction reserve, the shipped
+///   `PENDING_FREE_CAP` FIFO. `claim_park_release` is the whole §4.7
+///   per-extent protocol an SMO pays (claim the successor, park the
+///   predecessor gated on its free-record seq, release it when the
+///   durable tail covers it).
+/// * ledger — the record `checkpoint_cycle` actually writes: three tree
+///   roots + a live membership stamp (one stride run, one guest cursor
+///   — the shape a slot-mapped volume carries).
+fn bench_append_partition(c: &mut Criterion) {
+    use squeezefs::meta_backend::kv::alloc_ext::compaction_reserve_extents;
+    use squeezefs::meta_backend::kv::backend::PENDING_FREE_CAP;
+    use squeezefs::meta_backend::kv::checkpoint::{LedgerRecord, MembershipStamp, TreeRoot};
+    use squeezefs::meta_backend::kv::record::{TREE_DENTRIES, TREE_XATTRS};
+    use squeezefs::meta_backend::kv::slot_set::{SlotRun, SlotSet};
+
+    const VOL_LEN: u64 = 64 * 1024 * 1024 * 1024;
+    const EXTENT_LEN: u64 = 256 * 1024;
+    let total_extents = VOL_LEN / EXTENT_LEN;
+
+    let mut group = c.benchmark_group("kv_append_partition");
+    group.throughput(criterion::Throughput::Elements(1));
+
+    // ---- The A/B extent bitmap (§6.2 item 3): one whole-volume
+    // single-appender bitmap + one `advance_durable` tail today.
+    let alloc = ExtentAllocator::format(
+        total_extents,
+        compaction_reserve_extents(total_extents),
+        PENDING_FREE_CAP,
+    );
+    group.bench_function("alloc_claim_release", |b| {
+        b.iter(|| {
+            let e = alloc.claim_user().expect("heap has space");
+            alloc.release_unpublished(black_box(e));
+        })
+    });
+    let mut gate = 1u64;
+    group.bench_function("alloc_claim_park_release", |b| {
+        b.iter(|| {
+            let e = alloc.claim_internal().expect("heap has space");
+            gate += 1;
+            alloc.free_pending(black_box(e), gate).expect("FIFO room");
+            black_box(alloc.advance_durable(gate));
+        })
+    });
+
+    // ---- The A/B root ledger (§6.2 item 4): 32 round-robin slots,
+    // `slot = seq % 32`, newest-valid-wins.
+    let stamp = MembershipStamp {
+        set_uuid: [0x5A; 16],
+        set_epoch: 3,
+        member_position: 0,
+        member_count: 2,
+        routing_width: 1 << 16,
+        slots_hosted: SlotSet::from_runs(vec![SlotRun {
+            start: 0,
+            stride: 2,
+            count: 32_768,
+        }])
+        .expect("one stride run"),
+        native_slot: Some(0),
+        slot_cursors: vec![(0, 4096)],
+    };
+    let rec = LedgerRecord {
+        seq: 4_242,
+        tree_roots: vec![
+            TreeRoot {
+                tree_id: TREE_INODES,
+                node_addr: 0x40_0000,
+                node_seq: 7_001,
+            },
+            TreeRoot {
+                tree_id: TREE_DENTRIES,
+                node_addr: 0x80_0000,
+                node_seq: 7_002,
+            },
+            TreeRoot {
+                tree_id: TREE_XATTRS,
+                node_addr: 0xC0_0000,
+                node_seq: 7_003,
+            },
+        ],
+        journal_tail_seq: 9_876_543,
+        next_ino: 1_000_000,
+        alloc_bitmap_generation: 4_242,
+        node_seq_watermark: 7_100,
+        membership_stamp: Some(stamp),
+    };
+    group.bench_function("ledger_encode_slot", |b| {
+        b.iter(|| black_box(black_box(&rec).encode_slot().expect("fits a slot")))
+    });
+    let image = rec.encode_slot().expect("fits a slot");
+    group.bench_function("ledger_decode_slot", |b| {
+        b.iter(|| black_box(LedgerRecord::decode_slot(black_box(&image)).expect("decode")))
+    });
+    group.bench_function("ledger_slot_index", |b| {
+        b.iter(|| black_box(black_box(&rec).slot_index()))
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_kv_meta_metadata,
@@ -852,6 +969,7 @@ criterion_group!(
     bench_kv_fold,
     bench_kv_journal,
     bench_xattr_name_screen,
-    bench_superblock_cycle
+    bench_superblock_cycle,
+    bench_append_partition
 );
 criterion_main!(benches);

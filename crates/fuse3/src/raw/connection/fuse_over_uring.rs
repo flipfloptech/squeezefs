@@ -2002,6 +2002,11 @@ static GEOM_PAYLOAD_SZ: AtomicU64 = AtomicU64::new(0);
 static GEOM_MAX_BACKGROUND: AtomicU64 = AtomicU64::new(0);
 static GEOM_MAX_WRITE: AtomicU64 = AtomicU64::new(0);
 static GEOM_MAX_PAGES: AtomicU64 = AtomicU64::new(0);
+/// FUSE-4d: the kernel's `max_readahead`, exactly as echoed in the INIT
+/// reply. Published so the stats inode can show the negotiated limit
+/// alongside the R2 prefetch window it is DELIBERATELY independent of (see
+/// `negotiate_max_readahead`).
+static GEOM_MAX_READAHEAD: AtomicU64 = AtomicU64::new(0);
 
 /// Resolved transport geometry of the live session:
 /// `(queues, depth, payload_sz, total_payload_buffer_bytes,
@@ -2023,6 +2028,17 @@ pub fn over_uring_negotiated_write() -> (u64, u64) {
         GEOM_MAX_WRITE.load(Ordering::Relaxed),
         GEOM_MAX_PAGES.load(Ordering::Relaxed),
     )
+}
+
+/// FUSE-4d: the session's negotiated `max_readahead` (0 until a session
+/// negotiates). Stats inode `transport_max_readahead`.
+pub fn negotiated_max_readahead() -> u64 {
+    GEOM_MAX_READAHEAD.load(Ordering::Relaxed)
+}
+
+/// FUSE-4d: record the readahead limit the INIT reply echoed.
+pub fn note_negotiated_max_readahead(v: u32) {
+    GEOM_MAX_READAHEAD.store(u64::from(v), Ordering::Relaxed);
 }
 
 /// Best-effort: turn on kernel `fuse.enable_uring` so REGISTER is accepted.

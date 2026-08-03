@@ -1569,7 +1569,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let init_out = fuse_init_out {
             major: FUSE_KERNEL_VERSION,
             minor: reply_minor,
-            max_readahead: init_in.max_readahead,
+            // FUSE-4d: echoed VERBATIM (never clamped) and deliberately
+            // never consulted — see `negotiate_max_readahead`.
+            max_readahead: negotiate_max_readahead(init_in.max_readahead),
             flags: reply_flags,
             max_background,
             congestion_threshold,
@@ -5399,6 +5401,29 @@ fn negotiate_init_ext(kernel_minor: u32, kernel_flags: u32, reply_flags2: u32) -
     (reply_minor, init_ext)
 }
 
+/// FUSE-4d: the kernel's readahead limit, echoed VERBATIM into the INIT
+/// reply and published for the stats inode.
+///
+/// `max_readahead` bounds the KERNEL's per-file readahead requests to the
+/// daemon. The daemon's own R2 prefetch window is a DEVICE-side pipeline
+/// depth (measured bandwidth × latency, clamped by the R5 memory budget),
+/// so the two are different resources in different units and are
+/// deliberately NOT coupled: clamping the pipeline by a page-cache limit
+/// (or advertising a smaller limit because the pipeline is shallow) would
+/// each throttle one plane by the other's unrelated bound. What the echo
+/// must not do is shrink: a clamped echo caps kernel readahead for the
+/// mount's life, on every file, invisibly.
+#[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+fn negotiate_max_readahead(kernel_limit: u32) -> u32 {
+    crate::raw::connection::fuse_over_uring::note_negotiated_max_readahead(kernel_limit);
+    kernel_limit
+}
+
+#[cfg(not(all(target_os = "linux", feature = "tokio-runtime")))]
+fn negotiate_max_readahead(kernel_limit: u32) -> u32 {
+    kernel_limit
+}
+
 fn negotiate_reply_flags(init_in_flags: u32, mount_options: &MountOptions) -> u32 {
     let mut reply_flags = 0;
 
@@ -5431,6 +5456,14 @@ fn negotiate_reply_flags(init_in_flags: u32, mount_options: &MountOptions) -> u3
         reply_flags |= FUSE_ATOMIC_O_TRUNC;
     }
 
+    // FUSE-4b: advertising this makes the kernel encode `(nodeid,
+    // generation)` into NFS handles and compare the generation a LOOKUP
+    // returns against the handle's (`fuse_get_dentry` → ESTALE on
+    // mismatch). It is honest only if the filesystem answers with a REAL
+    // generation: the daemon derives it from the volume-set generation
+    // identity (superblock uuids) rather than the historical hardcoded `1`,
+    // so a handle minted before a `format` now gets ESTALE instead of a
+    // different file with the same ino.
     if init_in_flags & FUSE_EXPORT_SUPPORT > 0 {
         debug!("enable FUSE_EXPORT_SUPPORT");
 
@@ -5540,6 +5573,18 @@ fn negotiate_reply_flags(init_in_flags: u32, mount_options: &MountOptions) -> u3
         reply_flags |= FUSE_MAX_PAGES;
     }
 
+    // FUSE-4c: the kernel caches a symlink's target page for the inode's
+    // lifetime and there is NO invalidation path — and none is needed,
+    // which is the whole argument for echoing this. A target is written
+    // exactly once, inside the POSIX-3 `symlink()` create transaction, and
+    // can never be rewritten afterwards: POSIX has no retarget call, and
+    // the daemon's VAL-2 xattr allowlist refuses the `system.symlink`
+    // record through setxattr/removexattr (pinned in
+    // `xattr_allowlist_tests`; the one-writer law is grep-guarded in
+    // `negotiated_caps_tests`). Inode numbers are never reused (v3 allocates
+    // monotonically), so a cached page cannot be re-pointed at another
+    // file's target either. A NEW writer of that record would need
+    // `notify_inval_inode` on the symlink before this flag could stay.
     if init_in_flags & FUSE_CACHE_SYMLINKS > 0 {
         debug!("enable FUSE_CACHE_SYMLINKS");
 

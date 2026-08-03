@@ -4691,6 +4691,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // to it, so a reformat that did not wipe the staging dirs can
             // never poison this mount with dead-generation segments.
             let fs_generation = squeezefs::meta_backend::volume_set_generation(&meta_lvs).await?;
+            // FUSE-4b: the same identity IS this mount's NFS-handle
+            // `generation`. Every entry reply used to hardcode `1`, so a
+            // handle minted before a `format` resolved against the same ino
+            // in the NEW filesystem instead of returning ESTALE.
+            squeezefs::fuse_client::set_entry_generation(&fs_generation);
 
             let cache = TieredCache::new(
                 active_staging_dirs.clone(),

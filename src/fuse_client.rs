@@ -4393,6 +4393,52 @@ fn timestamp_to_ns_word(t: Timestamp) -> u64 {
         .saturating_add(t.nsec as i64) as u64
 }
 
+/// FUSE-4b: the `generation` every entry reply carries.
+///
+/// `FUSE_EXPORT_SUPPORT` is advertised, which makes the kernel encode
+/// `(nodeid, generation)` into NFS file handles and compare the generation
+/// it gets back from a LOOKUP against the one the handle carries
+/// (`fuse_get_dentry`: `handle->generation != inode->i_generation ⇒
+/// ESTALE`). Every reply used to hardcode `1`, so a handle minted before a
+/// `format` resolved happily against the SAME ino in the NEW filesystem —
+/// a different file, silently, where the protocol has a dedicated error
+/// for exactly this.
+///
+/// The value is derived at mount from the volume-set generation identity
+/// (the v3 superblock uuids, joined in volume order — the same string local
+/// staging is bound to), so it is stable for a filesystem's whole life and
+/// fresh after every `format`. Ino reuse cannot make it wrong from the
+/// other direction: v3 allocates inos monotonically and never reuses them.
+///
+/// Folded into 32 bits because the kernel stores `i_generation` as a `u32`,
+/// and never 0 — `fuse_get_dentry` skips the comparison for generation 0
+/// (`handle->generation && ...`), so 0 would silently restore the old
+/// behavior. Default `1` for in-RAM / test mounts that never publish an
+/// identity: exactly today's value.
+static ENTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// FUSE-4b: publish the mount's entry generation from the volume-set
+/// generation identity (`meta_backend::volume_set_generation`).
+pub fn set_entry_generation(fs_generation: &str) {
+    ENTRY_GENERATION.store(derive_entry_generation(fs_generation), Ordering::Release);
+}
+
+/// The pure derivation (pinned by `tests/export_generation_tests.rs`).
+pub fn derive_entry_generation(fs_generation: &str) -> u64 {
+    let h = xxhash_rust::xxh3::xxh3_64(fs_generation.as_bytes());
+    let folded = ((h >> 32) ^ h) as u32;
+    if folded == 0 {
+        1
+    } else {
+        folded as u64
+    }
+}
+
+/// The generation every entry reply of this mount carries (FUSE-4b).
+pub fn entry_generation() -> u64 {
+    ENTRY_GENERATION.load(Ordering::Acquire)
+}
+
 /// D1.d (design-metadata-throughput §5.1, PR M5): per-inode open-handle
 /// state — the open count plus the dirty bit data-mutating ops set
 /// (write / truncate / fallocate / copy_file_range dest). FLUSH/RELEASE
@@ -5961,6 +6007,15 @@ impl SqueezefsFilesystem {
         // 4 MiB field row's engagement instrument.
         #[cfg(target_os = "linux")]
         let (t_max_write, t_max_pages) = fuse3::over_uring_negotiated_write();
+        // FUSE-4d: the kernel's readahead limit as echoed VERBATIM in the
+        // INIT reply. Deliberately independent of the R2 prefetch window
+        // (kernel page-cache readahead vs a device-side pipeline depth) —
+        // published so an operator can see both numbers instead of
+        // inferring a coupling that does not exist.
+        #[cfg(target_os = "linux")]
+        let t_max_readahead = fuse3::negotiated_max_readahead();
+        #[cfg(not(target_os = "linux"))]
+        let t_max_readahead = 0u64;
         #[cfg(not(target_os = "linux"))]
         let (t_queues, t_depth, t_buffer_bytes, t_max_background, t_max_write, t_max_pages) =
             (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
@@ -6519,6 +6574,7 @@ impl SqueezefsFilesystem {
                 "transport_max_background": t_max_background,
                 "transport_max_write": t_max_write,
                 "transport_max_pages": t_max_pages,
+                "transport_max_readahead": t_max_readahead,
                 "transport_commit_batch": serde_json::Value::Object(t_cb_hist),
                 "transport_commit_batch_flushes": t_cb_flushes,
                 "transport_commit_batch_commits": t_cb_commits,
@@ -13217,7 +13273,7 @@ impl Filesystem for SqueezefsFilesystem {
             return Ok(ReplyEntry {
                 ttl: self.entry_ttl_for(attr.kind),
                 attr,
-                generation: 1,
+                generation: entry_generation(),
             });
         }
 
@@ -13235,7 +13291,7 @@ impl Filesystem for SqueezefsFilesystem {
                 // so the kernel's copy bound is never a stale size.
                 ttl: Duration::from_secs(0),
                 attr,
-                generation: 1,
+                generation: entry_generation(),
             });
         }
 
@@ -13250,7 +13306,7 @@ impl Filesystem for SqueezefsFilesystem {
             return Ok(ReplyEntry {
                 ttl: Duration::from_secs(0), // dynamic stats shouldn't be cached long
                 attr,
-                generation: 1,
+                generation: entry_generation(),
             });
         }
 
@@ -13280,7 +13336,7 @@ impl Filesystem for SqueezefsFilesystem {
             Ok(ReplyEntry {
                 ttl: self.entry_ttl_for(attr.kind),
                 attr,
-                generation: 1,
+                generation: entry_generation(),
             })
         };
 
@@ -13432,7 +13488,7 @@ impl Filesystem for SqueezefsFilesystem {
             Ok(ReplyEntry {
                 ttl: self.entry_ttl_for(attr.kind),
                 attr,
-                generation: 1,
+                generation: entry_generation(),
             })
         };
 
@@ -13510,7 +13566,7 @@ impl Filesystem for SqueezefsFilesystem {
             Ok(ReplyCreated {
                 ttl: self.entry_ttl_for(attr.kind),
                 attr,
-                generation: 1,
+                generation: entry_generation(),
                 fh: inode.ino,
                 flags: regular_open_reply_flags(),
             })
@@ -14490,7 +14546,7 @@ impl Filesystem for SqueezefsFilesystem {
             Ok(ReplyEntry {
                 ttl: self.entry_ttl_for(attr.kind),
                 attr,
-                generation: 1,
+                generation: entry_generation(),
             })
         };
 
@@ -14867,7 +14923,7 @@ impl Filesystem for SqueezefsFilesystem {
             Ok(ReplyEntry {
                 ttl: self.entry_ttl_for(attr.kind),
                 attr,
-                generation: 1,
+                generation: entry_generation(),
             })
         };
 
@@ -14942,7 +14998,7 @@ impl Filesystem for SqueezefsFilesystem {
             return Ok(ReplyEntry {
                 ttl: self.entry_ttl_for(attr.kind),
                 attr,
-                generation: 1,
+                generation: entry_generation(),
             });
         };
 
@@ -15298,7 +15354,7 @@ impl Filesystem for SqueezefsFilesystem {
                         name: ".".into(),
                         kind: FileType::Directory,
                         inode: parent,
-                        generation: 1,
+                        generation: entry_generation(),
                         attr,
                         entry_ttl: self.kernel_ttls.dir_entry,
                         attr_ttl: self.kernel_ttls.attr,
@@ -15317,7 +15373,7 @@ impl Filesystem for SqueezefsFilesystem {
                         name: "..".into(),
                         kind: FileType::Directory,
                         inode: parent_parent,
-                        generation: 1,
+                        generation: entry_generation(),
                         attr,
                         entry_ttl: self.kernel_ttls.dir_entry,
                         attr_ttl: self.kernel_ttls.attr,
@@ -15361,7 +15417,7 @@ impl Filesystem for SqueezefsFilesystem {
                         name: d.name.into(),
                         kind: attr.kind,
                         inode: d.ino,
-                        generation: 1,
+                        generation: entry_generation(),
                         attr,
                         entry_ttl,
                         attr_ttl,
@@ -17636,7 +17692,14 @@ pub async fn start_mount<P: AsRef<Path>>(
             // default to the L1 policy above; the historical tokens here were
             // dead letters, filtered before reaching the kernel.)
             options.custom_options(
-                "max_read=1048576,max_write=1048576,max_pages=256,max_readahead=4194304,async_read",
+                // FUSE-4d: no `max_readahead` token — the kernel's readahead
+                // limit is negotiated in the INIT reply (echoed verbatim
+                // from `fuse_init_in`), and fuse3's option filter strips
+                // this token before the mount syscall anyway. Shipping one
+                // implied a coupling with the R2 prefetch window that
+                // deliberately does not exist (different resource: kernel
+                // page-cache readahead vs a device-side pipeline depth).
+                "max_read=1048576,max_write=1048576,max_pages=256,async_read",
             );
         }
     }

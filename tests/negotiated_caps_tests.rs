@@ -48,7 +48,10 @@ fn the_entry_generation_is_derived_from_the_filesystem_identity() {
     );
     // Deterministic across calls (the same mount must answer every LOOKUP
     // with the same generation).
-    assert_eq!(a, derive_entry_generation("v3:00112233445566778899aabbccddeeff"));
+    assert_eq!(
+        a,
+        derive_entry_generation("v3:00112233445566778899aabbccddeeff")
+    );
     // The kernel stores `i_generation` as a u32 and SKIPS the comparison
     // when the handle's generation is 0 (`handle->generation && ...`).
     for s in [

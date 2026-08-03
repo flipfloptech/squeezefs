@@ -389,7 +389,10 @@ proptest! {
         }
     }
 
-    /// The layout-delta wire round-trips its whole optional-field matrix.
+    /// The layout-delta wire round-trips its whole optional-field matrix —
+    /// including the §6.2 item-9 version pair (present ⇔ `version != 0`;
+    /// an unversioned record cannot carry a base claim, which is the
+    /// `set_versions` invariant the generator honours).
     #[test]
     fn layout_delta_round_trips(
         file_type in "[a-z]{1,8}",
@@ -399,8 +402,9 @@ proptest! {
         file_id in prop::option::of("[a-z0-9-]{1,16}"),
         data_key in prop::option::of(prop::collection::vec(any::<u8>(), 1..32)),
         entries in prop::collection::vec((any::<u32>(), "[a-z0-9]{1,12}"), 0..8),
+        versions in prop::option::of((any::<u64>(), 1u64..=u64::MAX)),
     ) {
-        let d = LayoutDelta {
+        let mut d = LayoutDelta {
             file_type,
             size,
             block_map_id,
@@ -408,16 +412,19 @@ proptest! {
             file_id,
             data_key,
             entries,
+            ..Default::default()
         };
+        if let Some((base, version)) = versions {
+            d.set_versions(base, version);
+        }
         let enc = d.encode();
         let back = LayoutDelta::decode(&enc).expect("an encoded delta decodes");
-        prop_assert_eq!(back.file_type, d.file_type);
-        prop_assert_eq!(back.size, d.size);
-        prop_assert_eq!(back.block_map_id, d.block_map_id);
-        prop_assert_eq!(back.block_prefix, d.block_prefix);
-        prop_assert_eq!(back.file_id, d.file_id);
-        prop_assert_eq!(back.data_key, d.data_key);
-        prop_assert_eq!(back.entries, d.entries);
+        prop_assert_eq!(&back, &d, "whole-struct roundtrip (versions included)");
+        // The strip form is the un-stamped volume's wire: byte-identical
+        // to the zero-version twin (the bit-5 compatibility law).
+        let mut stripped = d.clone();
+        stripped.set_versions(0, 0);
+        prop_assert_eq!(d.encode_unversioned(), stripped.encode());
     }
 
     /// A layout base survives encode → decode with its map intact.

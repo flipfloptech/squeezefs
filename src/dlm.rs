@@ -677,6 +677,35 @@ pub fn test_swap_grant_seq(value: u64) -> u64 {
     GRANT_SEQ.swap(value, Ordering::AcqRel)
 }
 
+/// Spec §6.2 **item 9** — mint one durable **layout version**: the
+/// era-composed stamp a layout delta record carries as its own chain
+/// link name (`crate::layout_wire::LayoutDelta::version`).
+///
+/// Deliberately draws from the SAME [`GRANT_SEQ`] sequencer as the S1
+/// fencing mint: `(term, seq)` uniqueness is then ONE invariant with
+/// one owner instead of two counters that must never collide, and the
+/// sequence is gap-carrying by the same law that makes gap-carrying
+/// tokens legal everywhere (`<`, `==`, `.max()` consumers only). Two
+/// layout versions can therefore never be equal within a process, and
+/// the durable-term composition (S2, monotone `fetch_max` adoption)
+/// makes them unique ACROSS processes and writer eras — which is
+/// exactly what lets a delta chain name its base after a failover.
+///
+/// Returns `0` on 40-bit grant exhaustion (the same horizon at which
+/// [`LocalLockManager`]'s own mint refuses lock grants loud): `0` is
+/// the reserved "unversioned" value, and the publish path's disposition
+/// for it is the always-correct full-`Put` re-base — never an error
+/// minted here, because the lock mint is already the loud gate for a
+/// process in that state.
+pub fn mint_layout_version() -> u64 {
+    let seq = GRANT_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+    if seq > GRANT_SEQ_MAX {
+        0
+    } else {
+        compose_token(durable_term(), seq)
+    }
+}
+
 /// Per-stripe RELEASED-generation floors, fetch_max'd at every mint with
 /// the granted token (keyed by the FILE identity's stripe). An UNHELD
 /// object's generation read serves from its stripe floor: never below

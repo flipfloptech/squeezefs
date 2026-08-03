@@ -98,10 +98,10 @@ use squeezefs::meta_backend::kv::superblock::{
     FEATURES_INCOMPAT_KNOWN, FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS, FEATURE_INCOMPAT_KV_CLAIM_SET,
     FEATURE_INCOMPAT_KV_DURABLE_TERM, FEATURE_INCOMPAT_KV_DYNAMIC_ROUTING,
     FEATURE_INCOMPAT_KV_GUEST_SLOTS, FEATURE_INCOMPAT_KV_LAYOUT_DELTAS,
-    FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA, FEATURE_INCOMPAT_KV_PARTITIONED_APPEND,
-    FEATURE_INCOMPAT_KV_SLOT_MIGRATION, FEATURE_INCOMPAT_KV_V3,
-    FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE, FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING,
-    FEATURE_INCOMPAT_NODE_SEQ_WATERMARK,
+    FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS, FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA,
+    FEATURE_INCOMPAT_KV_PARTITIONED_APPEND, FEATURE_INCOMPAT_KV_SLOT_MIGRATION,
+    FEATURE_INCOMPAT_KV_V3, FEATURE_INCOMPAT_KV_VOLUME_LIFECYCLE,
+    FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING, FEATURE_INCOMPAT_NODE_SEQ_WATERMARK,
 };
 use squeezefs::meta_backend::reservation::{
     clear_override, install_override, FakeNvmeNamespace, FakeReservationClient,
@@ -731,6 +731,9 @@ fn incompat_bit_11_is_disjoint_from_every_other_feature_bit() {
         // this pin: it is listed here so a future renumber of EITHER bit
         // turns this assertion red instead of aliasing on disk.
         ("KV_CLAIM_SET", FEATURE_INCOMPAT_KV_CLAIM_SET),
+        // §6.2 item 9 (durable per-ino layout versions, bit 15) — listed
+        // for the same reason: a renumber of either side goes red here.
+        ("KV_LAYOUT_VERSIONS", FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS),
     ] {
         assert_eq!(
             FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA & bit,

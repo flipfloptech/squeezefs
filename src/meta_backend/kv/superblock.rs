@@ -483,6 +483,36 @@ pub const FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION: u64 = 1 << 13;
 /// test instead of silent on-disk aliasing.
 pub const FEATURE_INCOMPAT_KV_CLAIM_SET: u64 = 1 << 14;
 
+/// `features_incompat` bit 15: **durable per-ino layout versions**
+/// (pre-RC engineering spec §6.2 **item 9**; ruling **D9**). The
+/// volume's layout delta records carry the era-composed
+/// `(base_version, version)` pair (`crate::layout_wire`, wire flag
+/// bit 4; versions minted by [`crate::dlm::mint_layout_version`] —
+/// `(term << 40) | seq`, the fencing-token composition, so a chain's
+/// base is nameable ACROSS process death and writer failover). With
+/// the bit stamped: the publish commit gate refuses a delta whose
+/// named base is not the durable chain head ("divergent chains fold
+/// to divergent layouts" — refused loud, never folded), and the §4.2
+/// fold refuses a chain whose versioned links do not join.
+///
+/// Pre-item-9 binaries cannot decode the versioned wire
+/// (`LayoutDelta::decode` refuses the unknown flag bit as corruption
+/// **mid-read**), so the bit turns that into a clean mount-time
+/// refusal — the KD-14 pattern. Ordering invariant: version emission
+/// keys on the OPEN-time superblock snapshot (there is deliberately
+/// NO mount-time ratchet — the volume is stamped OFFLINE via
+/// [`set_layout_versions_bit`], the Phase-8 window), so the bit is
+/// durable strictly before the volume's first versioned record can
+/// be. Un-stamped volumes strip the pair at encode
+/// (`LayoutDelta::encode_unversioned`) and stay **byte-identical** to
+/// the shipped bit-5 wire. **Never stamped by [`SuperblockV3::plan`]**
+/// (ruling D9: built, never stamped at format).
+///
+/// **Bit 15** — 0..=14 are claimed (the union clause in
+/// `tests/writer_scoped_staging_tests.rs` is what makes a sixth
+/// parallel claim a red gate instead of silent on-disk aliasing).
+pub const FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS: u64 = 1 << 15;
+
 /// Incompat feature bits this binary understands. Any other set bit
 /// refuses the mount naming the bit (§6.1).
 pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
@@ -499,7 +529,8 @@ pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
     | FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA
     | FEATURE_INCOMPAT_KV_INO_LANES
     | FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION
-    | FEATURE_INCOMPAT_KV_CLAIM_SET;
+    | FEATURE_INCOMPAT_KV_CLAIM_SET
+    | FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS;
 
 /// Read-only feature bits this binary understands (none yet — §4.11
 /// reserves the mechanism for snapshots). Unknown bits mount read-only.
@@ -1354,6 +1385,31 @@ pub async fn set_guest_slots_bit(path: &Path) -> Result<bool, KvError> {
 /// **before** the volume's first layout-delta journal entry is written.
 pub async fn set_layout_deltas_bit(path: &Path) -> Result<bool, KvError> {
     set_incompat_bit(path, FEATURE_INCOMPAT_KV_LAYOUT_DELTAS, "layout-deltas").await
+}
+
+/// Stamp [`FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS`] on `path`'s superblock —
+/// the §6.2 item-9 upgrade path (the batched Phase-8 reformat window;
+/// **mount NEVER calls this**, ruling D9). Returns whether the bit was
+/// newly set. The volume must be offline (the caller holds the D0
+/// guard).
+///
+/// Ordering note (the KD-14 pattern, bits 5/7/9 lineage): the bit gates
+/// the VERSIONED delta wire, which a pre-item-9 binary's
+/// `LayoutDelta::decode` refuses as corruption mid-read — and version
+/// emission keys on the next mount's open-time superblock snapshot, so
+/// the bit is durable strictly before the volume's first versioned
+/// record. Stamp-then-crash is inert: old binaries are refused with
+/// zero versioned records present; this binary mounts, sees a
+/// pre-stamp (unversioned) chain head at the first publish, and
+/// re-bases it with a full `Put` (the first-touch rule) before any
+/// versioned link joins.
+pub async fn set_layout_versions_bit(path: &Path) -> Result<bool, KvError> {
+    set_incompat_bit(
+        path,
+        FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS,
+        "durable-layout-versions",
+    )
+    .await
 }
 
 /// Stamp [`FEATURE_INCOMPAT_KV_SLOT_MIGRATION`] on `path`'s superblock —

@@ -201,6 +201,23 @@ pub struct CachedMetadata {
     /// possible cross-client mutation — refetches, the pre-campaign
     /// posture). `0` = unknown provenance, never serve as base.
     pub layout_base_token: u64,
+    /// Spec §6.2 **item 9** (durable per-ino layout version): the
+    /// durable version of the last PERSISTED layout state this entry
+    /// descends from — exactly the value the ino's next delta record
+    /// names as its `base_version`. Stamped ONLY by the save republish
+    /// in `save_metadata_to_backend_ext` (the one site every layout
+    /// persist funnels through): a DELTA save stamps the version it
+    /// minted for that link; a FULL save stamps `0` (a bare `Put` base
+    /// carries no durable stamp, so the next link's first claim is `0`
+    /// by law). Every fetched/synthesized entry starts at `0` —
+    /// "unknown provenance" — which on a versions-stamped volume makes
+    /// the next publish re-base with a full `Put` (the first-touch
+    /// rule) instead of claiming a base it cannot name. Distinct from
+    /// [`Self::layout_base_token`] on purpose: the era token is
+    /// constant across many saves in one era, while the layout version
+    /// changes at every persisted link (fork detection needs per-STATE
+    /// uniqueness, not per-era).
+    pub layout_version: u64,
 }
 
 /// [`CachedMetadata::layout_delta_chain`] sentinel: the persisted base
@@ -231,6 +248,7 @@ impl Default for CachedMetadata {
             layout_dirty: false,
             layout_delta_chain: LAYOUT_DELTA_CHAIN_INELIGIBLE,
             layout_base_token: 0,
+            layout_version: 0,
         }
     }
 }
@@ -4827,6 +4845,14 @@ impl DataRouter {
                         // Lever A: backend-true at fetch — coherent with
                         // the CURRENT era by definition.
                         layout_base_token: self.inner.dlm.get_fencing_token_ino(ino),
+                        // §6.2 item 9: a refetched entry's chain
+                        // provenance is UNKNOWN (the fold hides the
+                        // head's version) — the next delta claims base
+                        // 0, and on a versions-stamped volume the
+                        // commit gate re-bases it with a full Put
+                        // (first-touch rule) rather than let it name a
+                        // base it never saw.
+                        layout_version: 0,
                     };
                     // Idea 1 refetch-compose (KD-1.9 — the eviction-hole
                     // belt): an open epoch's shadow bindings overlay the
@@ -7907,6 +7933,7 @@ impl DataRouter {
             // Synthesized (backend has no layout): never a coherent
             // publish base.
             layout_base_token: 0,
+            layout_version: 0,
         };
         self.metadata_cache.insert(ino, m.clone());
         Ok(m)

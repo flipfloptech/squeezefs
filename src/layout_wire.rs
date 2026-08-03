@@ -190,6 +190,19 @@ pub fn is_layout_delta(payload: &[u8]) -> bool {
     payload.len() >= 2 && u16::from_le_bytes([payload[0], payload[1]]) == LAYOUT_DELTA_MAGIC
 }
 
+/// Spec §6.2 item 9 — the `(base_version, version)` peek of a layout
+/// delta record, `None` for the unversioned (pre-item-9) wire. The
+/// fields sit at FIXED offsets right after the flags byte, so the
+/// commit gate can read the durable chain head's versions without a
+/// full record decode. `None` for anything that is not a well-formed
+/// versioned layout delta prefix (the caller treats that exactly like
+/// an unversioned record — the fold's own strict decode is where
+/// garbage dies loud).
+pub fn layout_delta_versions(_payload: &[u8]) -> Option<(u64, u64)> {
+    // Scaffold (tests-first): the versioned wire does not exist yet.
+    None
+}
+
 /// Layout-wire errors. Mapped to `KvError::Corrupt` by the fold layer.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LayoutWireError {
@@ -226,6 +239,24 @@ pub struct LayoutDelta {
     /// Map inserts, `(block_index, block_key)`. Inserts only — removals
     /// (truncate/punch) take the full-`Put` path by design.
     pub entries: Vec<(u32, String)>,
+    /// Spec §6.2 **item 9** — the DURABLE name of the base this delta
+    /// was computed against: the `version` of the previous chain link,
+    /// or `0` for the first link above a full `Put` (the base `Put`
+    /// carries no stamp, so the first link is unverifiable by
+    /// construction — uniqueness of `version` closes every fork from
+    /// the second link on). `0` also means "no claim" (a writer whose
+    /// RAM provenance is unknown after a refetch): the commit gate
+    /// re-bases such a publish with a full `Put` instead of staging it
+    /// onto a chain whose head it cannot name.
+    pub base_version: u64,
+    /// This link's own durable version — era-composed like every
+    /// fencing token in the tree (`(term << 40) | seq`,
+    /// [`crate::dlm::mint_layout_version`]): monotone, remount-safe,
+    /// unique across writers because the durable term is unique per
+    /// writer era. `0` = an UNVERSIONED record (the pre-item-9 wire —
+    /// the only shape an un-stamped volume ever stores; `base_version`
+    /// is not representable without it and encodes as absent).
+    pub version: u64,
 }
 
 const F_BLOCK_MAP_ID: u8 = 1 << 0;
@@ -255,15 +286,50 @@ impl LayoutDelta {
             file_id: file_id.map(str::to_string),
             data_key: data_key.map(<[u8]>::to_vec),
             entries,
+            base_version: 0,
+            version: 0,
+        }
+    }
+
+    /// Stamp the §6.2 item-9 version pair. A zero `version` means "this
+    /// record is unversioned" (mint exhaustion, or a caller that never
+    /// minted), and an unversioned record cannot carry a base claim —
+    /// the pair is zeroed together so the wire invariant
+    /// (`base_version` present ⇔ `version != 0`) holds structurally.
+    pub fn set_versions(&mut self, base_version: u64, version: u64) {
+        if version == 0 {
+            self.base_version = 0;
+            self.version = 0;
+        } else {
+            self.base_version = base_version;
+            self.version = version;
         }
     }
 
     /// Encode (little-endian, strict):
-    /// `magic u16 | flags u8 | file_type_len u8 | file_type | size u64 |
+    /// `magic u16 | flags u8 | [base_version u64 | version u64 — iff
+    /// flags bit 4] | file_type_len u8 | file_type | size u64 |
     /// [block_map_id u16+bytes] | [block_prefix u16+bytes] |
     /// [file_id u16+bytes] | [data_key u16+bytes] | entry_count u32 |
     /// entries × { block u32 | key_len u16 | key }`.
+    ///
+    /// The version pair encodes iff `self.version != 0` (spec §6.2
+    /// item 9); the zero-version encode is byte-identical to the
+    /// pre-item-9 wire.
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_inner(true)
+    }
+
+    /// [`Self::encode`] with the §6.2 item-9 version pair STRIPPED —
+    /// what the backend stores on a volume whose superblock does not
+    /// carry `KV_LAYOUT_VERSIONS` (incompat bit 15): byte-identical to
+    /// the pre-item-9 wire, so un-stamped volumes stay readable by
+    /// every bit-5 binary.
+    pub fn encode_unversioned(&self) -> Vec<u8> {
+        self.encode_inner(false)
+    }
+
+    fn encode_inner(&self, _keep_versions: bool) -> Vec<u8> {
         debug_assert!(self.file_type.len() <= u8::MAX as usize);
         let mut flags = 0u8;
         if self.block_map_id.is_some() {
@@ -361,6 +427,8 @@ impl LayoutDelta {
             file_id,
             data_key,
             entries,
+            base_version: 0,
+            version: 0,
         })
     }
 
@@ -483,6 +551,8 @@ mod tests {
             file_id: Some("stage-abc".into()),
             data_key: Some(vec![9, 8, 7]),
             entries: vec![(0, "b0://0".into()), (2, "b0://8388608".into())],
+            base_version: 0,
+            version: 0,
         }
     }
 

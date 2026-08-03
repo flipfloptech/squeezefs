@@ -14517,8 +14517,10 @@ impl Filesystem for SqueezefsFilesystem {
                     layout_dirty: false,
                     layout_delta_chain: crate::routing::LAYOUT_DELTA_CHAIN_INELIGIBLE,
                     // Synthesized create seed: never a coherent publish
-                    // base (Lever A).
+                    // base (Lever A), never a nameable chain base
+                    // (§6.2 item 9).
                     layout_base_token: 0,
+                    layout_version: 0,
                 },
             );
             self.bump_dir_generation(parent);

@@ -1178,6 +1178,14 @@ fn incompat_bits_are_single_bit_and_pairwise_disjoint() {
             sb::FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION,
         ),
         ("KV_CLAIM_SET", sb::FEATURE_INCOMPAT_KV_CLAIM_SET),
+        // §6.2 item 9 (durable per-ino layout versions) took bit 15 — the
+        // last free bit below 16, claimed against a program with FIVE
+        // prior parallel-claim collisions; this union clause is what
+        // makes the sixth a red gate instead of on-disk aliasing.
+        (
+            "KV_LAYOUT_VERSIONS",
+            sb::FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS,
+        ),
     ];
     let mut seen = 0u64;
     for (name, bit) in bits {

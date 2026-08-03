@@ -70,6 +70,8 @@ fn publish_delta(from: u32, to: u32, size: u64, seq: u64) -> Record {
         file_id: None,
         data_key: None,
         entries,
+        // Unversioned (pre-item-9) records: the shipped un-stamped wire.
+        ..Default::default()
     };
     Record {
         key: key(),
@@ -208,6 +210,10 @@ fn fold_forward_equivalence_property_layout_class() {
                 entries: (from..from + len)
                     .map(|b| (b, format!("oss0://{}", b as u64 * 4096)))
                     .collect(),
+                // Unversioned: the fold-equivalence property is the
+                // version-blind algebra (versioned-chain linking has its
+                // own strict law in tests/mw_layout_version_tests.rs).
+                ..Default::default()
             };
             (RecordKind::Delta, d.encode())
         }),

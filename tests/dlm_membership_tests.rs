@@ -877,6 +877,13 @@ fn incompat_bit_14_is_disjoint_and_never_stamped_by_format() {
             "KV_BLOCK_KEY_INCARNATION",
             sb::FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION,
         ),
+        // §6.2 item 9 (durable per-ino layout versions) took bit 15 in a
+        // parallel window with this stage's bit — listed so a renumber of
+        // either side turns THIS pin red instead of aliasing on disk.
+        (
+            "KV_LAYOUT_VERSIONS",
+            sb::FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS,
+        ),
     ] {
         assert_eq!(
             sb::FEATURE_INCOMPAT_KV_CLAIM_SET & bit,
